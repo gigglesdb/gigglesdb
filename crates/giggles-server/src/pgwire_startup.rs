@@ -25,6 +25,18 @@ pub(crate) async fn read_startup_packet<S: AsyncRead + Unpin>(s: &mut S) -> io::
 pub(crate) enum StartupPolicy<'a> {
     Agent,
     Postgresql { databases: &'a [String] },
+    /// GD-0061 R3-205: the agent (task) listener. The certificate picks the
+    /// binding; `user` must name its executor and `database` one of `databases`.
+    /// The task comes from `giggles.task` or `options` = `-c giggles.task=<name>`.
+    TaskAgent { databases: &'a [String] },
+}
+
+/// The task named by an `options` startup value. Only the exact form
+/// `-c giggles.task=<name>` is accepted; anything else is `None`.
+fn options_task(options: &str) -> Option<&str> {
+    let name = options.strip_prefix("-c giggles.task=")?;
+    (!name.is_empty() && !name.bytes().any(|b| b.is_ascii_whitespace() || b == b'\\'))
+        .then_some(name)
 }
 
 pub(crate) struct Startup {
@@ -33,6 +45,9 @@ pub(crate) struct Startup {
     pub(crate) database: String,
     pub(crate) settings: crate::pg_settings::Settings,
     pub(crate) timezone: String,
+    /// The task a `TaskAgent` startup selected; `None` for every other policy,
+    /// and for a task-agent startup that names none.
+    pub(crate) task: Option<String>,
 }
 
 pub(crate) fn parse_startup(
@@ -82,6 +97,26 @@ pub(crate) fn parse_startup(
             }
         }
         r.end()?;
+        let mut task = None;
+        if matches!(policy, StartupPolicy::TaskAgent { .. }) {
+            let direct = fields.remove("giggles.task");
+            let options = fields.remove("options");
+            if let Some(options) = &options
+                && options_task(options).is_none()
+            {
+                reason = "startup options must be exactly -c giggles.task=<name>";
+                return Err("0A000");
+            }
+            if direct.is_some() && options.is_some() {
+                reason = "startup names the task twice; use giggles.task or options, not both";
+                return Err("0A000");
+            }
+            task = direct.or_else(|| options.as_deref().and_then(options_task).map(str::to_owned));
+            if task.as_deref().is_some_and(str::is_empty) {
+                reason = "startup giggles.task must name a task";
+                return Err("0A000");
+            }
+        }
         match policy {
             StartupPolicy::Agent => {
                 if fields.get("user").map(String::as_str) != Some("giggles") {
@@ -93,7 +128,7 @@ pub(crate) fn parse_startup(
                     return Err("28000");
                 }
             }
-            StartupPolicy::Postgresql { databases } => {
+            StartupPolicy::Postgresql { databases } | StartupPolicy::TaskAgent { databases } => {
                 if fields.get("user").is_none_or(|v| v.is_empty() || v.len() > 63) {
                     reason = "startup user must name a role";
                     return Err("28000");
@@ -131,7 +166,11 @@ pub(crate) fn parse_startup(
                 reason = "unrecognized configuration parameter";
                 return Err("42704");
             }
-            reason = "unsupported startup parameter; allowed: user, database, client_encoding, application_name, DateStyle, TimeZone, extra_float_digits";
+            reason = if matches!(policy, StartupPolicy::TaskAgent { .. }) {
+                "unsupported startup parameter; allowed: user, database, giggles.task, options, client_encoding, application_name, DateStyle, TimeZone, extra_float_digits"
+            } else {
+                "unsupported startup parameter; allowed: user, database, client_encoding, application_name, DateStyle, TimeZone, extra_float_digits"
+            };
             return Err("0A000");
         }
         if fields
@@ -202,6 +241,7 @@ pub(crate) fn parse_startup(
             database: fields.remove("database").unwrap(),
             settings: startup_settings,
             timezone,
+            task,
         })
     })();
     validate.map_err(|code| (code, reason))
@@ -438,5 +478,51 @@ mod tests {
         let startup = parse_startup(&body(&[("user", "giggles"), ("database", "giggles")]), &StartupPolicy::Agent).ok().unwrap();
         assert_eq!(startup.timezone, "UTC");
         assert_eq!(startup.settings.timezone, "UTC");
+    }
+
+    #[test]
+    fn task_agent_reads_the_task_from_the_parameter_or_exact_options() {
+        let databases = vec![String::from("giggles")];
+        let agent = StartupPolicy::TaskAgent { databases: &databases };
+        let base = [("user", "agent_exec"), ("database", "giggles")];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut fields = base.to_vec();
+            fields.extend_from_slice(extra);
+            fields
+        };
+        let task = |fields: &[(&str, &str)]| parse_startup(&body(fields), &agent).ok().unwrap().task;
+        assert_eq!(task(&base), None);
+        assert_eq!(task(&with(&[("giggles.task", "inc-436")])).as_deref(), Some("inc-436"));
+        assert_eq!(task(&with(&[("options", "-c giggles.task=inc-436")])).as_deref(), Some("inc-436"));
+        let startup = parse_startup(&body(&with(&[("giggles.task", "inc-436")])), &agent).ok().unwrap();
+        assert_eq!((startup.user.as_str(), startup.database.as_str()), ("agent_exec", "giggles"));
+        for options in [
+            "-c search_path=public",
+            "-c giggles.task=inc-436 -c search_path=public",
+            "-c giggles.task=",
+            "-cgiggles.task=inc-436",
+            " -c giggles.task=inc-436",
+            "--giggles.task=inc-436",
+            "",
+        ] {
+            assert_eq!(error(&with(&[("options", options)]), &agent).0, "0A000", "{options:?}");
+        }
+        assert_eq!(error(&with(&[("giggles.task", "")]), &agent).0, "0A000");
+        assert_eq!(
+            error(&with(&[("giggles.task", "inc-436"), ("options", "-c giggles.task=inc-436")]), &agent).0,
+            "0A000"
+        );
+        // Other parameters keep the locked agent allow-list, matched exactly.
+        assert_eq!(error(&with(&[("search_path", "public")]), &agent).0, "0A000");
+        assert_eq!(error(&with(&[("GIGGLES.TASK", "inc-436")]), &agent).0, "0A000");
+        assert_eq!(error(&with(&[("replication", "true")]), &agent).0, "0A000");
+        // The other policies never accept the task parameters.
+        let pg = StartupPolicy::Postgresql { databases: &databases };
+        assert!(parse_startup(&body(&with(&[("giggles.task", "inc-436")])), &pg).is_err());
+        assert!(parse_startup(&body(&[("user", "giggles"), ("database", "giggles"), ("options", "-c giggles.task=x")]), &StartupPolicy::Agent).is_err());
+        // Identity: a role name is required and the database must be served.
+        assert_eq!(error(&[("user", ""), ("database", "giggles")], &agent).0, "28000");
+        assert_eq!(error(&[("user", "agent_exec"), ("database", "other")], &agent).0, "3D000");
+        assert_eq!(error(&[("user", "agent_exec")], &agent).0, "3D000");
     }
 }

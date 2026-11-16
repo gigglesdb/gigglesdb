@@ -241,3 +241,6 @@ mod role_switch_guard;
 
 #[path = "agent_bindings.rs"]
 mod agent_bindings;
+
+#[path = "agent_pg_connect.rs"]
+mod agent_pg_connect;

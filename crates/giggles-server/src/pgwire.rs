@@ -1980,6 +1980,80 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, session: Session)
     serve_session(s, session, startup, false, &[]).await
 }
 
+/// The one message every agent connect refusal carries (design-2 section 3).
+pub const AGENT_REFUSAL: &str = "agent credential is not authorized for a task session";
+
+/// GD-0061 R3-205: a connection on the agent pgwire listener, after TLS, whose
+/// certificate is in the agent map. Reads the startup packet (or a
+/// CancelRequest), opens the task session and serves it. Every credential
+/// refusal is the same FATAL 28000; the reason goes to stderr only.
+pub(crate) async fn run_agent<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut S,
+    service: &std::sync::Arc<crate::Service>,
+    fingerprint: &str,
+    databases: &[String],
+    shared: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> io::Result<()> {
+    use crate::pgwire_startup::{
+        StartupPolicy, parse_startup, read_startup_packet, reject_startup,
+    };
+    if !service.admission.request() {
+        return Ok(());
+    }
+    let startup = read_startup_packet(s).await?;
+    if startup.len() == 12 && startup[..4] == 80877102u32.to_be_bytes() {
+        let pid = u32::from_be_bytes(startup[4..8].try_into().unwrap());
+        let secret = u32::from_be_bytes(startup[8..12].try_into().unwrap());
+        service.cancel_agent(fingerprint, pid, secret);
+        return Ok(());
+    }
+    let startup = match parse_startup(&startup, &StartupPolicy::TaskAgent { databases }) {
+        Ok(startup) => startup,
+        Err((code, reason)) => {
+            eprintln!("protocol=agent_postgres rejected stage=startup code={code}");
+            reject_startup(s, code, reason).await?;
+            return Ok(());
+        }
+    };
+    let mut session = match service.agent_session(fingerprint, startup.task.as_deref()) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!(
+                "protocol=agent_postgres rejected stage=task_session fingerprint={} reason={error:?}",
+                &fingerprint[..8]
+            );
+            return agent_refusal(s).await;
+        }
+    };
+    let executor = match &session.role {
+        Role::Database { name } if name == &startup.user => name.clone(),
+        _ => {
+            eprintln!(
+                "protocol=agent_postgres rejected stage=task_session fingerprint={} reason=user_is_not_the_executor",
+                &fingerprint[..8]
+            );
+            return agent_refusal(s).await;
+        }
+    };
+    session.connection = Some(shared);
+    session.backend_ssl = true;
+    session.database = Some(startup.database.clone());
+    let statuses = [
+        ("is_superuser", "off".to_owned()),
+        ("session_authorization", executor),
+    ];
+    serve_session(s, session, startup, false, &statuses).await
+}
+
+async fn agent_refusal<S: AsyncWrite + Unpin>(s: &mut S) -> io::Result<()> {
+    let mut body = b"SFATAL\0VFATAL\0C28000\0M".to_vec();
+    z(AGENT_REFUSAL, &mut body);
+    body.push(0);
+    let mut out = Vec::new();
+    frame(b'E', &body, &mut out).map_err(io::Error::other)?;
+    send(s, &out).await
+}
+
 pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
     mut session: Session,

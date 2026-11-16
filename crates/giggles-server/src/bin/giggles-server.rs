@@ -1,6 +1,7 @@
 use giggles_core::{Admin, Limits};
 use giggles_server::{
     Binding, Running, Service,
+    agent::{AgentConfig, serve_agent_pg_bound},
     api::{
         ApiLimits, ApiRuntime,
         net::{serve_grpc_bound, serve_http_bound},
@@ -43,6 +44,9 @@ struct Config {
     bindings_file: Option<String>,
     skew_seconds: u64,
     max_pause_seconds: u64,
+    /// GD-0061 R3-205: agent (task) listeners and their binding map.
+    #[serde(default)]
+    agent: Option<AgentConfig>,
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -67,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let bytes = bounded_file(&path)?;
     let c: Config = serde_json::from_slice(&bytes)?;
+    validate_agent(&c)?;
     if c.replication.is_some() {
         #[cfg(not(feature = "engine-rocksdb"))]
         return Err("replication requires the engine-rocksdb feature".into());
@@ -88,9 +93,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => serde_json::from_slice(&bounded_file(path)?)?,
         None => c.bindings.clone(),
     };
-    let service = Service::with_limits(
+    let agent_bindings = match &c.agent {
+        Some(agent) => agent.load_bindings()?,
+        None => Vec::new(),
+    };
+    let service = Service::with_agent(
         admin,
         bindings,
+        agent_bindings,
         Clock::new(c.skew_seconds, c.max_pause_seconds)?,
         c.service_limits,
     )?;
@@ -100,6 +110,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls::certs(&c.client_ca)?,
     )?;
     let certificate_reload = tls::ReloadableCertificate::install(&mut config);
+    // The agent listener has its own TLS config: the same server certificate,
+    // and the agent CA for client certificates.
+    let mut agent_tls = match &c.agent {
+        Some(agent) => Some(tls::server(
+            tls::certs(&c.certificate)?,
+            tls::key(&c.private_key)?,
+            tls::certs(agent.client_ca.as_deref().unwrap_or(&c.client_ca))?,
+        )?),
+        None => None,
+    };
+    let agent_certificate_reload = agent_tls.as_mut().map(tls::ReloadableCertificate::install);
     let postgresql_reload = postgresql.as_mut().and_then(|listener| {
         std::sync::Arc::get_mut(listener).and_then(|listener| {
             listener
@@ -112,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listeners,
         api,
         addresses,
-    } = start_listeners(&c, &service, &config, postgresql, false).await?;
+    } = start_listeners(&c, &service, &config, postgresql, agent_tls, false).await?;
     println!("{} preview=single-host", addresses.join(" "));
     io::stdout().flush()?;
     // Trusted local stdin only; bounded command reader, one reload at a time.
@@ -127,6 +148,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => {}
                 Err(error) => eprintln!("TLS reload rejected; prior certificate retained: {error}"),
             }
+            if let Some(resolver) = &agent_certificate_reload
+                && let Err(error) = resolver.reload(&c.certificate, &c.private_key)
+            {
+                eprintln!("agent TLS reload rejected; prior certificate retained: {error}");
+            }
             if let (Some(resolver), Some(pg)) = (&postgresql_reload, &c.postgresql) {
                 match resolver.reload(
                     pg.certificate.as_ref().unwrap(),
@@ -138,18 +164,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 }
             }
-            if let Some(path) = c.bindings_file.clone() {
+            let agent_file = c.agent.as_ref().and_then(|a| a.bindings_file.as_ref());
+            if c.bindings_file.is_some() || agent_file.is_some() {
+                // Both maps are read and swapped together; a map without a
+                // file keeps its inline bindings.
+                let (path, inline, agent) =
+                    (c.bindings_file.clone(), c.bindings.clone(), c.agent.clone());
                 let service = service.clone();
                 let result = tokio::task::spawn_blocking(
-                    move || -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-                        let bindings = serde_json::from_slice(&bounded_file(&path)?)?;
-                        Ok(service.reload_bindings(bindings)?)
+                    move || -> Result<(u64, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+                        let bindings = match path {
+                            Some(path) => serde_json::from_slice(&bounded_file(&path)?)?,
+                            None => inline,
+                        };
+                        let agent = match &agent {
+                            Some(agent) => agent.load_bindings()?,
+                            None => Vec::new(),
+                        };
+                        let (epoch, _) = service.reload_all_bindings(bindings, agent)?;
+                        Ok((epoch, service.stale_agent_bindings()))
                     },
                 )
                 .await?;
                 match result {
-                    Ok(epoch) => {
+                    Ok((epoch, stale)) => {
                         api.invalidate_bindings();
+                        for fingerprint in stale {
+                            eprintln!("agent_binding_stale fingerprint={fingerprint}");
+                        }
                         println!("bindings reloaded epoch={epoch}");
                     }
                     Err(_) => eprintln!("reload rejected; prior bindings retained"),
@@ -438,7 +480,7 @@ async fn setup_role(
                     Clock::new(c.skew_seconds, c.max_pause_seconds)?, c.service_limits)?;
                 leader.set_statement_gate(repl.statement_gate(engine))
                     .map_err(|_| "statement gate already set")?;
-                let started = start_listeners(c, &leader, config, postgresql.clone(), true).await?;
+                let started = start_listeners(c, &leader, config, postgresql.clone(), None, true).await?;
                 listeners = started.listeners;
                 api = Some(started.api);
                 addresses = started.addresses;
@@ -511,6 +553,7 @@ async fn start_listeners(
     service: &std::sync::Arc<Service>,
     config: &std::sync::Arc<rustls::ServerConfig>,
     postgresql: Option<std::sync::Arc<giggles_server::auth::PostgresListener>>,
+    agent_tls: Option<std::sync::Arc<rustls::ServerConfig>>,
     retry: bool,
 ) -> Result<StartedListeners, Box<dyn std::error::Error>> {
     // Bind every requested socket before any accept loop can process traffic.
@@ -528,6 +571,10 @@ async fn start_listeners(
     let grpc_socket = match c.grpc {
         Some(address) => Some(bind_listener(address, retry).await?),
         None => None,
+    };
+    let agent_pg_socket = match (c.agent.as_ref().and_then(|a| a.postgres), &agent_tls) {
+        (Some(address), Some(_)) => Some(bind_listener(address, retry).await?),
+        _ => None,
     };
     let api = ApiRuntime::new(service.clone(), c.api_limits)?;
     let (start, gate) = watch::channel(false);
@@ -583,6 +630,19 @@ async fn start_listeners(
             .await?;
             addresses.push(format!("grpc={}", grpc.address));
             listeners.push(grpc);
+        }
+        if let (Some(socket), Some(tls), Some(agent)) = (agent_pg_socket, agent_tls, &c.agent) {
+            let agent_pg = serve_agent_pg_bound(
+                socket,
+                service.clone(),
+                tls,
+                agent.connections,
+                agent.databases.clone(),
+                gate.clone(),
+            )
+            .await?;
+            addresses.push(format!("agent_postgres={}", agent_pg.address));
+            listeners.push(agent_pg);
         }
         Ok(())
     }
@@ -642,6 +702,22 @@ async fn stop_all(listeners: Vec<Running>, api: &ApiRuntime) -> io::Result<()> {
     }
 }
 
+/// The `agent` section on its own, plus what R3 does not serve yet.
+fn validate_agent(c: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(agent) = &c.agent else {
+        return Ok(());
+    };
+    agent.validate()?;
+    if c.replication.is_some() {
+        // D13: replicated databases refuse task statements in R3.
+        return Err("agent listeners are not available with replication".into());
+    }
+    if agent.http.is_some() || agent.grpc.is_some() {
+        return Err("agent http and grpc listeners are not available yet".into());
+    }
+    Ok(())
+}
+
 fn bounded_file(path: &str) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
@@ -678,6 +754,28 @@ mod tests {
         assert_eq!(config.listen.port(), 0);
         assert!(config.build().is_ok());
         json["postgresql"]["typo"] = true.into();
+        assert!(serde_json::from_value::<Config>(json).is_err());
+    }
+
+    #[test]
+    fn agent_section_is_optional_strict_and_validated() {
+        let mut json = serde_json::json!({
+            "database": "db", "native": "127.0.0.1:0", "postgres": "127.0.0.1:0",
+            "certificate": "server.pem", "private_key": "server.key", "client_ca": "ca.pem",
+            "bindings": [], "connections": 32, "skew_seconds": 0, "max_pause_seconds": 3600
+        });
+        let config = serde_json::from_value::<Config>(json.clone()).unwrap();
+        assert!(config.agent.is_none());
+        assert!(validate_agent(&config).is_ok());
+        json["agent"] = serde_json::json!({});
+        assert!(validate_agent(&serde_json::from_value::<Config>(json.clone()).unwrap()).is_err());
+        json["agent"] = serde_json::json!({"postgres": "127.0.0.1:0"});
+        let config = serde_json::from_value::<Config>(json.clone()).unwrap();
+        assert!(validate_agent(&config).is_ok());
+        assert_eq!(config.agent.unwrap().databases, ["giggles"]);
+        json["agent"]["http"] = "127.0.0.1:0".into();
+        assert!(validate_agent(&serde_json::from_value::<Config>(json.clone()).unwrap()).is_err());
+        json["agent"] = serde_json::json!({"postgres": "127.0.0.1:0", "typo": 1});
         assert!(serde_json::from_value::<Config>(json).is_err());
     }
 }

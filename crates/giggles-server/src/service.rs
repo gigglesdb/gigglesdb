@@ -461,6 +461,57 @@ impl Service {
     }
 }
 impl Service {
+    /// The agent accept loop's first check: the certificate is in the agent map.
+    pub(crate) fn agent_known(&self, fingerprint: &str) -> bool {
+        self.agent
+            .lock()
+            .is_ok_and(|current| current.entries.contains_key(fingerprint))
+    }
+    /// A CancelRequest on the agent listener: it reaches only a backend that the
+    /// same certificate opened under its current agent-map epoch.
+    pub(crate) fn cancel_agent(&self, fingerprint: &str, pid: u32, secret: u32) {
+        let Ok(current) = self.agent.lock() else {
+            return;
+        };
+        if let Some((_, epoch)) = current.entries.get(fingerprint) {
+            self.cancellations.cancel(fingerprint, *epoch, pid, secret);
+        }
+    }
+    /// The first 8 hex of each agent binding whose tasks all exist and are all
+    /// revoked or past outcome retention (design-2 section 3). A task that does
+    /// not exist yet keeps its binding live. Empty when the clock is unavailable.
+    pub fn stale_agent_bindings(&self) -> Vec<String> {
+        use giggles_core::task::context::TaskDefinitions;
+        let Ok(now) = crate::agent::wall_now(&self.clock) else {
+            return Vec::new();
+        };
+        let retention = i64::try_from(
+            self.outcome_retention_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .unwrap_or(i64::MAX);
+        let entries: Vec<_> = match self.agent.lock() {
+            Ok(current) => current
+                .entries
+                .iter()
+                .map(|(fp, (entry, _))| (fp.clone(), entry.tasks.clone()))
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        let sql = self.admin.sql_session();
+        entries
+            .into_iter()
+            .filter(|(_, tasks)| {
+                tasks.iter().all(|name| match sql.task_definition(name) {
+                    Ok(Some(def)) => {
+                        def.revoked || now.0 >= def.expires_at.0.saturating_add(retention)
+                    }
+                    _ => false,
+                })
+            })
+            .map(|(fp, _)| fp[..8].to_owned())
+            .collect()
+    }
     /// An agent (task) session for a certificate in the agent map. `task` names
     /// the task; with no name the binding must list exactly one. Every refusal is
     /// `Policy(Authentication)`, so the client cannot tell the reasons apart; an
