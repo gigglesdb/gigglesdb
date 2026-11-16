@@ -130,6 +130,15 @@ impl NativeOutcomes {
         }
         Ok(false)
     }
+    /// Any retained GDOU version 2 receipt (feature bit WIDE_ONCE_RECEIPTS).
+    pub(crate) fn contains_wide(&self) -> bool {
+        self.entries.values().any(|e| {
+            e.record
+                .result
+                .as_deref()
+                .is_some_and(crate::operations::once::outcome::is_wide)
+        })
+    }
     pub(super) fn contains_typed(&self) -> Result<bool, CoreError> {
         for e in self.entries.values() {
             if let Some(b) = &e.record.result

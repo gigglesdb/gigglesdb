@@ -153,7 +153,7 @@ fn real_legacy_directory_has_no_rocks_files() {
 fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
-        0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES
+        0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS
     );
     for (i, (bit, _)) in FEATURE_TABLE[..14].iter().enumerate() {
         assert_eq!(*bit, 1u64 << i);
@@ -162,6 +162,7 @@ fn feature_positions_and_validation() {
     assert_eq!(FEATURE_TABLE[16].0, REPLICATED);
     assert_eq!(FEATURE_TABLE[17].0, KEY_DEPENDENCY_IDENTITY);
     assert_eq!(FEATURE_TABLE[18], (RANGES, "ranges"));
+    assert_eq!(FEATURE_TABLE[19], (1 << 19, "wide_once_receipts"));
     assert_eq!(FEATURE_TABLE[10].0, TEXT_BACKED_COLUMN_TYPES);
     assert_eq!(
         FEATURE_TABLE[11].0,
@@ -180,7 +181,7 @@ fn feature_positions_and_validation() {
     );
     let kv = base();
     assert_eq!(validate_meta(&kv).unwrap().features, 0);
-    for i in 19..64 {
+    for i in 20..64 {
         put(&kv, b"features", &(1u64 << i).to_be_bytes());
         assert!(matches!(
             validate_meta(&kv),
@@ -303,9 +304,9 @@ fn features_share_caller_atomic_batch() {
 #[test]
 fn invalid_features_leave_batch_unchanged() {
     for (bits, expected) in [
-        (1 << 19, FormatError::Unsupported("feature bits".into())),
+        (1 << 20, FormatError::Unsupported("feature bits".into())),
         (
-            (1 << 19) | 0xC00,
+            (1 << 20) | 0xC00,
             FormatError::Unsupported("feature bits".into()),
         ),
         (256, corrupt("sequence counters require catalog_ext")),
@@ -429,6 +430,23 @@ fn old_binary_rejects_each_new_feature_and_their_combination() {
 }
 
 #[test]
+fn old_binary_rejects_wide_once_receipts_bit_and_bit_requires_native_outcomes() {
+    let kv = base();
+    let bits = NATIVE_OUTCOMES | WIDE_ONCE_RECEIPTS;
+    put(&kv, b"features", &bits.to_be_bytes());
+    assert_eq!(validate_meta(&kv).unwrap().features, bits);
+    let allowed = FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit);
+    check_features(bits).unwrap();
+    check_features_allowed(bits, allowed).unwrap();
+    // The binary before bit 19 refuses the database rather than misreading receipts.
+    assert_eq!(
+        check_features_allowed(bits, allowed & !WIDE_ONCE_RECEIPTS),
+        Err(FormatError::Unsupported("feature bits".into()))
+    );
+    assert!(matches!(check_features(WIDE_ONCE_RECEIPTS), Err(FormatError::Corrupt(_))));
+}
+
+#[test]
 fn old_binary_guard_rejects_schema_type_bit_before_catalog_decode() {
     let kv = base();
     put(&kv, b"features", &SCHEMAS_AND_USER_TYPES.to_be_bytes());
@@ -476,7 +494,7 @@ fn replicated_creation_is_v2() {
 fn key_dependency_feature_requires_catalog_ext_and_is_monotone() {
     assert!(check_features(64 | KEY_DEPENDENCY_IDENTITY).is_ok());
     assert!(matches!(check_features(KEY_DEPENDENCY_IDENTITY), Err(FormatError::Corrupt(_))));
-    for unknown in [1 << 19, 1 << 40] {
+    for unknown in [1 << 20, 1 << 40] {
         assert!(matches!(check_features(unknown | KEY_DEPENDENCY_IDENTITY), Err(FormatError::Unsupported(_))));
     }
     let kv = base();
@@ -630,7 +648,7 @@ fn validate_meta_checks_range_local_values() {
         ),
         (
             raw_range_key(2, b"features"),
-            (1u64 << 19).to_be_bytes().to_vec(),
+            (1u64 << 20).to_be_bytes().to_vec(),
             FormatError::Unsupported("feature bits".into()),
         ),
         (raw_range_key(2, b"future"), Vec::new(), unknown()),

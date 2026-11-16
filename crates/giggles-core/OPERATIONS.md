@@ -722,7 +722,8 @@ literals of bool, integer, text, uuid, bytes or numeric keys),
 `StreamingFilter` (rows stream through the filter and only matching rows are
 retained) or `StreamingCompleteTableMaterialization` (no filter). V2 inserts and
 upserts read only the existing rows that share a proposed primary key. Filter/order evaluation still materializes complete input in memory;
-byte budgets and once receipt limits remain; V2 mutations use the same input. Limits also report the Admin admission/selected-key
+byte budgets and the 2 MiB once receipt remain (V2 once counts past 1,024 use
+GDOU version 2 and feature bit 19, `wide_once_receipts`); V2 mutations use the same input. Limits also report the Admin admission/selected-key
 configuration and engine byte/expression/binding ceilings.
 
 Explain itself borrows committed catalog metadata and does not call `run`,

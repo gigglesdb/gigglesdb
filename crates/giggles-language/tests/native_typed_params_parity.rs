@@ -146,7 +146,8 @@ fn typed_parameters_are_opt_in() {
         let old = Engine::with_version(admin.clone(), LanguageVersion::Embedded018);
         assert!(matches!(with_sql_parser_forbidden(|| old.execute_text("insert into t(id,v) values(1,$v)", &Bindings::from([("v".into(), date)]))), Err(Error::Unsupported)));
         let engine = Engine::with_version(admin.clone(), VERSION);
-        assert!(matches!(with_sql_parser_forbidden(|| engine.execute_text("t where id=$v", &Bindings::from([("v".into(), Value::Numeric(Numeric::parse("1").unwrap()))]))), Err(Error::Unsupported)));
+        // R2-NOCAP-5 admits Numeric comparison operands; against an integer column core binding says Type.
+        assert!(matches!(with_sql_parser_forbidden(|| engine.execute_text("t where id=$v", &Bindings::from([("v".into(), Value::Numeric(Numeric::parse("1").unwrap()))]))), Err(Error::Type)));
         assert_eq!(snapshot(&mut admin.sql_session()), before);
     }
 }

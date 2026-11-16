@@ -969,6 +969,15 @@ fn unify_type(left: Option<Ty>, right: Option<Ty>) -> Result<Option<Ty>> {
     }
     Ok(left.or(right))
 }
+fn numeric_literal(bound: &mut Bound, ty: &mut Option<Ty>, other: Option<Ty>) {
+    if other == Some(Ty::Numeric)
+        && let Bound::Value(Value::Int(n)) = bound
+        && let Ok(numeric) = crate::relational::Numeric::parse(&n.to_string())
+    {
+        *bound = Bound::Value(Value::Numeric(numeric));
+        *ty = Some(Ty::Numeric);
+    }
+}
 fn ty(v: &Value) -> Option<Ty> {
     match v {
         Value::Null => None,
@@ -1296,8 +1305,12 @@ impl Binder<'_> {
                 )
             }
             Expr::Compare(a, op, b) => {
-                let (a, ta) = self.expr(a, d + 1)?;
-                let (b, tb) = self.expr(b, d + 1)?;
+                let (mut a, mut ta) = self.expr(a, d + 1)?;
+                let (mut b, mut tb) = self.expr(b, d + 1)?;
+                // As in SQL, an integer literal compared with a numeric operand
+                // is resolved as numeric (`k = 1` on a NUMERIC column).
+                numeric_literal(&mut a, &mut ta, tb);
+                numeric_literal(&mut b, &mut tb, ta);
                 if ta == Some(Ty::Bpchar) || tb == Some(Ty::Bpchar) {
                     return Err(Error::Unsupported);
                 }

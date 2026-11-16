@@ -126,7 +126,7 @@ pub(crate) fn validate_once(envelope: &OnceEnvelope, version: LanguageVersion) -
     selected_version(envelope.language_version, version)?;
     match &envelope.body {
         OnceBody::Statement(statement) => {
-            execute::validate_depth(statement)?;
+            execute::validate_depth(statement, version)?;
             execute::validate_version(statement, version)?;
             // validate_depth has already admitted the finite wrapper shape.
             let statement = if let Statement::Returning { statement, .. } = statement {

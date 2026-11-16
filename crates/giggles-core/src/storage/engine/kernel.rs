@@ -207,12 +207,14 @@ impl Kernel {
     ) -> Result<usize, CoreError> {
         let txn = access.guarded_transaction()?;
         let before = before.map(records).transpose()?.unwrap_or_default();
+        let wide = after.0.native_outcomes.as_ref().is_some_and(|n| n.contains_wide());
         let after = records(after)?;
         if after.contains_key(&vec![7]) {
             let metadata: storage::Metadata = storage::decode(&after[&vec![0]])?;
             let (family, _, _, temporal, _) = storage::envelope_family(metadata.format)?;
             txn.require_features(super::meta::NATIVE_OUTCOMES
-                | u64::from(family.typed_scalars) | (u64::from(temporal) << 4));
+                | u64::from(family.typed_scalars) | (u64::from(temporal) << 4)
+                | if wide { super::meta::WIDE_ONCE_RECEIPTS } else { 0 });
             txn.require_subversion(super::meta::NATIVE_SUBVERSION);
         }
         let mut count = 0;

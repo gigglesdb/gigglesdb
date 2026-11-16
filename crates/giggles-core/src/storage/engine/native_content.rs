@@ -81,6 +81,9 @@ impl NativeContent {
             storage::envelope_family(metadata.format).map_err(corrupt)?;
         let typed = ledger.contains_typed().map_err(corrupt)?;
         let timed = ledger.contains_temporal().map_err(corrupt)?;
+        if ledger.contains_wide() && features & meta::WIDE_ONCE_RECEIPTS == 0 {
+            return Err(corrupt("wide once receipt without its feature bit"));
+        }
         if !family.native_outcomes
             || (typed && !family.typed_scalars)
             || (timed && !temporal)

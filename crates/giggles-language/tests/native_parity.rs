@@ -1166,21 +1166,44 @@ fn v2_inserts_upserts_and_typed_keys_read_only_their_keys() {
             assert_eq!(dump(&left, table), dump(&right, table), "{native}: {table}");
         }
     }
-    // The language admits Numeric values only in assignments (a numeric filter is
-    // Type or Unsupported); the core API takes a numeric key literal.
-    use giggles_core::operations::{Compare, Expr, Intent, Request, ValueExpr};
-    let half = || Expr::Compare(Box::new(Expr::Field("k".into())), Compare::Eq,
-        Box::new(Expr::Value(ValueExpr::Literal(Value::Numeric(Numeric::parse("12.50").unwrap())))));
-    let core = giggles_core::operations::Engine::new(left.clone());
-    let before = native_input_rows();
-    let update = Request::Update { table: "nk".into(), filter: half(), guard: None,
-        values: vec![("n".into(), ValueExpr::Literal(Value::Int(1)))], intent: Intent::One };
-    assert_eq!(core.execute(&update, &Bindings::new()).unwrap().affected, 1);
-    assert_eq!(native_input_rows().0 - before.0, 1);
-    assert_eq!(right.sql_session().execute("update nk set n=1 where k=12.5", &[], None).unwrap().affected, 1);
-    assert_eq!(dump(&left, "nk"), dump(&right, "nk"));
-    let read = Request::Read { table: "nk".into(), filter: Some(half()), order: vec![], limit: None, projection: vec![] };
-    assert_eq!(core.explain_read(&read, &Bindings::new()).unwrap().stages[0], Stage::PrimaryKeyLookup);
+    // Numeric and uuid keys from text (R2-NOCAP-5): a decimal literal, an
+    // integer literal (numeric, as in SQL), a Numeric binding and a uuid literal
+    // each take the key lookup (one row decoded) and match SQL.
+    let numeric = Bindings::from_iter([("k".to_string(), Value::Numeric(Numeric::parse("13.50").unwrap()))]);
+    for (native, statement, bindings) in [
+        ("update nk where k=12.50 set n=1", "update nk set n=1 where k=12.50", Bindings::new()),
+        ("update nk where k=7 set n=2", "update nk set n=2 where k=7", Bindings::new()),
+        ("update nk where k=$k set n=3", "update nk set n=3 where k=13.5", numeric.clone()),
+        ("update uk where k=\"00000000-0000-0000-0000-00000000000B\" set n=2",
+            "update uk set n=2 where k='00000000-0000-0000-0000-00000000000b'", Bindings::new()),
+    ] {
+        let before = native_input_rows();
+        let result = with_sql_parser_forbidden(|| engine.execute_text(native, &bindings))
+            .unwrap_or_else(|error| panic!("{native}: {error:?}"));
+        assert_eq!(native_input_rows().0 - before.0, 1, "{native}");
+        let expected = right.sql_session().execute(statement, &[], None).unwrap();
+        assert_eq!((result.affected, expected.affected), (1, 1), "{native}");
+        for table in ["nk", "uk"] {
+            assert_eq!(dump(&left, table), dump(&right, table), "{native}: {table}");
+        }
+    }
+    for (native, statement) in [
+        ("nk where k=12.5", "select * from nk where k=12.5"),
+        ("nk where k>=1998.5 or k=-1.5 order by k", "select * from nk where k>=1998.5 or k=-1.5 order by k"),
+        ("nk where n=1 or k<1 order by k", "select * from nk where n=1 or k<1 order by k"),
+    ] {
+        let result = with_sql_parser_forbidden(|| engine.execute_text(native, &Bindings::new()))
+            .unwrap_or_else(|error| panic!("{native}: {error:?}"));
+        let expected = right.sql_session().execute(statement, &[], None).unwrap();
+        assert_eq!(values(result.rows), values(expected.rows), "{native}");
+    }
+    for text in ["explain nk where k=12.50", "explain nk where k=7", "explain nk where k=$k"] {
+        let bindings = if text.contains("$k") { numeric.clone() } else { Bindings::new() };
+        assert_eq!(engine.explain_text(text, &bindings).unwrap().stages[0], Stage::PrimaryKeyLookup, "{text}");
+    }
+    // Spaced `1 . 5` is not a literal; a numeric operand against bigint stays Type.
+    assert!(engine.execute_text("nk where k=1 . 5", &Bindings::new()).is_err());
+    assert_eq!(engine.execute_text("items where n=$k", &numeric), Err(Error::Type));
     // Existing keys are found by lookup: 23505 as in SQL, nothing staged.
     for (native, statement, decoded) in [
         ("insert items set id=5,n=0,u=5", "insert into items values(5,0,5)", 0),

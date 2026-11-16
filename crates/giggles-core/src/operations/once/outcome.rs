@@ -1,7 +1,11 @@
-//! Independent durable result format: `GDOU`, version 1, explicit numeric tags.
+//! Independent durable result format: `GDOU`, version 1 or 2, explicit numeric tags.
 //!
-//! Integers are big endian. Counts/indices are u16 except columns, summaries,
-//! emissions and step indices (u8). Text/byte payload lengths are u32; names
+//! Integers are big endian. Counts/indices are u16 in version 1 and u32 in
+//! version 2 (whose NO_ROW sentinel is u32::MAX), except columns, summaries,
+//! emissions and step indices (u8). Version 1 is written whenever every count
+//! fits its 1024-row rules; version 2 only for a V2-engine result that does
+//! not, and a version 2 record whose counts all fit version 1 is rejected.
+//! Text/byte payload lengths are u32; names
 //! have a u8 byte length. Row arity comes from its enclosing column list.
 //! The header is followed by the accepting catalog epoch (u64), output schema
 //! (operation tag 0 / transaction tag 1), then result tag 0 / 1 / terminal 2.
@@ -25,7 +29,7 @@ use crate::{
 
 const MAGIC: &[u8; 4] = b"GDOU";
 const VERSION: u8 = 1;
-const NO_ROW: u16 = u16::MAX;
+const WIDE_VERSION: u8 = 2;
 type BusinessResult = std::result::Result<OnceOutcome, Error>;
 type Checked<T> = std::result::Result<T, Fault>;
 
@@ -52,19 +56,46 @@ fn corrupt(_: Fault) -> CoreError {
 }
 
 /// Admit the entire borrowed result before reserving the encoded buffer.
+/// Version 1 only: the legacy engine keeps its 1024-row receipts.
 pub(crate) fn encode(
     description: &OnceDescription,
     result: &BusinessResult,
 ) -> OnceResult<Vec<u8>> {
-    let mut counter = Writer::new(Counter { len: 0 });
+    encode_version(description, result, false)
+}
+
+/// V2 engine: version 1 whenever it admits the result (byte-identical to
+/// [`encode`]), otherwise version 2 with u32 counts and no row-count cap.
+pub(crate) fn encode_wide(
+    description: &OnceDescription,
+    result: &BusinessResult,
+) -> OnceResult<Vec<u8>> {
+    match encode_version(description, result, false) {
+        Err(OnceError::InvalidOutcome) => encode_version(description, result, true),
+        other => other,
+    }
+}
+
+fn encode_version(
+    description: &OnceDescription,
+    result: &BusinessResult,
+    wide: bool,
+) -> OnceResult<Vec<u8>> {
+    let mut counter = Writer::new(Counter { len: 0 }, wide);
     counter.result(description, result).map_err(encode_error)?;
+    invalid(!wide || counter.widest > MAX_ROWS).map_err(encode_error)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(counter.sink.len)
         .map_err(|_| OnceError::RetentionUnavailable)?;
-    let mut writer = Writer::new(Buffer { bytes });
+    let mut writer = Writer::new(Buffer { bytes }, wide);
     writer.result(description, result).map_err(encode_error)?;
     Ok(writer.sink.bytes)
+}
+
+/// True for a version 2 (u32 count) record; callers validate it separately.
+pub(crate) fn is_wide(bytes: &[u8]) -> bool {
+    bytes.get(..5).is_some_and(|h| h[..4] == *MAGIC && h[4] == WIDE_VERSION)
 }
 
 /// Validate without constructing strings, vectors, rows or public result DTOs.
@@ -93,9 +124,9 @@ struct Counts {
     changed: usize,
 }
 impl Counts {
-    fn check(self) -> Checked<()> {
+    fn check(self, wide: bool) -> Checked<()> {
         invalid(
-            self.matched <= MAX_ROWS
+            (wide || self.matched <= MAX_ROWS)
                 && self.changed <= self.affected
                 && self.affected <= self.matched,
         )
@@ -295,21 +326,53 @@ fn charge(remaining: &mut usize, bytes: usize) -> Checked<()> {
     Ok(())
 }
 
+// Returned-row indices are below affected <= matched == tuple count. Version 1
+// keeps a fixed stack bitset; only a version 2 count above it allocates one.
+enum Seen {
+    Fixed([u64; MAX_ROWS / 64]),
+    Wide(Vec<u64>),
+}
+impl Seen {
+    fn new(count: usize) -> Checked<Self> {
+        if count <= MAX_ROWS {
+            return Ok(Self::Fixed([0; MAX_ROWS / 64]));
+        }
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(count.div_ceil(64))
+            .map_err(|_| Fault::Bound)?;
+        words.resize(count.div_ceil(64), 0);
+        Ok(Self::Wide(words))
+    }
+    /// Mark `row`; false when it was already marked or is out of range.
+    fn mark(&mut self, row: usize) -> bool {
+        let words = match self {
+            Self::Fixed(words) => words.as_mut_slice(),
+            Self::Wide(words) => words.as_mut_slice(),
+        };
+        words.get_mut(row / 64).is_some_and(|word| {
+            let bit = 1u64 << (row % 64);
+            let fresh = *word & bit == 0;
+            *word |= bit;
+            fresh
+        })
+    }
+}
 struct ConflictCheck {
     counts: Counts,
     row_count: Option<usize>,
-    seen: [bool; MAX_ROWS],
+    seen: Seen,
     affected: usize,
     changed: usize,
     returned: usize,
 }
 impl ConflictCheck {
-    fn new(counts: Counts, count: usize, row_count: Option<usize>) -> Checked<Self> {
-        invalid(count <= MAX_ROWS && count == counts.matched)?;
+    fn new(counts: Counts, count: usize, row_count: Option<usize>, wide: bool) -> Checked<Self> {
+        invalid((wide || count <= MAX_ROWS) && count == counts.matched)?;
         Ok(Self {
             counts,
             row_count,
-            seen: [false; MAX_ROWS],
+            seen: Seen::new(count)?,
             affected: 0,
             changed: 0,
             returned: 0,
@@ -323,8 +386,7 @@ impl ConflictCheck {
                 self.affected += 1;
                 self.changed += usize::from(value.changed);
                 if let Some(row) = value.returned_row {
-                    invalid(row < self.counts.affected && row < MAX_ROWS && !self.seen[row])?;
-                    self.seen[row] = true;
+                    invalid(row < self.counts.affected && self.seen.mark(row))?;
                     self.returned += 1;
                 }
             }
@@ -379,20 +441,39 @@ impl Sink for Buffer {
 struct Writer<S> {
     sink: S,
     remaining_values: usize,
+    wide: bool,
+    widest: usize,
 }
 impl<S: Sink> Writer<S> {
-    fn new(sink: S) -> Self {
+    fn new(sink: S, wide: bool) -> Self {
         Self {
             sink,
             remaining_values: MAX_RESULT_BYTES,
+            wide,
+            widest: 0,
         }
     }
     fn u8(&mut self, n: u8) -> Checked<()> {
         self.sink.write(&[n])
     }
-    fn u16(&mut self, n: usize) -> Checked<()> {
-        self.sink
-            .write(&u16::try_from(n).map_err(|_| Fault::Invalid)?.to_be_bytes())
+    /// A count or index: u16 in version 1, u32 in version 2.
+    fn count(&mut self, n: usize) -> Checked<()> {
+        self.widest = self.widest.max(n);
+        if self.wide {
+            self.sink
+                .write(&u32::try_from(n).map_err(|_| Fault::Invalid)?.to_be_bytes())
+        } else {
+            self.sink
+                .write(&u16::try_from(n).map_err(|_| Fault::Invalid)?.to_be_bytes())
+        }
+    }
+    /// The version's NO_ROW sentinel; it is not a count, so `widest` skips it.
+    fn no_row(&mut self) -> Checked<()> {
+        if self.wide {
+            self.sink.write(&u32::MAX.to_be_bytes())
+        } else {
+            self.sink.write(&u16::MAX.to_be_bytes())
+        }
     }
     fn u32(&mut self, n: usize) -> Checked<()> {
         self.sink
@@ -410,10 +491,10 @@ impl<S: Sink> Writer<S> {
         self.sink.write(name.as_bytes())
     }
     fn counts(&mut self, counts: Counts, complete: bool) -> Checked<()> {
-        counts.check()?;
-        self.u16(counts.matched)?;
-        self.u16(counts.affected)?;
-        self.u16(counts.changed)?;
+        counts.check(self.wide)?;
+        self.count(counts.matched)?;
+        self.count(counts.affected)?;
+        self.count(counts.changed)?;
         self.boolean(complete)
     }
     fn columns(&mut self, columns: &[ColumnDef], allow_empty: bool) -> Checked<()> {
@@ -572,18 +653,21 @@ impl<S: Sink> Writer<S> {
         let Some(results) = results else {
             return self.u8(0);
         };
-        let mut check = ConflictCheck::new(counts, results.len(), rows)?;
+        let mut check = ConflictCheck::new(counts, results.len(), rows, self.wide)?;
         self.u8(1)?;
-        self.u16(results.len())?;
+        self.count(results.len())?;
         for (index, result) in results.iter().enumerate() {
             check.tuple(index, result)?;
-            self.u16(result.input_index)?;
+            self.count(result.input_index)?;
             self.u8(match result.status {
                 ConflictStatus::Success => 0,
                 ConflictStatus::Skipped => 1,
             })?;
             self.boolean(result.changed)?;
-            self.u16(result.returned_row.unwrap_or(usize::from(NO_ROW)))?;
+            match result.returned_row {
+                Some(row) => self.count(row)?,
+                None => self.no_row()?,
+            }
         }
         check.finish()
     }
@@ -593,7 +677,7 @@ impl<S: Sink> Writer<S> {
             affected: out.affected,
             changed: out.changed,
         };
-        invalid(out.rows.len() <= MAX_ROWS && out.rows.len() <= out.matched)?;
+        invalid((self.wide || out.rows.len() <= MAX_ROWS) && out.rows.len() <= out.matched)?;
         check_names(out.columns.len(), out.columns.iter().map(String::as_str))?;
         invalid(out.columns.len() == columns.len())?;
         invalid(
@@ -607,7 +691,7 @@ impl<S: Sink> Writer<S> {
         for name in &out.columns {
             self.name(name)?;
         }
-        self.u16(out.rows.len())?;
+        self.count(out.rows.len())?;
         for row in &out.rows {
             self.row(row, out.columns.len(), Some(columns))?;
         }
@@ -680,10 +764,10 @@ impl<S: Sink> Writer<S> {
                     EmitDescription::Rows { columns: expected },
                 ) => {
                     invalid(columns == expected)?;
-                    invalid(rows.len() <= MAX_ROWS)?;
+                    invalid(self.wide || rows.len() <= MAX_ROWS)?;
                     self.u8(2)?;
                     self.columns(columns, false)?;
-                    self.u16(rows.len())?;
+                    self.count(rows.len())?;
                     self.boolean(*complete)?;
                     for row in rows {
                         self.row(row, columns.len(), Some(columns))?;
@@ -696,7 +780,7 @@ impl<S: Sink> Writer<S> {
     }
     fn result(&mut self, description: &OnceDescription, result: &BusinessResult) -> Checked<()> {
         self.sink.write(MAGIC)?;
-        self.u8(VERSION)?;
+        self.u8(if self.wide { WIDE_VERSION } else { VERSION })?;
         self.description(description)?;
         match result {
             Ok(OnceOutcome::Operation(out)) => {
@@ -777,6 +861,8 @@ struct Reader<'a> {
     bytes: &'a [u8],
     offset: usize,
     remaining_values: usize,
+    wide: bool,
+    widest: usize,
     build: bool,
     typed: bool,
     temporal: bool,
@@ -820,6 +906,8 @@ impl<'a> Reader<'a> {
             bytes,
             offset: 0,
             remaining_values: MAX_RESULT_BYTES,
+            wide: false,
+            widest: 0,
             typed: false,
             temporal: false,
             build,
@@ -840,10 +928,24 @@ impl<'a> Reader<'a> {
     fn u8(&mut self) -> Checked<u8> {
         Ok(self.take(1)?[0])
     }
-    fn u16(&mut self) -> Checked<usize> {
-        Ok(usize::from(u16::from_be_bytes(
-            self.take(2)?.try_into().map_err(|_| Fault::Invalid)?,
-        )))
+    /// A count or index (u16 in version 1, u32 in version 2), or None for
+    /// the version's NO_ROW sentinel when `sentinel` allows one.
+    fn count_or_none(&mut self, sentinel: bool) -> Checked<Option<usize>> {
+        let (n, no_row) = if self.wide {
+            let n = u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| Fault::Invalid)?);
+            (usize::try_from(n).map_err(|_| Fault::Bound)?, n == u32::MAX)
+        } else {
+            let n = u16::from_be_bytes(self.take(2)?.try_into().map_err(|_| Fault::Invalid)?);
+            (usize::from(n), n == u16::MAX)
+        };
+        if sentinel && no_row {
+            return Ok(None);
+        }
+        self.widest = self.widest.max(n);
+        Ok(Some(n))
+    }
+    fn count(&mut self) -> Checked<usize> {
+        self.count_or_none(false)?.ok_or(Fault::Invalid)
     }
     fn u32(&mut self) -> Checked<usize> {
         usize::try_from(u32::from_be_bytes(
@@ -871,11 +973,11 @@ impl<'a> Reader<'a> {
     }
     fn counts(&mut self) -> Checked<(Counts, bool)> {
         let counts = Counts {
-            matched: self.u16()?,
-            affected: self.u16()?,
-            changed: self.u16()?,
+            matched: self.count()?,
+            affected: self.count()?,
+            changed: self.count()?,
         };
-        counts.check()?;
+        counts.check(self.wide)?;
         Ok((counts, self.boolean()?))
     }
     fn columns(&mut self, allow_empty: bool) -> Checked<Columns<'a>> {
@@ -1088,27 +1190,26 @@ impl<'a> Reader<'a> {
         match self.u8()? {
             0 => Ok(None),
             1 => {
-                let len = self.u16()?;
-                let mut check = ConflictCheck::new(counts, len, rows)?;
+                let len = self.count()?;
+                // Bound the version 2 bitset by the tuples actually present.
+                let tuple = if self.wide { 10 } else { 6 };
+                invalid(len.saturating_mul(tuple) <= self.bytes.len() - self.offset)?;
+                let mut check = ConflictCheck::new(counts, len, rows, self.wide)?;
                 let mut out = vector(self.build, len)?;
                 for index in 0..len {
-                    let input_index = self.u16()?;
+                    let input_index = self.count()?;
                     let status = match self.u8()? {
                         0 => ConflictStatus::Success,
                         1 => ConflictStatus::Skipped,
                         _ => return Err(Fault::Invalid),
                     };
                     let changed = self.boolean()?;
-                    let row = self.u16()?;
+                    let returned_row = self.count_or_none(true)?;
                     let result = ConflictTupleOutcome {
                         input_index,
                         status,
                         changed,
-                        returned_row: if row == usize::from(NO_ROW) {
-                            None
-                        } else {
-                            Some(row)
-                        },
+                        returned_row,
                     };
                     check.tuple(index, &result)?;
                     if let Some(out) = &mut out {
@@ -1138,8 +1239,8 @@ impl<'a> Reader<'a> {
                 columns.push(owned_text(name)?);
             }
         }
-        let row_count = self.u16()?;
-        invalid(row_count <= MAX_ROWS && row_count <= counts.matched)?;
+        let row_count = self.count()?;
+        invalid((self.wide || row_count <= MAX_ROWS) && row_count <= counts.matched)?;
         let mut rows = vector(self.build, row_count)?;
         for _ in 0..row_count {
             let row = self.row(len, Some(&expected))?;
@@ -1219,8 +1320,8 @@ impl<'a> Reader<'a> {
                 (2, EmitShape::Rows(expected_columns)) => {
                     let columns = self.columns(false)?;
                     invalid(columns == expected_columns)?;
-                    let len = self.u16()?;
-                    invalid(len <= MAX_ROWS)?;
+                    let len = self.count()?;
+                    invalid(self.wide || len <= MAX_ROWS)?;
                     let complete = self.boolean()?;
                     let mut rows = vector(self.build, len)?;
                     for _ in 0..len {
@@ -1258,7 +1359,12 @@ impl<'a> Reader<'a> {
         if self.bytes.len() > MAX_ONCE_RESULT_BYTES {
             return Err(Fault::Bound);
         }
-        invalid(self.take(4)? == MAGIC && self.u8()? == VERSION)?;
+        invalid(self.take(4)? == MAGIC)?;
+        self.wide = match self.u8()? {
+            VERSION => false,
+            WIDE_VERSION => true,
+            _ => return Err(Fault::Invalid),
+        };
         let (schema, description) = self.description()?;
         let result = match self.u8()? {
             0 => self.operation(&schema)?.map(Ok),
@@ -1277,6 +1383,8 @@ impl<'a> Reader<'a> {
             _ => return Err(Fault::Invalid),
         };
         invalid(self.offset == self.bytes.len())?;
+        // Canonical: version 2 only when some count does not fit version 1.
+        invalid(!self.wide || self.widest > MAX_ROWS)?;
         Ok(if self.build {
             Some((
                 description.ok_or(Fault::Invalid)?,
@@ -2279,5 +2387,113 @@ mod tests {
         bad(&malformed);
         let zeros = transaction(vec![EmittedValue::Scalar(Value::Null); 64]);
         roundtrip(&zeros);
+    }
+
+    fn update(count: usize) -> BusinessResult {
+        operation(Outcome { matched: count, affected: count, changed: count, ..Outcome::default() })
+    }
+    // Every odd tuple is skipped; with RETURN each success returns its own row.
+    fn upsert(count: usize, returning: bool) -> BusinessResult {
+        let affected = count.div_ceil(2);
+        let conflicts = (0..count)
+            .map(|i| ConflictTupleOutcome {
+                input_index: i,
+                status: if i % 2 == 0 { ConflictStatus::Success } else { ConflictStatus::Skipped },
+                changed: i % 2 == 0,
+                returned_row: (returning && i % 2 == 0).then_some(i / 2),
+            })
+            .collect();
+        let row = SqlRow { version: 1, values: vec![Value::Int(7)] };
+        operation(Outcome {
+            columns: if returning { vec!["n".into()] } else { vec![] },
+            rows: if returning { vec![row; affected] } else { vec![] },
+            matched: count,
+            affected,
+            changed: affected,
+            complete: true,
+            conflict_results: Some(conflicts),
+        })
+    }
+    fn wide(result: &BusinessResult) -> Vec<u8> {
+        super::encode_wide(&fixture_description(result), result).unwrap()
+    }
+
+    #[test]
+    fn version_one_is_kept_whenever_counts_fit_it() {
+        let summary = |matched| StepSummary {
+            item_index: 0,
+            matched,
+            affected: matched,
+            changed: 0,
+            complete: true,
+            conflict_results: None,
+        };
+        let rows = |n| EmittedValue::Rows {
+            columns: vec![column("n", DataType::BigInt, false)],
+            rows: vec![SqlRow { version: 0, values: vec![Value::Int(1)] }; n],
+            complete: true,
+        };
+        for result in [
+            operation(Outcome::default()),
+            update(1024),
+            upsert(1024, true),
+            upsert(1024, false),
+            dense_result(0),
+            Err(Error::NotFound),
+            transaction(vec![rows(1024)]),
+            Ok(OnceOutcome::Transaction(TransactionOutcome {
+                summaries: vec![summary(1024)],
+                emitted: vec![],
+            })),
+        ] {
+            let narrow = roundtrip(&result);
+            assert_eq!(wide(&result), narrow);
+            assert!(narrow[4] == 1 && !is_wide(&narrow));
+        }
+        // The legacy encoder keeps the 1,024-row cap; V2 widens only past it.
+        for result in [
+            update(5000),
+            upsert(5000, true),
+            upsert(2049, false),
+            transaction(vec![rows(1500)]),
+            Ok(OnceOutcome::Transaction(TransactionOutcome {
+                summaries: vec![summary(70_000)],
+                emitted: vec![],
+            })),
+        ] {
+            assert_eq!(encode(&result), Err(OnceError::InvalidOutcome));
+            let bytes = wide(&result);
+            assert!(is_wide(&bytes));
+            validate(&bytes).unwrap();
+            assert_eq!(decode(&bytes).unwrap(), (fixture_description(&result), result.clone()));
+        }
+        // Golden: u32 counts after version byte 2.
+        let mut expected = golden_prefix(&[0, 0]);
+        expected[4] = 2;
+        expected.extend([0, 0, 0, 0x13, 0x88, 0, 0, 0x13, 0x88, 0, 0, 0x13, 0x88, 1, 0]);
+        expected.extend([0, 0, 0, 0, 0]);
+        assert_eq!(wide(&update(5000)), expected);
+        // A skipped tuple's NO_ROW is u32::MAX in version 2.
+        let bytes = wide(&upsert(2049, false));
+        assert_eq!(bytes[bytes.len() - 4..], [255; 4]);
+        // Non-canonical: version 2 whose counts all fit version 1.
+        for result in [update(1024), upsert(3, true)] {
+            let mut writer = Writer::new(Buffer { bytes: Vec::with_capacity(MAX_ONCE_RESULT_BYTES) }, true);
+            writer.result(&fixture_description(&result), &result).unwrap();
+            assert_eq!(writer.sink.bytes[4], 2);
+            bad(&writer.sink.bytes);
+        }
+        // Truncation and duplicate returned rows fail before materialisation.
+        let bytes = wide(&upsert(5000, true));
+        for cut in [5, 30, bytes.len() / 2, bytes.len() - 1] {
+            bad(&bytes[..cut]);
+        }
+        // Tuple 4998 (10 bytes, second to last) returns row 2499; make it row 0.
+        let mut duplicate = bytes.clone();
+        let row = duplicate.len() - 14;
+        assert_eq!(duplicate[row..row + 4], 2499u32.to_be_bytes());
+        duplicate[row..row + 4].copy_from_slice(&0u32.to_be_bytes());
+        bad(&duplicate);
+        bad(&[b"GDOU\x03".as_slice(), &bytes[5..]].concat());
     }
 }

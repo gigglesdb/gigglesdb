@@ -316,7 +316,13 @@ impl Engine {
         crate::cancellation::check().map_err(core)?;
         // Admission includes all encoded descriptors and zero-payload cells.
         // Everything above is speculative until data and receipt commit together.
-        let encoded = outcome::encode(&description, &result)?;
+        // Only the V2 engine admits version 2 (u32 count) receipts; the
+        // publication sets the wide_once_receipts feature bit with the record.
+        let encoded = if setup.is_some() {
+            outcome::encode_wide(&description, &result)?
+        } else {
+            outcome::encode(&description, &result)?
+        };
         let (record, replayed) = session
             .publish_native_once_engine(
                 setup,

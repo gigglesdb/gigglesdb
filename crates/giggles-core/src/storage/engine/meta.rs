@@ -23,7 +23,9 @@ pub(crate) const REPLICATED: u64 = 1 << 16;
 pub(crate) const KEY_DEPENDENCY_IDENTITY: u64 = 1 << 17;
 /// Range-local Meta keys (`range/<id BE8>/<sub>`); requires REPLICATED.
 pub(crate) const RANGES: u64 = 1 << 18;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 19] = [
+/// The native once ledger holds a GDOU version 2 (u32 count) receipt.
+pub(crate) const WIDE_ONCE_RECEIPTS: u64 = 1 << 19;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 20] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -43,6 +45,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 19] = [
     (REPLICATED, "replicated"),
     (KEY_DEPENDENCY_IDENTITY, "key_dependency_identity"),
     (RANGES, "ranges"),
+    (WIDE_ONCE_RECEIPTS, "wide_once_receipts"),
 ];
 #[path = "meta_range.rs"]
 mod range_local;
@@ -320,7 +323,13 @@ pub(crate) fn check_subversion(version: u32, supported: u32) -> Result<(), Forma
 pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
     check_features_allowed(
         bits,
-        0x3FFF | SQL_VIEWS | RELATION_COMMENTS | REPLICATED | KEY_DEPENDENCY_IDENTITY | RANGES,
+        0x3FFF
+            | SQL_VIEWS
+            | RELATION_COMMENTS
+            | REPLICATED
+            | KEY_DEPENDENCY_IDENTITY
+            | RANGES
+            | WIDE_ONCE_RECEIPTS,
     )
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
@@ -338,6 +347,9 @@ fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     }
     if bits & 256 != 0 && bits & 64 == 0 {
         return Err(corrupt("sequence counters require catalog_ext"));
+    }
+    if bits & WIDE_ONCE_RECEIPTS != 0 && bits & NATIVE_OUTCOMES == 0 {
+        return Err(corrupt("wide once receipts require native_outcomes"));
     }
     Ok(())
 }

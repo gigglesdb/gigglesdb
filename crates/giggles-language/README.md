@@ -973,7 +973,10 @@ blocks stage their effects and commit once; read-only blocks release their snaps
 without a durable commit. On legacy, this native profile supports tables with at
 most 1,024 rows; on V2, reads and writes (point and many, insert, upsert,
 `insert into ... from`) accept tables of any size and caps beyond 1,024, and
-once receipts stay bounded at 1,024 rows. Core itself can store larger tables: a reverse primary-key probe verifies
+once writes past 1,024 rows record a GDOU version 2 receipt (u32 counts; the
+first one durably sets the V2 `wide_once_receipts` feature bit, so older
+binaries refuse the database). Legacy once receipts stay version 1 and bounded
+at 1,024 rows; returned rows stay bounded by the 2 MiB receipt. Core itself can store larger tables: a reverse primary-key probe verifies
 that the forward scan was complete, and an oversized table returns `Limit`
 before effects, even for a small read or point mutation. A nonempty native insert
 rejects a table already at 1,024 rows. Full scans can additionally hit the 1 MiB result

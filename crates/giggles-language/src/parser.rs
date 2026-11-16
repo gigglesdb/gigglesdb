@@ -485,9 +485,40 @@ impl Parser {
                 self.pos += 1;
                 return Ok(Expr::Value(ValueExpr::Literal(Value::Int(i64::MIN))));
             }
+            if let Some(value) = self.decimal(true)? {
+                return Ok(Expr::Value(ValueExpr::Literal(value)));
+            }
             return Ok(Expr::Negate(Box::new(self.unary(d + 1)?)));
         }
         self.atom(d)
+    }
+    /// R2 native: `digits.digits` is a NUMERIC literal (as in SQL), so a
+    /// filter can compare a NUMERIC column with `1.50`.
+    fn decimal(&mut self, negative: bool) -> Result<Option<Value>> {
+        if !self.version.supports_r2_native() {
+            return Ok(None);
+        }
+        let (
+            Some((Token::Number(whole), start)),
+            Some((Token::Symbol('.'), dot)),
+            Some((Token::Number(fraction), after)),
+        ) = (
+            self.tokens.get(self.pos).cloned(),
+            self.tokens.get(self.pos + 1).cloned(),
+            self.tokens.get(self.pos + 2).cloned(),
+        )
+        else {
+            return Ok(None);
+        };
+        // Only an unspaced `1.50`; `1 . 50` stays the old error.
+        if dot != start + whole.len() || after != dot + 1 {
+            return Ok(None);
+        }
+        let sign = if negative { "-" } else { "" };
+        let value = giggles_core::relational::Numeric::parse(&format!("{sign}{whole}.{fraction}"))
+            .map_err(|_| self.error())?;
+        self.pos += 3;
+        Ok(Some(Value::Numeric(value)))
     }
     fn atom(&mut self, d: usize) -> Result<Expr> {
         if d > MAX_DEPTH {
@@ -613,6 +644,9 @@ impl Parser {
             && !reserved_for(w, self.version)
         {
             return Ok(Expr::Field(self.name()?));
+        }
+        if let Some(value) = self.decimal(false)? {
+            return Ok(Expr::Value(ValueExpr::Literal(value)));
         }
         Ok(Expr::Value(self.value()?))
     }
@@ -847,7 +881,7 @@ impl Parser {
             Ok(ParsedInput::Once(envelope))
         } else {
             let statement = self.return_clause(statement)?;
-            execute::validate_depth(&statement)?;
+            execute::validate_depth(&statement, self.version)?;
             Ok(ParsedInput::Statement(statement))
         }
     }
@@ -1740,7 +1774,7 @@ pub fn parse_with_version(s: &str, version: LanguageVersion) -> Result<Statement
     if p.peek().is_some() {
         return Err(p.error());
     }
-    execute::validate_depth(&stmt)?;
+    execute::validate_depth(&stmt, version)?;
     Ok(stmt)
 }
 

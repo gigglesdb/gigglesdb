@@ -154,7 +154,7 @@ impl Engine {
         }
         let request = lower_checked(&statement.read, self.version)?;
         validate_size(statement)?;
-        reject_numeric_references(statement, bindings)?;
+        reject_numeric_references(statement, bindings, false)?;
         validate_parameter_admission(&statement.read, bindings, self.version)?;
         if bindings.len() > MAX_BINDINGS { return Err(Error::Limit); }
         let mut read_bindings = bindings.clone();
@@ -911,8 +911,9 @@ pub(crate) fn lower_checked(
     lower_statement(stmt, version)
 }
 
-pub(crate) fn validate_depth(stmt: &Statement) -> Result<()> {
-    validate_depth_for(stmt, LanguageVersion::Embedded018)
+pub(crate) fn validate_depth(stmt: &Statement, version: LanguageVersion) -> Result<()> {
+    // R2 native admits NUMERIC literals; older profiles keep the 0.18 rules.
+    validate_depth_for(stmt, if version.supports_r2_native() { version } else { LanguageVersion::Embedded018 })
 }
 fn validate_depth_for(stmt: &Statement, version: LanguageVersion) -> Result<()> {
     validate_statement_depth(stmt, &mut 0, version)
@@ -1348,7 +1349,12 @@ fn validate_size_within(stmt: &impl serde::Serialize, budget: usize) -> Result<(
 fn validate_native_value(value: &ValueExpr, version: LanguageVersion) -> Result<()> {
     match value {
         ValueExpr::Parameter(_) => Ok(()),
-        ValueExpr::Literal(value) if version.supports_r2_native() && typed_parameter(value) => Ok(()),
+        ValueExpr::Literal(value)
+            if version.supports_r2_native()
+                && (typed_parameter(value) || matches!(value, Value::Numeric(_))) =>
+        {
+            Ok(())
+        }
         ValueExpr::Literal(value) => match value {
             Value::Numeric(_)
             | Value::Float4(_)
@@ -2177,7 +2183,7 @@ fn validate_parameter_admission(
         }
     }
     scrub(&mut remaining, bindings);
-    reject_numeric_references(&remaining, bindings)?;
+    reject_numeric_references(&remaining, bindings, version.supports_r2_native())?;
     let other: Bindings = bindings
         .iter()
         .filter(|(_, v)| !matches!(v, Value::Numeric(_)))
@@ -2188,22 +2194,40 @@ fn validate_parameter_admission(
 
 // Inspect the public tree encoding after removing permitted assignment slots.
 // This catches every other occurrence, including nested functions and emits.
-fn reject_numeric_references(tree: &impl serde::Serialize, bindings: &Bindings) -> Result<()> {
-    fn visit(v: &serde_json::Value, bindings: &Bindings) -> bool {
+// With `compare` (R2 native), a parameter that is a direct comparison operand
+// is admitted: core binds it against the other operand's type, as SQL does.
+fn reject_numeric_references(
+    tree: &impl serde::Serialize,
+    bindings: &Bindings,
+    compare: bool,
+) -> Result<()> {
+    fn parameter(v: &serde_json::Value) -> bool {
+        v.get("Value").and_then(|v| v.get("Parameter")).is_some()
+    }
+    fn visit(v: &serde_json::Value, bindings: &Bindings, compare: bool) -> bool {
         match v {
             serde_json::Value::Object(map) => {
+                if compare
+                    && let Some(serde_json::Value::Array(items)) = map.get("Compare")
+                    && map.len() == 1
+                {
+                    return items
+                        .iter()
+                        .any(|item| !parameter(item) && visit(item, bindings, compare));
+                }
                 map.get("Parameter")
                     .and_then(|v| v.as_str())
                     .is_some_and(|name| matches!(bindings.get(name), Some(Value::Numeric(_))))
-                    || map.values().any(|v| visit(v, bindings))
+                    || map.values().any(|v| visit(v, bindings, compare))
             }
-            serde_json::Value::Array(values) => values.iter().any(|v| visit(v, bindings)),
+            serde_json::Value::Array(values) => values.iter().any(|v| visit(v, bindings, compare)),
             _ => false,
         }
     }
     if visit(
         &serde_json::to_value(tree).map_err(|_| Error::Unsupported)?,
         bindings,
+        compare,
     ) {
         Err(Error::Unsupported)
     } else {
@@ -2227,12 +2251,14 @@ fn validate_transaction_parameters(
             | TransactionStep::Let {
                 statement: stmt, ..
             } => validate_parameter_admission(stmt, bindings, version)?,
-            TransactionStep::Require(expr) => reject_numeric_references(expr, bindings)?,
+            TransactionStep::Require(expr) => {
+                reject_numeric_references(expr, bindings, version.supports_r2_native())?
+            }
             TransactionStep::Savepoint(_) | TransactionStep::RollbackTo(_) | TransactionStep::Release(_)
             | TransactionStep::Sequence { .. } => {},
         }
     }
-    reject_numeric_references(&transaction.emit, bindings)
+    reject_numeric_references(&transaction.emit, bindings, false)
 }
 
 fn typed_parameter(value: &Value) -> bool {

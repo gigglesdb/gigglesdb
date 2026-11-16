@@ -297,7 +297,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         }
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "typed_parameters", CapabilityState::Implemented,
-                "Float4/Float8/date/time/timetz/timestamp/timestamptz/interval parameters in assignments and predicates; uuid/jsonb as text parameters use SQL coercion. Numeric stays assignment-only.",
+                "Float4/Float8/date/time/timetz/timestamp/timestamptz/interval parameters in assignments and predicates; uuid/jsonb as text parameters use SQL coercion. Numeric parameters and unspaced decimal literals (1.50) are also comparison operands; an integer literal compared with a NUMERIC column is numeric, as in SQL.",
                 vec![evidence("crates/giggles-language/tests/native_typed_params_parity.rs", "typed_parameters_match_sql")], vec![]);
         }
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {

@@ -261,3 +261,76 @@ fn lost_reply_receipt_and_xact_status_agree_after_reopen() {
         }
     }
 }
+
+/// GDOU v2: a once write past 1,024 rows records a version 2 receipt, and the
+/// same commit sets WIDE_ONCE_RECEIPTS. Smaller writes keep version 1 and no bit.
+#[test]
+fn wide_receipt_sets_feature_bit_in_its_commit_and_replays_after_reopen() {
+    use crate::operations::{
+        self as ops, Compare, Expr, Intent, Request, ValueExpr,
+        once::{ONCE_CONTRACT_VERSION, OnceBody, OnceClockUnavailable, OnceIdentity, OnceRequest, OnceTime},
+    };
+    use relational::Value;
+    let (dir, admin) = fixture();
+    let mut sql = admin.sql_session();
+    for start in (0..5000).step_by(500) {
+        let tuples = (start..start + 500).map(|id| format!("({id},0)")).collect::<Vec<_>>().join(",");
+        sql.execute(&format!("INSERT INTO items VALUES{tuples}"), &[], None).unwrap();
+    }
+    drop(sql);
+    let domain = admin.authority_metadata().unwrap().0;
+    let request = |key: &[u8], filter: Expr| OnceRequest {
+        contract_version: ONCE_CONTRACT_VERSION,
+        identity: OnceIdentity { database_domain: domain, tenant: 1, namespace: "wide".into(), key: key.to_vec() },
+        retention_seconds: 60,
+        body: OnceBody::Operation(Request::Update {
+            table: "items".into(), filter, guard: None,
+            values: vec![("n".into(), ValueExpr::Literal(Value::Int(1)))],
+            intent: Intent::Many { cap: ValueExpr::Literal(Value::Int(5000)) },
+        }),
+    };
+    let clock = || -> Result<OnceTime, OnceClockUnavailable> {
+        Ok(OnceTime { lower_unix_seconds: 1000, upper_unix_seconds: 1001,
+            valid_until: Instant::now() + Duration::from_secs(10) })
+    };
+    let wide_bit = |admin: &Admin| meta::validate_meta(db(admin).kv.as_ref()).unwrap().features & meta::WIDE_ONCE_RECEIPTS;
+    let engine = ops::Engine::new(admin.clone());
+    let edge = request(b"edge", Expr::Compare(Box::new(Expr::Field("id".into())), Compare::Lt,
+        Box::new(Expr::Value(ValueExpr::Literal(Value::Int(1024))))));
+    let receipt = engine.execute_once(&edge, &ops::Bindings::new(), &clock).unwrap();
+    assert_eq!(receipt.outcome.as_ref().map(|o| matches!(o, ops::once::OnceOutcome::Operation(o) if o.affected == 1024)), Ok(true));
+    assert_eq!(wide_bit(&admin), 0, "1,024 rows: version 1 receipt, no feature bit");
+    let all = request(b"all", Expr::Value(ValueExpr::Literal(Value::Bool(true))));
+    let first = engine.execute_once(&all, &ops::Bindings::new(), &clock).unwrap();
+    assert!(!first.replayed);
+    assert_eq!(first.outcome.as_ref().map(|o| matches!(o, ops::once::OnceOutcome::Operation(o) if o.matched == 5000 && o.affected == 5000)), Ok(true));
+    assert_ne!(wide_bit(&admin), 0);
+    let mut expected = first;
+    expected.replayed = true;
+    assert_eq!(engine.execute_once(&all, &ops::Bindings::new(), &clock), Ok(expected.clone()));
+    drop(engine);
+    drop(admin);
+    let reopened = Admin::open(&dir.0, Limits::default()).unwrap();
+    assert_ne!(wide_bit(&reopened), 0);
+    let engine = ops::Engine::new(reopened.clone());
+    assert_eq!(engine.execute_once(&all, &ops::Bindings::new(), &clock), Ok(expected));
+    assert!(engine.execute_once(&edge, &ops::Bindings::new(), &clock).unwrap().replayed);
+    let rows = reopened.sql_session().execute("SELECT id FROM items WHERE n=1", &[], None).unwrap().rows;
+    assert_eq!(rows.len(), 5000);
+
+    // Legacy tables and once results stay within 1,024 rows (version 1 receipts):
+    // the 5,000 cap is refused before anything is written.
+    let path = dir.0.with_extension("legacy");
+    let legacy = Admin::create_engine(&path, Limits::default(), Engine::Legacy).unwrap();
+    legacy.sql_session().execute("CREATE TABLE items(id BIGINT PRIMARY KEY, n BIGINT)", &[], None).unwrap();
+    let tuples = (0..1024).map(|id| format!("({id},0)")).collect::<Vec<_>>().join(",");
+    legacy.sql_session().execute(&format!("INSERT INTO items VALUES{tuples}"), &[], None).unwrap();
+    let mut legacy_request = all.clone();
+    legacy_request.identity.database_domain = legacy.authority_metadata().unwrap().0;
+    let engine = ops::Engine::new(legacy.clone());
+    assert!(engine.execute_once(&legacy_request, &ops::Bindings::new(), &clock).is_err());
+    assert_eq!(legacy.sql_session().execute("SELECT id FROM items WHERE n=1", &[], None).unwrap().rows.len(), 0);
+    drop(engine);
+    drop(legacy);
+    if path.is_dir() { fs::remove_dir_all(&path).unwrap() } else { fs::remove_file(&path).unwrap() }
+}
