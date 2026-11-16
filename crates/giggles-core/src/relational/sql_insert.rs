@@ -568,10 +568,37 @@ impl Insert {
             clock,
             &mut || crate::cancellation::check().is_err(),
             None,
+            false,
         )?;
         let mut insert = materialized.insert;
         insert.source_types = Some(materialized.types);
         Ok(insert)
+    }
+    /// V2 non-pageable or self-reading source: run it once, before any page is
+    /// inserted, into a spill-backed store. Returns a literal-row template.
+    pub(super) fn source_store(
+        &self,
+        state: &Relational,
+        params: &[Value],
+        declared: &[Option<DataType>],
+        clock: Option<&clock::ExecutionClock>,
+        source: &dyn scan::RowSource,
+    ) -> R<(Self, SqlResult, Option<spill::Store<SqlRow>>)> {
+        let materialized = materialize_source(self, state, params, declared, clock,
+            &mut || crate::cancellation::check().is_err(), Some(source), true)?;
+        let mut insert = materialized.insert;
+        insert.source_types = Some(materialized.types);
+        let (result, store) = materialized.stored.unwrap_or_default();
+        Ok((insert, result, store))
+    }
+    /// One page of stored source rows on the `source_store` template.
+    pub(super) fn literal_page(&self, rows: Vec<SqlRow>) -> Self {
+        let mut page = self.batch(0, 0);
+        page.source_types.clone_from(&self.source_types);
+        page.defaults = vec![vec![false; self.columns.len()]; rows.len()];
+        page.rows = rows.into_iter()
+            .map(|row| row.values.into_iter().map(Expr::Literal).collect()).collect();
+        page
     }
     pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
         let mut dependencies = self
@@ -813,7 +840,9 @@ impl Insert {
 struct SourceRows {
     insert: Insert,
     types: Vec<Option<DataType>>,
+    stored: Option<(SqlResult, Option<spill::Store<SqlRow>>)>,
 }
+#[expect(clippy::too_many_arguments, reason = "statement inputs plus an optional source and capture mode")]
 fn materialize_source(
     insert: &Insert,
     state: &Relational,
@@ -822,6 +851,7 @@ fn materialize_source(
     clock: Option<&clock::ExecutionClock>,
     cancel: &mut dyn FnMut() -> bool,
     injected_source: Option<&dyn scan::RowSource>,
+    capture: bool,
 ) -> R<SourceRows> {
     let source = insert.source.as_ref().ok_or(SqlError::Unsupported)?;
     let table = state
@@ -851,13 +881,13 @@ fn materialize_source(
         }
     }
     let legacy = scan::LegacyRows(state);
-    let result = bound.execute_insert_source(
-        state,
-        injected_source.unwrap_or(&legacy),
-        params,
-        cancel,
-        declared,
-    )?;
+    let source = injected_source.unwrap_or(&legacy);
+    let (result, stored) = if capture {
+        let (result, store) = bound.execute_insert_source_captured(state, source, params, cancel, declared)?;
+        (SqlResult::default(), Some((result, store)))
+    } else {
+        (bound.execute_insert_source(state, source, params, cancel, declared)?, None)
+    };
     if result.rows.len() > MAX_ROWS {
         return Err(SqlError::Limit);
     }
@@ -881,6 +911,7 @@ fn materialize_source(
     Ok(SourceRows {
         insert: materialized,
         types,
+        stored,
     })
 }
 /// The executor and pre-lock probe share input assignment, without defaults.
@@ -1385,6 +1416,7 @@ pub(super) fn execute_declared(
             clock,
             cancel,
             injected_source,
+            false,
         )?;
         (&materialized.insert, Some(materialized.types.as_slice()))
     } else {

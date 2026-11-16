@@ -29,9 +29,22 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
         return false;
     }
     matches!(&prepared.statement, Statement::InsertMulti(i) if i.needs_pages()
-        && i.source.as_ref().is_none_or(|q| q.pageable_insert()
-            && q.read_tables().first().is_some_and(|name| state.tables.contains_key(name))
-            && !q.read_tables().contains(&i.table)))
+        && i.source.as_ref().is_none_or(|q| paged_source(state, i, q) || stored_source(state, q)))
+}
+
+/// Row-local SELECTs of another table are evaluated one source page at a time.
+fn paged_source(state: &Relational, insert: &sql_insert::Insert, query: &query::Query) -> bool {
+    query.pageable_insert()
+        && query.read_tables().first().is_some_and(|name| state.tables.contains_key(name))
+        && !query.read_tables().contains(&insert.table)
+}
+
+/// Other sources (ORDER BY, DISTINCT, joins, grouping, the target itself)
+/// are read completely into a spill store before the first page is inserted,
+/// so the insert never sees its own rows (PostgreSQL's statement snapshot).
+fn stored_source(state: &Relational, query: &query::Query) -> bool {
+    let tables = query.read_tables();
+    !tables.is_empty() && tables.iter().all(|name| state.tables.contains_key(name))
 }
 
 pub(super) fn execute(
@@ -58,8 +71,33 @@ pub(super) fn execute(
     let table = state.tables[&insert.table].clone();
     let foreign_keys = state.ext.constraints.get(&table.id).into_iter().flatten()
         .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. }));
+    let stored = match &insert.source {
+        Some(query) if !paged_source(state, insert, query) => {
+            let mut stored = None;
+            let image = &*state;
+            sink.with_row_source(&mut |source| {
+                stored = Some(insert.source_store(image, params, &prepared.parameter_types, clock, source)?);
+                Ok(())
+            })?;
+            stored
+        }
+        _ => None,
+    };
+    let mut stored_rows = match &stored {
+        Some((_, result, store)) => Some(query::subquery_rows(result, store.as_ref()).map_err(CoreError::Sql)?),
+        None => None,
+    };
     loop {
-        let (input, done) = if let Some(query) = &insert.source {
+        let (input, done) = if let (Some((template, ..)), Some(rows)) = (&stored, stored_rows.as_mut()) {
+            crate::cancellation::check()?;
+            let page = rows.by_ref().take(SHARED_WRITE_ROWS)
+                .map(|row| row.map(std::borrow::Cow::into_owned))
+                .collect::<R<Vec<_>>>().map_err(CoreError::Sql)?;
+            if page.is_empty() {
+                break;
+            }
+            (template.literal_page(page), false)
+        } else if let Some(query) = &insert.source {
             let table = &state.tables[&query.read_tables()[0]];
             let next = sink.read_page(table, after.take())?;
             let done = next.is_none();

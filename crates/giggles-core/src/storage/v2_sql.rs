@@ -1121,6 +1121,21 @@ impl RowSink for SqlRows<'_> {
     fn streams_index_builds(&self) -> bool {
         true
     }
+    fn with_row_source(
+        &mut self,
+        read: &mut dyn FnMut(&dyn relational::scan::RowSource) -> Result<(), SqlError>,
+    ) -> Result<(), CoreError> {
+        let source = reduction::Source::new(SqlRows {
+            conflict_floor: None, db: self.db, txn: &mut *self.txn, parts: self.parts,
+            writing: self.writing, prepared: self.prepared, params: self.params,
+            // The INSERT source is only read; protected write effects are
+            // recorded by the insert pages that follow.
+            effects: None,
+        });
+        let result = read(&source);
+        if let Some(error) = source.error.take() { return Err(error); }
+        result.map_err(CoreError::Sql)
+    }
     fn read_page(
         &mut self,
         table: &TableDef,

@@ -136,6 +136,13 @@ pub(crate) trait RowSink {
     fn streams_index_builds(&self) -> bool {
         false
     }
+    /// Runs `read` over a paging source of the statement's transaction (v2).
+    fn with_row_source(
+        &mut self,
+        _read: &mut dyn FnMut(&dyn scan::RowSource) -> R<()>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Sql(SqlError::Unsupported))
+    }
     fn read_page(
         &mut self,
         _table: &TableDef,

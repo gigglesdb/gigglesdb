@@ -5005,6 +5005,21 @@ impl BoundQuery<'_> {
         let execution = Execution::new(cancel, declared);
         self.execute_context(state, source, params, declared, &execution, false, true)
     }
+    /// A v2 INSERT source read completely before the first insert (PostgreSQL's
+    /// snapshot), spill-backed past SPILL_BYTES instead of capped rows.
+    pub(super) fn execute_insert_source_captured(
+        &self,
+        state: &Relational,
+        source: &dyn scan::RowSource,
+        params: &[Value],
+        cancel: &mut dyn FnMut() -> bool,
+        declared: &[Option<DataType>],
+    ) -> R<(SqlResult, Option<spill::Store<SqlRow>>)> {
+        let execution = Execution::new(cancel, declared);
+        execution.capture_subquery(|| {
+            self.execute_context(state, source, params, declared, &execution, false, true)
+        })
+    }
     #[expect(
         clippy::too_many_arguments,
         reason = "query execution context and parameter ownership"
@@ -5020,7 +5035,8 @@ impl BoundQuery<'_> {
         insert_source: bool,
     ) -> R<SqlResult> {
         // Read before any nested subquery runs; only this level is captured.
-        let capture = subquery && execution.capture.replace(false) && source.streams_reductions();
+        let capture = (subquery || insert_source) && execution.capture.replace(false)
+            && source.streams_reductions();
         if source.streams_reductions() {
             execution.unbounded.set(true);
         }
