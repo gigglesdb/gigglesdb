@@ -1,4 +1,4 @@
-//! Opt-in PostgreSQL access-session continuity and refusal tests.
+//! Opt-in PostgreSQL and native Spanner access-session continuity and refusal tests.
 use super::common::{ServeHarness, ServeResult, file_sink_policy};
 use nunya::{
     mgmt::client::{
@@ -528,5 +528,830 @@ async fn pg_quota_continuity_reconnect_rotation_reacquire() -> ServeResult<()> {
     let (last, last_secret) = acquire(&owner, false, None).await?;
     let (last_client, _last_driver) = session_connect(&h, &last, &last_secret).await?;
     limited(&last_client).await;
+    Ok(())
+}
+
+use google_cloud_googleapis::spanner::v1::{
+    CreateSessionRequest, DeleteSessionRequest, ExecuteSqlRequest, spanner_client::SpannerClient,
+};
+use tonic::{Code, Request, Status, transport::Endpoint};
+
+#[derive(Clone)]
+struct SpannerBearer(tonic::metadata::MetadataValue<tonic::metadata::Ascii>);
+impl tonic::service::Interceptor for SpannerBearer {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        request
+            .metadata_mut()
+            .insert("authorization", self.0.clone());
+        Ok(request)
+    }
+}
+type NativeClient = SpannerClient<
+    tonic::service::interceptor::InterceptedService<tonic::transport::Channel, SpannerBearer>,
+>;
+
+async fn spanner_client(
+    h: &ServeHarness,
+    user: &str,
+    secret: &SessionSecret,
+) -> ServeResult<NativeClient> {
+    let channel = Endpoint::from_shared(format!("http://{}", h.spanner_addr()))?
+        .connect()
+        .await?;
+    let bearer = SpannerBearer(format!("Bearer nunya.{user}.{}", &*secret.secret).parse()?);
+    Ok(SpannerClient::with_interceptor(channel, bearer))
+}
+
+fn spanner_sql(session: &str, sql: &str) -> ExecuteSqlRequest {
+    ExecuteSqlRequest {
+        session: session.into(),
+        sql: sql.into(),
+        ..Default::default()
+    }
+}
+
+fn spanner_denied<T>(result: Result<T, Status>, ny: &str) {
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("foreign Spanner credential or session accepted"),
+    };
+    assert_eq!(error.code(), Code::PermissionDenied);
+    assert!(
+        error.message().contains(ny),
+        "unexpected Spanner refusal code"
+    );
+}
+
+// Direct emulator deletion also works when gateway authentication has been revoked.
+struct SpannerSessions {
+    endpoint: String,
+    names: Vec<String>,
+}
+impl Drop for SpannerSessions {
+    fn drop(&mut self) {
+        let endpoint = self.endpoint.clone();
+        let names = self.names.clone();
+        let cleanup = std::thread::spawn(move || -> ServeResult<()> {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    let channel = Endpoint::from_shared(endpoint)?
+                        .connect_timeout(Duration::from_secs(3))
+                        .timeout(Duration::from_secs(3))
+                        .connect()
+                        .await?;
+                    let mut client = SpannerClient::new(channel);
+                    for name in names {
+                        let _ = client.delete_session(DeleteSessionRequest { name }).await;
+                    }
+                    Ok(())
+                })
+        })
+        .join();
+        if !matches!(cleanup, Ok(Ok(()))) {
+            eprintln!("upstream Spanner session cleanup failed");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_PG"]
+async fn spanner_scope_isolation() -> ServeResult<()> {
+    let url = std::env::var("NUNYA_TEST_PG")?;
+    let database = std::env::var("NUNYA_TEST_SPANNER_DB")?;
+    let endpoint = format!("http://{}", std::env::var("NUNYA_TEST_SPANNER_EMULATOR")?);
+    let fixture =
+        NativeFixture::new("email STRING(MAX)", "email", "'alice@example.test'", true).await?;
+    let policy = fixture.policy(&["email"], 20, 200);
+    let mut h = ServeHarness::new(
+        &policy,
+        Some(&url),
+        None,
+        Some(super::common::NativeUpstream {
+            database: &database,
+            emulator_endpoint: &endpoint,
+        }),
+        "",
+    )?;
+    let config_path = h.dir().join("nunya.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        config_path,
+        format!("schemas = ['public', '{}']\n{config}", fixture.schema),
+    )?;
+    h.start().await?;
+    let (pg, pg_secret, principal) = h
+        .acquire_session("native-scope", "postgres", Mode::ReadWrite)
+        .await?;
+    h.admin()
+        .set_grants(
+            &pg.principal,
+            &[
+                ("postgres", Mode::ReadWrite),
+                ("spanner-native", Mode::ReadWrite),
+            ],
+        )
+        .await?;
+    let owner = owner(&h, "native-scope", &principal)?;
+    let native_acquire = || async {
+        let secret = SessionSecret::generate();
+        let session = owner
+            .acquire(AcquireParams {
+                route: "spanner-native".into(),
+                mode: Some(Mode::ReadWrite),
+                lifetime: None,
+                isolated: false,
+                label: None,
+                verifier: secret.verifier.clone(),
+                secret_sha256: secret.sha256_hex.clone(),
+            })
+            .await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((session, secret))
+    };
+    let (a, a_secret) = native_acquire().await?;
+    let (b, b_secret) = native_acquire().await?;
+    let mut cleanup = SpannerSessions {
+        endpoint,
+        names: vec![],
+    };
+    let mut ca = spanner_client(&h, &format!("session:{}", a.id), &a_secret).await?;
+    let name = ca
+        .create_session(CreateSessionRequest {
+            database: database.clone(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner()
+        .name;
+    cleanup.names.push(name.clone());
+    let rows = ca
+        .execute_sql(spanner_sql(
+            &name,
+            &format!("SELECT email FROM {}.t WHERE id = 1", fixture.schema),
+        ))
+        .await?
+        .into_inner();
+    let native_token = match rows
+        .rows
+        .first()
+        .and_then(|r| r.values.first())
+        .and_then(|v| v.kind.as_ref())
+    {
+        Some(prost_types::value::Kind::StringValue(value)) => value,
+        _ => return Err("missing native email token".into()),
+    };
+    let (pg_client, _pg_driver) = session_connect(&h, &pg, &pg_secret).await?;
+    assert!(
+        values(
+            &pg_client,
+            &format!("SELECT email FROM {}.t WHERE id = 1", fixture.schema)
+        )
+        .await?[0][0]
+            != *native_token,
+        "routes reused token scope"
+    );
+    let mut mixed = spanner_client(&h, &format!("session:{}", b.id), &a_secret).await?;
+    spanner_denied(
+        mixed
+            .create_session(CreateSessionRequest {
+                database: database.clone(),
+                ..Default::default()
+            })
+            .await,
+        "NY003",
+    );
+    let mut principal_client = spanner_client(&h, "native-scope", &principal).await?;
+    spanner_denied(
+        principal_client
+            .create_session(CreateSessionRequest {
+                database: database.clone(),
+                ..Default::default()
+            })
+            .await,
+        "NY003",
+    );
+    let mut pg_route = spanner_client(&h, &format!("session:{}", pg.id), &pg_secret).await?;
+    spanner_denied(
+        pg_route
+            .create_session(CreateSessionRequest {
+                database: database.clone(),
+                ..Default::default()
+            })
+            .await,
+        "NY003",
+    );
+    let mut cb = spanner_client(&h, &format!("session:{}", b.id), &b_secret).await?;
+    spanner_denied(
+        cb.execute_sql(spanner_sql(
+            &name,
+            &format!("SELECT email FROM {}.t WHERE id = 1", fixture.schema),
+        ))
+        .await,
+        "NY003",
+    );
+    Ok(())
+}
+
+// Emulator DDL cannot run concurrently; hold the lane through fixture cleanup.
+static NATIVE_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// Each fixture owns only a unique named schema, including on assertion unwinding.
+struct NativeFixture {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    schema: String,
+    rest: String,
+    database: String,
+    endpoint: String,
+    pg_admin: Option<String>,
+}
+async fn native_rest(
+    base: &str,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> ServeResult<serde_json::Value> {
+    use http_body_util::{BodyExt, Full};
+    let uri: http::Uri = format!("{base}/v1/{path}").parse()?;
+    let stream = tokio::net::TcpStream::connect((
+        uri.host().ok_or("missing REST host")?,
+        uri.port_u16().ok_or("missing REST port")?,
+    ))
+    .await?;
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await?;
+    let _driver = Driver(tokio::spawn(async move {
+        let _ = connection.await;
+    }));
+    let request = http::Request::builder()
+        .method(method)
+        .uri(&uri)
+        .header(
+            "host",
+            uri.authority().ok_or("missing REST authority")?.as_str(),
+        )
+        .header("content-type", "application/json")
+        .body(Full::new(bytes::Bytes::from(serde_json::to_vec(&body)?)))?;
+    let response = sender.send_request(request).await?;
+    let status = response.status();
+    let success = status.is_success();
+    let data = response.into_body().collect().await?.to_bytes();
+    if !success {
+        return Err(format!("emulator REST request refused: HTTP {}", status.as_u16()).into());
+    }
+    if data.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    Ok(serde_json::from_slice(&data)?)
+}
+async fn native_ddl(rest: &str, database: &str, statements: Vec<String>) -> ServeResult<()> {
+    let mut operation = native_rest(
+        rest,
+        "PATCH",
+        &format!("{database}/ddl"),
+        serde_json::json!({"statements": statements}),
+    )
+    .await?;
+    for _ in 0..120 {
+        if operation.get("error").is_some() {
+            return Err("emulator DDL operation failed".into());
+        }
+        if operation["done"] == true {
+            return Ok(());
+        }
+        let name = operation["name"]
+            .as_str()
+            .ok_or("missing DDL operation name")?
+            .to_owned();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        operation = native_rest(rest, "GET", &name, serde_json::json!({})).await?;
+    }
+    Err("emulator DDL operation timed out".into())
+}
+impl NativeFixture {
+    async fn new(
+        definitions: &str,
+        columns: &str,
+        literals: &str,
+        postgres: bool,
+    ) -> ServeResult<Self> {
+        let fixture = Self {
+            _lock: NATIVE_FIXTURE_LOCK.lock().await,
+            schema: format!("b8_{}", &nunya::token::SessionId::random().to_hex()[..12]),
+            rest: std::env::var("NUNYA_TEST_SPANNER_REST")?,
+            database: std::env::var("NUNYA_TEST_SPANNER_DB")?,
+            endpoint: format!("http://{}", std::env::var("NUNYA_TEST_SPANNER_EMULATOR")?),
+            pg_admin: if postgres {
+                Some(std::env::var("NUNYA_TEST_PG_ADMIN")?)
+            } else {
+                None
+            },
+        };
+        let s = &fixture.schema;
+        native_ddl(
+            &fixture.rest,
+            &fixture.database,
+            vec![
+                format!("CREATE SCHEMA {s}"),
+                format!("CREATE TABLE {s}.t (id INT64 NOT NULL, {definitions}) PRIMARY KEY(id)"),
+            ],
+        )
+        .await?;
+        if let Some(url) = &fixture.pg_admin {
+            let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+            let _driver = Driver(tokio::spawn(async move {
+                let _ = connection.await;
+            }));
+            client.batch_execute(&format!("CREATE SCHEMA {s}; CREATE TABLE {s}.t (id int PRIMARY KEY, email text); INSERT INTO {s}.t VALUES (1, 'alice@example.test'); GRANT USAGE ON SCHEMA {s} TO nunya; GRANT SELECT, INSERT, DELETE ON {s}.t TO nunya")).await?;
+        }
+        fixture
+            .insert(&format!(
+                "INSERT INTO {s}.t (id, {columns}) VALUES (1, {literals})"
+            ))
+            .await?;
+        Ok(fixture)
+    }
+    async fn insert(&self, sql: &str) -> ServeResult<()> {
+        let session = native_rest(
+            &self.rest,
+            "POST",
+            &format!("{}/sessions", self.database),
+            serde_json::json!({}),
+        )
+        .await?;
+        let name = session["name"].as_str().ok_or("missing setup session")?;
+        let result = async {
+            let tx = native_rest(
+                &self.rest,
+                "POST",
+                &format!("{name}:beginTransaction"),
+                serde_json::json!({"options":{"readWrite":{}}}),
+            )
+            .await?;
+            let id = tx["id"].as_str().ok_or("missing setup transaction")?;
+            native_rest(
+                &self.rest,
+                "POST",
+                &format!("{name}:executeSql"),
+                serde_json::json!({"sql":sql,"transaction":{"id":id},"seqno":"1"}),
+            )
+            .await?;
+            native_rest(
+                &self.rest,
+                "POST",
+                &format!("{name}:commit"),
+                serde_json::json!({"transactionId":id}),
+            )
+            .await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        }
+        .await;
+        let _ = native_rest(&self.rest, "DELETE", name, serde_json::json!({})).await;
+        result
+    }
+    fn policy(&self, columns: &[&str], session: u64, principal: u64) -> String {
+        let mut policy =
+            "snapshot_max_age_ms = 60000\n[readlog]\nsink = 'file'\npath = 'read.log'\n".to_owned();
+        for col in columns {
+            policy.push_str(&format!("[domains.{col}]\ntokenize = 'on'\ntokenize_limit_per_session = {session}\ntokenize_limit_per_principal = {principal}\ntokenize_principal_window = '24h'\n"));
+        }
+        for col in columns {
+            policy.push_str(&format!(
+                "[[column]]\ntable = '{}.t'\nname = '{col}'\nblind = '{col}'\n",
+                self.schema
+            ));
+        }
+        policy
+    }
+    fn harness(&self, policy: &str, pg: Option<&str>, extra: &str) -> ServeResult<ServeHarness> {
+        ServeHarness::new(
+            policy,
+            pg,
+            None,
+            Some(super::common::NativeUpstream {
+                database: &self.database,
+                emulator_endpoint: &self.endpoint,
+            }),
+            extra,
+        )
+    }
+    fn sessions(&self) -> SpannerSessions {
+        SpannerSessions {
+            endpoint: self.endpoint.clone(),
+            names: vec![],
+        }
+    }
+}
+impl Drop for NativeFixture {
+    fn drop(&mut self) {
+        let (schema, rest, database, pg) = (
+            self.schema.clone(),
+            self.rest.clone(),
+            self.database.clone(),
+            self.pg_admin.clone(),
+        );
+        let result = std::thread::spawn(move || -> ServeResult<()> {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    let spanner = native_ddl(
+                        &rest,
+                        &database,
+                        vec![
+                            format!("DROP TABLE {schema}.t"),
+                            format!("DROP SCHEMA {schema}"),
+                        ],
+                    )
+                    .await;
+                    if let Some(url) = pg {
+                        let (client, connection) = tokio_postgres::connect(&url, NoTls).await?;
+                        let _driver = Driver(tokio::spawn(async move {
+                            let _ = connection.await;
+                        }));
+                        client
+                            .batch_execute(&format!(
+                                "DROP TABLE IF EXISTS {schema}.t; DROP SCHEMA IF EXISTS {schema}"
+                            ))
+                            .await?;
+                    }
+                    spanner
+                })
+        })
+        .join();
+        if !matches!(result, Ok(Ok(()))) {
+            eprintln!("native fixture schema cleanup failed");
+        }
+    }
+}
+async fn native_open(
+    h: &ServeHarness,
+    access: &SessionView,
+    secret: &SessionSecret,
+    database: &str,
+    cleanup: &mut SpannerSessions,
+) -> ServeResult<(NativeClient, String)> {
+    let mut client = spanner_client(h, &format!("session:{}", access.id), secret).await?;
+    let name = client
+        .create_session(CreateSessionRequest {
+            database: database.into(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner()
+        .name;
+    cleanup.names.push(name.clone());
+    Ok((client, name))
+}
+async fn native_acquire(
+    owner: &MgmtClient,
+    isolated: bool,
+    lifetime: Option<&str>,
+) -> ServeResult<(SessionView, SessionSecret)> {
+    let secret = SessionSecret::generate();
+    let session = owner
+        .acquire(AcquireParams {
+            route: "spanner-native".into(),
+            mode: Some(Mode::ReadWrite),
+            lifetime: lifetime.map(str::to_owned),
+            isolated,
+            label: None,
+            verifier: secret.verifier.clone(),
+            secret_sha256: secret.sha256_hex.clone(),
+        })
+        .await?;
+    Ok((session, secret))
+}
+fn native_cells(
+    rows: &google_cloud_googleapis::spanner::v1::ResultSet,
+) -> ServeResult<Vec<Vec<String>>> {
+    rows.rows
+        .iter()
+        .map(|row| {
+            row.values
+                .iter()
+                .map(|v| match &v.kind {
+                    Some(prost_types::value::Kind::StringValue(s)) => Ok(s.clone()),
+                    _ => Err("unexpected native cell type".into()),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_SPANNER_REST"]
+async fn spanner_reconnect_and_pool_every_token_type() -> ServeResult<()> {
+    use google_cloud_googleapis::spanner::v1::TypeCode;
+    // values::column_type maps STRING/INT64/DATE/TIMESTAMP to supported codecs.
+    // BOOL has too few values (policy refuses); BYTES maps to unsupported Bytea.
+    // NUMERIC/JSON/ARRAY map to unsupported Numeric/Json/Array codecs.
+    // FLOAT32/FLOAT64/STRUCT/PROTO/ENUM and unspecified types map to Other,
+    // which StandardCodec refuses (spanner::values::column_type, token::StandardCodec).
+    let types = [
+        ("email", TypeCode::String),
+        ("number", TypeCode::Int64),
+        ("day", TypeCode::Date),
+        ("stamp", TypeCode::Timestamp),
+    ];
+    let f = NativeFixture::new(
+        "email STRING(MAX), number INT64, day DATE, stamp TIMESTAMP",
+        "email, number, day, stamp",
+        "'alice@example.test', 42000000000, DATE '2024-05-06', TIMESTAMP '2024-05-06 07:08:09+00'",
+        false,
+    )
+    .await?;
+    let mut h = f.harness(
+        &f.policy(&["email", "number", "day", "stamp"], 20, 200),
+        None,
+        "",
+    )?;
+    h.start().await?;
+    let (access, secret, _) = h
+        .acquire_session("native-types", "spanner-native", Mode::ReadWrite)
+        .await?;
+    let mut cleanup = f.sessions();
+    let select = format!(
+        "SELECT email, number, day, stamp FROM {}.t WHERE id = 1",
+        f.schema
+    );
+    let (mut one, name) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
+    let first = native_cells(
+        &one.execute_sql(spanner_sql(&name, &select))
+            .await?
+            .into_inner(),
+    )?;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].len(), types.len());
+    for (got, clear) in first[0].iter().zip([
+        "alice@example.test",
+        "42000000000",
+        "2024-05-06",
+        "2024-05-06T07:08:09Z",
+    ]) {
+        assert!(got != clear, "native blind value was not transformed");
+    }
+    let (mut two, name_two) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
+    assert!(
+        native_cells(
+            &two.execute_sql(spanner_sql(&name_two, &select))
+                .await?
+                .into_inner()
+        )? == first,
+        "pooled native tokens changed"
+    );
+    native_verify(&mut two, &name_two, &select, &first, &types, &f.schema).await?;
+    drop(one);
+    drop(two);
+    let (mut three, name_three) =
+        native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
+    native_verify(&mut three, &name_three, &select, &first, &types, &f.schema).await?;
+    Ok(())
+}
+async fn native_verify(
+    client: &mut NativeClient,
+    name: &str,
+    select: &str,
+    first: &[Vec<String>],
+    types: &[(&str, google_cloud_googleapis::spanner::v1::TypeCode)],
+    schema: &str,
+) -> ServeResult<()> {
+    use google_cloud_googleapis::spanner::v1::Type;
+    assert!(
+        native_cells(
+            &client
+                .execute_sql(spanner_sql(name, select))
+                .await?
+                .into_inner()
+        )? == first,
+        "reconnected native tokens changed"
+    );
+    for ((col, code), token) in types.iter().zip(&first[0]) {
+        let mut req = spanner_sql(name, &format!("SELECT id FROM {schema}.t WHERE {col} = @p"));
+        req.params = Some(prost_types::Struct {
+            fields: std::collections::BTreeMap::from([(
+                "p".into(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(token.clone())),
+                },
+            )]),
+        });
+        req.param_types.insert(
+            "p".into(),
+            Type {
+                code: *code as i32,
+                ..Default::default()
+            },
+        );
+        assert!(
+            native_cells(&client.execute_sql(req).await?.into_inner())?
+                == vec![vec!["1".to_owned()]],
+            "third-channel token predicate failed for {col}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_SPANNER_REST"]
+async fn spanner_revoke_and_expiry_on_rpcs() -> ServeResult<()> {
+    let f = NativeFixture::new(
+        "email STRING(MAX), payload STRING(MAX)",
+        "email, payload",
+        "'alice@example.test', 'small'",
+        false,
+    )
+    .await?;
+    // A result larger than HTTP/2 flow-control buffers keeps an admitted stream
+    // alive while management revokes it. Clear payloads carry no blind values.
+    f.insert(&format!("INSERT INTO {}.t (id, email, payload) SELECT n, 'alice@example.test', REPEAT('x', 65536) FROM UNNEST(GENERATE_ARRAY(2, 513)) AS n", f.schema)).await?;
+    let mut h = f.harness(
+        &f.policy(&["email"], 20, 200),
+        None,
+        "\n[session]\nmax_lifetime = '60s'\nidle_timeout = 'off'\n",
+    )?;
+    h.start().await?;
+    let (access, secret, principal) = h
+        .acquire_session("native-ended", "spanner-native", Mode::ReadWrite)
+        .await?;
+    let owner = owner(&h, "native-ended", &principal)?;
+    let mut cleanup = f.sessions();
+    let (mut client, name) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
+    let select = format!("SELECT email FROM {}.t WHERE id = 1", f.schema);
+    client.execute_sql(spanner_sql(&name, &select)).await?;
+    let mut stream = client
+        .execute_streaming_sql(spanner_sql(
+            &name,
+            &format!("SELECT email, payload FROM {}.t", f.schema),
+        ))
+        .await?
+        .into_inner();
+    // Confirm the call was admitted before ending the access session.
+    let first = stream
+        .message()
+        .await?
+        .ok_or("stream ended before revocation")?;
+    let mut completed_values = first.values.len() - usize::from(first.chunked_value);
+    h.admin().revoke(&access.id).await?;
+    // Chunks sent before revocation may still be in flight and cannot be recalled.
+    // The gateway must send only an end status after revocation; count buffered chunks.
+    // B8c3 isolated run observed 3 chunks after revoke (64 total received rows).
+    let mut after_revoke = 0;
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.message().await {
+                Ok(Some(part)) => {
+                    after_revoke += 1;
+                    completed_values += part.values.len() - usize::from(part.chunked_value);
+                }
+                Err(status) => break status,
+                Ok(None) => panic!("revoked stream completed normally"),
+            }
+        }
+    })
+    .await?;
+    eprintln!(
+        "buffered chunks after revoke: {after_revoke}; rows: {}",
+        completed_values / 2
+    );
+    spanner_denied::<()>(Err(status), "NY011");
+    assert!(
+        completed_values / 2 < 513,
+        "revoked stream delivered every row"
+    );
+    assert!(
+        !matches!(
+            tokio::time::timeout(Duration::from_secs(10), stream.message()).await?,
+            Ok(Some(_))
+        ),
+        "stream emitted a chunk after end status"
+    );
+    spanner_denied(
+        client.execute_sql(spanner_sql(&name, &select)).await,
+        "NY003",
+    );
+    spanner_denied(
+        client
+            .execute_streaming_sql(spanner_sql(&name, &select))
+            .await,
+        "NY003",
+    );
+    spanner_denied(
+        client
+            .create_session(CreateSessionRequest {
+                database: f.database.clone(),
+                ..Default::default()
+            })
+            .await,
+        "NY003",
+    );
+    assert!(
+        matches!(owner.renew(&access.id, None, None).await, Err(ClientError::Api { code, .. }) if code == "session_ended"),
+        "revoked native renewal accepted"
+    );
+    let (expiring, expiry_secret) = native_acquire(&owner, false, Some("5s")).await?;
+    let (mut exp_client, exp_name) =
+        native_open(&h, &expiring, &expiry_secret, &f.database, &mut cleanup).await?;
+    let before = native_cells(
+        &exp_client
+            .execute_sql(spanner_sql(&exp_name, &select))
+            .await?
+            .into_inner(),
+    )?;
+    let renewed = owner.renew(&expiring.id, None, None).await?;
+    assert_eq!(renewed.scope, expiring.scope);
+    assert_eq!(
+        renewed.expires_ms, expiring.expires_ms,
+        "renewal extended absolute expiry"
+    );
+    assert!(
+        native_cells(
+            &exp_client
+                .execute_sql(spanner_sql(&exp_name, &select))
+                .await?
+                .into_inner()
+        )? == before,
+        "renewal changed native token or channel"
+    );
+    let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    let wait = expiring.expires_ms.saturating_sub(now) + 150;
+    assert!(wait < 10_000);
+    tokio::time::sleep(Duration::from_millis(wait)).await;
+    spanner_denied(
+        exp_client
+            .execute_sql(spanner_sql(&exp_name, &select))
+            .await,
+        "NY003",
+    );
+    spanner_denied(
+        exp_client
+            .execute_streaming_sql(spanner_sql(&exp_name, &select))
+            .await,
+        "NY003",
+    );
+    spanner_denied(
+        exp_client
+            .create_session(CreateSessionRequest {
+                database: f.database.clone(),
+                ..Default::default()
+            })
+            .await,
+        "NY003",
+    );
+    assert!(
+        matches!(owner.renew(&expiring.id, None, None).await, Err(ClientError::Api { code, .. }) if code == "session_ended"),
+        "expired native renewal accepted"
+    );
+    Ok(())
+}
+async fn native_tokenize_refused(client: &mut NativeClient, name: &str) {
+    let result = client
+        .execute_sql(spanner_sql(name, "SELECT nunya_tokenize('email', 'x')"))
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("native explicit tokenization accepted"),
+    };
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(
+        error.message().contains("NY004"),
+        "unexpected native refusal"
+    );
+}
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_SPANNER_REST"]
+async fn spanner_explicit_tokenize_refused() -> ServeResult<()> {
+    // src/dialect/googlesql has no nunya_tokenize lowering; local_tokenize in
+    // src/spanner/proxy.rs is reachable only from unit-built plans. The native
+    // offering in site/docs/spanner.html has no explicit tokenization, so this
+    // route cannot bypass per-session or per-principal tokenization limits.
+    let f = NativeFixture::new("email STRING(MAX)", "email", "'alice@example.test'", false).await?;
+    let mut h = f.harness(&f.policy(&["email"], 3, 5), None, "")?;
+    h.start().await?;
+    let (access, secret, principal) = h
+        .acquire_session("native-refusal", "spanner-native", Mode::ReadWrite)
+        .await?;
+    let owner = owner(&h, "native-refusal", &principal)?;
+    let mut cleanup = f.sessions();
+    let (mut one, name_one) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
+    native_tokenize_refused(&mut one, &name_one).await;
+    drop(one);
+    let salt = data_encoding::BASE64.decode(secret.scram_salt.as_bytes())?;
+    let rotated = SessionSecret::generate_with(&salt, secret.scram_iterations)?;
+    owner
+        .renew(
+            &access.id,
+            None,
+            Some(SessionCredential {
+                verifier: rotated.verifier.clone(),
+                secret_sha256: rotated.sha256_hex.clone(),
+            }),
+        )
+        .await?;
+    // Both bearers must remain valid during the rotation overlap, on new channels.
+    let (mut old, name_old) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
+    let (mut new, name_new) = native_open(&h, &access, &rotated, &f.database, &mut cleanup).await?;
+    native_tokenize_refused(&mut old, &name_old).await;
+    native_tokenize_refused(&mut new, &name_new).await;
     Ok(())
 }
