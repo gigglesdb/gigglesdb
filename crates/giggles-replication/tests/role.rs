@@ -37,10 +37,15 @@ impl Outbox for Network {
 struct FakeEngine {
     term: u64,
     fenced: AtomicBool,
+    fence_calls: AtomicU64,
 }
 impl Engine for FakeEngine {
     fn fence(&self) {
+        self.fence_calls.fetch_add(1, Ordering::SeqCst);
         self.fenced.store(true, Ordering::SeqCst);
+    }
+    fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
     }
 }
 struct Cluster {
@@ -104,6 +109,7 @@ impl Cluster {
                     Ok(FakeEngine {
                         term,
                         fenced: AtomicBool::new(false),
+                        fence_calls: AtomicU64::new(0),
                     })
                 }),
                 Duration::from_millis(5),
@@ -226,4 +232,41 @@ fn stopped_replica_never_opens_and_wait_times_out() {
         .is_none()
     );
     m.stop();
+}
+
+#[test]
+fn self_fenced_leader_reopens_in_the_same_term() {
+    let c = Cluster::new();
+    until(|| {
+        c.managers
+            .iter()
+            .any(|m| matches!(m.current(), Serving::Leader { .. }))
+    });
+    let leader = c
+        .managers
+        .iter()
+        .position(|m| matches!(m.current(), Serving::Leader { .. }))
+        .unwrap();
+    let Serving::Leader { term, engine } = c.managers[leader].current() else {
+        panic!("lost leader")
+    };
+    assert_eq!(engine.fence_calls.load(Ordering::SeqCst), 0);
+    engine.fenced.store(true, Ordering::SeqCst);
+    let reopened = c.managers[leader].wait_for(
+        |s| {
+            matches!(s, Serving::Leader { term: t, engine: e }
+            if *t == term && !Arc::ptr_eq(e, &engine))
+        },
+        Duration::from_millis(250),
+    );
+    let Some(Serving::Leader { engine: fresh, .. }) = reopened else {
+        panic!("fenced leader did not reopen in the same term")
+    };
+    assert_eq!(fresh.term, term);
+    assert!(!fresh.is_fenced());
+    assert_eq!(engine.fence_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(c.opens.lock().unwrap().get(&(leader, term)), Some(&2));
+    let role = c.handles[leader].role();
+    assert_eq!(role.state, StateRole::Leader);
+    assert_eq!(role.term, term);
 }

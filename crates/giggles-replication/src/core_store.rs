@@ -156,6 +156,9 @@ impl crate::role::Engine for ReplicatedEngine {
     fn fence(&self) {
         self.sink.fence();
     }
+    fn is_fenced(&self) -> bool {
+        self.sink.is_fenced()
+    }
 }
 
 /// Open a fresh engine for each confirmed leadership term.

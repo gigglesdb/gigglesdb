@@ -9,6 +9,9 @@ use std::{
 
 pub trait Engine: Send + 'static {
     fn fence(&self);
+    fn is_fenced(&self) -> bool {
+        false
+    }
 }
 pub enum Serving<E> {
     Follower { leader: u64, term: u64 },
@@ -66,7 +69,8 @@ impl<E: Engine + Sync> RoleManager<E> {
                     && (stopping
                         || handle.is_stopped()
                         || role.state != StateRole::Leader
-                        || role.term != *term)
+                        || role.term != *term
+                        || engine.is_fenced())
                 {
                     engine.fence();
                     state.serving = Serving::Follower {
