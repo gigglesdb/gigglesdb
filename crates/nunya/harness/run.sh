@@ -2,14 +2,16 @@
 set -euo pipefail
 mode=pg
 if [[ ${1:-} == spanner ]]; then mode=spanner; shift; fi
-if [[ $# != 2 || $1 != --task-root ]]; then
-  echo 'usage: run.sh [spanner] --task-root <directory under J:/gigglesdb-work>' >&2; exit 1
+if [[ $# == 0 ]]; then
+  root=$(mktemp -d)
+elif [[ $# == 2 && $1 == --task-root ]]; then
+  root=$2
+else
+  echo 'usage: run.sh [spanner] [--task-root <directory>]' >&2; exit 1
 fi
-root=$2
-case "$root" in J:/gigglesdb-work/*|j:/gigglesdb-work/*|/j/gigglesdb-work/*) ;; *) echo 'task root must be under J:/gigglesdb-work' >&2; exit 1;; esac
 mkdir -p "$root"
 root=$(cd "$root" && pwd -P)
-case "$root" in /j/gigglesdb-work/*|/J/gigglesdb-work/*|J:/gigglesdb-work/*|j:/gigglesdb-work/*) ;; *) echo 'resolved task root escapes J:/gigglesdb-work' >&2; exit 1;; esac
+printf 'Task root: %s\n' "$root"
 run="$root/nunya-harness-$$-$RANDOM"
 mkdir "$run" "$run/tmp"
 mkdir -p "$run/data/pg16/data" "$run/data/pg17/data" "$run/data/pg18"

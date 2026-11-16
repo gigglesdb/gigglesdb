@@ -2,7 +2,7 @@
 
 # Nunya
 
-Nunya is a PostgreSQL gateway that replaces protected values with task-scoped tokens. Agents can carry tokens between approved columns without seeing the underlying values. Masked columns return a placeholder or SQL NULL. Unanalysable operations fail closed.
+Nunya is a separate database entry point for AI agents. Applications keep their existing direct database connections, connection strings and drivers. Agents use their own endpoint and per-task credentials; Nunya connects upstream with its own least-privilege role (`[upstream] user`) and replaces protected values with task-scoped tokens. Agents can carry tokens between approved columns without seeing the underlying values. Masked columns return a placeholder or SQL NULL. Unanalysable operations fail closed.
 
 `nunya serve --config <path>` starts the configured routes and snapshot refresh; the PostgreSQL route also starts the admin endpoint. Upstream TLS supports `disable`, `require` (encrypted, accepts any certificate), and `verify-full` (hostname verification against `ca_file` as the only trust root). Set `upstream.dialect` to `postgres` (default) or `spanner-pg` for Google PGAdapter. `max_connections` defaults to 256 and permits 1 through 10000 concurrent agent connections. Policies reload through the admin endpoint or Unix SIGHUP; invalid policies retain the current policy. Failed or unsafe snapshot refreshes retain the old snapshot until its age causes NY008 refusals. Ctrl-C or SIGTERM stops accepting and allows sessions up to 30 seconds to drain.
 
@@ -85,7 +85,7 @@ For a service, use a dedicated unprivileged account, a private configuration dir
 
 ## Local PostgreSQL harness
 
-`harness/run.sh --task-root J:/gigglesdb-work/<your-task>` starts PostgreSQL 16, 17 and 18, waits for health checks, and removes containers and volumes on exit. Press Enter to stop. Host ports are 16432, 17432 and 18432; change the config port to select a version. Use `NUNYA_UPSTREAM_PASSWORD=nunya-harness-only` and a freshly generated `NUNYA_ROOT_KEY`. Seed credentials are for isolated local tests only. Images follow skedaddle's PostgreSQL Alpine family; its lock file contains no PostgreSQL digests, so these tags are unpinned. Harness run logs and temporary files live under the task root. The Dockerfile and harness are supplied without running Docker.
+`bash harness/run.sh` starts PostgreSQL 16, 17 and 18, waits for health checks, and removes containers and volumes on exit. Press Enter to stop. Host ports are 16432, 17432 and 18432; change the config port to select a version. Use `NUNYA_UPSTREAM_PASSWORD=nunya-harness-only` and a freshly generated `NUNYA_ROOT_KEY`. Seed credentials are for isolated local tests only. It uses the official `postgres:16-alpine`, `postgres:17-alpine` and `postgres:18-alpine` images. The script prints a fresh temporary task root for run logs and temporary files; optionally choose any directory with `--task-root /path/to/runs`.
 
 ## Spanner
 
@@ -96,7 +96,7 @@ or expose the native GoogleSQL gRPC route:
 [spanner_native]
 listen = "127.0.0.1:6433"
 database = "projects/my-project/instances/my-instance/databases/my-database"
-# For a trusted local emulator only:
+# For a trusted local emulator:
 # emulator_endpoint = "http://127.0.0.1:9010"
 # snapshot_refresh_ms = 30000
 ```
