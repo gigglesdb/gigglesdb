@@ -7,6 +7,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use toml::{Value, map::Map};
 use zeroize::Zeroizing;
@@ -49,6 +50,95 @@ pub struct StandingSection {
     /// Parsed SCRAM verifier.
     pub verifier: ScramVerifier,
 }
+/// Parse a positive integer duration with a single seconds, minutes, hours or days unit.
+pub fn parse_duration(text: &str) -> Option<Duration> {
+    let (unit, digits) = text.as_bytes().split_last()?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let multiplier = match unit {
+        b's' => 1,
+        b'm' => 60,
+        b'h' => 3600,
+        b'd' => 86400,
+        _ => return None,
+    };
+    let seconds = std::str::from_utf8(digits)
+        .ok()?
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(multiplier)?;
+    (seconds != 0).then(|| Duration::from_secs(seconds))
+}
+/// Session expiration policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSettings {
+    /// Maximum permitted session lifetime.
+    pub max_lifetime: Duration,
+    /// Idle expiration interval; absent when disabled.
+    pub idle_timeout: Option<Duration>,
+}
+impl Default for SessionSettings {
+    fn default() -> Self {
+        Self {
+            max_lifetime: Duration::from_secs(8 * 3600),
+            idle_timeout: Some(Duration::from_secs(3600)),
+        }
+    }
+}
+/// Reason a requested session lifetime was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifetimeError {
+    /// A lifetime must be positive.
+    Zero,
+    /// A lifetime must not exceed the configured maximum.
+    AboveMaximum,
+}
+impl fmt::Display for LifetimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Zero => "session lifetime must be positive",
+            Self::AboveMaximum => "session lifetime exceeds maximum",
+        })
+    }
+}
+impl SessionSettings {
+    /// Validate a requested lifetime or select the configured maximum.
+    pub fn lifetime_for(&self, requested: Option<Duration>) -> Result<Duration, LifetimeError> {
+        match requested {
+            None => Ok(self.max_lifetime),
+            Some(d) if d.is_zero() => Err(LifetimeError::Zero),
+            Some(d) if d > self.max_lifetime => Err(LifetimeError::AboveMaximum),
+            Some(d) => Ok(d),
+        }
+    }
+}
+/// Management listener settings.
+pub struct ManagementSection {
+    /// Validated listener address.
+    pub listen: SocketAddr,
+    /// Resolved and validated TLS files.
+    pub tls: Option<TlsSection>,
+    /// Management identities.
+    pub admins: Vec<AdminSection>,
+}
+impl fmt::Debug for ManagementSection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ManagementSection { [REDACTED] }")
+    }
+}
+/// Authenticated management identity.
+pub struct AdminSection {
+    /// Login name.
+    pub name: String,
+    /// Parsed SCRAM verifier.
+    pub verifier: ScramVerifier,
+}
+impl fmt::Debug for AdminSection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AdminSection { [REDACTED] }")
+    }
+}
 /// Validated configuration with zeroizing secrets.
 pub struct Config {
     /// Agent listener.
@@ -81,6 +171,14 @@ pub struct Config {
     pub dialect: UpstreamDialect,
     /// Maximum concurrent agent sessions.
     pub max_connections: usize,
+    /// Session expiration settings.
+    pub session: SessionSettings,
+    /// Optional management listener settings.
+    pub management: Option<ManagementSection>,
+    /// PostgreSQL route identity, when configured.
+    pub postgres_route_id: Option<String>,
+    /// Native Spanner route identity, when configured.
+    pub spanner_route_id: Option<String>,
     /// Standing identities.
     pub standing: Vec<StandingSection>,
 }
@@ -133,11 +231,11 @@ strict_section!(RawConfig,
     _watch=>"policy_watch_ms", _max=>"max_connections", _listen=>"listen", _admin=>"admin_listen", _policy=>"policy",
     _root=>"root_key_file", _state=>"state_dir", _schemas=>"schemas",
     _search=>"search_path", _refresh=>"snapshot_refresh_ms",
-    _plaintext=>"allow_plaintext", _tls=>"tls", _upstream=>"upstream", _standing=>"standing", _spanner=>"spanner_native");
+    _plaintext=>"allow_plaintext", _tls=>"tls", _upstream=>"upstream", _standing=>"standing", _spanner=>"spanner_native", _management=>"management", _session=>"session");
 strict_section!(RawUpstream,
     _dialect=>"dialect", _host=>"host", _port=>"port", _user=>"user", _password=>"password_file",
     _dbname=>"dbname", _tls=>"tls", _ca=>"ca_file", _timeout=>"connect_timeout_ms",
-    _application=>"application_name");
+    _application=>"application_name", _route=>"route_id");
 fn err(e: &mut Vec<String>, field: &str, why: &str) {
     e.push(format!("{field}: {why}"));
 }
@@ -247,6 +345,8 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
             "upstream",
             "standing",
             "spanner_native",
+            "management",
+            "session",
         ],
         "config",
         &mut e,
@@ -260,26 +360,35 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     if has_upstream && listen.is_none() {
         err(&mut e, "listen", "valid address required for upstream");
     }
-    let spanner_native =
-        m.remove("spanner_native")
-            .and_then(|v| match crate::spanner_serve::parse_section(&v) {
-                Ok(section) => {
-                    let parts: Vec<_> = section.database.split('/').collect();
-                    if parts.len() != 6
-                        || parts[0] != "projects"
-                        || parts[2] != "instances"
-                        || parts[4] != "databases"
-                        || [1, 3, 5].iter().any(|&i| parts[i].is_empty())
-                    {
-                        err(&mut e, "spanner_native", "invalid database path");
-                    }
-                    Some(section)
+    let mut spanner_route_id = None;
+    let spanner_native = m.remove("spanner_native").and_then(|mut v| {
+        if let Value::Table(t) = &mut v {
+            spanner_route_id = Some(route_id(
+                t.remove("route_id"),
+                "spanner-native",
+                "spanner_native.route_id",
+                &mut e,
+            ));
+        }
+        match crate::spanner_serve::parse_section(&v) {
+            Ok(section) => {
+                let parts: Vec<_> = section.database.split('/').collect();
+                if parts.len() != 6
+                    || parts[0] != "projects"
+                    || parts[2] != "instances"
+                    || parts[4] != "databases"
+                    || [1, 3, 5].iter().any(|&i| parts[i].is_empty())
+                {
+                    err(&mut e, "spanner_native", "invalid database path");
                 }
-                Err(_) => {
-                    err(&mut e, "spanner_native", "invalid configuration");
-                    None
-                }
-            });
+                Some(section)
+            }
+            Err(_) => {
+                err(&mut e, "spanner_native", "invalid configuration");
+                None
+            }
+        }
+    });
     if !has_upstream && spanner_native.is_none() {
         err(&mut e, "config", "at least one route is required");
     }
@@ -325,34 +434,19 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         err(&mut e, "max_connections", "must be from 1 to 10000");
     }
     let allow_plaintext = get(&mut m, "allow_plaintext", &mut e).unwrap_or(false);
-    let tls = m.remove("tls").and_then(|v| {
-        let t = table(v, &["cert_file", "key_file"], "tls", &mut e);
-        match Value::Table(t).try_into::<TlsSection>() {
-            Ok(mut t) => {
-                if t.cert_file.as_os_str().is_empty() || t.key_file.as_os_str().is_empty() {
-                    err(&mut e, "tls", "paths must be nonempty");
-                }
-                t.cert_file = resolve(base, t.cert_file);
-                t.key_file = resolve(base, t.key_file);
-                if load_tls(&t).is_err() {
-                    err(&mut e, "tls", "cannot load certificate and key");
-                }
-                Some(t)
-            }
-            Err(_) => {
-                err(&mut e, "tls", "certificate and key paths required");
-                None
-            }
-        }
-    });
+    let tls = m
+        .remove("tls")
+        .and_then(|v| parse_tls(v, base, "tls", &mut e));
     if !allow_plaintext && tls.is_none() {
         err(&mut e, "tls", "required unless allow_plaintext is true");
     }
+    let mut postgres_route_id = None;
     let mut dialect = UpstreamDialect::default();
     let upstream = m.remove("upstream").map(|uv| {
         let mut u = table(
             uv,
             &[
+                "route_id",
                 "dialect",
                 "host",
                 "port",
@@ -370,6 +464,12 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         if Value::Table(u.clone()).try_into::<RawUpstream>().is_err() {
             err(&mut e, "upstream", "invalid fields");
         }
+        postgres_route_id = Some(route_id(
+            u.remove("route_id"),
+            "postgres",
+            "upstream.route_id",
+            &mut e,
+        ));
         dialect = get(&mut u, "dialect", &mut e).unwrap_or_default();
         let host: String = req(&mut u, "host", &mut e);
         let user: String = req(&mut u, "user", &mut e);
@@ -459,10 +559,80 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
             err(&mut e, "standing", "expected array of tables");
         }
     }
+    if postgres_route_id.is_some() && postgres_route_id == spanner_route_id {
+        err(&mut e, "route_id", "routes must have distinct ids");
+    }
+    let session = m
+        .remove("session")
+        .map(|v| parse_session(v, &mut e))
+        .unwrap_or_default();
+    let management = m.remove("management").and_then(|v| {
+        let mut t = table(v, &["listen", "tls", "admin"], "management", &mut e);
+        let address = t
+            .remove("listen")
+            .and_then(|v| v.as_str().and_then(|s| s.parse::<SocketAddr>().ok()));
+        let tls = t
+            .remove("tls")
+            .and_then(|v| parse_tls(v, base, "management.tls", &mut e));
+        let mut admins = Vec::new();
+        let mut names = std::collections::BTreeSet::new();
+        let invalid = "management: invalid admin configuration";
+        if let Some(v) = t.remove("admin") {
+            if let Value::Array(entries) = v {
+                for v in entries {
+                    match v.try_into::<RawStanding>() {
+                        Ok(raw) => {
+                            let secret = Zeroizing::new(raw.verifier);
+                            match ScramVerifier::parse(&secret) {
+                                Some(verifier)
+                                    if !raw.name.is_empty() && names.insert(raw.name.clone()) =>
+                                {
+                                    admins.push(AdminSection {
+                                        name: raw.name,
+                                        verifier,
+                                    });
+                                }
+                                _ => e.push(invalid.into()),
+                            }
+                        }
+                        Err(_) => e.push(invalid.into()),
+                    }
+                }
+            } else {
+                e.push(invalid.into());
+            }
+        }
+        let Some(address) = address else {
+            err(&mut e, "management", "valid listen address required");
+            return None;
+        };
+        if !address.ip().is_loopback() && tls.is_none() {
+            err(&mut e, "management", "non-loopback listen requires tls");
+        }
+        let native_address = spanner_native
+            .as_ref()
+            .and_then(|s| s.listen.parse::<SocketAddr>().ok());
+        if Some(address) == listen || address == admin_listen || Some(address) == native_address {
+            err(
+                &mut e,
+                "management",
+                "listen conflicts with another listener",
+            );
+        }
+        Some(ManagementSection {
+            listen: address,
+            tls,
+            admins,
+        })
+    });
     if !e.is_empty() {
         return Err(e);
     }
     Ok(Config {
+        session,
+        management,
+        postgres_route_id,
+        spanner_route_id,
         listen,
         admin_listen,
         policy,
@@ -480,6 +650,78 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         upstream,
         spanner_native,
     })
+}
+fn route_id(value: Option<Value>, default: &str, field: &str, e: &mut Vec<String>) -> String {
+    let id = match value {
+        None => return default.into(),
+        Some(Value::String(s)) => s,
+        Some(_) => {
+            err(e, field, "invalid route id");
+            return default.into();
+        }
+    };
+    let valid = !id.is_empty()
+        && id.len() <= 63
+        && id
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && id.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        });
+    if !valid {
+        err(e, field, "invalid route id");
+    }
+    id
+}
+fn parse_session(v: Value, e: &mut Vec<String>) -> SessionSettings {
+    let mut t = table(v, &["max_lifetime", "idle_timeout"], "session", e);
+    let mut settings = SessionSettings::default();
+    if let Some(v) = t.remove("max_lifetime") {
+        match v.as_str().and_then(parse_duration) {
+            Some(d) if (Duration::from_secs(60)..=Duration::from_secs(30 * 86400)).contains(&d) => {
+                settings.max_lifetime = d
+            }
+            _ => err(e, "session", "invalid max_lifetime"),
+        }
+    }
+    if let Some(v) = t.remove("idle_timeout") {
+        if v.as_str() == Some("off") {
+            settings.idle_timeout = None;
+        } else {
+            match v.as_str().and_then(parse_duration) {
+                Some(d) => settings.idle_timeout = Some(d),
+                None => err(e, "session", "invalid idle_timeout"),
+            }
+        }
+    }
+    if settings
+        .idle_timeout
+        .is_some_and(|d| d < Duration::from_secs(60) || d > settings.max_lifetime)
+    {
+        err(e, "session", "invalid idle_timeout");
+    }
+    settings
+}
+fn parse_tls(v: Value, base: &Path, field: &str, e: &mut Vec<String>) -> Option<TlsSection> {
+    let t = table(v, &["cert_file", "key_file"], field, e);
+    match Value::Table(t).try_into::<TlsSection>() {
+        Ok(mut t) => {
+            if t.cert_file.as_os_str().is_empty() || t.key_file.as_os_str().is_empty() {
+                err(e, field, "paths must be nonempty");
+            }
+            t.cert_file = resolve(base, t.cert_file);
+            t.key_file = resolve(base, t.key_file);
+            if load_tls(&t).is_err() {
+                err(e, field, "cannot load certificate and key");
+            }
+            Some(t)
+        }
+        Err(_) => {
+            err(e, field, "certificate and key paths required");
+            None
+        }
+    }
 }
 fn valid_ca(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
@@ -557,6 +799,233 @@ dbname = "app"
 password_file = "password"
 tls = "disable"
 "#;
+    const NATIVE: &str = "\n[spanner_native]\nlisten='127.0.0.1:6433'\ndatabase='projects/p/instances/i/databases/d'\n";
+    #[test]
+    fn duration_grammar_and_overflow() {
+        for (text, secs) in [
+            ("1s", 1),
+            ("60m", 3600),
+            ("8h", 28800),
+            ("30d", 2592000),
+            ("001s", 1),
+            ("18446744073709551615s", u64::MAX),
+        ] {
+            assert_eq!(parse_duration(text), Some(Duration::from_secs(secs)));
+        }
+        for text in [
+            "",
+            "s",
+            "0h",
+            "0s",
+            "1",
+            "1ms",
+            "1S",
+            "-1h",
+            "+1h",
+            "8 h",
+            " 8h",
+            "8h ",
+            "1.5h",
+            "\u{ff11}h",
+            "18446744073709551616s",
+            "18446744073709551615m",
+        ] {
+            assert_eq!(parse_duration(text), None);
+        }
+    }
+    #[test]
+    fn session_defaults_bounds_and_requested_lifetimes() {
+        let f = Fixture::new();
+        let c = f.load(EXAMPLE).unwrap();
+        assert_eq!(c.session, SessionSettings::default());
+        assert_eq!(c.session.max_lifetime, Duration::from_secs(28800));
+        assert_eq!(c.session.idle_timeout, Some(Duration::from_secs(3600)));
+        assert!(c.management.is_none());
+        assert_eq!(c.session.lifetime_for(None), Ok(c.session.max_lifetime));
+        assert_eq!(
+            c.session.lifetime_for(Some(Duration::from_nanos(1))),
+            Ok(Duration::from_nanos(1))
+        );
+        assert_eq!(
+            c.session.lifetime_for(Some(c.session.max_lifetime)),
+            Ok(c.session.max_lifetime)
+        );
+        assert_eq!(
+            c.session.lifetime_for(Some(Duration::ZERO)),
+            Err(LifetimeError::Zero)
+        );
+        assert_eq!(
+            c.session.lifetime_for(Some(Duration::from_secs(28801))),
+            Err(LifetimeError::AboveMaximum)
+        );
+        for section in [
+            "",
+            "max_lifetime='30d'",
+            "max_lifetime='60s'\nidle_timeout='60s'",
+            "idle_timeout='off'",
+            "max_lifetime='60s'\nidle_timeout='off'",
+        ] {
+            let cfg = f.load(&format!("{EXAMPLE}\n[session]\n{section}")).unwrap();
+            if section.contains("'off'") {
+                assert!(cfg.session.idle_timeout.is_none());
+            }
+        }
+        for section in [
+            "max_lifetime='0h'",
+            "max_lifetime='31d'",
+            "max_lifetime='59s'",
+            "max_lifetime='8 h'",
+            "max_lifetime='-1h'",
+            "max_lifetime=8",
+            "idle_timeout='9h'",
+            "idle_timeout='0h'",
+            "idle_timeout='59s'",
+            "idle_timeout=1",
+            "idle_timeout='OFF'",
+            "max_lifetime='60s'",
+            "unknown='PRIVATE'",
+        ] {
+            let errors = f
+                .load(&format!("{EXAMPLE}\n[session]\n{section}"))
+                .unwrap_err();
+            assert!(errors.iter().all(|s| s.starts_with("session:")));
+            assert!(!format!("{errors:?}").contains("PRIVATE"));
+        }
+        assert!(
+            f.load(&EXAMPLE.replace("[upstream]", "session = 'bad'\n[upstream]"))
+                .is_err()
+        );
+    }
+    #[test]
+    fn route_id_defaults_overrides_and_refusals() {
+        let f = Fixture::new();
+        let c = f.load(EXAMPLE).unwrap();
+        assert_eq!(c.postgres_route_id.as_deref(), Some("postgres"));
+        assert_eq!(c.spanner_route_id, None);
+        let c = f.load(&format!("{EXAMPLE}{NATIVE}")).unwrap();
+        assert_eq!(c.spanner_route_id.as_deref(), Some("spanner-native"));
+        let native_only = format!("{}{NATIVE}", EXAMPLE.split("[upstream]").next().unwrap());
+        assert_eq!(f.load(&native_only).unwrap().postgres_route_id, None);
+        for id in ["custom.route_1-2", "0", &"x".repeat(63)] {
+            let text = EXAMPLE.replace("[upstream]", &format!("[upstream]\nroute_id='{id}'"));
+            assert_eq!(
+                f.load(&text).unwrap().postgres_route_id.as_deref(),
+                Some(id)
+            );
+            assert_eq!(
+                f.load(&format!("{native_only}route_id='{id}'"))
+                    .unwrap()
+                    .spanner_route_id
+                    .as_deref(),
+                Some(id)
+            );
+        }
+        for id in ["Upper", "", &"x".repeat(64), "a/b", "_a", ".a", "-a", "\u{e9}"] {
+            let errors = f
+                .load(&EXAMPLE.replace("[upstream]", &format!("[upstream]\nroute_id='{id}'")))
+                .unwrap_err();
+            assert!(errors.contains(&"upstream.route_id: invalid route id".into()));
+            let errors = f
+                .load(&format!("{native_only}route_id='{id}'"))
+                .unwrap_err();
+            assert!(errors.contains(&"spanner_native.route_id: invalid route id".into()));
+        }
+        for text in [
+            EXAMPLE.replace("[upstream]", "[upstream]\nroute_id=1"),
+            format!("{native_only}route_id=1"),
+        ] {
+            assert!(f.load(&text).is_err());
+        }
+        let errors = f
+            .load(&format!("{EXAMPLE}{NATIVE}route_id='postgres'"))
+            .unwrap_err();
+        assert!(errors.contains(&"route_id: routes must have distinct ids".into()));
+        assert!(
+            f.load(&format!("{EXAMPLE}{NATIVE}route_id='valid'\nunknown=true"))
+                .is_err()
+        );
+    }
+    #[test]
+    fn management_addresses_and_strict_fields() {
+        let f = Fixture::new();
+        for ip in ["127.0.0.1", "[::1]"] {
+            let c = f
+                .load(&format!("{EXAMPLE}\n[management]\nlisten='{ip}:6481'"))
+                .unwrap();
+            let m = c.management.unwrap();
+            assert!(m.tls.is_none());
+            assert!(m.admins.is_empty());
+        }
+        for ip in ["10.0.0.5", "0.0.0.0", "[::]"] {
+            let errors = f
+                .load(&format!("{EXAMPLE}\n[management]\nlisten='{ip}:6481'"))
+                .unwrap_err();
+            assert!(errors.contains(&"management: non-loopback listen requires tls".into()));
+        }
+        for section in [
+            "",
+            "listen='bad'",
+            "listen=1",
+            "listen='127.0.0.1:6481'\nunknown='PRIVATE'",
+        ] {
+            let errors = f
+                .load(&format!("{EXAMPLE}\n[management]\n{section}"))
+                .unwrap_err();
+            assert!(errors.iter().all(|s| s.starts_with("management:")));
+            assert!(!format!("{errors:?}").contains("PRIVATE"));
+        }
+        for port in [6432, 6433, 6480] {
+            let errors = f
+                .load(&format!(
+                    "{EXAMPLE}{NATIVE}\n[management]\nlisten='127.0.0.1:{port}'"
+                ))
+                .unwrap_err();
+            assert!(errors.contains(&"management: listen conflicts with another listener".into()));
+        }
+    }
+    #[test]
+    fn management_admins_redacted_and_validated() {
+        let f = Fixture::new();
+        let verifier = ScramVerifier::from_password("secret", b"salt", 1).to_pg_string();
+        let base = format!("{EXAMPLE}\n[management]\nlisten='127.0.0.1:6481'");
+        let entry = format!("\n[[management.admin]]\nname='PRIVATE_ADMIN'\nverifier='{verifier}'");
+        let c = f.load(&format!("{base}{entry}")).unwrap();
+        let m = c.management.unwrap();
+        assert_eq!(m.admins.len(), 1);
+        assert_eq!(m.admins[0].name, "PRIVATE_ADMIN");
+        assert_eq!(m.admins[0].verifier.to_pg_string(), verifier);
+        for debug in [format!("{m:?}"), format!("{:?}", m.admins[0])] {
+            assert!(!debug.contains(&verifier));
+            assert!(!debug.contains("PRIVATE_ADMIN"));
+        }
+        for text in [
+            format!("{base}{entry}{entry}"),
+            format!("{base}{entry}\nextra='PRIVATE'"),
+            format!("{base}{}", entry.replace("PRIVATE_ADMIN", "")),
+            format!("{base}{}", entry.replace(&verifier, "PRIVATE_VERIFIER")),
+            format!("{base}\n[[management.admin]]\nname='PRIVATE_ADMIN'"),
+            format!("{base}\nadmin='PRIVATE'"),
+        ] {
+            let errors = f.load(&text).unwrap_err();
+            assert_eq!(errors, vec!["management: invalid admin configuration"]);
+        }
+    }
+    #[test]
+    fn management_tls_rejects_invalid_files_and_fields() {
+        let f = Fixture::new();
+        let base = format!("{EXAMPLE}\n[management]\nlisten='10.0.0.5:6481'");
+        for invalid in [
+            "tls={cert_file='missing',key_file='mgmt.key'}",
+            "tls={cert_file='mgmt.crt'}",
+            "tls={cert_file='',key_file=''}",
+            "tls={cert_file='mgmt.crt',key_file='mgmt.key',unknown='PRIVATE'}",
+            "tls='PRIVATE'",
+        ] {
+            let errors = f.load(&format!("{base}\n{invalid}")).unwrap_err();
+            assert!(errors.iter().any(|s| s.starts_with("management.tls:")));
+            assert!(!format!("{errors:?}").contains("PRIVATE"));
+        }
+    }
     #[test]
     fn policy_watch_interval_bounds() {
         let f = Fixture::new();
