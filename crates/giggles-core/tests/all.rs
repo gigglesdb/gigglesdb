@@ -2,6 +2,8 @@
 #![allow(clippy::duplicate_mod)]
 #[path = "native_paging.rs"]
 mod native_paging;
+#[path = "alter_add_column_if_not_exists.rs"]
+mod alter_add_column_if_not_exists;
 #[path = "typed_leaf_read.rs"]
 mod typed_leaf_read;
 #[path = "view_select.rs"]

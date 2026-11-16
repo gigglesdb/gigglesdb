@@ -119,7 +119,7 @@ fn cascade(engine: Engine) {
         run(&mut s, "DROP TYPE IF EXISTS absent CASCADE");
         assert_eq!(
             take_sql_notices(),
-            vec![("type \"absent\" does not exist, skipping".into(), None)]
+            vec![("type \"absent\" does not exist, skipping".into(), None, None)]
         );
         run(&mut s, "CREATE DOMAIN only_type AS int");
         run(&mut s, "CREATE TABLE only_table (v only_type)");

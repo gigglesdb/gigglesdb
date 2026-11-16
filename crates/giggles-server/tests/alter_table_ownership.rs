@@ -8,6 +8,174 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn add_column_if_not_exists_notices_and_ownership_over_pgwire() {
+    use giggles_server::{
+        auth::{PostgresqlConfig, TlsMode, serve_postgresql},
+        pgwire::{frame, z},
+    };
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
+    async fn cycle(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut messages = Vec::new();
+            loop {
+                let tag = stream.read_u8().await.unwrap();
+                let len = stream.read_u32().await.unwrap();
+                assert!((4..65536).contains(&len));
+                let mut body = vec![0; len as usize - 4];
+                stream.read_exact(&mut body).await.unwrap();
+                messages.push((tag, body));
+                if tag == b'Z' {
+                    return messages;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    async fn connect(address: std::net::SocketAddr, user: &str) -> TcpStream {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let mut body = 196608u32.to_be_bytes().to_vec();
+        z("user", &mut body);
+        z(user, &mut body);
+        z("database", &mut body);
+        z("postgres", &mut body);
+        body.push(0);
+        stream.write_u32((body.len() + 4) as u32).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        let messages = cycle(&mut stream).await;
+        assert!(!messages.iter().any(|m| m.0 == b'E'), "{messages:?}");
+        stream
+    }
+    async fn query(stream: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+        let mut body = Vec::new();
+        z(sql, &mut body);
+        let mut packet = Vec::new();
+        frame(b'Q', &body, &mut packet).unwrap();
+        stream.write_all(&packet).await.unwrap();
+        cycle(stream).await
+    }
+    fn field(body: &[u8], tag: u8) -> &str {
+        let mut fields = body.split(|b| *b == 0).filter(|f| !f.is_empty());
+        let value = fields.find(|f| f[0] == tag).unwrap();
+        std::str::from_utf8(&value[1..]).unwrap()
+    }
+    fn completed(messages: &[(u8, Vec<u8>)], command: &str) {
+        assert!(!messages.iter().any(|m| m.0 == b'E'), "{messages:?}");
+        let completion = messages.iter().find(|m| m.0 == b'C').unwrap();
+        assert_eq!(&completion.1[..completion.1.len() - 1], command.as_bytes());
+    }
+
+    let root = std::env::var_os("GIGGLES_TEST_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = root.join(format!(
+        "alter-add-wire-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let admin = Admin::create_engine(
+        path.join("db.redb"),
+        Limits::default(),
+        giggles_core::Engine::V2,
+    )
+    .unwrap();
+    for (name, superuser) in [("owner", true), ("other", false)] {
+        admin
+            .roles()
+            .create(NewRole {
+                name: name.into(),
+                login: true,
+                superuser,
+                ..NewRole::default()
+            })
+            .unwrap();
+    }
+    let service = Service::new(admin.clone(), vec![], Clock::new(0, 3600).unwrap()).unwrap();
+    let config = PostgresqlConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tls: TlsMode::Disabled,
+        certificate: None,
+        private_key: None,
+        client_ca: None,
+        certificates: BTreeMap::new(),
+        databases: vec!["postgres".into()],
+        loopback_trust: true,
+        connections: 8,
+    };
+    let pg = serve_postgresql(
+        config.listen,
+        service.clone(),
+        Arc::new(config.build().unwrap()),
+    )
+    .await
+    .unwrap();
+    let mut owner = connect(pg.address, "owner").await;
+    for (sql, command) in [
+        ("CREATE SCHEMA _skedaddle", "CREATE SCHEMA"),
+        (
+            "CREATE TABLE _skedaddle.apply_progress (stream text PRIMARY KEY)",
+            "CREATE TABLE",
+        ),
+    ] {
+        completed(&query(&mut owner, sql).await, command);
+    }
+    let sql = "ALTER TABLE _skedaddle.apply_progress ADD COLUMN IF NOT EXISTS record_kind smallint, ADD COLUMN IF NOT EXISTS manifest_digest bytea, ADD COLUMN IF NOT EXISTS previous_manifest_digest bytea";
+    let first = query(&mut owner, sql).await;
+    completed(&first, "ALTER TABLE");
+    assert!(!first.iter().any(|m| m.0 == b'N'));
+    let second = query(&mut owner, sql).await;
+    completed(&second, "ALTER TABLE");
+    let notices: Vec<_> = second.iter().filter(|m| m.0 == b'N').collect();
+    assert_eq!(notices.len(), 3);
+    for (notice, column) in
+        notices
+            .iter()
+            .zip(["record_kind", "manifest_digest", "previous_manifest_digest"])
+    {
+        assert_eq!(field(&notice.1, b'C'), "42701");
+        assert_eq!(field(&notice.1, b'S'), "NOTICE");
+        assert_eq!(
+            field(&notice.1, b'M'),
+            format!("column \"{column}\" of relation \"apply_progress\" already exists, skipping")
+        );
+    }
+    let existing = query(&mut owner, "DROP VIEW IF EXISTS missing_view").await;
+    completed(&existing, "DROP VIEW");
+    let notice = existing.iter().find(|m| m.0 == b'N').unwrap();
+    assert_eq!(field(&notice.1, b'C'), "00000");
+    assert_eq!(
+        field(&notice.1, b'M'),
+        "view \"missing_view\" does not exist, skipping"
+    );
+    let mut other = connect(pg.address, "other").await;
+    for denied in [
+        sql,
+        "ALTER TABLE _skedaddle.apply_progress ADD IF NOT EXISTS record_kind varchar(0)",
+    ] {
+        let response = query(&mut other, denied).await;
+        let error = response.iter().find(|m| m.0 == b'E').unwrap();
+        assert_eq!(field(&error.1, b'C'), "42501");
+        assert!(!response.iter().any(|m| m.0 == b'N' || m.0 == b'C'));
+    }
+    drop(other);
+    drop(owner);
+    pg.shutdown().await.unwrap();
+    drop(service);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 #[test]
 fn alter_requires_owner_and_rename_publishes_authority_atomically() {
     let root = std::env::var_os("GIGGLES_TEST_ARTIFACTS")

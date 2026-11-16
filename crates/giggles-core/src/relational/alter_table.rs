@@ -9,7 +9,13 @@ pub(super) struct AlterTable {
 }
 #[derive(Debug, Clone)]
 pub(super) enum Action {
-    Add(ColumnDef, Option<i32>, Option<String>, Option<SqlError>),
+    Add(
+        ColumnDef,
+        Option<i32>,
+        Option<String>,
+        Option<SqlError>,
+        bool,
+    ),
     Drop(String, bool, bool),
     RenameColumn(String, String),
     RenameTable(String),
@@ -26,7 +32,7 @@ impl AlterTable {
         self.actions
             .iter()
             .filter_map(|action| match action {
-                Action::Add(_, _, Some(sql), _) | Action::Default(_, Some(sql)) => Some(sql),
+                Action::Add(_, _, Some(sql), _, _) | Action::Default(_, Some(sql)) => Some(sql),
                 _ => None,
             })
             .flat_map(|sql| defaults::dependencies(sql).unwrap_or_default())
@@ -89,30 +95,24 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                 if !explicit_column && (p.word("check") || p.word("primary") || p.word("foreign")) {
                     return Err(SqlError::Unsupported);
                 }
+                let if_not_exists = p.word("if");
+                if if_not_exists {
+                    p.need("not")?;
+                    p.need("exists")?;
+                }
                 let name = raw_name(p)?;
                 if !matches!(p.tokens.get(p.at), Some(Token::Word(_))) {
                     return Err(SqlError::Syntax);
                 }
-                let ddl_type::Parsed {
-                    data_type,
-                    typmod,
-                    semantic_error,
-                } = ddl_type::parse(p, ddl_type::Site::Alter)?;
-                let mut not_null = false;
-                let mut default = None;
-                loop {
-                    if p.word("not") {
-                        p.need("null")?;
-                        not_null = true;
-                    } else if p.word("default") {
-                        if default.is_some() {
-                            return Err(SqlError::Syntax);
-                        }
-                        default = Some(defaults::parse_alter_untyped(p)?);
-                    } else {
-                        break;
-                    }
-                }
+                let (
+                    ddl_type::Parsed {
+                        data_type,
+                        typmod,
+                        semantic_error,
+                    },
+                    not_null,
+                    default,
+                ) = parse_add_definition(p, if_not_exists)?;
                 Action::Add(
                     ColumnDef {
                         id: 0,
@@ -123,6 +123,7 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                     typmod,
                     default,
                     semantic_error,
+                    if_not_exists,
                 )
             }
         } else if p.word("drop") {
@@ -220,6 +221,106 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
         resolution_error,
     })
 }
+fn parse_add_definition(
+    p: &mut Parser,
+    if_not_exists: bool,
+) -> R<(ddl_type::Parsed, bool, Option<String>)> {
+    let type_start = p.at;
+    let mut parsed = match ddl_type::parse(p, ddl_type::Site::Alter) {
+        Ok(parsed) => parsed,
+        // An unknown type name is semantic, but its modifiers must still have
+        // valid syntax. Defer the existing Unsupported error until execution.
+        Err(SqlError::Unsupported) if if_not_exists && p.at == type_start + 1 => {
+            if p.sym('.') {
+                raw_name(p)?;
+            }
+            if p.sym('(') {
+                p.expr().map_err(add_modifier_syntax)?;
+                while p.sym(',') {
+                    p.expr().map_err(add_modifier_syntax)?;
+                }
+                p.punct(')')?;
+            }
+            while p.sym('[') {
+                p.punct(']')?;
+            }
+            ddl_type::Parsed {
+                data_type: DataType::Text,
+                typmod: None,
+                semantic_error: Some(SqlError::Unsupported),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    let mut not_null = false;
+    let mut default = None;
+    loop {
+        if p.word("not") {
+            p.need("null")?;
+            not_null = true;
+        } else if p.word("default") {
+            if default.is_some() {
+                return Err(SqlError::Syntax);
+            }
+            let default_start = p.at;
+            match defaults::parse_alter_untyped(p) {
+                Ok(sql) => default = Some(sql),
+                // The bounded default evaluator rejects functions/expressions
+                // that the general grammar can parse. A skipped ADD must not
+                // evaluate them, but malformed expressions still fail parsing.
+                Err(SqlError::Unsupported) if if_not_exists => {
+                    p.at = default_start;
+                    parse_skippable_default(p)?;
+                    parsed.semantic_error = Some(SqlError::Unsupported);
+                    default = Some(String::new());
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            break;
+        }
+    }
+    Ok((parsed, not_null, default))
+}
+fn parse_skippable_default(p: &mut Parser) -> R<()> {
+    let start = p.at;
+    let mut depth = 0usize;
+    while let Some(token) = p.tokens.get(p.at) {
+        match token {
+            Token::Symbol(',' | ';') if depth == 0 => break,
+            Token::Word(word)
+                if depth == 0
+                    && word == "not"
+                    && matches!(p.tokens.get(p.at + 1), Some(Token::Word(w)) if w == "null") =>
+            {
+                break;
+            }
+            Token::Symbol('(') => depth += 1,
+            Token::Symbol(')') => depth = depth.checked_sub(1).ok_or(SqlError::Syntax)?,
+            _ => {}
+        }
+        p.at += 1;
+    }
+    if depth != 0 || start == p.at {
+        return Err(SqlError::Syntax);
+    }
+    let mut tokens = vec![Token::Word("select".into())];
+    tokens.extend_from_slice(&p.tokens[start..p.at]);
+    let mut syntax = Parser {
+        tokens,
+        at: 0,
+        params: BTreeSet::new(),
+        relations: Vec::new(),
+    };
+    query::Query::parse(&mut syntax)?;
+    Ok(())
+}
+fn add_modifier_syntax(error: SqlError) -> SqlError {
+    match error {
+        SqlError::Unsupported => SqlError::Syntax,
+        other => other,
+    }
+}
 pub(super) fn raw_names(p: &mut Parser) -> R<Vec<String>> {
     p.punct('(')?;
     let mut names = vec![raw_name(p)?];
@@ -284,7 +385,15 @@ pub(super) fn execute(
             Action::DropConstraint(name, optional, cascade) => {
                 constraints::drop_named_cascade(&mut candidate, &table, name, *optional, *cascade)?
             }
-            Action::Add(column, typmod, default, semantic_error) => {
+            Action::Add(column, typmod, default, semantic_error, if_not_exists) => {
+                if *if_not_exists
+                    && column.name != "ctid"
+                    && table.columns.iter().any(|c| c.name == column.name)
+                {
+                    ident::ident(&column.name)?;
+                    user_types::duplicate_column_notice(&column.name, &table.name);
+                    continue;
+                }
                 if let Some(error) = semantic_error {
                     return Err(error.clone());
                 }

@@ -2,8 +2,9 @@
 pub use super::catalog_ext::TypeDef;
 use super::*;
 
+type SqlNotice = (String, Option<String>, Option<&'static str>);
 thread_local! {
-    static SQL_NOTICES: std::cell::RefCell<Vec<(String, Option<String>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SQL_NOTICES: std::cell::RefCell<Vec<SqlNotice>> = const { std::cell::RefCell::new(Vec::new()) };
     static SQL_ERROR_MESSAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 /// Consume the diagnostic immediately after a synchronous SQL call on this thread.
@@ -14,14 +15,21 @@ pub fn take_sql_error_message() -> Option<String> {
 pub(super) fn invalid_type_modifier_error() {
     SQL_ERROR_MESSAGE.with(|message| *message.borrow_mut() = Some("invalid type modifier".into()));
 }
-pub fn take_sql_notices() -> Vec<(String, Option<String>)> {
+pub fn take_sql_notices() -> Vec<SqlNotice> {
     SQL_NOTICES.with(|notices| std::mem::take(&mut *notices.borrow_mut()))
 }
 pub(super) fn view_recreate_error() {
     SQL_ERROR_MESSAGE.with(|message| *message.borrow_mut() = Some("view projection bindings unavailable; recreate the view".into()));
 }
 pub(super) fn view_missing_notice(name: &str) {
-    SQL_NOTICES.with(|notices| notices.borrow_mut().push((format!("view \"{name}\" does not exist, skipping"), None)));
+    SQL_NOTICES.with(|notices| notices.borrow_mut().push((format!("view \"{name}\" does not exist, skipping"), None, None)));
+}
+pub(super) fn duplicate_column_notice(column: &str, table: &str) {
+    SQL_NOTICES.with(|notices| notices.borrow_mut().push((
+        format!("column \"{column}\" of relation \"{table}\" already exists, skipping"),
+        None,
+        Some("42701"),
+    )));
 }
 pub(super) fn view_replace_error(message: String) {
     SQL_ERROR_MESSAGE.with(|pending| *pending.borrow_mut() = Some(message));
@@ -350,7 +358,7 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
                     if !optional {
                         return Err(SqlError::UndefinedObject);
                     }
-                    notices.push((format!("type \"{name}\" does not exist, skipping"), None));
+                    notices.push((format!("type \"{name}\" does not exist, skipping"), None, None));
                     continue;
                 };
                 if *domain && !matches!(ty, TypeDef::Domain { .. }) {
@@ -464,11 +472,12 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
             candidate.secondary =
                 candidate.secondary_build_complete_engine(&descriptors, &mut || false)?;
             if detail.len() == 1 {
-                notices.push((detail[0].clone(), None));
+                notices.push((detail[0].clone(), None, None));
             } else if !detail.is_empty() {
                 notices.push((
                     format!("drop cascades to {} other objects", detail.len()),
                     Some(detail.join("\n")),
+                    None,
                 ));
             }
             *state = candidate;

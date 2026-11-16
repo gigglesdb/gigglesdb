@@ -2021,7 +2021,7 @@ impl Prepared {
         let action = match action {
             A::AddColumn { column } => Action::Add(ColumnDef {
                 id: 0, name: column.name, data_type: column.data_type, not_null: column.not_null,
-            }, None, None, None),
+            }, None, None, None, false),
             A::DropColumn { name, cascade } => Action::Drop(name, false, cascade),
             A::RenameColumn { from, to } => Action::RenameColumn(from, to),
             A::RenameTable { to } => Action::RenameTable(to),

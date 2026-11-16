@@ -676,12 +676,12 @@ fn complete(command: &str, r: &SqlResult, out: &mut Vec<u8>) -> R<()> {
         body.push(0);
         frame(b'N', &body, out)?;
     }
-    for (message, detail) in giggles_core::relational::take_sql_notices() {
+    for (message, detail, code) in giggles_core::relational::take_sql_notices() {
         let mut body = vec![];
         for (field, value) in [
             (b'S', "NOTICE"),
             (b'V', "NOTICE"),
-            (b'C', "00000"),
+            (b'C', code.unwrap_or("00000")),
             (b'M', message.as_str()),
         ] {
             body.push(field);
