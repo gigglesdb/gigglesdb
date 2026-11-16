@@ -7,6 +7,7 @@
 //! these settings and preserve float bits which PostgreSQL text cannot carry.
 
 mod array;
+pub mod gigglesdb;
 mod json;
 pub mod mysql;
 mod numeric;
