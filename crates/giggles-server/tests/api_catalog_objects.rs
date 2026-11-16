@@ -52,9 +52,9 @@ async fn constraints_sql_twins_and_authority() {
             if code=="ok" {assert_eq!(reply["catalogOutcome"]["table"],"app.t"); assert!(reply["catalogOutcome"]["indexId"].is_null());}
         }
         for fixture in [&f,&twin] {fixture.service.role_session("owner").unwrap().execute_sql("INSERT INTO app.p VALUES(1)",&[]).unwrap();}
-        // Legacy native catalog retains its populated-database planning gate; SQL DDL remains synchronous.
-        let populated=execute(&f,&token,add("populated",json!({"unique":{"columns":["id"]}})),grpc).await;
-        assert_eq!(populated["nativeError"]["kind"],"NATIVE_ERROR_CLASS_PLAN_REQUIRED");
+        // On a populated Legacy database native ADD/DROP CONSTRAINT runs SQL's DDL executor and succeeds as SQL does (PG18.6).
+        assert_code(&execute(&f,&token,add("populated",json!({"unique":{"columns":["id"]}})),grpc).await,"ok");
+        assert_code(&execute(&f,&token,json!({"catalog":{"dropConstraint":{"table":"app.t","name":"populated"}}}),grpc).await,"ok");
         sql.execute_sql("ALTER TABLE app.t ADD CONSTRAINT populated UNIQUE(id)",&[]).unwrap(); sql.execute_sql("ALTER TABLE app.t DROP CONSTRAINT populated",&[]).unwrap();
         for (q,code) in [("INSERT INTO app.t VALUES(1,0)","23514"),("INSERT INTO app.t VALUES(1,2)","23503"),("INSERT INTO app.t VALUES(1,1)","ok"),("INSERT INTO app.t VALUES(2,1)","23505"),("DELETE FROM app.p WHERE id=1","ok")] {
             for fixture in [&f,&twin] {let result=fixture.service.role_session("owner").unwrap().execute_sql(q,&[]); assert_eq!(result.as_ref().err().map(giggles_server::sqlstate).unwrap_or("ok"),code,"{q}: {result:?}");}
@@ -69,10 +69,9 @@ async fn constraints_sql_twins_and_authority() {
         }
         for fixture in [&f,&twin] {let mut session=fixture.service.role_session("owner").unwrap();
             session.execute_sql("INSERT INTO app.t VALUES(3,99)",&[]).unwrap(); session.execute_sql("DELETE FROM app.t WHERE id=3",&[]).unwrap();}
-        // Wire expressions are shared, but core's native CHECK compiler is narrower than SQL.
+        // Native CHECK accepts the same expressions as SQL CHECK (PG18.6 accepts NOT(v > 0)).
         let rich=json!({"catalog":{"addConstraint":{"table":"app.t","name":"rich","check":{"expression":{"notExpr":{"compare":{"left":{"field":"v"},"comparison":"NATIVE_COMPARISON_GT","right":{"value":{"literal":{"intValue":"0"}}}}}}}}}});
-        let reply=execute(&f,&token,rich,grpc).await; assert_eq!(reply["code"],"native_error");
-        assert_eq!(reply["nativeError"]["kind"],"NATIVE_ERROR_CLASS_UNSUPPORTED"); assert!(reply["nativeError"]["sqlstate"].is_null());
+        assert_code(&execute(&f,&token,rich,grpc).await,"ok");
         sql.execute_sql("ALTER TABLE app.t ADD CONSTRAINT rich CHECK(NOT(v > 0))",&[]).unwrap();
         f.admin.roles().grant_schema("app","reader",&[SchemaPrivilege::Usage]).unwrap();
         for application in [false,true] {
