@@ -13,6 +13,8 @@
 //! namespaces 2 (tasks), 4 (approvals), 6 (accounting): 9 bytes.
 //! Internal namespace 255 (mutation stamp): 1 byte, with an empty value.
 //! SQL namespaces 5 and 8 are never persisted in Keyspace::Kernel.
+//! Namespaces 0x20..=0x2B hold protected task records (`task::records`); they
+//! are not part of the legacy image and `load` does not read them.
 use super::{
     hlc::Ts,
     kv::{Direction, Keyspace, Kv},
@@ -20,8 +22,12 @@ use super::{
     mvcc,
     txn::{Isolation, SerializationReason, Transaction, TxnError},
 };
-use crate::{CoreError, storage};
-use std::{collections::BTreeMap, ops::Bound::Unbounded, time::Instant};
+use crate::{CoreError, storage, task::records};
+use std::{
+    collections::BTreeMap,
+    ops::Bound::{Excluded, Included, Unbounded},
+    time::Instant,
+};
 
 const STAMP_KEY: &[u8] = &[0xFF];
 
@@ -159,24 +165,26 @@ impl Kernel {
 
     pub(crate) fn load(txn: &mut Transaction) -> Result<KernelImage, CoreError> {
         let mut out = BTreeMap::new();
-        for item in txn.scan(
-            Keyspace::Kernel,
-            Unbounded,
-            Unbounded,
-            Direction::Forward,
-            None,
-        )? {
-            let (key, value) = item?;
-            if key == STAMP_KEY {
-                if !value.is_empty() {
-                    return Err(CoreError::Corrupt("kernel mutation stamp value".into()));
+        // The protected task namespaces 0x20..=0x2B are not legacy records and
+        // can be large; skip them with two scans instead of reading them.
+        let protected_end = [records::NS_MAX + 1];
+        for (start, end) in [
+            (Unbounded, Excluded(&[records::NS_MIN][..])),
+            (Included(&protected_end[..]), Unbounded),
+        ] {
+            for item in txn.scan(Keyspace::Kernel, start, end, Direction::Forward, None)? {
+                let (key, value) = item?;
+                if key == STAMP_KEY {
+                    if !value.is_empty() {
+                        return Err(CoreError::Corrupt("kernel mutation stamp value".into()));
+                    }
+                    continue;
                 }
-                continue;
+                if !valid_key(&key) {
+                    return Err(CoreError::Corrupt("kernel namespace or key length".into()));
+                }
+                out.insert(key, value);
             }
-            if !valid_key(&key) {
-                return Err(CoreError::Corrupt("kernel namespace or key length".into()));
-            }
-            out.insert(key, value);
         }
         // Bootstrap must explicitly stage metadata (for example from an empty
         // domain-zero image to the chosen nonzero domain). An absent image is

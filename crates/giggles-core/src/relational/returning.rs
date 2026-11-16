@@ -16,6 +16,14 @@ impl Returning {
         self.query.bind_schema_names(bind, state, path);
     }
 
+    pub(super) fn query(&self) -> &query::Query {
+        &self.query
+    }
+
+    pub(super) fn query_mut(&mut self) -> &mut query::Query {
+        &mut self.query
+    }
+
     pub(super) fn reads_columns(&self) -> bool {
         self.query.projection_reads_columns()
     }

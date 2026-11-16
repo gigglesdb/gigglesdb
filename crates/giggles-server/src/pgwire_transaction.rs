@@ -214,6 +214,7 @@ pub(super) fn read_only_check(
         "CREATE VIEW" => "cannot execute CREATE VIEW in a read-only transaction",
         "DROP VIEW" => "cannot execute DROP VIEW in a read-only transaction",
         "COMMENT" => "cannot execute COMMENT in a read-only transaction",
+        "SECURITY LABEL" => "cannot execute SECURITY LABEL in a read-only transaction",
         "ALTER TABLE" => "cannot execute ALTER TABLE in a read-only transaction",
         "CREATE TYPE" => "cannot execute CREATE TYPE in a read-only transaction",
         "CREATE DOMAIN" => "cannot execute CREATE DOMAIN in a read-only transaction",

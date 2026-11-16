@@ -230,3 +230,11 @@ mod fk_section_network;
 #[path = "xact_status_network.rs"] mod xact_status_network;
 #[path = "isolation_anomalies.rs"]
 mod isolation_anomalies;
+#[path = "task_only_role_sql.rs"]
+mod task_only_role_sql;
+
+#[path = "task_only_roles.rs"]
+mod task_only_roles;
+
+#[path = "role_switch_guard.rs"]
+mod role_switch_guard;

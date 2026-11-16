@@ -63,6 +63,8 @@ impl From<SqlError> for CatalogError {
 pub(crate) struct CatalogView {
     pub(crate) sql_views: BTreeMap<u64, catalog_codec::sql_views::SqlViewDef>,
     pub(crate) comments: BTreeMap<(u64, u64), String>,
+    /// Kind 21 column labels: (table id, column id) -> flags (GD-0061 R3-307).
+    pub(crate) column_labels: BTreeMap<(u64, u64), u8>,
     pub(crate) by_name: BTreeMap<String, Arc<TableEntry>>,
     pub(crate) by_id: BTreeMap<u64, Arc<TableEntry>>,
     pub(crate) names: BTreeMap<String, u64>,
@@ -71,12 +73,21 @@ pub(crate) struct CatalogView {
     pub(crate) types: BTreeMap<u64, TypeDef>,
     pub(crate) schemas: BTreeMap<String, relational::schemas::Schema>,
     pub(crate) indexes: BTreeMap<u64, relational::secondary_index::Descriptor>,
+    /// Task definitions (kind 19), live and revoked. Not part of `parts()`:
+    /// SQL DDL rebuilds parts from the relational image, and tasks have
+    /// their own writer, like roles.
+    pub(crate) tasks: BTreeMap<u64, Arc<crate::task::definition::TaskDef>>,
+    /// Task name -> id, rebuilt from `tasks`; there is no name record.
+    pub(crate) task_names: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CatalogParts {
     pub(crate) sql_views: BTreeMap<u64, catalog_codec::sql_views::SqlViewDef>,
     pub(crate) comments: BTreeMap<(u64, u64), String>,
+    /// Kind 21 column labels: (table id, column id) -> flags (GD-0061 R3-307).
+    /// Outside `ext`: no namespace-5 or CatalogExt change.
+    pub(crate) column_labels: BTreeMap<(u64, u64), u8>,
     pub(crate) tables: BTreeMap<String, TableDef>,
     pub(crate) heap: BTreeSet<u64>,
     pub(crate) indexes: Vec<relational::secondary_index::Descriptor>,
@@ -87,6 +98,7 @@ impl CatalogView {
         let mut parts = CatalogParts {
             sql_views: self.sql_views.clone(),
             comments: self.comments.clone(),
+            column_labels: self.column_labels.clone(),
             ..CatalogParts::default()
         };
         for entry in self.by_id.values() {
@@ -358,6 +370,25 @@ impl Catalog {
         Ok(self.snapshot(txn)?.parts.clone())
     }
 
+    /// The committed catalog view at `txn`'s snapshot (task catalog reads,
+    /// GD-0061). Ignores the transaction's own uncommitted catalog writes.
+    pub(crate) fn committed_view(&self, txn: &mut Transaction) -> Result<Arc<CatalogView>, CoreError> {
+        self.check().map_err(CoreError::from)?;
+        let cache = self
+            .cache
+            .lock()
+            .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
+        cache.ensure_live().map_err(CoreError::from)?;
+        let snapshot = txn.snapshot_ts();
+        if let Some(error) = txn.snapshot_error() {
+            return Err(error.clone().into());
+        }
+        match cache.view_at(snapshot) {
+            Some(view) => Ok(view),
+            None => Ok(Arc::new(load_view(&*self.services.read_view(snapshot), snapshot)?)),
+        }
+    }
+
     pub(crate) fn snapshot(
         &self,
         txn: &mut Transaction,
@@ -510,12 +541,24 @@ impl Catalog {
             deadline,
             cancel,
         )?;
+        crate::task::catalog::check_table_ddl(
+            txn,
+            &*self.services.latest_view()?,
+            old,
+            new,
+            deadline,
+            cancel,
+        )?;
         for (key, value) in &new_records {
             txn.require_features(super::content_check::required_bits_for_catalog_value(key, value).map_err(|e| corrupt(&e.to_string()))?);
         }
         self.lock_and_write(txn, &old_records, &new_records, deadline, cancel)?;
         if !new.indexes.is_empty() {
             txn.require_features(super::meta::SECONDARY_INDEXES);
+        }
+        if new.column_labels != old.column_labels {
+            // Labels (and their tombstones) need TASK_CATALOG, which needs role_catalog.
+            txn.require_features(super::meta::TASK_CATALOG | super::super::roles::engine::FEATURE);
         }
         if !new.ext.is_empty() {
             txn.require_features(1 << 6);
@@ -759,6 +802,7 @@ impl Catalog {
         let mut new = old.clone();
         new.tables.remove(name);
         new.comments.retain(|(table, _), _| *table != entry.def.id);
+        new.column_labels.retain(|(table, _), _| *table != entry.def.id);
         new.heap.remove(&entry.def.id);
         new.indexes.retain(|d| d.table != entry.def.id);
         for column in &entry.def.columns {
@@ -857,6 +901,27 @@ impl Catalog {
                 if txn.catalog_own(&table_key(id)).is_none() && txn.catalog_own(&catalog_codec::sql_views::view_key(id)).is_none()
                     && catalog_codec::validate_comments(&BTreeMap::from([((id, column), String::new())]), latest.by_id.values().map(|e| &e.def), &latest.sql_views).is_err() {
                     return Err(TxnError::Serialization(SerializationReason::WriteConflict));
+                }
+            }
+            // A label racing a DROP of its table or column is stale, like a comment.
+            if key.first() == Some(&super::catalog_label_codec::LABEL_KIND) && value.is_some() {
+                let (id, column) = super::catalog_label_codec::decode_label_key(key).map_err(commit_error)?;
+                if txn.catalog_own(&table_key(id)).is_none()
+                    && !latest.by_id.get(&id).is_some_and(|e| e.def.columns.iter().any(|c| c.id == column)) {
+                    return Err(TxnError::Serialization(SerializationReason::WriteConflict));
+                }
+            }
+            if key.first() == Some(&1) {
+                let id = decode_id(&key[1..9]).map_err(commit_error)?;
+                let retained: BTreeSet<u64> = match value {
+                    None => BTreeSet::new(),
+                    Some(v) => decode_entry(v).map_err(commit_error)?.def.columns.iter().map(|c| c.id).collect(),
+                };
+                for &(table, column) in latest.column_labels.keys().filter(|(table, _)| *table == id) {
+                    if !retained.contains(&column)
+                        && !matches!(txn.catalog_own(&super::catalog_label_codec::label_key(table, column)), Some(None)) {
+                        return Err(TxnError::Serialization(SerializationReason::WriteConflict));
+                    }
                 }
             }
             if matches!(key.first(), Some(1 | 17)) {
@@ -999,6 +1064,14 @@ fn apply_record(
                 view.sql_views.remove(&id);
             }
         }
+        CatalogKind::ColumnLabel => {
+            let owner = super::catalog_label_codec::decode_label_key(key)?;
+            if let Some(value) = value {
+                view.column_labels.insert(owner, super::catalog_label_codec::decode_label(value)?);
+            } else {
+                view.column_labels.remove(&owner);
+            }
+        }
         CatalogKind::RelationComment => {
             let owner = (
                 decode_id(&key[1..9])?,
@@ -1099,6 +1172,18 @@ fn apply_record(
                 view.indexes.remove(&id);
             }
         }
+        CatalogKind::Task => {
+            let id = decode_id(&key[1..])?;
+            if let Some(value) = value {
+                view.tasks
+                    .insert(id, Arc::new(crate::task::catalog::decode_task(key, value)?));
+                if view.tasks.len() > crate::task::definition::MAX_TASKS {
+                    return Err(CoreError::Limit);
+                }
+            } else {
+                view.tasks.remove(&id);
+            }
+        }
         CatalogKind::RoleBootstrap => {}
         CatalogKind::Role
         | CatalogKind::RoleMembership
@@ -1119,6 +1204,7 @@ fn finish_view(
 ) -> Result<CatalogView, CoreError> {
     view.by_name.clear();
     catalog_codec::validate_comments(&view.comments, view.by_id.values().map(|entry| &entry.def), &view.sql_views)?;
+    super::catalog_label_codec::validate_labels(&view.column_labels, view.by_id.values().map(|entry| &entry.def))?;
     if !view.sql_views.is_empty() {
         let parts = view.parts();
         catalog_codec::sql_views::validate_catalog(&parts)?;
@@ -1200,6 +1286,17 @@ fn finish_view(
         relational::catalog_ext::validate_key_targets(&parts.ext, parts.tables.values(), parts.indexes.iter(), u64::MAX).map_err(|_| corrupt("invalid referenced key or primary birth"))?;
     }
     view.names = names;
+    view.task_names.clear();
+    for (id, task) in &view.tasks {
+        if view.task_names.insert(task.name.as_str().to_owned(), *id).is_some() {
+            return Err(corrupt("duplicate task name"));
+        }
+        // A DDL that would strand a live task fails before anything is
+        // written (commit_ddl runs overlay_view first); 2BP01 there.
+        if !task.revoked && !view.by_id.contains_key(&task.table) {
+            return Err(CoreError::Sql(SqlError::DependentObjects));
+        }
+    }
     if !view.schemas.is_empty()
         || !view.types.is_empty()
         || view.by_name.keys().any(|name| name.contains('\0'))
@@ -1264,7 +1361,14 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
     relational::catalog_ext::validate_unique_indexes(parts.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))), parts.indexes.iter()).map_err(|_| corrupt("invalid UNIQUE backing index"))?;
     object_ids(parts)?;
     relational::catalog_ext::validate_key_targets(&parts.ext, parts.tables.values(), parts.indexes.iter(), u64::MAX).map_err(|_| corrupt("invalid referenced key or primary birth"))?;
+    super::catalog_label_codec::validate_labels(&parts.column_labels, parts.tables.values())?;
     let mut records = BTreeMap::new();
+    for (&(table, column), &flags) in &parts.column_labels {
+        records.insert(
+            super::catalog_label_codec::label_key(table, column),
+            super::catalog_label_codec::encode_label(flags)?,
+        );
+    }
     for (&(relation, column), text) in &parts.comments {
         records.insert(
             catalog_codec::comment_key(relation, column),

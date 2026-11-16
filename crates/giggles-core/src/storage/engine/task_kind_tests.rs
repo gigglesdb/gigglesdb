@@ -1,0 +1,356 @@
+//! Catalog kind 19 (task definitions), the TASK_CATALOG bit, its commit gate
+//! and the open check (GD-0061 R3-102, design section 3).
+use super::{
+    catalog::Catalog,
+    codec,
+    commit::{ManualClock, Sequencer, SequencerConfig},
+    content_check,
+    hlc::Ts,
+    kv::{Durability, Keyspace, Kv, KvBackend, KvRead, WriteBatch},
+    kv_mem::MemKv,
+    locks::{LockConfig, LockManager, TxnId},
+    meta::{self, FormatError, TASK_CATALOG},
+    mvcc,
+    seq::SequenceAllocator,
+    txn::{Isolation, Transaction, TxnError},
+};
+use crate::{
+    relational::{ColumnDef, DataType, TableDef},
+    task::{
+        catalog::{decode_task, encode_task, task_key},
+        definition::{
+            ColumnMode, DisclosureCaps, LoadLimits, MutationCaps, PredicateText, TaskDef, TaskName,
+            TaskObjectId, WallClockMs,
+        },
+    },
+};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
+
+const ROLES: u64 = crate::storage::roles::engine::FEATURE;
+
+struct Fixture {
+    mem: Arc<MemKv>,
+    seq: Arc<Sequencer>,
+    locks: Arc<LockManager>,
+    catalog: Catalog,
+}
+
+fn open(mem: Arc<MemKv>) -> Result<Fixture, crate::CoreError> {
+    let kv = Arc::new(Kv::new(mem.clone()));
+    let seq = Sequencer::open(
+        kv.clone(),
+        Arc::new(ManualClock::new(10)),
+        SequencerConfig {
+            group_max: 0,
+            group_wait: Duration::ZERO,
+            ..SequencerConfig::default()
+        },
+    )
+    .unwrap();
+    let locks = Arc::new(LockManager::new(LockConfig::default()));
+    let catalog = Catalog::open(seq.clone(), locks.clone(), Arc::new(SequenceAllocator::new(kv, 64)))?;
+    Ok(Fixture { mem, seq, locks, catalog })
+}
+
+fn setup() -> Fixture {
+    open(Arc::new(MemKv::new())).unwrap()
+}
+
+fn txn(f: &Fixture, id: u64) -> Transaction {
+    Transaction::begin(&f.seq, &f.locks, TxnId(id), Isolation::ReadCommitted)
+}
+
+/// Creates table "shipments" and returns its id.
+fn create_table(f: &Fixture) -> u64 {
+    let column = |name: &str| ColumnDef {
+        id: 0,
+        name: name.into(),
+        data_type: DataType::BigInt,
+        not_null: name == "delivery_id",
+    };
+    let mut tx = txn(f, 1);
+    let entry = f
+        .catalog
+        .create_table(
+            &mut tx,
+            TableDef {
+                id: 0,
+                name: "shipments".into(),
+                columns: vec![column("delivery_id"), column("merchant_id")],
+                primary_key: vec![0],
+            },
+            false,
+            None,
+            &|| false,
+        )
+        .unwrap();
+    f.catalog.commit_ddl(tx).unwrap();
+    entry.def.id
+}
+
+fn task(id: u64, name: &str, table: u64) -> TaskDef {
+    TaskDef {
+        id: TaskObjectId(id),
+        name: TaskName::new(name).unwrap(),
+        def_version: 1,
+        issuer: "issuer".into(),
+        executor: "agent".into(),
+        approver: None,
+        table,
+        visible_rows: PredicateText("merchant_id = 42".into()),
+        columns: BTreeMap::from([("id".to_string(), ColumnMode::Readable)]),
+        untrusted_allowed: BTreeSet::new(),
+        allowed_write: None,
+        mutation_caps: MutationCaps::default(),
+        disclosure_caps: DisclosureCaps { rows_read: 10, rows_returned: 10, bytes_returned: 4096 },
+        limits: LoadLimits::default(),
+        approval_threshold: 0,
+        expires_at: WallClockMs(1_793_899_800_000),
+        revoked: false,
+        grants: BTreeMap::new(),
+    }
+}
+
+fn put_task(f: &Fixture, txn_id: u64, def: &TaskDef, features: u64) -> Result<Ts, TxnError> {
+    let mut tx = txn(f, txn_id);
+    tx.require_features(features);
+    tx.put(Keyspace::Catalog, task_key(def.id.0), encode_task(def).unwrap())
+        .unwrap();
+    f.catalog.commit_ddl(tx)
+}
+
+fn features(kv: &dyn KvRead) -> u64 {
+    kv.get(Keyspace::Meta, b"features")
+        .unwrap()
+        .map_or(0, |value| u64::from_be_bytes(value.try_into().unwrap()))
+}
+
+fn raw(mem: &MemKv, space: Keyspace, key: Vec<u8>, value: Vec<u8>) {
+    let mut batch = WriteBatch::default();
+    batch.put(space, key, value);
+    mem.write(batch, Durability::Sync).unwrap();
+}
+
+/// A raw catalog version, bypassing the sequencer's gate and overlay check.
+fn raw_catalog(mem: &MemKv, key: Vec<u8>, ts: u64, value: Option<Vec<u8>>) {
+    raw(
+        mem,
+        Keyspace::Catalog,
+        codec::user_key_seek_at(&key, Ts(ts)),
+        value.map_or_else(mvcc::encode_tombstone, |v| mvcc::encode_live(&v)),
+    );
+}
+
+/// Make forged versions at timestamps below 100 visible to a reopened sequencer.
+fn seal(mem: &MemKv) {
+    raw(mem, Keyspace::Meta, b"last_commit_ts".to_vec(), 100u64.to_be_bytes().to_vec());
+}
+
+fn view(f: &Fixture) -> Arc<super::catalog::CatalogView> {
+    f.catalog.view_at(f.seq.visible_ts()).unwrap()
+}
+
+#[test]
+fn commit_without_bit_is_refused() {
+    let f = setup();
+    let table = create_table(&f);
+    let before = features(f.seq.kv());
+    // A raw kind-19 put whose transaction never asked for TASK_CATALOG.
+    assert!(put_task(&f, 2, &task(500, "inc-436", table), ROLES).is_err());
+    assert_eq!(features(f.seq.kv()) & TASK_CATALOG, 0);
+    assert_eq!(features(f.seq.kv()) & !ROLES, before);
+    assert!(view(&f).tasks.is_empty());
+    // TASK_CATALOG without role_catalog is not a valid feature set either.
+    assert!(put_task(&f, 3, &task(500, "inc-436", table), TASK_CATALOG).is_err());
+    assert_eq!(features(f.seq.kv()) & TASK_CATALOG, 0);
+    assert!(view(&f).task_names.is_empty());
+}
+
+#[test]
+fn commit_with_bit_sets_features() {
+    let f = setup();
+    let table = create_table(&f);
+    let def = task(500, "inc-436", table);
+    put_task(&f, 2, &def, TASK_CATALOG | ROLES).unwrap();
+    assert_eq!(features(f.seq.kv()) & (TASK_CATALOG | ROLES), TASK_CATALOG | ROLES);
+    let view = view(&f);
+    assert_eq!(view.tasks.get(&500).map(|t| t.as_ref()), Some(&def));
+    assert_eq!(view.task_names, BTreeMap::from([("inc-436".to_string(), 500)]));
+    // Not part of the SQL catalog parts.
+    assert_eq!(view.parts(), {
+        let mut plain = view.as_ref().clone();
+        plain.tasks.clear();
+        plain.task_names.clear();
+        plain.parts()
+    });
+}
+
+#[test]
+fn reopen_loads_task_into_view() {
+    let f = setup();
+    let table = create_table(&f);
+    let live = task(500, "inc-436", table);
+    let mut revoked = task(501, "inc-437", table);
+    revoked.revoked = true;
+    revoked.def_version = 2;
+    put_task(&f, 2, &live, TASK_CATALOG | ROLES).unwrap();
+    put_task(&f, 3, &revoked, TASK_CATALOG | ROLES).unwrap();
+    let bits = features(f.seq.kv());
+    content_check::check(f.seq.kv(), bits).unwrap();
+    let reopened = open(Arc::new(f.mem.crash())).unwrap();
+    let view = view(&reopened);
+    assert_eq!(view.tasks.len(), 2);
+    assert_eq!(view.tasks[&500].as_ref(), &live);
+    assert_eq!(view.tasks[&501].as_ref(), &revoked);
+    assert_eq!(view.task_names["inc-437"], 501);
+}
+
+#[test]
+fn open_rejects_task_record_when_bit_cleared() {
+    let f = setup();
+    let table = create_table(&f);
+    put_task(&f, 2, &task(500, "inc-436", table), TASK_CATALOG | ROLES).unwrap();
+    let cleared = features(f.seq.kv()) & !TASK_CATALOG;
+    raw(&f.mem, Keyspace::Meta, b"features".to_vec(), cleared.to_be_bytes().to_vec());
+    assert_eq!(features(f.seq.kv()), cleared);
+    assert!(matches!(
+        content_check::check(f.seq.kv(), cleared),
+        Err(FormatError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn open_rejects_duplicate_task_name() {
+    let f = setup();
+    let table = create_table(&f);
+    put_task(&f, 2, &task(500, "inc-436", table), TASK_CATALOG | ROLES).unwrap();
+    // The overlay check refuses a second task with the same name.
+    assert!(put_task(&f, 3, &task(501, "inc-436", table), TASK_CATALOG | ROLES).is_err());
+    assert_eq!(view(&f).tasks.len(), 1);
+    // Forged on disk (revoked, so only the name rule applies), both open
+    // paths refuse it.
+    let mem = MemKv::new();
+    for id in [500, 501] {
+        let mut def = task(id, "inc-436", 77);
+        def.revoked = true;
+        raw_catalog(&mem, task_key(id), 5, Some(encode_task(&def).unwrap()));
+    }
+    seal(&mem);
+    assert!(matches!(
+        content_check::check(&mem, TASK_CATALOG | ROLES),
+        Err(FormatError::Corrupt(_))
+    ));
+    assert!(matches!(open(Arc::new(mem)), Err(crate::CoreError::Corrupt(_))));
+}
+
+#[test]
+fn open_rejects_live_task_on_missing_table() {
+    let f = setup();
+    let table = create_table(&f);
+    // The commit path refuses it before anything is written.
+    assert!(matches!(
+        put_task(&f, 2, &task(500, "inc-436", table + 1000), TASK_CATALOG | ROLES),
+        Err(TxnError::DependentObjects)
+    ));
+    // Dropping the table of a live task fails with 2BP01 too: the R3-106
+    // dependency guard (task::catalog::check_table_ddl) refuses it while the
+    // DDL is staged, before anything is written.
+    put_task(&f, 3, &task(500, "inc-436", table), TASK_CATALOG | ROLES).unwrap();
+    let mut tx = txn(&f, 4);
+    assert!(matches!(
+        f.catalog.drop_table(&mut tx, "shipments", None, &|| false),
+        Err(super::catalog::CatalogError::Core(crate::CoreError::Sql(
+            crate::relational::SqlError::DependentObjects
+        )))
+    ));
+    drop(tx);
+    assert!(view(&f).by_id.contains_key(&table));
+    // Forged on disk, both open paths refuse it.
+    let mem = MemKv::new();
+    raw_catalog(&mem, task_key(500), 5, Some(encode_task(&task(500, "inc-436", 77)).unwrap()));
+    seal(&mem);
+    assert!(matches!(
+        content_check::check(&mem, TASK_CATALOG | ROLES),
+        Err(FormatError::Corrupt(_))
+    ));
+    assert!(matches!(open(Arc::new(mem)), Err(crate::CoreError::Corrupt(_))));
+}
+
+#[test]
+fn revoked_task_on_missing_table_opens() {
+    let mut def = task(500, "inc-436", 77);
+    def.revoked = true;
+    def.def_version = 2;
+    let mem = MemKv::new();
+    raw_catalog(&mem, task_key(500), 5, Some(encode_task(&def).unwrap()));
+    seal(&mem);
+    content_check::check(&mem, TASK_CATALOG | ROLES).unwrap();
+    let f = open(Arc::new(mem)).unwrap();
+    assert_eq!(view(&f).tasks[&500].as_ref(), &def);
+    // The table of a revoked task may also be dropped.
+    let g = setup();
+    let table = create_table(&g);
+    let mut revoked = task(500, "inc-436", table);
+    revoked.revoked = true;
+    put_task(&g, 2, &revoked, TASK_CATALOG | ROLES).unwrap();
+    let mut tx = txn(&g, 3);
+    g.catalog.drop_table(&mut tx, "shipments", None, &|| false).unwrap();
+    g.catalog.commit_ddl(tx).unwrap();
+    assert!(view(&g).tasks.contains_key(&500));
+}
+
+#[test]
+fn tombstoned_task_key_still_requires_bit() {
+    assert_eq!(
+        content_check::required_bits_for_catalog_key(&task_key(500)).unwrap(),
+        TASK_CATALOG
+    );
+    assert!(content_check::required_bits_for_catalog_key(&[19, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    assert!(content_check::required_bits_for_catalog_key(&[19, 0, 1]).is_err());
+    let mem = MemKv::new();
+    raw_catalog(&mem, task_key(500), 5, None);
+    assert!(matches!(content_check::check(&mem, ROLES), Err(FormatError::Corrupt(_))));
+    content_check::check(&mem, TASK_CATALOG | ROLES).unwrap();
+    // A tombstone over a live version needs it too.
+    let mem = MemKv::new();
+    raw_catalog(&mem, task_key(500), 5, Some(encode_task(&task(500, "t", 77)).unwrap()));
+    raw_catalog(&mem, task_key(500), 6, None);
+    assert!(matches!(content_check::check(&mem, ROLES), Err(FormatError::Corrupt(_))));
+    content_check::check(&mem, TASK_CATALOG | ROLES).unwrap();
+    // The value check decodes the record.
+    let mut value = encode_task(&task(500, "t", 77)).unwrap();
+    assert_eq!(
+        content_check::required_bits_for_catalog_value(&task_key(500), &value).unwrap(),
+        TASK_CATALOG
+    );
+    value.push(0);
+    assert!(content_check::required_bits_for_catalog_value(&task_key(500), &value).is_err());
+    assert_eq!(decode_task(&task_key(500), &value[..value.len() - 1]).unwrap().name.as_str(), "t");
+}
+
+#[test]
+fn bit_20_without_role_catalog_is_corrupt() {
+    assert_eq!(TASK_CATALOG, 1 << 20);
+    assert!(matches!(meta::check_features(TASK_CATALOG), Err(FormatError::Corrupt(_))));
+    assert!(matches!(meta::check_features(TASK_CATALOG | 0x3FF), Err(FormatError::Corrupt(_))));
+    meta::check_features(TASK_CATALOG | ROLES).unwrap();
+    let mut batch = WriteBatch::default();
+    assert!(meta::put_features(&mut batch, TASK_CATALOG).is_err());
+    assert!(batch.is_empty());
+}
+
+#[test]
+fn unknown_bit_22_is_unsupported() {
+    // Bit 18 is RANGES, bit 19 WIDE_ONCE_RECEIPTS, bit 20 TASK_CATALOG and
+    // bit 21 PROTECTED_RECORDS (R3-600); bit 22 is the first unassigned one.
+    for bits in [1 << 22, (1 << 22) | TASK_CATALOG | ROLES, 1 << 22 | TASK_CATALOG] {
+        assert_eq!(
+            meta::check_features(bits),
+            Err(FormatError::Unsupported("feature bits".into()))
+        );
+    }
+}

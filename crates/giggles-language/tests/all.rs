@@ -47,6 +47,7 @@ mod native_parity;
 #[path = "native_create_fk21_parity.rs"] mod native_create_fk21_parity;
 #[path = "native_schema_parity.rs"]
 mod native_schema_parity;
+#[path = "native_task_definition.rs"] mod native_task_definition;
 #[path = "native_sqlstate_parity.rs"]
 mod native_sqlstate_parity;
 #[path = "native_view_parity.rs"]

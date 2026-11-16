@@ -423,24 +423,248 @@ fn table_reclamation_is_watermark_gated_and_isolates_neighbor_ids_including_maxi
     assert!(batches.iter().flatten().any(|op| matches!(op, Op::DeleteRange { ks: Keyspace::Rows, start, end } if start == &7u64.to_be_bytes() && end == &8u64.to_be_bytes())));
 }
 
+fn deletes_in(ops: &[Op]) -> usize {
+    ops.iter()
+        .filter(|op| matches!(op, Op::Delete { .. }))
+        .count()
+}
+
+fn cursor_writes(ops: &[Op]) -> usize {
+    ops.iter()
+        .filter(|op| {
+            matches!(
+                op,
+                Op::Put {
+                    ks: Keyspace::Gc,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
 #[test]
-fn oversized_key_group_errors_without_deletion_or_cursor_movement() {
+fn hot_key_with_250k_versions_is_collected() {
+    const VERSIONS: u64 = 250_000;
     let backend = Arc::new(RecordingKv::default());
     let mut batch = WriteBatch::default();
-    let user = row(7, 1);
-    for at in 0..100_001 {
-        version(&mut batch, Keyspace::Rows, &user, Ts(at), Some(b"v"));
+    let hot = row(7, 1);
+    let next = row(7, 2);
+    for at in 0..VERSIONS {
+        version(&mut batch, Keyspace::Rows, &hot, Ts(at), Some(b"v"));
+    }
+    version(&mut batch, Keyspace::Rows, &next, ts(10), Some(b"old"));
+    version(&mut batch, Keyspace::Rows, &next, ts(20), Some(b"new"));
+    seed(backend.as_ref(), ts(100), batch);
+    let (kv, _, gc) = open(backend.clone(), Duration::ZERO);
+    assert_eq!(gc.advance().unwrap(), ts(100));
+    backend.batches.lock().unwrap().clear();
+
+    let step = gc.step(Keyspace::Rows, 20_000).unwrap();
+    assert_eq!(
+        (step.examined, step.deleted, step.keys, step.wrapped),
+        (VERSIONS as usize, VERSIONS as usize - 1, 1, false),
+        "the whole hot group is processed in one step, never refused"
+    );
+    let batches = backend.batches.lock().unwrap().clone();
+    assert_eq!(
+        batches.len(),
+        25,
+        "249,999 deletes go out in 10,000-delete chunks"
+    );
+    for ops in &batches {
+        assert!(deletes_in(ops) <= super::DELETE_BATCH);
+    }
+    assert_eq!(
+        batches.iter().map(|ops| deletes_in(ops)).sum::<usize>(),
+        VERSIONS as usize - 1
+    );
+    let (last, chunks) = batches.split_last().unwrap();
+    assert!(chunks.iter().all(|ops| cursor_writes(ops) == 0));
+    assert_eq!(
+        cursor_writes(last),
+        1,
+        "the cursor moves only with the last batch"
+    );
+    let hot_left: Vec<_> = records(kv.as_ref(), Keyspace::Rows)
+        .into_iter()
+        .filter(|(raw, _)| codec::split_versioned(raw).unwrap().0 == hot)
+        .collect();
+    assert_eq!(
+        hot_left,
+        vec![(
+            codec::user_key_seek_at(&hot, Ts(VERSIONS - 1)),
+            mvcc::encode_live(b"v")
+        )]
+    );
+    assert_eq!(gc.stats().versions_deleted_total, VERSIONS - 1);
+
+    let rest = gc.step(Keyspace::Rows, 20_000).unwrap();
+    assert_eq!((rest.examined, rest.deleted, rest.keys), (2, 1, 1));
+    assert!(rest.wrapped);
+    assert_eq!(records(kv.as_ref(), Keyspace::Rows).len(), 2);
+}
+
+/// Every write is made durable and its crash image recorded, so each image is
+/// the process state a crash between two GC batches would leave.
+#[derive(Default)]
+struct ImagingKv {
+    inner: Arc<MemKv>,
+    images: Mutex<Vec<MemKv>>,
+}
+
+impl KvRead for ImagingKv {
+    fn get(&self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        self.inner.get(ks, key)
+    }
+
+    fn range(
+        &self,
+        ks: Keyspace,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        dir: Direction,
+    ) -> Result<KvIter<'_>, KvError> {
+        self.inner.range(ks, start, end, dir)
+    }
+}
+
+impl KvBackend for ImagingKv {
+    fn write(&self, batch: WriteBatch, durability: Durability) -> Result<(), KvError> {
+        let deletes = batch.ops().iter().any(|op| matches!(op, Op::Delete { .. }));
+        self.inner.write(batch, durability)?;
+        if deletes {
+            self.inner.flush_barrier()?;
+            self.images.lock().unwrap().push(self.inner.crash());
+        }
+        Ok(())
+    }
+
+    fn flush_barrier(&self) -> Result<(), KvError> {
+        self.inner.flush_barrier()
+    }
+
+    fn snapshot(&self) -> Result<Arc<dyn KvRead>, KvError> {
+        self.inner.snapshot()
+    }
+
+    fn engine_name(&self) -> &'static str {
+        "gc-imaging-mem"
+    }
+}
+
+/// The value a snapshot at `at` reads for `user`: the newest version <= at.
+fn read_at(kv: &dyn KvRead, user: &[u8], at: Ts) -> Option<Vec<u8>> {
+    records(kv, Keyspace::Rows)
+        .into_iter()
+        .filter_map(|(raw, value)| {
+            let (key, version) = codec::split_versioned(&raw).unwrap();
+            (key == user && version <= at).then_some((version, value))
+        })
+        .max_by_key(|(version, _)| *version)
+        .and_then(|(_, value)| mvcc::decode(&value).unwrap().map(|live| live.to_vec()))
+}
+
+#[test]
+fn tombstone_anchor_deleted_last() {
+    const OLDER: u64 = 25_000;
+    let backend = Arc::new(ImagingKv::default());
+    let mut batch = WriteBatch::default();
+    let hot = row(7, 1);
+    for at in 0..OLDER {
+        version(&mut batch, Keyspace::Rows, &hot, Ts(at), Some(b"old"));
+    }
+    version(&mut batch, Keyspace::Rows, &hot, ts(50), None);
+    seed(backend.as_ref(), ts(100), batch);
+    let (kv, _, gc) = open(backend.clone(), Duration::ZERO);
+    let watermark = gc.advance().unwrap();
+    assert_eq!(watermark, ts(100));
+    assert_eq!(read_at(kv.as_ref(), &hot, watermark), None);
+    backend.images.lock().unwrap().clear();
+
+    let step = gc.step(Keyspace::Rows, 1).unwrap();
+    assert_eq!(step.deleted, OLDER as usize + 1);
+    assert!(step.wrapped);
+    assert!(records(kv.as_ref(), Keyspace::Rows).is_empty());
+    let images = std::mem::take(&mut *backend.images.lock().unwrap());
+    assert_eq!(images.len(), 3, "two chunks, then the group's final batch");
+    let tombstone = codec::user_key_seek_at(&hot, ts(50));
+    for (index, image) in images.iter().enumerate() {
+        let last = index + 1 == images.len();
+        // No crash image resurrects an older value at any snapshot >= W.
+        for at in [watermark, ts(150), Ts(u64::MAX)] {
+            assert_eq!(read_at(image, &hot, at), None, "image {index} at {at:?}");
+        }
+        assert_eq!(
+            image.get(Keyspace::Rows, &tombstone).unwrap().is_some(),
+            !last,
+            "image {index}: the tombstone anchor goes only with the last batch"
+        );
+        assert_eq!(
+            image
+                .get(Keyspace::Gc, &[Keyspace::Rows as u8])
+                .unwrap()
+                .is_some(),
+            last,
+            "image {index}: the cursor is written only with the last batch"
+        );
+    }
+
+    // Recovery from a crash between chunks finishes the group cleanly.
+    let mid = Arc::new(images.into_iter().next().unwrap());
+    assert_eq!(
+        records(mid.as_ref(), Keyspace::Rows).len(),
+        OLDER as usize + 1 - super::DELETE_BATCH
+    );
+    let (kv, _, recovered) = open(mid, Duration::ZERO);
+    assert_eq!(recovered.watermark(), watermark);
+    sweep(&recovered, Keyspace::Rows, 1);
+    assert!(records(kv.as_ref(), Keyspace::Rows).is_empty());
+}
+
+#[test]
+fn versions_above_watermark_are_kept() {
+    const SIDE: u64 = 15_000;
+    let backend = Arc::new(RecordingKv::default());
+    let mut batch = WriteBatch::default();
+    let hot = row(7, 1);
+    let anchor = ts(50);
+    for offset in 1..=SIDE {
+        version(
+            &mut batch,
+            Keyspace::Rows,
+            &hot,
+            Ts(anchor.0 + offset),
+            Some(b"above"),
+        );
+    }
+    version(&mut batch, Keyspace::Rows, &hot, anchor, Some(b"anchor"));
+    for at in 0..SIDE {
+        version(&mut batch, Keyspace::Rows, &hot, Ts(at), Some(b"old"));
     }
     seed(backend.as_ref(), ts(100), batch);
     let (kv, _, gc) = open(backend.clone(), Duration::ZERO);
-    gc.advance().unwrap();
-    let cursors = records(kv.as_ref(), Keyspace::Gc);
+    let _pin = gc.pin(anchor, "reader".into()).unwrap();
+    assert_eq!(gc.advance().unwrap(), anchor);
     backend.batches.lock().unwrap().clear();
-    assert!(gc.step(Keyspace::Rows, 1).is_err());
-    assert_eq!(records(kv.as_ref(), Keyspace::Rows).len(), 100_001);
-    assert_eq!(records(kv.as_ref(), Keyspace::Gc), cursors);
-    assert!(backend.batches.lock().unwrap().is_empty());
-    assert_eq!(gc.stats().versions_deleted_total, 0);
+
+    let step = gc.step(Keyspace::Rows, 1).unwrap();
+    assert_eq!(
+        (step.examined, step.deleted),
+        (2 * SIDE as usize + 1, SIDE as usize)
+    );
+    assert_eq!(backend.batches.lock().unwrap().len(), 2);
+    let left = records(kv.as_ref(), Keyspace::Rows);
+    assert_eq!(left.len(), SIDE as usize + 1);
+    assert!(
+        left.iter()
+            .all(|(raw, _)| codec::split_versioned(raw).unwrap().1 >= anchor)
+    );
+    assert_eq!(read_at(kv.as_ref(), &hot, anchor), Some(b"anchor".to_vec()));
+    assert_eq!(
+        read_at(kv.as_ref(), &hot, Ts(anchor.0 + 7)),
+        Some(b"above".to_vec())
+    );
 }
 
 #[test]

@@ -160,6 +160,20 @@ Asserted native/SQL differences in 0.21:
   emitted (Unsupported) (native_recovery21_parity).
 - On V2, CREATE TABLE foreign keys get ALTER TABLE ADD CONSTRAINT object IDs;
   names, columns and actions match SQL CREATE TABLE (native_create_fk21_parity).
+Profile 0.22 selects `embedded-trusted-native-0.22`, inheriting 0.21:
+- task definitions (`parse_task_with_version`, `supports_tasks`): `create task
+  "inc-436" for role repair_agent [approver oncall_lead] on [schema.]table
+  visible when EXPR [readable (..)] [masked (col [= value], ..)] [untrusted text
+  (..)] [allow update (..) from EXPR to EXPR at most N distinct rows and N
+  transitions [approve above N]] disclose at most N rows read [and N rows
+  returned] and N bytes [limits (statement_ms = N, ..)] expires
+  timestamp("..")`; `revoke task`, `show task`, `show tasks`, `grant|revoke
+  undo, inspect on task NAME to|from roles`. They lower to core's
+  `TaskStatement`, identical to the SQL parser's output; expressions render to
+  SQL predicate text (`old.` only in `from`, `new.` only in `to`, both
+  stripped; `timestamp("..")` is a quoted literal). Parse and lowering only;
+  the general statement parser does not accept these words
+  (native_task_definition).
 No version implements the complete proposed native v1 language.
 
 From the repository root in PowerShell:

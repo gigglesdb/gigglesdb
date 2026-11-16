@@ -813,6 +813,9 @@ pub(crate) enum CatalogKind {
     Index,
     SqlView,
     RelationComment,
+    Task,
+    /// Kind 21: untrusted-text column label (GD-0061 R3-307).
+    ColumnLabel,
 }
 pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError> {
     Ok(match key.first() {
@@ -836,6 +839,10 @@ pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError>
         Some(16) if key.len() == 9 => CatalogKind::Index,
         Some(17) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::SqlView,
         Some(18) if key.len() == 17 && key[1..9] != [0; 8] => CatalogKind::RelationComment,
+        Some(19) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::Task,
+        Some(kind) if *kind == super::catalog_label_codec::LABEL_KIND && key.len() == 17 && key[1..9] != [0; 8] => {
+            CatalogKind::ColumnLabel
+        }
         Some(4) if key.len() == 17 => CatalogKind::Constraint,
         Some(5) if key.len() == 9 => CatalogKind::Sequence,
         Some(6) if key.len() == 9 => CatalogKind::Type,

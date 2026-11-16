@@ -4,7 +4,7 @@ use super::{
     commit::{CommitRequest, RawOp, Sequencer, SnapshotHandle, valid_counter_key},
     hlc::Ts,
     kv::{Direction, Keyspace, KvError, KvIter, KvRead},
-    locks::{LockError, LockKey, LockManager, LockMode, TxnId},
+    locks::{LockError, LockKey, LockManager, LockMode, TASK_AUTHORITY_LOCK_TABLE, TxnId},
     mvcc,
     once_guard::{CommitGuard, GuardRejection},
     ssi_validate::{ValidationConfig, Validator},
@@ -379,6 +379,8 @@ pub(crate) struct Transaction {
     /// latest committed state (GD-0075 R5-76); see `begin_latest`.
     set_aside: Option<Snapshot>,
     validation_config: ValidationConfig,
+    /// Set once `restart_snapshot` has replaced the first snapshot (GD-0061 C2/C3).
+    restarted: bool,
 }
 impl Transaction {
     pub(crate) fn begin(
@@ -420,6 +422,7 @@ impl Transaction {
             reads: ReadSet::default(),
             set_aside: None,
             validation_config: ValidationConfig::default(),
+            restarted: false,
         };
         if isolation == Isolation::ReadCommitted {
             txn.begin_statement();
@@ -576,6 +579,54 @@ impl Transaction {
     pub(crate) fn services(&self) -> &TxnServices {
         &self.services
     }
+    /// Replaces a non-RC snapshot with a fresh one and forgets every read made
+    /// under the old one (GD-0061 C2). Only legal before anything is buffered:
+    /// no writes, raw ops or savepoint undo records. Locks, including the
+    /// `locked` entries that permit writes, are kept.
+    pub(crate) fn restart_snapshot(&mut self) -> Result<Ts, TxnError> {
+        if self.isolation == Isolation::ReadCommitted
+            || !self.writes.is_empty()
+            || !self.raw.is_empty()
+            || !self.undo.is_empty()
+        {
+            return Err(TxnError::Misuse);
+        }
+        // Unregister the old snapshot before registering the new one.
+        self.snapshot = None;
+        self.reads = ReadSet::default();
+        let ts = self.try_snapshot_ts()?;
+        self.restarted = true;
+        Ok(ts)
+    }
+    pub(crate) fn snapshot_restarted(&self) -> bool {
+        self.restarted
+    }
+    /// Records `ks[start..end]` as read without reading it, so a later commit
+    /// into the range fails SERIALIZABLE validation (GD-0061 C5). Fixes the
+    /// snapshot the range is relative to. A no-op below SERIALIZABLE.
+    pub(crate) fn track_range(
+        &mut self,
+        ks: Keyspace,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+    ) -> Result<(), TxnError> {
+        if matches!(ks, Keyspace::Meta | Keyspace::Seq | Keyspace::Gc) {
+            return Err(TxnError::Misuse);
+        }
+        if self.isolation != Isolation::Serializable {
+            return Ok(());
+        }
+        self.snapshot_ts();
+        self.reads.ranges.push(ReadRange { ks, start, end });
+        Ok(())
+    }
+    /// Buffered keys of one keyspace, deletes included.
+    pub(crate) fn written_keys(&self, ks: Keyspace) -> impl Iterator<Item = &Vec<u8>> {
+        self.writes
+            .range((ks, Vec::new())..)
+            .take_while(move |((space, _), _)| *space == ks)
+            .map(|((_, key), _)| key)
+    }
     pub(crate) fn set_validation_config(&mut self, config: ValidationConfig) {
         self.validation_config = config;
     }
@@ -609,6 +660,15 @@ impl Transaction {
             }
         };
         Ok(version.and_then(|(_, value)| value))
+    }
+    /// Latest committed Kernel value, ignoring this transaction's snapshot and
+    /// its own buffered writes (GD-0061 C6).
+    pub(crate) fn kernel_latest_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
+        // Protected records are local-only (GD-0061); a cluster gateway has no form yet.
+        let TxnServices::Local { seq, .. } = &self.services else {
+            return Err(TxnError::Unsupported);
+        };
+        Ok(mvcc::latest_version(seq.kv(), Keyspace::Kernel, key)?.and_then(|(_, value)| value))
     }
     pub(crate) fn catalog_writes(&self) -> impl Iterator<Item = (&Vec<u8>, &Option<Vec<u8>>)> {
         // Metadata reads must not walk the growing row/index overlay during COPY.
@@ -690,6 +750,34 @@ impl Transaction {
             }
             TxnServices::Cluster(cluster) => cluster.lock_sentinel(self.id, table, mode, cancel)?,
         }
+        Ok(())
+    }
+    /// Exclusive engine lock on one Kernel key, held until transaction end and
+    /// kept across savepoint rollback (GD-0061 C6, the authority hold).
+    /// Acquires without choosing or inspecting a snapshot.
+    pub(crate) fn lock_kernel_key(
+        &self,
+        key: &[u8],
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError> {
+        if key.is_empty() {
+            return Err(TxnError::Misuse);
+        }
+        // The authority hold is local-only (GD-0061); a cluster gateway has no form yet.
+        let TxnServices::Local { locks, .. } = &self.services else {
+            return Err(TxnError::Unsupported);
+        };
+        locks.acquire(
+            self.id,
+            LockKey::Row {
+                table: TASK_AUTHORITY_LOCK_TABLE,
+                pk: key.to_vec(),
+            },
+            LockMode::Exclusive,
+            deadline,
+            cancel,
+        )?;
         Ok(())
     }
     #[cfg(test)]
@@ -1136,6 +1224,15 @@ mod savepoint_tests;
 #[cfg(test)]
 #[path = "txn_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "txn_restart_tests.rs"]
+mod restart_tests;
+#[cfg(test)]
+#[path = "txn_track_tests.rs"]
+mod track_tests;
+#[cfg(test)]
+#[path = "txn_hold_tests.rs"]
+mod hold_tests;
 
 #[cfg(test)]
 mod f19_mapping_tests {

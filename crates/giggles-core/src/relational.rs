@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod alter_table;
 mod comments;
+mod security_label;
 mod views;
 #[cfg(test)]
 #[path = "relational/catalog_image_tests.rs"]
@@ -11,6 +12,9 @@ mod catalog_image_tests;
 mod constraint_acceptance_tests;
 mod constraints;
 mod ctid;
+pub(crate) mod task_predicate;
+#[cfg(test)]
+mod task_predicate_tests;
 pub(crate) use constraints::{DeferralState, Event as ConstraintEvent};
 pub(crate) mod assign;
 pub(crate) mod clock;
@@ -732,6 +736,11 @@ enum Token {
     Symbol(char),
     Op(String),
 }
+/// Token count of `s` under the relational lexer; task predicates (GD-0061)
+/// use it to reject text the SQL layer cannot lex.
+pub(crate) fn lex_tokens(s: &str) -> R<usize> {
+    lex(s).map(|t| t.len())
+}
 fn lex(s: &str) -> R<Vec<Token>> {
     let mut out = Vec::new();
     lex_into(s, &mut out, false)?;
@@ -969,6 +978,7 @@ enum Statement {
     SetConstraints(Vec<String>, bool),
     AlterTable(alter_table::AlterTable),
     Comment(comments::Comment),
+    SecurityLabel(security_label::Label),
     View(views::Ddl),
     CreateIndex(sql_index::CreateIndex),
     DropIndex(sql_index::DropIndex),
@@ -1029,6 +1039,8 @@ enum Statement {
 }
 mod schema_binding;
 pub(crate) mod schemas;
+mod task_class;
+mod task_refs;
 mod truncate;
 #[doc(hidden)]
 pub use schema_binding::relation_key;
@@ -1217,6 +1229,9 @@ impl Parser {
         }
         if self.word("comment") {
             return comments::parse(self).map(Statement::Comment);
+        }
+        if security_label::claims(&self.tokens[self.at..]) {
+            return security_label::parse(self).map(Statement::SecurityLabel);
         }
         if schemas::claims(&self.tokens) {
             return schemas::parse(self).map(Statement::Schema);
@@ -1823,7 +1838,7 @@ impl Prepared {
             Statement::Truncate { .. } | Statement::Schema(_) | Statement::TypeDdl(_) => {
                 V2Class::Ddl
             }
-            Statement::Sequence(_) | Statement::DropTable { .. } | Statement::Comment(_) | Statement::View(_) => V2Class::Ddl,
+            Statement::Sequence(_) | Statement::DropTable { .. } | Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) => V2Class::Ddl,
             Statement::Create { .. } => V2Class::Ddl,
             Statement::CreateIndex(_) | Statement::DropIndex(_) => V2Class::Ddl,
             Statement::AlterTable(alter) => {
@@ -2586,6 +2601,7 @@ impl Prepared {
             Statement::InsertExpressions(values) => Some(&values.name),
             Statement::AlterTable(alter) => Some(&alter.table),
             Statement::Comment(comment) => Some(&comment.table),
+            Statement::SecurityLabel(label) => Some(&label.table),
             Statement::CreateIndex(index) => Some(&index.table),
             Statement::DropIndex(index) => index.table.as_deref(),
             Statement::InsertMulti(insert) => Some(&insert.table),
@@ -2679,6 +2695,7 @@ impl Prepared {
                 | Statement::DropIndex(_)
                 | Statement::AlterTable(_)
                 | Statement::Comment(_)
+                | Statement::SecurityLabel(_)
                 | Statement::View(_)
                 | Statement::DropTable { .. }
         )
@@ -2731,6 +2748,7 @@ impl Prepared {
             Statement::SetConstraints(..) => "SET CONSTRAINTS",
             Statement::AlterTable(_) => "ALTER TABLE",
             Statement::Comment(_) => "COMMENT",
+            Statement::SecurityLabel(_) => "SECURITY LABEL",
             Statement::View(ref ddl) => if ddl.query.is_some() { "CREATE VIEW" } else { "DROP VIEW" },
             Statement::Create { .. } => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
@@ -3907,7 +3925,7 @@ impl Relational {
                 }
                 alter_table::execute(self, alter, &prepared.search_path, clock, &mut cancel)?;
             }
-            Statement::Comment(_) | Statement::View(_) => return Err(SqlError::Unsupported), // v2 bridge only
+            Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) => return Err(SqlError::Unsupported), // v2 bridge only
             Statement::DropTable {
                 names,
                 optional,

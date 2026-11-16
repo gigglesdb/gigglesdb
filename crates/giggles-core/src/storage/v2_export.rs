@@ -98,6 +98,10 @@ fn export_inner(
     let features: [u8; 8] = features
         .try_into()
         .map_err(|_| corrupt("features length"))?;
+    // Task databases are not exportable (GD-0061 D8); refuse before any file exists.
+    if u64::from_be_bytes(features) & engine::meta::EXPORT_REFUSED != 0 {
+        return Err(CoreError::Unsupported);
+    }
     let ts = read
         .get(Keyspace::Meta, b"last_commit_ts")?
         .map(|v| {
@@ -215,6 +219,9 @@ impl ExportRead {
         let mut header = [0; HEADER as usize];
         file.read_exact(&mut header).map_err(io)?;
         if &header[..8] != MAGIC || header[8..12] != 1u32.to_be_bytes() {
+            return Err(CoreError::Unsupported);
+        }
+        if u64::from_be_bytes(header[12..20].try_into().unwrap()) & engine::meta::EXPORT_REFUSED != 0 {
             return Err(CoreError::Unsupported);
         }
         let mut read = Self {
@@ -359,7 +366,9 @@ impl KvRead for ExportRead {
             Keyspace::Rows => 2,
             Keyspace::Index => 3,
             Keyspace::Seq => 4,
-            _ => 255,
+            // Exports carry no other keyspace (verify rejects tags above 4), so
+            // the open check's Kernel ranges need not stream the whole file.
+            _ => return Ok(Box::new(std::iter::empty())),
         };
         let start = start.map(<[u8]>::to_vec);
         let end = end.map(<[u8]>::to_vec);
@@ -420,7 +429,7 @@ pub(super) fn restore(
     }
     let read = ExportRead::open(export)?;
     read.verify()?;
-    if read.features & engine::meta::REPLICATED != 0 {
+    if read.features & (engine::meta::REPLICATED | engine::meta::EXPORT_REFUSED) != 0 {
         return Err(CoreError::Unsupported);
     }
     fs::create_dir(path).map_err(|e| {
@@ -526,3 +535,7 @@ mod tests;
 #[cfg(test)]
 #[path = "v2_export_native_tests.rs"]
 mod native_tests;
+
+#[cfg(test)]
+#[path = "v2_export_task_tests.rs"]
+mod task_tests;

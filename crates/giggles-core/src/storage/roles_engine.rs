@@ -123,6 +123,16 @@ pub(crate) fn validate_record(key: &[u8], value: &[u8]) -> Result<(), CoreError>
     Ok(())
 }
 
+/// Whether a validated role record carries the task-only attribute, which
+/// additionally requires the TASK_CATALOG feature bit.
+pub(crate) fn is_task_only_record(key: &[u8], value: &[u8]) -> bool {
+    key.first() == Some(&8)
+        && value
+            .strip_prefix(&[1])
+            .and_then(|payload| serde_json::from_slice::<CatalogRole>(payload).ok())
+            .is_some_and(|role| role.task_only)
+}
+
 pub(super) fn encode_key(raw: &[u8]) -> Result<Vec<u8>, CoreError> {
     for (index, prefix) in PREFIXES.iter().enumerate() {
         if let Some(name) = raw.strip_prefix(*prefix) {
@@ -186,7 +196,18 @@ fn lock(
     )?;
     Ok(())
 }
+/// Shared role lock for writers (tasks) that read roles but must not race a
+/// role writer, which holds the lock in AccessExclusive mode.
+pub(crate) fn lock_shared(
+    txn: &mut Transaction,
+    deadline: Option<Instant>,
+    cancel: &dyn Fn() -> bool,
+) -> Result<(), CoreError> {
+    txn.acquire_lock(LockKey::Table(ROLE_LOCK), LockMode::AccessShare, deadline, cancel)?;
+    Ok(())
+}
 fn stage(txn: &mut Transaction, before: &RoleTable, after: &RoleTable) -> Result<(), RoleError> {
+    super::task_only_invariants(after)?;
     for raw in before.0.keys().filter(|raw| !after.0.contains_key(*raw)) {
         txn.delete(Keyspace::Catalog, encode_key(raw)?)
             .map_err(CoreError::from)?;
@@ -199,6 +220,9 @@ fn stage(txn: &mut Transaction, before: &RoleTable, after: &RoleTable) -> Result
         let value = [vec![1], payload.clone()].concat();
         validate_record(&key, &value)?;
         txn.require_features(FEATURE);
+        if is_task_only_record(&key, &value) {
+            txn.require_features(crate::storage::engine::meta::TASK_CATALOG);
+        }
         txn.put(Keyspace::Catalog, key, value)
             .map_err(CoreError::from)?;
     }
@@ -218,6 +242,7 @@ pub(super) fn write<T>(
     let before = load_txn(&mut txn)?;
     let mut after = before.clone();
     let result = change(&mut after)?;
+    crate::task::catalog::check_role_change(&mut txn, &before, &after)?;
     stage(&mut txn, &before, &after)?;
     db.catalog().commit_ddl(txn).map_err(CoreError::from)?;
     Ok(result)

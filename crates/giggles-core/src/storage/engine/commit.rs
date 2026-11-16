@@ -788,6 +788,16 @@ fn process_group(
                 if matches!(space, Keyspace::Meta | Keyspace::Seq | Keyspace::Gc) {
                     return true;
                 }
+                // Protected task records (Kernel 0x20..=0x2B) need their bit and
+                // well-formed bytes; other Kernel keys keep the legacy, ungated path.
+                if *space == Keyspace::Kernel {
+                    return super::content_check::required_bits_for_kernel_write(
+                        key,
+                        value.as_deref(),
+                        next_features,
+                    )
+                    .map_or(true, |required| required & !next_features != 0);
+                }
                 if *space != Keyspace::Catalog {
                     return false;
                 }

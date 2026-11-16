@@ -1,7 +1,7 @@
 use crate::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Token {
+pub(crate) enum Token {
     Word(String),
     QuotedIdentifier(String),
     String(String),
@@ -145,7 +145,7 @@ fn insert_step(out: &[(Token, usize)]) -> bool {
         _ => false,
     }
 }
-fn lex(s: &str, version: LanguageVersion) -> Result<Vec<(Token, usize)>> {
+pub(crate) fn lex(s: &str, version: LanguageVersion) -> Result<Vec<(Token, usize)>> {
     let mut budget = text_budget(s);
     let lexed = lex_within(s, version, &mut budget);
     // A block whose text exceeds MAX_INPUT without an INSERT step is refused
@@ -327,22 +327,23 @@ fn lex_within(s: &str, version: LanguageVersion, budget: &mut TextBudget) -> Res
     }
     Ok(out)
 }
-struct Parser {
-    tokens: Vec<(Token, usize)>,
-    pos: usize,
-    end: usize,
-    version: LanguageVersion,
+// Profile 0.22 task statements (`crate::task`) reuse this lexer and expression parser.
+pub(crate) struct Parser {
+    pub(crate) tokens: Vec<(Token, usize)>,
+    pub(crate) pos: usize,
+    pub(crate) end: usize,
+    pub(crate) version: LanguageVersion,
 }
 impl Parser {
-    fn error(&self) -> Error {
+    pub(crate) fn error(&self) -> Error {
         Error::Syntax {
             offset: self.tokens.get(self.pos).map_or(self.end, |t| t.1),
         }
     }
-    fn peek(&self) -> Option<&Token> {
+    pub(crate) fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos).map(|t| &t.0)
     }
-    fn word(&mut self, w: &str) -> bool {
+    pub(crate) fn word(&mut self, w: &str) -> bool {
         if self.peek() == Some(&Token::Word(w.into())) {
             self.pos += 1;
             true
@@ -350,14 +351,14 @@ impl Parser {
             false
         }
     }
-    fn need(&mut self, w: &str) -> Result<()> {
+    pub(crate) fn need(&mut self, w: &str) -> Result<()> {
         if self.word(w) {
             Ok(())
         } else {
             Err(self.error())
         }
     }
-    fn symbol(&mut self, c: char) -> bool {
+    pub(crate) fn symbol(&mut self, c: char) -> bool {
         if self.peek() == Some(&Token::Symbol(c)) {
             self.pos += 1;
             true
@@ -365,7 +366,7 @@ impl Parser {
             false
         }
     }
-    fn name(&mut self) -> Result<String> {
+    pub(crate) fn name(&mut self) -> Result<String> {
         match self.peek().cloned() {
             Some(Token::Word(w)) if canonical_identifier(&w) && !reserved_for(&w, self.version) => {
                 self.pos += 1;
@@ -398,7 +399,7 @@ impl Parser {
             _ => Err(self.error()),
         }
     }
-    fn value(&mut self) -> Result<ValueExpr> {
+    pub(crate) fn value(&mut self) -> Result<ValueExpr> {
         // Value-only clauses still accept signed integer literals in 0.2+;
         // they do not gain computed expressions or unary parameter operators.
         if self.version != LanguageVersion::Embedded01 && self.symbol('-') {
@@ -424,7 +425,7 @@ impl Parser {
         self.pos += 1;
         Ok(v)
     }
-    fn expr(&mut self, depth: usize) -> Result<Expr> {
+    pub(crate) fn expr(&mut self, depth: usize) -> Result<Expr> {
         self.or(depth)
     }
     /// Left-deep operator chains (`or`, `and`, `+`, `*`, ...) grow the tree
@@ -497,7 +498,7 @@ impl Parser {
             | LanguageVersion::Embedded012
             | LanguageVersion::Embedded013
             | LanguageVersion::Embedded014
-            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 => self.sum(d),
+            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022 => self.sum(d),
         }
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {
@@ -1350,7 +1351,7 @@ impl Parser {
             CatalogType::Int64
         } else if self.word("text") {
             CatalogType::Text
-        } else if matches!(self.version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) && self.word("numeric") {
+        } else if matches!(self.version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022) && self.word("numeric") {
             CatalogType::Numeric
         } else if self.word("bytes") {
             CatalogType::Bytes
@@ -1410,7 +1411,7 @@ impl Parser {
     }
     fn catalog_prefix(&self) -> bool {
         matches!(&self.tokens[self.pos..], [(Token::Word(create), _), (Token::Word(table), _), ..]
-            if ((create == "alter" && table == "table" && self.version.supports_r2_native()) || create == "create" || (create == "drop" && matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021)))
+            if ((create == "alter" && table == "table" && self.version.supports_r2_native()) || create == "create" || (create == "drop" && matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022)))
                 && (table == "table" || table == "index" || (table == "view" && self.version.supports_r2_wave2())
                     || (table == "sequence" && create != "alter" && self.version.supports_r2_wave3())))
     }
@@ -1418,7 +1419,7 @@ impl Parser {
         if !self.version.supports_catalog() {
             return Err(Error::Unsupported);
         }
-        if matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) && self.word("drop") {
+        if matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022) && self.word("drop") {
             if self.version.supports_r2_wave3() && self.word("sequence") {
                 let if_exists = self.word("if");
                 if if_exists { self.need("exists")?; }

@@ -482,3 +482,6 @@ mod parity_insert_duplicate_column;
 #[path = "parity_native_check.rs"] mod parity_native_check;
 #[path = "isolation_levels.rs"]
 mod isolation_levels;
+
+#[path = "task_dependencies.rs"] mod task_dependencies;
+#[path = "task_labels.rs"] mod task_labels;

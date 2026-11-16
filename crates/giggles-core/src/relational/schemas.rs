@@ -280,7 +280,7 @@ impl Prepared {
                     Statement::Create { .. } | Statement::AlterTable(_)
                     | Statement::CreateIndex(_) | Statement::DropIndex(_)
                     | Statement::DropTable { .. } | Statement::Truncate { .. }
-                    | Statement::Comment(_) | Statement::View(_) => SqlError::InvalidSchema,
+                    | Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) => SqlError::InvalidSchema,
                     _ => SqlError::UnknownTable,
                 };
                 return Err(error);

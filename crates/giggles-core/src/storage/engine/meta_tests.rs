@@ -153,8 +153,12 @@ fn real_legacy_directory_has_no_rocks_files() {
 fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
-        0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS
+        0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS | TASK_CATALOG | PROTECTED_RECORDS
     );
+    assert_eq!(FEATURE_TABLE.len(), 22);
+    assert_eq!(FEATURE_TABLE[21], (PROTECTED_RECORDS, "protected_records"));
+    assert_eq!(PROTECTED_RECORDS, 1 << 21);
+    assert_eq!(TASK_CATALOG, 1 << 20);
     for (i, (bit, _)) in FEATURE_TABLE[..14].iter().enumerate() {
         assert_eq!(*bit, 1u64 << i);
     }
@@ -163,6 +167,7 @@ fn feature_positions_and_validation() {
     assert_eq!(FEATURE_TABLE[17].0, KEY_DEPENDENCY_IDENTITY);
     assert_eq!(FEATURE_TABLE[18], (RANGES, "ranges"));
     assert_eq!(FEATURE_TABLE[19], (1 << 19, "wide_once_receipts"));
+    assert_eq!(FEATURE_TABLE[20], (TASK_CATALOG, "task_catalog"));
     assert_eq!(FEATURE_TABLE[10].0, TEXT_BACKED_COLUMN_TYPES);
     assert_eq!(
         FEATURE_TABLE[11].0,
@@ -181,7 +186,14 @@ fn feature_positions_and_validation() {
     );
     let kv = base();
     assert_eq!(validate_meta(&kv).unwrap().features, 0);
-    for i in 20..64 {
+    put(&kv, b"features", &TASK_CATALOG.to_be_bytes());
+    assert!(matches!(validate_meta(&kv), Err(FormatError::Corrupt(_))));
+    put(&kv, b"features", &(TASK_CATALOG | 2048).to_be_bytes());
+    assert!(validate_meta(&kv).is_ok());
+    put(&kv, b"features", &PROTECTED_RECORDS.to_be_bytes());
+    assert_eq!(validate_meta(&kv).unwrap().features, PROTECTED_RECORDS);
+    assert!(check_features(PROTECTED_RECORDS).is_ok());
+    for i in 22..64 {
         put(&kv, b"features", &(1u64 << i).to_be_bytes());
         assert!(matches!(
             validate_meta(&kv),
@@ -304,9 +316,9 @@ fn features_share_caller_atomic_batch() {
 #[test]
 fn invalid_features_leave_batch_unchanged() {
     for (bits, expected) in [
-        (1 << 20, FormatError::Unsupported("feature bits".into())),
+        (1 << 22, FormatError::Unsupported("feature bits".into())),
         (
-            (1 << 20) | 0xC00,
+            (1 << 22) | 0xC00,
             FormatError::Unsupported("feature bits".into()),
         ),
         (256, corrupt("sequence counters require catalog_ext")),
@@ -494,7 +506,7 @@ fn replicated_creation_is_v2() {
 fn key_dependency_feature_requires_catalog_ext_and_is_monotone() {
     assert!(check_features(64 | KEY_DEPENDENCY_IDENTITY).is_ok());
     assert!(matches!(check_features(KEY_DEPENDENCY_IDENTITY), Err(FormatError::Corrupt(_))));
-    for unknown in [1 << 20, 1 << 40] {
+    for unknown in [1 << 22, 1 << 40] {
         assert!(matches!(check_features(unknown | KEY_DEPENDENCY_IDENTITY), Err(FormatError::Unsupported(_))));
     }
     let kv = base();
@@ -648,7 +660,7 @@ fn validate_meta_checks_range_local_values() {
         ),
         (
             raw_range_key(2, b"features"),
-            (1u64 << 20).to_be_bytes().to_vec(),
+            (1u64 << 22).to_be_bytes().to_vec(),
             FormatError::Unsupported("feature bits".into()),
         ),
         (raw_range_key(2, b"future"), Vec::new(), unknown()),

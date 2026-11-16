@@ -13,12 +13,21 @@ use super::{
 use std::{
     collections::BTreeMap,
     ops::Bound,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 const WATERMARK_KEY: &[u8] = b"gc_watermark";
-const MAX_VERSIONS_PER_KEY: usize = 100_000;
+/// Deletes per write batch. A hot key's history is removed in chunks of this
+/// size rather than refused (R3-620).
+pub(crate) const DELETE_BATCH: usize = 10_000;
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GcConfig {
@@ -69,7 +78,8 @@ impl Drop for PinGuard {
 pub(crate) struct Gc {
     kv: Arc<Kv>,
     seq: Arc<Sequencer>,
-    config: GcConfig,
+    // `GcConfig.retention` in milliseconds; adjustable while running.
+    retention_ms: AtomicU64,
     // Orders pin admission, computation, durable advancement and publication.
     state: Arc<Mutex<State>>,
     // A step's cursor read/write and table reclamation must not race another
@@ -92,7 +102,7 @@ impl Gc {
         Ok(Self {
             kv,
             seq,
-            config,
+            retention_ms: AtomicU64::new(duration_ms(config.retention)),
             state: Arc::new(Mutex::new(State {
                 watermark,
                 next_pin: 0,
@@ -102,6 +112,13 @@ impl Gc {
             })),
             work: Mutex::new(()),
         })
+    }
+
+    /// Changes the retention window for later watermark computations. A
+    /// longer window never rewinds the durable watermark.
+    pub(crate) fn set_retention(&self, retention: Duration) {
+        self.retention_ms
+            .store(duration_ms(retention), Ordering::Relaxed);
     }
 
     pub(crate) fn pin(&self, ts: Ts, owner: String) -> Result<PinGuard, TxnError> {
@@ -150,7 +167,7 @@ impl Gc {
         // admitted at that older visible value before visibility advances.
         let visible = self.seq.visible_ts();
         let oldest = self.seq.oldest_active().unwrap_or(visible);
-        let retention_ms = self.config.retention.as_millis().min(u64::MAX as u128) as u64;
+        let retention_ms = self.retention_ms.load(Ordering::Relaxed);
         let retained = Ts((visible.0 >> 16).saturating_sub(retention_ms) << 16);
         let mut next = visible.min(oldest).min(retained);
         for (ts, _) in state.pins.values() {
@@ -205,6 +222,8 @@ impl Gc {
             .range(ks, lower, Bound::Unbounded, Direction::Forward)?;
         let mut pending = iter.next().transpose()?;
         let mut batch = WriteBatch::default();
+        // Deletes in `batch` not yet counted into the shared totals.
+        let mut unflushed = 0usize;
         let mut next_cursor = Vec::new();
         while let Some((first_key, first_value)) = pending.take() {
             let (user, _) = codec::split_versioned(&first_key)?;
@@ -213,31 +232,45 @@ impl Gc {
             }
             let user = user.to_vec();
             let mut current = Some((first_key, first_value));
-            let mut versions = 0;
             let mut anchor_seen = false;
+            // A tombstone anchor hides every older version from snapshots
+            // >= W. It is deleted only after all of them, in the group's
+            // final batch, so no crash image can resurrect an older value.
+            let mut tombstone_anchor = None;
             while let Some((key, value)) = current.take() {
-                versions += 1;
-                // Count even versions > W. Refuse the entire step before any
-                // write rather than split a huge group or truncate its history.
-                if versions > MAX_VERSIONS_PER_KEY {
-                    return Err(KvError::Corrupt(
-                        "GC user key exceeds 100000-version hard cap".into(),
-                    )
-                    .into());
-                }
                 stats.examined += 1;
                 let (_, ts) = codec::split_versioned(&key)?;
+                let mut resume_after = None;
                 if ts <= watermark {
-                    let delete = if anchor_seen {
-                        true
+                    if anchor_seen {
+                        // Older than the anchor: invisible to every live
+                        // snapshot, so any number of batches may remove them.
+                        stats.deleted += 1;
+                        unflushed += 1;
+                        if unflushed >= DELETE_BATCH {
+                            resume_after = Some(key.clone());
+                        }
+                        batch.delete(ks, key);
                     } else {
                         anchor_seen = true;
-                        mvcc::decode(&value)?.is_none()
-                    };
-                    if delete {
-                        batch.delete(ks, key);
-                        stats.deleted += 1;
+                        if mvcc::decode(&value)?.is_none() {
+                            tombstone_anchor = Some(key);
+                        }
                     }
+                }
+                if let Some(last) = resume_after {
+                    // Flush a chunk without the cursor. Reopen the scan after
+                    // the last deleted key so the backend iterator does not
+                    // pin the pre-delete view of the whole chunk.
+                    drop(iter);
+                    self.flush_deletes(std::mem::take(&mut batch), unflushed)?;
+                    unflushed = 0;
+                    iter = self.kv.range(
+                        ks,
+                        Bound::Excluded(&last),
+                        Bound::Unbounded,
+                        Direction::Forward,
+                    )?;
                 }
                 if let Some((key, value)) = iter.next().transpose()? {
                     let (next_user, _) = codec::split_versioned(&key)?;
@@ -247,6 +280,11 @@ impl Gc {
                         pending = Some((key, value));
                     }
                 }
+            }
+            if let Some(key) = tombstone_anchor {
+                batch.delete(ks, key);
+                stats.deleted += 1;
+                unflushed += 1;
             }
             stats.keys += 1;
             next_cursor = codec::user_key_upper_bound(&user);
@@ -260,21 +298,26 @@ impl Gc {
         }
         drop(iter);
         batch.put(Keyspace::Gc, cursor_key, next_cursor);
-        // Tombstone and ALL older versions share this batch, preventing
-        // resurrection. Cursor advancement is atomic with the same deletes.
-        // A crash may lose this NoSync batch: reprocessing is idempotent, while
-        // the watermark authorizing it was already Sync-durable.
+        // Cursor advancement shares the step's last batch, and every tombstone
+        // anchor shares a batch with or follows all its older versions. Each
+        // batch is NoSync and applied in order, so a crash keeps a prefix of
+        // them: reprocessing is idempotent, while the watermark authorizing
+        // the deletes was already Sync-durable.
         // Direct Kv deletes are safe: commits only add ts > visible >= W and
-        // never change <= W; GC only deletes <= W in complete version groups.
-        self.kv.write(batch, Durability::NoSync)?;
+        // never change <= W; GC only deletes <= W.
+        self.flush_deletes(batch, unflushed)?;
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.versions_examined_total = state
             .versions_examined_total
             .saturating_add(stats.examined as u64);
-        state.versions_deleted_total = state
-            .versions_deleted_total
-            .saturating_add(stats.deleted as u64);
         Ok(stats)
+    }
+
+    fn flush_deletes(&self, batch: WriteBatch, deleted: usize) -> Result<(), TxnError> {
+        self.kv.write(batch, Durability::NoSync)?;
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.versions_deleted_total = state.versions_deleted_total.saturating_add(deleted as u64);
+        Ok(())
     }
 
     /// The caller supplies the committed drop timestamp for a non-reused ID.

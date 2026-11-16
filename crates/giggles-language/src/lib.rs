@@ -26,6 +26,7 @@ mod explain;
 mod inspection;
 pub mod once;
 mod parser;
+mod task;
 pub use capabilities::{
     Capability, CapabilityInterface, CapabilityLimits, CapabilityManifest, CapabilityState,
     DeploymentProfile, EngineRowLimits, EngineRows, ReferenceRevision, TestEvidence, capability_manifest,
@@ -33,6 +34,7 @@ pub use capabilities::{
 };
 pub use execute::{BoundCatalogOperation, BoundOperation, BoundTransaction, Engine, Lowered, lower_text};
 pub use giggles_core::operations::ReadExplainOutcome;
+pub use task::parse_task_with_version;
 pub use inspection::InspectionOutcome;
 pub use once::{OnceError, OnceResult, OnceScope};
 pub use parser::{
@@ -119,6 +121,8 @@ pub enum LanguageVersion {
     Embedded020,
     #[serde(rename = "0.21")]
     Embedded021,
+    #[serde(rename = "0.22")]
+    Embedded022,
 }
 impl LanguageVersion {
     pub const fn as_str(self) -> &'static str {
@@ -144,6 +148,7 @@ impl LanguageVersion {
             Self::Embedded019 => "0.19",
             Self::Embedded020 => "0.20",
             Self::Embedded021 => "0.21",
+            Self::Embedded022 => "0.22",
         }
     }
     pub const fn profile_name(self) -> &'static str {
@@ -169,22 +174,27 @@ impl LanguageVersion {
             Self::Embedded019 => "embedded-trusted-native-0.19",
             Self::Embedded020 => "embedded-trusted-native-0.20",
             Self::Embedded021 => "embedded-trusted-native-0.21",
+            Self::Embedded022 => "embedded-trusted-native-0.22",
         }
     }
+    /// Profile 0.22: native task statements (`parse_task_with_version`).
+    pub const fn supports_tasks(self) -> bool {
+        matches!(self, Self::Embedded022)
+    }
     pub(crate) const fn supports_r2_wave3(self) -> bool {
-        matches!(self, Self::Embedded021)
+        matches!(self, Self::Embedded021 | Self::Embedded022)
     }
     pub(crate) const fn supports_r2_wave2(self) -> bool {
-        matches!(self, Self::Embedded020 | Self::Embedded021)
+        matches!(self, Self::Embedded020 | Self::Embedded021 | Self::Embedded022)
     }
     pub(crate) const fn supports_r2_native(self) -> bool {
-        matches!(self, Self::Embedded019 | Self::Embedded020 | Self::Embedded021)
+        matches!(self, Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022)
     }
     pub(crate) const fn supports_schema_names(self) -> bool {
-        matches!(self, Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021)
+        matches!(self, Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022)
     }
     pub(crate) const fn supports_indexes(self) -> bool {
-        matches!(self, Self::Embedded014 | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021)
+        matches!(self, Self::Embedded014 | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022)
     }
     pub(crate) const fn supports_computed(self) -> bool {
         matches!(
@@ -201,7 +211,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
     pub(crate) const fn supports_return(self) -> bool {
@@ -218,7 +228,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
     pub(crate) const fn supports_transactions(self) -> bool {
@@ -234,7 +244,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
     pub(crate) const fn supports_insert_many(self) -> bool {
@@ -249,7 +259,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
     pub(crate) const fn supports_catalog(self) -> bool {
@@ -263,7 +273,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
     pub(crate) const fn supports_scalar_functions(self) -> bool {
@@ -276,7 +286,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
     pub(crate) const fn supports_case(self) -> bool {
@@ -288,7 +298,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
     pub(crate) const fn supports_quoted_identifiers(self) -> bool {
@@ -300,7 +310,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
     pub(crate) const fn supports_upsert(self) -> bool {
@@ -311,7 +321,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
     pub(crate) const fn supports_once(self) -> bool {
@@ -321,19 +331,19 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
     pub(crate) const fn supports_explain(self) -> bool {
         matches!(
             self,
-            Self::Embedded013 | Self::Embedded014 | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+            Self::Embedded013 | Self::Embedded014 | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
     pub(crate) const fn supports_inspection(self) -> bool {
         matches!(
             self,
-            Self::Embedded012 | Self::Embedded013 | Self::Embedded014 | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021
+            Self::Embedded012 | Self::Embedded013 | Self::Embedded014 | Self::Embedded015 | Self::Embedded016 | Self::Embedded017 | Self::Embedded018 | Self::Embedded019 | Self::Embedded020 | Self::Embedded021 | Self::Embedded022
         )
     }
 }
@@ -803,7 +813,7 @@ pub fn profile_for(version: LanguageVersion) -> Profile {
             &["boolean", "smallint", "integer", "bigint", "text", "bytes", "null", "numeric parameters",
                 "real parameters", "double precision parameters", "date parameters", "time parameters",
                 "timetz parameters", "timestamp parameters", "timestamptz parameters", "interval parameters"]
-        } else if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) {
+        } else if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022) {
             &["boolean", "smallint", "integer", "bigint", "text", "bytes", "null", "numeric parameters"]
         } else {
             &["boolean", "smallint", "integer", "bigint", "text", "bytes", "null"]
@@ -1025,7 +1035,7 @@ pub fn profile_for(version: LanguageVersion) -> Profile {
                 "secondary unique conflict targets",
                 "cursors",
             ],
-            LanguageVersion::Embedded021 => &[
+            LanguageVersion::Embedded021 | LanguageVersion::Embedded022 => &[
                 "once without explicit original scope and trusted clock",
                 "CLI once execution and outcome lookup",
                 "duration parameters",

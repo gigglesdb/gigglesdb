@@ -1,0 +1,187 @@
+//! Task-session statement class of a prepared statement (GD-0061 R3-202, design section 2.4(a)).
+//!
+//! The match is exhaustive with no wildcard arm: a new `Statement` variant fails to compile
+//! until someone classifies it.
+
+use super::schema_binding::split_key;
+use super::{Prepared, Statement};
+use crate::task::columns::StatementShape;
+use crate::task::StatementClass;
+
+/// A relation of the system catalogs: `pg_catalog`, `information_schema` or any `pg_*`
+/// schema. Such names are reserved for user tables, so they only ever name a catalog.
+fn is_catalog_relation(key: &str) -> bool {
+    let (schema, name) = split_key(key);
+    schema == "pg_catalog"
+        || schema == "information_schema"
+        || schema.starts_with("pg_")
+        || (schema == "public" && name.starts_with("pg_"))
+}
+
+impl Prepared {
+    /// The class `task::admit::admit` sees for this statement.
+    ///
+    /// Table 4(a), plus one rule: a read that names a catalog relation anywhere (including a
+    /// subquery) is `Catalog`, because catalog queries are refused or filtered as a class
+    /// (ruling D11), never released through the column rules.
+    pub fn task_class(&self) -> StatementClass {
+        match &self.statement {
+            Statement::Select { name, .. } if is_catalog_relation(name) => StatementClass::Catalog,
+            Statement::Select { .. } => StatementClass::Select,
+            Statement::Query(q) => {
+                let mut shape = StatementShape::new(StatementClass::Select);
+                q.task_refs(&mut shape, true);
+                if shape.tables.iter().any(|t| is_catalog_relation(t)) {
+                    StatementClass::Catalog
+                } else if q.explain {
+                    StatementClass::Explain
+                } else if !q.task_has_no_sources() && q.target() == "giggles_join" {
+                    // Table 4(a) keys on `table() == Some("giggles_join")`; a table-free
+                    // SELECT has `table() == None` and stays Select (design 3.2: driver pings).
+                    StatementClass::Other
+                } else {
+                    StatementClass::Select
+                }
+            }
+            Statement::CompositeSelect(_) => StatementClass::Other,
+            Statement::Update { .. } | Statement::UpdateExpressions { .. } => {
+                StatementClass::Update
+            }
+            Statement::Insert { .. }
+            | Statement::InsertExpressions(_)
+            | Statement::InsertMulti(_) => StatementClass::Insert,
+            Statement::Delete { .. } | Statement::Truncate { .. } => StatementClass::Delete,
+            Statement::Begin
+            | Statement::Commit
+            | Statement::Rollback
+            | Statement::SetConstraints(..) => StatementClass::TransactionControl,
+            Statement::Savepoint(_) | Statement::Release(_) | Statement::RollbackTo(_) => {
+                StatementClass::Savepoint
+            }
+            Statement::Schema(_)
+            | Statement::TypeDdl(_)
+            | Statement::Sequence(_)
+            | Statement::Create { .. }
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
+            | Statement::AlterTable(_)
+            | Statement::Comment(_)
+            | Statement::SecurityLabel(_)
+            | Statement::View(_)
+            | Statement::DropTable { .. } => StatementClass::Ddl,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    // `deliveries` is reserved (relational/ident.rs); the worked example's columns are used
+    // under `shipments(id, merchant_id, status, failed_at, attempt_count, customer_email,
+    // card_token)`. Classification is syntactic, so no table needs to exist.
+    fn prepared(sql: &str) -> Prepared {
+        Prepared::parse(sql, 1, 0).unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+    }
+
+    #[test]
+    fn task_class_covers_every_statement() {
+        let cases = [
+            ("SELECT id FROM shipments WHERE id = 1", StatementClass::Select),
+            ("SELECT * FROM s.shipments", StatementClass::Select),
+            ("EXPLAIN SELECT id FROM shipments", StatementClass::Explain),
+            ("SELECT 1", StatementClass::Select),
+            ("SELECT now()", StatementClass::Select),
+            (
+                "SELECT a.id FROM shipments a JOIN others b ON a.id = b.id",
+                StatementClass::Other,
+            ),
+            ("SELECT ROW(1, 'a')::pair", StatementClass::Other),
+            ("SELECT * FROM information_schema.tables", StatementClass::Catalog),
+            (
+                "SELECT id FROM shipments WHERE status IN (SELECT table_name FROM information_schema.tables)",
+                StatementClass::Catalog,
+            ),
+            ("UPDATE shipments SET status = 'x' WHERE id = 1", StatementClass::Update),
+            (
+                "UPDATE shipments SET attempt_count = attempt_count + 1 WHERE id = 1",
+                StatementClass::Update,
+            ),
+            ("INSERT INTO shipments (id) VALUES (1)", StatementClass::Insert),
+            ("INSERT INTO shipments (id) VALUES (1), (2)", StatementClass::Insert),
+            ("INSERT INTO shipments (id) VALUES (1 + 1)", StatementClass::Insert),
+            ("DELETE FROM shipments WHERE id = 1", StatementClass::Delete),
+            ("TRUNCATE shipments", StatementClass::Delete),
+            ("BEGIN", StatementClass::TransactionControl),
+            ("COMMIT", StatementClass::TransactionControl),
+            ("ROLLBACK", StatementClass::TransactionControl),
+            ("SET CONSTRAINTS ALL DEFERRED", StatementClass::TransactionControl),
+            ("SAVEPOINT a", StatementClass::Savepoint),
+            ("RELEASE SAVEPOINT a", StatementClass::Savepoint),
+            ("ROLLBACK TO SAVEPOINT a", StatementClass::Savepoint),
+            ("CREATE TABLE t (id INT PRIMARY KEY)", StatementClass::Ddl),
+            ("CREATE INDEX i ON shipments (status)", StatementClass::Ddl),
+            ("DROP INDEX i", StatementClass::Ddl),
+            ("ALTER TABLE shipments ADD COLUMN x INT", StatementClass::Ddl),
+            ("COMMENT ON TABLE shipments IS 'x'", StatementClass::Ddl),
+            (
+                "SECURITY LABEL ON COLUMN shipments.status IS 'untrusted_text'",
+                StatementClass::Ddl,
+            ),
+            ("CREATE VIEW v AS SELECT id FROM shipments", StatementClass::Ddl),
+            ("DROP VIEW v", StatementClass::Ddl),
+            ("DROP TABLE shipments", StatementClass::Ddl),
+            ("CREATE SCHEMA s", StatementClass::Ddl),
+            ("DROP SCHEMA s", StatementClass::Ddl),
+            ("CREATE SEQUENCE q", StatementClass::Ddl),
+            ("ALTER SEQUENCE q RESTART", StatementClass::Ddl),
+            ("DROP SEQUENCE q", StatementClass::Ddl),
+            ("CREATE TYPE mood AS ENUM ('a')", StatementClass::Ddl),
+        ];
+        let mut commands = BTreeSet::new();
+        for (sql, want) in cases {
+            let p = prepared(sql);
+            assert_eq!(p.task_class(), want, "{sql}");
+            commands.insert(p.command());
+            // The column collector reports the same class.
+            assert_eq!(p.task_shape().unwrap().class, want, "{sql}");
+        }
+
+        // The legacy single-table `Select` has no SQL spelling of its own.
+        let mut p = prepared("SELECT id FROM shipments");
+        p.statement = Statement::Select {
+            name: "shipments".into(),
+            projection: vec!["id".into()],
+            predicates: Vec::new(),
+            order: Vec::new(),
+            limit: None,
+        };
+        assert_eq!(p.task_class(), StatementClass::Select);
+        if let Statement::Select { name, .. } = &mut p.statement {
+            *name = "pg_catalog\0pg_class".into();
+        }
+        assert_eq!(p.task_class(), StatementClass::Catalog);
+
+        // One case per `command()` kind the parser produces.
+        for command in [
+            "SELECT", "EXPLAIN", "UPDATE", "INSERT", "DELETE", "TRUNCATE TABLE", "BEGIN",
+            "COMMIT", "ROLLBACK", "SET CONSTRAINTS", "SAVEPOINT", "RELEASE", "CREATE TABLE",
+            "CREATE INDEX", "DROP INDEX", "ALTER TABLE", "COMMENT", "SECURITY LABEL", "CREATE VIEW", "DROP VIEW",
+            "DROP TABLE", "CREATE SCHEMA", "DROP SCHEMA", "CREATE SEQUENCE", "ALTER SEQUENCE",
+            "DROP SEQUENCE",
+        ] {
+            assert!(commands.contains(command), "{command} not covered: {commands:?}");
+        }
+    }
+
+    #[test]
+    fn catalog_relation_names() {
+        assert!(is_catalog_relation("pg_catalog\0pg_class"));
+        assert!(is_catalog_relation("information_schema\0tables"));
+        assert!(is_catalog_relation("pg_toast\0x"));
+        assert!(is_catalog_relation("pg_class"));
+        assert!(!is_catalog_relation("shipments"));
+        assert!(!is_catalog_relation("s\0shipments"));
+    }
+}

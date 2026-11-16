@@ -86,7 +86,7 @@ fn quote(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 impl Prepared {
     pub fn is_view_replacement(&self) -> bool { matches!(&self.statement, Statement::View(ddl) if ddl.replace) }
     pub(crate) fn clear_view_diagnostics(&self) {
-        if matches!(self.statement, Statement::View(_) | Statement::Comment(_)) { user_types::clear_sql_error_message(); }
+        if matches!(self.statement, Statement::View(_) | Statement::Comment(_) | Statement::SecurityLabel(_)) { user_types::clear_sql_error_message(); }
     }
     pub(crate) fn view_drop_locks(&self, state: &Relational, parts: &CatalogParts) -> BTreeSet<u64> {
         let Statement::View(ddl) = &self.statement else { return BTreeSet::new(); };

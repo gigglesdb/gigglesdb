@@ -6,6 +6,7 @@ use super::{
     meta::FormatError,
     mvcc,
 };
+use crate::task::records;
 use std::{collections::BTreeMap, ops::Bound};
 
 fn corrupt(error: impl std::fmt::Display) -> FormatError {
@@ -29,6 +30,14 @@ pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatErr
     } else if key.first() == Some(&18) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::RELATION_COMMENTS)
+    } else if key.first() == Some(&super::catalog_label_codec::LABEL_KIND) {
+        // Tombstones and history too, like kind 19.
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        super::catalog_label_codec::required_bits(key).map_err(corrupt)
+    } else if key.first() == Some(&crate::task::catalog::TASK_KIND) {
+        // Tombstones and history too: a kind-19 key never hides from old binaries.
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        Ok(super::meta::TASK_CATALOG)
     } else {
         Ok(0)
     }
@@ -88,6 +97,14 @@ pub(crate) fn required_bits_for_catalog_value(
             catalog_codec::decode_comment(value).map_err(corrupt)?;
             Ok(super::meta::RELATION_COMMENTS)
         }
+        CatalogKind::Task => {
+            crate::task::catalog::decode_task(key, value).map_err(corrupt)?;
+            Ok(super::meta::TASK_CATALOG)
+        }
+        CatalogKind::ColumnLabel => {
+            super::catalog_label_codec::decode_label(value).map_err(corrupt)?;
+            super::catalog_label_codec::required_bits(key).map_err(corrupt)
+        }
         CatalogKind::Name => Ok(if key[1..key.len() - 1].contains(&0) {
             super::meta::SCHEMAS_AND_USER_TYPES
         } else {
@@ -103,12 +120,105 @@ pub(crate) fn required_bits_for_catalog_value(
         | CatalogKind::SchemaGrant
         | CatalogKind::RoleOid => {
             super::super::roles::engine::validate_record(key, value).map_err(corrupt)?;
-            Ok(super::super::roles::engine::FEATURE)
+            Ok(super::super::roles::engine::FEATURE
+                | if super::super::roles::engine::is_task_only_record(key, value) {
+                    super::meta::TASK_CATALOG
+                } else {
+                    0
+                })
         }
     }
 }
 
+/// True for Kernel user keys in the protected task namespaces `0x20..=0x2B`.
+pub(crate) fn is_protected_kernel_key(key: &[u8]) -> bool {
+    key.first()
+        .is_some_and(|ns| (records::NS_MIN..=records::NS_MAX).contains(ns))
+}
+
+/// Commit gate for one Kernel write (GD-0061 D-B). Keys outside `0x20..=0x2B`
+/// need no bit (legacy behaviour). A protected key needs PROTECTED_RECORDS, a
+/// classifiable key and, for a live value, a value that decodes completely; a
+/// replicated database refuses protected records outright.
+pub(crate) fn required_bits_for_kernel_write(
+    key: &[u8],
+    value: Option<&[u8]>,
+    next_features: u64,
+) -> Result<u64, FormatError> {
+    if !is_protected_kernel_key(key) {
+        return Ok(0);
+    }
+    if next_features & super::meta::REPLICATED != 0 {
+        return Err(FormatError::Unsupported(
+            "protected records in a replicated database".into(),
+        ));
+    }
+    records::classify_key(key).map_err(corrupt)?;
+    if let Some(value) = value {
+        records::validate(key, value).map_err(corrupt)?;
+    }
+    Ok(super::meta::PROTECTED_RECORDS)
+}
+
+/// Raw Kernel entries in `0x20..0x2C` the open check inspects; full decoding
+/// happens at read time.
+pub(crate) const PROTECTED_OPEN_SCAN_LIMIT: usize = 4096;
+
+/// Constant-cost open check of the protected Kernel namespaces: at most
+/// [`PROTECTED_OPEN_SCAN_LIMIT`] entries plus one seek per unassigned range.
+fn check_protected_kernel(kv: &dyn KvRead, features: u64) -> Result<(), FormatError> {
+    if features & super::meta::PROTECTED_RECORDS != 0 && features & super::meta::REPLICATED != 0 {
+        return Err(FormatError::Unsupported(
+            "protected records in a replicated database".into(),
+        ));
+    }
+    for item in kv
+        .range(
+            Keyspace::Kernel,
+            Bound::Included(&[records::NS_MIN]),
+            Bound::Excluded(&[records::NS_MAX + 1]),
+            Direction::Forward,
+        )
+        .map_err(corrupt)?
+        .take(PROTECTED_OPEN_SCAN_LIMIT)
+    {
+        let (key, value) = item.map_err(corrupt)?;
+        if features & super::meta::PROTECTED_RECORDS == 0 {
+            return Err(corrupt("content requires unset format feature"));
+        }
+        let (user, _) = codec::split_versioned(&key)
+            .map_err(|error| FormatError::Corrupt(format!("{error:?}")))?;
+        records::classify_key(user).map_err(corrupt)?;
+        if let Some(value) = mvcc::decode(&value).map_err(corrupt)?
+            && value.first() != Some(&records::VERSION)
+        {
+            return Err(corrupt("protected record version"));
+        }
+    }
+    // Namespaces nobody assigns: one seek each, any entry is corrupt.
+    // native_content::check owns the legacy namespaces below and the stamp above.
+    use super::native_content::{LEGACY_KERNEL_END, STAMP_NAMESPACE};
+    for (start, end) in [
+        (LEGACY_KERNEL_END, records::NS_MIN),
+        (records::NS_MAX + 1, STAMP_NAMESPACE),
+    ] {
+        let mut gap = kv
+            .range(
+                Keyspace::Kernel,
+                Bound::Included(&[start]),
+                Bound::Excluded(&[end]),
+                Direction::Forward,
+            )
+            .map_err(corrupt)?;
+        if gap.next().transpose().map_err(corrupt)?.is_some() {
+            return Err(corrupt("unknown kernel namespace"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, FormatError> {
+    check_protected_kernel(kv, features)?;
     let mut stale = Vec::new();
     let mut previous = None;
     let mut tables = BTreeMap::new();
@@ -117,6 +227,8 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
     let mut comments = BTreeMap::new();
     let mut views = BTreeMap::new();
     let mut schemas = BTreeMap::new();
+    let mut tasks = Vec::new();
+    let mut labels = BTreeMap::new();
     let mut required = 0;
     for item in kv
         .range(
@@ -187,6 +299,13 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             CatalogKind::Index => {
                 super::indexes::decode_descriptor(value).map_err(corrupt)?;
             }
+            CatalogKind::Task => {
+                tasks.push(crate::task::catalog::decode_task(user, value).map_err(corrupt)?);
+            }
+            CatalogKind::ColumnLabel => {
+                let owner = super::catalog_label_codec::decode_label_key(user).map_err(corrupt)?;
+                labels.insert(owner, super::catalog_label_codec::decode_label(value).map_err(corrupt)?);
+            }
             CatalogKind::Schema => {
                 schemas.insert(String::from_utf8(user[1..user.len()-1].to_vec()).map_err(corrupt)?, catalog_codec::decode_schema(value).map_err(corrupt)?);
             }
@@ -208,6 +327,18 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
         catalog_codec::decode_constraint(&value, table).map_err(corrupt)?;
     }
     catalog_codec::validate_comments(&comments, tables.values(), &views).map_err(corrupt)?;
+    super::catalog_label_codec::validate_labels(&labels, tables.values()).map_err(corrupt)?;
+    // Task cross rules: names are unique, and a live task's table exists.
+    // Revoked tasks may outlive their table.
+    let mut task_names = std::collections::BTreeSet::new();
+    for task in &tasks {
+        if !task_names.insert(task.name.as_str()) {
+            return Err(corrupt("duplicate task name"));
+        }
+        if !task.revoked && !tables.contains_key(&task.table) {
+            return Err(corrupt("live task table is absent"));
+        }
+    }
     let mut parts = super::catalog::CatalogParts { sql_views: views, ..Default::default() };
     parts.tables = tables.into_iter().map(|(id, t)| (id.to_string(), t)).collect();
     parts.ext.schemas = schemas;
@@ -245,3 +376,7 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
 #[cfg(test)]
 #[path = "content_check_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "protected_gate_tests.rs"]
+mod protected_gate_tests;

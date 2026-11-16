@@ -25,6 +25,7 @@ pub use sql::parse_repair;
 pub mod local;
 pub mod operations;
 pub mod relational;
+pub mod task;
 
 pub mod cancellation;
 pub use cancellation::Cancellation;

@@ -158,6 +158,7 @@ impl Prepared {
                 } else { ddl.names.iter_mut().for_each(read); }
             }
             Statement::Comment(comment) => read(&mut comment.table),
+            Statement::SecurityLabel(label) => read(&mut label.table),
             Statement::Truncate { names, .. } | Statement::DropTable { names, .. } => names.iter_mut().for_each(read),
             Statement::Create {
                 name, constraints, ..

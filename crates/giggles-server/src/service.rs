@@ -208,7 +208,7 @@ impl Service {
                 Role::Database { name } => {
                     admin.roles().get(name)
                         .map_err(|_| CoreError::Policy(Error::Authentication))?
-                        .filter(|role| role.login)
+                        .filter(|role| role.login && !role.task_only)
                         .ok_or(CoreError::Policy(Error::Authentication))?;
                 }
                 _ => {}
@@ -290,7 +290,7 @@ impl Service {
             .roles()
             .get(name)
             .map_err(|_| CoreError::Policy(Error::Authentication))?
-            .filter(|role| role.login)
+            .filter(|role| role.login && !role.task_only)
             .ok_or(CoreError::Policy(Error::Authentication))?;
         let mut session = Session {
             surface: Surface::Native,
@@ -332,7 +332,7 @@ impl Service {
         let role_fence = if let Role::Database { name } = &role {
             let role = self.admin.roles().get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login)
+                .filter(|role| role.login && !role.task_only)
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             Some((role.oid, role.generation))
         } else {
@@ -501,6 +501,7 @@ impl Session {
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
                 .filter(|role| {
                     role.login
+                        && !role.task_only
                         && self.role_fence.is_none_or(|(oid, _)| role.oid == oid)
                         && self.service.role_generation_matches(role, self.role_epoch())
                 })
@@ -606,7 +607,7 @@ impl Session {
             .lock()
             .map_err(|_| "XX000")?;
         let target = match stmt {
-            crate::auth::statements::AdminStatement::Alter(name, changes)
+            crate::auth::statements::AdminStatement::Alter(name, changes, None)
                 if changes.password.is_some()
                     && changes.login.is_none()
                     && changes.superuser.is_none()
@@ -1349,7 +1350,7 @@ impl Session {
             if self.table_privilege_superuser()? {
                 superuser = true;
                 true
-            } else if p.command() == "COMMENT" || p.is_alter_table()
+            } else if matches!(p.command(), "COMMENT" | "SECURITY LABEL") || p.is_alter_table()
                 || (p.is_view_replacement() && self.sql.relation_exists(p.table().unwrap_or(""))?)
                 || p.is_drop_table()
                 || (p.command() == "DROP INDEX" && p.table().is_some())

@@ -171,7 +171,7 @@ async fn connection(
             .get(&startup.user)
             .ok()
             .flatten()
-            .filter(|role| role.login)
+            .filter(|role| role.login && !role.task_only)
             .and_then(|role| role.password)
             .and_then(|password| Verifier::parse(&password));
         if !authenticate(&mut stream, &startup.user, verifier).await? {

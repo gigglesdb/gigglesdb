@@ -25,7 +25,13 @@ pub(crate) const KEY_DEPENDENCY_IDENTITY: u64 = 1 << 17;
 pub(crate) const RANGES: u64 = 1 << 18;
 /// The native once ledger holds a GDOU version 2 (u32 count) receipt.
 pub(crate) const WIDE_ONCE_RECEIPTS: u64 = 1 << 19;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 20] = [
+/// Task definitions (catalog kind 19) and the task-only role attribute (GD-0061).
+pub(crate) const TASK_CATALOG: u64 = 1 << 20;
+/// Kernel namespaces 0x20..=0x2B hold protected task records (GD-0061 R3-600).
+pub(crate) const PROTECTED_RECORDS: u64 = 1 << 21;
+/// Feature bits whose databases export and restore refuse (GD-0061 D8, R3-111).
+pub(crate) const EXPORT_REFUSED: u64 = TASK_CATALOG | PROTECTED_RECORDS;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 22] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -46,6 +52,8 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 20] = [
     (KEY_DEPENDENCY_IDENTITY, "key_dependency_identity"),
     (RANGES, "ranges"),
     (WIDE_ONCE_RECEIPTS, "wide_once_receipts"),
+    (TASK_CATALOG, "task_catalog"),
+    (PROTECTED_RECORDS, "protected_records"),
 ];
 #[path = "meta_range.rs"]
 mod range_local;
@@ -329,7 +337,9 @@ pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
             | REPLICATED
             | KEY_DEPENDENCY_IDENTITY
             | RANGES
-            | WIDE_ONCE_RECEIPTS,
+            | WIDE_ONCE_RECEIPTS
+            | TASK_CATALOG
+            | PROTECTED_RECORDS,
     )
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
@@ -341,6 +351,9 @@ fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     }
     if bits & RANGES != 0 && bits & REPLICATED == 0 {
         return Err(corrupt("ranges requires replicated"));
+    }
+    if bits & TASK_CATALOG != 0 && bits & 2048 == 0 {
+        return Err(corrupt("task catalog requires role_catalog"));
     }
     if bits & UNIQUE_CONSTRAINT_IDENTITY != 0 && bits & 68 != 68 {
         return Err(corrupt("unique constraint identity requires catalog_ext and secondary_indexes"));

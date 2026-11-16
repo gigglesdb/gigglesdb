@@ -9,8 +9,15 @@ use std::{fs, path::Path};
 #[path = "reclaim.rs"]
 pub(super) mod reclaim;
 
+#[path = "v2_maintenance.rs"]
+pub(super) mod maintenance;
+
 #[allow(dead_code)]
 pub(crate) struct V2Db {
+    // First field: dropping it stops and joins the GC thread before the rest
+    // of the database (and its KV handle) is released.
+    maintenance: maintenance::Maintenance,
+    pub(crate) gc: Arc<engine::gc::Gc>,
     pub(crate) kv: Arc<engine::kv::Kv>,
     pub(crate) meta: engine::meta::MetaInfo,
     pub(crate) sequencer: Arc<engine::commit::Sequencer>,
@@ -106,16 +113,22 @@ impl V2Db {
             }
             kv.write(batch, engine::kv::Durability::Sync)?;
         }
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut config = engine::commit::SequencerConfig {
+            // Atomic paged DML retains transaction writes and savepoint undo.
+            write_set_bytes,
+            // Replicated groups must fit the same budget as individual writes.
+            group_max_bytes: replicated_allowed.then_some(write_set_bytes),
+            ..Default::default()
+        };
+        #[cfg(test)]
+        if let Some(bytes) = TEST_RECENT_LOG_BYTES.get() {
+            config.recent_log_bytes = bytes;
+        }
         let sequencer = engine::commit::Sequencer::open(
             kv.clone(),
             Arc::new(engine::commit::SystemClock),
-            engine::commit::SequencerConfig {
-                // Atomic paged DML retains transaction writes and savepoint undo.
-                write_set_bytes,
-                // Replicated groups must fit the same budget as individual writes.
-                group_max_bytes: replicated_allowed.then_some(write_set_bytes),
-                ..Default::default()
-            },
+            config,
         )?;
         let locks = Arc::new(engine::locks::LockManager::new(engine::locks::LockConfig {
             // One million rows plus old/new keys for secondary indexes.
@@ -126,7 +139,17 @@ impl V2Db {
         let xacts = engine::xact::XactIds::new(kv.clone(), sequences.clone());
         let catalog =
             engine::catalog::Catalog::open(sequencer.clone(), locks.clone(), sequences.clone())?;
+        let gc = Arc::new(engine::gc::Gc::open(
+            kv.clone(),
+            sequencer.clone(),
+            engine::gc::GcConfig {
+                retention: maintenance::RETENTION,
+            },
+        )?);
+        let replicated = meta.features & engine::meta::REPLICATED != 0;
         let db = Self {
+            maintenance: maintenance::Maintenance::start(&gc, replicated)?,
+            gc,
             kv,
             meta,
             sequencer,
@@ -165,6 +188,16 @@ impl V2Db {
             Arc::new(engine::commit::SystemClock),
             engine::commit::SequencerConfig::default(),
         )?;
+        // No GC on a gateway: range leaders own their data. Opened before the fence
+        // (the empty store has no watermark); `replicated` starts no thread.
+        let gc = Arc::new(engine::gc::Gc::open(
+            kv.clone(),
+            sequencer.clone(),
+            engine::gc::GcConfig {
+                retention: maintenance::RETENTION,
+            },
+        )?);
+        let maintenance = maintenance::Maintenance::start(&gc, true)?;
         kv.fence();
         let client = services.client();
         let sequences = Arc::new(engine::seq::SequenceAllocator::leased(client, 0));
@@ -174,6 +207,8 @@ impl V2Db {
             sequences.clone(),
         )?;
         Ok(Self {
+            maintenance,
+            gc,
             kv,
             meta: engine::meta::MetaInfo {
                 stale_counters: Vec::new(),
@@ -393,6 +428,13 @@ impl V2Db {
         }
     }
 }
+#[cfg(all(test, feature = "engine-rocksdb"))]
+thread_local! {
+    /// Test hook: the recent-log budget for databases opened on this thread,
+    /// so SERIALIZABLE validation takes its durable fallback (R3-610).
+    pub(crate) static TEST_RECENT_LOG_BYTES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
 #[cfg(test)]
 #[path = "v2_tests.rs"]
 mod tests;
@@ -408,3 +450,7 @@ mod catalog_snapshot_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "v2_backend_tests.rs"]
 mod backend_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_maintenance_tests.rs"]
+mod maintenance_tests;

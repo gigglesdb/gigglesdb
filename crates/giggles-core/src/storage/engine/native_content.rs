@@ -38,6 +38,10 @@ impl NativeContent {
             if *space != Keyspace::Kernel {
                 continue;
             }
+            // Protected task records (0x20..=0x2B) are gated by content_check.
+            if super::content_check::is_protected_kernel_key(key) {
+                continue;
+            }
             if !kernel::valid_key(key) && key.as_slice() != [255] {
                 return Err(corrupt("kernel namespace or key length"));
             }
@@ -96,17 +100,32 @@ impl NativeContent {
     }
 }
 
+/// Kernel ranges this check owns: the legacy namespaces below 0x0C and the
+/// mutation stamp 0xFF. The protected namespaces 0x20..=0x2B (bounded scan) and
+/// the unassigned gaps 0x0C..0x20 and 0x2C..0xFF (one seek each) belong to
+/// `content_check`, so open stays constant-cost in protected records.
+pub(super) const LEGACY_KERNEL_END: u8 = 0x0C;
+pub(super) const STAMP_NAMESPACE: u8 = 0xFF;
+
 pub(super) fn check(kv: &dyn KvRead, features: u64, version: u32) -> Result<(), FormatError> {
     let mut previous = None;
-    for item in kv
+    let legacy = kv
         .range(
             Keyspace::Kernel,
             Bound::Unbounded,
+            Bound::Excluded(&[LEGACY_KERNEL_END]),
+            Direction::Forward,
+        )
+        .map_err(corrupt)?;
+    let stamp = kv
+        .range(
+            Keyspace::Kernel,
+            Bound::Included(&[STAMP_NAMESPACE]),
             Bound::Unbounded,
             Direction::Forward,
         )
-        .map_err(corrupt)?
-    {
+        .map_err(corrupt)?;
+    for item in legacy.chain(stamp) {
         let (key, value) = item.map_err(corrupt)?;
         let (user, _) = codec::split_versioned(&key).map_err(|e| corrupt(format!("{e:?}")))?;
         if !kernel::valid_key(user) && user != [255] {

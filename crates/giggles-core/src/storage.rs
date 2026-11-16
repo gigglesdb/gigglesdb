@@ -2,8 +2,31 @@ use crate::*;
 mod catalog_inspection;
 mod cursor;
 mod drop_table;
-mod engine;
+pub(crate) mod engine;
 mod once_session;
+/// Task preview `schema_fp` input (GD-0061 R3-701): the catalog encodings of
+/// `table` and each of `constraints`, in the order given.
+pub(crate) fn task_schema_bytes(
+    table: &crate::relational::TableDef,
+    constraints: &[crate::relational::catalog_ext::Constraint],
+) -> Result<Vec<Vec<u8>>, CoreError> {
+    let entry = engine::catalog::TableEntry {
+        def: table.clone(),
+        heap: false,
+        primary_index_birth: None,
+        columns_ext: std::collections::BTreeMap::new(),
+    };
+    let mut out = vec![engine::catalog_codec::encode_table(&entry, &entry.columns_ext)?];
+    for c in constraints {
+        out.push(engine::catalog_codec::encode_constraint(c, &table.name)?);
+    }
+    Ok(out)
+}
+/// The row payload encoding `codec::encode_row` writes, without the record header.
+pub(crate) fn task_row_payload(values: &[crate::relational::Value]) -> Result<Vec<u8>, CoreError> {
+    encode(&values)
+}
+pub(crate) use engine::catalog_label_codec::UNTRUSTED_TEXT as UNTRUSTED_TEXT_LABEL;
 pub(crate) use engine::{catalog::CatalogParts, catalog_codec::sql_views::{SqlViewDef, SqlViewColumn, SqlViewDependency}};
 mod feature_envelope;
 mod format_policy;
@@ -19,13 +42,19 @@ mod range;
 #[cfg(feature = "engine-rocksdb")]
 mod cluster;
 pub mod roles;
+#[cfg(all(test, feature = "engine-rocksdb"))]
+mod roles_task_only_tests;
 mod secondary_index;
 mod secondary_index_catalog;
 mod secondary_index_public;
+mod column_labels_public;
 mod sequence_counters;
 pub(crate) mod sequences;
 mod upgrade;
-mod v2;
+pub(crate) mod v2;
+// GD-0061 R3-612: the task ledger reads and stages Kernel records.
+pub(crate) use engine::{kv::Keyspace, meta::PROTECTED_RECORDS, txn::{Isolation, Transaction}};
+pub(crate) use v2::V2Db;
 pub use upgrade::{UpgradePoint, UpgradeReport};
 mod copy_input;
 #[cfg(feature = "engine-rocksdb")]
@@ -88,6 +117,8 @@ pub enum CoreError {
     Sql(relational::SqlError),
     /// Schema DDL error outside the frozen, persisted scalar-error enum.
     DuplicateSchema,
+    /// Task-session error (GD-0061). Never stored in `SqlError`, which is persisted.
+    Task(crate::task::TaskError),
 }
 impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1077,7 +1108,32 @@ pub struct Executor {
     inner: Arc<Inner>,
     credential: Credential,
 }
+pub use v2::maintenance::MaintenanceStats;
 pub use v2::reclaim::ReclaimStats;
+
+impl Admin {
+    /// Runs one deterministic MVCC GC round on a v2 database (Kernel, then
+    /// Catalog, Rows and Index), as the background thread does over several
+    /// ticks. Legacy storage and replicated databases run no GC.
+    pub fn maintenance_step(&self) -> Result<MaintenanceStats, CoreError> {
+        let _ticket = self.inner.enter_sql()?;
+        match &self.inner.backend {
+            Backend::V2(db) => db.maintenance_step(),
+            _ => Ok(MaintenanceStats::default()),
+        }
+    }
+
+    /// Sets the v2 GC retention window (default 60 s). Shortening it lets the
+    /// next round collect sooner; lengthening it never rewinds the durable
+    /// watermark. No effect on legacy storage.
+    pub fn set_gc_retention(&self, retention: std::time::Duration) -> Result<(), CoreError> {
+        let _ticket = self.inner.enter_sql()?;
+        if let Backend::V2(db) = &self.inner.backend {
+            db.set_gc_retention(retention);
+        }
+        Ok(())
+    }
+}
 
 impl Admin {
     /// One-time trusted provisioning. A task's counters and caps cannot be reset.
@@ -1942,6 +1998,9 @@ pub struct SqlSession {
     admin: Admin,
     staged: Option<State>,
     v2_transaction: Option<engine::txn::Transaction>,
+    /// A parked protected run (R3-606, C1); set only inside
+    /// `execute_protected_v2`, never counted as an SQL transaction slot.
+    protected: Option<ProtectedRun>,
     copy_input: Option<CopyInput>,
     savepoints: Vec<SqlSavepoint>,
     v2_savepoints: Vec<(String, engine::txn::Savepoint, relational::DeferralState)>,
@@ -1962,6 +2021,8 @@ pub struct SqlSession {
     sequence_tables: Option<std::collections::BTreeSet<String>>,
     deferral: relational::DeferralState,
     isolation: SqlIsolation,
+    /// The task this session is bound to (GD-0061 R3-202); set once by `bind_task`.
+    pub(crate) task: Option<crate::task::context::TaskContext>,
 }
 mod complete_relation;
 pub(crate) use complete_relation::CompleteRelation;
@@ -1973,6 +2034,7 @@ impl Admin {
             admin: self.clone(),
             staged: None,
             v2_transaction: None,
+            protected: None,
             copy_input: None,
             savepoints: Vec::new(),
             v2_savepoints: Vec::new(),
@@ -1993,6 +2055,7 @@ impl Admin {
             sequence_tables: None,
             deferral: Default::default(),
             isolation: SqlIsolation::ReadCommitted,
+            task: None,
         }
     }
     /// Catalog preflight for the lossless logical archive profile. Refuse catalog
@@ -4009,6 +4072,8 @@ impl SqlSession {
     pub fn rollback(&mut self) {
         self.xact.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.copy_input = None;
+        // A parked protected run is not an SQL transaction slot.
+        self.protected = None;
         let v2 = self.v2_transaction.take().is_some();
         if self.staged.take().is_some() || v2 {
             self.admin
@@ -5106,3 +5171,12 @@ mod tests {
 
 #[cfg(all(test, feature = "engine-rocksdb"))]
 mod fk_target_plumbing_tests;
+
+/// A protected run: the caller-owned transaction plus the row effects its
+/// statements produced (design section 6, D-C).
+// Constructed by `protected_commit` (R3-610); until it lands only tests do.
+#[cfg_attr(not(all(test, feature = "engine-rocksdb")), allow(dead_code))]
+pub(crate) struct ProtectedRun {
+    pub(crate) txn: engine::txn::Transaction,
+    pub(crate) effects: crate::task::effects::Effects,
+}

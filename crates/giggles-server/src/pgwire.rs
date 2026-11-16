@@ -119,8 +119,9 @@ fn ready(session: &Session, out: &mut Vec<u8>) -> R<()> {
         out,
     )
 }
+const GENERIC_MESSAGE: &str = "request rejected; consult documented code";
 pub fn error(code: &str, out: &mut Vec<u8>) {
-    error_message(code, "request rejected; consult documented code", out);
+    error_message(code, GENERIC_MESSAGE, out);
 }
 pub(crate) fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>) {
     diagnostic_error(code, message, None, out);
@@ -146,6 +147,11 @@ impl Diagnostic {
             ))
         ) {
             self.wire_message = message;
+        }
+        if let Err(CoreError::Task(task)) = &result
+            && task.name().is_some()
+        {
+            self.message = Some(task.message());
         }
         core(result)
     }
@@ -174,6 +180,10 @@ fn diagnostic_error(
     let message = match code {
         "21000" => "more than one row returned by a subquery used as an expression",
         "42P10" => "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+        // Task codes: sites that only have the code still send a named message.
+        _ if message == GENERIC_MESSAGE => {
+            giggles_core::task::TaskError::message_for_sqlstate(code).unwrap_or(message)
+        }
         _ => message,
     };
     // Never log request text or values. Messages are fixed server diagnostics.
@@ -2245,7 +2255,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                             "unsupported SQL feature or parameter type in this server profile"
                         }
                         "42601" => "statement syntax is not supported by this server SQL profile",
-                        _ => "request rejected; consult documented code",
+                        _ => GENERIC_MESSAGE,
                     });
                     if state.copy.is_some() {
                         state.copy_error(code, &mut session, &mut out);

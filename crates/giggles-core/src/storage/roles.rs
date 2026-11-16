@@ -22,7 +22,7 @@ const ROLES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("giggles_roles
 const NEXT_OID: &[u8] = b"meta/next_oid";
 // Both engines run the same catalog operations on one atomic image.
 #[derive(Clone, Default)]
-struct RoleTable(BTreeMap<Vec<u8>, Vec<u8>>);
+pub(crate) struct RoleTable(BTreeMap<Vec<u8>, Vec<u8>>);
 struct Bytes<'a>(&'a [u8]);
 impl Bytes<'_> {
     fn value(&self) -> &[u8] {
@@ -30,6 +30,14 @@ impl Bytes<'_> {
     }
 }
 impl RoleTable {
+    /// Every role record, by name (the task dependency guard, GD-0061 R3-106).
+    pub(crate) fn role_records(&self) -> Result<BTreeMap<String, CatalogRole>, RoleError> {
+        self.0
+            .iter()
+            .filter(|(raw, _)| raw.starts_with(b"role/"))
+            .map(|(_, value)| decode::<CatalogRole>(value).map(|role| (role.name.clone(), role)))
+            .collect()
+    }
     fn get(&self, key: &[u8]) -> Result<Option<Bytes<'_>>, CoreError> {
         Ok(self.0.get(key).map(|v| Bytes(v)))
     }
@@ -71,6 +79,11 @@ pub struct CatalogRole {
     pub password: Option<String>,
     /// Increments on every alter (attributes or password). Starts at 1.
     pub generation: u64,
+    /// A task-only role acts only as a task executor (GD-0061 D6). Omitted
+    /// from the JSON when false, so existing role records stay byte-identical;
+    /// old binaries refuse it through the TASK_CATALOG feature bit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub task_only: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -149,11 +162,28 @@ pub struct RoleCatalog {
     inner: Arc<Inner>,
 }
 
+pub(crate) use engine::lock_shared;
+
 impl Admin {
+    pub fn tasks(&self) -> crate::task::catalog::TaskCatalog {
+        let db = match &self.inner.backend {
+            super::Backend::V2(db) => Some(Arc::clone(db)),
+            super::Backend::Legacy(_) => None,
+        };
+        crate::task::catalog::TaskCatalog::new(db, self.roles())
+    }
+
     pub fn roles(&self) -> RoleCatalog {
         RoleCatalog {
             inner: Arc::clone(&self.inner),
         }
+    }
+}
+
+impl super::SqlSession {
+    /// The task catalog of this session's database (GD-0061).
+    pub(crate) fn tasks(&self) -> crate::task::catalog::TaskCatalog {
+        self.admin.tasks()
     }
 }
 
@@ -216,6 +246,38 @@ fn raw_get(table: &RoleTable, key: &[u8]) -> Result<Option<Vec<u8>>, RoleError> 
 fn require_role(table: &RoleTable, name: &str) -> Result<(), RoleError> {
     if raw_get(table, &key(b"role/", name))?.is_none() {
         return Err(RoleError::Missing);
+    }
+    Ok(())
+}
+
+/// D6 on the whole role image: a task-only role is neither superuser nor
+/// createrole, owns nothing, and appears on neither side of a membership.
+fn task_only_invariants(table: &RoleTable) -> Result<(), RoleError> {
+    let mut task_only = BTreeSet::new();
+    for (raw, value) in &table.0 {
+        // Only a role that is task-only carries the field (false is skipped).
+        if raw.starts_with(b"role/") && value.windows(11).any(|w| w == b"\"task_only\"") {
+            let role: CatalogRole = decode(value)?;
+            if role.task_only {
+                if role.superuser || role.createrole {
+                    return Err(RoleError::Invalid);
+                }
+                task_only.insert(role.name.into_bytes());
+            }
+        }
+    }
+    if task_only.is_empty() {
+        return Ok(());
+    }
+    for (raw, value) in &table.0 {
+        if raw.starts_with(b"owner/") && task_only.contains(value) {
+            return Err(RoleError::Invalid);
+        }
+        if let Some(pair) = raw.strip_prefix(b"member/")
+            && pair.split(|b| *b == 0).any(|name| task_only.contains(name))
+        {
+            return Err(RoleError::Invalid);
+        }
     }
     Ok(())
 }
@@ -387,6 +449,7 @@ impl RoleCatalog {
                 createrole: new.createrole,
                 password: new.password,
                 generation: 1,
+                task_only: false,
             };
             table
                 .insert(role_key.as_slice(), json(&role)?.as_slice())
@@ -426,6 +489,32 @@ impl RoleCatalog {
                 .map_err(io)?;
             Ok(role)
         })
+    }
+
+    /// Set or clear the task-only attribute; bumps the generation. v2 only:
+    /// the legacy backend refuses with `CoreError::Unsupported`.
+    pub fn set_task_only(&self, name: &str, value: bool) -> Result<CatalogRole, RoleError> {
+        self.check_fenced()?;
+        if matches!(&self.inner.backend, super::Backend::Legacy(_)) {
+            return Err(CoreError::Unsupported.into());
+        }
+        validate_name(name)?;
+        self.write(|table| {
+            let role_key = key(b"role/", name);
+            let mut role: CatalogRole =
+                decode(&raw_get(table, &role_key)?.ok_or(RoleError::Missing)?)?;
+            role.generation = role.generation.checked_add(1).ok_or(RoleError::Limit)?;
+            role.task_only = value;
+            table
+                .insert(role_key.as_slice(), json(&role)?.as_slice())
+                .map_err(io)?;
+            Ok(role)
+        })
+    }
+
+    /// Whether the role is task-only; `Missing` if it does not exist.
+    pub fn is_task_only(&self, name: &str) -> Result<bool, RoleError> {
+        Ok(self.get(name)?.ok_or(RoleError::Missing)?.task_only)
     }
 
     pub fn drop(&self, name: &str) -> Result<(), RoleError> {
@@ -1426,6 +1515,7 @@ mod tests {
                             createrole: false,
                             password: None,
                             generation: 1,
+                            task_only: false,
                         };
                         table
                             .insert(

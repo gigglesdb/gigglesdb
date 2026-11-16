@@ -707,7 +707,7 @@ pub(crate) fn validate_catalog(
         return validate_size(statement);
     }
     if let CatalogStatement::DropTable { table: name, .. } | CatalogStatement::DropIndex { name, .. } = statement {
-        if !matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) { return Err(Error::Unsupported); }
+        if !matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022) { return Err(Error::Unsupported); }
         if !parser::semantic_relation(name, version) { return Err(Error::Bind("identifier".into())); }
         return validate_size(statement);
     }
@@ -744,7 +744,7 @@ pub(crate) fn validate_catalog(
     {
         return Err(Error::Limit);
     }
-    if !matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021)
+    if !matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022)
         && columns.iter().any(|column| column.data_type == CatalogType::Numeric)
     {
         return Err(Error::Unsupported);
@@ -2138,7 +2138,7 @@ fn validate_parameter_admission(
         validate_size(stmt)?;
         return Ok(());
     }
-    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021)
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
         return validate_bindings_for(bindings, version);
@@ -2249,7 +2249,7 @@ fn validate_transaction_parameters(
     bindings: &Bindings,
     version: LanguageVersion,
 ) -> Result<()> {
-    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021)
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
         return validate_bindings_for(bindings, version);

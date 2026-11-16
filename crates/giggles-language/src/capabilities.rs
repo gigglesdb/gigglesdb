@@ -227,7 +227,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         });
     };
 
-    if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) {
+    if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022) {
         add(
             CapabilityInterface::RustText,
             "numeric_parameters",
@@ -241,7 +241,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         );
     }
 
-    if matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) {
+    if matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022) {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "numeric_column_declaration", CapabilityState::Implemented,
                 "Legacy native CREATE TABLE: unconstrained NUMERIC, required or nullable. No typmod; v2 catalog writes remain refused.",
@@ -324,7 +324,14 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         }
     }
 
-    if matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) {
+    if version.supports_tasks() {
+        add(CapabilityInterface::RustText, "task_definition", CapabilityState::Implemented,
+            "parse_task_with_version: create task NAME for role R [approver A] on [schema.]table visible when EXPR [readable (..)] [masked (col [= value], ..)] [untrusted text (..)] [allow update (..) from EXPR to EXPR at most N distinct rows and N transitions [approve above N]] disclose at most N rows read [and N rows returned] and N bytes [limits (name = N, ..)] expires timestamp(\"..\"); revoke task, show task, show tasks, grant|revoke undo, inspect on task. Lowers to core's TaskStatement, identical to the SQL parser's; expressions render to SQL predicate text (old. only in from, new. only in to, both stripped). Parse and lowering only; earlier profiles return Unsupported.",
+            vec![evidence("crates/giggles-language/tests/native_task_definition.rs", "native_inc_436_lowers_to_same_statement_as_sql"),
+                evidence("crates/giggles-language/tests/native_task_definition.rs", "revoke_show_grant_forms")], vec![]);
+    }
+
+    if matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 | LanguageVersion::Embedded022) {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "catalog_drop", CapabilityState::Implemented,
                 "Standalone DROP TABLE/INDEX with default RESTRICT or explicit CASCADE/RESTRICT. Shared SQL dependencies and errors; DROP INDEX CASCADE removes FKs bound to a standalone index; legacy Unknown bindings remain Unsupported. Legacy requires empty business state; v2 permits populated state.",
@@ -1855,6 +1862,10 @@ fn rejection_evidence(version: LanguageVersion) -> TestEvidence {
         LanguageVersion::Embedded011 => (
             "crates/giggles-language/tests/once_capabilities.rs",
             "once_selected_manifest_rejections_use_selected_version",
+        ),
+        LanguageVersion::Embedded022 => (
+            "crates/giggles-language/tests/native_task_definition.rs",
+            "profile_0_21_rejects_create_task",
         ),
         LanguageVersion::Embedded021 => (
             "crates/giggles-language/tests/native_recovery21_parity.rs",

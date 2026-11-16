@@ -16,6 +16,16 @@ pub(crate) const CATALOG_NAME_INDEX: u64 = u64::MAX;
 /// Reserved table lock serializing kernel image read/modify/write transactions.
 pub(crate) const KERNEL_LOCK_TABLE: u64 = u64::MAX - 1;
 
+/// Reserved row-lock table for the GD-0061 task authority hold: `Row { table:
+/// TASK_AUTHORITY_LOCK_TABLE, pk: kernel_key }` in `Exclusive`. `MAX - 2` is the
+/// roles lock (`roles_engine.rs`).
+pub(crate) const TASK_AUTHORITY_LOCK_TABLE: u64 = u64::MAX - 3;
+
+/// Reserved table lock serializing GD-0061 task catalog writers (CREATE TASK,
+/// REVOKE TASK, task grants, purge): `Table(TASK_CATALOG_LOCK_TABLE)` in
+/// `AccessExclusive`, taken after the table and the shared role lock.
+pub(crate) const TASK_CATALOG_LOCK_TABLE: u64 = u64::MAX - 4;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct TxnId(pub u64);
 

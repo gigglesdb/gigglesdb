@@ -9,8 +9,9 @@ use giggles_core::{
 #[derive(Clone)]
 pub(crate) enum AdminStatement {
     Error(&'static str),
-    Create(String, RoleChanges),
-    Alter(String, RoleChanges),
+    /// The third field is TASKONLY (`Some(true)`) or NOTASKONLY (`Some(false)`).
+    Create(String, RoleChanges, Option<bool>),
+    Alter(String, RoleChanges, Option<bool>),
     Drop(bool, Vec<String>),
     /// Existence and authorization are validated for all names before dropping.
     /// Multi-name drops are not atomic: a later conflict can leave earlier names dropped.
@@ -141,9 +142,10 @@ impl Parser {
         }
         Ok(names)
     }
-    fn options(&mut self, user: bool) -> Result<RoleChanges, &'static str> {
+    fn options(&mut self, user: bool) -> Result<(RoleChanges, Option<bool>), &'static str> {
         self.kw("with");
         let mut c = RoleChanges::default();
+        let mut task_only = None;
         while self.pos < self.tokens.len() {
             let option = match self.tokens.get(self.pos) {
                 Some(Token::Word(word)) => {
@@ -157,6 +159,7 @@ impl Parser {
                 "superuser" | "nosuperuser" => Some((&mut c.superuser, option == "superuser")),
                 "login" | "nologin" => Some((&mut c.login, option == "login")),
                 "createrole" | "nocreaterole" => Some((&mut c.createrole, option == "createrole")),
+                "taskonly" | "notaskonly" => Some((&mut task_only, option == "taskonly")),
                 "password" => {
                     if c.password.is_some() {
                         return Err("42601");
@@ -189,7 +192,7 @@ impl Parser {
         if user && c.login.is_none() {
             c.login = Some(true);
         }
-        Ok(c)
+        Ok((c, task_only))
     }
     fn statement(&mut self) -> Result<AdminStatement, &'static str> {
         if self.kw("create") || self.kw("alter") {
@@ -201,11 +204,11 @@ impl Parser {
                 true
             };
             let name = self.ident()?;
-            let changes = self.options(user)?;
+            let (changes, task_only) = self.options(user)?;
             return Ok(if create {
-                AdminStatement::Create(name, changes)
+                AdminStatement::Create(name, changes, task_only)
             } else {
-                AdminStatement::Alter(name, changes)
+                AdminStatement::Alter(name, changes, task_only)
             });
         }
         if self.kw("drop") {
@@ -346,7 +349,24 @@ fn state(e: RoleError) -> &'static str {
         RoleError::Dependent => "2BP01",
         RoleError::Invalid => "22023",
         RoleError::Limit => "54000",
+        RoleError::Core(CoreError::Unsupported) => "0A000",
         RoleError::Core(_) => "XX000",
+    }
+}
+/// A task-only role conflicts with the requested role state (GD-0061 D6, section 7).
+const TASK_ONLY_CONFLICT: &str = "42P17";
+/// Apply TASKONLY / NOTASKONLY. Setting it on a superuser, an owner or a member
+/// fails the whole-image D6 check in the role catalog (`RoleError::Invalid`),
+/// which is a role-state conflict here.
+fn apply_task_only(
+    catalog: &giggles_core::roles::RoleCatalog,
+    name: &str,
+    value: bool,
+) -> Result<(), &'static str> {
+    match catalog.set_task_only(name, value) {
+        Ok(_) => Ok(()),
+        Err(RoleError::Invalid) if value => Err(TASK_ONLY_CONFLICT),
+        Err(e) => Err(state(e)),
     }
 }
 fn password(c: &RoleChanges) -> RoleChanges {
@@ -366,11 +386,15 @@ pub(crate) fn execute(
     let catalog = admin.roles();
     match stmt {
         AdminStatement::Error(e) => Err(*e),
-        AdminStatement::Create(name, c) => {
+        AdminStatement::Create(name, c, task_only) => {
             if !actor.superuser
                 && (!actor.createrole || c.superuser == Some(true) || c.createrole == Some(true))
             {
                 return Err("42501");
+            }
+            if *task_only == Some(true) && (c.superuser == Some(true) || c.createrole == Some(true))
+            {
+                return Err("22023");
             }
             let c = password(c);
             catalog
@@ -382,15 +406,23 @@ pub(crate) fn execute(
                     password: c.password.flatten(),
                 })
                 .map_err(state)?;
+            if *task_only == Some(true)
+                && let Err(e) = apply_task_only(&catalog, name, true)
+            {
+                // Never leave a half-created role behind.
+                let _ = catalog.drop(name);
+                return Err(e);
+            }
             Ok("CREATE ROLE")
         }
-        AdminStatement::Alter(name, c) => {
+        AdminStatement::Alter(name, c, task_only) => {
             let target = catalog.get(name).map_err(state)?.ok_or("42704")?;
             let own_password = name == &actor.name
                 && c.password.is_some()
                 && c.superuser.is_none()
                 && c.createrole.is_none()
-                && c.login.is_none();
+                && c.login.is_none()
+                && task_only.is_none();
             if !actor.superuser
                 && !own_password
                 && !(actor.createrole
@@ -401,7 +433,48 @@ pub(crate) fn execute(
             {
                 return Err("42501");
             }
-            catalog.alter(name, password(c)).map_err(state)?;
+            if *task_only == Some(true) && (c.superuser == Some(true) || c.createrole == Some(true))
+            {
+                return Err("22023");
+            }
+            // Section 7: the role would end up task-only and SUPERUSER or CREATEROLE.
+            let ends_task_only = task_only.unwrap_or(target.task_only);
+            if ends_task_only
+                && (c.superuser.unwrap_or(target.superuser)
+                    || c.createrole.unwrap_or(target.createrole))
+            {
+                return Err(TASK_ONLY_CONFLICT);
+            }
+            // An administrator never turns its own session's role task-only.
+            if *task_only == Some(true) && name == &actor.name {
+                return Err(TASK_ONLY_CONFLICT);
+            }
+            // NOTASKONLY is cleared before the other changes (so NOTASKONLY
+            // CREATEROLE passes D6); TASKONLY is set after them. A failure in
+            // the second step restores the first, best effort.
+            if *task_only == Some(false) {
+                apply_task_only(&catalog, name, false)?;
+            }
+            if let Err(e) = catalog.alter(name, password(c)) {
+                if *task_only == Some(false) && target.task_only {
+                    let _ = catalog.set_task_only(name, true);
+                }
+                return Err(state(e));
+            }
+            if *task_only == Some(true)
+                && let Err(e) = apply_task_only(&catalog, name, true)
+            {
+                let _ = catalog.alter(
+                    name,
+                    RoleChanges {
+                        superuser: Some(target.superuser),
+                        login: Some(target.login),
+                        createrole: Some(target.createrole),
+                        password: Some(target.password.clone()),
+                    },
+                );
+                return Err(e);
+            }
             Ok("ALTER ROLE")
         }
         AdminStatement::Drop(exists, names) => {
@@ -829,6 +902,44 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'stat
 mod tests {
     use super::*;
     #[test]
+    fn taskonly_parses() {
+        let Some(AdminStatement::Create(n, c, t)) = parse("CREATE ROLE agent LOGIN TASKONLY") else {
+            panic!()
+        };
+        assert_eq!(n, "agent");
+        assert_eq!(c.login, Some(true));
+        assert_eq!(t, Some(true));
+        let Some(AdminStatement::Create(_, c, t)) =
+            parse("CREATE USER a WITH PASSWORD 'x' TASKONLY")
+        else {
+            panic!()
+        };
+        assert_eq!(c.login, Some(true));
+        assert_eq!(t, Some(true));
+        let Some(AdminStatement::Alter(n, _, t)) = parse("alter role \"A\" notaskonly;") else {
+            panic!()
+        };
+        assert_eq!(n, "A");
+        assert_eq!(t, Some(false));
+        let Some(AdminStatement::Alter(_, _, t)) = parse("ALTER ROLE a LOGIN") else {
+            panic!()
+        };
+        assert_eq!(t, None);
+    }
+    #[test]
+    fn taskonly_twice_42601() {
+        for sql in [
+            "CREATE ROLE a TASKONLY TASKONLY",
+            "CREATE ROLE a TASKONLY NOTASKONLY",
+            "ALTER ROLE a NOTASKONLY TASKONLY",
+        ] {
+            assert!(
+                matches!(parse(sql), Some(AdminStatement::Error("42601"))),
+                "{sql}"
+            );
+        }
+    }
+    #[test]
     fn core_statements_fall_through() {
         for sql in [
             "CREATE TABLE t (x int)",
@@ -843,11 +954,11 @@ mod tests {
     #[test]
     fn identifiers_and_passwords() {
         assert!(
-            matches!(parse("CREATE ROLE\"Case\" LOGIN"), Some(AdminStatement::Create(n, _)) if n == "Case")
+            matches!(parse("CREATE ROLE\"Case\" LOGIN"), Some(AdminStatement::Create(n, _, _)) if n == "Case")
         );
         assert!(parse("CREATE ROLE r \"login\"").is_none());
         assert!(parse("GRANT \"select\" ON t TO r").is_none());
-        let Some(AdminStatement::Create(n, c)) =
+        let Some(AdminStatement::Create(n, c, _)) =
             parse("CrEaTe UsEr \"A\"\"B\" WITH PASSWORD 'a''b' NOLOGIN;")
         else {
             panic!()
@@ -855,7 +966,7 @@ mod tests {
         assert_eq!(n, "A\"B");
         assert_eq!(c.password, Some(Some("a'b".into())));
         assert_eq!(c.login, Some(false));
-        let Some(AdminStatement::Alter(n, c)) = parse("ALTER USER Mixed PASSWORD NULL") else {
+        let Some(AdminStatement::Alter(n, c, _)) = parse("ALTER USER Mixed PASSWORD NULL") else {
             panic!()
         };
         assert_eq!(n, "mixed");

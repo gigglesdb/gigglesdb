@@ -51,7 +51,7 @@ fn empty() -> CatalogParts {
         heap: BTreeSet::new(),
         indexes: Vec::new(),
         ext: CatalogExt::default(),
-        sql_views: BTreeMap::new(), comments: BTreeMap::new(),
+        sql_views: BTreeMap::new(), comments: BTreeMap::new(), column_labels: BTreeMap::new(),
     }
 }
 fn serial_parts(ids: &Range<u64>) -> CatalogParts {

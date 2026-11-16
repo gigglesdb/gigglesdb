@@ -77,6 +77,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::InvalidRowCountInResultOffsetClause) => "2201X",
         CoreError::Sql(S::CardinalityViolation) => "21000",
         CoreError::Sql(S::InvalidColumnReference) => "42P10",
+        CoreError::Task(e) => e.sqlstate(),
         CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
         CoreError::LockNotAvailable => "55P03",

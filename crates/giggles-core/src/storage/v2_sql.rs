@@ -93,7 +93,7 @@ impl SqlSession {
             u128::from_be_bytes(db.meta.domain), &image).map_err(CoreError::Sql)?;
         let result = image.execute_with_sink(&prepared, &[], None, None,
             &mut SqlRows { db, txn, parts: &catalog.parts, writing: false,
-                conflict_floor: None, prepared: &prepared, params: &[] },
+                conflict_floor: None, prepared: &prepared, params: &[], effects: None },
             u64::MAX, None)?;
         crate::cancellation::check()?;
         Ok(result)
@@ -343,9 +343,11 @@ impl SqlSession {
                         return Err(CoreError::Sql(E::Parameters));
                     }
                     let mut implicit = None;
-                    let txn = match &mut self.v2_transaction {
-                        Some(txn) => txn,
-                        None => implicit.insert(db.begin(self.isolation.engine())),
+                    let protected = self.protected.is_some();
+                    let (txn, mut protected_effects) = match (&mut self.protected, &mut self.v2_transaction) {
+                        (Some(run), _) => (&mut run.txn, Some(&mut run.effects)),
+                        (None, Some(txn)) => (txn, None),
+                        (None, None) => (implicit.insert(db.begin(self.isolation.engine())), None),
                     };
                     if !self.copy_input.as_ref().is_some_and(|input| input.started) {
                         txn.begin_statement();
@@ -535,7 +537,14 @@ impl SqlSession {
                             let fixed_snapshot = txn.isolation() != Isolation::ReadCommitted
                                 && expected_version.is_none()
                                 && self.copy_input.is_none();
-                            let shared = fixed_snapshot || append || candidates.is_some() || upsert.is_some();
+                            // C4 (R3-607): a protected run takes the Shared sentinel. The
+                            // lock queue is FIFO (engine/locks.rs), so a run waiting for
+                            // Exclusive behind one long application transaction would
+                            // stall every later application writer of the table, against
+                            // spec section 5. Row locks in `SqlRows::apply` and read-set
+                            // validation at commit keep the run correct.
+                            let shared = fixed_snapshot || append || candidates.is_some() || upsert.is_some()
+                                || protected;
                             txn.lock_sql_sentinel(table.id,
                                 if shared { LockMode::Shared } else { LockMode::Exclusive },
                                 &|| crate::cancellation::check().is_err())?;
@@ -615,7 +624,12 @@ impl SqlSession {
                         }
                         // Choose ONE snapshot after every potentially blocking lock.
                         // No refresh occurs while staging any of the statement's rows.
-                        if !self.copy_input.as_ref().is_some_and(|input| input.started) {
+                        if protected {
+                            // C1/C2/C5: one fresh snapshot after every lock wait, then
+                            // coarse Catalog tracking for the rest of the run.
+                            txn.restart_snapshot()?;
+                            txn.track_range(Keyspace::Catalog, Bound::Unbounded, Bound::Unbounded)?;
+                        } else if !self.copy_input.as_ref().is_some_and(|input| input.started) {
                             txn.begin_statement();
                         }
                         let catalog = db.catalog().snapshot(txn)?;
@@ -685,6 +699,7 @@ impl SqlSession {
                                     writing,
                                     prepared: &bound,
                                     params,
+                                    effects: None,
                                 },
                                 floor..versions.start,
                                 input.finishing,
@@ -698,7 +713,7 @@ impl SqlSession {
                         if !writing && image.streaming_reduction(&bound) {
                             let source = reduction::Source::new(SqlRows {
                                 conflict_floor: None, db, txn, parts: old,
-                                writing, prepared: &bound, params,
+                                writing, prepared: &bound, params, effects: None,
                             });
                             let result = image.execute_reduction(
                                 p, params, expected_version, context.as_ref(), &source);
@@ -707,7 +722,7 @@ impl SqlSession {
                             return result.map_err(CoreError::Sql);
                         }
                         bound.check_view_drop(&image).map_err(CoreError::Sql)?;
-                        let result = if matches!(bound.command(), "COMMENT" | "CREATE VIEW" | "DROP VIEW") { Ok(Default::default()) } else { image.execute_with_sink(
+                        let result = if matches!(bound.command(), "COMMENT" | "SECURITY LABEL" | "CREATE VIEW" | "DROP VIEW") { Ok(Default::default()) } else { image.execute_with_sink(
                             p,
                             params,
                             expected_version,
@@ -720,6 +735,7 @@ impl SqlSession {
                                 writing,
                                 prepared: &bound,
                                 params,
+                                effects: protected_effects.as_deref_mut(),
                             },
                             versions.end,
                             if self.transaction_id.is_some() {
@@ -789,12 +805,19 @@ impl SqlSession {
                                 })
                                 .map(|(owner, text)| (*owner, text.clone()))
                                 .collect(),
+                            // Labels are dropped with their column or table.
+                            column_labels: old.column_labels.iter()
+                                .filter(|((relation, column), _)| tables.values().any(|table| table.id == *relation
+                                    && table.columns.iter().any(|c| c.id == *column)))
+                                .map(|(owner, flags)| (*owner, *flags))
+                                .collect(),
                             tables,
                             heap,
                             ext,
                             indexes,
                         };
                         bound.apply_comment(&image, &mut new).map_err(CoreError::Sql)?;
+                        bound.apply_label(&image, &mut new).map_err(CoreError::Sql)?;
                         bound.apply_view(&image, &mut new, ids.start).map_err(CoreError::Sql)?;
                         txn.reclaim_after_commit |=
                             old.tables
@@ -836,7 +859,7 @@ impl SqlSession {
                         txn.rollback_to(&mark).map_err(CoreError::from)?;
                     }
                     txn.release(mark).map_err(CoreError::from)?;
-                    if self.v2_transaction.is_none() && result.is_ok() {
+                    if self.v2_transaction.is_none() && !protected && result.is_ok() {
                         let point = *inner.crash.lock().map_err(|_| CoreError::Fenced)?;
                         let mut txn = implicit.take().expect("implicit transaction");
                         if let Some(guard) = self.xact.lock()
@@ -937,6 +960,7 @@ pub(super) fn validate_pending(
             writing: true,
             prepared: &p,
             params: &[],
+            effects: None,
         },
         u64::MAX,
         Some(deferred),
@@ -989,6 +1013,9 @@ struct SqlRows<'a> {
     conflict_floor: Option<u64>,
     prepared: &'a relational::Prepared,
     params: &'a [relational::Value],
+    /// Effects collector of a protected run (R3-609); `None` on every
+    /// ordinary path.
+    effects: Option<&'a mut crate::task::effects::Effects>,
 }
 
 fn charge_mutation_point(table: &TableDef, row: &SqlRow,
@@ -1008,6 +1035,12 @@ impl SqlRows<'_> {
         physical.extend(codec::pk_bytes(&pk)?);
         Ok(self.txn.changed_since(Keyspace::Rows, &physical, ts)?)
     }
+    /// Whether the statement snapshot was taken after every FK table lock:
+    /// READ COMMITTED, or a protected run that restarted its snapshot there
+    /// (GD-0061 C2/C3).
+    fn statement_snapshot_is_latest(&self) -> bool {
+        self.txn.isolation() == Isolation::ReadCommitted || self.txn.snapshot_restarted()
+    }
     /// Runs `read` at the latest committed state when the snapshot is fixed
     /// (REPEATABLE READ, SERIALIZABLE), as PostgreSQL's RI queries for
     /// referencing rows do: a referencing row committed since the snapshot is a
@@ -1015,7 +1048,7 @@ impl SqlRows<'_> {
     /// lock_for_write. READ COMMITTED's statement snapshot is already latest.
     fn at_latest<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T, CoreError>)
         -> Result<T, CoreError> {
-        if self.txn.isolation() == Isolation::ReadCommitted {
+        if self.statement_snapshot_is_latest() {
             return read(self);
         }
         self.txn.begin_latest();
@@ -1040,7 +1073,9 @@ impl RowSink for SqlRows<'_> {
         result.map_err(CoreError::Sql)
     }
     // READ COMMITTED takes the statement snapshot after every FK table lock, so
-    // witnesses are current. A REPEATABLE READ or SERIALIZABLE snapshot can
+    // witnesses are current. So does a protected run: it restarts its snapshot
+    // after those locks (GD-0061 C2/C3), so no writer of a connected table is
+    // in flight and every commit is visible; its reads stay in its read set. A REPEATABLE READ or SERIALIZABLE snapshot can
     // predate commits by the writers those locks waited for. The Share and
     // RowExclusive locks are held to transaction end, so the latest committed
     // state of every FK-connected table is final for this transaction. As in
@@ -1051,7 +1086,7 @@ impl RowSink for SqlRows<'_> {
         &mut self, table: &TableDef, columns: &[u64], values: Option<&[relational::Value]>,
         parent: bool, visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
-        if self.txn.isolation() == Isolation::ReadCommitted {
+        if self.statement_snapshot_is_latest() {
             return self.lookup(table, columns, values, parent, visit);
         }
         let ts = self.txn.snapshot_ts();
@@ -1637,19 +1672,24 @@ impl RowSink for SqlRows<'_> {
                 (None, None) => (),
             }
         }
-        for (key, (_, new)) in changes {
+        for (key, (_, new)) in &changes {
             crate::cancellation::check()?;
             match new {
                 Some(row) => self.txn.put(
                     Keyspace::Rows,
                     key.clone(),
-                    codec::encode_row(&key, row.version, &row.values)?,
+                    codec::encode_row(key, row.version, &row.values)?,
                 )?,
-                None => self.txn.delete(Keyspace::Rows, key)?,
+                None => self.txn.delete(Keyspace::Rows, key.clone())?,
             }
             #[cfg(test)]
             if FAIL_AFTER_ROW_WRITE.replace(false) {
                 return Err(CoreError::Cancelled);
+            }
+        }
+        if let Some(effects) = self.effects.as_deref_mut() {
+            for (key, (old, new)) in &changes {
+                effects.record(table.id, key, *old, *new)?;
             }
         }
         Ok(())
@@ -1925,3 +1965,65 @@ thread_local! {
     static USED_INDEX_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_AFTER_ROW_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// Cross-checks a protected run's effects against its buffered row writes
+/// (R3-609, D-D): the two key sets must be equal.
+// Called by `protected_commit` (R3-610); until it lands only tests do.
+#[cfg_attr(not(all(test, feature = "engine-rocksdb")), allow(dead_code))]
+pub(crate) fn cross_check_effects(
+    effects: &crate::task::effects::Effects,
+    txn: &Transaction,
+) -> Result<(), CoreError> {
+    effects.cross_check(txn.written_keys(Keyspace::Rows))
+}
+
+impl SqlSession {
+    /// C1, the protected-statement seam: runs one DML statement inside the
+    /// caller's transaction and never commits. The run is parked on the
+    /// session for the duration and handed back with the result.
+    // Called by `protected_commit` (R3-610); until it lands only tests do.
+    #[cfg_attr(not(all(test, feature = "engine-rocksdb")), allow(dead_code))]
+    pub(crate) fn execute_protected_v2(
+        &mut self,
+        db: &Arc<v2::V2Db>,
+        run: ProtectedRun,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        clock: Option<&relational::clock::ExecutionClock>,
+    ) -> (ProtectedRun, Result<relational::SqlResult, CoreError>) {
+        if self.v2_transaction.is_some()
+            || self.staged.is_some()
+            || self.copy_input.is_some()
+            || self.protected.is_some()
+            || !matches!(p.v2_class(), relational::V2Class::Dml)
+        {
+            return (run, Err(CoreError::Sql(SqlError::Transaction)));
+        }
+        // A failed statement rolls its writes back to the statement mark, so
+        // its partial effects (earlier pages) must be dropped too.
+        let before = (!run.effects.is_empty()).then(|| run.effects.clone());
+        self.protected = Some(run);
+        let result = self.execute_v2(db, p, params, None, clock);
+        let mut run = self.protected.take().expect("parked protected run");
+        if result.is_err() {
+            run.effects = before.unwrap_or_default();
+        }
+        (run, result)
+    }
+}
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_protected_seam_tests.rs"]
+mod protected_seam_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_protected_sentinel_tests.rs"]
+mod protected_sentinel_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_protected_validation_tests.rs"]
+mod protected_validation_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_protected_fk_tests.rs"]
+mod protected_fk_tests;

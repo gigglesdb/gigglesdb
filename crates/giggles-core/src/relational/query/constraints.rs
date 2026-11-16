@@ -247,7 +247,10 @@ fn query(table: &TableDef, key: &str, expr: &str) -> R<Query> {
     if p.at != p.tokens.len() || !p.params.is_empty() {
         return Err(SqlError::Unsupported);
     }
-    Ok(Query {
+    Ok(table_query(table, key, filter))
+}
+fn table_query(table: &TableDef, key: &str, filter: Filter) -> Query {
+    Query {
         explain: false,
         sources: vec![Source {
             name: key.into(),
@@ -259,7 +262,7 @@ fn query(table: &TableDef, key: &str, expr: &str) -> R<Query> {
         filter: Some(filter),
         order: vec![],
         limit: None,
-    })
+    }
 }
 pub(super) fn immutable(filter: &BoundFilter) -> bool {
     match filter {
@@ -365,31 +368,88 @@ pub(in crate::relational) fn constraint_validate(
     }
     Ok(())
 }
-pub(in crate::relational) fn constraint_check(
+pub(in crate::relational) fn constraint_eval(
     state: &Relational,
     table: &TableDef,
     expr: &str,
     row: &SqlRow,
-) -> R<()> {
+) -> R<Option<bool>> {
     let q = query(
         table,
         &relation_key(state.table_schema(table.id), &table.name),
         expr,
     )?;
     let bound = q.bind(state, 0, &[])?;
-    let result = bound.filter.as_ref().ok_or(SqlError::Unsupported)?.eval(
+    bound.filter.as_ref().ok_or(SqlError::Unsupported)?.eval(
         &Tuple {
             values: vec![row.values.clone()],
             version: row.version,
         },
         &[],
         &mut 0,
-    )?;
-    if result == Some(false) {
+    )
+}
+pub(in crate::relational) fn constraint_check(
+    state: &Relational,
+    table: &TableDef,
+    expr: &str,
+    row: &SqlRow,
+) -> R<()> {
+    if constraint_eval(state, table, expr, row)? == Some(false) {
         Err(SqlError::CheckViolation)
     } else {
         Ok(())
     }
+}
+/// Identifier spelling shared by CHECK deparse and task predicate canonical text.
+pub(in crate::relational) fn constraint_quote(name: &str) -> String {
+    quote(name)
+}
+/// Strict task-predicate parse: the CHECK expression grammar (no SELECT, aggregates,
+/// parameters or simple CASE) with unqualified column references only.
+fn predicate_expression(tokens: &[Token]) -> R<Filter> {
+    let filter = expression(tokens.to_vec())?;
+    let mut qualified = false;
+    filter.walk_scalars(&mut |s| {
+        qualified |= matches!(s, Scalar::Column(c) if c.qualifier.is_some());
+        Ok(())
+    })?;
+    if qualified {
+        return Err(SqlError::Unsupported);
+    }
+    Ok(filter)
+}
+/// Parsed shape of a task predicate, used to prove that canonical text means the same.
+pub(in crate::relational) fn constraint_shape(tokens: &[Token]) -> R<String> {
+    Ok(format!("{:?}", predicate_expression(tokens)?))
+}
+/// Validates a task predicate against `table` alone (bound, deterministic) and lists
+/// the table columns it reads.
+pub(in crate::relational) fn constraint_columns(
+    state: &Relational,
+    table: &TableDef,
+    tokens: &[Token],
+) -> R<BTreeSet<String>> {
+    let filter = predicate_expression(tokens)?;
+    let mut read = BTreeSet::new();
+    filter.walk_scalars(&mut |s| {
+        if let Scalar::Column(c) = s {
+            read.insert(c.name.clone());
+        }
+        Ok(())
+    })?;
+    let q = table_query(
+        table,
+        &relation_key(state.table_schema(table.id), &table.name),
+        filter,
+    );
+    let bound = q.bind(state, 0, &[])?;
+    if !bound.filter.as_ref().is_some_and(immutable) {
+        return Err(SqlError::Unsupported);
+    }
+    read.iter()
+        .map(|name| Ok(table.columns[col(table, name)?].name.clone()))
+        .collect()
 }
 
 #[cfg(test)]
