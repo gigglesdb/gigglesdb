@@ -427,6 +427,9 @@ fn execute_reply(
             reply.native_result = match outcome {
                 native::NativeResult::Control => None,
                 native::NativeResult::Catalog(outcome, table) => Some(P::CatalogOutcome(native_codec::encode_catalog_outcome(outcome, table))),
+                native::NativeResult::SequenceCatalog(catalog_epoch, table) => Some(P::CatalogOutcome(proto::NativeCatalogOutcome {
+                    catalog_epoch, table, columns: vec![], primary_key: vec![], index_id: None,
+                })),
                 native::NativeResult::Sql(sql) => {
                     reply.sql = codec::encode_reply(Response { sql: Some(sql), ..Response::code("ok") }, state)?.sql;
                     None
@@ -434,6 +437,7 @@ fn execute_reply(
                 native::NativeResult::Operation(outcome) => {
                     Some(P::OperationOutcome(native_codec::encode_outcome(outcome)?))
                 }
+                native::NativeResult::Page(page) => Some(P::OperationOutcome(native_codec::encode_page(page)?)),
                 native::NativeResult::Transaction(outcome) => Some(P::TransactionOutcome(
                     native_codec::encode_transaction_outcome(outcome)?,
                 )),

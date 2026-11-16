@@ -1735,7 +1735,8 @@
           "savepoint": {"$ref": "#/components/schemas/NativeSavepointRequest"},
           "rollbackTo": {"$ref": "#/components/schemas/NativeSavepointRequest"},
           "release": {"$ref": "#/components/schemas/NativeSavepointRequest"},
-          "catalog": {"$ref": "#/components/schemas/NativeCatalogRequest"}
+          "catalog": {"$ref": "#/components/schemas/NativeCatalogRequest"},
+          "sequence": {"$ref": "#/components/schemas/NativeSequenceCall"}
         },
         "additionalProperties": false,
         "oneOf": [
@@ -1802,7 +1803,8 @@
           {"required": ["savepoint"]},
           {"required": ["rollbackTo"]},
           {"required": ["release"]},
-          {"required": ["catalog"]}
+          {"required": ["catalog"]},
+          {"required": ["sequence"]}
         ],
         "description": "Exactly one request alternative. Duplicate keys, aliases, unknown fields, JSON null, trailing documents and nesting deeper than 128 are rejected by the parser. Raw UTF-8 body limit is 262144 bytes including whitespace. Native request trees are typed directly into the core operation engine; SQL is a separate optional arm. Semantic core failures use nativeError in a successful HTTP 200 reply."
       },
@@ -1965,6 +1967,10 @@
             },
             "maxItems": 256,
             "description": "At most 256 unique case-sensitive names. Duplicate names rejected before map conversion. Combined value payload at most 65536 bytes: UTF-8 text/bytes length; nine bytes per scalar. Logical presence of names and values required."
+          },
+          "page": {
+            "$ref": "#/components/schemas/NativePage",
+            "description": "Keyset paging (core read_page) for a read request. Absent: the request runs unpaged. An empty or omitted after starts at the first page; otherwise after is the previous reply's nextPage.after. The read's limit is the page size."
           }
         },
         "additionalProperties": false,
@@ -1973,6 +1979,7 @@
         ],
         "x-max-binding-value-bytes": 65536
       },
+      "NativePage": {"type": "object", "additionalProperties": false, "properties": {"after": {"type": "array", "items": {"$ref": "#/components/schemas/Value"}, "maxItems": 1600}}, "description": "Keyset continuation: the order-key values of the last row returned."},
       "NativeCatalogRequest": {
         "type": "object", "additionalProperties": false,
         "properties": {
@@ -1982,9 +1989,13 @@
           "dropIndex": {"$ref": "#/components/schemas/NativeDropIndex"},
           "alterTable": {"$ref": "#/components/schemas/NativeAlterTable"},
           "addConstraint": {"$ref": "#/components/schemas/NativeAddConstraint"},
-          "dropConstraint": {"$ref": "#/components/schemas/NativeDropConstraint"}
+          "dropConstraint": {"$ref": "#/components/schemas/NativeDropConstraint"},
+          "createView": {"$ref": "#/components/schemas/NativeCreateView"},
+          "dropView": {"$ref": "#/components/schemas/NativeDropView"},
+          "createSequence": {"$ref": "#/components/schemas/NativeCreateSequence"},
+          "dropSequence": {"$ref": "#/components/schemas/NativeDropSequence"}
         },
-        "oneOf": [{"required": ["createTable"]}, {"required": ["createIndex"]}, {"required": ["dropTable"]}, {"required": ["dropIndex"]}, {"required": ["alterTable"]}, {"required": ["addConstraint"]}, {"required": ["dropConstraint"]}],
+        "oneOf": [{"required": ["createTable"]}, {"required": ["createIndex"]}, {"required": ["dropTable"]}, {"required": ["dropIndex"]}, {"required": ["alterTable"]}, {"required": ["addConstraint"]}, {"required": ["dropConstraint"]}, {"required": ["createView"]}, {"required": ["dropView"]}, {"required": ["createSequence"]}, {"required": ["dropSequence"]}],
         "description": "Exactly one synchronous catalog request. Unknown fields, duplicate keys and JSON null are rejected at every request level. Arrays omitted from requests default to empty; core validates their semantics. Names are exact identifiers resolved using the retained search_path. Errors use the existing native error mapping."
       },
       "NativeAddConstraint": {"type": "object", "additionalProperties": false, "properties": {"table": {"type": "string", "minLength": 1}, "name": {"type": "string", "minLength": 1}, "unique": {"$ref": "#/components/schemas/NativeUniqueConstraint"}, "check": {"$ref": "#/components/schemas/NativeCheckConstraint"}, "foreignKey": {"$ref": "#/components/schemas/NativeForeignKey"}}, "required": ["table"], "oneOf": [{"required": ["unique"]}, {"required": ["check"]}, {"required": ["foreignKey"]}]},
@@ -1993,6 +2004,13 @@
       "NativeForeignKey": {"type": "object", "additionalProperties": false, "properties": {"columns": {"type": "array", "maxItems": 1600, "items": {"type": "string"}}, "refTable": {"type": "string", "minLength": 1}, "refColumns": {"type": "array", "maxItems": 1600, "items": {"type": "string"}}, "refColumnsSet": {"type": "boolean", "default": false}, "onDelete": {"$ref": "#/components/schemas/NativeForeignKeyAction"}, "onUpdate": {"$ref": "#/components/schemas/NativeForeignKeyAction"}}, "required": ["refTable"], "description": "refColumnsSet absent or false means inferred referenced primary key, ignoring refColumns; true preserves refColumns including empty. Actions use exact enum names."},
       "NativeForeignKeyAction": {"type": "string", "enum": ["NoAction", "Restrict", "Cascade", "SetNull", "SetDefault"], "default": "NoAction"},
       "NativeDropConstraint": {"type": "object", "additionalProperties": false, "properties": {"table": {"type": "string", "minLength": 1}, "name": {"type": "string", "minLength": 1}, "cascade": {"type": "boolean", "default": false}}, "required": ["table", "name"]},
+      "NativeCreateView": {"type": "object", "additionalProperties": false, "properties": {"name": {"type": "string", "minLength": 1}, "read": {"$ref": "#/components/schemas/NativeTypedRead"}}, "required": ["name", "read"], "description": "CREATE VIEW name AS the typed read (single source or join). Authorization: CREATE on (or ownership of) the creation schema and SELECT on every read relation, like SQL CREATE VIEW. Reply: catalogOutcome with the canonical schema.view."},
+      "NativeDropView": {"type": "object", "additionalProperties": false, "properties": {"name": {"type": "string", "minLength": 1}, "cascade": {"type": "boolean", "default": false}}, "required": ["name"], "description": "DROP VIEW [CASCADE]. Authorization: ownership of the view, like SQL DROP VIEW."},
+      "NativeCreateSequence": {"type": "object", "additionalProperties": false, "properties": {"name": {"type": "string", "minLength": 1}}, "required": ["name"], "description": "CREATE SEQUENCE with default options. Authorization as SQL: superuser or CREATE on schema public. Reply: catalogOutcome with the canonical schema.sequence and empty columns and primaryKey."},
+      "NativeDropSequence": {"type": "object", "additionalProperties": false, "properties": {"name": {"type": "string", "minLength": 1}, "cascade": {"type": "boolean", "default": false}}, "required": ["name"], "description": "DROP SEQUENCE [CASCADE]; ownership required, as SQL."},
+      "NativeSequenceCall": {"type": "object", "additionalProperties": false, "properties": {"nextval": {"$ref": "#/components/schemas/NativeSequenceName"}, "currval": {"$ref": "#/components/schemas/NativeSequenceName"}, "setval": {"$ref": "#/components/schemas/NativeSetval"}}, "oneOf": [{"required": ["nextval"]}, {"required": ["currval"]}, {"required": ["setval"]}], "description": "One sequence function call in the retained session. The reply's sql result equals SQL SELECT nextval/currval/setval(...): one row, one bigint column named after the function."},
+      "NativeSequenceName": {"type": "object", "additionalProperties": false, "properties": {"name": {"type": "string", "minLength": 1}}, "required": ["name"]},
+      "NativeSetval": {"type": "object", "additionalProperties": false, "properties": {"name": {"type": "string", "minLength": 1}, "value": {"$ref": "#/components/schemas/Int64"}, "isCalled": {"type": "boolean", "default": true}}, "required": ["name", "value"]},
       "NativeCatalogDataType": {
         "type": "string",
         "enum": ["Boolean", "SmallInt", "Integer", "BigInt", "Text", "Bytes", "Numeric", "Real", "DoublePrecision", "Date", "Time", "TimeTz", "Timestamp", "TimestampTz", "Interval", "Varchar", "Bpchar", "Uuid", "Jsonb", "IntArray", "BigIntArray", "TextArray"]
@@ -3313,6 +3331,10 @@
           },
           "conflictResults": {
             "$ref": "#/components/schemas/NativeConflictResults"
+          },
+          "nextPage": {
+            "$ref": "#/components/schemas/NativePage",
+            "description": "Paging mode only: send it back as page to read the next page. Absent on the last page (complete is then true)."
           }
         },
         "additionalProperties": false,

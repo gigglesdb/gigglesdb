@@ -212,3 +212,6 @@ mod fk_section_network;
 #[path = "api_catalog_defaults.rs"] mod api_catalog_defaults;
 
 #[path = "api_catalog_objects.rs"] mod api_catalog_objects;
+#[path = "api_catalog_views.rs"] mod api_catalog_views;
+#[path = "api_paging.rs"] mod api_paging;
+#[path = "api_sequences.rs"] mod api_sequences;

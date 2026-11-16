@@ -37,6 +37,7 @@ message ExecuteRequest {
     NativeSavepointRequest rollback_to = 16;
     NativeSavepointRequest release = 17;
     NativeCatalogRequest catalog = 18;
+    NativeSequenceCall sequence = 19;
   }
   optional uint32 budget_ms = 20;
 }
@@ -231,6 +232,12 @@ message NativeEmpty {
 message NativeOperationRequest {
   NativeRequest request = 1;
   repeated NativeBinding bindings = 2;
+  // Present: keyset paging (core read_page) for a read request; empty after = first page.
+  NativePage page = 3;
+}
+
+message NativePage {
+  repeated Value after = 1;
 }
 
 message NativeTransactionRequest {
@@ -530,6 +537,8 @@ message NativeOutcome {
   uint64 changed = 5;
   bool complete = 6;
   NativeConflictResults conflict_results = 7;
+  // Paging mode only: the continuation for the next page; absent on the last page.
+  NativePage next_page = 8;
 }
 
 message NativeConflictResults {
@@ -639,12 +648,19 @@ enum NativeErrorClass {
   NATIVE_ERROR_CLASS_SQL = 20; // Underlying SQLSTATE in sqlstate
 }
 
-message NativeCatalogRequest { oneof request { NativeCreateTable create_table = 1; NativeCreateIndex create_index = 2; NativeDropTable drop_table = 3; NativeDropIndex drop_index = 4; NativeAlterTable alter_table = 5; NativeAddConstraint add_constraint = 6; NativeDropConstraint drop_constraint = 7; } }
+message NativeCatalogRequest { oneof request { NativeCreateTable create_table = 1; NativeCreateIndex create_index = 2; NativeDropTable drop_table = 3; NativeDropIndex drop_index = 4; NativeAlterTable alter_table = 5; NativeAddConstraint add_constraint = 6; NativeDropConstraint drop_constraint = 7; NativeCreateView create_view = 8; NativeDropView drop_view = 9; NativeCreateSequence create_sequence = 10; NativeDropSequence drop_sequence = 11; } }
 message NativeAddConstraint { optional string table = 1; optional string name = 2; oneof constraint { NativeUniqueConstraint unique = 3; NativeCheckConstraint check = 4; NativeForeignKey foreign_key = 5; } }
 message NativeUniqueConstraint { repeated string columns = 1; }
 message NativeCheckConstraint { NativeExpr expression = 1; }
 message NativeForeignKey { repeated string columns = 1; optional string ref_table = 2; repeated string ref_columns = 3; optional bool ref_columns_set = 4; optional string on_delete = 5; optional string on_update = 6; }
 message NativeDropConstraint { optional string table = 1; optional string name = 2; optional bool cascade = 3; }
+message NativeCreateView { optional string name = 1; NativeTypedRead read = 2; }
+message NativeDropView { optional string name = 1; optional bool cascade = 2; }
+message NativeCreateSequence { optional string name = 1; }
+message NativeDropSequence { optional string name = 1; optional bool cascade = 2; }
+message NativeSequenceCall { oneof call { NativeSequenceName nextval = 1; NativeSequenceName currval = 2; NativeSetval setval = 3; } }
+message NativeSequenceName { optional string name = 1; }
+message NativeSetval { optional string name = 1; optional int64 value = 2; optional bool is_called = 3; }
 message NativeCatalogColumn { optional string name = 1; optional string data_type = 2; optional bool not_null = 3; NativeColumnDefault default = 4; optional string generated = 5; }
 message NativeColumnDefault { oneof kind { Value value = 1; NativeClockDefault clock = 2; string nextval = 3; } }
 message NativeClockDefault { optional string kind = 1; optional uint32 precision = 2; }

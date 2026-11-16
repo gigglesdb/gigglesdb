@@ -17,6 +17,16 @@ impl Serialize for p::NativeOutcome {
         if let Some(v) = &self.conflict_results {
             m.serialize_entry("conflictResults", v)?;
         }
+        if let Some(v) = &self.next_page {
+            m.serialize_entry("nextPage", v)?;
+        }
+        m.end()
+    }
+}
+impl Serialize for p::NativePage {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(Some(1))?;
+        m.serialize_entry("after", &super::json::JsonValues(&self.after))?;
         m.end()
     }
 }
@@ -206,6 +216,16 @@ impl Decoder {
             }
             "dropConstraint" => Q::DropConstraint(p::NativeDropConstraint { table: Some(text(f.required("table")?)?),
                 name: Some(text(f.required("name")?)?), cascade: f.optional("cascade").map(boolean).transpose()? }),
+            "createView" => Q::CreateView(p::NativeCreateView {
+                name: Some(text(f.required("name")?)?), read: Some(self.typed_read(f.required("read")?)?),
+            }),
+            "createSequence" => Q::CreateSequence(p::NativeCreateSequence { name: Some(text(f.required("name")?)?) }),
+            "dropSequence" => Q::DropSequence(p::NativeDropSequence {
+                name: Some(text(f.required("name")?)?), cascade: f.optional("cascade").map(boolean).transpose()?,
+            }),
+            "dropView" => Q::DropView(p::NativeDropView {
+                name: Some(text(f.required("name")?)?), cascade: f.optional("cascade").map(boolean).transpose()?,
+            }),
             "alterTable" => {
                 use p::native_alter_table::Action as A;
                 let table = Some(text(f.required("table")?)?);
@@ -263,6 +283,21 @@ impl Decoder {
         let schemas = items(f.optional("schemas"), 64)?.into_iter().map(text).collect::<R<_>>()?;
         f.finish()?;
         Ok(p::NativeSearchPathRequest { set, schemas })
+    }
+    pub(super) fn sequence(&mut self, v: Json) -> R<p::NativeSequenceCall> {
+        use p::native_sequence_call::Call as K;
+        let (kind, v) = Object::new(v)?.one()?;
+        let mut f = Object::new(v)?;
+        let name = Some(text(f.required("name")?)?);
+        let call = match kind.as_str() {
+            "nextval" => K::Nextval(p::NativeSequenceName { name }),
+            "currval" => K::Currval(p::NativeSequenceName { name }),
+            "setval" => K::Setval(p::NativeSetval { name, value: Some(super::json::int(f.required("value")?)?),
+                is_called: f.optional("isCalled").map(boolean).transpose()? }),
+            _ => return Err(ApiError::InvalidArgument),
+        };
+        f.finish()?;
+        Ok(p::NativeSequenceCall { call: Some(call) })
     }
     pub(super) fn typed_read(&mut self, v: Json) -> R<p::NativeTypedRead> {
         let mut f = Object::new(v)?;
@@ -399,8 +434,14 @@ impl Decoder {
             .into_iter()
             .map(|v| self.native_binding(v))
             .collect::<R<Vec<_>>>()?;
+        let page = f.optional("page").map(|v| -> R<_> {
+            let mut f = Object::new(v)?;
+            let after = items(f.optional("after"), 1600)?.into_iter().map(decode_value).collect::<R<_>>()?;
+            f.finish()?;
+            Ok(p::NativePage { after })
+        }).transpose()?;
         f.finish()?;
-        Ok(p::NativeOperationRequest { request, bindings })
+        Ok(p::NativeOperationRequest { request, bindings, page })
     }
     pub(super) fn native_transaction_request(&mut self, v: Json) -> R<p::NativeTransactionRequest> {
         let mut f = Object::new(v)?;

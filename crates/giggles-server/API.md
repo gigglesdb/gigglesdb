@@ -570,7 +570,7 @@ Live privilege revocation is checked on each request, and a denied request
 inside BEGIN aborts the transaction (subsequent requests return `25P02`).
 
 Constraint catalog requests use additive oneof tags `add_constraint=6` and
-`drop_constraint=7`; views are not exposed by this wire version.
+`drop_constraint=7`.
 ```json
 {"catalog":{"addConstraint":{"table":"public.items","name":"items_unique","unique":{"columns":["body"]}}}}
 {"catalog":{"addConstraint":{"table":"public.items","name":"items_check","check":{"expression":{"compare":{"left":{"field":"id"},"comparison":"NATIVE_COMPARISON_GT","right":{"value":{"literal":{"intValue":"0"}}}}}}}}}
@@ -594,3 +594,70 @@ Duplicate named UNIQUE reports 42P07 for the existing backing-index name,
 matching PostgreSQL 18.6.
 Legacy native catalog requests on populated databases retain the existing
 `NATIVE_ERROR_CLASS_PLAN_REQUIRED` gate, while SQL DDL executes synchronously.
+
+View catalog requests use additive oneof tags `create_view=8`
+(`NativeCreateView {name=1, read=2}`, where `read` is the field-13
+`NativeTypedRead`, single source or join) and `drop_view=9`
+(`NativeDropView {name=1, cascade=2}`).
+```json
+{"catalog":{"createView":{"name":"app.recent","read":{"table":"app.items","projection":[{"expression":{"column":{"name":"id"}}}]}}}}
+{"catalog":{"dropView":{"name":"app.recent","cascade":false}}}
+```
+Views run through core's SQL view executor, so rows, dependencies and
+SQLSTATEs equal the matching `CREATE VIEW name AS SELECT ...` / `DROP VIEW`
+(42P01 missing relation, 3F000 missing schema, 2BP01 for a dependent view
+without CASCADE). Known differences shared with SQL: a duplicate view name
+returns `23505` on V2 (PG18: `42P07`); join views return `0A000` in
+both SQL and native (PG18 accepts them); the Legacy engine has no views
+(`0A000` in both). Names resolve through the retained
+search_path; the outcome names the canonical `schema.view` without `indexId`.
+Authorization equals SQL: CREATE VIEW needs CREATE on (or ownership of) the
+creation schema plus SELECT on every read relation; DROP VIEW needs ownership
+of the view; Application and Task roles are refused. Authorization precedes
+binding, so a refused role reading a missing table gets `42501`. The creator
+owns the view, as with SQL. Views inside BEGIN follow the transaction.
+
+### Native keyset paging
+
+`NativeOperationRequest` has an additive field `page = 3` (`NativePage {repeated Value after = 1}`)
+and `NativeOutcome` has `next_page = 8`. With `page` present, a read request runs through core
+`read_page`: the read's `order` is the keyset and its `limit` is the page size. Send `"page":{}`
+for the first page and then the previous reply's `nextPage` until a reply has none (its
+`complete` is then true). Without `page`, operations behave exactly as before.
+```json
+{"operation":{"request":{"read":{"table":"app","order":[{"field":"id","descending":false}],"limit":{"literal":{"intValue":"100"}},"projection":["id","body"]}},"page":{}}}
+{"operation":{"request":{"read":{"table":"app","order":[{"field":"id","descending":false}],"limit":{"literal":{"intValue":"100"}},"projection":["id","body"]}},"page":{"after":[{"intValue":"100"}]}}}
+```
+Authorization is the same as for the unpaged read and precedes the continuation check. Errors
+are core's: an invalid continuation (wrong arity or type) and the order/limit rules of
+`read_page`; paging a non-read request returns `NATIVE_ERROR_CLASS_UNSUPPORTED`. Pages run in the
+retained session, so inside BEGIN they see the transaction's own writes. Continuations are
+plain key values: rows committed between pages appear if they sort after the continuation.
+
+### Native sequences
+
+Catalog requests gain additive oneof tags `create_sequence=10`
+(`NativeCreateSequence {name=1}`) and `drop_sequence=11`
+(`NativeDropSequence {name=1, cascade=2}`); the reply is `catalogOutcome` with
+the canonical `schema.sequence` and empty `columns`/`primaryKey`.
+`ExecuteRequest` gains `sequence=19` (`NativeSequenceCall`, oneof
+`nextval=1`/`currval=2` with `NativeSequenceName {name=1}`, or
+`setval=3` with `NativeSetval {name=1, value=2, is_called=3}`).
+```json
+{"catalog":{"createSequence":{"name":"app.ids"}}}
+{"sequence":{"nextval":{"name":"app.ids"}}}
+{"sequence":{"setval":{"name":"app.ids","value":"100","isCalled":false}}}
+{"catalog":{"dropSequence":{"name":"app.ids","cascade":false}}}
+```
+A call's reply carries the same `sql` result as SQL `SELECT nextval('app.ids')`
+(one row, one bigint column named `nextval`, `currval` or `setval`). Names
+resolve through the retained search_path. Execution uses core's SQL sequence
+executor in the retained session: CREATE/DROP SEQUENCE are transactional,
+nextval/setval are not undone by ROLLBACK, currval is per session (55000
+before the first nextval), and errors are SQL's (42P07, 42P01, 3F000, 2BP01).
+Authorization equals SQL and precedes binding: CREATE SEQUENCE needs
+superuser or CREATE on schema `public` (the existing SQL rule); DROP SEQUENCE
+needs ownership; calls need ownership of the sequence or of the table that
+owns it (Application roles: a table in their allowlist). Refused requests,
+including ones naming a missing sequence, return `42501`. The creator owns a
+natively created sequence, as with SQL.

@@ -177,6 +177,7 @@ pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {
     use proto::execute_request::Request as P;
     let request = match kind.as_str() {
         "catalog" => P::Catalog(super::native_json::Decoder::default().catalog(value)?),
+        "sequence" => P::Sequence(super::native_json::Decoder::default().sequence(value)?),
         "searchPath" => P::SearchPath(super::native_json::Decoder::default().search_path(value)?),
         "typedRead" => P::TypedRead(super::native_json::Decoder::default().typed_read(value)?),
         "text" => P::Text(super::native_json::Decoder::default().native_text_request(value)?),
@@ -475,7 +476,7 @@ impl Serialize for JsonValue<'_> {
         map.end()
     }
 }
-struct JsonValues<'a>(&'a [proto::Value]);
+pub(super) struct JsonValues<'a>(pub(super) &'a [proto::Value]);
 impl Serialize for JsonValues<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;

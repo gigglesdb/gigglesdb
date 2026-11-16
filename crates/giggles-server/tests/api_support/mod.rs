@@ -91,8 +91,12 @@ impl Fixture {
         Self::with_limits(ApiLimits::default()).await
     }
     pub async fn catalog_empty() -> Self {
-        Self::build(ApiLimits::default(), giggles_server::admission::ServiceLimits::default(),
-            giggles_core::TaskResources { read_rows: 100000, disclosed_rows: 100000, encoded_bytes: 100000000 }, false).await
+        Self::catalog_empty_engine(giggles_core::Engine::Legacy).await
+    }
+    #[allow(dead_code)]
+    pub async fn catalog_empty_engine(engine: giggles_core::Engine) -> Self {
+        Self::build_engine(ApiLimits::default(), giggles_server::admission::ServiceLimits::default(),
+            giggles_core::TaskResources { read_rows: 100000, disclosed_rows: 100000, encoded_bytes: 100000000 }, false, engine).await
     }
     pub async fn with_limits(limits: ApiLimits) -> Self {
         Self::with_service_limits(limits, giggles_server::admission::ServiceLimits::default()).await
@@ -128,6 +132,15 @@ impl Fixture {
         resources: giggles_core::TaskResources,
         seed_rows: bool,
     ) -> Self {
+        Self::build_engine(limits, service_limits, resources, seed_rows, giggles_core::Engine::Legacy).await
+    }
+    async fn build_engine(
+        limits: ApiLimits,
+        service_limits: giggles_server::admission::ServiceLimits,
+        resources: giggles_core::TaskResources,
+        seed_rows: bool,
+        engine: giggles_core::Engine,
+    ) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::var_os("GIGGLES_TEST_ARTIFACTS")
             .map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(format!(
@@ -161,7 +174,11 @@ impl Fixture {
             )
             .unwrap();
         }
-        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        let admin = if engine == giggles_core::Engine::Legacy {
+            Admin::create(path.join("db.redb"), Limits::default()).unwrap()
+        } else {
+            Admin::create_engine(path.join("db.redb"), Limits::default(), engine).unwrap()
+        };
         let mut sql = admin.sql_session();
         sql.execute(
             "CREATE TABLE app (id BIGINT PRIMARY KEY, body TEXT, flag BOOLEAN, data BYTEA)",

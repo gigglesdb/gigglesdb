@@ -12,6 +12,11 @@ pub enum Invocation {
         request: giggles_core::operations::Request,
         bindings: giggles_core::operations::Bindings,
     },
+    Page {
+        request: giggles_core::operations::Request,
+        bindings: giggles_core::operations::Bindings,
+        after: Vec<giggles_core::relational::Value>,
+    },
     Transaction {
         transaction: giggles_core::operations::Transaction,
         bindings: giggles_core::operations::Bindings,
@@ -22,6 +27,7 @@ pub enum Invocation {
         language_version: giggles_language::LanguageVersion,
     },
     Catalog(Box<giggles_core::operations::CatalogRequest>),
+    Sequence(giggles_core::operations::SequenceCall),
     SearchPath(Option<Vec<String>>),
     Begin,
     Commit,
@@ -79,6 +85,7 @@ pub fn decode_execute(input: proto::ExecuteRequest) -> Result<DecodedExecute, Ap
     let input = input.request.ok_or(ApiError::InvalidArgument)?;
     let request = match input {
         P::Catalog(v) => return Ok(DecodedExecute { request: Invocation::Catalog(Box::new(super::native_codec::catalog_request(v)?)), budget_ms }),
+        P::Sequence(v) => return Ok(DecodedExecute { request: Invocation::Sequence(super::native_codec::sequence_call(v)?), budget_ms }),
         P::SearchPath(v) => return Ok(DecodedExecute {
             request: Invocation::SearchPath(v.set.filter(|v| *v).map(|_| v.schemas)), budget_ms,
         }),
@@ -105,12 +112,15 @@ pub fn decode_execute(input: proto::ExecuteRequest) -> Result<DecodedExecute, Ap
             });
         }
         P::Operation(v) => {
+            let request = super::native_codec::request(v.request.ok_or(ApiError::InvalidArgument)?)?;
+            let bindings = super::native_codec::bindings(v.bindings)?;
             return Ok(DecodedExecute {
-                request: Invocation::Operation {
-                    request: super::native_codec::request(
-                        v.request.ok_or(ApiError::InvalidArgument)?,
-                    )?,
-                    bindings: super::native_codec::bindings(v.bindings)?,
+                request: match v.page {
+                    Some(page) => Invocation::Page {
+                        request, bindings,
+                        after: page.after.into_iter().map(decode_value).collect::<Result<_, _>>()?,
+                    },
+                    None => Invocation::Operation { request, bindings },
                 },
                 budget_ms,
             });

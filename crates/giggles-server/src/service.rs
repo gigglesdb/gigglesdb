@@ -1194,8 +1194,17 @@ impl Session {
             Ok(())
         })
     }
+    pub(crate) fn authorize_native_sequence(&mut self, name: &str) -> Result<(), CoreError> {
+        self.authority_scope(|session| session.authorize_sequences(&[Some(name.to_owned())]))
+    }
     pub(crate) fn authorize_native_catalog(&mut self, request: &giggles_core::operations::CatalogRequest) -> Result<(), CoreError> {
         use giggles_core::operations::CatalogRequest as C;
+        // Same rules as SQL CREATE SEQUENCE / DROP SEQUENCE in `authorize`.
+        match request {
+            C::CreateSequence { .. } => return self.authorize_create_sequence(),
+            C::DropSequence { name, .. } => return self.authorize_alter_table(name),
+            _ => {}
+        }
         if matches!(request, C::AddConstraint { .. } | C::DropConstraint { .. }) {
             let table = match request { C::AddConstraint { table, .. } | C::DropConstraint { table, .. } => table, _ => unreachable!() };
             self.authorize_alter_table(&self.sql.native_relation_reference(table)?)?;
@@ -1209,7 +1218,7 @@ impl Session {
         else {
             let Role::Database { name } = &self.role else { unreachable!() };
             let table = match request {
-                C::DropTable { table, .. } | C::AlterTable { table, .. } => Some(self.sql.native_relation_reference(table)?),
+                C::DropTable { table, .. } | C::AlterTable { table, .. } | C::DropView { name: table, .. } => Some(self.sql.native_relation_reference(table)?),
                 C::DropIndex { name, .. } => self.sql.native_index_table(name)?,
                 _ => None,
             };
@@ -1218,13 +1227,28 @@ impl Session {
                 self.sql.table_owner(&key).map_err(|_| CoreError::Policy(Error::Scope))?.as_deref() == Some(name)
             } else {
                 let schema = match request {
-                    C::CreateTable { table, .. } => self.sql.native_creation_schema(table)?,
+                    C::CreateTable { table, .. } | C::CreateView { name: table, .. } => self.sql.native_creation_schema(table)?,
                     C::CreateIndex { table, .. } => self.sql.relation_schema(&self.sql.native_relation_reference(table)?)?,
                     _ => self.sql.relation_schema("")?,
                 };
-                self.sql.schema_metadata()?.schemas.get(&schema).is_some_and(|(_, owner)| owner == name)
+                let create = self.sql.schema_metadata()?.schemas.get(&schema).is_some_and(|(_, owner)| owner == name)
                     || self.service.admin.roles().schema_privileges(&schema, name)
-                        .map_err(|_| CoreError::Policy(Error::Scope))?.contains(&roles::SchemaPrivilege::Create)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?.contains(&roles::SchemaPrivilege::Create);
+                // SQL CREATE VIEW also needs SELECT on every relation the view reads.
+                create && match request {
+                    C::CreateView { read, .. } => {
+                        let sources = match read {
+                            relational::ViewRead::Single(read) => vec![read.table.as_str()],
+                            relational::ViewRead::Two(read) => vec![read.left.table.as_str(), read.right.table.as_str()],
+                        };
+                        let mut reqs = Vec::new();
+                        for table in sources {
+                            reqs.push((self.sql.native_relation_reference(table).unwrap_or_else(|_| table.to_owned()), roles::TablePrivilege::Select));
+                        }
+                        self.table_requirements_allowed(&reqs, false)?
+                    }
+                    _ => true,
+                }
             }
         };
         if !allowed { self.sql.abort(); return Err(CoreError::Policy(Error::Scope)); }
@@ -1701,6 +1725,23 @@ impl Session {
         }
         self.reconcile_sequence_owners()?;
         Ok(result)
+    }
+    pub(crate) fn execute_native_sequence_catalog(&mut self, request: &giggles_core::operations::CatalogRequest)
+        -> Result<Result<u64, giggles_core::operations::Error>, CoreError> {
+        use giggles_core::operations::CatalogRequest as C;
+        self.reconcile_sequence_owners()?;
+        let (command, name) = match request {
+            C::CreateSequence { name } => ("CREATE SEQUENCE", name),
+            C::DropSequence { name, .. } => ("DROP SEQUENCE", name),
+            _ => return Ok(Err(giggles_core::operations::Error::Unsupported)),
+        };
+        // SQL passes the statement's sequence names; a qualified native name is schema.name.
+        let key = name.split_once('.').map_or_else(|| name.clone(), |(schema, name)| relational::relation_key(schema, name));
+        self.execute_with_ddl_authority(command, None, true, true, vec![key], |session| {
+            let result = session.sql.execute_sequence_catalog_native(request);
+            let succeeded = result.is_ok();
+            Ok((result, succeeded, succeeded))
+        })
     }
     pub(crate) fn execute_native_catalog(&mut self, request: &giggles_core::operations::CatalogRequest)
         -> Result<Result<giggles_core::operations::CatalogOutcome, giggles_core::operations::Error>, CoreError> {

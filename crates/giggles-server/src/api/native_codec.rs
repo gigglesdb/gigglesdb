@@ -236,13 +236,27 @@ pub(crate) fn validate(input: &p::ExecuteRequest) -> R<()> {
                         && !valid(need(v.ref_table.as_deref())?) { return Err(ApiError::InvalidArgument); }
                 }
                 C::DropConstraint(v) => if !valid(need(v.table.as_deref())?) || !valid(need(v.name.as_deref())?) { return Err(ApiError::InvalidArgument); },
+                C::CreateView(v) => { if !valid(need(v.name.as_deref())?) { return Err(ApiError::InvalidArgument); } read_shape(need(v.read.as_ref())?)?; }
+                C::DropView(v) => if !valid(need(v.name.as_deref())?) { return Err(ApiError::InvalidArgument); },
+                C::CreateSequence(p::NativeCreateSequence { name }) | C::DropSequence(p::NativeDropSequence { name, .. }) =>
+                    need(name.as_deref()).and_then(|name| if valid(name) { Ok(()) } else { Err(ApiError::InvalidArgument) })?,
                 _ => {}
             }
         }
         Some(p::execute_request::Request::TypedRead(v)) => read_shape(v)?,
+        Some(p::execute_request::Request::Sequence(v)) => {
+            use p::native_sequence_call::Call as K;
+            let name = match need(v.call.as_ref())? {
+                K::Nextval(v) | K::Currval(v) => v.name.as_deref(),
+                K::Setval(v) => { need(v.value)?; v.name.as_deref() }
+            };
+            let name = need(name)?;
+            if name.is_empty() || name.contains('\0') { return Err(ApiError::InvalidArgument); }
+        }
         Some(p::execute_request::Request::Operation(v)) => {
             Shape::default().request(need(v.request.as_ref())?, 0)?;
             check_bindings(&v.bindings)?;
+            if let Some(page) = &v.page { cap(page.after.len(), 1600)?; }
         }
         Some(p::execute_request::Request::Transaction(v)) => {
             Shape::default().transaction(need(v.transaction.as_ref())?)?;
@@ -630,6 +644,11 @@ fn conflicts(v: Option<Vec<o::ConflictTupleOutcome>>) -> R<Option<p::NativeConfl
     })
     .transpose()
 }
+pub(crate) fn encode_page(v: o::Page) -> R<p::NativeOutcome> {
+    let mut outcome = encode_outcome(v.outcome)?;
+    outcome.next_page = v.next.map(|after| p::NativePage { after: after.into_iter().map(codec::encode_value).collect() });
+    Ok(outcome)
+}
 pub(crate) fn encode_outcome(v: o::Outcome) -> R<p::NativeOutcome> {
     Ok(p::NativeOutcome {
         columns: v.columns,
@@ -639,6 +658,7 @@ pub(crate) fn encode_outcome(v: o::Outcome) -> R<p::NativeOutcome> {
         changed: number(v.changed)?,
         complete: v.complete,
         conflict_results: conflicts(v.conflict_results)?,
+        next_page: None,
     })
 }
 fn column(v: ColumnDef) -> p::NativeColumn {
@@ -779,6 +799,17 @@ pub(crate) fn catalog_request(v: p::NativeCatalogRequest) -> R<o::CatalogRequest
             o::CatalogRequest::AddConstraint { table: need(v.table)?, name: v.name, constraint }
         }
         Q::DropConstraint(v) => o::CatalogRequest::DropConstraint { table: need(v.table)?, name: need(v.name)?, cascade: v.cascade.unwrap_or(false) },
+        Q::CreateView(v) => {
+            let read = match typed_read(need(v.read)?)? {
+                codec::Invocation::Read(read) => giggles_core::relational::ViewRead::Single(read),
+                codec::Invocation::Join(read) => giggles_core::relational::ViewRead::Two(read),
+                _ => return Err(ApiError::InvalidArgument),
+            };
+            o::CatalogRequest::CreateView { name: need(v.name)?, read }
+        }
+        Q::DropView(v) => o::CatalogRequest::DropView { name: need(v.name)?, cascade: v.cascade.unwrap_or(false) },
+        Q::CreateSequence(v) => o::CatalogRequest::CreateSequence { name: need(v.name)? },
+        Q::DropSequence(v) => o::CatalogRequest::DropSequence { name: need(v.name)?, cascade: v.cascade.unwrap_or(false) },
         Q::AlterTable(v) => {
             use p::native_alter_table::Action as A;
             let table = need(v.table)?;
@@ -793,6 +824,15 @@ pub(crate) fn catalog_request(v: p::NativeCatalogRequest) -> R<o::CatalogRequest
             };
             o::CatalogRequest::AlterTable { table, action }
         }
+    })
+}
+pub(crate) fn sequence_call(v: p::NativeSequenceCall) -> R<o::SequenceCall> {
+    use p::native_sequence_call::Call as K;
+    let name = |v: Option<String>| need(v).and_then(|v| if v.is_empty() || v.contains('\0') { Err(ApiError::InvalidArgument) } else { Ok(v) });
+    Ok(match need(v.call)? {
+        K::Nextval(v) => o::SequenceCall::Nextval(name(v.name)?),
+        K::Currval(v) => o::SequenceCall::Currval(name(v.name)?),
+        K::Setval(v) => o::SequenceCall::Setval { name: name(v.name)?, value: need(v.value)?, is_called: v.is_called },
     })
 }
 fn foreign_key_action(v: Option<String>) -> R<o::ForeignKeyAction> {

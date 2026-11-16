@@ -134,6 +134,7 @@ async fn main() -> Result<(), Error> {
                             }),
                         },
                     ],
+                    page: None,
                 }),
             )
             .await?;
@@ -144,6 +145,7 @@ async fn main() -> Result<(), Error> {
             Command::Operation(proto::NativeOperationRequest {
                 request: Some(read()),
                 bindings: vec![],
+                page: None,
             }),
         )
         .await?;

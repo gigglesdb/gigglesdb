@@ -6,8 +6,10 @@ use giggles_core::{CoreError, Error, operations as ops, relational::SqlError};
 pub(crate) enum NativeResult {
     Control,
     Catalog(ops::CatalogOutcome, String),
+    SequenceCatalog(u64, String),
     Sql(giggles_core::relational::SqlResult),
     Operation(ops::Outcome),
+    Page(ops::Page),
     Transaction(ops::TransactionOutcome),
     Error(ops::Error),
 }
@@ -109,7 +111,7 @@ fn catalog_table(session: &Session, request: &ops::CatalogRequest) -> String {
     use ops::CatalogRequest as C;
     // Resolution precedes execution; execution owns validation and native error mapping.
     let key = match request {
-        C::CreateTable { table, .. } => {
+        C::CreateTable { table, .. } | C::CreateView { name: table, .. } | C::CreateSequence { name: table } => {
             let schema = session.sql.native_creation_schema(table).unwrap_or_default();
             let name = table.split_once('.').map_or(table.as_str(), |(_, name)| name);
             return format!("{schema}.{name}");
@@ -118,8 +120,7 @@ fn catalog_table(session: &Session, request: &ops::CatalogRequest) -> String {
         C::CreateIndex { table, .. } | C::DropTable { table, .. } | C::AlterTable { table, .. }
         | C::AddConstraint { table, .. } | C::DropConstraint { table, .. } =>
             session.sql.native_relation_reference(table).unwrap_or_default(),
-        C::CreateView { name, .. } | C::DropView { name, .. }
-        | C::CreateSequence { name } | C::DropSequence { name, .. } =>
+        C::DropView { name, .. } | C::DropSequence { name, .. } =>
             session.sql.native_relation_reference(name).unwrap_or_default(),
     };
     let (schema, name) = key.split_once('\0').unwrap_or(("public", &key));
@@ -141,6 +142,15 @@ pub(crate) fn run(
                 session.authorize_native_catalog(request)?;
                 if session.is_aborted() { return Err(CoreError::Sql(SqlError::Aborted)); }
                 let table = catalog_table(session, request);
+                if matches!(**request, ops::CatalogRequest::CreateSequence { .. } | ops::CatalogRequest::DropSequence { .. }) {
+                    return match session.execute_native_sequence_catalog(request)? {
+                        Ok(epoch) => Ok(NativeResult::SequenceCatalog(epoch, table)),
+                        Err(error) => {
+                            if error != ops::Error::Unknown { giggles_core::cancellation::check()?; }
+                            Ok(NativeResult::Error(error))
+                        }
+                    };
+                }
                 match session.execute_native_catalog(request)? {
                     Ok(outcome) => Ok(NativeResult::Catalog(outcome, table)),
                     Err(error) => {
@@ -155,7 +165,7 @@ pub(crate) fn run(
         match &invocation {
             Invocation::Read(_) | Invocation::Join(_) => reqs.extend(read_tables(&invocation)
                 .into_iter().map(|t| (t, giggles_core::roles::TablePrivilege::Select))),
-            Invocation::Operation { request, .. } => reqs.extend(table_requirements(request)?),
+            Invocation::Operation { request, .. } | Invocation::Page { request, .. } => reqs.extend(table_requirements(request)?),
             Invocation::Transaction { transaction, .. } => {
                 if transaction.steps.len() > ops::MAX_TRANSACTION_ITEMS {
                     return Err(CoreError::Limit);
@@ -167,7 +177,7 @@ pub(crate) fn run(
                     }
                 }
             }
-            Invocation::Catalog(_) | Invocation::SearchPath(_) | Invocation::Begin | Invocation::Commit | Invocation::Rollback
+            Invocation::Catalog(_) | Invocation::Sequence(_) | Invocation::SearchPath(_) | Invocation::Begin | Invocation::Commit | Invocation::Rollback
             | Invocation::Savepoint(_) | Invocation::RollbackTo(_) | Invocation::Release(_) => {}
             Invocation::Legacy(_) | Invocation::Text { .. } => return Err(CoreError::Unsupported),
         }
@@ -188,6 +198,11 @@ pub(crate) fn run(
             if session.service.admin.authority_metadata()?.0.to_string() != *domain {
                 return Err(CoreError::Policy(Error::Authentication));
             }
+        }
+        if let Invocation::Sequence(call) = &invocation {
+            // SQL authorizes nextval/currval/setval through the same sequence dependency check.
+            let (ops::SequenceCall::Nextval(name) | ops::SequenceCall::Currval(name) | ops::SequenceCall::Setval { name, .. }) = call;
+            session.authorize_native_sequence(name)?;
         }
         if session.is_aborted() && !matches!(invocation, Invocation::Rollback | Invocation::RollbackTo(_)) {
             return Err(CoreError::Sql(SqlError::Aborted));
@@ -215,6 +230,10 @@ pub(crate) fn run(
                 .sql
                 .execute_native(&request, &bindings)
                 .map(NativeResult::Operation),
+            Invocation::Page { request, bindings, after } => session
+                .sql
+                .read_page(&request, (!after.is_empty()).then_some(after.as_slice()), &bindings)
+                .map(NativeResult::Page),
             Invocation::Transaction {
                 transaction,
                 bindings,
@@ -222,6 +241,14 @@ pub(crate) fn run(
                 .sql
                 .execute_native_transaction(&transaction, &bindings)
                 .map(NativeResult::Transaction),
+            Invocation::Sequence(call) => {
+                let column = match &call { ops::SequenceCall::Nextval(_) => "nextval", ops::SequenceCall::Currval(_) => "currval", ops::SequenceCall::Setval { .. } => "setval" };
+                session.sql.execute_sequence_native(&call).map(|value| NativeResult::Sql(giggles_core::relational::SqlResult {
+                    columns: vec![column.into()],
+                    rows: vec![giggles_core::relational::SqlRow { values: vec![giggles_core::relational::Value::Int(value)], version: 0 }],
+                    affected: 1,
+                }))
+            }
             Invocation::Savepoint(name) => { session.sql.savepoint(&name)?; return Ok(NativeResult::Control); }
             Invocation::RollbackTo(name) => { session.sql.rollback_to(&name)?; return Ok(NativeResult::Control); }
             Invocation::Release(name) => { session.sql.release(&name)?; return Ok(NativeResult::Control); }

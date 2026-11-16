@@ -59,6 +59,7 @@ fn descriptor_publishes_only_the_three_v1_methods() {
             ("rollback_to", 16),
             ("release", 17),
             ("catalog", 18),
+            ("sequence", 19),
             ("budget_ms", 20)
         ]
     );
@@ -253,7 +254,14 @@ fn catalog_descriptor_frozen_fields_and_presence() {
     let set = prost_types::FileDescriptorSet::decode(proto::FILE_DESCRIPTOR_SET).unwrap();
     let file = set.file.iter().find(|f| f.package.as_deref() == Some("giggles.v1")).unwrap();
     for (message, fields, optional, oneof) in [
-        ("NativeCatalogRequest", "create_table create_index drop_table drop_index alter_table add_constraint drop_constraint", "", Some("request")),
+        ("NativeCatalogRequest", "create_table create_index drop_table drop_index alter_table add_constraint drop_constraint create_view drop_view create_sequence drop_sequence", "", Some("request")),
+        ("NativeCreateSequence", "name", "name", None),
+        ("NativeDropSequence", "name cascade", "name cascade", None),
+        ("NativeSequenceCall", "nextval currval setval", "", Some("call")),
+        ("NativeSequenceName", "name", "name", None),
+        ("NativeSetval", "name value is_called", "name value is_called", None),
+        ("NativeCreateView", "name read", "name", None),
+        ("NativeDropView", "name cascade", "name cascade", None),
         ("NativeAddConstraint", "table name unique check foreign_key", "table name", Some("constraint")),
         ("NativeUniqueConstraint", "columns", "", None),
         ("NativeCheckConstraint", "expression", "", None),
@@ -280,6 +288,27 @@ fn catalog_descriptor_frozen_fields_and_presence() {
             if let Some(oneof) = oneof.filter(|_| !optional.split_whitespace().any(|n| n == name)) { assert_eq!(m.oneof_decl[f.oneof_index.unwrap() as usize].name.as_deref(), Some(oneof)); }
         }
     }
+    for (message, field, number) in [("NativeOperationRequest", "page", 3), ("NativeOutcome", "next_page", 8), ("NativePage", "after", 1)] {
+        let m = file.message_type.iter().find(|m| m.name.as_deref() == Some(message)).unwrap();
+        let f = m.field.iter().find(|f| f.name.as_deref() == Some(field)).unwrap();
+        assert_eq!(f.number, Some(number), "{message}.{field}");
+    }
+    let api: serde_json::Value = serde_json::from_str(include_str!("../docs/http-api.openapi.json")).unwrap();
+    let s = &api["components"]["schemas"];
+    assert_eq!(s["NativeOperationRequest"]["properties"]["page"]["$ref"], "#/components/schemas/NativePage");
+    assert_eq!(s["NativeOutcome"]["properties"]["nextPage"]["$ref"], "#/components/schemas/NativePage");
+    assert_eq!(s["NativePage"]["properties"].as_object().unwrap().keys().collect::<Vec<_>>(), ["after"]);
+    let m = file.message_type.iter().find(|m| m.name.as_deref() == Some("ExecuteRequest")).unwrap();
+    let f = m.field.iter().find(|f| f.name.as_deref() == Some("sequence")).unwrap();
+    assert_eq!(f.number, Some(19));
+    assert_eq!(m.oneof_decl[f.oneof_index.unwrap() as usize].name.as_deref(), Some("request"));
+    for (message, keys) in [("NativeCreateSequence", "name"), ("NativeDropSequence", "name cascade"), ("NativeSequenceCall", "nextval currval setval"),
+        ("NativeSequenceName", "name"), ("NativeSetval", "name value isCalled")] {
+        let props = s[message]["properties"].as_object().unwrap();
+        assert_eq!(props.len(), keys.split_whitespace().count(), "{message}");
+        for key in keys.split_whitespace() { assert!(props.contains_key(key), "{message}.{key}"); }
+    }
+    assert_eq!(api["components"]["schemas"]["ExecuteRequest"]["properties"]["sequence"]["$ref"], "#/components/schemas/NativeSequenceCall");
     let m = file.message_type.iter().find(|m| m.name.as_deref() == Some("ExecuteRequest")).unwrap();
     let f = m.field.iter().find(|f| f.name.as_deref() == Some("catalog")).unwrap();
     assert_eq!(m.oneof_decl[f.oneof_index.unwrap() as usize].name.as_deref(), Some("request"));
@@ -309,7 +338,7 @@ fn constraint_json_keys_and_malformed_shapes() {
         codec::decode_execute(json::decode_execute(&bytes).unwrap()).unwrap();
     }
     let api:serde_json::Value=serde_json::from_str(include_str!("../docs/http-api.openapi.json")).unwrap();
-    for (message,keys) in [("NativeAddConstraint","table name unique check foreignKey"),("NativeUniqueConstraint","columns"),("NativeCheckConstraint","expression"),("NativeForeignKey","columns refTable refColumns refColumnsSet onDelete onUpdate"),("NativeDropConstraint","table name cascade")] {
+    for (message,keys) in [("NativeAddConstraint","table name unique check foreignKey"),("NativeUniqueConstraint","columns"),("NativeCheckConstraint","expression"),("NativeForeignKey","columns refTable refColumns refColumnsSet onDelete onUpdate"),("NativeDropConstraint","table name cascade"),("NativeCreateView","name read"),("NativeDropView","name cascade")] {
         let props=api["components"]["schemas"][message]["properties"].as_object().unwrap();
         assert_eq!(props.len(),keys.split_whitespace().count()); for key in keys.split_whitespace() {assert!(props.contains_key(key));}
     }

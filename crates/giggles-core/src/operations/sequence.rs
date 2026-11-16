@@ -8,16 +8,7 @@ pub enum SequenceCall {
 }
 impl Engine {
     pub fn execute_sequence_catalog(&self, request: &CatalogRequest) -> Result<u64> {
-        use crate::relational::defaults::SequenceDdl;
-        let (name, ddl) = match request {
-            CatalogRequest::CreateSequence { name } => (name, SequenceDdl::create_native(native_relation_key(name))),
-            CatalogRequest::DropSequence { name, cascade } => (name, SequenceDdl::drop_native(native_relation_key(name), *cascade)),
-            _ => return Err(Error::Unsupported),
-        };
-        self.admin.sql_session().native_scope(false, || {
-            if !relation_identifier(name) { return Err(Error::Bind("identifier".into())); }
-            validate_size(request)
-        }, |session| session.sequence_catalog_engine(ddl).map_err(core))
+        self.admin.sql_session().execute_sequence_catalog_native(request)
     }
     /// Each engine call has a fresh session, including its currval state.
     pub fn execute_sequence(&self, call: &SequenceCall) -> Result<i64> {
@@ -25,6 +16,19 @@ impl Engine {
     }
 }
 impl SqlSession {
+    /// CREATE/DROP SEQUENCE in this session's transaction; returns the catalog epoch.
+    pub fn execute_sequence_catalog_native(&mut self, request: &CatalogRequest) -> Result<u64> {
+        use crate::relational::defaults::SequenceDdl;
+        let (name, ddl) = match request {
+            CatalogRequest::CreateSequence { name } => (name, SequenceDdl::create_native(native_relation_key(name))),
+            CatalogRequest::DropSequence { name, cascade } => (name, SequenceDdl::drop_native(native_relation_key(name), *cascade)),
+            _ => return Err(Error::Unsupported),
+        };
+        self.native_scope(false, || {
+            if !relation_identifier(name) { return Err(Error::Bind("identifier".into())); }
+            validate_size(request)
+        }, |session| session.sequence_catalog_engine(ddl).map_err(core))
+    }
     pub fn execute_sequence_native(&mut self, call: &SequenceCall) -> Result<i64> {
         let (operation, name, value, called) = match call {
             SequenceCall::Nextval(name) => ("nextval", name, None, true),

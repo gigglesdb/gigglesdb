@@ -108,7 +108,7 @@ async fn malformed_constraint_transports() {
     for (body,wire) in [
         (json!({"table":"t"}),p::NativeAddConstraint {table:Some("t".into()),..Default::default()}),
         (json!({"table":"","unique":{}}),p::NativeAddConstraint {table:Some("".into()),constraint:Some(p::native_add_constraint::Constraint::Unique(Default::default())),..Default::default()}),
-        (json!({"table":"t","name":"","unique":{}}),p::NativeAddConstraint {table:Some("t".into()),name:Some("".into()),constraint:Some(p::native_add_constraint::Constraint::Unique(Default::default())),..Default::default()}),
+        (json!({"table":"t","name":"","unique":{}}),p::NativeAddConstraint {table:Some("t".into()),name:Some("".into()),constraint:Some(p::native_add_constraint::Constraint::Unique(Default::default()))}),
         (json!({"table":"t","foreignKey":{"refTable":""}}),p::NativeAddConstraint {table:Some("t".into()),constraint:Some(p::native_add_constraint::Constraint::ForeignKey(p::NativeForeignKey {ref_table:Some("".into()),..Default::default()})),..Default::default()}),
         (json!({"table":"t","foreignKey":{"refTable":"p","onUpdate":"invalid"}}),p::NativeAddConstraint {table:Some("t".into()),constraint:Some(p::native_add_constraint::Constraint::ForeignKey(p::NativeForeignKey {ref_table:Some("p".into()),on_update:Some("invalid".into()),..Default::default()})),..Default::default()}),
     ] {

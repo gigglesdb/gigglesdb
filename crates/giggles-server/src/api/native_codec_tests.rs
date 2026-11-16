@@ -420,6 +420,7 @@ fn direct_protobuf_rejects_missing_presence_unknown_enums_and_excess_collections
                 p::NativeOperationRequest {
                     request: Some(request),
                     bindings: vec![],
+                    page: None,
                 },
             )),
             budget_ms: None,
@@ -491,6 +492,7 @@ fn direct_protobuf_rejects_missing_presence_unknown_enums_and_excess_collections
             p::NativeOperationRequest {
                 request: Some(read(None, vec![], vec![])),
                 bindings: vec![binding.clone(), binding],
+                page: None,
             },
         )),
         budget_ms: None,
