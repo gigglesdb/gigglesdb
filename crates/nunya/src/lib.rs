@@ -21,7 +21,7 @@ pub mod readlog;
 pub mod schema;
 /// Spanner support.
 pub mod spanner;
-/// Durable gateway state.
+/// Durable state, authority and connection registry.
 pub mod state;
 /// Task support.
 pub mod task;

@@ -1,6 +1,8 @@
-//! Durable gateway state with opaque transactional records.
+//! Durable gateway state, authority and connection tracking.
 /// Domain records and their storage encoding.
 pub mod model;
+/// Open connections by access session, with a cancellation signal per connection.
+pub mod registry;
 /// State table definitions and root-key continuity derivation.
 pub mod schema;
 /// Transactional state storage and ownership.
