@@ -1,17 +1,14 @@
 //! Native Spanner listener lifecycle and validated snapshot refresh.
 use crate::{
-    pgwire::auth::ScramVerifier,
     policy::Policy,
     readlog::ReadLog,
     spanner::{
         catalog::CatalogRunner,
         proxy::{self, SpannerContext, SpannerUpstream},
     },
-    task::TaskStore,
     token::{StandardCodec, keys::RootKey},
 };
 use std::{
-    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -95,16 +92,14 @@ pub async fn run_spanner(
     section: &SpannerNativeSection,
     policy: Arc<Policy>,
     root_key: RootKey,
-    tasks: TaskStore,
     state: RouteState,
     readlog: Box<dyn ReadLog>,
-    standing: BTreeMap<String, ScramVerifier>,
     _policy_path: PathBuf,
     tls: Option<tonic::transport::ServerTlsConfig>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     run_spanner_with_hub(
-        section, policy, root_key, tasks, state, readlog, standing, None, tls, shutdown,
+        section, policy, root_key, state, readlog, None, tls, shutdown,
     )
     .await
 }
@@ -113,10 +108,8 @@ pub(crate) async fn run_spanner_with_hub(
     section: &SpannerNativeSection,
     policy: Arc<Policy>,
     root_key: RootKey,
-    tasks: TaskStore,
     state: RouteState,
     readlog: Box<dyn ReadLog>,
-    standing: BTreeMap<String, ScramVerifier>,
     hub: Option<Arc<crate::reload::Hub>>,
     tls: Option<tonic::transport::ServerTlsConfig>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -161,9 +154,7 @@ pub(crate) async fn run_spanner_with_hub(
             policy: RwLock::new(policy),
             snapshot: RwLock::new(Arc::new(snapshot)),
             root_key,
-            tasks,
             readlog,
-            standing,
             codec: StandardCodec,
             database: section.database.clone(),
             clock: Arc::new(now),
@@ -208,6 +199,7 @@ pub(crate) async fn run_spanner_with_hub(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     #[test]
     fn section_is_strict_and_errors_are_sanitized() {
         let base: toml::Value = toml::from_str(

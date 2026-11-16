@@ -47,7 +47,7 @@ fn parameter(request: &mut ExecuteSqlRequest, token: &str) {
 }
 #[tokio::test]
 #[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR and NUNYA_TEST_SPANNER_DB"]
-async fn standing_worked_example() {
+async fn session_worked_example() {
     let endpoint = std::env::var("NUNYA_TEST_SPANNER_EMULATOR").unwrap_or_else(|_| {
         panic!("missing required environment variable NUNYA_TEST_SPANNER_EMULATOR")
     });
@@ -104,7 +104,6 @@ async fn standing_worked_example() {
         endpoint: None,
         snapshot_refresh_ms: None,
     };
-    let tasks = nunya::task::TaskStore::open_dir(&dir.join("tasks")).unwrap();
     let root = nunya::token::keys::RootKey::from_hex(&"ab".repeat(32)).unwrap();
     let runtime = nunya::state::runtime::StateRuntime::open(
         &dir.join("state"),
@@ -118,24 +117,61 @@ async fn standing_worked_example() {
         registry: runtime.registry.clone(),
         route: nunya::state::model::RouteId::new("spanner-native").unwrap(),
     };
-    let standing = BTreeMap::from([(
-        "agent".into(),
-        nunya::pgwire::auth::ScramVerifier::from_password(
-            "standing-test",
-            b"spanner-harness",
-            4096,
-        ),
-    )]);
+    use nunya::pgwire::auth::ScramVerifier;
+    use nunya::state::{
+        authority::AcquireRequest,
+        model::{Mode, PrincipalKind, Verifier},
+    };
+    use sha2::{Digest, Sha256};
+    let principal = runtime
+        .authority
+        .create_principal("agent", PrincipalKind::Agent, false, "native-test")
+        .unwrap();
+    runtime
+        .authority
+        .set_grants(principal.id, vec![(state.route.clone(), Mode::ReadWrite)])
+        .unwrap();
+    runtime
+        .authority
+        .add_principal_credential(
+            principal.id,
+            Verifier(ScramVerifier::from_password(
+                "session-test",
+                b"spanner-harness",
+                4096,
+            )),
+            None,
+        )
+        .unwrap();
+    let access = runtime
+        .authority
+        .acquire_session(
+            principal.id,
+            AcquireRequest {
+                route: state.route.clone(),
+                mode: None,
+                lifetime_ms: None,
+                isolated: false,
+                label: None,
+                idempotency_key: "native-test".into(),
+                verifier: Verifier(ScramVerifier::from_password(
+                    "session-test",
+                    b"spanner-harness",
+                    4096,
+                )),
+                secret_sha256: Sha256::digest(b"session-test").into(),
+            },
+        )
+        .unwrap();
+    let bearer = format!("Bearer nunya.session:{}.session-test", access.id.to_hex());
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let mut server = Abort(tokio::spawn(async move {
         nunya::spanner_serve::run_spanner(
             &section,
             Arc::new(policy),
             root,
-            tasks,
             state,
             log,
-            standing,
             PathBuf::new(),
             None,
             rx,
@@ -159,11 +195,9 @@ async fn standing_worked_example() {
     #[allow(clippy::result_large_err)]
     let mut agent = SpannerClient::with_interceptor(
         channel.expect("gateway ready"),
-        |mut req: Request<()>| -> Result<Request<()>, Status> {
-            req.metadata_mut().insert(
-                "authorization",
-                "Bearer nunya.agent.standing-test".parse().unwrap(),
-            );
+        move |mut req: Request<()>| -> Result<Request<()>, Status> {
+            req.metadata_mut()
+                .insert("authorization", bearer.parse().unwrap());
             Ok(req)
         },
     );

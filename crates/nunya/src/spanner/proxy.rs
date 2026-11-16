@@ -2,7 +2,7 @@
 // tonic::Status is large by design.
 #![allow(clippy::result_large_err)]
 use super::{
-    auth::{Authenticated, Authenticator},
+    auth::{self, Authenticated},
     redact::{nunya_status, redact_status},
     server::{SpannerServer, SpannerService},
     stream::{self, Event, Reassembler},
@@ -15,22 +15,18 @@ use crate::{
     },
     error::{NyCode, Refusal},
     ir::{InputRewrite, RewritePlan, StatementKind, ValueSource, check::check},
-    pgwire::auth::ScramVerifier,
     policy::{DomainName, Policy, TokenizeSetting},
     readlog::{Outcome, ReadLog, ReadLogRecord, statement_fingerprint},
     schema::Snapshot,
-    task::TaskStore,
-    token::{
-        StandardCodec, TokenCodec,
-        keys::{RootKey, derive_scope},
-    },
+    state::authority::{TokenizeError, TokenizeLimits},
+    token::{SessionId, StandardCodec, TokenCodec, keys::RootKey},
     value::ColumnType,
 };
 use futures::{Stream, StreamExt};
 use google_cloud_googleapis::spanner::v1::{spanner_client::SpannerClient, *};
 use prost_types::{ListValue, Value};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex, RwLock},
@@ -68,12 +64,8 @@ pub struct SpannerContext {
     pub snapshot: RwLock<Arc<Snapshot>>,
     /// Root token key.
     pub root_key: RootKey,
-    /// Persistent task scopes.
-    pub tasks: TaskStore,
     /// Mandatory read audit sink.
     pub readlog: Box<dyn ReadLog>,
-    /// Standing credential verifiers.
-    pub standing: BTreeMap<String, ScramVerifier>,
     /// Typed token codec.
     pub codec: StandardCodec,
     /// Only permitted upstream database.
@@ -106,10 +98,8 @@ pub struct NunyaSpanner {
     ctx: Arc<SpannerContext>,
     client: Client,
     channel: Channel,
-    sessions: Mutex<HashMap<String, String>>,
-    auth: Authenticator,
+    sessions: Mutex<HashMap<String, SessionId>>,
     provider: Option<Arc<dyn gcp_auth::TokenProvider>>,
-    tokenize_counts: Mutex<HashMap<(String, DomainName), u32>>,
 }
 fn refusal(code: NyCode) -> Refusal {
     Refusal::new(code, "Spanner request refused")
@@ -134,9 +124,7 @@ pub async fn build(ctx: Arc<SpannerContext>) -> Result<NunyaSpanner, Refusal> {
         client: SpannerClient::with_interceptor(channel.clone(), AuthInterceptor::default()),
         channel,
         sessions: Mutex::new(HashMap::new()),
-        auth: Authenticator::default(),
         provider,
-        tokenize_counts: Mutex::new(HashMap::new()),
     })
 }
 /// Connect with gateway credentials and configured transport security.
@@ -194,14 +182,13 @@ pub async fn serve(
 }
 impl NunyaSpanner {
     fn authenticate<T>(&self, req: &Request<T>) -> Result<Authenticated, Status> {
-        self.auth
-            .authenticate(
-                req.metadata(),
-                &self.ctx.tasks,
-                &self.ctx.standing,
-                (self.ctx.clock)(),
-            )
-            .map_err(status)
+        auth::authenticate(
+            req.metadata(),
+            &self.ctx.authority,
+            &self.ctx.route,
+            &self.ctx.root_key,
+        )
+        .map_err(status)
     }
     fn database(&self, database: &str) -> Result<(), Status> {
         if database == self.ctx.database {
@@ -224,15 +211,15 @@ impl NunyaSpanner {
     fn session(&self, name: &str, who: &Authenticated) -> Result<(), Status> {
         self.session_database(name)?;
         let sessions = self.sessions.lock().map_err(|_| invalid())?;
-        owned(&sessions, name, &who.principal).map_err(status)
+        owned(&sessions, name, &who.session).map_err(status)
     }
     fn record_session(&self, name: &str, who: &Authenticated) -> Result<(), Status> {
         self.session_database(name)?;
         let mut sessions = self.sessions.lock().map_err(|_| invalid())?;
-        if sessions.get(name).is_some_and(|p| p != &who.principal) {
+        if sessions.get(name).is_some_and(|p| p != &who.session) {
             return Err(nunya_status(NyCode::TokenNotValid));
         }
-        sessions.insert(name.into(), who.principal.clone());
+        sessions.insert(name.into(), who.session);
         Ok(())
     }
     async fn client(&self) -> Result<Client, Status> {
@@ -273,8 +260,8 @@ impl NunyaSpanner {
         ctx.readlog
             .write(&ReadLogRecord {
                 ts_unix_ms: (ctx.clock)(),
-                task: who.task_id,
-                credential: who.principal.clone(),
+                task: None,
+                credential: format!("session:{}", who.session.to_hex()),
                 statement_fingerprint: statement_fingerprint(
                     &crate::readlog::redact_tokenize_args(label),
                 ),
@@ -295,12 +282,12 @@ impl NunyaSpanner {
         decode: bool,
     ) -> Result<Value, Status> {
         let value = values::from_proto(ty, value).map_err(status)?;
-        let keys = derive_scope(&self.ctx.root_key, &who.salt);
+        let keys = &who.keys;
         let range = policy.domains.get(domain).and_then(|d| d.range.as_ref());
         let result = if decode {
-            self.ctx.codec.decode(&keys, domain, ty, range, &value)
+            self.ctx.codec.decode(keys, domain, ty, range, &value)
         } else {
-            self.ctx.codec.encode(&keys, domain, ty, range, &value)
+            self.ctx.codec.encode(keys, domain, ty, range, &value)
         }
         .map_err(status)?;
         values::to_proto(ty, &result).map_err(status)
@@ -359,10 +346,10 @@ impl NunyaSpanner {
         types: &[ColumnType],
         row: &mut [Value],
     ) -> Result<Vec<String>, Status> {
-        let keys = derive_scope(&ctx.root_key, &who.salt);
+        let keys = &who.keys;
         stream::rewrite_row(row, &plan.outputs, types, &mut |domain, ty, value| {
             ctx.codec.encode(
-                &keys,
+                keys,
                 domain,
                 ty,
                 policy.domains.get(domain).and_then(|d| d.range.as_ref()),
@@ -430,10 +417,17 @@ impl NunyaSpanner {
             return Ok(None);
         };
         let setting = policy.domains.get(domain).ok_or_else(denied)?;
-        let limit = match setting.tokenize {
+        let limits = match setting.tokenize {
             TokenizeSetting::On {
-                limit_per_session, ..
-            } => limit_per_session,
+                limit_per_session,
+                limit_per_principal,
+                principal_window,
+            } => TokenizeLimits {
+                per_session: u64::from(limit_per_session),
+                per_principal: u64::from(limit_per_principal),
+                principal_window_ms: u64::try_from(principal_window.as_millis())
+                    .unwrap_or(u64::MAX),
+            },
             TokenizeSetting::Off => return Err(denied()),
         };
         let (ty, value) = match arg {
@@ -467,21 +461,15 @@ impl NunyaSpanner {
             return Err(invalid());
         }
         let value = self.convert(who, policy, domain, &ty, &value, false)?;
-        if let Some(id) = who.task_id {
-            self.ctx
-                .tasks
-                .count_tokenize(&id, domain, limit)
-                .map_err(status)?;
-        } else {
-            let mut counts = self.tokenize_counts.lock().map_err(|_| invalid())?;
-            let count = counts
-                .entry((who.principal.clone(), domain.clone()))
-                .or_default();
-            *count = count
-                .checked_add(1)
-                .filter(|v| *v <= limit)
-                .ok_or_else(|| nunya_status(NyCode::TokenizeLimit))?;
-        }
+        self.ctx
+            .authority
+            .record_tokenization(who.session, domain, &limits)
+            .map_err(|error| {
+                nunya_status(match error {
+                    TokenizeError::LimitReached => NyCode::TokenizeLimit,
+                    TokenizeError::Ended | TokenizeError::Store => NyCode::SessionEnded,
+                })
+            })?;
         let code = if ty == ColumnType::Int8 {
             TypeCode::Int64
         } else {
@@ -605,13 +593,13 @@ impl NunyaSpanner {
     }
 }
 fn owned(
-    sessions: &HashMap<String, String>,
+    sessions: &HashMap<String, SessionId>,
     session: &str,
-    principal: &str,
+    access_session: &SessionId,
 ) -> Result<(), Refusal> {
     if sessions
         .get(session)
-        .is_some_and(|owner| owner == principal)
+        .is_some_and(|owner| owner == access_session)
     {
         Ok(())
     } else {
@@ -1165,29 +1153,41 @@ fn mutation_value_mut<'a>(m: &'a mut Mutation, pos: &ValuePosition) -> Option<&'
 mod tests {
     use super::*;
     use crate::{
+        pgwire::auth::ScramVerifier,
+        state::{
+            authority::AcquireRequest,
+            model::{Mode, PrincipalKind, Verifier},
+        },
+        token::PrincipalId,
+    };
+    use crate::{
         policy::{DomainSettings, ReadLogSink, Treatment},
         readlog::StdoutLog,
         schema::{Column, ColumnRef, Relation, RelationKind},
     };
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
     #[test]
     fn session_ownership_is_exact() {
         let sessions = HashMap::from([
-            ("db/sessions/a".into(), "alice".into()),
-            ("db/sessions/b".into(), "bob".into()),
+            ("db/sessions/a".into(), SessionId([1; 16])),
+            ("db/sessions/b".into(), SessionId([2; 16])),
         ]);
-        assert!(owned(&sessions, "db/sessions/a", "alice").is_ok());
+        assert!(owned(&sessions, "db/sessions/a", &SessionId([1; 16])).is_ok());
         assert_eq!(
-            owned(&sessions, "db/sessions/a", "bob").unwrap_err().code,
-            NyCode::TokenNotValid
-        );
-        assert_eq!(
-            owned(&sessions, "db/sessions/missing", "alice")
+            owned(&sessions, "db/sessions/a", &SessionId([2; 16]))
                 .unwrap_err()
                 .code,
             NyCode::TokenNotValid
         );
         assert_eq!(
-            owned(&sessions, "db/sessions/a/extra", "alice")
+            owned(&sessions, "db/sessions/missing", &SessionId([1; 16]))
+                .unwrap_err()
+                .code,
+            NyCode::TokenNotValid
+        );
+        assert_eq!(
+            owned(&sessions, "db/sessions/a/extra", &SessionId([1; 16]))
                 .unwrap_err()
                 .code,
             NyCode::TokenNotValid
@@ -1195,9 +1195,9 @@ mod tests {
     }
     #[test]
     fn deleted_session_is_not_owned() {
-        let mut sessions = HashMap::from([("db/sessions/a".into(), "alice".into())]);
+        let mut sessions = HashMap::from([("db/sessions/a".into(), SessionId([1; 16]))]);
         sessions.remove("db/sessions/a");
-        assert!(owned(&sessions, "db/sessions/a", "alice").is_err());
+        assert!(owned(&sessions, "db/sessions/a", &SessionId([1; 16])).is_err());
     }
     #[test]
     fn local_token_audit_keeps_tokens_and_omits_nulls() {
@@ -1339,19 +1339,60 @@ mod tests {
     fn domain() -> DomainName {
         DomainName("email".into())
     }
-    fn request<T>(value: T, user: &str) -> Request<T> {
-        let mut r = Request::new(value);
-        r.metadata_mut().insert(
+    fn session_request<T>(value: T, id: SessionId, secret: &str) -> Request<T> {
+        let mut req = Request::new(value);
+        req.metadata_mut().insert(
             "authorization",
-            format!("Bearer nunya.{user}.password").parse().unwrap(),
+            format!("Bearer nunya.session:{}.{}", id.to_hex(), secret)
+                .parse()
+                .unwrap(),
         );
-        r
+        req
+    }
+    fn acquire(a: &crate::state::authority::Authority, principal: PrincipalId) -> SessionId {
+        a.acquire_session(
+            principal,
+            AcquireRequest {
+                route: crate::state::model::RouteId::new("spanner-native").unwrap(),
+                mode: None,
+                lifetime_ms: None,
+                isolated: false,
+                label: None,
+                idempotency_key: SessionId::random().to_hex(),
+                verifier: Verifier(ScramVerifier::from_password("password", b"salt", 2)),
+                secret_sha256: Sha256::digest(b"password").into(),
+            },
+        )
+        .unwrap()
+        .id
+    }
+    fn provision(a: &crate::state::authority::Authority, name: &str) -> SessionId {
+        let p = a
+            .create_principal(name, PrincipalKind::Agent, false, name)
+            .unwrap();
+        a.set_grants(
+            p.id,
+            vec![(
+                crate::state::model::RouteId::new("spanner-native").unwrap(),
+                Mode::ReadWrite,
+            )],
+        )
+        .unwrap();
+        a.add_principal_credential(
+            p.id,
+            Verifier(ScramVerifier::from_password("password", b"salt", 2)),
+            None,
+        )
+        .unwrap();
+        acquire(a, p.id)
     }
     struct Fixture {
         svc: NunyaSpanner,
         fake: Arc<Fake>,
         server: tokio::task::JoinHandle<()>,
         dir: std::path::PathBuf,
+        alice: SessionId,
+        bob: SessionId,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -1360,6 +1401,14 @@ mod tests {
         }
     }
     impl Fixture {
+        fn request<T>(&self, value: T, user: &str) -> Request<T> {
+            let id = match user {
+                "alice" => self.alice,
+                "bob" => self.bob,
+                _ => panic!("unknown fixture identity"),
+            };
+            session_request(value, id, "password")
+        }
         async fn new() -> Self {
             let fake = Arc::new(Fake::default());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1435,18 +1484,7 @@ mod tests {
                 policy: RwLock::new(Arc::new(policy)),
                 snapshot: RwLock::new(Arc::new(snapshot)),
                 root_key: RootKey::from_hex(&"00".repeat(32)).unwrap(),
-                tasks: TaskStore::open_dir(&dir).unwrap(),
                 readlog: Box::new(StdoutLog),
-                standing: BTreeMap::from([
-                    (
-                        "alice".into(),
-                        ScramVerifier::from_password("password", b"salt", 4096),
-                    ),
-                    (
-                        "bob".into(),
-                        ScramVerifier::from_password("password", b"salt", 4096),
-                    ),
-                ]),
                 codec: StandardCodec,
                 database: "projects/p/instances/i/databases/d".into(),
                 clock: Arc::new(|| 0),
@@ -1454,9 +1492,13 @@ mod tests {
                     endpoint: format!("http://{addr}"),
                 },
             });
+            let alice = provision(&runtime.authority, "alice");
+            let bob = provision(&runtime.authority, "bob");
             let svc = build(ctx).await.unwrap();
             Self {
                 svc,
+                alice,
+                bob,
                 fake,
                 server,
                 dir,
@@ -1464,7 +1506,7 @@ mod tests {
         }
         async fn session(&self) -> String {
             self.svc
-                .create_session(request(
+                .create_session(self.request(
                     CreateSessionRequest {
                         database: self.svc.ctx.database.clone(),
                         ..Default::default()
@@ -1484,7 +1526,7 @@ mod tests {
             }
         }
         fn token(&self) -> Value {
-            let auth = self.svc.authenticate(&request((), "alice")).unwrap();
+            let auth = self.svc.authenticate(&self.request((), "alice")).unwrap();
             let policy = self.svc.ctx.policy.read().unwrap().clone();
             self.svc
                 .convert(
@@ -1511,7 +1553,7 @@ mod tests {
         });
         assert!(
             f.svc
-                .execute_sql(request(req.clone(), "alice"))
+                .execute_sql(f.request(req.clone(), "alice"))
                 .await
                 .unwrap_err()
                 .message()
@@ -1519,7 +1561,7 @@ mod tests {
         );
         assert!(
             f.svc
-                .execute_streaming_sql(request(req, "alice"))
+                .execute_streaming_sql(f.request(req, "alice"))
                 .await
                 .err()
                 .unwrap()
@@ -1556,7 +1598,7 @@ mod tests {
             };
             assert!(
                 f.svc
-                    .read(request(req, "alice"))
+                    .read(f.request(req, "alice"))
                     .await
                     .unwrap_err()
                     .message()
@@ -1574,7 +1616,7 @@ mod tests {
             };
             assert!(
                 f.svc
-                    .commit(request(req, "alice"))
+                    .commit(f.request(req, "alice"))
                     .await
                     .unwrap_err()
                     .message()
@@ -1594,7 +1636,7 @@ mod tests {
         };
         assert!(
             f.svc
-                .commit(request(req, "alice"))
+                .commit(f.request(req, "alice"))
                 .await
                 .unwrap_err()
                 .message()
@@ -1608,7 +1650,7 @@ mod tests {
         let req = f.query("SELECT email FROM customers").await;
         let result = f
             .svc
-            .execute_sql(request(req, "alice"))
+            .execute_sql(f.request(req, "alice"))
             .await
             .unwrap()
             .into_inner();
@@ -1626,7 +1668,7 @@ mod tests {
         req.params = Some(prost_types::Struct {
             fields: BTreeMap::from([("v".into(), f.token())]),
         });
-        f.svc.execute_sql(request(req, "alice")).await.unwrap();
+        f.svc.execute_sql(f.request(req, "alice")).await.unwrap();
         assert_eq!(
             f.fake.seen.lock().unwrap()[0]
                 .params
@@ -1642,29 +1684,33 @@ mod tests {
         let req = f
             .query("SELECT email FROM customers WHERE email LIKE '%example%'")
             .await;
-        assert!(f.svc.execute_sql(request(req, "alice")).await.is_err());
+        assert!(f.svc.execute_sql(f.request(req, "alice")).await.is_err());
         assert!(f.fake.seen.lock().unwrap().is_empty());
     }
     #[tokio::test]
     async fn wrong_bearer_is_ny003() {
         let f = Fixture::new().await;
-        let mut req = request(
-            CreateSessionRequest {
+        for principal in [false, true] {
+            let value = CreateSessionRequest {
                 database: f.svc.ctx.database.clone(),
                 ..Default::default()
-            },
-            "alice",
-        );
-        req.metadata_mut()
-            .insert("authorization", "Bearer nunya.alice.wrong".parse().unwrap());
-        assert!(
-            f.svc
-                .create_session(req)
-                .await
-                .unwrap_err()
-                .message()
-                .contains("NY003")
-        );
+            };
+            let mut req = session_request(value, f.alice, "wrong");
+            if principal {
+                req.metadata_mut().insert(
+                    "authorization",
+                    "Bearer nunya.alice.password".parse().unwrap(),
+                );
+            }
+            assert!(
+                f.svc
+                    .create_session(req)
+                    .await
+                    .unwrap_err()
+                    .message()
+                    .contains("NY003")
+            );
+        }
     }
     #[tokio::test]
     async fn another_principals_session_is_refused() {
@@ -1672,7 +1718,7 @@ mod tests {
         let req = f.query("SELECT email FROM customers").await;
         assert!(
             f.svc
-                .execute_sql(request(req, "bob"))
+                .execute_sql(f.request(req, "bob"))
                 .await
                 .unwrap_err()
                 .message()
@@ -1686,7 +1732,7 @@ mod tests {
         let session = f.session().await;
         let result = f
             .svc
-            .partition_query(request(
+            .partition_query(f.request(
                 PartitionQueryRequest {
                     session,
                     ..Default::default()
@@ -1705,7 +1751,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let result = f
             .svc
-            .create_session(request(
+            .create_session(f.request(
                 CreateSessionRequest {
                     database: f.svc.ctx.database.clone(),
                     ..Default::default()
@@ -1732,7 +1778,7 @@ mod tests {
             })),
         };
         f.svc
-            .commit(request(
+            .commit(f.request(
                 CommitRequest {
                     session,
                     mutations: vec![mutation],
@@ -1755,7 +1801,7 @@ mod tests {
     async fn creator_roles_are_never_forwarded() {
         let f = Fixture::new().await;
         f.svc
-            .create_session(request(
+            .create_session(f.request(
                 CreateSessionRequest {
                     database: f.svc.ctx.database.clone(),
                     session: Some(Session {
@@ -1768,7 +1814,7 @@ mod tests {
             .await
             .unwrap();
         f.svc
-            .batch_create_sessions(request(
+            .batch_create_sessions(f.request(
                 BatchCreateSessionsRequest {
                     database: f.svc.ctx.database.clone(),
                     session_template: Some(Session {
@@ -1789,7 +1835,7 @@ mod tests {
         let req = f.query("SELECT email FROM customers").await;
         let mut stream = f
             .svc
-            .execute_streaming_sql(request(req, "alice"))
+            .execute_streaming_sql(f.request(req, "alice"))
             .await
             .unwrap()
             .into_inner();
@@ -1850,5 +1896,64 @@ mod tests {
         let error = runner.query("SELECT catalog").await.unwrap_err();
         assert_eq!(error.code, NyCode::SchemaStale);
         assert!(!format!("{error:?}").contains("private@example.com"));
+    }
+    #[tokio::test]
+    async fn another_session_of_same_principal_is_refused() {
+        let f = Fixture::new().await;
+        let req = f.query("SELECT email FROM customers").await;
+        let first = f.svc.authenticate(&f.request((), "alice")).unwrap();
+        let second = acquire(&f.svc.ctx.authority, first.principal);
+        assert_ne!(first.session, second);
+        assert!(
+            f.svc
+                .execute_sql(session_request(req, second, "password"))
+                .await
+                .unwrap_err()
+                .message()
+                .contains("NY003")
+        );
+        assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn tokenization_uses_durable_session_counter() {
+        let f = Fixture::new().await;
+        let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
+        let policy = f.svc.ctx.policy.read().unwrap().clone();
+        let plan = RewritePlan {
+            outputs: vec![],
+            inputs: vec![],
+            tokenize: Some((
+                domain(),
+                ValueSource::Literal {
+                    span: crate::ir::Span { start: 0, end: 0 },
+                    text: "private@example.com".into(),
+                },
+            )),
+        };
+        let tokenize = || {
+            f.svc
+                .local_tokenize(&who, &policy, &plan, &[], &None, &HashMap::new())
+        };
+        for _ in 0..10 {
+            assert!(tokenize().unwrap().is_some());
+        }
+        assert_eq!(
+            f.svc
+                .ctx
+                .authority
+                .session_tokenizations(f.alice, &domain())
+                .unwrap(),
+            10
+        );
+        assert!(tokenize().unwrap_err().message().contains("NY007"));
+        assert_eq!(
+            f.svc
+                .ctx
+                .authority
+                .session_tokenizations(f.alice, &domain())
+                .unwrap(),
+            10
+        );
+        assert!(f.fake.seen.lock().unwrap().is_empty());
     }
 }

@@ -14,7 +14,7 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -321,8 +321,6 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let mut routes = JoinSet::new();
     if let Some(section) = config.spanner_native.take() {
-        let tasks = crate::task::TaskStore::open_dir(&config.state_dir.join("tasks"))
-            .map_err(|_| "task store unavailable")?;
         let state = crate::spanner_serve::RouteState {
             authority: runtime.authority.clone(),
             registry: runtime.registry.clone(),
@@ -348,13 +346,6 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
         let root_key =
             crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
-        let mut standing = BTreeMap::new();
-        for identity in &config.standing {
-            let text = zeroize::Zeroizing::new(identity.verifier.to_pg_string());
-            let verifier = crate::pgwire::auth::ScramVerifier::parse(&text)
-                .ok_or("standing identity unavailable")?;
-            standing.insert(identity.name.clone(), verifier);
-        }
         let policy = policy.clone();
         let route_hub = hub.clone();
         let rx = rx.clone();
@@ -363,10 +354,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 &section,
                 policy,
                 root_key,
-                tasks,
                 state,
                 readlog,
-                standing,
                 Some(route_hub),
                 tls,
                 rx,
@@ -586,6 +575,7 @@ async fn run_postgres(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     #[tokio::test]
     async fn route_failure_cancels_initializing_sibling() {
         let (tx, rx) = tokio::sync::watch::channel(false);
