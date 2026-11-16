@@ -75,8 +75,8 @@ fn sequences_match_sql() {
         assert_eq!(rows(&right, "SELECT id FROM t"), vec![vec![Value::Int(31)]]);
         assert_eq!(state(ddl("drop sequence s").unwrap_err()), "2BP01"); assert_eq!(sql_state(&left, "DROP SEQUENCE s"), "2BP01");
         assert_eq!(ddl("drop sequence if exists nope").unwrap(), None); sql_ok(&left, "DROP SEQUENCE IF EXISTS nope");
-        // PG18.6 skips a missing schema under IF EXISTS; repo SQL reports 42P01 (pinned).
-        assert_eq!(ddl("drop sequence if exists nope.s").unwrap(), None); assert_eq!(sql_state(&left, "DROP SEQUENCE IF EXISTS nope.s"), "42P01");
+        // PG18.6 skips a missing schema under IF EXISTS (NOTICE, success); native and SQL both do.
+        assert_eq!(ddl("drop sequence if exists nope.s").unwrap(), None); sql_ok(&left, "DROP SEQUENCE IF EXISTS nope.s");
         assert_eq!(ddl("create sequence if not exists app.s").unwrap(), None); sql_ok(&left, "CREATE SEQUENCE IF NOT EXISTS app.s");
         assert_eq!(state(ddl("create sequence s").unwrap_err()), "42P07"); assert_eq!(sql_state(&left, "CREATE SEQUENCE s"), "42P07");
         assert_eq!(state(call("nextval(nope)", &none).unwrap_err()), "42P01"); assert_eq!(sql_state(&left, "SELECT nextval('nope')"), "42P01");

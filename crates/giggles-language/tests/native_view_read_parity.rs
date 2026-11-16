@@ -65,8 +65,11 @@ fn view_reads_match_sql() {
         let actual = with_sql_parser_forbidden(|| engine.execute_text(native, &bindings)).unwrap();
         assert_eq!(actual.columns, expected.columns, "{native}");
         assert_eq!(actual.rows, expected.rows, "{native}");
+        // GD-0001 R2 PARITY-A3: native view reads follow SQL (PG18.6 reads views in FROM); the earlier 42P01 was a core gap.
+        // As for a table, matched counts rows before LIMIT and complete is false when LIMIT drops rows.
+        let (matched, complete) = if native.contains(" limit ") { (3, false) } else { (expected.rows.len(), true) };
         assert_eq!((actual.matched, actual.affected, actual.changed, actual.complete),
-            (expected.rows.len(), 0, 0, true), "{native}");
+            (matched, 0, 0, complete), "{native}");
         assert_eq!(snapshot(&left), before);
         assert_eq!(snapshot(&right), before);
     }
@@ -86,14 +89,21 @@ fn view_reads_need_twenty() {
     let old = Engine::with_version(right.clone(), LanguageVersion::Embedded019);
     let engine = Engine::with_version(right.clone(), V);
     let missing = Error::Sql { sqlstate: "42P01".into() };
-    assert_eq!(with_sql_parser_forbidden(|| old.execute_text("v select id,qty", &Bindings::new())), Err(missing.clone()));
+    // GD-0001 R2 PARITY-A3: native view reads follow SQL (PG18.6 reads views in FROM); the earlier 42P01 was a core gap.
+    // Profiles gate syntax only, so 0.19 text that parses reads the view too.
+    let same = |native: Result<Outcome>, sql: &str| {
+        let expected = left.sql_session().execute(sql, &[], None).unwrap();
+        assert_eq!(expected.rows.len(), 5, "{sql}");
+        let actual = native.unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert_eq!((actual.columns, actual.rows), (expected.columns, expected.rows), "{sql}");
+    };
+    same(with_sql_parser_forbidden(|| old.execute_text("v select id,qty", &Bindings::new())), "select id,qty from v");
     let sql_error = left.sql_session().execute("select id from nope", &[], None).unwrap_err();
     assert_eq!(giggles_core::sqlstate(&sql_error), "42P01");
-    assert_eq!(with_sql_parser_forbidden(|| engine.execute_text("nope select id", &Bindings::new())), Err(missing.clone()));
-    // Arithmetic projections and omitted projections have no equivalent Query expression.
+    assert_eq!(with_sql_parser_forbidden(|| engine.execute_text("nope select id", &Bindings::new())), Err(missing));
+    // Arithmetic and omitted projections read the view as SQL does.
     for (native, sql) in [("v select qty*2 as d", "select qty*2 as d from v"), ("v", "select * from v")] {
-        assert_eq!(left.sql_session().execute(sql, &[], None).unwrap().rows.len(), 5);
-        assert_eq!(with_sql_parser_forbidden(|| engine.execute_text(native, &Bindings::new())), Err(missing.clone()));
+        same(with_sql_parser_forbidden(|| engine.execute_text(native, &Bindings::new())), sql);
     }
     assert_eq!(snapshot(&left), before);
     assert_eq!(snapshot(&right), before);
