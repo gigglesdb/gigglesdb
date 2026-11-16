@@ -19,7 +19,8 @@ use giggles_core::{
     range_api::{
         ClusterTxnId, Epoch, HomeOp, HomeReply, LeaseKind, LockGrant, LockRequest, Outcome,
         RangeDescriptor, RangeEngineOpener, RangeError, RangeId, RangeService, RangeWrite,
-        ReadPage, ReadRequest, SYSTEM_RANGE, SystemService, Timestamp, TsOracle,
+        ReadPage, ReadRequest, SYSTEM_RANGE, SequenceOp, SequenceReply, SystemService, Timestamp,
+        TsOracle,
     },
     replicated::{self as gr, RangeStore},
 };
@@ -182,6 +183,15 @@ impl SystemService for ConfirmedSystem {
     fn lease(&self, kind: LeaseKind, id: u64, count: u64) -> Result<Range<u64>, RangeError> {
         confirm_leader(&self.handle, self.term)?;
         self.inner.lease(kind, id, count)
+    }
+    fn sequence(
+        &self,
+        id: u64,
+        incarnation: u128,
+        op: SequenceOp,
+    ) -> Result<SequenceReply, RangeError> {
+        confirm_leader(&self.handle, self.term)?;
+        self.inner.sequence(id, incarnation, op)
     }
 }
 

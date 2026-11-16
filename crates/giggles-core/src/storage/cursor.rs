@@ -136,6 +136,8 @@ impl SqlSession {
             });
             let (image, source, context) = match &self.admin.inner.backend {
                 Backend::V2(db) => {
+                    // Cursors read the local store directly (no cluster form yet).
+                    db.require_local()?;
                     // The existing transaction API cannot fork its write overlay.
                     // Keep read-your-writes correct via the bounded bridge fallback.
                     // SERIALIZABLE reads must enter the read set validated at COMMIT,

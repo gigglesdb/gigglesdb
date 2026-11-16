@@ -366,6 +366,32 @@ pub enum LeaseKind {
     Xid = 4,
 }
 
+/// A SQL sequence operation, evaluated on the system range leader (R5-43; design.md Changes
+/// 2026-11-16 Track C). The leader keeps each sequence's counter in memory and persists a
+/// reservation 32 steps ahead before handing out a value, as one node does, so values are
+/// globally ordered and a new leader resumes above every value handed out before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceOp {
+    /// nextval.
+    Next,
+    /// setval(value, called).
+    Set { value: i64, called: bool },
+    /// The sequence's definition was dropped or replaced: delete its stored counter.
+    Forget,
+}
+/// The answer to a [`SequenceOp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceReply {
+    /// nextval's result, or setval's value.
+    Value(i64),
+    /// No committed definition with this id and incarnation (Forget: done).
+    Gone,
+    /// nextval passed the sequence's limit without CYCLE.
+    Limit,
+    /// setval's value is outside the sequence's bounds.
+    OutOfRange,
+}
+
 /// Blocking client over the route cache and peer transport.
 pub trait RangeClient: Send + Sync {
     fn descriptor_for(&self, range_key: &[u8]) -> Result<RangeDescriptor, RangeError>;
@@ -411,6 +437,16 @@ pub trait RangeClient: Send + Sync {
     fn home(&self, range: RangeId, epoch: Epoch, op: HomeOp) -> Result<HomeReply, RangeError>;
     fn oracle(&self) -> &dyn TsOracle;
     fn lease(&self, kind: LeaseKind, id: u64, count: u64) -> Result<Range<u64>, RangeError>;
+    /// A SQL sequence operation on the system range leader (`SystemService::sequence`).
+    fn sequence(
+        &self,
+        id: u64,
+        incarnation: u128,
+        op: SequenceOp,
+    ) -> Result<SequenceReply, RangeError> {
+        let _ = (id, incarnation, op);
+        Err(RangeError::Unavailable("no sequence service".into()))
+    }
 }
 /// One service per range, on its current leader.
 pub trait RangeService: Send + Sync {
@@ -472,6 +508,17 @@ pub trait GatewayService: Send + Sync {
 pub trait SystemService: Send + Sync {
     fn oracle(&self) -> &dyn TsOracle;
     fn lease(&self, kind: LeaseKind, id: u64, count: u64) -> Result<Range<u64>, RangeError>;
+    /// Evaluates a SQL sequence operation against the sequence's committed definition
+    /// (implemented by the range engine's `SystemRange`; wrappers forward it).
+    fn sequence(
+        &self,
+        id: u64,
+        incarnation: u128,
+        op: SequenceOp,
+    ) -> Result<SequenceReply, RangeError> {
+        let _ = (id, incarnation, op);
+        Err(RangeError::Unavailable("no sequence service".into()))
+    }
 }
 /// Linearizable oracle, strictly increasing across system-range leader changes.
 pub trait TsOracle: Send + Sync {

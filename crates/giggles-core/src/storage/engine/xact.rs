@@ -25,13 +25,22 @@ pub(crate) enum XactLookupError {
     Txn(TxnError),
 }
 pub(crate) struct XactIds {
-    kv: Arc<Kv>,
+    /// None on a cluster gateway: markers are range-local there.
+    kv: Option<Arc<Kv>>,
     seq: Arc<SequenceAllocator>,
     live: Arc<Mutex<BTreeSet<u64>>>,
     pruned: AtomicU64,
 }
 impl XactIds {
     pub(crate) fn new(kv: Arc<Kv>, seq: Arc<SequenceAllocator>) -> Self {
+        Self::with_kv(Some(kv), seq)
+    }
+    /// Xids from a leased allocator, with no local markers to prune or read.
+    #[cfg_attr(not(test), allow(dead_code, reason = "R5-43 gateway wiring is pending"))]
+    pub(crate) fn leased(seq: Arc<SequenceAllocator>) -> Self {
+        Self::with_kv(None, seq)
+    }
+    fn with_kv(kv: Option<Arc<Kv>>, seq: Arc<SequenceAllocator>) -> Self {
         Self {
             kv,
             seq,
@@ -53,7 +62,7 @@ impl XactIds {
             live: self.live.clone(),
         };
         // Serialize pruning; on error the new guard is dropped after this lock.
-        {
+        if let Some(kv) = &self.kv {
             let _live = self.live.lock().map_err(|_| TxnError::Misuse)?;
             let next = self
                 .seq
@@ -64,7 +73,7 @@ impl XactIds {
             if cutoff.saturating_sub(self.pruned.load(Ordering::Relaxed)) >= 4096 {
                 let mut batch = WriteBatch::default();
                 batch.delete_range(Keyspace::Seq, marker_key(0), marker_key(cutoff));
-                self.kv.write(batch, Durability::NoSync)?;
+                kv.write(batch, Durability::NoSync)?;
                 self.pruned.store(cutoff, Ordering::Relaxed);
             }
         }
@@ -77,6 +86,17 @@ impl XactIds {
         if xid < FIRST_XID {
             return Ok(Some(XactStatus::Committed));
         }
+        let Some(kv) = &self.kv else {
+            let live = self
+                .live
+                .lock()
+                .map_err(|_| XactLookupError::Txn(TxnError::Misuse))?;
+            if live.contains(&xid) {
+                return Ok(Some(XactStatus::InProgress));
+            }
+            // Cross-range xid status is R5-55.
+            return Err(XactLookupError::Txn(TxnError::Unsupported));
+        };
         let next = self
             .seq
             .peek(4, 0)
@@ -96,8 +116,7 @@ impl XactIds {
         if live.contains(&xid) {
             return Ok(Some(XactStatus::InProgress));
         }
-        let marker = self
-            .kv
+        let marker = kv
             .get(Keyspace::Seq, &marker_key(xid))
             .map_err(|e| XactLookupError::Txn(TxnError::Kv(e)))?;
         Ok(Some(if marker.is_some() {
@@ -202,6 +221,36 @@ mod tests {
         let xid = guard.id();
         drop(guard);
         assert_eq!(ids.status(xid).unwrap(), Some(XactStatus::Committed));
+    }
+    #[test]
+    fn leased_ids_are_distinct_and_finished_status_is_refused() {
+        let stub = Arc::new(super::super::seq::lease_tests::StubClient::default());
+        let a = XactIds::leased(Arc::new(SequenceAllocator::leased(stub.clone(), 4)));
+        let b = XactIds::leased(Arc::new(SequenceAllocator::leased(stub, 4)));
+        let mut seen = BTreeSet::new();
+        let mut guards = Vec::new();
+        for _ in 0..10 {
+            for ids in [&a, &b] {
+                let guard = ids.assign().unwrap();
+                assert!(guard.id() >= FIRST_XID);
+                assert!(seen.insert(guard.id()), "duplicate xid {}", guard.id());
+                guards.push(guard);
+            }
+        }
+        let xid = guards[0].id();
+        assert_eq!(a.status(0).unwrap(), None);
+        assert_eq!(a.status(2).unwrap(), Some(XactStatus::Committed));
+        assert_eq!(a.status(xid).unwrap(), Some(XactStatus::InProgress));
+        // b cannot see a's live xid: that is a cross-range status lookup.
+        assert!(matches!(
+            b.status(xid),
+            Err(XactLookupError::Txn(TxnError::Unsupported))
+        ));
+        guards.clear();
+        assert!(matches!(
+            a.status(xid),
+            Err(XactLookupError::Txn(TxnError::Unsupported))
+        ));
     }
     #[test]
     fn retention_and_prune_threshold() {

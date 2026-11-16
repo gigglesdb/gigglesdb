@@ -23,16 +23,18 @@ use std::{
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
 };
 
-use super::home::HomeRecords;
+use super::home::{HomeRecords, RecoveryConfig};
 use super::kv::RangeKv;
 use super::local::local_interval;
 use super::oracle::SystemRange;
 use super::store::RangeStore;
+use super::txn_record::resolve_prepared;
 use crate::storage::engine::{
     commit::{Sequencer, SequencerConfig, ServedGate, SystemClock, TsSource},
     hlc::Ts,
@@ -42,9 +44,9 @@ use crate::storage::engine::{
     txn::TxnError,
 };
 use crate::storage::range_api::{
-    ClusterTxnId, Epoch, HomeOp, HomeReply, LockGrant, LockRequest, Outcome, RangeDescriptor,
-    RangeEngineOpener, RangeError, RangeId, RangeService, RangeWrite, ReadPage, ReadRequest,
-    SYSTEM_RANGE, Timestamp, TsOracle,
+    ClusterTxnId, Epoch, HomeOp, HomeReply, LockGrant, LockRequest, Outcome, RangeClient,
+    RangeDescriptor, RangeEngineOpener, RangeError, RangeId, RangeService, RangeWrite, ReadPage,
+    ReadRequest, SYSTEM_RANGE, Timestamp, TsOracle,
 };
 use crate::storage::replicated::BatchSink;
 
@@ -54,6 +56,8 @@ mod prepared;
 mod read;
 mod txns;
 
+#[cfg(test)]
+mod client_tests;
 #[cfg(test)]
 mod tests;
 
@@ -66,6 +70,13 @@ pub(crate) struct EngineConfig {
     pub(crate) read_wait: Duration,
     /// Lease sweep period.
     pub(crate) sweep: Duration,
+    /// How long a read or lock request waits on a prepared transaction before asking its home
+    /// (R5-53), and how often it asks again.
+    pub(crate) resolve_after: Duration,
+    /// Bounds of the home-record recovery worker (R5-52).
+    pub(crate) recovery: RecoveryConfig,
+    /// Period of the recovery worker.
+    pub(crate) recovery_tick: Duration,
 }
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -73,6 +84,9 @@ impl Default for EngineConfig {
             lease: Duration::from_secs(10),
             read_wait: Duration::from_secs(5),
             sweep: Duration::from_millis(500),
+            resolve_after: Duration::from_millis(250),
+            recovery: RecoveryConfig::default(),
+            recovery_tick: Duration::from_secs(1),
         }
     }
 }
@@ -110,6 +124,9 @@ pub(crate) struct RangeEngine {
     generation: u64,
     /// Track D's home records of transactions homed here (R5-50), over `home_log`.
     home: OnceLock<HomeRecords>,
+    /// Other ranges, for resolving prepared records through their homes (R5-53). Weak: the
+    /// client normally owns the engines. Without one, readers and lockers only wait.
+    client: OnceLock<Weak<dyn RangeClient>>,
 }
 
 fn txn_id(txn: ClusterTxnId) -> TxnId {
@@ -214,6 +231,7 @@ impl RangeEngine {
             closed: AtomicBool::new(false),
             generation,
             home: OnceLock::new(),
+            client: OnceLock::new(),
         });
         engine.reinstall_prepared(store)?;
         let log = Arc::new(home_log::EngineHomeLog(Arc::downgrade(&engine)));
@@ -239,6 +257,26 @@ impl RangeEngine {
         self.closed.store(true, Ordering::SeqCst);
         self.kv.fence();
         self.changed.notify_all();
+    }
+
+    /// Lets the engine ask other ranges (R5-53). Set once; later calls are ignored.
+    pub(crate) fn set_client(&self, client: Weak<dyn RangeClient>) {
+        let _ = self.client.set(client);
+    }
+
+    fn client(&self) -> Option<Arc<dyn RangeClient>> {
+        self.client.get().and_then(Weak::upgrade)
+    }
+
+    /// R5-53 (O6): resolves each blocking prepared transaction through its home record. Never
+    /// called under `self.state` (finalize takes it). Pending or an error leaves the record:
+    /// the caller keeps waiting and asks again later.
+    fn resolve_blockers(&self, client: &dyn RangeClient, blockers: &[(ClusterTxnId, RangeId)]) {
+        for &(txn, home) in blockers {
+            let _ = resolve_prepared(client, home, txn, &|outcome| {
+                self.finalize_txn(txn, outcome)
+            });
+        }
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -419,17 +457,55 @@ impl RangeService for RangeEngine {
     }
 }
 
+/// R5-52: one home-record recovery pass on every open engine each `tick`, until the sender of
+/// `stop` (the `RangeEngines`) is dropped. Holds only weak references; errors wait for the
+/// next tick.
+fn spawn_recovery(
+    open: Weak<OpenEngines>,
+    client: Weak<dyn RangeClient>,
+    stop: mpsc::Receiver<()>,
+    config: RecoveryConfig,
+    tick: Duration,
+) {
+    let _ = thread::Builder::new()
+        .name("range-recovery".into())
+        .spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(tick) {
+                let (Some(open), Some(client)) = (open.upgrade(), client.upgrade()) else {
+                    return;
+                };
+                let engines: Vec<Arc<RangeEngine>> = open
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .values()
+                    .cloned()
+                    .collect();
+                drop(open);
+                for engine in engines {
+                    if let (Ok(()), Some(home)) = (engine.check_open(), engine.home.get()) {
+                        let _ = home.recover_once(&*client, config, Instant::now());
+                    }
+                }
+            }
+        });
+}
+
+type OpenEngines = Mutex<HashMap<RangeId, Arc<RangeEngine>>>;
+
 /// The node's engines, opened by each range group's role manager (R5-16).
 pub(crate) struct RangeEngines {
     store: Arc<RangeStore>,
     oracle: Arc<dyn TsOracle>,
     config: EngineConfig,
-    open: Mutex<HashMap<RangeId, Arc<RangeEngine>>>,
+    open: Arc<OpenEngines>,
     /// Closed engines whose last writes were still in flight; a new engine of the range waits
     /// for them before it opens.
     draining: Mutex<HashMap<RangeId, Arc<RangeEngine>>>,
     /// The system range's oracle and leases while this node leads it (R5-31, R5-38).
     system: Mutex<Option<Arc<SystemRange>>>,
+    client: OnceLock<Weak<dyn RangeClient>>,
+    /// Dropped with `self`, which stops the recovery worker.
+    recovery_stop: OnceLock<mpsc::Sender<()>>,
 }
 
 impl RangeEngines {
@@ -446,10 +522,35 @@ impl RangeEngines {
             store,
             oracle,
             config,
-            open: Mutex::new(HashMap::new()),
+            open: Arc::new(Mutex::new(HashMap::new())),
             draining: Mutex::new(HashMap::new()),
             system: Mutex::new(None),
+            client: OnceLock::new(),
+            recovery_stop: OnceLock::new(),
         }
+    }
+
+    /// Gives the node's engines a client for other ranges: engines opened from now on resolve
+    /// prepared records through their homes (R5-53), and one worker thread runs home-record
+    /// recovery (R5-52) on every open engine each `recovery_tick` until `self` is dropped.
+    /// Weak, because the client normally owns the engines. Set once; later calls are ignored.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the node wires its RangeClient later in R5")
+    )]
+    pub(crate) fn set_client(&self, client: Weak<dyn RangeClient>) {
+        if self.client.set(client.clone()).is_err() {
+            return;
+        }
+        let (stop, stopped) = mpsc::channel();
+        let _ = self.recovery_stop.set(stop);
+        spawn_recovery(
+            Arc::downgrade(&self.open),
+            client,
+            stopped,
+            self.config.recovery,
+            self.config.recovery_tick,
+        );
     }
 
     /// The system range's services, while this node leads the system range.
@@ -496,7 +597,7 @@ impl RangeEngineOpener for RangeEngines {
             )?);
             *self.system.lock().unwrap_or_else(|p| p.into_inner()) = Some(system);
         }
-        let engine = match RangeEngine::open(
+        let opened = match RangeEngine::open(
             &self.store,
             descriptor,
             sink,
@@ -510,6 +611,15 @@ impl RangeEngineOpener for RangeEngines {
                 return Err(error);
             }
         };
+        let engine = opened;
+        if id == SYSTEM_RANGE
+            && let Some(system) = self.system()
+        {
+            system.attach_sequencer(engine.seq.clone());
+        }
+        if let Some(client) = self.client.get() {
+            engine.set_client(client.clone());
+        }
         self.open
             .lock()
             .unwrap_or_else(|p| p.into_inner())

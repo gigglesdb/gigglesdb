@@ -5,7 +5,9 @@ use std::time::Instant;
 use super::{RangeEngine, ts, txn_error};
 use crate::storage::engine::{codec, hlc::Ts, kv::KvRead};
 use crate::storage::range::keys::{cf_interval, is_versioned, keyspace_of};
-use crate::storage::range_api::{RangeError, ReadDirection, ReadPage, ReadRequest};
+use crate::storage::range_api::{
+    ClusterTxnId, RangeError, RangeId, ReadDirection, ReadPage, ReadRequest,
+};
 
 type Raw = Bound<Vec<u8>>;
 
@@ -123,41 +125,64 @@ impl RangeEngine {
                 "a commit at or below the read ts is in flight".into(),
             ));
         }
-        {
-            let mut state = self.state();
-            loop {
-                self.check_open()?;
-                let blocked = state.prepared.values().any(|record| {
-                    record.at <= at
-                        && record.writes.keys().any(|(wks, key)| {
-                            *wks == ks
-                                && inside(
-                                    &if versioned {
-                                        codec::user_key_seek_at(key, at)
-                                    } else {
-                                        key.clone()
-                                    },
-                                    &start,
-                                    &end,
-                                )
+        let mut next_resolve = Instant::now() + self.config.resolve_after;
+        loop {
+            // Taken outside `self.state`: dropping the last reference runs the client's Drop.
+            let client = self.client();
+            let blockers = {
+                let mut state = self.state();
+                loop {
+                    self.check_open()?;
+                    let blockers: Vec<(ClusterTxnId, RangeId)> = state
+                        .prepared
+                        .iter()
+                        .filter(|(_, record)| {
+                            record.at <= at
+                                && record.writes.keys().any(|(wks, key)| {
+                                    *wks == ks
+                                        && inside(
+                                            &if versioned {
+                                                codec::user_key_seek_at(key, at)
+                                            } else {
+                                                key.clone()
+                                            },
+                                            &start,
+                                            &end,
+                                        )
+                                })
                         })
-                });
-                if !blocked {
-                    break;
+                        .map(|(txn, record)| (*txn, record.home))
+                        .collect();
+                    if blockers.is_empty() {
+                        break blockers;
+                    }
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(RangeError::Unavailable(
+                            "prepared transaction unresolved".into(),
+                        ));
+                    }
+                    if client.is_some() && now >= next_resolve {
+                        break blockers;
+                    }
+                    let until = match client {
+                        Some(_) => deadline.min(next_resolve),
+                        None => deadline,
+                    };
+                    state = self
+                        .changed
+                        .wait_timeout(state, until - now)
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0;
                 }
-                let now = Instant::now();
-                if now >= deadline {
-                    // R5-53 (Track D) resolves a stale prepared record through its home.
-                    return Err(RangeError::Unavailable(
-                        "prepared transaction unresolved".into(),
-                    ));
-                }
-                state = self
-                    .changed
-                    .wait_timeout(state, deadline - now)
-                    .unwrap_or_else(|p| p.into_inner())
-                    .0;
-            }
+            };
+            let Some(client) = client.filter(|_| !blockers.is_empty()) else {
+                break;
+            };
+            // R5-53: Finalized removes the record (check again); Pending or an error waits,
+            // asking again at most every `resolve_after`.
+            self.resolve_blockers(&*client, &blockers);
+            next_resolve = Instant::now() + self.config.resolve_after;
         }
         let dir = match req.dir {
             ReadDirection::Forward => crate::storage::engine::kv::Direction::Forward,

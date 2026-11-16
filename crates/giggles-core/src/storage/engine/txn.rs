@@ -3,7 +3,7 @@ use super::{
     codec::CodecError,
     commit::{CommitRequest, RawOp, Sequencer, SnapshotHandle, valid_counter_key},
     hlc::Ts,
-    kv::{Direction, Keyspace, KvError},
+    kv::{Direction, Keyspace, KvError, KvIter, KvRead},
     locks::{LockError, LockKey, LockManager, LockMode, TxnId},
     mvcc,
     once_guard::{CommitGuard, GuardRejection},
@@ -36,6 +36,8 @@ pub(crate) enum TxnError {
     CommitAmbiguous,
     Fenced,
     Misuse,
+    /// Not available on this path yet (cluster mode before a later R5 item).
+    Unsupported,
     /// A counter reservation targeted a sequence that was dropped or recreated.
     SequenceGone,
     DependentObjects,
@@ -56,6 +58,7 @@ impl TxnError {
             Self::SequenceGone => "42P01",
             Self::DependentObjects => "2BP01",
             Self::Fenced | Self::Misuse => "XX000",
+            Self::Unsupported => "0A000",
             Self::Kv(_) | Self::Codec(_) => "XX000",
         }
     }
@@ -100,6 +103,7 @@ impl From<TxnError> for crate::CoreError {
             // CoreError has no dedicated unknown-outcome variant; Storage follows its unknown-outcome route.
             TxnError::CommitAmbiguous => Self::Storage("engine commit outcome unknown".into()),
             TxnError::Misuse => Self::Corrupt("engine transaction misuse".into()),
+            TxnError::Unsupported => Self::Unsupported,
             // The sequence relation no longer exists (42P01, as on legacy).
             TxnError::DependentObjects => Self::Sql(crate::relational::SqlError::DependentObjects),
             TxnError::SequenceGone => Self::Sql(crate::relational::SqlError::UnknownTable),
@@ -123,6 +127,7 @@ pub(crate) struct ReadSet {
     pub(crate) points: BTreeSet<(Keyspace, Vec<u8>)>,
     pub(crate) ranges: Vec<ReadRange>,
 }
+#[derive(Debug)]
 pub(crate) struct WriteTarget {
     pub(crate) current: Option<Vec<u8>>,
     pub(crate) changed_since_snapshot: bool,
@@ -144,12 +149,217 @@ struct UndoWrite {
     write_bytes: usize,
     bytes: usize,
 }
+/// What a transaction calls below it (GD-0075 design.md section 4): the single-node
+/// sequencer and lock manager, or a gateway's cluster services (R5-42). Enum dispatch;
+/// `Local` behaves exactly as before.
+#[derive(Clone)]
+pub(crate) enum TxnServices {
+    Local {
+        seq: Arc<Sequencer>,
+        locks: Arc<LockManager>,
+    },
+    Cluster(Arc<dyn ClusterServices>),
+}
+/// A key's newest committed version: its timestamp and value (None = tombstone).
+pub(crate) type LatestVersion = (Ts, Option<Vec<u8>>);
+/// Gateway services for cluster transactions, implemented by
+/// `storage::cluster::txn::ClusterTxnServices`. Per-transaction state is keyed by TxnId,
+/// as in LockManager.
+pub(crate) trait ClusterServices: Send + Sync {
+    /// A statement timestamp from the oracle (design.md 4a O2).
+    fn snapshot(&self, txn: TxnId) -> Result<Ts, TxnError>;
+    /// A fresh oracle timestamp not tied to a transaction (catalog loads and pins).
+    fn now(&self) -> Result<Ts, TxnError>;
+    /// Raw reader serving, for each user key, only its newest version at or below `ts`.
+    fn reader(&self, ts: Ts) -> Arc<dyn KvRead>;
+    /// This gateway's own lock manager (Table(0) and catalog-name locks).
+    fn gateway_locks(&self) -> &LockManager;
+    /// Exclusive row or unique lock in the key's range, then its newest committed version.
+    fn lock_key(
+        &self,
+        txn: TxnId,
+        ks: Keyspace,
+        key: &[u8],
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<LatestVersion>, TxnError>;
+    /// The per-table writer sentinel (design.md 3.1).
+    fn lock_sentinel(
+        &self,
+        txn: TxnId,
+        table: u64,
+        mode: LockMode,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError>;
+    fn write_set_bytes(&self) -> usize;
+    fn commit(&self, txn: TxnId, commit: ClusterCommit) -> Result<Ts, TxnError>;
+    /// Releases every lock the transaction holds, in ranges and on the gateway.
+    fn release_all(&self, txn: TxnId);
+    /// A new transaction id: the gateway's node id in the high 16 bits.
+    fn next_txn_id(&self) -> TxnId;
+    /// The range client: allocator leases and sequences on the system range.
+    fn client(&self) -> Arc<dyn crate::range_api::RangeClient>;
+}
+/// A cluster transaction's buffered effects at commit.
+pub(crate) struct ClusterCommit {
+    pub(crate) isolation: Isolation,
+    pub(crate) snapshot: Ts,
+    pub(crate) writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
+    pub(crate) features_or: u64,
+    pub(crate) raw: Vec<RawOp>,
+}
+enum Snapshot {
+    Local(SnapshotHandle),
+    Cluster { ts: Ts, reader: Arc<dyn KvRead> },
+}
+impl Snapshot {
+    fn ts(&self) -> Ts {
+        match self {
+            Self::Local(handle) => handle.ts(),
+            Self::Cluster { ts, .. } => *ts,
+        }
+    }
+}
+/// Read view of a cluster transaction whose statement timestamp could not be obtained.
+struct NoSnapshot;
+impl KvRead for NoSnapshot {
+    fn get(&self, _: Keyspace, _: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        Err(KvError::Io("no cluster statement timestamp".into()))
+    }
+    fn range(
+        &self,
+        _: Keyspace,
+        _: Bound<&[u8]>,
+        _: Bound<&[u8]>,
+        _: Direction,
+    ) -> Result<KvIter<'_>, KvError> {
+        Err(KvError::Io("no cluster statement timestamp".into()))
+    }
+}
+static NO_SNAPSHOT: NoSnapshot = NoSnapshot;
+/// A KV read view: borrowed from the local store, or a routed reader fixed at a timestamp.
+pub(crate) enum ReadView<'a> {
+    Borrowed(&'a dyn KvRead),
+    Owned(Arc<dyn KvRead>),
+}
+impl<'a> std::ops::Deref for ReadView<'a> {
+    type Target = dyn KvRead + 'a;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(kv) => *kv,
+            Self::Owned(kv) => kv.as_ref(),
+        }
+    }
+}
+/// A timestamp that GC and cache pruning must not pass while held (Local); a plain
+/// oracle timestamp in a cluster, where range leaders own GC.
+pub(crate) struct Pin {
+    ts: Ts,
+    _handle: Option<SnapshotHandle>,
+}
+impl Pin {
+    pub(crate) fn ts(&self) -> Ts {
+        self.ts
+    }
+}
+impl TxnServices {
+    pub(crate) fn pin(&self) -> Result<Pin, TxnError> {
+        Ok(match self {
+            Self::Local { seq, .. } => {
+                let handle = seq.snapshot();
+                Pin {
+                    ts: handle.ts(),
+                    _handle: Some(handle),
+                }
+            }
+            Self::Cluster(cluster) => Pin {
+                ts: cluster.now()?,
+                _handle: None,
+            },
+        })
+    }
+    /// The newest committed timestamp (Local) or a fresh oracle timestamp (cluster).
+    pub(crate) fn visible_ts(&self) -> Result<Ts, TxnError> {
+        match self {
+            Self::Local { seq, .. } => Ok(seq.visible_ts()),
+            Self::Cluster(cluster) => cluster.now(),
+        }
+    }
+    pub(crate) fn oldest_active(&self) -> Option<Ts> {
+        match self {
+            Self::Local { seq, .. } => seq.oldest_active(),
+            Self::Cluster(_) => None,
+        }
+    }
+    /// Reads at `ts` (and below). Local reads the whole store; MVCC filters by ts.
+    pub(crate) fn read_view(&self, ts: Ts) -> ReadView<'_> {
+        match self {
+            Self::Local { seq, .. } => ReadView::Borrowed(seq.kv()),
+            Self::Cluster(cluster) => ReadView::Owned(cluster.reader(ts)),
+        }
+    }
+    /// A view holding every committed version up to now, for "newest version" checks.
+    pub(crate) fn latest_view(&self) -> Result<ReadView<'_>, TxnError> {
+        Ok(match self {
+            Self::Local { seq, .. } => ReadView::Borrowed(seq.kv()),
+            Self::Cluster(cluster) => ReadView::Owned(cluster.reader(cluster.now()?)),
+        })
+    }
+    fn take_snapshot(&self, txn: TxnId) -> Result<Snapshot, TxnError> {
+        Ok(match self {
+            Self::Local { seq, .. } => Snapshot::Local(seq.snapshot()),
+            Self::Cluster(cluster) => {
+                let ts = cluster.snapshot(txn)?;
+                Snapshot::Cluster {
+                    ts,
+                    reader: cluster.reader(ts),
+                }
+            }
+        })
+    }
+    fn write_set_bytes(&self) -> usize {
+        match self {
+            Self::Local { seq, .. } => seq.write_set_bytes(),
+            Self::Cluster(cluster) => cluster.write_set_bytes(),
+        }
+    }
+    fn acquire(
+        &self,
+        txn: TxnId,
+        key: LockKey,
+        mode: LockMode,
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError> {
+        match self {
+            Self::Local { locks, .. } => locks.acquire(txn, key, mode, deadline, cancel)?,
+            Self::Cluster(cluster) => cluster
+                .gateway_locks()
+                .acquire(txn, key, mode, deadline, cancel)?,
+        }
+        Ok(())
+    }
+    fn release_all(&self, txn: TxnId) {
+        match self {
+            Self::Local { locks, .. } => locks.release_all(txn),
+            Self::Cluster(cluster) => cluster.release_all(txn),
+        }
+    }
+}
+fn snapshot_view<'a>(services: &'a TxnServices, snapshot: &'a Option<Snapshot>) -> &'a dyn KvRead {
+    match (services, snapshot) {
+        (TxnServices::Local { seq, .. }, _) => seq.kv(),
+        (TxnServices::Cluster(_), Some(Snapshot::Cluster { reader, .. })) => reader.as_ref(),
+        (TxnServices::Cluster(_), _) => &NO_SNAPSHOT,
+    }
+}
 pub(crate) struct Transaction {
-    seq: Arc<Sequencer>,
-    locks: Arc<LockManager>,
+    services: TxnServices,
     id: TxnId,
     isolation: Isolation,
-    snapshot: Option<SnapshotHandle>,
+    snapshot: Option<Snapshot>,
+    /// The last failure to obtain a statement timestamp (cluster only).
+    snapshot_error: Option<TxnError>,
     writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
     catalog_generation: u64,
     features_or: u64,
@@ -167,7 +377,7 @@ pub(crate) struct Transaction {
     reads: ReadSet,
     /// The transaction snapshot, set aside while FK crosscheck reads run at the
     /// latest committed state (GD-0075 R5-76); see `begin_latest`.
-    set_aside: Option<SnapshotHandle>,
+    set_aside: Option<Snapshot>,
     validation_config: ValidationConfig,
 }
 impl Transaction {
@@ -177,12 +387,22 @@ impl Transaction {
         id: TxnId,
         isolation: Isolation,
     ) -> Self {
+        Self::begin_with(
+            TxnServices::Local {
+                seq: seq.clone(),
+                locks: locks.clone(),
+            },
+            id,
+            isolation,
+        )
+    }
+    pub(crate) fn begin_with(services: TxnServices, id: TxnId, isolation: Isolation) -> Self {
         let mut txn = Self {
-            seq: seq.clone(),
-            locks: locks.clone(),
+            services,
             id,
             isolation,
             snapshot: None,
+            snapshot_error: None,
             writes: BTreeMap::new(),
             features_or: 0,
             minimum_subversion: 0,
@@ -323,20 +543,44 @@ impl Transaction {
     }
     pub(crate) fn begin_statement(&mut self) {
         if self.isolation == Isolation::ReadCommitted {
-            self.snapshot = Some(self.seq.snapshot());
+            // A failed cluster timestamp leaves no snapshot: reads then fail rather
+            // than run at an older timestamp.
+            self.snapshot = None;
+            let _ = self.try_snapshot_ts();
         }
     }
-    pub(crate) fn snapshot_ts(&mut self) -> Ts {
+    fn try_snapshot_ts(&mut self) -> Result<Ts, TxnError> {
         if self.snapshot.is_none() {
-            self.snapshot = Some(self.seq.snapshot());
+            match self.services.take_snapshot(self.id) {
+                Ok(snapshot) => {
+                    self.snapshot = Some(snapshot);
+                    self.snapshot_error = None;
+                }
+                Err(error) => {
+                    self.snapshot_error = Some(error.clone());
+                    return Err(error);
+                }
+            }
         }
-        self.snapshot.as_ref().unwrap().ts()
+        Ok(self.snapshot.as_ref().unwrap().ts())
+    }
+    /// Infallible for Local. In a cluster, an oracle failure returns Ts(0) with no
+    /// snapshot; every read then fails and `snapshot_error` reports the cause.
+    pub(crate) fn snapshot_ts(&mut self) -> Ts {
+        self.try_snapshot_ts().unwrap_or(Ts(0))
+    }
+    pub(crate) fn snapshot_error(&self) -> Option<&TxnError> {
+        self.snapshot_error.as_ref()
+    }
+    #[allow(dead_code)] // R5-43
+    pub(crate) fn services(&self) -> &TxnServices {
+        &self.services
     }
     pub(crate) fn set_validation_config(&mut self, config: ValidationConfig) {
         self.validation_config = config;
     }
     pub(crate) fn current_snapshot_ts(&self) -> Option<Ts> {
-        self.snapshot.as_ref().map(SnapshotHandle::ts)
+        self.snapshot.as_ref().map(Snapshot::ts)
     }
     pub(crate) fn read_set(&self) -> &ReadSet {
         &self.reads
@@ -354,8 +598,17 @@ impl Transaction {
         self.writes.get(&(Keyspace::Catalog, key.to_vec()))
     }
     pub(crate) fn catalog_latest_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
-        Ok(mvcc::latest_version(self.seq.kv(), Keyspace::Catalog, key)?
-            .and_then(|(_, value)| value))
+        let version = match &self.services {
+            TxnServices::Local { seq, .. } => {
+                mvcc::latest_version(seq.kv(), Keyspace::Catalog, key)?
+            }
+            TxnServices::Cluster(cluster) => {
+                // The reader holds only versions at or below a fresh oracle timestamp.
+                let ts = cluster.snapshot(self.id)?;
+                mvcc::latest_version(cluster.reader(ts).as_ref(), Keyspace::Catalog, key)?
+            }
+        };
+        Ok(version.and_then(|(_, value)| value))
     }
     pub(crate) fn catalog_writes(&self) -> impl Iterator<Item = (&Vec<u8>, &Option<Vec<u8>>)> {
         // Metadata reads must not walk the growing row/index overlay during COPY.
@@ -376,8 +629,7 @@ impl Transaction {
         {
             return Err(TxnError::Misuse);
         }
-        self.locks.acquire(self.id, key, mode, deadline, cancel)?;
-        Ok(())
+        self.services.acquire(self.id, key, mode, deadline, cancel)
     }
     /// Reads at the latest committed state until `end_latest`, recording no
     /// SERIALIZABLE reads; returns the transaction snapshot. FK checks at
@@ -387,7 +639,14 @@ impl Transaction {
     pub(crate) fn begin_latest(&mut self) -> Ts {
         let ts = self.snapshot_ts();
         debug_assert!(self.set_aside.is_none(), "nested latest-state reads");
-        self.set_aside = self.snapshot.replace(self.seq.snapshot());
+        match self.services.take_snapshot(self.id) {
+            Ok(latest) => self.set_aside = self.snapshot.replace(latest),
+            // A cluster oracle failure: no snapshot, so latest-state reads fail.
+            Err(error) => {
+                self.set_aside = self.snapshot.take();
+                self.snapshot_error = Some(error);
+            }
+        }
         ts
     }
     pub(crate) fn end_latest(&mut self) {
@@ -397,17 +656,23 @@ impl Transaction {
     }
     /// Whether a committed version of `key` is newer than `ts`.
     pub(crate) fn changed_since(&self, ks: Keyspace, key: &[u8], ts: Ts) -> Result<bool, TxnError> {
-        Ok(mvcc::latest_version(self.seq.kv(), ks, key)?.is_some_and(|(latest, _)| latest > ts))
+        let latest = match &self.services {
+            TxnServices::Local { seq, .. } => mvcc::latest_version(seq.kv(), ks, key)?,
+            TxnServices::Cluster(cluster) => {
+                mvcc::latest_version(&*cluster.reader(cluster.now()?), ks, key)?
+            }
+        };
+        Ok(latest.is_some_and(|(latest, _)| latest > ts))
     }
     pub(crate) fn get(&mut self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
-        let ts = self.snapshot_ts();
+        let ts = self.try_snapshot_ts()?;
         if self.isolation == Isolation::Serializable && self.set_aside.is_none() {
             self.reads.points.insert((ks, key.to_vec()));
         }
         if let Some(value) = self.writes.get(&(ks, key.to_vec())) {
             return Ok(value.clone());
         }
-        mvcc::read_at(self.seq.kv(), ks, key, ts)
+        mvcc::read_at(snapshot_view(&self.services, &self.snapshot), ks, key, ts)
     }
     /// SQL destination sentinel; acquire without choosing or inspecting a snapshot.
     pub(crate) fn lock_sql_sentinel(
@@ -419,12 +684,27 @@ impl Transaction {
         if !matches!(mode, LockMode::Shared | LockMode::Exclusive) {
             return Err(TxnError::Misuse);
         }
-        self.locks.acquire(self.id, LockKey::Row { table, pk: Vec::new() }, mode, None, cancel)?;
+        match &self.services {
+            TxnServices::Local { locks, .. } => {
+                locks.acquire(self.id, LockKey::Row { table, pk: Vec::new() }, mode, None, cancel)?
+            }
+            TxnServices::Cluster(cluster) => cluster.lock_sentinel(self.id, table, mode, cancel)?,
+        }
         Ok(())
     }
     #[cfg(test)]
+    pub(crate) fn local_seq(&self) -> &Arc<Sequencer> {
+        match &self.services {
+            TxnServices::Local { seq, .. } => seq,
+            TxnServices::Cluster(_) => panic!("cluster transaction has no local sequencer"),
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn sql_waiting_count(&self) -> usize {
-        self.locks.waiting_count()
+        match &self.services {
+            TxnServices::Local { locks, .. } => locks.waiting_count(),
+            TxnServices::Cluster(cluster) => cluster.gateway_locks().waiting_count(),
+        }
     }
     /// Selects the snapshot before waiting. Errors keep the transaction open; rollback or drop releases its locks.
     pub(crate) fn lock_for_write(
@@ -434,7 +714,7 @@ impl Transaction {
         deadline: Option<Instant>,
         cancel: &dyn Fn() -> bool,
     ) -> Result<WriteTarget, TxnError> {
-        let ts = self.snapshot_ts();
+        let ts = self.try_snapshot_ts()?;
         if key.len() < 8 {
             return Err(TxnError::Misuse);
         }
@@ -450,9 +730,13 @@ impl Transaction {
             },
             _ => return Err(TxnError::Misuse),
         };
-        self.locks
-            .acquire(self.id, lock, LockMode::Exclusive, deadline, cancel)?;
-        let latest = mvcc::latest_version(self.seq.kv(), ks, key)?;
+        let latest = match &self.services {
+            TxnServices::Local { seq, locks } => {
+                locks.acquire(self.id, lock, LockMode::Exclusive, deadline, cancel)?;
+                mvcc::latest_version(seq.kv(), ks, key)?
+            }
+            TxnServices::Cluster(cluster) => cluster.lock_key(self.id, ks, key, deadline, cancel)?,
+        };
         let changed = latest.as_ref().is_some_and(|(latest, _)| *latest > ts);
         let own = self.writes.get(&(ks, key.to_vec()));
         if self.isolation != Isolation::ReadCommitted && changed && own.is_none() {
@@ -463,7 +747,7 @@ impl Transaction {
         } else if self.isolation == Isolation::ReadCommitted {
             latest.and_then(|(_, v)| v)
         } else {
-            mvcc::read_at(self.seq.kv(), ks, key, ts)?
+            mvcc::read_at(snapshot_view(&self.services, &self.snapshot), ks, key, ts)?
         };
         self.locked.insert((ks, key.to_vec()));
         Ok(WriteTarget {
@@ -488,7 +772,7 @@ impl Transaction {
         key: Vec<u8>,
         value: Option<Vec<u8>>,
     ) -> Result<(), TxnError> {
-        self.snapshot_ts();
+        self.try_snapshot_ts()?;
         // Meta, Seq and Gc are unversioned: only the Sequencer worker writes them
         // (counters via write_counter, which ORs bit 8 in the same batch; DD-0068).
         if matches!(ks, Keyspace::Meta | Keyspace::Seq | Keyspace::Gc) {
@@ -538,7 +822,7 @@ impl Transaction {
             .ok_or(TxnError::WriteSetLimit)?;
         if size
             .checked_add(undo_bytes)
-            .is_none_or(|n| n > self.seq.write_set_bytes())
+            .is_none_or(|n| n > self.services.write_set_bytes())
         {
             return Err(TxnError::WriteSetLimit);
         }
@@ -566,7 +850,7 @@ impl Transaction {
         dir: Direction,
         limit: Option<usize>,
     ) -> Result<TxnScan<'a>, TxnError> {
-        let ts = self.snapshot_ts();
+        let ts = self.try_snapshot_ts()?;
         let start = start.map(<[u8]>::to_vec);
         let end = end.map(<[u8]>::to_vec);
         let empty = match (&start, &end) {
@@ -577,7 +861,7 @@ impl Transaction {
             _ => false,
         };
         let base = mvcc::VersionedRange::new(
-            self.seq.kv(),
+            snapshot_view(&self.services, &self.snapshot),
             ks,
             start.as_ref().map(Vec::as_slice),
             end.as_ref().map(Vec::as_slice),
@@ -681,11 +965,40 @@ impl Transaction {
             && self.minimum_subversion == 0
             && self.isolation != Isolation::Serializable
         {
-            let ts = self.seq.visible_ts();
+            let ts = match &self.services {
+                TxnServices::Local { seq, .. } => seq.visible_ts(),
+                TxnServices::Cluster(cluster) => match self.current_snapshot_ts() {
+                    Some(ts) => ts,
+                    None => cluster.snapshot(self.id)?,
+                },
+            };
             publish(ts)?;
             return Ok(ts);
         }
-        let snapshot = self.snapshot_ts();
+        let snapshot = self.try_snapshot_ts()?;
+        if let TxnServices::Cluster(cluster) = &self.services {
+            // A fenced guard compares against one node's visible timestamp,
+            // which a cluster does not have; guarded DDL arrives with Phase 11.
+            if let Some(guard) = &guard {
+                if guard.is_fenced() {
+                    return Err(TxnError::Unsupported);
+                }
+                guard.decide().map_err(TxnError::Guard)?;
+            }
+            // Drop releases every range lock after the commit returns.
+            let ts = cluster.commit(
+                self.id,
+                ClusterCommit {
+                    isolation: self.isolation,
+                    snapshot,
+                    writes: std::mem::take(&mut self.writes),
+                    features_or: self.features_or,
+                    raw: std::mem::take(&mut self.raw),
+                },
+            )?;
+            publish(ts)?;
+            return Ok(ts);
+        }
         let validator = (self.isolation == Isolation::Serializable).then(|| {
             Validator::new(
                 std::mem::take(&mut self.reads),
@@ -709,9 +1022,12 @@ impl Transaction {
                 ) as _
             }),
         };
+        let TxnServices::Local { seq, .. } = &self.services else {
+            unreachable!("cluster commits returned above");
+        };
         let ts = match guard {
-            Some(guard) => self.seq.submit_guarded(request, guard)?,
-            None => self.seq.submit(request)?,
+            Some(guard) => seq.submit_guarded(request, guard)?,
+            None => seq.submit(request)?,
         };
         publish(ts)?;
         Ok(ts)
@@ -720,7 +1036,7 @@ impl Transaction {
 }
 impl Drop for Transaction {
     fn drop(&mut self) {
-        self.locks.release_all(self.id);
+        self.services.release_all(self.id);
         self.snapshot.take();
     }
 }

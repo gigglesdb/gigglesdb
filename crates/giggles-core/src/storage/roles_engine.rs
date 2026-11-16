@@ -11,7 +11,7 @@ use crate::storage::{
     engine::{
         catalog::CatalogParts,
         catalog_codec::CatalogKind,
-        kv::{Direction, Keyspace, Kv},
+        kv::{Direction, Keyspace},
         locks::{LockKey, LockMode},
         txn::{Isolation, SerializationReason, Transaction, TxnError},
     },
@@ -226,7 +226,7 @@ pub(super) fn write<T>(
 /// Keep table authority in the same DDL commit as renames, drops and name reuse.
 pub(crate) fn reconcile_tables(
     txn: &mut Transaction,
-    kv: &Kv,
+    kv: &dyn crate::storage::engine::kv::KvRead,
     old: &CatalogParts,
     new: &CatalogParts,
     deadline: Option<Instant>,

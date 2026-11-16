@@ -1,0 +1,334 @@
+//! An in-process cluster for gateway tests (GD-0075 Track C).
+//!
+//! Real range engines (Track A) over one shared `RangeStore`, with one sink per range that
+//! applies each batch directly (one replica, no Raft) and a fixed route table. Only the parts
+//! Track B owns are stood in for: routing (the descriptors never change) and replication. Every
+//! read, lock, commit, prepare, finalize, home record, oracle timestamp, lease and sequence is
+//! served by the landed engine code.
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
+
+use crate::storage::range::RangeStore;
+use crate::storage::range::engine::{EngineConfig, RangeEngines};
+use crate::storage::range_api::{
+    ClusterTxnId, DeadlockProbe, Epoch, GatewayPeer, GatewayService, HomeOp, HomeReply, LeaseKind,
+    LockGrant, LockRequest, Outcome, RangeClient, RangeDescriptor, RangeEngineOpener, RangeError,
+    RangeId, RangeService, RangeSpace, RangeWrite, ReadPage, ReadRequest, ReplicaDesc, ReplicaRole,
+    SequenceOp, SequenceReply, SystemService, Timestamp, TsOracle, first_user_key, range_key,
+};
+use crate::storage::replicated::{AppliedPosition, BatchSink, ReplicateError};
+
+/// A temporary directory removed on drop.
+struct Dir(PathBuf);
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// One range's replication stand-in: applies batches in order, one at a time.
+struct Sink {
+    store: Arc<RangeStore>,
+    range: RangeId,
+    order: Mutex<()>,
+}
+impl BatchSink for Sink {
+    fn replicate(&self, encoded_batch: Vec<u8>) -> Result<(), ReplicateError> {
+        let _order = self.order.lock().unwrap_or_else(|p| p.into_inner());
+        let index = self
+            .store
+            .applied(self.range)
+            .map_err(|e| ReplicateError::Unavailable(format!("{e:?}")))?
+            .map_or(1, |p| p.index + 1);
+        self.store
+            .apply(
+                self.range,
+                &encoded_batch,
+                AppliedPosition { index, term: 1 },
+            )
+            .map_err(|e| ReplicateError::Unavailable(format!("{e:?}")))?;
+        Ok(())
+    }
+}
+
+/// The oracle every engine uses: the system range's, wherever it is open.
+struct SystemOracle(Weak<RangeEngines>);
+impl TsOracle for SystemOracle {
+    fn next(&self, n: u32) -> Result<Timestamp, RangeError> {
+        self.0
+            .upgrade()
+            .and_then(|engines| engines.system())
+            .ok_or(RangeError::NotLeader { hint: None })?
+            .next(n)
+    }
+}
+
+/// Test engine settings: short leases and waits.
+pub(crate) fn engine_config() -> EngineConfig {
+    EngineConfig {
+        lease: Duration::from_secs(2),
+        read_wait: Duration::from_secs(2),
+        sweep: Duration::from_millis(50),
+        ..EngineConfig::default()
+    }
+}
+
+pub(crate) struct LocalCluster {
+    _dir: Dir,
+    engines: Arc<RangeEngines>,
+    oracle: Arc<SystemOracle>,
+    descriptors: Vec<RangeDescriptor>,
+    sinks: HashMap<RangeId, Arc<Sink>>,
+    services: Mutex<HashMap<RangeId, Arc<dyn RangeService>>>,
+    /// Lock-table generation of each range's current engine (incremented per open).
+    generations: Mutex<HashMap<RangeId, u64>>,
+    /// Gateway deadlock services by node, for `GatewayPeer`.
+    gateways: Mutex<HashMap<u64, Weak<dyn GatewayService>>>,
+}
+
+impl LocalCluster {
+    /// A cluster whose user keyspace is split before each of `splits` (range keys, ascending,
+    /// each above `first_user_key()`): the system range, then one range per interval.
+    pub(crate) fn new(splits: &[Vec<u8>]) -> Arc<Self> {
+        Self::with_config(splits, engine_config())
+    }
+
+    pub(crate) fn with_config(splits: &[Vec<u8>], config: EngineConfig) -> Arc<Self> {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let dir = Dir(std::env::temp_dir().join(format!(
+            "gateway-cluster-{:032x}",
+            u128::from_be_bytes(nonce)
+        )));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let store = Arc::new(RangeStore::create(dir.0.join("db"), [9; 16]).unwrap());
+        let replicas = vec![ReplicaDesc {
+            node: 1,
+            role: ReplicaRole::Voter,
+        }];
+        let mut bounds = vec![Vec::new(), first_user_key()];
+        bounds.extend(splits.iter().cloned());
+        let descriptors: Vec<RangeDescriptor> = bounds
+            .iter()
+            .enumerate()
+            .map(|(i, start)| RangeDescriptor {
+                id: RangeId(i as u64 + 1),
+                epoch: Epoch(1),
+                start: start.clone(),
+                end: bounds.get(i + 1).cloned(),
+                replicas: replicas.clone(),
+            })
+            .collect();
+        for descriptor in &descriptors {
+            store.create_range(descriptor).unwrap();
+        }
+        let engines = Arc::new_cyclic(|weak: &Weak<RangeEngines>| {
+            RangeEngines::new(store.clone(), Arc::new(SystemOracle(weak.clone())), config)
+        });
+        let sinks = descriptors
+            .iter()
+            .map(|d| {
+                (
+                    d.id,
+                    Arc::new(Sink {
+                        store: store.clone(),
+                        range: d.id,
+                        order: Mutex::new(()),
+                    }),
+                )
+            })
+            .collect();
+        let cluster = Arc::new(Self {
+            _dir: dir,
+            oracle: Arc::new(SystemOracle(Arc::downgrade(&engines))),
+            engines,
+            descriptors,
+            sinks,
+            services: Mutex::new(HashMap::new()),
+            generations: Mutex::new(HashMap::new()),
+            gateways: Mutex::new(HashMap::new()),
+        });
+        // Engines resolve prepared records and run home recovery through this cluster.
+        let client: Weak<dyn RangeClient> = Arc::downgrade(&cluster) as Weak<dyn RangeClient>;
+        cluster.engines.set_client(client);
+        // The system range opens first: every engine's open takes an oracle timestamp.
+        for descriptor in &cluster.descriptors {
+            cluster.restart(descriptor.id);
+        }
+        cluster
+    }
+
+    /// The range holding `key` of `space`.
+    pub(crate) fn range_of(&self, space: RangeSpace, key: &[u8]) -> RangeId {
+        self.descriptor_for(&range_key(space, key)).unwrap().id
+    }
+
+    /// A new leader term for `range`: its engine is closed and reopened, so locks of
+    /// transactions that have not prepared are gone and prepared records are re-installed.
+    pub(crate) fn restart(&self, range: RangeId) {
+        let descriptor = self
+            .descriptors
+            .iter()
+            .find(|d| d.id == range)
+            .expect("known range")
+            .clone();
+        self.services.lock().unwrap().remove(&range);
+        let generation = {
+            let mut generations = self.generations.lock().unwrap();
+            let generation = generations.entry(range).or_insert(0);
+            *generation += 1;
+            *generation
+        };
+        let service = self
+            .engines
+            .open(descriptor, self.sinks[&range].clone(), generation)
+            .expect("open range engine");
+        self.services.lock().unwrap().insert(range, service);
+    }
+
+    /// Takes `range`'s leader away: every call to it fails NotLeader until `restart`.
+    pub(crate) fn stop(&self, range: RangeId) {
+        self.services.lock().unwrap().remove(&range);
+        self.engines.close(range);
+    }
+
+    /// Registers a gateway's deadlock service under its node id (stands in for B's wire).
+    pub(crate) fn register_gateway(&self, node: u64, service: Arc<dyn GatewayService>) {
+        // Weak: the gateway's services own the detector; a dropped gateway stops answering.
+        self.gateways
+            .lock()
+            .unwrap()
+            .insert(node, Arc::downgrade(&service));
+    }
+
+    fn service(&self, range: RangeId) -> Result<Arc<dyn RangeService>, RangeError> {
+        self.services
+            .lock()
+            .unwrap()
+            .get(&range)
+            .cloned()
+            .ok_or(RangeError::NotLeader { hint: None })
+    }
+
+    fn gateway(&self, node: u64) -> Result<Arc<dyn GatewayService>, RangeError> {
+        self.gateways
+            .lock()
+            .unwrap()
+            .get(&node)
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| RangeError::Unavailable(format!("no gateway {node}")))
+    }
+}
+
+impl RangeClient for LocalCluster {
+    fn descriptor_for(&self, range_key: &[u8]) -> Result<RangeDescriptor, RangeError> {
+        self.descriptors
+            .iter()
+            .find(|d| d.contains(range_key))
+            .cloned()
+            .ok_or_else(|| RangeError::Corrupt("no range holds the key".into()))
+    }
+    fn invalidate(&self, _: &RangeDescriptor) {}
+    fn read(&self, req: ReadRequest) -> Result<ReadPage, RangeError> {
+        self.service(req.range)?.read(req)
+    }
+    fn lock(&self, req: LockRequest) -> Result<LockGrant, RangeError> {
+        self.service(req.range)?.lock(req)
+    }
+    fn blockers(&self, range: RangeId, txn: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError> {
+        self.service(range)?.blockers(txn)
+    }
+    fn cancel_wait(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError> {
+        self.service(range)?.cancel_wait(txn)
+    }
+    fn release(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError> {
+        self.service(range)?.release(txn)
+    }
+    fn heartbeat(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError> {
+        self.service(range)?.heartbeat(txn)
+    }
+    fn commit(
+        &self,
+        range: RangeId,
+        epoch: Epoch,
+        txn: ClusterTxnId,
+        writes: Vec<RangeWrite>,
+        marker_xid: Option<u64>,
+        lock_generation: Option<u64>,
+    ) -> Result<Timestamp, RangeError> {
+        self.service(range)?
+            .commit(epoch, txn, writes, marker_xid, lock_generation)
+    }
+    fn prepare(
+        &self,
+        range: RangeId,
+        epoch: Epoch,
+        txn: ClusterTxnId,
+        home: RangeId,
+        writes: Vec<RangeWrite>,
+        lock_generation: Option<u64>,
+    ) -> Result<Timestamp, RangeError> {
+        self.service(range)?
+            .prepare(epoch, txn, home, writes, lock_generation)
+    }
+    fn finalize(
+        &self,
+        range: RangeId,
+        txn: ClusterTxnId,
+        outcome: Outcome,
+    ) -> Result<(), RangeError> {
+        self.service(range)?.finalize(txn, outcome)
+    }
+    fn home(&self, range: RangeId, epoch: Epoch, op: HomeOp) -> Result<HomeReply, RangeError> {
+        self.service(range)?.home(epoch, op)
+    }
+    fn oracle(&self) -> &dyn TsOracle {
+        self.oracle.as_ref()
+    }
+    fn lease(
+        &self,
+        kind: LeaseKind,
+        id: u64,
+        count: u64,
+    ) -> Result<std::ops::Range<u64>, RangeError> {
+        let system = self
+            .engines
+            .system()
+            .ok_or(RangeError::NotLeader { hint: None })?;
+        system.lease(kind, id, count)
+    }
+    fn sequence(
+        &self,
+        id: u64,
+        incarnation: u128,
+        op: SequenceOp,
+    ) -> Result<SequenceReply, RangeError> {
+        let system = self
+            .engines
+            .system()
+            .ok_or(RangeError::NotLeader { hint: None })?;
+        system.sequence(id, incarnation, op)
+    }
+}
+
+impl GatewayPeer for LocalCluster {
+    fn probe(&self, node: u64, probe: DeadlockProbe) -> Result<(), RangeError> {
+        self.gateway(node)?.probe(probe);
+        Ok(())
+    }
+    fn abort(&self, node: u64, victim: ClusterTxnId) -> Result<(), RangeError> {
+        self.gateway(node)?.abort(victim);
+        Ok(())
+    }
+    fn blockers(&self, node: u64, txn: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError> {
+        Ok(self.gateway(node)?.blockers(txn))
+    }
+    fn cancel_wait(&self, node: u64, txn: ClusterTxnId) -> Result<(), RangeError> {
+        self.gateway(node)?.cancel_wait(txn);
+        Ok(())
+    }
+}

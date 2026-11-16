@@ -1,14 +1,16 @@
 //! Transactional table metadata and snapshot-versioned catalog views.
+#[cfg(test)]
+use super::kv::Kv;
 use super::{
     catalog_codec::{self, CatalogKind},
     commit::Sequencer,
     hlc::Ts,
-    kv::{Direction, Keyspace, Kv, KvError},
+    kv::{Direction, Keyspace, KvError, KvRead},
     locks::{CATALOG_NAME_INDEX, LockKey, LockManager, LockMode},
     mvcc,
     once_guard::CommitGuard,
     seq::SequenceAllocator,
-    txn::{Isolation, SerializationReason, Transaction, TxnError},
+    txn::{Isolation, SerializationReason, Transaction, TxnError, TxnServices},
 };
 use crate::{
     CoreError,
@@ -248,7 +250,7 @@ pub(crate) struct CatalogCache {
     poisoned: bool,
 }
 impl CatalogCache {
-    pub(crate) fn load(kv: &Kv, visible: Ts) -> Result<Self, CoreError> {
+    pub(crate) fn load(kv: &dyn KvRead, visible: Ts) -> Result<Self, CoreError> {
         let mut cache = Self {
             versions: Vec::new(),
             snapshots: BTreeMap::new(),
@@ -302,21 +304,42 @@ impl CatalogCache {
 /// held while waiting for a transaction lock.
 pub(crate) struct Catalog {
     cache: Mutex<CatalogCache>,
-    sequencer: Arc<Sequencer>,
+    services: TxnServices,
     seq: Arc<SequenceAllocator>,
 }
 impl Catalog {
     pub(crate) fn open(
         sequencer: Arc<Sequencer>,
-        _locks: Arc<LockManager>,
+        locks: Arc<LockManager>,
         seq: Arc<SequenceAllocator>,
     ) -> Result<Self, CoreError> {
-        let cache = CatalogCache::load(sequencer.kv(), sequencer.visible_ts())?;
+        Self::open_with(
+            TxnServices::Local {
+                seq: sequencer,
+                locks,
+            },
+            seq,
+        )
+    }
+    /// A catalog over any transaction services; in a cluster it loads through the
+    /// routed reader (the catalog lives in the system range).
+    pub(crate) fn open_with(
+        services: TxnServices,
+        seq: Arc<SequenceAllocator>,
+    ) -> Result<Self, CoreError> {
+        let visible = services.visible_ts()?;
+        let cache = CatalogCache::load(&*services.read_view(visible), visible)?;
         Ok(Self {
             cache: Mutex::new(cache),
-            sequencer,
+            services,
             seq,
         })
+    }
+    fn prune_locked(&self, cache: &mut CatalogCache) -> Result<(), TxnError> {
+        // Read visible FIRST: a newly registered snapshot cannot be older than it.
+        let visible = self.services.visible_ts()?;
+        cache.prune(self.services.oldest_active(), visible);
+        Ok(())
     }
 
     fn check(&self) -> Result<(), TxnError> {
@@ -345,6 +368,9 @@ impl Catalog {
             .lock()
             .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
         let ts = txn.snapshot_ts();
+        if let Some(error) = txn.snapshot_error() {
+            return Err(error.clone().into());
+        }
         self.snapshot_locked(&mut cache, txn, ts)
     }
 
@@ -363,7 +389,7 @@ impl Catalog {
         let ts = match txn.current_snapshot_ts() {
             Some(ts) => ts,
             None => {
-                pin = self.sequencer.snapshot();
+                pin = self.services.pin()?;
                 pin.ts()
             }
         };
@@ -385,7 +411,7 @@ impl Catalog {
         let ts = match txn.current_snapshot_ts() {
             Some(ts) => ts,
             None => {
-                pin = self.sequencer.snapshot();
+                pin = self.services.pin()?;
                 pin.ts()
             }
         };
@@ -410,14 +436,14 @@ impl Catalog {
         cache.ensure_live().map_err(CoreError::from)?;
         // Acquisition also reclaims derived versions after a long-lived reader
         // leaves, even when subsequent commits contain no catalog writes.
-        cache.prune(self.sequencer.oldest_active(), self.sequencer.visible_ts());
+        self.prune_locked(cache)?;
         let end = cache
             .versions
             .partition_point(|(version, _)| *version <= ts);
         let Some(index) = end.checked_sub(1) else {
             // Preserve the existing old-snapshot fallback. Do not invent a
             // committed catalog-version key for a view loaded at a data timestamp.
-            let view = load_view(self.sequencer.kv(), ts)?;
+            let view = load_view(&*self.services.read_view(ts), ts)?;
             return Ok(Arc::new(CatalogSnapshot::new(&overlay_view(
                 &view,
                 txn.catalog_writes(),
@@ -478,7 +504,7 @@ impl Catalog {
         }
         super::super::roles::engine::reconcile_tables(
             txn,
-            self.sequencer.kv(),
+            &*self.services.latest_view()?,
             old,
             new,
             deadline,
@@ -640,7 +666,7 @@ impl Catalog {
         new.tables.insert(entry.def.name.clone(), entry.def.clone());
         super::super::roles::engine::reconcile_tables(
             txn,
-            self.sequencer.kv(),
+            &*self.services.latest_view()?,
             &old,
             &new,
             deadline,
@@ -671,7 +697,7 @@ impl Catalog {
                 let view = match cache.view_at(snapshot) {
                     Some(view) => view,
                     None => {
-                        cache.publish(snapshot, load_view(self.sequencer.kv(), snapshot)?);
+                        cache.publish(snapshot, load_view(&*self.services.read_view(snapshot), snapshot)?);
                         cache.view_at(snapshot).unwrap()
                     }
                 };
@@ -850,7 +876,7 @@ impl Catalog {
         // Reject limit/corruption before committing anything durably.
         overlay_view(latest, txn.catalog_writes()).map_err(commit_error)?;
         finish(txn, guard, |ts| {
-            let view = match load_view(self.sequencer.kv(), ts) {
+            let view = match load_view(&*self.services.read_view(ts), ts) {
                 Ok(view) => view,
                 Err(_) => {
                     // Durability already succeeded. Never expose the previous
@@ -860,8 +886,7 @@ impl Catalog {
                 }
             };
             cache.publish(ts, view);
-            cache.prune(self.sequencer.oldest_active(), self.sequencer.visible_ts());
-            Ok(())
+            self.prune_locked(&mut cache)
         })
     }
 
@@ -871,8 +896,7 @@ impl Catalog {
             .lock()
             .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
         cache.ensure_live().map_err(CoreError::from)?;
-        cache.prune(self.sequencer.oldest_active(), self.sequencer.visible_ts());
-        Ok(())
+        self.prune_locked(&mut cache).map_err(CoreError::from)
     }
     #[cfg(test)]
     pub(crate) fn cache_versions(&self) -> Vec<Ts> {
@@ -919,7 +943,7 @@ fn decode_id(value: &[u8]) -> Result<u64, CoreError> {
     }
     Ok(id)
 }
-fn load_view(kv: &Kv, snapshot: Ts) -> Result<CatalogView, CoreError> {
+fn load_view(kv: &dyn KvRead, snapshot: Ts) -> Result<CatalogView, CoreError> {
     let mut view = CatalogView::default();
     let mut names = BTreeMap::new();
     let records = mvcc::VersionedRange::new(

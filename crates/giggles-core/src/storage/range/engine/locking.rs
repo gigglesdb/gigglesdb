@@ -3,13 +3,13 @@ use std::time::{Duration, Instant};
 
 use super::{RangeEngine, TxnEntry, lock_error, txn_id};
 use crate::storage::engine::{
-    locks::{LockKey, LockMode},
+    locks::{LockError, LockKey, LockMode},
     mvcc,
 };
 use crate::storage::range::keys::keyspace_of;
 use crate::storage::range_api::{
-    ClusterTxnId, LockGrant, LockRequest, LockTarget, RangeError, RangeLockMode, RangeSpace,
-    Timestamp, range_key,
+    ClusterTxnId, LockGrant, LockRequest, LockTarget, RangeError, RangeId, RangeLockMode,
+    RangeSpace, Timestamp, range_key,
 };
 
 impl RangeEngine {
@@ -89,15 +89,39 @@ impl RangeEngine {
             .timeout_ms
             .map(|ms| Instant::now() + Duration::from_millis(ms));
         let cancel = || self.is_closed() || self.lease_lost(req.txn);
-        self.locks
-            .acquire(txn_id(req.txn), key, mode, deadline, &cancel)
-            .map_err(|error| {
-                if self.is_closed() || self.lease_lost(req.txn) {
-                    RangeError::Aborted("locks lost while waiting".into())
-                } else {
-                    lock_error(error)
+        loop {
+            // R5-53: with a client, wait at most `resolve_after` at a time and resolve the
+            // prepared holders of the key between attempts.
+            let client = self.client();
+            let attempt = match client {
+                Some(_) => {
+                    let step = Instant::now() + self.config.resolve_after;
+                    Some(deadline.map_or(step, |deadline| deadline.min(step)))
                 }
-            })?;
+                None => deadline,
+            };
+            let error =
+                match self
+                    .locks
+                    .acquire(txn_id(req.txn), key.clone(), mode, attempt, &cancel)
+                {
+                    Ok(()) => break,
+                    Err(error) => error,
+                };
+            if self.is_closed() || self.lease_lost(req.txn) {
+                return Err(RangeError::Aborted("locks lost while waiting".into()));
+            }
+            match client {
+                Some(client)
+                    if error == LockError::Timeout
+                        && deadline.is_none_or(|deadline| Instant::now() < deadline) =>
+                {
+                    let holders = self.prepared_holders(&key, mode);
+                    self.resolve_blockers(&*client, &holders);
+                }
+                _ => return Err(lock_error(error)),
+            }
+        }
         if self.lease_lost(req.txn) {
             // The sweep expired the lease while this request waited: give the lock back.
             self.locks.release_all(txn_id(req.txn));
@@ -116,6 +140,23 @@ impl RangeEngine {
             latest,
             generation: self.generation,
         })
+    }
+
+    /// Prepared transactions holding `key` in a mode that conflicts with `mode`. A prepared
+    /// transaction never waits, so these are the prepared ones among the request's blockers
+    /// (`LockManager::blockers` is empty once a timed-out request has left the queue).
+    fn prepared_holders(&self, key: &LockKey, mode: LockMode) -> Vec<(ClusterTxnId, RangeId)> {
+        self.state()
+            .prepared
+            .iter()
+            .filter(|(_, record)| {
+                record.locks.iter().any(|(held, held_mode)| {
+                    held == key
+                        && (mode == LockMode::Exclusive || *held_mode == LockMode::Exclusive)
+                })
+            })
+            .map(|(txn, record)| (*txn, record.home))
+            .collect()
     }
 
     /// The state, once no commit or prepare of `txn` is running.

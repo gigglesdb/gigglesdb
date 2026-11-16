@@ -1340,7 +1340,7 @@ impl Admin {
                 u128::from_be_bytes(db.meta.domain),
                 0,
                 0,
-                db.origin_at(db.sequencer.visible_ts())?,
+                db.origin_at(db.visible_ts()?)?,
             ));
         }
         self.inner

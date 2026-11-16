@@ -13,10 +13,10 @@ use std::ops::Bound;
 use std::sync::atomic::AtomicU64;
 
 /// Applies proposals to one range in log order, as its Raft group would.
-struct Sink {
-    store: Arc<RangeStore>,
-    range: RangeId,
-    fail: AtomicBool,
+pub(super) struct Sink {
+    pub(super) store: Arc<RangeStore>,
+    pub(super) range: RangeId,
+    pub(super) fail: AtomicBool,
 }
 impl BatchSink for Sink {
     fn replicate(&self, encoded_batch: Vec<u8>) -> Result<(), ReplicateError> {
@@ -41,23 +41,23 @@ impl BatchSink for Sink {
     }
 }
 
-struct Oracle(AtomicU64);
+pub(super) struct Oracle(pub(super) AtomicU64);
 impl TsOracle for Oracle {
     fn next(&self, n: u32) -> Result<Timestamp, RangeError> {
         Ok(Timestamp(self.0.fetch_add(u64::from(n), Ordering::SeqCst)))
     }
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     _dir: Dir,
-    store: Arc<RangeStore>,
-    oracle: Arc<Oracle>,
-    sink: Arc<Sink>,
+    pub(super) store: Arc<RangeStore>,
+    pub(super) oracle: Arc<Oracle>,
+    pub(super) sink: Arc<Sink>,
 }
-const B: RangeId = RangeId(2);
+pub(super) const B: RangeId = RangeId(2);
 const T: u64 = SPLIT_TABLE;
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let dir = Dir::new("range-engine");
     let store = Arc::new(two_ranges(&dir));
     let sink = Arc::new(Sink {
@@ -72,19 +72,22 @@ fn fixture() -> Fixture {
         sink,
     }
 }
-fn config() -> EngineConfig {
+pub(super) fn config() -> EngineConfig {
     EngineConfig {
         lease: Duration::from_millis(300),
         read_wait: Duration::from_millis(400),
         sweep: Duration::from_millis(50),
+        resolve_after: Duration::from_millis(50),
+        recovery: RecoveryConfig::default(),
+        recovery_tick: Duration::from_millis(20),
     }
 }
 impl Fixture {
-    fn open(&self) -> Arc<RangeEngine> {
+    pub(super) fn open(&self) -> Arc<RangeEngine> {
         self.open_at(1)
     }
     /// Opens an engine of B with lock generation `generation`.
-    fn open_at(&self, generation: u64) -> Arc<RangeEngine> {
+    pub(super) fn open_at(&self, generation: u64) -> Arc<RangeEngine> {
         let descriptor = self.store.descriptor(B).unwrap().unwrap();
         RangeEngine::open(
             &self.store,
@@ -97,18 +100,18 @@ impl Fixture {
         .unwrap()
     }
 }
-fn epoch(e: &RangeEngine) -> Epoch {
+pub(super) fn epoch(e: &RangeEngine) -> Epoch {
     e.descriptor.epoch
 }
-fn txn(n: u64) -> ClusterTxnId {
+pub(super) fn txn(n: u64) -> ClusterTxnId {
     ClusterTxnId::new(1, n)
 }
-fn key(n: u64) -> Vec<u8> {
+pub(super) fn key(n: u64) -> Vec<u8> {
     let mut key = T.to_be_bytes().to_vec();
     key.extend_from_slice(&n.to_be_bytes());
     key
 }
-fn lock(
+pub(super) fn lock(
     e: &RangeEngine,
     t: ClusterTxnId,
     n: u64,
@@ -127,7 +130,7 @@ fn lock(
         timeout_ms,
     })
 }
-fn write(n: u64, value: &[u8]) -> RangeWrite {
+pub(super) fn write(n: u64, value: &[u8]) -> RangeWrite {
     RangeWrite {
         space: RangeSpace::Rows,
         key: key(n),
@@ -145,7 +148,7 @@ fn commit(e: &RangeEngine, t: ClusterTxnId, n: u64, value: &[u8]) -> Timestamp {
     )
     .unwrap()
 }
-fn read_all(
+pub(super) fn read_all(
     e: &RangeEngine,
     at: Timestamp,
     dir: ReadDirection,

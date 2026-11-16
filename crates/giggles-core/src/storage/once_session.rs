@@ -27,6 +27,8 @@ impl SqlSession {
             inner.sql_transactions.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < relational::MAX_TRANSACTIONS).then_some(n + 1)
             }).map_err(|_| CoreError::Busy)?;
+            // Native once sessions lock the local kernel store (no cluster form yet).
+            db.require_local()?;
             // Install immediately so every fallible setup path uses normal rollback.
             self.v2_transaction = Some(db.begin(Isolation::RepeatableRead));
             let result = (|| {

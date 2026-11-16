@@ -5,7 +5,7 @@
 //! Seal the participant set, prepare every participant in parallel and record each vote at home,
 //! take a fresh commit timestamp after every vote, decide at home, and only then acknowledge.
 //! Every home operation after Open carries the incarnation Open returned (R5-50m bug B2).
-mod deadlock;
+pub(super) mod deadlock; // Track C: the gateway (cluster::txn) runs the detector.
 #[cfg(test)]
 mod tests;
 

@@ -8,6 +8,7 @@ impl Admin {
         let inner = &self.inner;
         let Backend::V2(db) = &inner.backend else { unreachable!() };
         let _ticket = inner.enter()?;
+        db.require_local()?;
         let mut txn = db.begin(Isolation::RepeatableRead);
         let mut kernel = Kernel::lock(&mut txn, &db.kv, None, &|| crate::cancellation::check().is_err())?;
         let presence = Kernel::probe(kernel.transaction())?;

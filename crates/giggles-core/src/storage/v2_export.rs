@@ -89,6 +89,7 @@ fn export_inner(
     // Register with GC first, then pin a physical snapshot. Its durable commit
     // timestamp and all unversioned feature/counter records are one atomic view.
     // The earlier MVCC pin protects every version needed by that later view.
+    db.require_local()?;
     let _pin = db.sequencer.snapshot();
     let read = db.kv.snapshot()?;
     let features = read

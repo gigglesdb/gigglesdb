@@ -29,21 +29,9 @@ fn definition(s: &State, id: u64) -> R<SequenceDef> {
         .ok_or(E::UnknownTable)
 }
 fn counter<'a>(s: &'a mut State, id: u64, def: &SequenceDef) -> &'a mut SeqCounter {
-    let entry = s.seq.entry(id).or_insert_with(|| SeqCounter {
-        incarnation: def.incarnation,
-        last_value: def.start,
-        is_called: false,
-        log_hw: def.start,
-        stamp: 0,
-    });
+    let entry = s.seq.entry(id).or_insert_with(|| fresh(def));
     if entry.incarnation != def.incarnation {
-        *entry = SeqCounter {
-            incarnation: def.incarnation,
-            last_value: def.start,
-            is_called: false,
-            log_hw: def.start,
-            stamp: 0,
-        };
+        *entry = fresh(def);
     }
     entry
 }
@@ -70,10 +58,24 @@ pub(crate) fn next(s: &mut State, id: u64) -> R<i64> {
         .unwrap_or(0)
         .checked_add(1)
         .ok_or(E::Overflow)?;
-    let c = counter(s, id, &def);
+    advance(counter(s, id, &def), &def, stamp)
+}
+/// A counter that has handed out nothing yet.
+pub(crate) fn fresh(def: &SequenceDef) -> SeqCounter {
+    SeqCounter {
+        incarnation: def.incarnation,
+        last_value: def.start,
+        is_called: false,
+        log_hw: def.start,
+        stamp: 0,
+    }
+}
+/// nextval on one counter: the next value, with the recovery reservation `log_hw`
+/// moved ahead when the value leaves it.
+pub(crate) fn advance(c: &mut SeqCounter, def: &SequenceDef, stamp: u64) -> R<i64> {
     let was_called = c.is_called;
     let value = if was_called {
-        step(c.last_value, &def)?
+        step(c.last_value, def)?
     } else {
         c.last_value
     };
@@ -118,12 +120,15 @@ pub(crate) fn setval(s: &mut State, id: u64, value: i64, called: bool) -> R<i64>
         .unwrap_or(0)
         .checked_add(1)
         .ok_or(E::Overflow)?;
-    let c = counter(s, id, &def);
+    set(counter(s, id, &def), value, called, stamp);
+    Ok(value)
+}
+/// setval on one counter whose bounds the caller checked.
+pub(crate) fn set(c: &mut SeqCounter, value: i64, called: bool, stamp: u64) {
     c.last_value = value;
     c.is_called = called;
     c.log_hw = value;
     c.stamp = stamp;
-    Ok(value)
 }
 pub(crate) fn currval(values: &BTreeMap<(u64, u128), i64>, id: u64, incarnation: u128) -> R<i64> {
     values

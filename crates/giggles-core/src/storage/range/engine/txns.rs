@@ -6,6 +6,7 @@ use super::{RangeEngine, txn_error, txn_id};
 use crate::storage::engine::{
     codec,
     commit::{CommitRequest, RawOp},
+    content_check,
     hlc::Ts,
     kv::{Durability, Keyspace, WriteBatch},
     locks::{LockKey, LockMode},
@@ -16,6 +17,27 @@ use crate::storage::range::keys::{is_versioned, keyspace_of};
 use crate::storage::range_api::{
     ClusterTxnId, Epoch, Outcome, RangeError, RangeId, RangeSpace, RangeWrite, Timestamp, range_key,
 };
+
+/// Feature bits the catalog content of `writes` needs. A gateway's own feature bits never reach
+/// the range (the range interface carries none), so the leader derives the bits from the
+/// content its sequencer validates against them (design.md Changes, Track A open item (d)).
+fn derived_features(writes: &Writes) -> Result<u64, RangeError> {
+    let corrupt = |e: crate::storage::engine::meta::FormatError| {
+        RangeError::Corrupt(format!("{e:?}"))
+    };
+    let mut bits = 0;
+    for ((ks, key), value) in writes {
+        if *ks != Keyspace::Catalog {
+            continue;
+        }
+        bits |= content_check::required_bits_for_catalog_key(key).map_err(corrupt)?;
+        if let Some(value) = value {
+            bits |=
+                content_check::required_bits_for_catalog_value(key, value).map_err(corrupt)?;
+        }
+    }
+    Ok(bits)
+}
 
 /// Clears a transaction's busy mark when dropped.
 struct Busy<'a>(&'a RangeEngine, ClusterTxnId);
@@ -44,20 +66,37 @@ impl Drop for Reserved<'_> {
 
 impl RangeEngine {
     /// Marks `txn` busy (one commit or prepare at a time), after any running one ends. The
-    /// transaction must hold a lease here in this term.
-    fn begin(&self, txn: ClusterTxnId) -> Result<Begun<'_>, RangeError> {
+    /// transaction must hold a lease here in this term, unless every write is catalog-only.
+    fn begin(&self, txn: ClusterTxnId, writes: &[RangeWrite]) -> Result<Begun<'_>, RangeError> {
         let mut state = self.idle(txn);
         self.check_open()?;
         if let Some(record) = state.prepared.get(&txn) {
             return Ok(Begun::Prepared(record.at));
         }
         let expired = state.expired.contains(&txn);
+        let catalog_only = !writes.is_empty()
+            && writes
+                .iter()
+                .all(|w| matches!(w.space, RangeSpace::Catalog | RangeSpace::Kernel));
         match state.txns.get_mut(&txn) {
             Some(entry) => {
                 entry.busy = true;
                 Ok(Begun::Ready(Busy(self, txn)))
             }
             None if expired => Err(RangeError::Aborted("lock lease expired".into())),
+            // The system range holds no lockable target (design.md 1), so a DDL's catalog-only
+            // commit there needs no lease.
+            None if catalog_only => {
+                state.txns.insert(
+                    txn,
+                    super::TxnEntry {
+                        expires: std::time::Instant::now() + self.config.lease,
+                        prepared: false,
+                        busy: true,
+                    },
+                );
+                Ok(Begun::Ready(Busy(self, txn)))
+            }
             None => Err(RangeError::Aborted(
                 "transaction holds no locks here in this term".into(),
             )),
@@ -134,17 +173,18 @@ impl RangeEngine {
         self.check_open()?;
         self.check_epoch(epoch)?;
         self.check_generation(lock_generation)?;
-        let _busy = match self.begin(txn)? {
+        let _busy = match self.begin(txn, &writes)? {
             Begun::Ready(busy) => busy,
             Begun::Prepared(_) => {
                 return Err(RangeError::Aborted("transaction is prepared".into()));
             }
         };
         let writes = self.checked_writes(txn, writes)?;
+        let features_or = derived_features(&writes)?;
         let result = self.seq.submit(CommitRequest {
             snapshot: self.seq.visible_ts(),
             writes,
-            features_or: 0,
+            features_or,
             minimum_subversion: 0,
             raw: marker_xid
                 .map(|xid| RawOp::XactCommitted { xid })
@@ -172,7 +212,7 @@ impl RangeEngine {
         // A retry of a prepared transaction returns its p whatever its lock generation: the
         // prepare was accepted under a valid one and a new leader re-took its locks (Track D
         // rule (a)). A concurrent duplicate waits.
-        let _busy = match self.begin(txn) {
+        let _busy = match self.begin(txn, &writes) {
             Ok(Begun::Prepared(at)) => return Ok(Timestamp(at.0)),
             Ok(Begun::Ready(busy)) => {
                 self.check_generation(lock_generation)?;
@@ -184,6 +224,21 @@ impl RangeEngine {
             }
         };
         let writes = self.checked_writes(txn, writes)?;
+        // Finalize writes the versions without the sequencer: the bits their content needs
+        // are made durable first, here, through it.
+        let features_or = derived_features(&writes)?;
+        if features_or != 0 {
+            self.seq
+                .submit(CommitRequest {
+                    snapshot: self.seq.visible_ts(),
+                    writes: Writes::new(),
+                    features_or,
+                    minimum_subversion: 0,
+                    raw: Vec::new(),
+                    validation: None,
+                })
+                .map_err(txn_error)?;
+        }
         let locks = self.locks.held(txn_id(txn));
         let at = self
             .gate

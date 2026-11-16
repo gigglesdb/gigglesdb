@@ -1485,7 +1485,8 @@ fn commit_with_observed_validator(
         config,
     ));
     let check = validator.clone();
-    let result = t.seq.submit(CommitRequest {
+    let seq = t.local_seq().clone();
+    let result = seq.submit(CommitRequest {
         features_or: 0,
         minimum_subversion: 0,
         raw: Vec::new(),

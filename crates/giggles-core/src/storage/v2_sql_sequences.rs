@@ -37,6 +37,41 @@ pub(super) fn callback(
                 .map(relational::Value::Int)
                 .map_err(CoreError::Sql);
         }
+        if committed && let Some(services) = db.cluster_services() {
+            // A cluster gateway keeps no counter: the system range leader evaluates every
+            // nextval/setval of a committed sequence (GD-0075 R5-43, design.md Changes).
+            use crate::range_api::{SequenceOp, SequenceReply};
+            let op = match operation {
+                "nextval" => SequenceOp::Next,
+                "setval" => SequenceOp::Set {
+                    value: value.ok_or(CoreError::Sql(SqlError::Parameters))?,
+                    called,
+                },
+                _ => return Err(CoreError::Sql(SqlError::Unsupported)),
+            };
+            let reply = services
+                .client()
+                .sequence(id, def.incarnation, op)
+                .map_err(|e| {
+                    CoreError::from(engine::txn::TxnError::Kv(match e {
+                        crate::range_api::RangeError::Corrupt(m) => engine::kv::KvError::Corrupt(m),
+                        other => engine::kv::KvError::Io(other.to_string()),
+                    }))
+                })?;
+            let result = match reply {
+                SequenceReply::Value(result) => result,
+                SequenceReply::Gone => return Err(CoreError::Sql(SqlError::UnknownTable)),
+                SequenceReply::Limit => return Err(CoreError::Sql(SqlError::SequenceLimit)),
+                SequenceReply::OutOfRange => return Err(CoreError::Sql(SqlError::Overflow)),
+            };
+            if operation == "nextval" || called {
+                values
+                    .lock()
+                    .map_err(|_| CoreError::Fenced)?
+                    .insert((id, def.incarnation), result);
+            }
+            return Ok(relational::Value::Int(result));
+        }
         let mut state = empty(0);
         state.sql = image.clone();
         let mut pending = pending.lock().map_err(|_| CoreError::Fenced)?;

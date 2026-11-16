@@ -30,9 +30,12 @@ use crate::storage::engine::{
     meta::{RangeLocalKey, range_local_key},
 };
 use crate::storage::range_api::{
-    LeaseKind, RangeDescriptor, RangeError, SYSTEM_RANGE, SystemService, Timestamp, TsOracle,
+    LeaseKind, RangeDescriptor, RangeError, SYSTEM_RANGE, SequenceOp, SequenceReply,
+    SystemService, Timestamp, TsOracle,
 };
 use crate::storage::replicated::BatchSink;
+
+mod sequence;
 
 /// Default window: one second of milliseconds in the `ms << 16 | logical` layout.
 pub(crate) const WINDOW: u64 = 1000 << 16;
@@ -49,6 +52,11 @@ pub(crate) struct SystemRange {
     width: u64,
     /// Serializes lease read-advance-persist.
     leases: Mutex<()>,
+    /// SQL sequence counters handed out in this term (sequence.rs).
+    sequences: Mutex<sequence::Live>,
+    /// The system range engine's sequencer: counter reservations go through it, so the
+    /// range's feature bits have one owner (sequence.rs).
+    sequencer: std::sync::OnceLock<Arc<crate::storage::engine::commit::Sequencer>>,
     closed: AtomicBool,
     now_ms: Box<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -103,9 +111,16 @@ impl SystemRange {
             }),
             width: width.max(1),
             leases: Mutex::new(()),
+            sequences: Mutex::new(sequence::Live::new()),
+            sequencer: std::sync::OnceLock::new(),
             closed: AtomicBool::new(false),
             now_ms,
         })
+    }
+
+    /// Attaches the system range engine's sequencer of this term (set once by the opener).
+    pub(crate) fn attach_sequencer(&self, sequencer: Arc<crate::storage::engine::commit::Sequencer>) {
+        let _ = self.sequencer.set(sequencer);
     }
 
     /// Fences this term's services.
@@ -193,6 +208,15 @@ impl SystemService for SystemRange {
         self.write(batch)?;
         drop(leases);
         Ok(start..end)
+    }
+
+    fn sequence(
+        &self,
+        id: u64,
+        incarnation: u128,
+        op: SequenceOp,
+    ) -> Result<SequenceReply, RangeError> {
+        self.sequence_op(id, incarnation, op)
     }
 }
 

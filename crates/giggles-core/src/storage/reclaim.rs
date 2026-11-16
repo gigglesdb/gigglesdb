@@ -54,6 +54,10 @@ impl V2Db {
     }
 
     pub(crate) fn reclaim_storage(&self, limit: usize) -> Result<ReclaimStats, CoreError> {
+        // A cluster gateway holds no data: range leaders reclaim their own ranges.
+        if self.cluster_services().is_some() {
+            return Ok(ReclaimStats::default());
+        }
         #[cfg(test)]
         {
             RECLAIM_PASSES.set(RECLAIM_PASSES.get() + 1);

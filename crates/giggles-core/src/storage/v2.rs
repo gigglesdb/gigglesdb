@@ -25,6 +25,9 @@ pub(crate) struct V2Db {
     pub(super) reclaim_errors: AtomicU64,
     binding_fences: std::sync::Mutex<std::collections::BTreeMap<(u64, u64, u64), u64>>,
     next_txn: AtomicU64,
+    /// Set on a cluster gateway (GD-0075 R5-43): transactions, the catalog, allocators and
+    /// sequences go to range leaders, and `kv`/`sequencer` are fenced placeholders.
+    cluster: Option<Arc<dyn engine::txn::ClusterServices>>,
 }
 pub(super) fn format_error(error: engine::meta::FormatError) -> CoreError {
     match error {
@@ -137,14 +140,98 @@ impl V2Db {
             reclaim_errors: AtomicU64::new(0),
             binding_fences: Default::default(),
             next_txn: AtomicU64::new(1),
+            cluster: None,
         };
         db.reclaim_background()?;
         Ok(db)
     }
 
+    /// A gateway's database in a cluster (GD-0075 R5-43): it holds no data. Transactions use
+    /// `services` (oracle timestamps, range locks and commits), the catalog loads through the
+    /// routed reader from the system range, and object/row/xid ids and SQL sequences come from
+    /// the system range leader. The local store and sequencer exist only so code that has no
+    /// cluster branch fails loudly: the store is fenced, so every read or write of it fails.
+    /// Reclaim does not run here; range leaders own their data.
+    #[cfg(feature = "engine-rocksdb")]
+    pub(crate) fn cluster(
+        services: Arc<dyn engine::txn::ClusterServices>,
+        domain: [u8; 16],
+    ) -> Result<Self, CoreError> {
+        let kv = Arc::new(engine::kv::Kv::new(Arc::new(
+            engine::kv_mem::MemKv::new(),
+        )));
+        let sequencer = engine::commit::Sequencer::open(
+            kv.clone(),
+            Arc::new(engine::commit::SystemClock),
+            engine::commit::SequencerConfig::default(),
+        )?;
+        kv.fence();
+        let client = services.client();
+        let sequences = Arc::new(engine::seq::SequenceAllocator::leased(client, 0));
+        let xacts = engine::xact::XactIds::leased(sequences.clone());
+        let catalog = engine::catalog::Catalog::open_with(
+            engine::txn::TxnServices::Cluster(services.clone()),
+            sequences.clone(),
+        )?;
+        Ok(Self {
+            kv,
+            meta: engine::meta::MetaInfo {
+                stale_counters: Vec::new(),
+                family: 2,
+                subversion: engine::meta::CURRENT_SUBVERSION,
+                features: 0,
+                domain,
+                engine: "cluster".into(),
+                last_commit_ts: None,
+                gc_watermark: None,
+            },
+            sequencer,
+            locks: Arc::new(engine::locks::LockManager::new(Default::default())),
+            catalog,
+            rows: engine::rows::RowStore::new(sequences.clone()),
+            sequences,
+            xacts,
+            sql_counters: Default::default(),
+            reclaim: Default::default(),
+            reclaim_errors: AtomicU64::new(0),
+            binding_fences: Default::default(),
+            next_txn: AtomicU64::new(1),
+            cluster: Some(services),
+        })
+    }
+
+    /// The gateway services when this database is a cluster gateway.
+    pub(crate) fn cluster_services(&self) -> Option<&Arc<dyn engine::txn::ClusterServices>> {
+        self.cluster.as_ref()
+    }
+
+    /// Fails with Unsupported on a cluster gateway: for paths that read or write the local
+    /// store directly and have no cluster form yet.
+    pub(crate) fn require_local(&self) -> Result<(), CoreError> {
+        match self.cluster {
+            Some(_) => Err(CoreError::Unsupported),
+            None => Ok(()),
+        }
+    }
+
+    /// The newest visible timestamp: the local sequencer's, or a fresh oracle timestamp.
+    pub(crate) fn visible_ts(&self) -> Result<engine::hlc::Ts, CoreError> {
+        match &self.cluster {
+            Some(services) => Ok(services.now()?),
+            None => Ok(self.sequencer.visible_ts()),
+        }
+    }
+
     // F8a-3b routes v2 SQL sessions through this.
     #[allow(dead_code)]
     pub(crate) fn begin(&self, isolation: engine::txn::Isolation) -> engine::txn::Transaction {
+        if let Some(services) = &self.cluster {
+            return engine::txn::Transaction::begin_with(
+                engine::txn::TxnServices::Cluster(services.clone()),
+                services.next_txn_id(),
+                isolation,
+            );
+        }
         let id = self
             .next_txn
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -251,9 +338,10 @@ impl V2Db {
         let (catalog, epoch) = match txn {
             Some(txn) => (
                 self.catalog.metadata_snapshot(txn)?,
-                txn.current_snapshot_ts()
-                    .unwrap_or_else(|| self.sequencer.visible_ts())
-                    .0,
+                match txn.current_snapshot_ts() {
+                    Some(ts) => ts.0,
+                    None => self.visible_ts()?.0,
+                },
             ),
             None => {
                 committed = self.begin(engine::txn::Isolation::ReadCommitted);
@@ -266,9 +354,16 @@ impl V2Db {
     /// Older SQL-only v2 databases have no kernel image. When present, its
     /// existing metadata record carries restore provenance.
     pub(super) fn origin_at(&self, ts: engine::hlc::Ts) -> Result<Option<u128>, CoreError> {
-        let Some(bytes) =
-            engine::mvcc::read_at(self.kv.as_ref(), engine::kv::Keyspace::Kernel, &[0], ts)?
-        else {
+        let bytes = match &self.cluster {
+            Some(services) => engine::mvcc::read_at(
+                &*services.reader(ts),
+                engine::kv::Keyspace::Kernel,
+                &[0],
+                ts,
+            )?,
+            None => engine::mvcc::read_at(self.kv.as_ref(), engine::kv::Keyspace::Kernel, &[0], ts)?,
+        };
+        let Some(bytes) = bytes else {
             return Ok(None);
         };
         let metadata: super::Metadata = super::decode(&bytes)?;
