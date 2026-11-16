@@ -172,6 +172,7 @@ pub(crate) fn lookup_name(name: &str) -> Result<Show> {
         "default_table_access_method" => Ok(Show::DefaultTableAccessMethod),
         "server_version" => Ok(Show::ServerVersion),
         "server_encoding" => Ok(Show::ServerEncoding),
+        "giggles_capabilities" => Ok(Show::GigglesCapabilities),
         "server_version_num" => Ok(Show::ServerVersionNum),
         "max_identifier_length" => Ok(Show::MaxIdentifierLength),
         "block_size" => Ok(Show::BlockSize),
@@ -232,6 +233,7 @@ pub(crate) fn parse_database(sql: &str) -> Result<Option<Vec<Setting>>> {
         name,
         Show::ServerVersion
             | Show::ServerEncoding
+            | Show::GigglesCapabilities
             | Show::ServerVersionNum
             | Show::MaxIndexKeys
             | Show::TransactionIsolation
@@ -461,6 +463,7 @@ pub(crate) fn function_assignment(name: &str, value: &str, local: bool) -> Resul
         name,
         Show::ServerVersion
             | Show::ServerEncoding
+            | Show::GigglesCapabilities
             | Show::ServerVersionNum
             | Show::MaxIndexKeys
             | Show::TransactionIsolation

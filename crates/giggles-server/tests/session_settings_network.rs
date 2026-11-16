@@ -193,6 +193,50 @@ fn code(error: tokio_postgres::Error) -> String {
 }
 
 #[tokio::test]
+async fn build_identity_and_capabilities_agree_across_protocol_surfaces() {
+    let fixture = Fixture::new().await;
+    let client = fixture.client().await;
+    let capabilities = giggles_pg_catalog::CAPABILITIES;
+    for sql in [
+        "SHOW giggles_capabilities",
+        "SHOW GiGgLeS_CaPaBiLiTiEs",
+        "SELECT current_setting('giggles_capabilities')",
+        "SELECT pg_catalog.current_setting('GiGgLeS_CaPaBiLiTiEs')",
+        "SELECT current_setting('giggles_capabilities', true)",
+        "SELECT pg_catalog.current_setting('giggles_capabilities', false)",
+        "SELECT current_setting('giggles_capabilities') FROM pg_catalog.pg_roles LIMIT 1",
+        "SELECT pg_catalog.current_setting('GiGgLeS_CaPaBiLiTiEs', true) FROM pg_catalog.pg_roles LIMIT 1",
+        "SELECT setting FROM pg_catalog.pg_settings WHERE name = 'giggles_capabilities'",
+    ] {
+        assert_eq!(values(&client.simple_query(sql).await.unwrap()), [capabilities], "{sql}");
+        assert_eq!(client.query_one(sql, &[]).await.unwrap().get::<_, String>(0), capabilities, "{sql}");
+    }
+    for (version_sql, capabilities_sql) in [
+        ("SET server_version = '1'", "SET giggles_capabilities = 'changed'"),
+        ("RESET server_version", "RESET giggles_capabilities"),
+        ("SELECT set_config('server_version', '1', false)", "SELECT set_config('giggles_capabilities', 'changed', false)"),
+        ("SELECT set_config('server_version', '1', true)", "SELECT pg_catalog.set_config('GiGgLeS_CaPaBiLiTiEs', 'changed', true)"),
+    ] {
+        let expected = code(client.simple_query(version_sql).await.unwrap_err());
+        assert_eq!(expected, "22023");
+        assert_eq!(code(client.simple_query(capabilities_sql).await.unwrap_err()), expected, "{capabilities_sql}");
+        let expected = code(client.query(version_sql, &[]).await.unwrap_err());
+        assert_eq!(code(client.query(capabilities_sql, &[]).await.unwrap_err()), expected, "{capabilities_sql}");
+    }
+    let build_id = giggles_pg_catalog::BUILD_ID;
+    assert!(build_id == "unknown" || (build_id.len() == 12
+        && build_id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))));
+    let expected = format!("PostgreSQL 18.0 (GigglesDB 0.1.0+{build_id})");
+    for sql in ["SELECT version()", "SELECT pg_catalog.version() FROM pg_catalog.pg_roles LIMIT 1"] {
+        assert_eq!(values(&client.simple_query(sql).await.unwrap()), [expected.as_str()], "{sql}");
+        assert_eq!(client.query_one(sql, &[]).await.unwrap().get::<_, String>(0), expected, "{sql}");
+    }
+    println!("observed version(): {expected}");
+    drop(client);
+    fixture.stop().await;
+}
+
+#[tokio::test]
 async fn server_encoding_is_utf8_and_read_only_across_protocol_surfaces() {
     let fixture = Fixture::new().await;
     let client = fixture.client().await;

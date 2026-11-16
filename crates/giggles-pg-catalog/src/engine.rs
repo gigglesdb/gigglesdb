@@ -2539,11 +2539,18 @@ impl Compiler {
                     }
                     // Only immutable presets can be folded here. Session GUCs
                     // remain owned by the server's settings evaluator.
-                    if n == "current_setting" && args.len() == 1 {
+                    if n == "current_setting"
+                        && (args.len() == 1
+                            || (args.len() == 2
+                                && matches!(&args[0].kind, K::Literal(Value::Text(name))
+                                    if name.eq_ignore_ascii_case("giggles_capabilities"))
+                                && matches!(&args[1].kind, K::Literal(Value::Bool(_)))))
+                    {
                         let K::Literal(Value::Text(name)) = &args[0].kind else {
                             return Err(Error::Unsupported);
                         };
                         let value = match name.to_ascii_lowercase().as_str() {
+                            "giggles_capabilities" => crate::CAPABILITIES,
                             "server_encoding" => "UTF8",
                             "server_version" => "18.0",
                             "server_version_num" => "180000",
@@ -4680,6 +4687,8 @@ impl Runtime<'_> {
             "version" => S(concat!(
                 "PostgreSQL 18.0 (GigglesDB ",
                 env!("CARGO_PKG_VERSION"),
+                "+",
+                env!("GIGGLES_BUILD_ID"),
                 ")"
             )
             .into()),

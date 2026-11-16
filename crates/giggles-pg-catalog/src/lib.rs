@@ -27,6 +27,13 @@
 //! General transaction IDs, timestamp functions, procedural execution,
 //! arbitrary SQL/data access, and unmodeled DataGrip discovery remain unsupported.
 mod catalog;
+/// Git revision embedded at build time, or an explicit build identifier override.
+pub const BUILD_ID: &str = env!("GIGGLES_BUILD_ID");
+/// Each token names a GD-0077 guarantee; tokens are only ever added when the
+/// guarantee ships with tests. Tokens are sorted and comma-separated without spaces.
+pub const CAPABILITIES: &str =
+    "add_column_if_not_exists,role_session_termination,server_encoding,union_common_type";
+
 pub use engine::catalog_identifier;
 mod engine;
 pub use engine::{

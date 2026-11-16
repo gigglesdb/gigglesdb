@@ -23,6 +23,39 @@ fn role(oid: u32, name: &str, login: bool) -> RoleDef {
 fn s(s: &str) -> Value {
     Value::Text(s.into())
 }
+
+#[test]
+fn build_identity_and_immutable_capabilities_are_pinned() {
+    assert_eq!(
+        CAPABILITIES,
+        "add_column_if_not_exists,role_session_termination,server_encoding,union_common_type"
+    );
+    let snapshot = CatalogSnapshot::default();
+    for sql in [
+        "SELECT current_setting('giggles_capabilities') FROM pg_catalog.pg_roles LIMIT 1",
+        "SELECT pg_catalog.current_setting('GiGgLeS_CaPaBiLiTiEs') FROM pg_catalog.pg_roles LIMIT 1",
+        "SELECT current_setting('giggles_capabilities', true) FROM pg_catalog.pg_roles LIMIT 1",
+        "SELECT pg_catalog.current_setting('GiGgLeS_CaPaBiLiTiEs', false) FROM pg_catalog.pg_roles LIMIT 1",
+    ] {
+        let result = run(&snapshot, sql);
+        assert_eq!(result.fields[0].data_type, PgType::Text, "{sql}");
+        assert_eq!(result.rows, vec![vec![s(CAPABILITIES)]], "{sql}");
+    }
+    let expected = format!("PostgreSQL 18.0 (GigglesDB 0.1.0+{BUILD_ID})");
+    assert!(
+        regex::Regex::new(r"^PostgreSQL 18\.0 \(GigglesDB 0\.1\.0\+([0-9a-f]{12}|unknown)\)$")
+            .unwrap()
+            .is_match(&expected)
+    );
+    for sql in [
+        "SELECT version()",
+        "SELECT pg_catalog.version() FROM pg_catalog.pg_roles LIMIT 1",
+    ] {
+        let result = run(&snapshot, sql);
+        assert_eq!(result.rows, vec![vec![s(&expected)]], "{sql}");
+    }
+    println!("observed version(): {expected}");
+}
 fn i(i: i64) -> Value {
     Value::Int(i)
 }
