@@ -70,8 +70,8 @@ fn assignment_sites_and_duplicate_precedence() {
         assert_eq!(giggles_core::sqlstate(&sql.execute("INSERT INTO t(id,v,w) VALUES(2,NULL,32768::int8)",&[],None).unwrap_err()),"22003");
     }
     let combined=Request::Update { table:"t".into(),filter:expr(V::Bool(true)),guard:None,values:vec![("v".into(),lit(V::Null)),("w".into(),lit(V::Int(32768)))],intent:Intent::One };
-    assert_eq!(engine.execute(&combined,&Bindings::new()).unwrap_err(),Error::Sql { sqlstate:"23502".into() });
-    assert_eq!(giggles_core::sqlstate(&sql.execute("UPDATE t SET v=NULL,w=32768::int8",&[],None).unwrap_err()),"23502");
+    assert_eq!(engine.execute(&combined,&Bindings::new()).unwrap_err(),Error::Overflow);
+    assert_eq!(giggles_core::sqlstate(&sql.execute("UPDATE t SET v=NULL,w=32768::int8",&[],None).unwrap_err()),"22003");
     let empty_update=Request::Update { table:"t".into(),filter:expr(V::Bool(false)),guard:None,values:vec![("v".into(),lit(V::Null))],intent:Intent::One };
     assert_eq!(engine.execute(&empty_update,&Bindings::new()).unwrap_err(),Error::Sql { sqlstate:"23502".into() });
     assert_eq!(sql.execute("UPDATE t SET v=NULL WHERE false",&[],None).unwrap().affected,0);

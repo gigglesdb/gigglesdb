@@ -1371,7 +1371,7 @@ impl Binder<'_> {
             if (!insert || v != Value::Null)
                 && let Err(error) = check(&v, &self.table()?.columns[i]) {
                 if !insert && (error == Error::Overflow || error.sqlstate() == Some("23502")) {
-                    if deferred.is_none() { deferred = Some(error); }
+                    if deferred.is_none() || error == Error::Overflow { deferred = Some(error); }
                 } else { return Err(error); }
             }
             out.push((i, v))
@@ -2433,7 +2433,13 @@ fn run<C: Context>(
                             .into_iter()
                             .map(|(index, value)| {
                                 s.coerce_column(&t.columns[index], value.into_owned())
-                                    .map(|value| (index, Cow::Owned(value)))
+                                    .and_then(|value| {
+                                        // Admit assignment widths before postimage NOT NULL.
+                                        if value != Value::Null {
+                                            check(&value, &t.columns[index])?;
+                                        }
+                                        Ok((index, Cow::Owned(value)))
+                                    })
                             })
                             .collect::<Result<Vec<_>>>()
                     })

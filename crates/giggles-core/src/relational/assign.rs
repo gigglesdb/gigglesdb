@@ -378,7 +378,11 @@ impl<'a> Plan<'a> {
                     .ok_or(SqlError::Type)?,
             };
             let value = coerce_to_column(self.state, &table.columns[index], value)?;
-            check(&value, &table.columns[index])?;
+            // Column NOT NULL belongs to the complete postimage, after every
+            // SET expression and assignment conversion has succeeded.
+            if value != super::Value::Null {
+                check(&value, &table.columns[index])?;
+            }
             values.push((index, value));
         }
         Relational::secondary_admit_values(values.iter().map(|(_, value)| value))?;

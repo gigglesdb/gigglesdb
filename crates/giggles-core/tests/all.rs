@@ -471,3 +471,5 @@ mod native_once_v2_format;
 mod native_catalog_session;
 #[path = "parity_insert_duplicate_column.rs"]
 mod parity_insert_duplicate_column;
+
+#[path = "parity_update_eval_order.rs"] mod parity_update_eval_order;
