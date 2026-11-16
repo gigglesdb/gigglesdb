@@ -106,8 +106,19 @@ fn reserved(s: &str) -> bool {
     ]
     .contains(&s)
 }
+/// Whether text is an INSERT, which SQL also bounds by bytes and flat tuples.
+fn insert_text(s: &str) -> bool {
+    let t = s.trim_start().as_bytes();
+    t.len() > 6 && t[..6].eq_ignore_ascii_case(b"insert") && t[6].is_ascii_whitespace()
+}
 fn lex(s: &str, version: LanguageVersion) -> Result<Vec<(Token, usize)>> {
-    if s.len() > MAX_INPUT {
+    let insert = insert_text(s);
+    let (max_input, max_tokens) = if insert {
+        (MAX_INSERT_INPUT.max(MAX_INPUT), MAX_INSERT_TOKENS)
+    } else {
+        (MAX_INPUT, MAX_TOKENS)
+    };
+    if s.len() > max_input {
         return Err(Error::Limit);
     }
     let b = s.as_bytes();
@@ -266,7 +277,7 @@ fn lex(s: &str, version: LanguageVersion) -> Result<Vec<(Token, usize)>> {
             _ => return Err(Error::Syntax { offset: start }),
         };
         out.push((t, start));
-        if out.len() > MAX_TOKENS {
+        if out.len() > max_tokens {
             return Err(Error::Limit);
         }
     }
@@ -938,7 +949,8 @@ impl Parser {
                     if !many || !self.symbol(',') {
                         break;
                     }
-                    if rows.len() >= MAX_INSERT_ROWS {
+                    // Flat tuples, as SQL VALUES; engines admit row counts.
+                    if rows.len() >= MAX_INSERT_TOKENS {
                         return Err(Error::Limit);
                     }
                 }

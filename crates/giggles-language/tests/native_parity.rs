@@ -1021,3 +1021,102 @@ fn native_large_writes_keep_v2_parity_and_legacy_cap() {
     assert_eq!(core.execute(&many(0, 1025), &Bindings::new()), Err(giggles_core::operations::Error::Limit));
     assert_eq!(core.execute(&many(0, 1024), &Bindings::new()).unwrap().affected, 1024);
 }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_literal_insert_many_and_engine_limits() {
+    let text = |table: &str, ids: std::ops::Range<usize>| format!(
+        "insert many into {table}(id,n,u) values {} at most {}",
+        ids.clone().map(|id| format!("({id},{},{id})", id % 7)).collect::<Vec<_>>().join(","), ids.len());
+    let (_left_db, left) = Database::fresh(StorageEngine::V2);
+    let (_right_db, right) = Database::fresh(StorageEngine::V2);
+    for admin in [&left, &right] {
+        sql(admin, "create table items(id bigint primary key, n bigint, u bigint)");
+    }
+    let engine = Engine::with_version(left.clone(), LanguageVersion::Embedded021);
+    let native = text("items", 0..5000);
+    assert!(native.len() > giggles_language::MAX_INPUT);
+    let result = with_sql_parser_forbidden(|| engine.execute_text(&native, &Bindings::new())).unwrap();
+    let sql_text = native.replacen("insert many into items(id,n,u) values", "insert into items values", 1)
+        .replacen(" at most 5000", "", 1);
+    assert_eq!((result.affected, right.sql_session().execute(&sql_text, &[], None).unwrap().affected), (5000, 5000));
+    let dump = |admin: &Admin| values(admin.sql_session().execute("select * from items order by id", &[], None).unwrap().rows);
+    assert_eq!(dump(&left), dump(&right));
+    assert_eq!(dump(&left).len(), 5000);
+    // Non-insert text keeps the 64 KiB / 4,096-token budget.
+    assert_eq!(engine.execute_text(&format!("items where {}true", "true and ".repeat(2100)), &Bindings::new()), Err(Error::Limit));
+
+    // Legacy keeps the 1,024-tuple cap, now admitted at bind rather than by text tokens.
+    let (_legacy_db, legacy) = Database::fresh(StorageEngine::Legacy);
+    sql(&legacy, "create table items(id bigint primary key, n bigint, u bigint)");
+    let engine = Engine::with_version(legacy.clone(), LanguageVersion::Embedded021);
+    assert_eq!(engine.execute_text(&text("items", 0..1025), &Bindings::new()), Err(Error::Limit));
+    assert_eq!(engine.execute_text(&text("items", 0..1024), &Bindings::new()).unwrap().affected, 1024);
+
+    // Advertised limits: existing fields stay legacy; engine_rows separates engines.
+    let manifest = serde_json::to_value(giggles_language::capability_manifest_for(LanguageVersion::Embedded021)).unwrap();
+    let limits = &manifest["limits"];
+    assert_eq!(limits["native_table_rows"], 1024);
+    assert_eq!(limits["insert_input_rows"], 1024);
+    assert_eq!(limits["insert_text_bytes"], giggles_core::relational::MAX_STATEMENT_SQL);
+    for field in ["native_table_rows", "result_page_rows", "mutation_rows", "insert_input_rows"] {
+        assert_eq!(limits["engine_rows"]["legacy"][field], 1024, "{field}");
+        assert!(limits["engine_rows"]["v2"][field].is_null(), "{field}");
+    }
+    let profile = serde_json::to_value(giggles_language::profile_for(LanguageVersion::Embedded021)).unwrap();
+    assert_eq!((profile["max_rows"].clone(), profile["v2_max_rows"].clone()), (1024.into(), serde_json::Value::Null));
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_point_writes_read_one_key_and_filters_stream() {
+    use giggles_core::operations::native_input_rows;
+    let (_left_db, left) = Database::fresh(StorageEngine::V2);
+    let (_right_db, right) = Database::fresh(StorageEngine::V2);
+    for admin in [&left, &right] {
+        sql(admin, "create table items(id bigint primary key, n bigint, u bigint)");
+        sql(admin, "create table pair(a bigint, b text, n bigint, primary key(a,b))");
+        sql(admin, "insert into pair values(1,'x',0),(1,'y',0)");
+        seed(admin, "items", 0..20_000);
+        sql(admin, "update items set n=id%1000");
+    }
+    let engine = Engine::with_version(left.clone(), LanguageVersion::Embedded021);
+    let dump = |admin: &Admin, table: &str| values(admin.sql_session()
+        .execute(&format!("select * from {table} order by 1,2"), &[], None).unwrap().rows);
+    // (native, SQL, affected or rows, rows decoded, rows retained)
+    for (native, statement, count, decoded, kept) in [
+        ("update items where id=12345 set u=0", "update items set u=0 where id=12345", 1, 1, 1),
+        ("items where id=777", "select * from items where id=777", 1, 1, 1),
+        ("items where 778=id and n=778", "select * from items where id=778 and n=778", 1, 1, 1),
+        ("items where id=778 and n=1", "select * from items where id=778 and n=1", 0, 1, 0),
+        ("delete items where id=19999", "delete from items where id=19999", 1, 1, 1),
+        ("items where id=19999", "select * from items where id=19999", 0, 0, 0),
+        ("update pair where a=1 and b=\"y\" set n=5", "update pair set n=5 where a=1 and b='y'", 1, 1, 1),
+        ("update many items where n=7 set u=1 at most 20", "update items set u=1 where n=7", 20, 19_999, 20),
+        ("items where n=7 order by id desc limit 3", "select * from items where n=7 order by id desc limit 3", 3, 19_999, 20),
+        ("delete many items where n=8 or id=5 at most 21", "delete from items where n=8 or id=5", 21, 19_999, 21),
+    ] {
+        let before = native_input_rows();
+        let result = with_sql_parser_forbidden(|| engine.execute_text(native, &Bindings::new()))
+            .unwrap_or_else(|error| panic!("{native}: {error:?}"));
+        let after = native_input_rows();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (decoded, kept), "{native}");
+        let expected = right.sql_session().execute(statement, &[], None).unwrap();
+        if statement.starts_with("select") {
+            assert_eq!(values(result.rows), values(expected.rows), "{native}");
+        } else {
+            assert_eq!((result.affected, expected.affected), (count, count as u64), "{native}");
+        }
+        for table in ["items", "pair"] {
+            assert_eq!(dump(&left, table), dump(&right, table), "{native}: {table}");
+        }
+    }
+    // Legacy keeps its bounded complete-table input and never takes this path.
+    let (_legacy_db, legacy) = Database::fresh(StorageEngine::Legacy);
+    sql(&legacy, "create table items(id bigint primary key, n bigint, u bigint)");
+    seed(&legacy, "items", 0..10);
+    let engine = Engine::with_version(legacy, LanguageVersion::Embedded021);
+    let before = native_input_rows();
+    assert_eq!(engine.execute_text("update items where id=3 set u=0", &Bindings::new()).unwrap().affected, 1);
+    assert_eq!(native_input_rows(), before);
+}

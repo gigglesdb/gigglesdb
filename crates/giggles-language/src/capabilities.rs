@@ -153,6 +153,39 @@ pub struct CapabilityLimits {
     pub columns_per_table: usize,
     pub catalog_tables: usize,
     pub concurrent_explicit_sessions: usize,
+    /// Text that begins with `insert` uses SQL's statement byte budget and
+    /// flat-tuple token budget instead of text_bytes and text_tokens.
+    pub insert_text_bytes: usize,
+    pub insert_text_tokens: usize,
+    /// Row ceilings by storage engine. The single-valued row fields above keep
+    /// the conservative legacy values for existing clients.
+    pub engine_rows: EngineRowLimits,
+}
+
+/// Row ceilings for the operations that the selected version supports.
+#[derive(Clone, Debug, Serialize)]
+pub struct EngineRowLimits {
+    pub legacy: EngineRows,
+    pub v2: EngineRows,
+}
+
+/// `null` means no fixed row ceiling; byte budgets above still apply.
+#[derive(Clone, Debug, Serialize)]
+pub struct EngineRows {
+    pub native_table_rows: Option<usize>,
+    pub result_page_rows: Option<usize>,
+    pub mutation_rows: Option<usize>,
+    pub insert_input_rows: Option<usize>,
+}
+
+impl EngineRows {
+    fn legacy() -> Self {
+        Self { native_table_rows: Some(MAX_ROWS), result_page_rows: Some(MAX_ROWS),
+            mutation_rows: Some(MAX_ROWS), insert_input_rows: Some(crate::MAX_INSERT_ROWS) }
+    }
+    fn v2() -> Self {
+        Self { native_table_rows: None, result_page_rows: None, mutation_rows: None, insert_input_rows: None }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -227,7 +260,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
     if version.supports_r2_wave2() {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree] {
             add(interface, "keyset_paging", CapabilityState::Implemented,
-                "page READ [after (key values)] reads one page in an explicit order ending in the full primary key and returns the exclusive continuation key. Page size is the read's limit (default 100, max 1024). Bad order or key arity is Error::Bind; every page is a full scan.",
+                "page READ [after (key values)] reads one page in an explicit order ending in the full primary key and returns the exclusive continuation key. Page size is the read's limit (default 100; max 1024 on legacy storage, no fixed maximum on v2). Bad order or key arity is Error::Bind; every page is a full scan.",
                 vec![evidence("crates/giggles-language/tests/native_paging_parity.rs", "paging_round_trips_match_sql")], vec![]);
         }
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
@@ -345,7 +378,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
                 interface,
                 "bounded_simple_read_static_explain",
                 CapabilityState::Implemented,
-                "Explicit 0.13 trusted simple-read static explain using actual bindings and fresh catalog IDs. Whole-state storage read/validation still occurs; no logical business read, mutation or commit. Describes complete materialization (1024 ceiling), conditional reverse-PK certification, in-memory filter/order/projection/page; estimates unknown. No indexed optimization or task authorization.",
+                "Explicit 0.13 trusted simple-read static explain using actual bindings and fresh catalog IDs. Whole-state storage read/validation still occurs; no logical business read, mutation or commit. Describes complete materialization (1024 ceiling on legacy storage; streamed with no fixed row ceiling on v2), conditional reverse-PK certification, in-memory filter/order/projection/page; estimates unknown. No indexed optimization or task authorization.",
                 vec![evidence(
                     "crates/giggles-language/tests/explain.rs",
                     "explain_text_tree_bindings_and_fresh_catalog",
@@ -1765,6 +1798,9 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
             columns_per_table: relational::MAX_COLUMNS,
             catalog_tables: relational::MAX_TABLES,
             concurrent_explicit_sessions: relational::MAX_TRANSACTIONS,
+            insert_text_bytes: crate::MAX_INSERT_INPUT.max(MAX_INPUT),
+            insert_text_tokens: crate::MAX_INSERT_TOKENS,
+            engine_rows: EngineRowLimits { legacy: EngineRows::legacy(), v2: EngineRows::v2() },
         },
         capabilities,
     }

@@ -1965,6 +1965,7 @@ pub struct SqlSession {
 }
 mod complete_relation;
 pub(crate) use complete_relation::CompleteRelation;
+pub use complete_relation::native_input_rows;
 
 impl Admin {
     pub fn sql_session(&self) -> SqlSession {

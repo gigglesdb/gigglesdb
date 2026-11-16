@@ -21,6 +21,17 @@ pub(crate) struct CompleteRelation {
     rows: Vec<SqlRow>,
 }
 
+thread_local! {
+    // (decoded, retained) rows of native filtered complete input on this thread.
+    static NATIVE_INPUT_ROWS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Rows decoded and rows retained by native v2 filtered complete input on
+/// this thread since it started. Instrumentation for tests and diagnostics.
+pub fn native_input_rows() -> (u64, u64) {
+    NATIVE_INPUT_ROWS.with(|n| n.get())
+}
+
 impl SqlSession {
     /// V2 read input is complete without imposing the legacy table capacity.
     /// The physical visitor decodes one row at a time; native order/filter
@@ -53,6 +64,73 @@ impl SqlSession {
             self.abort();
         }
         result
+    }
+
+    /// V2 complete input restricted to the rows `keep` accepts. Rows are
+    /// decoded one at a time and only kept rows are retained, so the logical
+    /// budget applies to the matching set. With `key`, the full primary key is
+    /// read directly instead of scanning the table. The caller must re-apply
+    /// its filter: the relation is complete only with respect to `keep`.
+    pub(crate) fn complete_read_table_where<E>(
+        &mut self,
+        table: &TableDef,
+        key: Option<&[crate::relational::Value]>,
+        keep: &mut impl FnMut(&SqlRow) -> Result<bool, E>,
+        map: fn(CoreError) -> E,
+    ) -> Result<CompleteRelation, E> {
+        let result = (|| {
+            if !self.is_v2_engine() {
+                return Err(map(CoreError::Sql(SqlError::Unsupported)));
+            }
+            let snapshot = self.complete_snapshot(table).map_err(map)?;
+            let mut rows = Vec::new();
+            let mut retained = crate::relational::scan::Retention::new(
+                crate::relational::scan::MAX_RETAINED_BYTES,
+            );
+            let mut visit = |row: &SqlRow| {
+                NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0 + 1, n.get().1)));
+                if !keep(row)? {
+                    return Ok(());
+                }
+                NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0, n.get().1 + 1)));
+                let mut charge = |bytes| retained.charge(bytes).map_err(|e| map(CoreError::Sql(e)));
+                charge(std::mem::size_of::<SqlRow>())?;
+                for value in &row.values {
+                    charge(std::mem::size_of_val(value) + crate::relational::value_bytes(value))?;
+                }
+                rows.push(row.clone());
+                Ok(())
+            };
+            match key {
+                Some(key) => self.visit_native_key(table, key, &mut visit, map)?,
+                None => self.visit_native_page(table, &mut visit, map)?,
+            }
+            Ok(CompleteRelation { snapshot, rows })
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
+    /// Visit the row with this full primary key, if any, in the statement snapshot.
+    fn visit_native_key<E>(
+        &mut self, table: &TableDef, key: &[crate::relational::Value],
+        visit: &mut impl FnMut(&SqlRow) -> Result<(), E>,
+        map: fn(CoreError) -> E,
+    ) -> Result<(), E> {
+        #[cfg(feature = "engine-rocksdb")]
+        if let super::Backend::V2(db) = &self.admin.inner.backend {
+            let db = db.clone();
+            let snapshot = self.complete_snapshot(table).map_err(map)?;
+            self.visit_native_key_v2(&db, table, key, visit, map)?;
+            if self.complete_snapshot(table).map_err(map)? != snapshot {
+                return Err(map(CoreError::Sql(SqlError::StaleSchema)));
+            }
+            return Ok(());
+        }
+        let _ = (table, key, visit);
+        Err(map(CoreError::Sql(SqlError::Unsupported)))
     }
 
     /// Stream one statement snapshot without asserting full-table boundedness.

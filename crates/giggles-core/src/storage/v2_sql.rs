@@ -51,6 +51,22 @@ impl SqlSession {
         Ok(())
     }
 
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn visit_native_key_v2<E>(
+        &mut self, db: &Arc<v2::V2Db>, table: &TableDef, key: &[relational::Value],
+        visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
+    ) -> Result<(), E> {
+        let _ticket = self.admin.inner.enter_sql().map_err(map)?;
+        crate::cancellation::check().map_err(map)?;
+        let txn = self.v2_transaction.as_mut()
+            .ok_or_else(|| map(CoreError::Sql(SqlError::Transaction)))?;
+        let entry = TableEntry { primary_index_birth: None, def: table.clone(), heap: false, columns_ext: BTreeMap::new() };
+        if let Some(row) = db.rows.get(txn, &entry, key).map_err(map)? {
+            visit(&SqlRow { values: row.values, version: row.version })?;
+        }
+        Ok(())
+    }
+
     pub(super) fn insert_sequence_callback(
         &self,
         db: &Arc<v2::V2Db>,

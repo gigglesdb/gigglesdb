@@ -902,7 +902,11 @@ pub(crate) fn lower_checked(
 ) -> Result<operations::Request> {
     // Check caller-supplied trees before serialization or recursive lowering.
     validate_depth_for(stmt, version)?;
-    validate_size(stmt)?;
+    if matches!(statement_parts(stmt)?.statement, Statement::InsertMany { .. }) {
+        validate_size_within(stmt, MAX_INSERT_TREE_BYTES)?;
+    } else {
+        validate_size(stmt)?;
+    }
     validate_version(stmt, version)?;
     lower_statement(stmt, version)
 }
@@ -1103,7 +1107,8 @@ fn validate_statement_depth(stmt: &Statement, nodes: &mut usize, version: Langua
         }
         Statement::InsertMany { columns, rows, .. } => {
             // Check every collection and arity before gathering expression roots.
-            if columns.len() > giggles_core::relational::MAX_COLUMNS || rows.len() > MAX_INSERT_ROWS
+            // Row counts are engine-specific and admitted by core at bind time.
+            if columns.len() > giggles_core::relational::MAX_COLUMNS || rows.len() > MAX_INSERT_TOKENS
             {
                 return Err(Error::Limit);
             }
@@ -1113,15 +1118,10 @@ fn validate_statement_depth(stmt: &Statement, nodes: &mut usize, version: Langua
             if rows.iter().any(|row| row.len() != columns.len()) {
                 return Err(Error::Type);
             }
-            let roots = rows.len().checked_mul(columns.len()).ok_or(Error::Limit)?;
-            if nodes
-                .checked_add(pending.len())
-                .and_then(|n| n.checked_add(roots))
-                .is_none_or(|n| n > MAX_EXPRESSION_NODES)
-            {
-                return Err(Error::Limit);
+            // Tuples are flat, as SQL VALUES: each tuple has its own node budget.
+            for row in rows {
+                validate_nodes(row.iter().map(|expr| (expr, 0)).collect(), &mut 0, version)?;
             }
-            pending.extend(rows.iter().flatten().map(|expr| (expr, 0)));
         }
         _ => (),
     }
@@ -1326,6 +1326,9 @@ fn validate_expression_version(mut pending: Vec<&Expr>, version: LanguageVersion
 // Enforce the existing serialized-AST bound without allocating an unbounded
 // temporary buffer for a caller-supplied string or vector.
 pub(crate) fn validate_size(stmt: &impl serde::Serialize) -> Result<()> {
+    validate_size_within(stmt, MAX_INPUT)
+}
+fn validate_size_within(stmt: &impl serde::Serialize, budget: usize) -> Result<()> {
     struct Budget(usize);
     impl Write for Budget {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -1339,7 +1342,7 @@ pub(crate) fn validate_size(stmt: &impl serde::Serialize) -> Result<()> {
             Ok(())
         }
     }
-    serde_json::to_writer(Budget(MAX_INPUT), stmt).map_err(|_| Error::Limit)
+    serde_json::to_writer(Budget(budget), stmt).map_err(|_| Error::Limit)
 }
 
 fn validate_native_value(value: &ValueExpr, version: LanguageVersion) -> Result<()> {

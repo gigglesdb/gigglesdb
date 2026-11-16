@@ -970,7 +970,10 @@ fn typed_keyed_delete_admission_cap() {
         let request = |cap| Request::Returning { request: Box::new(Request::Delete { table: "items".into(),
             filter: Expr::Value(ValueExpr::Literal(V::Bool(true))), guard: None,
             cap: Some(ValueExpr::Literal(V::Int(cap))) }), projection: vec![] };
-        assert_eq!(native.execute(&request(MAX_ROWS as i64 + 1), &Bindings::new()), Err(Error::Type));
+        // Legacy caps counts at 1,024; V2 admits larger caps (R2-NOCAP-2).
+        if backend == Engine::Legacy {
+            assert_eq!(native.execute(&request(MAX_ROWS as i64 + 1), &Bindings::new()), Err(Error::Type));
+        }
         assert_eq!(native.execute(&request(MAX_ROWS as i64 - 1), &Bindings::new()), Err(Error::TooManyMatches));
         let result = with_sql_parser_forbidden(|| native.execute(&request(MAX_ROWS as i64), &Bindings::new())).unwrap();
         assert_eq!((result.affected, result.rows.len()), (MAX_ROWS, MAX_ROWS));
@@ -981,7 +984,9 @@ fn typed_keyed_delete_admission_cap() {
             session.execute(&format!("INSERT INTO items VALUES({id})"), &[], None).unwrap();
         }
         session.commit_native().unwrap();
-        assert_eq!(native.execute(&request(MAX_ROWS as i64), &Bindings::new()), Err(Error::Limit));
+        // V2 has no complete-relation row ceiling, so only the cap refuses it.
+        let expected = if backend == Engine::Legacy { Error::Limit } else { Error::TooManyMatches };
+        assert_eq!(native.execute(&request(MAX_ROWS as i64), &Bindings::new()), Err(expected));
         drop(native); drop(session); drop(admin);
         fs::remove_dir_all(path).unwrap();
     }

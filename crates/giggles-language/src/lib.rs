@@ -28,7 +28,7 @@ pub mod once;
 mod parser;
 pub use capabilities::{
     Capability, CapabilityInterface, CapabilityLimits, CapabilityManifest, CapabilityState,
-    DeploymentProfile, ReferenceRevision, TestEvidence, capability_manifest,
+    DeploymentProfile, EngineRowLimits, EngineRows, ReferenceRevision, TestEvidence, capability_manifest,
     capability_manifest_for,
 };
 pub use execute::{BoundCatalogOperation, BoundOperation, BoundTransaction, Engine, Lowered, lower_text};
@@ -50,6 +50,13 @@ pub const MAX_INPUT: usize = 65_536;
 pub const MAX_DEPTH: usize = 32;
 pub const MAX_ROWS: usize = giggles_core::relational::MAX_ROWS;
 pub const MAX_TOKENS: usize = 4096;
+/// Text that begins with `insert` is bounded like SQL INSERT: by SQL's statement
+/// byte budget and its flat-tuple token budget, not by MAX_INPUT/MAX_TOKENS.
+/// Row counts and proposed bytes are then admitted per engine at bind time.
+pub const MAX_INSERT_INPUT: usize = giggles_core::relational::MAX_STATEMENT_SQL;
+pub const MAX_INSERT_TOKENS: usize = giggles_core::relational::MAX_INSERT_TOKENS;
+/// Serialized-tree bound for INSERT MANY requests (see MAX_INSERT_INPUT).
+pub const MAX_INSERT_TREE_BYTES: usize = giggles_core::operations::MAX_INSERT_REQUEST_BYTES;
 pub const MAX_EXPRESSION_NODES: usize = giggles_core::operations::MAX_EXPRESSION_NODES;
 pub const MAX_BINDINGS: usize = giggles_core::operations::MAX_BINDINGS;
 pub const MAX_BINDING_BYTES: usize = giggles_core::operations::MAX_BINDING_BYTES;
@@ -773,7 +780,10 @@ impl Default for Outcome {
 #[derive(Clone, Debug, Serialize)]
 pub struct Profile {
     pub name: &'static str,
+    /// Legacy storage row ceiling; kept for existing clients.
     pub max_rows: usize,
+    /// V2 storage row ceiling: `null`, no fixed row ceiling.
+    pub v2_max_rows: Option<usize>,
     pub default_page: usize,
     pub scalar_types: &'static [&'static str],
     pub unsupported: &'static [&'static str],
@@ -787,6 +797,7 @@ pub fn profile_for(version: LanguageVersion) -> Profile {
     Profile {
         name: version.profile_name(),
         max_rows: MAX_ROWS,
+        v2_max_rows: None,
         default_page: 100,
         scalar_types: if version.supports_r2_native() {
             &["boolean", "smallint", "integer", "bigint", "text", "bytes", "null", "numeric parameters",

@@ -231,7 +231,11 @@ fn insert_many_version_gates_and_empty_tree_contract() {
             .collect::<Vec<_>>()
             .join(",")
     );
-    assert_eq!(parse_with_version(&text_maximum, V6), Err(Error::Limit));
+    // INSERT text is bounded like SQL INSERT (bytes and flat tuples); the
+    // legacy 1,024-tuple cap is admitted at bind (R2-NOCAP-3).
+    assert!(parse_with_version(&text_maximum, V6).is_ok());
+    assert_eq!(parse_with_version(&format!("items where {}", "id=1 and ".repeat(1000) + "true"), V6),
+        Err(Error::Limit));
     assert_eq!(serde_json::to_value(V6).unwrap(), "0.6");
     assert_eq!(
         serde_json::from_value::<Error>(serde_json::to_value(Error::DuplicateTarget).unwrap())

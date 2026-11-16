@@ -491,14 +491,20 @@ primary keys return `DuplicateTarget`; conflicts with existing keys keep
 `Core("Sql(Duplicate)")`. A row error, duplicate, capacity violation or return error
 aborts the entire insert and its enclosing block.
 
-The tuple limit is 1,024 and the column limit is 64; every tuple must match the
-column count. Each proposed stored row fits 64 KiB, and all proposed full rows
-share a 1 MiB payload budget. On legacy the resulting table must remain within
-1,024 rows; V2 has no table ceiling.
-These bounds do not replace the existing 64 KiB input, 4,096-token, 4,096-node or
-64 KiB resolved-value bounds. In particular, a 1,024-tuple typed tree can exceed
-the text token limit when expressed as VALUES. The manifest exposes separate
-`insert_input_rows` and `insert_proposed_bytes` fields for 0.6 and later.
+The tuple limit is 1,024 on legacy and has no fixed row count on V2; the column
+limit is 64 and every tuple must match the column count. Each proposed stored row
+fits 64 KiB, and all proposed full rows share a 1 MiB payload budget (on V2 the
+tuple literals are charged to that budget rather than the 64 KiB resolved-value
+bound). On legacy the resulting table must remain within 1,024 rows; V2 has no
+table ceiling. Like SQL INSERT, text that begins with `insert` is bounded by SQL's
+statement byte budget (`insert_text_bytes`) and flat-tuple token budget
+(`insert_text_tokens`) instead of the 64 KiB / 4,096-token text bounds, and each
+tuple has its own 4,096-node budget. The manifest exposes separate
+`insert_input_rows` and `insert_proposed_bytes` fields for 0.6 and later; the
+legacy-valued row fields are kept, and `engine_rows.legacy` / `engine_rows.v2` give
+per-engine row ceilings (`null`: no fixed ceiling). On V2, filtered native reads,
+updates and deletes retain only matching rows while streaming, and a filter that
+fixes the full primary key with literals reads that one key.
 
 An empty typed `rows` vector is valid after checking columns, cap and return
 metadata; there are no row-level required-column checks when no row is proposed.

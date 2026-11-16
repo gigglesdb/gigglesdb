@@ -10,6 +10,7 @@
 //! retried blindly.
 
 pub use crate::relational::{SqlRow, Value};
+pub use crate::storage::native_input_rows;
 #[cfg(test)]
 mod case_tests;
 mod catalog;
@@ -62,6 +63,10 @@ pub const MAX_ROWS: usize = crate::relational::MAX_ROWS;
 pub const MAX_INSERT_ROWS: usize = MAX_ROWS;
 /// Aggregate proposed full-row payload admitted before an INSERT MANY stages.
 pub const MAX_INSERT_BYTES: usize = crate::relational::MAX_RESULT_BYTES;
+/// Serialized bound for an INSERT MANY request. Its tuples are flat, as SQL
+/// VALUES, so text and trees scale with SQL's statement budget rather than
+/// MAX_INPUT. Row counts (legacy) and proposed bytes are admitted at bind.
+pub const MAX_INSERT_REQUEST_BYTES: usize = 8 * crate::relational::MAX_STATEMENT_SQL;
 /// Maximum entries in a supplied parameter map, including unused entries.
 // Native operation bindings have an independent limit from SQL parameters.
 pub const MAX_BINDINGS: usize = 256;
@@ -663,7 +668,11 @@ fn page_compare(a: &Value, b: &Value) -> Ordering {
 }
 fn validate_request(request: &Request) -> Result<()> {
     validate_depth(request)?;
-    validate_size(request)?;
+    if matches!(request.parts()?.body, Request::InsertMany { .. }) {
+        validate_size_within(request, MAX_INSERT_REQUEST_BYTES)?;
+    } else {
+        validate_size(request)?;
+    }
     if !relation_identifier(request.table()?) {
         return Err(Error::Bind("identifier".into()));
     }
@@ -759,12 +768,15 @@ fn identifier(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
 }
 fn validate_size(request: &impl Serialize) -> Result<()> {
+    validate_size_within(request, MAX_INPUT)
+}
+fn validate_size_within(request: &impl Serialize, budget: usize) -> Result<()> {
     // Preserve the serialized request limit without allocating a serialized
     // copy of an oversized caller-owned literal or assignment collection.
-    struct Counter(usize);
+    struct Counter(usize, usize);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > MAX_INPUT - self.0 {
+            if bytes.len() > self.1 - self.0 {
                 return Err(std::io::Error::other("request size limit"));
             }
             self.0 += bytes.len();
@@ -774,7 +786,7 @@ fn validate_size(request: &impl Serialize) -> Result<()> {
             Ok(())
         }
     }
-    serde_json::to_writer(Counter(0), request).map_err(|_| Error::Limit)
+    serde_json::to_writer(Counter(0, budget), request).map_err(|_| Error::Limit)
 }
 pub(crate) fn validate_depth(stmt: &Request) -> Result<()> {
     validate_request_nodes(stmt, &mut 0)
@@ -806,15 +818,10 @@ fn validate_request_nodes(stmt: &Request, nodes: &mut usize) -> Result<()> {
         Request::InsertMany { columns, rows, .. } => {
             // Row counts are engine-specific and checked at bind time.
             validate_insert_shape(columns, rows, usize::MAX)?;
-            let roots = rows
-                .len()
-                .checked_mul(columns.len())
-                .and_then(|count| count.checked_add(pending.len()))
-                .ok_or(Error::Limit)?;
-            if roots > MAX_EXPRESSION_NODES.saturating_sub(*nodes) {
-                return Err(Error::Limit);
+            // Tuples are flat, as SQL VALUES: each has its own node budget.
+            for row in rows {
+                validate_expression_nodes(row.iter().map(|e| (e, 0)).collect(), &mut 0)?;
             }
-            pending.extend(rows.iter().flatten().map(|expression| (expression, 0)));
         }
         Request::InsertExpressions { values, .. } => {
             if values.len() > crate::relational::MAX_COLUMNS {
@@ -1569,6 +1576,12 @@ impl Binder<'_> {
                 columns, rows, cap, ..
             } => {
                 validate_insert_shape(columns, rows, self.row_limit)?;
+                if self.row_limit > MAX_ROWS {
+                    // V2 tuple literals are data, as SQL VALUES: they share the
+                    // proposed-row budget instead of the per-row binding budget.
+                    self.remaining_value_bytes = self.remaining_value_bytes
+                        .saturating_add(MAX_INSERT_BYTES.saturating_sub(MAX_BOUND_VALUE_BYTES));
+                }
                 self.insert_targets(columns.iter().map(String::as_str))?;
                 let mut seen = BTreeSet::new();
                 let mut indexes = Vec::new();
@@ -2313,10 +2326,71 @@ fn run_complete(
     {
         return run_view(session, table, operation, rows, retained);
     }
-    // V2 reads and writes share the snapshot-pinned streaming loader; legacy
-    // keeps its bounded complete-table proof for both.
+    if session.is_v2_engine()
+        && let Operation::Read { filter, .. } | Operation::ReadExpressions { filter, .. }
+            | Operation::Mutate { filter, .. } = &operation
+    {
+        // V2 filtered reads and writes retain only matching rows, and a filter
+        // that fixes the full primary key reads that one key. Their result
+        // depends only on matching rows; run re-applies the same filter.
+        let mut filter = filter.clone();
+        filter.coerce_equality(session, table)?;
+        let key = primary_key_point(table, &filter);
+        let input = session.complete_read_table_where(
+            table, key.as_deref(), &mut |row| filter.accepts(row), input_error)?;
+        return run(session, table, operation, input, retained);
+    }
+    // Inserts need the whole relation. V2 streams it into the snapshot-pinned
+    // loader; legacy keeps its bounded complete-table proof for every operation.
     let input = session.complete_read_table_engine(table).map_err(limit)?;
     run(session, table, operation, input, retained)
+}
+fn input_error(error: CoreError) -> Error {
+    match error {
+        CoreError::Limit => Error::Limit,
+        other => core(other),
+    }
+}
+/// The full primary key when `filter` is a conjunction of column-to-literal
+/// comparisons, each literal of its column's own storage class and admissible
+/// for that column, that fixes every key column by equality. Such terms cannot
+/// fail on other rows, so one key read equals a filtered scan.
+fn primary_key_point(table: &TableDef, filter: &Bound) -> Option<Vec<Value>> {
+    if table.primary_key.is_empty() || table.hidden_rowid().is_some() {
+        return None;
+    }
+    let mut key = vec![None; table.primary_key.len()];
+    let mut pending = vec![filter];
+    while let Some(bound) = pending.pop() {
+        let (index, op, value) = match bound {
+            Bound::And(a, b) => {
+                pending.extend([a.as_ref(), b.as_ref()]);
+                continue;
+            }
+            Bound::Compare(a, op, b) => match (a.as_ref(), b.as_ref()) {
+                (Bound::Field(i), Bound::Value(v)) | (Bound::Value(v), Bound::Field(i)) => (*i, *op, v),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let column = table.columns.get(index)?;
+        if !matches!((&column.data_type, value),
+            (DataType::Boolean, Value::Bool(_))
+            | (DataType::SmallInt | DataType::Integer | DataType::BigInt, Value::Int(_))
+            | (DataType::Text | DataType::Varchar, Value::Text(_))
+            | (DataType::Bytes, Value::Bytes(_)))
+            || crate::relational::check(value, column).is_err()
+        {
+            return None;
+        }
+        if op == Compare::Eq
+            && let Some(slot) = table.primary_key.iter().position(|p| *p == index)
+            && key[slot].replace(value.clone()).is_some()
+        {
+            return None;
+        }
+    }
+    key.into_iter().collect()
 }
 fn run<C: Context>(
     s: &mut C,
