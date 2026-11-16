@@ -80,7 +80,7 @@ impl<T> Drop for AbortTask<T> {
     }
 }
 #[derive(Clone)]
-struct ReloadableLog(Arc<RwLock<Box<dyn crate::readlog::ReadLog>>>);
+pub(crate) struct ReloadableLog(pub(crate) Arc<RwLock<Box<dyn crate::readlog::ReadLog>>>);
 impl crate::readlog::ReadLog for ReloadableLog {
     fn write(&self, record: &crate::readlog::ReadLogRecord) -> Result<(), crate::error::Refusal> {
         self.0
@@ -171,7 +171,7 @@ async fn connect_schema_inner(cfg: &UpstreamConfig) -> Result<SchemaClient, Stri
         }),
     })
 }
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -207,9 +207,14 @@ pub(crate) async fn snapshot(
     };
     result.map_err(|_| "upstream schema snapshot unavailable".into())
 }
-/// Load policy and resolve its audit path relative to the policy file.
-pub(crate) fn load_policy(path: &Path) -> Result<Policy, Vec<PolicyError>> {
-    let mut policy = crate::policy::file::load_policy(path)?;
+/// Parse policy bytes and resolve its audit path relative to the policy file.
+pub(crate) fn parse_policy_bytes(path: &Path, bytes: &[u8]) -> Result<Policy, Vec<PolicyError>> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        vec![PolicyError {
+            message: "policy file is not UTF-8".into(),
+        }]
+    })?;
+    let mut policy = crate::policy::file::parse_policy(text)?;
     if let crate::policy::ReadLogSink::File { path: log, .. } = &mut policy.readlog
         && log.is_relative()
     {
@@ -217,6 +222,7 @@ pub(crate) fn load_policy(path: &Path) -> Result<Policy, Vec<PolicyError>> {
     }
     Ok(policy)
 }
+#[cfg(test)]
 fn reload_decision(
     candidate: Result<Policy, Vec<PolicyError>>,
     snapshot: &Snapshot,
@@ -225,7 +231,7 @@ fn reload_decision(
     crate::policy::validate::validate(&policy, snapshot)?;
     Ok(policy)
 }
-fn errors(errors: Vec<PolicyError>) -> String {
+pub(crate) fn errors(errors: Vec<PolicyError>) -> String {
     errors
         .into_iter()
         .map(|e| e.to_string().replace(['\r', '\n'], " "))
@@ -247,7 +253,7 @@ async fn terminate() {
     std::future::pending::<()>().await;
 }
 #[cfg(unix)]
-async fn hangup() {
+pub(crate) async fn hangup() {
     if let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
         signal.recv().await;
     } else {
@@ -255,20 +261,34 @@ async fn hangup() {
     }
 }
 #[cfg(not(unix))]
-async fn hangup() {
+pub(crate) async fn hangup() {
     std::future::pending::<()>().await;
 }
 
 /// Serve agents until a shutdown signal, draining active sessions for thirty seconds.
 pub async fn run(mut config: Config) -> Result<(), String> {
-    let policy = Arc::new(load_policy(&config.policy).map_err(errors)?);
+    let hub = crate::reload::Hub::new(&config.policy, config.policy_watch_ms)?;
+    let policy = hub.policy();
+    let (reload_tx, reload_rx) = mpsc::channel(1);
+    let admin_hub = hub.clone();
+    let status_hub = hub.clone();
+    let mut admin = AbortTask(tokio::spawn(crate::admin::serve_admin(
+        config.admin_listen,
+        Arc::new(move || admin_hub.metrics()),
+        reload_tx,
+        Arc::new(move || status_hub.status()),
+    )));
+    let reload_hub = hub.clone();
+    let reload_path = config.policy.clone();
+    let _reload = AbortTask(tokio::spawn(async move {
+        reload_hub.run(reload_path, reload_rx).await
+    }));
     let tasks = crate::task::TaskStore::open_dir(&config.state_dir.join("tasks"))
         .map_err(|_| "task store unavailable")?;
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let mut routes = JoinSet::new();
     if let Some(section) = config.spanner_native.take() {
-        let readlog =
-            crate::readlog::open_sink(&policy.readlog).map_err(|_| "read log unavailable")?;
+        let readlog = Box::new(hub.log.clone());
         let tls = config
             .tls
             .as_ref()
@@ -297,11 +317,19 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         }
         let policy = policy.clone();
         let tasks = tasks.clone();
-        let path = config.policy.clone();
+        let route_hub = hub.clone();
         let rx = rx.clone();
         routes.spawn(async move {
-            crate::spanner_serve::run_spanner(
-                &section, policy, root_key, tasks, readlog, standing, path, tls, rx,
+            crate::spanner_serve::run_spanner_with_hub(
+                &section,
+                policy,
+                root_key,
+                tasks,
+                readlog,
+                standing,
+                Some(route_hub),
+                tls,
+                rx,
             )
             .await
         });
@@ -310,7 +338,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         let rx = rx.clone();
         routes.spawn(async move {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let work = run_postgres(config, policy, tasks, rx.clone(), ready_tx);
+            let work = run_postgres(config, policy, tasks, rx.clone(), ready_tx, hub);
             tokio::pin!(work);
             tokio::select! {
                 biased;
@@ -320,7 +348,16 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             }
         });
     }
-    supervise(routes, shutdown).await
+    let supervision = supervise(routes, shutdown.clone());
+    tokio::pin!(supervision);
+    tokio::select! {
+        result = &mut supervision => result,
+        _ = &mut admin.0 => {
+            let _ = shutdown.send(true);
+            let _ = supervision.await;
+            Err("admin listener stopped".into())
+        }
+    }
 }
 async fn stopped(mut rx: tokio::sync::watch::Receiver<bool>) {
     loop {
@@ -354,9 +391,9 @@ async fn run_postgres(
     tasks: crate::task::TaskStore,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ready: tokio::sync::oneshot::Sender<()>,
+    hub: Arc<crate::reload::Hub>,
 ) -> Result<(), String> {
-    let readlog = crate::readlog::open_sink(&policy.readlog).map_err(|_| "read log unavailable")?;
-    let log = ReloadableLog(Arc::new(RwLock::new(readlog)));
+    let log = hub.log.clone();
     let upstream = config
         .upstream_config()
         .ok_or("PostgreSQL route unavailable")?;
@@ -367,7 +404,7 @@ async fn run_postgres(
     )
     .await
     .map_err(|_| "upstream schema snapshot timed out")??;
-    crate::policy::validate::validate(&policy, &first).map_err(errors)?;
+
     let tls = config
         .tls
         .as_ref()
@@ -402,32 +439,7 @@ async fn run_postgres(
         tokio::net::TcpListener::bind(config.listen.ok_or("agent listener unavailable")?)
             .await
             .map_err(|_| "agent listener unavailable")?;
-    let (reload_tx, mut reload_rx) = mpsc::channel(1);
-    let metrics_ctx = ctx.clone();
-    let admin = tokio::spawn(crate::admin::serve_admin(
-        config.admin_listen,
-        Arc::new(move || {
-            let s = metrics_ctx.metrics.snapshot();
-            let mut values = vec![
-                ("nunya_connections_total".into(), s.connections),
-                (
-                    "nunya_statements_allowed_total".into(),
-                    s.statements_allowed,
-                ),
-                ("nunya_bytes_total".into(), s.bytes),
-            ];
-            values.extend(
-                crate::error::NyCode::ALL
-                    .iter()
-                    .zip(s.statements_refused)
-                    .map(|(code, n)| (format!("nunya_refused_{}_total", code.sqlstate()), n)),
-            );
-            values
-        }),
-        reload_tx,
-    ));
-    let mut admin = AbortTask(admin);
-    let mut admin_finished = false;
+    hub.register(crate::reload::Route::Postgres(ctx.clone()))?;
     let config = Arc::new(config);
     let refresh_config = config.clone();
     let (snapshot_tx, mut snapshot_rx) = mpsc::channel(1);
@@ -476,14 +488,11 @@ async fn run_postgres(
     let mut sessions = JoinSet::new();
     let shutdown = stopped(shutdown_rx);
     tokio::pin!(shutdown);
-    let hup = hangup();
-    tokio::pin!(hup);
     let _ = ready.send(());
     eprintln!("serve: listening");
     let outcome = loop {
         tokio::select! {
             _ = &mut shutdown => break Ok(()),
-            _ = &mut admin.0 => { admin_finished = true; break Err("admin listener stopped".into()); },
             accepted = listener.accept() => {
                 let (mut tcp, _) = match accepted { Ok(pair) => pair, Err(_) => break Err("agent listener failed".into()) };
                 if tcp.set_nodelay(true).is_err() { continue; }
@@ -498,30 +507,8 @@ async fn run_postgres(
             }
             _ = sessions.join_next(), if !sessions.is_empty() => {},
             Some(new) = snapshot_rx.recv() => {
-                let policy = ctx.policy.read().map_err(|_| "policy lock unavailable")?;
-                match crate::policy::validate::validate(&policy, &new) {
-                    Ok(()) => *ctx.snapshot.write().map_err(|_| "snapshot lock unavailable")? = Arc::new(new),
-                    Err(e) => eprintln!("serve: refresh validation failed: {}", errors(e)),
-                }
-            }
-            _ = async { tokio::select! { _ = reload_rx.recv() => {}, _ = &mut hup => {} } } => {
-                hup.set(hangup());
-                let snapshot = ctx.snapshot.read().map_err(|_| "snapshot lock unavailable")?;
-                match reload_decision(load_policy(&config.policy), &snapshot) {
-                    Ok(new) => {
-                        let changed = ctx.policy.read().map_err(|_| "policy lock unavailable")?.readlog != new.readlog;
-                        let replacement = if changed { crate::readlog::open_sink(&new.readlog).map(Some) } else { Ok(None) };
-                        match replacement {
-                            Ok(sink) => {
-                                let mut audit = log.0.write().map_err(|_| "read log lock unavailable")?;
-                                if let Some(sink) = sink { *audit = sink; }
-                                *ctx.policy.write().map_err(|_| "policy lock unavailable")? = Arc::new(new);
-                                eprintln!("serve: policy reloaded");
-                            }
-                            Err(_) => eprintln!("serve: policy reload failed: read log unavailable"),
-                        }
-                    }
-                    Err(e) => eprintln!("serve: policy reload failed: {}", errors(e)),
+                if let Err(e) = hub.refresh(&crate::reload::Route::Postgres(ctx.clone()), new) {
+                    eprintln!("serve: refresh validation failed: {e}");
                 }
             }
         }
@@ -529,10 +516,6 @@ async fn run_postgres(
     eprintln!("serve: shutting down");
     drop(listener);
     drop(_refresher);
-    admin.0.abort();
-    if !admin_finished {
-        let _ = (&mut admin.0).await;
-    }
     if tokio::time::timeout(Duration::from_secs(30), async {
         while sessions.join_next().await.is_some() {}
     })
@@ -572,6 +555,18 @@ mod tests {
             snapshot_max_age_ms: 60000,
             readlog: crate::policy::ReadLogSink::Stdout,
         }
+    }
+    #[test]
+    fn captured_policy_bytes_resolve_relative_readlog() {
+        let policy = parse_policy_bytes(
+            Path::new("config/policy.toml"),
+            b"[readlog]\nsink = 'file'\npath = 'audit.jsonl'\n",
+        )
+        .unwrap();
+        assert!(
+            matches!(policy.readlog, crate::policy::ReadLogSink::File { path, .. } if path == Path::new("config/audit.jsonl"))
+        );
+        assert!(parse_policy_bytes(Path::new("unused"), &[255]).is_err());
     }
     #[test]
     fn reload_accepts_valid_and_refuses_parse_or_schema_errors() {

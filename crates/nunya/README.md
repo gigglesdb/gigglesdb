@@ -4,7 +4,7 @@
 
 Nunya is a separate database entry point for AI agents. Applications keep their existing direct database connections, connection strings and drivers. Agents use their own endpoint and per-task credentials; Nunya connects upstream with its own least-privilege role (`[upstream] user`) and replaces protected values with task-scoped tokens. Agents can carry tokens between approved columns without seeing the underlying values. Masked columns return a placeholder or SQL NULL. Unanalysable operations fail closed.
 
-`nunya serve --config <path>` starts the configured routes and snapshot refresh; the PostgreSQL route also starts the admin endpoint. Upstream TLS supports `disable`, `require` (encrypted, accepts any certificate), and `verify-full` (hostname verification against `ca_file` as the only trust root). Set `upstream.dialect` to `postgres` (default) or `spanner-pg` for Google PGAdapter. `max_connections` defaults to 256 and permits 1 through 10000 concurrent agent connections. Policies reload through the admin endpoint or Unix SIGHUP; invalid policies retain the current policy. Failed or unsafe snapshot refreshes retain the old snapshot until its age causes NY008 refusals. Ctrl-C or SIGTERM stops accepting and allows sessions up to 30 seconds to drain.
+`nunya serve --config <path>` starts the configured routes and snapshot refresh; the service also starts the admin endpoint. Upstream TLS supports `disable`, `require` (encrypted, accepts any certificate), and `verify-full` (hostname verification against `ca_file` as the only trust root). Set `upstream.dialect` to `postgres` (default) or `spanner-pg` for Google PGAdapter. `max_connections` defaults to 256 and permits 1 through 10000 concurrent agent connections. Policies reload across both routes through the admin endpoint or Unix SIGHUP; invalid policies retain the current policy. Optional `policy_watch_ms` (100 through 3600000) polls for changes and waits for two identical consecutive reads before attempting a reload. `GET /status` reports the applied policy hash, timestamps and last reload outcome. Failed or unsafe snapshot refreshes retain the old snapshot until its age causes NY008 refusals. Ctrl-C or SIGTERM stops accepting and allows sessions up to 30 seconds to drain.
 
 ## Threat model
 
@@ -79,7 +79,7 @@ digest, and every build runs the image with `--help`.
 
 ## Container or service
 
-Build from the repository root using `docker build -f crates/nunya/Dockerfile -t nunya .`. The image runs as uid 10001 and exposes port 6432. Mount a read-only configuration directory at `/etc/nunya` and a writable state directory owned by uid 10001 at the path configured by `state_dir`. Mount secret and TLS files read-only with permissions that let that uid read them. Set `[tls]` `cert_file` and `key_file` for agent TLS; without TLS, configuration requires explicit `allow_plaintext = true`. The admin address defaults to loopback port 6480; keep it private. Its health, metrics and reload routes have no authentication.
+Build from the repository root using `docker build -f crates/nunya/Dockerfile -t nunya .`. The image runs as uid 10001 and exposes port 6432. Mount a read-only configuration directory at `/etc/nunya` and a writable state directory owned by uid 10001 at the path configured by `state_dir`. Mount secret and TLS files read-only with permissions that let that uid read them. Set `[tls]` `cert_file` and `key_file` for agent TLS; without TLS, configuration requires explicit `allow_plaintext = true`. The admin address defaults to loopback port 6480; keep it private. Its `GET /health`, `GET /metrics`, `GET /status` and `POST /reload` routes have no authentication.
 
 For a service, use a dedicated unprivileged account, a private configuration directory, and a writable private state directory. Run `nunya serve --config /etc/nunya/nunya.toml`. Exit 0 means clean shutdown; exit 1 means a configuration or service error.
 
@@ -105,8 +105,8 @@ The native route can run alone (omit `[upstream]` and top-level `listen`) or bes
 the PostgreSQL route. At least one route is required. Both use the same policy,
 root key, task store, standing identities and inbound TLS certificate/key files.
 `policy check` validates the policy against every configured route's catalog.
-A Spanner-route policy change requires a restart; admin reload and SIGHUP reload
-only the PostgreSQL route. Native catalog snapshots still refresh periodically.
+Admin reload and Unix SIGHUP reload both routes together after validation against
+every current catalog. Native catalog snapshots still refresh periodically.
 
 Agents supply `Authorization: Bearer nunya.<user>.<secret>` metadata, using the
 user and secret returned by `task open` (user `task:<id>`), or a configured standing

@@ -91,6 +91,23 @@ pub async fn run_spanner(
     standing: BTreeMap<String, ScramVerifier>,
     _policy_path: PathBuf,
     tls: Option<tonic::transport::ServerTlsConfig>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    run_spanner_with_hub(
+        section, policy, root_key, tasks, readlog, standing, None, tls, shutdown,
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_spanner_with_hub(
+    section: &SpannerNativeSection,
+    policy: Arc<Policy>,
+    root_key: RootKey,
+    tasks: TaskStore,
+    readlog: Box<dyn ReadLog>,
+    standing: BTreeMap<String, ScramVerifier>,
+    hub: Option<Arc<crate::reload::Hub>>,
+    tls: Option<tonic::transport::ServerTlsConfig>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     if *shutdown.borrow() {
@@ -122,8 +139,10 @@ pub async fn run_spanner(
         let snapshot = crate::schema::spanner_gsql::load_gsql_snapshot(&runner, now())
             .await
             .map_err(|_| "spanner: catalog unavailable".to_owned())?;
-        crate::policy::validate::validate(&policy, &snapshot)
-            .map_err(|_| "spanner: policy validation failed".to_owned())?;
+        if hub.is_none() {
+            crate::policy::validate::validate(&policy, &snapshot)
+                .map_err(|_| "spanner: policy validation failed".to_owned())?;
+        }
         let ctx = Arc::new(SpannerContext {
             policy: RwLock::new(policy),
             snapshot: RwLock::new(Arc::new(snapshot)),
@@ -136,6 +155,9 @@ pub async fn run_spanner(
             clock: Arc::new(now),
             upstream,
         });
+        if let Some(hub) = &hub {
+            hub.register(crate::reload::Route::Spanner(ctx.clone()))?;
+        }
         let svc = proxy::build(ctx.clone())
             .await
             .map_err(|_| "spanner: upstream unavailable".to_owned())?;
@@ -147,6 +169,10 @@ pub async fn run_spanner(
                 if let Ok(snapshot) =
                     crate::schema::spanner_gsql::load_gsql_snapshot(&runner, now()).await
                 {
+                    if let Some(hub) = &hub {
+                        let _ = hub.refresh(&crate::reload::Route::Spanner(ctx.clone()), snapshot);
+                        continue;
+                    }
                     let policy = ctx
                         .policy
                         .read()

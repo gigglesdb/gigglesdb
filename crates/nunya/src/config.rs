@@ -67,6 +67,8 @@ pub struct Config {
     pub search_path: Vec<String>,
     /// Refresh interval in milliseconds.
     pub snapshot_refresh_ms: u64,
+    /// Optional policy polling interval in milliseconds.
+    pub policy_watch_ms: Option<u64>,
     /// Permit inbound plaintext.
     pub allow_plaintext: bool,
     /// Inbound TLS configuration.
@@ -128,7 +130,7 @@ macro_rules! strict_section {
     };
 }
 strict_section!(RawConfig,
-    _max=>"max_connections", _listen=>"listen", _admin=>"admin_listen", _policy=>"policy",
+    _watch=>"policy_watch_ms", _max=>"max_connections", _listen=>"listen", _admin=>"admin_listen", _policy=>"policy",
     _root=>"root_key_file", _state=>"state_dir", _schemas=>"schemas",
     _search=>"search_path", _refresh=>"snapshot_refresh_ms",
     _plaintext=>"allow_plaintext", _tls=>"tls", _upstream=>"upstream", _standing=>"standing", _spanner=>"spanner_native");
@@ -230,6 +232,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     let mut m = table(
         v,
         &[
+            "policy_watch_ms",
             "max_connections",
             "listen",
             "admin_listen",
@@ -312,6 +315,10 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     let snapshot_refresh_ms = get(&mut m, "snapshot_refresh_ms", &mut e).unwrap_or(30000);
     if snapshot_refresh_ms == 0 {
         err(&mut e, "snapshot_refresh_ms", "must be positive");
+    }
+    let policy_watch_ms: Option<u64> = get(&mut m, "policy_watch_ms", &mut e);
+    if policy_watch_ms.is_some_and(|ms| !(100..=3600000).contains(&ms)) {
+        err(&mut e, "policy_watch_ms", "must be from 100 to 3600000");
     }
     let max_connections = get(&mut m, "max_connections", &mut e).unwrap_or(256usize);
     if !(1..=10000).contains(&max_connections) {
@@ -464,6 +471,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         schemas,
         search_path,
         snapshot_refresh_ms,
+        policy_watch_ms,
         allow_plaintext,
         tls,
         standing,
@@ -519,8 +527,7 @@ mod tests {
             let mut nonce = [0u8; 16];
             getrandom::fill(&mut nonce).unwrap();
             let name = data_encoding::HEXLOWER.encode(&nonce);
-            let dir =
-                std::env::temp_dir().join(format!("config-{name}"));
+            let dir = std::env::temp_dir().join(format!("config-{name}"));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("root.key"), "ab".repeat(32)).unwrap();
             std::fs::write(dir.join("password"), "private-password\n").unwrap();
@@ -550,6 +557,25 @@ dbname = "app"
 password_file = "password"
 tls = "disable"
 "#;
+    #[test]
+    fn policy_watch_interval_bounds() {
+        let f = Fixture::new();
+        assert_eq!(f.load(EXAMPLE).unwrap().policy_watch_ms, None);
+        for ms in [100, 500, 3600000] {
+            let text =
+                EXAMPLE.replace("[upstream]", &format!("policy_watch_ms = {ms}\n[upstream]"));
+            assert_eq!(f.load(&text).unwrap().policy_watch_ms, Some(ms));
+        }
+        for ms in [99, 3600001] {
+            let text =
+                EXAMPLE.replace("[upstream]", &format!("policy_watch_ms = {ms}\n[upstream]"));
+            assert!(
+                f.load(&text)
+                    .unwrap_err()
+                    .contains(&"policy_watch_ms: must be from 100 to 3600000".to_owned())
+            );
+        }
+    }
     #[test]
     fn optional_routes_and_strict_native_settings() {
         let f = Fixture::new();

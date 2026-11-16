@@ -10,6 +10,7 @@ use tokio::{
 
 const REQUEST_LIMIT: usize = 8192;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+type Status = Arc<dyn Fn() -> String + Send + Sync>;
 type Metrics = Arc<dyn Fn() -> Vec<(String, u64)> + Send + Sync>;
 
 /// Serve one bounded HTTP/1.1 request per connection until the listener fails.
@@ -17,15 +18,17 @@ pub async fn serve_admin(
     addr: SocketAddr,
     metrics: Arc<dyn Fn() -> Vec<(String, u64)> + Send + Sync>,
     reload: mpsc::Sender<()>,
+    status: Status,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     loop {
         let (stream, _) = listener.accept().await?;
         let metrics = metrics.clone();
         let reload = reload.clone();
+        let status = status.clone();
         tokio::spawn(async move {
             // Client failures contain no diagnostics and do not stop the listener.
-            let _ = handle(stream, &metrics, &reload, READ_TIMEOUT).await;
+            let _ = handle(stream, &metrics, &reload, &status, READ_TIMEOUT).await;
         });
     }
 }
@@ -125,9 +128,7 @@ async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Vec<u8
             let total = end
                 .checked_add(request.body_len)
                 .filter(|n| *n <= REQUEST_LIMIT)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "request too large")
-                })?;
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "request too large"))?;
             expected = Some(total);
         }
     }
@@ -143,6 +144,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     metrics: &Metrics,
     reload: &mpsc::Sender<()>,
+    status: &Status,
     read_timeout: Duration,
 ) -> io::Result<()> {
     let (status, body, content_type) = match timeout(read_timeout, read_request(&mut stream)).await
@@ -160,6 +162,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 .map(|p| p + 4);
             let request = end.and_then(|end| parse_head(&bytes[..end]));
             match request.map(|r| (r.method, r.path)) {
+                Some(("GET", "/status")) => ("200 OK", status(), "text/plain"),
                 Some(("GET", "/health")) => ("200 OK", "ok".to_owned(), "text/plain"),
                 Some(("GET", "/metrics")) => {
                     let mut body = String::new();
@@ -202,13 +205,15 @@ mod tests {
             vec![
                 ("nunya_requests_total".into(), 7),
                 ("bad\nsecret".into(), 9),
+                ("nunya_policy_reloads_total".into(), 2),
+                ("nunya_policy_reload_failures_total".into(), 1),
+                ("nunya_policy_applied_unix_ms".into(), 123),
             ]
         });
         let (tx, rx) = mpsc::channel(1);
-        let task =
-            tokio::spawn(
-                async move { handle(server, &metrics, &tx, Duration::from_millis(20)).await },
-            );
+        let task = tokio::spawn(async move {
+            handle(server, &metrics, &tx, &(Arc::new(|| format!("policy_sha256={}\npolicy_applied_unix_ms=1\nlast_reload=none\nlast_reload_unix_ms=0\npolicy_watch=off\n", "a".repeat(64))) as Status), Duration::from_millis(20)).await
+        });
         client.write_all(request).await.unwrap();
         let mut response = String::new();
         client.read_to_string(&mut response).await.unwrap();
@@ -231,11 +236,22 @@ mod tests {
 
     #[tokio::test]
     async fn health_metrics_reload_and_missing_routes() {
+        let (status, _) = exchange(b"GET /status HTTP/1.1\r\nHost: local\r\n\r\n").await;
+        assert!(status.starts_with("HTTP/1.1 200"));
+        assert!(status.contains("Content-Type: text/plain\r\n"));
+        assert!(status.ends_with(&format!("policy_sha256={}\npolicy_applied_unix_ms=1\nlast_reload=none\nlast_reload_unix_ms=0\npolicy_watch=off\n", "a".repeat(64))));
         let (health, _) = exchange(b"GET /health HTTP/1.1\r\nHost: local\r\n\r\n").await;
         assert!(health.starts_with("HTTP/1.1 200"));
         assert!(health.ends_with("\r\n\r\nok"));
         let (metrics, _) = exchange(b"GET /metrics HTTP/1.1\r\nHost: local\r\n\r\n").await;
-        assert!(metrics.ends_with("nunya_requests_total 7\n"));
+        assert!(metrics.contains("nunya_requests_total 7\n"));
+        for name in [
+            "nunya_policy_reloads_total",
+            "nunya_policy_reload_failures_total",
+            "nunya_policy_applied_unix_ms",
+        ] {
+            assert!(metrics.contains(name));
+        }
         assert!(!metrics.contains("secret"));
         let (reload, mut rx) =
             exchange(b"POST /reload HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\nabc").await;
@@ -275,8 +291,9 @@ mod tests {
             } else {
                 tx.try_send(()).unwrap();
             }
-            let task =
-                tokio::spawn(async move { handle(server, &metrics, &tx, READ_TIMEOUT).await });
+            let task = tokio::spawn(async move {
+                handle(server, &metrics, &tx, &(Arc::new(|| format!("policy_sha256={}\npolicy_applied_unix_ms=1\nlast_reload=none\nlast_reload_unix_ms=0\npolicy_watch=off\n", "a".repeat(64))) as Status), READ_TIMEOUT).await
+            });
             client
                 .write_all(b"POST /reload HTTP/1.1\r\nHost: local\r\n\r\n")
                 .await
