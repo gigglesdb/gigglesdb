@@ -82,6 +82,14 @@ pub struct AuthInterceptor {
     /// Gateway-only bearer token.
     pub(super) token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
+fn tokenize_refusal(error: TokenizeError) -> NyCode {
+    match error {
+        TokenizeError::LimitReached => NyCode::TokenizeLimit,
+        TokenizeError::Ended => NyCode::SessionEnded,
+        TokenizeError::Store => NyCode::ReadLogUnavailable,
+    }
+}
+
 impl Interceptor for AuthInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         req.metadata_mut().remove("authorization");
@@ -522,6 +530,17 @@ impl NunyaSpanner {
         rows: u64,
         tokens: Vec<String>,
     ) -> Result<(), Status> {
+        Self::audit_outcome(ctx, watchers, who, label, rows, tokens, Outcome::Allowed)
+    }
+    fn audit_outcome(
+        ctx: &SpannerContext,
+        watchers: &Mutex<HashMap<SessionId, SessionWatcher>>,
+        who: &Authenticated,
+        label: &str,
+        rows: u64,
+        tokens: Vec<String>,
+        outcome: Outcome,
+    ) -> Result<(), Status> {
         // Fingerprint the original agent statement; log no literals, tokens, or upstream values.
         ctx.readlog
             .write(&ReadLogRecord {
@@ -538,7 +557,7 @@ impl NunyaSpanner {
                     &crate::readlog::redact_tokenize_args(label),
                 ),
                 statement: "Spanner operation".into(),
-                outcome: Outcome::Allowed,
+                outcome,
                 rows,
                 tokens_released: tokens,
             })
@@ -737,10 +756,14 @@ impl NunyaSpanner {
             .authority
             .record_tokenization(who.session, domain, &limits)
             .map_err(|error| {
-                nunya_status(match error {
-                    TokenizeError::LimitReached => NyCode::TokenizeLimit,
-                    TokenizeError::Ended | TokenizeError::Store => NyCode::SessionEnded,
-                })
+                let code = tokenize_refusal(error);
+                match Self::audit_outcome(
+                    &self.ctx, &self.watchers, who, "Spanner nunya_tokenize", 0, vec![],
+                    Outcome::Refused(code),
+                ) {
+                    Ok(()) => nunya_status(code),
+                    Err(error) => error,
+                }
             })?;
         let code = if ty == ColumnType::Int8 {
             TypeCode::Int64
@@ -1068,7 +1091,9 @@ impl SpannerService for NunyaSpanner {
         } else {
             label
         };
-        Self::audit(&self.ctx, &self.watchers, &who, &label, 0, vec![])?;
+        if plan.tokenize.is_none() {
+            Self::audit(&self.ctx, &self.watchers, &who, &label, 0, vec![])?;
+        }
         if let Some(result) =
             self.local_tokenize(&who, &policy, &plan, &names, &req.params, &req.param_types)?
         {
@@ -1125,7 +1150,9 @@ impl SpannerService for NunyaSpanner {
         } else {
             label
         };
-        Self::audit(&self.ctx, &self.watchers, &who, &label, 0, vec![])?;
+        if plan.tokenize.is_none() {
+            Self::audit(&self.ctx, &self.watchers, &who, &label, 0, vec![])?;
+        }
         if let Some(result) =
             self.local_tokenize(&who, &policy, &plan, &names, &req.params, &req.param_types)?
         {
@@ -2453,9 +2480,20 @@ mod tests {
         );
         assert!(f.fake.seen.lock().unwrap().is_empty());
     }
+    #[test]
+    fn tokenization_store_refuses_as_unavailable() {
+        assert_eq!(tokenize_refusal(TokenizeError::Ended), NyCode::SessionEnded);
+        let code = tokenize_refusal(TokenizeError::Store);
+        assert_eq!(code, NyCode::ReadLogUnavailable);
+        assert_eq!(nunya_status(code).code(), tonic::Code::FailedPrecondition);
+    }
     #[tokio::test]
     async fn tokenization_uses_durable_session_counter() {
-        let f = Fixture::new().await;
+        let records = Arc::new(Mutex::new(vec![]));
+        let f = Fixture::with_log(Box::new(CaptureLog(
+            records.clone(),
+            Arc::new(Mutex::new(vec![])),
+        ))).await;
         let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
         let policy = f.svc.ctx.policy.read().unwrap().clone();
         let plan = RewritePlan {
@@ -2484,7 +2522,13 @@ mod tests {
                 .unwrap(),
             10
         );
+        records.lock().unwrap().clear();
         assert!(tokenize().unwrap_err().message().contains("NY007"));
+        {
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(matches!(records[0].outcome, Outcome::Refused(NyCode::TokenizeLimit)));
+        }
         assert_eq!(
             f.svc
                 .ctx

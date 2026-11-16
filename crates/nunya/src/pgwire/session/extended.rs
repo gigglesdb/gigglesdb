@@ -79,13 +79,11 @@ impl Session {
         self.drain_local(&mut out);
         out
     }
-    fn ext_refuse(&mut self, sql: &str, code: NyCode, aborted: bool) -> Actions {
+    /// Refuse a local extended request and wait for Sync unless the session must close.
+    pub(super) fn ext_refuse(&mut self, sql: &str, code: NyCode, aborted: bool) -> Actions {
         self.skip = true;
         self.rollback_on_sync |= self.extended_execute_forwarded;
         let mut local = self.refuse(sql, code, false);
-        if code == NyCode::ReadLogUnavailable {
-            local.close = true;
-        }
         if aborted && !local.close {
             local.client[0] = Backend::ErrorResponse(redact_error(&[(b'C', "25P02".into())]));
         }
@@ -417,13 +415,12 @@ impl Session {
                         let (domain, _) = p.plan.tokenize.as_ref().ok_or_else(protocol)?;
                         let ty = p.token_ty.as_ref().ok_or_else(protocol)?;
                         let settings = p.policy.domains.get(domain).ok_or_else(protocol)?;
+                        self.record_tokenization(domain)?;
                         self.ctx
                             .metrics
                             .statements_allowed
                             .fetch_add(1, Ordering::Relaxed);
                         let mut record = self.record(&p.sql, Outcome::Allowed);
-                        self.ctx.readlog.write(&record)?;
-                        self.record_tokenization(domain)?;
                         let token = self.ctx.codec.encode(
                             &self.keys,
                             domain,

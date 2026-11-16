@@ -6,6 +6,15 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
+/// Default iteration count for generated access-session SCRAM verifiers.
+pub const SESSION_SCRAM_ITERATIONS: u32 = 4096;
+
+/// Derive the same dummy public salt for each raw startup login name.
+pub(crate) fn dummy_scram_salt(root: &crate::token::keys::RootKey, user: &str) -> Vec<u8> {
+    let key = crate::token::keys::dummy_scram_key(root);
+    mac(key.as_ref(), user.as_bytes())[..16].to_vec()
+}
+
 fn denied() -> Refusal {
     Refusal::new(NyCode::TokenNotValid, "authentication failed")
 }
@@ -347,6 +356,19 @@ mod tests {
             format!("v={}", BASE64.encode(&mac(&v.server_key, auth.as_bytes()))).into_bytes(),
         )
     }
+    #[test]
+    fn dummy_salt_is_stable_and_bound_to_user_and_root() {
+        let root = crate::token::keys::RootKey::from_hex(&"00".repeat(32)).unwrap();
+        let other = crate::token::keys::RootKey::from_hex(&"01".repeat(32)).unwrap();
+        let salt = dummy_scram_salt(&root, "nunya_session_dead");
+        assert!(salt.len() == 16);
+        assert!(salt == dummy_scram_salt(&root, "nunya_session_dead"));
+        assert!(salt != dummy_scram_salt(&root, "nunya_session_other"));
+        assert!(salt != dummy_scram_salt(&other, "nunya_session_dead"));
+        let live = crate::mgmt::client::SessionSecret::generate();
+        assert!(live.scram_iterations == SESSION_SCRAM_ITERATIONS);
+    }
+
     #[test]
     fn overlap_accepts_each_password_with_its_server_signature() {
         for password in ["password-a", "password-b"] {

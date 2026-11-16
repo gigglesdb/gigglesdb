@@ -34,6 +34,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 fn failure(code: NyCode) -> Refusal {
     Refusal::new(code, "session refused")
 }
+fn tokenize_refusal(error: TokenizeError) -> NyCode {
+    match error {
+        TokenizeError::LimitReached => NyCode::TokenizeLimit,
+        TokenizeError::Ended => NyCode::SessionEnded,
+        TokenizeError::Store => NyCode::ReadLogUnavailable,
+    }
+}
 fn protocol() -> Refusal {
     failure(NyCode::ProtocolNotAllowed)
 }
@@ -274,14 +281,7 @@ impl Session {
                         .unwrap_or(u64::MAX),
                 },
             )
-            .map_err(|error| {
-                failure(match error {
-                    TokenizeError::LimitReached => NyCode::TokenizeLimit,
-                    TokenizeError::Ended => NyCode::SessionEnded,
-                    // Unavailable authorization state must fail closed.
-                    TokenizeError::Store => NyCode::SessionEnded,
-                })
-            })
+            .map_err(|error| failure(tokenize_refusal(error)))
     }
     /// Consume an agent request without performing network I/O.
     pub fn frontend(&mut self, msg: Frontend) -> Actions {
@@ -380,9 +380,11 @@ impl Session {
                 let text = sql
                     .get(statement.source_span.start..statement.source_span.end)
                     .ok_or_else(protocol)?;
-                self.ctx
-                    .readlog
-                    .write(&self.record(text, Outcome::Allowed))?;
+                if plans.first().is_none_or(|plan| plan.tokenize.is_none()) {
+                    self.ctx
+                        .readlog
+                        .write(&self.record(text, Outcome::Allowed))?;
+                }
             }
             self.ctx
                 .metrics
@@ -483,14 +485,7 @@ impl Session {
                 }
                 out
             }
-            Err(e) => {
-                let mut out = self.refuse(sql, e.code, true);
-                if e.code == NyCode::ReadLogUnavailable {
-                    out.close = true;
-                    out.client.truncate(1);
-                }
-                out
-            }
+            Err(e) => self.refuse(sql, e.code, true),
         }
     }
     /// Consume an upstream response, sanitizing every data-bearing result.
@@ -1154,8 +1149,8 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
     let verifiers = match candidate {
         Some(v) => v,
         None => vec![ScramVerifier {
-            salt: random::<16>()?.to_vec(),
-            iterations: 4096,
+            salt: auth::dummy_scram_salt(&ctx.root_key, &user),
+            iterations: auth::SESSION_SCRAM_ITERATIONS,
             stored_key: random::<32>()?,
             server_key: random::<32>()?,
         }],
@@ -2709,6 +2704,49 @@ mod tests {
             principal_window: std::time::Duration::from_secs(86400),
         };
         *f.ctx.policy.write().unwrap() = Arc::new(policy);
+    }
+    #[test]
+    fn tokenization_store_refusal_keeps_session_open() {
+        assert_eq!(tokenize_refusal(TokenizeError::Store), NyCode::ReadLogUnavailable);
+        assert_eq!(tokenize_refusal(TokenizeError::Ended), NyCode::SessionEnded);
+        assert_eq!(tokenize_refusal(TokenizeError::LimitReached), NyCode::TokenizeLimit);
+        for extended in [false, true] {
+            let f = Fixture::new();
+            let mut s = f.session();
+            let sql = "SELECT nunya_tokenize('secret', 'private')";
+            let out = if extended {
+                s.ext_refuse(sql, tokenize_refusal(TokenizeError::Store), false)
+            } else {
+                s.refuse(sql, tokenize_refusal(TokenizeError::Store), true)
+            };
+            assert_eq!(code(&out), "NY009");
+            assert!(!out.close);
+            assert!(out.upstream.is_empty());
+            let ready = if extended {
+                assert!(!s.frontend(Frontend::Sync).close);
+                s.backend(Backend::ReadyForQuery(b'I'))
+            } else {
+                out
+            };
+            assert!(ready.client.iter().any(|m| matches!(m, Backend::ReadyForQuery(b'I'))));
+            assert!(f.ctx.authority.session_login(s.session, &f.ctx.route).is_some());
+        }
+    }
+    #[test]
+    fn tokenize_limit_audit_has_only_refused_record() {
+        for extended in [false, true] {
+            let f = Fixture::new();
+            set_tokenize_limits(&f, 1, 20);
+            let mut s = f.session();
+            assert!(tokenize(&mut s, extended).client.iter().any(|m| matches!(m, Backend::DataRow(_))));
+            f.identities.lock().unwrap().clear();
+            let allowed = f.allowed_records.load(Ordering::Relaxed);
+            assert_eq!(code(&tokenize(&mut s, extended)), "NY007");
+            assert_eq!(f.allowed_records.load(Ordering::Relaxed), allowed);
+            let records = f.identities.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(matches!(records[0].outcome, Outcome::Refused(NyCode::TokenizeLimit)));
+        }
     }
     #[test]
     fn durable_tokenize_session_limit_survives_reconnect() {

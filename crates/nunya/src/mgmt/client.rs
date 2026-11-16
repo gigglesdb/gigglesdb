@@ -167,14 +167,14 @@ impl SessionSecret {
         getrandom::fill(bytes.as_mut()).expect("session entropy unavailable");
         getrandom::fill(&mut salt).expect("session entropy unavailable");
         let secret = Zeroizing::new(data_encoding::HEXLOWER.encode(bytes.as_ref()));
-        let verifier = ScramVerifier::from_password(&secret, &salt, 4096).to_pg_string();
+        let verifier = ScramVerifier::from_password(&secret, &salt, crate::pgwire::auth::SESSION_SCRAM_ITERATIONS).to_pg_string();
         let sha256_hex = data_encoding::HEXLOWER.encode(&Sha256::digest(secret.as_bytes()));
         Self {
             secret,
             verifier,
             sha256_hex,
             scram_salt: data_encoding::BASE64.encode(&salt),
-            scram_iterations: 4096,
+            scram_iterations: crate::pgwire::auth::SESSION_SCRAM_ITERATIONS,
         }
     }
 }

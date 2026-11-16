@@ -54,6 +54,15 @@ impl RootKey {
         Self::from_hex(&value)
     }
 }
+/// Derive a secret key for deterministic dummy SCRAM salts.
+pub(crate) fn dummy_scram_key(root: &RootKey) -> Zeroizing<[u8; 32]> {
+    let mut output = Zeroizing::new([0; 32]);
+    Hkdf::<Sha256>::new(None, &root.0)
+        .expand(b"nunya-pg-scram-dummy-salt-v1", output.as_mut())
+        .expect("fixed HKDF output length");
+    output
+}
+
 /// Derive the domain-separated root-key continuity value.
 pub(crate) fn root_check(root: &RootKey) -> [u8; 32] {
     let mut output = [0; 32];
