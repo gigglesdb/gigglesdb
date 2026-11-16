@@ -98,9 +98,19 @@ fn v2_order_by_spills_and_returns_every_row_in_order() {
     assert_eq!(rows[0].values[1], Value::Text(text(expected[0])));
     assert_eq!(dir.files(), 0);
 
+    // Callers that materialise whole results (HTTP/gRPC API, native reads)
+    // keep the per-statement result budget: 54000, no spill file.
+    let bounded = spill::bounded(|| s.execute("SELECT id, w FROM t ORDER BY w DESC", &[], None));
+    assert_eq!(bounded, Err(CoreError::Sql(SqlError::Limit)));
+    assert_eq!(dir.files(), 0);
+
     // Top-N stays in memory and is unchanged.
     let r = s.execute("SELECT id FROM t ORDER BY k DESC NULLS LAST LIMIT 10", &[], None).unwrap();
     assert_eq!(ids(&r.rows), by_key(true, false)[..10]);
+    // A large OFFSET + LIMIT sorts externally, like the unlimited sort.
+    let r = s.execute("SELECT id FROM t ORDER BY k DESC NULLS LAST LIMIT 20 OFFSET 150000", &[], None).unwrap();
+    assert_eq!(ids(&r.rows), by_key(true, false)[150_000..150_020]);
+    assert_eq!(dir.files(), 0);
 
     // SqlSession cursors read the spilled result in chunks; dropping one early removes it.
     let p = s.prepare("SELECT id FROM t ORDER BY k DESC").unwrap();

@@ -322,11 +322,17 @@ pub(crate) fn visit_page(
         for pair in txn.scan(Keyspace::Index, after.as_ref().map(Vec::as_slice),
             hi.as_ref().map(Vec::as_slice), Direction::Forward, Some(page_rows))? {
             let (key, pk) = pair?;
-            retention.charge(key.len().saturating_add(pk.len()).saturating_add(64))
-                .map_err(CoreError::Sql)?;
-            entries.push((key, pk));
+            // A page is a batch, not a result: a full page budget ends the page
+            // early (the caller resumes after its last key); only a single
+            // oversized entry fails.
+            match retention.charge(key.len().saturating_add(pk.len()).saturating_add(64)) {
+                Err(error) if entries.is_empty() => return Err(CoreError::Sql(error)),
+                Err(_) => break,
+                Ok(()) => entries.push((key, pk)),
+            }
         }
         let last = entries.last().map(|(key, _)| key.clone());
+        let mut visited = None;
         for (key, pk) in entries {
         crate::cancellation::check()?;
         if !key.starts_with(&prefix) {
@@ -337,17 +343,14 @@ pub(crate) fn visit_page(
         let bytes = txn
             .get(Keyspace::Rows, &row_key)?
             .ok_or_else(|| CoreError::Corrupt("dangling index entry".into()))?;
-        retention
-            .charge(
-                bytes.len().saturating_mul(2).saturating_add(
-                    table
-                        .def
-                        .columns
-                        .len()
-                        .saturating_mul(std::mem::size_of::<Value>()),
-                ),
-            )
-            .map_err(CoreError::Sql)?;
+        let charged = retention.charge(bytes.len().saturating_mul(2).saturating_add(
+            table.def.columns.len().saturating_mul(std::mem::size_of::<Value>()),
+        ));
+        match charged {
+            Err(error) if visited.is_none() => return Err(CoreError::Sql(error)),
+            Err(_) => return Ok(visited),
+            Ok(()) => {}
+        }
         let row = super::rows::decode(&row_key, &bytes, table.def.columns.len())?;
         let witness = BTreeMap::from([(
             Vec::new(),
@@ -361,6 +364,7 @@ pub(crate) fn visit_page(
             return Err(CoreError::Corrupt("index entry disagrees with row".into()));
         }
         visitor(pk, row)?;
+        visited = Some(key);
         }
     Ok(last)
 }

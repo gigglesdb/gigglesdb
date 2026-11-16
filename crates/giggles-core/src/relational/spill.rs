@@ -3,9 +3,11 @@
 //!
 //! Rows stay in memory up to `SPILL_BYTES`, then move to a private temp file
 //! that is deleted on drop, so error, rollback and unwind paths clean up.
-//! A completed spill reaches the caller through a thread-local slot: callers
-//! inside [`streaming`] read it sequentially; every other SqlSession caller
-//! gets the rows materialised into `SqlResult::rows` (never truncated).
+//! A completed spill reaches the caller through a thread-local slot: the first
+//! outermost statement inside [`streaming`] that spills leaves it for that
+//! caller; nested or later statements, and every other SqlSession caller, get
+//! the rows materialised into `SqlResult::rows` (never truncated), except that
+//! inside [`bounded`] output past the result budget fails with 54000.
 //! [`sort_external`] keeps `SORT_BYTES` of sort input in memory, writes sorted
 //! runs past that and merges them, stable in input order.
 use super::{SqlError, SqlResult, SqlRow, scan, searched};
@@ -23,19 +25,26 @@ use std::sync::atomic::AtomicU64;
 pub const SPILL_BYTES: usize = super::MAX_RESULT_BYTES;
 /// Sort input kept in memory before sorted runs spill (PostgreSQL's default work_mem).
 pub const SORT_BYTES: usize = 4 * 1024 * 1024;
+/// Sort memory before a run spills: work_mem, but at most an eighth of the
+/// statement retention ledger so pages, group state and other sorters fit.
+pub(crate) fn work_mem() -> usize {
+    SORT_BYTES.min(scan::retention_limit() / 8)
+}
 /// Runs merged at once; more runs are first merged into longer runs.
 const MERGE_FAN_IN: usize = 64;
 
 thread_local! {
     static STREAMING: Cell<bool> = const { Cell::new(false) };
     static ARMED: Cell<bool> = const { Cell::new(false) };
+    static BOUNDED: Cell<bool> = const { Cell::new(false) };
     static SLOT: RefCell<Option<SpilledRows>> = const { RefCell::new(None) };
     static ERROR: RefCell<Option<CoreError>> = const { RefCell::new(None) };
     static DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
+/// A temp-file failure: 53100 disk_full when the device is full, else 58030.
 fn io(error: std::io::Error) -> CoreError {
-    CoreError::Storage(format!("spill file: {error}"))
+    CoreError::TempFile { disk_full: error.kind() == std::io::ErrorKind::StorageFull, detail: error.to_string() }
 }
 
 /// Carry a non-SQL spill error through SQL execution; [`statement`] restores it.
@@ -78,18 +87,29 @@ pub fn streaming<T>(f: impl FnOnce() -> T) -> (T, Option<SpilledRows>) {
     (value, SLOT.take())
 }
 
+/// Run `f` for a caller that materialises whole results (HTTP/gRPC API, native
+/// reads): statement output stays in memory and fails with 54000 past the
+/// per-statement result budget instead of spilling (their pre-spill contract).
+pub fn bounded<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BOUNDED.set(self.0);
+        }
+    }
+    let _reset = Reset(BOUNDED.replace(true));
+    f()
+}
+
 /// Override this thread's spill directory (default: the process temp dir).
 pub fn set_thread_dir(dir: Option<PathBuf>) {
     DIR.set(dir);
 }
 
-/// Drop any spill left by an earlier statement on this thread.
-pub(crate) fn clear() {
-    SLOT.take();
-}
-
 /// One SqlSession statement: arms SELECT output spills, settles the slot, and
 /// drops any spill when `f` errors or unwinds (the slot never outlives it).
+/// A nested statement (or one after the streamed one) never takes, hides or
+/// drops another statement's spill: the slot is saved and restored around it.
 pub(crate) fn statement(f: impl FnOnce() -> Result<SqlResult, CoreError>) -> Result<SqlResult, CoreError> {
     struct Armed(bool);
     impl Drop for Armed {
@@ -101,20 +121,26 @@ pub(crate) fn statement(f: impl FnOnce() -> Result<SqlResult, CoreError>) -> Res
             }
         }
     }
-    clear();
-    ERROR.take();
+    let saved = SLOT.take();
+    let outer_error = ERROR.take();
     let armed = Armed(ARMED.replace(true));
+    let nested = armed.0;
     let result = f();
     drop(armed);
-    let stashed = ERROR.take();
-    settle(result.map_err(|error| match (error, stashed) {
+    let stashed = ERROR.replace(outer_error);
+    let result = settle(result.map_err(|error| match (error, stashed) {
         (CoreError::Sql(SqlError::Unsupported), Some(stashed)) => stashed,
         (error, _) => error,
-    }))
+    }), !nested && STREAMING.get());
+    if SLOT.with_borrow(Option::is_none) {
+        SLOT.set(saved);
+    }
+    result
 }
 
-/// Statement boundary: drop a spill on error; materialise it unless streaming.
-pub(crate) fn settle(result: Result<SqlResult, CoreError>) -> Result<SqlResult, CoreError> {
+/// Statement boundary: drop a spill on error; leave it for a streaming caller
+/// (consuming that caller's one stream) or materialise it.
+fn settle(result: Result<SqlResult, CoreError>, stream: bool) -> Result<SqlResult, CoreError> {
     let mut result = match result {
         Ok(result) => result,
         Err(error) => {
@@ -122,13 +148,10 @@ pub(crate) fn settle(result: Result<SqlResult, CoreError>) -> Result<SqlResult, 
             return Err(error);
         }
     };
-    if !STREAMING.get()
-        && let Some(spilled) = SLOT.take()
-    {
-        result.rows.reserve(spilled.len().try_into().unwrap_or(0));
-        for row in spilled {
-            result.rows.push(row?);
-        }
+    if stream && SLOT.with_borrow(Option::is_some) {
+        STREAMING.set(false);
+    } else if let Some(spilled) = SLOT.take() {
+        result.rows = spilled.materialise()?;
     }
     Ok(result)
 }
@@ -161,6 +184,9 @@ impl RowBuffer {
         self.bytes = self.bytes.saturating_add(bytes);
         self.rows.push(row);
         if self.bytes > SPILL_BYTES {
+            if BOUNDED.get() && !STREAMING.get() {
+                return Err(CoreError::Sql(SqlError::Limit));
+            }
             self.spill()?;
         }
         Ok(())
@@ -177,7 +203,8 @@ impl RowBuffer {
         Ok(())
     }
 
-    /// Store in-memory rows in `result`, or publish the spill for this statement.
+    /// Store in-memory rows in `result`, or publish the spill for this
+    /// statement; outside a statement nothing settles a slot, so read it back.
     pub(crate) fn finish(self, result: &mut SqlResult) -> Result<(), CoreError> {
         let Some((writer, temp)) = self.file else {
             result.rows = self.rows;
@@ -185,8 +212,8 @@ impl RowBuffer {
         };
         let mut file = writer.into_inner().map_err(|e| io(e.into_error()))?;
         file.seek(SeekFrom::Start(0)).map_err(io)?;
-        result.rows = Vec::new();
-        SLOT.set(Some(SpilledRows { reader: BufReader::new(file), remaining: self.count, temp }));
+        let spilled = SpilledRows { reader: BufReader::new(file), remaining: self.count, temp, failed: None };
+        result.rows = if armed() { SLOT.set(Some(spilled)); Vec::new() } else { spilled.materialise()? };
         Ok(())
     }
 }
@@ -203,12 +230,16 @@ fn create(kind: &str) -> Result<(File, TempPath), CoreError> {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         u64::from_le_bytes(nonce)
     ));
-    let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).map_err(io)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(&path).map_err(io)?;
     Ok((file, TempPath(path)))
 }
 
 fn write_item<T: Serialize>(writer: &mut BufWriter<File>, item: &T) -> Result<(), CoreError> {
-    let bytes = bincode::serialize(item).map_err(|e| CoreError::Storage(e.to_string()))?;
+    let bytes = bincode::serialize(item).map_err(|e| io(std::io::Error::other(e)))?;
     let len = u32::try_from(bytes.len()).map_err(|_| CoreError::Sql(SqlError::Limit))?;
     writer.write_all(&len.to_le_bytes()).map_err(io)?;
     writer.write_all(&bytes).map_err(io)
@@ -219,14 +250,16 @@ fn read_item<T: DeserializeOwned>(reader: &mut BufReader<File>) -> Result<T, Cor
     reader.read_exact(&mut len).map_err(io)?;
     let mut bytes = vec![0; u32::from_le_bytes(len) as usize];
     reader.read_exact(&mut bytes).map_err(io)?;
-    bincode::deserialize(&bytes).map_err(|e| CoreError::Storage(e.to_string()))
+    bincode::deserialize(&bytes).map_err(|e| io(std::io::Error::other(e)))
 }
 
 /// Rows of one completed statement, read once in order from a temp file.
+/// A read error is sticky: every later read repeats it, never a short end.
 pub struct SpilledRows {
     reader: BufReader<File>,
     remaining: u64,
     temp: TempPath,
+    failed: Option<CoreError>,
 }
 
 impl std::fmt::Debug for SpilledRows {
@@ -240,8 +273,24 @@ impl SpilledRows {
     pub fn len(&self) -> u64 {
         self.remaining
     }
+    /// True only once every row was read successfully.
     pub fn is_empty(&self) -> bool {
-        self.remaining == 0
+        self.remaining == 0 && self.failed.is_none()
+    }
+    fn materialise(self) -> Result<Vec<SqlRow>, CoreError> {
+        let mut rows = Vec::with_capacity(self.remaining.try_into().unwrap_or(0));
+        for row in self {
+            rows.push(row?);
+            if rows.len().is_multiple_of(4096) {
+                crate::cancellation::check()?;
+            }
+        }
+        Ok(rows)
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_next_read(&mut self) {
+        // A write-only handle: the next read fails like a lost or damaged file.
+        self.reader = BufReader::new(OpenOptions::new().write(true).open(&self.temp.0).expect("reopen"));
     }
     /// The backing temp file, removed when this handle drops.
     pub fn path(&self) -> &Path {
@@ -252,19 +301,18 @@ impl SpilledRows {
 impl Iterator for SpilledRows {
     type Item = Result<SqlRow, CoreError>;
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(error) = &self.failed {
+            return Some(Err(error.clone()));
+        }
         if self.remaining == 0 {
             return None;
         }
-        self.remaining -= 1;
         let row = read_item(&mut self.reader);
-        if row.is_err() {
-            self.remaining = 0;
+        match &row {
+            Ok(_) => self.remaining -= 1,
+            Err(error) => self.failed = Some(error.clone()),
         }
         Some(row)
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = usize::try_from(self.remaining).unwrap_or(usize::MAX);
-        (n, Some(n))
     }
 }
 
@@ -272,6 +320,8 @@ impl Iterator for SpilledRows {
 pub(crate) struct Run {
     reader: BufReader<File>,
     remaining: u64,
+    /// Merge passes behind this run (0 = written from memory).
+    level: u32,
     _temp: TempPath,
 }
 
@@ -285,7 +335,7 @@ fn write_run<T: Serialize>(items: impl Iterator<Item = Result<T, SqlError>>) -> 
     }
     let mut file = writer.into_inner().map_err(|e| sql_error(io(e.into_error())))?;
     file.seek(SeekFrom::Start(0)).map_err(|e| sql_error(io(e)))?;
-    Ok(Run { reader: BufReader::new(file), remaining, _temp: temp })
+    Ok(Run { reader: BufReader::new(file), remaining, level: 0, _temp: temp })
 }
 
 pub(crate) enum Input<T> {
@@ -393,14 +443,43 @@ impl<T: Serialize + DeserializeOwned> Sorter<T> {
         cmp: C,
         retention: &mut impl scan::RetentionBudget,
     ) -> Result<(), SqlError> {
-        if !self.memory.is_empty() && self.bytes.saturating_add(n) > SORT_BYTES {
-            self.memory.sort_by(cmp);
-            self.runs.push(write_run(self.memory.drain(..).map(Ok))?);
-            retention.release(std::mem::take(&mut self.bytes));
+        if !self.memory.is_empty() && self.bytes.saturating_add(n) > work_mem() {
+            self.spill_run(cmp, retention)?;
         }
-        retention.charge(n)?;
+        // Less than work_mem left in the statement ledger: spill, don't fail.
+        if retention.charge(n).is_err() {
+            if self.memory.is_empty() {
+                return Err(SqlError::Limit);
+            }
+            self.spill_run(cmp, retention)?;
+            retention.charge(n)?;
+        }
         self.bytes += n;
         self.memory.push(item);
+        Ok(())
+    }
+
+    /// Writes memory as a run. Every `MERGE_FAN_IN` newest runs of one level
+    /// merge into one run of the next level, so open run files stay at most
+    /// `MERGE_FAN_IN` per level (logarithmic in input size); adjacent runs
+    /// merge in input order, so ties stay stable.
+    fn spill_run<C: Fn(&T, &T) -> Ordering + Copy>(
+        &mut self,
+        cmp: C,
+        retention: &mut impl scan::RetentionBudget,
+    ) -> Result<(), SqlError> {
+        self.memory.sort_by(cmp);
+        self.runs.push(write_run(self.memory.drain(..).map(Ok))?);
+        retention.release(std::mem::take(&mut self.bytes));
+        while let Some(tail) = self.runs.len().checked_sub(MERGE_FAN_IN)
+            && self.runs[tail..].iter().all(|run| run.level == self.runs[tail].level)
+        {
+            let level = self.runs[tail].level + 1;
+            let inputs = self.runs.drain(tail..).map(Input::Run).collect();
+            let mut merged = write_run(Merge::new(inputs, cmp)?)?;
+            merged.level = level;
+            self.runs.push(merged);
+        }
         Ok(())
     }
 
@@ -623,6 +702,69 @@ mod tests {
         assert!(unwound.is_err());
         assert!(SLOT.with_borrow(Option::is_none) && !armed());
         assert_eq!(files(&dir), 0);
+        set_thread_dir(None);
+    }
+
+    fn spill_rows(n: usize) -> Result<SqlResult, CoreError> {
+        let mut buffer = RowBuffer::new(Vec::new())?;
+        for i in 0..n {
+            let value = super::super::Value::Text(format!("{i:0>64}"));
+            buffer.push(SqlRow { values: vec![value], version: 0 })?;
+        }
+        let mut result = SqlResult::default();
+        buffer.finish(&mut result)?;
+        Ok(result)
+    }
+
+    #[test]
+    fn streaming_is_per_statement_and_reads_fail_stickily() {
+        let dir = dir("giggles-spill-scope");
+        // Outside any statement, finish materialises instead of hiding rows.
+        assert_eq!(spill_rows(20_000).unwrap().rows.len(), 20_000);
+        assert!(SLOT.with_borrow(Option::is_none) && files(&dir) == 0);
+        // The streamed statement keeps its spill; a nested statement and a later
+        // one in the same closure get their own rows and leave it in place.
+        let ((outer, later), spilled) = streaming(|| {
+            let outer = statement(|| {
+                let nested = statement(|| spill_rows(15_000)).unwrap();
+                assert_eq!(nested.rows.len(), 15_000);
+                spill_rows(20_000)
+            })
+            .unwrap();
+            (outer, statement(|| spill_rows(18_000)).unwrap())
+        });
+        assert!(outer.rows.is_empty());
+        assert_eq!(later.rows.len(), 18_000);
+        let mut spilled = spilled.expect("outer spill");
+        assert_eq!(spilled.len(), 20_000);
+        // A read error repeats on every later read; the handle never looks done.
+        assert!(spilled.next().unwrap().is_ok());
+        spilled.fail_next_read();
+        assert!(matches!(spilled.next(), Some(Err(CoreError::TempFile { disk_full: false, .. }))));
+        assert!(matches!(spilled.next(), Some(Err(CoreError::TempFile { .. }))));
+        assert!(!spilled.is_empty());
+        drop(spilled);
+        // Bounded callers fail at the result budget instead of spilling.
+        let bounded_result = bounded(|| statement(|| spill_rows(20_000)));
+        assert_eq!(bounded_result, Err(CoreError::Sql(SqlError::Limit)));
+        assert_eq!(files(&dir), 0);
+        set_thread_dir(None);
+    }
+
+    #[test]
+    fn sorter_spills_under_a_small_ledger_and_bounds_open_runs() {
+        let dir = dir("giggles-sort-ledger");
+        let mut ledger = scan::Retention::new(64 * 1024);
+        ledger.charge(32 * 1024).unwrap();
+        let cmp = |a: &u64, b: &u64| a.cmp(b);
+        let mut sorter = Sorter::new();
+        for i in (0..200_000u64).rev() {
+            sorter.push(i, 256, cmp, &mut ledger).unwrap();
+            assert!(sorter.runs.len() < 2 * MERGE_FAN_IN && files(&dir) < 2 * MERGE_FAN_IN);
+        }
+        let sorted = sorter.finish(cmp, &mut ledger).unwrap();
+        assert!(sorted.map(Result::unwrap).eq(0..200_000));
+        assert_eq!((ledger.used(), files(&dir)), (32 * 1024, 0));
         set_thread_dir(None);
     }
 }

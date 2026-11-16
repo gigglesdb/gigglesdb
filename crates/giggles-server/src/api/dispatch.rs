@@ -293,8 +293,11 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 context.scope(|| {
                     lease.session().authority_scope(|session| {
-                        // Immutable response construction remains within the lease.
-                        Ok(execute_reply(session, request, received, encoding))
+                        // Immutable response construction remains within the lease. The
+                        // API materialises whole results, so v2 output keeps the result
+                        // budget (54000) instead of spilling (R2-PGLIMITS-5 B2).
+                        Ok(giggles_core::relational::spill::bounded(
+                            || execute_reply(session, request, received, encoding)))
                     })
                 })
             }));

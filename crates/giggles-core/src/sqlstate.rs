@@ -84,6 +84,8 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Deadlock => "40P01",
         CoreError::Storage(_) | CoreError::Fenced => "08007",
         CoreError::Corrupt(_) | CoreError::Exists => "XX000",
+        CoreError::TempFile { disk_full: true, .. } => "53100",
+        CoreError::TempFile { disk_full: false, .. } => "58030",
     }
 }
 

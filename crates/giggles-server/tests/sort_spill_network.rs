@@ -7,6 +7,7 @@ use giggles_server::{
     clock::Clock,
 };
 use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
 
 const ROWS: i32 = 200_000;
@@ -20,6 +21,13 @@ fn spill_files() -> usize {
             name.starts_with(&format!("giggles-sort-{pid}-")) || name.starts_with(&format!("giggles-returning-{pid}-"))
         })
         .count()
+}
+
+async fn message(s: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+    let tag = s.read_u8().await.unwrap();
+    let mut body = vec![0; s.read_u32().await.unwrap() as usize - 4];
+    s.read_exact(&mut body).await.unwrap();
+    (tag, body)
 }
 
 /// A permutation of 0..ROWS, NULL on every 1000th id.
@@ -88,6 +96,34 @@ async fn v2_order_by_past_work_mem_streams_every_row_in_order() {
     let mut expected = (0..ROWS).collect::<Vec<_>>();
     expected.sort_by_key(|id| id % 50_000);
     assert_eq!(ids, expected);
+    assert_eq!(spill_files(), 0);
+
+    // COPY (SELECT ...) TO STDOUT streams the spilled result like PostgreSQL:
+    // every row arrives in order (it used to be materialised, then capped).
+    let mut s = tokio::net::TcpStream::connect(running.address).await.unwrap();
+    let mut startup = 196608u32.to_be_bytes().to_vec();
+    startup.extend(b"user\0owner\0database\0postgres\0\0");
+    s.write_u32((startup.len() + 4) as u32).await.unwrap();
+    s.write_all(&startup).await.unwrap();
+    while message(&mut s).await.0 != b'Z' {}
+    let sql = b"COPY (SELECT id, w FROM t ORDER BY w) TO STDOUT\0";
+    s.write_u8(b'Q').await.unwrap();
+    s.write_u32((sql.len() + 4) as u32).await.unwrap();
+    s.write_all(sql).await.unwrap();
+    let (mut copied, mut complete) = (Vec::new(), false);
+    loop {
+        match message(&mut s).await {
+            (b'd', body) => copied.push(String::from_utf8(body).unwrap()),
+            (b'C', body) => complete = body == format!("COPY {ROWS}\0").as_bytes(),
+            (b'Z', _) => break,
+            (b'H' | b'c', _) => {}
+            (tag, body) => panic!("unexpected COPY message {tag}: {}", String::from_utf8_lossy(&body)),
+        }
+    }
+    assert!(complete);
+    let copied_ids = copied.iter().map(|line| line.split('\t').next().unwrap().parse::<i32>().unwrap()).collect::<Vec<_>>();
+    assert_eq!(copied_ids, expected);
+    drop(s);
     assert_eq!(spill_files(), 0);
 
     // Top-N is unchanged.

@@ -5419,6 +5419,10 @@ impl BoundQuery<'_> {
                 .rows
                 .extend(page.apply(std::iter::once(SqlRow { values, version: 0 })));
         } else {
+            // V2 full sorts, and top-N sorts keeping more than TOP_N_ROWS rows
+            // (OFFSET + LIMIT), spill like PostgreSQL's bounded-heap fallback.
+            const TOP_N_ROWS: usize = 10_000;
+            let external = source.streams_reductions() && page.keep().is_none_or(|keep| keep > TOP_N_ROWS);
             let rows: Box<dyn Iterator<Item = R<Tuple>> + '_> = if self.order.is_empty() {
                 Box::new(filtered)
             } else {
@@ -5446,7 +5450,7 @@ impl BoundQuery<'_> {
                             .sum();
                         // Unbounded streamed sorts retain owned tuples rather than a
                         // hydrated table image. Charge their allocation overhead too.
-                        let overhead = if source.streams_reductions() && limit.is_none() {
+                        let overhead = if external {
                             std::mem::size_of::<(Tuple, Vec<Value>, Option<Vec<u8>>, usize, usize)>()
                                 + row.values.len() * std::mem::size_of::<Vec<Value>>()
                                 + (row.values.iter().map(Vec::len).sum::<usize>() + keys.len())
@@ -5487,7 +5491,7 @@ impl BoundQuery<'_> {
                     };
                 // v2 full sorts spill sorted runs past work_mem (PostgreSQL's
                 // external sort); top-N sorts keep only OFFSET + LIMIT rows.
-                if source.streams_reductions() && limit.is_none() {
+                if external {
                     let sorted = spill::sort_external(keyed, size, compare, &mut retention)?;
                     Box::new(sorted.map(|item| item.map(|(row, _, _)| row)))
                 } else {

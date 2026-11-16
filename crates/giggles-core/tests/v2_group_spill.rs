@@ -69,6 +69,18 @@ fn v2_group_by_distinct_and_distinct_aggregates_spill() {
     }
     assert_eq!(dir.files(), 0);
 
+    // Hash aggregation (no DISTINCT aggregate): groups past work_mem spill and
+    // merge back with the in-memory ones in group-key order; few groups stay
+    // in memory.
+    let r = rows(&mut s, "SELECT g, count(*), sum(id) FROM t GROUP BY g");
+    assert_eq!(r.len(), GROUPS as usize);
+    for (row, g) in r.iter().zip(0..GROUPS) {
+        assert_eq!(ints(row), [g, 2, 2 * g + GROUPS]);
+    }
+    let r = rows(&mut s, "SELECT g % 3, count(*) FROM t GROUP BY g % 3");
+    assert_eq!(r.iter().map(ints).collect::<Vec<_>>(), [[0, 66_668], [1, 66_666], [2, 66_666]]);
+    assert_eq!(dir.files(), 0);
+
     // Non-aggregate DISTINCT keeps first occurrences in input order.
     let r = rows(&mut s, "SELECT DISTINCT g FROM t");
     assert_eq!(r.iter().map(|row| ints(row)[0]).collect::<Vec<_>>(), (0..GROUPS).collect::<Vec<_>>());
@@ -76,6 +88,23 @@ fn v2_group_by_distinct_and_distinct_aggregates_spill() {
     // Global DISTINCT aggregates over every row.
     let r = rows(&mut s, "SELECT count(DISTINCT x), count(DISTINCT g), count(*) FROM t");
     assert_eq!(ints(&r[0]), [150_000, GROUPS, ROWS]);
+    assert_eq!(dir.files(), 0);
+
+    // Keyless grouped shapes (no GROUP BY keys, non-plain projection) also
+    // apply their deferred DISTINCT inputs (review B1).
+    let r = rows(&mut s, "SELECT 'n', count(DISTINCT x) FROM t");
+    assert_eq!(r[0].values, [Value::Text("n".into()), Value::Int(150_000)]);
+    s.execute("CREATE TABLE small (id int PRIMARY KEY, x int)", &[], None).unwrap();
+    insert(&mut s, "small", 1_000, |i| format!("({i},{})", i % 300));
+    for sql in [
+        "SELECT count(DISTINCT x) FROM small HAVING count(*) > 0",
+        "SELECT count(DISTINCT x) + 0 FROM small",
+        "SELECT count(DISTINCT x) FROM small ORDER BY 1",
+    ] {
+        assert_eq!(ints(&rows(&mut s, sql)[0]), [300], "{sql}");
+    }
+    let r = rows(&mut s, "SELECT sum(DISTINCT x), max(x), count(DISTINCT id) FROM small HAVING count(DISTINCT x) > 1");
+    assert_eq!(ints(&r[0]), [299 * 300 / 2, 299, 1_000]);
     assert_eq!(dir.files(), 0);
 
     // An error after the group sort has spilled removes every run.

@@ -119,6 +119,8 @@ pub enum CoreError {
     DuplicateSchema,
     /// Task-session error (GD-0061). Never stored in `SqlError`, which is persisted.
     Task(crate::task::TaskError),
+    /// A query temp (spill) file failed: 53100 when the device is full, else 58030.
+    TempFile { disk_full: bool, detail: String },
 }
 impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2655,7 +2657,7 @@ impl SqlSession {
         let Some(key) = self.native_view_key(view)? else { return Ok(None) };
         let p = self.prepare_typed_read(vec![key.clone()], |domain, epoch|
             relational::Prepared::from_relation_read(domain, epoch, key))?;
-        let rows = self.execute_bound_engine(&p, &[], None)?.rows;
+        let rows = relational::spill::bounded(|| self.execute_bound_engine(&p, &[], None))?.rows;
         if rows.len() > relational::MAX_ROWS { return Err(CoreError::Limit); }
         Ok(Some(rows))
     }
@@ -3518,7 +3520,8 @@ impl SqlSession {
     pub fn execute_typed_read(&mut self, read: relational::SingleSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
         let p = self.prepare_typed_read(vec![read.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_single_source_read(domain, epoch, read))?;
-        self.execute_bound_engine(&p, &[], expected_version)
+        // Native reads materialise their whole result: keep the result budget.
+        relational::spill::bounded(|| self.execute_bound_engine(&p, &[], expected_version))
     }
     /// Trusted Admin entry point; gateways must authorize both source tables first.
     pub fn describe_typed_join(&mut self, read: relational::TwoSourceRead) -> Result<relational::Description, CoreError> {
@@ -3529,7 +3532,7 @@ impl SqlSession {
     pub fn execute_typed_join(&mut self, read: relational::TwoSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
         let p = self.prepare_typed_read(vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_two_source_read(domain, epoch, read))?;
-        self.execute_bound_engine(&p, &[], expected_version)
+        relational::spill::bounded(|| self.execute_bound_engine(&p, &[], expected_version))
     }
     /// Trusted Admin entry point; gateways authorize the target and every source first.
     pub fn execute_typed_insert_select(&mut self, insert: relational::TypedInsertSelect,

@@ -931,10 +931,14 @@ impl Grouping {
             return Ok(result);
         }
         let mut groups = BTreeMap::<Key, (Vec<Value>, Vec<AggregateAuxiliary>)>::new();
-        // V2 groups by sorting input on the group key (spilling past work_mem)
-        // and streaming one group's state at a time; groups leave in key order.
+        // V2 hash-aggregates in memory up to work_mem (PostgreSQL HashAgg).
+        // Past that, rows of groups not in memory sort on the group key
+        // (spilling) and stream one group's state at a time; both halves merge
+        // in key order. DISTINCT aggregates always take the sorted path.
         let v2 = source.streams_reductions();
         let sort_groups = v2 && !self.keys.is_empty();
+        let hash = sort_groups && !self.aggregates.iter().any(|a| matches!(a, BoundItem::Aggregate(a, _) if a.distinct()));
+        let mut hash_bytes = 0usize;
         let mut sorter = spill::Sorter::<GroupInput>::new();
         let mut scope = RetentionScope::new(execution);
         let mut retention = scope.borrow();
@@ -972,20 +976,20 @@ impl Grouping {
                     .iter()
                     .map(|s| s.eval(row, params, &mut key_work))
                     .collect::<R<Vec<_>>>()?);
-                if sort_groups {
+                if sort_groups && (!hash || (hash_bytes > spill::work_mem() && !groups.contains_key(&key))) {
                     let bytes = retained(&key.0) + std::mem::size_of::<GroupInput>()
                         + row.values.iter().map(|v| retained(v) + std::mem::size_of::<Vec<Value>>()).sum::<usize>();
                     return sorter.push((key.0, row.clone()), bytes, group_key_cmp, &mut *retention);
                 }
                 if !groups.contains_key(&key) {
-                    if groups.len() >= scan::query_row_limit() {
+                    if !hash && groups.len() >= scan::query_row_limit() {
                         return Err(SqlError::Limit);
                     }
                     let mut initial = self.initial();
                     initial.extend(self.dependents.iter().map(|c| row.get(*c).clone()));
-                    retention.charge(
-                        retained(&key.0) + retained(&initial) + 6 * std::mem::size_of::<usize>(),
-                    )?;
+                    let bytes = retained(&key.0) + retained(&initial) + 6 * std::mem::size_of::<usize>();
+                    hash_bytes += bytes + self.aggregates.len() * std::mem::size_of::<AggregateAuxiliary>();
+                    retention.charge(bytes)?;
                     let mut auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
                     if source.streams_reductions() {
                         for (aux, direct) in auxiliary.iter_mut().zip(&self.direct_inputs) {
@@ -1044,7 +1048,7 @@ impl Grouping {
         type Group = (Key, (Vec<Value>, Vec<AggregateAuxiliary>));
         let groups: Box<dyn Iterator<Item = R<Group>> + '_> = if sort_groups {
             let mut sorted = sorter.finish(group_key_cmp, &mut *scope.borrow())?.peekable();
-            Box::new(std::iter::from_fn(move || {
+            let sorted_groups = std::iter::from_fn(move || {
                 let (key, mut row) = match sorted.next()? {
                     Ok(first) => first,
                     Err(error) => return Some(Err(error)),
@@ -1074,8 +1078,25 @@ impl Grouping {
                         &mut auxiliary, &mut retention, &mut input_work)?;
                     Ok((Key(key), (values, auxiliary)))
                 })())
+            });
+            // In-memory and spilled groups have disjoint keys; merge in key order.
+            let (mut memory, mut sorted) = (groups.into_iter().peekable(), sorted_groups.peekable());
+            Box::new(std::iter::from_fn(move || {
+                let from_memory = match (memory.peek(), sorted.peek()) {
+                    (None, None) => return None,
+                    (Some((a, _)), Some(Ok((b, _)))) => a < b,
+                    (head, _) => head.is_some(),
+                };
+                if from_memory { memory.next().map(Ok) } else { sorted.next() }
             }))
         } else {
+            // The no-key v2 group defers DISTINCT aggregate inputs like the sorted path.
+            let mut retention = scope.borrow();
+            for (values, auxiliary) in groups.values_mut() {
+                flush_distinct(&self.aggregates, &self.aggregate_columns, values, auxiliary,
+                    &mut retention, &mut input_work)?;
+            }
+            drop(retention);
             Box::new(groups.into_iter().map(Ok))
         };
         let mut rows = vec![];
@@ -1151,6 +1172,18 @@ impl Grouping {
             } else {
                 values
             };
+            // V2 groups already leave in key order; with no ORDER BY or DISTINCT
+            // they go straight to the output instead of through a sort.
+            if v2 && self.order.is_empty() && !query.query.distinct() {
+                if page.limit.is_some_and(|limit| skipped >= page.offset.saturating_add(limit)) {
+                    break;
+                }
+                if skipped >= page.offset {
+                    output.push(SqlRow { values, version: 0 }, &mut result)?;
+                }
+                skipped += 1;
+                continue;
+            }
             let mut work = 0;
             let keys = self
                 .order

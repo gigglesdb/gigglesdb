@@ -102,7 +102,17 @@ impl State {
         let prepared = core(session.prepare(&options.select))?;
         let description = core(session.describe(&prepared))?;
         self.settings.queried = session.in_transaction();
-        let result = core(session.execute_prepared(&prepared, &[]))?;
+        // PostgreSQL streams COPY TO STDOUT: a spilled v2 result is read from its
+        // temp file in chunks and flushed as it goes, never materialised.
+        let (result, spilled) = giggles_core::relational::spill::streaming(
+            || session.execute_prepared(&prepared, &[]));
+        let result = core(result)?;
+        let rows: Box<dyn Iterator<Item = Result<giggles_core::relational::SqlRow, giggles_core::CoreError>>> =
+            match spilled {
+                Some(spilled) => Box::new(spilled),
+                None => Box::new(result.rows.into_iter().map(Ok)),
+            };
+        let mut count = 0usize;
         let mut header = vec![u8::from(options.format == 2)];
         header.extend(
             u16::try_from(description.columns.len())
@@ -127,7 +137,12 @@ impl State {
             data.push(b'\n');
             frame(b'd', &data, out)?;
         }
-        for row in &result.rows {
+        for row in rows {
+            let row = core(row)?;
+            count += 1;
+            if count.is_multiple_of(CURSOR_ROWS) {
+                flush_output(&self.output, out)?;
+            }
             let mut data = Vec::new();
             if options.format == 2 {
                 data.extend((description.columns.len() as i16).to_be_bytes());
@@ -201,7 +216,7 @@ impl State {
         }
         frame(b'c', &[], out)?;
         complete(
-            &format!("COPY {}", result.rows.len()),
+            &format!("COPY {count}"),
             &SqlResult::default(),
             out,
         )
