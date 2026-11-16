@@ -1,0 +1,284 @@
+//! Pure synchronous management request dispatch.
+use super::auth::{Origin, authenticate};
+use crate::{
+    pgwire::auth::ScramVerifier,
+    state::{
+        authority::{Authority, AuthorityError},
+        model::*,
+    },
+    token::{PrincipalId, SessionId},
+};
+use bytes::Bytes;
+use http::{
+    HeaderMap, Request, Response, StatusCode,
+    header::{CONTENT_TYPE, WWW_AUTHENTICATE},
+};
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::{fmt, sync::Arc};
+
+/// Read-only connection registry adapter.
+pub trait ConnectionSource: Send + Sync {
+    /// Snapshot current connections.
+    fn list(&self) -> Vec<ConnectionView>;
+}
+/// Read-only runtime revision adapter.
+pub trait StatusSource: Send + Sync {
+    /// Current policy revision.
+    fn policy_revision(&self) -> Option<String>;
+    /// Current configuration revision.
+    fn config_revision(&self) -> Option<String>;
+    /// Configured route identifiers.
+    fn route_ids(&self) -> Vec<String>;
+}
+/// Non-secret connection metadata.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConnectionView {
+    /// Connection identifier.
+    pub id: u64,
+    /// Session identifier.
+    pub session: String,
+    /// Principal identifier.
+    pub principal: String,
+    /// Route identifier.
+    pub route: String,
+}
+/// Shared management services and configured administrators.
+pub struct MgmtContext {
+    /// Durable authority.
+    pub authority: Arc<Authority>,
+    /// Configuration administrator verifiers.
+    pub admins: Vec<(String, ScramVerifier)>,
+    /// Active connection snapshot provider.
+    pub connections: Arc<dyn ConnectionSource>,
+    /// Runtime revision provider.
+    pub status: Arc<dyn StatusSource>,
+}
+impl fmt::Debug for MgmtContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MgmtContext { [REDACTED] }")
+    }
+}
+/// Build a JSON response without exposing serialization errors.
+pub fn json_response(status: StatusCode, value: impl Serialize) -> Response<Bytes> {
+    let bytes = match serde_json::to_vec(&value) {
+        Ok(b) => b,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+    };
+    let mut response = Response::new(Bytes::from(bytes));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
+}
+/// Build a fixed-code error response.
+pub fn error(status: StatusCode, code: &'static str) -> Response<Bytes> {
+    json_response(status, json!({"error": code}))
+}
+/// Map authority errors to fixed public codes.
+pub fn authority_error(err: AuthorityError) -> Response<Bytes> {
+    use AuthorityError::*;
+    let (status, code) = match err {
+        NotFound => (404, "not_found"),
+        NameInvalid => (400, "bad_request"),
+        NameTaken => (409, "name_taken"),
+        ConfigManaged => (409, "config_managed"),
+        PrincipalDisabled => (403, "principal_disabled"),
+        NoGrant => (403, "no_grant"),
+        ModeExceedsGrant => (403, "mode_exceeds_grant"),
+        LifetimeTooLong => (400, "lifetime_too_long"),
+        IdempotencyConflict => (409, "idempotency_conflict"),
+        SessionEnded => (409, "session_ended"),
+        Store => (503, "unavailable"),
+    };
+    error(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+        code,
+    )
+}
+/// Extract a single bounded visible-ASCII mutation retry key.
+pub fn idempotency_key(headers: &HeaderMap) -> Option<&str> {
+    if headers.get_all("Idempotency-Key").iter().count() != 1 {
+        return None;
+    }
+    let key = headers.get("Idempotency-Key")?.to_str().ok()?;
+    (1..=128).contains(&key.len()).then_some(())?;
+    key.bytes()
+        .all(|b| (0x21..=0x7e).contains(&b))
+        .then_some(key)
+}
+fn session_view(ctx: &MgmtContext, s: &AccessSession) -> Value {
+    json!({"id":s.id, "principal":s.principal, "route":s.route, "mode":s.mode,
+        "state":s.state, "created_ms":s.created_ms, "expires_ms":s.expires_ms,
+        "idle_timeout_ms":s.idle_timeout_ms, "last_used_ms":s.last_used_ms,
+        "revoke_reason":s.revoke_reason.map(EndReason::as_str), "label":s.label,
+        "isolated":s.isolated, "scope":s.scope, "scope_continuity":ctx.authority.scope_continuous(s)})
+}
+#[derive(Clone, Copy)]
+enum Endpoint {
+    Sessions,
+    Session(SessionId),
+    Renew(SessionId),
+    Revoke(SessionId),
+    Principals,
+    Principal(PrincipalId),
+    Disable(PrincipalId),
+    Enable(PrincipalId),
+    Credentials(PrincipalId),
+    Credential(PrincipalId, CredentialId),
+    Grants(PrincipalId),
+    Connections,
+    Status,
+}
+fn endpoint(path: &str) -> Option<Endpoint> {
+    use Endpoint::*;
+    let parts: Vec<_> = path.split('/').collect();
+    match parts.as_slice() {
+        ["", "v1", "sessions"] => Some(Sessions),
+        ["", "v1", "sessions", id] => Some(Session(SessionId::from_hex(id)?)),
+        ["", "v1", "sessions", id, "renew"] => Some(Renew(SessionId::from_hex(id)?)),
+        ["", "v1", "sessions", id, "revoke"] => Some(Revoke(SessionId::from_hex(id)?)),
+        ["", "v1", "principals"] => Some(Principals),
+        ["", "v1", "principals", id] => Some(Principal(PrincipalId::from_hex(id)?)),
+        ["", "v1", "principals", id, "disable"] => Some(Disable(PrincipalId::from_hex(id)?)),
+        ["", "v1", "principals", id, "enable"] => Some(Enable(PrincipalId::from_hex(id)?)),
+        ["", "v1", "principals", id, "credentials"] => {
+            Some(Credentials(PrincipalId::from_hex(id)?))
+        }
+        ["", "v1", "principals", id, "credentials", cid] => Some(Credential(
+            PrincipalId::from_hex(id)?,
+            CredentialId::from_hex(cid)?,
+        )),
+        ["", "v1", "principals", id, "grants"] => Some(Grants(PrincipalId::from_hex(id)?)),
+        ["", "v1", "connections"] => Some(Connections),
+        ["", "v1", "status"] => Some(Status),
+        _ => None,
+    }
+}
+/// Authenticate, authorize and dispatch one bounded management request.
+pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Response<Bytes> {
+    use Endpoint::*;
+    let caller = match authenticate(ctx, origin, req.headers()) {
+        Ok(c) => c,
+        Err(_) => {
+            let mut r = error(StatusCode::UNAUTHORIZED, "unauthorized");
+            r.headers_mut()
+                .insert(WWW_AUTHENTICATE, http::HeaderValue::from_static("Bearer"));
+            return r;
+        }
+    };
+    let Some(ep) = endpoint(req.uri().path()) else {
+        return error(StatusCode::NOT_FOUND, "not_found");
+    };
+    let method = req.method().as_str();
+    let allowed = match ep {
+        Sessions | Principals => method == "GET" || method == "POST",
+        Session(_) | Principal(_) | Connections | Status => method == "GET",
+        Renew(_) | Revoke(_) => method == "POST",
+        Disable(id) | Enable(id) | Credentials(id) => {
+            // B5c consumes this validated principal target.
+            let _ = id;
+            method == "POST"
+        }
+        Credential(id, cid) => {
+            // B5c consumes these validated principal and credential targets.
+            let _ = (id, cid);
+            method == "DELETE"
+        }
+        Grants(id) => {
+            // B5c consumes this validated principal target.
+            let _ = id;
+            method == "PUT"
+        }
+    };
+    if !allowed {
+        return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
+    }
+    match ep {
+        Sessions if method == "POST" => {
+            if caller.principal.is_none() {
+                return error(StatusCode::FORBIDDEN, "forbidden");
+            }
+        }
+        Session(id) | Revoke(id) | Renew(id) => {
+            if matches!(ep, Renew(_)) && caller.principal.is_none() {
+                return error(StatusCode::FORBIDDEN, "forbidden");
+            }
+            let Some(s) = ctx.authority.session(id) else {
+                return error(StatusCode::NOT_FOUND, "not_found");
+            };
+            if caller.principal != Some(s.principal) && (!caller.admin || matches!(ep, Renew(_))) {
+                return error(StatusCode::NOT_FOUND, "not_found");
+            }
+        }
+        Sessions => {}
+        Principals
+        | Principal(_)
+        | Disable(_)
+        | Enable(_)
+        | Credentials(_)
+        | Credential(_, _)
+        | Grants(_)
+        | Connections
+        | Status => {
+            if !caller.admin {
+                return error(StatusCode::FORBIDDEN, "forbidden");
+            }
+        }
+    }
+    if matches!(method, "POST" | "PUT" | "DELETE") {
+        if idempotency_key(req.headers()).is_none() {
+            return error(StatusCode::BAD_REQUEST, "idempotency_key_required");
+        }
+        // B5b: session acquisition, renewal and revocation mutations.
+        // B5c: principal, credential and grant mutations.
+        return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+    }
+    let result = match ep {
+        Sessions => {
+            let rows = ctx.authority.all_sessions();
+            json!(
+                rows.iter()
+                    .filter(|s| caller.admin || caller.principal == Some(s.principal))
+                    .map(|s| session_view(ctx, s))
+                    .collect::<Vec<_>>()
+            )
+        }
+        Session(id) => match ctx.authority.session(id) {
+            Some(s) => session_view(ctx, &s),
+            None => return error(StatusCode::NOT_FOUND, "not_found"),
+        },
+        Principals => json!(ctx.authority.principals()),
+        Principal(id) => {
+            let Some(p) = ctx.authority.principal(id) else {
+                return error(StatusCode::NOT_FOUND, "not_found");
+            };
+            let mut value = json!(p);
+            value["grants"] = json!(
+                ctx.authority
+                    .grants_of(id)
+                    .into_iter()
+                    .map(|(route, mode)| json!({"route":route,"mode":mode}))
+                    .collect::<Vec<_>>()
+            );
+            value["credentials"] = json!(ctx.authority.credentials_of(id));
+            value
+        }
+        Connections => json!(ctx.connections.list()),
+        Status => {
+            json!({"deployment_id":data_encoding::HEXLOWER.encode(&ctx.authority.deployment_id()),
+            "store_format":ctx.authority.store_format_version(), "route_ids":ctx.status.route_ids(),
+            "policy_revision":ctx.status.policy_revision(), "config_revision":ctx.status.config_revision()})
+        }
+        Renew(_)
+        | Revoke(_)
+        | Disable(_)
+        | Enable(_)
+        | Credentials(_)
+        | Credential(_, _)
+        | Grants(_) => return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
+    };
+    json_response(StatusCode::OK, result)
+}

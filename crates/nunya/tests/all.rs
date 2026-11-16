@@ -23,6 +23,8 @@ fn every_test_file_is_registered() {
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "management_api.rs"]
+mod management_api;
 #[path = "corpus.rs"]
 mod corpus;
 #[path = "noninterference.rs"]

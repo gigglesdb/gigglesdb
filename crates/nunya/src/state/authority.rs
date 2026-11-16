@@ -15,6 +15,7 @@ use std::{
 
 mod config_sync;
 mod counters;
+mod api_ext;
 mod login;
 pub use login::SessionLogin;
 pub use config_sync::{ConfigPrincipal, ConfigSync};

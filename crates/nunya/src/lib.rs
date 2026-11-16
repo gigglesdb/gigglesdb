@@ -11,6 +11,8 @@ pub mod dialect;
 pub mod error;
 /// Ir support.
 pub mod ir;
+/// Management API.
+pub mod mgmt;
 /// Pgwire support.
 pub mod pgwire;
 /// Policy support.
