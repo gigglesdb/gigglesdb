@@ -56,7 +56,7 @@ adding, each checked against the same SQL on legacy and v2:
   over uncorrelated single-source reads, and `insert into dst(id, v) from src where
   v > 1 select id, v`. Subqueries inside JOIN ON and HAVING also match SQL;
 - `alter table t add [column] c [nullable] int64`, `drop [column] c [cascade|restrict]`,
-  `rename [column] a to b` and `rename to t2` (legacy requires empty business state);
+  `rename [column] a to b` and `rename to t2` (populated tables are accepted like SQL on both engines);
 - `savepoint a`, `rollback to [savepoint] a` and `release [savepoint] a` inside a
   `transaction { ... }` block of plain statements (no let/require/emit; a failing step
   rolls back the whole block; such blocks cannot be prepared or used with once);
@@ -108,9 +108,8 @@ Asserted native/SQL differences and shared limits in 0.20:
   42P01 while SQL succeeds.
   Legacy view DDL returns 0A000 in both frontends. Filtered and joined views are
   also a shared 0A000 gap versus PostgreSQL 18.6.
-- Legacy constraint mutation on populated business state returns native
-  `PlanRequired` while SQL succeeds; native cross-column CHECK (`qty > id`)
-  returns `Unsupported` while SQL succeeds. Native DML retains `Duplicate` for
+- Native cross-column CHECK (`qty > id`) returns `Unsupported` while SQL
+  succeeds. Native DML retains `Duplicate` for
   SQLSTATE 23505. DROP CONSTRAINT CASCADE returns shared 42601.
 - Paging `matched` counts eligible rows before LIMIT; SQL exposes returned rows.
   Native tuple keyset paging works where core SQL row-value comparison returns

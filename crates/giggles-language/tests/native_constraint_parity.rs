@@ -55,13 +55,13 @@ fn constraint_matrix_matches_sql() {
             for sql in ["create table parent(id bigint primary key)", "create table child(id bigint primary key,parent_id bigint,qty bigint,code text)"] {
                 a.sql_session().execute(sql, &[], None).unwrap();
             }
-            if storage == Storage::V2 { for sql in ["insert into parent values(1)", "insert into child values(9,1,1,'seed')"] { a.sql_session().execute(sql, &[], None).unwrap(); } }
+            // Populated on both engines: native ADD CONSTRAINT follows SQL on Legacy too.
+            for sql in ["insert into parent values(1)", "insert into child values(9,1,1,'seed')"] { a.sql_session().execute(sql, &[], None).unwrap(); }
         }
         for text in ["alter table child add constraint uq unique(code)", "alter table child add check(qty > 0)",
             "alter table child add constraint fk foreign key(parent_id) references parent(id) on delete cascade on update restrict"] {
             step(&left, &right, text, text, None);
         }
-        if storage == Storage::Legacy { for a in [&left, &right] { a.sql_session().execute("insert into parent values(1)", &[], None).unwrap(); } }
         for (native, sql, state) in [("insert child set id=1,parent_id=1,qty=1,code=\"a\"", "insert into child values(1,1,1,'a')", None),
             ("insert child set id=2,parent_id=1,qty=1,code=\"a\"", "insert into child values(2,1,1,'a')", Some("23505")),
             ("insert child set id=2,parent_id=1,qty=0,code=\"b\"", "insert into child values(2,1,0,'b')", Some("23514")),
@@ -96,17 +96,12 @@ fn constraint_matrix_matches_sql() {
         for a in [&left, &right] { for sql in ["create schema app", "create table app.t(id bigint primary key,v bigint)"] { a.sql_session().execute(sql, &[], None).unwrap(); } }
         step(&left, &right, "alter table app.t add constraint u unique(v)", "alter table app.t add constraint u unique(v)", None);
         for a in [&left, &right] { a.sql_session().execute("insert into app.t values(1,2),(2,2)", &[], None).unwrap_err(); }
-        if storage == Storage::V2 {
-            for a in [&left, &right] { for sql in ["create table dup(id bigint primary key,v bigint)", "insert into dup values(1,2),(2,2)"] { a.sql_session().execute(sql, &[], None).unwrap(); } }
-            step(&left, &right, "alter table dup add unique(v)", "alter table dup add unique(v)", Some("23505"));
-        } else {
-            for a in [&left, &right] { a.sql_session().execute("insert into app.t values(1,2)", &[], None).unwrap(); }
-            let before = snapshot(&mut right.sql_session());
-            assert_eq!(with_sql_parser_forbidden(|| engine.execute_catalog_text("alter table app.t add check(v > 0)")), Err(Error::PlanRequired));
-            assert_eq!(snapshot(&mut right.sql_session()), before);
-            left.sql_session().execute("alter table app.t add check(v > 0)", &[], None).unwrap();
-            assert_ne!(snapshot(&mut left.sql_session()), before);
-        }
+        for a in [&left, &right] { for sql in ["create table dup(id bigint primary key,v bigint)", "insert into dup values(1,2),(2,2)"] { a.sql_session().execute(sql, &[], None).unwrap(); } }
+        step(&left, &right, "alter table dup add unique(v)", "alter table dup add unique(v)", Some("23505"));
+        // Populated Legacy and v2 both follow SQL (formerly native PlanRequired on Legacy).
+        for a in [&left, &right] { a.sql_session().execute("insert into app.t values(1,2)", &[], None).unwrap(); }
+        step(&left, &right, "alter table app.t add check(v > 5)", "alter table app.t add check(v > 5)", Some("23514"));
+        step(&left, &right, "alter table app.t add check(v > 0)", "alter table app.t add check(v > 0)", None);
     }
 }
 #[test]

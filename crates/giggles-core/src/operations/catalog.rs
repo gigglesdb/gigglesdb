@@ -584,7 +584,17 @@ fn stage_catalog(
         let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
         return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
     }
-    if !session.catalog_empty_engine().map_err(core)? {
+    // Legacy's empty-database policy covers native creates and drops. ALTER
+    // and ADD/DROP CONSTRAINT run SQL's DDL executor, which already accepts
+    // populated Legacy tables, so they follow SQL there. The staged snapshot
+    // and commit certification still reject any intervening write.
+    let populated_ddl = matches!(
+        request,
+        CatalogRequest::AlterTable { .. }
+            | CatalogRequest::AddConstraint { .. }
+            | CatalogRequest::DropConstraint { .. }
+    );
+    if !session.catalog_empty_engine().map_err(core)? && !populated_ddl {
         return Err(Error::PlanRequired);
     }
     if matches!(request, CatalogRequest::AddConstraint { .. } | CatalogRequest::DropConstraint { .. }) {

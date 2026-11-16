@@ -98,7 +98,7 @@ fn drop_restrict_dependencies_and_commit_rollback_are_atomic() {
     }
 }
 #[test]
-fn populated_validation_and_failed_add_rollback_match_sql_or_legacy_plan_boundary() {
+fn populated_validation_and_failed_add_rollback_match_sql() {
     for backend in backends() { for violating in [false, true] { for (spec, ddl, _, expected) in cases() {
         let (_, native) = fixture(backend);
         let (_, sql) = fixture(backend);
@@ -108,12 +108,8 @@ fn populated_validation_and_failed_add_rollback_match_sql_or_legacy_plan_boundar
             admin.sql_session().execute(setup, &[], None).unwrap();
         }
         let before = format!("{:?}", native.catalog_presentation().unwrap());
+        // Populated Legacy follows SQL too (formerly native PlanRequired).
         let result = Engine::new(native.clone()).execute_catalog(&add(spec, true));
-        if backend == Backend::Legacy {
-            assert_eq!(result, Err(Error::PlanRequired));
-            assert_eq!(format!("{:?}", native.catalog_presentation().unwrap()), before);
-            continue;
-        }
         let paired = sql.sql_session().execute(&format!("ALTER TABLE child ADD CONSTRAINT rule {ddl}"), &[], None);
         if violating {
             assert_eq!(result.unwrap_err().sqlstate(), Some(expected));

@@ -232,7 +232,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         }
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "catalog_constraints", CapabilityState::Implemented,
-                "ALTER TABLE ADD [CONSTRAINT name] UNIQUE/CHECK/FOREIGN KEY (with ON DELETE/ON UPDATE actions) and DROP CONSTRAINT [IF EXISTS] name through SQL's DDL executor. CHECK is a column compared with an int, text, bool or NULL literal. Legacy requires empty business state. DROP CONSTRAINT CASCADE currently returns SQL's 42601.",
+                "ALTER TABLE ADD [CONSTRAINT name] UNIQUE/CHECK/FOREIGN KEY (with ON DELETE/ON UPDATE actions) and DROP CONSTRAINT [IF EXISTS] name through SQL's DDL executor. CHECK is a column compared with an int, text, bool or NULL literal. Populated tables are accepted like SQL on Legacy and v2. DROP CONSTRAINT CASCADE currently returns SQL's 42601.",
                 vec![evidence("crates/giggles-language/tests/native_constraint_parity.rs", "constraint_matrix_matches_sql")], vec![]);
             add(interface, "catalog_views", CapabilityState::Implemented,
                 "CREATE VIEW name AS <typed read> and DROP VIEW [IF EXISTS] name [CASCADE|RESTRICT] through SQL's view executor. RESTRICT is the default; dependent views give 2BP01 unless CASCADE. Legacy returns SQL's 0A000; two-source views return SQL's 0A000.",
@@ -269,7 +269,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         }
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "catalog_alter", CapabilityState::Implemented,
-                "ALTER TABLE ADD/DROP/RENAME COLUMN and RENAME TO through SQL's ALTER executor. DROP COLUMN defaults to RESTRICT; dependent views give 2BP01 unless CASCADE. Legacy requires empty business state; v2 permits populated state.",
+                "ALTER TABLE ADD/DROP/RENAME COLUMN and RENAME TO through SQL's ALTER executor. DROP COLUMN defaults to RESTRICT; dependent views give 2BP01 unless CASCADE. Populated tables are accepted like SQL on Legacy and v2.",
                 vec![evidence("crates/giggles-language/tests/native_alter_parity.rs", "alter_matrix_matches_sql")], vec![]);
         }
     }

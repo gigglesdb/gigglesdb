@@ -503,8 +503,10 @@ rows, and no retained tasks, operations, approvals or task-accounting entries.
 Existing empty tables are permitted. Logical clock/allocator counters and restore
 origin metadata alone do not make the database populated. A populated snapshot
 returns `PlanRequired` without effects; no migration job is fabricated. This
-finite policy applies to catalog intents and does not restrict ordinary SQL
-CREATE. Catalog intents cannot appear inside data transaction blocks or RETURN.
+finite policy applies to catalog creates and drops and does not restrict
+ordinary SQL CREATE. Native ALTER TABLE and ADD/DROP CONSTRAINT run SQL's DDL
+executor and, like SQL, succeed on populated Legacy tables. Catalog intents
+cannot appear inside data transaction blocks or RETURN.
 
 The private typed schema constructor enters the same internal CREATE executor,
 statement admission, cancellation, full-envelope validation and transaction

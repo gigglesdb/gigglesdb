@@ -66,13 +66,13 @@ fn alter_matrix_matches_sql() {
             step(&left, &right, "alter table t2 drop c", "alter table t2 drop c", Some("2BP01"));
             step(&left, &right, "alter table t2 drop c cascade", "alter table t2 drop c cascade", None);
             assert!(right.sql_session().catalog_metadata().unwrap().presentation.views.is_empty());
-        } else {
-            let before = snapshot(&mut right.sql_session());
-            assert_eq!(with_sql_parser_forbidden(|| Engine::with_version(right.clone(), VERSION).execute_catalog_text("alter table t2 add x nullable int64")), Err(Error::PlanRequired));
-            assert_eq!(snapshot(&mut right.sql_session()), before);
-            left.sql_session().execute("alter table t2 add x bigint", &[], None).unwrap();
-            assert_ne!(snapshot(&mut left.sql_session()), before);
         }
+        // Populated Legacy and v2 both follow SQL (formerly native PlanRequired on Legacy).
+        step(&left, &right, "alter table t2 add x nullable int64", "alter table t2 add x bigint", None);
+        step(&left, &right, "alter table t2 add y int64", "alter table t2 add y bigint not null", Some("23502"));
+        step(&left, &right, "alter table t2 rename column x to x2", "alter table t2 rename column x to x2", None);
+        step(&left, &right, "alter table t2 drop x2", "alter table t2 drop x2", None);
+        step(&left, &right, "alter table t2 rename to t3", "alter table t2 rename to t3", None);
     }
 }
 #[test]

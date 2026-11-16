@@ -86,7 +86,7 @@ fn legacy_alter_matches_sql() { exercise(false); }
 fn populated_v2_alter_matches_sql() { exercise(true); }
 
 #[test]
-fn legacy_populated_requires_plan_and_bound_handles_fence_drift() {
+fn legacy_populated_alter_matches_sql_and_bound_handles_fence_drift() {
     let admin = Admin::create(common::fresh("alter-plan"), Limits::default()).unwrap();
     let engine = Engine::new(admin.clone());
     admin.sql_session().execute("CREATE TABLE t(id int PRIMARY KEY, c int)", &[], None).unwrap();
@@ -94,11 +94,18 @@ fn legacy_populated_requires_plan_and_bound_handles_fence_drift() {
     engine.execute_catalog(&request("t", add("first"))).unwrap();
     assert_eq!(engine.execute_catalog_bound(&stale), Err(Error::Sql { sqlstate: "0A000".into() }));
     let bound = engine.prepare_catalog_bound(&request("t", add("later"))).unwrap();
+    // A row write does not move the catalog epoch, so the handle stays valid, and a
+    // populated Legacy table accepts ALTER like SQL (formerly native PlanRequired).
     admin.sql_session().execute("INSERT INTO t(id) VALUES(1)", &[], None).unwrap();
+    let outcome = engine.execute_catalog_bound(&bound).unwrap();
+    assert!(outcome.table.columns.iter().any(|c| c.name == "later"));
     let before = snapshot(&admin);
-    assert_eq!(engine.execute_catalog_bound(&bound), Err(Error::PlanRequired));
-    assert_eq!(engine.execute_catalog(&request("t", add("later"))), Err(Error::PlanRequired));
+    assert_eq!(engine.execute_catalog(&request("t", add("later"))), Err(Error::Sql { sqlstate: "42701".into() }));
     assert_eq!(snapshot(&admin), before);
+    assert_eq!(engine.execute_catalog_bound(&bound), Err(Error::Sql { sqlstate: "0A000".into() }));
+    let rows = admin.sql_session().execute("SELECT * FROM t", &[], None).unwrap().rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values.len(), 4);
 }
 
 #[test]
