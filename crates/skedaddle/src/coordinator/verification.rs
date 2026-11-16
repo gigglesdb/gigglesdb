@@ -798,6 +798,8 @@ impl super::epoch::Coordinator {
 #[serde(deny_unknown_fields)]
 pub struct VerificationState {
     pub report: Option<Box<ReportRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_report: Option<Box<native::ReportRef>>,
     pub invalidated: bool,
     pub generation: u64,
     pub runs: std::collections::BTreeMap<String, String>,
@@ -808,6 +810,7 @@ pub struct VerificationState {
 impl VerificationState {
     pub(crate) fn is_empty(&self) -> bool {
         self.report.is_none()
+            && self.native_report.is_none()
             && !self.invalidated
             && self.generation == 0
             && self.runs.is_empty()
@@ -826,4 +829,205 @@ pub fn pg_report_lsn(
         return Err(crate::verify::VerifyError::NonPgVerificationReportUnsupported);
     }
     pg.lsn(position)
+}
+
+/// Explicit native durable contract; PG v1 stays on the original path.
+#[path = "../verify/native_report.rs"]
+pub mod native;
+
+impl From<native::Error> for Error {
+    fn from(error: native::Error) -> Self {
+        Self::NativeVerification(error)
+    }
+}
+
+/// Reconstruct only a qualified connector comparator from the journaled domain.
+fn native_order(binding: &super::SourceBinding) -> Result<crate::mysql::position::MysqlOrder> {
+    use super::{SourceBindingError, SourceConnector};
+    use crate::event::PositionOrder;
+    binding.validate()?;
+    if binding.connector != SourceConnector::Mysql {
+        return Err(Error::SourceBinding(SourceBindingError::Connector));
+    }
+    let domain_error = || Error::SourceBinding(SourceBindingError::OrderDomain);
+    let domain = binding
+        .order_domain
+        .strip_prefix("mysql:")
+        .ok_or_else(domain_error)?;
+    let order = if let Some(source) = domain.strip_suffix("/gtid") {
+        crate::mysql::position::MysqlOrder::gtid(source).map_err(|_| domain_error())?
+    } else if let Some(server) = domain.strip_suffix("/file") {
+        crate::mysql::position::MysqlOrder::file(server).map_err(|_| domain_error())?
+    } else {
+        return Err(domain_error());
+    };
+    if order.domain() != binding.order_domain {
+        return Err(domain_error());
+    }
+    Ok(order)
+}
+
+pub(crate) fn admit_native(state: &super::Materialized, report: &native::ReportRef) -> Result<()> {
+    use super::SourceBindingError;
+    if report.version != native::VERSION {
+        return Err(native::Error::Version(Some(report.version)).into());
+    }
+    let binding = state
+        .source_binding
+        .as_ref()
+        .ok_or(Error::SourceBinding(SourceBindingError::Missing))?;
+    binding.require_same(&report.binding)?;
+    native_order(binding)?;
+    let definition = state
+        .definition
+        .as_ref()
+        .ok_or_else(|| invalid("verification requires definition"))?;
+    binding.validate_definition(definition)?;
+    let selected = definition
+        .selected_objects
+        .iter()
+        .filter(|o| o.kind == crate::definition::ObjectKind::Table)
+        .map(|o| (o.schema.clone(), o.name.clone()))
+        .collect::<BTreeSet<_>>();
+    let covered = report
+        .scope
+        .iter()
+        .map(|s| (s.schema.clone(), s.table.clone()))
+        .collect::<BTreeSet<_>>();
+    if report.epoch != state.epoch
+        || report.generation != state.verification.generation
+        || report.definition_digest != definition.canonical_digest()?
+        || selected.is_empty()
+        || selected != covered
+        || covered.len() != report.scope.len()
+    {
+        return Err(invalid(
+            "native verification epoch/definition/full scope differs",
+        ));
+    }
+    Ok(())
+}
+
+impl super::journal::Journal {
+    pub async fn publish_native_verification(
+        &self,
+        state: &super::Materialized,
+        report: &native::Report,
+    ) -> Result<native::ReportRef> {
+        let binding = state
+            .source_binding
+            .as_ref()
+            .ok_or(Error::SourceBinding(super::SourceBindingError::Missing))?;
+        let reference = report.reference(binding, &native_order(binding)?)?;
+        admit_native(state, &reference)?;
+        if report.migration != self.migration_id() {
+            return Err(invalid("native report namespace differs"));
+        }
+        self.create(
+            &self.verification_key(&report.run),
+            serde_json::to_vec(report)?,
+        )
+        .await?;
+        Ok(reference)
+    }
+    pub fn native_verification_report<'a>(
+        &'a self,
+        state: &'a super::Materialized,
+        reference: &'a native::ReportRef,
+    ) -> futures::future::BoxFuture<'a, Result<Box<native::Report>>> {
+        Box::pin(async move {
+            // Invalidations advance generation; retained objects still authenticate
+            // their original epoch/generation, but never regain current readiness.
+            let binding = state
+                .source_binding
+                .as_ref()
+                .ok_or(Error::SourceBinding(super::SourceBindingError::Missing))?;
+            let definition = state
+                .definition
+                .as_ref()
+                .ok_or_else(|| invalid("verification requires definition"))?;
+            binding.validate_definition(definition)?;
+            if reference.migration != self.migration_id() {
+                return Err(invalid("native report namespace differs"));
+            }
+            let bytes = self
+                .read_bounded(&self.verification_key(&reference.run), REPORT_BYTES)
+                .await?;
+            let report =
+                reference.authenticate(bytes.as_deref(), binding, &native_order(binding)?)?;
+            let mut original = state.clone();
+            original.epoch = report.epoch;
+            original.verification.generation = report.generation;
+            admit_native(&original, reference)?;
+            Ok(Box::new(report))
+        })
+    }
+    pub(crate) async fn validate_native_verification(
+        &self,
+        state: &super::Materialized,
+    ) -> Result<()> {
+        if state.verification.report.is_some() && state.source_binding.is_some() {
+            return Err(Error::SourceBinding(super::SourceBindingError::Connector));
+        }
+        if let Some(reference) = &state.verification.native_report {
+            if reference.epoch > state.epoch
+                || reference.generation > state.verification.generation
+                || state.verification.runs.get(&reference.run) != Some(&reference.digest)
+            {
+                return Err(invalid("native reference is not a recorded completion"));
+            }
+            if state.verification.report.is_some() {
+                return Err(invalid("ambiguous verification versions"));
+            }
+            self.native_verification_report(state, reference).await?;
+        }
+        Ok(())
+    }
+}
+
+impl super::journal::Journal {
+    /// Refresh object authentication before projecting native readiness. A retained
+    /// reference alone cannot replace missing or corrupt durable evidence.
+    pub async fn native_verification_facts(
+        &self,
+        state: &super::Materialized,
+        capture: &crate::event::Position,
+    ) -> Result<VerificationFacts> {
+        let Some(reference) = &state.verification.native_report else {
+            return Ok(VerificationFacts::default());
+        };
+        let report = self.native_verification_report(state, reference).await?;
+        if state.verification.invalidated || admit_native(state, reference).is_err() {
+            return Ok(VerificationFacts::default());
+        }
+        let through = crate::event::Position::try_from(reference.through.clone())
+            .map_err(|_| Error::NativeVerification(native::Error::PositionEncoding))?;
+        if through
+            .compare(capture, &native_order(&reference.binding)?)
+            .map_err(|e| Error::NativeVerification(native::Error::Position(e)))?
+            == Ordering::Less
+        {
+            return Ok(VerificationFacts::default());
+        }
+        let mut counts = Counts::default();
+        let mut busy = 0u64;
+        for table in &report.tables {
+            counts.add(&table.counts)?;
+            for range in &table.ranges {
+                busy = busy
+                    .checked_add(range.exhausted_busy)
+                    .ok_or_else(|| invalid("busy overflow"))?;
+            }
+        }
+        Ok(VerificationFacts {
+            verification: counts.verified == counts.total
+                && counts.busy == 0
+                && counts.mismatched == 0
+                && counts.excluded == 0
+                && report.dead_letters.count == 0
+                && report.sections.all().iter().all(|s| s.findings.is_empty()),
+            busy_rows_past_budget: Some(busy),
+            dead_letters: Some(report.dead_letters.count),
+        })
+    }
 }

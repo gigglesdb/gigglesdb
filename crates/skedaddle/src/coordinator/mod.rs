@@ -27,6 +27,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     BudgetExceeded(budget::Blocker),
     SourceBinding(SourceBindingError),
+    NativeVerification(verification::native::Error),
     RecoveryRequired(String),
     UnsupportedFormatVersion {
         format: &'static str,
@@ -52,6 +53,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SourceBinding(error) => error.fmt(f),
+            Self::NativeVerification(error) => error.fmt(f),
             Self::BudgetExceeded(b) => write!(
                 f,
                 "{}: {} exceeds {}; {}",
@@ -622,6 +624,9 @@ pub enum Transition {
     VerificationCompleted {
         report: Box<verification::ReportRef>,
     },
+    VerificationCompletedNative {
+        report: Box<verification::native::ReportRef>,
+    },
     VerificationInvalidated {
         invalidation: verification::Invalidation,
     },
@@ -900,7 +905,26 @@ impl Materialized {
                             self.verifier_exceptions.remove(id);
                         }
                     }
+                    Transition::VerificationCompletedNative { report } => {
+                        verification::admit_native(self, report)?;
+                        if self.verification.runs.contains_key(&report.run)
+                            || self.verification.runs.len() >= 128
+                        {
+                            return Err(Error::Rejected(
+                                "verification run already completed".into(),
+                            ));
+                        }
+                        self.verification
+                            .runs
+                            .insert(report.run.clone(), report.digest.clone());
+                        self.verification.report = None;
+                        self.verification.native_report = Some(report.clone());
+                        self.verification.invalidated = false;
+                    }
                     Transition::VerificationCompleted { report } => {
+                        if self.source_binding.is_some() {
+                            return Err(Error::SourceBinding(SourceBindingError::Connector));
+                        }
                         report.validate()?;
                         let definition = self.definition.as_ref().ok_or_else(|| {
                             Error::Rejected("verification requires definition".into())
@@ -937,6 +961,7 @@ impl Materialized {
                         self.verification
                             .runs
                             .insert(report.summary.run.clone(), report.digest.clone());
+                        self.verification.native_report = None;
                         self.verification.report = Some(report.clone());
                         self.verification.invalidated = false;
                     }
@@ -965,6 +990,7 @@ impl Materialized {
                             .report
                             .as_ref()
                             .is_some_and(|r| invalidation.applies(r))
+                            || self.verification.native_report.is_some()
                         {
                             self.verification.invalidated = true;
                         }

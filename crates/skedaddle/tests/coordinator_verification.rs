@@ -970,3 +970,441 @@ fn native_boundaries_cannot_be_reinterpreted_as_pg_v1_reports() {
         Err(VerifyError::Position(_))
     ));
 }
+
+fn native_binding() -> skedaddle::coordinator::SourceBinding {
+    skedaddle::coordinator::SourceBinding {
+        version: 1,
+        connector: skedaddle::coordinator::SourceConnector::Mysql,
+        order_domain: "mysql:source/gtid".into(),
+        stream: "source-stream".into(),
+    }
+}
+async fn native_owner(j: Journal) -> Coordinator {
+    let mut c = Coordinator::observer(
+        j,
+        Local::create(scratch("native-local").join("db")).unwrap(),
+        "owner",
+    )
+    .unwrap();
+    c.acquire().await.unwrap();
+    let mut d = definition();
+    d.source.engine = skedaddle::definition::Engine::Mysql;
+    d.source.connection_ref = None;
+    d.source.version = "8.4".into();
+    d.source.mysql = Some(
+        serde_json::from_value(serde_json::json!({
+            "host": "127.0.0.1", "port": 3306,
+            "user": "env:SKEDADDLE_TEST_MYSQL_USER", "password": "env:SKEDADDLE_TEST_MYSQL_PASSWORD"
+        }))
+        .unwrap(),
+    );
+    assert!(d.validate().is_empty());
+    c.commit(Transition::Define {
+        definition: Box::new(d),
+    })
+    .await
+    .unwrap();
+    c.commit(Transition::SourceBindingV1 {
+        binding: native_binding(),
+    })
+    .await
+    .unwrap();
+    c
+}
+fn native_report(c: &Coordinator) -> native::Report {
+    use skedaddle::{
+        event::{Position, PositionWireV1},
+        mysql::position::MysqlPosition,
+    };
+    let pg = report(
+        c.state().epoch,
+        c.state().verification.generation,
+        "native-run",
+    );
+    let pos = |last: u64| -> PositionWireV1 {
+        let p = MysqlPosition::Gtid {
+            set: format!("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-{last}")
+                .parse()
+                .unwrap(),
+            server_uuid: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
+            file: "mysql-bin.000001".into(),
+            offset: 100,
+        };
+        (&Position::new("mysql:source/gtid", p.encode().unwrap())).into()
+    };
+    let interval = native::Interval {
+        armed: 1,
+        source_read: 2,
+        destination_read: 3,
+        complete_through: pos(9),
+        evidence: "complete transcript".into(),
+    };
+    let scope = native::TableScope {
+        schema: "public".into(),
+        table: "accounts".into(),
+        catalog_digest: "a".repeat(64),
+        plan_digest: "b".repeat(64),
+        key: vec![native::KeyColumn {
+            name: "id".into(),
+            mapping_identity: "bigint".into(),
+            kind: native::KeyType::Signed { bits: 64 },
+        }],
+    };
+    let lower = native::Boundary::NegativeInfinity;
+    let upper = native::Boundary::PositiveInfinity;
+    let counts = pg.tables[0].counts.clone();
+    let range = native::RangeResult {
+        id: native::range_identity(&scope, &lower, &upper).unwrap(),
+        lower,
+        upper,
+        counts: counts.clone(),
+        exclusions: vec![],
+        interval: native::Interval {
+            complete_through: pos(10),
+            ..interval.clone()
+        },
+        applied: pos(100),
+        applied_evidence: "applied checkpoint".into(),
+        source_digest: "c".repeat(64),
+        destination_digest: "c".repeat(64),
+        retry_attempts: 0,
+        exhausted_busy: 0,
+        outstanding_keys: vec![],
+    };
+    let mut r = native::Report {
+        version: 2,
+        coverage_version: 2,
+        binding: native_binding(),
+        migration: "migration".into(),
+        definition_digest: c
+            .state()
+            .definition
+            .as_ref()
+            .unwrap()
+            .canonical_digest()
+            .unwrap(),
+        run: "native-run".into(),
+        epoch: c.state().epoch,
+        generation: c.state().verification.generation,
+        completed: true,
+        interval,
+        tables: vec![native::TableResult {
+            scope,
+            counts,
+            ranges: vec![range],
+        }],
+        retry: RetryPolicy {
+            version: 2,
+            ..pg.retry
+        },
+        dead_letters: pg.dead_letters,
+        sections: pg.sections,
+        coverage_digest: String::new(),
+    };
+    r.coverage_digest = r.computed_coverage_digest().unwrap();
+    r
+}
+#[tokio::test]
+async fn native_completion_checkpoint_recovery_and_copy_preserve_variable_positions() {
+    let j = journal(&scratch("native-roundtrip"));
+    let mut c = native_owner(j.clone()).await;
+    let r = native_report(&c);
+    assert_ne!(
+        skedaddle::event::Position::try_from(r.interval.complete_through.clone())
+            .unwrap()
+            .bytes()
+            .len(),
+        skedaddle::event::Position::try_from(r.tables[0].ranges[0].applied.clone())
+            .unwrap()
+            .bytes()
+            .len()
+    );
+    let reference = j.publish_native_verification(c.state(), &r).await.unwrap();
+    c.commit(Transition::VerificationCompletedNative {
+        report: Box::new(reference.clone()),
+    })
+    .await
+    .unwrap();
+    let expected = c.state().clone();
+    let capture =
+        skedaddle::event::Position::try_from(r.interval.complete_through.clone()).unwrap();
+    assert!(
+        j.native_verification_facts(&expected, &capture)
+            .await
+            .unwrap()
+            .verification
+    );
+    c.checkpoint().await.unwrap();
+    for checkpoint in [false, true] {
+        assert_eq!(j.load(checkpoint).await.unwrap(), expected);
+    }
+    let local = Local::create(scratch("native-recover").join("db")).unwrap();
+    let mut observer = Coordinator::observer(j.clone(), local, "restart").unwrap();
+    observer.refresh().await.unwrap();
+    assert_eq!(observer.state(), &expected);
+    assert_eq!(
+        *j.native_verification_report(&expected, &reference)
+            .await
+            .unwrap(),
+        r
+    );
+    let dest = journal(&scratch("native-copy"));
+    assert_eq!(j.copy_entries_for_rebuild(&dest).await.unwrap(), expected);
+    assert_eq!(dest.load(false).await.unwrap(), expected);
+}
+#[tokio::test]
+async fn native_admission_rejects_versions_binding_and_scope() {
+    use skedaddle::coordinator::{Error, SourceBindingError, SourceConnector};
+    let j = journal(&scratch("native-admission"));
+    let mut c = native_owner(j.clone()).await;
+    let r = native_report(&c);
+    let good = j.publish_native_verification(c.state(), &r).await.unwrap();
+    for mutation in 0..8 {
+        let mut bad = good.clone();
+        match mutation {
+            0 => bad.version = 99,
+            1 => bad.binding.connector = SourceConnector::Spanner,
+            2 => bad.binding.order_domain = "unknown".into(),
+            3 => bad.epoch += 1,
+            4 => bad.generation += 1,
+            5 => bad.definition_digest = "e".repeat(64),
+            6 => bad.scope[0].table = "other".into(),
+            _ => bad.binding.stream = "other".into(),
+        }
+        let e = c
+            .commit(Transition::VerificationCompletedNative {
+                report: Box::new(bad),
+            })
+            .await
+            .unwrap_err();
+        if mutation == 0 {
+            assert!(matches!(
+                e,
+                Error::NativeVerification(native::Error::Version(Some(99)))
+            ));
+        }
+    }
+    let mut missing = c.state().clone();
+    missing.source_binding = None;
+    assert!(matches!(
+        j.native_verification_report(&missing, &good).await,
+        Err(Error::SourceBinding(SourceBindingError::Missing))
+    ));
+    let mut unknown = c.state().clone();
+    unknown.source_binding.as_mut().unwrap().order_domain = "unknown".into();
+    assert!(matches!(
+        j.native_verification_report(&unknown, &good).await,
+        Err(Error::SourceBinding(SourceBindingError::OrderDomain))
+    ));
+    assert!(c.state().verification.native_report.is_none());
+}
+#[tokio::test]
+async fn native_missing_or_corrupt_report_refuses_replay_checkpoint_and_refresh() {
+    use object_store::ObjectStoreExt;
+    for corrupt in [false, true] {
+        let root = scratch("native-loss");
+        let store = fs_store(&root);
+        let j = journal(&root);
+        let mut c = native_owner(j.clone()).await;
+        let r = native_report(&c);
+        let reference = j.publish_native_verification(c.state(), &r).await.unwrap();
+        c.commit(Transition::VerificationCompletedNative {
+            report: Box::new(reference),
+        })
+        .await
+        .unwrap();
+        c.checkpoint().await.unwrap();
+        let capture =
+            skedaddle::event::Position::try_from(r.interval.complete_through.clone()).unwrap();
+        assert!(
+            j.native_verification_facts(c.state(), &capture)
+                .await
+                .unwrap()
+                .verification
+        );
+        let key = j.verification_key(&r.run);
+        if corrupt {
+            store
+                .put(&key, object_store::PutPayload::from_static(b"{}"))
+                .await
+                .unwrap();
+        } else {
+            store.delete(&key).await.unwrap();
+        }
+        assert!(
+            j.native_verification_facts(c.state(), &capture)
+                .await
+                .is_err()
+        );
+        assert!(j.load(false).await.is_err());
+        assert!(j.load(true).await.is_err());
+        assert!(c.refresh().await.is_err());
+        assert!(c.checkpoint().await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn v1_reference_and_transition_bytes_still_roundtrip_without_native_fields() {
+    let j = journal(&scratch("v1-wire"));
+    let reference = j.publish_verification(&report(1, 0, "v1")).await.unwrap();
+    let bytes = serde_json::to_vec(&reference).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&serde_json::from_slice::<ReportRef>(&bytes).unwrap()).unwrap(),
+        bytes
+    );
+    let transition = Transition::VerificationCompleted {
+        report: Box::new(reference),
+    };
+    let bytes = serde_json::to_vec(&transition).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&serde_json::from_slice::<Transition>(&bytes).unwrap()).unwrap(),
+        bytes
+    );
+    let mut state = serde_json::to_value(skedaddle::coordinator::Materialized::default()).unwrap();
+    assert!(state.get("verification").is_none());
+    state["verification"] =
+        serde_json::json!({"report": null,"invalidated": false,"generation": 1,"runs": {}});
+    let old = serde_json::to_vec(&state).unwrap();
+    let decoded: skedaddle::coordinator::Materialized = serde_json::from_slice(&old).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), state);
+}
+
+fn runner_native_key() -> skedaddle::mysql::chunk_key::MysqlTableKey {
+    use skedaddle::mysql::chunk_key::*;
+    MysqlTableKey {
+        event_table: "public.accounts".into(),
+        schema: "public".into(),
+        table: "accounts".into(),
+        columns: vec![MysqlKeyColumn {
+            name: "id".into(),
+            data_type: "bigint".into(),
+            column_type: "bigint".into(),
+            character_set: None,
+            collation: None,
+            type_id: "bigint".into(),
+            direction: MysqlKeyDirection::Asc,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn runner_native_publication_projects_exact_current_facts_and_refuses_lost_objects() {
+    use object_store::ObjectStoreExt;
+    use skedaddle::{
+        engine::Engine,
+        event::Position,
+        runner::verification::{native_current, publish_native},
+    };
+    for corrupt in [false, true] {
+        let root = scratch("runner-native-publication");
+        let store = fs_store(&root);
+        let j = journal(&root);
+        let c = native_owner(j.clone()).await;
+        let r = native_report(&c);
+        let engine = Engine::new(c, j.clone());
+        let runtime = engine.runtime();
+        publish_native(&runtime, &j, &r, &[runner_native_key()])
+            .await
+            .unwrap();
+        let state = runtime.state().await;
+        assert!(state.verification.report.is_none());
+        assert!(state.verification.native_report.is_some());
+        assert_eq!(j.load(true).await.unwrap(), state);
+        let capture = Position::try_from(r.interval.complete_through.clone()).unwrap();
+        let scope = r.tables.iter().map(|t| t.scope.clone()).collect::<Vec<_>>();
+        let projected = native_current(&j, &state, &capture, &scope).await.unwrap();
+        assert!(projected.verification.is_some());
+        assert_eq!(projected.verification.unwrap().tables[0].rows.verified, 2);
+        assert!(
+            native_current(&j, &state, &capture, &[])
+                .await
+                .unwrap()
+                .verification
+                .is_none()
+        );
+        let advanced = Position::try_from(r.tables[0].ranges[0].applied.clone()).unwrap();
+        assert!(
+            native_current(&j, &state, &advanced, &scope)
+                .await
+                .unwrap()
+                .verification
+                .is_none()
+        );
+        let mut unrecorded = state.clone();
+        unrecorded.verification.runs.clear();
+        assert!(
+            native_current(&j, &unrecorded, &capture, &scope)
+                .await
+                .is_err()
+        );
+        let mut stale = state.clone();
+        stale.verification.generation += 1;
+        assert!(
+            native_current(&j, &stale, &capture, &scope)
+                .await
+                .unwrap()
+                .verification
+                .is_none()
+        );
+        let mut wrong = state.clone();
+        wrong.source_binding.as_mut().unwrap().stream = "other".into();
+        assert!(native_current(&j, &wrong, &capture, &scope).await.is_err());
+        if corrupt {
+            // Replace the object explicitly: Windows can deny rename-overwrite
+            // while an object-store streaming reader is finishing its close.
+            store.delete(&j.verification_key(&r.run)).await.unwrap();
+            store
+                .put(
+                    &j.verification_key(&r.run),
+                    object_store::PutPayload::from_static(b"{}"),
+                )
+                .await
+                .unwrap();
+        } else {
+            store.delete(&j.verification_key(&r.run)).await.unwrap();
+        }
+        for _ in 0..2 {
+            assert!(native_current(&j, &state, &capture, &scope).await.is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn runner_native_creation_refuses_unsupported_keys_before_publication() {
+    use skedaddle::{engine::Engine, runner::verification::publish_native};
+    let root = scratch("runner-native-key-scope");
+    let j = journal(&root);
+    let c = native_owner(j.clone()).await;
+    let r = native_report(&c);
+    let engine = Engine::new(c, j.clone());
+    let runtime = engine.runtime();
+    for kind in ["date", "datetime", "time", "binary", "varbinary", "varchar"] {
+        let mut key = runner_native_key();
+        key.columns[0].data_type = kind.into();
+        key.columns[0].column_type = kind.into();
+        if kind == "varchar" {
+            key.columns[0].character_set = Some("utf8mb4".into());
+            key.columns[0].collation = Some(skedaddle::mysql::schema::Collation {
+                id: 255,
+                name: "utf8mb4_0900_ai_ci".into(),
+            });
+        }
+        key.validate().unwrap();
+        assert!(matches!(publish_native(&runtime, &j, &r, &[key]).await,
+            Err(skedaddle::coordinator::Error::NativeVerification(native::Error::NativeReportKeyUnsupported {table, column, kind: _}))
+                if table == "public.accounts" && column == "id"));
+        assert!(runtime.state().await.verification.native_report.is_none());
+        assert!(
+            j.native_verification_report(
+                &runtime.state().await,
+                &r.reference(
+                    &r.binding,
+                    &skedaddle::mysql::position::MysqlOrder::gtid("source").unwrap()
+                )
+                .unwrap()
+            )
+            .await
+            .is_err()
+        );
+    }
+}

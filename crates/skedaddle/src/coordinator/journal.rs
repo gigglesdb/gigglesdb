@@ -443,6 +443,7 @@ impl Journal {
                 | Transition::ReverseConsistentPoint { .. }
                 | Transition::VerificationInvalidated { .. }
                 | Transition::VerificationCompleted { .. }
+                | Transition::VerificationCompletedNative { .. }
                 | Transition::SourceBindingV1 { .. }
                 | Transition::ChunkPlanned { .. }
                 | Transition::ChunkStarted { .. }
@@ -656,6 +657,7 @@ impl Journal {
     async fn write_checkpoint(&self, state: &Materialized, archive: Option<String>) -> Result<()> {
         let cp = Checkpoint::new(state, archive)?;
         cp.validate_materialization()?;
+        self.validate_native_verification(&cp.state).await?;
         if let Some(report) = &cp.state.verification.report {
             self.verification_report(report).await?;
         }
@@ -759,6 +761,7 @@ impl Journal {
             .ok_or_else(|| Error::RecoveryRequired("published checkpoint is missing".into()))?;
         let cp: Checkpoint = decode(&bytes)?;
         cp.validate_materialization()?;
+        self.validate_native_verification(&cp.state).await?;
         if let Some(report) = &cp.state.verification.report {
             self.verification_report(report).await?;
         }
@@ -991,6 +994,16 @@ impl Journal {
                     return Err(Error::Rejected("copied verification differs".into()));
                 }
             }
+            if let Transition::VerificationCompletedNative { report } = &entry.transition {
+                let object = self.native_verification_report(&state, report).await?;
+                if destination
+                    .publish_native_verification(&state, &object)
+                    .await?
+                    != **report
+                {
+                    return Err(Error::Rejected("copied native verification differs".into()));
+                }
+            }
             if let Transition::ChunkPlanned { plan } = &entry.transition {
                 let object = self.chunk_plan(plan).await?;
                 if destination.publish_chunk_plan(&object).await? != *plan {
@@ -1034,7 +1047,9 @@ impl Journal {
                 self.apply_entry(&mut state, &entry)
                     .await
                     .map_err(|e| match e {
-                        Error::UnsupportedFormatVersion { .. } | Error::SourceBinding(_) => e,
+                        Error::UnsupportedFormatVersion { .. }
+                        | Error::SourceBinding(_)
+                        | Error::NativeVerification(_) => e,
                         _ => Error::RecoveryRequired(format!("journal tail at {seq}: {e}")),
                     })?;
             }
@@ -1115,7 +1130,9 @@ impl Journal {
             self.apply_entry(&mut state, &entry)
                 .await
                 .map_err(|e| match e {
-                    Error::UnsupportedFormatVersion { .. } | Error::SourceBinding(_) => e,
+                    Error::UnsupportedFormatVersion { .. }
+                    | Error::SourceBinding(_)
+                    | Error::NativeVerification(_) => e,
                     _ => Error::RecoveryRequired(format!("journal replay at {seq}: {e}")),
                 })?;
             if let Some(key) = checkpoints.remove(seq) {
@@ -1125,6 +1142,7 @@ impl Journal {
                     .ok_or_else(|| Error::RecoveryRequired("listed checkpoint vanished".into()))?;
                 let cp: Checkpoint = decode(&bytes)?;
                 cp.validate_materialization()?;
+                self.validate_native_verification(&cp.state).await?;
                 if let Some(report) = &cp.state.verification.report {
                     self.verification_report(report).await?;
                 }

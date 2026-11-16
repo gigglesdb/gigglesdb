@@ -617,6 +617,7 @@ pub fn coordinator_gc_error(error: Error) -> reader::Error {
         // not used by this authority; fail closed for unexpected variants.
         Error::RecoveryRequired(_)
         | Error::SourceBinding(_)
+        | Error::NativeVerification(_)
         | Error::UnsupportedFormatVersion { .. }
         | Error::Rejected(_)
         | Error::Lifecycle(_)

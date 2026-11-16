@@ -561,6 +561,9 @@ impl Journal {
         transition: &Transition,
     ) -> Result<()> {
         match transition {
+            Transition::VerificationCompletedNative { report } => {
+                self.native_verification_report(state, report).await?;
+            }
             Transition::VerificationCompleted { report } => {
                 self.verification_report(report).await?;
             }

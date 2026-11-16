@@ -616,6 +616,31 @@ pub struct AppliedSourceWaiter {
 }
 
 impl Runtime {
+    /// Persist a native completion under the same ownership lock as journal commits.
+    /// Native positions never pass through the PG LSN conversion boundary.
+    pub async fn complete_native_verification(
+        &self,
+        journal: &crate::coordinator::journal::Journal,
+        report: &crate::coordinator::verification::native::Report,
+    ) -> crate::coordinator::Result<()> {
+        let mut coordinator = self.0.lock().await;
+        self.flush_progress_locked(&mut coordinator).await?;
+        let reference = journal
+            .publish_native_verification(coordinator.state(), report)
+            .await?;
+        let result = coordinator
+            .commit(
+                crate::coordinator::Transition::VerificationCompletedNative {
+                    report: Box::new(reference),
+                },
+            )
+            .await;
+        self.observe_journal_error(&coordinator, &result);
+        *self.1.write().expect("engine snapshot poisoned") = coordinator.state().clone();
+        result?;
+        Ok(())
+    }
+
     /// Fail closed when an external capture adapter reports an interval it
     /// cannot replay. Also provides the explicit fault-injection seam used by
     /// the real-engine verification qualification; it can only remove trust.

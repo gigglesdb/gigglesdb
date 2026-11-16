@@ -18,6 +18,85 @@ use std::{
     time::Instant,
 };
 
+/// Publish only scopes built from the qualified source key metadata. PG callers
+/// continue to use the unchanged v1 Service and PG LSN conversion.
+pub async fn publish_native(
+    runtime: &engine::Runtime,
+    journal: &Journal,
+    report: &durable::native::Report,
+    keys: &[crate::mysql::chunk_key::MysqlTableKey],
+) -> coordinator::Result<()> {
+    if keys.len() != report.tables.len() {
+        return Err(invalid());
+    }
+    for table in &report.tables {
+        let mut matching = keys
+            .iter()
+            .filter(|k| k.schema == table.scope.schema && k.table == table.scope.table);
+        let key = matching.next().ok_or_else(invalid)?;
+        if matching.next().is_some() || durable::native::mysql_key(key)? != table.scope.key {
+            return Err(invalid());
+        }
+    }
+    runtime.complete_native_verification(journal, report).await
+}
+
+/// Refresh both the object and current identity before projecting native facts.
+/// This async path does not trust a cached summary or a control-file result.
+pub async fn native_current(
+    journal: &Journal,
+    state: &Materialized,
+    capture: &crate::event::Position,
+    scope: &[durable::native::TableScope],
+) -> coordinator::Result<ComponentSnapshot> {
+    let Some(reference) = &state.verification.native_report else {
+        return Ok(ComponentSnapshot::default());
+    };
+    journal.validate_native_verification(state).await?;
+    journal.validate_native_verification(state).await?;
+    let report = journal.native_verification_report(state, reference).await?;
+    if reference.scope != scope {
+        return Ok(ComponentSnapshot::default());
+    }
+    let facts = journal.native_verification_facts(state, capture).await?;
+    let mut live = verify::VerificationReport::default();
+    for table in &report.tables {
+        live.tables.push(verify::TableCoverage {
+            table: format!("{}.{}", table.scope.schema, table.scope.table),
+            rows: verify::Coverage {
+                total: table.counts.total,
+                verified: table.counts.verified,
+                busy: table.counts.busy,
+                mismatched: table.counts.mismatched,
+                excluded: table.counts.excluded,
+            },
+            exclusion_reason: None,
+        });
+    }
+    macro_rules! section {
+        ($field:ident, $source:ident) => {
+            if report.sections.$source.completed && report.sections.$source.findings.is_empty() {
+                live.$field = verify::ResultSlot::Collected {
+                    checked: report.sections.$source.checked,
+                    findings: vec![],
+                    evidence: vec![],
+                };
+            }
+        };
+    }
+    section!(schema, schema);
+    section!(sequences, sequences);
+    section!(constraints, constraints);
+    section!(indexes, indexes);
+    section!(foreign_keys, destination_foreign_keys);
+    Ok(ComponentSnapshot {
+        verification: facts.verification.then_some(live),
+        busy_rows_past_budget: facts.busy_rows_past_budget,
+        dead_letters: facts.dead_letters,
+        ..ComponentSnapshot::default()
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VerifyResponse {
     pub exit_code: u8,
@@ -64,6 +143,10 @@ fn now_ms() -> Option<u64> {
         .ok()
 }
 fn readiness_status(root: &Path, id: &str, state: &Materialized) -> super::readiness::Facts {
+    // PG control files cannot certify a native report/capture identity.
+    if state.verification.native_report.is_some() {
+        return super::readiness::Facts::sample(state.definition.as_ref(), None);
+    }
     let valid = (|| -> Option<super::readiness::Facts> {
         let generation = active(root).ok()??;
         let status: ReadinessStatus =
@@ -137,7 +220,7 @@ pub fn verification_status(root: &Path, id: &str, state: &Materialized) -> Json 
         }
         Some(status.verification)
     })();
-    json!({"verification":valid.unwrap_or(false),"live_owner_observation":valid.is_some(),"completed_report":state.verification.report.as_ref().map(|r|&r.summary.run),"operational_schema":state.operational_schema,"schema_remediation":crate::pg::ddl::SCHEMA_REMEDIATION,"readiness":readiness_status(&control, id, state)})
+    json!({"verification":valid.unwrap_or(false),"live_owner_observation":valid.is_some(),"completed_report":state.verification.report.as_ref().map(|r|&r.summary.run).or_else(||state.verification.native_report.as_ref().map(|r|&r.run)),"operational_schema":state.operational_schema,"schema_remediation":crate::pg::ddl::SCHEMA_REMEDIATION,"readiness":readiness_status(&control, id, state)})
 }
 
 fn control_file(root: &Path, name: &str) -> std::io::Result<File> {

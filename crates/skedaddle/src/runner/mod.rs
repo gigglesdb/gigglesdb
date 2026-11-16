@@ -18,7 +18,7 @@ pub use rollback::{request_rollback, status as rollback_status};
 mod readiness;
 mod reverse_capabilities;
 mod selection;
-mod verification;
+pub mod verification;
 pub use crate::coordinator::{SourceBinding, SourceBindingError, SourceConnector};
 pub use cutover::{
     CutoverError, CutoverErrorKind, CutoverOutcome, CutoverReason, StepTiming, request_cutover,
