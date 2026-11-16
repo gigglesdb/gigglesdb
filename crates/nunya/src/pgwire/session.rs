@@ -1909,7 +1909,7 @@ mod tests {
             });
             let (client, connection) = tokio_postgres::Config::new()
                 .host("127.0.0.1").port(address.port())
-                .user(&format!("session:{}", id.to_hex())).password("login-secret")
+                .user(format!("session:{}", id.to_hex())).password("login-secret")
                 .dbname("app").connect(tokio_postgres::NoTls).await.unwrap();
             let connection = tokio::spawn(connection);
             let query = tokio::spawn(async move { client.batch_execute("COMMIT").await });
