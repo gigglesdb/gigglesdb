@@ -5,7 +5,8 @@
 //! log, reads the range's applied descriptor and opens an engine through the
 //! `RangeEngineOpener` (design.md section 4). The engine's sink is bound to that
 //! leadership term and descriptor epoch; leadership loss, a stop or any failed
-//! write fences it and calls `opener.close(range)` exactly once.
+//! write fences it and calls `opener.close(range)` exactly once. Each open gets a
+//! fresh lock generation `(term << 20) | k` (design.md Changes 2026-11-16T10:40Z).
 use crate::{
     core_store::TermSink,
     host::StateFactory,
@@ -136,8 +137,10 @@ impl RangeService for ConfirmedService {
         txn: ClusterTxnId,
         writes: Vec<RangeWrite>,
         marker_xid: Option<u64>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
-        self.inner.commit(epoch, txn, writes, marker_xid)
+        self.inner
+            .commit(epoch, txn, writes, marker_xid, lock_generation)
     }
     fn prepare(
         &self,
@@ -145,8 +148,10 @@ impl RangeService for ConfirmedService {
         txn: ClusterTxnId,
         home: RangeId,
         writes: Vec<RangeWrite>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
-        self.inner.prepare(epoch, txn, home, writes)
+        self.inner
+            .prepare(epoch, txn, home, writes, lock_generation)
     }
     fn finalize(&self, txn: ClusterTxnId, outcome: Outcome) -> Result<(), RangeError> {
         self.inner.finalize(txn, outcome)
@@ -222,10 +227,44 @@ impl Drop for RangeEngine {
 
 type States = Arc<Mutex<BTreeMap<RangeId, Arc<RangeStateMachine>>>>;
 
+/// Per range: the term of this node's last engine open and how many opens it made in it.
+type Opened = Arc<Mutex<BTreeMap<RangeId, (u64, u64)>>>;
+
+/// Bits of a lock generation below the term (design.md Changes 2026-11-16T10:40Z (d)).
+const GENERATION_K_BITS: u32 = 20;
+
+/// The lock generation of the next engine this node opens for `range` in `term`:
+/// `(term << 20) | k`, k = engines this node already opened for the range in that
+/// term (reset per term). Strictly increasing per range across leaders (terms
+/// increase) and same-term reopens; every attempt takes a fresh k, so a failed
+/// open is never reused. Fails rather than wrap when k or the term overflows.
+pub(crate) fn next_generation(
+    opened: &Mutex<BTreeMap<RangeId, (u64, u64)>>,
+    range: RangeId,
+    term: u64,
+) -> Result<u64, String> {
+    let mut opened = opened.lock().unwrap_or_else(PoisonError::into_inner);
+    let entry = opened.entry(range).or_insert((term, 0));
+    if entry.0 != term {
+        *entry = (term, 0);
+    }
+    let k = entry.1;
+    if k >= 1 << GENERATION_K_BITS || term >= 1 << (64 - GENERATION_K_BITS) {
+        return Err(format!(
+            "range {}: no lock generation left in term {term}",
+            range.0
+        ));
+    }
+    entry.1 += 1;
+    Ok((term << GENERATION_K_BITS) | k)
+}
+
 struct Backing {
     store: Arc<RangeStore>,
     opener: Option<Arc<dyn RangeEngineOpener>>,
     states: States,
+    /// Lock-generation counters; kept across role-manager restarts of a range.
+    opened: Opened,
 }
 
 /// The store-backed part of a `RangeHost`: role managers and the system service.
@@ -256,6 +295,7 @@ impl RangeRoles {
                 store,
                 opener,
                 states,
+                opened: Opened::default(),
             }),
             ..Self::default()
         };
@@ -284,6 +324,7 @@ impl RangeRoles {
             return;
         };
         let store = backing.store.clone();
+        let opened = backing.opened.clone();
         let barrier = handle.clone();
         let open = Box::new(move |term| {
             // Runs after the leader's read barrier: the descriptor is the applied one.
@@ -292,9 +333,10 @@ impl RangeRoles {
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("range {} has no descriptor", range.0))?;
             let guard = state.engine_guard();
+            let generation = next_generation(&opened, range, term)?;
             let sink = Arc::new(RangeSink::new(handle.clone(), term, descriptor.epoch));
             let service = opener
-                .open(descriptor, sink.clone())
+                .open(descriptor, sink.clone(), generation)
                 .map_err(|e| e.to_string())?;
             Ok(RangeEngine {
                 range,
@@ -368,5 +410,30 @@ impl RangeRoles {
 
     pub(crate) fn set_system(&self, system: Option<Arc<dyn SystemService>>) {
         *self.system.write().unwrap_or_else(PoisonError::into_inner) = system;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generations_grow_across_same_term_reopens_and_terms() {
+        let opened = Mutex::default();
+        let (a, b) = (RangeId(2), RangeId(3));
+        let first = next_generation(&opened, a, 5).unwrap();
+        assert_eq!(first, 5 << 20);
+        // A same-term reopen (after a fenced sink) gets a larger generation.
+        let reopen = next_generation(&opened, a, 5).unwrap();
+        assert_eq!(reopen, (5 << 20) | 1);
+        // Counters are per range; a new term resets k but stays above every earlier one.
+        assert_eq!(next_generation(&opened, b, 5).unwrap(), 5 << 20);
+        let next_term = next_generation(&opened, a, 6).unwrap();
+        assert_eq!(next_term, 6 << 20);
+        assert!(first < reopen && reopen < next_term);
+        // Overflow fails instead of reusing a generation.
+        opened.lock().unwrap().insert(a, (6, 1 << 20));
+        assert!(next_generation(&opened, a, 6).is_err());
+        assert!(next_generation(&opened, b, 1 << 44).is_err());
     }
 }

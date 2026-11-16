@@ -26,6 +26,8 @@ struct RangeState {
     versions: Vec<(Vec<u8>, Timestamp)>,
     locks: HashSet<ClusterTxnId>,
     prepared_at: Vec<Timestamp>,
+    /// The range's lock generation (0 until a test simulates a leader change).
+    generation: u64,
 }
 
 /// In-memory cluster: participants follow the prepare/finalize rules of design.md 3-5, and
@@ -173,6 +175,7 @@ impl RangeClient for Link<'_> {
         _: ClusterTxnId,
         _: Vec<RangeWrite>,
         _: Option<u64>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         unimplemented!()
     }
@@ -183,6 +186,7 @@ impl RangeClient for Link<'_> {
         txn: ClusterTxnId,
         _: RangeId,
         writes: Vec<RangeWrite>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.call()?;
         if self.cluster.fail_prepare == Some(range) {
@@ -190,6 +194,9 @@ impl RangeClient for Link<'_> {
         }
         let mut ranges = self.cluster.ranges.lock().unwrap();
         let rs = ranges.entry(range).or_default();
+        if lock_generation.is_some_and(|g| g != rs.generation) {
+            return Err(RangeError::Aborted("locks lost: another generation".into()));
+        }
         if let Some((p, _)) = rs.prepared.get(&txn) {
             return Ok(*p);
         }
@@ -271,6 +278,7 @@ fn plan(ranges: &[u64], lock_only: &[u64]) -> CommitPlan {
                     key: format!("k{r}").into_bytes(),
                     value: Some(b"v".to_vec()),
                 }],
+                lock_generation: Some(0),
             })
             .collect(),
         lock_only: lock_only.iter().map(|&r| RangeId(r)).collect(),
@@ -330,6 +338,25 @@ fn refused_prepare_aborts_everywhere() {
     fake.fail_prepare = Some(RangeId(2));
     let err = commit_cross_range(&Link::up(&fake), plan(&[1, 2, 3], &[4])).unwrap_err();
     assert!(matches!(err, CommitError::Aborted(_)), "{err:?}");
+    assert_clean(&fake);
+    assert_eq!(applied(&fake, &[1, 2, 3]), None);
+}
+
+#[test]
+fn locks_of_an_older_generation_abort_everywhere() {
+    // Range 2 changed leader after granting the locks (its lock generation moved on).
+    let fake = FakeCluster::new(&ids(&[1, 2, 3]), TXN);
+    fake.ranges
+        .lock()
+        .unwrap()
+        .get_mut(&RangeId(2))
+        .unwrap()
+        .generation = 1;
+    let err = commit_cross_range(&Link::up(&fake), plan(&[1, 2, 3], &[])).unwrap_err();
+    assert!(
+        matches!(&err, CommitError::Aborted(RangeError::Aborted(m)) if m.starts_with("locks lost")),
+        "{err:?}"
+    );
     assert_clean(&fake);
     assert_eq!(applied(&fake, &[1, 2, 3]), None);
 }

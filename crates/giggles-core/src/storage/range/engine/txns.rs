@@ -129,9 +129,11 @@ impl RangeEngine {
         txn: ClusterTxnId,
         writes: Vec<RangeWrite>,
         marker_xid: Option<u64>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.check_open()?;
         self.check_epoch(epoch)?;
+        self.check_generation(lock_generation)?;
         let _busy = match self.begin(txn)? {
             Begun::Ready(busy) => busy,
             Begun::Prepared(_) => {
@@ -163,13 +165,23 @@ impl RangeEngine {
         txn: ClusterTxnId,
         home: RangeId,
         writes: Vec<RangeWrite>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.check_open()?;
         self.check_epoch(epoch)?;
-        // A retry of a prepared transaction returns its p; a concurrent duplicate waits.
-        let _busy = match self.begin(txn)? {
-            Begun::Ready(busy) => busy,
-            Begun::Prepared(at) => return Ok(Timestamp(at.0)),
+        // A retry of a prepared transaction returns its p whatever its lock generation: the
+        // prepare was accepted under a valid one and a new leader re-took its locks (Track D
+        // rule (a)). A concurrent duplicate waits.
+        let _busy = match self.begin(txn) {
+            Ok(Begun::Prepared(at)) => return Ok(Timestamp(at.0)),
+            Ok(Begun::Ready(busy)) => {
+                self.check_generation(lock_generation)?;
+                busy
+            }
+            Err(error) => {
+                self.check_generation(lock_generation)?;
+                return Err(error);
+            }
         };
         let writes = self.checked_writes(txn, writes)?;
         let locks = self.locks.held(txn_id(txn));

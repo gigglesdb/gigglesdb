@@ -102,6 +102,7 @@ fn calls() -> Vec<PeerCall> {
             txn,
             writes: writes.clone(),
             marker_xid: Some(77),
+            lock_generation: Some((9 << 20) | 2),
         },
         RangeCall::Commit {
             range,
@@ -109,6 +110,7 @@ fn calls() -> Vec<PeerCall> {
             txn,
             writes: Vec::new(),
             marker_xid: None,
+            lock_generation: None,
         },
         RangeCall::Prepare {
             range,
@@ -116,6 +118,7 @@ fn calls() -> Vec<PeerCall> {
             txn,
             home: RangeId(2),
             writes,
+            lock_generation: Some(u64::MAX),
         },
         RangeCall::Finalize {
             range,
@@ -192,11 +195,16 @@ fn replies() -> Vec<Result<PeerReply, RangeError>> {
         }),
         RangeReply::Lock(LockGrant {
             latest: Some((Timestamp(8), Some(b"v".to_vec()))),
+            generation: (4 << 20) | 1,
         }),
         RangeReply::Lock(LockGrant {
             latest: Some((Timestamp(8), None)),
+            generation: u64::MAX,
         }),
-        RangeReply::Lock(LockGrant { latest: None }),
+        RangeReply::Lock(LockGrant {
+            latest: None,
+            generation: 0,
+        }),
         RangeReply::Blockers(vec![ClusterTxnId(1), ClusterTxnId(2)]),
         RangeReply::CancelWait,
         RangeReply::Release,
@@ -224,7 +232,9 @@ fn replies() -> Vec<Result<PeerReply, RangeError>> {
     .collect();
     out.extend([
         Ok(PeerReply::Gateway(GatewayReply::Done)),
-        Ok(PeerReply::Gateway(GatewayReply::Blockers(vec![ClusterTxnId(3)]))),
+        Ok(PeerReply::Gateway(GatewayReply::Blockers(vec![
+            ClusterTxnId(3),
+        ]))),
         Err(RangeError::NotLeader { hint: Some(2) }),
         Err(RangeError::NotLeader { hint: None }),
         Err(RangeError::StaleEpoch { descriptor: desc() }),
@@ -241,7 +251,10 @@ fn replies() -> Vec<Result<PeerReply, RangeError>> {
 }
 
 /// Every strict prefix and one appended byte must be rejected; a bad version too.
-fn assert_strict<T: std::fmt::Debug>(bytes: &[u8], decode: impl Fn(&[u8]) -> Result<T, RangeError>) {
+fn assert_strict<T: std::fmt::Debug>(
+    bytes: &[u8],
+    decode: impl Fn(&[u8]) -> Result<T, RangeError>,
+) {
     for n in 0..bytes.len() {
         assert!(decode(&bytes[..n]).is_err(), "prefix {n} of {bytes:?}");
     }

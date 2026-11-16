@@ -23,6 +23,9 @@ pub(crate) struct Participant {
     pub range: RangeId,
     pub epoch: Epoch,
     pub writes: Vec<RangeWrite>,
+    /// Generation of the lock grants the transaction holds there, as its caller recorded
+    /// them (None = no lock taken there); passed to prepare, which refuses a lost one.
+    pub lock_generation: Option<u64>,
 }
 
 /// A cross-range commit; the first participant is the home (first range written).
@@ -198,7 +201,14 @@ pub(crate) fn commit_cross_range(
             .iter()
             .map(|p| {
                 s.spawn(move || {
-                    let prepared_at = client.prepare(p.range, p.epoch, txn, h, p.writes.clone())?;
+                    let prepared_at = client.prepare(
+                        p.range,
+                        p.epoch,
+                        txn,
+                        h,
+                        p.writes.clone(),
+                        p.lock_generation,
+                    )?;
                     let vote = HomeOp::Vote {
                         txn,
                         incarnation,

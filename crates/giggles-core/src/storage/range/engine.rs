@@ -14,6 +14,10 @@
 //! - Commit, prepare and finalize (txns.rs) check that every write is inside the range and
 //!   that the transaction took its locks in this term; a prepared record (prepared.rs) is
 //!   range-local data, so a new engine re-installs its locks at open.
+//! - Lock generation (design.md Changes 2026-11-16T10:40Z): every grant carries the
+//!   generation the engine was opened with; commit and prepare carrying another generation
+//!   are refused before anything changes (locks were lost to a leader change or reopen).
+//!   Finalize never checks it.
 use std::{
     collections::HashMap,
     sync::{
@@ -102,6 +106,8 @@ pub(crate) struct RangeEngine {
     state: Mutex<EngineState>,
     changed: Condvar,
     closed: AtomicBool,
+    /// Lock-table generation from the opener, stamped on every grant.
+    generation: u64,
     /// Track D's home records of transactions homed here (R5-50), over `home_log`.
     home: OnceLock<HomeRecords>,
 }
@@ -151,6 +157,7 @@ impl RangeEngine {
         sink: Arc<dyn BatchSink>,
         oracle: Arc<dyn TsOracle>,
         config: EngineConfig,
+        generation: u64,
     ) -> Result<Arc<Self>, RangeError> {
         let corrupt = |e: crate::CoreError| RangeError::Corrupt(format!("{e:?}"));
         let install =
@@ -205,6 +212,7 @@ impl RangeEngine {
             state: Mutex::new(EngineState::default()),
             changed: Condvar::new(),
             closed: AtomicBool::new(false),
+            generation,
             home: OnceLock::new(),
         });
         engine.reinstall_prepared(store)?;
@@ -251,6 +259,18 @@ impl RangeEngine {
             });
         }
         Ok(())
+    }
+
+    /// Design.md Changes 10:40Z (c): a transaction whose grants came from another lock table
+    /// lost them; None (no lock taken here) is not checked.
+    fn check_generation(&self, lock_generation: Option<u64>) -> Result<(), RangeError> {
+        match lock_generation {
+            Some(g) if g != self.generation => Err(RangeError::Aborted(format!(
+                "locks lost: granted under lock generation {g}, the range is at {}",
+                self.generation
+            ))),
+            _ => Ok(()),
+        }
     }
 
     fn state(&self) -> MutexGuard<'_, EngineState> {
@@ -372,8 +392,9 @@ impl RangeService for RangeEngine {
         txn: ClusterTxnId,
         writes: Vec<RangeWrite>,
         marker_xid: Option<u64>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
-        self.commit_writes(epoch, txn, writes, marker_xid)
+        self.commit_writes(epoch, txn, writes, marker_xid, lock_generation)
     }
     fn prepare(
         &self,
@@ -381,8 +402,9 @@ impl RangeService for RangeEngine {
         txn: ClusterTxnId,
         home: RangeId,
         writes: Vec<RangeWrite>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
-        self.prepare_writes(epoch, txn, home, writes)
+        self.prepare_writes(epoch, txn, home, writes, lock_generation)
     }
     fn finalize(&self, txn: ClusterTxnId, outcome: Outcome) -> Result<(), RangeError> {
         self.finalize_txn(txn, outcome)
@@ -445,6 +467,7 @@ impl RangeEngineOpener for RangeEngines {
         &self,
         descriptor: RangeDescriptor,
         sink: Arc<dyn BatchSink>,
+        generation: u64,
     ) -> Result<Arc<dyn RangeService>, RangeError> {
         let id = descriptor.id;
         self.close(id);
@@ -479,6 +502,7 @@ impl RangeEngineOpener for RangeEngines {
             sink,
             self.oracle.clone(),
             self.config.clone(),
+            generation,
         ) {
             Ok(engine) => engine,
             Err(error) => {

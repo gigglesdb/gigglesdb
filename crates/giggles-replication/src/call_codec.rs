@@ -396,6 +396,7 @@ fn put_range_call(w: &mut Writer, call: &RangeCall) -> Result<(), RangeError> {
             txn,
             writes,
             marker_xid,
+            lock_generation,
         } => {
             w.u8(8);
             w.u64(range.0);
@@ -403,6 +404,7 @@ fn put_range_call(w: &mut Writer, call: &RangeCall) -> Result<(), RangeError> {
             w.u64(txn.0);
             w.writes(writes)?;
             w.opt_u64(*marker_xid);
+            w.opt_u64(*lock_generation);
         }
         RangeCall::Prepare {
             range,
@@ -410,6 +412,7 @@ fn put_range_call(w: &mut Writer, call: &RangeCall) -> Result<(), RangeError> {
             txn,
             home,
             writes,
+            lock_generation,
         } => {
             w.u8(9);
             w.u64(range.0);
@@ -417,6 +420,7 @@ fn put_range_call(w: &mut Writer, call: &RangeCall) -> Result<(), RangeError> {
             w.u64(txn.0);
             w.u64(home.0);
             w.writes(writes)?;
+            w.opt_u64(*lock_generation);
         }
         RangeCall::Finalize {
             range,
@@ -507,6 +511,7 @@ fn range_call(tag: u8, r: &mut Reader<'_>) -> Result<RangeCall, RangeError> {
             txn: r.txn()?,
             writes: r.writes()?,
             marker_xid: r.opt_u64()?,
+            lock_generation: r.opt_u64()?,
         },
         9 => RangeCall::Prepare {
             range: r.range()?,
@@ -514,6 +519,7 @@ fn range_call(tag: u8, r: &mut Reader<'_>) -> Result<RangeCall, RangeError> {
             txn: r.txn()?,
             home: r.range()?,
             writes: r.writes()?,
+            lock_generation: r.opt_u64()?,
         },
         10 => RangeCall::Finalize {
             range: r.range()?,
@@ -687,6 +693,7 @@ fn put_range_reply(w: &mut Writer, reply: &RangeReply) -> Result<(), RangeError>
                     w.opt_bytes(value.as_deref())?;
                 }
             }
+            w.u64(grant.generation);
         }
         RangeReply::Blockers(txns) => {
             w.u8(4);
@@ -773,6 +780,7 @@ fn range_reply(tag: u8, r: &mut Reader<'_>) -> Result<RangeReply, RangeError> {
             } else {
                 None
             },
+            generation: r.u64()?,
         }),
         4 => RangeReply::Blockers(r.txns()?),
         5 => RangeReply::CancelWait,

@@ -332,10 +332,16 @@ pub struct LockRequest {
     pub mode: RangeLockMode,
     pub timeout_ms: Option<u64>,
 }
-/// Newest committed key version; table sentinel always returns None.
+/// A granted lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockGrant {
+    /// Newest committed key version; a table sentinel always returns None.
     pub latest: Option<(Timestamp, Option<Vec<u8>>)>,
+    /// Generation of the lock table that granted the lock: the value passed to
+    /// [`RangeEngineOpener::open`] for the engine serving the range. Strictly increasing per
+    /// range across leader changes and engine reopens, so a later grant with a different
+    /// generation (or a refused commit/prepare) means earlier locks there were lost.
+    pub generation: u64,
 }
 /// User key write; None means delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +378,9 @@ pub trait RangeClient: Send + Sync {
     fn cancel_wait(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError>;
     fn release(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError>;
     fn heartbeat(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError>;
+    /// `lock_generation`: the generation of the grants `txn` holds on `range` (None = it took
+    /// no lock there). A leader whose lock table has another generation refuses with
+    /// `RangeError::Aborted("locks lost ...")` and changes nothing.
     fn commit(
         &self,
         range: RangeId,
@@ -379,7 +388,9 @@ pub trait RangeClient: Send + Sync {
         txn: ClusterTxnId,
         writes: Vec<RangeWrite>,
         marker_xid: Option<u64>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError>;
+    /// `lock_generation` as for [`RangeClient::commit`].
     fn prepare(
         &self,
         range: RangeId,
@@ -387,7 +398,10 @@ pub trait RangeClient: Send + Sync {
         txn: ClusterTxnId,
         home: RangeId,
         writes: Vec<RangeWrite>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError>;
+    /// Never checks a lock generation: every new leader re-takes a prepared record's locks,
+    /// so its outcome applies whatever the generation.
     fn finalize(
         &self,
         range: RangeId,
@@ -409,20 +423,26 @@ pub trait RangeService: Send + Sync {
     fn cancel_wait(&self, txn: ClusterTxnId) -> Result<(), RangeError>;
     fn release(&self, txn: ClusterTxnId) -> Result<(), RangeError>;
     fn heartbeat(&self, txn: ClusterTxnId) -> Result<(), RangeError>;
+    /// `Some(g)` with g != this engine's lock generation: `Aborted("locks lost ...")`, nothing
+    /// changed; None (no lock taken here) is not checked.
     fn commit(
         &self,
         epoch: Epoch,
         txn: ClusterTxnId,
         writes: Vec<RangeWrite>,
         marker_xid: Option<u64>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError>;
+    /// `lock_generation` as for [`RangeService::commit`].
     fn prepare(
         &self,
         epoch: Epoch,
         txn: ClusterTxnId,
         home: RangeId,
         writes: Vec<RangeWrite>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError>;
+    /// Never checks a lock generation (prepared locks are re-taken by every new leader).
     fn finalize(&self, txn: ClusterTxnId, outcome: Outcome) -> Result<(), RangeError>;
     fn home(&self, epoch: Epoch, op: HomeOp) -> Result<HomeReply, RangeError>;
 }
@@ -461,10 +481,15 @@ pub trait TsOracle: Send + Sync {
 /// Called by the per-group role manager after the leader's read barrier.
 #[cfg(feature = "engine-rocksdb")]
 pub trait RangeEngineOpener: Send + Sync {
+    /// `generation` is the new engine's lock-table generation, stamped on every
+    /// [`LockGrant`] and compared on commit/prepare. The role manager passes
+    /// `(raft_term << 20) | k`, k = engines this node already opened for the range in that
+    /// term: strictly increasing per range across leaders and reopens.
     fn open(
         &self,
         descriptor: RangeDescriptor,
         sink: Arc<dyn crate::replicated::BatchSink>,
+        generation: u64,
     ) -> Result<Arc<dyn RangeService>, RangeError>;
     fn close(&self, range: RangeId);
 }

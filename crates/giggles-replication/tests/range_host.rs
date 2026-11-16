@@ -65,9 +65,12 @@ impl GroupNetwork for MemNet {
     }
 }
 
-/// Opens and closes per (node, range).
+/// Opens and closes per (node, range), and every open's (node, range, lock generation).
 #[derive(Default)]
-struct Log(Mutex<BTreeMap<(u64, RangeId), (usize, usize)>>);
+struct Log(
+    Mutex<BTreeMap<(u64, RangeId), (usize, usize)>>,
+    Mutex<Vec<(u64, RangeId, u64)>>,
+);
 impl Log {
     fn counts(&self, node: u64, range: RangeId) -> (usize, usize) {
         self.0
@@ -95,11 +98,17 @@ impl RangeEngineOpener for StubOpener {
         &self,
         descriptor: RangeDescriptor,
         sink: Arc<dyn BatchSink>,
+        generation: u64,
     ) -> Result<Arc<dyn RangeService>, RangeError> {
         let mut log = self.log.0.lock().unwrap();
         let entry = log.entry((self.node, descriptor.id)).or_default();
         assert_eq!(entry.0, entry.1, "open twice without close");
         entry.0 += 1;
+        self.log
+            .1
+            .lock()
+            .unwrap()
+            .push((self.node, descriptor.id, generation));
         Ok(Arc::new(StubService { descriptor, sink }))
     }
     fn close(&self, range: RangeId) {
@@ -146,6 +155,7 @@ impl RangeService for StubService {
         _: ClusterTxnId,
         writes: Vec<RangeWrite>,
         _: Option<u64>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         let puts: Vec<(Vec<u8>, Vec<u8>)> = writes
             .into_iter()
@@ -168,6 +178,7 @@ impl RangeService for StubService {
         _: ClusterTxnId,
         _: RangeId,
         _: Vec<RangeWrite>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         stub()
     }
@@ -372,7 +383,7 @@ impl Cluster {
             key,
             value: Some(b"v".to_vec()),
         };
-        service.commit(epoch, ClusterTxnId(1), vec![write], None)
+        service.commit(epoch, ClusterTxnId(1), vec![write], None, None)
     }
 }
 
@@ -411,10 +422,26 @@ fn store_backed_hosts_open_engines_on_leaders_fence_on_isolation_and_reopen() {
         );
         assert!(c.applied(node, range) > written);
         c.wait_replicated(range, written + 1);
-        let fenced = service.commit(Epoch(1), ClusterTxnId(2), Vec::new(), None);
+        let fenced = service.commit(Epoch(1), ClusterTxnId(2), Vec::new(), None, None);
         assert_eq!(fenced, Err(RangeError::NotLeader { hint: None }));
     }
     let mut leaders = c.leaders(&NODES);
+
+    // Each open of a range on a node got a larger lock generation than the one before;
+    // the engines fenced above were reopened in the same term, with the next k.
+    let gens = c.log.1.lock().unwrap().clone();
+    let mut same_term = 0;
+    for (i, &(node, range, generation)) in gens.iter().enumerate() {
+        let previous = gens[..i]
+            .iter()
+            .rev()
+            .find(|(n, r, _)| (*n, *r) == (node, range));
+        if let Some(&(_, _, previous)) = previous {
+            assert!(generation > previous, "generation went back: {gens:?}");
+            same_term += usize::from(generation >> 20 == previous >> 20);
+        }
+    }
+    assert!(same_term > 0, "no same-term reopen: {gens:?}");
 
     // Spread leaders over at least two nodes by moving them off a node that leads all.
     for _ in 0..5 {

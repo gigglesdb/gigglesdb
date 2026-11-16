@@ -93,7 +93,10 @@ impl RangeService for Reads {
         })
     }
     fn lock(&self, _: LockRequest) -> Result<LockGrant, RangeError> {
-        Ok(LockGrant { latest: None })
+        Ok(LockGrant {
+            latest: None,
+            generation: 0,
+        })
     }
     fn blockers(&self, _: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError> {
         unavailable()
@@ -113,6 +116,7 @@ impl RangeService for Reads {
         _: ClusterTxnId,
         _: Vec<RangeWrite>,
         _: Option<u64>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         unavailable()
     }
@@ -122,6 +126,7 @@ impl RangeService for Reads {
         _: ClusterTxnId,
         _: RangeId,
         _: Vec<RangeWrite>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         unavailable()
     }
@@ -139,6 +144,7 @@ impl RangeEngineOpener for Opener {
         &self,
         descriptor: RangeDescriptor,
         _sink: Arc<dyn BatchSink>,
+        _generation: u64,
     ) -> Result<Arc<dyn RangeService>, RangeError> {
         Ok(Arc::new(Reads(descriptor)))
     }

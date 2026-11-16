@@ -93,6 +93,7 @@ impl RangeService for Stub {
         _: ClusterTxnId,
         _: Vec<RangeWrite>,
         _: Option<u64>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         unavailable()
     }
@@ -102,6 +103,7 @@ impl RangeService for Stub {
         _: ClusterTxnId,
         _: RangeId,
         _: Vec<RangeWrite>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         unavailable()
     }
@@ -121,6 +123,7 @@ impl RangeEngineOpener for Opener {
         &self,
         descriptor: RangeDescriptor,
         _sink: Arc<dyn BatchSink>,
+        _generation: u64,
     ) -> Result<Arc<dyn RangeService>, RangeError> {
         let directory = if descriptor.id == SYSTEM_RANGE {
             self.directory.clone()

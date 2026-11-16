@@ -45,6 +45,8 @@ pub enum RangeCall {
         txn: ClusterTxnId,
         writes: Vec<RangeWrite>,
         marker_xid: Option<u64>,
+        /// Generation of the transaction's grants on the range (None = no lock there).
+        lock_generation: Option<u64>,
     },
     Prepare {
         range: RangeId,
@@ -52,6 +54,7 @@ pub enum RangeCall {
         txn: ClusterTxnId,
         home: RangeId,
         writes: Vec<RangeWrite>,
+        lock_generation: Option<u64>,
     },
     Finalize {
         range: RangeId,
@@ -167,14 +170,28 @@ pub fn dispatch(local: &dyn LocalRanges, call: RangeCall) -> Result<RangeReply, 
             txn,
             writes,
             marker_xid,
-        } => RangeReply::Commit(service(range)?.commit(epoch, txn, writes, marker_xid)?),
+            lock_generation,
+        } => RangeReply::Commit(service(range)?.commit(
+            epoch,
+            txn,
+            writes,
+            marker_xid,
+            lock_generation,
+        )?),
         RangeCall::Prepare {
             range,
             epoch,
             txn,
             home,
             writes,
-        } => RangeReply::Prepare(service(range)?.prepare(epoch, txn, home, writes)?),
+            lock_generation,
+        } => RangeReply::Prepare(service(range)?.prepare(
+            epoch,
+            txn,
+            home,
+            writes,
+            lock_generation,
+        )?),
         RangeCall::Finalize {
             range,
             txn,
@@ -418,6 +435,7 @@ impl RangeClient for RoutedRangeClient {
         txn: ClusterTxnId,
         writes: Vec<RangeWrite>,
         marker_xid: Option<u64>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         let call = RangeCall::Commit {
             range,
@@ -425,6 +443,7 @@ impl RangeClient for RoutedRangeClient {
             txn,
             writes,
             marker_xid,
+            lock_generation,
         };
         routed!(self.router, call, RangeReply::Commit(ts) => ts)
     }
@@ -435,6 +454,7 @@ impl RangeClient for RoutedRangeClient {
         txn: ClusterTxnId,
         home: RangeId,
         writes: Vec<RangeWrite>,
+        lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         let call = RangeCall::Prepare {
             range,
@@ -442,6 +462,7 @@ impl RangeClient for RoutedRangeClient {
             txn,
             home,
             writes,
+            lock_generation,
         };
         routed!(self.router, call, RangeReply::Prepare(ts) => ts)
     }

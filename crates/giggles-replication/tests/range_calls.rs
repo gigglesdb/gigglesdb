@@ -62,7 +62,10 @@ impl RangeService for FakeRange {
         })
     }
     fn lock(&self, _: LockRequest) -> Result<LockGrant, RangeError> {
-        self.serve().map(|()| LockGrant { latest: None })
+        self.serve().map(|()| LockGrant {
+            latest: None,
+            generation: 0,
+        })
     }
     fn blockers(&self, _: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError> {
         self.serve().map(|()| vec![])
@@ -82,6 +85,7 @@ impl RangeService for FakeRange {
         _: ClusterTxnId,
         writes: Vec<RangeWrite>,
         _: Option<u64>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.serve()
             .map(|()| Timestamp(epoch.0 * 100 + writes.len() as u64))
@@ -92,6 +96,7 @@ impl RangeService for FakeRange {
         _: ClusterTxnId,
         _: RangeId,
         _: Vec<RangeWrite>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.serve().map(|()| Timestamp(8))
     }
@@ -228,6 +233,7 @@ fn commit(range: RangeId) -> RangeCall {
             value: Some(b"v".to_vec()),
         }],
         marker_xid: None,
+        lock_generation: Some(3 << 20),
     }
 }
 

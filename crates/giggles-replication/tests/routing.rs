@@ -99,8 +99,10 @@ impl RangeService for FakeRange {
         })
     }
     fn lock(&self, req: LockRequest) -> Result<LockGrant, RangeError> {
-        self.check(Some(req.epoch))
-            .map(|()| LockGrant { latest: None })
+        self.check(Some(req.epoch)).map(|()| LockGrant {
+            latest: None,
+            generation: 0,
+        })
     }
     fn blockers(&self, _: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError> {
         self.check(None).map(|()| vec![])
@@ -120,6 +122,7 @@ impl RangeService for FakeRange {
         _: ClusterTxnId,
         _: Vec<RangeWrite>,
         _: Option<u64>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.check(Some(epoch)).map(|()| Timestamp(7))
     }
@@ -129,6 +132,7 @@ impl RangeService for FakeRange {
         _: ClusterTxnId,
         _: RangeId,
         _: Vec<RangeWrite>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.check(Some(epoch)).map(|()| Timestamp(7))
     }
@@ -448,8 +452,20 @@ fn not_leader_hint_followed_and_voters_preferred() {
         mode: RangeLockMode::Shared,
         timeout_ms: None,
     };
-    assert_eq!(client.lock(lock.clone()), Ok(LockGrant { latest: None }));
-    assert_eq!(client.lock(lock), Ok(LockGrant { latest: None }));
+    assert_eq!(
+        client.lock(lock.clone()),
+        Ok(LockGrant {
+            latest: None,
+            generation: 0,
+        })
+    );
+    assert_eq!(
+        client.lock(lock),
+        Ok(LockGrant {
+            latest: None,
+            generation: 0,
+        })
+    );
     assert_eq!(net.calls("Lock"), vec![3, 4, 4]);
 }
 
@@ -461,7 +477,7 @@ fn local_leaders_are_called_in_process() {
     let client = net.client(1);
     assert_eq!(client.descriptor_for(&key(5)), Ok(r10.clone()));
     assert_eq!(
-        client.commit(r10.id, r10.epoch, txn(), vec![], None),
+        client.commit(r10.id, r10.epoch, txn(), vec![], None, None),
         Ok(Timestamp(7))
     );
     assert_eq!(client.finalize(r10.id, txn(), Outcome::Abort), Ok(()));

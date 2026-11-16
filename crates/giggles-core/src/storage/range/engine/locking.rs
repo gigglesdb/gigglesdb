@@ -112,7 +112,10 @@ impl RangeEngine {
                     .map(|(at, value)| (Timestamp(at.0), value))
             }
         };
-        Ok(LockGrant { latest })
+        Ok(LockGrant {
+            latest,
+            generation: self.generation,
+        })
     }
 
     /// The state, once no commit or prepare of `txn` is running.

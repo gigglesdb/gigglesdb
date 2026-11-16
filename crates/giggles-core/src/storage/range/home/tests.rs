@@ -582,6 +582,7 @@ impl RangeClient for Recorder {
         _: ClusterTxnId,
         _: Vec<crate::range_api::RangeWrite>,
         _: Option<u64>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         unreachable!()
     }
@@ -592,6 +593,7 @@ impl RangeClient for Recorder {
         _: ClusterTxnId,
         _: RangeId,
         _: Vec<crate::range_api::RangeWrite>,
+        _: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         unreachable!()
     }

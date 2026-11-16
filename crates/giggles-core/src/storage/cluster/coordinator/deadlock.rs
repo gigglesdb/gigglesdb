@@ -488,9 +488,10 @@ mod tests {
                 LockTarget::TableSentinel { table } => table.to_be_bytes().to_vec(),
             };
             let table = self.table(req.range)?;
-            table
-                .lock(req.txn, key, req.mode)
-                .map(|()| LockGrant { latest: None })
+            table.lock(req.txn, key, req.mode).map(|()| LockGrant {
+                latest: None,
+                generation: 0,
+            })
         }
         fn blockers(
             &self,
@@ -518,6 +519,7 @@ mod tests {
             _: ClusterTxnId,
             _: Vec<RangeWrite>,
             _: Option<u64>,
+            _: Option<u64>,
         ) -> Result<Timestamp, RangeError> {
             unimplemented!()
         }
@@ -528,6 +530,7 @@ mod tests {
             _: ClusterTxnId,
             _: RangeId,
             _: Vec<RangeWrite>,
+            _: Option<u64>,
         ) -> Result<Timestamp, RangeError> {
             unimplemented!()
         }

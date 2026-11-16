@@ -81,6 +81,10 @@ fn config() -> EngineConfig {
 }
 impl Fixture {
     fn open(&self) -> Arc<RangeEngine> {
+        self.open_at(1)
+    }
+    /// Opens an engine of B with lock generation `generation`.
+    fn open_at(&self, generation: u64) -> Arc<RangeEngine> {
         let descriptor = self.store.descriptor(B).unwrap().unwrap();
         RangeEngine::open(
             &self.store,
@@ -88,6 +92,7 @@ impl Fixture {
             self.sink.clone(),
             self.oracle.clone(),
             config(),
+            generation,
         )
         .unwrap()
     }
@@ -130,8 +135,15 @@ fn write(n: u64, value: &[u8]) -> RangeWrite {
     }
 }
 fn commit(e: &RangeEngine, t: ClusterTxnId, n: u64, value: &[u8]) -> Timestamp {
-    lock(e, t, n, Some(1000)).unwrap();
-    e.commit(epoch(e), t, vec![write(n, value)], None).unwrap()
+    let grant = lock(e, t, n, Some(1000)).unwrap();
+    e.commit(
+        epoch(e),
+        t,
+        vec![write(n, value)],
+        None,
+        Some(grant.generation),
+    )
+    .unwrap()
 }
 fn read_all(
     e: &RangeEngine,
@@ -199,7 +211,7 @@ fn commits_land_in_their_range_and_reads_page_at_a_timestamp() {
     // A write outside the range, or without its lock, writes nothing.
     lock(&e, txn(200), 30, None).unwrap();
     assert!(matches!(
-        e.commit(epoch(&e), txn(200), vec![write(31, b"x")], None),
+        e.commit(epoch(&e), txn(200), vec![write(31, b"x")], None, None),
         Err(RangeError::Aborted(_))
     ));
     let outside = RangeWrite {
@@ -209,11 +221,11 @@ fn commits_land_in_their_range_and_reads_page_at_a_timestamp() {
     };
     lock(&e, txn(201), 32, None).unwrap();
     assert!(matches!(
-        e.commit(epoch(&e), txn(201), vec![outside], None),
+        e.commit(epoch(&e), txn(201), vec![outside], None, None),
         Err(RangeError::StaleEpoch { .. })
     ));
     assert!(matches!(
-        e.commit(Epoch(99), txn(201), vec![], None),
+        e.commit(Epoch(99), txn(201), vec![], None, None),
         Err(RangeError::StaleEpoch { .. })
     ));
 }
@@ -225,7 +237,7 @@ fn a_new_term_aborts_old_locks_and_keeps_prepared_ones() {
     lock(&e, txn(1), 1, None).unwrap();
     lock(&e, txn(2), 2, None).unwrap();
     let p = e
-        .prepare(epoch(&e), txn(2), B, vec![write(2, b"prepared")])
+        .prepare(epoch(&e), txn(2), B, vec![write(2, b"prepared")], None)
         .unwrap();
     assert!(matches!(
         lock(&e, txn(2), 3, None),
@@ -239,12 +251,12 @@ fn a_new_term_aborts_old_locks_and_keeps_prepared_ones() {
     let e = f.open();
     // Unprepared locks died with the old engine; the prepared record's lock is back.
     assert!(matches!(
-        e.commit(epoch(&e), txn(1), vec![write(1, b"late")], None),
+        e.commit(epoch(&e), txn(1), vec![write(1, b"late")], None, None),
         Err(RangeError::Aborted(_))
     ));
     lock(&e, txn(3), 1, Some(100)).unwrap();
     assert_eq!(lock(&e, txn(4), 2, Some(100)), Err(RangeError::LockTimeout));
-    assert_eq!(e.prepare(epoch(&e), txn(2), B, vec![]).unwrap(), p);
+    assert_eq!(e.prepare(epoch(&e), txn(2), B, vec![], None).unwrap(), p);
     // A reader at T >= p waits for the outcome; a reader below p does not.
     assert!(read_all(&e, Timestamp(p.0 - 1), ReadDirection::Forward, 1 << 20).is_empty());
     let reader = {
@@ -265,6 +277,74 @@ fn a_new_term_aborts_old_locks_and_keeps_prepared_ones() {
 }
 
 #[test]
+fn commit_and_prepare_refuse_locks_of_another_generation() {
+    let f = fixture();
+    let e1 = f.open_at(1);
+    assert_eq!(lock(&e1, txn(1), 1, None).unwrap().generation, 1);
+    assert_eq!(lock(&e1, txn(2), 2, None).unwrap().generation, 1);
+    assert_eq!(lock(&e1, txn(3), 3, None).unwrap().generation, 1);
+    let p = e1
+        .prepare(epoch(&e1), txn(3), B, vec![write(3, b"prepared")], Some(1))
+        .unwrap();
+    e1.close();
+    // Leader change: the new engine's lock table has generation 2.
+    let e2 = f.open_at(2);
+    let applied = f.store.applied(B).unwrap();
+    let lost = |r: Result<Timestamp, RangeError>| match r {
+        Err(RangeError::Aborted(m)) => m.starts_with("locks lost"),
+        _ => false,
+    };
+    assert!(lost(e2.commit(
+        epoch(&e2),
+        txn(1),
+        vec![write(1, b"lost")],
+        None,
+        Some(1)
+    )));
+    assert!(lost(e2.prepare(
+        epoch(&e2),
+        txn(2),
+        B,
+        vec![write(2, b"lost")],
+        Some(1)
+    )));
+    // Refused before anything changed: nothing replicated, no lease taken.
+    assert_eq!(f.store.applied(B).unwrap(), applied);
+    assert!(matches!(e2.heartbeat(txn(1)), Err(RangeError::Aborted(_))));
+    assert!(matches!(e2.heartbeat(txn(2)), Err(RangeError::Aborted(_))));
+    // Re-locked under generation 2, the commit goes through.
+    let grant = lock(&e2, txn(1), 1, Some(1000)).unwrap();
+    assert_eq!(grant.generation, 2);
+    e2.commit(
+        epoch(&e2),
+        txn(1),
+        vec![write(1, b"relocked")],
+        None,
+        Some(2),
+    )
+    .unwrap();
+    // A retried prepare of the transaction already prepared under generation 1 returns its
+    // p (Track D rule (a)): it was accepted under a valid generation.
+    assert_eq!(
+        e2.prepare(epoch(&e2), txn(3), B, vec![write(3, b"prepared")], Some(1)),
+        Ok(p)
+    );
+    // The record prepared under generation 1 has its lock back, and finalize applies it.
+    assert_eq!(lock(&e2, txn(4), 3, Some(50)), Err(RangeError::LockTimeout));
+    let c = f.oracle.next(1).unwrap();
+    assert!(c > p);
+    e2.finalize(txn(3), Outcome::Commit(c)).unwrap();
+    let at = f.oracle.next(1).unwrap();
+    assert_eq!(
+        read_all(&e2, at, ReadDirection::Forward, 1 << 20),
+        vec![
+            (1, Some(b"relocked".to_vec())),
+            (3, Some(b"prepared".to_vec()))
+        ]
+    );
+}
+
+#[test]
 fn abort_releases_every_lock_with_or_without_a_prepared_record() {
     let f = fixture();
     let e = f.open();
@@ -273,7 +353,7 @@ fn abort_releases_every_lock_with_or_without_a_prepared_record() {
     lock(&e, txn(2), 1, Some(100)).unwrap();
     lock(&e, txn(3), 5, None).unwrap();
     let p = e
-        .prepare(epoch(&e), txn(3), B, vec![write(5, b"x")])
+        .prepare(epoch(&e), txn(3), B, vec![write(5, b"x")], None)
         .unwrap();
     // release() of a prepared transaction keeps its locks.
     e.release(txn(3)).unwrap();
@@ -345,7 +425,13 @@ fn table_sentinels_live_on_ranges_with_the_tables_rows() {
         mode: RangeLockMode::Shared,
         timeout_ms: None,
     };
-    assert_eq!(e.lock(sentinel(T)).unwrap(), LockGrant { latest: None });
+    assert_eq!(
+        e.lock(sentinel(T)).unwrap(),
+        LockGrant {
+            latest: None,
+            generation: 1
+        }
+    );
     assert!(matches!(
         e.lock(sentinel(T - 1)),
         Err(RangeError::StaleEpoch { .. })
@@ -363,7 +449,7 @@ fn a_lost_sink_reports_an_unknown_outcome() {
     lock(&e, txn(1), 1, None).unwrap();
     f.sink.fail.store(true, Ordering::SeqCst);
     assert!(matches!(
-        e.commit(epoch(&e), txn(1), vec![write(1, b"x")], None),
+        e.commit(epoch(&e), txn(1), vec![write(1, b"x")], None, None),
         Err(RangeError::Unknown(_))
     ));
     // The fenced engine serves nothing more.
@@ -378,7 +464,7 @@ fn the_opener_replaces_and_fences_engines() {
     let f = fixture();
     let engines = RangeEngines::new(f.store.clone(), f.oracle.clone(), config());
     let descriptor = f.store.descriptor(B).unwrap().unwrap();
-    let first = engines.open(descriptor.clone(), f.sink.clone()).unwrap();
+    let first = engines.open(descriptor.clone(), f.sink.clone(), 1).unwrap();
     let txn1 = txn(1);
     let lock_req = |svc: &Arc<dyn RangeService>, t| LockRequest {
         range: B,
@@ -392,14 +478,17 @@ fn the_opener_replaces_and_fences_engines() {
         mode: RangeLockMode::Exclusive,
         timeout_ms: Some(100),
     };
-    first.lock(lock_req(&first, txn1)).unwrap();
+    assert_eq!(first.lock(lock_req(&first, txn1)).unwrap().generation, 1);
     // Reopening (a new term) fences the old engine; its unprepared locks are gone.
-    let second = engines.open(descriptor, f.sink.clone()).unwrap();
+    let second = engines.open(descriptor, f.sink.clone(), 2).unwrap();
     assert!(matches!(
         first.lock(lock_req(&first, txn(2))),
         Err(RangeError::NotLeader { .. })
     ));
-    second.lock(lock_req(&second, txn(2))).unwrap();
+    assert_eq!(
+        second.lock(lock_req(&second, txn(2))).unwrap().generation,
+        2
+    );
     engines.close(B);
     assert!(matches!(
         second.heartbeat(txn(2)),
@@ -409,7 +498,7 @@ fn the_opener_replaces_and_fences_engines() {
     let mut stale = f.store.descriptor(B).unwrap().unwrap();
     stale.epoch = Epoch(stale.epoch.0 + 1);
     assert!(matches!(
-        engines.open(stale, f.sink.clone()),
+        engines.open(stale, f.sink.clone(), 3),
         Err(RangeError::StaleEpoch { .. })
     ));
 }
@@ -430,7 +519,7 @@ fn the_system_range_opens_its_oracle_and_leases_with_its_engine() {
     ));
     assert!(engines.system().is_none());
     let descriptor = f.store.descriptor(a).unwrap().unwrap();
-    engines.open(descriptor.clone(), sink.clone()).unwrap();
+    engines.open(descriptor.clone(), sink.clone(), 1).unwrap();
     let system = engines.system().unwrap();
     let first = system.next(1).unwrap();
     assert!(system.next(1).unwrap() > first);
@@ -444,7 +533,7 @@ fn the_system_range_opens_its_oracle_and_leases_with_its_engine() {
     assert!(engines.system().is_none());
     assert!(matches!(system.next(1), Err(RangeError::NotLeader { .. })));
     // A new term starts above every timestamp of the old one.
-    engines.open(descriptor, sink).unwrap();
+    engines.open(descriptor, sink, 2).unwrap();
     assert!(engines.system().unwrap().next(1).unwrap() > first);
 }
 
@@ -456,7 +545,7 @@ fn duplicate_prepares_get_one_timestamp_and_expired_leases_stay_aborted() {
     let racers: Vec<_> = (0..4)
         .map(|_| {
             let e = e.clone();
-            thread::spawn(move || e.prepare(epoch(&e), txn(1), B, vec![write(1, b"p")]))
+            thread::spawn(move || e.prepare(epoch(&e), txn(1), B, vec![write(1, b"p")], None))
         })
         .collect();
     let stamps: Vec<_> = racers
@@ -478,7 +567,7 @@ fn duplicate_prepares_get_one_timestamp_and_expired_leases_stay_aborted() {
         Err(RangeError::Aborted(_))
     ));
     assert!(matches!(
-        e.prepare(epoch(&e), txn(2), B, vec![write(2, b"x")]),
+        e.prepare(epoch(&e), txn(2), B, vec![write(2, b"x")], None),
         Err(RangeError::Aborted(_))
     ));
     // The gateway's release forgets it.
