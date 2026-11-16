@@ -698,3 +698,199 @@ fn fake_cluster_timestamps_epochs_and_locks() {
         Err(RangeError::Unavailable(_))
     ));
 }
+
+type Descriptor = crate::storage::range_api::RangeDescriptor;
+
+fn overlap(a: &Descriptor, b: &Descriptor) -> bool {
+    a.end.as_ref().is_none_or(|end| b.start < *end)
+        && b.end.as_ref().is_none_or(|end| a.start < *end)
+}
+
+/// A gateway whose directory still holds a split parent's record from before the split: the
+/// child is not published yet (the split crashed before its publish, or the publish lags), and
+/// the child has no leader until `leader_at`. As a range engine does, a StaleEpoch reply names
+/// the range holding the request key, which the router caches; `learn` caches too.
+struct Unpublished {
+    inner: Arc<FakeClient>,
+    cluster: Arc<FakeCluster>,
+    /// The parent's record before the split, still in the directory.
+    directory: Descriptor,
+    child: RangeId,
+    leader_at: Instant,
+    cache: std::sync::Mutex<Vec<Descriptor>>,
+}
+impl Unpublished {
+    fn cache(&self, desc: &Descriptor) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.retain(|cached| !overlap(cached, desc));
+        cache.push(desc.clone());
+    }
+}
+impl RangeClient for Unpublished {
+    fn descriptor_for(&self, range_key: &[u8]) -> Result<Descriptor, RangeError> {
+        let cached = self.cache.lock().unwrap();
+        if let Some(desc) = cached.iter().find(|desc| desc.contains(range_key)) {
+            return Ok(desc.clone());
+        }
+        drop(cached);
+        let found = if self.directory.contains(range_key) {
+            self.directory.clone()
+        } else {
+            self.inner.descriptor_for(range_key)?
+        };
+        self.cache(&found);
+        Ok(found)
+    }
+    fn invalidate(&self, stale: &Descriptor) {
+        self.cache
+            .lock()
+            .unwrap()
+            .retain(|cached| (cached.id, cached.epoch) != (stale.id, stale.epoch));
+    }
+    fn learn(&self, desc: &Descriptor) {
+        let newer = self
+            .cache
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|cached| cached.id == desc.id && cached.epoch >= desc.epoch);
+        if !newer {
+            self.cache(desc);
+        }
+    }
+    fn read(&self, req: ReadRequest) -> Result<crate::storage::range_api::ReadPage, RangeError> {
+        if req.range == self.child && Instant::now() < self.leader_at {
+            return Err(RangeError::Unavailable("no leader".into()));
+        }
+        let at = match (&req.dir, &req.start, &req.end) {
+            (ReadDirection::Forward, Bound::Included(key) | Bound::Excluded(key), _)
+            | (ReadDirection::Reverse, _, Bound::Included(key) | Bound::Excluded(key)) => {
+                range_key(req.space, key)
+            }
+            (ReadDirection::Forward, ..) => range_key(req.space, &[]),
+            (ReadDirection::Reverse, ..) => vec![req.space.tag() + 1],
+        };
+        match self.inner.read(req) {
+            Err(RangeError::StaleEpoch { .. }) => {
+                let holder = self
+                    .cluster
+                    .descriptors()
+                    .into_iter()
+                    .rev()
+                    .find(|desc| desc.start < at || desc.contains(&at))
+                    .expect("ranges cover every key");
+                self.cache(&holder);
+                Err(RangeError::StaleEpoch { descriptor: holder })
+            }
+            other => other,
+        }
+    }
+    fn lock(&self, req: LockRequest) -> Result<crate::storage::range_api::LockGrant, RangeError> {
+        self.inner.lock(req)
+    }
+    fn blockers(&self, range: RangeId, txn: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError> {
+        self.inner.blockers(range, txn)
+    }
+    fn cancel_wait(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError> {
+        self.inner.cancel_wait(range, txn)
+    }
+    fn release(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError> {
+        self.inner.release(range, txn)
+    }
+    fn heartbeat(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError> {
+        self.inner.heartbeat(range, txn)
+    }
+    fn commit(
+        &self,
+        range: RangeId,
+        epoch: Epoch,
+        txn: ClusterTxnId,
+        writes: Vec<RangeWrite>,
+        marker_xid: Option<u64>,
+        lock_generation: Option<u64>,
+    ) -> Result<Timestamp, RangeError> {
+        self.inner
+            .commit(range, epoch, txn, writes, marker_xid, lock_generation)
+    }
+    fn prepare(
+        &self,
+        range: RangeId,
+        epoch: Epoch,
+        txn: ClusterTxnId,
+        home: RangeId,
+        writes: Vec<RangeWrite>,
+        lock_generation: Option<u64>,
+    ) -> Result<Timestamp, RangeError> {
+        self.inner
+            .prepare(range, epoch, txn, home, writes, lock_generation)
+    }
+    fn finalize(
+        &self,
+        range: RangeId,
+        txn: ClusterTxnId,
+        outcome: crate::storage::range_api::Outcome,
+    ) -> Result<(), RangeError> {
+        self.inner.finalize(range, txn, outcome)
+    }
+    fn home(
+        &self,
+        range: RangeId,
+        epoch: Epoch,
+        op: crate::storage::range_api::HomeOp,
+    ) -> Result<crate::storage::range_api::HomeReply, RangeError> {
+        self.inner.home(range, epoch, op)
+    }
+    fn oracle(&self) -> &dyn crate::storage::range_api::TsOracle {
+        self.inner.oracle()
+    }
+    fn lease(
+        &self,
+        kind: LeaseKind,
+        id: u64,
+        count: u64,
+    ) -> Result<std::ops::Range<u64>, RangeError> {
+        self.inner.lease(kind, id, count)
+    }
+}
+
+/// Review S2: a read reaching a split child that is not yet in the directory and has no leader
+/// for 400 ms (its first election) waits it out. The directory's older parent record is not a
+/// route change: the read keeps the child's descriptor instead of bouncing between parent and
+/// child until its stale-epoch budget runs out (about 100 ms). A point read and a forward scan.
+#[test]
+fn a_read_waits_out_an_unpublished_split_child_without_a_leader() {
+    for point in [true, false] {
+        let cluster = FakeCluster::new(&[]);
+        let ts = sixty_rows(&cluster);
+        let directory = cluster.client().descriptor_for(&first_user_key()).unwrap();
+        let child = cluster.split(&range_key(RangeSpace::Rows, &key(1, 30)));
+        let started = Instant::now();
+        let client = Arc::new(Unpublished {
+            inner: cluster.client(),
+            cluster: cluster.clone(),
+            directory,
+            child,
+            leader_at: started + Duration::from_millis(400),
+            cache: std::sync::Mutex::new(Vec::new()),
+        });
+        let reader = RoutedKvRead::new(client, Ts(ts.0), 1 << 20);
+        if point {
+            let rows = keyspace(RangeSpace::Rows);
+            assert_eq!(
+                mvcc::read_at(&reader, rows, &key(1, 45), Ts(ts.0)).unwrap(),
+                Some(vec![45; 10])
+            );
+        } else {
+            let all = (Bound::Unbounded, Bound::Unbounded);
+            let dir = Direction::Forward;
+            let got = versions(&reader, RangeSpace::Rows, &all.0, &all.1, dir, ts).unwrap();
+            let want = versions(&*cluster.kv(), RangeSpace::Rows, &all.0, &all.1, dir, ts);
+            assert_eq!(got.len(), 60);
+            assert_eq!(got, want.unwrap());
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "point {point}"
+        );
+    }
+}

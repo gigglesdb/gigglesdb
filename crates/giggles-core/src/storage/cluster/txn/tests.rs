@@ -112,6 +112,28 @@ fn read_your_writes_and_latest_value_through_the_lock() {
     );
 }
 
+/// GD-0075 P9-9: a write reaching a range with no leader for 400 ms (a new split child before
+/// its first election) waits it out instead of failing after about 113 ms.
+#[test]
+fn a_write_waits_out_a_range_without_a_leader() {
+    let cluster = cluster();
+    let gw = services(&cluster, ClusterConfig::default());
+    let range = cluster.range_of(RangeSpace::Rows, &row(10, b"a"));
+    cluster.stop(range);
+    let elected = {
+        let cluster = cluster.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            cluster.restart(range);
+        })
+    };
+    let mut txn = begin(&gw, Isolation::ReadCommitted);
+    put_row(&mut txn, 10, b"a", b"x");
+    elected.join().unwrap();
+    txn.commit().unwrap();
+    assert_eq!(read(&gw, 10, b"a"), Some(b"x".to_vec()));
+}
+
 #[test]
 fn a_commit_across_ranges_is_atomic_and_frees_every_lock() {
     let cluster = cluster();
@@ -401,8 +423,23 @@ fn an_oracle_failure_fails_reads_instead_of_reading_old_data() {
 struct Dying {
     cluster: Arc<LocalCluster>,
     budget: std::sync::atomic::AtomicUsize,
+    /// Commit and prepare calls that reached the cluster.
+    commits: std::sync::atomic::AtomicUsize,
+    prepares: std::sync::atomic::AtomicUsize,
+    /// The next this-many commits that reach the cluster apply, then answer Unavailable (the
+    /// reply was lost: the outcome is unknown to the caller but applied).
+    lost_replies: std::sync::atomic::AtomicUsize,
 }
 impl Dying {
+    fn new(cluster: &Arc<LocalCluster>) -> Arc<Self> {
+        Arc::new(Self {
+            cluster: cluster.clone(),
+            budget: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            commits: std::sync::atomic::AtomicUsize::new(0),
+            prepares: std::sync::atomic::AtomicUsize::new(0),
+            lost_replies: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
     fn call(&self) -> Result<(), RangeError> {
         self.budget
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |b| b.checked_sub(1))
@@ -449,8 +486,19 @@ impl RangeClient for Dying {
         lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.call()?;
-        self.cluster
-            .commit(range, epoch, txn, writes, marker_xid, lock_generation)
+        self.commits.fetch_add(1, Ordering::SeqCst);
+        let result = self
+            .cluster
+            .commit(range, epoch, txn, writes, marker_xid, lock_generation);
+        if result.is_ok()
+            && self
+                .lost_replies
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Err(RangeError::Unavailable("reply lost".into()));
+        }
+        result
     }
     fn prepare(
         &self,
@@ -462,6 +510,7 @@ impl RangeClient for Dying {
         lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.call()?;
+        self.prepares.fetch_add(1, Ordering::SeqCst);
         self.cluster
             .prepare(range, epoch, txn, home, writes, lock_generation)
     }
@@ -527,10 +576,7 @@ fn a_coordinator_killed_at_every_step_leaves_one_outcome_readers_resolve() {
     let reader = services(&cluster, ClusterConfig::default());
     let mut outcomes = BTreeSet::new();
     for budget in 0..40 {
-        let dying = Arc::new(Dying {
-            cluster: cluster.clone(),
-            budget: std::sync::atomic::AtomicUsize::new(usize::MAX),
-        });
+        let dying = Dying::new(&cluster);
         let gw = ClusterTxnServices::new(
             dying.clone(),
             ClusterConfig {
@@ -601,10 +647,7 @@ fn a_coordinator_killed_at_every_step_leaves_one_outcome_readers_resolve() {
 #[test]
 fn a_single_range_commit_that_runs_out_of_attempts_is_ambiguous() {
     let cluster = cluster();
-    let dying = Arc::new(Dying {
-        cluster: cluster.clone(),
-        budget: std::sync::atomic::AtomicUsize::new(usize::MAX),
-    });
+    let dying = Dying::new(&cluster);
     let gw = ClusterTxnServices::new(
         dying.clone(),
         ClusterConfig {
@@ -619,4 +662,98 @@ fn a_single_range_commit_that_runs_out_of_attempts_is_ambiguous() {
     // Every commit attempt fails without an answer.
     dying.budget.store(0, Ordering::SeqCst);
     assert_eq!(txn.commit().unwrap_err(), TxnError::CommitAmbiguous);
+}
+
+/// Review S3 (design.md Changes (g)): a commit holding no lock on its range (catalog-only, on
+/// the system range) is not resent once an attempt may have applied: nothing there refuses the
+/// resend, which would apply its writes again at a later timestamp. A locked commit keeps its
+/// rules: it is resent, the range refuses it (the first attempt ended the transaction there),
+/// and the outcome is unknown.
+#[test]
+fn a_lockless_commit_that_may_have_applied_is_never_resent() {
+    let cluster = cluster();
+    let dying = Dying::new(&cluster);
+    let gw = ClusterTxnServices::new(
+        dying.clone(),
+        ClusterConfig {
+            heartbeat: Duration::from_secs(60),
+            ..ClusterConfig::default()
+        },
+    );
+    let mut txn = begin(&gw, Isolation::ReadCommitted);
+    let token = crate::storage::engine::catalog::GENERATION_KEY.to_vec();
+    txn.put(Keyspace::Catalog, token, b"t".to_vec()).unwrap();
+    dying.lost_replies.store(1, Ordering::SeqCst);
+    // Catalog writes commit through commit_then (the catalog publishes after commit).
+    let error = txn.commit_then(|_| Ok(())).unwrap_err();
+    assert_eq!(error, TxnError::CommitAmbiguous);
+    assert_eq!(dying.commits.load(Ordering::SeqCst), 1, "resent");
+
+    let mut txn = begin(&gw, Isolation::ReadCommitted);
+    put_row(&mut txn, 10, b"a", b"x");
+    dying.lost_replies.store(1, Ordering::SeqCst);
+    assert_eq!(txn.commit().unwrap_err(), TxnError::CommitAmbiguous);
+    assert_eq!(
+        dying.commits.load(Ordering::SeqCst),
+        3,
+        "locked: resent once"
+    );
+    assert_eq!(read(&gw, 10, b"a"), Some(b"x".to_vec()));
+}
+
+/// Review B N4 (replaces P9-10's pre-prepare wait): a Rows participant that granted the
+/// transaction no lock (a split child: the split dropped its locks, and the gateway holds no
+/// grant from the child's id) cannot prepare, so the commit fails at once with 40001 before any
+/// prepare, even while that range has no leader.
+#[test]
+fn a_cross_range_commit_with_a_lockless_participant_fails_before_any_prepare() {
+    let cluster = cluster();
+    let dying = Dying::new(&cluster);
+    let gw = ClusterTxnServices::new(
+        dying.clone(),
+        ClusterConfig {
+            heartbeat: Duration::from_secs(60),
+            ..ClusterConfig::default()
+        },
+    );
+    let right = cluster.range_of(RangeSpace::Rows, &row(10, b"z"));
+    let mut txn = begin(&gw, Isolation::ReadCommitted);
+    put_row(&mut txn, 10, b"a", b"x");
+    put_row(&mut txn, 10, b"z", b"y");
+    // As after a split: the right range's locks are gone, no grant from it is recorded, and it
+    // has no leader yet.
+    cluster.restart(right);
+    cluster.stop(right);
+    gw.state(txn.id(), |state| state.generations.remove(&right));
+    let started = Instant::now();
+    let error = txn.commit().unwrap_err();
+    assert_eq!(error.sqlstate(), "40001", "{error:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(dying.prepares.load(Ordering::SeqCst), 0);
+    cluster.restart(right);
+    assert_eq!(read(&gw, 10, b"a"), None);
+    assert_eq!(read(&gw, 10, b"z"), None);
+}
+
+/// A participant that holds the transaction's locks but has no leader at prepare (a split
+/// child reopening for its next split) aborts the commit before any decision: 40001, not an
+/// I/O error (split_scan's "no leader" batches).
+#[test]
+fn a_cross_range_commit_with_a_leaderless_participant_aborts_retryably() {
+    let cluster = cluster();
+    let gw = services(&cluster, ClusterConfig::default());
+    let right = cluster.range_of(RangeSpace::Rows, &row(10, b"z"));
+    let mut txn = begin(&gw, Isolation::ReadCommitted);
+    put_row(&mut txn, 10, b"a", b"x");
+    put_row(&mut txn, 10, b"z", b"y");
+    cluster.stop(right);
+    let error = txn.commit().unwrap_err();
+    assert_eq!(error.sqlstate(), "40001", "{error:?}");
+    cluster.restart(right);
+    assert_eq!(read(&gw, 10, b"a"), None);
+    assert_eq!(read(&gw, 10, b"z"), None);
 }

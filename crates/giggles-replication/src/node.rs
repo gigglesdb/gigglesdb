@@ -391,6 +391,11 @@ impl Replica {
         }
         Ok(())
     }
+    /// Raft leader transfer to voter `to` (a no-op unless this replica leads).
+    pub fn transfer_leader(&mut self, to: u64) {
+        self.wake();
+        self.raw.transfer_leader(to);
+    }
     pub fn campaign(&mut self) -> Result<()> {
         self.wake();
         self.raw.campaign().map_err(Error::Raft)

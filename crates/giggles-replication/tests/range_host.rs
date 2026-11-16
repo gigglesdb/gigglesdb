@@ -209,6 +209,7 @@ fn start(dir: &Path, fresh: bool) -> Cluster {
             node,
             sinks: sinks.clone(),
             blocked: blocked.clone(),
+            snaps: Default::default(),
         });
         let opener = Arc::new(StubOpener {
             node,

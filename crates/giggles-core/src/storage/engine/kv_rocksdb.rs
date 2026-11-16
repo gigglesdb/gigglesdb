@@ -371,8 +371,7 @@ impl RocksKv {
         db.get_approximate_sizes_cf(cf, &[rocksdb::Range::new(&from, &to)])[0]
     }
 
-    /// Flush every column family's memtables to SST files (tests of approximate sizes).
-    #[cfg(test)]
+    /// Flush every column family's memtables to SST files, so approximate sizes count them.
     pub(crate) fn flush_memtables(&self) -> Result<(), KvError> {
         for ks in Keyspace::ALL {
             let cf = self.db.cf_handle(ks.name()).unwrap();

@@ -108,6 +108,7 @@ enum Command {
     Step(u64, Message),
     ReportSnapshot(u64, bool),
     Liveness(u64, bool),
+    TransferLeader(u64),
     Shutdown,
 }
 #[derive(Clone)]
@@ -180,6 +181,11 @@ impl ReplicaHandle {
     /// Reports a peer node's liveness change to a quiescing group (GD-0075 R5-17b).
     pub fn node_liveness(&self, node: u64, alive: bool) {
         let _ = self.tx.send(Command::Liveness(node, alive));
+    }
+    /// Asks this replica, if it leads, to hand leadership to voter `to` (Raft leader transfer:
+    /// `to` campaigns once caught up). Fire and forget: watch `role()` for the outcome.
+    pub fn transfer_leader(&self, to: u64) {
+        let _ = self.tx.send(Command::TransferLeader(to));
     }
     pub fn role(&self) -> RoleInfo {
         *self.role.lock().expect("role mutex poisoned")
@@ -265,6 +271,8 @@ pub fn spawn_with_policy(
                     Ok(Err(e)) => eprintln!("snapshot build failed: {e}"),
                     Err(_) => eprintln!("snapshot build thread panicked"),
                 }
+                // Requests made during the build: raft asks again if this one does not serve.
+                replica.log().take_snapshot_wanted();
             }
             replica.hold_quiescence(!barrier.is_idle() || !pending.is_empty());
             // A quiesced group does not tick: block until a command arrives (R5-17b).
@@ -297,6 +305,7 @@ pub fn spawn_with_policy(
                     Ok(Command::Liveness(node, alive)) => {
                         let _ = replica.node_liveness(node, alive);
                     }
+                    Ok(Command::TransferLeader(to)) => replica.transfer_leader(to),
                     Ok(Command::LastIndex(reply)) => {
                         let _ = reply.send(Ok(replica.last_index()));
                     }
@@ -436,6 +445,17 @@ pub fn spawn_with_policy(
                         Ok(job) => build = job,
                         Err(e) => eprintln!("snapshot preparation failed: {e}"),
                     }
+                }
+            }
+            // On demand (GD-0075 P9-2c): raft found no built snapshot for a follower behind the
+            // log's first index; without this it would wait for the policy (or forever).
+            if build.is_none()
+                && replica.log().take_snapshot_wanted()
+                && snapshot_index(&replica) < replica.applied_index()
+            {
+                match start_snapshot(&mut replica) {
+                    Ok(job) => build = job,
+                    Err(e) => eprintln!("on-demand snapshot preparation failed: {e}"),
                 }
             }
             published = out.role;

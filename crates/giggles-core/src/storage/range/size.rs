@@ -40,6 +40,12 @@ impl RangeStore {
             .sum())
     }
 
+    /// Flush memtables so approximate_size counts recent writes. The size policy does not call
+    /// this (RocksDB flushes on its own in production); tests call it before a policy pass.
+    pub fn flush_memtables(&self) -> Result<(), CoreError> {
+        Ok(self.kv().flush_memtables()?)
+    }
+
     /// A range key strictly inside the range (start < key < end) at a whole stored user key,
     /// chosen so that about half of the range's bytes lie below it; None when the range holds
     /// fewer than two distinct user keys, or is the system range (SYSTEM_RANGE never splits by
@@ -233,7 +239,7 @@ mod tests {
         let before = store.approximate_size(RIGHT).unwrap();
         let ns: Vec<u64> = (0..1024).collect();
         put(&store, Keyspace::Rows, SPLIT_TABLE, &ns, 1, 4096);
-        store.kv().flush_memtables().unwrap();
+        store.flush_memtables().unwrap();
         let after = store.approximate_size(RIGHT).unwrap();
         let written = 1024 * 4096;
         assert!(after > before && after > written / 2, "{before} -> {after}");

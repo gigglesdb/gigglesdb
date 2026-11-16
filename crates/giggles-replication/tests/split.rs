@@ -12,7 +12,7 @@ use giggles_core::{
 use giggles_replication::{
     client::LocalRanges,
     range_state::{
-        MemOp, MemRangeStore, RangeProposal, RangeStateMachine, RangeStoreOps,
+        MemOp, MemRangeStore, RangeProposal, RangeStateMachine, RangeStoreOps, SplitEvent,
         decode_range_proposal, encode_proposal, encode_split_proposal,
     },
     sink::ReplicateError,
@@ -82,7 +82,7 @@ fn mem_store_split_moves_keys_and_notifies_the_listener() {
     let s = RangeStateMachine::new(RangeId(7), store.clone());
     let heard = Arc::new(Mutex::new(Vec::new()));
     let sink = heard.clone();
-    s.set_split_listener(Arc::new(move |d: &RangeDescriptor| {
+    s.set_split_listener(Arc::new(move |d: &RangeDescriptor, _: SplitEvent| {
         sink.lock().unwrap().push(d.clone());
     }));
     let pos = |index| AppliedPosition { index, term: 1 };

@@ -49,6 +49,11 @@ pub trait RangeStoreOps: Send + Sync {
     fn export(&self, range: RangeId, target: &Path) -> Result<AppliedPosition, StateError>;
     fn install(&self, range: RangeId, source: &Path) -> Result<AppliedPosition, StateError>;
     fn flush(&self) -> Result<(), StateError>;
+    /// Lineage: the descriptors (as at split time) of the children split off `range`.
+    fn children(&self, range: RangeId) -> Result<Vec<RangeDescriptor>, StateError> {
+        let _ = range;
+        Ok(Vec::new())
+    }
 }
 
 fn core_position(at: AppliedPosition) -> giggles_core::replicated::AppliedPosition {
@@ -118,6 +123,9 @@ impl RangeStoreOps for RangeStore {
     }
     fn flush(&self) -> Result<(), StateError> {
         RangeStore::flush(self).map_err(state_error)
+    }
+    fn children(&self, range: RangeId) -> Result<Vec<RangeDescriptor>, StateError> {
+        RangeStore::children(self, range).map_err(state_error)
     }
 }
 
@@ -195,8 +203,19 @@ pub fn decode_range_proposal(bytes: &[u8]) -> Result<(Epoch, RangeProposal<'_>),
     Ok((epoch, RangeProposal::Split { at_key, right }))
 }
 
-/// Called with the new right descriptor after a split entry applied, on the applying thread.
-pub type SplitListener = Arc<dyn Fn(&RangeDescriptor) + Send + Sync>;
+/// Why a split listener is called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitEvent {
+    /// The range applied a split entry; the descriptor is the new right range (stored).
+    Applied,
+    /// The range installed a snapshot whose lineage names this child, which is not stored
+    /// here: this replica learned of the split only from the snapshot (GD-0075 P9-2c).
+    Lineage,
+}
+
+/// Called with a split child's descriptor on the applying thread: the new right range after
+/// a split entry applied, or a lineage child not stored here after a snapshot install.
+pub type SplitListener = Arc<dyn Fn(&RangeDescriptor, SplitEvent) + Send + Sync>;
 
 /// RAII marker for a live leader engine of one range; installs are refused
 /// while any guard lives.
@@ -267,7 +286,7 @@ impl RangeStateMachine {
                 // writer of that engine may be waiting on this very apply.
                 self.moved.fetch_max(left.epoch.0, Ordering::SeqCst);
                 if let Some(listener) = self.split_listener.get() {
-                    listener(&right);
+                    listener(&right, SplitEvent::Applied);
                 }
                 Ok(ApplyOutcome::Applied)
             }
@@ -325,8 +344,18 @@ impl StateMachine for RangeStateMachine {
     fn can_install(&self) -> bool {
         self.engines.load(Ordering::SeqCst) == 0
     }
+    /// After the install, each lineage child not stored here goes to the split listener: the
+    /// snapshot may postdate splits this replica never applied (GD-0075 P9-2c).
     fn install(&self, source: &Path) -> Result<AppliedPosition, StateError> {
-        self.store.install(self.range, source)
+        let at = self.store.install(self.range, source)?;
+        if let Some(listener) = self.split_listener.get() {
+            for child in self.store.children(self.range)? {
+                if self.store.descriptor(child.id)?.is_none() {
+                    listener(&child, SplitEvent::Lineage);
+                }
+            }
+        }
+        Ok(at)
     }
     fn flush(&self) -> Result<(), StateError> {
         self.store.flush()

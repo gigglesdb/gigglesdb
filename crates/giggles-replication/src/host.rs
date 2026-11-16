@@ -12,7 +12,7 @@ use crate::{
     log_store::LogStore,
     node::Replica,
     range_role::{RangeEngine, RangeRoles},
-    range_state::{SplitListener, encode_split_proposal},
+    range_state::{SplitEvent, SplitListener, encode_split_proposal},
     role::Serving,
     sink::{Outbox, ReplicaHandle, ReplicateError, SnapshotPolicy, spawn_with_policy},
     snapshot::SnapshotStore,
@@ -29,9 +29,12 @@ use raft::StateRole;
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// First and longest wait between retries of a split child's group open.
@@ -95,6 +98,10 @@ struct Inner {
     listeners: Arc<Mutex<BTreeMap<RangeId, ReplicaHandle>>>,
     /// Set once `stop()` began; held while a range opens so none opens after it.
     stopped: Mutex<bool>,
+    /// When this host applied the split that created each range (since it opened; R5-83).
+    split_children: Mutex<BTreeMap<RangeId, Instant>>,
+    /// Split children created here from a parent's lineage (GD-0075 P9-2c).
+    lineage: AtomicU64,
 }
 
 impl RangeHost {
@@ -125,6 +132,8 @@ impl RangeHost {
             liveness: None,
             listeners: Arc::default(),
             stopped: Mutex::new(false),
+            split_children: Mutex::default(),
+            lineage: AtomicU64::new(0),
         };
         if let Some(liveness) = host.config.liveness {
             let group = RangeId(LIVENESS_GROUP);
@@ -155,6 +164,9 @@ impl RangeHost {
     /// With an opener, each group's role manager opens a leader engine through it.
     /// A split applied by any of its groups opens the new right range's group here
     /// when its descriptor lists this node (a range already hosted is left alone).
+    /// A snapshot install whose lineage names a child not stored here, listing this node,
+    /// stores that child as needing a snapshot and opens its group (GD-0075 P9-2c); so does
+    /// `open` for a child a crash left uncreated after such an install.
     pub fn open(
         config: RangeHostConfig,
         network: Arc<dyn GroupNetwork>,
@@ -166,9 +178,9 @@ impl RangeHost {
         }
         let slot: Arc<OnceLock<Weak<Inner>>> = Arc::default();
         let hook = slot.clone();
-        let listener: SplitListener = Arc::new(move |right: &RangeDescriptor| {
+        let listener: SplitListener = Arc::new(move |right: &RangeDescriptor, event| {
             if let Some(inner) = hook.get().and_then(Weak::upgrade) {
-                inner.open_split_child(right);
+                inner.open_split_child(right, event);
             }
         });
         let (roles, states) = RangeRoles::backed(store.clone(), opener, listener);
@@ -180,6 +192,15 @@ impl RangeHost {
             };
             if descriptor.replicas.iter().any(|r| r.node == host.node_id()) {
                 host.inner.open_range(&descriptor, true)?;
+            }
+        }
+        // A split stores both halves in one batch, so an unstored lineage child was learned
+        // from a snapshot whose install a crash cut off before the child was created.
+        for range in store.ranges().map_err(core)? {
+            for child in store.children(range).map_err(core)? {
+                if store.descriptor(child.id).map_err(core)?.is_none() {
+                    host.inner.open_split_child(&child, SplitEvent::Lineage);
+                }
             }
         }
         Ok(host)
@@ -268,6 +289,11 @@ impl RangeHost {
         }
     }
 
+    /// The multi-range store of a store-backed host (`open`).
+    pub fn store(&self) -> Option<Arc<RangeStore>> {
+        self.inner.roles.store().cloned()
+    }
+
     /// The range's role (leader engine or follower); None without a role manager.
     pub fn serving(&self, range: RangeId) -> Option<Serving<RangeEngine>> {
         self.inner.roles.serving(range)
@@ -280,6 +306,22 @@ impl RangeHost {
 
     pub fn node_id(&self) -> u64 {
         self.inner.config.node_id
+    }
+
+    /// When this host applied the split entry that created `range` (GD-0075 R5-83 cooldown).
+    /// In memory: None for ranges created before this host opened, or by a layout.
+    pub fn created_by_split(&self, range: RangeId) -> Option<Instant> {
+        let children = self
+            .inner
+            .split_children
+            .lock()
+            .expect("range host mutex poisoned");
+        children.get(&range).copied()
+    }
+
+    /// Split children this host created from a parent snapshot's lineage (GD-0075 P9-2c).
+    pub fn lineage_children(&self) -> u64 {
+        self.inner.lineage.load(Ordering::Relaxed)
     }
 
     /// Opens (or creates) the group's log and snapshot stores and starts its replica thread.
@@ -326,14 +368,31 @@ impl Inner {
         Ok(Some(handle))
     }
 
-    /// Split listener, on the parent's applying thread after the store's split write:
-    /// opens the right range's group when it lists this node. A failed open is retried
+    /// Split listener, on the parent's applying thread: after the store's split write
+    /// (`Applied`) or a snapshot install (`Lineage`, the child first stored as needing a
+    /// snapshot). Opens the child's group when it lists this node. A failed open is retried
     /// on a background thread until it succeeds or the host stops (the split entry is
     /// applied once, so nothing else would open the child before a restart).
-    fn open_split_child(self: &Arc<Self>, right: &RangeDescriptor) {
+    ///
+    /// Running on the applying thread cannot deadlock: like a split's open, it takes only
+    /// host and store locks no other thread holds while waiting on a replica (`stop()`
+    /// releases them before joining), spawns the child's replica thread, and never waits on
+    /// the parent's own driver (the caller).
+    fn open_split_child(self: &Arc<Self>, right: &RangeDescriptor, event: SplitEvent) {
+        if event == SplitEvent::Applied {
+            self.split_children
+                .lock()
+                .expect("range host mutex poisoned")
+                .insert(right.id, Instant::now());
+        }
         let (cluster, node) = (&self.config.cluster, Some(self.config.node_id));
-        crate::failpoint::hit(cluster, node, "range.split.applied");
+        if event == SplitEvent::Applied {
+            crate::failpoint::hit(cluster, node, "range.split.applied");
+        }
         if !right.replicas.iter().any(|r| r.node == self.config.node_id) {
+            return;
+        }
+        if event == SplitEvent::Lineage && !self.create_from_lineage(right) {
             return;
         }
         match self.open_range(right, true) {
@@ -352,6 +411,33 @@ impl Inner {
                 if let Err(e) = spawned {
                     eprintln!("split range {}: no retry thread: {e}", range.0);
                 }
+            }
+        }
+    }
+
+    /// Stores a lineage child as needing a snapshot (its leader sends one on demand);
+    /// false when that failed (the next `open` retries it).
+    fn create_from_lineage(&self, child: &RangeDescriptor) -> bool {
+        let Some(store) = self.roles.store() else {
+            return false;
+        };
+        match store.create_needs_snapshot(child) {
+            Ok(created) => {
+                if created {
+                    self.lineage.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "node {}: range {} created from its parent's snapshot lineage; it waits for its own snapshot",
+                        self.config.node_id, child.id.0
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "node {}: creating range {} from lineage failed (retried on restart): {e}",
+                    self.config.node_id, child.id.0
+                );
+                false
             }
         }
     }

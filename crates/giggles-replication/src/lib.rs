@@ -27,6 +27,7 @@ pub mod role;
 pub mod route;
 pub mod sink;
 pub mod snapshot;
+pub mod split;
 pub mod state;
 pub mod store_slot;
 pub mod transport;

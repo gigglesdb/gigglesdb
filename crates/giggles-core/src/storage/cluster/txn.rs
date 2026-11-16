@@ -8,9 +8,9 @@ use super::coordinator::{
 use super::read::{RoutedKvRead, range_space};
 use super::xact::{Lookup, XactRecord, read_record, xact_key};
 use crate::range_api::{
-    ClusterTxnId, DeadlockProbe, GatewayPeer, GatewayService, LeaseKind, LockRequest, LockTarget,
-    RangeClient, RangeDescriptor, RangeError, RangeId, RangeLockMode, RangeSpace, RangeWrite,
-    SequenceOp, Timestamp, WaitSite, range_key,
+    ClusterTxnId, DeadlockProbe, Epoch, GatewayPeer, GatewayService, LeaseKind, LockRequest,
+    LockTarget, RangeClient, RangeDescriptor, RangeError, RangeId, RangeLockMode, RangeSpace,
+    RangeWrite, SequenceOp, Timestamp, WaitSite, range_key,
 };
 use crate::storage::engine::{
     commit::RawOp,
@@ -324,8 +324,7 @@ impl ClusterTxnServices {
         loop {
             match call() {
                 Err(RangeError::NotLeader { .. } | RangeError::Unavailable(_))
-                    if attempt + 1 < self.config.retries
-                        || started.elapsed() < FAILOVER_WINDOW =>
+                    if self.may_retry(attempt, started) =>
                 {
                     attempt += 1;
                     thread::sleep(delay);
@@ -335,8 +334,29 @@ impl ClusterTxnServices {
             }
         }
     }
+    /// Whether a call failing NotLeader / Unavailable after `failures` earlier such failures
+    /// since `since` is tried again: under `config.retries` attempts, or inside
+    /// `FAILOVER_WINDOW` (a new split child elects its first leader in 300-530 ms).
+    fn may_retry(&self, failures: u32, since: Instant) -> bool {
+        failures + 1 < self.config.retries || since.elapsed() < FAILOVER_WINDOW
+    }
     fn descriptor(&self, range_key: &[u8]) -> Result<RangeDescriptor, TxnError> {
         self.retry(|| self.client.descriptor_for(range_key))
+    }
+    /// After a NotLeader / Unavailable backoff on a call addressed to `desc` (holding `key`),
+    /// looks the range up again (GD-0075 P9-9, as read.rs `send`): a routed client picks
+    /// replicas from its cached descriptor, and a new split child may simply have no leader
+    /// yet. Returns a newer epoch holding the key (a route change: the range would refuse the
+    /// call as StaleEpoch). An older or unknown record there (a split not yet published to the
+    /// directory) is not one: `desc` is learned back so the by-id call still routes.
+    fn reroute(&self, key: &[u8], desc: &RangeDescriptor) -> Option<RangeDescriptor> {
+        self.client.invalidate(desc);
+        match self.client.descriptor_for(key) {
+            Ok(current) if current.epoch > desc.epoch => return Some(current),
+            Ok(current) if current == *desc => {}
+            _ => self.client.learn(desc),
+        }
+        None
     }
 
     /// One lock request in the range containing `rk`, in slices so `cancel` is observed.
@@ -355,6 +375,12 @@ impl ClusterTxnServices {
         let mut stale = 0;
         let mut unavailable = 0;
         let mut delay = Duration::from_millis(1);
+        // The (id, epoch) last asked: each change (a split or move seen through the directory
+        // or a StaleEpoch) restarts the NotLeader / Unavailable budget and window, at most
+        // `retries` times (GD-0075 P9-9). The window opens at the first such failure.
+        let mut route: Option<(RangeId, Epoch)> = None;
+        let mut route_changes = 0;
+        let mut unavailable_since: Option<Instant> = None;
         // One registered wait spans every slice, so a wait older than deadlock_timeout is
         // probed even though each range request lasts only one slice.
         let mut wait: Option<(RangeId, super::coordinator::deadlock::WaitGuard)> = None;
@@ -367,6 +393,14 @@ impl ClusterTxnServices {
                 return Err(TxnError::Deadlock);
             }
             let descriptor = self.descriptor(rk)?;
+            let current = (descriptor.id, descriptor.epoch);
+            if route.is_some_and(|last| last != current) && route_changes < self.config.retries {
+                route_changes += 1;
+                unavailable = 0;
+                unavailable_since = None;
+                delay = Duration::from_millis(1);
+            }
+            route = Some(current);
             if let Some(detector) = &self.detector
                 && wait
                     .as_ref()
@@ -426,12 +460,16 @@ impl ClusterTxnServices {
                     self.client.invalidate(&descriptor);
                 }
                 Err(RangeError::NotLeader { .. } | RangeError::Unavailable(_))
-                    if unavailable + 1 < self.config.retries =>
+                    if self.may_retry(
+                        unavailable,
+                        *unavailable_since.get_or_insert_with(Instant::now),
+                    ) =>
                 {
                     unavailable += 1;
-                    self.client.invalidate(&descriptor);
                     thread::sleep(delay);
                     delay = (delay * 2).min(Duration::from_millis(50));
+                    // A newer epoch is picked up by the next lookup (a route change).
+                    let _ = self.reroute(rk, &descriptor);
                 }
                 Err(error) => return Err(txn_error(error)),
             }
@@ -719,7 +757,12 @@ impl ClusterServices for ClusterTxnServices {
             // One range and no xid: one single-range commit.
             1 if marker_xid.is_none() => {
                 let group = groups.pop().expect("one group");
-                self.commit_one(txn, &group)?
+                // The commit re-resolves its range after each backoff (GD-0075 P9-9).
+                let first = group.writes.first().ok_or(TxnError::Misuse)?;
+                let key = range_key(first.space, &first.key);
+                let desc = current.filter(|d| (d.id, d.epoch) == (group.range, group.epoch));
+                let route = desc.as_ref().map(|d| (key.as_slice(), d));
+                self.commit_one(txn, &group, route)?
             }
             _ => {
                 // Several ranges, or any transaction holding an xid (even when the system
@@ -730,6 +773,19 @@ impl ClusterServices for ClusterTxnServices {
                 // every vote, and a reader that finds the owner ended waits on the prepared
                 // write; a plain single-range commit could land after a reader reported the xid
                 // "aborted" (review S1).
+                //
+                // A Rows/Index participant that granted this transaction no lock cannot
+                // prepare: its writes must be covered by locks taken there in its current term,
+                // and it is a split child whose split dropped them (review B N4). Fail at once,
+                // before any prepare. Catalog-only participants need no lock.
+                if groups.iter().any(|p| {
+                    p.lock_generation.is_none()
+                        && p.writes
+                            .iter()
+                            .any(|w| matches!(w.space, RangeSpace::Rows | RangeSpace::Index))
+                }) {
+                    return Err(TxnError::Serialization(SerializationReason::WriteConflict));
+                }
                 let lock_only: Vec<RangeId> = self.state(txn, |state| {
                     state
                         .ranges
@@ -744,6 +800,11 @@ impl ClusterServices for ClusterTxnServices {
                     lock_only,
                 };
                 commit_cross_range(self.client.as_ref(), plan).map_err(|e| match e {
+                    // A participant without a leader (a split child reopening or electing)
+                    // aborted the transaction before any decision: retryable, not an I/O error.
+                    CommitError::Aborted(
+                        RangeError::NotLeader { .. } | RangeError::Unavailable(_),
+                    ) => TxnError::Serialization(SerializationReason::WriteConflict),
                     CommitError::Aborted(cause) => match txn_error(cause) {
                         // A definite abort is never reported as an unknown outcome.
                         TxnError::CommitAmbiguous => {
@@ -836,11 +897,21 @@ impl ClusterTxnServices {
     /// failure of any kind, or running out of attempts, is `CommitAmbiguous` (08007), never an
     /// I/O error or an abort (review S1). Running out of attempts on NotLeader alone is
     /// reported as unknown too. Before any such attempt a definite error keeps its meaning
-    /// (an abort stays 40001).
-    fn commit_one(&self, txn: TxnId, group: &Participant) -> Result<Timestamp, TxnError> {
+    /// (an abort stays 40001). With `route` = (a key the group writes, its descriptor), the
+    /// range is looked up again after each backoff (`reroute`): a newer epoch there ends the
+    /// commit as StaleEpoch (40001), or `CommitAmbiguous` once an attempt may have applied.
+    /// A group holding no lock on the range (`lock_generation` None) is not resent at all once
+    /// an attempt may have applied (review S3).
+    fn commit_one(
+        &self,
+        txn: TxnId,
+        group: &Participant,
+        route: Option<(&[u8], &RangeDescriptor)>,
+    ) -> Result<Timestamp, TxnError> {
         let mut delay = Duration::from_millis(1);
         let mut attempt = 0;
         let mut maybe_applied = false;
+        let started = Instant::now();
         loop {
             attempt += 1;
             match self.client.commit(
@@ -854,11 +925,24 @@ impl ClusterTxnServices {
                 Ok(ts) => return Ok(ts),
                 Err(e @ (RangeError::NotLeader { .. } | RangeError::Unavailable(_))) => {
                     maybe_applied |= matches!(e, RangeError::Unavailable(_));
-                    if attempt >= self.config.retries {
+                    // Review S3, design.md Changes (g): with no lock on the range, nothing
+                    // there refuses a resend (a catalog-only commit would apply again at a
+                    // later timestamp), so a possibly applied attempt is never resent.
+                    if (maybe_applied && group.lock_generation.is_none())
+                        || !self.may_retry(attempt - 1, started)
+                    {
                         return Err(TxnError::CommitAmbiguous);
                     }
                     thread::sleep(delay);
                     delay = (delay * 2).min(Duration::from_millis(50));
+                    if let Some((key, desc)) = route
+                        && let Some(descriptor) = self.reroute(key, desc)
+                    {
+                        if maybe_applied {
+                            return Err(TxnError::CommitAmbiguous);
+                        }
+                        return Err(txn_error(RangeError::StaleEpoch { descriptor }));
+                    }
                 }
                 Err(_) if maybe_applied => return Err(TxnError::CommitAmbiguous),
                 Err(e) => return Err(txn_error(e)),

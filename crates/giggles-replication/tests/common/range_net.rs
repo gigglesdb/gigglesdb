@@ -1,6 +1,7 @@
-//! In-process `GroupNetwork` for store-backed RangeHosts, the Rows write batch
-//! encoding their range proposals carry (range_host.rs, split.rs), and a
-//! three-node store-backed cluster (split.rs, split_lifecycle.rs).
+//! In-process `GroupNetwork` for store-backed RangeHosts (snapshots are copied between
+//! the groups' snapshot stores), the Rows write batch encoding their range proposals
+//! carry (range_host.rs, split.rs), and a three-node store-backed cluster (split.rs,
+//! split_lifecycle.rs, split_snapshot.rs).
 use giggles_core::{
     range_api::{Epoch, RangeEngineOpener, RangeId, RangeSpace, range_key},
     replicated::RangeStore,
@@ -9,7 +10,8 @@ use giggles_replication::{
     bootstrap::presplit,
     host::{GroupNetwork, RangeHost, RangeHostConfig},
     range_state::encode_proposal,
-    sink::{Outbox, ReplicateError},
+    sink::{Outbox, ReplicateError, SnapshotPolicy},
+    snapshot::SnapshotStore,
     transport::PeerSink,
 };
 use raft::{StateRole, eraftpb::Message};
@@ -27,16 +29,52 @@ use std::{
 pub type Sinks = Arc<Mutex<HashMap<(u64, RangeId), Arc<dyn PeerSink>>>>;
 /// Nodes whose messages are dropped both ways.
 pub type Blocked = Arc<Mutex<BTreeSet<u64>>>;
+/// Each (node, group)'s snapshot store.
+pub type Snaps = Arc<Mutex<HashMap<(u64, RangeId), Arc<SnapshotStore>>>>;
 
 pub struct MemNet {
     pub node: u64,
     pub sinks: Sinks,
     pub blocked: Blocked,
+    pub snaps: Snaps,
 }
 struct MemOutbox {
     group: RangeId,
     sinks: Sinks,
     blocked: Blocked,
+    snaps: Snaps,
+}
+impl MemOutbox {
+    /// Copies the sender's built snapshot `m` names into the receiver's incoming area.
+    fn transfer(&self, m: &Message) -> bool {
+        let (from, to) = {
+            let snaps = self.snaps.lock().unwrap();
+            let get = |node| snaps.get(&(node, self.group)).cloned();
+            (get(m.from), get(m.to))
+        };
+        let (Some(from), Some(to)) = (from, to) else {
+            return false;
+        };
+        let meta = m.get_snapshot().get_metadata();
+        let Some(manifest) = from
+            .latest()
+            .filter(|l| (l.index, l.term) == (meta.index, meta.term))
+        else {
+            return false;
+        };
+        if to.take_incoming(manifest.index, manifest.term).is_none() {
+            let dir = from.built_data_dir(&manifest);
+            let mut writer = to.incoming(&manifest).unwrap();
+            for (i, file) in manifest.files.iter().enumerate() {
+                let bytes = std::fs::read(dir.join(&file.name)).unwrap();
+                if !bytes.is_empty() {
+                    writer.write_chunk(i as u32, 0, &bytes).unwrap();
+                }
+            }
+            writer.finish().unwrap();
+        }
+        true
+    }
 }
 impl Outbox for MemOutbox {
     fn send(&mut self, m: Message) {
@@ -46,9 +84,21 @@ impl Outbox for MemOutbox {
                 return;
             }
         }
-        let sink = self.sinks.lock().unwrap().get(&(m.to, self.group)).cloned();
+        let snapshot = !m.get_snapshot().is_empty();
+        if snapshot && !self.transfer(&m) {
+            return;
+        }
+        let (from, to) = (m.from, m.to);
+        let (sender, sink) = {
+            let sinks = self.sinks.lock().unwrap();
+            let get = |node| sinks.get(&(node, self.group)).cloned();
+            (get(from), get(to))
+        };
         if let Some(sink) = sink {
-            sink.deliver(m.from, m);
+            sink.deliver(from, m);
+            if let (true, Some(sender)) = (snapshot, sender) {
+                sender.snapshot_status(to, true);
+            }
         }
     }
 }
@@ -58,13 +108,26 @@ impl GroupNetwork for MemNet {
             group,
             sinks: self.sinks.clone(),
             blocked: self.blocked.clone(),
+            snaps: self.snaps.clone(),
         })
     }
     fn register(&self, group: RangeId, sink: Arc<dyn PeerSink>) {
         self.sinks.lock().unwrap().insert((self.node, group), sink);
     }
+    fn register_group(
+        &self,
+        group: RangeId,
+        sink: Arc<dyn PeerSink>,
+        snapshots: Option<Arc<SnapshotStore>>,
+    ) {
+        if let Some(store) = snapshots {
+            self.snaps.lock().unwrap().insert((self.node, group), store);
+        }
+        self.register(group, sink);
+    }
     fn unregister(&self, group: RangeId) {
         self.sinks.lock().unwrap().remove(&(self.node, group));
+        self.snaps.lock().unwrap().remove(&(self.node, group));
     }
 }
 
@@ -72,11 +135,19 @@ impl GroupNetwork for MemNet {
 /// per op `[tag][keyspace index in Keyspace::ALL]` + `len BE4 + bytes` fields,
 /// then crc32c BE4 of everything before it. Put = tag 1, Rows = index 2.
 pub fn rows_batch(puts: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let ops: Vec<_> = puts
+        .iter()
+        .map(|(k, v)| (k.clone(), Some(v.clone())))
+        .collect();
+    rows_ops(&ops)
+}
+/// As `rows_batch`, with deletes (`None`: tag 2, key field only).
+pub fn rows_ops(ops: &[(Vec<u8>, Option<Vec<u8>>)]) -> Vec<u8> {
     let mut out = vec![1];
-    out.extend_from_slice(&(puts.len() as u32).to_be_bytes());
-    for (key, value) in puts {
-        out.extend_from_slice(&[1, 2]);
-        for field in [key, value] {
+    out.extend_from_slice(&(ops.len() as u32).to_be_bytes());
+    for (key, value) in ops {
+        out.extend_from_slice(&[if value.is_some() { 1 } else { 2 }, 2]);
+        for field in std::iter::once(key).chain(value) {
             out.extend_from_slice(&(field.len() as u32).to_be_bytes());
             out.extend_from_slice(field);
         }
@@ -131,8 +202,24 @@ pub fn start_with(
     fresh: bool,
     opener: &dyn Fn(u64) -> Option<Arc<dyn RangeEngineOpener>>,
 ) -> Cluster {
+    boot(dir, cluster, fresh, opener, None)
+}
+
+/// As `start` (fresh), every group with snapshot `policy`.
+pub fn start_with_policy(dir: &Path, cluster: [u8; 16], policy: SnapshotPolicy) -> Cluster {
+    boot(dir, cluster, true, &|_| None, Some(policy))
+}
+
+fn boot(
+    dir: &Path,
+    cluster: [u8; 16],
+    fresh: bool,
+    opener: &dyn Fn(u64) -> Option<Arc<dyn RangeEngineOpener>>,
+    policy: Option<SnapshotPolicy>,
+) -> Cluster {
     let sinks: Sinks = Arc::default();
     let blocked: Blocked = Arc::default();
+    let snaps: Snaps = Arc::default();
     let (mut hosts, mut stores) = (Vec::new(), Vec::new());
     for node in NODES {
         let data = dir.join(format!("n{node}/data"));
@@ -147,13 +234,14 @@ pub fn start_with(
             log_dir: dir.join(format!("n{node}/log")),
             snap_dir: dir.join(format!("n{node}/snap")),
             tick: Duration::from_millis(10),
-            policy: None,
+            policy,
             liveness: None,
         };
         let network = Arc::new(MemNet {
             node,
             sinks: sinks.clone(),
             blocked: blocked.clone(),
+            snaps: snaps.clone(),
         });
         let host = RangeHost::open(config, network, store.clone(), opener(node)).unwrap();
         if fresh {

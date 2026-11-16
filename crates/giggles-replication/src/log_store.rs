@@ -7,7 +7,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -38,6 +38,8 @@ pub struct LogStore {
     snapshots: Option<Arc<SnapshotStore>>,
     /// Durable write transactions committed by `persist` since open.
     commits: AtomicU64,
+    /// Raft asked for a snapshot no built one covers (GD-0075 P9-2c): the driver builds one.
+    snapshot_wanted: AtomicBool,
 }
 fn decode<T: Message + Default>(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
@@ -82,6 +84,7 @@ impl LogStore {
             identity: (cluster, node_id),
             snapshots: None,
             commits: AtomicU64::new(0),
+            snapshot_wanted: AtomicBool::new(false),
         })
     }
     pub fn attach_snapshots(&mut self, s: Arc<SnapshotStore>) {
@@ -96,6 +99,11 @@ impl LogStore {
     }
     pub fn identity(&self) -> ([u8; 16], u64) {
         self.identity
+    }
+    /// Whether `Storage::snapshot` failed for want of a built snapshot since the last call;
+    /// clears the flag.
+    pub fn take_snapshot_wanted(&self) -> bool {
+        self.snapshot_wanted.swap(false, Ordering::AcqRel)
     }
     /// Durable `persist` commits since open (GD-0075 R5-17a idle-cost check).
     pub fn durable_commits(&self) -> u64 {
@@ -424,11 +432,16 @@ impl Storage for LogStore {
         })()
         .map_err(raft_error)
     }
+    /// The latest built snapshot; else records that one is wanted (the driver builds it
+    /// and raft retries sending).
     fn snapshot(&self, request_index: u64, _: u64) -> raft::Result<Snapshot> {
         self.snapshots
             .as_ref()
             .and_then(|s| s.latest_snapshot())
             .filter(|s| s.get_metadata().index >= request_index)
-            .ok_or_else(|| StorageError::SnapshotTemporarilyUnavailable.into())
+            .ok_or_else(|| {
+                self.snapshot_wanted.store(true, Ordering::Release);
+                StorageError::SnapshotTemporarilyUnavailable.into()
+            })
     }
 }

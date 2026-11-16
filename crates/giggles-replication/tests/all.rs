@@ -112,6 +112,14 @@ mod host;
 mod split;
 #[path = "split_lifecycle.rs"]
 mod split_lifecycle;
+#[path = "split_driver.rs"]
+mod split_driver;
+#[path = "split_size.rs"]
+mod split_size;
+#[path = "split_prepared.rs"]
+mod split_prepared;
+#[path = "split_snapshot.rs"]
+mod split_snapshot;
 #[path = "range_state.rs"]
 mod range_state;
 #[path = "range_host.rs"]
@@ -158,3 +166,6 @@ mod leader_reads;
 
 #[path = "gateway_cluster.rs"]
 mod gateway_cluster;
+
+#[path = "split_scan.rs"]
+mod split_scan;

@@ -373,6 +373,72 @@ fn child_routes_prefer_the_stored_descriptor_then_the_lineage() {
     assert_eq!(child_route(kv, P, RangeId(77)).unwrap(), None);
 }
 
+/// GD-0075 P9-2c: a replica that installs the parent's post-split snapshot learns the child
+/// only from the lineage; stored as needing a snapshot, the child applies nothing (also after
+/// a reopen) until its own snapshot replaces its interval, stale right-half rows included.
+#[test]
+fn a_child_learned_from_lineage_waits_for_its_own_snapshot() {
+    let (source_dir, lagging_dir) = (Dir::new("range-lineage-a"), Dir::new("range-lineage-b"));
+    let (source, lagging) = (parent(&source_dir), parent(&lagging_dir));
+    let SplitOutcome::Applied { left, right } =
+        source.split(P, Epoch(1), &at_key(), R, pos(2, 1)).unwrap()
+    else {
+        panic!("split refused");
+    };
+    let mut delete = WriteBatch::default();
+    delete.delete(Keyspace::Rows, row(RIGHT_T, 1, 1));
+    let applied = RangeApplyOutcome::Applied;
+    assert_eq!(
+        source.apply(R, &delete.encode(), pos(3, 1)).unwrap(),
+        applied
+    );
+    let left_row = one(Keyspace::Rows, row(LEFT_T, 9, 1));
+    assert_eq!(source.apply(P, &left_row, pos(3, 1)).unwrap(), applied);
+    source.export(P, &source_dir.sub("parent")).unwrap();
+    assert_eq!(
+        lagging.install(P, &source_dir.sub("parent")).unwrap(),
+        pos(3, 1)
+    );
+    assert_eq!(lagging.descriptor(P).unwrap(), Some(left));
+    assert_eq!(lagging.children(P).unwrap(), vec![right.clone()]);
+    assert_eq!(lagging.descriptor(R).unwrap(), None);
+    let stale = row(RIGHT_T, 1, 1);
+    assert!(
+        rows(&lagging, Keyspace::Rows)
+            .iter()
+            .any(|(k, _)| *k == stale)
+    );
+    assert!(lagging.create_needs_snapshot(&right).unwrap());
+    assert!(!lagging.create_needs_snapshot(&right).unwrap());
+    assert!(
+        !source.create_needs_snapshot(&right).unwrap(),
+        "stored by the split"
+    );
+    let refuses = |store: &RangeStore| {
+        assert_eq!(store.descriptor(R).unwrap(), Some(right.clone()));
+        assert_eq!(store.applied(R).unwrap(), None);
+        assert!(get(store, &meta(R, RangeLocalKey::Install)).is_some());
+        let put = one(Keyspace::Rows, row(RIGHT_T, 7, 1));
+        assert!(matches!(
+            store.apply(R, &put, pos(1, 1)),
+            Err(CoreError::Corrupt(_))
+        ));
+    };
+    refuses(&lagging);
+    drop(lagging);
+    let lagging = RangeStore::open(lagging_dir.sub("db")).unwrap();
+    refuses(&lagging);
+    source.export(R, &source_dir.sub("child")).unwrap();
+    assert_eq!(
+        lagging.install(R, &source_dir.sub("child")).unwrap(),
+        pos(3, 1)
+    );
+    assert_eq!(get(&lagging, &meta(R, RangeLocalKey::Install)), None);
+    assert_eq!(data(&lagging), data(&source));
+    let put = one(Keyspace::Rows, row(RIGHT_T, 8, 1));
+    assert_eq!(lagging.apply(R, &put, pos(4, 1)).unwrap(), applied);
+}
+
 struct NoSink;
 impl BatchSink for NoSink {
     fn replicate(&self, _: Vec<u8>) -> Result<(), ReplicateError> {

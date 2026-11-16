@@ -420,6 +420,38 @@ impl RangeStore {
         Ok(manifest.applied)
     }
 
+    /// GD-0075 P9-2c: store `descriptor` as a range that needs a snapshot when no range of
+    /// its id is stored here: its descriptor plus an install marker with an empty source (the
+    /// rolled-back state of `recover_installs`), so `apply` refuses the range until an install
+    /// of its snapshot clears the marker. For a split child this replica learned of only from
+    /// its parent's snapshot (the parent's lineage record). No overlap fence: the range holds
+    /// no data or position yet (its interval was the parent's until the parent's install
+    /// narrowed it), and its own install fences against every stored range. Returns false,
+    /// writing nothing, when the range is already stored.
+    pub fn create_needs_snapshot(&self, descriptor: &RangeDescriptor) -> Result<bool, CoreError> {
+        let lock = self.range_lock(descriptor.id)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| CoreError::Corrupt("range apply lock poisoned".into()))?;
+        let _installs = self.installs_lock()?;
+        if self.descriptor(descriptor.id)?.is_some() {
+            return Ok(false);
+        }
+        let mut batch = replace_local(descriptor.id);
+        batch.put(
+            Keyspace::Meta,
+            range_local_key(descriptor.id, &RangeLocalKey::Descriptor),
+            descriptor.encode().map_err(corrupt)?,
+        );
+        batch.put(
+            Keyspace::Meta,
+            range_local_key(descriptor.id, &RangeLocalKey::Install),
+            encode_marker(descriptor, Path::new(""))?,
+        );
+        self.kv().write(batch, Durability::Sync)?;
+        Ok(true)
+    }
+
     /// The install fences; run under the range's apply lock before the marker is written.
     fn can_install(&self, range: RangeId, manifest: &Manifest) -> Result<(), CoreError> {
         if manifest.range != range {

@@ -29,10 +29,11 @@ mod prefetch;
 #[cfg(test)]
 mod tests;
 
-/// NotLeader / Unavailable: attempts per request, with doubling backoff.
-const TRANSIENT_ATTEMPTS: u32 = 8;
+/// NotLeader / Unavailable: attempts per request, with doubling backoff: about 0.9 s in all,
+/// so a scan outlasts a new split child's first election (R5-84).
+const TRANSIENT_ATTEMPTS: u32 = 16;
 const FIRST_BACKOFF: Duration = Duration::from_millis(1);
-const MAX_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_BACKOFF: Duration = Duration::from_millis(100);
 /// Route changes (StaleEpoch) tolerated while fetching one page.
 const STALE_ATTEMPTS: u32 = 64;
 /// Ranges whose first page a scan fetches ahead (R5-44).
@@ -137,6 +138,17 @@ impl RoutedKvRead {
                     attempt += 1;
                     thread::sleep(backoff);
                     backoff = (backoff * 2).min(MAX_BACKOFF);
+                    // R5-84: a routed client picks replicas from its cached descriptor, so look
+                    // the range up again (a new split child may simply have no leader yet).
+                    // Only a newer epoch at the key is a route change (txn.rs `reroute`'s rule;
+                    // review S2): an older or unknown record there (a split child not yet
+                    // published to the directory) keeps `desc`, learned back so the by-id
+                    // request still routes, and the backoff goes on.
+                    match self.client.descriptor_for(&desc.start) {
+                        Ok(current) if current.epoch > desc.epoch => return Ok(None),
+                        Ok(current) if current == *desc => {}
+                        _ => self.client.learn(desc),
+                    }
                 }
                 Err(e) => return Err(kv_error(e)),
             }
