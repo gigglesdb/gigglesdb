@@ -76,8 +76,7 @@ impl Drop for Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let dir = PathBuf::from("J:/gigglesdb-work/nunya/target-w2-tmp")
-            .join(format!("mgmt-{}", SessionId::random().to_hex()));
+        let dir = std::env::temp_dir().join(format!("ny-{}", &SessionId::random().to_hex()[..8]));
         std::fs::create_dir_all(&dir).unwrap();
         let clock = Arc::new(AtomicU64::new(1000));
         let c = clock.clone();
@@ -2132,4 +2131,23 @@ async fn principal_cli_lifecycle() -> TransportResult {
     assert!(principal::grant(&admin, &id, &[]).await?.grants.is_empty());
     drop(authority);
     finish_server(tx, server).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn listener_refuses_overlong_socket_path() -> TransportResult {
+    use nunya::mgmt::server::{SpawnError, spawn};
+    use std::os::unix::ffi::OsStrExt;
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing context")?);
+    let long_dir = f.dir.join("x".repeat(108));
+    std::fs::create_dir(&long_dir)?;
+    assert!(long_dir.join("nunya.sock").as_os_str().as_bytes().len() > 107);
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    assert!(matches!(
+        spawn(ctx, &listener_section(false), &long_dir, rx).await,
+        Err(SpawnError::SocketPathTooLong)
+    ));
+    assert_eq!(std::fs::read_dir(&long_dir)?.count(), 0);
+    Ok(())
 }

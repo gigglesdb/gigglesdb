@@ -707,9 +707,9 @@ mod tests {
     impl Temp {
         fn new() -> Self {
             Self(
-                PathBuf::from("J:/gigglesdb-work/nunya/target-w2-tmp").join(format!(
-                    "helper-{}",
-                    crate::token::SessionId::random().to_hex()
+                std::env::temp_dir().join(format!(
+                    "ny-{}",
+                    &crate::token::SessionId::random().to_hex()[..8]
                 )),
             )
         }

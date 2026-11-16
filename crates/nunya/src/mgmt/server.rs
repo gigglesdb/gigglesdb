@@ -28,6 +28,8 @@ use tokio_rustls::TlsAcceptor;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_LIMIT: usize = 64 * 1024;
+const TCP_CONNECTIONS: usize = 64;
+const SOCKET_CONNECTIONS: usize = 8;
 
 /// Sanitized listener startup refusal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +42,8 @@ pub enum SpawnError {
     Bind,
     /// Local socket could not be installed securely.
     Socket,
+    /// The Unix socket path exceeds the supported byte length.
+    SocketPathTooLong,
 }
 impl fmt::Display for SpawnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -48,6 +52,9 @@ impl fmt::Display for SpawnError {
             Self::Tls => "management TLS unavailable",
             Self::Bind => "management listener unavailable",
             Self::Socket => "management socket unavailable",
+            Self::SocketPathTooLong => {
+                "management socket path too long (over 107 bytes); use a shorter state_dir"
+            }
         })
     }
 }
@@ -138,24 +145,51 @@ async fn connection<I>(
     }
 }
 
+#[cfg(any(unix, test))]
+fn socket_path_fits(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().len() <= 107
+    }
+    #[cfg(not(unix))]
+    {
+        path.as_os_str().as_encoded_bytes().len() <= 107
+    }
+}
+
 #[cfg(unix)]
-fn socket(state_dir: &Path) -> Result<(tokio::net::UnixListener, PathBuf), SpawnError> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+fn socket(state_dir: &Path) -> Result<(tokio::net::UnixListener, PathBuf, u32), SpawnError> {
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
     let path = state_dir.join("nunya.sock");
+    if !socket_path_fits(&path) {
+        return Err(SpawnError::SocketPathTooLong);
+    }
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if !meta.file_type().is_socket() => return Err(SpawnError::Socket),
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(SpawnError::Socket),
     }
-    let mut nonce = [0; 16];
-    getrandom::fill(&mut nonce).map_err(|_| SpawnError::Socket)?;
-    let temp = state_dir.join(format!(
-        ".nunya.sock.{}",
-        data_encoding::HEXLOWER.encode(&nonce)
-    ));
-    let listener = tokio::net::UnixListener::bind(&temp).map_err(|_| SpawnError::Socket)?;
-    let install = || {
+    let mut private_dir = None;
+    for _ in 0..8 {
+        let mut nonce = [0; 2];
+        getrandom::fill(&mut nonce).map_err(|_| SpawnError::Socket)?;
+        let candidate = state_dir.join(format!(".n{}", data_encoding::HEXLOWER.encode(&nonce)));
+        match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => {
+                private_dir = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(SpawnError::Socket),
+        }
+    }
+    let private_dir = private_dir.ok_or(SpawnError::Socket)?;
+    let temp = private_dir.join("s");
+    let mut installed = false;
+    let mut install = || -> std::io::Result<_> {
+        let listener = tokio::net::UnixListener::bind(&temp)?;
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
         // Recheck before replacement; never deliberately replace a regular file.
         match std::fs::symlink_metadata(&path) {
@@ -166,13 +200,23 @@ fn socket(state_dir: &Path) -> Result<(tokio::net::UnixListener, PathBuf), Spawn
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        std::fs::rename(&temp, &path)
+        std::fs::rename(&temp, &path)?;
+        installed = true;
+        let service_uid = std::fs::metadata(&path)?.uid();
+        std::fs::remove_dir(&private_dir)?;
+        Ok((listener, service_uid))
     };
-    if install().is_err() {
-        let _ = std::fs::remove_file(&temp);
-        return Err(SpawnError::Socket);
+    match install() {
+        Ok((listener, service_uid)) => Ok((listener, path, service_uid)),
+        Err(_) => {
+            let _ = std::fs::remove_file(&temp);
+            let _ = std::fs::remove_dir(&private_dir);
+            if installed {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(SpawnError::Socket)
+        }
     }
-    Ok((listener, path))
 }
 
 /// Start bounded TCP and local management listeners without wiring the main service.
@@ -197,7 +241,7 @@ pub async fn spawn(
         .map_err(|_| SpawnError::Bind)?;
     let tcp_addr = tcp.local_addr().map_err(|_| SpawnError::Bind)?;
     #[cfg(unix)]
-    let (local, path) = socket(state_dir)?;
+    let (local, path, service_uid) = socket(state_dir)?;
     #[cfg(unix)]
     let socket_path = Some(path.clone());
     #[cfg(not(unix))]
@@ -206,7 +250,8 @@ pub async fn spawn(
         None
     };
     let task = tokio::spawn(async move {
-        let permits = Arc::new(Semaphore::new(64));
+        let tcp_permits = Arc::new(Semaphore::new(TCP_CONNECTIONS));
+        let socket_permits = Arc::new(Semaphore::new(SOCKET_CONNECTIONS));
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut connections = JoinSet::new();
         loop {
@@ -223,7 +268,7 @@ pub async fn spawn(
                         }
                         continue;
                     };
-                    let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
+                    let Ok(permit) = tcp_permits.clone().try_acquire_owned() else { continue; };
                     let ctx = ctx.clone();
                     let tls = tls.clone();
                     let mut stop = stop_rx.clone();
@@ -257,7 +302,11 @@ pub async fn spawn(
                         }
                         continue;
                     };
-                    let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
+                    #[cfg(unix)]
+                    if !matches!(io.peer_cred(), Ok(cred) if cred.uid() == service_uid) {
+                        continue;
+                    }
+                    let Ok(permit) = socket_permits.clone().try_acquire_owned() else { continue; };
                     let ctx = ctx.clone();
                     let stop = stop_rx.clone();
                     connections.spawn(async move {
@@ -288,4 +337,21 @@ pub async fn spawn(
         socket_path,
         task,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_path_byte_length_limit() {
+        assert!(socket_path_fits(Path::new(&"a".repeat(107))));
+        assert!(!socket_path_fits(Path::new(&"a".repeat(108))));
+        assert!(socket_path_fits(Path::new(&format!("{}a", "\u{e9}".repeat(53)))));
+        assert!(!socket_path_fits(Path::new(&"\u{e9}".repeat(54))));
+        assert_eq!(
+            SpawnError::SocketPathTooLong.to_string(),
+            "management socket path too long (over 107 bytes); use a shorter state_dir"
+        );
+    }
 }
