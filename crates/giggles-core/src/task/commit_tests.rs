@@ -18,6 +18,9 @@ use crate::{Admin, Engine, Limits};
 use std::ops::Bound;
 use std::path::PathBuf;
 
+#[path = "commit_denial_tests.rs"]
+mod denial;
+
 /// 2026-11-05 17:00:00 UTC; the task expires at 17:30.
 const NOW: u64 = 1_793_898_000_000;
 const EXPIRES: u64 = NOW + 1_800_000;
@@ -343,19 +346,19 @@ fn revoked_before_and_during_run() {
     nothing_recorded(&f, "requeue-1");
 
     // After the statement snapshot: the tracked catalog read fails the
-    // commit's validation (one attempt in R3-615, so 40001).
+    // commit's validation, and the internal retry (R3-616) sees the revoke.
     let f = fixture();
+    let mut revoked = false;
     let mut load = |db: &V2Db, task: TaskObjectId, at: DefAt<'_>| {
-        if matches!(at, DefAt::Snapshot(_)) {
+        if matches!(at, DefAt::Snapshot(_)) && !revoked {
+            revoked = true;
             f.admin().tasks().revoke(&f.issuer, "inc-436").unwrap();
         }
         catalog_def(db, task, at)
     };
     let error = commit_loading(&f, "requeue-1", &mut load).unwrap_err();
-    assert_eq!(error, TaskError::Retry);
-    assert_eq!(error.sqlstate(), "40001");
+    assert_eq!(error, TaskError::Revoked);
     nothing_recorded(&f, "requeue-1");
-    // And the next attempt sees the revoke.
     assert_eq!(commit(&f, "requeue-1").unwrap_err(), TaskError::Revoked);
 }
 
