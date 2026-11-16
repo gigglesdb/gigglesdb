@@ -13,9 +13,18 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, MutexGuard, mpsc},
     time::{Duration, Instant},
 };
+
+// Linux flock locks can be inherited by children spawned on concurrent test threads
+// until exec. Serialize these tests to remove concurrent spawns, so no retry or
+// sleep is needed when reopening the database.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 struct Dir(PathBuf);
 impl Drop for Dir {
@@ -141,10 +150,12 @@ fn crash_case(mode: &str, committed: bool, crash_code: Option<i32>) {
 
 #[test]
 fn before_commit_process_crash_leaves_no_row_or_receipt_and_retry_executes() {
+    let _serial = serial();
     crash_case("before", false, Some(86));
 }
 #[test]
 fn error_before_commit_is_unknown_then_absent_and_retryable() {
+    let _serial = serial();
     // Same contract as legacy lost_commit_ack_is_resolved_by_the_original_key_after_reopen:
     // the caller sees Unknown; the original key resolves to Absent and executes once.
     let (dir, admin, engine) = fixture();
@@ -159,14 +170,17 @@ fn error_before_commit_is_unknown_then_absent_and_retryable() {
 }
 #[test]
 fn after_commit_process_crash_retains_row_index_and_replay_without_duplicates() {
+    let _serial = serial();
     crash_case("after", true, Some(86));
 }
 #[test]
 fn before_ack_process_crash_retains_row_index_and_replay_without_duplicates() {
+    let _serial = serial();
     crash_case("ack", true, Some(86));
 }
 #[test]
 fn error_after_commit_is_unknown_and_fences_once_calls_until_reopen() {
+    let _serial = serial();
     let (dir, admin, engine) = fixture();
     let original = request(&admin);
     admin.set_crash_point(CrashPoint::ErrorAfterCommit).unwrap();
@@ -186,10 +200,12 @@ fn error_after_commit_is_unknown_and_fences_once_calls_until_reopen() {
 }
 #[test]
 fn before_decision_abort_leaves_no_row_or_receipt() {
+    let _serial = serial();
     crash_case("decision", false, None);
 }
 #[test]
 fn killed_admitted_owner_is_absent_after_restart_and_retry_executes() {
+    let _serial = serial();
     let (dir, admin, engine) = fixture();
     let original = request(&admin);
     drop(engine);
