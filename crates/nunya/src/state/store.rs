@@ -77,12 +77,15 @@ pub enum StoreError {
     Io,
 }
 
+/// Ordered opaque key/value rows returned by a prefix scan.
+pub type ScanRows = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Snapshot reads of opaque state records.
 pub trait ReadTxn {
     /// Read a single record by exact key.
     fn get(&self, t: Table, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError>;
     /// Read matching records in ascending byte-key order.
-    fn scan_prefix(&self, t: Table, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError>;
+    fn scan_prefix(&self, t: Table, prefix: &[u8]) -> Result<ScanRows, StoreError>;
 }
 /// Atomic mutations, aborted when dropped without committing.
 pub trait WriteTxn: ReadTxn {
@@ -255,7 +258,7 @@ struct RedbWrite<'a> {
 fn scan(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     prefix: &[u8],
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+) -> Result<ScanRows, StoreError> {
     let mut rows = Vec::new();
     for row in table.range(prefix..).map_err(|_| StoreError::Io)? {
         let (key, value) = row.map_err(|_| StoreError::Io)?;
@@ -277,7 +280,7 @@ impl ReadTxn for RedbRead {
             .map_err(|_| StoreError::Io)?
             .map(|value| value.value().to_vec()))
     }
-    fn scan_prefix(&self, t: Table, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+    fn scan_prefix(&self, t: Table, prefix: &[u8]) -> Result<ScanRows, StoreError> {
         scan(
             &self
                 .0
@@ -298,7 +301,7 @@ impl ReadTxn for RedbWrite<'_> {
             .map_err(|_| StoreError::Io)?
             .map(|value| value.value().to_vec()))
     }
-    fn scan_prefix(&self, t: Table, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+    fn scan_prefix(&self, t: Table, prefix: &[u8]) -> Result<ScanRows, StoreError> {
         scan(
             &self
                 .txn

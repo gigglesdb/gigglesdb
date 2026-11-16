@@ -13,6 +13,11 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
+mod config_sync;
+mod counters;
+pub use config_sync::{ConfigPrincipal, ConfigSync};
+pub use counters::{TokenizeError, TokenizeLimits};
+
 /// Service-wide upper bounds for session lifetimes.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionLimits {
@@ -176,17 +181,28 @@ fn hash<T: serde::Serialize>(value: &T) -> [u8; 32] {
     Sha256::digest(encode(value)).into()
 }
 fn end(view: &mut View, id: SessionId, reason: EndReason, now: u64) {
-    if let Some(s) = view.sessions.get_mut(&id) {
-        if s.state == SessionState::Active {
-            s.state = if matches!(reason, EndReason::Expired | EndReason::IdleTimeout) {
-                SessionState::Expired
-            } else {
-                SessionState::Revoked
-            };
-            s.revoke_reason = Some(reason);
-            s.ended_ms = Some(now);
-            view.pending.insert(id);
-        }
+    if let Some(s) = view.sessions.get_mut(&id)
+        && s.state == SessionState::Active
+    {
+        s.state = if matches!(reason, EndReason::Expired | EndReason::IdleTimeout) {
+            SessionState::Expired
+        } else {
+            SessionState::Revoked
+        };
+        s.revoke_reason = Some(reason);
+        s.ended_ms = Some(now);
+        view.pending.insert(id);
+    }
+}
+fn end_principal(view: &mut View, id: PrincipalId, reason: EndReason, now: u64) {
+    let ids: Vec<_> = view
+        .sessions
+        .values()
+        .filter(|s| s.principal == id)
+        .map(|s| s.id)
+        .collect();
+    for sid in ids {
+        end(view, sid, reason, now);
     }
 }
 impl Authority {
@@ -268,7 +284,11 @@ impl Authority {
                             v.idempotency.insert((r.principal, r.key.clone()), r);
                         }
                         Table::SessionCounters | Table::PrincipalCounters => {
-                            decode_count(&bytes).map_err(|_| bad())?;
+                            if table == Table::PrincipalCounters {
+                                counters::decode_principal_count(&bytes).map_err(|_| bad())?;
+                            } else {
+                                decode_count(&bytes).map_err(|_| bad())?;
+                            }
                             let suffix = if table == Table::PrincipalCounters {
                                 8
                             } else {
@@ -410,20 +430,12 @@ impl Authority {
             let mut v = self.view.write().unwrap();
             if !enabled {
                 v.principals.insert(id, p.clone());
-                let ids: Vec<_> = v
-                    .sessions
-                    .values()
-                    .filter(|s| s.principal == id)
-                    .map(|s| s.id)
-                    .collect();
-                for sid in ids {
-                    end(
-                        &mut v,
-                        sid,
-                        EndReason::PrincipalDisabled,
-                        self.store.now_ms(),
-                    );
-                }
+                end_principal(
+                    &mut v,
+                    id,
+                    EndReason::PrincipalDisabled,
+                    self.store.now_ms(),
+                );
             }
             v.pending
                 .iter()
@@ -435,6 +447,11 @@ impl Authority {
         let mut tx = self.store.write()?;
         tx.put(Table::Principals, &keys::principal(id), &encode(&p))?;
         for s in &rows {
+            let _: AccessSession = decode(
+                &tx.get(Table::Sessions, &keys::session(s.id))?
+                    .ok_or(AuthorityError::Store)?,
+            )
+            .map_err(|_| AuthorityError::Store)?;
             tx.put(Table::Sessions, &keys::session(s.id), &encode(s))?;
         }
         tx.commit()?;
@@ -734,51 +751,64 @@ impl Authority {
         mode: Option<Mode>,
         add_credential: Option<(Verifier, [u8; 32])>,
     ) -> Result<AccessSession, AuthorityError> {
-        let _writer = self.writer.lock().unwrap();
-        let mut s = self.owned_session(principal, id)?;
-        self.admit(id, Operation::Read)
-            .map_err(|_| AuthorityError::SessionEnded)?;
-        let grant = self.grant(principal, &s.route)?;
-        if let Some(mode) = mode {
-            if mode.min(grant) != mode {
-                return Err(AuthorityError::ModeExceedsGrant);
+        let writer = self.writer.lock().unwrap();
+        let result = (|| {
+            let mut s = self.owned_session(principal, id)?;
+            self.admit(id, Operation::Read)
+                .map_err(|_| AuthorityError::SessionEnded)?;
+            let grant = self.grant(principal, &s.route)?;
+            if let Some(mode) = mode {
+                if mode.min(grant) != mode {
+                    return Err(AuthorityError::ModeExceedsGrant);
+                }
+                s.mode = mode;
             }
-            s.mode = mode;
-        }
-        s.last_used_ms = self.store.now_ms().max(s.last_used_ms);
-        let credential = add_credential.map(|(verifier, secret_hash)| SessionCredential {
-            id: CredentialId::random(),
-            session: id,
-            verifier,
-            secret_hash,
-            expires_ms: s.expires_ms,
-            state: CredentialState::Active,
-        });
-        let persisted_last_used = s.last_used_ms;
-        let mut tx = self.store.write()?;
-        tx.put(Table::Sessions, &keys::session(id), &encode(&s))?;
-        if let Some(c) = &credential {
-            tx.put(
-                Table::SessionCredentials,
-                &keys::session_credential(id, c.id),
-                &encode(c),
-            )?;
-        }
-        tx.commit()?;
-        let mut v = self.view.write().unwrap();
-        // Admission can end the session or advance last_used during I/O. Never resurrect it.
-        let current = v.sessions.get_mut(&id).ok_or(AuthorityError::NotFound)?;
-        if current.state != SessionState::Active {
-            return Err(AuthorityError::SessionEnded);
-        }
-        current.mode = s.mode;
-        current.last_used_ms = current.last_used_ms.max(s.last_used_ms);
-        s = current.clone();
-        v.flushed.insert(id, persisted_last_used);
-        if let Some(c) = credential {
-            v.session_credentials.insert(c.id, c);
-        }
-        Ok(s)
+            s.last_used_ms = self.store.now_ms().max(s.last_used_ms);
+            let credential = add_credential.map(|(verifier, secret_hash)| SessionCredential {
+                id: CredentialId::random(),
+                session: id,
+                verifier,
+                secret_hash,
+                expires_ms: s.expires_ms,
+                state: CredentialState::Active,
+            });
+            let persisted_last_used = s.last_used_ms;
+            let mut tx = self.store.write()?;
+            let stored: AccessSession = tx
+                .get(Table::Sessions, &keys::session(id))?
+                .ok_or(AuthorityError::SessionEnded)
+                .and_then(|b| decode(&b).map_err(|_| AuthorityError::Store))?;
+            if stored.state != SessionState::Active || self.store.now_ms() >= stored.expires_ms {
+                return Err(AuthorityError::SessionEnded);
+            }
+            tx.put(Table::Sessions, &keys::session(id), &encode(&s))?;
+            if let Some(c) = &credential {
+                tx.put(
+                    Table::SessionCredentials,
+                    &keys::session_credential(id, c.id),
+                    &encode(c),
+                )?;
+            }
+            tx.commit()?;
+            let mut v = self.view.write().unwrap();
+            // Admission can end the session or advance last_used during I/O. Never resurrect it.
+            let current = v.sessions.get_mut(&id).ok_or(AuthorityError::NotFound)?;
+            if current.state != SessionState::Active {
+                return Err(AuthorityError::SessionEnded);
+            }
+            current.mode = s.mode;
+            current.last_used_ms = current.last_used_ms.max(s.last_used_ms);
+            s = current.clone();
+            v.flushed.insert(id, persisted_last_used);
+            if let Some(c) = credential {
+                v.session_credentials.insert(c.id, c);
+            }
+            Ok(s)
+        })();
+        let rows = self.persist_pending()?;
+        drop(writer);
+        self.notify(&rows);
+        result
     }
     /// Deny first, persist second, and notify only after a successful commit.
     pub fn revoke(&self, id: SessionId, reason: EndReason) -> Result<(), AuthorityError> {
@@ -805,6 +835,11 @@ impl Authority {
         }
         let mut tx = self.store.write()?;
         for s in rows {
+            let _: AccessSession = decode(
+                &tx.get(Table::Sessions, &keys::session(s.id))?
+                    .ok_or(AuthorityError::Store)?,
+            )
+            .map_err(|_| AuthorityError::Store)?;
             tx.put(Table::Sessions, &keys::session(s.id), &encode(s))?;
         }
         tx.commit()?;
@@ -814,6 +849,23 @@ impl Authority {
             v.flushed.insert(s.id, s.last_used_ms);
         }
         Ok(())
+    }
+    fn persist_pending(&self) -> Result<Vec<AccessSession>, AuthorityError> {
+        let mut persisted = Vec::new();
+        loop {
+            let rows: Vec<_> = {
+                let v = self.view.read().unwrap();
+                v.pending
+                    .iter()
+                    .filter_map(|id| v.sessions.get(id).cloned())
+                    .collect()
+            };
+            if rows.is_empty() {
+                return Ok(persisted);
+            }
+            self.persist_ended(&rows)?;
+            persisted.extend(rows);
+        }
     }
     /// Admit using only memory and the injected clock, queuing expiry persistence.
     pub fn admit(&self, id: SessionId, op: Operation) -> Result<Admitted, AdmitError> {
@@ -896,10 +948,8 @@ impl Authority {
             stored.update(&c.secret_hash);
             matched |= stored.verify_slice(&tag).is_ok();
         }
-        if !matched {
-            if let (Some(last), Some(s)) = (previous, v.sessions.get_mut(&id)) {
-                s.last_used_ms = last;
-            }
+        if !matched && let (Some(last), Some(s)) = (previous, v.sessions.get_mut(&id)) {
+            s.last_used_ms = last;
         }
         matched
     }
@@ -949,7 +999,7 @@ impl Authority {
     }
     /// Persist activity timestamps after at least one minute of movement.
     pub fn flush_last_used(&self) -> Result<(), AuthorityError> {
-        let _writer = self.writer.lock().unwrap();
+        let writer = self.writer.lock().unwrap();
         let rows = {
             let v = self.view.read().unwrap();
             v.sessions
@@ -963,18 +1013,27 @@ impl Authority {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        if rows.is_empty() {
-            return Ok(());
+        if !rows.is_empty() {
+            let mut tx = self.store.write()?;
+            for s in &rows {
+                let stored: AccessSession = decode(
+                    &tx.get(Table::Sessions, &keys::session(s.id))?
+                        .ok_or(AuthorityError::Store)?,
+                )
+                .map_err(|_| AuthorityError::Store)?;
+                if stored.state == SessionState::Active && self.store.now_ms() < stored.expires_ms {
+                    tx.put(Table::Sessions, &keys::session(s.id), &encode(s))?;
+                }
+            }
+            tx.commit()?;
+            let mut v = self.view.write().unwrap();
+            for s in rows {
+                v.flushed.insert(s.id, s.last_used_ms);
+            }
         }
-        let mut tx = self.store.write()?;
-        for s in &rows {
-            tx.put(Table::Sessions, &keys::session(s.id), &encode(s))?;
-        }
-        tx.commit()?;
-        let mut v = self.view.write().unwrap();
-        for s in rows {
-            v.flushed.insert(s.id, s.last_used_ms);
-        }
+        let ended = self.persist_pending()?;
+        drop(writer);
+        self.notify(&ended);
         Ok(())
     }
     /// Delete retained tombstones, their credentials and session counters.
@@ -1027,7 +1086,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    struct TestDir(PathBuf);
+    pub(super) struct TestDir(pub(super) PathBuf);
     impl TestDir {
         fn new() -> Self {
             let path = PathBuf::from(std::env::var_os("TEMP").unwrap())
@@ -1042,33 +1101,33 @@ mod tests {
         }
     }
     #[derive(Default)]
-    struct Hook(Mutex<Vec<(SessionId, PrincipalId, EndReason)>>);
+    pub(super) struct Hook(pub(super) Mutex<Vec<(SessionId, PrincipalId, EndReason)>>);
     impl RevocationHook for Hook {
         fn session_ended(&self, s: SessionId, p: PrincipalId, r: EndReason) {
             self.0.lock().unwrap().push((s, p, r));
         }
     }
-    struct Fixture {
-        a: Arc<Authority>,
-        store: Arc<RedbStore>,
-        clock: Arc<AtomicU64>,
-        hook: Arc<Hook>,
-        dir: TestDir,
+    pub(super) struct Fixture {
+        pub(super) a: Arc<Authority>,
+        pub(super) store: Arc<RedbStore>,
+        pub(super) clock: Arc<AtomicU64>,
+        pub(super) hook: Arc<Hook>,
+        pub(super) dir: TestDir,
     }
-    fn root() -> RootKey {
+    pub(super) fn root() -> RootKey {
         RootKey::from_hex(&"01".repeat(32)).unwrap()
     }
-    fn verifier() -> Verifier {
+    pub(super) fn verifier() -> Verifier {
         Verifier(ScramVerifier::from_password(
             "test-only-password",
             b"test-only-salt",
             1,
         ))
     }
-    fn route() -> RouteId {
+    pub(super) fn route() -> RouteId {
         RouteId::new("postgres").unwrap()
     }
-    fn request(key: &str) -> AcquireRequest {
+    pub(super) fn request(key: &str) -> AcquireRequest {
         AcquireRequest {
             route: route(),
             mode: None,
@@ -1081,10 +1140,10 @@ mod tests {
         }
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self::limits(SessionLimits::default())
         }
-        fn limits(limits: SessionLimits) -> Self {
+        pub(super) fn limits(limits: SessionLimits) -> Self {
             let dir = TestDir::new();
             let clock = Arc::new(AtomicU64::new(1000));
             let c = clock.clone();
@@ -1103,7 +1162,7 @@ mod tests {
                 dir,
             }
         }
-        fn principal(&self, name: &str, mode: Mode) -> Principal {
+        pub(super) fn principal(&self, name: &str, mode: Mode) -> Principal {
             let p = self
                 .a
                 .create_principal(name, PrincipalKind::Agent, false, name)
@@ -1111,10 +1170,10 @@ mod tests {
             self.a.set_grants(p.id, vec![(route(), mode)]).unwrap();
             p
         }
-        fn acquire(&self, p: PrincipalId, key: &str) -> AccessSession {
+        pub(super) fn acquire(&self, p: PrincipalId, key: &str) -> AccessSession {
             self.a.acquire_session(p, request(key)).unwrap()
         }
-        fn rows(&self) -> usize {
+        pub(super) fn rows(&self) -> usize {
             self.store
                 .read()
                 .unwrap()
@@ -1122,7 +1181,7 @@ mod tests {
                 .unwrap()
                 .len()
         }
-        fn stored(&self, id: SessionId) -> AccessSession {
+        pub(super) fn stored(&self, id: SessionId) -> AccessSession {
             decode(
                 &self
                     .store
