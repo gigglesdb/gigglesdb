@@ -120,6 +120,7 @@ fn sql_survives_leader_stop() {
     let configs: Vec<_> = (0..3)
         .map(|i| ReplicationConfig {
             node_id: i as u64 + 1,
+            join: false,
             cluster: "12".repeat(16),
             listen: addresses[i],
             log_dir: cluster.dir.join(format!("log-{i}")),

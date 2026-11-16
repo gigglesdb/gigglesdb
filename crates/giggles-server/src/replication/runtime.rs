@@ -32,49 +32,54 @@ pub struct Replicated {
     node: Node,
 }
 
+/// Build the authenticated peer transport shared by the server and operator CLI.
+pub fn transport_config(v: &Validated) -> Result<TransportConfig, String> {
+    let cert =
+        std::fs::File::open(&v.certificate).map_err(|e| format!("replication.certificate: {e}"))?;
+    let cert = rustls_pemfile::certs(&mut std::io::BufReader::new(cert))
+        .next()
+        .transpose()
+        .map_err(|e| format!("replication.certificate: {e}"))?
+        .ok_or("replication.certificate: no certificates")?;
+    let mut peers: std::collections::BTreeMap<_, _> = v
+        .peers
+        .iter()
+        .map(|(id, address, fingerprint)| {
+            (
+                *id,
+                PeerConfig {
+                    address: address.to_string(),
+                    fingerprint: fingerprint.clone(),
+                },
+            )
+        })
+        .collect();
+    peers.insert(
+        v.node_id,
+        PeerConfig {
+            address: v.listen.to_string(),
+            fingerprint: fingerprint(&cert),
+        },
+    );
+    Ok(TransportConfig {
+        node_id: v.node_id,
+        cluster: v.cluster,
+        listen: v.listen.to_string(),
+        certificate: v.certificate.clone(),
+        key: v.private_key.clone(),
+        ca: v.ca.clone(),
+        peers,
+    })
+}
+
 impl Replicated {
     pub fn start(v: &Validated, database: &Path) -> Result<Self, String> {
-        let cert = std::fs::File::open(&v.certificate)
-            .map_err(|e| format!("replication.certificate: {e}"))?;
-        let cert = rustls_pemfile::certs(&mut std::io::BufReader::new(cert))
-            .next()
-            .transpose()
-            .map_err(|e| format!("replication.certificate: {e}"))?
-            .ok_or("replication.certificate: no certificates")?;
-        let mut peers: std::collections::BTreeMap<_, _> = v
-            .peers
-            .iter()
-            .map(|(id, address, fingerprint)| {
-                (
-                    *id,
-                    PeerConfig {
-                        address: address.to_string(),
-                        fingerprint: fingerprint.clone(),
-                    },
-                )
-            })
-            .collect();
-        peers.insert(
-            v.node_id,
-            PeerConfig {
-                address: v.listen.to_string(),
-                fingerprint: fingerprint(&cert),
-            },
-        );
         let node = Node::start(NodeConfig {
-            transport: TransportConfig {
-                node_id: v.node_id,
-                cluster: v.cluster,
-                listen: v.listen.to_string(),
-                certificate: v.certificate.clone(),
-                key: v.private_key.clone(),
-                ca: v.ca.clone(),
-                peers,
-            },
+            transport: transport_config(v)?,
             data_dir: database.into(),
             log_dir: v.log_dir.clone(),
             snap_dir: v.snapshot_dir.clone(),
-            voters: v.voters.clone(),
+            voters: if v.join { vec![] } else { v.voters.clone() },
             tick: v.tick,
             policy: SnapshotPolicy::default(),
             limits: giggles_core::Limits::default(),

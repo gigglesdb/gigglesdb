@@ -51,6 +51,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{}", giggles_server::dev::USAGE);
         std::process::exit(2);
     };
+    if path == "replica" {
+        std::process::exit(replica_command(args).await);
+    }
     if path == "--dev" {
         let options = giggles_server::dev::Options::parse(args).unwrap_or_else(|usage| {
             eprintln!("{usage}");
@@ -160,6 +163,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     stop_all(listeners, &api).await?;
     Ok(())
+}
+
+#[cfg(not(feature = "engine-rocksdb"))]
+async fn replica_command(_args: impl Iterator<Item = String>) -> i32 {
+    eprintln!("replication requires the engine-rocksdb feature");
+    2
+}
+
+#[cfg(feature = "engine-rocksdb")]
+async fn replica_command(args: impl Iterator<Item = String>) -> i32 {
+    use giggles_server::replication::{cli, runtime::transport_config};
+    use std::{path::Path, time::Duration};
+    let command = match cli::Command::parse(args) {
+        Ok(command) => command,
+        Err(usage) => {
+            eprintln!("{usage}");
+            return 2;
+        }
+    };
+    let setup = || -> Result<_, Box<dyn std::error::Error>> {
+        let c: Config = serde_json::from_slice(&bounded_file(&command.config)?)?;
+        let v = c
+            .replication
+            .as_ref()
+            .ok_or("replication section is required")?
+            .validate(
+                Path::new(&c.database),
+                Path::new(&c.certificate),
+                Path::new(&c.private_key),
+                Path::new(&c.client_ca),
+            )?;
+        Ok((transport_config(&v)?, v.node_id))
+    };
+    let (transport, node_id) = match setup() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}\n{}", cli::USAGE);
+            return 2;
+        }
+    };
+    // admin::call owns a synchronous Tokio runtime.
+    match tokio::task::spawn_blocking(move || {
+        giggles_replication::admin::call(
+            &transport,
+            node_id,
+            &command.request,
+            command.timeout + Duration::from_secs(30),
+        )
+    })
+    .await
+    {
+        Ok(Ok(response)) => {
+            let (code, text) = cli::output(response);
+            if code == 0 {
+                println!("{text}");
+            } else {
+                eprintln!("{text}");
+            }
+            code
+        }
+        Ok(Err(error)) => {
+            eprintln!("transport error: {error}");
+            4
+        }
+        Err(error) => {
+            eprintln!("transport error: {error}");
+            4
+        }
+    }
 }
 
 #[cfg(feature = "engine-rocksdb")]

@@ -17,6 +17,9 @@ pub struct PeerConfig {
 #[serde(deny_unknown_fields)]
 pub struct ReplicationConfig {
     pub node_id: u64,
+    /// New machine replacing a lost voter; list the two surviving voters as peers.
+    #[serde(default)]
+    pub join: bool,
     pub cluster: String,
     pub listen: SocketAddr,
     pub log_dir: PathBuf,
@@ -38,6 +41,7 @@ fn default_tick_ms() -> u64 {
 #[derive(Debug)]
 pub struct Validated {
     pub node_id: u64,
+    pub join: bool,
     pub cluster: [u8; 16],
     pub voters: Vec<u64>,
     pub listen: SocketAddr,
@@ -142,6 +146,7 @@ impl ReplicationConfig {
         voters.sort_unstable();
         Ok(Validated {
             node_id: self.node_id,
+            join: self.join,
             cluster,
             voters,
             listen: self.listen,
@@ -171,6 +176,7 @@ mod tests {
     fn config() -> ReplicationConfig {
         ReplicationConfig {
             node_id: 3,
+            join: false,
             cluster: "0123456789abcdef0123456789abcdef".into(),
             listen: "[::1]:9003".parse().unwrap(),
             log_dir: "replication-log".into(),
@@ -390,6 +396,25 @@ mod tests {
         let c: ReplicationConfig = serde_json::from_value(value.clone()).unwrap();
 
         assert_eq!(c.tick_ms, 100);
+        value.as_object_mut().unwrap().remove("join");
+        assert!(
+            !serde_json::from_value::<ReplicationConfig>(value.clone())
+                .unwrap()
+                .join
+        );
+        value["join"] = true.into();
+        let joining: ReplicationConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            joining
+                .validate(
+                    Path::new("db"),
+                    Path::new("cert"),
+                    Path::new("key"),
+                    Path::new("ca")
+                )
+                .unwrap()
+                .join
+        );
         value["surprise"] = true.into();
         assert!(serde_json::from_value::<ReplicationConfig>(value).is_err());
         let mut value = serde_json::to_value(config()).unwrap();
