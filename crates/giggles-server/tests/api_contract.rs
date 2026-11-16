@@ -55,6 +55,9 @@ fn descriptor_publishes_only_the_three_v1_methods() {
             ("text", 12),
             ("typed_read", 13),
             ("search_path", 14),
+            ("savepoint", 15),
+            ("rollback_to", 16),
+            ("release", 17),
             ("budget_ms", 20)
         ]
     );
@@ -65,6 +68,7 @@ fn descriptor_publishes_only_the_three_v1_methods() {
         .unwrap();
     assert_eq!(budget.proto3_optional, Some(true));
     for (message, fields) in [
+        ("NativeSavepointRequest", vec!["name"]),
         ("TaskRequest", vec!["operation"]),
         ("RepairSqlRequest", vec!["operation", "approval"]),
         ("StatusRequest", vec!["operation"]),

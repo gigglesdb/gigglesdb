@@ -472,3 +472,23 @@ empty paths display `""`. Keyword quoting currently differs from PostgreSQL:
 Native operations, native text 0.18, and SQL reads share the retained path.
 SQL API `SET search_path` currently returns `0A000` (unsupported). Session path changes commit with a successful transaction and restore the prior path
 on rollback. COMMIT in an aborted transaction remains refused with `25P02`; the retained path is restored when ROLLBACK ends the block.
+
+### Native savepoints
+
+Execute accepts `{"savepoint":{"name":"a"}}`, `{"rollbackTo":{"name":"a"}}`,
+and `{"release":{"name":"a"}}` (gRPC fields 15-17, `NativeSavepointRequest`).
+Names are required, nonempty, case-sensitive strings without NUL; unknown JSON
+fields are rejected. Invalid shapes return HTTP 400 / gRPC INVALID_ARGUMENT.
+Long names reach core and truncate at the 63-byte UTF-8 boundary. Duplicate
+names resolve to the latest savepoint. These controls use the existing native
+transaction control replies, binding checks, and role gates.
+
+Outside a transaction they return SQLSTATE 25P01; unknown names return 3B001.
+An aborted transaction rejects savepoint/release with 25P02. `rollbackTo` can
+recover it; an aborted commit remains 25P02 until recovery or full rollback.
+Native savepoints capture the retained API search path. Rollback restores the
+latest matching capture, discards later captures, and retains its target;
+release discards its target and later captures while keeping the current path.
+Transaction end clears captures. SQL savepoint controls do not maintain this
+API path stack; mixing SQL and native savepoints can therefore differ in path
+restoration.

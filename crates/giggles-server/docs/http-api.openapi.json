@@ -1719,7 +1719,10 @@
             "$ref": "#/components/schemas/NativeTextRequest"
           },
           "typedRead": {"$ref": "#/components/schemas/NativeTypedRead"},
-          "searchPath": {"$ref": "#/components/schemas/NativeSearchPathRequest"}
+          "searchPath": {"$ref": "#/components/schemas/NativeSearchPathRequest"},
+          "savepoint": {"$ref": "#/components/schemas/NativeSavepointRequest"},
+          "rollbackTo": {"$ref": "#/components/schemas/NativeSavepointRequest"},
+          "release": {"$ref": "#/components/schemas/NativeSavepointRequest"}
         },
         "additionalProperties": false,
         "oneOf": [
@@ -1782,7 +1785,10 @@
             "required": ["text"]
           },
           {"required": ["typedRead"]},
-          {"required": ["searchPath"]}
+          {"required": ["searchPath"]},
+          {"required": ["savepoint"]},
+          {"required": ["rollbackTo"]},
+          {"required": ["release"]}
         ],
         "description": "Exactly one request alternative. Duplicate keys, aliases, unknown fields, JSON null, trailing documents and nesting deeper than 128 are rejected by the parser. Raw UTF-8 body limit is 262144 bytes including whitespace. Native request trees are typed directly into the core operation engine; SQL is a separate optional arm. Semantic core failures use nativeError in a successful HTTP 200 reply."
       },
@@ -1952,6 +1958,10 @@
           "request"
         ],
         "x-max-binding-value-bytes": 65536
+      },
+      "NativeSavepointRequest": {
+        "type": "object", "additionalProperties": false, "required": ["name"],
+        "properties": {"name": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$"}}
       },
       "NativeSearchPathRequest": {
         "type": "object", "additionalProperties": false,

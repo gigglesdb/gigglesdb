@@ -127,7 +127,8 @@ pub(crate) fn run(
                     }
                 }
             }
-            Invocation::SearchPath(_) | Invocation::Begin | Invocation::Commit | Invocation::Rollback => {}
+            Invocation::SearchPath(_) | Invocation::Begin | Invocation::Commit | Invocation::Rollback
+            | Invocation::Savepoint(_) | Invocation::RollbackTo(_) | Invocation::Release(_) => {}
             Invocation::Legacy(_) | Invocation::Text { .. } => return Err(CoreError::Unsupported),
         }
         let reserved = reqs.iter().any(|(table, _)| table == "giggles_join");
@@ -148,7 +149,7 @@ pub(crate) fn run(
                 return Err(CoreError::Policy(Error::Authentication));
             }
         }
-        if session.is_aborted() && !matches!(invocation, Invocation::Rollback) {
+        if session.is_aborted() && !matches!(invocation, Invocation::Rollback | Invocation::RollbackTo(_)) {
             return Err(CoreError::Sql(SqlError::Aborted));
         }
         let result = match invocation {
@@ -180,6 +181,9 @@ pub(crate) fn run(
                 .sql
                 .execute_native_transaction(&transaction, &bindings)
                 .map(NativeResult::Transaction),
+            Invocation::Savepoint(name) => { session.sql.savepoint(&name)?; return Ok(NativeResult::Control); }
+            Invocation::RollbackTo(name) => { session.sql.rollback_to(&name)?; return Ok(NativeResult::Control); }
+            Invocation::Release(name) => { session.sql.release(&name)?; return Ok(NativeResult::Control); }
             Invocation::Begin => {
                 session.sql.begin_native()?;
                 return Ok(NativeResult::Control);

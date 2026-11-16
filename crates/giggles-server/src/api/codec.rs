@@ -25,6 +25,9 @@ pub enum Invocation {
     Begin,
     Commit,
     Rollback,
+    Savepoint(String),
+    RollbackTo(String),
+    Release(String),
     Read(Box<giggles_core::relational::SingleSourceRead>),
     Join(Box<giggles_core::relational::TwoSourceRead>),
 }
@@ -121,6 +124,9 @@ pub fn decode_execute(input: proto::ExecuteRequest) -> Result<DecodedExecute, Ap
                 budget_ms,
             });
         }
+        P::Savepoint(v) => return Ok(DecodedExecute { request: Invocation::Savepoint(v.name.ok_or(ApiError::InvalidArgument)?), budget_ms }),
+        P::RollbackTo(v) => return Ok(DecodedExecute { request: Invocation::RollbackTo(v.name.ok_or(ApiError::InvalidArgument)?), budget_ms }),
+        P::Release(v) => return Ok(DecodedExecute { request: Invocation::Release(v.name.ok_or(ApiError::InvalidArgument)?), budget_ms }),
         P::Begin(_) => {
             return Ok(DecodedExecute {
                 request: Invocation::Begin,

@@ -260,6 +260,13 @@ impl Decoder {
         self.depth -= 1;
         Ok(p::NativeReadExpr { expression })
     }
+    pub(super) fn savepoint(&mut self, v: Json) -> R<p::NativeSavepointRequest> {
+        let mut f = Object::new(v)?;
+        let name = text(f.required("name")?)?;
+        if name.is_empty() || name.contains('\0') { return Err(ApiError::InvalidArgument); }
+        f.finish()?;
+        Ok(p::NativeSavepointRequest { name: Some(name) })
+    }
     pub(super) fn begin_request(&mut self, v: Json) -> R<p::BeginRequest> {
         empty(v)?;
         Ok(p::BeginRequest {})

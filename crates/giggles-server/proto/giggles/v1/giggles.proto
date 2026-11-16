@@ -33,6 +33,9 @@ message ExecuteRequest {
     NativeTextRequest text = 12;
     NativeTypedRead typed_read = 13;
     NativeSearchPathRequest search_path = 14;
+    NativeSavepointRequest savepoint = 15;
+    NativeSavepointRequest rollback_to = 16;
+    NativeSavepointRequest release = 17;
   }
   optional uint32 budget_ms = 20;
 }
@@ -43,6 +46,8 @@ message NativeTextRequest {
 }
 
 // Exact identifiers; expressions are typed trees, never SQL fragments.
+message NativeSavepointRequest { optional string name = 1; }
+
 message NativeSearchPathRequest {
   optional bool set = 1;
   repeated string schemas = 2;

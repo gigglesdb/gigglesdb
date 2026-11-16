@@ -368,6 +368,7 @@ pub(crate) enum Surface {
 pub(crate) struct ApiPathState {
     pub(crate) transaction_start: Option<String>,
     pub(crate) sql_committed: bool,
+    pub(crate) savepoints: Vec<(String, String)>,
 }
 pub struct Session {
     pub(crate) surface: Surface,

@@ -214,6 +214,10 @@ fn intent_shape(i: &p::NativeIntent) -> R<()> {
 }
 pub(crate) fn validate(input: &p::ExecuteRequest) -> R<()> {
     match input.request.as_ref() {
+        Some(p::execute_request::Request::Savepoint(v) | p::execute_request::Request::RollbackTo(v) | p::execute_request::Request::Release(v)) => {
+            let name = need(v.name.as_ref())?;
+            if name.is_empty() || name.contains('\0') { return Err(ApiError::InvalidArgument); }
+        }
         Some(p::execute_request::Request::SearchPath(v)) => {
             cap(v.schemas.len(), 64)?;
             if (!v.schemas.is_empty() && v.set != Some(true))

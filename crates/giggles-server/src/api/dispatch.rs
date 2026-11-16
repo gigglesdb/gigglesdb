@@ -361,6 +361,12 @@ fn execute_reply(
     let was_aborted = session.is_aborted();
     let prior_path = session.search_path.clone();
     let native_commit = matches!(&request, Invocation::Commit);
+    let path_control = match &request {
+        Invocation::Savepoint(n) => Some((0, n.clone())),
+        Invocation::RollbackTo(n) => Some((1, n.clone())),
+        Invocation::Release(n) => Some((2, n.clone())),
+        _ => None,
+    };
     session.api_path.sql_committed = false;
     let executed = match request {
         Invocation::Legacy(request) => Executed::Legacy(session.handle_received(request, received)),
@@ -374,9 +380,25 @@ fn execute_reply(
             Executed::Native(outcome)
         }
     };
+    if matches!(&executed, Executed::Native(Ok(native::NativeResult::Control)))
+        && let Some((kind, mut name)) = path_control {
+        let mut end = name.len().min(63);
+        while !name.is_char_boundary(end) { end -= 1; }
+        name.truncate(end);
+        if kind == 0 {
+            session.api_path.savepoints.push((name, prior_path.clone()));
+        } else if let Some(i) = session.api_path.savepoints.iter().rposition(|(n, _)| n == &name) {
+            if kind == 1 {
+                let path = session.api_path.savepoints[i].1.clone();
+                session.set_search_path(if path == "\"\"" { "" } else { &path });
+            }
+            session.api_path.savepoints.truncate(i + usize::from(kind == 1));
+        }
+    }
     if !was_transaction && session.sql.in_transaction() {
         session.api_path.transaction_start = Some(prior_path);
     } else if was_transaction && !session.sql.in_transaction() {
+        session.api_path.savepoints.clear();
         let committed = !was_aborted && match &executed {
             Executed::Native(Ok(native::NativeResult::Control)) => native_commit,
             Executed::Legacy(response) => response.code == "ok" && session.api_path.sql_committed,

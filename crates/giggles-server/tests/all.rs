@@ -204,3 +204,5 @@ mod privilege_functions_network;
 #[path = "fk_section_network.rs"]
 mod fk_section_network;
 #[path = "api_search_path.rs"] mod api_search_path;
+
+#[path = "api_savepoints.rs"] mod api_savepoints;

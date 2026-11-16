@@ -185,6 +185,9 @@ pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {
         "transaction" => P::Transaction(
             super::native_json::Decoder::default().native_transaction_request(value)?,
         ),
+        "savepoint" => P::Savepoint(super::native_json::Decoder::default().savepoint(value)?),
+        "rollbackTo" => P::RollbackTo(super::native_json::Decoder::default().savepoint(value)?),
+        "release" => P::Release(super::native_json::Decoder::default().savepoint(value)?),
         "begin" => P::Begin(super::native_json::Decoder::default().begin_request(value)?),
         "commit" => P::Commit(super::native_json::Decoder::default().commit_request(value)?),
         "rollback" => P::Rollback(super::native_json::Decoder::default().rollback_request(value)?),
