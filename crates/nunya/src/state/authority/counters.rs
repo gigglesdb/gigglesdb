@@ -79,17 +79,16 @@ impl Authority {
         let mut current = None;
         for (key, bytes) in &rows {
             let start = keys::principal_counter_window(key, &prefix).ok_or(TokenizeError::Store)?;
-            let (count, _) = decode_principal_count(bytes)?;
-            if start > now {
+            let (count, end) = decode_principal_count(bytes)?;
+            if end < start {
                 return Err(TokenizeError::Store);
             }
-            if start.saturating_add(limits.principal_window_ms) > now
-                && current.replace((start, count)).is_some()
-            {
+            if end > now && current.replace((start, count, end)).is_some() {
                 return Err(TokenizeError::Store);
             }
         }
-        let (start, principal_count) = current.unwrap_or((now, 0));
+        let (start, principal_count, end) =
+            current.unwrap_or((now, 0, now.saturating_add(limits.principal_window_ms)));
         if principal_count >= limits.per_principal {
             return Err(TokenizeError::LimitReached);
         }
@@ -99,11 +98,7 @@ impl Authority {
                 tx.delete(Table::PrincipalCounters, &key)?;
             }
         }
-        let value = [
-            encode_count(principal_count + 1),
-            encode_count(start.saturating_add(limits.principal_window_ms)),
-        ]
-        .concat();
+        let value = [encode_count(principal_count + 1), encode_count(end)].concat();
         tx.put(
             Table::SessionCounters,
             &session_key,
@@ -144,7 +139,7 @@ impl Authority {
             let start =
                 keys::principal_counter_window(&key, &prefix).ok_or(TokenizeError::Store)?;
             let (count, end) = decode_principal_count(&bytes)?;
-            if start > now || end < start {
+            if end < start {
                 return Err(TokenizeError::Store);
             }
             if end > now && current.replace((start, count)).is_some() {
@@ -271,8 +266,8 @@ mod tests {
         let p = f.principal("owner", Mode::ReadOnly);
         let s = f.acquire(p.id, "one");
         let limits = TokenizeLimits {
-            per_session: 1000,
-            per_principal: 1000,
+            per_session: 20,
+            per_principal: 20,
             ..limits()
         };
         let ok = AtomicUsize::new(0);
@@ -322,6 +317,95 @@ mod tests {
             Err(TokenizeError::Ended)
         );
     }
+    #[test]
+    fn clock_step_back_keeps_the_current_window() {
+        let f = Fixture::new();
+        let p = f.principal("owner", Mode::ReadOnly);
+        let s = f.acquire(p.id, "one");
+        let limits = TokenizeLimits {
+            principal_window_ms: 1000,
+            ..limits()
+        };
+        f.clock.store(5000, Ordering::SeqCst);
+        f.a.record_tokenization(s.id, &domain(), &limits).unwrap();
+        f.clock.store(4000, Ordering::SeqCst);
+        assert_eq!(
+            f.a.principal_tokenizations(p.id, &domain()).unwrap(),
+            Some((5000, 1))
+        );
+        f.a.record_tokenization(s.id, &domain(), &limits).unwrap();
+        assert_eq!(
+            f.a.principal_tokenizations(p.id, &domain()).unwrap(),
+            Some((5000, 2))
+        );
+        assert_principal_row(&f, p.id, 5000, 2, 6000);
+    }
+
+    fn assert_principal_row(f: &Fixture, principal: PrincipalId, start: u64, count: u64, end: u64) {
+        let prefix = keys::principal_counter_prefix(principal, &domain()).unwrap();
+        let rows = f
+            .store
+            .read()
+            .unwrap()
+            .scan_prefix(Table::PrincipalCounters, &prefix)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            keys::principal_counter_window(&rows[0].0, &prefix),
+            Some(start)
+        );
+        assert_eq!(decode_principal_count(&rows[0].1).unwrap(), (count, end));
+    }
+
+    #[test]
+    fn window_length_change_applies_from_the_next_window() {
+        let f = Fixture::new();
+        let p = f.principal("owner", Mode::ReadOnly);
+        let s = f.acquire(p.id, "one");
+        let original = TokenizeLimits {
+            principal_window_ms: 1000,
+            ..limits()
+        };
+        let changed = TokenizeLimits {
+            principal_window_ms: 100,
+            ..original
+        };
+        f.a.record_tokenization(s.id, &domain(), &original).unwrap();
+        assert_eq!(
+            f.a.principal_tokenizations(p.id, &domain()).unwrap(),
+            Some((1000, 1))
+        );
+        assert_principal_row(&f, p.id, 1000, 1, 2000);
+        for (now, count) in [(1500, 2), (1999, 3)] {
+            f.clock.store(now, Ordering::SeqCst);
+            assert_eq!(
+                f.a.principal_tokenizations(p.id, &domain()).unwrap(),
+                Some((1000, count - 1))
+            );
+            f.a.record_tokenization(s.id, &domain(), &changed).unwrap();
+            assert_eq!(
+                f.a.principal_tokenizations(p.id, &domain()).unwrap(),
+                Some((1000, count))
+            );
+            assert_principal_row(&f, p.id, 1000, count, 2000);
+        }
+        f.clock.store(2000, Ordering::SeqCst);
+        assert_eq!(f.a.principal_tokenizations(p.id, &domain()).unwrap(), None);
+        f.a.record_tokenization(s.id, &domain(), &changed).unwrap();
+        assert_eq!(
+            f.a.principal_tokenizations(p.id, &domain()).unwrap(),
+            Some((2000, 1))
+        );
+        assert_principal_row(&f, p.id, 2000, 1, 2100);
+        f.clock.store(2099, Ordering::SeqCst);
+        assert_eq!(
+            f.a.principal_tokenizations(p.id, &domain()).unwrap(),
+            Some((2000, 1))
+        );
+        f.clock.store(2100, Ordering::SeqCst);
+        assert_eq!(f.a.principal_tokenizations(p.id, &domain()).unwrap(), None);
+    }
+
     #[test]
     fn durable_window_survives_sessions_credentials_and_policy_limits() {
         let f = Fixture::new();

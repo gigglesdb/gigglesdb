@@ -54,6 +54,15 @@ impl RootKey {
         Self::from_hex(&value)
     }
 }
+/// Derive the domain-separated root-key continuity value.
+pub(crate) fn root_check(root: &RootKey) -> [u8; 32] {
+    let mut output = [0; 32];
+    Hkdf::<Sha256>::new(None, &root.0)
+        .expand(b"nunya/v1/root-check", &mut output)
+        .expect("fixed HKDF output length");
+    output
+}
+
 /// Derive a scope secret from its public random salt.
 pub fn derive_scope(root: &RootKey, scope_salt: &[u8; 32]) -> ScopeKeys {
     let mut secret = [0; 32];
@@ -107,6 +116,18 @@ pub fn random_salt() -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn root_check_fixed_vector() {
+        // python -I -c "import hmac,hashlib; ikm=bytes([1])*32; prk=hmac.new(bytes(32),ikm,hashlib.sha256).digest(); okm=hmac.new(prk,b'nunya/v1/root-check'+bytes([1]),hashlib.sha256).digest(); print(okm.hex()); print(list(okm))"
+        assert_eq!(
+            root_check(&RootKey([1; 32])),
+            [
+                39, 208, 210, 217, 40, 85, 33, 153, 93, 54, 55, 169, 34, 126, 132, 163, 8, 27, 155,
+                207, 81, 109, 26, 2, 221, 198, 219, 69, 194, 0, 24, 18,
+            ]
+        );
+    }
+
     #[test]
     fn scope_v2_vectors() {
         let vectors = [

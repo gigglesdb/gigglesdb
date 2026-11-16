@@ -1,17 +1,10 @@
 //! Durable state table layout and root-key continuity check.
-use crate::token::keys::{RootKey, derive_scope};
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
+use crate::token::keys::{self, RootKey};
 
 /// Supported on-disk metadata format.
 pub const FORMAT_VERSION: u32 = 1;
 /// Store filename within the service state directory.
 pub const STORE_FILE: &str = "nunya.redb";
-
-const ROOT_CHECK_SALT: [u8; 32] = [
-    176, 141, 55, 252, 226, 223, 254, 235, 49, 213, 109, 38, 82, 125, 39, 249, 40, 125, 39, 67,
-    237, 161, 36, 19, 21, 78, 158, 3, 45, 143, 31, 215,
-];
 
 /// Opaque record tables available to state transactions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,30 +64,21 @@ impl Table {
 
 /// Derive the domain-separated root-key continuity value for persistent state.
 pub fn root_check_value(root: &RootKey) -> [u8; 32] {
-    let k = derive_scope(root, &ROOT_CHECK_SALT);
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(&k.secret).expect("HMAC accepts a fixed 32-byte key");
-    mac.update(b"nunya/v2/store-root-check");
-    mac.finalize().into_bytes().into()
+    keys::root_check(root)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::Digest;
-
     #[test]
     fn root_check_fixed_vector() {
-        assert_eq!(
-            ROOT_CHECK_SALT,
-            <[u8; 32]>::from(Sha256::digest(b"nunya/v2/store-root-check-salt"))
-        );
         let root = RootKey::from_hex(&"01".repeat(32)).unwrap();
+        // python -I -c "import hmac,hashlib; ikm=bytes([1])*32; prk=hmac.new(bytes(32),ikm,hashlib.sha256).digest(); okm=hmac.new(prk,b'nunya/v1/root-check'+bytes([1]),hashlib.sha256).digest(); print(okm.hex()); print(list(okm))"
         assert_eq!(
             root_check_value(&root),
             [
-                88, 167, 155, 192, 151, 194, 129, 168, 3, 14, 17, 38, 84, 128, 1, 219, 154, 133,
-                108, 177, 23, 221, 238, 90, 244, 195, 212, 101, 62, 9, 3, 32,
+                39, 208, 210, 217, 40, 85, 33, 153, 93, 54, 55, 169, 34, 126, 132, 163, 8, 27, 155,
+                207, 81, 109, 26, 2, 221, 198, 219, 69, 194, 0, 24, 18,
             ]
         );
     }
