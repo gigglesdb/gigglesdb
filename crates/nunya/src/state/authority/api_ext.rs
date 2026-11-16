@@ -11,7 +11,42 @@ pub struct CredentialSummary {
     /// Optional expiration time.
     pub expires_ms: Option<u64>,
 }
+/// Renewal failure without credential data.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RenewError {
+    /// Existing authority refusal.
+    Authority(AuthorityError),
+    /// Rotation parameters differ from the active credential.
+    RotationSaltMismatch,
+}
+impl RenewError {
+    /// Extract an authority refusal, or none for a rotation parameter mismatch.
+    pub fn into_authority(self) -> Option<AuthorityError> {
+        match self {
+            Self::Authority(error) => Some(error),
+            Self::RotationSaltMismatch => None,
+        }
+    }
+}
+impl From<AuthorityError> for RenewError {
+    fn from(error: AuthorityError) -> Self {
+        Self::Authority(error)
+    }
+}
 impl Authority {
+    /// Salt and iterations of the first active, unexpired credential by identifier.
+    pub fn session_scram_params(&self, id: SessionId) -> Option<(Vec<u8>, u32)> {
+        let now = self.store.now_ms();
+        self.view
+            .read()
+            .unwrap()
+            .session_credentials
+            .values()
+            .filter(|c| c.session == id && c.state == CredentialState::Active && now < c.expires_ms)
+            .min_by_key(|c| c.id)
+            .map(|c| (c.verifier.0.salt.clone(), c.verifier.0.iterations))
+    }
+
     /// Return the authority clock timestamp.
     pub fn now_ms(&self) -> u64 {
         self.store.now_ms()
@@ -49,7 +84,10 @@ impl Authority {
     ) -> Result<(), AuthorityError> {
         let _writer = self.writer.lock().unwrap();
         let mut tx = self.store.write()?;
-        tx.delete(Table::Idempotency, &keys::idempotency(owner, namespaced_key))?;
+        tx.delete(
+            Table::Idempotency,
+            &keys::idempotency(owner, namespaced_key),
+        )?;
         tx.commit()?;
         self.view
             .write()
@@ -207,7 +245,7 @@ impl Authority {
         mode: Option<Mode>,
         add_credential: Option<(Verifier, [u8; 32])>,
         key: &str,
-    ) -> Result<AccessSession, AuthorityError> {
+    ) -> Result<AccessSession, RenewError> {
         let key = format!("\0renew:{key}");
         let (verifier, digest) = match &add_credential {
             Some((v, h)) => (Some(v), Some(h)),
@@ -218,8 +256,12 @@ impl Authority {
             return if s.state == SessionState::Active {
                 Ok(s)
             } else {
-                Err(AuthorityError::SessionEnded)
+                Err(AuthorityError::SessionEnded.into())
             };
+        }
+        let session = self.owned_session(principal, id)?;
+        if session.state != SessionState::Active || self.store.now_ms() >= session.expires_ms {
+            return Err(AuthorityError::SessionEnded.into());
         }
         let add_credential = add_credential.filter(|(_, digest)| {
             !self
@@ -234,6 +276,12 @@ impl Authority {
                         && c.secret_hash == *digest
                 })
         });
+        if let Some((verifier, _)) = &add_credential
+            && self.session_scram_params(id).as_ref()
+                != Some(&(verifier.0.salt.clone(), verifier.0.iterations))
+        {
+            return Err(RenewError::RotationSaltMismatch);
+        }
         let session = self.renew(principal, id, mode, add_credential)?;
         // Write after the mutation: state-setting replay is a no-op, including deduplicated credentials.
         self.record_session_retry(principal, key, request_hash, id)?;
@@ -442,6 +490,74 @@ mod tests {
         assert!(a.grants_of(p.id).is_empty());
     }
     #[test]
+    fn rotation_reuses_parameters_and_refuses_without_mutation() {
+        let f = Fixture::new();
+        let p = f.principal("rotation-owner", Mode::ReadWrite);
+        let session = f.acquire(p.id, "acquire");
+        let params = f.a.session_scram_params(session.id).unwrap();
+        for (salt, iterations) in [
+            (b"different".to_vec(), params.1),
+            (params.0.clone(), params.1 + 1),
+        ] {
+            let mut v = verifier();
+            v.0.salt = salt;
+            v.0.iterations = iterations;
+            assert_eq!(
+                f.a.renew_idempotent(
+                    p.id,
+                    session.id,
+                    Some(Mode::ReadOnly),
+                    Some((v, [42; 32])),
+                    "bad"
+                )
+                .unwrap_err(),
+                RenewError::RotationSaltMismatch
+            );
+            assert_eq!(f.a.view.read().unwrap().session_credentials.len(), 1);
+            assert_eq!(encode(&f.a.session(session.id).unwrap()), encode(&session));
+        }
+        f.a.renew_idempotent(p.id, session.id, None, Some((verifier(), [42; 32])), "good")
+            .unwrap();
+        {
+            let view = f.a.view.read().unwrap();
+            assert_eq!(view.session_credentials.len(), 2);
+            assert!(
+                view.session_credentials
+                    .values()
+                    .all(|c| (c.verifier.0.salt.clone(), c.verifier.0.iterations) == params)
+            );
+        }
+        f.clock
+            .store(session.expires_ms, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(f.a.session_scram_params(session.id), None);
+        assert_eq!(
+            f.a.renew_idempotent(
+                p.id,
+                session.id,
+                None,
+                Some((verifier(), [43; 32])),
+                "expired"
+            )
+            .unwrap_err(),
+            RenewError::Authority(AuthorityError::SessionEnded)
+        );
+        f.clock
+            .store(session.created_ms, std::sync::atomic::Ordering::SeqCst);
+        f.a.view.write().unwrap().session_credentials.clear();
+        assert_eq!(f.a.session_scram_params(session.id), None);
+        assert_eq!(
+            f.a.renew_idempotent(
+                p.id,
+                session.id,
+                None,
+                Some((verifier(), [44; 32])),
+                "missing-credential"
+            )
+            .unwrap_err(),
+            RenewError::RotationSaltMismatch
+        );
+    }
+    #[test]
     fn renewal_retry_deduplicates_credentials_and_survives_reload() {
         let f = Fixture::new();
         let p = f.principal("renew-owner", Mode::ReadWrite);
@@ -473,7 +589,7 @@ mod tests {
             loaded
                 .renew_idempotent(p.id, s.id, None, None, "retry")
                 .unwrap_err(),
-            AuthorityError::IdempotencyConflict
+            RenewError::Authority(AuthorityError::IdempotencyConflict)
         );
         loaded
             .revoke_idempotent(p.id, s.id, EndReason::Requested, "retry")
@@ -482,7 +598,7 @@ mod tests {
             loaded
                 .renew_idempotent(p.id, s.id, Some(Mode::ReadOnly), credential(), "retry")
                 .unwrap_err(),
-            AuthorityError::SessionEnded
+            RenewError::Authority(AuthorityError::SessionEnded)
         );
         let loaded = Authority::load(f.store.clone(), SessionLimits::default()).unwrap();
         let ended = loaded

@@ -92,16 +92,25 @@ impl Fixture {
         let authority = Authority::load(store, SessionLimits::default()).unwrap();
         let mut forbidden = vec![];
         let mut make_verifier = |secret: &str| {
-            let salt = b"management-fixture-salt";
+            let salt: &[u8] = if secret == "session-private.secret" {
+                b"session-fixture-salt"
+            } else {
+                b"management-fixture-salt"
+            };
             let v = ScramVerifier::from_password(secret, salt, 4096);
             forbidden.extend([
                 secret.to_owned(),
-                data_encoding::HEXLOWER.encode(salt),
-                data_encoding::BASE64.encode(salt),
                 v.to_pg_string(),
                 data_encoding::HEXLOWER.encode(&v.stored_key),
                 data_encoding::HEXLOWER.encode(&v.server_key),
             ]);
+            // Principal salts remain private; session salts are public.
+            if secret != "session-private.secret" {
+                forbidden.extend([
+                    data_encoding::HEXLOWER.encode(salt),
+                    data_encoding::BASE64.encode(salt),
+                ]);
+            }
             Verifier::try_from(v.to_pg_string()).unwrap()
         };
         let mut principals = vec![];
@@ -460,7 +469,6 @@ impl Fixture {
             hash.clone(),
             data_encoding::HEXLOWER.encode(&verifier.stored_key),
             data_encoding::HEXLOWER.encode(&verifier.server_key),
-            data_encoding::BASE64.encode(&verifier.salt),
         ]);
         serde_json::json!({"route":"postgres", "verifier":verifier.to_pg_string(), "secret_sha256":hash})
     }
@@ -574,6 +582,113 @@ fn acquire_mutations_validation_idempotency_and_secret_checks() {
     assert_eq!(value(&r)["expires_ms"], 1_801_000);
     assert_eq!(value(&r)["isolated"], true);
 }
+#[test]
+fn rotation_parameter_mismatch_is_atomic() -> TransportResult {
+    use sha2::{Digest, Sha256};
+    let mut f = Fixture::new();
+    let body = f.session_body("rotation-original");
+    let acquired = f.post(ALICE, "/v1/sessions", "rotation-acquire", body);
+    assert_eq!(acquired.status(), 201);
+    let view = value(&acquired);
+    let sid = view["id"].as_str().ok_or("missing session id")?;
+    let id = SessionId::from_hex(sid).ok_or("invalid session id")?;
+    let before = f.ctx().authority.session(id).ok_or("missing session")?;
+    let params = f
+        .ctx()
+        .authority
+        .session_scram_params(id)
+        .ok_or("missing SCRAM parameters")?;
+    let detail = f.request(
+        Origin::Network,
+        Some(ALICE),
+        "GET",
+        &format!("/v1/sessions/{sid}"),
+        None,
+    );
+    let detail_value = value(&detail);
+    assert_eq!(
+        detail_value["scram_salt"],
+        data_encoding::BASE64.encode(&params.0)
+    );
+    assert_eq!(detail_value["scram_iterations"], params.1);
+    let original = ScramVerifier::from_password("rotation-original", &params.0, params.1);
+    for key in [original.stored_key, original.server_key] {
+        assert!(
+            !String::from_utf8_lossy(detail.body()).contains(&data_encoding::BASE64.encode(&key))
+        );
+    }
+    for (salt, iterations, retry) in [
+        (b"different-salt".as_slice(), params.1, "salt"),
+        (params.0.as_slice(), params.1 + 1, "iterations"),
+    ] {
+        let verifier = ScramVerifier::from_password("refused-rotation-secret", salt, iterations);
+        error_is(f.post(ALICE, &format!("/v1/sessions/{sid}/renew"), retry, serde_json::json!({
+            "mode":"read_only", "add_credential": {"verifier":verifier.to_pg_string(), "secret_sha256":data_encoding::HEXLOWER.encode(&Sha256::digest(b"refused-rotation-secret"))}
+        })), 400, "rotation_salt_mismatch");
+        let after = f.ctx().authority.session(id).ok_or("missing session")?;
+        assert_eq!(after.mode, before.mode);
+        assert_eq!(after.last_used_ms, before.last_used_ms);
+        assert!(
+            !f.ctx()
+                .authority
+                .check_session_secret(id, b"refused-rotation-secret")
+        );
+        assert_eq!(
+            f.ctx().authority.session_scram_params(id),
+            Some(params.clone())
+        );
+    }
+    f.clock.store(before.expires_ms, Ordering::SeqCst);
+    let expired = value(&f.request(
+        Origin::Network,
+        Some(ALICE),
+        "GET",
+        &format!("/v1/sessions/{sid}"),
+        None,
+    ));
+    assert!(expired["scram_salt"].is_null());
+    assert!(expired["scram_iterations"].is_null());
+    Ok(())
+}
+
+#[test]
+fn rotation_on_ended_sessions_returns_session_ended_and_records_refusal() {
+    for expired in [true, false] {
+        let mut f = Fixture::new();
+        let id = f.sessions[0];
+        let sid = id.to_hex();
+        let rotation = f.session_body("ended-rotation-private.secret");
+        let body = serde_json::json!({"add_credential": {
+            "verifier": rotation["verifier"],
+            "secret_sha256": rotation["secret_sha256"]
+        }});
+        if expired {
+            let session = f.ctx().authority.session(id).unwrap();
+            f.clock.store(session.expires_ms + 1, Ordering::SeqCst);
+        } else {
+            f.ctx().authority.revoke(id, EndReason::Requested).unwrap();
+        }
+        error_is(
+            f.post(
+                ALICE,
+                &format!("/v1/sessions/{sid}/renew"),
+                "ended-rotation",
+                body,
+            ),
+            409,
+            "session_ended",
+        );
+        let records = assert_audit_material(&f);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, LifecycleKind::ResumeRefused);
+        assert_eq!(records[0].reason, "session_ended");
+        assert_eq!(records[0].session.as_deref(), Some(sid.as_str()));
+        assert_eq!(records[0].principal, f.principals[0].to_hex());
+        assert_eq!(records[0].actor, Actor::Owner);
+        assert_eq!(records[0].at_ms, f.clock.load(Ordering::SeqCst));
+    }
+}
+
 #[test]
 fn renew_mutations_credentials_narrowing_and_ownership() {
     let mut f = Fixture::new();
@@ -1534,7 +1649,10 @@ async fn client_all_methods_and_session_secret() -> TransportResult {
     assert!(authority.check_session_secret(sid, secret.secret.as_bytes()));
     assert_eq!(alice.session(&s.id).await?.id, s.id);
     assert!(alice.sessions().await?.iter().any(|row| row.id == s.id));
-    let second = SessionSecret::generate();
+    let params = authority
+        .session_scram_params(sid)
+        .ok_or("missing SCRAM parameters")?;
+    let second = SessionSecret::generate_with(&params.0, params.1)?;
     let renewed = alice
         .renew(
             &s.id,
@@ -1680,7 +1798,13 @@ async fn client_unix_socket() -> TransportResult {
 }
 #[tokio::test]
 async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportResult {
-    use nunya::{cli::session::{AcquireOpts, ConnectionOpts, HelperError, HelperStore, acquire_or_resume, pg_env, revoke}, mgmt::server::spawn};
+    use nunya::{
+        cli::session::{
+            AcquireOpts, ConnectionOpts, HelperError, HelperStore, acquire_or_resume, pg_env,
+            revoke,
+        },
+        mgmt::server::spawn,
+    };
     let mut f = Fixture::new();
     let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
     let authority = ctx.authority.clone();
@@ -1690,8 +1814,22 @@ async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportRes
     let admin = api_client(server.tcp_addr, "admin", "admin-private.secret");
     let store = HelperStore::at(f.dir.join("helper"));
     let mut opts = AcquireOpts {
-        connection: ConnectionOpts { server: format!("http://{}", server.tcp_addr), ca_file: None, principal: Some("alice".into()), principal_secret_file: None, context: None },
-        route: "postgres".into(), mode: Some(Mode::ReadOnly), ttl: Some("30m".into()), label: None, new_scope: false, pg_host: "127.0.0.1".into(), pg_port: 6432, isolated: false,
+        connection: ConnectionOpts {
+            server: format!("http://{}", server.tcp_addr),
+            ca_file: None,
+            principal: Some("alice".into()),
+            principal_secret_file: None,
+            context: None,
+        },
+        route: "postgres".into(),
+        mode: Some(Mode::ReadOnly),
+        ttl: Some("30m".into()),
+        label: None,
+        new_scope: false,
+        rotate: false,
+        pg_host: "127.0.0.1".into(),
+        pg_port: 6432,
+        isolated: false,
     };
     let first = acquire_or_resume(&alice, &store, &opts).await?;
     let stored = store.get("default")?;
@@ -1699,11 +1837,46 @@ async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportRes
     assert!(authority.check_session_secret(sid, stored.secret.as_bytes()));
     let resumed = acquire_or_resume(&alice, &store, &opts).await?;
     assert_eq!(first.session_id, resumed.session_id);
-    assert!(first.secret.as_str() == resumed.secret.as_str(), "resumed credential changed");
+    assert!(
+        first.secret.as_str() == resumed.secret.as_str(),
+        "resumed credential changed"
+    );
+    let original_params = authority
+        .session_scram_params(sid)
+        .ok_or("missing parameters")?;
+    opts.rotate = true;
+    let rotated = acquire_or_resume(&alice, &store, &opts).await?;
+    assert_eq!(rotated.session_id, first.session_id);
+    assert_eq!(rotated.scope, first.scope);
+    assert!(
+        rotated.secret.as_str() != first.secret.as_str(),
+        "rotation did not replace credential"
+    );
+    assert!(
+        store.get("default")?.secret.as_str() == rotated.secret.as_str(),
+        "rotated credential not stored"
+    );
+    assert!(authority.check_session_secret(sid, first.secret.as_bytes()));
+    assert!(authority.check_session_secret(sid, rotated.secret.as_bytes()));
+    assert_eq!(
+        authority.session_scram_params(sid),
+        Some(original_params.clone())
+    );
+    let mut renewed = rotated;
+    nunya::cli::session::rotate(&alice, &store, &mut renewed, None).await?;
+    assert_eq!(renewed.session_id, first.session_id);
+    assert_eq!(renewed.scope, first.scope);
+    assert!(authority.check_session_secret(sid, renewed.secret.as_bytes()));
+    assert!(authority.check_session_secret(sid, first.secret.as_bytes()));
+    assert_eq!(authority.session_scram_params(sid), Some(original_params));
+    opts.rotate = false;
     admin.revoke(&first.session_id).await?;
     let err = acquire_or_resume(&alice, &store, &opts).await.unwrap_err();
     assert_eq!(err, HelperError::ScopeReplaced);
-    assert_eq!(err.to_string(), "the stored session has ended and its token scope was replaced; tokens from it will not match a new session. Run again with --new-scope to start a new scope.");
+    assert_eq!(
+        err.to_string(),
+        "the stored session has ended and its token scope was replaced; tokens from it will not match a new session. Run again with --new-scope to start a new scope."
+    );
     assert_eq!(store.get("default")?.session_id, first.session_id);
     opts.new_scope = true;
     let replacement = acquire_or_resume(&alice, &store, &opts).await?;
@@ -1712,17 +1885,36 @@ async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportRes
     assert_eq!(store.get("default")?.session_id, replacement.session_id);
     opts.isolated = true;
     let isolated = acquire_or_resume(&alice, &store, &opts).await?;
-    assert!(isolated.isolated); assert!(isolated.name.starts_with("isolated-"));
+    assert!(isolated.isolated);
+    assert!(isolated.name.starts_with("isolated-"));
     assert_eq!(store.get("default")?.session_id, replacement.session_id);
     assert_eq!(store.get(&isolated.name)?.session_id, isolated.session_id);
     opts.connection.context = Some("default".into());
-    assert_eq!(acquire_or_resume(&alice, &store, &opts).await.unwrap_err(), HelperError::Conflict);
+    assert_eq!(
+        acquire_or_resume(&alice, &store, &opts).await.unwrap_err(),
+        HelperError::Conflict
+    );
     opts.connection.context = Some("explicit-isolation".into());
     let named = acquire_or_resume(&alice, &store, &opts).await?;
     assert_eq!(named.name, "explicit-isolation");
     let env = pg_env(&replacement);
-    assert_eq!(env.iter().find(|(k,_)| k == "PGUSER").ok_or("missing PGUSER")?.1.as_str(), format!("session:{}", replacement.session_id));
-    assert!(env.iter().find(|(k,_)| k == "PGPASSWORD").ok_or("missing PGPASSWORD")?.1.as_str() == replacement.secret.as_str(), "environment credential mismatch");
+    assert_eq!(
+        env.iter()
+            .find(|(k, _)| k == "PGUSER")
+            .ok_or("missing PGUSER")?
+            .1
+            .as_str(),
+        format!("session:{}", replacement.session_id)
+    );
+    assert!(
+        env.iter()
+            .find(|(k, _)| k == "PGPASSWORD")
+            .ok_or("missing PGPASSWORD")?
+            .1
+            .as_str()
+            == replacement.secret.as_str(),
+        "environment credential mismatch"
+    );
     revoke(&alice, &store, &replacement).await?;
     assert_eq!(store.get("default").unwrap_err(), HelperError::Missing);
     assert!(store.get(&isolated.name).is_ok());

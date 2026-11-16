@@ -132,12 +132,28 @@ impl fmt::Debug for Credentials {
 pub struct SessionSecret {
     /// 32 random bytes encoded as 64 lowercase hex characters.
     pub secret: Zeroizing<String>,
-    /// PostgreSQL SCRAM verifier with a random 16-byte salt and 4096 iterations.
+    /// PostgreSQL SCRAM verifier using the generated or supplied public parameters.
     pub verifier: String,
     /// Lowercase SHA-256 of the secret's UTF-8 bytes.
     pub sha256_hex: String,
 }
 impl SessionSecret {
+    /// Generate a fresh credential using existing public SCRAM parameters.
+    pub fn generate_with(salt: &[u8], iterations: u32) -> Result<Self, ClientError> {
+        if salt.is_empty() || iterations == 0 {
+            return Err(ClientError::Decode);
+        }
+        let mut bytes = Zeroizing::new([0; 32]);
+        getrandom::fill(bytes.as_mut()).map_err(|_| ClientError::Transport)?;
+        let secret = Zeroizing::new(data_encoding::HEXLOWER.encode(bytes.as_ref()));
+        let verifier = ScramVerifier::from_password(&secret, salt, iterations).to_pg_string();
+        let sha256_hex = data_encoding::HEXLOWER.encode(&Sha256::digest(secret.as_bytes()));
+        Ok(Self {
+            secret,
+            verifier,
+            sha256_hex,
+        })
+    }
     /// Generate a fresh credential; abort with a fixed message if OS entropy fails.
     pub fn generate() -> Self {
         let mut bytes = Zeroizing::new([0; 32]);
@@ -188,6 +204,10 @@ pub struct SessionCredential {
 /// Public session projection.
 #[derive(Debug, Deserialize)]
 pub struct SessionView {
+    /// Standard base64 salt of the active session credential.
+    pub scram_salt: Option<String>,
+    /// Iteration count of the active session credential.
+    pub scram_iterations: Option<u32>,
     /// Session hex identifier.
     pub id: String,
     /// Principal hex identifier.
@@ -663,6 +683,24 @@ fn item(collection: &str, id: &str) -> Result<String, ClientError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generated_rotation_parameters() -> Result<(), super::ClientError> {
+        use super::*;
+        assert_eq!(
+            SessionSecret::generate_with(b"", 1).unwrap_err(),
+            ClientError::Decode
+        );
+        assert_eq!(
+            SessionSecret::generate_with(b"salt", 0).unwrap_err(),
+            ClientError::Decode
+        );
+        let secret = SessionSecret::generate_with(b"reused-salt", 2)?;
+        let verifier = ScramVerifier::parse(&secret.verifier).ok_or(ClientError::Decode)?;
+        assert_eq!(verifier.salt, b"reused-salt");
+        assert_eq!(verifier.iterations, 2);
+        Ok(())
+    }
+
     use super::*;
     #[test]
     fn endpoint_parsing() {

@@ -2,7 +2,8 @@
 use crate::{
     config::parse_duration,
     mgmt::client::{
-        AcquireParams, ClientError, Credentials, MgmtClient, SessionSecret, SessionView,
+        AcquireParams, ClientError, Credentials, MgmtClient, SessionCredential, SessionSecret,
+        SessionView,
     },
     state::model::{Mode, SessionState},
 };
@@ -34,7 +35,7 @@ pub enum HelperError {
     /// Connection configuration invalid.
     Configuration,
     /// Management request refused or unavailable.
-    Management,
+    Management(ClientError),
     /// Child could not be started.
     Child,
 }
@@ -47,15 +48,17 @@ impl fmt::Display for HelperError {
             Self::Missing => "session context not found",
             Self::Conflict => "session context already exists or belongs to another connection",
             Self::Configuration => "invalid session helper configuration",
-            Self::Management => "session management request failed",
+            Self::Management(error) => {
+                return write!(f, "session management request failed: {error}");
+            }
             Self::Child => "unable to start child command",
         })
     }
 }
 impl std::error::Error for HelperError {}
 impl From<ClientError> for HelperError {
-    fn from(_: ClientError) -> Self {
-        Self::Management
+    fn from(error: ClientError) -> Self {
+        Self::Management(error)
     }
 }
 mod secret_serde {
@@ -341,6 +344,9 @@ pub struct AcquireOpts {
     /// Explicit permission to replace an ended scope.
     #[arg(long)]
     pub new_scope: bool,
+    /// Rotate the credential of an existing session.
+    #[arg(long, conflicts_with = "new_scope")]
+    pub rotate: bool,
     /// PostgreSQL host.
     #[arg(long, env = "NUNYA_PG_HOST", default_value = "127.0.0.1")]
     pub pg_host: String,
@@ -360,7 +366,7 @@ pub enum SessionCommand {
         #[command(flatten)]
         opts: AcquireOpts,
         /// Create a separate scope in a new context.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "rotate")]
         isolated: bool,
     },
     /// Display public session details.
@@ -373,6 +379,9 @@ pub enum SessionCommand {
         /// Requested access mode.
         #[arg(long, value_parser = mode)]
         mode: Option<Mode>,
+        /// Rotate the stored credential.
+        #[arg(long)]
+        rotate: bool,
     },
     /// Revoke and remove the stored session.
     Revoke(ConnectionOpts),
@@ -413,7 +422,7 @@ async fn resume(client: &MgmtClient, ctx: &mut Context) -> Result<SessionView, H
         if ended(&e) {
             HelperError::ScopeReplaced
         } else {
-            HelperError::Management
+            HelperError::Management(e)
         }
     })?;
     if view.state != SessionState::Active || view.scope != ctx.scope {
@@ -427,7 +436,7 @@ async fn resume(client: &MgmtClient, ctx: &mut Context) -> Result<SessionView, H
             if ended(&e) {
                 HelperError::ScopeReplaced
             } else {
-                HelperError::Management
+                HelperError::Management(e)
             }
         })?;
     ctx.expires_ms = view.expires_ms;
@@ -440,6 +449,14 @@ pub async fn acquire_or_resume(
     opts: &AcquireOpts,
 ) -> Result<Context, HelperError> {
     let name = opts.connection.name();
+    if opts.rotate {
+        if opts.new_scope || opts.isolated {
+            return Err(HelperError::Conflict);
+        }
+        let mut ctx = opts.connection.context(store)?;
+        rotate(client, store, &mut ctx, opts.mode).await?;
+        return Ok(ctx);
+    }
     let existing = store.load()?.contexts.contains_key(name);
     if opts.isolated {
         if opts.connection.context.is_some() && existing {
@@ -471,7 +488,9 @@ pub async fn acquire_or_resume(
     let name = if opts.isolated && opts.connection.context.is_none() {
         format!(
             "isolated-{}",
-            view.id.get(..8).ok_or(HelperError::Management)?
+            view.id
+                .get(..8)
+                .ok_or(HelperError::Management(ClientError::Decode))?
         )
     } else {
         name.into()
@@ -495,6 +514,40 @@ pub async fn acquire_or_resume(
     };
     store.put(&ctx)?;
     Ok(ctx)
+}
+/// Rotate a stored session credential while preserving its session and scope.
+pub async fn rotate(
+    client: &MgmtClient,
+    store: &HelperStore,
+    ctx: &mut Context,
+    mode: Option<Mode>,
+) -> Result<(), HelperError> {
+    let current = client.session(&ctx.session_id).await?;
+    if current.state != SessionState::Active || current.scope != ctx.scope {
+        return Err(HelperError::ScopeReplaced);
+    }
+    let salt = data_encoding::BASE64
+        .decode(current.scram_salt.ok_or(ClientError::Decode)?.as_bytes())
+        .map_err(|_| ClientError::Decode)?;
+    let secret =
+        SessionSecret::generate_with(&salt, current.scram_iterations.ok_or(ClientError::Decode)?)?;
+    let view = client
+        .renew(
+            &ctx.session_id,
+            mode,
+            Some(SessionCredential {
+                verifier: secret.verifier,
+                secret_sha256: secret.sha256_hex,
+            }),
+        )
+        .await?;
+    let mut updated = ctx.clone();
+    updated.secret = secret.secret;
+    updated.expires_ms = view.expires_ms;
+    store.put(&updated)?;
+    *ctx = updated;
+    println!("The previous secret keeps working until the session expires.");
+    Ok(())
 }
 /// PostgreSQL environment values, including the protected password.
 pub fn pg_env(ctx: &Context) -> Vec<(String, Zeroizing<String>)> {
@@ -549,12 +602,20 @@ async fn dispatch(command: SessionCommand) -> Result<i32, HelperError> {
                 v.state, v.mode, v.expires_ms, v.revoke_reason, v.scope_continuity
             );
         }
-        SessionCommand::Renew { connection, mode } => {
+        SessionCommand::Renew {
+            connection,
+            mode,
+            rotate: rotating,
+        } => {
             let client = connection.client()?;
             let mut ctx = connection.context(&store)?;
-            let view = client.renew(&ctx.session_id, mode, None).await?;
-            ctx.expires_ms = view.expires_ms;
-            store.put(&ctx)?;
+            if rotating {
+                rotate(&client, &store, &mut ctx, mode).await?;
+            } else {
+                let view = client.renew(&ctx.session_id, mode, None).await?;
+                ctx.expires_ms = view.expires_ms;
+                store.put(&ctx)?;
+            }
             summary(&client, &ctx).await?;
         }
         SessionCommand::Revoke(connection) => {
@@ -650,6 +711,17 @@ mod tests {
             isolated: false,
             label: None,
         }
+    }
+    #[test]
+    fn management_refusal_display() {
+        let error = HelperError::from(ClientError::Api {
+            status: 403,
+            code: "no_grant".into(),
+        });
+        assert_eq!(
+            error.to_string(),
+            "session management request failed: management API 403: no_grant"
+        );
     }
     #[test]
     fn shell_quoting() {

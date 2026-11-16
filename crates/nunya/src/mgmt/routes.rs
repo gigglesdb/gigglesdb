@@ -144,7 +144,9 @@ fn audit_unavailable() -> Response<Bytes> {
     error(StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable")
 }
 fn session_view(ctx: &MgmtContext, s: &AccessSession) -> Value {
-    json!({"id":s.id, "principal":s.principal, "route":s.route, "mode":s.mode,
+    let params = ctx.authority.session_scram_params(s.id);
+    json!({"scram_salt":params.as_ref().map(|(salt, _)| data_encoding::BASE64.encode(salt)),
+        "scram_iterations":params.map(|(_, iterations)| iterations), "id":s.id, "principal":s.principal, "route":s.route, "mode":s.mode,
         "state":s.state, "created_ms":s.created_ms, "expires_ms":s.expires_ms,
         "idle_timeout_ms":s.idle_timeout_ms, "last_used_ms":s.last_used_ms,
         "revoke_reason":s.revoke_reason.map(EndReason::as_str), "label":s.label,
@@ -428,8 +430,16 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     None => None,
                 };
                 replay = ctx.authority.renewal_recorded(principal, key);
-                ctx.authority
+                match ctx
+                    .authority
                     .renew_idempotent(principal, id, request.mode, add, key)
+                {
+                    Ok(s) => Ok(s),
+                    Err(e) => match e.into_authority() {
+                        Some(e) => Err(e),
+                        None => return error(StatusCode::BAD_REQUEST, "rotation_salt_mismatch"),
+                    },
+                }
             }
             Revoke(id) => {
                 if serde_json::from_slice::<RevokeBody>(body).is_err() {

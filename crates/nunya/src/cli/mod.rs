@@ -420,6 +420,23 @@ mod tests {
         );
     }
     #[test]
+    fn rotation_flags() {
+        for verb in ["acquire", "renew"] {
+            let args = [
+                "nunya",
+                "session",
+                verb,
+                "--server",
+                "unix:/tmp/nunya.sock",
+                "--rotate",
+            ];
+            assert!(Cli::try_parse_from(args).is_ok());
+            for conflict in ["--new-scope", "--isolated"] {
+                assert!(Cli::try_parse_from(args.into_iter().chain([conflict])).is_err());
+            }
+        }
+    }
+    #[test]
     fn durations() {
         for (text, ms) in [("30m", 1_800_000), ("2h", 7_200_000), ("3600s", 3_600_000)] {
             assert_eq!(parse_ttl(text).unwrap(), ms);
