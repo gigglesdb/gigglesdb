@@ -12,6 +12,146 @@ pub struct CredentialSummary {
     pub expires_ms: Option<u64>,
 }
 impl Authority {
+    /// Set principal state with a caller-local retry record.
+    pub fn set_principal_enabled_idempotent(
+        &self,
+        owner: PrincipalId,
+        id: PrincipalId,
+        enabled: bool,
+        key: &str,
+    ) -> Result<(), AuthorityError> {
+        self.api_principal(id)?;
+        let operation = if enabled { "enable" } else { "disable" };
+        let key = format!("\0{operation}:{key}");
+        let request_hash = hash(&(id, enabled));
+        if self.result_retry(owner, &key, request_hash)?.is_some() {
+            return Ok(());
+        }
+        self.set_principal_enabled(id, enabled)?;
+        // Write after the mutation: state-setting replay is a no-op.
+        self.record_result_retry(owner, key, request_hash, id.to_hex())
+    }
+    /// Revoke a credential with a caller-local retry record.
+    pub fn revoke_principal_credential_idempotent(
+        &self,
+        owner: PrincipalId,
+        id: PrincipalId,
+        cid: CredentialId,
+        key: &str,
+    ) -> Result<CredentialSummary, AuthorityError> {
+        self.api_principal(id)?;
+        let key = format!("\0credential-revoke:{key}");
+        let request_hash = hash(&(id, cid));
+        if self.result_retry(owner, &key, request_hash)?.is_none() {
+            self.revoke_principal_credential(id, cid)?;
+            // Write after the mutation: state-setting replay is a no-op.
+            self.record_result_retry(owner, key, request_hash, cid.to_hex())?;
+        }
+        self.credentials_of(id)
+            .into_iter()
+            .find(|c| c.id == cid)
+            .ok_or(AuthorityError::NotFound)
+    }
+    /// Replace grants with a caller-local, order-independent retry record.
+    pub fn set_grants_idempotent(
+        &self,
+        owner: PrincipalId,
+        id: PrincipalId,
+        mut grants: Vec<(RouteId, Mode)>,
+        key: &str,
+    ) -> Result<(), AuthorityError> {
+        grants.sort_by(|a, b| a.0.cmp(&b.0));
+        let key = format!("\0grants:{key}");
+        let request_hash = hash(&(id, &grants));
+        if self.result_retry(owner, &key, request_hash)?.is_some() {
+            return Ok(());
+        }
+        self.set_grants(id, grants)?;
+        // Write after the mutation: state-setting replay is a no-op.
+        self.record_result_retry(owner, key, request_hash, id.to_hex())
+    }
+    /// Create a credential with a positive relative expiry and an atomic caller-local retry record.
+    pub fn add_principal_credential_idempotent(
+        &self,
+        owner: PrincipalId,
+        id: PrincipalId,
+        verifier: Verifier,
+        expires_in_ms: Option<u64>,
+        key: &str,
+    ) -> Result<CredentialSummary, AuthorityError> {
+        let _writer = self.writer.lock().unwrap();
+        self.api_principal(id)?;
+        let key = format!("\0credential:{key}");
+        let request_hash = hash(&(id, &verifier, expires_in_ms));
+        if let Some(result) = self.result_retry(owner, &key, request_hash)? {
+            let cid = CredentialId::from_hex(&result).ok_or(AuthorityError::Store)?;
+            return self
+                .credentials_of(id)
+                .into_iter()
+                .find(|c| c.id == cid)
+                .ok_or(AuthorityError::Store);
+        }
+        let expires_ms = expires_in_ms
+            .map(|duration| {
+                if duration == 0 {
+                    return Err(AuthorityError::LifetimeTooLong);
+                }
+                self.store
+                    .now_ms()
+                    .checked_add(duration)
+                    .ok_or(AuthorityError::LifetimeTooLong)
+            })
+            .transpose()?;
+        let c = PrincipalCredential {
+            id: CredentialId::random(),
+            principal: id,
+            verifier,
+            state: CredentialState::Active,
+            expires_ms,
+        };
+        let record = IdempotencyRecord {
+            principal: owner,
+            key: key.clone(),
+            request_hash,
+            result: c.id.to_hex(),
+        };
+        let mut tx = self.store.write()?;
+        tx.put(
+            Table::PrincipalCredentials,
+            &keys::principal_credential(id, c.id),
+            &encode(&c),
+        )?;
+        tx.put(
+            Table::Idempotency,
+            &keys::idempotency(owner, &key),
+            &encode(&record),
+        )?;
+        tx.commit()?;
+        let summary = CredentialSummary {
+            id: c.id,
+            state: c.state,
+            expires_ms: c.expires_ms,
+        };
+        let mut v = self.view.write().unwrap();
+        v.credentials.insert(c.id, c);
+        v.idempotency.insert((owner, key), record);
+        Ok(summary)
+    }
+    fn result_retry(
+        &self,
+        owner: PrincipalId,
+        key: &str,
+        request_hash: [u8; 32],
+    ) -> Result<Option<String>, AuthorityError> {
+        let v = self.view.read().unwrap();
+        let Some(record) = v.idempotency.get(&(owner, key.to_owned())) else {
+            return Ok(None);
+        };
+        if record.request_hash != request_hash {
+            return Err(AuthorityError::IdempotencyConflict);
+        }
+        Ok(Some(record.result.clone()))
+    }
     /// Renew a session with a caller-local retry record and credential deduplication.
     pub fn renew_idempotent(
         &self,
@@ -95,11 +235,20 @@ impl Authority {
         request_hash: [u8; 32],
         id: SessionId,
     ) -> Result<(), AuthorityError> {
+        self.record_result_retry(owner, key, request_hash, id.to_hex())
+    }
+    fn record_result_retry(
+        &self,
+        owner: PrincipalId,
+        key: String,
+        request_hash: [u8; 32],
+        result: String,
+    ) -> Result<(), AuthorityError> {
         let record = IdempotencyRecord {
             principal: owner,
             key: key.clone(),
             request_hash,
-            result: id.to_hex(),
+            result,
         };
         let mut tx = self.store.write()?;
         tx.put(
@@ -199,6 +348,52 @@ mod tests {
     use super::super::tests::{Fixture, verifier};
     use super::*;
 
+    #[test]
+    fn principal_mutation_retries_survive_reload_and_scope_by_owner() {
+        let f = Fixture::new();
+        let p = f.principal("credential-owner", Mode::ReadWrite);
+        let other = f.principal("other-owner", Mode::ReadWrite);
+        let first =
+            f.a.add_principal_credential_idempotent(p.id, p.id, verifier(), Some(5000), "add")
+                .unwrap();
+        assert_eq!(first.expires_ms, Some(6000));
+        f.clock.store(2000, std::sync::atomic::Ordering::SeqCst);
+        let a = Authority::load(f.store.clone(), SessionLimits::default()).unwrap();
+        let again = a
+            .add_principal_credential_idempotent(p.id, p.id, verifier(), Some(5000), "add")
+            .unwrap();
+        assert_eq!(first.id, again.id);
+        assert_eq!(first.expires_ms, again.expires_ms);
+        assert_eq!(a.credentials_of(p.id).len(), 1);
+        assert_eq!(
+            a.add_principal_credential_idempotent(p.id, p.id, verifier(), None, "add")
+                .unwrap_err(),
+            AuthorityError::IdempotencyConflict
+        );
+        let independent = a
+            .add_principal_credential_idempotent(other.id, p.id, verifier(), None, "add")
+            .unwrap();
+        assert_ne!(first.id, independent.id);
+        a.revoke_principal_credential_idempotent(p.id, p.id, first.id, "revoke")
+            .unwrap();
+        a.set_principal_enabled_idempotent(other.id, p.id, false, "disable")
+            .unwrap();
+        a.set_grants_idempotent(other.id, p.id, vec![], "grants")
+            .unwrap();
+        let a = Authority::load(f.store.clone(), SessionLimits::default()).unwrap();
+        assert_eq!(
+            a.revoke_principal_credential_idempotent(p.id, p.id, first.id, "revoke")
+                .unwrap()
+                .state,
+            CredentialState::Revoked
+        );
+        a.set_principal_enabled_idempotent(other.id, p.id, false, "disable")
+            .unwrap();
+        assert_eq!(a.principal(p.id).unwrap().revision, 2);
+        a.set_grants_idempotent(other.id, p.id, vec![], "grants")
+            .unwrap();
+        assert!(a.grants_of(p.id).is_empty());
+    }
     #[test]
     fn renewal_retry_deduplicates_credentials_and_survives_reload() {
         let f = Fixture::new();

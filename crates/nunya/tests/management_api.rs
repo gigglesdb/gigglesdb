@@ -14,7 +14,13 @@ use nunya::{
     },
     token::{PrincipalId, SessionId, keys::RootKey},
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 struct Sources;
 impl ConnectionSource for Sources {
@@ -44,6 +50,7 @@ struct Fixture {
     principals: Vec<PrincipalId>,
     sessions: Vec<SessionId>,
     forbidden: Vec<String>,
+    clock: Arc<AtomicU64>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -56,11 +63,13 @@ impl Fixture {
         let dir = PathBuf::from("J:/gigglesdb-work/nunya/target-w2-tmp")
             .join(format!("mgmt-{}", SessionId::random().to_hex()));
         std::fs::create_dir_all(&dir).unwrap();
+        let clock = Arc::new(AtomicU64::new(1000));
+        let c = clock.clone();
         let store = Arc::new(
             RedbStore::with_clock(
                 &dir,
                 &RootKey::from_hex(&"72".repeat(32)).unwrap(),
-                Arc::new(|| 1000),
+                Arc::new(move || c.load(Ordering::SeqCst)),
             )
             .unwrap(),
         );
@@ -138,6 +147,7 @@ impl Fixture {
             principals,
             sessions,
             forbidden,
+            clock,
         }
     }
     fn ctx(&self) -> &MgmtContext {
@@ -207,7 +217,7 @@ fn endpoint_authorization_matrix_and_uniform_auth_failures() {
             [200, 404, 200, 200, 200],
         ),
         ("GET", "/v1/sessions".into(), [200, 200, 200, 200, 200]),
-        ("POST", "/v1/principals".into(), [403, 403, 503, 503, 503]),
+        ("POST", "/v1/principals".into(), [403, 403, 400, 400, 400]),
         ("GET", "/v1/principals".into(), [403, 403, 200, 200, 200]),
         (
             "GET",
@@ -217,27 +227,27 @@ fn endpoint_authorization_matrix_and_uniform_auth_failures() {
         (
             "POST",
             format!("/v1/principals/{pid}/disable"),
-            [403, 403, 503, 503, 503],
+            [403, 403, 200, 200, 200],
         ),
         (
             "POST",
             format!("/v1/principals/{pid}/enable"),
-            [403, 403, 503, 503, 503],
+            [403, 403, 200, 200, 200],
         ),
         (
             "POST",
             format!("/v1/principals/{pid}/credentials"),
-            [403, 403, 503, 503, 503],
+            [403, 403, 400, 400, 400],
         ),
         (
             "DELETE",
             format!("/v1/principals/{pid}/credentials/{cid}"),
-            [403, 403, 503, 503, 503],
+            [403, 403, 404, 404, 404],
         ),
         (
             "PUT",
             format!("/v1/principals/{pid}/grants"),
-            [403, 403, 503, 503, 503],
+            [403, 403, 400, 400, 400],
         ),
         ("GET", "/v1/connections".into(), [403, 403, 200, 200, 200]),
         ("GET", "/v1/status".into(), [403, 403, 200, 200, 200]),
@@ -278,6 +288,12 @@ fn endpoint_authorization_matrix_and_uniform_auth_failures() {
                 statuses[i],
                 "{method} {path} caller {i}"
             );
+            if path.ends_with("/disable") && r.status() == 200 {
+                f.ctx()
+                    .authority
+                    .set_principal_enabled(f.principals[0], true)
+                    .unwrap();
+            }
             if method != "GET"
                 && (statuses[i] == 503
                     || statuses[i] == 200
@@ -661,4 +677,323 @@ fn revoke_mutations_owner_admin_retry_and_admission() {
             .status(),
         200
     );
+}
+
+impl Fixture {
+    fn mutation(
+        &self,
+        method: &str,
+        path: &str,
+        key: &str,
+        body: serde_json::Value,
+    ) -> Response<Bytes> {
+        self.request_body(
+            Origin::Network,
+            Some(ADMIN),
+            method,
+            path,
+            Some(key),
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+    }
+    fn principal_verifier(&mut self, secret: &str) -> String {
+        self.session_body(secret)["verifier"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+    fn authenticates(&self, auth: &str, status: u16) {
+        assert_eq!(
+            self.request(Origin::Network, Some(auth), "GET", "/v1/sessions", None)
+                .status()
+                .as_u16(),
+            status
+        );
+    }
+}
+#[test]
+fn principal_creation_validation_authentication_and_retries() {
+    use serde_json::json;
+    let mut f = Fixture::new();
+    let verifier = f.principal_verifier("created-private.secret");
+    let body = json!({"name":"created", "kind":"service", "verifier":verifier});
+    let first = f.post(ADMIN, "/v1/principals", "create", body.clone());
+    assert_eq!(first.status(), 201);
+    assert_eq!(
+        f.post(ADMIN, "/v1/principals", "create", body).body(),
+        first.body()
+    );
+    let pid = value(&first)["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        f.request(
+            Origin::Network,
+            Some(ADMIN),
+            "GET",
+            &format!("/v1/principals/{pid}"),
+            None
+        )
+        .body(),
+        first.body()
+    );
+    f.authenticates("Bearer nunya.created.created-private.secret", 200);
+    let bare = f.post(
+        ADMIN,
+        "/v1/principals",
+        "bare",
+        json!({"name":"bare", "kind":"person"}),
+    );
+    assert_eq!(bare.status(), 201);
+    assert_eq!(value(&bare)["credentials"], json!([]));
+    assert_eq!(value(&bare)["administrator"], false);
+    error_is(
+        f.post(
+            ADMIN,
+            "/v1/principals",
+            "create",
+            json!({"name":"different", "kind":"service"}),
+        ),
+        409,
+        "idempotency_conflict",
+    );
+    for name in ["created", "configured"] {
+        error_is(
+            f.post(
+                ADMIN,
+                "/v1/principals",
+                name,
+                json!({"name":name, "kind":"agent"}),
+            ),
+            409,
+            "name_taken",
+        );
+    }
+    for body in [
+        json!({"name":"bad.name", "kind":"person"}),
+        json!({"name":"invalid", "kind":"robot"}),
+        json!({"name":"invalid", "kind":"person", "verifier":"bad"}),
+        json!({"name":"invalid", "kind":"person", "extra":1}),
+    ] {
+        error_is(
+            f.post(ADMIN, "/v1/principals", "invalid", body),
+            400,
+            "bad_request",
+        );
+    }
+    assert!(f.ctx().authority.principal_by_name("invalid").is_none());
+}
+#[test]
+fn principal_state_and_config_ownership() {
+    use serde_json::json;
+    let mut f = Fixture::new();
+    let base = format!("/v1/principals/{}", f.principals[0].to_hex());
+    let disabled = f.post(ADMIN, &format!("{base}/disable"), "disable", json!({}));
+    assert_eq!(disabled.status(), 200);
+    assert_eq!(
+        f.post(ADMIN, &format!("{base}/disable"), "disable", json!({}))
+            .body(),
+        disabled.body()
+    );
+    let session = f.ctx().authority.session(f.sessions[0]).unwrap();
+    assert_eq!(session.revoke_reason, Some(EndReason::PrincipalDisabled));
+    f.authenticates(ALICE, 401);
+    assert_eq!(
+        f.post(ADMIN, &format!("{base}/enable"), "enable", json!({}))
+            .status(),
+        200
+    );
+    f.authenticates(ALICE, 200);
+    assert_eq!(
+        f.ctx().authority.session(f.sessions[0]).unwrap().state,
+        SessionState::Revoked
+    );
+    let configured = f
+        .ctx()
+        .authority
+        .principal_by_name("configured")
+        .unwrap()
+        .id;
+    let base = format!("/v1/principals/{}", configured.to_hex());
+    let verifier = f.principal_verifier("blocked-private.secret");
+    for (method, suffix, body) in [
+        ("POST", "disable", json!({})),
+        ("POST", "enable", json!({})),
+        ("POST", "credentials", json!({"verifier":verifier})),
+        (
+            "DELETE",
+            "credentials/00000000000000000000000000000000",
+            json!({}),
+        ),
+    ] {
+        error_is(
+            f.mutation(method, &format!("{base}/{suffix}"), suffix, body),
+            409,
+            "config_managed",
+        );
+    }
+    error_is(
+        f.post(
+            ADMIN,
+            &format!("/v1/principals/{}/enable", f.principals[0].to_hex()),
+            "bad",
+            json!({"extra":true}),
+        ),
+        400,
+        "bad_request",
+    );
+}
+#[test]
+fn principal_credential_rotation_retries_and_validation() {
+    use serde_json::json;
+    let mut f = Fixture::new();
+    let base = format!("/v1/principals/{}/credentials", f.principals[0].to_hex());
+    let verifier = f.principal_verifier("rotated-private.secret");
+    let body = json!({"verifier":verifier});
+    let first = f.post(ADMIN, &base, "rotate", body.clone());
+    assert_eq!(first.status(), 201);
+    assert_eq!(
+        f.post(ADMIN, &base, "rotate", body.clone()).body(),
+        first.body()
+    );
+    assert_eq!(f.ctx().authority.credentials_of(f.principals[0]).len(), 2);
+    let rotated = "Bearer nunya.alice.rotated-private.secret";
+    f.authenticates(rotated, 200);
+    f.authenticates(ALICE, 200);
+    let cid = value(&first)["id"].as_str().unwrap().to_owned();
+    error_is(
+        f.mutation(
+            "DELETE",
+            &format!(
+                "/v1/principals/{}/credentials/{cid}",
+                f.principals[1].to_hex()
+            ),
+            "foreign",
+            json!({}),
+        ),
+        404,
+        "not_found",
+    );
+    let deleted = f.mutation("DELETE", &format!("{base}/{cid}"), "delete", json!({}));
+    assert_eq!(deleted.status(), 200);
+    assert_eq!(value(&deleted)["state"], "revoked");
+    assert_eq!(
+        f.mutation("DELETE", &format!("{base}/{cid}"), "delete", json!({}))
+            .body(),
+        deleted.body()
+    );
+    f.authenticates(rotated, 401);
+    f.authenticates(ALICE, 200);
+    let different = f.principal_verifier("conflicting-private.secret");
+    error_is(
+        f.post(ADMIN, &base, "rotate", json!({"verifier":different})),
+        409,
+        "idempotency_conflict",
+    );
+    for expires in ["0s", "garbage"] {
+        error_is(
+            f.post(
+                ADMIN,
+                &base,
+                "invalid",
+                json!({"verifier":verifier,"expires":expires}),
+            ),
+            400,
+            "bad_request",
+        );
+    }
+    error_is(
+        f.post(ADMIN, &base, "invalid", json!({"verifier":"bad"})),
+        400,
+        "bad_request",
+    );
+    let expiring = f.post(
+        ADMIN,
+        &base,
+        "expiring",
+        json!({"verifier":verifier,"expires":"1h"}),
+    );
+    assert_eq!(expiring.status(), 201);
+    assert_eq!(value(&expiring)["expires_ms"], 3_601_000);
+}
+#[test]
+fn principal_credential_relative_expiry_retry_keeps_original_deadline() {
+    use serde_json::json;
+    let mut f = Fixture::new();
+    let base = format!("/v1/principals/{}/credentials", f.principals[0].to_hex());
+    let verifier = f.principal_verifier("expiring-private.secret");
+    let body = json!({"verifier":verifier,"expires":"30m"});
+    let first = f.post(ADMIN, &base, "K", body.clone());
+    assert_eq!(first.status(), 201);
+    assert_eq!(value(&first)["expires_ms"], 1_801_000);
+    f.clock.store(61_000, Ordering::SeqCst);
+    let again = f.post(ADMIN, &base, "K", body);
+    assert_eq!(again.status(), 201);
+    assert_eq!(value(&first)["id"], value(&again)["id"]);
+    assert_eq!(first.body(), again.body());
+    assert_eq!(f.ctx().authority.credentials_of(f.principals[0]).len(), 2);
+    let expiring = "Bearer nunya.alice.expiring-private.secret";
+    f.authenticates(expiring, 200);
+    f.clock.store(1_801_001, Ordering::SeqCst);
+    f.authenticates(expiring, 401);
+    f.authenticates(ALICE, 200);
+}
+#[test]
+fn grant_replacement_narrowing_removal_and_canonical_retry() {
+    use nunya::state::authority::{AdmitError, Operation};
+    use serde_json::json;
+    let f = Fixture::new();
+    let base = format!("/v1/principals/{}/grants", f.principals[0].to_hex());
+    let body = json!({"grants":[{"route":"postgres","mode":"read_only"}, {"route":"other","mode":"read_write"}]});
+    let first = f.mutation("PUT", &base, "grants", body.clone());
+    assert_eq!(first.status(), 200);
+    let reversed = json!({"grants":[{"route":"other","mode":"read_write"},{"route":"postgres","mode":"read_only"}]});
+    assert_eq!(
+        f.mutation("PUT", &base, "grants", reversed).body(),
+        first.body()
+    );
+    assert!(matches!(
+        f.ctx().authority.admit(f.sessions[0], Operation::Write),
+        Err(AdmitError::ReadOnly)
+    ));
+    error_is(
+        f.mutation("PUT", &base, "grants", json!({"grants":[]})),
+        409,
+        "idempotency_conflict",
+    );
+    for grants in [
+        json!([{"route":"postgres","mode":"read_only"},{"route":"postgres","mode":"read_write"}]),
+        json!([{"route":"","mode":"read_only"}]),
+        json!([{"route":"postgres","mode":"unknown"}]),
+        json!([{"route":"postgres","mode":"read_only","extra":true}]),
+    ] {
+        error_is(
+            f.mutation("PUT", &base, "invalid", json!({"grants":grants})),
+            400,
+            "bad_request",
+        );
+    }
+    assert_eq!(
+        f.mutation("PUT", &base, "remove", json!({"grants":[]}))
+            .status(),
+        200
+    );
+    assert_eq!(
+        f.ctx()
+            .authority
+            .session(f.sessions[0])
+            .unwrap()
+            .revoke_reason,
+        Some(EndReason::GrantRemoved)
+    );
+    let configured = f
+        .ctx()
+        .authority
+        .principal_by_name("configured")
+        .unwrap()
+        .id;
+    let path = format!("/v1/principals/{}/grants", configured.to_hex());
+    assert_eq!(
+        f.mutation("PUT", &path, "config-grants", body).status(),
+        200
+    );
+    assert_eq!(f.ctx().authority.grants_of(configured).len(), 2);
 }

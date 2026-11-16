@@ -116,6 +116,58 @@ fn session_view(ctx: &MgmtContext, s: &AccessSession) -> Value {
         "revoke_reason":s.revoke_reason.map(EndReason::as_str), "label":s.label,
         "isolated":s.isolated, "scope":s.scope, "scope_continuity":ctx.authority.scope_continuous(s)})
 }
+fn principal_view(ctx: &MgmtContext, id: PrincipalId) -> Result<Value, AuthorityError> {
+    let p = ctx
+        .authority
+        .principal(id)
+        .ok_or(AuthorityError::NotFound)?;
+    let mut value = json!(p);
+    value["grants"] = json!(
+        ctx.authority
+            .grants_of(id)
+            .into_iter()
+            .map(|(route, mode)| json!({"route":route,"mode":mode}))
+            .collect::<Vec<_>>()
+    );
+    value["credentials"] = json!(ctx.authority.credentials_of(id));
+    Ok(value)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateBody {
+    name: String,
+    kind: PrincipalKind,
+    #[serde(default)]
+    admin: bool,
+    verifier: Option<String>,
+}
+impl fmt::Debug for CreateBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CreateBody { [REDACTED] }")
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrincipalCredentialBody {
+    verifier: String,
+    expires: Option<String>,
+}
+impl fmt::Debug for PrincipalCredentialBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PrincipalCredentialBody { [REDACTED] }")
+    }
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantsBody {
+    grants: Vec<GrantBody>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantBody {
+    route: String,
+    mode: Mode,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcquireBody {
@@ -266,21 +318,9 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
         Sessions | Principals => method == "GET" || method == "POST",
         Session(_) | Principal(_) | Connections | Status => method == "GET",
         Renew(_) | Revoke(_) => method == "POST",
-        Disable(id) | Enable(id) | Credentials(id) => {
-            // B5c consumes this validated principal target.
-            let _ = id;
-            method == "POST"
-        }
-        Credential(id, cid) => {
-            // B5c consumes these validated principal and credential targets.
-            let _ = (id, cid);
-            method == "DELETE"
-        }
-        Grants(id) => {
-            // B5c consumes this validated principal target.
-            let _ = id;
-            method == "PUT"
-        }
+        Disable(_) | Enable(_) | Credentials(_) => method == "POST",
+        Credential(_, _) => method == "DELETE",
+        Grants(_) => method == "PUT",
     };
     if !allowed {
         return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
@@ -373,18 +413,137 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     key,
                 )
             }
-            // B5c: principal, credential and grant mutations.
-            Principals
-            | Principal(_)
-            | Disable(_)
-            | Enable(_)
-            | Credentials(_)
-            | Credential(_, _)
-            | Grants(_)
-            | Session(_)
-            | Connections
-            | Status => {
-                return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+            Principals => {
+                let Ok(request) = serde_json::from_slice::<CreateBody>(body) else {
+                    return bad_request();
+                };
+                let verifier = match request.verifier {
+                    Some(v) => match Verifier::try_from(v) {
+                        Ok(v) => Some(v),
+                        Err(_) => return bad_request(),
+                    },
+                    None => None,
+                };
+                let p = match ctx.authority.create_principal(
+                    &request.name,
+                    request.kind,
+                    request.admin,
+                    key,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => return authority_error(e),
+                };
+                if let Some(v) = verifier
+                    && let Err(e) = ctx.authority.add_principal_credential_idempotent(
+                        caller.principal.unwrap_or(PrincipalId([0; 16])),
+                        p.id,
+                        v,
+                        None,
+                        &format!("create:{key}"),
+                    )
+                {
+                    return authority_error(e);
+                }
+                return match principal_view(ctx, p.id) {
+                    Ok(p) => json_response(StatusCode::CREATED, p),
+                    Err(e) => authority_error(e),
+                };
+            }
+            Disable(id) | Enable(id) => {
+                if serde_json::from_slice::<RevokeBody>(body).is_err() {
+                    return bad_request();
+                }
+                if let Err(e) = ctx.authority.set_principal_enabled_idempotent(
+                    caller.principal.unwrap_or(PrincipalId([0; 16])),
+                    id,
+                    matches!(ep, Enable(_)),
+                    key,
+                ) {
+                    return authority_error(e);
+                }
+                return match principal_view(ctx, id) {
+                    Ok(p) => json_response(StatusCode::OK, p),
+                    Err(e) => authority_error(e),
+                };
+            }
+            Credentials(id) => {
+                let Ok(request) = serde_json::from_slice::<PrincipalCredentialBody>(body) else {
+                    return bad_request();
+                };
+                let Ok(verifier) = Verifier::try_from(request.verifier) else {
+                    return bad_request();
+                };
+                let expires_in_ms = match request.expires {
+                    Some(s) => {
+                        let Some(duration) = crate::config::parse_duration(&s) else {
+                            return bad_request();
+                        };
+                        let Ok(ms) = u64::try_from(duration.as_millis()) else {
+                            return bad_request();
+                        };
+                        if ms == 0 {
+                            return bad_request();
+                        }
+                        Some(ms)
+                    }
+                    None => None,
+                };
+                return match ctx.authority.add_principal_credential_idempotent(
+                    caller.principal.unwrap_or(PrincipalId([0; 16])),
+                    id,
+                    verifier,
+                    expires_in_ms,
+                    key,
+                ) {
+                    Ok(c) => json_response(StatusCode::CREATED, c),
+                    Err(AuthorityError::LifetimeTooLong) => bad_request(),
+                    Err(e) => authority_error(e),
+                };
+            }
+            Credential(id, cid) => {
+                if serde_json::from_slice::<RevokeBody>(body).is_err() {
+                    return bad_request();
+                }
+                return match ctx.authority.revoke_principal_credential_idempotent(
+                    caller.principal.unwrap_or(PrincipalId([0; 16])),
+                    id,
+                    cid,
+                    key,
+                ) {
+                    Ok(c) => json_response(StatusCode::OK, c),
+                    Err(e) => authority_error(e),
+                };
+            }
+            Grants(id) => {
+                let Ok(request) = serde_json::from_slice::<GrantsBody>(body) else {
+                    return bad_request();
+                };
+                let mut routes = std::collections::HashSet::new();
+                let mut grants = Vec::new();
+                for grant in request.grants {
+                    let Some(route) = RouteId::new(&grant.route) else {
+                        return bad_request();
+                    };
+                    if !routes.insert(route.clone()) {
+                        return bad_request();
+                    }
+                    grants.push((route, grant.mode));
+                }
+                if let Err(e) = ctx.authority.set_grants_idempotent(
+                    caller.principal.unwrap_or(PrincipalId([0; 16])),
+                    id,
+                    grants,
+                    key,
+                ) {
+                    return authority_error(e);
+                }
+                return match principal_view(ctx, id) {
+                    Ok(p) => json_response(StatusCode::OK, p),
+                    Err(e) => authority_error(e),
+                };
+            }
+            Principal(_) | Session(_) | Connections | Status => {
+                return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
             }
         };
         return match result {
@@ -414,21 +573,10 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
             None => return error(StatusCode::NOT_FOUND, "not_found"),
         },
         Principals => json!(ctx.authority.principals()),
-        Principal(id) => {
-            let Some(p) = ctx.authority.principal(id) else {
-                return error(StatusCode::NOT_FOUND, "not_found");
-            };
-            let mut value = json!(p);
-            value["grants"] = json!(
-                ctx.authority
-                    .grants_of(id)
-                    .into_iter()
-                    .map(|(route, mode)| json!({"route":route,"mode":mode}))
-                    .collect::<Vec<_>>()
-            );
-            value["credentials"] = json!(ctx.authority.credentials_of(id));
-            value
-        }
+        Principal(id) => match principal_view(ctx, id) {
+            Ok(p) => p,
+            Err(e) => return authority_error(e),
+        },
         Connections => json!(ctx.connections.list()),
         Status => {
             json!({"deployment_id":data_encoding::HEXLOWER.encode(&ctx.authority.deployment_id()),
