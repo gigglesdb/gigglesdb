@@ -41,8 +41,12 @@ pub(crate) struct Settings {
     pub xmloption: String,
     pub default_read_only: bool,
     pub transaction_read_only: bool,
+    /// Requested levels, as PostgreSQL keeps them; reporting maps them to the
+    /// level `engine` executes (`pg_transaction::effective_isolation`).
     pub default_isolation: crate::pg_transaction::IsolationLevel,
     pub transaction_isolation: crate::pg_transaction::IsolationLevel,
+    /// The storage engine this session's transactions run on.
+    pub engine: giggles_core::Engine,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -63,6 +67,8 @@ impl Default for Settings {
             transaction_read_only: false,
             default_isolation: crate::pg_transaction::DEFAULT_ISOLATION,
             transaction_isolation: crate::pg_transaction::DEFAULT_ISOLATION,
+            // The pgwire session overwrites this with its Admin's engine.
+            engine: giggles_core::Engine::Legacy,
         }
     }
 }
@@ -118,8 +124,7 @@ impl SessionSettings {
             self.saved = Some(self.current.clone());
             self.queried = false;
             self.current.transaction_read_only = self.current.default_read_only;
-            self.current.transaction_isolation =
-                crate::pg_transaction::effective_isolation(self.current.default_isolation);
+            self.current.transaction_isolation = self.current.default_isolation;
             self.local.clear();
         }
         if was && !now {
@@ -137,8 +142,7 @@ impl SessionSettings {
             self.local.clear();
             self.queried = false;
             self.current.transaction_read_only = self.current.default_read_only;
-            self.current.transaction_isolation =
-                crate::pg_transaction::effective_isolation(self.current.default_isolation);
+            self.current.transaction_isolation = self.current.default_isolation;
         }
     }
     pub fn apply(&mut self, setting: &Setting, in_transaction: bool) -> bool {
@@ -171,8 +175,7 @@ impl SessionSettings {
         }
         if !in_transaction {
             self.current.transaction_read_only = self.current.default_read_only;
-            self.current.transaction_isolation =
-                crate::pg_transaction::effective_isolation(self.current.default_isolation);
+            self.current.transaction_isolation = self.current.default_isolation;
         }
         false
     }
@@ -294,13 +297,21 @@ impl Show {
             ),
             Self::TransactionIsolation => (
                 "transaction_isolation",
-                settings.transaction_isolation.name().into(),
+                crate::pg_transaction::effective_isolation(
+                    settings.transaction_isolation,
+                    settings.engine,
+                )
+                .name()
+                .into(),
             ),
             Self::DefaultTransactionIsolation => (
                 "default_transaction_isolation",
-                crate::pg_transaction::effective_isolation(settings.default_isolation)
-                    .name()
-                    .into(),
+                crate::pg_transaction::effective_isolation(
+                    settings.default_isolation,
+                    settings.engine,
+                )
+                .name()
+                .into(),
             ),
             Self::TransactionReadOnly => (
                 "transaction_read_only",

@@ -1,4 +1,4 @@
-//! PostgreSQL transaction modes. The engine currently executes at serializable.
+//! PostgreSQL transaction modes, and the level each storage engine executes.
 use crate::pg_settings::database::Parser;
 
 type Result<T> = std::result::Result<T, &'static str>;
@@ -28,19 +28,34 @@ impl IsolationLevel {
         }
     }
 }
-/// GD-0054 F3b (track F v2 engine) will add real READ COMMITTED (planned default)
-/// and REPEATABLE READ; change this default-setting normalization then.
-/// Explicit transaction modes retain the requested level for reporting only;
-/// the storage engine still executes every transaction at serializable.
-pub(crate) fn effective_isolation(requested: IsolationLevel) -> IsolationLevel {
-    match requested {
-        IsolationLevel::Serializable
-        | IsolationLevel::RepeatableRead
-        | IsolationLevel::ReadCommitted
-        | IsolationLevel::ReadUncommitted => IsolationLevel::Serializable,
+/// The level `engine` executes for a `requested` level, which is what
+/// `transaction_isolation` and `default_transaction_isolation` report
+/// (GD-0075 R5-75). Sessions keep the requested level; only reporting maps it.
+/// - Legacy publishes each SQL transaction only if no other commit happened
+///   since its snapshot, so every request runs SERIALIZABLE.
+/// - v2 runs the requested level (R5-76). READ UNCOMMITTED runs as READ
+///   COMMITTED and, as in PostgreSQL, still reports `read uncommitted`.
+pub(crate) fn effective_isolation(
+    requested: IsolationLevel,
+    engine: giggles_core::Engine,
+) -> IsolationLevel {
+    match engine {
+        giggles_core::Engine::Legacy => IsolationLevel::Serializable,
+        giggles_core::Engine::V2 => requested,
     }
 }
-pub(crate) const DEFAULT_ISOLATION: IsolationLevel = IsolationLevel::Serializable;
+/// The v2 engine level for a requested PostgreSQL level.
+pub(crate) fn sql_isolation(requested: IsolationLevel) -> giggles_core::SqlIsolation {
+    match requested {
+        IsolationLevel::Serializable => giggles_core::SqlIsolation::Serializable,
+        IsolationLevel::RepeatableRead => giggles_core::SqlIsolation::RepeatableRead,
+        IsolationLevel::ReadCommitted | IsolationLevel::ReadUncommitted => {
+            giggles_core::SqlIsolation::ReadCommitted
+        }
+    }
+}
+/// PostgreSQL's default requested level; `effective_isolation` gives what runs.
+pub(crate) const DEFAULT_ISOLATION: IsolationLevel = IsolationLevel::ReadCommitted;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Modes {
     pub isolation: Option<IsolationLevel>,
@@ -209,6 +224,17 @@ pub(crate) fn parse(sql: &str) -> Result<Option<Command>> {
 mod tests {
     use super::*;
     #[test]
+    fn read_uncommitted_runs_read_committed() {
+        assert_eq!(
+            sql_isolation(IsolationLevel::ReadUncommitted),
+            giggles_core::SqlIsolation::ReadCommitted
+        );
+        assert_eq!(
+            sql_isolation(IsolationLevel::RepeatableRead),
+            giggles_core::SqlIsolation::RepeatableRead
+        );
+    }
+    #[test]
     fn every_requested_isolation_maps_to_the_engine_level() {
         for requested in [
             IsolationLevel::Serializable,
@@ -216,7 +242,14 @@ mod tests {
             IsolationLevel::ReadCommitted,
             IsolationLevel::ReadUncommitted,
         ] {
-            assert_eq!(effective_isolation(requested), IsolationLevel::Serializable);
+            assert_eq!(
+                effective_isolation(requested, giggles_core::Engine::Legacy),
+                IsolationLevel::Serializable
+            );
+            assert_eq!(
+                effective_isolation(requested, giggles_core::Engine::V2),
+                requested
+            );
         }
     }
     #[test]

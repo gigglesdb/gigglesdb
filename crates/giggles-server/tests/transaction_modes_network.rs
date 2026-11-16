@@ -306,14 +306,14 @@ async fn isolation_levels_modes_and_control_synonyms_in_both_protocols() {
         ))
         .await
         .unwrap();
-        assert_eq!(values(&c.simple_query("SHOW transaction_isolation; SHOW default_transaction_isolation; SHOW transaction_read_only; SHOW default_transaction_read_only").await.unwrap()), [level.to_lowercase().as_str(), "serializable", "off", "off"]);
+        assert_eq!(values(&c.simple_query("SHOW transaction_isolation; SHOW default_transaction_isolation; SHOW transaction_read_only; SHOW default_transaction_read_only").await.unwrap()), ["serializable", "serializable", "off", "off"]);
         c.simple_query("END WORK").await.unwrap();
         c.execute(&format!("BEGIN ISOLATION LEVEL {level}"), &[])
             .await
             .unwrap();
         let rows = c.query("SHOW transaction_isolation", &[]).await.unwrap();
-        // PostgreSQL reports the requested level; execution stays serializable.
-        assert_eq!(rows[0].get::<_, String>(0), level.to_lowercase());
+        // The legacy engine runs every level serializable and reports that (GD-0075 R5-75).
+        assert_eq!(rows[0].get::<_, String>(0), "serializable");
         c.execute("COMMIT WORK", &[]).await.unwrap();
         c.execute(&format!("SET default_transaction_isolation='{level}'"), &[])
             .await
@@ -436,11 +436,7 @@ async fn set_transaction_before_queries_and_session_defaults() {
         }
         assert_eq!(
             c.query("SHOW transaction_isolation", &[]).await.unwrap()[0].get::<_, String>(0),
-            if extended {
-                "read committed"
-            } else {
-                "serializable"
-            }
+            "serializable"
         );
         assert_eq!(
             c.query("SHOW transaction_read_only", &[]).await.unwrap()[0].get::<_, String>(0),

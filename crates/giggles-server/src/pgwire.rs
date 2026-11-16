@@ -952,6 +952,7 @@ fn begin_implicit(
     settings: &mut crate::pg_settings::SessionSettings,
 ) -> R<()> {
     if !session.in_transaction() {
+        session.set_default_isolation(&settings.current);
         core(session.execute_sql("BEGIN", &[]))?;
         settings.transaction(false, true, "BEGIN");
         *implicit = true;
@@ -1020,6 +1021,7 @@ fn execute_control(
             return Err("25P02");
         }
         if !was {
+            session.set_default_isolation(&settings.current);
             core(session.execute_sql("BEGIN", &[]))?;
         }
     } else if was && let Err(error) = session.execute_sql(actual, &[]) {
@@ -1048,6 +1050,7 @@ impl State {
         session.set_time_zone(&self.settings.current.timezone);
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        session.set_default_isolation(&self.settings.current);
         if tag == b'E' { statement_deadline(&self.settings.current); }
         let result = self.handle_inner(tag, b, session, out, received);
         if !session.in_transaction() {
@@ -2044,6 +2047,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     if !matches!(session.role, Role::Database { .. }) {
         startup_settings.search_path = "public".into();
     }
+    startup_settings.engine = session.service.admin.engine();
     state.settings.defaults = startup_settings.clone();
     state.settings.current = startup_settings;
     session.set_time_zone(&state.settings.current.timezone);

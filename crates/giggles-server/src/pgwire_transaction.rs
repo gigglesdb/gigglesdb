@@ -35,7 +35,7 @@ pub(super) fn execute_mode(
     diagnostic: &mut Diagnostic,
     out: &mut Vec<u8>,
 ) -> R<&'static str> {
-    use crate::pg_transaction::{Command, effective_isolation};
+    use crate::pg_transaction::Command;
     if !session.role.is_sql() {
         return Err("42501");
     }
@@ -45,6 +45,12 @@ pub(super) fn execute_mode(
             let actual = execute_control("BEGIN", session, implicit, settings, out)?;
             if starting {
                 if let Some(isolation) = modes.isolation {
+                    // Re-level the transaction BEGIN just opened (GD-0075 R5-76). An
+                    // implicit block that already wrote cannot change level.
+                    session
+                        .sql
+                        .set_transaction_isolation(crate::pg_transaction::sql_isolation(isolation))
+                        .map_err(|_| "25001")?;
                     settings.current.transaction_isolation = isolation;
                 }
                 if let Some(read_only) = modes.read_only {
@@ -117,6 +123,15 @@ pub(super) fn execute_mode(
                     return Err("25001");
                 }
                 if let Some(isolation) = modes.isolation {
+                    if session
+                        .sql
+                        .set_transaction_isolation(crate::pg_transaction::sql_isolation(isolation))
+                        .is_err()
+                    {
+                        diagnostic.message =
+                            Some("SET TRANSACTION ISOLATION LEVEL must be called before any query");
+                        return Err("25001");
+                    }
                     settings.current.transaction_isolation = isolation;
                 }
                 if let Some(read_only) = modes.read_only {
@@ -133,9 +148,7 @@ pub(super) fn execute_mode(
             for (name, value) in [
                 (
                     Show::DefaultTransactionIsolation,
-                    modes
-                        .isolation
-                        .map(|level| effective_isolation(level).name().to_owned()),
+                    modes.isolation.map(|level| level.name().to_owned()),
                 ),
                 (
                     Show::DefaultTransactionReadOnly,

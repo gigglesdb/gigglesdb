@@ -636,6 +636,27 @@ pub enum Engine {
     Legacy,
     V2,
 }
+/// The isolation level of a SQL transaction on the v2 engine (GD-0075 R5-76).
+/// PostgreSQL's READ UNCOMMITTED runs as READ COMMITTED. The legacy engine
+/// runs every SQL transaction serializable and ignores the level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SqlIsolation {
+    #[default]
+    ReadCommitted,
+    /// One snapshot per transaction; a concurrent update of a row it writes fails with 40001.
+    RepeatableRead,
+    /// REPEATABLE READ plus commit-time validation of every row and range it read (40001).
+    Serializable,
+}
+impl SqlIsolation {
+    pub(crate) fn engine(self) -> engine::txn::Isolation {
+        match self {
+            Self::ReadCommitted => engine::txn::Isolation::ReadCommitted,
+            Self::RepeatableRead => engine::txn::Isolation::RepeatableRead,
+            Self::Serializable => engine::txn::Isolation::Serializable,
+        }
+    }
+}
 const TASK_EXECUTORS: &str = "task executors";
 const PROTECTED_OPERATIONS: &str = "protected operations";
 const KERNEL_RECORDS: &str = "kernel records";
@@ -1304,7 +1325,8 @@ impl Admin {
         self.inner.db(KERNEL_RECORDS)?;
         self.inner.inspect(|s| Ok(s.view.clone()))
     }
-    pub(crate) fn engine(&self) -> Engine {
+    /// The storage engine behind this handle.
+    pub fn engine(&self) -> Engine {
         match &self.inner.backend {
             Backend::Legacy(_) => Engine::Legacy,
             Backend::V2(_) => Engine::V2,
@@ -1939,6 +1961,7 @@ pub struct SqlSession {
     sequence_baseline: BTreeMap<u64, u128>,
     sequence_tables: Option<std::collections::BTreeSet<String>>,
     deferral: relational::DeferralState,
+    isolation: SqlIsolation,
 }
 mod complete_relation;
 pub(crate) use complete_relation::CompleteRelation;
@@ -1968,6 +1991,7 @@ impl Admin {
             sequence_baseline: BTreeMap::new(),
             sequence_tables: None,
             deferral: Default::default(),
+            isolation: SqlIsolation::ReadCommitted,
         }
     }
     /// Catalog preflight for the lossless logical archive profile. Refuse catalog
@@ -2244,6 +2268,22 @@ impl SqlSession {
         self.admin.roles().table_privileges(table, role)
     }
 
+    /// The level of every SQL transaction this session begins from now on:
+    /// BEGIN, and a statement outside a transaction block (GD-0075 R5-76).
+    pub fn set_isolation(&mut self, level: SqlIsolation) {
+        self.isolation = level;
+    }
+    /// Re-levels the open transaction (SET TRANSACTION ISOLATION LEVEL). It
+    /// must not have run a statement yet; callers reject that case first
+    /// (25001). Without an open v2 transaction there is nothing to change.
+    pub fn set_transaction_isolation(&mut self, level: SqlIsolation) -> Result<(), CoreError> {
+        match &mut self.v2_transaction {
+            Some(txn) if txn.isolation() != level.engine() => txn
+                .set_isolation(level.engine())
+                .map_err(|_| CoreError::Sql(relational::SqlError::Transaction)),
+            _ => Ok(()),
+        }
+    }
     /// Set the precision used by SQL floating-point text conversions.
     pub fn set_extra_float_digits(&mut self, value: i32) {
         self.extra_float_digits = value;
@@ -2617,6 +2657,10 @@ impl SqlSession {
                 .as_mut()
                 .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
             txn.begin_statement();
+            // PostgreSQL's LOCK takes no snapshot: a REPEATABLE READ or
+            // SERIALIZABLE transaction snapshots at its first query after the
+            // lock is granted (GD-0075 R5-76).
+            let first = txn.current_snapshot_ts().is_none();
             let mode = match mode {
                 SqlTableLockMode::AccessShare => engine::locks::LockMode::AccessShare,
                 SqlTableLockMode::RowShare => engine::locks::LockMode::RowShare,
@@ -2642,6 +2686,9 @@ impl SqlSession {
                         }
                         engine::catalog::CatalogError::Txn(error) => error.into(),
                     })?;
+            }
+            if first {
+                txn.forget_unused_snapshot();
             }
             Ok(())
         })();

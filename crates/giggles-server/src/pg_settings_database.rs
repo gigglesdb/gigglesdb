@@ -292,11 +292,7 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
             _ => Err("22023"),
         },
         Show::DefaultTransactionIsolation => crate::pg_transaction::IsolationLevel::parse(&lower)
-            .map(|requested| {
-                crate::pg_transaction::effective_isolation(requested)
-                    .name()
-                    .into()
-            }),
+            .map(|requested| requested.name().into()),
         Show::ApplicationName if value.len() <= 128 => Ok(value),
         Show::ExtraFloatDigits => value
             .parse::<i32>()
