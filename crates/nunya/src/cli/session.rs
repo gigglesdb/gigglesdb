@@ -177,6 +177,37 @@ impl HelperStore {
         }
         Self::secure(&self.dir, true)
     }
+    // File drop releases the advisory lock, including on every error path.
+    fn lock(&self) -> Result<fs::File, HelperError> {
+        self.prepare()?;
+        let path = self.dir.join("sessions.lock");
+        if path.try_exists().map_err(|_| HelperError::Store)? {
+            Self::secure(&path, false)?;
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|_| HelperError::Store)?;
+        Self::secure(&path, false)?;
+        file.lock().map_err(|_| HelperError::Store)?;
+        Ok(file)
+    }
+    fn check_available(&self, name: &str) -> Result<(), HelperError> {
+        if self.load()?.contexts.contains_key(name) {
+            Err(HelperError::Conflict)
+        } else {
+            Ok(())
+        }
+    }
+    fn put_new(&self, ctx: &Context) -> Result<(), HelperError> {
+        let _lock = self.lock()?;
+        self.check_available(&ctx.name)?;
+        self.put_unlocked(ctx)
+    }
     fn load(&self) -> Result<Stored, HelperError> {
         self.prepare()?;
         let path = self.dir.join("sessions.json");
@@ -243,12 +274,17 @@ impl HelperStore {
     }
     /// Save a context by its name.
     pub fn put(&self, ctx: &Context) -> Result<(), HelperError> {
+        let _lock = self.lock()?;
+        self.put_unlocked(ctx)
+    }
+    fn put_unlocked(&self, ctx: &Context) -> Result<(), HelperError> {
         let mut data = self.load()?;
         data.contexts.insert(ctx.name.clone(), ctx.clone());
         self.save(&data)
     }
     /// Delete a context.
     pub fn remove(&self, name: &str) -> Result<(), HelperError> {
+        let _lock = self.lock()?;
         let mut data = self.load()?;
         data.contexts.remove(name);
         self.save(&data)
@@ -468,7 +504,14 @@ pub async fn acquire_or_resume(
         rotate(client, store, &mut ctx, opts.mode).await?;
         return Ok(ctx);
     }
-    let existing = store.load()?.contexts.contains_key(name);
+    let existing = {
+        let _lock = store.lock()?;
+        let existing = store.load()?.contexts.contains_key(name);
+        if opts.isolated && opts.connection.context.is_some() {
+            store.check_available(name)?;
+        }
+        existing
+    };
     if opts.isolated {
         if opts.connection.context.is_some() && existing {
             return Err(HelperError::Conflict);
@@ -496,37 +539,41 @@ pub async fn acquire_or_resume(
             secret_sha256: secret.sha256_hex,
         })
         .await?;
-    let name = if opts.isolated && opts.connection.context.is_none() {
-        format!(
-            "isolated-{}",
-            view.id
-                .get(..8)
-                .ok_or(HelperError::Management(ClientError::Decode))?
-        )
-    } else {
-        name.into()
-    };
-    if store.load()?.contexts.contains_key(&name) {
-        return Err(HelperError::Conflict);
+    let acquired_id = view.id.clone();
+    let result = (|| {
+        let name = if opts.isolated && opts.connection.context.is_none() {
+            format!(
+                "isolated-{}",
+                view.id
+                    .get(..8)
+                    .ok_or(HelperError::Management(ClientError::Decode))?
+            )
+        } else {
+            name.into()
+        };
+        let ctx = Context {
+            name,
+            server: opts.connection.server.clone(),
+            principal: opts.connection.principal.clone(),
+            route: view.route,
+            session_id: view.id,
+            secret: secret.secret,
+            scram_salt: Some(secret.scram_salt),
+            scram_iterations: Some(secret.scram_iterations),
+            scope: view.scope,
+            expires_ms: view.expires_ms,
+            pg_host: opts.pg_host.clone(),
+            pg_port: opts.pg_port,
+            isolated: view.isolated,
+            label: view.label,
+        };
+        store.put_new(&ctx)?;
+        Ok(ctx)
+    })();
+    if result.is_err() {
+        let _ = client.revoke(&acquired_id).await;
     }
-    let ctx = Context {
-        name,
-        server: opts.connection.server.clone(),
-        principal: opts.connection.principal.clone(),
-        route: view.route,
-        session_id: view.id,
-        secret: secret.secret,
-        scram_salt: Some(secret.scram_salt),
-        scram_iterations: Some(secret.scram_iterations),
-        scope: view.scope,
-        expires_ms: view.expires_ms,
-        pg_host: opts.pg_host.clone(),
-        pg_port: opts.pg_port,
-        isolated: view.isolated,
-        label: view.label,
-    };
-    store.put(&ctx)?;
-    Ok(ctx)
+    result
 }
 fn rotation_parameters(ctx: &Context) -> Result<(Vec<u8>, u32), HelperError> {
     let salt = ctx
@@ -706,12 +753,10 @@ mod tests {
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
-            Self(
-                std::env::temp_dir().join(format!(
-                    "ny-{}",
-                    &crate::token::SessionId::random().to_hex()[..8]
-                )),
-            )
+            Self(std::env::temp_dir().join(format!(
+                "ny-{}",
+                &crate::token::SessionId::random().to_hex()[..8]
+            )))
         }
     }
     impl Drop for Temp {
@@ -775,6 +820,32 @@ mod tests {
     fn shell_quoting() {
         assert_eq!(quoted("a'b", EnvFormat::Sh).as_str(), "'a'\\''b'");
         assert_eq!(quoted("a'b", EnvFormat::Powershell).as_str(), "'a''b'");
+    }
+    #[test]
+    fn concurrent_put_preserves_all_contexts() {
+        let temp = Temp::new();
+        std::thread::scope(|scope| {
+            for worker in 0..2 {
+                let dir = &temp.0;
+                scope.spawn(move || {
+                    let store = HelperStore::at(dir);
+                    for index in 0..20 {
+                        let mut ctx = context();
+                        ctx.name = format!("worker-{worker}-{index}");
+                        store.put(&ctx).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(HelperStore::at(&temp.0).load().unwrap().contexts.len(), 40);
+    }
+    #[test]
+    fn pre_acquire_conflict_is_local() {
+        let temp = Temp::new();
+        let store = HelperStore::at(&temp.0);
+        store.put(&context()).unwrap();
+        let _lock = store.lock().unwrap();
+        assert_eq!(store.check_available("default"), Err(HelperError::Conflict));
     }
     #[test]
     fn store_round_trip() -> Result<(), HelperError> {

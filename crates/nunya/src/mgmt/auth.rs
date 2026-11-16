@@ -58,12 +58,20 @@ fn bearer(headers: &HeaderMap) -> Result<(&str, &str), Unauthorized> {
     }
     Ok((name, secret))
 }
+const AUTH_CHECKS: usize = 4;
+#[cfg(test)]
+thread_local! { static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+fn check(v: &ScramVerifier, secret: &str) -> bool {
+    #[cfg(test)]
+    CHECKS.with(|n| n.set(n.get() + 1));
+    verify_password(v, secret)
+}
 fn dummy(secret: &str) {
     static VERIFIER: OnceLock<ScramVerifier> = OnceLock::new();
     let v = VERIFIER.get_or_init(|| {
         ScramVerifier::from_password("management-dummy", b"management-dummy-salt", 4096)
     });
-    let _ = verify_password(v, secret);
+    let _ = check(v, secret);
 }
 /// Authenticate socket trust or a principal/configuration bearer credential.
 pub fn authenticate(
@@ -79,48 +87,138 @@ pub fn authenticate(
         });
     }
     let (name, secret) = bearer(headers)?;
-    if let Some((_, verifier)) = ctx.admins.iter().find(|(n, _)| n == name) {
-        return if verify_password(verifier, secret) {
-            Ok(Caller {
-                principal: None,
-                name: name.into(),
-                admin: true,
-            })
-        } else {
-            Err(Unauthorized)
-        };
-    }
-    let Some(p) = ctx.authority.principal_by_name(name) else {
-        dummy(secret);
-        return Err(Unauthorized);
+    let principal = ctx.authority.principal_by_name(name);
+    let admin = ctx.admins.iter().find(|(n, _)| n == name);
+    let stored = principal
+        .as_ref()
+        .filter(|p| p.state == PrincipalState::Enabled)
+        .map(|p| ctx.authority.principal_credential_verifiers(p.id))
+        .unwrap_or_default();
+    let mut verifiers: Vec<&ScramVerifier> = if let Some((_, verifier)) = admin {
+        vec![verifier]
+    } else {
+        stored.iter().map(|v| &v.0).collect()
     };
-    if p.state != PrincipalState::Enabled {
-        dummy(secret);
-        return Err(Unauthorized);
-    }
-    let verifiers = ctx.authority.principal_credential_verifiers(p.id);
+    // Stable verifier ordering also handles legacy stores containing over four credentials.
+    verifiers.sort_by_key(|v| v.to_pg_string());
     let mut matches = false;
-    if verifiers.is_empty() {
-        dummy(secret);
-    }
-    for verifier in verifiers {
-        if let Some(parsed) = ScramVerifier::parse(&verifier.0.to_pg_string()) {
-            matches |= verify_password(&parsed, secret);
+    for index in 0..AUTH_CHECKS {
+        if let Some(verifier) = verifiers.get(index) {
+            matches |= check(verifier, secret);
+        } else {
+            dummy(secret);
         }
     }
-    if matches {
-        Ok(Caller {
-            principal: Some(p.id),
-            name: p.name,
-            admin: p.administrator,
-        })
-    } else {
-        Err(Unauthorized)
+    if !matches {
+        return Err(Unauthorized);
     }
+    if admin.is_some() {
+        return Ok(Caller {
+            principal: None,
+            name: name.into(),
+            admin: true,
+        });
+    }
+    let p = principal.ok_or(Unauthorized)?;
+    Ok(Caller {
+        principal: Some(p.id),
+        name: p.name,
+        admin: p.administrator,
+    })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bearer_verification_count_is_uniform() {
+        use crate::{
+            mgmt::{
+                audit::{AuditUnavailable, LifecycleRecord, LifecycleSink},
+                routes::{ConnectionSource, ConnectionView, StatusSource},
+            },
+            state::{
+                authority::{Authority, SessionLimits},
+                model::{PrincipalKind, Verifier},
+                store::RedbStore,
+            },
+            token::{SessionId, keys::RootKey},
+        };
+        use std::sync::Arc;
+        struct Sources;
+        impl ConnectionSource for Sources {
+            fn list(&self) -> Vec<ConnectionView> {
+                vec![]
+            }
+        }
+        impl StatusSource for Sources {
+            fn policy_revision(&self) -> Option<String> {
+                None
+            }
+            fn config_revision(&self) -> Option<String> {
+                None
+            }
+            fn route_ids(&self) -> Vec<String> {
+                vec![]
+            }
+        }
+        impl LifecycleSink for Sources {
+            fn record(&self, _: &LifecycleRecord) -> Result<(), AuditUnavailable> {
+                Ok(())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("auth-count-{}", SessionId::random().to_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store =
+            Arc::new(RedbStore::open(&dir, &RootKey::from_hex(&"72".repeat(32)).unwrap()).unwrap());
+        let authority = Authority::load(store, SessionLimits::default()).unwrap();
+        let verifier = ScramVerifier::from_password("secret", b"auth-count-salt", 4096);
+        for (name, count) in [("disabled", 1), ("zero", 0), ("one", 1), ("four", 4)] {
+            let p = authority
+                .create_principal(name, PrincipalKind::Agent, false, name)
+                .unwrap();
+            for _ in 0..count {
+                authority
+                    .add_principal_credential(
+                        p.id,
+                        Verifier::try_from(verifier.to_pg_string()).unwrap(),
+                        None,
+                    )
+                    .unwrap();
+            }
+            if name == "disabled" {
+                authority.set_principal_enabled(p.id, false).unwrap();
+            }
+        }
+        let ctx = MgmtContext {
+            authority,
+            admins: vec![("configured".into(), verifier)],
+            connections: Arc::new(Sources),
+            status: Arc::new(Sources),
+            lifecycle: Arc::new(Sources),
+        };
+        for (name, accepted) in [
+            ("unknown", false),
+            ("disabled", false),
+            ("zero", false),
+            ("one", true),
+            ("four", true),
+            ("configured", true),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                format!("Bearer nunya.{name}.secret").parse().unwrap(),
+            );
+            CHECKS.with(|n| n.set(0));
+            assert_eq!(
+                authenticate(&ctx, Origin::Network, &headers).is_ok(),
+                accepted
+            );
+            CHECKS.with(|n| assert_eq!(n.get(), AUTH_CHECKS));
+        }
+        drop(ctx);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn header_parsing_rejects_malformed_credentials() {
         assert!(bearer(&HeaderMap::new()).is_err());

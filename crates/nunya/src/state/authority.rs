@@ -400,9 +400,20 @@ impl Authority {
         }
         Ok(p)
     }
-    /// Create an API principal, retrying by a global creation key.
+    /// Create an API principal with the legacy global retry owner.
     pub fn create_principal(
         &self,
+        name: &str,
+        kind: PrincipalKind,
+        admin: bool,
+        idem_key: &str,
+    ) -> Result<Principal, AuthorityError> {
+        self.create_principal_by(PrincipalId([0; 16]), name, kind, admin, idem_key)
+    }
+    /// Create an API principal, retrying by a caller-local creation key.
+    pub fn create_principal_by(
+        &self,
+        owner: PrincipalId,
         name: &str,
         kind: PrincipalKind,
         admin: bool,
@@ -413,7 +424,6 @@ impl Authority {
             return Err(AuthorityError::NameInvalid);
         }
         let key = format!("\0principal:{idem_key}");
-        let owner = PrincipalId([0; 16]);
         let request_hash = hash(&("create_principal", name, kind, admin));
         {
             let v = self.view.read().unwrap();

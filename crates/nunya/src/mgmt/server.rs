@@ -347,7 +347,10 @@ mod tests {
     fn socket_path_byte_length_limit() {
         assert!(socket_path_fits(Path::new(&"a".repeat(107))));
         assert!(!socket_path_fits(Path::new(&"a".repeat(108))));
-        assert!(socket_path_fits(Path::new(&format!("{}a", "\u{e9}".repeat(53)))));
+        assert!(socket_path_fits(Path::new(&format!(
+            "{}a",
+            "\u{e9}".repeat(53)
+        ))));
         assert!(!socket_path_fits(Path::new(&"\u{e9}".repeat(54))));
         assert_eq!(
             SpawnError::SocketPathTooLong.to_string(),

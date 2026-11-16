@@ -2151,3 +2151,100 @@ async fn listener_refuses_overlong_socket_path() -> TransportResult {
     assert_eq!(std::fs::read_dir(&long_dir)?.count(), 0);
     Ok(())
 }
+
+#[test]
+fn credential_limit_and_replay() {
+    let f = Fixture::new();
+    let path = format!("/v1/principals/{}/credentials", f.principals[0].to_hex());
+    let verifier = ScramVerifier::from_password("extra", b"extra-salt", 4096).to_pg_string();
+    let body = Bytes::from(serde_json::json!({"verifier": verifier}).to_string());
+    for key in ["extra-1", "extra-2", "extra-3"] {
+        assert_eq!(
+            f.request_body(
+                Origin::Network,
+                Some(CONFIG),
+                "POST",
+                &path,
+                Some(key),
+                body.clone()
+            )
+            .status(),
+            201
+        );
+    }
+    let refused = f.request_body(
+        Origin::Network,
+        Some(CONFIG),
+        "POST",
+        &path,
+        Some("extra-4"),
+        body.clone(),
+    );
+    assert_eq!(refused.status(), 409);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(refused.body()).unwrap()["error"],
+        "credential_limit"
+    );
+    assert_eq!(
+        f.request_body(
+            Origin::Network,
+            Some(CONFIG),
+            "POST",
+            &path,
+            Some("extra-3"),
+            body
+        )
+        .status(),
+        201
+    );
+}
+#[test]
+fn config_admin_names_reserved_and_retry_owners_separate() {
+    let mut f = Fixture::new();
+    f.ctx.as_mut().unwrap().admins.push((
+        "second-admin".into(),
+        ScramVerifier::from_password("second-secret", b"second-salt", 4096),
+    ));
+    let create = |auth, name: &str| {
+        f.request_body(
+            Origin::Network,
+            Some(auth),
+            "POST",
+            "/v1/principals",
+            Some("same-create-key"),
+            Bytes::from(serde_json::json!({"name":name,"kind":"agent"}).to_string()),
+        )
+    };
+    let first = create(CONFIG, "first-created");
+    let second = create("Bearer nunya.second-admin.second-secret", "second-created");
+    assert_eq!(first.status(), 201);
+    assert_eq!(second.status(), 201);
+    assert_ne!(
+        serde_json::from_slice::<serde_json::Value>(first.body()).unwrap()["id"],
+        serde_json::from_slice::<serde_json::Value>(second.body()).unwrap()["id"]
+    );
+    let collision = create(CONFIG, "second-admin");
+    assert_eq!(collision.status(), 409);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(collision.body()).unwrap()["error"],
+        "name_taken"
+    );
+    // Distinct targets with the same retry key would conflict under a shared owner.
+    for (origin, auth, pid) in [
+        (Origin::Socket, None, f.principals[0]),
+        (Origin::Network, Some(CONFIG), f.principals[1]),
+    ] {
+        assert_eq!(
+            f.request_body(
+                origin,
+                auth,
+                "POST",
+                &format!("/v1/principals/{}/disable", pid.to_hex()),
+                Some("same-disable-key"),
+                Bytes::from_static(b"{}")
+            )
+            .status(),
+            200
+        );
+    }
+}

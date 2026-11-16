@@ -626,6 +626,17 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
             admins,
         })
     });
+    if management.as_ref().is_some_and(|m| {
+        m.admins
+            .iter()
+            .any(|a| standing.iter().any(|p| p.name == a.name))
+    }) {
+        err(
+            &mut e,
+            "management",
+            "admin name conflicts with a standing principal",
+        );
+    }
     if !e.is_empty() {
         return Err(e);
     }
@@ -1028,6 +1039,18 @@ tls = "disable"
             let errors = f.load(&text).unwrap_err();
             assert_eq!(errors, vec!["management: invalid admin configuration"]);
         }
+    }
+    #[test]
+    fn management_admin_name_conflicts_with_standing() {
+        let f = Fixture::new();
+        let verifier = ScramVerifier::from_password("secret", b"salt", 1).to_pg_string();
+        let text = format!(
+            "{EXAMPLE}\n[[standing]]\nname='same'\nverifier='{verifier}'\n[management]\nlisten='127.0.0.1:6481'\n[[management.admin]]\nname='same'\nverifier='{verifier}'"
+        );
+        assert_eq!(
+            f.load(&text).unwrap_err(),
+            vec!["management: admin name conflicts with a standing principal"]
+        );
     }
     #[test]
     fn management_tls_rejects_invalid_files_and_fields() {

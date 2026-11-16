@@ -18,8 +18,26 @@ use http::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{fmt, sync::Arc};
 
+fn idempotency_owner(caller: &Caller, origin: Origin) -> PrincipalId {
+    if let Some(id) = caller.principal {
+        return id;
+    }
+    let mut hash = Sha256::new();
+    match origin {
+        Origin::Socket => hash.update(b"nunya-mgmt-owner\0socket"),
+        Origin::Network => {
+            hash.update(b"nunya-mgmt-owner\0config-admin\0");
+            hash.update(caller.name.as_bytes());
+        }
+    }
+    let digest = hash.finalize();
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest[..16]);
+    PrincipalId(id)
+}
 /// Read-only connection registry adapter.
 pub trait ConnectionSource: Send + Sync {
     /// Snapshot current connections.
@@ -480,13 +498,9 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                 };
                 replay = ctx
                     .authority
-                    .revocation_recorded(caller.principal.unwrap_or(PrincipalId([0; 16])), key);
-                ctx.authority.revoke_idempotent(
-                    caller.principal.unwrap_or(PrincipalId([0; 16])),
-                    id,
-                    reason,
-                    key,
-                )
+                    .revocation_recorded(idempotency_owner(&caller, origin), key);
+                ctx.authority
+                    .revoke_idempotent(idempotency_owner(&caller, origin), id, reason, key)
             }
             Principals => {
                 let Ok(request) = serde_json::from_slice::<CreateBody>(body) else {
@@ -499,7 +513,11 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     },
                     None => None,
                 };
-                let p = match ctx.authority.create_principal(
+                if ctx.admins.iter().any(|(name, _)| name == &request.name) {
+                    return authority_error(AuthorityError::NameTaken);
+                }
+                let p = match ctx.authority.create_principal_by(
+                    idempotency_owner(&caller, origin),
                     &request.name,
                     request.kind,
                     request.admin,
@@ -510,14 +528,17 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                 };
                 if let Some(v) = verifier
                     && let Err(e) = ctx.authority.add_principal_credential_idempotent(
-                        caller.principal.unwrap_or(PrincipalId([0; 16])),
+                        idempotency_owner(&caller, origin),
                         p.id,
                         v,
                         None,
                         &format!("create:{key}"),
                     )
                 {
-                    return authority_error(e);
+                    return match e.into_authority() {
+                        Some(e) => authority_error(e),
+                        None => error(StatusCode::CONFLICT, "credential_limit"),
+                    };
                 }
                 return match principal_view(ctx, p.id) {
                     Ok(p) => json_response(StatusCode::CREATED, p),
@@ -530,9 +551,9 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                 }
                 let disable_replay = ctx
                     .authority
-                    .disablement_recorded(caller.principal.unwrap_or(PrincipalId([0; 16])), key);
+                    .disablement_recorded(idempotency_owner(&caller, origin), key);
                 if let Err(e) = ctx.authority.set_principal_enabled_idempotent(
-                    caller.principal.unwrap_or(PrincipalId([0; 16])),
+                    idempotency_owner(&caller, origin),
                     id,
                     matches!(ep, Enable(_)),
                     key,
@@ -555,7 +576,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                         .is_err()
                 {
                     let _ = ctx.authority.forget_retry(
-                        caller.principal.unwrap_or(PrincipalId([0; 16])),
+                        idempotency_owner(&caller, origin),
                         &format!("\0disable:{key}"),
                     );
                     return audit_unavailable();
@@ -588,15 +609,18 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     None => None,
                 };
                 return match ctx.authority.add_principal_credential_idempotent(
-                    caller.principal.unwrap_or(PrincipalId([0; 16])),
+                    idempotency_owner(&caller, origin),
                     id,
                     verifier,
                     expires_in_ms,
                     key,
                 ) {
                     Ok(c) => json_response(StatusCode::CREATED, c),
-                    Err(AuthorityError::LifetimeTooLong) => bad_request(),
-                    Err(e) => authority_error(e),
+                    Err(e) => match e.into_authority() {
+                        Some(AuthorityError::LifetimeTooLong) => bad_request(),
+                        Some(e) => authority_error(e),
+                        None => error(StatusCode::CONFLICT, "credential_limit"),
+                    },
                 };
             }
             Credential(id, cid) => {
@@ -604,7 +628,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     return bad_request();
                 }
                 return match ctx.authority.revoke_principal_credential_idempotent(
-                    caller.principal.unwrap_or(PrincipalId([0; 16])),
+                    idempotency_owner(&caller, origin),
                     id,
                     cid,
                     key,
@@ -629,7 +653,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     grants.push((route, grant.mode));
                 }
                 if let Err(e) = ctx.authority.set_grants_idempotent(
-                    caller.principal.unwrap_or(PrincipalId([0; 16])),
+                    idempotency_owner(&caller, origin),
                     id,
                     grants,
                     key,
@@ -664,7 +688,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     let _ = ctx.authority.revoke(s.id, EndReason::AdminRevoked);
                 } else if matches!(ep, Revoke(_)) {
                     let _ = ctx.authority.forget_retry(
-                        caller.principal.unwrap_or(PrincipalId([0; 16])),
+                        idempotency_owner(&caller, origin),
                         &format!("\0revoke:{key}"),
                     );
                 }

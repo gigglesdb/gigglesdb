@@ -33,6 +33,33 @@ impl From<AuthorityError> for RenewError {
         Self::Authority(error)
     }
 }
+/// Principal credential addition refusal without credential data.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AddCredentialError {
+    /// Existing authority refusal.
+    Authority(AuthorityError),
+    /// Four active unexpired credentials already exist.
+    CredentialLimit,
+}
+impl AddCredentialError {
+    /// Extract the authority refusal, or none when the credential limit was reached.
+    pub fn into_authority(self) -> Option<AuthorityError> {
+        match self {
+            Self::Authority(e) => Some(e),
+            Self::CredentialLimit => None,
+        }
+    }
+}
+impl From<AuthorityError> for AddCredentialError {
+    fn from(e: AuthorityError) -> Self {
+        Self::Authority(e)
+    }
+}
+impl From<StoreError> for AddCredentialError {
+    fn from(_: StoreError) -> Self {
+        Self::Authority(AuthorityError::Store)
+    }
+}
 impl Authority {
     /// Salt and iterations of the first active, unexpired credential by identifier.
     pub fn session_scram_params(&self, id: SessionId) -> Option<(Vec<u8>, u32)> {
@@ -163,7 +190,7 @@ impl Authority {
         verifier: Verifier,
         expires_in_ms: Option<u64>,
         key: &str,
-    ) -> Result<CredentialSummary, AuthorityError> {
+    ) -> Result<CredentialSummary, AddCredentialError> {
         let _writer = self.writer.lock().unwrap();
         self.api_principal(id)?;
         let key = format!("\0credential:{key}");
@@ -174,7 +201,18 @@ impl Authority {
                 .credentials_of(id)
                 .into_iter()
                 .find(|c| c.id == cid)
-                .ok_or(AuthorityError::Store);
+                .ok_or(AuthorityError::Store)
+                .map_err(Into::into);
+        }
+        let now = self.store.now_ms();
+        if self
+            .credentials_of(id)
+            .iter()
+            .filter(|c| c.state == CredentialState::Active && c.expires_ms.is_none_or(|e| now < e))
+            .count()
+            >= 4
+        {
+            return Err(AddCredentialError::CredentialLimit);
         }
         let expires_ms = expires_in_ms
             .map(|duration| {
@@ -463,7 +501,7 @@ mod tests {
         assert_eq!(
             a.add_principal_credential_idempotent(p.id, p.id, verifier(), None, "add")
                 .unwrap_err(),
-            AuthorityError::IdempotencyConflict
+            AddCredentialError::Authority(AuthorityError::IdempotencyConflict)
         );
         let independent = a
             .add_principal_credential_idempotent(other.id, p.id, verifier(), None, "add")
