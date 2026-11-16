@@ -372,12 +372,17 @@ impl Session {
                     }
                 }
                 Frontend::Execute { portal, max_rows } => {
+                    // Admit at processing time so deferred executes use current authority.
+                    let mode = self.admit()?;
                     let portal_state = self
                         .portals
                         .get(&portal)
                         .cloned()
                         .ok_or_else(|| failure(NyCode::NotAnalysable))?;
                     let p = portal_state.prepared;
+                    if !mode.permits_write() && writes(&p.kind) {
+                        return Err(failure(NyCode::StatementNotAllowed));
+                    }
                     let snapshot = self.ctx.snapshot.read().map_err(|_| protocol())?.clone();
                     if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms)
                         > p.policy.snapshot_max_age_ms

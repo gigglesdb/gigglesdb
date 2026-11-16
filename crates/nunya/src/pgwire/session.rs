@@ -16,7 +16,10 @@ use crate::{
     },
     policy::{DomainName, Policy, TokenizeSetting},
     readlog::{Outcome, ReadLogRecord, redact_tokenize_args, statement_fingerprint},
-    state::authority::{TokenizeError, TokenizeLimits},
+    state::{
+        authority::{AdmitError, Operation, TokenizeError, TokenizeLimits},
+        model::Mode,
+    },
     token::{PrincipalId, ScopeKeys, SessionId, TokenCodec, keys::derive_scope_v2},
     value::SqlValue,
 };
@@ -121,6 +124,18 @@ impl Session {
             extended_execute_forwarded: false,
             rollback_on_sync: false,
         }
+    }
+    fn admit(&self) -> Result<Mode, Refusal> {
+        self.ctx
+            .authority
+            .admit(self.session, Operation::Read)
+            .map(|admitted| admitted.mode)
+            .map_err(|error| {
+                failure(match error {
+                    AdmitError::Unknown | AdmitError::Ended => NyCode::SessionEnded,
+                    AdmitError::ReadOnly => NyCode::StatementNotAllowed,
+                })
+            })
     }
     fn ready(&self) -> Backend {
         Backend::ReadyForQuery(if self.aborted && self.status != b'I' {
@@ -243,6 +258,8 @@ impl Session {
     }
     fn query(&mut self, sql: &str) -> Actions {
         let result = (|| {
+            // Admit at processing time so deferred queries use current authority.
+            let mode = self.admit()?;
             let policy = self.ctx.policy.read().map_err(|_| protocol())?.clone();
             let snapshot = self.ctx.snapshot.read().map_err(|_| protocol())?.clone();
             if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms)
@@ -255,6 +272,9 @@ impl Session {
                 Err(_) if self.aborted => return Ok(None),
                 Err(e) => return Err(e),
             };
+            if !mode.permits_write() && statements.iter().any(|s| writes(&s.kind)) {
+                return Err(failure(NyCode::StatementNotAllowed));
+            }
             if self.aborted
                 && (statements.len() != 1 || !statements.iter().all(|s| recovery(&s.kind)))
             {
@@ -553,6 +573,21 @@ impl Session {
             | Backend::NegotiateProtocolVersion { .. }
             | Backend::Refused(_) => Err(protocol()),
         }
+    }
+}
+fn writes(kind: &StatementKind) -> bool {
+    match kind {
+        StatementKind::Insert | StatementKind::Update | StatementKind::Delete => true,
+        StatementKind::Select
+        | StatementKind::Begin
+        | StatementKind::Commit
+        | StatementKind::Rollback
+        | StatementKind::Savepoint
+        | StatementKind::ReleaseSavepoint
+        | StatementKind::RollbackToSavepoint
+        | StatementKind::SessionNoop { .. }
+        | StatementKind::Tokenize { .. }
+        | StatementKind::Refused(_) => false,
     }
 }
 fn recovery(kind: &StatementKind) -> bool {
@@ -1324,9 +1359,12 @@ mod tests {
     }
 
     fn acquire_login(f: &Fixture, route: &str) -> (SessionId, PrincipalId) {
+        acquire_login_with_mode(f, route, Mode::ReadWrite)
+    }
+    fn acquire_login_with_mode(f: &Fixture, route: &str, mode: Mode) -> (SessionId, PrincipalId) {
         use crate::state::{
             authority::AcquireRequest,
-            model::{Mode, PrincipalKind, RouteId, Verifier},
+            model::{PrincipalKind, RouteId, Verifier},
         };
         use sha2::{Digest, Sha256};
         let a = &f.ctx.authority;
@@ -1334,7 +1372,7 @@ mod tests {
             .create_principal("api-agent", PrincipalKind::Agent, false, "login")
             .unwrap();
         let route = RouteId::new(route).unwrap();
-        a.set_grants(p.id, vec![(route.clone(), Mode::ReadWrite)])
+        a.set_grants(p.id, vec![(route.clone(), mode)])
             .unwrap();
         a.add_principal_credential(
             p.id,
@@ -1366,6 +1404,131 @@ mod tests {
             )
             .unwrap();
         (s.id, p.id)
+    }
+    fn prepare_admission_portal(session: &mut Session, sql: &str) {
+        let out = session.frontend(Frontend::Parse {
+            name: "s".into(),
+            query: sql.into(),
+            param_types: vec![],
+        });
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Parse { .. }]));
+        assert!(matches!(
+            session.backend(Backend::ParseComplete).client.as_slice(),
+            [Backend::ParseComplete]
+        ));
+        let out = session.frontend(Frontend::Bind {
+            portal: "p".into(),
+            statement: "s".into(),
+            param_formats: vec![],
+            params: vec![],
+            result_formats: vec![],
+        });
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Bind { .. }]));
+        assert!(matches!(
+            session.backend(Backend::BindComplete).client.as_slice(),
+            [Backend::BindComplete]
+        ));
+    }
+    #[test]
+    fn admission_simple_query_after_revocation() {
+        let f = Fixture::new();
+        let mut session = f.session();
+        f.ctx
+            .authority
+            .revoke(session.session, crate::state::model::EndReason::AdminRevoked)
+            .unwrap();
+        let out = session.frontend(Frontend::Query("SELECT value FROM items".into()));
+        assert_eq!(code(&out), "NY011");
+        assert!(out.close);
+        assert!(out.upstream.is_empty());
+        assert_eq!(out.client.len(), 1);
+        assert_eq!(*f.records.lock().unwrap(), vec![(0, 0)]);
+    }
+    #[test]
+    fn admission_execute_after_revocation() {
+        let f = Fixture::new();
+        let mut session = f.session();
+        prepare_admission_portal(&mut session, "SELECT value FROM items");
+        f.ctx
+            .authority
+            .revoke(session.session, crate::state::model::EndReason::AdminRevoked)
+            .unwrap();
+        let out = session.frontend(Frontend::Execute {
+            portal: "p".into(),
+            max_rows: 0,
+        });
+        assert_eq!(code(&out), "NY011");
+        assert!(out.close);
+        assert!(out.upstream.is_empty());
+        assert_eq!(*f.records.lock().unwrap(), vec![(0, 0)]);
+    }
+    #[test]
+    fn admission_read_only_simple_write_refused_read_forwarded() {
+        let f = Fixture::new();
+        let (id, principal) = acquire_login_with_mode(&f, "postgres", Mode::ReadOnly);
+        let mut session = f.for_access(id, principal);
+        let out = session.frontend(Frontend::Query(
+            "INSERT INTO items(value) VALUES (NULL)".into(),
+        ));
+        assert_eq!(code(&out), "NY006");
+        assert!(!out.close);
+        assert!(out.upstream.is_empty());
+        let out = session.frontend(Frontend::Query("SELECT value FROM items".into()));
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Query(_)]));
+    }
+    #[test]
+    fn admission_read_only_execute_write_refused() {
+        let f = Fixture::new();
+        let (id, principal) = acquire_login_with_mode(&f, "postgres", Mode::ReadOnly);
+        let mut session = f.for_access(id, principal);
+        prepare_admission_portal(&mut session, "INSERT INTO items(value) VALUES (NULL)");
+        let out = session.frontend(Frontend::Execute {
+            portal: "p".into(),
+            max_rows: 0,
+        });
+        assert_eq!(code(&out), "NY006");
+        assert!(!out.close);
+        assert!(out.upstream.is_empty());
+    }
+    #[test]
+    fn admission_reduced_grant_refuses_next_write_allows_read() {
+        let f = Fixture::new();
+        let mut session = f.session();
+        prepare_admission_portal(&mut session, "INSERT INTO items(value) VALUES (NULL)");
+        f.ctx
+            .authority
+            .set_grants(session.principal, vec![(f.ctx.route.clone(), Mode::ReadOnly)])
+            .unwrap();
+        let out = session.frontend(Frontend::Execute {
+            portal: "p".into(),
+            max_rows: 0,
+        });
+        assert_eq!(code(&out), "NY006");
+        assert!(out.upstream.is_empty());
+        let sync = session.frontend(Frontend::Sync);
+        assert!(matches!(sync.upstream.as_slice(), [Frontend::Sync]));
+        session.backend(Backend::ReadyForQuery(b'I'));
+        let out = session.frontend(Frontend::Query(
+            "INSERT INTO items(value) VALUES (NULL)".into(),
+        ));
+        assert_eq!(code(&out), "NY006");
+        assert!(out.upstream.is_empty());
+        let out = session.frontend(Frontend::Query("SELECT value FROM items".into()));
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Query(_)]));
+    }
+    #[test]
+    fn admission_read_only_mixed_query_refused_as_a_whole() {
+        let f = Fixture::new();
+        let (id, principal) = acquire_login_with_mode(&f, "postgres", Mode::ReadOnly);
+        let mut session = f.for_access(id, principal);
+        let out = session.frontend(Frontend::Query(
+            "SELECT value FROM items; INSERT INTO items(value) VALUES (NULL)".into(),
+        ));
+        assert_eq!(code(&out), "NY006");
+        assert!(out.upstream.is_empty());
+        assert!(session.active.is_empty());
+        assert_eq!(f.allowed_records.load(Ordering::Relaxed), 0);
+        assert_eq!(*f.records.lock().unwrap(), vec![(0, 0)]);
     }
     async fn assert_login_refused(f: &mut Fixture, user: &str, password: &str) {
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
