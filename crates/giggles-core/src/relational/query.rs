@@ -5179,8 +5179,9 @@ impl BoundQuery<'_> {
             affected: 0,
         };
         let mut result_bytes = 0usize;
-        // Computed inputs and SUM/AVG keep the statement-wide scalar work budget (DD-0068
-        // aggregate_scalar_work_budget_is_shared_over_full_input).
+        // Computed aggregate inputs keep the statement-wide scalar work budget (DD-0068
+        // aggregate_scalar_work_budget_is_shared_over_full_input). On v2, SUM/AVG
+        // transitions use a per-value budget like PostgreSQL's constant-size state.
         let mut aggregate_work_bytes = 0usize;
         if self.query.distinct() && !self.aggregate {
             let mut seen = std::collections::BTreeSet::new();
@@ -5245,10 +5246,10 @@ impl BoundQuery<'_> {
                 .collect::<Vec<_>>();
             let scope = RetentionScope::new(execution);
             let mut auxiliary = aggregate_auxiliary(&self.items, &mut scope.borrow())?;
-            if source.streams_reductions() && self.items.iter().all(|item|
-                !matches!(item, BoundItem::Aggregate(a, _) if matches!(a.base(), Aggregate::Sum | Aggregate::Avg))) {
+            if source.streams_reductions() {
                 for (aux, (item, _)) in auxiliary.iter_mut().zip(&self.query.items) {
                     aux.stream_column = matches!(item, Item::Aggregate(a, Some(Scalar::Column(_))) if !a.distinct());
+                    aux.local_transition = true;
                 }
             }
             scope.borrow().charge(aggregate_retained(&values))?;
@@ -5606,6 +5607,9 @@ fn eval_like(
 
 struct AggregateAuxiliary {
     stream_column: bool,
+    // V2: SUM/AVG numeric transitions charge a per-value budget, not the
+    // statement-wide one, so constant-size running state never hits 54000.
+    local_transition: bool,
     count: i64,
     distinct: std::collections::BTreeSet<grouping::Key>,
 }
@@ -5618,6 +5622,7 @@ fn aggregate_auxiliary(
         .iter()
         .map(|_| AggregateAuxiliary {
             stream_column: false,
+            local_transition: false,
             count: 0,
             distinct: std::collections::BTreeSet::new(),
         })
@@ -5641,7 +5646,11 @@ fn finish_aggregates(
                 Value::Float8(sum) => Value::Float8(Float8::from_bits(
                     (sum.value() / state.count as f64).to_bits(),
                 )),
-                sum => functions::aggregate_numeric_average(sum, state.count, work)?,
+                sum => {
+                    let mut local = 0;
+                    let budget = if state.local_transition { &mut local } else { &mut *work };
+                    functions::aggregate_numeric_average(sum, state.count, budget)?
+                }
             };
         }
     }
@@ -5695,16 +5704,20 @@ fn update_filtered_aggregates(
         {
             continue;
         }
-        // A fixed-width column read allocates no scalar intermediate. V2 can keep
-        // this scratch row-local for COUNT/MIN/MAX. Computed arguments and every
-        // SUM/AVG query retain DD-0068's cumulative work budget unchanged.
+        // A fixed-width or numeric column read is one stored value. V2 keeps this
+        // scratch row-local; computed arguments retain DD-0068's cumulative budget.
         let mut column_work = 0;
         let evaluated = c.as_ref().map(|e| e.eval(row, params,
             if auxiliary[index].stream_column && matches!(e.ty,
-                DataType::SmallInt | DataType::Integer | DataType::BigInt
+                DataType::SmallInt | DataType::Integer | DataType::BigInt | DataType::Numeric
                 | DataType::Boolean | DataType::Real | DataType::DoublePrecision) {
                 &mut column_work
-            } else { work })).transpose()?;
+            } else { &mut *work })).transpose()?;
+        // SUM/AVG keep a running sum and count; on v2 each transition is guarded
+        // per value (digit/scale limits, 22003) rather than cumulatively.
+        let mut transition_work = 0;
+        let transition: &mut usize =
+            if auxiliary[index].local_transition { &mut transition_work } else { &mut *work };
         let v = evaluated.as_ref();
         if v == Some(&Value::Null) {
             continue;
@@ -5732,7 +5745,7 @@ fn update_filtered_aggregates(
             Aggregate::Avg => {
                 let v = v.ok_or(SqlError::Type)?;
                 value = if columns[index].data_type == DataType::Numeric {
-                    functions::aggregate_numeric_add(value, v.clone(), work)?
+                    functions::aggregate_numeric_add(value, v.clone(), transition)?
                 } else {
                     let n = match v {
                         Value::Float4(n) => f64::from(n.value()),
@@ -5758,7 +5771,7 @@ fn update_filtered_aggregates(
                     DataType::Numeric => functions::aggregate_numeric_add(
                         value,
                         evaluated.ok_or(SqlError::Type)?,
-                        work,
+                        transition,
                     )?,
                     DataType::Real => {
                         let Value::Float4(n) = v else {

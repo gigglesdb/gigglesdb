@@ -485,3 +485,5 @@ mod isolation_levels;
 
 #[path = "task_dependencies.rs"] mod task_dependencies;
 #[path = "task_labels.rs"] mod task_labels;
+#[path = "v2_sum_avg_unbounded.rs"]
+mod v2_sum_avg_unbounded;

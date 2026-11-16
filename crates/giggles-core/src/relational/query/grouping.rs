@@ -594,8 +594,7 @@ pub(super) fn bind<'a>(
     let mut aggregate_columns = vec![];
     let mut aggregate_filters = vec![];
     let direct_inputs = lower.aggregates.iter().map(|(a, arg, _)|
-        !a.distinct() && matches!(arg, Some(Scalar::Column(_)))
-        && lower.aggregates.iter().all(|(a, _, _)| !matches!(a.base(), Aggregate::Sum | Aggregate::Avg)))
+        !a.distinct() && matches!(arg, Some(Scalar::Column(_))))
         .collect::<Vec<_>>();
     for (a, arg, filter) in lower.aggregates {
         aggregate_filters.push(
@@ -930,6 +929,7 @@ impl Grouping {
             if source.streams_reductions() {
                 for (aux, direct) in auxiliary.iter_mut().zip(&self.direct_inputs) {
                     aux.stream_column = *direct;
+                    aux.local_transition = true;
                 }
             }
             groups.insert(Key(vec![]), (initial, auxiliary));
@@ -969,6 +969,7 @@ impl Grouping {
                     if source.streams_reductions() {
                         for (aux, direct) in auxiliary.iter_mut().zip(&self.direct_inputs) {
                             aux.stream_column = *direct;
+                            aux.local_transition = true;
                         }
                     }
                     groups.insert(key.clone(), (initial, auxiliary));
