@@ -5,3 +5,6 @@ pub mod model;
 pub mod schema;
 /// Transactional state storage and ownership.
 pub mod store;
+
+/// In-memory authoritative view with write-through.
+pub mod authority;
