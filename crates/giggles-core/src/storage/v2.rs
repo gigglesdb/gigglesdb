@@ -35,6 +35,9 @@ pub(crate) struct V2Db {
     /// Set on a cluster gateway (GD-0075 R5-43): transactions, the catalog, allocators and
     /// sequences go to range leaders, and `kv`/`sequencer` are fenced placeholders.
     cluster: Option<Arc<dyn engine::txn::ClusterServices>>,
+    /// The one wall clock for task expiry, receipts and retention (GD-0061
+    /// ruling R7); tests replace it with a manual clock.
+    wall_clock: std::sync::RwLock<Arc<dyn engine::commit::Clock>>,
 }
 pub(super) fn format_error(error: engine::meta::FormatError) -> CoreError {
     match error {
@@ -164,6 +167,7 @@ impl V2Db {
             binding_fences: Default::default(),
             next_txn: AtomicU64::new(1),
             cluster: None,
+            wall_clock: std::sync::RwLock::new(Arc::new(engine::commit::SystemClock)),
         };
         db.reclaim_background()?;
         Ok(db)
@@ -232,6 +236,7 @@ impl V2Db {
             binding_fences: Default::default(),
             next_txn: AtomicU64::new(1),
             cluster: Some(services),
+            wall_clock: std::sync::RwLock::new(Arc::new(engine::commit::SystemClock)),
         })
     }
 
@@ -277,6 +282,25 @@ impl V2Db {
             engine::locks::TxnId(id),
             isolation,
         )
+    }
+
+    /// Unix milliseconds from the database's wall clock (GD-0061 ruling R7):
+    /// task expiry, receipt `decided_ms` and retention all read this.
+    pub(crate) fn wall_now_ms(&self) -> u64 {
+        let clock = match self.wall_clock.read() {
+            Ok(clock) => Arc::clone(&clock),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        };
+        clock.now_ms()
+    }
+
+    /// Test hook: replace the wall clock.
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn set_wall_clock(&self, clock: Arc<dyn engine::commit::Clock>) {
+        match self.wall_clock.write() {
+            Ok(mut slot) => *slot = clock,
+            Err(poisoned) => *poisoned.into_inner() = clock,
+        }
     }
 
     // F8a-3b routes v2 SQL sessions through this.

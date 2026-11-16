@@ -7,6 +7,9 @@ pub mod admit;
 #[allow(dead_code)]
 pub(crate) mod authority;
 pub mod catalog;
+// R3-615: the protected commit; its callers (agent routing) land later.
+#[allow(dead_code)]
+pub(crate) mod commit;
 pub mod columns;
 pub mod context;
 // R3-614: consumed by protected_commit (R3-615+).

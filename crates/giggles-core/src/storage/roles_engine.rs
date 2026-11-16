@@ -152,7 +152,9 @@ pub(super) fn encode_key(raw: &[u8]) -> Result<Vec<u8>, CoreError> {
     }
     Err(corrupt("unknown role image key"))
 }
-fn load_txn(txn: &mut Transaction) -> Result<RoleTable, RoleError> {
+/// The role image at `txn`'s snapshot, through tracked catalog reads (the
+/// protected commit's in-transaction privilege recheck, GD-0061 R3-615).
+pub(crate) fn load_txn(txn: &mut Transaction) -> Result<RoleTable, RoleError> {
     let mut image = RoleTable::default();
     for entry in txn
         .scan(

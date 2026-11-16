@@ -5180,3 +5180,16 @@ pub(crate) struct ProtectedRun {
     pub(crate) txn: engine::txn::Transaction,
     pub(crate) effects: crate::task::effects::Effects,
 }
+
+pub(crate) use v2_sql::cross_check_effects;
+
+impl SqlSession {
+    /// The session's v2 database; `None` on the legacy engine (GD-0061
+    /// R3-615: the protected commit is v2 only, D9).
+    pub(crate) fn v2_db(&self) -> Option<Arc<v2::V2Db>> {
+        match &self.admin.inner.backend {
+            Backend::V2(db) => Some(Arc::clone(db)),
+            Backend::Legacy(_) => None,
+        }
+    }
+}

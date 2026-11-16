@@ -282,6 +282,18 @@ fn task_only_invariants(table: &RoleTable) -> Result<(), RoleError> {
     Ok(())
 }
 
+/// `role`'s grants on `table` (a role-catalog relation identity) at `txn`'s
+/// snapshot. The reads are tracked, so a later GRANT or REVOKE fails the
+/// transaction's validation (GD-0061 R3-615, D-F step 9).
+pub(crate) fn table_privileges_txn(
+    txn: &mut super::engine::txn::Transaction,
+    table: &str,
+    role: &str,
+) -> Result<BTreeSet<TablePrivilege>, RoleError> {
+    let image = engine::load_txn(txn)?;
+    privileges(raw_get(&image, &grant_key(b"tgrant/", table, role))?)
+}
+
 fn privileges<P: DeserializeOwned + Ord>(value: Option<Vec<u8>>) -> Result<BTreeSet<P>, RoleError> {
     match value {
         Some(value) => Ok(decode::<Vec<P>>(&value)?.into_iter().collect()),
