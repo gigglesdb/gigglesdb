@@ -113,6 +113,40 @@ impl SqlSession {
         result
     }
 
+    /// V2 keyed input: the snapshot certificate without rows. Callers find
+    /// the existing rows they depend on with `native_key_rows`, so an insert
+    /// or upsert reads one key per proposed row rather than the whole table.
+    pub(crate) fn complete_keyed_engine(
+        &mut self,
+        table: &TableDef,
+    ) -> Result<CompleteRelation, CoreError> {
+        let result = (|| {
+            if !self.is_v2_engine() {
+                return Err(CoreError::Sql(SqlError::Unsupported));
+            }
+            Ok(CompleteRelation { snapshot: self.complete_snapshot(table)?, rows: Vec::new() })
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
+    /// The existing V2 rows with these full primary keys, read by key lookup
+    /// in the statement snapshot. Missing keys contribute no row.
+    pub(crate) fn native_key_rows(
+        &mut self,
+        table: &TableDef,
+        keys: impl IntoIterator<Item = Vec<crate::relational::Value>>,
+    ) -> Result<Vec<SqlRow>, CoreError> {
+        let mut rows = Vec::new();
+        for key in keys {
+            let input = self.complete_read_table_where(table, Some(&key), &mut |_| Ok(true), |e| e)?;
+            rows.extend(self.consume_complete_engine(input, table)?);
+        }
+        Ok(rows)
+    }
+
     /// Visit the row with this full primary key, if any, in the statement snapshot.
     fn visit_native_key<E>(
         &mut self, table: &TableDef, key: &[crate::relational::Value],

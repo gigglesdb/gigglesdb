@@ -106,10 +106,15 @@ fn reserved(s: &str) -> bool {
     ]
     .contains(&s)
 }
-/// Whether text is an INSERT, which SQL also bounds by bytes and flat tuples.
+/// Whether text is an INSERT, or a transaction block containing one, which
+/// SQL also bounds by statement bytes and flat tuples. Node, item and
+/// serialized-tree budgets still bound everything else in a block.
 fn insert_text(s: &str) -> bool {
     let t = s.trim_start().as_bytes();
-    t.len() > 6 && t[..6].eq_ignore_ascii_case(b"insert") && t[6].is_ascii_whitespace()
+    let word = |w: &[u8]| t.len() > w.len() && t[..w.len()].eq_ignore_ascii_case(w)
+        && (t[w.len()].is_ascii_whitespace() || t[w.len()] == b'{');
+    word(b"insert")
+        || (word(b"transaction") && t.windows(6).any(|w| w.eq_ignore_ascii_case(b"insert")))
 }
 fn lex(s: &str, version: LanguageVersion) -> Result<Vec<(Token, usize)>> {
     let insert = insert_text(s);

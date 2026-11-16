@@ -14,6 +14,10 @@ pub enum ReadExplainStage {
     FieldProjection,
     OutputPage,
     StreamingCompleteTableMaterialization,
+    /// V2: the filter fixes the full primary key; one key lookup is the input.
+    PrimaryKeyLookup,
+    /// V2: rows stream through the filter and only matching rows are retained.
+    StreamingFilter,
     /// Additional access after the complete input admission above; no avoided
     /// full materialization or estimated cost is claimed.
     SecondaryIndexCandidates {
@@ -165,7 +169,14 @@ impl Engine {
                     ReadExplainStage::ReversePrimaryKeyCompletenessCertification,
                 ];
                 if v2 {
-                    stages = vec![ReadExplainStage::StreamingCompleteTableMaterialization];
+                    // The access path run_complete takes for this V2 read.
+                    stages = vec![if primary_key_point(table, &bound_filter).is_some() {
+                        ReadExplainStage::PrimaryKeyLookup
+                    } else if filter.is_some() {
+                        ReadExplainStage::StreamingFilter
+                    } else {
+                        ReadExplainStage::StreamingCompleteTableMaterialization
+                    }];
                 }
                 if let Some(id) = secondary_selector::choose(table, &bound_filter)
                     .and_then(|choice| choice.descriptor(table, descriptors))

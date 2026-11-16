@@ -91,6 +91,12 @@ pub(super) fn run(
         }
         keys.push((encoded, key, input_index));
     }
+    let existing = if session.is_v2_engine() {
+        // Keyed input: the only rows an upsert can match share a proposed key.
+        session.native_key_rows(table, keys.iter().map(|(_, key, _)| key.clone())).map_err(core)?
+    } else {
+        existing
+    };
     let mut existing_keys = BTreeMap::new();
     for (index, row) in existing.iter().enumerate() {
         crate::cancellation::check().map_err(core)?;

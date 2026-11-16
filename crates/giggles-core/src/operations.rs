@@ -2340,9 +2340,14 @@ fn run_complete(
             table, key.as_deref(), &mut |row| filter.accepts(row), input_error)?;
         return run(session, table, operation, input, retained);
     }
-    // Inserts need the whole relation. V2 streams it into the snapshot-pinned
-    // loader; legacy keeps its bounded complete-table proof for every operation.
-    let input = session.complete_read_table_engine(table).map_err(limit)?;
+    // V2 inserts and upserts read only the keys they propose (insert_many and
+    // upsert look them up); a single insert relies on the write path's
+    // per-row 23505, as SQL does. Legacy keeps its bounded complete-table proof.
+    let input = if session.is_v2_engine() {
+        session.complete_keyed_engine(table).map_err(limit)?
+    } else {
+        session.complete_read_table_engine(table).map_err(limit)?
+    };
     run(session, table, operation, input, retained)
 }
 fn input_error(error: CoreError) -> Error {
@@ -2374,18 +2379,22 @@ fn primary_key_point(table: &TableDef, filter: &Bound) -> Option<Vec<Value>> {
             _ => return None,
         };
         let column = table.columns.get(index)?;
-        if !matches!((&column.data_type, value),
+        // Numeric keys use the scale-insensitive key codec, so a numeric
+        // literal finds exactly the rows numeric equality accepts. A uuid
+        // literal was already canonicalised by coerce_equality. Temporal values
+        // have no key encoding (encode_key rejects them), so they stream.
+        let value = match (&column.data_type, value) {
             (DataType::Boolean, Value::Bool(_))
             | (DataType::SmallInt | DataType::Integer | DataType::BigInt, Value::Int(_))
-            | (DataType::Text | DataType::Varchar, Value::Text(_))
-            | (DataType::Bytes, Value::Bytes(_)))
-            || crate::relational::check(value, column).is_err()
-        {
-            return None;
-        }
+            | (DataType::Text | DataType::Varchar | DataType::Uuid, Value::Text(_))
+            | (DataType::Numeric, Value::Numeric(_))
+            | (DataType::Bytes, Value::Bytes(_)) => value.clone(),
+            _ => return None,
+        };
+        crate::relational::check(&value, column).ok()?;
         if op == Compare::Eq
             && let Some(slot) = table.primary_key.iter().position(|p| *p == index)
-            && key[slot].replace(value.clone()).is_some()
+            && key[slot].replace(value).is_some()
         {
             return None;
         }
@@ -2889,6 +2898,12 @@ fn insert_many(
         }
         keys.push((encoded, key, index));
     }
+    let existing = if session.is_v2_engine() {
+        // Keyed input: only rows sharing a proposed full primary key can conflict.
+        session.native_key_rows(table, keys.iter().map(|(_, key, _)| key.clone())).map_err(core)?
+    } else {
+        existing
+    };
     for row in &existing {
         crate::cancellation::check().map_err(core)?;
         let key = table

@@ -1120,3 +1120,113 @@ fn v2_point_writes_read_one_key_and_filters_stream() {
     assert_eq!(engine.execute_text("update items where id=3 set u=0", &Bindings::new()).unwrap().affected, 1);
     assert_eq!(native_input_rows(), before);
 }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_inserts_upserts_and_typed_keys_read_only_their_keys() {
+    use giggles_core::{operations::{ReadExplainStage as Stage, native_input_rows}, relational::Numeric};
+    let (_left_db, left) = Database::fresh(StorageEngine::V2);
+    let (_right_db, right) = Database::fresh(StorageEngine::V2);
+    let uuid = |n: usize| format!("00000000-0000-0000-0000-{n:012x}");
+    for admin in [&left, &right] {
+        sql(admin, "create table items(id bigint primary key, n bigint, u bigint)");
+        sql(admin, "create table dst(id bigint primary key, n bigint, u bigint)");
+        sql(admin, "create table nk(k numeric primary key, n bigint)");
+        sql(admin, "create table uk(k uuid primary key, n bigint)");
+        seed(admin, "items", 0..20_000);
+        let nk = (0..2000).map(|i| format!("({i}.5,0),({i},0)")).collect::<Vec<_>>().join(",");
+        sql(admin, &format!("insert into nk values{nk}"));
+        let uk = (0..2000).map(|i| format!("('{}',0)", uuid(i))).collect::<Vec<_>>().join(",");
+        sql(admin, &format!("insert into uk values{uk}"));
+    }
+    let engine = Engine::with_version(left.clone(), LanguageVersion::Embedded021);
+    let dump = |admin: &Admin, table: &str| values(admin.sql_session()
+        .execute(&format!("select * from {table} order by 1"), &[], None).unwrap().rows);
+    let key = |text: &str| Bindings::from_iter([("uuid".to_string(), Value::Text(uuid(10).to_uppercase()))]
+        .into_iter().filter(|_| text.contains("$uuid")));
+    // (native, SQL, affected, rows decoded by native input): O(written), not O(table).
+    for (native, statement, count, decoded) in [
+        ("insert items set id=30000,n=0,u=30000", "insert into items values(30000,0,30000)", 1, 0),
+        ("insert many into items(id,n,u) values(30001,0,30001),(30002,0,30002) at most 2",
+            "insert into items values(30001,0,30001),(30002,0,30002)", 2, 0),
+        ("insert into items(id,n,u) values(10,5,10) on conflict(id) do update set n=incoming.n",
+            "insert into items values(10,5,10) on conflict(id) do update set n=excluded.n", 1, 1),
+        ("insert many into items(id,n,u) values(11,1,11),(30003,1,30003) on conflict(id) do nothing at most 2",
+            "insert into items values(11,1,11),(30003,1,30003) on conflict(id) do nothing", 1, 1),
+        ("insert into dst from items select id,n,u", "insert into dst select id,n,u from items", 20_004, 0),
+        ("update uk where k=$uuid set n=1", "update uk set n=1 where k='00000000-0000-0000-0000-00000000000a'", 1, 1),
+    ] {
+        let before = native_input_rows();
+        let result = with_sql_parser_forbidden(|| engine.execute_text(native, &key(native)))
+            .unwrap_or_else(|error| panic!("{native}: {error:?}"));
+        assert_eq!(native_input_rows().0 - before.0, decoded, "{native}");
+        let expected = right.sql_session().execute(statement, &[], None).unwrap();
+        assert_eq!((result.affected, expected.affected), (count, count as u64), "{native}");
+        for table in ["items", "dst", "nk", "uk"] {
+            assert_eq!(dump(&left, table), dump(&right, table), "{native}: {table}");
+        }
+    }
+    // The language admits Numeric values only in assignments (a numeric filter is
+    // Type or Unsupported); the core API takes a numeric key literal.
+    use giggles_core::operations::{Compare, Expr, Intent, Request, ValueExpr};
+    let half = || Expr::Compare(Box::new(Expr::Field("k".into())), Compare::Eq,
+        Box::new(Expr::Value(ValueExpr::Literal(Value::Numeric(Numeric::parse("12.50").unwrap())))));
+    let core = giggles_core::operations::Engine::new(left.clone());
+    let before = native_input_rows();
+    let update = Request::Update { table: "nk".into(), filter: half(), guard: None,
+        values: vec![("n".into(), ValueExpr::Literal(Value::Int(1)))], intent: Intent::One };
+    assert_eq!(core.execute(&update, &Bindings::new()).unwrap().affected, 1);
+    assert_eq!(native_input_rows().0 - before.0, 1);
+    assert_eq!(right.sql_session().execute("update nk set n=1 where k=12.5", &[], None).unwrap().affected, 1);
+    assert_eq!(dump(&left, "nk"), dump(&right, "nk"));
+    let read = Request::Read { table: "nk".into(), filter: Some(half()), order: vec![], limit: None, projection: vec![] };
+    assert_eq!(core.explain_read(&read, &Bindings::new()).unwrap().stages[0], Stage::PrimaryKeyLookup);
+    // Existing keys are found by lookup: 23505 as in SQL, nothing staged.
+    for (native, statement, decoded) in [
+        ("insert items set id=5,n=0,u=5", "insert into items values(5,0,5)", 0),
+        ("insert many into items(id,n,u) values(40000,0,40000),(6,0,6) at most 2",
+            "insert into items values(40000,0,40000),(6,0,6)", 1),
+    ] {
+        let before = native_input_rows();
+        assert_eq!(with_sql_parser_forbidden(|| engine.execute_text(native, &Bindings::new())), Err(Error::Duplicate), "{native}");
+        assert_eq!(native_input_rows().0 - before.0, decoded, "{native}");
+        assert_eq!(sql(&right, statement), Step::Sql(SqlError::Duplicate), "{statement}");
+        assert_eq!(dump(&left, "items"), dump(&right, "items"), "{native}");
+    }
+    // A transaction block carrying a large INSERT MANY has the INSERT text bound.
+    let tuples = (50_000..55_000).map(|id| format!("({id},1,{id})")).collect::<Vec<_>>().join(",");
+    let block = format!("transaction {{ insert many into items(id,n,u) values{tuples} at most 5000; }}");
+    assert!(block.len() > 65_536);
+    let before = native_input_rows();
+    with_sql_parser_forbidden(|| engine.execute_transaction_text(&block, &Bindings::new())).unwrap();
+    assert_eq!(native_input_rows().0 - before.0, 0);
+    sql(&right, &format!("insert into items values{tuples}"));
+    assert_eq!(dump(&left, "items"), dump(&right, "items"));
+    let read = format!("transaction {{ items where {}; }}", vec!["id=1"; 20_000].join(" or "));
+    assert_eq!(engine.execute_transaction_text(&read, &Bindings::new()).map(|_| ()), Err(Error::Limit));
+    // Temporal values have no key encoding in SQL either, so no temporal key exists to look up.
+    sql(&right, "create table tk(k timestamp primary key)");
+    assert!(!matches!(sql(&right, "insert into tk values('2020-01-01 00:00:00')"), Step::Success(_)));
+    // Explain names the V2 access path; legacy keeps its stages.
+    for (text, stage) in [
+        ("explain items where id=7", Stage::PrimaryKeyLookup),
+        ("explain uk where k=$uuid", Stage::PrimaryKeyLookup),
+        ("explain items where n=7 order by id", Stage::StreamingFilter),
+        ("explain items where id=7 or id=8", Stage::StreamingFilter),
+        ("explain items order by id", Stage::StreamingCompleteTableMaterialization),
+    ] {
+        let explain = engine.explain_text(text, &key(text)).unwrap_or_else(|error| panic!("{text}: {error:?}"));
+        assert_eq!(explain.stages[0], stage, "{text}");
+    }
+    let (_legacy_db, legacy) = Database::fresh(StorageEngine::Legacy);
+    sql(&legacy, "create table items(id bigint primary key, n bigint, u bigint)");
+    seed(&legacy, "items", 0..10);
+    let engine = Engine::with_version(legacy, LanguageVersion::Embedded021);
+    let before = native_input_rows();
+    assert_eq!(engine.execute_text("insert into items(id,n,u) values(3,1,3) on conflict(id) do update set n=incoming.n",
+        &Bindings::new()).unwrap().affected, 1);
+    assert_eq!(engine.execute_text("insert items set id=3,n=0,u=3", &Bindings::new()), Err(Error::Duplicate));
+    assert_eq!(native_input_rows(), before);
+    let explain = engine.explain_text("explain items where id=7", &Bindings::new()).unwrap();
+    assert_eq!(explain.stages[..2], [Stage::WholeStateSnapshot, Stage::BoundedCompleteTableMaterialization]);
+}

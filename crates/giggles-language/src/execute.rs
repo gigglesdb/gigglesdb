@@ -1556,7 +1556,11 @@ pub(crate) fn validate_transaction(
             }
         }
     }
-    validate_size(transaction)
+    // INSERT MANY in a block keeps that statement's tree bound (see lower_checked).
+    let insert_many = transaction.steps.iter().any(|step| matches!(step,
+        TransactionStep::Execute(statement) | TransactionStep::Let { statement, .. }
+            if matches!(statement_parts(statement).map(|p| p.statement), Ok(Statement::InsertMany { .. }))));
+    validate_size_within(transaction, if insert_many { MAX_INSERT_TREE_BYTES } else { MAX_INPUT })
 }
 pub(crate) fn lower_transaction_checked(
     transaction: &Transaction,

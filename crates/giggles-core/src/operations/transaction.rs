@@ -321,7 +321,12 @@ pub(super) fn validate_transaction(transaction: &Transaction) -> Result<()> {
             }
         }
     }
-    validate_size(transaction)
+    // A block carrying INSERT MANY has that statement's tree bound, as a
+    // single INSERT MANY request does (SQL bounds each statement the same way).
+    let insert_many = transaction.steps.iter().any(|step| matches!(step,
+        TransactionStep::Execute(request) | TransactionStep::Let { request, .. }
+            if matches!(request.parts().map(|p| p.body), Ok(Request::InsertMany { .. }))));
+    validate_size_within(transaction, if insert_many { MAX_INSERT_REQUEST_BYTES } else { MAX_INPUT })
 }
 fn scalar_description(bound: &Bound, ty: Option<Ty>) -> EmitDescription {
     let data_type = match bound {

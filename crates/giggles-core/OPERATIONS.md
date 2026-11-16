@@ -716,8 +716,12 @@ certification, then in-memory filter/order/field projection/output page. There
 is no claimed indexed optimization. Legacy input and output retain their 1024-row
 ceilings. V2 streams complete table input and accepts nonnegative read limits
 that fit `usize`; output still defaults to 100. V2 explain reports
-`StreamingCompleteTableMaterialization` and `input_rows: usize::MAX` (no fixed
-row ceiling). Filter/order evaluation still materializes complete input in memory;
+`input_rows: usize::MAX` (no fixed row ceiling) and the access path as its
+first stage: `PrimaryKeyLookup` (the filter fixes the full primary key with
+literals of bool, integer, text, uuid, bytes or numeric keys),
+`StreamingFilter` (rows stream through the filter and only matching rows are
+retained) or `StreamingCompleteTableMaterialization` (no filter). V2 inserts and
+upserts read only the existing rows that share a proposed primary key. Filter/order evaluation still materializes complete input in memory;
 byte budgets and once receipt limits remain; V2 mutations use the same input. Limits also report the Admin admission/selected-key
 configuration and engine byte/expression/binding ceilings.
 

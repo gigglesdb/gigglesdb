@@ -5,7 +5,9 @@ use giggles_language::{
 };
 fn run() -> std::result::Result<serde_json::Value, Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.iter().any(|s| s.len() > MAX_INPUT) {
+    // The parser applies the text bound of each statement kind (INSERT text
+    // has SQL's statement bound); this is only the outer argument ceiling.
+    if args.iter().any(|s| s.len() > giggles_language::MAX_INSERT_INPUT.max(MAX_INPUT)) {
         return Err(Error::Limit);
     }
     match args.as_slice() {
