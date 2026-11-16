@@ -731,7 +731,16 @@ impl Session {
         &mut self,
         class: giggles_core::task::StatementClass,
     ) -> Result<(), CoreError> {
-        giggles_core::task::admit::admit(self.sql.task(), class).map_err(CoreError::Task)?;
+        let admitted = giggles_core::task::admit::admit(self.sql.task(), class);
+        #[cfg(test)]
+        let admitted = admitted.or_else(|error| {
+            if crate::agent::statement::test_route::enabled(class) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        });
+        admitted.map_err(CoreError::Task)?;
         if self.sql.task().is_none() {
             return Ok(());
         }
@@ -741,8 +750,8 @@ impl Session {
     }
     /// GD-0061 R3-207: run one protected statement (direct write, preview,
     /// apply or outcome lookup). It admits the class, then hands the statement
-    /// to `agent::statement::protected_seam`, which fails closed until the
-    /// Phase 6 and 7 bodies land. This is the only place `in_protected` is set.
+    /// to `agent::statement::protected_seam` (R3-615 fills in the direct write;
+    /// the other forms fail closed until Phase 7).
     pub(crate) fn execute_protected(
         &mut self,
         statement: &crate::agent::statement::ProtectedStatement,
@@ -753,11 +762,57 @@ impl Session {
                 return Err(CoreError::Policy(Error::Scope));
             }
             session.admit(statement.class())?;
-            session.in_protected = true;
-            let result = crate::agent::statement::protected_seam(session, statement, params);
-            session.in_protected = false;
-            result
+            session.protected_scope(|session| {
+                crate::agent::statement::protected_seam(session, statement, params)
+            })
         })
+    }
+    /// R3-207/615: prepare the `UPDATE` wrapped by `OPERATION '<id>'` (or
+    /// `PREVIEW`). Its class is admitted first; the `authorize` backstop then
+    /// lets the wrapped UPDATE through because `in_protected` is set.
+    pub(crate) fn prepare_protected(
+        &mut self,
+        class: giggles_core::task::StatementClass,
+        sql: &str,
+        declared_types: &[Option<relational::DataType>],
+    ) -> Result<Prepared, CoreError> {
+        if self.sql.task().is_none() {
+            return Err(CoreError::Policy(Error::Scope));
+        }
+        self.admit(class)?;
+        self.protected_scope(|session| session.prepare_with_parameter_types(sql, declared_types))
+    }
+    /// The only place `in_protected` is set. It is cleared on every exit,
+    /// including an error or a panic out of `work` (the guard's drop).
+    fn protected_scope<T>(
+        &mut self,
+        work: impl FnOnce(&mut Self) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        struct Reset<'a>(&'a mut Session);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.in_protected = false;
+            }
+        }
+        self.in_protected = true;
+        let reset = Reset(self);
+        work(&mut *reset.0)
+    }
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn in_protected(&self) -> bool {
+        self.in_protected
+    }
+    /// Test hook: a panic inside the protected scope still clears the flag.
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn panic_in_protected_scope(&mut self) -> bool {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.protected_scope(|session| -> Result<(), CoreError> {
+                assert!(session.in_protected);
+                panic!("protected scope test panic")
+            })
+        }));
+        assert!(caught.is_err());
+        self.in_protected
     }
     /// Backstop for every internal path of a task session (design-2 section 4,
     /// call site 5): the class must be admitted. An UPDATE passes only inside

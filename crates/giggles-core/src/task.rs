@@ -7,7 +7,7 @@ pub mod admit;
 #[allow(dead_code)]
 pub(crate) mod authority;
 pub mod catalog;
-// R3-615: the protected commit; its callers (agent routing) land later.
+// R3-615: the protected commit; the agent seam (R3-207) calls it.
 #[allow(dead_code)]
 pub(crate) mod commit;
 pub mod columns;
@@ -39,4 +39,8 @@ pub mod statements;
 mod statements_tests;
 
 pub use admit::StatementClass;
+// R3-615 through the agent seam (R3-207): the server's direct protected write.
+pub use commit::{protected_commit, Actor, ProtectedRequest};
+pub use ledger::OperationId;
+pub use receipt::Receipt;
 pub use error::{Budget, DenyRule, TaskError};

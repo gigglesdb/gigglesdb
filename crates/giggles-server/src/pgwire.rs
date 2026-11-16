@@ -832,6 +832,26 @@ fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32]) -> R<(Pl
     Ok((Plan::Sql(Box::new(prepared)), description))
 }
 
+/// R3-207/615: `prepare_declared_sql` for the UPDATE wrapped by a protected
+/// form, prepared inside the session's protected scope (`class` admitted first).
+fn prepare_protected_sql(
+    session: &mut Session,
+    class: giggles_core::task::StatementClass,
+    sql: &str,
+    oids: &[u32],
+) -> R<(Prepared, Description)> {
+    let declared = oids
+        .iter()
+        .map(|&o| core_declared_type(o))
+        .collect::<Vec<_>>();
+    let prepared = core(session.prepare_protected(class, sql, &declared))?;
+    let description = core(session.describe(&prepared))?;
+    if oids.len() > description.parameters.len() {
+        return Err("08P01");
+    }
+    Ok((prepared, description))
+}
+
 #[derive(Clone)]
 enum Plan {
     Empty,

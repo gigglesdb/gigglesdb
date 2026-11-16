@@ -1,0 +1,341 @@
+//! R3-207 seam -> R3-615: the direct protected write through
+//! `Session::execute_protected`. `Update` is not in `task::admit::ENABLED` yet
+//! (design-2 section 4: the last Phase 6 item adds it), so these tests admit it
+//! through `test_route` and drive the session directly.
+//!
+//! Task "requeue failed for merchant 42, 25 rows" on `shipments` (`deliveries`
+//! is reserved): visible rows `merchant_id = 42`, write `status` from 'failed'
+//! to 'queued'.
+use super::{OperationId, ProtectedStatement, test_route};
+use crate::{AgentBinding, Service, Session};
+use giggles_core::{
+    Admin, CoreError, Engine, Limits,
+    relational::{Prepared, SqlResult, Value},
+    roles::{NewRole, TablePrivilege},
+    sqlstate,
+    task::{
+        DenyRule, StatementClass, TaskError,
+        definition::{
+            AllowedWrite, DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText,
+        },
+    },
+};
+use std::sync::Arc;
+
+const REQUEUE: &str =
+    "UPDATE shipments SET status = 'queued' WHERE merchant_id = 42 AND status = 'failed'";
+const FINGERPRINT: &str = "ab";
+static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn fixture() -> (Arc<Service>, Session) {
+    let path = crate::test_support::fixture_root().join(format!(
+        "agent-seam-{}-{}-{}",
+        std::process::id(),
+        SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), Engine::V2).unwrap();
+    for statement in [
+        "CREATE TABLE shipments (id bigint primary key, merchant_id bigint, status text, \
+         attempt_count int)",
+        "INSERT INTO shipments VALUES (1, 42, 'failed', 1), (2, 42, 'failed', 2), \
+         (3, 42, 'failed', 1), (4, 42, 'failed', 3), (5, 42, 'delivered', 0), (6, 7, 'failed', 1)",
+    ] {
+        admin.sql_session().execute(statement, &[], None).unwrap();
+    }
+    let roles = admin.roles();
+    for (name, task_only) in [("incident_controller", false), ("agent_exec", true)] {
+        roles
+            .create(NewRole {
+                name: name.into(),
+                login: true,
+                ..NewRole::default()
+            })
+            .unwrap();
+        if task_only {
+            roles.set_task_only(name, true).unwrap();
+        }
+        roles
+            .grant_table("shipments", name, &[TablePrivilege::Select, TablePrivilege::Update])
+            .unwrap();
+    }
+    let issuer = roles.get("incident_controller").unwrap().unwrap();
+    let clock = crate::clock::Clock::new(0, 3600).unwrap();
+    let now = crate::agent::wall_now(&clock).unwrap();
+    admin
+        .tasks()
+        .create(
+            &issuer,
+            NewTask {
+                name: "inc-436".into(),
+                executor: "agent_exec".into(),
+                approver: None,
+                schema: None,
+                table: "shipments".into(),
+                visible_rows: PredicateText("merchant_id = 42".into()),
+                readable: ["id", "merchant_id", "status", "attempt_count"]
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
+                masked: Vec::new(),
+                untrusted_text: Vec::new(),
+                allowed_write: Some(AllowedWrite {
+                    columns: ["status".to_string()].into_iter().collect(),
+                    old_row: PredicateText("status = 'failed'".into()),
+                    new_row: PredicateText("status = 'queued'".into()),
+                }),
+                mutation_caps: MutationCaps {
+                    distinct_rows: 25,
+                    transitions: 25,
+                },
+                disclosure_caps: DisclosureCaps {
+                    rows_read: 1000,
+                    rows_returned: 1000,
+                    bytes_returned: 2_097_152,
+                },
+                limits: LoadLimits::default(),
+                approval_threshold: 25,
+                expires: "2999-01-01 00:00:00+00".into(),
+            },
+            now,
+        )
+        .unwrap();
+    let fingerprint = FINGERPRINT.repeat(32);
+    let service = Service::with_agent(
+        admin,
+        vec![],
+        vec![AgentBinding {
+            fingerprint: fingerprint.clone(),
+            executor: "agent_exec".into(),
+            tasks: vec!["inc-436".into()],
+        }],
+        clock,
+        crate::admission::ServiceLimits::default(),
+    )
+    .unwrap();
+    let session = service.agent_session(&fingerprint, None).unwrap();
+    (service, session)
+}
+
+fn statuses(service: &Service) -> Vec<String> {
+    service
+        .admin
+        .sql_session()
+        .execute("SELECT status FROM shipments ORDER BY id", &[], None)
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|row| match &row.values[0] {
+            Value::Text(text) => text.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+const BEFORE: [&str; 6] = ["failed", "failed", "failed", "failed", "delivered", "failed"];
+const AFTER: [&str; 6] = ["queued", "queued", "queued", "queued", "delivered", "failed"];
+
+fn prepare(session: &mut Session, class: StatementClass, sql: &str) -> Result<Prepared, CoreError> {
+    session.prepare_protected(class, sql, &[])
+}
+
+/// `OPERATION '<op>' <sql>` as pgwire builds it: the wrapped UPDATE prepared in
+/// the protected scope, then run through `execute_protected`.
+fn direct(
+    session: &mut Session,
+    op: &str,
+    sql: &str,
+    params: &[Value],
+) -> Result<SqlResult, CoreError> {
+    let prepared = prepare(session, StatementClass::Update, sql)?;
+    let statement = ProtectedStatement::Direct {
+        op: OperationId::new(op).unwrap(),
+        prepared: Box::new(prepared),
+        text: Arc::from(sql),
+    };
+    let result = session.execute_protected(&statement, params);
+    assert!(!session.in_protected(), "in_protected leaked: {result:?}");
+    result
+}
+
+fn assert_bare_update_needs_operation_id(session: &mut Session) {
+    assert_eq!(
+        session.prepare(REQUEUE).map(|_| ()),
+        Err(CoreError::Task(TaskError::OperationIdRequired))
+    );
+}
+
+#[test]
+fn direct_update_commits_and_returns_the_receipt_count() {
+    let (service, mut session) = fixture();
+    test_route::enable(&[StatementClass::Update]);
+    let result = direct(&mut session, "inc-436:requeue.1", REQUEUE, &[]).unwrap();
+    assert_eq!(result.affected, 4);
+    assert!(result.columns.is_empty() && result.rows.is_empty());
+    assert_eq!(statuses(&service), AFTER);
+    // Parameters travel to the commit; zero rows still commits.
+    let result = direct(
+        &mut session,
+        "inc-436:requeue.2",
+        "UPDATE shipments SET status = $1 WHERE merchant_id = 42 AND status = $2",
+        &[Value::Text("queued".into()), Value::Text("failed".into())],
+    )
+    .unwrap();
+    assert_eq!(result.affected, 0);
+    assert_eq!(statuses(&service), AFTER);
+    assert_bare_update_needs_operation_id(&mut session);
+}
+
+#[test]
+fn update_outside_allowed_columns_is_denied_and_writes_nothing() {
+    let (service, mut session) = fixture();
+    test_route::enable(&[StatementClass::Update]);
+    let error = direct(
+        &mut session,
+        "inc-436:bad.1",
+        "UPDATE shipments SET status = 'queued', attempt_count = 9 WHERE id = 1",
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        CoreError::Task(TaskError::Denied(DenyRule::ColumnNotWritable))
+    );
+    assert_eq!(
+        sqlstate(&error),
+        TaskError::Denied(DenyRule::ColumnNotWritable).sqlstate()
+    );
+    assert_eq!(statuses(&service), BEFORE);
+    let attempts = service
+        .admin
+        .sql_session()
+        .execute("SELECT attempt_count FROM shipments WHERE id = 1", &[], None)
+        .unwrap();
+    assert_eq!(attempts.rows[0].values, [Value::Int(1)]);
+    // The session is usable afterwards and the flag did not leak.
+    assert_bare_update_needs_operation_id(&mut session);
+    assert_eq!(direct(&mut session, "inc-436:ok.1", REQUEUE, &[]).unwrap().affected, 4);
+}
+
+#[test]
+fn reused_operation_id_replays_or_conflicts() {
+    let (service, mut session) = fixture();
+    test_route::enable(&[StatementClass::Update]);
+    assert_eq!(direct(&mut session, "op-1", REQUEUE, &[]).unwrap().affected, 4);
+    // Make the rows match again: a replay must not run the statement.
+    service
+        .admin
+        .sql_session()
+        .execute("UPDATE shipments SET status = 'failed' WHERE id = 1", &[], None)
+        .unwrap();
+    let replay = direct(&mut session, "op-1", REQUEUE, &[]).unwrap();
+    assert_eq!(replay.affected, 4);
+    assert_eq!(
+        statuses(&service),
+        ["failed", "queued", "queued", "queued", "delivered", "failed"]
+    );
+    // Same ID, another request: 42T03, nothing written.
+    for (sql, params) in [
+        (
+            "UPDATE shipments SET status = 'queued' WHERE id = 1 AND status = 'failed'",
+            vec![],
+        ),
+        (
+            "UPDATE shipments SET status = $1 WHERE merchant_id = 42 AND status = $2",
+            vec![Value::Text("queued".into()), Value::Text("failed".into())],
+        ),
+    ] {
+        let error = direct(&mut session, "op-1", sql, &params).unwrap_err();
+        assert_eq!(error, CoreError::Task(TaskError::OperationConflict), "{sql}");
+        assert_eq!(sqlstate(&error), "42T03");
+    }
+    // The same text with other parameters is another request too.
+    let sql = "UPDATE shipments SET status = $1 WHERE id = $2 AND status = 'failed'";
+    let params = |id| [Value::Text("queued".into()), Value::Int(id)];
+    assert_eq!(direct(&mut session, "op-2", sql, &params(1)).unwrap().affected, 1);
+    assert_eq!(
+        direct(&mut session, "op-2", sql, &params(6)).unwrap_err(),
+        CoreError::Task(TaskError::OperationConflict)
+    );
+    assert_eq!(statuses(&service), AFTER);
+}
+
+#[test]
+fn update_class_stays_refused_without_the_route() {
+    let (service, mut session) = fixture();
+    let refused = CoreError::Task(TaskError::NotAllowedInTaskSession(StatementClass::Update));
+    assert_eq!(
+        prepare(&mut session, StatementClass::Update, REQUEUE).map(|_| ()),
+        Err(refused.clone())
+    );
+    assert_eq!(sqlstate(&refused), "0A000");
+    // A statement prepared under the route is still refused at execution.
+    test_route::enable(&[StatementClass::Update]);
+    let prepared = prepare(&mut session, StatementClass::Update, REQUEUE).unwrap();
+    test_route::enable(&[]);
+    let statement = ProtectedStatement::Direct {
+        op: OperationId::new("op-1").unwrap(),
+        prepared: Box::new(prepared),
+        text: Arc::from(REQUEUE),
+    };
+    assert_eq!(session.execute_protected(&statement, &[]), Err(refused));
+    assert!(!session.in_protected());
+    assert_eq!(statuses(&service), BEFORE);
+    assert_bare_update_needs_operation_id(&mut session);
+}
+
+#[test]
+fn returning_is_refused_before_anything_runs() {
+    let (service, mut session) = fixture();
+    test_route::enable(&[StatementClass::Update]);
+    let error = direct(&mut session, "op-r", &format!("{REQUEUE} RETURNING id"), &[]).unwrap_err();
+    assert_eq!(error, CoreError::Unsupported);
+    assert_eq!(sqlstate(&error), "0A000");
+    assert_eq!(statuses(&service), BEFORE);
+    // The ID was not consumed.
+    assert_eq!(direct(&mut session, "op-r", REQUEUE, &[]).unwrap().affected, 4);
+}
+
+#[test]
+fn preview_apply_and_outcome_still_fail_closed() {
+    let (service, mut session) = fixture();
+    test_route::enable(&[
+        StatementClass::Update,
+        StatementClass::Preview,
+        StatementClass::Apply,
+        StatementClass::OutcomeLookup,
+    ]);
+    let prepared = prepare(&mut session, StatementClass::Preview, REQUEUE).unwrap();
+    let op = OperationId::new("op-1").unwrap();
+    for statement in [
+        ProtectedStatement::Preview {
+            prepared: Box::new(prepared),
+        },
+        ProtectedStatement::Apply {
+            op: op.clone(),
+            preview: 1,
+            digest: [0; 32],
+        },
+        ProtectedStatement::Outcome { op },
+    ] {
+        let error = session.execute_protected(&statement, &[]).unwrap_err();
+        assert_eq!(
+            error,
+            CoreError::Task(TaskError::NotAllowedInTaskSession(statement.class()))
+        );
+        assert_eq!(sqlstate(&error), "0A000");
+        assert!(!session.in_protected());
+    }
+    assert_eq!(statuses(&service), BEFORE);
+}
+
+#[test]
+fn protected_flag_is_cleared_after_a_panic() {
+    let (_service, mut session) = fixture();
+    assert!(!session.panic_in_protected_scope());
+    assert_bare_update_needs_operation_id(&mut session);
+}

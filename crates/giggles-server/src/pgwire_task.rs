@@ -381,23 +381,22 @@ impl State {
                 {
                     return Err("42601");
                 }
-                let (Plan::Sql(prepared), description) =
-                    prepare_declared_sql(session, wrapped, oids)?
-                else {
-                    return Err("42601");
-                };
+                let (prepared, description) =
+                    prepare_protected_sql(session, head.class(), wrapped, oids)?;
                 if prepared.task_class() != StatementClass::Update {
                     return Err("42601");
                 }
-                Some((prepared, description))
+                Some((Box::new(prepared), description))
             }
             ProtectedHead::Apply { .. } | ProtectedHead::Outcome { .. } => None,
         };
         let description = protected::description(&head, prepared.as_ref().map(|(_, d)| d));
         let statement = match (head, prepared) {
-            (ProtectedHead::Direct { op }, Some((prepared, _))) => {
-                ProtectedStatement::Direct { op, prepared }
-            }
+            (ProtectedHead::Direct { op }, Some((prepared, _))) => ProtectedStatement::Direct {
+                op,
+                prepared,
+                text: std::sync::Arc::from(wrapped),
+            },
             (ProtectedHead::Preview, Some((prepared, _))) => ProtectedStatement::Preview { prepared },
             (ProtectedHead::Apply { op, change, digest }, None) => ProtectedStatement::Apply {
                 op,

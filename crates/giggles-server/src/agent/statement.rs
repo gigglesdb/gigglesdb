@@ -10,15 +10,18 @@
 //! | `OPERATION '<id>' APPLY CHANGE <change_id> DIGEST '<hex>'` | Apply         |
 //! | `SHOW OPERATION '<id>'`                                    | OutcomeLookup |
 //!
-//! This item lands the forms refusing. [`protected_seam`] is the one place the
-//! Phase 6 and 7 items (R3-615 direct write, R3-617 outcome lookup, R3-707
-//! preview and apply) fill in; until then it fails closed with 0A000.
+//! [`protected_seam`] is the one place the Phase 6 and 7 items fill in. The
+//! direct write runs `task::protected_commit` (R3-615); outcome lookup (R3-617),
+//! preview and apply (R3-707) still fail closed with 0A000. Admission refuses
+//! `Update` until the last Phase 6 item adds it to `task::admit::ENABLED`
+//! (design-2 section 4), so over the wire the direct form still answers 0A000.
 
 use giggles_core::{
     CoreError,
     relational::{ColumnDef, DataType, Description, Prepared, SqlResult, Value},
-    task::{StatementClass, TaskError},
+    task::{Actor, ProtectedRequest, StatementClass, TaskError},
 };
+use std::sync::Arc;
 
 /// The longest operation ID, in bytes (`task::ledger::MAX_OPERATION_ID`).
 pub const MAX_OPERATION_ID: usize = 128;
@@ -38,6 +41,12 @@ impl OperationId {
     }
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+    /// The same ID as core's ledger key. Every server ID is a valid core ID
+    /// (core accepts any 1..=128 bytes); a mismatch still fails closed.
+    fn to_core(&self) -> Result<giggles_core::task::OperationId, CoreError> {
+        giggles_core::task::OperationId::new(self.0.as_bytes())
+            .ok_or(CoreError::Task(TaskError::OperationIdRequired))
     }
 }
 
@@ -65,10 +74,17 @@ impl ProtectedHead {
 /// A protected statement after admission, ready for [`Session::execute_protected`].
 ///
 /// [`Session::execute_protected`]: crate::Session::execute_protected
+/// `Direct` keeps the wrapped `UPDATE`'s text exactly as received (the suffix
+/// of the statement after the `OPERATION '<id>'` prefix): it is fingerprinted
+/// with the parameters, so a resend under the same ID replays.
 #[derive(Clone, Debug)]
-#[allow(dead_code, reason = "the fields are read by the Phase 6 and 7 bodies of protected_seam")]
+#[allow(dead_code, reason = "the fields are read by the Phase 7 bodies of protected_seam")]
 pub(crate) enum ProtectedStatement {
-    Direct { op: OperationId, prepared: Box<Prepared> },
+    Direct {
+        op: OperationId,
+        prepared: Box<Prepared>,
+        text: Arc<str>,
+    },
     Preview { prepared: Box<Prepared> },
     Apply { op: OperationId, preview: u64, digest: [u8; 32] },
     Outcome { op: OperationId },
@@ -139,20 +155,84 @@ pub fn description(head: &ProtectedHead, wrapped: Option<&Description>) -> Descr
     }
 }
 
-/// The seam the Phase 6 and 7 bodies fill in: R3-615 (`task::commit::protected_commit`
-/// for `Direct` and `Apply`), R3-617 (`outcome` for `Outcome`) and R3-707
-/// (preview). Until they land, every form fails closed with
+/// The seam the Phase 6 and 7 bodies fill in. `Direct` runs
+/// `task::protected_commit` as the session's executor (R3-615); `Outcome`
+/// (R3-617), `Preview` and `Apply` (R3-707) fail closed with
 /// `NotAllowedInTaskSession(class)` (0A000), even when admission would pass.
 /// It runs inside `Session::execute_protected`, after admission and with the
 /// session's `in_protected` flag set.
 pub(crate) fn protected_seam(
-    _session: &mut crate::Session,
+    session: &mut crate::Session,
     statement: &ProtectedStatement,
-    _params: &[Value],
+    params: &[Value],
 ) -> Result<SqlResult, CoreError> {
-    Err(CoreError::Task(TaskError::NotAllowedInTaskSession(
-        statement.class(),
-    )))
+    match statement {
+        ProtectedStatement::Direct { op, prepared, text } => {
+            direct(session, op, prepared, text, params)
+        }
+        ProtectedStatement::Preview { .. }
+        | ProtectedStatement::Apply { .. }
+        | ProtectedStatement::Outcome { .. } => Err(CoreError::Task(
+            TaskError::NotAllowedInTaskSession(statement.class()),
+        )),
+    }
+}
+
+/// `OPERATION '<id>' UPDATE ...`: one protected commit. The reply is
+/// `UPDATE n` with the receipt's row count; a replayed operation answers the
+/// stored receipt's count. A `TaskError` keeps its own SQLSTATE.
+fn direct(
+    session: &mut crate::Session,
+    op: &OperationId,
+    prepared: &Prepared,
+    text: &Arc<str>,
+    params: &[Value],
+) -> Result<SqlResult, CoreError> {
+    let ctx = session
+        .task()
+        .cloned()
+        .ok_or(CoreError::Policy(giggles_core::Error::Scope))?;
+    // protected_commit returns a receipt, not rows: a RETURNING list would be
+    // silently dropped, so it is refused before anything runs.
+    if !session.describe(prepared)?.columns.is_empty() {
+        return Err(CoreError::Unsupported);
+    }
+    let op = op.to_core()?;
+    let request = ProtectedRequest::Direct {
+        statement: prepared.clone(),
+        params: params.to_vec(),
+        text: text.clone(),
+    };
+    let receipt =
+        giggles_core::task::protected_commit(&mut session.sql, Actor::Executor(&ctx), &op, request)
+            .map_err(CoreError::from)?;
+    Ok(SqlResult {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        affected: u64::from(receipt.rows_affected),
+    })
+}
+
+/// Test-only route to the seam while admission keeps `Update` out of
+/// `task::admit::ENABLED`: classes listed here are admitted on this thread by
+/// `Session::admit`. Compiled into unit tests only.
+#[cfg(test)]
+pub(crate) mod test_route {
+    use giggles_core::task::StatementClass;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ENABLED: RefCell<Vec<StatementClass>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    pub(crate) fn enable(classes: &[StatementClass]) {
+        ENABLED.with(|enabled| *enabled.borrow_mut() = classes.to_vec());
+    }
+
+    pub(crate) fn enabled(class: StatementClass) -> bool {
+        ENABLED.with(|enabled| enabled.borrow().contains(&class))
+    }
 }
 
 const SYNTAX: &str = "42601";
@@ -313,6 +393,10 @@ pub fn parse(sql: &str) -> Result<Option<(ProtectedHead, &str)>, &'static str> {
     }
     Ok(None)
 }
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "statement_tests.rs"]
+mod seam_tests;
 
 #[cfg(test)]
 mod tests {
