@@ -22,6 +22,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_engine(giggles_core::Engine::Legacy).await
+    }
+    async fn with_engine(engine: giggles_core::Engine) -> Self {
         let path = std::env::temp_dir().join(format!(
             "pg-dump-preamble-{}-{}-{}",
             std::process::id(),
@@ -32,7 +35,7 @@ impl Fixture {
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
-        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), engine).unwrap();
         admin
             .roles()
             .create(NewRole {
@@ -1141,5 +1144,182 @@ async fn copy_formats_match_pg18_bytes() {
         drop(s);
     }
     drop(c);
+    f.stop().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+async fn lock_fixture() -> (Fixture, Client, Client) {
+    let f = Fixture::with_engine(giggles_core::Engine::V2).await;
+    let a = f.client().await;
+    let b = f.client().await;
+    a.simple_query(
+        "CREATE TABLE t(id integer PRIMARY KEY); CREATE TABLE u(id integer PRIMARY KEY)",
+    )
+    .await
+    .unwrap();
+    (f, a, b)
+}
+
+#[cfg(feature = "engine-rocksdb")]
+async fn bounded_query(
+    c: &Client,
+    sql: &str,
+) -> Result<Vec<SimpleQueryMessage>, tokio_postgres::Error> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), c.simple_query(sql))
+        .await
+        .expect("statement exceeded bounded wait")
+}
+
+#[cfg(feature = "engine-rocksdb")]
+async fn blocked_then_release(a: &Client, b: &Client, sql: &str) -> Vec<SimpleQueryMessage> {
+    let query = b.simple_query(sql);
+    tokio::pin!(query);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut query)
+            .await
+            .is_err(),
+        "conflicting statement returned before release"
+    );
+    bounded_query(a, "COMMIT").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), query)
+        .await
+        .expect("lock was not released")
+        .unwrap()
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn lock_access_exclusive_blocks_select() {
+    let (f, a, b) = lock_fixture().await;
+    a.simple_query("BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    blocked_then_release(&a, &b, "SELECT * FROM t").await;
+    drop((a, b));
+    f.stop().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn lock_nowait_wire_code_and_rollback_release() {
+    let (f, a, b) = lock_fixture().await;
+    a.simple_query("BEGIN; LOCK t IN ACCESS SHARE MODE")
+        .await
+        .unwrap();
+    b.simple_query("BEGIN").await.unwrap();
+    // Exercise extended execution as well as simple-query locking.
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        b.query("LOCK t IN ACCESS EXCLUSIVE MODE NOWAIT", &[]),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(code(error), "55P03");
+    a.simple_query("ROLLBACK").await.unwrap();
+    b.simple_query("ROLLBACK; BEGIN").await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        b.query("LOCK t IN ACCESS EXCLUSIVE MODE NOWAIT", &[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    b.simple_query("ROLLBACK").await.unwrap();
+    drop((a, b));
+    f.stop().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn lock_share_blocks_insert() {
+    let (f, a, b) = lock_fixture().await;
+    a.simple_query("BEGIN; LOCK t IN SHARE MODE").await.unwrap();
+    blocked_then_release(&a, &b, "INSERT INTO t VALUES (1)").await;
+    assert_eq!(
+        values(&a.simple_query("SELECT id FROM t").await.unwrap()),
+        ["1"]
+    );
+    drop((a, b));
+    f.stop().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn lock_share_compatible_and_reentrant() {
+    let (f, a, b) = lock_fixture().await;
+    a.simple_query("BEGIN; LOCK t IN SHARE MODE").await.unwrap();
+    b.simple_query("BEGIN").await.unwrap();
+    bounded_query(&b, "LOCK t, public.t IN SHARE MODE NOWAIT")
+        .await
+        .unwrap();
+    bounded_query(&b, "LOCK t IN ROW SHARE MODE NOWAIT")
+        .await
+        .unwrap();
+    b.simple_query("ROLLBACK").await.unwrap();
+    a.simple_query("ROLLBACK").await.unwrap();
+    drop((a, b));
+    f.stop().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn lock_exclusive_allows_select() {
+    let (f, a, b) = lock_fixture().await;
+    a.simple_query("BEGIN; LOCK t IN EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    bounded_query(&b, "SELECT * FROM t").await.unwrap();
+    a.simple_query("ROLLBACK").await.unwrap();
+    drop((a, b));
+    f.stop().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn lock_deadlock_reports_40p01() {
+    let (f, a, b) = lock_fixture().await;
+    a.simple_query("BEGIN; LOCK t").await.unwrap();
+    b.simple_query("BEGIN; LOCK u").await.unwrap();
+    {
+        let waiting = a.simple_query("LOCK u");
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            code(bounded_query(&b, "LOCK t").await.unwrap_err()),
+            "40P01"
+        );
+        b.simple_query("ROLLBACK").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    a.simple_query("ROLLBACK").await.unwrap();
+    drop((a, b));
+    f.stop().await;
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn lock_repeatable_read_select_refreshes_after_grant() {
+    let (f, a, b) = lock_fixture().await;
+    a.simple_query("BEGIN; INSERT INTO t VALUES (1)")
+        .await
+        .unwrap();
+    b.simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
+    blocked_then_release(&a, &b, "LOCK t IN SHARE MODE").await;
+    assert_eq!(
+        values(&bounded_query(&b, "SELECT id FROM t").await.unwrap()),
+        ["1"]
+    );
+    b.simple_query("ROLLBACK").await.unwrap();
+    drop((a, b));
     f.stop().await;
 }

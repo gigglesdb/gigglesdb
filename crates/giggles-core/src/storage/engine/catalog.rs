@@ -660,13 +660,7 @@ impl Catalog {
     ) -> Result<Arc<TableEntry>, CatalogError> {
         self.check()?;
         validate_identifier(relational::split_key(name).1)?;
-        if !matches!(
-            mode,
-            LockMode::AccessShare
-                | LockMode::RowExclusive
-                | LockMode::Share
-                | LockMode::AccessExclusive
-        ) {
+        if !mode.is_table() {
             return Err(TxnError::Misuse.into());
         }
         for attempt in 0..3 {

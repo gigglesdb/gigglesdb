@@ -79,6 +79,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::InvalidColumnReference) => "42P10",
         CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
+        CoreError::LockNotAvailable => "55P03",
         CoreError::Deadlock => "40P01",
         CoreError::Storage(_) | CoreError::Fenced => "08007",
         CoreError::Corrupt(_) | CoreError::Exists => "XX000",

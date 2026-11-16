@@ -55,6 +55,19 @@ const FORMAT: u32 = 3;
 const NATIVE_FORMAT: u32 = 4;
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"GDEXP001";
+/// PostgreSQL table lock modes, held until the SQL transaction ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlTableLockMode {
+    AccessShare,
+    RowShare,
+    RowExclusive,
+    ShareUpdateExclusive,
+    Share,
+    ShareRowExclusive,
+    ExclusiveTable,
+    AccessExclusive,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreError {
     Storage(String),
@@ -67,6 +80,7 @@ pub enum CoreError {
     Exists,
     Busy,
     Deadlock,
+    LockNotAvailable,
     Fenced,
     Cancelled,
     Limit,
@@ -2570,6 +2584,73 @@ impl SqlSession {
             Ok(relational::relation_key(schema, table))
         })
     }
+    /// Acquire explicit table locks in list order on the open v2 transaction.
+    /// Legacy sessions retain their historical validated no-op behaviour.
+    pub fn lock_tables(
+        &mut self,
+        tables: &[String],
+        mode: SqlTableLockMode,
+        nowait: bool,
+    ) -> Result<(), CoreError> {
+        if !self.is_v2_engine() {
+            return Ok(());
+        }
+        let result = (|| {
+            if self.aborted {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            let names = tables
+                .iter()
+                .map(|name| {
+                    let prepared = self.prepare(&format!("SELECT * FROM {name} LIMIT 0"))?;
+                    prepared
+                        .table()
+                        .map(str::to_owned)
+                        .ok_or(CoreError::Sql(relational::SqlError::UnknownTable))
+                })
+                .collect::<Result<Vec<_>, CoreError>>()?;
+            let Backend::V2(db) = &self.admin.inner.backend else {
+                unreachable!()
+            };
+            let txn = self
+                .v2_transaction
+                .as_mut()
+                .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+            txn.begin_statement();
+            let mode = match mode {
+                SqlTableLockMode::AccessShare => engine::locks::LockMode::AccessShare,
+                SqlTableLockMode::RowShare => engine::locks::LockMode::RowShare,
+                SqlTableLockMode::RowExclusive => engine::locks::LockMode::RowExclusive,
+                SqlTableLockMode::ShareUpdateExclusive => {
+                    engine::locks::LockMode::ShareUpdateExclusive
+                }
+                SqlTableLockMode::Share => engine::locks::LockMode::Share,
+                SqlTableLockMode::ShareRowExclusive => engine::locks::LockMode::ShareRowExclusive,
+                SqlTableLockMode::ExclusiveTable => engine::locks::LockMode::ExclusiveTable,
+                SqlTableLockMode::AccessExclusive => engine::locks::LockMode::AccessExclusive,
+            };
+            let deadline = nowait.then(std::time::Instant::now);
+            for name in names {
+                db.catalog()
+                    .resolve(txn, &name, mode, deadline, &|| {
+                        crate::cancellation::check().is_err()
+                    })
+                    .map_err(|error| match error {
+                        engine::catalog::CatalogError::Core(error) => error,
+                        engine::catalog::CatalogError::Txn(engine::txn::TxnError::LockTimeout) => {
+                            CoreError::LockNotAvailable
+                        }
+                        engine::catalog::CatalogError::Txn(error) => error.into(),
+                    })?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
     /// Eligibility from the active definition snapshot. Legacy requires empty
     /// business/task state; v2 uses SQL's synchronous populated-database DDL.
     pub(crate) fn catalog_empty_engine(&mut self) -> Result<bool, CoreError> {

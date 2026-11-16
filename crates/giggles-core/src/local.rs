@@ -72,6 +72,7 @@ pub fn failure(e: CoreError) -> Reply {
         CoreError::Unsupported | CoreError::EngineUnsupported { .. } => 12,
         CoreError::Exists => 13,
         CoreError::Busy => 14,
+        CoreError::LockNotAvailable => 20,
         CoreError::Deadlock => 19,
         CoreError::Fenced => 15,
         CoreError::Limit => 16,

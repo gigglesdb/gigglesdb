@@ -29,30 +29,36 @@ pub(crate) enum LockKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum LockMode {
     AccessShare,
+    RowShare,
     RowExclusive,
+    ShareUpdateExclusive,
     Share,
+    ShareRowExclusive,
+    ExclusiveTable,
     AccessExclusive,
     Shared,
     Exclusive,
 }
 
 impl LockMode {
-    fn conflict_set(self) -> u8 {
+    // Table bits follow the first eight enum variants in PostgreSQL mode order.
+    fn conflict_set(self) -> u16 {
         match self {
-            Self::AccessShare => 0b1000,
-            Self::RowExclusive => 0b1100,
-            Self::Share => 0b1010,
-            Self::AccessExclusive => 0b1111,
+            Self::AccessShare => 0b10000000,
+            Self::RowShare => 0b11000000,
+            Self::RowExclusive => 0b11110000,
+            Self::ShareUpdateExclusive => 0b11111000,
+            Self::Share => 0b11101100,
+            Self::ShareRowExclusive => 0b11111100,
+            Self::ExclusiveTable => 0b11111110,
+            Self::AccessExclusive => 0b11111111,
             Self::Shared => 0b10,
             Self::Exclusive => 0b11,
         }
     }
 
-    fn is_table(self) -> bool {
-        matches!(
-            self,
-            Self::AccessShare | Self::RowExclusive | Self::Share | Self::AccessExclusive
-        )
+    pub(crate) fn is_table(self) -> bool {
+        !matches!(self, Self::Shared | Self::Exclusive)
     }
 
     pub(crate) fn covers(self, requested: Self) -> bool {
@@ -61,19 +67,20 @@ impl LockMode {
     }
 
     fn conflicts(self, other: Self) -> bool {
-        match self {
-            Self::AccessShare => matches!(other, Self::AccessExclusive),
-            Self::RowExclusive => matches!(other, Self::Share | Self::AccessExclusive),
-            Self::Share => matches!(other, Self::RowExclusive | Self::AccessExclusive),
-            Self::AccessExclusive => true,
-            Self::Shared => matches!(other, Self::Exclusive),
-            Self::Exclusive => true,
+        if self.is_table() && other.is_table() {
+            self.conflict_set() & (1 << other as u8) != 0
+        } else {
+            match self {
+                Self::Shared => matches!(other, Self::Exclusive),
+                Self::Exclusive | Self::AccessExclusive => true,
+                _ => false,
+            }
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct HeldModes(u8);
+struct HeldModes(u16);
 
 impl HeldModes {
     fn insert(&mut self, mode: LockMode) {
@@ -84,8 +91,12 @@ impl HeldModes {
         use LockMode::*;
         [
             AccessShare,
+            RowShare,
             RowExclusive,
+            ShareUpdateExclusive,
             Share,
+            ShareRowExclusive,
+            ExclusiveTable,
             AccessExclusive,
             Shared,
             Exclusive,
@@ -208,6 +219,9 @@ impl LockManager {
             return Ok(());
         }
 
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(LockError::Timeout);
+        }
         let id = state.next_waiter;
         state.next_waiter = state.next_waiter.checked_add(1).ok_or(LockError::Misuse)?;
         let upgrade = held.is_some();

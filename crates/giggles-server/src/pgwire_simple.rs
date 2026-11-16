@@ -282,7 +282,7 @@ impl State {
             if !session.in_transaction() || *implicit {
                 return Err("25P01");
             }
-            validate_lock(session, &tables.0, tables.1)?;
+            validate_lock(session, &tables.tables, tables.mode, tables.nowait)?;
             return complete("LOCK TABLE", &SqlResult::default(), out);
         }
         if let Some(select) = crate::auth::statements::copy_stdout_select(sql)? {
@@ -745,13 +745,21 @@ fn copy_csv_field(value: &[u8], options: &crate::auth::statements::CopyOutput, o
     }
 }
 
-// Serializable snapshots pin schema and reads; explicit table lock modes are
-// validated no-ops, with PostgreSQL's mode-dependent privilege requirements.
-pub(super) fn validate_lock(session: &mut Session, tables: &[String], strong: bool) -> R<()> {
+// Validate every name and privilege before acquiring any explicit locks.
+pub(super) fn validate_lock(
+    session: &mut Session,
+    tables: &[String],
+    mode: giggles_core::SqlTableLockMode,
+    nowait: bool,
+) -> R<()> {
+    let strong = !matches!(
+        mode,
+        giggles_core::SqlTableLockMode::AccessShare | giggles_core::SqlTableLockMode::RowShare
+    );
     use giggles_core::{Error, roles::TablePrivilege};
     core(session.validate_access_share(tables))?;
     if !strong {
-        return Ok(());
+        return core(session.sql.lock_tables(tables, mode, nowait));
     }
     core(session.authority_scope(|session| {
         for table in tables {
@@ -793,7 +801,8 @@ pub(super) fn validate_lock(session: &mut Session, tables: &[String], strong: bo
             session.sql.describe(&prepared)?;
         }
         Ok(())
-    }))
+    }))?;
+    core(session.sql.lock_tables(tables, mode, nowait))
 }
 
 #[cfg(test)]

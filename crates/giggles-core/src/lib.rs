@@ -16,7 +16,7 @@ pub use storage::{
     Admin, CoreError, CrashPoint, DecisionPoint, Engine, Executor, IndexInfo, Limits, ReclaimStats,
     RecoveryPoint, UpgradePoint, UpgradeReport,
 };
-pub use storage::{Cursor, SqlSession};
+pub use storage::{Cursor, SqlSession, SqlTableLockMode};
 mod sqlstate;
 pub use sqlstate::sqlstate;
 mod sql;

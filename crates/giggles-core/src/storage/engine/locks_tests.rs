@@ -234,6 +234,7 @@ fn covers_respects_incomparable_table_modes_and_mode_families() {
                 }
                 Shared => matches!(weak, Shared),
                 Exclusive => matches!(weak, Shared | Exclusive),
+                _ => unreachable!("this regression enumerates the original modes"),
             };
             assert_eq!(strong.covers(weak), expected, "{strong:?}.covers({weak:?})");
         }
@@ -901,4 +902,91 @@ fn release_all_visits_only_affected_keys_and_releases_queued_grants() {
     drop(state);
     first.finish();
     second.finish();
+}
+
+#[test]
+fn postgres_table_lock_matrix_and_coverage() {
+    use LockMode::*;
+    let modes = [
+        AccessShare,
+        RowShare,
+        RowExclusive,
+        ShareUpdateExclusive,
+        Share,
+        ShareRowExclusive,
+        ExclusiveTable,
+        AccessExclusive,
+    ];
+    // Rows are requested, columns held, in PostgreSQL documentation order.
+    let matrix = [
+        [false, false, false, false, false, false, false, true],
+        [false, false, false, false, false, false, true, true],
+        [false, false, false, false, true, true, true, true],
+        [false, false, false, true, true, true, true, true],
+        [false, false, true, true, false, true, true, true],
+        [false, false, true, true, true, true, true, true],
+        [false, true, true, true, true, true, true, true],
+        [true, true, true, true, true, true, true, true],
+    ];
+    for (r, &requested) in modes.iter().enumerate() {
+        for (h, &held) in modes.iter().enumerate() {
+            assert_eq!(
+                requested.conflicts(held),
+                matrix[r][h],
+                "{requested:?} vs {held:?}"
+            );
+            let lm = manager();
+            acquire(&lm, 1, LockKey::Table(1), held);
+            assert_eq!(
+                lm.acquire(
+                    TxnId(2),
+                    LockKey::Table(1),
+                    requested,
+                    Some(Instant::now()),
+                    &|| false
+                ),
+                if matrix[r][h] {
+                    Err(LockError::Timeout)
+                } else {
+                    Ok(())
+                }
+            );
+            let covers = (0..8).all(|i| !matrix[r][i] || matrix[h][i]);
+            assert_eq!(
+                held.covers(requested),
+                covers,
+                "{held:?} covers {requested:?}"
+            );
+            assert!(!held.covers(Shared));
+            assert!(!Exclusive.covers(requested));
+        }
+    }
+}
+
+#[test]
+fn nowait_does_not_join_a_deadlock_cycle() {
+    let lm = manager();
+    acquire(&lm, 1, LockKey::Table(1), LockMode::AccessExclusive);
+    acquire(&lm, 2, LockKey::Table(2), LockMode::AccessExclusive);
+    let waiter = spawn_waiter(&lm, 1, LockKey::Table(2), LockMode::AccessExclusive);
+    until(|| lm.waiting_count() == 1);
+    assert_eq!(
+        lm.acquire(
+            TxnId(2),
+            LockKey::Table(1),
+            LockMode::AccessExclusive,
+            Some(Instant::now()),
+            &|| false
+        ),
+        Err(LockError::Timeout)
+    );
+    assert_eq!(lm.waiting_count(), 1);
+    lm.release_all(TxnId(2));
+    waiter.granted();
+    waiter.finish();
+    lm.release_all(TxnId(1));
+    assert_eq!(
+        crate::sqlstate(&crate::CoreError::LockNotAvailable),
+        "55P03"
+    );
 }

@@ -572,8 +572,15 @@ fn quote_relation(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+#[derive(Clone)]
+pub(crate) struct TableLockRequest {
+    pub(crate) tables: Vec<String>,
+    pub(crate) mode: giggles_core::SqlTableLockMode,
+    pub(crate) nowait: bool,
+}
+
 // Parse the bounded pg_dump lock surface without granting admin authority.
-pub(crate) fn access_share_tables(sql: &str) -> Result<Option<(Vec<String>, bool)>, &'static str> {
+pub(crate) fn access_share_tables(sql: &str) -> Result<Option<TableLockRequest>, &'static str> {
     let tokens = match lex(sql) {
         Ok(tokens) => tokens,
         Err(_) => return Ok(None),
@@ -598,7 +605,8 @@ pub(crate) fn access_share_tables(sql: &str) -> Result<Option<(Vec<String>, bool
             break;
         }
     }
-    let mut strong = true; // PostgreSQL defaults to ACCESS EXCLUSIVE.
+    use giggles_core::SqlTableLockMode::*;
+    let mut lock_mode = AccessExclusive;
     if p.kw("in") {
         let start = p.pos;
         while p.pos < p.tokens.len() && p.tokens[p.pos] != Token::Word("mode".into()) {
@@ -612,25 +620,26 @@ pub(crate) fn access_share_tables(sql: &str) -> Result<Option<(Vec<String>, bool
             })
             .collect::<Vec<_>>()
             .join(" ");
-        strong = match mode.as_str() {
-            "access share" | "row share" => false,
-            "row exclusive"
-            | "share update exclusive"
-            | "share"
-            | "share row exclusive"
-            | "exclusive"
-            | "access exclusive" => true,
+        lock_mode = match mode.as_str() {
+            "access share" => AccessShare,
+            "row share" => RowShare,
+            "row exclusive" => RowExclusive,
+            "share update exclusive" => ShareUpdateExclusive,
+            "share" => Share,
+            "share row exclusive" => ShareRowExclusive,
+            "exclusive" => ExclusiveTable,
+            "access exclusive" => AccessExclusive,
             _ => return Err("42601"),
         };
         if !p.kw("mode") {
             return Err("42601");
         }
     }
-    p.kw("nowait");
+    let nowait = p.kw("nowait");
     if p.pos != p.tokens.len() {
         return Err("42601");
     }
-    Ok(Some((tables, strong)))
+    Ok(Some(TableLockRequest { tables, mode: lock_mode, nowait }))
 }
 
 pub(crate) struct CopyOutput {
