@@ -9,7 +9,7 @@ pub use crate::relational::ViewRead;
 #[serde(deny_unknown_fields)]
 pub enum ConstraintSpec {
     Unique { columns: Vec<String> },
-    /// Currently bounded to a column compared with an int, text, bool or NULL literal.
+    /// Expressions are translated to the existing bounded SQL CHECK validator.
     Check { expression: Expr },
     ForeignKey { columns: Vec<String>, ref_table: String, ref_columns: Option<Vec<String>>, on_delete: ForeignKeyAction, on_update: ForeignKeyAction },
 }
@@ -253,9 +253,31 @@ fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
                     if let Some(columns) = ref_columns { check_columns(columns)?; }
                 }
                 ConstraintSpec::Check { expression } => {
-                    let Expr::Compare(left, _, right) = expression else { return Err(Error::Unsupported); };
-                    let (Expr::Field(column), Expr::Value(ValueExpr::Literal(Value::Int(_) | Value::Bool(_) | Value::Text(_) | Value::Null))) = (&**left, &**right) else { return Err(Error::Unsupported); };
-                    if !identifier(column) { return Err(Error::Bind("identifier".into())); }
+                    let mut pending = vec![(expression, 0)];
+                    let mut nodes = 0;
+                    while let Some((expr, depth)) = pending.pop() {
+                        nodes += 1;
+                        if depth > MAX_DEPTH || nodes > MAX_EXPRESSION_NODES { return Err(Error::Limit); }
+                        match expr {
+                            Expr::Value(ValueExpr::Parameter(_)) | Expr::Local(_) | Expr::ConflictField { .. } => return Err(Error::Unsupported),
+                            Expr::Value(ValueExpr::Literal(value)) if !matches!(value, Value::Int(_) | Value::Bool(_) | Value::Text(_) | Value::Null) => return Err(Error::Unsupported),
+                            Expr::Field(name) if !identifier(name) => return Err(Error::Bind("identifier".into())),
+                            Expr::Compare(a, _, b) | Expr::Arithmetic(a, _, b) | Expr::And(a, b) | Expr::Or(a, b) => { pending.push((a.as_ref(), depth + 1)); pending.push((b.as_ref(), depth + 1)); }
+                            Expr::IsNull(e, _) | Expr::Not(e) | Expr::Negate(e) => pending.push((e.as_ref(), depth + 1)),
+                            Expr::Call { arguments, .. } => {
+                                if arguments.len() > MAX_EXPRESSION_NODES.saturating_sub(nodes + pending.len()) { return Err(Error::Limit); }
+                                pending.extend(arguments.iter().map(|e| (e, depth + 1)));
+                            }
+                            Expr::Case { operand, arms, else_expr } => {
+                                let children = arms.len().saturating_mul(2).saturating_add(usize::from(operand.is_some()) + usize::from(else_expr.is_some()));
+                                if children > MAX_EXPRESSION_NODES.saturating_sub(nodes + pending.len()) { return Err(Error::Limit); }
+                                pending.extend(operand.iter().map(|e| (e.as_ref(), depth + 1)));
+                                pending.extend(arms.iter().flat_map(|(a, b)| [(a, depth + 1), (b, depth + 1)]));
+                                pending.extend(else_expr.iter().map(|e| (e.as_ref(), depth + 1)));
+                            }
+                            _ => (),
+                        }
+                    }
                 }
             }
         }

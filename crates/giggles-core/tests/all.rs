@@ -475,3 +475,5 @@ mod parity_insert_duplicate_column;
 #[path = "parity_update_eval_order.rs"] mod parity_update_eval_order;
 
 #[path = "parity_sequence_schema.rs"] mod parity_sequence_schema;
+
+#[path = "parity_native_check.rs"] mod parity_native_check;

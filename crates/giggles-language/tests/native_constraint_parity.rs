@@ -122,7 +122,7 @@ fn constraint_syntax_is_opt_in() {
     assert!(parse_catalog_with_version("alter table t add foreign key(x) references p on delete cascade on delete restrict", VERSION).is_err());
     let (_db, admin) = Database::fresh(Storage::Legacy);
     admin.sql_session().execute("create table t(id bigint primary key,qty bigint)", &[], None).unwrap();
-    assert_eq!(with_sql_parser_forbidden(|| Engine::with_version(admin.clone(), VERSION).execute_catalog_text("alter table t add check(qty > id)")), Err(Error::Unsupported));
+    with_sql_parser_forbidden(|| Engine::with_version(admin.clone(), VERSION).execute_catalog_text("alter table t add check(qty > id)")).unwrap();
     admin.sql_session().execute("alter table t add check(qty > id)", &[], None).unwrap();
     assert_eq!(capability_manifest_for(VERSION).capabilities.iter().filter(|c| c.feature == "catalog_constraints").count(), 3);
     assert_eq!(capability_manifest_for(LanguageVersion::Embedded019).capabilities.iter().filter(|c| c.feature == "catalog_constraints").count(), 0);

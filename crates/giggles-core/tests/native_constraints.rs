@@ -138,7 +138,8 @@ fn cascade_and_request_decoder_match_sql() {
         assert!(serde_json::from_str::<CatalogRequest>(r#"{"DropConstraint":{"table":"child","name":"rule","cascade":false,"extra":true}}"#).is_err());
         let engine = Engine::new(native.clone());
         let rich = add(ConstraintSpec::Check { expression: Expr::Not(Box::new(Expr::Value(ValueExpr::Literal(Value::Bool(false))))) }, false);
-        assert_eq!(engine.execute_catalog(&rich), Err(Error::Unsupported));
+        // Native CHECK now accepts SQL's CHECK grammar (PARITY-A item 2); probe it on a scratch fixture.
+        { let (_, scratch) = fixture(backend); Engine::new(scratch.clone()).execute_catalog(&rich).unwrap(); }
         let reserved = CatalogRequest::AddConstraint { table: "system_native".into(), name: None, constraint: cases().remove(0).0 };
         let expected = state(sql.sql_session().execute("ALTER TABLE system_native ADD UNIQUE(n)", &[], None).unwrap_err());
         assert_eq!(engine.execute_catalog(&reserved).unwrap_err().sqlstate(), Some(expected.as_str()));

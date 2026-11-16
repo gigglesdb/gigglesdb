@@ -1730,6 +1730,77 @@ pub(crate) fn validate_create_definition(
     }
     Ok(())
 }
+// Preserve expression grouping while leaving ordinary SQL CHECK spelling unchanged.
+fn native_check_tokens(expression: &crate::operations::Expr, parent: u8) -> R<Vec<Token>> {
+    use crate::operations::{Arithmetic as A, Compare as C, Expr as E, ScalarFunction as F, ValueExpr};
+    let precedence = match expression {
+        E::Or(..) => 1, E::And(..) => 2, E::Not(..) => 3,
+        E::Compare(..) | E::IsNull(..) => 4,
+        E::Arithmetic(_, A::Add | A::Subtract, _) => 5,
+        E::Arithmetic(..) => 6, E::Negate(..) => 7, _ => 8,
+    };
+    let word = |s: &str| Token::Word(s.into());
+    let mut tokens = match expression {
+        E::Value(ValueExpr::Literal(value)) => match value {
+            Value::Int(n) => {
+                let mut out = Vec::new();
+                if *n < 0 { out.push(Token::Op("-".into())); }
+                out.push(Token::Number(n.unsigned_abs().to_string())); out
+            }
+            Value::Text(s) => vec![Token::String(s.clone())],
+            Value::Bool(b) => vec![word(if *b { "true" } else { "false" })],
+            Value::Null => vec![word("null")],
+            _ => return Err(SqlError::Unsupported),
+        },
+        E::Field(name) => { ident(name)?; vec![Token::QuotedIdent(name.clone())] }
+        E::Compare(left, op, right) => {
+            let mut out = native_check_tokens(left, precedence + 1)?;
+            out.push(Token::Op(match op { C::Eq => "=", C::Ne => "<>", C::Lt => "<", C::Le => "<=", C::Gt => ">", C::Ge => ">=" }.into()));
+            out.extend(native_check_tokens(right, precedence + 1)?); out
+        }
+        E::Arithmetic(left, op, right) => {
+            let mut out = native_check_tokens(left, precedence)?;
+            out.push(Token::Op(match op { A::Add => "+", A::Subtract => "-", A::Multiply => "*", A::Divide => "/", A::Remainder => "%" }.into()));
+            out.extend(native_check_tokens(right, precedence + 1)?); out
+        }
+        E::And(left, right) | E::Or(left, right) => {
+            let mut out = native_check_tokens(left, precedence)?;
+            out.push(word(if matches!(expression, E::And(..)) { "and" } else { "or" }));
+            out.extend(native_check_tokens(right, precedence + 1)?); out
+        }
+        E::Not(inner) | E::Negate(inner) => {
+            let mut out = vec![if matches!(expression, E::Not(..)) { word("not") } else { Token::Op("-".into()) }];
+            out.extend(native_check_tokens(inner, precedence + u8::from(matches!(expression, E::Negate(..))))?); out
+        }
+        E::IsNull(inner, negated) => {
+            let mut out = native_check_tokens(inner, precedence + 1)?;
+            out.push(word("is"));
+            if *negated { out.push(word("not")); }
+            out.push(word("null")); out
+        }
+        E::Call { function, arguments } => {
+            let mut out = vec![word(match function { F::Coalesce => "coalesce", F::Abs => "abs", F::Length => "length" }), Token::Symbol('(')];
+            for (i, argument) in arguments.iter().enumerate() {
+                if i != 0 { out.push(Token::Symbol(',')); }
+                out.extend(native_check_tokens(argument, 0)?);
+            }
+            out.push(Token::Symbol(')')); out
+        }
+        E::Case { operand, arms, else_expr } => {
+            let mut out = vec![word("case")];
+            if let Some(operand) = operand { out.extend(native_check_tokens(operand, 0)?); }
+            for (when, then) in arms {
+                out.push(word("when")); out.extend(native_check_tokens(when, 0)?);
+                out.push(word("then")); out.extend(native_check_tokens(then, 0)?);
+            }
+            if let Some(otherwise) = else_expr { out.push(word("else")); out.extend(native_check_tokens(otherwise, 0)?); }
+            out.push(word("end")); out
+        }
+        E::Value(ValueExpr::Parameter(_)) | E::Local(_) | E::ConflictField { .. } => return Err(SqlError::Unsupported),
+    };
+    if precedence < parent { tokens.insert(0, Token::Symbol('(')); tokens.push(Token::Symbol(')')); }
+    Ok(tokens)
+}
 impl Prepared {
     #[allow(dead_code)] // Awaiting v2 dispatch integration.
     pub(crate) fn v2_class(&self) -> V2Class {
@@ -2036,7 +2107,7 @@ impl Prepared {
         Self::engine(Statement::Begin, domain, epoch)
     }
     pub(crate) fn constraint_engine(request: &crate::operations::CatalogRequest, domain: u128, epoch: u64) -> R<Self> {
-        use crate::operations::{CatalogRequest as C, ConstraintSpec as S, ForeignKeyAction as F, Expr as E, ValueExpr, Compare};
+        use crate::operations::{CatalogRequest as C, ConstraintSpec as S, ForeignKeyAction as F};
         let names = |columns: &[String]| -> R<()> {
             if columns.is_empty() || columns.len() > MAX_COLUMNS { return Err(SqlError::Limit); }
             for name in columns { ident(name)?; }
@@ -2049,18 +2120,7 @@ impl Prepared {
                 let definition = match constraint {
                     S::Unique { columns } => { names(columns)?; constraints::Definition::Unique { name: name.clone(), columns: columns.clone() } }
                     S::Check { expression } => {
-                        let E::Compare(left, op, right) = expression else { return Err(SqlError::Unsupported); };
-                        let (E::Field(column), E::Value(ValueExpr::Literal(value))) = (&**left, &**right) else { return Err(SqlError::Unsupported); };
-                        ident(column)?;
-                        let mut tokens = vec![Token::QuotedIdent(column.clone()), Token::Op(match op { Compare::Eq => "=", Compare::Ne => "<>", Compare::Lt => "<", Compare::Le => "<=", Compare::Gt => ">", Compare::Ge => ">=" }.into())];
-                        let literal = match value {
-                            Value::Int(n) => { if *n < 0 { tokens.push(Token::Op("-".into())); } Token::Number(n.unsigned_abs().to_string()) }
-                            Value::Text(s) => Token::String(s.clone()),
-                            Value::Bool(b) => Token::Word(b.to_string()),
-                            Value::Null => Token::Word("null".into()),
-                            _ => return Err(SqlError::Unsupported),
-                        };
-                        tokens.push(literal);
+                        let tokens = native_check_tokens(expression, 0)?;
                         constraints::Definition::Check { name: name.clone(), expression: tokens, not_valid: false }
                     }
                     S::ForeignKey { columns, ref_table, ref_columns, on_delete, on_update } => {
