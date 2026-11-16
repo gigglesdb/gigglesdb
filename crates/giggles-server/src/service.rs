@@ -123,6 +123,7 @@ pub struct Service {
     pub(crate) clock: Clock,
     password_generations: std::sync::Mutex<BTreeMap<String, (u32, u64, u64)>>,
     pub(crate) authority_gate: std::sync::RwLock<()>,
+    pub(crate) binding_changes: tokio::sync::watch::Sender<()>,
     bindings: std::sync::Mutex<Credentials>,
     pub(crate) admission: crate::admission::Admission,
 }
@@ -162,6 +163,7 @@ impl Service {
             task_gate: std::sync::Mutex::new(()),
             password_generations: std::sync::Mutex::new(BTreeMap::new()),
             authority_gate: std::sync::RwLock::new(()),
+            binding_changes: tokio::sync::watch::channel(()).0,
             bindings: std::sync::Mutex::new(Credentials { next, entries }),
             admission: crate::admission::Admission::new(limits)?,
             admin,
@@ -245,6 +247,8 @@ impl Service {
             entries.insert(fp, (role, epoch));
         }
         *current = Credentials { next, entries };
+        drop(current);
+        self.binding_changes.send_replace(());
         Ok(next)
     }
     pub(crate) fn cancel_bound(&self, session: &Session, pid: u32, secret: u32) {
@@ -375,7 +379,10 @@ pub struct Session {
     sequence_owner_candidates: BTreeSet<String>,
 }
 impl Drop for Session {
-    fn drop(&mut self) { self.service.advisory.release(self.backend_pid, false); }
+    fn drop(&mut self) {
+        self.abort();
+        self.service.advisory.release(self.backend_pid, false);
+    }
 }
 impl Session {
     pub(crate) fn zone(&self) -> Option<SessionZone> {
@@ -585,27 +592,35 @@ impl Session {
             }
             _ => {}
         }
-        let result = crate::auth::statements::execute(&bound, &self.service.admin, &actor)?;
-        if let Some(before) = target {
-            let after = self
-                .service
-                .admin
-                .roles()
-                .get(&before.name)
-                .map_err(|_| "XX000")?
-                .ok_or("XX000")?;
-            let mut expected = before.clone();
-            expected.password = after.password.clone();
-            expected.generation = after.generation;
-            if expected == after && before.generation.checked_add(1) == Some(after.generation) {
-                let first = aliases
+        let result = crate::auth::statements::execute(&bound, &self.service.admin, &actor);
+        // Even a multi-role DROP that returns an error may have committed a
+        // preceding drop. Publish only after password aliases are ready.
+        let result = (|| {
+            let result = result?;
+            if let Some(before) = target {
+                let after = self
+                    .service
+                    .admin
+                    .roles()
                     .get(&before.name)
-                    .filter(|&&(oid, _, last)| oid == before.oid && last == before.generation)
-                    .map_or(before.generation, |&(_, first, _)| first);
-                aliases.insert(before.name, (after.oid, first, after.generation));
+                    .map_err(|_| "XX000")?
+                    .ok_or("XX000")?;
+                let mut expected = before.clone();
+                expected.password = after.password.clone();
+                expected.generation = after.generation;
+                if expected == after && before.generation.checked_add(1) == Some(after.generation) {
+                    let first = aliases
+                        .get(&before.name)
+                        .filter(|&&(oid, _, last)| oid == before.oid && last == before.generation)
+                        .map_or(before.generation, |&(_, first, _)| first);
+                    aliases.insert(before.name, (after.oid, first, after.generation));
+                }
             }
-        }
-        Ok(result)
+            Ok(result)
+        })();
+        drop(aliases);
+        self.service.binding_changes.send_replace(());
+        result
     }
     /// Wire description of a prepared statement. DDL returns no rows and takes
     /// no parameters; core does not describe it, so report an empty shape.

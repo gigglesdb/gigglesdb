@@ -195,7 +195,7 @@ impl ApiRuntime {
         receiver.await.map_err(|_| ApiError::Internal)?
     }
 
-    /// Called after an atomic binding reload; the periodic sweep also covers
+    /// Called after an atomic binding reload. Service notifications also cover
     /// trusted library reloads that do not pass through the executable.
     pub fn invalidate_bindings(&self) {
         self.registry.sweep();
@@ -227,6 +227,9 @@ async fn supervise(
     mut jobs: mpsc::Receiver<Job>,
     mut stop: watch::Receiver<bool>,
 ) {
+    let mut binding_changes = service.binding_changes.subscribe();
+    // Cover a reload between runtime construction and this task's first poll.
+    registry.sweep();
     let mut workers = JoinSet::new();
     let mut sweep = tokio::time::interval(Duration::from_secs(1));
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -237,6 +240,7 @@ async fn supervise(
                 if changed.is_err() || *stop.borrow() { break; }
             }
             Some(_) = workers.join_next(), if !workers.is_empty() => {}
+            _ = binding_changes.changed() => registry.sweep(),
             _ = sweep.tick() => registry.sweep(),
             job = jobs.recv() => match job {
                 Some(job) => { workers.spawn(run_job(service.clone(), job)); }

@@ -2,7 +2,7 @@ use super::{error::ApiError, identity::ConnectionIdentity, limits::*};
 use crate::{Service, Session};
 use giggles_core::Cancellation;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
@@ -35,10 +35,19 @@ impl Tokens for RandomTokens {
 pub(crate) struct Registry {
     service: Arc<Service>,
     entries: Mutex<HashMap<String, Arc<Entry>>>,
+    // Locked only under entries, so removing a live token and recording its
+    // revocation is atomic to lookups. Markers own no sessions or permits.
+    revoked: Mutex<VecDeque<Revoked>>,
+    capacity: usize,
     slots: Arc<Semaphore>,
     clock: Arc<dyn Clock>,
     tokens: Arc<dyn Tokens>,
     stopping: AtomicBool,
+}
+struct Revoked {
+    token: String,
+    owner: ConnectionIdentity,
+    at: Instant,
 }
 struct Entry {
     owner: ConnectionIdentity,
@@ -74,6 +83,8 @@ impl Registry {
         Arc::new(Self {
             service,
             entries: Mutex::new(HashMap::new()),
+            revoked: Mutex::new(VecDeque::new()),
+            capacity: limits.sessions,
             slots: Arc::new(Semaphore::new(limits.sessions)),
             clock,
             tokens,
@@ -123,14 +134,16 @@ impl Registry {
                 if self.stopping.load(Ordering::Acquire) {
                     return Err(ApiError::Unavailable);
                 }
-                if map.contains_key(&token) {
+                let mut revoked = self.revoked.lock().map_err(|_| ApiError::Internal)?;
+                revoked.retain(|marker| now < marker.at + IDLE_TIMEOUT);
+                if map.contains_key(&token) || revoked.iter().any(|marker| marker.token == token) {
                     continue;
                 }
                 map.insert(token.clone(), entry.clone());
             }
             // Reload may race construction/insertion. Never publish a stale handle.
             if let Err(error) = owner.check(&self.service) {
-                self.invalidate(&token, &entry);
+                self.invalidate(&token, &entry, true);
                 return Err(error);
             }
             return Ok(token);
@@ -150,15 +163,32 @@ impl Registry {
             return Err(ApiError::InvalidArgument);
         }
         owner.check(&self.service)?;
-        let entry = self
-            .entries
-            .lock()
-            .map_err(|_| ApiError::Internal)?
-            .get(token)
-            .cloned()
-            .ok_or(ApiError::SessionNotFound)?;
+        let entry = {
+            let map = self.entries.lock().map_err(|_| ApiError::Internal)?;
+            let mut revoked = self.revoked.lock().map_err(|_| ApiError::Internal)?;
+            let now = self.now();
+            revoked.retain(|marker| now < marker.at + IDLE_TIMEOUT);
+            if revoked
+                .iter()
+                .any(|marker| marker.token == token && &marker.owner == owner)
+            {
+                return Err(ApiError::Unauthenticated);
+            }
+            map.get(token).cloned().ok_or(ApiError::SessionNotFound)?
+        };
         if &entry.owner != owner {
             return Err(ApiError::SessionNotFound);
+        }
+        if entry.owner.check(&self.service).is_err() {
+            let state = entry.state.lock().map_err(|_| ApiError::Internal)?;
+            let expired = expired(&entry, &state, self.now());
+            drop(state);
+            self.invalidate(token, &entry, !expired);
+            return Err(if expired {
+                ApiError::SessionNotFound
+            } else {
+                ApiError::Unauthenticated
+            });
         }
         Ok(entry)
     }
@@ -177,7 +207,7 @@ impl Registry {
         let mut state = entry.state.lock().map_err(|_| ApiError::Internal)?;
         if state.closing || expired(&entry, &state, now) {
             drop(state);
-            self.invalidate(token, &entry);
+            self.invalidate(token, &entry, false);
             return Err(ApiError::SessionNotFound);
         }
         if state.busy {
@@ -209,7 +239,7 @@ impl Registry {
         let state = entry.state.lock().map_err(|_| ApiError::Internal)?;
         let found = !state.closing && !expired(&entry, &state, self.now());
         drop(state);
-        let removed = self.invalidate(token, &entry);
+        let removed = self.invalidate(token, &entry, false);
         if found && removed {
             Ok(())
         } else {
@@ -219,7 +249,7 @@ impl Registry {
 
     /// Mark closed before removing the map key; lookups that already copied the Arc
     /// observe Closing. No work, authority lock, or destructor runs under map locks.
-    fn invalidate(&self, token: &str, entry: &Arc<Entry>) -> bool {
+    fn invalidate(&self, token: &str, entry: &Arc<Entry>, revoked: bool) -> bool {
         let (session, cancellation) = {
             let mut state = entry.state.lock().unwrap_or_else(|p| p.into_inner());
             state.closing = true;
@@ -232,6 +262,19 @@ impl Registry {
                 .is_some_and(|found| Arc::ptr_eq(found, entry))
             {
                 map.remove(token);
+                if revoked {
+                    let now = self.now();
+                    let mut markers = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
+                    markers.retain(|marker| now < marker.at + IDLE_TIMEOUT);
+                    if markers.len() == self.capacity {
+                        markers.pop_front();
+                    }
+                    markers.push_back(Revoked {
+                        token: token.into(),
+                        owner: entry.owner.clone(),
+                        at: now,
+                    });
+                }
                 true
             } else {
                 false
@@ -253,14 +296,21 @@ impl Registry {
             .map(|(token, entry)| (token.clone(), entry.clone()))
             .collect();
         let now = self.now();
+        {
+            let _map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+            self.revoked
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|marker| now < marker.at + IDLE_TIMEOUT);
+        }
         for (token, entry) in entries {
             let invalid_identity = entry.owner.check(&self.service).is_err();
-            let invalid_state = entry
-                .state
-                .lock()
-                .map_or(true, |state| state.closing || expired(&entry, &state, now));
+            let (invalid_state, expired) = entry.state.lock().map_or((true, false), |state| {
+                let expired = expired(&entry, &state, now);
+                (state.closing || expired, expired)
+            });
             if invalid_identity || invalid_state {
-                self.invalidate(&token, &entry);
+                self.invalidate(&token, &entry, invalid_identity && !expired);
             }
         }
     }
@@ -275,7 +325,7 @@ impl Registry {
             .map(|(token, entry)| (token.clone(), entry.clone()))
             .collect();
         for (token, entry) in entries {
-            self.invalidate(&token, &entry);
+            self.invalidate(&token, &entry, false);
         }
     }
 }
@@ -365,10 +415,114 @@ impl Drop for SessionLease {
         }
         state.closing = true;
         drop(state);
-        registry.invalidate(&self.token, &self.entry);
+        registry.invalidate(&self.token, &self.entry, !identity_valid);
         drop(session);
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod revoked_tests {
+    use super::*;
+    use crate::{Binding, Role, clock::Clock as ServiceClock};
+    use giggles_core::{Admin, Limits};
+
+    struct TestClock(Mutex<Instant>);
+    impl Clock for TestClock {
+        fn now(&self) -> Instant {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn markers_are_owner_scoped_bounded_and_expire_without_holding_slots() {
+        let path = crate::test_support::fixture_root().join(format!(
+            "api-revoked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        admin
+            .sql_session()
+            .execute("CREATE TABLE app (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        let role = Role::Application {
+            domain: admin.authority_metadata().unwrap().0.to_string(),
+            tables: ["app".into()].into_iter().collect(),
+        };
+        let bindings: Vec<_> = ["11", "22"]
+            .into_iter()
+            .map(|hex| Binding {
+                fingerprint: hex.repeat(32),
+                role: role.clone(),
+            })
+            .collect();
+        let service =
+            Service::new(admin, bindings.clone(), ServiceClock::new(0, 3600).unwrap()).unwrap();
+        let owner = ConnectionIdentity::verified(&service, &bindings[0].fingerprint).unwrap();
+        let other = ConnectionIdentity::verified(&service, &bindings[1].fingerprint).unwrap();
+        let clock = Arc::new(TestClock(Mutex::new(Instant::now())));
+        let registry = Registry::with_sources(
+            service.clone(),
+            ApiLimits { sessions: 2 },
+            clock.clone(),
+            Arc::new(RandomTokens),
+        );
+        let survivor = registry.open(&other).unwrap();
+        let first = registry.open(&owner).unwrap();
+        service.reload_bindings(vec![bindings[1].clone()]).unwrap();
+        registry.sweep();
+        assert_eq!(registry.slots.available_permits(), 1);
+        service.reload_bindings(bindings.clone()).unwrap();
+        // A replaced binding has a new epoch and cannot inspect another owner's marker.
+        let replacement = ConnectionIdentity::verified(&service, &bindings[0].fingerprint).unwrap();
+        assert!(matches!(
+            registry.lookup(&first, &replacement),
+            Err(ApiError::SessionNotFound)
+        ));
+        assert!(matches!(
+            registry.lookup(&first, &other),
+            Err(ApiError::SessionNotFound)
+        ));
+        assert!(registry.lookup(&survivor, &other).is_ok());
+
+        // Drive two more genuine binding failures, including one busy lease.
+        let second = registry.open(&replacement).unwrap();
+        let cancellation = Cancellation::default();
+        let lease = registry
+            .lease(&second, &replacement, cancellation.clone())
+            .unwrap();
+        service.reload_bindings(vec![bindings[1].clone()]).unwrap();
+        registry.sweep();
+        assert!(cancellation.check().is_err());
+        assert_eq!(registry.slots.available_permits(), 0);
+        drop(lease);
+        assert_eq!(registry.slots.available_permits(), 1);
+        service.reload_bindings(bindings.clone()).unwrap();
+        let replacement = ConnectionIdentity::verified(&service, &bindings[0].fingerprint).unwrap();
+        let third = registry.open(&replacement).unwrap();
+        service.reload_bindings(vec![bindings[1].clone()]).unwrap();
+        registry.sweep();
+        let markers = registry.revoked.lock().unwrap();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0].token, second);
+        assert_eq!(markers[1].token, third);
+        drop(markers);
+        assert!(registry.lookup(&survivor, &other).is_ok());
+        // Expiry is measured from eviction and queries never refresh it.
+        *clock.0.lock().unwrap() += IDLE_TIMEOUT;
+        registry.sweep();
+        assert!(registry.revoked.lock().unwrap().is_empty());
+        assert_eq!(registry.slots.available_permits(), 2);
+        assert!(matches!(
+            registry.lookup(&third, &other),
+            Err(ApiError::SessionNotFound)
+        ));
+    }
+}

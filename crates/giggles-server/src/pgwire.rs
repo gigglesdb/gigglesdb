@@ -2051,10 +2051,51 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     session.set_extra_float_digits(state.settings.current.extra_float_digits);
     let mut admin_sync = false;
     let mut pending_tag = None;
+    let mut binding_changes = session.service.binding_changes.subscribe();
+    let mut binding_check_pending = true;
     loop {
         // Idle connections hold a bounded admission slot, not an active frame.
         // Once a frame starts, its remaining header and body have a deadline.
-        let tag = match if let Some(tag) = pending_tag.take() { Ok(tag) } else { s.read_u8().await } {
+        let tag = loop {
+            // Mark changes seen before checking, so a concurrent change still
+            // triggers revalidation before waiting for an idle client's byte.
+            if !admin_sync
+                && (binding_check_pending || binding_changes.has_changed().unwrap_or(false))
+            {
+                binding_changes.borrow_and_update();
+                binding_check_pending = false;
+                if session.check_binding().is_err() {
+                    session.abort();
+                    let mut body = Vec::new();
+                    for (field, value) in [
+                        (b'S', "FATAL"),
+                        (b'V', "FATAL"),
+                        (b'C', "57P01"),
+                        (b'M', "terminating connection due to administrator command"),
+                    ] {
+                        body.push(field);
+                        z(value, &mut body);
+                    }
+                    body.push(0);
+                    let mut out = Vec::new();
+                    frame(b'E', &body, &mut out).map_err(io::Error::other)?;
+                    send(s, &out).await?;
+                    return Ok(());
+                }
+            }
+            if let Some(tag) = pending_tag.take() {
+                break Ok(tag);
+            }
+            tokio::select! {
+                biased;
+                _ = binding_changes.changed(), if !admin_sync => {
+                    binding_check_pending = true;
+                    continue;
+                },
+                tag = s.read_u8() => break tag,
+            }
+        };
+        let tag = match tag {
             Ok(tag) => tag,
             Err(_) => return Ok(()),
         };

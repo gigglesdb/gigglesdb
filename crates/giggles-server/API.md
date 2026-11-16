@@ -55,8 +55,11 @@ return Scope (`42501`).
 A certificate-bound Database session checks both its fingerprint binding epoch
 and its SQL role generation on every request. Removing or replacing the binding,
 dropping/recreating the role, or revoking LOGIN invalidates existing sessions
-(`28000`). Unchanged configuration reloads preserve bindings; removing and
-readding one never revives old sessions. Password-only SQL changes use the same
+(`28000`). The server promptly ends invalidated sessions: pgwire receives FATAL
+`57P01` ("terminating connection due to administrator command") and its open
+transaction is rolled back; HTTP/gRPC sessions are aborted and their handles
+answer 401/UNAUTHENTICATED. Unchanged configuration reloads preserve bindings;
+removing and readding one never revives old sessions. Password-only SQL changes use the same
 generation aliases as authenticated PostgreSQL sessions.
 
 ## Persistent sessions
