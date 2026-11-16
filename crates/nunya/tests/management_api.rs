@@ -997,3 +997,198 @@ fn grant_replacement_narrowing_removal_and_canonical_retry() {
     );
     assert_eq!(f.ctx().authority.grants_of(configured).len(), 2);
 }
+
+// Transport tests use the same forbidden-material list as the pure route tests.
+type TransportResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+fn listener_section(tls: bool) -> nunya::config::ManagementSection {
+    nunya::config::ManagementSection {
+        listen: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        tls: tls.then(|| nunya::config::TlsSection {
+            cert_file: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/mgmt/localhost.crt"),
+            key_file: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/mgmt/localhost.key"),
+        }),
+        admins: vec![],
+    }
+}
+fn status_request(auth: Option<&str>) -> String {
+    let auth = auth
+        .map(|a| format!("Authorization: {a}\r\n"))
+        .unwrap_or_default();
+    format!("GET /v1/status HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n")
+}
+async fn wire<I>(io: &mut I, request: &[u8], forbidden: &[String]) -> TransportResult<String>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    io.write_all(request).await?;
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        io.read_to_end(&mut response),
+    )
+    .await??;
+    let response = String::from_utf8(response)?;
+    for secret in forbidden {
+        assert!(
+            !response.contains(secret),
+            "transport response leaked fixture material"
+        );
+    }
+    Ok(response)
+}
+async fn tcp_request(
+    addr: std::net::SocketAddr,
+    request: &[u8],
+    forbidden: &[String],
+) -> TransportResult<String> {
+    let mut io = tokio::net::TcpStream::connect(addr).await?;
+    wire(&mut io, request, forbidden).await
+}
+async fn finish_server(
+    tx: tokio::sync::watch::Sender<bool>,
+    server: nunya::mgmt::server::ServerHandle,
+) -> TransportResult {
+    let addr = server.tcp_addr;
+    tx.send(true)?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), server.wait()).await?;
+    assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    Ok(())
+}
+#[tokio::test]
+async fn listener_loopback_auth_limits_and_shutdown() -> TransportResult {
+    use nunya::mgmt::server::spawn;
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
+    #[cfg(windows)]
+    assert!(server.socket_path.is_none());
+    let addr = server.tcp_addr;
+    let ok = tcp_request(addr, status_request(Some(ADMIN)).as_bytes(), &f.forbidden).await?;
+    assert!(ok.starts_with("HTTP/1.1 200 "));
+    let denied = tcp_request(addr, status_request(None).as_bytes(), &f.forbidden).await?;
+    assert!(denied.starts_with("HTTP/1.1 401 "));
+    assert!(
+        denied
+            .to_ascii_lowercase()
+            .contains("www-authenticate: bearer\r\n")
+    );
+    assert!(denied.ends_with("{\"error\":\"unauthorized\"}"));
+    let large_header =
+        b"POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000000\r\n\r\n";
+    let large = tcp_request(addr, large_header, &f.forbidden).await?;
+    assert!(large.starts_with("HTTP/1.1 413 "));
+    assert!(large.ends_with("{\"error\":\"payload_too_large\"}"));
+    let mut chunked = b"POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n10001\r\n".to_vec();
+    chunked.extend(std::iter::repeat_n(b'x', 64 * 1024 + 1));
+    chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+    let large = tcp_request(addr, &chunked, &f.forbidden).await?;
+    assert!(large.starts_with("HTTP/1.1 413 "));
+    assert!(large.ends_with("{\"error\":\"payload_too_large\"}"));
+    // Idle keep-alive connections must not hold shutdown open indefinitely.
+    let _idle = tokio::net::TcpStream::connect(addr).await?;
+    finish_server(tx, server).await
+}
+#[tokio::test]
+async fn listener_tls_and_plaintext_refusal() -> TransportResult {
+    use nunya::mgmt::server::spawn;
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let server = spawn(ctx, &listener_section(true), &f.dir, rx).await?;
+    let mut roots = rustls::RootCertStore::empty();
+    let cert = rustls_pemfile::certs(&mut &include_bytes!("fixtures/mgmt/localhost.crt")[..])
+        .next()
+        .ok_or("missing fixture cert")??;
+    roots.add(cert)?;
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let io = tokio::net::TcpStream::connect(server.tcp_addr).await?;
+    let mut io = connector
+        .connect(rustls::pki_types::ServerName::try_from("localhost")?, io)
+        .await?;
+    let ok = wire(
+        &mut io,
+        status_request(Some(ADMIN)).as_bytes(),
+        &f.forbidden,
+    )
+    .await?;
+    assert!(ok.starts_with("HTTP/1.1 200 "));
+    // A TLS alert or a closed connection is acceptable; plaintext HTTP success is not.
+    let mut plain = tokio::net::TcpStream::connect(server.tcp_addr).await?;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    plain
+        .write_all(status_request(Some(ADMIN)).as_bytes())
+        .await?;
+    let mut bytes = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        plain.read_to_end(&mut bytes),
+    )
+    .await?;
+    let response = String::from_utf8_lossy(&bytes);
+    for secret in &f.forbidden {
+        assert!(
+            !response.contains(secret),
+            "TLS refusal leaked fixture material"
+        );
+    }
+    assert!(!response.starts_with("HTTP/1.1 200 "));
+    finish_server(tx, server).await
+}
+#[tokio::test]
+async fn listener_non_loopback_requires_tls_and_sender_drop_stops() -> TransportResult {
+    use nunya::mgmt::server::{SpawnError, spawn};
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let mut section = listener_section(false);
+    section.listen = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+    assert!(matches!(
+        spawn(ctx.clone(), &section, &f.dir, rx.clone()).await,
+        Err(SpawnError::TlsRequired)
+    ));
+    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
+    let addr = server.tcp_addr;
+    drop(tx);
+    tokio::time::timeout(std::time::Duration::from_secs(10), server.wait()).await?;
+    assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    Ok(())
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn listener_unix_socket_permissions_auth_cleanup_and_file_refusal() -> TransportResult {
+    use nunya::mgmt::server::{SpawnError, spawn};
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let path = f.dir.join("nunya.sock");
+    std::fs::write(&path, b"preserve")?;
+    assert!(matches!(
+        spawn(ctx.clone(), &listener_section(false), &f.dir, rx.clone()).await,
+        Err(SpawnError::Socket)
+    ));
+    assert_eq!(std::fs::read(&path)?, b"preserve");
+    std::fs::remove_file(&path)?;
+    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
+    assert_eq!(server.socket_path.as_ref(), Some(&path));
+    assert_eq!(
+        std::fs::metadata(&path)?.permissions().mode() & 0o777,
+        0o600
+    );
+    let mut io = tokio::net::UnixStream::connect(&path).await?;
+    let ok = wire(&mut io, status_request(None).as_bytes(), &f.forbidden).await?;
+    assert!(ok.starts_with("HTTP/1.1 200 "));
+    finish_server(tx, server).await?;
+    assert!(!path.exists());
+    Ok(())
+}
