@@ -394,7 +394,8 @@ impl Visitor for Scan {
             let introspection = function(&f.name).is_ok_and(|n| matches!(n.as_str(),
                 "pg_get_indexdef" | "pg_get_constraintdef" | "pg_get_expr"
                 | "pg_get_userbyid" | "format_type" | "obj_description"
-                | "col_description" | "shobj_description" | "pg_get_viewdef"));
+                | "col_description" | "shobj_description" | "pg_get_viewdef"
+                | "has_table_privilege" | "has_column_privilege"));
             self.introspection |= introspection;
             self.introspection_only &= introspection;
         }
@@ -3218,8 +3219,17 @@ fn check_expr(e: &mut E) -> R<()> {
             "pg_get_userbyid" | "pg_table_is_visible" | "pg_type_is_visible" => {
                 expect(&mut args[0], PgType::Oid)?
             }
-            "has_table_privilege"
-            | "has_type_privilege"
+            "has_table_privilege" | "has_column_privilege" => {
+                let last = args.len() - 1;
+                expect(&mut args[last], PgType::Text)?;
+                for arg in &mut args[..last] {
+                    if unknown(arg) || textual(arg.ty) { expect(arg, PgType::Text)?; }
+                    else if !matches!(arg.ty, PgType::Oid | PgType::Int2 | PgType::Int4 | PgType::Int8) {
+                        return Err(Error::Type);
+                    }
+                }
+            }
+            "has_type_privilege"
             | "has_schema_privilege"
             | "has_database_privilege" => expect(&mut args[1], PgType::Text)?,
             "nullif" => {
@@ -3289,9 +3299,9 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         }
         ("nullif", 2) => a[0].ty,
         ("coalesce", n) if n > 0 => a[0].ty,
+        ("has_table_privilege", 2 | 3) | ("has_column_privilege", 3 | 4) => PgType::Bool,
         (
-            "has_table_privilege"
-            | "has_schema_privilege"
+            "has_schema_privilege"
             | "has_type_privilege"
             | "has_database_privilege",
             2,
@@ -4409,6 +4419,155 @@ impl Runtime<'_> {
         }
         Ok(value)
     }
+    fn acl_allows(&mut self, acl: Value, role: i64, requested: &[(String, bool)]) -> R<bool> {
+        let Value::Array(entries) = self.call("_aclexplode", vec![acl], None)? else {
+            return Err(Error::Type);
+        };
+        self.charge(entries.len().saturating_mul(requested.len()))?;
+        Ok(entries.iter().any(|entry| match entry {
+            Value::Record(row) => {
+                (row[1] == Value::Int(role) || row[1] == Value::Int(0))
+                    && requested.iter().any(|(name, grant)| {
+                        row[2] == Value::Text(name.clone())
+                            && (!grant || row[3] == Value::Bool(true))
+                    })
+            }
+            _ => false,
+        }))
+    }
+    fn privilege_function(&mut self, name: &str, values: &[Value]) -> R<Value> {
+        use Value::{Bool as B, Int as I, Null as N, Text as S};
+        let column = name == "has_column_privilege";
+        let explicit_role = values.len() == if column { 4 } else { 3 };
+        let table_at = usize::from(explicit_role);
+        let privilege_list = text(values.last().unwrap().clone())?;
+        let mut requested = vec![];
+        for privilege in privilege_list.split(',') {
+            let normalized = privilege.trim().to_ascii_uppercase();
+            let (name, grant) = normalized
+                .strip_suffix(" WITH GRANT OPTION")
+                .map_or((normalized.as_str(), false), |n| (n.trim_end(), true));
+            let valid = if column {
+                matches!(name, "SELECT" | "INSERT" | "UPDATE" | "REFERENCES")
+            } else {
+                matches!(
+                    name,
+                    "SELECT"
+                        | "INSERT"
+                        | "UPDATE"
+                        | "DELETE"
+                        | "TRUNCATE"
+                        | "REFERENCES"
+                        | "TRIGGER"
+                        | "MAINTAIN"
+                )
+            };
+            if !valid {
+                return Err(Error::InvalidPrivilege(format!(
+                    "unrecognized privilege type: \"{}\"",
+                    privilege.trim()
+                )));
+            }
+            requested.push((name.to_owned(), grant));
+        }
+        let role_value = if explicit_role {
+            values[0].clone()
+        } else {
+            S(self.snapshot.user.clone())
+        };
+        self.charge(self.snapshot.roles.len())?;
+        let role = match &role_value {
+            S(name) if name == "public" => 0,
+            S(name) => self
+                .snapshot
+                .roles
+                .iter()
+                .find(|r| r.name == *name)
+                .map(|r| i64::from(r.oid))
+                .ok_or(Error::Unsupported)?,
+            I(oid) => *oid,
+            _ => return Err(Error::Type),
+        };
+        let table_value = &values[table_at];
+        let oid = match table_value {
+            S(name) => match regclass_oid(name, self.snapshot) {
+                Ok(oid) => i64::from(oid),
+                Err(Error::Unsupported) => return Ok(B(false)),
+                Err(e) => return Err(e),
+            },
+            I(oid) => *oid,
+            _ => return Err(Error::Type),
+        };
+        let relations = &self.catalogs["pg_class"];
+        self.charge(relations.rows.len())?;
+        let Some(relation) = relations.rows.iter().find(|r| r[0] == I(oid)).cloned() else {
+            return Ok(if matches!(table_value, S(_)) {
+                B(false)
+            } else {
+                N
+            });
+        };
+        let owner_index = relations
+            .fields
+            .iter()
+            .position(|f| f.name == "relowner")
+            .unwrap();
+        let acl_index = relations
+            .fields
+            .iter()
+            .position(|f| f.name == "relacl")
+            .unwrap();
+        let owner = relation[owner_index].clone();
+        let mut column_acl = N;
+        if column {
+            let attributes = &self.catalogs["pg_attribute"];
+            let at = |name: &str| {
+                attributes
+                    .fields
+                    .iter()
+                    .position(|f| f.name == name)
+                    .unwrap()
+            };
+            let num = at("attnum");
+            let dropped = at("attisdropped");
+            let column_value = &values[table_at + 1];
+            self.charge(attributes.rows.len())?;
+            let attribute = attributes.rows.iter().find(|r| {
+                r[0] == I(oid)
+                    && r[dropped] == B(false)
+                    && match column_value {
+                        S(name) => r[1] == S(name.clone()),
+                        I(n) => r[num] == I(*n),
+                        _ => false,
+                    }
+            });
+            let Some(attribute) = attribute else {
+                return if matches!(column_value, S(_)) {
+                    Err(Error::UnknownColumn)
+                } else {
+                    Ok(N)
+                };
+            };
+            column_acl = attribute[at("attacl")].clone();
+        }
+        if owner == I(role)
+            || self
+                .snapshot
+                .roles
+                .iter()
+                .any(|r| i64::from(r.oid) == role && r.superuser)
+        {
+            return Ok(B(true));
+        }
+        let acl = if relation[acl_index] == N {
+            self.call("acldefault", vec![S("r".into()), owner], None)?
+        } else {
+            relation[acl_index].clone()
+        };
+        Ok(B(self.acl_allows(acl, role, &requested)?
+            || (column
+                && self.acl_allows(column_acl, role, &requested)?)))
+    }
     fn call(&mut self, n: &str, v: Vec<Value>, remaining: Option<usize>) -> R<Value> {
         use Value::{Bool as B, Int as I, Null as N, Text as S};
         self.charge(v.iter().map(Value::bytes).sum::<usize>() / 64 + 1)?;
@@ -4620,7 +4779,7 @@ impl Runtime<'_> {
             }
             "acldefault" => {
                 // Defaults describe the object owner's initial rights, independently
-                // of actual catalog ACLs (which this snapshot does not model).
+                // of the object's explicit ACL, if supplied in the snapshot.
                 let privileges = match text(v[0].clone())?.as_str() {
                     "n" => "UC",
                     "r" => "arwdDxtm",
@@ -5109,40 +5268,22 @@ impl Runtime<'_> {
                         })),
                 }
             }
-            "has_table_privilege" | "has_schema_privilege" | "has_type_privilege" => {
+            "has_table_privilege" | "has_column_privilege" => self.privilege_function(n, &v)?,
+            "has_schema_privilege" | "has_type_privilege" => {
                 let requested = text(v[1].clone())?;
-                let allowed = if n == "has_table_privilege" {
-                    "SELECT"
-                } else {
-                    "USAGE"
-                };
+                let allowed = "USAGE";
                 let privileges = requested
                     .split(',')
                     .map(str::trim)
                     .map(str::to_ascii_uppercase)
                     .collect::<Vec<_>>();
-                let known = if n == "has_table_privilege" {
-                    &[
-                        "SELECT",
-                        "INSERT",
-                        "UPDATE",
-                        "DELETE",
-                        "TRUNCATE",
-                        "REFERENCES",
-                        "TRIGGER",
-                        "RULE",
-                    ][..]
-                } else if n == "has_schema_privilege" {
+                let known = if n == "has_schema_privilege" {
                     &["USAGE", "CREATE"][..]
-                } else {
-                    &["USAGE"][..]
-                };
+                } else { &["USAGE"][..] };
                 if privileges.iter().any(|p| !known.contains(&p.as_str())) {
                     return Err(Error::Unsupported);
                 }
-                let relation = if n == "has_table_privilege" {
-                    "pg_class"
-                } else if n == "has_schema_privilege" {
+                let relation = if n == "has_schema_privilege" {
                     "pg_namespace"
                 } else {
                     "pg_type"

@@ -488,7 +488,8 @@ fn types_rejected_before_empty_execution() {
 }
 #[test]
 fn privileges_are_read_only_and_visibility_bounded() {
-    assert_eq!(run("SELECT has_table_privilege('inventory','SELECT'), has_table_privilege('inventory','UPDATE'), has_table_privilege('hidden','SELECT'), has_schema_privilege('public','USAGE'), has_schema_privilege('public','CREATE') FROM pg_database").rows,vec![vec![Value::Bool(true),Value::Bool(false),Value::Bool(false),Value::Bool(true),Value::Bool(false)]]);
+    // PG18: owners and superusers hold every table privilege (GD-0077 E2e).
+    assert_eq!(run("SELECT has_table_privilege('inventory','SELECT'), has_table_privilege('inventory','UPDATE'), has_table_privilege('hidden','SELECT'), has_schema_privilege('public','USAGE'), has_schema_privilege('public','CREATE') FROM pg_database").rows,vec![vec![Value::Bool(true),Value::Bool(true),Value::Bool(false),Value::Bool(true),Value::Bool(false)]]);
 }
 #[test]
 fn bounds_parameter_nesting_and_intermediate_arrays() {

@@ -52,6 +52,39 @@ pub(crate) fn role_name(snapshot: &CatalogSnapshot, oid: i64) -> Option<&str> {
                 .map(|(_, name)| *name)
         })
 }
+pub(crate) fn acl_role_name(name: &str) -> String {
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        name.to_owned()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+fn acl_value(snapshot: &CatalogSnapshot, entries: Option<&Vec<AclEntry>>) -> Value {
+    entries.map_or(N, |entries| {
+        Value::Array(
+            entries
+                .iter()
+                .map(|entry| {
+                    let grantee = if entry.grantee == 0 {
+                        String::new()
+                    } else {
+                        acl_role_name(role_name(snapshot, i64::from(entry.grantee)).unwrap())
+                    };
+                    let grantor =
+                        acl_role_name(role_name(snapshot, i64::from(entry.grantor)).unwrap());
+                    let mut privileges = String::new();
+                    for privilege in &entry.privileges {
+                        privileges.push(privilege.code());
+                        if entry.grant_option {
+                            privileges.push('*');
+                        }
+                    }
+                    s(&format!("{grantee}={privileges}/{grantor}"))
+                })
+                .collect(),
+        )
+    })
+}
 /// Injective OIDs in disjoint slots; oversized IDs fail instead of hashing/colliding.
 pub fn table_oid(id: u64) -> R<u32> {
     u32::try_from(
@@ -1239,6 +1272,57 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     {
         return Err(Error::InvalidSnapshot);
     }
+    let mut acl_size = 0usize;
+    let mut acl_bytes = 0usize;
+    for (table, column, entries) in snapshot
+        .table_acls
+        .iter()
+        .map(|(t, a)| (*t, None, a))
+        .chain(
+            snapshot
+                .column_acls
+                .iter()
+                .map(|((t, c), a)| (*t, Some(*c), a)),
+        )
+    {
+        let Some(t) = snapshot.tables.iter().find(|t| t.id == table) else {
+            return Err(Error::InvalidSnapshot);
+        };
+        if column.is_some_and(|id| !t.columns.iter().any(|c| c.id == id)) {
+            return Err(Error::InvalidSnapshot);
+        }
+        for entry in entries {
+            acl_size = acl_size.saturating_add(1 + entry.privileges.len());
+            if acl_size > MAX_ROWS {
+                return Err(Error::Limit);
+            }
+            if (entry.grantee != 0 && role_name(snapshot, i64::from(entry.grantee)).is_none())
+                || role_name(snapshot, i64::from(entry.grantor)).is_none()
+                || entry.privileges.iter().collect::<BTreeSet<_>>().len() != entry.privileges.len()
+                || (column.is_some()
+                    && entry.privileges.iter().any(|p| {
+                        !matches!(
+                            p,
+                            AclPrivilege::Select
+                                | AclPrivilege::Insert
+                                | AclPrivilege::Update
+                                | AclPrivilege::References
+                        )
+                    }))
+            {
+                return Err(Error::InvalidSnapshot);
+            }
+            // Bound encoded ACL allocation before constructing the catalog rows;
+            // repeated long role names must not multiply the input-name budget.
+            let grantee = role_name(snapshot, i64::from(entry.grantee)).map_or(0, str::len);
+            let grantor = role_name(snapshot, i64::from(entry.grantor)).unwrap().len();
+            acl_bytes =
+                acl_bytes.saturating_add(2 * (grantee + grantor) + 2 * entry.privileges.len() + 64);
+            if acl_bytes > MAX_BYTES {
+                return Err(Error::Limit);
+            }
+        }
+    }
     let mut occupied = snapshot
         .tables
         .iter()
@@ -1668,7 +1752,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 I(if view.is_some() { 0 } else { 2 }),
                 I(0),
                 N,
-                N,
+                acl_value(snapshot, snapshot.table_acls.get(&t.id)),
                 N,
                 N,
             ],
@@ -2051,7 +2135,11 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         };
         let (storage, align) = type_layout(oid);
         // Builders above supply the structural fields in their original order.
-        // Project once into PG18's physical order, including NULL column ACLs.
+        // Project once into PG18's physical order, including supplied column ACLs.
+        let column_acl = snapshot.tables.iter().find(|t| table_oid(t.id).ok().map(|oid| I(i64::from(oid))) == Some(row[0].clone()))
+            .and_then(|t| match row[3] { I(n) if n > 0 => t.columns.get((n - 1) as usize).map(|c| (t.id, c.id)), _ => None })
+            .and_then(|key| snapshot.column_acls.get(&key));
+        let column_acl = acl_value(snapshot, column_acl);
         let old = std::mem::take(row);
         *row = vec![
             old[0].clone(),
@@ -2092,7 +2180,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             I(0),
             old[11].clone(),
             N,
-            N,
+            column_acl,
             N,
             old[15].clone(),
             N,

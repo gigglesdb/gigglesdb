@@ -102,7 +102,7 @@ pub struct ConstraintDef {
     pub update: char, pub delete: char, pub deferrable: bool, pub deferred: bool,
     pub validated: bool, pub expression: Option<String>, pub index: u64,
 }
-/// Presentation metadata only; these flags do not implement role privileges or policies.
+/// Role metadata used for catalog presentation and privilege inquiry functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleDef {
     pub oid: u32,
@@ -115,6 +115,40 @@ pub struct RoleDef {
     pub replication: bool,
     pub bypassrls: bool,
     pub connlimit: i32,
+}
+/// Privileges representable in a PostgreSQL table or column ACL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AclPrivilege {
+    Insert,
+    Select,
+    Update,
+    Delete,
+    Truncate,
+    References,
+    Trigger,
+    Maintain,
+}
+impl AclPrivilege {
+    pub(crate) fn code(self) -> char {
+        match self {
+            Self::Insert => 'a',
+            Self::Select => 'r',
+            Self::Update => 'w',
+            Self::Delete => 'd',
+            Self::Truncate => 'D',
+            Self::References => 'x',
+            Self::Trigger => 't',
+            Self::Maintain => 'm',
+        }
+    }
+}
+/// A grant from one role to another (grantee 0 means PUBLIC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclEntry {
+    pub grantee: u32,
+    pub grantor: u32,
+    pub privileges: Vec<AclPrivilege>,
+    pub grant_option: bool,
 }
 /// Presentation of a user-defined type; enum labels are in declaration order.
 #[derive(Debug, Clone)]
@@ -132,7 +166,7 @@ pub struct UserType {
 /// Roles include exactly one bootstrap role (OID 10); predefined PostgreSQL roles
 /// are supplied by the catalog. Ownership references snapshot roles, with omitted
 /// table owners defaulting to OID 10. `user` independently controls current_user;
-/// none of this metadata establishes authentication, membership, or privileges.
+/// the host remains responsible for authentication, membership, and authorization.
 #[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
     /// Catalog xid: legacy publication counter or V2 physical HLC seconds.
@@ -167,6 +201,11 @@ pub struct CatalogSnapshot {
     pub roles: Vec<RoleDef>,
     /// Table ID to snapshot role OID; missing entries use OID 10. Empty by default.
     pub table_owners: std::collections::BTreeMap<u64, u32>,
+    /// Explicit table ACLs keyed by stable table ID. Absent means NULL/default;
+    /// a present empty vector means an explicitly empty ACL.
+    pub table_acls: std::collections::BTreeMap<u64, Vec<AclEntry>>,
+    /// Explicit column ACLs keyed by (stable table ID, stable column ID).
+    pub column_acls: std::collections::BTreeMap<(u64, u64), Vec<AclEntry>>,
     /// Owner of the current pg_database row (`datdba`); defaults to OID 10.
     pub database_owner: u32,
     /// Stable column ID to PostgreSQL typmod; omitted entries mean -1.
@@ -213,6 +252,8 @@ impl Default for CatalogSnapshot {
                 connlimit: -1,
             }],
             table_owners: std::collections::BTreeMap::new(),
+            table_acls: Default::default(),
+            column_acls: Default::default(),
             database_owner: 10,
             column_typmods: std::collections::BTreeMap::new(),
         }
@@ -376,10 +417,14 @@ pub enum Error {
     Type,
     Parameters,
     InvalidSnapshot,
+    InvalidPrivilege(String),
     Limit,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::InvalidPrivilege(message) = self {
+            return f.write_str(message);
+        }
         write!(f, "catalog {self:?}")
     }
 }

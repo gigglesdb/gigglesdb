@@ -36,6 +36,7 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
         E::Parameters => "08P01",
         E::Limit => "54000",
         E::InvalidSnapshot => "55000",
+        E::InvalidPrivilege(_) => "22023",
         E::Unsupported => "0A000",
     }
 }
@@ -74,6 +75,68 @@ pub(crate) fn snapshot(
     column_typmods.retain(|id, _| columns.contains(id));
     let visible: std::collections::BTreeSet<_> = tables.iter().map(|table| table.id).collect();
     let (roles, table_owners) = catalog_roles(session, &tables);
+    let mut table_acls = std::collections::BTreeMap::new();
+    let schemas_for_acl = session.sql.schema_metadata().map_err(|_| "XX000")?;
+    for table in &tables {
+        use giggles_core::roles::TablePrivilege as C;
+        use giggles_pg_catalog::{AclEntry, AclPrivilege as P};
+        let key = giggles_core::relational::relation_key(
+            schemas_for_acl
+                .tables
+                .get(&table.id)
+                .map_or("public", String::as_str),
+            &table.name,
+        );
+        let owner = *table_owners.get(&table.id).unwrap_or(&10);
+        let mut grants = vec![];
+        for role in &roles {
+            let privileges = session
+                .sql
+                .table_privileges(&key, &role.name)
+                .map_err(|_| "XX000")?;
+            if !privileges.is_empty() {
+                let mut acl = vec![];
+                for privilege in privileges {
+                    match privilege {
+                        C::Select => acl.push(P::Select),
+                        C::Insert => acl.push(P::Insert),
+                        C::Update => acl.push(P::Update),
+                        // The authorization store intentionally shares DELETE/TRUNCATE.
+                        C::Delete => acl.extend([P::Delete, P::Truncate]),
+                    }
+                }
+                // SQL grants have no grant option; the store models the owner as
+                // the granting authority, not the identity of a superuser actor.
+                grants.push(AclEntry {
+                    grantee: role.oid,
+                    grantor: owner,
+                    privileges: acl,
+                    grant_option: false,
+                });
+            }
+        }
+        if !grants.is_empty() {
+            grants.insert(
+                0,
+                AclEntry {
+                    grantee: owner,
+                    grantor: owner,
+                    privileges: vec![
+                        P::Insert,
+                        P::Select,
+                        P::Update,
+                        P::Delete,
+                        P::Truncate,
+                        P::References,
+                        P::Trigger,
+                        P::Maintain,
+                    ],
+                    grant_option: false,
+                },
+            );
+            table_acls.insert(table.id, grants);
+        }
+    }
     let user_types = types
         .types
         .iter()
@@ -179,6 +242,7 @@ pub(crate) fn snapshot(
         column_type_oids,
         roles,
         table_owners,
+        table_acls,
         user: match &session.role {
             crate::Role::Database { name } => name.clone(),
             _ => "giggles".into(),

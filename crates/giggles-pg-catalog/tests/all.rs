@@ -125,3 +125,5 @@ mod rails_indexes;
 mod union_type_resolution;
 
 #[path = "fk_conindid.rs"] mod fk_conindid;
+#[path = "privilege_functions.rs"]
+mod privilege_functions;
