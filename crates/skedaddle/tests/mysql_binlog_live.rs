@@ -77,6 +77,7 @@ async fn idle(stream: &mut MysqlBinlogStream) {
             .expect("heartbeat within four periods")
             .expect("live stream")
             .expect("decode")
+            .event
         {
             MysqlEvent::Heartbeat => break,
             MysqlEvent::Rotate { .. }
@@ -97,6 +98,8 @@ async fn transaction(stream: &mut MysqlBinlogStream, gtid: bool, id: i64, execut
             .expect("transaction timeout")
             .expect("live stream")
             .expect("decode");
+        assert!(!event.file.is_empty());
+        let event = event.event;
         match event {
             MysqlEvent::Gtid { sid, sequence, tag } => {
                 assert!(gtid);
@@ -334,6 +337,7 @@ async fn live_binlog_tls_status_rows_heartbeat_rotate() -> Result<(), Box<dyn st
         match timeout_at(deadline, limited.next())
             .await?
             .expect("limit stream")
+            .map(|positioned| positioned.event)
         {
             Err(MysqlError::PayloadTooLarge { limit: 1 }) => break,
             Ok(
@@ -355,7 +359,8 @@ async fn live_binlog_tls_status_rows_heartbeat_rotate() -> Result<(), Box<dyn st
             .expect("rotate timeout")
             .unwrap()
             .unwrap();
-        match event {
+        assert_eq!(event.file, rotated.file);
+        match event.event {
             MysqlEvent::Rotate { file, offset } => {
                 assert_eq!(file, rotated.file.as_bytes());
                 assert_eq!(offset, 4);

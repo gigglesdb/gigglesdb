@@ -8,9 +8,48 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 
 ROOT = pathlib.Path(__file__).resolve().parent
+
+
+def run_cargo(args, env, task, *, total_timeout=5400, output_timeout=1800):
+    # buildslot2 is silent while queued. Allow 90 minutes overall, but only
+    # 30 minutes after cargo's first output (stdout OR stderr). File-backed
+    # capture works on Windows, where communicate timeouts omit partial output.
+    stdout_path, stderr_path = task / "cargo-stdout.log", task / "cargo-stderr.log"
+    timed_out = False
+    with stdout_path.open("w", encoding="utf8") as stdout_file, \
+            stderr_path.open("w", encoding="utf8") as stderr_file:
+        process = subprocess.Popen(args, env=env, cwd=ROOT.parent,
+                                   stdout=stdout_file, stderr=stderr_file)
+        deadline = time.monotonic() + total_timeout
+        output_started = False
+        while True:
+            try:
+                process.wait(timeout=max(0, min(1, deadline - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                if now >= deadline:
+                    # Killing only bash would leave cargo/test children using the lane.
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                                   env=env, capture_output=True, check=False)
+                    process.wait()
+                    timed_out = True
+                    break
+                if not output_started and (stdout_path.stat().st_size or stderr_path.stat().st_size):
+                    output_started = True
+                    deadline = min(deadline, now + output_timeout)
+    stdout = stdout_path.read_text(encoding="utf8", errors="replace")
+    stderr = stderr_path.read_text(encoding="utf8", errors="replace")
+    (task / "cargo-test.log").write_text(stdout + stderr, encoding="utf8", newline="\n")
+    if timed_out:
+        raise RuntimeError(
+            f"MySQL cargo lane exceeded {total_timeout}s overall or {output_timeout}s "
+            "after first cargo output; killed process tree; see cargo-test.log")
+    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
 def main():
@@ -101,7 +140,7 @@ def main():
         save("setup-probe.txt", probe.stdout)
         if cargo_test:
             # The fixed lane must never overlap another build in this coordinator.
-            lane_lock = pathlib.Path("J:/gigglesdb-work/lead-a/build.lock")
+            lane_lock = pathlib.Path(os.environ.get("SKEDADDLE_LANE_LOCK", "J:/gigglesdb-work/lead-a/build.lock"))
             with lane_lock.open("x", encoding="utf8") as owner:
                 try:
                     owner.write(str(os.getpid()))
@@ -109,18 +148,7 @@ def main():
                     args = ["C:/Program Files/Git/bin/bash.exe",
                             "J:/gigglesdb-work/r2/buildslot2.sh", "cargo", "test", "-p", "skedaddle",
                             *shlex.split(cargo_test)]
-                    process = subprocess.Popen(args, env=env, cwd=ROOT.parent, stdout=subprocess.PIPE,
-                                               stderr=subprocess.PIPE, encoding="utf8", errors="replace")
-                    try:
-                        stdout, stderr = process.communicate(timeout=1800)
-                    except subprocess.TimeoutExpired:
-                        # Killing only bash would leave cargo/test children using the lane.
-                        subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
-                                       env=env, capture_output=True, check=False)
-                        process.communicate()
-                        raise RuntimeError("MySQL cargo lane exceeded 30 minutes; killed process tree")
-                    result = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
-                    save("cargo-test.log", result.stdout + result.stderr)
+                    result = run_cargo(args, env, task)
                     print(result.stdout, end="", flush=True)
                     print(result.stderr, file=sys.stderr, end="", flush=True)
                     return result.returncode

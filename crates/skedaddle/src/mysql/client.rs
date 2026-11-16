@@ -1,7 +1,7 @@
 //! CA- and hostname-verified MySQL connections and versioned replication requests.
 use super::{
     GtidSet, MysqlPosition,
-    binlog::{BinlogDecoder, MysqlEvent},
+    binlog::{BinlogDecoder, MysqlEvent, PositionedEvent},
 };
 use futures::Stream;
 use mysql_async::{
@@ -24,6 +24,11 @@ pub enum MysqlError {
     Invalid(&'static str),
     UnsupportedEvent(u8),
     PayloadTooLarge { limit: usize },
+    MissingPrimaryKey { schema: String, table: String },
+    Value(&'static str),
+    Assembly(&'static str),
+    TransactionTooLarge { limit: usize },
+    Event(crate::event::EventError),
 }
 impl std::fmt::Display for MysqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -39,6 +44,11 @@ impl From<std::io::Error> for MysqlError {
 impl From<mysql_async::Error> for MysqlError {
     fn from(e: mysql_async::Error) -> Self {
         Self::Driver(e)
+    }
+}
+impl From<crate::event::EventError> for MysqlError {
+    fn from(e: crate::event::EventError) -> Self {
+        Self::Event(e)
     }
 }
 pub type Result<T> = std::result::Result<T, MysqlError>;
@@ -134,6 +144,8 @@ pub struct MysqlBinlogStream {
     transport: BinlogStream,
     decoder: BinlogDecoder,
     ended: bool,
+    file: String,
+    payload_end: Option<u64>,
 }
 impl MysqlBinlogStream {
     pub async fn close(self) -> Result<()> {
@@ -142,7 +154,7 @@ impl MysqlBinlogStream {
     }
 }
 impl Stream for MysqlBinlogStream {
-    type Item = Result<MysqlEvent>;
+    type Item = Result<PositionedEvent>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         while !this.ended {
@@ -157,9 +169,41 @@ impl Stream for MysqlBinlogStream {
                     break;
                 }
             };
+            let end = u64::from(event.header().log_pos());
             match this.decoder.decode_stream_event(&event) {
-                Ok(Some(decoded)) => return Poll::Ready(Some(Ok(decoded))),
-                Ok(None) => continue,
+                Ok(Some(decoded)) => {
+                    if let MysqlEvent::Rotate { file, .. } = &decoded {
+                        this.file = match String::from_utf8(file.clone()) {
+                            Ok(file) => file,
+                            Err(_) => {
+                                this.ended = true;
+                                return Poll::Ready(Some(Err(MysqlError::Invalid(
+                                    "binlog filename",
+                                ))));
+                            }
+                        };
+                    }
+                    let log_pos = this.payload_end.unwrap_or(end);
+                    if matches!(
+                        decoded,
+                        MysqlEvent::Xid(_)
+                            | MysqlEvent::Query {
+                                kind: super::binlog::QueryKind::Commit,
+                                ..
+                            }
+                    ) {
+                        this.payload_end = None;
+                    }
+                    return Poll::Ready(Some(Ok(PositionedEvent {
+                        event: decoded,
+                        file: this.file.clone(),
+                        log_pos,
+                    })));
+                }
+                Ok(None) => {
+                    this.payload_end = Some(end);
+                    continue;
+                }
                 Err(error) => {
                     this.ended = true;
                     return Poll::Ready(Some(Err(error)));
@@ -200,6 +244,9 @@ impl MysqlClient {
             transport: self.conn.get_binlog_stream(request.request()).await?,
             decoder: BinlogDecoder::new(self.limit),
             ended: false,
+            file: String::from_utf8(request.file.clone())
+                .map_err(|_| MysqlError::Invalid("binlog filename"))?,
+            payload_end: None,
         })
     }
     pub async fn status(&mut self) -> Result<MysqlStatus> {

@@ -37,8 +37,8 @@ def resources(run=None):
     filt='label=skedaddle.test'+('='+run if run else '')
     return {kind:docker(*args,'--filter',filt).stdout.split() for kind,args in [('container',['ps','-aq']),('volume',['volume','ls','-q']),('network',['network','ls','-q'])]}
 
-def check():
-    found=resources()
+def check(run=None):
+    found=resources(run)
     print('no_leftover_test_resources',json.dumps(found),flush=True)
     if any(found.values()): raise RuntimeError('labeled test resources remain; other runs are preserved')
 
@@ -273,6 +273,22 @@ PG_MATRIX_TESTS=('pg_replication','pg_source','pg_apply','pg_preflight','pg_chun
                  'runner','runner_verify','engine','source_ack')
 
 
+def pg_test_selections():
+    raw=ENV.get('SKEDADDLE_PG_TEST_SELECTION')
+    if raw is None: return [(binary,None) for binary in PG_MATRIX_TESTS]
+    requested=json.loads(raw)
+    if not isinstance(requested,list) or not requested:
+        raise ValueError('PG test selection must be a nonempty list')
+    selected=[]
+    for item in requested:
+        if not isinstance(item,str): raise ValueError('PG test selection must be text')
+        binary,separator,selection=item.partition('::')
+        if binary not in PG_MATRIX_TESTS or (separator and not selection):
+            raise ValueError('invalid PG binary or test filter: '+item)
+        selected.append((binary,selection if separator else None))
+    return selected
+
+
 def pg_matrix_config(ports, ca_paths):
     """One config contract, with env-only legacy gates also recorded in JSON.
 
@@ -366,6 +382,7 @@ def pg_client_precheck():
 
 def pg_matrix():
     """Future Docker lane only. Static acceptance never invokes this function."""
+    selections=pg_test_selections()  # Reject bad selections before fixture startup.
     pg_client_precheck()  # Read-only, before any database mutation or fixture startup.
     guard()  # Includes C:/J:/Docker-VM headroom, before fixture startup/pulls.
     for directory in (SCRATCH,TASK/'tmp'): directory.mkdir(exist_ok=True)
@@ -400,11 +417,13 @@ def pg_matrix():
                    PGSSLMODE='verify-full',PGSSLROOTCERT=cfg['ca_pem'])
         # Some gates are #[ignore], others are ordinary tests with env gates.
         # Run both sets explicitly, serially; retain every failed test binary.
-        for binary in PG_MATRIX_TESTS:
+        for binary,selection in selections:
             if not (CRATE/'tests'/(binary+'.rs')).is_file():
                 raise RuntimeError('required gated test binary absent: '+binary)
             for ignored in (False,True):
-                args=['test','--locked','--no-fail-fast','-j4','--test',binary,'--']
+                args=['test','--locked','--no-fail-fast','-j4','--test',binary]
+                if selection: args.append(selection)
+                args.append('--')
                 if ignored:args+=['--ignored']
                 args+=['--nocapture','--test-threads=1']
                 status|=cargo(args,'pg'+PG_VERSION+'-'+binary+('-ignored' if ignored else '')+'-'+RUN)
@@ -412,7 +431,7 @@ def pg_matrix():
         library_selections=('pg::source::tests::', 'pg::tls::tests::harness_connection_reports_real_encryption',
                             'runner::fence_readiness::tests::live_extra_writer_and_definer_block_then_exact_acknowledgments_hold',
                             'runner::destination_readiness::tests::live_invalid_index_not_valid_sequence_type_and_reverse_privilege')
-        for selection_index,selection in enumerate(library_selections):
+        for selection_index,selection in enumerate(library_selections if 'SKEDADDLE_PG_TEST_SELECTION' not in ENV else ()):
             for ignored in (False,True):
                 args=['test','--locked','--no-fail-fast','-j4','--lib',selection,'--']
                 if ignored:args+=['--ignored']
@@ -537,10 +556,11 @@ if __name__=='__main__':
         elif action=='linux-fs':code=linux_fs()
         elif action=='pg-matrix':code=pg_matrix()
         elif action=='guard':guard()
-        elif action=='check':check()
+        elif action=='check':check(sys.argv[3] if len(sys.argv)>3 and sys.argv[3] else None)
         elif action=='down':down()
         elif action=='mutants':code=p2(mutate=True)
         else:raise ValueError(action)
     finally:
-        if action!='check':check()
+        # Scope the post-run check to this run: concurrent runs of other lanes are not ours to judge.
+        if action!='check':check(RUN)
     sys.exit(code)

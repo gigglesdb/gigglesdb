@@ -10,7 +10,9 @@ param(
     [string]$SpannerCargoTest='',
     [ValidateSet('ON','OFF')][string]$MysqlGtid='ON',
     [string]$MysqlSpike='',
-    [string]$MysqlCargoTest=''
+    [string]$MysqlCargoTest='',
+    # Optional PG binary or binary::test-filter selections; empty keeps the full matrix.
+    [string[]]$PgTestSelection=@()
 )
 $ErrorActionPreference='Stop'
 $resolved=[IO.Path]::GetFullPath($TaskRoot).Replace('\','/')
@@ -61,13 +63,24 @@ if ($Phase -in @('mysql80','mysql84')) {
         & python -I -X "pycache_prefix=$resolved/pycache" (Join-Path $PSScriptRoot 'mysql-run.py') $Phase $resolved $MysqlGtid "--spike=$MysqlSpike" "--cargo-test=$MysqlCargoTest"
         $mysqlResult=$LASTEXITCODE
     } finally {
-        & (Join-Path $PSScriptRoot 'cleanup.ps1') -Check -TaskRoot $resolved
-        if ($LASTEXITCODE -ne 0) { $mysqlResult=1 }
+        $mysqlOwnerPath=Join-Path $resolved 'owner.json'
+        if (Test-Path -LiteralPath $mysqlOwnerPath) {
+            $mysqlRunId=(Get-Content -Raw -LiteralPath $mysqlOwnerPath | ConvertFrom-Json).run_id
+            if ($mysqlRunId) {
+                & (Join-Path $PSScriptRoot 'cleanup.ps1') -Check -TaskRoot $resolved -RunId $mysqlRunId
+                if ($LASTEXITCODE -ne 0) { $mysqlResult=1 }
+            } else {
+                Write-Error 'MySQL owner record has no run_id; cannot verify scoped cleanup'
+                $mysqlResult=1
+            }
+        }
         $ErrorActionPreference=$savedErrorPreference
     }
     exit $mysqlResult
 }
 if ($Phase -eq 'pg-matrix') {
+    if ($PgTestSelection.Count) { $env:CARGO_HOME=$spannerCallerCargoHome; $env:SKEDADDLE_PG_TEST_SELECTION=ConvertTo-Json -Compress -InputObject @($PgTestSelection) }
+    else { Remove-Item Env:SKEDADDLE_PG_TEST_SELECTION -ErrorAction SilentlyContinue }
     $clientLock=Get-Content -Raw (Join-Path $PSScriptRoot 'pg-client.lock') | ConvertFrom-Json
     $env:SKEDADDLE_PSQL=$clientLock.executable
 }
@@ -78,7 +91,10 @@ try {
 }
 finally {
     if ($Phase -eq 'pg-matrix') {
-        & (Join-Path $PSScriptRoot 'cleanup.ps1') -Check -TaskRoot $resolved
+        # Scope the check to this run's own resources (owner-<run>.json written by harness.py).
+        $pgOwner=Get-ChildItem -LiteralPath $resolved -Filter 'owner-*.json' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($pgOwner) { & (Join-Path $PSScriptRoot 'cleanup.ps1') -Check -TaskRoot $resolved -RunId ((Get-Content -Raw -LiteralPath $pgOwner.FullName | ConvertFrom-Json).run_id) }
+        else { & (Join-Path $PSScriptRoot 'cleanup.ps1') -Check -TaskRoot $resolved }
         if ($LASTEXITCODE -ne 0) { if ($Phase -eq 'pg-matrix') {
     $clientLock=Get-Content -Raw (Join-Path $PSScriptRoot 'pg-client.lock') | ConvertFrom-Json
     $env:SKEDADDLE_PSQL=$clientLock.executable

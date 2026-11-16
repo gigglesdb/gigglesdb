@@ -8,6 +8,7 @@
 
 mod array;
 mod json;
+pub mod mysql;
 mod numeric;
 mod temporal;
 mod text;

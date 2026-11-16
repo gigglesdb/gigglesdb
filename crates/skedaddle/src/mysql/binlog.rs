@@ -120,10 +120,18 @@ pub enum MysqlEvent {
     /// ROWS_QUERY, IGNORABLE and STOP carry no row or transaction state.
     Skipped(u8),
 }
+/// End coordinate of the wire event. All payload children share its end.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PositionedEvent {
+    pub event: MysqlEvent,
+    pub file: String,
+    pub log_pos: u64,
+}
 pub struct BinlogDecoder {
     reader: EventStreamReader,
     maps: HashMap<u64, TableMapEvent<'static>>,
     limit: usize,
+    file: Option<String>,
 }
 impl BinlogDecoder {
     pub fn new(max_decompressed_bytes: usize) -> Self {
@@ -131,6 +139,7 @@ impl BinlogDecoder {
             reader: EventStreamReader::new(Version4),
             maps: HashMap::new(),
             limit: max_decompressed_bytes,
+            file: None,
         }
     }
     pub fn read(&mut self, input: &mut impl BufRead) -> Result<Option<MysqlEvent>> {
@@ -139,6 +148,29 @@ impl BinlogDecoder {
         };
         Self::verify_checksum(&event)?;
         self.decode(&event).map(Some)
+    }
+    /// Supply the initial on-disk filename; subsequent ROTATEs update it.
+    pub fn read_positioned(
+        &mut self,
+        input: &mut impl BufRead,
+        initial_file: &str,
+    ) -> Result<Option<PositionedEvent>> {
+        let Some(event) = self.reader.read(input)? else {
+            return Ok(None);
+        };
+        Self::verify_checksum(&event)?;
+        let decoded = self.decode(&event)?;
+        if let MysqlEvent::Rotate { file, .. } = &decoded {
+            self.file = Some(
+                String::from_utf8(file.clone())
+                    .map_err(|_| MysqlError::Invalid("binlog filename"))?,
+            );
+        }
+        Ok(Some(PositionedEvent {
+            event: decoded,
+            file: self.file.get_or_insert_with(|| initial_file.into()).clone(),
+            log_pos: u64::from(event.header().log_pos()),
+        }))
     }
     fn verify_checksum(event: &Event) -> Result<()> {
         if let Some(checksum) = event
