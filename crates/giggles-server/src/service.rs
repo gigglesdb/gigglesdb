@@ -1196,6 +1196,14 @@ impl Session {
     }
     pub(crate) fn authorize_native_catalog(&mut self, request: &giggles_core::operations::CatalogRequest) -> Result<(), CoreError> {
         use giggles_core::operations::CatalogRequest as C;
+        if matches!(request, C::AddConstraint { .. } | C::DropConstraint { .. }) {
+            let table = match request { C::AddConstraint { table, .. } | C::DropConstraint { table, .. } => table, _ => unreachable!() };
+            self.authorize_alter_table(&self.sql.native_relation_reference(table)?)?;
+            if let C::AddConstraint { constraint: giggles_core::operations::ConstraintSpec::ForeignKey { ref_table, .. }, .. } = request {
+                self.authorize_alter_table(&self.sql.native_relation_reference(ref_table)?)?;
+            }
+            return Ok(());
+        }
         let allowed = if !matches!(self.role, Role::Database { .. }) { false }
         else if self.table_privilege_superuser()? { true }
         else {

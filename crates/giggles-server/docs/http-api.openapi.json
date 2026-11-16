@@ -1980,11 +1980,19 @@
           "createIndex": {"$ref": "#/components/schemas/NativeCreateIndex"},
           "dropTable": {"$ref": "#/components/schemas/NativeDropTable"},
           "dropIndex": {"$ref": "#/components/schemas/NativeDropIndex"},
-          "alterTable": {"$ref": "#/components/schemas/NativeAlterTable"}
+          "alterTable": {"$ref": "#/components/schemas/NativeAlterTable"},
+          "addConstraint": {"$ref": "#/components/schemas/NativeAddConstraint"},
+          "dropConstraint": {"$ref": "#/components/schemas/NativeDropConstraint"}
         },
-        "oneOf": [{"required": ["createTable"]}, {"required": ["createIndex"]}, {"required": ["dropTable"]}, {"required": ["dropIndex"]}, {"required": ["alterTable"]}],
+        "oneOf": [{"required": ["createTable"]}, {"required": ["createIndex"]}, {"required": ["dropTable"]}, {"required": ["dropIndex"]}, {"required": ["alterTable"]}, {"required": ["addConstraint"]}, {"required": ["dropConstraint"]}],
         "description": "Exactly one synchronous catalog request. Unknown fields, duplicate keys and JSON null are rejected at every request level. Arrays omitted from requests default to empty; core validates their semantics. Names are exact identifiers resolved using the retained search_path. Errors use the existing native error mapping."
       },
+      "NativeAddConstraint": {"type": "object", "additionalProperties": false, "properties": {"table": {"type": "string", "minLength": 1}, "name": {"type": "string", "minLength": 1}, "unique": {"$ref": "#/components/schemas/NativeUniqueConstraint"}, "check": {"$ref": "#/components/schemas/NativeCheckConstraint"}, "foreignKey": {"$ref": "#/components/schemas/NativeForeignKey"}}, "required": ["table"], "oneOf": [{"required": ["unique"]}, {"required": ["check"]}, {"required": ["foreignKey"]}]},
+      "NativeUniqueConstraint": {"type": "object", "additionalProperties": false, "properties": {"columns": {"type": "array", "maxItems": 1600, "items": {"type": "string"}}}},
+      "NativeCheckConstraint": {"type": "object", "additionalProperties": false, "properties": {"expression": {"$ref": "#/components/schemas/NativeExpr"}}, "required": ["expression"]},
+      "NativeForeignKey": {"type": "object", "additionalProperties": false, "properties": {"columns": {"type": "array", "maxItems": 1600, "items": {"type": "string"}}, "refTable": {"type": "string", "minLength": 1}, "refColumns": {"type": "array", "maxItems": 1600, "items": {"type": "string"}}, "refColumnsSet": {"type": "boolean", "default": false}, "onDelete": {"$ref": "#/components/schemas/NativeForeignKeyAction"}, "onUpdate": {"$ref": "#/components/schemas/NativeForeignKeyAction"}}, "required": ["refTable"], "description": "refColumnsSet absent or false means inferred referenced primary key, ignoring refColumns; true preserves refColumns including empty. Actions use exact enum names."},
+      "NativeForeignKeyAction": {"type": "string", "enum": ["NoAction", "Restrict", "Cascade", "SetNull", "SetDefault"], "default": "NoAction"},
+      "NativeDropConstraint": {"type": "object", "additionalProperties": false, "properties": {"table": {"type": "string", "minLength": 1}, "name": {"type": "string", "minLength": 1}, "cascade": {"type": "boolean", "default": false}}, "required": ["table", "name"]},
       "NativeCatalogDataType": {
         "type": "string",
         "enum": ["Boolean", "SmallInt", "Integer", "BigInt", "Text", "Bytes", "Numeric", "Real", "DoublePrecision", "Date", "Time", "TimeTz", "Timestamp", "TimestampTz", "Interval", "Varchar", "Bpchar", "Uuid", "Jsonb", "IntArray", "BigIntArray", "TextArray"]

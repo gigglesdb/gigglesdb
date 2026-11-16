@@ -210,3 +210,5 @@ mod fk_section_network;
 
 #[path = "api_catalog_auth.rs"] mod api_catalog_auth;
 #[path = "api_catalog_defaults.rs"] mod api_catalog_defaults;
+
+#[path = "api_catalog_objects.rs"] mod api_catalog_objects;

@@ -639,7 +639,12 @@ enum NativeErrorClass {
   NATIVE_ERROR_CLASS_SQL = 20; // Underlying SQLSTATE in sqlstate
 }
 
-message NativeCatalogRequest { oneof request { NativeCreateTable create_table = 1; NativeCreateIndex create_index = 2; NativeDropTable drop_table = 3; NativeDropIndex drop_index = 4; NativeAlterTable alter_table = 5; } }
+message NativeCatalogRequest { oneof request { NativeCreateTable create_table = 1; NativeCreateIndex create_index = 2; NativeDropTable drop_table = 3; NativeDropIndex drop_index = 4; NativeAlterTable alter_table = 5; NativeAddConstraint add_constraint = 6; NativeDropConstraint drop_constraint = 7; } }
+message NativeAddConstraint { optional string table = 1; optional string name = 2; oneof constraint { NativeUniqueConstraint unique = 3; NativeCheckConstraint check = 4; NativeForeignKey foreign_key = 5; } }
+message NativeUniqueConstraint { repeated string columns = 1; }
+message NativeCheckConstraint { NativeExpr expression = 1; }
+message NativeForeignKey { repeated string columns = 1; optional string ref_table = 2; repeated string ref_columns = 3; optional bool ref_columns_set = 4; optional string on_delete = 5; optional string on_update = 6; }
+message NativeDropConstraint { optional string table = 1; optional string name = 2; optional bool cascade = 3; }
 message NativeCatalogColumn { optional string name = 1; optional string data_type = 2; optional bool not_null = 3; NativeColumnDefault default = 4; optional string generated = 5; }
 message NativeColumnDefault { oneof kind { Value value = 1; NativeClockDefault clock = 2; string nextval = 3; } }
 message NativeClockDefault { optional string kind = 1; optional uint32 precision = 2; }

@@ -225,6 +225,20 @@ pub(crate) fn validate(input: &p::ExecuteRequest) -> R<()> {
                 return Err(ApiError::InvalidArgument);
             }
         }
+        Some(p::execute_request::Request::Catalog(v)) => {
+            use p::native_catalog_request::Request as C;
+            let valid = |s: &str| !s.is_empty() && !s.contains('\0');
+            match need(v.request.as_ref())? {
+                C::AddConstraint(v) => {
+                    if !valid(need(v.table.as_deref())?) || v.name.as_deref().is_some_and(|s| !valid(s)) { return Err(ApiError::InvalidArgument); }
+                    if let Some(p::native_add_constraint::Constraint::Check(v)) = &v.constraint { Shape::default().expr(need(v.expression.as_ref())?)?; }
+                    if let Some(p::native_add_constraint::Constraint::ForeignKey(v)) = &v.constraint
+                        && !valid(need(v.ref_table.as_deref())?) { return Err(ApiError::InvalidArgument); }
+                }
+                C::DropConstraint(v) => if !valid(need(v.table.as_deref())?) || !valid(need(v.name.as_deref())?) { return Err(ApiError::InvalidArgument); },
+                _ => {}
+            }
+        }
         Some(p::execute_request::Request::TypedRead(v)) => read_shape(v)?,
         Some(p::execute_request::Request::Operation(v)) => {
             Shape::default().request(need(v.request.as_ref())?, 0)?;
@@ -750,6 +764,21 @@ pub(crate) fn catalog_request(v: p::NativeCatalogRequest) -> R<o::CatalogRequest
         }
         Q::DropTable(v) => o::CatalogRequest::DropTable { table: need(v.table)?, cascade: v.cascade.unwrap_or(false) },
         Q::DropIndex(v) => o::CatalogRequest::DropIndex { name: need(v.name)?, cascade: v.cascade.unwrap_or(false) },
+        Q::AddConstraint(v) => {
+            use p::native_add_constraint::Constraint as K;
+            let constraint = match need(v.constraint)? {
+                K::Unique(v) => { cap(v.columns.len(), 1600)?; o::ConstraintSpec::Unique { columns: v.columns } },
+                K::Check(v) => { let expression = need(v.expression)?; Shape::default().expr(&expression)?; o::ConstraintSpec::Check { expression: expr(expression)? } },
+                K::ForeignKey(v) => {
+                    cap(v.columns.len(), 1600)?; cap(v.ref_columns.len(), 1600)?;
+                    o::ConstraintSpec::ForeignKey { columns: v.columns, ref_table: need(v.ref_table)?,
+                        ref_columns: v.ref_columns_set.unwrap_or(false).then_some(v.ref_columns),
+                        on_delete: foreign_key_action(v.on_delete)?, on_update: foreign_key_action(v.on_update)? }
+                }
+            };
+            o::CatalogRequest::AddConstraint { table: need(v.table)?, name: v.name, constraint }
+        }
+        Q::DropConstraint(v) => o::CatalogRequest::DropConstraint { table: need(v.table)?, name: need(v.name)?, cascade: v.cascade.unwrap_or(false) },
         Q::AlterTable(v) => {
             use p::native_alter_table::Action as A;
             let table = need(v.table)?;
@@ -765,6 +794,11 @@ pub(crate) fn catalog_request(v: p::NativeCatalogRequest) -> R<o::CatalogRequest
             o::CatalogRequest::AlterTable { table, action }
         }
     })
+}
+fn foreign_key_action(v: Option<String>) -> R<o::ForeignKeyAction> {
+    use o::ForeignKeyAction::*;
+    Ok(match v.as_deref().unwrap_or("NoAction") { "NoAction" => NoAction, "Restrict" => Restrict,
+        "Cascade" => Cascade, "SetNull" => SetNull, "SetDefault" => SetDefault, _ => return Err(ApiError::InvalidArgument) })
 }
 fn catalog_column(v: p::NativeCatalogColumn) -> R<o::ColumnSpec> {
     Ok(o::ColumnSpec { name: need(v.name)?, data_type: catalog_type(&need(v.data_type)?)?, not_null: v.not_null.unwrap_or(false), default: v.default.map(column_default).transpose()?, generated: v.generated.map(|v| Ok(match v.as_str() {

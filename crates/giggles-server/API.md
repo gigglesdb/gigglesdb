@@ -568,3 +568,29 @@ also return `42501` for missing objects, where PostgreSQL 18.6 returns `42P01`
 (relations) or `42704` (DROP INDEX). A missing creation schema returns `3F000`.
 Live privilege revocation is checked on each request, and a denied request
 inside BEGIN aborts the transaction (subsequent requests return `25P02`).
+
+Constraint catalog requests use additive oneof tags `add_constraint=6` and
+`drop_constraint=7`; views are not exposed by this wire version.
+```json
+{"catalog":{"addConstraint":{"table":"public.items","name":"items_unique","unique":{"columns":["body"]}}}}
+{"catalog":{"addConstraint":{"table":"public.items","name":"items_check","check":{"expression":{"compare":{"left":{"field":"id"},"comparison":"NATIVE_COMPARISON_GT","right":{"value":{"literal":{"intValue":"0"}}}}}}}}}
+{"catalog":{"addConstraint":{"table":"public.items","name":"items_fk","foreignKey":{"columns":["parent"],"refTable":"public.parents","refColumns":["id"],"refColumnsSet":true,"onDelete":"Cascade","onUpdate":"NoAction"}}}}
+{"catalog":{"dropConstraint":{"table":"public.items","name":"items_unique","cascade":false}}}
+```
+`name` is optional on ADD. Exactly one of `unique`, `check`, `foreignKey` is
+required. CHECK uses the existing bounded native expression wire message;
+execution currently supports only a column compared with an int, text, bool
+or NULL literal (other shapes return `NATIVE_ERROR_CLASS_UNSUPPORTED` without
+a SQLSTATE, even where SQL accepts the expression). FK actions are
+`NoAction`, `Restrict`, `Cascade`, `SetNull`, `SetDefault` (default `NoAction`).
+`refColumnsSet` absent/false infers the referenced primary key and ignores
+`refColumns`; true preserves the array, including empty. Table names use the
+retained search_path. Outcomes name the constrained table, without `indexId`.
+ADD/DROP require table ownership; REFERENCES also requires referenced-table
+ownership under the shared SQL rule. Application roles cannot perform DDL.
+Authorization precedes column and constraint binding. Native and SQL currently
+both reject DROP CONSTRAINT CASCADE with 42601; PostgreSQL 18.6 supports it.
+Duplicate named UNIQUE reports 42P07 for the existing backing-index name,
+matching PostgreSQL 18.6.
+Legacy native catalog requests on populated databases retain the existing
+`NATIVE_ERROR_CLASS_PLAN_REQUIRED` gate, while SQL DDL executes synchronously.

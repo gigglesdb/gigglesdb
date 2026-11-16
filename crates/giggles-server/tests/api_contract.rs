@@ -253,7 +253,12 @@ fn catalog_descriptor_frozen_fields_and_presence() {
     let set = prost_types::FileDescriptorSet::decode(proto::FILE_DESCRIPTOR_SET).unwrap();
     let file = set.file.iter().find(|f| f.package.as_deref() == Some("giggles.v1")).unwrap();
     for (message, fields, optional, oneof) in [
-        ("NativeCatalogRequest", "create_table create_index drop_table drop_index alter_table", "", Some("request")),
+        ("NativeCatalogRequest", "create_table create_index drop_table drop_index alter_table add_constraint drop_constraint", "", Some("request")),
+        ("NativeAddConstraint", "table name unique check foreign_key", "table name", Some("constraint")),
+        ("NativeUniqueConstraint", "columns", "", None),
+        ("NativeCheckConstraint", "expression", "", None),
+        ("NativeForeignKey", "columns ref_table ref_columns ref_columns_set on_delete on_update", "ref_table ref_columns_set on_delete on_update", None),
+        ("NativeDropConstraint", "table name cascade", "table name cascade", None),
         ("NativeCatalogColumn", "name data_type not_null default generated", "name data_type not_null generated", None),
         ("NativeColumnDefault", "value clock nextval", "", Some("kind")),
         ("NativeClockDefault", "kind precision", "kind precision", None),
@@ -292,4 +297,51 @@ fn catalog_default_json_schema_contract() {
     assert_eq!(s["NativeClockDefault"]["oneOf"][1]["properties"]["precision"]["maximum"], u32::MAX);
     assert!(s["NativeAlterTable"]["properties"]["addColumn"]["allOf"][1]["not"].is_object());
     assert!(s["NativeCatalogOutcome"]["properties"]["columns"]["items"]["allOf"][1]["not"].is_object());
+}
+
+#[test]
+fn constraint_json_keys_and_malformed_shapes() {
+    use serde_json::json;
+    for body in [json!({"table":"t","unique":{"columns":["v"]}}),
+        json!({"table":"t","name":"ck","check":{"expression":{"field":"v"}}}),
+        json!({"table":"t","name":"fk","foreignKey":{"columns":["v"],"refTable":"p","refColumns":["id"],"refColumnsSet":true,"onDelete":"Cascade","onUpdate":"Restrict"}})] {
+        let bytes=serde_json::to_vec(&json!({"catalog":{"addConstraint":body}})).unwrap();
+        codec::decode_execute(json::decode_execute(&bytes).unwrap()).unwrap();
+    }
+    let api:serde_json::Value=serde_json::from_str(include_str!("../docs/http-api.openapi.json")).unwrap();
+    for (message,keys) in [("NativeAddConstraint","table name unique check foreignKey"),("NativeUniqueConstraint","columns"),("NativeCheckConstraint","expression"),("NativeForeignKey","columns refTable refColumns refColumnsSet onDelete onUpdate"),("NativeDropConstraint","table name cascade")] {
+        let props=api["components"]["schemas"][message]["properties"].as_object().unwrap();
+        assert_eq!(props.len(),keys.split_whitespace().count()); for key in keys.split_whitespace() {assert!(props.contains_key(key));}
+    }
+    for body in [json!({"table":"t"}),json!({"table":"","unique":{}}),json!({"table":"t","name":"","unique":{}}),
+        json!({"table":"t","foreignKey":{"refTable":"p","onDelete":"cascade"}}),json!({"table":"t","unique":{"unknown":1}})] {
+        let bytes=serde_json::to_vec(&json!({"catalog":{"addConstraint":body}})).unwrap();
+        assert!(json::decode_execute(&bytes).and_then(codec::decode_execute).is_err());
+    }
+}
+
+#[test]
+fn foreign_key_presence_and_action_decoding() {
+    use serde_json::json;
+    use giggles_core::operations::{CatalogRequest,ConstraintSpec,ForeignKeyAction as A};
+    for (action,expected) in [("NoAction",A::NoAction),("Restrict",A::Restrict),("Cascade",A::Cascade),("SetNull",A::SetNull),("SetDefault",A::SetDefault)] {
+        for set in [None,Some(false),Some(true)] {
+            let mut body=json!({"columns":["v"],"refTable":"p","refColumns":["id"],"onDelete":action,"onUpdate":action});
+            if let Some(set)=set {body["refColumnsSet"]=json!(set);}
+            let input=json!({"catalog":{"addConstraint":{"table":"t","foreignKey":body}}});
+            let decoded=codec::decode_execute(json::decode_execute(&serde_json::to_vec(&input).unwrap()).unwrap()).unwrap();
+            let codec::Invocation::Catalog(request)=decoded.request else {panic!()};
+            let CatalogRequest::AddConstraint {name,constraint:ConstraintSpec::ForeignKey{ref_columns,on_delete,on_update,..},..}=*request else {panic!()};
+            assert!(name.is_none()); assert_eq!(on_delete,expected); assert_eq!(on_update,expected);
+            assert_eq!(ref_columns,set.filter(|s|*s).map(|_|vec!["id".to_owned()]));
+        }
+    }
+}
+
+#[test]
+fn constraint_check_depth_is_bounded_before_encoding() {
+    let mut e=proto::NativeExpr {expression:Some(proto::native_expr::Expression::Field("v".into()))};
+    for _ in 0..26 {e=proto::NativeExpr {expression:Some(proto::native_expr::Expression::NotExpr(Box::new(e)))};}
+    let request=proto::ExecuteRequest {request:Some(proto::execute_request::Request::Catalog(proto::NativeCatalogRequest {request:Some(proto::native_catalog_request::Request::AddConstraint(proto::NativeAddConstraint {table:Some("t".into()),constraint:Some(proto::native_add_constraint::Constraint::Check(proto::NativeCheckConstraint {expression:Some(e)})),..Default::default()}))})),..Default::default()};
+    assert!(codec::decode_execute(request).is_err());
 }

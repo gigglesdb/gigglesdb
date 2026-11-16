@@ -183,6 +183,29 @@ impl Decoder {
             "dropIndex" => Q::DropIndex(p::NativeDropIndex {
                 name: Some(text(f.required("name")?)?), cascade: f.optional("cascade").map(boolean).transpose()?,
             }),
+            "addConstraint" => {
+                use p::native_add_constraint::Constraint as K;
+                let table = Some(text(f.required("table")?)?);
+                let name = f.optional("name").map(text).transpose()?;
+                let (kind, value) = f.one()?;
+                let mut a = Object::new(value)?;
+                let constraint = Some(match kind.as_str() {
+                    "unique" => K::Unique(p::NativeUniqueConstraint { columns: items(a.optional("columns"),1600)?.into_iter().map(text).collect::<R<_>>()? }),
+                    "check" => K::Check(p::NativeCheckConstraint { expression: Some(self.native_expr(a.required("expression")?)?) }),
+                    "foreignKey" => K::ForeignKey(p::NativeForeignKey {
+                        columns: items(a.optional("columns"),1600)?.into_iter().map(text).collect::<R<_>>()?,
+                        ref_table: Some(text(a.required("refTable")?)?),
+                        ref_columns: items(a.optional("refColumns"),1600)?.into_iter().map(text).collect::<R<_>>()?,
+                        ref_columns_set: a.optional("refColumnsSet").map(boolean).transpose()?,
+                        on_delete: a.optional("onDelete").map(text).transpose()?, on_update: a.optional("onUpdate").map(text).transpose()?,
+                    }),
+                    _ => return Err(ApiError::InvalidArgument),
+                });
+                a.finish()?;
+                return Ok(p::NativeCatalogRequest { request: Some(Q::AddConstraint(p::NativeAddConstraint { table, name, constraint })) });
+            }
+            "dropConstraint" => Q::DropConstraint(p::NativeDropConstraint { table: Some(text(f.required("table")?)?),
+                name: Some(text(f.required("name")?)?), cascade: f.optional("cascade").map(boolean).transpose()? }),
             "alterTable" => {
                 use p::native_alter_table::Action as A;
                 let table = Some(text(f.required("table")?)?);
