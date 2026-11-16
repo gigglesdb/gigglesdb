@@ -368,7 +368,8 @@ impl<'a> Inputs<'a> {
                     self.statement(statement)?
                 }
                 TransactionStep::Require(expression) => self.expression(expression)?,
-                TransactionStep::Savepoint(_) | TransactionStep::RollbackTo(_) | TransactionStep::Release(_) => return Err(Error::Unsupported),
+                TransactionStep::Savepoint(_) | TransactionStep::RollbackTo(_) | TransactionStep::Release(_)
+                | TransactionStep::Sequence { .. } => return Err(Error::Unsupported),
             }
         }
         if let Some(emitted) = &transaction.emit {

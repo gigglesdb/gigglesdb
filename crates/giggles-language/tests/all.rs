@@ -31,6 +31,7 @@ mod inspection_capabilities;
 mod native_alter_parity;
 #[path = "native_block_query_parity.rs"] mod native_block_query_parity;
 #[path = "native_bound_query_parity.rs"] mod native_bound_query_parity;
+#[path = "native_column_defaults21_parity.rs"] mod native_column_defaults21_parity;
 #[path = "native_constraint_parity.rs"]
 mod native_constraint_parity;
 #[path = "native_defaults_parity.rs"]
@@ -42,6 +43,7 @@ mod native_paging_parity;
 #[path = "native_parity.rs"]
 mod native_parity;
 #[path = "native_qualified_query_parity.rs"] mod native_qualified_query_parity;
+#[path = "native_recovery21_parity.rs"] mod native_recovery21_parity;
 #[path = "native_schema_parity.rs"]
 mod native_schema_parity;
 #[path = "native_sqlstate_parity.rs"]
@@ -103,6 +105,7 @@ fn every_test_file_is_registered() {
 
 #[path = "native_savepoint_parity.rs"] mod native_savepoint_parity;
 #[path = "native_savepoint_recovery_parity.rs"] mod native_savepoint_recovery_parity;
+#[path = "native_sequence21_parity.rs"] mod native_sequence21_parity;
 
 #[path = "typed_read_parser.rs"] mod typed_read_parser;
 #[path = "native_typed_read_parity.rs"] mod native_typed_read_parity;

@@ -1,6 +1,6 @@
 use giggles_core::{Admin, Engine as StorageEngine, Limits};
 use giggles_language::{
-    Bindings, Engine, Error, InspectionOutcome, InspectionStatement, LanguageVersion, MAX_INPUT,
+    Bindings, CatalogStatement, Engine, Error, InspectionOutcome, InspectionStatement, LanguageVersion, MAX_INPUT,
     ParsedInput, parse_input_with_version,
 };
 fn run() -> std::result::Result<serde_json::Value, Error> {
@@ -115,6 +115,7 @@ fn language_version(version: &str) -> std::result::Result<LanguageVersion, Error
         "0.18" => Ok(LanguageVersion::Embedded018),
         "0.19" => Ok(LanguageVersion::Embedded019),
         "0.20" => Ok(LanguageVersion::Embedded020),
+        "0.21" => Ok(LanguageVersion::Embedded021),
         _ => Err(Error::Unsupported),
     }
 }
@@ -160,6 +161,12 @@ fn execute(
         ParsedInput::Catalog(statement) => {
             if !bindings.is_empty() {
                 return Err(Error::Bind("catalog bindings".into()));
+            }
+            if matches!(statement, CatalogStatement::CreateSequence { .. } | CatalogStatement::DropSequence { .. }) {
+                return match engine.execute_sequence_catalog(&statement)? {
+                    Some(epoch) => Ok(serde_json::json!({"catalog_epoch": epoch})),
+                    None => Ok(serde_json::json!({"message": "nothing to do"})),
+                };
             }
             match engine.execute_catalog_optional(&statement)? {
                 Some(outcome) => serde_json::to_value(outcome),

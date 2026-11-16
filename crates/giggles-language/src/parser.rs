@@ -5,6 +5,7 @@ enum Token {
     Word(String),
     QuotedIdentifier(String),
     String(String),
+    DefaultText(String),
     Number(String),
     Param(String),
     Symbol(char),
@@ -143,6 +144,20 @@ fn lex(s: &str, version: LanguageVersion) -> Result<Vec<(Token, usize)>> {
                     return Err(Error::Unsupported);
                 }
                 Token::QuotedIdentifier(name.to_owned())
+            }
+            b'\'' if version.supports_r2_wave3() => {
+                i += 1;
+                let mut text = String::new();
+                let mut from = i;
+                loop {
+                    if i == b.len() { return Err(Error::Syntax { offset: start }); }
+                    if b[i] == b'\'' {
+                        text.push_str(&s[from..i]); i += 1;
+                        if b.get(i) != Some(&b'\'') { break; }
+                        text.push('\''); i += 1; from = i;
+                    } else { i += 1; }
+                }
+                Token::DefaultText(text)
             }
             b'"' => {
                 i += 1;
@@ -410,7 +425,7 @@ impl Parser {
             | LanguageVersion::Embedded012
             | LanguageVersion::Embedded013
             | LanguageVersion::Embedded014
-            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 => self.sum(d),
+            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021 => self.sum(d),
         }
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {
@@ -1222,7 +1237,7 @@ impl Parser {
             CatalogType::Int64
         } else if self.word("text") {
             CatalogType::Text
-        } else if matches!(self.version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) && self.word("numeric") {
+        } else if matches!(self.version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) && self.word("numeric") {
             CatalogType::Numeric
         } else if self.word("bytes") {
             CatalogType::Bytes
@@ -1231,16 +1246,74 @@ impl Parser {
         };
         Ok(ColumnSpec { name, data_type, nullable })
     }
+    fn table_column(&mut self) -> Result<TableColumn> {
+        if !self.version.supports_r2_wave3() {
+            return Ok(TableColumn { column: self.catalog_column()?, default: None, generated: None });
+        }
+        let start = self.pos;
+        let name = self.name()?;
+        let nullable = self.word("nullable");
+        let serial = if self.word("serial") { Some(CatalogType::Int32) }
+            else if self.word("bigserial") { Some(CatalogType::Int64) } else { None };
+        let column = if let Some(data_type) = serial { ColumnSpec { name, nullable, data_type } }
+            else { self.pos = start; self.catalog_column()? };
+        let mut generated = serial.map(|_| ColumnGenerated::Serial);
+        let default = if self.word("default") {
+            Some(if self.word("nextval") {
+                if !self.symbol('(') { return Err(self.error()); }
+                let relation = self.relation_name()?;
+                if !self.symbol(')') { return Err(self.error()); }
+                ColumnDefaultSpec::Nextval(relation)
+            } else {
+                let start = self.pos;
+                let negative = self.symbol('-');
+                let number = if let Some(Token::Number(n)) = self.peek().cloned() {
+                    self.pos += 1;
+                    if self.symbol('.') {
+                        let Some(Token::Number(fraction)) = self.peek().cloned() else { return Err(self.error()); };
+                        self.pos += 1;
+                        Some(format!("{}{n}.{fraction}", if negative { "-" } else { "" }))
+                    } else { None }
+                } else { None };
+                let value = if let Some(number) = number {
+                    Value::Numeric(giggles_core::relational::Numeric::parse(&number).map_err(|_| self.error())?)
+                } else {
+                    self.pos = start;
+                    if let Some(Token::DefaultText(text)) = self.peek().cloned() {
+                        self.pos += 1; Value::Text(text)
+                    } else { match self.value()? { ValueExpr::Literal(v) => v, ValueExpr::Parameter(_) => return Err(Error::Unsupported) } }
+                };
+                ColumnDefaultSpec::Value(value)
+            })
+        } else { None };
+        if self.word("generated") {
+            if generated.is_some() { return Err(self.error()); }
+            generated = Some(if self.word("always") { ColumnGenerated::IdentityAlways }
+                else { self.need("by")?; self.need("default")?; ColumnGenerated::IdentityByDefault });
+            self.need("as")?; self.need("identity")?;
+        }
+        if column.nullable && generated.is_some() { return Err(self.error()); }
+        Ok(TableColumn { column, default, generated })
+    }
     fn catalog_prefix(&self) -> bool {
         matches!(&self.tokens[self.pos..], [(Token::Word(create), _), (Token::Word(table), _), ..]
-            if ((create == "alter" && table == "table" && self.version.supports_r2_native()) || create == "create" || (create == "drop" && matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020)))
-                && (table == "table" || table == "index" || (table == "view" && self.version.supports_r2_wave2())))
+            if ((create == "alter" && table == "table" && self.version.supports_r2_native()) || create == "create" || (create == "drop" && matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021)))
+                && (table == "table" || table == "index" || (table == "view" && self.version.supports_r2_wave2())
+                    || (table == "sequence" && create != "alter" && self.version.supports_r2_wave3())))
     }
     fn catalog(&mut self) -> Result<CatalogStatement> {
         if !self.version.supports_catalog() {
             return Err(Error::Unsupported);
         }
-        if matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) && self.word("drop") {
+        if matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) && self.word("drop") {
+            if self.version.supports_r2_wave3() && self.word("sequence") {
+                let if_exists = self.word("if");
+                if if_exists { self.need("exists")?; }
+                let name = self.relation_name()?;
+                let cascade = self.word("cascade");
+                if !cascade { self.word("restrict"); }
+                return Ok(CatalogStatement::DropSequence { name, if_exists, cascade });
+            }
             if self.version.supports_r2_wave2() && self.word("view") {
                 let if_exists = self.word("if");
                 if if_exists { self.need("exists")?; }
@@ -1296,6 +1369,11 @@ impl Parser {
             return Ok(CatalogStatement::AlterTable { table, action });
         }
         self.need("create")?;
+        if self.version.supports_r2_wave3() && self.word("sequence") {
+            let if_not_exists = self.word("if");
+            if if_not_exists { self.need("not")?; self.need("exists")?; }
+            return Ok(CatalogStatement::CreateSequence { name: self.relation_name()?, if_not_exists });
+        }
         if self.version.supports_r2_wave2() && self.word("view") {
             let name = self.relation_name()?;
             self.need("as")?;
@@ -1361,7 +1439,7 @@ impl Parser {
                 if columns.len() >= giggles_core::relational::MAX_COLUMNS {
                     return Err(Error::Limit);
                 }
-                columns.push(self.catalog_column()?);
+                columns.push(self.table_column()?);
             }
             if !self.symbol(',') {
                 break;
@@ -1370,11 +1448,12 @@ impl Parser {
         if !self.symbol(')') {
             return Err(self.error());
         }
-        Ok(CatalogStatement::CreateTable {
-            table,
-            columns,
-            primary_key: primary_key.ok_or_else(|| self.error())?,
-        })
+        let primary_key = primary_key.ok_or_else(|| self.error())?;
+        if columns.iter().any(|c| c.default.is_some() || c.generated.is_some()) {
+            Ok(CatalogStatement::CreateTableWith { table, columns, primary_key, constraints: vec![] })
+        } else {
+            Ok(CatalogStatement::CreateTable { table, columns: columns.into_iter().map(|c| c.column).collect(), primary_key })
+        }
     }
     fn constraint_columns(&mut self) -> Result<Vec<String>> {
         if !self.symbol('(') { return Err(self.error()); }
@@ -1494,6 +1573,28 @@ impl Parser {
             Ok(ParsedInput::Transaction(transaction))
         }
     }
+    /// Profile 0.21: `nextval(` / `currval(` / `setval(` at `offset` tokens ahead.
+    fn sequence_prefix(&self, offset: usize) -> bool {
+        self.version.supports_r2_wave3() && matches!(&self.tokens[(self.pos + offset).min(self.tokens.len())..],
+            [(Token::Word(f), _), (Token::Symbol('('), _), ..] if matches!(f.as_str(), "nextval" | "currval" | "setval"))
+    }
+    fn sequence_call(&mut self) -> Result<SequenceStatement> {
+        let call = if self.word("nextval") { None } else if self.word("currval") { Some(false) } else { self.need("setval")?; Some(true) };
+        if !self.symbol('(') { return Err(self.error()); }
+        let name = self.relation_name()?;
+        let statement = match call {
+            None => SequenceStatement::Nextval(name),
+            Some(false) => SequenceStatement::Currval(name),
+            Some(true) => {
+                if !self.symbol(',') { return Err(self.error()); }
+                let value = self.value()?;
+                let is_called = if self.symbol(',') { Some(self.value()?) } else { None };
+                SequenceStatement::Setval { name, value, is_called }
+            }
+        };
+        if !self.symbol(')') { return Err(self.error()); }
+        Ok(statement)
+    }
     fn savepoint_name(&mut self) -> Result<String> {
         match self.peek().cloned() {
             Some(Token::Word(name)) if canonical_identifier(&name) && !reserved_for(&name, self.version) => {
@@ -1537,12 +1638,17 @@ impl Parser {
             } else if self.version.supports_r2_native() && self.item_word("release") {
                 self.word("savepoint");
                 TransactionStep::Release(self.savepoint_name()?)
+            } else if self.sequence_prefix(0) {
+                TransactionStep::Sequence { name: None, call: self.sequence_call()? }
             } else if self.item_word("let") {
                 let name = self.variable_name()?;
                 if self.peek() != Some(&Token::Op(Compare::Eq)) {
                     return Err(self.error());
                 }
                 self.pos += 1;
+                if self.sequence_prefix(0) {
+                    TransactionStep::Sequence { name: Some(name), call: self.sequence_call()? }
+                } else {
                 if !self.symbol('(') {
                     return Err(self.error());
                 }
@@ -1551,6 +1657,7 @@ impl Parser {
                     return Err(self.error());
                 }
                 TransactionStep::Let { name, statement }
+                }
             } else if self.item_word("require") {
                 TransactionStep::Require(self.expr(0)?)
             } else {
@@ -1732,6 +1839,17 @@ pub fn parse_explain_with_version(s: &str, version: LanguageVersion) -> Result<E
 }
 
 /// Parse a standalone simple read page in explicit 0.20.
+/// Profile 0.21: `nextval(s)`, `currval(s)` or `setval(s, value [, is_called])`.
+pub fn parse_sequence_with_version(s: &str, version: LanguageVersion) -> Result<SequenceStatement> {
+    if !version.supports_r2_wave3() { return Err(Error::Unsupported); }
+    let mut p = Parser { tokens: lex(s, version)?, pos: 0, end: s.len(), version };
+    if !p.sequence_prefix(0) { return Err(p.error()); }
+    let statement = p.sequence_call()?;
+    p.symbol(';');
+    if p.peek().is_some() { return Err(p.error()); }
+    execute::validate_sequence(&statement, version)?;
+    Ok(statement)
+}
 pub fn parse_page_with_version(s: &str, version: LanguageVersion) -> Result<PageStatement> {
     if !version.supports_r2_wave2() { return Err(Error::Unsupported); }
     let mut p = Parser { tokens: lex(s, version)?, pos: 0, end: s.len(), version };

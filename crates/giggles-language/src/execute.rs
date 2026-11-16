@@ -400,6 +400,8 @@ impl Engine {
             bindings,
         )
     }
+    /// Version 0.21 skips aborted block steps until an existing savepoint recovers.
+    /// A block ending aborted returns its original error and rolls back.
     pub fn execute_transaction(
         &self,
         transaction: &Transaction,
@@ -423,16 +425,45 @@ impl Engine {
             let mut pending: Option<Error> = None;
             let mut locals = std::collections::BTreeMap::new();
             for (item_index, step) in block.steps.iter().enumerate() {
-                if !matches!(step, TransactionStep::RollbackTo(_)) { assert!(pending.is_none()); }
+                if pending.is_some() && !matches!(step, TransactionStep::RollbackTo(_)) {
+                    if self.version.supports_r2_wave3() { continue; }
+                    assert!(pending.is_none());
+                }
                 match step {
                     TransactionStep::Savepoint(name) => session.savepoint(name).map_err(control_error)?,
                     TransactionStep::RollbackTo(name) => {
                         if let Err(err) = session.rollback_to(name) {
+                            if self.version.supports_r2_wave3() && pending.is_some() { continue; }
                             return Err(pending.take().unwrap_or_else(|| control_error(err)));
                         }
                         pending = None;
                     }
                     TransactionStep::Release(name) => session.release(name).map_err(control_error)?,
+                    TransactionStep::Sequence { name, call } => {
+                        let result = sequence_call(call, bindings, self.version)
+                            .and_then(|call| session.execute_sequence_native(&call).map_err(error));
+                        let value = match result {
+                            Ok(value) => value,
+                            Err(err) if !matches!(err, Error::Unknown)
+                                && block.steps[item_index + 1..].iter().any(|s| matches!(s, TransactionStep::RollbackTo(_))) => {
+                                pending = Some(err);
+                                continue;
+                            }
+                            Err(err) => return Err(err),
+                        };
+                        if let Some(name) = name {
+                            let column = match call {
+                                SequenceStatement::Nextval(_) => "nextval", SequenceStatement::Currval(_) => "currval",
+                                SequenceStatement::Setval { .. } => "setval",
+                            };
+                            locals.insert(name.clone(), operations::EmittedValue::Rows {
+                                columns: vec![giggles_core::relational::ColumnDef { id: 0, name: column.into(),
+                                    data_type: giggles_core::relational::DataType::BigInt, not_null: true }],
+                                rows: vec![sequence_row(value)], complete: true });
+                        }
+                        summaries.push(operations::StepSummary { item_index, matched: 1, affected: 0, changed: 0,
+                            complete: true, conflict_results: None });
+                    }
                     TransactionStep::Execute(statement) | TransactionStep::Let { statement, .. } => {
                         let result = (|| {
                             let out = match statement {
@@ -453,7 +484,9 @@ impl Engine {
                             Ok(out) => out,
                             Err(err) => {
                                 if self.version.supports_r2_wave2() && !matches!(err, Error::Unknown)
-                                    && matches!(block.steps.get(item_index + 1), Some(TransactionStep::RollbackTo(_))) {
+                                    && (if self.version.supports_r2_wave3() {
+                                        block.steps[item_index + 1..].iter().any(|s| matches!(s, TransactionStep::RollbackTo(_)))
+                                    } else { matches!(block.steps.get(item_index + 1), Some(TransactionStep::RollbackTo(_))) }) {
                                     pending = Some(err);
                                     continue;
                                 }
@@ -467,6 +500,7 @@ impl Engine {
                     _ => return Err(Error::Unsupported),
                 }
             }
+            if let Some(err) = pending { return Err(err); }
             let emitted = block.emit.iter().flatten().map(|emit| {
                 let EmitExpr::Rows(name) = emit else { return Err(Error::Unsupported); };
                 locals.get(name).cloned().ok_or(Error::Unsupported)
@@ -518,6 +552,36 @@ impl Engine {
             .map_err(error)
     }
 
+    /// Profile 0.21 CREATE/DROP SEQUENCE text; see [`Self::execute_sequence_catalog`].
+    pub fn execute_sequence_catalog_text(&self, text: &str) -> Result<Option<u64>> {
+        self.execute_sequence_catalog(&parse_catalog_with_version(text, self.version)?)
+    }
+    /// Run CREATE/DROP SEQUENCE through SQL's sequence DDL in one commit and
+    /// return the catalog epoch. `None`: DROP IF EXISTS found nothing (42P01/3F000)
+    /// or CREATE IF NOT EXISTS found an existing relation (42P07).
+    /// Table, view and constraint DDL use [`Self::execute_catalog`].
+    pub fn execute_sequence_catalog(&self, statement: &CatalogStatement) -> Result<Option<u64>> {
+        if !matches!(statement, CatalogStatement::CreateSequence { .. } | CatalogStatement::DropSequence { .. }) { return Err(Error::Unsupported); }
+        let request = lower_catalog_checked(statement, self.version)?;
+        match self.inner.execute_sequence_catalog(&request).map_err(error) {
+            Err(Error::Sql { sqlstate }) if matches!(statement, CatalogStatement::DropSequence { if_exists: true, .. })
+                && matches!(sqlstate.as_str(), "42P01" | "3F000") => Ok(None),
+            Err(Error::Sql { sqlstate }) if matches!(statement, CatalogStatement::CreateSequence { if_not_exists: true, .. })
+                && sqlstate == "42P07" => Ok(None),
+            result => result.map(Some),
+        }
+    }
+    /// Profile 0.21 `nextval(s)` / `currval(s)` / `setval(s, v [, is_called])` text.
+    pub fn execute_sequence_text(&self, text: &str, bindings: &Bindings) -> Result<i64> {
+        self.execute_sequence(&parse_sequence_with_version(text, self.version)?, bindings)
+    }
+    /// Each standalone call runs in a fresh session, like a new SQL connection,
+    /// so `currval` gives 55000 here; use a transaction block step for
+    /// session-scoped currval. nextval is never rolled back.
+    pub fn execute_sequence(&self, statement: &SequenceStatement, bindings: &Bindings) -> Result<i64> {
+        let call = sequence_call(statement, bindings, self.version)?;
+        self.inner.execute_sequence(&call).map_err(error)
+    }
     /// Execute one safe catalog operation in its own transaction.
     pub fn execute_catalog_text(&self, text: &str) -> Result<CatalogOutcome> {
         self.execute_catalog(&parse_catalog_with_version(text, self.version)?)
@@ -534,6 +598,7 @@ impl Engine {
     }
     /// Execute catalog DDL; optional views suppress SQL 42P01/3F000; optional constraints suppress 42704.
     pub fn execute_catalog_optional(&self, statement: &CatalogStatement) -> Result<Option<CatalogOutcome>> {
+        if matches!(statement, CatalogStatement::CreateSequence { .. } | CatalogStatement::DropSequence { .. }) { return Err(Error::Unsupported); }
         let request = lower_catalog_checked(statement, self.version)?;
         match self.inner.execute_catalog(&request).map_err(error) {
             Err(Error::Sql { sqlstate }) if matches!(statement, CatalogStatement::DropView { if_exists: true, .. })
@@ -584,13 +649,28 @@ fn lower_fk_action(action: ForeignKeyAction) -> operations::ForeignKeyAction {
 }
 
 fn reject_optional_catalog(statement: &CatalogStatement) -> Result<()> {
-    if matches!(statement, CatalogStatement::DropView { if_exists: true, .. } | CatalogStatement::AlterTable { action: AlterTableAction::DropConstraint { if_exists: true, .. }, .. }) { Err(Error::Unsupported) } else { Ok(()) }
+    if matches!(statement, CatalogStatement::CreateSequence { .. } | CatalogStatement::DropSequence { .. } | CatalogStatement::DropView { if_exists: true, .. } | CatalogStatement::AlterTable { action: AlterTableAction::DropConstraint { if_exists: true, .. }, .. }) { Err(Error::Unsupported) } else { Ok(()) }
 }
 
 pub(crate) fn validate_catalog(
     statement: &CatalogStatement,
     version: LanguageVersion,
 ) -> Result<()> {
+    if let CatalogStatement::CreateTableWith { table, columns, primary_key, constraints } = statement {
+        if !version.supports_r2_wave3() || !constraints.is_empty() { return Err(Error::Unsupported); }
+        if columns.len() > giggles_core::relational::MAX_COLUMNS || primary_key.len() > giggles_core::relational::MAX_COLUMNS { return Err(Error::Limit); }
+        validate_size(statement)?;
+        for column in columns {
+            if let Some(ColumnDefaultSpec::Nextval(name)) = &column.default
+                && !parser::semantic_relation(name, version) { return Err(Error::Bind("identifier".into())); }
+        }
+        return validate_catalog(&CatalogStatement::CreateTable { table: table.clone(), columns: columns.iter().map(|c| c.column.clone()).collect(), primary_key: primary_key.clone() }, version);
+    }
+    if let CatalogStatement::CreateSequence { name, .. } | CatalogStatement::DropSequence { name, .. } = statement {
+        if !version.supports_r2_wave3() { return Err(Error::Unsupported); }
+        if !parser::semantic_relation(name, version) { return Err(Error::Bind("identifier".into())); }
+        return validate_size(statement);
+    }
     if let CatalogStatement::CreateView { name, .. } | CatalogStatement::DropView { name, .. } = statement {
         if !version.supports_r2_wave2() { return Err(Error::Unsupported); }
         if !parser::semantic_relation(name, version) { return Err(Error::Bind("identifier".into())); }
@@ -617,7 +697,7 @@ pub(crate) fn validate_catalog(
         return validate_size(statement);
     }
     if let CatalogStatement::DropTable { table: name, .. } | CatalogStatement::DropIndex { name, .. } = statement {
-        if !matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) { return Err(Error::Unsupported); }
+        if !matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) { return Err(Error::Unsupported); }
         if !parser::semantic_relation(name, version) { return Err(Error::Bind("identifier".into())); }
         return validate_size(statement);
     }
@@ -654,7 +734,7 @@ pub(crate) fn validate_catalog(
     {
         return Err(Error::Limit);
     }
-    if !matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020)
+    if !matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021)
         && columns.iter().any(|column| column.data_type == CatalogType::Numeric)
     {
         return Err(Error::Unsupported);
@@ -682,6 +762,21 @@ fn lower_catalog_checked(
     }
     validate_catalog(statement, version)?;
     match statement {
+        CatalogStatement::CreateTableWith { table, columns, primary_key, .. } => return Ok(operations::CatalogRequest::CreateTable {
+            table: table.clone(), primary_key: primary_key.clone(), columns: columns.iter().map(|c| {
+                let mut column = lower_column(&c.column);
+                column.default = c.default.as_ref().map(|d| match d {
+                    ColumnDefaultSpec::Value(v) => operations::ColumnDefault::Value(v.clone()),
+                    ColumnDefaultSpec::Nextval(n) => operations::ColumnDefault::Nextval(n.clone()),
+                });
+                column.generated = c.generated.map(|g| match g {
+                    ColumnGenerated::IdentityAlways => operations::Generated::IdentityAlways,
+                    ColumnGenerated::IdentityByDefault => operations::Generated::IdentityByDefault,
+                    ColumnGenerated::Serial => operations::Generated::Serial,
+                });
+                column
+            }).collect(),
+        }),
         CatalogStatement::CreateView { name, query } => return Ok(operations::CatalogRequest::CreateView {
             name: name.clone(), read: match lower_query(query, &Bindings::default(), version)? {
                 TypedQuery::Single(read) => operations::ViewRead::Single(read),
@@ -689,6 +784,8 @@ fn lower_catalog_checked(
             },
         }),
         CatalogStatement::DropView { name, cascade, .. } => return Ok(operations::CatalogRequest::DropView { name: name.clone(), cascade: *cascade }),
+        CatalogStatement::CreateSequence { name, .. } => return Ok(operations::CatalogRequest::CreateSequence { name: name.clone() }),
+        CatalogStatement::DropSequence { name, cascade, .. } => return Ok(operations::CatalogRequest::DropSequence { name: name.clone(), cascade: *cascade }),
         CatalogStatement::AlterTable { table, action: AlterTableAction::AddConstraint { name, constraint } } => return Ok(operations::CatalogRequest::AddConstraint {
             table: table.clone(), name: name.clone(), constraint: match constraint {
                 ConstraintSpec::Unique { columns } => operations::ConstraintSpec::Unique { columns: columns.clone() },
@@ -1258,6 +1355,37 @@ fn local_reference(reference: &LocalRef, version: LanguageVersion) -> Result<ope
     })
 }
 
+pub(crate) fn validate_sequence(statement: &SequenceStatement, version: LanguageVersion) -> Result<()> {
+    if !version.supports_r2_wave3() { return Err(Error::Unsupported); }
+    let (SequenceStatement::Nextval(name) | SequenceStatement::Currval(name) | SequenceStatement::Setval { name, .. }) = statement;
+    if !parser::semantic_relation(name, version) { return Err(Error::Bind("identifier".into())); }
+    if let SequenceStatement::Setval { value, is_called, .. } = statement {
+        for value in std::iter::once(value).chain(is_called) {
+            validate_native_value(value, version)?;
+            if let ValueExpr::Parameter(name) = value { crate::once::parameter_name(name)?; }
+        }
+    }
+    validate_size(statement)
+}
+fn sequence_call(statement: &SequenceStatement, bindings: &Bindings, version: LanguageVersion) -> Result<operations::SequenceCall> {
+    validate_sequence(statement, version)?;
+    if bindings.len() > MAX_BINDINGS { return Err(Error::Limit); }
+    let resolve = |value: &ValueExpr| -> Result<Value> {
+        match value {
+            ValueExpr::Literal(value) => Ok(value.clone()),
+            ValueExpr::Parameter(name) => bindings.get(name).cloned().ok_or_else(|| Error::Bind("parameter missing".into())),
+        }
+    };
+    Ok(match statement {
+        SequenceStatement::Nextval(name) => operations::SequenceCall::Nextval(name.clone()),
+        SequenceStatement::Currval(name) => operations::SequenceCall::Currval(name.clone()),
+        SequenceStatement::Setval { name, value, is_called } => operations::SequenceCall::Setval {
+            name: name.clone(),
+            value: match resolve(value)? { Value::Int(v) => v, _ => return Err(Error::Type) },
+            is_called: is_called.as_ref().map(|v| match resolve(v)? { Value::Bool(b) => Ok(b), _ => Err(Error::Type) }).transpose()?,
+        },
+    })
+}
 pub(crate) fn has_savepoints(block: &Transaction) -> bool {
     block.steps.iter().any(|step| matches!(step,
         TransactionStep::Savepoint(_) | TransactionStep::RollbackTo(_) | TransactionStep::Release(_)))
@@ -1266,6 +1394,7 @@ fn has_typed_steps(block: &Transaction) -> bool {
     block.steps.iter().any(|step| match step {
         TransactionStep::Execute(s) | TransactionStep::Let { statement: s, .. } =>
             matches!(s, Statement::Query(_) | Statement::InsertSelect { .. }),
+        TransactionStep::Sequence { .. } => true,
         _ => false,
     })
 }
@@ -1307,8 +1436,10 @@ pub(crate) fn validate_transaction(
     let typed = has_typed_steps(transaction);
     if typed && !version.supports_r2_wave2() { return Err(Error::Unsupported); }
     let savepoints = has_savepoints(transaction);
-    if savepoints && !typed && (!version.supports_r2_native() || transaction.emit.is_some()
-        || transaction.steps.iter().any(|step| matches!(step, TransactionStep::Let { .. } | TransactionStep::Require(_)))) {
+    if savepoints && !typed && (!version.supports_r2_native()
+        || (!version.supports_r2_wave3() && (transaction.emit.is_some()
+            || transaction.steps.iter().any(|step| matches!(step, TransactionStep::Let { .. }))))
+        || transaction.steps.iter().any(|step| matches!(step, TransactionStep::Require(_)))) {
         return Err(Error::Unsupported);
     }
     let mut nodes = 0;
@@ -1349,6 +1480,11 @@ pub(crate) fn validate_transaction(
             }
             TransactionStep::Savepoint(name) | TransactionStep::RollbackTo(name) | TransactionStep::Release(name) => {
                 identifier(name, version)?;
+            }
+            TransactionStep::Sequence { name, call } => {
+                validate_sequence(call, version)?;
+                if transaction.read_only && !matches!(call, SequenceStatement::Currval(_)) { return Err(Error::Unsupported); }
+                if let Some(name) = name { identifier(name, version)?; locals += 1; }
             }
             TransactionStep::Require(expr) => {
                 if typed { return Err(Error::Unsupported); }
@@ -1941,7 +2077,7 @@ fn validate_parameter_admission(
         validate_size(stmt)?;
         return Ok(());
     }
-    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020)
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
         return validate_bindings_for(bindings, version);
@@ -2034,7 +2170,7 @@ fn validate_transaction_parameters(
     bindings: &Bindings,
     version: LanguageVersion,
 ) -> Result<()> {
-    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020)
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
         return validate_bindings_for(bindings, version);
@@ -2046,7 +2182,8 @@ fn validate_transaction_parameters(
                 statement: stmt, ..
             } => validate_parameter_admission(stmt, bindings, version)?,
             TransactionStep::Require(expr) => reject_numeric_references(expr, bindings)?,
-            TransactionStep::Savepoint(_) | TransactionStep::RollbackTo(_) | TransactionStep::Release(_) => {},
+            TransactionStep::Savepoint(_) | TransactionStep::RollbackTo(_) | TransactionStep::Release(_)
+            | TransactionStep::Sequence { .. } => {},
         }
     }
     reject_numeric_references(&transaction.emit, bindings)
@@ -2204,3 +2341,4 @@ mod numeric_profile_tests {
         assert!(validate_size(&ValueExpr::Literal(Value::Text("Numeric".into()))).is_ok());
     }
 }
+fn sequence_row(value: i64) -> SqlRow { SqlRow { values: vec![Value::Int(value)], version: 0 } }

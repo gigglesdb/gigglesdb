@@ -194,7 +194,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         });
     };
 
-    if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) {
+    if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) {
         add(
             CapabilityInterface::RustText,
             "numeric_parameters",
@@ -208,7 +208,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         );
     }
 
-    if matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) {
+    if matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "numeric_column_declaration", CapabilityState::Implemented,
                 "Legacy native CREATE TABLE: unconstrained NUMERIC, required or nullable. No typmod; v2 catalog writes remain refused.",
@@ -257,8 +257,10 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         }
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "block_savepoints", CapabilityState::Implemented,
-                "SAVEPOINT, ROLLBACK TO and RELEASE between plain block statements on one retained session; a failing step still rolls back the whole block. Blocks with savepoints admit no let/require/emit and cannot be prepared, lowered or used as once bodies.",
-                vec![evidence("crates/giggles-language/tests/native_savepoint_parity.rs", "savepoint_blocks_match_sql")], vec![]);
+                if version.supports_r2_wave3() { "SAVEPOINT, ROLLBACK TO and RELEASE between block statements on one retained session. After a failing step, later statements, SAVEPOINT and RELEASE are skipped without a summary (SQL reports 25P02 for each) until a ROLLBACK TO an existing savepoint recovers; a ROLLBACK TO an unknown savepoint keeps the block aborted (SQL 3B001). A block that ends aborted fails with the original error and changes nothing." } else { "SAVEPOINT, ROLLBACK TO and RELEASE between plain block statements on one retained session; a failing step still rolls back the whole block. Blocks with savepoints admit no let/require/emit and cannot be prepared, lowered or used as once bodies." },
+                { let mut tests = vec![evidence("crates/giggles-language/tests/native_savepoint_parity.rs", "savepoint_blocks_match_sql")];
+                    if version.supports_r2_wave3() { tests.push(evidence("crates/giggles-language/tests/native_recovery21_parity.rs", "full_recovery_matches_sql")); }
+                    tests }, vec![]);
         }
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "typed_parameters", CapabilityState::Implemented,
@@ -272,7 +274,21 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         }
     }
 
-    if matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) {
+    if version.supports_r2_wave3() {
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
+            add(interface, "column_defaults", CapabilityState::Implemented,
+                "CREATE TABLE column DEFAULT (literal or nextval(seq)), GENERATED ALWAYS|BY DEFAULT AS IDENTITY and serial/bigserial through SQL's default validation, stored default text and owned sequences. Text literals are typed (no unknown-literal coercion); no clock defaults.",
+                vec![evidence("crates/giggles-language/tests/native_column_defaults21_parity.rs", "defaults_identity_serial_match_sql")], vec![]);
+        }
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree] {
+            add(interface, "sequences", CapabilityState::Implemented,
+                "CREATE SEQUENCE [IF NOT EXISTS] and DROP SEQUENCE [IF EXISTS] [CASCADE|RESTRICT] via execute_sequence_catalog; nextval/currval/setval standalone (fresh session; currval gives 55000) via execute_sequence, or as block steps sharing the block's session. nextval is not rolled back.",
+                vec![evidence("crates/giggles-language/tests/native_sequence21_parity.rs", "sequences_match_sql"),
+                    evidence("crates/giggles-language/tests/native_sequence21_parity.rs", "block_sequence_calls_match_sql")], vec![]);
+        }
+    }
+
+    if matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 | LanguageVersion::Embedded021) {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "catalog_drop", CapabilityState::Implemented,
                 "Standalone DROP TABLE/INDEX with default RESTRICT or explicit CASCADE/RESTRICT. Shared SQL dependencies and errors; DROP INDEX CASCADE removes FKs bound to a standalone index; legacy Unknown bindings remain Unsupported. Legacy requires empty business state; v2 permits populated state.",
@@ -1800,6 +1816,10 @@ fn rejection_evidence(version: LanguageVersion) -> TestEvidence {
         LanguageVersion::Embedded011 => (
             "crates/giggles-language/tests/once_capabilities.rs",
             "once_selected_manifest_rejections_use_selected_version",
+        ),
+        LanguageVersion::Embedded021 => (
+            "crates/giggles-language/tests/native_recovery21_parity.rs",
+            "recovery_profile_is_opt_in_and_inherits_twenty",
         ),
         LanguageVersion::Embedded020 => (
             "crates/giggles-language/tests/native_view_parity.rs",
