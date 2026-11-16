@@ -108,7 +108,7 @@ pub(super) fn run(
         .map(|(key, _, _)| existing_keys.get(key).copied())
         .collect::<Vec<_>>();
     let inserts = targets.iter().filter(|target| target.is_none()).count();
-    if existing.len().checked_add(inserts).ok_or(Error::Limit)? > MAX_ROWS {
+    if existing.len().checked_add(inserts).ok_or(Error::Limit)? > Context::max_read_rows(session) {
         return Err(Error::Limit);
     }
 

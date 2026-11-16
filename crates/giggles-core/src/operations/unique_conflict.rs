@@ -924,6 +924,7 @@ impl Relational {
             bindings: &bindings,
             used: BTreeSet::new(),
             remaining_value_bytes: MAX_BOUND_VALUE_BYTES,
+            row_limit: crate::relational::MAX_ROWS,
         };
         let bound = (|| -> Result<BoundConflict> {
             Ok(match action {

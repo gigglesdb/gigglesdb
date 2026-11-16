@@ -729,6 +729,7 @@ fn bind_table(
         bindings,
         used: BTreeSet::new(),
         remaining_value_bytes: MAX_BOUND_VALUE_BYTES,
+        row_limit: MAX_ROWS,
     };
     let operation = binder.bind(request, max_read_rows)?;
     // Every recorded name resolved successfully, so used is a subset. Counts
@@ -803,7 +804,8 @@ fn validate_request_nodes(stmt: &Request, nodes: &mut usize) -> Result<()> {
             }
         }
         Request::InsertMany { columns, rows, .. } => {
-            validate_insert_shape(columns, rows)?;
+            // Row counts are engine-specific and checked at bind time.
+            validate_insert_shape(columns, rows, usize::MAX)?;
             let roots = rows
                 .len()
                 .checked_mul(columns.len())
@@ -846,8 +848,8 @@ fn validate_request_nodes(stmt: &Request, nodes: &mut usize) -> Result<()> {
     }
     validate_expression_nodes(pending, nodes)
 }
-fn validate_insert_shape(columns: &[String], rows: &[Vec<Expr>]) -> Result<()> {
-    if columns.len() > crate::relational::MAX_COLUMNS || rows.len() > MAX_INSERT_ROWS {
+fn validate_insert_shape(columns: &[String], rows: &[Vec<Expr>], max_rows: usize) -> Result<()> {
+    if columns.len() > crate::relational::MAX_COLUMNS || rows.len() > max_rows {
         return Err(Error::Limit);
     }
     if columns.is_empty() {
@@ -1063,6 +1065,8 @@ struct Binder<'a> {
     bindings: &'a Bindings,
     used: BTreeSet<String>,
     remaining_value_bytes: usize,
+    /// Engine row ceiling for explicit counts: legacy keeps MAX_ROWS, V2 has none.
+    row_limit: usize,
 }
 impl Binder<'_> {
     fn table(&self) -> Result<&TableDef> {
@@ -1112,7 +1116,7 @@ impl Binder<'_> {
         Ok(value.clone())
     }
     fn count(&mut self, e: &ValueExpr) -> Result<usize> {
-        self.read_count(e, MAX_ROWS)
+        self.read_count(e, self.row_limit)
     }
     fn read_count(&mut self, e: &ValueExpr, maximum: usize) -> Result<usize> {
         match self.value(e)? {
@@ -1505,6 +1509,7 @@ impl Binder<'_> {
         })
     }
     fn bind(&mut self, s: &Request, max_read_rows: usize) -> Result<Operation> {
+        self.row_limit = max_read_rows;
         let RequestParts {
             body: s,
             returning,
@@ -1563,7 +1568,7 @@ impl Binder<'_> {
             Request::InsertMany {
                 columns, rows, cap, ..
             } => {
-                validate_insert_shape(columns, rows)?;
+                validate_insert_shape(columns, rows, self.row_limit)?;
                 self.insert_targets(columns.iter().map(String::as_str))?;
                 let mut seen = BTreeSet::new();
                 let mut indexes = Vec::new();
@@ -2308,11 +2313,9 @@ fn run_complete(
     {
         return run_view(session, table, operation, rows, retained);
     }
-    let input = if matches!(operation, Operation::Read { .. } | Operation::ReadExpressions { .. }) {
-        session.complete_read_table_engine(table)
-    } else {
-        session.complete_table_engine(table)
-    }.map_err(limit)?;
+    // V2 reads and writes share the snapshot-pinned streaming loader; legacy
+    // keeps its bounded complete-table proof for both.
+    let input = session.complete_read_table_engine(table).map_err(limit)?;
     run(session, table, operation, input, retained)
 }
 fn run<C: Context>(
@@ -2377,7 +2380,7 @@ fn run<C: Context>(
     if matches!(
         op,
         Operation::Insert { .. } | Operation::InsertExpressions { .. }
-    ) && rows.len() == MAX_ROWS
+    ) && rows.len() >= s.max_read_rows()
     {
         return Err(Error::Limit);
     }
@@ -2825,7 +2828,7 @@ fn insert_many(
             return Err(core(CoreError::Sql(SqlError::Duplicate)));
         }
     }
-    if existing.len().checked_add(count).ok_or(Error::Limit)? > MAX_ROWS {
+    if existing.len().checked_add(count).ok_or(Error::Limit)? > Context::max_read_rows(session) {
         return Err(Error::Limit);
     }
     // RETURN order is canonical full-PK order, independent of input tuple order.

@@ -143,6 +143,7 @@ impl Engine {
                     bindings,
                     used: BTreeSet::new(),
                     remaining_value_bytes: MAX_BOUND_VALUE_BYTES,
+                    row_limit: MAX_ROWS,
                 };
                 let Operation::Read {
                     filter: bound_filter,

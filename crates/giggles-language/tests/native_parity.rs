@@ -919,3 +919,105 @@ fn arithmetic_zero_divisor_sqlstate_matches_on_both_engines() {
         }
     }
 }
+
+#[cfg(feature = "engine-rocksdb")]
+fn seed(admin: &Admin, table: &str, ids: std::ops::Range<usize>) {
+    let mut writer = admin.sql_session();
+    writer.execute("BEGIN", &[], None).unwrap();
+    for start in ids.clone().step_by(500) {
+        let tuples = (start..(start + 500).min(ids.end)).map(|id| format!("({id},0,{id})")).collect::<Vec<_>>().join(",");
+        writer.execute(&format!("insert into {table} values{tuples}"), &[], None).unwrap();
+    }
+    writer.execute("COMMIT", &[], None).unwrap();
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn native_large_writes_keep_v2_parity_and_legacy_cap() {
+    let (_left_db, left) = Database::fresh(StorageEngine::V2);
+    let (_right_db, right) = Database::fresh(StorageEngine::V2);
+    for admin in [&left, &right] {
+        for table in ["items", "dst", "edge"] {
+            sql(admin, &format!("create table {table}(id bigint primary key, n bigint, u bigint)"));
+        }
+        sql(admin, "alter table items add constraint uq unique(u)");
+        seed(admin, "items", 0..5000);
+        seed(admin, "edge", 0..1024);
+    }
+    let engine = Engine::with_version(left.clone(), LanguageVersion::Embedded021);
+    let dump = |admin: &Admin, table: &str| values(admin.sql_session()
+        .execute(&format!("select * from {table} order by id"), &[], None).unwrap().rows);
+    for (native, statement, affected) in [
+        ("insert into dst from items select id,n,u", "insert into dst select id,n,u from items", 5000),
+        ("update items where id=4999 set n=1", "update items set n=1 where id=4999", 1),
+        ("delete items where id=4998", "delete from items where id=4998", 1),
+        ("insert items set id=8000,n=0,u=8000", "insert into items values(8000,0,8000)", 1),
+        ("insert many into items(id,n,u) values(7000,0,7000),(7001,0,7001) at most 2",
+            "insert into items values(7000,0,7000),(7001,0,7001)", 2),
+        ("insert into items(id,n,u) values(10,5,10) on conflict(id) do update set n=incoming.n",
+            "insert into items values(10,5,10) on conflict(id) do update set n=excluded.n", 1),
+        ("insert into items(id,n,u) values(6000,1,6000) on conflict(id) do nothing",
+            "insert into items values(6000,1,6000) on conflict(id) do nothing", 1),
+        ("update many items where true set n=n+1 at most 5003", "update items set n=n+1", 5003),
+        ("update many edge where true set n=1 at most 1024", "update edge set n=1", 1024),
+        ("insert edge set id=1024,n=0,u=1024", "insert into edge values(1024,0,1024)", 1),
+        ("update many edge where true set n=2 at most 1025", "update edge set n=2", 1025),
+        ("delete many dst where true at most 5000", "delete from dst", 5000),
+    ] {
+        let result = with_sql_parser_forbidden(|| engine.execute_text(native, &Bindings::new()))
+            .unwrap_or_else(|error| panic!("{native}: {error:?}"));
+        let expected = right.sql_session().execute(statement, &[], None).unwrap();
+        assert_eq!((result.affected, expected.affected), (affected, affected as u64), "{native}");
+        for table in ["items", "dst", "edge"] {
+            assert_eq!(dump(&left, table), dump(&right, table), "{native}: {table}");
+        }
+    }
+    assert_eq!(dump(&left, "items").len(), 5003);
+    // Cardinality-explicit semantics remain, now beyond 1,024.
+    for (native, error) in [
+        ("update many edge where true set n=3 at most 1024", Error::TooManyMatches),
+        ("delete many items where true at most 5002", Error::TooManyMatches),
+        ("insert items set id=9000,n=0,u=10", Error::Duplicate),
+        ("update items where id=11 set u=12", Error::Duplicate),
+    ] {
+        assert_eq!(with_sql_parser_forbidden(|| engine.execute_text(native, &Bindings::new())), Err(error), "{native}");
+    }
+    for statement in ["insert into items values(9000,0,10)", "update items set u=12 where id=11"] {
+        assert_eq!(sql(&right, statement), Step::Sql(SqlError::Duplicate), "{statement}");
+        assert_eq!(giggles_core::sqlstate(&CoreError::Sql(SqlError::Duplicate)), "23505");
+    }
+    let result = with_sql_parser_forbidden(|| engine.execute_text("delete many items where true at most 5003", &Bindings::new())).unwrap();
+    assert_eq!(result.affected, 5003);
+    assert_eq!(right.sql_session().execute("delete from items", &[], None).unwrap().affected, 5003);
+    assert_eq!(dump(&left, "items"), dump(&right, "items"));
+    let many = |base: i64, count: i64| {
+        use giggles_core::operations::{Expr, Request, ValueExpr};
+        let literal = |n: i64| Expr::Value(ValueExpr::Literal(Value::Int(n)));
+        Request::InsertMany { table: "dst".into(), columns: vec!["id".into()],
+            rows: (base..base + count).map(|id| vec![literal(id)]).collect(),
+            cap: ValueExpr::Literal(Value::Int(count)) }
+    };
+    let core = giggles_core::operations::Engine::new(left.clone());
+    for (base, count) in [(0, 1024), (2000, 1025)] {
+        assert_eq!(core.execute(&many(base, count), &Bindings::new()).unwrap().affected, count as usize);
+    }
+    assert_eq!(dump(&left, "dst").len(), 2049);
+
+    // Legacy keeps its table and count capacity.
+    let (_legacy_db, legacy) = Database::fresh(StorageEngine::Legacy);
+    sql(&legacy, "create table edge(id bigint primary key, n bigint, u bigint)");
+    seed(&legacy, "edge", 0..1024);
+    let engine = Engine::with_version(legacy.clone(), LanguageVersion::Embedded021);
+    for (native, outcome) in [
+        ("update many edge where true set n=1 at most 1024", Ok(1024)),
+        ("update many edge where true set n=1 at most 1025", Err(Error::Type)),
+        ("insert edge set id=1024,n=0,u=1024", Err(Error::Limit)),
+    ] {
+        let actual = with_sql_parser_forbidden(|| engine.execute_text(native, &Bindings::new())).map(|out| out.affected);
+        assert_eq!(actual, outcome, "{native}");
+    }
+    sql(&legacy, "create table dst(id bigint primary key)");
+    let core = giggles_core::operations::Engine::new(legacy);
+    assert_eq!(core.execute(&many(0, 1025), &Bindings::new()), Err(giggles_core::operations::Error::Limit));
+    assert_eq!(core.execute(&many(0, 1024), &Bindings::new()).unwrap().affected, 1024);
+}

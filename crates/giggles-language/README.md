@@ -493,7 +493,8 @@ aborts the entire insert and its enclosing block.
 
 The tuple limit is 1,024 and the column limit is 64; every tuple must match the
 column count. Each proposed stored row fits 64 KiB, and all proposed full rows
-share a 1 MiB payload budget. The resulting table must remain within 1,024 rows.
+share a 1 MiB payload budget. On legacy the resulting table must remain within
+1,024 rows; V2 has no table ceiling.
 These bounds do not replace the existing 64 KiB input, 4,096-token, 4,096-node or
 64 KiB resolved-value bounds. In particular, a 1,024-tuple typed tree can exceed
 the text token limit when expressed as VALUES. The manifest exposes separate
@@ -724,7 +725,7 @@ before any conflict SET expression evaluates; false or NULL yields
 row obeys the 64 KiB row limit. Inserted, updated and no-op final rows share one
 combined 1 MiB budget, separate from the budget for all incoming proposals.
 RETURN and retained local results are admitted before staging.
-The 1,024-row table ceiling counts actual new inserts, so a full table can still
+The legacy 1,024-row table ceiling counts actual new inserts, so a full table can still
 skip or update existing rows. No new work, transport-decoding or total-heap
 bound is implied.
 
@@ -963,8 +964,10 @@ insert columns are NULL, subject to required-column checks; no defaults exist.
 
 Each statement or block uses one explicit core transaction. Statements and writing
 blocks stage their effects and commit once; read-only blocks release their snapshot
-without a durable commit. This native profile supports tables with at most 1,024
-rows. Core itself can store larger tables: a reverse primary-key probe verifies
+without a durable commit. On legacy, this native profile supports tables with at
+most 1,024 rows; on V2, reads and writes (point and many, insert, upsert,
+`insert into ... from`) accept tables of any size and caps beyond 1,024, and
+once receipts stay bounded at 1,024 rows. Core itself can store larger tables: a reverse primary-key probe verifies
 that the forward scan was complete, and an oversized table returns `Limit`
 before effects, even for a small read or point mutation. A nonempty native insert
 rejects a table already at 1,024 rows. Full scans can additionally hit the 1 MiB result

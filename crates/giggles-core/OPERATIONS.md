@@ -295,7 +295,8 @@ checked before staging. The original `Insert` value-only behavior is unchanged.
 `Request::InsertMany { table, columns, rows, cap }` inserts explicit scalar
 expression tuples under a mandatory cap. `columns` is a nonempty unique list
 of at most 64 target names; every tuple must have matching arity. There are at
-most `MAX_INSERT_ROWS` (1,024) tuples. Structural vector/arity bounds and the
+most `MAX_INSERT_ROWS` (1,024) tuples on legacy; V2 has no tuple-count ceiling
+beyond the input, expression and byte budgets. Structural vector/arity bounds and the
 combined tuple/RETURN root count are checked before constructing traversal
 work. All expression nodes, frozen values, cap and RETURN share the ordinary
 request or enclosing block budgets. RHS expressions have no source-row field
@@ -315,7 +316,8 @@ The canonical complete-primary-key codec defines proposal identity. Repeated
 input identities return `DuplicateTarget`, including identical tuples. This
 check follows all proposed-row validation and precedes existing-key checks.
 An existing key retains the ordinary `Core("Sql(Duplicate)")` diagnostic.
-After key checks, the resulting table must contain at most 1,024 rows. There is
+After key checks, a legacy table must contain at most 1,024 rows (V2: no row
+ceiling). There is
 no replacement, source query or partial acceptance. Conflict handling requires
 the explicit OnConflict wrapper; the plain insert variants keep duplicate errors.
 All proposed rows and requested output are validated before any insertion is
@@ -365,7 +367,8 @@ incoming row, including skipped inputs, under the 64 KiB row and aggregate
 1 MiB `MAX_INSERT_BYTES` bounds. Canonical duplicate input PKs return
 `DuplicateTarget` before existing-row conflict handling. The complete snapshot
 then determines inserts, updates and skips. Capacity counts only new keys: a
-1,024-row table can still update or skip an existing key. Every conflicting
+1,024-row legacy table can still update or skip an existing key; V2 has no
+table capacity. Every conflicting
 winner must pass its guard before any conflict SET RHS evaluates; a false or
 NULL guard returns `ConditionFailed` and aborts the entire statement.
 
@@ -522,8 +525,12 @@ are not used by this path.
 
 These common operations support explicitly selected finite native profiles.
 The engine does not infer a native version or change ordinary SQL update policy.
-It accepts tables with at most 1,024 rows, checks completeness using a reverse
-scan of the full primary key, and rejects larger tables before effects. The
+On legacy it accepts tables with at most 1,024 rows, checks completeness using
+a reverse scan of the full primary key, and rejects larger tables before
+effects. On V2, reads and writes stream the snapshot-pinned table one decoded row
+at a time into complete input (64 MiB retained-input budget), accept any table
+size, and accept explicit caps/limits beyond 1,024; writes stage row by row
+through the SQL V2 write path. Once receipts keep their 1,024-row bound. The
 1 MiB scan result limit and existing row, input, expression and transaction
 bounds still apply. A small point request does not bypass these table limits.
 Task authority, native schema jobs, server opcodes and distributed operations
@@ -711,7 +718,7 @@ ceilings. V2 streams complete table input and accepts nonnegative read limits
 that fit `usize`; output still defaults to 100. V2 explain reports
 `StreamingCompleteTableMaterialization` and `input_rows: usize::MAX` (no fixed
 row ceiling). Filter/order evaluation still materializes complete input in memory;
-byte budgets and mutation/once limits remain. Limits also report the Admin admission/selected-key
+byte budgets and once receipt limits remain; V2 mutations use the same input. Limits also report the Admin admission/selected-key
 configuration and engine byte/expression/binding ceilings.
 
 Explain itself borrows committed catalog metadata and does not call `run`,

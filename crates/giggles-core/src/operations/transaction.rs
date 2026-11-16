@@ -371,6 +371,7 @@ pub(super) fn bind_transaction(
             bindings,
             used,
             remaining_value_bytes,
+            row_limit: MAX_ROWS,
         };
         let bound = match step {
             TransactionStep::Require(expression) => {
@@ -432,6 +433,7 @@ pub(super) fn bind_transaction(
         bindings,
         used,
         remaining_value_bytes,
+        row_limit: MAX_ROWS,
     };
     if let Some(items) = &transaction.emit {
         for item in items {
