@@ -259,6 +259,35 @@ impl Check {
     }
 }
 
+/// SQL/result collection mode. Destination modes omit source-only inventory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectionDialect {
+    PostgresSource,
+    PostgresDestination,
+    GigglesdbDestination,
+}
+
+pub async fn collect_destination(
+    client: &mut Client,
+    objects: &[ObjectSelector],
+    engine: crate::definition::Engine,
+) -> Result<Snapshot, tokio_postgres::Error> {
+    let dialect = if engine == crate::definition::Engine::Gigglesdb {
+        CollectionDialect::GigglesdbDestination
+    } else {
+        CollectionDialect::PostgresDestination
+    };
+    let tx = client
+        .build_transaction()
+        .read_only(true)
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .start()
+        .await?;
+    let snapshot = queries::collect(&tx, objects, dialect).await?;
+    tx.rollback().await?;
+    Ok(snapshot)
+}
+
 /// Opens a consistent, read-only catalog snapshot; performs no installs.
 pub async fn collect(
     client: &mut Client,
@@ -281,7 +310,7 @@ pub async fn collect_in(
     transaction: &Transaction<'_>,
     objects: &[ObjectSelector],
 ) -> Result<Snapshot, tokio_postgres::Error> {
-    queries::collect(transaction, objects).await
+    queries::collect(transaction, objects, CollectionDialect::PostgresSource).await
 }
 
 pub async fn assess<F: Fn(&ColumnType) -> bool>(

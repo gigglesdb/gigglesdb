@@ -74,6 +74,8 @@ pub struct Qualification {
     pub source_observations: usize,
     pub destination_observations: usize,
     pub utf8_readbacks_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_comparison: Option<&'static str>,
     pub external_effects_performed: bool,
 }
 
@@ -292,9 +294,10 @@ async fn prepare(definition: &MigrationDefinition) -> Result<Prepared, Failure> 
         let source_snapshot = Box::pin(preflight::collect(&mut source.client, &catalog_objects))
             .await
             .map_err(|_| infrastructure())?;
-        let destination_snapshot = Box::pin(preflight::collect(
+        let destination_snapshot = Box::pin(preflight::collect_destination(
             &mut destination.client,
             &catalog_objects,
+            definition.destination.engine,
         ))
         .await
         .map_err(|_| infrastructure())?;
@@ -354,12 +357,13 @@ async fn prepare(definition: &MigrationDefinition) -> Result<Prepared, Failure> 
                 table: Some(redactor.redact(&table_name)),
                 column: Some(redactor.redact(&error.column)),
             };
-            let qualified = catalog::build(
+            let qualified = catalog::build_destination(
                 &source_snapshot,
                 &destination_snapshot,
                 &[selection],
                 0,
                 true,
+                definition.destination.engine,
             )
             .map_err(blocker)?;
             for table in qualified {
@@ -393,6 +397,8 @@ async fn prepare(definition: &MigrationDefinition) -> Result<Prepared, Failure> 
             source_observations: source_snapshot.observations.len(),
             destination_observations: destination_snapshot.observations.len(),
             utf8_readbacks_verified: true,
+            destination_comparison: (definition.destination.engine == Engine::Gigglesdb)
+                .then_some("GigglesDB UTF8 byte-order (C) comparison capability"),
             external_effects_performed: false,
         };
         Ok(Prepared {

@@ -4,7 +4,7 @@
 use serde_json::Value;
 use tokio_postgres::Transaction;
 
-use super::{Check, Observation, Snapshot};
+use super::{Check, CollectionDialect, Observation, Snapshot};
 use crate::definition::{ObjectKind, ObjectSelector};
 
 fn literal(text: &str) -> String {
@@ -37,9 +37,13 @@ async fn observe(
     check: Check,
     object: Option<&ObjectSelector>,
     sql: &str,
+    dialect: CollectionDialect,
 ) -> Result<Observation, tokio_postgres::Error> {
-    let sql =
-        format!("SELECT pg_catalog.row_to_json(preflight_row)::text FROM ({sql}) preflight_row");
+    let sql = if dialect == CollectionDialect::GigglesdbDestination {
+        sql.to_owned()
+    } else {
+        format!("SELECT pg_catalog.row_to_json(preflight_row)::text FROM ({sql}) preflight_row")
+    };
     tx.batch_execute("SAVEPOINT skedaddle_preflight_query")
         .await?;
     let result = tx.query(&sql, &[]).await;
@@ -49,7 +53,13 @@ async fn observe(
                 .await?;
             let parsed: Result<Vec<Value>, _> = rows
                 .iter()
-                .map(|row| serde_json::from_str(row.get::<_, &str>(0)))
+                .map(|row| {
+                    if dialect == CollectionDialect::GigglesdbDestination {
+                        crate::gigglesdb::collect::row_json(row)
+                    } else {
+                        serde_json::from_str(row.get::<_, &str>(0)).map_err(|_| ())
+                    }
+                })
                 .collect();
             match parsed {
                 Ok(rows) => (rows, None),
@@ -82,22 +92,40 @@ async fn add(
     check: Check,
     object: Option<&ObjectSelector>,
     sql: &str,
+    dialect: CollectionDialect,
 ) -> Result<(), tokio_postgres::Error> {
     snapshot
         .observations
-        .push(observe(tx, check, object, sql).await?);
+        .push(observe(tx, check, object, sql, dialect).await?);
     Ok(())
 }
 
 pub(super) async fn collect(
     tx: &Transaction<'_>,
     objects: &[ObjectSelector],
+    dialect: CollectionDialect,
 ) -> Result<Snapshot, tokio_postgres::Error> {
     // Do not resolve built-in functions against a caller-controlled schema.
     tx.batch_execute("SET LOCAL search_path = pg_catalog")
         .await?;
     let mut snapshot = Snapshot::default();
-    add(&mut snapshot, tx, Check::Version, None, "SELECT current_setting('server_version_num')::bigint AS version_num, current_setting('server_version') AS version").await?;
+    if dialect == CollectionDialect::GigglesdbDestination {
+        let version_num: String = tx
+            .query_one("SELECT current_setting('server_version_num')", &[])
+            .await?
+            .get(0);
+        let version: String = tx
+            .query_one("SELECT current_setting('server_version')", &[])
+            .await?
+            .get(0);
+        snapshot.observations.push(Observation {
+            check: Check::Version, object: None,
+            sql: "SELECT current_setting('server_version_num'); SELECT current_setting('server_version')".into(),
+            rows: vec![serde_json::json!({"version_num": version_num.parse::<u64>().ok(), "version": version})], error: None,
+        });
+    } else {
+        add(&mut snapshot, tx, Check::Version, None, "SELECT current_setting('server_version_num')::bigint AS version_num, current_setting('server_version') AS version", dialect).await?;
+    }
     let major = snapshot.observations[0]
         .rows
         .first()
@@ -108,67 +136,69 @@ pub(super) async fn collect(
         // Do not run catalogs we have not qualified on an unknown major.
         return Ok(snapshot);
     }
-    for (check, sql) in [
-        (
-            Check::WalLevel,
-            "SELECT current_setting('wal_level') AS wal_level, pg_is_in_recovery() AS in_recovery",
-        ),
-        (
-            Check::SlotHeadroom,
-            "SELECT current_setting('max_replication_slots')::bigint AS maximum, (SELECT count(*) FROM pg_catalog.pg_replication_slots) AS used",
-        ),
-        (
-            Check::WalSenderHeadroom,
-            "SELECT current_setting('max_wal_senders')::bigint AS maximum, (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE backend_type='walsender') AS used",
-        ),
-        (
-            Check::WalRetention,
-            "SELECT setting::bigint AS setting, unit, CASE WHEN setting='-1' THEN -1::bigint ELSE pg_size_bytes(setting || COALESCE(unit,'')) END AS bytes FROM pg_catalog.pg_settings WHERE name='max_slot_wal_keep_size'",
-        ),
-        // pg_ls_waldir reports allocated bytes, never free bytes. External
-        // source-filesystem evidence is separately required by classification.
-        (
-            Check::WalDisk,
-            "SELECT COALESCE(sum(size),0)::bigint AS allocated_wal_bytes, count(*) AS wal_files FROM pg_catalog.pg_ls_waldir()",
-        ),
-        (
-            Check::ReplicationPrivilege,
-            "SELECT rolcanlogin AS login, rolreplication AS replication, rolsuper AS superuser FROM pg_catalog.pg_roles WHERE rolname=current_user",
-        ),
-        (
-            Check::DatabaseCreate,
-            "SELECT has_database_privilege(current_user,current_database(),'CREATE') AS create",
-        ),
-        // Still superuser-only on PG16, PG17 and PG18. Do not confuse the
-        // pg_create_subscription role with event-trigger creation authority.
-        (
-            Check::EventTriggerPrivilege,
-            "SELECT current_setting('server_version_num')::bigint AS version_num, rolsuper AS superuser FROM pg_catalog.pg_roles WHERE rolname=current_user",
-        ),
-        (
-            Check::OriginGrants,
-            "SELECT p.oid::regprocedure::text AS function, has_function_privilege(current_user,p.oid,'EXECUTE') AS execute FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='pg_catalog' AND p.proname ~ '^pg_replication_origin_' ORDER BY p.oid",
-        ),
-        (
-            Check::LargeObjects,
-            "SELECT count(*) AS count FROM pg_catalog.pg_largeobject_metadata",
-        ),
-        (
-            Check::PreparedTransactions,
-            "SELECT gid, owner, database, prepared::text AS prepared FROM pg_catalog.pg_prepared_xacts ORDER BY prepared, gid",
-        ),
-        // pg_stat_activity masks other users' transactions for ordinary roles.
-        // The visibility flag prevents masked rows from becoming a false pass.
-        (
-            Check::LongTransactions,
-            "SELECT (SELECT rolsuper OR pg_has_role(current_user,'pg_read_all_stats','USAGE') FROM pg_catalog.pg_roles WHERE rolname=current_user) AS visible, COALESCE(max(EXTRACT(epoch FROM (clock_timestamp()-xact_start))) FILTER (WHERE pid<>pg_backend_pid()),0)::double precision AS oldest_seconds, count(*) FILTER (WHERE pid<>pg_backend_pid() AND xact_start IS NOT NULL) AS transactions FROM pg_catalog.pg_stat_activity",
-        ),
-        (
-            Check::RestartLocks,
-            "SELECT name, setting, unit, context, pending_restart FROM pg_catalog.pg_settings WHERE name IN ('wal_level','max_replication_slots','max_wal_senders','max_slot_wal_keep_size') ORDER BY name",
-        ),
-    ] {
-        add(&mut snapshot, tx, check, None, sql).await?;
+    if dialect == CollectionDialect::PostgresSource {
+        for (check, sql) in [
+            (
+                Check::WalLevel,
+                "SELECT current_setting('wal_level') AS wal_level, pg_is_in_recovery() AS in_recovery",
+            ),
+            (
+                Check::SlotHeadroom,
+                "SELECT current_setting('max_replication_slots')::bigint AS maximum, (SELECT count(*) FROM pg_catalog.pg_replication_slots) AS used",
+            ),
+            (
+                Check::WalSenderHeadroom,
+                "SELECT current_setting('max_wal_senders')::bigint AS maximum, (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE backend_type='walsender') AS used",
+            ),
+            (
+                Check::WalRetention,
+                "SELECT setting::bigint AS setting, unit, CASE WHEN setting='-1' THEN -1::bigint ELSE pg_size_bytes(setting || COALESCE(unit,'')) END AS bytes FROM pg_catalog.pg_settings WHERE name='max_slot_wal_keep_size'",
+            ),
+            // pg_ls_waldir reports allocated bytes, never free bytes. External
+            // source-filesystem evidence is separately required by classification.
+            (
+                Check::WalDisk,
+                "SELECT COALESCE(sum(size),0)::bigint AS allocated_wal_bytes, count(*) AS wal_files FROM pg_catalog.pg_ls_waldir()",
+            ),
+            (
+                Check::ReplicationPrivilege,
+                "SELECT rolcanlogin AS login, rolreplication AS replication, rolsuper AS superuser FROM pg_catalog.pg_roles WHERE rolname=current_user",
+            ),
+            (
+                Check::DatabaseCreate,
+                "SELECT has_database_privilege(current_user,current_database(),'CREATE') AS create",
+            ),
+            // Still superuser-only on PG16, PG17 and PG18. Do not confuse the
+            // pg_create_subscription role with event-trigger creation authority.
+            (
+                Check::EventTriggerPrivilege,
+                "SELECT current_setting('server_version_num')::bigint AS version_num, rolsuper AS superuser FROM pg_catalog.pg_roles WHERE rolname=current_user",
+            ),
+            (
+                Check::OriginGrants,
+                "SELECT p.oid::regprocedure::text AS function, has_function_privilege(current_user,p.oid,'EXECUTE') AS execute FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='pg_catalog' AND p.proname ~ '^pg_replication_origin_' ORDER BY p.oid",
+            ),
+            (
+                Check::LargeObjects,
+                "SELECT count(*) AS count FROM pg_catalog.pg_largeobject_metadata",
+            ),
+            (
+                Check::PreparedTransactions,
+                "SELECT gid, owner, database, prepared::text AS prepared FROM pg_catalog.pg_prepared_xacts ORDER BY prepared, gid",
+            ),
+            // pg_stat_activity masks other users' transactions for ordinary roles.
+            // The visibility flag prevents masked rows from becoming a false pass.
+            (
+                Check::LongTransactions,
+                "SELECT (SELECT rolsuper OR pg_has_role(current_user,'pg_read_all_stats','USAGE') FROM pg_catalog.pg_roles WHERE rolname=current_user) AS visible, COALESCE(max(EXTRACT(epoch FROM (clock_timestamp()-xact_start))) FILTER (WHERE pid<>pg_backend_pid()),0)::double precision AS oldest_seconds, count(*) FILTER (WHERE pid<>pg_backend_pid() AND xact_start IS NOT NULL) AS transactions FROM pg_catalog.pg_stat_activity",
+            ),
+            (
+                Check::RestartLocks,
+                "SELECT name, setting, unit, context, pending_restart FROM pg_catalog.pg_settings WHERE name IN ('wal_level','max_replication_slots','max_wal_senders','max_slot_wal_keep_size') ORDER BY name",
+            ),
+        ] {
+            add(&mut snapshot, tx, check, None, sql, dialect).await?;
+        }
     }
 
     // Inventory only schemas named by the selection. With an empty selection
@@ -191,7 +221,7 @@ pub(super) async fn collect(
         // extension objects outside the selected schemas.
         (Check::Extensions, "SELECT e.extname AS name,e.extversion AS version,n.nspname AS schema,e.extrelocatable AS relocatable FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid=e.extnamespace ORDER BY e.extname".into()),
     ] {
-        add(&mut snapshot, tx, check, None, &sql).await?;
+        add(&mut snapshot, tx, check, None, &sql, dialect).await?;
     }
 
     for object in objects {
@@ -208,6 +238,7 @@ pub(super) async fn collect(
                     literal(&object.name),
                     literal(&format!("{:?}", object.kind))
                 ),
+                dialect,
             )
             .await?;
             continue;
@@ -243,12 +274,12 @@ pub(super) async fn collect(
             error,
         });
         let oid = table_oid(object);
-        add(&mut snapshot, tx, Check::Table, Some(object), &format!("SELECT c.relkind::text AS kind,c.relpersistence::text AS persistence,c.relreplident::text AS replica_identity,c.relrowsecurity AS rls,c.relforcerowsecurity AS force_rls,row_security_active(c.oid) AS rls_active FROM pg_catalog.pg_class c WHERE c.oid IN ({oid})")).await?;
+        add(&mut snapshot, tx, Check::Table, Some(object), &format!("SELECT c.relkind::text AS kind,c.relpersistence::text AS persistence,c.relreplident::text AS replica_identity,c.relrowsecurity AS rls,c.relforcerowsecurity AS force_rls,row_security_active(c.oid) AS rls_active FROM pg_catalog.pg_class c WHERE c.oid IN ({oid})"), dialect).await?;
         let keys = format!(
             "SELECT c.relreplident::text AS replica_identity,ic.relname AS name,i.indisprimary AS primary,i.indisunique AS unique,i.indisvalid AS valid,i.indisready AS ready,i.indimmediate AS immediate,i.indisreplident AS identity_index,(i.indpred IS NOT NULL) AS partial,(i.indexprs IS NOT NULL) AS expression,COALESCE((SELECT bool_and(a.attnotnull) FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,ord) LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.attnum WHERE k.ord<=i.indnkeyatts),false) AS not_null,ARRAY(SELECT a.attname FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,ord) JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.attnum WHERE k.ord<=i.indnkeyatts ORDER BY k.ord)AS columns,am.amname AS access_method,ARRAY(SELECT json_build_object('column',a.attname,'desc',(i.indoption[k.ord::int-1] & 1)<>0,'nulls_first',(i.indoption[k.ord::int-1] & 2)<>0,'collation_schema',cn.nspname,'collation_name',coll.collname,'opclass_schema',opn.nspname,'opclass_name',op.opcname,'opclass_default',op.opcdefault,'opclass_input_oid',op.opcintype::bigint,'opfamily_schema',ofn.nspname,'opfamily_name',opf.opfname) FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,ord) JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.attnum JOIN pg_catalog.pg_opclass op ON op.oid=i.indclass[k.ord::int-1] JOIN pg_catalog.pg_namespace opn ON opn.oid=op.opcnamespace JOIN pg_catalog.pg_opfamily opf ON opf.oid=op.opcfamily JOIN pg_catalog.pg_namespace ofn ON ofn.oid=opf.opfnamespace LEFT JOIN pg_catalog.pg_collation coll ON coll.oid=i.indcollation[k.ord::int-1] LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid=coll.collnamespace WHERE k.ord<=i.indnkeyatts ORDER BY k.ord) AS key_columns FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_index i ON i.indrelid=c.oid LEFT JOIN pg_catalog.pg_class ic ON ic.oid=i.indexrelid LEFT JOIN pg_catalog.pg_am am ON am.oid=ic.relam WHERE c.oid IN ({oid}) ORDER BY ic.relname"
         );
         for check in [Check::Key, Check::ReplicaIdentity, Check::MutableKeys] {
-            add(&mut snapshot, tx, check, Some(object), &keys).await?;
+            add(&mut snapshot, tx, check, Some(object), &keys, dialect).await?;
         }
         // Scan actual data for each nullable unique index, grouping composite
         // keys with NULLs (SQL UNIQUE normally allows those duplicate groups).
@@ -285,6 +316,7 @@ pub(super) async fn collect(
             Check::NullableKeyDuplicates,
             Some(object),
             &duplicates,
+            dialect,
         )
         .await?;
         // Failed key inspection must not imply there were no duplicate keys.
@@ -348,7 +380,7 @@ pub(super) async fn collect(
                 ),
             ),
         ] {
-            add(&mut snapshot, tx, check, Some(object), &sql).await?;
+            add(&mut snapshot, tx, check, Some(object), &sql, dialect).await?;
         }
     }
     Ok(snapshot)

@@ -229,6 +229,43 @@ impl TypeResolver for QualifiedResolver {
     }
 }
 
+/// Qualify an engine-bound destination comparison capability. GigglesDB has
+/// UTF8 byte ordering, not fabricated pg_collation identities. Locale-aware
+/// source keys must remain blocked.
+pub fn build_destination(
+    source: &Snapshot,
+    destination: &Snapshot,
+    selections: &[TableSelection],
+    schema_version: u64,
+    utf8_encoding_verified: bool,
+    engine: crate::definition::Engine,
+) -> Result<Vec<TableCatalog>> {
+    let tables = build(
+        source,
+        destination,
+        selections,
+        schema_version,
+        utf8_encoding_verified,
+    )?;
+    if engine == crate::definition::Engine::Gigglesdb {
+        for table in &tables {
+            for key in &table.key.columns {
+                if let Some(name) = &key.collation
+                    && !crate::gigglesdb::collect::ByteOrderUtf8::accepts_source_collation(name)
+                {
+                    return Err(blocked(
+                        &key.name,
+                        "collation",
+                        "GigglesDB destination capability is C byte comparison with UTF8 only",
+                        "Use a source key with explicit pg_catalog.C/POSIX ordering.",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(tables)
+}
+
 /// Assemble selected tables. `utf8_encoding_verified` means BOTH server_encoding
 /// and client_encoding were read back as UTF8 on EACH endpoint. Snapshot lacks
 /// encoding evidence: client wire encoding alone cannot qualify catalog types.
