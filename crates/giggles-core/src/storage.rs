@@ -12,6 +12,11 @@ pub(crate) mod operation_adapter;
 pub mod replica;
 #[cfg(feature = "engine-rocksdb")]
 pub mod replicated;
+pub mod range_api;
+#[cfg(feature = "engine-rocksdb")]
+mod range;
+#[cfg(feature = "engine-rocksdb")]
+mod cluster;
 pub mod roles;
 mod secondary_index;
 mod secondary_index_catalog;

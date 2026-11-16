@@ -8,6 +8,7 @@ mod policy;
 mod scalar;
 mod storage;
 pub use storage::replica;
+pub use storage::range_api;
 #[cfg(feature = "engine-rocksdb")]
 pub use storage::replicated;
 pub use storage::roles;
