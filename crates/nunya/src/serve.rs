@@ -16,7 +16,7 @@ use rustls::{
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, atomic::{AtomicBool, Ordering}},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -88,21 +88,34 @@ pub(crate) struct Revisions {
 pub(crate) struct ReloadableLog(
     pub(crate) Arc<RwLock<Box<dyn crate::readlog::ReadLog>>>,
     pub(crate) Arc<RwLock<Revisions>>,
+    pub(crate) Arc<AtomicBool>,
 );
+impl ReloadableLog {
+    /// Whether the last audit write succeeded, initially true.
+    pub(crate) fn last_write_ok(&self) -> bool { self.2.load(Ordering::Relaxed) }
+}
 impl crate::readlog::ReadLog for ReloadableLog {
     fn write_lifecycle(&self, record: &crate::readlog::LifecycleRecord) -> Result<(), crate::error::Refusal> {
-        self.0.read().map_err(|_| crate::error::Refusal::new(
-            crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))?.write_lifecycle(record)
+        let result = (|| {
+            self.0.read().map_err(|_| crate::error::Refusal::new(
+                crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))?.write_lifecycle(record)
+        })();
+        self.2.store(result.is_ok(), Ordering::Relaxed);
+        result
     }
     fn write(&self, record: &crate::readlog::ReadLogRecord) -> Result<(), crate::error::Refusal> {
-        let sink = self.0.read().map_err(|_| crate::error::Refusal::new(
-            crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))?;
-        let revisions = self.1.read().map_err(|_| crate::error::Refusal::new(
-            crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))?;
-        let mut stamped = record.clone();
-        stamped.policy_revision.get_or_insert_with(|| revisions.policy.clone());
-        stamped.config_revision.get_or_insert_with(|| revisions.config.clone());
-        sink.write(&stamped)
+        let result = (|| {
+            let sink = self.0.read().map_err(|_| crate::error::Refusal::new(
+                crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))?;
+            let revisions = self.1.read().map_err(|_| crate::error::Refusal::new(
+                crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))?;
+            let mut stamped = record.clone();
+            stamped.policy_revision.get_or_insert_with(|| revisions.policy.clone());
+            stamped.config_revision.get_or_insert_with(|| revisions.config.clone());
+            sink.write(&stamped)
+        })();
+        self.2.store(result.is_ok(), Ordering::Relaxed);
+        result
     }
 }
 /// Owned schema connection driver, aborted on every exit path.
@@ -314,17 +327,26 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         None
     };
     let hub = crate::reload::Hub::new(&config.policy, config.policy_watch_ms)?;
+    hub.configure_routes(postgres_route.iter().chain(spanner_route.iter()).cloned().collect())?;
     runtime.set_lifecycle_log(Arc::new(hub.log.clone()));
     hub.log.1.write().map_err(|_| "read log lock unavailable")?.config = config.revision.clone();
     let policy = hub.policy();
     let (reload_tx, reload_rx) = mpsc::channel(1);
     let admin_hub = hub.clone();
     let status_hub = hub.clone();
+    let metrics_runtime = runtime.clone();
+    let ready_runtime = runtime.clone();
+    let ready_hub = hub.clone();
     let mut admin = AbortTask(tokio::spawn(crate::admin::serve_admin(
         config.admin_listen,
-        Arc::new(move || admin_hub.metrics()),
+        Arc::new(move || {
+            let mut metrics = admin_hub.metrics();
+            metrics.extend(metrics_runtime.metrics());
+            metrics
+        }),
         reload_tx,
         Arc::new(move || status_hub.status()),
+        Arc::new(move || ready_hub.readiness(ready_hub.log.last_write_ok(), ready_runtime.store_last_write_ok())),
     )));
     let reload_hub = hub.clone();
     let reload_path = config.policy.clone();
@@ -589,6 +611,46 @@ async fn run_postgres(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    #[test]
+    fn audit_availability_tracks_both_write_kinds_and_recovers() {
+        use crate::readlog::{ReadLog, ReadLogRecord, LifecycleRecord, LifecycleKind, LifecycleActor};
+        struct Sink(Arc<AtomicBool>);
+        impl ReadLog for Sink {
+            fn write(&self, _: &ReadLogRecord) -> Result<(), crate::error::Refusal> {
+                if self.0.load(Ordering::Relaxed) { Ok(()) } else {
+                    Err(crate::error::Refusal::new(crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))
+                }
+            }
+            fn write_lifecycle(&self, _: &LifecycleRecord) -> Result<(), crate::error::Refusal> {
+                self.write(&record())
+            }
+        }
+        fn record() -> ReadLogRecord {
+            ReadLogRecord {
+                ts_unix_ms: 1, principal: crate::token::PrincipalId([1; 16]),
+                session: crate::token::SessionId([2; 16]), scope: crate::token::ScopeId([3; 16]),
+                connection: None, credential_id: None, route: "postgres".into(),
+                policy_revision: None, config_revision: None, statement_fingerprint: "test".into(),
+                statement: "test".into(), outcome: crate::readlog::Outcome::Allowed, rows: 0, tokens_released: vec![],
+            }
+        }
+        let available = Arc::new(AtomicBool::new(true));
+        let log = ReloadableLog(Arc::new(RwLock::new(Box::new(Sink(available.clone())))),
+            Arc::new(RwLock::new(Revisions::default())), Arc::new(AtomicBool::new(true)));
+        let lifecycle = LifecycleRecord {
+            kind: LifecycleKind::SessionEnded, at_ms: 1, principal: String::new(), session: None,
+            route: None, connection: None, actor: LifecycleActor::System, reason: "requested",
+        };
+        assert!(log.last_write_ok());
+        for lifecycle_write in [false, true] {
+            for ok in [false, true] {
+                available.store(ok, Ordering::Relaxed);
+                let result = if lifecycle_write { log.write_lifecycle(&lifecycle) } else { log.write(&record()) };
+                assert_eq!(result.is_ok(), ok);
+                assert_eq!(log.last_write_ok(), ok);
+            }
+        }
+    }
     #[tokio::test]
     async fn route_failure_cancels_initializing_sibling() {
         let (tx, rx) = tokio::sync::watch::channel(false);

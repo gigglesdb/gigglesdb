@@ -3,13 +3,13 @@ use super::{
     authority::{Authority, ConfigPrincipal, RevocationHook, SessionLimits},
     model::{EndReason, Verifier},
     registry::{ConnectionRegistry, EndReason as ConnectionEndReason},
-    store::{RedbStore, StoreError},
+    store::{RedbStore, StoreError, Store, StoreMeta, ReadTxn, WriteTxn, ScanRows},
 };
 use crate::{
     config::{SessionSettings, StandingSection},
     token::{PrincipalId, SessionId, keys::RootKey},
 };
-use std::{fmt, path::Path, sync::{Arc, OnceLock, Weak}, time::Duration};
+use std::{fmt, path::Path, sync::{Arc, OnceLock, Weak, atomic::{AtomicBool, AtomicU64, Ordering}}, time::Duration};
 use crate::readlog::{ReadLog, LifecycleRecord, LifecycleKind, LifecycleActor};
 
 /// Delay between service state maintenance passes.
@@ -35,20 +35,87 @@ pub struct MaintenanceOutcome {
 /// Shared registry of access-session connections.
 pub type Registry = ConnectionRegistry<SessionId, PrincipalId>;
 
+struct StoreHealth {
+    failures: AtomicU64,
+    last_write_ok: AtomicBool,
+}
+impl Default for StoreHealth {
+    fn default() -> Self {
+        Self { failures: AtomicU64::new(0), last_write_ok: AtomicBool::new(true) }
+    }
+}
+impl StoreHealth {
+    fn record(&self, ok: bool) {
+        if !ok { self.failures.fetch_add(1, Ordering::Relaxed); }
+        self.last_write_ok.store(ok, Ordering::Relaxed);
+    }
+}
+struct CountingStore {
+    inner: Arc<dyn Store>,
+    health: Arc<StoreHealth>,
+}
+struct CountingWrite<'a> {
+    inner: Box<dyn WriteTxn + 'a>,
+    health: &'a StoreHealth,
+}
+impl Store for CountingStore {
+    fn meta(&self) -> &StoreMeta { self.inner.meta() }
+    fn now_ms(&self) -> u64 { self.inner.now_ms() }
+    fn read(&self) -> Result<Box<dyn ReadTxn + '_>, StoreError> { self.inner.read() }
+    fn write(&self) -> Result<Box<dyn WriteTxn + '_>, StoreError> {
+        match self.inner.write() {
+            Ok(inner) => Ok(Box::new(CountingWrite { inner, health: &self.health })),
+            Err(error) => { self.health.record(false); Err(error) }
+        }
+    }
+}
+impl ReadTxn for CountingWrite<'_> {
+    fn get(&self, t: super::schema::Table, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.get(t, key)
+    }
+    fn scan_prefix(&self, t: super::schema::Table, prefix: &[u8]) -> Result<ScanRows, StoreError> {
+        self.inner.scan_prefix(t, prefix)
+    }
+}
+impl WriteTxn for CountingWrite<'_> {
+    fn put(&mut self, t: super::schema::Table, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.inner.put(t, key, value)
+    }
+    fn delete(&mut self, t: super::schema::Table, key: &[u8]) -> Result<bool, StoreError> {
+        self.inner.delete(t, key)
+    }
+    fn commit(self: Box<Self>) -> Result<(), StoreError> {
+        let result = self.inner.commit();
+        self.health.record(result.is_ok());
+        result
+    }
+}
+#[derive(Default)]
+struct EndCounters {
+    revoked: AtomicU64,
+    expired: AtomicU64,
+}
 struct RegistryHook {
     registry: Registry,
     authority: Weak<Authority>,
     log: Arc<OnceLock<Arc<dyn ReadLog>>>,
+    ends: Arc<EndCounters>,
 }
 impl RevocationHook for RegistryHook {
     fn session_ended(&self, session: SessionId, principal: PrincipalId, reason: EndReason) {
         let connection_reason = match reason {
-            EndReason::Expired | EndReason::IdleTimeout => ConnectionEndReason::Expired,
+            EndReason::Expired | EndReason::IdleTimeout => {
+                self.ends.expired.fetch_add(1, Ordering::Relaxed);
+                ConnectionEndReason::Expired
+            },
             EndReason::Requested
             | EndReason::AdminRevoked
             | EndReason::PrincipalDisabled
             | EndReason::ConfigRemoved
-            | EndReason::GrantRemoved => ConnectionEndReason::Revoked,
+            | EndReason::GrantRemoved => {
+                self.ends.revoked.fetch_add(1, Ordering::Relaxed);
+                ConnectionEndReason::Revoked
+            },
         };
         self.registry.signal_session(&session, connection_reason);
         let route = self.authority.upgrade()
@@ -77,6 +144,8 @@ pub struct StateRuntime {
     /// Open connections shared by both routes.
     pub registry: Registry,
     lifecycle_log: Arc<OnceLock<Arc<dyn ReadLog>>>,
+    store_health: Arc<StoreHealth>,
+    ends: Arc<EndCounters>,
 }
 impl fmt::Debug for StateRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -97,6 +166,25 @@ fn store_error(error: StoreError) -> String {
     }
 }
 impl StateRuntime {
+    /// Whether the most recent store write attempt succeeded, initially true.
+    pub fn store_last_write_ok(&self) -> bool {
+        self.store_health.last_write_ok.load(Ordering::Relaxed)
+    }
+    /// Return data-free session, connection and storage metrics.
+    pub fn metrics(&self) -> Vec<(String, u64)> {
+        let counters = self.authority.counters();
+        vec![
+            ("nunya_sessions_active".into(), self.authority.active_session_count() as u64),
+            ("nunya_connections_open".into(), self.registry.len() as u64),
+            ("nunya_sessions_issued_total".into(), counters.sessions_issued),
+            ("nunya_sessions_renewed_total".into(), counters.sessions_renewed),
+            ("nunya_sessions_revoked_total".into(), self.ends.revoked.load(Ordering::Relaxed)),
+            ("nunya_sessions_expired_total".into(), self.ends.expired.load(Ordering::Relaxed)),
+            ("nunya_session_resumes_refused_total".into(), counters.resumes_refused),
+            ("nunya_store_write_failures_total".into(), self.store_health.failures.load(Ordering::Relaxed)),
+        ]
+    }
+
     /// Attach the startup lifecycle audit sink once it is available.
     pub fn set_lifecycle_log(&self, log: Arc<dyn ReadLog>) {
         let _ = self.lifecycle_log.set(log);
@@ -157,16 +245,21 @@ impl StateRuntime {
         clock: super::store::Clock,
     ) -> Arc<Self> {
         let store = Arc::new(RedbStore::with_clock(state_dir, &tests::root(), clock).unwrap());
+        let store_health = Arc::new(StoreHealth::default());
+        let store = Arc::new(CountingStore { inner: store, health: store_health.clone() });
+        let ends = Arc::new(EndCounters::default());
         let authority = Authority::load(store, limits).unwrap();
         let registry = Registry::new();
         let lifecycle_log = Arc::new(OnceLock::new());
         authority.set_hook(Arc::new(RegistryHook {
-            registry: registry.clone(), authority: Arc::downgrade(&authority), log: lifecycle_log.clone(),
+            registry: registry.clone(), authority: Arc::downgrade(&authority), log: lifecycle_log.clone(), ends: ends.clone(),
         }));
         Arc::new(Self {
             authority,
             registry,
             lifecycle_log,
+            store_health,
+            ends,
         })
     }
 
@@ -181,6 +274,9 @@ impl StateRuntime {
             eprintln!("serve: state_dir/tasks is from an earlier version and is ignored");
         }
         let store = Arc::new(RedbStore::open(state_dir, root_key).map_err(store_error)?);
+        let store_health = Arc::new(StoreHealth::default());
+        let store = Arc::new(CountingStore { inner: store, health: store_health.clone() });
+        let ends = Arc::new(EndCounters::default());
         let authority = Authority::load(
             store,
             SessionLimits {
@@ -192,7 +288,7 @@ impl StateRuntime {
         let registry = Registry::new();
         let lifecycle_log = Arc::new(OnceLock::new());
         authority.set_hook(Arc::new(RegistryHook {
-            registry: registry.clone(), authority: Arc::downgrade(&authority), log: lifecycle_log.clone(),
+            registry: registry.clone(), authority: Arc::downgrade(&authority), log: lifecycle_log.clone(), ends: ends.clone(),
         }));
         let principals: Vec<_> = standing
             .iter()
@@ -213,6 +309,8 @@ impl StateRuntime {
             authority,
             registry,
             lifecycle_log,
+            store_health,
+            ends,
         }))
     }
 }
@@ -226,6 +324,81 @@ mod tests {
     };
     use std::path::PathBuf;
 
+    #[test]
+    fn failed_write_begin_counts_once() {
+        struct Unavailable(Arc<RedbStore>);
+        impl Store for Unavailable {
+            fn meta(&self) -> &StoreMeta { self.0.meta() }
+            fn now_ms(&self) -> u64 { self.0.now_ms() }
+            fn read(&self) -> Result<Box<dyn ReadTxn + '_>, StoreError> { self.0.read() }
+            fn write(&self) -> Result<Box<dyn WriteTxn + '_>, StoreError> { Err(StoreError::Io) }
+        }
+        let dir = TestDir::new();
+        let health = Arc::new(StoreHealth::default());
+        let store = CountingStore {
+            inner: Arc::new(Unavailable(Arc::new(RedbStore::open(&dir.0, &root()).unwrap()))),
+            health: health.clone(),
+        };
+        assert!(store.write().is_err());
+        assert_eq!(health.failures.load(Ordering::Relaxed), 1);
+        assert!(!health.last_write_ok.load(Ordering::Relaxed));
+    }
+    #[test]
+    fn store_failures_count_and_recover_on_commit() {
+        let dir = TestDir::new();
+        let inner = Arc::new(RedbStore::open(&dir.0, &root()).unwrap());
+        let health = Arc::new(StoreHealth::default());
+        let store = CountingStore { inner: inner.clone(), health: health.clone() };
+        assert!(health.last_write_ok.load(Ordering::Relaxed));
+        inner.fail_commits(true);
+        assert!(store.write().unwrap().commit().is_err());
+        assert_eq!(health.failures.load(Ordering::Relaxed), 1);
+        assert!(!health.last_write_ok.load(Ordering::Relaxed));
+        inner.fail_commits(false);
+        drop(store.write().unwrap());
+        assert!(!health.last_write_ok.load(Ordering::Relaxed));
+        store.write().unwrap().commit().unwrap();
+        assert!(health.last_write_ok.load(Ordering::Relaxed));
+        assert_eq!(health.failures.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn metrics_count_session_events_and_connection_guards() {
+        let dir = TestDir::new();
+        let runtime = dir.open(&[]);
+        let session = acquire(&runtime);
+        let a = &runtime.authority;
+        let replay = a.acquire_session(session.principal, AcquireRequest {
+            route: session.route.clone(), mode: None, lifetime_ms: None, isolated: false,
+            label: None, idempotency_key: "acquire".into(), verifier: Verifier(verifier()), secret_sha256: [1; 32],
+        }).unwrap();
+        assert_eq!(replay.id, session.id);
+        assert_eq!(a.counters().sessions_issued, 1);
+        assert_eq!(a.active_session_count(), 1);
+        a.renew(session.principal, session.id, None, None).unwrap();
+        assert_eq!(a.counters().sessions_renewed, 1);
+        a.resume(session.principal, session.id).unwrap();
+        assert_eq!(a.counters().resumes_refused, 0);
+        let (guard, _) = runtime.registry.register(session.id, session.principal, "postgres", None);
+        let values = runtime.metrics();
+        assert_eq!(values, vec![
+            ("nunya_sessions_active".into(), 1), ("nunya_connections_open".into(), 1),
+            ("nunya_sessions_issued_total".into(), 1), ("nunya_sessions_renewed_total".into(), 1),
+            ("nunya_sessions_revoked_total".into(), 0), ("nunya_sessions_expired_total".into(), 0),
+            ("nunya_session_resumes_refused_total".into(), 0), ("nunya_store_write_failures_total".into(), 0),
+        ]);
+        a.revoke(session.id, EndReason::Requested).unwrap();
+        a.revoke(session.id, EndReason::Requested).unwrap();
+        assert!(a.resume(session.principal, session.id).is_err());
+        assert!(a.renew(session.principal, session.id, None, None).is_err());
+        drop(guard);
+        let values = runtime.metrics();
+        assert_eq!(values[0].1, 0);
+        assert_eq!(values[1].1, 0);
+        assert_eq!(values[3].1, 1);
+        assert_eq!(values[4].1, 1);
+        assert_eq!(values[6].1, 1);
+        assert!(runtime.store_last_write_ok());
+    }
     #[derive(Default)]
     struct Audit(std::sync::Mutex<Vec<LifecycleRecord>>);
     impl ReadLog for Audit {
@@ -369,6 +542,10 @@ mod tests {
             }
         );
         assert_eq!(signal.try_ended(), Some(ConnectionEndReason::Expired));
+        assert_eq!(runtime.metrics()[0].1, 0);
+        assert_eq!(runtime.metrics()[5].1, 1);
+        assert_eq!(runtime.authority.sweep().unwrap(), 0);
+        assert_eq!(runtime.metrics()[5].1, 1);
         let records = log.0.lock().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].kind, LifecycleKind::SessionEnded);
@@ -498,7 +675,11 @@ mod tests {
             let session = SessionId::random();
             let principal = PrincipalId::random();
             let (_guard, signal) = registry.register(session, principal, "postgres", None);
-            RegistryHook { registry, authority: Weak::new(), log: Arc::new(OnceLock::new()) }.session_ended(session, principal, reason);
+            let ends = Arc::new(EndCounters::default());
+            RegistryHook { registry, authority: Weak::new(), log: Arc::new(OnceLock::new()), ends: ends.clone() }.session_ended(session, principal, reason);
+            let expired = matches!(reason, EndReason::Expired | EndReason::IdleTimeout);
+            assert_eq!(ends.expired.load(Ordering::Relaxed), u64::from(expired));
+            assert_eq!(ends.revoked.load(Ordering::Relaxed), u64::from(!expired));
             let expected = match reason {
                 EndReason::Expired | EndReason::IdleTimeout => ConnectionEndReason::Expired,
                 EndReason::Requested

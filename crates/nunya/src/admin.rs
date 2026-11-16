@@ -11,6 +11,7 @@ use tokio::{
 const REQUEST_LIMIT: usize = 8192;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 type Status = Arc<dyn Fn() -> String + Send + Sync>;
+type Ready = Arc<dyn Fn() -> (bool, String) + Send + Sync>;
 type Metrics = Arc<dyn Fn() -> Vec<(String, u64)> + Send + Sync>;
 
 /// Serve one bounded HTTP/1.1 request per connection until the listener fails.
@@ -19,6 +20,7 @@ pub async fn serve_admin(
     metrics: Arc<dyn Fn() -> Vec<(String, u64)> + Send + Sync>,
     reload: mpsc::Sender<()>,
     status: Status,
+    ready: Ready,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     loop {
@@ -26,9 +28,10 @@ pub async fn serve_admin(
         let metrics = metrics.clone();
         let reload = reload.clone();
         let status = status.clone();
+        let ready = ready.clone();
         tokio::spawn(async move {
             // Client failures contain no diagnostics and do not stop the listener.
-            let _ = handle(stream, &metrics, &reload, &status, READ_TIMEOUT).await;
+            let _ = handle(stream, &metrics, &reload, &status, &ready, READ_TIMEOUT).await;
         });
     }
 }
@@ -145,6 +148,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     metrics: &Metrics,
     reload: &mpsc::Sender<()>,
     status: &Status,
+    ready: &Ready,
     read_timeout: Duration,
 ) -> io::Result<()> {
     let (status, body, content_type) = match timeout(read_timeout, read_request(&mut stream)).await
@@ -163,6 +167,10 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             let request = end.and_then(|end| parse_head(&bytes[..end]));
             match request.map(|r| (r.method, r.path)) {
                 Some(("GET", "/status")) => ("200 OK", status(), "text/plain"),
+                Some(("GET", "/ready")) => {
+                    let (ok, body) = ready();
+                    (if ok { "200 OK" } else { "503 Service Unavailable" }, body, "text/plain")
+                }
                 Some(("GET", "/health")) => ("200 OK", "ok".to_owned(), "text/plain"),
                 Some(("GET", "/metrics")) => {
                     let mut body = String::new();
@@ -212,13 +220,32 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel(1);
         let task = tokio::spawn(async move {
-            handle(server, &metrics, &tx, &(Arc::new(|| format!("policy_sha256={}\npolicy_applied_unix_ms=1\nlast_reload=none\nlast_reload_unix_ms=0\npolicy_watch=off\n", "a".repeat(64))) as Status), Duration::from_millis(20)).await
+            handle(server, &metrics, &tx, &(Arc::new(|| format!("policy_sha256={}\npolicy_applied_unix_ms=1\nlast_reload=none\nlast_reload_unix_ms=0\npolicy_watch=off\n", "a".repeat(64))) as Status), &(Arc::new(|| (false, "unavailable".into())) as Ready), Duration::from_millis(20)).await
         });
         client.write_all(request).await.unwrap();
         let mut response = String::new();
         client.read_to_string(&mut response).await.unwrap();
         task.await.unwrap().unwrap();
         (response, rx)
+    }
+
+    #[tokio::test]
+    async fn readiness_status_and_body_are_passed_through() {
+        for ok in [false, true] {
+            let (mut client, server) = tokio::io::duplex(2048);
+            let (tx, _rx) = mpsc::channel(1);
+            let ready: Ready = Arc::new(move || (ok, "route=postgres policy=ok catalog=ok audit=ok store=ok\n".into()));
+            let task = tokio::spawn(async move {
+                handle(server, &(Arc::new(Vec::new) as Metrics), &tx,
+                    &(Arc::new(String::new) as Status), &ready, READ_TIMEOUT).await
+            });
+            client.write_all(b"GET /ready HTTP/1.1\r\nHost: local\r\n\r\n").await.unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            task.await.unwrap().unwrap();
+            assert!(response.starts_with(if ok { "HTTP/1.1 200 OK" } else { "HTTP/1.1 503 Service Unavailable" }));
+            assert!(response.ends_with("route=postgres policy=ok catalog=ok audit=ok store=ok\n"));
+        }
     }
 
     #[test]
@@ -259,6 +286,8 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(()));
         let (missing, _) = exchange(b"GET /reload HTTP/1.1\r\nHost: local\r\n\r\n").await;
         assert!(missing.starts_with("HTTP/1.1 404"));
+        let (unknown, _) = exchange(b"GET /unknown HTTP/1.1\r\nHost: local\r\n\r\n").await;
+        assert!(unknown.starts_with("HTTP/1.1 404"));
     }
 
     #[tokio::test]
@@ -292,7 +321,7 @@ mod tests {
                 tx.try_send(()).unwrap();
             }
             let task = tokio::spawn(async move {
-                handle(server, &metrics, &tx, &(Arc::new(|| format!("policy_sha256={}\npolicy_applied_unix_ms=1\nlast_reload=none\nlast_reload_unix_ms=0\npolicy_watch=off\n", "a".repeat(64))) as Status), READ_TIMEOUT).await
+                handle(server, &metrics, &tx, &(Arc::new(|| format!("policy_sha256={}\npolicy_applied_unix_ms=1\nlast_reload=none\nlast_reload_unix_ms=0\npolicy_watch=off\n", "a".repeat(64))) as Status), &(Arc::new(|| (false, "unavailable".into())) as Ready), READ_TIMEOUT).await
             });
             client
                 .write_all(b"POST /reload HTTP/1.1\r\nHost: local\r\n\r\n")

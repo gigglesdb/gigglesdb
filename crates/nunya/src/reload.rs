@@ -2,12 +2,13 @@
 use crate::{
     policy::Policy,
     schema::Snapshot,
+    state::model::RouteId,
     serve::{ReloadableLog, now, parse_policy_bytes},
 };
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -21,6 +22,15 @@ pub(crate) enum Route {
     Test(PolicyLock, SnapshotLock),
 }
 impl Route {
+    fn id(&self) -> &str {
+        match self {
+            Self::Postgres(c) => c.route.as_str(),
+            Self::Spanner(c) => c.route.as_str(),
+            #[cfg(test)]
+            Self::Test(_, _) => "postgres",
+        }
+    }
+
     fn locks(&self) -> (&PolicyLock, &SnapshotLock) {
         match self {
             Self::Postgres(c) => (&c.policy, &c.snapshot),
@@ -33,6 +43,7 @@ impl Route {
 struct State {
     policy: Arc<Policy>,
     routes: Vec<Route>,
+    configured: Vec<RouteId>,
     hash: String,
     applied: u64,
     last: &'static str,
@@ -52,6 +63,47 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<Policy, String> {
     parse_policy_bytes(path, bytes).map_err(crate::serve::errors)
 }
 impl Hub {
+    /// Record configured routes before their catalogs finish loading.
+    pub(crate) fn configure_routes(&self, routes: Vec<RouteId>) -> Result<(), String> {
+        self.state.lock().map_err(|_| "policy lock unavailable")?.configured = routes;
+        Ok(())
+    }
+    /// Report data-free readiness for every configured route.
+    pub(crate) fn readiness(&self, audit_ok: bool, store_ok: bool) -> (bool, String) {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let policy_available = !self.state.is_poisoned();
+        let mut ready = policy_available && !state.configured.is_empty();
+        let mut body = String::new();
+        let at = now();
+        for id in &state.configured {
+            let route = state.routes.iter().find(|r| r.id() == id.as_str());
+            let mut policy_ok = policy_available;
+            let catalog = match route {
+                Some(route) => {
+                    let (policy, snapshot) = route.locks();
+                    match (policy.read(), snapshot.read()) {
+                        (Ok(policy), Ok(snapshot)) => {
+                            policy_ok &= Arc::ptr_eq(&policy, &state.policy);
+                            if at.saturating_sub(snapshot.taken_at_unix_ms) > policy.snapshot_max_age_ms {
+                                "stale"
+                            } else { "ok" }
+                        }
+                        (Err(_), Ok(_)) => { policy_ok = false; "unavailable" }
+                        (Ok(_), Err(_)) => "unavailable",
+                        (Err(_), Err(_)) => { policy_ok = false; "unavailable" }
+                    }
+                }
+                None => "unavailable",
+            };
+            ready &= policy_ok && catalog == "ok" && audit_ok && store_ok;
+            use std::fmt::Write;
+            let available = |ok| if ok { "ok" } else { "unavailable" };
+            let _ = writeln!(body, "route={} policy={} catalog={} audit={} store={}",
+                id.as_str(), available(policy_ok), catalog, available(audit_ok), available(store_ok));
+        }
+        (ready, body)
+    }
+
     pub(crate) fn new(path: &Path, watch_ms: Option<u64>) -> Result<Arc<Self>, String> {
         let bytes = std::fs::read(path).map_err(|_| "policy file unavailable")?;
         let policy = Arc::new(parse(path, &bytes)?);
@@ -60,6 +112,7 @@ impl Hub {
             state: Mutex::new(State {
                 policy,
                 routes: vec![],
+                configured: vec![],
                 hash: hash(&bytes),
                 applied: now(),
                 last: "none",
@@ -67,7 +120,7 @@ impl Hub {
                 attempts: 0,
                 failures: 0,
             }),
-            log: ReloadableLog(Arc::new(RwLock::new(log)), Arc::new(RwLock::new(crate::serve::Revisions { policy: hash(&bytes), config: String::new() }))),
+            log: ReloadableLog(Arc::new(RwLock::new(log)), Arc::new(RwLock::new(crate::serve::Revisions { policy: hash(&bytes), config: String::new() })), Arc::new(AtomicBool::new(true))),
             watch_ms,
         }))
     }
@@ -299,10 +352,11 @@ mod tests {
         Hub {
             log: ReloadableLog(Arc::new(RwLock::new(
                 crate::readlog::open_sink(&p.readlog).unwrap(),
-            )), Arc::new(RwLock::new(crate::serve::Revisions { policy: hash(b"initial"), config: "config-test".into() }))),
+            )), Arc::new(RwLock::new(crate::serve::Revisions { policy: hash(b"initial"), config: "config-test".into() })), Arc::new(AtomicBool::new(true))),
             state: Mutex::new(State {
                 policy: Arc::new(p),
                 routes: vec![],
+                configured: vec![],
                 hash: hash(b"initial"),
                 applied: 1,
                 last: "none",
@@ -313,6 +367,26 @@ mod tests {
             watch_ms: None,
         }
     }
+    #[test]
+    fn postgres_readiness_tracks_loading_staleness_and_dependencies() {
+        let h = hub();
+        h.configure_routes(vec![RouteId::new("postgres").unwrap()]).unwrap();
+        assert_eq!(h.readiness(true, true), (false,
+            "route=postgres policy=ok catalog=unavailable audit=ok store=ok\n".into()));
+        h.register(Route::Test(RwLock::new(Arc::new(policy())),
+            RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec![], now()))))).unwrap();
+        assert_eq!(h.readiness(true, true), (true,
+            "route=postgres policy=ok catalog=ok audit=ok store=ok\n".into()));
+        assert!(!h.readiness(false, true).0);
+        assert!(h.readiness(false, true).1.contains("audit=unavailable"));
+        assert!(!h.readiness(true, false).0);
+        assert!(h.readiness(true, false).1.contains("store=unavailable"));
+        *h.state.lock().unwrap().routes[0].locks().1.write().unwrap() =
+            Arc::new(Snapshot::new(vec![], vec![], vec![], 0));
+        assert_eq!(h.readiness(true, true), (false,
+            "route=postgres policy=ok catalog=stale audit=ok store=ok\n".into()));
+    }
+
     #[test]
     fn watcher_debounces_rejections_and_recovers_readability() {
         let mut w = Watcher {
@@ -453,7 +527,21 @@ mod tests {
                 endpoint: "http://127.0.0.1:1".into(),
             },
         });
+        h.configure_routes(vec![ctx.route.clone()]).unwrap();
+        assert!(!h.readiness(true, true).0);
+        *ctx.snapshot.write().unwrap() = Arc::new(Snapshot::new(vec![], vec![], vec![], now()));
         h.register(Route::Spanner(ctx.clone())).unwrap();
+        assert_eq!(h.readiness(true, true), (true,
+            "route=spanner-native policy=ok catalog=ok audit=ok store=ok\n".into()));
+        h.configure_routes(vec![RouteId::new("postgres").unwrap(), ctx.route.clone()]).unwrap();
+        assert!(!h.readiness(true, true).0);
+        h.register(Route::Test(RwLock::new(Arc::new(policy())),
+            RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec![], now()))))).unwrap();
+        let (ready, body) = h.readiness(true, true);
+        assert!(ready);
+        assert_eq!(body.lines().count(), 2);
+        assert!(body.starts_with("route=postgres "));
+        assert!(body.contains("route=spanner-native "));
         let mut new = policy();
         new.snapshot_max_age_ms = 123;
         new.readlog = ReadLogSink::File {

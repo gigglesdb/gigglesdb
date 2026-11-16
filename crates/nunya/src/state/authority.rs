@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, atomic::{AtomicU64, Ordering}},
 };
 
 mod config_sync;
@@ -163,6 +163,16 @@ struct View {
     pending: HashSet<SessionId>,
     flushed: HashMap<SessionId, u64>,
 }
+/// Process-lifetime session operation counts.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AuthorityCounters {
+    /// New sessions committed, excluding idempotent retries.
+    pub sessions_issued: u64,
+    /// Successful explicit renewals.
+    pub sessions_renewed: u64,
+    /// Unsuccessful resume attempts.
+    pub resumes_refused: u64,
+}
 /// Authoritative memory view with serialized write-through mutations.
 pub struct Authority {
     store: Arc<dyn Store>,
@@ -171,6 +181,9 @@ pub struct Authority {
     // This mutex coordinates writers only; admission never takes it.
     writer: Mutex<()>,
     hook: RwLock<Option<Arc<dyn RevocationHook>>>,
+    sessions_issued: AtomicU64,
+    sessions_renewed: AtomicU64,
+    resumes_refused: AtomicU64,
 }
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -220,6 +233,20 @@ fn secret_matches(key: &[u8; 32], digest: &[u8; 32]) -> bool {
     stored.verify_slice(&tag).is_ok()
 }
 impl Authority {
+    /// Read process-lifetime session operation counts.
+    pub fn counters(&self) -> AuthorityCounters {
+        AuthorityCounters {
+            sessions_issued: self.sessions_issued.load(Ordering::Relaxed),
+            sessions_renewed: self.sessions_renewed.load(Ordering::Relaxed),
+            resumes_refused: self.resumes_refused.load(Ordering::Relaxed),
+        }
+    }
+    /// Count sessions currently marked active in the authority view.
+    pub fn active_session_count(&self) -> usize {
+        self.view.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions.values().filter(|s| s.state == SessionState::Active).count()
+    }
+
     /// Load and validate every application table before accepting requests.
     pub fn load(store: Arc<dyn Store>, limits: SessionLimits) -> Result<Arc<Self>, AuthorityError> {
         let mut v = View::default();
@@ -346,6 +373,9 @@ impl Authority {
             view: RwLock::new(v),
             writer: Mutex::new(()),
             hook: RwLock::new(None),
+            sessions_issued: AtomicU64::new(0),
+            sessions_renewed: AtomicU64::new(0),
+            resumes_refused: AtomicU64::new(0),
         }))
     }
     /// Install the post-commit termination hook.
@@ -800,6 +830,7 @@ impl Authority {
         v.idempotency.insert((principal, r.key.clone()), r);
         v.flushed.insert(s.id, now);
         v.sessions.insert(s.id, s.clone());
+        self.sessions_issued.fetch_add(1, Ordering::Relaxed);
         Ok(s)
     }
     fn owned_session(
@@ -817,10 +848,16 @@ impl Authority {
         principal: PrincipalId,
         id: SessionId,
     ) -> Result<AccessSession, AuthorityError> {
-        self.owned_session(principal, id)?;
-        self.admit(id, Operation::Read)
-            .map_err(|_| AuthorityError::SessionEnded)?;
-        self.owned_session(principal, id)
+        let result = (|| {
+            self.owned_session(principal, id)?;
+            self.admit(id, Operation::Read)
+                .map_err(|_| AuthorityError::SessionEnded)?;
+            self.owned_session(principal, id)
+        })();
+        if result.is_err() {
+            self.resumes_refused.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
     /// Explicitly renew mode or credentials without extending absolute expiry.
     pub fn renew(
@@ -914,6 +951,9 @@ impl Authority {
         ended.extend(self.drain_pending_best_effort());
         drop(writer);
         self.notify(&ended);
+        if result.is_ok() {
+            self.sessions_renewed.fetch_add(1, Ordering::Relaxed);
+        }
         result
     }
     /// Deny first, persist second, and notify only after a successful commit.
