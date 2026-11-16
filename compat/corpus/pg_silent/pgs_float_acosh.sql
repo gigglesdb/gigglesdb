@@ -3,4 +3,6 @@
 -- owner: DD-0068
 -- expect: compatible
 -- source: Differences: Read first / Floating point acosh over spread of inputs
-SELECT x, acosh(x) FROM (VALUES (1::float8),(1.0000001::float8),(1.1::float8),(2::float8),(10::float8),(1000::float8)) AS inputs(x) ORDER BY x;
+CREATE TABLE r0c_pgs_float_acosh (id int PRIMARY KEY, x double precision);
+INSERT INTO r0c_pgs_float_acosh VALUES (1, 1), (2, 1.0000001), (3, 1.1), (4, 2), (5, 10), (6, 1000);
+SELECT id, acosh(x) FROM r0c_pgs_float_acosh ORDER BY id;

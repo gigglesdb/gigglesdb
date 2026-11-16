@@ -3,4 +3,6 @@
 -- owner: DD-0068
 -- expect: compatible
 -- source: Differences: Read first / Floating point atanh over spread of inputs
-SELECT x, atanh(x) FROM (VALUES (-0.99::float8),(-0.5::float8),(-0.1::float8),(0::float8),(0.1::float8),(0.5::float8),(0.99::float8)) AS inputs(x) ORDER BY x;
+CREATE TABLE r0c_pgs_float_atanh (id int PRIMARY KEY, x double precision);
+INSERT INTO r0c_pgs_float_atanh VALUES (1, -0.99), (2, -0.5), (3, -0.1), (4, 0), (5, 0.1), (6, 0.5), (7, 0.99);
+SELECT id, atanh(x) FROM r0c_pgs_float_atanh ORDER BY id;

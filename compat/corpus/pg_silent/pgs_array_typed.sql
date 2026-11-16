@@ -5,4 +5,5 @@
 -- source: Differences: Read first / || between array column and string literal
 CREATE TABLE r0c_pgs_array_typed (id int PRIMARY KEY, v text[]);
 INSERT INTO r0c_pgs_array_typed VALUES (1, '{a,b}');
-SELECT v || '{c}'::text[] AS merged, pg_typeof(v || '{c}'::text[]) AS result_type FROM r0c_pgs_array_typed;
+SELECT id, v || '{c}'::text[] FROM r0c_pgs_array_typed ORDER BY id;
+SELECT id, pg_typeof(v || '{c}'::text[]) AS result_type FROM r0c_pgs_array_typed ORDER BY id;
