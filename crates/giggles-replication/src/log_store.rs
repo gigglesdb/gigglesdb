@@ -3,7 +3,13 @@ use crate::snapshot::SnapshotStore;
 use protobuf::Message;
 use raft::{GetEntriesContext, RaftState, Storage, StorageError, eraftpb::*};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 const ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("entries");
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
@@ -30,6 +36,8 @@ pub struct LogStore {
     db: Database,
     identity: ([u8; 16], u64),
     snapshots: Option<Arc<SnapshotStore>>,
+    /// Durable write transactions committed by `persist` since open.
+    commits: AtomicU64,
 }
 fn decode<T: Message + Default>(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
@@ -73,6 +81,7 @@ impl LogStore {
             db,
             identity: (cluster, node_id),
             snapshots: None,
+            commits: AtomicU64::new(0),
         })
     }
     pub fn attach_snapshots(&mut self, s: Arc<SnapshotStore>) {
@@ -88,7 +97,16 @@ impl LogStore {
     pub fn identity(&self) -> ([u8; 16], u64) {
         self.identity
     }
+    /// Durable `persist` commits since open (GD-0075 R5-17a idle-cost check).
+    pub fn durable_commits(&self) -> u64 {
+        self.commits.load(Ordering::Relaxed)
+    }
     pub fn persist(&self, entries: &[Entry], hard_state: Option<&HardState>) -> Result<()> {
+        if entries.is_empty() && hard_state.is_none() {
+            // A heartbeat-only Ready has nothing to make durable: skip the fsync'd
+            // write transaction (GD-0075 R5-17a; ~72% of an idle group's cost).
+            return Ok(());
+        }
         let mut tx = self.db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
@@ -120,6 +138,7 @@ impl LogStore {
             "log.persist.before",
         );
         tx.commit()?;
+        self.commits.fetch_add(1, Ordering::Relaxed);
         crate::failpoint::hit(
             &self.identity().0,
             Some(self.identity().1),

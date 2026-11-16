@@ -33,6 +33,15 @@ pub enum Body {
     },
     SnapDone,
     SnapAck(std::result::Result<(), String>),
+    /// A range or gateway call (`call_codec` body), answered by the `CallResponse` with its id.
+    CallRequest {
+        id: u64,
+        body: Vec<u8>,
+    },
+    CallResponse {
+        id: u64,
+        body: Vec<u8>,
+    },
 }
 
 fn corrupt() -> Error {
@@ -93,6 +102,18 @@ pub fn encode(h: &Header, b: &Body) -> Result<Vec<u8>> {
                 }
             }
         }
+        Body::CallRequest { id, body } | Body::CallResponse { id, body } => {
+            if body.is_empty() {
+                return Err(corrupt());
+            }
+            bytes.push(if matches!(b, Body::CallRequest { .. }) {
+                9
+            } else {
+                10
+            });
+            bytes.extend(id.to_be_bytes());
+            bytes.extend(body);
+        }
     }
     if bytes.len() > MAX_FRAME {
         return Err(corrupt());
@@ -144,6 +165,15 @@ pub fn decode(expected: &Header, bytes: &[u8]) -> Result<Body> {
         6 if p.first() == Some(&1) => Body::SnapAck(Err(
             String::from_utf8(p[1..].to_vec()).map_err(|_| corrupt())?
         )),
+        9 | 10 if p.len() > 8 => {
+            let id = u64::from_be_bytes(p[..8].try_into().unwrap());
+            let body = p[8..].to_vec();
+            if bytes[40] == 9 {
+                Body::CallRequest { id, body }
+            } else {
+                Body::CallResponse { id, body }
+            }
+        }
         _ => return Err(corrupt()),
     })
 }

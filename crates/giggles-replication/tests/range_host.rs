@@ -1,0 +1,492 @@
+//! Store-backed RangeHost with per-range role managers (GD-0075 R5-13, R5-16).
+use giggles_core::{
+    range_api::{
+        ClusterTxnId, Epoch, HomeOp, HomeReply, LockGrant, LockRequest, Outcome, RangeDescriptor,
+        RangeEngineOpener, RangeError, RangeId, RangeService, RangeSpace, RangeWrite, ReadPage,
+        ReadRequest, ReplicaDesc, ReplicaRole, Timestamp, range_key,
+    },
+    replicated::{BatchSink, RangeStore, ReplicateError},
+};
+use giggles_replication::{
+    client::LocalRanges,
+    host::{GroupNetwork, RangeHost, RangeHostConfig},
+    sink::Outbox,
+    transport::PeerSink,
+};
+use raft::{StateRole, eraftpb::Message};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+
+type Sinks = Arc<Mutex<HashMap<(u64, RangeId), Arc<dyn PeerSink>>>>;
+type Blocked = Arc<Mutex<BTreeSet<u64>>>;
+
+struct MemNet {
+    node: u64,
+    sinks: Sinks,
+    blocked: Blocked,
+}
+struct MemOutbox {
+    group: RangeId,
+    sinks: Sinks,
+    blocked: Blocked,
+}
+impl Outbox for MemOutbox {
+    fn send(&mut self, m: Message) {
+        {
+            let blocked = self.blocked.lock().unwrap();
+            if blocked.contains(&m.from) || blocked.contains(&m.to) {
+                return;
+            }
+        }
+        let sink = self.sinks.lock().unwrap().get(&(m.to, self.group)).cloned();
+        if let Some(sink) = sink {
+            sink.deliver(m.from, m);
+        }
+    }
+}
+impl GroupNetwork for MemNet {
+    fn outbox(&self, group: RangeId) -> Box<dyn Outbox> {
+        Box::new(MemOutbox {
+            group,
+            sinks: self.sinks.clone(),
+            blocked: self.blocked.clone(),
+        })
+    }
+    fn register(&self, group: RangeId, sink: Arc<dyn PeerSink>) {
+        self.sinks.lock().unwrap().insert((self.node, group), sink);
+    }
+    fn unregister(&self, group: RangeId) {
+        self.sinks.lock().unwrap().remove(&(self.node, group));
+    }
+}
+
+/// Opens and closes per (node, range).
+#[derive(Default)]
+struct Log(Mutex<BTreeMap<(u64, RangeId), (usize, usize)>>);
+impl Log {
+    fn counts(&self, node: u64, range: RangeId) -> (usize, usize) {
+        self.0
+            .lock()
+            .unwrap()
+            .get(&(node, range))
+            .copied()
+            .unwrap_or_default()
+    }
+    fn open_nodes(&self, range: RangeId) -> Vec<u64> {
+        let log = self.0.lock().unwrap();
+        log.iter()
+            .filter(|((_, r), (opens, closes))| *r == range && opens > closes)
+            .map(|((n, _), _)| *n)
+            .collect()
+    }
+}
+
+struct StubOpener {
+    node: u64,
+    log: Arc<Log>,
+}
+impl RangeEngineOpener for StubOpener {
+    fn open(
+        &self,
+        descriptor: RangeDescriptor,
+        sink: Arc<dyn BatchSink>,
+    ) -> Result<Arc<dyn RangeService>, RangeError> {
+        let mut log = self.log.0.lock().unwrap();
+        let entry = log.entry((self.node, descriptor.id)).or_default();
+        assert_eq!(entry.0, entry.1, "open twice without close");
+        entry.0 += 1;
+        Ok(Arc::new(StubService { descriptor, sink }))
+    }
+    fn close(&self, range: RangeId) {
+        let mut log = self.log.0.lock().unwrap();
+        let entry = log.entry((self.node, range)).or_default();
+        assert_eq!(entry.0, entry.1 + 1, "close without open");
+        entry.1 += 1;
+    }
+}
+
+/// `commit` replicates one batch of Rows puts through the sink.
+struct StubService {
+    descriptor: RangeDescriptor,
+    sink: Arc<dyn BatchSink>,
+}
+fn stub<T>() -> Result<T, RangeError> {
+    Err(RangeError::Unavailable("stub".into()))
+}
+impl RangeService for StubService {
+    fn descriptor(&self) -> RangeDescriptor {
+        self.descriptor.clone()
+    }
+    fn read(&self, _: ReadRequest) -> Result<ReadPage, RangeError> {
+        stub()
+    }
+    fn lock(&self, _: LockRequest) -> Result<LockGrant, RangeError> {
+        stub()
+    }
+    fn blockers(&self, _: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError> {
+        stub()
+    }
+    fn cancel_wait(&self, _: ClusterTxnId) -> Result<(), RangeError> {
+        stub()
+    }
+    fn release(&self, _: ClusterTxnId) -> Result<(), RangeError> {
+        stub()
+    }
+    fn heartbeat(&self, _: ClusterTxnId) -> Result<(), RangeError> {
+        stub()
+    }
+    fn commit(
+        &self,
+        _: Epoch,
+        _: ClusterTxnId,
+        writes: Vec<RangeWrite>,
+        _: Option<u64>,
+    ) -> Result<Timestamp, RangeError> {
+        let puts: Vec<(Vec<u8>, Vec<u8>)> = writes
+            .into_iter()
+            .map(|w| {
+                assert_eq!(w.space, RangeSpace::Rows);
+                let mut raw = w.key;
+                raw.extend_from_slice(&[0xff; 8]); // version suffix
+                (raw, w.value.unwrap_or_default())
+            })
+            .collect();
+        match self.sink.replicate(rows_batch(&puts)) {
+            Ok(()) => Ok(Timestamp(1)),
+            Err(ReplicateError::NotLeader) => Err(RangeError::NotLeader { hint: None }),
+            Err(ReplicateError::Unavailable(reason)) => Err(RangeError::Unavailable(reason)),
+        }
+    }
+    fn prepare(
+        &self,
+        _: Epoch,
+        _: ClusterTxnId,
+        _: RangeId,
+        _: Vec<RangeWrite>,
+    ) -> Result<Timestamp, RangeError> {
+        stub()
+    }
+    fn finalize(&self, _: ClusterTxnId, _: Outcome) -> Result<(), RangeError> {
+        stub()
+    }
+    fn home(&self, _: Epoch, _: HomeOp) -> Result<HomeReply, RangeError> {
+        stub()
+    }
+}
+
+/// WriteBatch wire format (kv.rs `WriteBatch::encode`): version 1, op count BE4,
+/// per op `[tag][keyspace index in Keyspace::ALL]` + `len BE4 + bytes` fields,
+/// then crc32c BE4 of everything before it. Put = tag 1, Rows = index 2.
+fn rows_batch(puts: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut out = vec![1];
+    out.extend_from_slice(&(puts.len() as u32).to_be_bytes());
+    for (key, value) in puts {
+        out.extend_from_slice(&[1, 2]);
+        for field in [key, value] {
+            out.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            out.extend_from_slice(field);
+        }
+    }
+    let crc = crc32c(&out);
+    out.extend_from_slice(&crc.to_be_bytes());
+    out
+}
+fn crc32c(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ if crc & 1 != 0 { 0x82f6_3b78 } else { 0 };
+        }
+    }
+    !crc
+}
+
+const NODES: [u64; 3] = [1, 2, 3];
+const CLUSTER: [u8; 16] = [7; 16];
+
+/// Eight ranges splitting Rows at user-key first bytes 32, 64, ..., 224.
+fn descriptors() -> Vec<RangeDescriptor> {
+    (0..8u8)
+        .map(|i| RangeDescriptor {
+            id: RangeId(101 + u64::from(i)),
+            epoch: Epoch(1),
+            start: range_key(RangeSpace::Rows, &[i * 32][..usize::from(i > 0)]),
+            end: (i < 7).then(|| range_key(RangeSpace::Rows, &[(i + 1) * 32])),
+            replicas: NODES
+                .iter()
+                .map(|&node| ReplicaDesc {
+                    node,
+                    role: ReplicaRole::Voter,
+                })
+                .collect(),
+        })
+        .collect()
+}
+fn ids() -> Vec<RangeId> {
+    descriptors().iter().map(|d| d.id).collect()
+}
+/// A Rows user key inside range number `i` (0..8).
+fn user_key(i: usize) -> Vec<u8> {
+    vec![(i * 32 + 1) as u8, 0, 0, 0, 0, 0, 0, 7]
+}
+
+struct Cluster {
+    hosts: Vec<RangeHost>,
+    stores: Vec<Arc<RangeStore>>,
+    log: Arc<Log>,
+    blocked: Blocked,
+    sinks: Sinks,
+}
+
+fn start(dir: &Path, fresh: bool) -> Cluster {
+    let sinks: Sinks = Arc::default();
+    let blocked: Blocked = Arc::default();
+    let log: Arc<Log> = Arc::default();
+    let mut hosts = Vec::new();
+    let mut stores = Vec::new();
+    for node in NODES {
+        let data = dir.join(format!("n{node}/data"));
+        let store = Arc::new(if fresh {
+            RangeStore::create(&data, CLUSTER).unwrap()
+        } else {
+            RangeStore::open(&data).unwrap()
+        });
+        let config = RangeHostConfig {
+            node_id: node,
+            cluster: CLUSTER,
+            log_dir: dir.join(format!("n{node}/log")),
+            snap_dir: dir.join(format!("n{node}/snap")),
+            tick: Duration::from_millis(10),
+            policy: None,
+            liveness: None,
+        };
+        let network = Arc::new(MemNet {
+            node,
+            sinks: sinks.clone(),
+            blocked: blocked.clone(),
+        });
+        let opener = Arc::new(StubOpener {
+            node,
+            log: log.clone(),
+        });
+        let host = RangeHost::open(config, network, store.clone(), Some(opener)).unwrap();
+        if fresh {
+            assert!(host.groups().is_empty());
+            for descriptor in descriptors() {
+                host.create_range(&descriptor).unwrap();
+            }
+        }
+        assert_eq!(host.groups(), ids());
+        hosts.push(host);
+        stores.push(store);
+    }
+    Cluster {
+        hosts,
+        stores,
+        log,
+        blocked,
+        sinks,
+    }
+}
+
+fn wait(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out: {what}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+impl Cluster {
+    fn host(&self, node: u64) -> &RangeHost {
+        &self.hosts[node as usize - 1]
+    }
+    fn store(&self, node: u64) -> &RangeStore {
+        &self.stores[node as usize - 1]
+    }
+    fn applied(&self, node: u64, range: RangeId) -> u64 {
+        self.store(node)
+            .applied(range)
+            .unwrap()
+            .map_or(0, |p| p.index)
+    }
+    fn is_leader(&self, node: u64, range: RangeId) -> bool {
+        self.host(node).group(range).unwrap().role().state == StateRole::Leader
+    }
+    /// The one node (among `among`) serving `range`, if it leads the group and
+    /// is the only node with an open engine for it.
+    fn steady(&self, range: RangeId, among: &[u64]) -> Option<u64> {
+        let serving: Vec<u64> = among
+            .iter()
+            .copied()
+            .filter(|&n| self.host(n).service(range).is_some())
+            .collect();
+        let open: Vec<u64> = self
+            .log
+            .open_nodes(range)
+            .into_iter()
+            .filter(|n| among.contains(n))
+            .collect();
+        match serving[..] {
+            [node] if open == [node] && self.is_leader(node, range) => Some(node),
+            _ => None,
+        }
+    }
+    /// Waits until every range is steady among `among`; returns range -> leader.
+    fn leaders(&self, among: &[u64]) -> BTreeMap<RangeId, u64> {
+        let mut leaders = BTreeMap::new();
+        wait("one open engine per range on its leader", || {
+            leaders.clear();
+            for range in ids() {
+                match self.steady(range, among) {
+                    Some(node) => leaders.insert(range, node),
+                    None => return false,
+                };
+            }
+            true
+        });
+        leaders
+    }
+    fn wait_replicated(&self, range: RangeId, index: u64) {
+        wait("applied on all three stores", || {
+            NODES.iter().all(|&n| self.applied(n, range) >= index)
+        });
+    }
+    fn isolate(&self, node: u64) {
+        self.blocked.lock().unwrap().insert(node);
+    }
+    fn heal(&self) {
+        self.blocked.lock().unwrap().clear();
+    }
+    fn commit(&self, node: u64, range: RangeId, key: Vec<u8>) -> Result<Timestamp, RangeError> {
+        let service = self.host(node).service(range).expect("leader engine");
+        let epoch = service.descriptor().epoch;
+        let write = RangeWrite {
+            space: RangeSpace::Rows,
+            key,
+            value: Some(b"v".to_vec()),
+        };
+        service.commit(epoch, ClusterTxnId(1), vec![write], None)
+    }
+}
+
+fn temp_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "range-role-host-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
+#[test]
+fn store_backed_hosts_open_engines_on_leaders_fence_on_isolation_and_reopen() {
+    let dir = temp_dir();
+    let c = start(&dir, true);
+    let leaders = c.leaders(&NODES);
+
+    // A write through each leader lands in its range on all three stores; a key
+    // outside the range is refused (the position still advances), reported as
+    // NotLeader, and fences the engine, which the role manager replaces.
+    for (i, range) in ids().into_iter().enumerate() {
+        let node = leaders[&range];
+        c.commit(node, range, user_key(i)).unwrap();
+        let written = c.applied(node, range);
+        c.wait_replicated(range, written);
+        let service = c.host(node).service(range).unwrap();
+        let outside = user_key((i + 1) % 8);
+        let refused = c.commit(node, range, outside.clone()).unwrap_err();
+        // Refused at apply = definitely not applied: NotLeader, never an unknown outcome.
+        assert!(
+            matches!(&refused, RangeError::NotLeader { .. }),
+            "{refused:?}"
+        );
+        assert!(c.applied(node, range) > written);
+        c.wait_replicated(range, written + 1);
+        let fenced = service.commit(Epoch(1), ClusterTxnId(2), Vec::new(), None);
+        assert_eq!(fenced, Err(RangeError::NotLeader { hint: None }));
+    }
+    let mut leaders = c.leaders(&NODES);
+
+    // Spread leaders over at least two nodes by moving them off a node that leads all.
+    for _ in 0..5 {
+        let nodes: BTreeSet<u64> = leaders.values().copied().collect();
+        if nodes.len() > 1 {
+            break;
+        }
+        let only = *nodes.first().unwrap();
+        c.isolate(only);
+        let rest: Vec<u64> = NODES.iter().copied().filter(|&n| n != only).collect();
+        c.leaders(&rest);
+        c.heal();
+        leaders = c.leaders(&NODES);
+    }
+    let nodes: BTreeSet<u64> = leaders.values().copied().collect();
+    assert!(nodes.len() > 1, "leaders never spread: {leaders:?}");
+
+    // Isolating the node leading the most ranges fences only its engines.
+    let victim = *NODES
+        .iter()
+        .max_by_key(|&&n| leaders.values().filter(|&&l| l == n).count())
+        .unwrap();
+    let kept: BTreeMap<RangeId, (u64, (usize, usize))> = leaders
+        .iter()
+        .filter(|(_, n)| **n != victim)
+        .map(|(r, n)| (*r, (*n, c.log.counts(*n, *r))))
+        .collect();
+    c.isolate(victim);
+    let rest: Vec<u64> = NODES.iter().copied().filter(|&n| n != victim).collect();
+    let moved = c.leaders(&rest);
+    wait("isolated node's engines closed", || {
+        ids()
+            .into_iter()
+            .all(|r| c.host(victim).service(r).is_none() && !c.log.open_nodes(r).contains(&victim))
+    });
+    for (range, (node, counts)) in &kept {
+        assert_eq!(moved[range], *node, "range {} changed leader", range.0);
+        assert_eq!(c.log.counts(*node, *range), *counts, "engine reopened");
+        assert!(c.host(*node).service(*range).is_some());
+    }
+    c.heal();
+    let healed = c.leaders(&NODES);
+    for (range, (node, _)) in &kept {
+        assert_eq!(healed[range], *node);
+    }
+    for (i, range) in ids().into_iter().enumerate() {
+        c.commit(healed[&range], range, user_key(i)).unwrap();
+    }
+    let applied: BTreeMap<(u64, RangeId), u64> = NODES
+        .iter()
+        .flat_map(|&n| ids().into_iter().map(move |r| (n, r)))
+        .map(|(n, r)| ((n, r), c.applied(n, r)))
+        .collect();
+
+    // Restart: stop closes every engine; reopening the stores reopens all groups.
+    for host in &c.hosts {
+        host.stop();
+        assert!(host.groups().is_empty());
+    }
+    for range in ids() {
+        assert!(c.log.open_nodes(range).is_empty());
+    }
+    assert!(c.sinks.lock().unwrap().is_empty());
+    drop(c);
+    let c = start(&dir, false);
+    let leaders = c.leaders(&NODES);
+    for ((node, range), index) in applied {
+        assert!(c.applied(node, range) >= index);
+    }
+    for (i, range) in ids().into_iter().enumerate() {
+        c.commit(leaders[&range], range, user_key(i)).unwrap();
+    }
+    drop(c);
+    let _ = std::fs::remove_dir_all(&dir);
+}

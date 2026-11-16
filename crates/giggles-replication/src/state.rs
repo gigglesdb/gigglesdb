@@ -16,6 +16,9 @@ pub struct AppliedPosition {
 pub enum ApplyOutcome {
     Applied,
     Skipped,
+    /// The index was consumed as a no-op because its batch was refused (stale
+    /// epoch or a key outside the range); see `StateMachine::take_refusal`.
+    Refused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +42,11 @@ pub trait StateMachine: Send + Sync {
     }
     fn install(&self, source: &Path) -> Result<AppliedPosition, StateError>;
     fn flush(&self) -> Result<(), StateError>;
+    /// Removes and returns the reason the batch at `index` was applied as a
+    /// refused no-op (`ApplyOutcome::Refused`), if one was recorded.
+    fn take_refusal(&self, _index: u64) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Default)]

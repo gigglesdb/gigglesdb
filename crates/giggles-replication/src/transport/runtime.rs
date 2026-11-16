@@ -1,9 +1,13 @@
-use super::{Body, Header, PeerConfig, TransportConfig, fingerprint, frame, tls};
+use super::calls::{CallLimits, CallServer, PeerCalls};
+use super::{Body, GroupRouter, Header, PeerConfig, TransportConfig, fingerprint, frame, tls};
 use crate::{
+    client::LocalRanges,
     error::{Error, Result},
+    group::{group_cluster, group_of},
     sink::Outbox,
     snapshot::{Manifest, SnapshotStore},
 };
+use giggles_core::range_api::GatewayService;
 use raft::eraftpb::{Message, MessageType};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -63,15 +67,16 @@ impl<S: PeerSink> PeerSink for LateSink<S> {
     }
 }
 
+/// One group's outbox; every group's outbox shares the per-peer queues.
 #[derive(Clone)]
 struct Sender {
     shared: Arc<Peers>,
-    sink: Arc<dyn PeerSink>,
-    snapshots: Option<Arc<SnapshotSender>>,
+    router: Arc<GroupRouter>,
+    group: u64,
 }
 
 struct Peer {
-    tx: mpsc::Sender<Message>,
+    tx: mpsc::Sender<(u64, Message)>,
     task: JoinHandle<()>,
     permit: Arc<Semaphore>,
     cancel: watch::Sender<()>,
@@ -85,11 +90,11 @@ struct PeerTable {
     config: BTreeMap<u64, PeerConfig>,
     active: BTreeMap<u64, Peer>,
 }
-struct Peers {
-    config: Arc<TransportConfig>,
+pub(crate) struct Peers {
+    pub(super) config: Arc<TransportConfig>,
     table: RwLock<PeerTable>,
     connector: tokio_rustls::TlsConnector,
-    runtime: tokio::runtime::Handle,
+    pub(super) runtime: tokio::runtime::Handle,
 }
 impl Peers {
     fn set(self: &Arc<Self>, peers: BTreeMap<u64, PeerConfig>) -> Result<()> {
@@ -153,7 +158,7 @@ impl Peers {
         table.config = peers;
         Ok(())
     }
-    async fn connect(
+    pub(super) async fn connect(
         &self,
         id: u64,
     ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
@@ -170,14 +175,13 @@ impl Peers {
     }
 }
 
-struct SnapshotSender {
-    shared: Arc<Peers>,
-    store: Arc<SnapshotStore>,
-    runtime: tokio::runtime::Handle,
-}
-
 impl Outbox for Sender {
     fn apply_membership(&mut self, m: &crate::membership::Membership) {
+        // The peer table is node-wide. Only an R4 single-group database (group 0)
+        // derives it from its group's membership; a range host sets it itself.
+        if self.group != 0 {
+            return;
+        }
         let mut peers = self.shared.config.peers.clone();
         for (id, peer) in &m.peers {
             peers.insert(
@@ -195,39 +199,48 @@ impl Outbox for Sender {
     }
 
     fn set_peers(&mut self, peers: &BTreeMap<u64, PeerConfig>) {
+        if self.group != 0 {
+            return;
+        }
         if let Err(error) = self.shared.set(peers.clone()) {
             eprintln!("replication set_peers failed: {error}");
         }
     }
     fn send(&mut self, m: Message) {
         if m.has_snapshot() || m.get_msg_type() == MessageType::MsgSnapshot {
-            let Some(snapshots) = self.snapshots.clone() else {
-                self.sink.snapshot_status(m.to, false);
+            // A group unregistered here has no replica left to report to.
+            let Some(route) = self.router.route(self.group) else {
                 return;
             };
+            let sink = route.sink;
+            let Some(store) = route.snapshots else {
+                sink.snapshot_status(m.to, false);
+                return;
+            };
+            let shared = self.shared.clone();
+            let cluster = group_cluster(shared.config.cluster, self.group);
             let table = self.shared.table.read().unwrap();
             let Some(peer) = table.active.get(&m.to) else {
-                self.sink.snapshot_status(m.to, false);
+                sink.snapshot_status(m.to, false);
                 return;
             };
             let Ok(permit) = peer.permit.clone().try_acquire_owned() else {
-                self.sink.snapshot_status(m.to, false);
+                sink.snapshot_status(m.to, false);
                 return;
             };
             let mut cancelled = peer.cancel.subscribe();
-            let sink = self.sink.clone();
-            let runtime = snapshots.runtime.clone();
+            let runtime = shared.runtime.clone();
             runtime.spawn(async move {
                 let _permit = permit;
                 let ok = tokio::select! {
                     biased;
                     _ = cancelled.changed() => false,
-                    result = tokio::time::timeout(Duration::from_secs(300), send_snapshot(&snapshots, &m)) => matches!(result, Ok(Ok(()))),
+                    result = tokio::time::timeout(Duration::from_secs(300), send_snapshot(&shared, &store, cluster, &m)) => matches!(result, Ok(Ok(()))),
                 };
                 sink.snapshot_status(m.to, ok);
             });
         } else if let Some(peer) = self.shared.table.read().unwrap().active.get(&m.to) {
-            let _ = peer.tx.try_send(m);
+            let _ = peer.tx.try_send((self.group, m));
         }
     }
 }
@@ -237,15 +250,27 @@ pub struct Transport {
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
     addr: SocketAddr,
-    sender: Sender,
+    shared: Arc<Peers>,
+    router: Arc<GroupRouter>,
+    calls: Arc<PeerCalls>,
+    call_server: Arc<CallServer>,
 }
 
 impl Transport {
+    /// R4 single-group mode: a router holding only group 0.
     pub fn start(
         config: TransportConfig,
         sink: Arc<dyn PeerSink>,
         snapshots: Option<Arc<SnapshotStore>>,
     ) -> Result<Self> {
+        let router = Arc::new(GroupRouter::new());
+        router.register(0, sink, snapshots);
+        Self::start_groups(config, router)
+    }
+
+    /// Many groups over one transport. `config.cluster` is the database
+    /// cluster id; group `g`'s frames carry `group_cluster(config.cluster, g)`.
+    pub fn start_groups(config: TransportConfig, router: Arc<GroupRouter>) -> Result<Self> {
         config.validate()?;
         let (acceptor, connector) = tls::tls(&config)?;
         let listener = std::net::TcpListener::bind(&config.listen)?;
@@ -270,21 +295,16 @@ impl Transport {
             runtime: runtime.handle().clone(),
         });
         shared.set(config.peers.clone())?;
-        let sender = Sender {
-            snapshots: snapshots.as_ref().map(|store| {
-                Arc::new(SnapshotSender {
-                    shared: shared.clone(),
-                    store: store.clone(),
-                    runtime: runtime.handle().clone(),
-                })
-            }),
-            shared: shared.clone(),
-            sink: sink.clone(),
-        };
+        let accept_shared = shared.clone();
+        let accept_router = router.clone();
+        let call_server = Arc::new(CallServer::new());
+        let accept_calls = call_server.clone();
         let (stop, mut stopped) = oneshot::channel();
         let task = runtime.spawn(async move {
             let mut tasks = JoinSet::new();
-            let permits = Arc::new(Semaphore::new(16));
+            // Each peer keeps two lasting inbound connections (Raft stream, calls),
+            // plus short snapshot and admin exchanges.
+            let permits = Arc::new(Semaphore::new(64));
             loop {
                 tokio::select! {
                     _ = &mut stopped => break,
@@ -300,10 +320,10 @@ impl Transport {
                         };
                         let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
                         let config = config.clone();
-                        let shared = shared.clone();
+                        let shared = accept_shared.clone();
                         let acceptor = acceptor.clone();
-                        let sink = sink.clone();
-                        let snapshots = snapshots.clone();
+                        let router = accept_router.clone();
+                        let calls = accept_calls.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
                             let Ok(Ok(mut stream)) = tokio::time::timeout(
@@ -314,7 +334,7 @@ impl Transport {
                                 (p.fingerprint == fp).then_some(id));
                             let Some(peer) = peer else { return };
                             let h = Header { cluster: config.cluster, from: peer, to: config.node_id };
-                            let _ = inbound(&mut stream, h, sink, snapshots.as_deref(), &shared, &fp).await;
+                            let _ = inbound(&mut stream, h, &router, &calls, &shared, &fp).await;
 
                         });
                     }
@@ -328,19 +348,55 @@ impl Transport {
             stop: Some(stop),
             task: Some(task),
             addr,
-            sender,
+            calls: Arc::new(PeerCalls::new(shared.clone())),
+            shared,
+            router,
+            call_server,
         })
     }
 
+    /// Client side of range and gateway calls to peers (R5-21).
+    pub fn calls(&self) -> &Arc<PeerCalls> {
+        &self.calls
+    }
+
+    /// Handlers of inbound peer calls; a call without its handler gets `Unavailable`.
+    pub fn set_call_handlers(
+        &self,
+        local: Option<Arc<dyn LocalRanges>>,
+        gateway: Option<Arc<dyn GatewayService>>,
+    ) {
+        self.call_server.set_handlers(local, gateway);
+    }
+
+    /// Queue, pool and timeout bounds of peer calls; open call connections are restarted.
+    pub fn set_call_limits(&self, limits: CallLimits) {
+        self.calls.set_limits(limits);
+        self.call_server.set_limits(limits);
+    }
+
     pub fn set_peers(&self, peers: BTreeMap<u64, PeerConfig>) -> Result<()> {
-        self.sender.shared.set(peers)
+        self.shared.set(peers)
+    }
+
+    pub fn router(&self) -> &Arc<GroupRouter> {
+        &self.router
+    }
+
+    /// Group `group`'s outbox; it shares each peer's connection with every other group.
+    pub fn group_outbox(&self, group: u64) -> Box<dyn Outbox> {
+        Box::new(Sender {
+            shared: self.shared.clone(),
+            router: self.router.clone(),
+            group,
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
     pub fn outbox(&self) -> Box<dyn Outbox> {
-        Box::new(self.sender.clone())
+        self.group_outbox(0)
     }
     pub fn shutdown(self) {
         drop(self);
@@ -368,13 +424,8 @@ impl Drop for Transport {
     }
 }
 
-async fn outbound(peers: Arc<Peers>, id: u64, mut rx: mpsc::Receiver<Message>) {
+async fn outbound(peers: Arc<Peers>, id: u64, mut rx: mpsc::Receiver<(u64, Message)>) {
     let config = &peers.config;
-    let h = Header {
-        cluster: config.cluster,
-        from: config.node_id,
-        to: id,
-    };
     let mut backoff = Duration::from_millis(100);
     let mut pending = None;
     loop {
@@ -383,8 +434,8 @@ async fn outbound(peers: Arc<Peers>, id: u64, mut rx: mpsc::Receiver<Message>) {
             backoff = Duration::from_millis(100);
             let mut probe = [0];
             loop {
-                let m = if let Some(m) = pending.take() {
-                    m
+                let (group, m) = if let Some(item) = pending.take() {
+                    item
                 } else {
                     tokio::select! {
                         biased;
@@ -394,11 +445,16 @@ async fn outbound(peers: Arc<Peers>, id: u64, mut rx: mpsc::Receiver<Message>) {
                         m = rx.recv() => match m { Some(m) => m, None => return },
                     }
                 };
+                let h = Header {
+                    cluster: group_cluster(config.cluster, group),
+                    from: config.node_id,
+                    to: id,
+                };
                 let Ok(bytes) = frame::encode(&h, &Body::Raft(m.clone())) else {
                     continue;
                 };
                 if frame::write_frame(&mut stream, &bytes).await.is_err() {
-                    pending = Some(m);
+                    pending = Some((group, m));
                     break;
                 }
             }
@@ -420,16 +476,22 @@ async fn read_body<S: AsyncRead + Unpin>(s: &mut S, h: &Header) -> Result<Body> 
     frame::decode(h, &frame::read_frame(s).await?)
 }
 
-async fn send_snapshot(sender: &SnapshotSender, m: &Message) -> Result<()> {
-    let manifest = Manifest::from_raft(sender.shared.config.cluster, m.get_snapshot())?;
-    let dir = sender.store.built_data_dir(&manifest);
+/// Sends one group's snapshot; `cluster` is that group's cluster id.
+async fn send_snapshot(
+    shared: &Peers,
+    store: &SnapshotStore,
+    cluster: [u8; 16],
+    m: &Message,
+) -> Result<()> {
+    let manifest = Manifest::from_raft(cluster, m.get_snapshot())?;
+    let dir = store.built_data_dir(&manifest);
     if !dir.is_dir() {
         return Err(protocol_error());
     }
-    let mut stream = sender.shared.connect(m.to).await?;
+    let mut stream = shared.connect(m.to).await?;
     let h = Header {
-        cluster: sender.shared.config.cluster,
-        from: sender.shared.config.node_id,
+        cluster,
+        from: shared.config.node_id,
         to: m.to,
     };
     let reply = Header {
@@ -481,21 +543,42 @@ async fn send_snapshot(sender: &SnapshotSender, m: &Message) -> Result<()> {
     }
 }
 
+/// Serves one inbound connection. `base` carries the database cluster id;
+/// each frame names its group through its header cluster (`group::group_of`).
 async fn inbound<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
-    h: Header,
-    sink: Arc<dyn PeerSink>,
-    store: Option<&SnapshotStore>,
+    base: Header,
+    router: &GroupRouter,
+    calls: &CallServer,
     peers: &Peers,
     fp: &str,
 ) -> Result<()> {
-    let reply = Header {
-        from: h.to,
-        to: h.from,
-        ..h
-    };
     loop {
-        match read_current(stream, &h, peers, fp).await? {
+        let (group, h, body) = read_group(stream, &base, peers, fp).await?;
+        let reply = Header {
+            from: h.to,
+            to: h.from,
+            ..h
+        };
+        if let Body::CallRequest { id, body } = body {
+            // A call connection carries only calls, all under the database cluster id.
+            if group != 0 || h.from == h.to {
+                return Err(protocol_error());
+            }
+            let check = || authorized(&peers.table.read().unwrap(), h.from, fp).is_ok();
+            return calls.serve(stream, h, (id, body), &check).await;
+        }
+        let Some(route) = router.route(group) else {
+            // Dropped and counted. A Raft stream stays up for the other groups;
+            // an admin call or snapshot transfer is one exchange, so it closes.
+            router.count_unknown();
+            if matches!(body, Body::Raft(_)) {
+                continue;
+            }
+            return Err(protocol_error());
+        };
+        let sink = route.sink;
+        match body {
             Body::AdminRequest(bytes) => {
                 let req = crate::admin::AdminRequest::decode(&bytes)?;
                 let response = tokio::task::spawn_blocking(move || sink.admin(h.from, req))
@@ -517,6 +600,7 @@ async fn inbound<S: AsyncRead + AsyncWrite + Unpin>(
                     return Err(protocol_error());
                 }
                 let manifest = Manifest::decode(h.cluster, &bytes)?;
+                let store = route.snapshots.as_deref();
                 let mut writer = store.ok_or_else(protocol_error)?.incoming(&manifest)?;
                 let (file, offset) = writer.resume_point();
                 write_body(stream, &reply, Body::SnapResume { file, offset }).await?;
@@ -577,4 +661,27 @@ async fn read_current<S: AsyncRead + Unpin>(
     let body = read_body(stream, h).await?;
     authorized(&peers.table.read().unwrap(), h.from, fp)?;
     Ok(body)
+}
+
+/// Reads one frame of any group derived from `base.cluster`. A cluster that
+/// derives from no group is rejected exactly as R4 rejects another cluster.
+async fn read_group<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    base: &Header,
+    peers: &Peers,
+    fp: &str,
+) -> Result<(u64, Header, Body)> {
+    let bytes = frame::read_frame(stream).await?;
+    let group = bytes
+        .get(8..24)
+        .and_then(|c| <[u8; 16]>::try_from(c).ok())
+        .and_then(|c| Some((group_of(base.cluster, c)?, c)));
+    let Some((group, cluster)) = group else {
+        frame::decode(base, &bytes)?;
+        return Err(protocol_error());
+    };
+    let h = Header { cluster, ..*base };
+    let body = frame::decode(&h, &bytes)?;
+    authorized(&peers.table.read().unwrap(), h.from, fp)?;
+    Ok((group, h, body))
 }

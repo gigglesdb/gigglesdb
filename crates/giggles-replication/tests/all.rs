@@ -101,3 +101,53 @@ mod sql_history;
 
 #[path = "once_net.rs"]
 mod once_net;
+
+#[path = "multi_group.rs"]
+mod multi_group;
+
+#[path = "host.rs"]
+mod host;
+
+#[path = "range_state.rs"]
+mod range_state;
+#[path = "range_host.rs"]
+mod range_host;
+
+#[path = "routing.rs"]
+mod routing;
+
+#[path = "group.rs"]
+mod group;
+
+#[path = "idle.rs"]
+mod idle;
+
+#[path = "call_codec.rs"]
+mod call_codec;
+
+#[path = "quiesce.rs"]
+mod quiesce;
+
+#[path = "bootstrap.rs"]
+mod bootstrap;
+
+#[path = "liveness.rs"]
+mod liveness;
+
+#[path = "transport_groups.rs"]
+mod transport_groups;
+
+#[path = "idle_hosts.rs"]
+mod idle_hosts;
+
+#[path = "range_calls.rs"]
+mod range_calls;
+
+#[path = "presplit.rs"]
+mod presplit;
+
+#[path = "group_snapshot.rs"]
+mod group_snapshot;
+
+#[path = "leader_reads.rs"]
+mod leader_reads;

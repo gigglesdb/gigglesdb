@@ -95,8 +95,10 @@ impl TermSink {
         *self.fenced.read().unwrap_or_else(PoisonError::into_inner)
     }
 }
-impl gr::BatchSink for TermSink {
-    fn replicate(&self, batch: Vec<u8>) -> Result<(), gr::ReplicateError> {
+impl TermSink {
+    /// `replicate` with this crate's error, so a caller can tell a refused batch
+    /// (definitely not applied) from an unknown outcome. Any error fences the sink.
+    pub(crate) fn replicate_local(&self, batch: Vec<u8>) -> Result<(), ReplicateError> {
         let submitted = {
             let fenced = self.fenced.read().unwrap_or_else(PoisonError::into_inner);
             let role = self.handle.role();
@@ -106,16 +108,20 @@ impl gr::BatchSink for TermSink {
                 self.handle.submit(batch)
             }
         };
-        let result = submitted
-            .and_then(|reply| reply.recv().unwrap_or(Err(ReplicateError::Stopped)))
-            .map_err(|e| match e {
-                ReplicateError::NotLeader => gr::ReplicateError::NotLeader,
-                e => gr::ReplicateError::Unavailable(e.to_string()),
-            });
+        let result =
+            submitted.and_then(|reply| reply.recv().unwrap_or(Err(ReplicateError::Stopped)));
         if result.is_err() {
             self.fence();
         }
         result
+    }
+}
+impl gr::BatchSink for TermSink {
+    fn replicate(&self, batch: Vec<u8>) -> Result<(), gr::ReplicateError> {
+        self.replicate_local(batch).map_err(|e| match e {
+            ReplicateError::NotLeader => gr::ReplicateError::NotLeader,
+            e => gr::ReplicateError::Unavailable(e.to_string()),
+        })
     }
 }
 

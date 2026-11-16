@@ -107,6 +107,7 @@ enum Command {
     LastIndex(Reply<u64>),
     Step(u64, Message),
     ReportSnapshot(u64, bool),
+    Liveness(u64, bool),
     Shutdown,
 }
 #[derive(Clone)]
@@ -115,6 +116,7 @@ pub struct ReplicaHandle {
     role: Arc<Mutex<RoleInfo>>,
     rounds: Arc<AtomicU64>,
     stopped: Arc<AtomicBool>,
+    quiesced: Arc<AtomicBool>,
 }
 impl ReplicaHandle {
     pub fn replicate(&self, encoded_batch: Vec<u8>) -> Result<(), ReplicateError> {
@@ -175,6 +177,10 @@ impl ReplicaHandle {
     pub fn report_snapshot(&self, to: u64, ok: bool) {
         let _ = self.tx.send(Command::ReportSnapshot(to, ok));
     }
+    /// Reports a peer node's liveness change to a quiescing group (GD-0075 R5-17b).
+    pub fn node_liveness(&self, node: u64, alive: bool) {
+        let _ = self.tx.send(Command::Liveness(node, alive));
+    }
     pub fn role(&self) -> RoleInfo {
         *self.role.lock().expect("role mutex poisoned")
     }
@@ -183,6 +189,10 @@ impl ReplicaHandle {
     }
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+    /// Whether the replica was quiesced after its last driver round (R5-17b).
+    pub fn is_quiesced(&self) -> bool {
+        self.quiesced.load(Ordering::Acquire)
     }
     pub fn shutdown(&self) {
         let _ = self.tx.send(Command::Shutdown);
@@ -225,10 +235,12 @@ pub fn spawn_with_policy(
         role: Arc::new(Mutex::new(replica.role())),
         rounds: Arc::new(AtomicU64::new(0)),
         stopped: Arc::new(AtomicBool::new(false)),
+        quiesced: Arc::new(AtomicBool::new(false)),
     };
     let role = handle.role.clone();
     let rounds = handle.rounds.clone();
     let stopped = handle.stopped.clone();
+    let quiesced_flag = handle.quiesced.clone();
     let join = thread::spawn(move || {
         let mut build: Option<thread::JoinHandle<crate::error::Result<crate::snapshot::Manifest>>> =
             None;
@@ -239,6 +251,7 @@ pub fn spawn_with_policy(
         let mut seq = 0u64;
         let mut published = replica.role();
         let mut next_tick = Instant::now() + tick;
+        let mut was_quiesced = false;
         let issue = |replica: &mut Replica, ctx| {
             if replica.read_index(ctx).is_ok() {
                 rounds.fetch_add(1, Ordering::Relaxed);
@@ -253,21 +266,37 @@ pub fn spawn_with_policy(
                     Err(_) => eprintln!("snapshot build thread panicked"),
                 }
             }
+            replica.hold_quiescence(!barrier.is_idle() || !pending.is_empty());
+            // A quiesced group does not tick: block until a command arrives (R5-17b).
+            let quiesced = replica.is_quiesced();
+            if was_quiesced && !quiesced {
+                next_tick = Instant::now() + tick;
+            }
+            was_quiesced = quiesced;
             // Checking the deadline before receiving prevents busy peer traffic from starving ticks.
-            if Instant::now() >= next_tick {
+            if !quiesced && Instant::now() >= next_tick {
                 replica.tick();
                 if let Some(ctx) = barrier.tick() {
                     issue(&mut replica, ctx);
                 }
                 next_tick = Instant::now() + tick;
             } else {
-                match rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+                let received = if quiesced {
+                    rx.recv()
+                        .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                } else {
+                    rx.recv_timeout(next_tick.saturating_duration_since(Instant::now()))
+                };
+                match received {
                     Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Ok(Command::Step(from, m)) => {
                         let _ = replica.step(from, m);
                     }
                     Ok(Command::ReportSnapshot(to, ok)) => replica.report_snapshot(to, ok),
+                    Ok(Command::Liveness(node, alive)) => {
+                        let _ = replica.node_liveness(node, alive);
+                    }
                     Ok(Command::LastIndex(reply)) => {
                         let _ = reply.send(Ok(replica.last_index()));
                     }
@@ -407,6 +436,7 @@ pub fn spawn_with_policy(
             }
             published = out.role;
             *role.lock().expect("role mutex poisoned") = published;
+            quiesced_flag.store(replica.is_quiesced(), Ordering::Release);
         }
         *role.lock().expect("role mutex poisoned") = RoleInfo {
             state: StateRole::Follower,

@@ -5,7 +5,7 @@ use crate::{
     log_store::{LogStore, PendingInstall},
     membership::{AdminCommand, Membership},
     snapshot::Manifest,
-    state::{AppliedPosition, StateMachine},
+    state::{AppliedPosition, ApplyOutcome, StateMachine},
 };
 use protobuf::Message as _;
 use raft::{
@@ -29,6 +29,10 @@ pub struct Output {
     pub read_states: Vec<(Vec<u8>, u64)>,
     pub role: RoleInfo,
 }
+/// Heartbeat context of a quiesce request (GD-0075 R5-17b).
+const QUIESCE: &[u8] = b"GDQUIESCE1";
+/// Consecutive idle leader ticks before a group quiesces (two heartbeat rounds).
+const QUIESCE_AFTER_TICKS: u32 = 4;
 struct Pending {
     waiter: u64,
     index: u64,
@@ -41,6 +45,18 @@ pub struct Replica {
     cluster: [u8; 16],
     pending: Vec<Pending>,
     membership: Membership,
+    /// Quiescence is on only when the host reports node liveness (`node_liveness`).
+    quiesce_enabled: bool,
+    /// Quiesced: ticks are ignored until a proposal, message or liveness change wakes it.
+    quiesced: bool,
+    /// The driver holds quiescence off while it waits on work raft-rs does not
+    /// track (a dropped ReadIndex its barrier will re-issue, an unreplied proposal).
+    quiesce_hold: bool,
+    /// Peer nodes the host's liveness tracker currently reports dead.
+    dead: BTreeSet<u64>,
+    idle_ticks: u32,
+    /// Messages built outside raft-rs (quiesce heartbeats), sent with the next drive.
+    outgoing: Vec<Message>,
 }
 impl Replica {
     pub fn new(log: LogStore, state: Arc<dyn StateMachine>, voters: &[u64]) -> Result<Self> {
@@ -93,6 +109,12 @@ impl Replica {
             cluster,
             pending: Vec::new(),
             membership,
+            quiesce_enabled: false,
+            quiesced: false,
+            quiesce_hold: false,
+            dead: BTreeSet::new(),
+            idle_ticks: 0,
+            outgoing: Vec::new(),
         })
     }
     fn decode_membership(bytes: Option<&[u8]>) -> Result<Membership> {
@@ -221,10 +243,126 @@ impl Replica {
             Ok(None)
         }
     }
+    /// One logical clock tick. A quiesced replica ignores it. A leader whose group has
+    /// been idle and fully replicated for `QUIESCE_AFTER_TICKS` ticks quiesces the group
+    /// (GD-0075 R5-17b): it sends every peer a quiesce heartbeat and stops ticking.
     pub fn tick(&mut self) {
+        if self.quiesced {
+            return;
+        }
+        // Judged before the tick: a heartbeat tick leaves outgoing messages pending.
+        let idle = self.can_quiesce();
         self.raw.tick();
+        if idle && self.raw.raft.state == StateRole::Leader {
+            self.idle_ticks += 1;
+            if self.idle_ticks >= QUIESCE_AFTER_TICKS {
+                self.quiesce();
+            }
+        } else {
+            self.idle_ticks = 0;
+        }
+    }
+    /// Lets an idle leader quiesce this group. Only for a host that reports every
+    /// peer node's liveness changes through `node_liveness`: a quiesced follower
+    /// detects its leader's failure only that way.
+    pub fn enable_quiescence(&mut self) {
+        self.quiesce_enabled = true;
+    }
+    /// True while this replica ignores ticks (no heartbeats, no election timeout).
+    pub fn is_quiesced(&self) -> bool {
+        self.quiesced
+    }
+    /// Holds quiescence off (driver-side pending work, review B1).
+    pub fn hold_quiescence(&mut self, hold: bool) {
+        self.quiesce_hold = hold;
+    }
+    fn wake(&mut self) {
+        if self.quiesced && self.raw.raft.state == StateRole::Leader {
+            // Peer activity flags are as old as the quiescence: clear them and
+            // restart the election clock, so the next check-quorum (a full
+            // election timeout from now) counts only fresh replies (review S5).
+            let me = self.node_id;
+            for (id, pr) in self.raw.raft.mut_prs().iter_mut() {
+                if *id != me {
+                    pr.recent_active = false;
+                }
+            }
+            self.raw.raft.election_elapsed = 0;
+        }
+        self.quiesced = false;
+        self.idle_ticks = 0;
+    }
+    /// A leader can quiesce when nothing is in flight: every entry is committed, applied
+    /// and matched by every peer that was recently active, and no proposal, read, leader
+    /// transfer or configuration change is pending.
+    fn can_quiesce(&self) -> bool {
+        let raft = &self.raw.raft;
+        let last = raft.raft_log.last_index();
+        self.quiesce_enabled
+            && !self.quiesce_hold
+            && raft.state == StateRole::Leader
+            && self.pending.is_empty()
+            && raft.lead_transferee.is_none()
+            && !raft.has_pending_conf()
+            && raft.pending_read_count() == 0
+            && raft.raft_log.committed == last
+            && raft.raft_log.applied == last
+            && !self.raw.has_ready()
+            && raft
+                .prs()
+                .iter()
+                .all(|(&id, pr)| {
+                    id == self.node_id
+                        || (pr.matched == last && pr.recent_active && !self.dead.contains(&id))
+                })
+    }
+    fn quiesce(&mut self) {
+        let raft = &self.raw.raft;
+        for (&id, pr) in raft.prs().iter() {
+            if id == self.node_id {
+                continue;
+            }
+            let mut m = Message::default();
+            m.set_msg_type(MessageType::MsgHeartbeat);
+            m.to = id;
+            m.from = self.node_id;
+            m.term = raft.term;
+            m.commit = pr.matched.min(raft.raft_log.committed);
+            m.context = QUIESCE.to_vec().into();
+            self.outgoing.push(m);
+        }
+        self.quiesced = true;
+        self.idle_ticks = 0;
+    }
+    /// A node's liveness changed (GD-0075 R5-17b; the host's coalesced node heartbeat).
+    /// A quiesced follower whose leader's node died wakes and campaigns. A quiesced
+    /// leader wakes on any peer's change: to catch a returning node up, or, when it is
+    /// itself cut off and sees its peers die, to tick again so check-quorum deposes it.
+    pub fn node_liveness(&mut self, node: u64, alive: bool) -> Result<()> {
+        if node == self.node_id {
+            return Ok(());
+        }
+        // Remembered even while awake: a late quiesce heartbeat from a leader
+        // already reported dead must not quiesce this follower (review S2).
+        if alive {
+            self.dead.remove(&node);
+        } else {
+            self.dead.insert(node);
+        }
+        if !self.quiesced || self.raw.raft.prs().get(node).is_none() {
+            return Ok(());
+        }
+        let role = self.role();
+        if role.state == StateRole::Leader {
+            self.wake();
+        } else if !alive && role.leader == node {
+            self.wake();
+            self.campaign()?;
+        }
+        Ok(())
     }
     pub fn campaign(&mut self) -> Result<()> {
+        self.wake();
         self.raw.campaign().map_err(Error::Raft)
     }
     pub fn set_election_timeout(&mut self, ticks: usize) {
@@ -300,6 +438,14 @@ impl Replica {
             peer.become_probe();
             peer.next_idx = m.reject_hint + 1;
         }
+        // Quiescence (R5-17b): a quiesce heartbeat from the current leader quiesces a
+        // caught-up follower; heartbeat responses never wake; anything else wakes.
+        let quiesce_request = m.get_msg_type() == MessageType::MsgHeartbeat && m.context == QUIESCE;
+        let leader_commit = m.commit;
+        let term = m.term;
+        if !quiesce_request && m.get_msg_type() != MessageType::MsgHeartbeatResponse {
+            self.wake();
+        }
         // The leader may still remember this peer's acknowledged position after
         // its disks were wiped. A heartbeat can arrive before snapshot recovery;
         // raft-rs otherwise panics when that remembered commit exceeds our log.
@@ -307,7 +453,24 @@ impl Replica {
         if m.get_msg_type() == MessageType::MsgHeartbeat {
             m.commit = m.commit.min(self.raw.raft.raft_log.last_index());
         }
-        self.raw.step(m).map_err(Error::Raft)
+        self.raw.step(m).map_err(Error::Raft)?;
+        if quiesce_request {
+            let raft = &self.raw.raft;
+            if self.quiesce_enabled
+                && !self.dead.contains(&from)
+                && raft.state == StateRole::Follower
+                && raft.leader_id == from
+                && raft.term == term
+                && raft.raft_log.last_index() == leader_commit
+                && raft.raft_log.committed == leader_commit
+            {
+                self.quiesced = true;
+                self.idle_ticks = 0;
+            } else {
+                self.wake();
+            }
+        }
+        Ok(())
     }
     fn propose_with(
         &mut self,
@@ -322,6 +485,7 @@ impl Replica {
             seq: waiter,
         }
         .encode();
+        self.wake();
         submit(&mut self.raw, context).map_err(Error::Raft)?;
         self.pending.push(Pending {
             waiter,
@@ -351,6 +515,7 @@ impl Replica {
         if self.role().state != StateRole::Leader {
             return Err(Error::NotLeader);
         }
+        self.wake();
         self.raw.read_index(ctx);
         Ok(())
     }
@@ -400,6 +565,13 @@ impl Replica {
                                 "node.apply.before",
                             );
                             let result = self.state.apply(payload, at);
+                            if result == Ok(ApplyOutcome::Refused) {
+                                // A range group refused the batch at apply time (stale
+                                // epoch or a key outside its bounds): nothing changed.
+                                refused = Some(self.state.take_refusal(e.index).unwrap_or_else(
+                                    || "the batch was refused at apply time".to_owned(),
+                                ));
+                            }
                             if result.is_ok() {
                                 crate::failpoint::hit(
                                     &self.cluster,
@@ -558,6 +730,9 @@ impl Replica {
             self.raw.advance_apply();
             self.fail_deposed(&mut out);
         }
+        // After this round's raft messages: a quiesce heartbeat must reach each peer after
+        // the ordinary heartbeat of the same tick, which would otherwise wake it again.
+        out.messages.append(&mut self.outgoing);
         self.fail_deposed(&mut out);
         if self.role().state == StateRole::Leader {
             let cs = self.conf_state();

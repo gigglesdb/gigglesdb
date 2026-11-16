@@ -1,4 +1,5 @@
 pub mod certs;
+pub mod groups;
 pub mod net_cluster;
 use giggles_replication::{
     error::Result,
@@ -40,6 +41,9 @@ pub struct Cluster {
     rng: u64,
     serial: u64,
     faults: (u64, u64, bool),
+    quiesce: bool,
+    /// Messages delivered to a replica so far.
+    pub delivered: u64,
 }
 impl Cluster {
     pub fn new(name: &str, voters: u64, seed: u64) -> Self {
@@ -65,6 +69,8 @@ impl Cluster {
             rng: seed,
             serial: 0,
             faults: (0, 0, false),
+            quiesce: false,
+            delivered: 0,
         };
         for id in 1..=voters {
             c.states.insert(id, Arc::new(MemStateMachine::new()));
@@ -160,6 +166,7 @@ impl Cluster {
             let node = self.nodes.get_mut(&m.to).unwrap();
             for _ in 0..copies {
                 node.step(m.from, m.clone()).expect("step");
+                self.delivered += 1;
             }
             if snapshot {
                 self.nodes
@@ -232,6 +239,14 @@ impl Cluster {
         self.pump();
         Ok(self.serial)
     }
+    /// Lets idle groups quiesce on every node, now and after restarts (R5-17b).
+    #[allow(dead_code)]
+    pub fn enable_quiescence(&mut self) {
+        self.quiesce = true;
+        for node in self.nodes.values_mut() {
+            node.enable_quiescence();
+        }
+    }
     #[allow(dead_code)]
     pub fn refused(&self, waiter: u64) -> Option<String> {
         self.refused.get(&waiter).cloned()
@@ -278,6 +293,9 @@ impl Cluster {
         )
         .unwrap();
         node.set_election_timeout(10 + id as usize);
+        if self.quiesce {
+            node.enable_quiescence();
+        }
         self.nodes.insert(id, node);
     }
     #[allow(dead_code)]
