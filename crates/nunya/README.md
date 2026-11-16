@@ -1,3 +1,5 @@
+**Documentation:** [Nunya site](site/index.html) | [Quickstart](site/docs/quickstart.html) | [Reference](site/docs/index.html)
+
 # Nunya
 
 Nunya is a PostgreSQL gateway that replaces protected values with task-scoped tokens. Agents can carry tokens between approved columns without seeing the underlying values. Masked columns return a placeholder or SQL NULL. Unanalysable operations fail closed.

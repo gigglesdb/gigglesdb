@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Drivers - Nunya</title><link rel="stylesheet" href="../assets/site.css"><script src="../assets/site.js" defer></script></head>
+<body class="docs-page"><a class="skip-link" href="#main">Skip to content</a><header class="topbar"><a class="brand" href="../index.html">Nunya</a><nav aria-label="Primary"><a href="index.html">Documentation</a><a href="quickstart.html">Quickstart</a></nav><button class="nav-toggle" aria-controls="docs-nav" aria-expanded="false" type="button">Menu</button></header><div class="docs-layout"><nav id="docs-nav" class="sidebar" aria-label="Documentation"><a href="index.html">Documentation</a><a href="quickstart.html">Quickstart</a><a href="how-it-works.html">How it works</a><a href="concepts.html">Concepts</a><a href="walkthrough.html">Walkthrough</a><a href="policy.html">Policy reference</a><a href="configuration.html">Configuration</a><a href="cli.html">CLI reference</a><a href="errors.html">Errors</a><a href="sql.html">SQL support</a><a href="drivers.html" aria-current="page">Drivers</a><a href="spanner.html">Spanner</a><a href="security.html">Security</a><a href="operations.html">Operations</a><a href="limitations.html">Limitations</a><a href="faq.html">FAQ</a></nav><article id="main" class="doc-content"><p class="eyebrow">Nunya documentation</p><h1>Drivers</h1><p>Connect PostgreSQL clients to Nunya's listener with the task user and secret. The SQL policy applies regardless of the driver; a working handshake does not make every driver-generated statement supported.</p><nav class="on-this-page" aria-label="On this page"><strong>On this page</strong><ul><li><a href="#tested">What has been exercised</a></li><li><a href="#psycopg">psycopg connection</a></li><li><a href="#jdbc">pgJDBC connection</a></li><li><a href="#tokio">tokio-postgres connection</a></li><li><a href="#compatibility">Compatibility checklist</a></li></ul></nav><section aria-labelledby="tested"><h2 id="tested">What has been exercised</h2><div class="table-wrap"><table><thead><tr><th scope="col">Client</th><th scope="col">Evidence and scope</th></tr></thead><tbody><tr><td>psycopg 3</td><td>Seven-step harness check using prepared statements and text parameters/results.</td></tr><tr><td>pgJDBC 42.7.3</td><td>Seven-step harness check with extended mode, prepare threshold 1 and binary transfer disabled.</td></tr><tr><td>tokio-postgres 0.7.15</td><td>Used in service, non-interference and PGAdapter integration tests. This is not the same seven-step external-driver qualification.</td></tr></tbody></table></div><p>The psycopg and JDBC checks read blind emails, write one to the same domain, check stable token output, refuse a token into plain notes, refuse blind LIKE, query a missing plain-country row, and verify the masked phone placeholder. Run against freshly seeded harness data. No driver changes are needed for the tested workflows; point connection settings to Nunya and respect its supported SQL subset.</p></section><section aria-labelledby="psycopg"><h2 id="psycopg">psycopg connection</h2><pre><code>import os
+import psycopg
+
+with psycopg.connect(
+    &#x27;host=127.0.0.1 port=6432 dbname=app sslmode=disable&#x27;,
+    user=os.environ[&#x27;NUNYA_TASK_USER&#x27;],
+    password=os.environ[&#x27;NUNYA_TASK_SECRET&#x27;],
+    autocommit=True,
+) as conn:
+    with conn.cursor() as cur:
+        cur.execute(&#x27;SELECT id, email FROM customers WHERE failed_payments &gt;= %s&#x27;,
+                    (2,), prepare=True)
+        rows = cur.fetchall()
+        # Keep token values opaque; carry them only to approved destinations.
+</code></pre><p>The harness script accepts its own driver-test arguments (these are not Nunya CLI flags):</p><pre><code>python harness/drivers/psycopg_check.py \
+  --dsn postgresql://127.0.0.1:6432/app \
+  --task-id &quot;$TASK_ID&quot; --secret &quot;$TASK_SECRET&quot;</code></pre><p>The script prints only PASS/FAIL step names and a total such as <code>7 passed; 0 failed</code>; it suppresses returned values and exception details. Command-line secrets can appear in process listings, so use this only for isolated test credentials.</p></section><section aria-labelledby="jdbc"><h2 id="jdbc">pgJDBC connection</h2><pre><code>Properties properties = new Properties();
+properties.setProperty(&quot;user&quot;, System.getenv(&quot;NUNYA_TASK_USER&quot;));
+properties.setProperty(&quot;password&quot;, System.getenv(&quot;NUNYA_TASK_SECRET&quot;));
+properties.setProperty(&quot;preferQueryMode&quot;, &quot;extended&quot;);
+properties.setProperty(&quot;prepareThreshold&quot;, &quot;1&quot;);
+properties.setProperty(&quot;binaryTransfer&quot;, &quot;false&quot;);
+properties.setProperty(&quot;stringtype&quot;, &quot;unspecified&quot;);
+Connection connection = DriverManager.getConnection(
+    &quot;jdbc:postgresql://127.0.0.1:6432/app'sslmode=disable&quot;, properties);
+connection.setAutoCommit(true);
+PreparedStatement query = connection.prepareStatement(
+    &quot;SELECT id, email FROM customers WHERE failed_payments &gt;= '&quot;);
+query.setInt(1, 2);
+ResultSet rows = query.executeQuery();</code></pre><p>The checked harness uses Java 17+ single-file source launching. Supply an existing pgJDBC JAR path:</p><pre><code>java --class-path /path/to/postgresql-42.7.3.jar \
+  harness/drivers/jdbc_check.java \
+  &quot;jdbc:postgresql://127.0.0.1:6432/app'sslmode=disable&quot; &quot;$TASK_ID&quot; &quot;$TASK_SECRET&quot;</code></pre></section><section aria-labelledby="tokio"><h2 id="tokio">tokio-postgres connection</h2><pre><code>let mut config = tokio_postgres::Config::new();
+config.host(&quot;127.0.0.1&quot;).port(6432).dbname(&quot;app&quot;);
+config.user(&amp;std::env::var(&quot;NUNYA_TASK_USER&quot;)');
+config.password(std::env::var(&quot;NUNYA_TASK_SECRET&quot;)');
+let (client, connection) = config.connect(tokio_postgres::NoTls).await';
+tokio::spawn(async move { let _ = connection.await; });
+let rows = client.query(
+    &quot;SELECT id, email FROM customers WHERE failed_payments &gt;= $1&quot;,
+    &amp;[&amp;2_i32],
+).await';</code></pre><p>This fragment belongs in an async Rust application that already handles errors and runs Tokio. NoTls is for the explicitly plaintext local harness. For a deployed listener, configure certificate verification in the client's TLS connector.</p></section><section aria-labelledby="compatibility"><h2 id="compatibility">Compatibility checklist</h2><p>Keep task tokens opaque, preserve their apparent SQL types, bind them only in the permitted domain, and handle Nunya SQLSTATE refusals. Send initial no-op SET statements separately from application SQL. Choose explicit text parameter/result formats when reproducing the published driver checks. Do not enable driver discovery, migration, COPY, partition or metadata workflows without checking their statements against <a href="sql.html">SQL support</a>. For native gRPC authentication and GoogleSQL parameters, use the <a href="spanner.html">Spanner guide</a>.</p></section></article></div><footer class="site-footer"><a href="../index.html">Nunya</a><span>Let agents work with data they never see.</span><a href="index.html">Documentation</a></footer></body></html>
