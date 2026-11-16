@@ -3,6 +3,9 @@
 //! New task types live here so they never collide with the legacy prototype
 //! names (`crate::types::TaskId`, `policy.rs`, `accounting.rs`).
 pub mod admit;
+// R3-611: consumed by protected_commit (R3-615+), the preview store and undo.
+#[allow(dead_code)]
+pub(crate) mod authority;
 pub mod catalog;
 pub mod columns;
 pub mod context;
@@ -22,6 +25,9 @@ pub(crate) mod records;
 pub(crate) mod preview;
 #[allow(dead_code)]
 pub(crate) mod undo;
+// R3-613: consumed by protected_commit (R3-615+) and outcome lookup.
+#[allow(dead_code)]
+pub(crate) mod receipt;
 pub mod statements;
 #[cfg(test)]
 mod statements_tests;
