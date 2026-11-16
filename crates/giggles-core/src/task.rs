@@ -9,6 +9,9 @@ pub(crate) mod authority;
 pub mod catalog;
 pub mod columns;
 pub mod context;
+// R3-614: consumed by protected_commit (R3-615+).
+#[allow(dead_code)]
+pub(crate) mod decide;
 pub mod definition;
 pub mod effects;
 pub mod error;
