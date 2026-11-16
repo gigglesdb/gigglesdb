@@ -63,14 +63,6 @@ pub(crate) fn root_check(root: &RootKey) -> [u8; 32] {
     output
 }
 
-/// Derive a scope secret from its public random salt.
-pub fn derive_scope(root: &RootKey, scope_salt: &[u8; 32]) -> ScopeKeys {
-    let mut secret = [0; 32];
-    Hkdf::<Sha256>::new(Some(scope_salt), &root.0)
-        .expand(b"nunya/v1/scope", &mut secret)
-        .expect("fixed HKDF output length");
-    ScopeKeys::new(secret)
-}
 /// Derivation version stored with each scope row.
 pub const SCOPE_DERIVATION_V2: u16 = 2;
 
@@ -177,11 +169,9 @@ mod tests {
         let a = derive_scope_v2(&root, &[0; 32], &[0; 16], "postgres").unwrap();
         let other_route = derive_scope_v2(&root, &[0; 32], &[0; 16], "spanner-native").unwrap();
         let other_deployment = derive_scope_v2(&root, &[0; 32], &[1; 16], "postgres").unwrap();
-        let v1 = derive_scope(&root, &[0; 32]);
         assert!(a.secret != other_route.secret);
         assert!(a.secret != other_deployment.secret);
         for keys in [&a, &other_route, &other_deployment] {
-            assert!(keys.secret != v1.secret);
             assert_eq!(format!("{keys:?}"), "ScopeKeys(..)");
         }
         assert_eq!(SCOPE_DERIVATION_V2, 2);
@@ -198,26 +188,5 @@ mod tests {
                 assert!(!format!("{error:?} {error}").contains(&route));
             }
         }
-    }
-
-    #[test]
-    fn separation_and_redaction() {
-        let root = RootKey::from_hex(&"00".repeat(32)).unwrap();
-        let a = derive_scope(&root, &[0; 32]);
-        let b = derive_scope(&root, &[1; 32]);
-        assert!(
-            a.secret
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-                == "50aac2c0c305bcfa9c0308d2b8148599073357c2b9b6a29c0f7bd2880cbf765f"
-        );
-        assert!(a.secret != b.secret);
-        assert!(
-            *subkey(&a, &DomainName("a".into()), "text")
-                != *subkey(&a, &DomainName("b".into()), "text")
-        );
-        assert_eq!(format!("{root:?}"), "RootKey(..)");
-        assert!(RootKey::from_hex("invalid").is_err());
     }
 }

@@ -3,7 +3,6 @@ use crate::{
     error::{NyCode, Refusal},
     pgwire::auth::ScramVerifier,
     policy::DomainName,
-    token::TaskId,
 };
 use data_encoding::{BASE32_NOPAD, HEXLOWER};
 use serde::{Deserialize, Serialize};
@@ -17,6 +16,21 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// Legacy task identifier used only by the old CLI task commands.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TaskId(
+    /// Non-secret identifier bytes.
+    pub [u8; 16],
+);
+impl std::fmt::Debug for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Persistent task records serialized under one store-local mutation lock.
 #[derive(Clone)]

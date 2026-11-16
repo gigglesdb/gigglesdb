@@ -12,20 +12,6 @@ pub mod fpe;
 pub mod keys;
 /// Text token support.
 pub mod text;
-/// Non-secret task identifier.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TaskId(
-    /// Non-secret identifier bytes.
-    pub [u8; 16],
-);
-impl std::fmt::Debug for TaskId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in self.0 {
-            write!(f, "{b:02x}")?;
-        }
-        Ok(())
-    }
-}
 // Shared implementation also used by durable credential identifiers.
 macro_rules! id_type {
     ($name:ident, $doc:literal) => {

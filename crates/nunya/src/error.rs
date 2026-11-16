@@ -6,7 +6,7 @@ pub enum NyCode {
     TokenOutsideDomain,
     /// operation not allowed on a blind column.
     BlindOperation,
-    /// token not valid in this task.
+    /// token not valid in this session.
     TokenNotValid,
     /// statement could not be fully analysed.
     NotAnalysable,
@@ -14,7 +14,7 @@ pub enum NyCode {
     MaskedExpression,
     /// statement kind not allowed through the gateway.
     StatementNotAllowed,
-    /// tokenize limit reached for this task.
+    /// tokenize limit reached.
     TokenizeLimit,
     /// schema snapshot is stale.
     SchemaStale,
@@ -65,11 +65,11 @@ impl NyCode {
         match self {
             Self::TokenOutsideDomain => "token used outside its domain",
             Self::BlindOperation => "operation not allowed on a blind column",
-            Self::TokenNotValid => "token not valid in this task",
+            Self::TokenNotValid => "token not valid in this session",
             Self::NotAnalysable => "statement could not be fully analysed",
             Self::MaskedExpression => "masked column used in an expression",
             Self::StatementNotAllowed => "statement kind not allowed through the gateway",
-            Self::TokenizeLimit => "tokenize limit reached for this task",
+            Self::TokenizeLimit => "tokenize limit reached",
             Self::SchemaStale => "schema snapshot is stale",
             Self::ReadLogUnavailable => "read log unavailable",
             Self::ProtocolNotAllowed => "protocol feature not allowed through the gateway",

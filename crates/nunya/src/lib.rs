@@ -23,7 +23,7 @@ pub mod schema;
 pub mod spanner;
 /// Durable state, authority and connection registry.
 pub mod state;
-/// Task support.
+/// Legacy task store used only by the old CLI task commands; removed when the CLI group is removed.
 pub mod task;
 /// Token support.
 pub mod token;
