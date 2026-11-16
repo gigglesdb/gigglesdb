@@ -1075,18 +1075,20 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
             .session_login(id, &ctx.route)
             .map(|login| (id, login))
     });
-    let candidate = login.as_ref().map(|(_, login)| login.verifier.clone().0);
-    let verifier = match candidate {
+    let candidate = login
+        .as_ref()
+        .map(|(_, login)| login.verifiers.iter().map(|v| v.clone().0).collect());
+    let verifiers = match candidate {
         Some(v) => v,
-        None => ScramVerifier {
+        None => vec![ScramVerifier {
             salt: random::<16>()?.to_vec(),
             iterations: 4096,
             stored_key: random::<32>()?,
             server_key: random::<32>()?,
-        },
+        }],
     };
     let nonce = random::<18>()?;
-    let mut scram = ScramServer::new(verifier, || nonce);
+    let mut scram = ScramServer::new(verifiers, || nonce);
     agent
         .send(&[Backend::AuthenticationSasl(ScramServer::mechanisms())])
         .await?;
@@ -1630,6 +1632,85 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    fn acquire_overlap(f: &Fixture) -> SessionId {
+        use crate::state::model::Verifier;
+        use sha2::{Digest, Sha256};
+        let (id, principal) = acquire_login(f, "postgres");
+        f.ctx
+            .authority
+            .renew(
+                principal,
+                id,
+                None,
+                Some((
+                    Verifier(ScramVerifier::from_password(
+                        "rotated-secret",
+                        b"test-salt",
+                        4096,
+                    )),
+                    Sha256::digest(b"rotated-secret").into(),
+                )),
+            )
+            .unwrap();
+        id
+    }
+    async fn assert_login_accepted(f: &mut Fixture, id: SessionId, password: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let ctx = Arc::get_mut(&mut f.ctx).unwrap();
+            ctx.upstream.host = "127.0.0.1".into();
+            ctx.upstream.port = listener.local_addr().unwrap().port();
+            let fake_ctx = f.ctx.clone();
+            let fake = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut wire = Agent { io: Box::new(stream), buffer: BytesMut::new(), ctx: fake_ctx };
+                assert!(matches!(wire.startup().await.unwrap(), StartupMessage::Startup { .. }));
+                wire.send(&[
+                    Backend::AuthenticationOk,
+                    Backend::BackendKeyData { pid: 123, secret: vec![1, 2, 3, 4] },
+                    Backend::ReadyForQuery(b'I'),
+                ]).await.unwrap();
+                assert!(matches!(wire.recv().await.unwrap(), Frontend::Query(sql) if sql.starts_with("SET search_path")));
+                wire.send(&[Backend::CommandComplete("SET".into()), Backend::ReadyForQuery(b'I')]).await.unwrap();
+                let mut byte = [0];
+                while wire.io.read(&mut byte).await.unwrap() != 0 {}
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let ctx = f.ctx.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_tcp(stream, ctx).await;
+            });
+            let (client, connection) = tokio_postgres::Config::new()
+                .host("127.0.0.1").port(address.port())
+                .user(format!("session:{}", id.to_hex())).password(password)
+                .dbname("app").connect(tokio_postgres::NoTls).await.unwrap();
+            let connection = tokio::spawn(connection);
+            drop(client);
+            connection.await.unwrap().unwrap();
+            server.await.unwrap();
+            fake.await.unwrap();
+        }).await.unwrap();
+    }
+    #[tokio::test]
+    async fn overlap_accepts_both_session_passwords() {
+        let mut f = Fixture::new();
+        let id = acquire_overlap(&f);
+        assert_login_accepted(&mut f, id, "login-secret").await;
+        assert_login_accepted(&mut f, id, "rotated-secret").await;
+    }
+    #[tokio::test]
+    async fn revoked_overlap_password_refused_before_upstream() {
+        use sha2::{Digest, Sha256};
+        let mut f = Fixture::new();
+        let id = acquire_overlap(&f);
+        f.ctx
+            .authority
+            .revoke_login_credential(id, Sha256::digest(b"login-secret").into());
+        assert_login_refused(&mut f, &format!("session:{}", id.to_hex()), "login-secret").await;
+        assert_login_accepted(&mut f, id, "rotated-secret").await;
     }
     #[tokio::test]
     async fn principal_credentials_are_not_database_logins() {

@@ -7,19 +7,31 @@ pub struct SessionLogin {
     pub principal: PrincipalId,
     /// Stored session token scope.
     pub scope: TokenScope,
-    /// Selected active credential verifier.
-    pub verifier: Verifier,
+    /// Active credential verifiers sharing the advertised SCRAM parameters.
+    pub verifiers: Vec<Verifier>,
 }
 impl fmt::Debug for SessionLogin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionLogin")
             .field("principal", &self.principal)
             .field("scope", &"[REDACTED]")
-            .field("verifier", &"[REDACTED]")
+            .field("verifiers", &"[REDACTED]")
             .finish()
     }
 }
 impl Authority {
+    /// Revoke a credential in the authority view for login tests only.
+    #[cfg(test)]
+    pub(crate) fn revoke_login_credential(&self, id: SessionId, secret_hash: [u8; 32]) {
+        let mut view = self.view.write().unwrap();
+        let credential = view
+            .session_credentials
+            .values_mut()
+            .find(|c| c.session == id && c.secret_hash == secret_hash)
+            .unwrap();
+        credential.state = CredentialState::Revoked;
+    }
+
     /// Resolve login material without refreshing activity or mutating state.
     pub fn session_login(&self, id: SessionId, route: &RouteId) -> Option<SessionLogin> {
         let v = self.view.read().ok()?;
@@ -40,17 +52,25 @@ impl Authority {
         if scope.route != *route || scope.derivation_version != 2 {
             return None;
         }
-        // SCRAM can offer only one salt; credential-rotation overlap on this port
-        // remains an open question raised by lead 4.
-        let credential = v
+        // Q9: offer every active credential during rotation when all share the
+        // SCRAM salt and iterations; otherwise fall back to the newest only.
+        let mut credentials: Vec<_> = v
             .session_credentials
             .values()
             .filter(|c| c.session == id && c.state == CredentialState::Active && now < c.expires_ms)
-            .max_by_key(|c| (c.expires_ms, c.id))?;
+            .collect();
+        credentials.sort_unstable_by_key(|c| std::cmp::Reverse((c.expires_ms, c.id)));
+        let newest = credentials.first()?;
+        if !credentials.iter().all(|c| {
+            c.verifier.0.salt == newest.verifier.0.salt
+                && c.verifier.0.iterations == newest.verifier.0.iterations
+        }) {
+            credentials.truncate(1);
+        }
         Some(SessionLogin {
             principal: session.principal,
             scope: scope.clone(),
-            verifier: credential.verifier.clone(),
+            verifiers: credentials.iter().map(|c| c.verifier.clone()).collect(),
         })
     }
 }
@@ -159,11 +179,11 @@ mod tests {
         assert_eq!(login.principal, s.principal);
         assert_eq!(login.scope.id, s.scope);
         assert!(
-            login.verifier.0.to_pg_string() == super::super::tests::verifier().0.to_pg_string()
+            login.verifiers[0].0.to_pg_string() == super::super::tests::verifier().0.to_pg_string()
         );
         let debug = format!("{login:?}");
         assert!(debug.contains("scope: \"[REDACTED]\""));
-        assert!(!debug.contains(&login.verifier.0.to_pg_string()));
+        assert!(!debug.contains(&login.verifiers[0].0.to_pg_string()));
     }
     #[test]
     fn credential_selection() {
@@ -181,10 +201,12 @@ mod tests {
         ));
         v.session_credentials.insert(c.id, c.clone());
         drop(v);
+        assert_eq!(
+            f.a.session_login(s.id, &route()).unwrap().verifiers.len(),
+            1
+        );
         assert!(
-            f.a.session_login(s.id, &route())
-                .unwrap()
-                .verifier
+            f.a.session_login(s.id, &route()).unwrap().verifiers[0]
                 .0
                 .to_pg_string()
                 == c.verifier.0.to_pg_string()
@@ -192,13 +214,96 @@ mod tests {
         let mut v = f.a.view.write().unwrap();
         v.session_credentials.get_mut(&first.id).unwrap().expires_ms += 1;
         drop(v);
+        assert_eq!(
+            f.a.session_login(s.id, &route()).unwrap().verifiers.len(),
+            1
+        );
         assert!(
-            f.a.session_login(s.id, &route())
-                .unwrap()
-                .verifier
+            f.a.session_login(s.id, &route()).unwrap().verifiers[0]
                 .0
                 .to_pg_string()
                 == first.verifier.0.to_pg_string()
+        );
+    }
+    fn overlap_fixture() -> (Fixture, AccessSession, CredentialId, CredentialId) {
+        let (f, s) = fixture();
+        let mut v = f.a.view.write().unwrap();
+        let mut c = v.session_credentials.values().next().unwrap().clone();
+        v.session_credentials.clear();
+        c.id = CredentialId([1; 16]);
+        let first = c.id;
+        v.session_credentials.insert(c.id, c.clone());
+        c.id = CredentialId([2; 16]);
+        // Preserve the advertised parameters while changing the password.
+        c.verifier = Verifier(crate::pgwire::auth::ScramVerifier::from_password(
+            "rotated",
+            &c.verifier.0.salt,
+            c.verifier.0.iterations,
+        ));
+        let second = c.id;
+        v.session_credentials.insert(c.id, c);
+        drop(v);
+        (f, s, first, second)
+    }
+    #[test]
+    fn shared_parameters_return_all_newest_first() {
+        let (f, s, first, second) = overlap_fixture();
+        let login = f.a.session_login(s.id, &route()).unwrap();
+        assert_eq!(login.verifiers.len(), 2);
+        let v = f.a.view.read().unwrap();
+        for (actual, id) in login.verifiers.iter().zip([second, first]) {
+            assert!(
+                actual.0.to_pg_string() == v.session_credentials[&id].verifier.0.to_pg_string()
+            );
+        }
+    }
+    #[test]
+    fn differing_iterations_return_newest_only() {
+        let (f, s, _, second) = overlap_fixture();
+        f.a.view
+            .write()
+            .unwrap()
+            .session_credentials
+            .get_mut(&second)
+            .unwrap()
+            .verifier
+            .0
+            .iterations += 1;
+        assert_eq!(
+            f.a.session_login(s.id, &route()).unwrap().verifiers.len(),
+            1
+        );
+    }
+    #[test]
+    fn revoked_overlap_credential_is_excluded() {
+        let (f, s, _, second) = overlap_fixture();
+        f.a.view
+            .write()
+            .unwrap()
+            .session_credentials
+            .get_mut(&second)
+            .unwrap()
+            .state = CredentialState::Revoked;
+        let login = f.a.session_login(s.id, &route()).unwrap();
+        assert_eq!(login.verifiers.len(), 1);
+        assert!(
+            login.verifiers[0].0.to_pg_string() == super::super::tests::verifier().0.to_pg_string()
+        );
+    }
+    #[test]
+    fn expired_overlap_credential_is_excluded() {
+        let (f, s, _, second) = overlap_fixture();
+        f.a.view
+            .write()
+            .unwrap()
+            .session_credentials
+            .get_mut(&second)
+            .unwrap()
+            .expires_ms = 1000;
+        let login = f.a.session_login(s.id, &route()).unwrap();
+        assert_eq!(login.verifiers.len(), 1);
+        assert!(
+            login.verifiers[0].0.to_pg_string() == super::super::tests::verifier().0.to_pg_string()
         );
     }
     #[test]

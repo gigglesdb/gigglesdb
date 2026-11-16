@@ -124,7 +124,7 @@ enum State {
 }
 /// Single-use SCRAM server; every failed exchange becomes permanently closed.
 pub struct ScramServer {
-    verifier: ScramVerifier,
+    verifiers: Vec<ScramVerifier>,
     suffix: String,
     state: State,
 }
@@ -135,12 +135,12 @@ impl fmt::Debug for ScramServer {
 }
 impl ScramServer {
     /// Create an exchange using 144 bits of caller-supplied fresh nonce entropy.
-    pub fn new(verifier: ScramVerifier, nonce_source: impl FnOnce() -> [u8; 18]) -> Self {
-        Self::with_suffix(verifier, BASE64.encode(&nonce_source()))
+    pub fn new(verifiers: Vec<ScramVerifier>, nonce_source: impl FnOnce() -> [u8; 18]) -> Self {
+        Self::with_suffix(verifiers, BASE64.encode(&nonce_source()))
     }
-    fn with_suffix(verifier: ScramVerifier, suffix: String) -> Self {
+    fn with_suffix(verifiers: Vec<ScramVerifier>, suffix: String) -> Self {
         Self {
-            verifier,
+            verifiers,
             suffix,
             state: State::Initial,
         }
@@ -153,6 +153,14 @@ impl ScramServer {
     pub fn handle_initial(&mut self, mechanism: &str, data: &[u8]) -> Result<ScramStep, Refusal> {
         let state = std::mem::replace(&mut self.state, State::Closed);
         if !matches!(state, State::Initial) || mechanism != "SCRAM-SHA-256" {
+            return Err(denied());
+        }
+        let verifier = self.verifiers.first().ok_or_else(denied)?;
+        if verifier.iterations == 0
+            || !self.verifiers.iter().all(|candidate| {
+                candidate.salt == verifier.salt && candidate.iterations == verifier.iterations
+            })
+        {
             return Err(denied());
         }
         if data.starts_with(b"y,,") || data.starts_with(b"p=") {
@@ -175,15 +183,15 @@ impl ScramServer {
             .next()
             .and_then(|s| s.strip_prefix("r="))
             .ok_or_else(denied)?;
-        if !valid_nonce(nonce) || fields.next().is_some() || self.verifier.iterations == 0 {
+        if !valid_nonce(nonce) || fields.next().is_some() {
             return Err(denied());
         }
         let nonce = format!("{}{}", nonce, self.suffix);
         let first = format!(
             "r={},s={},i={}",
             nonce,
-            BASE64.encode(&self.verifier.salt),
-            self.verifier.iterations
+            BASE64.encode(&verifier.salt),
+            verifier.iterations
         );
         self.state = State::Final {
             bare: bare.into(),
@@ -220,25 +228,33 @@ impl ScramServer {
             .map_err(|_| denied())?;
         let (without_proof, _) = text.rsplit_once(",p=").ok_or_else(denied)?;
         let auth = format!("{bare},{first},{without_proof}");
-        let signature = mac(&self.verifier.stored_key, auth.as_bytes());
-        let mut key = [0; 32];
-        for ((out, a), b) in key.iter_mut().zip(proof).zip(signature) {
-            *out = a ^ b;
+        let mut matched = false;
+        let mut server_signature = [0u8; 32];
+        for verifier in &self.verifiers {
+            let signature = mac(&verifier.stored_key, auth.as_bytes());
+            let mut key = [0; 32];
+            for ((out, a), b) in key.iter_mut().zip(proof).zip(signature) {
+                *out = a ^ b;
+            }
+            // Vetted constant-time equality for every candidate, without early exit.
+            let candidate: [u8; 32] = Sha256::digest(key).into();
+            let check = mac(&verifier.stored_key, &candidate);
+            let mut comparison =
+                Hmac::<Sha256>::new_from_slice(&verifier.stored_key).map_err(|_| denied())?;
+            comparison.update(&verifier.stored_key);
+            let valid = comparison.verify_slice(&check).is_ok();
+            let mask = 0u8.wrapping_sub(u8::from(valid));
+            let signature = mac(&verifier.server_key, auth.as_bytes());
+            for (out, byte) in server_signature.iter_mut().zip(signature) {
+                *out = (*out & !mask) | (byte & mask);
+            }
+            matched |= valid;
         }
-        // Compare HMAC(stored_key, candidate) with HMAC(stored_key, stored_key)
-        // using the vetted constant-time verify_slice, avoiding a manual equality loop.
-        let candidate: [u8; 32] = Sha256::digest(key).into();
-        let check = mac(&self.verifier.stored_key, &candidate);
-        let mut comparison =
-            Hmac::<Sha256>::new_from_slice(&self.verifier.stored_key).map_err(|_| denied())?;
-        comparison.update(&self.verifier.stored_key);
-        comparison.verify_slice(&check).map_err(|_| denied())?;
+        if !matched {
+            return Err(denied());
+        }
         Ok(ScramStep::Done {
-            server_final: format!(
-                "v={}",
-                BASE64.encode(&mac(&self.verifier.server_key, auth.as_bytes()))
-            )
-            .into_bytes(),
+            server_final: format!("v={}", BASE64.encode(&server_signature)).into_bytes(),
         })
     }
 }
@@ -299,7 +315,80 @@ mod tests {
         )
     }
     fn server(password: &str) -> ScramServer {
-        ScramServer::with_suffix(verifier(password), SUFFIX.into())
+        ScramServer::with_suffix(vec![verifier(password)], SUFFIX.into())
+    }
+    fn client_final(password: &str) -> (Vec<u8>, Vec<u8>) {
+        let salt = BASE64.decode(b"W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
+        let mut input = salt;
+        input.extend_from_slice(&1u32.to_be_bytes());
+        let mut u = mac(password.as_bytes(), &input);
+        let mut salted = u;
+        for _ in 1..4096 {
+            u = mac(password.as_bytes(), &u);
+            for (a, b) in salted.iter_mut().zip(u) {
+                *a ^= b;
+            }
+        }
+        let without = format!("c=biws,r=rOprNGfwEbeRWgbNEkqO{SUFFIX}");
+        let auth = format!("n=user,r=rOprNGfwEbeRWgbNEkqO,{FIRST},{without}");
+        let v = verifier(password);
+        let mut proof = mac(&salted, b"Client Key");
+        for (out, byte) in proof.iter_mut().zip(mac(&v.stored_key, auth.as_bytes())) {
+            *out ^= byte;
+        }
+        (
+            format!("{without},p={}", BASE64.encode(&proof)).into_bytes(),
+            format!("v={}", BASE64.encode(&mac(&v.server_key, auth.as_bytes()))).into_bytes(),
+        )
+    }
+    #[test]
+    fn overlap_accepts_each_password_with_its_server_signature() {
+        for password in ["password-a", "password-b"] {
+            let mut s = ScramServer::with_suffix(
+                vec![verifier("password-a"), verifier("password-b")],
+                SUFFIX.into(),
+            );
+            assert_eq!(
+                s.handle_initial("SCRAM-SHA-256", INITIAL).unwrap(),
+                ScramStep::Continue(FIRST.as_bytes().into())
+            );
+            let (proof, server_final) = client_final(password);
+            assert_eq!(
+                s.handle_final(&proof).unwrap(),
+                ScramStep::Done { server_final }
+            );
+        }
+    }
+    #[test]
+    fn overlap_rejects_wrong_password() {
+        let mut s = ScramServer::with_suffix(
+            vec![verifier("password-a"), verifier("password-b")],
+            SUFFIX.into(),
+        );
+        s.handle_initial("SCRAM-SHA-256", INITIAL).unwrap();
+        assert_eq!(
+            s.handle_final(&client_final("wrong").0).unwrap_err(),
+            denied()
+        );
+    }
+    #[test]
+    fn empty_or_incompatible_verifiers_are_refused() {
+        let mut salt = verifier("b");
+        salt.salt.push(0);
+        let mut iterations = verifier("b");
+        iterations.iterations += 1;
+        for verifiers in [
+            vec![],
+            vec![verifier("a"), salt],
+            vec![verifier("a"), iterations],
+        ] {
+            let mut s = ScramServer::new(verifiers, || [0; 18]);
+            assert_eq!(
+                s.handle_initial("SCRAM-SHA-256", INITIAL).unwrap_err(),
+                denied()
+            );
+            assert_eq!(s.handle_final(FINAL).unwrap_err(), denied());
+        }
     }
     #[test]
     fn rfc7677_exact_exchange() {
@@ -364,7 +453,7 @@ mod tests {
     }
     #[test]
     fn public_constructor_encodes_nonce_and_advertises_plain_scram() {
-        let mut s = ScramServer::new(verifier("pencil"), || [0x31; 18]);
+        let mut s = ScramServer::new(vec![verifier("pencil")], || [0x31; 18]);
         assert_eq!(ScramServer::mechanisms(), vec!["SCRAM-SHA-256"]);
         let ScramStep::Continue(first) = s.handle_initial("SCRAM-SHA-256", INITIAL).unwrap() else {
             panic!("expected continue")
