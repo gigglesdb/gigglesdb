@@ -7,6 +7,7 @@ pub mod bootstrap;
 pub mod call_codec;
 pub mod client;
 pub mod cluster;
+pub mod cluster_node;
 pub mod core_store;
 pub mod directory;
 pub mod entry;

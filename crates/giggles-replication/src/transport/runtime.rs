@@ -369,6 +369,11 @@ impl Transport {
         self.call_server.set_handlers(local, gateway);
     }
 
+    /// Handler of inbound node-status calls (R5-64); without it they get `Unavailable`.
+    pub fn set_node_handler(&self, node: Option<Arc<dyn super::NodeService>>) {
+        self.call_server.set_node_handler(node);
+    }
+
     /// Queue, pool and timeout bounds of peer calls; open call connections are restarted.
     pub fn set_call_limits(&self, limits: CallLimits) {
         self.calls.set_limits(limits);
@@ -561,8 +566,9 @@ async fn inbound<S: AsyncRead + AsyncWrite + Unpin>(
             ..h
         };
         if let Body::CallRequest { id, body } = body {
-            // A call connection carries only calls, all under the database cluster id.
-            if group != 0 || h.from == h.to {
+            // A call connection carries only calls, all under the database cluster id. One
+            // from this node's own certificate (an operator CLI) gets node status only.
+            if group != 0 {
                 return Err(protocol_error());
             }
             let check = || authorized(&peers.table.read().unwrap(), h.from, fp).is_ok();

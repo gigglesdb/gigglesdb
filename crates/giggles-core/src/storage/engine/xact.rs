@@ -22,6 +22,9 @@ pub(crate) enum XactStatus {
 #[derive(Debug)]
 pub(crate) enum XactLookupError {
     Future,
+    /// A cluster gateway: the xid is not live here, its status is in the system range
+    /// (`ClusterServices::xact_status`, R5-55).
+    Cluster,
     Txn(TxnError),
 }
 pub(crate) struct XactIds {
@@ -94,8 +97,7 @@ impl XactIds {
             if live.contains(&xid) {
                 return Ok(Some(XactStatus::InProgress));
             }
-            // Cross-range xid status is R5-55.
-            return Err(XactLookupError::Txn(TxnError::Unsupported));
+            return Err(XactLookupError::Cluster);
         };
         let next = self
             .seq
@@ -241,16 +243,10 @@ mod tests {
         assert_eq!(a.status(0).unwrap(), None);
         assert_eq!(a.status(2).unwrap(), Some(XactStatus::Committed));
         assert_eq!(a.status(xid).unwrap(), Some(XactStatus::InProgress));
-        // b cannot see a's live xid: that is a cross-range status lookup.
-        assert!(matches!(
-            b.status(xid),
-            Err(XactLookupError::Txn(TxnError::Unsupported))
-        ));
+        // b cannot see a's live xid: that is a cluster status lookup (R5-55).
+        assert!(matches!(b.status(xid), Err(XactLookupError::Cluster)));
         guards.clear();
-        assert!(matches!(
-            a.status(xid),
-            Err(XactLookupError::Txn(TxnError::Unsupported))
-        ));
+        assert!(matches!(a.status(xid), Err(XactLookupError::Cluster)));
     }
     #[test]
     fn retention_and_prune_threshold() {

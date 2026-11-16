@@ -6,10 +6,11 @@ use super::coordinator::{
     deadlock::{DeadlockConfig, DeadlockDetector, DetectorHandle, LocalLocks},
 };
 use super::read::{RoutedKvRead, range_space};
+use super::xact::{Lookup, XactRecord, read_record, xact_key};
 use crate::range_api::{
-    ClusterTxnId, GatewayPeer, GatewayService, LeaseKind, LockRequest, LockTarget, RangeClient,
-    RangeDescriptor, RangeError, RangeId, RangeLockMode, RangeSpace, RangeWrite, SequenceOp,
-    Timestamp, WaitSite, range_key,
+    ClusterTxnId, DeadlockProbe, GatewayPeer, GatewayService, LeaseKind, LockRequest, LockTarget,
+    RangeClient, RangeDescriptor, RangeError, RangeId, RangeLockMode, RangeSpace, RangeWrite,
+    SequenceOp, Timestamp, WaitSite, range_key,
 };
 use crate::storage::engine::{
     commit::RawOp,
@@ -19,9 +20,10 @@ use crate::storage::engine::{
     txn::{
         ClusterCommit, ClusterServices, Isolation, LatestVersion, SerializationReason, TxnError,
     },
+    xact::XactStatus,
 };
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
@@ -42,6 +44,9 @@ type RangeLatest = (Timestamp, Option<Vec<u8>>);
 const TXN_ID_SPACE: u64 = 1 << 32;
 /// Transaction ids leased at a time.
 const TXN_ID_BLOCK: u64 = 1 << 20;
+/// How long a range call keeps being retried on NotLeader/Unavailable: past liveness declaring
+/// a leader's node dead (1 s) plus an election.
+const FAILOVER_WINDOW: Duration = Duration::from_secs(5);
 
 /// Gateway settings. Defaults follow design.md 3.2 (`lock_wait_backstop` 5 min).
 #[derive(Clone, Debug)]
@@ -106,6 +111,47 @@ pub(crate) struct ClusterTxnServices {
     /// Cross-range and gateway deadlock detection (R5-56), when the gateway has peers.
     detector: Option<Arc<DeadlockDetector>>,
     _detector_thread: Option<DetectorHandle>,
+    /// The other gateways, asked whether an xid's owner is live (R5-55).
+    peer: Option<Arc<dyn GatewayPeer>>,
+    /// What the peer dispatcher serves for this gateway: deadlock calls and `txn_live`.
+    endpoint: Arc<GatewayEndpoint>,
+}
+
+/// This gateway's `GatewayService`: deadlock calls go to the detector (none without peers),
+/// `txn_live` answers from the transactions that registered an xid here and have not ended.
+struct GatewayEndpoint {
+    detector: Option<Arc<DeadlockDetector>>,
+    xact_owners: Mutex<HashSet<TxnId>>,
+}
+impl GatewayEndpoint {
+    fn owners(&self) -> std::sync::MutexGuard<'_, HashSet<TxnId>> {
+        self.xact_owners.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+impl GatewayService for GatewayEndpoint {
+    fn probe(&self, probe: DeadlockProbe) {
+        if let Some(detector) = &self.detector {
+            detector.probe(probe);
+        }
+    }
+    fn abort(&self, victim: ClusterTxnId) {
+        if let Some(detector) = &self.detector {
+            detector.abort(victim);
+        }
+    }
+    fn blockers(&self, txn: ClusterTxnId) -> Vec<ClusterTxnId> {
+        self.detector
+            .as_ref()
+            .map_or_else(Vec::new, |detector| detector.blockers(txn))
+    }
+    fn cancel_wait(&self, txn: ClusterTxnId) {
+        if let Some(detector) = &self.detector {
+            detector.cancel_wait(txn);
+        }
+    }
+    fn txn_live(&self, txn: ClusterTxnId) -> bool {
+        self.owners().contains(&TxnId(txn.0))
+    }
 }
 
 /// The gateway's own lock manager as the detector sees it (`WaitSite::Gateway`).
@@ -170,6 +216,7 @@ impl ClusterTxnServices {
         peer: Option<(Arc<dyn GatewayPeer>, DeadlockConfig)>,
     ) -> Arc<Self> {
         let gateway = Arc::new(LockManager::new(LockConfig::default()));
+        let peer_handle = peer.as_ref().map(|(peer, _)| peer.clone());
         let detector = peer.map(|(peer, deadlock)| {
             DeadlockDetector::new(
                 config.node,
@@ -180,6 +227,10 @@ impl ClusterTxnServices {
             )
         });
         let thread = detector.as_ref().map(DeadlockDetector::spawn);
+        let endpoint = Arc::new(GatewayEndpoint {
+            detector: detector.clone(),
+            xact_owners: Mutex::new(HashSet::new()),
+        });
         let services = Arc::new(Self {
             client,
             gateway,
@@ -189,6 +240,8 @@ impl ClusterTxnServices {
             stop: Arc::new(AtomicBool::new(false)),
             detector,
             _detector_thread: thread,
+            peer: peer_handle,
+            endpoint,
         });
         let weak = Arc::downgrade(&services);
         let stop = services.stop.clone();
@@ -199,15 +252,10 @@ impl ClusterTxnServices {
             .expect("spawn gateway heartbeat thread");
         services
     }
-    /// This gateway's deadlock service, for the peer dispatcher (Track B) to deliver probes.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Phase 7 wires the peer dispatcher")
-    )]
-    pub(crate) fn gateway_service(&self) -> Option<Arc<dyn GatewayService>> {
-        self.detector
-            .clone()
-            .map(|detector| detector as Arc<dyn GatewayService>)
+    /// This gateway's service for the peer dispatcher (Track B): deadlock probes (when the
+    /// gateway has peers) and `txn_live` (always, R5-55).
+    pub(crate) fn gateway_service(&self) -> Arc<dyn GatewayService> {
+        self.endpoint.clone()
     }
     /// A new transaction id: this node's id in the high 16 bits.
     /// A new transaction id: this node's id in the high 16 bits and a counter that never
@@ -266,14 +314,18 @@ impl ClusterTxnServices {
     fn oracle(&self) -> Result<Timestamp, TxnError> {
         self.retry(|| self.client.oracle().next(1))
     }
-    /// Retries NotLeader and Unavailable with a short doubling backoff.
+    /// Retries NotLeader and Unavailable with a short doubling backoff: at least
+    /// `config.retries` attempts, and for at least `FAILOVER_WINDOW`, so a statement outlasts a
+    /// leader's node being declared dead and a new leader being elected (delta review D6).
     fn retry<T>(&self, mut call: impl FnMut() -> Result<T, RangeError>) -> Result<T, TxnError> {
         let mut delay = Duration::from_millis(1);
         let mut attempt = 0;
+        let started = Instant::now();
         loop {
             match call() {
                 Err(RangeError::NotLeader { .. } | RangeError::Unavailable(_))
-                    if attempt + 1 < self.config.retries =>
+                    if attempt + 1 < self.config.retries
+                        || started.elapsed() < FAILOVER_WINDOW =>
                 {
                     attempt += 1;
                     thread::sleep(delay);
@@ -611,7 +663,7 @@ impl ClusterServices for ClusterTxnServices {
     fn write_set_bytes(&self) -> usize {
         self.config.write_set_bytes
     }
-    fn commit(&self, txn: TxnId, commit: ClusterCommit) -> Result<Ts, TxnError> {
+    fn commit(&self, txn: TxnId, mut commit: ClusterCommit) -> Result<Ts, TxnError> {
         self.check_live(txn)?;
         if commit.isolation == Isolation::Serializable {
             // SERIALIZABLE in a cluster is Phase 8 (shared and gap locks).
@@ -627,6 +679,14 @@ impl ClusterServices for ClusterTxnServices {
                 // Counters are written only by the system range leader (SequenceOp).
                 RawOp::PutCounter { .. } => return Err(TxnError::Unsupported),
             }
+        }
+        // R5-55 rule 2: an xid's Committed record is one more write of the transaction, in
+        // the system range, so it is committed iff the transaction is.
+        if let Some(xid) = marker_xid {
+            commit.writes.insert(
+                (Keyspace::Catalog, xact_key(xid)),
+                Some(XactRecord::Committed.encode()),
+            );
         }
         // Feature bits are range-local (deviation E9); range leaders own them.
         let _ = commit.features_or;
@@ -653,25 +713,23 @@ impl ClusterServices for ClusterTxnServices {
         }
         self.check_lock_only(txn, &groups)?;
         let ts = match groups.len() {
-            // Nothing to write (an xid with no writes, or only retired counters): the
-            // transaction ends at a fresh timestamp. An xid's status is R5-55.
+            // Nothing to write (no xid, only retired counters): the transaction ends at a
+            // fresh timestamp.
             0 => self.oracle()?,
-            1 => {
+            // One range and no xid: one single-range commit.
+            1 if marker_xid.is_none() => {
                 let group = groups.pop().expect("one group");
-                self.retry(|| {
-                    self.client.commit(
-                        group.range,
-                        group.epoch,
-                        ClusterTxnId(txn.0),
-                        group.writes.clone(),
-                        marker_xid,
-                        group.lock_generation,
-                    )
-                })?
+                self.commit_one(txn, &group)?
             }
             _ => {
-                // Several ranges: Track D's coordinator, with the home in the first range
-                // written in key order. The commit marker of an xid is R5-55.
+                // Several ranges, or any transaction holding an xid (even when the system
+                // range is its only participant): Track D's coordinator, with the home in the
+                // first range written in key order (the system range when an xid's record is
+                // written). An xid's Committed record is then prepared before any decision, so
+                // a late request can only commit through a Decide this coordinator sent after
+                // every vote, and a reader that finds the owner ended waits on the prepared
+                // write; a plain single-range commit could land after a reader reported the xid
+                // "aborted" (review S1).
                 let lock_only: Vec<RangeId> = self.state(txn, |state| {
                     state
                         .ranges
@@ -722,11 +780,135 @@ impl ClusterServices for ClusterTxnServices {
             }
         }
         self.gateway.release_all(txn);
+        // The transaction has ended (after its commit returned, or rolled back): an xid it
+        // registered is no longer live here (R5-55 rule 3c).
+        self.endpoint.owners().remove(&txn);
     }
     fn next_txn_id(&self) -> TxnId {
         ClusterTxnServices::next_txn_id(self)
     }
     fn client(&self) -> Arc<dyn RangeClient> {
         self.client.clone()
+    }
+    fn register_xact(&self, txn: TxnId, xid: u64) -> Result<(), TxnError> {
+        // Live before the record can be read: whoever finds Owner and asks hears "live".
+        self.endpoint.owners().insert(txn);
+        let result = self.write_owner(txn, xid);
+        if result.is_err() {
+            self.endpoint.owners().remove(&txn);
+        }
+        result
+    }
+    fn xact_status(&self, xid: u64) -> Result<Option<XactStatus>, TxnError> {
+        let (node, owner) = match read_record(self.client.as_ref(), xid)? {
+            Lookup::Pending => return Ok(Some(XactStatus::InProgress)),
+            // Never assigned, or the assignment failed before anyone saw the xid.
+            Lookup::Found(None) => return Ok(None),
+            Lookup::Found(Some(XactRecord::Committed)) => return Ok(Some(XactStatus::Committed)),
+            Lookup::Found(Some(XactRecord::Owner { node, txn })) => (node, txn),
+        };
+        let live = if node == u64::from(self.config.node) {
+            Ok(self.endpoint.txn_live(owner))
+        } else {
+            match &self.peer {
+                Some(peer) => peer.txn_live(node, owner),
+                None => Err(RangeError::Unavailable("no gateway peers".into())),
+            }
+        };
+        Ok(Some(match live {
+            // Live, or the owner cannot be asked: it may still commit if only partitioned.
+            Ok(true) | Err(_) => XactStatus::InProgress,
+            // Ended: its commit returned (the decision is durable) or it rolled back. A read
+            // at a new timestamp sees its Committed record or resolves the prepared write.
+            Ok(false) => match read_record(self.client.as_ref(), xid)? {
+                Lookup::Pending => XactStatus::InProgress,
+                Lookup::Found(Some(XactRecord::Committed)) => XactStatus::Committed,
+                Lookup::Found(_) => XactStatus::Aborted,
+            },
+        }))
+    }
+}
+
+impl ClusterTxnServices {
+    /// One single-range commit of a transaction without an xid. NotLeader and Unavailable are
+    /// retried like `retry` does, but once an attempt may have reached a leader (Unavailable:
+    /// a transport timeout, or a request still queued there) the outcome is unknown: a later
+    /// failure of any kind, or running out of attempts, is `CommitAmbiguous` (08007), never an
+    /// I/O error or an abort (review S1). Running out of attempts on NotLeader alone is
+    /// reported as unknown too. Before any such attempt a definite error keeps its meaning
+    /// (an abort stays 40001).
+    fn commit_one(&self, txn: TxnId, group: &Participant) -> Result<Timestamp, TxnError> {
+        let mut delay = Duration::from_millis(1);
+        let mut attempt = 0;
+        let mut maybe_applied = false;
+        loop {
+            attempt += 1;
+            match self.client.commit(
+                group.range,
+                group.epoch,
+                ClusterTxnId(txn.0),
+                group.writes.clone(),
+                None,
+                group.lock_generation,
+            ) {
+                Ok(ts) => return Ok(ts),
+                Err(e @ (RangeError::NotLeader { .. } | RangeError::Unavailable(_))) => {
+                    maybe_applied |= matches!(e, RangeError::Unavailable(_));
+                    if attempt >= self.config.retries {
+                        return Err(TxnError::CommitAmbiguous);
+                    }
+                    thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_millis(50));
+                }
+                Err(_) if maybe_applied => return Err(TxnError::CommitAmbiguous),
+                Err(e) => return Err(txn_error(e)),
+            }
+        }
+    }
+
+    /// R5-55 rule 1: `XACT/<xid> = Owner{node, txn}` as one single-range commit on the system
+    /// range. It runs under a transaction id of its own: a commit ends its transaction on the
+    /// range (releasing its locks there), and `txn` is still running. Each attempt takes a
+    /// fresh id: a range commit is never retried under an id whose earlier attempt failed
+    /// (design.md Changes (g)).
+    fn write_owner(&self, txn: TxnId, xid: u64) -> Result<(), TxnError> {
+        let record = XactRecord::Owner {
+            node: u64::from(self.config.node),
+            txn: ClusterTxnId(txn.0),
+        };
+        let route = range_key(RangeSpace::Catalog, &xact_key(xid));
+        let mut delay = Duration::from_millis(1);
+        let mut last = RangeError::Unavailable("no attempt".into());
+        for _ in 0..self.config.retries {
+            let writer = ClusterTxnId(self.next_txn_id().0);
+            let descriptor = self.descriptor(&route)?;
+            // Catalog writes on the system range need no lock lease.
+            match self.client.commit(
+                descriptor.id,
+                descriptor.epoch,
+                writer,
+                vec![record.write(xid)],
+                None,
+                None,
+            ) {
+                Ok(_) => return Ok(()),
+                // Refused before anything was proposed: safe to try again.
+                Err(e @ RangeError::StaleEpoch { .. }) => {
+                    self.client.invalidate(&descriptor);
+                    last = e;
+                    thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_millis(50));
+                }
+                // Anything else may still apply later. A retry could then land an Owner record
+                // over a later Committed one, and the xid would read as aborted; instead the
+                // assignment fails and the xid is never shown (its late record names an xid
+                // nobody holds).
+                Err(e) => {
+                    self.client.invalidate(&descriptor);
+                    return Err(txn_error(e));
+                }
+            }
+        }
+        Err(txn_error(last))
     }
 }

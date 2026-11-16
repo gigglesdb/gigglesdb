@@ -10,6 +10,8 @@ mod storage;
 pub use storage::replica;
 pub use storage::range_api;
 #[cfg(feature = "engine-rocksdb")]
+pub use storage::cluster_node;
+#[cfg(feature = "engine-rocksdb")]
 pub use storage::replicated;
 pub use storage::roles;
 pub use storage::{

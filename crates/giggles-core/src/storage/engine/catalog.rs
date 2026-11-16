@@ -1,4 +1,12 @@
 //! Transactional table metadata and snapshot-versioned catalog views.
+//!
+//! Cluster gateways (GD-0075): another gateway's DDL reaches this cache through the
+//! catalog-generation record (`refresh_locked`), checked when a statement takes its snapshot.
+//! Table locks are local to each gateway, so until Phase 11 (R5-100) nothing orders DML on one
+//! gateway against DDL on the same table through another: a DML transaction that resolved the
+//! table before the DDL committed can still commit against the old definition (for example,
+//! insert into a table another gateway has just dropped, or write rows in the layout before an
+//! `ADD COLUMN ... DEFAULT` or a type change). Run schema changes while the table is quiet.
 #[cfg(test)]
 use super::kv::Kv;
 use super::{
@@ -259,16 +267,24 @@ impl CatalogSnapshot {
 pub(crate) struct CatalogCache {
     versions: Vec<(Ts, Arc<CatalogView>)>,
     snapshots: BTreeMap<Ts, Arc<CatalogSnapshot>>,
+    /// Cluster gateways only (GD-0075 P7-1): for a cached version, the catalog-generation
+    /// token it was loaded with and the newest timestamp at which that token was still current.
+    tokens: BTreeMap<Ts, (u128, Ts)>,
     poisoned: bool,
 }
 impl CatalogCache {
-    pub(crate) fn load(kv: &dyn KvRead, visible: Ts) -> Result<Self, CoreError> {
+    pub(crate) fn load(
+        kv: &dyn KvRead,
+        visible: Ts,
+        end: Bound<&[u8]>,
+    ) -> Result<Self, CoreError> {
         let mut cache = Self {
             versions: Vec::new(),
             snapshots: BTreeMap::new(),
+            tokens: BTreeMap::new(),
             poisoned: false,
         };
-        cache.publish(visible, load_view(kv, visible)?);
+        cache.publish(visible, load_view_until(kv, visible, end)?);
         Ok(cache)
     }
     pub(crate) fn view_at(&self, snapshot: Ts) -> Option<Arc<CatalogView>> {
@@ -284,6 +300,7 @@ impl CatalogCache {
             return;
         }
         self.snapshots.remove(&ts);
+        self.tokens.remove(&ts);
         match self.versions.binary_search_by_key(&ts, |(ts, _)| *ts) {
             Ok(index) => self.versions[index].1 = Arc::new(view),
             Err(index) => self.versions.insert(index, (ts, Arc::new(view))),
@@ -299,6 +316,7 @@ impl CatalogCache {
             self.versions.drain(..anchor);
             let first = self.versions[0].0;
             self.snapshots.retain(|ts, _| *ts >= first);
+            self.tokens.retain(|ts, _| *ts >= first);
         }
     }
     fn ensure_live(&self) -> Result<(), TxnError> {
@@ -340,7 +358,12 @@ impl Catalog {
         seq: Arc<SequenceAllocator>,
     ) -> Result<Self, CoreError> {
         let visible = services.visible_ts()?;
-        let cache = CatalogCache::load(&*services.read_view(visible), visible)?;
+        let mut cache =
+            CatalogCache::load(&*services.read_view(visible), visible, catalog_end(&services))?;
+        if matches!(services, TxnServices::Cluster(_)) {
+            let token = generation_token(&*services.read_view(visible), visible)?;
+            cache.tokens.insert(visible, (token, visible));
+        }
         Ok(Self {
             cache: Mutex::new(cache),
             services,
@@ -385,7 +408,11 @@ impl Catalog {
         }
         match cache.view_at(snapshot) {
             Some(view) => Ok(view),
-            None => Ok(Arc::new(load_view(&*self.services.read_view(snapshot), snapshot)?)),
+            None => Ok(Arc::new(load_view_until(
+                &*self.services.read_view(snapshot),
+                snapshot,
+                catalog_end(&self.services),
+            )?)),
         }
     }
 
@@ -468,13 +495,14 @@ impl Catalog {
         // Acquisition also reclaims derived versions after a long-lived reader
         // leaves, even when subsequent commits contain no catalog writes.
         self.prune_locked(cache)?;
+        self.refresh_locked(cache, ts)?;
         let end = cache
             .versions
             .partition_point(|(version, _)| *version <= ts);
         let Some(index) = end.checked_sub(1) else {
             // Preserve the existing old-snapshot fallback. Do not invent a
             // committed catalog-version key for a view loaded at a data timestamp.
-            let view = load_view(&*self.services.read_view(ts), ts)?;
+            let view = self.load_at(ts)?;
             return Ok(Arc::new(CatalogSnapshot::new(&overlay_view(
                 &view,
                 txn.catalog_writes(),
@@ -495,6 +523,46 @@ impl Catalog {
         cache.snapshots.insert(version, snapshot.clone());
         Ok(snapshot)
     }
+    /// Cluster gateways (GD-0075 P7-1): DDL committed through another gateway reaches this
+    /// cache only here. When the catalog-generation token at `ts` differs from the one the
+    /// version serving `ts` was loaded with, the catalog is reloaded at `ts` and published there.
+    /// The cross-gateway DDL/DML limit this leaves is in the module doc.
+    fn refresh_locked(&self, cache: &mut CatalogCache, ts: Ts) -> Result<(), CoreError> {
+        if !matches!(self.services, TxnServices::Cluster(_)) {
+            return Ok(());
+        }
+        let end = cache.versions.partition_point(|(version, _)| *version <= ts);
+        let Some(index) = end.checked_sub(1) else {
+            return Ok(());
+        };
+        let version = cache.versions[index].0;
+        if cache.tokens.get(&version).is_some_and(|(_, checked)| *checked >= ts) {
+            return Ok(());
+        }
+        let token = generation_token(&*self.services.read_view(ts), ts)?;
+        match cache.tokens.get_mut(&version) {
+            Some((known, checked)) if *known == token => *checked = ts,
+            _ => self.publish_loaded(cache, ts)?,
+        }
+        Ok(())
+    }
+
+    /// The committed catalog at `ts` (bounded below the cluster records on a gateway).
+    fn load_at(&self, ts: Ts) -> Result<CatalogView, CoreError> {
+        load_view_until(&*self.services.read_view(ts), ts, catalog_end(&self.services))
+    }
+
+    /// Loads the catalog at `ts` and publishes it, with its generation token on a gateway.
+    fn publish_loaded(&self, cache: &mut CatalogCache, ts: Ts) -> Result<(), CoreError> {
+        let kv = self.services.read_view(ts);
+        let view = load_view_until(&*kv, ts, catalog_end(&self.services))?;
+        cache.publish(ts, view);
+        if matches!(self.services, TxnServices::Cluster(_)) && !cache.poisoned {
+            cache.tokens.insert(ts, (generation_token(&*kv, ts)?, ts));
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_diff(
         &self,
         txn: &mut Transaction,
@@ -737,10 +805,11 @@ impl Catalog {
                 let mut cache = self.cache.lock().map_err(|_| TxnError::Misuse)?;
                 cache.ensure_live()?;
                 let snapshot = txn.snapshot_ts();
+                self.refresh_locked(&mut cache, snapshot)?;
                 let view = match cache.view_at(snapshot) {
                     Some(view) => view,
                     None => {
-                        cache.publish(snapshot, load_view(&*self.services.read_view(snapshot), snapshot)?);
+                        self.publish_loaded(&mut cache, snapshot)?;
                         cache.view_at(snapshot).unwrap()
                     }
                 };
@@ -876,7 +945,7 @@ impl Catalog {
     pub(crate) fn commit_ddl_guarded(&self, txn: Transaction, guard: CommitGuard) -> Result<Ts, TxnError> {
         self.commit_ddl_inner(txn, Some(guard))
     }
-    fn commit_ddl_inner(&self, txn: Transaction, guard: Option<CommitGuard>) -> Result<Ts, TxnError> {
+    fn commit_ddl_inner(&self, mut txn: Transaction, guard: Option<CommitGuard>) -> Result<Ts, TxnError> {
         fn finish(txn: Transaction, guard: Option<CommitGuard>, publish: impl FnOnce(Ts) -> Result<(), TxnError>) -> Result<Ts, TxnError> {
             match guard { Some(guard) => txn.commit_guarded(guard, publish), None => txn.commit_then(publish) }
         }
@@ -940,9 +1009,26 @@ impl Catalog {
         }
         // Reject limit/corruption before committing anything durably.
         overlay_view(latest, txn.catalog_writes()).map_err(commit_error)?;
+        // A gateway's catalog commit also replaces the generation record, so other gateways
+        // see that their cached catalog is stale (GD-0075 P7-1).
+        let token = match self.services {
+            TxnServices::Cluster(_) => {
+                let token = new_generation_token().map_err(commit_error)?;
+                let mut value = vec![GENERATION_VERSION];
+                value.extend_from_slice(&token.to_be_bytes());
+                txn.put(Keyspace::Catalog, GENERATION_KEY.to_vec(), value)?;
+                Some(token)
+            }
+            TxnServices::Local { .. } => None,
+        };
         finish(txn, guard, |ts| {
-            let view = match load_view(&*self.services.read_view(ts), ts) {
+            let view = match self.load_at(ts) {
                 Ok(view) => view,
+                // On a cluster gateway the reload is a network read and may fail
+                // transiently. The commit and its new generation token are durable, so the
+                // next snapshot's generation check reloads; fencing the gateway would turn
+                // one lost read into an outage (delta review D3).
+                Err(_) if token.is_some() => return Ok(()),
                 Err(_) => {
                     // Durability already succeeded. Never expose the previous
                     // view as current; this catalog must be reopened.
@@ -951,6 +1037,9 @@ impl Catalog {
                 }
             };
             cache.publish(ts, view);
+            if let Some(token) = token {
+                cache.tokens.insert(ts, (token, ts));
+            }
             self.prune_locked(&mut cache)
         })
     }
@@ -998,6 +1087,32 @@ pub(crate) fn decode_entry(value: &[u8]) -> Result<TableEntry, CoreError> {
     Ok(entry)
 }
 
+/// The catalog-generation record (GD-0075 P7-1): system-range Catalog key `[0xF4]`, value
+/// `[1][token u128 BE]`, replaced with a fresh random token by every catalog commit through a
+/// cluster gateway. It is not a catalog object: catalog loads skip it.
+pub(crate) const GENERATION_KEY: &[u8] = &[0xF4];
+const GENERATION_VERSION: u8 = 1;
+
+/// The generation token at `ts`; 0 when no gateway has written the record yet.
+fn generation_token(kv: &dyn KvRead, ts: Ts) -> Result<u128, CoreError> {
+    match mvcc::read_at(kv, Keyspace::Catalog, GENERATION_KEY, ts)? {
+        None => Ok(0),
+        Some(value) => match value.split_first() {
+            Some((&GENERATION_VERSION, token)) if token.len() == 16 => {
+                Ok(u128::from_be_bytes(token.try_into().expect("checked length")))
+            }
+            _ => Err(corrupt("invalid catalog generation record")),
+        },
+    }
+}
+
+fn new_generation_token() -> Result<u128, CoreError> {
+    let mut token = [0; 16];
+    getrandom::fill(&mut token).map_err(|_| CoreError::Storage("no randomness".into()))?;
+    // 0 stands for an absent record.
+    Ok(u128::from_be_bytes(token).max(1))
+}
+
 fn decode_id(value: &[u8]) -> Result<u64, CoreError> {
     let bytes = value
         .try_into()
@@ -1008,20 +1123,47 @@ fn decode_id(value: &[u8]) -> Result<u64, CoreError> {
     }
     Ok(id)
 }
+/// First Catalog user key of the system range's cluster records (`cluster_record_key`: 0xF0
+/// directory, 0xF1 `gw/`, 0xF2 `ddl/`, 0xF3 `XACT/`, 0xF4 generation).
+const CLUSTER_RECORDS: &[u8] = &[0xF0];
+
+/// Where a catalog load stops. On a cluster gateway the scan ends before the cluster records
+/// (review S4): there is one `XACT/` record per assigned xid, and a prepared one (a cross-range
+/// xid commit between prepare and finalize) would make the load wait on it. The generation
+/// record is read by point (`generation_token`). Single-node loads keep scanning everything,
+/// so a stray key there still fails validation.
+fn catalog_end(services: &TxnServices) -> Bound<&'static [u8]> {
+    match services {
+        TxnServices::Cluster(_) => Bound::Excluded(CLUSTER_RECORDS),
+        TxnServices::Local { .. } => Bound::Unbounded,
+    }
+}
+
+#[cfg(test)]
 fn load_view(kv: &dyn KvRead, snapshot: Ts) -> Result<CatalogView, CoreError> {
+    load_view_until(kv, snapshot, Bound::Unbounded)
+}
+fn load_view_until(
+    kv: &dyn KvRead,
+    snapshot: Ts,
+    end: Bound<&[u8]>,
+) -> Result<CatalogView, CoreError> {
     let mut view = CatalogView::default();
     let mut names = BTreeMap::new();
     let records = mvcc::VersionedRange::new(
         kv,
         Keyspace::Catalog,
         Bound::Unbounded,
-        Bound::Unbounded,
+        end,
         Direction::Forward,
         snapshot,
     )
     .map_err(CoreError::from)?;
     for record in records {
         let (key, value) = record.map_err(CoreError::from)?;
+        if key == GENERATION_KEY {
+            continue;
+        }
         apply_record(&mut view, &mut names, &key, Some(&value))?;
     }
     finish_view(view, names).map_err(loaded_catalog_error)

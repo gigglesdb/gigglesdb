@@ -6,7 +6,9 @@
 //! holds one slot of the peer's bounded queue until its reply or timeout; a full queue or an
 //! exhausted server pool answers `Unavailable` at once, never silence.
 use super::{Body, Header, MAX_FRAME, frame, runtime::Peers};
-use crate::call_codec::{self, GatewayCall, GatewayReply, PeerCall, PeerReply};
+use crate::call_codec::{
+    self, GatewayCall, GatewayReply, NodeCall, NodeReport, PeerCall, PeerReply,
+};
 use crate::client::{self, LocalRanges, RangeCall, RangeReply, RangeTransport};
 use crate::error::{Error, Result};
 use giggles_core::range_api::{
@@ -202,7 +204,7 @@ impl PeerCalls {
         let timeout = self.limits.read().unwrap().timeout;
         match PeerCalls::call(self, node, PeerCall::Gateway(call), timeout)? {
             PeerReply::Gateway(reply) => Ok(reply),
-            PeerReply::Range(_) => Err(mismatched()),
+            _ => Err(mismatched()),
         }
     }
 }
@@ -216,7 +218,7 @@ impl RangeTransport for PeerCalls {
         let timeout = self.timeout(&call);
         match PeerCalls::call(self, node, PeerCall::Range(call), timeout)? {
             PeerReply::Range(reply) => Ok(reply),
-            PeerReply::Gateway(_) => Err(mismatched()),
+            _ => Err(mismatched()),
         }
     }
 }
@@ -228,7 +230,7 @@ impl GatewayPeer for PeerCalls {
     fn abort(&self, node: u64, victim: ClusterTxnId) -> std::result::Result<(), RangeError> {
         match self.gateway(node, GatewayCall::Abort(victim))? {
             GatewayReply::Done => Ok(()),
-            GatewayReply::Blockers(_) => Err(mismatched()),
+            _ => Err(mismatched()),
         }
     }
     fn blockers(
@@ -238,13 +240,19 @@ impl GatewayPeer for PeerCalls {
     ) -> std::result::Result<Vec<ClusterTxnId>, RangeError> {
         match self.gateway(node, GatewayCall::Blockers(txn))? {
             GatewayReply::Blockers(txns) => Ok(txns),
-            GatewayReply::Done => Err(mismatched()),
+            _ => Err(mismatched()),
         }
     }
     fn cancel_wait(&self, node: u64, txn: ClusterTxnId) -> std::result::Result<(), RangeError> {
         match self.gateway(node, GatewayCall::CancelWait(txn))? {
             GatewayReply::Done => Ok(()),
-            GatewayReply::Blockers(_) => Err(mismatched()),
+            _ => Err(mismatched()),
+        }
+    }
+    fn txn_live(&self, node: u64, txn: ClusterTxnId) -> std::result::Result<bool, RangeError> {
+        match self.gateway(node, GatewayCall::TxnLive(txn))? {
+            GatewayReply::Live(live) => Ok(live),
+            _ => Err(mismatched()),
         }
     }
 }
@@ -340,6 +348,11 @@ async fn connection(peers: Arc<Peers>, node: u64, mut rx: mpsc::Receiver<Outgoin
     }
 }
 
+/// Answers `NodeCall::Status` (R5-64): every range this node replicates.
+pub trait NodeService: Send + Sync {
+    fn status(&self) -> NodeReport;
+}
+
 /// Server side: the registered handlers and the bounded worker pool.
 pub(crate) struct CallServer {
     handlers: RwLock<Handlers>,
@@ -351,6 +364,7 @@ pub(crate) struct CallServer {
 struct Handlers {
     local: Option<Arc<dyn LocalRanges>>,
     gateway: Option<Arc<dyn GatewayService>>,
+    node: Option<Arc<dyn NodeService>>,
 }
 
 impl CallServer {
@@ -367,7 +381,13 @@ impl CallServer {
         local: Option<Arc<dyn LocalRanges>>,
         gateway: Option<Arc<dyn GatewayService>>,
     ) {
-        *self.handlers.write().unwrap() = Handlers { local, gateway };
+        let mut handlers = self.handlers.write().unwrap();
+        handlers.local = local;
+        handlers.gateway = gateway;
+    }
+
+    pub(crate) fn set_node_handler(&self, node: Option<Arc<dyn NodeService>>) {
+        self.handlers.write().unwrap().node = node;
     }
 
     pub(crate) fn set_limits(&self, limits: CallLimits) {
@@ -376,7 +396,8 @@ impl CallServer {
     }
 
     /// Serves one call connection from its first request on; `authorized` rechecks the
-    /// caller's identity against the current peer table for every frame.
+    /// caller's identity against the current peer table for every frame. A connection that
+    /// presents this node's own certificate (an operator CLI) may only ask for node status.
     pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         stream: &mut S,
@@ -384,6 +405,7 @@ impl CallServer {
         first: (u64, Vec<u8>),
         authorized: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<()> {
+        let node_only = base.from == base.to;
         let reply_header = Header {
             from: base.to,
             to: base.from,
@@ -401,7 +423,7 @@ impl CallServer {
                         _ => return Err(Error::Corrupt("unexpected peer call frame".into())),
                     },
                 };
-                self.start(id, &body, &tx).await;
+                self.start(id, &body, node_only, &tx).await;
             }
         };
         let writer = async {
@@ -418,8 +440,19 @@ impl CallServer {
     }
 
     /// Answers at once when the call is invalid or the pool is full; else runs it on a worker.
-    async fn start(&self, id: u64, body: &[u8], tx: &mpsc::Sender<(u64, Vec<u8>)>) {
+    async fn start(
+        &self,
+        id: u64,
+        body: &[u8],
+        node_only: bool,
+        tx: &mpsc::Sender<(u64, Vec<u8>)>,
+    ) {
         let call = match call_codec::decode_call(body) {
+            Ok(PeerCall::Range(_) | PeerCall::Gateway(_)) if node_only => {
+                let refused = Err(RangeError::Unavailable("not a peer node".into()));
+                let _ = tx.send((id, reply_body(&refused))).await;
+                return;
+            }
             Ok(call) => call,
             Err(error) => {
                 let _ = tx.send((id, reply_body(&Err(error)))).await;
@@ -475,7 +508,12 @@ fn handle(handlers: &Handlers, call: PeerCall) -> Reply {
                     gateway.cancel_wait(txn);
                     GatewayReply::Done
                 }
+                GatewayCall::TxnLive(txn) => GatewayReply::Live(gateway.txn_live(txn)),
             }))
+        }
+        PeerCall::Node(NodeCall::Status) => {
+            let node = handlers.node.as_ref().ok_or_else(|| missing("node status"))?;
+            Ok(PeerReply::Node(node.status()))
         }
     }
 }

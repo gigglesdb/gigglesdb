@@ -41,6 +41,8 @@ pub mod range_api;
 mod range;
 #[cfg(feature = "engine-rocksdb")]
 mod cluster;
+#[cfg(feature = "engine-rocksdb")]
+pub mod cluster_node;
 pub mod roles;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 mod roles_task_only_tests;

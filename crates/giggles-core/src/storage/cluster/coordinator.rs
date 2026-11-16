@@ -5,7 +5,7 @@
 //! Seal the participant set, prepare every participant in parallel and record each vote at home,
 //! take a fresh commit timestamp after every vote, decide at home, and only then acknowledge.
 //! Every home operation after Open carries the incarnation Open returned (R5-50m bug B2).
-pub(super) mod deadlock; // Track C: the gateway (cluster::txn) runs the detector.
+pub(in crate::storage) mod deadlock; // Track C: the gateway runs it; cluster_node configures it.
 #[cfg(test)]
 mod tests;
 
@@ -18,7 +18,6 @@ use crate::range_api::{
 const RETRIES: usize = 5;
 
 /// One range the transaction wrote, with its writes there.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Participant {
     pub range: RangeId,
     pub epoch: Epoch,
@@ -29,7 +28,6 @@ pub(crate) struct Participant {
 }
 
 /// A cross-range commit; the first participant is the home (first range written).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct CommitPlan {
     pub txn: ClusterTxnId,
     pub participants: Vec<Participant>,
@@ -38,7 +36,6 @@ pub(crate) struct CommitPlan {
 }
 
 /// Commit failure: definitely aborted, or outcome unknown (recovery finishes it).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CommitError {
     Aborted(RangeError),
@@ -164,7 +161,6 @@ fn abort(
 
 /// Commits `plan` atomically across its participant ranges (GD-0075 Track D protocol,
 /// coordinator steps 1-6). Returns the commit timestamp only once Commit is durable at home.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn commit_cross_range(
     client: &dyn RangeClient,
     plan: CommitPlan,

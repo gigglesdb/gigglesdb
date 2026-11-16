@@ -86,7 +86,7 @@ pub(crate) struct LocalCluster {
     services: Mutex<HashMap<RangeId, Arc<dyn RangeService>>>,
     /// Lock-table generation of each range's current engine (incremented per open).
     generations: Mutex<HashMap<RangeId, u64>>,
-    /// Gateway deadlock services by node, for `GatewayPeer`.
+    /// Gateway services (deadlock calls, `txn_live`) by node, for `GatewayPeer`.
     gateways: Mutex<HashMap<u64, Weak<dyn GatewayService>>>,
 }
 
@@ -196,7 +196,7 @@ impl LocalCluster {
         self.engines.close(range);
     }
 
-    /// Registers a gateway's deadlock service under its node id (stands in for B's wire).
+    /// Registers a gateway's service under its node id (stands in for B's wire).
     pub(crate) fn register_gateway(&self, node: u64, service: Arc<dyn GatewayService>) {
         // Weak: the gateway's services own the detector; a dropped gateway stops answering.
         self.gateways
@@ -330,5 +330,8 @@ impl GatewayPeer for LocalCluster {
     fn cancel_wait(&self, node: u64, txn: ClusterTxnId) -> Result<(), RangeError> {
         self.gateway(node)?.cancel_wait(txn);
         Ok(())
+    }
+    fn txn_live(&self, node: u64, txn: ClusterTxnId) -> Result<bool, RangeError> {
+        Ok(self.gateway(node)?.txn_live(txn))
     }
 }

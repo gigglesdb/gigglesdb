@@ -151,3 +151,6 @@ mod group_snapshot;
 
 #[path = "leader_reads.rs"]
 mod leader_reads;
+
+#[path = "gateway_cluster.rs"]
+mod gateway_cluster;

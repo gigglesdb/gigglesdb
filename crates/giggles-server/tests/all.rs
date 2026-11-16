@@ -254,3 +254,6 @@ mod agent_pg_operations;
 mod returning_spill_network;
 #[path = "sort_spill_network.rs"]
 mod sort_spill_network;
+
+#[path = "cluster_harness.rs"] pub(crate) mod cluster_harness;
+#[path = "cluster_process.rs"] mod cluster_process;

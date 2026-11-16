@@ -199,6 +199,11 @@ pub(crate) trait ClusterServices: Send + Sync {
     fn next_txn_id(&self) -> TxnId;
     /// The range client: allocator leases and sequences on the system range.
     fn client(&self) -> Arc<dyn crate::range_api::RangeClient>;
+    /// R5-55: commits `XACT/<xid> = Owner{this node, txn}` to the system range; `txn` then
+    /// counts as live here until it ends. Must succeed before the xid is shown to anyone.
+    fn register_xact(&self, txn: TxnId, xid: u64) -> Result<(), TxnError>;
+    /// R5-55: the status of an xid that is not live on this gateway (None: never assigned).
+    fn xact_status(&self, xid: u64) -> Result<Option<super::xact::XactStatus>, TxnError>;
 }
 /// A cluster transaction's buffered effects at commit.
 pub(crate) struct ClusterCommit {

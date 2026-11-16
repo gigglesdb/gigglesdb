@@ -16,10 +16,6 @@ pub(crate) mod local;
 mod tests;
 
 /// A gateway: its SQL admin and its transaction services (for the peer dispatcher).
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "Phase 7 starts gateways in giggles-server")
-)]
 pub(crate) struct Gateway {
     pub(crate) admin: Admin,
     pub(crate) services: Arc<ClusterTxnServices>,
@@ -29,10 +25,6 @@ pub(crate) struct Gateway {
 /// database's identity (the range store's domain). With `peer`, the gateway detects deadlocks
 /// across ranges and gateways (design.md 3.2); its `services.gateway_service()` must then be
 /// reachable by the other gateways' peers.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "Phase 7 starts gateways in giggles-server")
-)]
 pub(crate) fn attach(
     client: Arc<dyn RangeClient>,
     config: ClusterConfig,

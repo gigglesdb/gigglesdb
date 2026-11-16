@@ -104,6 +104,17 @@ pub fn first_user_key() -> Vec<u8> {
     range_key(RangeSpace::Rows, &[])
 }
 
+/// Catalog user-key tag of transaction-status records `XACT/<xid>` in the system range
+/// (GD-0075 R5-55), next to Track B's directory tags 0xF0..=0xF2.
+pub const XACT_TAG: u8 = 0xF3;
+/// Whether a Catalog user key is a range-mode cluster record (leading tag >= 0xF0: Track B's
+/// directory, `gw/` and `ddl/` records 0xF0..=0xF2, `XACT/` records 0xF3, 0xF4.. reserved),
+/// not a catalog object: catalog loads skip them and range leaders do not validate them as
+/// catalog content.
+pub fn cluster_record_key(key: &[u8]) -> bool {
+    key.first().is_some_and(|tag| *tag >= 0xF0)
+}
+
 /// Role of a replica in its range group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -492,6 +503,12 @@ pub trait GatewayPeer: Send + Sync {
     fn blockers(&self, node: u64, txn: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError>;
     /// Makes txn's pending request return RangeError::Deadlock; no-op if not waiting.
     fn cancel_wait(&self, node: u64, txn: ClusterTxnId) -> Result<(), RangeError>;
+    /// Whether `txn`, which registered an xid on `node`'s gateway, has not ended there
+    /// (R5-55). Err when the gateway cannot be asked.
+    fn txn_live(&self, node: u64, txn: ClusterTxnId) -> Result<bool, RangeError> {
+        let _ = (node, txn);
+        Err(RangeError::Unavailable("no txn_live".into()))
+    }
 }
 /// Deadlock service on every gateway, called by the peer dispatcher.
 pub trait GatewayService: Send + Sync {
@@ -503,6 +520,12 @@ pub trait GatewayService: Send + Sync {
     fn blockers(&self, txn: ClusterTxnId) -> Vec<ClusterTxnId>;
     /// Makes txn's pending request return RangeError::Deadlock; no-op if not waiting.
     fn cancel_wait(&self, txn: ClusterTxnId);
+    /// Whether `txn` registered an xid on this gateway and has not ended (R5-55). A restarted
+    /// gateway answers false for every earlier transaction (ids are never reused).
+    fn txn_live(&self, txn: ClusterTxnId) -> bool {
+        let _ = txn;
+        false
+    }
 }
 /// Only on the system range's leader.
 pub trait SystemService: Send + Sync {

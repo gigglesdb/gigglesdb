@@ -1,4 +1,4 @@
-//! Wire codec of range and gateway calls between nodes (GD-0075 R5-21).
+//! Wire codec of range, gateway and node-status calls between nodes (GD-0075 R5-21, R5-64).
 //!
 //! A call body is `[version u8 = 1][call tag u8][fields]`; a reply body is
 //! `[version u8 = 1][0][reply tag u8][fields]` or `[version u8 = 1][1][error tag u8][fields]`.
@@ -10,7 +10,8 @@ use std::ops::{Bound, Range};
 use giggles_core::range_api::{
     ClusterTxnId, DeadlockProbe, Epoch, HomeOp, HomeReply, HomeStatus, LeaseKind, LockGrant,
     LockRequest, LockTarget, Outcome, RangeDescriptor, RangeError, RangeId, RangeLockMode,
-    RangeSpace, RangeWrite, ReadDirection, ReadPage, ReadRequest, Timestamp,
+    RangeSpace, RangeWrite, ReadDirection, ReadPage, ReadRequest, SequenceOp, SequenceReply,
+    Timestamp,
 };
 
 use crate::client::{RangeCall, RangeReply};
@@ -24,6 +25,8 @@ pub enum GatewayCall {
     Abort(ClusterTxnId),
     Blockers(ClusterTxnId),
     CancelWait(ClusterTxnId),
+    /// Whether the gateway still runs the transaction (R5-55 status of another gateway's xid).
+    TxnLive(ClusterTxnId),
 }
 
 /// Result of a `GatewayCall`.
@@ -31,6 +34,72 @@ pub enum GatewayCall {
 pub enum GatewayReply {
     Done,
     Blockers(Vec<ClusterTxnId>),
+    Live(bool),
+}
+
+/// An operator call to a node (R5-64 `giggles-server cluster status`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeCall {
+    Status,
+}
+
+/// A replica's Raft role (a pre-candidate reports as candidate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeRole {
+    Leader,
+    Follower,
+    Candidate,
+}
+
+/// Calls a node's leader engines served for one range since the node started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallCounts {
+    pub reads: u64,
+    pub locks: u64,
+    /// Commits, prepares and finalizes.
+    pub writes: u64,
+    pub other: u64,
+}
+
+impl CallCounts {
+    pub fn total(&self) -> u64 {
+        [self.locks, self.writes, self.other]
+            .into_iter()
+            .fold(self.reads, u64::saturating_add)
+    }
+}
+
+/// One replica of a range as its node sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeReport {
+    pub descriptor: RangeDescriptor,
+    pub role: RangeRole,
+    pub term: u64,
+    /// The leader this replica knows of; 0 if none.
+    pub leader: u64,
+    pub applied: u64,
+    /// Approximate bytes stored for the range; `None` when unknown.
+    pub size: Option<u64>,
+    pub calls: CallCounts,
+    /// Calls served within the last `window_ms` (about a minute).
+    pub recent: u64,
+    pub window_ms: u64,
+}
+
+impl RangeReport {
+    pub fn calls_total(&self) -> u64 {
+        self.calls.total()
+    }
+    pub fn calls_per_sec(&self) -> f64 {
+        self.recent as f64 * 1000.0 / self.window_ms.max(1) as f64
+    }
+}
+
+/// A node's answer to `NodeCall::Status`: every range it replicates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeReport {
+    pub node: u64,
+    pub ranges: Vec<RangeReport>,
 }
 
 /// Any call one node makes to another over the peer connection.
@@ -38,6 +107,7 @@ pub enum GatewayReply {
 pub enum PeerCall {
     Range(RangeCall),
     Gateway(GatewayCall),
+    Node(NodeCall),
 }
 
 /// Result of a `PeerCall`.
@@ -45,6 +115,7 @@ pub enum PeerCall {
 pub enum PeerReply {
     Range(RangeReply),
     Gateway(GatewayReply),
+    Node(NodeReport),
 }
 
 fn corrupt(what: &str) -> RangeError {
@@ -455,6 +526,26 @@ fn put_range_call(w: &mut Writer, call: &RangeCall) -> Result<(), RangeError> {
             w.u64(*id);
             w.u64(*count);
         }
+        RangeCall::Sequence {
+            range,
+            id,
+            incarnation,
+            op,
+        } => {
+            w.u8(14);
+            w.u64(range.0);
+            w.u64(*id);
+            w.0.extend_from_slice(&incarnation.to_be_bytes());
+            match op {
+                SequenceOp::Next => w.u8(0),
+                SequenceOp::Set { value, called } => {
+                    w.u8(1);
+                    w.0.extend_from_slice(&value.to_be_bytes());
+                    w.u8(u8::from(*called));
+                }
+                SequenceOp::Forget => w.u8(2),
+            }
+        }
     }
     Ok(())
 }
@@ -544,6 +635,20 @@ fn range_call(tag: u8, r: &mut Reader<'_>) -> Result<RangeCall, RangeError> {
             id: r.u64()?,
             count: r.u64()?,
         },
+        14 => RangeCall::Sequence {
+            range: r.range()?,
+            id: r.u64()?,
+            incarnation: u128::from_be_bytes(r.take(16)?.try_into().expect("16 bytes")),
+            op: match r.u8()? {
+                0 => SequenceOp::Next,
+                1 => SequenceOp::Set {
+                    value: r.u64()? as i64,
+                    called: r.flag()?,
+                },
+                2 => SequenceOp::Forget,
+                _ => return Err(corrupt("unknown sequence op")),
+            },
+        },
         _ => return Err(corrupt("unknown call")),
     })
 }
@@ -566,15 +671,18 @@ pub fn encode_call(call: &PeerCall) -> Result<Vec<u8>, RangeError> {
             }
             GatewayCall::Abort(txn)
             | GatewayCall::Blockers(txn)
-            | GatewayCall::CancelWait(txn) => {
+            | GatewayCall::CancelWait(txn)
+            | GatewayCall::TxnLive(txn) => {
                 w.u8(match call {
                     GatewayCall::Abort(_) => 33,
                     GatewayCall::Blockers(_) => 34,
-                    _ => 35,
+                    GatewayCall::CancelWait(_) => 35,
+                    _ => 36,
                 });
                 w.u64(txn.0);
             }
         },
+        PeerCall::Node(NodeCall::Status) => w.u8(48),
     }
     Ok(w.0)
 }
@@ -601,6 +709,8 @@ pub fn decode_call(bytes: &[u8]) -> Result<PeerCall, RangeError> {
         33 => PeerCall::Gateway(GatewayCall::Abort(r.txn()?)),
         34 => PeerCall::Gateway(GatewayCall::Blockers(r.txn()?)),
         35 => PeerCall::Gateway(GatewayCall::CancelWait(r.txn()?)),
+        36 => PeerCall::Gateway(GatewayCall::TxnLive(r.txn()?)),
+        48 => PeerCall::Node(NodeCall::Status),
         tag => PeerCall::Range(range_call(tag, &mut r)?),
     };
     r.finish(call)
@@ -755,6 +865,18 @@ fn put_range_reply(w: &mut Writer, reply: &RangeReply) -> Result<(), RangeError>
             w.u64(range.start);
             w.u64(range.end);
         }
+        RangeReply::Sequence(reply) => {
+            w.u8(14);
+            match reply {
+                SequenceReply::Value(v) => {
+                    w.u8(0);
+                    w.0.extend_from_slice(&v.to_be_bytes());
+                }
+                SequenceReply::Gone => w.u8(1),
+                SequenceReply::Limit => w.u8(2),
+                SequenceReply::OutOfRange => w.u8(3),
+            }
+        }
     }
     Ok(())
 }
@@ -817,8 +939,69 @@ fn range_reply(tag: u8, r: &mut Reader<'_>) -> Result<RangeReply, RangeError> {
             }
             RangeReply::Lease(Range { start, end })
         }
+        14 => RangeReply::Sequence(match r.u8()? {
+            0 => SequenceReply::Value(r.u64()? as i64),
+            1 => SequenceReply::Gone,
+            2 => SequenceReply::Limit,
+            3 => SequenceReply::OutOfRange,
+            _ => return Err(corrupt("unknown sequence reply")),
+        }),
         _ => return Err(corrupt("unknown reply")),
     })
+}
+
+fn put_node_report(w: &mut Writer, report: &NodeReport) -> Result<(), RangeError> {
+    w.u64(report.node);
+    w.len(report.ranges.len())?;
+    for range in &report.ranges {
+        w.descriptor(&range.descriptor)?;
+        w.u8(match range.role {
+            RangeRole::Leader => 0,
+            RangeRole::Follower => 1,
+            RangeRole::Candidate => 2,
+        });
+        w.u64(range.term);
+        w.u64(range.leader);
+        w.u64(range.applied);
+        w.opt_u64(range.size);
+        let c = &range.calls;
+        for v in [c.reads, c.locks, c.writes, c.other, range.recent, range.window_ms] {
+            w.u64(v);
+        }
+    }
+    Ok(())
+}
+
+fn node_report(r: &mut Reader<'_>) -> Result<NodeReport, RangeError> {
+    let node = r.u64()?;
+    // Each range takes at least 4 + 1 + 3 * 8 + 1 + 6 * 8 bytes.
+    let n = r.count(78)?;
+    let ranges = (0..n)
+        .map(|_| {
+            Ok(RangeReport {
+                descriptor: r.descriptor()?,
+                role: match r.u8()? {
+                    0 => RangeRole::Leader,
+                    1 => RangeRole::Follower,
+                    2 => RangeRole::Candidate,
+                    _ => return Err(corrupt("unknown range role")),
+                },
+                term: r.u64()?,
+                leader: r.u64()?,
+                applied: r.u64()?,
+                size: r.opt_u64()?,
+                calls: CallCounts {
+                    reads: r.u64()?,
+                    locks: r.u64()?,
+                    writes: r.u64()?,
+                    other: r.u64()?,
+                },
+                recent: r.u64()?,
+                window_ms: r.u64()?,
+            })
+        })
+        .collect::<Result<_, RangeError>>()?;
+    Ok(NodeReport { node, ranges })
 }
 
 /// Encodes a reply body.
@@ -837,6 +1020,16 @@ pub fn encode_reply(reply: &Result<PeerReply, RangeError>) -> Result<Vec<u8>, Ra
             w.u8(0);
             w.u8(33);
             w.txns(txns)?;
+        }
+        Ok(PeerReply::Gateway(GatewayReply::Live(live))) => {
+            w.u8(0);
+            w.u8(34);
+            w.u8(u8::from(*live));
+        }
+        Ok(PeerReply::Node(report)) => {
+            w.u8(0);
+            w.u8(48);
+            put_node_report(&mut w, report)?;
         }
         Err(e) => {
             w.u8(1);
@@ -858,6 +1051,8 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Result<PeerReply, RangeError>, Range
         Ok(match r.u8()? {
             32 => PeerReply::Gateway(GatewayReply::Done),
             33 => PeerReply::Gateway(GatewayReply::Blockers(r.txns()?)),
+            34 => PeerReply::Gateway(GatewayReply::Live(r.flag()?)),
+            48 => PeerReply::Node(node_report(&mut r)?),
             tag => PeerReply::Range(range_reply(tag, &mut r)?),
         })
     };

@@ -56,7 +56,7 @@ pub struct Validated {
     pub owner: Option<String>,
 }
 
-fn decode_hex<const N: usize>(value: &str, field: &str) -> Result<[u8; N], String> {
+pub(crate) fn decode_hex<const N: usize>(value: &str, field: &str) -> Result<[u8; N], String> {
     if value.len() != N * 2
         || !value
             .bytes()
@@ -70,6 +70,43 @@ fn decode_hex<const N: usize>(value: &str, field: &str) -> Result<[u8; N], Strin
     let mut result = [0; N];
     hex::decode_to_slice(value, &mut result).map_err(|e| format!("{field}: {e}"))?;
     Ok(result)
+}
+
+/// Resolves `<section>.log_dir` and `<section>.snapshot_dir` (default `<log_dir>.snapshots`) to
+/// absolute paths and rejects any overlap between them and the database.
+pub(crate) fn resolve_dirs(
+    section: &str,
+    log_dir: &Path,
+    snapshot_dir: Option<&Path>,
+    database: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    let log_dir = std::path::absolute(log_dir).map_err(|e| format!("{section}.log_dir: {e}"))?;
+    let database = std::path::absolute(database)
+        .map_err(|e| format!("{section}.log_dir: invalid database path: {e}"))?;
+    if log_dir.starts_with(&database) || database.starts_with(&log_dir) {
+        return Err(format!("{section}.log_dir: must be separate from database"));
+    }
+    let snapshot_dir = match snapshot_dir {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let mut name = log_dir
+                .file_name()
+                .ok_or_else(|| format!("{section}.log_dir: expected a directory name"))?
+                .to_os_string();
+            name.push(".snapshots");
+            log_dir.with_file_name(name)
+        }
+    };
+    let snapshot_dir =
+        std::path::absolute(snapshot_dir).map_err(|e| format!("{section}.snapshot_dir: {e}"))?;
+    for other in [&log_dir, &database] {
+        if snapshot_dir.starts_with(other) || other.starts_with(&snapshot_dir) {
+            return Err(format!(
+                "{section}.snapshot_dir: must be separate from log_dir and database"
+            ));
+        }
+    }
+    Ok((log_dir, snapshot_dir))
 }
 
 impl ReplicationConfig {
@@ -99,33 +136,12 @@ impl ReplicationConfig {
         {
             return Err("replication.write_set_bytes: must be between 1 MiB and 32 MiB".into());
         }
-        let log_dir =
-            std::path::absolute(&self.log_dir).map_err(|e| format!("replication.log_dir: {e}"))?;
-        let database = std::path::absolute(database)
-            .map_err(|e| format!("replication.log_dir: invalid database path: {e}"))?;
-        if log_dir.starts_with(&database) || database.starts_with(&log_dir) {
-            return Err("replication.log_dir: must be separate from database".into());
-        }
-        let snapshot_dir = match &self.snapshot_dir {
-            Some(path) => path.clone(),
-            None => {
-                let name = log_dir
-                    .file_name()
-                    .ok_or("replication.log_dir: expected a directory name")?;
-                let mut name = name.to_os_string();
-                name.push(".snapshots");
-                log_dir.with_file_name(name)
-            }
-        };
-        let snapshot_dir = std::path::absolute(snapshot_dir)
-            .map_err(|e| format!("replication.snapshot_dir: {e}"))?;
-        for other in [&log_dir, &database] {
-            if snapshot_dir.starts_with(other) || other.starts_with(&snapshot_dir) {
-                return Err(
-                    "replication.snapshot_dir: must be separate from log_dir and database".into(),
-                );
-            }
-        }
+        let (log_dir, snapshot_dir) = resolve_dirs(
+            "replication",
+            &self.log_dir,
+            self.snapshot_dir.as_deref(),
+            database,
+        )?;
         let mut voters = vec![self.node_id];
         let mut peers = Vec::with_capacity(2);
         for (i, peer) in self.peers.iter().enumerate() {

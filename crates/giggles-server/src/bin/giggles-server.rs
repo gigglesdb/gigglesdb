@@ -23,6 +23,8 @@ struct Config {
     database: String,
     #[serde(default)]
     replication: Option<giggles_server::replication::config::ReplicationConfig>,
+    #[serde(default)]
+    cluster: Option<giggles_server::cluster::config::ClusterConfig>,
     native: SocketAddr,
     postgres: SocketAddr,
     #[serde(default)]
@@ -58,6 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if path == "replica" {
         std::process::exit(replica_command(args).await);
     }
+    if path == "cluster" {
+        std::process::exit(cluster_command(args).await);
+    }
     if path == "--dev" {
         let options = giggles_server::dev::Options::parse(args).unwrap_or_else(|usage| {
             eprintln!("{usage}");
@@ -72,6 +77,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bytes = bounded_file(&path)?;
     let c: Config = serde_json::from_slice(&bytes)?;
     validate_agent(&c)?;
+    let cluster = match &c.cluster {
+        Some(cluster) => Some(cluster_validate(&c, cluster)?),
+        None => None,
+    };
     if c.replication.is_some() {
         #[cfg(not(feature = "engine-rocksdb"))]
         return Err("replication requires the engine-rocksdb feature".into());
@@ -88,7 +97,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PostgresqlConfig::build)
         .transpose()?
         .map(std::sync::Arc::new);
-    let admin = Admin::open(&c.database, Limits::default())?;
+    #[cfg(feature = "engine-rocksdb")]
+    let mut cluster_runtime = None;
+    #[cfg_attr(not(feature = "engine-rocksdb"), allow(unused_mut))]
+    let mut preview = "preview=single-host".to_string();
+    let admin = match cluster {
+        #[cfg(feature = "engine-rocksdb")]
+        Some(v) => {
+            let database = c.database.clone();
+            let runtime = tokio::task::spawn_blocking(move || {
+                giggles_server::cluster::runtime::ClusterRuntime::start(
+                    &v,
+                    std::path::Path::new(&database),
+                )
+            })
+            .await??;
+            preview = format!("preview=cluster node={}", runtime.node_id());
+            let admin = runtime.admin().clone();
+            cluster_runtime = Some(runtime);
+            admin
+        }
+        #[cfg(not(feature = "engine-rocksdb"))]
+        Some(_) => unreachable!("cluster_validate refuses without engine-rocksdb"),
+        None => Admin::open(&c.database, Limits::default())?,
+    };
     let bindings = match &c.bindings_file {
         Some(path) => serde_json::from_slice(&bounded_file(path)?)?,
         None => c.bindings.clone(),
@@ -134,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api,
         addresses,
     } = start_listeners(&c, &service, &config, postgresql, agent_tls, false).await?;
-    println!("{} preview=single-host", addresses.join(" "));
+    println!("{} {preview}", addresses.join(" "));
     io::stdout().flush()?;
     // Trusted local stdin only; bounded command reader, one reload at a time.
     // Certificate reload uses the same trusted local trigger as binding reload.
@@ -204,7 +236,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     stop_all(listeners, &api).await?;
+    drop(service);
+    #[cfg(feature = "engine-rocksdb")]
+    if let Some(runtime) = cluster_runtime {
+        tokio::task::spawn_blocking(move || runtime.stop()).await?;
+    }
     Ok(())
+}
+
+/// The validated `cluster` section, or why this configuration cannot run in cluster mode.
+fn cluster_validate(
+    c: &Config,
+    cluster: &giggles_server::cluster::config::ClusterConfig,
+) -> Result<giggles_server::cluster::config::ClusterValidated, String> {
+    use std::path::Path;
+    if c.replication.is_some() {
+        return Err("cluster: cannot be combined with replication".into());
+    }
+    if !cfg!(feature = "engine-rocksdb") {
+        return Err("cluster requires the engine-rocksdb feature".into());
+    }
+    cluster.validate(
+        Path::new(&c.database),
+        Path::new(&c.certificate),
+        Path::new(&c.private_key),
+        Path::new(&c.client_ca),
+    )
+}
+
+#[cfg(not(feature = "engine-rocksdb"))]
+async fn cluster_command(_args: impl Iterator<Item = String>) -> i32 {
+    eprintln!("cluster requires the engine-rocksdb feature");
+    2
+}
+
+/// `cluster status <config.json> [--json]`: every member's ranges, leaders and load, asked
+/// with this node's certificate. Exit 0 if a member answered, 1 if none, 2 on bad usage.
+#[cfg(feature = "engine-rocksdb")]
+async fn cluster_command(args: impl Iterator<Item = String>) -> i32 {
+    use giggles_server::cluster::{cli, runtime::transport_config};
+    let command = match cli::Command::parse(args) {
+        Ok(command) => command,
+        Err(usage) => {
+            eprintln!("{usage}");
+            return 2;
+        }
+    };
+    let setup = || -> Result<_, Box<dyn std::error::Error>> {
+        let c: Config = serde_json::from_slice(&bounded_file(&command.config)?)?;
+        let cluster = c.cluster.as_ref().ok_or("cluster section is required")?;
+        let v = cluster_validate(&c, cluster)?;
+        Ok((transport_config(&v)?, v.members))
+    };
+    let (transport, members) = match setup() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}\n{}", cli::USAGE);
+            return 2;
+        }
+    };
+    let asked = tokio::task::spawn_blocking(move || {
+        giggles_replication::cluster_node::query_status(&transport, &members, cli::TIMEOUT)
+    })
+    .await;
+    let answers = match asked {
+        Ok(Ok(answers)) => answers,
+        Ok(Err(error)) => {
+            eprintln!("transport error: {error}");
+            return 1;
+        }
+        Err(error) => {
+            eprintln!("transport error: {error}");
+            return 1;
+        }
+    };
+    let summary = cli::summarize(&answers);
+    if command.json {
+        match serde_json::to_string_pretty(&summary) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("{error}");
+                return 1;
+            }
+        }
+    } else {
+        println!("{}", cli::text(&summary));
+    }
+    summary.exit_code()
 }
 
 #[cfg(not(feature = "engine-rocksdb"))]
@@ -776,6 +894,43 @@ mod tests {
         json["agent"]["http"] = "127.0.0.1:0".into();
         assert!(validate_agent(&serde_json::from_value::<Config>(json.clone()).unwrap()).is_err());
         json["agent"] = serde_json::json!({"postgres": "127.0.0.1:0", "typo": 1});
+        assert!(serde_json::from_value::<Config>(json).is_err());
+    }
+
+    #[test]
+    fn cluster_section_is_optional_validated_and_exclusive() {
+        let mut json = serde_json::json!({
+            "database": "db", "native": "127.0.0.1:0", "postgres": "127.0.0.1:0",
+            "certificate": "server.pem", "private_key": "server.key", "client_ca": "ca.pem",
+            "bindings": [], "connections": 32, "skew_seconds": 0, "max_pause_seconds": 3600
+        });
+        let c = serde_json::from_value::<Config>(json.clone()).unwrap();
+        assert!(c.cluster.is_none() && c.replication.is_none());
+        json["cluster"] = serde_json::json!({
+            "node_id": 1, "cluster": "0123456789abcdef0123456789abcdef",
+            "listen": "127.0.0.1:7101", "log_dir": "cluster-log"
+        });
+        let c = serde_json::from_value::<Config>(json.clone()).unwrap();
+        match cluster_validate(&c, c.cluster.as_ref().unwrap()) {
+            Ok(v) => assert_eq!((v.node_id, v.bootstrap_node()), (1, 1)),
+            Err(error) => assert_eq!(error, "cluster requires the engine-rocksdb feature"),
+        }
+        json["cluster"]["node_id"] = 0.into();
+        let c = serde_json::from_value::<Config>(json.clone()).unwrap();
+        if cfg!(feature = "engine-rocksdb") {
+            let error = cluster_validate(&c, c.cluster.as_ref().unwrap()).unwrap_err();
+            assert!(error.starts_with("cluster.node_id:"), "{error}");
+        }
+        json["replication"] = serde_json::json!({
+            "node_id": 1, "cluster": "0123456789abcdef0123456789abcdef",
+            "listen": "127.0.0.1:7201", "log_dir": "replication-log", "peers": []
+        });
+        let c = serde_json::from_value::<Config>(json.clone()).unwrap();
+        assert_eq!(
+            cluster_validate(&c, c.cluster.as_ref().unwrap()).unwrap_err(),
+            "cluster: cannot be combined with replication"
+        );
+        json["cluster"]["typo"] = true.into();
         assert!(serde_json::from_value::<Config>(json).is_err());
     }
 }

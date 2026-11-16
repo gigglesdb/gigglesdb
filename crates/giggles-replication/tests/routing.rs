@@ -157,6 +157,22 @@ impl SystemService for FakeSystem {
     fn lease(&self, _: LeaseKind, _: u64, count: u64) -> Result<std::ops::Range<u64>, RangeError> {
         Ok(0..count)
     }
+    /// nextval = id * 1000 + the oracle's next value; incarnation 0 = no definition.
+    fn sequence(
+        &self,
+        id: u64,
+        incarnation: u128,
+        op: SequenceOp,
+    ) -> Result<SequenceReply, RangeError> {
+        Ok(match (incarnation, op) {
+            (0, _) => SequenceReply::Gone,
+            (_, SequenceOp::Next) => {
+                SequenceReply::Value((id * 1000 + self.0.fetch_add(1, Ordering::SeqCst)) as i64)
+            }
+            (_, SequenceOp::Set { value, .. }) => SequenceReply::Value(value),
+            (_, SequenceOp::Forget) => SequenceReply::Gone,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -484,6 +500,35 @@ fn local_leaders_are_called_in_process() {
     assert!(client.oracle().next(2).unwrap() > Timestamp(100));
     assert_eq!(client.lease(LeaseKind::Xid, 0, 4), Ok(0..4));
     assert!(net.log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn sequence_calls_reach_the_system_leader_remote_or_local() {
+    let (net, _) = Net::new(&[]);
+    // Node 9 holds no system range: nextval goes to node 1 over the transport.
+    let remote = net.client(9);
+    let first = remote.sequence(7, 5, SequenceOp::Next).unwrap();
+    let second = remote.sequence(7, 5, SequenceOp::Next).unwrap();
+    let (SequenceReply::Value(a), SequenceReply::Value(b)) = (first, second) else {
+        panic!("{first:?} {second:?}");
+    };
+    assert!(b > a && a > 7000, "{a} {b}");
+    assert_eq!(
+        remote.sequence(7, 5, SequenceOp::Set {
+            value: -3,
+            called: false
+        }),
+        Ok(SequenceReply::Value(-3))
+    );
+    assert_eq!(remote.sequence(7, 0, SequenceOp::Next), Ok(SequenceReply::Gone));
+    assert_eq!(net.calls("Sequence"), vec![1, 1, 1, 1]);
+    // On the system leader itself the call stays in process.
+    let local = net.client(1);
+    assert!(matches!(
+        local.sequence(8, 1, SequenceOp::Next),
+        Ok(SequenceReply::Value(v)) if v > 8000
+    ));
+    assert_eq!(net.calls("Sequence").len(), 4);
 }
 
 #[test]

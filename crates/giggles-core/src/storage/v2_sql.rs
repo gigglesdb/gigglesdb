@@ -159,7 +159,11 @@ impl SqlSession {
                     self.sequence_values.clone(),
                     self.search_path.clone(),
                 ))
-                .with_xact(sql_xact::callback(db.clone(), self.xact.clone()));
+                .with_xact(sql_xact::callback(
+                    db.clone(),
+                    self.xact.clone(),
+                    self.v2_transaction.as_ref().map(|txn| txn.id()),
+                ));
             let output = state.sql.normalize_copy(prepared, rows, Some(&context));
             crate::cancellation::check()?;
             if let Some(error) = context.take_error() {
@@ -680,7 +684,11 @@ impl SqlSession {
                                 self.sequence_values.clone(),
                                 self.search_path.clone(),
                             ))
-                            .with_xact(sql_xact::callback(db.clone(), self.xact.clone()))
+                            .with_xact(sql_xact::callback(
+                                db.clone(),
+                                self.xact.clone(),
+                                Some(txn.id()),
+                            ))
                         });
                         if let Some(input) = self.copy_input.as_mut() {
                             let table = bound.table().ok_or(CoreError::Sql(E::Unsupported))?;

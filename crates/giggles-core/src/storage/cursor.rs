@@ -162,8 +162,12 @@ impl SqlSession {
             });
             let (image, source, context) = match &self.admin.inner.backend {
                 Backend::V2(db) => {
-                    // Cursors read the local store directly (no cluster form yet).
-                    db.require_local()?;
+                    // The snapshot source below reads the local store directly; a cluster
+                    // gateway buffers the result of the normal execution path instead
+                    // (GD-0075 P7-2; streaming over ranges is later work).
+                    if db.cluster_services().is_some() {
+                        return self.buffer_cursor(&p, params, clock, buffer_limit);
+                    }
                     // The existing transaction API cannot fork its write overlay.
                     // Keep read-your-writes correct via the bounded bridge fallback.
                     // SERIALIZABLE reads must enter the read set validated at COMMIT,

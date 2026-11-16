@@ -13,12 +13,13 @@ use std::{ops::Bound, sync::Arc, thread, time::Duration};
 
 use crate::storage::{
     engine::{
+        catalog::GENERATION_KEY,
         hlc::Ts,
         kv::{Direction, Keyspace, KvError, KvIter, KvPair, KvRead},
     },
     range_api::{
         RangeClient, RangeDescriptor, RangeError, RangeSpace, ReadDirection, ReadPage, ReadRequest,
-        Timestamp, range_key, split_range_key,
+        Timestamp, cluster_record_key, range_key, split_range_key,
     },
 };
 
@@ -163,11 +164,13 @@ impl RoutedKvRead {
     }
 }
 
-/// Catalog keys with these leading tags are Track B's directory records in the system range
-/// (0xF0 directory, 0xF1 `gw/`, 0xF2 `ddl/`; design.md Changes 2026-11-16T10:40Z (iii)), not
-/// catalog objects: catalog loads through a gateway never see them.
+/// Catalog keys with these leading tags are cluster records in the system range (0xF0
+/// directory, 0xF1 `gw/`, 0xF2 `ddl/`; design.md Changes 2026-11-16T10:40Z (iii); 0xF3 `XACT/`,
+/// R5-55), not catalog objects: catalog loads through a gateway never see them. The
+/// catalog-generation record (0xF4, P7-1) stays readable: gateways read it to notice DDL
+/// committed elsewhere, and catalog loads skip it themselves.
 fn directory_key(ks: Keyspace, key: &[u8]) -> bool {
-    ks == Keyspace::Catalog && matches!(key.first(), Some(0xF0..=0xF2))
+    ks == Keyspace::Catalog && cluster_record_key(key) && !key.starts_with(GENERATION_KEY)
 }
 
 fn route_unsettled() -> KvError {

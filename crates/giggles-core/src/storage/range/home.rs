@@ -15,8 +15,6 @@
 //! [`HomeLog`] over its sequencer, so `put` returns only after the batch is durably applied,
 //! and routes `RangeService::home` to [`HomeRecords::apply`]. The cross-range protocol these
 //! records serve is in `storage/cluster/coordinator.rs`.
-// Wired by the range engine (Track A) and the gateway later in R5; until then only tests use it.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::range_api::{
     ClusterTxnId, HomeOp, HomeReply, HomeStatus, Outcome, RangeClient, RangeError, RangeId,

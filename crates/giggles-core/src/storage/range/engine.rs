@@ -509,10 +509,6 @@ pub(crate) struct RangeEngines {
 }
 
 impl RangeEngines {
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "R5-16 role manager constructs it")
-    )]
     pub(crate) fn new(
         store: Arc<RangeStore>,
         oracle: Arc<dyn TsOracle>,
@@ -534,10 +530,6 @@ impl RangeEngines {
     /// prepared records through their homes (R5-53), and one worker thread runs home-record
     /// recovery (R5-52) on every open engine each `recovery_tick` until `self` is dropped.
     /// Weak, because the client normally owns the engines. Set once; later calls are ignored.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "the node wires its RangeClient later in R5")
-    )]
     pub(crate) fn set_client(&self, client: Weak<dyn RangeClient>) {
         if self.client.set(client.clone()).is_err() {
             return;
@@ -554,7 +546,6 @@ impl RangeEngines {
     }
 
     /// The system range's services, while this node leads the system range.
-    #[cfg_attr(not(test), allow(dead_code, reason = "Track B's dispatcher serves it"))]
     pub(crate) fn system(&self) -> Option<Arc<SystemRange>> {
         self.system
             .lock()

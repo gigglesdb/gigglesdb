@@ -13,9 +13,19 @@ fn corrupt(error: impl std::fmt::Display) -> FormatError {
     FormatError::Corrupt(error.to_string())
 }
 
+/// Catalog keys tagged 0xF0.. are a cluster's own records in its system range (range directory,
+/// gateways, DDL, transaction status, catalog generation; GD-0075 design.md Changes), never
+/// catalog objects: they need no format bits, and catalog loads skip them. A single-node or R4
+/// catalog load still refuses them (`classify_catalog_key`).
+pub(crate) fn is_cluster_system_key(key: &[u8]) -> bool {
+    key.first().is_some_and(|tag| *tag >= 0xF0)
+}
+
 /// New role kinds need their guard even when the physical value is a tombstone.
 pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatError> {
-    if key.first().is_some_and(|kind| (8..=13).contains(kind)) {
+    if is_cluster_system_key(key) {
+        Ok(0)
+    } else if key.first().is_some_and(|kind| (8..=13).contains(kind)) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::super::roles::engine::FEATURE)
     } else if key.first().is_some_and(|kind| matches!(kind, 14 | 15)) {
@@ -48,6 +58,9 @@ pub(crate) fn required_bits_for_catalog_value(
     key: &[u8],
     value: &[u8],
 ) -> Result<u64, FormatError> {
+    if is_cluster_system_key(key) {
+        return Ok(0);
+    }
     match catalog_codec::classify_catalog_key(key).map_err(corrupt)? {
         CatalogKind::Table => {
             let (entry, ext) = catalog_codec::decode_table(value).map_err(corrupt)?;

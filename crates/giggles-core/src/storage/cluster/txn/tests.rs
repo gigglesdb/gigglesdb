@@ -594,3 +594,29 @@ fn a_coordinator_killed_at_every_step_leaves_one_outcome_readers_resolve() {
     }
     assert_eq!(outcomes.len(), 2, "both outcomes were exercised");
 }
+
+/// Review S1: a single-range commit that runs out of attempts on Unavailable may have reached
+/// the leader (a timed-out request can still be queued there): the outcome is unknown (08007),
+/// never an I/O error. A definite refusal on the first attempt stays 40001 (above).
+#[test]
+fn a_single_range_commit_that_runs_out_of_attempts_is_ambiguous() {
+    let cluster = cluster();
+    let dying = Arc::new(Dying {
+        cluster: cluster.clone(),
+        budget: std::sync::atomic::AtomicUsize::new(usize::MAX),
+    });
+    let gw = ClusterTxnServices::new(
+        dying.clone(),
+        ClusterConfig {
+            retries: 3,
+            heartbeat: Duration::from_secs(60),
+            ..ClusterConfig::default()
+        },
+    );
+    let mut txn = begin(&gw, Isolation::ReadCommitted);
+    txn.snapshot_ts();
+    put_row(&mut txn, 10, b"a", b"x");
+    // Every commit attempt fails without an answer.
+    dying.budget.store(0, Ordering::SeqCst);
+    assert_eq!(txn.commit().unwrap_err(), TxnError::CommitAmbiguous);
+}

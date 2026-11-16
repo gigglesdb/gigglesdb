@@ -247,6 +247,7 @@ impl V2Db {
 
     /// Fails with Unsupported on a cluster gateway: for paths that read or write the local
     /// store directly and have no cluster form yet.
+    #[cfg_attr(not(feature = "engine-rocksdb"), allow(dead_code))]
     pub(crate) fn require_local(&self) -> Result<(), CoreError> {
         match self.cluster {
             Some(_) => Err(CoreError::Unsupported),
@@ -357,9 +358,9 @@ impl V2Db {
         &self,
         txn: Option<&engine::txn::Transaction>,
     ) -> Result<super::State, CoreError> {
-        self.with_metadata_catalog(txn, |catalog, epoch| {
+        self.with_metadata_catalog(txn, |catalog, epoch, ts| {
             let mut state = super::empty(u128::from_be_bytes(self.meta.domain));
-            state.origin = self.origin_at(engine::hlc::Ts(epoch))?;
+            state.origin = self.origin_at(ts)?;
             state.sql = (*catalog.image().map_err(CoreError::Sql)?).clone();
             state.sql.epoch = epoch;
             Ok(state)
@@ -373,9 +374,9 @@ impl V2Db {
         txn: Option<&engine::txn::Transaction>,
         inspect: impl FnOnce(&super::MetadataState<'_>) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
-        self.with_metadata_catalog(txn, |catalog, epoch| {
+        self.with_metadata_catalog(txn, |catalog, epoch, ts| {
             // Preserve the owned metadata API's provenance read and its errors.
-            self.origin_at(engine::hlc::Ts(epoch))?;
+            self.origin_at(ts)?;
             let image = catalog.image().map_err(CoreError::Sql)?;
             let mut state = super::MetadataState::new(
                 &image,
@@ -388,27 +389,51 @@ impl V2Db {
         })
     }
 
+    /// Passes the catalog, the metadata epoch and the read timestamp. The epoch is the read
+    /// timestamp, except on a cluster gateway (GD-0075 P7-2): there every read draws a fresh
+    /// oracle timestamp, so the epoch is the catalog version the snapshot used (the read
+    /// timestamp only when the snapshot predates every cached version). Two reads then share
+    /// an epoch exactly when no catalog change was published between them.
     fn with_metadata_catalog<T>(
         &self,
         txn: Option<&engine::txn::Transaction>,
-        inspect: impl FnOnce(Arc<engine::catalog::CatalogSnapshot>, u64) -> Result<T, CoreError>,
+        inspect: impl FnOnce(
+            Arc<engine::catalog::CatalogSnapshot>,
+            u64,
+            engine::hlc::Ts,
+        ) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
         let mut committed;
-        let (catalog, epoch) = match txn {
-            Some(txn) => (
-                self.catalog.metadata_snapshot(txn)?,
-                match txn.current_snapshot_ts() {
-                    Some(ts) => ts.0,
-                    None => self.visible_ts()?.0,
-                },
-            ),
+        let cluster = self.cluster.is_some();
+        let (catalog, ts, version) = match txn {
+            Some(txn) => {
+                let (catalog, version) = if cluster {
+                    self.catalog.binding_snapshot(txn)?
+                } else {
+                    (self.catalog.metadata_snapshot(txn)?, None)
+                };
+                let ts = match txn.current_snapshot_ts() {
+                    Some(ts) => ts,
+                    None => self.visible_ts()?,
+                };
+                (catalog, ts, version)
+            }
+            None if cluster => {
+                committed = self.begin(engine::txn::Isolation::ReadCommitted);
+                let ts = committed.snapshot_ts();
+                if let Some(error) = committed.snapshot_error() {
+                    return Err(error.clone().into());
+                }
+                let (catalog, version) = self.catalog.binding_snapshot(&committed)?;
+                (catalog, ts, version)
+            }
             None => {
                 committed = self.begin(engine::txn::Isolation::ReadCommitted);
                 let catalog = self.catalog.snapshot(&mut committed)?;
-                (catalog, committed.snapshot_ts().0)
+                (catalog, committed.snapshot_ts(), None)
             }
         };
-        inspect(catalog, epoch)
+        inspect(catalog, version.unwrap_or(ts).0, ts)
     }
     /// Older SQL-only v2 databases have no kernel image. When present, its
     /// existing metadata record carries restore provenance.

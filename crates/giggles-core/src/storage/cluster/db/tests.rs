@@ -47,9 +47,7 @@ fn gateway(cluster: &Arc<LocalCluster>, node: u16) -> Gateway {
         Limits::default(),
     )
     .unwrap();
-    if let Some(service) = gateway.services.gateway_service() {
-        cluster.register_gateway(u64::from(node), service);
-    }
+    cluster.register_gateway(u64::from(node), gateway.services.gateway_service());
     gateway
 }
 
@@ -350,4 +348,138 @@ fn a_gateway_aggregate_over_the_retention_budget_spills() {
         )
         .unwrap();
     assert_eq!(ints(&groups), vec![vec![17_000]]);
+}
+
+fn run(session: &mut crate::storage::SqlSession, sql: &str) -> crate::relational::SqlResult {
+    session.execute_at(sql, &[], None, &clock()).unwrap()
+}
+
+/// P7-1: a gateway attached before another gateway's DDL serves that DDL (the catalog-generation
+/// record tells it its cached catalog is stale).
+#[test]
+fn a_gateway_sees_ddl_committed_through_another_gateway() {
+    let cluster = LocalCluster::new(&splits());
+    let a = gateway(&cluster, 1);
+    let b = gateway(&cluster, 2);
+    let (mut sa, mut sb) = (a.admin.sql_session(), b.admin.sql_session());
+    run(&mut sa, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+    run(&mut sa, "CREATE TABLE gone(id INT PRIMARY KEY)");
+    run(&mut sa, "INSERT INTO t VALUES (1, 10)");
+    assert_eq!(ints(&run(&mut sb, "SELECT id, v FROM t")), vec![vec![1, 10]]);
+    run(&mut sb, "INSERT INTO t VALUES (2, 20)");
+    assert_eq!(
+        ints(&run(&mut sa, "SELECT id, v FROM t ORDER BY id")),
+        vec![vec![1, 10], vec![2, 20]]
+    );
+    run(&mut sa, "ALTER TABLE t ADD COLUMN w INT");
+    run(&mut sa, "DROP TABLE gone");
+    run(&mut sb, "UPDATE t SET w = 7 WHERE id = 2");
+    assert_eq!(
+        ints(&run(&mut sb, "SELECT id, w FROM t WHERE w IS NOT NULL")),
+        vec![vec![2, 7]]
+    );
+    let error = sb
+        .execute_at("SELECT * FROM gone", &[], None, &clock())
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("UnknownTable"), "{error:?}");
+    assert_eq!(
+        ints(&run(&mut sa, "SELECT id, w FROM t WHERE w IS NOT NULL")),
+        vec![vec![2, 7]]
+    );
+}
+
+/// P7-2: the PostgreSQL wire path on a gateway. SELECTs run through cursors (buffered on a
+/// gateway), and two metadata reads share an epoch while no catalog change is published
+/// between them, although each read draws a fresh oracle timestamp; DDL changes the epoch.
+#[test]
+fn a_gateway_serves_cursors_and_stable_metadata_epochs() {
+    let cluster = LocalCluster::new(&splits());
+    let a = gateway(&cluster, 1);
+    let mut s = a.admin.sql_session();
+    run(&mut s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+    run(&mut s, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    for (sql, want) in [
+        ("SELECT id, v FROM t ORDER BY id", vec![vec![1, 10], vec![2, 20]]),
+        ("SELECT count(*) FROM t", vec![vec![2]]),
+        ("SELECT 1", vec![vec![1]]),
+    ] {
+        let p = s.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        s.describe(&p).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        let mut cursor = s.open_cursor(&p, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        let rows = crate::relational::SqlResult {
+            rows: cursor.fetch(100, 1 << 20).unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(ints(&rows), want, "{sql}");
+    }
+    let epoch = s.catalog_metadata().unwrap().presentation.epoch;
+    run(&mut s, "INSERT INTO t VALUES (3, 30)");
+    assert_eq!(s.catalog_metadata().unwrap().presentation.epoch, epoch);
+    run(&mut s, "ALTER TABLE t ADD COLUMN w INT");
+    assert_ne!(s.catalog_metadata().unwrap().presentation.epoch, epoch);
+}
+
+/// P7-1: roles are read from the system range on every lookup, so a role created through one
+/// gateway is visible on another; role writers serialize across gateways, so two creates of
+/// one name leave exactly one role and distinct names get distinct OIDs.
+#[test]
+fn role_writes_through_two_gateways_serialize() {
+    use crate::storage::roles::{NewRole, RoleError};
+    let cluster = LocalCluster::new(&splits());
+    let a = gateway(&cluster, 1);
+    let b = gateway(&cluster, 2);
+    let role = |name: &str| NewRole {
+        name: name.into(),
+        ..NewRole::default()
+    };
+    a.admin.roles().create(role("early")).unwrap();
+    assert!(b.admin.roles().get("early").unwrap().is_some());
+    for round in 0..5 {
+        let barrier = std::sync::Barrier::new(2);
+        let same = format!("same{round}");
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = [&a, &b]
+                .into_iter()
+                .map(|gateway| {
+                    let (barrier, same) = (&barrier, &same);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        gateway.admin.roles().create(role(same))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let duplicates = results
+            .iter()
+            .filter(|r| matches!(r, Err(RoleError::Duplicate)))
+            .count();
+        assert_eq!((results.len() - duplicates, duplicates), (1, 1), "{results:?}");
+        let distinct: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = [(&a, "x"), (&b, "y")]
+                .into_iter()
+                .map(|(gateway, prefix)| {
+                    let name = format!("{prefix}{round}");
+                    scope.spawn(move || gateway.admin.roles().create(role(&name)).unwrap().oid)
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_ne!(distinct[0], distinct[1]);
+    }
+    let names = |admin: &crate::storage::Admin| -> Vec<(String, u32)> {
+        let mut roles: Vec<_> = admin
+            .roles()
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.name, r.oid))
+            .collect();
+        roles.sort();
+        roles
+    };
+    let listed = names(&a.admin);
+    assert_eq!(listed, names(&b.admin));
+    assert_eq!(listed.len(), 16);
+    assert_eq!(listed.iter().map(|r| r.1).collect::<BTreeSet<_>>().len(), 16);
 }

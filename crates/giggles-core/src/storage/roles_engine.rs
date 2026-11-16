@@ -13,7 +13,7 @@ use crate::storage::{
         catalog_codec::CatalogKind,
         kv::{Direction, Keyspace},
         locks::{LockKey, LockMode},
-        txn::{Isolation, SerializationReason, Transaction, TxnError},
+        txn::{Isolation, SerializationReason, Transaction, TxnError, TxnServices},
     },
     v2::V2Db,
 };
@@ -196,6 +196,11 @@ fn lock(
         deadline,
         cancel,
     )?;
+    // The lock above is this gateway's only; across gateways role writers serialize on an
+    // exclusive range sentinel (GD-0075 P7-1).
+    if matches!(txn.services(), TxnServices::Cluster(_)) {
+        txn.lock_sql_sentinel(ROLE_LOCK, LockMode::Exclusive, cancel)?;
+    }
     Ok(())
 }
 /// Shared role lock for writers (tasks) that read roles but must not race a

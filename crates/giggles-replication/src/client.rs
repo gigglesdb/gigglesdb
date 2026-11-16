@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use giggles_core::range_api::{
     ClusterTxnId, Epoch, HomeOp, HomeReply, LeaseKind, LockGrant, LockRequest, Outcome,
     RangeClient, RangeDescriptor, RangeError, RangeId, RangeService, RangeWrite, ReadPage,
-    ReadRequest, SYSTEM_RANGE, SystemService, Timestamp, TsOracle,
+    ReadRequest, SYSTEM_RANGE, SequenceOp, SequenceReply, SystemService, Timestamp, TsOracle,
 };
 
 use crate::{directory, route::RouteCache};
@@ -15,7 +15,7 @@ use crate::{directory, route::RouteCache};
 /// Attempts per call in total (local, hint, replicas) before `Unavailable`.
 pub const MAX_ATTEMPTS: usize = 3;
 
-/// One range call; system calls (`OracleNext`, `Lease`) target `SYSTEM_RANGE`.
+/// One range call; system calls (`OracleNext`, `Lease`, `Sequence`) target `SYSTEM_RANGE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RangeCall {
     Descriptor {
@@ -76,6 +76,13 @@ pub enum RangeCall {
         id: u64,
         count: u64,
     },
+    /// A SQL sequence operation on the system range leader (design.md Changes, Track C (a)).
+    Sequence {
+        range: RangeId,
+        id: u64,
+        incarnation: u128,
+        op: SequenceOp,
+    },
 }
 
 impl RangeCall {
@@ -94,7 +101,8 @@ impl RangeCall {
             | Self::Finalize { range, .. }
             | Self::Home { range, .. }
             | Self::OracleNext { range, .. }
-            | Self::Lease { range, .. } => *range,
+            | Self::Lease { range, .. }
+            | Self::Sequence { range, .. } => *range,
         }
     }
     /// Calls carrying the caller's epoch: `StaleEpoch` goes back to the caller.
@@ -109,7 +117,10 @@ impl RangeCall {
         )
     }
     fn is_system(&self) -> bool {
-        matches!(self, Self::OracleNext { .. } | Self::Lease { .. })
+        matches!(
+            self,
+            Self::OracleNext { .. } | Self::Lease { .. } | Self::Sequence { .. }
+        )
     }
 }
 
@@ -129,6 +140,7 @@ pub enum RangeReply {
     Home(HomeReply),
     OracleNext(Timestamp),
     Lease(Range<u64>),
+    Sequence(SequenceReply),
 }
 
 /// Remote path to a node's range leaders (the peer transport, R5-21).
@@ -205,6 +217,12 @@ pub fn dispatch(local: &dyn LocalRanges, call: RangeCall) -> Result<RangeReply, 
         RangeCall::Lease {
             kind, id, count, ..
         } => RangeReply::Lease(system()?.lease(kind, id, count)?),
+        RangeCall::Sequence {
+            id,
+            incarnation,
+            op,
+            ..
+        } => RangeReply::Sequence(system()?.sequence(id, incarnation, op)?),
     })
 }
 
@@ -488,5 +506,19 @@ impl RangeClient for RoutedRangeClient {
             count,
         };
         routed!(self.router, call, RangeReply::Lease(range) => range)
+    }
+    fn sequence(
+        &self,
+        id: u64,
+        incarnation: u128,
+        op: SequenceOp,
+    ) -> Result<SequenceReply, RangeError> {
+        let call = RangeCall::Sequence {
+            range: SYSTEM_RANGE,
+            id,
+            incarnation,
+            op,
+        };
+        routed!(self.router, call, RangeReply::Sequence(reply) => reply)
     }
 }

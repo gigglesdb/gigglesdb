@@ -12,8 +12,6 @@
 //! - Open: keep waiting; recovery on the home aborts an idle record.
 //!
 //! Status does not restart the home's recovery clock (R5-50m B3), so polling never delays it.
-// Wired by the range engine (Track A); until then only tests use it.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::range_api::{
     ClusterTxnId, Epoch, HomeOp, HomeReply, HomeStatus, Outcome, RangeClient, RangeError, RangeId,
