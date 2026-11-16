@@ -62,8 +62,8 @@ impl std::error::Error for SpawnError {}
 
 /// Bound endpoints and completion of the management server.
 pub struct ServerHandle {
-    /// Actual bound TCP address, including an allocated ephemeral port.
-    pub tcp_addr: SocketAddr,
+    /// Bound TCP address when configured, including an allocated ephemeral port.
+    pub tcp_addr: Option<SocketAddr>,
     /// Local socket path on Unix.
     pub socket_path: Option<PathBuf>,
     task: JoinHandle<()>,
@@ -219,27 +219,25 @@ fn socket(state_dir: &Path) -> Result<(tokio::net::UnixListener, PathBuf, u32), 
     }
 }
 
-/// Start bounded TCP and local management listeners without wiring the main service.
+/// Start bounded management listeners, with TCP only when configured.
 pub async fn spawn(
     ctx: Arc<MgmtContext>,
-    section: &ManagementSection,
+    section: Option<&ManagementSection>,
     state_dir: &Path,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<ServerHandle, SpawnError> {
-    if !section.listen.ip().is_loopback() && section.tls.is_none() {
-        return Err(SpawnError::TlsRequired);
-    }
-    let tls = section
-        .tls
-        .as_ref()
-        .map(config::load_tls)
-        .transpose()
-        .map_err(|_| SpawnError::Tls)?
-        .map(TlsAcceptor::from);
-    let tcp = TcpListener::bind(section.listen)
-        .await
-        .map_err(|_| SpawnError::Bind)?;
-    let tcp_addr = tcp.local_addr().map_err(|_| SpawnError::Bind)?;
+    let (tcp, tls) = if let Some(section) = section {
+        if !section.listen.ip().is_loopback() && section.tls.is_none() {
+            return Err(SpawnError::TlsRequired);
+        }
+        let tls = section.tls.as_ref().map(config::load_tls).transpose()
+            .map_err(|_| SpawnError::Tls)?.map(TlsAcceptor::from);
+        let tcp = TcpListener::bind(section.listen).await.map_err(|_| SpawnError::Bind)?;
+        (Some(tcp), tls)
+    } else {
+        (None, None)
+    };
+    let tcp_addr = tcp.as_ref().map(TcpListener::local_addr).transpose().map_err(|_| SpawnError::Bind)?;
     #[cfg(unix)]
     let (local, path, service_uid) = socket(state_dir)?;
     #[cfg(unix)]
@@ -259,7 +257,12 @@ pub async fn spawn(
                 biased;
                 _ = stopped(&mut shutdown) => break,
                 Some(_) = connections.join_next(), if !connections.is_empty() => {},
-                accepted = tcp.accept() => {
+                accepted = async {
+                    match &tcp {
+                        Some(tcp) => tcp.accept().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     let Ok((io, _)) = accepted else {
                         // Retry transient accept failures without delaying shutdown.
                         tokio::select! {

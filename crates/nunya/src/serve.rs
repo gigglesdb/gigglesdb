@@ -289,6 +289,29 @@ pub(crate) async fn hangup() {
     std::future::pending::<()>().await;
 }
 
+struct ManagementConnections(crate::state::runtime::Registry);
+impl crate::mgmt::routes::ConnectionSource for ManagementConnections {
+    fn list(&self) -> Vec<crate::mgmt::routes::ConnectionView> {
+        self.0.list_all().into_iter().filter(|snap| snap.ended.is_none()).map(|snap| {
+            crate::mgmt::routes::ConnectionView { id: snap.id.get(), session: snap.session.to_hex(),
+                principal: snap.principal.to_hex(), route: snap.route }
+        }).collect()
+    }
+}
+struct ManagementStatus {
+    revisions: Arc<RwLock<Revisions>>,
+    routes: Vec<String>,
+}
+impl crate::mgmt::routes::StatusSource for ManagementStatus {
+    fn policy_revision(&self) -> Option<String> {
+        self.revisions.read().ok().map(|r| r.policy.clone())
+    }
+    fn config_revision(&self) -> Option<String> {
+        self.revisions.read().ok().map(|r| r.config.clone())
+    }
+    fn route_ids(&self) -> Vec<String> { self.routes.clone() }
+}
+
 /// Serve agents until a shutdown signal, draining active sessions for thirty seconds.
 pub async fn run(mut config: Config) -> Result<(), String> {
     let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
@@ -303,7 +326,6 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let maintenance = AbortTask(tokio::spawn(runtime.clone().run_maintenance(
         crate::state::runtime::MAINTENANCE_INTERVAL,
     )));
-    // GD-0081 integration: start mgmt::server here (not started yet; lead 5 builds it).
     let postgres_route = if config.upstream.is_some() {
         Some(
             config
@@ -354,6 +376,23 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         reload_hub.run(reload_path, reload_rx).await
     }));
     let (shutdown, rx) = tokio::sync::watch::channel(false);
+    let management = if config.management.is_some() || cfg!(unix) {
+        let admins = config.management.as_mut().map(|section| {
+            std::mem::take(&mut section.admins).into_iter().map(|admin| (admin.name, admin.verifier)).collect()
+        }).unwrap_or_default();
+        let ctx = crate::mgmt::routes::MgmtContext {
+            authority: runtime.authority.clone(), admins,
+            connections: Arc::new(ManagementConnections(runtime.registry.clone())),
+            status: Arc::new(ManagementStatus {
+                revisions: hub.log.1.clone(),
+                routes: postgres_route.iter().chain(spanner_route.iter()).map(|r| r.as_str().to_owned()).collect(),
+            }),
+            lifecycle: Arc::new(crate::mgmt::audit::ReadLogSink(hub.log.clone())),
+        };
+        Some(crate::mgmt::server::spawn(Arc::new(ctx), config.management.as_ref(),
+            &config.state_dir, rx.clone()).await.map_err(|err| err.to_string())?)
+    } else { None };
+
     let mut routes = JoinSet::new();
     if let Some(section) = config.spanner_native.take() {
         let state = crate::spanner_serve::RouteState {
@@ -430,6 +469,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             Err("admin listener stopped".into())
         }
     };
+    if let Some(management) = management { management.wait().await; }
     // Abort maintenance before releasing the runtime after all routes have drained.
     drop(maintenance);
     // Retain exclusive state ownership until all routes have drained.
@@ -611,6 +651,41 @@ async fn run_postgres(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    #[test]
+    fn management_status_tracks_live_revisions_and_refuses_poisoned_lock() {
+        use crate::mgmt::routes::StatusSource;
+        let revisions = Arc::new(RwLock::new(Revisions { policy: "first".into(), config: "config".into() }));
+        let status = ManagementStatus { revisions: revisions.clone(), routes: vec!["postgres".into()] };
+        assert_eq!(status.policy_revision().as_deref(), Some("first"));
+        revisions.write().unwrap().policy = "reloaded".into();
+        assert_eq!(status.policy_revision().as_deref(), Some("reloaded"));
+        assert_eq!(status.config_revision().as_deref(), Some("config"));
+        assert_eq!(status.route_ids(), ["postgres"]);
+        let _ = std::thread::spawn(move || {
+            let _guard = revisions.write().unwrap();
+            panic!("poison revision lock");
+        }).join();
+        assert_eq!(status.policy_revision(), None);
+        assert_eq!(status.config_revision(), None);
+    }
+    #[test]
+    fn management_connections_excludes_ended_snapshots() {
+        use crate::mgmt::routes::ConnectionSource;
+        use crate::token::{SessionId, PrincipalId};
+        let registry = crate::state::runtime::Registry::default();
+        let session = SessionId([1; 16]);
+        let principal = PrincipalId([2; 16]);
+        let (guard, _signal) = registry.register(session, principal, "postgres", None);
+        let source = ManagementConnections(registry.clone());
+        let connections = source.list();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].id, guard.id().get());
+        assert_eq!(connections[0].session, session.to_hex());
+        assert_eq!(connections[0].principal, principal.to_hex());
+        assert_eq!(connections[0].route, "postgres");
+        registry.signal_session(&session, crate::state::registry::EndReason::Revoked);
+        assert!(source.list().is_empty());
+    }
     #[test]
     fn audit_availability_tracks_both_write_kinds_and_recovers() {
         use crate::readlog::{ReadLog, ReadLogRecord, LifecycleRecord, LifecycleKind, LifecycleActor};

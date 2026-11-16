@@ -1194,7 +1194,7 @@ async fn finish_server(
     tx: tokio::sync::watch::Sender<bool>,
     server: nunya::mgmt::server::ServerHandle,
 ) -> TransportResult {
-    let addr = server.tcp_addr;
+    let addr = server.tcp_addr.ok_or("missing TCP listener")?;
     tx.send(true)?;
     tokio::time::timeout(std::time::Duration::from_secs(10), server.wait()).await?;
     assert!(tokio::net::TcpStream::connect(addr).await.is_err());
@@ -1206,10 +1206,10 @@ async fn listener_loopback_auth_limits_and_shutdown() -> TransportResult {
     let mut f = Fixture::new();
     let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
+    let server = spawn(ctx, Some(&listener_section(false)), &f.dir, rx).await?;
     #[cfg(windows)]
     assert!(server.socket_path.is_none());
-    let addr = server.tcp_addr;
+    let addr = server.tcp_addr.ok_or("missing TCP listener")?;
     let ok = tcp_request(addr, status_request(Some(ADMIN)).as_bytes(), &f.forbidden).await?;
     assert!(ok.starts_with("HTTP/1.1 200 "));
     let denied = tcp_request(addr, status_request(None).as_bytes(), &f.forbidden).await?;
@@ -1241,7 +1241,7 @@ async fn listener_tls_and_plaintext_refusal() -> TransportResult {
     let mut f = Fixture::new();
     let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let server = spawn(ctx, &listener_section(true), &f.dir, rx).await?;
+    let server = spawn(ctx, Some(&listener_section(true)), &f.dir, rx).await?;
     let mut roots = rustls::RootCertStore::empty();
     let cert = rustls_pemfile::certs(&mut &include_bytes!("fixtures/mgmt/localhost.crt")[..])
         .next()
@@ -1254,7 +1254,7 @@ async fn listener_tls_and_plaintext_refusal() -> TransportResult {
     .with_root_certificates(roots)
     .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let io = tokio::net::TcpStream::connect(server.tcp_addr).await?;
+    let io = tokio::net::TcpStream::connect(server.tcp_addr.ok_or("missing TCP listener")?).await?;
     let mut io = connector
         .connect(rustls::pki_types::ServerName::try_from("localhost")?, io)
         .await?;
@@ -1266,7 +1266,7 @@ async fn listener_tls_and_plaintext_refusal() -> TransportResult {
     .await?;
     assert!(ok.starts_with("HTTP/1.1 200 "));
     // A TLS alert or a closed connection is acceptable; plaintext HTTP success is not.
-    let mut plain = tokio::net::TcpStream::connect(server.tcp_addr).await?;
+    let mut plain = tokio::net::TcpStream::connect(server.tcp_addr.ok_or("missing TCP listener")?).await?;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     plain
         .write_all(status_request(Some(ADMIN)).as_bytes())
@@ -1296,11 +1296,11 @@ async fn listener_non_loopback_requires_tls_and_sender_drop_stops() -> Transport
     let mut section = listener_section(false);
     section.listen = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
     assert!(matches!(
-        spawn(ctx.clone(), &section, &f.dir, rx.clone()).await,
+        spawn(ctx.clone(), Some(&section), &f.dir, rx.clone()).await,
         Err(SpawnError::TlsRequired)
     ));
-    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
-    let addr = server.tcp_addr;
+    let server = spawn(ctx, Some(&listener_section(false)), &f.dir, rx).await?;
+    let addr = server.tcp_addr.ok_or("missing TCP listener")?;
     drop(tx);
     tokio::time::timeout(std::time::Duration::from_secs(10), server.wait()).await?;
     assert!(tokio::net::TcpStream::connect(addr).await.is_err());
@@ -1317,12 +1317,12 @@ async fn listener_unix_socket_permissions_auth_cleanup_and_file_refusal() -> Tra
     let path = f.dir.join("nunya.sock");
     std::fs::write(&path, b"preserve")?;
     assert!(matches!(
-        spawn(ctx.clone(), &listener_section(false), &f.dir, rx.clone()).await,
+        spawn(ctx.clone(), Some(&listener_section(false)), &f.dir, rx.clone()).await,
         Err(SpawnError::Socket)
     ));
     assert_eq!(std::fs::read(&path)?, b"preserve");
     std::fs::remove_file(&path)?;
-    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
+    let server = spawn(ctx, Some(&listener_section(false)), &f.dir, rx).await?;
     assert_eq!(server.socket_path.as_ref(), Some(&path));
     assert_eq!(
         std::fs::metadata(&path)?.permissions().mode() & 0o777,
@@ -1667,9 +1667,9 @@ async fn client_all_methods_and_session_secret() -> TransportResult {
     let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
     let authority = ctx.authority.clone();
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
-    let admin = api_client(server.tcp_addr, "admin", "admin-private.secret");
-    let alice = api_client(server.tcp_addr, "alice", "alice-private.secret");
+    let server = spawn(ctx, Some(&listener_section(false)), &f.dir, rx).await?;
+    let admin = api_client(server.tcp_addr.ok_or("missing TCP listener")?, "admin", "admin-private.secret");
+    let alice = api_client(server.tcp_addr.ok_or("missing TCP listener")?, "alice", "alice-private.secret");
     let secret = SessionSecret::generate();
     let bearer = nunya::mgmt::client::Credentials::Bearer {
         name: "alice".into(),
@@ -1764,7 +1764,7 @@ async fn client_all_methods_and_session_secret() -> TransportResult {
             code: "forbidden".into()
         }
     );
-    let wrong = api_client(server.tcp_addr, "alice", "wrong");
+    let wrong = api_client(server.tcp_addr.ok_or("missing TCP listener")?, "alice", "wrong");
     assert_eq!(
         wrong.status().await.unwrap_err(),
         ClientError::Api {
@@ -1772,7 +1772,7 @@ async fn client_all_methods_and_session_secret() -> TransportResult {
             code: "unauthorized".into()
         }
     );
-    let no_grant = api_client(server.tcp_addr, "client-principal", &password.secret);
+    let no_grant = api_client(server.tcp_addr.ok_or("missing TCP listener")?, "client-principal", &password.secret);
     admin.set_grants(&p.id, &[]).await?;
     assert_eq!(
         no_grant
@@ -1813,10 +1813,10 @@ async fn client_tls_custom_ca() -> TransportResult {
     let mut f = Fixture::new();
     let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let server = spawn(ctx, &listener_section(true), &f.dir, rx).await?;
+    let server = spawn(ctx, Some(&listener_section(true)), &f.dir, rx).await?;
     let ca = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mgmt/localhost.crt");
     let client = MgmtClient::new(
-        format!("https://localhost:{}", server.tcp_addr.port()).parse()?,
+        format!("https://localhost:{}", server.tcp_addr.ok_or("missing TCP listener")?.port()).parse()?,
         Some(&ca),
         Credentials::Bearer {
             name: "admin".into(),
@@ -1844,7 +1844,7 @@ async fn client_unix_socket() -> TransportResult {
     let mut f = Fixture::new();
     let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
+    let server = spawn(ctx, Some(&listener_section(false)), &f.dir, rx).await?;
     let path = server.socket_path.as_ref().ok_or("missing socket")?;
     let client = MgmtClient::new(
         format!("unix:{}", path.display()).parse()?,
@@ -1867,13 +1867,13 @@ async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportRes
     let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
     let authority = ctx.authority.clone();
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
-    let alice = api_client(server.tcp_addr, "alice", "alice-private.secret");
-    let admin = api_client(server.tcp_addr, "admin", "admin-private.secret");
+    let server = spawn(ctx, Some(&listener_section(false)), &f.dir, rx).await?;
+    let alice = api_client(server.tcp_addr.ok_or("missing TCP listener")?, "alice", "alice-private.secret");
+    let admin = api_client(server.tcp_addr.ok_or("missing TCP listener")?, "admin", "admin-private.secret");
     let store = HelperStore::at(f.dir.join("helper"));
     let mut opts = AcquireOpts {
         connection: ConnectionOpts {
-            server: format!("http://{}", server.tcp_addr),
+            server: format!("http://{}", server.tcp_addr.ok_or("missing TCP listener")?),
             ca_file: None,
             principal: Some("alice".into()),
             principal_secret_file: None,
@@ -1993,8 +1993,8 @@ async fn principal_cli_lifecycle() -> TransportResult {
     let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
     let authority = ctx.authority.clone();
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
-    let admin = api_client(server.tcp_addr, "admin", "admin-private.secret");
+    let server = spawn(ctx, Some(&listener_section(false)), &f.dir, rx).await?;
+    let admin = api_client(server.tcp_addr.ok_or("missing TCP listener")?, "admin", "admin-private.secret");
     let opts = CredentialOpts {
         verifier: None,
         generate_secret: true,
@@ -2048,11 +2048,11 @@ async fn principal_cli_lifecycle() -> TransportResult {
     let granted =
         principal::grant(&admin, "cli-principal", &["postgres=read-write".into()]).await?;
     assert_eq!(granted.grants[0].mode, Mode::ReadWrite);
-    let client = api_client(server.tcp_addr, "cli-principal", &secret);
+    let client = api_client(server.tcp_addr.ok_or("missing TCP listener")?, "cli-principal", &secret);
     let store = HelperStore::at(f.dir.join("principal-cli-helper"));
     let acquire = AcquireOpts {
         connection: ConnectionOpts {
-            server: format!("http://{}", server.tcp_addr),
+            server: format!("http://{}", server.tcp_addr.ok_or("missing TCP listener")?),
             ca_file: None,
             principal: Some("cli-principal".into()),
             principal_secret_file: None,
@@ -2085,7 +2085,7 @@ async fn principal_cli_lifecycle() -> TransportResult {
         }
     );
     let new_secret = second.secret.ok_or("missing second secret")?;
-    let new_client = api_client(server.tcp_addr, "cli-principal", &new_secret);
+    let new_client = api_client(server.tcp_addr.ok_or("missing TCP listener")?, "cli-principal", &new_secret);
     assert_eq!(
         acquire_or_resume(&new_client, &store, &acquire)
             .await?
@@ -2145,7 +2145,7 @@ async fn listener_refuses_overlong_socket_path() -> TransportResult {
     assert!(long_dir.join("nunya.sock").as_os_str().as_bytes().len() > 107);
     let (_tx, rx) = tokio::sync::watch::channel(false);
     assert!(matches!(
-        spawn(ctx, &listener_section(false), &long_dir, rx).await,
+        spawn(ctx, Some(&listener_section(false)), &long_dir, rx).await,
         Err(SpawnError::SocketPathTooLong)
     ));
     assert_eq!(std::fs::read_dir(&long_dir)?.count(), 0);
@@ -2247,4 +2247,134 @@ fn config_admin_names_reserved_and_retry_owners_separate() {
             200
         );
     }
+}
+
+/// Create a read-only principal and acquire a PostgreSQL session through serve's HTTP listener.
+pub(crate) async fn acquire_session_through_serve(
+    addr: std::net::SocketAddr,
+    admin: &nunya::mgmt::client::MgmtClient,
+    name: &str,
+) -> TransportResult<(nunya::mgmt::client::SessionView, nunya::mgmt::client::SessionSecret)> {
+    use nunya::mgmt::client::{AcquireParams, SessionSecret};
+    let credential = SessionSecret::generate();
+    let principal = admin.create_principal(name, PrincipalKind::Agent, false, Some(&credential.verifier)).await?;
+    admin.set_grants(&principal.id, &[("postgres", Mode::ReadOnly)]).await?;
+    let owner = api_client(addr, name, &credential.secret);
+    let secret = SessionSecret::generate();
+    let session = owner.acquire(AcquireParams {
+        route: "postgres".into(), mode: Some(Mode::ReadOnly), lifetime: None,
+        isolated: false, label: None, verifier: secret.verifier.clone(),
+        secret_sha256: secret.sha256_hex.clone(),
+    }).await?;
+    Ok((session, secret))
+}
+
+struct ServeAbort<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for ServeAbort<T> {
+    fn drop(&mut self) { self.0.abort(); }
+}
+struct ServeCleanup(PathBuf);
+impl Drop for ServeCleanup {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+}
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG pointing at harness/seed.sql database"]
+async fn serve_management_acquire_and_pg_login() -> TransportResult {
+    use nunya::mgmt::client::SessionSecret;
+    use std::time::Duration;
+    let pg: tokio_postgres::Config = std::env::var("NUNYA_TEST_PG")?.parse()?;
+    let host = match pg.get_hosts().first() {
+        Some(tokio_postgres::config::Host::Tcp(host)) => host,
+        _ => return Err("TCP upstream required".into()),
+    };
+    let dir = std::env::temp_dir().join(format!("serve-mgmt-{}", SessionId::random().to_hex()));
+    std::fs::create_dir_all(&dir)?;
+    let _cleanup = ServeCleanup(dir.clone());
+    std::fs::write(dir.join("root.key"), "ab".repeat(32))?;
+    std::fs::write(dir.join("password"), pg.get_password().unwrap_or_default())?;
+    let policy = include_str!("../harness/policy.toml")
+        .replace("sink = \"stdout\"", "sink = \"file\"\npath = \"read.log\"");
+    std::fs::write(dir.join("policy.toml"), policy)?;
+    // Keep the reservation sockets alive together so the three ports are distinct.
+    let reservations: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind("127.0.0.1:0")).collect::<Result<_, _>>()?;
+    let listen = reservations[0].local_addr()?.port();
+    let admin_port = reservations[1].local_addr()?.port();
+    let management = reservations[2].local_addr()?;
+    let credential = SessionSecret::generate();
+    let mut upstream = toml::map::Map::new();
+    for (key, value) in [("host", host.as_str()), ("user", pg.get_user().unwrap_or("postgres")),
+        ("dbname", pg.get_dbname().unwrap_or("app")), ("password_file", "password"), ("tls", "disable")] {
+        upstream.insert(key.into(), toml::Value::String(value.into()));
+    }
+    upstream.insert("port".into(), toml::Value::Integer(i64::from(*pg.get_ports().first().unwrap_or(&5432))));
+    let text = format!(
+        "listen = '127.0.0.1:{listen}'\nadmin_listen = '127.0.0.1:{admin_port}'\npolicy = 'policy.toml'\nstate_dir = 'state'\nroot_key_file = 'root.key'\nallow_plaintext = true\n[management]\nlisten = '{management}'\n[[management.admin]]\nname = 'bootstrap'\nverifier = '{}'\n[upstream]\n{}",
+        credential.verifier, toml::to_string(&upstream)?);
+    let path = dir.join("nunya.toml");
+    std::fs::write(&path, text)?;
+    let cfg = nunya::config::Config::load(&path).map_err(|_| "invalid serve test config")?;
+    drop(reservations);
+    let server = ServeAbort(tokio::spawn(nunya::serve::run(cfg)));
+    let admin = api_client(management, "bootstrap", &credential.secret);
+    let mut ready = false;
+    for _ in 0..100 {
+        assert!(!server.0.is_finished(), "gateway stopped during startup");
+        if admin.status().await.is_ok() { ready = true; break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "management listener ready");
+    let (session, secret) = acquire_session_through_serve(management, &admin, "managed-agent").await?;
+    let mut connected = None;
+    let mut agent = tokio_postgres::Config::new();
+    agent.host("127.0.0.1").port(listen).user(&format!("session:{}", session.id))
+        .password(secret.secret.as_bytes()).dbname("app");
+    for _ in 0..100 {
+        assert!(!server.0.is_finished(), "gateway stopped during startup");
+        if let Ok(pair) = agent.connect(tokio_postgres::NoTls).await { connected = Some(pair); break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (client, connection) = connected.ok_or("gateway not ready")?;
+    let _driver = ServeAbort(tokio::spawn(async move { let _ = connection.await; }));
+    let rows = client.simple_query("SELECT email FROM customers WHERE id = 1").await?;
+    let email = rows.iter().find_map(|message| match message {
+        tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0),
+        _ => None,
+    }).ok_or("missing email")?;
+    assert_ne!(email, "alice@example.test");
+    assert!(email.starts_with("tok_"), "email is a token");
+    let connections = admin.connections().await?;
+    assert!(connections.iter().any(|c| c.session == session.id && c.principal == session.principal && c.route == "postgres"));
+    let status = admin.status().await?;
+    for revision in [status.policy_revision, status.config_revision] {
+        let revision = revision.ok_or("missing revision")?;
+        assert_eq!(revision.len(), 64);
+        assert!(revision.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+    assert_eq!(status.route_ids, ["postgres"]);
+    admin.revoke(&session.id).await?;
+    assert!(client.simple_query("SELECT email FROM customers WHERE id = 1").await.is_err());
+    drop(client);
+    drop(_driver);
+    server.0.abort();
+    let mut server = server;
+    let _ = (&mut server.0).await;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn listener_socket_only_without_management_section() -> TransportResult {
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let server = nunya::mgmt::server::spawn(ctx, None, &f.dir, rx).await?;
+    assert_eq!(server.tcp_addr, None);
+    let path = server.socket_path.clone().ok_or("missing socket")?;
+    let mut io = tokio::net::UnixStream::connect(&path).await?;
+    let ok = wire(&mut io, status_request(None).as_bytes(), &f.forbidden).await?;
+    assert!(ok.starts_with("HTTP/1.1 200 "));
+    tx.send(true)?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), server.wait()).await?;
+    assert!(!path.exists());
+    Ok(())
 }
