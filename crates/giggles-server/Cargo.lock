@@ -558,6 +558,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "giggles-faultlab"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "giggles-history"
 version = "0.1.0"
 dependencies = [
@@ -619,6 +628,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "giggles-core",
+ "giggles-faultlab",
  "giggles-history",
  "giggles-language",
  "giggles-pg-catalog",

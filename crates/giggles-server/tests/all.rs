@@ -220,6 +220,7 @@ mod fk_section_network;
 #[path = "replication_gate.rs"] mod replication_gate;
 #[path = "replication_runtime.rs"] mod replication_runtime;
 #[path = "replication_process.rs"] mod replication_process;
+#[path = "replication_partition_process.rs"] mod replication_partition_process;
 
 #[path = "replication_replace_process.rs"] mod replication_replace_process;
 #[path = "replication_harness.rs"] pub(crate) mod replication_harness;

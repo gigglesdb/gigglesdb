@@ -49,14 +49,18 @@ impl Default for ProxyLimits {
         }
     }
 }
+/// Upper bound for `lifetime_millis` and `idle_millis`: one hour, so a proxy can
+/// sit on a long-lived one-way link (a replication peer stream, which never
+/// carries data back) for a whole process-level run without cycling it.
+pub const MAX_LINK_MILLIS: u64 = 3_600_000;
 impl ProxyLimits {
     pub fn validate(&self) -> Result<()> {
         if !(1..=64).contains(&self.connections)
             || !(1..=65536).contains(&self.buffer_bytes)
             || !(1..=65536).contains(&self.events)
             || !(1..=1000).contains(&self.connect_millis)
-            || !(1..=30000).contains(&self.lifetime_millis)
-            || !(1..=30000).contains(&self.idle_millis)
+            || !(1..=MAX_LINK_MILLIS).contains(&self.lifetime_millis)
+            || !(1..=MAX_LINK_MILLIS).contains(&self.idle_millis)
         {
             return Err("proxy limits out of bounds".into());
         }

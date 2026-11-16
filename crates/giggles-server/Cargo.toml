@@ -44,6 +44,7 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 giggles-core = { path = "../giggles-core", default-features = false, features = ["test-sql-parser-trap"] }
+giggles-faultlab = { path = "../giggles-faultlab" }
 giggles-history = { path = "../giggles-history" }
 prost-types = "0.14"
 rcgen = "0.13"

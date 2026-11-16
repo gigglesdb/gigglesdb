@@ -173,7 +173,11 @@ async fn invalid_limits_and_remote_upstream() {
             ..Default::default()
         },
         ProxyLimits {
-            idle_millis: 30001,
+            idle_millis: MAX_LINK_MILLIS + 1,
+            ..Default::default()
+        },
+        ProxyLimits {
+            lifetime_millis: MAX_LINK_MILLIS + 1,
             ..Default::default()
         },
     ] {
@@ -186,6 +190,13 @@ async fn invalid_limits_and_remote_upstream() {
                 .is_err()
         );
     }
+    // A long-lived peer link may stay open, and one-way, for up to an hour.
+    let long = ProxyLimits {
+        lifetime_millis: MAX_LINK_MILLIS,
+        idle_millis: MAX_LINK_MILLIS,
+        ..Default::default()
+    };
+    Proxy::start(address, long).await.unwrap().stop().await;
     let p = Proxy::start(address, ProxyLimits::default()).await.unwrap();
     assert!(
         p.set(Direction::Upstream, Fault::Delay { millis: 10001 })

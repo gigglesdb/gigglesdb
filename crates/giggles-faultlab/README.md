@@ -10,7 +10,12 @@ replication prototype through the `giggles-client` task SDK (`run`/`check`
 binary, `lab`, `report` and node-process control). That prototype and its SDK
 were retired after R4's exit evidence (GD-0074 Phase 8), so only the proxy
 remains. Replicated `giggles-server` failover is exercised by
-`crates/giggles-server/tests/replication_process.rs`.
+`crates/giggles-server/tests/replication_process.rs`, and
+`crates/giggles-server/tests/replication_partition_process.rs` puts one proxy
+on each directed peer link between three real server processes to cut a live
+leader off the network (full, one-way, and from one follower only). Peer
+streams are one-way and long-lived, so connection lifetime and idle limits
+go up to `MAX_LINK_MILLIS` (one hour).
 
 All domains are **LOCAL simulations on one machine**. Proxy runs do not
 establish cloud/AZ independence, availability qualification, production
