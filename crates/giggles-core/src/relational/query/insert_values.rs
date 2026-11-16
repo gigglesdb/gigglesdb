@@ -406,15 +406,7 @@ impl InsertExpressions {
         if count > MAX_PARAMS || self.values.len() > MAX_COLUMNS {
             return Err(SqlError::Limit);
         }
-        let indexes = if self.columns.is_empty() {
-            table.logical_offsets()
-        } else {
-            self.columns
-                .iter()
-                .map(|name| col(table, name))
-                .collect::<R<Vec<_>>>()?
-        };
-        unique(&indexes)?;
+        let indexes = insert_indexes(table, &self.columns)?;
         if indexes.len() != self.values.len() {
             return Err(SqlError::Type);
         }

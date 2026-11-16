@@ -43,13 +43,13 @@ fn assignment_sites_and_duplicate_precedence() {
             3 => Request::Update { table: "t".into(), filter: expr(V::Bool(true)), guard: None, values, intent: Intent::One },
             _ => Request::UpdateExpressions { table: "t".into(), filter: expr(V::Bool(true)), guard: None, values: values.into_iter().map(|(n,v)| (n,Expr::Value(v))).collect(), intent: Intent::One },
         };
-        assert_eq!(engine.execute(&request,&Bindings::new()).unwrap_err(),if mode < 3 { Error::Bind("duplicate assignment".into()) } else { Error::Sql { sqlstate:"42601".into() } });
+        assert_eq!(engine.execute(&request,&Bindings::new()).unwrap_err(),if mode < 3 { Error::Sql { sqlstate:"42701".into() } } else { Error::Sql { sqlstate:"42601".into() } });
         let statement = if mode < 3 { "INSERT INTO t(id,v,v) VALUES(2,1,2)" } else { "UPDATE t SET v=1,v=2" };
-        assert_eq!(giggles_core::sqlstate(&sql.execute(statement,&[],None).unwrap_err()),if mode < 3 { "23505" } else { "42601" });
+        assert_eq!(giggles_core::sqlstate(&sql.execute(statement,&[],None).unwrap_err()),if mode < 3 { "42701" } else { "42601" });
     }
     let duplicate_bad_value = Request::Insert { table: "t".into(), values: vec![("id".into(),lit(V::Int(2))),("v".into(),lit(V::Bool(true))),("v".into(),lit(V::Int(1)))] };
-    assert_eq!(engine.execute(&duplicate_bad_value,&Bindings::new()).unwrap_err(),Error::Sql { sqlstate:"42804".into() });
-    assert_eq!(giggles_core::sqlstate(&sql.execute("INSERT INTO t(id,v,v) VALUES(2,true::boolean,1)",&[],None).unwrap_err()),"23505");
+    assert_eq!(engine.execute(&duplicate_bad_value,&Bindings::new()).unwrap_err(),Error::Sql { sqlstate:"42701".into() });
+    assert_eq!(giggles_core::sqlstate(&sql.execute("INSERT INTO t(id,v,v) VALUES(2,true::boolean,1)",&[],None).unwrap_err()),"42701");
     for first in [false,true] { for expression in [false,true] {
         let mut values=vec![("v".into(),lit(V::Bool(true))),("v".into(),lit(V::Int(1)))]; if !first { values.reverse(); }
         let request=if expression { Request::UpdateExpressions { table:"t".into(),filter:expr(V::Bool(true)),guard:None,values:values.into_iter().map(|(n,v)| (n,Expr::Value(v))).collect(),intent:Intent::One } } else { Request::Update { table:"t".into(),filter:expr(V::Bool(true)),guard:None,values,intent:Intent::One } };

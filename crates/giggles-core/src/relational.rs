@@ -2403,11 +2403,7 @@ impl Prepared {
                     values,
                     ..
                 } => {
-                    let indexes = if names.is_empty() {
-                        t.logical_offsets()
-                    } else {
-                        names.iter().map(|n| col(t, n)).collect::<R<Vec<_>>>()?
-                    };
+                    let indexes = insert_indexes(t, names)?;
                     if indexes.len() != values.len() {
                         return Err(SqlError::Type);
                     }
@@ -3193,6 +3189,16 @@ fn col(t: &TableDef, name: &str) -> R<usize> {
         .iter()
         .position(|c| c.name == name)
         .ok_or(SqlError::UnknownColumn)
+}
+/// Resolve the explicit INSERT target list before processing any input rows.
+fn insert_indexes(table: &TableDef, columns: &[String]) -> R<Vec<usize>> {
+    let indexes = if columns.is_empty() {
+        table.logical_offsets()
+    } else {
+        columns.iter().map(|name| col(table, name)).collect::<R<Vec<_>>>()?
+    };
+    unique(&indexes).map_err(|_| SqlError::DuplicateColumn)?;
+    Ok(indexes)
 }
 fn unique<T: Ord>(v: impl IntoIterator<Item = T>) -> R<()> {
     let mut set = BTreeSet::new();
@@ -4079,12 +4085,7 @@ impl Relational {
                     return Err(SqlError::Unsupported);
                 }
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
-                let indexes = if columns.is_empty() {
-                    t.logical_offsets()
-                } else {
-                    columns.iter().map(|c| col(t, c)).collect::<R<Vec<_>>>()?
-                };
-                unique(&indexes)?;
+                let indexes = insert_indexes(t, columns)?;
                 if indexes.len() != values.len() {
                     return Err(SqlError::Type);
                 }

@@ -386,16 +386,9 @@ fn indexes(insert: &Insert, table: &TableDef) -> R<Vec<usize>> {
             return Err(SqlError::Syntax);
         }
         vec![]
-    } else if insert.columns.is_empty() {
-        table.logical_offsets()
     } else {
-        insert
-            .columns
-            .iter()
-            .map(|name| col(table, name))
-            .collect::<R<Vec<_>>>()?
+        insert_indexes(table, &insert.columns)?
     };
-    unique(&indexes)?;
     if insert.source.is_none() && insert.rows.iter().any(|row| row.len() != indexes.len()) {
         return Err(SqlError::Type);
     }

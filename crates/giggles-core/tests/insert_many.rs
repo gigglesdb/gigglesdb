@@ -116,7 +116,7 @@ fn insert_many_binding_and_shape_checks_precede_execution() {
         (many(&[], vec![], 0), Error::Bind("columns".into())),
         (
             many(&["id", "id"], vec![], 0),
-            Error::Bind("duplicate assignment".into()),
+            Error::Sql { sqlstate: "42701".into() },
         ),
         (many(&["absent"], vec![], 0), Error::Sql { sqlstate: "42703".into() }),
         (many(&["id", "n"], vec![vec![int(1)]], 0), Error::Type),

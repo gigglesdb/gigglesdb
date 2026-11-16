@@ -1336,6 +1336,15 @@ impl Binder<'_> {
         }
         Ok(out)
     }
+    fn insert_targets<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        for name in names {
+            if !seen.insert(self.field(name)?) {
+                return Err(core(CoreError::Sql(SqlError::DuplicateColumn)));
+            }
+        }
+        Ok(())
+    }
     fn assignments(
         &mut self,
         v: &[(String, ValueExpr)],
@@ -1344,6 +1353,7 @@ impl Binder<'_> {
         if v.is_empty() || v.len() > crate::relational::MAX_COLUMNS {
             return Err(Error::Bind("assignments".into()));
         }
+        if insert { self.insert_targets(v.iter().map(|(name, _)| name.as_str()))?; }
         let mut seen = BTreeSet::new();
         let mut duplicate = false;
         let mut out = vec![];
@@ -1351,7 +1361,7 @@ impl Binder<'_> {
         for (n, e) in v {
             let i = self.field(n)?;
             if !seen.insert(i) {
-                if insert { return Err(Error::Bind("duplicate assignment".into())); }
+                if insert { return Err(core(CoreError::Sql(SqlError::DuplicateColumn))); }
                 duplicate = true;
             }
             if !insert && self.table()?.primary_key.contains(&i) {
@@ -1526,12 +1536,13 @@ impl Binder<'_> {
                 columns, rows, cap, ..
             } => {
                 validate_insert_shape(columns, rows)?;
+                self.insert_targets(columns.iter().map(String::as_str))?;
                 let mut seen = BTreeSet::new();
                 let mut indexes = Vec::new();
                 for name in columns {
                     let index = self.field(name)?;
                     if !seen.insert(index) {
-                        return Err(Error::Bind("duplicate assignment".into()));
+                        return Err(core(CoreError::Sql(SqlError::DuplicateColumn)));
                     }
                     indexes.push(index);
                 }
@@ -1571,12 +1582,13 @@ impl Binder<'_> {
                 if values.is_empty() || values.len() > crate::relational::MAX_COLUMNS {
                     return Err(Error::Bind("assignments".into()));
                 }
+                self.insert_targets(values.iter().map(|(name, _)| name.as_str()))?;
                 let mut seen = BTreeSet::new();
                 let mut expressions = vec![Bound::Value(Value::Null); self.table()?.columns.len()];
                 for (name, expression) in values {
                     let index = self.field(name)?;
                     if !seen.insert(index) {
-                        return Err(Error::Bind("duplicate assignment".into()));
+                        return Err(core(CoreError::Sql(SqlError::DuplicateColumn)));
                     }
                     self.allow_fields = false;
                     let bound = self.expr(expression, 0);

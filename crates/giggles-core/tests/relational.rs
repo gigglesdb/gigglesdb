@@ -448,12 +448,17 @@ fn strict_rejection_matrix_and_resource_bounds() {
         "CREATE TABLE dup (id BIGINT, id TEXT, PRIMARY KEY(id))",
         E::DuplicateColumn,
     );
-    for q in [
+    err(
+        &mut s,
         "CREATE TABLE dup (id BIGINT, PRIMARY KEY(id,id))",
+        E::Duplicate,
+    );
+    // PG18.6: INSERT naming a target column twice is 42701 duplicate_column.
+    err(
+        &mut s,
         "INSERT INTO safe (id,id) VALUES(1,2)",
-    ] {
-        err(&mut s, q, E::Duplicate);
-    }
+        E::DuplicateColumn,
+    );
     assert!(run(&mut s, "SELECT * FROM safe ORDER BY n LIMIT 1").rows.is_empty());
     assert!(run(&mut s, "SELECT * FROM safe").rows.is_empty());
     assert_eq!(
