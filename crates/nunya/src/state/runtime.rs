@@ -11,6 +11,26 @@ use crate::{
 };
 use std::{fmt, path::Path, sync::Arc, time::Duration};
 
+/// Delay between service state maintenance passes.
+pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
+/// Number of maintenance passes between tombstone purges.
+pub const PURGE_EVERY: u32 = 120;
+/// Minimum retention after a session's absolute expiry before tombstone removal.
+pub const TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 3600);
+
+/// Data-free counts from one independent sequence of maintenance steps.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MaintenanceOutcome {
+    /// Session endings persisted by the sweep.
+    pub swept: usize,
+    /// Successful last-used flush passes.
+    pub flushes: u32,
+    /// Tombstones removed on a purge pass.
+    pub purged: usize,
+    /// Maintenance steps that failed.
+    pub failures: u32,
+}
+
 /// Shared registry of access-session connections.
 pub type Registry = ConnectionRegistry<SessionId, PrincipalId>;
 
@@ -55,6 +75,70 @@ fn store_error(error: StoreError) -> String {
     }
 }
 impl StateRuntime {
+    /// Sweep expiry, flush activity and periodically purge retained tombstones.
+    pub fn maintain(&self, tick: u64) -> MaintenanceOutcome {
+        let mut outcome = MaintenanceOutcome::default();
+        match self.authority.sweep() {
+            Ok(count) => outcome.swept = count,
+            Err(error) => {
+                outcome.failures += 1;
+                eprintln!("state maintenance sweep failed: {error}");
+            }
+        }
+        match self.authority.flush_last_used() {
+            Ok(()) => outcome.flushes = 1,
+            Err(error) => {
+                outcome.failures += 1;
+                eprintln!("state maintenance flush_last_used failed: {error}");
+            }
+        }
+        if tick.is_multiple_of(u64::from(PURGE_EVERY)) {
+            match self.authority.purge_tombstones(millis(TOMBSTONE_RETENTION)) {
+                Ok(count) => outcome.purged = count,
+                Err(error) => {
+                    outcome.failures += 1;
+                    eprintln!("state maintenance purge_tombstones failed: {error}");
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Run delayed maintenance passes off the async executor until aborted.
+    pub async fn run_maintenance(self: Arc<Self>, interval: Duration) {
+        let mut timer = tokio::time::interval(interval);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        timer.tick().await;
+        let mut tick = 0u64;
+        loop {
+            timer.tick().await;
+            tick = tick.wrapping_add(1);
+            let runtime = self.clone();
+            if tokio::task::spawn_blocking(move || runtime.maintain(tick))
+                .await
+                .is_err()
+            {
+                eprintln!("state maintenance task failed");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn with_clock(
+        state_dir: &Path,
+        limits: SessionLimits,
+        clock: super::store::Clock,
+    ) -> Arc<Self> {
+        let store = Arc::new(RedbStore::with_clock(state_dir, &tests::root(), clock).unwrap());
+        let authority = Authority::load(store, limits).unwrap();
+        let registry = Registry::new();
+        authority.set_hook(Arc::new(RegistryHook(registry.clone())));
+        Arc::new(Self {
+            authority,
+            registry,
+        })
+    }
+
     /// Open exclusive state ownership, attach revocation signals and reconcile configuration.
     pub fn open(
         state_dir: &Path,
@@ -124,12 +208,128 @@ mod tests {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
     }
-    fn root() -> RootKey {
+    pub(super) fn root() -> RootKey {
         RootKey::from_hex(&"42".repeat(32)).unwrap()
     }
     fn verifier() -> crate::pgwire::auth::ScramVerifier {
         crate::pgwire::auth::ScramVerifier::from_password("test", b"runtime-test", 4096)
     }
+    fn acquire(runtime: &StateRuntime) -> crate::state::model::AccessSession {
+        let principal = runtime
+            .authority
+            .create_principal("agent", PrincipalKind::Agent, false, "create")
+            .unwrap();
+        let route = RouteId::new("postgres").unwrap();
+        runtime
+            .authority
+            .set_grants(principal.id, vec![(route.clone(), Mode::ReadOnly)])
+            .unwrap();
+        runtime
+            .authority
+            .acquire_session(
+                principal.id,
+                AcquireRequest {
+                    route,
+                    mode: None,
+                    lifetime_ms: None,
+                    isolated: false,
+                    label: None,
+                    idempotency_key: "acquire".into(),
+                    verifier: Verifier(verifier()),
+                    secret_sha256: [1; 32],
+                },
+            )
+            .unwrap()
+    }
+
+    fn expiry_case(idle_timeout_ms: Option<u64>, advance_to: u64, reason: EndReason) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = TestDir::new();
+        let clock = Arc::new(AtomicU64::new(1000));
+        let c = clock.clone();
+        let runtime = StateRuntime::with_clock(
+            &dir.0,
+            SessionLimits {
+                max_lifetime_ms: 10_000,
+                idle_timeout_ms,
+            },
+            Arc::new(move || c.load(Ordering::SeqCst)),
+        );
+        let session = acquire(&runtime);
+        let (_guard, signal) =
+            runtime
+                .registry
+                .register(session.id, session.principal, "postgres", None);
+        assert_eq!(
+            runtime.maintain(1),
+            MaintenanceOutcome {
+                flushes: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(signal.try_ended(), None);
+        clock.store(advance_to, Ordering::SeqCst);
+        assert_eq!(
+            runtime.maintain(2),
+            MaintenanceOutcome {
+                swept: 1,
+                flushes: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(signal.try_ended(), Some(ConnectionEndReason::Expired));
+        assert_eq!(
+            runtime.authority.session(session.id).unwrap().revoke_reason,
+            Some(reason)
+        );
+    }
+
+    #[test]
+    fn maintenance_ends_absolute_expiry_and_signals_connection() {
+        expiry_case(None, 11_001, EndReason::Expired);
+    }
+
+    #[test]
+    fn maintenance_ends_idle_expiry_and_signals_connection() {
+        expiry_case(Some(100), 1101, EndReason::IdleTimeout);
+    }
+
+    #[test]
+    fn maintenance_purges_only_on_purge_ticks_after_retention() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = TestDir::new();
+        let clock = Arc::new(AtomicU64::new(1000));
+        let c = clock.clone();
+        let runtime = StateRuntime::with_clock(
+            &dir.0,
+            SessionLimits::default(),
+            Arc::new(move || c.load(Ordering::SeqCst)),
+        );
+        let session = acquire(&runtime);
+        runtime
+            .authority
+            .revoke(session.id, EndReason::Requested)
+            .unwrap();
+        clock.store(
+            session.expires_ms + millis(TOMBSTONE_RETENTION),
+            Ordering::SeqCst,
+        );
+        assert_eq!(runtime.maintain(u64::from(PURGE_EVERY)).purged, 0);
+        assert!(runtime.authority.session(session.id).is_some());
+        clock.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(runtime.maintain(u64::from(PURGE_EVERY) + 1).purged, 0);
+        assert!(runtime.authority.session(session.id).is_some());
+        assert_eq!(
+            runtime.maintain(2 * u64::from(PURGE_EVERY)),
+            MaintenanceOutcome {
+                purged: 1,
+                flushes: 1,
+                ..Default::default()
+            }
+        );
+        assert!(runtime.authority.session(session.id).is_none());
+    }
+
     #[test]
     fn fresh_open_and_exclusive_ownership() {
         let dir = TestDir::new();

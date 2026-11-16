@@ -276,6 +276,9 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         &config.session,
         &config.standing,
     )?;
+    let maintenance = AbortTask(tokio::spawn(runtime.clone().run_maintenance(
+        crate::state::runtime::MAINTENANCE_INTERVAL,
+    )));
     // GD-0081 integration: start mgmt::server here (not started yet; lead 5 builds it).
     let postgres_route = if config.upstream.is_some() {
         Some(
@@ -405,6 +408,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             Err("admin listener stopped".into())
         }
     };
+    // Abort maintenance before releasing the runtime after all routes have drained.
+    drop(maintenance);
     // Retain exclusive state ownership until all routes have drained.
     drop(runtime);
     result

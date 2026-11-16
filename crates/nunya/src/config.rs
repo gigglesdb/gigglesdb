@@ -540,8 +540,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
                         let s = Zeroizing::new(raw.verifier);
                         match ScramVerifier::parse(&s) {
                             Some(verifier)
-                                if !raw.name.is_empty()
-                                    && !raw.name.starts_with("task:")
+                                if valid_principal_name(&raw.name)
                                     && names.insert(raw.name.clone()) =>
                             {
                                 standing.push(StandingSection {
@@ -758,6 +757,14 @@ pub fn load_tls(cfg: &TlsSection) -> Result<Arc<rustls::ServerConfig>, String> {
     .with_single_cert(certs, key)
     .map_err(|_| fail())?;
     Ok(Arc::new(config))
+}
+
+fn valid_principal_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 #[cfg(test)]
@@ -1183,6 +1190,26 @@ tls = "disable"
         assert!(errors.iter().any(|e| e.contains("required unless")));
         assert!(!format!("{errors:?}").contains("DO_NOT_LEAK"));
     }
+    #[test]
+    fn standing_names_follow_principal_name_rule() {
+        let f = Fixture::new();
+        let verifier = ScramVerifier::from_password("secret", b"salt", 1).to_pg_string();
+        for name in ["ops", "agent_1", "A-b", &"x".repeat(64)] {
+            let text = format!("{EXAMPLE}\n[[standing]]\nname='{name}'\nverifier='{verifier}'");
+            assert_eq!(f.load(&text).unwrap().standing[0].name, name);
+        }
+        for name in [
+            "", &"x".repeat(65), "task:x", "a.b", "a b", "\u{e9}", "\u{c3}\u{a9}",
+        ] {
+            let text = format!("{EXAMPLE}\n[[standing]]\nname='{name}'\nverifier='{verifier}'");
+            let errors = f.load(&text).unwrap_err();
+            assert_eq!(errors, vec!["standing: invalid or duplicate name or verifier"]);
+            if !name.is_empty() {
+                assert!(!errors.join(";").contains(name));
+            }
+        }
+    }
+
     #[test]
     fn verifier_validation_and_tls_requirements() {
         let f = Fixture::new();
