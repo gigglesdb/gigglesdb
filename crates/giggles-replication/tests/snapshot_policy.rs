@@ -1,7 +1,7 @@
 use giggles_replication::{
     log_store::LogStore,
     node::Replica,
-    sink::{self, Outbox, ReplicaHandle, SnapshotPolicy},
+    sink::{self, Outbox, ReplicaHandle, ReplicateError, SnapshotPolicy},
     snapshot::SnapshotStore,
     state::MemStateMachine,
 };
@@ -58,6 +58,73 @@ fn until(mut predicate: impl FnMut() -> bool) {
         thread::sleep(Duration::from_millis(5));
     }
 }
+/// The leader with the highest term, waiting until one exists.
+fn current_leader(handles: &[ReplicaHandle]) -> usize {
+    let mut found = None;
+    until(|| {
+        found = handles
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.role().state == StateRole::Leader)
+            .max_by_key(|(_, h)| h.role().term)
+            .map(|(i, _)| i);
+        found.is_some()
+    });
+    found.unwrap()
+}
+/// Replicate `payload` exactly once, the way a client must across a leader change.
+///
+/// `NotLeader` means the proposal was never appended, so it is retried. `Unknown` means
+/// the proposer was deposed with the proposal in flight: it may or may not commit. That
+/// is resolved on the current leader: a read barrier there returns only once the leader
+/// has committed an entry of its own term and applied up to its commit index, so every
+/// entry of an earlier term is by then either applied there or discarded for good. The
+/// payload is proposed again only if it was discarded. Both errors must coincide with a
+/// leadership change, so a proposal that fails for any other reason (for example a
+/// snapshot build) still fails the test. Returns the number of leadership changes met.
+fn replicate_once(c: &Cluster, payload: &[u8]) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut changes = 0;
+    loop {
+        assert!(Instant::now() < deadline, "replicate deadline");
+        let leader = current_leader(&c.handles);
+        let role = c.handles[leader].role();
+        match c.handles[leader].replicate(payload.to_vec()) {
+            Ok(()) => return changes,
+            Err(ReplicateError::NotLeader) => {}
+            Err(ReplicateError::Unknown(reason)) => {
+                // Unknown is only legitimate when the proposer lost this leadership term.
+                until(|| c.handles[leader].role() != role);
+                changes += 1;
+                loop {
+                    assert!(Instant::now() < deadline, "unresolved proposal: {reason}");
+                    let resolver = current_leader(&c.handles);
+                    match c.handles[resolver].read_barrier() {
+                        Ok(_) => {
+                            let applied = c.states[resolver]
+                                .applied_batches()
+                                .iter()
+                                .any(|(_, batch)| batch == payload);
+                            eprintln!("in-flight proposal resolved: applied={applied} ({reason})");
+                            if applied {
+                                return changes;
+                            }
+                            break;
+                        }
+                        Err(ReplicateError::NotLeader) => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("read barrier failed: {e:?}"),
+                    }
+                }
+                continue;
+            }
+            Err(e) => panic!("proposal failed outside a leadership change: {e:?}"),
+        }
+        changes += 1;
+        thread::sleep(Duration::from_millis(5));
+    }
+}
 #[test]
 fn snapshots_build_and_compact_while_proposals_continue() {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -106,16 +173,16 @@ fn snapshots_build_and_compact_while_proposals_continue() {
             .iter()
             .any(|h| h.role().state == StateRole::Leader)
     });
-    let leader = c
-        .handles
-        .iter()
-        .position(|h| h.role().state == StateRole::Leader)
-        .unwrap();
+    let mut changes = 0;
     for n in 0u64..100 {
-        // Every proposal must succeed, including those after policy builds start.
-        c.handles[leader]
-            .replicate(n.to_be_bytes().to_vec())
-            .unwrap();
+        // Every proposal must succeed, including those after policy builds start. Under
+        // machine load the leader can change mid-run; a proposal caught by that is resolved
+        // (applied once, never twice) rather than failing the test.
+        changes += replicate_once(&c, &n.to_be_bytes());
+    }
+    let leader = current_leader(&c.handles);
+    if changes > 0 {
+        eprintln!("resolved {changes} proposals across leadership changes");
     }
     until(|| c.snapshots[leader].latest().is_some_and(|m| m.index >= 80));
     until(|| {
@@ -123,7 +190,14 @@ fn snapshots_build_and_compact_while_proposals_continue() {
             .iter()
             .all(|s| s.applied_batches() == c.states[leader].applied_batches())
     });
-    assert_eq!(c.states[leader].applied_batches().len(), 100);
+    // Exactly once and in order: a resolved proposal is never applied twice.
+    let applied: Vec<Vec<u8>> = c.states[leader]
+        .applied_batches()
+        .into_iter()
+        .map(|(_, batch)| batch)
+        .collect();
+    let expected: Vec<Vec<u8>> = (0u64..100).map(|n| n.to_be_bytes().to_vec()).collect();
+    assert_eq!(applied, expected);
     // Stop the drivers before reopening the log to inspect its persisted compaction point.
     for handle in &c.handles {
         handle.shutdown();
