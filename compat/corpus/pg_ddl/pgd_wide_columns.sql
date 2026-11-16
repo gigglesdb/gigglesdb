@@ -1,0 +1,8 @@
+-- case: pgd_wide_columns
+-- title: wide columns
+-- owner: E1
+-- expect: compatible
+-- source: Differences: more than 64 columns
+CREATE TABLE r0c_pgd_wide_columns (id int PRIMARY KEY, c1 int DEFAULT 1, c2 int DEFAULT 2, c3 int DEFAULT 3, c4 int DEFAULT 4, c5 int DEFAULT 5, c6 int DEFAULT 6, c7 int DEFAULT 7, c8 int DEFAULT 8, c9 int DEFAULT 9, c10 int DEFAULT 10, c11 int DEFAULT 11, c12 int DEFAULT 12, c13 int DEFAULT 13, c14 int DEFAULT 14, c15 int DEFAULT 15, c16 int DEFAULT 16, c17 int DEFAULT 17, c18 int DEFAULT 18, c19 int DEFAULT 19, c20 int DEFAULT 20, c21 int DEFAULT 21, c22 int DEFAULT 22, c23 int DEFAULT 23, c24 int DEFAULT 24, c25 int DEFAULT 25, c26 int DEFAULT 26, c27 int DEFAULT 27, c28 int DEFAULT 28, c29 int DEFAULT 29, c30 int DEFAULT 30, c31 int DEFAULT 31, c32 int DEFAULT 32, c33 int DEFAULT 33, c34 int DEFAULT 34, c35 int DEFAULT 35, c36 int DEFAULT 36, c37 int DEFAULT 37, c38 int DEFAULT 38, c39 int DEFAULT 39, c40 int DEFAULT 40, c41 int DEFAULT 41, c42 int DEFAULT 42, c43 int DEFAULT 43, c44 int DEFAULT 44, c45 int DEFAULT 45, c46 int DEFAULT 46, c47 int DEFAULT 47, c48 int DEFAULT 48, c49 int DEFAULT 49, c50 int DEFAULT 50, c51 int DEFAULT 51, c52 int DEFAULT 52, c53 int DEFAULT 53, c54 int DEFAULT 54, c55 int DEFAULT 55, c56 int DEFAULT 56, c57 int DEFAULT 57, c58 int DEFAULT 58, c59 int DEFAULT 59, c60 int DEFAULT 60, c61 int DEFAULT 61, c62 int DEFAULT 62, c63 int DEFAULT 63, c64 int DEFAULT 64, c65 int DEFAULT 65, c66 int DEFAULT 66, c67 int DEFAULT 67, c68 int DEFAULT 68, c69 int DEFAULT 69);
+INSERT INTO r0c_pgd_wide_columns(id) VALUES(1);
+SELECT id,c1,c64,c69 FROM r0c_pgd_wide_columns ORDER BY id;
