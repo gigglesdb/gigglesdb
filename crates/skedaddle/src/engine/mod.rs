@@ -23,7 +23,10 @@ pub use live_readiness::{
 pub use pg::*;
 pub use readiness::*;
 pub use retention::{EnginePauseReason, RetentionStatus};
-pub use verification::{AppliedSourceWaiter, PgChangeEvidence, VerificationLimits};
+pub use verification::{
+    AppliedSourceWaiter, NativeChangeEvidence, NativeVerificationMarker, PgChangeEvidence,
+    VerificationEmitter, VerificationKey, VerificationLimits,
+};
 
 use std::{collections::VecDeque, future::Future, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -163,6 +166,13 @@ pub struct Captured {
 /// manufacture final-marker receipts through the neutral control route.
 pub enum CapturedMarker {
     Pg(source::Watermark),
+    /// Process-local connector verification evidence, isolated from copy windows.
+    Verification {
+        marker: NativeVerificationMarker,
+        commit: Position,
+        transaction: crate::event::TxnId,
+        committed_events: Vec<crate::event::Event>,
+    },
     Chunk {
         marker: Watermark,
         commit: Position,
@@ -173,6 +183,35 @@ impl From<source::Watermark> for CapturedMarker {
     fn from(marker: source::Watermark) -> Self {
         Self::Pg(marker)
     }
+}
+/// Process-local schema evidence. `None` from a producer is unknown; an
+/// explicit state with neither flag set establishes a known-clear classifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaState {
+    pub blocked_boundary: Option<SchemaBoundary>,
+    pub unknown_schema_job: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchemaBoundary {
+    Postgres(crate::pg::ddl::SafeBoundaryStop),
+    Connector(ConnectorSchemaStop),
+}
+/// Connector-native diagnostic evidence, never a persisted event/format.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectorSchemaStop {
+    pub connector: String,
+    pub kind: SchemaStopKind,
+    /// Connector-qualified table name, when the classifier knows it.
+    pub table: Option<String>,
+    /// Original statement or classifier diagnostic.
+    pub diagnostic: String,
+    pub position: Position,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaStopKind {
+    Ddl,
+    UnknownDdl,
+    TableMapChanged,
 }
 pub trait Capture {
     fn position_order(&self) -> Arc<dyn PositionOrder + Send + Sync>;
@@ -189,7 +228,7 @@ pub trait Capture {
             Ok(())
         })
     }
-    fn schema_state(&self) -> Option<source::SchemaState> {
+    fn schema_state(&self) -> Option<SchemaState> {
         None
     }
     /// Schema-aware adapters must forward the writer-bound END receipt.
@@ -279,6 +318,27 @@ pub struct Runtime(
     Arc<live_readiness::Hub>,
 );
 impl Runtime {
+    /// Publish the complete applied boundary durably before receipt collection.
+    pub(crate) async fn record_applied(
+        &self,
+        txn: &AssembledTxn,
+        mseq: u64,
+        checkpoint: &crate::buffer::reader::ReaderCheckpoint,
+    ) -> Result<()> {
+        self.applied_final_marker(txn, mseq, checkpoint).await?;
+        self.progress_marker(
+            "applied",
+            encode_reader_checkpoint(checkpoint)?,
+            checkpoint.next_mseq.to_string(),
+        )
+        .await?;
+        self.flush_progress().await?;
+        self.7.applied(&txn.commit_position, checkpoint);
+        self.queue_applied(txn.commit_position.clone(), checkpoint.clone())
+            .await;
+        Ok(())
+    }
+
     pub async fn state(&self) -> Materialized {
         self.snapshot()
     }
@@ -1111,6 +1171,7 @@ impl Active {
         let mut high = None;
         for watermark in &captured.watermarks {
             let (marker, commit) = match watermark {
+                CapturedMarker::Verification { .. } => continue,
                 CapturedMarker::Pg(w) => {
                     let CapturedControl::Chunk(marker) =
                         decode_marker_payload(&w.content, w.message_lsn).map_err(recovery)?

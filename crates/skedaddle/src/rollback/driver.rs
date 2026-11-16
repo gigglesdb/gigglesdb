@@ -30,7 +30,7 @@ pub struct Components<'a, D, C, P, V, S, H, J> {
     pub capture: &'a mut C,
     pub pre_hook: &'a mut P,
     pub replay: &'a apply::Replay,
-    pub target: &'a mut dyn crate::pg::apply::executor::Destination,
+    pub target: &'a mut dyn apply::RollbackSink,
     pub verification: &'a mut V,
     pub source: &'a mut S,
     pub post_hook: &'a mut H,
@@ -126,7 +126,7 @@ where
                 }
                 Step::ReverseApply | Step::Verify => {
                     executor
-                        .block_on(apply::execute_next(
+                        .block_on(apply::execute_next_with_sink(
                             key,
                             c.replay,
                             c.target,

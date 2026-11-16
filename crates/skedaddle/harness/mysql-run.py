@@ -56,10 +56,11 @@ def run_cargo(args, env, task, *, total_timeout=5400, output_timeout=1800):
 def main():
     profile, task_arg, gtid = sys.argv[1:4]
     # Explicit prefixes preserve empty optional arguments in Windows PowerShell.
-    optional = [arg for arg in sys.argv[4:] if arg != "--replica"]
+    optional = [arg for arg in sys.argv[4:] if arg not in ("--replica", "--with-pg")]
     spike_arg = optional[0].removeprefix("--spike=") if optional else ""
     cargo_test = optional[1].removeprefix("--cargo-test=") if len(optional) > 1 else ""
     replica = "--replica" in sys.argv[4:]
+    with_pg = "--with-pg" in sys.argv[4:]
     task = pathlib.Path(task_arg).resolve()
     if profile not in ("mysql80", "mysql84") or gtid not in ("ON", "OFF"):
         raise ValueError("expected mysql80/mysql84 and ON/OFF")
@@ -77,7 +78,12 @@ def main():
                SCCACHE_DIR="J:/gigglesdb-work/sccache-cache", SCCACHE_CACHE_SIZE="100G",
                CARGO_INCREMENTAL="0", CARGO_BUILD_JOBS="4")
     services = [profile, profile + "-replica"] if replica else [profile]
+    if with_pg:
+        services.append("pg-destination")
     lock = json.loads((ROOT / "images.lock").read_text())["images"]
+    if with_pg:
+        pg_lock = json.loads((ROOT.parent / "artifacts/spikes/s4-harness/images.lock").read_text())["images"]
+        env["PG_MATRIX_IMAGE"] = pg_lock["pg18"]["ref"]
     for name in ("mysql80", "mysql84"):
         env[name.upper() + "_IMAGE"] = lock[name]["ref"]
     # Compose interpolates unselected legacy services too; they are never started.
@@ -97,7 +103,8 @@ def main():
 
     def compose(*args, **kwargs):
         return docker("compose", "-f", ROOT / "compose.yaml", "-p", "skedaddle-" + run,
-                      "--profile", profile, *args, **kwargs)
+                      "--profile", profile, *(["--profile", "pg-matrix"] if with_pg else []),
+                      *args, **kwargs)
 
     def sql(container, statement):
         return docker("exec", "-e", "MYSQL_PWD=skedaddle", container,
@@ -136,6 +143,14 @@ def main():
         env.update(M1_PORT=address.rsplit(":", 1)[1], M1_CA=str(task / "ca.pem"),
                    M1_OUTPUT=str(task), M1_PROFILE=profile, M1_GTID=gtid,
                    M1_CONTAINER_ID=cid)
+        if with_pg:
+            pg_cid = compose("ps", "-q", "pg-destination").stdout.strip()
+            pg_ca = docker("exec", pg_cid, "cat", "/var/lib/postgresql/h1/tls/ca.pem").stdout
+            pg_port = compose("port", "pg-destination", "5432").stdout.strip().rsplit(":", 1)[1]
+            pg_dsn = f"host=localhost hostaddr=127.0.0.1 port={pg_port} user=postgres password=skedaddle dbname=skedaddle sslmode=require"
+            save("pg-ca.pem", pg_ca)
+            save("pg-config.json", json.dumps(dict(dsn=pg_dsn, ca_pem=str(task / "pg-ca.pem"))))
+            env["SKEDADDLE_TEST_CONFIG"] = str(task / "pg-config.json")
         config_path = task / "mysql-config.json"
         test_config = dict(host="localhost", port=int(env["M1_PORT"]),
              ca=env["M1_CA"], user="root", password="skedaddle", profile=profile, gtid=gtid,
@@ -240,7 +255,9 @@ def main():
             container = compose("ps", "-aq", service, check=False).stdout.strip()
             if container:
                 usage[service] = dict(
-                    data=docker("exec", container, "du", "-sk", "/var/lib/mysql", check=False).stdout,
+                    data=docker("exec", container, "du", "-sk",
+                                "/var/lib/postgresql" if service == "pg-destination" else "/var/lib/mysql",
+                                check=False).stdout,
                     memory=docker("stats", "--no-stream", "--format", "{{.MemUsage}}", container,
                                   check=False).stdout)
         save("resource-usage.json", json.dumps(usage, indent=2))

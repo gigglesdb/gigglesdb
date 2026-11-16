@@ -3,7 +3,10 @@
 //! Capture and apply use the existing engines with the endpoints swapped.
 
 mod eligibility;
-pub use eligibility::{Eligibility, InverseMapping, MappingFailure, ReverseResolver, Violation};
+pub use eligibility::{
+    Eligibility, InverseMapping, MappingConstructor, MappingFailure, ReverseResolver,
+    ValidatedMapping, Violation,
+};
 
 use std::{fmt, time::Duration};
 
@@ -82,6 +85,26 @@ impl Readiness {
             return Err(Error::Invalid("reverse slot must precede activation"));
         }
         Ok(())
+    }
+}
+
+/// Destination preparation alone never grants old-source apply readiness.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CapturePreparation {
+    installation: String,
+    slot: SlotEvidence,
+}
+impl CapturePreparation {
+    pub(crate) fn slot(&self) -> &SlotEvidence {
+        &self.slot
+    }
+    pub(crate) fn check_activation(&self, config: &Config, activation_lsn: u64) -> Result<()> {
+        Readiness {
+            installation: self.installation.clone(),
+            slot: self.slot.clone(),
+        }
+        .check_activation(config, activation_lsn)
     }
 }
 
@@ -323,6 +346,38 @@ END;",
         timeout: Duration,
         mut before: impl FnMut(&mut C, Endpoint, &Intent) -> Result<()>,
     ) -> Result<Readiness> {
+        let prepared = self.prepare_capture_bound(destination, previous, timeout, &mut before)?;
+        before(destination, Endpoint::OldSource, &Intent::ApplyObjects)?;
+        let origin = self.origin();
+        let administrative_origin = ddl::administrative_origin(old_source, timeout)
+            .map_err(|_| Error::Invalid("old source DDL capture installation lookup"))?;
+        query(
+            old_source,
+            &apply_objects_sql(&origin, &administrative_origin),
+            timeout,
+        )?;
+        let ready = Readiness {
+            installation: self.installation.clone(),
+            slot: prepared.slot,
+        };
+        before(
+            destination,
+            Endpoint::Destination,
+            &Intent::Ready(ready.clone()),
+        )?;
+        Ok(ready)
+    }
+
+    /// Prepare only the PG endpoint, retaining every ownership/journal check.
+    /// The caller must separately install its old-source apply objects and
+    /// journal combined readiness while it still owns the destination fence.
+    pub(crate) fn prepare_capture_bound<C: fence::Connection>(
+        &self,
+        destination: &mut C,
+        previous: Option<&SlotEvidence>,
+        timeout: Duration,
+        mut before: impl FnMut(&mut C, Endpoint, &Intent) -> Result<()>,
+    ) -> Result<CapturePreparation> {
         if timeout.is_zero() {
             return Err(Error::Invalid("setup timeout"));
         }
@@ -402,25 +457,10 @@ END;",
         if verified.first().and_then(|r| r.first()).map(String::as_str) != Some("true") {
             return Err(Error::Invalid("reverse DDL trigger verification"));
         }
-        before(destination, Endpoint::OldSource, &Intent::ApplyObjects)?;
-        let origin = self.origin();
-        let administrative_origin = ddl::administrative_origin(old_source, timeout)
-            .map_err(|_| Error::Invalid("old source DDL capture installation lookup"))?;
-        query(
-            old_source,
-            &apply_objects_sql(&origin, &administrative_origin),
-            timeout,
-        )?;
-        let ready = Readiness {
+        Ok(CapturePreparation {
             installation: self.installation.clone(),
             slot: evidence,
-        };
-        before(
-            destination,
-            Endpoint::Destination,
-            &Intent::Ready(ready.clone()),
-        )?;
-        Ok(ready)
+        })
     }
 }
 
@@ -507,13 +547,37 @@ impl<R: source::TypeResolver> Capture<R> {
         schemas: ddl::SchemaVersions,
         eligibility: Eligibility,
     ) -> source::Result<Self> {
+        Self::with_mapping(
+            config,
+            source,
+            durable_lsn,
+            writer,
+            resolver,
+            schemas,
+            eligibility,
+            |mapping, eligibility| Box::new(eligibility::InverseMapping::new(mapping, eligibility)),
+        )
+    }
+    /// Opt in to a qualified capture mapping (for example ValidatedMapping::boxed).
+    /// The default constructor continues to invert PG mappings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_mapping(
+        config: &Config,
+        source: SourceIdentity,
+        durable_lsn: u64,
+        writer: BufferWriter,
+        resolver: R,
+        schemas: ddl::SchemaVersions,
+        eligibility: Eligibility,
+        construct: eligibility::MappingConstructor,
+    ) -> source::Result<Self> {
         let eligibility_schemas = schemas.clone();
         let inner = source::Capture::new(
             source,
             config.stream(),
             durable_lsn,
             writer,
-            ReverseResolver::new(resolver, eligibility.clone()),
+            ReverseResolver::with_mapping(resolver, eligibility.clone(), construct),
             config.installation.clone(),
             schemas,
             super::chunk::MESSAGE_PREFIX.into(),

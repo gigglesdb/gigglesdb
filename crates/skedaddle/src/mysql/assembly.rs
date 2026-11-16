@@ -49,6 +49,7 @@ pub struct Assembler {
     order: MysqlOrder,
     gtid_mode: bool,
     gtid: Option<String>,
+    commit_time: Option<i64>,
     open: bool,
     begun: bool,
     rows: Vec<(Arc<TableDescriptor>, ControlRow)>,
@@ -109,6 +110,7 @@ impl Assembler {
             order,
             gtid_mode,
             gtid: None,
+            commit_time: None,
             open: false,
             begun: false,
             rows: Vec::new(),
@@ -140,21 +142,28 @@ impl Assembler {
         outputs: &mut Vec<AssemblerOutput>,
     ) -> Result<()> {
         match event {
-            M::Gtid { sid, sequence, tag } => {
+            M::Gtid {
+                sid,
+                sequence,
+                tag,
+                commit_time,
+            } => {
                 if tag.is_some() {
                     return Err(MysqlError::Assembly("tagged GTID"));
                 }
                 self.start()?;
+                self.commit_time = commit_time;
                 self.gtid = Some(format!("{sid}:{sequence}"));
                 // Validate even when operating in file mode.
                 let mut one = super::GtidSet::default();
                 one.add(self.gtid.as_deref().ok_or(MysqlError::Assembly("GTID"))?)?;
             }
-            M::AnonymousGtid { .. } => {
+            M::AnonymousGtid { commit_time, .. } => {
                 if self.gtid_mode {
                     return Err(MysqlError::Assembly("anonymous GTID in GTID mode"));
                 }
                 self.start()?;
+                self.commit_time = commit_time;
             }
             M::Query { schema, sql, kind } => {
                 if sql
@@ -188,6 +197,16 @@ impl Assembler {
                 }
             }
             M::TableMap(t) => {
+                if t.schema == b"_skedaddle"
+                    && matches!(t.table.as_slice(), b"apply_receipts" | b"apply_progress")
+                {
+                    let d = super::control::apply_descriptors()
+                        .into_iter()
+                        .find(|d| d.table.as_bytes() == t.table)
+                        .expect("owned control descriptor");
+                    super::schema::compare_table_map(&d, &t)
+                        .map_err(|_| MysqlError::Control("apply control table schema mismatch"))?;
+                }
                 let schema = String::from_utf8(t.schema)
                     .map_err(|_| MysqlError::Assembly("table schema UTF-8"))?;
                 let table = String::from_utf8(t.table)
@@ -386,7 +405,13 @@ impl Assembler {
                     unchanged_cols: BTreeSet::new(),
                 });
             }
-            let txn = AssembledTxn::new(self.source.clone(), id, commit_position, None, events)?;
+            let txn = AssembledTxn::new(
+                self.source.clone(),
+                id,
+                commit_position,
+                self.commit_time,
+                events,
+            )?;
             outputs.push(AssemblerOutput::Txn { txn, control_rows });
         }
         self.reset();
@@ -396,6 +421,7 @@ impl Assembler {
         self.open = false;
         self.begun = false;
         self.gtid = None;
+        self.commit_time = None;
         self.bytes = 0;
         self.rows.clear();
         self.maps.clear();

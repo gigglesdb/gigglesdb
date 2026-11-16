@@ -378,7 +378,11 @@ impl Fixture {
                 capture: &mut Endpoint(e.clone()),
                 pre_hook: &mut Endpoint(e.clone()),
                 replay: &replay(true, true),
-                target: &mut Target(self.rows.clone()),
+                target: &mut apply::PgRollbackSink {
+                    destination: &mut Target(self.rows.clone()),
+                    key: &self.key,
+                    replay: &replay(true, true),
+                },
                 verification: &mut Endpoint(e.clone()),
                 source: &mut Endpoint(e.clone()),
                 post_hook: &mut Endpoint(e.clone()),
@@ -555,7 +559,7 @@ impl OwnerModel {
             e.borrow_mut().guarded=true;
             let mut log=RuntimeJournal::new(&runtime,Default::default())?;
             let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-            let result=execute_next(&key,now,&mut runtime.cutover_authority(),&rt,&mut Components {destination:&mut Endpoint(e.clone()),capture:&mut OwnerCapture {endpoint:Endpoint(e.clone()),runtime:runtime.clone(),digest},pre_hook:&mut Endpoint(e.clone()),replay:&replay,target:&mut Target(model.rows.clone()),verification:&mut Endpoint(e.clone()),source:&mut Endpoint(e.clone()),post_hook:&mut Endpoint(e.clone()),journal:&mut log});
+            let result=execute_next(&key,now,&mut runtime.cutover_authority(),&rt,&mut Components {destination:&mut Endpoint(e.clone()),capture:&mut OwnerCapture {endpoint:Endpoint(e.clone()),runtime:runtime.clone(),digest},pre_hook:&mut Endpoint(e.clone()),replay:&replay,target:&mut apply::PgRollbackSink {destination:&mut Target(model.rows.clone()),key:&key,replay:&replay},verification:&mut Endpoint(e.clone()),source:&mut Endpoint(e.clone()),post_hook:&mut Endpoint(e.clone()),journal:&mut log});
             *model.effects.lock().unwrap()=e.borrow().clone();
             result
         }).await.unwrap()

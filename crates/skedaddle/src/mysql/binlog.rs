@@ -94,10 +94,13 @@ pub enum MysqlEvent {
         sid: String,
         sequence: u64,
         tag: Option<String>,
+        /// Immediate source commit time, Unix microseconds; never an ordering key.
+        commit_time: Option<i64>,
     },
     AnonymousGtid {
         sid: String,
         sequence: u64,
+        commit_time: Option<i64>,
     },
     Query {
         schema: Vec<u8>,
@@ -230,10 +233,12 @@ impl BinlogDecoder {
                 sid: uuid::Uuid::from_bytes(g.sid()).to_string(),
                 sequence: g.gno(),
                 tag: g.tag().map(ToString::to_string),
+                commit_time: commit_time(g.immediate_commit_timestamp()),
             },
             Some(EventData::AnonymousGtidEvent(g)) => MysqlEvent::AnonymousGtid {
                 sid: uuid::Uuid::from_bytes(g.0.sid()).to_string(),
                 sequence: g.0.gno(),
+                commit_time: commit_time(g.0.immediate_commit_timestamp()),
             },
             Some(EventData::QueryEvent(q)) => {
                 let sql = q.query_raw();
@@ -324,6 +329,11 @@ impl BinlogDecoder {
             _ => return Err(MysqlError::UnsupportedEvent(raw)),
         })
     }
+}
+fn commit_time(timestamp: u64) -> Option<i64> {
+    (timestamp > 0)
+        .then(|| i64::try_from(timestamp).ok())
+        .flatten()
 }
 fn table(map: &TableMapEvent<'_>) -> Result<MysqlTable> {
     let meta = OptionalMetaExtractor::new(map.iter_optional_meta())?;
@@ -493,7 +503,7 @@ fn image(row: BinlogRow, columns: &[MysqlColumn]) -> Result<RowImage> {
                     collation: column.collation.unwrap(),
                 }
             }
-            (_, Value::Bytes(bytes)) => MysqlValue::Binary(bytes),
+            (_, Value::Bytes(bytes)) => MysqlValue::Binary(binary_bytes(column, bytes)?),
         };
         out.push(value);
     }
@@ -501,4 +511,107 @@ fn image(row: BinlogRow, columns: &[MysqlColumn]) -> Result<RowImage> {
 }
 fn text(bytes: Vec<u8>) -> Result<String> {
     String::from_utf8(bytes).map_err(|_| MysqlError::Invalid("ASCII scalar"))
+}
+
+// Field_string::pack strips the charset pad byte; binary collation uses 0x00.
+// Restore only fixed STRING/BINARY cells, never VARCHAR/VARBINARY or BLOB.
+fn binary_bytes(column: &MysqlColumn, mut bytes: Vec<u8>) -> Result<Vec<u8>> {
+    if column.column_type == ColumnType::MYSQL_TYPE_STRING as u8 && column.collation == Some(63) {
+        let [kind, low] = column.metadata.as_slice() else {
+            return Err(MysqlError::Invalid("BINARY column metadata"));
+        };
+        if kind & 0xcf != (ColumnType::MYSQL_TYPE_STRING as u8) & 0xcf {
+            return Err(MysqlError::Invalid("BINARY column metadata"));
+        }
+        let width = usize::from(*low) | (usize::from((kind & 0x30) ^ 0x30) << 4);
+        if bytes.len() > width {
+            return Err(MysqlError::Invalid("BINARY column length"));
+        }
+        bytes.resize(width, 0);
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod binary_padding_tests {
+    use super::*;
+    fn column(width: u8) -> MysqlColumn {
+        MysqlColumn {
+            name: b"b".to_vec(),
+            column_type: ColumnType::MYSQL_TYPE_STRING as u8,
+            metadata: vec![ColumnType::MYSQL_TYPE_STRING as u8, width],
+            unsigned: None,
+            collation: Some(63),
+            nullable: false,
+            labels: None,
+        }
+    }
+    #[test]
+    fn fixed_binary_restores_trailing_zeroes_and_maps_to_bytea() {
+        use crate::{
+            mapping::{
+                Value as PgValue,
+                mysql::{forward, plan_column},
+            },
+            mysql::schema::ColumnDescriptor,
+        };
+        for width in [16, 32] {
+            for zeros in [1, 4, width] {
+                let decoded =
+                    binary_bytes(&column(width), vec![0xab; usize::from(width - zeros)]).unwrap();
+                let mut expected = vec![0xab; usize::from(width)];
+                expected[usize::from(width - zeros)..].fill(0);
+                assert_eq!(decoded, expected);
+                let descriptor = ColumnDescriptor {
+                    name: "b".into(),
+                    ordinal: 1,
+                    data_type: "binary".into(),
+                    column_type: format!("binary({width})"),
+                    character_set: None,
+                    collation: None,
+                    nullable: false,
+                    generated: false,
+                    column_default: None,
+                    default_generated: false,
+                    generation_expression: None,
+                };
+                assert_eq!(
+                    forward(
+                        &plan_column(&descriptor).unwrap(),
+                        &MysqlValue::Binary(decoded)
+                    )
+                    .unwrap(),
+                    PgValue::Bytea(expected)
+                );
+            }
+        }
+    }
+    #[test]
+    fn binary_padding_preserves_full_values_and_variable_width_cells() {
+        let bytes = vec![0xab; 32];
+        assert_eq!(binary_bytes(&column(32), bytes.clone()).unwrap(), bytes);
+        for ty in [
+            ColumnType::MYSQL_TYPE_VARCHAR,
+            ColumnType::MYSQL_TYPE_VAR_STRING,
+            ColumnType::MYSQL_TYPE_BLOB,
+        ] {
+            let mut c = column(32);
+            c.column_type = ty as u8;
+            assert_eq!(binary_bytes(&c, vec![1, 0]).unwrap(), vec![1, 0]);
+        }
+        let mut c = column(32);
+        c.collation = Some(255);
+        assert_eq!(binary_bytes(&c, vec![1]).unwrap(), vec![1]);
+        c.collation = None;
+        assert_eq!(binary_bytes(&c, vec![1]).unwrap(), vec![1]);
+    }
+    #[test]
+    fn binary_padding_rejects_invalid_metadata_and_oversize_values() {
+        assert!(binary_bytes(&column(16), vec![1; 17]).is_err());
+        let mut c = column(32);
+        c.metadata.clear();
+        assert!(binary_bytes(&c, vec![]).is_err());
+        c.metadata = vec![ColumnType::MYSQL_TYPE_ENUM as u8, 32];
+        assert!(binary_bytes(&c, vec![]).is_err());
+    }
 }

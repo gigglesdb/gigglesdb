@@ -2,6 +2,7 @@
 //! Tip/clock metadata are explicit inputs to the pure observation contract;
 //! the config-gated engine test qualifies their PostgreSQL producers.
 use super::*;
+use crate::engine::live_readiness::MAX_OBSERVATION_AGE;
 use crate::pg::{ddl, replication::Lineage};
 use std::time::Instant;
 
@@ -155,6 +156,7 @@ struct NativeProbe {
     lag_known: bool,
     retention: Option<RetentionMargin>,
     schema_unknown: bool,
+    schema_boundary: Option<SchemaBoundary>,
 }
 impl NativeProbe {
     fn new() -> Self {
@@ -165,6 +167,7 @@ impl NativeProbe {
             age: Some(1500),
             lag_known: true,
             schema_unknown: false,
+            schema_boundary: None,
             retention: Some(RetentionMargin {
                 position: native_position("9"),
                 remaining: LagMeasure {
@@ -202,8 +205,8 @@ impl ReadinessProbe for NativeProbe {
             }),
             oldest_unapplied_age_ms: self.age,
             retention: self.retention.clone(),
-            schema: Some(source::SchemaState {
-                blocked_boundary: None,
+            schema: Some(SchemaState {
+                blocked_boundary: self.schema_boundary.clone(),
                 unknown_schema_job: self.schema_unknown,
             }),
             observed_at: self.started,
@@ -263,6 +266,113 @@ fn admit_native(runtime: &Runtime, probe: NativeProbe) {
 }
 
 #[tokio::test]
+async fn connector_schema_stop_retains_native_evidence_across_clear_probe_and_exit() {
+    let f = Fixture::new().await;
+    let runtime = f.engine.runtime();
+    for kind in [
+        SchemaStopKind::Ddl,
+        SchemaStopKind::UnknownDdl,
+        SchemaStopKind::TableMapChanged,
+    ] {
+        begin_native(&runtime, None);
+        let boundary = SchemaBoundary::Connector(ConnectorSchemaStop {
+            connector: "test-native".into(),
+            kind,
+            table: Some("source.widgets".into()),
+            diagnostic: "ALTER TABLE source.widgets ADD COLUMN value int".into(),
+            position: native_position("10"),
+        });
+        runtime.7.schema(Some(SchemaState {
+            blocked_boundary: Some(boundary.clone()),
+            unknown_schema_job: false,
+        }));
+        // A capture stop is already a blocker before lag/retention is known.
+        assert_eq!(
+            runtime.live_readiness().blocked,
+            Some(ReadinessBlocked::Schema(boundary.clone()))
+        );
+        tokio::time::sleep(MAX_OBSERVATION_AGE + Duration::from_millis(10)).await;
+        admit_native(&runtime, NativeProbe::new());
+        let live = runtime.live_readiness();
+        assert!(live.lag.is_some() && live.retention.is_some());
+        assert!(
+            !live.schema_fresh,
+            "fresh clear probe cannot refresh capture"
+        );
+        assert_eq!(
+            live.schema.unwrap().blocked_boundary,
+            Some(boundary.clone())
+        );
+        assert_eq!(
+            live.blocked,
+            Some(ReadinessBlocked::Schema(boundary.clone()))
+        );
+        let mut lost_retention = NativeProbe::new();
+        lost_retention.retention.as_mut().unwrap().history_available = false;
+        admit_native(&runtime, lost_retention);
+        let live = runtime.live_readiness();
+        assert!(!live.retention.unwrap().history_available);
+        assert_eq!(
+            live.blocked,
+            Some(ReadinessBlocked::Schema(boundary.clone()))
+        );
+        runtime.7.finish();
+        let live = runtime.live_readiness();
+        assert!(!live.running && live.lag.is_none());
+        assert_eq!(live.blocked, Some(ReadinessBlocked::Schema(boundary)));
+    }
+}
+
+#[tokio::test]
+async fn unknown_schema_job_blocks_from_probe_and_capture_with_clear_probe() {
+    let f = Fixture::new().await;
+    let runtime = f.engine.runtime();
+    begin_native(&runtime, None);
+    let mut probe = NativeProbe::new();
+    probe.schema_unknown = true;
+    admit_native(&runtime, probe);
+    assert_eq!(
+        runtime.live_readiness().blocked,
+        Some(ReadinessBlocked::UnknownSchemaJob)
+    );
+    runtime.7.schema(Some(SchemaState {
+        blocked_boundary: None,
+        unknown_schema_job: true,
+    }));
+    admit_native(&runtime, NativeProbe::new());
+    assert_eq!(
+        runtime.live_readiness().blocked,
+        Some(ReadinessBlocked::UnknownSchemaJob)
+    );
+    // A fresh owner with an explicitly clear classifier can establish readiness.
+    begin_native(&runtime, None);
+    admit_native(&runtime, NativeProbe::new());
+    assert_eq!(runtime.live_readiness().blocked, None);
+}
+
+#[tokio::test]
+async fn connector_probe_schema_stop_blocks_even_without_lag_or_retention() {
+    let f = Fixture::new().await;
+    let runtime = f.engine.runtime();
+    begin_native(&runtime, None);
+    let mut probe = NativeProbe::new();
+    let boundary = SchemaBoundary::Connector(ConnectorSchemaStop {
+        connector: "test-native".into(),
+        kind: SchemaStopKind::UnknownDdl,
+        table: None,
+        diagnostic: "unclassified statement".into(),
+        position: native_position("10"),
+    });
+    probe.schema_boundary = Some(boundary.clone());
+    probe.retention = None;
+    probe.lag_known = false;
+    admit_native(&runtime, probe);
+    let live = runtime.live_readiness();
+    assert!(live.schema_fresh && live.lag.is_none());
+    assert_eq!(live.blocked, Some(ReadinessBlocked::Schema(boundary)));
+}
+
+#[tokio::test]
 async fn native_probe_uses_order_age_freshness_baseline_and_independent_schema() {
     let f = Fixture::new().await;
     let runtime = f.engine.runtime();
@@ -296,7 +406,7 @@ async fn native_probe_uses_order_age_freshness_baseline_and_independent_schema()
     let live = runtime.live_readiness();
     assert_eq!(live.lag.unwrap().lag.value, 1);
     assert!(live.schema_fresh && live.schema.unwrap().unknown_schema_job);
-    runtime.7.schema(Some(source::SchemaState {
+    runtime.7.schema(Some(SchemaState {
         blocked_boundary: None,
         unknown_schema_job: true,
     }));
@@ -753,9 +863,16 @@ async fn ddl_accessor_blocks_unclassified_and_sticky_boundary_then_new_baseline_
     assert!(batch.stop);
     let schema = capture.schema_state().unwrap();
     assert!(schema.blocked_boundary.is_some() && !schema.unknown_schema_job);
+    let Some(SchemaBoundary::Postgres(boundary)) = schema.blocked_boundary.as_ref() else {
+        panic!("PG producer must retain its typed boundary");
+    };
+    assert_eq!((&*boundary.xid, boundary.schema_version), ("40", 1));
+    assert!(boundary.stop_apply_before_transaction && boundary.readiness_blocked);
+    let expected = schema.blocked_boundary.clone().unwrap();
     f.engine.runtime.7.schema(Some(schema));
     f.engine.runtime.7.finish();
     let live = f.engine.runtime.live_readiness();
+    assert_eq!(live.blocked, Some(ReadinessBlocked::Schema(expected)));
     assert!(!live.running && live.schema.unwrap().blocked_boundary.is_some());
     // Resolving a sticky boundary requires a newly qualified capture baseline;
     // no mutation/clear API is added to SchemaVersions.

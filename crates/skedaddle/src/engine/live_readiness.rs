@@ -34,6 +34,8 @@ pub enum ReadinessBlocked {
     Stale,
     Unavailable,
     Position(EventError),
+    Schema(SchemaBoundary),
+    UnknownSchemaJob,
 }
 /// A connector supplies an authenticated source tip/clock and its native units.
 /// The tip is admitted only after its transactional marker is durably captured.
@@ -52,7 +54,7 @@ pub struct ReadinessProbeSample {
     pub lag: Option<LagMeasure>,
     pub oldest_unapplied_age_ms: Option<u64>,
     pub retention: Option<RetentionMargin>,
-    pub schema: Option<source::SchemaState>,
+    pub schema: Option<SchemaState>,
     pub observed_at: Instant,
 }
 #[derive(Clone)]
@@ -124,7 +126,7 @@ pub struct LiveReadinessObservation {
     pub owner_generation: Option<String>,
     pub capture: Option<CaptureObservation>,
     pub lag: Option<ApplyLagObservation>,
-    pub schema: Option<source::SchemaState>,
+    pub schema: Option<SchemaState>,
     pub running: bool,
     pub schema_fresh: bool,
     pub blocked: Option<ReadinessBlocked>,
@@ -149,7 +151,7 @@ struct Live {
     pending: VecDeque<(Position, Option<i64>)>,
     tip: Option<Tip>,
     awaiting: Option<Tip>,
-    schema: Option<source::SchemaState>,
+    schema: Option<SchemaState>,
     schema_at: Option<Instant>,
 }
 #[derive(Default)]
@@ -229,7 +231,7 @@ impl Hub {
         state.tip = None;
         state.awaiting = None;
     }
-    pub(super) fn schema(&self, schema: Option<source::SchemaState>) {
+    pub(super) fn schema(&self, schema: Option<SchemaState>) {
         let mut state = self.0.lock().expect("live readiness poisoned");
         state.schema = schema;
         state.schema_at = Some(Instant::now());
@@ -291,6 +293,7 @@ impl Hub {
         if let Some(tip) = state.awaiting.as_ref()
             && compare(&state, position, tip.probe.tip()).is_ok_and(|o| !o.is_lt())
             && batch.watermarks.iter().any(|w| match w {
+                super::CapturedMarker::Verification { .. } => false,
                 super::CapturedMarker::Pg(w) => {
                     w.transactional
                         && pg_position_lsn(position, position.order_domain())
@@ -421,13 +424,13 @@ impl Hub {
         let state = self.0.lock().expect("live readiness poisoned");
         let mut retention = None;
         let mut probe_schema = None;
-        let blocked;
-        let lag = (|| -> std::result::Result<_, ReadinessBlocked> {
+        let mut blocked;
+        let lag = (|| -> std::result::Result<_, Box<ReadinessBlocked>> {
             if let Some(error) = &state.invalid_position {
-                return Err(ReadinessBlocked::Position(error.clone()));
+                return Err(ReadinessBlocked::Position(error.clone()).into());
             }
             if !state.running || !state.valid {
-                return Err(ReadinessBlocked::Unavailable);
+                return Err(ReadinessBlocked::Unavailable.into());
             }
             let tip = state.tip.as_ref().ok_or(
                 if state
@@ -452,7 +455,7 @@ impl Hub {
                     .checked_duration_since(sample.observed_at)
                     .is_none_or(|age| age > MAX_OBSERVATION_AGE)
             {
-                return Err(ReadinessBlocked::Stale);
+                return Err(ReadinessBlocked::Stale.into());
             }
             probe_schema = sample.schema;
             if let Some(margin) = &sample.retention {
@@ -460,7 +463,7 @@ impl Hub {
                     .map_err(ReadinessBlocked::Position)?;
                 retention = Some(margin.clone());
                 if !margin.history_available {
-                    return Err(ReadinessBlocked::RetentionLost);
+                    return Err(ReadinessBlocked::RetentionLost.into());
                 }
                 let seconds = margin
                     .time_to_exhaustion
@@ -471,16 +474,16 @@ impl Hub {
                     &crate::status::RetentionPolicy::default(),
                 );
                 if matches!(level, WalLevel::Blocker | WalLevel::Abort) {
-                    return Err(ReadinessBlocked::RetentionRisk(level));
+                    return Err(ReadinessBlocked::RetentionRisk(level).into());
                 }
             } else if tip.probe.source().engine != "postgres" {
-                return Err(ReadinessBlocked::UnknownRetention);
+                return Err(ReadinessBlocked::UnknownRetention.into());
             }
             retention = sample.retention;
             if state.baseline.as_ref().is_some_and(|baseline| {
                 compare(&state, applied, baseline).map_or(true, |o| o.is_lt())
             }) {
-                return Err(ReadinessBlocked::UnknownLag);
+                return Err(ReadinessBlocked::UnknownLag.into());
             }
             Ok(ApplyLagObservation {
                 source: state.source.clone().ok_or(ReadinessBlocked::Unavailable)?,
@@ -500,10 +503,21 @@ impl Hub {
                 Some(lag)
             }
             Err(reason) => {
-                blocked = Some(reason);
+                blocked = Some(*reason);
                 None
             }
         };
+        // Capture owns the classifier state, including sticky stops. A clear
+        // probe cannot replace it or refresh the capture's original deadline.
+        let schema = state.schema.clone().or_else(|| probe_schema.clone());
+        if let Some(schema) = &schema {
+            if let Some(boundary) = &schema.blocked_boundary {
+                // Schema stops survive lag/retention failures and owner exit.
+                blocked = Some(ReadinessBlocked::Schema(boundary.clone()));
+            } else if schema.unknown_schema_job && blocked.is_none() {
+                blocked = Some(ReadinessBlocked::UnknownSchemaJob);
+            }
+        }
         LiveReadinessObservation {
             owner_generation: state.owner_generation.clone(),
             capture: state
@@ -524,7 +538,7 @@ impl Hub {
             lag,
             blocked,
             retention,
-            schema: state.schema.clone().or_else(|| probe_schema.clone()),
+            schema,
             running: state.running,
             schema_fresh: if state.schema.is_some() {
                 state

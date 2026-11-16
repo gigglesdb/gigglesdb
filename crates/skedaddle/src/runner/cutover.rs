@@ -362,7 +362,7 @@ impl<C: Capture> Capture for Observed<C> {
     ) -> coordinator::Result<()> {
         self.capture.prepare_schema(journal, runtime).await
     }
-    fn schema_state(&self) -> Option<source::SchemaState> {
+    fn schema_state(&self) -> Option<engine::SchemaState> {
         self.capture.schema_state()
     }
     fn buffered_marker(&self, batch: &engine::Captured) -> coordinator::Result<String> {

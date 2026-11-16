@@ -616,6 +616,7 @@ pub fn coordinator_gc_error(error: Error) -> reader::Error {
         // Other local-core failures include corrupt/fenced state. Postgres is
         // not used by this authority; fail closed for unexpected variants.
         Error::RecoveryRequired(_)
+        | Error::SourceBinding(_)
         | Error::UnsupportedFormatVersion { .. }
         | Error::Rejected(_)
         | Error::Lifecycle(_)
@@ -668,6 +669,7 @@ mod classification_tests {
             .err()
             .expect("invalid configuration");
         let fatal = [
+            Error::SourceBinding(super::super::SourceBindingError::Connector),
             Error::RecoveryRequired("injected".into()),
             Error::Rejected("injected".into()),
             Error::LostOwnership,

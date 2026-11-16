@@ -193,15 +193,69 @@ impl Mapping for InverseMapping {
     }
 }
 
+/// Constructs a capture-facing mapping using the capture's shared latch.
+pub type MappingConstructor = fn(Box<dyn Mapping>, Eligibility) -> Box<dyn Mapping>;
+
+/// Opt-in for a qualified resolver whose forward method already produces the
+/// desired reverse event value. Unlike InverseMapping this never inverts it.
+pub struct ValidatedMapping {
+    mapping: Box<dyn Mapping>,
+    eligibility: Eligibility,
+}
+impl ValidatedMapping {
+    pub fn boxed(mapping: Box<dyn Mapping>, eligibility: Eligibility) -> Box<dyn Mapping> {
+        Box::new(Self {
+            mapping,
+            eligibility,
+        })
+    }
+}
+impl Mapping for ValidatedMapping {
+    fn forward(&self, value: &Value) -> Result<Value, MappingError> {
+        self.domain_check(value)?;
+        self.mapping.forward(value).or_else(|reason| {
+            self.eligibility.end(Violation::Value {
+                reason: (&reason).into(),
+            })?;
+            Err(reason)
+        })
+    }
+    fn inverse(&self, value: &Value) -> Result<Value, MappingError> {
+        self.domain_check(value)?;
+        self.mapping.inverse(value)
+    }
+    fn domain_check(&self, value: &Value) -> Result<(), MappingError> {
+        self.eligibility.check(self.mapping.as_ref(), value)
+    }
+    fn is_reversible(&self) -> bool {
+        self.mapping.is_reversible() && self.eligibility.eligible()
+    }
+    fn classification(&self) -> Classification {
+        self.mapping.classification()
+    }
+}
+fn inverse_mapping(mapping: Box<dyn Mapping>, eligibility: Eligibility) -> Box<dyn Mapping> {
+    Box::new(InverseMapping::new(mapping, eligibility))
+}
+
 pub struct ReverseResolver<R> {
     resolver: R,
     eligibility: Eligibility,
+    construct: MappingConstructor,
 }
 impl<R> ReverseResolver<R> {
     pub fn new(resolver: R, eligibility: Eligibility) -> Self {
+        Self::with_mapping(resolver, eligibility, inverse_mapping)
+    }
+    pub fn with_mapping(
+        resolver: R,
+        eligibility: Eligibility,
+        construct: MappingConstructor,
+    ) -> Self {
         Self {
             resolver,
             eligibility,
+            construct,
         }
     }
 }
@@ -222,7 +276,7 @@ impl<R: TypeResolver> TypeResolver for ReverseResolver<R> {
         match self.resolver.resolve(relation, column) {
             Ok(value) => Ok(ColumnMapping {
                 pg_type: value.pg_type,
-                mapping: Box::new(InverseMapping::new(value.mapping, self.eligibility.clone())),
+                mapping: (self.construct)(value.mapping, self.eligibility.clone()),
             }),
             Err(e) => {
                 self.eligibility

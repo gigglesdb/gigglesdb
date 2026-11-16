@@ -313,7 +313,7 @@ pub struct RecordEvidence {
     identity: (String, u64, TxnId, Position, ContentDigest),
 }
 impl RecordEvidence {
-    fn new(
+    pub(crate) fn new(
         kind: RecordKind,
         manifest_digest: ContentDigest,
         previous_manifest_digest: ContentDigest,

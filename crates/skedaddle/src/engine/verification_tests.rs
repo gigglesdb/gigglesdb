@@ -56,6 +56,7 @@ fn make_arm(limits: VerificationLimits) -> Armed {
         bytes: 0,
         failure: None,
         marker: verification_marker(Uuid::new_v4()),
+        native: None,
         through: None,
     }
 }
@@ -397,4 +398,331 @@ fn applied_observations_use_native_order_and_reject_invalid_checkpoints() {
                 || state.terminal == Some(ApplierTerminalCause::CheckpointRejected)
         );
     }
+}
+
+// A connector contract fixture: no database behavior is simulated.
+struct NativeOrder;
+impl crate::event::PositionOrder for NativeOrder {
+    fn domain(&self) -> &str {
+        "native-test"
+    }
+    fn compare(
+        &self,
+        a: &[u8],
+        b: &[u8],
+    ) -> std::result::Result<Ordering, crate::event::EventError> {
+        let parse = |v: &[u8]| {
+            std::str::from_utf8(v)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or(crate::event::EventError::InvalidEncoding("native-test"))
+        };
+        Ok(parse(a)?.cmp(&parse(b)?))
+    }
+}
+fn native_position(n: u64) -> Position {
+    Position::new("native-test", n.to_string().as_bytes())
+}
+fn native_source() -> SourceIdentity {
+    SourceIdentity {
+        engine: "native-test".into(),
+        ..source()
+    }
+}
+struct NativeKey;
+impl VerificationKey for NativeKey {
+    fn table(&self) -> &str {
+        "public.rows"
+    }
+    fn columns(&self) -> Vec<&str> {
+        vec!["id"]
+    }
+    fn validate(&self) -> verify::Result<()> {
+        Ok(())
+    }
+    fn validate_key(&self, key: &[Value]) -> verify::Result<()> {
+        if matches!(key, [Value::Int4(_)]) {
+            Ok(())
+        } else {
+            Err(VerifyError::Invalid("native key"))
+        }
+    }
+}
+struct NativeKeys;
+impl KeyOrder for NativeKeys {
+    fn compare_keys(&self, a: &Key, b: &Key) -> verify::Result<Ordering> {
+        match (a.as_slice(), b.as_slice()) {
+            ([Value::Int4(a)], [Value::Int4(b)]) => Ok(a.cmp(b)),
+            _ => Err(VerifyError::Invalid("native order")),
+        }
+    }
+}
+fn native_batch(marker: NativeVerificationMarker) -> Captured {
+    let mut events = Vec::new();
+    for (i, mut e) in [
+        event(EventKind::Insert, 1, Some(1)),
+        event(EventKind::Update, 1, Some(2)),
+        event(EventKind::Update, 2, Some(1)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        e.source = native_source();
+        e.position = native_position(9);
+        e.ordinal_in_txn = i as u64;
+        events.push(e);
+    }
+    let txn = crate::event::AssembledTxn::new(
+        native_source(),
+        TxnId(vec![1]),
+        native_position(10),
+        None,
+        events,
+    )
+    .unwrap();
+    Captured {
+        watermarks: vec![super::super::CapturedMarker::Verification {
+            marker,
+            transaction: txn.txn.clone(),
+            commit: txn.commit_position.clone(),
+            committed_events: txn.events.clone(),
+        }],
+        transaction: Some(txn),
+        ..Captured::default()
+    }
+}
+fn apply_native(hub: &Hub, position: Position) {
+    hub.applied(
+        &position,
+        &ReaderCheckpoint {
+            next_mseq: 1,
+            last_position: Some(position.clone()),
+            last_record: Some(crate::buffer::format::RecordBoundary {
+                source: native_source(),
+                chunk_rows: false,
+            }),
+            ..ReaderCheckpoint::default()
+        },
+    );
+}
+struct ContractEmitter {
+    hub: Arc<Hub>,
+    apply: bool,
+}
+#[async_trait]
+impl VerificationEmitter for ContractEmitter {
+    async fn emit(&self, marker: &NativeVerificationMarker) -> verify::Result<()> {
+        self.hub.observe(&native_batch(marker.clone()));
+        if self.apply {
+            apply_native(&self.hub, native_position(10));
+        }
+        Ok(())
+    }
+}
+fn native_provider(apply: bool) -> NativeChangeEvidence<NativeKeys> {
+    let hub = Arc::new(Hub::default());
+    hub.begin(native_source(), Arc::new(NativeOrder));
+    let binding = hub.state.lock().unwrap().binding.clone().unwrap();
+    PgChangeEvidence {
+        emitter: Some(Arc::new(ContractEmitter {
+            hub: hub.clone(),
+            apply,
+        })),
+        hub,
+        binding,
+        admin: None,
+        table: Arc::new(NativeKey),
+        order: NativeKeys,
+        limits: VerificationLimits {
+            timeout: Duration::from_millis(30),
+            ..limits()
+        },
+        armed: None,
+    }
+}
+#[tokio::test]
+async fn native_evidence_authenticates_and_waits_for_applied_boundary() {
+    for applied in [true, false] {
+        let mut provider = native_provider(applied);
+        let range = make_arm(limits()).range;
+        provider.arm(&range).await.unwrap();
+        let result = provider.changes(&range, native_position(9)).await;
+        if applied {
+            let evidence = result.unwrap();
+            assert_eq!(evidence.through_position, native_position(10));
+            assert_eq!(
+                evidence.keys,
+                vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+            );
+        } else {
+            assert!(matches!(result, Err(VerifyError::ApplierTimeout { .. })));
+        }
+        assert!(provider.hub.state.lock().unwrap().arms.is_empty());
+    }
+}
+#[tokio::test]
+async fn native_closing_marker_rejects_mismatched_batch_and_version() {
+    for fault in 0..7 {
+        let mut provider = native_provider(false);
+        let range = make_arm(limits()).range;
+        provider.arm(&range).await.unwrap();
+        let token = provider.armed.unwrap();
+        let marker = provider.hub.state.lock().unwrap().arms[&token]
+            .native
+            .clone()
+            .unwrap();
+        let mut batch = native_batch(marker);
+        let super::super::CapturedMarker::Verification {
+            marker,
+            commit,
+            transaction,
+            committed_events,
+        } = &mut batch.watermarks[0]
+        else {
+            unreachable!()
+        };
+        match fault {
+            0 => *commit = native_position(11),
+            1 => *transaction = TxnId(vec![2]),
+            2 => committed_events.clear(),
+            3 => batch.transaction.as_mut().unwrap().source.stream = "other".into(),
+            4 => *commit = Position::new("wrong-domain", b"10"),
+            5 => {
+                marker.version = 2;
+                provider
+                    .hub
+                    .state
+                    .lock()
+                    .unwrap()
+                    .arms
+                    .get_mut(&token)
+                    .unwrap()
+                    .native
+                    .as_mut()
+                    .unwrap()
+                    .version = 2;
+            }
+            _ => batch.transaction = None,
+        }
+        provider.hub.observe(&batch);
+        let state = provider.hub.state.lock().unwrap();
+        assert!(state.arms[&token].through.is_none());
+        assert!(state.invalid.is_some() || state.arms[&token].failure.is_some());
+    }
+}
+#[tokio::test]
+async fn native_waiter_uses_numeric_order_and_fails_closed() {
+    use verify::Applier;
+    for fault in 0..5 {
+        let provider = native_provider(false);
+        let mut waiter = AppliedSourceWaiter {
+            hub: provider.hub.clone(),
+            binding: provider.binding.clone(),
+            timeout: provider.limits.timeout,
+            barrier: None,
+        };
+        apply_native(&provider.hub, native_position(10));
+        let target = match fault {
+            0 => native_position(9),
+            1 => Position::new("wrong-domain", b"9"),
+            2 => {
+                apply_native(&provider.hub, native_position(8));
+                native_position(9)
+            }
+            3 => native_position(11),
+            _ => {
+                provider.hub.finish(ApplierTerminalCause::CaptureStopped);
+                native_position(9)
+            }
+        };
+        let result = waiter.wait_until(target).await;
+        match fault {
+            0 => assert_eq!(result.unwrap(), native_position(10)),
+            2 | 4 => assert!(matches!(result, Err(VerifyError::ApplierTerminal { .. }))),
+            3 => assert!(matches!(result, Err(VerifyError::ApplierTimeout { .. }))),
+            _ => assert!(result.is_err()),
+        }
+    }
+}
+#[tokio::test]
+async fn native_continuity_invalidation_and_cancel_remove_trust() {
+    let mut provider = native_provider(false);
+    let range = make_arm(limits()).range;
+    provider.arm(&range).await.unwrap();
+    let token = provider.armed.unwrap();
+    provider.hub.invalidate_continuity();
+    provider
+        .hub
+        .observe(&native_batch(NativeVerificationMarker {
+            version: 1,
+            token,
+        }));
+    assert!(matches!(
+        provider.changes(&range, native_position(9)).await,
+        Err(VerifyError::EvidenceInvalidated { .. })
+    ));
+    assert!(provider.arm(&range).await.is_err());
+    assert!(provider.hub.state.lock().unwrap().arms.is_empty());
+
+    let mut provider = native_provider(false);
+    provider.arm(&range).await.unwrap();
+    let hub = provider.hub.clone();
+    let mut pending = Box::pin(provider.changes(&range, native_position(9)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(2), &mut pending)
+            .await
+            .is_err()
+    );
+    drop(pending);
+    assert!(hub.state.lock().unwrap().arms.is_empty());
+}
+
+#[test]
+fn native_verification_marker_cannot_close_a_chunk_window() {
+    use super::super::{Active, CapturedMarker};
+    let table = TableKey {
+        table: "public.rows".into(),
+        relation: QualifiedName {
+            schema: "public".into(),
+            name: "rows".into(),
+        },
+        columns: vec![KeyColumn {
+            name: "id".into(),
+            pg_type: PgType::Int4,
+            sql_type: QualifiedName {
+                schema: "pg_catalog".into(),
+                name: "int4".into(),
+            },
+            collation: None,
+            direction: Direction::Asc,
+        }],
+    };
+    let plan = crate::coordinator::chunk::ChunkPlan::new(table.clone(), 100, vec![]).unwrap();
+    let chunk = plan.ranges[0].clone();
+    let window = crate::pg::chunk::Window::new(table, chunk.clone(), vec![], 1).unwrap();
+    let (complete, _) = tokio::sync::oneshot::channel();
+    let (_, journaled) = tokio::sync::oneshot::channel();
+    let mut active = Active {
+        plan: Box::new(plan),
+        chunk,
+        attempt: 1,
+        window: Some(window),
+        backlog: Default::default(),
+        bytes: 0,
+        complete,
+        journaled,
+    };
+    let captured = Captured {
+        watermarks: vec![CapturedMarker::Verification {
+            marker: NativeVerificationMarker {
+                version: 1,
+                token: Uuid::new_v4(),
+            },
+            commit: native_position(10),
+            transaction: TxnId(vec![1]),
+            committed_events: vec![],
+        }],
+        ..Captured::default()
+    };
+    assert!(active.feed(&captured, &NativeOrder).unwrap().is_none());
 }

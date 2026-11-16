@@ -63,6 +63,18 @@ fn clean<T>(section: &ResultSlot<T>) -> bool {
     matches!(section, ResultSlot::Collected { findings, .. } if findings.is_empty())
 }
 
+fn binding_matches(binding: &coordinator::SourceBinding, capture: &CaptureObservation) -> bool {
+    let connector = match binding.connector {
+        coordinator::SourceConnector::Postgres => "postgres",
+        coordinator::SourceConnector::Mysql => "mysql",
+        coordinator::SourceConnector::Spanner => "spanner",
+    };
+    binding.validate().is_ok()
+        && capture.source.engine == connector
+        && capture.position.order_domain() == binding.order_domain
+        && capture.source.stream == binding.stream
+}
+
 pub(super) async fn assemble(
     runtime: &Runtime,
     journal: &Journal,
@@ -75,6 +87,13 @@ pub(super) async fn assemble(
         chunks_done &= state.unfinished_chunks(&plan)?.is_empty();
     }
     let lineage_matches = sample.capture.as_ref().is_some_and(|capture| {
+        if state
+            .source_binding
+            .as_ref()
+            .is_some_and(|binding| !binding_matches(binding, capture))
+        {
+            return false;
+        }
         if capture.source.engine == "postgres" {
             state
                 .progress
@@ -491,6 +510,43 @@ impl Engine {
                 _ = cancelled(&mut cancel) => return Ok(SupervisedStop::Cancelled),
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {},
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn native_readiness_requires_the_saved_connector_domain_stream_and_version() {
+        let binding = coordinator::SourceBinding {
+            version: 1,
+            connector: coordinator::SourceConnector::Mysql,
+            order_domain: "mysql:source/gtid".into(),
+            stream: "binlog".into(),
+        };
+        let capture = CaptureObservation {
+            healthy: true,
+            source: SourceIdentity {
+                engine: "mysql".into(),
+                system_id: "source".into(),
+                lineage: "cluster".into(),
+                db_name: "database".into(),
+                stream: "binlog".into(),
+            },
+            position: Position::new("mysql:source/gtid", b"native"),
+        };
+        assert!(binding_matches(&binding, &capture));
+        for field in ["connector", "domain", "stream", "version"] {
+            let mut wrong = binding.clone();
+            match field {
+                "connector" => wrong.connector = coordinator::SourceConnector::Postgres,
+                "domain" => wrong.order_domain.push_str("-wrong"),
+                "stream" => wrong.stream.push_str("-wrong"),
+                _ => wrong.version = 2,
+            }
+            assert!(!binding_matches(&wrong, &capture), "{field}");
         }
     }
 }

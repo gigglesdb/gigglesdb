@@ -1601,7 +1601,7 @@ async fn delayed_manifest_acknowledgement_completes_without_tick_cancellation() 
         async fn prepare_schema(&mut self, journal: &Journal, runtime: &Runtime) -> Result<()> {
             self.0.prepare_schema(journal, runtime).await
         }
-        fn schema_state(&self) -> Option<source::SchemaState> {
+        fn schema_state(&self) -> Option<SchemaState> {
             self.0.schema_state()
         }
         fn buffered_marker(&self, batch: &Captured) -> Result<String> {
@@ -2044,7 +2044,7 @@ async fn copy_throttle_never_stalls_capture() {
         async fn prepare_schema(&mut self, journal: &Journal, runtime: &Runtime) -> Result<()> {
             self.inner.prepare_schema(journal, runtime).await
         }
-        fn schema_state(&self) -> Option<source::SchemaState> {
+        fn schema_state(&self) -> Option<SchemaState> {
             self.inner.schema_state()
         }
         fn buffered_marker(&self, batch: &Captured) -> Result<String> {
@@ -2641,4 +2641,29 @@ async fn obsolete_buffered_progress_blocks_worker_admission() {
         ));
         assert_eq!(capture.capture.writer().checkpoint().unwrap().next_mseq, 0);
     }
+}
+
+#[tokio::test]
+async fn record_applied_is_journal_durable_before_return() {
+    let f = Fixture::new().await;
+    let txn = AssembledTxn::new(
+        source(),
+        crate::event::TxnId(vec![1]),
+        Position::new("engine-test", 10u64.to_be_bytes()),
+        None,
+        vec![],
+    )
+    .unwrap();
+    let checkpoint = ReaderCheckpoint::default();
+    f.engine
+        .runtime()
+        .record_applied(&txn, 0, &checkpoint)
+        .await
+        .unwrap();
+    let durable = f.journal.load(false).await.unwrap();
+    assert_eq!(
+        decode_reader_checkpoint(&durable.progress["applied"].0).unwrap(),
+        checkpoint
+    );
+    assert_eq!(durable.progress["applied"].1, "0");
 }

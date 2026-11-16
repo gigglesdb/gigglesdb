@@ -23,6 +23,9 @@ fn col(ty: &str) -> ColumnDescriptor {
         }),
         nullable: true,
         generated: false,
+        column_default: None,
+        default_generated: false,
+        generation_expression: None,
     }
 }
 fn round(p: &MysqlPgColumn, v: V) {

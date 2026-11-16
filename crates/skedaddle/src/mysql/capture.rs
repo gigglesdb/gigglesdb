@@ -1,5 +1,5 @@
 //! MySQL engine adapter. No binlog acknowledgement is sent to the source.
-//! TODO(M10): exclude Skedaddle's own apply transactions using their control route.
+//! Receipt-marked single-writer apply transactions are excluded before mapping.
 use super::{
     assembly::{Assembler, AssemblerOutput},
     binlog::{MysqlEvent, PositionedEvent},
@@ -203,6 +203,7 @@ impl MysqlCapture {
         }
         let selected = descriptors.clone();
         descriptors.push(control::descriptor());
+        descriptors.extend(control::apply_descriptors());
         let assembler = Assembler::new(source.clone(), descriptors, start, gtid, max_row_bytes)?;
         Ok(Self {
             descriptors: selected,
@@ -254,6 +255,7 @@ impl MysqlCapture {
         let start = MysqlPosition::decode(self.delivered.bytes())?;
         let mut descriptors = self.descriptors.clone();
         descriptors.push(control::descriptor());
+        descriptors.extend(control::apply_descriptors());
         self.assembler = Assembler::new(
             self.source.clone(),
             descriptors,
@@ -438,17 +440,40 @@ impl MysqlCapture {
             if let Some(output) = self.outputs.pop_front() {
                 match output {
                     AssemblerOutput::Txn { txn, control_rows } => {
-                        let txn = self.mapped(txn)?;
                         let mut watermarks = Vec::new();
-                        for row in control_rows {
-                            if let Some(marker) = control::decode_watermark(&row)? {
-                                watermarks.push(CapturedMarker::Chunk {
-                                    marker,
-                                    commit: txn.commit_position.clone(),
-                                    committed_events: txn.events.clone(),
-                                });
+                        let mut own_apply = false;
+                        let mut apply_control = false;
+                        for row in &control_rows {
+                            if let Some(marker) = control::decode_apply(row)? {
+                                own_apply |= marker;
+                                apply_control = true;
+                            } else if let Some(marker) = control::decode_watermark(row)? {
+                                watermarks.push(marker);
                             }
                         }
+                        // Apply is single-writer: the receipt authenticates the entire
+                        // InnoDB transaction, even if it includes additional tables.
+                        // Validate all controls first, then skip mapping and chunk markers.
+                        if own_apply
+                            || (apply_control && txn.events.is_empty() && watermarks.is_empty())
+                        {
+                            self.safe = txn.commit_position;
+                            self.boundary = None;
+                            self.last_progress = Instant::now();
+                            return Ok(Captured {
+                                durable_position: Some(self.safe.clone()),
+                                ..Default::default()
+                            });
+                        }
+                        let txn = self.mapped(txn)?;
+                        let watermarks = watermarks
+                            .into_iter()
+                            .map(|marker| CapturedMarker::Chunk {
+                                marker,
+                                commit: txn.commit_position.clone(),
+                                committed_events: txn.events.clone(),
+                            })
+                            .collect();
                         self.pending = Some(Captured {
                             durable_position: Some(txn.commit_position.clone()),
                             transaction: Some(txn),

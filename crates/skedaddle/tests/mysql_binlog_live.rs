@@ -102,7 +102,9 @@ async fn transaction(stream: &mut MysqlBinlogStream, gtid: bool, id: i64, execut
         assert!(!event.file.is_empty());
         let event = event.event;
         match event {
-            MysqlEvent::Gtid { sid, sequence, tag } => {
+            MysqlEvent::Gtid {
+                sid, sequence, tag, ..
+            } => {
                 assert!(gtid);
                 assert!(tag.is_none());
                 assert!(sequence > 0);

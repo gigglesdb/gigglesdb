@@ -100,7 +100,7 @@ impl Facts {
                 blocker.remediation = "Allow destination apply to catch up, reduce source write load, and resample fresh source/apply observations.".into();
             }
         }
-        self.schema_jobs.source = "Running source::Capture::schema_state: SchemaVersions::blocker and unclassified/failed DDL state.".into();
+        self.schema_jobs.source = "Running engine::Capture::schema_state: connector schema boundary and unclassified/failed DDL state.".into();
         self.schema_jobs.staleness = "Sampled every 50 ms; expires after 1 second; capture/apply exit revokes immediately. Last blocked boundary is retained for diagnosis.".into();
         self.schema_jobs.blocker = Some(Blocker {
             code: "schema-boundary-pending".into(),
@@ -115,14 +115,7 @@ impl Facts {
             if self.schema_jobs.ready {
                 self.schema_jobs.blocker = None;
             } else if let Some(boundary) = &schema.blocked_boundary {
-                self.schema_jobs.blocker = Some(Blocker {
-                    code: "schema-boundary-pending".into(),
-                    reason: format!(
-                        "DDL boundary at xid {}, schema version {}: {} (capture/apply running: {}).",
-                        boundary.xid, boundary.schema_version, boundary.reason, live.running
-                    ),
-                    remediation: boundary.remediation.into(),
-                });
+                self.schema_jobs.blocker = Some(schema_boundary_blocker(boundary, live.running));
                 self.schema_boundary = self.schema_jobs.blocker.clone();
             } else if schema.unknown_schema_job {
                 self.schema_jobs.blocker.as_mut().expect("blocked schema").reason = "Capture has failed or a DDL transaction has not yet been classified; schema-job state is unknown.".into();
@@ -165,7 +158,7 @@ impl Facts {
             ),
             schema_jobs: missing(
                 "schema-boundary-pending",
-                "Running source::Capture::schema_state observation is unavailable.",
+                "Running engine::Capture::schema_state observation is unavailable.",
                 "No fresh running capture DDL boundary/schema-job observation is available.",
                 "Restore capture from a qualified schema baseline and resample its live classifier state.",
             ),
@@ -182,11 +175,138 @@ impl Facts {
     }
 }
 
+fn schema_boundary_blocker(boundary: &crate::engine::SchemaBoundary, running: bool) -> Blocker {
+    use crate::engine::SchemaBoundary;
+    let (reason, remediation) = match boundary {
+        SchemaBoundary::Postgres(boundary) => (
+            format!(
+                "DDL boundary at xid {}, schema version {}: {} (capture/apply running: {}).",
+                boundary.xid, boundary.schema_version, boundary.reason, running
+            ),
+            boundary.remediation.into(),
+        ),
+        SchemaBoundary::Connector(boundary) => (
+            format!(
+                "{} {:?} schema boundary{} at native position {:?}: {} (capture/apply running: {}).",
+                boundary.connector,
+                boundary.kind,
+                boundary.table.as_ref().map_or(String::new(), |table| format!(" on {table}")),
+                boundary.position,
+                boundary.diagnostic,
+                running
+            ),
+            "Resolve the connector schema boundary and restore capture from a newly qualified schema baseline.".into(),
+        ),
+    };
+    Blocker {
+        code: "schema-boundary-pending".into(),
+        reason,
+        remediation,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{buffer::backends::ObjectBufferStore, definition::LocalFsOptions};
     use std::{path::PathBuf, time::Duration};
+
+    fn schema_live(schema: crate::engine::SchemaState) -> crate::engine::LiveReadinessObservation {
+        crate::engine::LiveReadinessObservation {
+            owner_generation: None,
+            capture: None,
+            lag: None,
+            schema: Some(schema),
+            running: true,
+            schema_fresh: true,
+            blocked: None,
+            retention: None,
+        }
+    }
+
+    #[test]
+    fn pg_schema_diagnostic_and_readiness_decisions_golden() {
+        use crate::engine::{SchemaBoundary, SchemaState};
+        let mut live = schema_live(SchemaState {
+            blocked_boundary: None,
+            unknown_schema_job: false,
+        });
+        let mut facts = Facts::sample(None, None);
+        facts.compose_live(None, &live);
+        assert!(facts.schema_jobs.ready && facts.schema_jobs.blocker.is_none());
+        live.schema.as_mut().unwrap().unknown_schema_job = true;
+        facts.compose_live(None, &live);
+        assert!(!facts.schema_jobs.ready);
+        assert_eq!(
+            facts.schema_jobs.blocker.as_ref().unwrap().reason,
+            "Capture has failed or a DDL transaction has not yet been classified; schema-job state is unknown."
+        );
+        live.schema.as_mut().unwrap().blocked_boundary =
+            Some(SchemaBoundary::Postgres(crate::pg::ddl::SafeBoundaryStop {
+                xid: "40".into(),
+                schema_version: 1,
+                reason: "ALTER TABLE widgets".into(),
+                remediation: "Requalify the schema baseline.",
+                capture_continues: true,
+                stop_apply_before_transaction: true,
+                readiness_blocked: true,
+            }));
+        for running in [true, false] {
+            live.running = running;
+            facts.compose_live(None, &live);
+            assert!(!facts.schema_jobs.ready);
+            let blocker = facts.schema_boundary.as_ref().unwrap();
+            assert_eq!(blocker.code, "schema-boundary-pending");
+            assert_eq!(
+                blocker.reason,
+                format!(
+                    "DDL boundary at xid 40, schema version 1: ALTER TABLE widgets (capture/apply running: {running})."
+                )
+            );
+            assert_eq!(blocker.remediation, "Requalify the schema baseline.");
+        }
+        live.running = true;
+        live.schema.as_mut().unwrap().blocked_boundary = None;
+        live.schema.as_mut().unwrap().unknown_schema_job = false;
+        live.schema_fresh = false;
+        facts.compose_live(None, &live);
+        assert!(!facts.schema_jobs.ready && facts.schema_boundary.is_none());
+    }
+
+    #[test]
+    fn connector_schema_diagnostic_uses_native_boundary_without_pg_metadata() {
+        use crate::engine::{ConnectorSchemaStop, SchemaBoundary, SchemaState, SchemaStopKind};
+        for (kind, table) in [
+            (SchemaStopKind::Ddl, Some("source.widgets")),
+            (SchemaStopKind::UnknownDdl, None),
+            (SchemaStopKind::TableMapChanged, Some("source.widgets")),
+        ] {
+            let boundary = SchemaBoundary::Connector(ConnectorSchemaStop {
+                connector: "mysql".into(),
+                kind,
+                table: table.map(str::to_owned),
+                diagnostic: "source schema changed".into(),
+                position: crate::event::Position::new("mysql-native", [4, 5]),
+            });
+            let live = schema_live(SchemaState {
+                blocked_boundary: Some(boundary),
+                unknown_schema_job: false,
+            });
+            let mut facts = Facts::sample(None, None);
+            facts.compose_live(None, &live);
+            assert!(!facts.schema_jobs.ready);
+            let blocker = facts.schema_boundary.unwrap();
+            assert_eq!(blocker.code, "schema-boundary-pending");
+            assert_eq!(
+                blocker.reason,
+                format!(
+                    "mysql {kind:?} schema boundary{} at native position Position {{ order_domain: \"mysql-native\", bytes: [4, 5] }}: source schema changed (capture/apply running: true).",
+                    table.map_or(String::new(), |table| format!(" on {table}"))
+                )
+            );
+            assert!(!blocker.remediation.is_empty());
+        }
+    }
 
     fn local() -> (MigrationDefinition, ObjectBufferStore) {
         let root = PathBuf::from(

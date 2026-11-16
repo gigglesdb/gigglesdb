@@ -19,6 +19,7 @@ mod readiness;
 mod reverse_capabilities;
 mod selection;
 mod verification;
+pub use crate::coordinator::{SourceBinding, SourceBindingError, SourceConnector};
 pub use cutover::{
     CutoverError, CutoverErrorKind, CutoverOutcome, CutoverReason, StepTiming, request_cutover,
 };

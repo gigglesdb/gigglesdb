@@ -42,9 +42,15 @@ enum ExclusionBackend<'a> {
     File(&'a Path),
 }
 fn migration_exclusion(
+    binding: &SourceBinding,
     backend: ExclusionBackend<'_>,
 ) -> coordinator::Result<Arc<coordinator::exclusion::MigrationExclusion>> {
     use coordinator::exclusion::MigrationExclusion;
+    if binding.connector != SourceConnector::Postgres {
+        return Err(coordinator::Error::SourceBinding(
+            SourceBindingError::ExclusionUnsupported(binding.connector),
+        ));
+    }
     match backend {
         ExclusionBackend::Source(config, policy) => {
             Ok(MigrationExclusion::postgres(config.clone(), *policy))
@@ -95,17 +101,127 @@ impl PositionOrder for Order {
         Ok(a.cmp(b))
     }
 }
-fn reader_config(id: &str) -> ReaderConfig {
-    ReaderConfig {
-        prefix: PREFIX.into(),
-        migration_id: id.into(),
-        stream: format!("skedaddle-{id}-wal"),
-        limits: format::Limits::default(),
-        required_next_mseq: 0,
+impl SourceBinding {
+    /// Until connector startup supplies an observed native boundary, non-PG
+    /// selections are journal-only and stop before constructing any adapter.
+    pub fn for_definition(id: &str, definition: &MigrationDefinition) -> coordinator::Result<Self> {
+        let connector = SourceConnector::from_engine(definition.source.engine)?;
+        let (order_domain, stream) =
+            match connector {
+                SourceConnector::Postgres => (
+                    format!("skedaddle-postgres:{id}"),
+                    format!("skedaddle_{id}"),
+                ),
+                SourceConnector::Mysql => (
+                    crate::mysql::position::MysqlOrder::gtid(id)
+                        .map_err(recovery)?
+                        .domain()
+                        .into(),
+                    format!("skedaddle-{id}-binlog"),
+                ),
+                SourceConnector::Spanner => {
+                    let endpoint = definition.source.spanner.as_ref().ok_or(
+                        coordinator::Error::SourceBinding(SourceBindingError::Invalid),
+                    )?;
+                    let order = crate::spanner::frontier::SpannerOrder::new(
+                        &endpoint.project,
+                        &endpoint.instance,
+                        &endpoint.database,
+                        &endpoint.change_stream,
+                        0,
+                    )
+                    .map_err(recovery)?;
+                    (order.domain().into(), endpoint.change_stream.clone())
+                }
+            };
+        let binding = Self {
+            version: 1,
+            connector,
+            order_domain,
+            stream,
+        };
+        binding.validate()?;
+        Ok(binding)
     }
-}
-fn order(id: &str) -> Arc<dyn PositionOrder + Send + Sync> {
-    Arc::new(Order(format!("skedaddle-postgres:{id}")))
+    fn reader_config(&self, id: &str) -> ReaderConfig {
+        ReaderConfig {
+            prefix: PREFIX.into(),
+            migration_id: id.into(),
+            stream: if self.connector == SourceConnector::Postgres {
+                format!("skedaddle-{id}-wal")
+            } else {
+                self.stream.clone()
+            },
+            limits: format::Limits::default(),
+            required_next_mseq: 0,
+        }
+    }
+    fn position_order(
+        &self,
+        id: &str,
+        definition: &MigrationDefinition,
+    ) -> coordinator::Result<Arc<dyn PositionOrder + Send + Sync>> {
+        self.require_same(&Self::for_definition(id, definition)?)?;
+        Ok(match self.connector {
+            SourceConnector::Postgres => Arc::new(Order(self.order_domain.clone())),
+            SourceConnector::Mysql => {
+                Arc::new(crate::mysql::position::MysqlOrder::gtid(id).map_err(recovery)?)
+            }
+            SourceConnector::Spanner => {
+                let e =
+                    definition
+                        .source
+                        .spanner
+                        .as_ref()
+                        .ok_or(coordinator::Error::SourceBinding(
+                            SourceBindingError::Invalid,
+                        ))?;
+                Arc::new(
+                    crate::spanner::frontier::SpannerOrder::new(
+                        &e.project,
+                        &e.instance,
+                        &e.database,
+                        &e.change_stream,
+                        0,
+                    )
+                    .map_err(recovery)?,
+                )
+            }
+        })
+    }
+    fn validate_state(&self, id: &str, state: &Materialized) -> coordinator::Result<()> {
+        self.validate()?;
+        if let Some(definition) = &state.definition {
+            self.require_same(&Self::for_definition(id, definition)?)?;
+        }
+        if let Some(saved) = &state.source_binding {
+            self.require_same(saved)?;
+        } else if self.connector != SourceConnector::Postgres
+            && (!state.progress.is_empty()
+                || !state.intent_roots.is_empty()
+                || !state.chunk_plans.is_empty())
+        {
+            return Err(coordinator::Error::SourceBinding(
+                SourceBindingError::Missing,
+            ));
+        }
+        Ok(())
+    }
+    fn postgres_checkpoint(
+        &self,
+        state: &Materialized,
+    ) -> coordinator::Result<Option<crate::pg::replication::Checkpoint>> {
+        if self.connector != SourceConnector::Postgres {
+            return Err(coordinator::Error::SourceBinding(
+                SourceBindingError::NotWired(self.connector),
+            ));
+        }
+        state
+            .progress
+            .get("source-slot")
+            .map(|(marker, _)| engine::decode_source_checkpoint(marker))
+            .transpose()
+    }
 }
 pub(super) fn buffer(
     definition: &MigrationDefinition,
@@ -136,19 +252,74 @@ pub async fn open_journal(root: &Path, id: &str) -> coordinator::Result<Journal>
         id,
         Duration::from_secs(30),
     )?;
-    if raw.load(true).await.is_ok() {
-        return Ok(raw);
+    match raw.load(true).await {
+        Ok(state) => {
+            if let Some(definition) = &state.definition {
+                SourceBinding::for_definition(id, definition)?.validate_state(id, &state)?;
+            }
+            return Ok(raw);
+        }
+        Err(error @ coordinator::Error::SourceBinding(_)) => return Err(error),
+        Err(_) => {}
     }
     let entries = raw.history_page(0, 128).await?;
     if let Some(definition) = entries.iter().find_map(|e| match &e.transition {
         coordinator::Transition::Define { definition } => Some(definition),
         _ => None,
     }) {
+        let binding = SourceBinding::for_definition(id, definition)?;
         let store = buffer(definition, false)?;
-        return Ok(raw.with_chunk_buffer(store, reader_config(id), order(id)));
+        let journal = raw.with_chunk_buffer(
+            store,
+            binding.reader_config(id),
+            binding.position_order(id, definition)?,
+        );
+        binding.validate_state(id, &journal.load(true).await?)?;
+        return Ok(journal);
     }
     // Retain the journal's original integrity diagnostic on the caller's load.
     Ok(raw)
+}
+
+/// Journal metadata uses create-only ownership CAS; no source exclusion or
+/// endpoint is acquired here. A connector authority is mandatory before effects.
+async fn record_unwired_binding(
+    root: &Path,
+    id: &str,
+    binding: &SourceBinding,
+) -> coordinator::Result<()> {
+    let journal = open_journal(root, id).await?;
+    let state = journal.load(true).await?;
+    binding.validate_state(id, &state)?;
+    if state.definition.is_none() {
+        return Err(coordinator::Error::SourceBinding(
+            SourceBindingError::Missing,
+        ));
+    }
+    if state.source_binding.is_none() {
+        let path = root.join(format!("{id}.local"));
+        let local = if path.exists() {
+            Local::open_journal(&path, &journal).await?
+        } else {
+            let mut local = Local::create(&path)?;
+            local.replay_journal(&journal).await?;
+            local
+        };
+        let mut coordinator =
+            Coordinator::observer(journal, local, format!("runner-{}", std::process::id()))?;
+        coordinator.acquire().await?;
+        binding.validate_state(id, coordinator.state())?;
+        if coordinator.state().source_binding.is_none() {
+            coordinator
+                .commit(coordinator::Transition::SourceBindingV1 {
+                    binding: binding.clone(),
+                })
+                .await?;
+        }
+    }
+    Err(coordinator::Error::SourceBinding(
+        SourceBindingError::NotWired(binding.connector),
+    ))
 }
 
 pub(super) struct Resolver(pub Vec<catalog::TableCatalog>);
@@ -299,16 +470,16 @@ pub fn run(
     mut pause: watch::Receiver<bool>,
 ) -> impl std::future::Future<Output = Result<Reached, RunError>> {
     Box::pin(async move {
-        if definition.source.engine == Engine::Mysql {
-            return Err(RunError::Preparation(failure(
-                FailureKind::NotWired,
-                "MySQL source runtime not wired yet",
-                "Run live MySQL preflight; wait for the qualified forward runtime before start/resume.",
-            )));
+        let binding = SourceBinding::for_definition(id, definition)?;
+        let initial = open_journal(root, id).await?.load(true).await?;
+        binding.validate_state(id, &initial)?;
+        if binding.connector != SourceConnector::Postgres {
+            record_unwired_binding(root, id, &binding).await?;
         }
         // Terminal replay is authenticated before connections or copy workers start.
         if resume {
             let terminal = open_journal(root, id).await?.load(true).await?;
+            binding.validate_state(id, &terminal)?;
             if terminal.lifecycle.state.is_terminal() {
                 return Ok(Reached {
                     state: terminal.lifecycle.state,
@@ -350,8 +521,8 @@ pub fn run(
         let repl = replication(&prepared.source_config)?;
         let connection = Box::pin(source::connect(&repl)).await.map_err(recovery)?;
         let store = buffer(definition, true)?;
-        let config = reader_config(id);
-        let order = order(id);
+        let config = binding.reader_config(id);
+        let order = binding.position_order(id, definition)?;
         let journal_objects = Arc::new(coordinator::journal::local_store(root)?);
         let raw = Journal::new(
             journal_objects.clone(),
@@ -368,10 +539,10 @@ pub fn run(
             local.replay_journal(&journal).await?;
             local
         };
-        let exclusion = migration_exclusion(ExclusionBackend::Source(
-            &prepared.source_config,
-            &definition.source.tls,
-        ))?;
+        let exclusion = migration_exclusion(
+            &binding,
+            ExclusionBackend::Source(&prepared.source_config, &definition.source.tls),
+        )?;
         let mut coordinator = operational_coordinator(journal.clone(), local, exclusion.clone())?;
         coordinator.acquire().await?;
         let holder = Arc::new(Mutex::new(coordinator));
@@ -386,11 +557,8 @@ pub fn run(
             .into_inner();
         let state = coordinator.state().clone();
         let reader_checkpoint = restart_reader_checkpoint(&state, reader_checkpoint)?;
-        let checkpoint = state
-            .progress
-            .get("source-slot")
-            .map(|(m, _)| engine::decode_source_checkpoint(m))
-            .transpose()?;
+        binding.validate_state(id, &state)?;
+        let checkpoint = binding.postgres_checkpoint(&state)?;
         if resume && checkpoint.is_none() {
             return Err(recovery("resume requires saved slot checkpoint").into());
         }
@@ -454,7 +622,7 @@ pub fn run(
             )
             .await?;
         let publication = format!("skedaddle_{id}");
-        let slot = format!("skedaddle_{id}");
+        let slot = binding.stream.clone();
         let mut installer = PgInstaller {
             schema_tables: engine.runtime().scoped_schema_tables().await?,
             schema_baseline: engine
@@ -921,7 +1089,14 @@ mod exclusion_tests {
         let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task test root"))
             .join(format!("runner-exclusion-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        let exclusion = migration_exclusion(ExclusionBackend::File(&root.join("locks"))).unwrap();
+        let binding = SourceBinding {
+            version: 1,
+            connector: SourceConnector::Postgres,
+            order_domain: "pg-test".into(),
+            stream: "slot".into(),
+        };
+        let exclusion =
+            migration_exclusion(&binding, ExclusionBackend::File(&root.join("locks"))).unwrap();
         let journal = Journal::new(
             Arc::new(coordinator::journal::local_store(&root).unwrap()),
             "runner",
@@ -951,5 +1126,411 @@ mod exclusion_tests {
         }
         let guard = coordinator.exclusive().await.unwrap();
         assert_eq!(guard.owner().unwrap().1, 1);
+    }
+
+    fn binding_definition() -> MigrationDefinition {
+        let readme = include_str!("../../README.md");
+        serde_json::from_str(
+            readme
+                .split("```json")
+                .nth(1)
+                .unwrap()
+                .split("```")
+                .next()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    fn binding_root() -> PathBuf {
+        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task test root"))
+            .join(format!("runtime-binding-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    async fn defined_journal(
+        root: &Path,
+        id: &str,
+        definition: MigrationDefinition,
+    ) -> Coordinator {
+        let journal = Journal::new(
+            Arc::new(coordinator::journal::local_store(root).unwrap()),
+            "skedaddle",
+            id,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let mut owner = Coordinator::observer(
+            journal,
+            Local::create(root.join("seed-local")).unwrap(),
+            "binding-test",
+        )
+        .unwrap();
+        owner.acquire().await.unwrap();
+        owner
+            .commit(coordinator::Transition::Define {
+                definition: Box::new(definition),
+            })
+            .await
+            .unwrap();
+        owner
+    }
+    fn assert_binding_error<T>(result: coordinator::Result<T>, expected: SourceBindingError) {
+        match result {
+            Err(coordinator::Error::SourceBinding(error)) => assert_eq!(error, expected),
+            Err(error) => panic!("unexpected error: {error}"),
+            Ok(_) => panic!("expected binding rejection"),
+        }
+    }
+    #[test]
+    fn postgres_binding_preserves_startup_and_journal_golden_bytes() {
+        let definition = binding_definition();
+        let binding = SourceBinding::for_definition("golden", &definition).unwrap();
+        assert_eq!(binding.connector, SourceConnector::Postgres);
+        assert_eq!(binding.stream, "skedaddle_golden");
+        assert_eq!(
+            binding.reader_config("golden").stream,
+            "skedaddle-golden-wal"
+        );
+        let order = binding.position_order("golden", &definition).unwrap();
+        assert_eq!(order.domain(), "skedaddle-postgres:golden");
+        assert_eq!(
+            order
+                .compare(&1u64.to_be_bytes(), &256u64.to_be_bytes())
+                .unwrap(),
+            Ordering::Less
+        );
+        assert!(order.compare(b"not an LSN", b"bad").is_err());
+        let checkpoint = crate::pg::replication::Checkpoint {
+            lineage: crate::pg::replication::Lineage {
+                system_id: 42,
+                timeline: 3,
+                xlogpos: 256,
+                database: "db".into(),
+            },
+            slot: binding.stream.clone(),
+            durable_lsn: 256,
+        };
+        let marker = engine::encode_source_checkpoint(&checkpoint).unwrap();
+        assert_eq!(
+            marker,
+            r#"{"system_id":42,"timeline":3,"database":"db","slot":"skedaddle_golden","durable_lsn":256}"#
+        );
+        let transition = coordinator::Transition::Progress {
+            stream: "source-slot".into(),
+            marker: marker.clone(),
+            position: "installed".into(),
+        };
+        let golden = r#"{"version":3,"seq":7,"epoch":2,"prev_digest":"abc","transition":{"kind":"progress","stream":"source-slot","marker":"{\"system_id\":42,\"timeline\":3,\"database\":\"db\",\"slot\":\"skedaddle_golden\",\"durable_lsn\":256}","position":"installed"},"at":1234,"coordinator_instance":"runner-golden","digest":"07c70bd2c6f60c799e4458db3f769ead19eef7e3270202d412232911a40e64e3"}"#;
+        let entry: coordinator::journal::Entry = serde_json::from_str(golden).unwrap();
+        entry.validate().unwrap();
+        assert_eq!(entry.transition, transition);
+        assert_eq!(serde_json::to_string(&entry).unwrap(), golden);
+        let mut state = Materialized::default();
+        state
+            .progress
+            .insert("source-slot".into(), (marker, "installed".into()));
+        assert_eq!(
+            binding.postgres_checkpoint(&state).unwrap().unwrap(),
+            checkpoint
+        );
+        assert!(
+            !serde_json::to_string(&state)
+                .unwrap()
+                .contains("source_binding")
+        );
+    }
+    #[tokio::test]
+    async fn mysql_run_journals_binding_before_not_wired_and_reopens_without_effects() {
+        let root = binding_root();
+        let mut definition = binding_definition();
+        definition.source = serde_json::from_value(serde_json::json!({
+            "engine": "mysql", "version": "8.4", "tls_ca_ref": "env:MYSQL_CA",
+            "mysql": { "host": "localhost", "port": 3306, "user": "env:MYSQL_USER",
+                "password": "env:MYSQL_PASSWORD", "gtid_mode": "ON" }
+        }))
+        .unwrap();
+        let binding = SourceBinding::for_definition("mysql", &definition).unwrap();
+        let owner = defined_journal(&root, "mysql", definition.clone()).await;
+        drop(owner);
+        for resume in [false, true] {
+            let (_send, pause) = watch::channel(false);
+            let result = run(
+                &root,
+                "mysql",
+                &definition,
+                resume,
+                StopAt::CatchingUp,
+                pause,
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(RunError::Engine(coordinator::Error::SourceBinding(
+                    SourceBindingError::NotWired(SourceConnector::Mysql)
+                )))
+            ));
+        }
+        let journal = open_journal(&root, "mysql").await.unwrap();
+        let state = journal.load(false).await.unwrap();
+        assert_eq!(state.source_binding.as_ref(), Some(&binding));
+        assert_eq!(state.lifecycle.state, State::Defined);
+        assert!(state.progress.is_empty());
+        assert!(state.intent_roots.is_empty());
+        let entries = journal.history_page(0, 128).await.unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| matches!(
+                    e.transition,
+                    coordinator::Transition::SourceBindingV1 { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e.transition, coordinator::Transition::Intent { .. }))
+        );
+        let record = serde_json::to_value(&entries.last().unwrap().transition).unwrap();
+        assert_eq!(record["kind"], "skedaddle-source-binding-v1");
+        journal.checkpoint(&state).await.unwrap();
+        assert_eq!(
+            open_journal(&root, "mysql")
+                .await
+                .unwrap()
+                .load(true)
+                .await
+                .unwrap(),
+            state
+        );
+        let order = binding.position_order("mysql", &definition).unwrap();
+        assert_eq!(order.domain(), "mysql:mysql/gtid");
+        // Even a valid legacy PG marker must never select a PG decoder for MySQL.
+        assert_binding_error(
+            binding.postgres_checkpoint(&state),
+            SourceBindingError::NotWired(SourceConnector::Mysql),
+        );
+        definition.source.engine = Engine::Postgresql;
+        for resume in [false, true] {
+            let (_send, pause) = watch::channel(false);
+            assert!(matches!(
+                run(
+                    &root,
+                    "mysql",
+                    &definition,
+                    resume,
+                    StopAt::CatchingUp,
+                    pause
+                )
+                .await,
+                Err(RunError::Engine(coordinator::Error::SourceBinding(
+                    SourceBindingError::Connector
+                )))
+            ));
+        }
+    }
+    #[tokio::test]
+    async fn reopen_rejects_changed_order_domain_or_stream_in_startup_record() {
+        for (field, expected) in [
+            ("domain", SourceBindingError::OrderDomain),
+            ("stream", SourceBindingError::Stream),
+        ] {
+            let root = binding_root();
+            let mut definition = binding_definition();
+            definition.source = serde_json::from_value(serde_json::json!({
+                "engine": "mysql", "version": "8.4", "tls_ca_ref": "env:MYSQL_CA",
+                "mysql": { "host": "localhost", "port": 3306, "user": "env:MYSQL_USER",
+                    "password": "env:MYSQL_PASSWORD", "gtid_mode": "ON" }
+            }))
+            .unwrap();
+            let mut binding = SourceBinding::for_definition("mysql", &definition).unwrap();
+            if field == "domain" {
+                binding.order_domain.push_str("-different");
+            } else {
+                binding.stream.push_str("-different");
+            }
+            let mut owner = defined_journal(&root, "mysql", definition).await;
+            owner
+                .commit(coordinator::Transition::SourceBindingV1 { binding })
+                .await
+                .unwrap();
+            assert_binding_error(open_journal(&root, "mysql").await, expected);
+        }
+    }
+    #[tokio::test]
+    async fn binding_record_rejects_wrong_connector_unknown_version_replacement_and_late_startup() {
+        let root = binding_root();
+        let mut definition = binding_definition();
+        definition.source = serde_json::from_value(serde_json::json!({
+            "engine": "mysql", "version": "8.4", "tls_ca_ref": "env:MYSQL_CA",
+            "mysql": { "host": "localhost", "port": 3306, "user": "env:MYSQL_USER",
+                "password": "env:MYSQL_PASSWORD", "gtid_mode": "ON" }
+        }))
+        .unwrap();
+        let binding = SourceBinding::for_definition("mysql", &definition).unwrap();
+        let mut owner = defined_journal(&root, "mysql", definition).await;
+        assert_binding_error(
+            owner
+                .effect(
+                    EffectKind::BufferPublication,
+                    "must-not-run".into(),
+                    |_| async { Ok(()) },
+                )
+                .await,
+            SourceBindingError::Missing,
+        );
+        for (mut changed, expected) in [
+            (binding.clone(), SourceBindingError::Connector),
+            (binding.clone(), SourceBindingError::Version(2)),
+        ] {
+            match expected {
+                SourceBindingError::Connector => changed.connector = SourceConnector::Spanner,
+                _ => changed.version = 2,
+            }
+            assert_binding_error(
+                owner
+                    .commit(coordinator::Transition::SourceBindingV1 { binding: changed })
+                    .await,
+                expected,
+            );
+        }
+        owner
+            .commit(coordinator::Transition::SourceBindingV1 {
+                binding: binding.clone(),
+            })
+            .await
+            .unwrap();
+        let mut changed = binding.clone();
+        changed.stream.push_str("-other");
+        assert_binding_error(
+            owner
+                .commit(coordinator::Transition::SourceBindingV1 { binding: changed })
+                .await,
+            SourceBindingError::Stream,
+        );
+        assert_binding_error(
+            owner
+                .commit(coordinator::Transition::SourceBindingV1 { binding })
+                .await,
+            SourceBindingError::Invalid,
+        );
+        let root = binding_root();
+        let mut definition = binding_definition();
+        definition.source = serde_json::from_value(serde_json::json!({
+            "engine": "mysql", "version": "8.4", "tls_ca_ref": "env:MYSQL_CA",
+            "mysql": { "host": "localhost", "port": 3306, "user": "env:MYSQL_USER",
+                "password": "env:MYSQL_PASSWORD", "gtid_mode": "ON" }
+        }))
+        .unwrap();
+        let binding = SourceBinding::for_definition("mysql", &definition).unwrap();
+        let mut owner = defined_journal(&root, "mysql", definition).await;
+        owner
+            .commit(coordinator::Transition::Progress {
+                stream: "source-slot".into(),
+                marker: "legacy-PG".into(),
+                position: "installed".into(),
+            })
+            .await
+            .unwrap();
+        assert_binding_error(
+            owner
+                .commit(coordinator::Transition::SourceBindingV1 { binding })
+                .await,
+            SourceBindingError::Missing,
+        );
+        assert_binding_error(
+            open_journal(&root, "mysql").await,
+            SourceBindingError::Missing,
+        );
+    }
+    #[test]
+    fn non_postgres_authority_is_explicitly_unsupported_and_spanner_has_its_native_order() {
+        let root = binding_root();
+        let mut definition = binding_definition();
+        definition.source = serde_json::from_value(serde_json::json!({
+            "engine": "mysql", "version": "8.4", "tls_ca_ref": "env:MYSQL_CA",
+            "mysql": { "host": "localhost", "port": 3306, "user": "env:MYSQL_USER",
+                "password": "env:MYSQL_PASSWORD", "gtid_mode": "ON" }
+        }))
+        .unwrap();
+        let binding = SourceBinding::for_definition("mysql", &definition).unwrap();
+        assert_binding_error(
+            migration_exclusion(&binding, ExclusionBackend::File(&root.join("locks"))),
+            SourceBindingError::ExclusionUnsupported(SourceConnector::Mysql),
+        );
+        definition.source.engine = Engine::Spanner;
+        definition.source.spanner = Some(crate::definition::SpannerEndpoint {
+            project: "project".into(),
+            instance: "instance".into(),
+            database: "database".into(),
+            dialect: crate::definition::SpannerDialect::GoogleSql,
+            change_stream: "changes".into(),
+            credentials: crate::definition::SecretRef::parse("env:SPANNER_BINDING_TEST").unwrap(),
+            emulator: true,
+        });
+        let binding = SourceBinding::for_definition("spanner", &definition).unwrap();
+        assert_eq!(binding.stream, "changes");
+        assert_eq!(
+            binding
+                .position_order("spanner", &definition)
+                .unwrap()
+                .domain(),
+            "spanner:project/instance/database/changes/0"
+        );
+        assert_binding_error(
+            migration_exclusion(&binding, ExclusionBackend::File(&root.join("locks"))),
+            SourceBindingError::ExclusionUnsupported(SourceConnector::Spanner),
+        );
+    }
+    #[tokio::test]
+    async fn reopening_invalid_persisted_connector_or_version_keeps_the_typed_error() {
+        for (expected, checkpoint) in [
+            SourceBindingError::Connector,
+            SourceBindingError::Version(9),
+        ]
+        .into_iter()
+        .flat_map(|error| [false, true].map(move |checkpoint| (error.clone(), checkpoint)))
+        {
+            let root = binding_root();
+            let mut definition = binding_definition();
+            definition.source = serde_json::from_value(serde_json::json!({
+                "engine": "mysql", "version": "8.4", "tls_ca_ref": "env:MYSQL_CA",
+                "mysql": { "host": "localhost", "port": 3306, "user": "env:MYSQL_USER",
+                    "password": "env:MYSQL_PASSWORD", "gtid_mode": "ON" }
+            }))
+            .unwrap();
+            let mut binding = SourceBinding::for_definition("mysql", &definition).unwrap();
+            let owner = defined_journal(&root, "mysql", definition).await;
+            match expected {
+                SourceBindingError::Connector => binding.connector = SourceConnector::Postgres,
+                _ => binding.version = 9,
+            }
+            let entry = coordinator::journal::Entry::new(
+                owner.state(),
+                coordinator::Transition::SourceBindingV1 { binding },
+                owner.instance_id(),
+            )
+            .unwrap();
+            let journal = Journal::new(
+                Arc::new(coordinator::journal::local_store(&root).unwrap()),
+                "skedaddle",
+                "mysql",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_binding_error(journal.put(&entry).await, expected.clone());
+            if checkpoint {
+                journal.checkpoint(owner.state()).await.unwrap();
+            }
+            // Real corrupt journal evidence: simulate an otherwise correctly hashed
+            // entry from an incompatible writer, bypassing publication admission.
+            std::fs::write(
+                root.join(journal.entry_key(entry.seq).as_ref()),
+                serde_json::to_vec(&entry).unwrap(),
+            )
+            .unwrap();
+            assert_binding_error(open_journal(&root, "mysql").await, expected);
+        }
     }
 }

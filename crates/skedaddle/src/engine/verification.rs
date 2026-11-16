@@ -30,6 +30,42 @@ const MAX_OBSERVERS: usize = 64;
 #[path = "verification_tests.rs"]
 mod tests;
 
+/// Versioned identity emitted by a native connector in a committed transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeVerificationMarker {
+    pub version: u32,
+    pub token: Uuid,
+}
+
+/// Dedicated idle/autocommit source session. Emission alone proves no progress.
+#[async_trait]
+pub trait VerificationEmitter: Send + Sync {
+    async fn emit(&self, marker: &NativeVerificationMarker) -> verify::Result<()>;
+}
+
+/// Connector-qualified key metadata, supplied by its catalog qualification.
+/// Validation must reject wrong arity, NULLs, and values outside qualified types.
+pub trait VerificationKey: Send + Sync {
+    fn table(&self) -> &str;
+    fn columns(&self) -> Vec<&str>;
+    fn validate(&self) -> verify::Result<()>;
+    fn validate_key(&self, key: &[Value]) -> verify::Result<()>;
+}
+impl VerificationKey for TableKey {
+    fn table(&self) -> &str {
+        &self.table
+    }
+    fn columns(&self) -> Vec<&str> {
+        self.columns.iter().map(|c| c.name.as_str()).collect()
+    }
+    fn validate(&self) -> verify::Result<()> {
+        TableKey::validate(self).map_err(|_| VerifyError::Invalid("unqualified verification key"))
+    }
+    fn validate_key(&self, key: &[Value]) -> verify::Result<()> {
+        TableKey::validate_key(self, key).map_err(|_| VerifyError::Invalid("verification key"))
+    }
+}
+
 /// Hard bounds on each armed interval, including keys outside the range in the
 /// same table. max_bytes bounds canonical key payloads/identities plus a fixed
 /// per-entry charge; it is not a measurement of allocator-resident heap bytes.
@@ -71,12 +107,13 @@ struct State {
 
 struct Armed {
     range: RangePlan,
-    table: Arc<TableKey>,
+    table: Arc<dyn VerificationKey>,
     limits: VerificationLimits,
     keys: BTreeMap<Vec<u8>, Key>,
     bytes: usize,
     failure: Option<ArmFailure>,
     marker: Watermark,
+    native: Option<NativeVerificationMarker>,
     through: Option<Position>,
 }
 
@@ -219,6 +256,13 @@ impl State {
 }
 
 impl Hub {
+    fn invalidate_continuity(&self) {
+        let mut state = self.state.lock().expect("verification state poisoned");
+        state.invalidate(EvidenceInvalidation::Reconnected);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
     pub(super) fn begin(&self, source: SourceIdentity, order: verify::SourcePositionOrder) {
         let mut state = self.state.lock().expect("verification state poisoned");
         let generation = state
@@ -296,6 +340,37 @@ impl Hub {
             }
         }
         for watermark in &batch.watermarks {
+            if let super::CapturedMarker::Verification {
+                marker,
+                commit,
+                transaction,
+                committed_events,
+            } = watermark
+            {
+                for arm in state.arms.values_mut() {
+                    if arm.failure.is_some()
+                        || arm.through.is_some()
+                        || arm.native.as_ref() != Some(marker)
+                    {
+                        continue;
+                    }
+                    let authenticated = marker.version == 1
+                        && batch.transaction.as_ref().is_some_and(|txn| {
+                            txn.source == binding.source
+                                && txn.txn == *transaction
+                                && txn.commit_position == *commit
+                                && commit.order_domain() == binding.domain
+                                && txn.events == *committed_events
+                                && txn.events.iter().all(|event| event.txn == *transaction)
+                        });
+                    if authenticated {
+                        arm.through = Some(commit.clone());
+                    } else {
+                        arm.failure = Some(ArmFailure::Invalid(EvidenceInvalidation::CaptureGap));
+                    }
+                }
+                continue;
+            }
             let super::CapturedMarker::Pg(watermark) = watermark else {
                 continue;
             };
@@ -303,7 +378,10 @@ impl Hub {
                 if arm.failure.is_some() || arm.through.is_some() {
                     continue;
                 }
-                if Watermark::parse(&watermark.message()).is_ok_and(|marker| marker == arm.marker) {
+                if arm.native.is_none()
+                    && Watermark::parse(&watermark.message())
+                        .is_ok_and(|marker| marker == arm.marker)
+                {
                     let authenticated = batch.transaction.as_ref().is_some_and(|txn| {
                         txn.source == binding.source
                             && txn.commit_position.order_domain() == binding.domain
@@ -377,13 +455,13 @@ impl Hub {
 impl Armed {
     fn observe_event(&mut self, event: &Event) {
         if let EventKind::Truncate { relations, .. } = &event.kind {
-            if relations.contains(&self.table.table) {
+            if relations.iter().any(|table| table == self.table.table()) {
                 self.failure = Some(ArmFailure::Invalid(EvidenceInvalidation::CaptureGap));
                 self.keys.clear();
             }
             return;
         }
-        if event.table.as_deref() != Some(&self.table.table)
+        if event.table.as_deref() != Some(self.table.table())
             || !matches!(
                 event.kind,
                 EventKind::Insert | EventKind::Update | EventKind::Delete
@@ -411,12 +489,12 @@ impl Armed {
         if self.failure.is_some() {
             return;
         }
-        let mut key = Vec::with_capacity(self.table.columns.len());
+        let mut key = Vec::with_capacity(self.table.columns().len());
         let mut bytes_used = 0_usize;
-        for column in &self.table.columns {
+        for column in self.table.columns() {
             let Some(value) = overlay
-                .and_then(|row| row.get(&column.name))
-                .or_else(|| base.get(&column.name))
+                .and_then(|row| row.get(column))
+                .or_else(|| base.get(column))
             else {
                 self.failure = Some(ArmFailure::Invalid(EvidenceInvalidation::CaptureGap));
                 return;
@@ -477,8 +555,9 @@ impl Armed {
 pub struct PgChangeEvidence<O> {
     hub: Arc<Hub>,
     binding: Binding,
-    admin: Arc<Client>,
-    table: Arc<TableKey>,
+    admin: Option<Arc<Client>>,
+    emitter: Option<Arc<dyn VerificationEmitter>>,
+    table: Arc<dyn VerificationKey>,
     order: O,
     limits: VerificationLimits,
     armed: Option<Uuid>,
@@ -510,12 +589,30 @@ impl Drop for DisarmOnExit {
     }
 }
 
+/// Native evidence uses the same bounded observation and cancellation lifecycle.
+pub type NativeChangeEvidence<O> = PgChangeEvidence<O>;
+
+#[async_trait]
+trait AppliedBarrier: Send + Sync {
+    async fn emit(&self) -> verify::Result<()>;
+}
+struct PgAppliedBarrier(Arc<Client>);
+#[async_trait]
+impl AppliedBarrier for PgAppliedBarrier {
+    async fn emit(&self) -> verify::Result<()> {
+        verification_marker(Uuid::new_v4())
+            .emit(&self.0)
+            .await
+            .map_err(|_| VerifyError::Read("verification applied barrier failed".into()))
+    }
+}
+
 /// An applied SOURCE position waiter for one run generation and lineage.
 pub struct AppliedSourceWaiter {
     hub: Arc<Hub>,
     binding: Binding,
     timeout: Duration,
-    admin: Arc<Client>,
+    barrier: Option<Arc<dyn AppliedBarrier>>,
 }
 
 impl Runtime {
@@ -530,6 +627,58 @@ impl Runtime {
             .expect("verification state poisoned")
             .invalidate(EvidenceInvalidation::CaptureGap);
         self.6.changed.notify_waiters();
+    }
+
+    /// Call BEFORE every reconnect attempt and on permanent capture failure/stop.
+    /// Trust only decreases within a run, even when reconnect succeeds.
+    pub fn invalidate_verification_continuity(&self) {
+        self.invalidate_final_marker_capture_gap();
+        self.6.invalidate_continuity();
+    }
+
+    /// Native connector adapter; emission and catalog qualification are explicit.
+    pub fn native_verification<O: KeyOrder + Send>(
+        &self,
+        emitter: Arc<dyn VerificationEmitter>,
+        table: Arc<dyn VerificationKey>,
+        order: O,
+        limits: VerificationLimits,
+    ) -> verify::Result<(NativeChangeEvidence<O>, AppliedSourceWaiter)> {
+        limits.validate()?;
+        table.validate()?;
+        if table.table().is_empty() || table.columns().is_empty() {
+            return Err(VerifyError::Invalid("unqualified verification key"));
+        }
+        let state = self.6.state.lock().expect("verification state poisoned");
+        let binding = state.binding.clone().filter(|_| state.running).ok_or(
+            VerifyError::ApplierTerminal {
+                cause: ApplierTerminalCause::CaptureStopped,
+            },
+        )?;
+        state.check_binding(&binding)?;
+        if binding.source.engine == "postgres" {
+            return Err(VerifyError::Invalid(
+                "native verification requires non-PG source",
+            ));
+        }
+        Ok((
+            PgChangeEvidence {
+                hub: self.6.clone(),
+                binding: binding.clone(),
+                admin: None,
+                emitter: Some(emitter),
+                table,
+                order,
+                limits,
+                armed: None,
+            },
+            AppliedSourceWaiter {
+                hub: self.6.clone(),
+                binding,
+                timeout: limits.timeout,
+                barrier: None,
+            },
+        ))
     }
 
     /// Construct only while Engine::run/run_until is active. `table` and `order`
@@ -566,7 +715,8 @@ impl Runtime {
             PgChangeEvidence {
                 hub: self.6.clone(),
                 binding: binding.clone(),
-                admin: admin.clone(),
+                admin: Some(admin.clone()),
+                emitter: None,
                 table: Arc::new(table),
                 order,
                 limits,
@@ -576,7 +726,7 @@ impl Runtime {
                 hub: self.6.clone(),
                 binding,
                 timeout: limits.timeout,
-                admin,
+                barrier: Some(Arc::new(PgAppliedBarrier(admin))),
             },
         ))
     }
@@ -595,7 +745,7 @@ impl<O: KeyOrder + Send> SqlChangeEvidence for PgChangeEvidence<O> {
     }
     async fn arm(&mut self, range: &RangePlan) -> verify::Result<()> {
         self.disarm();
-        if range.id.table != self.table.table {
+        if range.id.table != self.table.table() {
             return Err(VerifyError::Invalid("verification evidence table mismatch"));
         }
         for key in [&range.lo, &range.hi].into_iter().flatten() {
@@ -617,6 +767,9 @@ impl<O: KeyOrder + Send> SqlChangeEvidence for PgChangeEvidence<O> {
         let marker = verification_marker(token);
         let mut state = self.hub.state.lock().expect("verification state poisoned");
         state.check_binding(&self.binding)?;
+        if let Some(cause) = state.terminal {
+            return Err(VerifyError::ApplierTerminal { cause });
+        }
         if !state.running {
             return Err(invalid(EvidenceInvalidation::CaptureGap));
         }
@@ -636,6 +789,10 @@ impl<O: KeyOrder + Send> SqlChangeEvidence for PgChangeEvidence<O> {
                 bytes: 0,
                 failure: None,
                 marker,
+                native: self
+                    .emitter
+                    .as_ref()
+                    .map(|_| NativeVerificationMarker { version: 1, token }),
                 through: None,
             }),
         );
@@ -690,19 +847,33 @@ impl<O: KeyOrder + Send> PgChangeEvidence<O> {
         let hub = self.hub.clone();
         let binding = self.binding.clone();
         let admin = self.admin.clone();
+        let emitter = self.emitter.clone();
+        let native = self.emitter.is_some();
+        let timeout = self.limits.timeout;
         let order = &mut self.order;
         let waited_position = source_lsn.clone();
         let result = tokio::time::timeout(
             self.limits.timeout,
             Box::pin(async move {
-                marker
-                    .emit(&admin)
-                    .await
-                    .map_err(|_| VerifyError::Read("verification source barrier failed".into()))?;
+                if let Some(emitter) = emitter {
+                    emitter
+                        .emit(&NativeVerificationMarker { version: 1, token })
+                        .await?;
+                } else {
+                    marker
+                        .emit(admin.as_ref().expect("PG admin"))
+                        .await
+                        .map_err(|_| {
+                            VerifyError::Read("verification source barrier failed".into())
+                        })?;
+                }
                 loop {
                     let notified = hub.changed.notified();
                     let complete = {
                         let mut state = hub.state.lock().expect("verification state poisoned");
+                        if let Some(cause) = state.terminal {
+                            return Err(VerifyError::ApplierTerminal { cause });
+                        }
                         state.check_binding(&binding)?;
                         if !state.running {
                             return Err(invalid(EvidenceInvalidation::CaptureGap));
@@ -732,6 +903,16 @@ impl<O: KeyOrder + Send> PgChangeEvidence<O> {
                         )? == Ordering::Less
                         {
                             return Err(invalid(EvidenceInvalidation::CaptureGap));
+                        }
+                        if native {
+                            let mut waiter = AppliedSourceWaiter {
+                                hub: hub.clone(),
+                                binding: binding.clone(),
+                                timeout,
+                                barrier: None,
+                            };
+                            verify::Applier::wait_until(&mut waiter, through_position.clone())
+                                .await?;
                         }
                         return Ok(ChangeEvidence {
                             through_position,
@@ -843,13 +1024,8 @@ impl verify::Applier for AppliedSourceWaiter {
                     // position. An idle stream still needs a later committed
                     // SOURCE transaction. This marker advances nothing until
                     // its real Applied receipt is authenticated and journaled.
-                    if !emitted {
-                        verification_marker(Uuid::new_v4())
-                            .emit(&self.admin)
-                            .await
-                            .map_err(|_| {
-                                VerifyError::Read("verification applied barrier failed".into())
-                            })?;
+                    if !emitted && let Some(barrier) = &self.barrier {
+                        barrier.emit().await?;
                         emitted = true;
                         continue;
                     }

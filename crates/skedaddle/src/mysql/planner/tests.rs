@@ -20,6 +20,9 @@ fn table() -> MysqlPlannerTable {
         collation: None,
         nullable: false,
         generated: false,
+        column_default: None,
+        default_generated: false,
+        generation_expression: None,
     })
     .unwrap()
     .type_id;

@@ -26,6 +26,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     BudgetExceeded(budget::Blocker),
+    SourceBinding(SourceBindingError),
     RecoveryRequired(String),
     UnsupportedFormatVersion {
         format: &'static str,
@@ -50,6 +51,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SourceBinding(error) => error.fmt(f),
             Self::BudgetExceeded(b) => write!(
                 f,
                 "{}: {} exceeds {}; {}",
@@ -118,6 +120,95 @@ from_error!(serde_json::Error, Json);
 from_error!(std::io::Error, Io);
 from_error!(tokio_postgres::Error, Postgres);
 from_error!(crate::mysql::client::MysqlError, Mysql);
+
+/// Connector identity is independent of definition engine spelling and credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceConnector {
+    Postgres,
+    Mysql,
+    Spanner,
+}
+impl SourceConnector {
+    pub fn from_engine(engine: crate::definition::Engine) -> Result<Self> {
+        use crate::definition::Engine;
+        match engine {
+            Engine::Postgresql => Ok(Self::Postgres),
+            Engine::Mysql => Ok(Self::Mysql),
+            Engine::Spanner => Ok(Self::Spanner),
+            _ => Err(Error::SourceBinding(SourceBindingError::Invalid)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceBindingError {
+    Version(u16),
+    Invalid,
+    Missing,
+    Connector,
+    OrderDomain,
+    Stream,
+    NotWired(SourceConnector),
+    ExclusionUnsupported(SourceConnector),
+}
+impl fmt::Display for SourceBindingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "source runtime binding: {self:?}; preserve the journal and use its original connector, order domain and stream"
+        )
+    }
+}
+
+/// Versioned startup record for non-PG sources. PG keeps its existing startup bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBinding {
+    pub version: u16,
+    pub connector: SourceConnector,
+    pub order_domain: String,
+    pub stream: String,
+}
+impl SourceBinding {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != 1 {
+            return Err(Error::SourceBinding(SourceBindingError::Version(
+                self.version,
+            )));
+        }
+        if self.order_domain.is_empty() || self.stream.is_empty() {
+            return Err(Error::SourceBinding(SourceBindingError::Invalid));
+        }
+        Ok(())
+    }
+    pub fn require_same(&self, saved: &Self) -> Result<()> {
+        self.validate()?;
+        saved.validate()?;
+        let error = if self.connector != saved.connector {
+            Some(SourceBindingError::Connector)
+        } else if self.order_domain != saved.order_domain {
+            Some(SourceBindingError::OrderDomain)
+        } else if self.stream != saved.stream {
+            Some(SourceBindingError::Stream)
+        } else {
+            None
+        };
+        error.map_or(Ok(()), |error| Err(Error::SourceBinding(error)))
+    }
+    pub(crate) fn validate_definition(
+        &self,
+        definition: &crate::MigrationDefinition,
+    ) -> Result<()> {
+        self.validate()?;
+        if self.connector == SourceConnector::Postgres
+            || self.connector != SourceConnector::from_engine(definition.source.engine)?
+        {
+            return Err(Error::SourceBinding(SourceBindingError::Connector));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -485,6 +576,10 @@ pub struct VerifierException {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Transition {
+    #[serde(rename = "skedaddle-source-binding-v1")]
+    SourceBindingV1 {
+        binding: SourceBinding,
+    },
     Define {
         definition: Box<crate::MigrationDefinition>,
     },
@@ -593,6 +688,8 @@ pub struct Materialized {
 /// Cold metadata shares one allocation while retaining the checkpoint wire shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializedMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_binding: Option<SourceBinding>,
     #[serde(
         default,
         skip_serializing_if = "crate::pg::ddl::OperationalSchema::is_empty"
@@ -687,6 +784,24 @@ impl Materialized {
                         }
                         self.definition = Some((**definition).clone());
                         self.lifecycle.since_seq = entry.seq;
+                    }
+                    Transition::SourceBindingV1 { binding } => {
+                        binding.validate_definition(
+                            self.definition
+                                .as_ref()
+                                .ok_or(Error::SourceBinding(SourceBindingError::Missing))?,
+                        )?;
+                        if let Some(saved) = &self.source_binding {
+                            binding.require_same(saved)?;
+                            return Err(Error::SourceBinding(SourceBindingError::Invalid));
+                        }
+                        if !self.progress.is_empty()
+                            || !self.intent_roots.is_empty()
+                            || !self.chunk_plans.is_empty()
+                        {
+                            return Err(Error::SourceBinding(SourceBindingError::Missing));
+                        }
+                        self.source_binding = Some(binding.clone());
                     }
                     Transition::RollbackEligibilityEnded { reason } => {
                         reverse::end_eligibility(self, reason)?;
@@ -894,7 +1009,14 @@ impl Materialized {
                             ));
                         }
                     }
-                    Transition::Intent { .. } => {}
+                    Transition::Intent { .. } => {
+                        if self.definition.as_ref().is_some_and(|definition| {
+                            definition.source.engine != crate::definition::Engine::Postgresql
+                        }) && self.source_binding.is_none()
+                        {
+                            return Err(Error::SourceBinding(SourceBindingError::Missing));
+                        }
+                    }
                     Transition::AcquireOwnership { .. } => unreachable!(),
                 }
             }

@@ -24,6 +24,9 @@ fn column(name: &str, ordinal: u64, column_type: &str) -> ColumnDescriptor {
         }),
         nullable: name != "id",
         generated: false,
+        column_default: None,
+        default_generated: false,
+        generation_expression: None,
     }
 }
 fn descriptors() -> Vec<TableDescriptor> {
@@ -125,6 +128,7 @@ fn begin(a: &mut Assembler) {
     push(
         a,
         M::AnonymousGtid {
+            commit_time: None,
             sid: UUID.into(),
             sequence: 0,
         },
@@ -245,6 +249,7 @@ fn replay(variant: &str) {
                 .unwrap(),
             Ordering::Less
         );
+        assert!(txn.commit_time.is_some_and(|time| time > 0), "{variant}");
         previous = txn.commit_position.bytes().to_vec();
         assert_eq!(
             AssembledTxn::from_canonical_bytes(&txn.canonical_bytes().unwrap()).unwrap(),
@@ -397,6 +402,7 @@ fn typed_failures_and_poison() {
         push(
             &mut a,
             M::Gtid {
+                commit_time: None,
                 sid: UUID.into(),
                 sequence: 1,
                 tag: Some("tag".into())

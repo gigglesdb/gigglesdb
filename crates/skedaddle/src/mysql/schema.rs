@@ -21,6 +21,10 @@ pub struct ColumnDescriptor {
     pub collation: Option<Collation>,
     pub nullable: bool,
     pub generated: bool,
+    pub column_default: Option<String>,
+    /// EXTRA contains DEFAULT_GENERATED: the default is an expression, not a literal.
+    pub default_generated: bool,
+    pub generation_expression: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableDescriptor {
@@ -38,7 +42,7 @@ pub async fn load_descriptors(
         let rows: Vec<mysql_async::Row> = conn
             .exec(
                 "SELECT c.COLUMN_NAME,c.ORDINAL_POSITION,c.DATA_TYPE,c.COLUMN_TYPE,\
-             c.CHARACTER_SET_NAME,c.COLLATION_NAME,c.IS_NULLABLE,c.EXTRA,k.ID \
+             c.CHARACTER_SET_NAME,c.COLLATION_NAME,c.IS_NULLABLE,c.EXTRA,k.ID,c.COLUMN_DEFAULT,c.GENERATION_EXPRESSION \
              FROM information_schema.COLUMNS c LEFT JOIN information_schema.COLLATIONS k \
              ON c.COLLATION_NAME=k.COLLATION_NAME \
              WHERE c.TABLE_SCHEMA=? AND c.TABLE_NAME=? ORDER BY c.ORDINAL_POSITION",
@@ -57,6 +61,8 @@ pub async fn load_descriptors(
                 String,
                 String,
                 Option<u16>,
+                Option<String>,
+                Option<String>,
             );
             let (
                 name,
@@ -68,6 +74,8 @@ pub async fn load_descriptors(
                 nullable,
                 extra,
                 id,
+                column_default,
+                generation_expression,
             ): Fields = mysql_async::from_row_opt(row)
                 .map_err(|_| MysqlError::Invalid("column descriptor"))?;
             let collation = match (collation, id) {
@@ -83,6 +91,9 @@ pub async fn load_descriptors(
                 character_set,
                 collation,
                 nullable: nullable == "YES",
+                column_default,
+                default_generated: extra.contains("DEFAULT_GENERATED"),
+                generation_expression: generation_expression.filter(|s| !s.is_empty()),
                 generated: extra.contains("VIRTUAL GENERATED")
                     || extra.contains("STORED GENERATED"),
             });

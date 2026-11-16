@@ -1029,6 +1029,9 @@ fn copy_table(
                             .schema
                             .and_then(|s| s.blocked_boundary)
                         {
+                            let engine::SchemaBoundary::Postgres(boundary) = boundary else {
+                                panic!("expected PostgreSQL boundary");
+                            };
                             assert!(boundary.reason.contains("CREATE TABLE"));
                             assert!(
                                 boundary.stop_apply_before_transaction
@@ -1397,6 +1400,9 @@ async fn qualify_live_readiness(
                 .as_ref()
                 .and_then(|s| s.blocked_boundary.as_ref())
             {
+                let engine::SchemaBoundary::Postgres(boundary) = boundary else {
+                    panic!("expected PostgreSQL boundary");
+                };
                 assert!(boundary.readiness_blocked);
                 assert!(!boundary.reason.is_empty() && !boundary.remediation.is_empty());
                 break;

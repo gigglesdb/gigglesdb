@@ -1,3 +1,4 @@
+use futures::StreamExt;
 use mysql_async::prelude::Queryable;
 use skedaddle::{
     buffer::{
@@ -145,6 +146,9 @@ async fn live_capture_durable_mapping_control_progress_and_restart()
         .query_drop("DROP TABLE _skedaddle.watermark")
         .await?;
     admin.conn.query_drop(WATERMARK_DDL).await?;
+    admin.conn.query_drop(
+        "CREATE TABLE type_zoo.capture_binary (id INT PRIMARY KEY, b16 BINARY(16), b32 BINARY(32)) ENGINE=InnoDB"
+    ).await?;
     let status = admin.status().await?;
     assert_eq!(status.gtid_on, cfg.gtid == "ON");
     let start = if status.gtid_on {
@@ -169,8 +173,14 @@ async fn live_capture_durable_mapping_control_progress_and_restart()
     let tables = vec![
         ("type_zoo".into(), "zoo".into()),
         ("type_zoo".into(), "capture_selected".into()),
+        ("type_zoo".into(), "capture_binary".into()),
     ];
     let descriptors = load_descriptors(&mut admin.conn, &tables).await?;
+    let mut binary_stream = cfg
+        .connect()
+        .await?
+        .open_stream(&start, 6423, Duration::from_millis(500))
+        .await?;
     let mut capture = MysqlCapture::new(
         &cfg,
         source(),
@@ -287,6 +297,67 @@ async fn live_capture_durable_mapping_control_progress_and_restart()
             .bytes
             .is_none()
     );
+    // Fixed-width binary images must retain every trailing zero through mapping.
+    admin
+        .conn
+        .query_drop(
+            "INSERT INTO type_zoo.capture_binary VALUES
+         (1, UNHEX(CONCAT(REPEAT('ab',15),'00')), UNHEX(CONCAT(REPEAT('ab',31),'00'))),
+         (2, UNHEX(CONCAT(REPEAT('cd',12),'00000000')), UNHEX(CONCAT(REPEAT('cd',28),'00000000'))),
+         (3, UNHEX(REPEAT('00',16)), UNHEX(REPEAT('00',32)))",
+        )
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut binary_table = None;
+    let mut seen = 0;
+    let mut binary_lengths = Vec::new();
+    while seen < 3 {
+        use skedaddle::mysql::binlog::{MysqlEvent, MysqlValue};
+        let event = timeout_at(deadline, binary_stream.next())
+            .await
+            .unwrap()
+            .unwrap()?;
+        match event.event {
+            MysqlEvent::TableMap(table) if table.table == b"capture_binary" => {
+                eprintln!("BINARY TABLE metadata: {:?}", table.columns);
+                binary_table = Some(table.id);
+            }
+            MysqlEvent::Rows {
+                table_id, images, ..
+            } if Some(table_id) == binary_table => {
+                for (_, after) in images {
+                    let row = after.unwrap();
+                    eprintln!("BINARY raw decoded row: {row:?}");
+                    for (i, width) in [(1, 16), (2, 32)] {
+                        let MysqlValue::Binary(bytes) = &row[i] else {
+                            panic!("binary cell")
+                        };
+                        binary_lengths.push((bytes.len(), width));
+                    }
+                    seen += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    binary_stream.close().await?;
+    assert!(
+        binary_lengths.iter().all(|(actual, width)| actual == width),
+        "decoded binary lengths: {binary_lengths:?}"
+    );
+    let binary = next_transaction(&mut capture).await;
+    let binary = verify(&binary, &capture, &mut reader, &mut previous, 3).await;
+    for (event, (byte, zeros)) in binary.events.iter().zip([(0xab, 1), (0xcd, 4), (0, 32)]) {
+        let row = event.after.as_ref().unwrap();
+        for (column, width) in [("b16", 16), ("b32", 32)] {
+            let mut expected = vec![byte; width];
+            expected[width - zeros.min(width)..].fill(0);
+            assert_eq!(
+                row[column].bytes,
+                Some(Value::Bytea(expected).canonical_bytes()?)
+            );
+        }
+    }
     admin
         .conn
         .query_drop("INSERT INTO type_zoo.capture_unselected VALUES(2)")

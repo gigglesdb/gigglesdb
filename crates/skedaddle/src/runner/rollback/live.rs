@@ -416,7 +416,11 @@ fn run_slice(
             capture: worker,
             pre_hook: &mut pre,
             replay: &replay,
-            target: &mut target,
+            target: &mut apply::PgRollbackSink {
+                destination: &mut target,
+                key: &key,
+                replay: &replay,
+            },
             verification: &mut verification,
             source: &mut source,
             post_hook: &mut post,

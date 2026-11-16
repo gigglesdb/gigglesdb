@@ -404,8 +404,12 @@ impl<R: source::TypeResolver, T: source::Transport> Capture for PgCapture<R, T> 
         self.feedback_runtime = Some(Box::new(runtime.clone()));
         Ok(())
     }
-    fn schema_state(&self) -> Option<source::SchemaState> {
-        Some(self.capture.schema_state())
+    fn schema_state(&self) -> Option<SchemaState> {
+        let schema = self.capture.schema_state();
+        Some(SchemaState {
+            blocked_boundary: schema.blocked_boundary.map(SchemaBoundary::Postgres),
+            unknown_schema_job: schema.unknown_schema_job,
+        })
     }
     fn buffered_marker(&self, batch: &Captured) -> Result<String> {
         let txn = batch

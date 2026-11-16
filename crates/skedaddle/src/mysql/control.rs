@@ -90,6 +90,9 @@ pub fn descriptor() -> TableDescriptor {
             collation: None,
             nullable: false,
             generated: false,
+            column_default: None,
+            default_generated: false,
+            generation_expression: None,
         })
         .collect(),
         primary_key: vec!["id".into()],
@@ -138,4 +141,105 @@ pub fn decode_watermark(row: &ControlRow) -> Result<Option<Watermark>> {
         .encode()
         .map_err(|_| MysqlError::Control("invalid watermark identity"))?;
     Ok(Some(marker))
+}
+
+/// Fixed M10 replay-table contracts. Capture owns these independently of selection.
+pub fn apply_descriptors() -> Vec<TableDescriptor> {
+    let specs = [
+        (
+            "apply_receipts",
+            vec![
+                ("stream", "varbinary", "varbinary(32)"),
+                ("position_hash", "binary", "binary(32)"),
+                ("position_domain", "varbinary", "varbinary(1024)"),
+                ("position", "longblob", "longblob"),
+                ("txn_id", "longblob", "longblob"),
+                ("digest", "binary", "binary(32)"),
+                ("committed_at", "timestamp", "timestamp(6)"),
+            ],
+            vec!["stream", "position_hash"],
+        ),
+        (
+            "apply_progress",
+            vec![
+                ("stream", "varbinary", "varbinary(32)"),
+                ("position_domain", "varbinary", "varbinary(1024)"),
+                ("last_position", "longblob", "longblob"),
+            ],
+            vec!["stream"],
+        ),
+    ];
+    specs
+        .into_iter()
+        .map(|(table, columns, key)| TableDescriptor {
+            schema: "_skedaddle".into(),
+            table: table.into(),
+            columns: columns
+                .into_iter()
+                .enumerate()
+                .map(|(i, (name, data_type, column_type))| ColumnDescriptor {
+                    name: name.into(),
+                    ordinal: i as u64 + 1,
+                    data_type: data_type.into(),
+                    column_type: column_type.into(),
+                    character_set: None,
+                    collation: None,
+                    nullable: false,
+                    generated: false,
+                    column_default: None,
+                    default_generated: false,
+                    generation_expression: None,
+                })
+                .collect(),
+            primary_key: key.into_iter().map(String::from).collect(),
+        })
+        .collect()
+}
+
+/// Validate every control image before deciding whether to suppress a transaction.
+/// Receipt inserts mark apply; receipt deletes and progress writes are GC/progress.
+pub fn decode_apply(row: &ControlRow) -> Result<Option<bool>> {
+    let Some(d) = apply_descriptors()
+        .into_iter()
+        .find(|d| row.table == format!("{}.{}", d.schema, d.table))
+    else {
+        return Ok(None);
+    };
+    let receipt = d.table == "apply_receipts";
+    let images = (row.before.is_some(), row.after.is_some());
+    if images
+        != match row.kind {
+            EventKind::Insert => (false, true),
+            EventKind::Update if !receipt => (true, true),
+            EventKind::Delete if receipt => (true, false),
+            _ => return Err(MysqlError::Control("invalid apply control operation")),
+        }
+    {
+        return Err(MysqlError::Control("invalid apply control images"));
+    }
+    for image in row.before.iter().chain(row.after.iter()) {
+        if image.len() != d.columns.len() {
+            return Err(MysqlError::Control("invalid apply control columns"));
+        }
+        for c in &d.columns {
+            let value = image
+                .get(&c.name)
+                .ok_or(MysqlError::Control("missing apply control column"))?;
+            let decoded = from_opaque(c, value)
+                .map_err(|_| MysqlError::Control("invalid apply control value"))?;
+            let valid = match decoded {
+                MysqlValue::Binary(bytes) => match c.name.as_str() {
+                    "stream" | "position_hash" | "digest" => bytes.len() == 32,
+                    "position_domain" => !bytes.is_empty() && bytes.len() <= 1024,
+                    _ => !bytes.is_empty(),
+                },
+                MysqlValue::Timestamp(_) => c.name == "committed_at",
+                _ => false,
+            };
+            if !valid {
+                return Err(MysqlError::Control("invalid apply control value"));
+            }
+        }
+    }
+    Ok(Some(receipt && row.kind == EventKind::Insert))
 }

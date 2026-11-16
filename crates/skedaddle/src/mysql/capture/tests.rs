@@ -97,6 +97,9 @@ fn zoo() -> TableDescriptor {
                     }),
                     nullable: *n != "id",
                     generated: false,
+                    column_default: None,
+                    default_generated: false,
+                    generation_expression: None,
                 }
             })
             .collect(),
@@ -318,6 +321,7 @@ async fn filtered_fixture_progress_and_heartbeat_never_pass_open_transaction() {
     events.push(at(MysqlEvent::Heartbeat, 999_999));
     events.push(at(
         MysqlEvent::Gtid {
+            commit_time: None,
             sid: UUID.into(),
             sequence: 999,
             tag: None,
@@ -369,6 +373,7 @@ fn control_events(payload: serde_json::Value, kind: RowKind) -> Vec<PositionedEv
     vec![
         at(
             MysqlEvent::AnonymousGtid {
+                commit_time: None,
                 sid: UUID.into(),
                 sequence: 0,
             },
@@ -637,12 +642,14 @@ async fn ddl_classification_stops_selected_and_unknown_at_query_boundary() {
             let (w, _, root) = writer(&p).await;
             let first = if gtid {
                 MysqlEvent::Gtid {
+                    commit_time: None,
                     sid: UUID.into(),
                     sequence: 1,
                     tag: None,
                 }
             } else {
                 MysqlEvent::AnonymousGtid {
+                    commit_time: None,
                     sid: UUID.into(),
                     sequence: 0,
                 }
@@ -855,4 +862,192 @@ async fn fixture_table_maps_follow_source_case_rules() {
         drop(c);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+fn apply_control(
+    receipt: bool,
+    kind: crate::event::EventKind,
+) -> crate::mysql::assembly::ControlRow {
+    let d = control::apply_descriptors().remove(if receipt { 0 } else { 1 });
+    let row: Row = d
+        .columns
+        .iter()
+        .map(|c| {
+            let v = match c.name.as_str() {
+                "committed_at" => V::Timestamp("1700000000.000000".into()),
+                "stream" | "position_hash" | "digest" => V::Binary(vec![1; 32]),
+                _ => V::Binary(vec![1]),
+            };
+            (
+                c.name.clone(),
+                crate::mysql::value::to_opaque(c, &v).unwrap(),
+            )
+        })
+        .collect();
+    crate::mysql::assembly::ControlRow {
+        table: format!("{}.{}", d.schema, d.table),
+        before: (kind != crate::event::EventKind::Insert).then(|| row.clone()),
+        after: (kind != crate::event::EventKind::Delete).then_some(row),
+        kind,
+    }
+}
+
+#[tokio::test]
+async fn apply_echo_and_gc_are_progress_only_before_mapping_and_adjacent_user_survives() {
+    use crate::event::{Event, EventKind, TxnId};
+    for kind in [EventKind::Insert, EventKind::Delete, EventKind::Update] {
+        let p = start(false);
+        let (w, mut reader, root) = writer(&p).await;
+        let mut capture = MysqlCapture::from_stream(
+            source(),
+            p,
+            vec![zoo()],
+            w,
+            futures::stream::pending(),
+            1_000_000,
+        )
+        .unwrap();
+        let position = |n| {
+            Position::new(
+                capture.order.domain(),
+                MysqlPosition::File {
+                    server_uuid: UUID.into(),
+                    file_seq: 4,
+                    offset: n,
+                }
+                .encode()
+                .unwrap(),
+            )
+        };
+        let first = position(100);
+        let second = position(200);
+        // An unmappable extra table proves receipt inspection precedes mapping.
+        let extra = Event {
+            source: source(),
+            txn: TxnId(vec![1]),
+            ordinal_in_txn: 0,
+            position: first.clone(),
+            schema_version: 1,
+            kind: EventKind::Insert,
+            table: Some("not_planned.extra".into()),
+            key: Row::new(),
+            before: None,
+            after: Some(Row::new()),
+            unchanged_cols: Default::default(),
+        };
+        let events = if kind == EventKind::Insert {
+            vec![extra]
+        } else {
+            vec![]
+        };
+        let txn = AssembledTxn::new(source(), TxnId(vec![1]), first.clone(), None, events).unwrap();
+        let key = Row::from([(
+            "id".into(),
+            crate::mysql::value::to_opaque(&zoo().columns[0], &V::Signed(42)).unwrap(),
+        )]);
+        let user = AssembledTxn::new(
+            source(),
+            TxnId(vec![2]),
+            second.clone(),
+            None,
+            vec![Event {
+                source: source(),
+                txn: TxnId(vec![2]),
+                position: second.clone(),
+                ordinal_in_txn: 0,
+                schema_version: 1,
+                kind: EventKind::Insert,
+                table: Some("type_zoo.zoo".into()),
+                key: key.clone(),
+                before: None,
+                after: Some(key),
+                unchanged_cols: Default::default(),
+            }],
+        )
+        .unwrap();
+        let mapped_user = capture.mapped(user.clone()).unwrap();
+        capture.outputs.push_back(AssemblerOutput::Txn {
+            txn,
+            control_rows: vec![apply_control(kind != EventKind::Update, kind)],
+        });
+        capture.outputs.push_back(AssemblerOutput::Txn {
+            txn: user.clone(),
+            control_rows: vec![],
+        });
+        let suppressed = capture.step().await.unwrap();
+        assert!(suppressed.transaction.is_none() && suppressed.watermarks.is_empty());
+        assert_eq!(suppressed.durable_position, Some(first));
+        capture.buffered_marker(&suppressed).unwrap();
+        assert!(
+            capture
+                .writer_checkpoint()
+                .unwrap()
+                .unwrap()
+                .redelivery
+                .is_empty()
+        );
+        assert_eq!(
+            capture.step().await.unwrap().transaction,
+            Some(mapped_user.clone())
+        );
+        assert_eq!(reader.next_txn().await.unwrap(), Some(mapped_user));
+        drop((capture, reader));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn apply_control_malformed_shapes_fail_closed() {
+    use crate::event::EventKind;
+    for receipt in [false, true] {
+        let good = apply_control(receipt, EventKind::Insert);
+        assert_eq!(control::decode_apply(&good).unwrap(), Some(receipt));
+        let mut missing = good.clone();
+        missing.after.as_mut().unwrap().remove("stream");
+        assert!(matches!(
+            control::decode_apply(&missing),
+            Err(MysqlError::Control(_))
+        ));
+        let mut bad = good.clone();
+        bad.after.as_mut().unwrap().get_mut("stream").unwrap().bytes = Some(vec![1]);
+        assert!(matches!(
+            control::decode_apply(&bad),
+            Err(MysqlError::Control(_))
+        ));
+        let mut null = good;
+        null.after
+            .as_mut()
+            .unwrap()
+            .get_mut("stream")
+            .unwrap()
+            .bytes = None;
+        assert!(matches!(
+            control::decode_apply(&null),
+            Err(MysqlError::Control(_))
+        ));
+    }
+    assert!(control::decode_apply(&apply_control(true, EventKind::Update)).is_err());
+}
+
+#[test]
+fn apply_table_map_malformed_shape_is_typed_control_error() {
+    let mut a = Assembler::new(
+        source(),
+        control::apply_descriptors(),
+        start(false),
+        false,
+        1_000_000,
+    )
+    .unwrap();
+    let t = MysqlTable {
+        id: 7,
+        schema: b"_skedaddle".to_vec(),
+        table: b"apply_receipts".to_vec(),
+        columns: vec![],
+        full_metadata: vec![],
+    };
+    assert!(matches!(
+        a.push(at(MysqlEvent::TableMap(t), 10)),
+        Err(MysqlError::Control(_))
+    ));
 }

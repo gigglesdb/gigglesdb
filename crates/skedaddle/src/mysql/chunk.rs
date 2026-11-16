@@ -70,6 +70,9 @@ fn descriptor(c: &MysqlKeyColumn, ordinal: usize) -> ColumnDescriptor {
         collation: c.collation.clone(),
         nullable: false,
         generated: false,
+        column_default: None,
+        default_generated: false,
+        generation_expression: None,
     }
 }
 fn mappings(key: &MysqlTableKey) -> Result<Vec<MysqlPgColumn>> {
@@ -221,6 +224,33 @@ pub struct MysqlChunkQuery {
     pub parameters: Vec<Parameter>,
 }
 impl MysqlTableKey {
+    /// Bounded keyset page, using precisely the capture/chunk range comparisons.
+    pub fn page_query_columns(
+        &self,
+        range: &ChunkRange,
+        columns: &[ColumnDescriptor],
+        after: Option<&Key>,
+        limit: u64,
+    ) -> Result<MysqlChunkQuery> {
+        if limit == 0 || limit > i64::MAX as u64 {
+            return Err(invalid("page size"));
+        }
+        let mut query = self.read_query_columns(range, columns)?;
+        if let Some(after) = after {
+            let (sql, bindings) = parameters(self, after)?;
+            let predicate = comparison(&expressions(self, false)?, ">", &sql);
+            let ordering = format!(" ORDER BY {}", order(self, false)?);
+            let head = query
+                .sql
+                .strip_suffix(&ordering)
+                .ok_or(invalid("page query shape"))?;
+            query.sql = format!("{head} AND {predicate}{ordering}");
+            query.parameters.extend(bindings);
+        }
+        query.sql.push_str(" LIMIT ?");
+        query.parameters.push(Parameter::UInt(limit));
+        Ok(query)
+    }
     pub fn sampling_query(&self, size: usize) -> Result<MysqlChunkQuery> {
         mappings(self)?;
         let size = u64::try_from(size)

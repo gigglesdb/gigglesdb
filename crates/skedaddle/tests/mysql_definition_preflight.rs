@@ -222,6 +222,25 @@ async fn mysql_definition_preflight_clean_mapping_and_declared_mode() {
     assert_eq!(output.status.code(), Some(2));
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["outcome"], "blocked");
+    // Start normally follows Define; the runtime journals its source binding
+    // before refusing an unwired connector, without creating apply work.
+    let journal = skedaddle::runner::open_journal(&root, "unwired")
+        .await
+        .unwrap();
+    let mut owner = skedaddle::coordinator::epoch::Coordinator::observer(
+        journal,
+        skedaddle::coordinator::local::Local::create(root.join("seed-local")).unwrap(),
+        "definition-preflight",
+    )
+    .unwrap();
+    owner.acquire().await.unwrap();
+    owner
+        .commit(skedaddle::coordinator::Transition::Define {
+            definition: Box::new(def.clone()),
+        })
+        .await
+        .unwrap();
+    drop(owner);
     let (pause, receiver) = tokio::sync::watch::channel(false);
     let result = skedaddle::runner::run(
         &root,
@@ -232,14 +251,36 @@ async fn mysql_definition_preflight_clean_mapping_and_declared_mode() {
         receiver,
     )
     .await;
-    let Err(skedaddle::runner::RunError::Preparation(error)) = result else {
-        panic!("MySQL runtime must refuse")
-    };
-    assert!(matches!(
-        error.kind,
-        skedaddle::runner::FailureKind::NotWired
-    ));
-    assert_eq!(error.what, "MySQL source runtime not wired yet");
+    assert!(
+        matches!(
+            result,
+            Err(skedaddle::runner::RunError::Engine(
+                skedaddle::coordinator::Error::SourceBinding(
+                    skedaddle::runner::SourceBindingError::NotWired(
+                        skedaddle::runner::SourceConnector::Mysql
+                    )
+                )
+            ))
+        ),
+        "MySQL runtime must refuse with typed NotWired"
+    );
+    let state = skedaddle::runner::open_journal(&root, "unwired")
+        .await
+        .unwrap()
+        .load(true)
+        .await
+        .unwrap();
+    assert_eq!(
+        state.source_binding.as_ref().unwrap().connector,
+        skedaddle::runner::SourceConnector::Mysql
+    );
+    assert_eq!(
+        state.lifecycle.state,
+        skedaddle::coordinator::State::Defined
+    );
+    assert!(state.progress.is_empty());
+    assert!(state.intent_roots.is_empty());
+    assert!(state.chunk_plans.is_empty());
     drop(pause);
     drop(cleanup);
 }

@@ -179,6 +179,14 @@ impl Checkpoint {
         {
             return Err(Error::ReverseProof(super::reverse::ProofError::Missing));
         }
+        if let Some(binding) = &self.state.source_binding {
+            binding.validate_definition(
+                self.state
+                    .definition
+                    .as_ref()
+                    .ok_or(Error::SourceBinding(super::SourceBindingError::Missing))?,
+            )?;
+        }
         super::budget::state(&self.state)?;
         super::local::projection(&self.state)?;
         for (seq, entry) in &self.state.audit {
@@ -435,6 +443,7 @@ impl Journal {
                 | Transition::ReverseConsistentPoint { .. }
                 | Transition::VerificationInvalidated { .. }
                 | Transition::VerificationCompleted { .. }
+                | Transition::SourceBindingV1 { .. }
                 | Transition::ChunkPlanned { .. }
                 | Transition::ChunkStarted { .. }
                 | Transition::ChunkDone { .. }
@@ -1025,7 +1034,7 @@ impl Journal {
                 self.apply_entry(&mut state, &entry)
                     .await
                     .map_err(|e| match e {
-                        Error::UnsupportedFormatVersion { .. } => e,
+                        Error::UnsupportedFormatVersion { .. } | Error::SourceBinding(_) => e,
                         _ => Error::RecoveryRequired(format!("journal tail at {seq}: {e}")),
                     })?;
             }
@@ -1106,7 +1115,7 @@ impl Journal {
             self.apply_entry(&mut state, &entry)
                 .await
                 .map_err(|e| match e {
-                    Error::UnsupportedFormatVersion { .. } => e,
+                    Error::UnsupportedFormatVersion { .. } | Error::SourceBinding(_) => e,
                     _ => Error::RecoveryRequired(format!("journal replay at {seq}: {e}")),
                 })?;
             if let Some(key) = checkpoints.remove(seq) {

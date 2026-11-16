@@ -270,7 +270,7 @@ def p2(mutate=False,backend_only=False,p3=False):
 PG_MATRIX_SERVICES=('pg-source','pg-destination','pg-replica-wal')
 PG_MATRIX_TESTS=('pg_replication','pg_source','pg_apply','pg_preflight','pg_chunk','pg_catalog',
                  'pg_ddl','pg_fence','pg_activate','pg_reverse','verify_pg','cutover','rollback',
-                 'runner','runner_verify','engine','source_ack')
+                 'runner','runner_verify','engine','source_ack','mysql_dest_schema')
 
 
 def pg_test_selections():

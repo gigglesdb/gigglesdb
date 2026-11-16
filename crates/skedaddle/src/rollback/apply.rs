@@ -16,11 +16,12 @@ use crate::{
     event::{AssembledTxn, PositionOrder},
     pg::apply::{
         self,
-        executor::{self, Destination, ReaderLoop},
+        executor::{self, Destination},
     },
     verify::{self, Projection, RangePlan, RowSource},
 };
-use std::{cell::Cell, fmt, sync::Arc};
+use async_trait::async_trait;
+use std::{fmt, sync::Arc};
 
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
@@ -133,6 +134,93 @@ fn executor_error(error: executor::Error) -> Error {
     }
 }
 
+/// Evidence from the authenticated reader, independent of the destination.
+pub struct ApplyContext {
+    pub mseq: u64,
+    pub manifest_digest: [u8; 32],
+    pub previous_digest: [u8; 32],
+    pub chunk_rows: Option<bool>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SinkOutcome {
+    Committed,
+    AlreadyCommitted,
+}
+
+/// A successful outcome guarantees durable effects or an exact replay receipt.
+/// Errors/cancellation require rebuilding the caller from its durable checkpoint.
+/// This path must never publish forward engine applied progress.
+#[async_trait]
+pub trait RollbackSink: Send {
+    async fn apply(&mut self, txn: &AssembledTxn, context: &ApplyContext) -> Result<SinkOutcome>;
+    /// Called only for a durable request checkpoint (including restart recovery).
+    async fn checkpoint_durable(&mut self, _checkpoint: &ReaderCheckpoint) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Existing PG reverse planner/executor, retaining native LSN ordering and GC.
+pub struct PgRollbackSink<'a> {
+    pub destination: &'a mut dyn Destination,
+    pub key: &'a Key,
+    pub replay: &'a Replay,
+}
+#[async_trait]
+impl RollbackSink for PgRollbackSink<'_> {
+    async fn apply(&mut self, txn: &AssembledTxn, context: &ApplyContext) -> Result<SinkOutcome> {
+        let mut plan = apply::plan_transaction(
+            txn,
+            &self.replay.tables,
+            &apply::PlanContext {
+                positions: apply::SourcePositions::new(
+                    self.replay.order.clone(),
+                    apply::OriginPolicy::NativePgLsn,
+                ),
+                stream: format!("{}_rev", self.key.migration),
+                mseq: context.mseq,
+                origin: format!("skedaddle_{}_rev", self.key.migration),
+                synthetic_commit_time: Some(0),
+            },
+            |_, _| Ok(apply::RangeState::Completed),
+        )
+        .map_err(|e| executor_error(e.into()))?;
+        plan.progress.evidence = context.chunk_rows.map(|chunk| {
+            apply::RecordEvidence::new(
+                if chunk {
+                    apply::RecordKind::ChunkRows
+                } else {
+                    apply::RecordKind::Transaction
+                },
+                context.manifest_digest,
+                context.previous_digest,
+                &plan.progress,
+            )
+        });
+        *plan
+            .statements
+            .last_mut()
+            .ok_or(Error::OperatorAction("missing progress write"))? =
+            apply::progress_statement(&plan.progress, plan.origin_policy);
+        if self
+            .destination
+            .apply(&plan)
+            .await
+            .map_err(executor_error)?
+            != apply::CommitDecision::Applied
+        {
+            return Err(Error::OperatorAction("reverse apply evidence unavailable"));
+        }
+        Ok(SinkOutcome::Committed)
+    }
+    async fn checkpoint_durable(&mut self, checkpoint: &ReaderCheckpoint) -> Result<()> {
+        self.destination
+            .retain_after_checkpoint(checkpoint)
+            .await
+            .map_err(executor_error)
+    }
+}
+
 /// Call only while holding the exclusive authority guard used by destination
 /// preparation. Source must be the existing executor configured with stream
 /// `<migration>_rev` and origin `skedaddle_<migration>_rev`, on the OLD SOURCE.
@@ -143,6 +231,29 @@ pub async fn execute_next(
     key: &Key,
     replay: &Replay,
     source: &mut dyn Destination,
+    verification: &mut impl Verification,
+    journal: &mut impl Journal,
+) -> Result<Outcome> {
+    execute_next_with_sink(
+        key,
+        replay,
+        &mut PgRollbackSink {
+            destination: source,
+            key,
+            replay,
+        },
+        verification,
+        journal,
+    )
+    .await
+}
+
+/// Connector-neutral bounded replay. Marker validation precedes sink effects;
+/// sink commit precedes the request checkpoint, which precedes receipt retention.
+pub async fn execute_next_with_sink(
+    key: &Key,
+    replay: &Replay,
+    sink: &mut dyn RollbackSink,
     verification: &mut impl Verification,
     journal: &mut impl Journal,
 ) -> Result<Outcome> {
@@ -186,8 +297,7 @@ pub async fn execute_next(
     let (checkpoint, reached) = journal.progress(&request)?;
     if !reached {
         let stream = format!("{}_rev", key.migration);
-        let origin = format!("skedaddle_{}_rev", key.migration);
-        let reader = BufferReader::new(
+        let mut reader = BufferReader::new(
             replay.store.clone(),
             ReaderConfig {
                 prefix: "reverse-runner-v1".into(),
@@ -200,47 +310,55 @@ pub async fn execute_next(
             replay.order.clone(),
         )
         .map_err(|_| Error::OperatorAction("reverse checkpoint invalid"))?;
-        let mut reader = ReaderLoop::new(reader, stream.clone());
+        if reader.checkpoint().next_mseq != 0 {
+            sink.checkpoint_durable(reader.checkpoint()).await?;
+        }
         loop {
-            let found = Cell::new(false);
-            let save_failed = Cell::new(false);
-            let applied = reader
-                .step(
-                    source,
-                    |txn, mseq| {
-                        found.set(is_final(txn, &request, marker, key.epoch)?);
-                        apply::plan_transaction(
-                            txn,
-                            &replay.tables,
-                            &apply::PlanContext {
-                                positions: apply::SourcePositions::new(
-                                    replay.order.clone(),
-                                    apply::OriginPolicy::NativePgLsn,
-                                ),
-                                stream: stream.clone(),
-                                mseq,
-                                origin: origin.clone(),
-                                synthetic_commit_time: Some(0),
-                            },
-                            |_, _| Ok(apply::RangeState::Completed),
-                        )
-                    },
-                    |checkpoint| {
-                        let result = journal.save(&request, checkpoint, found.get());
-                        save_failed.set(result.is_err());
-                        std::future::ready(result.map_err(|_| executor::Error::Checkpoint))
-                    },
-                )
-                .await;
-            if save_failed.get() {
-                return Err(Error::Retry);
-            }
-            if !applied.map_err(executor_error)? {
-                return Err(Error::OperatorAction(
+            let before = reader.checkpoint().clone();
+            let txn = reader
+                .next_txn()
+                .await
+                .map_err(|e| match e {
+                    crate::buffer::reader::Error::Store(_) => Error::Retry,
+                    _ => Error::OperatorAction("reverse apply evidence unavailable"),
+                })?
+                .ok_or(Error::OperatorAction(
                     "reverse buffer ended before final marker",
-                ));
-            }
-            if found.get() {
+                ))?;
+            let found = is_final(&txn, &request, marker, key.epoch)
+                .map_err(|e| executor_error(e.into()))?;
+            let verified = reader
+                .last_verified()
+                .ok_or(Error::OperatorAction("missing verified manifest"))?;
+            let mseq = verified.entry().mseq;
+            let after = reader.checkpoint();
+            let chunk_rows = if after.next_mseq
+                == mseq
+                    .checked_add(1)
+                    .ok_or(Error::OperatorAction("manifest sequence exhausted"))?
+            {
+                after.last_record.as_ref().map(|r| r.chunk_rows)
+            } else if before.next_mseq == mseq
+                && before.last_position.as_ref() == Some(&txn.commit_position)
+                && before.last_record.as_ref().is_some_and(|r| !r.chunk_rows)
+            {
+                Some(true)
+            } else {
+                None
+            };
+            let context = ApplyContext {
+                mseq,
+                manifest_digest: verified.digest(),
+                previous_digest: verified.entry().prev_digest,
+                chunk_rows,
+            };
+            sink.apply(&txn, &context).await?;
+            let checkpoint = reader.checkpoint().clone();
+            journal
+                .save(&request, checkpoint.clone(), found)
+                .map_err(|_| Error::Retry)?;
+            sink.checkpoint_durable(&checkpoint).await?;
+            if found {
                 break;
             }
         }

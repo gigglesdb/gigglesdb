@@ -8,6 +8,7 @@
 mod compare;
 mod coverage;
 mod hash;
+pub mod mysql;
 mod protocol;
 pub mod sql;
 

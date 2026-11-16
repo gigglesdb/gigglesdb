@@ -607,3 +607,110 @@ async fn rollback_preserves_destination_writes() {
             .unwrap();
     }
 }
+
+// This test sink models only commit/checkpoint acknowledgment faults; the
+// unchanged PG harness test above qualifies actual database effects.
+struct TestSink {
+    trace: Arc<Mutex<Vec<String>>>,
+    receipts: BTreeSet<u64>,
+    fail_after_commit: bool,
+}
+#[async_trait]
+impl RollbackSink for TestSink {
+    async fn apply(&mut self, txn: &AssembledTxn, context: &ApplyContext) -> Result<SinkOutcome> {
+        assert_eq!(context.mseq, 0);
+        let n = u64::from_be_bytes(txn.commit_position.bytes().try_into().unwrap());
+        self.trace.lock().unwrap().push(format!("sink:{n}"));
+        let fresh = self.receipts.insert(n);
+        if self.fail_after_commit {
+            self.fail_after_commit = false;
+            return Err(Error::Retry);
+        }
+        Ok(if fresh {
+            SinkOutcome::Committed
+        } else {
+            SinkOutcome::AlreadyCommitted
+        })
+    }
+}
+struct TestJournal(Log);
+impl Journal for TestJournal {
+    fn state(&self) -> Materialized {
+        self.0.state()
+    }
+    fn publish(&mut self, r: Record) -> Result<()> {
+        self.0.publish(r)
+    }
+    fn progress(&self, request: &str) -> Result<(ReaderCheckpoint, bool)> {
+        self.0.progress(request)
+    }
+    fn save(&mut self, request: &str, checkpoint: ReaderCheckpoint, reached: bool) -> Result<()> {
+        self.0.trace.lock().unwrap().push(format!("save:{reached}"));
+        self.0.save(request, checkpoint, reached)
+    }
+}
+#[tokio::test]
+async fn neutral_sink_commits_in_order_before_request_saves() {
+    let (k, log, _, mut v) = fixture();
+    let trace = log.trace.clone();
+    let mut j = TestJournal(log);
+    let mut sink = TestSink {
+        trace: trace.clone(),
+        receipts: BTreeSet::new(),
+        fail_after_commit: false,
+    };
+    execute_next_with_sink(&k, &replay(true, true), &mut sink, &mut v, &mut j)
+        .await
+        .unwrap();
+    let trace = trace.lock().unwrap();
+    assert!(trace[0].contains("ReverseApply"));
+    assert_eq!(
+        &trace[1..7],
+        [
+            "sink:10",
+            "save:false",
+            "sink:20",
+            "save:false",
+            "sink:30",
+            "save:true"
+        ]
+    );
+    assert_eq!(sink.receipts, BTreeSet::from([10, 20, 30]));
+    assert!(j.0.saved.1);
+}
+#[tokio::test]
+async fn neutral_sink_replays_lost_checkpoint_and_lost_commit_reply() {
+    for lost_commit in [false, true] {
+        let (k, mut log, _, mut v) = fixture();
+        if !lost_commit {
+            log.fail = Some(3);
+        } // first save fails before durability
+        let trace = log.trace.clone();
+        let mut j = TestJournal(log);
+        let mut sink = TestSink {
+            trace: trace.clone(),
+            receipts: BTreeSet::new(),
+            fail_after_commit: lost_commit,
+        };
+        assert!(matches!(
+            execute_next_with_sink(&k, &replay(true, true), &mut sink, &mut v, &mut j).await,
+            Err(Error::Retry)
+        ));
+        assert_eq!(j.0.saved, (ReaderCheckpoint::default(), false));
+        if lost_commit {
+            assert!(!trace.lock().unwrap().iter().any(|s| s.starts_with("save:")));
+        }
+        execute_next_with_sink(&k, &replay(true, true), &mut sink, &mut v, &mut j)
+            .await
+            .unwrap();
+        let calls: Vec<_> = trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.starts_with("sink:"))
+            .cloned()
+            .collect();
+        assert_eq!(calls, ["sink:10", "sink:10", "sink:20", "sink:30"]);
+        assert_eq!(sink.receipts, BTreeSet::from([10, 20, 30]));
+    }
+}
