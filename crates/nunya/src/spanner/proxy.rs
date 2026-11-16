@@ -99,8 +99,43 @@ pub struct NunyaSpanner {
     ctx: Arc<SpannerContext>,
     channel: Channel,
     sessions: Arc<Mutex<HashMap<String, SessionId>>>,
-    watchers: Arc<Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<()>>>>,
+    watchers: Arc<Mutex<HashMap<SessionId, SessionWatcher>>>,
     provider: Option<Arc<dyn gcp_auth::TokenProvider>>,
+}
+struct SessionWatcher {
+    stop: tokio::sync::oneshot::Sender<()>,
+    ended: tokio::sync::watch::Receiver<bool>,
+}
+fn ended_status(write: bool) -> Status {
+    nunya_status(if write {
+        NyCode::WriteOutcomeUnknown
+    } else {
+        NyCode::SessionEnded
+    })
+}
+fn after_forward(error: Status, write: bool) -> Status {
+    if write { ended_status(true) } else { error }
+}
+async fn ended(signal: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *signal.borrow_and_update() {
+            return;
+        }
+        if signal.changed().await.is_err() {
+            return;
+        }
+    }
+}
+async fn cancellable<T>(
+    signal: &mut tokio::sync::watch::Receiver<bool>,
+    write: bool,
+    future: impl std::future::Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    tokio::select! {
+        biased;
+        _ = ended(signal) => Err(ended_status(write)),
+        result = future => result.map_err(remote),
+    }
 }
 fn refusal(code: NyCode) -> Refusal {
     Refusal::new(code, "Spanner request refused")
@@ -271,7 +306,8 @@ impl NunyaSpanner {
                 .admit(who.session, Operation::Read)
                 .map_err(admission_status)?;
             let (stop, stopped) = tokio::sync::oneshot::channel();
-            entry.insert(stop);
+            let (ended_tx, ended) = tokio::sync::watch::channel(false);
+            entry.insert(SessionWatcher { stop, ended });
             let sessions = self.sessions.clone();
             let watchers = Arc::downgrade(&self.watchers);
             let channel = self.channel.clone();
@@ -284,6 +320,7 @@ impl NunyaSpanner {
                     _ = stopped => return,
                     _ = end.ended() => {},
                 }
+                ended_tx.send_replace(true);
                 let cleanup = async {
                     let names = {
                         let mut sessions = sessions.lock().map_err(|_| invalid())?;
@@ -321,6 +358,26 @@ impl NunyaSpanner {
         }
         sessions.insert(name.into(), who.session);
         Ok(())
+    }
+    fn end_signal(
+        &self,
+        who: &Authenticated,
+    ) -> Result<tokio::sync::watch::Receiver<bool>, Status> {
+        let signal = self
+            .watchers
+            .lock()
+            .map_err(|_| ended_status(false))?
+            .get(&who.session)
+            .map(|watcher| watcher.ended.clone())
+            .ok_or_else(|| ended_status(false))?;
+        if *signal.borrow() {
+            return Err(ended_status(false));
+        }
+        self.ctx
+            .authority
+            .admit(who.session, Operation::Read)
+            .map_err(|_| ended_status(false))?;
+        Ok(signal)
     }
     fn admit_write(&self, who: &Authenticated) -> Result<(), Status> {
         self.ctx
@@ -617,6 +674,7 @@ impl NunyaSpanner {
         }
         Ok(result)
     }
+    #[allow(clippy::too_many_arguments)]
     fn stream(
         &self,
         who: Authenticated,
@@ -624,6 +682,8 @@ impl NunyaSpanner {
         plan: RewritePlan,
         label: String,
         mut upstream: tonic::Streaming<PartialResultSet>,
+        mut signal: tokio::sync::watch::Receiver<bool>,
+        write: bool,
     ) -> ResultStream {
         let ctx = self.ctx.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
@@ -633,28 +693,39 @@ impl NunyaSpanner {
             let work = async {
                 let mut reassembler = Reassembler::new();
                 let mut types = None;
-                while let Some(part) = upstream.next().await {
+                loop {
+                    let part = tokio::select! {
+                        biased;
+                        _ = ended(&mut signal) => return Err(ended_status(write)),
+                        part = upstream.next() => part,
+                    };
+                    let Some(part) = part else {
+                        break;
+                    };
+                    ctx.authority
+                        .admit(who.session, Operation::Read)
+                        .map_err(|_| ended_status(write))?;
                     let (events, resume) =
-                        reassembler.push(part.map_err(remote)?).map_err(status)?;
+                        reassembler.push(part.map_err(remote)?).map_err(|e| after_forward(status(e), write))?;
+                    let mut chunk_tokens = vec![];
                     let mut metadata = None;
                     let mut rows = vec![];
                     let mut stats = None;
                     for event in events {
                         match event {
                             Event::Metadata(m) => {
-                                types = Some(Self::types(Some(&m), &plan)?);
+                                types = Some(Self::types(Some(&m), &plan).map_err(|e| after_forward(e, write))?);
                                 metadata = Some(m);
                             }
                             Event::Row(mut row) => {
-                                tokens.extend(Self::rewrite(
+                                chunk_tokens.extend(Self::rewrite(
                                     &ctx,
                                     &who,
                                     &policy,
                                     &plan,
-                                    types.as_deref().ok_or_else(invalid)?,
+                                    types.as_deref().ok_or_else(|| after_forward(invalid(), write))?,
                                     &mut row,
-                                )?);
-                                count += 1;
+                                ).map_err(|e| after_forward(e, write))?);
                                 rows.push(row);
                             }
                             Event::Stats(mut s) => {
@@ -666,17 +737,32 @@ impl NunyaSpanner {
                     }
                     if metadata.is_some() || !rows.is_empty() || stats.is_some() || resume.is_some()
                     {
-                        tx.send(Ok(stream::emit(metadata, rows, resume, stats)))
-                            .await
-                            .map_err(|_| Status::cancelled("stream closed"))?;
+                        let row_count = rows.len() as u64;
+                        tokio::select! {
+                            biased;
+                            _ = ended(&mut signal) => return Err(ended_status(write)),
+                            result = tx.send(Ok(stream::emit(metadata, rows, resume, stats))) => {
+                                result.map_err(|_| after_forward(Status::cancelled("stream closed"), write))?;
+                            }
+                        }
+                        count += row_count;
+                        tokens.extend(chunk_tokens);
                     }
                 }
-                reassembler.finish().map_err(status)?;
+                reassembler.finish().map_err(|e| after_forward(status(e), write))?;
                 Ok::<(), Status>(())
             }
             .await;
-            let audit = Self::audit(&ctx, &who, &label, count, tokens);
-            let work = audit.and(work);
+            drop(upstream);
+            let audit =
+                Self::audit(&ctx, &who, &label, count, tokens).map_err(|e| after_forward(e, write));
+            // A failed audit after a forwarded write is indeterminate even if the
+            // upstream also failed. For reads, preserve an NY011 cancellation.
+            let work = if write {
+                audit.and(work)
+            } else {
+                work.and(audit)
+            };
             if let Err(error) = work {
                 let _ = tx.send(Err(error)).await;
             }
@@ -812,7 +898,7 @@ impl SpannerService for NunyaSpanner {
         if !sessions.values().any(|owner| *owner == who.session)
             && let Some(stop) = watchers.remove(&who.session)
         {
-            let _ = stop.send(());
+            let _ = stop.stop.send(());
         }
         Ok(Response::new(()))
     }
@@ -823,10 +909,15 @@ impl SpannerService for NunyaSpanner {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
         self.session(&req.session, &who)?;
+        let mut signal = self.end_signal(&who)?;
         sql_features(&req)?;
         let (policy, snapshot) = self.configuration()?;
         let label = req.sql.clone();
         let (plan, names, kind) = self.sql(&who, &req.sql, &mut req.params, &policy, &snapshot)?;
+        let write = matches!(
+            kind,
+            StatementKind::Insert | StatementKind::Update | StatementKind::Delete
+        );
         match kind {
             StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {
                 self.admit_write(&who)?
@@ -853,15 +944,14 @@ impl SpannerService for NunyaSpanner {
             Self::audit(&self.ctx, &who, &label, 1, local_tokens(&result)?)?;
             return Ok(Response::new(result));
         }
-        let mut result = self
-            .client()
+        let mut result = cancellable(&mut signal, write, self.client().await?.execute_sql(req))
             .await?
-            .execute_sql(req)
-            .await
-            .map_err(remote)?
             .into_inner();
-        let tokens = self.rows(&who, &policy, &plan, &mut result)?;
-        Self::audit(&self.ctx, &who, &label, result.rows.len() as u64, tokens)?;
+        let tokens = self
+            .rows(&who, &policy, &plan, &mut result)
+            .map_err(|e| after_forward(e, write))?;
+        Self::audit(&self.ctx, &who, &label, result.rows.len() as u64, tokens)
+            .map_err(|e| after_forward(e, write))?;
         Ok(Response::new(result))
     }
     async fn execute_streaming_sql(
@@ -871,10 +961,15 @@ impl SpannerService for NunyaSpanner {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
         self.session(&req.session, &who)?;
+        let mut signal = self.end_signal(&who)?;
         sql_features(&req)?;
         let (policy, snapshot) = self.configuration()?;
         let label = req.sql.clone();
         let (plan, names, kind) = self.sql(&who, &req.sql, &mut req.params, &policy, &snapshot)?;
+        let write = matches!(
+            kind,
+            StatementKind::Insert | StatementKind::Update | StatementKind::Delete
+        );
         match kind {
             StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {
                 self.admit_write(&who)?
@@ -907,15 +1002,15 @@ impl SpannerService for NunyaSpanner {
                 },
             )]))));
         }
-        let upstream = self
-            .client()
-            .await?
-            .execute_streaming_sql(req)
-            .await
-            .map_err(remote)?
-            .into_inner();
+        let upstream = cancellable(
+            &mut signal,
+            write,
+            self.client().await?.execute_streaming_sql(req),
+        )
+        .await?
+        .into_inner();
         Ok(Response::new(
-            self.stream(who, policy, plan, label, upstream),
+            self.stream(who, policy, plan, label, upstream, signal, write),
         ))
     }
     async fn execute_batch_dml(
@@ -925,6 +1020,7 @@ impl SpannerService for NunyaSpanner {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
         self.session(&req.session, &who)?;
+        let mut signal = self.end_signal(&who)?;
         let (policy, snapshot) = self.configuration()?;
         let mut plans = vec![];
         let mut labels = vec![];
@@ -956,19 +1052,22 @@ impl SpannerService for NunyaSpanner {
         for label in &labels {
             Self::audit(&self.ctx, &who, label, 0, vec![])?;
         }
-        let mut result = self
-            .client()
-            .await?
-            .execute_batch_dml(req)
-            .await
-            .map_err(remote)?
-            .into_inner();
+        let mut result = cancellable(
+            &mut signal,
+            true,
+            self.client().await?.execute_batch_dml(req),
+        )
+        .await?
+        .into_inner();
         if result.result_sets.len() > plans.len() {
-            return Err(invalid());
+            return Err(ended_status(true));
         }
         for (i, set) in result.result_sets.iter_mut().enumerate() {
-            let tokens = self.rows(&who, &policy, &plans[i], set)?;
-            Self::audit(&self.ctx, &who, &labels[i], set.rows.len() as u64, tokens)?;
+            let tokens = self
+                .rows(&who, &policy, &plans[i], set)
+                .map_err(|e| after_forward(e, true))?;
+            Self::audit(&self.ctx, &who, &labels[i], set.rows.len() as u64, tokens)
+                .map_err(|e| after_forward(e, true))?;
         }
         if let Some(s) = &mut result.status {
             s.message = if s.code == 0 {
@@ -986,6 +1085,7 @@ impl SpannerService for NunyaSpanner {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
         self.session(&req.session, &who)?;
+        let mut signal = self.end_signal(&who)?;
         read_features(&req)?;
         let (policy, snapshot) = self.configuration()?;
         let lowered = spanner_struct::lower_read(&req, &snapshot, &policy).map_err(status)?;
@@ -1004,12 +1104,8 @@ impl SpannerService for NunyaSpanner {
             *read_value_mut(&mut req, &lowered.positions[index]).ok_or_else(invalid)? = value;
         }
         Self::audit(&self.ctx, &who, "Read", 0, vec![])?;
-        let mut result = self
-            .client()
+        let mut result = cancellable(&mut signal, false, self.client().await?.read(req))
             .await?
-            .read(req)
-            .await
-            .map_err(remote)?
             .into_inner();
         let tokens = self.rows(&who, &policy, &plan, &mut result)?;
         Self::audit(&self.ctx, &who, "Read", result.rows.len() as u64, tokens)?;
@@ -1022,6 +1118,7 @@ impl SpannerService for NunyaSpanner {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
         self.session(&req.session, &who)?;
+        let mut signal = self.end_signal(&who)?;
         read_features(&req)?;
         let (policy, snapshot) = self.configuration()?;
         let lowered = spanner_struct::lower_read(&req, &snapshot, &policy).map_err(status)?;
@@ -1040,12 +1137,8 @@ impl SpannerService for NunyaSpanner {
             *read_value_mut(&mut req, &lowered.positions[index]).ok_or_else(invalid)? = value;
         }
         Self::audit(&self.ctx, &who, "Read", 0, vec![])?;
-        let upstream = self
-            .client()
+        let upstream = cancellable(&mut signal, false, self.client().await?.streaming_read(req))
             .await?
-            .streaming_read(req)
-            .await
-            .map_err(remote)?
             .into_inner();
         Ok(Response::new(self.stream(
             who,
@@ -1053,6 +1146,8 @@ impl SpannerService for NunyaSpanner {
             plan,
             "Read".into(),
             upstream,
+            signal,
+            false,
         )))
     }
     async fn begin_transaction(
@@ -1062,24 +1157,24 @@ impl SpannerService for NunyaSpanner {
         let who = self.authenticate(&req)?;
         let req = req.into_inner();
         self.session(&req.session, &who)?;
+        let mut signal = self.end_signal(&who)?;
         Ok(Response::new(
-            self.client()
-                .await?
-                .begin_transaction(req)
-                .await
-                .map_err(remote)?
-                .into_inner(),
+            cancellable(
+                &mut signal,
+                false,
+                self.client().await?.begin_transaction(req),
+            )
+            .await?
+            .into_inner(),
         ))
     }
     async fn rollback(&self, req: Request<RollbackRequest>) -> Result<Response<()>, Status> {
         let who = self.authenticate(&req)?;
         let req = req.into_inner();
         self.session(&req.session, &who)?;
-        self.client()
+        let mut signal = self.end_signal(&who)?;
+        cancellable(&mut signal, false, self.client().await?.rollback(req))
             .await?
-            .rollback(req)
-            .await
-            .map_err(remote)?
             .into_inner();
         Ok(Response::new(()))
     }
@@ -1090,6 +1185,7 @@ impl SpannerService for NunyaSpanner {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
         self.session(&req.session, &who)?;
+        let mut signal = self.end_signal(&who)?;
         let (policy, snapshot) = self.configuration()?;
         if !req.mutations.is_empty() {
             self.admit_write(&who)?;
@@ -1117,11 +1213,8 @@ impl SpannerService for NunyaSpanner {
         }
         Self::audit(&self.ctx, &who, "Commit", 0, vec![])?;
         Ok(Response::new(
-            self.client()
+            cancellable(&mut signal, true, self.client().await?.commit(req))
                 .await?
-                .commit(req)
-                .await
-                .map_err(remote)?
                 .into_inner(),
         ))
     }
@@ -1358,6 +1451,10 @@ mod tests {
         next_session: std::sync::atomic::AtomicUsize,
         roles: Mutex<Vec<String>>,
         failure: std::sync::atomic::AtomicBool,
+        hold_sql: std::sync::atomic::AtomicBool,
+        hold_commit: std::sync::atomic::AtomicBool,
+        hold_stream: std::sync::atomic::AtomicBool,
+        release: tokio::sync::Notify,
     }
     #[tonic::async_trait]
     impl SpannerService for Fake {
@@ -1409,6 +1506,28 @@ mod tests {
         ) -> Result<Response<ResultStream>, Status> {
             self.streaming
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let hold = self.hold_stream.load(std::sync::atomic::Ordering::Relaxed);
+            if hold {
+                let first = PartialResultSet {
+                    metadata: Some(ResultSetMetadata {
+                        row_type: Some(StructType {
+                            fields: vec![struct_type::Field {
+                                name: "email".into(),
+                                r#type: Some(Type {
+                                    code: TypeCode::String as i32,
+                                    ..Default::default()
+                                }),
+                            }],
+                        }),
+                        ..Default::default()
+                    }),
+                    values: vec![text("private@example.com")],
+                    ..Default::default()
+                };
+                return Ok(Response::new(Box::pin(
+                    futures::stream::iter([Ok(first)]).chain(futures::stream::pending()),
+                )));
+            }
             Ok(Response::new(Box::pin(futures::stream::iter(vec![
                 Ok(PartialResultSet {
                     metadata: Some(ResultSetMetadata {
@@ -1449,6 +1568,9 @@ mod tests {
                 || req.sql.starts_with("INSERT ")
                 || req.sql.starts_with("DELETE ");
             self.seen.lock().unwrap().push(req);
+            if self.hold_sql.load(std::sync::atomic::Ordering::Relaxed) {
+                self.release.notified().await;
+            }
             if dml {
                 return Ok(Response::new(ResultSet::default()));
             }
@@ -1483,6 +1605,9 @@ mod tests {
             req: Request<CommitRequest>,
         ) -> Result<Response<CommitResponse>, Status> {
             self.commits.lock().unwrap().push(req.into_inner());
+            if self.hold_commit.load(std::sync::atomic::Ordering::Relaxed) {
+                self.release.notified().await;
+            }
             Ok(Response::new(CommitResponse::default()))
         }
     }
@@ -1565,6 +1690,9 @@ mod tests {
             session_request(value, id, "password")
         }
         async fn new() -> Self {
+            Self::with_log(Box::new(StdoutLog)).await
+        }
+        async fn with_log(readlog: Box<dyn ReadLog>) -> Self {
             let fake = Arc::new(Fake::default());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1639,7 +1767,7 @@ mod tests {
                 policy: RwLock::new(Arc::new(policy)),
                 snapshot: RwLock::new(Arc::new(snapshot)),
                 root_key: RootKey::from_hex(&"00".repeat(32)).unwrap(),
-                readlog: Box::new(StdoutLog),
+                readlog,
                 codec: StandardCodec,
                 database: "projects/p/instances/i/databases/d".into(),
                 clock: Arc::new(|| 0),
@@ -2137,6 +2265,142 @@ mod tests {
             nunya_status(NyCode::StatementNotAllowed).code()
         );
         assert!(error.message().contains("NY006"));
+    }
+    fn revoke(f: &Fixture) {
+        f.svc
+            .ctx
+            .authority
+            .revoke(f.alice, crate::state::model::EndReason::AdminRevoked)
+            .unwrap();
+    }
+    fn assert_ended(error: Status, write: bool) {
+        assert_eq!(
+            error.code(),
+            if write {
+                tonic::Code::Unknown
+            } else {
+                tonic::Code::PermissionDenied
+            }
+        );
+        assert!(
+            error
+                .message()
+                .contains(if write { "NY012" } else { "NY011" })
+        );
+    }
+    #[tokio::test]
+    async fn stream_stops_after_revocation() {
+        let f = Fixture::new().await;
+        f.fake
+            .hold_stream
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let req = f.query("SELECT email FROM customers").await;
+        let mut stream = f
+            .svc
+            .execute_streaming_sql(f.request(req, "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.values, vec![f.token()]);
+        revoke(&f);
+        let error = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_ended(error, false);
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            f.fake.streaming.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn commit_in_flight_is_ny012_after_revocation() {
+        let f = Fixture::new().await;
+        let session = f.session().await;
+        f.fake
+            .hold_commit
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let call = f.svc.commit(f.request(
+            CommitRequest {
+                session,
+                ..Default::default()
+            },
+            "alice",
+        ));
+        let cancel = async {
+            wait_for(|| f.fake.commits.lock().unwrap().len() == 1).await;
+            revoke(&f);
+        };
+        let (response, ()) =
+            tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(call, cancel) })
+                .await
+                .unwrap();
+        assert_ended(response.unwrap_err(), true);
+        assert_eq!(f.fake.commits.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn dml_in_flight_is_ny012_and_select_is_ny011() {
+        for write in [true, false] {
+            let f = Fixture::new().await;
+            let mut req = f
+                .query(if write {
+                    "UPDATE customers SET email = @v"
+                } else {
+                    "SELECT email FROM customers"
+                })
+                .await;
+            if write {
+                req.params = Some(prost_types::Struct {
+                    fields: [("v".into(), f.token())].into(),
+                });
+            }
+            f.fake
+                .hold_sql
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let call = f.svc.execute_sql(f.request(req, "alice"));
+            let cancel = async {
+                wait_for(|| f.fake.seen.lock().unwrap().len() == 1).await;
+                revoke(&f);
+            };
+            let (response, ()) =
+                tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(call, cancel) })
+                    .await
+                    .unwrap();
+            assert_ended(response.unwrap_err(), write);
+            assert_eq!(f.fake.seen.lock().unwrap().len(), 1);
+        }
+    }
+    struct FailPostAudit(std::sync::atomic::AtomicUsize);
+    impl ReadLog for FailPostAudit {
+        fn write(&self, _: &ReadLogRecord) -> Result<(), Refusal> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                Ok(())
+            } else {
+                Err(refusal(NyCode::ReadLogUnavailable))
+            }
+        }
+    }
+    #[tokio::test]
+    async fn audit_failure_after_forwarded_dml_is_ny012() {
+        let f = Fixture::with_log(Box::new(FailPostAudit(
+            std::sync::atomic::AtomicUsize::new(0),
+        )))
+        .await;
+        let mut req = f.query("UPDATE customers SET email = @v").await;
+        req.params = Some(prost_types::Struct {
+            fields: [("v".into(), f.token())].into(),
+        });
+        assert_ended(
+            f.svc
+                .execute_sql(f.request(req, "alice"))
+                .await
+                .unwrap_err(),
+            true,
+        );
+        assert_eq!(f.fake.seen.lock().unwrap().len(), 1);
     }
     #[tokio::test]
     async fn revocation_deletes_upstream_sessions() {

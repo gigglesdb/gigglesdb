@@ -32,7 +32,7 @@ pub fn nunya_status(code: NyCode) -> Status {
         NyCode::SessionEnded => Code::PermissionDenied,
         NyCode::WriteOutcomeUnknown => Code::Unknown,
         NyCode::NotAnalysable => Code::InvalidArgument,
-        NyCode::SchemaStale | NyCode::ReadLogUnavailable => Code::Unavailable,
+        NyCode::SchemaStale | NyCode::ReadLogUnavailable => Code::FailedPrecondition,
         NyCode::TokenOutsideDomain
         | NyCode::BlindOperation
         | NyCode::TokenNotValid
@@ -60,6 +60,18 @@ mod tests {
     fn refusals() {
         for code in NyCode::ALL {
             let s = nunya_status(code);
+            assert!(!matches!(
+                s.code(),
+                Code::Aborted
+                    | Code::Unavailable
+                    | Code::ResourceExhausted
+                    | Code::Internal
+                    | Code::NotFound
+                    | Code::DeadlineExceeded
+            ));
+            if matches!(code, NyCode::SchemaStale | NyCode::ReadLogUnavailable) {
+                assert_eq!(s.code(), Code::FailedPrecondition);
+            }
             assert_eq!(
                 s.message(),
                 format!("{}: {}", code.sqlstate(), code.message())
