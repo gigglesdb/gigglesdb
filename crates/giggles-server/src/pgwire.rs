@@ -2116,6 +2116,19 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(Ok(v)) => v,
             _ => return Ok(()),
         };
+        if matches!(tag, b'Q' | b'E')
+            && let Some(gate) = session.service.statement_gate.get().cloned()
+            && !matches!(tokio::task::spawn_blocking(move || gate()).await, Ok(Ok(())))
+        {
+            let mut body = b"SFATAL\0VFATAL\0C57P01\0M".to_vec();
+            z("terminating connection: this node is not the replication leader", &mut body);
+            body.push(0);
+            let mut out = Vec::new();
+            frame(b'E', &body, &mut out).map_err(io::Error::other)?;
+            send(s, &out).await?;
+            s.shutdown().await?;
+            return Ok(());
+        }
         // An admin command may invalidate its own login generation. Deliver its
         // completion and finish the extended cycle, then reject further work.
         if admin_sync {

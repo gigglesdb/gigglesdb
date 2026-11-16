@@ -215,3 +215,8 @@ mod fk_section_network;
 #[path = "api_catalog_views.rs"] mod api_catalog_views;
 #[path = "api_paging.rs"] mod api_paging;
 #[path = "api_sequences.rs"] mod api_sequences;
+#[path = "replication_refuse.rs"] mod replication_refuse;
+
+#[path = "replication_gate.rs"] mod replication_gate;
+#[path = "replication_runtime.rs"] mod replication_runtime;
+#[path = "replication_process.rs"] mod replication_process;

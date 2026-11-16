@@ -157,7 +157,7 @@ fn owner_password() -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
-fn password_verifier(password: &str) -> io::Result<String> {
+pub fn password_verifier(password: &str) -> io::Result<String> {
     let mut salt = [0; 16];
     getrandom::fill(&mut salt).map_err(io::Error::other)?;
     Ok(Verifier::derive(password, &salt, crate::auth::scram::DEFAULT_ITERATIONS).encode())

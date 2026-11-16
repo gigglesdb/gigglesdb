@@ -6,6 +6,7 @@ mod pg_settings;
 mod pg_transaction;
 pub mod pgwire;
 pub(crate) mod pgwire_startup;
+pub mod replication;
 pub mod service;
 pub mod tls;
 pub mod transport;

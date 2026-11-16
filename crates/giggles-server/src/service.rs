@@ -114,7 +114,10 @@ fn digest(effects: &[Effect]) -> String {
 }
 pub use giggles_core::sqlstate;
 
+pub type StatementGate = std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
 pub struct Service {
+    pub(crate) statement_gate: std::sync::OnceLock<StatementGate>,
     pub(crate) advisory: crate::advisory::Locks,
     pub(crate) blocking: crate::blocking::Blocking,
     pub(crate) cancellations: crate::cancel::Registry,
@@ -161,6 +164,7 @@ impl Service {
             blocking: crate::blocking::Blocking::new(),
             cancellations: crate::cancel::Registry::default(),
             task_gate: std::sync::Mutex::new(()),
+            statement_gate: std::sync::OnceLock::new(),
             password_generations: std::sync::Mutex::new(BTreeMap::new()),
             authority_gate: std::sync::RwLock::new(()),
             binding_changes: tokio::sync::watch::channel(()).0,
@@ -169,6 +173,12 @@ impl Service {
             admin,
             clock,
         }))
+    }
+    pub fn set_statement_gate(&self, gate: StatementGate) -> Result<(), StatementGate> {
+        self.statement_gate.set(gate)
+    }
+    pub(crate) fn check_statement_gate(&self) -> Result<(), String> {
+        self.statement_gate.get().map_or(Ok(()), |gate| gate())
     }
     fn validate(
         admin: &Admin,
@@ -1815,6 +1825,9 @@ impl Session {
             .unwrap_or_else(|error| Response::error(&error))
     }
     fn handle_authorized(&mut self, request: Request, received: std::time::Instant) -> Response {
+        if self.service.check_statement_gate().is_err() {
+            return Response::code("57P01");
+        }
         let context = Cancellation::current().unwrap_or_default();
         context.scope(|| {
             let response = self.handle_scoped(request, received, &context);
