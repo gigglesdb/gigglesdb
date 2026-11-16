@@ -52,6 +52,69 @@ pub struct ReadLogRecord {
     /// Tokens released by this statement.
     pub tokens_released: Vec<String>,
 }
+/// Fixed lifecycle event kinds.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleKind {
+    /// A session was issued.
+    Issued,
+    /// A session was renewed.
+    Renewed,
+    /// A session was revoked.
+    Revoked,
+    /// A principal was disabled.
+    PrincipalDisabled,
+    /// A resume was refused.
+    ResumeRefused,
+    /// A durable session ended.
+    SessionEnded,
+    /// A registered connection ended.
+    ConnectionEnded,
+}
+/// Non-secret actor responsible for a lifecycle event.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleActor {
+    /// The session owner.
+    Owner,
+    /// An administrator's principal hex identifier.
+    Admin(String),
+    /// The configuration administrator.
+    ConfigAdmin,
+    /// The local management socket.
+    Socket,
+    /// Automatic state maintenance or connection termination.
+    System,
+}
+/// Data-free lifecycle audit record containing identifiers and fixed codes only.
+#[derive(Clone, Debug)]
+pub struct LifecycleRecord {
+    /// Lifecycle event kind.
+    pub kind: LifecycleKind,
+    /// Unix timestamp in milliseconds.
+    pub at_ms: u64,
+    /// Principal hex identifier.
+    pub principal: String,
+    /// Optional session hex identifier.
+    pub session: Option<String>,
+    /// Optional route identifier.
+    pub route: Option<String>,
+    /// Optional registered connection identifier.
+    pub connection: Option<u64>,
+    /// Event actor.
+    pub actor: LifecycleActor,
+    /// Fixed, data-free reason code.
+    pub reason: &'static str,
+}
+fn lifecycle_line(rec: &LifecycleRecord) -> Result<Vec<u8>, Refusal> {
+    let mut bytes = serde_json::to_vec(&serde_json::json!({
+        "kind": "lifecycle", "event": rec.kind, "ts": rec.at_ms,
+        "principal": rec.principal, "session": rec.session, "route": rec.route,
+        "connection": rec.connection, "actor": rec.actor, "reason": rec.reason,
+    })).map_err(|_| failure())?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
 fn failure() -> Refusal {
     Refusal::new(NyCode::ReadLogUnavailable, "read log unavailable")
 }
@@ -68,14 +131,23 @@ fn line(rec: &ReadLogRecord) -> Result<Vec<u8>, Refusal> {
 pub trait ReadLog: Send + Sync {
     /// Write and flush one JSON record.
     fn write(&self, rec: &ReadLogRecord) -> Result<(), Refusal>;
+    /// Write and flush one lifecycle record.
+    fn write_lifecycle(&self, rec: &LifecycleRecord) -> Result<(), Refusal>;
 }
 /// Standard-output JSON log.
 pub struct StdoutLog;
 impl ReadLog for StdoutLog {
     fn write(&self, rec: &ReadLogRecord) -> Result<(), Refusal> {
-        let bytes = line(rec)?;
+        self.write_bytes(&line(rec)?)
+    }
+    fn write_lifecycle(&self, rec: &LifecycleRecord) -> Result<(), Refusal> {
+        self.write_bytes(&lifecycle_line(rec)?)
+    }
+}
+impl StdoutLog {
+    fn write_bytes(&self, bytes: &[u8]) -> Result<(), Refusal> {
         let mut out = std::io::stdout().lock();
-        out.write_all(&bytes)
+        out.write_all(bytes)
             .and_then(|_| out.flush())
             .map_err(|_| failure())
     }
@@ -111,7 +183,14 @@ impl FileLog {
 }
 impl ReadLog for FileLog {
     fn write(&self, rec: &ReadLogRecord) -> Result<(), Refusal> {
-        let bytes = line(rec)?;
+        self.write_bytes(&line(rec)?)
+    }
+    fn write_lifecycle(&self, rec: &LifecycleRecord) -> Result<(), Refusal> {
+        self.write_bytes(&lifecycle_line(rec)?)
+    }
+}
+impl FileLog {
+    fn write_bytes(&self, bytes: &[u8]) -> Result<(), Refusal> {
         let len = u64::try_from(bytes.len()).map_err(|_| failure())?;
         let mut state = self.state.lock().map_err(|_| failure())?;
         if state.size != 0 && state.size.checked_add(len).ok_or_else(failure)? > self.max_bytes {
@@ -140,7 +219,7 @@ impl ReadLog for FileLog {
             state.size = 0;
         }
         let file = state.file.as_mut().ok_or_else(failure)?;
-        if file.write_all(&bytes).and_then(|_| file.flush()).is_err() {
+        if file.write_all(bytes).and_then(|_| file.flush()).is_err() {
             drop(state.file.take());
             return Err(failure());
         }
@@ -366,6 +445,57 @@ fn redact_inner(sql: &str, depth: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn lifecycle(actor: LifecycleActor) -> LifecycleRecord {
+        LifecycleRecord {
+            kind: LifecycleKind::SessionEnded, at_ms: 42,
+            principal: "01".repeat(16), session: Some("02".repeat(16)),
+            route: None, connection: None, actor, reason: "grant_removed",
+        }
+    }
+    #[test]
+    fn lifecycle_json_has_only_identifiers_and_codes() {
+        for (actor, expected) in [
+            (LifecycleActor::Admin("03".repeat(16)), serde_json::json!({"admin": "03".repeat(16)})),
+            (LifecycleActor::System, serde_json::json!("system")),
+        ] {
+            let bytes = lifecycle_line(&lifecycle(actor)).unwrap();
+            assert_eq!(bytes.last(), Some(&b'\n'));
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value, serde_json::json!({
+                "kind": "lifecycle", "event": "session_ended", "ts": 42,
+                "principal": "01".repeat(16), "session": "02".repeat(16),
+                "route": null, "connection": null, "actor": expected, "reason": "grant_removed",
+            }));
+        }
+        for (kind, code) in [
+            (LifecycleKind::Issued, "issued"), (LifecycleKind::Renewed, "renewed"),
+            (LifecycleKind::Revoked, "revoked"), (LifecycleKind::PrincipalDisabled, "principal_disabled"),
+            (LifecycleKind::ResumeRefused, "resume_refused"), (LifecycleKind::ConnectionEnded, "connection_ended"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), code);
+        }
+        for (actor, code) in [(LifecycleActor::Owner, "owner"), (LifecycleActor::ConfigAdmin, "config_admin"), (LifecycleActor::Socket, "socket")] {
+            assert_eq!(serde_json::to_value(actor).unwrap(), code);
+        }
+    }
+    #[test]
+    fn file_log_orders_both_record_kinds() {
+        let dir = temp();
+        let path = dir.join("audit");
+        let log = FileLog::open(&path, u64::MAX).unwrap();
+        let statement = record();
+        let lifecycle = lifecycle(LifecycleActor::System);
+        log.write(&statement).unwrap();
+        log.write_lifecycle(&lifecycle).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [line(&statement).unwrap(), lifecycle_line(&lifecycle).unwrap()].concat());
+        drop(log);
+        let log = FileLog::open(&path, 1).unwrap();
+        log.write_lifecycle(&lifecycle).unwrap();
+        assert_eq!(std::fs::read(dir.join("audit.1")).unwrap(), [line(&statement).unwrap(), lifecycle_line(&lifecycle).unwrap()].concat());
+        assert_eq!(std::fs::read(&path).unwrap(), lifecycle_line(&lifecycle).unwrap());
+        drop(log);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     fn record() -> ReadLogRecord {
         ReadLogRecord {
             ts_unix_ms: 42,

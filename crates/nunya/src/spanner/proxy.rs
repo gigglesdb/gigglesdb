@@ -16,7 +16,7 @@ use crate::{
     error::{NyCode, Refusal},
     ir::{InputRewrite, RewritePlan, StatementKind, ValueSource, check::check},
     policy::{DomainName, Policy, TokenizeSetting},
-    readlog::{Outcome, ReadLog, ReadLogRecord, statement_fingerprint},
+    readlog::{LifecycleRecord, LifecycleKind, LifecycleActor, Outcome, ReadLog, ReadLogRecord, statement_fingerprint},
     schema::Snapshot,
     state::authority::{AdmitError, Operation, TokenizeError, TokenizeLimits},
     token::{SessionId, StandardCodec, TokenCodec, keys::RootKey},
@@ -314,14 +314,31 @@ impl NunyaSpanner {
             let channel = self.channel.clone();
             let provider = self.provider.clone();
             let session = who.session;
+            let principal = who.principal;
+            let ctx = self.ctx.clone();
             tokio::spawn(async move {
                 let _guard = guard;
-                tokio::select! {
+                let reason = tokio::select! {
                     biased;
                     _ = stopped => return,
-                    _ = end.ended() => {},
-                }
+                    reason = end.ended() => reason,
+                };
                 ended_tx.send_replace(true);
+                if ctx.readlog.write_lifecycle(&LifecycleRecord {
+                    kind: LifecycleKind::ConnectionEnded,
+                    at_ms: (ctx.clock)(),
+                    principal: principal.to_hex(),
+                    session: Some(session.to_hex()),
+                    route: Some(ctx.route.as_str().into()),
+                    connection: Some(_guard.id().get()),
+                    actor: LifecycleActor::System,
+                    reason: match reason {
+                        crate::state::registry::EndReason::Revoked => "revoked",
+                        crate::state::registry::EndReason::Expired => "expired",
+                    },
+                }).is_err() {
+                    eprintln!("audit: lifecycle record unavailable");
+                }
                 let cleanup = async {
                     let names = {
                         let mut sessions = sessions.lock().map_err(|_| invalid())?;
@@ -1832,17 +1849,43 @@ mod tests {
                 .unwrap()
         }
     }
-    struct CaptureLog(Arc<Mutex<Vec<ReadLogRecord>>>);
+    struct CaptureLog(Arc<Mutex<Vec<ReadLogRecord>>>, Arc<Mutex<Vec<LifecycleRecord>>>);
     impl ReadLog for CaptureLog {
+        fn write_lifecycle(&self, record: &LifecycleRecord) -> Result<(), Refusal> {
+            self.1.lock().unwrap().push(record.clone());
+            Ok(())
+        }
         fn write(&self, record: &ReadLogRecord) -> Result<(), Refusal> {
             self.0.lock().unwrap().push(record.clone());
             Ok(())
         }
     }
     #[tokio::test]
+    async fn revocation_audits_watcher_connection() {
+        let records = Arc::new(Mutex::new(vec![]));
+        let lifecycle = Arc::new(Mutex::new(vec![]));
+        let f = Fixture::with_log(Box::new(CaptureLog(records.clone(), lifecycle.clone()))).await;
+        let _name = f.session().await;
+        let connection = f.svc.watchers.lock().unwrap()[&f.alice].connection;
+        let row = f.svc.ctx.authority.session(f.alice).unwrap();
+        revoke(&f);
+        wait_for(|| !lifecycle.lock().unwrap().is_empty()).await;
+        let lifecycle = lifecycle.lock().unwrap();
+        assert_eq!(lifecycle.len(), 1);
+        let record = &lifecycle[0];
+        assert_eq!(record.kind, LifecycleKind::ConnectionEnded);
+        assert_eq!(record.actor, LifecycleActor::System);
+        assert_eq!(record.reason, "revoked");
+        assert_eq!(record.connection, Some(connection));
+        assert_eq!(record.session, Some(f.alice.to_hex()));
+        assert_eq!(record.principal, row.principal.to_hex());
+        assert_eq!(record.route.as_deref(), Some(f.svc.ctx.route.as_str()));
+        assert!(records.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
     async fn audit_records_bearer_identity_and_watcher_connection() {
         let records = Arc::new(Mutex::new(vec![]));
-        let f = Fixture::with_log(Box::new(CaptureLog(records.clone()))).await;
+        let f = Fixture::with_log(Box::new(CaptureLog(records.clone(), Arc::new(Mutex::new(vec![]))))).await;
         let name = f.session().await;
         let authority = &f.svc.ctx.authority;
         let row = authority.session(f.alice).unwrap();
@@ -2417,7 +2460,15 @@ mod tests {
     }
     struct FailPostAudit(std::sync::atomic::AtomicUsize);
     impl ReadLog for FailPostAudit {
+        fn write_lifecycle(&self, _: &LifecycleRecord) -> Result<(), Refusal> {
+            self.next()
+        }
         fn write(&self, _: &ReadLogRecord) -> Result<(), Refusal> {
+            self.next()
+        }
+    }
+    impl FailPostAudit {
+        fn next(&self) -> Result<(), Refusal> {
             if self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
                 Ok(())
             } else {

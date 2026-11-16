@@ -9,7 +9,7 @@ use nunya::{
         session::serve_tcp,
         upstream::{UpstreamConfig, UpstreamTls},
     },
-    readlog::{ReadLog, ReadLogRecord},
+    readlog::{LifecycleRecord, ReadLog, ReadLogRecord},
     token::{StandardCodec, keys::RootKey},
 };
 use std::{
@@ -24,6 +24,9 @@ type Rows = Vec<Vec<Option<String>>>;
 
 struct Audit;
 impl ReadLog for Audit {
+    fn write_lifecycle(&self, _: &LifecycleRecord) -> Result<(), Refusal> {
+        Ok(())
+    }
     fn write(&self, _: &ReadLogRecord) -> Result<(), Refusal> {
         Ok(())
     }

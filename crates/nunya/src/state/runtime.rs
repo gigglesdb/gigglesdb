@@ -9,7 +9,8 @@ use crate::{
     config::{SessionSettings, StandingSection},
     token::{PrincipalId, SessionId, keys::RootKey},
 };
-use std::{fmt, path::Path, sync::Arc, time::Duration};
+use std::{fmt, path::Path, sync::{Arc, OnceLock, Weak}, time::Duration};
+use crate::readlog::{ReadLog, LifecycleRecord, LifecycleKind, LifecycleActor};
 
 /// Delay between service state maintenance passes.
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
@@ -34,10 +35,14 @@ pub struct MaintenanceOutcome {
 /// Shared registry of access-session connections.
 pub type Registry = ConnectionRegistry<SessionId, PrincipalId>;
 
-struct RegistryHook(Registry);
+struct RegistryHook {
+    registry: Registry,
+    authority: Weak<Authority>,
+    log: Arc<OnceLock<Arc<dyn ReadLog>>>,
+}
 impl RevocationHook for RegistryHook {
-    fn session_ended(&self, session: SessionId, _: PrincipalId, reason: EndReason) {
-        let reason = match reason {
+    fn session_ended(&self, session: SessionId, principal: PrincipalId, reason: EndReason) {
+        let connection_reason = match reason {
             EndReason::Expired | EndReason::IdleTimeout => ConnectionEndReason::Expired,
             EndReason::Requested
             | EndReason::AdminRevoked
@@ -45,7 +50,23 @@ impl RevocationHook for RegistryHook {
             | EndReason::ConfigRemoved
             | EndReason::GrantRemoved => ConnectionEndReason::Revoked,
         };
-        self.0.signal_session(&session, reason);
+        self.registry.signal_session(&session, connection_reason);
+        let route = self.authority.upgrade()
+            .and_then(|authority| authority.session(session))
+            .map(|row| row.route.as_str().to_owned());
+        let record = LifecycleRecord {
+            kind: LifecycleKind::SessionEnded,
+            at_ms: crate::serve::now(),
+            principal: principal.to_hex(),
+            session: Some(session.to_hex()),
+            route,
+            connection: None,
+            actor: LifecycleActor::System,
+            reason: reason.as_str(),
+        };
+        if self.log.get().is_none_or(|log| log.write_lifecycle(&record).is_err()) {
+            eprintln!("audit: lifecycle record unavailable");
+        }
     }
 }
 
@@ -55,6 +76,7 @@ pub struct StateRuntime {
     pub authority: Arc<Authority>,
     /// Open connections shared by both routes.
     pub registry: Registry,
+    lifecycle_log: Arc<OnceLock<Arc<dyn ReadLog>>>,
 }
 impl fmt::Debug for StateRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -75,6 +97,11 @@ fn store_error(error: StoreError) -> String {
     }
 }
 impl StateRuntime {
+    /// Attach the startup lifecycle audit sink once it is available.
+    pub fn set_lifecycle_log(&self, log: Arc<dyn ReadLog>) {
+        let _ = self.lifecycle_log.set(log);
+    }
+
     /// Sweep expiry, flush activity and periodically purge retained tombstones.
     pub fn maintain(&self, tick: u64) -> MaintenanceOutcome {
         let mut outcome = MaintenanceOutcome::default();
@@ -132,10 +159,14 @@ impl StateRuntime {
         let store = Arc::new(RedbStore::with_clock(state_dir, &tests::root(), clock).unwrap());
         let authority = Authority::load(store, limits).unwrap();
         let registry = Registry::new();
-        authority.set_hook(Arc::new(RegistryHook(registry.clone())));
+        let lifecycle_log = Arc::new(OnceLock::new());
+        authority.set_hook(Arc::new(RegistryHook {
+            registry: registry.clone(), authority: Arc::downgrade(&authority), log: lifecycle_log.clone(),
+        }));
         Arc::new(Self {
             authority,
             registry,
+            lifecycle_log,
         })
     }
 
@@ -159,7 +190,10 @@ impl StateRuntime {
         )
         .map_err(|e| format!("state authority load failed: {e}"))?;
         let registry = Registry::new();
-        authority.set_hook(Arc::new(RegistryHook(registry.clone())));
+        let lifecycle_log = Arc::new(OnceLock::new());
+        authority.set_hook(Arc::new(RegistryHook {
+            registry: registry.clone(), authority: Arc::downgrade(&authority), log: lifecycle_log.clone(),
+        }));
         let principals: Vec<_> = standing
             .iter()
             .map(|entry| ConfigPrincipal {
@@ -178,6 +212,7 @@ impl StateRuntime {
         Ok(Arc::new(Self {
             authority,
             registry,
+            lifecycle_log,
         }))
     }
 }
@@ -191,6 +226,60 @@ mod tests {
     };
     use std::path::PathBuf;
 
+    #[derive(Default)]
+    struct Audit(std::sync::Mutex<Vec<LifecycleRecord>>);
+    impl ReadLog for Audit {
+        fn write(&self, _: &crate::readlog::ReadLogRecord) -> Result<(), crate::error::Refusal> { Ok(()) }
+        fn write_lifecycle(&self, record: &LifecycleRecord) -> Result<(), crate::error::Refusal> {
+            self.0.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+    }
+    #[test]
+    fn failed_lifecycle_sink_does_not_prevent_revocation() {
+        struct Unavailable;
+        impl ReadLog for Unavailable {
+            fn write(&self, _: &crate::readlog::ReadLogRecord) -> Result<(), crate::error::Refusal> {
+                Err(crate::error::Refusal::new(crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))
+            }
+            fn write_lifecycle(&self, _: &LifecycleRecord) -> Result<(), crate::error::Refusal> {
+                Err(crate::error::Refusal::new(crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))
+            }
+        }
+        let dir = TestDir::new();
+        let runtime = dir.open(&[]);
+        let session = acquire(&runtime);
+        runtime.set_lifecycle_log(Arc::new(Unavailable));
+        let (_guard, signal) = runtime.registry.register(session.id, session.principal, "postgres", None);
+        runtime.authority.revoke(session.id, EndReason::Requested).unwrap();
+        assert_eq!(signal.try_ended(), Some(ConnectionEndReason::Revoked));
+        assert!(runtime.authority.admit(session.id, crate::state::authority::Operation::Read).is_err());
+    }
+    #[test]
+    fn session_end_records_requested_and_grant_removed() {
+        for reason in [EndReason::Requested, EndReason::GrantRemoved] {
+            let dir = TestDir::new();
+            let runtime = dir.open(&[]);
+            let log = Arc::new(Audit::default());
+            runtime.set_lifecycle_log(log.clone());
+            let session = acquire(&runtime);
+            match reason {
+                EndReason::Requested => { runtime.authority.revoke(session.id, reason).unwrap(); }
+                EndReason::GrantRemoved => { runtime.authority.set_grants(session.principal, vec![]).unwrap(); }
+                EndReason::AdminRevoked | EndReason::PrincipalDisabled | EndReason::ConfigRemoved | EndReason::Expired | EndReason::IdleTimeout => panic!("unexpected test reason"),
+            }
+            let records = log.0.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(record.kind, LifecycleKind::SessionEnded);
+            assert_eq!(record.actor, LifecycleActor::System);
+            assert_eq!(record.reason, reason.as_str());
+            assert_eq!(record.principal, session.principal.to_hex());
+            assert_eq!(record.session, Some(session.id.to_hex()));
+            assert_eq!(record.route.as_deref(), Some("postgres"));
+            assert_eq!(record.connection, None);
+        }
+    }
     struct TestDir(PathBuf);
     impl TestDir {
         fn new() -> Self {
@@ -255,6 +344,8 @@ mod tests {
             },
             Arc::new(move || c.load(Ordering::SeqCst)),
         );
+        let log = Arc::new(Audit::default());
+        runtime.set_lifecycle_log(log.clone());
         let session = acquire(&runtime);
         let (_guard, signal) =
             runtime
@@ -278,6 +369,13 @@ mod tests {
             }
         );
         assert_eq!(signal.try_ended(), Some(ConnectionEndReason::Expired));
+        let records = log.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, LifecycleKind::SessionEnded);
+        assert_eq!(records[0].reason, reason.as_str());
+        assert_eq!(records[0].session, Some(session.id.to_hex()));
+        assert_eq!(records[0].principal, session.principal.to_hex());
+        assert_eq!(records[0].route.as_deref(), Some("postgres"));
         assert_eq!(
             runtime.authority.session(session.id).unwrap().revoke_reason,
             Some(reason)
@@ -400,7 +498,7 @@ mod tests {
             let session = SessionId::random();
             let principal = PrincipalId::random();
             let (_guard, signal) = registry.register(session, principal, "postgres", None);
-            RegistryHook(registry).session_ended(session, principal, reason);
+            RegistryHook { registry, authority: Weak::new(), log: Arc::new(OnceLock::new()) }.session_ended(session, principal, reason);
             let expected = match reason {
                 EndReason::Expired | EndReason::IdleTimeout => ConnectionEndReason::Expired,
                 EndReason::Requested

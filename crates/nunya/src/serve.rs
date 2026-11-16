@@ -90,6 +90,10 @@ pub(crate) struct ReloadableLog(
     pub(crate) Arc<RwLock<Revisions>>,
 );
 impl crate::readlog::ReadLog for ReloadableLog {
+    fn write_lifecycle(&self, record: &crate::readlog::LifecycleRecord) -> Result<(), crate::error::Refusal> {
+        self.0.read().map_err(|_| crate::error::Refusal::new(
+            crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))?.write_lifecycle(record)
+    }
     fn write(&self, record: &crate::readlog::ReadLogRecord) -> Result<(), crate::error::Refusal> {
         let sink = self.0.read().map_err(|_| crate::error::Refusal::new(
             crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))?;
@@ -310,6 +314,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         None
     };
     let hub = crate::reload::Hub::new(&config.policy, config.policy_watch_ms)?;
+    runtime.set_lifecycle_log(Arc::new(hub.log.clone()));
     hub.log.1.write().map_err(|_| "read log lock unavailable")?.config = config.revision.clone();
     let policy = hub.policy();
     let (reload_tx, reload_rx) = mpsc::channel(1);

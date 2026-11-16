@@ -15,7 +15,7 @@ use crate::{
         ValueSource,
     },
     policy::{DomainName, Policy, TokenizeSetting},
-    readlog::{Outcome, ReadLogRecord, redact_tokenize_args, statement_fingerprint},
+    readlog::{LifecycleActor, LifecycleKind, LifecycleRecord, Outcome, ReadLogRecord, redact_tokenize_args, statement_fingerprint},
     state::{
         authority::{AdmitError, Operation, TokenizeError, TokenizeLimits},
         model::Mode,
@@ -149,15 +149,34 @@ impl Session {
             })
     }
     /// Audit and close an ended connection, preserving uncertain write outcomes.
-    pub(crate) fn end(&mut self) -> Actions {
+    pub(crate) fn end(&mut self, reason: crate::state::registry::EndReason) -> Actions {
         let code = if self.write_in_flight() {
             NyCode::WriteOutcomeUnknown
         } else {
             NyCode::SessionEnded
         };
-        let mut actions = self.refuse("", code, false);
-        actions.close = true;
-        actions
+        self.ctx.metrics.refused(code);
+        let record = LifecycleRecord {
+            kind: LifecycleKind::ConnectionEnded,
+            at_ms: (self.ctx.clock)(),
+            principal: self.principal.to_hex(),
+            session: Some(self.session.to_hex()),
+            route: Some(self.ctx.route.as_str().into()),
+            connection: self.connection,
+            actor: LifecycleActor::System,
+            reason: match reason {
+                crate::state::registry::EndReason::Revoked => "revoked",
+                crate::state::registry::EndReason::Expired => "expired",
+            },
+        };
+        let failed = self.ctx.readlog.write_lifecycle(&record).is_err();
+        Actions {
+            client: vec![Backend::ErrorResponse(nunya_error(if failed {
+                NyCode::ReadLogUnavailable
+            } else { code }))],
+            close: true,
+            ..Actions::default()
+        }
     }
     fn admit(&self) -> Result<Mode, Refusal> {
         self.ctx
@@ -1011,12 +1030,13 @@ async fn end_connection(
     agent: &mut Agent,
     upstream: &mut Upstream,
     session: &mut Session,
+    reason: crate::state::registry::EndReason,
 ) -> Result<(), Refusal> {
     if session.waiting || session.write_in_flight() {
         let (pid, secret) = upstream.backend_key();
         let _ = send_cancel(&session.ctx.upstream, pid, &secret).await;
     }
-    let actions = session.end();
+    let actions = session.end(reason);
     agent.send(&actions.client).await
 }
 async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusal> {
@@ -1194,15 +1214,15 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
     let mut deferred = VecDeque::new();
     let mut deferred_bytes = 0usize;
     loop {
-        if end.try_ended().is_some() {
-            end_connection(agent, &mut upstream, &mut session).await?;
+        if let Some(reason) = end.try_ended() {
+            end_connection(agent, &mut upstream, &mut session, reason).await?;
             return Ok(());
         }
         let actions = if session.waiting {
             tokio::select! {
                 biased;
-                _=end.ended()=>{
-                    end_connection(agent, &mut upstream, &mut session).await?;
+                reason=end.ended()=>{
+                    end_connection(agent, &mut upstream, &mut session, reason).await?;
                     return Ok(());
                 }
                 response=upstream.recv()=>session.backend(response?),
@@ -1224,8 +1244,8 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
         } else {
             tokio::select! {
                 biased;
-                _=end.ended()=>{
-                    end_connection(agent, &mut upstream, &mut session).await?;
+                reason=end.ended()=>{
+                    end_connection(agent, &mut upstream, &mut session, reason).await?;
                     return Ok(());
                 }
                 response=upstream.recv()=>session.backend(response?),
@@ -1266,8 +1286,16 @@ mod tests {
         allowed_records: Arc<std::sync::atomic::AtomicU64>,
         records: Arc<Mutex<Vec<(u64, usize)>>>,
         identities: Arc<Mutex<Vec<ReadLogRecord>>>,
+        lifecycle: Arc<Mutex<Vec<LifecycleRecord>>>,
     }
     impl ReadLog for Audit {
+        fn write_lifecycle(&self, r: &LifecycleRecord) -> Result<(), Refusal> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(failure(NyCode::ReadLogUnavailable));
+            }
+            self.lifecycle.lock().unwrap().push(r.clone());
+            Ok(())
+        }
         fn write(&self, r: &ReadLogRecord) -> Result<(), Refusal> {
             if self.fail.load(Ordering::Relaxed) {
                 return Err(failure(NyCode::ReadLogUnavailable));
@@ -1291,6 +1319,7 @@ mod tests {
         allowed_records: Arc<std::sync::atomic::AtomicU64>,
         records: Arc<Mutex<Vec<(u64, usize)>>>,
         identities: Arc<Mutex<Vec<ReadLogRecord>>>,
+        lifecycle: Arc<Mutex<Vec<LifecycleRecord>>>,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -1354,6 +1383,7 @@ mod tests {
             let fail = Arc::new(AtomicBool::new(false));
             let records = Arc::new(Mutex::new(vec![]));
             let identities = Arc::new(Mutex::new(vec![]));
+            let lifecycle = Arc::new(Mutex::new(vec![]));
             let allowed_records = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let runtime = crate::state::runtime::StateRuntime::open(
                 &dir.join("state"),
@@ -1374,6 +1404,7 @@ mod tests {
                     allowed_records: allowed_records.clone(),
                     records: records.clone(),
                     identities: identities.clone(),
+                    lifecycle: lifecycle.clone(),
                 }),
                 upstream: UpstreamConfig {
                     host: "unused".into(),
@@ -1402,6 +1433,7 @@ mod tests {
                 allowed_records,
                 records,
                 identities,
+                lifecycle,
             }
         }
         fn session(&self) -> Session {
@@ -1937,14 +1969,39 @@ mod tests {
                 .authority
                 .revoke(s.session, crate::state::model::EndReason::AdminRevoked)
                 .unwrap();
+            s.set_connection(42);
             let before = f.records.lock().unwrap().len();
-            let out = s.end();
+            let out = s.end(crate::state::registry::EndReason::Revoked);
             assert_eq!(code(&out), expected);
             assert!(out.close);
             assert!(out.upstream.is_empty());
             assert_eq!(out.client.len(), 1);
-            assert_eq!(f.records.lock().unwrap().len(), before + 1);
+            assert_eq!(f.records.lock().unwrap().len(), before);
+            let lifecycle = f.lifecycle.lock().unwrap();
+            assert_eq!(lifecycle.len(), 1);
+            let record = &lifecycle[0];
+            assert_eq!(record.kind, LifecycleKind::ConnectionEnded);
+            assert_eq!(record.actor, LifecycleActor::System);
+            assert_eq!(record.reason, "revoked");
+            assert_eq!(record.connection, Some(42));
+            assert_eq!(record.session, Some(s.session.to_hex()));
+            assert_eq!(record.principal, s.principal.to_hex());
+            assert_eq!(record.route.as_deref(), Some("postgres"));
         }
+    }
+    #[test]
+    fn end_audits_expired_connection() {
+        let f = Fixture::new();
+        let mut s = f.session();
+        s.set_connection(7);
+        let out = s.end(crate::state::registry::EndReason::Expired);
+        assert_eq!(code(&out), "NY011");
+        assert!(out.close);
+        let records = f.lifecycle.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].reason, "expired");
+        assert_eq!(records[0].connection, Some(7));
+        assert!(f.identities.lock().unwrap().is_empty());
     }
     #[test]
     fn end_audit_failure_returns_ny009() {
@@ -1952,7 +2009,7 @@ mod tests {
         let mut s = f.session();
         s.frontend(Frontend::Query("COMMIT".into()));
         f.fail.store(true, Ordering::Relaxed);
-        let out = s.end();
+        let out = s.end(crate::state::registry::EndReason::Revoked);
         assert_eq!(code(&out), "NY009");
         assert!(out.close);
         assert!(out.upstream.is_empty());
