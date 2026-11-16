@@ -1,0 +1,10 @@
+# Keep the root context limited to Nunya's standalone workspace.
+**
+!crates/
+crates/*
+!crates/nunya/
+!crates/nunya/**
+crates/nunya/target
+crates/nunya/harness
+crates/nunya/tests
+crates/nunya/site

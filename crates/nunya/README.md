@@ -68,6 +68,15 @@ The read-log sink is required. Use `sink = "file"`, `path = "read.log"` and opti
 | NY009 | read log unavailable |
 | NY010 | protocol feature not allowed through the gateway |
 
+## Container image
+
+Run the **Nunya image** workflow manually in GitHub Actions to build and push
+`ghcr.io/gigglesdb/nunya:sha-<short sha>` for `linux/amd64`. Default-branch builds
+also receive `latest`; the optional `tag` input adds a release tag such as
+`0.1.0`. Set `push` to false for a dry run that loads and smoke-tests the image
+without publishing it. The workflow summary records the image reference and
+digest, and every build runs the image with `--help`.
+
 ## Container or service
 
 Build from the repository root using `docker build -f crates/nunya/Dockerfile -t nunya .`. The image runs as uid 10001 and exposes port 6432. Mount a read-only configuration directory at `/etc/nunya` and a writable state directory owned by uid 10001 at the path configured by `state_dir`. Mount secret and TLS files read-only with permissions that let that uid read them. Set `[tls]` `cert_file` and `key_file` for agent TLS; without TLS, configuration requires explicit `allow_plaintext = true`. The admin address defaults to loopback port 6480; keep it private. Its health, metrics and reload routes have no authentication.
