@@ -43,6 +43,9 @@ pub(crate) fn required_bits_for_catalog_value(
         CatalogKind::Table => {
             let (entry, ext) = catalog_codec::decode_table(value).map_err(corrupt)?;
             let mut required = if ext.is_empty() { 0 } else { 64 };
+            if entry.primary_index_birth.is_some() {
+                required |= 64 | super::meta::KEY_DEPENDENCY_IDENTITY;
+            }
             if ext.values().any(|column| column.typmod.is_some()) {
                 required |= 128;
             }
@@ -55,9 +58,20 @@ pub(crate) fn required_bits_for_catalog_value(
             }
             Ok(required)
         }
-        CatalogKind::Constraint => Ok(64 | if value.first() == Some(&2) {
-            super::meta::UNIQUE_CONSTRAINT_IDENTITY | super::meta::SECONDARY_INDEXES
-        } else { 0 }),
+        CatalogKind::Constraint => {
+            let extra = match value.first() {
+                Some(2) => super::meta::UNIQUE_CONSTRAINT_IDENTITY | super::meta::SECONDARY_INDEXES,
+                Some(3) => {
+                    let target = catalog_codec::constraint_key_dependency_target(value).map_err(corrupt)?;
+                    super::meta::KEY_DEPENDENCY_IDENTITY | if matches!(target,
+                        crate::relational::catalog_ext::ReferencedKey::Secondary(_)) {
+                        super::meta::SECONDARY_INDEXES
+                    } else { 0 }
+                }
+                _ => 0,
+            };
+            Ok(64 | extra)
+        }
         CatalogKind::Sequence | CatalogKind::Type => Ok(64),
         // validate_meta treats a live kind-7 marker without bit 9 as Corrupt,
         // so the commit guard must refuse it too (DD-0068 X1).

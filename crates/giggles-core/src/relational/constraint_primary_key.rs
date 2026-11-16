@@ -1,6 +1,12 @@
 //! Primary-key installation uses the ordinary row-key codec and index rebuild.
 use super::*;
 
+impl Relational {
+    pub(crate) fn primary_key_order(&self, table_id: u64) -> u64 {
+        self.ext.primary_index_birth.get(&table_id).copied().unwrap_or(0)
+    }
+}
+
 pub(super) fn primary_key_name(state: &Relational, table: &TableDef) -> Option<String> {
     if table.hidden_rowid().is_some() {
         return None;
@@ -112,6 +118,15 @@ pub(super) fn add(
         .tables
         .insert(candidate.table_key(&keyed), keyed.clone());
     candidate.rows.insert(keyed.id, rows);
+    // Missing births mean the PK precedes every secondary descriptor.
+    if candidate.secondary_descriptors_engine().iter()
+        .any(|d| d.table == table.id && d.unique)
+    {
+        candidate.mutate_ext(|ext, next_id| {
+            ext.primary_index_birth.insert(table.id, allocate(next_id)?);
+            Ok(())
+        })?;
+    }
     record_name(&mut candidate, &keyed, &name)?;
     let descriptors = candidate.secondary_descriptors_engine().to_vec();
     candidate.secondary = candidate.secondary_build_complete_engine(&descriptors, &mut *cancel)?;
@@ -130,6 +145,40 @@ mod tests {
         let p = Prepared::parse(sql, 1, state.epoch)?;
         state.execute(&p, &[], None)
     }
+    #[test]
+    fn birth_free_creates_preserve_catalog_bytes() {
+        for sql in [
+            "CREATE TABLE t(a int PRIMARY KEY)",
+            "CREATE TABLE t(a int PRIMARY KEY,UNIQUE(a))",
+            "CREATE TABLE t(a int PRIMARY KEY,b int UNIQUE)",
+        ] {
+            let mut state = Relational::default();
+            run(&mut state, sql).unwrap();
+            let before = bincode::serialize(&state.ext).unwrap();
+            let version = state.ext.wire_version();
+            run(&mut state, "CREATE UNIQUE INDEX s ON t(a)").unwrap();
+            assert_eq!(state.primary_key_order(state.tables["t"].id), 0);
+            assert_eq!(bincode::serialize(&state.ext).unwrap(), before);
+            assert_eq!(state.ext.wire_version(), version);
+            assert!(!state.ext.has_key_dependency_identity()); // feature bit 17
+        }
+    }
+
+    #[test]
+    fn late_cancel_does_not_publish_birth() {
+        let mut state = Relational::default();
+        run(&mut state, "CREATE TABLE t(a int)").unwrap();
+        run(&mut state, "CREATE UNIQUE INDEX s ON t(a)").unwrap();
+        let before = state.clone();
+        let table = state.tables["t"].clone();
+        let mut polls = 0;
+        assert_eq!(add(&mut state, &table, None, &["a".into()], &mut || {
+            polls += 1;
+            polls > 1
+        }), Err(SqlError::Aborted));
+        assert_eq!(state, before);
+    }
+
     #[test]
     fn heap_rekey_rebuilds_indexes_and_reopens() {
         let mut state = Relational::default();

@@ -1,7 +1,8 @@
 //! Format 53 content policy. Future owners replace only their named predicate.
 use super::*;
 use crate::relational::Relational;
-pub(super) const NEW_BITS: u64 = 0x3c0;
+pub(crate) const KEY_DEPENDENCY_IDENTITY: u64 = 1 << 17;
+pub(super) const NEW_BITS: u64 = 0x3c0 | KEY_DEPENDENCY_IDENTITY;
 pub(super) const ROLE_BOOTSTRAP: u64 = 1 << 9;
 
 /// E1 B0b: true when CatalogExt is nonempty.
@@ -41,7 +42,8 @@ pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
         | (u64::from(catalog_ext_present(s)) << 6)
         | (u64::from(extended_types_present(s)) << 7)
         | (u64::from(sequence_counters_present(s)) << 8)
-        | (u64::from(role_bootstrap_present(s)) << 9))
+        | (u64::from(role_bootstrap_present(s)) << 9)
+        | if s.sql.catalog_ext().has_key_dependency_identity() { KEY_DEPENDENCY_IDENTITY } else { 0 })
 }
 
 /// Records-only exports never carry role bootstrap state (DD-0068 bit-9 rule 5).
@@ -70,13 +72,13 @@ pub(super) fn decode_bits(
         .and_then(|v| v.as_slice().try_into().ok())
         .ok_or_else(|| CoreError::Corrupt("missing or malformed feature record".into()))?;
     let bits = u64::from_be_bytes(bytes);
-    if bits & !1023 != 0 {
+    if bits & !(1023 | KEY_DEPENDENCY_IDENTITY) != 0 {
         return Err(CoreError::Unsupported);
     }
     if import && bits & ROLE_BOOTSTRAP != 0 {
         return Err(CoreError::Unsupported);
     }
-    if bits & NEW_BITS == 0 || (bits & 256 != 0 && bits & 64 == 0) {
+    if bits & NEW_BITS == 0 || (bits & (256 | KEY_DEPENDENCY_IDENTITY) != 0 && bits & 64 == 0) {
         return Err(CoreError::Corrupt("noncanonical feature bits".into()));
     }
     Ok(Some(bits))

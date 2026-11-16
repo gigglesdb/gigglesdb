@@ -10,6 +10,7 @@ fn hex(s: &str) -> Vec<u8> {
 }
 fn table() -> TableEntry {
     TableEntry {
+        primary_index_birth: None,
         def: TableDef {
             id: 1,
             name: "t".into(),
@@ -130,6 +131,7 @@ fn frozen_constraints() {
                     on_update: Action::NoAction,
                     not_valid: false,
                     deferral: Deferral::NotDeferrable,
+                    target: crate::relational::catalog_ext::ReferencedKey::Unknown,
                 },
             },
         ),
@@ -180,6 +182,7 @@ fn frozen_constraints() {
                 on_update: Action::NoAction,
                 not_valid: false,
                 deferral: live,
+                target: crate::relational::catalog_ext::ReferencedKey::Unknown,
             },
         };
         assert_eq!(
@@ -680,4 +683,48 @@ fn unique_constraint_record_v2_roundtrip_old_record_and_unknown_version() {
     for version in [0, 1, 3, 255] {
         let mut bad = bytes.clone(); bad[0] = version; assert_corrupt(decode_constraint(&bad, &table().def));
     }
+}
+
+#[test]
+fn table_v3_birth_roundtrip_frozen_payload_and_canonicality() {
+    let mut entry = table(); entry.primary_index_birth = Some(10);
+    let bytes = encode_table(&entry, &BTreeMap::new()).unwrap();
+    let mut expected = hex(TABLE); expected[0] = 3; expected.extend(10u64.to_be_bytes());
+    assert_eq!(bytes, expected);
+    assert_eq!(decode_table(&bytes).unwrap().0, entry);
+    assert_eq!(decode_table(&hex(TABLE)).unwrap().0.primary_index_birth, None);
+    for n in 0..bytes.len() { assert_corrupt(decode_table(&bytes[..n])); }
+    let mut trailing = bytes.clone(); trailing.push(0); assert_corrupt(decode_table(&trailing));
+    let mut zero = bytes; let at = zero.len() - 8; zero[at..].fill(0); assert_corrupt(decode_table(&zero));
+    for (heap, pk) in [(true, vec![0]), (false, vec![])] {
+        entry.heap = heap; entry.def.primary_key = pk;
+        assert_corrupt(encode_table(&entry, &BTreeMap::new()));
+        let dto = TableEntryV2Dto::try_from((entry.clone(), BTreeMap::new())).unwrap();
+        assert_corrupt(decode_table(&encode_version(3, &(dto, 10u64)).unwrap()));
+    }
+}
+#[test]
+fn constraint_v3_known_targets_preserve_frozen_fk_payload() {
+    let old = decode_constraint(&hex(FK), &table().def).unwrap();
+    assert!(matches!(old.kind, ConstraintKind::ForeignKey { target: ReferencedKey::Unknown, .. }));
+    for target in [ReferencedKey::PrimaryKey, ReferencedKey::Secondary(12)] {
+        let mut c = old.clone();
+        if let ConstraintKind::ForeignKey { target: saved, .. } = &mut c.kind { *saved = target; }
+        let bytes = encode_constraint(&c, "t").unwrap();
+        let mut expected = hex(FK); expected[0] = 3;
+        expected.extend(if target == ReferencedKey::PrimaryKey { 1u32 } else { 2u32 }.to_be_bytes());
+        if let ReferencedKey::Secondary(id) = target { expected.extend(id.to_be_bytes()); }
+        assert_eq!(bytes, expected);
+        assert_eq!(decode_constraint(&bytes, &table().def).unwrap(), c);
+        for n in 0..bytes.len() { assert_corrupt(decode_constraint(&bytes[..n], &table().def)); }
+        let mut trailing = bytes; trailing.push(0); assert_corrupt(decode_constraint(&trailing, &table().def));
+    }
+    let dto = ConstraintDto::from(old);
+    for target in [ReferencedKey::Unknown, ReferencedKey::Secondary(0)] {
+        assert_corrupt(decode_constraint(&encode_version(3, &(dto.clone(), target)).unwrap(), &table().def));
+    }
+    let mut tag = hex(FK); tag[0] = 3; tag.extend(3u32.to_be_bytes());
+    assert_corrupt(decode_constraint(&tag, &table().def));
+    let pk: ConstraintDto = decode_version(1, &hex(PK)).unwrap();
+    assert_corrupt(decode_constraint(&encode_version(3, &(pk, ReferencedKey::PrimaryKey)).unwrap(), &table().def));
 }

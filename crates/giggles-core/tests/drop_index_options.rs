@@ -96,15 +96,7 @@ fn exercise(path: &std::path::Path, mut admin: Admin, views: bool) {
             SqlError::DependentObjects,
         );
         s.set_search_path("public", "giggles");
-        // Known gap: R2-29 report.md / pg18.txt demonstrates FK-to-UNIQUE-index
-        // dependency ambiguity. Until it is persisted, CASCADE stays 0A000.
-        error(
-            &mut s,
-            "DROP INDEX standalone_u CASCADE",
-            SqlError::Unsupported,
-        );
-        // Preserve the pre-existing bare and RESTRICT standalone UNIQUE drops.
-        for option in ["", " RESTRICT"] {
+        for option in ["", " RESTRICT", " CASCADE"] {
             run(&mut s, &format!("DROP INDEX standalone_u{option}"));
             error(&mut s, "DROP INDEX standalone_u", SqlError::UndefinedObject);
             run(&mut s, "CREATE UNIQUE INDEX standalone_u ON plain(id)");

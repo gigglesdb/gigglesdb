@@ -218,7 +218,7 @@ fn pk_mutation_visibility_own_writes_deleted_rows_and_uncommitted_writer() {
         s.execute("DELETE FROM t WHERE id=3",&[],None).unwrap();
         assert_eq!(s.execute("UPDATE t SET v=v+1 WHERE id=3",&[],None).unwrap().affected,0);
         s.execute("ROLLBACK",&[],None).unwrap();
-        let entry=TableEntry { def:f.parts().tables["t"].clone(),heap:false,columns_ext:BTreeMap::new() };
+        let entry=TableEntry { primary_index_birth: None, def:f.parts().tables["t"].clone(),heap:false,columns_ext:BTreeMap::new() };
         if disabled {
             let mut writer=f.db().begin(Isolation::ReadCommitted);
             f.db().rows.update(&mut writer,&entry,&[Int(2)],&[(1,Int(99))],None,None,&||false).unwrap();

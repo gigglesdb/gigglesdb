@@ -91,7 +91,8 @@ fn constraint_matrix_matches_sql() {
         let missing = "alter table absent drop constraint if exists nope";
         assert_eq!(giggles_core::sqlstate(&left.sql_session().execute(missing, &[], None).unwrap_err()), "42P01");
         assert_eq!(with_sql_parser_forbidden(|| engine.execute_catalog_optional_text(missing)).unwrap_err(), Error::Sql { sqlstate: "42P01".into() });
-        step(&left, &right, "alter table child drop constraint fk cascade", "alter table child drop constraint fk cascade", Some("42601"));
+        // PG18.6 accepts DROP CONSTRAINT ... CASCADE (FKIDX); native and SQL both succeed.
+        step(&left, &right, "alter table child drop constraint fk cascade", "alter table child drop constraint fk cascade", None);
         for a in [&left, &right] { for sql in ["create schema app", "create table app.t(id bigint primary key,v bigint)"] { a.sql_session().execute(sql, &[], None).unwrap(); } }
         step(&left, &right, "alter table app.t add constraint u unique(v)", "alter table app.t add constraint u unique(v)", None);
         for a in [&left, &right] { a.sql_session().execute("insert into app.t values(1,2),(2,2)", &[], None).unwrap_err(); }

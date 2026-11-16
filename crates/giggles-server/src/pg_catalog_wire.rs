@@ -159,6 +159,10 @@ pub(crate) fn snapshot(
             .map(|c| giggles_pg_catalog::ConstraintDef {
                 id: c.id, table: c.table, name: c.name, kind: c.kind, columns: c.columns,
                 foreign_table: c.foreign_table, foreign_columns: c.foreign_columns,
+                foreign_key_target: c.foreign_key_target.map(|target| match target {
+                    giggles_core::relational::ForeignKeyTarget::PrimaryKey => giggles_pg_catalog::ForeignKeyTarget::PrimaryKey,
+                    giggles_core::relational::ForeignKeyTarget::Index(id) => giggles_pg_catalog::ForeignKeyTarget::Index(id),
+                }),
                 update: c.update, delete: c.delete, deferrable: c.deferrable, deferred: c.deferred,
                 validated: c.validated, expression: c.expression, index: c.index,
             }).collect(),

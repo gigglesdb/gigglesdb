@@ -153,13 +153,14 @@ fn real_legacy_directory_has_no_rocks_files() {
 fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
-        0x1FFFF
+        0x1FFFF | KEY_DEPENDENCY_IDENTITY
     );
     for (i, (bit, _)) in FEATURE_TABLE[..14].iter().enumerate() {
         assert_eq!(*bit, 1u64 << i);
     }
     assert_eq!(FEATURE_TABLE[14].0, SQL_VIEWS);
     assert_eq!(FEATURE_TABLE[16].0, REPLICATED);
+    assert_eq!(FEATURE_TABLE[17].0, KEY_DEPENDENCY_IDENTITY);
     assert_eq!(FEATURE_TABLE[10].0, TEXT_BACKED_COLUMN_TYPES);
     assert_eq!(
         FEATURE_TABLE[11].0,
@@ -174,11 +175,11 @@ fn feature_positions_and_validation() {
         FEATURE_TABLE[6..10]
             .iter()
             .fold(0, |bits, (bit, _)| bits | bit),
-        super::super::super::feature_envelope::NEW_BITS
+        super::super::super::feature_envelope::NEW_BITS & !KEY_DEPENDENCY_IDENTITY
     );
     let kv = base();
     assert_eq!(validate_meta(&kv).unwrap().features, 0);
-    for i in 17..64 {
+    for i in 18..64 {
         put(&kv, b"features", &(1u64 << i).to_be_bytes());
         assert!(matches!(
             validate_meta(&kv),
@@ -301,9 +302,9 @@ fn features_share_caller_atomic_batch() {
 #[test]
 fn invalid_features_leave_batch_unchanged() {
     for (bits, expected) in [
-        (1 << 17, FormatError::Unsupported("feature bits".into())),
+        (1 << 18, FormatError::Unsupported("feature bits".into())),
         (
-            (1 << 17) | 0xC00,
+            (1 << 18) | 0xC00,
             FormatError::Unsupported("feature bits".into()),
         ),
         (256, corrupt("sequence counters require catalog_ext")),
@@ -468,4 +469,16 @@ fn replicated_creation_is_v2() {
     assert_eq!(validate_meta(kv.as_ref()).unwrap().features, REPLICATED);
     drop(kv);
     assert_eq!(classify_dir(&d.0).unwrap(), DirClass::V2);
+}
+
+#[test]
+fn key_dependency_feature_requires_catalog_ext_and_is_monotone() {
+    assert!(check_features(64 | KEY_DEPENDENCY_IDENTITY).is_ok());
+    assert!(matches!(check_features(KEY_DEPENDENCY_IDENTITY), Err(FormatError::Corrupt(_))));
+    for unknown in [1 << 18, 1 << 40] {
+        assert!(matches!(check_features(unknown | KEY_DEPENDENCY_IDENTITY), Err(FormatError::Unsupported(_))));
+    }
+    let kv = base();
+    put(&kv, b"features", &(64 | KEY_DEPENDENCY_IDENTITY).to_be_bytes());
+    assert_eq!(open_checks(&kv).unwrap().features, 64 | KEY_DEPENDENCY_IDENTITY);
 }

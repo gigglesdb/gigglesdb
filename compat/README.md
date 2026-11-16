@@ -532,6 +532,9 @@ restore into GigglesDB. Dumps use pinned client binaries, plain SQL,
 tables in `r0_src`, validates its dump by restoring into a separate PostgreSQL
 database, then checks GigglesDB's restored rows against the source.
 
+The fixture includes foreign keys referencing redundant standalone UNIQUE and primary keys.
+Restore rebinding to the primary key is PostgreSQL 18 behavior; historical key binding is recorded separately and is not asserted by these checks.
+
 Schema normalization drops comments, SET prologue lines, blank lines, trailing
 whitespace, and PostgreSQL 18's random `\restrict`/`\unrestrict` guard tokens.
 SQL definitions remain intact. Each check keeps raw artifacts and records its

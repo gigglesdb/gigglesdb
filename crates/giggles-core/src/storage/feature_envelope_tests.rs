@@ -248,6 +248,7 @@ fn catalog_ext_records_roundtrip_gate_bits_and_restore_legacy() {
                 on_update: Action::SetDefault,
                 not_valid: true,
                 deferral: crate::relational::catalog_ext::Deferral::NotDeferrable,
+                target: crate::relational::catalog_ext::ReferencedKey::Unknown,
             },
         ),
         (3, "t_pkey", ConstraintKind::PrimaryKey),
@@ -355,7 +356,7 @@ fn catalog_ext_wire_errors_distinguish_corrupt_and_unsupported() {
         from_records(catalog_ext_raw_records(encode(&ext).unwrap())),
         Err(CoreError::Corrupt(_))
     ));
-    ext.ext_version = 8;
+    ext.ext_version = 9;
     // Exercise the relational decoder itself, before format-53 content policy:
     // unknown extensions retain Unsupported on the older namespace-5 path.
     let unknown_records = catalog_ext_raw_records(encode(&ext).unwrap());
@@ -516,4 +517,63 @@ fn sequence_counter_feature_bit_matches_records_and_requires_catalog_metadata() 
         Err(CoreError::Unsupported)
     ));
     // Partition projection begins with the same rejecting replica source decoder.
+}
+
+#[test]
+fn key_dependency_feature_gates_and_content_witnesses() {
+    use crate::relational::catalog_ext::*;
+    let bit = KEY_DEPENDENCY_IDENTITY;
+    assert_eq!(decode_bits(&forged(64 | bit), 53, false).unwrap(), Some(64 | bit));
+    assert!(matches!(decode_bits(&forged(bit), 53, false),
+        Err(CoreError::Corrupt(message)) if message == "noncanonical feature bits"));
+    for unknown in [1 << 10, 1 << 18] {
+        let mut r = forged(unknown | bit);
+        r.insert(vec![5], vec![255]);
+        assert!(matches!(normal(r), Err(CoreError::Unsupported)));
+    }
+    assert!(matches!(normal(forged(64 | bit)), Err(CoreError::Corrupt(_))));
+    let (mut s, tid, _) = catalog_ext_fixture();
+    let cid = s.sql.tables["t"].columns[0].id;
+    let constraint = |id, target| Constraint {
+        id, name: "fk".into(), kind: ConstraintKind::ForeignKey {
+            columns: vec![cid], ref_table: tid, ref_columns: vec![cid],
+            on_delete: Action::NoAction, on_update: Action::NoAction, not_valid: false,
+            deferral: Deferral::NotDeferrable, target,
+        },
+    };
+    s.sql.add_constraint(tid, constraint(s.sql.catalog_parts().2, ReferencedKey::Unknown)).unwrap();
+    let old = records(&s).unwrap();
+    assert_eq!(feature_bits_present(&s).unwrap() & bit, 0);
+    assert_eq!(records(&normal(old.clone()).unwrap()).unwrap(), old);
+    let mut extra = old;
+    let old_bits = feature_bits_present(&s).unwrap();
+    extra.insert(vec![10], (old_bits | bit).to_be_bytes().to_vec());
+    assert!(matches!(normal(extra), Err(CoreError::Corrupt(_))));
+    s.sql.remove_constraint(tid, "fk").unwrap();
+    s.sql.add_constraint(tid, constraint(s.sql.catalog_parts().2, ReferencedKey::PrimaryKey)).unwrap();
+    let known = records(&s).unwrap();
+    assert_ne!(feature_bits_present(&s).unwrap() & bit, 0);
+    assert_eq!(records(&normal(known.clone()).unwrap()).unwrap(), known);
+    let mut missing = known;
+    missing.insert(vec![10], old_bits.to_be_bytes().to_vec());
+    assert!(matches!(normal(missing), Err(CoreError::Corrupt(_))));
+    let mut ext = CatalogExt::default();
+    ext.primary_index_birth.insert(tid, cid + 20);
+    assert!(ext.has_key_dependency_identity());
+    assert_eq!(ext.wire_version(), 8);
+}
+
+#[test]
+fn primary_birth_alone_sets_legacy_identity_bit() {
+    let (mut s, tid, _) = catalog_ext_fixture();
+    let (tables, mut ext, next_id, next_version) = s.sql.catalog_parts();
+    ext.primary_index_birth.insert(tid, next_id);
+    s.sql = Relational::catalog_image(tables, ext, next_id + 1, next_version).unwrap();
+    let bits = feature_bits_present(&s).unwrap();
+    assert_eq!(bits & (64 | KEY_DEPENDENCY_IDENTITY), 64 | KEY_DEPENDENCY_IDENTITY);
+    let r = records(&s).unwrap();
+    assert_eq!(records(&normal(r.clone()).unwrap()).unwrap(), r);
+    let mut missing = r;
+    missing.insert(vec![10], (bits & !KEY_DEPENDENCY_IDENTITY).to_be_bytes().to_vec());
+    assert!(matches!(normal(missing), Err(CoreError::Corrupt(_))));
 }

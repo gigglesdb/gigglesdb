@@ -10,6 +10,7 @@ pub(super) fn large_table(count: usize, duplicates: bool, indexed: bool) -> Fixt
     }
     let parts = f.parts();
     let entry = TableEntry {
+        primary_index_birth: None,
         def: parts.tables["t"].clone(),
         heap: false,
         columns_ext: BTreeMap::new(),
@@ -105,6 +106,7 @@ fn large_ddl_with_and_without_existing_index() {
             f.reopen();
             if sql.contains("ADD COLUMN") {
                 let entry = TableEntry {
+                    primary_index_birth: None,
                     def: f.parts().tables["t"].clone(),
                     heap: false,
                     columns_ext: BTreeMap::new(),
@@ -141,6 +143,7 @@ fn large_unique_builds() {
 fn paged_validation_rejects_bad_rows_after_the_first_page() {
     let f = large_table(1025, false, true);
     let entry = TableEntry {
+        primary_index_birth: None,
         def: f.parts().tables["t"].clone(),
         heap: false,
         columns_ext: BTreeMap::new(),
@@ -194,6 +197,7 @@ fn large_primary_key_validation() {
     f.execute("CREATE TABLE t (id bigint, v bigint)");
     let parts = f.parts();
     let entry = TableEntry {
+        primary_index_birth: None,
         def: parts.tables["t"].clone(),
         heap: true,
         columns_ext: BTreeMap::new(),
@@ -227,6 +231,7 @@ fn large_primary_key_validation() {
 fn large_unique_duplicate_failure_leaves_no_index_after_reopen() {
     let mut f = large_table(200_000, false, false);
     let entry = TableEntry {
+        primary_index_birth: None,
         def: f.parts().tables["t"].clone(),
         heap: false,
         columns_ext: BTreeMap::new(),
@@ -377,6 +382,7 @@ fn reclaim_large_drop_and_snapshot_horizon() {
     let f = large_table(200_000, false, false);
     let mut reader = f.db().begin(Isolation::RepeatableRead);
     let entry = TableEntry {
+        primary_index_birth: None,
         def: f.db().catalog().parts(&mut reader).unwrap().tables["t"].clone(),
         heap: false,
         columns_ext: BTreeMap::new(),

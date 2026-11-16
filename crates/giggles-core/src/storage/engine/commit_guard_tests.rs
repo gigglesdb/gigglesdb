@@ -46,6 +46,7 @@ fn request(bits: u64) -> CommitRequest {
 }
 fn table(typmod: bool) -> Vec<u8> {
     let entry = TableEntry {
+        primary_index_birth: None,
         def: TableDef {
             id: 1,
             name: "t".into(),

@@ -83,6 +83,7 @@ fn column(id: u64, name: &str, data_type: DataType, not_null: bool) -> ColumnDef
 }
 fn table(id: u64) -> TableEntry {
     TableEntry {
+        primary_index_birth: None,
         def: TableDef {
             id,
             name: format!("table_{id}"),

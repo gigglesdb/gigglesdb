@@ -52,7 +52,6 @@ fn native_catalog_drops_match_sql() {
             (CatalogRequest::DropIndex { name: "parent_pkey".into(), cascade: true }, "DROP INDEX parent_pkey CASCADE", "2BP01"),
             (CatalogRequest::DropIndex { name: "parent_uq".into(), cascade: false }, "DROP INDEX parent_uq RESTRICT", "2BP01"),
             (CatalogRequest::DropIndex { name: "parent_uq".into(), cascade: true }, "DROP INDEX parent_uq CASCADE", "2BP01"),
-            (CatalogRequest::DropIndex { name: "parent_unique_idx".into(), cascade: true }, "DROP INDEX parent_unique_idx CASCADE", "0A000"),
         ] {
             let before = admin.catalog().unwrap();
             let error = sql.execute(text, &[], None).unwrap_err();
@@ -78,7 +77,7 @@ fn native_catalog_drops_match_sql() {
             assert_eq!(outcome.table, preimage);
             assert!(outcome.catalog_epoch > bound.description().catalog_epoch);
             assert_eq!(native.execute_catalog_bound(&bound).unwrap_err().sqlstate(), Some("0A000"));
-            native.execute_catalog(&CatalogRequest::DropIndex { name: "parent_unique_idx".into(), cascade: false }).unwrap();
+            native.execute_catalog(&CatalogRequest::DropIndex { name: "parent_unique_idx".into(), cascade: true }).unwrap();
             native.execute_catalog(&CatalogRequest::CreateIndex { table: "parent".into(), name: "automatic_idx".into(), columns: vec!["id".into()] }).unwrap();
             let request = CatalogRequest::DropTable { table: "parent".into(), cascade: true };
             let bound = native.prepare_catalog_bound(&request).unwrap();

@@ -16,7 +16,8 @@ pub(crate) const UNIQUE_CONSTRAINT_IDENTITY: u64 = 1 << 13;
 pub(crate) const SQL_VIEWS: u64 = 1 << 14;
 pub(crate) const RELATION_COMMENTS: u64 = 1 << 15;
 pub(crate) const REPLICATED: u64 = 1 << 16;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 17] = [
+pub(crate) const KEY_DEPENDENCY_IDENTITY: u64 = 1 << 17;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 18] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -34,6 +35,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 17] = [
     (SQL_VIEWS, "sql_views"),
     (RELATION_COMMENTS, "relation_comments"),
     (REPLICATED, "replicated"),
+    (KEY_DEPENDENCY_IDENTITY, "key_dependency_identity"),
 ];
 const MARKER: &str = "GIGGLES_FORMAT";
 const TMP: &str = "GIGGLES_FORMAT.tmp";
@@ -274,11 +276,14 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     })
 }
 pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
-    check_features_allowed(bits, 0x3FFF | SQL_VIEWS | RELATION_COMMENTS | REPLICATED)
+    check_features_allowed(bits, 0x3FFF | SQL_VIEWS | RELATION_COMMENTS | REPLICATED | KEY_DEPENDENCY_IDENTITY)
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     if bits & !allowed != 0 {
         return Err(FormatError::Unsupported("feature bits".into()));
+    }
+    if bits & KEY_DEPENDENCY_IDENTITY != 0 && bits & 64 == 0 {
+        return Err(corrupt("key dependency identity requires catalog_ext"));
     }
     if bits & UNIQUE_CONSTRAINT_IDENTITY != 0 && bits & 68 != 68 {
         return Err(corrupt("unique constraint identity requires catalog_ext and secondary_indexes"));

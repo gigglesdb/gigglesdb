@@ -38,7 +38,7 @@ impl SqlSession {
         let _ticket = self.admin.inner.enter_sql().map_err(map)?;
         let txn = self.v2_transaction.as_mut()
             .ok_or_else(|| map(CoreError::Sql(SqlError::Transaction)))?;
-        let entry = TableEntry { def: table.clone(), heap: false, columns_ext: BTreeMap::new() };
+        let entry = TableEntry { primary_index_birth: None, def: table.clone(), heap: false, columns_ext: BTreeMap::new() };
         for pair in db.rows.scan(txn, &entry, Bound::Unbounded, Bound::Unbounded,
             engine::kv::Direction::Forward, None).map_err(map)? {
             crate::cancellation::check().map_err(map)?;
@@ -999,6 +999,7 @@ impl RowSink for SqlRows<'_> {
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
         crate::cancellation::check()?;
         let entry = TableEntry {
+            primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
             def: table.clone(),
             heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
@@ -1035,7 +1036,7 @@ impl RowSink for SqlRows<'_> {
         -> Result<Option<DdlRows>, CoreError> {
         #[cfg(test)]
         if DISABLE_MUTATION_POINTS.get() { return Ok(None); }
-        let entry = TableEntry { def: table.clone(), heap: self.parts.heap.contains(&table.id),
+        let entry = TableEntry { primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(), def: table.clone(), heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new() };
         let mut rows = DdlRows::new();
         let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
@@ -1062,7 +1063,7 @@ impl RowSink for SqlRows<'_> {
         #[cfg(test)]
         let keys = if DISABLE_MUTATION_POINTS.get() { None } else { keys };
         let Some(keys) = keys else { return self.ddl_pages(table, table, true, page); };
-        let entry = TableEntry { def: table.clone(), heap: self.parts.heap.contains(&table.id),
+        let entry = TableEntry { primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(), def: table.clone(), heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new() };
         let mut rows = DdlRows::new();
         let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
@@ -1100,6 +1101,7 @@ impl RowSink for SqlRows<'_> {
         page: &mut dyn FnMut(DdlRows) -> Result<DdlRows, CoreError>,
     ) -> Result<(), CoreError> {
         let entry = TableEntry {
+            primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
             def: table.clone(),
             heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
@@ -1166,6 +1168,7 @@ impl RowSink for SqlRows<'_> {
         index: &relational::secondary_index::Descriptor,
     ) -> Result<(), CoreError> {
         let entry = TableEntry {
+            primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
             def: table.clone(),
             heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
@@ -1240,6 +1243,7 @@ impl RowSink for SqlRows<'_> {
         visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
         let entry = TableEntry {
+            primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
             def: table.clone(),
             heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
@@ -1336,7 +1340,7 @@ impl RowSink for SqlRows<'_> {
             let ids = descriptor.map_or(primary.as_slice(), |d| d.columns.as_slice());
             let ordered = ids[..columns.len()].iter().map(|id|
                 values[columns.iter().position(|c| c == id).unwrap()].clone()).collect::<Vec<_>>();
-            let entry = TableEntry { def: table.clone(), heap: self.parts.heap.contains(&table.id), columns_ext: BTreeMap::new() };
+            let entry = TableEntry { primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(), def: table.clone(), heap: self.parts.heap.contains(&table.id), columns_ext: BTreeMap::new() };
             let mut rows = DdlRows::new();
             let mut collect = |row: engine::rows::Row| {
                 let row = SqlRow { values: row.values, version: row.version };
@@ -1432,6 +1436,7 @@ impl RowSink for SqlRows<'_> {
         visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
         let entry = TableEntry {
+            primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
             def: table.clone(),
             heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
@@ -1618,7 +1623,7 @@ pub(super) fn secondary_read_native(
         columns: projection.iter().map(|i| table.columns[*i].name.clone()).collect(),
         ..Default::default()
     };
-    let entry = TableEntry { def: table.clone(), heap: false, columns_ext: BTreeMap::new() };
+    let entry = TableEntry { primary_index_birth: catalog.parts.ext.primary_index_birth.get(&table.id).copied(), def: table.clone(), heap: false, columns_ext: BTreeMap::new() };
     engine::indexes::visit(txn, &entry, &descriptor, lo, hi, &mut |_, row| {
         crate::cancellation::check()?;
         // SQL selects on the leading index column. Check every native term,
@@ -1670,7 +1675,7 @@ impl relational::scan::RowSource for MutationRows<'_> {
                 if let Some(hook) = hook.borrow_mut().as_mut() { hook(&table.name); }
             });
         }
-        let entry = TableEntry { def: table.clone(), heap: self.parts.heap.contains(&table.id),
+        let entry = TableEntry { primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(), def: table.clone(), heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new() };
         let (mut lo, mut hi) = (range.lo.clone(), range.hi.clone());
         let forward = direction == relational::scan::Direction::Forward;

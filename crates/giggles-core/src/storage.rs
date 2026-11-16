@@ -2007,6 +2007,40 @@ fn catalog_xid_from_hlc(epoch: u64) -> u64 {
     (epoch >> 16) / 1000
 }
 impl SqlSession {
+    /// Test inspection of PK ordering, allocation and catalog extension version.
+    #[doc(hidden)]
+    pub fn primary_key_birth_metadata(&self) -> Result<(BTreeMap<u64, u64>, u64, u32), CoreError> {
+        self.inspect_metadata(|s| Ok((
+            s.sql.tables.values().filter_map(|t| {
+                let birth = s.sql.primary_key_order(t.id);
+                (birth != 0).then_some((t.id, birth))
+            }).collect(), s.sql.catalog_parts().2, s.sql.catalog_ext().wire_version(),
+        )))
+    }
+    /// Logical FK binding names for tests (constraint names should be unique in the fixture).
+    #[doc(hidden)]
+    pub fn foreign_key_targets(&self) -> Result<BTreeMap<String, String>, CoreError> {
+        use relational::catalog_ext::{ConstraintKind, ReferencedKey};
+        self.inspect_metadata(|s| Ok(s.sql.catalog_ext().constraints.values().flatten()
+            .filter_map(|c| {
+                let ConstraintKind::ForeignKey { ref_table, target, .. } = c.kind else { return None };
+                let name = match target {
+                    ReferencedKey::Unknown => "unknown".into(),
+                    ReferencedKey::PrimaryKey => {
+                        let table = s.sql.tables.values().find(|t| t.id == ref_table).unwrap();
+                        let pk = s.sql.table_constraints(ref_table).iter()
+                            .find(|c| matches!(c.kind, ConstraintKind::PrimaryKey))
+                            .map(|c| c.name.clone()).unwrap_or_else(|| format!("{}_pkey", table.name));
+                        format!("pk:{pk}")
+                    }
+                    ReferencedKey::Secondary(id) => {
+                        let index = s.sql.secondary_descriptors_engine().iter().find(|d| d.id == id).unwrap();
+                        format!("index:{}", relational::split_key(&index.name).1)
+                    }
+                };
+                Some((c.name.clone(), name))
+            }).collect()))
+    }
     /// Coherent catalog metadata, including V2 transaction-private DDL.
     pub fn catalog_metadata(&self) -> Result<CatalogMetadata, CoreError> {
         let read = |s: &MetadataState<'_>| {
@@ -2696,6 +2730,7 @@ impl SqlSession {
                     Ok(_) => return Err(CoreError::Corrupt("metadata contains rows".into())),
                 }
                 let entry = engine::catalog::TableEntry {
+                    primary_index_birth: catalog.parts.ext.primary_index_birth.get(&table.id).copied(),
                     def: table.clone(), heap: catalog.parts.heap.contains(&table.id),
                     columns_ext: BTreeMap::new(),
                 };
@@ -4866,3 +4901,6 @@ mod tests {
         assert!(Admin::open(path, Limits::default()).is_err());
     }
 }
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+mod fk_target_plumbing_tests;

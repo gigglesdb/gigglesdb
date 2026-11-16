@@ -23,6 +23,36 @@ pub(super) enum Definition {
         deferral: Deferral,
     },
 }
+// CREATE's accepted key specs are immediate and NULLS DISTINCT. Keep the PK
+// first, then the first occurrence of each ordered UNIQUE key (PG18).
+pub(super) fn canonicalize_create(
+    keys: &[String],
+    primary_name: &Option<String>,
+    definitions: &[Definition],
+) -> (Option<String>, Vec<Definition>) {
+    let mut primary_name = primary_name.clone();
+    let mut kept = Vec::new();
+    for definition in definitions {
+        if let Definition::Unique { name, columns } = definition {
+            if !keys.is_empty() && columns == keys {
+                if primary_name.is_none() {
+                    primary_name = name.clone();
+                }
+                continue;
+            }
+            if let Some(Definition::Unique { name: earlier, .. }) = kept.iter_mut().find(
+                |d| matches!(d, Definition::Unique { columns: earlier, .. } if earlier == columns),
+            ) {
+                if earlier.is_none() {
+                    *earlier = name.clone();
+                }
+                continue;
+            }
+        }
+        kept.push(definition.clone());
+    }
+    (primary_name, kept)
+}
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DeferralState {
     pub(crate) modes: BTreeMap<u64, bool>,
@@ -193,6 +223,29 @@ fn named_ids(table: &TableDef, names: &[String]) -> R<Vec<u64>> {
         .map(|n| col(table, n).map(|i| table.columns[i].id))
         .collect()
 }
+// Select once at installation; persisted bindings are never reconsidered.
+fn referenced_key(
+    state: &Relational, parent: &TableDef, columns: &[u64], omitted: bool,
+) -> R<super::catalog_ext::ReferencedKey> {
+    use super::catalog_ext::ReferencedKey;
+    let same_set = |a: &[u64], b: &[u64]| {
+        a.len() == b.len() && a.iter().all(|id| b.contains(id))
+    };
+    let pk: Vec<_> = parent.primary_key.iter().map(|i| parent.columns[*i].id).collect();
+    let primary = parent.hidden_rowid().is_none() && same_set(&pk, columns);
+    if omitted {
+        return if primary { Ok(ReferencedKey::PrimaryKey) } else { Err(SqlError::UndefinedObject) };
+    }
+    let mut candidates = Vec::new();
+    if primary {
+        candidates.push((state.primary_key_order(parent.id), ReferencedKey::PrimaryKey));
+    }
+    candidates.extend(state.secondary_descriptors_engine().iter()
+        .filter(|d| d.table == parent.id && d.unique && same_set(&d.columns, columns))
+        .map(|d| (d.id, ReferencedKey::Secondary(d.id))));
+    candidates.into_iter().min_by_key(|(order, _)| *order)
+        .map(|(_, target)| target).ok_or(SqlError::InvalidForeignKey)
+}
 fn key_values(row: &SqlRow, positions: &[usize]) -> Vec<Value> {
     positions.iter().map(|i| row.values[*i].clone()).collect()
 }
@@ -328,6 +381,9 @@ pub(super) fn install(
             }
             let parent = state.tables.get(parent).ok_or(SqlError::UnknownTable)?;
             let refs = if references.is_empty() {
+                if parent.hidden_rowid().is_some() {
+                    return Err(SqlError::UndefinedObject);
+                }
                 parent
                     .primary_key
                     .iter()
@@ -343,22 +399,8 @@ pub(super) fn install(
             let ids = named_ids(table, columns)?;
             let ref_ids = named_ids(parent, &refs)?;
             unique(&ids)?;
-            unique(&ref_ids)?;
-            let pk: Vec<_> = parent
-                .primary_key
-                .iter()
-                .map(|i| parent.columns[*i].id)
-                .collect();
-            let same_set =
-                |a: &[u64], b: &[u64]| a.len() == b.len() && a.iter().all(|id| b.contains(id));
-            let unique_key = parent.hidden_rowid().is_none() && same_set(&pk, &ref_ids)
-                || state
-                    .secondary_descriptors_engine()
-                    .iter()
-                    .any(|d| d.table == parent.id && d.unique && same_set(&d.columns, &ref_ids));
-            if !unique_key {
-                return Err(SqlError::InvalidForeignKey);
-            }
+            unique(&ref_ids).map_err(|_| SqlError::InvalidForeignKey)?;
+            let target = referenced_key(state, parent, &ref_ids, references.is_empty())?;
             for (a, b) in ids.iter().zip(&ref_ids) {
                 let a = &table.columns[table
                     .columns
@@ -389,6 +431,7 @@ pub(super) fn install(
                     on_update: on_update.clone(),
                     not_valid: *not_valid,
                     deferral: *deferral,
+                    target,
                 },
             )
         }
@@ -481,11 +524,39 @@ pub(super) fn validate_named(
     }
     Ok(())
 }
+/// Persisted bindings are authoritative; legacy Unknown bindings block by column set.
+pub(super) fn key_dependents(
+    state: &Relational, table: u64, key: catalog_ext::ReferencedKey, columns: &[u64],
+) -> (Vec<(u64, u64)>, bool) {
+    let mut known = Vec::new();
+    let mut unknown = false;
+    for (&child, constraints) in &state.ext.constraints {
+        for c in constraints {
+            if let ConstraintKind::ForeignKey { ref_table, ref_columns, target, .. } = &c.kind {
+                if *ref_table != table { continue; }
+                if *target == catalog_ext::ReferencedKey::Unknown {
+                    unknown |= ref_columns.iter().copied().collect::<BTreeSet<_>>()
+                        == columns.iter().copied().collect::<BTreeSet<_>>();
+                } else if *target == key { known.push((child, c.id)); }
+            }
+        }
+    }
+    (known, unknown)
+}
 pub(super) fn drop_named(
     state: &mut Relational,
     table: &TableDef,
     name: &str,
     optional: bool,
+) -> R<()> {
+    drop_named_cascade(state, table, name, optional, false)
+}
+pub(super) fn drop_named_cascade(
+    state: &mut Relational,
+    table: &TableDef,
+    name: &str,
+    optional: bool,
+    cascade: bool,
 ) -> R<()> {
     if table.hidden_rowid().is_none()
         && constraint_primary_key::primary_key_name(state, table).as_deref() == Some(name)
@@ -496,9 +567,20 @@ pub(super) fn drop_named(
         state.table_constraints(table.id).iter().find(|c| c.name == name) {
         let index = *index;
         let columns = &state.secondary_descriptors_engine().iter().find(|d| d.id == index).ok_or(SqlError::Type)?.columns;
-        if state.ext.constraints.values().flatten().any(|c| matches!(&c.kind,
-            ConstraintKind::ForeignKey { ref_table, ref_columns, .. } if *ref_table == table.id && ref_columns.len() == columns.len() && ref_columns.iter().all(|id| columns.contains(id)))) {
+        let (dependents, unknown) = key_dependents(
+            state, table.id, catalog_ext::ReferencedKey::Secondary(index), columns,
+        );
+        if unknown {
+            return Err(if cascade { SqlError::Unsupported } else { SqlError::DependentObjects });
+        }
+        if !dependents.is_empty() && !cascade {
             return Err(SqlError::DependentObjects);
+        }
+        for (child, id) in dependents {
+            let child = state.tables.values().find(|t| t.id == child).ok_or(SqlError::Type)?.clone();
+            let name = state.table_constraints(child.id).iter().find(|c| c.id == id)
+                .ok_or(SqlError::Type)?.name.clone();
+            drop_named(state, &child, &name, false)?;
         }
         let descriptors = state.secondary_descriptors_engine().iter()
             .filter(|d| d.id != index).cloned().collect::<Vec<_>>();
@@ -555,6 +637,9 @@ pub(super) fn enforce_with_rows<'a>(
     clock: Option<&clock::ExecutionClock>,
     mut load: Option<&mut LoadRows<'_>>,
 ) -> R<std::borrow::Cow<'a, Relational>> {
+    // DDL may have removed constraints with queued checks or explicit modes.
+    deferred.modes.retain(|id, _| state.ext.constraints.values().flatten().any(|c| c.id == *id));
+    deferred.pending.retain(|(id, table), _| state.table_constraints(*table).iter().any(|c| c.id == *id));
     // UNIQUE is enforced by its index; it must not activate row-event checks.
     if !state.ext.constraints.values().flatten().any(|c| matches!(c.kind,
         ConstraintKind::Check { .. } | ConstraintKind::ForeignKey { .. })) {

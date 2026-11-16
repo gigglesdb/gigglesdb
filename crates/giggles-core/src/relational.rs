@@ -27,7 +27,7 @@ pub use clock::StatementClock;
 #[allow(dead_code)]
 pub(crate) mod catalog_ext;
 mod catalog_presentation;
-pub use catalog_presentation::{CatalogConstraint, CatalogPresentation, CatalogView};
+pub use catalog_presentation::{CatalogConstraint, CatalogPresentation, CatalogView, ForeignKeyTarget};
 use catalog_ext::*;
 mod ident;
 use ident::ident;
@@ -2073,10 +2073,7 @@ impl Prepared {
                 (table, alter_table::Action::Constraint(definition), parent_ref)
             }
             C::DropConstraint { table, name, cascade } => {
-                // SQL currently rejects the trailing CASCADE token (42601).
-                // Known gap: J:/gigglesdb-work/r2/r2-33/design.md, pending DD-0068.
-                if *cascade { return Err(SqlError::Syntax); }
-                (table, alter_table::Action::DropConstraint(name.clone(), false), None)
+                (table, alter_table::Action::DropConstraint(name.clone(), false, *cascade), None)
             }
             _ => return Err(SqlError::Unsupported),
         };
@@ -3378,6 +3375,7 @@ impl Relational {
         }
         ext.constraints.remove(&table_id);
         ext.table_schemas.remove(&table_id);
+        ext.primary_index_birth.remove(&table_id);
         for constraints in ext.constraints.values_mut() {
             let incoming = |constraint: &Constraint| matches!(&constraint.kind,ConstraintKind::ForeignKey {ref_table,..} if *ref_table == table_id);
             if !cascade && constraints.iter().any(incoming) {
@@ -3875,10 +3873,19 @@ impl Relational {
                         matches!(c.kind, ConstraintKind::Unique { index, .. } if index == descriptor.id)) {
                         return Err(SqlError::DependentObjects);
                     }
-                    // Standalone UNIQUE indexes need persisted FK-to-index dependencies
-                    // before CASCADE can safely implement PostgreSQL semantics.
-                    if descriptor.unique && index.cascade {
-                        return Err(SqlError::Unsupported);
+                    let (dependents, unknown) = constraints::key_dependents(
+                        self, descriptor.table, catalog_ext::ReferencedKey::Secondary(descriptor.id),
+                        &descriptor.columns,
+                    );
+                    if unknown { return Err(SqlError::Unsupported); }
+                    if !dependents.is_empty() && !index.cascade {
+                        return Err(SqlError::DependentObjects);
+                    }
+                    for (table, id) in dependents {
+                        let table = self.tables.values().find(|t| t.id == table).ok_or(SqlError::Type)?.clone();
+                        let name = self.table_constraints(table.id).iter().find(|c| c.id == id)
+                            .ok_or(SqlError::Type)?.name.clone();
+                        constraints::drop_named(self, &table, &name, false)?;
                     }
                     let descriptors = self
                         .secondary_descriptors_engine()
@@ -4017,6 +4024,8 @@ impl Relational {
                     c.id = allocate(&mut next_id)?;
                 }
                 let epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
+                let (primary_name, constraints) =
+                    constraints::canonicalize_create(keys, primary_name, constraints);
                 let chosen_primary =
                     if keys.is_empty() {
                         None

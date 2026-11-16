@@ -233,3 +233,54 @@ fn sql_leader_handoff_and_checkpoint() {
     assert_eq!(copy.applied().unwrap(), stores[0].applied().unwrap());
     assert_eq!(contents(&copy), contents(&stores[0]));
 }
+
+#[test]
+fn foreign_key_identity_replicates_and_reopens() {
+    use super::meta::{KEY_DEPENDENCY_IDENTITY, REPLICATED};
+
+    let dirs = [Dir::new(), Dir::new(), Dir::new()];
+    let stores = dirs.each_ref()
+        .map(|d| Arc::new(ReplicaStore::create(&d.0, [10; 16]).unwrap()));
+    let sink = Arc::new(Fanout {
+        stores: stores.clone(),
+        next: Mutex::new(1),
+    });
+    let admin = stores[0]
+        .open_admin(sink, Limits::default(), v2::DEFAULT_WRITE_SET_BYTES)
+        .unwrap();
+    let mut session = admin.sql_session();
+    session.execute("CREATE TABLE parent(id int PRIMARY KEY)", &[], None).unwrap();
+    session.execute(
+        "CREATE TABLE child(id int, parent_id int, CONSTRAINT child_parent_fk FOREIGN KEY(parent_id) REFERENCES parent(id))",
+        &[], None,
+    ).unwrap();
+    let targets = session.foreign_key_targets().unwrap();
+    assert_eq!(targets.get("child_parent_fk").map(String::as_str), Some("pk:parent_pkey"));
+    let required = REPLICATED | KEY_DEPENDENCY_IDENTITY | 64;
+    for store in &stores {
+        let bytes = store.kv.get(Keyspace::Meta, b"features").unwrap().unwrap();
+        let features = u64::from_be_bytes(bytes.try_into().unwrap());
+        assert_eq!(features & required, required);
+    }
+    assert_equal(&stores);
+    let checkpoint_dir = Dir::new();
+    let checkpoint = checkpoint_dir.0.join("checkpoint");
+    stores[0].checkpoint(&checkpoint).unwrap();
+    let original = contents(&stores[0]);
+    drop(session);
+    drop(admin);
+    drop(stores);
+
+    let stores = dirs.each_ref().map(|d| Arc::new(ReplicaStore::open(&d.0).unwrap()));
+    assert_equal(&stores);
+    let copy = Arc::new(ReplicaStore::open(&checkpoint).unwrap());
+    assert_eq!(contents(&copy), original);
+    let next = stores[0].applied().unwrap().unwrap().index + 1;
+    let sink = Arc::new(Fanout { stores: stores.clone(), next: Mutex::new(next) });
+    for store in [&stores[1], &copy] {
+        let admin = store
+            .open_admin(sink.clone(), Limits::default(), v2::DEFAULT_WRITE_SET_BYTES)
+            .unwrap();
+        assert_eq!(admin.sql_session().foreign_key_targets().unwrap(), targets);
+    }
+}

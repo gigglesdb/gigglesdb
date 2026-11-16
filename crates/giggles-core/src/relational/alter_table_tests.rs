@@ -66,6 +66,7 @@ fn drop_rejects_foreign_key_source_and_non_primary_target_columns_atomically() {
                     on_update: catalog_ext::Action::NoAction,
                     not_valid: false,
                     deferral: Deferral::NotDeferrable,
+                    target: crate::relational::catalog_ext::ReferencedKey::Unknown,
                 },
             },
         )

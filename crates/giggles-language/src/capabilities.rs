@@ -275,7 +275,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
     if matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "catalog_drop", CapabilityState::Implemented,
-                "Standalone DROP TABLE/INDEX with default RESTRICT or explicit CASCADE/RESTRICT. Shared SQL dependencies and errors; DROP INDEX CASCADE remains Unsupported. Legacy requires empty business state; v2 permits populated state.",
+                "Standalone DROP TABLE/INDEX with default RESTRICT or explicit CASCADE/RESTRICT. Shared SQL dependencies and errors; DROP INDEX CASCADE removes FKs bound to a standalone index; legacy Unknown bindings remain Unsupported. Legacy requires empty business state; v2 permits populated state.",
                 vec![evidence("crates/giggles-language/tests/native_drop_parity.rs", "drop_matrix_matches_sql")], vec![]);
         }
     }

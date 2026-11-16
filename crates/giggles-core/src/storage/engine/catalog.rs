@@ -30,6 +30,8 @@ pub(crate) const MAX_TABLES: usize = 100_000;
 pub(crate) struct TableEntry {
     pub def: TableDef,
     pub heap: bool,
+    #[serde(skip)] // Runtime metadata uses the explicit versioned table DTO.
+    pub primary_index_birth: Option<u64>,
     pub columns_ext: BTreeMap<u64, ColumnExt>,
 }
 
@@ -95,6 +97,7 @@ impl CatalogView {
             if entry.heap {
                 parts.heap.insert(entry.def.id);
             }
+            if let Some(birth) = entry.primary_index_birth { parts.ext.primary_index_birth.insert(entry.def.id, birth); }
             parts.ext.columns.extend(entry.columns_ext.clone());
             for column in &entry.def.columns {
                 let kind = match column.data_type {
@@ -220,6 +223,7 @@ impl CatalogSnapshot {
                     })
                     .chain(self.parts.sql_views.iter().flat_map(|(id, v)| std::iter::once(*id).chain(v.columns.iter().map(|c| c.id))))
                     .chain(self.parts.indexes.iter().map(|index| index.id))
+                    .chain(self.parts.ext.primary_index_birth.values().copied())
                     .chain(self.parts.ext.constraints.values().flatten().map(|c| c.id))
                     .chain(self.parts.ext.sequences.keys().copied())
                     .chain(self.parts.ext.types.iter().map(|(&id, ty)| match ty {
@@ -618,6 +622,7 @@ impl Catalog {
             column.id = self.seq.next(0, 0)?;
         }
         let entry = Arc::new(TableEntry {
+            primary_index_birth: None,
             def,
             heap,
             columns_ext: BTreeMap::new(),
@@ -739,6 +744,7 @@ impl Catalog {
             new.ext.columns.remove(&column.id);
         }
         new.ext.constraints.remove(&entry.def.id);
+        new.ext.primary_index_birth.remove(&entry.def.id);
         new.ext.sequences.retain(|_, sequence| {
             sequence
                 .owned_by
@@ -1159,6 +1165,12 @@ fn finish_view(
         return Err(corrupt("constraint table absent"));
     }
     relational::catalog_ext::validate_unique_indexes(view.constraints.iter().flat_map(|(t, cs)| cs.values().map(move |c| (*t, c))), view.indexes.values()).map_err(|_| corrupt("invalid UNIQUE backing index"))?;
+    if view.by_id.values().any(|e| e.primary_index_birth.is_some()) || view.constraints.values().flat_map(|cs| cs.values()).any(|c|
+        matches!(c.kind, relational::catalog_ext::ConstraintKind::ForeignKey { target, .. } if target != relational::catalog_ext::ReferencedKey::Unknown)) {
+        let parts = view.parts();
+        object_ids(&parts)?;
+        relational::catalog_ext::validate_key_targets(&parts.ext, parts.tables.values(), parts.indexes.iter(), u64::MAX).map_err(|_| corrupt("invalid referenced key or primary birth"))?;
+    }
     view.names = names;
     if !view.schemas.is_empty()
         || !view.types.is_empty()
@@ -1212,6 +1224,7 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
             }
         }
     }
+    for (table, birth) in &parts.ext.primary_index_birth { insert(*birth, (18, *table))?; }
     for schema in parts.ext.schemas.values() {
         insert(schema.id, (14, 0))?;
     }
@@ -1222,6 +1235,7 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
     catalog_codec::sql_views::validate_catalog(parts)?;
     relational::catalog_ext::validate_unique_indexes(parts.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))), parts.indexes.iter()).map_err(|_| corrupt("invalid UNIQUE backing index"))?;
     object_ids(parts)?;
+    relational::catalog_ext::validate_key_targets(&parts.ext, parts.tables.values(), parts.indexes.iter(), u64::MAX).map_err(|_| corrupt("invalid referenced key or primary birth"))?;
     let mut records = BTreeMap::new();
     for (&(relation, column), text) in &parts.comments {
         records.insert(
@@ -1260,6 +1274,7 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
         let mut stored_def = def.clone();
         stored_def.name = name.clone();
         let entry = TableEntry {
+            primary_index_birth: parts.ext.primary_index_birth.get(&def.id).copied(),
             def: stored_def,
             heap: parts.heap.contains(&def.id),
             columns_ext: ext,

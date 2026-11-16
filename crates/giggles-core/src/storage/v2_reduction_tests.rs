@@ -6,6 +6,7 @@ fn seed(count: usize) -> Fixture {
     let f = Fixture::new();
     f.execute("CREATE TABLE big(id bigint PRIMARY KEY, v bigint, h bigint)");
     let entry = TableEntry {
+        primary_index_birth: None,
         def: f.parts().tables["big"].clone(),
         heap: false,
         columns_ext: BTreeMap::new(),

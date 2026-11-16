@@ -18,7 +18,7 @@ fn pg18_check_fk_defaults_identity_and_dependencies() {
     s.constraints.push(ConstraintDef { id: 30, table: 20, name: "child_amount_check".into(), kind: 'c',
         columns: vec![22], expression: Some("(amount >= 0)".into()), validated: true, ..Default::default() });
     s.constraints.push(ConstraintDef { id: 31, table: 20, name: "child_parent_id_fkey".into(), kind: 'f', columns: vec![21],
-        foreign_table: 10, foreign_columns: vec![10], update: 'a', delete: 'a', validated: true, ..Default::default() });
+        foreign_table: 10, foreign_columns: vec![10], foreign_key_target: Some(ForeignKeyTarget::PrimaryKey), update: 'a', delete: 'a', validated: true, ..Default::default() });
     assert_eq!(run(&s, "SELECT pg_get_constraintdef(oid),pg_get_constraintdef(oid,true),pg_get_expr(conbin,conrelid) FROM pg_constraint WHERE contype='c'"),
         vec![vec![S("CHECK ((amount >= 0))".into()), S("CHECK (amount >= 0)".into()), S("(amount >= 0)".into())]]);
     assert_eq!(run(&s, "SELECT pg_get_constraintdef(oid),confupdtype,confdeltype,confmatchtype,condeferrable,condeferred FROM pg_constraint WHERE contype='f'"),

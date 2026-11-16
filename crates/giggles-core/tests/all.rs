@@ -440,3 +440,21 @@ mod native_views;
 
 #[path = "native_sequences.rs"] mod native_sequences;
 #[path = "native_error_splits.rs"] mod native_error_splits;
+#[path = "fk_target_codec.rs"]
+mod fk_target_codec;
+
+#[path = "fk_pk_birth.rs"] mod fk_pk_birth;
+
+#[path = "fk_create_candidates.rs"] mod fk_create_candidates;
+
+#[path = "fk_index_binding.rs"] mod fk_index_binding;
+
+#[path = "fk_drop_index.rs"] mod fk_drop_index;
+
+#[path = "fk_drop_constraint.rs"] mod fk_drop_constraint;
+
+#[path = "fk_catalog_target.rs"] mod fk_catalog_target;
+
+#[path = "fk_drop_durability.rs"] mod fk_drop_durability;
+
+#[path = "fk_integration_main.rs"] mod fk_integration_main;

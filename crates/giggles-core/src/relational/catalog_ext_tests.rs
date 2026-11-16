@@ -27,6 +27,7 @@ fn constraint_extension_frozen_v1_and_canonical_v2_goldens() {
                 on_update: Action::NoAction,
                 not_valid: false,
                 deferral: Deferral::NotDeferrable,
+                target: crate::relational::catalog_ext::ReferencedKey::Unknown,
             },
         }],
     );
@@ -52,7 +53,7 @@ fn constraint_extension_frozen_v1_and_canonical_v2_goldens() {
             .contains("noncanonical")
     );
     let mut unknown = bytes(V1);
-    unknown[..4].copy_from_slice(&8u32.to_be_bytes());
+    unknown[..4].copy_from_slice(&9u32.to_be_bytes());
     assert!(
         codec()
             .deserialize::<CatalogExt>(&unknown)
@@ -173,6 +174,7 @@ fn catalog_ext_all_metadata_roundtrips_and_drop_cleans_owned_entries() {
                 on_update: Action::NoAction,
                 not_valid: false,
                 deferral: Deferral::NotDeferrable,
+                target: crate::relational::catalog_ext::ReferencedKey::Unknown,
             },
         ),
         ("explicit_pkey", ConstraintKind::PrimaryKey),
@@ -273,6 +275,7 @@ fn catalog_ext_foreign_keys_owned_sequences_and_ids_are_validated() {
                 on_update: Action::NoAction,
                 not_valid: false,
                 deferral: Deferral::NotDeferrable,
+                target: crate::relational::catalog_ext::ReferencedKey::Unknown,
             },
         };
         let before = invalid.clone();
@@ -463,6 +466,7 @@ fn catalog_ext_incoming_foreign_key_drop_is_atomic() {
                     on_update: Action::NoAction,
                     not_valid: false,
                     deferral: Deferral::NotDeferrable,
+                    target: crate::relational::catalog_ext::ReferencedKey::Unknown,
                 },
             },
         )
@@ -607,7 +611,7 @@ fn unique_origin_v7_roundtrip_and_old_index_has_no_origin() {
     let mut old: Relational = bincode::deserialize(&base).unwrap();
     old.secondary_restore_engine(secondary_index::codec::decode_pending(&indexes, || false).unwrap(), || false).unwrap();
     assert!(old.catalog_presentation().unwrap().constraints.is_empty());
-    let mut unknown = ext; unknown[..4].copy_from_slice(&8u32.to_be_bytes());
+    let mut unknown = ext; unknown[..4].copy_from_slice(&9u32.to_be_bytes());
     assert!(codec().deserialize::<CatalogExt>(&unknown).unwrap_err().to_string().contains(catalog_ext::UNSUPPORTED_CATALOG_EXT));
 }
 

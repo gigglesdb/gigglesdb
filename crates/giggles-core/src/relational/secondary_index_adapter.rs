@@ -981,6 +981,7 @@ impl Relational {
             self.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))),
             staged.descriptors().iter(),
         )?;
+        super::catalog_ext::validate_key_targets(&self.ext, self.tables.values(), staged.descriptors().iter(), self.next_id)?;
         tick(&mut cancel)?;
         self.secondary = staged;
         Ok(())

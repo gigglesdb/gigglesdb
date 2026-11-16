@@ -14,7 +14,7 @@ fn audit(users: i64) {
     f.execute("CREATE TABLE order_items(order_id bigint REFERENCES orders(id), sku bigint, PRIMARY KEY(order_id,sku))");
     let parts = f.parts();
     for (name, count) in [("users", users), ("orders", users * 4), ("order_items", users * 12)] {
-        let entry = TableEntry { def: parts.tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
+        let entry = TableEntry { primary_index_birth: None, def: parts.tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
         for start in (0..count).step_by(1000) {
             let mut txn = f.db().begin(Isolation::ReadCommitted);
             for id in start..(start + 1000).min(count) {
@@ -120,7 +120,7 @@ fn unindexed_visit_limit_and_equality_buckets() {
     let parts = f.parts();
     let mut txn = f.db().begin(Isolation::ReadCommitted);
     for name in ["a", "b"] {
-        let entry = TableEntry { def: parts.tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
+        let entry = TableEntry { primary_index_birth: None, def: parts.tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
         for id in 0..4097 {
             f.db().rows.insert(&mut txn, &entry, vec![Int(id), Int(id)], None, &|| false).unwrap();
         }

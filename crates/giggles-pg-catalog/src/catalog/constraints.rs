@@ -22,11 +22,20 @@ pub(super) fn populate(snapshot: &CatalogSnapshot, all: &mut BTreeMap<String, Re
         let keys = key(table, &c.columns)?;
         let (foreign, foreign_keys, index) = if c.kind == 'f' {
             let parent = snapshot.tables.iter().find(|t| t.id == c.foreign_table).ok_or(Error::InvalidSnapshot)?;
-            let pk: Vec<_> = parent.primary_key.iter().map(|i| parent.columns[*i].id).collect();
             let same = |ids: &[u64]| ids.len() == c.foreign_columns.len() && ids.iter().all(|i| c.foreign_columns.contains(i));
-            let index = if !pk.is_empty() && same(&pk) { table_oid(parent.id)? + 1 } else {
-                table_oid(snapshot.indexes.iter().find(|i| i.table == parent.id && i.unique && same(&i.columns))
-                    .ok_or(Error::InvalidSnapshot)?.id)?
+            let index = match c.foreign_key_target {
+                None => 0,
+                Some(ForeignKeyTarget::PrimaryKey) => {
+                    let pk = parent.primary_key.iter().map(|i| parent.columns.get(*i)
+                        .map(|c| c.id).ok_or(Error::InvalidSnapshot)).collect::<R<Vec<_>>>()?;
+                    if pk.is_empty() || !same(&pk) { return Err(Error::InvalidSnapshot); }
+                    table_oid(parent.id)? + 1
+                }
+                Some(ForeignKeyTarget::Index(id)) => {
+                    let index = snapshot.indexes.iter().find(|i| i.id == id && i.table == parent.id
+                        && i.unique && same(&i.columns)).ok_or(Error::InvalidSnapshot)?;
+                    table_oid(index.id)?
+                }
             };
             if keys.is_empty() || keys.len() != c.foreign_columns.len()
                 || !matches!(c.update, 'a'|'r'|'c'|'n'|'d') || !matches!(c.delete, 'a'|'r'|'c'|'n'|'d') {
@@ -57,7 +66,7 @@ pub(super) fn populate(snapshot: &CatalogSnapshot, all: &mut BTreeMap<String, Re
         }
         if let Value::Array(keys) = foreign_keys {
             for k in keys { depend(all, 2606, oid, foreign, k, "n"); }
-            depend(all, 2606, oid, index, I(0), "n");
+            if index != 0 { depend(all, 2606, oid, index, I(0), "n"); }
         }
     }
     for table in &snapshot.tables {

@@ -99,7 +99,7 @@ fn internal_exists_scale_and_own_writes() {
     let parts = f.parts();
     let mut txn = f.db().begin(Isolation::ReadCommitted);
     for (name, count) in [("users", 5000), ("orders", 20000)] {
-        let entry = engine::catalog::TableEntry { def: parts.tables[name].clone(),
+        let entry = engine::catalog::TableEntry { primary_index_birth: None, def: parts.tables[name].clone(),
             heap: false, columns_ext: BTreeMap::new() };
         for id in 1..=count {
             let mut values = vec![Value::Int(id)];
@@ -338,6 +338,7 @@ fn invalid_stored_constraint_fails_image_validation_without_catalog_writes() {
             on_update: Action::NoAction,
             not_valid: false,
             deferral: Deferral::NotDeferrable,
+            target: crate::relational::catalog_ext::ReferencedKey::Unknown,
         },
     };
     let ts = engine::meta::open_checks(f.db().kv.as_ref())
@@ -791,6 +792,7 @@ fn failed_statement_preserves_prior_transaction_writes() {
     // the first successful statement but publishes none of its own rows.
     let parts = f.parts();
     let entry = engine::catalog::TableEntry {
+        primary_index_birth: None,
         def: parts.tables["t"].clone(),
         heap: false,
         columns_ext: BTreeMap::new(),
@@ -926,6 +928,7 @@ fn sink_failure_rolls_back_partial_rekey_and_column_rewrite() {
         let txn = s.v2_transaction.as_mut().unwrap();
         let parts = f.db().catalog().parts(txn).unwrap();
         let entry = engine::catalog::TableEntry {
+            primary_index_birth: None,
             def: parts.tables["t"].clone(),
             heap: false,
             columns_ext: BTreeMap::new(),

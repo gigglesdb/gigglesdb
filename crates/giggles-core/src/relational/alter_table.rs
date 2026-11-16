@@ -19,7 +19,7 @@ pub(super) enum Action {
     PrimaryKey(Option<String>, Vec<String>),
     Constraint(constraints::Definition),
     Validate(String),
-    DropConstraint(String, bool),
+    DropConstraint(String, bool, bool),
 }
 impl AlterTable {
     pub fn sequence_dependencies(&self) -> Vec<Option<String>> {
@@ -131,7 +131,10 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                 if optional {
                     p.need("exists")?;
                 }
-                Action::DropConstraint(raw_name(p)?, optional)
+                let name = raw_name(p)?;
+                let cascade = p.word("cascade");
+                if !cascade { p.word("restrict"); }
+                Action::DropConstraint(name, optional, cascade)
             } else {
                 p.word("column");
                 let optional = p.word("if");
@@ -278,8 +281,8 @@ pub(super) fn execute(
             Action::Validate(name) => {
                 constraints::validate_named(&mut candidate, &table, name, &mut *cancel)?
             }
-            Action::DropConstraint(name, optional) => {
-                constraints::drop_named(&mut candidate, &table, name, *optional)?
+            Action::DropConstraint(name, optional, cascade) => {
+                constraints::drop_named_cascade(&mut candidate, &table, name, *optional, *cascade)?
             }
             Action::Add(column, typmod, default, semantic_error) => {
                 if let Some(error) = semantic_error {

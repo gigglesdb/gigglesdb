@@ -28,6 +28,7 @@ fn catalog(kv: &MemKv, key: Vec<u8>, ts: u64, value: Option<Vec<u8>>) {
 }
 fn table(ext: bool, typmod: bool) -> Vec<u8> {
     let entry = TableEntry {
+        primary_index_birth: None,
         def: TableDef {
             id: 1,
             name: "t".into(),
@@ -294,4 +295,51 @@ fn schema_and_user_type_records_require_bit_twelve_even_when_tombstoned() {
             check(&kv, 0x1FFF).unwrap();
         }
     }
+}
+
+#[test]
+fn key_dependency_records_require_identity_and_secondary_bits() {
+    use crate::relational::catalog_ext::{Action, Deferral, ReferencedKey};
+    let bit = meta::KEY_DEPENDENCY_IDENTITY;
+    let table_key = catalog_codec::table_key(1);
+    let old_table = table(false, false);
+    assert_eq!(required_bits_for_catalog_value(&table_key, &old_table).unwrap(), 0);
+    let (mut entry, ext) = catalog_codec::decode_table(&old_table).unwrap();
+    entry.primary_index_birth = Some(9);
+    let new_table = catalog_codec::encode_table(&entry, &ext).unwrap();
+    assert_eq!(new_table[0], 3);
+    assert_eq!(required_bits_for_catalog_value(&table_key, &new_table).unwrap(), 64 | bit);
+    let kv = MemKv::new();
+    catalog(&kv, table_key.clone(), 1, Some(new_table));
+    corrupt_check(&kv, 64);
+    corrupt_check(&kv, bit);
+    check(&kv, 64 | bit).unwrap();
+    catalog(&kv, table_key.clone(), 2, None);
+    check(&kv, 64 | bit).unwrap();
+    for target in [ReferencedKey::Unknown, ReferencedKey::PrimaryKey, ReferencedKey::Secondary(9)] {
+        let constraint = Constraint {
+            id: 4, name: "fk".into(), kind: ConstraintKind::ForeignKey {
+                columns: vec![2], ref_table: 1, ref_columns: vec![2],
+                on_delete: Action::NoAction, on_update: Action::NoAction, not_valid: false,
+                deferral: Deferral::NotDeferrable, target,
+            },
+        };
+        let key = catalog_codec::constraint_key(1, 4);
+        let value = catalog_codec::encode_constraint(&constraint, "t").unwrap();
+        let required = 64 | if target == ReferencedKey::Unknown { 0 } else { bit }
+            | if matches!(target, ReferencedKey::Secondary(_)) { meta::SECONDARY_INDEXES } else { 0 };
+        assert_eq!(required_bits_for_catalog_value(&key, &value).unwrap(), required);
+        let kv = MemKv::new();
+        catalog(&kv, table_key.clone(), 1, Some(old_table.clone()));
+        catalog(&kv, key, 1, Some(value));
+        if target != ReferencedKey::Unknown { corrupt_check(&kv, required & !bit); }
+        if matches!(target, ReferencedKey::Secondary(_)) { corrupt_check(&kv, required & !meta::SECONDARY_INDEXES); }
+        check(&kv, required).unwrap();
+    }
+    let unique = Constraint { id: 4, name: "uq".into(),
+        kind: ConstraintKind::Unique { columns: vec![2], index: 9 } };
+    let value = catalog_codec::encode_constraint(&unique, "t").unwrap();
+    assert_eq!(value[0], 2);
+    assert_eq!(required_bits_for_catalog_value(&catalog_codec::constraint_key(1, 4), &value).unwrap(),
+        64 | meta::UNIQUE_CONSTRAINT_IDENTITY | meta::SECONDARY_INDEXES);
 }

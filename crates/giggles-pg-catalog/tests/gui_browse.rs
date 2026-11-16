@@ -59,7 +59,7 @@ fn jdbc_imported_keys_joins_stay_within_execution_budget() {
         s.table_schemas.insert(id, "gui_sales".into());
     }
     s.constraints.push(ConstraintDef { id: 31, table: 20, name: "child_parent_id_fkey".into(), kind: 'f', columns: vec![21],
-        foreign_table: 10, foreign_columns: vec![10], update: 'a', delete: 'a', validated: true, ..Default::default() });
+        foreign_table: 10, foreign_columns: vec![10], foreign_key_target: Some(ForeignKeyTarget::PrimaryKey), update: 'a', delete: 'a', validated: true, ..Default::default() });
     let sql = "SELECT pkn.nspname,pkc.relname,pka.attname,fkn.nspname,fkc.relname,fka.attname,pos.n,con.conname,pkic.relname FROM pg_namespace pkn,pg_class pkc,pg_attribute pka,pg_namespace fkn,pg_class fkc,pg_attribute fka,pg_constraint con,generate_series(1,32) pos(n),pg_class pkic WHERE pkn.oid=pkc.relnamespace AND pkc.oid=pka.attrelid AND pka.attnum=con.confkey[pos.n] AND con.confrelid=pkc.oid AND fkn.oid=fkc.relnamespace AND fkc.oid=fka.attrelid AND fka.attnum=con.conkey[pos.n] AND con.conrelid=fkc.oid AND con.contype='f' AND (pkic.relkind='i' OR pkic.relkind='I') AND pkic.oid=con.conindid AND fkn.nspname='gui_sales' AND fkc.relname='child' ORDER BY pkn.nspname,pkc.relname,con.conname,pos.n";
     assert_eq!(run(sql, &s).rows, vec![vec![Value::Text("gui_sales".into()),Value::Text("parent".into()),Value::Text("id".into()),Value::Text("gui_sales".into()),Value::Text("child".into()),Value::Text("parent_id".into()),Value::Int(1),Value::Text("child_parent_id_fkey".into()),Value::Text("parent_pkey".into())]]);
 }

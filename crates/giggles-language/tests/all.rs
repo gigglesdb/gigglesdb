@@ -108,3 +108,4 @@ fn every_test_file_is_registered() {
 #[path = "native_typed_read_parity.rs"] mod native_typed_read_parity;
 
 #[path = "native_subquery_parity.rs"] mod native_subquery_parity;
+#[path = "fk_native_drop.rs"] mod fk_native_drop;

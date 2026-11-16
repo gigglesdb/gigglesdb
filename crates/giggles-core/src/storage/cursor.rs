@@ -446,6 +446,7 @@ mod tests {
         let Backend::V2(db) = &admin.inner.backend else { unreachable!() };
         let mut txn = db.begin(engine::txn::Isolation::ReadCommitted);
         let entry = engine::catalog::TableEntry {
+            primary_index_birth: None,
             def: db.catalog().parts(&mut txn).unwrap().tables["t"].clone(),
             heap: false, columns_ext: BTreeMap::new(),
         };
@@ -534,6 +535,7 @@ mod tests {
         };
         let mut txn = db.begin(engine::txn::Isolation::ReadCommitted);
         let entry = engine::catalog::TableEntry {
+            primary_index_birth: None,
             def: db.catalog().parts(&mut txn).unwrap().tables["t"].clone(),
             heap: false,
             columns_ext: BTreeMap::new(),

@@ -9,6 +9,7 @@ fn exercise(count: usize) {
     f.execute("CREATE INDEX big_v ON big(v)");
     f.execute("CREATE INDEX big_h ON big(h)");
     let entry = TableEntry {
+        primary_index_birth: None,
         def: f.parts().tables["big"].clone(), heap: false, columns_ext: BTreeMap::new(),
     };
     let started = Instant::now();

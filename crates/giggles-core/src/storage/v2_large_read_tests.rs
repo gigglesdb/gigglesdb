@@ -4,6 +4,7 @@ use relational::Value::{Int, Text};
 
 fn seed(f: &Fixture, name: &str, count: usize) {
     let entry = TableEntry {
+        primary_index_birth: None,
         def: f.parts().tables[name].clone(),
         heap: false,
         columns_ext: BTreeMap::new(),
@@ -337,7 +338,7 @@ fn deferred_200000_pending_keys_validate_in_pages_and_rollback() {
 
 
 fn seed_cascade(f: &Fixture, name: &str, count: usize, parent: impl Fn(usize) -> usize) {
-    let entry = TableEntry { def: f.parts().tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
+    let entry = TableEntry { primary_index_birth: None, def: f.parts().tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
     for start in (0..count).step_by(200) {
         let mut txn = f.db().begin(Isolation::ReadCommitted);
         for n in start..(start + 200).min(count) {

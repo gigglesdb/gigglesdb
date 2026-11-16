@@ -100,7 +100,7 @@ fn views_validate_names_ids_dependencies_comments_and_drops() {
     assert_eq!(catalog.commit_ddl(tx), Err(TxnError::DependentObjects));
     let mut tx = txn(&seq, &locks, 3);
     let def = changed.tables["serial_table"].clone();
-    tx.put(Keyspace::Catalog, table_key(t), encode_entry(&TableEntry { def, heap: false, columns_ext: BTreeMap::new() }).unwrap()).unwrap();
+    tx.put(Keyspace::Catalog, table_key(t), encode_entry(&TableEntry { primary_index_birth: None, def, heap: false, columns_ext: BTreeMap::new() }).unwrap()).unwrap();
     assert_eq!(catalog.commit_ddl(tx), Err(TxnError::DependentObjects));
     assert_eq!(parts(&catalog, &seq).sql_views, wanted.sql_views);
 }

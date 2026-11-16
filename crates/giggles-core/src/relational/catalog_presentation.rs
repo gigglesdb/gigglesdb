@@ -1,9 +1,14 @@
 //! Read-only presentation of existing catalog extensions; no wire format changes.
 use super::*;
+/// Persisted referenced key; index IDs identify secondary index descriptors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForeignKeyTarget { PrimaryKey, Index(u64) }
 #[derive(Clone, Debug, Default)]
 pub struct CatalogConstraint {
     pub id: u64, pub table: u64, pub name: String, pub kind: char,
     pub columns: Vec<u64>, pub foreign_table: u64, pub foreign_columns: Vec<u64>,
+    /// None denotes an unknown legacy binding.
+    pub foreign_key_target: Option<ForeignKeyTarget>,
     pub update: char, pub delete: char, pub deferrable: bool, pub deferred: bool,
     pub validated: bool, pub expression: Option<String>, pub index: u64,
 }
@@ -66,7 +71,12 @@ impl Relational {
                         info.expression = Some(expr.into());
                     }
                     ConstraintKind::ForeignKey { columns, ref_table, ref_columns, on_delete,
-                        on_update, not_valid, deferral } => {
+                        on_update, not_valid, deferral, target } => {
+                        info.foreign_key_target = match target {
+                            ReferencedKey::Unknown => None,
+                            ReferencedKey::PrimaryKey => Some(ForeignKeyTarget::PrimaryKey),
+                            ReferencedKey::Secondary(id) => Some(ForeignKeyTarget::Index(*id)),
+                        };
                         info.kind = 'f'; info.columns = columns.clone();
                         info.foreign_table = *ref_table; info.foreign_columns = ref_columns.clone();
                         info.update = action(on_update); info.delete = action(on_delete);

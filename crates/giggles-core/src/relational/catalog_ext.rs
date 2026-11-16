@@ -17,6 +17,7 @@ pub(crate) struct CatalogExt {
     pub(crate) logical_kinds: BTreeMap<u64, LogicalKind>,
     pub(crate) schemas: BTreeMap<String, schemas::Schema>,
     pub(crate) table_schemas: BTreeMap<u64, String>,
+    pub(crate) primary_index_birth: BTreeMap<u64, u64>,
 }
 impl Default for CatalogExt {
     fn default() -> Self {
@@ -29,6 +30,7 @@ impl Default for CatalogExt {
             logical_kinds: BTreeMap::new(),
             schemas: BTreeMap::new(),
             table_schemas: BTreeMap::new(),
+            primary_index_birth: BTreeMap::new(),
         }
     }
 }
@@ -41,6 +43,7 @@ impl CatalogExt {
             && self.logical_kinds.is_empty()
             && self.schemas.is_empty()
             && self.table_schemas.is_empty()
+            && self.primary_index_birth.is_empty()
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -133,6 +136,7 @@ pub(crate) enum ConstraintKind {
         on_update: Action,
         not_valid: bool,
         deferral: Deferral,
+        target: ReferencedKey,
     },
     PrimaryKey,
     Unique {
@@ -140,6 +144,73 @@ pub(crate) enum ConstraintKind {
         columns: Vec<u64>,
         index: u64,
     },
+}
+// Frozen v2-7 tuples: live FK additions must never change these bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConstraintV2To7 {
+    pub(crate) id: u64,
+    #[serde(deserialize_with = "name")]
+    pub(crate) name: String,
+    pub(crate) kind: ConstraintKindV2To7,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum ConstraintKindV2To7 {
+    Check {
+        #[serde(deserialize_with = "expression")]
+        expr: String,
+        not_valid: bool,
+    },
+    ForeignKey {
+        #[serde(deserialize_with = "ids")]
+        columns: Vec<u64>,
+        ref_table: u64,
+        #[serde(deserialize_with = "ids")]
+        ref_columns: Vec<u64>,
+        on_delete: Action,
+        on_update: Action,
+        not_valid: bool,
+        deferral: Deferral,
+    },
+    PrimaryKey,
+    Unique {
+        #[serde(deserialize_with = "ids")]
+        columns: Vec<u64>,
+        index: u64,
+    },
+}
+impl From<ConstraintV2To7> for Constraint {
+    fn from(c: ConstraintV2To7) -> Self {
+        let kind = match c.kind {
+            ConstraintKindV2To7::Check { expr, not_valid } => ConstraintKind::Check { expr, not_valid },
+            ConstraintKindV2To7::ForeignKey { columns, ref_table, ref_columns, on_delete, on_update, not_valid, deferral } => ConstraintKind::ForeignKey {
+                columns, ref_table, ref_columns, on_delete, on_update, not_valid, deferral, target: ReferencedKey::Unknown,
+            },
+            ConstraintKindV2To7::PrimaryKey => ConstraintKind::PrimaryKey,
+            ConstraintKindV2To7::Unique { columns, index } => ConstraintKind::Unique { columns, index },
+        };
+        Self { id: c.id, name: c.name, kind }
+    }
+}
+impl From<&Constraint> for ConstraintV2To7 {
+    fn from(c: &Constraint) -> Self {
+        let kind = match &c.kind {
+            ConstraintKind::Check { expr, not_valid } => ConstraintKindV2To7::Check { expr: expr.clone(), not_valid: *not_valid },
+            ConstraintKind::ForeignKey { columns, ref_table, ref_columns, on_delete, on_update, not_valid, deferral, .. } => ConstraintKindV2To7::ForeignKey {
+                columns: columns.clone(), ref_table: *ref_table, ref_columns: ref_columns.clone(), on_delete: on_delete.clone(), on_update: on_update.clone(), not_valid: *not_valid, deferral: *deferral,
+            },
+            ConstraintKind::PrimaryKey => ConstraintKindV2To7::PrimaryKey,
+            ConstraintKind::Unique { columns, index } => ConstraintKindV2To7::Unique { columns: columns.clone(), index: *index },
+        };
+        Self { id: c.id, name: c.name.clone(), kind }
+    }
+}
+// Wire tags are frozen: Unknown=0, PrimaryKey=1, Secondary=2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(crate) enum ReferencedKey {
+    #[default]
+    Unknown,
+    PrimaryKey,
+    Secondary(u64),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) enum Deferral {
@@ -198,6 +269,7 @@ impl From<ConstraintV1> for Constraint {
                 on_update,
                 not_valid,
                 deferral: Deferral::NotDeferrable,
+                target: ReferencedKey::Unknown,
             },
             ConstraintKindV1::PrimaryKey => ConstraintKind::PrimaryKey,
         };
@@ -257,12 +329,70 @@ pub(crate) fn validate_unique_indexes<'a>(
     }
     Ok(())
 }
+fn validate_births(ext: &CatalogExt, tables: &BTreeMap<u64, &TableDef>, next_id: u64, used: &mut BTreeSet<u64>) -> R<()> {
+    if ext.primary_index_birth.len() > MAX_TABLES { return Err(SqlError::Type); }
+    for (table, birth) in &ext.primary_index_birth {
+        let table = tables.get(table).ok_or(SqlError::Type)?;
+        if table.hidden_rowid().is_some() || table.primary_key.is_empty()
+            || *birth == 0 || *birth >= next_id || !used.insert(*birth) {
+            return Err(SqlError::Type);
+        }
+    }
+    Ok(())
+}
+/// Cross-index checks run only after the authoritative descriptors are loaded.
+pub(crate) fn validate_key_targets<'a>(ext: &CatalogExt, tables: impl Iterator<Item = &'a TableDef>,
+    indexes: impl Iterator<Item = &'a super::secondary_index::Descriptor>, next_id: u64) -> R<()> {
+    if ext.primary_index_birth.is_empty() && !ext.constraints.values().flatten().any(|c|
+        matches!(c.kind, ConstraintKind::ForeignKey { target, .. } if target != ReferencedKey::Unknown)) { return Ok(()); }
+    let tables: BTreeMap<_, _> = tables.map(|t| (t.id, t)).collect();
+    let indexes: BTreeMap<_, _> = indexes.map(|d| (d.id, d)).collect();
+    let mut used: BTreeSet<_> = tables.values().flat_map(|t| std::iter::once(t.id).chain(t.columns.iter().map(|c| c.id)))
+        .chain(indexes.keys().copied()).chain(ext.constraints.values().flatten().map(|c| c.id))
+        .chain(ext.sequences.keys().copied()).chain(ext.schemas.values().map(|s| s.id)).collect();
+    for (id, ty) in &ext.types {
+        used.insert(*id);
+        if let TypeDef::Enum { labels, .. } = ty {
+            for offset in 1..=labels.len() as u64 { used.insert(id.checked_add(offset).ok_or(SqlError::Type)?); }
+        }
+    }
+    validate_births(ext, &tables, next_id, &mut used)?;
+    for c in ext.constraints.values().flatten() {
+        let ConstraintKind::ForeignKey { ref_table, ref_columns, target, .. } = &c.kind else { continue };
+        if *target != ReferencedKey::Unknown {
+            let remote = tables.get(ref_table).ok_or(SqlError::Type)?;
+            if ref_columns.iter().any(|id| !remote.columns.iter().any(|c| c.id == *id)) { return Err(SqlError::Type); }
+        }
+        let key = match target {
+            ReferencedKey::Unknown => continue,
+            ReferencedKey::PrimaryKey => {
+                let t = tables.get(ref_table).ok_or(SqlError::Type)?;
+                if t.hidden_rowid().is_some() { return Err(SqlError::Type); }
+                t.primary_key.iter().map(|i| t.columns.get(*i).map(|c| c.id).ok_or(SqlError::Type)).collect::<R<Vec<_>>>()?
+            }
+            ReferencedKey::Secondary(id) => {
+                let d = indexes.get(id).ok_or(SqlError::Type)?;
+                if *id == 0 || *id >= next_id || d.table != *ref_table || !d.unique { return Err(SqlError::Type); }
+                d.columns.clone()
+            }
+        };
+        let refs: BTreeSet<_> = ref_columns.iter().copied().collect();
+        if key.is_empty() || key.len() != ref_columns.len() || refs.len() != ref_columns.len()
+            || key.into_iter().collect::<BTreeSet<_>>() != refs { return Err(SqlError::Type); }
+    }
+    Ok(())
+}
 impl CatalogExt {
     fn has_text_kind(&self) -> bool {
         self.columns.values().any(|c| c.text_kind.is_some())
     }
+    pub(crate) fn has_key_dependency_identity(&self) -> bool {
+        !self.primary_index_birth.is_empty() || self.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { target, .. } if target != ReferencedKey::Unknown))
+    }
     pub(crate) fn wire_version(&self) -> u32 {
-        if self.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::Unique { .. })) {
+        if self.has_key_dependency_identity() {
+            8
+        } else if self.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::Unique { .. })) {
             7
         } else if !self.types.is_empty() || self.columns.values().any(|c| c.type_id.is_some()) {
             6
@@ -287,6 +417,7 @@ impl Serialize for CatalogExt {
         use serde::ser::SerializeTuple;
         let version = self.wire_version();
         let mut out = serializer.serialize_tuple(match version {
+            8 => 9,
             5..=7 => 8,
             4 => 6,
             _ => 5,
@@ -335,6 +466,10 @@ impl Serialize for CatalogExt {
                 .map(|(id, cs)| Ok((*id, cs.iter().map(ConstraintV1::try_from).collect::<Result<Vec<_>, _>>()?)))
                 .collect::<Result<_, &'static str>>().map_err(serde::ser::Error::custom)?;
             out.serialize_element(&legacy)?;
+        } else if version <= 7 {
+            let frozen: BTreeMap<_, Vec<_>> = self.constraints.iter()
+                .map(|(id, cs)| (*id, cs.iter().map(ConstraintV2To7::from).collect())).collect();
+            out.serialize_element(&frozen)?;
         } else {
             out.serialize_element(&self.constraints)?;
         }
@@ -347,6 +482,7 @@ impl Serialize for CatalogExt {
             out.serialize_element(&self.schemas)?;
             out.serialize_element(&self.table_schemas)?;
         }
+        if version == 8 { out.serialize_element(&self.primary_index_birth)?; }
         out.end()
     }
 }
@@ -386,9 +522,15 @@ impl<'de> Deserialize<'de> for CatalogExt {
             bounded_map::<D, LegacyConstraints, MAX_TABLES>(d)
         }
         #[derive(Deserialize)]
-        struct CurrentMap(
-            #[serde(deserialize_with = "constraint_map")] BTreeMap<u64, Vec<Constraint>>,
-        );
+        struct FrozenConstraints(#[serde(deserialize_with = "frozen_constraints")] Vec<ConstraintV2To7>);
+        fn frozen_constraints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ConstraintV2To7>, D::Error> {
+            bounded_vec::<D, ConstraintV2To7, MAX_EXT_CONSTRAINTS>(d)
+        }
+        #[derive(Deserialize)]
+        struct FrozenMap(#[serde(deserialize_with = "frozen_map")] BTreeMap<u64, FrozenConstraints>);
+        fn frozen_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, FrozenConstraints>, D::Error> {
+            bounded_map::<D, FrozenConstraints, MAX_TABLES>(d)
+        }
         #[derive(Deserialize)]
         struct LogicalKinds(
             #[serde(deserialize_with = "logical_kind_map")] BTreeMap<u64, LogicalKind>,
@@ -438,6 +580,13 @@ impl<'de> Deserialize<'de> for CatalogExt {
                 .map(|(id, name)| (id, name.0))
                 .collect())
         }
+        #[derive(Deserialize)]
+        struct CurrentMap(#[serde(deserialize_with = "constraint_map")] BTreeMap<u64, Vec<Constraint>>);
+        #[derive(Deserialize)]
+        struct Births(#[serde(deserialize_with = "birth_map")] BTreeMap<u64, u64>);
+        fn birth_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, u64>, D::Error> {
+            bounded_map::<D, u64, MAX_TABLES>(d)
+        }
         struct V;
         impl<'de> Visitor<'de> for V {
             type Value = CatalogExt;
@@ -452,7 +601,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     };
                 }
                 let ext_version = next!(u32);
-                if !matches!(ext_version, 1..=7) {
+                if !matches!(ext_version, 1..=8) {
                     return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
                 }
                 let columns = if ext_version >= 6 {
@@ -483,6 +632,8 @@ impl<'de> Deserialize<'de> for CatalogExt {
                         .into_iter()
                         .map(|(id, cs)| (id, cs.0.into_iter().map(Constraint::from).collect()))
                         .collect()
+                } else if ext_version <= 7 {
+                    next!(FrozenMap).0.into_iter().map(|(id, cs)| (id, cs.0.into_iter().map(Constraint::from).collect())).collect()
                 } else {
                     next!(CurrentMap).0
                 };
@@ -515,6 +666,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     } else {
                         BTreeMap::new()
                     },
+                    primary_index_birth: if ext_version == 8 { next!(Births).0 } else { BTreeMap::new() },
                 };
                 if ext_version != out.wire_version() {
                     return Err(de::Error::custom("noncanonical catalog extension version"));
@@ -522,7 +674,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                 Ok(out)
             }
         }
-        d.deserialize_tuple(8, V)
+        d.deserialize_tuple(9, V)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1000,7 +1152,8 @@ impl Relational {
         validate_unique_indexes(
             self.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))),
             self.secondary.descriptors().iter(),
-        )
+        )?;
+        validate_key_targets(&self.ext, self.tables.values(), self.secondary.descriptors().iter(), self.next_id)
     }
     pub(crate) fn validate_ext(&self) -> R<()> {
         self.validate_ext_candidate(&self.ext, self.next_id, None)
@@ -1011,7 +1164,7 @@ impl Relational {
         next_id: u64,
         excluded_table: Option<u64>,
     ) -> R<()> {
-        if !matches!(ext.ext_version, 1..=7) {
+        if !matches!(ext.ext_version, 1..=8) {
             return Err(SqlError::Unsupported);
         }
         self.validate_schemas(ext, next_id, excluded_table)?;
@@ -1239,6 +1392,7 @@ impl Relational {
                 return Err(SqlError::Type);
             }
         }
+        validate_births(ext, &tables, next_id, &mut used)?;
         Ok(())
     }
     fn require_column(&self, id: u64) -> R<()> {
@@ -1448,3 +1602,7 @@ mod logical_catalog_ext_tests {
         assert!(codec().deserialize::<CatalogExt>(&wrong).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "fk_target_codec_tests.rs"]
+mod fk_target_codec_tests;

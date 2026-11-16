@@ -4,6 +4,7 @@ use relational::Value::Int;
 
 fn row(f: &Fixture, id: i64) -> Option<engine::rows::Row> {
     let entry = TableEntry {
+        primary_index_birth: None,
         def: f.parts().tables["t"].clone(),
         heap: false,
         columns_ext: BTreeMap::new(),
@@ -158,6 +159,7 @@ fn returning_exceeds_legacy_row_cap_and_keeps_output_budget() {
 
 fn count(f: &Fixture, name: &str) -> usize {
     let entry = TableEntry {
+        primary_index_birth: None,
         def: f.parts().tables[name].clone(), heap: false, columns_ext: BTreeMap::new(),
     };
     let mut txn = f.db().begin(Isolation::ReadCommitted);
@@ -186,7 +188,7 @@ fn audit_updates(users: i64, orders: i64) {
     f.execute("CREATE TABLE bare(id bigint PRIMARY KEY, v bigint)");
     let parts = f.parts();
     for (name, count) in [("users", users), ("orders", orders), ("bare", 4)] {
-        let entry = TableEntry { def: parts.tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
+        let entry = TableEntry { primary_index_birth: None, def: parts.tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
         for start in (0..count).step_by(200) {
             let mut txn = f.db().begin(Isolation::ReadCommitted);
             for id in start..(start + 200).min(count) {
@@ -391,7 +393,7 @@ fn primary_key_moves_stream_audit_subqueries_and_own_writes() {
     f.execute("CREATE TABLE bare(id bigint PRIMARY KEY)");
     f.execute("CREATE TABLE users(id bigint PRIMARY KEY, email text UNIQUE)");
     for (name, count) in [("bare", 100_000), ("users", 50_000)] {
-        let entry = TableEntry { def: f.parts().tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
+        let entry = TableEntry { primary_index_birth: None, def: f.parts().tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
         for start in (0..count).step_by(200) {
             let mut txn = f.db().begin(Isolation::ReadCommitted);
             for id in start..(start + 200).min(count) {

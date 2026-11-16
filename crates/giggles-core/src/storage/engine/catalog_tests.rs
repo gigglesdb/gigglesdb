@@ -1222,6 +1222,7 @@ fn qualified_table_without_its_schema_is_corrupt() {
     view.by_id.insert(
         1,
         Arc::new(TableEntry {
+            primary_index_birth: None,
             def,
             heap: false,
             columns_ext: BTreeMap::new(),
@@ -1266,4 +1267,46 @@ fn forged_unique_index_references_fail_save_and_load() {
         mem.write(batch, Durability::Sync).unwrap();
         assert!(matches!(load_view(&Kv::new(Arc::new(mem)), Ts(1)), Err(CoreError::Corrupt(_))), "{name}");
     }
+}
+
+#[test]
+fn referenced_key_and_birth_catalog_roundtrip_and_validation() {
+    use crate::relational::{Relational, Prepared, catalog_ext::{ConstraintKind, ReferencedKey}};
+    let mut sql = Relational::default();
+    for text in ["CREATE TABLE p(a bigint,b bigint,PRIMARY KEY(a,b))", "CREATE UNIQUE INDEX u ON p(a,b)",
+        "CREATE TABLE q(a bigint,b bigint)", "CREATE UNIQUE INDEX wrong ON q(a,b)",
+        "CREATE TABLE c(a bigint,b bigint,FOREIGN KEY(a,b) REFERENCES p(b,a))"] {
+        sql.execute(&Prepared::parse(text, 1, sql.epoch).unwrap(), &[], None).unwrap();
+    }
+    let p = sql.tables["p"].id; let c = sql.tables["c"].id;
+    let index = sql.secondary_descriptors_engine().iter().find(|d| d.name == "u").unwrap().id;
+    let (tables, mut ext, birth, _) = sql.catalog_parts();
+    ext.primary_index_birth.insert(p, birth);
+    if let ConstraintKind::ForeignKey { target, .. } = &mut ext.constraints.get_mut(&c).unwrap()[0].kind { *target = ReferencedKey::Secondary(index); }
+    ext.ext_version = ext.wire_version();
+    let parts = CatalogParts { tables, ext, indexes: sql.secondary_descriptors_engine().to_vec(), ..CatalogParts::default() };
+    let records = parts_records(&parts).unwrap();
+    let load = |records: BTreeMap<Vec<u8>, Vec<u8>>| {
+        let mem = MemKv::new(); let mut batch = WriteBatch::default();
+        for (key, value) in records { batch.put(Keyspace::Catalog, super::super::codec::user_key_seek_at(&key, Ts(1)), mvcc::encode_live(&value)); }
+        mem.write(batch, Durability::Sync).unwrap(); load_view(&Kv::new(Arc::new(mem)), Ts(1))
+    };
+    let loaded = load(records.clone()).unwrap();
+    assert_eq!(loaded.by_id[&p].primary_index_birth, Some(birth));
+    assert_eq!(loaded.parts(), parts);
+    assert_eq!(CatalogSnapshot::new(&loaded).allocation_floor().unwrap(), birth + 1);
+    for id in [parts.indexes.iter().find(|d| d.name == "wrong").unwrap().id, 999] {
+        let mut bad = parts.clone();
+        let constraint = &mut bad.ext.constraints.get_mut(&c).unwrap()[0];
+        if let ConstraintKind::ForeignKey { target, .. } = &mut constraint.kind { *target = ReferencedKey::Secondary(id); }
+        let key = catalog_codec::constraint_key(c, constraint.id);
+        let value = catalog_codec::encode_constraint(constraint, "c").unwrap();
+        assert!(matches!(parts_records(&bad), Err(CoreError::Corrupt(_))));
+        let mut forged = records.clone(); forged.insert(key, value);
+        assert!(matches!(load(forged), Err(CoreError::Corrupt(_))));
+    }
+    let mut forged = records;
+    let mut entry = (*loaded.by_id[&p]).clone(); entry.primary_index_birth = Some(index);
+    forged.insert(table_key(p), encode_entry(&entry).unwrap());
+    assert!(matches!(load(forged), Err(CoreError::Corrupt(_))));
 }

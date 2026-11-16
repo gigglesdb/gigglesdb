@@ -51,7 +51,6 @@ fn step(left: &Admin, right: &Admin, text: &str, succeeds: bool) {
             let sqlstate = match text {
                 "drop table missing" => "42P01",
                 "drop index missing" => "42704",
-                "drop index parent_unique_idx cascade" => "0A000",
                 _ => "2BP01",
             };
             assert_eq!(giggles_core::sqlstate(&error), sqlstate, "{text}");
@@ -89,6 +88,7 @@ fn drop_matrix_matches_sql() {
                 equal(&left, &right);
             }
         }
+        assert_eq!(left.sql_session().foreign_key_targets().unwrap().values().next().unwrap(), "pk:parent_pkey");
         step(&left, &right, "drop table scratch", true);
         let before = equal(&left, &right);
         let mut sql = left.sql_session();
@@ -113,8 +113,7 @@ fn drop_matrix_matches_sql() {
             ("drop index parent_pkey", false), ("drop index parent_pkey restrict", false),
             ("drop index parent_pkey cascade", false), ("drop index parent_uq", false),
             ("drop index parent_uq restrict", false), ("drop index parent_uq cascade", false),
-            ("drop index parent_unique_idx cascade", false), // Standalone UNIQUE CASCADE remains 0A000.
-            ("drop index parent_unique_idx restrict", true),
+            ("drop index parent_unique_idx cascade", true),
             ("drop index parent_cascade_idx cascade", true),
             ("drop index parent_idx restrict", true), ("drop table parent cascade", true)] {
             step(&left, &right, text, succeeds);

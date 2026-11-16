@@ -11,3 +11,9 @@ INSERT INTO r0p_orders VALUES (103, 1, 922337203685477580, 'quote '' and newline
 INSERT INTO r0p_blobs VALUES (1, '\x0001ff');
 INSERT INTO r0p_blobs VALUES (2, '\x');
 INSERT INTO r0p_blobs VALUES (3, NULL);
+CREATE TABLE r0p_parent (id integer NOT NULL, label text);
+CREATE UNIQUE INDEX r0p_parent_standalone ON r0p_parent(id);
+ALTER TABLE r0p_parent ADD CONSTRAINT r0p_parent_pk PRIMARY KEY (id);
+CREATE TABLE r0p_child (id integer PRIMARY KEY, explicit_ref integer CONSTRAINT r0p_child_explicit_fk REFERENCES r0p_parent(id), omitted_ref integer CONSTRAINT r0p_child_omitted_fk REFERENCES r0p_parent);
+INSERT INTO r0p_parent VALUES (1, 'first parent'), (2, 'second parent');
+INSERT INTO r0p_child VALUES (1, 1, 2), (2, NULL, NULL);

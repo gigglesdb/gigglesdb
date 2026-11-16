@@ -128,26 +128,51 @@ fn populated_validation_and_failed_add_rollback_match_sql_or_legacy_plan_boundar
     } } }
 }
 #[test]
-fn cascade_known_gap_and_request_decoder_are_pinned() {
-    let (_, admin) = fixture(Backend::Legacy);
-    let request = add(cases().remove(0).0, true);
-    let bytes = serde_json::to_vec(&request).unwrap();
-    assert_eq!(serde_json::from_slice::<CatalogRequest>(&bytes).unwrap(), request);
-    assert!(serde_json::from_str::<CatalogRequest>(r#"{"DropConstraint":{"table":"child","name":"rule","cascade":false,"extra":true}}"#).is_err());
-    let engine = Engine::new(admin.clone());
-    let rich = add(ConstraintSpec::Check { expression: Expr::Not(Box::new(Expr::Value(ValueExpr::Literal(Value::Bool(false))))) }, false);
-    assert_eq!(engine.execute_catalog(&rich), Err(Error::Unsupported));
-    let reserved = CatalogRequest::AddConstraint { table: "system_native".into(), name: None, constraint: cases().remove(0).0 };
-    let expected = state(admin.sql_session().execute("ALTER TABLE system_native ADD UNIQUE(n)", &[], None).unwrap_err());
-    assert_eq!(engine.execute_catalog(&reserved).unwrap_err().sqlstate(), Some(expected.as_str()));
-    assert!(serde_json::from_str::<CatalogRequest>(r#"{"AddConstraint":{"table":"child","name":null,"constraint":{"Unique":{"columns":["n"],"deferrable":true}}}}"#).is_err());
-    engine.execute_catalog(&request).unwrap();
-    // Known SQL/PG gap, blocked by persisted FK-index identity: J:/gigglesdb-work/r2/r2-33/design.md (DD-0068).
-    let sql_error = admin.sql_session().execute("ALTER TABLE child DROP CONSTRAINT rule CASCADE", &[], None).unwrap_err();
-    assert_eq!(state(sql_error), "42601");
-    assert_eq!(engine.execute_catalog(&drop_request("rule", true)).unwrap_err().sqlstate(), Some("42601"));
-    assert!(admin.catalog_presentation().unwrap().constraints.iter().any(|c| c.name == "rule"));
-    assert_eq!(engine.execute_catalog(&drop_request("missing", false)).unwrap_err().sqlstate(), Some("42704"));
+fn cascade_and_request_decoder_match_sql() {
+    for backend in backends() {
+        let (_, native) = fixture(backend);
+        let (_, sql) = fixture(backend);
+        let request = add(cases().remove(0).0, true);
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert_eq!(serde_json::from_slice::<CatalogRequest>(&bytes).unwrap(), request);
+        assert!(serde_json::from_str::<CatalogRequest>(r#"{"DropConstraint":{"table":"child","name":"rule","cascade":false,"extra":true}}"#).is_err());
+        let engine = Engine::new(native.clone());
+        let rich = add(ConstraintSpec::Check { expression: Expr::Not(Box::new(Expr::Value(ValueExpr::Literal(Value::Bool(false))))) }, false);
+        assert_eq!(engine.execute_catalog(&rich), Err(Error::Unsupported));
+        let reserved = CatalogRequest::AddConstraint { table: "system_native".into(), name: None, constraint: cases().remove(0).0 };
+        let expected = state(sql.sql_session().execute("ALTER TABLE system_native ADD UNIQUE(n)", &[], None).unwrap_err());
+        assert_eq!(engine.execute_catalog(&reserved).unwrap_err().sqlstate(), Some(expected.as_str()));
+        assert!(serde_json::from_str::<CatalogRequest>(r#"{"AddConstraint":{"table":"child","name":null,"constraint":{"Unique":{"columns":["n"],"deferrable":true}}}}"#).is_err());
+        engine.execute_catalog(&request).unwrap();
+        sql.sql_session().execute("ALTER TABLE child ADD CONSTRAINT rule UNIQUE(n)", &[], None).unwrap();
+        engine.execute_catalog(&drop_request("rule", true)).unwrap();
+        sql.sql_session().execute("ALTER TABLE child DROP CONSTRAINT rule CASCADE", &[], None).unwrap();
+        same(&native, &sql);
+        assert!(!native.catalog_presentation().unwrap().constraints.iter().any(|c| c.name == "rule"));
+        assert_eq!(engine.execute_catalog(&drop_request("missing", false)).unwrap_err().sqlstate(), Some("42704"));
+
+        // Keep allocation history identical: the decoder/error probes above are native-only.
+        let (_, native) = fixture(backend);
+        let (_, sql) = fixture(backend);
+        let engine = Engine::new(native.clone());
+        // PG18.6: a foreign key bound to this UNIQUE blocks bare DROP, but CASCADE removes it.
+        engine.execute_catalog(&request).unwrap();
+        sql.sql_session().execute("ALTER TABLE child ADD CONSTRAINT rule UNIQUE(n)", &[], None).unwrap();
+        for admin in [&native, &sql] {
+            admin.sql_session().execute("CREATE TABLE dependent (n BIGINT CONSTRAINT bound_fk REFERENCES child(n))", &[], None).unwrap();
+        }
+        same(&native, &sql);
+        let before_native = format!("{:?}", native.catalog_presentation().unwrap());
+        let before_sql = format!("{:?}", sql.catalog_presentation().unwrap());
+        assert_eq!(engine.execute_catalog(&drop_request("rule", false)).unwrap_err().sqlstate(), Some("2BP01"));
+        assert_eq!(state(sql.sql_session().execute("ALTER TABLE child DROP CONSTRAINT rule", &[], None).unwrap_err()), "2BP01");
+        assert_eq!(format!("{:?}", native.catalog_presentation().unwrap()), before_native);
+        assert_eq!(format!("{:?}", sql.catalog_presentation().unwrap()), before_sql);
+        engine.execute_catalog(&drop_request("rule", true)).unwrap();
+        sql.sql_session().execute("ALTER TABLE child DROP CONSTRAINT rule CASCADE", &[], None).unwrap();
+        same(&native, &sql);
+        assert!(!native.catalog_presentation().unwrap().constraints.iter().any(|c| c.name == "rule" || c.name == "bound_fk"));
+    }
 }
 #[test]
 fn outcome_uses_sql_schema_resolution_for_same_named_tables() {

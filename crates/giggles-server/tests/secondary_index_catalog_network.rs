@@ -301,3 +301,16 @@ async fn secondary_unique_index_reports_23505() {
         .unwrap_err();
     assert_eq!(error.code().unwrap().code(), "23505");
 }
+
+#[tokio::test]
+async fn fk_conindid_uses_saved_standalone_index() {
+    let (_running, client) = fixture().await;
+    for sql in ["CREATE TABLE p(id int not null)", "CREATE UNIQUE INDEX s ON p(id)",
+        "ALTER TABLE p ADD PRIMARY KEY(id)", "CREATE TABLE c(id int REFERENCES p(id))"] {
+        client.batch_execute(sql).await.unwrap();
+    }
+    let row = client.query_one("SELECT i.relname FROM pg_constraint c JOIN pg_class i ON i.oid=c.conindid WHERE c.contype='f'", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "s");
+    let row = client.query_one("SELECT i.relname FROM pg_depend d JOIN pg_constraint c ON c.oid=d.objid JOIN pg_class i ON i.oid=d.refobjid WHERE d.classid=2606 AND d.refclassid=1259 AND d.refobjsubid=0 AND d.deptype='n' AND c.contype='f'", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "s");
+}

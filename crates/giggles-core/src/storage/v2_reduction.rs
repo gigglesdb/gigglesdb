@@ -41,6 +41,7 @@ impl Source<'_> {
             return Ok(Box::new(std::iter::empty()));
         }
         let entry = TableEntry {
+            primary_index_birth: self.rows.borrow().parts.ext.primary_index_birth.get(&table.id).copied(),
             def: table.clone(),
             heap: self.rows.borrow().parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
@@ -196,6 +197,7 @@ impl RowSource for Source<'_> {
     ) -> Result<Option<scan::SourceRow<'s>>, SqlError> {
         let mut rows = self.rows.borrow_mut();
         let entry = TableEntry {
+            primary_index_birth: rows.parts.ext.primary_index_birth.get(&table.id).copied(),
             def: table.clone(),
             heap: rows.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),

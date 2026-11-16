@@ -82,11 +82,16 @@ pub struct IndexDef {
     pub columns: Vec<u64>,
     pub unique: bool,
 }
+/// Persisted referenced key; index IDs identify secondary index descriptors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForeignKeyTarget { PrimaryKey, Index(u64) }
 /// Read-only CHECK/FK/UNIQUE metadata, using stable core IDs and PostgreSQL action codes.
 #[derive(Debug, Clone, Default)]
 pub struct ConstraintDef {
     pub id: u64, pub table: u64, pub name: String, pub kind: char,
     pub columns: Vec<u64>, pub foreign_table: u64, pub foreign_columns: Vec<u64>,
+    /// None denotes an unknown legacy binding.
+    pub foreign_key_target: Option<ForeignKeyTarget>,
     pub update: char, pub delete: char, pub deferrable: bool, pub deferred: bool,
     pub validated: bool, pub expression: Option<String>, pub index: u64,
 }

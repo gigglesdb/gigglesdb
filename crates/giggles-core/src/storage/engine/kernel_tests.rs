@@ -280,6 +280,7 @@ fn changed_account_has_one_new_version_and_deletion_is_a_tombstone() {
 
 fn table() -> TableEntry {
     TableEntry {
+        primary_index_birth: None,
         def: relational::TableDef {
             id: 42,
             name: "business".into(),

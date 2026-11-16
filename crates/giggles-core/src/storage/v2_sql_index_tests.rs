@@ -150,6 +150,7 @@ fn native_unique_waits_then_returns_duplicate() {
     };
     let parts = f.parts();
     let table = engine::catalog::TableEntry {
+        primary_index_birth: None,
         def: parts.tables["t"].clone(),
         heap: false,
         columns_ext: BTreeMap::new(),
@@ -233,6 +234,7 @@ fn point_and_range_use_mvcc_index_entries() {
     f.execute("CREATE INDEX iv ON t(v)");
     let parts = f.parts();
     let table = TableEntry {
+        primary_index_birth: None,
         def: parts.tables["t"].clone(),
         heap: false,
         columns_ext: BTreeMap::new(),
@@ -307,6 +309,7 @@ fn native_unique_wait_preserves_row_store_deadline() {
     let f = Fixture::new();
     f.execute("CREATE TABLE t(id bigint PRIMARY KEY,v bigint UNIQUE)");
     let table = TableEntry {
+        primary_index_birth: None,
         def: f.parts().tables["t"].clone(),
         heap: false,
         columns_ext: BTreeMap::new(),

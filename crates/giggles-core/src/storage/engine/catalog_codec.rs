@@ -7,7 +7,7 @@ use crate::{
     relational::{
         ColumnDef, DataType, MAX_COLUMNS, TableDef,
         catalog_ext::{
-            Action, ColumnExt, Constraint, ConstraintKind, Deferral, Identity, SequenceDef,
+            Action, ColumnExt, Constraint, ConstraintKind, Deferral, Identity, ReferencedKey, SequenceDef,
             TextKind, TypeDef, validate_typmod,
         },
         validate_create_definition,
@@ -364,6 +364,7 @@ impl From<ConstraintKind> for ConstraintKindDto {
                 on_update,
                 not_valid,
                 deferral,
+                ..
             } => Self::ForeignKey {
                 columns,
                 ref_table,
@@ -399,6 +400,7 @@ impl TryFrom<ConstraintKindDto> for ConstraintKind {
                 on_update: on_update.into(),
                 not_valid,
                 deferral: deferral.into(),
+                target: ReferencedKey::Unknown,
             },
             ConstraintKindDto::PrimaryKey => Self::PrimaryKey,
             ConstraintKindDto::Unique { columns, index } => Self::Unique { columns, index },
@@ -569,6 +571,7 @@ impl TryFrom<TableEntryV2Dto> for (TableEntry, BTreeMap<u64, ColumnExt>) {
         }
         Ok((
             TableEntry {
+                primary_index_birth: None,
                 def,
                 heap,
                 columns_ext: columns_ext.clone(),
@@ -592,12 +595,20 @@ pub(crate) fn encode_table(
             return Err(corrupt("column text kind/type mismatch"));
         }
     }
-    encode_version(2, &TableEntryV2Dto::try_from((entry.clone(), ext.clone()))?)
+    let dto = TableEntryV2Dto::try_from((entry.clone(), ext.clone()))?;
+    if let Some(birth) = entry.primary_index_birth {
+        validate_primary_birth(entry, birth)?;
+        encode_version(3, &(dto, birth))
+    } else { encode_version(2, &dto) }
 }
 pub(crate) fn decode_table(
     value: &[u8],
 ) -> Result<(TableEntry, BTreeMap<u64, ColumnExt>), CoreError> {
-    let dto: TableEntryV2Dto = decode_version(2, value)?;
+    let (dto, birth): (TableEntryV2Dto, Option<u64>) = match value.first() {
+        Some(2) => (decode_version(2, value)?, None),
+        Some(3) => { let (dto, birth) = decode_version(3, value)?; (dto, Some(birth)) }
+        _ => return Err(corrupt("unsupported table version")),
+    };
     if dto.columns_ext.len() > crate::relational::catalog_ext::MAX_EXT_COLUMNS
         || dto
             .columns_ext
@@ -606,7 +617,9 @@ pub(crate) fn decode_table(
     {
         return Err(corrupt("catalog column extension limit"));
     }
-    let (entry, ext): (TableEntry, BTreeMap<u64, ColumnExt>) = dto.try_into()?;
+    let (mut entry, ext): (TableEntry, BTreeMap<u64, ColumnExt>) = dto.try_into()?;
+    if let Some(birth) = birth { validate_primary_birth(&entry, birth)?; }
+    entry.primary_index_birth = birth;
     validate_definition(&entry.def)?;
     for (id, column_ext) in &ext {
         let column = entry
@@ -621,6 +634,12 @@ pub(crate) fn decode_table(
         }
     }
     Ok((entry, ext))
+}
+fn validate_primary_birth(entry: &TableEntry, birth: u64) -> Result<(), CoreError> {
+    if birth == 0 || entry.heap || entry.def.hidden_rowid().is_some() || entry.def.primary_key.is_empty() {
+        return Err(corrupt("noncanonical primary index birth"));
+    }
+    Ok(())
 }
 /// Per-entry checks only: catalog-wide id allocation and references remain the
 /// caller's responsibility. The exact hidden heap column is a legacy exception to
@@ -657,12 +676,34 @@ fn validate_definition(def: &TableDef) -> Result<(), CoreError> {
         .map_err(|_| corrupt("invalid catalog table definition"))
 }
 pub(crate) fn encode_constraint(v: &Constraint, _table: &str) -> Result<Vec<u8>, CoreError> {
-    encode_version(if matches!(v.kind, ConstraintKind::Unique { .. }) { 2 } else { 1 }, &ConstraintDto::from(v.clone()))
+    let dto = ConstraintDto::from(v.clone());
+    if let ConstraintKind::ForeignKey { target, .. } = v.kind
+        && target != ReferencedKey::Unknown {
+        validate_known_target(target)?;
+        return encode_version(3, &(dto, target));
+    }
+    encode_version(if matches!(v.kind, ConstraintKind::Unique { .. }) { 2 } else { 1 }, &dto)
+}
+/// Decode the v3 target for the feature witness before its owning table is loaded.
+pub(crate) fn constraint_key_dependency_target(v: &[u8]) -> Result<ReferencedKey, CoreError> {
+    let (dto, target): (ConstraintDto, ReferencedKey) = decode_version(3, v)?;
+    validate_known_target(target)?;
+    if !matches!(dto.kind, ConstraintKindDto::ForeignKey { .. }) {
+        return Err(corrupt("noncanonical constraint v3 kind"));
+    }
+    Ok(target)
 }
 pub(crate) fn decode_constraint(v: &[u8], table: &TableDef) -> Result<Constraint, CoreError> {
     let version = *v.first().ok_or_else(|| corrupt("missing constraint version"))?;
-    if !matches!(version, 1 | 2) { return Err(corrupt("unsupported constraint version")); }
-    let dto: ConstraintDto = decode_version(version, v)?;
+    if !matches!(version, 1..=3) { return Err(corrupt("unsupported constraint version")); }
+    let (dto, target): (ConstraintDto, ReferencedKey) = if version == 3 {
+        let (dto, target) = decode_version(3, v)?;
+        validate_known_target(target)?;
+        (dto, target)
+    } else { (decode_version(version, v)?, ReferencedKey::Unknown) };
+    if version == 3 && !matches!(dto.kind, ConstraintKindDto::ForeignKey { .. }) {
+        return Err(corrupt("noncanonical constraint v3 kind"));
+    }
     if (version == 2) != matches!(dto.kind, ConstraintKindDto::Unique { .. }) {
         return Err(corrupt("noncanonical constraint version"));
     }
@@ -697,7 +738,15 @@ pub(crate) fn decode_constraint(v: &[u8], table: &TableDef) -> Result<Constraint
         }
         _ => {}
     }
-    Constraint::try_from(dto)
+    let mut constraint = Constraint::try_from(dto)?;
+    if let ConstraintKind::ForeignKey { target: saved, .. } = &mut constraint.kind { *saved = target; }
+    Ok(constraint)
+}
+fn validate_known_target(target: ReferencedKey) -> Result<(), CoreError> {
+    if matches!(target, ReferencedKey::Unknown | ReferencedKey::Secondary(0)) {
+        return Err(corrupt("noncanonical known foreign key target"));
+    }
+    Ok(())
 }
 pub(crate) fn encode_sequence(v: &SequenceDef) -> Result<Vec<u8>, CoreError> {
     encode_version(1, &SequenceDefDto::try_from(v.clone())?)
