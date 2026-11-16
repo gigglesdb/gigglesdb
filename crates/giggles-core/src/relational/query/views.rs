@@ -7,6 +7,13 @@ pub(crate) struct Projection {
     pub base: String,
     pub columns: Vec<(ColumnDef, usize)>,
     pub reads: Vec<String>,
+    filters: Vec<ViewPredicate>,
+    pub dependencies: Vec<u64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ViewPredicate {
+    select: String,
+    columns: Vec<(String, usize)>,
 }
 impl Relational {
     pub(crate) fn catalog_views(&mut self, definitions: &BTreeMap<u64, SqlViewDef>) -> R<()> {
@@ -29,7 +36,7 @@ fn expand(state: &Relational, definitions: &BTreeMap<u64, SqlViewDef>, id: u64, 
     if let Some(projection) = cache.get(&key) { return Ok(projection.clone()); }
     visited.insert(id);
     let view = definitions.get(&id).ok_or(SqlError::UnknownTable)?;
-    let mut result = Projection { base: String::new(), columns: vec![], reads: vec![] };
+    let mut result = Projection { base: String::new(), columns: vec![], reads: vec![], filters: vec![], dependencies: vec![] };
     for output in &view.columns {
         let (relation, column) = output.source.ok_or(SqlError::Unsupported)?;
         let (base, offset, reads, source_id) = if let Some((name, table)) = state.tables.iter().find(|(_, t)| t.id == relation) {
@@ -45,6 +52,23 @@ fn expand(state: &Relational, definitions: &BTreeMap<u64, SqlViewDef>, id: u64, 
         result.reads.extend(reads);
         result.columns.push((ColumnDef { id: source_id, name: output.name.clone(), data_type: output.storage_type.clone(), not_null: false }, offset));
     }
+    // Retain each layer's predicate with its original names mapped to physical offsets.
+    if !view.select.is_empty() {
+        let query = stored_query(&view.select)?;
+        query.view_source()?;
+        let relation = view.dependencies.first().ok_or(SqlError::UnknownTable)?.relation;
+        let mapping = if definitions.contains_key(&relation) {
+            let inner = expand(state, definitions, relation, visited, cache)?;
+            result.filters = inner.filters;
+            result.dependencies.extend(inner.dependencies);
+            inner.columns.iter().map(|(c, offset)| (c.name.clone(), *offset)).collect()
+        } else {
+            let table = state.tables.values().find(|t| t.id == relation).ok_or(SqlError::UnknownTable)?;
+            table.columns.iter().enumerate().map(|(i,c)| (c.name.clone(),i)).collect()
+        };
+        if query.where_filter().is_some() { result.filters.push(ViewPredicate { select: view.select.clone(), columns: mapping }); }
+    }
+    result.dependencies.extend(view.dependencies.iter().flat_map(|d| d.columns.iter().copied()));
     result.reads.extend(state.view_names.iter().filter(|(_, v)| v.0 == id).map(|(name, _)| name.clone()));
     result.reads.sort(); result.reads.dedup();
     visited.remove(&id);
@@ -90,6 +114,70 @@ impl Query {
         }
         if let Some(Filter::Clauses(c)) = &mut self.filter { c.view_reads = reads; }
     }
+}
+
+
+fn stored_query(sql: &str) -> R<Query> {
+    let mut parser = Parser { tokens: lex(sql)?, at: 0, params: BTreeSet::new(), relations: vec![] };
+    Query::parse(&mut parser)
+}
+pub(super) fn bind_filters(query: &Query, state: &Relational, tables: &[&TableDef], joins: &mut Vec<BoundJoin>, filter: &mut Option<BoundFilter>) -> R<()> {
+    for (source, syntax) in query.sources.iter().enumerate() {
+        let Some(projection) = projection(state, &syntax.name)? else { continue; };
+        for binding in &projection.filters {
+            let stored = stored_query(&binding.select)?;
+            let Some(predicate) = stored.where_filter() else { continue; };
+            let resolve = |c: &ColumnRef, _: usize| {
+                let column = binding.columns.iter().find(|(name,_)| name == &c.name).ok_or(SqlError::UnknownColumn)?.1;
+                Ok(BoundColumn { source, column })
+            };
+            let mut params = vec![];
+            predicate.infer(&mut params, &resolve, tables)?;
+            let bound = predicate.bind(&params, &resolve, tables)?;
+            if source > 0 {
+                // Filter right-side view rows before the join's NULL extension.
+                let mut join = joins.remove(source - 1);
+                join.on = BoundFilter::Logic(Box::new(join.on), true, Box::new(bound));
+                joins.insert(source - 1, join);
+            } else {
+                *filter = Some(match filter.take() {
+                    Some(previous) => BoundFilter::Logic(Box::new(previous), true, Box::new(bound)),
+                    None => bound,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+impl Query {
+    pub(in crate::relational) fn view_dependencies(&self) -> R<BTreeSet<String>> {
+        let mut names = BTreeSet::new();
+        self.walk_scalars(&mut |s| { if let Scalar::Column(c) = s { names.insert(c.name.clone()); } Ok(()) })?;
+        Ok(names)
+    }
+    pub(in crate::relational) fn view_where_sql(&self) -> R<Option<String>> {
+        self.where_filter().map(view_filter_sql).transpose()
+    }
+}
+fn view_scalar_sql(s: &Scalar) -> R<String> {
+    Ok(match s {
+        Scalar::Column(c) => format!("\"{}\"", c.name.replace('"', "\"\"")),
+        Scalar::Literal(Value::Text(s)) => format!("'{}'", s.replace('\'', "''")),
+        Scalar::Literal(Value::Int(n)) => n.to_string(),
+        Scalar::Literal(Value::Bool(b)) => b.to_string(),
+        Scalar::Literal(Value::Null) => "NULL".into(),
+        _ => return Err(SqlError::Unsupported),
+    })
+}
+fn view_filter_sql(f: &Filter) -> R<String> {
+    Ok(match f {
+        Filter::Scalar(s) => view_scalar_sql(s)?,
+        Filter::Compare(a, op, b) => format!("({} {op} {})", view_scalar_sql(a)?, view_scalar_sql(b)?),
+        Filter::Null(a, negated) => format!("({} IS {}NULL)", view_scalar_sql(a)?, if *negated { "NOT " } else { "" }),
+        Filter::Not(a) => format!("(NOT {})", view_filter_sql(a)?),
+        Filter::Logic(a, and, b) => format!("({} {} {})", view_filter_sql(a)?, if *and { "AND" } else { "OR" }, view_filter_sql(b)?),
+        _ => return Err(SqlError::Unsupported),
+    })
 }
 
 #[cfg(test)]

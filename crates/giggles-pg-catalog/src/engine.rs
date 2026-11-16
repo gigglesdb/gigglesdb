@@ -3,6 +3,7 @@ mod flat_union;
 mod numeric_literals;
 mod join_selection;
 mod regtype;
+mod viewdef;
 mod subscripts;
 #[cfg(test)]
 mod gui_properties;
@@ -5325,9 +5326,16 @@ impl Runtime<'_> {
                 }
             }
             "pg_get_viewdef" => {
-                let oid = match &v[0] { S(name) => i64::from(regclass_oid(name, self.snapshot)?), value => integer(value.clone())? };
-                self.snapshot.views.iter().find_map(|(id, sql)|
-                    (catalog::table_oid(*id).ok().map(i64::from) == Some(oid)).then(|| S(sql.clone()))).unwrap_or(N)
+                let oid = match &v[0] { S(name) => i64::from(regclass_oid(name, self.snapshot).map_err(|_| Error::UnknownRelation(name.clone()))?), value => integer(value.clone())? };
+                let stored = self.snapshot.views.iter().find(|(id, _)| catalog::table_oid(**id).ok().map(i64::from) == Some(oid));
+                match stored {
+                    Some((_, sql)) => {
+                        let pretty = matches!(v.get(1), Some(B(true) | I(_)));
+                        let wrap = match v.get(1) { Some(I(n)) => Some(*n), _ => None };
+                        S(viewdef::deparse(sql, self.snapshot, pretty, wrap)?)
+                    }
+                    None => N,
+                }
             }
             "pg_get_ruledef"
             | "pg_get_triggerdef"

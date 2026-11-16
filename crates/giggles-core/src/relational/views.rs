@@ -55,7 +55,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
 // earlier removals. Persisted definitions/comments are removed at publication.
 pub(super) fn drop_column_views(state: &mut Relational, column: u64, cascade: bool) -> R<()> {
     let mut dropped = state.view_names.iter().filter(|(_, (_, p))|
-        p.as_ref().is_ok_and(|p| p.columns.iter().any(|(c, _)| c.id == column)))
+        p.as_ref().is_ok_and(|p| p.columns.iter().any(|(c, _)| c.id == column) || p.dependencies.contains(&column)))
         .map(|(name, _)| name.clone()).collect::<BTreeSet<_>>();
     loop {
         let before = dropped.len();
@@ -150,12 +150,14 @@ impl Prepared {
             let mut seen = BTreeSet::new();
             if outputs.iter().any(|c| !seen.insert(&c.name)) { return Err(SqlError::DuplicateColumn); }
             let table = binding.tables.get(source).ok_or(SqlError::UnknownTable)?;
+            let referenced = query.view_dependencies()?;
             let dependencies = vec![SqlViewDependency { relation: table.id,
-                columns: table.logical_columns().filter(|c| outputs.iter().any(|o| o.id == c.id)).map(|c| c.id).collect() }];
-            let select = format!("SELECT {} FROM {}.{}", outputs.iter().map(|c| {
+                columns: table.logical_columns().filter(|c| outputs.iter().any(|o| o.id == c.id) || referenced.contains(&c.name)).map(|c| c.id).collect() }];
+            let mut select = format!("SELECT {} FROM {}.{}", outputs.iter().map(|c| {
                 let original = table.logical_columns().find(|s| s.id == c.id).unwrap();
                 format!("{} AS {}", quote(&original.name), quote(&c.name))
             }).collect::<Vec<_>>().join(", "), quote(split_key(source).0), quote(split_key(source).1));
+            if let Some(predicate) = query.view_where_sql()? { select.push_str(&format!(" WHERE {predicate}")); }
             let id = match existing { Some(id) => id, None => allocate(&mut next)? };
             let previous = existing.and_then(|id| parts.sql_views.get(&id));
             let columns = outputs.iter().enumerate().map(|(position, c)| {

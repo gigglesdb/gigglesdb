@@ -1784,12 +1784,13 @@ fn integer_width(ty: &DataType) -> bool {
 
 impl Query {
     pub(super) fn view_projection(&self, state: &Relational) -> R<Vec<ColumnDef>> {
-        if self.sources.len() != 1 || !self.joins.is_empty() || !self.predicates.is_empty()
-            || self.where_filter().is_some() || !self.order.is_empty() || self.limit.is_some()
+        if self.sources.len() != 1 || !self.joins.is_empty()
+            || !self.order.is_empty() || self.limit.is_some()
             || self.distinct() || !self.group().is_empty() || self.having().is_some()
             || self.offset().is_some() || self.derived().is_some()
             || self.items.iter().any(|(i, _)| !matches!(i, Item::Star | Item::QualifiedStar { .. } | Item::Scalar(Scalar::Column(_))))
         { return Err(SqlError::Unsupported); }
+        self.view_where_sql()?;
         let mut query = self.clone();
         // Duplicate output names belong to CREATE VIEW's final-name check.
         for (i, (item, alias)) in query.items.iter_mut().enumerate() {
@@ -3902,7 +3903,7 @@ impl Query {
                 }
             }
         }
-        let joins = self.bind_joins(&tables, &mut parameters, &resolve, &subqueries)?;
+        let mut joins = self.bind_joins(&tables, &mut parameters, &resolve, &subqueries)?;
         let mut columns = vec![];
         let mut aliases = BTreeSet::new();
         for (item, alias) in &self.items {
@@ -4068,10 +4069,11 @@ impl Query {
         {
             return Err(SqlError::Unsupported);
         }
-        let filter = self
+        let mut filter = self
             .where_filter()
             .map(|f| f.bind_with_subqueries(&parameters, &resolve, &tables, &subqueries))
             .transpose()?;
+        views::bind_filters(self, state, &tables, &mut joins, &mut filter)?;
         let order = self
             .order
             .iter()

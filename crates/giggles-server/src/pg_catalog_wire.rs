@@ -37,6 +37,7 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
         E::Limit => "54000",
         E::InvalidSnapshot => "55000",
         E::InvalidPrivilege(_) => "22023",
+        E::UnknownRelation(_) => "42P01",
         E::Unsupported => "0A000",
     }
 }
@@ -232,8 +233,8 @@ pub(crate) fn snapshot(
         generation,
         backend_pid: session.backend_pid,
         table_locks: session.sql.held_table_locks().into_iter()
-            .filter(|(_, table, _)| visible.contains(table))
-            .map(|(txn, table, mode)| (txn, table, session.backend_pid, mode.into())).collect(),
+            .filter(|(_, table, _, _)| visible.contains(table))
+            .map(|(txn, table, mode, fastpath)| (txn, table, session.backend_pid, mode.into(), fastpath)).collect(),
         backend_ssl: session.backend_ssl,
         schemas,
         table_schemas: metadata

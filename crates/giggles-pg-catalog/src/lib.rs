@@ -182,8 +182,8 @@ pub struct CatalogSnapshot {
     pub comments: std::collections::BTreeMap<(u64, u64), String>,
     /// Current wire backend identity, supplied by the host (0 in offline snapshots).
     pub backend_pid: i32,
-    /// Granted relation locks supplied by the engine: (transaction, table ID, pid, mode).
-    pub table_locks: Vec<(u64, u64, i32, String)>,
+    /// Granted relation locks supplied by the engine: (transaction, table ID, pid, mode, fastpath).
+    pub table_locks: Vec<(u64, u64, i32, String, bool)>,
     /// Optional explicit Unix second for deterministic timezone presentation.
     pub timezone_now: Option<i64>,
     /// Whether this connection actually completed a TLS handshake.
@@ -422,6 +422,7 @@ pub enum Error {
     MixedRelations,
     Mutation,
     UnknownColumn,
+    UnknownRelation(String),
     AmbiguousColumn,
     DivisionByZero,
     Type,

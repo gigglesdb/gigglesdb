@@ -1552,10 +1552,10 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         let interval = format!("{sign}{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
         add("pg_timezone_names", vec![s(name), s(&abbrev), s(&interval), B(dst)]);
     }
-    for (txn, table, pid, mode) in &snapshot.table_locks {
+    for (txn, table, pid, mode, fastpath) in &snapshot.table_locks {
         add("pg_locks", vec![s("relation"), I(16384), I(i64::from(table_oid(*table)?)),
             N, N, N, N, N, N, N, s(&format!("{pid}/{txn}")), I(i64::from(*pid)),
-            s(mode), B(true), B(false), N]);
+            s(mode), B(true), B(*fastpath), N]);
     }
     // Catalog relations are genuine virtual tables, with their actual columns below.
     for &name in known_names() {

@@ -9,7 +9,7 @@ fn timezone_columns_and_values() {
 }
 #[test]
 fn held_relation_lock_full_shape() {
-    let snapshot = CatalogSnapshot { backend_pid: 42, table_locks: vec![(7, 1, 42, "ShareRowExclusiveLock".into()), (7, 1, 42, "AccessShareLock".into())], ..Default::default() };
+    let snapshot = CatalogSnapshot { backend_pid: 42, table_locks: vec![(7, 1, 42, "ShareRowExclusiveLock".into(), false), (7, 1, 42, "AccessShareLock".into(), false)], ..Default::default() };
     let p = plan("SELECT * FROM pg_locks WHERE pid = pg_backend_pid() ORDER BY mode").unwrap().unwrap();
     let result = execute(&p, &snapshot, &[]).unwrap();
     assert_eq!(result.fields.iter().map(|f| f.data_type).collect::<Vec<_>>(), vec![PgType::Text, PgType::Oid, PgType::Oid, PgType::Int4, PgType::Int2, PgType::Text, PgType::Xid, PgType::Oid, PgType::Oid, PgType::Int2, PgType::Text, PgType::Int4, PgType::Text, PgType::Bool, PgType::Bool, PgType::TimestampTz]);

@@ -156,6 +156,7 @@ impl LockError {
 struct KeyState {
     holders: HashMap<TxnId, HeldModes>,
     queue: Vec<u64>,
+    slow: HashSet<TxnId>,
 }
 
 #[derive(Debug)]
@@ -329,6 +330,7 @@ impl LockManager {
         for key in &affected {
             if let Some(locks) = state.keys.get_mut(key) {
                 locks.holders.remove(&txn);
+                locks.slow.remove(&txn);
             }
         }
         state.row_counts.remove(&txn);
@@ -410,6 +412,12 @@ impl LockManager {
             .collect()
     }
 
+    pub(crate) fn fastpath(&self, txn: TxnId, table: u64, mode: LockMode) -> bool {
+        matches!(mode, LockMode::AccessShare | LockMode::RowShare | LockMode::RowExclusive)
+            && self.state.lock().unwrap_or_else(|p| p.into_inner()).keys.get(&LockKey::Table(table))
+                .is_some_and(|locks| !locks.slow.contains(&txn))
+    }
+
     /// Count live queue entries, recovering state for inspection after poisoning.
     pub(crate) fn waiting_count(&self) -> usize {
         self.state
@@ -442,6 +450,16 @@ impl State {
         }
         if previous.is_none() {
             self.held_keys.entry(txn).or_default().insert(key.clone());
+        }
+        if matches!(key, LockKey::Table(_)) {
+            let locks = self.keys.entry(key.clone()).or_default();
+            if !matches!(mode, LockMode::AccessShare | LockMode::RowShare | LockMode::RowExclusive) {
+                locks.slow.extend(locks.holders.keys().copied());
+                locks.slow.insert(txn);
+            } else if locks.holders.values().any(|held| held.iter().any(|mode|
+                !matches!(mode, LockMode::AccessShare | LockMode::RowShare | LockMode::RowExclusive))) {
+                locks.slow.insert(txn);
+            }
         }
         self.keys
             .entry(key.clone())

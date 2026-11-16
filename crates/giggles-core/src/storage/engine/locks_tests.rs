@@ -991,3 +991,26 @@ fn nowait_does_not_join_a_deadlock_cycle() {
         "55P03"
     );
 }
+
+#[test]
+fn fastpath_weak_sequences_and_sticky_cross_session_transfer() {
+    use LockMode::*;
+    let lm = manager();
+    let key = LockKey::Table(77);
+    let take = |txn, mode| lm.acquire(TxnId(txn), key.clone(), mode, None, &|| false).unwrap();
+    take(1, AccessShare);
+    assert!(lm.fastpath(TxnId(1),77,AccessShare));
+    take(2, ShareUpdateExclusive);
+    assert!(!lm.fastpath(TxnId(1),77,AccessShare));
+    assert!(!lm.fastpath(TxnId(2),77,ShareUpdateExclusive));
+    take(3, RowExclusive);
+    assert!(!lm.fastpath(TxnId(3),77,RowExclusive));
+    lm.release_all(TxnId(2));
+    assert!(!lm.fastpath(TxnId(1),77,AccessShare));
+    lm.release_all(TxnId(1)); lm.release_all(TxnId(3));
+    for modes in [vec![AccessShare], vec![RowExclusive,RowShare], vec![RowExclusive], vec![Share,RowExclusive],vec![RowExclusive,Share]] {
+        for mode in &modes { take(1,*mode); }
+        for mode in &modes { assert_eq!(lm.fastpath(TxnId(1),77,*mode), !modes.contains(&Share)); }
+        lm.release_all(TxnId(1));
+    }
+}

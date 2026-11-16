@@ -20,7 +20,7 @@ fn views_have_typed_outputs_definitions_and_no_heap_objects() {
         "SELECT * FROM pg_tables WHERE tablename='v'"] { assert!(run(&s, sql).is_empty()); }
     assert_eq!(run(&s, "SELECT schemaname,viewname,viewowner FROM pg_views"), vec![vec![S("public".into()),S("v".into()),S("giggles".into())]]);
     for arg in ["65576::oid", "65576::oid,false", "65576::oid,true", "65576::oid,40", "'public.v'", "'v',true"] {
-        assert_eq!(run(&s, &format!("SELECT pg_get_viewdef({arg})")), vec![vec![S(s.views[&10].clone())]]);
+        assert_eq!(run(&s, &format!("SELECT pg_get_viewdef({arg})")), vec![vec![S(" SELECT amount\n   FROM public.t;".into())]]);
         assert!(plan_gateway(&format!("SELECT pg_get_viewdef({arg})")).unwrap().is_some());
     }
     assert_eq!(run(&s, "SELECT pg_get_viewdef(1::oid),pg_get_viewdef(NULL::oid),obj_description(65576::oid)"),
@@ -33,5 +33,5 @@ fn views_have_typed_outputs_definitions_and_no_heap_objects() {
     assert_eq!(run(&s, "SELECT view_definition FROM information_schema.views"), vec![vec![N]]);
     let prepared = plan("SELECT pg_get_viewdef(65576::oid)").unwrap().unwrap();
     s.views.insert(10, "SELECT renamed FROM public.t;".into());
-    assert_eq!(execute(&prepared, &s, &[]).unwrap().rows, vec![vec![S(s.views[&10].clone())]]);
+    assert_eq!(execute(&prepared, &s, &[]).unwrap().rows, vec![vec![S(" SELECT renamed\n   FROM public.t;".into())]]);
 }

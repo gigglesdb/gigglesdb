@@ -647,7 +647,7 @@ impl Transaction {
     pub(crate) fn id(&self) -> TxnId {
         self.id
     }
-    pub(crate) fn held_table_locks(&self) -> Vec<(u64, &'static str)> {
+    pub(crate) fn held_table_locks(&self) -> Vec<(u64, &'static str, bool)> {
         let locks = match &self.services {
             TxnServices::Local { locks, .. } => locks.as_ref(),
             TxnServices::Cluster(cluster) => cluster.gateway_locks(),
@@ -662,7 +662,7 @@ impl Transaction {
                 ExclusiveTable => "ExclusiveLock", AccessExclusive => "AccessExclusiveLock",
                 Shared | Exclusive => return None,
             };
-            Some((table, name))
+            Some((table, name, locks.fastpath(self.id, table, mode)))
         }).collect()
     }
     pub(crate) fn catalog_generation(&self) -> u64 {
