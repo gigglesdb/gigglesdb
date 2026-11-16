@@ -11,6 +11,7 @@ pub use sections::*;
 use std::{cmp::Ordering, collections::BTreeMap};
 
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use tokio_postgres::{Client, IsolationLevel, types::ToSql};
 
 use super::{
@@ -22,6 +23,109 @@ use crate::{
     mapping::{PgType, Value},
     pg::chunk::{ChunkQuery, TableKey},
 };
+
+/// SQL capabilities of the verification endpoint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SqlDialect {
+    #[default]
+    Postgres,
+    Gigglesdb,
+}
+
+impl SqlDialect {
+    pub fn text_expression(self, expr: &str, pg_type: &PgType) -> String {
+        match (self, pg_type) {
+            (Self::Gigglesdb, PgType::Char { .. }) => expr.to_owned(),
+            (_, PgType::Domain { base, .. }) => self.text_expression(expr, base),
+            _ => text_expression(expr, pg_type),
+        }
+    }
+
+    /// Preserve bpchar padding without calling octet_length on bpchar.
+    pub fn size_expression(
+        self,
+        expr: &str,
+        pg_type: &PgType,
+        typmod: Option<i32>,
+    ) -> Result<String> {
+        match (self, pg_type) {
+            (Self::Gigglesdb, PgType::Char { .. }) => {
+                let length = typmod.and_then(|n| n.checked_sub(4)).filter(|n| *n > 0)
+                    .ok_or(VerifyError::Invalid("GigglesDB verification char byte budget requires a known positive char(n) length modifier"))?;
+                Ok(format!("rpad({expr}::text, {length}, ' ')"))
+            }
+            (_, PgType::Domain { base, .. }) => self.size_expression(expr, base, typmod),
+            _ => Ok(self.text_expression(expr, pg_type)),
+        }
+    }
+
+    /// `from` is a base-table FROM/WHERE clause for GigglesDB.
+    pub fn size_sql(self, select: &[String], from: &str) -> String {
+        let bytes = select
+            .iter()
+            .enumerate()
+            .map(|(i, expr)| match self {
+                Self::Postgres => format!("8::numeric + COALESCE(octet_length(\"v{i}\"), 0)"),
+                Self::Gigglesdb => format!("8::numeric + COALESCE(octet_length({expr}), 0)"),
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
+        match self {
+            Self::Postgres => {
+                let sized_select = select
+                    .iter()
+                    .enumerate()
+                    .map(|(i, expr)| format!("{expr} AS \"v{i}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "SELECT count(*)::text, COALESCE(sum({bytes}), 0)::text FROM (SELECT {sized_select}{from}) AS sized"
+                )
+            }
+            Self::Gigglesdb => {
+                format!("SELECT CAST(count(*) AS text), COALESCE(sum({bytes}), 0)::text{from}")
+            }
+        }
+    }
+
+    pub fn ordered_sample_sql(select: &str, from: &str, ordering: &str) -> String {
+        format!("SELECT {select}{from} ORDER BY {ordering}")
+    }
+
+    /// Ordered, bounded-memory alternative to a window-function sample.
+    /// The first candidate is final even if it exceeds the byte cap.
+    pub async fn stream_sample<C: tokio_postgres::GenericClient + Sync>(
+        client: &C,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+        stride: u64,
+        max_bytes: u64,
+    ) -> Result<Option<tokio_postgres::Row>> {
+        if stride == 0 {
+            return Err(VerifyError::Invalid("zero sample stride"));
+        }
+        let rows = client
+            .query_raw(sql, params.iter().copied())
+            .await
+            .map_err(pg_error)?;
+        futures::pin_mut!(rows);
+        let mut index = 0u64;
+        while let Some(row) = rows.try_next().await.map_err(pg_error)? {
+            if index > 0 && index.is_multiple_of(stride) {
+                let bytes = (0..row.len()).try_fold(0u64, |total, i| {
+                    let text: Option<&str> = row.try_get(i).map_err(pg_error)?;
+                    total
+                        .checked_add(8)
+                        .and_then(|n| n.checked_add(text.map_or(0, |s| s.len() as u64)))
+                        .ok_or(VerifyError::Invalid("sample key size overflow"))
+                })?;
+                return Ok((bytes <= max_bytes).then_some(row));
+            }
+            index += 1;
+        }
+        Ok(None)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -49,6 +153,8 @@ pub trait SqlChangeEvidence: Send {
 pub struct PgRowSource<O> {
     client: Client,
     side: Side,
+    dialect: SqlDialect,
+    type_modifiers: BTreeMap<String, i32>,
     key: TableKey,
     columns: BTreeMap<String, PgType>,
     order: O,
@@ -91,6 +197,8 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
         Ok(Self {
             client,
             side,
+            dialect: SqlDialect::Postgres,
+            type_modifiers: BTreeMap::new(),
             key,
             columns: scoped,
             order,
@@ -104,6 +212,16 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
     /// Explicit source lineage for reads made without online evidence.
     pub fn with_source_positions(mut self, positions: PgSourcePosition) -> Self {
         self.source_positions = Some(positions);
+        self
+    }
+
+    pub fn with_dialect(mut self, dialect: SqlDialect) -> Self {
+        self.dialect = dialect;
+        self
+    }
+
+    pub fn with_type_modifiers(mut self, modifiers: BTreeMap<String, i32>) -> Self {
+        self.type_modifiers = modifiers;
         self
     }
 
@@ -190,19 +308,37 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
         } else {
             None
         };
-        let bytes = (0..select.len())
-            .map(|i| format!("8::numeric + COALESCE(octet_length(\"v{i}\"), 0)"))
-            .collect::<Vec<_>>()
-            .join(" + ");
-        let sized_select = select
-            .iter()
-            .enumerate()
-            .map(|(i, expr)| format!("{expr} AS \"v{i}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let size_sql = format!(
-            "SELECT count(*)::text, COALESCE(sum({bytes}), 0)::text FROM (SELECT {sized_select}{from}) AS sized"
+        let base_tail = tail
+            .strip_suffix(&format!(" ORDER BY {}", key_order(&self.key, None)?))
+            .ok_or(VerifyError::Invalid("chunk ordering shape"))?;
+        let relation = self.key.relation.sql().map_err(chunk_error)?;
+        let base_from = base_tail.replacen(
+            &format!(" FROM {relation}"),
+            &format!(" FROM {relation} v"),
+            1,
         );
+        let size_from = match self.dialect {
+            SqlDialect::Postgres => &from,
+            SqlDialect::Gigglesdb => &base_from,
+        };
+        let size_select = if self.dialect == SqlDialect::Gigglesdb {
+            self.key
+                .columns
+                .iter()
+                .map(|c| (&c.name, &c.pg_type))
+                .chain(projection.columns().iter().zip(types.iter()))
+                .map(|(name, ty)| {
+                    self.dialect.size_expression(
+                        &format!("v.{}", ident(name)?),
+                        ty,
+                        self.type_modifiers.get(name).copied(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            select.clone()
+        };
+        let size_sql = self.dialect.size_sql(&size_select, size_from);
         let size = tx.query_one(&size_sql, &params).await.map_err(pg_error)?;
         let count = parse_count(size.get(0))?;
         let bytes = parse_count(size.get(1))?;
@@ -222,7 +358,8 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
                 .map(|(i, c)| {
                     Ok(format!(
                         "{} AS \"k{i}\"",
-                        text_expression(&format!("v.{}", ident(&c.name)?), &c.pg_type)
+                        self.dialect
+                            .text_expression(&format!("v.{}", ident(&c.name)?), &c.pg_type)
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -249,13 +386,19 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
                 count / 2,
                 self.budget.max_bytes
             );
-            let sampled = tx
-                .query_opt(&sample_sql, &params)
-                .await
-                .map_err(pg_error)?
-                .ok_or(VerifyError::Invalid(
-                    "sample key exceeds verification byte cap",
-                ))?;
+            let sampled = match self.dialect {
+                SqlDialect::Postgres => {
+                    tx.query_opt(&sample_sql, &params).await.map_err(pg_error)?
+                }
+                SqlDialect::Gigglesdb => {
+                    let sql = SqlDialect::ordered_sample_sql(&aliases, &base_from, &ordering);
+                    SqlDialect::stream_sample(&tx, &sql, &params, count / 2, self.budget.max_bytes)
+                        .await?
+                }
+            }
+            .ok_or(VerifyError::Invalid(
+                "sample key exceeds verification byte cap",
+            ))?;
             let boundary = decode_key(&sampled, &self.key)?;
             let splits = split_range(&self.order, range, boundary)?;
             tx.commit().await.map_err(pg_error)?;
@@ -292,10 +435,9 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
             .columns
             .iter()
             .map(|c| {
-                Ok(text_expression(
-                    &format!("v.{}", ident(&c.name)?),
-                    &c.pg_type,
-                ))
+                Ok(self
+                    .dialect
+                    .text_expression(&format!("v.{}", ident(&c.name)?), &c.pg_type))
             })
             .collect::<Result<Vec<_>>>()?;
         let mut types = Vec::new();
@@ -306,7 +448,7 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
                     .ok_or(VerifyError::Invalid("column outside verification scope"))?
                     .clone(),
             );
-            select.push(text_expression(
+            select.push(self.dialect.text_expression(
                 &format!("v.{}", ident(name)?),
                 types.last().expect("type inserted"),
             ));

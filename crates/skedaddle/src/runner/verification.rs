@@ -1245,7 +1245,21 @@ impl Service {
                     budget,
                 )
                 .await
-                .map_err(|_| invalid())?,
+                .map_err(|_| invalid())?
+                .with_type_modifiers(
+                    table
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.typmod))
+                        .collect(),
+                )
+                .with_dialect(
+                    if self.definition.destination.engine == crate::definition::Engine::Gigglesdb {
+                        sql::SqlDialect::Gigglesdb
+                    } else {
+                        sql::SqlDialect::Postgres
+                    },
+                ),
                 observed: observed.clone(),
                 start,
             };

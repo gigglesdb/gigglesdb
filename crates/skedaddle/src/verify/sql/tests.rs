@@ -303,3 +303,67 @@ fn repair_retains_native_source_boundary_and_shared_revision_refusals() {
     context.destination_change_revision = Some(10);
     assert!(decide_repair(&IntOrder, &request, &context, &coverage).is_ok());
 }
+
+#[test]
+fn dialect_sql_preserves_postgres_and_flattens_gigglesdb_budget() {
+    let select = vec!["v.\"id\"::text".into(), "v.\"payload\"::text".into()];
+    assert_eq!(
+        SqlDialect::Postgres.size_sql(&select, " FROM t v"),
+        "SELECT count(*)::text, COALESCE(sum(8::numeric + COALESCE(octet_length(\"v0\"), 0) + 8::numeric + COALESCE(octet_length(\"v1\"), 0)), 0)::text FROM (SELECT v.\"id\"::text AS \"v0\", v.\"payload\"::text AS \"v1\" FROM t v) AS sized"
+    );
+    assert_eq!(
+        SqlDialect::Gigglesdb.size_sql(&select, " FROM t v WHERE v.id >= $1"),
+        "SELECT CAST(count(*) AS text), COALESCE(sum(8::numeric + COALESCE(octet_length(v.\"id\"::text), 0) + 8::numeric + COALESCE(octet_length(v.\"payload\"::text), 0)), 0)::text FROM t v WHERE v.id >= $1"
+    );
+}
+
+#[test]
+fn dialect_char_projection_keeps_padding() {
+    let ty = PgType::Char {
+        encoding: "UTF8".into(),
+    };
+    assert_eq!(
+        SqlDialect::Postgres.text_expression("v.c", &ty),
+        "pg_catalog.bpcharout(v.c)::text"
+    );
+    assert_eq!(SqlDialect::Gigglesdb.text_expression("v.c", &ty), "v.c");
+    assert_eq!(
+        SqlDialect::Gigglesdb.text_expression("v.i", &PgType::Int4),
+        "v.i::text"
+    );
+}
+
+#[test]
+fn gigglesdb_sample_has_ordering_without_window_function() {
+    assert_eq!(
+        SqlDialect::ordered_sample_sql(
+            "v.a::text, v.b::text",
+            " FROM t v WHERE v.a >= $1",
+            "v.a ASC, v.b DESC"
+        ),
+        "SELECT v.a::text, v.b::text FROM t v WHERE v.a >= $1 ORDER BY v.a ASC, v.b DESC"
+    );
+}
+
+#[test]
+fn gigglesdb_char_budget_requires_length_and_restores_padding() {
+    let ty = PgType::Char {
+        encoding: "UTF8".into(),
+    };
+    assert_eq!(
+        SqlDialect::Gigglesdb
+            .size_expression("v.c", &ty, Some(9))
+            .unwrap(),
+        "rpad(v.c::text, 5, ' ')"
+    );
+    for typmod in [None, Some(-1), Some(4), Some(i32::MIN)] {
+        assert!(matches!(SqlDialect::Gigglesdb.size_expression("v.c", &ty, typmod),
+            Err(VerifyError::Invalid("GigglesDB verification char byte budget requires a known positive char(n) length modifier"))));
+    }
+    assert_eq!(
+        SqlDialect::Postgres
+            .size_expression("v.c", &ty, None)
+            .unwrap(),
+        "pg_catalog.bpcharout(v.c)::text"
+    );
+}
