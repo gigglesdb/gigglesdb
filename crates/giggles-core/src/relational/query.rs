@@ -3040,12 +3040,21 @@ impl Query {
     }
     /// Negative diagnostic classification only; this never grants table-free access.
     pub(super) fn rejects_unsupported_table_free_scalar(&self) -> bool {
+        // Transaction-state routines must fall through to core's session execution context.
+        const TRANSACTION_STATE_ROUTINES: &[&str] = &[
+            "pg_current_xact_id",
+            "pg_current_xact_id_if_assigned",
+            "pg_xact_status",
+        ];
         fn scalar(s: &Scalar) -> bool {
             match s {
                 Scalar::Literal(_) | Scalar::Param(_) => true,
                 Scalar::Column(_) => false,
                 Scalar::Cast(s, _) | Scalar::Domain(s, ..) | Scalar::Unary(_, s) => scalar(s),
                 Scalar::Binary(_, a, b) => scalar(a) && scalar(b),
+                Scalar::Call(name, _) if TRANSACTION_STATE_ROUTINES.contains(&name.as_str()) => {
+                    false
+                }
                 Scalar::Call(_, args) => args.iter().all(scalar),
                 Scalar::Predicate(f) => filter(f),
                 Scalar::Case(c) => {
@@ -6035,6 +6044,18 @@ mod average_distinct_retention_tests {
 #[cfg(test)]
 mod deferred_routine_only_tests {
     use super::*;
+
+    #[test]
+    fn transaction_status_routing() {
+        for sql in [
+            "SELECT pg_current_xact_id()",
+            "SELECT pg_current_xact_id_if_assigned()",
+            "SELECT pg_xact_status(5)",
+        ] {
+            assert!(!query(sql).rejects_unsupported_table_free_scalar(), "{sql}");
+        }
+        assert!(query("SELECT random()").rejects_unsupported_table_free_scalar());
+    }
 
     fn query(sql: &str) -> Query {
         let prepared = Prepared::parse(sql, 1, 0).unwrap_or_else(|e| panic!("{sql}: {e:?}"));

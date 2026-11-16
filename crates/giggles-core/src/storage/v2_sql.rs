@@ -14,6 +14,9 @@ mod sql_xact;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "v2_xact_tests.rs"]
 mod xact_tests;
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_xact_clock_tests.rs"]
+mod v2_xact_clock_tests;
 #[path = "v2_reduction.rs"]
 mod reduction;
 #[cfg(all(test, feature = "engine-rocksdb"))]
