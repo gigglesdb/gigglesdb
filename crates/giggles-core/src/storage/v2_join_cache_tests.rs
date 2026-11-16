@@ -7,6 +7,8 @@ thread_local! {
     pub(crate) static BUCKET_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static GETS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Lowers the legacy join-visit cap (R2-PGLIMITS-4); v2 has none.
+    pub(crate) static VISIT_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 fn run(state: &mut Relational, sql: &str) -> SqlResult {
     let p = Prepared::parse(sql, 1, state.epoch).unwrap();

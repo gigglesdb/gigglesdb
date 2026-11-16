@@ -593,8 +593,10 @@ pub(super) fn bind<'a>(
     let mut aggregates = vec![];
     let mut aggregate_columns = vec![];
     let mut aggregate_filters = vec![];
-    let direct_inputs = lower.aggregates.iter().map(|(a, arg, _)|
-        !a.distinct() && matches!(arg, Some(Scalar::Column(_))))
+    // V2 DISTINCT inputs spill (R2-PGLIMITS-4), so a direct column read is
+    // row-local for them too.
+    let direct_inputs = lower.aggregates.iter().map(|(_, arg, _)|
+        matches!(arg, Some(Scalar::Column(_))))
         .collect::<Vec<_>>();
     for (a, arg, filter) in lower.aggregates {
         aggregate_filters.push(
@@ -842,13 +844,20 @@ impl PartialOrd for Key {
 }
 impl Ord for Key {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0
-            .iter()
-            .zip(&other.0)
-            .map(|(a, b)| cmp(a, b))
-            .find(|o| *o != Ordering::Equal)
-            .unwrap_or_else(|| self.0.len().cmp(&other.0.len()))
+        cmp_values(&self.0, &other.0)
     }
+}
+/// Grouping and DISTINCT identity order.
+pub(super) fn cmp_values(a: &[Value], b: &[Value]) -> Ordering {
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| cmp(a, b))
+        .find(|o| *o != Ordering::Equal)
+        .unwrap_or_else(|| a.len().cmp(&b.len()))
+}
+type GroupInput = (Vec<Value>, Tuple);
+fn group_key_cmp(a: &GroupInput, b: &GroupInput) -> Ordering {
+    cmp_values(&a.0, &b.0)
 }
 fn retained(values: &[Value]) -> usize {
     std::mem::size_of_val(values) + values.iter().map(value_bytes).sum::<usize>()
@@ -874,6 +883,7 @@ impl Grouping {
             })
             .collect()
     }
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn execute(
         &self,
         query: &BoundQuery<'_>,
@@ -882,6 +892,7 @@ impl Grouping {
         params: &[Value],
         execution: &Execution<'_>,
         exists: bool,
+        mut output: Output,
     ) -> R<SqlResult> {
         let mut cancel_impl = || execution.cancelled();
         let cancel = &mut cancel_impl;
@@ -920,7 +931,12 @@ impl Grouping {
             return Ok(result);
         }
         let mut groups = BTreeMap::<Key, (Vec<Value>, Vec<AggregateAuxiliary>)>::new();
-        let scope = RetentionScope::new(execution);
+        // V2 groups by sorting input on the group key (spilling past work_mem)
+        // and streaming one group's state at a time; groups leave in key order.
+        let v2 = source.streams_reductions();
+        let sort_groups = v2 && !self.keys.is_empty();
+        let mut sorter = spill::Sorter::<GroupInput>::new();
+        let mut scope = RetentionScope::new(execution);
         let mut retention = scope.borrow();
         if self.keys.is_empty() {
             let initial = self.initial();
@@ -956,6 +972,11 @@ impl Grouping {
                     .iter()
                     .map(|s| s.eval(row, params, &mut key_work))
                     .collect::<R<Vec<_>>>()?);
+                if sort_groups {
+                    let bytes = retained(&key.0) + std::mem::size_of::<GroupInput>()
+                        + row.values.iter().map(|v| retained(v) + std::mem::size_of::<Vec<Value>>()).sum::<usize>();
+                    return sorter.push((key.0, row.clone()), bytes, group_key_cmp, &mut *retention);
+                }
                 if !groups.contains_key(&key) {
                     if groups.len() >= scan::query_row_limit() {
                         return Err(SqlError::Limit);
@@ -986,6 +1007,7 @@ impl Grouping {
                     row,
                     params,
                     &mut aggregate_work,
+                    None,
                 )?;
                 let after = retained(values);
                 if after > before {
@@ -1018,10 +1040,52 @@ impl Grouping {
                 }
             }
         }
+        let mut input_work = 0;
+        type Group = (Key, (Vec<Value>, Vec<AggregateAuxiliary>));
+        let groups: Box<dyn Iterator<Item = R<Group>> + '_> = if sort_groups {
+            let mut sorted = sorter.finish(group_key_cmp, &mut *scope.borrow())?.peekable();
+            Box::new(std::iter::from_fn(move || {
+                let (key, mut row) = match sorted.next()? {
+                    Ok(first) => first,
+                    Err(error) => return Some(Err(error)),
+                };
+                Some((|| {
+                    let group_scope = RetentionScope::new(execution);
+                    let mut retention = group_scope.borrow();
+                    let mut values = self.initial();
+                    values.extend(self.dependents.iter().map(|c| row.get(*c).clone()));
+                    let mut auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
+                    for (aux, direct) in auxiliary.iter_mut().zip(&self.direct_inputs) {
+                        aux.stream_column = *direct;
+                        aux.local_transition = true;
+                    }
+                    loop {
+                        update_filtered_aggregates(&self.aggregates, &self.aggregate_filters,
+                            &self.aggregate_columns, &mut values, &mut auxiliary, &mut retention,
+                            &row, params, &mut input_work, None)?;
+                        match sorted.peek() {
+                            Some(Ok((next, _))) if cmp_values(next, &key) == Ordering::Equal => {
+                                row = sorted.next().ok_or(SqlError::Limit)??.1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    flush_distinct(&self.aggregates, &self.aggregate_columns, &mut values,
+                        &mut auxiliary, &mut retention, &mut input_work)?;
+                    Ok((Key(key), (values, auxiliary)))
+                })())
+            }))
+        } else {
+            Box::new(groups.into_iter().map(Ok))
+        };
         let mut rows = vec![];
+        let order = &self.order;
+        let order_cmp = |a: &(SqlRow, Vec<Value>), b: &(SqlRow, Vec<Value>)| order_values(&a.1, &b.1, order);
+        let mut ordered = spill::Sorter::new();
         let mut distinct = std::collections::BTreeSet::new();
         let mut skipped = 0;
-        for (key, (mut values, auxiliary)) in groups {
+        for group in groups {
+            let (key, (mut values, auxiliary)) = group?;
             finish_aggregates(
                 &self.aggregates,
                 &mut values,
@@ -1075,7 +1139,7 @@ impl Grouping {
                 .iter()
                 .map(|s| s.eval(&row, params, &mut work))
                 .collect::<R<Vec<_>>>()?;
-            let values = if query.query.distinct() {
+            let values = if query.query.distinct() && !v2 {
                 let key = Key(values);
                 if distinct.contains(&key) {
                     continue;
@@ -1100,10 +1164,35 @@ impl Grouping {
                     }
                 })
                 .collect::<R<Vec<_>>>()?;
-            if !query.query.distinct() {
-                retention.charge(retained(&values) + retained(&keys))?;
+            let item = (SqlRow { values, version: 0 }, keys);
+            if v2 {
+                let bytes = keyed_row_bytes(&item);
+                ordered.push(item, bytes, order_cmp, &mut *retention)?;
+                continue;
             }
-            rows.push((SqlRow { values, version: 0 }, keys));
+            if !query.query.distinct() {
+                retention.charge(retained(&item.0.values) + retained(&item.1))?;
+            }
+            rows.push(item);
+        }
+        if v2 {
+            // ORDER BY over all groups, then DISTINCT keeps each first occurrence.
+            let sorted = ordered.finish(order_cmp, &mut scope)?;
+            let rows: Box<dyn Iterator<Item = R<(SqlRow, Vec<Value>)>>> = if query.query.distinct() {
+                Box::new(spill::unique_external(sorted, keyed_row_bytes,
+                    |a: &(SqlRow, Vec<Value>), b: &(SqlRow, Vec<Value>)| cmp_values(&a.0.values, &b.0.values),
+                    &mut scope)?)
+            } else {
+                Box::new(sorted)
+            };
+            for item in page.apply(rows) {
+                output.push(item?.0, &mut result)?;
+            }
+            output.finish(&mut result, execution)?;
+            if cancel() {
+                return Err(SqlError::Aborted);
+            }
+            return Ok(result);
         }
         rows.sort_by(|(_, a), (_, b)| {
             for ((_, desc, first), (a, b)) in self.order.iter().zip(a.iter().zip(b)) {
@@ -1134,13 +1223,10 @@ impl Grouping {
             }
             Ordering::Equal
         });
-        let mut bytes = 0;
         for (row, _) in page.apply(rows.into_iter()) {
-            for value in &row.values {
-                charge(&mut bytes, value)?;
-            }
-            result.rows.push(row);
+            output.push(row, &mut result)?;
         }
+        output.finish(&mut result, execution)?;
         if cancel() {
             return Err(SqlError::Aborted);
         }

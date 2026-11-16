@@ -1267,7 +1267,7 @@ impl Filter {
 }
 
 struct MaterializedSubquery {
-    values: Vec<Value>,
+    values: spill::Store<Value>,
     keys: Option<std::collections::HashSet<Vec<u8>>>,
     has_null: bool,
 }
@@ -1279,6 +1279,12 @@ struct Execution<'a> {
     declared: Vec<Option<DataType>>,
     exists: RefCell<BTreeMap<usize, bool>>,
     frames: RefCell<Vec<Vec<Vec<Value>>>>,
+    /// Set by a derived-table or IN consumer: the next v2 subquery result is
+    /// spill-backed in `captured` instead of capped `SqlResult::rows`.
+    capture: Cell<bool>,
+    captured: RefCell<Option<spill::Store<SqlRow>>>,
+    /// V2 statements have no cumulative join-visit cap (PostgreSQL has none).
+    unbounded: Cell<bool>,
 }
 impl<'a> Execution<'a> {
     fn new(cancel: &'a mut dyn FnMut() -> bool, declared: &[Option<DataType>]) -> Self {
@@ -1290,13 +1296,16 @@ impl<'a> Execution<'a> {
             visits: Cell::new(0),
             subqueries: RefCell::new(BTreeMap::new()),
             retention: RefCell::new(scan::Retention::new(scan::retention_limit())),
+            capture: Cell::new(false),
+            captured: RefCell::new(None),
+            unbounded: Cell::new(false),
         }
     }
     fn cancelled(&self) -> bool {
         (self.cancel.borrow_mut())()
     }
     fn comparison(&self) -> R<()> {
-        charge_candidate(&self.visits)?;
+        charge_candidate(&self.visits, !self.unbounded.get())?;
         if self
             .visits
             .get()
@@ -1308,10 +1317,35 @@ impl<'a> Execution<'a> {
         Ok(())
     }
 }
-fn charge_candidate(visits: &Cell<usize>) -> R<()> {
+impl Execution<'_> {
+    /// Run a derived-table or IN child, taking its spill-backed v2 result.
+    pub(super) fn capture_subquery(&self, f: impl FnOnce() -> R<SqlResult>)
+        -> R<(SqlResult, Option<spill::Store<SqlRow>>)> {
+        self.capture.set(true);
+        let result = f();
+        self.capture.set(false);
+        let captured = self.captured.take();
+        Ok((result?, captured))
+    }
+}
+/// Rows of a subquery result, from its spill store when captured.
+pub(super) fn subquery_rows<'r>(result: &'r SqlResult, captured: Option<&'r spill::Store<SqlRow>>)
+    -> R<spill::StoreIter<'r, SqlRow>> {
+    match captured {
+        Some(store) => store.iter(),
+        None => Ok(Box::new(result.rows.iter().map(|row| Ok(std::borrow::Cow::Borrowed(row))))),
+    }
+}
+/// Counts a candidate visit; only legacy (`capped`) has a cumulative ceiling.
+/// Callers poll cancellation per visit or every CANCEL_POLL_ROWS visits.
+fn charge_candidate(visits: &Cell<usize>, capped: bool) -> R<()> {
+    #[cfg(test)]
+    let cap = MAX_JOIN_VISITS.min(super::v2_join_cache_tests::VISIT_CAP.get());
+    #[cfg(not(test))]
+    let cap = MAX_JOIN_VISITS;
     let next = visits.get().checked_add(1).ok_or(SqlError::Limit)?;
     visits.set(next);
-    if next > MAX_JOIN_VISITS {
+    if capped && next > cap {
         return Err(SqlError::Limit);
     }
     Ok(())
@@ -1341,7 +1375,7 @@ impl BoundFilter {
             } => {
                 if !execution.subqueries.borrow().contains_key(query) {
                     let child = owner.subqueries.get(*query, SubplanMode::In)?;
-                    let result = child.execute_context(
+                    let (result, captured) = execution.capture_subquery(|| child.execute_context(
                         state,
                         source,
                         params,
@@ -1349,37 +1383,45 @@ impl BoundFilter {
                         execution,
                         true,
                         false,
-                    )?;
-                    let mut values = Vec::with_capacity(result.rows.len());
+                    ))?;
+                    let mut values = spill::Store::new();
                     let mut keys = functions::join_key_supported(&value.ty, column_type)
                         .then(std::collections::HashSet::new);
                     let mut has_null = false;
-                    for result_row in result.rows {
+                    // A spill-backed v2 result keeps its hash keys while they fit
+                    // 4 * work_mem, then probes the stored values like an unhashed subplan.
+                    let mut key_bytes = 0usize;
+                    for result_row in subquery_rows(&result, captured.as_ref())? {
                         if execution.cancelled() {
                             return Err(SqlError::Aborted);
                         }
-                        let element = result_row
+                        let element = result_row?
                             .values
-                            .into_iter()
-                            .next()
+                            .first()
+                            .cloned()
                             .ok_or(SqlError::Syntax)?;
-                        execution
-                            .retention
-                            .borrow_mut()
-                            .charge(value_bytes(&element) + std::mem::size_of::<Value>())?;
+                        let element_bytes = value_bytes(&element) + std::mem::size_of::<Value>();
+                        if captured.is_none() {
+                            execution.retention.borrow_mut().charge(element_bytes)?;
+                        }
                         has_null |= element == Value::Null;
                         if element != Value::Null
-                            && let Some(keys) = &mut keys
+                            && let Some(set) = &mut keys
                         {
                             let key = encode_key(std::slice::from_ref(&element))?;
-                            execution
-                                .retention
-                                .borrow_mut()
-                                .charge(key.len() + 4 * std::mem::size_of::<usize>())?;
-                            keys.insert(key);
+                            let bytes = key.len() + 4 * std::mem::size_of::<usize>();
+                            if captured.is_some() && key_bytes + bytes > 4 * spill::SORT_BYTES {
+                                execution.retention.borrow_mut().release(key_bytes);
+                                keys = None;
+                            } else {
+                                execution.retention.borrow_mut().charge(bytes)?;
+                                key_bytes += bytes;
+                                set.insert(key);
+                            }
                         }
-                        values.push(element);
+                        values.push(element, element_bytes)?;
                     }
+                    values.finish()?;
                     execution.subqueries.borrow_mut().insert(
                         *query,
                         MaterializedSubquery {
@@ -1392,7 +1434,7 @@ impl BoundFilter {
                 let lhs = value.eval(row, params, bytes)?;
                 let cache = execution.subqueries.borrow();
                 let materialized = cache.get(query).ok_or(SqlError::Unsupported)?;
-                let member = if materialized.values.is_empty() {
+                let member = if materialized.values.len() == 0 {
                     Some(false)
                 } else if lhs == Value::Null {
                     None
@@ -1404,7 +1446,8 @@ impl BoundFilter {
                         }
                     } else {
                         let mut found = false;
-                        for element in &materialized.values {
+                        for element in materialized.values.iter()? {
+                            let element = &*element?;
                             execution.comparison()?;
                             if functions::join_equal(
                                 &lhs,
@@ -1844,9 +1887,9 @@ impl Query {
         }
         if exists || self.derived().is_some() { return true; }
         if !self.joins.is_empty() { return true; }
+        // DISTINCT and IN subqueries stream too: their state spills (R2-PGLIMITS-4).
         self.sources.len() == 1
-            && !self.distinct() && !self.has_in_subquery()
-            && (!self.group().is_empty()
+            && (self.distinct() || self.has_in_subquery() || !self.group().is_empty()
                 || self.items.iter().any(|(item, _)| match item {
                     Item::Aggregate(..) => true,
                     Item::Scalar(s) => grouping::contains_aggregate(s),
@@ -4104,7 +4147,7 @@ pub(super) struct BoundQuery<'a> {
     subqueries: Subplans<'a>,
     declared: Vec<Option<DataType>>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Tuple {
     values: Vec<Vec<Value>>,
     version: u64,
@@ -4176,7 +4219,7 @@ fn join_rows<'a>(
                 if let Some(candidate) = candidate {
                     meter.tick()?;
                     if depth > 0 || charge_base {
-                        charge_candidate(visits)?;
+                        charge_candidate(visits, !source.streams_reductions())?;
                     }
                     let candidate = candidate?;
                     if depth == 0 {
@@ -4372,6 +4415,52 @@ fn charge(bytes: &mut usize, value: &Value) -> R<()> {
         return Err(SqlError::Limit);
     }
     Ok(())
+}
+/// Where SELECT rows go: the capped in-memory result, a v2 SqlSession
+/// statement's spilled output (tuplestore), or a captured v2 subquery store.
+enum Output {
+    Capped(usize),
+    Statement(spill::RowBuffer),
+    Capture(spill::Store<SqlRow>),
+}
+impl Output {
+    fn new(v2: bool, subquery: bool, insert_source: bool, capture: bool) -> R<Self> {
+        Ok(if v2 && capture {
+            Self::Capture(spill::Store::new())
+        } else if v2 && !subquery && !insert_source && spill::armed() {
+            Self::Statement(spill::RowBuffer::new(Vec::new()).map_err(spill::sql_error)?)
+        } else {
+            Self::Capped(0)
+        })
+    }
+    fn push(&mut self, row: SqlRow, result: &mut SqlResult) -> R<()> {
+        match self {
+            Self::Capped(bytes) => {
+                if result.rows.len() >= scan::query_row_limit() {
+                    return Err(SqlError::Limit);
+                }
+                row.values.iter().try_for_each(|value| charge(bytes, value))?;
+                result.rows.push(row);
+                Ok(())
+            }
+            Self::Statement(buffer) => buffer.push(row).map_err(spill::sql_error),
+            Self::Capture(store) => {
+                let bytes = searched::retained_row_bytes(&[], &row)?;
+                store.push(row, bytes)
+            }
+        }
+    }
+    fn finish(self, result: &mut SqlResult, execution: &Execution<'_>) -> R<()> {
+        match self {
+            Self::Capped(_) => Ok(()),
+            Self::Statement(buffer) => buffer.finish(result).map_err(spill::sql_error),
+            Self::Capture(mut store) => {
+                store.finish()?;
+                execution.captured.replace(Some(store));
+                Ok(())
+            }
+        }
+    }
 }
 impl BoundQuery<'_> {
     fn project_tuple(
@@ -4930,6 +5019,11 @@ impl BoundQuery<'_> {
         subquery: bool,
         insert_source: bool,
     ) -> R<SqlResult> {
+        // Read before any nested subquery runs; only this level is captured.
+        let capture = subquery && execution.capture.replace(false) && source.streams_reductions();
+        if source.streams_reductions() {
+            execution.unbounded.set(true);
+        }
         let materialized = self.materialize_derived(state, source, params, declared, execution)?;
         let source: &dyn scan::RowSource = materialized.as_ref().map_or(source, |rows| rows);
         if !self.outer_slots.is_empty() {
@@ -4962,7 +5056,8 @@ impl BoundQuery<'_> {
             )?;
         }
         if let Some(grouping) = &self.grouping {
-            return grouping.execute(self, state, source, params, execution, false);
+            let output = Output::new(source.streams_reductions(), subquery, insert_source, capture)?;
+            return grouping.execute(self, state, source, params, execution, false, output);
         }
         let offset = match self.query.offset() {
             Some(e) => match self.query.page_value(e, params, false)? {
@@ -5184,6 +5279,40 @@ impl BoundQuery<'_> {
         // aggregate_scalar_work_budget_is_shared_over_full_input). On v2, SUM/AVG
         // transitions use a per-value budget like PostgreSQL's constant-size state.
         let mut aggregate_work_bytes = 0usize;
+        if self.query.distinct() && !self.aggregate && source.streams_reductions() {
+            // V2: a sort-based Unique keeps each first occurrence in input order,
+            // then a stable sort applies ORDER BY; both spill past work_mem.
+            let distinct = filtered.map(|row| {
+                let row = row?;
+                let projected = self.project_tuple(&row, params, &mut 0, &mut 0)?;
+                let keys = self.order.iter().zip(&self.distinct_order_slots).map(|((s, _, _), slot)| {
+                    if self.columns[*slot].data_type != s.ty {
+                        s.eval(&row, params, &mut 0)
+                    } else {
+                        Ok(projected.values[*slot].clone())
+                    }
+                }).collect::<R<Vec<_>>>()?;
+                Ok((projected, keys))
+            });
+            let mut retention = RetentionScope::new(execution);
+            let unique = spill::unique_external(distinct, keyed_row_bytes,
+                |a: &(SqlRow, Vec<Value>), b: &(SqlRow, Vec<Value>)| grouping::cmp_values(&a.0.values, &b.0.values),
+                &mut retention)?;
+            let rows: Box<dyn Iterator<Item = R<(SqlRow, Vec<Value>)>>> = if self.order.is_empty() {
+                Box::new(unique)
+            } else {
+                let order = &self.order;
+                Box::new(spill::sort_external(unique, keyed_row_bytes,
+                    |a: &(SqlRow, Vec<Value>), b: &(SqlRow, Vec<Value>)| order_values(&a.1, &b.1, order),
+                    &mut retention)?)
+            };
+            let mut output = Output::new(true, subquery, insert_source, capture)?;
+            for item in page.apply(rows) {
+                output.push(item?.0, &mut result)?;
+            }
+            output.finish(&mut result, execution)?;
+            return Ok(result);
+        }
         if self.query.distinct() && !self.aggregate {
             let mut seen = std::collections::BTreeSet::new();
             let mut unique_rows = Vec::new();
@@ -5249,7 +5378,7 @@ impl BoundQuery<'_> {
             let mut auxiliary = aggregate_auxiliary(&self.items, &mut scope.borrow())?;
             if source.streams_reductions() {
                 for (aux, (item, _)) in auxiliary.iter_mut().zip(&self.query.items) {
-                    aux.stream_column = matches!(item, Item::Aggregate(a, Some(Scalar::Column(_))) if !a.distinct());
+                    aux.stream_column = matches!(item, Item::Aggregate(_, Some(Scalar::Column(_))));
                     aux.local_transition = true;
                 }
             }
@@ -5275,6 +5404,8 @@ impl BoundQuery<'_> {
                     retention.release(before - after);
                 }
             }
+            flush_distinct(&self.items, &self.columns, &mut values, &mut auxiliary,
+                &mut scope.borrow(), &mut aggregate_work_bytes)?;
             finish_aggregates(
                 &self.items,
                 &mut values,
@@ -5366,16 +5497,14 @@ impl BoundQuery<'_> {
             };
             // A v2 SqlSession statement's own output spills past SPILL_BYTES like
             // a tuplestore, so it has no row or byte ceiling; each row still does.
-            let mut output = (source.streams_reductions() && !subquery && !insert_source && spill::armed())
-                .then(|| spill::RowBuffer::new(Vec::new()))
-                .transpose()
-                .map_err(spill::sql_error)?;
+            // A captured v2 subquery result is spill-backed the same way.
+            let mut output = Output::new(source.streams_reductions(), subquery, insert_source, capture)?;
             for row in page.apply(rows) {
                 let row = row?;
                 let mut scalar_work_bytes = 0usize;
-                if let Some(output) = output.as_mut() {
+                if !matches!(output, Output::Capped(_)) {
                     let row = self.project_tuple(&row, params, &mut scalar_work_bytes, &mut 0)?;
-                    output.push(row).map_err(spill::sql_error)?;
+                    output.push(row, &mut result)?;
                     continue;
                 }
                 if result.rows.len() >= scan::query_row_limit() {
@@ -5388,9 +5517,7 @@ impl BoundQuery<'_> {
                     &mut result_bytes,
                 )?);
             }
-            if let Some(output) = output {
-                output.finish(&mut result).map_err(spill::sql_error)?;
-            }
+            output.finish(&mut result, execution)?;
         }
         if self.aggregate && cancel() {
             return Err(SqlError::Aborted);
@@ -5466,6 +5593,11 @@ fn distinct_charge(values: &[Value], slots: &[usize], retention: &mut scan::Rete
     Ok(bytes)
 }
 
+/// Spill-sort size estimate of a projected row with its sort keys.
+fn keyed_row_bytes((row, keys): &(SqlRow, Vec<Value>)) -> usize {
+    std::mem::size_of::<(SqlRow, Vec<Value>)>()
+        + row.values.iter().chain(keys).map(|v| std::mem::size_of::<Value>() + value_bytes(v)).sum::<usize>()
+}
 fn order_values(a: &[Value], b: &[Value], order: &[(BoundScalar, bool, bool)]) -> Ordering {
     for ((a, b), (_, desc, first)) in a.iter().zip(b).zip(order) {
         let ord = match (a, b) {
@@ -5631,6 +5763,8 @@ struct AggregateAuxiliary {
     local_transition: bool,
     count: i64,
     distinct: std::collections::BTreeSet<grouping::Key>,
+    /// V2 DISTINCT aggregate inputs, deduplicated by an external sort at finish.
+    pending: Option<spill::Sorter<Value>>,
 }
 fn aggregate_auxiliary(
     items: &[BoundItem],
@@ -5644,8 +5778,35 @@ fn aggregate_auxiliary(
             local_transition: false,
             count: 0,
             distinct: std::collections::BTreeSet::new(),
+            pending: None,
         })
         .collect())
+}
+/// V2 DISTINCT aggregates: sort the deferred inputs and apply each distinct
+/// value once, in sorted order like PostgreSQL's sorted DISTINCT aggregate input.
+fn flush_distinct(
+    items: &[BoundItem],
+    columns: &[ColumnDef],
+    values: &mut [Value],
+    auxiliary: &mut [AggregateAuxiliary],
+    retention: &mut scan::Retention,
+    work: &mut usize,
+) -> R<()> {
+    let empty = Tuple { values: vec![], version: 0 };
+    for index in 0..items.len() {
+        let Some(sorter) = auxiliary[index].pending.take() else { continue };
+        let mut last: Option<Value> = None;
+        for value in sorter.finish(|a: &Value, b: &Value| cmp(a, b), retention)? {
+            let value = value?;
+            if last.as_ref().is_some_and(|last| cmp(last, &value) == Ordering::Equal) {
+                continue;
+            }
+            last = Some(value.clone());
+            update_filtered_aggregates(items, &[], columns, values, auxiliary, retention, &empty, &[], work,
+                Some((index, value)))?;
+        }
+    }
+    Ok(())
 }
 fn aggregate_retained(values: &[Value]) -> usize {
     std::mem::size_of_val(values) + values.iter().map(value_bytes).sum::<usize>()
@@ -5698,6 +5859,7 @@ fn update_aggregates(
         row,
         params,
         work,
+        None,
     )
 }
 #[allow(clippy::too_many_arguments)]
@@ -5711,14 +5873,19 @@ fn update_filtered_aggregates(
     row: &Tuple,
     params: &[Value],
     work: &mut usize,
+    inject: Option<(usize, Value)>,
 ) -> R<()> {
     for (index, item) in items.iter().enumerate() {
+        if inject.as_ref().is_some_and(|(i, _)| *i != index) {
+            continue;
+        }
         let BoundItem::Aggregate(a, c) = item else {
             return Err(SqlError::Unsupported);
         };
         // Like WHERE, each predicate has a fresh per-row scalar budget. Aggregate
         // arguments retain the statement-wide input budget below.
-        if let Some(Some(filter)) = filters.get(index)
+        if inject.is_none()
+            && let Some(Some(filter)) = filters.get(index)
             && filter.eval(row, params, &mut 0)? != Some(true)
         {
             continue;
@@ -5726,12 +5893,12 @@ fn update_filtered_aggregates(
         // A fixed-width or numeric column read is one stored value. V2 keeps this
         // scratch row-local; computed arguments retain DD-0068's cumulative budget.
         let mut column_work = 0;
-        let evaluated = c.as_ref().map(|e| e.eval(row, params,
+        let evaluated = if let Some((_, value)) = &inject { Some(Ok(value.clone())) } else { c.as_ref().map(|e| e.eval(row, params,
             if auxiliary[index].stream_column && matches!(e.ty,
                 DataType::SmallInt | DataType::Integer | DataType::BigInt | DataType::Numeric
                 | DataType::Boolean | DataType::Real | DataType::DoublePrecision) {
                 &mut column_work
-            } else { &mut *work })).transpose()?;
+            } else { &mut *work })) }.transpose()?;
         // SUM/AVG keep a running sum and count; on v2 each transition is guarded
         // per value (digit/scale limits, 22003) rather than cumulatively.
         let mut transition_work = 0;
@@ -5742,7 +5909,14 @@ fn update_filtered_aggregates(
             continue;
         }
         let state = &mut auxiliary[index];
-        if a.distinct() {
+        if a.distinct() && inject.is_none() && state.local_transition {
+            let input = evaluated.ok_or(SqlError::Type)?;
+            let bytes = std::mem::size_of::<Value>() + value_bytes(&input);
+            state.pending.get_or_insert_with(spill::Sorter::new)
+                .push(input, bytes, |a: &Value, b: &Value| cmp(a, b), retention)?;
+            continue;
+        }
+        if a.distinct() && inject.is_none() {
             let input = evaluated.as_ref().ok_or(SqlError::Type)?;
             let bytes = std::mem::size_of::<Value>()
                 + value_bytes(input)

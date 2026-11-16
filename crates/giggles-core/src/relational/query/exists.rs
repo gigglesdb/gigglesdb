@@ -129,7 +129,7 @@ impl BoundQuery<'_> {
         let offset = number(self.query.offset(), Some(0), false)?.unwrap_or(0);
         if number(self.query.limit.as_ref(), None, true)? == Some(0) { return Ok(false); }
         if let Some(grouping) = &self.grouping {
-            return Ok(!grouping.execute(self, state, source, params, execution, true)?.rows.is_empty());
+            return Ok(!grouping.execute(self, state, source, params, execution, true, Output::Capped(0))?.rows.is_empty());
         }
         let scope = RetentionScope::new(execution);
         let outer = self.outer_values(execution);

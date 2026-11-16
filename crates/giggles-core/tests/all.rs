@@ -491,3 +491,5 @@ mod v2_sum_avg_unbounded;
 mod v2_returning_spill;
 #[path = "v2_sort_spill.rs"]
 mod v2_sort_spill;
+#[path = "v2_group_spill.rs"]
+mod v2_group_spill;

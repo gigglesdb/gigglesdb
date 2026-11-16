@@ -54,11 +54,14 @@ pub(super) fn column(query: &Query, c: &ColumnRef) -> R<Option<ColumnRef>> {
         _ => Err(SqlError::AmbiguousColumn),
     }
 }
-pub(super) struct Rows<'a> { rows: Vec<SqlRow>, _scope: RetentionScope<'a> }
+/// Materialised derived rows; a v2 child's rows spill past work_mem (tuplestore)
+/// and the outer query keeps v2 execution (`streams`).
+pub(super) struct Rows<'a> { rows: spill::Store<SqlRow>, streams: bool, _scope: RetentionScope<'a> }
 impl scan::RowSource for Rows<'_> {
+    fn streams_reductions(&self) -> bool { self.streams }
     fn scan<'s>(&'s self, _: &TableDef, _: &scan::KeyRange, _: scan::Direction) -> R<scan::SourceRows<'s>> {
-        Ok(Box::new(self.rows.iter().map(|row| Ok(scan::SourceRow {
-            key: Cow::Borrowed(&[]), row: Cow::Borrowed(row),
+        Ok(Box::new(self.rows.iter()?.map(|row| Ok(scan::SourceRow {
+            key: Cow::Borrowed(&[]), row: row?,
         }))))
     }
     fn get<'s>(&'s self, _: &TableDef, _: &[u8]) -> R<Option<scan::SourceRow<'s>>> { Err(SqlError::Unsupported) }
@@ -68,19 +71,23 @@ impl BoundQuery<'_> {
         params: &[Value], declared: &[Option<DataType>], execution: &'e Execution<'_>) -> R<Option<Rows<'e>>> {
         let Some(child) = self.query.derived() else { return Ok(None); };
         let bound = self.subqueries.get(child as *const Query as usize, SubplanMode::Scalar)?;
-        let result = bound.execute_context(state, source, params, declared, execution, true, false)?;
+        let (result, captured) = execution.capture_subquery(
+            || bound.execute_context(state, source, params, declared, execution, true, false))?;
         let table = self.tables[0];
         let offsets = bound.columns.iter().map(|c| table.columns.iter().position(|t| t.id == c.id)
             .ok_or(SqlError::Unsupported)).collect::<R<Vec<_>>>()?;
         let scope = RetentionScope::new(execution);
-        let mut rows = Vec::new();
-        for row in result.rows {
+        let mut rows = spill::Store::new();
+        for row in subquery_rows(&result, captured.as_ref())? {
+            let row = row?;
             if execution.cancelled() { return Err(SqlError::Aborted); }
             let mut values = vec![Value::Null; table.columns.len()];
-            for (value, offset) in row.values.into_iter().zip(&offsets) { values[*offset] = value; }
-            scope.borrow().charge(64 + values.iter().map(value_bytes).sum::<usize>())?;
-            rows.push(SqlRow { values, version: row.version });
+            for (value, offset) in row.values.iter().zip(&offsets) { values[*offset] = value.clone(); }
+            let bytes = 64 + values.iter().map(value_bytes).sum::<usize>();
+            if captured.is_none() { scope.borrow().charge(bytes)?; }
+            rows.push(SqlRow { values, version: row.version }, bytes)?;
         }
-        Ok(Some(Rows { rows, _scope: scope }))
+        rows.finish()?;
+        Ok(Some(Rows { rows, streams: captured.is_some(), _scope: scope }))
     }
 }

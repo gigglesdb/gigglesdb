@@ -11,6 +11,7 @@
 use super::{SqlError, SqlResult, SqlRow, scan, searched};
 use crate::CoreError;
 use serde::{Serialize, de::DeserializeOwned};
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
@@ -372,9 +373,61 @@ impl<T: DeserializeOwned, C: Fn(&T, &T) -> Ordering> Iterator for Sorted<T, C> {
     }
 }
 
-/// Stable full sort with no size ceiling. Up to `SORT_BYTES` of input (by
-/// `size`) is charged to `retention` while held; beyond that, sorted runs
-/// spill to temp files and are merged.
+/// Push-based external sort: up to `SORT_BYTES` of input (by caller size) is
+/// charged to retention while held; past that, sorted runs spill to temp files.
+pub(crate) struct Sorter<T> {
+    memory: Vec<T>,
+    runs: Vec<Run>,
+    bytes: usize,
+}
+
+impl<T: Serialize + DeserializeOwned> Sorter<T> {
+    pub(crate) fn new() -> Self {
+        Self { memory: Vec::new(), runs: Vec::new(), bytes: 0 }
+    }
+
+    pub(crate) fn push<C: Fn(&T, &T) -> Ordering + Copy>(
+        &mut self,
+        item: T,
+        n: usize,
+        cmp: C,
+        retention: &mut impl scan::RetentionBudget,
+    ) -> Result<(), SqlError> {
+        if !self.memory.is_empty() && self.bytes.saturating_add(n) > SORT_BYTES {
+            self.memory.sort_by(cmp);
+            self.runs.push(write_run(self.memory.drain(..).map(Ok))?);
+            retention.release(std::mem::take(&mut self.bytes));
+        }
+        retention.charge(n)?;
+        self.bytes += n;
+        self.memory.push(item);
+        Ok(())
+    }
+
+    /// Releases the held retention; the result is stable in push order.
+    pub(crate) fn finish<C: Fn(&T, &T) -> Ordering + Copy>(
+        mut self,
+        cmp: C,
+        retention: &mut impl scan::RetentionBudget,
+    ) -> Result<Sorted<T, C>, SqlError> {
+        retention.release(std::mem::take(&mut self.bytes));
+        self.memory.sort_by(cmp);
+        let mut runs = self.runs;
+        if runs.is_empty() {
+            return Ok(Sorted::Memory(self.memory.into_iter()));
+        }
+        while runs.len() >= MERGE_FAN_IN {
+            let first = runs.drain(..MERGE_FAN_IN).map(Input::Run).collect();
+            let merged = write_run(Merge::new(first, cmp)?)?;
+            runs.insert(0, merged);
+        }
+        let mut inputs: Vec<_> = runs.into_iter().map(Input::Run).collect();
+        inputs.push(Input::Memory(self.memory.into_iter()));
+        Ok(Sorted::Merge(Merge::new(inputs, cmp)?))
+    }
+}
+
+/// Stable full sort with no size ceiling (see [`Sorter`]).
 pub(crate) fn sort_external<T, C>(
     rows: impl Iterator<Item = Result<T, SqlError>>,
     size: impl Fn(&T) -> usize,
@@ -385,40 +438,117 @@ where
     T: Serialize + DeserializeOwned,
     C: Fn(&T, &T) -> Ordering + Copy,
 {
-    let mut memory = Vec::new();
-    let mut runs = Vec::new();
-    let mut bytes = 0usize;
+    let mut sorter = Sorter::new();
     let fill = || -> Result<(), SqlError> {
         for row in rows {
             let row = row?;
             let n = size(&row);
-            if !memory.is_empty() && bytes.saturating_add(n) > SORT_BYTES {
-                memory.sort_by(cmp);
-                runs.push(write_run(memory.drain(..).map(Ok))?);
-                retention.release(bytes);
-                bytes = 0;
-            }
-            retention.charge(n)?;
-            bytes += n;
-            memory.push(row);
+            sorter.push(row, n, cmp, retention)?;
         }
         Ok(())
     };
-    let filled = fill();
-    retention.release(bytes);
-    filled?;
-    memory.sort_by(cmp);
-    if runs.is_empty() {
-        return Ok(Sorted::Memory(memory.into_iter()));
+    if let Err(error) = fill() {
+        retention.release(sorter.bytes);
+        return Err(error);
     }
-    while runs.len() >= MERGE_FAN_IN {
-        let first = runs.drain(..MERGE_FAN_IN).map(Input::Run).collect();
-        let merged = write_run(Merge::new(first, cmp)?)?;
-        runs.insert(0, merged);
+    sorter.finish(cmp, retention)
+}
+
+type BySeq<T> = fn(&(u64, T), &(u64, T)) -> Ordering;
+/// Output of [`unique_external`]; names no borrow of the retention budget.
+pub(crate) type Unique<T> = std::iter::Map<Sorted<(u64, T), BySeq<T>>, fn(Result<(u64, T), SqlError>) -> Result<T, SqlError>>;
+
+/// The first item of each `key`-equal set, in input order (a sort-based
+/// PostgreSQL Unique): sort by key, keep the first of each run, restore order.
+pub(crate) fn unique_external<T, K>(
+    rows: impl Iterator<Item = Result<T, SqlError>>,
+    size: impl Fn(&T) -> usize + Copy,
+    key: K,
+    retention: &mut impl scan::RetentionBudget,
+) -> Result<Unique<T>, SqlError>
+where
+    T: Serialize + DeserializeOwned + Clone,
+    K: Fn(&T, &T) -> Ordering + Copy,
+{
+    let numbered = rows.zip(0u64..).map(|(row, seq)| row.map(|row| (seq, row)));
+    let item_size = move |(_, row): &(u64, T)| size(row) + 8;
+    let by_key = sort_external(numbered, item_size, move |a: &(u64, T), b: &(u64, T)| key(&a.1, &b.1), retention)?;
+    let mut last: Option<T> = None;
+    let firsts = by_key.filter(move |item| match item {
+        Ok((_, row)) if last.as_ref().is_some_and(|last| key(last, row) == Ordering::Equal) => false,
+        Ok((_, row)) => {
+            last = Some(row.clone());
+            true
+        }
+        Err(_) => true,
+    });
+    let by_seq: BySeq<T> = |a, b| a.0.cmp(&b.0);
+    let ordered = sort_external(firsts, item_size, by_seq, retention)?;
+    Ok(ordered.map(|item| item.map(|(_, row)| row)))
+}
+
+pub(crate) type StoreIter<'a, T> = Box<dyn Iterator<Item = Result<Cow<'a, T>, SqlError>> + 'a>;
+
+/// Rewindable materialised items (PostgreSQL's tuplestore): memory up to
+/// `SPILL_BYTES`, then a temp file that each [`Store::iter`] re-reads.
+pub(crate) struct Store<T> {
+    memory: Vec<T>,
+    bytes: usize,
+    len: u64,
+    file: Option<(BufWriter<File>, TempPath)>,
+}
+
+impl<T: Serialize + DeserializeOwned + Clone> Store<T> {
+    pub(crate) fn new() -> Self {
+        Self { memory: Vec::new(), bytes: 0, len: 0, file: None }
     }
-    let mut inputs: Vec<_> = runs.into_iter().map(Input::Run).collect();
-    inputs.push(Input::Memory(memory.into_iter()));
-    Ok(Sorted::Merge(Merge::new(inputs, cmp)?))
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn push(&mut self, item: T, size: usize) -> Result<(), SqlError> {
+        self.len += 1;
+        if let Some((writer, _)) = &mut self.file {
+            return write_item(writer, &item).map_err(sql_error);
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.memory.push(item);
+        if self.bytes > SPILL_BYTES {
+            let (file, temp) = create("store").map_err(sql_error)?;
+            let mut writer = BufWriter::new(file);
+            for item in self.memory.drain(..) {
+                write_item(&mut writer, &item).map_err(sql_error)?;
+            }
+            self.file = Some((writer, temp));
+        }
+        Ok(())
+    }
+
+    /// Flush pushed items so [`Store::iter`] can read them.
+    pub(crate) fn finish(&mut self) -> Result<(), SqlError> {
+        match &mut self.file {
+            Some((writer, _)) => writer.flush().map_err(|e| sql_error(io(e))),
+            None => Ok(()),
+        }
+    }
+
+    /// Every item in push order; each call reads the file from the start.
+    pub(crate) fn iter(&self) -> Result<StoreIter<'_, T>, SqlError> {
+        let Some((_, temp)) = &self.file else {
+            return Ok(Box::new(self.memory.iter().map(|item| Ok(Cow::Borrowed(item)))));
+        };
+        let mut reader = BufReader::new(File::open(&temp.0).map_err(|e| sql_error(io(e)))?);
+        let mut remaining = self.len;
+        Ok(Box::new(std::iter::from_fn(move || {
+            remaining = remaining.checked_sub(1)?;
+            let item = read_item(&mut reader).map(Cow::Owned).map_err(sql_error);
+            if item.is_err() {
+                remaining = 0;
+            }
+            Some(item)
+        })))
+    }
 }
 
 #[cfg(test)]

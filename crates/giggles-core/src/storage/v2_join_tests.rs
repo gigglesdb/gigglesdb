@@ -128,11 +128,39 @@ fn unindexed_visit_limit_and_equality_buckets() {
     txn.commit().unwrap();
     let mut session = f.admin().sql_session();
     assert_eq!(values(&mut session, "SELECT count(*) FROM a JOIN b ON a.v=b.v"), vec![vec![Int(4097)]]);
-    // Equality buckets avoid the Cartesian scan, while the original path retains its visit bound.
+    // Equality buckets avoid the Cartesian scan. The original path and a
+    // non-equality join run past a lowered visit cap: v2 has no cumulative
+    // cap (R2-PGLIMITS-4; the legacy cap is covered below).
+    relational::v2_join_cache_tests::VISIT_CAP.set(1_000);
     relational::v2_join_cache_tests::BUCKET_DISABLED.set(true);
-    let uncached = session.execute("SELECT count(*) FROM a JOIN b ON a.v=b.v", &[], None);
+    let uncached = values(&mut session, "SELECT count(*) FROM a JOIN b ON a.v=b.v WHERE a.id < 3");
     relational::v2_join_cache_tests::BUCKET_DISABLED.set(false);
-    assert_eq!(uncached, Err(CoreError::Sql(SqlError::Limit)));
-    // A non-equality join cannot use buckets and must still enforce MAX_JOIN_VISITS.
-    assert_eq!(session.execute("SELECT count(*) FROM a JOIN b ON a.v <= b.v", &[], None), Err(CoreError::Sql(SqlError::Limit)));
+    let ranged = values(&mut session, "SELECT count(*) FROM a JOIN b ON a.v <= b.v WHERE a.id < 3");
+    relational::v2_join_cache_tests::VISIT_CAP.set(usize::MAX);
+    assert_eq!((uncached, ranged), (vec![vec![Int(3)]], vec![vec![Int(3 * 4097 - 3)]]));
+}
+
+/// R2-PGLIMITS-4: v2 joins have no cumulative candidate-visit cap (PostgreSQL
+/// has none); legacy keeps it. The test hook lowers the cap to 1,000 visits.
+#[test]
+fn v2_join_visits_have_no_cumulative_cap() {
+    let f = Fixture::new();
+    let path = f.path.with_extension("legacy-visits");
+    let legacy = Admin::create_engine(&path, Limits::default(), Engine::Legacy).unwrap();
+    let rows = (0..100).map(|i| format!("({i})")).collect::<Vec<_>>().join(",");
+    let mut sessions = [f.admin().sql_session(), legacy.sql_session()];
+    for s in &mut sessions {
+        for table in ["a", "b"] {
+            s.execute(&format!("CREATE TABLE {table}(id int PRIMARY KEY)"), &[], None).unwrap();
+            s.execute(&format!("INSERT INTO {table} VALUES {rows}"), &[], None).unwrap();
+        }
+    }
+    relational::v2_join_cache_tests::VISIT_CAP.set(1_000);
+    let [v2, old] = &mut sessions;
+    let sql = "SELECT count(*) FROM a JOIN b ON a.id >= 0";
+    let v2_result = v2.execute(sql, &[], None).map(|r| r.rows[0].values.clone());
+    let legacy_result = old.execute(sql, &[], None).map(|r| r.rows.len());
+    relational::v2_join_cache_tests::VISIT_CAP.set(usize::MAX);
+    assert_eq!(v2_result.unwrap(), vec![Int(10_000)]);
+    assert_eq!(legacy_result, Err(CoreError::Sql(relational::SqlError::Limit)));
 }
