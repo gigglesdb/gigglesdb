@@ -1467,3 +1467,214 @@ fn lifecycle_sink_failure_closes_access_and_preserves_refusal() {
         assert_eq!(records[1].kind, LifecycleKind::PrincipalDisabled);
     }
 }
+
+fn api_client(
+    addr: std::net::SocketAddr,
+    name: &str,
+    secret: &str,
+) -> nunya::mgmt::client::MgmtClient {
+    use nunya::mgmt::client::{Credentials, MgmtClient};
+    MgmtClient::new(
+        format!("http://{addr}").parse().unwrap(),
+        None,
+        Credentials::Bearer {
+            name: name.into(),
+            secret: zeroize::Zeroizing::new(secret.into()),
+        },
+    )
+    .unwrap()
+}
+#[tokio::test]
+async fn client_all_methods_and_session_secret() -> TransportResult {
+    use nunya::mgmt::{
+        client::{AcquireParams, ClientError, SessionCredential, SessionSecret},
+        server::spawn,
+    };
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
+    let authority = ctx.authority.clone();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
+    let admin = api_client(server.tcp_addr, "admin", "admin-private.secret");
+    let alice = api_client(server.tcp_addr, "alice", "alice-private.secret");
+    let secret = SessionSecret::generate();
+    let bearer = nunya::mgmt::client::Credentials::Bearer {
+        name: "alice".into(),
+        secret: zeroize::Zeroizing::new(secret.secret.to_string()),
+    };
+    for debug in [
+        format!("{bearer:?}"),
+        format!("{secret:?}"),
+        format!("{alice:?}"),
+    ] {
+        for value in [
+            secret.secret.as_str(),
+            &secret.verifier,
+            &secret.sha256_hex,
+            "alice-private.secret",
+        ] {
+            assert!(
+                !debug.contains(value),
+                "client diagnostics leaked credential material"
+            );
+        }
+    }
+    let s = alice
+        .acquire(AcquireParams {
+            route: "postgres".into(),
+            mode: Some(Mode::ReadOnly),
+            lifetime: Some("30m".into()),
+            isolated: false,
+            label: Some("client-test".into()),
+            verifier: secret.verifier.clone(),
+            secret_sha256: secret.sha256_hex.clone(),
+        })
+        .await?;
+    let sid = SessionId::from_hex(&s.id).ok_or("invalid session id")?;
+    assert!(authority.check_session_secret(sid, secret.secret.as_bytes()));
+    assert_eq!(alice.session(&s.id).await?.id, s.id);
+    assert!(alice.sessions().await?.iter().any(|row| row.id == s.id));
+    let second = SessionSecret::generate();
+    let renewed = alice
+        .renew(
+            &s.id,
+            Some(Mode::ReadOnly),
+            Some(SessionCredential {
+                verifier: second.verifier.clone(),
+                secret_sha256: second.sha256_hex.clone(),
+            }),
+        )
+        .await?;
+    assert_eq!(renewed.id, s.id);
+    assert!(authority.check_session_secret(sid, second.secret.as_bytes()));
+    assert_eq!(alice.renew(&s.id, None, None).await?.id, s.id);
+    assert_eq!(alice.revoke(&s.id).await?.state, SessionState::Revoked);
+    let password = SessionSecret::generate();
+    let p = admin
+        .create_principal(
+            "client-principal",
+            PrincipalKind::Agent,
+            false,
+            Some(&password.verifier),
+        )
+        .await?;
+    assert_eq!(p.credentials.len(), 1);
+    assert!(admin.principals().await?.iter().any(|row| row.id == p.id));
+    assert_eq!(admin.principal(&p.id).await?.name, "client-principal");
+    let grants = admin
+        .set_grants(&p.id, &[("postgres", Mode::ReadOnly)])
+        .await?;
+    assert_eq!(grants.grants.len(), 1);
+    assert_eq!(grants.grants[0].mode, Mode::ReadOnly);
+    assert_eq!(admin.disable(&p.id).await?.state, PrincipalState::Disabled);
+    assert_eq!(admin.enable(&p.id).await?.state, PrincipalState::Enabled);
+    let c = admin
+        .add_credential(&p.id, &second.verifier, Some("1h"))
+        .await?;
+    assert!(c.expires_ms.is_some());
+    assert_eq!(
+        admin.delete_credential(&p.id, &c.id).await?.state,
+        CredentialState::Revoked
+    );
+    assert_eq!(admin.connections().await?[0].id, 7);
+    let status = admin.status().await?;
+    assert_eq!(status.route_ids, ["postgres"]);
+    assert_eq!(status.policy_revision.as_deref(), Some("policy-1"));
+    let err = alice.status().await.unwrap_err();
+    assert_eq!(
+        err,
+        ClientError::Api {
+            status: 403,
+            code: "forbidden".into()
+        }
+    );
+    let wrong = api_client(server.tcp_addr, "alice", "wrong");
+    assert_eq!(
+        wrong.status().await.unwrap_err(),
+        ClientError::Api {
+            status: 401,
+            code: "unauthorized".into()
+        }
+    );
+    let no_grant = api_client(server.tcp_addr, "client-principal", &password.secret);
+    admin.set_grants(&p.id, &[]).await?;
+    assert_eq!(
+        no_grant
+            .acquire(AcquireParams {
+                route: "postgres".into(),
+                mode: None,
+                lifetime: None,
+                isolated: false,
+                label: None,
+                verifier: second.verifier,
+                secret_sha256: second.sha256_hex,
+            })
+            .await
+            .unwrap_err(),
+        ClientError::Api {
+            status: 403,
+            code: "no_grant".into()
+        }
+    );
+    let records = f.audit.records.lock().unwrap().clone();
+    assert!(records.iter().any(|r| r.kind == LifecycleKind::Issued && r.session.as_deref() == Some(s.id.as_str())));
+    assert!(records.iter().any(|r| r.kind == LifecycleKind::Renewed));
+    assert!(records.iter().any(|r| r.kind == LifecycleKind::Revoked));
+    assert!(
+        records
+            .iter()
+            .any(|r| r.kind == LifecycleKind::PrincipalDisabled)
+    );
+    drop(authority);
+    finish_server(tx, server).await
+}
+#[tokio::test]
+async fn client_tls_custom_ca() -> TransportResult {
+    use nunya::mgmt::{
+        client::{Credentials, MgmtClient},
+        server::spawn,
+    };
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let server = spawn(ctx, &listener_section(true), &f.dir, rx).await?;
+    let ca = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mgmt/localhost.crt");
+    let client = MgmtClient::new(
+        format!("https://localhost:{}", server.tcp_addr.port()).parse()?,
+        Some(&ca),
+        Credentials::Bearer {
+            name: "admin".into(),
+            secret: zeroize::Zeroizing::new("admin-private.secret".into()),
+        },
+    )?;
+    assert_eq!(
+        client.status().await?.config_revision.as_deref(),
+        Some("config-2")
+    );
+    assert!(
+        "http://10.0.0.1:1"
+            .parse::<nunya::mgmt::client::Endpoint>()
+            .is_err()
+    );
+    finish_server(tx, server).await
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn client_unix_socket() -> TransportResult {
+    use nunya::mgmt::{
+        client::{Credentials, MgmtClient},
+        server::spawn,
+    };
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
+    let path = server.socket_path.as_ref().ok_or("missing socket")?;
+    let client = MgmtClient::new(
+        format!("unix:{}", path.display()).parse()?,
+        None,
+        Credentials::None,
+    )?;
+    assert_eq!(client.status().await?.route_ids, ["postgres"]);
+    finish_server(tx, server).await
+}

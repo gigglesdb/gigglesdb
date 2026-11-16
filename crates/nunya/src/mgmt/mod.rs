@@ -7,3 +7,5 @@ pub mod routes;
 pub mod server;
 /// Lifecycle audit adapter boundary.
 pub mod audit;
+/// Management API client.
+pub mod client;

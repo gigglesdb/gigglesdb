@@ -1477,6 +1477,7 @@ dependencies = [
  "prost-types",
  "redb",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "serde_json",
