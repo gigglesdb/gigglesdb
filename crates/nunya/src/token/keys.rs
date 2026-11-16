@@ -62,6 +62,33 @@ pub fn derive_scope(root: &RootKey, scope_salt: &[u8; 32]) -> ScopeKeys {
         .expect("fixed HKDF output length");
     ScopeKeys::new(secret)
 }
+/// Derivation version stored with each scope row.
+pub const SCOPE_DERIVATION_V2: u16 = 2;
+
+/// Derive a scope secret bound to its deployment and route (derivation v2).
+pub fn derive_scope_v2(
+    root: &RootKey,
+    scope_salt: &[u8; 32],
+    deployment_id: &[u8; 16],
+    route_id: &str,
+) -> Result<ScopeKeys, Refusal> {
+    let route_len = u16::try_from(route_id.len())
+        .ok()
+        .filter(|len| *len != 0)
+        .ok_or_else(|| Refusal::new(NyCode::NotAnalysable, "invalid scope route"))?;
+    let mut info = Vec::with_capacity(b"nunya/v2/scope".len() + 2 + 16 + 2 + route_id.len());
+    info.extend_from_slice(b"nunya/v2/scope");
+    info.extend_from_slice(&16u16.to_be_bytes());
+    info.extend_from_slice(deployment_id);
+    info.extend_from_slice(&route_len.to_be_bytes());
+    info.extend_from_slice(route_id.as_bytes());
+    let mut secret = [0; 32];
+    Hkdf::<Sha256>::new(Some(scope_salt), &root.0)
+        .expand(&info, &mut secret)
+        .expect("fixed HKDF output length");
+    Ok(ScopeKeys::new(secret))
+}
+
 pub(crate) fn subkey(keys: &ScopeKeys, domain: &DomainName, purpose: &str) -> Zeroizing<[u8; 32]> {
     let mut output = Zeroizing::new([0; 32]);
     let info = format!("nunya/v1/{}/{purpose}", domain.0);
@@ -80,6 +107,78 @@ pub fn random_salt() -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scope_v2_vectors() {
+        let vectors = [
+            (
+                [0; 32],
+                [0; 32],
+                [0; 16],
+                "postgres",
+                "f13c7d291fa2d64e4b7362c0726ec37ebd835a050215076a4221775645ef064c",
+            ),
+            (
+                [0; 32],
+                [0; 32],
+                [0; 16],
+                "spanner-native",
+                "b75e87876baea4e2d94246191b3ed32f3167fae49bea0914949fcdb10628540e",
+            ),
+            (
+                [0; 32],
+                [0; 32],
+                [1; 16],
+                "postgres",
+                "644bc8f1fc4f262330101cde4b3974df5952aed1c539ad2da6396ac03f9a60a2",
+            ),
+            (
+                std::array::from_fn(|i| i as u8),
+                [0xab; 32],
+                std::array::from_fn(|i| 0x10 + i as u8),
+                "postgres",
+                "bd07af90f6bded2b43923410a866e110f88ff5d6862472b5ea28079e6c5488fb",
+            ),
+        ];
+        for (root, salt, deployment, route, expected) in vectors {
+            let keys = derive_scope_v2(&RootKey(root), &salt, &deployment, route).unwrap();
+            let actual = keys
+                .secret
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn scope_v2_separation() {
+        let root = RootKey([0; 32]);
+        let a = derive_scope_v2(&root, &[0; 32], &[0; 16], "postgres").unwrap();
+        let other_route = derive_scope_v2(&root, &[0; 32], &[0; 16], "spanner-native").unwrap();
+        let other_deployment = derive_scope_v2(&root, &[0; 32], &[1; 16], "postgres").unwrap();
+        let v1 = derive_scope(&root, &[0; 32]);
+        assert!(a.secret != other_route.secret);
+        assert!(a.secret != other_deployment.secret);
+        for keys in [&a, &other_route, &other_deployment] {
+            assert!(keys.secret != v1.secret);
+            assert_eq!(format!("{keys:?}"), "ScopeKeys(..)");
+        }
+        assert_eq!(SCOPE_DERIVATION_V2, 2);
+    }
+
+    #[test]
+    fn scope_v2_refuses_bad_route() {
+        let root = RootKey([0; 32]);
+        for route in [String::new(), "x".repeat(65536)] {
+            let error = derive_scope_v2(&root, &[0; 32], &[0; 16], &route).unwrap_err();
+            assert_eq!(error.code, NyCode::NotAnalysable);
+            assert_eq!(error.reason, "invalid scope route");
+            if !route.is_empty() {
+                assert!(!format!("{error:?} {error}").contains(&route));
+            }
+        }
+    }
+
     #[test]
     fn separation_and_redaction() {
         let root = RootKey::from_hex(&"00".repeat(32)).unwrap();
