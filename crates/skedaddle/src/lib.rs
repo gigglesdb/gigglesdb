@@ -12,6 +12,7 @@ pub mod definition;
 pub mod engine;
 pub mod event;
 pub mod fsconfine;
+pub mod gigglesdb;
 pub mod hooks;
 pub mod mapping;
 pub mod mysql;
