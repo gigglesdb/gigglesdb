@@ -145,22 +145,14 @@ impl Fixture {
 }
 
 async fn terminated(closed: Closed) {
-    // The client sends no request: its connection driver observes the unsolicited
-    // FATAL frame (or EOF). A driver without a database error still proves closure.
+    // The client sends no request: its connection driver must observe EOF,
+    // without an unsolicited ErrorResponse frame.
     let result = timeout(PROMPT, closed)
         .await
         .expect("idle socket was not terminated")
         .unwrap();
-    if let Err(error) = result
-        && let Some(db) = error.as_db_error()
-    {
-        assert_eq!(db.severity(), "FATAL");
-        assert_eq!(db.code().code(), "57P01");
-        assert_eq!(
-            db.message(),
-            "terminating connection due to administrator command"
-        );
-    }
+    let error = result.expect_err("idle connection driver ended without observing EOF");
+    assert!(error.is_closed(), "expected silent EOF, got {error:?}");
 }
 
 async fn pg_idle_write(insert: bool) {

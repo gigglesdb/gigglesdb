@@ -2066,20 +2066,6 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                 binding_check_pending = false;
                 if session.check_binding().is_err() {
                     session.abort();
-                    let mut body = Vec::new();
-                    for (field, value) in [
-                        (b'S', "FATAL"),
-                        (b'V', "FATAL"),
-                        (b'C', "57P01"),
-                        (b'M', "terminating connection due to administrator command"),
-                    ] {
-                        body.push(field);
-                        z(value, &mut body);
-                    }
-                    body.push(0);
-                    let mut out = Vec::new();
-                    frame(b'E', &body, &mut out).map_err(io::Error::other)?;
-                    send(s, &out).await?;
                     return Ok(());
                 }
             }
