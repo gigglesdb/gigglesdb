@@ -436,6 +436,15 @@ fn bind_catalog(
         },
     })
 }
+impl SqlSession {
+    /// Execute a catalog intent in this session's SQL/native transaction.
+    pub fn execute_catalog_native(&mut self, request: &CatalogRequest) -> Result<CatalogOutcome> {
+        self.native_scope(false, || validate_catalog_request(request), |session| {
+            let prepared = bind_catalog(session, request)?;
+            stage_catalog(session, &prepared.description.request, SqlSession::create_index_engine)
+        })
+    }
+}
 impl Engine {
     /// Execute a catalog intent in one fresh snapshot and one commit decision.
     pub fn execute_catalog(&self, request: &CatalogRequest) -> Result<CatalogOutcome> {

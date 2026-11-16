@@ -466,3 +466,6 @@ mod native_once_v2_format;
 
 #[path = "native_once_v2_execute.rs"] mod native_once_v2_execute;
 #[path = "native_once_v2_terminal.rs"] mod native_once_v2_terminal;
+
+#[path = "native_catalog_session.rs"]
+mod native_catalog_session;

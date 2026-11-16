@@ -58,6 +58,7 @@ fn descriptor_publishes_only_the_three_v1_methods() {
             ("savepoint", 15),
             ("rollback_to", 16),
             ("release", 17),
+            ("catalog", 18),
             ("budget_ms", 20)
         ]
     );
@@ -230,6 +231,7 @@ fn native_descriptor_has_complete_typed_arms_and_explicit_presence() {
         ("operation_outcome", 8),
         ("transaction_outcome", 9),
         ("native_error", 10),
+        ("catalog_outcome", 11),
     ] {
         let field = reply
             .field
@@ -244,4 +246,34 @@ fn native_descriptor_has_complete_typed_arms_and_explicit_presence() {
             Some("native_result")
         );
     }
+}
+
+#[test]
+fn catalog_descriptor_frozen_fields_and_presence() {
+    let set = prost_types::FileDescriptorSet::decode(proto::FILE_DESCRIPTOR_SET).unwrap();
+    let file = set.file.iter().find(|f| f.package.as_deref() == Some("giggles.v1")).unwrap();
+    for (message, fields, optional, oneof) in [
+        ("NativeCatalogRequest", "create_table create_index drop_table drop_index alter_table", "", Some("request")),
+        ("NativeCatalogColumn", "name data_type not_null", "name data_type not_null", None),
+        ("NativeCreateTable", "table columns primary_key", "table", None),
+        ("NativeCreateIndex", "table name columns", "table name", None),
+        ("NativeDropTable", "table cascade", "table cascade", None),
+        ("NativeDropIndex", "name cascade", "name cascade", None),
+        ("NativeAlterTable", "table add_column drop_column rename_column rename_table", "table", Some("action")),
+        ("NativeDropColumn", "name cascade", "name cascade", None),
+        ("NativeRenameColumn", "from to", "from to", None),
+        ("NativeRenameTable", "to", "to", None),
+        ("NativeCatalogOutcome", "catalog_epoch table columns primary_key index_id", "index_id", None),
+    ] {
+        let m = file.message_type.iter().find(|m| m.name.as_deref() == Some(message)).unwrap();
+        assert_eq!(m.field.len(), fields.split_whitespace().count());
+        for (i, name) in fields.split_whitespace().enumerate() {
+            let f = &m.field[i]; assert_eq!(f.name.as_deref(), Some(name)); assert_eq!(f.number, Some(i as i32 + 1));
+            assert_eq!(f.proto3_optional.unwrap_or(false), optional.split_whitespace().any(|n| n == name));
+            if let Some(oneof) = oneof.filter(|_| !optional.split_whitespace().any(|n| n == name)) { assert_eq!(m.oneof_decl[f.oneof_index.unwrap() as usize].name.as_deref(), Some(oneof)); }
+        }
+    }
+    let m = file.message_type.iter().find(|m| m.name.as_deref() == Some("ExecuteRequest")).unwrap();
+    let f = m.field.iter().find(|f| f.name.as_deref() == Some("catalog")).unwrap();
+    assert_eq!(m.oneof_decl[f.oneof_index.unwrap() as usize].name.as_deref(), Some("request"));
 }

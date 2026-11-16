@@ -90,6 +90,10 @@ impl Fixture {
     pub async fn new() -> Self {
         Self::with_limits(ApiLimits::default()).await
     }
+    pub async fn catalog_empty() -> Self {
+        Self::build(ApiLimits::default(), giggles_server::admission::ServiceLimits::default(),
+            giggles_core::TaskResources { read_rows: 100000, disclosed_rows: 100000, encoded_bytes: 100000000 }, false).await
+    }
     pub async fn with_limits(limits: ApiLimits) -> Self {
         Self::with_service_limits(limits, giggles_server::admission::ServiceLimits::default()).await
     }
@@ -105,6 +109,7 @@ impl Fixture {
                 disclosed_rows: 100000,
                 encoded_bytes: 100000000,
             },
+            true,
         )
         .await
     }
@@ -113,6 +118,7 @@ impl Fixture {
             ApiLimits::default(),
             giggles_server::admission::ServiceLimits::default(),
             resources,
+            true,
         )
         .await
     }
@@ -120,6 +126,7 @@ impl Fixture {
         limits: ApiLimits,
         service_limits: giggles_server::admission::ServiceLimits,
         resources: giggles_core::TaskResources,
+        seed_rows: bool,
     ) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::var_os("GIGGLES_TEST_ARTIFACTS")
@@ -165,6 +172,7 @@ impl Fixture {
         sql.execute("CREATE TABLE other (id BIGINT PRIMARY KEY)", &[], None)
             .unwrap();
         drop(sql);
+        if seed_rows {
         admin
             .grant(Grant {
                 task: TaskId(1),
@@ -202,6 +210,7 @@ impl Fixture {
                     },
                 )
                 .unwrap();
+        }
         }
         let domain = admin.authority_metadata().unwrap().0.to_string();
         let bindings = vec![

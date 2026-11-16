@@ -4,7 +4,7 @@
   "info": {
     "title": "Giggles HTTP API",
     "version": "1.0.0",
-    "description": "The strict JSON profile of giggles.v1.Giggles. HTTPS with verified client certificates is mandatory. Persistent sessions share transactions across HTTP and gRPC calls, including reconnects with the same certificate. One Execute owns a session through response completion. Session handles do not grant authority by themselves. Only documented lowerCamel field names are accepted. No compression, query parameters, automatic retries, DDL capability expansion, approval issuance or identity-selection fields. Close/expiry drops uncommitted state once active ownership permits; a lost response never proves rollback. Domain errors remain successful transport responses. Metadata/protocol errors may terminate a connection instead of yielding an envelope. Native operation, atomic transaction, and explicit begin/commit/rollback arms execute the typed core API directly. Bound handles, catalog mutation and once/idempotency APIs are not exposed."
+    "description": "The strict JSON profile of giggles.v1.Giggles. HTTPS with verified client certificates is mandatory. Persistent sessions share transactions across HTTP and gRPC calls, including reconnects with the same certificate. One Execute owns a session through response completion. Session handles do not grant authority by themselves. Only documented lowerCamel field names are accepted. No compression, query parameters, automatic retries, DDL capability expansion, approval issuance or identity-selection fields. Close/expiry drops uncommitted state once active ownership permits; a lost response never proves rollback. Domain errors remain successful transport responses. Metadata/protocol errors may terminate a connection instead of yielding an envelope. Native operation, atomic transaction, and explicit begin/commit/rollback arms execute the typed core API directly. Native catalog DDL uses the retained session. Bound handles and once/idempotency APIs are not exposed."
   },
   "servers": [
     {
@@ -337,6 +337,14 @@
                 "$ref": "#/components/schemas/ExecuteRequest"
               },
               "examples": {
+                "catalogCreateTable": {"value": {"catalog": {"createTable": {"table": "public.items","columns": [{"name": "id","dataType": "BigInt","notNull": true},{"name": "body","dataType": "Text"}],"primaryKey": ["id"]}}}},
+                "catalogCreateIndex": {"value": {"catalog": {"createIndex": {"table": "public.items","name": "items_body","columns": ["body"]}}}},
+                "catalogDropTable": {"value": {"catalog": {"dropTable": {"table": "public.items","cascade": false}}}},
+                "catalogDropIndex": {"value": {"catalog": {"dropIndex": {"name": "public.items_body","cascade": false}}}},
+                "catalogAddColumn": {"value": {"catalog": {"alterTable": {"table": "public.items","addColumn": {"name": "note","dataType": "Text","notNull": false}}}}},
+                "catalogDropColumn": {"value": {"catalog": {"alterTable": {"table": "public.items","dropColumn": {"name": "note","cascade": false}}}}},
+                "catalogRenameColumn": {"value": {"catalog": {"alterTable": {"table": "public.items","renameColumn": {"from": "body","to": "description"}}}}},
+                "catalogRenameTable": {"value": {"catalog": {"alterTable": {"table": "public.items","renameTable": {"to": "products"}}}}},
                 "typedAggregate": {
                   "value": {"typedRead": {"table": "app", "projection": [
                     {"expression": {"aggregate": {"function": "count_star"}}, "alias": "n"}
@@ -1637,7 +1645,8 @@
           },
           "nativeError": {
             "$ref": "#/components/schemas/NativeError"
-          }
+          },
+          "catalogOutcome": {"$ref": "#/components/schemas/NativeCatalogOutcome"}
         },
         "required": [
           "version",
@@ -1646,6 +1655,9 @@
         ],
         "additionalProperties": false,
         "allOf": [
+          {"not": {"required": ["catalogOutcome", "operationOutcome"]}},
+          {"not": {"required": ["catalogOutcome", "transactionOutcome"]}},
+          {"not": {"required": ["catalogOutcome", "nativeError"]}},
           {
             "not": {
               "anyOf": [
@@ -1722,7 +1734,8 @@
           "searchPath": {"$ref": "#/components/schemas/NativeSearchPathRequest"},
           "savepoint": {"$ref": "#/components/schemas/NativeSavepointRequest"},
           "rollbackTo": {"$ref": "#/components/schemas/NativeSavepointRequest"},
-          "release": {"$ref": "#/components/schemas/NativeSavepointRequest"}
+          "release": {"$ref": "#/components/schemas/NativeSavepointRequest"},
+          "catalog": {"$ref": "#/components/schemas/NativeCatalogRequest"}
         },
         "additionalProperties": false,
         "oneOf": [
@@ -1788,7 +1801,8 @@
           {"required": ["searchPath"]},
           {"required": ["savepoint"]},
           {"required": ["rollbackTo"]},
-          {"required": ["release"]}
+          {"required": ["release"]},
+          {"required": ["catalog"]}
         ],
         "description": "Exactly one request alternative. Duplicate keys, aliases, unknown fields, JSON null, trailing documents and nesting deeper than 128 are rejected by the parser. Raw UTF-8 body limit is 262144 bytes including whitespace. Native request trees are typed directly into the core operation engine; SQL is a separate optional arm. Semantic core failures use nativeError in a successful HTTP 200 reply."
       },
@@ -1958,6 +1972,77 @@
           "request"
         ],
         "x-max-binding-value-bytes": 65536
+      },
+      "NativeCatalogRequest": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "createTable": {"$ref": "#/components/schemas/NativeCreateTable"},
+          "createIndex": {"$ref": "#/components/schemas/NativeCreateIndex"},
+          "dropTable": {"$ref": "#/components/schemas/NativeDropTable"},
+          "dropIndex": {"$ref": "#/components/schemas/NativeDropIndex"},
+          "alterTable": {"$ref": "#/components/schemas/NativeAlterTable"}
+        },
+        "oneOf": [{"required": ["createTable"]}, {"required": ["createIndex"]}, {"required": ["dropTable"]}, {"required": ["dropIndex"]}, {"required": ["alterTable"]}],
+        "description": "Exactly one synchronous catalog request. Unknown fields, duplicate keys and JSON null are rejected at every request level. Arrays omitted from requests default to empty; core validates their semantics. Names are exact identifiers resolved using the retained search_path. Errors use the existing native error mapping."
+      },
+      "NativeCatalogDataType": {
+        "type": "string",
+        "enum": ["Boolean", "SmallInt", "Integer", "BigInt", "Text", "Bytes", "Numeric", "Real", "DoublePrecision", "Date", "Time", "TimeTz", "Timestamp", "TimestampTz", "Interval", "Varchar", "Bpchar", "Uuid", "Jsonb", "IntArray", "BigIntArray", "TextArray"]
+      },
+      "NativeCatalogColumn": {
+        "type": "object", "additionalProperties": false, "required": ["name", "dataType"],
+        "properties": {"name": {"type": "string"}, "dataType": {"$ref": "#/components/schemas/NativeCatalogDataType"}, "notNull": {"type": "boolean", "default": false}}
+      },
+      "NativeCreateTable": {
+        "type": "object", "additionalProperties": false, "required": ["table"],
+        "properties": {
+          "table": {"type": "string"},
+          "columns": {"type": "array", "maxItems": 1600, "items": {"$ref": "#/components/schemas/NativeCatalogColumn"}},
+          "primaryKey": {"type": "array", "maxItems": 1600, "items": {"type": "string"}}
+        }
+      },
+      "NativeCreateIndex": {
+        "type": "object", "additionalProperties": false, "required": ["table", "name"],
+        "properties": {"table": {"type": "string"}, "name": {"type": "string"}, "columns": {"type": "array", "maxItems": 1600, "items": {"type": "string"}}}
+      },
+      "NativeDropTable": {
+        "type": "object", "additionalProperties": false, "required": ["table"],
+        "properties": {"table": {"type": "string"}, "cascade": {"type": "boolean", "default": false}}
+      },
+      "NativeDropIndex": {
+        "type": "object", "additionalProperties": false, "required": ["name"],
+        "properties": {"name": {"type": "string"}, "cascade": {"type": "boolean", "default": false}}
+      },
+      "NativeAlterTable": {
+        "type": "object", "additionalProperties": false, "required": ["table"],
+        "properties": {
+          "table": {"type": "string"}, "addColumn": {"$ref": "#/components/schemas/NativeCatalogColumn"},
+          "dropColumn": {"$ref": "#/components/schemas/NativeDropColumn"},
+          "renameColumn": {"$ref": "#/components/schemas/NativeRenameColumn"},
+          "renameTable": {"$ref": "#/components/schemas/NativeRenameTable"}
+        },
+        "oneOf": [{"required": ["addColumn"]}, {"required": ["dropColumn"]}, {"required": ["renameColumn"]}, {"required": ["renameTable"]}]
+      },
+      "NativeDropColumn": {
+        "type": "object", "additionalProperties": false, "required": ["name"],
+        "properties": {"name": {"type": "string"}, "cascade": {"type": "boolean", "default": false}}
+      },
+      "NativeRenameColumn": {
+        "type": "object", "additionalProperties": false, "required": ["from", "to"],
+        "properties": {"from": {"type": "string"}, "to": {"type": "string"}}
+      },
+      "NativeRenameTable": {
+        "type": "object", "additionalProperties": false, "required": ["to"],
+        "properties": {"to": {"type": "string"}}
+      },
+      "NativeCatalogOutcome": {
+        "type": "object", "additionalProperties": false, "required": ["catalogEpoch", "table", "columns", "primaryKey"],
+        "properties": {
+          "catalogEpoch": {"$ref": "#/components/schemas/UInt64"}, "table": {"type": "string"},
+          "columns": {"type": "array", "items": {"allOf": [{"$ref": "#/components/schemas/NativeCatalogColumn"}, {"required": ["notNull"]}]}},
+          "primaryKey": {"type": "array", "items": {"type": "string"}}, "indexId": {"$ref": "#/components/schemas/UInt64"}
+        },
+        "description": "Logical catalog metadata; hidden row IDs are excluded. table is canonical schema-qualified (new name after rename). Drops return removed table or owning-table metadata. indexId is present for index creation/deletion."
       },
       "NativeSavepointRequest": {
         "type": "object", "additionalProperties": false, "required": ["name"],

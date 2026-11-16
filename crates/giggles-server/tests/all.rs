@@ -206,3 +206,6 @@ mod fk_section_network;
 #[path = "api_search_path.rs"] mod api_search_path;
 
 #[path = "api_savepoints.rs"] mod api_savepoints;
+#[path = "api_catalog.rs"] mod api_catalog;
+
+#[path = "api_catalog_auth.rs"] mod api_catalog_auth;

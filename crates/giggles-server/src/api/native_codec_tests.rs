@@ -691,3 +691,65 @@ fn character_column_types_use_existing_native_text_tag() {
         );
     }
 }
+
+fn catalog(q: p::native_catalog_request::Request) -> R<o::CatalogRequest> {
+    let v = p::NativeCatalogRequest { request: Some(q) };
+    catalog_request(p::NativeCatalogRequest::decode(v.encode_to_vec().as_slice()).unwrap())
+}
+fn catalog_col() -> p::NativeCatalogColumn {
+    p::NativeCatalogColumn { name: Some("id".into()), data_type: Some("Integer".into()), not_null: None }
+}
+#[test]
+fn catalog_requests_actions_and_required_presence() {
+    use p::native_catalog_request::Request as Q;
+    use p::native_alter_table::Action as A;
+    assert!(catalog_request(p::NativeCatalogRequest::default()).is_err());
+    let ct = p::NativeCreateTable { table: Some("t".into()), columns: vec![catalog_col()], primary_key: vec!["id".into()] };
+    assert!(matches!(catalog(Q::CreateTable(ct.clone())).unwrap(), o::CatalogRequest::CreateTable { columns, .. } if !columns[0].not_null));
+    let ci = p::NativeCreateIndex { table: Some("t".into()), name: Some("i".into()), columns: vec!["id".into()] };
+    assert!(matches!(catalog(Q::CreateIndex(ci.clone())).unwrap(), o::CatalogRequest::CreateIndex { name, .. } if name == "i"));
+    assert!(matches!(catalog(Q::DropTable(p::NativeDropTable { table: Some("t".into()), cascade: None })).unwrap(), o::CatalogRequest::DropTable { cascade: false, .. }));
+    assert!(matches!(catalog(Q::DropIndex(p::NativeDropIndex { name: Some("i".into()), cascade: Some(true) })).unwrap(), o::CatalogRequest::DropIndex { cascade: true, .. }));
+    let actions = [A::AddColumn(catalog_col()), A::DropColumn(p::NativeDropColumn { name: Some("id".into()), cascade: None }), A::RenameColumn(p::NativeRenameColumn { from: Some("id".into()), to: Some("next".into()) }), A::RenameTable(p::NativeRenameTable { to: Some("next".into()) })];
+    let expected = [o::AlterTableAction::AddColumn { column: o::ColumnSpec { name: "id".into(), data_type: DataType::Integer, not_null: false, default: None, generated: None } }, o::AlterTableAction::DropColumn { name: "id".into(), cascade: false }, o::AlterTableAction::RenameColumn { from: "id".into(), to: "next".into() }, o::AlterTableAction::RenameTable { to: "next".into() }];
+    for (action, expected) in actions.into_iter().zip(expected) {
+        assert_eq!(catalog(Q::AlterTable(p::NativeAlterTable { table: Some("t".into()), action: Some(action) })).unwrap(), o::CatalogRequest::AlterTable { table: "t".into(), action: expected });
+    }
+    let mut missing = ct.clone(); missing.table = None;
+    assert!(catalog(Q::CreateTable(missing)).is_err());
+    for field in 0..2 {
+        let mut v = ci.clone(); if field == 0 { v.table = None; } else { v.name = None; }
+        assert!(catalog(Q::CreateIndex(v)).is_err());
+        let mut c = catalog_col(); if field == 0 { c.name = None; } else { c.data_type = None; }
+        assert!(catalog_column(c.clone()).is_err());
+        let mut v = ct.clone(); v.columns = vec![c.clone()]; assert!(matches!(catalog(Q::CreateTable(v)), Err(ApiError::InvalidArgument)));
+        assert!(catalog(Q::AlterTable(p::NativeAlterTable { table: Some("t".into()), action: Some(A::AddColumn(c)) })).is_err());
+    }
+    assert!(catalog(Q::DropTable(p::NativeDropTable::default())).is_err());
+    assert!(catalog(Q::DropIndex(p::NativeDropIndex::default())).is_err());
+    assert!(catalog(Q::AlterTable(p::NativeAlterTable::default())).is_err());
+    assert!(catalog(Q::AlterTable(p::NativeAlterTable { table: None, action: Some(A::AddColumn(catalog_col())) })).is_err());
+    let bad = [None, Some(A::DropColumn(p::NativeDropColumn::default())), Some(A::RenameColumn(p::NativeRenameColumn { from: None, to: Some("n".into()) })), Some(A::RenameColumn(p::NativeRenameColumn { from: Some("n".into()), to: None })), Some(A::RenameTable(p::NativeRenameTable::default()))];
+    for action in bad { assert!(catalog(Q::AlterTable(p::NativeAlterTable { table: Some("t".into()), action })).is_err()); }
+    for n in [1600, 1601] {
+        let mut v = ct.clone(); v.columns = vec![catalog_col(); n]; assert_eq!(catalog(Q::CreateTable(v)).is_ok(), n == 1600);
+        let mut v = ct.clone(); v.primary_key = vec!["id".into(); n]; assert_eq!(catalog(Q::CreateTable(v)).is_ok(), n == 1600);
+        let mut v = ci.clone(); v.columns = vec!["id".into(); n]; assert_eq!(catalog(Q::CreateIndex(v)).is_ok(), n == 1600);
+    }
+}
+#[test]
+fn catalog_types_and_outcome_preserve_exact_names_and_key_order() {
+    let names = "Boolean SmallInt Integer BigInt Text Bytes Numeric Real DoublePrecision Date Time TimeTz Timestamp TimestampTz Interval Varchar Bpchar Uuid Jsonb IntArray BigIntArray TextArray";
+    let columns = names.split_whitespace().enumerate().map(|(i, name)| {
+        let c = catalog_column(p::NativeCatalogColumn { name: Some(format!("c{i}")), data_type: Some(name.into()), not_null: Some(true) }).unwrap();
+        assert_eq!(catalog_type_name(&c.data_type), name);
+        ColumnDef { id: i as u64, name: c.name, data_type: c.data_type, not_null: c.not_null }
+    }).collect();
+    let outcome = o::CatalogOutcome { catalog_epoch: 9, table: giggles_core::relational::TableDef { id: 1, name: "ignored".into(), columns, primary_key: vec![2, 0] }, index_id: Some(7) };
+    let encoded = encode_catalog_outcome(outcome, "public.t".into());
+    let encoded = p::NativeCatalogOutcome::decode(encoded.encode_to_vec().as_slice()).unwrap();
+    assert_eq!((encoded.catalog_epoch, encoded.table.as_str(), encoded.index_id), (9, "public.t", Some(7)));
+    assert_eq!(encoded.primary_key, ["c2", "c0"]);
+    for (c, name) in encoded.columns.iter().zip(names.split_whitespace()) { assert_eq!(c.data_type.as_deref(), Some(name)); assert!(c.name.is_some()); assert_eq!(c.not_null, Some(true)); }
+    for name in ["integer", "Unknown", ""] { assert!(catalog_type(name).is_err()); }
+}

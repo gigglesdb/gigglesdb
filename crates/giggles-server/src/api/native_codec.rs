@@ -735,3 +735,98 @@ pub(crate) fn encode_error(v: o::Error) -> p::NativeError {
         sqlstate,
     }
 }
+
+pub(crate) fn catalog_request(v: p::NativeCatalogRequest) -> R<o::CatalogRequest> {
+    use p::native_catalog_request::Request as Q;
+    Ok(match need(v.request)? {
+        Q::CreateTable(v) => {
+            cap(v.columns.len(), 1600)?;
+            cap(v.primary_key.len(), 1600)?;
+            o::CatalogRequest::CreateTable { table: need(v.table)?, columns: list(v.columns, catalog_column)?, primary_key: v.primary_key }
+        }
+        Q::CreateIndex(v) => {
+            cap(v.columns.len(), 1600)?;
+            o::CatalogRequest::CreateIndex { table: need(v.table)?, name: need(v.name)?, columns: v.columns }
+        }
+        Q::DropTable(v) => o::CatalogRequest::DropTable { table: need(v.table)?, cascade: v.cascade.unwrap_or(false) },
+        Q::DropIndex(v) => o::CatalogRequest::DropIndex { name: need(v.name)?, cascade: v.cascade.unwrap_or(false) },
+        Q::AlterTable(v) => {
+            use p::native_alter_table::Action as A;
+            let table = need(v.table)?;
+            let action = match need(v.action)? {
+                A::AddColumn(v) => o::AlterTableAction::AddColumn { column: catalog_column(v)? },
+                A::DropColumn(v) => o::AlterTableAction::DropColumn { name: need(v.name)?, cascade: v.cascade.unwrap_or(false) },
+                A::RenameColumn(v) => o::AlterTableAction::RenameColumn { from: need(v.from)?, to: need(v.to)? },
+                A::RenameTable(v) => o::AlterTableAction::RenameTable { to: need(v.to)? },
+            };
+            o::CatalogRequest::AlterTable { table, action }
+        }
+    })
+}
+fn catalog_column(v: p::NativeCatalogColumn) -> R<o::ColumnSpec> {
+    Ok(o::ColumnSpec { name: need(v.name)?, data_type: catalog_type(&need(v.data_type)?)?, not_null: v.not_null.unwrap_or(false), default: None, generated: None })
+}
+fn catalog_type(v: &str) -> R<DataType> {
+    Ok(match v {
+        "Boolean" => DataType::Boolean,
+        "SmallInt" => DataType::SmallInt,
+        "Integer" => DataType::Integer,
+        "BigInt" => DataType::BigInt,
+        "Text" => DataType::Text,
+        "Bytes" => DataType::Bytes,
+        "Numeric" => DataType::Numeric,
+        "Real" => DataType::Real,
+        "DoublePrecision" => DataType::DoublePrecision,
+        "Date" => DataType::Date,
+        "Time" => DataType::Time,
+        "TimeTz" => DataType::TimeTz,
+        "Timestamp" => DataType::Timestamp,
+        "TimestampTz" => DataType::TimestampTz,
+        "Interval" => DataType::Interval,
+        "Varchar" => DataType::Varchar,
+        "Bpchar" => DataType::Bpchar,
+        "Uuid" => DataType::Uuid,
+        "Jsonb" => DataType::Jsonb,
+        "IntArray" => DataType::IntArray,
+        "BigIntArray" => DataType::BigIntArray,
+        "TextArray" => DataType::TextArray,
+        _ => return Err(ApiError::InvalidArgument),
+    })
+}
+fn catalog_type_name(v: &DataType) -> &'static str {
+    match v {
+        DataType::Boolean => "Boolean",
+        DataType::SmallInt => "SmallInt",
+        DataType::Integer => "Integer",
+        DataType::BigInt => "BigInt",
+        DataType::Text => "Text",
+        DataType::Bytes => "Bytes",
+        DataType::Numeric => "Numeric",
+        DataType::Real => "Real",
+        DataType::DoublePrecision => "DoublePrecision",
+        DataType::Date => "Date",
+        DataType::Time => "Time",
+        DataType::TimeTz => "TimeTz",
+        DataType::Timestamp => "Timestamp",
+        DataType::TimestampTz => "TimestampTz",
+        DataType::Interval => "Interval",
+        DataType::Varchar => "Varchar",
+        DataType::Bpchar => "Bpchar",
+        DataType::Uuid => "Uuid",
+        DataType::Jsonb => "Jsonb",
+        DataType::IntArray => "IntArray",
+        DataType::BigIntArray => "BigIntArray",
+        DataType::TextArray => "TextArray",
+    }
+}
+pub(crate) fn encode_catalog_outcome(v: o::CatalogOutcome, canonical_table: String) -> p::NativeCatalogOutcome {
+    p::NativeCatalogOutcome {
+        catalog_epoch: v.catalog_epoch,
+        table: canonical_table,
+        primary_key: v.table.primary_key.iter().filter(|i| Some(**i) != v.table.hidden_rowid()).map(|i| v.table.columns[*i].name.clone()).collect(),
+        columns: v.table.logical_columns().map(|c| p::NativeCatalogColumn {
+            data_type: Some(catalog_type_name(&c.data_type).into()), name: Some(c.name.clone()), not_null: Some(c.not_null),
+        }).collect(),
+        index_id: v.index_id,
+    }
+}

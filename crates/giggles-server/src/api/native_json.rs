@@ -163,6 +163,57 @@ pub(super) struct Decoder {
     wrappers: usize,
 }
 impl Decoder {
+    pub(super) fn catalog(&mut self, v: Json) -> R<p::NativeCatalogRequest> {
+        use p::native_catalog_request::Request as Q;
+        let (kind, v) = Object::new(v)?.one()?;
+        let mut f = Object::new(v)?;
+        let request = Some(match kind.as_str() {
+            "createTable" => Q::CreateTable(p::NativeCreateTable {
+                table: Some(text(f.required("table")?)?),
+                columns: items(f.optional("columns"), 1600)?.into_iter().map(Self::catalog_column).collect::<R<_>>()?,
+                primary_key: items(f.optional("primaryKey"), 1600)?.into_iter().map(text).collect::<R<_>>()?,
+            }),
+            "createIndex" => Q::CreateIndex(p::NativeCreateIndex {
+                table: Some(text(f.required("table")?)?), name: Some(text(f.required("name")?)?),
+                columns: items(f.optional("columns"), 1600)?.into_iter().map(text).collect::<R<_>>()?,
+            }),
+            "dropTable" => Q::DropTable(p::NativeDropTable {
+                table: Some(text(f.required("table")?)?), cascade: f.optional("cascade").map(boolean).transpose()?,
+            }),
+            "dropIndex" => Q::DropIndex(p::NativeDropIndex {
+                name: Some(text(f.required("name")?)?), cascade: f.optional("cascade").map(boolean).transpose()?,
+            }),
+            "alterTable" => {
+                use p::native_alter_table::Action as A;
+                let table = Some(text(f.required("table")?)?);
+                let (kind, value) = f.one()?;
+                let action = Some(match kind.as_str() {
+                    "addColumn" => A::AddColumn(Self::catalog_column(value)?),
+                    "dropColumn" => { let mut a = Object::new(value)?;
+                        let v = p::NativeDropColumn { name: Some(text(a.required("name")?)?), cascade: a.optional("cascade").map(boolean).transpose()? };
+                        a.finish()?; A::DropColumn(v) }
+                    "renameColumn" => { let mut a = Object::new(value)?;
+                        let v = p::NativeRenameColumn { from: Some(text(a.required("from")?)?), to: Some(text(a.required("to")?)?) };
+                        a.finish()?; A::RenameColumn(v) }
+                    "renameTable" => { let mut a = Object::new(value)?;
+                        let v = p::NativeRenameTable { to: Some(text(a.required("to")?)?) };
+                        a.finish()?; A::RenameTable(v) }
+                    _ => return Err(ApiError::InvalidArgument),
+                });
+                return Ok(p::NativeCatalogRequest { request: Some(Q::AlterTable(p::NativeAlterTable { table, action })) });
+            }
+            _ => return Err(ApiError::InvalidArgument),
+        });
+        f.finish()?;
+        Ok(p::NativeCatalogRequest { request })
+    }
+    fn catalog_column(v: Json) -> R<p::NativeCatalogColumn> {
+        let mut f = Object::new(v)?;
+        let column = p::NativeCatalogColumn { name: Some(text(f.required("name")?)?),
+            data_type: Some(text(f.required("dataType")?)?), not_null: f.optional("notNull").map(boolean).transpose()? };
+        f.finish()?;
+        Ok(column)
+    }
     pub(super) fn search_path(&mut self, v: Json) -> R<p::NativeSearchPathRequest> {
         let mut f = Object::new(v)?;
         let set = f.optional("set").map(boolean).transpose()?;
@@ -839,5 +890,26 @@ impl Decoder {
             _ => return Err(ApiError::InvalidArgument),
         });
         Ok(p::NativeEmitExpr { value })
+    }
+}
+
+impl Serialize for p::NativeCatalogColumn {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        if let Some(v) = &self.name { m.serialize_entry("name", v)?; }
+        if let Some(v) = &self.data_type { m.serialize_entry("dataType", v)?; }
+        if let Some(v) = &self.not_null { m.serialize_entry("notNull", v)?; }
+        m.end()
+    }
+}
+impl Serialize for p::NativeCatalogOutcome {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("catalogEpoch", &Decimal(self.catalog_epoch))?;
+        m.serialize_entry("table", &self.table)?;
+        m.serialize_entry("columns", &self.columns)?;
+        m.serialize_entry("primaryKey", &self.primary_key)?;
+        if let Some(v) = self.index_id { m.serialize_entry("indexId", &Decimal(v))?; }
+        m.end()
     }
 }

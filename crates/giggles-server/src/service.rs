@@ -1140,7 +1140,7 @@ impl Session {
                     .is_ok_and(|privileges| privileges.contains(&privilege))
             }))
     }
-    fn table_privilege_superuser(&self) -> Result<bool, CoreError> {
+    pub(crate) fn table_privilege_superuser(&self) -> Result<bool, CoreError> {
         let Role::Database { name } = &self.role else {
             return Ok(false);
         };
@@ -1193,6 +1193,34 @@ impl Session {
             }
             Ok(())
         })
+    }
+    pub(crate) fn authorize_native_catalog(&mut self, request: &giggles_core::operations::CatalogRequest) -> Result<(), CoreError> {
+        use giggles_core::operations::CatalogRequest as C;
+        let allowed = if !matches!(self.role, Role::Database { .. }) { false }
+        else if self.table_privilege_superuser()? { true }
+        else {
+            let Role::Database { name } = &self.role else { unreachable!() };
+            let table = match request {
+                C::DropTable { table, .. } | C::AlterTable { table, .. } => Some(self.sql.native_relation_reference(table)?),
+                C::DropIndex { name, .. } => self.sql.native_index_table(name)?,
+                _ => None,
+            };
+            if let Some(table) = table {
+                let key = self.sql.table_authority_name(&table)?;
+                self.sql.table_owner(&key).map_err(|_| CoreError::Policy(Error::Scope))?.as_deref() == Some(name)
+            } else {
+                let schema = match request {
+                    C::CreateTable { table, .. } => self.sql.native_creation_schema(table)?,
+                    C::CreateIndex { table, .. } => self.sql.relation_schema(&self.sql.native_relation_reference(table)?)?,
+                    _ => self.sql.relation_schema("")?,
+                };
+                self.sql.schema_metadata()?.schemas.get(&schema).is_some_and(|(_, owner)| owner == name)
+                    || self.service.admin.roles().schema_privileges(&schema, name)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?.contains(&roles::SchemaPrivilege::Create)
+            }
+        };
+        if !allowed { self.sql.abort(); return Err(CoreError::Policy(Error::Scope)); }
+        Ok(())
     }
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
         if let Some((schema, owner, create)) = p.schema_ddl() {
@@ -1620,95 +1648,63 @@ impl Session {
                 zone: session.zone,
                 wall: Some(Arc::new(move || service.clock.sql_micros())),
             };
-            let transactional_authority = session.sql.set_ddl_owner(match &session.role {
-                Role::Database { name } => Some(name),
-                _ => None,
-            });
-            let sequence_candidates = if p.is_ddl() && !transactional_authority {
-                session
-                    .sql
-                    .sequence_owners()?
-                    .into_iter()
-                    .map(|(name, _)| name)
-                    .collect::<Vec<_>>()
-            } else {
-                vec![]
-            };
-            let table_preexisting = if p.command() == "CREATE TABLE" {
-                match p.table() {
-                    Some(table) => session.sql.relation_exists(table)?,
-                    None => false,
-                }
-            } else {
-                false
-            };
-            let result = session.sql.execute_prepared_at(p, params, None, &clock);
-            if !session.sql.in_transaction() {
-                session.transaction_us = None;
-            } else if clock.unavailable.is_none() {
-                session.transaction_us = Some(transaction_us);
-            }
-            let result = result?;
-            if transactional_authority {
-                return Ok(result);
-            }
-            session
-                .sequence_owner_candidates
-                .extend(sequence_candidates.iter().cloned());
-            session
-                .sequence_owner_candidates
-                .extend(p.sequence_ddl_names().into_iter().map(str::to_owned));
-            let roles = session.service.admin.roles();
-            if p.command() == "CREATE SEQUENCE" && result.affected != 0 {
-                for sequence in p.sequence_ddl_names() {
-                    roles
-                        .forget_table(sequence)
-                        .map_err(|_| CoreError::Policy(Error::Scope))?;
-                    if let Role::Database { name } = &session.role {
-                        roles
-                            .set_table_owner(sequence, name)
-                            .map_err(|_| CoreError::Policy(Error::Scope))?;
-                    }
-                }
-            }
-            if p.command() == "CREATE TABLE"
-                && !table_preexisting
-                && let Some(table) = p.table()
-            {
-                roles
-                    .forget_table(table)
-                    .map_err(|_| CoreError::Policy(Error::Scope))?;
-                if let Role::Database { name } = &session.role {
-                    roles
-                        .set_table_owner(table, name)
-                        .map_err(|_| CoreError::Policy(Error::Scope))?;
-                }
-            }
-            if p.is_ddl() && !p.is_sequence_ddl() {
-                for (sequence, table) in session.sql.sequence_owners()? {
-                    if sequence_candidates.contains(&sequence) {
-                        continue;
-                    }
-                    roles
-                        .forget_table(&sequence)
-                        .map_err(|_| CoreError::Policy(Error::Scope))?;
-                    if let Some(table) = table {
-                        let durable_table = session.sql.table_authority_name(&table)?;
-                        if let Some(owner) = roles
-                            .table_owner(&durable_table)
-                            .map_err(|_| CoreError::Policy(Error::Scope))?
-                        {
-                            roles
-                                .set_table_owner(&sequence, &owner)
-                                .map_err(|_| CoreError::Policy(Error::Scope))?;
-                        }
-                    }
-                    session.sequence_owner_candidates.insert(sequence);
-                }
-            }
-            session.reconcile_sequence_owners()?;
-            Ok(result)
+            session.execute_with_ddl_authority(p.command(), p.table(), p.is_ddl(), p.is_sequence_ddl(),
+                p.sequence_ddl_names().into_iter().map(str::to_owned).collect(), |session| {
+                    let result = session.sql.execute_prepared_at(p, params, None, &clock);
+                    if !session.sql.in_transaction() { session.transaction_us = None; }
+                    else if clock.unavailable.is_none() { session.transaction_us = Some(transaction_us); }
+                    result.map(|result| { let affected = result.affected != 0; (result, affected, true) })
+                })
         })
+    }
+    fn execute_with_ddl_authority<T>(
+        &mut self, command: &str, table: Option<&str>, ddl: bool, sequence_ddl: bool,
+        sequences: Vec<String>, execute: impl FnOnce(&mut Self) -> Result<(T, bool, bool), CoreError>,
+    ) -> Result<T, CoreError> {
+        let transactional = self.sql.set_ddl_owner(match &self.role { Role::Database { name } => Some(name), _ => None });
+        let candidates = if ddl && !transactional { self.sql.sequence_owners()?.into_iter().map(|(name, _)| name).collect::<Vec<_>>() } else { vec![] };
+        let preexisting = command == "CREATE TABLE" && table.map(|t| self.sql.relation_exists(t)).transpose()?.unwrap_or(false);
+        // Native errors stay in the result envelope; failed execution must skip bookkeeping.
+        let (result, affected, succeeded) = execute(self)?;
+        if transactional || !succeeded { return Ok(result); }
+        self.sequence_owner_candidates.extend(candidates.iter().cloned());
+        self.sequence_owner_candidates.extend(sequences.iter().cloned());
+        let roles = self.service.admin.roles();
+        let mut created = if command == "CREATE SEQUENCE" && affected { sequences } else { vec![] };
+        if command == "CREATE TABLE" && !preexisting { created.extend(table.map(str::to_owned)); }
+        for name in created {
+            roles.forget_table(&name).map_err(|_| CoreError::Policy(Error::Scope))?;
+            if let Role::Database { name: owner } = &self.role {
+                roles.set_table_owner(&name, owner).map_err(|_| CoreError::Policy(Error::Scope))?;
+            }
+        }
+        if ddl && !sequence_ddl {
+            for (sequence, table) in self.sql.sequence_owners()? {
+                if candidates.contains(&sequence) { continue; }
+                roles.forget_table(&sequence).map_err(|_| CoreError::Policy(Error::Scope))?;
+                if let Some(table) = table {
+                    let durable = self.sql.table_authority_name(&table)?;
+                    if let Some(owner) = roles.table_owner(&durable).map_err(|_| CoreError::Policy(Error::Scope))? {
+                        roles.set_table_owner(&sequence, &owner).map_err(|_| CoreError::Policy(Error::Scope))?;
+                    }
+                }
+                self.sequence_owner_candidates.insert(sequence);
+            }
+        }
+        self.reconcile_sequence_owners()?;
+        Ok(result)
+    }
+    pub(crate) fn execute_native_catalog(&mut self, request: &giggles_core::operations::CatalogRequest)
+        -> Result<Result<giggles_core::operations::CatalogOutcome, giggles_core::operations::Error>, CoreError> {
+        use giggles_core::operations::CatalogRequest as C;
+        self.reconcile_sequence_owners()?;
+        let table = if let C::CreateTable { table, .. } = request {
+            let schema = self.sql.native_creation_schema(table)?;
+            let name = table.split_once('.').map_or(table.as_str(), |(_, name)| name);
+            Some(relational::relation_key(&schema, name))
+        } else { None };
+        self.execute_with_ddl_authority(if table.is_some() { "CREATE TABLE" } else { "" }, table.as_deref(), true, false, vec![],
+            |session| { let result = session.sql.execute_catalog_native(request); let succeeded = result.is_ok(); Ok((result, true, succeeded)) })
     }
     pub fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<SqlResult, CoreError> {
         self.authority_scope(|session| session.execute_sql_authorized(sql, params))

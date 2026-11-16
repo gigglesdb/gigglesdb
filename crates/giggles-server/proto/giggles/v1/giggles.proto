@@ -36,6 +36,7 @@ message ExecuteRequest {
     NativeSavepointRequest savepoint = 15;
     NativeSavepointRequest rollback_to = 16;
     NativeSavepointRequest release = 17;
+    NativeCatalogRequest catalog = 18;
   }
   optional uint32 budget_ms = 20;
 }
@@ -201,6 +202,7 @@ message ExecuteReply {
     NativeOutcome operation_outcome = 8;
     NativeTransactionOutcome transaction_outcome = 9;
     NativeError native_error = 10;
+    NativeCatalogOutcome catalog_outcome = 11;
   }
 }
 message SqlResult {
@@ -636,3 +638,15 @@ enum NativeErrorClass {
   NATIVE_ERROR_CLASS_DUPLICATE = 19; // SQLSTATE 23505
   NATIVE_ERROR_CLASS_SQL = 20; // Underlying SQLSTATE in sqlstate
 }
+
+message NativeCatalogRequest { oneof request { NativeCreateTable create_table = 1; NativeCreateIndex create_index = 2; NativeDropTable drop_table = 3; NativeDropIndex drop_index = 4; NativeAlterTable alter_table = 5; } }
+message NativeCatalogColumn { optional string name = 1; optional string data_type = 2; optional bool not_null = 3; }
+message NativeCreateTable { optional string table = 1; repeated NativeCatalogColumn columns = 2; repeated string primary_key = 3; }
+message NativeCreateIndex { optional string table = 1; optional string name = 2; repeated string columns = 3; }
+message NativeDropTable { optional string table = 1; optional bool cascade = 2; }
+message NativeDropIndex { optional string name = 1; optional bool cascade = 2; }
+message NativeAlterTable { optional string table = 1; oneof action { NativeCatalogColumn add_column = 2; NativeDropColumn drop_column = 3; NativeRenameColumn rename_column = 4; NativeRenameTable rename_table = 5; } }
+message NativeDropColumn { optional string name = 1; optional bool cascade = 2; }
+message NativeRenameColumn { optional string from = 1; optional string to = 2; }
+message NativeRenameTable { optional string to = 1; }
+message NativeCatalogOutcome { uint64 catalog_epoch = 1; string table = 2; repeated NativeCatalogColumn columns = 3; repeated string primary_key = 4; optional uint64 index_id = 5; }

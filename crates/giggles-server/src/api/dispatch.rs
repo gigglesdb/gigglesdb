@@ -426,6 +426,7 @@ fn execute_reply(
             use proto::execute_reply::NativeResult as P;
             reply.native_result = match outcome {
                 native::NativeResult::Control => None,
+                native::NativeResult::Catalog(outcome, table) => Some(P::CatalogOutcome(native_codec::encode_catalog_outcome(outcome, table))),
                 native::NativeResult::Sql(sql) => {
                     reply.sql = codec::encode_reply(Response { sql: Some(sql), ..Response::code("ok") }, state)?.sql;
                     None

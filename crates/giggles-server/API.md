@@ -34,7 +34,7 @@ authority. HTTP headers, URL paths, SQL and gRPC metadata cannot choose a role.
 Use application identities for typed data operations, transaction controls and
 parameterized SQL, and task identities for the
 existing scoped Preview, Execute, RepairSql and Status operations. Neither API
-exposes provisioning, grants, approval creation, catalog DDL, administrative SQL,
+exposes provisioning, grants, approval creation, administrative SQL,
 remote bound handles or trusted core `once`/`outcome` handles. Typed operations
 check every referenced table, including wrappers and later block steps, against
 the application binding before any step runs. Task identities cannot invoke
@@ -241,7 +241,7 @@ explicit Boolean presence is required for `readOnly`, sort `descending` and
 uncompressed message per call, with a 256 KiB payload cap.
 
 Successful dispatch returns `ExecuteReply`, including `version: 1`, `code` and
-`transactionState`, plus `operationOutcome`, `transactionOutcome`, `nativeError`,
+`transactionState`, plus `operationOutcome`, `transactionOutcome`, `catalogOutcome`, `nativeError`,
 or optional SQL/redacted task fields as appropriate. The three
 states are `TRANSACTION_STATE_IDLE`, `TRANSACTION_STATE_IN_TRANSACTION` and
 `TRANSACTION_STATE_ABORTED`. Domain errors such as `23505`, `42501`, `25P02`,
@@ -492,3 +492,66 @@ release discards its target and later captures while keeping the current path.
 Transaction end clears captures. SQL savepoint controls do not maintain this
 API path stack; mixing SQL and native savepoints can therefore differ in path
 restoration.
+
+## Native catalog DDL
+
+Execute accepts `catalog` (protobuf field 18, `NativeCatalogRequest`) with
+exactly one request below. Each example is a complete Execute JSON body.
+
+```json
+{"catalog":{"createTable":{"table":"public.items","columns":[{"name":"id","dataType":"BigInt","notNull":true},{"name":"body","dataType":"Text"}],"primaryKey":["id"]}}}
+{"catalog":{"createIndex":{"table":"public.items","name":"items_body","columns":["body"]}}}
+{"catalog":{"dropTable":{"table":"public.items","cascade":false}}}
+{"catalog":{"dropIndex":{"name":"public.items_body","cascade":false}}}
+{"catalog":{"alterTable":{"table":"public.items","addColumn":{"name":"note","dataType":"Text","notNull":false}}}}
+{"catalog":{"alterTable":{"table":"public.items","dropColumn":{"name":"note","cascade":false}}}}
+{"catalog":{"alterTable":{"table":"public.items","renameColumn":{"from":"body","to":"description"}}}}
+{"catalog":{"alterTable":{"table":"public.items","renameTable":{"to":"products"}}}}
+```
+
+`table`, index `name`, column `name`/`dataType`, rename `from`/`to`, and
+exactly one alter action are required where shown. `columns` and `primaryKey`
+default to empty lists and each accepts at most 1600 entries; core validates
+their meaning. Native table creation requires a primary key and returns
+`NATIVE_ERROR_CLASS_BIND` without one; SQL can create a heap table without a
+primary key. `notNull` and `cascade` default to false. Unknown fields, duplicate
+keys, nulls and multiple request/action alternatives are rejected.
+The exact, case-sensitive `dataType` names are `Boolean`, `SmallInt`, `Integer`,
+`BigInt`, `Text`, `Bytes`, `Numeric`, `Real`, `DoublePrecision`, `Date`, `Time`,
+`TimeTz`, `Timestamp`, `TimestampTz`, `Interval`, `Varchar`, `Bpchar`, `Uuid`,
+`Jsonb`, `IntArray`, `BigIntArray` and `TextArray`; SQL type spellings and
+parameterized type declarations are not accepted here.
+
+Successful replies use `code: "ok"` and `catalogOutcome` (protobuf field 11):
+`catalogEpoch` is an unsigned 64-bit decimal string, `table` is the canonical
+schema-qualified table name (the new name after rename), `columns` contains
+logical columns in table order with `name`, `dataType` and `notNull`, and
+`primaryKey` contains logical key column names. Hidden row IDs are omitted.
+`indexId`, an unsigned 64-bit decimal string, is present for index
+creation/deletion. Drop outcomes
+describe the removed table or the index's owning table.
+
+Catalog changes execute synchronously in the retained session. Outside an open
+transaction, each successful DDL request commits automatically. Native and SQL
+DDL share transaction visibility and rollback, including native savepoints.
+Unqualified names use the retained `search_path`; creation uses its creation
+schema. The legacy engine returns `NATIVE_ERROR_CLASS_PLAN_REQUIRED` (tag 18)
+on a populated database, where SQL DDL can succeed.
+Malformed requests return HTTP 400 / gRPC INVALID_ARGUMENT; execution failures
+use the existing native error mapping above, including `NATIVE_ERROR_CLASS_SQL`
+with preserved SQLSTATEs, and abort an open transaction. An aborted transaction
+requires rollback or rollback-to-savepoint recovery before further DDL.
+
+Authorization follows SQL DDL rules: Application and Task roles cannot perform
+any of the five catalog operations. Database roles need schema CREATE, schema
+ownership or superuser for CREATE TABLE and CREATE INDEX, and table ownership
+(or superuser) for ALTER/DROP TABLE and DROP INDEX. Table grants alone do not
+authorize DDL. CREATE INDEX follows GigglesDB SQL's schema CREATE rule even on
+another role's table; PostgreSQL 18.6 instead requires table ownership. After
+the session binding and role gate, authorization precedes validation, column
+binding and classification (E939), so an unauthorized request with a missing
+column returns `42501`. Unauthorized DROP/ALTER TABLE and CREATE/DROP INDEX
+also return `42501` for missing objects, where PostgreSQL 18.6 returns `42P01`
+(relations) or `42704` (DROP INDEX). A missing creation schema returns `3F000`.
+Live privilege revocation is checked on each request, and a denied request
+inside BEGIN aborts the transaction (subsequent requests return `25P02`).

@@ -2098,6 +2098,21 @@ impl SqlSession {
         self.resolve_relation_reference(&crate::operations::native_relation_key(name))
     }
 
+    /// Resolve the schema selected for a native CREATE TABLE request.
+    pub fn native_creation_schema(&self, table: &str) -> Result<String, CoreError> {
+        let key = self.native_creation_key_engine(&crate::operations::native_relation_key(table))?;
+        Ok(relational::split_key(&key).0.to_owned())
+    }
+
+    /// Resolve a native index to its owning table's internal relation key.
+    pub fn native_index_table(&self, name: &str) -> Result<Option<String>, CoreError> {
+        let name = crate::operations::native_relation_key(name);
+        self.inspect_metadata(|s| {
+            let key = s.sql.resolve_index_key(&name, &self.search_path);
+            Ok(s.sql.index_table_key(&key))
+        })
+    }
+
     pub fn resolve_relation_reference(&self, name: &str) -> Result<String, CoreError> {
         let resolve = |s: &MetadataState<'_>| Ok(s.sql.resolve_relation_key(name, &self.search_path));
         match &self.staged {

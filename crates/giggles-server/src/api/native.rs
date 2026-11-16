@@ -5,6 +5,7 @@ use giggles_core::{CoreError, Error, operations as ops, relational::SqlError};
 
 pub(crate) enum NativeResult {
     Control,
+    Catalog(ops::CatalogOutcome, String),
     Sql(giggles_core::relational::SqlResult),
     Operation(ops::Outcome),
     Transaction(ops::TransactionOutcome),
@@ -104,12 +105,51 @@ fn table_requirements(
     Err(CoreError::Limit)
 }
 
+fn catalog_table(session: &Session, request: &ops::CatalogRequest) -> String {
+    use ops::CatalogRequest as C;
+    // Resolution precedes execution; execution owns validation and native error mapping.
+    let key = match request {
+        C::CreateTable { table, .. } => {
+            let schema = session.sql.native_creation_schema(table).unwrap_or_default();
+            let name = table.split_once('.').map_or(table.as_str(), |(_, name)| name);
+            return format!("{schema}.{name}");
+        }
+        C::DropIndex { name, .. } => session.sql.native_index_table(name).ok().flatten().unwrap_or_default(),
+        C::CreateIndex { table, .. } | C::DropTable { table, .. } | C::AlterTable { table, .. }
+        | C::AddConstraint { table, .. } | C::DropConstraint { table, .. } =>
+            session.sql.native_relation_reference(table).unwrap_or_default(),
+        C::CreateView { name, .. } | C::DropView { name, .. }
+        | C::CreateSequence { name } | C::DropSequence { name, .. } =>
+            session.sql.native_relation_reference(name).unwrap_or_default(),
+    };
+    let (schema, name) = key.split_once('\0').unwrap_or(("public", &key));
+    let name = match request {
+        C::AlterTable { action: ops::AlterTableAction::RenameTable { to }, .. } => to,
+        _ => name,
+    };
+    format!("{schema}.{name}")
+}
+
 pub(crate) fn run(
     session: &mut Session,
     invocation: Invocation,
 ) -> Result<NativeResult, CoreError> {
     let result = (|| {
         session.check_binding()?;
+        if let Invocation::Catalog(request) = &invocation {
+            return session.authority_scope(|session| {
+                session.authorize_native_catalog(request)?;
+                if session.is_aborted() { return Err(CoreError::Sql(SqlError::Aborted)); }
+                let table = catalog_table(session, request);
+                match session.execute_native_catalog(request)? {
+                    Ok(outcome) => Ok(NativeResult::Catalog(outcome, table)),
+                    Err(error) => {
+                        if error != ops::Error::Unknown { giggles_core::cancellation::check()?; }
+                        Ok(NativeResult::Error(error))
+                    }
+                }
+            });
+        }
         // Collect every target before resolution, authorization, or execution.
         let mut reqs = Vec::new();
         match &invocation {
@@ -127,7 +167,7 @@ pub(crate) fn run(
                     }
                 }
             }
-            Invocation::SearchPath(_) | Invocation::Begin | Invocation::Commit | Invocation::Rollback
+            Invocation::Catalog(_) | Invocation::SearchPath(_) | Invocation::Begin | Invocation::Commit | Invocation::Rollback
             | Invocation::Savepoint(_) | Invocation::RollbackTo(_) | Invocation::Release(_) => {}
             Invocation::Legacy(_) | Invocation::Text { .. } => return Err(CoreError::Unsupported),
         }
@@ -153,6 +193,7 @@ pub(crate) fn run(
             return Err(CoreError::Sql(SqlError::Aborted));
         }
         let result = match invocation {
+            Invocation::Catalog(_) => unreachable!(),
             Invocation::SearchPath(schemas) => {
                 if let Some(schemas) = schemas {
                     let path = schemas.iter().map(|s| format!("\"{}\"", s.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
