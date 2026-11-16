@@ -34,7 +34,7 @@ use tokio_postgres::Client;
 use crate::{
     MigrationDefinition,
     coordinator::chunk::ChunkPlan,
-    definition::{Connection, Engine, ObjectKind},
+    definition::{Connection, Engine, GigglesdbDeployment, ObjectKind},
     pg::{catalog, preflight, source, tls},
     security::{self, Redactor},
 };
@@ -89,7 +89,25 @@ impl Drop for Driver {
 }
 
 fn config(connection: &Connection, redactor: &mut Redactor) -> Result<tls::Config, Failure> {
-    if connection.engine != Engine::Postgresql {
+    if connection.engine == Engine::Gigglesdb {
+        let message = match connection.gigglesdb.as_ref().map(|e| e.deployment) {
+            Some(GigglesdbDeployment::Server) => None,
+            Some(GigglesdbDeployment::Embedded) => {
+                Some("Embedded GigglesDB runner lands with GD-0065 N6")
+            }
+            Some(GigglesdbDeployment::Distributed) => {
+                Some("Distributed GigglesDB is out of scope (GD-0065 Q3)")
+            }
+            None => Some("GigglesDB endpoint block missing"),
+        };
+        if let Some(message) = message {
+            return Err(failure(
+                FailureKind::Blocked,
+                message,
+                "Select a GigglesDB server destination.",
+            ));
+        }
+    } else if connection.engine != Engine::Postgresql {
         return Err(failure(
             FailureKind::Blocked,
             "Runner preparation requires PostgreSQL endpoints",
@@ -214,11 +232,57 @@ struct Prepared {
     tables: Vec<catalog::TableCatalog>,
 }
 
+fn check_direction(source: &Connection, destination: &Connection) -> Result<(), Failure> {
+    if source.engine == Engine::Gigglesdb {
+        return Err(failure(
+            FailureKind::Blocked,
+            "GigglesDB source needs GD-0077 capture",
+            "Select a PostgreSQL source.",
+        ));
+    }
+    if source.engine == Engine::Postgresql
+        && destination.engine == Engine::Gigglesdb
+        && destination
+            .gigglesdb
+            .as_ref()
+            .is_some_and(|e| e.deployment == GigglesdbDeployment::Server && !e.accept_forward_only)
+    {
+        return Err(failure(
+            FailureKind::Blocked,
+            "GigglesDB destination has no rollback",
+            "set destination.gigglesdb.accept_forward_only after accepting that no rollback exists",
+        ));
+    }
+    Ok(())
+}
+
 async fn prepare(definition: &MigrationDefinition) -> Result<Prepared, Failure> {
+    check_direction(&definition.source, &definition.destination)?;
     let mut redactor = Redactor::default();
     let source_config = config(&definition.source, &mut redactor)?;
     let destination_config = config(&definition.destination, &mut redactor)?;
     let operation = async {
+        if definition.destination.engine == Engine::Gigglesdb {
+            let items = crate::gigglesdb::preflight::check(
+                &definition.destination,
+                &definition.selected_objects,
+                &destination_config,
+            )
+            .await
+            .map_err(|_| infrastructure())?;
+            if let Some(item) = items.iter().find(|item| {
+                !matches!(
+                    item.status,
+                    crate::ItemStatus::Supported | crate::ItemStatus::SupportedWithTransformation
+                )
+            }) {
+                return Err(failure(
+                    FailureKind::Blocked,
+                    &format!("GigglesDB preflight blocked: {}", item.id),
+                    &item.remediation,
+                ));
+            }
+        }
         let mut source = Box::pin(session(&source_config, &definition.source)).await?;
         let mut destination =
             Box::pin(session(&destination_config, &definition.destination)).await?;
@@ -299,6 +363,15 @@ async fn prepare(definition: &MigrationDefinition) -> Result<Prepared, Failure> 
             )
             .map_err(blocker)?;
             for table in qualified {
+                if definition.destination.engine == Engine::Gigglesdb {
+                    crate::gigglesdb::engine::check_types(&table.destination).map_err(|_| {
+                        failure(
+                            FailureKind::Blocked,
+                            "Unqualified GigglesDB value mapping",
+                            "Select column types qualified by GigglesdbMapping.",
+                        )
+                    })?;
+                }
                 // This temporary unbounded plan qualifies the key's typed order
                 // support only. It is never saved or treated as a copy plan or
                 // source-lineage observation.
@@ -618,4 +691,61 @@ async fn assess_mysql_endpoints(
         }
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn connection(engine: &str, deployment: &str) -> Connection {
+        let mut value = json!({"engine": engine, "version": "18", "tls": "disable-for-local-test"});
+        if engine == "gigglesdb" {
+            value["gigglesdb"] = json!({"deployment": deployment, "accept_forward_only": true});
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn pg_and_gigglesdb_server_share_pgwire_config() {
+        let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task test root"));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("n5a-pgwire-config");
+        std::fs::write(&path, "host=localhost port=5432 user=test dbname=test").unwrap();
+        let mut pg = connection("postgresql", "server");
+        let mut gd = connection("gigglesdb", "server");
+        let reference = serde_json::from_value(json!(format!("file:{}", path.display()))).unwrap();
+        pg.connection_ref = Some(reference);
+        gd.connection_ref = pg.connection_ref.clone();
+        assert!(check_direction(&pg, &pg).is_ok());
+        assert!(check_direction(&pg, &gd).is_ok());
+        for connection in [&pg, &gd] {
+            let config = config(connection, &mut Redactor::default()).unwrap();
+            assert_eq!(config.postgres.get_user(), Some("test"));
+            assert_eq!(
+                config.postgres.get_connect_timeout(),
+                Some(&Duration::from_secs(3))
+            );
+        }
+        gd.gigglesdb.as_mut().unwrap().accept_forward_only = false;
+        let refused = check_direction(&pg, &gd).unwrap_err();
+        assert!(refused.next_step.contains("accept_forward_only"));
+        let refused = check_direction(&gd, &pg).unwrap_err();
+        assert!(refused.what.contains("needs GD-0077 capture"));
+    }
+
+    #[test]
+    fn config_refuses_unavailable_deployments_and_engines() {
+        for (deployment, reason) in [
+            ("embedded", "lands with GD-0065 N6"),
+            ("distributed", "out of scope"),
+        ] {
+            let result = config(
+                &connection("gigglesdb", deployment),
+                &mut Redactor::default(),
+            );
+            assert!(result.err().unwrap().what.contains(reason));
+        }
+        assert!(config(&connection("mysql", "server"), &mut Redactor::default()).is_err());
+    }
 }

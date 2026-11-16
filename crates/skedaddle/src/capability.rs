@@ -298,12 +298,26 @@ impl CapabilityReport {
             (definition.source.engine, definition.destination.engine),
             (Engine::Postgresql, Engine::Gigglesdb) | (Engine::Gigglesdb, Engine::Postgresql)
         ) {
+            let accepted = definition.source.engine == Engine::Postgresql
+                && definition
+                    .destination
+                    .gigglesdb
+                    .as_ref()
+                    .is_some_and(|e| e.accept_forward_only);
             items.push(item(
                 "rollback.gigglesdb",
                 ItemStatus::Unsupported,
-                Criticality::Critical,
-                "forward-only until GD-0077 capture ships; rollback requires the GigglesDB source connector",
-                "The PostgreSQL/GigglesDB pair has no qualified reverse connector.".to_owned(),
+                if accepted { Criticality::Advisory } else { Criticality::Critical },
+                if accepted {
+                    "forward-only until GD-0077 capture ships; rollback requires the GigglesDB source connector"
+                } else {
+                    "set destination.gigglesdb.accept_forward_only after accepting that no rollback exists"
+                },
+                if accepted {
+                    "operator accepted forward-only (no rollback) for PostgreSQL -> GigglesDB"
+                } else {
+                    "The PostgreSQL/GigglesDB pair has no qualified reverse connector."
+                }.to_owned(),
             ));
         }
         // These legacy claims apply only to a PostgreSQL-to-PostgreSQL migration.

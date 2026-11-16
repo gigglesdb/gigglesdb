@@ -718,7 +718,7 @@ fn gigglesdb_capability_gates_are_separate_critical_and_never_supported() {
                 (
                     "rollback.gigglesdb".to_owned(),
                     ItemStatus::Unsupported,
-                    "forward-only until GD-0077 capture ships; rollback requires the GigglesDB source connector",
+                    "set destination.gigglesdb.accept_forward_only after accepting that no rollback exists",
                 ),
             ];
             expected.push(if side == "destination" {
@@ -771,6 +771,76 @@ fn gigglesdb_capability_gates_are_separate_critical_and_never_supported() {
                         && item.status == ItemStatus::Unsupported)
             );
         }
+    }
+}
+
+#[test]
+fn gigglesdb_forward_only_defaults_preserve_serialization_and_digest() {
+    let mut value = example_value();
+    value["destination"] = gigglesdb_connection("server");
+    let legacy = parse_value(&value).unwrap();
+    let endpoint = legacy.destination.gigglesdb.as_ref().unwrap();
+    assert!(!endpoint.accept_forward_only);
+    value["destination"]["gigglesdb"]["accept_forward_only"] = json!(false);
+    let explicit = parse_value(&value).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&legacy).unwrap(),
+        serde_json::to_vec(&explicit).unwrap()
+    );
+    let digest = legacy.canonical_digest().unwrap();
+    assert_eq!(digest, explicit.canonical_digest().unwrap());
+    let serialized = serde_json::to_value(&explicit).unwrap();
+    assert!(
+        serialized["destination"]["gigglesdb"]
+            .get("accept_forward_only")
+            .is_none()
+    );
+    value["destination"]["gigglesdb"]["accept_forward_only"] = json!(true);
+    let accepted = parse_value(&value).unwrap();
+    assert_ne!(digest, accepted.canonical_digest().unwrap());
+    assert_eq!(
+        serde_json::to_value(&accepted).unwrap()["destination"]["gigglesdb"]["accept_forward_only"],
+        true
+    );
+    value["source"] = value["destination"].clone();
+    assert_validation_at(&value, "source.gigglesdb.accept_forward_only");
+}
+
+#[test]
+fn gigglesdb_forward_only_accepts_only_the_rollback_risk() {
+    for accepted in [false, true] {
+        let mut value = example_value();
+        value["destination"] = gigglesdb_connection("server");
+        value["destination"]["gigglesdb"]["accept_forward_only"] = json!(accepted);
+        let report = CapabilityReport::from_definition(&parse_value(&value).unwrap()).unwrap();
+        let item = |id| report.items.iter().find(|i| i.id == id).unwrap();
+        let rollback = item("rollback.gigglesdb");
+        assert_eq!(rollback.status, ItemStatus::Unsupported);
+        assert_eq!(
+            rollback.criticality,
+            if accepted {
+                Criticality::Advisory
+            } else {
+                Criticality::Critical
+            }
+        );
+        assert_eq!(report.blocking().contains(&rollback), !accepted);
+        if accepted {
+            assert_eq!(
+                rollback.evidence[0].description,
+                "operator accepted forward-only (no rollback) for PostgreSQL -> GigglesDB"
+            );
+        } else {
+            assert_eq!(
+                rollback.remediation,
+                "set destination.gigglesdb.accept_forward_only after accepting that no rollback exists"
+            );
+        }
+        assert_eq!(
+            item("destination.gigglesdb.destination_apply").status,
+            ItemStatus::Unverified
+        );
+        assert!(!report.blocking().is_empty());
     }
 }
 

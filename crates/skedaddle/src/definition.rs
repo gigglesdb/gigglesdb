@@ -133,6 +133,8 @@ pub struct GigglesdbEndpoint {
     pub deployment: GigglesdbDeployment,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_path: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accept_forward_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,6 +563,18 @@ impl MigrationDefinition {
                     &mut errors,
                     &format!("{path}.mysql"),
                     "mysql endpoint block requires the MySQL engine",
+                );
+            }
+            if path == "source"
+                && connection
+                    .gigglesdb
+                    .as_ref()
+                    .is_some_and(|e| e.accept_forward_only)
+            {
+                push_error(
+                    &mut errors,
+                    "source.gigglesdb.accept_forward_only",
+                    "accept_forward_only is meaningful only on the destination",
                 );
             }
             if connection.engine != Engine::Gigglesdb && connection.gigglesdb.is_some() {

@@ -141,6 +141,7 @@ fn definition(version: &str, deployment: GigglesdbDeployment) -> Connection {
         gigglesdb: Some(GigglesdbEndpoint {
             deployment,
             database_path: None,
+            accept_forward_only: false,
         }),
     }
 }

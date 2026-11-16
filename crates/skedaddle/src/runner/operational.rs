@@ -18,6 +18,10 @@ use crate::{
         Reached, StopAt,
     },
     event::{AssembledTxn, EventError, PositionOrder, Row, SourceIdentity},
+    gigglesdb::{
+        apply::GigglesdbExecutor,
+        engine::{DestinationInstaller, RunnerDestination},
+    },
     mapping::Value,
     pg::{
         apply::{
@@ -563,6 +567,7 @@ pub fn run(
             return Err(recovery("resume requires saved slot checkpoint").into());
         }
         let origin = format!("skedaddle_{id}");
+        let gigglesdb = definition.destination.engine == Engine::Gigglesdb;
         let Session {
             client: source_client,
             driver: source_driver,
@@ -572,27 +577,29 @@ pub fn run(
             driver: destination_driver,
         } = prepared.destination;
         let _drivers = (source_driver, destination_driver);
-        coordinator
-            .effect(
-                EffectKind::BufferPublication,
-                format!("runner-origin:{origin}"),
-                |_| async {
-                    if destination_client
-                        .query_opt(
-                            "SELECT 1 FROM pg_replication_origin WHERE roname=$1",
-                            &[&origin],
-                        )
-                        .await?
-                        .is_none()
-                    {
-                        destination_client
-                            .query_one("SELECT pg_replication_origin_create($1)", &[&origin])
-                            .await?;
-                    }
-                    Ok(())
-                },
-            )
-            .await?;
+        if !gigglesdb {
+            coordinator
+                .effect(
+                    EffectKind::BufferPublication,
+                    format!("runner-origin:{origin}"),
+                    |_| async {
+                        if destination_client
+                            .query_opt(
+                                "SELECT 1 FROM pg_replication_origin WHERE roname=$1",
+                                &[&origin],
+                            )
+                            .await?
+                            .is_none()
+                        {
+                            destination_client
+                                .query_one("SELECT pg_replication_origin_create($1)", &[&origin])
+                                .await?;
+                        }
+                        Ok(())
+                    },
+                )
+                .await?;
+        }
         let engine = engine::Engine::new_with_exclusion(coordinator, journal.clone(), exclusion)
             .with_pause_control(PauseControl::new(root.join(format!("{id}.control")))?);
         let readiness =
@@ -623,7 +630,7 @@ pub fn run(
             .await?;
         let publication = format!("skedaddle_{id}");
         let slot = binding.stream.clone();
-        let mut installer = PgInstaller {
+        let installer = PgInstaller {
             schema_tables: engine.runtime().scoped_schema_tables().await?,
             schema_baseline: engine
                 .runtime()
@@ -645,9 +652,13 @@ pub fn run(
                 .collect(),
             checkpoint,
         };
+        let mut installer = DestinationInstaller {
+            pg: installer,
+            gigglesdb,
+        };
         if !resume {
             Box::pin(engine.start(&mut installer)).await?;
-        } else if installer.schema_baseline.is_none() {
+        } else if installer.pg.schema_baseline.is_none() {
             return Err(coordinator::Error::RecoveryRequired("Missing durable scoped schema baseline; quiesce schema changes and restart from a fresh snapshot".into()).into());
         }
         engine
@@ -658,6 +669,7 @@ pub fn run(
             .require_clear()
             .map_err(|e| coordinator::Error::RecoveryRequired(e.to_string()))?;
         let mut checkpoint = installer
+            .pg
             .checkpoint
             .take()
             .ok_or_else(|| recovery("slot checkpoint missing"))?;
@@ -714,7 +726,7 @@ pub fn run(
                 if resume {
                     return Err(recovery("resume table plan missing").into());
                 }
-                let saved = plan(table, &mut installer.source).await?;
+                let saved = plan(table, &mut installer.pg.source).await?;
                 engine.plan(&saved).await?;
                 saved
             };
@@ -808,7 +820,10 @@ pub fn run(
             apply::SourcePositions::new(order.clone(), apply::OriginPolicy::NativePgLsn);
         let plan_positions = positions.clone();
         let planner = move |txn: &AssembledTxn, mseq, state: &Materialized| {
-            apply::plan_transaction_with_ddl(
+            if gigglesdb {
+                crate::gigglesdb::engine::check_values(txn, &tables)?;
+            }
+            let plan = apply::plan_transaction_with_ddl(
                 txn,
                 &tables,
                 &apply::PlanContext {
@@ -828,20 +843,27 @@ pub fn run(
                         .classify(row, &txn.commit_position, state)
                         .map(|s| s.apply_state())
                 },
+            )?;
+            if gigglesdb {
+                crate::gigglesdb::apply::plan_for_gigglesdb(plan)
+            } else {
+                Ok(plan)
+            }
+        };
+        let connector = Connect {
+            config: prepared.destination_config.clone(),
+            connection: definition.destination.clone(),
+            drivers: vec![],
+        };
+        let executor = if gigglesdb {
+            RunnerDestination::Gigglesdb(
+                GigglesdbExecutor::new(connector, stream.clone(), 1000, positions).map_err(recovery)?,
+            )
+        } else {
+            RunnerDestination::Postgresql(
+                Executor::new(connector, stream.clone(), origin, 1000, positions).map_err(recovery)?,
             )
         };
-        let executor = Executor::new(
-            Connect {
-                config: prepared.destination_config.clone(),
-                connection: definition.destination.clone(),
-                drivers: vec![],
-            },
-            stream.clone(),
-            origin,
-            1000,
-            positions,
-        )
-        .map_err(recovery)?;
         let mut reader_config = config;
         reader_config.required_next_mseq = recovered.next_mseq;
         let mut applier = PgApplier::new(
