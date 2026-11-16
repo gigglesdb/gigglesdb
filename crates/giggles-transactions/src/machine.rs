@@ -1,3 +1,4 @@
+use crate::home::HomeRecord;
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -53,10 +54,8 @@ impl CommittedView for NoEvidence {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Home {
     digest: Digest,
-    participants: BTreeSet<Domain>,
-    seal: Option<SealRef>,
-    votes: BTreeMap<Domain, PrepareRef>,
-    decision: Option<DecisionRef>,
+    // Serialized inline: the snapshot bytes are those of the four fields it holds.
+    record: HomeRecord<Domain, PrepareRef, SealRef, DecisionRef>,
 }
 
 /// Terminal records are retained and prevent conflicting retries.
@@ -160,7 +159,7 @@ impl Machine {
     pub fn outcome(&self, transaction: TransactionId) -> Option<&DecisionRef> {
         self.homes
             .get(&transaction)
-            .and_then(|h| h.decision.as_ref())
+            .and_then(|h| h.record.decision())
     }
 
     /// Split/drain guard. Includes unprepared work and queued waiters.
@@ -168,7 +167,7 @@ impl Machine {
         self.participants
             .values()
             .any(|p| matches!(p.phase, Phase::Active | Phase::Prepared))
-            || self.homes.values().any(|h| h.decision.is_none())
+            || self.homes.values().any(|h| h.record.decision.is_none())
     }
 
     /// True only when this transaction currently holds coverage for the entire span.
@@ -247,7 +246,10 @@ impl Machine {
     fn resolution_reserve(&self) -> Result<usize, Error> {
         let mut reserve = 0;
         let mut reply = 256;
-        for h in self.homes.values().filter(|h| h.decision.is_none()) {
+        for h in self.homes.values().map(|h| &h.record) {
+            if h.decision.is_some() {
+                continue;
+            }
             reserve += 256
                 + usize::from(h.seal.is_none()) * 256
                 + (h.participants.len() - h.votes.len()) * 256;
@@ -334,10 +336,7 @@ impl Machine {
                     transaction,
                     Home {
                         digest,
-                        participants: BTreeSet::new(),
-                        seal: None,
-                        votes: BTreeMap::new(),
-                        decision: None,
+                        record: HomeRecord::new(),
                     },
                 );
                 Ok(Response::Applied)
@@ -352,20 +351,14 @@ impl Machine {
                 }
                 let cap = self.limits.participants;
                 let h = self.home_mut(transaction, digest)?;
-                if h.participants.contains(&participant) {
-                    return Ok(Response::Applied);
-                }
-                if h.seal.is_some() || h.decision.is_some() {
-                    return Err(Error::WrongPhase);
-                }
-                // One range cannot appear with two ownership epochs.
-                if h.participants.iter().any(|p| p.range == participant.range) {
-                    return Err(Error::Conflict);
-                }
-                if h.participants.len() >= cap {
-                    return Err(Error::Capacity);
-                }
-                h.participants.insert(participant);
+                h.record.register(participant, cap, |set, new| {
+                    // One range cannot appear with two ownership epochs.
+                    if set.iter().any(|p| p.range == new.range) {
+                        Err(Error::Conflict)
+                    } else {
+                        Ok(())
+                    }
+                })?;
                 Ok(Response::Applied)
             }
             Command::Seal {
@@ -374,46 +367,31 @@ impl Machine {
             } => {
                 let cap = self.limits.encoded_bytes;
                 let h = self.home_mut(transaction, digest)?;
-                if let Some(seal) = &h.seal {
-                    return Ok(Response::Seal(seal.clone()));
-                }
-                if h.decision.is_some() {
-                    return Err(Error::WrongPhase);
-                }
-                if h.participants.is_empty() {
-                    return Err(Error::MissingParticipants);
-                }
-                let seal = SealRef {
-                    transaction,
-                    digest,
-                    index,
-                    participants_digest: participant_digest(&h.participants, cap)?,
-                };
-                h.seal = Some(seal.clone());
-                Ok(Response::Seal(seal))
+                let seal = h.record.seal_with(|participants| {
+                    Ok(SealRef {
+                        transaction,
+                        digest,
+                        index,
+                        participants_digest: participant_digest(participants, cap)?,
+                    })
+                })?;
+                Ok(Response::Seal(seal.clone()))
             }
             Command::RecordPrepare(reference) => {
                 let h = self.home_mut(reference.seal.transaction, reference.seal.digest)?;
-                if h.seal.as_ref() != Some(&reference.seal)
-                    || !h.participants.contains(&reference.participant)
-                {
-                    return Err(Error::Conflict);
-                }
-                if let Some(old) = h.votes.get(&reference.participant) {
-                    return if old == &reference {
-                        Ok(Response::Applied)
-                    } else {
-                        Err(Error::Conflict)
-                    };
-                }
-                if h.decision.is_some() {
-                    return Err(Error::WrongPhase);
-                }
-                let proof = view.prepare(&reference).ok_or(Error::MissingEvidence)?;
-                if proof.reference != reference || reference.index == 0 {
-                    return Err(Error::Conflict);
-                }
-                h.votes.insert(reference.participant, reference);
+                let seal = reference.seal.clone();
+                h.record.vote(
+                    reference.participant,
+                    reference,
+                    |s| *s == seal,
+                    |reference| {
+                        let proof = view.prepare(reference).ok_or(Error::MissingEvidence)?;
+                        if proof.reference != *reference || reference.index == 0 {
+                            return Err(Error::Conflict);
+                        }
+                        Ok(())
+                    },
+                )?;
                 Ok(Response::Applied)
             }
             Command::Decide {
@@ -422,26 +400,13 @@ impl Machine {
                 outcome,
             } => {
                 let h = self.home_mut(transaction, digest)?;
-                if let Some(d) = &h.decision {
-                    return if d.outcome == outcome {
-                        Ok(Response::Decision(d.clone()))
-                    } else {
-                        Err(Error::Conflict)
-                    };
-                }
-                if outcome == Outcome::Commit
-                    && (h.seal.is_none() || h.votes.len() != h.participants.len())
-                {
-                    return Err(Error::MissingParticipants);
-                }
-                let reference = DecisionRef {
+                let decision = h.record.decide(outcome, || DecisionRef {
                     transaction,
                     digest,
                     index,
                     outcome,
-                };
-                h.decision = Some(reference.clone());
-                Ok(Response::Decision(reference))
+                })?;
+                Ok(Response::Decision(decision.clone()))
             }
             Command::Begin(seal) => {
                 self.valid_transaction(seal.transaction)?;
@@ -715,7 +680,7 @@ impl Machine {
 
     /// Mint only after this machine's state and combined effects are durable.
     pub fn seal_evidence(&self, reference: &SealRef) -> Option<SealEvidence> {
-        let h = self.homes.get(&reference.transaction)?;
+        let h = &self.homes.get(&reference.transaction)?.record;
         (h.seal.as_ref() == Some(reference) && h.decision.is_none()).then(|| SealEvidence {
             seal: reference.clone(),
             participants: h.participants.iter().copied().collect(),
@@ -757,7 +722,7 @@ impl Machine {
         )
     }
     pub fn decision_evidence(&self, reference: &DecisionRef) -> Option<DecisionEvidence> {
-        let h = self.homes.get(&reference.transaction)?;
+        let h = &self.homes.get(&reference.transaction)?.record;
         (h.decision.as_ref() == Some(reference)).then(|| DecisionEvidence {
             reference: reference.clone(),
             seal: h.seal.clone(),
@@ -811,7 +776,8 @@ impl Machine {
         {
             return Err(Error::InvalidSnapshot);
         }
-        for (t, h) in &self.homes {
+        for (t, home) in &self.homes {
+            let h = &home.record;
             self.valid_transaction(*t)?;
             if t.home != self.domain || h.participants.len() > self.limits.participants {
                 return Err(Error::Invalid);
@@ -822,7 +788,13 @@ impl Machine {
                 self.limits.participants,
             )?;
             if let Some(s) = &h.seal {
-                validate_seal(s, *t, h.digest, &h.participants, self.limits.encoded_bytes)?;
+                validate_seal(
+                    s,
+                    *t,
+                    home.digest,
+                    &h.participants,
+                    self.limits.encoded_bytes,
+                )?;
                 if s.index > self.applied {
                     return Err(Error::Invalid);
                 }
@@ -840,7 +812,7 @@ impl Machine {
             }
             if let Some(d) = &h.decision
                 && (d.transaction != *t
-                    || d.digest != h.digest
+                    || d.digest != home.digest
                     || d.index == 0
                     || d.index > self.applied
                     || h.seal.as_ref().is_some_and(|s| s.index >= d.index)
@@ -1120,15 +1092,17 @@ mod snapshot_invariants {
             t(1),
             Home {
                 digest: p.seal.digest,
-                participants: BTreeSet::from([domain()]),
-                seal: Some(p.seal),
-                votes: BTreeMap::new(),
-                decision: Some(DecisionRef {
-                    transaction: t(1),
-                    digest: [3; 32],
-                    index: 9,
-                    outcome: Outcome::Commit,
-                }),
+                record: HomeRecord {
+                    participants: BTreeSet::from([domain()]),
+                    seal: Some(p.seal),
+                    votes: BTreeMap::new(),
+                    decision: Some(DecisionRef {
+                        transaction: t(1),
+                        digest: [3; 32],
+                        index: 9,
+                        outcome: Outcome::Commit,
+                    }),
+                },
             },
         );
         rejected(&m);
@@ -1165,5 +1139,51 @@ mod snapshot_invariants {
         p.phase = Phase::Prepared;
         p.prepare_index = Some(11);
         rejected(&m);
+    }
+}
+
+#[cfg(test)]
+mod home_encoding {
+    use super::*;
+    // R5-50a moved Home's four rule fields into HomeRecord. Snapshots must keep
+    // the bytes of the flat layout: digest, participants, seal, votes, decision.
+    #[test]
+    fn home_record_keeps_the_flat_snapshot_layout() {
+        let d = Domain {
+            database: DatabaseId([1; 16]),
+            range: 1,
+            epoch: 1,
+        };
+        let t = TransactionId { home: d, nonce: 1 };
+        let participants = BTreeSet::from([d]);
+        let seal = SealRef {
+            transaction: t,
+            digest: [3; 32],
+            index: 2,
+            participants_digest: participant_digest(&participants, 4096).unwrap(),
+        };
+        let vote = PrepareRef {
+            seal: seal.clone(),
+            participant: d,
+            index: 3,
+        };
+        let decision = DecisionRef {
+            transaction: t,
+            digest: [3; 32],
+            index: 4,
+            outcome: Outcome::Commit,
+        };
+        let votes = BTreeMap::from([(d, vote)]);
+        let home = Home {
+            digest: [3; 32],
+            record: HomeRecord {
+                participants: participants.clone(),
+                seal: Some(seal.clone()),
+                votes: votes.clone(),
+                decision: Some(decision.clone()),
+            },
+        };
+        let flat = ([3u8; 32], participants, Some(seal), votes, Some(decision));
+        assert_eq!(encode(&home, 1 << 20), encode(&flat, 1 << 20));
     }
 }

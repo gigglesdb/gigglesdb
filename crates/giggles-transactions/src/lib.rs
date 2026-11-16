@@ -79,7 +79,9 @@
 //! let forged: Machine = bincode::deserialize(&[]).unwrap();
 //! ```
 
+mod home;
 mod machine;
 mod types;
+pub use home::*;
 pub use machine::*;
 pub use types::*;

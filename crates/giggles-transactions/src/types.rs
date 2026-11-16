@@ -148,7 +148,9 @@ pub struct Lock {
 }
 
 impl Lock {
-    pub(crate) fn conflicts(&self, other: &Self) -> bool {
+    /// True when the two locks cannot be held by different transactions at once:
+    /// at least one is exclusive and their spans overlap.
+    pub fn conflicts(&self, other: &Self) -> bool {
         (self.mode == Mode::Exclusive || other.mode == Mode::Exclusive)
             && self.span.overlaps(&other.span)
     }
