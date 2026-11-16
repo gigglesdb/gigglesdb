@@ -163,6 +163,13 @@ pub(super) struct Decoder {
     wrappers: usize,
 }
 impl Decoder {
+    pub(super) fn search_path(&mut self, v: Json) -> R<p::NativeSearchPathRequest> {
+        let mut f = Object::new(v)?;
+        let set = f.optional("set").map(boolean).transpose()?;
+        let schemas = items(f.optional("schemas"), 64)?.into_iter().map(text).collect::<R<_>>()?;
+        f.finish()?;
+        Ok(p::NativeSearchPathRequest { set, schemas })
+    }
     pub(super) fn typed_read(&mut self, v: Json) -> R<p::NativeTypedRead> {
         let mut f = Object::new(v)?;
         let table = Some(text(f.required("table")?)?);

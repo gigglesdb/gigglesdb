@@ -214,6 +214,13 @@ fn intent_shape(i: &p::NativeIntent) -> R<()> {
 }
 pub(crate) fn validate(input: &p::ExecuteRequest) -> R<()> {
     match input.request.as_ref() {
+        Some(p::execute_request::Request::SearchPath(v)) => {
+            cap(v.schemas.len(), 64)?;
+            if (!v.schemas.is_empty() && v.set != Some(true))
+                || v.schemas.iter().any(|s| s.is_empty() || s.len() > 63 || s.contains('\0')) {
+                return Err(ApiError::InvalidArgument);
+            }
+        }
         Some(p::execute_request::Request::TypedRead(v)) => read_shape(v)?,
         Some(p::execute_request::Request::Operation(v)) => {
             Shape::default().request(need(v.request.as_ref())?, 0)?;

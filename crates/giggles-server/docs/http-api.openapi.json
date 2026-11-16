@@ -1718,7 +1718,8 @@
           "text": {
             "$ref": "#/components/schemas/NativeTextRequest"
           },
-          "typedRead": {"$ref": "#/components/schemas/NativeTypedRead"}
+          "typedRead": {"$ref": "#/components/schemas/NativeTypedRead"},
+          "searchPath": {"$ref": "#/components/schemas/NativeSearchPathRequest"}
         },
         "additionalProperties": false,
         "oneOf": [
@@ -1780,7 +1781,8 @@
           {
             "required": ["text"]
           },
-          {"required": ["typedRead"]}
+          {"required": ["typedRead"]},
+          {"required": ["searchPath"]}
         ],
         "description": "Exactly one request alternative. Duplicate keys, aliases, unknown fields, JSON null, trailing documents and nesting deeper than 128 are rejected by the parser. Raw UTF-8 body limit is 262144 bytes including whitespace. Native request trees are typed directly into the core operation engine; SQL is a separate optional arm. Semantic core failures use nativeError in a successful HTTP 200 reply."
       },
@@ -1950,6 +1952,14 @@
           "request"
         ],
         "x-max-binding-value-bytes": 65536
+      },
+      "NativeSearchPathRequest": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "set": {"type": "boolean"},
+          "schemas": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 63, "description": "At most 63 UTF-8 bytes; no NUL."}}
+        },
+        "description": "Read unless set is true. Nonempty schemas require set=true; true with omitted schemas clears the path."
       },
       "NativeTypedRead": {
         "type": "object", "additionalProperties": false,

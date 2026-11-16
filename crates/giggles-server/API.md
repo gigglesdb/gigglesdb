@@ -96,6 +96,10 @@ Already-started decisions retain their ownership until they finish.
 
 ## Typed operations and atomic blocks
 
+Native operation and text table names accept `schema.table`; bare names use the retained SQL
+session search_path. Authorization checks the resolved SQL table identity for all
+block targets before binding or executing any target.
+
 Send one `operation` with a typed `request` and named `bindings`. For example,
 insert an application row with typed parameters:
 
@@ -450,3 +454,21 @@ inside typedRead for a LEFT JOIN (`left:false` selects INNER JOIN).
 complete=true). Binding/execution failures use nativeError kind SQL with the underlying SQLSTATE.
 Malformed shapes return HTTP 400/gRPC InvalidArgument before leasing the
 session; an execution failure aborts an open transaction.
+
+### Session search_path
+
+Execute accepts `{"searchPath":{}}` to read the retained session path, or
+`{"searchPath":{"set":true,"schemas":["app","public"]}}` to replace it.
+The protobuf oneof field is `search_path = 14` (`NativeSearchPathRequest`).
+Omitted/false `set` reads; nonempty schemas require true. True with no schemas
+clears the path. Names must be nonempty, NUL-free, at most 63 UTF-8 bytes,
+and the list at most 64 entries. Unknown JSON fields are rejected.
+Application and Database sessions may use this operation; Task sessions may not.
+The `ok` reply contains SQL columns `["search_path"]`, one text row, and the
+normal transaction state. The default is `"$user", public`. Simple lowercase
+identifiers display bare; other names are double quoted with doubled quotes;
+empty paths display `""`. Keyword quoting currently differs from PostgreSQL:
+`select` displays bare here, versus `"select"` in PostgreSQL 18.6.
+Native operations, native text 0.18, and SQL reads share the retained path.
+SQL API `SET search_path` currently returns `0A000` (unsupported). Session path changes commit with a successful transaction and restore the prior path
+on rollback. COMMIT in an aborted transaction remains refused with `25P02`; the retained path is restored when ROLLBACK ends the block.

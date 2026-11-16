@@ -719,7 +719,7 @@ fn relation_identifier(s: &str) -> bool {
         identifier(schema) && identifier(name)
     })
 }
-fn native_relation_key(s: &str) -> String {
+pub(crate) fn native_relation_key(s: &str) -> String {
     s.split_once('.').map_or_else(|| s.into(), |(schema, name)| {
         format!("{schema}\0{name}")
     })

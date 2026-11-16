@@ -2093,6 +2093,11 @@ impl SqlSession {
         self.inspect_metadata(|s| s.sql.require_relation_schema(name).map_err(CoreError::Sql))
     }
 
+    /// Resolve a native dotted relation using this session's SQL search path.
+    pub fn native_relation_reference(&self, name: &str) -> Result<String, CoreError> {
+        self.resolve_relation_reference(&crate::operations::native_relation_key(name))
+    }
+
     pub fn resolve_relation_reference(&self, name: &str) -> Result<String, CoreError> {
         let resolve = |s: &MetadataState<'_>| Ok(s.sql.resolve_relation_key(name, &self.search_path));
         match &self.staged {

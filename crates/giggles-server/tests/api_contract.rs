@@ -54,6 +54,7 @@ fn descriptor_publishes_only_the_three_v1_methods() {
             ("rollback", 11),
             ("text", 12),
             ("typed_read", 13),
+            ("search_path", 14),
             ("budget_ms", 20)
         ]
     );

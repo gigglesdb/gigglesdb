@@ -21,6 +21,7 @@ pub enum Invocation {
         bindings: giggles_core::operations::Bindings,
         language_version: giggles_language::LanguageVersion,
     },
+    SearchPath(Option<Vec<String>>),
     Begin,
     Commit,
     Rollback,
@@ -73,6 +74,9 @@ pub fn decode_execute(input: proto::ExecuteRequest) -> Result<DecodedExecute, Ap
     use proto::execute_request::Request as P;
     let input = input.request.ok_or(ApiError::InvalidArgument)?;
     let request = match input {
+        P::SearchPath(v) => return Ok(DecodedExecute {
+            request: Invocation::SearchPath(v.set.filter(|v| *v).map(|_| v.schemas)), budget_ms,
+        }),
         P::TypedRead(v) => return Ok(DecodedExecute {
             request: super::native_codec::typed_read(v)?, budget_ms,
         }),

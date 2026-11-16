@@ -5,6 +5,7 @@ use giggles_core::{CoreError, Error, operations as ops, relational::SqlError};
 
 pub(crate) enum NativeResult {
     Control,
+    Sql(giggles_core::relational::SqlResult),
     Operation(ops::Outcome),
     Transaction(ops::TransactionOutcome),
     Error(ops::Error),
@@ -30,35 +31,6 @@ fn read_outcome(result: Result<giggles_core::relational::SqlResult, CoreError>) 
         matched: result.rows.len(), columns: result.columns, rows: result.rows,
         ..ops::Outcome::default()
     }))
-}
-
-fn authorize_request(
-    request: &ops::Request,
-    tables: &std::collections::BTreeSet<String>,
-) -> Result<(), CoreError> {
-    let mut request = request;
-    for _ in 0..=2 {
-        request = match request {
-            ops::Request::Returning { request, .. } | ops::Request::OnConflict { request, .. } => {
-                request
-            }
-            ops::Request::Read { table, .. }
-            | ops::Request::Insert { table, .. }
-            | ops::Request::Update { table, .. }
-            | ops::Request::Delete { table, .. }
-            | ops::Request::UpdateExpressions { table, .. }
-            | ops::Request::ReadExpressions { table, .. }
-            | ops::Request::InsertExpressions { table, .. }
-            | ops::Request::InsertMany { table, .. } => {
-                return if table != "giggles_join" && tables.contains(table) {
-                    Ok(())
-                } else {
-                    Err(CoreError::Policy(Error::Scope))
-                };
-            }
-        };
-    }
-    Err(CoreError::Limit)
 }
 
 // Collect syntactic reads before binding, at the same step as SQL authorization.
@@ -138,68 +110,65 @@ pub(crate) fn run(
 ) -> Result<NativeResult, CoreError> {
     let result = (|| {
         session.check_binding()?;
-        if matches!(&session.role, Role::Database { .. }) {
-            let mut reqs = Vec::new();
-            match &invocation {
-                Invocation::Read(_) | Invocation::Join(_) => reqs.extend(read_tables(&invocation)
-                    .into_iter().map(|t| (t, giggles_core::roles::TablePrivilege::Select))),
-                Invocation::Operation { request, .. } => reqs.extend(table_requirements(request)?),
-                Invocation::Transaction { transaction, .. } => {
-                    if transaction.steps.len() > ops::MAX_TRANSACTION_ITEMS {
-                        return Err(CoreError::Limit);
-                    }
-                    for step in &transaction.steps {
-                        if let ops::TransactionStep::Execute(request)
-                        | ops::TransactionStep::Let { request, .. } = step
-                        {
-                            reqs.extend(table_requirements(request)?);
-                        }
-                    }
-                }
-                Invocation::Begin | Invocation::Commit | Invocation::Rollback => {}
-                Invocation::Legacy(_) | Invocation::Text { .. } => return Err(CoreError::Unsupported),
-            }
-            session.authorize_table_requirements(&reqs)?;
-        } else {
-        let Role::Application { domain, tables } = &session.role else {
-            return Err(CoreError::Policy(Error::Scope));
-        };
-        // Traverse all targets before consulting any catalog or executing an
-        // earlier block step. Expressions cannot introduce additional tables.
+        // Collect every target before resolution, authorization, or execution.
+        let mut reqs = Vec::new();
         match &invocation {
-            Invocation::Read(_) | Invocation::Join(_) => {
-                for table in read_tables(&invocation) {
-                    if table == "giggles_join" || !tables.contains(&table) {
-                        return Err(CoreError::Policy(Error::Scope));
-                    }
-                }
-            }
-            Invocation::Operation { request, .. } => authorize_request(request, tables)?,
+            Invocation::Read(_) | Invocation::Join(_) => reqs.extend(read_tables(&invocation)
+                .into_iter().map(|t| (t, giggles_core::roles::TablePrivilege::Select))),
+            Invocation::Operation { request, .. } => reqs.extend(table_requirements(request)?),
             Invocation::Transaction { transaction, .. } => {
                 if transaction.steps.len() > ops::MAX_TRANSACTION_ITEMS {
                     return Err(CoreError::Limit);
                 }
                 for step in &transaction.steps {
                     if let ops::TransactionStep::Execute(request)
-                    | ops::TransactionStep::Let { request, .. } = step
-                    {
-                        authorize_request(request, tables)?;
+                    | ops::TransactionStep::Let { request, .. } = step {
+                        reqs.extend(table_requirements(request)?);
                     }
                 }
             }
-            Invocation::Begin | Invocation::Commit | Invocation::Rollback => {}
+            Invocation::SearchPath(_) | Invocation::Begin | Invocation::Commit | Invocation::Rollback => {}
             Invocation::Legacy(_) | Invocation::Text { .. } => return Err(CoreError::Unsupported),
         }
-        if session.service.admin.authority_metadata()?.0.to_string() != *domain {
-            return Err(CoreError::Policy(Error::Authentication));
+        let reserved = reqs.iter().any(|(table, _)| table == "giggles_join");
+        for (table, _) in &mut reqs {
+            // Failed resolution must not disclose binding errors before authority.
+            *table = session.sql.native_relation_reference(table).unwrap_or_else(|_| table.clone());
         }
+        if matches!(&session.role, Role::Database { .. }) {
+            session.authorize_table_requirements(&reqs)?;
+        } else {
+            let Role::Application { domain, tables } = &session.role else {
+                return Err(CoreError::Policy(Error::Scope));
+            };
+            if reserved || reqs.iter().any(|(table, _)| table == "giggles_join" || !tables.contains(table)) {
+                return Err(CoreError::Policy(Error::Scope));
+            }
+            if session.service.admin.authority_metadata()?.0.to_string() != *domain {
+                return Err(CoreError::Policy(Error::Authentication));
+            }
         }
         if session.is_aborted() && !matches!(invocation, Invocation::Rollback) {
             return Err(CoreError::Sql(SqlError::Aborted));
         }
         let result = match invocation {
-            Invocation::Read(read) => return read_outcome(session.sql.execute_typed_read(*read, None)),
-            Invocation::Join(read) => return read_outcome(session.sql.execute_typed_join(*read, None)),
+            Invocation::SearchPath(schemas) => {
+                if let Some(schemas) = schemas {
+                    let path = schemas.iter().map(|s| format!("\"{}\"", s.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
+                    session.set_search_path(&path);
+                }
+                return Ok(NativeResult::Sql(giggles_core::relational::SqlResult {
+                    columns: vec!["search_path".into()],
+                    rows: vec![giggles_core::relational::SqlRow { values: vec![giggles_core::relational::Value::Text(session.search_path.clone())], version: 0 }],
+                    affected: 0,
+                }));
+            }
+            Invocation::Read(read) => {
+                return read_outcome(session.sql.execute_typed_read(*read, None));
+            }
+            Invocation::Join(read) => {
+                return read_outcome(session.sql.execute_typed_join(*read, None));
+            }
             Invocation::Operation { request, bindings } => session
                 .sql
                 .execute_native(&request, &bindings)
@@ -348,5 +317,25 @@ mod tests {
         let mut dropped = service.session(&fingerprint).unwrap();
         service.admin.roles().drop("bound").unwrap();
         assert!(matches!(run(&mut dropped, Invocation::Begin), Err(CoreError::Policy(Error::Authentication))));
+        for sql in ["CREATE SCHEMA app", "CREATE TABLE app.t(id BIGINT PRIMARY KEY)",
+            "CREATE TABLE public.t(id BIGINT PRIMARY KEY)"] {
+            service.admin.sql_session().execute(sql, &[], None).unwrap();
+        }
+        service.reload_bindings(vec![Binding { fingerprint: fingerprint.clone(),
+            role: Role::Application { domain: service.admin.authority_metadata().unwrap().0.to_string(),
+                tables: ["app\0t".into()].into_iter().collect() } }]).unwrap();
+        let mut session = service.session(&fingerprint).unwrap();
+        session.sql.set_search_path("app,public", "reader");
+        for table in ["t", "public.t"] {
+            let result = run(&mut session, Invocation::Operation { request: ops::Request::Read {
+                table: table.into(), filter: None, order: vec![], limit: None, projection: vec![]
+            }, bindings: ops::Bindings::new() });
+            if table == "t" {
+                assert!(matches!(result.unwrap(), NativeResult::Operation(_)));
+            } else {
+                assert!(matches!(result, Err(CoreError::Policy(Error::Scope))));
+            }
+        }
+
     }
 }

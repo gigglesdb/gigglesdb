@@ -176,6 +176,7 @@ pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {
     let (kind, value) = root.one()?;
     use proto::execute_request::Request as P;
     let request = match kind.as_str() {
+        "searchPath" => P::SearchPath(super::native_json::Decoder::default().search_path(value)?),
         "typedRead" => P::TypedRead(super::native_json::Decoder::default().typed_read(value)?),
         "text" => P::Text(super::native_json::Decoder::default().native_text_request(value)?),
         "operation" => {

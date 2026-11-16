@@ -357,6 +357,11 @@ fn execute_reply(
         Legacy(Response),
         Native(Result<native::NativeResult, giggles_core::CoreError>),
     }
+    let was_transaction = session.sql.in_transaction();
+    let was_aborted = session.is_aborted();
+    let prior_path = session.search_path.clone();
+    let native_commit = matches!(&request, Invocation::Commit);
+    session.api_path.sql_committed = false;
     let executed = match request {
         Invocation::Legacy(request) => Executed::Legacy(session.handle_received(request, received)),
         request => {
@@ -369,6 +374,18 @@ fn execute_reply(
             Executed::Native(outcome)
         }
     };
+    if !was_transaction && session.sql.in_transaction() {
+        session.api_path.transaction_start = Some(prior_path);
+    } else if was_transaction && !session.sql.in_transaction() {
+        let committed = !was_aborted && match &executed {
+            Executed::Native(Ok(native::NativeResult::Control)) => native_commit,
+            Executed::Legacy(response) => response.code == "ok" && session.api_path.sql_committed,
+            _ => false,
+        };
+        if let Some(path) = session.api_path.transaction_start.take() && !committed {
+            session.set_search_path(if path == "\"\"" { "" } else { &path });
+        }
+    }
     let state = if session.is_aborted() {
         proto::TransactionState::Aborted
     } else if session.in_transaction() {
@@ -387,6 +404,10 @@ fn execute_reply(
             use proto::execute_reply::NativeResult as P;
             reply.native_result = match outcome {
                 native::NativeResult::Control => None,
+                native::NativeResult::Sql(sql) => {
+                    reply.sql = codec::encode_reply(Response { sql: Some(sql), ..Response::code("ok") }, state)?.sql;
+                    None
+                }
                 native::NativeResult::Operation(outcome) => {
                     Some(P::OperationOutcome(native_codec::encode_outcome(outcome)?))
                 }

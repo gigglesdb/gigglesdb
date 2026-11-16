@@ -282,7 +282,7 @@ impl Service {
             .map_err(|_| CoreError::Policy(Error::Authentication))?
             .filter(|role| role.login)
             .ok_or(CoreError::Policy(Error::Authentication))?;
-        Ok(Session {
+        let mut session = Session {
             surface: Surface::Native,
             backend_pid: 0,
             connection_closed: Default::default(),
@@ -304,7 +304,11 @@ impl Service {
             zone: Some(SessionZone::Fixed(0)),
             transaction_us: None,
             sequence_owner_candidates: BTreeSet::new(),
-        })
+            search_path: String::new(),
+            api_path: ApiPathState::default(),
+        };
+        session.set_search_path("\"$user\", \"public\"");
+        Ok(session)
     }
     pub fn session(self: &Arc<Self>, fingerprint: &str) -> Result<Session, CoreError> {
         let (role, epoch) = self
@@ -324,7 +328,7 @@ impl Service {
         } else {
             None
         };
-        Ok(Session {
+        let mut session = Session {
             surface: Surface::Native,
             backend_pid: 0,
             connection_closed: Default::default(),
@@ -346,7 +350,11 @@ impl Service {
             zone: Some(SessionZone::Fixed(0)),
             transaction_us: None,
             sequence_owner_candidates: BTreeSet::new(),
-        })
+            search_path: String::new(),
+            api_path: ApiPathState::default(),
+        };
+        session.set_search_path("\"$user\", \"public\"");
+        Ok(session)
     }
 }
 /// DD-0068 F9: protocol surface of a session. Only pgwire opts into Postgres; every other surface stays Native (E939 42501), fail-closed.
@@ -355,6 +363,11 @@ pub(crate) enum Surface {
     #[default]
     Native,
     Postgres,
+}
+#[derive(Default)]
+pub(crate) struct ApiPathState {
+    pub(crate) transaction_start: Option<String>,
+    pub(crate) sql_committed: bool,
 }
 pub struct Session {
     pub(crate) surface: Surface,
@@ -377,6 +390,8 @@ pub struct Session {
     zone: Option<SessionZone>,
     transaction_us: Option<i64>,
     sequence_owner_candidates: BTreeSet<String>,
+    pub(crate) search_path: String,
+    pub(crate) api_path: ApiPathState,
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -394,6 +409,15 @@ impl Session {
             _ => "giggles",
         };
         self.sql.set_search_path(path, user);
+        let names = relational::schema_search_path(path, "$user");
+        self.search_path = if names.is_empty() { "\"\"".into() } else {
+            names.iter().map(|name| {
+                let mut chars = name.bytes();
+                let bare = chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == b'_')
+                    && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'$');
+                if bare { name.clone() } else { format!("\"{}\"", name.replace('"', "\"\"")) }
+            }).collect::<Vec<_>>().join(", ")
+        };
     }
     pub(crate) fn set_extra_float_digits(&mut self, value: i32) {
         self.sql.set_extra_float_digits(value);
@@ -1708,7 +1732,9 @@ impl Session {
             return result;
         }
         let p = self.prepare(sql)?;
-        self.execute_prepared(&p, params)
+        let result = self.execute_prepared(&p, params);
+        self.api_path.sql_committed = result.is_ok() && p.command() == "COMMIT";
+        result
     }
     fn executor(&self) -> Result<(Executor, (u64, u64)), CoreError> {
         self.check_binding()?;

@@ -32,6 +32,7 @@ message ExecuteRequest {
     RollbackRequest rollback = 11;
     NativeTextRequest text = 12;
     NativeTypedRead typed_read = 13;
+    NativeSearchPathRequest search_path = 14;
   }
   optional uint32 budget_ms = 20;
 }
@@ -42,6 +43,11 @@ message NativeTextRequest {
 }
 
 // Exact identifiers; expressions are typed trees, never SQL fragments.
+message NativeSearchPathRequest {
+  optional bool set = 1;
+  repeated string schemas = 2;
+}
+
 message NativeTypedRead {
   optional string table = 1;
   repeated NativeReadProjection projection = 2;
