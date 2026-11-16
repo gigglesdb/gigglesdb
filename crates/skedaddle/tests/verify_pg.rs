@@ -317,10 +317,17 @@ async fn range_caps_split_without_returning_partial_rows_and_record_source_lsn()
         ))
         .await
         .unwrap();
-    let mut source = f.reader(Side::Source, 3, 57).await;
+    let mut source = f.reader(Side::Source, 3, 57).await.with_source_positions(
+        skedaddle::verify::sql::PgSourcePosition::new("verify-pg-test"),
+    );
     let read = source.read_with_lsn(&f.range(), &projection).await.unwrap();
     assert_eq!(read.rows.len(), 3);
-    assert!(read.lsn > 0);
+    assert!(
+        skedaddle::verify::sql::PgSourcePosition::new("verify-pg-test")
+            .lsn(&read.position)
+            .unwrap()
+            > 0
+    );
     assert!(
         source
             .fetch(

@@ -814,3 +814,16 @@ impl VerificationState {
             && self.reverse.is_none()
     }
 }
+
+/// The durable v1 report only accepts PostgreSQL source boundaries. Native
+/// reports require a future explicit version; never reinterpret native bytes.
+pub fn pg_report_lsn(
+    source_engine: &str,
+    position: &crate::event::Position,
+    pg: &crate::verify::sql::PgSourcePosition,
+) -> crate::verify::Result<u64> {
+    if source_engine != "postgres" {
+        return Err(crate::verify::VerifyError::NonPgVerificationReportUnsupported);
+    }
+    pg.lsn(position)
+}

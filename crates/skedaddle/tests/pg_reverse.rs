@@ -195,8 +195,24 @@ fn configuration_rejects_internal_tables_and_unsafe_ids() {
         .is_err()
     );
     assert!(Config::new("ok", 150000, vec![("public".into(), "t".into())]).is_err());
-    assert_eq!(config().apply_context(3).origin, "skedaddle_p11a_rev");
-    assert_eq!(config().apply_context(3).stream, "p11a_rev");
+    assert_eq!(
+        config()
+            .apply_context(
+                3,
+                skedaddle::pg::apply::SourcePositions::native_pg("p11a_rev")
+            )
+            .origin,
+        "skedaddle_p11a_rev"
+    );
+    assert_eq!(
+        config()
+            .apply_context(
+                3,
+                skedaddle::pg::apply::SourcePositions::native_pg("p11a_rev")
+            )
+            .stream,
+        "p11a_rev"
+    );
 }
 
 #[test]

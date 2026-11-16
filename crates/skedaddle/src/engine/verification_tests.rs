@@ -160,7 +160,10 @@ fn malformed_key_and_truncate_cannot_produce_empty_success() {
 #[test]
 fn adapter_binding_rejects_lineage_slot_domain_and_restart() {
     let hub = Hub::default();
-    hub.begin(source(), "pg:1:1:slot".into());
+    hub.begin(
+        source(),
+        Arc::new(crate::pg::apply::NativePgOrder("pg:1:1:slot".into())),
+    );
     let binding = hub.state.lock().unwrap().binding.clone().unwrap();
     for reason in [
         EvidenceInvalidation::LineageChanged,
@@ -173,12 +176,18 @@ fn adapter_binding_rejects_lineage_slot_domain_and_restart() {
             EvidenceInvalidation::SlotChanged => actual.stream = "other".into(),
             _ => {}
         }
-        hub.begin(actual, binding.domain.clone());
+        hub.begin(
+            actual,
+            Arc::new(crate::pg::apply::NativePgOrder(binding.domain.clone())),
+        );
         assert!(
             matches!(hub.state.lock().unwrap().check_binding(&binding), Err(VerifyError::EvidenceInvalidated { reason: r }) if r == reason)
         );
     }
-    hub.begin(source(), "different-domain".into());
+    hub.begin(
+        source(),
+        Arc::new(crate::pg::apply::NativePgOrder("different-domain".into())),
+    );
     assert!(matches!(
         hub.state.lock().unwrap().check_binding(&binding),
         Err(VerifyError::EvidenceInvalidated {
@@ -190,7 +199,10 @@ fn adapter_binding_rejects_lineage_slot_domain_and_restart() {
 #[test]
 fn terminal_exit_invalidates_every_observer() {
     let hub = Arc::new(Hub::default());
-    hub.begin(source(), "pg:1:1:slot".into());
+    hub.begin(
+        source(),
+        Arc::new(crate::pg::apply::NativePgOrder("pg:1:1:slot".into())),
+    );
     let token = Uuid::new_v4();
     hub.state
         .lock()
@@ -245,23 +257,26 @@ fn verification_state_is_heap_bounded() {
 #[test]
 fn timed_out_marker_wait_preserves_terminal_and_binding_failure_priority() {
     let hub = Hub::default();
-    hub.begin(source(), "pg:1:1:slot".into());
+    hub.begin(
+        source(),
+        Arc::new(crate::pg::apply::NativePgOrder("pg:1:1:slot".into())),
+    );
     let mut state = hub.state.lock().unwrap();
     let binding = state.binding.clone().unwrap();
     let elapsed = Duration::from_millis(12);
     assert!(
-        matches!(state.applier_timeout(&binding, 99, elapsed), VerifyError::ApplierTimeout { waited_lsn: 99, elapsed: e } if e == elapsed)
+        matches!(state.applier_timeout(&binding, pg_position(99), elapsed), VerifyError::ApplierTimeout { waited_position, elapsed: e } if e == elapsed && waited_position == pg_position(99))
     );
     state.invalidate(EvidenceInvalidation::LineageChanged);
     assert!(matches!(
-        state.applier_timeout(&binding, 99, elapsed),
+        state.applier_timeout(&binding, pg_position(99), elapsed),
         VerifyError::EvidenceInvalidated {
             reason: EvidenceInvalidation::LineageChanged
         }
     ));
     state.terminal = Some(ApplierTerminalCause::ApplyStopped);
     assert!(matches!(
-        state.applier_timeout(&binding, 99, elapsed),
+        state.applier_timeout(&binding, pg_position(99), elapsed),
         VerifyError::ApplierTerminal {
             cause: ApplierTerminalCause::ApplyStopped
         }
@@ -271,7 +286,10 @@ fn timed_out_marker_wait_preserves_terminal_and_binding_failure_priority() {
 #[test]
 fn timed_out_evidence_marker_preserves_gap_overflow_and_disarm() {
     let hub = Hub::default();
-    hub.begin(source(), "pg:1:1:slot".into());
+    hub.begin(
+        source(),
+        Arc::new(crate::pg::apply::NativePgOrder("pg:1:1:slot".into())),
+    );
     let mut state = hub.state.lock().unwrap();
     let binding = state.binding.clone().unwrap();
     let token = Uuid::new_v4();
@@ -280,12 +298,12 @@ fn timed_out_evidence_marker_preserves_gap_overflow_and_disarm() {
     state.arms.insert(token, Box::new(armed));
     let elapsed = Duration::from_millis(12);
     assert!(matches!(
-        state.evidence_timeout(&binding, token, &range, 99, elapsed),
-        VerifyError::ApplierTimeout { waited_lsn: 99, .. }
+        state.evidence_timeout(&binding, token, &range, pg_position(99), elapsed),
+        VerifyError::ApplierTimeout { waited_position, .. } if waited_position == pg_position(99)
     ));
     state.terminal = Some(ApplierTerminalCause::CheckpointRejected);
     assert!(matches!(
-        state.evidence_timeout(&binding, token, &range, 99, elapsed),
+        state.evidence_timeout(&binding, token, &range, pg_position(99), elapsed),
         VerifyError::ApplierTerminal {
             cause: ApplierTerminalCause::CheckpointRejected
         }
@@ -294,7 +312,7 @@ fn timed_out_evidence_marker_preserves_gap_overflow_and_disarm() {
     state.arms.get_mut(&token).unwrap().failure =
         Some(ArmFailure::Overflow(EvidenceLimit::Keys(8)));
     assert!(matches!(
-        state.evidence_timeout(&binding, token, &range, 99, elapsed),
+        state.evidence_timeout(&binding, token, &range, pg_position(99), elapsed),
         VerifyError::EvidenceOverflow {
             limit: EvidenceLimit::Keys(8),
             ..
@@ -302,7 +320,7 @@ fn timed_out_evidence_marker_preserves_gap_overflow_and_disarm() {
     ));
     state.invalidate(EvidenceInvalidation::CaptureGap);
     assert!(matches!(
-        state.evidence_timeout(&binding, token, &range, 99, elapsed),
+        state.evidence_timeout(&binding, token, &range, pg_position(99), elapsed),
         VerifyError::EvidenceInvalidated {
             reason: EvidenceInvalidation::CaptureGap
         }
@@ -310,9 +328,73 @@ fn timed_out_evidence_marker_preserves_gap_overflow_and_disarm() {
     state.invalid = None;
     state.arms.remove(&token);
     assert!(matches!(
-        state.evidence_timeout(&binding, token, &range, 99, elapsed),
+        state.evidence_timeout(&binding, token, &range, pg_position(99), elapsed),
         VerifyError::EvidenceInvalidated {
             reason: EvidenceInvalidation::CaptureGap
         }
     ));
+}
+
+fn pg_position(lsn: u64) -> Position {
+    verify::sql::PgSourcePosition::new("pg:1:1:slot").position(lsn)
+}
+
+#[test]
+fn applied_observations_use_native_order_and_reject_invalid_checkpoints() {
+    struct DecimalOrder;
+    impl crate::event::PositionOrder for DecimalOrder {
+        fn domain(&self) -> &str {
+            "native-decimal"
+        }
+        fn compare(
+            &self,
+            left: &[u8],
+            right: &[u8],
+        ) -> std::result::Result<Ordering, crate::event::EventError> {
+            let parse = |bytes: &[u8]| {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or(crate::event::EventError::InvalidEncoding("native decimal"))
+            };
+            Ok(parse(left)?.cmp(&parse(right)?))
+        }
+    }
+    let hub = Hub::default();
+    let native = |value: &str| Position::new("native-decimal", value.as_bytes());
+    let apply = |position: &Position| {
+        hub.applied(
+            position,
+            &ReaderCheckpoint {
+                next_mseq: 1,
+                last_position: Some(position.clone()),
+                last_record: Some(crate::buffer::format::RecordBoundary {
+                    source: source(),
+                    chunk_rows: false,
+                }),
+                ..ReaderCheckpoint::default()
+            },
+        );
+    };
+    for bad in [
+        native("9"),
+        native("incomparable"),
+        Position::new("wrong-domain", b"11"),
+    ] {
+        hub.begin(source(), Arc::new(DecimalOrder));
+        apply(&native("9"));
+        apply(&native("10"));
+        {
+            let state = hub.state.lock().unwrap();
+            assert_eq!(state.applied, Some(native("10")));
+            assert!(state.terminal.is_none());
+            assert!(state.invalid.is_none());
+        }
+        apply(&bad);
+        let state = hub.state.lock().unwrap();
+        assert!(
+            state.invalid.is_some()
+                || state.terminal == Some(ApplierTerminalCause::CheckpointRejected)
+        );
+    }
 }

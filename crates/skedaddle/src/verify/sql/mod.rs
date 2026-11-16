@@ -14,10 +14,11 @@ use async_trait::async_trait;
 use tokio_postgres::{Client, IsolationLevel, types::ToSql};
 
 use super::{
-    BoundarySource, ChangeEvidence, Key, KeyOrder, Lsn, Projection, RangePlan, Result, Row,
-    RowSource, SourceRead, VerifyError,
+    BoundarySource, ChangeEvidence, Key, KeyOrder, Projection, RangePlan, Result, Row, RowSource,
+    SourceRead, VerifyError,
 };
 use crate::{
+    event::Position,
     mapping::{PgType, Value},
     pg::chunk::{ChunkQuery, TableKey},
 };
@@ -40,8 +41,9 @@ pub struct Column {
 /// evidence must extend through the destination read when `changes` is called.
 #[async_trait]
 pub trait SqlChangeEvidence: Send {
+    fn position_order(&self) -> super::SourcePositionOrder;
     async fn arm(&mut self, range: &RangePlan) -> Result<()>;
-    async fn changes(&mut self, range: &RangePlan, source_lsn: Lsn) -> Result<ChangeEvidence>;
+    async fn changes(&mut self, range: &RangePlan, source_lsn: Position) -> Result<ChangeEvidence>;
 }
 
 pub struct PgRowSource<O> {
@@ -53,6 +55,7 @@ pub struct PgRowSource<O> {
     budget: RangeBudget,
     evidence: Option<Box<dyn SqlChangeEvidence>>,
     transport: crate::pg::tls::TransportEvidence,
+    source_positions: Option<PgSourcePosition>,
 }
 
 impl<O: KeyOrder + Send> PgRowSource<O> {
@@ -94,7 +97,14 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
             budget,
             evidence: None,
             transport,
+            source_positions: None,
         })
+    }
+
+    /// Explicit source lineage for reads made without online evidence.
+    pub fn with_source_positions(mut self, positions: PgSourcePosition) -> Self {
+        self.source_positions = Some(positions);
+        self
     }
 
     pub fn transport_evidence(&self) -> &crate::pg::tls::TransportEvidence {
@@ -102,6 +112,7 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
     }
 
     pub fn with_change_evidence(mut self, evidence: impl SqlChangeEvidence + 'static) -> Self {
+        self.source_positions = Some(PgSourcePosition::new(evidence.position_order().domain()));
         self.evidence = Some(Box::new(evidence));
         self
     }
@@ -117,10 +128,18 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
         if self.side != Side::Source {
             return Err(VerifyError::Invalid("source read on destination"));
         }
-        self.read(range, projection).await
+        let (rows, position) = self.read(range, projection).await?;
+        Ok(SourceRead {
+            rows,
+            position: position.ok_or(VerifyError::Invalid("source position order is not bound"))?,
+        })
     }
 
-    async fn read(&mut self, range: &RangePlan, projection: &Projection) -> Result<SourceRead> {
+    async fn read(
+        &mut self,
+        range: &RangePlan,
+        projection: &Projection,
+    ) -> Result<(Vec<Row>, Option<Position>)> {
         super::compare::validate_range(self, range)?;
         let query = self.key.read_query(range).map_err(chunk_error)?;
         let (select, types) = self.select(projection)?;
@@ -163,6 +182,14 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
         };
         let lsn_text: String = tx.query_one(lsn_sql, &[]).await.map_err(pg_error)?.get(0);
         let lsn = parse_lsn(&lsn_text)?;
+        // Destination 0/0 is a query placeholder, never a source boundary.
+        let position = if self.side == Side::Source {
+            self.source_positions
+                .as_ref()
+                .map(|adapter| adapter.position(lsn))
+        } else {
+            None
+        };
         let bytes = (0..select.len())
             .map(|i| format!("8::numeric + COALESCE(octet_length(\"v{i}\"), 0)"))
             .collect::<Vec<_>>()
@@ -256,7 +283,7 @@ impl<O: KeyOrder + Send> PgRowSource<O> {
             })
             .collect::<Result<_>>()?;
         tx.commit().await.map_err(pg_error)?;
-        Ok(SourceRead { rows, lsn })
+        Ok((rows, position))
     }
 
     fn select(&self, projection: &Projection) -> Result<(Vec<String>, Vec<PgType>)> {
@@ -297,12 +324,18 @@ impl<O: KeyOrder> KeyOrder for PgRowSource<O> {
 #[async_trait]
 impl<O: KeyOrder + Send> RowSource for PgRowSource<O> {
     async fn fetch(&mut self, range: &RangePlan, projection: &Projection) -> Result<Vec<Row>> {
-        Ok(self.read(range, projection).await?.rows)
+        Ok(self.read(range, projection).await?.0)
     }
 }
 
 #[async_trait]
 impl<O: KeyOrder + Send> BoundarySource for PgRowSource<O> {
+    fn position_order(&self) -> super::SourcePositionOrder {
+        self.evidence
+            .as_ref()
+            .expect("read_source requires evidence")
+            .position_order()
+    }
     async fn read_source(
         &mut self,
         range: &RangePlan,
@@ -320,7 +353,7 @@ impl<O: KeyOrder + Send> BoundarySource for PgRowSource<O> {
     async fn changed_since(
         &mut self,
         range: &RangePlan,
-        source_lsn: Lsn,
+        source_lsn: Position,
     ) -> Result<ChangeEvidence> {
         self.evidence
             .as_mut()
@@ -405,7 +438,7 @@ fn parse_count(text: &str) -> Result<u64> {
     text.parse()
         .map_err(|_| VerifyError::Invalid("range size overflow"))
 }
-fn parse_lsn(text: &str) -> Result<Lsn> {
+fn parse_lsn(text: &str) -> Result<u64> {
     let (hi, lo) = text
         .split_once('/')
         .ok_or(VerifyError::Invalid("PostgreSQL LSN"))?;
@@ -416,3 +449,21 @@ fn parse_lsn(text: &str) -> Result<Lsn> {
 
 #[cfg(test)]
 mod tests;
+
+/// Process-local conversion between PostgreSQL WAL LSNs and a bound source domain.
+#[derive(Clone, Debug)]
+pub struct PgSourcePosition(crate::pg::apply::NativePgOrder);
+impl PgSourcePosition {
+    pub fn new(domain: impl Into<String>) -> Self {
+        Self(crate::pg::apply::NativePgOrder(domain.into()))
+    }
+    pub fn position(&self, lsn: u64) -> Position {
+        Position::new(self.0.0.clone(), lsn.to_be_bytes())
+    }
+    pub fn lsn(&self, position: &Position) -> Result<u64> {
+        super::compare_positions(&self.0, position, position)?;
+        Ok(u64::from_be_bytes(
+            position.bytes().try_into().expect("validated PG LSN"),
+        ))
+    }
+}

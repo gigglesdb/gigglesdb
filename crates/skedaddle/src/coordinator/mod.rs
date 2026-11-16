@@ -44,6 +44,7 @@ pub enum Error {
     Json(serde_json::Error),
     Io(std::io::Error),
     Postgres(tokio_postgres::Error),
+    Mysql(crate::mysql::client::MysqlError),
 }
 
 impl fmt::Display for Error {
@@ -97,6 +98,7 @@ impl fmt::Display for Error {
             Self::Json(e) => write!(f, "invalid coordinator JSON: {e}"),
             Self::Io(e) => e.fmt(f),
             Self::Postgres(e) => e.fmt(f),
+            Self::Mysql(e) => e.fmt(f),
         }
     }
 }
@@ -115,6 +117,7 @@ from_error!(object_store::Error, Store);
 from_error!(serde_json::Error, Json);
 from_error!(std::io::Error, Io);
 from_error!(tokio_postgres::Error, Postgres);
+from_error!(crate::mysql::client::MysqlError, Mysql);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

@@ -99,6 +99,7 @@ fn reseal(txn: AssembledTxn) -> AssembledTxn {
 }
 fn context() -> PlanContext {
     PlanContext {
+        positions: SourcePositions::native_pg("pg/source"),
         stream: "forward".into(),
         mseq: 7,
         origin: "skedaddle_test".into(),
@@ -155,7 +156,10 @@ fn configured_internal_ddl_is_noop_with_original_progress_and_digest() {
     assert_eq!(plan.progress.txn, txn.txn);
     assert_eq!(plan.progress.digest, txn.digest);
     assert_eq!(plan.progress.mseq, context().mseq);
-    assert_eq!(plan.progress.lsn, 99);
+    assert_eq!(
+        plan.progress.position,
+        Position::new("pg/source", 99_u64.to_be_bytes())
+    );
     assert_eq!(
         plan.statements[2].parameters[4].bytes(),
         Some(txn.digest.as_slice())
@@ -173,7 +177,7 @@ fn configured_internal_ddl_is_noop_with_original_progress_and_digest() {
             .unwrap();
     assert_eq!(
         reverse
-            .plan_transaction(&txn, &[], 7, |_, _| panic!())
+            .plan_transaction(&txn, &[], 7, context().positions, |_, _| panic!())
             .unwrap()
             .progress
             .digest,
@@ -577,7 +581,10 @@ fn grouped_truncate_has_one_statement_in_source_order_and_preserves_origin() {
             assert!(plan.statements[2].parameters.is_empty());
             assert_eq!(plan.source_origin, txn.source_origin);
             assert_eq!(plan.progress.digest, txn.digest);
-            assert_eq!(plan.progress.lsn, 99);
+            assert_eq!(
+                plan.progress.position,
+                Position::new("pg/source", 99_u64.to_be_bytes())
+            );
             assert_eq!(
                 plan.session_setup.parameters[0].bytes(),
                 Some(context().origin.as_bytes())
@@ -752,10 +759,10 @@ fn ambiguous_commit_decision_table_requires_matching_digest() {
     let mut bad = target.clone();
     bad.digest[0] ^= 1;
     let mut earlier = target.clone();
-    earlier.lsn = 97;
+    earlier.position = Position::new("pg/source", 97_u64.to_be_bytes());
     earlier.txn = TxnId(vec![2]);
     let mut later = target.clone();
-    later.lsn = 100;
+    later.position = Position::new("pg/source", 100_u64.to_be_bytes());
     later.txn = TxnId(vec![3]);
     for n in [0, 1, 98, 99, 100, 200] {
         assert_eq!(
@@ -848,7 +855,7 @@ fn equal_h_pair() -> (Progress, Progress) {
         stream: "wal".into(),
         mseq: 1,
         txn: TxnId(vec![1]),
-        lsn: 20,
+        position: Position::new("pg/source", 20_u64.to_be_bytes()),
         digest: [1; 32],
         evidence: None,
     };
@@ -862,7 +869,7 @@ fn equal_h_pair() -> (Progress, Progress) {
         stream: "wal".into(),
         mseq: 2,
         txn: TxnId(vec![2]),
-        lsn: 20,
+        position: Position::new("pg/source", 20_u64.to_be_bytes()),
         digest: [2; 32],
         evidence: None,
     };
@@ -953,7 +960,7 @@ fn equal_h_invalid_ties_missing_predecessor_and_evidence_fail_closed() {
             Err(ApplyError::InconsistentProgress)
         );
         let mut earlier = h.clone();
-        earlier.lsn -= 1;
+        earlier.position = Position::new("pg/source", 19_u64.to_be_bytes());
         earlier.evidence = Some(RecordEvidence::new(
             RecordKind::Transaction,
             [11; 32],
@@ -1022,10 +1029,196 @@ fn equal_h_verified_proof_cannot_be_reused_with_changed_identity_or_digest() {
             match field {
                 0 => target.digest[0] ^= 1,
                 1 => target.txn.0.push(3),
-                2 => target.lsn += 1,
+                2 => target.position = Position::new("pg/source", 21_u64.to_be_bytes()),
                 _ => target.mseq += 1,
             }
             assert!(resolve_commit(&target, Some(&h), origin, None).is_err());
         }
     }
+}
+
+fn resolve_commit(
+    target: &Progress,
+    latest: Option<&Progress>,
+    origin: u64,
+    receipt: Option<&Progress>,
+) -> Result<CommitDecision> {
+    super::resolve_commit(&context().positions, target, latest, origin, receipt)
+}
+
+#[test]
+fn native_pg_rejects_foreign_domain_before_planning_sql() {
+    let mut txn = transaction(EventKind::Delete, None);
+    txn.commit_position = Position::new("foreign", 99_u64.to_be_bytes());
+    txn.events[0].position = txn.commit_position.clone();
+    let txn = reseal(txn);
+    assert!(matches!(
+        plan_transaction(&txn, &[table()], &context(), |_, _| panic!(
+            "must reject before classification or SQL"
+        )),
+        Err(ApplyError::Position(EventError::PositionDomainMismatch))
+    ));
+    let mut progress = plan(&transaction(EventKind::Delete, None), RangeState::Copying).progress;
+    progress.position = txn.commit_position;
+    assert_eq!(
+        super::resolve_commit(&context().positions, &progress, None, 0, None),
+        Err(ApplyError::Position(EventError::PositionDomainMismatch))
+    );
+}
+
+// A variable-length decimal source cursor deliberately differs from byte order.
+struct DecimalOrder;
+impl PositionOrder for DecimalOrder {
+    fn domain(&self) -> &str {
+        "decimal"
+    }
+    fn compare(&self, a: &[u8], b: &[u8]) -> std::result::Result<Ordering, EventError> {
+        let parse = |v| {
+            std::str::from_utf8(v)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or(EventError::InvalidEncoding("decimal"))
+        };
+        Ok(parse(a)?.cmp(&parse(b)?))
+    }
+}
+fn opaque_positions() -> SourcePositions {
+    SourcePositions::new(Arc::new(DecimalOrder), OriginPolicy::Opaque)
+}
+#[test]
+fn opaque_planning_has_session_tag_without_xact_setup_or_timestamp_conversion() {
+    for time in [None, Some(i64::MIN)] {
+        let mut txn = transaction(EventKind::Delete, None);
+        txn.commit_position = Position::new("decimal", b"1000");
+        txn.events[0].position = txn.commit_position.clone();
+        txn.commit_time = time;
+        let txn = reseal(txn);
+        let canonical = txn.canonical_bytes().unwrap();
+        let mut context = context();
+        context.positions = opaque_positions();
+        let plan =
+            plan_transaction(&txn, &[table()], &context, |_, _| Ok(RangeState::Copying)).unwrap();
+        assert!(plan.session_setup.sql.contains("origin_session_setup"));
+        assert!(
+            plan.statements
+                .iter()
+                .all(|s| !s.sql.contains("xact_setup") && !s.sql.contains("origin_progress"))
+        );
+        assert!(
+            plan.statements
+                .last()
+                .unwrap()
+                .sql
+                .contains("apply_progress_v3")
+        );
+        assert_eq!(plan.progress.position, txn.commit_position);
+        assert_eq!(
+            AssembledTxn::from_canonical_bytes(&canonical)
+                .unwrap()
+                .commit_time,
+            time
+        );
+    }
+}
+#[test]
+fn opaque_recovery_uses_bound_order_and_exact_receipts_without_native_high_water() {
+    let positions = opaque_positions();
+    let mut earlier = plan(&transaction(EventKind::Delete, None), RangeState::Copying).progress;
+    earlier.position = Position::new("decimal", b"9");
+    earlier.mseq = 1;
+    let mut later = earlier.clone();
+    later.position = Position::new("decimal", b"1000");
+    later.mseq = 2;
+    assert!(earlier.position.bytes() > later.position.bytes());
+    for native in [0, u64::MAX] {
+        assert_eq!(
+            super::resolve_commit(&positions, &earlier, None, native, None),
+            Ok(CommitDecision::NotApplied)
+        );
+        assert_eq!(
+            super::resolve_commit(&positions, &later, Some(&earlier), native, None),
+            Ok(CommitDecision::NotApplied)
+        );
+        assert_eq!(
+            super::resolve_commit(&positions, &earlier, Some(&earlier), native, None),
+            Ok(CommitDecision::Applied)
+        );
+        assert_eq!(
+            super::resolve_commit(&positions, &earlier, Some(&later), native, None),
+            Err(ApplyError::MissingDigestEvidence)
+        );
+        assert_eq!(
+            super::resolve_commit(&positions, &earlier, Some(&later), native, Some(&earlier)),
+            Ok(CommitDecision::Applied)
+        );
+        let mut conflict = earlier.clone();
+        conflict.digest[0] ^= 1;
+        assert_eq!(
+            super::resolve_commit(&positions, &earlier, Some(&later), native, Some(&conflict)),
+            Err(ApplyError::DigestMismatch)
+        );
+    }
+    let mut equal_but_different = later.clone();
+    equal_but_different.position = Position::new("decimal", b"01000");
+    assert_eq!(
+        super::resolve_commit(&positions, &later, Some(&equal_but_different), 0, None),
+        Err(ApplyError::InconsistentProgress)
+    );
+    let mut wrong = earlier.clone();
+    wrong.position = Position::new("wrong", b"9");
+    assert_eq!(
+        super::resolve_commit(&positions, &wrong, None, 0, None),
+        Err(ApplyError::Position(EventError::PositionDomainMismatch))
+    );
+    let mut txn = transaction(EventKind::Delete, None);
+    txn.commit_position = wrong.position.clone();
+    txn.events[0].position = wrong.position;
+    let txn = reseal(txn);
+    let mut context = context();
+    context.positions = positions;
+    assert!(matches!(
+        plan_transaction(&txn, &[table()], &context, |_, _| panic!(
+            "wrong domain before classification"
+        )),
+        Err(ApplyError::Position(EventError::PositionDomainMismatch))
+    ));
+}
+#[test]
+fn opaque_equal_h_preserves_authenticated_pair_truth_table() {
+    let positions = opaque_positions();
+    let (mut h, mut rows) = equal_h_pair();
+    h.position = Position::new("decimal", b"1000");
+    rows.position = h.position.clone();
+    for p in [&mut h, &mut rows] {
+        let e = p.evidence.take().unwrap();
+        p.evidence = Some(RecordEvidence::new(
+            e.kind,
+            e.manifest_digest,
+            e.previous_manifest_digest,
+            p,
+        ));
+    }
+    assert_eq!(
+        super::resolve_commit(&positions, &rows, Some(&h), 0, None),
+        Ok(CommitDecision::NotApplied)
+    );
+    assert_eq!(
+        super::resolve_commit(&positions, &h, Some(&rows), 0, Some(&h)),
+        Ok(CommitDecision::Applied)
+    );
+    assert_eq!(
+        super::resolve_commit(&positions, &h, Some(&rows), 0, None),
+        Err(ApplyError::MissingDigestEvidence)
+    );
+    let mut conflict = rows.clone();
+    conflict.digest[0] ^= 1;
+    conflict.evidence = None;
+    assert_eq!(
+        super::resolve_commit(&positions, &rows, Some(&rows), 0, Some(&conflict)),
+        Err(ApplyError::DigestMismatch)
+    );
+    assert_eq!(
+        super::resolve_commit(&positions, &rows, None, 0, None),
+        Err(ApplyError::InconsistentProgress)
+    );
 }

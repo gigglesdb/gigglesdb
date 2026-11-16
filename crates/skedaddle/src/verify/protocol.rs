@@ -8,19 +8,18 @@ use super::{
     compare::{compare_key, compare_with_changes, validate_range},
 };
 
-/// PostgreSQL WAL byte position in the single source lineage bound to a session.
-/// Adapters must bind the source, applier and evidence to that same lineage.
-pub type Lsn = u64;
+use super::{SourcePositionOrder, compare_positions};
+use crate::event::Position;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceRead {
     pub rows: Vec<Row>,
-    pub lsn: Lsn,
+    pub position: Position,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeEvidence {
-    pub through_lsn: Lsn,
+    pub through_position: Position,
     /// Complete, strictly key-ordered set, including inserts, deletes, key
     /// changes (old AND new key), and changes later reverted to the old value.
     pub keys: Vec<Key>,
@@ -28,6 +27,8 @@ pub struct ChangeEvidence {
 
 #[async_trait]
 pub trait BoundarySource: RowSource {
+    /// The authenticated stream order, bound for the lifetime of this session.
+    fn position_order(&self) -> SourcePositionOrder;
     /// Read a consistent source range and record its source LSN. The adapter
     /// must ensure every change not visible to this snapshot is included by
     /// changed_since, including transactions in flight at snapshot creation.
@@ -41,28 +42,31 @@ pub trait BoundarySource: RowSource {
     /// Called AFTER the destination read completes. Evidence must cover the
     /// entire source-read/destination-read interval, not merely the wait target.
     /// Missing evidence is an error, never an empty set or a count heuristic.
-    async fn changed_since(&mut self, range: &RangePlan, source_lsn: Lsn)
-    -> Result<ChangeEvidence>;
+    async fn changed_since(
+        &mut self,
+        range: &RangePlan,
+        source_position: Position,
+    ) -> Result<ChangeEvidence>;
 }
 
 #[async_trait]
 pub trait Applier: Send {
     /// Wait using applied source positions, not a destination WAL position.
     /// May return an error/timeout; a below-target return is rejected as well.
-    async fn wait_until(&mut self, source_lsn: Lsn) -> Result<Lsn>;
+    async fn wait_until(&mut self, source_position: Position) -> Result<Position>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundaryState {
     ReadSource,
     WaitForApplier {
-        source_lsn: Lsn,
+        source_position: Position,
     },
     ReadDestination {
-        source_lsn: Lsn,
+        source_position: Position,
     },
     CheckChanges {
-        source_lsn: Lsn,
+        source_position: Position,
     },
     Requeued {
         busy: u64,
@@ -111,7 +115,8 @@ pub struct VerificationSession {
     source: Option<SourceRead>,
     destination: Vec<Row>,
     known_keys: Vec<Key>,
-    last_lsn: Option<Lsn>,
+    last_position: Option<Position>,
+    position_order: Option<SourcePositionOrder>,
     result: Option<Verification>,
 }
 
@@ -131,7 +136,8 @@ impl VerificationSession {
             source: None,
             destination: Vec::new(),
             known_keys: Vec::new(),
-            last_lsn: None,
+            last_position: None,
+            position_order: None,
             result: None,
         })
     }
@@ -184,28 +190,50 @@ impl VerificationSession {
             BoundaryState::ReadSource => {
                 validate_range(source, &self.range)?;
                 let read = source.read_source(&self.range, &self.projection).await?;
-                if self.last_lsn.is_some_and(|previous| read.lsn < previous) {
-                    return Err(VerifyError::Invalid("source LSN regressed"));
+                let order = self
+                    .position_order
+                    .get_or_insert_with(|| source.position_order());
+                compare_positions(order.as_ref(), &read.position, &read.position)?;
+                if let Some(previous) = &self.last_position
+                    && compare_positions(order.as_ref(), &read.position, previous)?
+                        == Ordering::Less
+                {
+                    return Err(VerifyError::Invalid("source position regressed"));
                 }
                 self.state = BoundaryState::WaitForApplier {
-                    source_lsn: read.lsn,
+                    source_position: read.position.clone(),
                 };
                 self.source = Some(read);
                 self.attempts += 1;
             }
-            BoundaryState::WaitForApplier { source_lsn } => {
-                if applier.wait_until(source_lsn).await? < source_lsn {
-                    return Err(VerifyError::Invalid("applier has not reached source LSN"));
+            BoundaryState::WaitForApplier { source_position } => {
+                let applied = applier.wait_until(source_position.clone()).await?;
+                if compare_positions(
+                    self.position_order.as_ref().expect("source order").as_ref(),
+                    &applied,
+                    &source_position,
+                )? == Ordering::Less
+                {
+                    return Err(VerifyError::Invalid(
+                        "applier has not reached source position",
+                    ));
                 }
-                self.state = BoundaryState::ReadDestination { source_lsn };
+                self.state = BoundaryState::ReadDestination { source_position };
             }
-            BoundaryState::ReadDestination { source_lsn } => {
+            BoundaryState::ReadDestination { source_position } => {
                 self.destination = destination.fetch(&self.range, &self.projection).await?;
-                self.state = BoundaryState::CheckChanges { source_lsn };
+                self.state = BoundaryState::CheckChanges { source_position };
             }
-            BoundaryState::CheckChanges { source_lsn } => {
-                let changes = source.changed_since(&self.range, source_lsn).await?;
-                if changes.through_lsn < source_lsn {
+            BoundaryState::CheckChanges { source_position } => {
+                let changes = source
+                    .changed_since(&self.range, source_position.clone())
+                    .await?;
+                if compare_positions(
+                    self.position_order.as_ref().expect("source order").as_ref(),
+                    &changes.through_position,
+                    &source_position,
+                )? == Ordering::Less
+                {
                     return Err(VerifyError::Invalid(
                         "change evidence predates source boundary",
                     ));
@@ -226,7 +254,7 @@ impl VerificationSession {
                 let known = union(source, &self.known_keys, &source_keys)?;
                 let known = union(source, &known, &destination_keys)?;
                 self.known_keys = union(source, &known, &changes.keys)?;
-                self.last_lsn = Some(changes.through_lsn);
+                self.last_position = Some(changes.through_position);
                 let busy = comparison.coverage.busy;
                 self.result = Some(Verification {
                     range: self.range.clone(),
@@ -304,6 +332,11 @@ fn union(order: &(impl KeyOrder + ?Sized), left: &[Key], right: &[Key]) -> Resul
 }
 
 #[cfg(test)]
+fn pg_position(lsn: u64) -> Position {
+    crate::verify::sql::PgSourcePosition::new("test-pg").position(lsn)
+}
+
+#[cfg(test)]
 mod operational_tests {
     use super::*;
     use crate::{
@@ -311,6 +344,155 @@ mod operational_tests {
         verify::{ApplierTerminalCause, EvidenceInvalidation, EvidenceLimit},
     };
     use std::time::Duration;
+
+    // Pure order/protocol contract probes; no database behavior is emulated.
+    struct DecimalOrder;
+    impl crate::event::PositionOrder for DecimalOrder {
+        fn domain(&self) -> &str {
+            "native-decimal"
+        }
+        fn compare(
+            &self,
+            left: &[u8],
+            right: &[u8],
+        ) -> std::result::Result<Ordering, crate::event::EventError> {
+            let number = |bytes: &[u8]| {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or(crate::event::EventError::InvalidEncoding(
+                        "incomparable decimal position",
+                    ))
+            };
+            Ok(number(left)?.cmp(&number(right)?))
+        }
+    }
+    fn native(value: &str) -> Position {
+        Position::new("native-decimal", value.as_bytes())
+    }
+    struct NativeProbe {
+        reads: std::collections::VecDeque<Position>,
+        changes: std::collections::VecDeque<ChangeEvidence>,
+        returned: Option<Position>,
+    }
+    impl KeyOrder for NativeProbe {
+        fn compare_keys(&self, left: &Key, right: &Key) -> Result<Ordering> {
+            match (left.as_slice(), right.as_slice()) {
+                ([crate::mapping::Value::Int8(a)], [crate::mapping::Value::Int8(b)]) => {
+                    Ok(a.cmp(b))
+                }
+                _ => Err(VerifyError::Invalid("test key")),
+            }
+        }
+    }
+    #[async_trait]
+    impl RowSource for NativeProbe {
+        async fn fetch(&mut self, _: &RangePlan, _: &Projection) -> Result<Vec<Row>> {
+            Ok(vec![])
+        }
+    }
+    #[async_trait]
+    impl BoundarySource for NativeProbe {
+        fn position_order(&self) -> SourcePositionOrder {
+            std::sync::Arc::new(DecimalOrder)
+        }
+        async fn read_source(&mut self, _: &RangePlan, _: &Projection) -> Result<SourceRead> {
+            Ok(SourceRead {
+                rows: vec![],
+                position: self.reads.pop_front().unwrap(),
+            })
+        }
+        async fn changed_since(&mut self, _: &RangePlan, _: Position) -> Result<ChangeEvidence> {
+            Ok(self.changes.pop_front().unwrap())
+        }
+    }
+    #[async_trait]
+    impl Applier for NativeProbe {
+        async fn wait_until(&mut self, position: Position) -> Result<Position> {
+            Ok(self.returned.clone().unwrap_or(position))
+        }
+    }
+    fn native_probe() -> NativeProbe {
+        NativeProbe {
+            reads: [native("9"), native("11")].into(),
+            changes: [
+                ChangeEvidence {
+                    through_position: native("10"),
+                    keys: vec![vec![crate::mapping::Value::Int8(1)]],
+                },
+                ChangeEvidence {
+                    through_position: native("12"),
+                    keys: vec![],
+                },
+            ]
+            .into(),
+            returned: Some(native("12")),
+        }
+    }
+    #[tokio::test]
+    async fn native_variable_length_order_drives_wait_evidence_and_retry() {
+        assert!(native("9").bytes() > native("10").bytes());
+        let mut session = session();
+        let mut source = native_probe();
+        let mut destination = ContractProbe { fault: None };
+        let mut applier = native_probe();
+        let result = session
+            .run(&mut source, &mut destination, &mut applier)
+            .await
+            .unwrap();
+        assert_eq!(result.attempts, 2);
+        assert_eq!(result.comparison.coverage.busy, 0);
+        assert_eq!(session.last_position, Some(native("12")));
+    }
+    #[tokio::test]
+    async fn native_wrong_domain_and_incomparable_boundaries_fail_closed() {
+        for bad in [Position::new("other", b"9"), native("incomparable")] {
+            for phase in [FaultAt::Source, FaultAt::Wait, FaultAt::Changes] {
+                let mut session = session();
+                let mut source = native_probe();
+                let mut applier = native_probe();
+                match phase {
+                    FaultAt::Source => source.reads[0] = bad.clone(),
+                    FaultAt::Wait => applier.returned = Some(bad.clone()),
+                    FaultAt::Changes => source.changes[0].through_position = bad.clone(),
+                }
+                let error = session
+                    .run(
+                        &mut source,
+                        &mut ContractProbe { fault: None },
+                        &mut applier,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, VerifyError::Position(_)));
+                assert!(session.result().is_none());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn native_below_target_and_regression_are_rejected() {
+        for phase in [FaultAt::Source, FaultAt::Wait, FaultAt::Changes] {
+            let mut session = session();
+            let mut source = native_probe();
+            let mut applier = native_probe();
+            match phase {
+                FaultAt::Source => source.reads[1] = native("9"),
+                FaultAt::Wait => applier.returned = Some(native("8")),
+                FaultAt::Changes => source.changes[0].through_position = native("8"),
+            }
+            assert!(matches!(
+                session
+                    .run(
+                        &mut source,
+                        &mut ContractProbe { fault: None },
+                        &mut applier
+                    )
+                    .await,
+                Err(VerifyError::Invalid(_))
+            ));
+            assert!(session.result().is_none());
+        }
+    }
 
     // Trait-contract probes return typed faults without emulating any database
     // or capture behavior. Production producer qualification is separate.
@@ -349,15 +531,18 @@ mod operational_tests {
 
     #[async_trait]
     impl BoundarySource for ContractProbe {
+        fn position_order(&self) -> SourcePositionOrder {
+            std::sync::Arc::new(crate::pg::apply::NativePgOrder("test-pg".into()))
+        }
         async fn read_source(&mut self, _: &RangePlan, _: &Projection) -> Result<SourceRead> {
             self.take_fault(FaultAt::Source)?;
             Ok(SourceRead {
                 rows: vec![],
-                lsn: 10,
+                position: pg_position(10),
             })
         }
 
-        async fn changed_since(&mut self, _: &RangePlan, _: Lsn) -> Result<ChangeEvidence> {
+        async fn changed_since(&mut self, _: &RangePlan, _: Position) -> Result<ChangeEvidence> {
             self.take_fault(FaultAt::Changes)?;
             panic!("contract probe must fail before comparison")
         }
@@ -365,9 +550,9 @@ mod operational_tests {
 
     #[async_trait]
     impl Applier for ContractProbe {
-        async fn wait_until(&mut self, source_lsn: Lsn) -> Result<Lsn> {
+        async fn wait_until(&mut self, source_position: Position) -> Result<Position> {
             self.take_fault(FaultAt::Wait)?;
-            Ok(source_lsn)
+            Ok(source_position)
         }
     }
 
@@ -433,10 +618,12 @@ mod operational_tests {
             EvidenceInvalidation::SlotChanged,
         ] {
             let mut session = session();
-            session.state = BoundaryState::CheckChanges { source_lsn: 10 };
+            session.state = BoundaryState::CheckChanges {
+                source_position: pg_position(10),
+            };
             session.source = Some(SourceRead {
                 rows: vec![],
-                lsn: 10,
+                position: pg_position(10),
             });
             session.record_error(&VerifyError::EvidenceInvalidated { reason });
             assert_eq!(
@@ -455,10 +642,12 @@ mod operational_tests {
     fn timeout_is_not_verifiable_and_retains_typed_wait_details() {
         let mut session = session();
         let reason = NotVerifiableReason::ApplierTimeout {
-            waited_lsn: 42,
+            waited_position: pg_position(42),
             elapsed: Duration::from_millis(27),
         };
-        session.state = BoundaryState::WaitForApplier { source_lsn: 42 };
+        session.state = BoundaryState::WaitForApplier {
+            source_position: pg_position(42),
+        };
         let error = reason.clone().into_error(session.range.id.clone());
         session.record_error(&error);
         assert_eq!(
@@ -480,12 +669,16 @@ mod operational_tests {
             ApplierTerminalCause::CheckpointRejected,
         ] {
             let mut session = session();
-            session.state = BoundaryState::WaitForApplier { source_lsn: 42 };
+            session.state = BoundaryState::WaitForApplier {
+                source_position: pg_position(42),
+            };
             let error = VerifyError::ApplierTerminal { cause };
             session.record_error(&error);
             assert_eq!(
                 session.state(),
-                &BoundaryState::WaitForApplier { source_lsn: 42 }
+                &BoundaryState::WaitForApplier {
+                    source_position: pg_position(42)
+                }
             );
             assert!(error.not_verifiable_reason(&session.range.id).is_none());
             assert!(session.result().is_none());
@@ -502,7 +695,7 @@ mod operational_tests {
                 reason: EvidenceInvalidation::CaptureGap,
             },
             NotVerifiableReason::ApplierTimeout {
-                waited_lsn: 81,
+                waited_position: pg_position(81),
                 elapsed: Duration::from_millis(5),
             },
         ] {
@@ -524,7 +717,7 @@ mod operational_tests {
             (
                 FaultAt::Wait,
                 NotVerifiableReason::ApplierTimeout {
-                    waited_lsn: 10,
+                    waited_position: pg_position(10),
                     elapsed: Duration::from_millis(3),
                 },
             ),
@@ -600,7 +793,9 @@ mod operational_tests {
         ));
         assert_eq!(
             session.state(),
-            &BoundaryState::WaitForApplier { source_lsn: 10 }
+            &BoundaryState::WaitForApplier {
+                source_position: pg_position(10)
+            }
         );
         assert!(session.result().is_none());
     }

@@ -6,6 +6,479 @@ use crate::pg::{ddl, replication::Lineage};
 use std::time::Instant;
 
 const PG_EPOCH_US: i64 = 946_684_800_000_000;
+
+#[test]
+fn pg_probe_distance_age_and_budget_match_old_numbers_golden() {
+    let order = Arc::new(crate::pg::apply::NativePgOrder("engine-test".into()));
+    for tip in [1, 9, 10, 255, u32::MAX as u64, u64::MAX] {
+        for applied in [1, 9, 10, 256, u32::MAX as u64, u64::MAX] {
+            let probe =
+                PgReadinessProbe::new(source(), order.domain().into(), tip, 0, Instant::now());
+            let sample = probe
+                .sample(&Position::new(order.domain(), applied.to_be_bytes()), None)
+                .unwrap();
+            let mut lag = ApplyLagObservation {
+                source: source(),
+                order: order.clone(),
+                source_tip: probe.tip().clone(),
+                applied_source: Position::new(order.domain(), applied.to_be_bytes()),
+                lag: sample.lag.unwrap(),
+                oldest_unapplied_age_ms: 0,
+                observed_at: sample.observed_at,
+            };
+            let capture = CaptureObservation {
+                healthy: true,
+                source: source(),
+                position: probe.tip().clone(),
+            };
+            assert_eq!(
+                lag.lag,
+                LagMeasure {
+                    value: tip.saturating_sub(applied),
+                    unit: "bytes"
+                }
+            );
+            assert!(lag.matches(&capture));
+            for age in [0, 1, 999, 1000, 1001, u64::MAX] {
+                lag.oldest_unapplied_age_ms = age;
+                for budget in [0u64, 1, u64::MAX] {
+                    assert_eq!(
+                        lag.compare_budget(budget),
+                        (age, budget.saturating_mul(1000))
+                    );
+                }
+            }
+            lag.lag.value ^= 1;
+            assert!(!lag.matches(&capture), "tampered byte distance");
+            lag.lag.value ^= 1;
+            lag.order = Arc::new(crate::pg::apply::NativePgOrder(String::new()));
+            lag.source_tip = Position::new("", tip.to_be_bytes());
+            lag.applied_source = Position::new("", applied.to_be_bytes());
+            let capture = CaptureObservation {
+                position: lag.source_tip.clone(),
+                ..capture
+            };
+            assert!(!lag.matches(&capture), "empty ordering domain");
+        }
+    }
+    // Exact old checked arithmetic, including rounding, future clocks and overflow.
+    for (clock, elapsed_us, committed, expected) in [
+        (1000, 0, Some(Some(1000)), Some(0)),
+        (1000, 0, Some(Some(999)), Some(1)),
+        (1000, 0, Some(Some(0)), Some(1)),
+        (1000, 1, Some(Some(0)), Some(2)),
+        (1000, 1000, Some(Some(0)), Some(2)),
+        (0, 0, Some(Some(1)), None),
+        (i64::MAX, 1, None, None),
+        (i64::MAX, 0, Some(Some(i64::MIN)), None),
+        (
+            i64::MAX,
+            0,
+            Some(Some(0)),
+            Some((i64::MAX as u64).div_ceil(1000)),
+        ),
+        (0, 0, None, Some(0)),
+        (0, 0, Some(None), None),
+    ] {
+        assert_eq!(
+            PgReadinessProbe::commit_age(clock, Duration::from_micros(elapsed_us), committed),
+            expected
+        );
+    }
+    let probe = PgReadinessProbe::new(source(), order.domain().into(), 1, 0, Instant::now());
+    assert_eq!(
+        probe
+            .sample(&Position::new("wrong", 1u64.to_be_bytes()), None)
+            .err(),
+        Some(crate::event::EventError::PositionDomainMismatch)
+    );
+    for applied in [
+        Position::new(order.domain(), vec![1]),
+        Position::new(order.domain(), 0u64.to_be_bytes()),
+    ] {
+        assert!(probe.sample(&applied, None).is_err());
+    }
+    assert!(
+        PgReadinessProbe::new(source(), order.domain().into(), 0, 0, Instant::now())
+            .sample(&Position::new(order.domain(), 1u64.to_be_bytes()), None)
+            .is_err()
+    );
+}
+
+struct DecimalReadinessOrder;
+fn decimal(bytes: &[u8]) -> std::result::Result<u64, crate::event::EventError> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or(crate::event::EventError::InvalidEncoding(
+            "readiness decimal",
+        ))
+}
+impl PositionOrder for DecimalReadinessOrder {
+    fn domain(&self) -> &str {
+        "readiness-decimal"
+    }
+    fn compare(
+        &self,
+        left: &[u8],
+        right: &[u8],
+    ) -> std::result::Result<std::cmp::Ordering, crate::event::EventError> {
+        Ok(decimal(left)?.cmp(&decimal(right)?))
+    }
+}
+fn native_position(value: &str) -> Position {
+    Position::new("readiness-decimal", value.as_bytes())
+}
+fn native_source() -> SourceIdentity {
+    SourceIdentity {
+        engine: "test-native".into(),
+        ..source()
+    }
+}
+fn native_checkpoint(value: &str) -> ReaderCheckpoint {
+    ReaderCheckpoint {
+        next_mseq: 1,
+        last_position: Some(native_position(value)),
+        last_record: Some(crate::buffer::format::RecordBoundary {
+            source: native_source(),
+            chunk_rows: false,
+        }),
+        ..ReaderCheckpoint::default()
+    }
+}
+#[derive(Clone)]
+struct NativeProbe {
+    source: SourceIdentity,
+    tip: Position,
+    started: Instant,
+    age: Option<u64>,
+    lag_known: bool,
+    retention: Option<RetentionMargin>,
+    schema_unknown: bool,
+}
+impl NativeProbe {
+    fn new() -> Self {
+        Self {
+            source: native_source(),
+            tip: native_position("10"),
+            started: Instant::now(),
+            age: Some(1500),
+            lag_known: true,
+            schema_unknown: false,
+            retention: Some(RetentionMargin {
+                position: native_position("9"),
+                remaining: LagMeasure {
+                    value: 500,
+                    unit: "transactions",
+                },
+                history_available: true,
+                time_to_exhaustion: Some(Duration::from_secs(7200)),
+            }),
+        }
+    }
+}
+impl ReadinessProbe for NativeProbe {
+    fn source(&self) -> &SourceIdentity {
+        &self.source
+    }
+    fn tip(&self) -> &Position {
+        &self.tip
+    }
+    fn observed_at(&self) -> Instant {
+        self.started
+    }
+    fn sample(
+        &self,
+        applied: &Position,
+        _: Option<Option<i64>>,
+    ) -> std::result::Result<ReadinessProbeSample, crate::event::EventError> {
+        self.tip.compare(applied, &DecimalReadinessOrder)?;
+        Ok(ReadinessProbeSample {
+            lag: self.lag_known.then(|| LagMeasure {
+                value: decimal(self.tip.bytes())
+                    .unwrap()
+                    .saturating_sub(decimal(applied.bytes()).unwrap()),
+                unit: "transactions",
+            }),
+            oldest_unapplied_age_ms: self.age,
+            retention: self.retention.clone(),
+            schema: Some(source::SchemaState {
+                blocked_boundary: None,
+                unknown_schema_job: self.schema_unknown,
+            }),
+            observed_at: self.started,
+        })
+    }
+}
+fn begin_native(runtime: &Runtime, baseline: Option<&str>) {
+    let writer = baseline.map_or_else(crate::buffer::writer::WriterCheckpoint::default, |value| {
+        crate::buffer::writer::WriterCheckpoint {
+            next_mseq: 1,
+            last_position: Some(native_position(value)),
+            last_record: native_checkpoint(value).last_record,
+            ..crate::buffer::writer::WriterCheckpoint::default()
+        }
+    });
+    runtime.7.begin(
+        native_source(),
+        Arc::new(DecimalReadinessOrder),
+        Some(writer),
+        Some(native_checkpoint("9")),
+    );
+}
+fn observe_native(runtime: &Runtime, mark: Watermark, value: &str) {
+    let position = native_position(value);
+    runtime.7.observe(&Captured {
+        transaction: Some(
+            AssembledTxn::new(
+                native_source(),
+                crate::event::TxnId(vec![1]),
+                position.clone(),
+                None,
+                vec![],
+            )
+            .unwrap(),
+        ),
+        durable_position: Some(position.clone()),
+        watermarks: vec![super::super::CapturedMarker::Chunk {
+            marker: mark,
+            commit: position,
+            committed_events: vec![],
+        }],
+        ..Captured::default()
+    });
+}
+fn admit_native(runtime: &Runtime, probe: NativeProbe) {
+    let mark = heartbeat();
+    let previous = runtime.live_readiness().lag.map(|lag| lag.observed_at);
+    runtime
+        .observe_readiness_probe(Arc::new(probe), mark.clone())
+        .unwrap();
+    assert_eq!(
+        runtime.live_readiness().lag.map(|lag| lag.observed_at),
+        previous,
+        "uncaptured tip cannot replace or refresh previous durable evidence"
+    );
+    observe_native(runtime, mark, "10");
+}
+
+#[tokio::test]
+async fn native_probe_uses_order_age_freshness_baseline_and_independent_schema() {
+    let f = Fixture::new().await;
+    let runtime = f.engine.runtime();
+    begin_native(&runtime, Some("10"));
+    admit_native(&runtime, NativeProbe::new());
+    assert_eq!(
+        runtime.live_readiness().blocked,
+        Some(ReadinessBlocked::UnknownLag)
+    );
+    runtime
+        .7
+        .applied(&native_position("10"), &native_checkpoint("10"));
+    let live = runtime.live_readiness();
+    let lag = live.lag.unwrap();
+    assert!(lag.matches(live.capture.as_ref().unwrap()));
+    assert_eq!(lag.compare_budget(1), (1500, 1000));
+    assert_eq!(lag.compare_budget(2), (1500, 2000));
+    assert_eq!(
+        lag.lag,
+        LagMeasure {
+            value: 0,
+            unit: "transactions"
+        }
+    );
+    assert_eq!(lag.applied_source, native_position("10"));
+    // Lexical bytes put 10 below 9; the source order must accept 9 -> 10.
+    begin_native(&runtime, None);
+    let mut probe = NativeProbe::new();
+    probe.schema_unknown = true;
+    admit_native(&runtime, probe);
+    let live = runtime.live_readiness();
+    assert_eq!(live.lag.unwrap().lag.value, 1);
+    assert!(live.schema_fresh && live.schema.unwrap().unknown_schema_job);
+    runtime.7.schema(Some(source::SchemaState {
+        blocked_boundary: None,
+        unknown_schema_job: true,
+    }));
+    admit_native(&runtime, NativeProbe::new());
+    assert!(
+        runtime.live_readiness().schema.unwrap().unknown_schema_job,
+        "probe cannot clear capture blocker"
+    );
+    let mut stale = NativeProbe::new();
+    stale.started -= Duration::from_secs(2);
+    admit_native(&runtime, stale);
+    let live = runtime.live_readiness();
+    assert_eq!(live.blocked, Some(ReadinessBlocked::Stale));
+    assert!(live.lag.is_none() && live.capture.is_none());
+    runtime.7.finish();
+    assert_eq!(
+        runtime.live_readiness().blocked,
+        Some(ReadinessBlocked::Unavailable)
+    );
+}
+
+#[tokio::test]
+async fn native_unknown_missing_and_retention_block_at_maximum_budget() {
+    for case in 0..8 {
+        let f = Fixture::new().await;
+        let runtime = f.engine.runtime();
+        {
+            let mut state = runtime.1.write().unwrap();
+            state.definition = Some(
+                crate::MigrationDefinition::from_json(
+                    include_str!("../../README.md")
+                        .split("```json")
+                        .nth(1)
+                        .unwrap()
+                        .split("```")
+                        .next()
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+            let definition = state.definition.as_mut().unwrap();
+            definition.readiness_policy.max_lag_seconds = u64::MAX;
+            definition.budgets.max_replication_lag_seconds = u64::MAX;
+        }
+        begin_native(&runtime, None);
+        let mut probe = NativeProbe::new();
+        let expected = match case {
+            0 => ReadinessBlocked::MissingProbe,
+            1 => {
+                probe.lag_known = false;
+                ReadinessBlocked::UnknownLag
+            }
+            2 => {
+                probe.age = None;
+                ReadinessBlocked::UnknownLag
+            }
+            3 => {
+                probe.retention = None;
+                ReadinessBlocked::UnknownRetention
+            }
+            4 => {
+                probe.retention.as_mut().unwrap().history_available = false;
+                ReadinessBlocked::RetentionLost
+            }
+            5 => {
+                probe.retention.as_mut().unwrap().time_to_exhaustion = None;
+                ReadinessBlocked::UnknownRetention
+            }
+            6 => {
+                probe.retention.as_mut().unwrap().time_to_exhaustion =
+                    Some(Duration::from_secs(900));
+                ReadinessBlocked::RetentionRisk(WalLevel::Blocker)
+            }
+            _ => {
+                probe.retention.as_mut().unwrap().time_to_exhaustion =
+                    Some(Duration::from_secs(120));
+                ReadinessBlocked::RetentionRisk(WalLevel::Abort)
+            }
+        };
+        if case != 0 {
+            admit_native(&runtime, probe);
+        }
+        let live = runtime.live_readiness();
+        assert_eq!(live.blocked, Some(expected), "case {case}");
+        assert!(live.lag.is_none());
+        let sample = ComponentSnapshot {
+            capture: live.capture,
+            apply_lag: live.lag,
+            ..ComponentSnapshot::default()
+        };
+        let facts = super::super::readiness::assemble(&runtime, &f.journal, &sample)
+            .await
+            .unwrap();
+        assert_eq!((facts.apply_lag, facts.lag_budget), (1, 0));
+        assert_eq!(
+            facts.lineage_matches,
+            case != 0,
+            "lag/retention blockers do not change source identity"
+        );
+        assert!(facts.blockers().contains(&"apply-lag-over-budget".into()));
+        if matches!(case, 4 | 6 | 7) {
+            let mut monitor = WalMonitor::new(
+                Arc::new(budget::SystemClock::default()),
+                crate::status::RetentionPolicy::default(),
+            )
+            .unwrap();
+            let decision = monitor
+                .sample_components(&runtime, &sample)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                decision.level,
+                if case == 6 {
+                    WalLevel::Blocker
+                } else {
+                    WalLevel::Abort
+                }
+            );
+            f.engine.enforce_wal(&decision).await.unwrap();
+            assert_eq!(f.engine.resumable(), case == 6);
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_wrong_domain_and_incomparable_positions_keep_typed_errors() {
+    let f = Fixture::new().await;
+    let runtime = f.engine.runtime();
+    for (position, expected) in [
+        (
+            Position::new("wrong", b"10"),
+            crate::event::EventError::PositionDomainMismatch,
+        ),
+        (
+            native_position("incomparable"),
+            crate::event::EventError::InvalidEncoding("readiness decimal"),
+        ),
+    ] {
+        begin_native(&runtime, None);
+        let mut probe = NativeProbe::new();
+        probe.tip = position.clone();
+        assert_eq!(
+            runtime.observe_readiness_probe(Arc::new(probe), heartbeat()),
+            Err(expected.clone())
+        );
+        begin_native(&runtime, None);
+        let mut probe = NativeProbe::new();
+        probe.retention.as_mut().unwrap().position = position.clone();
+        admit_native(&runtime, probe);
+        assert_eq!(
+            runtime.live_readiness().blocked,
+            Some(ReadinessBlocked::Position(expected.clone()))
+        );
+        begin_native(&runtime, None);
+        let mut checkpoint = native_checkpoint("10");
+        checkpoint.last_position = Some(position.clone());
+        runtime.7.applied(&position, &checkpoint);
+        assert_eq!(
+            runtime.live_readiness().blocked,
+            Some(ReadinessBlocked::Position(expected.clone()))
+        );
+        begin_native(&runtime, None);
+        runtime.7.observe(&Captured {
+            transaction: Some(
+                AssembledTxn::new(
+                    native_source(),
+                    crate::event::TxnId(vec![1]),
+                    position.clone(),
+                    None,
+                    vec![],
+                )
+                .unwrap(),
+            ),
+            durable_position: Some(position),
+            ..Captured::default()
+        });
+        assert_eq!(
+            runtime.live_readiness().blocked,
+            Some(ReadinessBlocked::Position(expected))
+        );
+    }
+}
 fn lineage() -> Lineage {
     Lineage {
         system_id: 1,
@@ -37,7 +510,7 @@ async fn ready() -> (
     let runtime = f.engine.runtime();
     runtime.7.begin(
         source(),
-        "engine-test".into(),
+        capture.position_order(),
         capture.writer_checkpoint().unwrap(),
         None,
     );
@@ -75,6 +548,71 @@ async fn probe(
 }
 
 #[tokio::test]
+async fn pg_probe_heartbeat_admission_matches_old_decisions_golden() {
+    let (f, mut capture, tx, _) = ready().await;
+    let runtime = f.engine.runtime();
+    let expected = heartbeat();
+    runtime
+        .7
+        .source_tip(
+            &lineage(),
+            25,
+            PG_EPOCH_US,
+            Instant::now(),
+            expected.clone(),
+        )
+        .unwrap();
+    assert!(runtime.live_readiness().lag.is_none());
+    marker(&tx, heartbeat(), 30).await;
+    runtime.7.observe(&durable(&mut capture).await);
+    assert!(
+        runtime.live_readiness().lag.is_none(),
+        "unrelated marker cannot admit sampled tip"
+    );
+    marker(&tx, expected, 40).await;
+    runtime.7.observe(&durable(&mut capture).await);
+    assert_eq!(runtime.live_readiness().lag.unwrap().lag.value, 5);
+    let previous = runtime.live_readiness().lag.unwrap().observed_at;
+    let next = heartbeat();
+    runtime
+        .7
+        .source_tip(&lineage(), 45, PG_EPOCH_US, Instant::now(), next.clone())
+        .unwrap();
+    let old = runtime.live_readiness().lag.unwrap();
+    assert_eq!(
+        old.observed_at, previous,
+        "pending heartbeat cannot refresh old evidence"
+    );
+    assert_eq!(pg_position_lsn(&old.source_tip, "engine-test").unwrap(), 25);
+    marker(&tx, next, 50).await;
+    runtime.7.observe(&durable(&mut capture).await);
+    assert_eq!(
+        pg_position_lsn(
+            &runtime.live_readiness().lag.unwrap().source_tip,
+            "engine-test"
+        )
+        .unwrap(),
+        45
+    );
+    for (tip, started) in [
+        (0, Instant::now()),
+        (25, Instant::now() + Duration::from_secs(60)),
+    ] {
+        assert!(
+            runtime
+                .7
+                .source_tip(&lineage(), tip, PG_EPOCH_US, started, heartbeat())
+                .is_err()
+        );
+        let live = runtime.live_readiness();
+        assert!(
+            live.capture.is_none() && live.lag.is_none(),
+            "invalid probe revokes prior tip"
+        );
+    }
+}
+
+#[tokio::test]
 async fn paired_lag_reports_bytes_and_source_commit_age_then_apply_clears_age() {
     let (f, mut capture, tx, mut apply) = ready().await;
     let started = Instant::now();
@@ -82,7 +620,11 @@ async fn paired_lag_reports_bytes_and_source_commit_age_then_apply_clears_age() 
     let live = f.engine.runtime.live_readiness();
     let lag = live.lag.unwrap();
     assert_eq!(
-        (lag.source_tip_lsn, lag.applied_source_lsn, lag.lag_bytes),
+        (
+            pg_position_lsn(&lag.source_tip, "engine-test").unwrap(),
+            pg_position_lsn(&lag.applied_source, "engine-test").unwrap(),
+            lag.lag.value
+        ),
         (25, 20, 5)
     );
     assert!(
@@ -93,8 +635,13 @@ async fn paired_lag_reports_bytes_and_source_commit_age_then_apply_clears_age() 
     assert!(apply.step(&f.engine.runtime()).await.unwrap());
     let lag = f.engine.runtime.live_readiness().lag.unwrap();
     // Applied can advance past a sampled tip; its diagnostic distance is zero.
-    assert!(lag.applied_source_lsn > lag.source_tip_lsn);
-    assert_eq!((lag.oldest_unapplied_age_ms, lag.lag_bytes), (0, 0));
+    assert!(
+        lag.applied_source
+            .compare(&lag.source_tip, lag.order.as_ref())
+            .unwrap()
+            .is_gt()
+    );
+    assert_eq!((lag.oldest_unapplied_age_ms, lag.lag.value), (0, 0));
 }
 
 #[tokio::test]
@@ -138,7 +685,7 @@ async fn recovered_buffer_baseline_is_unknown_until_its_real_applied_receipt() {
     let checkpoint = decode_reader_checkpoint(&runtime.snapshot().progress["applied"].0).unwrap();
     runtime.7.begin(
         source(),
-        "engine-test".into(),
+        capture.position_order(),
         capture.writer_checkpoint().unwrap(),
         Some(checkpoint.clone()),
     );
@@ -218,7 +765,7 @@ async fn ddl_accessor_blocks_unclassified_and_sticky_boundary_then_new_baseline_
     assert!(clean.blocked_boundary.is_none() && !clean.unknown_schema_job);
     new.engine.runtime.7.begin(
         source(),
-        "engine-test".into(),
+        Arc::new(crate::pg::apply::NativePgOrder("engine-test".into())),
         Some(crate::buffer::writer::WriterCheckpoint::default()),
         None,
     );

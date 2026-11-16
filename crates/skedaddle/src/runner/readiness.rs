@@ -62,13 +62,17 @@ impl Facts {
         self.apply_lag.ready = false;
         self.schema_jobs.ready = false;
         self.schema_boundary = None;
-        self.apply_lag.source = "Fresh source WAL tip and clock, covered by a manifest-durable transactional heartbeat; authenticated journaled Applied source receipt; captured source commit timestamps.".into();
+        self.apply_lag.source = "Fresh native source tip and clock, covered by a manifest-durable transactional heartbeat; authenticated journaled Applied source receipt; captured source commit timestamps.".into();
         self.apply_lag.staleness = "Expires 1 second from probe start; capture/apply exit revokes immediately; startup backlog remains unknown until its buffered baseline is applied.".into();
         self.apply_lag.blocker = Some(Blocker {
             code: "apply-lag-over-budget".into(),
             reason: "Paired source/apply lag age is unknown, stale, has a different lineage, or startup backlog has not drained.".into(),
             remediation: "Restore live capture and apply, let the startup buffer baseline drain, and obtain a fresh captured source heartbeat.".into(),
         });
+        if let Some(reason) = &live.blocked {
+            self.apply_lag.blocker.as_mut().expect("blocked lag").reason =
+                format!("Native readiness observation blocked: {reason:?}.");
+        }
         if let (Some(lag), Some(definition)) = (&live.lag, definition) {
             let budget_ms = definition
                 .readiness_policy
@@ -76,20 +80,22 @@ impl Facts {
                 .min(definition.budgets.max_replication_lag_seconds)
                 .saturating_mul(1000);
             self.apply_lag.source = format!(
-                "{} source_tip_lsn={}, applied_source_lsn={}, lag_bytes={}, oldest_unapplied_age_ms={}, budget_ms={budget_ms}.",
+                "{} source_tip={:?}, applied_source={:?}, lag={} {}, oldest_unapplied_age_ms={}, budget_ms={budget_ms}.",
                 self.apply_lag.source,
-                lag.source_tip_lsn,
-                lag.applied_source_lsn,
-                lag.lag_bytes,
+                lag.source_tip,
+                lag.applied_source,
+                lag.lag.value,
+                lag.lag.unit,
                 lag.oldest_unapplied_age_ms
             );
-            self.apply_lag.ready = live.running && lag.within_budget(definition);
+            self.apply_lag.ready =
+                live.running && live.blocked.is_none() && lag.within_budget(definition);
             if self.apply_lag.ready {
                 self.apply_lag.blocker = None;
             } else if let Some(blocker) = &mut self.apply_lag.blocker {
                 blocker.reason = format!(
-                    "Apply age {} ms exceeds budget {budget_ms} ms ({} bytes behind), or its observation has expired.",
-                    lag.oldest_unapplied_age_ms, lag.lag_bytes
+                    "Apply age {} ms exceeds budget {budget_ms} ms ({} {} behind), or its observation has expired.",
+                    lag.oldest_unapplied_age_ms, lag.lag.value, lag.lag.unit
                 );
                 blocker.remediation = "Allow destination apply to catch up, reduce source write load, and resample fresh source/apply observations.".into();
             }

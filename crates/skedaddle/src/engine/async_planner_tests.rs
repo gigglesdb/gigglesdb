@@ -280,7 +280,8 @@ impl PgTransactionPlanner for Fault {
                 Self::Io => Err(std::io::Error::other("secret source query details").into()),
                 Self::Identity => {
                     let mut p = planner(txn, mseq, state)?;
-                    p.progress.lsn += 1;
+                    let lsn = u64::from_be_bytes(p.progress.position.bytes().try_into().unwrap());
+                    p.progress.position = Position::new("engine-test", (lsn + 1).to_be_bytes());
                     Ok(p)
                 }
                 Self::MissingProgress => {
@@ -325,6 +326,7 @@ impl PgTransactionPlanner for ClassifyingPlanner {
                     key: vec!["id".into()],
                 }],
                 &apply::PlanContext {
+                    positions: apply::SourcePositions::native_pg("engine-test"),
                     stream: "wal".into(),
                     mseq,
                     origin: "test".into(),

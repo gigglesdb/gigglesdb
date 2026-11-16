@@ -4,6 +4,7 @@ use skedaddle::mysql::{
     GtidSet, MysqlPosition,
     binlog::{MysqlEvent, MysqlValue as V, QueryKind, RowKind},
     client::{MysqlBinlogStream, MysqlConfig, MysqlError, MysqlVersion},
+    resume::ResumeBlocker,
 };
 use std::time::Duration;
 use tokio::time::{Instant, timeout, timeout_at};
@@ -215,9 +216,7 @@ async fn live_binlog_tls_status_rows_heartbeat_rotate() -> Result<(), Box<dyn st
     if !status.gtid_on {
         assert!(matches!(
             writer.binlog_request(&gtid_position, 6402, HEARTBEAT).await,
-            Err(MysqlError::Invalid(
-                "GTID auto-position requires gtid_mode=ON"
-            ))
+            Err(MysqlError::Resume(ResumeBlocker::GtidDisabled))
         ));
     } else {
         let mut tagged = gtid_position.clone();
@@ -226,7 +225,7 @@ async fn live_binlog_tls_status_rows_heartbeat_rotate() -> Result<(), Box<dyn st
         }
         assert!(matches!(
             writer.binlog_request(&tagged, 6402, HEARTBEAT).await,
-            Err(MysqlError::Invalid("tagged GTID requests unsupported"))
+            Err(MysqlError::Resume(ResumeBlocker::TaggedGtid))
         ));
     }
     for offset in [3, u64::from(u32::MAX) + 1] {
@@ -236,9 +235,7 @@ async fn live_binlog_tls_status_rows_heartbeat_rotate() -> Result<(), Box<dyn st
         }
         assert!(matches!(
             writer.binlog_request(&invalid, 6402, HEARTBEAT).await,
-            Err(MysqlError::Invalid(
-                "file offset outside COM_BINLOG_DUMP range"
-            ))
+            Err(MysqlError::Resume(ResumeBlocker::OffsetOutsideFile { .. }))
         ));
     }
     let position = if status.gtid_on {

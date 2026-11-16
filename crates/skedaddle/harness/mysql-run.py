@@ -56,8 +56,10 @@ def run_cargo(args, env, task, *, total_timeout=5400, output_timeout=1800):
 def main():
     profile, task_arg, gtid = sys.argv[1:4]
     # Explicit prefixes preserve empty optional arguments in Windows PowerShell.
-    spike_arg = sys.argv[4].removeprefix("--spike=") if len(sys.argv) > 4 else ""
-    cargo_test = sys.argv[5].removeprefix("--cargo-test=") if len(sys.argv) > 5 else ""
+    optional = [arg for arg in sys.argv[4:] if arg != "--replica"]
+    spike_arg = optional[0].removeprefix("--spike=") if optional else ""
+    cargo_test = optional[1].removeprefix("--cargo-test=") if len(optional) > 1 else ""
+    replica = "--replica" in sys.argv[4:]
     task = pathlib.Path(task_arg).resolve()
     if profile not in ("mysql80", "mysql84") or gtid not in ("ON", "OFF"):
         raise ValueError("expected mysql80/mysql84 and ON/OFF")
@@ -74,6 +76,7 @@ def main():
                RUSTC_WRAPPER="J:/gigglesdb-work/tools/bin/sccache.exe",
                SCCACHE_DIR="J:/gigglesdb-work/sccache-cache", SCCACHE_CACHE_SIZE="100G",
                CARGO_INCREMENTAL="0", CARGO_BUILD_JOBS="4")
+    services = [profile, profile + "-replica"] if replica else [profile]
     lock = json.loads((ROOT / "images.lock").read_text())["images"]
     for name in ("mysql80", "mysql84"):
         env[name.upper() + "_IMAGE"] = lock[name]["ref"]
@@ -81,9 +84,10 @@ def main():
     for name in ("PG", "MINIO", "GCS", "TOXIPROXY", "FAULTS"):
         env.setdefault(name + "_IMAGE", "unused:unselected")
 
-    def command(args, check=True, timeout=300):
+    def command(args, check=True, timeout=300, input=None):
         p = subprocess.run([str(a) for a in args], env=env, cwd=ROOT,
-                           capture_output=True, encoding="utf8", errors="replace", timeout=timeout)
+                           capture_output=True, encoding="utf8", errors="replace", timeout=timeout,
+                           input=input)
         if check and p.returncode:
             raise RuntimeError(f"command failed ({p.returncode}): {args}\n{p.stdout}\n{p.stderr}")
         return p
@@ -94,6 +98,11 @@ def main():
     def compose(*args, **kwargs):
         return docker("compose", "-f", ROOT / "compose.yaml", "-p", "skedaddle-" + run,
                       "--profile", profile, *args, **kwargs)
+
+    def sql(container, statement):
+        return docker("exec", "-e", "MYSQL_PWD=skedaddle", container,
+                      "mysql", "-h127.0.0.1", "-uroot", "--ssl-mode=VERIFY_CA",
+                      "--ssl-ca=/var/lib/mysql/harness/tls/ca.pem", "-Nse", statement).stdout
 
     def save(name, value):
         (task / name).write_text(value, encoding="utf8", newline="\n")
@@ -116,7 +125,7 @@ def main():
         save("disk-guard.txt", guard.stdout)
         if int(guard.stdout.splitlines()[-1].split()[3]) * 1024 < 4 * 1024**3:
             raise RuntimeError("Docker VM lacks 4 GiB headroom")
-        up = compose("up", "-d", "--wait", "--wait-timeout", "240", profile, check=False)
+        up = compose("up", "-d", "--wait", "--wait-timeout", "240", *services, check=False)
         save("startup.log", up.stdout + up.stderr)
         if up.returncode:
             raise RuntimeError("MySQL startup failed; see startup.log and server.log")
@@ -128,16 +137,70 @@ def main():
                    M1_OUTPUT=str(task), M1_PROFILE=profile, M1_GTID=gtid,
                    M1_CONTAINER_ID=cid)
         config_path = task / "mysql-config.json"
-        save("mysql-config.json", json.dumps(dict(host="localhost", port=int(env["M1_PORT"]),
+        test_config = dict(host="localhost", port=int(env["M1_PORT"]),
              ca=env["M1_CA"], user="root", password="skedaddle", profile=profile, gtid=gtid,
-             container_id=cid, max_decompressed_bytes=16 * 1024 * 1024)))
+             container_id=cid, max_decompressed_bytes=16 * 1024 * 1024)
+        if replica:
+            replica_service = profile + "-replica"
+            replica_cid = compose("ps", "-q", replica_service).stdout.strip()
+            save("replica-ca.pem", docker("exec", replica_cid, "cat",
+                                        "/var/lib/mysql/harness/tls/ca.pem").stdout)
+            # No client writes have begun. The source is quiescent throughout the
+            # dump and coordinate read, in both GTID and file-position modes.
+            dump = docker("exec", "-e", "MYSQL_PWD=skedaddle", cid, "mysqldump",
+                          "-h127.0.0.1", "-uroot", "--ssl-mode=VERIFY_CA",
+                          "--ssl-ca=/var/lib/mysql/harness/tls/ca.pem",
+                          "--single-transaction", "--no-tablespaces", "--set-gtid-purged=" +
+                          ("ON" if gtid == "ON" else "OFF"),
+                          "--databases", "type_zoo", "_skedaddle")
+            save("snapshot-dump.log", dump.stderr)
+            status_sql = "SHOW BINARY LOG STATUS" if profile == "mysql84" else "SHOW MASTER STATUS"
+            coordinates = sql(cid, status_sql).splitlines()[0].split("\t")
+            sql(replica_cid, "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF")
+            # This is a fresh, disposable clone: discard only its initialization
+            # GTIDs so promotion does not invent errant account-setup history.
+            sql(replica_cid, "RESET BINARY LOGS AND GTIDS" if profile == "mysql84" else "RESET MASTER")
+            docker("exec", "-i", "-e", "MYSQL_PWD=skedaddle", replica_cid,
+                   "mysql", "-h127.0.0.1", "-uroot", "--ssl-mode=VERIFY_CA",
+                   "--ssl-ca=/var/lib/mysql/harness/tls/ca.pem", "--binary-mode",
+                   input="SET SESSION sql_log_bin=0;\n" + dump.stdout)
+            # Only the public source CA crosses volumes; keys remain private.
+            docker("exec", "-i", replica_cid, "bash", "-c",
+                   "cat > /var/lib/mysql/harness/source-ca.pem; "
+                   "chown mysql:mysql /var/lib/mysql/harness/source-ca.pem", input=ca)
+            coordinate = ("SOURCE_AUTO_POSITION=1" if gtid == "ON" else
+                          f"SOURCE_LOG_FILE='{coordinates[0]}',SOURCE_LOG_POS={int(coordinates[1])}")
+            sql(replica_cid,
+                "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; "
+                f"CHANGE REPLICATION SOURCE TO SOURCE_HOST='{profile}',SOURCE_PORT=3306,"
+                "SOURCE_USER='root',SOURCE_PASSWORD='skedaddle',SOURCE_SSL=1,"
+                "SOURCE_SSL_VERIFY_SERVER_CERT=1,"
+                "SOURCE_SSL_CA='/var/lib/mysql/harness/source-ca.pem'," + coordinate + "; START REPLICA")
+            deadline = time.monotonic() + 60
+            while True:
+                # Check named columns instead of depending on version-specific offsets.
+                detail = docker("exec", "-e", "MYSQL_PWD=skedaddle", replica_cid,
+                                "mysql", "-h127.0.0.1", "-uroot", "--ssl-mode=VERIFY_CA",
+                                "--ssl-ca=/var/lib/mysql/harness/tls/ca.pem",
+                                "-e", "SHOW REPLICA STATUS\\G").stdout
+                if "Replica_IO_Running: Yes" in detail and "Replica_SQL_Running: Yes" in detail:
+                    break
+                if time.monotonic() >= deadline:
+                    save("replication-startup.txt", detail)
+                    raise RuntimeError("replication did not start; see replication-startup.txt")
+                time.sleep(0.2)
+            save("replication-startup.txt", detail)
+            address = compose("port", replica_service, "3306").stdout.strip()
+            test_config["replica"] = dict(test_config, port=int(address.rsplit(":", 1)[1]),
+                                          ca=str(task / "replica-ca.pem"), container_id=replica_cid)
+        save("mysql-config.json", json.dumps(test_config))
         env["SKEDADDLE_MYSQL_CONFIG"] = str(config_path)
-        sql = ("SELECT @@version,@@gtid_mode,@@binlog_format,@@binlog_row_image,@@binlog_row_metadata; "
+        probe_sql = ("SELECT @@version,@@gtid_mode,@@binlog_format,@@binlog_row_image,@@binlog_row_metadata; "
                "SELECT COUNT(*) FROM type_zoo.zoo; "
                "SELECT HEX(cv),HEX(JSON_UNQUOTE(JSON_EXTRACT(jv,'$.nested[3]'))),OCTET_LENGTH(wide_row) FROM type_zoo.zoo WHERE id=1;")
         probe = docker("exec", "-e", "MYSQL_PWD=skedaddle", cid, "mysql", "-h127.0.0.1", "-uroot",
                        "--ssl-mode=VERIFY_CA", "--ssl-ca=/var/lib/mysql/harness/tls/ca.pem",
-                       "--default-character-set=utf8mb4", "-Nse", sql)
+                       "--default-character-set=utf8mb4", "-Nse", probe_sql)
         save("setup-probe.txt", probe.stdout)
         if cargo_test:
             # A caller holding its lane lock may explicitly skip reacquisition.
@@ -170,8 +233,17 @@ def main():
             print(result.stderr, file=sys.stderr, end="")
         return result.returncode
     finally:
-        logs = compose("logs", "--no-color", profile, check=False)
+        logs = compose("logs", "--no-color", *services, check=False)
         save("server.log", logs.stdout + logs.stderr)
+        usage = {}
+        for service in services:
+            container = compose("ps", "-aq", service, check=False).stdout.strip()
+            if container:
+                usage[service] = dict(
+                    data=docker("exec", container, "du", "-sk", "/var/lib/mysql", check=False).stdout,
+                    memory=docker("stats", "--no-stream", "--format", "{{.MemUsage}}", container,
+                                  check=False).stdout)
+        save("resource-usage.json", json.dumps(usage, indent=2))
         # Compose only removes this project. The guard was not created by compose.
         compose("down", "--volumes", "--remove-orphans")
         guard = docker("inspect", guard_name, check=False)

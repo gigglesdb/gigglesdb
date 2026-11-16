@@ -462,6 +462,7 @@ fn assert_plans_unchanged(txns: &[AssembledTxn], version: u64) {
             txn,
             &tables,
             &apply::PlanContext {
+                positions: apply::SourcePositions::native_pg("pg-test"),
                 stream: "wal".into(),
                 mseq: mseq as u64,
                 origin: "skedaddle_p5e".into(),
@@ -958,7 +959,13 @@ async fn chunk_publication_at_high_precedes_next_commit_and_validates_in_journal
             )])
         })
         .collect();
-    let window = Window::new(plan.table.clone(), range.clone(), snapshot, 1).unwrap();
+    let window = Window::new(
+        plan.table.postgres().unwrap().clone(),
+        range.clone(),
+        snapshot,
+        1,
+    )
+    .unwrap();
     struct Sink {
         window: Window,
         marks: Vec<Watermark>,

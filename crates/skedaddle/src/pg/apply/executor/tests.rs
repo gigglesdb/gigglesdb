@@ -127,6 +127,7 @@ fn plan(t: &AssembledTxn, mseq: u64) -> super::super::Result<TransactionPlan> {
         t,
         &[],
         &super::super::PlanContext {
+            positions: SourcePositions::native_pg("p6b"),
             stream: "forward".into(),
             mseq,
             origin: "origin".into(),
@@ -144,17 +145,22 @@ struct Probe {
 #[async_trait]
 impl Destination for Probe {
     async fn apply(&mut self, p: &TransactionPlan) -> Result<CommitDecision> {
-        self.trace
-            .lock()
-            .unwrap()
-            .push(format!("apply:{}:{}", p.progress.mseq, p.progress.lsn));
-        if self.fail == Some(p.progress.lsn) {
+        self.trace.lock().unwrap().push(format!(
+            "apply:{}:{}",
+            p.progress.mseq,
+            u64::from_be_bytes(p.progress.position.bytes().try_into().unwrap())
+        ));
+        if self.fail
+            == Some(u64::from_be_bytes(
+                p.progress.position.bytes().try_into().unwrap(),
+            ))
+        {
             return Err(Error::Database);
         }
-        self.trace
-            .lock()
-            .unwrap()
-            .push(format!("commit:{}", p.progress.lsn));
+        self.trace.lock().unwrap().push(format!(
+            "commit:{}",
+            u64::from_be_bytes(p.progress.position.bytes().try_into().unwrap())
+        ));
         Ok(CommitDecision::Applied)
     }
     async fn retain_after_checkpoint(&mut self, cp: &ReaderCheckpoint) -> Result<()> {
@@ -487,11 +493,18 @@ async fn equal_h_real_reader_binds_manifest_kind_including_empty_nonfinal_chunk(
         super::super::RecordKind::ChunkRows
     );
     assert_eq!(
-        resolve_commit(&rows_plan.progress, Some(&h_plan.progress), 20, None),
+        resolve_commit(
+            &SourcePositions::native_pg("p6b"),
+            &rows_plan.progress,
+            Some(&h_plan.progress),
+            20,
+            None
+        ),
         Ok(CommitDecision::NotApplied)
     );
     assert_eq!(
         resolve_commit(
+            &SourcePositions::native_pg("p6b"),
             &h_plan.progress,
             Some(&rows_plan.progress),
             20,
@@ -542,4 +555,41 @@ async fn equal_h_real_reader_rejects_second_chunk_and_lineage_conflicts() {
             Err(crate::buffer::reader::Error::RecoveryRequired(_))
         ));
     }
+}
+
+#[test]
+fn native_pg_progress_and_receipt_position_bytes_match_v2_golden() {
+    let txn = txn(0x0123_4567_89ab_cdef);
+    let plan = plan(&txn, 7).unwrap();
+    let golden = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+    assert_eq!(plan.progress.position, Position::new("p6b", golden));
+    assert_eq!(
+        plan.statements.last().unwrap().parameters[3].bytes(),
+        Some(golden.as_slice())
+    );
+    assert_eq!(receipt_position(&plan.progress), golden);
+    assert_eq!(
+        plan.statements[1].parameters[0].bytes(),
+        Some(b"1234567/89ABCDEF".as_slice())
+    );
+}
+
+#[test]
+fn opaque_hash_lookup_verifies_full_domain_and_bytes() {
+    let position = Position::new("decimal", b"1000");
+    assert!(verify_hash_match(&position, &position).is_ok());
+    for collision in [
+        Position::new("decimal", b"1001"),
+        Position::new("other", b"1000"),
+    ] {
+        assert!(matches!(
+            verify_hash_match(&position, &collision),
+            Err(Error::Apply(ApplyError::PositionHashCollision))
+        ));
+    }
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        position_hash(&position).as_slice(),
+        Sha256::digest(b"decimal\x001000").as_slice()
+    );
 }

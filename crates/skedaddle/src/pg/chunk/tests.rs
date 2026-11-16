@@ -6,6 +6,22 @@ use crate::{
     pg::pgoutput::Message,
 };
 
+#[test]
+fn pg_logical_plan_hash_golden() {
+    let ranges = plan_chunks(&table(&[Direction::Asc]), 100, &[key(10), key(20)]).unwrap();
+    let plan = crate::coordinator::chunk::ChunkPlan::new(
+        table(&[Direction::Asc]),
+        100,
+        vec![key(10), key(20)],
+    )
+    .unwrap();
+    assert_eq!(plan.ranges, ranges);
+    assert_eq!(
+        ranges[0].id.plan,
+        "c74a32a037c427b6b84119ba49b8ee6d8fb6f8ae60ff56949c036ca2e895849d"
+    );
+}
+
 fn name(n: &str) -> QualifiedName {
     QualifiedName {
         schema: "pg_catalog".into(),

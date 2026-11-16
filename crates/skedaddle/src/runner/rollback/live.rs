@@ -381,6 +381,7 @@ fn run_slice(
         format!("{id}_rev"),
         format!("skedaddle_{id}_rev"),
         1000,
+        crate::pg::apply::SourcePositions::native_pg(format!("{id}_rev")),
     )
     .map_err(invalid)?;
     // Verification uses the original source-side key inventory and saved plans.

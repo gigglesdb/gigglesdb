@@ -185,16 +185,22 @@ struct Target {
 #[async_trait]
 impl Destination for Target {
     async fn apply(&mut self, p: &apply::TransactionPlan) -> executor::Result<CommitDecision> {
-        self.trace
-            .lock()
-            .unwrap()
-            .push(format!("apply:{}", p.progress.lsn));
+        self.trace.lock().unwrap().push(format!(
+            "apply:{}",
+            u64::from_be_bytes(p.progress.position.bytes().try_into().unwrap())
+        ));
         assert_eq!(
             p.session_setup.parameters[0].bytes(),
             Some(b"skedaddle_m_rev".as_slice())
         );
-        self.rows.insert(p.progress.lsn);
-        if self.fail == Some(p.progress.lsn) {
+        self.rows.insert(u64::from_be_bytes(
+            p.progress.position.bytes().try_into().unwrap(),
+        ));
+        if self.fail
+            == Some(u64::from_be_bytes(
+                p.progress.position.bytes().try_into().unwrap(),
+            ))
+        {
             self.fail = None;
             return Err(executor::Error::Database);
         }
@@ -525,8 +531,14 @@ async fn rollback_preserves_destination_writes() {
     }];
     let (mut key, mut journal, _, _) = fixture();
     key.migration = id;
-    let mut executor =
-        executor::Executor::new(PgConnector(sc), stream.clone(), origin.clone(), 100).unwrap();
+    let mut executor = executor::Executor::new(
+        PgConnector(sc),
+        stream.clone(),
+        origin.clone(),
+        100,
+        apply::SourcePositions::new(replay.order.clone(), apply::OriginPolicy::NativePgLsn),
+    )
+    .unwrap();
     let mut verification = vec![TableVerification {
         destination: PgRows {
             client: dst,

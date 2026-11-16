@@ -12,7 +12,8 @@ param(
     [string]$MysqlSpike='',
     [string]$MysqlCargoTest='',
     # Optional PG binary or binary::test-filter selections; empty keeps the full matrix.
-    [string[]]$PgTestSelection=@()
+    [string[]]$PgTestSelection=@(),
+    [switch]$MysqlReplica=($env:SKEDADDLE_MYSQL_REPLICA -eq '1')
 )
 $ErrorActionPreference='Stop'
 $resolved=[IO.Path]::GetFullPath($TaskRoot).Replace('\','/')
@@ -60,7 +61,7 @@ if ($Phase -in @('mysql80','mysql84')) {
         # Windows PowerShell treats redirected native stderr as an error record.
         # Preserve the process exit code and always reach teardown verification.
         $ErrorActionPreference='Continue'
-        & python -I -X "pycache_prefix=$resolved/pycache" (Join-Path $PSScriptRoot 'mysql-run.py') $Phase $resolved $MysqlGtid "--spike=$MysqlSpike" "--cargo-test=$MysqlCargoTest"
+        & python -I -X "pycache_prefix=$resolved/pycache" (Join-Path $PSScriptRoot 'mysql-run.py') $Phase $resolved $MysqlGtid "--spike=$MysqlSpike" "--cargo-test=$MysqlCargoTest" $(if ($MysqlReplica) { '--replica' })
         $mysqlResult=$LASTEXITCODE
     } finally {
         $mysqlOwnerPath=Join-Path $resolved 'owner.json'

@@ -299,6 +299,13 @@ pub fn run(
     mut pause: watch::Receiver<bool>,
 ) -> impl std::future::Future<Output = Result<Reached, RunError>> {
     Box::pin(async move {
+        if definition.source.engine == Engine::Mysql {
+            return Err(RunError::Preparation(failure(
+                FailureKind::NotWired,
+                "MySQL source runtime not wired yet",
+                "Run live MySQL preflight; wait for the qualified forward runtime before start/resume.",
+            )));
+        }
         // Terminal replay is authenticated before connections or copy workers start.
         if resume {
             let terminal = open_journal(root, id).await?.load(true).await?;
@@ -629,11 +636,15 @@ pub fn run(
         // Keep the exact migration-qualified identity across all buffer bindings.
         let stream = config.stream.clone();
         let plan_stream = stream.clone();
+        let positions =
+            apply::SourcePositions::new(order.clone(), apply::OriginPolicy::NativePgLsn);
+        let plan_positions = positions.clone();
         let planner = move |txn: &AssembledTxn, mseq, state: &Materialized| {
             apply::plan_transaction_with_ddl(
                 txn,
                 &tables,
                 &apply::PlanContext {
+                    positions: plan_positions.clone(),
                     stream: plan_stream.clone(),
                     mseq,
                     origin: plan_origin.clone(),
@@ -660,6 +671,7 @@ pub fn run(
             stream.clone(),
             origin,
             1000,
+            positions,
         )
         .map_err(recovery)?;
         let mut reader_config = config;

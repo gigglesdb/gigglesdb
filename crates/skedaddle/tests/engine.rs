@@ -17,7 +17,7 @@ use skedaddle::{
     },
     cutover::{self, SourceFence as _},
     engine::{self, CopyConfig, Engine, PgApplier, PgCapture, PgChunks, PgInstaller},
-    event::{AssembledTxn, EventError, PositionOrder, SourceIdentity},
+    event::{AssembledTxn, EventError, Position, PositionOrder, SourceIdentity},
     mapping::{PgType, Value},
     pg::{
         self,
@@ -769,6 +769,8 @@ fn copy_table(
         let plan_installation = id.clone();
         let internal_plans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let planned_internal = internal_plans.clone();
+        let positions = apply::SourcePositions::new(order.clone(), apply::OriginPolicy::NativePgLsn);
+        let plan_positions = positions.clone();
         let planner = move |txn: &AssembledTxn, mseq: u64, state: &Materialized| {
             // This qualification has one unbounded range, so no Rust key-order
             // approximation is needed. Pre-H records remain Copying on replay.
@@ -786,6 +788,7 @@ fn copy_table(
                 txn,
                 &tables,
                 &apply::PlanContext {
+                    positions: plan_positions.clone(),
                     stream: plan_stream.clone(),
                     mseq,
                     origin: plan_origin.clone(),
@@ -815,6 +818,7 @@ fn copy_table(
             apply_stream.clone(),
             origin.clone(),
             1000,
+            positions,
         )?;
         let (apply_gate, gated) = tokio::sync::watch::channel(false);
         let applier = PgApplier::new(
@@ -1057,7 +1061,7 @@ fn copy_table(
                     &repl,
                     &id,
                 ))
-                .await?;
+                .await.inspect_err(|error| eprintln!("live readiness qualification failed: {error}"))?;
                 return TestResult::Ok(());
             }
             pause.send_replace(true);
@@ -1360,7 +1364,7 @@ async fn qualify_live_readiness(
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 if let Some(lag) = runtime.live_readiness().lag
                     && lag.oldest_unapplied_age_ms > 1000
-                    && lag.lag_bytes > 0
+                    && lag.lag.value > 0
                     && !lag.within_budget(&definition)
                 {
                     break;
@@ -1458,6 +1462,9 @@ struct ArmingWrites<E> {
 }
 #[async_trait]
 impl<E: SqlChangeEvidence> SqlChangeEvidence for ArmingWrites<E> {
+    fn position_order(&self) -> verify::SourcePositionOrder {
+        self.inner.position_order()
+    }
     async fn arm(&mut self, range: &verify::RangePlan) -> verify::Result<()> {
         self.inner.arm(range).await?;
         self.writer
@@ -1468,7 +1475,7 @@ impl<E: SqlChangeEvidence> SqlChangeEvidence for ArmingWrites<E> {
     async fn changes(
         &mut self,
         range: &verify::RangePlan,
-        lsn: u64,
+        lsn: Position,
     ) -> verify::Result<verify::ChangeEvidence> {
         self.inner.changes(range, lsn).await
     }
@@ -1495,7 +1502,12 @@ async fn qualify_live_verification(
         Int4KeyOrder,
         limits,
     )?;
-    let mut source_rows = verification_rows(source_dsn, ca, id, Side::Source).await?;
+    let pg_positions = verify::sql::PgSourcePosition::new(evidence.position_order().domain());
+    let verify_position = |lsn| pg_positions.position(lsn);
+    let lsn = |position: &Position| pg_positions.lsn(position);
+    let mut source_rows = verification_rows(source_dsn, ca, id, Side::Source)
+        .await?
+        .with_source_positions(pg_positions.clone());
     let mut destination_rows =
         verification_rows(destination_dsn, ca, id, Side::Destination).await?;
     assert_eq!(
@@ -1503,11 +1515,11 @@ async fn qualify_live_verification(
         2 * std::mem::size_of::<usize>()
     );
     assert_eq!(
-        std::mem::size_of_val(&evidence.changes(&range, 0)),
+        std::mem::size_of_val(&evidence.changes(&range, verify_position(0))),
         2 * std::mem::size_of::<usize>()
     );
     assert_eq!(
-        std::mem::size_of_val(&waiter.wait_until(0)),
+        std::mem::size_of_val(&waiter.wait_until(verify_position(0))),
         2 * std::mem::size_of::<usize>()
     );
     // This transaction writes BEFORE arm and commits AFTER the source snapshot.
@@ -1540,8 +1552,9 @@ async fn qualify_live_verification(
     // an authenticated applied SOURCE marker rather than use destination WAL.
     let wait_sql = format!("INSERT INTO {id}.rows VALUES(205,'during-wait')");
     let during_wait = source.batch_execute(&wait_sql);
-    let (waited, wait_write) = tokio::join!(waiter.wait_until(snapshot.lsn), during_wait);
-    assert!(waited? >= snapshot.lsn);
+    let (waited, wait_write) =
+        tokio::join!(waiter.wait_until(snapshot.position.clone()), during_wait);
+    assert!(lsn(&waited?)? >= lsn(&snapshot.position)?);
     wait_write?;
     let during_destination = async {
         source.batch_execute(&format!("UPDATE {id}.rows SET body='during-destination' WHERE id=11;INSERT INTO {id}.rows VALUES(202,'during-destination')")).await
@@ -1552,7 +1565,8 @@ async fn qualify_live_verification(
     );
     destination_read?;
     writes?;
-    let changes = evidence.changes(&range, snapshot.lsn).await?;
+    let changes = evidence.changes(&range, snapshot.position).await?;
+    let through = changes.through_position;
     for id in [7, 8, 10, 11, 201, 202, 203, 204, 205, 208, 299] {
         assert!(
             changes.keys.contains(&vec![Value::Int4(id)]),
@@ -1570,28 +1584,29 @@ async fn qualify_live_verification(
             .all(|w| Int4KeyOrder.compare_keys(&w[0], &w[1]).unwrap() == Ordering::Less)
     );
     assert!(
-        waiter.wait_until(changes.through_lsn).await? >= changes.through_lsn,
+        lsn(&waiter.wait_until(through.clone()).await?)? >= lsn(&through)?,
         "capture-only marker cannot satisfy applied proof"
     );
 
     // An empty armed interval still needs a fresh real committed barrier.
     evidence.arm(&range).await?;
-    let empty = evidence.changes(&range, changes.through_lsn).await?;
+    let empty = evidence.changes(&range, through).await?;
+    let empty_through = empty.through_position;
     assert!(empty.keys.is_empty());
-    assert!(waiter.wait_until(empty.through_lsn).await? >= empty.through_lsn);
+    assert!(lsn(&waiter.wait_until(empty_through.clone()).await?)? >= lsn(&empty_through)?);
     evidence.arm(&range).await?;
     evidence.disarm();
     evidence.disarm();
     assert!(matches!(
-        evidence.changes(&range, empty.through_lsn).await,
+        evidence.changes(&range, empty_through.clone()).await,
         Err(verify::VerifyError::EvidenceInvalidated {
             reason: verify::EvidenceInvalidation::CaptureGap
         })
     ));
     evidence.arm(&range).await?;
-    let rearmed = evidence.changes(&range, empty.through_lsn).await?;
+    let rearmed = evidence.changes(&range, empty_through.clone()).await?;
     assert!(rearmed.keys.is_empty());
-    waiter.wait_until(rearmed.through_lsn).await?;
+    waiter.wait_until(rearmed.through_position).await?;
 
     // Overflow propagates all the way through the real SQL boundary session.
     // It must not emit a successful/mismatched comparison, even for empty reads.
@@ -1638,15 +1653,16 @@ async fn qualify_live_verification(
     // A caller can cancel marker emission/observation; its observer is removed,
     // and a later interval requires a distinct fresh marker.
     evidence.arm(&range).await?;
-    let mut cancelled = Box::pin(evidence.changes(&range, empty.through_lsn));
+    let mut cancelled = Box::pin(evidence.changes(&range, empty_through.clone()));
     assert!(matches!(
         futures::poll!(cancelled.as_mut()),
         std::task::Poll::Pending
     ));
     drop(cancelled);
     evidence.arm(&range).await?;
-    let after_cancel = evidence.changes(&range, empty.through_lsn).await?;
-    waiter.wait_until(after_cancel.through_lsn).await?;
+    let after_cancel = evidence.changes(&range, empty_through.clone()).await?;
+    let after_through = after_cancel.through_position;
+    waiter.wait_until(after_through.clone()).await?;
 
     let (_, mut timeout_waiter) = runtime.pg_verification(
         connect(source_dsn, ca).await?,
@@ -1658,24 +1674,24 @@ async fn qualify_live_verification(
         },
     )?;
     assert!(matches!(
-        timeout_waiter.wait_until(u64::MAX).await,
+        timeout_waiter.wait_until(verify_position(u64::MAX)).await,
         Err(verify::VerifyError::ApplierTimeout {
-            waited_lsn: u64::MAX,
+            waited_position,
             ..
-        })
+        }) if waited_position == verify_position(u64::MAX)
     ));
     // The ONLY injected fault: real stream capture cannot deliberately omit a
     // committed interval. It fails closed alongside the real path exercised above.
     evidence.arm(&range).await?;
     runtime.invalidate_verification_capture_gap();
     assert!(matches!(
-        evidence.changes(&range, after_cancel.through_lsn).await,
+        evidence.changes(&range, after_through).await,
         Err(verify::VerifyError::EvidenceInvalidated {
             reason: verify::EvidenceInvalidation::CaptureGap
         })
     ));
     assert!(matches!(
-        waiter.wait_until(0).await,
+        waiter.wait_until(verify_position(0)).await,
         Err(verify::VerifyError::EvidenceInvalidated {
             reason: verify::EvidenceInvalidation::CaptureGap
         })

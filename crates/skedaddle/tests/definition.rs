@@ -365,10 +365,9 @@ fn spanner_structure_dialect_and_credentials_are_strict() {
 }
 
 #[test]
-fn non_spanner_endpoints_still_require_connection_references_and_versions() {
+fn non_spanner_endpoints_require_engine_specific_shapes_and_versions() {
     for engine in [
         "postgresql",
-        "mysql",
         "mariadb",
         "sqlite",
         "sql-server",
@@ -391,6 +390,45 @@ fn non_spanner_endpoints_still_require_connection_references_and_versions() {
                 );
             }
         }
+    }
+    for side in ["source", "destination"] {
+        for pg_reference in [false, true] {
+            let mut value = example_value();
+            value[side]["engine"] = json!("mysql");
+            value[side]["version"] = json!("8.4");
+            if !pg_reference {
+                value[side]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("connection_ref");
+            }
+            let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+                panic!("MySQL must require its typed endpoint block");
+            };
+            assert!(errors.iter().any(|error| {
+                error.path == format!("{side}.mysql")
+                    && error.message == "MySQL engine requires a mysql endpoint block"
+            }));
+            if pg_reference {
+                assert!(errors.iter().any(|error| {
+                    error.path == side
+                        && error.message
+                            == "MySQL requires only its mysql endpoint block, without connection_ref or spanner"
+                }));
+            }
+        }
+        let mut value = example_value();
+        value[side] = mysql_connection();
+        assert!(parse_value(&value).is_ok());
+        value[side].as_object_mut().unwrap().remove("version");
+        let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+            panic!("MySQL must require its version family");
+        };
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.path == format!("{side}.version"))
+        );
     }
 }
 
@@ -921,14 +959,7 @@ fn exclusions_require_reason_and_appear_in_report() {
 
 #[test]
 fn unsupported_engine_blocks_preflight() {
-    for engine in [
-        "mysql",
-        "mariadb",
-        "sqlite",
-        "sql-server",
-        "oracle",
-        "mongodb",
-    ] {
+    for engine in ["mariadb", "sqlite", "sql-server", "oracle", "mongodb"] {
         for side in ["source", "destination", "both"] {
             let mut value = example_value();
             if side != "destination" {
@@ -953,6 +984,52 @@ fn unsupported_engine_blocks_preflight() {
                 4,
                 "one blocker, two advisory trust summaries and one advisory exclusion"
             );
+        }
+    }
+    for version in ["8.0", "8.4"] {
+        for side in ["source", "destination", "both"] {
+            let mut value = example_value();
+            for endpoint in ["source", "destination"] {
+                if side == endpoint || side == "both" {
+                    value[endpoint] = mysql_connection();
+                    value[endpoint]["version"] = json!(version);
+                }
+            }
+            let report = CapabilityReport::from_definition(&parse_value(&value).unwrap()).unwrap();
+            let blocking = report.blocking();
+            if side != "destination" {
+                let mysql_items: Vec<_> = report
+                    .items
+                    .iter()
+                    .filter(|item| item.id.starts_with("source.mysql."))
+                    .collect();
+                assert_eq!(
+                    mysql_items
+                        .iter()
+                        .map(|item| item.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["source.mysql.preflight", "source.mysql.mapping"]
+                );
+                for item in mysql_items {
+                    assert_eq!(item.status, ItemStatus::Unverified);
+                    assert_eq!(item.criticality, Criticality::Critical);
+                    assert!(blocking.contains(&item));
+                }
+            }
+            if side != "source" {
+                assert!(blocking.iter().any(|item| {
+                    item.id == "connector.unsupported"
+                        && item.status == ItemStatus::Unsupported
+                        && item.criticality == Criticality::Critical
+                }));
+            } else {
+                assert!(
+                    blocking
+                        .iter()
+                        .all(|item| item.status == ItemStatus::Unverified)
+                );
+                assert_eq!(blocking.len(), 2);
+            }
         }
     }
 }
@@ -1475,4 +1552,85 @@ async fn live_spanner_seam_without_connections_preserves_offline_report() {
             assert_eq!(offline, live);
         }
     }
+}
+
+fn mysql_connection() -> Value {
+    json!({"engine":"mysql", "version":"8.4", "tls_ca_ref":"env:MYSQL_CA",
+        "mysql":{"host":"localhost", "port":3306, "user":"env:MYSQL_USER",
+        "password":"env:MYSQL_PASSWORD", "gtid_mode":"ON"}})
+}
+
+#[test]
+fn mysql_endpoint_validates_strict_shape_and_policy() {
+    let mut value = example_value();
+    value["source"] = mysql_connection();
+    let definition = parse_value(&value).unwrap();
+    assert_eq!(definition.source.tls, TlsPolicy::Required);
+    for (field, invalid) in [
+        ("port", json!(0)),
+        ("port", json!(65536)),
+        ("host", json!(" padded")),
+        ("user", json!("inline-secret")),
+        ("password", json!("inline-secret")),
+        ("gtid_mode", json!("ON_PERMISSIVE")),
+        ("unknown", json!(true)),
+    ] {
+        let mut invalid_value = value.clone();
+        invalid_value["source"]["mysql"][field] = invalid;
+        let error = parse_value(&invalid_value).unwrap_err().to_string();
+        assert!(!error.contains("inline-secret"));
+    }
+    for version in ["8", "8.0.40", "8.4.7", "9.0", "MariaDB"] {
+        value["source"]["version"] = json!(version);
+        assert!(parse_value(&value).is_err());
+    }
+    value["source"]["version"] = json!("8.0");
+    value["source"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tls_ca_ref");
+    assert!(parse_value(&value).is_err());
+    value["source"]["tls"] = json!("disable-for-local-test");
+    assert!(parse_value(&value).is_ok());
+    value["source"]["engine"] = json!("postgresql");
+    assert!(parse_value(&value).is_err());
+    let mut changed = definition.clone();
+    changed.source.mysql.as_mut().unwrap().gtid_mode =
+        Some(skedaddle::definition::MysqlGtidMode::Off);
+    assert_ne!(
+        definition.canonical_digest().unwrap(),
+        changed.canonical_digest().unwrap()
+    );
+}
+
+#[test]
+fn mysql_offline_capability_blocks_and_endpoint_debug_is_redacted() {
+    let mut value = example_value();
+    value["source"] = mysql_connection();
+    let definition = parse_value(&value).unwrap();
+    let debug = format!("{:?}", definition.source);
+    assert!(!debug.contains("MYSQL_USER"));
+    assert!(!debug.contains("MYSQL_PASSWORD"));
+    assert!(debug.contains("[REDACTED]"));
+    let report = CapabilityReport::from_definition(&definition).unwrap();
+    let items: Vec<_> = report
+        .items
+        .iter()
+        .filter(|i| i.id.starts_with("source.mysql."))
+        .collect();
+    assert_eq!(items.len(), 2);
+    assert!(
+        items
+            .iter()
+            .all(|i| i.status == ItemStatus::Unverified && i.criticality == Criticality::Critical)
+    );
+    assert_eq!(report.blocking().len(), 2);
+    value["destination"] = mysql_connection();
+    assert!(
+        CapabilityReport::from_definition(&parse_value(&value).unwrap())
+            .unwrap()
+            .blocking()
+            .iter()
+            .any(|i| i.status == ItemStatus::Unsupported)
+    );
 }

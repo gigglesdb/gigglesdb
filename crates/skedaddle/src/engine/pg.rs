@@ -479,9 +479,10 @@ impl PgChunks {
         tables: &'a [pg::catalog::TableCatalog],
         plan: &ChunkPlan,
     ) -> Result<&'a pg::catalog::TableCatalog> {
+        let key = plan.table.postgres().map_err(recovery)?;
         tables
             .iter()
-            .find(|table| table.key == plan.table)
+            .find(|table| &table.key == key)
             .ok_or_else(|| recovery("unqualified chunk table"))
     }
     /// Preview the exact qualified projection used by snapshot reads.
@@ -659,6 +660,7 @@ impl<D: Destination, P: PgTransactionPlanner> PgApplier<D, P> {
                         if_previous_missing: false,
                     };
                     Ok(apply::TransactionPlan {
+                        origin_policy: apply::OriginPolicy::NativePgLsn,
                         source_origin: txn.source_origin.clone(),
                         session_setup: placeholder.clone(),
                         statements: vec![placeholder],
@@ -666,13 +668,7 @@ impl<D: Destination, P: PgTransactionPlanner> PgApplier<D, P> {
                             stream: stream.clone(),
                             mseq,
                             txn: txn.txn.clone(),
-                            lsn: u64::from_be_bytes(
-                                txn.commit_position.bytes().try_into().map_err(|_| {
-                                    apply::ApplyError::Invalid(
-                                        "PG commit position must be an eight-byte LSN",
-                                    )
-                                })?,
-                            ),
+                            position: txn.commit_position.clone(),
                             digest: txn.digest,
                             evidence: None,
                         },
@@ -798,19 +794,16 @@ impl<D: Destination, P: PgTransactionPlanner> Destination for PlanningDestinatio
             || p.mseq != e.mseq
             || p.txn != e.txn
             || p.digest != e.digest
-            || p.lsn != e.lsn
+            || p.position != e.position
         {
             return Err(apply::ApplyError::Invalid("reader plan identity").into());
         }
+        plan.progress = envelope.progress.clone();
         *plan
             .statements
             .last_mut()
-            .ok_or(apply::ApplyError::Invalid("missing progress write"))? = envelope
-            .statements
-            .last()
-            .expect("reader progress write")
-            .clone();
-        plan.progress = envelope.progress.clone();
+            .ok_or(apply::ApplyError::Invalid("missing progress write"))? =
+            apply::progress_statement(&plan.progress, plan.origin_policy);
         // From this point onward cancellation must drain, including persistence
         // of the reader checkpoint and receipt retention in ReaderLoop::step.
         if self
@@ -928,4 +921,107 @@ pub fn capture<R: source::TypeResolver>(
         pg::chunk::MESSAGE_PREFIX.into(),
     )
     .map_err(recovery)
+}
+
+/// PostgreSQL adapter: byte distance is diagnostic, age uses source commit time.
+pub struct PgReadinessProbe {
+    source: SourceIdentity,
+    tip: Position,
+    source_time_us: i64,
+    started: std::time::Instant,
+}
+impl PgReadinessProbe {
+    pub(super) fn matches_lag(lag: &ApplyLagObservation) -> bool {
+        let domain = lag.order.domain();
+        match (
+            pg_position_lsn(&lag.source_tip, domain),
+            pg_position_lsn(&lag.applied_source, domain),
+        ) {
+            (Ok(tip), Ok(applied)) => {
+                tip > 0
+                    && applied > 0
+                    && lag.lag.unit == "bytes"
+                    && lag.lag.value == tip.saturating_sub(applied)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn new(
+        source: SourceIdentity,
+        domain: String,
+        tip: u64,
+        source_time_us: i64,
+        started: std::time::Instant,
+    ) -> Self {
+        Self {
+            source,
+            tip: Position::new(domain, tip.to_be_bytes()),
+            source_time_us,
+            started,
+        }
+    }
+}
+impl ReadinessProbe for PgReadinessProbe {
+    fn source(&self) -> &SourceIdentity {
+        &self.source
+    }
+    fn tip(&self) -> &Position {
+        &self.tip
+    }
+    fn observed_at(&self) -> std::time::Instant {
+        self.started
+    }
+    fn sample(
+        &self,
+        applied: &Position,
+        oldest_commit: Option<Option<i64>>,
+    ) -> std::result::Result<ReadinessProbeSample, crate::event::EventError> {
+        use crate::event::EventError;
+        let order = crate::pg::apply::NativePgOrder(self.tip.order_domain().into());
+        self.tip.compare(applied, &order)?;
+        let decode = |p: &Position| {
+            <[u8; 8]>::try_from(p.bytes())
+                .map(u64::from_be_bytes)
+                .map_err(|_| EventError::InvalidEncoding("PostgreSQL readiness position width"))
+        };
+        let tip = decode(&self.tip)?;
+        let applied = decode(applied)?;
+        if tip == 0 || applied == 0 {
+            return Err(EventError::InvalidEncoding(
+                "zero PostgreSQL readiness position",
+            ));
+        }
+        let age = Self::commit_age(self.source_time_us, self.started.elapsed(), oldest_commit);
+        Ok(ReadinessProbeSample {
+            lag: Some(LagMeasure {
+                value: tip.saturating_sub(applied),
+                unit: "bytes",
+            }),
+            oldest_unapplied_age_ms: age,
+            retention: None,
+            schema: None,
+            observed_at: self.started,
+        })
+    }
+}
+impl PgReadinessProbe {
+    pub(super) fn commit_age(
+        source_time_us: i64,
+        elapsed: Duration,
+        oldest_commit: Option<Option<i64>>,
+    ) -> Option<u64> {
+        // Preserve the old checked source-clock arithmetic even when drained.
+        let now = i64::try_from(elapsed.as_micros())
+            .ok()
+            .and_then(|elapsed| source_time_us.checked_add(elapsed))?;
+        match oldest_commit {
+            None => Some(0),
+            Some(Some(committed)) => now
+                .checked_sub(committed)
+                .and_then(|age| u64::try_from(age).ok())
+                .map(|age| age.div_ceil(1000)),
+            Some(None) => None,
+        }
+    }
 }

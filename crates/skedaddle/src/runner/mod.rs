@@ -44,6 +44,7 @@ pub enum FailureKind {
     InvalidInput,
     Infrastructure,
     Blocked,
+    NotWired,
 }
 
 #[derive(Debug, Serialize)]
@@ -332,4 +333,288 @@ async fn prepare(definition: &MigrationDefinition) -> Result<Prepared, Failure> 
     tokio::time::timeout(Duration::from_secs(30), operation)
         .await
         .map_err(|_| infrastructure())?
+}
+
+/// Live source preflight only; this does not install or start a migration.
+/// Caller supplies real retention estimates and an explicit decoder bound.
+pub async fn assess_mysql(
+    definition: &MigrationDefinition,
+    options: crate::mysql::preflight::Options,
+) -> Result<crate::CapabilityReport, Failure> {
+    assess_mysql_endpoints(definition, options, true).await
+}
+/// Inspect only the source when destination configuration is unavailable.
+/// Destination evidence remains an explicit critical blocker.
+pub async fn assess_mysql_source(
+    definition: &MigrationDefinition,
+    options: crate::mysql::preflight::Options,
+) -> Result<crate::CapabilityReport, Failure> {
+    assess_mysql_endpoints(definition, options, false).await
+}
+async fn assess_mysql_endpoints(
+    definition: &MigrationDefinition,
+    mut options: crate::mysql::preflight::Options,
+    inspect_destination: bool,
+) -> Result<crate::CapabilityReport, Failure> {
+    use crate::{
+        capability::{CapabilityItem, Criticality, Evidence, ItemStatus},
+        definition::MysqlGtidMode,
+        mysql::{client::MysqlConfig, preflight as mysql_preflight, schema::load_descriptors},
+    };
+    let mut report = crate::CapabilityReport::from_definition(definition).map_err(|_| {
+        failure(
+            FailureKind::InvalidInput,
+            "Invalid MySQL migration definition",
+            "Correct the definition and retry check.",
+        )
+    })?;
+    if definition.source.engine != Engine::Mysql
+        || definition.destination.engine != Engine::Postgresql
+    {
+        return Err(failure(
+            FailureKind::Blocked,
+            "Live MySQL preflight requires a MySQL source and PostgreSQL destination",
+            "Select the qualified connector pair.",
+        ));
+    }
+    if options.estimated_copy_seconds == 0
+        || options.planned_catchup_seconds == 0
+        || options
+            .estimated_copy_seconds
+            .checked_add(options.planned_catchup_seconds)
+            .is_none()
+        || options.max_decompressed_bytes == 0
+    {
+        return Err(failure(
+            FailureKind::InvalidInput,
+            "Explicit nonzero copy/catch-up estimates and decoder bound required",
+            "Supply measured copy and catch-up planning estimates and a bounded decoder size.",
+        ));
+    }
+    // Scope always comes from the authenticated definition, never caller options.
+    options.selected_tables = definition
+        .selected_objects
+        .iter()
+        .filter(|o| o.kind == ObjectKind::Table)
+        .cloned()
+        .collect();
+    let mut redactor = Redactor::default();
+    let endpoint = definition.source.mysql.as_ref().ok_or_else(|| {
+        failure(
+            FailureKind::InvalidInput,
+            "MySQL endpoint missing",
+            "Set the mysql endpoint block.",
+        )
+    })?;
+    let mut resolve = |reference: &crate::definition::SecretRef| -> Result<String, Failure> {
+        let secret = security::resolve(reference).map_err(|_| {
+            failure(
+                FailureKind::Infrastructure,
+                "MySQL endpoint secret unavailable",
+                "Restore the referenced UTF-8 secret and retry.",
+            )
+        })?;
+        redactor.register(&secret);
+        Ok(secret.expose_secret().to_owned())
+    };
+    let user = resolve(&endpoint.user)?;
+    let password = resolve(&endpoint.password)?;
+    let ca = match &definition.source.tls_ca_ref {
+        Some(reference) => PathBuf::from(resolve(reference)?),
+        None => {
+            return Err(failure(
+                FailureKind::Blocked,
+                "MySQL live connector requires TLS CA trust",
+                "Use TLS require with an explicit CA path reference; plaintext transport is not qualified.",
+            ));
+        }
+    };
+    let mysql_config = MysqlConfig {
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        ca,
+        user,
+        password,
+        profile: String::new(),
+        gtid: String::new(),
+        container_id: String::new(),
+        max_decompressed_bytes: options.max_decompressed_bytes,
+    };
+    let make_item =
+        |id: &str, object, status, description: String, remediation: &str| CapabilityItem {
+            id: id.into(),
+            object,
+            status,
+            sampled: false,
+            criticality: Criticality::Critical,
+            remediation: remediation.into(),
+            evidence: vec![Evidence {
+                source: "live-preflight".into(),
+                description,
+            }],
+        };
+    let operation = async {
+        let mut client = mysql_config.connect().await.map_err(|_| failure(FailureKind::Infrastructure, "MySQL preflight connection failed (details redacted)", "Check endpoint reachability, TLS trust/hostname, credentials and supported server version."))?;
+        let snapshot = mysql_preflight::collect(&mut client, &options).await;
+        report.items.retain(|i| {
+            !matches!(
+                i.id.as_str(),
+                "source.mysql.preflight" | "source.mysql.mapping"
+            )
+        });
+        report.items.extend(
+            mysql_preflight::classify(&snapshot, &options)
+                .into_iter()
+                .map(|mut i| {
+                    i.id = format!("source.{}", i.id);
+                    i
+                }),
+        );
+        let actual_family = match client.version {
+            crate::mysql::client::MysqlVersion::V80 => "8.0",
+            crate::mysql::client::MysqlVersion::V84 => "8.4",
+        };
+        report.items.push(make_item(
+            "source.mysql.declared_version",
+            None,
+            if actual_family == definition.source.version {
+                ItemStatus::Supported
+            } else {
+                ItemStatus::RequiresExternalChange
+            },
+            format!("Observed version family: {actual_family}"),
+            "Review the observed server and correct the declared version family.",
+        ));
+        if let Some(declared) = endpoint.gtid_mode {
+            let observations: Vec<_> = snapshot
+                .observations
+                .iter()
+                .filter(|o| o.check == mysql_preflight::MysqlCheck::GtidMode)
+                .collect();
+            let observed = match observations.as_slice() {
+                [o] if o.error.is_none() && o.rows.len() == 1 => o.rows[0]["value"].as_str(),
+                _ => None,
+            };
+            let expected = match declared {
+                MysqlGtidMode::On => "ON",
+                MysqlGtidMode::Off => "OFF",
+            };
+            let status = match observed {
+                Some("ON" | "OFF") if observed == Some(expected) => ItemStatus::Supported,
+                Some("ON" | "OFF") => ItemStatus::RequiresExternalChange,
+                _ => ItemStatus::Unverified,
+            };
+            report.items.push(make_item("source.mysql.declared_gtid_mode", None, status,
+                format!("Declared mode: {expected}; observed mode: {}", observed.unwrap_or("unverified")),
+                "Review the observed GTID mode; correct the declaration or finish the documented server transition, then recollect."));
+        }
+        for object in &definition.selected_objects {
+            if object.kind != ObjectKind::Table {
+                report.items.push(make_item(
+                    "source.mysql.object_kind",
+                    Some(object.clone()),
+                    ItemStatus::Unsupported,
+                    "Selected non-table object has no MySQL mapping adapter.".into(),
+                    "Select tables or qualify an adapter for this object kind.",
+                ));
+                continue;
+            }
+            let descriptors = load_descriptors(
+                &mut client.conn,
+                &[(object.schema.clone(), object.name.clone())],
+            )
+            .await;
+            match descriptors {
+                Ok(descriptors) if descriptors.len() == 1 => {
+                    let descriptor = &descriptors[0];
+                    if object.exclude_columns.iter().any(|name| descriptor.primary_key.contains(name) || !descriptor.columns.iter().any(|c| &c.name == name)) {
+                        report.items.push(make_item("source.mysql.projection", Some(object.clone()), ItemStatus::Unsupported,
+                            "Excluded column is missing or is an operational primary key.".into(), "Retain every primary-key column and correct excluded column names."));
+                    }
+                    for column in descriptor.columns.iter().filter(|c| !object.exclude_columns.contains(&c.name)) {
+                        if let Err(error) = crate::mapping::mysql::plan_column(column) {
+                            report.items.push(make_item(&format!("source.mysql.mapping.{}", column.name), Some(object.clone()), ItemStatus::Unsupported,
+                                format!("Column {}: {error}", column.name), "Convert the column to a qualified MySQL/PG mapping or explicitly exclude this non-key column; preserve its data separately."));
+                        }
+                    }
+                }
+                _ => report.items.push(make_item("source.mysql.mapping", Some(object.clone()), ItemStatus::Unverified,
+                    "Selected-table descriptor collection failed (details redacted).".into(), "Restore catalog visibility and an existing table with a primary key, then recollect every column.")),
+            }
+        }
+        let _ = client.conn.disconnect().await;
+        // Receiver checks deliberately exclude source WAL, replication, slot and
+        // replica-identity requirements. Mapped destination DDL is a later item.
+        if inspect_destination {
+            let destination = config(&definition.destination, &mut redactor)?;
+            let mut destination = Box::pin(session(&destination, &definition.destination)).await?;
+            settings(&destination.client).await?;
+            let mut snapshot = Box::pin(preflight::collect(&mut destination.client, &[]))
+                .await
+                .map_err(|_| infrastructure())?;
+            snapshot.observations.retain(|o| {
+                matches!(
+                    o.check,
+                    preflight::Check::Version
+                        | preflight::Check::DatabaseCreate
+                        | preflight::Check::OriginGrants
+                )
+            });
+            let destination_report = preflight::classify(
+                &report.definition_digest,
+                &snapshot,
+                &preflight::Options::default(),
+                |_| false,
+            );
+            report
+                .items
+                .extend(destination_report.items.into_iter().map(|mut i| {
+                    i.id = format!("destination.{}", i.id);
+                    i
+                }));
+        } else {
+            report.items.push(make_item(
+                "destination.pg.preflight",
+                None,
+                ItemStatus::Unverified,
+                "Source-only inspection; PostgreSQL destination was not connected.".into(),
+                "Supply destination secrets and run combined live preflight.",
+            ));
+        }
+        report.items.push(make_item(
+            "destination.pg.mapped_schema",
+            None,
+            ItemStatus::Unverified,
+            "Mapped destination schema and apply compatibility have not been qualified.".into(),
+            "Qualify mapped destination DDL and apply adapters before starting the migration.",
+        ));
+        Ok(report)
+    };
+    let mut report: crate::CapabilityReport =
+        tokio::time::timeout(Duration::from_secs(30), operation)
+            .await
+            .map_err(|_| {
+                failure(
+                    FailureKind::Infrastructure,
+                    "Live MySQL preflight timed out",
+                    "Restore endpoint access and retry preflight.",
+                )
+            })??;
+    // Server evidence (including grants) may echo resolved credential values.
+    for item in &mut report.items {
+        item.id = redactor.redact(&item.id);
+        item.remediation = redactor.redact(&item.remediation);
+        if let Some(object) = &mut item.object {
+            object.schema = redactor.redact(&object.schema);
+            object.name = redactor.redact(&object.name);
+            for name in &mut object.exclude_columns {
+                *name = redactor.redact(name);
+            }
+        }
+        for evidence in &mut item.evidence {
+            evidence.source = redactor.redact(&evidence.source);
+            evidence.description = redactor.redact(&evidence.description);
+        }
+    }
+    Ok(report)
 }

@@ -273,6 +273,9 @@ impl<O: KeyOrder + Send> RowSource for Source<O> {
 }
 #[async_trait::async_trait]
 impl<O: KeyOrder + Send> BoundarySource for Source<O> {
+    fn position_order(&self) -> verify::SourcePositionOrder {
+        self.pg.position_order()
+    }
     async fn read_source(
         &mut self,
         range: &ChunkRange,
@@ -283,16 +286,24 @@ impl<O: KeyOrder + Send> BoundarySource for Source<O> {
         let read = self.pg.read_source(range, projection).await?;
         let mut seen = self.observed.lock().expect("observation poisoned");
         seen.source_read = tick(self.start);
-        seen.source_lsn = read.lsn;
+        seen.source_lsn = durable::pg_report_lsn(
+            "postgres",
+            &read.position,
+            &sql::PgSourcePosition::new(self.pg.position_order().domain()),
+        )?;
         Ok(read)
     }
     async fn changed_since(
         &mut self,
         range: &ChunkRange,
-        lsn: u64,
+        lsn: crate::event::Position,
     ) -> verify::Result<verify::ChangeEvidence> {
         let changes = self.pg.changed_since(range, lsn).await?;
-        self.observed.lock().expect("observation poisoned").through = changes.through_lsn;
+        self.observed.lock().expect("observation poisoned").through = durable::pg_report_lsn(
+            "postgres",
+            &changes.through_position,
+            &sql::PgSourcePosition::new(self.pg.position_order().domain()),
+        )?;
         Ok(changes)
     }
 }
@@ -1322,7 +1333,14 @@ impl Service {
                 })
                 .await
                 .map_err(|_| invalid())?;
-                let applied = waiter.wait_until(through).await.map_err(|_| invalid())?;
+                let pg_positions =
+                    sql::PgSourcePosition::new(format!("skedaddle-postgres:{}", self.id));
+                let applied = waiter
+                    .wait_until(pg_positions.position(through))
+                    .await
+                    .map_err(|_| invalid())?;
+                let applied = durable::pg_report_lsn("postgres", &applied, &pg_positions)
+                    .map_err(|_| invalid())?;
                 self.runtime.flush_progress().await.map_err(|_| invalid())?;
                 let applied_state = self.runtime.state().await;
                 observed.lock().expect("observation poisoned").applied = applied;

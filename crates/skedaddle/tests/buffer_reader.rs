@@ -76,6 +76,198 @@ fn root() -> PathBuf {
 fn local() -> Arc<dyn BufferStore> {
     Arc::new(ObjectBufferStore::local(root(), Duration::from_secs(30)).unwrap())
 }
+
+#[tokio::test]
+async fn long_mysql_gtid_positions_round_trip_equal_h_and_resume() {
+    use skedaddle::{
+        event::{Event, EventKind, Row},
+        mysql::{MysqlOrder, MysqlPosition},
+    };
+
+    let order = Arc::new(MysqlOrder::gtid("long-buffer-test").unwrap());
+    let executed = (0..256)
+        .map(|n| format!("{n:08x}-0000-0000-0000-000000000000:1-10"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let native = MysqlPosition::Gtid {
+        set: executed.parse().unwrap(),
+        server_uuid: "00000000-0000-0000-0000-000000000000".into(),
+        file: "mysql-bin.000001".into(),
+        offset: 1234,
+    };
+    let position = Position::new(order.domain(), native.encode().unwrap());
+    assert!(position.bytes().len() > 8 * 1024);
+    assert_eq!(MysqlPosition::decode(position.bytes()).unwrap(), native);
+    let record = |id: u8, chunk_rows: bool| {
+        let mut source = txn(1).source;
+        source.engine = "mysql".into();
+        let txn = TxnId(vec![id]);
+        let event = Event {
+            source: source.clone(),
+            txn: txn.clone(),
+            ordinal_in_txn: 0,
+            position: position.clone(),
+            schema_version: 1,
+            kind: if chunk_rows {
+                EventKind::ChunkRows
+            } else {
+                EventKind::Insert
+            },
+            table: Some("db.t".into()),
+            key: Row::new(),
+            before: None,
+            after: Some(Row::new()),
+            unchanged_cols: Default::default(),
+        };
+        AssembledTxn::new(source, txn, position.clone(), Some(7), vec![event]).unwrap()
+    };
+    let transaction = record(1, false);
+    let chunk = record(2, true);
+    // Exercise both one segment and the distinct equal-H suffix segment.
+    for seal_at_h in [false, true] {
+        let store = local();
+        let mut c = config();
+        let writer_config = WriterConfig {
+            prefix: c.prefix.clone(),
+            migration_id: c.migration_id.clone(),
+            stream: c.stream.clone(),
+            epoch: 1,
+            segment_bytes: 1024 * 1024,
+            segment_transactions: 100,
+            segment_age: Duration::from_secs(60),
+            max_transaction_bytes: 1024 * 1024,
+        };
+        let (tx, _) = mpsc::channel();
+        let mut writer = BufferWriter::open_with_scratch(
+            store.clone(),
+            writer_config.clone(),
+            order.clone(),
+            tx,
+            root(),
+        )
+        .await
+        .unwrap();
+        writer
+            .append(transaction.clone(), Instant::now())
+            .await
+            .unwrap();
+        if seal_at_h {
+            writer.seal().await.unwrap();
+        }
+        let at_h = writer.checkpoint().unwrap();
+        writer
+            .append_chunk_rows(chunk.clone(), Instant::now())
+            .await
+            .unwrap();
+        c.required_next_mseq = if seal_at_h { 2 } else { 1 };
+        assert_eq!(writer.next_manifest_sequence(), c.required_next_mseq);
+        let durable = writer.checkpoint().unwrap();
+        drop(writer);
+        // Streaming writer recovery checks full endpoints and envelope kinds.
+        let (tx, _) = mpsc::channel();
+        let recovered = BufferWriter::open_from_checkpoint(
+            store.clone(),
+            writer_config,
+            at_h,
+            order.clone(),
+            tx,
+            root(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.checkpoint().unwrap(), durable);
+        drop(recovered);
+
+        let mut reader = BufferReader::new(
+            store.clone(),
+            c.clone(),
+            ReaderCheckpoint::default(),
+            order.clone(),
+        )
+        .unwrap();
+        assert_eq!(reader.next_txn().await.unwrap(), Some(transaction.clone()));
+        let checkpoint = reader.checkpoint().clone();
+        assert_eq!(checkpoint.next_mseq, u64::from(seal_at_h));
+        if seal_at_h {
+            reader =
+                BufferReader::new(store.clone(), c.clone(), checkpoint, order.clone()).unwrap();
+        }
+        assert_eq!(reader.next_txn().await.unwrap(), Some(chunk.clone()));
+        assert!(reader.next_txn().await.unwrap().is_none());
+        assert_eq!(reader.checkpoint().last_position.as_ref(), Some(&position));
+        assert!(reader.checkpoint().last_record.as_ref().unwrap().chunk_rows);
+
+        // Real local backend pagination: bounded filenames, including suffix.
+        let mut token = None;
+        let mut keys = vec![];
+        loop {
+            let page = store
+                .list_prefix(&c.segment_prefix(), token.as_deref(), 1)
+                .await
+                .unwrap();
+            keys.extend(page.objects.into_iter().map(|o| o.key));
+            token = page.next;
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(keys.len() as u64, c.required_next_mseq);
+        assert!(keys.iter().all(|key| key.len() < 300));
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+        if seal_at_h {
+            assert_eq!(keys[1], format!("{}.chunk-rows", keys[0]));
+        }
+    }
+}
+
+#[tokio::test]
+async fn reader_and_writer_reject_old_segment_key_scheme_before_object_lookup() {
+    use skedaddle::buffer::format::FormatError;
+    let store = local();
+    let c = config();
+    let (_, mut entry) = encoded(&c, 1, 1, 1);
+    entry.segment_key = format!("{}x64.01-x64.01-1.seg", c.segment_prefix());
+    store
+        .put_create_only(&c.manifest_key(0), &entry.canonical_json().unwrap())
+        .await
+        .unwrap();
+    let mut reader = BufferReader::new(
+        store.clone(),
+        c.clone(),
+        ReaderCheckpoint::default(),
+        Arc::new(Order),
+    )
+    .unwrap();
+    assert!(matches!(
+        reader.next_txn().await,
+        Err(Error::Format(FormatError::UnsupportedFormatVersion {
+            format: "segment-key",
+            found: None,
+            expected: 2,
+        }))
+    ));
+    let writer_config = WriterConfig {
+        prefix: c.prefix,
+        migration_id: c.migration_id,
+        stream: c.stream,
+        epoch: 1,
+        segment_bytes: 1024,
+        segment_transactions: 100,
+        segment_age: Duration::from_secs(1),
+        max_transaction_bytes: 1024,
+    };
+    let (tx, _) = mpsc::channel();
+    assert!(matches!(
+        BufferWriter::open_with_scratch(store, writer_config, Arc::new(Order), tx, root(),).await,
+        Err(skedaddle::buffer::writer::Error::Format(
+            FormatError::UnsupportedFormatVersion {
+                format: "segment-key",
+                found: None,
+                expected: 2,
+            }
+        ))
+    ));
+}
 fn encoded(c: &ReaderConfig, start: u64, count: u64, epoch: u64) -> (Vec<u8>, ManifestEntry) {
     let mut encoder = SegmentEncoder::new(
         Vec::new(),

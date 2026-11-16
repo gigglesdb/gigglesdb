@@ -3,14 +3,19 @@ use super::{RangeStatus, TableCatalog};
 use crate::{
     coordinator::{Materialized, chunk::ChunkPlan},
     engine::{PgPlanFuture, PgPlannerError, PgTransactionPlanner},
-    event::{AssembledTxn, EventKind, Position, Row},
+    event::{AssembledTxn, EventKind, Position, PositionOrder, Row},
     mapping::{PgType, Value},
     pg::{
         apply::{self, ApplyError},
         chunk::{self, ChunkQuery, ChunkRange, Key, QualifiedName},
     },
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+};
 use tokio_postgres::Client;
 
 type Result<T> = std::result::Result<T, PgPlannerError>;
@@ -25,16 +30,38 @@ fn chunk_error(error: chunk::ChunkError) -> PgPlannerError {
 }
 
 /// Saved qualification inputs for one table. No server order is inferred here.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerTable {
     catalog: TableCatalog,
     plan: ChunkPlan,
-    order_domain: String,
+    order: Arc<dyn PositionOrder + Send + Sync>,
+}
+impl fmt::Debug for ServerTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerTable")
+            .field("domain", &self.order.domain())
+            .finish_non_exhaustive()
+    }
 }
 impl ServerTable {
     pub fn new(catalog: &TableCatalog, plan: &ChunkPlan, order_domain: &str) -> Result<Self> {
-        if order_domain.is_empty()
-            || plan.table != catalog.key
+        Self::with_position_order(
+            catalog,
+            plan,
+            Arc::new(apply::NativePgOrder(order_domain.into())),
+        )
+    }
+    pub fn with_position_order(
+        catalog: &TableCatalog,
+        plan: &ChunkPlan,
+        order: Arc<dyn PositionOrder + Send + Sync>,
+    ) -> Result<Self> {
+        let key = plan
+            .table
+            .postgres()
+            .map_err(|_| invalid("MySQL plan not yet supported by PostgreSQL classifier"))?;
+        if order.domain().is_empty()
+            || key != &catalog.key
             || chunk::plan_chunks(&catalog.key, plan.chunk_size, &plan.samples)
                 .ok()
                 .as_ref()
@@ -69,7 +96,7 @@ impl ServerTable {
         Ok(Self {
             catalog: catalog.clone(),
             plan: plan.clone(),
-            order_domain: order_domain.into(),
+            order,
         })
     }
     fn key(&self, row: &Row) -> Result<Key> {
@@ -100,10 +127,10 @@ impl ServerTable {
         self.catalog.key.validate_key(&key).map_err(chunk_error)?;
         Ok(key)
     }
-    fn lsn(&self, position: &Position, state: &Materialized) -> Result<u64> {
-        if position.order_domain() != self.order_domain {
-            return Err(invalid("catalog position domain mismatch"));
-        }
+    fn validate_position(&self, position: &Position, state: &Materialized) -> Result<()> {
+        position
+            .compare(position, self.order.as_ref())
+            .map_err(ApplyError::Position)?;
         let reference = state
             .chunk_plans
             .get(&self.catalog.key.table)
@@ -113,14 +140,14 @@ impl ServerTable {
         {
             return Err(invalid("catalog durable plan mismatch"));
         }
-        Ok(u64::from_be_bytes(
-            position
-                .bytes()
-                .try_into()
-                .map_err(|_| invalid("PostgreSQL LSN width"))?,
-        ))
+        Ok(())
     }
-    fn status(&self, range: &ChunkRange, lsn: u64, state: &Materialized) -> Result<RangeStatus> {
+    fn status(
+        &self,
+        range: &ChunkRange,
+        position: &Position,
+        state: &Materialized,
+    ) -> Result<RangeStatus> {
         let id =
             serde_json::to_string(&range.id).map_err(|_| invalid("chunk identity encoding"))?;
         let Some(attempt) = state.chunk_attempts.get(&id) else {
@@ -134,16 +161,12 @@ impl ServerTable {
                 .done
                 .as_ref()
                 .map(|done| {
-                    if done.high.order_domain() != self.order_domain {
-                        return Err(invalid("catalog Done position domain mismatch"));
-                    }
-                    let high = u64::from_be_bytes(
-                        done.high
-                            .bytes()
-                            .try_into()
-                            .map_err(|_| invalid("PostgreSQL LSN width"))?,
-                    );
-                    Ok(lsn > high)
+                    Ok::<_, PgPlannerError>(
+                        position
+                            .compare(&done.high, self.order.as_ref())
+                            .map_err(ApplyError::Position)?
+                            == Ordering::Greater,
+                    )
                 })
                 .transpose()?
                 .unwrap_or(false)
@@ -345,7 +368,7 @@ impl ServerPlanner {
             .iter()
             .find(|t| t.catalog.key.table == table)
             .ok_or_else(|| invalid("unknown server classifier table"))?;
-        let lsn = table.lsn(position, state)?;
+        table.validate_position(position, state)?;
         let keys = rows
             .iter()
             .map(|r| table.key(r))
@@ -364,7 +387,7 @@ impl ServerPlanner {
                     if found[ordinal].is_some() {
                         return Err(invalid("overlapping catalog ranges"));
                     }
-                    found[ordinal] = Some(table.status(range, lsn, state)?);
+                    found[ordinal] = Some(table.status(range, position, state)?);
                 }
             }
             statuses.extend(

@@ -1112,7 +1112,7 @@ fn manifest() -> ManifestEntry {
         mseq: 1,
         epoch: 7,
         prev_digest: [0; 32],
-        segment_key: "p/buffer/m/s/seg/x64.09-x64.09-7.seg".into(),
+        segment_key: "p/buffer/m/s/seg/v2-5db55b96e0749079be2022b337c70a864b0ea17850b6417f55ed1aa411021447-5db55b96e0749079be2022b337c70a864b0ea17850b6417f55ed1aa411021447-7.seg".into(),
         segment_digest: unhex("4d6fa58b20fa624e7cb98feb2028ff1d260d56adb7651d680797b1919b05d920")
             .try_into()
             .unwrap(),
@@ -1130,21 +1130,21 @@ fn manifest_has_canonical_json_and_independent_self_digest() {
     // separators=(',', ':')) + hashlib.sha256, excluding the digest field.
     assert_eq!(
         entry.digest().unwrap().as_slice(),
-        unhex("61095dd59ca927555c6aa216b9e49b6e63a915aa222b17850076a0d4e216c116")
+        unhex("a3b45512e426e52c07b76a65a1660352cd2d74d52ba24481e696c45198e7416f")
     );
     let bytes = entry.canonical_json().unwrap();
     let golden = concat!(
-        "{\"bytes\":213,\"digest\":\"61095dd59ca927555c6aa216b9e49b6e63a915aa222b17850076a0d4e216c116\",\"epoch\":7,",
+        "{\"bytes\":213,\"digest\":\"a3b45512e426e52c07b76a65a1660352cd2d74d52ba24481e696c45198e7416f\",\"epoch\":7,",
         "\"first_pos\":{\"bytes\":\"09\",\"order_domain\":\"d\"},\"last_pos\":{\"bytes\":\"09\",\"order_domain\":\"d\"},\"mseq\":1,",
         "\"prev_digest\":\"0000000000000000000000000000000000000000000000000000000000000000\",",
         "\"segment_digest\":\"4d6fa58b20fa624e7cb98feb2028ff1d260d56adb7651d680797b1919b05d920\",",
-        "\"segment_key\":\"p/buffer/m/s/seg/x64.09-x64.09-7.seg\",\"txn_count\":1,\"version\":2}"
+        "\"segment_key\":\"p/buffer/m/s/seg/v2-5db55b96e0749079be2022b337c70a864b0ea17850b6417f55ed1aa411021447-5db55b96e0749079be2022b337c70a864b0ea17850b6417f55ed1aa411021447-7.seg\",\"txn_count\":1,\"version\":2}"
     );
     assert_eq!(bytes, golden.as_bytes());
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
         value["digest"],
-        "61095dd59ca927555c6aa216b9e49b6e63a915aa222b17850076a0d4e216c116"
+        "a3b45512e426e52c07b76a65a1660352cd2d74d52ba24481e696c45198e7416f"
     );
     assert_eq!(ManifestEntry::from_canonical_json(&bytes).unwrap(), entry);
     let pretty = serde_json::to_vec_pretty(&value).unwrap();
@@ -1176,6 +1176,24 @@ fn manifest_rejects_missing_and_wrong_version_before_decoding_payload() {
                 }) if actual == found
             ));
         }
+    }
+}
+
+#[test]
+fn manifest_rejects_old_and_unknown_segment_key_schemes_with_valid_digests() {
+    for (key, found) in [
+        ("p/buffer/m/s/seg/x64.09-x64.09-7.seg", None),
+        ("p/buffer/m/s/seg/v1-old.seg", Some(1)),
+        ("p/buffer/m/s/seg/v3-future.seg", Some(3)),
+    ] {
+        let mut entry = manifest();
+        entry.segment_key = key.into();
+        assert!(matches!(
+            ManifestEntry::from_canonical_json(&entry.canonical_json().unwrap()),
+            Err(FormatError::UnsupportedFormatVersion {
+                format: "segment-key", found: actual, expected: 2,
+            }) if actual == found
+        ));
     }
 }
 
@@ -1239,7 +1257,7 @@ fn key_layout_padding_order_and_components_are_stable() {
     );
     assert_eq!(
         segment_key("p", "m", "s", &pos(), &pos(), 7),
-        "p/buffer/m/s/seg/x64.09-x64.09-7.seg"
+        "p/buffer/m/s/seg/v2-5db55b96e0749079be2022b337c70a864b0ea17850b6417f55ed1aa411021447-5db55b96e0749079be2022b337c70a864b0ea17850b6417f55ed1aa411021447-7.seg"
     );
     assert_eq!(
         manifest_key("", "m", "s", 0),

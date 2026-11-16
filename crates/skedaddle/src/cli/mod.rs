@@ -135,6 +135,12 @@ enum Command {
         id: String,
         #[arg(long)]
         sample: Option<u64>,
+        #[arg(long)]
+        estimated_copy_seconds: Option<u64>,
+        #[arg(long)]
+        planned_catchup_seconds: Option<u64>,
+        #[arg(long)]
+        max_decompressed_bytes: Option<usize>,
     },
     Start {
         id: String,
@@ -241,6 +247,10 @@ fn redact_ca_references(value: &mut Value) {
     match value {
         Value::Object(fields) => {
             fields.remove("tls_ca_ref");
+            if let Some(endpoint) = fields.get_mut("mysql").and_then(Value::as_object_mut) {
+                endpoint.remove("user");
+                endpoint.remove("password");
+            }
             for child in fields.values_mut() {
                 redact_ca_references(child);
             }
@@ -505,7 +515,13 @@ fn run(cli: &Cli) -> impl std::future::Future<Output = Result<(Outcome, Value)>>
                     json!({"id":id,"observer":true,"state":visible_state,"tls_trust":trust,"verification":crate::runner::verification_status(root,id,&state),"reverse":crate::runner::reverse_status(&state),"rollback":crate::runner::rollback_status(&state)}),
                 ))
             }
-            Command::Assess { sample, .. } => {
+            Command::Assess {
+                sample,
+                estimated_copy_seconds,
+                planned_catchup_seconds,
+                max_decompressed_bytes,
+                ..
+            } => {
                 let report = CapabilityReport::from_definition(def).map_err(|e| {
                     fail(
                         Outcome::InvalidInput,
@@ -518,6 +534,34 @@ fn run(cli: &Cli) -> impl std::future::Future<Output = Result<(Outcome, Value)>>
                     let mut error = unwired("assess --sample");
                     error.2 = json!({"offline_report":report,"requested_sample":sample,"sampling_performed":false});
                     return Err(error);
+                }
+                if def.source.engine == crate::definition::Engine::Mysql {
+                    let report = crate::runner::assess_mysql(
+                        def,
+                        crate::mysql::preflight::Options {
+                            estimated_copy_seconds: estimated_copy_seconds.unwrap_or(0),
+                            planned_catchup_seconds: planned_catchup_seconds.unwrap_or(0),
+                            max_decompressed_bytes: max_decompressed_bytes.unwrap_or(0),
+                            selected_tables: vec![],
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        fail(
+                            match e.kind {
+                                crate::runner::FailureKind::InvalidInput => Outcome::InvalidInput,
+                                crate::runner::FailureKind::Infrastructure => {
+                                    Outcome::Infrastructure
+                                }
+                                crate::runner::FailureKind::Blocked => Outcome::Blocked,
+                                crate::runner::FailureKind::NotWired => Outcome::NotWired,
+                            },
+                            e.what,
+                            "Live MySQL preflight failed.",
+                            &e.next_step,
+                        )
+                    })?;
+                    return capability(report);
                 }
                 capability(report)
             }
@@ -644,6 +688,7 @@ fn run(cli: &Cli) -> impl std::future::Future<Output = Result<(Outcome, Value)>>
                     crate::runner::FailureKind::InvalidInput => Outcome::InvalidInput,
                     crate::runner::FailureKind::Infrastructure => Outcome::Infrastructure,
                     crate::runner::FailureKind::Blocked => Outcome::Blocked,
+                    crate::runner::FailureKind::NotWired => Outcome::NotWired,
                 };
                 let mut failure = fail(
                     outcome,
@@ -693,6 +738,7 @@ fn run(cli: &Cli) -> impl std::future::Future<Output = Result<(Outcome, Value)>>
                             crate::runner::FailureKind::Infrastructure => Outcome::Infrastructure,
                             crate::runner::FailureKind::InvalidInput => Outcome::InvalidInput,
                             crate::runner::FailureKind::Blocked => Outcome::Blocked,
+                            crate::runner::FailureKind::NotWired => Outcome::NotWired,
                         };
                         fail(
                             outcome,
@@ -728,6 +774,7 @@ fn run(cli: &Cli) -> impl std::future::Future<Output = Result<(Outcome, Value)>>
                             crate::runner::FailureKind::Infrastructure => Outcome::Infrastructure,
                             crate::runner::FailureKind::InvalidInput => Outcome::InvalidInput,
                             crate::runner::FailureKind::Blocked => Outcome::Blocked,
+                            crate::runner::FailureKind::NotWired => Outcome::NotWired,
                         };
                         fail(
                             outcome,

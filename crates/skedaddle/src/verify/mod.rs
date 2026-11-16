@@ -17,7 +17,7 @@ pub use compare::{
 pub use coverage::*;
 pub use hash::{ContentDigest, Projection, Row, range_digest, row_hash};
 pub use protocol::{
-    Applier, BoundarySource, BoundaryState, ChangeEvidence, Lsn, SourceRead, Verification,
+    Applier, BoundarySource, BoundaryState, ChangeEvidence, SourceRead, Verification,
     VerificationSession,
 };
 // The chunk planner owns the bounds, identity, and catalog ordering contract.
@@ -25,7 +25,21 @@ pub use crate::pg::chunk::{ChunkRange as RangePlan, Key};
 
 use std::{error::Error, fmt, time::Duration};
 
-use crate::mapping::MappingError;
+use crate::{
+    event::{EventError, Position, PositionOrder},
+    mapping::MappingError,
+};
+
+pub type SourcePositionOrder = std::sync::Arc<dyn PositionOrder + Send + Sync>;
+
+/// Fail closed for wrong domains and connector-incomparable positions.
+pub fn compare_positions(
+    order: &(impl PositionOrder + ?Sized),
+    left: &Position,
+    right: &Position,
+) -> Result<std::cmp::Ordering> {
+    left.compare(right, order).map_err(VerifyError::Position)
+}
 
 pub type Result<T> = std::result::Result<T, VerifyError>;
 
@@ -57,9 +71,16 @@ pub enum EvidenceLimit {
 /// The range has no comparable boundary; its row denominator remains unknown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NotVerifiableReason {
-    EvidenceOverflow { limit: EvidenceLimit },
-    EvidenceInvalidated { reason: EvidenceInvalidation },
-    ApplierTimeout { waited_lsn: Lsn, elapsed: Duration },
+    EvidenceOverflow {
+        limit: EvidenceLimit,
+    },
+    EvidenceInvalidated {
+        reason: EvidenceInvalidation,
+    },
+    ApplierTimeout {
+        waited_position: Position,
+        elapsed: Duration,
+    },
 }
 
 impl NotVerifiableReason {
@@ -68,10 +89,10 @@ impl NotVerifiableReason {
             Self::EvidenceOverflow { limit } => VerifyError::EvidenceOverflow { range, limit },
             Self::EvidenceInvalidated { reason } => VerifyError::EvidenceInvalidated { reason },
             Self::ApplierTimeout {
-                waited_lsn,
+                waited_position,
                 elapsed,
             } => VerifyError::ApplierTimeout {
-                waited_lsn,
+                waited_position,
                 elapsed,
             },
         }
@@ -81,6 +102,8 @@ impl NotVerifiableReason {
 #[derive(Debug)]
 pub enum VerifyError {
     Invalid(&'static str),
+    Position(EventError),
+    NonPgVerificationReportUnsupported,
     Mapping(MappingError),
     /// Adapters must redact credentials and row values from diagnostics.
     Read(String),
@@ -94,7 +117,7 @@ pub enum VerifyError {
         reason: EvidenceInvalidation,
     },
     ApplierTimeout {
-        waited_lsn: Lsn,
+        waited_position: Position,
         elapsed: Duration,
     },
     ApplierTerminal {
@@ -118,10 +141,10 @@ impl VerifyError {
                 Some(NotVerifiableReason::EvidenceInvalidated { reason: *reason })
             }
             Self::ApplierTimeout {
-                waited_lsn,
+                waited_position,
                 elapsed,
             } => Some(NotVerifiableReason::ApplierTimeout {
-                waited_lsn: *waited_lsn,
+                waited_position: waited_position.clone(),
                 elapsed: *elapsed,
             }),
             _ => None,
@@ -132,6 +155,10 @@ impl VerifyError {
 impl fmt::Display for VerifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Position(error) => write!(f, "verification source position: {error}"),
+            Self::NonPgVerificationReportUnsupported => {
+                f.write_str("non-PG verification report not supported yet")
+            }
             Self::Invalid(reason) => write!(f, "invalid verification input: {reason}"),
             Self::Mapping(error) => write!(f, "verification encoding: {error}"),
             Self::Read(reason) => write!(f, "verification read: {reason}"),
@@ -145,12 +172,12 @@ impl fmt::Display for VerifyError {
                 write!(f, "verification change evidence invalidated: {reason:?}")
             }
             Self::ApplierTimeout {
-                waited_lsn,
+                waited_position,
                 elapsed,
             } => {
                 write!(
                     f,
-                    "verification applier timed out at source LSN {waited_lsn} after {elapsed:?}"
+                    "verification applier timed out at source position {waited_position:?} after {elapsed:?}"
                 )
             }
             Self::ApplierTerminal { cause } => {

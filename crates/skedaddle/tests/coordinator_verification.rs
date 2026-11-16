@@ -939,3 +939,34 @@ async fn report_objects_never_alias_another_migrations_journal_namespace() {
     assert_eq!(second.scrub().await.unwrap(), Default::default());
     assert!(current_verification(&first.load(false).await.unwrap(), &facts(&r)).verification);
 }
+
+#[test]
+fn native_boundaries_cannot_be_reinterpreted_as_pg_v1_reports() {
+    use skedaddle::{
+        event::Position,
+        verify::{VerifyError, sql::PgSourcePosition},
+    };
+    let pg = PgSourcePosition::new("pg-report");
+    assert_eq!(
+        pg_report_lsn("postgres", &pg.position(42), &pg).unwrap(),
+        42
+    );
+    // A native connector's eight-byte collision is still not a PG report.
+    for (engine, position) in [
+        ("mysql", Position::new("mysql-native", 42_u64.to_be_bytes())),
+        ("spanner", Position::new("spanner-native", b"revision-42")),
+    ] {
+        assert!(matches!(
+            pg_report_lsn(engine, &position, &pg),
+            Err(VerifyError::NonPgVerificationReportUnsupported)
+        ));
+    }
+    assert!(matches!(
+        pg_report_lsn(
+            "postgres",
+            &Position::new("other-pg", 42_u64.to_be_bytes()),
+            &pg
+        ),
+        Err(VerifyError::Position(_))
+    ));
+}

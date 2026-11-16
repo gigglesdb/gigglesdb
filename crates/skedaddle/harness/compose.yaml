@@ -66,6 +66,36 @@ services:
       - mysql84data:/var/lib/mysql
       - ./mysql-start.sh:/harness/mysql-start.sh:ro
       - ./mysql-init.sql:/docker-entrypoint-initdb.d/10-m1.sql:ro
+  mysql80-replica:
+    <<: *mysql-matrix
+    # The runner selects this service explicitly only for -MysqlReplica.
+    profiles: [mysql80]
+    image: ${MYSQL80_IMAGE:-mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b}
+    environment:
+      MYSQL_ROOT_PASSWORD: skedaddle
+      MYSQL_ROOT_HOST: '%'
+      HARNESS_MYSQL_GTID: ${MYSQL_GTID_MODE:-ON}
+      HARNESS_MYSQL_SERVER_ID: '6402'
+    mem_limit: 384m
+    volumes:
+      - mysql80replicadata:/var/lib/mysql
+      - ./mysql-start.sh:/harness/mysql-start.sh:ro
+      - ./mysql-replica-init.sql:/docker-entrypoint-initdb.d/10-replica.sql:ro
+  mysql84-replica:
+    <<: *mysql-matrix
+    # The runner selects this service explicitly only for -MysqlReplica.
+    profiles: [mysql84]
+    image: ${MYSQL84_IMAGE:-mysql:8.4@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902}
+    environment:
+      MYSQL_ROOT_PASSWORD: skedaddle
+      MYSQL_ROOT_HOST: '%'
+      HARNESS_MYSQL_GTID: ${MYSQL_GTID_MODE:-ON}
+      HARNESS_MYSQL_SERVER_ID: '6402'
+    mem_limit: 384m
+    volumes:
+      - mysql84replicadata:/var/lib/mysql
+      - ./mysql-start.sh:/harness/mysql-start.sh:ro
+      - ./mysql-replica-init.sql:/docker-entrypoint-initdb.d/10-replica.sql:ro
   pg-source:
     <<: *pg-matrix
     volumes:
@@ -161,6 +191,13 @@ volumes:
     labels: {skedaddle.test: '${RUN_ID}'}
     driver_opts: {type: tmpfs, device: tmpfs, o: 'size=480m,mode=0700'}
   mysql84data:
+    labels: {skedaddle.test: '${RUN_ID}'}
+    driver_opts: {type: tmpfs, device: tmpfs, o: 'size=480m,mode=0700'}
+  # A selected primary/replica pair has at most 960 MiB of data volumes.
+  mysql80replicadata:
+    labels: {skedaddle.test: '${RUN_ID}'}
+    driver_opts: {type: tmpfs, device: tmpfs, o: 'size=480m,mode=0700'}
+  mysql84replicadata:
     labels: {skedaddle.test: '${RUN_ID}'}
     driver_opts: {type: tmpfs, device: tmpfs, o: 'size=480m,mode=0700'}
   # Hard aggregate cap: three 256 MiB volumes = 768 MiB, including WAL/TLS.

@@ -487,7 +487,7 @@ async fn typed_plan_reuses_source_samples_on_resume_and_is_bounded() {
     .await
     .unwrap();
     // >60 KiB of samples/ranges stay in an immutable object, not a local row.
-    let mut large_table = plan.table.clone();
+    let mut large_table = plan.table.postgres().unwrap().clone();
     large_table.table = "public.large".into();
     let many = chunk::ChunkPlan::new(
         large_table,
@@ -507,7 +507,7 @@ async fn typed_plan_reuses_source_samples_on_resume_and_is_bounded() {
     assert!(Local::estimate(c.state()).unwrap() < budget::ENVELOPE_BYTES);
     c.checkpoint().await.unwrap();
     assert_eq!(journal.load(true).await.unwrap(), *c.state());
-    let mut oversized = plan.table.clone();
+    let mut oversized = plan.table.postgres().unwrap().clone();
     oversized.table = "t".repeat(chunk::PLAN_BYTES / 2);
     assert!(matches!(
         chunk::ChunkPlan::new(

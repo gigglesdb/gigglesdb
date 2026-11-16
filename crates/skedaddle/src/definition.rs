@@ -97,6 +97,31 @@ pub struct Connection {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spanner: Option<SpannerEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mysql: Option<MysqlEndpoint>,
+}
+
+/// Persisted endpoint: credentials remain references; TLS/version use Connection policy.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MysqlEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub user: SecretRef,
+    pub password: SecretRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gtid_mode: Option<MysqlGtidMode>,
+}
+impl fmt::Debug for MysqlEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MysqlEndpoint([REDACTED])")
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum MysqlGtidMode {
+    On,
+    Off,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +496,54 @@ impl MigrationDefinition {
             nonempty(&mut errors, path, value);
         }
         for (path, connection) in [("source", &self.source), ("destination", &self.destination)] {
+            if connection.engine == Engine::Mysql {
+                if connection.connection_ref.is_some() || connection.spanner.is_some() {
+                    push_error(
+                        &mut errors,
+                        path,
+                        "MySQL requires only its mysql endpoint block, without connection_ref or spanner",
+                    );
+                }
+                if !matches!(connection.version.as_str(), "8.0" | "8.4") {
+                    push_error(
+                        &mut errors,
+                        &format!("{path}.version"),
+                        "expected MySQL version family 8.0 or 8.4",
+                    );
+                }
+                match &connection.mysql {
+                    Some(endpoint) => {
+                        if endpoint.host.is_empty()
+                            || endpoint.host.trim() != endpoint.host
+                            || endpoint.host.chars().any(char::is_control)
+                        {
+                            push_error(
+                                &mut errors,
+                                &format!("{path}.mysql.host"),
+                                "host must be non-empty, trimmed, and free of control characters",
+                            );
+                        }
+                        if endpoint.port == 0 {
+                            push_error(
+                                &mut errors,
+                                &format!("{path}.mysql.port"),
+                                "port must be in 1..=65535",
+                            );
+                        }
+                    }
+                    None => push_error(
+                        &mut errors,
+                        &format!("{path}.mysql"),
+                        "MySQL engine requires a mysql endpoint block",
+                    ),
+                }
+            } else if connection.mysql.is_some() {
+                push_error(
+                    &mut errors,
+                    &format!("{path}.mysql"),
+                    "mysql endpoint block requires the MySQL engine",
+                );
+            }
             if connection.engine == Engine::Spanner {
                 match &connection.spanner {
                     Some(endpoint) => {
@@ -507,7 +580,7 @@ impl MigrationDefinition {
                     "spanner endpoint block requires the Spanner engine",
                 );
             }
-            if connection.connection_ref.is_none() {
+            if connection.connection_ref.is_none() && connection.engine != Engine::Mysql {
                 push_error(
                     &mut errors,
                     &format!("{path}.connection_ref"),
@@ -796,4 +869,21 @@ fn public_http_endpoint(endpoint: &str) -> bool {
             && !rest.chars().any(char::is_whitespace)
             && !rest.chars().any(char::is_control)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn mysql_endpoint_references_are_strict_and_debug_is_redacted() {
+        let endpoint: MysqlEndpoint = serde_json::from_str(r#"{"host":"localhost","port":3306,"user":"env:PRIVATE_USER","password":"env:PRIVATE_PASSWORD","gtid_mode":"OFF"}"#).unwrap();
+        assert_eq!(format!("{endpoint:?}"), "MysqlEndpoint([REDACTED])");
+        assert_eq!(endpoint.gtid_mode, Some(MysqlGtidMode::Off));
+        assert!(
+            serde_json::from_str::<MysqlEndpoint>(
+                r#"{"host":"localhost","port":3306,"user":"env:USER","password":"inline-value"}"#
+            )
+            .is_err()
+        );
+    }
 }

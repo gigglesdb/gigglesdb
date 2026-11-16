@@ -36,12 +36,28 @@ pub struct ComponentSnapshot {
 pub struct CaptureObservation {
     pub healthy: bool,
     /// Must be observed from the connected source, not copied from the saved marker.
-    pub checkpoint: crate::pg::replication::Checkpoint,
+    pub source: SourceIdentity,
+    pub position: Position,
 }
 pub struct WalObservation {
     pub slot: SlotStatus,
     /// pg_current_wal_lsn, not retained bytes: restart_lsn can advance.
     pub current_lsn: u64,
+}
+pub(super) fn retention_level(
+    valid: bool,
+    seconds: Option<f64>,
+    policy: &RetentionPolicy,
+) -> WalLevel {
+    if !valid || seconds.is_some_and(|s| s <= policy.abort_seconds as f64) {
+        WalLevel::Abort
+    } else if seconds.is_some_and(|s| s <= policy.blocker_seconds as f64) {
+        WalLevel::Blocker
+    } else if seconds.is_some_and(|s| s <= policy.warning_seconds as f64) {
+        WalLevel::Warning
+    } else {
+        WalLevel::Healthy
+    }
 }
 fn clean<T>(section: &ResultSlot<T>) -> bool {
     matches!(section, ResultSlot::Collected { findings, .. } if findings.is_empty())
@@ -59,15 +75,19 @@ pub(super) async fn assemble(
         chunks_done &= state.unfinished_chunks(&plan)?.is_empty();
     }
     let lineage_matches = sample.capture.as_ref().is_some_and(|capture| {
-        state
-            .progress
-            .get("source-slot")
-            .is_some_and(|(marker, _)| {
-                decode_source_checkpoint(marker).is_ok_and(|saved| {
-                    saved.slot == capture.checkpoint.slot
-                        && saved.lineage.check(&capture.checkpoint.lineage).is_ok()
+        if capture.source.engine == "postgres" {
+            state
+                .progress
+                .get("source-slot")
+                .is_some_and(|(marker, _)| {
+                    decode_source_checkpoint(marker).is_ok_and(|saved| {
+                        live_readiness::source_matches(&capture.source, &saved.lineage)
+                            && saved.slot == capture.source.stream
+                    })
                 })
-            })
+        } else {
+            runtime.7.bound(&capture.source, &capture.position)
+        }
     });
     // ReadinessFacts carries comparable integers. Both values are milliseconds;
     // byte distance is diagnostic only, never compared with a seconds budget.
@@ -81,7 +101,7 @@ pub(super) async fn assemble(
             && sample
                 .capture
                 .as_ref()
-                .is_some_and(|capture| lag.matches(&capture.checkpoint))
+                .is_some_and(|capture| lag.matches(capture))
             && state.progress.get("applied").is_some_and(|(marker, _)| {
                 decode_reader_checkpoint(marker).is_ok_and(|checkpoint| {
                     checkpoint
@@ -89,10 +109,9 @@ pub(super) async fn assemble(
                         .as_ref()
                         .is_some_and(|record| record.source == lag.source)
                         && checkpoint.last_position.as_ref().is_some_and(|p| {
-                            p.order_domain() == lag.order_domain
-                                && <[u8; 8]>::try_from(p.bytes()).is_ok_and(|bytes| {
-                                    lag.applied_source_lsn <= u64::from_be_bytes(bytes)
-                                })
+                            lag.applied_source
+                                .compare(p, lag.order.as_ref())
+                                .is_ok_and(|order| !order.is_gt())
                         })
                 })
             })
@@ -226,16 +245,7 @@ impl WalMonitor {
         } else {
             rate.filter(|r| *r > 0.0).map(|r| bytes as f64 / r)
         };
-        let level = if !slot.valid || seconds.is_some_and(|s| s <= self.policy.abort_seconds as f64)
-        {
-            WalLevel::Abort
-        } else if seconds.is_some_and(|s| s <= self.policy.blocker_seconds as f64) {
-            WalLevel::Blocker
-        } else if seconds.is_some_and(|s| s <= self.policy.warning_seconds as f64) {
-            WalLevel::Warning
-        } else {
-            WalLevel::Healthy
-        };
+        let level = retention_level(slot.valid, seconds, &self.policy);
         Ok(WalDecision {
             level,
             wal_bytes_per_second: rate,
@@ -246,6 +256,46 @@ impl WalMonitor {
             resumable: level != WalLevel::Abort,
             source_untouched: true,
         })
+    }
+    /// Native connectors supply their own time projection, never a fabricated LSN.
+    pub fn sample_native(&self, margin: &RetentionMargin) -> Option<WalDecision> {
+        let seconds = margin.time_to_exhaustion.map(|time| time.as_secs_f64());
+        if margin.history_available && seconds.is_none() {
+            return None;
+        }
+        let level = retention_level(margin.history_available, seconds, &self.policy);
+        Some(WalDecision {
+            level,
+            wal_bytes_per_second: None,
+            seconds_to_exhaustion: seconds,
+            slot_headroom_bytes: None,
+            disk_free_bytes: 0,
+            coverage_loss: level == WalLevel::Abort,
+            resumable: level != WalLevel::Abort,
+            source_untouched: true,
+        })
+    }
+    pub(super) fn sample_components(
+        &mut self,
+        runtime: &Runtime,
+        sample: &ComponentSnapshot,
+    ) -> Result<Option<WalDecision>> {
+        let live = runtime.live_readiness();
+        if live
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.source.engine != "postgres")
+        {
+            return Ok(live
+                .retention
+                .as_ref()
+                .and_then(|margin| self.sample_native(margin)));
+        }
+        sample
+            .wal
+            .as_ref()
+            .map(|observation| self.sample(observation))
+            .transpose()
     }
 }
 pub(super) enum SupervisedStop {
@@ -421,8 +471,7 @@ impl Engine {
                 .as_ref()
                 .map_or_else(ComponentSnapshot::default, |s| s.sample());
             self.evaluate_sample(&sample).await?;
-            if let Some(observation) = sample.wal {
-                let decision = wal.sample(&observation)?;
+            if let Some(decision) = wal.sample_components(&self.runtime, &sample)? {
                 if matches!(decision.level, WalLevel::Blocker | WalLevel::Abort) {
                     // Stop and join workers before recording the terminal/blocking event.
                     stop.send_replace(true);

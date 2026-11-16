@@ -16,7 +16,10 @@ pub use final_marker::{
     CapturedControl, FinalMarkerProgress, FinalMarkerReceipt, MarkerProgressError,
     classify_captured_control, decode_marker_payload,
 };
-pub use live_readiness::{ApplyLagObservation, LiveReadinessObservation};
+pub use live_readiness::{
+    ApplyLagObservation, LagMeasure, LiveReadinessObservation, ReadinessBlocked, ReadinessProbe,
+    ReadinessProbeSample, RetentionMargin,
+};
 pub use pg::*;
 pub use readiness::*;
 pub use retention::{EnginePauseReason, RetentionStatus};
@@ -691,12 +694,10 @@ impl Engine {
                 )
                 .map_err(recovery)?;
             let _markers = final_marker::RunGuard(self.runtime.6.markers.clone());
-            self.runtime
-                .6
-                .begin(config.source.clone(), config.order_domain.clone());
+            self.runtime.6.begin(config.source.clone(), order.clone());
             self.runtime.7.begin(
                 config.source.clone(),
-                config.order_domain.clone(),
+                order.clone(),
                 capture.writer_checkpoint()?,
                 self.runtime
                     .snapshot()
@@ -896,13 +897,12 @@ impl Engine {
                     .readiness_source
                     .as_ref()
                     .map_or_else(ComponentSnapshot::default, |s| s.sample());
-                if let Some(observation) = &sample.wal {
-                    let decision = wal.sample(observation)?;
-                    if matches!(decision.level, WalLevel::Blocker | WalLevel::Abort) {
-                        self.evaluate_sample(&sample).await?;
-                        self.enforce_run_wal(&decision).await?;
-                        return self.reached(stop_at, false).await;
-                    }
+                if let Some(decision) = wal.sample_components(&self.runtime, &sample)?
+                    && matches!(decision.level, WalLevel::Blocker | WalLevel::Abort)
+                {
+                    self.evaluate_sample(&sample).await?;
+                    self.enforce_run_wal(&decision).await?;
+                    return self.reached(stop_at, false).await;
                 }
                 if !pause_requested {
                     let facts = readiness::assemble(&self.runtime, &self.journal, &sample).await?;
@@ -1198,7 +1198,7 @@ fn capture_loop(
                             },
                             Some(Command::Rows { rows, ready }) => {
                                 let current = active.as_mut().ok_or_else(|| recovery("rows without Started"))?;
-                                current.window = Some(Window::new(current.plan.table.clone(), current.chunk.clone(),
+                                current.window = Some(current.plan.window(current.chunk.clone(),
                                     rows, current.attempt).map_err(recovery)?);
                                 while let Some(batch) = current.backlog.pop_front() { current.feed(&batch, order.as_ref())?; }
                                 let _ = ready.send(());

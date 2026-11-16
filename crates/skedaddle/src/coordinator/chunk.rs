@@ -4,26 +4,107 @@ use super::{Error, Materialized, Result, Transition, budget, journal::Journal};
 use crate::{
     buffer::{backends::BufferStore, format, reader},
     event::{ContentDigest, Position, PositionOrder},
-    pg::chunk::{ChunkRange, Key, TableKey, plan_chunks},
+    mysql::chunk_key::MysqlTableKey,
+    pg::chunk::{self, ChunkError, ChunkId, ChunkRange, Key, TableKey, Window, plan_chunks},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 pub const PLAN_BYTES: usize = 4 * 1024 * 1024;
+pub const PLAN_FORMAT_VERSION: u16 = 2;
+const PLAN_FORMAT: &str = "skedaddle-chunk-plan";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum SourceTableKey {
+    Postgres(TableKey),
+    Mysql(MysqlTableKey),
+}
+impl From<TableKey> for SourceTableKey {
+    fn from(table: TableKey) -> Self {
+        Self::Postgres(table)
+    }
+}
+impl From<MysqlTableKey> for SourceTableKey {
+    fn from(table: MysqlTableKey) -> Self {
+        Self::Mysql(table)
+    }
+}
+impl SourceTableKey {
+    pub fn event_table(&self) -> &str {
+        match self {
+            Self::Postgres(t) => &t.table,
+            Self::Mysql(t) => &t.event_table,
+        }
+    }
+    pub fn postgres(&self) -> chunk::Result<&TableKey> {
+        match self {
+            Self::Postgres(t) => Ok(t),
+            Self::Mysql(_) => Err(ChunkError::UnsupportedSource(
+                "MySQL plan not yet supported by PostgreSQL adapter",
+            )),
+        }
+    }
+    fn ranges(&self, size: usize, samples: &[Key]) -> chunk::Result<Vec<ChunkRange>> {
+        let Self::Mysql(table) = self else {
+            // Preserve the pre-v2 PostgreSQL logical hash byte for byte.
+            return plan_chunks(self.postgres()?, size, samples);
+        };
+        table.validate().map_err(ChunkError::MysqlKey)?;
+        if size == 0 || i64::try_from(size).is_err() {
+            return Err(ChunkError::Invalid("chunk size"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for key in samples {
+            table.validate_key(key).map_err(ChunkError::MysqlKey)?;
+            if !seen.insert(chunk::key_bytes(key)?) {
+                return Err(ChunkError::Invalid("duplicate sample boundary"));
+            }
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"skedaddle-chunk-plan-mysql-v1\0");
+        hash.update(serde_json::to_vec(&(table, size, samples))?);
+        let plan = format!("{:x}", hash.finalize());
+        Ok((0..=samples.len())
+            .map(|i| ChunkRange {
+                id: ChunkId {
+                    table: table.event_table.clone(),
+                    plan: plan.clone(),
+                    ordinal: i as u64,
+                },
+                lo: i.checked_sub(1).map(|j| samples[j].clone()),
+                hi: samples.get(i).cloned(),
+            })
+            .collect())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanEnvelope<T> {
+    format: String,
+    version: u16,
+    plan: T,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkPlan {
-    pub table: TableKey,
+    pub table: SourceTableKey,
     pub chunk_size: usize,
     /// Source order, never sorted or regenerated during recovery.
     pub samples: Vec<Key>,
     pub ranges: Vec<ChunkRange>,
 }
 impl ChunkPlan {
-    pub fn new(table: TableKey, chunk_size: usize, samples: Vec<Key>) -> Result<Self> {
-        let ranges = plan_chunks(&table, chunk_size, &samples).map_err(invalid)?;
+    pub fn new(
+        table: impl Into<SourceTableKey>,
+        chunk_size: usize,
+        samples: Vec<Key>,
+    ) -> Result<Self> {
+        let table = table.into();
+        let ranges = table.ranges(chunk_size, &samples).map_err(invalid)?;
         let plan = Self {
             table,
             chunk_size,
@@ -36,19 +117,71 @@ impl ChunkPlan {
     fn validate(&self) -> Result<()> {
         budget::check(budget::Budget::Chunks, self.ranges.len(), budget::CHUNKS)?;
         if self.ranges
-            != plan_chunks(&self.table, self.chunk_size, &self.samples).map_err(invalid)?
+            != self
+                .table
+                .ranges(self.chunk_size, &self.samples)
+                .map_err(invalid)?
         {
             return Err(invalid("samples/plan mismatch"));
         }
         budget::check(
             budget::Budget::Chunks,
-            serde_json::to_vec(self)?.len(),
+            self.object_bytes()?.len(),
             PLAN_BYTES,
         )
     }
+    fn object_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&PlanEnvelope {
+            format: PLAN_FORMAT.into(),
+            version: PLAN_FORMAT_VERSION,
+            plan: self,
+        })?)
+    }
+    fn from_object_bytes(bytes: &[u8]) -> Result<Self> {
+        // Decode only the version header before attempting the typed plan body.
+        #[derive(Deserialize)]
+        struct Header {
+            version: Option<serde_json::Value>,
+        }
+        let header: Header = serde_json::from_slice(bytes)?;
+        let found = header
+            .version
+            .and_then(|v| v.as_u64().and_then(|n| u16::try_from(n).ok()));
+        if found != Some(PLAN_FORMAT_VERSION) {
+            return Err(Error::UnsupportedFormatVersion {
+                format: PLAN_FORMAT,
+                found,
+                expected: PLAN_FORMAT_VERSION,
+            });
+        }
+        let envelope: PlanEnvelope<Self> = serde_json::from_slice(bytes)?;
+        if envelope.format != PLAN_FORMAT {
+            return Err(invalid("plan object format"));
+        }
+        envelope.plan.validate()?;
+        Ok(envelope.plan)
+    }
+    /// The window removes touched mapped identities; it never classifies ranges.
+    pub(crate) fn window(
+        &self,
+        range: ChunkRange,
+        rows: Vec<crate::event::Row>,
+        attempt: u64,
+    ) -> chunk::Result<Window> {
+        match &self.table {
+            SourceTableKey::Postgres(table) => Window::new(table.clone(), range, rows, attempt),
+            SourceTableKey::Mysql(table) => Window::with_keys(
+                table.event_table.clone(),
+                Box::new(table.clone()),
+                range,
+                rows,
+                attempt,
+            ),
+        }
+    }
     fn reference(&self, bytes: &[u8]) -> ChunkPlanRef {
         ChunkPlanRef {
-            table: self.table.table.clone(),
+            table: self.table.event_table().into(),
             plan: self.ranges[0].id.plan.clone(),
             digest: format!("{:x}", Sha256::digest(bytes)),
             bytes: bytes.len(),
@@ -85,6 +218,165 @@ fn hex_digest(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use crate::{
+        mapping::Value,
+        mysql::{chunk_key::tests::table, schema::Collation},
+    };
+
+    #[test]
+    fn plan_envelope_round_trip_and_versions_precede_body_decode() {
+        let plan = ChunkPlan::new(table(), 10, vec![vec![Value::Int4(7)]]).unwrap();
+        let bytes = plan.object_bytes().unwrap();
+        assert_eq!(ChunkPlan::from_object_bytes(&bytes).unwrap(), plan);
+        let object: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(object["format"], PLAN_FORMAT);
+        assert_eq!(object["version"], 2);
+        for (bytes, found) in [
+            (br#"{"plan":false}"#.as_slice(), None),
+            (br#"{"version":1,"plan":false}"#.as_slice(), Some(1)),
+            (br#"{"version":3,"plan":false}"#.as_slice(), Some(3)),
+        ] {
+            assert!(matches!(ChunkPlan::from_object_bytes(bytes),
+                Err(Error::UnsupportedFormatVersion { format: PLAN_FORMAT, found: v, expected: 2 }) if v == found));
+        }
+        assert!(matches!(
+            ChunkPlan::from_object_bytes(&serde_json::to_vec(&plan).unwrap()),
+            Err(Error::UnsupportedFormatVersion { found: None, .. })
+        ));
+        assert!(matches!(
+            ChunkPlan::from_object_bytes(
+                br#"{"format":"skedaddle-chunk-plan","version":2,"plan":false}"#
+            ),
+            Err(Error::Json(_))
+        ));
+        let mut foreign = object;
+        foreign["format"] = "foreign".into();
+        assert!(ChunkPlan::from_object_bytes(&serde_json::to_vec(&foreign).unwrap()).is_err());
+    }
+
+    #[test]
+    fn mysql_plan_hash_has_own_domain_and_binds_every_key_field() {
+        let mut t = table();
+        t.columns[0].character_set = Some("utf8mb4".into());
+        t.columns[0].collation = Some(Collation {
+            name: "utf8mb4_bin".into(),
+            id: 46,
+        });
+        let samples = vec![vec![Value::Int4(7)], vec![Value::Int4(9)]];
+        let hash = |t: MysqlTableKey| {
+            ChunkPlan::new(t, 10, samples.clone()).unwrap().ranges[0]
+                .id
+                .plan
+                .clone()
+        };
+        let expected = hash(t.clone());
+        let recipe = serde_json::to_vec(&(&t, 10usize, &samples)).unwrap();
+        let digest = |domain: &[u8], body: &[u8]| {
+            let mut h = Sha256::new();
+            h.update(domain);
+            h.update(body);
+            format!("{:x}", h.finalize())
+        };
+        assert_eq!(
+            expected,
+            digest(b"skedaddle-chunk-plan-mysql-v1\0", &recipe)
+        );
+        assert_ne!(expected, digest(b"skedaddle-chunk-plan-v1\0", &recipe));
+        // Each descriptor field, including collation's wire ID, is bound.
+        for field in [
+            "event_table",
+            "schema",
+            "table",
+            "name",
+            "data_type",
+            "column_type",
+            "character_set",
+            "collation_name",
+            "collation_id",
+            "type_id",
+        ] {
+            let mut changed = t.clone();
+            match field {
+                "event_table" => changed.event_table.push('x'),
+                "schema" => changed.schema.push('x'),
+                "table" => changed.table.push('x'),
+                "name" => changed.columns[0].name.push('x'),
+                "data_type" => changed.columns[0].data_type = "bigint".into(),
+                "column_type" => changed.columns[0].column_type = "bigint unsigned".into(),
+                "character_set" => changed.columns[0].character_set = Some("utf8mb3".into()),
+                "collation_name" => changed.columns[0]
+                    .collation
+                    .as_mut()
+                    .unwrap()
+                    .name
+                    .push('x'),
+                "collation_id" => changed.columns[0].collation.as_mut().unwrap().id += 1,
+                "type_id" => changed.columns[0].type_id.push('x'),
+                _ => unreachable!(),
+            }
+            assert_ne!(hash(changed), expected, "{field}");
+        }
+        let changed_direction = String::from_utf8(recipe.clone())
+            .unwrap()
+            .replace("\"Asc\"", "\"Desc\"");
+        assert_ne!(
+            expected,
+            digest(
+                b"skedaddle-chunk-plan-mysql-v1\0",
+                changed_direction.as_bytes()
+            )
+        );
+        assert_ne!(
+            expected,
+            ChunkPlan::new(t.clone(), 11, samples.clone())
+                .unwrap()
+                .ranges[0]
+                .id
+                .plan
+        );
+        let mut reversed = samples.clone();
+        reversed.reverse();
+        assert_ne!(
+            expected,
+            ChunkPlan::new(t.clone(), 10, reversed).unwrap().ranges[0]
+                .id
+                .plan
+        );
+        let mut changed = samples;
+        changed[0][0] = Value::Int4(8);
+        assert_ne!(
+            expected,
+            ChunkPlan::new(t.clone(), 10, changed).unwrap().ranges[0]
+                .id
+                .plan
+        );
+        let mut second = t.columns[0].clone();
+        second.name.push('2');
+        t.columns.push(second);
+        let composite_samples = vec![vec![Value::Int4(1), Value::Int4(2)]];
+        let original = ChunkPlan::new(t.clone(), 10, composite_samples.clone()).unwrap();
+        t.columns.reverse();
+        assert_ne!(
+            original.ranges[0].id.plan,
+            ChunkPlan::new(t, 10, composite_samples).unwrap().ranges[0]
+                .id
+                .plan
+        );
+    }
+
+    #[test]
+    fn mysql_plan_does_not_enter_postgres_adapters() {
+        let plan = ChunkPlan::new(table(), 10, vec![]).unwrap();
+        assert!(matches!(
+            plan.table.postgres(),
+            Err(ChunkError::UnsupportedSource(_))
+        ));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,8 +489,8 @@ impl Materialized {
     /// Includes never-started ranges and the latest Started without Done.
     pub fn unfinished_chunks(&self, plan: &ChunkPlan) -> Result<Vec<ChunkRange>> {
         plan.validate()?;
-        let bytes = serde_json::to_vec(plan)?;
-        if self.chunk_plans.get(&plan.table.table) != Some(&plan.reference(&bytes)) {
+        let bytes = plan.object_bytes()?;
+        if self.chunk_plans.get(plan.table.event_table()) != Some(&plan.reference(&bytes)) {
             return Err(invalid("resume requires the saved plan"));
         }
         plan.ranges
@@ -246,7 +538,7 @@ impl Journal {
     }
     pub async fn publish_chunk_plan(&self, plan: &ChunkPlan) -> Result<ChunkPlanRef> {
         plan.validate()?;
-        let bytes = serde_json::to_vec(plan)?;
+        let bytes = plan.object_bytes()?;
         let reference = plan.reference(&bytes);
         self.create(&self.plan_key(&reference), bytes).await?;
         Ok(reference)
@@ -257,8 +549,7 @@ impl Journal {
             .read_bounded(&self.plan_key(reference), PLAN_BYTES)
             .await?
             .ok_or_else(|| invalid("missing durable plan object"))?;
-        let plan: ChunkPlan = serde_json::from_slice(&bytes)?;
-        plan.validate()?;
+        let plan = ChunkPlan::from_object_bytes(&bytes)?;
         if plan.reference(&bytes) != *reference {
             return Err(invalid("plan object digest/identity mismatch"));
         }

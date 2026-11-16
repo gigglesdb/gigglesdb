@@ -9,7 +9,7 @@ use crate::{
     pg::chunk::{ChunkId, TableKey, Watermark, WatermarkKind, key_bytes},
     verify::{
         self, ApplierTerminalCause, ChangeEvidence, EvidenceInvalidation, EvidenceLimit, Key,
-        KeyOrder, Lsn, RangePlan, VerifyError, sql::SqlChangeEvidence,
+        KeyOrder, RangePlan, VerifyError, sql::SqlChangeEvidence,
     },
 };
 use async_trait::async_trait;
@@ -64,7 +64,8 @@ struct State {
     running: bool,
     terminal: Option<ApplierTerminalCause>,
     invalid: Option<EvidenceInvalidation>,
-    applied: Option<Lsn>,
+    applied: Option<Position>,
+    order: Option<verify::SourcePositionOrder>,
     arms: HashMap<Uuid, Box<Armed>>,
 }
 
@@ -76,7 +77,7 @@ struct Armed {
     bytes: usize,
     failure: Option<ArmFailure>,
     marker: Watermark,
-    through: Option<Lsn>,
+    through: Option<Position>,
 }
 
 #[derive(Clone, Copy)]
@@ -120,6 +121,10 @@ pub(super) fn verification_marker(token: Uuid) -> Watermark {
     }
 }
 
+fn txn_position(binding: &Binding, lsn: u64) -> Position {
+    verify::sql::PgSourcePosition::new(&binding.domain).position(lsn)
+}
+
 fn source_change(expected: &SourceIdentity, actual: &SourceIdentity) -> EvidenceInvalidation {
     if expected.stream != actual.stream {
         EvidenceInvalidation::SlotChanged
@@ -161,7 +166,7 @@ impl State {
     fn applier_timeout(
         &self,
         binding: &Binding,
-        waited_lsn: Lsn,
+        waited_position: Position,
         elapsed: Duration,
     ) -> VerifyError {
         // Marker SQL may remain pending after the engine has already stopped.
@@ -178,7 +183,7 @@ impl State {
             };
         }
         VerifyError::ApplierTimeout {
-            waited_lsn,
+            waited_position,
             elapsed,
         }
     }
@@ -188,7 +193,7 @@ impl State {
         binding: &Binding,
         token: Uuid,
         range: &RangePlan,
-        waited_lsn: Lsn,
+        waited_position: Position,
         elapsed: Duration,
     ) -> VerifyError {
         if let Err(error) = self.check_binding(binding) {
@@ -207,14 +212,14 @@ impl State {
             return failure.error(range);
         }
         VerifyError::ApplierTimeout {
-            waited_lsn,
+            waited_position,
             elapsed,
         }
     }
 }
 
 impl Hub {
-    pub(super) fn begin(&self, source: SourceIdentity, domain: String) {
+    pub(super) fn begin(&self, source: SourceIdentity, order: verify::SourcePositionOrder) {
         let mut state = self.state.lock().expect("verification state poisoned");
         let generation = state
             .binding
@@ -223,9 +228,10 @@ impl Hub {
         state.invalidate(EvidenceInvalidation::Reconnected);
         state.binding = Some(Binding {
             source,
-            domain,
+            domain: order.domain().into(),
             generation,
         });
+        state.order = Some(order);
         state.running = true;
         state.terminal = None;
         state.invalid = None;
@@ -255,10 +261,21 @@ impl Hub {
             if txn.source != binding.source {
                 state.invalidate(source_change(&binding.source, &txn.source));
             } else if txn.commit_position.order_domain() != binding.domain
-                || txn.commit_position.bytes().len() != 8
+                || verify::compare_positions(
+                    state.order.as_ref().expect("bound order").as_ref(),
+                    &txn.commit_position,
+                    &txn.commit_position,
+                )
+                .is_err()
                 || txn.events.iter().any(|event| {
                     event.source != binding.source
                         || event.position.order_domain() != binding.domain
+                        || verify::compare_positions(
+                            state.order.as_ref().expect("bound order").as_ref(),
+                            &event.position,
+                            &event.position,
+                        )
+                        .is_err()
                 })
             {
                 state.invalidate(EvidenceInvalidation::LineageChanged);
@@ -295,7 +312,7 @@ impl Hub {
                     if !authenticated || !watermark.transactional {
                         arm.failure = Some(ArmFailure::Invalid(EvidenceInvalidation::CaptureGap));
                     } else {
-                        arm.through = Some(watermark.commit_lsn);
+                        arm.through = Some(txn_position(&binding, watermark.commit_lsn));
                     }
                 }
             }
@@ -330,16 +347,18 @@ impl Hub {
         {
             state.invalidate(EvidenceInvalidation::LineageChanged);
         } else if !record.chunk_rows {
-            if let Ok(bytes) = <[u8; 8]>::try_from(position.bytes()) {
-                let lsn = u64::from_be_bytes(bytes);
-                if state.applied.is_some_and(|previous| previous > lsn) || checkpoint.next_mseq == 0
-                {
-                    state.terminal = Some(ApplierTerminalCause::CheckpointRejected);
-                } else {
-                    state.applied = Some(lsn);
-                }
-            } else {
+            let order = state.order.as_ref().expect("bound order");
+            let valid = verify::compare_positions(order.as_ref(), position, position).is_ok()
+                && state.applied.as_ref().is_none_or(|previous| {
+                    matches!(
+                        verify::compare_positions(order.as_ref(), previous, position),
+                        Ok(Ordering::Less | Ordering::Equal)
+                    )
+                });
+            if !valid || checkpoint.next_mseq == 0 {
                 state.terminal = Some(ApplierTerminalCause::CheckpointRejected);
+            } else {
+                state.applied = Some(position.clone());
             }
         }
         drop(state);
@@ -536,6 +555,11 @@ impl Runtime {
             },
         )?;
         state.check_binding(&binding)?;
+        if binding.source.engine != "postgres" {
+            return Err(VerifyError::Invalid(
+                "PG verification adapter requires PostgreSQL source",
+            ));
+        }
         drop(state);
         let admin = Arc::new(admin);
         Ok((
@@ -560,6 +584,15 @@ impl Runtime {
 
 #[async_trait]
 impl<O: KeyOrder + Send> SqlChangeEvidence for PgChangeEvidence<O> {
+    fn position_order(&self) -> verify::SourcePositionOrder {
+        self.hub
+            .state
+            .lock()
+            .expect("verification state poisoned")
+            .order
+            .clone()
+            .expect("bound order")
+    }
     async fn arm(&mut self, range: &RangePlan) -> verify::Result<()> {
         self.disarm();
         if range.id.table != self.table.table {
@@ -613,7 +646,7 @@ impl<O: KeyOrder + Send> SqlChangeEvidence for PgChangeEvidence<O> {
     async fn changes(
         &mut self,
         range: &RangePlan,
-        source_lsn: Lsn,
+        source_lsn: Position,
     ) -> verify::Result<ChangeEvidence> {
         Box::pin(self.collect(range, source_lsn)).await
     }
@@ -623,7 +656,7 @@ impl<O: KeyOrder + Send> PgChangeEvidence<O> {
     async fn collect(
         &mut self,
         range: &RangePlan,
-        source_lsn: Lsn,
+        source_lsn: Position,
     ) -> verify::Result<ChangeEvidence> {
         let token = self
             .armed
@@ -637,6 +670,11 @@ impl<O: KeyOrder + Send> PgChangeEvidence<O> {
         let marker = {
             let state = self.hub.state.lock().expect("verification state poisoned");
             state.check_binding(&self.binding)?;
+            verify::compare_positions(
+                state.order.as_ref().expect("bound order").as_ref(),
+                &source_lsn,
+                &source_lsn,
+            )?;
             let arm = state
                 .arms
                 .get(&token)
@@ -653,6 +691,7 @@ impl<O: KeyOrder + Send> PgChangeEvidence<O> {
         let binding = self.binding.clone();
         let admin = self.admin.clone();
         let order = &mut self.order;
+        let waited_position = source_lsn.clone();
         let result = tokio::time::timeout(
             self.limits.timeout,
             Box::pin(async move {
@@ -676,14 +715,26 @@ impl<O: KeyOrder + Send> PgChangeEvidence<O> {
                             return Err(failure.error(range));
                         }
                         arm.through
+                            .clone()
                             .map(|through| (through, std::mem::take(&mut arm.keys)))
                     };
-                    if let Some((through_lsn, keys)) = complete {
-                        if through_lsn < source_lsn {
+                    if let Some((through_position, keys)) = complete {
+                        if verify::compare_positions(
+                            hub.state
+                                .lock()
+                                .expect("verification state poisoned")
+                                .order
+                                .as_ref()
+                                .expect("bound order")
+                                .as_ref(),
+                            &through_position,
+                            &source_lsn,
+                        )? == Ordering::Less
+                        {
                             return Err(invalid(EvidenceInvalidation::CaptureGap));
                         }
                         return Ok(ChangeEvidence {
-                            through_lsn,
+                            through_position,
                             keys: ordered_range_keys(&*order, range, keys.into_values().collect())?,
                         });
                     }
@@ -698,7 +749,13 @@ impl<O: KeyOrder + Send> PgChangeEvidence<O> {
                 .state
                 .lock()
                 .expect("verification state poisoned")
-                .evidence_timeout(&self.binding, token, range, source_lsn, started.elapsed()))
+                .evidence_timeout(
+                    &self.binding,
+                    token,
+                    range,
+                    waited_position,
+                    started.elapsed(),
+                ))
         })
     }
 }
@@ -753,7 +810,7 @@ fn ordered_range_keys(
 
 #[async_trait]
 impl verify::Applier for AppliedSourceWaiter {
-    async fn wait_until(&mut self, source_lsn: Lsn) -> verify::Result<Lsn> {
+    async fn wait_until(&mut self, source_lsn: Position) -> verify::Result<Position> {
         let started = tokio::time::Instant::now();
         let result = tokio::time::timeout(
             self.timeout,
@@ -773,8 +830,13 @@ impl verify::Applier for AppliedSourceWaiter {
                                 cause: ApplierTerminalCause::ApplyStopped,
                             });
                         }
-                        if let Some(lsn) = state.applied.filter(|lsn| *lsn >= source_lsn) {
-                            return Ok(lsn);
+                        let order = state.order.as_ref().expect("bound order");
+                        verify::compare_positions(order.as_ref(), &source_lsn, &source_lsn)?;
+                        if let Some(position) = &state.applied
+                            && verify::compare_positions(order.as_ref(), position, &source_lsn)?
+                                != Ordering::Less
+                        {
+                            return Ok(position.clone());
                         }
                     }
                     // A snapshot may sample the WAL end after the latest commit

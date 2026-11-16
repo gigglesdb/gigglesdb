@@ -2,6 +2,7 @@
 use super::{
     GtidSet, MysqlPosition,
     binlog::{BinlogDecoder, MysqlEvent, PositionedEvent},
+    resume::{self, ResumeBlocker, ResumePlan},
 };
 use futures::Stream;
 use mysql_async::{
@@ -23,16 +24,66 @@ pub enum MysqlError {
     UnsupportedVersion(String),
     Invalid(&'static str),
     UnsupportedEvent(u8),
-    PayloadTooLarge { limit: usize },
-    MissingPrimaryKey { schema: String, table: String },
+    PayloadTooLarge {
+        limit: usize,
+    },
+    MissingPrimaryKey {
+        schema: String,
+        table: String,
+    },
     Value(&'static str),
     Assembly(&'static str),
-    TransactionTooLarge { limit: usize },
+    TransactionTooLarge {
+        limit: usize,
+    },
     Event(crate::event::EventError),
+    Control(&'static str),
+    Mapping(crate::mapping::MappingError),
+    Resume(ResumeBlocker),
+    StreamEnded,
+    ReconnectExhausted {
+        attempts: usize,
+        last: Box<MysqlError>,
+    },
+}
+impl MysqlError {
+    /// Retry transport loss and server shutdown, never TLS/auth/codec failures.
+    pub fn is_transient(&self) -> bool {
+        fn io(e: &std::io::Error) -> bool {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NotConnected
+            )
+        }
+        match self {
+            Self::StreamEnded => true,
+            Self::Io(e) => io(e),
+            Self::Driver(mysql_async::Error::Io(mysql_async::IoError::Io(e))) => io(e),
+            Self::Driver(mysql_async::Error::Driver(
+                mysql_async::DriverError::ConnectionClosed,
+            )) => true,
+            Self::Driver(mysql_async::Error::Server(e)) => matches!(e.code, 1053 | 1077 | 1079),
+            _ => false,
+        }
+    }
+}
+impl From<ResumeBlocker> for MysqlError {
+    fn from(e: ResumeBlocker) -> Self {
+        Self::Resume(e)
+    }
 }
 impl std::fmt::Display for MysqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Resume(blocker) => write!(f, "RecoveryRequired: {blocker}"),
+            _ => write!(f, "{self:?}"),
+        }
     }
 }
 impl std::error::Error for MysqlError {}
@@ -231,8 +282,8 @@ impl MysqlBinlogRequest {
     }
 }
 impl MysqlClient {
-    /// Consumes the verified TLS connection. An empty GTID request uses the current
-    /// status file/offset only for the dump; callers still track GTIDs from events.
+    /// Consumes the verified TLS connection after checking resume safety. An empty
+    /// GTID request uses its durable file/offset; events still track GTIDs.
     pub async fn open_stream(
         mut self,
         position: &MysqlPosition,
@@ -293,59 +344,20 @@ impl MysqlClient {
         if server_id == 0 || heartbeat.is_zero() || heartbeat.as_nanos() > u64::MAX.into() {
             return Err(MysqlError::Invalid("server id or heartbeat"));
         }
-        let status = self.status().await?;
-        let mut request = MysqlBinlogRequest {
-            server_id,
-            file: Vec::new(),
-            offset: 4,
-            sids: None,
-        };
-        let request = match position {
-            MysqlPosition::Gtid { set, .. } => {
-                if !status.gtid_on {
-                    return Err(MysqlError::Invalid(
-                        "GTID auto-position requires gtid_mode=ON",
-                    ));
-                }
-                if set.to_string().is_empty() {
-                    // mysql_common drops BINLOG_THROUGH_GTID for empty SID blocks.
-                    if status.offset < 4 || status.offset > u32::MAX.into() {
-                        return Err(MysqlError::Invalid(
-                            "file offset outside COM_BINLOG_DUMP range",
-                        ));
-                    }
-                    request.file = status.file.into_bytes();
-                    request.offset = status.offset;
-                } else {
-                    request.sids = Some(sids(set)?);
-                }
-                request
-            }
-            MysqlPosition::File {
-                server_uuid,
-                file_seq,
+        let plan = resume::check(position, &self.status().await?)?;
+        let request = match plan {
+            ResumePlan::Gtid { set, .. } => MysqlBinlogRequest {
+                server_id,
+                file: Vec::new(),
+                offset: 4,
+                sids: Some(sids(&set)?),
+            },
+            ResumePlan::File { file, offset } => MysqlBinlogRequest {
+                server_id,
+                file: file.into_bytes(),
                 offset,
-            } => {
-                if *offset < 4 || *offset > u32::MAX.into() {
-                    return Err(MysqlError::Invalid(
-                        "file offset outside COM_BINLOG_DUMP range",
-                    ));
-                }
-                if *server_uuid != status.server_uuid {
-                    return Err(MysqlError::Invalid("file position server mismatch"));
-                }
-                let file = status
-                    .binary_logs
-                    .iter()
-                    .find(|(name, _)| {
-                        name.rsplit('.').next().and_then(|s| s.parse::<u64>().ok())
-                            == Some(*file_seq)
-                    })
-                    .ok_or(MysqlError::Invalid("binlog file unavailable"))?;
-                request.file = file.0.as_bytes().to_vec();
-                request.offset = *offset;
-                request
-            }
+                sids: None,
+            },
         };
         self.conn
             .query_drop(format!(

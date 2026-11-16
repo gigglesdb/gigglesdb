@@ -213,6 +213,10 @@ pub async fn execute_next(
                             txn,
                             &replay.tables,
                             &apply::PlanContext {
+                                positions: apply::SourcePositions::new(
+                                    replay.order.clone(),
+                                    apply::OriginPolicy::NativePgLsn,
+                                ),
                                 stream: stream.clone(),
                                 mseq,
                                 origin: origin.clone(),

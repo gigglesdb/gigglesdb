@@ -35,6 +35,11 @@ pub const MAGIC: &[u8; 8] = b"SKEDSEG\0";
 pub const END_MAGIC: &[u8; 8] = b"SKEDEND\0";
 pub const FORMAT_VERSION: u16 = 2;
 
+/// Version 1 embedded unbounded position hex and had no explicit key marker.
+/// Version 2 hashes both endpoints for every connector, including PostgreSQL.
+/// Segment/manifest payloads and coordinator checkpoints are unchanged.
+pub const SEGMENT_KEY_VERSION: u16 = 2;
+
 /// Coordinator checkpoint schema. Version 3 rejects pre-opaque-progress state.
 /// The consumed equal-H slot introduced in version 2 is preserved.
 pub const CHECKPOINT_VERSION: u16 = 3;
@@ -1029,6 +1034,7 @@ impl ManifestEntry {
         if entry.canonical_json()? != bytes {
             return Err(FormatError::Invalid("noncanonical manifest JSON"));
         }
+        validate_segment_key_version(&entry.segment_key)?;
         Ok(entry)
     }
 }
@@ -1088,11 +1094,28 @@ fn component(text: &str) -> String {
     out
 }
 fn position_component(position: &Position) -> String {
-    format!(
-        "x{}.{}",
-        hex(position.order_domain().as_bytes()),
-        hex(position.bytes())
-    )
+    let mut digest = Sha256::new();
+    digest.update(position.order_domain().as_bytes());
+    digest.update([0]);
+    digest.update(position.bytes());
+    hex(&digest.finalize())
+}
+
+fn validate_segment_key_version(key: &str) -> Result<(), FormatError> {
+    let found = key
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.strip_prefix('v'))
+        .and_then(|name| name.split_once('-'))
+        .and_then(|(version, _)| version.parse::<u16>().ok());
+    if found != Some(SEGMENT_KEY_VERSION) {
+        return Err(FormatError::UnsupportedFormatVersion {
+            format: "segment-key",
+            found,
+            expected: SEGMENT_KEY_VERSION,
+        });
+    }
+    Ok(())
 }
 fn root(prefix: &str, migration_id: &str, stream: &str) -> String {
     let prefix = prefix.trim_end_matches('/');
@@ -1104,6 +1127,10 @@ fn root(prefix: &str, migration_id: &str, stream: &str) -> String {
     }
 }
 
+/// Endpoint hashes bound the filename independently of native position size.
+/// Replay order comes exclusively from manifest mseq, never segment LIST order.
+/// Manifests retain the full positions; readers compare the regenerated key and
+/// all header endpoints, and decoding checks the first/last record positions.
 pub fn segment_key(
     prefix: &str,
     migration_id: &str,
@@ -1113,7 +1140,7 @@ pub fn segment_key(
     epoch: u64,
 ) -> String {
     format!(
-        "{}/seg/{}-{}-{epoch}.seg",
+        "{}/seg/v{SEGMENT_KEY_VERSION}-{}-{}-{epoch}.seg",
         root(prefix, migration_id, stream),
         position_component(first_pos),
         position_component(last_pos)
@@ -1125,4 +1152,57 @@ pub fn manifest_key(prefix: &str, migration_id: &str, stream: &str, mseq: u64) -
         "{}/manifest/{mseq:020}.json",
         root(prefix, migration_id, stream)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_keys_are_bounded_and_distinguish_endpoint_bytes_and_domains() {
+        let first = Position::new("mysql:source/gtid", vec![7; 64 * 1024]);
+        let key = segment_key("p", "m", "s", &first, &first, u64::MAX);
+        assert!(key.len() < 200, "{}", key.len());
+        let mut changed = first.bytes().to_vec();
+        *changed.last_mut().unwrap() = 8;
+        let changed = Position::new(first.order_domain(), changed);
+        let domain = Position::new("other", first.bytes().to_vec());
+        for other in [&changed, &domain] {
+            assert_ne!(key, segment_key("p", "m", "s", other, &first, u64::MAX));
+            assert_ne!(key, segment_key("p", "m", "s", &first, other, u64::MAX));
+        }
+        assert_ne!(key, segment_key("p", "m", "s", &first, &first, 1));
+        assert_eq!(key, segment_key("p", "m", "s", &first, &first, u64::MAX));
+    }
+
+    #[test]
+    fn manifest_order_and_equal_h_key_identity_are_preserved() {
+        let position = Position::new("d", vec![9]);
+        let base = segment_key("p", "m", "s", &position, &position, 7);
+        let chunk = boundary_segment_key(base.clone(), &position, Some(&position));
+        assert_eq!(chunk, format!("{base}.chunk-rows"));
+        assert_ne!(base, chunk);
+        assert!(base < chunk); // Both remain distinct in lexically paginated LISTs.
+        for key in [&base, &chunk] {
+            validate_segment_key_version(key).unwrap();
+        }
+        let keys: Vec<_> = [0, 1, 9, 10, 999, u64::MAX]
+            .map(|mseq| manifest_key("p", "m", "s", mseq))
+            .into();
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn old_and_unknown_segment_key_schemes_are_typed_errors() {
+        for (key, expected_found) in [
+            ("p/buffer/m/s/seg/x64.09-x64.09-7.seg", None),
+            ("p/buffer/m/s/seg/v1-old.seg", Some(1)),
+            ("p/buffer/m/s/seg/v3-future.seg", Some(3)),
+        ] {
+            assert!(matches!(validate_segment_key_version(key),
+                Err(FormatError::UnsupportedFormatVersion {
+                    format: "segment-key", found, expected: 2,
+                }) if found == expected_found));
+        }
+    }
 }

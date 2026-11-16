@@ -182,7 +182,11 @@ impl TableCatalog {
         plan: &crate::coordinator::chunk::ChunkPlan,
         order_domain: &str,
     ) -> Result<RangeClassifier> {
-        RangeClassifier::new(self, plan, order_domain)
+        RangeClassifier::with_position_order(
+            self,
+            plan,
+            std::sync::Arc::new(crate::pg::apply::NativePgOrder(order_domain.into())),
+        )
     }
 }
 

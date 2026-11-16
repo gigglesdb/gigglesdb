@@ -1,4 +1,5 @@
-use super::super::{Key, Lsn, RangePlan, TableCoverage};
+use super::super::{Key, RangePlan, TableCoverage};
+use crate::event::Position;
 
 pub const REPAIR_VERSION: u32 = 1;
 
@@ -9,14 +10,15 @@ pub struct RepairScope {
     pub columns: Vec<String>,
 }
 
-/// Positions here MUST be comparable timestamps/revisions from the same change
-/// authority. A destination WAL LSN is never comparable with a source WAL LSN.
+/// Revisions MUST come from the same change authority. The native source-read
+/// position is boundary metadata, not destination-change provenance. A
+/// destination WAL position must never be compared with this source boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepairRequest {
     pub version: u32,
     pub scope: RepairScope,
     pub source_read_revision: u64,
-    pub source_read_lsn: Lsn,
+    pub source_read_position: Position,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

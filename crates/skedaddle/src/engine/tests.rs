@@ -183,6 +183,7 @@ fn planner(
             key: vec!["id".into()],
         }],
         &apply::PlanContext {
+            positions: apply::SourcePositions::native_pg("engine-test"),
             stream: "wal".into(),
             mseq,
             origin: "test".into(),
@@ -745,7 +746,7 @@ mod opaque_capture {
     async fn native_copy(
         seam: &Seam,
         capture: &mut FrontierCapture,
-        database: &mut FrontierDatabase,
+        database: &mut impl ChunkDatabase,
     ) {
         let runtime = seam.engine.runtime();
         let config = CopyConfig {
@@ -756,8 +757,8 @@ mod opaque_capture {
         let (commands, receive) = mpsc::channel(1);
         let (stop, stopped) = watch::channel(false);
         let mut budget = budget();
-        let (captured, copied, ()) = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::try_join!(
                 capture_loop(capture, receive, stopped.clone(), &runtime, &config),
                 copy_loop(
                     database,
@@ -773,13 +774,13 @@ mod opaque_capture {
                         tokio::task::yield_now().await;
                     }
                     stop.send_replace(true);
+                    Ok::<(), coordinator::Error>(())
                 }
             )
         })
         .await
+        .unwrap()
         .unwrap();
-        captured.unwrap();
-        copied.unwrap();
     }
     #[tokio::test]
     async fn native_chunk_completes_and_authenticates_done_after_restart() {
@@ -895,6 +896,134 @@ mod opaque_capture {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
+    async fn mysql_plan_window_excludes_touched_mapped_keys() {
+        let seam = Seam::new().await;
+        seam.engine
+            .runtime
+            .lifecycle(Event::Advance {
+                to: State::Assessed,
+            })
+            .await
+            .unwrap();
+        seam.engine
+            .start(&mut Setup(Arc::new(AtomicU64::new(0))))
+            .await
+            .unwrap();
+        let plan = ChunkPlan::new(crate::mysql::chunk_key::tests::table(), 10, vec![]).unwrap();
+        seam.engine.plan(&plan).await.unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let mut capture = seam.capture(VecDeque::new()).await;
+        capture.incoming = Some(rx);
+        struct TouchedDatabase(FrontierDatabase);
+        impl ChunkDatabase for TouchedDatabase {
+            async fn emit(&mut self, marker: Watermark) -> Result<()> {
+                if marker.wm == WatermarkKind::High {
+                    let mut txn = transaction(&[1, 0]);
+                    txn.events.push(crate::event::Event {
+                        source: identity(),
+                        txn: txn.txn.clone(),
+                        ordinal_in_txn: 0,
+                        position: txn.commit_position.clone(),
+                        schema_version: 1,
+                        kind: crate::event::EventKind::Delete,
+                        table: Some("rows".into()),
+                        key: [(
+                            "id".into(),
+                            OpaqueValue {
+                                type_id: "int4".into(),
+                                bytes: Some(Value::Int4(7).canonical_bytes().unwrap()),
+                            },
+                        )]
+                        .into(),
+                        before: None,
+                        after: None,
+                        unchanged_cols: Default::default(),
+                    });
+                    let txn = AssembledTxn::new(
+                        txn.source,
+                        txn.txn,
+                        txn.commit_position,
+                        None,
+                        txn.events,
+                    )
+                    .unwrap();
+                    self.0
+                        .tx
+                        .send(Captured {
+                            durable_position: Some(txn.commit_position.clone()),
+                            transaction: Some(txn),
+                            ..Captured::default()
+                        })
+                        .await
+                        .map_err(recovery)?;
+                }
+                self.0.emit(marker).await
+            }
+            async fn read(&mut self, plan: &ChunkPlan, range: &ChunkRange) -> Result<Vec<Row>> {
+                let mut rows = self.0.read(plan, range).await?;
+                rows.push(
+                    [(
+                        "id".into(),
+                        OpaqueValue {
+                            type_id: "int4".into(),
+                            bytes: Some(Value::Int4(8).canonical_bytes().unwrap()),
+                        },
+                    )]
+                    .into(),
+                );
+                Ok(rows)
+            }
+        }
+        let mut db = TouchedDatabase(FrontierDatabase {
+            tx,
+            boundary: 0,
+            stall: false,
+            reads: Arc::new(AtomicU64::new(0)),
+        });
+        native_copy(&seam, &mut capture, &mut db).await;
+        assert!(
+            seam.engine
+                .runtime()
+                .snapshot()
+                .unfinished_chunks(&plan)
+                .unwrap()
+                .is_empty()
+        );
+        let mut reader = BufferReader::new(
+            seam.store.clone(),
+            ReaderConfig {
+                prefix: "seam".into(),
+                migration_id: "test".into(),
+                stream: "frontier".into(),
+                limits: format::Limits::default(),
+                required_next_mseq: 0,
+            },
+            ReaderCheckpoint::default(),
+            Arc::new(FrontierOrder),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        while let Some(txn) = reader.next_txn().await.unwrap() {
+            records.push(txn);
+        }
+        assert_eq!(records.len(), 4); // L, delete, H, authenticated ChunkRows.
+        assert_eq!(records.iter().map(|t| t.events.len()).sum::<usize>(), 2);
+        assert_eq!(records[1].events[0].kind, crate::event::EventKind::Delete);
+        let snapshot = &records.last().unwrap().events;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].kind, crate::event::EventKind::ChunkRows);
+        assert_eq!(
+            Value::from_canonical_bytes(snapshot[0].key["id"].bytes.as_deref().unwrap()).unwrap(),
+            Value::Int4(8)
+        );
+
+        let root = seam.root.clone();
+        drop(reader);
+        drop(capture);
+        drop(seam);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
     async fn neutral_chunk_marker_never_creates_pg_final_marker_evidence() {
         let seam = Seam::new().await;
         let batch = Captured {
@@ -985,7 +1114,13 @@ mod opaque_capture {
         use crate::pg::chunk::ChunkError;
         let p = plan();
         for high in [vec![1], vec![], vec![0]] {
-            let mut window = Window::new(p.table.clone(), p.ranges[0].clone(), vec![], 1).unwrap();
+            let mut window = Window::new(
+                p.table.postgres().unwrap().clone(),
+                p.ranges[0].clone(),
+                vec![],
+                1,
+            )
+            .unwrap();
             let marker = |wm| Watermark {
                 wm,
                 chunk: p.ranges[0].id.clone(),
@@ -1016,7 +1151,13 @@ mod opaque_capture {
                     .is_err()
             );
         }
-        let mut window = Window::new(p.table.clone(), p.ranges[0].clone(), vec![], 1).unwrap();
+        let mut window = Window::new(
+            p.table.postgres().unwrap().clone(),
+            p.ranges[0].clone(),
+            vec![],
+            1,
+        )
+        .unwrap();
         let marker = Watermark {
             wm: WatermarkKind::Low,
             chunk: p.ranges[0].id.clone(),

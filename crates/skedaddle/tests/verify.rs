@@ -7,11 +7,12 @@ use std::{
 
 use async_trait::async_trait;
 use skedaddle::{
+    event::Position,
     mapping::{EncodedBytes, Numeric, Value},
     pg::chunk::ChunkId,
     verify::{
         Applier, BoundarySource, BoundaryState, ChangeEvidence, Coverage, Difference, Key,
-        KeyOrder, Lsn, Projection, RangePlan, Result, ResultSlot, Row, RowSource, SourceRead,
+        KeyOrder, Projection, RangePlan, Result, ResultSlot, Row, RowSource, SourceRead,
         TableCoverage, VerificationReport, VerificationSession, VerifyError, compare_rows,
         compare_sources, range_digest, row_hash,
     },
@@ -141,6 +142,9 @@ impl RowSource for Memory {
 
 #[async_trait]
 impl BoundarySource for Memory {
+    fn position_order(&self) -> skedaddle::verify::SourcePositionOrder {
+        Arc::new(skedaddle::pg::apply::NativePgOrder("test-pg".into()))
+    }
     async fn read_source(
         &mut self,
         range: &RangePlan,
@@ -150,21 +154,21 @@ impl BoundarySource for Memory {
         self.fetches += 1;
         let read = self.snapshots.pop_front().unwrap_or(SourceRead {
             rows: self.rows.clone(),
-            lsn: 10,
+            position: pg_position(10),
         });
         Ok(SourceRead {
             rows: self.projected(&read.rows, range, projection)?,
-            lsn: read.lsn,
+            position: read.position,
         })
     }
 
-    async fn changed_since(&mut self, _range: &RangePlan, lsn: Lsn) -> Result<ChangeEvidence> {
+    async fn changed_since(&mut self, _range: &RangePlan, lsn: Position) -> Result<ChangeEvidence> {
         self.trace.lock().unwrap().push("changes");
         if self.evidence_unavailable {
             return Err(VerifyError::Read("change evidence unavailable".into()));
         }
         Ok(self.changes.pop_front().unwrap_or(ChangeEvidence {
-            through_lsn: lsn,
+            through_position: lsn,
             keys: vec![],
         }))
     }
@@ -173,14 +177,14 @@ impl BoundarySource for Memory {
 #[derive(Default)]
 struct Applied {
     trace: Trace,
-    returned_lsn: Option<Lsn>,
+    returned_lsn: Option<Position>,
 }
 
 #[async_trait]
 impl Applier for Applied {
-    async fn wait_until(&mut self, lsn: Lsn) -> Result<Lsn> {
+    async fn wait_until(&mut self, lsn: Position) -> Result<Position> {
         self.trace.lock().unwrap().push("wait");
-        Ok(self.returned_lsn.unwrap_or(lsn))
+        Ok(self.returned_lsn.clone().unwrap_or(lsn))
     }
 }
 
@@ -365,7 +369,9 @@ async fn missing_change_evidence_cannot_verify_equal_rows() {
     );
     assert_eq!(
         session.state(),
-        &BoundaryState::CheckChanges { source_lsn: 10 }
+        &BoundaryState::CheckChanges {
+            source_position: pg_position(10)
+        }
     );
     assert!(session.result().is_none());
 }
@@ -389,7 +395,7 @@ async fn table_coverage_aggregates_complete_plan_without_double_counting() {
         .clone();
     let mut source = Memory::new(vec![row(2, 20), row(3, 30)]);
     source.changes.push_back(ChangeEvidence {
-        through_lsn: 10,
+        through_position: pg_position(10),
         keys: vec![key(3)],
     });
     let upper_result = VerificationSession::new(upper, projection(), 0)
@@ -534,7 +540,9 @@ async fn comparable_boundary_state_machine_orders_reads() {
             .advance(&mut source, &mut destination, &mut applied)
             .await
             .unwrap(),
-        &BoundaryState::WaitForApplier { source_lsn: 10 }
+        &BoundaryState::WaitForApplier {
+            source_position: pg_position(10)
+        }
     );
     assert_eq!(destination.fetches, 0);
     assert_eq!(
@@ -542,7 +550,9 @@ async fn comparable_boundary_state_machine_orders_reads() {
             .advance(&mut source, &mut destination, &mut applied)
             .await
             .unwrap(),
-        &BoundaryState::ReadDestination { source_lsn: 10 }
+        &BoundaryState::ReadDestination {
+            source_position: pg_position(10)
+        }
     );
     assert_eq!(destination.fetches, 0);
     assert_eq!(
@@ -550,7 +560,9 @@ async fn comparable_boundary_state_machine_orders_reads() {
             .advance(&mut source, &mut destination, &mut applied)
             .await
             .unwrap(),
-        &BoundaryState::CheckChanges { source_lsn: 10 }
+        &BoundaryState::CheckChanges {
+            source_position: pg_position(10)
+        }
     );
     let result = session
         .run(&mut source, &mut destination, &mut applied)
@@ -573,7 +585,7 @@ async fn comparable_boundary_state_machine_orders_reads() {
 async fn busy_rows_stay_in_denominator() {
     let mut source = Memory::new(vec![row(1, 10), row(2, 20)]);
     source.changes.push_back(ChangeEvidence {
-        through_lsn: 11,
+        through_position: pg_position(11),
         keys: vec![key(2), key(3)],
     });
     let mut destination = Memory::new(vec![row(1, 10), row(2, 21)]);
@@ -601,7 +613,7 @@ async fn busy_rows_stay_in_denominator() {
 async fn busy_even_when_values_match_or_change_was_reverted() {
     let mut source = Memory::new(vec![row(1, 10)]);
     source.changes.push_back(ChangeEvidence {
-        through_lsn: 12,
+        through_position: pg_position(12),
         keys: vec![key(1)],
     });
     let result = VerificationSession::new(range(), projection(), 0)
@@ -624,15 +636,15 @@ async fn busy_requeued_with_budget_and_eventually_verified() {
     source.snapshots = VecDeque::from([
         SourceRead {
             rows: vec![row(1, 9)],
-            lsn: 10,
+            position: pg_position(10),
         },
         SourceRead {
             rows: vec![row(1, 10)],
-            lsn: 12,
+            position: pg_position(12),
         },
     ]);
     source.changes.push_back(ChangeEvidence {
-        through_lsn: 11,
+        through_position: pg_position(11),
         keys: vec![key(1)],
     });
     let mut destination = Memory::new(vec![row(1, 10)]);
@@ -665,11 +677,14 @@ async fn busy_requeued_with_budget_and_eventually_verified() {
 async fn retry_budget_exhaustion_retains_busy_rows() {
     let mut source = Memory {
         snapshots: (10..=12)
-            .map(|lsn| SourceRead { rows: vec![], lsn })
+            .map(|lsn| SourceRead {
+                rows: vec![],
+                position: pg_position(lsn),
+            })
             .collect(),
         changes: (10..=12)
-            .map(|through_lsn| ChangeEvidence {
-                through_lsn,
+            .map(|through_position| ChangeEvidence {
+                through_position: pg_position(through_position),
                 keys: vec![key(5)],
             })
             .collect(),
@@ -694,17 +709,17 @@ async fn vanished_busy_row_remains_in_denominator_after_retry() {
         snapshots: VecDeque::from([
             SourceRead {
                 rows: vec![row(1, 10)],
-                lsn: 10,
+                position: pg_position(10),
             },
             SourceRead {
                 rows: vec![],
-                lsn: 12,
+                position: pg_position(12),
             },
         ]),
         ..Memory::default()
     };
     source.changes.push_back(ChangeEvidence {
-        through_lsn: 11,
+        through_position: pg_position(11),
         keys: vec![key(1)],
     });
     let result = VerificationSession::new(range(), projection(), 1)
@@ -722,7 +737,7 @@ async fn vanished_busy_row_remains_in_denominator_after_retry() {
 async fn stable_corruption_next_to_busy_row_is_still_mismatched() {
     let mut source = Memory::new(vec![row(1, 10), row(2, 20)]);
     source.changes.push_back(ChangeEvidence {
-        through_lsn: 11,
+        through_position: pg_position(11),
         keys: vec![key(2)],
     });
     let result = VerificationSession::new(range(), projection(), 0)
@@ -745,7 +760,7 @@ async fn behind_applier_never_reads_destination() {
     let mut source = Memory::new(vec![row(1, 10)]);
     let mut destination = Memory::default();
     let mut applied = Applied {
-        returned_lsn: Some(9),
+        returned_lsn: Some(pg_position(9)),
         ..Applied::default()
     };
     let mut session = VerificationSession::new(range(), projection(), 0).unwrap();
@@ -757,11 +772,13 @@ async fn behind_applier_never_reads_destination() {
     );
     assert_eq!(
         session.state(),
-        &BoundaryState::WaitForApplier { source_lsn: 10 }
+        &BoundaryState::WaitForApplier {
+            source_position: pg_position(10)
+        }
     );
     assert_eq!(destination.fetches, 0);
     assert!(session.result().is_none());
-    applied.returned_lsn = Some(10);
+    applied.returned_lsn = Some(pg_position(10));
     assert!(
         session
             .run(&mut source, &mut destination, &mut applied)
@@ -771,10 +788,10 @@ async fn behind_applier_never_reads_destination() {
 }
 
 #[tokio::test]
-async fn rejects_stale_change_evidence_and_regressing_source_lsn() {
+async fn rejects_stale_change_evidence_and_regressing_source_position() {
     let mut source = Memory::default();
     source.changes.push_back(ChangeEvidence {
-        through_lsn: 9,
+        through_position: pg_position(9),
         keys: vec![],
     });
     let mut session = VerificationSession::new(range(), projection(), 0).unwrap();
@@ -787,7 +804,7 @@ async fn rejects_stale_change_evidence_and_regressing_source_lsn() {
     assert!(session.result().is_none());
     let mut source = Memory::default();
     source.changes.push_back(ChangeEvidence {
-        through_lsn: 11,
+        through_position: pg_position(11),
         keys: vec![key(1)],
     });
     let mut session = VerificationSession::new(range(), projection(), 1).unwrap();
@@ -855,7 +872,7 @@ async fn change_keys_must_be_unique_ordered_and_in_range() {
     for keys in [vec![key(2), key(1)], vec![key(1), key(1)], vec![key(4)]] {
         let mut source = Memory::default();
         source.changes.push_back(ChangeEvidence {
-            through_lsn: 11,
+            through_position: pg_position(11),
             keys,
         });
         let mut bounded = range();
@@ -898,4 +915,8 @@ fn verifier_never_reads_buffer() {
         &mut count,
     );
     assert!(count >= 1);
+}
+
+fn pg_position(lsn: u64) -> Position {
+    skedaddle::verify::sql::PgSourcePosition::new("test-pg").position(lsn)
 }

@@ -10,14 +10,20 @@
 //! fails closed instead of dropping evidence if checkpoint persistence stalls.
 //! Cancellation poisons an executor/reader loop: reconstruct both from durable
 //! state rather than continuing with a partly consumed record or open SQL txn.
-use super::{ApplyError, CommitDecision, Progress, Statement, TransactionPlan, resolve_commit};
+use super::{
+    ApplyError, CommitDecision, OriginPolicy, Progress, SourcePositions, Statement,
+    TransactionPlan, resolve_commit,
+};
 use crate::{
     buffer::reader::{BufferReader, ReaderCheckpoint},
-    event::{AssembledTxn, TxnId},
+    event::{AssembledTxn, Position, TxnId},
 };
 use async_trait::async_trait;
 use std::{fmt, future::Future};
 use tokio_postgres::{Client, Row, types::ToSql};
+
+mod schema;
+pub use schema::{INSTALL_OPAQUE_INTENT, OPAQUE_DDL, install_opaque_progress};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -144,10 +150,17 @@ pub struct Executor<C> {
     stream: String,
     origin: String,
     max_receipts: u32,
+    positions: SourcePositions,
     blocked: bool,
 }
 impl<C: Connector> Executor<C> {
-    pub fn new(connector: C, stream: String, origin: String, max_receipts: u32) -> Result<Self> {
+    pub fn new(
+        connector: C,
+        stream: String,
+        origin: String,
+        max_receipts: u32,
+        positions: SourcePositions,
+    ) -> Result<Self> {
         if stream.is_empty()
             || stream.len() > 512
             || stream.contains('\0')
@@ -164,6 +177,7 @@ impl<C: Connector> Executor<C> {
             stream,
             origin,
             max_receipts,
+            positions,
             blocked: false,
         })
     }
@@ -178,6 +192,23 @@ impl<C: Connector> Executor<C> {
                 &[&self.origin],
             )
             .await?;
+        let binding: Result<()> = async {
+            schema::check_mode(&client, &self.stream, self.positions.policy).await?;
+            if self.positions.policy == OriginPolicy::Opaque {
+                schema::validate(&client).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = binding {
+            let _ = client
+                .query_one(
+                    "SELECT pg_catalog.pg_replication_origin_session_reset()",
+                    &[],
+                )
+                .await;
+            return Err(error);
+        }
         self.client = Some(client);
         Ok(())
     }
@@ -188,29 +219,49 @@ impl<C: Connector> Executor<C> {
     // Ownership stabilizes these separate reads. Flush native high-water, but
     // never infer committed effects from it or normalize a legitimate abort lead.
     async fn decision(&self, target: &Progress) -> Result<CommitDecision> {
-        let latest = self.client().query_opt("SELECT last_mseq::text, last_txn, last_position, last_digest, record_kind, manifest_digest, previous_manifest_digest FROM _skedaddle.apply_progress WHERE stream = $1", &[&self.stream]).await?;
+        let opaque = self.positions.policy == OriginPolicy::Opaque;
+        let (progress_table, receipt_table) = tables(self.positions.policy);
+        let domain = if opaque { ", position_domain" } else { "" };
+        let latest = self.client().query_opt(&format!("SELECT last_mseq::text, last_txn, last_position, last_digest, record_kind, manifest_digest, previous_manifest_digest{domain} FROM {progress_table} WHERE stream = $1"), &[&self.stream]).await?;
         let latest = latest
             .as_ref()
-            .map(|r| decode_progress(&self.stream, r))
+            .map(|r| decode_progress(&self.stream, &self.positions, r))
             .transpose()?;
-        let receipt = self.client().query_opt("SELECT mseq::text, txn, position, digest, record_kind, manifest_digest, previous_manifest_digest FROM _skedaddle.apply_receipts WHERE stream = $1 AND mseq = $2::text::numeric AND position = $3", &[&self.stream, &target.mseq.to_string(), &target.lsn.to_be_bytes().as_slice()]).await?;
+        let key = if opaque {
+            position_hash(&target.position).to_vec()
+        } else {
+            target.position.bytes().to_vec()
+        };
+        let key_column = if opaque { "position_hash" } else { "position" };
+        let receipt = self.client().query_opt(&format!("SELECT mseq::text, txn, position, digest, record_kind, manifest_digest, previous_manifest_digest{domain} FROM {receipt_table} WHERE stream = $1 AND mseq = $2::text::numeric AND {key_column} = $3"), &[&self.stream, &target.mseq.to_string(), &key]).await?;
+        if opaque && let Some(row) = &receipt {
+            verify_hash_match(
+                &target.position,
+                &Position::new(row.try_get::<_, String>(7)?, row.try_get::<_, Vec<u8>>(2)?),
+            )?;
+        }
         let receipt = receipt
             .as_ref()
-            .map(|r| decode_progress(&self.stream, r))
+            .map(|r| decode_progress(&self.stream, &self.positions, r))
             .transpose()?;
         if let Some(receipt) = &receipt {
             super::verify_receipt(target, receipt)?;
         }
-        let origin: Option<String> = self
-            .client()
-            .query_one(
-                "SELECT pg_catalog.pg_replication_origin_progress($1, true)::text",
-                &[&self.origin],
-            )
-            .await?
-            .try_get(0)?;
-        let origin = origin.map(|v| parse_lsn(&v)).transpose()?.unwrap_or(0);
+        let origin = if opaque {
+            0
+        } else {
+            let value: Option<String> = self
+                .client()
+                .query_one(
+                    "SELECT pg_catalog.pg_replication_origin_progress($1, true)::text",
+                    &[&self.origin],
+                )
+                .await?
+                .try_get(0)?;
+            value.map(|v| parse_lsn(&v)).transpose()?.unwrap_or(0)
+        };
         Ok(resolve_commit(
+            &self.positions,
             target,
             latest.as_ref(),
             origin,
@@ -225,7 +276,10 @@ impl<C: Connector> Executor<C> {
         let count: i64 = self
             .client()
             .query_one(
-                "SELECT count(*) FROM _skedaddle.apply_receipts WHERE stream = $1",
+                &format!(
+                    "SELECT count(*) FROM {} WHERE stream = $1",
+                    tables(self.positions.policy).1
+                ),
                 &[&self.stream],
             )
             .await?
@@ -246,7 +300,11 @@ impl<C: Connector> Executor<C> {
             .evidence
             .as_ref()
             .map(|e| e.previous_manifest_digest.to_vec());
-        let inserted = self.client().execute("INSERT INTO _skedaddle.apply_receipts (stream, mseq, txn, position, digest, record_kind, manifest_digest, previous_manifest_digest) VALUES ($1, $2::text::numeric, $3, $4, $5, $6, $7, $8)", &[&p.stream, &p.mseq.to_string(), &p.txn.0, &p.lsn.to_be_bytes().as_slice(), &p.digest.as_slice(), &kind, &manifest, &previous]).await?;
+        let inserted = if self.positions.policy == OriginPolicy::Opaque {
+            self.client().execute("INSERT INTO _skedaddle.apply_receipts_v3 (stream, mseq, txn, position, digest, record_kind, manifest_digest, previous_manifest_digest, position_domain, position_hash) VALUES ($1,$2::text::numeric,$3,$4,$5,$6,$7,$8,$9,$10)", &[&p.stream, &p.mseq.to_string(), &p.txn.0, &receipt_position(p), &p.digest.as_slice(), &kind, &manifest, &previous, &p.position.order_domain(), &position_hash(&p.position).as_slice()]).await?
+        } else {
+            self.client().execute("INSERT INTO _skedaddle.apply_receipts (stream, mseq, txn, position, digest, record_kind, manifest_digest, previous_manifest_digest) VALUES ($1, $2::text::numeric, $3, $4, $5, $6, $7, $8)", &[&p.stream, &p.mseq.to_string(), &p.txn.0, &receipt_position(p), &p.digest.as_slice(), &kind, &manifest, &previous]).await?
+        };
         if inserted != 1 {
             return Err(ApplyError::UnexpectedRowCount(inserted).into());
         }
@@ -257,6 +315,10 @@ impl<C: Connector> Executor<C> {
         plan: &TransactionPlan,
         observer: &mut dyn Observer,
     ) -> Result<CommitDecision> {
+        self.positions.validate(&plan.progress.position)?;
+        if plan.origin_policy != self.positions.policy {
+            return Err(ApplyError::OriginPolicyMismatch.into());
+        }
         if plan.progress.stream != self.stream
             || plan.progress.txn.0.len() > 512
             || plan.session_setup.parameters.len() != 1
@@ -345,7 +407,15 @@ impl<C: Connector> Destination for Executor<C> {
         if self.client.is_none() {
             self.connect().await?;
         }
-        self.client().execute("DELETE FROM _skedaddle.apply_receipts WHERE stream = $1 AND mseq < $2::text::numeric", &[&self.stream, &checkpoint.next_mseq.to_string()]).await?;
+        self.client()
+            .execute(
+                &format!(
+                    "DELETE FROM {} WHERE stream = $1 AND mseq < $2::text::numeric",
+                    tables(self.positions.policy).1
+                ),
+                &[&self.stream, &checkpoint.next_mseq.to_string()],
+            )
+            .await?;
         Ok(())
     }
 }
@@ -369,7 +439,11 @@ async fn execute_statement(client: &Client, statement: &Statement) -> Result<u64
     statement.check_rows(rows)?;
     Ok(rows)
 }
-fn decode_progress(stream: &str, row: &Row) -> Result<Progress> {
+fn receipt_position(progress: &Progress) -> &[u8] {
+    progress.position.bytes()
+}
+
+fn decode_progress(stream: &str, positions: &SourcePositions, row: &Row) -> Result<Progress> {
     let sequence: String = row.try_get(0)?;
     let position: Vec<u8> = row.try_get(2)?;
     let digest: Vec<u8> = row.try_get(3)?;
@@ -381,10 +455,18 @@ fn decode_progress(stream: &str, row: &Row) -> Result<Progress> {
         stream: stream.into(),
         mseq: sequence.parse().map_err(|_| bad())?,
         txn: TxnId(row.try_get(1)?),
-        lsn: u64::from_be_bytes(position.try_into().map_err(|_| bad())?),
+        position: Position::new(
+            if positions.policy == OriginPolicy::Opaque {
+                row.try_get::<_, String>(7)?
+            } else {
+                positions.order.domain().into()
+            },
+            position,
+        ),
         digest: digest.try_into().map_err(|_| bad())?,
         evidence: None,
     };
+    positions.validate(&progress.position)?;
     progress.evidence = match (kind, manifest, previous) {
         (None, None, None) => None, // Backward-safe v1 rows, never a pair proof.
         (Some(kind), Some(manifest), Some(previous)) => Some(super::RecordEvidence::new(
@@ -467,7 +549,7 @@ impl ReaderLoop {
             || plan.progress.stream != self.stream
             || plan.progress.txn != txn.txn
             || plan.progress.digest != txn.digest
-            || plan.progress.lsn != super::lsn(&txn)?
+            || plan.progress.position != txn.commit_position
         {
             return Err(ApplyError::Invalid("reader plan identity").into());
         }
@@ -507,7 +589,7 @@ impl ReaderLoop {
             .statements
             .last_mut()
             .ok_or(ApplyError::Invalid("missing progress write"))? =
-            super::progress_statement(&plan.progress);
+            super::progress_statement(&plan.progress, plan.origin_policy);
         if destination.apply(&plan).await? != CommitDecision::Applied {
             return Err(ApplyError::InconsistentProgress.into());
         }
@@ -521,3 +603,27 @@ impl ReaderLoop {
 
 #[cfg(test)]
 mod tests;
+
+fn tables(policy: OriginPolicy) -> (&'static str, &'static str) {
+    match policy {
+        OriginPolicy::NativePgLsn => ("_skedaddle.apply_progress", "_skedaddle.apply_receipts"),
+        OriginPolicy::Opaque => (
+            "_skedaddle.apply_progress_v3",
+            "_skedaddle.apply_receipts_v3",
+        ),
+    }
+}
+fn position_hash(position: &Position) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(position.order_domain().as_bytes());
+    hash.update([0]);
+    hash.update(position.bytes());
+    hash.finalize().into()
+}
+fn verify_hash_match(target: &Position, stored: &Position) -> Result<()> {
+    if target != stored {
+        return Err(ApplyError::PositionHashCollision.into());
+    }
+    Ok(())
+}

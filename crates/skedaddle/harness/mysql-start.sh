@@ -12,7 +12,7 @@ if [ ! -s "$tls/server.pem" ]; then
         -keyout "$tls/ca.key" -out "$tls/ca.pem"
     openssl req -new -newkey rsa:2048 -nodes -subj /CN=localhost \
         -keyout "$tls/server.key" -out "$tls/server.csr"
-    printf '%s\n' 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+    printf '%s\n' 'subjectAltName=DNS:localhost,IP:127.0.0.1,DNS:mysql80,DNS:mysql84' \
         'basicConstraints=critical,CA:FALSE' 'extendedKeyUsage=serverAuth' \
         'keyUsage=critical,digitalSignature,keyEncipherment' > "$tls/server.ext"
     openssl x509 -req -in "$tls/server.csr" -CA "$tls/ca.pem" \
@@ -23,7 +23,8 @@ case "${HARNESS_MYSQL_GTID:-ON}" in ON|OFF) ;; *) echo 'GTID must be ON or OFF' 
 chown mysql:mysql /var/lib/mysql
 chown -R mysql:mysql "$base"
 exec /usr/local/bin/docker-entrypoint.sh mysqld \
-    --datadir="$base/data" --server-id=6401 --log-bin=mysql-bin \
+    --datadir="$base/data" --server-id="${HARNESS_MYSQL_SERVER_ID:-6401}" --log-bin=mysql-bin \
+    --log-replica-updates=ON --relay-log=mysql-relay \
     --binlog-format=ROW --binlog-row-image=FULL --binlog-row-metadata=FULL \
     --gtid-mode="${HARNESS_MYSQL_GTID:-ON}" --enforce-gtid-consistency=ON \
     --ssl-ca="$tls/ca.pem" --ssl-cert="$tls/server.pem" --ssl-key="$tls/server.key" \

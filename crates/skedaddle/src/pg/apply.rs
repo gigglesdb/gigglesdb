@@ -10,10 +10,13 @@
 //! verifies domain constraints, and configures the connection's client_encoding
 //! to match the mapping's text encoding. This planner does not qualify a schema.
 
-use std::{collections::BTreeMap, fmt, io};
+use std::{cmp::Ordering, collections::BTreeMap, fmt, io, sync::Arc};
 
 use crate::{
-    event::{AssembledTxn, ContentDigest, Event, EventKind, OpaqueValue, Row, SourceOrigin, TxnId},
+    event::{
+        AssembledTxn, ContentDigest, Event, EventError, EventKind, OpaqueValue, Position,
+        PositionOrder, Row, SourceOrigin, TxnId,
+    },
     mapping::{MappingError, PgType, Value},
 };
 use tokio_postgres::types::{Format, IsNull, Kind, ToSql, Type, private::BytesMut};
@@ -26,6 +29,11 @@ type Result<T> = std::result::Result<T, ApplyError>;
 pub enum ApplyError {
     Invalid(&'static str),
     Mapping(MappingError),
+    Position(EventError),
+    Unsupported(OriginPolicy),
+    PositionHashCollision,
+    SchemaMismatch,
+    OriginPolicyMismatch,
     InvalidTransaction,
     MissingRow { table: String, ordinal: u64 },
     UnexpectedRowCount(u64),
@@ -107,8 +115,79 @@ pub enum RangeState {
     Completed,
 }
 
+/// Immutable origin behavior selected by stream configuration, never position width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginPolicy {
+    NativePgLsn,
+    Opaque,
+}
+
+/// One authoritative source order and origin policy for a destination stream.
+#[derive(Clone)]
+pub struct SourcePositions {
+    order: Arc<dyn PositionOrder + Send + Sync>,
+    policy: OriginPolicy,
+}
+impl fmt::Debug for SourcePositions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourcePositions")
+            .field("domain", &self.order.domain())
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+impl SourcePositions {
+    pub fn new(order: Arc<dyn PositionOrder + Send + Sync>, policy: OriginPolicy) -> Self {
+        Self { order, policy }
+    }
+    pub fn native_pg(domain: impl Into<String>) -> Self {
+        Self::new(
+            Arc::new(NativePgOrder(domain.into())),
+            OriginPolicy::NativePgLsn,
+        )
+    }
+    fn validate(&self, position: &Position) -> Result<()> {
+        self.compare(position, position)?;
+        if self.policy == OriginPolicy::NativePgLsn && position.bytes().len() != 8 {
+            return Err(ApplyError::Invalid(
+                "PG commit position must be an eight-byte LSN",
+            ));
+        }
+        Ok(())
+    }
+    fn compare(&self, left: &Position, right: &Position) -> Result<Ordering> {
+        left.compare(right, self.order.as_ref())
+            .map_err(ApplyError::Position)
+    }
+    /// Decode only where PostgreSQL's native origin API needs an LSN.
+    fn native_lsn(&self, position: &Position) -> Result<u64> {
+        self.validate(position)?;
+        Ok(u64::from_be_bytes(
+            position.bytes().try_into().expect("validated LSN"),
+        ))
+    }
+}
+/// PostgreSQL's numeric LSN order, explicitly bound to a source lineage domain.
+#[derive(Clone, Debug)]
+pub struct NativePgOrder(pub String);
+impl PositionOrder for NativePgOrder {
+    fn domain(&self) -> &str {
+        &self.0
+    }
+    fn compare(&self, left: &[u8], right: &[u8]) -> std::result::Result<Ordering, EventError> {
+        let lsn = |bytes: &[u8]| {
+            bytes
+                .try_into()
+                .map(u64::from_be_bytes)
+                .map_err(|_| EventError::InvalidEncoding("PostgreSQL LSN width"))
+        };
+        Ok(lsn(left)?.cmp(&lsn(right)?))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PlanContext {
+    pub positions: SourcePositions,
     pub stream: String,
     /// Manifest containing this record; mseq alone is NOT a transaction ID.
     pub mseq: u64,
@@ -231,7 +310,7 @@ pub struct RecordEvidence {
     manifest_digest: ContentDigest,
     previous_manifest_digest: ContentDigest,
     // Bind a cloned proof to the exact verified record, not mutable Progress.
-    identity: (String, u64, TxnId, u64, ContentDigest),
+    identity: (String, u64, TxnId, Position, ContentDigest),
 }
 impl RecordEvidence {
     fn new(
@@ -244,14 +323,20 @@ impl RecordEvidence {
             kind,
             manifest_digest,
             previous_manifest_digest,
-            identity: (p.stream.clone(), p.mseq, p.txn.clone(), p.lsn, p.digest),
+            identity: (
+                p.stream.clone(),
+                p.mseq,
+                p.txn.clone(),
+                p.position.clone(),
+                p.digest,
+            ),
         }
     }
     fn verify_identity(&self, p: &Progress) -> Result<()> {
         if self.identity.0 != p.stream
             || self.identity.1 != p.mseq
             || self.identity.2 != p.txn
-            || self.identity.3 != p.lsn
+            || self.identity.3 != p.position
         {
             return Err(ApplyError::InconsistentProgress);
         }
@@ -267,15 +352,16 @@ pub struct Progress {
     pub stream: String,
     pub mseq: u64,
     pub txn: TxnId,
-    pub lsn: u64,
+    pub position: Position,
     pub digest: ContentDigest,
     pub evidence: Option<RecordEvidence>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TransactionPlan {
-    /// Preserved publisher metadata; destination origin setup still uses the
-    /// dedicated stream origin and connector commit LSN for durable progress.
+    pub origin_policy: OriginPolicy,
+    /// Preserved publisher metadata. Both policies use the dedicated stream
+    /// origin; only NativePgLsn also supplies a commit LSN and timestamp.
     pub source_origin: Option<SourceOrigin>,
     pub session_setup: Statement,
     /// BEGIN/COMMIT are executor responsibilities; a row-count fault rolls back.
@@ -297,15 +383,6 @@ fn ident(name: &str) -> Result<String> {
     }
     Ok(format!("\"{}\"", name.replace('"', "\"\"")))
 }
-fn lsn(txn: &AssembledTxn) -> Result<u64> {
-    Ok(u64::from_be_bytes(
-        txn.commit_position
-            .bytes()
-            .try_into()
-            .map_err(|_| ApplyError::Invalid("PG commit position must be an eight-byte LSN"))?,
-    ))
-}
-
 /// Event.key must be the OLD key for updates/key changes and the current key
 /// otherwise. `range` classifies it using durable ChunkDone state. ChunkRows
 /// always overwrite and bypass the range lookup.
@@ -340,6 +417,7 @@ fn plan_transaction_inner(
     installation: Option<&str>,
     mut range: impl FnMut(&Table, &Row) -> Result<RangeState>,
 ) -> Result<TransactionPlan> {
+    context.positions.validate(&txn.commit_position)?;
     txn.write_canonical(&mut io::sink())
         .map_err(|_| ApplyError::InvalidTransaction)?;
     // Preflight the entire transaction before invoking any row classifier.
@@ -405,37 +483,37 @@ fn plan_transaction_inner(
             return Err(ApplyError::Invalid("duplicate table"));
         }
     }
-    let lsn = lsn(txn)?;
-    let time = txn
-        .commit_time
-        .or_else(|| {
-            txn.events
-                .iter()
-                .all(|e| {
-                    matches!(
-                        e.kind,
-                        EventKind::ChunkRows | EventKind::Watermark | EventKind::FinalMarker
-                    )
-                })
-                .then_some(context.synthetic_commit_time)
-                .flatten()
-        })
-        .ok_or(ApplyError::Invalid("missing origin commit time"))?;
-    let pg_time = time
-        .checked_sub(946_684_800_000_000)
-        .ok_or(ApplyError::Invalid("origin timestamp overflow"))?;
     let session_setup = statement(
         "SELECT pg_catalog.pg_replication_origin_session_setup($1)".into(),
         vec![Parameter::text(Type::TEXT, context.origin.as_bytes())],
         RowCount::ExactlyOne,
     );
-    let mut statements = vec![
-        statement(
-            "SET LOCAL session_replication_role = replica".into(),
-            vec![],
-            RowCount::Any,
-        ),
-        statement(
+    let mut statements = vec![statement(
+        "SET LOCAL session_replication_role = replica".into(),
+        vec![],
+        RowCount::Any,
+    )];
+    if context.positions.policy == OriginPolicy::NativePgLsn {
+        let lsn = context.positions.native_lsn(&txn.commit_position)?;
+        let time = txn
+            .commit_time
+            .or_else(|| {
+                txn.events
+                    .iter()
+                    .all(|e| {
+                        matches!(
+                            e.kind,
+                            EventKind::ChunkRows | EventKind::Watermark | EventKind::FinalMarker
+                        )
+                    })
+                    .then_some(context.synthetic_commit_time)
+                    .flatten()
+            })
+            .ok_or(ApplyError::Invalid("missing origin commit time"))?;
+        let pg_time = time
+            .checked_sub(946_684_800_000_000)
+            .ok_or(ApplyError::Invalid("origin timestamp overflow"))?;
+        statements.push(statement(
             "SELECT pg_catalog.pg_replication_origin_xact_setup($1, $2)".into(),
             vec![
                 Parameter::text(Type::PG_LSN, format!("{:X}/{:X}", lsn >> 32, lsn as u32)),
@@ -446,8 +524,8 @@ fn plan_transaction_inner(
                 },
             ],
             RowCount::ExactlyOne,
-        ),
-    ];
+        ));
+    }
     for event in &txn.events {
         match event.kind {
             EventKind::DdlBoundary | EventKind::Watermark | EventKind::FinalMarker => continue,
@@ -586,12 +664,13 @@ fn plan_transaction_inner(
         stream: context.stream.clone(),
         mseq: context.mseq,
         txn: txn.txn.clone(),
-        lsn,
+        position: txn.commit_position.clone(),
         digest: txn.digest,
         evidence: None,
     };
-    statements.push(progress_statement(&progress));
+    statements.push(progress_statement(&progress, context.positions.policy));
     Ok(TransactionPlan {
+        origin_policy: context.positions.policy,
         source_origin: txn.source_origin.clone(),
         session_setup,
         statements,
@@ -599,11 +678,18 @@ fn plan_transaction_inner(
     })
 }
 
-fn progress_statement(p: &Progress) -> Statement {
+pub(crate) fn progress_statement(p: &Progress, policy: OriginPolicy) -> Statement {
+    if policy == OriginPolicy::Opaque {
+        let (kind, manifest, previous) = evidence_parameters(p);
+        return statement(
+            "INSERT INTO _skedaddle.apply_progress_v3 (stream, last_mseq, last_txn, last_position, last_digest, record_kind, manifest_digest, previous_manifest_digest, position_domain) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (stream) DO UPDATE SET last_mseq=EXCLUDED.last_mseq, last_txn=EXCLUDED.last_txn, last_position=EXCLUDED.last_position, last_digest=EXCLUDED.last_digest, record_kind=EXCLUDED.record_kind, manifest_digest=EXCLUDED.manifest_digest, previous_manifest_digest=EXCLUDED.previous_manifest_digest, position_domain=EXCLUDED.position_domain".into(),
+            vec![Parameter::text(Type::TEXT, p.stream.as_bytes()), Parameter::text(Type::NUMERIC, p.mseq.to_string()), binary(Type::BYTEA, p.txn.0.clone()), binary(Type::BYTEA, p.position.bytes().to_vec()), binary(Type::BYTEA, p.digest.to_vec()), kind, manifest, previous, Parameter::text(Type::TEXT, p.position.order_domain().as_bytes())], RowCount::ExactlyOne,
+        );
+    }
     let (kind, manifest, previous) = evidence_parameters(p);
     statement(
         "INSERT INTO _skedaddle.apply_progress (stream, last_mseq, last_txn, last_position, last_digest, record_kind, manifest_digest, previous_manifest_digest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (stream) DO UPDATE SET last_mseq = EXCLUDED.last_mseq, last_txn = EXCLUDED.last_txn, last_position = EXCLUDED.last_position, last_digest = EXCLUDED.last_digest, record_kind = EXCLUDED.record_kind, manifest_digest = EXCLUDED.manifest_digest, previous_manifest_digest = EXCLUDED.previous_manifest_digest".into(),
-        vec![Parameter::text(Type::TEXT, p.stream.as_bytes()), Parameter::text(Type::NUMERIC, p.mseq.to_string()), binary(Type::BYTEA, p.txn.0.clone()), binary(Type::BYTEA, p.lsn.to_be_bytes().to_vec()), binary(Type::BYTEA, p.digest.to_vec()), kind, manifest, previous], RowCount::ExactlyOne,
+        vec![Parameter::text(Type::TEXT, p.stream.as_bytes()), Parameter::text(Type::NUMERIC, p.mseq.to_string()), binary(Type::BYTEA, p.txn.0.clone()), binary(Type::BYTEA, p.position.bytes().to_vec()), binary(Type::BYTEA, p.digest.to_vec()), kind, manifest, previous], RowCount::ExactlyOne,
     )
 }
 fn evidence_parameters(p: &Progress) -> (Parameter, Parameter, Parameter) {
@@ -882,13 +968,16 @@ pub enum CommitDecision {
 /// Native progress is attempted-position high-water, including aborted work;
 /// it may lead transactional progress but must never be behind a committed row.
 /// Only transactional identity and digest prove commit, never native coverage.
+/// Opaque ignores origin_lsn entirely; its executor never queries native progress.
 pub fn resolve_commit(
+    positions: &SourcePositions,
     target: &Progress,
     latest: Option<&Progress>,
     origin_lsn: u64,
     receipt: Option<&Progress>,
 ) -> Result<CommitDecision> {
     for progress in [Some(target), latest, receipt].into_iter().flatten() {
+        positions.validate(&progress.position)?;
         if let Some(evidence) = &progress.evidence {
             evidence.verify_identity(progress)?;
         }
@@ -908,10 +997,16 @@ pub fn resolve_commit(
             Err(ApplyError::InconsistentProgress)
         };
     };
-    if latest.stream != target.stream || origin_lsn < latest.lsn {
+    if latest.stream != target.stream
+        || (positions.policy == OriginPolicy::NativePgLsn
+            && positions.compare(
+                &Position::new(positions.order.domain(), origin_lsn.to_be_bytes()),
+                &latest.position,
+            )? == Ordering::Less)
+    {
         return Err(ApplyError::InconsistentProgress);
     }
-    match latest.lsn.cmp(&target.lsn) {
+    match positions.compare(&latest.position, &target.position)? {
         std::cmp::Ordering::Less => {
             if latest.mseq > target.mseq || receipt.is_some() || chunk(target) {
                 return Err(ApplyError::InconsistentProgress);
@@ -919,14 +1014,17 @@ pub fn resolve_commit(
             Ok(CommitDecision::NotApplied)
         }
         std::cmp::Ordering::Equal => {
+            if latest.position != target.position {
+                return Err(ApplyError::InconsistentProgress);
+            }
             if latest.mseq == target.mseq {
                 verify_receipt(target, latest)?;
                 return Ok(CommitDecision::Applied);
             }
-            if ordered_h_pair(latest, target) && receipt.is_none() {
+            if ordered_h_pair(positions, latest, target)? && receipt.is_none() {
                 return Ok(CommitDecision::NotApplied);
             }
-            if ordered_h_pair(target, latest) {
+            if ordered_h_pair(positions, target, latest)? {
                 let receipt = receipt.ok_or(ApplyError::MissingDigestEvidence)?;
                 if receipt.evidence.is_none() {
                     return Err(ApplyError::MissingDigestEvidence);
@@ -947,22 +1045,27 @@ pub fn resolve_commit(
 }
 /// Both records must be authenticated, adjacent manifests in the same verified
 /// chain. Only Transaction(H) -> ChunkRows(H) consumes the equal-position slot.
-fn ordered_h_pair(transaction: &Progress, rows: &Progress) -> bool {
+fn ordered_h_pair(
+    positions: &SourcePositions,
+    transaction: &Progress,
+    rows: &Progress,
+) -> Result<bool> {
     let (Some(t), Some(r)) = (&transaction.evidence, &rows.evidence) else {
-        return false;
+        return Ok(false);
     };
-    transaction.stream == rows.stream
-        && transaction.lsn == rows.lsn
+    Ok(transaction.stream == rows.stream
+        && positions.compare(&transaction.position, &rows.position)? == Ordering::Equal
+        && transaction.position == rows.position
         && transaction.mseq.checked_add(1) == Some(rows.mseq)
         && t.kind == RecordKind::Transaction
         && r.kind == RecordKind::ChunkRows
-        && t.manifest_digest == r.previous_manifest_digest
+        && t.manifest_digest == r.previous_manifest_digest)
 }
 
 fn verify_receipt(target: &Progress, receipt: &Progress) -> Result<()> {
     if target.stream != receipt.stream
         || target.mseq != receipt.mseq
-        || target.lsn != receipt.lsn
+        || target.position != receipt.position
         || target.txn != receipt.txn
     {
         return Err(ApplyError::InconsistentProgress);

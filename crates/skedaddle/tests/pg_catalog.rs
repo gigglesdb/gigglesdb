@@ -101,9 +101,9 @@ fn event_key(c: &catalog::TableCatalog, values: Vec<Value>) -> Row {
 fn planned(plan: &ChunkPlan) -> Materialized {
     let mut state = Materialized::default();
     state.chunk_plans.insert(
-        plan.table.table.clone(),
+        plan.table.event_table().to_string(),
         ChunkPlanRef {
-            table: plan.table.table.clone(),
+            table: plan.table.event_table().to_string(),
             plan: plan.ranges[0].id.plan.clone(),
             digest: "a".repeat(64),
             bytes: 1,
@@ -848,7 +848,7 @@ async fn live_server_planner_range_and_transaction_qualification() -> TestResult
             catalogs.push(c);plans.push(plan);ordered.push(rows);
         }
         let tables=catalogs.iter().zip(&plans).map(|(c,p)|ServerTable::new(c,p,"pg:k2b")).collect::<Result<Vec<_>,_>>()?;
-        let context=pg::apply::PlanContext{stream:"k2b".into(),mseq:0,origin:"k2b_origin".into(),synthetic_commit_time:None};
+        let context=pg::apply::PlanContext{positions:pg::apply::SourcePositions::native_pg("pg:k2b"),stream:"k2b".into(),mseq:0,origin:"k2b_origin".into(),synthetic_commit_time:None};
         // Deliberately use batches of two to exercise multiple queries.
         let mut planner=ServerPlanner::new(connect(source_dsn,ca).await?,&mut destination,tables,context,2).await?;
         assert!(planner.collation_evidence().iter().any(|e|e.name.name=="C" && e.source.fixed_byte_order && e.source==e.destination));

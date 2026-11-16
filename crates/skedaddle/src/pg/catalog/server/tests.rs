@@ -1,5 +1,41 @@
 use super::*;
 use crate::pg::chunk::{Direction, KeyColumn, TableKey};
+#[test]
+fn postgres_classifiers_reject_mysql_plan_with_typed_errors() {
+    let plan = ChunkPlan::new(crate::mysql::chunk_key::tests::table(), 10, vec![]).unwrap();
+    let catalog = TableCatalog {
+        selection: crate::pg::catalog::TableSelection {
+            schema: "s".into(),
+            name: "rows".into(),
+            columns: vec![],
+        },
+        columns: vec![],
+        index_columns: vec![],
+        key: table(&[Direction::Asc]),
+        destination: apply::Table {
+            event_table: "rows".into(),
+            schema: "s".into(),
+            name: "rows".into(),
+            schema_version: 1,
+            columns: vec![],
+            key: vec![],
+        },
+    };
+    assert!(matches!(
+        ServerTable::new(&catalog, &plan, "pg"),
+        Err(PgPlannerError::Apply(ApplyError::Invalid(
+            "MySQL plan not yet supported by PostgreSQL classifier"
+        )))
+    ));
+    let error = crate::pg::catalog::RangeClassifier::with_position_order(
+        &catalog,
+        &plan,
+        Arc::new(apply::NativePgOrder("pg".into())),
+    )
+    .unwrap_err();
+    assert_eq!(error.sql_type, "chunk source");
+    assert!(error.reason.contains("MySQL plan not yet supported"));
+}
 fn table(directions: &[Direction]) -> TableKey {
     TableKey {
         table: "quoted table".into(),

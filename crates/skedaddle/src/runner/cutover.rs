@@ -380,7 +380,15 @@ impl<C: Capture> Capture for Observed<C> {
                 &txn.commit_position,
                 self.capture.position_order().domain(),
             )?;
-            if application_write(txn, &self.installation, &self.origin) {
+            if application_write(
+                txn,
+                &self.installation,
+                &self.origin,
+                crate::pg::apply::SourcePositions::new(
+                    self.capture.position_order(),
+                    crate::pg::apply::OriginPolicy::NativePgLsn,
+                ),
+            ) {
                 self.runtime
                     .marker(WRITES, lsn.to_string(), "captured-data-or-ddl".into())
                     .await?;
@@ -413,7 +421,12 @@ impl<C: Capture> Capture for Observed<C> {
 // real apply preflight for canonical shape, XID, ordered versions and D8/D10's
 // shared predicate. An empty mapping means ANY data in a mixed transaction
 // remains a breach; malformed/foreign/application DDL fails closed too.
-fn application_write(txn: &AssembledTxn, installation: &str, reverse_origin: &str) -> bool {
+fn application_write(
+    txn: &AssembledTxn,
+    installation: &str,
+    reverse_origin: &str,
+    positions: crate::pg::apply::SourcePositions,
+) -> bool {
     if txn
         .source_origin
         .as_ref()
@@ -432,6 +445,7 @@ fn application_write(txn: &AssembledTxn, installation: &str, reverse_origin: &st
         txn,
         &[],
         &crate::pg::apply::PlanContext {
+            positions,
             stream: "cutover-breach-monitor".into(),
             mseq: 0,
             origin: reverse_origin.into(),
@@ -1979,6 +1993,14 @@ mod tests {
             vec![event],
         )
         .unwrap()
+    }
+    fn application_write(txn: &AssembledTxn, installation: &str, reverse_origin: &str) -> bool {
+        super::application_write(
+            txn,
+            installation,
+            reverse_origin,
+            crate::pg::apply::SourcePositions::native_pg("pg/source"),
+        )
     }
     #[test]
     fn breach_monitor_accepts_only_validated_internal_ddl_and_exact_reverse_origin() {

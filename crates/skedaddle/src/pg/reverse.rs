@@ -126,8 +126,13 @@ impl Config {
     pub fn stream(&self) -> String {
         format!("{}_rev", self.installation)
     }
-    pub fn apply_context(&self, mseq: u64) -> apply::PlanContext {
+    pub fn apply_context(
+        &self,
+        mseq: u64,
+        positions: apply::SourcePositions,
+    ) -> apply::PlanContext {
         apply::PlanContext {
+            positions,
             stream: self.stream(),
             mseq,
             origin: self.origin(),
@@ -141,6 +146,7 @@ impl Config {
         txn: &AssembledTxn,
         tables: &[apply::Table],
         mseq: u64,
+        positions: apply::SourcePositions,
         range: impl FnMut(
             &apply::Table,
             &crate::event::Row,
@@ -149,7 +155,7 @@ impl Config {
         apply::plan_transaction_with_ddl(
             txn,
             tables,
-            &self.apply_context(mseq),
+            &self.apply_context(mseq, positions),
             &self.installation,
             range,
         )
@@ -158,8 +164,15 @@ impl Config {
         &self,
         connector: C,
         max_receipts: u32,
+        positions: apply::SourcePositions,
     ) -> apply::executor::Result<apply::executor::Executor<C>> {
-        apply::executor::Executor::new(connector, self.stream(), self.origin(), max_receipts)
+        apply::executor::Executor::new(
+            connector,
+            self.stream(),
+            self.origin(),
+            max_receipts,
+            positions,
+        )
     }
     /// Connects to the destination, with source's session/lineage verification
     /// and the existing START_REPLICATION origin 'none' option.

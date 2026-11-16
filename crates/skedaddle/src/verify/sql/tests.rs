@@ -174,7 +174,7 @@ fn repair() -> (RepairRequest, RepairContext, TableCoverage) {
             columns: vec!["amount".into()],
         },
         source_read_revision: 10,
-        source_read_lsn: 200,
+        source_read_position: pg_position(200),
     };
     let context = RepairContext {
         expected_scope: request.scope.clone(),
@@ -239,4 +239,67 @@ fn repair_refuses_newer_or_unknown_destination_changes_after_transfer() {
         context.destination_change_revision = Some(revision);
         assert!(decide_repair(&IntOrder, &request, &context, &coverage).is_ok());
     }
+}
+
+fn pg_position(lsn: u64) -> crate::event::Position {
+    crate::verify::sql::PgSourcePosition::new("test-pg").position(lsn)
+}
+
+#[test]
+fn pg_position_adapter_matches_numeric_lsn_decisions_golden() {
+    let pg = PgSourcePosition::new("pg-golden");
+    let order = crate::pg::apply::NativePgOrder("pg-golden".into());
+    let lsns = [
+        0,
+        1,
+        255,
+        256,
+        u32::MAX as u64,
+        1_u64 << 32,
+        (1_u64 << 32) + 1,
+        u64::MAX,
+    ];
+    for a in lsns {
+        assert_eq!(pg.lsn(&pg.position(a)).unwrap(), a);
+        for b in lsns {
+            let actual =
+                super::super::compare_positions(&order, &pg.position(a), &pg.position(b)).unwrap();
+            assert_eq!(actual, a.cmp(&b));
+            assert_eq!(actual == Ordering::Less, a < b);
+            assert_eq!(actual != Ordering::Less, a >= b);
+        }
+    }
+    assert!(matches!(
+        pg.lsn(&Position::new("other", 1_u64.to_be_bytes())),
+        Err(VerifyError::Position(
+            crate::event::EventError::PositionDomainMismatch
+        ))
+    ));
+    assert!(matches!(
+        pg.lsn(&Position::new("pg-golden", [1])),
+        Err(VerifyError::Position(_))
+    ));
+}
+
+#[test]
+fn repair_retains_native_source_boundary_and_shared_revision_refusals() {
+    let (mut request, mut context, coverage) = repair();
+    request.source_read_position = Position::new("native-repair", b"revision-10");
+    let decision = decide_repair(&IntOrder, &request, &context, &coverage).unwrap();
+    assert_eq!(
+        decision.request.source_read_position,
+        request.source_read_position
+    );
+    context.authority_transferred = true;
+    assert_eq!(
+        decide_repair(&IntOrder, &request, &context, &coverage),
+        Err(RepairRefusal::UnknownDestinationChange)
+    );
+    context.destination_change_revision = Some(11);
+    assert_eq!(
+        decide_repair(&IntOrder, &request, &context, &coverage),
+        Err(RepairRefusal::NewerDestinationChange)
+    );
+    context.destination_change_revision = Some(10);
+    assert!(decide_repair(&IntOrder, &request, &context, &coverage).is_ok());
 }

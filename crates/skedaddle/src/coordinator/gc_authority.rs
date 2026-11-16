@@ -624,7 +624,8 @@ pub fn coordinator_gc_error(error: Error) -> reader::Error {
         | Error::Observer
         | Error::Core(_)
         | Error::Json(_)
-        | Error::Postgres(_) => reader::Error::RecoveryRequired(
+        | Error::Postgres(_)
+        | Error::Mysql(_) => reader::Error::RecoveryRequired(
             "coordinator refused GC authority; inspect durable apply/checkpoint facts and ownership",
         ),
     }

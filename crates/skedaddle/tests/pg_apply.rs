@@ -3,14 +3,14 @@
 //! installer provisions progress/receipts. No service is started by this binary.
 //! Harness invocation: cargo test --test pg_apply -- --ignored --nocapture.
 use async_trait::async_trait;
-use std::{collections::BTreeMap, error::Error};
+use std::{collections::BTreeMap, error::Error, sync::Arc};
 
 use skedaddle::{
     event::{AssembledTxn, Event, EventKind, OpaqueValue, Position, SourceIdentity, TxnId},
     mapping::{EncodedBytes, PgType, Value},
     pg::apply::{
-        ApplyError, Column, CommitDecision, PlanContext, Progress, RangeState, Table,
-        TransactionPlan,
+        ApplyError, Column, CommitDecision, OriginPolicy, PlanContext, Progress, RangeState,
+        SourcePositions, Table, TransactionPlan,
         executor::{self, Connector, Destination, Executor, Observer, Seam, install_progress},
         plan_transaction, resolve_commit,
     },
@@ -110,6 +110,7 @@ fn pgoutput_truncate_and_origin_survive_assembly_canonical_storage_and_planning(
         &txn,
         &tables,
         &PlanContext {
+            positions: SourcePositions::native_pg("pg/source"),
             stream: "forward".into(),
             mseq: 1,
             origin: "destination_stream".into(),
@@ -131,7 +132,10 @@ fn pgoutput_truncate_and_origin_survive_assembly_canonical_storage_and_planning(
             lsn: 7
         })
     );
-    assert_eq!(plan.progress.lsn, 100);
+    assert_eq!(
+        plan.progress.position,
+        Position::new("pg/source", 100_u64.to_be_bytes())
+    );
     assert_eq!(plan.progress.digest, txn.digest);
 }
 
@@ -228,6 +232,26 @@ impl Fixture {
         }))
     }
     async fn cleanup(self) -> TestResult<()> {
+        for table in ["apply_progress_v3", "apply_receipts_v3"] {
+            if self
+                .admin
+                .client
+                .query_one(
+                    "SELECT to_regclass($1) IS NOT NULL",
+                    &[&format!("_skedaddle.{table}")],
+                )
+                .await?
+                .get::<_, bool>(0)
+            {
+                self.admin
+                    .client
+                    .execute(
+                        &format!("DELETE FROM _skedaddle.{table} WHERE stream=$1"),
+                        &[&self.id],
+                    )
+                    .await?;
+            }
+        }
         // Exact unique names only. Never drop the harness-owned progress table.
         let receipts = self
             .admin
@@ -268,6 +292,7 @@ impl Fixture {
             self.id.clone(),
             self.origin.clone(),
             100,
+            SourcePositions::native_pg(&self.id),
         )
     }
     fn transaction(&self, kind: EventKind) -> TestResult<AssembledTxn> {
@@ -327,6 +352,15 @@ impl Fixture {
         mseq: u64,
         state: RangeState,
     ) -> TestResult<TransactionPlan> {
+        self.plan_with_positions(txn, mseq, state, SourcePositions::native_pg(&self.id))
+    }
+    fn plan_with_positions(
+        &self,
+        txn: &AssembledTxn,
+        mseq: u64,
+        state: RangeState,
+        positions: SourcePositions,
+    ) -> TestResult<TransactionPlan> {
         let table = Table {
             event_table: "rows".into(),
             schema: self.id.clone(),
@@ -354,6 +388,7 @@ impl Fixture {
             txn,
             &[table],
             &PlanContext {
+                positions,
                 stream: self.id.clone(),
                 mseq,
                 origin: self.origin.clone(),
@@ -372,7 +407,10 @@ impl Fixture {
                     stream: self.id.clone(),
                     mseq: row.get::<_, String>(0).parse()?,
                     txn: TxnId(row.get(1)),
-                    lsn: u64::from_be_bytes(bytes.try_into().map_err(|_| "invalid progress LSN")?),
+                    position: Position::new(
+                        &self.id,
+                        <[u8; 8]>::try_from(bytes).map_err(|_| "invalid progress LSN")?,
+                    ),
                     digest: digest.try_into().map_err(|_| "invalid progress digest")?,
                     evidence: None,
                 })
@@ -399,7 +437,7 @@ impl Fixture {
     async fn receipt(&self, target: &Progress) -> TestResult<Option<Progress>> {
         let row = self.admin.client.query_opt(
             "SELECT txn, digest, record_kind, manifest_digest, previous_manifest_digest FROM _skedaddle.apply_receipts WHERE stream=$1 AND mseq=$2::text::numeric AND position=$3",
-            &[&self.id, &target.mseq.to_string(), &target.lsn.to_be_bytes().as_slice()],
+            &[&self.id, &target.mseq.to_string(), &target.position.bytes()],
         ).await?;
         row.map(|r| {
             require(
@@ -439,12 +477,17 @@ impl Fixture {
             "incorrect effects after termination",
         )?;
         require(
-            resolve_commit(&plan.progress, latest.as_ref(), native, receipt.as_ref())?
-                == if committed {
-                    CommitDecision::Applied
-                } else {
-                    CommitDecision::NotApplied
-                },
+            resolve_commit(
+                &SourcePositions::native_pg(&self.id),
+                &plan.progress,
+                latest.as_ref(),
+                native,
+                receipt.as_ref(),
+            )? == if committed {
+                CommitDecision::Applied
+            } else {
+                CommitDecision::NotApplied
+            },
             "transactional evidence disagrees with commit",
         )?;
         if committed {
@@ -574,12 +617,17 @@ async fn exactly_one_effect_after_crash_matrix() -> TestResult<()> {
             drop(executor);
             let (latest, origin) = fixture.evidence().await?;
             require(
-                resolve_commit(&plan.progress, latest.as_ref(), origin, None)?
-                    == if seam == Seam::BeforeCommit {
-                        CommitDecision::NotApplied
-                    } else {
-                        CommitDecision::Applied
-                    },
+                resolve_commit(
+                    &SourcePositions::native_pg(&fixture.id),
+                    &plan.progress,
+                    latest.as_ref(),
+                    origin,
+                    None,
+                )? == if seam == Seam::BeforeCommit {
+                    CommitDecision::NotApplied
+                } else {
+                    CommitDecision::Applied
+                },
                 "crash seam differs from durable outcome",
             )?;
             replay(&fixture, &plan).await?;
@@ -670,7 +718,11 @@ async fn digest_mismatch_on_skip_is_error() -> TestResult<()> {
                 stream: fixture.id.clone(),
             },
             TxnId(vec![2]),
-            Position::new(&fixture.id, (plan.progress.lsn + 1).to_be_bytes()),
+            Position::new(
+                &fixture.id,
+                (u64::from_be_bytes(plan.progress.position.bytes().try_into().unwrap()) + 1)
+                    .to_be_bytes(),
+            ),
             Some(1_700_000_000_000_000),
             vec![],
         )?;
@@ -678,6 +730,7 @@ async fn digest_mismatch_on_skip_is_error() -> TestResult<()> {
             &later_txn,
             &[],
             &PlanContext {
+                positions: SourcePositions::native_pg(&fixture.id),
                 stream: fixture.id.clone(),
                 mseq: 1,
                 origin: fixture.origin.clone(),
@@ -690,6 +743,7 @@ async fn digest_mismatch_on_skip_is_error() -> TestResult<()> {
             fixture.id.clone(),
             fixture.origin.clone(),
             1,
+            SourcePositions::native_pg(&fixture.id),
         )?;
         require(
             matches!(
@@ -719,7 +773,7 @@ async fn digest_mismatch_on_skip_is_error() -> TestResult<()> {
             .client
             .execute(
                 "DELETE FROM _skedaddle.apply_receipts WHERE stream = $1 AND position = $2",
-                &[&fixture.id, &plan.progress.lsn.to_be_bytes().as_slice()],
+                &[&fixture.id, &plan.progress.position.bytes()],
             )
             .await?;
         let mut executor = fixture.executor()?;
@@ -738,6 +792,7 @@ async fn digest_mismatch_on_skip_is_error() -> TestResult<()> {
             fixture.id.clone(),
             fixture.origin.clone(),
             1,
+            SourcePositions::native_pg(&fixture.id),
         )?;
         require(
             matches!(capped.apply(&later).await, Ok(CommitDecision::Applied)),
@@ -868,11 +923,40 @@ async fn pair_buffer(
     std::sync::Arc<dyn skedaddle::buffer::backends::BufferStore>,
     skedaddle::buffer::reader::ReaderConfig,
 )> {
+    let h = fixture.transaction(if marker {
+        EventKind::FinalMarker
+    } else {
+        EventKind::Insert
+    })?;
+    let mut rows = fixture.transaction(EventKind::ChunkRows)?;
+    rows.txn = TxnId(vec![2]);
+    rows.events[0].txn = rows.txn.clone();
+    let rows = AssembledTxn::new(
+        rows.source,
+        rows.txn,
+        rows.commit_position,
+        rows.commit_time,
+        rows.events,
+    )?;
+    pair_buffer_records(
+        fixture,
+        vec![
+            skedaddle::buffer::format::SegmentRecord::Transaction(h),
+            skedaddle::buffer::format::SegmentRecord::ChunkRows(rows),
+        ],
+    )
+    .await
+}
+async fn pair_buffer_records(
+    fixture: &Fixture,
+    records: Vec<skedaddle::buffer::format::SegmentRecord>,
+) -> TestResult<(
+    Arc<dyn skedaddle::buffer::backends::BufferStore>,
+    skedaddle::buffer::reader::ReaderConfig,
+)> {
     use skedaddle::buffer::{
         backends::{BufferStore, ObjectBufferStore},
-        format::{
-            Limits, ManifestEntry, SegmentEncoder, SegmentHeader, SegmentRecord, segment_key,
-        },
+        format::{Limits, ManifestEntry, SegmentEncoder, SegmentHeader, segment_key},
         reader::ReaderConfig,
     };
     let root = std::path::PathBuf::from(
@@ -891,29 +975,8 @@ async fn pair_buffer(
         limits: Limits::default(),
         required_next_mseq: 2,
     };
-    let h = fixture.transaction(if marker {
-        EventKind::FinalMarker
-    } else {
-        EventKind::Insert
-    })?;
-    let mut rows = fixture.transaction(EventKind::ChunkRows)?;
-    rows.txn = TxnId(vec![2]);
-    rows.events[0].txn = rows.txn.clone();
-    let rows = AssembledTxn::new(
-        rows.source,
-        rows.txn,
-        rows.commit_position,
-        rows.commit_time,
-        rows.events,
-    )?;
     let mut previous = [0; 32];
-    for (mseq, record) in [
-        SegmentRecord::Transaction(h),
-        SegmentRecord::ChunkRows(rows),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (mseq, record) in records.into_iter().enumerate() {
         let pos = record.position().clone();
         let mut encoder = SegmentEncoder::new(
             Vec::new(),
@@ -1300,11 +1363,12 @@ async fn explicit_rollback_and_committed_prefix_with_aborted_successor() -> Test
             drop(executor);
             let (latest, native) = fixture.evidence().await?;
             require(
-                native > a.progress.lsn,
+                native > u64::from_be_bytes(a.progress.position.bytes().try_into().unwrap()),
                 "abort failed to retain native lead",
             )?;
             require(
                 resolve_commit(
+                    &SourcePositions::native_pg(&fixture.id),
                     &a.progress,
                     latest.as_ref(),
                     native,
@@ -1317,8 +1381,13 @@ async fn explicit_rollback_and_committed_prefix_with_aborted_successor() -> Test
                 "aborted B has receipt",
             )?;
             require(
-                resolve_commit(&b.progress, latest.as_ref(), native, None)?
-                    == CommitDecision::NotApplied,
+                resolve_commit(
+                    &SourcePositions::native_pg(&fixture.id),
+                    &b.progress,
+                    latest.as_ref(),
+                    native,
+                    None,
+                )? == CommitDecision::NotApplied,
                 "native lead skipped B",
             )?;
             replay(&fixture, &a).await?;
@@ -1442,7 +1511,7 @@ async fn aborted_final_marker_does_not_publish_checkpoint_from_native_lead() -> 
             .ok_or("marker plan absent")?;
         let (latest, native) = fixture.evidence().await?;
         require(
-            native > plan.progress.lsn
+            native > u64::from_be_bytes(plan.progress.position.bytes().try_into().unwrap())
                 && latest.is_none()
                 && fixture.receipt(&plan.progress).await?.is_none(),
             "aborted marker has transactional evidence",
@@ -1498,4 +1567,399 @@ impl Destination for MarkerCrash<'_> {
     ) -> executor::Result<()> {
         Ok(())
     }
+}
+
+fn mysql_positions(gtid: bool) -> TestResult<(SourcePositions, Position, Position)> {
+    use skedaddle::{
+        event::PositionOrder,
+        mysql::{GtidSet, MysqlOrder, MysqlPosition},
+    };
+    let server = "11111111-1111-1111-1111-111111111111";
+    let order = if gtid {
+        MysqlOrder::gtid("opaque-live")?
+    } else {
+        MysqlOrder::file(server)?
+    };
+    let (a, b) = if gtid {
+        // Random UUIDs resist TOAST compression; the full position cannot be a B-tree key.
+        let mut text = (0..160)
+            .map(|_| format!("{}:1-3", uuid::Uuid::new_v4()))
+            .collect::<Vec<_>>()
+            .join(",");
+        // Filling one GTID hole compresses the canonical set: source order
+        // advances while the encoded position becomes shorter and sorts first.
+        text.push_str(&format!(",{server}:1-9:11-20"));
+        let set: GtidSet = text.parse()?;
+        let mut later = set.clone();
+        later.add(&format!("{server}:10"))?;
+        (
+            MysqlPosition::Gtid {
+                set,
+                server_uuid: server.into(),
+                file: "mysql-bin.000001".into(),
+                offset: 4,
+            },
+            MysqlPosition::Gtid {
+                set: later,
+                server_uuid: server.into(),
+                file: "mysql-bin.000001".into(),
+                offset: 1000,
+            },
+        )
+    } else {
+        (
+            MysqlPosition::File {
+                server_uuid: server.into(),
+                file_seq: 1,
+                offset: 4,
+            },
+            MysqlPosition::File {
+                server_uuid: server.into(),
+                file_seq: 1,
+                offset: 1000,
+            },
+        )
+    };
+    let a = Position::new(order.domain(), a.encode()?);
+    let b = Position::new(order.domain(), b.encode()?);
+    assert_eq!(a.compare(&b, &order)?, std::cmp::Ordering::Less);
+    if gtid {
+        assert!(a.bytes().len() > 3072 && b.bytes().len() > 3072);
+        assert!(a.bytes() > b.bytes());
+        assert!(a.bytes().len() > b.bytes().len());
+    }
+    Ok((
+        SourcePositions::new(Arc::new(order), OriginPolicy::Opaque),
+        a,
+        b,
+    ))
+}
+fn opaque_txn(f: &Fixture, position: Position, id: i32) -> TestResult<AssembledTxn> {
+    let mut txn = f.transaction(EventKind::Insert)?;
+    txn.source.engine = "mysql".into();
+    txn.txn = TxnId(id.to_be_bytes().to_vec());
+    txn.commit_position = position.clone();
+    for event in &mut txn.events {
+        event.source = txn.source.clone();
+        event.txn = txn.txn.clone();
+        event.position = position.clone();
+        let value = OpaqueValue {
+            type_id: "id".into(),
+            bytes: Some(Value::Int4(id).canonical_bytes()?),
+        };
+        event.key.insert("id".into(), value.clone());
+        event.after.as_mut().unwrap().insert("id".into(), value);
+    }
+    Ok(AssembledTxn::new(
+        txn.source,
+        txn.txn,
+        position,
+        Some(i64::MIN),
+        txn.events,
+    )?)
+}
+fn opaque_executor(
+    f: &Fixture,
+    positions: SourcePositions,
+) -> executor::Result<Executor<HarnessConnector>> {
+    Executor::new(
+        HarnessConnector(f.dsn.clone()),
+        f.id.clone(),
+        f.origin.clone(),
+        100,
+        positions,
+    )
+}
+
+#[tokio::test]
+#[ignore = "REAL-PG APPLY SKIPPED: Docker harness must supply pg_apply; run --ignored --nocapture"]
+async fn opaque_mysql_positions_recover_receipts_and_filter_session_origin() -> TestResult<()> {
+    for (gtid, committed) in [(false, false), (false, true), (true, false), (true, true)] {
+        let Some(mut f) = Fixture::open().await? else {
+            return Ok(());
+        };
+        let slot = format!("{}_opaque", f.id);
+        let publication = slot.clone();
+        let result = async {
+            executor::install_opaque_progress(&mut f.admin.client, |intent| { assert_eq!(intent, executor::INSTALL_OPAQUE_INTENT); async { Ok(()) } }).await?;
+            executor::install_opaque_progress(&mut f.admin.client, |_| async { Ok(()) }).await?;
+            f.admin.client.batch_execute(&format!("CREATE PUBLICATION {publication} FOR TABLE {}.rows",f.id)).await?;
+            f.admin.client.query_one("SELECT pg_create_logical_replication_slot($1,'pgoutput')", &[&slot]).await?;
+            let (positions,a,b) = mysql_positions(gtid)?;
+            let txn = opaque_txn(&f,a,1)?;
+            let first = f.plan_with_positions(&txn,1,RangeState::Completed,positions.clone())?;
+            let second = f.plan_with_positions(&opaque_txn(&f,b,2)?,1,RangeState::Completed,positions.clone())?;
+            let mut destination = opaque_executor(&f,positions.clone())?;
+            let mut crash = Crash { fixture: &f, plan: None, seam: Seam::BeforeCommit,
+                lost_commit_response: committed, resume_commit: true, fired: false };
+            destination.apply_observed(&first,&mut crash).await?;
+            assert!(crash.fired);
+            destination.apply(&second).await?;
+            destination.close().await?;
+            // Earlier transaction shares mseq: only its exact hashed receipt proves replay.
+            let mut restarted = opaque_executor(&f,positions.clone())?;
+            restarted.apply(&first).await?; restarted.apply(&second).await?;
+            restarted.close().await?;
+            assert_eq!(f.count().await?,2);
+            let receipt = f.admin.client.query_one("SELECT position_domain, position, octet_length(position_hash) FROM _skedaddle.apply_receipts_v3 WHERE stream=$1 AND txn=$2", &[&f.id,&first.progress.txn.0]).await?;
+            assert_eq!(receipt.get::<_,String>(0),first.progress.position.order_domain());
+            assert_eq!(receipt.get::<_,Vec<u8>>(1),first.progress.position.bytes());
+            assert_eq!(receipt.get::<_,i32>(2),32);
+            let progress = f.admin.client.query_one("SELECT position_domain,last_position FROM _skedaddle.apply_progress_v3 WHERE stream=$1", &[&f.id]).await?;
+            assert_eq!(progress.get::<_,String>(0),second.progress.position.order_domain());
+            assert_eq!(progress.get::<_,Vec<u8>>(1),second.progress.position.bytes());
+            // Negative control proves WAL was consumed: only the untagged INSERT survives.
+            f.admin.client.batch_execute(&format!("INSERT INTO {}.rows VALUES(999,'untagged')",f.id)).await?;
+            let count: i64 = f.admin.client.query_one("SELECT count(*) FROM pg_logical_slot_get_binary_changes($1,NULL,NULL,'proto_version','1','publication_names',$2,'origin','none') WHERE get_byte(data,0)=73", &[&slot,&publication]).await?.get(0);
+            assert_eq!(count,1);
+            // A forced hash match with different complete bytes is a typed hard error.
+            f.admin.client.execute("UPDATE _skedaddle.apply_receipts_v3 SET position=$2 WHERE stream=$1 AND txn=$3", &[&f.id,&second.progress.position.bytes(),&first.progress.txn.0]).await?;
+            let mut collision = opaque_executor(&f,positions.clone())?;
+            assert!(matches!(collision.apply(&first).await,Err(executor::Error::Apply(ApplyError::PositionHashCollision))));
+            collision.close().await?;
+            f.admin.client.execute("UPDATE _skedaddle.apply_receipts_v3 SET position=$2,position_domain='wrong' WHERE stream=$1 AND txn=$3", &[&f.id,&first.progress.position.bytes(),&first.progress.txn.0]).await?;
+            let mut collision = opaque_executor(&f,positions.clone())?;
+            assert!(matches!(collision.apply(&first).await,Err(executor::Error::Apply(ApplyError::PositionHashCollision))));
+            collision.close().await?;
+            f.admin.client.execute("UPDATE _skedaddle.apply_receipts_v3 SET position_domain=$2 WHERE stream=$1", &[&f.id,&first.progress.position.order_domain()]).await?;
+            // Native streams cannot consume v3 evidence, even if progress is absent.
+            for receipt_only in [false,true] {
+                if receipt_only { f.admin.client.execute("DELETE FROM _skedaddle.apply_progress_v3 WHERE stream=$1", &[&f.id]).await?; }
+                let mut native = f.executor()?;
+                assert!(matches!(native.apply(&f.plan(EventKind::Insert,RangeState::Completed)?).await,Err(executor::Error::Apply(ApplyError::OriginPolicyMismatch))));
+                native.close().await?;
+            }
+            TestResult::Ok(())
+        }.await;
+        let _ = f.admin.client.query_one("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name=$1", &[&slot]).await;
+        let _ = f
+            .admin
+            .client
+            .batch_execute(&format!("DROP PUBLICATION IF EXISTS {publication}"))
+            .await;
+        let cleanup = f.cleanup().await;
+        result?;
+        cleanup?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "REAL-PG APPLY SKIPPED: Docker harness must supply pg_apply; run --ignored --nocapture"]
+async fn opaque_rejects_native_stream_rows_and_wrong_saved_domain() -> TestResult<()> {
+    let Some(mut f) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        executor::install_opaque_progress(&mut f.admin.client, |_| async { Ok(()) }).await?;
+        let native_plan = f.plan(EventKind::Insert, RangeState::Completed)?;
+        let mut native = f.executor()?;
+        native.apply(&native_plan).await?;
+        native.close().await?;
+        let (positions, a, _) = mysql_positions(false)?;
+        let plan = f.plan_with_positions(
+            &opaque_txn(&f, a, 2)?,
+            1,
+            RangeState::Completed,
+            positions.clone(),
+        )?;
+        for receipt_only in [false, true] {
+            if receipt_only {
+                f.admin
+                    .client
+                    .execute(
+                        "DELETE FROM _skedaddle.apply_progress WHERE stream=$1",
+                        &[&f.id],
+                    )
+                    .await?;
+            }
+            let mut opaque = opaque_executor(&f, positions.clone())?;
+            assert!(matches!(
+                opaque.apply(&plan).await,
+                Err(executor::Error::Apply(ApplyError::OriginPolicyMismatch))
+            ));
+            opaque.close().await?;
+        }
+        f.admin
+            .client
+            .execute(
+                "DELETE FROM _skedaddle.apply_receipts WHERE stream=$1",
+                &[&f.id],
+            )
+            .await?;
+        let mut opaque = opaque_executor(&f, positions.clone())?;
+        opaque.apply(&plan).await?;
+        opaque.close().await?;
+        f.admin
+            .client
+            .execute(
+                "UPDATE _skedaddle.apply_progress_v3 SET position_domain='wrong' WHERE stream=$1",
+                &[&f.id],
+            )
+            .await?;
+        let mut opaque = opaque_executor(&f, positions)?;
+        assert!(matches!(
+            opaque.apply(&plan).await,
+            Err(executor::Error::Apply(ApplyError::Position(
+                skedaddle::event::EventError::PositionDomainMismatch
+            )))
+        ));
+        opaque.close().await?;
+        TestResult::Ok(())
+    }
+    .await;
+    let cleanup = f.cleanup().await;
+    result?;
+    cleanup
+}
+
+#[tokio::test]
+#[ignore = "REAL-PG APPLY SKIPPED: Docker harness must supply pg_apply; run --ignored --nocapture"]
+async fn opaque_installer_rejects_actual_schema_mismatch() -> TestResult<()> {
+    let Some(f) = Fixture::open().await? else {
+        return Ok(());
+    };
+    // Isolate deliberately malformed schemas from every other fixture.
+    let database = format!("{}_schema", f.id);
+    f.admin
+        .client
+        .batch_execute(&format!("CREATE DATABASE {database}"))
+        .await?;
+    let result = async {
+        let mut config: tokio_postgres::Config = f.dsn.parse()?; config.dbname(&database);
+        let (mut client,driver,_) = skedaddle::pg::tls::connect(&tls_config(config), &skedaddle::security::TlsPolicy::Required).await?;
+        let driver = tokio::spawn(async move { let _ = driver.await; });
+        let result = async {
+            client.batch_execute("CREATE SCHEMA _skedaddle; CREATE TABLE _skedaddle.apply_progress_v3 (stream text PRIMARY KEY,last_position text)").await?;
+            assert!(matches!(executor::install_opaque_progress(&mut client, |_| async { Ok(()) }).await,Err(executor::Error::Apply(ApplyError::SchemaMismatch))));
+            client.batch_execute("DROP TABLE _skedaddle.apply_progress_v3").await?;
+            executor::install_opaque_progress(&mut client, |_| async { Ok(()) }).await?;
+            for (break_schema,restore) in [
+                ("ALTER TABLE _skedaddle.apply_progress_v3 ALTER COLUMN position_domain DROP NOT NULL", "ALTER TABLE _skedaddle.apply_progress_v3 ALTER COLUMN position_domain SET NOT NULL"),
+                ("ALTER TABLE _skedaddle.apply_progress_v3 ALTER COLUMN last_position TYPE text USING encode(last_position,'hex')", "ALTER TABLE _skedaddle.apply_progress_v3 ALTER COLUMN last_position TYPE bytea USING decode(last_position,'hex')"),
+                ("ALTER TABLE _skedaddle.apply_receipts_v3 ADD CONSTRAINT wrong_width CHECK(octet_length(position)=8)", "ALTER TABLE _skedaddle.apply_receipts_v3 DROP CONSTRAINT wrong_width"),
+                ("ALTER TABLE _skedaddle.apply_receipts_v3 DROP CONSTRAINT apply_receipts_v3_pkey", "ALTER TABLE _skedaddle.apply_receipts_v3 ADD PRIMARY KEY(stream,mseq,position_hash)"),
+            ] {
+                client.batch_execute(break_schema).await?;
+                assert!(matches!(executor::install_opaque_progress(&mut client, |_| async { Ok(()) }).await,Err(executor::Error::Apply(ApplyError::SchemaMismatch))));
+                client.batch_execute(restore).await?;
+            }
+            executor::install_opaque_progress(&mut client, |_| async { Ok(()) }).await?;
+            TestResult::Ok(())
+        }.await;
+        drop(client); let _ = driver.await; result
+    }.await;
+    let dropped = f
+        .admin
+        .client
+        .batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        .await;
+    let cleanup = f.cleanup().await;
+    result?;
+    dropped?;
+    cleanup
+}
+
+#[tokio::test]
+#[ignore = "REAL-PG APPLY SKIPPED: Docker harness must supply pg_apply; run --ignored --nocapture"]
+async fn opaque_equal_h_reader_evidence_and_checkpoint_retention() -> TestResult<()> {
+    use skedaddle::{
+        buffer::{
+            format::SegmentRecord,
+            reader::{BufferReader, ReaderCheckpoint},
+        },
+        mysql::MysqlOrder,
+        pg::apply::executor::ReaderLoop,
+    };
+    let Some(mut f) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        executor::install_opaque_progress(&mut f.admin.client, |_| async { Ok(()) }).await?;
+        // Native file cursors exercise the local backend's hashed component
+        // sidecars. Long GTID logical keys exceed its separate 4096-byte cap;
+        // their destination receipt keys are qualified in the campaign above.
+        let (positions, h, _) = mysql_positions(false)?;
+        let order = Arc::new(MysqlOrder::file("11111111-1111-1111-1111-111111111111")?);
+        let transaction = opaque_txn(&f, h.clone(), 1)?;
+        let mut rows = opaque_txn(&f, h.clone(), 1)?;
+        rows.txn = TxnId(vec![2]);
+        rows.events[0].txn = rows.txn.clone();
+        rows.events[0].kind = EventKind::ChunkRows;
+        let rows = AssembledTxn::new(rows.source, rows.txn, h, rows.commit_time, rows.events)?;
+        let (store, config) = pair_buffer_records(
+            &f,
+            vec![
+                SegmentRecord::Transaction(transaction),
+                SegmentRecord::ChunkRows(rows),
+            ],
+        )
+        .await?;
+        let reader = BufferReader::new(
+            store.clone(),
+            config.clone(),
+            ReaderCheckpoint::default(),
+            order.clone(),
+        )?;
+        let mut runner = ReaderLoop::new(reader, f.id.clone());
+        let mut destination = RetainedExecutor {
+            executor: opaque_executor(&f, positions.clone())?,
+            crash: None,
+            plans: vec![],
+        };
+        let mut saved = ReaderCheckpoint::default();
+        for _ in 0..2 {
+            assert!(
+                runner
+                    .step(
+                        &mut destination,
+                        |txn, mseq| f
+                            .plan_with_positions(txn, mseq, RangeState::Copying, positions.clone())
+                            .map_err(|_| ApplyError::InvalidTransaction),
+                        |cp| {
+                            saved = cp;
+                            async { Ok(()) }
+                        }
+                    )
+                    .await?
+            );
+        }
+        assert!(destination.plans.iter().all(|plan| plan.progress.evidence.is_some()));
+        let kinds: Vec<i16> = f.admin.client.query(
+            "SELECT record_kind FROM _skedaddle.apply_receipts_v3 WHERE stream=$1 ORDER BY mseq", &[&f.id],
+        ).await?.iter().map(|row| row.get(0)).collect();
+        assert_eq!(kinds, [1, 2]);
+        destination.executor.apply(&destination.plans[0]).await?;
+        destination.executor.apply(&destination.plans[1]).await?;
+        assert_eq!(f.count().await?, 1);
+        assert_eq!(saved.next_mseq, 2);
+        destination.executor.retain_after_checkpoint(&saved).await?;
+        let receipts: i64 = f
+            .admin
+            .client
+            .query_one(
+                "SELECT count(*) FROM _skedaddle.apply_receipts_v3 WHERE stream=$1",
+                &[&f.id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(receipts, 0);
+        let reader = BufferReader::new(store, config, saved, order)?;
+        let mut restarted = ReaderLoop::new(reader, f.id.clone());
+        assert!(
+            !restarted
+                .step(
+                    &mut destination,
+                    |_, _| panic!("idle checkpoint"),
+                    |_| async { Ok(()) }
+                )
+                .await?
+        );
+        destination.executor.close().await?;
+        TestResult::Ok(())
+    }
+    .await;
+    let cleanup = f.cleanup().await;
+    result?;
+    cleanup
 }

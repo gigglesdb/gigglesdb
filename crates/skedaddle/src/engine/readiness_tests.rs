@@ -39,14 +39,18 @@ fn snapshot() -> ComponentSnapshot {
     ComponentSnapshot {
         capture: Some(CaptureObservation {
             healthy: true,
-            checkpoint: checkpoint(),
+            source: source(),
+            position: Position::new("engine-test", 10u64.to_be_bytes()),
         }),
         apply_lag: Some(ApplyLagObservation {
             source: source(),
-            order_domain: "engine-test".into(),
-            source_tip_lsn: 10,
-            applied_source_lsn: 10,
-            lag_bytes: 0,
+            order: Arc::new(crate::pg::apply::NativePgOrder("engine-test".into())),
+            source_tip: Position::new("engine-test", 10u64.to_be_bytes()),
+            applied_source: Position::new("engine-test", 10u64.to_be_bytes()),
+            lag: LagMeasure {
+                value: 0,
+                unit: "bytes",
+            },
             oldest_unapplied_age_ms: 0,
             observed_at: std::time::Instant::now(),
         }),
@@ -139,7 +143,8 @@ async fn lag_uses_milliseconds_and_missing_stale_or_wrong_domain_fails_at_maximu
             sample.apply_lag.as_mut().unwrap().observed_at -= Duration::from_secs(2);
         } else if stale_or_wrong == 2 {
             sample = snapshot();
-            sample.apply_lag.as_mut().unwrap().order_domain = "wrong".into();
+            sample.apply_lag.as_mut().unwrap().applied_source =
+                Position::new("wrong", 10u64.to_be_bytes());
         }
         let facts = super::super::readiness::assemble(&f.engine.runtime, &f.journal, &sample)
             .await
@@ -192,7 +197,7 @@ async fn every_component_regression_recomputes_and_journals_its_reason() {
             "capture-unhealthy",
         ),
         (
-            |s| s.capture.as_mut().unwrap().checkpoint.lineage.timeline += 1,
+            |s| s.capture.as_mut().unwrap().source.lineage = "2".into(),
             "lineage-mismatch",
         ),
         (
@@ -304,7 +309,7 @@ async fn missing_producers_and_zero_denominator_fail_closed() {
             .is_empty()
     );
     // A fresh chunk plan regression must override otherwise holding reports.
-    let mut table = plan().table;
+    let mut table = plan().table.postgres().unwrap().clone();
     table.table = "other".into();
     let different = ChunkPlan::new(table, 100, vec![]).unwrap();
     f.engine.plan(&different).await.unwrap();
@@ -439,6 +444,42 @@ fn wal_uses_source_growth_even_when_retained_wal_decreases_and_checks_slot_limit
     assert_eq!(decision.level, WalLevel::Abort);
     assert_eq!(decision.slot_headroom_bytes, Some(1000));
     assert!(monitor.sample(&slot(199, 0, 1000, None)).is_err());
+}
+
+#[test]
+fn pg_retention_projection_matches_old_numbers_golden() {
+    for (free, retained, maximum, valid, expected_seconds, expected_level) in [
+        (36_010, 0, None, true, 3601.0, WalLevel::Healthy),
+        (36_000, 0, None, true, 3600.0, WalLevel::Warning),
+        (9_010, 0, None, true, 901.0, WalLevel::Warning),
+        (9_000, 0, None, true, 900.0, WalLevel::Blocker),
+        (1_210, 0, None, true, 121.0, WalLevel::Blocker),
+        (1_200, 0, None, true, 120.0, WalLevel::Abort),
+        (0, 0, None, true, 0.0, WalLevel::Abort),
+        (100_000, 800, Some(2000), true, 120.0, WalLevel::Abort),
+        (100_000, 3000, Some(2000), true, 0.0, WalLevel::Abort),
+        (100_000, 0, None, false, 10_000.0, WalLevel::Abort),
+    ] {
+        let clock = Arc::new(Clock::default());
+        let mut monitor = WalMonitor::new(clock.clone(), RetentionPolicy::default()).unwrap();
+        monitor
+            .sample(&slot(100, 1000, 100_000, Some(100_000)))
+            .unwrap();
+        clock.0.store(10, AtomicOrdering::SeqCst);
+        let mut observation = slot(200, retained, free, maximum);
+        observation.slot.valid = valid;
+        let decision = monitor.sample(&observation).unwrap();
+        assert_eq!(decision.wal_bytes_per_second, Some(10.0));
+        assert_eq!(decision.seconds_to_exhaustion, Some(expected_seconds));
+        assert_eq!(
+            decision.slot_headroom_bytes,
+            maximum.map(|m| m.saturating_sub(retained))
+        );
+        assert_eq!(decision.level, expected_level);
+        assert_eq!(decision.coverage_loss, expected_level == WalLevel::Abort);
+        assert_eq!(decision.resumable, expected_level != WalLevel::Abort);
+        assert!(decision.source_untouched);
+    }
 }
 struct AbortWhenApplying {
     entered: Arc<std::sync::atomic::AtomicBool>,

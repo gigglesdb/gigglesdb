@@ -5,10 +5,10 @@ use crate::pg::{
 };
 use crate::{
     coordinator::{Materialized, chunk::ChunkPlan},
-    event::{AssembledTxn, Position, Row},
+    event::{AssembledTxn, Position, PositionOrder, Row},
     mapping::{Date, PgType, Timestamp, Value},
 };
-use std::cmp::Ordering;
+use std::{cmp::Ordering, fmt, sync::Arc};
 
 /// Done applies only to transactions strictly after the saved high watermark.
 /// Pre-H replay remains InWindow, even when the durable journal already has Done.
@@ -26,20 +26,35 @@ impl RangeStatus {
         }
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RangeClassifier {
     catalog: TableCatalog,
     plan: ChunkPlan,
-    order_domain: String,
+    order: Arc<dyn PositionOrder + Send + Sync>,
+}
+impl fmt::Debug for RangeClassifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RangeClassifier")
+            .field("domain", &self.order.domain())
+            .finish_non_exhaustive()
+    }
 }
 impl RangeClassifier {
-    pub(super) fn new(
+    pub fn with_position_order(
         catalog: &TableCatalog,
         plan: &ChunkPlan,
-        order_domain: &str,
+        order: Arc<dyn PositionOrder + Send + Sync>,
     ) -> Result<Self> {
-        if order_domain.is_empty()
-            || plan.table != catalog.key
+        let key = plan.table.postgres().map_err(|error| {
+            blocked(
+                &catalog.selection.name,
+                "chunk source",
+                error.to_string(),
+                "Use the MySQL source planner for a MySQL plan.",
+            )
+        })?;
+        if order.domain().is_empty()
+            || key != &catalog.key
             || chunk::plan_chunks(&catalog.key, plan.chunk_size, &plan.samples)
                 .ok()
                 .as_ref()
@@ -74,7 +89,7 @@ impl RangeClassifier {
         let classifier = Self {
             catalog: catalog.clone(),
             plan: plan.clone(),
-            order_domain: order_domain.into(),
+            order,
         };
         for sample in &plan.samples {
             classifier.compare_keys(sample, sample).map_err(|_| {
@@ -129,15 +144,9 @@ impl RangeClassifier {
         position: &Position,
         state: &Materialized,
     ) -> std::result::Result<RangeStatus, ApplyError> {
-        if position.order_domain() != self.order_domain {
-            return Err(ApplyError::Invalid("catalog position domain mismatch"));
-        }
-        let lsn = u64::from_be_bytes(
-            position
-                .bytes()
-                .try_into()
-                .map_err(|_| ApplyError::Invalid("PostgreSQL LSN width"))?,
-        );
+        position
+            .compare(position, self.order.as_ref())
+            .map_err(ApplyError::Position)?;
         let mut key = Vec::new();
         for k in &self.catalog.key.columns {
             let c = self
@@ -204,16 +213,12 @@ impl RangeClassifier {
                 .done
                 .as_ref()
                 .map(|done| {
-                    if done.high.order_domain() != self.order_domain {
-                        return Err(ApplyError::Invalid("catalog Done position domain mismatch"));
-                    }
-                    let high = u64::from_be_bytes(
-                        done.high
-                            .bytes()
-                            .try_into()
-                            .map_err(|_| ApplyError::Invalid("PostgreSQL LSN width"))?,
-                    );
-                    Ok(lsn > high)
+                    Ok::<_, ApplyError>(
+                        position
+                            .compare(&done.high, self.order.as_ref())
+                            .map_err(ApplyError::Position)?
+                            == Ordering::Greater,
+                    )
                 })
                 .transpose()?
                 .unwrap_or(false)

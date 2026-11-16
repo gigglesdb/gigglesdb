@@ -29,6 +29,8 @@ pub type Result<T> = std::result::Result<T, ChunkError>;
 #[derive(Debug)]
 pub enum ChunkError {
     Invalid(&'static str),
+    UnsupportedSource(&'static str),
+    MysqlKey(crate::mysql::chunk_key::MysqlKeyError),
     Mapping(MappingError),
     Event(EventError),
     Postgres(tokio_postgres::Error),

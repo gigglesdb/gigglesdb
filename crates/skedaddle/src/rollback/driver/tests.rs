@@ -314,7 +314,9 @@ struct Target(Arc<Mutex<Vec<u64>>>);
 #[async_trait]
 impl Destination for Target {
     async fn apply(&mut self, p: &pgapply::TransactionPlan) -> executor::Result<CommitDecision> {
-        self.0.lock().unwrap().push(p.progress.lsn);
+        self.0.lock().unwrap().push(u64::from_be_bytes(
+            p.progress.position.bytes().try_into().unwrap(),
+        ));
         Ok(CommitDecision::Applied)
     }
     async fn retain_after_checkpoint(&mut self, _: &ReaderCheckpoint) -> executor::Result<()> {

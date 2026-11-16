@@ -156,8 +156,9 @@ impl CapabilityReport {
             ("destination", &definition.destination),
         ]
         .into_iter()
-        .filter(|(_, connection)| {
+        .filter(|(side, connection)| {
             !matches!(connection.engine, Engine::Postgresql | Engine::Spanner)
+                && !(*side == "source" && connection.engine == Engine::Mysql)
         })
         .map(|(side, connection)| format!("{side}: {}", connection.engine))
         .collect();
@@ -191,6 +192,16 @@ impl CapabilityReport {
                             connection.version
                         ),
                     ));
+                }
+                Engine::Mysql if side == "source" => {
+                    for capability in ["preflight", "mapping"] {
+                        items.push(item(
+                            &format!("source.mysql.{capability}"), ItemStatus::Unverified,
+                            Criticality::Critical,
+                            "Run live MySQL preflight with explicit copy/catch-up estimates and selected-column mapping inspection.",
+                            "No live MySQL evidence has been collected; declarations do not qualify source capabilities.".into(),
+                        ));
+                    }
                 }
                 Engine::Spanner => {
                     for (capability, remediation) in [
@@ -360,5 +371,33 @@ pub fn tls_trust(connection: &crate::definition::Connection) -> TlsTrust {
                 "file"
             }
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn mysql_offline_items_block_without_resolving_secrets() {
+        let readme = include_str!("../README.md");
+        let json = readme
+            .split("```json")
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        value["source"] = serde_json::json!({"engine":"mysql","version":"8.0","tls_ca_ref":"env:UNRESOLVED_CA", "mysql":{"host":"localhost","port":3306,"user":"env:UNRESOLVED_USER","password":"env:UNRESOLVED_PASSWORD"}});
+        let definition =
+            MigrationDefinition::from_json(&serde_json::to_string(&value).unwrap()).unwrap();
+        let report = CapabilityReport::from_definition(&definition).unwrap();
+        assert_eq!(report.blocking().len(), 2);
+        assert!(
+            report
+                .blocking()
+                .iter()
+                .all(|i| i.status == ItemStatus::Unverified)
+        );
     }
 }
