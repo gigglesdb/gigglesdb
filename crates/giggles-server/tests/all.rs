@@ -244,3 +244,9 @@ mod agent_bindings;
 
 #[path = "agent_pg_connect.rs"]
 mod agent_pg_connect;
+
+#[path = "agent_pg_profile.rs"]
+mod agent_pg_profile;
+
+#[path = "agent_pg_operations.rs"]
+mod agent_pg_operations;

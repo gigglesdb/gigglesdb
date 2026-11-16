@@ -36,7 +36,7 @@ pub(super) fn description(function: &crate::pg_settings::Function) -> Descriptio
         }],
     }
 }
-fn evaluate(
+pub(super) fn evaluate(
     function: &crate::pg_settings::Function,
     settings: &mut crate::pg_settings::SessionSettings,
     session: &Session,

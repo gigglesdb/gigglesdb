@@ -5,6 +5,7 @@
 
 pub mod bindings;
 pub mod listener;
+pub mod statement;
 
 pub use bindings::AgentBinding;
 pub use listener::{AgentConfig, serve_agent_pg_bound};

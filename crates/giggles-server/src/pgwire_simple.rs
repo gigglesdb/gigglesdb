@@ -9,6 +9,10 @@ impl State {
         out: &mut Vec<u8>,
         received: std::time::Instant,
     ) -> R<()> {
+        // GD-0061 R3-206: one statement per Query, admitted before it runs.
+        if session.task().is_some() {
+            return self.task_simple(sql, session, out);
+        }
         let mut implicit = false;
         if !matches!(session.role, Role::Database { .. }) {
             return self.simple_statement(sql, session, out, received, &mut implicit);
@@ -265,6 +269,9 @@ impl State {
         received: std::time::Instant,
         implicit: &mut bool,
     ) -> R<()> {
+        if session.task().is_some() {
+            return self.task_statement(sql, session, out);
+        }
         if let Some(command) = cursor::parse(sql)? {
             self.cursors.execute(
                 &command,

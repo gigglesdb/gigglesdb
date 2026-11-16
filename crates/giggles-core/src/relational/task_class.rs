@@ -19,6 +19,18 @@ fn is_catalog_relation(key: &str) -> bool {
 }
 
 impl Prepared {
+    /// The class of `sql` from its text alone (GD-0061 R3-206). It parses without binding, so
+    /// it reads no catalog, sequence or table: a task session admits the class before any of
+    /// those reads happen. A statement that does not parse returns the parse error.
+    pub fn task_class_of_sql(sql: &str) -> Result<StatementClass, crate::CoreError> {
+        if sql.len() > super::MAX_STATEMENT_SQL {
+            return Err(crate::CoreError::Sql(super::SqlError::Limit));
+        }
+        Prepared::parse(sql, 0, 0)
+            .map(|p| p.task_class())
+            .map_err(crate::CoreError::Sql)
+    }
+
     /// The class `task::admit::admit` sees for this statement.
     ///
     /// Table 4(a), plus one rule: a read that names a catalog relation anywhere (including a
@@ -173,6 +185,23 @@ mod tests {
         ] {
             assert!(commands.contains(command), "{command} not covered: {commands:?}");
         }
+    }
+
+    #[test]
+    fn task_class_of_sql_matches_prepared_class_without_binding() {
+        for sql in [
+            "SELECT id FROM shipments WHERE id = $1",
+            "UPDATE shipments SET status = $1 WHERE id = $2",
+            "BEGIN",
+            "DROP INDEX i",
+        ] {
+            assert_eq!(
+                Prepared::task_class_of_sql(sql).unwrap(),
+                prepared(sql).task_class(),
+                "{sql}"
+            );
+        }
+        assert!(Prepared::task_class_of_sql("UPDATE").is_err());
     }
 
     #[test]

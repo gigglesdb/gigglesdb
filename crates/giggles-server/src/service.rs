@@ -394,6 +394,7 @@ impl Service {
             epoch: role.generation,
             fingerprint_bound: false,
             agent: false,
+            in_protected: false,
             role_fence: Some((role.oid, role.generation)),
             scoped: false,
             connection: None,
@@ -440,6 +441,7 @@ impl Service {
             epoch,
             fingerprint_bound: true,
             agent: false,
+            in_protected: false,
             role_fence,
             scoped: false,
             connection: None,
@@ -572,6 +574,7 @@ impl Service {
             epoch,
             fingerprint_bound: true,
             agent: true,
+            in_protected: false,
             role_fence: Some((role.oid, role.generation)),
             scoped: false,
             connection: None,
@@ -615,6 +618,9 @@ pub struct Session {
     fingerprint_bound: bool,
     // An agent (task) session: bound through the agent map, never the ordinary one.
     agent: bool,
+    // Set only by `execute_protected` while the protected seam runs; the
+    // `authorize` backstop lets a task session's UPDATE through only then.
+    in_protected: bool,
     // Database role OID and generation, independent of any fingerprint binding epoch.
     pub(crate) role_fence: Option<(u32, u64)>,
     scoped: bool,
@@ -732,6 +738,42 @@ impl Session {
         let now = crate::agent::wall_now(&self.service.clock)?;
         let standing = self.sql.task_standing(now).map_err(CoreError::Task)?;
         crate::agent::standing_admits(standing, class).map_err(CoreError::Task)
+    }
+    /// GD-0061 R3-207: run one protected statement (direct write, preview,
+    /// apply or outcome lookup). It admits the class, then hands the statement
+    /// to `agent::statement::protected_seam`, which fails closed until the
+    /// Phase 6 and 7 bodies land. This is the only place `in_protected` is set.
+    pub(crate) fn execute_protected(
+        &mut self,
+        statement: &crate::agent::statement::ProtectedStatement,
+        params: &[Value],
+    ) -> Result<SqlResult, CoreError> {
+        self.authority_scope(|session| {
+            if session.sql.task().is_none() {
+                return Err(CoreError::Policy(Error::Scope));
+            }
+            session.admit(statement.class())?;
+            session.in_protected = true;
+            let result = crate::agent::statement::protected_seam(session, statement, params);
+            session.in_protected = false;
+            result
+        })
+    }
+    /// Backstop for every internal path of a task session (design-2 section 4,
+    /// call site 5): the class must be admitted. An UPDATE passes only inside
+    /// `execute_protected`; outside it, it needs an operation ID.
+    fn admit_backstop(
+        &mut self,
+        class: giggles_core::task::StatementClass,
+    ) -> Result<(), CoreError> {
+        use giggles_core::task::{StatementClass, TaskError};
+        if self.sql.task().is_none() {
+            return Ok(());
+        }
+        if class == StatementClass::Update && !self.in_protected {
+            return Err(CoreError::Task(TaskError::OperationIdRequired));
+        }
+        self.admit(class)
     }
     /// The agent-map entry still has this session's epoch and executor and
     /// still lists its task.
@@ -852,6 +894,13 @@ impl Session {
         &mut self,
         stmt: &crate::auth::statements::AdminStatement,
     ) -> Result<&'static str, &'static str> {
+        let class = match stmt {
+            crate::auth::statements::AdminStatement::DropTable(..) => {
+                giggles_core::task::StatementClass::Ddl
+            }
+            _ => giggles_core::task::StatementClass::RoleStatement,
+        };
+        self.admit_backstop(class).map_err(|error| sqlstate(&error))?;
         let Role::Database { name } = &self.role else {
             return Err("42501");
         };
@@ -965,6 +1014,7 @@ impl Session {
     pub(crate) fn catalog_snapshot(
         &mut self,
     ) -> Result<(u64, Vec<relational::TableDef>, Vec<giggles_core::IndexInfo>), CoreError> {
+        self.admit_backstop(giggles_core::task::StatementClass::Catalog)?;
         self.authority_scope(|session| {
             if session.is_aborted() {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -1241,6 +1291,12 @@ impl Session {
         if dependencies.is_empty() {
             return Ok(());
         }
+        if self.sql.task().is_some() {
+            // D7: sequences are never reachable from a task statement.
+            return Err(CoreError::Task(giggles_core::task::TaskError::Denied(
+                giggles_core::task::DenyRule::Sequence,
+            )));
+        }
         self.authority_scope(|session| session.authorize_sequences(&dependencies))
     }
     fn authorize_create_sequence(&mut self) -> Result<(), CoreError> {
@@ -1368,6 +1424,7 @@ impl Session {
         Ok(())
     }
     pub(crate) fn validate_access_share(&mut self, tables: &[String]) -> Result<(), CoreError> {
+        self.admit_backstop(giggles_core::task::StatementClass::Lock)?;
         self.authority_scope(|session| {
             if session.is_aborted() {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -1554,6 +1611,7 @@ impl Session {
         Ok(())
     }
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
+        self.admit_backstop(p.task_class())?;
         if let Some((schema, owner, create)) = p.schema_ddl() {
             let allowed = if let Role::Database { name } = &self.role {
                 let roles = self.service.admin.roles();
@@ -1730,6 +1788,7 @@ impl Session {
         Ok(())
     }
     fn authorize_copy_sql(&mut self, sql: &str) -> Result<(), CoreError> {
+        self.admit_backstop(giggles_core::task::StatementClass::Copy)?;
         if !self.role.is_sql() {
             self.abort();
             return Err(CoreError::Policy(Error::Scope));

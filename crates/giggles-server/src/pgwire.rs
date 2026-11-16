@@ -27,6 +27,8 @@ use simple::{execute_settings, parse_settings, settings_status, show_settings};
 mod cursor;
 #[path = "pgwire_transaction.rs"]
 mod transaction;
+#[path = "pgwire_task.rs"]
+mod task_path;
 use transaction::{admin_command, execute_mode, parse_control, read_only_check};
 
 type R<T> = Result<T, &'static str>;
@@ -848,6 +850,8 @@ enum Plan {
     Sql(Box<Prepared>),
     Copy(giggles_core::relational::Copy, Box<Prepared>),
     Task(crate::task_statement::TaskStatement),
+    /// GD-0061 R3-207: a protected form; task sessions only.
+    Protected(Box<crate::agent::statement::ProtectedStatement>),
 }
 #[derive(Clone)]
 struct Statement {
@@ -862,6 +866,9 @@ struct Statement {
 impl Statement {
     fn describe(&self, session: &mut Session) -> R<Description> {
         match &self.p {
+            // A task session holds only relation-free catalog plans, which
+            // read no catalog (R3-206).
+            Plan::Catalog(..) if session.task().is_some() => Ok(self.d.clone()),
             Plan::Catalog(plan, _, epoch) => {
                 let (current, _, _) = core(session.catalog_snapshot())?;
                 if current != *epoch && !plan.refreshes_view_definitions() {
@@ -882,7 +889,8 @@ impl Statement {
             | Plan::Settings(_)
             | Plan::Control(_)
             | Plan::SettingsFunction(_)
-            | Plan::Inspect(_) => Ok(self.d.clone()),
+            | Plan::Inspect(_)
+            | Plan::Protected(_) => Ok(self.d.clone()),
         }
     }
 }
@@ -1079,6 +1087,11 @@ impl State {
         oids: Vec<u32>,
         session: &mut Session,
     ) -> R<Statement> {
+        // GD-0061 R3-206: a task session admits the class before any catalog
+        // or sequence read, on its own path.
+        if session.task().is_some() {
+            return self.task_prepare(sql, oids, session);
+        }
         if !is_copy_sql(sql) {
             core(session.authorize_sequence_sql(sql))?;
         }
@@ -1297,6 +1310,7 @@ impl State {
         let old = self.statements.get(name).ok_or("26000")?.clone();
         let stale = match &old.p {
             Plan::Sql(p) | Plan::Copy(_, p) => !session.sql.prepared_is_current(p),
+            Plan::Catalog(_, _, _) if session.task().is_some() => false,
             Plan::Catalog(plan, _, epoch) if !plan.depends_on_relations() => {
                 let (current, _, _) = core(session.catalog_snapshot())?;
                 current != *epoch
@@ -1578,6 +1592,10 @@ impl State {
                 r.end()?;
                 if max > i32::MAX as u32 {
                     return Err("08P01");
+                }
+                // GD-0061 R3-206: a task session's portal runs on its own path.
+                if session.task().is_some() {
+                    return self.task_execute(&name, max, retained, session, out).map(|()| true);
                 }
                 let p = self.portals.get_mut(&name).ok_or("34000")?;
                 self.diagnostic.query_id = p.s.query_id.clone();
