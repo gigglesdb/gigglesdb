@@ -18,7 +18,7 @@ use crate::{
     policy::{DomainName, Policy, TokenizeSetting},
     readlog::{Outcome, ReadLog, ReadLogRecord, statement_fingerprint},
     schema::Snapshot,
-    state::authority::{TokenizeError, TokenizeLimits},
+    state::authority::{AdmitError, Operation, TokenizeError, TokenizeLimits},
     token::{SessionId, StandardCodec, TokenCodec, keys::RootKey},
     value::ColumnType,
 };
@@ -30,6 +30,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex, RwLock},
+    time::Duration,
 };
 use tonic::{
     Request, Response, Status,
@@ -96,9 +97,9 @@ type ResultStream = Pin<Box<dyn Stream<Item = Result<PartialResultSet, Status>> 
 /// Native Spanner service and its gateway-created session ownership registry.
 pub struct NunyaSpanner {
     ctx: Arc<SpannerContext>,
-    client: Client,
     channel: Channel,
-    sessions: Mutex<HashMap<String, SessionId>>,
+    sessions: Arc<Mutex<HashMap<String, SessionId>>>,
+    watchers: Arc<Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<()>>>>,
     provider: Option<Arc<dyn gcp_auth::TokenProvider>>,
 }
 fn refusal(code: NyCode) -> Refusal {
@@ -116,14 +117,44 @@ fn denied() -> Status {
 fn remote(error: Status) -> Status {
     redact_status(error.code())
 }
+fn admission_status(error: AdmitError) -> Status {
+    nunya_status(match error {
+        AdmitError::ReadOnly => NyCode::StatementNotAllowed,
+        AdmitError::Unknown | AdmitError::Ended => NyCode::SessionEnded,
+    })
+}
+async fn upstream_client(
+    channel: &Channel,
+    provider: &Option<Arc<dyn gcp_auth::TokenProvider>>,
+) -> Result<Client, Status> {
+    if let Some(provider) = provider {
+        let token = provider
+            .token(&["https://www.googleapis.com/auth/spanner.data"])
+            .await
+            .map_err(|_| nunya_status(NyCode::TokenNotValid))?;
+        let token = format!("Bearer {}", token.as_str())
+            .parse()
+            .map_err(|_| nunya_status(NyCode::TokenNotValid))?;
+        // Reuse the channel and replace only its interceptor token.
+        Ok(SpannerClient::with_interceptor(
+            channel.clone(),
+            AuthInterceptor { token: Some(token) },
+        ))
+    } else {
+        Ok(SpannerClient::with_interceptor(
+            channel.clone(),
+            AuthInterceptor::default(),
+        ))
+    }
+}
 /// Connect to the configured upstream; downstream credentials never leave Nunya.
 pub async fn build(ctx: Arc<SpannerContext>) -> Result<NunyaSpanner, Refusal> {
     let (channel, provider) = connect(&ctx.upstream).await?;
     Ok(NunyaSpanner {
         ctx,
-        client: SpannerClient::with_interceptor(channel.clone(), AuthInterceptor::default()),
         channel,
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        watchers: Arc::new(Mutex::new(HashMap::new())),
         provider,
     })
 }
@@ -219,26 +250,87 @@ impl NunyaSpanner {
         if sessions.get(name).is_some_and(|p| p != &who.session) {
             return Err(nunya_status(NyCode::TokenNotValid));
         }
+        let mut watchers = self.watchers.lock().map_err(|_| invalid())?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = watchers.entry(who.session) {
+            let row = self
+                .ctx
+                .authority
+                .session(who.session)
+                .ok_or_else(|| nunya_status(NyCode::SessionEnded))?;
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_millis(row.expires_ms.saturating_sub(crate::serve::now()));
+            let (guard, mut end) = self.ctx.registry.register(
+                who.session,
+                who.principal,
+                self.ctx.route.as_str(),
+                Some(deadline),
+            );
+            // Register before rechecking admission so a concurrent revocation cannot be missed.
+            self.ctx
+                .authority
+                .admit(who.session, Operation::Read)
+                .map_err(admission_status)?;
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            entry.insert(stop);
+            let sessions = self.sessions.clone();
+            let watchers = Arc::downgrade(&self.watchers);
+            let channel = self.channel.clone();
+            let provider = self.provider.clone();
+            let session = who.session;
+            tokio::spawn(async move {
+                let _guard = guard;
+                tokio::select! {
+                    biased;
+                    _ = stopped => return,
+                    _ = end.ended() => {},
+                }
+                let cleanup = async {
+                    let names = {
+                        let mut sessions = sessions.lock().map_err(|_| invalid())?;
+                        let names: Vec<_> = sessions
+                            .iter()
+                            .filter(|(_, owner)| **owner == session)
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                        for name in &names {
+                            sessions.remove(name);
+                        }
+                        if let Some(watchers) = watchers.upgrade() {
+                            watchers.lock().map_err(|_| invalid())?.remove(&session);
+                        }
+                        names
+                    };
+                    for name in names {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                            upstream_client(&channel, &provider)
+                                .await?
+                                .delete_session(DeleteSessionRequest { name })
+                                .await
+                        })
+                        .await;
+                    }
+                    Ok::<(), Status>(())
+                };
+                let _ = cleanup.await;
+            });
+        } else {
+            self.ctx
+                .authority
+                .admit(who.session, Operation::Read)
+                .map_err(admission_status)?;
+        }
         sessions.insert(name.into(), who.session);
         Ok(())
     }
+    fn admit_write(&self, who: &Authenticated) -> Result<(), Status> {
+        self.ctx
+            .authority
+            .admit(who.session, Operation::Write)
+            .map(|_| ())
+            .map_err(admission_status)
+    }
     async fn client(&self) -> Result<Client, Status> {
-        if let Some(provider) = &self.provider {
-            let token = provider
-                .token(&["https://www.googleapis.com/auth/spanner.data"])
-                .await
-                .map_err(|_| nunya_status(NyCode::TokenNotValid))?;
-            let token = format!("Bearer {}", token.as_str())
-                .parse()
-                .map_err(|_| nunya_status(NyCode::TokenNotValid))?;
-            // Reuse the channel and replace only its interceptor token.
-            Ok(SpannerClient::with_interceptor(
-                self.channel.clone(),
-                AuthInterceptor { token: Some(token) },
-            ))
-        } else {
-            Ok(self.client.clone())
-        }
+        upstream_client(&self.channel, &self.provider).await
     }
     fn configuration(&self) -> Result<(Arc<Policy>, Arc<Snapshot>), Status> {
         let policy = self.ctx.policy.read().map_err(|_| invalid())?.clone();
@@ -714,10 +806,14 @@ impl SpannerService for NunyaSpanner {
             .delete_session(req.clone())
             .await
             .map_err(remote)?;
-        self.sessions
-            .lock()
-            .map_err(|_| invalid())?
-            .remove(&req.name);
+        let mut sessions = self.sessions.lock().map_err(|_| invalid())?;
+        let mut watchers = self.watchers.lock().map_err(|_| invalid())?;
+        sessions.remove(&req.name);
+        if !sessions.values().any(|owner| *owner == who.session)
+            && let Some(stop) = watchers.remove(&who.session)
+        {
+            let _ = stop.send(());
+        }
         Ok(Response::new(()))
     }
     async fn execute_sql(
@@ -730,7 +826,21 @@ impl SpannerService for NunyaSpanner {
         sql_features(&req)?;
         let (policy, snapshot) = self.configuration()?;
         let label = req.sql.clone();
-        let (plan, names, _) = self.sql(&who, &req.sql, &mut req.params, &policy, &snapshot)?;
+        let (plan, names, kind) = self.sql(&who, &req.sql, &mut req.params, &policy, &snapshot)?;
+        match kind {
+            StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {
+                self.admit_write(&who)?
+            }
+            StatementKind::Select | StatementKind::Tokenize { .. } => {}
+            StatementKind::Begin
+            | StatementKind::Commit
+            | StatementKind::Rollback
+            | StatementKind::Savepoint
+            | StatementKind::ReleaseSavepoint
+            | StatementKind::RollbackToSavepoint
+            | StatementKind::SessionNoop { .. }
+            | StatementKind::Refused(_) => return Err(denied()),
+        }
         let label = if plan.tokenize.is_some() {
             "Spanner nunya_tokenize".to_owned()
         } else {
@@ -764,7 +874,21 @@ impl SpannerService for NunyaSpanner {
         sql_features(&req)?;
         let (policy, snapshot) = self.configuration()?;
         let label = req.sql.clone();
-        let (plan, names, _) = self.sql(&who, &req.sql, &mut req.params, &policy, &snapshot)?;
+        let (plan, names, kind) = self.sql(&who, &req.sql, &mut req.params, &policy, &snapshot)?;
+        match kind {
+            StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {
+                self.admit_write(&who)?
+            }
+            StatementKind::Select | StatementKind::Tokenize { .. } => {}
+            StatementKind::Begin
+            | StatementKind::Commit
+            | StatementKind::Rollback
+            | StatementKind::Savepoint
+            | StatementKind::ReleaseSavepoint
+            | StatementKind::RollbackToSavepoint
+            | StatementKind::SessionNoop { .. }
+            | StatementKind::Refused(_) => return Err(denied()),
+        }
         let label = if plan.tokenize.is_some() {
             "Spanner nunya_tokenize".to_owned()
         } else {
@@ -828,6 +952,7 @@ impl SpannerService for NunyaSpanner {
             }
             plans.push(plan);
         }
+        self.admit_write(&who)?;
         for label in &labels {
             Self::audit(&self.ctx, &who, label, 0, vec![])?;
         }
@@ -966,6 +1091,9 @@ impl SpannerService for NunyaSpanner {
         let mut req = req.into_inner();
         self.session(&req.session, &who)?;
         let (policy, snapshot) = self.configuration()?;
+        if !req.mutations.is_empty() {
+            self.admit_write(&who)?;
+        }
         for mutation in &mut req.mutations {
             let lowered =
                 spanner_struct::lower_mutation(mutation, &snapshot, &policy).map_err(status)?;
@@ -1019,6 +1147,7 @@ impl SpannerService for NunyaSpanner {
     ) -> Result<Response<Self::BatchWriteStream>, Status> {
         let who = self.authenticate(&req)?;
         self.session(&req.get_ref().session, &who)?;
+        self.admit_write(&who)?;
         Err(denied())
     }
 }
@@ -1223,6 +1352,10 @@ mod tests {
     struct Fake {
         seen: Mutex<Vec<ExecuteSqlRequest>>,
         commits: Mutex<Vec<CommitRequest>>,
+        deleted: Mutex<Vec<String>>,
+        batches: Mutex<Vec<ExecuteBatchDmlRequest>>,
+        streaming: std::sync::atomic::AtomicUsize,
+        next_session: std::sync::atomic::AtomicUsize,
         roles: Mutex<Vec<String>>,
         failure: std::sync::atomic::AtomicBool,
     }
@@ -1245,7 +1378,12 @@ mod tests {
                 .unwrap()
                 .push(req.session.unwrap_or_default().creator_role);
             Ok(Response::new(Session {
-                name: format!("{}/sessions/fake", req.database),
+                name: format!(
+                    "{}/sessions/fake-{}",
+                    req.database,
+                    self.next_session
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ),
                 ..Default::default()
             }))
         }
@@ -1269,6 +1407,8 @@ mod tests {
             &self,
             _req: Request<ExecuteSqlRequest>,
         ) -> Result<Response<ResultStream>, Status> {
+            self.streaming
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(Response::new(Box::pin(futures::stream::iter(vec![
                 Ok(PartialResultSet {
                     metadata: Some(ResultSetMetadata {
@@ -1295,15 +1435,23 @@ mod tests {
         }
         async fn delete_session(
             &self,
-            _req: Request<DeleteSessionRequest>,
+            req: Request<DeleteSessionRequest>,
         ) -> Result<Response<()>, Status> {
+            self.deleted.lock().unwrap().push(req.into_inner().name);
             Ok(Response::new(()))
         }
         async fn execute_sql(
             &self,
             req: Request<ExecuteSqlRequest>,
         ) -> Result<Response<ResultSet>, Status> {
-            self.seen.lock().unwrap().push(req.into_inner());
+            let req = req.into_inner();
+            let dml = req.sql.starts_with("UPDATE ")
+                || req.sql.starts_with("INSERT ")
+                || req.sql.starts_with("DELETE ");
+            self.seen.lock().unwrap().push(req);
+            if dml {
+                return Ok(Response::new(ResultSet::default()));
+            }
             Ok(Response::new(ResultSet {
                 metadata: Some(ResultSetMetadata {
                     row_type: Some(StructType {
@@ -1322,6 +1470,13 @@ mod tests {
                 }],
                 ..Default::default()
             }))
+        }
+        async fn execute_batch_dml(
+            &self,
+            req: Request<ExecuteBatchDmlRequest>,
+        ) -> Result<Response<ExecuteBatchDmlResponse>, Status> {
+            self.batches.lock().unwrap().push(req.into_inner());
+            Ok(Response::new(ExecuteBatchDmlResponse::default()))
         }
         async fn commit(
             &self,
@@ -1955,5 +2110,233 @@ mod tests {
             10
         );
         assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
+    async fn wait_for(mut ready: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    fn reduce_grant(f: &Fixture) {
+        let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
+        f.svc
+            .ctx
+            .authority
+            .set_grants(
+                who.principal,
+                vec![(f.svc.ctx.route.clone(), Mode::ReadOnly)],
+            )
+            .unwrap();
+    }
+    fn assert_read_only(error: Status) {
+        assert_eq!(
+            error.code(),
+            nunya_status(NyCode::StatementNotAllowed).code()
+        );
+        assert!(error.message().contains("NY006"));
+    }
+    #[tokio::test]
+    async fn revocation_deletes_upstream_sessions() {
+        let f = Fixture::new().await;
+        let first = f.session().await;
+        let second = f.session().await;
+        let bob = f
+            .svc
+            .create_session(f.request(
+                CreateSessionRequest {
+                    database: f.svc.ctx.database.clone(),
+                    ..Default::default()
+                },
+                "bob",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .name;
+        assert_eq!(f.svc.ctx.registry.list_session(&f.alice).len(), 1);
+        f.svc
+            .ctx
+            .authority
+            .revoke(f.alice, crate::state::model::EndReason::AdminRevoked)
+            .unwrap();
+        wait_for(|| {
+            f.fake.deleted.lock().unwrap().len() == 2
+                && f.svc.ctx.registry.list_session(&f.alice).is_empty()
+        })
+        .await;
+        let deleted = f.fake.deleted.lock().unwrap().clone();
+        assert!(deleted.contains(&first));
+        assert!(deleted.contains(&second));
+        assert!(!deleted.contains(&bob));
+        assert!(
+            !f.svc
+                .sessions
+                .lock()
+                .unwrap()
+                .values()
+                .any(|s| *s == f.alice)
+        );
+        let who = f.svc.authenticate(&f.request((), "bob")).unwrap();
+        assert!(f.svc.session(&first, &who).is_err());
+        f.svc
+            .execute_sql(f.request(
+                ExecuteSqlRequest {
+                    session: bob,
+                    sql: "SELECT email FROM customers".into(),
+                    ..Default::default()
+                },
+                "bob",
+            ))
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn revoked_session_is_refused_on_next_rpc() {
+        let f = Fixture::new().await;
+        let req = f.query("SELECT email FROM customers").await;
+        f.svc
+            .execute_sql(f.request(req.clone(), "alice"))
+            .await
+            .unwrap();
+        f.svc
+            .ctx
+            .authority
+            .revoke(f.alice, crate::state::model::EndReason::AdminRevoked)
+            .unwrap();
+        let error = f
+            .svc
+            .execute_sql(f.request(req, "alice"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert!(error.message().contains("NY003"));
+        assert_eq!(f.fake.seen.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn delete_last_session_stops_watcher() {
+        let f = Fixture::new().await;
+        let name = f.session().await;
+        assert_eq!(f.svc.ctx.registry.list_session(&f.alice).len(), 1);
+        f.svc
+            .delete_session(f.request(DeleteSessionRequest { name: name.clone() }, "alice"))
+            .await
+            .unwrap();
+        wait_for(|| f.svc.ctx.registry.list_session(&f.alice).is_empty()).await;
+        assert_eq!(*f.fake.deleted.lock().unwrap(), vec![name]);
+        assert!(f.svc.watchers.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn read_only_session_refuses_writes() {
+        let f = Fixture::new().await;
+        reduce_grant(&f);
+        let select = f.query("SELECT email FROM customers").await;
+        let session = select.session.clone();
+        f.svc.execute_sql(f.request(select, "alice")).await.unwrap();
+        // A valid token lets SQL lowering reach admission for the blind column.
+        let dml = ExecuteSqlRequest {
+            session: session.clone(),
+            sql: "UPDATE customers SET email = @v".into(),
+            params: Some(prost_types::Struct {
+                fields: [("v".into(), f.token())].into(),
+            }),
+            ..Default::default()
+        };
+        assert_read_only(
+            f.svc
+                .execute_sql(f.request(dml.clone(), "alice"))
+                .await
+                .unwrap_err(),
+        );
+        assert_read_only(
+            f.svc
+                .execute_streaming_sql(f.request(dml.clone(), "alice"))
+                .await
+                .err()
+                .unwrap(),
+        );
+        assert_read_only(
+            f.svc
+                .execute_batch_dml(f.request(
+                    ExecuteBatchDmlRequest {
+                        session: session.clone(),
+                        statements: vec![execute_batch_dml_request::Statement {
+                            sql: dml.sql,
+                            params: dml.params,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    "alice",
+                ))
+                .await
+                .unwrap_err(),
+        );
+        assert_read_only(
+            f.svc
+                .commit(f.request(
+                    CommitRequest {
+                        session: session.clone(),
+                        mutations: vec![Mutation::default()],
+                        ..Default::default()
+                    },
+                    "alice",
+                ))
+                .await
+                .unwrap_err(),
+        );
+        assert_read_only(
+            f.svc
+                .batch_write(f.request(
+                    BatchWriteRequest {
+                        session: session.clone(),
+                        ..Default::default()
+                    },
+                    "alice",
+                ))
+                .await
+                .err()
+                .unwrap(),
+        );
+        assert_eq!(f.fake.seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            f.fake.streaming.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(f.fake.batches.lock().unwrap().is_empty());
+        assert!(f.fake.commits.lock().unwrap().is_empty());
+        f.svc
+            .commit(f.request(
+                CommitRequest {
+                    session,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(f.fake.commits.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn grant_reduced_mid_session_refuses_dml() {
+        let f = Fixture::new().await;
+        let mut req = f.query("UPDATE customers SET email = @v").await;
+        req.params = Some(prost_types::Struct {
+            fields: [("v".into(), f.token())].into(),
+        });
+        f.svc
+            .execute_sql(f.request(req.clone(), "alice"))
+            .await
+            .unwrap();
+        reduce_grant(&f);
+        assert_read_only(
+            f.svc
+                .execute_sql(f.request(req, "alice"))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(f.fake.seen.lock().unwrap().len(), 1);
     }
 }
