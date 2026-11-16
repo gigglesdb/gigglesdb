@@ -532,21 +532,52 @@ impl Authority {
         id: PrincipalId,
         grants: Vec<(RouteId, Mode)>,
     ) -> Result<(), AuthorityError> {
-        let _writer = self.writer.lock().unwrap();
+        let writer = self.writer.lock().unwrap();
         self.principal(id).ok_or(AuthorityError::NotFound)?;
         let grants: HashMap<_, _> = grants.into_iter().collect();
-        let old: Vec<_> = self
-            .view
-            .read()
-            .unwrap()
-            .grants
-            .keys()
-            .filter(|(p, _)| *p == id)
-            .cloned()
-            .collect();
+        let rows = {
+            let mut v = self.view.write().unwrap();
+            // Restrict existing grants now; additions and widenings require durability.
+            v.grants.retain(|(p, route), mode| {
+                if *p != id {
+                    return true;
+                }
+                if let Some(new) = grants.get(route) {
+                    *mode = mode.min(*new);
+                    true
+                } else {
+                    false
+                }
+            });
+            let active: Vec<_> = v
+                .sessions
+                .values()
+                .filter(|s| s.principal == id && s.state == SessionState::Active)
+                .map(|s| s.id)
+                .collect();
+            for sid in active {
+                let route = v.sessions[&sid].route.clone();
+                if let Some(mode) = grants.get(&route) {
+                    let session = v.sessions.get_mut(&sid).ok_or(AuthorityError::Store)?;
+                    session.mode = session.mode.min(*mode);
+                } else {
+                    end(&mut v, sid, EndReason::GrantRemoved, self.store.now_ms());
+                }
+            }
+            // Include active rows on retries: a failed reduction already narrowed memory.
+            v.sessions
+                .values()
+                .filter(|s| {
+                    s.principal == id
+                        && (s.state == SessionState::Active || v.pending.contains(&s.id))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let mut tx = self.store.write()?;
-        for (_, route) in &old {
-            tx.delete(Table::Grants, &keys::grant(id, route))?;
+        // Durable rows, rather than memory, retain routes removed by a failed attempt.
+        for (key, _) in tx.scan_prefix(Table::Grants, &keys::principal(id))? {
+            tx.delete(Table::Grants, &key)?;
         }
         for (route, mode) in &grants {
             tx.put(
@@ -559,13 +590,47 @@ impl Authority {
                 }),
             )?;
         }
-        tx.commit()?;
-        let mut v = self.view.write().unwrap();
-        v.grants.retain(|(p, _), _| *p != id);
-        for (route, mode) in grants {
-            v.grants.insert((id, route), mode);
+        let mut written = Vec::new();
+        for s in &rows {
+            let stored: AccessSession = decode(
+                &tx.get(Table::Sessions, &keys::session(s.id))?
+                    .ok_or(AuthorityError::Store)?,
+            )
+            .map_err(|_| AuthorityError::Store)?;
+            if s.state == SessionState::Active
+                && (stored.state != SessionState::Active || stored.mode == s.mode)
+            {
+                continue;
+            }
+            tx.put(Table::Sessions, &keys::session(s.id), &encode(s))?;
+            written.push(s.clone());
         }
-        Ok(())
+        tx.commit()?;
+        {
+            let mut v = self.view.write().unwrap();
+            v.grants.retain(|(p, _), _| *p != id);
+            for (route, mode) in grants {
+                v.grants.insert((id, route), mode);
+            }
+            for s in &written {
+                // Admission may have ended an active snapshot during the transaction.
+                if s.state != SessionState::Active {
+                    v.pending.remove(&s.id);
+                }
+                v.flushed.insert(s.id, s.last_used_ms);
+            }
+        }
+        let mut ended: Vec<_> = written
+            .into_iter()
+            .filter(|s| s.state != SessionState::Active)
+            .collect();
+        let drained = self.persist_pending();
+        if let Ok(rows) = &drained {
+            ended.extend(rows.iter().cloned());
+        }
+        drop(writer);
+        self.notify(&ended);
+        drained.map(|_| ())
     }
     /// Look up a principal by opaque identifier.
     pub fn principal(&self, id: PrincipalId) -> Option<Principal> {
@@ -1294,6 +1359,136 @@ mod tests {
         assert_eq!(
             f.a.admit(ro.id, Operation::Read).unwrap_err(),
             AdmitError::Ended
+        );
+    }
+    #[test]
+    fn removed_grant_ends_durably_and_readding_never_revives() {
+        let f = Fixture::new();
+        let p = f.principal("agent", Mode::ReadWrite);
+        let s = f.acquire(p.id, "rw");
+        f.a.set_grants(p.id, vec![]).unwrap();
+        for row in [f.a.session(s.id).unwrap(), f.stored(s.id)] {
+            assert_eq!(row.state, SessionState::Revoked);
+            assert_eq!(row.revoke_reason, Some(EndReason::GrantRemoved));
+            assert_eq!(row.ended_ms, Some(1000));
+        }
+        assert_eq!(
+            *f.hook.0.lock().unwrap(),
+            vec![(s.id, p.id, EndReason::GrantRemoved)]
+        );
+        f.a.set_grants(p.id, vec![(route(), Mode::ReadWrite)])
+            .unwrap();
+        assert_eq!(
+            f.a.admit(s.id, Operation::Read).unwrap_err(),
+            AdmitError::Ended
+        );
+        assert_eq!(f.a.session(s.id).unwrap().state, SessionState::Revoked);
+        assert_eq!(f.hook.0.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn grant_reduction_is_sticky_and_other_route_is_untouched() {
+        let f = Fixture::new();
+        let p = f.principal("agent", Mode::ReadWrite);
+        let other = RouteId::new("other").unwrap();
+        f.a.set_grants(
+            p.id,
+            vec![(route(), Mode::ReadWrite), (other.clone(), Mode::ReadWrite)],
+        )
+        .unwrap();
+        let s = f.acquire(p.id, "rw");
+        let mut req = request("other");
+        req.route = other.clone();
+        let untouched = f.a.acquire_session(p.id, req).unwrap();
+        for mode in [Mode::ReadOnly, Mode::ReadWrite] {
+            f.a.set_grants(
+                p.id,
+                vec![(route(), mode), (other.clone(), Mode::ReadWrite)],
+            )
+            .unwrap();
+            assert_eq!(
+                f.a.admit(s.id, Operation::Write).unwrap_err(),
+                AdmitError::ReadOnly
+            );
+            for row in [f.a.session(s.id).unwrap(), f.stored(s.id)] {
+                assert_eq!(row.mode, Mode::ReadOnly);
+                assert_eq!(row.expires_ms, s.expires_ms);
+                assert_eq!(row.created_ms, s.created_ms);
+            }
+            assert_eq!(
+                encode(&f.a.session(untouched.id).unwrap()),
+                encode(&untouched)
+            );
+            assert_eq!(encode(&f.stored(untouched.id)), encode(&untouched));
+        }
+        f.a.admit(untouched.id, Operation::Write).unwrap();
+        f.a.renew(p.id, s.id, Some(Mode::ReadWrite), None).unwrap();
+        f.a.admit(s.id, Operation::Write).unwrap();
+    }
+    #[test]
+    fn failed_grant_changes_remain_denied_and_retry_notifies_once() {
+        let f = Fixture::new();
+        let p = f.principal("agent", Mode::ReadWrite);
+        let s = f.acquire(p.id, "rw");
+        f.store.fail_commits(true);
+        assert_eq!(
+            f.a.set_grants(p.id, vec![(route(), Mode::ReadOnly)]),
+            Err(AuthorityError::Store)
+        );
+        assert_eq!(
+            f.a.admit(s.id, Operation::Write).unwrap_err(),
+            AdmitError::ReadOnly
+        );
+        assert_eq!(f.a.session(s.id).unwrap().mode, Mode::ReadOnly);
+        assert_eq!(f.stored(s.id).mode, Mode::ReadWrite);
+        assert_eq!(
+            f.a.set_grants(p.id, vec![(route(), Mode::ReadWrite)]),
+            Err(AuthorityError::Store)
+        );
+        assert_eq!(f.a.grant(p.id, &route()).unwrap(), Mode::ReadOnly);
+        assert_eq!(f.a.set_grants(p.id, vec![]), Err(AuthorityError::Store));
+        assert_eq!(
+            f.a.admit(s.id, Operation::Read).unwrap_err(),
+            AdmitError::Ended
+        );
+        assert_eq!(f.stored(s.id).state, SessionState::Active);
+        assert!(f.hook.0.lock().unwrap().is_empty());
+        assert_eq!(
+            f.a.set_grants(p.id, vec![(route(), Mode::ReadWrite)]),
+            Err(AuthorityError::Store)
+        );
+        assert_eq!(f.a.grant(p.id, &route()), Err(AuthorityError::NoGrant));
+        f.store.fail_commits(false);
+        f.a.set_grants(p.id, vec![]).unwrap();
+        let stored = f.stored(s.id);
+        assert_eq!(stored.state, SessionState::Revoked);
+        assert_eq!(stored.revoke_reason, Some(EndReason::GrantRemoved));
+        assert_eq!(f.hook.0.lock().unwrap().len(), 1);
+        f.a.set_grants(p.id, vec![]).unwrap();
+        assert_eq!(f.hook.0.lock().unwrap().len(), 1);
+        let loaded = Authority::load(f.store.clone(), SessionLimits::default()).unwrap();
+        assert_eq!(loaded.grant(p.id, &route()), Err(AuthorityError::NoGrant));
+        assert_eq!(
+            loaded.admit(s.id, Operation::Read).unwrap_err(),
+            AdmitError::Ended
+        );
+    }
+    #[test]
+    fn failed_grant_reduction_retry_persists_narrowed_session() {
+        let f = Fixture::new();
+        let p = f.principal("agent", Mode::ReadWrite);
+        let s = f.acquire(p.id, "rw");
+        f.store.fail_commits(true);
+        assert_eq!(
+            f.a.set_grants(p.id, vec![(route(), Mode::ReadOnly)]),
+            Err(AuthorityError::Store)
+        );
+        f.store.fail_commits(false);
+        f.a.set_grants(p.id, vec![(route(), Mode::ReadWrite)])
+            .unwrap();
+        assert_eq!(f.stored(s.id).mode, Mode::ReadOnly);
+        assert_eq!(
+            f.a.admit(s.id, Operation::Write).unwrap_err(),
+            AdmitError::ReadOnly
         );
     }
     #[test]

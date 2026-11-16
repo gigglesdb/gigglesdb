@@ -127,6 +127,11 @@ impl Authority {
         // Share the API's fail-closed ending primitive, including retries after failed commits.
         let rows = {
             let mut v = self.view.write().unwrap();
+            for c in &changed_credentials {
+                if c.state == CredentialState::Revoked {
+                    v.credentials.insert(c.id, c.clone());
+                }
+            }
             for p in principals
                 .values()
                 .filter(|p| p.source == PrincipalSource::Config && !names.contains(&p.name))
@@ -149,7 +154,16 @@ impl Authority {
         ) {
             tx.put(Table::Principals, &keys::principal(p.id), &encode(p))?;
         }
-        for c in &changed_credentials {
+        // Include previously revoked credentials when retrying a failed rotation.
+        for c in changed_credentials
+            .iter()
+            .chain(credentials.values().filter(|c| {
+                c.state == CredentialState::Revoked
+                    && principals
+                        .get(&c.principal)
+                        .is_some_and(|p| p.source == PrincipalSource::Config)
+            }))
+        {
             tx.put(
                 Table::PrincipalCredentials,
                 &keys::principal_credential(c.principal, c.id),
@@ -322,6 +336,54 @@ mod tests {
         drop(store);
         drop(hook);
         drop(dir);
+    }
+    #[test]
+    fn failed_credential_rotation_denies_old_and_new_until_retry() {
+        let f = Fixture::new();
+        let original = entry("standing");
+        f.a.sync_config_principals(std::slice::from_ref(&original))
+            .unwrap();
+        let p = f.a.principal_by_name("standing").unwrap();
+        f.a.set_grants(p.id, vec![(route(), Mode::ReadWrite)])
+            .unwrap();
+        let session = f.acquire(p.id, "active");
+        let changed = ConfigPrincipal {
+            name: "standing".into(),
+            verifier: Verifier(ScramVerifier::from_password(
+                "rotated-test-password",
+                b"salt",
+                1,
+            )),
+        };
+        f.store.fail_commits(true);
+        assert_eq!(
+            f.a.sync_config_principals(std::slice::from_ref(&changed))
+                .unwrap_err(),
+            AuthorityError::Store
+        );
+        assert!(f.a.principal_credential_verifiers(p.id).is_empty());
+        f.a.admit(session.id, Operation::Write).unwrap();
+        assert_eq!(f.a.session(session.id).unwrap().state, SessionState::Active);
+        assert!(f.hook.0.lock().unwrap().is_empty());
+        f.store.fail_commits(false);
+        assert_eq!(
+            f.a.sync_config_principals(std::slice::from_ref(&changed))
+                .unwrap()
+                .updated,
+            1
+        );
+        let verifiers = f.a.principal_credential_verifiers(p.id);
+        assert_eq!(verifiers.len(), 1);
+        assert!(verifiers[0].0.to_pg_string() == changed.verifier.0.to_pg_string());
+        let loaded = Authority::load(f.store.clone(), SessionLimits::default()).unwrap();
+        let verifiers = loaded.principal_credential_verifiers(p.id);
+        assert_eq!(verifiers.len(), 1);
+        assert!(verifiers[0].0.to_pg_string() == changed.verifier.0.to_pg_string());
+        assert_eq!(
+            loaded.session(session.id).unwrap().state,
+            SessionState::Active
+        );
+        assert!(f.hook.0.lock().unwrap().is_empty());
     }
     type Snapshot = Vec<(Table, Vec<(Vec<u8>, Vec<u8>)>)>;
     fn snapshot(a: &Authority) -> Snapshot {

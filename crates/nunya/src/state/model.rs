@@ -123,6 +123,8 @@ pub enum EndReason {
     Expired,
     /// Session ended for this reason.
     IdleTimeout,
+    /// The principal no longer grants the session route.
+    GrantRemoved,
 }
 impl Mode {
     /// Return the more restrictive of two modes.
@@ -147,6 +149,7 @@ impl EndReason {
             Self::ConfigRemoved => "config_removed",
             Self::Expired => "expired",
             Self::IdleTimeout => "idle_timeout",
+            Self::GrantRemoved => "grant_removed",
         }
     }
 }
@@ -733,6 +736,7 @@ mod tests {
             EndReason::ConfigRemoved,
             EndReason::Expired,
             EndReason::IdleTimeout,
+            EndReason::GrantRemoved,
         ] {
             assert_eq!(encode(&reason), encode(&reason.as_str()));
         }
