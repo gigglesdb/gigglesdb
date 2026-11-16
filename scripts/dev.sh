@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     echo 'Usage: dev.sh [--task|-Task TASK] [--crate|-Crate NAME] [--release|-Release] [--work|-Work PATH] [--port|-Port PORT]' >&2
-    echo 'Tasks: setup fresh-setup dev-server dev-server-v2 server ping server-query sql sql-query native-query capabilities backup export topology outbox-example failover distributed faultlab range-history check build test clippy fmt docs' >&2
+    echo 'Tasks: setup fresh-setup dev-server dev-server-v2 server ping server-query sql sql-query native-query capabilities backup export topology outbox-example failover distributed range-history check build test clippy fmt docs' >&2
     exit 2
 }
 die() { echo "$*" >&2; exit 1; }
@@ -23,7 +23,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 case "$task" in
-    setup|fresh-setup|dev-server|dev-server-v2|server|ping|server-query|sql|sql-query|native-query|capabilities|backup|export|topology|outbox-example|failover|distributed|faultlab|range-history|check|build|test|clippy|fmt|docs) ;;
+    setup|fresh-setup|dev-server|dev-server-v2|server|ping|server-query|sql|sql-query|native-query|capabilities|backup|export|topology|outbox-example|failover|distributed|range-history|check|build|test|clippy|fmt|docs) ;;
     *) usage ;;
 esac
 case "$port" in ''|*[!0-9]*) usage ;; esac
@@ -193,12 +193,6 @@ case "$task" in
         fi
         for name in "${names[@]}"; do
             echo "=== $task $name ($profile) ==="
-            if [ "$task" = test ] && { [ "$name" = giggles-client ] || [ "$name" = giggles-faultlab ]; }; then
-                build=(build --locked --bin giggles-node)
-                if "$release"; then build+=(--release); fi
-                invoke_cargo giggles-consensus "${build[@]}"
-                export GIGGLES_NODE_EXE="$CARGO_TARGET_DIR/$profile/giggles-node$suffix"
-            fi
             case "$task" in
                 fmt) arguments=(fmt -- --check) ;;
                 clippy) arguments=(clippy --locked --all-targets) ;;
@@ -225,13 +219,9 @@ case "$task" in
     capabilities) invoke_binary giggles-language giggles-language capability-manifest ;;
     topology) invoke_binary giggles-topology giggles-topology analyze "$root/crates/giggles-topology/tests/fixtures/three-providers.json" baseline ;;
     outbox-example) destination=$(new_output); invoke_cargo giggles-outbox run --locked --example orders -- "$destination/orders.db" ;;
-    failover) invoke_cargo giggles-consensus test --locked --test process real_three_process_mtls_failover_snapshot_and_lost_ack -- --exact --nocapture ;;
+    failover) invoke_cargo giggles-server test --locked --test all replication_process::three_process_failover -- --exact --nocapture ;;
     distributed) invoke_cargo giggles-distributed test --locked --test process -- --test-threads=1 --nocapture ;;
     range-history) invoke_cargo giggles-range-history test --locked --test process -- --test-threads=1 --nocapture ;;
-    faultlab)
-        invoke_cargo giggles-consensus build --locked --bin giggles-node
-        invoke_binary giggles-faultlab giggles-faultlab run "$CARGO_TARGET_DIR/debug/giggles-node$suffix" 1
-        ;;
     *)
         # Validate state before dispatch, as in dev.ps1.
         directory=$(state directory)

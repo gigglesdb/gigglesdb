@@ -173,8 +173,7 @@ Responses are JSON. Ping should return `"code":"ok"`; the SELECT should return
 the inserted ID and text in its SQL result. Repeating the INSERT with the same
 primary key returns an error; choose another ID or issue an UPDATE.
 
-This `giggles-client` binary belongs to **`giggles-server`**. The separately named
-`crates/giggles-client` SDK targets the replicated task protocol. Each invocation
+This `giggles-client` binary belongs to **`giggles-server`**. Each invocation
 of the helper above opens a new connection, so use a persistent client connection
 for multi-statement transactions.
 
@@ -264,43 +263,34 @@ The local shell has trusted access to the database files. See the
 
 Start with the [SQL compatibility reference](crates/giggles-core/SQL.md),
 [distributed runtime guide](crates/giggles-distributed/README.md),
-[Rust client](crates/giggles-client/README.md), or
+[replication release notes](docs/release-notes/R4.md), or
 [native language guide](crates/giggles-language/README.md).
 Each crate documents its supported behavior and current limits.
 
 ## Run multiple nodes
 
 The single-host server above does **not** become replicated by starting multiple
-copies. The distributed binaries use their own configurations and storage files:
+copies. A replicated database runs `giggles-server` in replicated mode on three
+machines, each with a `replication` section in its configuration:
 
 | Binary | Use |
 | --- | --- |
-| `giggles-server` | Single-host application SQL and scoped task service |
-| `giggles-node` (`giggles-consensus`) | Three-voter single-range consensus and replicated task interfaces |
+| `giggles-server` | Single-host application SQL and scoped task service; with a `replication` section, one voter of a three-voter replicated database |
 | `giggles-ranges` (`giggles-distributed`) | Multi-range runtime, transactions and membership operations through trusted owner controls |
 
 To exercise a real three-process cluster with generated mTLS credentials, run
 from the repository root:
 
 ```powershell
-cd crates/giggles-consensus
-cargo test --locked --test process real_three_process_mtls_failover_snapshot_and_lost_ack -- --exact --nocapture
+cd crates/giggles-server
+cargo test --locked --test all replication_process::three_process_failover -- --exact --nocapture
 ```
 
-This launches actual node processes, exercises failover and retains their
-configuration and evidence. For manual startup, use the retained per-node
-configuration paths, one terminal per voter:
-
-```powershell
-cargo run --locked --bin giggles-node -- PATH/TO/node-1.json
-```
-
-Start the other voters with their own configurations and database files. Follow
-the [consensus guide](crates/giggles-consensus/README.md) for peer identities,
-existing-store startup and task listener provisioning, or the
+This launches three actual server processes, kills the leader and reconnects
+with a multi-host connection string. The
+[replication release notes](docs/release-notes/R4.md) describe the configuration,
+how clients connect, lost replies and replacing a lost machine. See the
 [multi-range guide](crates/giggles-distributed/README.md) for `giggles-ranges`.
-These interfaces have different capabilities; the single-host application SQL
-quickstart is not a replicated SQL deployment recipe.
 
 ## Development
 

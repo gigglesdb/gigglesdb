@@ -8,8 +8,7 @@ and snapshots. The peer listener accepts authenticated Raft messages and bounded
 
 This is an owner-controlled typed row API, using GigglesDB core `Key`, `Row` and
 kernel images. It does not provide distributed application SQL or protected task
-transactions. Existing `giggles-node` native/pgwire TASK service remains separate.
-There is no automatic migration or split of that service's task-bearing image.
+transactions.
 
 ## Start three voters
 

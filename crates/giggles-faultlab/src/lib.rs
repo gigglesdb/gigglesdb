@@ -1,4 +1,4 @@
-//! Bounded local TCP fault rehearsal. Synthetic domains are not cloud qualification.
+//! Bounded local TCP fault proxy. Synthetic domains are not cloud qualification.
 //!
 //! ```no_run
 //! use giggles_faultlab::proxy::{Proxy, ProxyLimits, Direction, Fault};
@@ -12,9 +12,7 @@
 //! # Ok(())
 //! # }
 //! ```
-pub mod lab;
 pub mod process;
 pub mod proxy;
-pub mod report;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

@@ -1,14 +1,23 @@
 # giggles-history-runtime
 
-Independent external capture harness for the current bounded consensus runtime.
+> **Retired target.** This harness drove the `giggles-node` replication
+> prototype (`crates/giggles-consensus`), which was removed after R4's exit
+> evidence (GD-0074 Phase 8). Its process test was removed with it. Replicated
+> `giggles-server` histories are captured and checked by
+> `crates/giggles-server/tests/replication_history.rs` with `giggles-history`;
+> see [the replication release notes](../../docs/release-notes/R4.md). The
+> library is kept for reference and history tooling reuse; it has no runnable
+> target binary on main.
+
+Independent external capture harness for the former bounded consensus runtime.
 Runs **actual three-node processes**, with distinct retained redb files and
 generated mTLS peer certificates. It links only the history checker, JSON,
 certificate generation and hashing libraries. It never imports a runtime
 evaluator or computes expected results with runtime code.
 
 ```powershell
-cargo build --locked --manifest-path crates/giggles-consensus/Cargo.toml --bin giggles-node -j 2 --target-dir crates/giggles-history-runtime/target/owner-node
-cargo run --manifest-path crates/giggles-history-runtime/Cargo.toml -j 2 -- crates/giggles-history-runtime/target/owner-node/debug/giggles-node.exe crates/giggles-history-runtime/artifacts 42
+# NODE_BINARY was a giggles-node build from an older commit (before GD-0074 Phase 8).
+cargo run --manifest-path crates/giggles-history-runtime/Cargo.toml -j 2 -- PATH/TO/giggles-node.exe crates/giggles-history-runtime/artifacts 42
 ```
 
 The CLI takes `NODE_BINARY ARTIFACT_PARENT SEED`. Each run creates a unique
@@ -108,14 +117,10 @@ PostgreSQL comparative CONTROL remains deferred.
 ```powershell
 cargo fmt --manifest-path crates/giggles-history-runtime/Cargo.toml --check
 cargo clippy --manifest-path crates/giggles-history-runtime/Cargo.toml -j 2 --all-targets -- -D warnings
-cargo test --manifest-path crates/giggles-history-runtime/Cargo.toml -j 2
-cargo test --manifest-path crates/giggles-history-runtime/Cargo.toml -j 2 --release
 cargo test --manifest-path crates/giggles-history-runtime/Cargo.toml -j 2 --doc
 cargo doc --manifest-path crates/giggles-history-runtime/Cargo.toml -j 2 --no-deps
 ```
 
-The integration test builds the actual node with `--locked` and writes all
-build outputs inside this crate, then runs the actual harness CLI for seeds42,43.
-Owner source hashes before/after the node build must agree and are retained.
-It replays original and negative histories and verifies event ordering and
-process/fault evidence. Raw test/build/CLI logs remain in unique artifact dirs.
+The process integration test, which built `giggles-node` from
+`crates/giggles-consensus` and ran the harness CLI for seeds 42 and 43, was
+removed with the prototype (GD-0074 Phase 8).

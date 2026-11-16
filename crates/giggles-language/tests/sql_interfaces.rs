@@ -118,8 +118,8 @@ fn sql_interface_inventory_keeps_authority_and_support_distinct() {
             assert!(limits.contains(limit.as_str()), "unknown limit: {limit}");
         }
     }
-    // In particular, the SDK and conformance harness cannot become SQL support
-    // merely because they transport finite typed repair requests.
+    // In particular, the bundled client cannot become SQL support merely
+    // because it transports requests.
     let expected = BTreeSet::from([
         ("core_admin_relational", "relational"),
         ("core_executor_repair", "finite_repair"),
@@ -133,8 +133,6 @@ fn sql_interface_inventory_keeps_authority_and_support_distinct() {
         ("server_task_repair", "finite_repair"),
         ("server_task_prepared", "finite_repair"),
         ("server_bundled_client", "transport_only"),
-        ("consensus_sdk", "none"),
-        ("client_conformance", "none"),
     ]);
     assert_eq!(actual, expected);
     let ids: BTreeSet<_> = inventory.interfaces.iter().map(|i| &i.id).collect();

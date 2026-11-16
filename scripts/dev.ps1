@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('setup','fresh-setup','dev-server','server','ping','server-query','sql','sql-query','native-query','capabilities','backup','export','topology','outbox-example','failover','distributed','faultlab','range-history','check','build','test','clippy','fmt','docs')]
+    [ValidateSet('setup','fresh-setup','dev-server','server','ping','server-query','sql','sql-query','native-query','capabilities','backup','export','topology','outbox-example','failover','distributed','range-history','check','build','test','clippy','fmt','docs')]
     [string]$Task = 'setup',
     [string]$Crate = 'all',
     [switch]$Release,
@@ -106,12 +106,6 @@ try {
         if ($Crate -eq 'all') { $names = @(Get-ChildItem "$root/crates" -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'Cargo.toml') } | Sort-Object Name | ForEach-Object Name) }
         foreach ($name in $names) {
             Write-Host "=== $Task $name ($profile) ==="
-            if ($Task -eq 'test' -and $name -in @('giggles-client','giggles-faultlab')) {
-                $nodeBuild = @('build','--locked','--bin','giggles-node')
-                if ($Release) { $nodeBuild += '--release' }
-                Invoke-Cargo 'giggles-consensus' $nodeBuild
-                $env:GIGGLES_NODE_EXE = Join-Path $env:CARGO_TARGET_DIR "$profile/giggles-node.exe"
-            }
             $arguments = switch ($Task) {
                 'fmt' { @('fmt','--','--check') }
                 'clippy' { @('clippy','--locked','--all-targets') }
@@ -134,13 +128,9 @@ try {
             $destination = New-OutputDirectory
             Invoke-Cargo 'giggles-outbox' @('run','--locked','--example','orders','--',"$destination/orders.db")
         }
-        'failover' { Invoke-Cargo 'giggles-consensus' @('test','--locked','--test','process','real_three_process_mtls_failover_snapshot_and_lost_ack','--','--exact','--nocapture') }
+        'failover' { Invoke-Cargo 'giggles-server' @('test','--locked','--test','all','replication_process::three_process_failover','--','--exact','--nocapture') }
         'distributed' { Invoke-Cargo 'giggles-distributed' @('test','--locked','--test','process','--','--test-threads=1','--nocapture') }
         'range-history' { Invoke-Cargo 'giggles-range-history' @('test','--locked','--test','process','--','--test-threads=1','--nocapture') }
-        'faultlab' {
-            Invoke-Cargo 'giggles-consensus' @('build','--locked','--bin','giggles-node')
-            Invoke-Binary 'giggles-faultlab' 'giggles-faultlab' @('run',"$env:CARGO_TARGET_DIR/debug/giggles-node.exe",'1')
-        }
         default {
             $state = Read-State
             switch ($Task) {
