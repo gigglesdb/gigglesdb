@@ -2326,7 +2326,7 @@ async fn serve_management_acquire_and_pg_login() -> TransportResult {
     let (session, secret) = acquire_session_through_serve(management, &admin, "managed-agent").await?;
     let mut connected = None;
     let mut agent = tokio_postgres::Config::new();
-    agent.host("127.0.0.1").port(listen).user(&format!("session:{}", session.id))
+    agent.host("127.0.0.1").port(listen).user(format!("session:{}", session.id))
         .password(secret.secret.as_bytes()).dbname("app");
     for _ in 0..100 {
         assert!(!server.0.is_finished(), "gateway stopped during startup");
