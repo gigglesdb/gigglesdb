@@ -137,9 +137,9 @@ fn qualified_sequences_match_sql() {
         }
         assert_eq!(engine.execute_sequence_catalog(&create("nope.s")), Err(err("3F000")));
         assert_eq!(sql(&mut reference, "CREATE SEQUENCE nope.s"), Err(err("3F000")));
-        // Repo SQL reports a missing relation (42P01); PG18 reports missing schema (3F000).
-        assert_eq!(engine.execute_sequence_catalog(&drop_sequence("nope.s", false)), Err(err("42P01")));
-        assert_eq!(sql(&mut reference, "DROP SEQUENCE nope.s"), Err(err("42P01")));
+        // PostgreSQL distinguishes a missing explicit schema from a missing relation.
+        assert_eq!(engine.execute_sequence_catalog(&drop_sequence("nope.s", false)), Err(err("3F000")));
+        assert_eq!(sql(&mut reference, "DROP SEQUENCE nope.s"), Err(err("3F000")));
         engine.execute_sequence_catalog(&drop_sequence("app.s", false)).unwrap();
         sql(&mut reference, "DROP SEQUENCE app.r").unwrap();
         assert_eq!(native.execute_sequence_native(&S::Nextval("s".into())), Ok(2));

@@ -151,8 +151,8 @@ fn qualified_defaults_match_sql() {
                 assert_eq!(text(a.id), text(b.id));
                 assert_eq!(presentation.identities.get(&a.id), presentation.identities.get(&b.id));
             }
-            // Repo SQL quotes canonical qualified regclass text; PG18 prints app.s here.
-            assert_eq!(presentation.defaults.get(&native.columns[2].id).unwrap(), r#"nextval('"app"."s"'::regclass)"#);
+            // Presentation uses PostgreSQL regclass qualification without changing stored text.
+            assert_eq!(presentation.defaults.get(&native.columns[2].id).unwrap(), r#"nextval('app.s'::regclass)"#);
             let owners = sql.sequence_owners().unwrap();
             for prefix in ["n", "s"] {
                 assert!(owners.contains(&(format!("app\0{prefix}_{suffix}_id_seq"), Some(format!("app\0{prefix}_{suffix}")))));

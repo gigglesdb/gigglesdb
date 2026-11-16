@@ -31,7 +31,11 @@ pub struct CatalogPresentation {
     pub constraints: Vec<CatalogConstraint>,
 }
 impl Relational {
+    #[cfg(test)]
     pub(crate) fn catalog_presentation(&self) -> R<CatalogPresentation> {
+        self.catalog_presentation_in_path(&["public".into()])
+    }
+    pub(crate) fn catalog_presentation_in_path(&self, path: &[String]) -> R<CatalogPresentation> {
         let mut out = CatalogPresentation { epoch: self.epoch, ..Default::default() };
         let action = |a: &Action| match a {
             Action::NoAction => 'a', Action::Restrict => 'r', Action::Cascade => 'c',
@@ -45,7 +49,7 @@ impl Relational {
                 if let Some(identity) = self.column_identity(column.id) {
                     out.identities.insert(column.id, if identity.always { 'a' } else { 'd' });
                 } else if let Some(sql) = self.column_default(column.id) {
-                    out.defaults.insert(column.id, sql.to_owned());
+                    out.defaults.insert(column.id, defaults::present_default(self, sql, path));
                 }
             }
             for c in self.table_constraints(table.id) {

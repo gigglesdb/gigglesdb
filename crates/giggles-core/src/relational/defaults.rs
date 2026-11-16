@@ -501,6 +501,10 @@ pub(super) fn execute_sequence(state: &mut Relational, ddl: &SequenceDdl) -> R<u
         } => {
             // Resolve the whole list against a private candidate: failure is atomic.
             for name in names {
+                if let Err(error) = candidate.require_relation_schema(name) {
+                    if *optional { continue; }
+                    return Err(error);
+                }
                 let Some((&id, seq)) = candidate
                     .ext
                     .sequences
@@ -805,6 +809,35 @@ pub(super) fn normalize_r1_sequence_defaults(
         }
     }
     Ok(())
+}
+
+// Deparse sequence references for the reader without changing stored defaults.
+pub(super) fn present_default(state: &Relational, sql: &str, path: &[String]) -> String {
+    fn present(state: &Relational, value: &mut Expression, path: &[String]) -> R<bool> {
+        match value {
+            Expression::Sequence(name) => {
+                let key = crate::storage::sequences::sequence_name(name)?;
+                let (schema, local) = split_key(&key);
+                let local_ref = sequence_reference(local);
+                *name = if state.resolve_relation_key(local, path) == key {
+                    local_ref
+                } else {
+                    format!("{}.{}", sequence_reference(schema), local_ref)
+                };
+                Ok(true)
+            }
+            Expression::Cast(value, _) | Expression::Negative(value) => present(state, value, path),
+            _ => Ok(false),
+        }
+    }
+    let Ok(tokens) = lex(&format!("{sql},")) else { return sql.to_owned() };
+    let mut parser = Parser { tokens, at: 0,
+        params: BTreeSet::new(), relations: Vec::new() };
+    let Ok(mut value) = expression(&mut parser, 0) else { return sql.to_owned() };
+    if parser.at + 1 != parser.tokens.len() || parser.tokens.get(parser.at) != Some(&Token::Symbol(',')) {
+        return sql.to_owned();
+    }
+    if matches!(present(state, &mut value, path), Ok(true)) { value.sql() } else { sql.to_owned() }
 }
 
 pub(super) fn default_sql(state: &Relational, column: &ColumnDef) -> Option<String> {
@@ -1396,6 +1429,13 @@ pub(super) fn parse_alter_untyped(p: &mut Parser) -> R<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn present_default_preserves_sql_when_reparsing_fails() {
+        let state = Relational::default();
+        for sql in ["'unterminated", "unknown_function()", "1 2", "nextval('')", " 0007 "] {
+            assert_eq!(present_default(&state, sql, &[]), sql, "{sql}");
+        }
+    }
     #[test]
     fn sequence_metadata_uses_existing_wire_and_unique_incarnations() {
         let mut state = Relational::default();

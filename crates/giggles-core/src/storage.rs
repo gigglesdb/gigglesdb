@@ -220,10 +220,16 @@ impl MetadataSql<'_> {
         metadata.epoch = self.epoch;
         metadata
     }
-    fn catalog_presentation(
+    // Both shadow the image's methods so session reads keep the V2 epoch, comments and
+    // views; without the 0-arg form, Deref would reach the raw image.
+    fn catalog_presentation(&self) -> Result<relational::CatalogPresentation, relational::SqlError> {
+        self.catalog_presentation_in_path(&["public".into()])
+    }
+    fn catalog_presentation_in_path(
         &self,
+        path: &[String],
     ) -> Result<relational::CatalogPresentation, relational::SqlError> {
-        let mut metadata = self.image.catalog_presentation()?;
+        let mut metadata = self.image.catalog_presentation_in_path(path)?;
         metadata.epoch = self.epoch;
         metadata.comments = self.comments.cloned().unwrap_or_default();
         metadata.views = self.views.into_iter().flatten().map(|(&id, v)| (id, relational::CatalogView {
@@ -2050,7 +2056,7 @@ impl SqlSession {
     /// Coherent catalog metadata, including V2 transaction-private DDL.
     pub fn catalog_metadata(&self) -> Result<CatalogMetadata, CoreError> {
         let read = |s: &MetadataState<'_>| {
-            let presentation = s.sql.catalog_presentation().map_err(CoreError::Sql)?;
+            let presentation = s.sql.catalog_presentation_in_path(&self.search_path).map_err(CoreError::Sql)?;
             let tables = s.sql.tables.values().cloned().chain(presentation.views.values().map(|v| v.table.clone())).collect();
             Ok(CatalogMetadata {
                 presentation, tables,

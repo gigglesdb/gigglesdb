@@ -256,6 +256,10 @@ impl Prepared {
         self.schema_user = user;
     }
     pub(crate) fn validate_schemas(&self, state: &Relational) -> R<()> {
+        // DROP SEQUENCE validates schemas in name order during execution.
+        if matches!(&self.statement, Statement::Sequence(defaults::SequenceDdl::Drop { .. })) {
+            return Ok(());
+        }
         // Typed index operations can carry their target without parser references.
         if let Statement::DropIndex(index) = &self.statement && !index.optional {
             state.require_relation_schema(&index.name)?;

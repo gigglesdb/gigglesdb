@@ -473,3 +473,5 @@ mod native_catalog_session;
 mod parity_insert_duplicate_column;
 
 #[path = "parity_update_eval_order.rs"] mod parity_update_eval_order;
+
+#[path = "parity_sequence_schema.rs"] mod parity_sequence_schema;
