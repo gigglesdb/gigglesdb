@@ -12,7 +12,7 @@ fn logical_terms(e: &A, op: &Op, pretty: bool, precedence: u8, terms: &mut Vec<S
     }
     Ok(())
 }
-fn expr(e: &A, pretty: bool, parent: u8) -> R<String> {
+pub(super) fn expr(e: &A, pretty: bool, parent: u8) -> R<String> {
     let (s, precedence, operator) = match e {
         A::Nested(e) => return expr(e, pretty, parent),
         A::Identifier(i) => (ident(i), 9, false),

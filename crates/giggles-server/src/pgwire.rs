@@ -21,6 +21,8 @@ mod copy_in;
 mod settings_functions;
 #[path = "pgwire_simple.rs"]
 mod simple;
+#[path = "pgwire_explain.rs"]
+mod explain;
 use copy_in::{CopyIn, is_copy_sql};
 use simple::{execute_settings, parse_settings, settings_status, show_settings};
 #[path = "pgwire_cursor.rs"]
@@ -858,6 +860,7 @@ fn prepare_protected_sql(
 
 #[derive(Clone)]
 enum Plan {
+    Explain(giggles_pg_catalog::ExplainQuery),
     Empty,
     Cursor(cursor::Command),
     AccessShare(crate::auth::statements::TableLockRequest),
@@ -905,7 +908,7 @@ impl Statement {
                 core(session.copy_columns(copy, p))?;
                 Ok(self.d.clone())
             }
-            Plan::Cursor(_)
+            Plan::Explain(_) | Plan::Cursor(_)
             | Plan::Task(_)
             | Plan::AccessShare(_)
             | Plan::Admin(_)
@@ -1222,6 +1225,8 @@ impl State {
             // exists; they get the same 42501 that application prepare gives them.
             self.diagnostic.phase = "application prepare";
             return Err("42501");
+        } else if let Some(query) = explain::prepare(sql, session)? {
+            (Plan::Explain(query), explain::description())
         } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic, session)? {
             let (epoch, _, _) = core(session.catalog_snapshot())?;
             let fields = giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
@@ -1729,6 +1734,21 @@ impl State {
                     } else {
                         catalog_complete(result.rows.len(), out)?;
                     }
+                    return Ok(true);
+                }
+                if let Plan::Explain(query) = &p.s.p {
+                    begin_implicit(session, &mut self.implicit, &mut self.settings)?;
+                    if p.result.is_none() {
+                        p.result = Some(explain::execute(query, session)?);
+                    }
+                    let result = p.result.as_ref().unwrap();
+                    let end = if max == 0 { result.rows.len() }
+                        else { p.at.saturating_add(max as usize).min(result.rows.len()) };
+                    rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
+                        result, &p.s.d, &p.formats, p.at, end, out)?;
+                    p.at = end;
+                    if end < result.rows.len() { frame(b's', &[], out)?; }
+                    else { complete("EXPLAIN", result, out)?; }
                     return Ok(true);
                 }
                 if matches!(p.s.p, Plan::Empty) {

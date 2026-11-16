@@ -1,5 +1,7 @@
 // Each file keeps its own support modules, exactly as when it was its own binary.
 #![allow(clippy::duplicate_mod)]
+#[path = "explain_text_network.rs"]
+mod explain_text_network;
 #[path = "view_select_network.rs"]
 mod view_select_network;
 #[path = "comments_network.rs"]

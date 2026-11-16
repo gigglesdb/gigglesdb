@@ -425,6 +425,14 @@ impl State {
             // exists; they get the same 42501 that application prepare gives them.
             self.diagnostic.phase = "application SQL";
             return Err("42501");
+        } else if let Some(query) = explain::prepare(sql, session)? {
+            self.settings.queried = session.in_transaction();
+            let result = explain::execute(&query, session)?;
+            let description = explain::description();
+            row_description(&description, &[], out)?;
+            rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
+                &result, &description, &[], 0, result.rows.len(), out)?;
+            complete("EXPLAIN", &result, out)?;
         } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic, session)? {
             self.diagnostic.phase = "catalog execution";
             self.settings.queried = session.in_transaction();

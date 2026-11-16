@@ -35,6 +35,9 @@ pub const CAPABILITIES: &str =
     "add_column_if_not_exists,role_session_termination,server_encoding,union_common_type";
 
 pub use engine::catalog_identifier;
+pub use engine::explain::{ExplainQuery, explain_query, explain_statement};
+/// Quote an identifier for PostgreSQL plan text using the catalog's rules.
+pub fn quote_explain_identifier(name: &str) -> String { catalog::quote_identifier(name) }
 mod engine;
 pub use engine::{
     Plan, describe, execute, execute_with_startup, plan, plan_gateway, plan_gateway_with_relations,

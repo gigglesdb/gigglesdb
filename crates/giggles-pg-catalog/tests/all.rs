@@ -134,3 +134,5 @@ mod lateral_unnest;
 #[path = "locks_timezone_parity.rs"] mod locks_timezone_parity;
 
 #[path = "viewdef_parity.rs"] mod viewdef_parity;
+#[path = "explain_text.rs"]
+mod explain_text;

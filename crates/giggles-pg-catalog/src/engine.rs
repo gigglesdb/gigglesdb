@@ -4,6 +4,7 @@ mod numeric_literals;
 mod join_selection;
 mod regtype;
 mod viewdef;
+pub(crate) mod explain;
 mod subscripts;
 #[cfg(test)]
 mod gui_properties;

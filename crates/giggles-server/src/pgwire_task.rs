@@ -28,6 +28,7 @@ pub(super) fn plan_class(plan: &Plan) -> Option<StatementClass> {
     use crate::pg_transaction::Command as C;
     Some(match plan {
         Plan::Empty => return None,
+        Plan::Explain(_) => StatementClass::Explain,
         Plan::Cursor(_) => StatementClass::Cursor,
         Plan::AccessShare(_) => StatementClass::Lock,
         Plan::Admin(A::DropTable(..)) => StatementClass::Ddl,
@@ -629,6 +630,7 @@ impl State {
             }
             // Prepare admitted none of these; refuse rather than run them.
             Plan::Empty
+            | Plan::Explain(_)
             | Plan::Cursor(_)
             | Plan::AccessShare(_)
             | Plan::Admin(_)
