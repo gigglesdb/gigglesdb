@@ -275,7 +275,7 @@ pub struct Grant {
 }
 
 /// Durable AccessSession record.
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessSession {
     /// Stored id.
@@ -306,6 +306,26 @@ pub struct AccessSession {
     pub label: Option<String>,
     /// Stored isolated.
     pub isolated: bool,
+}
+impl fmt::Debug for AccessSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccessSession")
+            .field("id", &self.id)
+            .field("principal", &self.principal)
+            .field("route", &self.route)
+            .field("mode", &self.mode)
+            .field("scope", &self.scope)
+            .field("created_ms", &self.created_ms)
+            .field("expires_ms", &self.expires_ms)
+            .field("idle_timeout_ms", &self.idle_timeout_ms)
+            .field("last_used_ms", &self.last_used_ms)
+            .field("state", &self.state)
+            .field("revoke_reason", &self.revoke_reason)
+            .field("ended_ms", &self.ended_ms)
+            .field("label", &"[REDACTED]")
+            .field("isolated", &self.isolated)
+            .finish()
+    }
 }
 
 /// Durable SessionCredential record.
@@ -372,7 +392,7 @@ impl fmt::Debug for TokenScope {
 }
 
 /// Durable IdempotencyRecord record.
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdempotencyRecord {
     /// Stored principal.
@@ -384,6 +404,16 @@ pub struct IdempotencyRecord {
     pub request_hash: [u8; 32],
     /// Stored result.
     pub result: String,
+}
+impl fmt::Debug for IdempotencyRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IdempotencyRecord")
+            .field("principal", &self.principal)
+            .field("key", &"[REDACTED]")
+            .field("request_hash", &"[REDACTED]")
+            .field("result", &self.result)
+            .finish()
+    }
 }
 
 /// Data-free malformed stored-record error.
@@ -656,6 +686,37 @@ mod tests {
                 verifier().0.to_pg_string(),
             ] {
                 assert!(!text.contains(&secret));
+            }
+        }
+    }
+    #[test]
+    fn session_labels_and_idempotency_inputs_are_redacted() {
+        let session = AccessSession {
+            id: SessionId([1; 16]),
+            principal: PrincipalId([2; 16]),
+            route: route(),
+            mode: Mode::ReadOnly,
+            scope: ScopeId([3; 16]),
+            created_ms: 100,
+            expires_ms: 900,
+            idle_timeout_ms: None,
+            last_used_ms: 100,
+            state: SessionState::Active,
+            revoke_reason: None,
+            ended_ms: None,
+            label: Some("PRIVATE-LABEL".into()),
+            isolated: false,
+        };
+        let record = IdempotencyRecord {
+            principal: session.principal,
+            key: "PRIVATE-KEY".into(),
+            request_hash: [0xab; 32],
+            result: session.id.to_hex(),
+        };
+        for text in [format!("{session:?}"), format!("{record:?}")] {
+            assert!(text.contains("[REDACTED]"));
+            for marker in ["PRIVATE-LABEL", "PRIVATE-KEY", "abab", "171, 171"] {
+                assert!(!text.contains(marker));
             }
         }
     }

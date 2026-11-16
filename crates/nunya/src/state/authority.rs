@@ -205,6 +205,18 @@ fn end_principal(view: &mut View, id: PrincipalId, reason: EndReason, now: u64) 
         end(view, sid, reason, now);
     }
 }
+fn secret_matches(key: &[u8; 32], digest: &[u8; 32]) -> bool {
+    let Ok(mut candidate) = Hmac::<Sha256>::new_from_slice(key) else {
+        return false;
+    };
+    candidate.update(digest);
+    let tag = candidate.finalize().into_bytes();
+    let Ok(mut stored) = Hmac::<Sha256>::new_from_slice(key) else {
+        return false;
+    };
+    stored.update(key);
+    stored.verify_slice(&tag).is_ok()
+}
 impl Authority {
     /// Load and validate every application table before accepting requests.
     pub fn load(store: Arc<dyn Store>, limits: SessionLimits) -> Result<Arc<Self>, AuthorityError> {
@@ -624,13 +636,10 @@ impl Authority {
             .into_iter()
             .filter(|s| s.state != SessionState::Active)
             .collect();
-        let drained = self.persist_pending();
-        if let Ok(rows) = &drained {
-            ended.extend(rows.iter().cloned());
-        }
+        ended.extend(self.drain_pending_best_effort());
         drop(writer);
         self.notify(&ended);
-        drained.map(|_| ())
+        Ok(())
     }
     /// Look up a principal by opaque identifier.
     pub fn principal(&self, id: PrincipalId) -> Option<Principal> {
@@ -710,6 +719,9 @@ impl Authority {
                 }
                 return SessionId::from_hex(&r.result)
                     .and_then(|id| v.sessions.get(&id).cloned())
+                    .filter(|s| {
+                        s.state == SessionState::Active && self.store.now_ms() < s.expires_ms
+                    })
                     .ok_or(AuthorityError::SessionEnded);
             }
         }
@@ -817,6 +829,7 @@ impl Authority {
         add_credential: Option<(Verifier, [u8; 32])>,
     ) -> Result<AccessSession, AuthorityError> {
         let writer = self.writer.lock().unwrap();
+        let mut ended = Vec::new();
         let result = (|| {
             let mut s = self.owned_session(principal, id)?;
             self.admit(id, Operation::Read)
@@ -837,6 +850,18 @@ impl Authority {
                 expires_ms: s.expires_ms,
                 state: CredentialState::Active,
             });
+            // Keep admission from ending the session while the transaction is built.
+            let v = self.view.read().unwrap();
+            let current = v.sessions.get(&id).ok_or(AuthorityError::NotFound)?;
+            if current.state != SessionState::Active {
+                return Err(AuthorityError::SessionEnded);
+            }
+            s.last_used_ms = s.last_used_ms.max(current.last_used_ms);
+            let pending: Vec<_> = v
+                .pending
+                .iter()
+                .filter_map(|id| v.sessions.get(id).cloned())
+                .collect();
             let persisted_last_used = s.last_used_ms;
             let mut tx = self.store.write()?;
             let stored: AccessSession = tx
@@ -847,6 +872,14 @@ impl Authority {
                 return Err(AuthorityError::SessionEnded);
             }
             tx.put(Table::Sessions, &keys::session(id), &encode(&s))?;
+            for row in &pending {
+                let _: AccessSession = decode(
+                    &tx.get(Table::Sessions, &keys::session(row.id))?
+                        .ok_or(AuthorityError::Store)?,
+                )
+                .map_err(|_| AuthorityError::Store)?;
+                tx.put(Table::Sessions, &keys::session(row.id), &encode(row))?;
+            }
             if let Some(c) = &credential {
                 tx.put(
                     Table::SessionCredentials,
@@ -854,8 +887,14 @@ impl Authority {
                     &encode(c),
                 )?;
             }
+            drop(v);
             tx.commit()?;
             let mut v = self.view.write().unwrap();
+            for row in &pending {
+                v.pending.remove(&row.id);
+                v.flushed.insert(row.id, row.last_used_ms);
+            }
+            ended.extend(pending);
             // Admission can end the session or advance last_used during I/O. Never resurrect it.
             let current = v.sessions.get_mut(&id).ok_or(AuthorityError::NotFound)?;
             if current.state != SessionState::Active {
@@ -870,9 +909,9 @@ impl Authority {
             }
             Ok(s)
         })();
-        let rows = self.persist_pending()?;
+        ended.extend(self.drain_pending_best_effort());
         drop(writer);
-        self.notify(&rows);
+        self.notify(&ended);
         result
     }
     /// Deny first, persist second, and notify only after a successful commit.
@@ -929,6 +968,23 @@ impl Authority {
                 return Ok(persisted);
             }
             self.persist_ended(&rows)?;
+            persisted.extend(rows);
+        }
+    }
+    // Preserve the caller's result and all notifications even if a later batch fails.
+    fn drain_pending_best_effort(&self) -> Vec<AccessSession> {
+        let mut persisted = Vec::new();
+        loop {
+            let rows: Vec<_> = {
+                let v = self.view.read().unwrap();
+                v.pending
+                    .iter()
+                    .filter_map(|id| v.sessions.get(id).cloned())
+                    .collect()
+            };
+            if rows.is_empty() || self.persist_ended(&rows).is_err() {
+                return persisted;
+            }
             persisted.extend(rows);
         }
     }
@@ -994,6 +1050,7 @@ impl Authority {
         // Refused authentication must not refresh an idle session.
         let previous = v.sessions.get(&id).map(|s| s.last_used_ms);
         if Self::admit_view(&mut v, id, Operation::Read, now).is_err() {
+            let _ = secret_matches(&[0; 32], &digest);
             return false;
         }
         let mut matched = false;
@@ -1002,16 +1059,7 @@ impl Authority {
             .values()
             .filter(|c| c.session == id && c.state == CredentialState::Active && now < c.expires_ms)
         {
-            let Ok(mut candidate) = Hmac::<Sha256>::new_from_slice(&c.secret_hash) else {
-                continue;
-            };
-            candidate.update(&digest);
-            let tag = candidate.finalize().into_bytes();
-            let Ok(mut stored) = Hmac::<Sha256>::new_from_slice(&c.secret_hash) else {
-                continue;
-            };
-            stored.update(&c.secret_hash);
-            matched |= stored.verify_slice(&tag).is_ok();
+            matched |= secret_matches(&c.secret_hash, &digest);
         }
         if !matched && let (Some(last), Some(s)) = (previous, v.sessions.get_mut(&id)) {
             s.last_used_ms = last;
@@ -1037,7 +1085,7 @@ impl Authority {
             .cloned()
             .collect()
     }
-    /// Persist pending endings and detect absolute expiry.
+    /// Persist pending endings and detect absolute or idle expiry.
     pub fn sweep(&self) -> Result<usize, AuthorityError> {
         let writer = self.writer.lock().unwrap();
         let now = self.store.now_ms();
@@ -1046,11 +1094,22 @@ impl Authority {
             let ids: Vec<_> = v
                 .sessions
                 .values()
-                .filter(|s| s.state == SessionState::Active && now >= s.expires_ms)
-                .map(|s| s.id)
+                .filter(|s| s.state == SessionState::Active)
+                .filter_map(|s| {
+                    if now >= s.expires_ms {
+                        Some((s.id, EndReason::Expired))
+                    } else if s
+                        .idle_timeout_ms
+                        .is_some_and(|idle| now.saturating_sub(s.last_used_ms) > idle)
+                    {
+                        Some((s.id, EndReason::IdleTimeout))
+                    } else {
+                        None
+                    }
+                })
                 .collect();
-            for id in ids {
-                end(&mut v, id, EndReason::Expired, now);
+            for (id, reason) in ids {
+                end(&mut v, id, reason, now);
             }
             v.pending
                 .iter()
@@ -1257,6 +1316,227 @@ mod tests {
                     .unwrap(),
             )
             .unwrap()
+        }
+    }
+    // Inject actions during commit and failures in the following pending drain.
+    struct CommitStore {
+        inner: Arc<RedbStore>,
+        after_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        fail_writes: std::sync::atomic::AtomicBool,
+    }
+    impl Store for CommitStore {
+        fn meta(&self) -> &super::super::store::StoreMeta {
+            self.inner.meta()
+        }
+        fn now_ms(&self) -> u64 {
+            self.inner.now_ms()
+        }
+        fn read(&self) -> Result<Box<dyn super::super::store::ReadTxn + '_>, StoreError> {
+            self.inner.read()
+        }
+        fn write(&self) -> Result<Box<dyn super::super::store::WriteTxn + '_>, StoreError> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                return Err(StoreError::Io);
+            }
+            Ok(Box::new(CommitTxn {
+                inner: self.inner.write()?,
+                store: self,
+            }))
+        }
+    }
+    struct CommitTxn<'a> {
+        inner: Box<dyn super::super::store::WriteTxn + 'a>,
+        store: &'a CommitStore,
+    }
+    impl super::super::store::ReadTxn for CommitTxn<'_> {
+        fn get(&self, t: Table, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+            self.inner.get(t, key)
+        }
+        fn scan_prefix(
+            &self,
+            t: Table,
+            prefix: &[u8],
+        ) -> Result<super::super::store::ScanRows, StoreError> {
+            self.inner.scan_prefix(t, prefix)
+        }
+    }
+    impl super::super::store::WriteTxn for CommitTxn<'_> {
+        fn put(&mut self, t: Table, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+            self.inner.put(t, key, value)
+        }
+        fn delete(&mut self, t: Table, key: &[u8]) -> Result<bool, StoreError> {
+            self.inner.delete(t, key)
+        }
+        fn commit(self: Box<Self>) -> Result<(), StoreError> {
+            self.inner.commit()?;
+            let action = self.store.after_commit.lock().unwrap().take();
+            if let Some(action) = action {
+                action();
+            }
+            Ok(())
+        }
+    }
+    fn commit_store(f: &mut Fixture) -> Arc<CommitStore> {
+        let store = Arc::new(CommitStore {
+            inner: f.store.clone(),
+            after_commit: Mutex::new(None),
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
+        });
+        f.a = Authority::load(store.clone(), SessionLimits::default()).unwrap();
+        f.a.set_hook(f.hook.clone());
+        store
+    }
+    #[test]
+    fn ended_acquisition_replays_are_refused() {
+        let f = Fixture::new();
+        let p = f.principal("agent", Mode::ReadWrite);
+        let s = f.acquire(p.id, "revoked");
+        f.a.revoke(s.id, EndReason::Requested).unwrap();
+        assert_eq!(
+            f.a.acquire_session(p.id, request("revoked")).unwrap_err(),
+            AuthorityError::SessionEnded
+        );
+        let mut req = request("expired");
+        req.lifetime_ms = Some(1);
+        f.a.acquire_session(p.id, req.clone()).unwrap();
+        f.clock.store(1001, Ordering::SeqCst);
+        assert_eq!(
+            f.a.acquire_session(p.id, req).unwrap_err(),
+            AuthorityError::SessionEnded
+        );
+    }
+    #[test]
+    fn renew_refuses_and_persists_memory_ended_session() {
+        let f = Fixture::limits(SessionLimits {
+            max_lifetime_ms: 1000,
+            idle_timeout_ms: Some(10),
+        });
+        let p = f.principal("agent", Mode::ReadWrite);
+        let s = f.acquire(p.id, "idle");
+        f.clock.store(1011, Ordering::SeqCst);
+        assert_eq!(
+            f.a.admit(s.id, Operation::Read).unwrap_err(),
+            AdmitError::Ended
+        );
+        assert_eq!(
+            f.a.renew(p.id, s.id, None, None).unwrap_err(),
+            AuthorityError::SessionEnded
+        );
+        assert_eq!(f.stored(s.id).revoke_reason, Some(EndReason::IdleTimeout));
+        assert_eq!(f.hook.0.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn renew_transaction_persists_other_pending_ending_and_failure_stays_closed() {
+        for fail in [false, true] {
+            let f = Fixture::limits(SessionLimits {
+                max_lifetime_ms: 1000,
+                idle_timeout_ms: Some(10),
+            });
+            let p = f.principal("agent", Mode::ReadWrite);
+            let idle = f.acquire(p.id, "idle");
+            f.clock.store(1005, Ordering::SeqCst);
+            let active = f.acquire(p.id, "active");
+            f.clock.store(1011, Ordering::SeqCst);
+            assert_eq!(
+                f.a.admit(idle.id, Operation::Read).unwrap_err(),
+                AdmitError::Ended
+            );
+            f.store.fail_commits(fail);
+            let result = f.a.renew(p.id, active.id, Some(Mode::ReadOnly), None);
+            if fail {
+                assert_eq!(result.unwrap_err(), AuthorityError::Store);
+                assert_eq!(f.a.session(active.id).unwrap().mode, Mode::ReadWrite);
+                assert_eq!(f.stored(idle.id).state, SessionState::Active);
+                assert!(f.hook.0.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(result.unwrap().mode, Mode::ReadOnly);
+                assert_eq!(
+                    f.stored(idle.id).revoke_reason,
+                    Some(EndReason::IdleTimeout)
+                );
+                assert_eq!(f.hook.0.lock().unwrap().len(), 1);
+                assert_eq!(f.a.sweep().unwrap(), 0);
+            }
+            assert_eq!(
+                f.a.admit(idle.id, Operation::Read).unwrap_err(),
+                AdmitError::Ended
+            );
+        }
+    }
+    #[test]
+    fn idle_sweep_ends_without_admission_and_notifies_once() {
+        let f = Fixture::limits(SessionLimits {
+            max_lifetime_ms: 1000,
+            idle_timeout_ms: Some(10),
+        });
+        let p = f.principal("agent", Mode::ReadWrite);
+        let s = f.acquire(p.id, "idle");
+        f.clock.store(1011, Ordering::SeqCst);
+        assert_eq!(f.a.sweep().unwrap(), 1);
+        assert_eq!(f.stored(s.id).state, SessionState::Expired);
+        assert_eq!(f.stored(s.id).revoke_reason, Some(EndReason::IdleTimeout));
+        assert_eq!(
+            *f.hook.0.lock().unwrap(),
+            vec![(s.id, p.id, EndReason::IdleTimeout)]
+        );
+        assert_eq!(f.a.sweep().unwrap(), 0);
+        assert_eq!(f.hook.0.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn renew_persists_session_ended_during_commit_before_returning() {
+        let mut f = Fixture::new();
+        let p = f.principal("agent", Mode::ReadWrite);
+        let s = f.acquire(p.id, "active");
+        let store = commit_store(&mut f);
+        let a = f.a.clone();
+        *store.after_commit.lock().unwrap() = Some(Box::new(move || {
+            end(&mut a.view.write().unwrap(), s.id, EndReason::Expired, 1001);
+        }));
+        assert_eq!(
+            f.a.renew(p.id, s.id, None, None).unwrap_err(),
+            AuthorityError::SessionEnded
+        );
+        assert_eq!(f.stored(s.id).state, SessionState::Expired);
+        assert_eq!(f.hook.0.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn successful_renew_and_grants_keep_result_when_other_pending_drain_fails() {
+        for grants in [false, true] {
+            let mut f = Fixture::new();
+            let p = f.principal("agent", Mode::ReadWrite);
+            let s = f.acquire(p.id, "active");
+            let other = f.acquire(p.id, "other");
+            let store = commit_store(&mut f);
+            let a = f.a.clone();
+            let failing = store.clone();
+            *store.after_commit.lock().unwrap() = Some(Box::new(move || {
+                end(
+                    &mut a.view.write().unwrap(),
+                    other.id,
+                    EndReason::Expired,
+                    1001,
+                );
+                failing.fail_writes.store(true, Ordering::SeqCst);
+            }));
+            if grants {
+                assert_eq!(
+                    f.a.set_grants(p.id, vec![(route(), Mode::ReadOnly)]),
+                    Ok(())
+                );
+            } else {
+                assert!(f.a.renew(p.id, s.id, Some(Mode::ReadOnly), None).is_ok());
+            }
+            assert_eq!(f.stored(s.id).mode, Mode::ReadOnly);
+            assert_eq!(f.stored(other.id).state, SessionState::Active);
+            assert_eq!(
+                f.a.admit(other.id, Operation::Read).unwrap_err(),
+                AdmitError::Ended
+            );
+            assert!(f.hook.0.lock().unwrap().is_empty());
+            store.fail_writes.store(false, Ordering::SeqCst);
+            assert_eq!(f.a.sweep().unwrap(), 1);
+            assert_eq!(f.stored(other.id).state, SessionState::Expired);
+            assert_eq!(f.hook.0.lock().unwrap().len(), 1);
         }
     }
     #[test]
