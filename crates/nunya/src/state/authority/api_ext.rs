@@ -12,6 +12,53 @@ pub struct CredentialSummary {
     pub expires_ms: Option<u64>,
 }
 impl Authority {
+    /// Return the authority clock timestamp.
+    pub fn now_ms(&self) -> u64 {
+        self.store.now_ms()
+    }
+
+    /// Whether an acquisition already has an idempotency record.
+    pub fn acquisition_recorded(&self, principal: PrincipalId, key: &str) -> bool {
+        self.view
+            .read()
+            .unwrap()
+            .idempotency
+            .contains_key(&(principal, key.to_owned()))
+    }
+
+    /// Whether a renewal already has an idempotency record.
+    pub fn renewal_recorded(&self, principal: PrincipalId, key: &str) -> bool {
+        self.acquisition_recorded(principal, &format!("\0renew:{key}"))
+    }
+
+    /// Whether a revocation already has an idempotency record.
+    pub fn revocation_recorded(&self, principal: PrincipalId, key: &str) -> bool {
+        self.acquisition_recorded(principal, &format!("\0revoke:{key}"))
+    }
+
+    /// Whether a disablement already has an idempotency record.
+    pub fn disablement_recorded(&self, principal: PrincipalId, key: &str) -> bool {
+        self.acquisition_recorded(principal, &format!("\0disable:{key}"))
+    }
+
+    /// Delete a namespaced retry record from durable storage and the view.
+    pub fn forget_retry(
+        &self,
+        owner: PrincipalId,
+        namespaced_key: &str,
+    ) -> Result<(), AuthorityError> {
+        let _writer = self.writer.lock().unwrap();
+        let mut tx = self.store.write()?;
+        tx.delete(Table::Idempotency, &keys::idempotency(owner, namespaced_key))?;
+        tx.commit()?;
+        self.view
+            .write()
+            .unwrap()
+            .idempotency
+            .remove(&(owner, namespaced_key.to_owned()));
+        Ok(())
+    }
+
     /// Set principal state with a caller-local retry record.
     pub fn set_principal_enabled_idempotent(
         &self,

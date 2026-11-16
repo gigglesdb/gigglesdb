@@ -5,3 +5,5 @@ pub mod auth;
 pub mod routes;
 /// Bounded HTTP management listeners.
 pub mod server;
+/// Lifecycle audit adapter boundary.
+pub mod audit;

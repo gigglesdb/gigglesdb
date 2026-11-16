@@ -1,5 +1,8 @@
 //! Pure synchronous management request dispatch.
-use super::auth::{Origin, authenticate};
+use super::{
+    audit::{Actor, AuditUnavailable, LifecycleKind, LifecycleRecord, LifecycleSink},
+    auth::{Caller, Origin, authenticate},
+};
 use crate::{
     pgwire::auth::ScramVerifier,
     state::{
@@ -53,6 +56,8 @@ pub struct MgmtContext {
     pub connections: Arc<dyn ConnectionSource>,
     /// Runtime revision provider.
     pub status: Arc<dyn StatusSource>,
+    /// Lifecycle record sink.
+    pub lifecycle: Arc<dyn LifecycleSink>,
 }
 impl fmt::Debug for MgmtContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -108,6 +113,35 @@ pub fn idempotency_key(headers: &HeaderMap) -> Option<&str> {
     key.bytes()
         .all(|b| (0x21..=0x7e).contains(&b))
         .then_some(key)
+}
+fn lifecycle_actor(caller: &Caller, origin: Origin, principal: PrincipalId) -> Actor {
+    match caller.principal {
+        Some(id) if id == principal => Actor::Owner,
+        Some(id) => Actor::Admin(id.to_hex()),
+        None if origin == Origin::Socket => Actor::Socket,
+        None => Actor::ConfigAdmin,
+    }
+}
+fn record_session(
+    ctx: &MgmtContext,
+    caller: &Caller,
+    origin: Origin,
+    session: &AccessSession,
+    kind: LifecycleKind,
+    reason: &'static str,
+) -> Result<(), AuditUnavailable> {
+    ctx.lifecycle.record(&LifecycleRecord {
+        kind,
+        at_ms: ctx.authority.now_ms(),
+        principal: session.principal.to_hex(),
+        session: Some(session.id.to_hex()),
+        route: Some(session.route.as_str().to_owned()),
+        actor: lifecycle_actor(caller, origin, session.principal),
+        reason,
+    })
+}
+fn audit_unavailable() -> Response<Bytes> {
+    error(StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable")
 }
 fn session_view(ctx: &MgmtContext, s: &AccessSession) -> Value {
     json!({"id":s.id, "principal":s.principal, "route":s.route, "mode":s.mode,
@@ -367,6 +401,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
         } else {
             req.body().as_ref()
         };
+        let replay;
         let result = match ep {
             Sessions => {
                 let Some(principal) = caller.principal else {
@@ -375,6 +410,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                 let Some(request) = acquire_body(body, key) else {
                     return bad_request();
                 };
+                replay = ctx.authority.acquisition_recorded(principal, key);
                 ctx.authority.acquire_session(principal, request)
             }
             Renew(id) => {
@@ -391,6 +427,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     },
                     None => None,
                 };
+                replay = ctx.authority.renewal_recorded(principal, key);
                 ctx.authority
                     .renew_idempotent(principal, id, request.mode, add, key)
             }
@@ -406,6 +443,9 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                 } else {
                     EndReason::AdminRevoked
                 };
+                replay = ctx
+                    .authority
+                    .revocation_recorded(caller.principal.unwrap_or(PrincipalId([0; 16])), key);
                 ctx.authority.revoke_idempotent(
                     caller.principal.unwrap_or(PrincipalId([0; 16])),
                     id,
@@ -453,6 +493,9 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                 if serde_json::from_slice::<RevokeBody>(body).is_err() {
                     return bad_request();
                 }
+                let disable_replay = ctx
+                    .authority
+                    .disablement_recorded(caller.principal.unwrap_or(PrincipalId([0; 16])), key);
                 if let Err(e) = ctx.authority.set_principal_enabled_idempotent(
                     caller.principal.unwrap_or(PrincipalId([0; 16])),
                     id,
@@ -460,6 +503,27 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     key,
                 ) {
                     return authority_error(e);
+                }
+                if matches!(ep, Disable(_))
+                    && !disable_replay
+                    && ctx
+                        .lifecycle
+                        .record(&LifecycleRecord {
+                            kind: LifecycleKind::PrincipalDisabled,
+                            at_ms: ctx.authority.now_ms(),
+                            principal: id.to_hex(),
+                            session: None,
+                            route: None,
+                            actor: lifecycle_actor(&caller, origin, id),
+                            reason: "principal_disabled",
+                        })
+                        .is_err()
+                {
+                    let _ = ctx.authority.forget_retry(
+                        caller.principal.unwrap_or(PrincipalId([0; 16])),
+                        &format!("\0disable:{key}"),
+                    );
+                    return audit_unavailable();
                 }
                 return match principal_view(ctx, id) {
                     Ok(p) => json_response(StatusCode::OK, p),
@@ -546,6 +610,41 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                 return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
             }
         };
+        if let Ok(s) = &result {
+            let (kind, reason, revoke_on_failure) = match ep {
+                Sessions => (LifecycleKind::Issued, "issued", true),
+                Renew(_) => (LifecycleKind::Renewed, "renewed", true),
+                Revoke(_) => (
+                    LifecycleKind::Revoked,
+                    s.revoke_reason.unwrap_or(EndReason::AdminRevoked).as_str(),
+                    false,
+                ),
+                _ => return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
+            };
+            if !replay && record_session(ctx, &caller, origin, s, kind, reason).is_err() {
+                if revoke_on_failure {
+                    let _ = ctx.authority.revoke(s.id, EndReason::AdminRevoked);
+                } else if matches!(ep, Revoke(_)) {
+                    let _ = ctx.authority.forget_retry(
+                        caller.principal.unwrap_or(PrincipalId([0; 16])),
+                        &format!("\0revoke:{key}"),
+                    );
+                }
+                return audit_unavailable();
+            }
+        } else if matches!(&result, Err(AuthorityError::SessionEnded))
+            && let Renew(id) = ep
+            && let Some(s) = ctx.authority.session(id)
+        {
+            let _ = record_session(
+                ctx,
+                &caller,
+                origin,
+                &s,
+                LifecycleKind::ResumeRefused,
+                "session_ended",
+            );
+        }
         return match result {
             Ok(s) => json_response(
                 if matches!(ep, Sessions) {

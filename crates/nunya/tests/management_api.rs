@@ -3,6 +3,7 @@ use bytes::Bytes;
 use http::{Request, Response};
 use nunya::{
     mgmt::{
+        audit::{Actor, AuditUnavailable, LifecycleKind, LifecycleRecord, LifecycleSink},
         auth::Origin,
         routes::{self, ConnectionSource, ConnectionView, MgmtContext, StatusSource},
     },
@@ -17,11 +18,25 @@ use nunya::{
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
+#[derive(Default)]
+struct AuditSink {
+    records: Mutex<Vec<LifecycleRecord>>,
+    failing: AtomicBool,
+}
+impl LifecycleSink for AuditSink {
+    fn record(&self, record: &LifecycleRecord) -> Result<(), AuditUnavailable> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(AuditUnavailable);
+        }
+        self.records.lock().unwrap().push(record.clone());
+        Ok(())
+    }
+}
 struct Sources;
 impl ConnectionSource for Sources {
     fn list(&self) -> Vec<ConnectionView> {
@@ -51,6 +66,7 @@ struct Fixture {
     sessions: Vec<SessionId>,
     forbidden: Vec<String>,
     clock: Arc<AtomicU64>,
+    audit: Arc<AuditSink>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -130,11 +146,13 @@ impl Fixture {
             }])
             .unwrap();
         let admin = make_verifier("config-admin-private.secret");
+        let audit = Arc::new(AuditSink::default());
         let ctx = MgmtContext {
             authority,
             admins: vec![("config-admin".into(), admin.0)],
             connections: Arc::new(Sources),
             status: Arc::new(Sources),
+            lifecycle: audit.clone(),
         };
         for s in ctx.authority.all_sessions() {
             let scope = ctx.authority.scope(s.scope).unwrap();
@@ -148,6 +166,7 @@ impl Fixture {
             sessions,
             forbidden,
             clock,
+            audit,
         }
     }
     fn ctx(&self) -> &MgmtContext {
@@ -184,6 +203,7 @@ impl Fixture {
         for secret in &self.forbidden {
             assert!(!text.contains(secret), "response leaked fixture material");
         }
+        assert_audit_material(self);
         r
     }
 }
@@ -1191,4 +1211,259 @@ async fn listener_unix_socket_permissions_auth_cleanup_and_file_refusal() -> Tra
     finish_server(tx, server).await?;
     assert!(!path.exists());
     Ok(())
+}
+
+fn assert_audit_material(f: &Fixture) -> Vec<LifecycleRecord> {
+    let records = f.audit.records.lock().unwrap().clone();
+    for record in &records {
+        let text = serde_json::to_string(record).unwrap();
+        for forbidden in f.forbidden.iter().map(String::as_str).chain([
+            "test-session",
+            "audit label",
+            "private-audit-label",
+            "config-admin",
+        ]) {
+            assert!(!text.contains(forbidden), "audit leaked fixture material");
+        }
+    }
+    records
+}
+
+#[test]
+fn lifecycle_records_deduplicate_mutations_and_refuse_resume() {
+    let mut f = Fixture::new();
+    let mut body = f.session_body("audit-session-private.secret");
+    body["label"] = serde_json::json!("private-audit-label");
+    let acquired = f.post(ALICE, "/v1/sessions", "audit-acquire", body.clone());
+    assert_eq!(acquired.status(), 201);
+    let sid = value(&acquired)["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        f.post(ALICE, "/v1/sessions", "audit-acquire", body)
+            .status(),
+        201
+    );
+    let renew = format!("/v1/sessions/{sid}/renew");
+    for _ in 0..2 {
+        assert_eq!(
+            f.post(ALICE, &renew, "audit-renew", serde_json::json!({}))
+                .status(),
+            200
+        );
+    }
+    let revoke = format!("/v1/sessions/{sid}/revoke");
+    for _ in 0..2 {
+        assert_eq!(
+            f.post(ALICE, &revoke, "audit-revoke", serde_json::json!({}))
+                .status(),
+            200
+        );
+    }
+    error_is(
+        f.post(ALICE, &renew, "resume", serde_json::json!({})),
+        409,
+        "session_ended",
+    );
+    let admin_revoke = format!("/v1/sessions/{}/revoke", f.sessions[1].to_hex());
+    assert_eq!(
+        f.post(ADMIN, &admin_revoke, "admin-revoke", serde_json::json!({}))
+            .status(),
+        200
+    );
+    let disable = format!("/v1/principals/{}/disable", f.principals[1].to_hex());
+    for _ in 0..2 {
+        assert_eq!(
+            f.post(ADMIN, &disable, "disable", serde_json::json!({}))
+                .status(),
+            200
+        );
+    }
+    let enable = format!("/v1/principals/{}/enable", f.principals[1].to_hex());
+    assert_eq!(
+        f.post(ADMIN, &enable, "enable", serde_json::json!({}))
+            .status(),
+        200
+    );
+    let records = assert_audit_material(&f);
+    assert_eq!(
+        records.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        vec![
+            LifecycleKind::Issued,
+            LifecycleKind::Renewed,
+            LifecycleKind::Revoked,
+            LifecycleKind::ResumeRefused,
+            LifecycleKind::Revoked,
+            LifecycleKind::PrincipalDisabled,
+        ]
+    );
+    for r in &records[..4] {
+        assert_eq!(r.at_ms, f.clock.load(Ordering::SeqCst));
+        assert_eq!(serde_json::to_value(r).unwrap()["actor"], "owner");
+        assert_eq!(r.actor, Actor::Owner);
+        assert_eq!(r.principal, f.principals[0].to_hex());
+        assert_eq!(r.session.as_deref(), Some(sid.as_str()));
+        assert_eq!(r.route.as_deref(), Some("postgres"));
+    }
+    assert_eq!(records[2].reason, "requested");
+    assert_eq!(records[3].reason, "session_ended");
+    assert_eq!(records[4].reason, "admin_revoked");
+    assert_eq!(
+        serde_json::to_value(&records[4]).unwrap()["actor"],
+        serde_json::json!({"admin": f.principals[2].to_hex()})
+    );
+    assert_eq!(records[4].actor, Actor::Admin(f.principals[2].to_hex()));
+    assert_eq!(records[5].actor, Actor::Admin(f.principals[2].to_hex()));
+    assert_eq!(records[5].principal, f.principals[1].to_hex());
+    assert_eq!(records[5].session, None);
+    assert_eq!(records[5].route, None);
+}
+
+#[test]
+fn lifecycle_config_and_socket_actors_hide_names() {
+    let f = Fixture::new();
+    for (index, origin, auth, actor) in [
+        (0, Origin::Network, Some(CONFIG), Actor::ConfigAdmin),
+        (1, Origin::Socket, None, Actor::Socket),
+    ] {
+        let path = format!("/v1/sessions/{}/revoke", f.sessions[index].to_hex());
+        assert_eq!(
+            f.request(
+                origin,
+                auth,
+                "POST",
+                &path,
+                Some(if index == 0 {
+                    "config-actor"
+                } else {
+                    "socket-actor"
+                })
+            )
+            .status(),
+            200
+        );
+        let records = assert_audit_material(&f);
+        assert_eq!(records[index].actor, actor);
+        assert_eq!(records[index].reason, "admin_revoked");
+        let serialized = serde_json::to_value(&records[index]).unwrap();
+        assert_eq!(
+            serialized["actor"],
+            if index == 0 { "config_admin" } else { "socket" }
+        );
+    }
+}
+
+#[test]
+fn lifecycle_sink_failure_closes_access_and_preserves_refusal() {
+    use nunya::state::authority::Operation;
+    let mut f = Fixture::new();
+    let body = f.session_body("audit-failed-private.secret");
+    f.audit.failing.store(true, Ordering::SeqCst);
+    error_is(
+        f.post(ALICE, "/v1/sessions", "failed-acquire", body.clone()),
+        503,
+        "audit_unavailable",
+    );
+    let new_session = f
+        .ctx()
+        .authority
+        .all_sessions()
+        .into_iter()
+        .find(|s| !f.sessions.contains(&s.id))
+        .unwrap();
+    assert_eq!(new_session.revoke_reason, Some(EndReason::AdminRevoked));
+    assert!(
+        f.ctx()
+            .authority
+            .admit(new_session.id, Operation::Read)
+            .is_err()
+    );
+    error_is(
+        f.post(ALICE, "/v1/sessions", "failed-acquire", body),
+        409,
+        "session_ended",
+    );
+    let renew = format!("/v1/sessions/{}/renew", f.sessions[0].to_hex());
+    error_is(
+        f.post(ALICE, &renew, "failed-renew", serde_json::json!({})),
+        503,
+        "audit_unavailable",
+    );
+    assert_eq!(
+        f.ctx()
+            .authority
+            .session(f.sessions[0])
+            .unwrap()
+            .revoke_reason,
+        Some(EndReason::AdminRevoked)
+    );
+    assert!(
+        f.ctx()
+            .authority
+            .admit(f.sessions[0], Operation::Read)
+            .is_err()
+    );
+    error_is(
+        f.post(ALICE, &renew, "failed-renew", serde_json::json!({})),
+        409,
+        "session_ended",
+    );
+    let revoke = format!("/v1/sessions/{}/revoke", f.sessions[1].to_hex());
+    error_is(
+        f.post(BOB, &revoke, "failed-revoke", serde_json::json!({})),
+        503,
+        "audit_unavailable",
+    );
+    assert_eq!(
+        f.ctx()
+            .authority
+            .session(f.sessions[1])
+            .unwrap()
+            .revoke_reason,
+        Some(EndReason::Requested)
+    );
+    assert!(
+        f.ctx()
+            .authority
+            .admit(f.sessions[1], Operation::Read)
+            .is_err()
+    );
+    let bob_renew = format!("/v1/sessions/{}/renew", f.sessions[1].to_hex());
+    error_is(
+        f.post(BOB, &bob_renew, "refuse", serde_json::json!({})),
+        409,
+        "session_ended",
+    );
+    let disable = format!("/v1/principals/{}/disable", f.principals[0].to_hex());
+    error_is(
+        f.post(ADMIN, &disable, "failed-disable", serde_json::json!({})),
+        503,
+        "audit_unavailable",
+    );
+    assert_eq!(
+        f.ctx().authority.principal(f.principals[0]).unwrap().state,
+        PrincipalState::Disabled
+    );
+    assert!(assert_audit_material(&f).is_empty());
+    // Failed audit attempts keep the mutation, but allow a same-key audit retry.
+    f.audit.failing.store(false, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert_eq!(
+            f.post(BOB, &revoke, "failed-revoke", serde_json::json!({}))
+                .status(),
+            200
+        );
+        let records = assert_audit_material(&f);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, LifecycleKind::Revoked);
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            f.post(ADMIN, &disable, "failed-disable", serde_json::json!({}))
+                .status(),
+            200
+        );
+        let records = assert_audit_material(&f);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].kind, LifecycleKind::Revoked);
+        assert_eq!(records[1].kind, LifecycleKind::PrincipalDisabled);
+    }
 }
