@@ -10,7 +10,6 @@ use nunya::{
         upstream::{UpstreamConfig, UpstreamTls},
     },
     readlog::{ReadLog, ReadLogRecord},
-    task::TaskStore,
     token::{StandardCodec, keys::RootKey},
 };
 use std::{
@@ -65,17 +64,39 @@ async fn gateway(url: &str, side: &str) -> TestResult<Gateway> {
         &[],
     )
     .unwrap();
+    use nunya::state::{
+        authority::AcquireRequest,
+        model::{Mode, PrincipalKind, RouteId, Verifier},
+    };
+    use sha2::{Digest, Sha256};
+    let principal =
+        runtime
+            .authority
+            .create_principal("ni-agent", PrincipalKind::Agent, false, "ni")?;
+    let route = RouteId::new("postgres").unwrap();
+    runtime
+        .authority
+        .set_grants(principal.id, vec![(route.clone(), Mode::ReadWrite)])?;
+    let session = runtime.authority.acquire_session(
+        principal.id,
+        AcquireRequest {
+            route,
+            mode: None,
+            lifetime_ms: None,
+            isolated: false,
+            label: None,
+            idempotency_key: "ni".into(),
+            verifier: Verifier(ScramVerifier::from_password("ni-test-only", &[7; 16], 4096)),
+            secret_sha256: Sha256::digest(b"ni-test-only").into(),
+        },
+    )?;
     let context = Arc::new(GatewayContext {
         authority: runtime.authority.clone(),
         registry: runtime.registry.clone(),
         route: nunya::state::model::RouteId::new("postgres").unwrap(),
         policy: RwLock::new(Arc::new(policy)),
         snapshot: RwLock::new(Arc::new(snapshot)),
-        // serve_tcp chooses a fresh random scope salt for standing credentials.
-        // Its public API cannot inject the requested fixed salt. Paired token
-        // pools below preserve each live connection's own scope instead.
         root_key: RootKey::from_hex(&"42".repeat(32))?,
-        tasks: TaskStore::with_clock(&dir, Arc::new(|| 0))?,
         readlog: Box::new(Audit),
         upstream: UpstreamConfig {
             host,
@@ -94,10 +115,6 @@ async fn gateway(url: &str, side: &str) -> TestResult<Gateway> {
             connect_timeout_ms: 10_000,
         },
         search_path: vec!["public".into()],
-        standing: BTreeMap::from([(
-            "ni-agent".into(),
-            ScramVerifier::from_password("ni-test-only", &[7; 16], 4096),
-        )]),
         lowering: PgLowering,
         codec: StandardCodec,
         clock: Arc::new(|| 0),
@@ -117,7 +134,7 @@ async fn gateway(url: &str, side: &str) -> TestResult<Gateway> {
     agent
         .host("127.0.0.1")
         .port(address.port())
-        .user("ni-agent")
+        .user(format!("session:{}", session.id.to_hex()))
         .password("ni-test-only")
         .dbname("app");
     let (client, connection) = agent

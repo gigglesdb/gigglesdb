@@ -1,16 +1,15 @@
 //! Shared, reloadable gateway state and data-free counters.
-use super::{auth::ScramVerifier, upstream::UpstreamConfig};
+use super::upstream::UpstreamConfig;
 use crate::{
     dialect::pg::PgLowering,
     error::NyCode,
     policy::Policy,
     readlog::ReadLog,
     schema::Snapshot,
-    task::TaskStore,
     token::{StandardCodec, keys::RootKey},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -73,16 +72,12 @@ pub struct GatewayContext {
     pub snapshot: RwLock<Arc<Snapshot>>,
     /// Root token encryption key.
     pub root_key: RootKey,
-    /// Persistent task scopes.
-    pub tasks: TaskStore,
     /// Mandatory audit sink.
     pub readlog: Box<dyn ReadLog>,
     /// Upstream connection settings.
     pub upstream: UpstreamConfig,
     /// Trusted upstream search path.
     pub search_path: Vec<String>,
-    /// Standing credential verifiers.
-    pub standing: BTreeMap<String, ScramVerifier>,
     /// SQL lowering implementation.
     pub lowering: PgLowering,
     /// Token codec.

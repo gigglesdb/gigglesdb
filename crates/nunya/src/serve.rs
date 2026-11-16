@@ -318,11 +318,11 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let _reload = AbortTask(tokio::spawn(async move {
         reload_hub.run(reload_path, reload_rx).await
     }));
-    let tasks = crate::task::TaskStore::open_dir(&config.state_dir.join("tasks"))
-        .map_err(|_| "task store unavailable")?;
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let mut routes = JoinSet::new();
     if let Some(section) = config.spanner_native.take() {
+        let tasks = crate::task::TaskStore::open_dir(&config.state_dir.join("tasks"))
+            .map_err(|_| "task store unavailable")?;
         let state = crate::spanner_serve::RouteState {
             authority: runtime.authority.clone(),
             registry: runtime.registry.clone(),
@@ -356,7 +356,6 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             standing.insert(identity.name.clone(), verifier);
         }
         let policy = policy.clone();
-        let tasks = tasks.clone();
         let route_hub = hub.clone();
         let rx = rx.clone();
         routes.spawn(async move {
@@ -383,7 +382,6 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             let work = run_postgres(
                 config,
                 policy,
-                tasks,
                 rx.clone(),
                 ready_tx,
                 hub,
@@ -441,9 +439,8 @@ async fn supervise(
     result
 }
 async fn run_postgres(
-    mut config: Config,
+    config: Config,
     policy: Arc<Policy>,
-    tasks: crate::task::TaskStore,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ready: tokio::sync::oneshot::Sender<()>,
     hub: Arc<crate::reload::Hub>,
@@ -479,16 +476,11 @@ async fn run_postgres(
         policy: RwLock::new(policy),
         snapshot: RwLock::new(Arc::new(first)),
         root_key,
-        tasks,
         readlog: Box::new(log.clone()),
         upstream: config
             .upstream_config()
             .ok_or("PostgreSQL route unavailable")?,
         search_path: config.search_path.clone(),
-        standing: std::mem::take(&mut config.standing)
-            .into_iter()
-            .map(|s| (s.name, s.verifier))
-            .collect::<BTreeMap<_, _>>(),
         lowering: crate::dialect::pg::PgLowering,
         codec: crate::token::StandardCodec,
         clock: Arc::new(now),

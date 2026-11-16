@@ -1,6 +1,6 @@
 //! Pure SCRAM-SHA-256 server authentication.
 use crate::error::{NyCode, Refusal};
-use crate::token::TaskId;
+use crate::token::SessionId;
 use data_encoding::BASE64;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -279,9 +279,9 @@ pub fn parse_sasl_initial(payload: &[u8]) -> Result<(String, Vec<u8>), Refusal> 
     }
     Ok((mechanism.into(), data.into()))
 }
-/// Recognize task credentials with exactly 32 lowercase hexadecimal digits.
-pub fn parse_task_user(user: &str) -> Option<TaskId> {
-    crate::task::parse_task_id(user.strip_prefix("task:")?)
+/// Recognize session credentials with exactly 32 lowercase hexadecimal digits.
+pub fn parse_session_user(user: &str) -> Option<SessionId> {
+    SessionId::from_hex(user.strip_prefix("session:")?)
 }
 #[cfg(test)]
 mod tests {
@@ -349,16 +349,17 @@ mod tests {
         assert!(!debug.contains(&format!("{:?}", v.stored_key)));
     }
     #[test]
-    fn task_user_is_exact() {
-        assert!(parse_task_user("task:0123456789abcdef0123456789abcdef").is_some());
+    fn session_user_is_exact() {
+        assert!(parse_session_user("session:0123456789abcdef0123456789abcdef").is_some());
         for bad in [
             "standing",
-            "task:",
-            "task:0123456789ABCDEF0123456789abcdef",
-            "task:0123456789abcdef0123456789abcde",
-            "task:0123456789abcdef0123456789abcdef0",
+            "task:0123456789abcdef0123456789abcdef",
+            "session:",
+            "session:0123456789ABCDEF0123456789abcdef",
+            "session:0123456789abcdef0123456789abcde",
+            "session:0123456789abcdef0123456789abcdef0",
         ] {
-            assert!(parse_task_user(bad).is_none());
+            assert!(parse_session_user(bad).is_none());
         }
     }
     #[test]

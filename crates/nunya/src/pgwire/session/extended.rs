@@ -424,15 +424,11 @@ impl Session {
                             .fetch_add(1, Ordering::Relaxed);
                         let mut record = self.record(&p.sql, Outcome::Allowed);
                         self.ctx.readlog.write(&record)?;
-                        if let Some(id) = self.task {
-                            self.ctx.tasks.count_tokenize(&id, domain, limit_per_session)?;
-                        } else {
-                            let count = self.counts.entry(domain.clone()).or_default();
-                            *count = count
-                                .checked_add(1)
-                                .filter(|n| *n <= limit_per_session)
-                                .ok_or_else(|| failure(NyCode::TokenizeLimit))?;
-                        }
+                        let count = self.counts.entry(domain.clone()).or_default();
+                        *count = count
+                            .checked_add(1)
+                            .filter(|n| *n <= limit_per_session)
+                            .ok_or_else(|| failure(NyCode::TokenizeLimit))?;
                         let token = self.ctx.codec.encode(
                             &self.keys,
                             domain,

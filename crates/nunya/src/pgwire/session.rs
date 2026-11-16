@@ -16,7 +16,7 @@ use crate::{
     },
     policy::{DomainName, Policy, TokenizeSetting},
     readlog::{Outcome, ReadLogRecord, redact_tokenize_args, statement_fingerprint},
-    token::{ScopeKeys, TaskId, TokenCodec, keys::derive_scope},
+    token::{PrincipalId, ScopeKeys, SessionId, TokenCodec, keys::derive_scope_v2},
     value::SqlValue,
 };
 use bytes::BytesMut;
@@ -73,7 +73,11 @@ struct Active {
 pub struct Session {
     ctx: Arc<GatewayContext>,
     keys: ScopeKeys,
-    task: Option<TaskId>,
+    // Used by durable counters and admission in the next session-wiring step.
+    #[allow(dead_code)]
+    session: SessionId,
+    #[allow(dead_code)]
+    principal: PrincipalId,
     credential: String,
     counts: BTreeMap<DomainName, u32>,
     active: VecDeque<Active>,
@@ -95,13 +99,15 @@ impl Session {
     pub fn new(
         ctx: Arc<GatewayContext>,
         keys: ScopeKeys,
-        task: Option<TaskId>,
+        session: SessionId,
+        principal: PrincipalId,
         credential: String,
     ) -> Self {
         Self {
             ctx,
             keys,
-            task,
+            session,
+            principal,
             credential,
             counts: BTreeMap::new(),
             active: VecDeque::new(),
@@ -130,7 +136,7 @@ impl Session {
         let statement = redact_tokenize_args(sql);
         ReadLogRecord {
             ts_unix_ms: (self.ctx.clock)(),
-            task: self.task,
+            task: None,
             credential: self.credential.clone(),
             statement_fingerprint: statement_fingerprint(&statement),
             statement,
@@ -302,15 +308,11 @@ impl Session {
                     return Err(failure(NyCode::StatementNotAllowed));
                 };
                 let value = values::decode_text(&ty, text.as_bytes())?;
-                if let Some(id) = self.task {
-                    self.ctx.tasks.count_tokenize(&id, domain, limit_per_session)?;
-                } else {
-                    let count = self.counts.entry(domain.clone()).or_default();
-                    *count = count
-                        .checked_add(1)
-                        .filter(|n| *n <= limit_per_session)
-                        .ok_or_else(|| failure(NyCode::TokenizeLimit))?;
-                }
+                let count = self.counts.entry(domain.clone()).or_default();
+                *count = count
+                    .checked_add(1)
+                    .filter(|n| *n <= limit_per_session)
+                    .ok_or_else(|| failure(NyCode::TokenizeLimit))?;
                 let encoded = self.ctx.codec.encode(
                     &self.keys,
                     domain,
@@ -969,25 +971,12 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
             }
         }
     };
-    let mut salt = random::<32>()?;
-    let mut task = None;
-    let candidate = if let Some(id) = auth::parse_task_user(&user) {
-        match ctx.tasks.scram_verifier(&id) {
-            Ok((record, verifier)) => {
-                salt = record.salt;
-                task = Some(id);
-                Some(verifier)
-            }
-            Err(_) => None,
-        }
-    } else if user.starts_with("task:") {
-        None
-    } else {
-        ctx.standing
-            .get(&user)
-            .and_then(|v| ScramVerifier::parse(&v.to_pg_string()))
-    };
-    let known = candidate.is_some();
+    let login = auth::parse_session_user(&user).and_then(|id| {
+        ctx.authority
+            .session_login(id, &ctx.route)
+            .map(|login| (id, login))
+    });
+    let candidate = login.as_ref().map(|(_, login)| login.verifier.clone().0);
     let verifier = match candidate {
         Some(v) => v,
         None => ScramVerifier {
@@ -1015,12 +1004,23 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
     let Frontend::Password(final_msg) = agent.recv().await? else {
         return Err(failure(NyCode::TokenNotValid));
     };
-    let ScramStep::Done { server_final } = scram.handle_final(&final_msg)? else {
+    let ScramStep::Done { server_final } = scram
+        .handle_final(&final_msg)
+        .map_err(|_| failure(NyCode::TokenNotValid))?
+    else {
         return Err(protocol());
     };
-    if !known {
-        return Err(failure(NyCode::TokenNotValid));
-    }
+    let (id, login) = login.ok_or_else(|| failure(NyCode::TokenNotValid))?;
+    ctx.authority
+        .admit(id, crate::state::authority::Operation::Read)
+        .map_err(|_| failure(NyCode::TokenNotValid))?;
+    let keys = derive_scope_v2(
+        &ctx.root_key,
+        &login.scope.salt,
+        &login.scope.deployment_id,
+        login.scope.route.as_str(),
+    )
+    .map_err(|_| failure(NyCode::TokenNotValid))?;
     let mut upstream = Upstream::connect(&ctx.upstream, &ctx.search_path).await?;
     agent
         .send(&[
@@ -1059,7 +1059,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
             Backend::ReadyForQuery(b'I'),
         ])
         .await?;
-    let mut session = Session::new(ctx.clone(), derive_scope(&ctx.root_key, &salt), task, user);
+    let mut session = Session::new(ctx.clone(), keys, id, login.principal, user);
     let mut deferred = VecDeque::new();
     let mut deferred_bytes = 0usize;
     loop {
@@ -1110,7 +1110,6 @@ mod tests {
         policy::{DomainSettings, ReadLogSink, Treatment},
         readlog::ReadLog,
         schema::{Column, ColumnRef, Relation, RelationKind, Snapshot},
-        task::TaskStore,
         token::{StandardCodec, keys::RootKey},
     };
     use std::{
@@ -1220,7 +1219,6 @@ mod tests {
                 policy: RwLock::new(Arc::new(policy)),
                 snapshot: RwLock::new(Arc::new(snapshot)),
                 root_key: RootKey::from_hex(&"00".repeat(32)).unwrap(),
-                tasks: TaskStore::with_clock(&dir, Arc::new(|| 100)).unwrap(),
                 readlog: Box::new(Audit {
                     fail: fail.clone(),
                     allowed_records: allowed_records.clone(),
@@ -1237,7 +1235,6 @@ mod tests {
                     connect_timeout_ms: 100,
                 },
                 search_path: vec!["public".into()],
-                standing: BTreeMap::new(),
                 lowering: crate::dialect::pg::PgLowering,
                 codec: StandardCodec,
                 clock: Arc::new(|| 100),
@@ -1257,11 +1254,130 @@ mod tests {
         fn session(&self) -> Session {
             Session::new(
                 self.ctx.clone(),
-                derive_scope(&self.ctx.root_key, &[1; 32]),
-                None,
+                crate::token::keys::derive_scope(&self.ctx.root_key, &[1; 32]),
+                SessionId::random(),
+                PrincipalId::random(),
                 "agent".into(),
             )
         }
+    }
+    fn acquire_login(f: &Fixture, route: &str) -> (SessionId, PrincipalId) {
+        use crate::state::{
+            authority::AcquireRequest,
+            model::{Mode, PrincipalKind, RouteId, Verifier},
+        };
+        use sha2::{Digest, Sha256};
+        let a = &f.ctx.authority;
+        let p = a
+            .create_principal("api-agent", PrincipalKind::Agent, false, "login")
+            .unwrap();
+        let route = RouteId::new(route).unwrap();
+        a.set_grants(p.id, vec![(route.clone(), Mode::ReadWrite)])
+            .unwrap();
+        a.add_principal_credential(
+            p.id,
+            Verifier(ScramVerifier::from_password(
+                "login-secret",
+                b"test-salt",
+                4096,
+            )),
+            None,
+        )
+        .unwrap();
+        let s = a
+            .acquire_session(
+                p.id,
+                AcquireRequest {
+                    route,
+                    mode: None,
+                    lifetime_ms: None,
+                    isolated: false,
+                    label: None,
+                    idempotency_key: "login".into(),
+                    verifier: Verifier(ScramVerifier::from_password(
+                        "login-secret",
+                        b"test-salt",
+                        4096,
+                    )),
+                    secret_sha256: Sha256::digest(b"login-secret").into(),
+                },
+            )
+            .unwrap();
+        (s.id, p.id)
+    }
+    async fn assert_login_refused(f: &mut Fixture, user: &str, password: &str) {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctx = Arc::get_mut(&mut f.ctx).unwrap();
+        ctx.upstream.host = "127.0.0.1".into();
+        ctx.upstream.port = upstream.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let ctx = f.ctx.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_tcp(stream, ctx).await;
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio_postgres::Config::new()
+                .host("127.0.0.1")
+                .port(address.port())
+                .user(user)
+                .password(password)
+                .dbname("app")
+                .connect(tokio_postgres::NoTls),
+        )
+        .await
+        .unwrap();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("login unexpectedly accepted"),
+        };
+        assert_eq!(error.code().map(|c| c.code()), Some("NY003"));
+        server.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), upstream.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn principal_credentials_are_not_database_logins() {
+        let mut f = Fixture::new();
+        acquire_login(&f, "postgres");
+        assert_login_refused(&mut f, "api-agent", "login-secret").await;
+    }
+    #[tokio::test]
+    async fn task_login_refused() {
+        let mut f = Fixture::new();
+        assert_login_refused(
+            &mut f,
+            "task:0123456789abcdef0123456789abcdef",
+            "login-secret",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn session_wrong_password_refused() {
+        let mut f = Fixture::new();
+        let (id, _) = acquire_login(&f, "postgres");
+        assert_login_refused(&mut f, &format!("session:{}", id.to_hex()), "wrong").await;
+    }
+    #[tokio::test]
+    async fn spanner_session_refused_on_postgres() {
+        let mut f = Fixture::new();
+        let (id, _) = acquire_login(&f, "spanner-native");
+        assert_login_refused(&mut f, &format!("session:{}", id.to_hex()), "login-secret").await;
+    }
+    #[tokio::test]
+    async fn revoked_session_refused() {
+        let mut f = Fixture::new();
+        let (id, _) = acquire_login(&f, "postgres");
+        f.ctx
+            .authority
+            .revoke(id, crate::state::model::EndReason::Requested)
+            .unwrap();
+        assert_login_refused(&mut f, &format!("session:{}", id.to_hex()), "login-secret").await;
     }
     #[test]
     fn session_settings_simple_are_local_and_mixes_refused() {
