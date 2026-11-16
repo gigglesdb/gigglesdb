@@ -161,18 +161,8 @@ fn out_of_range_batches_are_refused_identically() {
         ),
         put(
             Keyspace::Meta,
-            range_local_key(a, &RangeLocalKey::LastCommitTs),
-            &[0; 7],
-        ),
-        put(
-            Keyspace::Meta,
             range_local_key(RangeId(2), &RangeLocalKey::OracleHw),
             &[0; 8],
-        ),
-        put(
-            Keyspace::Meta,
-            range_local_key(a, &RangeLocalKey::Features),
-            &(1u64 << 60).to_be_bytes(),
         ),
     ];
     for store in &stores {
@@ -194,7 +184,9 @@ fn out_of_range_batches_are_refused_identically() {
     let mut sweep = WriteBatch::default();
     sweep.delete_range(Keyspace::Meta, lo, hi);
     assert_eq!(
-        stores[1].apply(a, &sweep.encode(), pos(11, 1)).unwrap(),
+        stores[1]
+            .apply(a, &sweep.encode(), pos(refused.len() as u64 + 1, 1))
+            .unwrap(),
         RangeApplyOutcome::Refused
     );
 }
@@ -277,4 +269,25 @@ fn create_range_is_idempotent_and_needs_the_ranges_feature() {
         crate::storage::replicated::ReplicaStore::open(dir.sub("db")),
         Err(CoreError::Unsupported)
     ));
+}
+
+#[test]
+fn invalid_range_values_stop_the_range_instead_of_being_refused() {
+    let dir = Dir::new("range-store");
+    let store = two_ranges(&dir);
+    let a = RangeId(1);
+    // A feature bit this build does not know: an error, and the position does not move.
+    let unknown = put(
+        Keyspace::Meta,
+        range_local_key(a, &RangeLocalKey::Features),
+        &(1u64 << 60).to_be_bytes(),
+    );
+    assert!(matches!(store.apply(a, &unknown, pos(1, 1)), Err(CoreError::Corrupt(_))));
+    assert_eq!(store.applied(a).unwrap(), None);
+    let short = put(Keyspace::Meta, range_local_key(a, &RangeLocalKey::LastCommitTs), &[0; 7]);
+    assert!(matches!(store.apply(a, &short, pos(1, 1)), Err(CoreError::Corrupt(_))));
+    // An op outside the range is refused and advances the position.
+    let outside = put(Keyspace::Rows, row(SPLIT_TABLE, 1, 1), b"x");
+    assert_eq!(store.apply(a, &outside, pos(1, 1)).unwrap(), RangeApplyOutcome::Refused);
+    assert_eq!(store.applied(a).unwrap(), Some(pos(1, 1)));
 }

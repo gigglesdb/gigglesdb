@@ -154,6 +154,8 @@ struct Waiter {
     key: LockKey,
     mode: LockMode,
     upgrade: bool,
+    // Set by `cancel_wait`: the request ends `Deadlock` instead of being granted.
+    cancelled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -241,6 +243,7 @@ impl LockManager {
                 key: key.clone(),
                 mode,
                 upgrade,
+                cancelled: false,
             },
         );
         state
@@ -266,7 +269,9 @@ impl LockManager {
             if let Some(result) = state.completed.remove(&id) {
                 return result;
             }
-            let error = if cancelled {
+            let error = if state.waiters.get(&id).is_some_and(|waiter| waiter.cancelled) {
+                Some(LockError::Deadlock)
+            } else if cancelled {
                 Some(LockError::Cancelled)
             } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 Some(LockError::Timeout)
@@ -333,6 +338,46 @@ impl LockManager {
             }
         }
         self.changed.notify_all();
+    }
+
+    /// Transactions blocking `txn`'s pending request(s): conflicting holders plus
+    /// conflicting waiters queued ahead of it. Sorted and deduplicated; empty
+    /// when `txn` is not waiting. Feeds the cross-range deadlock detector.
+    pub(crate) fn blockers(&self, txn: TxnId) -> Vec<TxnId> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut blockers = Vec::new();
+        for (&id, waiter) in state.waiters.iter().filter(|(_, waiter)| waiter.txn == txn) {
+            let Some(locks) = state.keys.get(&waiter.key) else {
+                continue;
+            };
+            if let Some(position) = locks.queue.iter().position(|&queued| queued == id) {
+                state.queue_blockers(locks, position, &mut blockers);
+            }
+        }
+        blockers.sort_unstable();
+        blockers.dedup();
+        blockers
+    }
+
+    /// End `txn`'s pending acquire(s) with `Deadlock` (a cross-range victim).
+    /// Sets the per-request cancel flag and wakes the waiter, which removes its
+    /// own queue entry. No-op when `txn` is not waiting.
+    pub(crate) fn cancel_wait(&self, txn: TxnId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut any = false;
+        for waiter in state.waiters.values_mut().filter(|waiter| waiter.txn == txn) {
+            waiter.cancelled = true;
+            any = true;
+        }
+        if any {
+            self.changed.notify_all();
+        }
     }
 
     /// Snapshot held locks, recovering the state for inspection after poisoning.
@@ -409,6 +454,12 @@ impl State {
             let waiter = &self.waiters[&id];
             let txn = waiter.txn;
             let mode = waiter.mode;
+            // A cancel_wait victim is never granted, even if its thread has not
+            // observed the flag yet.
+            if waiter.cancelled {
+                self.remove_waiter(id, Err(LockError::Deadlock));
+                continue;
+            }
             if self.keys[key]
                 .holders
                 .iter()
@@ -421,23 +472,29 @@ impl State {
         }
     }
 
+    /// Wait-for edges of the waiter at `position` in `locks.queue`: other
+    /// transactions holding a conflicting mode, then conflicting earlier waiters.
+    fn queue_blockers(&self, locks: &KeyState, position: usize, blockers: &mut Vec<TxnId>) {
+        let waiter = &self.waiters[&locks.queue[position]];
+        for (&owner, held) in &locks.holders {
+            if owner != waiter.txn && held.iter().any(|mode| waiter.mode.conflicts(mode)) {
+                blockers.push(owner);
+            }
+        }
+        for preceding in &locks.queue[..position] {
+            let preceding = &self.waiters[preceding];
+            if preceding.txn != waiter.txn && waiter.mode.conflicts(preceding.mode) {
+                blockers.push(preceding.txn);
+            }
+        }
+    }
+
     fn has_cycle(&self, requester: TxnId) -> bool {
         let mut edges: HashMap<TxnId, Vec<TxnId>> = HashMap::new();
         for locks in self.keys.values() {
             for (position, id) in locks.queue.iter().enumerate() {
-                let waiter = &self.waiters[id];
-                let blockers = edges.entry(waiter.txn).or_default();
-                for (&owner, held) in &locks.holders {
-                    if owner != waiter.txn && held.iter().any(|mode| waiter.mode.conflicts(mode)) {
-                        blockers.push(owner);
-                    }
-                }
-                for preceding in &locks.queue[..position] {
-                    let preceding = &self.waiters[preceding];
-                    if preceding.txn != waiter.txn && waiter.mode.conflicts(preceding.mode) {
-                        blockers.push(preceding.txn);
-                    }
-                }
+                let blockers = edges.entry(self.waiters[id].txn).or_default();
+                self.queue_blockers(locks, position, blockers);
             }
         }
         let mut visited = HashMap::new();
@@ -457,3 +514,7 @@ impl State {
 #[cfg(test)]
 #[path = "locks_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "locks_deadlock_tests.rs"]
+mod deadlock_tests;

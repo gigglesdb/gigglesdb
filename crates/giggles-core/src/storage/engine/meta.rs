@@ -191,6 +191,36 @@ fn optional(kv: &dyn KvRead, key: &[u8]) -> Result<Option<u64>, FormatError> {
         })
         .transpose()
 }
+/// Live role-bootstrap (kind-7) catalog entries in the Catalog column family.
+pub(crate) fn live_role_bootstrap_entries(kv: &dyn KvRead) -> Result<usize, FormatError> {
+    // Descending timestamps make the first physical version the latest. Only
+    // kind-7 keys are relevant, but malformed kind-7 envelopes fail closed.
+    let mut previous = None;
+    let mut live = 0usize;
+    for item in kv
+        .range(
+            Keyspace::Catalog,
+            Bound::Included(&[7]),
+            Bound::Excluded(&[8]),
+            Direction::Forward,
+        )
+        .map_err(corrupt)?
+    {
+        let (key, value) = item.map_err(corrupt)?;
+        if key.len() < 9 {
+            return Err(corrupt("short kind-7 versioned key"));
+        }
+        let user = &key[..key.len() - 8];
+        if previous.as_deref() == Some(user) {
+            continue;
+        }
+        previous = Some(user.to_vec());
+        if super::mvcc::decode(&value).map_err(corrupt)?.is_some() {
+            live += 1;
+        }
+    }
+    Ok(live)
+}
 pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     // Features gate the key allowlist; a missing or malformed value gates
     // nothing and fails below exactly as before.
@@ -259,32 +289,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     {
         return Err(corrupt("missing or invalid engine"));
     }
-    // Descending timestamps make the first physical version the latest. Only
-    // kind-7 keys are relevant, but malformed kind-7 envelopes fail closed.
-    let mut previous = None;
-    let mut live = 0usize;
-    for item in kv
-        .range(
-            Keyspace::Catalog,
-            Bound::Included(&[7]),
-            Bound::Excluded(&[8]),
-            Direction::Forward,
-        )
-        .map_err(corrupt)?
-    {
-        let (key, value) = item.map_err(corrupt)?;
-        if key.len() < 9 {
-            return Err(corrupt("short kind-7 versioned key"));
-        }
-        let user = &key[..key.len() - 8];
-        if previous.as_deref() == Some(user) {
-            continue;
-        }
-        previous = Some(user.to_vec());
-        if super::mvcc::decode(&value).map_err(corrupt)?.is_some() {
-            live += 1;
-        }
-    }
+    let live = live_role_bootstrap_entries(kv)?;
     // In range mode (R5) the node's features are the union of its ranges' bits and the role
     // catalog lives in the system range only; the range engine checks it per range at open.
     if features & RANGES == 0

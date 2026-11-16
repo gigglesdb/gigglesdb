@@ -215,16 +215,20 @@ fn a_crash_at_each_install_step_recovers_to_a_consistent_range() {
         let left = range_contents(&dest, B);
         assert!(
             left.iter().all(|(ks, rows)| match ks {
-                Keyspace::Meta => rows.len() == 1, // the descriptor
+                Keyspace::Meta => rows.len() == 2, // descriptor + needs-snapshot marker
                 _ => rows.is_empty(),
             }),
             "{step:?}: {left:?}"
         );
         assert_eq!(rows(&dest, Keyspace::Rows).len(), 3, "range 1 rows survive");
-        assert_eq!(
-            dest.apply(B, &batch(1), pos(1, 1)).unwrap(),
-            RangeApplyOutcome::Applied
-        );
+        // The rolled-back range applies nothing until a snapshot is installed, also after reopen.
+        assert!(matches!(dest.apply(B, &batch(1), pos(1, 1)), Err(CoreError::Corrupt(_))));
+        assert!(dest.export(B, &sub.sub("again")).is_err());
+        drop(dest);
+        let dest = RangeStore::open(sub.sub("dest")).unwrap();
+        assert!(matches!(dest.apply(B, &batch(1), pos(1, 1)), Err(CoreError::Corrupt(_))));
+        assert_eq!(dest.install(B, &dir.sub("snap")).unwrap(), at);
+        assert_eq!(range_contents(&dest, B), expect, "{step:?} reinstalled");
     }
 }
 

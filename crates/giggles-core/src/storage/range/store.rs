@@ -46,6 +46,9 @@ pub struct RangeStore {
     locks: Mutex<HashMap<RangeId, Arc<Mutex<()>>>>,
     /// Serializes read-modify-write of the node's `Meta/features` union.
     features: Mutex<()>,
+    /// Serializes installs with each other and with descriptor changes, so the overlap fence
+    /// of one install sees every other range's bounds.
+    installs: Mutex<()>,
 }
 
 impl RangeStore {
@@ -86,6 +89,7 @@ impl RangeStore {
             domain,
             locks: Mutex::new(HashMap::new()),
             features: Mutex::new(()),
+            installs: Mutex::new(()),
         }
     }
 
@@ -220,8 +224,21 @@ impl RangeStore {
             None => WriteBatch::default(),
         };
         let (mut batch, outcome) = match check_batch(&descriptor, &batch) {
-            Ok(features) => (batch, Some(features)),
-            Err(_) => (WriteBatch::default(), None),
+            Ok(check) => (batch, Some(check)),
+            Err(BatchError::Outside(_)) => (WriteBatch::default(), None),
+            // A value this build cannot validate (for example a feature bit from a newer
+            // build) stops the range instead of being refused: refusing would drop data that
+            // a newer replica applies (R4 fails the same way, on the next open).
+            Err(BatchError::Invalid(reason)) => {
+                return Err(CoreError::Corrupt(format!(
+                    "range {} batch at {}: {reason}",
+                    range.0, at.index
+                )));
+            }
+        };
+        let _installs = match outcome {
+            Some(BatchCheck { descriptor: true, .. }) => Some(self.installs_lock()?),
+            _ => None,
         };
         batch.put(
             Keyspace::Meta,
@@ -233,11 +250,11 @@ impl RangeStore {
                 self.kv.write(batch, Durability::NoSync)?;
                 Ok(RangeApplyOutcome::Refused)
             }
-            Some(0) => {
+            Some(BatchCheck { features: 0, .. }) => {
                 self.kv.write(batch, Durability::NoSync)?;
                 Ok(RangeApplyOutcome::Applied)
             }
-            Some(bits) => {
+            Some(BatchCheck { features: bits, .. }) => {
                 let _features = self
                     .features
                     .lock()
@@ -252,6 +269,13 @@ impl RangeStore {
     /// Flush all applied batches to durable storage.
     pub fn flush(&self) -> Result<(), CoreError> {
         Ok(self.kv.flush_barrier()?)
+    }
+
+    /// Serializes installs and descriptor changes across ranges.
+    pub(super) fn installs_lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, CoreError> {
+        self.installs
+            .lock()
+            .map_err(|_| CoreError::Corrupt("install lock poisoned".into()))
     }
 
     /// Serializes a `Meta/features` read-modify-write against concurrent applies.
@@ -307,32 +331,63 @@ pub(super) fn union_node_features(
     Ok(())
 }
 
-/// Checks every op of `batch` against the range. `Ok(bits)` returns the feature bits the batch
-/// writes into the range's `features` key (0 if none); `Err` names the first op outside it.
+/// Checks every op of `batch` against the range: `Err(Outside)` names the first op outside it,
+/// `Err(Invalid)` a range-local value this build rejects.
 ///
 /// Allowed: non-Meta keys and delete-ranges inside the descriptor (keys.rs, exact for keys);
 /// Meta puts and deletes of this range's local keys other than `applied` and `install` (the
 /// store writes those), with values `validate_meta` accepts, and no delete of `descriptor`; a
 /// Meta delete-range inside the range's local interval that covers none of those three.
-pub(crate) fn check_batch(descriptor: &RangeDescriptor, batch: &WriteBatch) -> Result<u64, String> {
+/// Why `check_batch` rejected a batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BatchError {
+    /// An op outside the range (a pure function of the descriptor and the batch bytes, the
+    /// same in every build): the batch is refused.
+    Outside(String),
+    /// A range-local value this build does not accept: applying stops with an error.
+    Invalid(String),
+}
+impl std::fmt::Display for BatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Outside(reason) | Self::Invalid(reason) => f.write_str(reason),
+        }
+    }
+}
+
+/// What an accepted batch does to range-wide state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchCheck {
+    /// Feature bits written into the range's `features` key (0 if none).
+    pub(crate) features: u64,
+    /// Whether the batch replaces the range's descriptor.
+    pub(crate) descriptor: bool,
+}
+
+pub(crate) fn check_batch(
+    descriptor: &RangeDescriptor,
+    batch: &WriteBatch,
+) -> Result<BatchCheck, BatchError> {
+    let outside = BatchError::Outside;
     let id = descriptor.id;
     // `applied` and `install` belong to the store; the descriptor may be replaced (split) but
     // never removed, or every later apply of the range would fail on every replica.
-    let own_key = |key: &[u8], delete: bool| -> Result<RangeLocalKey, String> {
+    let own_key = |key: &[u8], delete: bool| -> Result<RangeLocalKey, BatchError> {
         match parse_range_local_key(key) {
             Some((owner, sub)) if owner == id => match sub {
                 RangeLocalKey::Applied | RangeLocalKey::Install => {
-                    Err(format!("batch writes range {} {sub:?}", id.0))
+                    Err(outside(format!("batch writes range {} {sub:?}", id.0)))
                 }
                 RangeLocalKey::Descriptor if delete => {
-                    Err(format!("batch deletes range {} descriptor", id.0))
+                    Err(outside(format!("batch deletes range {} descriptor", id.0)))
                 }
                 sub => Ok(sub),
             },
-            _ => Err(format!("meta key outside range {}", id.0)),
+            _ => Err(outside(format!("meta key outside range {}", id.0))),
         }
     };
     let mut features = 0;
+    let mut replaces_descriptor = false;
     for op in batch.ops() {
         match op {
             Op::Put {
@@ -341,7 +396,9 @@ pub(crate) fn check_batch(descriptor: &RangeDescriptor, batch: &WriteBatch) -> R
                 value,
             } => {
                 let sub = own_key(key, false)?;
-                check_range_value(id, &sub, value, u64::MAX).map_err(|e| e.to_string())?;
+                check_range_value(id, &sub, value, u64::MAX)
+                    .map_err(|e| BatchError::Invalid(e.to_string()))?;
+                replaces_descriptor |= sub == RangeLocalKey::Descriptor;
                 if sub == RangeLocalKey::Features {
                     features |= u64::from_be_bytes(value.as_slice().try_into().expect("checked"));
                 }
@@ -362,7 +419,7 @@ pub(crate) fn check_batch(descriptor: &RangeDescriptor, batch: &WriteBatch) -> R
                 }
                 let (lo, hi) = local_interval(id);
                 if start < &lo || end > &hi {
-                    return Err(format!("meta delete-range outside range {}", id.0));
+                    return Err(outside(format!("meta delete-range outside range {}", id.0)));
                 }
                 for protected in [
                     RangeLocalKey::Applied,
@@ -371,26 +428,31 @@ pub(crate) fn check_batch(descriptor: &RangeDescriptor, batch: &WriteBatch) -> R
                 ] {
                     let key = range_local_key(id, &protected);
                     if start <= &key && &key < end {
-                        return Err(format!(
+                        return Err(outside(format!(
                             "meta delete-range covers range {} {protected:?}",
                             id.0
-                        ));
+                        )));
                     }
                 }
             }
             Op::Put { ks, key, .. } | Op::Delete { ks, key } => {
-                if !contains_raw(descriptor, *ks, key).map_err(|e| format!("{e:?}"))? {
-                    return Err(format!("{ks:?} key outside range {}", id.0));
+                if !contains_raw(descriptor, *ks, key).map_err(|e| outside(format!("{e:?}")))? {
+                    return Err(outside(format!("{ks:?} key outside range {}", id.0)));
                 }
             }
             Op::DeleteRange { ks, start, end } => {
-                if !interval_in_range(descriptor, *ks, start, end).map_err(|e| format!("{e:?}"))? {
-                    return Err(format!("{ks:?} delete-range outside range {}", id.0));
+                if !interval_in_range(descriptor, *ks, start, end)
+                    .map_err(|e| outside(format!("{e:?}")))?
+                {
+                    return Err(outside(format!("{ks:?} delete-range outside range {}", id.0)));
                 }
             }
         }
     }
-    Ok(features)
+    Ok(BatchCheck {
+        features,
+        descriptor: replaces_descriptor,
+    })
 }
 
 #[cfg(test)]

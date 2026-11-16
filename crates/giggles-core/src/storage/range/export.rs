@@ -12,7 +12,8 @@
 //! applied position), ORs the range's features into the node's `Meta/features` and clears the
 //! marker. Step 2 is not atomic across keyspaces, so `RangeStore::open` finds a marker and
 //! completes the install from the source directory when it is still intact, or else rolls the
-//! range back to empty (descriptor kept, no applied position, so it needs a new snapshot).
+//! range back to empty: descriptor kept, no applied position, and a marker with an empty source
+//! that makes `apply` refuse the range until a new snapshot is installed.
 //!
 //! Keys of an older, wider descriptor of this range that fall outside the exported descriptor
 //! are not deleted: after a split they belong to the sibling range.
@@ -28,7 +29,8 @@
 //!  install][n BE2][(space tag u8, keys BE8, bytes BE8, file flag u8, file: len BE2 + UTF-8)]*n`
 //! with one entry per range space the descriptor owns, in `SPACES` order.
 //! Install marker value (persisted, version 1, strict):
-//! `[ver=1][descriptor: len BE4 + bytes][source dir: len BE4 + UTF-8]`.
+//! `[ver=1][descriptor: len BE4 + bytes][source dir: len BE4 + UTF-8]`; an empty source means
+//! "rolled back, needs a snapshot".
 use std::{
     ops::Bound,
     path::{Path, PathBuf},
@@ -405,6 +407,7 @@ impl RangeStore {
         let _guard = lock
             .lock()
             .map_err(|_| CoreError::Corrupt("range apply lock poisoned".into()))?;
+        let _installs = self.installs_lock()?;
         self.can_install(range, &manifest)?;
         let mut batch = WriteBatch::default();
         batch.put(
@@ -537,6 +540,10 @@ impl RangeStore {
         }
         for (range, value) in marked {
             let (descriptor, source) = decode_marker(&value)?;
+            if source.as_os_str().is_empty() {
+                // Rolled back earlier: the range waits for a new snapshot.
+                continue;
+            }
             match Manifest::read(&source) {
                 Ok(manifest) if manifest.range == range && manifest.descriptor == descriptor => {
                     if let Err(error) = self.finish_install(&manifest, &source, Step::Done) {
@@ -553,7 +560,9 @@ impl RangeStore {
         Ok(())
     }
 
-    /// Empty the range's data and local keys, keep its descriptor, clear the marker.
+    /// Empty the range's data and local keys and keep its descriptor plus a marker with no
+    /// source: the range needs a new snapshot. `apply` refuses it until an install clears the
+    /// marker, so log entries never re-apply over the rolled-back state.
     fn roll_back_install(&self, descriptor: &RangeDescriptor) -> Result<(), CoreError> {
         let data: Vec<SstInstall> = intervals(descriptor)
             .into_iter()
@@ -565,6 +574,11 @@ impl RangeStore {
             Keyspace::Meta,
             range_local_key(descriptor.id, &RangeLocalKey::Descriptor),
             descriptor.encode().map_err(corrupt)?,
+        );
+        batch.put(
+            Keyspace::Meta,
+            range_local_key(descriptor.id, &RangeLocalKey::Install),
+            encode_marker(descriptor, Path::new(""))?,
         );
         Ok(self.kv().write(batch, Durability::Sync)?)
     }

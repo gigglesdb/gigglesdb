@@ -285,6 +285,10 @@ impl Kv {
             fenced: AtomicBool::new(false),
         }
     }
+    /// Fences the handle: every later call fails without reaching the backend.
+    pub(crate) fn fence(&self) {
+        self.fenced.store(true, Ordering::Release);
+    }
     pub(crate) fn is_fenced(&self) -> bool {
         self.fenced.load(Ordering::Acquire)
     }

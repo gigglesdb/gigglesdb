@@ -9,6 +9,7 @@
 //! The engine keeps three per-database Meta keys, `last_commit_ts`, `features` (sequencer) and
 //! `gc_watermark` (gc.rs). A range engine keeps them per range, so this backend maps exact
 //! `get`s and writes of them to `Meta/range/<id>/<same name>`. Meta range scans are not mapped.
+//! Commit markers `Seq/[5] || xid` map to `Meta/range/<id>/marker/<xid>` the same way.
 //! `subversion` stays node-wide: a batch writing it is refused (format upgrades are not run in
 //! range mode).
 use std::{ops::Bound, sync::Arc};
@@ -31,13 +32,21 @@ const MAPPED: [(&[u8], RangeLocalKey); 3] = [
 ];
 
 fn mapped(range: RangeId, ks: Keyspace, key: &[u8]) -> Option<Vec<u8>> {
-    if ks != Keyspace::Meta {
-        return None;
+    match ks {
+        Keyspace::Meta => MAPPED
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, sub)| range_local_key(range, sub)),
+        // A commit marker `Seq/[5] || xid` (xact.rs marker_key) is range-local in a cluster
+        // (design.md section 6, `marker/<xid>`).
+        Keyspace::Seq => match key {
+            [5, xid @ ..] => <[u8; 8]>::try_from(xid)
+                .ok()
+                .map(|xid| range_local_key(range, &RangeLocalKey::Marker(u64::from_be_bytes(xid)))),
+            _ => None,
+        },
+        _ => None,
     }
-    MAPPED
-        .iter()
-        .find(|(name, _)| *name == key)
-        .map(|(_, sub)| range_local_key(range, sub))
 }
 
 /// Maps the sequencer's Meta keys of `inner` reads to the range's own keys.

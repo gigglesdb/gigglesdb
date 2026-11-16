@@ -1,13 +1,15 @@
 //! Single durable commit sequencer and bounded conflict history.
 use super::{
+    codec::CodecError,
     hlc::{HlcClock, Ts},
     kv::{Durability, Keyspace, Kv, KvRead, WriteBatch},
     txn::TxnError,
     once_guard::CommitGuard,
 };
+use crate::storage::range_api::TsOracle;
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -43,6 +45,142 @@ impl Clock for ManualClock {
     }
 }
 
+/// Where commit timestamps come from (GD-0075 design section 4, rules O1/O4/O7).
+#[derive(Clone, Default)]
+pub(crate) enum TsSource {
+    /// The local hybrid logical clock; the behaviour before ranges.
+    #[default]
+    Hlc,
+    /// A range leader: one oracle timestamp per commit group, refetched while it
+    /// is not above the served-read floor and the last commit timestamp (O4).
+    Oracle(Arc<dyn TsOracle>),
+}
+impl std::fmt::Debug for TsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hlc => f.write_str("Hlc"),
+            Self::Oracle(_) => f.write_str("Oracle(..)"),
+        }
+    }
+}
+/// Refetches allowed before an oracle that keeps returning stale values fails the group.
+const ORACLE_REFETCH_LIMIT: usize = 1000;
+/// The served-read floor and in-flight timestamp reservations of one range leader (GD-0075
+/// design section 4a, O3/O4/O6): every commit or prepare timestamp is reserved above the floor
+/// and stays registered until its write is applied; a read at T raises the floor to T and waits
+/// for every reservation at or below T. Check-and-register and raise-and-collect take one mutex,
+/// so a reservation either sees the raised floor (and refetches) or is waited for.
+pub(crate) struct ServedGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+struct GateState {
+    served: Ts,
+    /// First timestamp of each live reservation, with a count.
+    in_flight: BTreeMap<Ts, usize>,
+}
+impl ServedGate {
+    pub(crate) fn new(floor: Ts) -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                served: floor,
+                in_flight: BTreeMap::new(),
+            }),
+            changed: Condvar::new(),
+        }
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    pub(crate) fn served(&self) -> Ts {
+        self.lock().served
+    }
+    /// Raises the floor without waiting (leader open, O7).
+    pub(crate) fn raise(&self, ts: Ts) {
+        let mut state = self.lock();
+        state.served = state.served.max(ts);
+    }
+    /// Reserves `n` consecutive oracle timestamps whose first is above max(floor, `last`) and
+    /// registers the reservation in flight. The oracle is called outside the mutex.
+    pub(crate) fn reserve(&self, oracle: &dyn TsOracle, n: u32, last: Ts) -> Result<Ts, TxnError> {
+        for _ in 0..ORACLE_REFETCH_LIMIT {
+            // Timestamp and Ts share the ms << 16 | logical layout.
+            let first = Ts(oracle
+                .next(n)
+                .map_err(|_| TxnError::Codec(CodecError::Clock))?
+                .0);
+            let mut state = self.lock();
+            if first > state.served.max(last) {
+                *state.in_flight.entry(first).or_default() += 1;
+                return Ok(first);
+            }
+        }
+        Err(TxnError::Codec(CodecError::Clock))
+    }
+    /// Waits until no reservation is in flight (an old leader's last writes). False when
+    /// `deadline` passes first.
+    pub(crate) fn drain(&self, deadline: Instant) -> bool {
+        let mut state = self.lock();
+        while !state.in_flight.is_empty() {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        true
+    }
+    /// Ends a reservation made by `reserve` (applied, failed or abandoned).
+    pub(crate) fn finish(&self, first: Ts) {
+        let mut state = self.lock();
+        if let Some(count) = state.in_flight.get_mut(&first) {
+            *count -= 1;
+            if *count == 0 {
+                state.in_flight.remove(&first);
+            }
+        }
+        drop(state);
+        self.changed.notify_all();
+    }
+    /// O6: raises the floor to `ts`, then waits until no reservation at or below `ts` is in
+    /// flight. False when `deadline` passes first.
+    pub(crate) fn serve(&self, ts: Ts, deadline: Option<Instant>) -> bool {
+        let mut state = self.lock();
+        state.served = state.served.max(ts);
+        while state.in_flight.range(..=ts).next().is_some() {
+            match deadline {
+                None => state = self.changed.wait(state).unwrap_or_else(|p| p.into_inner()),
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return false;
+                    }
+                    state = self
+                        .changed
+                        .wait_timeout(state, deadline - now)
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0;
+                }
+            }
+        }
+        true
+    }
+}
+/// Finishes a reservation when dropped.
+struct Reservation<'a> {
+    gate: &'a ServedGate,
+    first: Ts,
+}
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.gate.finish(self.first);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SequencerConfig {
     /// Maximum additional requests gathered after the first; zero means singleton.
@@ -53,6 +191,7 @@ pub(crate) struct SequencerConfig {
     pub(crate) group_wait: Duration,
     pub(crate) recent_log_bytes: usize,
     pub(crate) write_set_bytes: usize,
+    pub(crate) ts_source: TsSource,
 }
 impl Default for SequencerConfig {
     fn default() -> Self {
@@ -62,6 +201,7 @@ impl Default for SequencerConfig {
             group_wait: Duration::ZERO,
             recent_log_bytes: 256 * 1024 * 1024,
             write_set_bytes: 256 * 1024 * 1024,
+            ts_source: TsSource::Hlc,
         }
     }
 }
@@ -202,6 +342,8 @@ pub(crate) struct Sequencer {
     kv: Arc<Kv>,
     config: SequencerConfig,
     shared: Arc<Shared>,
+    /// Served-read floor and in-flight reservations (O3/O4/O6); used in oracle mode.
+    served: Arc<ServedGate>,
     sender: mpsc::Sender<Message>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -231,6 +373,8 @@ impl Sequencer {
                 active: BTreeMap::new(),
             }),
         });
+        let served = Arc::new(ServedGate::new(Ts(0)));
+        let worker_served = served.clone();
         let (sender, receiver) = mpsc::channel();
         let worker_shared = shared.clone();
         let worker_kv = kv.clone();
@@ -242,6 +386,7 @@ impl Sequencer {
                 clock,
                 worker_config,
                 worker_shared,
+                worker_served,
                 seed,
                 features,
                 subversion,
@@ -251,6 +396,7 @@ impl Sequencer {
             kv,
             config,
             shared,
+            served,
             sender,
             worker: Mutex::new(Some(worker)),
         }))
@@ -263,6 +409,15 @@ impl Sequencer {
         self.config.group_max_bytes
     }
 
+    /// The served-read gate shared with the range engine's reads and prepares (R5-33, R5-36).
+    pub(crate) fn served_gate(&self) -> Arc<ServedGate> {
+        self.served.clone()
+    }
+    /// Raises the served-read floor to at least `ts`.
+    #[cfg(test)]
+    pub(crate) fn note_served(&self, ts: Ts) {
+        self.served.raise(ts);
+    }
     pub(crate) fn write_set_bytes(&self) -> usize {
         self.config.write_set_bytes
     }
@@ -452,6 +607,7 @@ fn run(
     clock: Arc<dyn Clock>,
     config: SequencerConfig,
     shared: Arc<Shared>,
+    served: Arc<ServedGate>,
     seed: Ts,
     mut features: u64,
     mut subversion: u32,
@@ -501,6 +657,8 @@ fn run(
             &mut log,
             &mut features,
             &mut subversion,
+            &config.ts_source,
+            &served,
         );
     }
     for message in receiver.try_iter() {
@@ -569,7 +727,36 @@ fn process_group(
     log: &mut RecentLog,
     features: &mut u64,
     subversion: &mut u32,
+    ts_source: &TsSource,
+    served: &ServedGate,
 ) -> bool {
+    // Oracle mode reserves the group's timestamps before anything is staged, so an
+    // oracle failure fails every request and writes nothing.
+    // Each write request gets its own timestamp of one `next(n)` reservation (first + i).
+    let writers = group.iter().filter(|p| !p.request.writes.is_empty()).count();
+    // The reservation stays in flight (readers at or above it wait) until this group ends.
+    let mut _reservation = None;
+    let mut group_ts = match ts_source {
+        TsSource::Oracle(oracle) if writers > 0 => {
+            let n = u32::try_from(writers).unwrap_or(u32::MAX);
+            match served.reserve(oracle.as_ref(), n, hlc.last) {
+                Ok(ts) => {
+                    _reservation = Some(Reservation {
+                        gate: served,
+                        first: ts,
+                    });
+                    Some(ts)
+                }
+                Err(error) => {
+                    for p in group {
+                        let _ = p.reply.send(Err(error.clone()));
+                    }
+                    return false;
+                }
+            }
+        }
+        _ => None,
+    };
     let visible = shared
         .snap
         .lock()
@@ -647,6 +834,10 @@ fn process_group(
         }
         let ts = if request.writes.is_empty() {
             visible
+        } else if let Some(ts) = group_ts.as_mut() {
+            let this = *ts;
+            *ts = Ts(ts.0 + 1);
+            this
         } else {
             match HlcClock::new(hlc.last).next(clock.now_ms()) {
                 Ok(ts) => ts,
@@ -792,6 +983,8 @@ impl Sequencer {
             log,
             &mut features,
             &mut subversion,
+            &self.config.ts_source,
+            &self.served,
         );
         receives
             .into_iter()
@@ -819,3 +1012,7 @@ mod cap_tests;
 #[cfg(test)]
 #[path = "native_format_tests.rs"]
 mod native_format_tests;
+
+#[cfg(test)]
+#[path = "commit_tssource_tests.rs"]
+mod tssource_tests;
