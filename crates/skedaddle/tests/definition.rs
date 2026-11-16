@@ -88,6 +88,21 @@ fn spanner_connection(dialect: &str) -> Value {
     })
 }
 
+fn gigglesdb_connection(deployment: &str) -> Value {
+    let mut value = json!({
+        "engine": "gigglesdb",
+        "version": "PostgreSQL 18.0 (GigglesDB 0.1.0)",
+        "gigglesdb": {"deployment": deployment}
+    });
+    if deployment == "embedded" {
+        value["gigglesdb"]["database_path"] = json!("J:/gigglesdb-work/declared-db");
+    } else {
+        value["connection_ref"] = json!("env:UNRESOLVED_GIGGLESDB_CONNECTION");
+        value["tls_ca_ref"] = json!("env:UNRESOLVED_GIGGLESDB_CA");
+    }
+    value
+}
+
 fn assert_spanner_blockers(report: &CapabilityReport, side: &str) {
     assert!(!report.blocking().is_empty());
     for capability in [
@@ -203,21 +218,30 @@ fn spanner_and_gigglesdb_are_independently_unverified_and_unsupported() {
         for (side, unsupported_side) in [("source", "destination"), ("destination", "source")] {
             let mut value = example_value();
             value[side] = spanner_connection(dialect);
-            value[unsupported_side]["engine"] = json!("gigglesdb");
+            value[unsupported_side] = gigglesdb_connection("server");
             let report = CapabilityReport::from_definition(&parse_value(&value).unwrap()).unwrap();
             assert_spanner_blockers(&report, side);
-            assert_eq!(report.blocking().len(), 5);
+            assert_eq!(report.blocking().len(), 7);
             let unsupported: Vec<_> = report
                 .items
                 .iter()
                 .filter(|item| item.status == ItemStatus::Unsupported)
                 .collect();
-            assert_eq!(unsupported.len(), 1);
-            assert_eq!(unsupported[0].id, "connector.unsupported");
-            assert_eq!(unsupported[0].criticality, Criticality::Critical);
-            let evidence = &unsupported[0].evidence[0].description;
-            assert!(evidence.contains(&format!("{unsupported_side}: gigglesdb")));
-            assert!(!evidence.contains("spanner"));
+            assert_eq!(
+                unsupported.len(),
+                if unsupported_side == "source" { 2 } else { 1 }
+            );
+            assert!(unsupported.iter().all(|item| {
+                item.id
+                    .starts_with(&format!("{unsupported_side}.gigglesdb."))
+                    && item.criticality == Criticality::Critical
+            }));
+            assert!(
+                report
+                    .items
+                    .iter()
+                    .all(|item| item.id != "connector.unsupported")
+            );
         }
     }
 }
@@ -379,6 +403,9 @@ fn non_spanner_endpoints_require_engine_specific_shapes_and_versions() {
             for field in ["connection_ref", "version"] {
                 let mut value = example_value();
                 value[side]["engine"] = json!(engine);
+                if engine == "gigglesdb" {
+                    value[side] = gigglesdb_connection("server");
+                }
                 value[side].as_object_mut().unwrap().remove(field);
                 let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
                     panic!("{engine} must require {field}");
@@ -435,7 +462,7 @@ fn non_spanner_endpoints_require_engine_specific_shapes_and_versions() {
 #[test]
 fn gigglesdb_is_declared_and_preflight_remains_unsupported() {
     let mut value = example_value();
-    value["source"]["engine"] = json!("gigglesdb");
+    value["source"] = gigglesdb_connection("server");
     let definition = parse_value(&value).unwrap();
     assert_eq!(
         definition.source.engine,
@@ -448,10 +475,316 @@ fn gigglesdb_is_declared_and_preflight_remains_unsupported() {
     );
     let report = CapabilityReport::from_definition(&definition).unwrap();
     assert!(
-        report.blocking().iter().any(
-            |item| item.id == "connector.unsupported" && item.status == ItemStatus::Unsupported
-        )
+        report
+            .blocking()
+            .iter()
+            .any(|item| item.id == "source.gigglesdb.source_capture"
+                && item.status == ItemStatus::Unsupported)
     );
+}
+
+#[test]
+fn gigglesdb_server_and_embedded_round_trip_on_either_side() {
+    use skedaddle::definition::GigglesdbDeployment;
+    for (deployment, expected) in [
+        ("server", GigglesdbDeployment::Server),
+        ("embedded", GigglesdbDeployment::Embedded),
+    ] {
+        for side in ["source", "destination"] {
+            let mut value = example_value();
+            value[side] = gigglesdb_connection(deployment);
+            let definition = parse_value(&value).unwrap();
+            let connection = if side == "source" {
+                &definition.source
+            } else {
+                &definition.destination
+            };
+            assert_eq!(connection.gigglesdb.as_ref().unwrap().deployment, expected);
+            assert_eq!(connection.version, "PostgreSQL 18.0 (GigglesDB 0.1.0)");
+            let bytes = serde_json::to_string(&definition).unwrap();
+            assert_eq!(MigrationDefinition::from_json(&bytes).unwrap(), definition);
+            let serialized = serde_json::to_value(connection).unwrap();
+            assert_eq!(serialized["gigglesdb"]["deployment"], deployment);
+            assert_eq!(
+                serialized["gigglesdb"].get("database_path").is_some(),
+                deployment == "embedded"
+            );
+        }
+    }
+}
+
+fn assert_validation_at(value: &Value, path: &str) {
+    let Err(DefinitionError::Validation(errors)) = parse_value(value) else {
+        panic!("expected validation error at {path}");
+    };
+    assert!(errors.iter().any(|error| error.path == path), "{errors:?}");
+}
+
+#[test]
+fn gigglesdb_blocks_must_match_the_engine_on_either_side() {
+    for side in ["source", "destination"] {
+        let mut value = example_value();
+        value[side] = gigglesdb_connection("server");
+        value[side].as_object_mut().unwrap().remove("gigglesdb");
+        assert_validation_at(&value, &format!("{side}.gigglesdb"));
+        for engine in [
+            "postgresql",
+            "mysql",
+            "mariadb",
+            "sqlite",
+            "sql-server",
+            "oracle",
+            "mongodb",
+            "spanner",
+        ] {
+            value[side] = if engine == "spanner" {
+                spanner_connection("google-sql")
+            } else {
+                example_value()[side].clone()
+            };
+            value[side]["engine"] = json!(engine);
+            value[side]["gigglesdb"] = json!({"deployment": "server"});
+            assert_validation_at(&value, &format!("{side}.gigglesdb"));
+        }
+    }
+}
+
+#[test]
+fn gigglesdb_server_requires_pgwire_and_forbids_database_path() {
+    for side in ["source", "destination"] {
+        let mut value = example_value();
+        value[side] = gigglesdb_connection("server");
+        value[side]
+            .as_object_mut()
+            .unwrap()
+            .remove("connection_ref");
+        assert_validation_at(&value, &format!("{side}.connection_ref"));
+        value[side] = gigglesdb_connection("server");
+        value[side]["gigglesdb"]["database_path"] = json!("/absolute/db");
+        assert_validation_at(&value, &format!("{side}.gigglesdb.database_path"));
+        value[side] = gigglesdb_connection("server");
+        value[side].as_object_mut().unwrap().remove("tls_ca_ref");
+        assert_validation_at(&value, &format!("{side}.tls_ca_ref"));
+        value[side]["tls"] = json!("disable-for-local-test");
+        assert!(parse_value(&value).is_ok());
+        value[side]["tls_ca_ref"] = json!("env:UNRESOLVED_CA");
+        assert_validation_at(&value, &format!("{side}.tls_ca_ref"));
+    }
+}
+
+#[test]
+fn gigglesdb_embedded_requires_a_clean_absolute_database_path() {
+    for side in ["source", "destination"] {
+        let mut value = example_value();
+        value[side] = gigglesdb_connection("embedded");
+        value[side]["gigglesdb"]
+            .as_object_mut()
+            .unwrap()
+            .remove("database_path");
+        assert_validation_at(&value, &format!("{side}.gigglesdb.database_path"));
+        for invalid in [
+            "",
+            " ",
+            "relative/db",
+            "C:relative",
+            "\\rooted",
+            "\\\\",
+            "\\\\server",
+            "\\\\server\\",
+            " /db",
+            "/db ",
+            "/a\nb",
+            "/a\0b",
+            "/a\u{7f}b",
+        ] {
+            value[side]["gigglesdb"]["database_path"] = json!(invalid);
+            assert_validation_at(&value, &format!("{side}.gigglesdb.database_path"));
+        }
+        for valid in [
+            "/var/lib/gigglesdb",
+            "J:/gigglesdb-work/db",
+            "J:\\gigglesdb-work\\db",
+            "\\\\server\\share\\db",
+        ] {
+            value[side]["gigglesdb"]["database_path"] = json!(valid);
+            assert!(parse_value(&value).is_ok(), "rejected {valid:?}");
+        }
+    }
+}
+
+#[test]
+fn gigglesdb_embedded_rejects_pgwire_and_tls_configuration() {
+    for side in ["source", "destination"] {
+        for (field, invalid) in [
+            ("connection_ref", json!("env:UNRESOLVED_CONNECTION")),
+            ("tls", json!("disable-for-local-test")),
+            ("tls_ca_ref", json!("env:UNRESOLVED_CA")),
+        ] {
+            let mut value = example_value();
+            value[side] = gigglesdb_connection("embedded");
+            value[side][field] = invalid;
+            assert_validation_at(&value, &format!("{side}.{field}"));
+        }
+        let mut value = example_value();
+        value[side] = gigglesdb_connection("embedded");
+        value[side]["tls"] = json!("require");
+        assert!(parse_value(&value).is_ok());
+    }
+}
+
+#[test]
+fn gigglesdb_distributed_parses_but_fails_with_the_scope_decision() {
+    use skedaddle::definition::GigglesdbDeployment;
+    for side in ["source", "destination"] {
+        let mut value = example_value();
+        value[side] = gigglesdb_connection("distributed");
+        let definition: MigrationDefinition = serde_json::from_value(value.clone()).unwrap();
+        let connection = if side == "source" {
+            &definition.source
+        } else {
+            &definition.destination
+        };
+        assert_eq!(
+            connection.gigglesdb.as_ref().unwrap().deployment,
+            GigglesdbDeployment::Distributed
+        );
+        let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+            panic!("distributed deployment accepted");
+        };
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, format!("{side}.gigglesdb.deployment"));
+        assert_eq!(
+            errors[0].message,
+            "distributed GigglesDB deployments are out of scope (GD-0065 Q3)"
+        );
+        assert!(CapabilityReport::from_definition(&definition).is_err());
+    }
+}
+
+#[test]
+fn gigglesdb_version_is_required_for_both_deployments_and_sides() {
+    for deployment in ["server", "embedded"] {
+        for side in ["source", "destination"] {
+            for version in [None, Some(""), Some(" \t\n")] {
+                let mut value = example_value();
+                value[side] = gigglesdb_connection(deployment);
+                if let Some(version) = version {
+                    value[side]["version"] = json!(version);
+                } else {
+                    value[side].as_object_mut().unwrap().remove("version");
+                }
+                assert_validation_at(&value, &format!("{side}.version"));
+            }
+        }
+    }
+}
+
+#[test]
+fn gigglesdb_endpoint_structure_is_strict() {
+    for endpoint in [
+        json!({}),
+        json!({"deployment": "Server"}),
+        json!({"deployment": "unknown"}),
+        json!({"deployment": "server", "typo": true}),
+        json!({"deployment": "embedded", "database_path": 42}),
+    ] {
+        let mut value = example_value();
+        value["destination"] = gigglesdb_connection("server");
+        value["destination"]["gigglesdb"] = endpoint;
+        assert!(matches!(parse_value(&value), Err(DefinitionError::Json(_))));
+    }
+}
+
+#[test]
+fn gigglesdb_capability_gates_are_separate_critical_and_never_supported() {
+    for side in ["source", "destination"] {
+        for deployment in ["server", "embedded"] {
+            let mut value = example_value();
+            value[side] = gigglesdb_connection(deployment);
+            // No affirmative exclusion declarations in this capability-only fixture.
+            value["excluded_objects"] = json!([]);
+            let report = CapabilityReport::from_definition(&parse_value(&value).unwrap()).unwrap();
+            let mut expected = vec![
+                (
+                    format!("{side}.gigglesdb.fenced_reversible"),
+                    ItemStatus::Unsupported,
+                    "needs source capture (GD-0077 stage 2) and the fence for the declared deployment",
+                ),
+                (
+                    format!("{side}.gigglesdb.version_pin"),
+                    ItemStatus::Unverified,
+                    "version() reports only the crate version; no build or capability identity yet (GD-0077 question)",
+                ),
+                (
+                    "rollback.gigglesdb".to_owned(),
+                    ItemStatus::Unsupported,
+                    "forward-only until GD-0077 capture ships; rollback requires the GigglesDB source connector",
+                ),
+            ];
+            expected.push(if side == "destination" {
+                (format!("{side}.gigglesdb.destination_apply"), ItemStatus::Unverified, "connector not yet built or qualified; conformance tests against a real giggles-server pending (GD-0065 N3)")
+            } else {
+                (format!("{side}.gigglesdb.source_capture"), ItemStatus::Unsupported, "GD-0077 capture stage not built")
+            });
+            if deployment == "embedded" {
+                expected.push((
+                    format!("{side}.gigglesdb.embedded_fence"),
+                    ItemStatus::Unsupported,
+                    "GD-0077 E4 pending DD-0068 pre-release",
+                ));
+            }
+            assert_eq!(report.blocking().len(), expected.len());
+            for (id, status, remediation) in &expected {
+                let item = report.items.iter().find(|item| &item.id == id).unwrap();
+                assert_eq!(&item.status, status);
+                assert_eq!(&item.remediation, remediation);
+                assert_eq!(item.criticality, Criticality::Critical);
+                assert!(!item.sampled);
+                assert!(item.object.is_none());
+                assert!(report.blocking().contains(&item));
+            }
+            let pg_side = if side == "source" {
+                "destination"
+            } else {
+                "source"
+            };
+            let mut expected_ids: Vec<_> = expected.iter().map(|(id, _, _)| id.clone()).collect();
+            expected_ids.push(format!("{pg_side}.tls_trust"));
+            if deployment == "server" {
+                expected_ids.push(format!("{side}.tls_trust"));
+            }
+            expected_ids.sort();
+            let mut actual_ids: Vec<_> = report.items.iter().map(|item| item.id.clone()).collect();
+            actual_ids.sort();
+            assert_eq!(actual_ids, expected_ids);
+            assert!(report.items.iter().all(|item| !matches!(
+                item.status,
+                ItemStatus::Supported | ItemStatus::SupportedWithTransformation
+            )));
+            value[pg_side]["version"] = json!("15.8");
+            let report = CapabilityReport::from_definition(&parse_value(&value).unwrap()).unwrap();
+            assert!(
+                report
+                    .blocking()
+                    .iter()
+                    .any(|item| item.id == format!("{pg_side}.version")
+                        && item.status == ItemStatus::Unsupported)
+            );
+        }
+    }
+}
+
+#[test]
+fn spanner_connection_serialization_preserves_existing_bytes() {
+    for dialect in ["google-sql", "postgresql"] {
+        let mut value = example_value();
+        value["source"] = spanner_connection(dialect);
+        let definition = parse_value(&value).unwrap();
+        let old_json = format!(
+            "{{\"engine\":\"spanner\",\"tls\":\"require\",\"version\":\"\",\"spanner\":{{\"project\":\"unresolved-project\",\"instance\":\"instance\",\"database\":\"database\",\"dialect\":\"{dialect}\",\"change_stream\":\"changes\",\"credentials\":\"file:/unread/spanner-credentials\",\"emulator\":false}}}}"
+        );
+        assert_eq!(serde_json::to_string(&definition.source).unwrap(), old_json);
+    }
 }
 
 #[test]

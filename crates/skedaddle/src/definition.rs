@@ -93,12 +93,15 @@ pub struct Connection {
     pub tls_ca_ref: Option<SecretRef>,
     /// Server version to qualify, e.g. "17.2". This is a declaration, not evidence.
     /// Spanner endpoints do not require a declared server version.
+    /// GigglesDB uses the exact version() string the operator qualified against.
     #[serde(default)]
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spanner: Option<SpannerEndpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mysql: Option<MysqlEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gigglesdb: Option<GigglesdbEndpoint>,
 }
 
 /// Persisted endpoint: credentials remain references; TLS/version use Connection policy.
@@ -122,6 +125,22 @@ impl fmt::Debug for MysqlEndpoint {
 pub enum MysqlGtidMode {
     On,
     Off,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GigglesdbEndpoint {
+    pub deployment: GigglesdbDeployment,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_path: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GigglesdbDeployment {
+    Server,
+    Embedded,
+    Distributed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,6 +563,13 @@ impl MigrationDefinition {
                     "mysql endpoint block requires the MySQL engine",
                 );
             }
+            if connection.engine != Engine::Gigglesdb && connection.gigglesdb.is_some() {
+                push_error(
+                    &mut errors,
+                    &format!("{path}.gigglesdb"),
+                    "gigglesdb endpoint block requires the GigglesDB engine",
+                );
+            }
             if connection.engine == Engine::Spanner {
                 match &connection.spanner {
                     Some(endpoint) => {
@@ -579,6 +605,81 @@ impl MigrationDefinition {
                     &format!("{path}.spanner"),
                     "spanner endpoint block requires the Spanner engine",
                 );
+            }
+            if connection.engine == Engine::Gigglesdb {
+                match &connection.gigglesdb {
+                    None => push_error(
+                        &mut errors,
+                        &format!("{path}.gigglesdb"),
+                        "GigglesDB engine requires a gigglesdb endpoint block",
+                    ),
+                    Some(endpoint) => match endpoint.deployment {
+                        GigglesdbDeployment::Server => {
+                            if endpoint.database_path.is_some() {
+                                push_error(
+                                    &mut errors,
+                                    &format!("{path}.gigglesdb.database_path"),
+                                    "server GigglesDB deployments must not declare database_path",
+                                );
+                            }
+                        }
+                        GigglesdbDeployment::Embedded => {
+                            let valid_path = endpoint.database_path.as_ref().is_some_and(|value| {
+                                let bytes = value.as_bytes();
+                                !value.is_empty()
+                                    && value.trim() == value
+                                    && !value.chars().any(char::is_control)
+                                    && (value.starts_with('/')
+                                        || value.strip_prefix("\\\\").is_some_and(|rest| {
+                                            let mut parts = rest.split(['\\', '/']);
+                                            parts.next().is_some_and(|part| !part.is_empty())
+                                                && parts.next().is_some_and(|part| !part.is_empty())
+                                        })
+                                        || (bytes.len() >= 3
+                                            && bytes[0].is_ascii_alphabetic()
+                                            && bytes[1] == b':'
+                                            && matches!(bytes[2], b'/' | b'\\')))
+                            });
+                            if !valid_path {
+                                push_error(
+                                    &mut errors,
+                                    &format!("{path}.gigglesdb.database_path"),
+                                    "embedded GigglesDB deployments require a non-empty, trimmed, control-free absolute database_path",
+                                );
+                            }
+                            if connection.connection_ref.is_some() {
+                                push_error(
+                                    &mut errors,
+                                    &format!("{path}.connection_ref"),
+                                    "connection_ref is not applicable to embedded GigglesDB deployments",
+                                );
+                            }
+                            if connection.tls != crate::security::TlsPolicy::default() {
+                                push_error(
+                                    &mut errors,
+                                    &format!("{path}.tls"),
+                                    "TLS policy is not applicable to embedded GigglesDB deployments; leave the default",
+                                );
+                            }
+                            if connection.tls_ca_ref.is_some() {
+                                push_error(
+                                    &mut errors,
+                                    &format!("{path}.tls_ca_ref"),
+                                    "TLS CA trust is not applicable to embedded GigglesDB deployments",
+                                );
+                            }
+                            continue;
+                        }
+                        GigglesdbDeployment::Distributed => {
+                            push_error(
+                                &mut errors,
+                                &format!("{path}.gigglesdb.deployment"),
+                                "distributed GigglesDB deployments are out of scope (GD-0065 Q3)",
+                            );
+                            continue;
+                        }
+                    },
+                }
             }
             if connection.connection_ref.is_none() && connection.engine != Engine::Mysql {
                 push_error(

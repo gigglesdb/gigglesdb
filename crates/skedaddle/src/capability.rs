@@ -4,7 +4,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::definition::{
-    DefinitionError, Engine, MigrationDefinition, ObjectSelector, postgres_major,
+    DefinitionError, Engine, GigglesdbDeployment, MigrationDefinition, ObjectSelector,
+    postgres_major,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,7 +158,7 @@ impl CapabilityReport {
         ]
         .into_iter()
         .filter(|(side, connection)| {
-            !matches!(connection.engine, Engine::Postgresql | Engine::Spanner)
+            !matches!(connection.engine, Engine::Postgresql | Engine::Spanner | Engine::Gigglesdb)
                 && !(*side == "source" && connection.engine == Engine::Mysql)
         })
         .map(|(side, connection)| format!("{side}: {}", connection.engine))
@@ -244,8 +245,66 @@ impl CapabilityReport {
                         ));
                     }
                 }
+                Engine::Gigglesdb => {
+                    let (gate, status, remediation) = if side == "destination" {
+                        (
+                            "destination_apply",
+                            ItemStatus::Unverified,
+                            "connector not yet built or qualified; conformance tests against a real giggles-server pending (GD-0065 N3)",
+                        )
+                    } else {
+                        (
+                            "source_capture",
+                            ItemStatus::Unsupported,
+                            "GD-0077 capture stage not built",
+                        )
+                    };
+                    let mut gates = vec![
+                        (gate, status, remediation),
+                        (
+                            "fenced_reversible",
+                            ItemStatus::Unsupported,
+                            "needs source capture (GD-0077 stage 2) and the fence for the declared deployment",
+                        ),
+                        (
+                            "version_pin",
+                            ItemStatus::Unverified,
+                            "version() reports only the crate version; no build or capability identity yet (GD-0077 question)",
+                        ),
+                    ];
+                    if connection.gigglesdb.as_ref().is_some_and(|endpoint| {
+                        endpoint.deployment == GigglesdbDeployment::Embedded
+                    }) {
+                        gates.push((
+                            "embedded_fence",
+                            ItemStatus::Unsupported,
+                            "GD-0077 E4 pending DD-0068 pre-release",
+                        ));
+                    }
+                    for (gate, status, remediation) in gates {
+                        items.push(item(
+                            &format!("{side}.gigglesdb.{gate}"),
+                            status,
+                            Criticality::Critical,
+                            remediation,
+                            format!("Declared {side} GigglesDB endpoint; no connector qualification evidence has been collected."),
+                        ));
+                    }
+                }
                 _ => {}
             }
+        }
+        if matches!(
+            (definition.source.engine, definition.destination.engine),
+            (Engine::Postgresql, Engine::Gigglesdb) | (Engine::Gigglesdb, Engine::Postgresql)
+        ) {
+            items.push(item(
+                "rollback.gigglesdb",
+                ItemStatus::Unsupported,
+                Criticality::Critical,
+                "forward-only until GD-0077 capture ships; rollback requires the GigglesDB source connector",
+                "The PostgreSQL/GigglesDB pair has no qualified reverse connector.".to_owned(),
+            ));
         }
         // These legacy claims apply only to a PostgreSQL-to-PostgreSQL migration.
         if definition.source.engine == Engine::Postgresql
@@ -294,7 +353,12 @@ impl CapabilityReport {
             ("source", &definition.source),
             ("destination", &definition.destination),
         ] {
-            if connection.engine == Engine::Spanner {
+            if connection.engine == Engine::Spanner
+                || connection
+                    .gigglesdb
+                    .as_ref()
+                    .is_some_and(|endpoint| endpoint.deployment == GigglesdbDeployment::Embedded)
+            {
                 continue;
             }
             let trust = tls_trust(connection);
