@@ -558,7 +558,7 @@ async fn spanner_client(
     let channel = Endpoint::from_shared(format!("http://{}", h.spanner_addr()))?
         .connect()
         .await?;
-    let bearer = SpannerBearer(format!("Bearer nunya.{user}.{}", &*secret.secret).parse()?);
+    let bearer = SpannerBearer(format!("Bearer nunya.{user}.{}", *secret.secret).parse()?);
     Ok(SpannerClient::with_interceptor(channel, bearer))
 }
 
@@ -1353,5 +1353,342 @@ async fn spanner_explicit_tokenize_refused() -> ServeResult<()> {
     let (mut new, name_new) = native_open(&h, &access, &rotated, &f.database, &mut cleanup).await?;
     native_tokenize_refused(&mut old, &name_old).await;
     native_tokenize_refused(&mut new, &name_new).await;
+    Ok(())
+}
+
+async fn restart_fixture() -> ServeResult<(NativeFixture, ServeHarness)> {
+    let url = std::env::var("NUNYA_TEST_PG")?;
+    let f = NativeFixture::new("email STRING(MAX)", "email", "'alice@example.test'", true).await?;
+    let h = f.harness(&f.policy(&["email"], 20, 200), Some(&url), "")?;
+    let path = h.dir().join("nunya.toml");
+    let config = std::fs::read_to_string(&path)?;
+    std::fs::write(
+        path,
+        format!("schemas = ['public', '{}']\n{config}", f.schema),
+    )?;
+    Ok((f, h))
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG, NUNYA_TEST_PG_ADMIN and NUNYA_TEST_SPANNER_* harness endpoints"]
+async fn restart_keeps_token_meaning_and_revocation_both_routes() -> ServeResult<()> {
+    let (f, mut h) = restart_fixture().await?;
+    h.start().await?;
+    let (pg, pg_secret, _) = h
+        .acquire_session("restart-pg", "postgres", Mode::ReadWrite)
+        .await?;
+    let (native, native_secret, _) = h
+        .acquire_session("restart-native", "spanner-native", Mode::ReadWrite)
+        .await?;
+    let (revoked, revoked_secret, _) = h
+        .acquire_session("restart-revoked", "postgres", Mode::ReadWrite)
+        .await?;
+    let select = format!("SELECT email FROM {}.t WHERE id = 1", f.schema);
+    let (before, _driver) = session_connect(&h, &pg, &pg_secret).await?;
+    let pg_tokens = values(&before, &select).await?;
+    assert_eq!(pg_tokens.len(), 1);
+    assert_eq!(pg_tokens[0].len(), 1);
+    let mut cleanup = f.sessions();
+    let (mut client, name) =
+        native_open(&h, &native, &native_secret, &f.database, &mut cleanup).await?;
+    let native_tokens = native_cells(
+        &client
+            .execute_sql(spanner_sql(&name, &select))
+            .await?
+            .into_inner(),
+    )?;
+    assert_eq!(native_tokens.len(), 1);
+    assert_eq!(native_tokens[0].len(), 1);
+    h.admin().revoke(&revoked.id).await?;
+    h.restart().await?;
+    let (after, _after_driver) = session_connect(&h, &pg, &pg_secret).await?;
+    assert!(
+        values(&after, &select).await? == pg_tokens,
+        "restart changed PG token meaning"
+    );
+    let rows = values(
+        &after,
+        &format!(
+            "SELECT id FROM {}.t WHERE email = '{}'",
+            f.schema,
+            pg_tokens[0][0].replace('\'', "''")
+        ),
+    )
+    .await?;
+    assert!(
+        rows == vec![vec!["1".to_owned()]],
+        "pre-restart PG token predicate failed"
+    );
+    let (mut after_native, after_name) =
+        native_open(&h, &native, &native_secret, &f.database, &mut cleanup).await?;
+    native_verify(
+        &mut after_native,
+        &after_name,
+        &select,
+        &native_tokens,
+        &[(
+            "email",
+            google_cloud_googleapis::spanner::v1::TypeCode::String,
+        )],
+        &f.schema,
+    )
+    .await?;
+    let refusal = match session_connect(&h, &revoked, &revoked_secret).await {
+        Err(error) => error,
+        Ok(_) => panic!("restart revived revoked session"),
+    };
+    let error = refusal
+        .downcast_ref::<tokio_postgres::Error>()
+        .ok_or("unexpected login error type")?;
+    assert!(
+        error.code().is_some_and(|code| code.code() == "NY003"),
+        "expected revoked login NY003"
+    );
+    let sessions = h.admin().sessions().await?;
+    assert!(
+        sessions
+            .iter()
+            .any(|s| s.id == revoked.id && s.state == nunya::state::model::SessionState::Revoked),
+        "durable revocation missing"
+    );
+    for original in [&pg, &native] {
+        assert!(
+            sessions.iter().any(|s| s.id == original.id
+                && s.scope == original.scope
+                && s.state == nunya::state::model::SessionState::Active),
+            "restart lost active scope metadata"
+        );
+    }
+    Ok(())
+}
+
+// Roll back directly even during unwinding before deleting the upstream session.
+// A crash leaves an emulator transaction open, blocking subsequent schema changes.
+struct NativeTransactionCleanup {
+    endpoint: String,
+    session: String,
+    transaction: Vec<u8>,
+}
+impl Drop for NativeTransactionCleanup {
+    fn drop(&mut self) {
+        use google_cloud_googleapis::spanner::v1::RollbackRequest;
+        let (endpoint, session, transaction_id) = (
+            self.endpoint.clone(),
+            self.session.clone(),
+            self.transaction.clone(),
+        );
+        let result = std::thread::spawn(move || -> ServeResult<()> {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    let channel = Endpoint::from_shared(endpoint)?
+                        .connect_timeout(Duration::from_secs(3))
+                        .timeout(Duration::from_secs(3))
+                        .connect()
+                        .await?;
+                    let mut client = SpannerClient::new(channel);
+                    let rollback = client
+                        .rollback(RollbackRequest {
+                            session: session.clone(),
+                            transaction_id,
+                        })
+                        .await;
+                    let _ = client
+                        .delete_session(DeleteSessionRequest { name: session })
+                        .await;
+                    rollback?;
+                    Ok(())
+                })
+        })
+        .join();
+        if !matches!(result, Ok(Ok(()))) {
+            eprintln!("upstream native transaction cleanup failed");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG, NUNYA_TEST_PG_ADMIN and NUNYA_TEST_SPANNER_* harness endpoints"]
+async fn restart_reports_open_transaction_lost() -> ServeResult<()> {
+    use google_cloud_googleapis::spanner::v1::{
+        BeginTransactionRequest, CommitRequest, TransactionOptions, TransactionSelector,
+        commit_request, transaction_options, transaction_selector,
+    };
+    let (f, mut h) = restart_fixture().await?;
+    h.start().await?;
+    let (pg, pg_secret, _) = h
+        .acquire_session("lost-pg", "postgres", Mode::ReadWrite)
+        .await?;
+    let (native, native_secret, _) = h
+        .acquire_session("lost-native", "spanner-native", Mode::ReadWrite)
+        .await?;
+    let (old_pg, _old_driver) = session_connect(&h, &pg, &pg_secret).await?;
+    old_pg.batch_execute("BEGIN").await?;
+    // Only clear columns are written, so no synthetic blind input is required.
+    old_pg
+        .batch_execute(&format!("INSERT INTO {}.t (id) VALUES (81)", f.schema))
+        .await?;
+    let mut cleanup = f.sessions();
+    let (mut old_native, old_name) =
+        native_open(&h, &native, &native_secret, &f.database, &mut cleanup).await?;
+    let tx = old_native
+        .begin_transaction(BeginTransactionRequest {
+            session: old_name.clone(),
+            options: Some(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadWrite(
+                    transaction_options::ReadWrite::default(),
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let transaction_cleanup = NativeTransactionCleanup {
+        endpoint: f.endpoint.clone(),
+        session: old_name.clone(),
+        transaction: tx.id.clone(),
+    };
+    let mut insert = spanner_sql(
+        &old_name,
+        &format!("INSERT INTO {}.t (id) VALUES (82)", f.schema),
+    );
+    insert.transaction = Some(TransactionSelector {
+        selector: Some(transaction_selector::Selector::Id(tx.id.clone())),
+    });
+    insert.seqno = 1;
+    old_native.execute_sql(insert).await?;
+    h.restart().await?;
+    assert!(
+        old_pg.batch_execute("COMMIT").await.is_err(),
+        "restart falsely resumed PG transaction"
+    );
+    let admin_url = std::env::var("NUNYA_TEST_PG_ADMIN")?;
+    let (admin, connection) = tokio_postgres::connect(&admin_url, NoTls).await?;
+    let _admin_driver = Driver(tokio::spawn(async move {
+        let _ = connection.await;
+    }));
+    assert!(
+        values(
+            &admin,
+            &format!("SELECT id FROM {}.t WHERE id = 81", f.schema)
+        )
+        .await?
+        .is_empty(),
+        "uncommitted PG marker persisted"
+    );
+    let (fresh_pg, _fresh_driver) = session_connect(&h, &pg, &pg_secret).await?;
+    assert!(
+        values(
+            &fresh_pg,
+            &format!("SELECT id FROM {}.t WHERE id = 1", f.schema)
+        )
+        .await?
+            == vec![vec!["1".to_owned()]],
+        "PG authorization did not resume"
+    );
+    let (mut fresh_native, fresh_name) =
+        native_open(&h, &native, &native_secret, &f.database, &mut cleanup).await?;
+    assert!(
+        fresh_native
+            .commit(CommitRequest {
+                session: fresh_name.clone(),
+                transaction: Some(commit_request::Transaction::TransactionId(tx.id)),
+                ..Default::default()
+            })
+            .await
+            .is_err(),
+        "restart falsely resumed native transaction"
+    );
+    drop(transaction_cleanup);
+    assert!(
+        native_cells(
+            &fresh_native
+                .execute_sql(spanner_sql(
+                    &fresh_name,
+                    &format!("SELECT id FROM {}.t WHERE id = 82", f.schema)
+                ))
+                .await?
+                .into_inner()
+        )?
+        .is_empty(),
+        "uncommitted native marker persisted"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG pointing at harness database"]
+async fn second_serve_on_same_state_dir_refused() -> ServeResult<()> {
+    let url = std::env::var("NUNYA_TEST_PG")?;
+    let mut h = ServeHarness::new(&file_sink_policy(), Some(&url), None, None, "")?;
+    h.start().await?;
+    let (session, secret, _) = h
+        .acquire_session("single-writer", "postgres", Mode::ReadWrite)
+        .await?;
+    let mut second = h.spawn_second()?;
+    let status = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(status) = second.try_wait()? {
+                return Ok::<_, std::io::Error>(status);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    assert!(!status.success(), "second writer exited successfully");
+    let stderr = std::fs::read_to_string(h.dir().join("stderr-2.log"))?;
+    assert!(
+        stderr.contains("state is owned by a running service"),
+        "second writer did not report state ownership refusal"
+    );
+    h.admin().status().await?;
+    let (client, _driver) = session_connect(&h, &session, &secret).await?;
+    token(&client).await?;
+    h.stop()?;
+    h.start().await?;
+    h.admin().status().await?;
+    let (fresh, _fresh_driver) = session_connect(&h, &session, &secret).await?;
+    token(&fresh).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG pointing at harness database"]
+async fn quota_continuity_across_restart() -> ServeResult<()> {
+    let url = std::env::var("NUNYA_TEST_PG")?;
+    let policy = file_sink_policy()
+        .replace(
+            "tokenize_limit_per_session = 20",
+            "tokenize_limit_per_session = 3",
+        )
+        .replace(
+            "tokenize_limit_per_principal = 200",
+            "tokenize_limit_per_principal = 5",
+        );
+    let mut h = ServeHarness::new(&policy, Some(&url), None, None, "")?;
+    h.start().await?;
+    let (s, secret, principal) = h
+        .acquire_session("restart-quota", "postgres", Mode::ReadWrite)
+        .await?;
+    let owner = owner(&h, "restart-quota", &principal)?;
+    let (client, _driver) = session_connect(&h, &s, &secret).await?;
+    tokenize(&client, "restart-one").await?;
+    tokenize(&client, "restart-two").await?;
+    h.restart().await?;
+    let (client, _driver) = session_connect(&h, &s, &secret).await?;
+    tokenize(&client, "restart-three").await?;
+    limited(&client).await;
+    let (s2, secret2) = acquire(&owner, false, None).await?;
+    let (client2, _driver2) = session_connect(&h, &s2, &secret2).await?;
+    tokenize(&client2, "restart-four").await?;
+    tokenize(&client2, "restart-five").await?;
+    h.restart().await?;
+    let (client2, _driver2) = session_connect(&h, &s2, &secret2).await?;
+    limited(&client2).await;
+    let (s3, secret3) = acquire(&owner, false, None).await?;
+    let (client3, _driver3) = session_connect(&h, &s3, &secret3).await?;
+    limited(&client3).await;
     Ok(())
 }

@@ -258,11 +258,11 @@ impl ServeHarness {
         }
         self.child = Some(self.spawn()?);
         for _ in 0..200 {
-            if let Some(child) = &mut self.child {
-                if child.try_wait()?.is_some() {
-                    self.child = None;
-                    return Err(self.startup_error("serve exited during startup"));
-                }
+            if let Some(child) = &mut self.child
+                && child.try_wait()?.is_some()
+            {
+                self.child = None;
+                return Err(self.startup_error("serve exited during startup"));
             }
             if self.admin.status().await.is_ok() {
                 return Ok(());
