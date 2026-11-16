@@ -55,6 +55,10 @@ pub struct Authenticated {
     pub principal: PrincipalId,
     /// Derived v2 token scope keys.
     pub keys: Arc<ScopeKeys>,
+    /// Matched bearer credential identifier.
+    pub credential: crate::state::model::CredentialId,
+    /// Stored token scope identifier.
+    pub scope: crate::token::ScopeId,
 }
 impl std::fmt::Debug for Authenticated {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -86,8 +90,8 @@ pub fn authenticate(
     let id = parse_session_user(user);
     let lookup = id.unwrap_or(SessionId([0; 16]));
     let login = id.and_then(|id| authority.session_login(id, route));
-    let valid_secret = authority.check_session_secret(lookup, secret.as_bytes());
-    let login = login.filter(|_| valid_secret).ok_or_else(denied)?;
+    let credential = authority.session_secret_credential(lookup, secret.as_bytes());
+    let login = login.filter(|_| credential.is_some()).ok_or_else(denied)?;
     let keys = derive_scope_v2(
         root,
         &login.scope.salt,
@@ -97,6 +101,8 @@ pub fn authenticate(
     .map_err(|_| denied())?;
     Ok(Authenticated {
         session: lookup,
+        credential: credential.ok_or_else(denied)?,
+        scope: login.scope.id,
         principal: login.principal,
         keys: Arc::new(keys),
     })

@@ -79,19 +79,26 @@ impl<T> Drop for AbortTask<T> {
         self.0.abort();
     }
 }
+#[derive(Default)]
+pub(crate) struct Revisions {
+    pub(crate) policy: String,
+    pub(crate) config: String,
+}
 #[derive(Clone)]
-pub(crate) struct ReloadableLog(pub(crate) Arc<RwLock<Box<dyn crate::readlog::ReadLog>>>);
+pub(crate) struct ReloadableLog(
+    pub(crate) Arc<RwLock<Box<dyn crate::readlog::ReadLog>>>,
+    pub(crate) Arc<RwLock<Revisions>>,
+);
 impl crate::readlog::ReadLog for ReloadableLog {
     fn write(&self, record: &crate::readlog::ReadLogRecord) -> Result<(), crate::error::Refusal> {
-        self.0
-            .read()
-            .map_err(|_| {
-                crate::error::Refusal::new(
-                    crate::error::NyCode::ReadLogUnavailable,
-                    "read log unavailable",
-                )
-            })?
-            .write(record)
+        let sink = self.0.read().map_err(|_| crate::error::Refusal::new(
+            crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))?;
+        let revisions = self.1.read().map_err(|_| crate::error::Refusal::new(
+            crate::error::NyCode::ReadLogUnavailable, "read log unavailable"))?;
+        let mut stamped = record.clone();
+        stamped.policy_revision.get_or_insert_with(|| revisions.policy.clone());
+        stamped.config_revision.get_or_insert_with(|| revisions.config.clone());
+        sink.write(&stamped)
     }
 }
 /// Owned schema connection driver, aborted on every exit path.
@@ -303,6 +310,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         None
     };
     let hub = crate::reload::Hub::new(&config.policy, config.policy_watch_ms)?;
+    hub.log.1.write().map_err(|_| "read log lock unavailable")?.config = config.revision.clone();
     let policy = hub.policy();
     let (reload_tx, reload_rx) = mpsc::channel(1);
     let admin_hub = hub.clone();

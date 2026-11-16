@@ -8,7 +8,7 @@ pub struct SessionLogin {
     /// Stored session token scope.
     pub scope: TokenScope,
     /// Active credential verifiers sharing the advertised SCRAM parameters.
-    pub verifiers: Vec<Verifier>,
+    pub verifiers: Vec<(CredentialId, Verifier)>,
 }
 impl fmt::Debug for SessionLogin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -20,6 +20,37 @@ impl fmt::Debug for SessionLogin {
     }
 }
 impl Authority {
+    /// Resolve the matching credential without refreshing failed authentication.
+    pub fn session_secret_credential(&self, id: SessionId, secret: &[u8]) -> Option<CredentialId> {
+        let now = self.store.now_ms();
+        let digest: [u8; 32] = Sha256::digest(secret).into();
+        let mut v = self.view.write().ok()?;
+        // Refused authentication must not refresh an idle session.
+        let previous = v.sessions.get(&id).map(|s| s.last_used_ms);
+        if Self::admit_view(&mut v, id, Operation::Read, now).is_err() {
+            let _ = secret_matches(&[0; 32], &digest);
+            return None;
+        }
+        let mut matched = false;
+        let mut selected = [0u8; 16];
+        for c in v
+            .session_credentials
+            .values()
+            .filter(|c| c.session == id && c.state == CredentialState::Active && now < c.expires_ms)
+        {
+            let valid = secret_matches(&c.secret_hash, &digest);
+            let mask = 0u8.wrapping_sub(u8::from(valid));
+            for (out, byte) in selected.iter_mut().zip(c.id.0) {
+                *out = (*out & !mask) | (byte & mask);
+            }
+            matched |= valid;
+        }
+        if !matched && let (Some(last), Some(s)) = (previous, v.sessions.get_mut(&id)) {
+            s.last_used_ms = last;
+        }
+        matched.then_some(CredentialId(selected))
+    }
+
     /// Revoke a credential in the authority view for login tests only.
     #[cfg(test)]
     pub(crate) fn revoke_login_credential(&self, id: SessionId, secret_hash: [u8; 32]) {
@@ -70,7 +101,7 @@ impl Authority {
         Some(SessionLogin {
             principal: session.principal,
             scope: scope.clone(),
-            verifiers: credentials.iter().map(|c| c.verifier.clone()).collect(),
+            verifiers: credentials.iter().map(|c| (c.id, c.verifier.clone())).collect(),
         })
     }
 }
@@ -86,6 +117,26 @@ mod tests {
         let p = f.principal("agent", Mode::ReadWrite);
         let s = f.acquire(p.id, "login");
         (f, s)
+    }
+    #[test]
+    fn bearer_credential_identity_and_failed_authentication_activity() {
+        let (f, s) = fixture();
+        let first = f.a.session_secret_credential(s.id, b"session-secret").unwrap();
+        f.a.renew(s.principal, s.id, None, Some((
+            super::super::tests::verifier(), Sha256::digest(b"second-secret").into(),
+        ))).unwrap();
+        let second = f.a.session_secret_credential(s.id, b"second-secret").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(f.a.session_secret_credential(s.id, b"session-secret"), Some(first));
+        let previous = f.a.session(s.id).unwrap().last_used_ms;
+        f.clock.store(previous + 1, Ordering::SeqCst);
+        assert!(f.a.session_secret_credential(s.id, b"wrong").is_none());
+        assert_eq!(f.a.session(s.id).unwrap().last_used_ms, previous);
+        f.a.revoke_login_credential(s.id, Sha256::digest(b"session-secret").into());
+        assert!(f.a.session_secret_credential(s.id, b"session-secret").is_none());
+        assert_eq!(f.a.session_secret_credential(s.id, b"second-secret"), Some(second));
+        f.a.revoke(s.id, EndReason::Requested).unwrap();
+        assert!(f.a.session_secret_credential(s.id, b"second-secret").is_none());
     }
     #[test]
     fn unknown_id() {
@@ -179,11 +230,11 @@ mod tests {
         assert_eq!(login.principal, s.principal);
         assert_eq!(login.scope.id, s.scope);
         assert!(
-            login.verifiers[0].0.to_pg_string() == super::super::tests::verifier().0.to_pg_string()
+            login.verifiers[0].1.0.to_pg_string() == super::super::tests::verifier().0.to_pg_string()
         );
         let debug = format!("{login:?}");
         assert!(debug.contains("scope: \"[REDACTED]\""));
-        assert!(!debug.contains(&login.verifiers[0].0.to_pg_string()));
+        assert!(!debug.contains(&login.verifiers[0].1.0.to_pg_string()));
     }
     #[test]
     fn credential_selection() {
@@ -207,7 +258,7 @@ mod tests {
         );
         assert!(
             f.a.session_login(s.id, &route()).unwrap().verifiers[0]
-                .0
+                .1.0
                 .to_pg_string()
                 == c.verifier.0.to_pg_string()
         );
@@ -220,7 +271,7 @@ mod tests {
         );
         assert!(
             f.a.session_login(s.id, &route()).unwrap().verifiers[0]
-                .0
+                .1.0
                 .to_pg_string()
                 == first.verifier.0.to_pg_string()
         );
@@ -253,7 +304,7 @@ mod tests {
         let v = f.a.view.read().unwrap();
         for (actual, id) in login.verifiers.iter().zip([second, first]) {
             assert!(
-                actual.0.to_pg_string() == v.session_credentials[&id].verifier.0.to_pg_string()
+                actual.1.0.to_pg_string() == v.session_credentials[&id].verifier.0.to_pg_string()
             );
         }
     }
@@ -287,7 +338,7 @@ mod tests {
         let login = f.a.session_login(s.id, &route()).unwrap();
         assert_eq!(login.verifiers.len(), 1);
         assert!(
-            login.verifiers[0].0.to_pg_string() == super::super::tests::verifier().0.to_pg_string()
+            login.verifiers[0].1.0.to_pg_string() == super::super::tests::verifier().0.to_pg_string()
         );
     }
     #[test]
@@ -303,7 +354,7 @@ mod tests {
         let login = f.a.session_login(s.id, &route()).unwrap();
         assert_eq!(login.verifiers.len(), 1);
         assert!(
-            login.verifiers[0].0.to_pg_string() == super::super::tests::verifier().0.to_pg_string()
+            login.verifiers[0].1.0.to_pg_string() == super::super::tests::verifier().0.to_pg_string()
         );
     }
     #[test]

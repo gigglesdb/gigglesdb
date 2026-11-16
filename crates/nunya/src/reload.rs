@@ -67,7 +67,7 @@ impl Hub {
                 attempts: 0,
                 failures: 0,
             }),
-            log: ReloadableLog(Arc::new(RwLock::new(log))),
+            log: ReloadableLog(Arc::new(RwLock::new(log)), Arc::new(RwLock::new(crate::serve::Revisions { policy: hash(&bytes), config: String::new() }))),
             watch_ms,
         }))
     }
@@ -135,18 +135,21 @@ impl Hub {
                 .0
                 .write()
                 .map_err(|_| "read log lock unavailable")?;
+            let mut revisions = self.log.1.write().map_err(|_| "revision lock unavailable")?;
+            let revision = digest.as_ref().ok_or("policy digest unavailable")?;
             if let Some(replacement) = replacement {
                 *log = replacement;
             }
             for current in &mut policies {
                 **current = policy.clone();
             }
+            revisions.policy = revision.clone();
             Ok::<_, String>(policy)
         })();
         match result {
             Ok(policy) => {
                 s.policy = policy;
-                s.hash = digest.unwrap();
+                s.hash = digest.ok_or("policy digest unavailable")?;
                 s.applied = now();
                 s.last = "applied";
                 Ok(())
@@ -296,7 +299,7 @@ mod tests {
         Hub {
             log: ReloadableLog(Arc::new(RwLock::new(
                 crate::readlog::open_sink(&p.readlog).unwrap(),
-            ))),
+            )), Arc::new(RwLock::new(crate::serve::Revisions { policy: hash(b"initial"), config: "config-test".into() }))),
             state: Mutex::new(State {
                 policy: Arc::new(p),
                 routes: vec![],
@@ -418,6 +421,7 @@ mod tests {
         let bytes = b"snapshot_max_age_ms = 60000\n[readlog]\nsink = 'stdout'\n";
         std::fs::write(&policy_path, bytes).unwrap();
         let h = Hub::new(&policy_path, Some(100)).unwrap();
+        h.log.1.write().unwrap().config = "config-test".into();
         assert_eq!(h.state.lock().unwrap().hash, hash(bytes));
         assert!(h.status().ends_with("policy_watch=100\n"));
         // Manual reloads apply unchanged bytes, and parse exactly the supplied
@@ -461,8 +465,14 @@ mod tests {
         ctx.readlog
             .write(&crate::readlog::ReadLogRecord {
                 ts_unix_ms: 1,
-                task: None,
-                credential: "test".into(),
+                principal: crate::token::PrincipalId([1; 16]),
+                session: crate::token::SessionId([2; 16]),
+                scope: crate::token::ScopeId([3; 16]),
+                connection: None,
+                credential_id: None,
+                route: ctx.route.as_str().into(),
+                policy_revision: None,
+                config_revision: None,
                 statement_fingerprint: "test".into(),
                 statement: "test".into(),
                 outcome: crate::readlog::Outcome::Allowed,
@@ -470,7 +480,26 @@ mod tests {
                 tokens_released: vec![],
             })
             .unwrap();
-        assert!(!std::fs::read(dir.join("audit.log")).unwrap().is_empty());
+        let logged: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("audit.log")).unwrap()).unwrap();
+        assert_eq!(logged["policy_revision"], hash(b"native"));
+        assert_eq!(logged["config_revision"], "config-test");
+        let mut next = (*h.policy()).clone();
+        next.snapshot_max_age_ms = 124;
+        h.apply(Ok(next), Some(hash(b"next"))).unwrap();
+        ctx.readlog.write(&crate::readlog::ReadLogRecord {
+            ts_unix_ms: 2,
+            principal: crate::token::PrincipalId([1; 16]),
+            session: crate::token::SessionId([2; 16]),
+            scope: crate::token::ScopeId([3; 16]),
+            connection: None, credential_id: None, route: ctx.route.as_str().into(),
+            policy_revision: None, config_revision: None,
+            statement_fingerprint: "test".into(), statement: "test".into(),
+            outcome: crate::readlog::Outcome::Allowed, rows: 0, tokens_released: vec![],
+        }).unwrap();
+        let bytes = std::fs::read_to_string(dir.join("audit.log")).unwrap();
+        let logged: serde_json::Value = serde_json::from_str(bytes.lines().last().unwrap()).unwrap();
+        assert_eq!(logged["policy_revision"], hash(b"next"));
+        assert_eq!(logged["config_revision"], "config-test");
         drop(h);
         drop(ctx);
         drop(runtime);

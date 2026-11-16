@@ -2,7 +2,8 @@
 use crate::{
     error::{NyCode, Refusal},
     policy::ReadLogSink,
-    token::TaskId,
+    token::{PrincipalId, SessionId, ScopeId},
+    state::model::CredentialId,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,6 +13,7 @@ use std::{
     sync::Mutex,
 };
 /// Result of the logged statement.
+#[derive(Clone)]
 pub enum Outcome {
     /// Statement was permitted.
     Allowed,
@@ -19,13 +21,26 @@ pub enum Outcome {
     Refused(NyCode),
 }
 /// Data supplied by the session after redacting explicit tokenize arguments.
+#[derive(Clone)]
 pub struct ReadLogRecord {
     /// Unix timestamp in milliseconds.
     pub ts_unix_ms: u64,
-    /// Non-secret task identifier.
-    pub task: Option<TaskId>,
-    /// Credential identifier.
-    pub credential: String,
+    /// Owning principal identifier.
+    pub principal: PrincipalId,
+    /// Access session identifier.
+    pub session: SessionId,
+    /// Stored token scope identifier.
+    pub scope: ScopeId,
+    /// Registered connection identifier.
+    pub connection: Option<u64>,
+    /// Matched credential identifier.
+    pub credential_id: Option<CredentialId>,
+    /// Serving route identifier.
+    pub route: String,
+    /// Applied policy file digest.
+    pub policy_revision: Option<String>,
+    /// Startup config file digest.
+    pub config_revision: Option<String>,
     /// Hex SHA-256 of normalized statement text.
     pub statement_fingerprint: String,
     /// Statement with tokenize plaintext removed.
@@ -45,7 +60,7 @@ fn line(rec: &ReadLogRecord) -> Result<Vec<u8>, Refusal> {
         Outcome::Allowed => "allowed",
         Outcome::Refused(c) => c.sqlstate(),
     };
-    let mut bytes=serde_json::to_vec(&serde_json::json!({"ts":rec.ts_unix_ms,"task":rec.task.map(|t|format!("{t:?}")),"credential":rec.credential,"fingerprint":rec.statement_fingerprint,"statement":rec.statement,"outcome":outcome,"rows":rec.rows,"tokens":rec.tokens_released})).map_err(|_|failure())?;
+    let mut bytes=serde_json::to_vec(&serde_json::json!({"ts":rec.ts_unix_ms,"kind":"statement","principal":rec.principal.to_hex(),"session":rec.session.to_hex(),"scope":rec.scope.to_hex(),"connection":rec.connection,"credential_id":rec.credential_id.map(|id| id.to_hex()),"route":rec.route,"policy_revision":rec.policy_revision,"config_revision":rec.config_revision,"fingerprint":rec.statement_fingerprint,"statement":rec.statement,"outcome":outcome,"rows":rec.rows,"tokens":rec.tokens_released})).map_err(|_|failure())?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -354,8 +369,14 @@ mod tests {
     fn record() -> ReadLogRecord {
         ReadLogRecord {
             ts_unix_ms: 42,
-            task: Some(TaskId([1; 16])),
-            credential: "reader".into(),
+            principal: PrincipalId([1; 16]),
+            session: SessionId([2; 16]),
+            scope: ScopeId([3; 16]),
+            connection: None,
+            credential_id: None,
+            route: "postgres".into(),
+            policy_revision: None,
+            config_revision: None,
             statement_fingerprint: statement_fingerprint(&redact_tokenize_args("SELECT  1")),
             statement: "SELECT 1".into(),
             outcome: Outcome::Allowed,
@@ -369,7 +390,11 @@ mod tests {
         assert_eq!(bytes.last(), Some(&b'\n'));
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["ts"], 42);
-        assert_eq!(v["task"], "01".repeat(16));
+        assert_eq!(v["principal"], "01".repeat(16));
+        let keys: std::collections::BTreeSet<_> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["kind", "ts", "principal", "session", "scope", "connection", "credential_id", "route", "policy_revision", "config_revision", "fingerprint", "statement", "outcome", "rows", "tokens"].into_iter().collect());
+        assert!(v["connection"].is_null());
+        assert!(v["credential_id"].is_null());
         assert_eq!(v["outcome"], "allowed");
         assert_eq!(v["tokens"][0], "tok");
         assert_eq!(

@@ -78,9 +78,10 @@ pub struct Session {
     ctx: Arc<GatewayContext>,
     keys: ScopeKeys,
     session: SessionId,
-    #[allow(dead_code)]
     principal: PrincipalId,
-    credential: String,
+    credential: Option<crate::state::model::CredentialId>,
+    scope: crate::token::ScopeId,
+    connection: Option<u64>,
     active: VecDeque<Active>,
     waiting: bool,
     status: u8,
@@ -102,7 +103,8 @@ impl Session {
         keys: ScopeKeys,
         session: SessionId,
         principal: PrincipalId,
-        credential: String,
+        credential: Option<crate::state::model::CredentialId>,
+        scope: crate::token::ScopeId,
     ) -> Self {
         Self {
             ctx,
@@ -110,6 +112,8 @@ impl Session {
             session,
             principal,
             credential,
+            scope,
+            connection: None,
             active: VecDeque::new(),
             waiting: false,
             status: b'I',
@@ -124,6 +128,10 @@ impl Session {
             extended_execute_forwarded: false,
             rollback_on_sync: false,
         }
+    }
+    /// Attach the registered connection identifier.
+    pub fn set_connection(&mut self, id: u64) {
+        self.connection = Some(id);
     }
     /// Whether a forwarded write or commit still awaits completion.
     pub(crate) fn write_in_flight(&self) -> bool {
@@ -174,8 +182,14 @@ impl Session {
         let statement = redact_tokenize_args(sql);
         ReadLogRecord {
             ts_unix_ms: (self.ctx.clock)(),
-            task: None,
-            credential: self.credential.clone(),
+            principal: self.principal,
+            session: self.session,
+            scope: self.scope,
+            connection: self.connection,
+            credential_id: self.credential,
+            route: self.ctx.route.as_str().into(),
+            policy_revision: None,
+            config_revision: None,
             statement_fingerprint: statement_fingerprint(&statement),
             statement,
             outcome,
@@ -1077,7 +1091,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
     });
     let candidate = login
         .as_ref()
-        .map(|(_, login)| login.verifiers.iter().map(|v| v.clone().0).collect());
+        .map(|(_, login)| login.verifiers.iter().map(|(_, v)| v.clone().0).collect());
     let verifiers = match candidate {
         Some(v) => v,
         None => vec![ScramVerifier {
@@ -1105,13 +1119,15 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
     let Frontend::Password(final_msg) = agent.recv().await? else {
         return Err(failure(NyCode::TokenNotValid));
     };
-    let ScramStep::Done { server_final } = scram
+    let ScramStep::Done { server_final, matched } = scram
         .handle_final(&final_msg)
         .map_err(|_| failure(NyCode::TokenNotValid))?
     else {
         return Err(protocol());
     };
     let (id, login) = login.ok_or_else(|| failure(NyCode::TokenNotValid))?;
+    let credential = login.verifiers.get(matched).map(|(id, _)| *id)
+        .ok_or_else(|| failure(NyCode::TokenNotValid))?;
     ctx.authority
         .admit(id, crate::state::authority::Operation::Read)
         .map_err(|_| failure(NyCode::TokenNotValid))?;
@@ -1158,7 +1174,8 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
     let (_connection_guard, mut end) =
         ctx.registry
             .register(id, login.principal, ctx.route.as_str(), deadline);
-    let mut session = Session::new(ctx.clone(), keys, id, login.principal, user);
+    let mut session = Session::new(ctx.clone(), keys, id, login.principal, Some(credential), login.scope.id);
+    session.set_connection(_connection_guard.id().get());
     // Recheck after registration so revocation between login and registration cannot be missed.
     if ctx.authority.admit(id, Operation::Read).is_err() {
         let actions = session.refuse("", NyCode::SessionEnded, false);
@@ -1248,6 +1265,7 @@ mod tests {
         fail: Arc<AtomicBool>,
         allowed_records: Arc<std::sync::atomic::AtomicU64>,
         records: Arc<Mutex<Vec<(u64, usize)>>>,
+        identities: Arc<Mutex<Vec<ReadLogRecord>>>,
     }
     impl ReadLog for Audit {
         fn write(&self, r: &ReadLogRecord) -> Result<(), Refusal> {
@@ -1257,6 +1275,7 @@ mod tests {
             if matches!(r.outcome, Outcome::Allowed) {
                 self.allowed_records.fetch_add(1, Ordering::Relaxed);
             }
+            self.identities.lock().unwrap().push(r.clone());
             self.records
                 .lock()
                 .unwrap()
@@ -1271,6 +1290,7 @@ mod tests {
         fail: Arc<AtomicBool>,
         allowed_records: Arc<std::sync::atomic::AtomicU64>,
         records: Arc<Mutex<Vec<(u64, usize)>>>,
+        identities: Arc<Mutex<Vec<ReadLogRecord>>>,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -1333,6 +1353,7 @@ mod tests {
             ));
             let fail = Arc::new(AtomicBool::new(false));
             let records = Arc::new(Mutex::new(vec![]));
+            let identities = Arc::new(Mutex::new(vec![]));
             let allowed_records = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let runtime = crate::state::runtime::StateRuntime::open(
                 &dir.join("state"),
@@ -1352,6 +1373,7 @@ mod tests {
                     fail: fail.clone(),
                     allowed_records: allowed_records.clone(),
                     records: records.clone(),
+                    identities: identities.clone(),
                 }),
                 upstream: UpstreamConfig {
                     host: "unused".into(),
@@ -1379,6 +1401,7 @@ mod tests {
                 fail,
                 allowed_records,
                 records,
+                identities,
             }
         }
         fn session(&self) -> Session {
@@ -1395,7 +1418,7 @@ mod tests {
                 scope.route.as_str(),
             )
             .unwrap();
-            Session::new(self.ctx.clone(), keys, id, principal, "agent".into())
+            Session::new(self.ctx.clone(), keys, id, principal, None, scope.id)
         }
         fn second_session(&self) -> Session {
             use crate::state::{authority::AcquireRequest, model::Verifier};
@@ -1688,6 +1711,19 @@ mod tests {
                 .user(format!("session:{}", id.to_hex())).password(password)
                 .dbname("app").connect(tokio_postgres::NoTls).await.unwrap();
             let connection = tokio::spawn(connection);
+            assert!(client.simple_query("DROP TABLE items").await.is_err());
+            {
+                let records = f.identities.lock().unwrap();
+                let record = records.last().unwrap();
+                let row = f.ctx.authority.session(id).unwrap();
+                let credential = f.ctx.authority.session_secret_credential(id, password.as_bytes()).unwrap();
+                assert_eq!(record.principal, row.principal);
+                assert_eq!(record.session, id);
+                assert_eq!(record.scope, row.scope);
+                assert_eq!(record.route, f.ctx.route.as_str());
+                assert_eq!(record.credential_id, Some(credential));
+                assert!(record.connection.is_some());
+            }
             drop(client);
             connection.await.unwrap().unwrap();
             server.await.unwrap();

@@ -141,6 +141,8 @@ impl fmt::Debug for AdminSection {
 }
 /// Validated configuration with zeroizing secrets.
 pub struct Config {
+    /// SHA-256 of the startup config file bytes.
+    pub revision: String,
     /// Agent listener.
     pub listen: Option<SocketAddr>,
     /// Administration listener.
@@ -627,7 +629,9 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     if !e.is_empty() {
         return Err(e);
     }
+    use sha2::{Digest, Sha256};
     Ok(Config {
+        revision: data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes())),
         session,
         management,
         postgres_route_id,
@@ -807,6 +811,14 @@ password_file = "password"
 tls = "disable"
 "#;
     const NATIVE: &str = "\n[spanner_native]\nlisten='127.0.0.1:6433'\ndatabase='projects/p/instances/i/databases/d'\n";
+    #[test]
+    fn startup_revision_hashes_exact_config_bytes() {
+        use sha2::{Digest, Sha256};
+        let f = Fixture::new();
+        let text = EXAMPLE.replace("\n", "\r\n");
+        let config = f.load(&text).unwrap();
+        assert_eq!(config.revision, data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes())));
+    }
     #[test]
     fn duration_grammar_and_overflow() {
         for (text, secs) in [

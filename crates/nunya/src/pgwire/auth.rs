@@ -103,6 +103,8 @@ pub enum ScramStep {
     Done {
         /// Server signature message sent after successful authentication.
         server_final: Vec<u8>,
+        /// Index of the matching advertised credential.
+        matched: usize,
     },
 }
 impl fmt::Debug for ScramStep {
@@ -229,8 +231,9 @@ impl ScramServer {
         let (without_proof, _) = text.rsplit_once(",p=").ok_or_else(denied)?;
         let auth = format!("{bare},{first},{without_proof}");
         let mut matched = false;
+        let mut matched_index = 0usize;
         let mut server_signature = [0u8; 32];
-        for verifier in &self.verifiers {
+        for (index, verifier) in self.verifiers.iter().enumerate() {
             let signature = mac(&verifier.stored_key, auth.as_bytes());
             let mut key = [0; 32];
             for ((out, a), b) in key.iter_mut().zip(proof).zip(signature) {
@@ -248,12 +251,15 @@ impl ScramServer {
             for (out, byte) in server_signature.iter_mut().zip(signature) {
                 *out = (*out & !mask) | (byte & mask);
             }
+            let index_mask = 0usize.wrapping_sub(usize::from(valid));
+            matched_index = (matched_index & !index_mask) | (index & index_mask);
             matched |= valid;
         }
         if !matched {
             return Err(denied());
         }
         Ok(ScramStep::Done {
+            matched: matched_index,
             server_final: format!("v={}", BASE64.encode(&server_signature)).into_bytes(),
         })
     }
@@ -355,7 +361,7 @@ mod tests {
             let (proof, server_final) = client_final(password);
             assert_eq!(
                 s.handle_final(&proof).unwrap(),
-                ScramStep::Done { server_final }
+                ScramStep::Done { server_final, matched: usize::from(password == "password-b") }
             );
         }
     }
@@ -402,7 +408,8 @@ mod tests {
         assert_eq!(
             s.handle_final(FINAL).unwrap(),
             ScramStep::Done {
-                server_final: b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=".to_vec()
+                server_final: b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=".to_vec(),
+                matched: 0
             }
         );
         assert_eq!(s.handle_final(FINAL).unwrap_err(), denied());

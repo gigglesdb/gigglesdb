@@ -1046,28 +1046,9 @@ impl Authority {
     }
     /// Verify a secret digest in constant time for an admissible session.
     pub fn check_session_secret(&self, id: SessionId, secret: &[u8]) -> bool {
-        let now = self.store.now_ms();
-        let digest: [u8; 32] = Sha256::digest(secret).into();
-        let mut v = self.view.write().unwrap();
-        // Refused authentication must not refresh an idle session.
-        let previous = v.sessions.get(&id).map(|s| s.last_used_ms);
-        if Self::admit_view(&mut v, id, Operation::Read, now).is_err() {
-            let _ = secret_matches(&[0; 32], &digest);
-            return false;
-        }
-        let mut matched = false;
-        for c in v
-            .session_credentials
-            .values()
-            .filter(|c| c.session == id && c.state == CredentialState::Active && now < c.expires_ms)
-        {
-            matched |= secret_matches(&c.secret_hash, &digest);
-        }
-        if !matched && let (Some(last), Some(s)) = (previous, v.sessions.get_mut(&id)) {
-            s.last_used_ms = last;
-        }
-        matched
+        self.session_secret_credential(id, secret).is_some()
     }
+
     /// Read a session snapshot.
     pub fn session(&self, id: SessionId) -> Option<AccessSession> {
         self.view.read().unwrap().sessions.get(&id).cloned()
