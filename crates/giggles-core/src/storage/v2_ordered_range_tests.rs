@@ -36,14 +36,15 @@ fn exercise(count: usize) {
         assert_eq!(super::super::reduction::SCANNED.get(), 100, "{sql}");
         eprintln!("ordered range rows={count} {sql}: {:?}", started.elapsed());
     }
-    // The cap applies before OFFSET discards rows, and before result row limits.
+    // R2-PGLIMITS-3: v2 full sorts spill to disk instead of failing (PostgreSQL
+    // external sort); OFFSET past the end returns no rows.
     let started = Instant::now();
-    assert_eq!(s.execute("SELECT id,h FROM big ORDER BY v OFFSET 1000000", &[], None),
-        Err(CoreError::Sql(SqlError::Limit)));
-    assert_eq!(scan::with_cursor_limit(64 * 1024, || s.execute(
-        "SELECT id,h FROM big WHERE v<10000 ORDER BY v OFFSET 10000", &[], None)),
-        Err(CoreError::Sql(SqlError::Limit)));
-    eprintln!("ordered range rows={count} no-range/retention rejection: {:?}", started.elapsed());
+    let past = s.execute(&format!("SELECT id,h FROM big ORDER BY v OFFSET {count}"), &[], None).unwrap();
+    assert!(past.rows.is_empty());
+    let tail = scan::with_cursor_limit(64 * 1024, || s.execute(
+        "SELECT id,h FROM big WHERE v<10000 ORDER BY v OFFSET 10000", &[], None)).unwrap();
+    assert!(tail.rows.is_empty());
+    eprintln!("ordered range rows={count} spilled sort: {:?}", started.elapsed());
     for (sql, length) in [
         ("SELECT id,h FROM big WHERE h=12345", 1),
         ("SELECT id,h FROM big WHERE v>=0 AND v<100", 100),

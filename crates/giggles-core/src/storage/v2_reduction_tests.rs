@@ -90,25 +90,32 @@ fn exercise(count: usize) {
         "reduction rows={count} sum/avg 10k: {:?}",
         started.elapsed()
     );
-    for sql in [
-        "SELECT sum(h) FROM big",
-        "SELECT avg(h) FROM big",
-        "SELECT sum(h) FROM big WHERE id < 100000",
-        "SELECT avg(h) FROM big WHERE id < 100000",
+    // R2-PGLIMITS-1/4: v2 SUM/AVG of a column and large GROUP BY no longer hit a
+    // statement-wide cap (PostgreSQL streams aggregates and spills groups).
+    let n = count as i128;
+    let small = n.min(100_000);
+    for (sql, expected) in [
+        ("SELECT sum(h) FROM big".to_owned(), (n * (n - 1) / 2).to_string()),
+        ("SELECT sum(h) FROM big WHERE id < 100000".to_owned(), (small * (small - 1) / 2).to_string()),
     ] {
         assert_eq!(
-            s.execute(sql, &[], None),
-            Err(CoreError::Sql(SqlError::Limit))
+            values(&mut s, &sql),
+            vec![vec![relational::Value::Numeric(
+                giggles_pg_types::Numeric::parse(&expected).unwrap()
+            )]],
+            "{sql}"
         );
     }
-    assert_eq!(
-        scan::with_cursor_limit(128 * 1024, || s.execute(
-            "SELECT id,count(*) FROM big GROUP BY id",
-            &[],
-            None
-        )),
-        Err(CoreError::Sql(SqlError::Limit))
-    );
+    for sql in ["SELECT avg(h) FROM big", "SELECT avg(h) FROM big WHERE id < 100000"] {
+        assert!(s.execute(sql, &[], None).is_ok(), "{sql}");
+    }
+    let grouped = scan::with_cursor_limit(128 * 1024, || s.execute(
+        "SELECT id,count(*) FROM big GROUP BY id",
+        &[],
+        None
+    ))
+    .unwrap();
+    assert_eq!(grouped.rows.len(), count);
     s.execute("BEGIN", &[], None).unwrap();
     s.execute(
         &format!("INSERT INTO big VALUES ({count},0,{count})"),
