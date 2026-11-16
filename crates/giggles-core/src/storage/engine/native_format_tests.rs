@@ -249,18 +249,31 @@ fn receipt_descriptions_require_scalar_and_temporal_format_guards() {
 }
 
 #[test]
-fn replicated_native_content_is_rejected_at_commit_and_open() {
+fn replicated_native_content_follows_the_single_node_rules() {
+    // GD-0074 R4-41: the replicated bit neither forbids nor relaxes native content.
     let (mem, seq) = fixture();
     let mut req = native();
     req.features_or |= meta::REPLICATED;
-    assert_eq!(seq.submit(req), Err(TxnError::Misuse));
-    assert_eq!(seq.visible_ts(), Ts(0));
-    assert_eq!(meta::open_checks(mem.as_ref()).unwrap().features, 0);
+    seq.submit(req).unwrap();
+    let info = meta::open_checks(mem.as_ref()).unwrap();
+    let bits = meta::NATIVE_OUTCOMES | meta::REPLICATED;
+    assert_eq!((info.features & bits, info.subversion), (bits, meta::NATIVE_SUBVERSION));
+    for (features_or, minimum_subversion) in [
+        (meta::REPLICATED, meta::NATIVE_SUBVERSION),
+        (meta::NATIVE_OUTCOMES | meta::REPLICATED, 1),
+    ] {
+        let (mem, seq) = fixture();
+        let mut req = native();
+        req.features_or = features_or;
+        req.minimum_subversion = minimum_subversion;
+        assert_eq!(seq.submit(req), Err(TxnError::Misuse));
+        assert_eq!(seq.visible_ts(), Ts(0));
+        assert_eq!(meta::open_checks(mem.as_ref()).unwrap().features, 0);
+    }
+    let (mem, seq) = fixture();
     seq.submit(native()).unwrap();
     let mut batch = WriteBatch::default();
-    meta::put_features(&mut batch, meta::NATIVE_OUTCOMES | meta::REPLICATED).unwrap();
+    meta::put_features(&mut batch, meta::REPLICATED).unwrap();
     mem.write(batch, Durability::Sync).unwrap();
-    assert!(matches!(meta::open_checks(mem.as_ref()),
-        Err(meta::FormatError::Unsupported(message))
-            if message == "native outcomes on a replicated database"));
+    assert!(matches!(meta::open_checks(mem.as_ref()), Err(meta::FormatError::Corrupt(_))));
 }

@@ -62,11 +62,6 @@ impl NativeContent {
         if self.ledger.is_none() && features & meta::NATIVE_OUTCOMES == 0 {
             return Ok(());
         }
-        if features & meta::REPLICATED != 0 {
-            return Err(FormatError::Unsupported(
-                "native outcomes on a replicated database".into(),
-            ));
-        }
         if features & meta::NATIVE_OUTCOMES == 0 || version < meta::NATIVE_SUBVERSION {
             return Err(corrupt("native content requires feature/subversion"));
         }

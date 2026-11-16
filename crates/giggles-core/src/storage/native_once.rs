@@ -335,15 +335,6 @@ fn persistence(error: GuardedPersistError) -> NativeOnceError {
     }
 }
 impl Inner {
-    fn check_native_once_supported(&self) -> Result<(), CoreError> {
-        if let Backend::V2(db) = &self.backend
-            && db.meta.features & engine::meta::REPLICATED != 0
-        {
-            return Err(CoreError::Unsupported);
-        }
-        Ok(())
-    }
-
     fn native_once_locked<T>(
         &self,
         work: impl FnOnce(&mut State) -> NativeResult<T>,
@@ -438,7 +429,6 @@ impl Admin {
         &self,
         clock: &mut dyn FnMut() -> NativeResult<NativeClockLease>,
     ) -> NativeResult<usize> {
-        self.inner.check_native_once_supported()?;
         #[cfg(feature = "engine-rocksdb")]
         if matches!(&self.inner.backend, Backend::V2(_)) { return self.compact_native_once_v2(clock); }
         self.inner.native_once_locked(|state| {

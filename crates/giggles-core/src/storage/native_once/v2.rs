@@ -4,7 +4,6 @@ use crate::storage::engine::{kv::Keyspace, txn::Isolation};
 
 impl Inner {
     pub(super) fn native_once_view<T>(&self, work: impl FnOnce(&LedgerView<'_>) -> NativeResult<T>) -> NativeResult<T> {
-        self.check_native_once_supported()?;
         let Backend::V2(db) = &self.backend else {
             return self.native_once_locked(|state| work(&LedgerView::borrow(state)));
         };
