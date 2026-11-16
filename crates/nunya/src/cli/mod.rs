@@ -1,4 +1,6 @@
 //! Operator commands.
+/// Session helper and command implementation.
+pub mod session;
 use crate::{
     config::Config,
     task::{TaskStore, format_task_id, parse_task_id},
@@ -17,6 +19,11 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    Session {
+        #[command(subcommand)]
+        command: session::SessionCommand,
+    },
+    Exec(session::ExecOpts),
     Version,
     Serve {
         #[arg(long)]
@@ -208,6 +215,8 @@ fn runtime_validate(path: &Path) -> Result<(), Vec<String>> {
 }
 fn execute(command: Command) -> Result<i32, Vec<String>> {
     match command {
+        Command::Session { command } => Ok(session::run_command(command)),
+        Command::Exec(opts) => Ok(session::run_exec(opts)),
         Command::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(0)
@@ -288,6 +297,128 @@ pub fn run() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn session_commands() {
+        for verb in ["show", "renew", "revoke", "env"] {
+            assert!(
+                Cli::try_parse_from([
+                    "nunya",
+                    "session",
+                    verb,
+                    "--server",
+                    "http://127.0.0.1:8000",
+                    "--context",
+                    "work"
+                ])
+                .is_ok()
+            );
+        }
+        let args = [
+            "nunya",
+            "session",
+            "acquire",
+            "--server",
+            "http://127.0.0.1:8000",
+            "--ca-file",
+            "ca",
+            "--principal",
+            "alice",
+            "--principal-secret-file",
+            "secret",
+            "--context",
+            "work",
+            "--route",
+            "postgres",
+            "--mode",
+            "read-write",
+            "--ttl",
+            "1d",
+            "--label",
+            "label",
+            "--isolated",
+            "--new-scope",
+            "--pg-host",
+            "localhost",
+            "--pg-port",
+            "6543",
+        ];
+        assert!(Cli::try_parse_from(args).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "nunya",
+                "session",
+                "renew",
+                "--server",
+                "unix:/tmp/nunya.sock",
+                "--mode",
+                "read-only"
+            ])
+            .is_ok()
+        );
+        for format in ["sh", "powershell"] {
+            assert!(
+                Cli::try_parse_from([
+                    "nunya",
+                    "session",
+                    "env",
+                    "--server",
+                    "unix:/tmp/nunya.sock",
+                    "--format",
+                    format
+                ])
+                .is_ok()
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "nunya",
+            "exec",
+            "--server",
+            "unix:/tmp/nunya.sock",
+            "--new-scope",
+            "--",
+            "psql",
+            "-c",
+            "select 1",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Exec(_)));
+        assert!(
+            Cli::try_parse_from([
+                "nunya",
+                "exec",
+                "--server",
+                "unix:/tmp/nunya.sock",
+                "--isolated",
+                "--",
+                "psql"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "nunya",
+                "session",
+                "acquire",
+                "--server",
+                "unix:/tmp/nunya.sock",
+                "--principal-secret",
+                "secret"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "nunya",
+                "session",
+                "acquire",
+                "--server",
+                "unix:/tmp/nunya.sock",
+                "--ttl",
+                "0s"
+            ])
+            .is_err()
+        );
+    }
     #[test]
     fn durations() {
         for (text, ms) in [("30m", 1_800_000), ("2h", 7_200_000), ("3600s", 3_600_000)] {

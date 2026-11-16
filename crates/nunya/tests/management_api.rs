@@ -1678,3 +1678,54 @@ async fn client_unix_socket() -> TransportResult {
     assert_eq!(client.status().await?.route_ids, ["postgres"]);
     finish_server(tx, server).await
 }
+#[tokio::test]
+async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportResult {
+    use nunya::{cli::session::{AcquireOpts, ConnectionOpts, HelperError, HelperStore, acquire_or_resume, pg_env, revoke}, mgmt::server::spawn};
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
+    let authority = ctx.authority.clone();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
+    let alice = api_client(server.tcp_addr, "alice", "alice-private.secret");
+    let admin = api_client(server.tcp_addr, "admin", "admin-private.secret");
+    let store = HelperStore::at(f.dir.join("helper"));
+    let mut opts = AcquireOpts {
+        connection: ConnectionOpts { server: format!("http://{}", server.tcp_addr), ca_file: None, principal: Some("alice".into()), principal_secret_file: None, context: None },
+        route: "postgres".into(), mode: Some(Mode::ReadOnly), ttl: Some("30m".into()), label: None, new_scope: false, pg_host: "127.0.0.1".into(), pg_port: 6432, isolated: false,
+    };
+    let first = acquire_or_resume(&alice, &store, &opts).await?;
+    let stored = store.get("default")?;
+    let sid = SessionId::from_hex(&first.session_id).ok_or("invalid session id")?;
+    assert!(authority.check_session_secret(sid, stored.secret.as_bytes()));
+    let resumed = acquire_or_resume(&alice, &store, &opts).await?;
+    assert_eq!(first.session_id, resumed.session_id);
+    assert!(first.secret.as_str() == resumed.secret.as_str(), "resumed credential changed");
+    admin.revoke(&first.session_id).await?;
+    let err = acquire_or_resume(&alice, &store, &opts).await.unwrap_err();
+    assert_eq!(err, HelperError::ScopeReplaced);
+    assert_eq!(err.to_string(), "the stored session has ended and its token scope was replaced; tokens from it will not match a new session. Run again with --new-scope to start a new scope.");
+    assert_eq!(store.get("default")?.session_id, first.session_id);
+    opts.new_scope = true;
+    let replacement = acquire_or_resume(&alice, &store, &opts).await?;
+    assert_ne!(replacement.session_id, first.session_id);
+    assert_ne!(replacement.scope, first.scope);
+    assert_eq!(store.get("default")?.session_id, replacement.session_id);
+    opts.isolated = true;
+    let isolated = acquire_or_resume(&alice, &store, &opts).await?;
+    assert!(isolated.isolated); assert!(isolated.name.starts_with("isolated-"));
+    assert_eq!(store.get("default")?.session_id, replacement.session_id);
+    assert_eq!(store.get(&isolated.name)?.session_id, isolated.session_id);
+    opts.connection.context = Some("default".into());
+    assert_eq!(acquire_or_resume(&alice, &store, &opts).await.unwrap_err(), HelperError::Conflict);
+    opts.connection.context = Some("explicit-isolation".into());
+    let named = acquire_or_resume(&alice, &store, &opts).await?;
+    assert_eq!(named.name, "explicit-isolation");
+    let env = pg_env(&replacement);
+    assert_eq!(env.iter().find(|(k,_)| k == "PGUSER").ok_or("missing PGUSER")?.1.as_str(), format!("session:{}", replacement.session_id));
+    assert!(env.iter().find(|(k,_)| k == "PGPASSWORD").ok_or("missing PGPASSWORD")?.1.as_str() == replacement.secret.as_str(), "environment credential mismatch");
+    revoke(&alice, &store, &replacement).await?;
+    assert_eq!(store.get("default").unwrap_err(), HelperError::Missing);
+    assert!(store.get(&isolated.name).is_ok());
+    drop(authority);
+    finish_server(tx, server).await
+}
