@@ -207,6 +207,7 @@ dependencies = [
  "bincode",
  "getrandom 0.3.4",
  "giggles-pg-types",
+ "giggles-transactions",
  "redb",
  "rocksdb",
  "serde",
@@ -233,6 +234,15 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "tz-rs",
+]
+
+[[package]]
+name = "giggles-transactions"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "sha2",
 ]
 
 [[package]]

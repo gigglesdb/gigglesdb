@@ -5,8 +5,8 @@ mod export;
 mod kv;
 mod engine;
 mod oracle;
-mod home;
-mod txn_record;
+pub(super) mod home; // Track D: the gateway coordinator (storage::cluster) and its tests use it.
+pub(super) mod txn_record; // Track D: R5-53 resolver, tested with the coordinator's fake cluster.
 
 // Track A (R5-03): the multi-range store, public through `replicated` for giggles-replication.
 pub use store::{RangeApplyOutcome, RangeStore};

@@ -470,6 +470,12 @@ pub trait RangeEngineOpener: Send + Sync {
 }
 
 /// Cross-range commit home operations; home is the first range written.
+///
+/// `incarnation` (R5-50m bug B2): `Open` creates a record and returns its incarnation, an id
+/// the home never reuses for that transaction (for example the applied index of the Open).
+/// Seal, Vote, Decide and Forget carry it; an op whose incarnation does not match the stored
+/// record is treated as if no record exists. A delayed duplicate Open that re-creates a
+/// forgotten record thus cannot be used by the coordinator of the old incarnation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HomeOp {
     Open {
@@ -477,15 +483,18 @@ pub enum HomeOp {
     },
     Seal {
         txn: ClusterTxnId,
+        incarnation: u64,
         participants: Vec<RangeId>,
     },
     Vote {
         txn: ClusterTxnId,
+        incarnation: u64,
         participant: RangeId,
         prepared_at: Timestamp,
     },
     Decide {
         txn: ClusterTxnId,
+        incarnation: u64,
         outcome: Outcome,
     },
     Status {
@@ -493,12 +502,14 @@ pub enum HomeOp {
     },
     Forget {
         txn: ClusterTxnId,
+        incarnation: u64,
     },
 }
-/// Home operation acknowledgement or status.
+/// Home operation acknowledgement, the incarnation an `Open` created or found, or status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HomeReply {
     Ok,
+    Opened { incarnation: u64 },
     Status(HomeStatus),
 }
 /// Unknown, open with seal and votes, or durably decided home record.
