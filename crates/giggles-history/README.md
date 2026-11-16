@@ -191,3 +191,12 @@ CLI tests preserve exact inputs, invocation arguments, exit codes and raw
 stdout/stderr in unique ignored `artifacts/cli-*` directories. These are
 synthetic checker tests; system qualification and independent integration
 review remain separate work.
+
+## Runtime recording
+
+The record module supplies a thread-safe Recorder with a process-wide clock,
+a deterministic TransferWorkload, and window validation with conservation and
+nonnegative account invariants. Complete unknown responses as Indeterminate;
+resolve attaches independent durable evidence without guessing a decision time.
+The controls module returns mutations only when the bounded checker confirms
+FAIL; absent candidates or inconclusive mutations return None.

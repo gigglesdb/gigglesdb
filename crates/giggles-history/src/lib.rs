@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 
+pub mod record;
 mod search;
 mod wire;
 
