@@ -18,6 +18,8 @@ mod advisory;
 pub mod task_statement;
 
 pub mod admission;
+pub mod agent;
+pub use agent::AgentBinding;
 pub mod api;
 pub mod auth;
 pub mod dev;

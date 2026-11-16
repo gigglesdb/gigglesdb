@@ -238,3 +238,6 @@ mod task_only_roles;
 
 #[path = "role_switch_guard.rs"]
 mod role_switch_guard;
+
+#[path = "agent_bindings.rs"]
+mod agent_bindings;

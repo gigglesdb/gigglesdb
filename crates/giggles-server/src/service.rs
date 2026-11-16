@@ -128,6 +128,9 @@ pub struct Service {
     pub(crate) authority_gate: std::sync::RwLock<()>,
     pub(crate) binding_changes: tokio::sync::watch::Sender<()>,
     bindings: std::sync::Mutex<Credentials>,
+    // Lock order: `bindings` before `agent` whenever both are held.
+    agent: std::sync::Mutex<crate::agent::bindings::AgentCredentials>,
+    outcome_retention_ms: std::sync::atomic::AtomicU64,
     pub(crate) admission: crate::admission::Admission,
 }
 struct Credentials {
@@ -149,14 +152,32 @@ impl Service {
         clock: Clock,
         limits: crate::admission::ServiceLimits,
     ) -> Result<Arc<Self>, CoreError> {
+        Self::with_agent(admin, bindings, Vec::new(), clock, limits)
+    }
+    /// A service with both binding maps. A fingerprint may appear in only one.
+    pub fn with_agent(
+        admin: Admin,
+        bindings: Vec<Binding>,
+        agent: Vec<crate::agent::AgentBinding>,
+        clock: Clock,
+        limits: crate::admission::ServiceLimits,
+    ) -> Result<Arc<Self>, CoreError> {
         crate::pg_catalog_wire::initialize_startup();
         let map = Self::validate(&admin, bindings)?;
+        let agent_map = crate::agent::bindings::validate(&admin, &map, agent)?;
         let mut next = 0u64;
         let entries = map
             .into_iter()
             .map(|(fp, role)| {
                 next += 1;
                 (fp, (role, next))
+            })
+            .collect();
+        let agent_entries = agent_map
+            .into_iter()
+            .map(|(fp, entry)| {
+                next += 1;
+                (fp, (entry, next))
             })
             .collect();
         Ok(Arc::new(Self {
@@ -169,6 +190,13 @@ impl Service {
             authority_gate: std::sync::RwLock::new(()),
             binding_changes: tokio::sync::watch::channel(()).0,
             bindings: std::sync::Mutex::new(Credentials { next, entries }),
+            agent: std::sync::Mutex::new(crate::agent::bindings::AgentCredentials {
+                next,
+                entries: agent_entries,
+            }),
+            outcome_retention_ms: std::sync::atomic::AtomicU64::new(
+                crate::agent::DEFAULT_OUTCOME_RETENTION_MS,
+            ),
             admission: crate::admission::Admission::new(limits)?,
             admin,
             clock,
@@ -239,12 +267,26 @@ impl Service {
         Ok(map)
     }
     /// Trusted local control only. Validates completely before an atomic replacement.
-    /// Decisions already ordered before this lock are never undone.
+    /// Decisions already ordered before this lock are never undone. The agent map
+    /// is kept as it is, and revalidated against the new ordinary map.
     pub fn reload_bindings(&self, bindings: Vec<Binding>) -> Result<u64, CoreError> {
+        let agent = self.agent.lock().map_err(|_| CoreError::Fenced)?.bindings();
+        self.reload_all_bindings(bindings, agent).map(|(next, _)| next)
+    }
+    /// Trusted local control only. Validates both maps completely, then swaps both
+    /// under one write of the authority gate. An entry keeps its epoch only when
+    /// it is unchanged; any change cuts that fingerprint's live sessions.
+    pub fn reload_all_bindings(
+        &self,
+        bindings: Vec<Binding>,
+        agent: Vec<crate::agent::AgentBinding>,
+    ) -> Result<(u64, u64), CoreError> {
         let proposed = Self::validate(&self.admin, bindings)?;
+        let proposed_agent = crate::agent::bindings::validate(&self.admin, &proposed, agent)?;
         let _gate = self.authority_gate.write().map_err(|_| CoreError::Fenced)?;
         let mut current = self.bindings.lock().map_err(|_| CoreError::Fenced)?;
-        let mut next = current.next;
+        let mut current_agent = self.agent.lock().map_err(|_| CoreError::Fenced)?;
+        let mut next = current.next.max(current_agent.next);
         let mut entries = BTreeMap::new();
         for (fp, role) in proposed {
             let epoch = match current.entries.get(&fp) {
@@ -256,14 +298,63 @@ impl Service {
             };
             entries.insert(fp, (role, epoch));
         }
+        let mut agent_entries = BTreeMap::new();
+        for (fp, entry) in proposed_agent {
+            let epoch = match current_agent.entries.get(&fp) {
+                Some((old, epoch)) if old == &entry => *epoch,
+                _ => {
+                    next = next.checked_add(1).ok_or(CoreError::Limit)?;
+                    next
+                }
+            };
+            agent_entries.insert(fp, (entry, epoch));
+        }
         *current = Credentials { next, entries };
+        *current_agent = crate::agent::bindings::AgentCredentials {
+            next,
+            entries: agent_entries,
+        };
+        drop(current_agent);
         drop(current);
         self.binding_changes.send_replace(());
-        Ok(next)
+        Ok((next, next))
+    }
+    /// Phase 5 exposure: which agent credentials may open `task`, as the first
+    /// 8 hex of each fingerprint and its executor role.
+    pub fn agent_bindings_for(
+        &self,
+        task: &giggles_core::task::definition::TaskName,
+    ) -> Vec<(String, String)> {
+        let Ok(current) = self.agent.lock() else {
+            return Vec::new();
+        };
+        current
+            .entries
+            .iter()
+            .filter(|(_, (entry, _))| entry.tasks.contains(task))
+            .map(|(fp, (entry, _))| (fp[..8].to_owned(), entry.executor.clone()))
+            .collect()
+    }
+    /// How long after a task's expiry its credential still connects for outcome
+    /// lookup (D5). Server setting; defaults to 30 days.
+    pub fn set_outcome_retention(&self, retention: std::time::Duration) {
+        let ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
+        self.outcome_retention_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
     pub(crate) fn cancel_bound(&self, session: &Session, pid: u32, secret: u32) {
         // Hold registry snapshot through cancellation; reload cannot revoke
         // between validation and signaling. Never wait for the decision gate.
+        if session.agent {
+            let Ok(current) = self.agent.lock() else {
+                return;
+            };
+            if session.agent_entry_matches(&current) {
+                self.cancellations
+                    .cancel(&session.fingerprint, session.epoch, pid, secret);
+            }
+            return;
+        }
         let Ok(current) = self.bindings.lock() else {
             return;
         };
@@ -302,6 +393,7 @@ impl Service {
             role: Role::Database { name: role.name },
             epoch: role.generation,
             fingerprint_bound: false,
+            agent: false,
             role_fence: Some((role.oid, role.generation)),
             scoped: false,
             connection: None,
@@ -347,6 +439,7 @@ impl Service {
             role,
             epoch,
             fingerprint_bound: true,
+            agent: false,
             role_fence,
             scoped: false,
             connection: None,
@@ -357,6 +450,82 @@ impl Service {
                 sql.set_authority_managed(true);
                 sql
             },
+            zone: Some(SessionZone::Fixed(0)),
+            transaction_us: None,
+            sequence_owner_candidates: BTreeSet::new(),
+            search_path: String::new(),
+            api_path: ApiPathState::default(),
+        };
+        session.set_search_path("\"$user\", \"public\"");
+        Ok(session)
+    }
+}
+impl Service {
+    /// An agent (task) session for a certificate in the agent map. `task` names
+    /// the task; with no name the binding must list exactly one. Every refusal is
+    /// `Policy(Authentication)`, so the client cannot tell the reasons apart; an
+    /// unavailable clock refuses the same way.
+    pub fn agent_session(
+        self: &Arc<Self>,
+        fingerprint: &str,
+        task: Option<&str>,
+    ) -> Result<Session, CoreError> {
+        use giggles_core::task::{context::open_context, definition::TaskName};
+        let refused = || CoreError::Policy(Error::Authentication);
+        // 1. The fingerprint is in the agent map.
+        let (entry, epoch) = self
+            .agent
+            .lock()
+            .map_err(|_| CoreError::Fenced)?
+            .entries
+            .get(fingerprint)
+            .cloned()
+            .ok_or_else(refused)?;
+        // 2. The task is selected.
+        let name = match task {
+            Some(name) => TaskName::new(name)
+                .ok()
+                .filter(|name| entry.tasks.contains(name))
+                .ok_or_else(refused)?,
+            None if entry.tasks.len() == 1 => entry.tasks.first().cloned().ok_or_else(refused)?,
+            None => return Err(refused()),
+        };
+        // 3. The executor is a login, task-only role.
+        let role = self
+            .admin
+            .roles()
+            .get(&entry.executor)
+            .map_err(|_| refused())?
+            .filter(crate::agent::bindings::executor_role)
+            .ok_or_else(refused)?;
+        // 4. The task opens for this executor at this time.
+        let mut digest = [0u8; 32];
+        hex::decode_to_slice(fingerprint, &mut digest).map_err(|_| refused())?;
+        let now = crate::agent::wall_now(&self.clock).map_err(|_| refused())?;
+        let retention = self
+            .outcome_retention_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut sql = self.admin.sql_session();
+        sql.set_authority_managed(true);
+        let ctx = open_context(&sql, &name, &role.name, digest, now, retention)
+            .map_err(|_| refused())?;
+        sql.bind_task(ctx)?;
+        let mut session = Session {
+            surface: Surface::Native,
+            backend_pid: 0,
+            connection_closed: Default::default(),
+            backend_ssl: false,
+            service: self.clone(),
+            fingerprint: fingerprint.to_owned(),
+            role: Role::Database { name: role.name },
+            epoch,
+            fingerprint_bound: true,
+            agent: true,
+            role_fence: Some((role.oid, role.generation)),
+            scoped: false,
+            connection: None,
+            database: None,
+            sql,
             zone: Some(SessionZone::Fixed(0)),
             transaction_us: None,
             sequence_owner_candidates: BTreeSet::new(),
@@ -393,6 +562,8 @@ pub struct Session {
     pub(crate) epoch: u64,
     // Trusted pgwire sessions pin role identity without a certificate binding.
     fingerprint_bound: bool,
+    // An agent (task) session: bound through the agent map, never the ordinary one.
+    agent: bool,
     // Database role OID and generation, independent of any fingerprint binding epoch.
     pub(crate) role_fence: Option<(u32, u64)>,
     scoped: bool,
@@ -492,7 +663,67 @@ impl Session {
     fn role_epoch(&self) -> u64 {
         self.role_fence.map_or(self.epoch, |(_, generation)| generation)
     }
+    /// The task this session is bound to; `None` for every non-agent session.
+    pub fn task(&self) -> Option<&giggles_core::task::context::TaskContext> {
+        self.sql.task()
+    }
+    /// Per-call admission for a task session (design-2 section 3, steps 2 and 3):
+    /// the static profile, then the task's standing. A non-agent session is
+    /// always admitted.
+    pub fn admit(
+        &mut self,
+        class: giggles_core::task::StatementClass,
+    ) -> Result<(), CoreError> {
+        giggles_core::task::admit::admit(self.sql.task(), class).map_err(CoreError::Task)?;
+        if self.sql.task().is_none() {
+            return Ok(());
+        }
+        let now = crate::agent::wall_now(&self.service.clock)?;
+        let standing = self.sql.task_standing(now).map_err(CoreError::Task)?;
+        crate::agent::standing_admits(standing, class).map_err(CoreError::Task)
+    }
+    /// The agent-map entry still has this session's epoch and executor and
+    /// still lists its task.
+    fn agent_entry_matches(&self, current: &crate::agent::bindings::AgentCredentials) -> bool {
+        let (Some(ctx), Role::Database { name }) = (self.sql.task(), &self.role) else {
+            return false;
+        };
+        current
+            .entries
+            .get(&self.fingerprint)
+            .is_some_and(|(entry, epoch)| {
+                *epoch == self.epoch && &entry.executor == name && entry.tasks.contains(&ctx.name)
+            })
+    }
+    /// Step 1 for an agent session: the executor role is unchanged (oid and
+    /// generation), still a login task-only role, and the agent entry matches.
+    fn check_agent_binding(&self) -> Result<(), CoreError> {
+        let Role::Database { name } = &self.role else {
+            return Err(CoreError::Policy(Error::Authentication));
+        };
+        self.service
+            .admin
+            .roles()
+            .get(name)
+            .map_err(|_| CoreError::Policy(Error::Authentication))?
+            .filter(|role| {
+                crate::agent::bindings::executor_role(role)
+                    && self.role_fence.is_some_and(|(oid, generation)| {
+                        role.oid == oid && role.generation == generation
+                    })
+            })
+            .ok_or(CoreError::Policy(Error::Authentication))?;
+        let current = self.service.agent.lock().map_err(|_| CoreError::Fenced)?;
+        if self.agent_entry_matches(&current) {
+            Ok(())
+        } else {
+            Err(CoreError::Policy(Error::Authentication))
+        }
+    }
     pub(crate) fn check_binding(&self) -> Result<(), CoreError> {
+        if self.agent {
+            return self.check_agent_binding();
+        }
         if let Role::Database { name } = &self.role {
             self.service
                 .admin
