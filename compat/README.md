@@ -584,3 +584,47 @@ transaction intent/COMMIT acknowledgement journals. Failures stop immediately
 with a nonzero exit and retain data for reproduction; successful large-load
 and restored data are removed. The script abruptly kills its servers and
 removes its temporary psql container before exiting. No product files change.
+
+## Replicated cluster mode
+
+`run --cluster` replaces the single `giggles-server --dev` process with three
+replicated `giggles-server` processes started from the same frozen binary
+(`compat_lib/cluster.py`) and runs every selected client and corpus case against
+the elected leader only. `--server-arg` is refused with `--cluster`: config-file
+mode has no `--dev` flags. Each node gets a JSON config under
+`data/cluster/node-N/config.json` (database `db`, Raft `raftlog`, PostgreSQL on a
+reserved `127.0.0.1` port with TLS disabled and `loopback_trust: false`, so the
+owner authenticates with the per-run password exactly as in `--dev` mode), and
+`replication.owner: postgres` bootstraps the `postgres` role from
+`GIGGLES_OWNER_PASSWORD` on the first leader. The served database is `postgres`.
+
+Peer mTLS material is generated per run in `data/cluster/pki/`: an ECDSA P-256 CA
+and one leaf per node with `subjectAltName = DNS:localhost` and server+client
+EKU (the peer transport verifies SNI `localhost` and pins each leaf's DER
+SHA-256 fingerprint). The generator uses a host `openssl` (PATH, then Git for
+Windows' `mingw64/bin/openssl.exe`) and falls back to the pinned PostgreSQL
+image's `openssl` via `docker run -i --network none` without mounts. Keys are
+test-only and are deleted with the other scratch directories.
+
+Readiness waits up to 60 seconds for every node's `preview=replicated role=...`
+stdout line and exactly one `role=leader`; the leader's `postgresql=` address
+must match its configured port. Logs are `server-nodeN.stdout.log` and
+`server-nodeN.stderr.log` (redacted). Report `build.server_mode` is
+`replicated-3-leader` (single-node runs record `single-node-dev`), and
+`build.cluster` records the PKI method, ports, fingerprints, leader node/term,
+readiness time, per-node exit codes, and any role announcements between
+readiness and shutdown (`leader_changes_after_ready`; non-zero means clients may
+have reached a refusing follower). Shutdown sends `shutdown` on each node's stdin
+and then closes stdin: a replicated process acts on the command but exits only
+once stdin also delivers EOF.
+
+Compare two reports record by record with:
+
+```powershell
+python -I -B compat/tools/compare_reports.py A/report.json B/report.json --label-a single --label-b cluster --out J:/gigglesdb-work/<unique-task>/comparison.md
+```
+
+It keys client checks by (client, check) and corpus cases by (area, case),
+prints both runs' identities and outcome totals plus a table of every record
+whose outcome differs or exists on one side only, and exits 0 when identical,
+1 when different, 2 for invalid input.

@@ -10,7 +10,7 @@ import fnmatch
 import json
 import math
 import secrets
-from compat_lib import checks, corpus, delta, docker, gigglesdb, oracle, pins, probes, psql_client, report, scratch, util, watch
+from compat_lib import checks, cluster, corpus, delta, docker, gigglesdb, oracle, pins, probes, psql_client, report, scratch, util, watch
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
@@ -37,6 +37,8 @@ def parser():
     run.add_argument('--keep-scratch', action='store_true')
     for flag in ('pull','keep','strict'):
         run.add_argument('--'+flag, action='store_true')
+    run.add_argument('--cluster', action='store_true',
+                     help='run every client against the leader of a three-process replicated cluster')
     observer = sub.add_parser('watch')
     observer.add_argument('--state', type=Path, default=Path('J:/gigglesdb-work/r0-harness/watch/state.json'))
     observer.add_argument('--seed-report', type=Path)
@@ -269,7 +271,11 @@ def _run(args, capture):
         if not engine.image(pins.reference(pinned['postgres']), args.pull):
             raise RuntimeError('pinned oracle image unavailable: '+pins.reference(pinned['postgres'])+'; use --pull to permit fetching')
         network, pg_host, data['oracle'] = oracle.start(engine, pinned)
-        server = gigglesdb.Server(binary.resolve(strict=True), run, env, password, server_args=args.server_arg)
+        if getattr(args, 'cluster', False):
+            server = cluster.ClusterServer(binary.resolve(strict=True), run, env, password, server_args=args.server_arg)
+        else:
+            server = gigglesdb.Server(binary.resolve(strict=True), run, env, password, server_args=args.server_arg)
+            data['build']['server_mode'] = 'single-node-dev'
         data['build'].update(server.meta)
         port = server.start()
         data['build'].update(server.meta)
