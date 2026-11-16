@@ -109,6 +109,8 @@ impl V2Db {
             engine::commit::SequencerConfig {
                 // Atomic paged DML retains transaction writes and savepoint undo.
                 write_set_bytes,
+                // Replicated groups must fit the same budget as individual writes.
+                group_max_bytes: replicated_allowed.then_some(write_set_bytes),
                 ..Default::default()
             },
         )?;

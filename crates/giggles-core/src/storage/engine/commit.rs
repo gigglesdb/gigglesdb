@@ -258,6 +258,11 @@ impl Sequencer {
     pub(crate) fn kv(&self) -> &Kv {
         &self.kv
     }
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn group_max_bytes(&self) -> Option<usize> {
+        self.config.group_max_bytes
+    }
+
     pub(crate) fn write_set_bytes(&self) -> usize {
         self.config.write_set_bytes
     }

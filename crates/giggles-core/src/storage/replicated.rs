@@ -76,9 +76,10 @@ impl KvRead for ReplicatedKv {
 impl KvBackend for ReplicatedKv {
     fn write(&self, batch: WriteBatch, _durability: Durability) -> Result<(), KvError> {
         // The Raft log is the durable record; only the sink applies to the store.
-        self.sink
-            .replicate(batch.encode())
-            .map_err(|e| KvError::Io(format!("replication: {e}")))
+        self.sink.replicate(batch.encode()).map_err(|e| {
+            eprintln!("replication: write not confirmed, commit outcome unknown: {e}");
+            KvError::Io(format!("replication: {e}"))
+        })
     }
 
     fn flush_barrier(&self) -> Result<(), KvError> {

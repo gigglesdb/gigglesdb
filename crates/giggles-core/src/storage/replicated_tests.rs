@@ -137,3 +137,33 @@ fn errors_and_backend_contract() {
     );
     assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn replicated_groups_are_byte_capped_and_single_node_groups_are_not() {
+    let cap = 4096;
+    let mem = Arc::new(MemKv::new());
+    meta::write_initial_meta(mem.as_ref(), [9; 16], meta::REPLICATED).unwrap();
+    let sink = Arc::new(Loopback {
+        store: mem.clone(),
+        calls: AtomicUsize::new(0),
+        fail: AtomicBool::new(false),
+    });
+    let replicated = v2::V2Db::from_backend(Arc::new(ReplicatedKv::new(mem, sink)), cap).unwrap();
+    assert_eq!(replicated.sequencer.group_max_bytes(), Some(cap));
+    assert_eq!(replicated.sequencer.write_set_bytes(), cap);
+
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "replicated-group-cap-{:032x}",
+        u128::from_be_bytes(nonce)
+    ));
+    let single_node = v2::V2Db::create(&dir).unwrap();
+    assert_eq!(single_node.sequencer.group_max_bytes(), None);
+    assert_eq!(
+        single_node.sequencer.write_set_bytes(),
+        DEFAULT_WRITE_SET_BYTES
+    );
+    drop(single_node);
+    std::fs::remove_dir_all(dir).unwrap();
+}
