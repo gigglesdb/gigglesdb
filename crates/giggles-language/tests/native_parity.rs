@@ -1270,7 +1270,10 @@ fn nocap6_long_operator_chains_in_insert_text_are_limit_without_overflow() {
                 Err(Error::Limit), "{op}");
         }
         // Chains within MAX_DEPTH links stay parseable in large INSERT text.
+        // Builds without the v2 engine keep the 64 KiB SQL text budget.
+        #[cfg(feature = "engine-rocksdb")]
         let tuples = vec!["(1+1+1,2*2*2,3)"; 5_000].join(",");
+        #[cfg(feature = "engine-rocksdb")]
         assert!(giggles_language::parse_with_version(
             &format!("insert many into items(id,n,u) values{tuples} at most 5000"), version).is_ok());
     }).unwrap().join().unwrap();
