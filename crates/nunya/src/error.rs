@@ -22,10 +22,14 @@ pub enum NyCode {
     ReadLogUnavailable,
     /// protocol feature not allowed through the gateway.
     ProtocolNotAllowed,
+    /// access session ended.
+    SessionEnded,
+    /// write outcome unknown.
+    WriteOutcomeUnknown,
 }
 impl NyCode {
     /// Every gateway refusal code in SQLSTATE order.
-    pub const ALL: [NyCode; 10] = [
+    pub const ALL: [NyCode; 12] = [
         Self::TokenOutsideDomain,
         Self::BlindOperation,
         Self::TokenNotValid,
@@ -36,6 +40,8 @@ impl NyCode {
         Self::SchemaStale,
         Self::ReadLogUnavailable,
         Self::ProtocolNotAllowed,
+        Self::SessionEnded,
+        Self::WriteOutcomeUnknown,
     ];
     /// Return the five-character gateway SQLSTATE.
     pub fn sqlstate(self) -> &'static str {
@@ -50,6 +56,8 @@ impl NyCode {
             Self::SchemaStale => "NY008",
             Self::ReadLogUnavailable => "NY009",
             Self::ProtocolNotAllowed => "NY010",
+            Self::SessionEnded => "NY011",
+            Self::WriteOutcomeUnknown => "NY012",
         }
     }
     /// Return a fixed message safe to show agents.
@@ -65,6 +73,8 @@ impl NyCode {
             Self::SchemaStale => "schema snapshot is stale",
             Self::ReadLogUnavailable => "read log unavailable",
             Self::ProtocolNotAllowed => "protocol feature not allowed through the gateway",
+            Self::SessionEnded => "access session ended",
+            Self::WriteOutcomeUnknown => "write outcome unknown",
         }
     }
 }
@@ -100,6 +110,18 @@ mod tests {
             assert!(seen.insert(code.sqlstate()));
             assert!(!code.message().is_empty());
         }
+    }
+    #[test]
+    fn session_and_write_outcome_codes() {
+        assert!(NyCode::ALL.contains(&NyCode::SessionEnded));
+        assert!(NyCode::ALL.contains(&NyCode::WriteOutcomeUnknown));
+        assert_eq!(NyCode::SessionEnded.sqlstate(), "NY011");
+        assert_eq!(NyCode::SessionEnded.message(), "access session ended");
+        assert_eq!(NyCode::WriteOutcomeUnknown.sqlstate(), "NY012");
+        assert_eq!(
+            NyCode::WriteOutcomeUnknown.message(),
+            "write outcome unknown"
+        );
     }
     #[test]
     fn display_omits_internal_hint() {

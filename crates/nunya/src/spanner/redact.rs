@@ -29,6 +29,8 @@ pub fn redact_status(code: Code) -> Status {
 /// Map a Nunya refusal to its fixed public gRPC status.
 pub fn nunya_status(code: NyCode) -> Status {
     let grpc = match code {
+        NyCode::SessionEnded => Code::PermissionDenied,
+        NyCode::WriteOutcomeUnknown => Code::Unknown,
         NyCode::NotAnalysable => Code::InvalidArgument,
         NyCode::SchemaStale | NyCode::ReadLogUnavailable => Code::Unavailable,
         NyCode::TokenOutsideDomain

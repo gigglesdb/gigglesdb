@@ -16,6 +16,7 @@ use crate::{
     },
     policy::{DomainName, Policy, TokenizeSetting},
     readlog::{Outcome, ReadLogRecord, redact_tokenize_args, statement_fingerprint},
+    state::authority::{TokenizeError, TokenizeLimits},
     token::{PrincipalId, ScopeKeys, SessionId, TokenCodec, keys::derive_scope_v2},
     value::SqlValue,
 };
@@ -73,13 +74,10 @@ struct Active {
 pub struct Session {
     ctx: Arc<GatewayContext>,
     keys: ScopeKeys,
-    // Used by durable counters and admission in the next session-wiring step.
-    #[allow(dead_code)]
     session: SessionId,
     #[allow(dead_code)]
     principal: PrincipalId,
     credential: String,
-    counts: BTreeMap<DomainName, u32>,
     active: VecDeque<Active>,
     waiting: bool,
     status: u8,
@@ -109,7 +107,6 @@ impl Session {
             session,
             principal,
             credential,
-            counts: BTreeMap::new(),
             active: VecDeque::new(),
             waiting: false,
             status: b'I',
@@ -161,13 +158,52 @@ impl Session {
             } else {
                 code
             }))],
-            close: failed,
+            close: failed || code == NyCode::SessionEnded,
             ..Actions::default()
         };
-        if ready && !failed {
+        if ready && !out.close {
             out.client.push(self.ready());
         }
         out
+    }
+    fn record_tokenization(&self, domain: &DomainName) -> Result<(), Refusal> {
+        let policy = self
+            .ctx
+            .policy
+            .read()
+            .map_err(|_| failure(NyCode::SessionEnded))?;
+        let settings = policy
+            .domains
+            .get(domain)
+            .ok_or_else(|| failure(NyCode::StatementNotAllowed))?;
+        let TokenizeSetting::On {
+            limit_per_session,
+            limit_per_principal,
+            principal_window,
+        } = settings.tokenize
+        else {
+            return Err(failure(NyCode::StatementNotAllowed));
+        };
+        self.ctx
+            .authority
+            .record_tokenization(
+                self.session,
+                domain,
+                &TokenizeLimits {
+                    per_session: u64::from(limit_per_session),
+                    per_principal: u64::from(limit_per_principal),
+                    principal_window_ms: u64::try_from(principal_window.as_millis())
+                        .unwrap_or(u64::MAX),
+                },
+            )
+            .map_err(|error| {
+                failure(match error {
+                    TokenizeError::LimitReached => NyCode::TokenizeLimit,
+                    TokenizeError::Ended => NyCode::SessionEnded,
+                    // Unavailable authorization state must fail closed.
+                    TokenizeError::Store => NyCode::SessionEnded,
+                })
+            })
     }
     /// Consume an agent request without performing network I/O.
     pub fn frontend(&mut self, msg: Frontend) -> Actions {
@@ -301,18 +337,8 @@ impl Session {
                     return Err(failure(NyCode::NotAnalysable));
                 };
                 let settings = policy.domains.get(domain).ok_or_else(protocol)?;
-                let TokenizeSetting::On {
-                    limit_per_session, ..
-                } = settings.tokenize
-                else {
-                    return Err(failure(NyCode::StatementNotAllowed));
-                };
                 let value = values::decode_text(&ty, text.as_bytes())?;
-                let count = self.counts.entry(domain.clone()).or_default();
-                *count = count
-                    .checked_add(1)
-                    .filter(|n| *n <= limit_per_session)
-                    .ok_or_else(|| failure(NyCode::TokenizeLimit))?;
+                self.record_tokenization(domain)?;
                 let encoded = self.ctx.codec.encode(
                     &self.keys,
                     domain,
@@ -1137,6 +1163,7 @@ mod tests {
         }
     }
     struct Fixture {
+        access: std::sync::OnceLock<(SessionId, PrincipalId)>,
         ctx: Arc<GatewayContext>,
         dir: PathBuf,
         fail: Arc<AtomicBool>,
@@ -1244,6 +1271,7 @@ mod tests {
                 allow_plaintext: true,
             });
             Self {
+                access: std::sync::OnceLock::new(),
                 ctx,
                 dir,
                 fail,
@@ -1252,15 +1280,49 @@ mod tests {
             }
         }
         fn session(&self) -> Session {
-            Session::new(
-                self.ctx.clone(),
-                crate::token::keys::derive_scope(&self.ctx.root_key, &[1; 32]),
-                SessionId::random(),
-                PrincipalId::random(),
-                "agent".into(),
+            let &(id, principal) = self.access.get_or_init(|| acquire_login(self, "postgres"));
+            self.for_access(id, principal)
+        }
+        fn for_access(&self, id: SessionId, principal: PrincipalId) -> Session {
+            let row = self.ctx.authority.session(id).unwrap();
+            let scope = self.ctx.authority.scope(row.scope).unwrap();
+            let keys = derive_scope_v2(
+                &self.ctx.root_key,
+                &scope.salt,
+                &scope.deployment_id,
+                scope.route.as_str(),
             )
+            .unwrap();
+            Session::new(self.ctx.clone(), keys, id, principal, "agent".into())
+        }
+        fn second_session(&self) -> Session {
+            use crate::state::{authority::AcquireRequest, model::Verifier};
+            let first = self.session();
+            let row = self
+                .ctx
+                .authority
+                .acquire_session(
+                    first.principal,
+                    AcquireRequest {
+                        route: self.ctx.route.clone(),
+                        mode: None,
+                        lifetime_ms: None,
+                        isolated: false,
+                        label: None,
+                        idempotency_key: "second".into(),
+                        verifier: Verifier(ScramVerifier::from_password(
+                            "test",
+                            b"test-salt",
+                            4096,
+                        )),
+                        secret_sha256: [1; 32],
+                    },
+                )
+                .unwrap();
+            self.for_access(row.id, first.principal)
         }
     }
+
     fn acquire_login(f: &Fixture, route: &str) -> (SessionId, PrincipalId) {
         use crate::state::{
             authority::AcquireRequest,
@@ -1900,6 +1962,170 @@ mod tests {
         assert!(out.close);
         assert_eq!(code(&out), "NY009");
     }
+    fn tokenize(s: &mut Session, extended: bool) -> Actions {
+        if !extended {
+            return s.frontend(Frontend::Query(
+                "SELECT nunya_tokenize('secret', 'private')".into(),
+            ));
+        }
+        let parse = s.frontend(Frontend::Parse {
+            name: String::new(),
+            query: "SELECT nunya_tokenize('secret', $1)".into(),
+            param_types: vec![25],
+        });
+        assert!(matches!(parse.client.first(), Some(Backend::ParseComplete)));
+        let bind = s.frontend(Frontend::Bind {
+            portal: String::new(),
+            statement: String::new(),
+            param_formats: vec![],
+            params: vec![Some(b"private".to_vec())],
+            result_formats: vec![],
+        });
+        assert!(matches!(bind.client.first(), Some(Backend::BindComplete)));
+        s.frontend(Frontend::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        })
+    }
+    fn set_tokenize_limits(f: &Fixture, session: u32, principal: u32) {
+        let mut policy = (**f.ctx.policy.read().unwrap()).clone();
+        policy
+            .domains
+            .get_mut(&DomainName("secret".into()))
+            .unwrap()
+            .tokenize = TokenizeSetting::On {
+            limit_per_session: session,
+            limit_per_principal: principal,
+            principal_window: std::time::Duration::from_secs(86400),
+        };
+        *f.ctx.policy.write().unwrap() = Arc::new(policy);
+    }
+    #[test]
+    fn durable_tokenize_session_limit_survives_reconnect() {
+        for extended in [false, true] {
+            let f = Fixture::new();
+            let mut first = f.session();
+            let mut reconnect = f.session();
+            assert_eq!(first.session, reconnect.session);
+            assert!(
+                tokenize(&mut first, extended)
+                    .client
+                    .iter()
+                    .any(|message| matches!(message, Backend::DataRow(_)))
+            );
+            assert!(
+                tokenize(&mut reconnect, extended)
+                    .client
+                    .iter()
+                    .any(|message| matches!(message, Backend::DataRow(_)))
+            );
+            let refused = tokenize(&mut reconnect, extended);
+            assert_eq!(code(&refused), "NY007");
+            assert!(!refused.close);
+            assert_eq!(
+                f.ctx
+                    .authority
+                    .session_tokenizations(first.session, &DomainName("secret".into()))
+                    .unwrap(),
+                2
+            );
+        }
+    }
+    #[test]
+    fn durable_tokenize_principal_limit_spans_access_sessions() {
+        for extended in [false, true] {
+            let f = Fixture::new();
+            set_tokenize_limits(&f, 10, 1);
+            let mut first = f.session();
+            let mut second = f.second_session();
+            assert_ne!(first.session, second.session);
+            assert_eq!(first.principal, second.principal);
+            assert!(
+                tokenize(&mut first, extended)
+                    .client
+                    .iter()
+                    .any(|message| matches!(message, Backend::DataRow(_)))
+            );
+            let refused = tokenize(&mut second, extended);
+            assert_eq!(code(&refused), "NY007");
+            assert!(!refused.close);
+            assert_eq!(
+                f.ctx
+                    .authority
+                    .session_tokenizations(second.session, &DomainName("secret".into()))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+    #[test]
+    fn revoked_tokenize_session_refuses_and_closes() {
+        for extended in [false, true] {
+            let f = Fixture::new();
+            let mut s = f.session();
+            f.ctx
+                .authority
+                .revoke(s.session, crate::state::model::EndReason::Requested)
+                .unwrap();
+            let refused = tokenize(&mut s, extended);
+            assert_eq!(code(&refused), "NY011");
+            assert!(refused.close);
+            assert!(refused.upstream.is_empty());
+            assert_eq!(
+                f.ctx
+                    .authority
+                    .session_tokenizations(s.session, &DomainName("secret".into()))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+    #[test]
+    fn tokenize_reload_applies_next_limit_without_resetting_counters() {
+        for extended in [false, true] {
+            let f = Fixture::new();
+            let mut s = f.session();
+            assert!(
+                tokenize(&mut s, extended)
+                    .client
+                    .iter()
+                    .any(|message| matches!(message, Backend::DataRow(_)))
+            );
+            set_tokenize_limits(&f, 1, 20);
+            assert_eq!(code(&tokenize(&mut s, extended)), "NY007");
+            assert_eq!(
+                f.ctx
+                    .authority
+                    .session_tokenizations(s.session, &DomainName("secret".into()))
+                    .unwrap(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn prepared_tokenize_uses_reloaded_limit_at_execute() {
+        let f = Fixture::new();
+        let mut s = f.session();
+        assert!(
+            tokenize(&mut s, true)
+                .client
+                .iter()
+                .any(|message| matches!(message, Backend::DataRow(_)))
+        );
+        s.frontend(Frontend::Bind {
+            portal: "next".into(),
+            statement: String::new(),
+            param_formats: vec![],
+            params: vec![Some(b"private".to_vec())],
+            result_formats: vec![],
+        });
+        set_tokenize_limits(&f, 1, 20);
+        let refused = s.frontend(Frontend::Execute {
+            portal: "next".into(),
+            max_rows: 0,
+        });
+        assert_eq!(code(&refused), "NY007");
+    }
     #[test]
     fn local_tokenize_limit_and_mixed_query() {
         let f = Fixture::new();
@@ -2187,7 +2413,13 @@ mod tests {
             });
             assert_eq!(code(&out), "NY008");
             assert!(out.upstream.is_empty());
-            assert!(s.counts.is_empty());
+            assert_eq!(
+                f.ctx
+                    .authority
+                    .session_tokenizations(s.session, &DomainName("secret".into()))
+                    .unwrap(),
+                0
+            );
             assert_eq!(f.ctx.metrics.statements_allowed.load(Ordering::Relaxed), 0);
             assert_eq!(&*f.records.lock().unwrap(), &[(0, 0)]);
             assert_eq!(f.allowed_records.load(Ordering::Relaxed), 0);
@@ -2299,7 +2531,13 @@ mod tests {
                 max_rows: 0,
             });
             assert!(matches!(&again.client[0],Backend::CommandComplete(tag) if tag=="SELECT 0"));
-            assert_eq!(s.counts[&DomainName("secret".into())], 1);
+            assert_eq!(
+                f.ctx
+                    .authority
+                    .session_tokenizations(s.session, &DomainName("secret".into()))
+                    .unwrap(),
+                1
+            );
         }
     }
     #[test]

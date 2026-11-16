@@ -23,7 +23,7 @@ pub struct Metrics {
     /// Statements accepted by policy.
     pub statements_allowed: AtomicU64,
     /// Refusals indexed in NyCode::ALL order.
-    pub statements_refused: [AtomicU64; 10],
+    pub statements_refused: [AtomicU64; NyCode::ALL.len()],
     /// Bytes read and written on agent transports.
     pub bytes: AtomicU64,
 }
@@ -34,7 +34,7 @@ pub struct MetricsSnapshot {
     /// Total allowed statements.
     pub statements_allowed: u64,
     /// Refusals indexed in NyCode::ALL order.
-    pub statements_refused: [u64; 10],
+    pub statements_refused: [u64; NyCode::ALL.len()],
     /// Total agent bytes.
     pub bytes: u64,
 }

@@ -412,23 +412,13 @@ impl Session {
                         let (domain, _) = p.plan.tokenize.as_ref().ok_or_else(protocol)?;
                         let ty = p.token_ty.as_ref().ok_or_else(protocol)?;
                         let settings = p.policy.domains.get(domain).ok_or_else(protocol)?;
-                        let TokenizeSetting::On {
-                            limit_per_session, ..
-                        } = settings.tokenize
-                        else {
-                            return Err(failure(NyCode::StatementNotAllowed));
-                        };
                         self.ctx
                             .metrics
                             .statements_allowed
                             .fetch_add(1, Ordering::Relaxed);
                         let mut record = self.record(&p.sql, Outcome::Allowed);
                         self.ctx.readlog.write(&record)?;
-                        let count = self.counts.entry(domain.clone()).or_default();
-                        *count = count
-                            .checked_add(1)
-                            .filter(|n| *n <= limit_per_session)
-                            .ok_or_else(|| failure(NyCode::TokenizeLimit))?;
+                        self.record_tokenization(domain)?;
                         let token = self.ctx.codec.encode(
                             &self.keys,
                             domain,
