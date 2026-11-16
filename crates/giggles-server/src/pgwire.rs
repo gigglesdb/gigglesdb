@@ -2066,6 +2066,20 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                 binding_check_pending = false;
                 if session.check_binding().is_err() {
                     session.abort();
+                    // Absorb late client writes so the peer observes EOF without a reset.
+                    let _ = timeout(std::time::Duration::from_secs(2), async {
+                        let _ = s.shutdown().await;
+                        let mut remaining = 64 * 1024;
+                        let mut discard = [0; 4096];
+                        while remaining > 0 {
+                            let limit = remaining.min(discard.len());
+                            match s.read(&mut discard[..limit]).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => remaining -= n,
+                            }
+                        }
+                    })
+                    .await;
                     return Ok(());
                 }
             }
