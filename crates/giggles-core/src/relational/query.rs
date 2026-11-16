@@ -5275,9 +5275,9 @@ impl BoundQuery<'_> {
             affected: 0,
         };
         let mut result_bytes = 0usize;
-        // Computed aggregate inputs keep the statement-wide scalar work budget (DD-0068
-        // aggregate_scalar_work_budget_is_shared_over_full_input). On v2, SUM/AVG
-        // transitions use a per-value budget like PostgreSQL's constant-size state.
+        // Legacy computed aggregate inputs keep the statement-wide scalar work budget
+        // (DD-0068 aggregate_scalar_work_budget_is_shared_over_full_input). On v2,
+        // arguments and SUM/AVG transitions are limited per value (DD-0068 Q4).
         let mut aggregate_work_bytes = 0usize;
         if self.query.distinct() && !self.aggregate && source.streams_reductions() {
             // V2: a sort-based Unique keeps each first occurrence in input order,
@@ -5762,8 +5762,8 @@ fn eval_like(
 
 struct AggregateAuxiliary {
     stream_column: bool,
-    // V2: SUM/AVG numeric transitions charge a per-value budget, not the
-    // statement-wide one, so constant-size running state never hits 54000.
+    // V2: argument evaluation and SUM/AVG numeric transitions charge a per-value
+    // budget, not the statement-wide one (DD-0068 Q4), so no 54000 from input size.
     local_transition: bool,
     count: i64,
     distinct: std::collections::BTreeSet<grouping::Key>,
@@ -5894,13 +5894,15 @@ fn update_filtered_aggregates(
         {
             continue;
         }
-        // A fixed-width or numeric column read is one stored value. V2 keeps this
-        // scratch row-local; computed arguments retain DD-0068's cumulative budget.
+        // V2 limits each aggregate argument value on its own (DD-0068 Q4, "per-value
+        // limits on v2"): computed arguments and DISTINCT inputs get a fresh scalar
+        // budget per row, like PostgreSQL's per-tuple expression context. Legacy
+        // keeps DD-0068's cumulative budget, except for fixed-width column reads.
         let mut column_work = 0;
         let evaluated = if let Some((_, value)) = &inject { Some(Ok(value.clone())) } else { c.as_ref().map(|e| e.eval(row, params,
-            if auxiliary[index].stream_column && matches!(e.ty,
+            if auxiliary[index].local_transition || (auxiliary[index].stream_column && matches!(e.ty,
                 DataType::SmallInt | DataType::Integer | DataType::BigInt | DataType::Numeric
-                | DataType::Boolean | DataType::Real | DataType::DoublePrecision) {
+                | DataType::Boolean | DataType::Real | DataType::DoublePrecision)) {
                 &mut column_work
             } else { &mut *work })) }.transpose()?;
         // SUM/AVG keep a running sum and count; on v2 each transition is guarded
