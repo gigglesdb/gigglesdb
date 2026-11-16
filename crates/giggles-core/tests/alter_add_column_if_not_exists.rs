@@ -4,6 +4,7 @@ use giggles_core::{
     relational::{SqlError, Value, take_sql_notices},
 };
 
+#[cfg_attr(not(feature = "engine-rocksdb"), allow(clippy::single_element_loop))]
 fn databases(mut test: impl FnMut(&Admin, &mut SqlSession)) {
     for engine in [
         Engine::Legacy,
