@@ -27,6 +27,7 @@
 //! General transaction IDs, timestamp functions, procedural execution,
 //! arbitrary SQL/data access, and unmodeled DataGrip discovery remain unsupported.
 mod catalog;
+mod timezone_abbrevs;
 /// Git revision embedded at build time, or an explicit build identifier override.
 pub const BUILD_ID: &str = env!("GIGGLES_BUILD_ID");
 /// Each token names a GD-0077 guarantee; tokens are only ever added when the
@@ -189,6 +190,8 @@ pub struct CatalogSnapshot {
     pub table_locks: Vec<(u64, u64, i32, String, bool)>,
     /// Optional explicit Unix second for deterministic timezone presentation.
     pub timezone_now: Option<i64>,
+    /// Current session TimeZone, supplied by the host.
+    pub timezone: giggles_pg_types::temporal::SessionZone,
     /// Whether this connection actually completed a TLS handshake.
     pub backend_ssl: bool,
     /// Freshly authorized application rows, supplied by the hosting session.
@@ -237,6 +240,7 @@ impl Default for CatalogSnapshot {
             backend_pid: 0,
             table_locks: Vec::new(),
             timezone_now: None,
+            timezone: giggles_pg_types::temporal::SessionZone::Fixed(0),
             backend_ssl: false,
             user_relations: Default::default(),
             user_types: Vec::new(),

@@ -214,6 +214,7 @@ pub(crate) fn snapshot(
     presentation.comments.retain(|(table, column), _| visible.contains(table)
         && (*column == 0 || columns.contains(column)));
     Ok(giggles_pg_catalog::CatalogSnapshot {
+        timezone: session.zone().unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0)),
         views: presentation.views.into_iter().map(|(id, v)| (id, v.definition)).collect(),
         comments: presentation.comments,
         column_defaults: presentation.defaults, column_identities: presentation.identities,
@@ -1004,44 +1005,54 @@ mod tests {
     #[test]
     fn held_table_lock_catalog_parity() {
         use giggles_core::{Admin, Limits, roles::NewRole, SqlTableLockMode as M};
-        let path = crate::test_support::fixture_root().join(format!("lock-catalog-{}", std::process::id()));
-        let admin = Admin::create(&path, Limits::default()).unwrap();
-        admin.roles().create(NewRole { name: "lock_owner".into(), login: true, superuser: true, ..Default::default() }).unwrap();
-        let service = crate::Service::new(admin, vec![], crate::clock::Clock::new(0, 3600).unwrap()).unwrap();
-        let mut session = service.role_session("lock_owner").unwrap();
-        session.backend_pid = 42;
-        session.execute_sql("CREATE TABLE t (id INT PRIMARY KEY)", &[]).unwrap();
-        let read = |session: &mut crate::Session| {
-            let (epoch, tables, indexes, typmods, types) = session.catalog_snapshot_with_typmods().unwrap();
-            let snap = snapshot(session, epoch, tables, indexes, typmods, types).unwrap();
-            let plan = giggles_pg_catalog::plan("SELECT mode, granted FROM pg_locks WHERE relation = 't'::regclass AND pid = pg_backend_pid() ORDER BY mode").unwrap().unwrap();
-            giggles_pg_catalog::execute(&plan, &snap, &[]).unwrap().rows
-        };
-        for (mode, name) in [(M::AccessShare, "AccessShareLock"), (M::RowShare, "RowShareLock"), (M::RowExclusive, "RowExclusiveLock"), (M::ShareUpdateExclusive, "ShareUpdateExclusiveLock"), (M::Share, "ShareLock"), (M::ShareRowExclusive, "ShareRowExclusiveLock"), (M::ExclusiveTable, "ExclusiveLock"), (M::AccessExclusive, "AccessExclusiveLock")] {
-            for nowait in [false, true] {
-                session.execute_sql("BEGIN", &[]).unwrap();
-                session.sql.lock_tables(&["t".into()], mode, nowait).unwrap();
-                assert_eq!(read(&mut session), vec![vec![Value::Text(name.into()), Value::Bool(true)]], "{name}");
-                session.execute_sql(if nowait { "COMMIT" } else { "ROLLBACK" }, &[]).unwrap();
-                assert!(read(&mut session).is_empty());
+        // Legacy has no table lock manager; V2 exposes its transaction-held locks.
+        for engine in [giggles_core::Engine::Legacy, #[cfg(feature = "engine-rocksdb")] giggles_core::Engine::V2] {
+            let holds_locks = engine == giggles_core::Engine::V2;
+            let path = crate::test_support::fixture_root().join(format!("lock-catalog-{engine:?}-{}", std::process::id()));
+            let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+            admin.roles().create(NewRole { name: "lock_owner".into(), login: true, superuser: true, ..Default::default() }).unwrap();
+            let service = crate::Service::new(admin, vec![], crate::clock::Clock::new(0, 3600).unwrap()).unwrap();
+            let mut session = service.role_session("lock_owner").unwrap();
+            session.backend_pid = 42;
+            session.execute_sql("CREATE TABLE t (id INT PRIMARY KEY)", &[]).unwrap();
+            let read = |session: &mut crate::Session| {
+                let (epoch, tables, indexes, typmods, types) = session.catalog_snapshot_with_typmods().unwrap();
+                let snap = snapshot(session, epoch, tables, indexes, typmods, types).unwrap();
+                let plan = giggles_pg_catalog::plan("SELECT mode, granted FROM pg_locks WHERE relation = 't'::regclass AND pid = pg_backend_pid() ORDER BY mode").unwrap().unwrap();
+                giggles_pg_catalog::execute(&plan, &snap, &[]).unwrap().rows
+            };
+            for (mode, name) in [(M::AccessShare, "AccessShareLock"), (M::RowShare, "RowShareLock"), (M::RowExclusive, "RowExclusiveLock"), (M::ShareUpdateExclusive, "ShareUpdateExclusiveLock"), (M::Share, "ShareLock"), (M::ShareRowExclusive, "ShareRowExclusiveLock"), (M::ExclusiveTable, "ExclusiveLock"), (M::AccessExclusive, "AccessExclusiveLock")] {
+                for nowait in [false, true] {
+                    session.execute_sql("BEGIN", &[]).unwrap();
+                    session.sql.lock_tables(&["t".into()], mode, nowait).unwrap();
+                    let expected = if holds_locks { vec![vec![Value::Text(name.into()), Value::Bool(true)]] } else { vec![] };
+                    assert_eq!(read(&mut session), expected, "{engine:?}: {name}");
+                    session.execute_sql(if nowait { "COMMIT" } else { "ROLLBACK" }, &[]).unwrap();
+                    assert!(read(&mut session).is_empty());
+                }
             }
-        }
-        session.execute_sql("BEGIN", &[]).unwrap();
-        session.sql.lock_tables(&["t".into()], M::ShareRowExclusive, false).unwrap();
-        session.sql.lock_tables(&["t".into()], M::AccessShare, false).unwrap();
-        assert_eq!(read(&mut session).len(), 2);
-        session.execute_sql("ROLLBACK", &[]).unwrap();
-        for sql in ["SELECT * FROM t", "INSERT INTO t VALUES (1)", "UPDATE t SET id=2", "DELETE FROM t"] {
             session.execute_sql("BEGIN", &[]).unwrap();
-            session.execute_sql(sql, &[]).unwrap();
-            let mode = if sql.starts_with("SELECT") { "AccessShareLock" } else { "RowExclusiveLock" };
-            assert!(read(&mut session).iter().any(|r| r[0] == Value::Text(mode.into())), "{sql}");
+            session.sql.lock_tables(&["t".into()], M::ShareRowExclusive, false).unwrap();
+            session.sql.lock_tables(&["t".into()], M::AccessShare, false).unwrap();
+            assert_eq!(read(&mut session).len(), if holds_locks { 2 } else { 0 });
             session.execute_sql("ROLLBACK", &[]).unwrap();
+            for sql in ["SELECT * FROM t", "INSERT INTO t VALUES (1)", "UPDATE t SET id=2", "DELETE FROM t"] {
+                session.execute_sql("BEGIN", &[]).unwrap();
+                session.execute_sql(sql, &[]).unwrap();
+                let mode = if sql.starts_with("SELECT") { "AccessShareLock" } else { "RowExclusiveLock" };
+                let rows = read(&mut session);
+                if holds_locks {
+                    assert!(rows.iter().any(|r| r[0] == Value::Text(mode.into())), "{sql}");
+                } else {
+                    assert!(rows.is_empty(), "Legacy holds no table locks: {sql}");
+                }
+                session.execute_sql("ROLLBACK", &[]).unwrap();
+            }
+            assert_eq!(encode(&Value::Text("-03:00:00".into()), PgType::Interval, 0).unwrap(), Some(b"-03:00:00".to_vec()));
+            assert_eq!(encode(&Value::Text("-03:00:00".into()), PgType::Interval, 1).unwrap(), Some(giggles_pg_types::temporal::Interval::parse("-03:00:00").unwrap().to_binary().to_vec()));
+            drop(session); drop(service);
+            std::fs::remove_dir_all(path).unwrap();
         }
-        assert_eq!(encode(&Value::Text("-03:00:00".into()), PgType::Interval, 0).unwrap(), Some(b"-03:00:00".to_vec()));
-        assert_eq!(encode(&Value::Text("-03:00:00".into()), PgType::Interval, 1).unwrap(), Some(giggles_pg_types::temporal::Interval::parse("-03:00:00").unwrap().to_binary().to_vec()));
-        drop(session); drop(service);
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

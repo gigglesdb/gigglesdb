@@ -24,3 +24,57 @@ fn held_relation_lock_full_shape() {
     assert_eq!(&row[13..], &[Value::Bool(true), Value::Bool(false), Value::Null]);
     assert!(execute(&p, &CatalogSnapshot::default(), &[]).unwrap().rows.is_empty());
 }
+
+fn abbreviation_golden(zone: &str, golden: &str, count: usize) {
+    let snapshot = CatalogSnapshot {
+        timezone_now: Some(1794844800),
+        timezone: giggles_pg_types::temporal::SessionZone::setting(zone)
+            .unwrap()
+            .0,
+        ..Default::default()
+    };
+    let p = plan("SELECT * FROM pg_catalog.pg_timezone_abbrevs ORDER BY abbrev")
+        .unwrap()
+        .unwrap();
+    let result = execute(&p, &snapshot, &[]).unwrap();
+    assert_eq!(
+        result
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            ("abbrev", PgType::Text),
+            ("utc_offset", PgType::Interval),
+            ("is_dst", PgType::Bool)
+        ]
+    );
+    assert_eq!(result.rows.len(), count);
+    let text = result
+        .rows
+        .iter()
+        .map(|row| {
+            let [Value::Text(name), Value::Text(offset), Value::Bool(dst)] = row.as_slice() else {
+                panic!("unexpected row {row:?}")
+            };
+            format!("{name}|{offset}|{}\n", if *dst { "t" } else { "f" })
+        })
+        .collect::<String>();
+    assert_eq!(text, golden.replace('\r', ""));
+}
+#[test]
+fn timezone_abbreviations_utc_golden() {
+    abbreviation_golden(
+        "UTC",
+        include_str!("fixtures/pg_timezone_abbrevs/utc.txt"),
+        195,
+    );
+}
+#[test]
+fn timezone_abbreviations_new_york_golden() {
+    abbreviation_golden(
+        "America/New_York",
+        include_str!("fixtures/pg_timezone_abbrevs/nyc.txt"),
+        198,
+    );
+}

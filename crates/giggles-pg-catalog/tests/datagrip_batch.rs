@@ -50,6 +50,8 @@ fn captured_expanded_global_discovery() {
     for (i, sql) in cases.iter().enumerate() {
         let r = run(sql, &[]);
         let expected = match i + 1 {
+            // PG18.6 Default abbreviations: 487 zone pairs plus 193 additional abbrev pairs.
+            1 => 680,
             2 => 17,
             4 => 2, // Built-in pg_default and pg_global tablespaces.
             5 => 3, // Two tablespaces plus the snapshot database.

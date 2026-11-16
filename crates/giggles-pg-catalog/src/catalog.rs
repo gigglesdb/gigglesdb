@@ -411,7 +411,7 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
             ("set_option", T::Bool),
         ],
         "pg_timezone_names" => &[("name", T::Text), ("abbrev", T::Text), ("utc_offset", T::Interval), ("is_dst", T::Bool)],
-        "pg_timezone_abbrevs" => &[("abbrev", T::Text), ("is_dst", T::Bool)],
+        "pg_timezone_abbrevs" => &[("abbrev", T::Text), ("utc_offset", T::Interval), ("is_dst", T::Bool)],
         "pg_tablespace" => &[
             ("oid", T::Oid),
             ("spcname", T::Name),
@@ -1551,6 +1551,12 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         let seconds = seconds.unsigned_abs();
         let interval = format!("{sign}{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
         add("pg_timezone_names", vec![s(name), s(&abbrev), s(&interval), B(dst)]);
+    }
+    for (abbrev, seconds, dst) in crate::timezone_abbrevs::rows(snapshot.timezone, now)? {
+        let sign = if seconds < 0 { "-" } else { "" };
+        let seconds = seconds.unsigned_abs();
+        let interval = format!("{sign}{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
+        add("pg_timezone_abbrevs", vec![s(&abbrev), s(&interval), B(dst)]);
     }
     for (txn, table, pid, mode, fastpath) in &snapshot.table_locks {
         add("pg_locks", vec![s("relation"), I(16384), I(i64::from(table_oid(*table)?)),

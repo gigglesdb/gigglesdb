@@ -79,13 +79,13 @@ fn view_matrix_matches_sql() {
             continue;
         }
         for admin in [&left, &right] { for sql in ["insert into orders values(1,1,1),(2,1,3)", "create table items(id bigint primary key)", "insert into items values(1)", "create schema app"] { admin.sql_session().execute(sql, &[], None).unwrap(); } }
-        // PostgreSQL accepts filtered views; GigglesDB SQL and native both reject them (shared R1 gap)
-        step(&left, &right, "create view vf as orders where qty > 1 select id,qty", "create view vf as select id,qty from orders where qty > 1", Some("0A000"), false);
+        // PostgreSQL accepts filtered views; SQL and native must preserve the predicate.
+        step(&left, &right, "create view vf as orders where qty > 1 select id,qty", "create view vf as select id,qty from orders where qty > 1", None, false);
         for (native, sql) in [
             ("create view v as orders select id,qty", "create view v as select id,qty from orders"),
             ("create view app.v2 as orders select id", "create view app.v2 as select id from orders"),
             ("create view w as v select id", "create view w as select id from v")] { step(&left, &right, native, sql, None, false); }
-        for query in ["select * from v order by id", "select * from app.v2 order by id", "select * from w order by id"] {
+        for query in ["select * from vf order by id", "select * from v order by id", "select * from app.v2 order by id", "select * from w order by id"] {
             let rows = |admin: &Admin| admin.sql_session().execute(query, &[], None).unwrap().rows.into_iter().map(|r| r.values).collect::<Vec<_>>();
             assert_eq!(rows(&left), rows(&right));
         }
@@ -101,6 +101,6 @@ fn view_matrix_matches_sql() {
             // PostgreSQL accepts joins in views; R1 SQL and native both reject them.
             ("create view j as items i join orders o on i.id = o.item select i.id,o.qty", "create view j as select i.id,o.qty from items i join orders o on i.id = o.item", Some("0A000"), false)
         ] { step(&left, &right, native, sql, state, missing); }
-        assert_eq!(right.sql_session().catalog_metadata().unwrap().presentation.views.len(), 1);
+        assert_eq!(right.sql_session().catalog_metadata().unwrap().presentation.views.len(), 2);
     }
 }

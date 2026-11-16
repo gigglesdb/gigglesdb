@@ -77,6 +77,22 @@ pub enum SessionZone {
     Named(Tz),
 }
 impl SessionZone {
+    /// Distinct historical abbreviations of this session zone, in TZif order.
+    /// The first type wins when a designation occurs with multiple offsets.
+    pub fn abbreviations(self) -> Result<Vec<(String, i32, bool)>, Error> {
+        let Self::Named(zone) = self else {
+            return Ok(Vec::new());
+        };
+        let db = database(zone)?;
+        let mut rows = Vec::new();
+        for info in db.as_ref().as_ref().local_time_types() {
+            let name = info.time_zone_designation();
+            if !rows.iter().any(|(n, _, _)| n == name) {
+                rows.push((name.to_owned(), info.ut_offset(), info.is_dst()));
+            }
+        }
+        Ok(rows)
+    }
     pub fn fixed(seconds_east: i32) -> Result<Self, Error> {
         Ok(Self::Fixed(offset_valid(seconds_east)?))
     }
@@ -400,6 +416,23 @@ mod setting_tests {
 #[cfg(test)]
 mod parity_catalog_tests {
     use super::*;
+    #[test]
+    fn session_zone_historical_abbreviations() {
+        let rows = SessionZone::named("America/New_York")
+            .unwrap()
+            .abbreviations()
+            .unwrap();
+        for (name, offset, dst) in [
+            ("LMT", -17762, false),
+            ("EWT", -14400, true),
+            ("EPT", -14400, true),
+        ] {
+            assert!(rows.contains(&(name.into(), offset, dst)));
+        }
+        assert!(SessionZone::Fixed(3600).abbreviations().unwrap().is_empty());
+        let utc = SessionZone::named("UTC").unwrap().abbreviations().unwrap();
+        assert_eq!(utc, vec![("UTC".into(), 0, false)]);
+    }
     #[test]
     fn pinned_names_and_current_rows() {
         assert_eq!(TIMEZONE_NAMES.lines().count(), 487);
