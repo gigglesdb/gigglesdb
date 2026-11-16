@@ -254,7 +254,9 @@ fn catalog_descriptor_frozen_fields_and_presence() {
     let file = set.file.iter().find(|f| f.package.as_deref() == Some("giggles.v1")).unwrap();
     for (message, fields, optional, oneof) in [
         ("NativeCatalogRequest", "create_table create_index drop_table drop_index alter_table", "", Some("request")),
-        ("NativeCatalogColumn", "name data_type not_null", "name data_type not_null", None),
+        ("NativeCatalogColumn", "name data_type not_null default generated", "name data_type not_null generated", None),
+        ("NativeColumnDefault", "value clock nextval", "", Some("kind")),
+        ("NativeClockDefault", "kind precision", "kind precision", None),
         ("NativeCreateTable", "table columns primary_key", "table", None),
         ("NativeCreateIndex", "table name columns", "table name", None),
         ("NativeDropTable", "table cascade", "table cascade", None),
@@ -276,4 +278,18 @@ fn catalog_descriptor_frozen_fields_and_presence() {
     let m = file.message_type.iter().find(|m| m.name.as_deref() == Some("ExecuteRequest")).unwrap();
     let f = m.field.iter().find(|f| f.name.as_deref() == Some("catalog")).unwrap();
     assert_eq!(m.oneof_decl[f.oneof_index.unwrap() as usize].name.as_deref(), Some("request"));
+}
+
+#[test]
+fn catalog_default_json_schema_contract() {
+    let schema: serde_json::Value = serde_json::from_str(include_str!("../docs/http-api.openapi.json")).unwrap();
+    let s = &schema["components"]["schemas"];
+    assert_eq!(s["NativeCatalogColumn"]["properties"]["default"]["$ref"], "#/components/schemas/NativeColumnDefault");
+    assert_eq!(s["NativeCatalogColumn"]["properties"]["generated"]["enum"], serde_json::json!(["IdentityAlways", "IdentityByDefault", "Serial"]));
+    for (i, name) in ["Value", "Nextval", "Clock"].into_iter().enumerate() {
+        assert_eq!(s["NativeColumnDefault"]["oneOf"][i]["required"], serde_json::json!([name]));
+    }
+    assert_eq!(s["NativeClockDefault"]["oneOf"][1]["properties"]["precision"]["maximum"], u32::MAX);
+    assert!(s["NativeAlterTable"]["properties"]["addColumn"]["allOf"][1]["not"].is_object());
+    assert!(s["NativeCatalogOutcome"]["properties"]["columns"]["items"]["allOf"][1]["not"].is_object());
 }

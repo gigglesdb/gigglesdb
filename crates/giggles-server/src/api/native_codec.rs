@@ -754,7 +754,10 @@ pub(crate) fn catalog_request(v: p::NativeCatalogRequest) -> R<o::CatalogRequest
             use p::native_alter_table::Action as A;
             let table = need(v.table)?;
             let action = match need(v.action)? {
-                A::AddColumn(v) => o::AlterTableAction::AddColumn { column: catalog_column(v)? },
+                A::AddColumn(v) => {
+                    if v.default.is_some() || v.generated.is_some() { return Err(ApiError::InvalidArgument); }
+                    o::AlterTableAction::AddColumn { column: catalog_column(v)? }
+                },
                 A::DropColumn(v) => o::AlterTableAction::DropColumn { name: need(v.name)?, cascade: v.cascade.unwrap_or(false) },
                 A::RenameColumn(v) => o::AlterTableAction::RenameColumn { from: need(v.from)?, to: need(v.to)? },
                 A::RenameTable(v) => o::AlterTableAction::RenameTable { to: need(v.to)? },
@@ -764,7 +767,29 @@ pub(crate) fn catalog_request(v: p::NativeCatalogRequest) -> R<o::CatalogRequest
     })
 }
 fn catalog_column(v: p::NativeCatalogColumn) -> R<o::ColumnSpec> {
-    Ok(o::ColumnSpec { name: need(v.name)?, data_type: catalog_type(&need(v.data_type)?)?, not_null: v.not_null.unwrap_or(false), default: None, generated: None })
+    Ok(o::ColumnSpec { name: need(v.name)?, data_type: catalog_type(&need(v.data_type)?)?, not_null: v.not_null.unwrap_or(false), default: v.default.map(column_default).transpose()?, generated: v.generated.map(|v| Ok(match v.as_str() {
+        "IdentityAlways" => o::Generated::IdentityAlways, "IdentityByDefault" => o::Generated::IdentityByDefault, "Serial" => o::Generated::Serial, _ => return Err(ApiError::InvalidArgument),
+    })).transpose()? })
+}
+fn column_default(v: p::NativeColumnDefault) -> R<o::ColumnDefault> {
+    use p::native_column_default::Kind as K;
+    Ok(match need(v.kind)? {
+        K::Value(v) => o::ColumnDefault::Value(codec::decode_value(v)?),
+        K::Nextval(v) => o::ColumnDefault::Nextval(v),
+        K::Clock(v) => o::ColumnDefault::Clock(clock_default(v)?),
+    })
+}
+fn clock_default(v: p::NativeClockDefault) -> R<o::ClockDefault> {
+    use o::ClockDefault as C;
+    let kind = need(v.kind)?;
+    Ok(match kind.as_str() {
+        "CurrentTime" => C::CurrentTime(v.precision), "CurrentTimestamp" => C::CurrentTimestamp(v.precision),
+        "LocalTime" => C::LocalTime(v.precision), "LocalTimestamp" => C::LocalTimestamp(v.precision),
+        _ if v.precision.is_some() => return Err(ApiError::InvalidArgument),
+        "Now" => C::Now, "TransactionTimestamp" => C::TransactionTimestamp,
+        "StatementTimestamp" => C::StatementTimestamp, "ClockTimestamp" => C::ClockTimestamp,
+        "CurrentDate" => C::CurrentDate, _ => return Err(ApiError::InvalidArgument),
+    })
 }
 fn catalog_type(v: &str) -> R<DataType> {
     Ok(match v {
@@ -825,7 +850,7 @@ pub(crate) fn encode_catalog_outcome(v: o::CatalogOutcome, canonical_table: Stri
         table: canonical_table,
         primary_key: v.table.primary_key.iter().filter(|i| Some(**i) != v.table.hidden_rowid()).map(|i| v.table.columns[*i].name.clone()).collect(),
         columns: v.table.logical_columns().map(|c| p::NativeCatalogColumn {
-            data_type: Some(catalog_type_name(&c.data_type).into()), name: Some(c.name.clone()), not_null: Some(c.not_null),
+            data_type: Some(catalog_type_name(&c.data_type).into()), name: Some(c.name.clone()), not_null: Some(c.not_null), default: None, generated: None,
         }).collect(),
         index_id: v.index_id,
     }

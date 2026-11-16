@@ -1991,7 +1991,20 @@
       },
       "NativeCatalogColumn": {
         "type": "object", "additionalProperties": false, "required": ["name", "dataType"],
-        "properties": {"name": {"type": "string"}, "dataType": {"$ref": "#/components/schemas/NativeCatalogDataType"}, "notNull": {"type": "boolean", "default": false}}
+        "properties": {"name": {"type": "string"}, "dataType": {"$ref": "#/components/schemas/NativeCatalogDataType"}, "notNull": {"type": "boolean", "default": false}, "default": {"$ref": "#/components/schemas/NativeColumnDefault"}, "generated": {"type": "string", "enum": ["IdentityAlways", "IdentityByDefault", "Serial"]}}
+      },
+      "NativeColumnDefault": {
+        "oneOf": [
+          {"type": "object", "additionalProperties": false, "required": ["Value"], "properties": {"Value": {"$ref": "#/components/schemas/Value"}}},
+          {"type": "object", "additionalProperties": false, "required": ["Nextval"], "properties": {"Nextval": {"type": "string"}}},
+          {"type": "object", "additionalProperties": false, "required": ["Clock"], "properties": {"Clock": {"$ref": "#/components/schemas/NativeClockDefault"}}}
+        ]
+      },
+      "NativeClockDefault": {
+        "oneOf": [
+          {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"type": "string", "enum": ["Now", "TransactionTimestamp", "StatementTimestamp", "ClockTimestamp", "CurrentDate"]}}},
+          {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"type": "string", "enum": ["CurrentTime", "CurrentTimestamp", "LocalTime", "LocalTimestamp"]}, "precision": {"type": "integer", "minimum": 0, "maximum": 4294967295}}}
+        ]
       },
       "NativeCreateTable": {
         "type": "object", "additionalProperties": false, "required": ["table"],
@@ -2016,7 +2029,7 @@
       "NativeAlterTable": {
         "type": "object", "additionalProperties": false, "required": ["table"],
         "properties": {
-          "table": {"type": "string"}, "addColumn": {"$ref": "#/components/schemas/NativeCatalogColumn"},
+          "table": {"type": "string"}, "addColumn": {"allOf": [{"$ref": "#/components/schemas/NativeCatalogColumn"}, {"not": {"anyOf": [{"required": ["default"]}, {"required": ["generated"]}]}}]},
           "dropColumn": {"$ref": "#/components/schemas/NativeDropColumn"},
           "renameColumn": {"$ref": "#/components/schemas/NativeRenameColumn"},
           "renameTable": {"$ref": "#/components/schemas/NativeRenameTable"}
@@ -2039,7 +2052,7 @@
         "type": "object", "additionalProperties": false, "required": ["catalogEpoch", "table", "columns", "primaryKey"],
         "properties": {
           "catalogEpoch": {"$ref": "#/components/schemas/UInt64"}, "table": {"type": "string"},
-          "columns": {"type": "array", "items": {"allOf": [{"$ref": "#/components/schemas/NativeCatalogColumn"}, {"required": ["notNull"]}]}},
+          "columns": {"type": "array", "items": {"allOf": [{"$ref": "#/components/schemas/NativeCatalogColumn"}, {"required": ["notNull"], "not": {"anyOf": [{"required": ["default"]}, {"required": ["generated"]}]}}]}},
           "primaryKey": {"type": "array", "items": {"type": "string"}}, "indexId": {"$ref": "#/components/schemas/UInt64"}
         },
         "description": "Logical catalog metadata; hidden row IDs are excluded. table is canonical schema-qualified (new name after rename). Drops return removed table or owning-table metadata. indexId is present for index creation/deletion."

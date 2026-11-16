@@ -522,6 +522,19 @@ The exact, case-sensitive `dataType` names are `Boolean`, `SmallInt`, `Integer`,
 `Jsonb`, `IntArray`, `BigIntArray` and `TextArray`; SQL type spellings and
 parameterized type declarations are not accepted here.
 
+Create-table columns additionally accept `default` with exactly one of
+`{"Value": <native Value>}`, `{"Nextval":"sequence_name"}` or
+`{"Clock":{"kind":"Now"}}`, and `generated`: `IdentityAlways`,
+`IdentityByDefault` or `Serial`. Clock kinds are `Now`, `TransactionTimestamp`,
+`StatementTimestamp`, `ClockTimestamp`, `CurrentDate`, `CurrentTime`,
+`CurrentTimestamp`, `LocalTime`, `LocalTimestamp`. Only the last four accept
+optional unsigned 32-bit numeric `precision`; execution validates its meaning.
+Unknown keys/kinds are malformed. Protobuf column tags are default=4 and
+generated=5; default oneof tags are value=1, clock=2, nextval=3, and clock tags
+are kind=1, precision=2. Native ALTER addColumn rejects either new field as a
+malformed request on both transports; SQL ALTER TABLE ADD COLUMN supports DEFAULT/IDENTITY.
+Catalog outcomes do not echo default/generated definitions.
+
 Successful replies use `code: "ok"` and `catalogOutcome` (protobuf field 11):
 `catalogEpoch` is an unsigned 64-bit decimal string, `table` is the canonical
 schema-qualified table name (the new name after rename), `columns` contains

@@ -640,7 +640,9 @@ enum NativeErrorClass {
 }
 
 message NativeCatalogRequest { oneof request { NativeCreateTable create_table = 1; NativeCreateIndex create_index = 2; NativeDropTable drop_table = 3; NativeDropIndex drop_index = 4; NativeAlterTable alter_table = 5; } }
-message NativeCatalogColumn { optional string name = 1; optional string data_type = 2; optional bool not_null = 3; }
+message NativeCatalogColumn { optional string name = 1; optional string data_type = 2; optional bool not_null = 3; NativeColumnDefault default = 4; optional string generated = 5; }
+message NativeColumnDefault { oneof kind { Value value = 1; NativeClockDefault clock = 2; string nextval = 3; } }
+message NativeClockDefault { optional string kind = 1; optional uint32 precision = 2; }
 message NativeCreateTable { optional string table = 1; repeated NativeCatalogColumn columns = 2; repeated string primary_key = 3; }
 message NativeCreateIndex { optional string table = 1; optional string name = 2; repeated string columns = 3; }
 message NativeDropTable { optional string table = 1; optional bool cascade = 2; }

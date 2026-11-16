@@ -197,17 +197,17 @@ async fn catalog_malformed_transport_arguments() {
         let mut column=json!({});
         if let Some(v)=name {column["name"]=json!(v);}
         if let Some(v)=data_type {column["dataType"]=json!(v);}
-        requests.push((json!({"createTable":{"table":"t","columns":[column]}}),C::CreateTable(p::NativeCreateTable {table:Some("t".into()),columns:vec![p::NativeCatalogColumn {name:name.map(str::to_owned),data_type:data_type.map(str::to_owned),not_null:None}],..Default::default()})));
+        requests.push((json!({"createTable":{"table":"t","columns":[column]}}),C::CreateTable(p::NativeCreateTable {table:Some("t".into()),columns:vec![p::NativeCatalogColumn {name:name.map(str::to_owned),data_type:data_type.map(str::to_owned),not_null:None,..Default::default()}],..Default::default()})));
     }
     requests.push((json!({"createIndex":{"name":"i"}}),C::CreateIndex(p::NativeCreateIndex {name:Some("i".into()),..Default::default()})));
-    requests.push((json!({"createTable":{"columns":[{"name":"id","dataType":"BigInt"}],"primaryKey":["id"]}}),C::CreateTable(p::NativeCreateTable {table:None,columns:vec![p::NativeCatalogColumn {name:Some("id".into()),data_type:Some("BigInt".into()),not_null:None}],primary_key:vec!["id".into()]})));
+    requests.push((json!({"createTable":{"columns":[{"name":"id","dataType":"BigInt"}],"primaryKey":["id"]}}),C::CreateTable(p::NativeCreateTable {table:None,columns:vec![p::NativeCatalogColumn {name:Some("id".into()),data_type:Some("BigInt".into()),not_null:None,..Default::default()}],primary_key:vec!["id".into()]})));
     for (name,data_type) in [(None,Some("BigInt")),(Some("id"),None),(Some("id"),Some("bogus"))] {
         let mut column=json!({});
         if let Some(v)=name {column["name"]=json!(v);}
         if let Some(v)=data_type {column["dataType"]=json!(v);}
-        requests.push((json!({"alterTable":{"table":"t","addColumn":column}}),C::AlterTable(p::NativeAlterTable {table:Some("t".into()),action:Some(A::AddColumn(p::NativeCatalogColumn {name:name.map(str::to_owned),data_type:data_type.map(str::to_owned),not_null:None}))})));
+        requests.push((json!({"alterTable":{"table":"t","addColumn":column}}),C::AlterTable(p::NativeAlterTable {table:Some("t".into()),action:Some(A::AddColumn(p::NativeCatalogColumn {name:name.map(str::to_owned),data_type:data_type.map(str::to_owned),not_null:None,..Default::default()}))})));
     }
-    let col=p::NativeCatalogColumn {name:Some("id".into()),data_type:Some("BigInt".into()),not_null:None};
+    let col=p::NativeCatalogColumn {name:Some("id".into()),data_type:Some("BigInt".into()),not_null:None,..Default::default()};
     requests.extend([
         (json!({"createTable":{"table":"t","columns":vec![json!({"name":"id","dataType":"BigInt"});1601]}}),C::CreateTable(p::NativeCreateTable {table:Some("t".into()),columns:vec![col;1601],..Default::default()})),
         (json!({"createTable":{"table":"t","primaryKey":vec!["id";1601]}}),C::CreateTable(p::NativeCreateTable {table:Some("t".into()),primary_key:vec!["id".into();1601],..Default::default()})),

@@ -210,9 +210,29 @@ impl Decoder {
     fn catalog_column(v: Json) -> R<p::NativeCatalogColumn> {
         let mut f = Object::new(v)?;
         let column = p::NativeCatalogColumn { name: Some(text(f.required("name")?)?),
-            data_type: Some(text(f.required("dataType")?)?), not_null: f.optional("notNull").map(boolean).transpose()? };
+            data_type: Some(text(f.required("dataType")?)?), not_null: f.optional("notNull").map(boolean).transpose()?,
+            default: f.optional("default").map(Self::column_default).transpose()?, generated: f.optional("generated").map(text).transpose()? };
         f.finish()?;
         Ok(column)
+    }
+    fn column_default(v: Json) -> R<p::NativeColumnDefault> {
+        use p::native_column_default::Kind as K;
+        let (kind, v) = Object::new(v)?.one()?;
+        let kind = Some(match kind.as_str() {
+            "Value" => K::Value(decode_value(v)?), "Nextval" => K::Nextval(text(v)?),
+            "Clock" => {
+                let mut f = Object::new(v)?;
+                let kind = Some(text(f.required("kind")?)?);
+                let precision = f.optional("precision").map(|v| match v {
+                    Json::Unsigned(n) => u32::try_from(n).map_err(|_| ApiError::InvalidArgument),
+                    _ => Err(ApiError::InvalidArgument),
+                }).transpose()?;
+                f.finish()?;
+                K::Clock(p::NativeClockDefault { kind, precision })
+            }
+            _ => return Err(ApiError::InvalidArgument),
+        });
+        Ok(p::NativeColumnDefault { kind })
     }
     pub(super) fn search_path(&mut self, v: Json) -> R<p::NativeSearchPathRequest> {
         let mut f = Object::new(v)?;
@@ -899,6 +919,8 @@ impl Serialize for p::NativeCatalogColumn {
         if let Some(v) = &self.name { m.serialize_entry("name", v)?; }
         if let Some(v) = &self.data_type { m.serialize_entry("dataType", v)?; }
         if let Some(v) = &self.not_null { m.serialize_entry("notNull", v)?; }
+        if let Some(v) = &self.default { m.serialize_entry("default", v)?; }
+        if let Some(v) = &self.generated { m.serialize_entry("generated", v)?; }
         m.end()
     }
 }
@@ -911,5 +933,63 @@ impl Serialize for p::NativeCatalogOutcome {
         m.serialize_entry("primaryKey", &self.primary_key)?;
         if let Some(v) = self.index_id { m.serialize_entry("indexId", &Decimal(v))?; }
         m.end()
+    }
+}
+
+impl Serialize for p::NativeColumnDefault {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(Some(1))?;
+        match &self.kind {
+            Some(p::native_column_default::Kind::Value(v)) => m.serialize_entry("Value", &JsonValue(v))?,
+            Some(p::native_column_default::Kind::Nextval(v)) => m.serialize_entry("Nextval", v)?,
+            Some(p::native_column_default::Kind::Clock(v)) => m.serialize_entry("Clock", v)?,
+            None => return Err(S::Error::custom("missing column default")),
+        }
+        m.end()
+    }
+}
+impl Serialize for p::NativeClockDefault {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        if let Some(v) = &self.kind { m.serialize_entry("kind", v)?; }
+        if let Some(v) = &self.precision { m.serialize_entry("precision", v)?; }
+        m.end()
+    }
+}
+#[cfg(test)]
+mod catalog_defaults_tests {
+    use super::*;
+    fn decode(s: &str, add: bool) -> R<giggles_core::operations::CatalogRequest> {
+        let action = if add { "alterTable" } else { "createTable" };
+        let columns = if add { format!("\"addColumn\":{s}") } else { format!("\"columns\":[{s}]") };
+        let json = format!("{{\"{action}\":{{\"table\":\"t\",{columns}}}}}");
+        let request = super::super::json::decode_execute(format!("{{\"catalog\":{json}}}").as_bytes())?;
+        let Some(p::execute_request::Request::Catalog(catalog)) = request.request else { unreachable!() };
+        if let Some(p::native_catalog_request::Request::CreateTable(v)) = &catalog.request {
+            assert_eq!(serde_json::to_value(&v.columns[0]).unwrap(), serde_json::from_str::<serde_json::Value>(s).unwrap());
+        }
+        super::super::native_codec::catalog_request(catalog)
+    }
+    #[test]
+    fn strict_column_defaults() {
+        for field in [r#""default":{"Value":{"intValue":"7"}}"#, r#""default":{"Nextval":"s"}"#,
+            r#""generated":"IdentityAlways""#, r#""generated":"IdentityByDefault""#, r#""generated":"Serial""#] {
+            let column = format!(r#"{{"name":"c","dataType":"Integer",{field}}}"#);
+            assert!(decode(&column, false).is_ok(), "{column}");
+            assert!(decode(&column, true).is_err());
+        }
+        for kind in ["Now", "TransactionTimestamp", "StatementTimestamp", "ClockTimestamp", "CurrentDate", "CurrentTime", "CurrentTimestamp", "LocalTime", "LocalTimestamp"] {
+            for precision in ["", ",\"precision\":3"] {
+                let column = format!(r#"{{"name":"c","dataType":"Time","default":{{"Clock":{{"kind":"{kind}"{precision}}}}}}}"#);
+                assert_eq!(decode(&column, false).is_ok(), precision.is_empty() || ["CurrentTime", "CurrentTimestamp", "LocalTime", "LocalTimestamp"].contains(&kind), "{column}");
+            }
+        }
+        for field in [r#""default":{}"#, r#""default":{"Value":{}}"#, r#""default":{"Unknown":"x"}"#, r#""default":{"Value":{"intValue":"1"},"Nextval":"s"}"#,
+            r#""default":{"Clock":{}}"#, r#""default":{"Clock":{"kind":"bad"}}"#, r#""default":{"Clock":{"kind":"Now","extra":1}}"#,
+            r#""default":{"Clock":{"kind":"CurrentTime","precision":-1}}"#, r#""default":{"Clock":{"kind":"CurrentTime","precision":"3"}}"#,
+            r#""default":{"Clock":{"kind":"CurrentTime","precision":4294967296}}"#, r#""default":{"Clock":{"kind":"CurrentTime","precision":null}}"#,
+            r#""generated":"unknown""#, r#""extra":1"#] {
+            assert!(decode(&format!(r#"{{"name":"c","dataType":"Integer",{field}}}"#), false).is_err(), "{field}");
+        }
     }
 }

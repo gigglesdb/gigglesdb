@@ -697,7 +697,7 @@ fn catalog(q: p::native_catalog_request::Request) -> R<o::CatalogRequest> {
     catalog_request(p::NativeCatalogRequest::decode(v.encode_to_vec().as_slice()).unwrap())
 }
 fn catalog_col() -> p::NativeCatalogColumn {
-    p::NativeCatalogColumn { name: Some("id".into()), data_type: Some("Integer".into()), not_null: None }
+    p::NativeCatalogColumn { name: Some("id".into()), data_type: Some("Integer".into()), not_null: None, ..Default::default() }
 }
 #[test]
 fn catalog_requests_actions_and_required_presence() {
@@ -741,7 +741,7 @@ fn catalog_requests_actions_and_required_presence() {
 fn catalog_types_and_outcome_preserve_exact_names_and_key_order() {
     let names = "Boolean SmallInt Integer BigInt Text Bytes Numeric Real DoublePrecision Date Time TimeTz Timestamp TimestampTz Interval Varchar Bpchar Uuid Jsonb IntArray BigIntArray TextArray";
     let columns = names.split_whitespace().enumerate().map(|(i, name)| {
-        let c = catalog_column(p::NativeCatalogColumn { name: Some(format!("c{i}")), data_type: Some(name.into()), not_null: Some(true) }).unwrap();
+        let c = catalog_column(p::NativeCatalogColumn { name: Some(format!("c{i}")), data_type: Some(name.into()), not_null: Some(true), ..Default::default() }).unwrap();
         assert_eq!(catalog_type_name(&c.data_type), name);
         ColumnDef { id: i as u64, name: c.name, data_type: c.data_type, not_null: c.not_null }
     }).collect();
@@ -750,6 +750,37 @@ fn catalog_types_and_outcome_preserve_exact_names_and_key_order() {
     let encoded = p::NativeCatalogOutcome::decode(encoded.encode_to_vec().as_slice()).unwrap();
     assert_eq!((encoded.catalog_epoch, encoded.table.as_str(), encoded.index_id), (9, "public.t", Some(7)));
     assert_eq!(encoded.primary_key, ["c2", "c0"]);
-    for (c, name) in encoded.columns.iter().zip(names.split_whitespace()) { assert_eq!(c.data_type.as_deref(), Some(name)); assert!(c.name.is_some()); assert_eq!(c.not_null, Some(true)); }
+    for (c, name) in encoded.columns.iter().zip(names.split_whitespace()) { assert_eq!(c.data_type.as_deref(), Some(name)); assert!(c.name.is_some()); assert_eq!(c.not_null, Some(true)); assert!(c.default.is_none() && c.generated.is_none()); }
     for name in ["integer", "Unknown", ""] { assert!(catalog_type(name).is_err()); }
+}
+
+#[test]
+fn catalog_column_defaults_and_generated() {
+    use p::native_column_default::Kind as K;
+    let defaults = [K::Value(codec::encode_value(giggles_core::relational::Value::Int(7))), K::Nextval("s".into())];
+    let expected = [o::ColumnDefault::Value(giggles_core::relational::Value::Int(7)), o::ColumnDefault::Nextval("s".into())];
+    for (kind, expected) in defaults.into_iter().zip(expected) {
+        let mut c = catalog_col(); c.default = Some(p::NativeColumnDefault { kind: Some(kind) });
+        assert_eq!(catalog_column(c.clone()).unwrap().default, Some(expected));
+        assert!(catalog(p::native_catalog_request::Request::AlterTable(p::NativeAlterTable { table: Some("t".into()), action: Some(p::native_alter_table::Action::AddColumn(c)) })).is_err());
+    }
+    use o::ClockDefault as C;
+    for (kind, expected) in [("Now", C::Now), ("TransactionTimestamp", C::TransactionTimestamp), ("StatementTimestamp", C::StatementTimestamp), ("ClockTimestamp", C::ClockTimestamp), ("CurrentDate", C::CurrentDate)] {
+        assert_eq!(clock_default(p::NativeClockDefault { kind: Some(kind.into()), precision: None }).unwrap(), expected);
+        assert!(clock_default(p::NativeClockDefault { kind: Some(kind.into()), precision: Some(3) }).is_err());
+    }
+    for precision in [None, Some(3)] {
+        for (kind, expected) in [("CurrentTime", C::CurrentTime(precision)), ("CurrentTimestamp", C::CurrentTimestamp(precision)), ("LocalTime", C::LocalTime(precision)), ("LocalTimestamp", C::LocalTimestamp(precision))] {
+            assert_eq!(column_default(p::NativeColumnDefault { kind: Some(K::Clock(p::NativeClockDefault { kind: Some(kind.into()), precision })) }).unwrap(), o::ColumnDefault::Clock(expected));
+        }
+    }
+    for (name, expected) in [("IdentityAlways", o::Generated::IdentityAlways), ("IdentityByDefault", o::Generated::IdentityByDefault), ("Serial", o::Generated::Serial)] {
+        let mut c = catalog_col(); c.generated = Some(name.into());
+        assert_eq!(catalog_column(c.clone()).unwrap().generated, Some(expected));
+        assert!(catalog(p::native_catalog_request::Request::AlterTable(p::NativeAlterTable { table: Some("t".into()), action: Some(p::native_alter_table::Action::AddColumn(c)) })).is_err());
+    }
+    assert!(column_default(p::NativeColumnDefault::default()).is_err());
+    assert!(column_default(p::NativeColumnDefault { kind: Some(K::Value(p::Value::default())) }).is_err());
+    for kind in [None, Some("unknown".into())] { assert!(clock_default(p::NativeClockDefault { kind, precision: None }).is_err()); }
+    let mut c = catalog_col(); c.generated = Some("unknown".into()); assert!(catalog_column(c).is_err());
 }
