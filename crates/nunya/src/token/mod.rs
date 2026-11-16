@@ -26,6 +26,66 @@ impl std::fmt::Debug for TaskId {
         Ok(())
     }
 }
+// Shared implementation also used by durable credential identifiers.
+macro_rules! id_type {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(
+            /// Non-secret identifier bytes.
+            pub [u8; 16],
+        );
+        impl $name {
+            /// Generate an identifier; operating-system entropy failure is fatal.
+            pub fn random() -> Self {
+                let mut bytes = [0; 16];
+                getrandom::fill(&mut bytes).expect("identifier entropy unavailable");
+                Self(bytes)
+            }
+            /// Return exactly 32 lowercase hexadecimal characters.
+            pub fn to_hex(&self) -> String {
+                data_encoding::HEXLOWER.encode(&self.0)
+            }
+            /// Parse exactly 32 lowercase hexadecimal characters.
+            pub fn from_hex(s: &str) -> Option<Self> {
+                if s.len() != 32
+                    || !s
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return None;
+                }
+                Some(Self(
+                    data_encoding::HEXLOWER
+                        .decode(s.as_bytes())
+                        .ok()?
+                        .try_into()
+                        .ok()?,
+                ))
+            }
+        }
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.to_hex())
+            }
+        }
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&self.to_hex())
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let s = <String as serde::Deserialize>::deserialize(deserializer)?;
+                Self::from_hex(&s).ok_or_else(|| serde::de::Error::custom("invalid identifier"))
+            }
+        }
+    };
+}
+pub(crate) use id_type;
+id_type!(PrincipalId, "Non-secret principal identifier.");
+id_type!(SessionId, "Non-secret access session identifier.");
+id_type!(ScopeId, "Non-secret token scope identifier.");
 /// Scope secret, erased on drop and never cloned or exposed by Debug.
 #[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct ScopeKeys {
