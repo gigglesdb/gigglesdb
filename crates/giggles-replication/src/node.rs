@@ -368,8 +368,18 @@ impl Replica {
                     if e.index > self.log().conf_index()? {
                         if self.membership.accept_conf_change(&cc, e.index) {
                             let cs = self.raw.apply_conf_change(&cc).map_err(Error::Raft)?;
+                            crate::failpoint::hit(
+                                &self.cluster,
+                                Some(self.node_id),
+                                "node.conf.before",
+                            );
                             self.log()
                                 .apply_conf(&cs, e.index, &self.membership.encode())?;
+                            crate::failpoint::hit(
+                                &self.cluster,
+                                Some(self.node_id),
+                                "node.conf.after",
+                            );
                             out.membership_changed = true;
                         } else {
                             refused = Some("unexpected membership configuration change".to_owned());
@@ -383,7 +393,22 @@ impl Replica {
                     let (kind, payload) = entry::decode(self.cluster, &e.data)
                         .map_err(|e| Error::Corrupt(e.to_string()))?;
                     match kind {
-                        EntryKind::Batch => self.state.apply(payload, at),
+                        EntryKind::Batch => {
+                            crate::failpoint::hit(
+                                &self.cluster,
+                                Some(self.node_id),
+                                "node.apply.before",
+                            );
+                            let result = self.state.apply(payload, at);
+                            if result.is_ok() {
+                                crate::failpoint::hit(
+                                    &self.cluster,
+                                    Some(self.node_id),
+                                    "node.apply.after",
+                                );
+                            }
+                            result
+                        }
                         EntryKind::Admin => {
                             if e.index > self.log().conf_index()? {
                                 let cs = self.log().conf_state()?;
@@ -391,11 +416,21 @@ impl Replica {
                                     .and_then(|cmd| self.membership.apply_admin(&cmd, &cs, e.index))
                                 {
                                     Ok(()) => {
+                                        crate::failpoint::hit(
+                                            &self.cluster,
+                                            Some(self.node_id),
+                                            "node.admin.before",
+                                        );
                                         self.log().apply_conf(
                                             &cs,
                                             e.index,
                                             &self.membership.encode(),
                                         )?;
+                                        crate::failpoint::hit(
+                                            &self.cluster,
+                                            Some(self.node_id),
+                                            "node.admin.after",
+                                        );
                                         out.membership_changed = true;
                                     }
                                     Err(e) => refused = Some(e.to_string()),
@@ -471,10 +506,16 @@ impl Replica {
                     conf: snap.get_metadata().get_conf_state().clone(),
                     membership: manifest.membership.clone(),
                 })?;
+                crate::failpoint::hit(
+                    &self.cluster,
+                    Some(self.node_id),
+                    "snapshot.install.pending",
+                );
                 let pos = self
                     .state
                     .install(&dir)
                     .map_err(|e| Error::Apply(e.to_string()))?;
+                crate::failpoint::hit(&self.cluster, Some(self.node_id), "snapshot.install.state");
                 if pos
                     != (AppliedPosition {
                         index: manifest.index,
@@ -494,6 +535,9 @@ impl Replica {
                 snapshots.discard_incoming_through(pos.index);
             }
             self.log().persist(ready.entries(), ready.hs())?;
+            if ready.hs().is_some() {
+                crate::failpoint::hit(&self.cluster, Some(self.node_id), "node.commit.persisted");
+            }
             out.messages.extend(ready.take_persisted_messages());
             self.apply(ready.committed_entries(), &mut out)?;
             out.read_states.extend(
@@ -507,6 +551,7 @@ impl Replica {
                 let mut hs = self.log().hard_state()?;
                 hs.commit = commit;
                 self.log().persist(&[], Some(&hs))?;
+                crate::failpoint::hit(&self.cluster, Some(self.node_id), "node.commit.persisted");
             }
             out.messages.extend(light.take_messages());
             self.apply(light.committed_entries(), &mut out)?;

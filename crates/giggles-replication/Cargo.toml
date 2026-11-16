@@ -18,6 +18,8 @@ rustls-pemfile = "2"
 hex = "0.4"
 
 [dev-dependencies]
+giggles-history = { path = "../giggles-history" }
+rocksdb = { version = "=0.25.0", default-features = false, features = ["lz4", "bindgen-runtime"] }
 rcgen = "0.13"
 
 [[test]]

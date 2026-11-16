@@ -301,6 +301,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "giggles-history"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "giggles-pg-types"
 version = "0.1.0"
 dependencies = [
@@ -316,11 +324,13 @@ name = "giggles-replication"
 version = "0.1.0"
 dependencies = [
  "giggles-core",
+ "giggles-history",
  "hex",
  "protobuf",
  "raft",
  "rcgen",
  "redb",
+ "rocksdb",
  "rustls",
  "rustls-pemfile",
  "sha2",

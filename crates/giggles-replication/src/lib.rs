@@ -7,6 +7,7 @@ pub mod cluster;
 pub mod core_store;
 pub mod entry;
 pub mod error;
+pub mod failpoint;
 pub mod log_store;
 pub mod membership;
 pub mod node;

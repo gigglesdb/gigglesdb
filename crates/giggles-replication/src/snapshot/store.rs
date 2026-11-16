@@ -103,6 +103,7 @@ impl SnapshotStore {
         fs::create_dir(&tmp)?;
         let result = (|| {
             checkpoint(&tmp.join("data"))?;
+            crate::failpoint::hit(&self.cluster, None, "snapshot.build.data");
             let m = Manifest {
                 cluster: self.cluster,
                 index,
@@ -114,6 +115,7 @@ impl SnapshotStore {
             // Apply the same size and name rules to locally produced manifests.
             Manifest::decode(self.cluster, &m.encode())?;
             publish(&tmp, &m)?;
+            crate::failpoint::hit(&self.cluster, None, "snapshot.build.manifest");
             let mut latest = self.state.lock().unwrap();
             // A concurrent builder may have published this position while we hashed.
             if dest.join("MANIFEST").exists() {
@@ -237,6 +239,7 @@ impl IncomingWriter {
             .append(true)
             .open(path)?
             .write_all(data)?;
+        crate::failpoint::hit(&self.manifest.cluster, None, "snapshot.receive.chunk");
         Ok(())
     }
 
@@ -260,6 +263,7 @@ impl IncomingWriter {
                     .open(data.join(&f.name))?
                     .sync_all()?;
             }
+            crate::failpoint::hit(&self.manifest.cluster, None, "snapshot.receive.finish");
             if !self.dir.join("MANIFEST").exists() {
                 publish(&self.dir, &self.manifest)?;
             }

@@ -3,6 +3,8 @@
 mod barrier;
 #[path = "entry.rs"]
 mod entry;
+#[path = "failpoint.rs"]
+mod failpoint;
 #[path = "log_store.rs"]
 mod log_store;
 #[path = "state.rs"]
@@ -72,18 +74,25 @@ mod transport_snapshot;
 #[path = "cluster_net.rs"]
 mod cluster_net;
 
-#[path = "transport_peers.rs"]
-mod transport_peers;
 #[path = "membership.rs"]
 mod membership;
+#[path = "transport_peers.rs"]
+mod transport_peers;
 
 #[path = "membership_node.rs"]
 mod membership_node;
 
-#[path = "replace_net.rs"]
-mod replace_net;
 #[path = "membership_crash.rs"]
 mod membership_crash;
+#[path = "replace_net.rs"]
+mod replace_net;
 
 #[path = "admin_net.rs"]
 mod admin_net;
+
+#[path = "measure.rs"]
+mod measure;
+#[path = "recovery_matrix.rs"]
+mod recovery_matrix;
+#[path = "sql_history.rs"]
+mod sql_history;

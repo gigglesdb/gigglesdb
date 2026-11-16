@@ -114,7 +114,17 @@ impl LogStore {
                 state.insert("hard_state", hs.write_to_bytes()?.as_slice())?;
             }
         }
+        crate::failpoint::hit(
+            &self.identity().0,
+            Some(self.identity().1),
+            "log.persist.before",
+        );
         tx.commit()?;
+        crate::failpoint::hit(
+            &self.identity().0,
+            Some(self.identity().1),
+            "log.persist.after",
+        );
         Ok(())
     }
     pub fn compact(&self, to: u64) -> Result<()> {
@@ -136,6 +146,11 @@ impl LogStore {
             log.retain_in(..=to, |_, _| false)?;
             state.insert("snapshot_meta", meta.write_to_bytes()?.as_slice())?;
         }
+        crate::failpoint::hit(
+            &self.identity().0,
+            Some(self.identity().1),
+            "log.compact.before",
+        );
         tx.commit()?;
         Ok(())
     }

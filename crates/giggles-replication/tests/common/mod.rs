@@ -1,4 +1,5 @@
 pub mod certs;
+pub mod net_cluster;
 use giggles_replication::{
     error::Result,
     log_store::LogStore,

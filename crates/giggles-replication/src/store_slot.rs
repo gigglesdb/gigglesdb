@@ -112,8 +112,10 @@ impl StoreSlot {
             *current = gr::ReplicaStore::open(&self.data_dir).ok().map(Arc::new);
             return Err(state_error(e));
         }
+        crate::failpoint::hit(&self.domain(), None, "slot.install.old");
         let result = (|| {
             fs::rename(source, &self.data_dir).map_err(state_error)?;
+            crate::failpoint::hit(&self.domain(), None, "slot.install.new");
             let store = gr::ReplicaStore::open(&self.data_dir).map_err(state_error)?;
             if store.domain() != self.domain {
                 return Err(StateError("data domain mismatch".into()));
