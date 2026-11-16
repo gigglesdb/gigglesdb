@@ -407,6 +407,12 @@ pub enum SequenceReply {
 pub trait RangeClient: Send + Sync {
     fn descriptor_for(&self, range_key: &[u8]) -> Result<RangeDescriptor, RangeError>;
     fn invalidate(&self, stale: &RangeDescriptor);
+    /// A descriptor the caller learned outside the directory (GD-0075 R5-82: a split parent's
+    /// lineage record of a child it must finalize). A routing hint only, like a StaleEpoch
+    /// descriptor: a client may cache it when it is newer than what it holds. Default: ignored.
+    fn learn(&self, descriptor: &RangeDescriptor) {
+        let _ = descriptor;
+    }
     fn read(&self, req: ReadRequest) -> Result<ReadPage, RangeError>;
     fn lock(&self, req: LockRequest) -> Result<LockGrant, RangeError>;
     /// Holders and conflicting waiters queued ahead; empty if txn is not waiting there.

@@ -1,4 +1,5 @@
 //! Store-backed RangeHost with per-range role managers (GD-0075 R5-13, R5-16).
+use super::common::range_net::{Blocked, MemNet, Sinks, rows_batch};
 use giggles_core::{
     range_api::{
         ClusterTxnId, Epoch, HomeOp, HomeReply, LockGrant, LockRequest, Outcome, RangeDescriptor,
@@ -9,61 +10,16 @@ use giggles_core::{
 };
 use giggles_replication::{
     client::LocalRanges,
-    host::{GroupNetwork, RangeHost, RangeHostConfig},
-    sink::Outbox,
-    transport::PeerSink,
+    host::{RangeHost, RangeHostConfig},
 };
-use raft::{StateRole, eraftpb::Message};
+use raft::StateRole;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
-
-type Sinks = Arc<Mutex<HashMap<(u64, RangeId), Arc<dyn PeerSink>>>>;
-type Blocked = Arc<Mutex<BTreeSet<u64>>>;
-
-struct MemNet {
-    node: u64,
-    sinks: Sinks,
-    blocked: Blocked,
-}
-struct MemOutbox {
-    group: RangeId,
-    sinks: Sinks,
-    blocked: Blocked,
-}
-impl Outbox for MemOutbox {
-    fn send(&mut self, m: Message) {
-        {
-            let blocked = self.blocked.lock().unwrap();
-            if blocked.contains(&m.from) || blocked.contains(&m.to) {
-                return;
-            }
-        }
-        let sink = self.sinks.lock().unwrap().get(&(m.to, self.group)).cloned();
-        if let Some(sink) = sink {
-            sink.deliver(m.from, m);
-        }
-    }
-}
-impl GroupNetwork for MemNet {
-    fn outbox(&self, group: RangeId) -> Box<dyn Outbox> {
-        Box::new(MemOutbox {
-            group,
-            sinks: self.sinks.clone(),
-            blocked: self.blocked.clone(),
-        })
-    }
-    fn register(&self, group: RangeId, sink: Arc<dyn PeerSink>) {
-        self.sinks.lock().unwrap().insert((self.node, group), sink);
-    }
-    fn unregister(&self, group: RangeId) {
-        self.sinks.lock().unwrap().remove(&(self.node, group));
-    }
-}
 
 /// Opens and closes per (node, range), and every open's (node, range, lock generation).
 #[derive(Default)]
@@ -188,34 +144,6 @@ impl RangeService for StubService {
     fn home(&self, _: Epoch, _: HomeOp) -> Result<HomeReply, RangeError> {
         stub()
     }
-}
-
-/// WriteBatch wire format (kv.rs `WriteBatch::encode`): version 1, op count BE4,
-/// per op `[tag][keyspace index in Keyspace::ALL]` + `len BE4 + bytes` fields,
-/// then crc32c BE4 of everything before it. Put = tag 1, Rows = index 2.
-fn rows_batch(puts: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
-    let mut out = vec![1];
-    out.extend_from_slice(&(puts.len() as u32).to_be_bytes());
-    for (key, value) in puts {
-        out.extend_from_slice(&[1, 2]);
-        for field in [key, value] {
-            out.extend_from_slice(&(field.len() as u32).to_be_bytes());
-            out.extend_from_slice(field);
-        }
-    }
-    let crc = crc32c(&out);
-    out.extend_from_slice(&crc.to_be_bytes());
-    out
-}
-fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ if crc & 1 != 0 { 0x82f6_3b78 } else { 0 };
-        }
-    }
-    !crc
 }
 
 const NODES: [u64; 3] = [1, 2, 3];

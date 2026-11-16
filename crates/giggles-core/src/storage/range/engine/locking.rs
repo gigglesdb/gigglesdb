@@ -60,7 +60,12 @@ impl RangeEngine {
 
     pub(super) fn lock_target(&self, req: LockRequest) -> Result<LockGrant, RangeError> {
         self.check_open()?;
-        self.check_epoch(req.epoch)?;
+        let range_key = match &req.target {
+            LockTarget::Key { space, key } => Some(range_key(*space, key)),
+            LockTarget::TableSentinel { .. } => None,
+        };
+        self.check_epoch(req.epoch, range_key.as_deref())?;
+        self.check_stored(range_key.as_deref())?;
         let key = self.lock_key(&req.target)?;
         {
             let mut state = self.state();

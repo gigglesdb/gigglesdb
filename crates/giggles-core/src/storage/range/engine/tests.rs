@@ -228,8 +228,13 @@ fn commits_land_in_their_range_and_reads_page_at_a_timestamp() {
         Err(RangeError::StaleEpoch { .. })
     ));
     assert!(matches!(
-        e.commit(Epoch(99), txn(201), vec![], None, None),
+        e.commit(Epoch(0), txn(201), vec![], None, None),
         Err(RangeError::StaleEpoch { .. })
+    ));
+    // Review N4: an epoch this node has not applied yet is retried, not named stale.
+    assert!(matches!(
+        e.commit(Epoch(99), txn(201), vec![], None, None),
+        Err(RangeError::Unavailable(_))
     ));
 }
 
@@ -445,16 +450,86 @@ fn table_sentinels_live_on_ranges_with_the_tables_rows() {
     },);
 }
 
+/// Fails every batch with its error once one is set; else applies through `inner`.
+struct Switch {
+    inner: Arc<Sink>,
+    error: Mutex<Option<ReplicateError>>,
+}
+impl BatchSink for Switch {
+    fn replicate(&self, encoded_batch: Vec<u8>) -> Result<(), ReplicateError> {
+        match self.error.lock().unwrap().clone() {
+            Some(error) => Err(error),
+            None => self.inner.replicate(encoded_batch),
+        }
+    }
+}
+
 #[test]
-fn a_lost_sink_reports_an_unknown_outcome() {
+fn a_refused_write_is_definite_and_a_lost_one_unknown() {
+    // R5-81: NotLeader from the sink = never applied: commit Aborted (the sequencer's
+    // "nothing written in this term"), prepare and finalize NotLeader; the engine is fenced.
+    for op in ["commit", "prepare", "finalize"] {
+        let f = fixture();
+        let e = f.open();
+        let generation = lock(&e, txn(1), 1, None).unwrap().generation;
+        if op == "finalize" {
+            e.prepare(epoch(&e), txn(1), B, vec![write(1, b"x")], Some(generation))
+                .unwrap();
+        }
+        f.sink.fail.store(true, Ordering::SeqCst);
+        let result = match op {
+            "commit" => e
+                .commit(
+                    epoch(&e),
+                    txn(1),
+                    vec![write(1, b"x")],
+                    None,
+                    Some(generation),
+                )
+                .map(drop),
+            "prepare" => e
+                .prepare(epoch(&e), txn(1), B, vec![write(1, b"x")], Some(generation))
+                .map(drop),
+            _ => e.finalize(txn(1), Outcome::Abort),
+        };
+        let definite = match op {
+            "commit" => {
+                matches!(&result, Err(RangeError::Aborted(m)) if m == "range engine fenced")
+            }
+            _ => matches!(result, Err(RangeError::NotLeader { hint: None })),
+        };
+        assert!(definite, "{op}: {result:?}");
+        assert!(matches!(
+            lock(&e, txn(2), 2, None),
+            Err(RangeError::NotLeader { .. })
+        ));
+    }
+    // Unavailable (the proposal may still commit) stays an unknown outcome.
     let f = fixture();
-    let e = f.open();
-    lock(&e, txn(1), 1, None).unwrap();
-    f.sink.fail.store(true, Ordering::SeqCst);
-    assert!(matches!(
-        e.commit(epoch(&e), txn(1), vec![write(1, b"x")], None, None),
-        Err(RangeError::Unknown(_))
-    ));
+    let sink = Arc::new(Switch {
+        inner: f.sink.clone(),
+        error: Mutex::new(None),
+    });
+    let descriptor = f.store.descriptor(B).unwrap().unwrap();
+    let e = RangeEngine::open(
+        &f.store,
+        descriptor,
+        sink.clone(),
+        f.oracle.clone(),
+        config(),
+        1,
+    )
+    .unwrap();
+    let generation = lock(&e, txn(1), 1, None).unwrap().generation;
+    *sink.error.lock().unwrap() = Some(ReplicateError::Unavailable("lost".into()));
+    let result = e.commit(
+        epoch(&e),
+        txn(1),
+        vec![write(1, b"x")],
+        None,
+        Some(generation),
+    );
+    assert!(matches!(result, Err(RangeError::Unknown(_))), "{result:?}");
     // The fenced engine serves nothing more.
     assert!(matches!(
         lock(&e, txn(2), 2, None),
@@ -622,6 +697,7 @@ fn prepared_records_round_trip_and_reject_damage() {
                 LockMode::Shared,
             ),
         ],
+        children: Vec::new(),
     };
     let bytes = record.encode().unwrap();
     let back = prepared::Prepared::decode(&bytes).unwrap();
@@ -676,8 +752,12 @@ fn home_records_persist_across_terms() {
     )
     .unwrap();
     assert!(matches!(
-        e.home(Epoch(99), HomeOp::Status { txn: t }),
+        e.home(Epoch(0), HomeOp::Status { txn: t }),
         Err(RangeError::StaleEpoch { .. })
+    ));
+    assert!(matches!(
+        e.home(Epoch(99), HomeOp::Status { txn: t }),
+        Err(RangeError::Unavailable(_))
     ));
     e.close();
     assert!(matches!(
@@ -702,4 +782,55 @@ fn home_records_persist_across_terms() {
         HomeReply::Opened { incarnation: next } => assert!(next > incarnation),
         other => panic!("{other:?}"),
     }
+}
+
+/// Fences `engine` from inside the sequencer's timestamp reservation of a commit group: after
+/// the worker's own fence check and before the group's first read (P9-5b).
+struct FencingOracle {
+    inner: Oracle,
+    engine: Mutex<Option<Weak<RangeEngine>>>,
+}
+impl TsOracle for FencingOracle {
+    fn next(&self, n: u32) -> Result<Timestamp, RangeError> {
+        let armed = self.engine.lock().unwrap().take();
+        if let Some(engine) = armed.and_then(|engine| engine.upgrade()) {
+            engine.close();
+        }
+        self.inner.next(n)
+    }
+}
+
+#[test]
+fn a_commit_fenced_as_its_group_starts_is_aborted_not_corrupt() {
+    let f = fixture();
+    let oracle = Arc::new(FencingOracle {
+        inner: Oracle(AtomicU64::new(1 << 20)),
+        engine: Mutex::new(None),
+    });
+    let descriptor = f.store.descriptor(B).unwrap().unwrap();
+    let e = RangeEngine::open(
+        &f.store,
+        descriptor,
+        f.sink.clone(),
+        oracle.clone(),
+        config(),
+        1,
+    )
+    .unwrap();
+    let grant = lock(&e, txn(1), 1, Some(1000)).unwrap();
+    let applied = f.store.applied(B).unwrap();
+    *oracle.engine.lock().unwrap() = Some(Arc::downgrade(&e));
+    let result = e.commit(
+        epoch(&e),
+        txn(1),
+        vec![write(1, b"x")],
+        None,
+        Some(grant.generation),
+    );
+    // Was Corrupt("Misuse"): the group's native-content read failed on the fenced KV.
+    assert_eq!(
+        result,
+        Err(RangeError::Aborted("range engine fenced".into()))
+    );
+    assert_eq!(f.store.applied(B).unwrap(), applied, "nothing proposed");
 }

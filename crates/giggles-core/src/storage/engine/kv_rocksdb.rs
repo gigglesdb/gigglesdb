@@ -176,7 +176,7 @@ pub(crate) type SstPart = (Keyspace, OwnedBound, OwnedBound);
 /// `(keyspace, start, end, file)` interval to replace; `None` empties it.
 pub(crate) type SstInstall = (Keyspace, OwnedBound, OwnedBound, Option<PathBuf>);
 
-/// A `KvRead` over a borrowed native snapshot, valid only inside `export_sst`.
+/// A `KvRead` over a borrowed native snapshot, valid only inside `export_sst` or `with_snapshot`.
 struct BorrowedSnapshot<'a> {
     db: &'a DB,
     snapshot: &'a rocksdb::Snapshot<'a>,
@@ -319,6 +319,64 @@ impl RocksKv {
                 db.ingest_external_file_cf_opts(cf, &ingest, vec![native_path(path)])
                     .map_err(map_error)?;
             }
+        }
+        Ok(())
+    }
+}
+
+/// The key standing for an unbounded end in `approximate_size`: raw keys start with a small
+/// kind byte or a BE8 table/index id, so no stored key sorts at or above 64 bytes of 0xFF (and
+/// a key that did would only make the approximation smaller).
+const APPROX_END: [u8; 64] = [0xFF; 64];
+
+impl RocksKv {
+    /// Run `read` against ONE RocksDB snapshot held for the duration of the call.
+    pub(crate) fn with_snapshot<T>(
+        &self,
+        read: impl FnOnce(&dyn KvRead) -> Result<T, KvError>,
+    ) -> Result<T, KvError> {
+        let db: &DB = &self.db.db;
+        let snapshot = db.snapshot();
+        read(&BorrowedSnapshot {
+            db,
+            snapshot: &snapshot,
+        })
+    }
+
+    /// RocksDB's approximate stored bytes of one column family's raw interval. rocksdb 0.25
+    /// wraps only `get_approximate_sizes_cf`, which counts SST files: data still in memtables
+    /// is not counted until it is flushed. An unbounded start is the empty key, an unbounded
+    /// end `APPROX_END`.
+    pub(crate) fn approximate_size(
+        &self,
+        ks: Keyspace,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+    ) -> u64 {
+        let db: &DB = &self.db.db;
+        let from = match start {
+            Bound::Included(key) => key.to_vec(),
+            Bound::Excluded(key) => successor(key),
+            Bound::Unbounded => Vec::new(),
+        };
+        let to = match end {
+            Bound::Included(key) => successor(key),
+            Bound::Excluded(key) => key.to_vec(),
+            Bound::Unbounded => APPROX_END.to_vec(),
+        };
+        if from >= to {
+            return 0;
+        }
+        let cf = db.cf_handle(ks.name()).unwrap();
+        db.get_approximate_sizes_cf(cf, &[rocksdb::Range::new(&from, &to)])[0]
+    }
+
+    /// Flush every column family's memtables to SST files (tests of approximate sizes).
+    #[cfg(test)]
+    pub(crate) fn flush_memtables(&self) -> Result<(), KvError> {
+        for ks in Keyspace::ALL {
+            let cf = self.db.cf_handle(ks.name()).unwrap();
+            self.db.flush_cf(cf).map_err(map_error)?;
         }
         Ok(())
     }

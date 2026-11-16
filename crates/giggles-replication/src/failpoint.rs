@@ -27,11 +27,15 @@ pub const POINTS: &[&str] = &[
     "slot.install.new",
     "snapshot.install.state",
     "log.compact.before",
+    "range.split.applied",
+    "range.split.child_opened",
 ];
 struct Track {
     point: &'static str,
     nth: u64,
     hits: u64,
+    /// Count only hits reported by this node (`arm_node`).
+    node: Option<u64>,
     fired: Vec<(&'static str, Option<u64>)>,
 }
 static TRACKS: LazyLock<Mutex<HashMap<[u8; 16], Track>>> =
@@ -78,7 +82,7 @@ pub fn hit(cluster: &[u8; 16], node: Option<u64>, point: &'static str) {
         let mut tracks = TRACKS.lock().unwrap();
         if let Some(t) = tracks
             .get_mut(cluster)
-            .filter(|t| t.nth > 0 && t.point == point)
+            .filter(|t| t.nth > 0 && t.point == point && t.node.is_none_or(|n| node == Some(n)))
         {
             t.hits = t.hits.saturating_add(1);
             if t.hits == t.nth {
@@ -97,6 +101,13 @@ pub fn hit(cluster: &[u8; 16], node: Option<u64>, point: &'static str) {
 }
 /// Replace this cluster's arming with a 1-based crash count; reject unknown points.
 pub fn arm(cluster: [u8; 16], point: &'static str, nth: u64) {
+    arm_track(cluster, point, nth, None);
+}
+/// As `arm`, but only hits that report `node` count and fire.
+pub fn arm_node(cluster: [u8; 16], point: &'static str, nth: u64, node: u64) {
+    arm_track(cluster, point, nth, Some(node));
+}
+fn arm_track(cluster: [u8; 16], point: &'static str, nth: u64, node: Option<u64>) {
     assert!(POINTS.contains(&point), "unknown failpoint: {point}");
     assert!(nth > 0, "failpoint count must be 1-based");
     let mut tracks = TRACKS.lock().unwrap();
@@ -104,6 +115,7 @@ pub fn arm(cluster: [u8; 16], point: &'static str, nth: u64) {
         point,
         nth: 0,
         hits: 0,
+        node,
         fired: Vec::new(),
     });
     if t.nth == 0 {
@@ -112,6 +124,7 @@ pub fn arm(cluster: [u8; 16], point: &'static str, nth: u64) {
     t.point = point;
     t.nth = nth;
     t.hits = 0;
+    t.node = node;
 }
 /// Stop counting and firing for this cluster; preserve its recorded history.
 pub fn disarm(cluster: [u8; 16]) {
@@ -167,6 +180,18 @@ mod tests {
         disarm(c);
         hit(&c, None, POINTS[1]);
         assert_eq!(hits(c, POINTS[1]), 1);
+        disarm(c);
+    }
+    #[test]
+    fn node_filter_counts_only_that_node() {
+        let c = [244; 16];
+        let p = POINTS[0];
+        arm_node(c, p, 1, 2);
+        hit(&c, Some(1), p);
+        hit(&c, None, p);
+        assert_eq!(hits(c, p), 0);
+        assert!(std::panic::catch_unwind(|| hit(&c, Some(2), p)).is_err());
+        assert_eq!(fired(c), vec![(p, Some(2))]);
         disarm(c);
     }
     #[test]

@@ -527,7 +527,7 @@ fn ranges_feature_requires_replicated() {
 }
 
 use crate::storage::range_api::{Epoch, RangeDescriptor, RangeId, SYSTEM_RANGE};
-const RANGE_SUBS: [RangeLocalKey; 9] = [
+const RANGE_SUBS: [RangeLocalKey; 10] = [
     RangeLocalKey::Applied,
     RangeLocalKey::LastCommitTs,
     RangeLocalKey::Descriptor,
@@ -537,6 +537,7 @@ const RANGE_SUBS: [RangeLocalKey; 9] = [
     RangeLocalKey::Prepared(0x0102_0304_0506_0708),
     RangeLocalKey::Home(0),
     RangeLocalKey::Marker(u64::MAX),
+    RangeLocalKey::Child(5),
 ];
 fn raw_range_key(id: u64, sub: &[u8]) -> Vec<u8> {
     let mut key = b"range/".to_vec();
@@ -566,6 +567,12 @@ fn range_local_keys_round_trip() {
         raw_range_key(2, &prepared)
     );
     assert_eq!(range_local_prefix(RangeId(2)), raw_range_key(2, b""));
+    let mut child = b"child/".to_vec();
+    child.extend_from_slice(&5u64.to_be_bytes());
+    assert_eq!(
+        range_local_key(RangeId(2), &RANGE_SUBS[9]),
+        raw_range_key(2, &child)
+    );
     assert_eq!(
         range_local_key(RangeId(2), &RangeLocalKey::LastCommitTs),
         raw_range_key(2, b"last_commit_ts")
@@ -596,6 +603,8 @@ fn malformed_range_local_keys_do_not_parse() {
         raw_range_key(2, b"prepared/\0\0\0\0\0\0\0\x01\0"),
         raw_range_key(2, b"home/"),
         raw_range_key(2, b"marker"),
+        raw_range_key(2, b"child/\0\0\0\0\0\0\x05"),
+        raw_range_key(2, b"child"),
         b"ranges/\0\0\0\0\0\0\0\x01/applied".to_vec(),
     ] {
         assert_eq!(parse_range_local_key(&key), None, "{key:?}");
@@ -615,6 +624,7 @@ fn ranged() -> MemKv {
     for sub in &RANGE_SUBS[6..] {
         let value: &[u8] = match sub {
             RangeLocalKey::Marker(_) => &[1; 8],
+            RangeLocalKey::Child(child) => &descriptor(*child),
             _ => b"any",
         };
         put(&kv, &range_local_key(RangeId(2), sub), value);
@@ -630,6 +640,7 @@ fn validate_meta_checks_range_local_values() {
     let len = || corrupt("wrong range metadata length");
     let unknown = || FormatError::Unsupported("unknown metadata key".into());
     let marker = range_local_key(RangeId(2), &RangeLocalKey::Marker(3));
+    let child = range_local_key(RangeId(2), &RangeLocalKey::Child(5));
     let cases: Vec<(Vec<u8>, Vec<u8>, FormatError)> = vec![
         (raw_range_key(1, b"applied"), vec![0; 15], corrupt("wrong range applied length")),
         (raw_range_key(1, b"applied"), vec![0; 17], corrupt("wrong range applied length")),
@@ -663,6 +674,17 @@ fn validate_meta_checks_range_local_values() {
             (1u64 << 22).to_be_bytes().to_vec(),
             FormatError::Unsupported("feature bits".into()),
         ),
+        (child.clone(), descriptor(6), corrupt("range child id mismatch")),
+        (
+            range_local_key(RangeId(2), &RangeLocalKey::Child(2)),
+            descriptor(2),
+            corrupt("range child id mismatch"),
+        ),
+        (
+            range_local_key(RangeId(2), &RangeLocalKey::Child(0)),
+            descriptor(0),
+            corrupt("range child id mismatch"),
+        ),
         (raw_range_key(2, b"future"), Vec::new(), unknown()),
         (raw_range_key(0, b"applied"), vec![0; 16], unknown()),
     ];
@@ -674,6 +696,9 @@ fn validate_meta_checks_range_local_values() {
     for bad in [Vec::new(), vec![2], descriptor(1)[..20].to_vec()] {
         let kv = ranged();
         put(&kv, &raw_range_key(1, b"descriptor"), &bad);
+        assert!(matches!(validate_meta(&kv), Err(FormatError::Corrupt(_))));
+        let kv = ranged();
+        put(&kv, &child, &bad);
         assert!(matches!(validate_meta(&kv), Err(FormatError::Corrupt(_))));
     }
     assert_eq!(SYSTEM_RANGE, RangeId(1));

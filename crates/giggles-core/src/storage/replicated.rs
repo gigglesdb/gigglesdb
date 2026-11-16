@@ -13,7 +13,7 @@ use super::{
 use crate::{Admin, CoreError, Limits};
 
 /// The multi-range store (GD-0075 R5-03).
-pub use super::range::{RangeApplyOutcome, RangeStore};
+pub use super::range::{RangeApplyOutcome, RangeStore, SplitOutcome};
 use std::{
     ops::Bound,
     path::Path,

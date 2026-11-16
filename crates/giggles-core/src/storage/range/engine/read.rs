@@ -6,7 +6,7 @@ use super::{RangeEngine, ts, txn_error};
 use crate::storage::engine::{codec, hlc::Ts, kv::KvRead};
 use crate::storage::range::keys::{cf_interval, is_versioned, keyspace_of};
 use crate::storage::range_api::{
-    ClusterTxnId, RangeError, RangeId, ReadDirection, ReadPage, ReadRequest,
+    ClusterTxnId, RangeError, RangeId, ReadDirection, ReadPage, ReadRequest, range_key,
 };
 
 type Raw = Bound<Vec<u8>>;
@@ -90,7 +90,20 @@ impl RangeEngine {
     /// for prepared records with p <= T that write inside the span, then read MVCC at T.
     pub(super) fn read_page(&self, req: ReadRequest) -> Result<ReadPage, RangeError> {
         self.check_open()?;
-        self.check_epoch(req.epoch)?;
+        // A stale reply names the range holding the key the gateway routes this page by:
+        // the start of a forward page, the end of a reverse one (review S4; cluster/read.rs
+        // `lower_route`, `upper_route`).
+        let route_key = match (req.dir, &req.start, &req.end) {
+            (ReadDirection::Forward, Bound::Included(key) | Bound::Excluded(key), _)
+            | (ReadDirection::Reverse, _, Bound::Included(key) | Bound::Excluded(key)) => {
+                range_key(req.space, key)
+            }
+            (ReadDirection::Forward, Bound::Unbounded, _) => range_key(req.space, &[]),
+            // The space's end: the first key past every key of the space.
+            (ReadDirection::Reverse, _, Bound::Unbounded) => vec![req.space.tag() + 1],
+        };
+        self.check_epoch(req.epoch, Some(&route_key))?;
+        self.check_stored(Some(&route_key))?;
         let range_end = match req.dir {
             ReadDirection::Forward => self.descriptor.end.clone(),
             ReadDirection::Reverse => Some(self.descriptor.start.clone()),

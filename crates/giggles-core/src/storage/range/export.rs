@@ -84,7 +84,7 @@ struct Manifest {
 }
 
 /// The spaces a descriptor owns and their raw intervals, in `SPACES` order.
-fn intervals(descriptor: &RangeDescriptor) -> Vec<(RangeSpace, RawInterval)> {
+pub(super) fn intervals(descriptor: &RangeDescriptor) -> Vec<(RangeSpace, RawInterval)> {
     SPACES
         .into_iter()
         .filter_map(|space| cf_interval(descriptor, space).map(|interval| (space, interval)))

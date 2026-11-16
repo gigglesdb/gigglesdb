@@ -12,8 +12,9 @@ use crate::{
     log_store::LogStore,
     node::Replica,
     range_role::{RangeEngine, RangeRoles},
+    range_state::{SplitListener, encode_split_proposal},
     role::Serving,
-    sink::{Outbox, ReplicaHandle, SnapshotPolicy, spawn_with_policy},
+    sink::{Outbox, ReplicaHandle, ReplicateError, SnapshotPolicy, spawn_with_policy},
     snapshot::SnapshotStore,
     state::StateMachine,
     transport::PeerSink,
@@ -24,13 +25,17 @@ use giggles_core::{
     },
     replicated::RangeStore,
 };
+use raft::StateRole;
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
-    thread::JoinHandle,
+    sync::{Arc, Mutex, OnceLock, Weak},
+    thread::{self, JoinHandle},
     time::Duration,
 };
+
+/// First and longest wait between retries of a split child's group open.
+const OPEN_RETRY: (Duration, Duration) = (Duration::from_millis(50), Duration::from_secs(2));
 
 /// Routes Raft messages for many groups over one process-wide network.
 pub trait GroupNetwork: Send + Sync {
@@ -74,6 +79,11 @@ struct Group {
 }
 
 pub struct RangeHost {
+    inner: Arc<Inner>,
+}
+
+/// The host's shared parts; split listeners hold a `Weak` to it (GD-0075 R5-80).
+struct Inner {
     config: RangeHostConfig,
     network: Arc<dyn GroupNetwork>,
     states: StateFactory,
@@ -83,6 +93,8 @@ pub struct RangeHost {
     liveness: Option<Arc<Liveness>>,
     /// Handles told about peer liveness changes (quiescing groups).
     listeners: Arc<Mutex<BTreeMap<RangeId, ReplicaHandle>>>,
+    /// Set once `stop()` began; held while a range opens so none opens after it.
+    stopped: Mutex<bool>,
 }
 
 impl RangeHost {
@@ -94,22 +106,30 @@ impl RangeHost {
         states: StateFactory,
         existing: Vec<(RangeId, Vec<u64>)>,
     ) -> Result<Self> {
-        let mut host = Self {
+        Self::build(config, network, states, RangeRoles::default(), existing)
+    }
+
+    fn build(
+        config: RangeHostConfig,
+        network: Arc<dyn GroupNetwork>,
+        states: StateFactory,
+        roles: RangeRoles,
+        existing: Vec<(RangeId, Vec<u64>)>,
+    ) -> Result<Self> {
+        let mut host = Inner {
             config,
             network,
             states,
             groups: Mutex::new(BTreeMap::new()),
-            roles: RangeRoles::default(),
+            roles,
             liveness: None,
             listeners: Arc::default(),
+            stopped: Mutex::new(false),
         };
         if let Some(liveness) = host.config.liveness {
             let group = RangeId(LIVENESS_GROUP);
-            let tracker = Liveness::start(
-                host.config.node_id,
-                liveness,
-                host.network.outbox(group),
-            );
+            let tracker =
+                Liveness::start(host.config.node_id, liveness, host.network.outbox(group));
             host.network
                 .register(group, Arc::new(LivenessSink(tracker.clone())));
             let listeners = host.listeners.clone();
@@ -124,13 +144,17 @@ impl RangeHost {
         for (range, voters) in existing {
             host.create_group(range, &voters)?;
         }
-        Ok(host)
+        Ok(Self {
+            inner: Arc::new(host),
+        })
     }
 
     /// Opens a host over a multi-range store (GD-0075 R5-13/R5-16): one group,
     /// with a `RangeStateMachine` over `store`, for every stored range whose
     /// descriptor lists this node; its voters are the descriptor's Voter replicas.
     /// With an opener, each group's role manager opens a leader engine through it.
+    /// A split applied by any of its groups opens the new right range's group here
+    /// when its descriptor lists this node (a range already hosted is left alone).
     pub fn open(
         config: RangeHostConfig,
         network: Arc<dyn GroupNetwork>,
@@ -140,15 +164,22 @@ impl RangeHost {
         if store.domain() != config.cluster {
             return Err(Error::Identity("range store domain mismatch".into()));
         }
-        let (roles, states) = RangeRoles::backed(store.clone(), opener);
-        let mut host = Self::start(config, network, states, Vec::new())?;
-        host.roles = roles;
+        let slot: Arc<OnceLock<Weak<Inner>>> = Arc::default();
+        let hook = slot.clone();
+        let listener: SplitListener = Arc::new(move |right: &RangeDescriptor| {
+            if let Some(inner) = hook.get().and_then(Weak::upgrade) {
+                inner.open_split_child(right);
+            }
+        });
+        let (roles, states) = RangeRoles::backed(store.clone(), opener, listener);
+        let host = Self::build(config, network, states, roles, Vec::new())?;
+        let _ = slot.set(Arc::downgrade(&host.inner));
         for range in store.ranges().map_err(core)? {
             let Some(descriptor) = store.descriptor(range).map_err(core)? else {
                 continue;
             };
             if descriptor.replicas.iter().any(|r| r.node == host.node_id()) {
-                host.open_range(&descriptor)?;
+                host.inner.open_range(&descriptor, true)?;
             }
         }
         Ok(host)
@@ -156,7 +187,8 @@ impl RangeHost {
 
     /// Stores a new range's first descriptor and opens its group (store-backed hosts).
     pub fn create_range(&self, descriptor: &RangeDescriptor) -> Result<ReplicaHandle> {
-        let store = self
+        let inner = &self.inner;
+        let store = inner
             .roles
             .store()
             .ok_or_else(|| Error::Identity("range host has no range store".into()))?;
@@ -174,10 +206,114 @@ impl RangeHost {
             )));
         }
         store.create_range(descriptor).map_err(core)?;
-        self.open_range(descriptor)
+        inner
+            .open_range(descriptor, false)?
+            .ok_or_else(|| Error::Identity("range host is stopped".into()))
     }
 
-    fn open_range(&self, descriptor: &RangeDescriptor) -> Result<ReplicaHandle> {
+    /// Splits `range` at `at_key` (GD-0075 R5-80): the range keeps `[start, at_key)`
+    /// and the new range `right` gets `[at_key, end)`, both at the next epoch. Only on
+    /// the range's current leader; the split entry is proposed at the stored
+    /// descriptor's epoch and applied here before this returns `(left, right)`. Every
+    /// replica's store-backed host opens `right`'s group when it applies the entry, and marks
+    /// the range's leader engine there as moved: whichever node leads the range reopens it
+    /// over `left` (GD-0075 R5-81).
+    pub fn split(
+        &self,
+        range: RangeId,
+        at_key: &[u8],
+        right: RangeId,
+    ) -> Result<(RangeDescriptor, RangeDescriptor)> {
+        let store = self
+            .inner
+            .roles
+            .store()
+            .ok_or_else(|| Error::Identity("range host has no range store".into()))?;
+        let handle = self
+            .group(range)
+            .ok_or_else(|| Error::Identity(format!("range {} is not hosted here", range.0)))?;
+        let not_leader = || {
+            let leader = handle.role().leader;
+            let hint = if leader == 0 || leader == self.node_id() {
+                "none".to_owned()
+            } else {
+                format!("node {leader}")
+            };
+            Error::Identity(format!(
+                "node {} does not lead range {}; leader hint: {hint}",
+                self.node_id(),
+                range.0
+            ))
+        };
+        if handle.role().state != StateRole::Leader {
+            return Err(not_leader());
+        }
+        let read = |id: RangeId| {
+            store
+                .descriptor(id)
+                .map_err(core)?
+                .ok_or_else(|| Error::Core(format!("range {} has no descriptor", id.0)))
+        };
+        let epoch = read(range)?.epoch;
+        // Proposer-side only (stored data is not a deterministic apply input): the bound must
+        // be a whole user key or a table/index boundary (design.md Changes, Track A (g)).
+        store
+            .check_split_key(range, at_key)
+            .map_err(|e| Error::Apply(format!("range {} split key refused: {e}", range.0)))?;
+        match handle.replicate(encode_split_proposal(epoch, at_key, right)) {
+            Ok(()) => Ok((read(range)?, read(right)?)),
+            Err(ReplicateError::NotLeader) => Err(not_leader()),
+            Err(ReplicateError::Refused(reason)) => Err(Error::Apply(reason)),
+            Err(e) => Err(Error::Apply(format!("range {} split: {e}", range.0))),
+        }
+    }
+
+    /// The range's role (leader engine or follower); None without a role manager.
+    pub fn serving(&self, range: RangeId) -> Option<Serving<RangeEngine>> {
+        self.inner.roles.serving(range)
+    }
+
+    /// The system service `LocalRanges::system` returns (the system range's owner sets it).
+    pub fn set_system(&self, system: Option<Arc<dyn SystemService>>) {
+        self.inner.roles.set_system(system);
+    }
+
+    pub fn node_id(&self) -> u64 {
+        self.inner.config.node_id
+    }
+
+    /// Opens (or creates) the group's log and snapshot stores and starts its replica thread.
+    pub fn create_group(&self, range: RangeId, voters: &[u64]) -> Result<ReplicaHandle> {
+        self.inner.create_group(range, voters)
+    }
+
+    pub fn group(&self, range: RangeId) -> Option<ReplicaHandle> {
+        self.inner.group(range)
+    }
+
+    pub fn groups(&self) -> Vec<RangeId> {
+        let groups = self.inner.groups.lock().expect("range host mutex poisoned");
+        groups.keys().copied().collect()
+    }
+
+    /// Shuts every group down and joins its replica thread. Idempotent.
+    pub fn stop(&self) {
+        self.inner.stop();
+    }
+}
+
+impl Inner {
+    /// Opens the range's group and role manager. `Ok(None)` once `stop()` began, or
+    /// when `if_absent` and the group is already hosted. Serialized with `stop()`.
+    fn open_range(
+        &self,
+        descriptor: &RangeDescriptor,
+        if_absent: bool,
+    ) -> Result<Option<ReplicaHandle>> {
+        let stopped = self.stopped.lock().expect("range host mutex poisoned");
+        if *stopped || (if_absent && self.group(descriptor.id).is_some()) {
+            return Ok(None);
+        }
         let voters: Vec<u64> = descriptor
             .replicas
             .iter()
@@ -187,31 +323,57 @@ impl RangeHost {
         let handle = self.create_group(descriptor.id, &voters)?;
         self.roles
             .start(descriptor.id, handle.clone(), self.config.tick);
-        Ok(handle)
+        Ok(Some(handle))
     }
 
-    /// The range's role (leader engine or follower); None without a role manager.
-    pub fn serving(&self, range: RangeId) -> Option<Serving<RangeEngine>> {
-        self.roles.serving(range)
+    /// Split listener, on the parent's applying thread after the store's split write:
+    /// opens the right range's group when it lists this node. A failed open is retried
+    /// on a background thread until it succeeds or the host stops (the split entry is
+    /// applied once, so nothing else would open the child before a restart).
+    fn open_split_child(self: &Arc<Self>, right: &RangeDescriptor) {
+        let (cluster, node) = (&self.config.cluster, Some(self.config.node_id));
+        crate::failpoint::hit(cluster, node, "range.split.applied");
+        if !right.replicas.iter().any(|r| r.node == self.config.node_id) {
+            return;
+        }
+        match self.open_range(right, true) {
+            Ok(Some(_)) => crate::failpoint::hit(cluster, node, "range.split.child_opened"),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "node {}: opening split range {} failed, retrying: {e}",
+                    self.config.node_id, right.id.0
+                );
+                let weak = Arc::downgrade(self);
+                let range = right.id;
+                let spawned = thread::Builder::new()
+                    .name(format!("split-open-{}", range.0))
+                    .spawn(move || retry_open(&weak, range));
+                if let Err(e) = spawned {
+                    eprintln!("split range {}: no retry thread: {e}", range.0);
+                }
+            }
+        }
     }
 
-    /// The system service `LocalRanges::system` returns (the system range's owner sets it).
-    pub fn set_system(&self, system: Option<Arc<dyn SystemService>>) {
-        self.roles.set_system(system);
+    /// One retry of a split child's open, from its stored descriptor. `Ok` when done:
+    /// opened, already hosted, no longer listing this node, or the host stopped.
+    fn reopen_child(&self, range: RangeId) -> Result<()> {
+        let Some(store) = self.roles.store() else {
+            return Ok(());
+        };
+        match store.descriptor(range).map_err(core)? {
+            Some(d) if d.replicas.iter().any(|r| r.node == self.config.node_id) => {
+                self.open_range(&d, true).map(drop)
+            }
+            _ => Ok(()),
+        }
     }
 
-    pub fn node_id(&self) -> u64 {
-        self.config.node_id
-    }
-
-    /// Opens (or creates) the group's log and snapshot stores and starts its replica thread.
-    pub fn create_group(&self, range: RangeId, voters: &[u64]) -> Result<ReplicaHandle> {
+    fn create_group(&self, range: RangeId, voters: &[u64]) -> Result<ReplicaHandle> {
         if range.0 == 0 || range.0 == LIVENESS_GROUP {
             // 0 is the R4 single-group identity; u64::MAX carries node liveness.
-            return Err(Error::Identity(format!(
-                "range id {} is reserved",
-                range.0
-            )));
+            return Err(Error::Identity(format!("range id {} is reserved", range.0)));
         }
         let mut groups = self.groups.lock().expect("range host mutex poisoned");
         if groups.contains_key(&range) {
@@ -226,7 +388,11 @@ impl RangeHost {
             &self.config.snap_dir.join(&dir),
             cluster,
         )?);
-        let mut log = LogStore::open(&self.config.log_dir.join(&dir), cluster, self.config.node_id)?;
+        let mut log = LogStore::open(
+            &self.config.log_dir.join(&dir),
+            cluster,
+            self.config.node_id,
+        )?;
         log.attach_snapshots(snapshots.clone());
         let mut replica = Replica::new(log, (self.states)(range), voters)?;
         if let Some(liveness) = &self.liveness {
@@ -257,18 +423,13 @@ impl RangeHost {
         Ok(handle)
     }
 
-    pub fn group(&self, range: RangeId) -> Option<ReplicaHandle> {
+    fn group(&self, range: RangeId) -> Option<ReplicaHandle> {
         let groups = self.groups.lock().expect("range host mutex poisoned");
         groups.get(&range).map(|g| g.handle.clone())
     }
 
-    pub fn groups(&self) -> Vec<RangeId> {
-        let groups = self.groups.lock().expect("range host mutex poisoned");
-        groups.keys().copied().collect()
-    }
-
-    /// Shuts every group down and joins its replica thread. Idempotent.
-    pub fn stop(&self) {
+    fn stop(&self) {
+        *self.stopped.lock().expect("range host mutex poisoned") = true;
         if let Some(liveness) = &self.liveness {
             liveness.stop();
             self.network.unregister(RangeId(LIVENESS_GROUP));
@@ -301,10 +462,29 @@ impl Drop for RangeHost {
 /// This node's open, unfenced leader engines (store-backed hosts with an opener).
 impl LocalRanges for RangeHost {
     fn service(&self, range: RangeId) -> Option<Arc<dyn RangeService>> {
-        self.roles.service(range)
+        self.inner.roles.service(range)
     }
     fn system(&self) -> Option<Arc<dyn SystemService>> {
-        self.roles.system()
+        self.inner.roles.system()
+    }
+}
+
+/// Retries a split child's open with backoff until done or the host is gone.
+fn retry_open(host: &Weak<Inner>, range: RangeId) {
+    let mut wait = OPEN_RETRY.0;
+    loop {
+        thread::sleep(wait);
+        let Some(inner) = host.upgrade() else {
+            return;
+        };
+        match inner.reopen_child(range) {
+            Ok(()) => return,
+            Err(e) => eprintln!(
+                "node {}: opening split range {} failed, retrying: {e}",
+                inner.config.node_id, range.0
+            ),
+        }
+        wait = (wait * 2).min(OPEN_RETRY.1);
     }
 }
 

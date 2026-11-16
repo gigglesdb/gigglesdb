@@ -108,6 +108,10 @@ mod multi_group;
 #[path = "host.rs"]
 mod host;
 
+#[path = "split.rs"]
+mod split;
+#[path = "split_lifecycle.rs"]
+mod split_lifecycle;
 #[path = "range_state.rs"]
 mod range_state;
 #[path = "range_host.rs"]

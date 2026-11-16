@@ -428,6 +428,18 @@ impl RangeClient for RoutedRangeClient {
     fn invalidate(&self, stale: &RangeDescriptor) {
         self.router.cache().invalidate(stale);
     }
+    /// Caches `descriptor` (e.g. a split child from its parent's lineage record) unless the
+    /// same range is cached at an epoch >= its own; like a StaleEpoch descriptor, it then drops
+    /// every cached descriptor overlapping its span (`RouteCache::insert`).
+    fn learn(&self, descriptor: &RangeDescriptor) {
+        let mut cache = self.router.cache();
+        if cache
+            .by_id(descriptor.id)
+            .is_none_or(|cached| cached.epoch < descriptor.epoch)
+        {
+            cache.insert(descriptor.clone());
+        }
+    }
     fn read(&self, req: ReadRequest) -> Result<ReadPage, RangeError> {
         routed!(self.router, RangeCall::Read(req), RangeReply::Read(page) => page)
     }

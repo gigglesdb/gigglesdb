@@ -4,13 +4,14 @@
 //! that, once this node leads the group and its read barrier has drained the
 //! log, reads the range's applied descriptor and opens an engine through the
 //! `RangeEngineOpener` (design.md section 4). The engine's sink is bound to that
-//! leadership term and descriptor epoch; leadership loss, a stop or any failed
-//! write fences it and calls `opener.close(range)` exactly once. Each open gets a
-//! fresh lock generation `(term << 20) | k` (design.md Changes 2026-11-16T10:40Z).
+//! leadership term and descriptor epoch; leadership loss, a stop, any failed write
+//! or a split applied on this node (R5-81) fences it and calls `opener.close(range)`
+//! exactly once. Each open gets a fresh lock generation `(term << 20) | k`
+//! (design.md Changes 2026-11-16T10:40Z).
 use crate::{
     core_store::TermSink,
     host::StateFactory,
-    range_state::{EngineGuard, RangeStateMachine, encode_proposal},
+    range_state::{EngineGuard, RangeStateMachine, SplitListener, encode_proposal},
     role::{Engine, RoleManager, Serving},
     sink::{ReplicaHandle, ReplicateError},
     state::StateMachine,
@@ -30,7 +31,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, Mutex, PoisonError, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -204,6 +205,9 @@ pub struct RangeEngine {
     term: u64,
     opener: Arc<dyn RangeEngineOpener>,
     closed: AtomicBool,
+    /// The range's `RangeStateMachine::moved_epoch`: a split applied on this node moved the
+    /// descriptor past this engine's epoch (GD-0075 R5-81).
+    moved: Arc<AtomicU64>,
     // Keeps snapshot installs of this range refused while the engine lives.
     _guard: EngineGuard,
 }
@@ -225,8 +229,11 @@ impl Engine for RangeEngine {
             self.opener.close(self.range);
         }
     }
+    /// Also once a split applied on this node moved the range past the engine's epoch: the
+    /// role manager then fences it on its own thread and reopens it in the same term, over
+    /// the narrowed descriptor and with a fresh lock generation (`role.rs`).
     fn is_fenced(&self) -> bool {
-        self.sink.is_fenced()
+        self.sink.is_fenced() || self.moved.load(Ordering::SeqCst) > self.sink.epoch().0
     }
 }
 impl Drop for RangeEngine {
@@ -285,16 +292,19 @@ pub(crate) struct RangeRoles {
     system: RwLock<Option<Arc<dyn SystemService>>>,
 }
 impl RangeRoles {
-    /// Roles over `store`, and the factory building each group's `RangeStateMachine`.
+    /// Roles over `store`, and the factory building each group's `RangeStateMachine`
+    /// (with `split` as its split listener).
     pub(crate) fn backed(
         store: Arc<RangeStore>,
         opener: Option<Arc<dyn RangeEngineOpener>>,
+        split: SplitListener,
     ) -> (Self, StateFactory) {
         let states = States::default();
         let made = states.clone();
         let over = store.clone();
         let factory: StateFactory = Arc::new(move |range| {
             let state = Arc::new(RangeStateMachine::new(range, over.clone()));
+            state.set_split_listener(split.clone());
             made.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(range, state.clone());
@@ -343,6 +353,7 @@ impl RangeRoles {
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("range {} has no descriptor", range.0))?;
             let guard = state.engine_guard();
+            let moved = state.moved_epoch();
             let generation = next_generation(&opened, range, term)?;
             let sink = Arc::new(RangeSink::new(handle.clone(), term, descriptor.epoch));
             let service = opener
@@ -356,6 +367,7 @@ impl RangeRoles {
                 term,
                 opener: opener.clone(),
                 closed: AtomicBool::new(false),
+                moved,
                 _guard: guard,
             })
         });

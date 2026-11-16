@@ -8,6 +8,11 @@
 //! key bytes: len BE4 + bytes, mode u8 (0 shared, 1 exclusive))]*n`.
 //! Writes are user keys of the range's spaces (keyspace tag = RangeSpace tag); locks are the
 //! transaction's row and unique locks in this range at prepare.
+//!
+//! Version 2 (R5-82) = the v1 layout with version byte 2, then `[n children BE4][range BE8]*n`,
+//! n >= 1, distinct, none 0, 1 or u64::MAX: the ranges that took a share of the record at a
+//! split of this range, finalized before this range's own share. A record without children
+//! is always written as v1.
 use std::collections::BTreeMap;
 
 use super::super::keys::{is_versioned, keyspace_of, space_of};
@@ -16,11 +21,12 @@ use crate::storage::engine::{
     kv::Keyspace,
     locks::{LockKey, LockMode},
 };
-use crate::storage::range_api::{RangeError, RangeId, RangeSpace};
+use crate::storage::range_api::{RangeError, RangeId, RangeSpace, SYSTEM_RANGE, range_key};
 
-const VERSION: u8 = 1;
+const V1: u8 = 1;
+const V2: u8 = 2;
 
-pub(super) type Writes = BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>;
+pub(crate) type Writes = BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Prepared {
@@ -28,6 +34,24 @@ pub(crate) struct Prepared {
     pub(crate) at: Ts,
     pub(crate) writes: Writes,
     pub(crate) locks: Vec<(LockKey, LockMode)>,
+    /// Ranges holding a share of this transaction since a split of this range (v2).
+    pub(crate) children: Vec<RangeId>,
+}
+
+/// Range key a lock's requests are routed by (engine/locking.rs `lock_key`). None for a
+/// table sentinel (`Row` with an empty pk, design.md 3.1): it lives on every range holding
+/// the table's rows, not at one key.
+fn lock_position(key: &LockKey) -> Option<Vec<u8>> {
+    let at = |space, id: u64, rest: &[u8]| {
+        let mut user = id.to_be_bytes().to_vec();
+        user.extend_from_slice(rest);
+        Some(range_key(space, &user))
+    };
+    match key {
+        LockKey::Row { table, pk } if !pk.is_empty() => at(RangeSpace::Rows, *table, pk),
+        LockKey::Unique { index, tuple } => at(RangeSpace::Index, *index, tuple),
+        LockKey::Row { .. } | LockKey::Table(_) => None,
+    }
 }
 
 fn corrupt(message: &str) -> RangeError {
@@ -72,8 +96,36 @@ impl<'a> Reader<'a> {
 }
 
 impl Prepared {
+    /// R5-82: moves the writes and locks at or above `at_key` into a record for `right` (same
+    /// home and p, no children) and names `right` as a child of this one. None, and this
+    /// record unchanged, when nothing moves. Sentinels stay here (`lock_position`).
+    pub(crate) fn split_off(&mut self, at_key: &[u8], right: RangeId) -> Option<Prepared> {
+        let moves =
+            |position: Option<Vec<u8>>| position.is_some_and(|key| key.as_slice() >= at_key);
+        let (moved, kept): (Writes, Writes) = std::mem::take(&mut self.writes)
+            .into_iter()
+            .partition(|((ks, key), _)| moves(space_of(*ks).map(|space| range_key(space, key))));
+        let (moved_locks, kept_locks): (Vec<_>, Vec<_>) = std::mem::take(&mut self.locks)
+            .into_iter()
+            .partition(|(key, _)| moves(lock_position(key)));
+        self.writes = kept;
+        self.locks = kept_locks;
+        if moved.is_empty() && moved_locks.is_empty() {
+            return None;
+        }
+        self.children.push(right);
+        Some(Prepared {
+            home: self.home,
+            at: self.at,
+            writes: moved,
+            locks: moved_locks,
+            children: Vec::new(),
+        })
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>, RangeError> {
-        let mut out = vec![VERSION];
+        let version = if self.children.is_empty() { V1 } else { V2 };
+        let mut out = vec![version];
         out.extend_from_slice(&self.home.0.to_be_bytes());
         out.extend_from_slice(&self.at.0.to_be_bytes());
         put_len(&mut out, self.writes.len())?;
@@ -115,12 +167,19 @@ impl Prepared {
         for lock in locks {
             out.extend_from_slice(&lock);
         }
+        if version == V2 {
+            put_len(&mut out, self.children.len())?;
+            for child in &self.children {
+                out.extend_from_slice(&child.0.to_be_bytes());
+            }
+        }
         Ok(out)
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, RangeError> {
         let mut r = Reader(bytes);
-        if r.u8()? != VERSION {
+        let version = r.u8()?;
+        if version != V1 && version != V2 {
             return Err(corrupt("unknown version"));
         }
         let home = RangeId(r.u64()?);
@@ -166,6 +225,20 @@ impl Prepared {
             }
             locks.push((key, mode));
         }
+        let mut children = Vec::new();
+        if version == V2 {
+            let n = r.u32()?;
+            if n == 0 {
+                return Err(corrupt("v2 without children"));
+            }
+            for _ in 0..n {
+                let child = RangeId(r.u64()?);
+                if [0, SYSTEM_RANGE.0, u64::MAX].contains(&child.0) || children.contains(&child) {
+                    return Err(corrupt("bad or duplicate child range"));
+                }
+                children.push(child);
+            }
+        }
         if !r.0.is_empty() {
             return Err(corrupt("trailing bytes"));
         }
@@ -174,6 +247,7 @@ impl Prepared {
             at,
             writes,
             locks,
+            children,
         })
     }
 }

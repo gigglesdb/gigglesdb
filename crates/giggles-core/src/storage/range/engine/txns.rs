@@ -18,13 +18,17 @@ use crate::storage::range_api::{
     ClusterTxnId, Epoch, Outcome, RangeError, RangeId, RangeSpace, RangeWrite, Timestamp, range_key,
 };
 
+/// Range key of the first write: where a stale commit or prepare is sent (R5-81).
+fn first_key(writes: &[RangeWrite]) -> Option<Vec<u8>> {
+    writes.first().map(|w| range_key(w.space, &w.key))
+}
+
 /// Feature bits the catalog content of `writes` needs. A gateway's own feature bits never reach
 /// the range (the range interface carries none), so the leader derives the bits from the
 /// content its sequencer validates against them (design.md Changes, Track A open item (d)).
 fn derived_features(writes: &Writes) -> Result<u64, RangeError> {
-    let corrupt = |e: crate::storage::engine::meta::FormatError| {
-        RangeError::Corrupt(format!("{e:?}"))
-    };
+    let corrupt =
+        |e: crate::storage::engine::meta::FormatError| RangeError::Corrupt(format!("{e:?}"));
     let mut bits = 0;
     for ((ks, key), value) in writes {
         if *ks != Keyspace::Catalog {
@@ -32,8 +36,7 @@ fn derived_features(writes: &Writes) -> Result<u64, RangeError> {
         }
         bits |= content_check::required_bits_for_catalog_key(key).map_err(corrupt)?;
         if let Some(value) = value {
-            bits |=
-                content_check::required_bits_for_catalog_value(key, value).map_err(corrupt)?;
+            bits |= content_check::required_bits_for_catalog_value(key, value).map_err(corrupt)?;
         }
     }
     Ok(bits)
@@ -171,7 +174,7 @@ impl RangeEngine {
         lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.check_open()?;
-        self.check_epoch(epoch)?;
+        self.check_epoch(epoch, first_key(&writes).as_deref())?;
         self.check_generation(lock_generation)?;
         let _busy = match self.begin(txn, &writes)? {
             Begun::Ready(busy) => busy,
@@ -208,7 +211,7 @@ impl RangeEngine {
         lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.check_open()?;
-        self.check_epoch(epoch)?;
+        self.check_epoch(epoch, first_key(&writes).as_deref())?;
         // A retry of a prepared transaction returns its p whatever its lock generation: the
         // prepare was accepted under a valid one and a new leader re-took its locks (Track D
         // rule (a)). A concurrent duplicate waits.
@@ -250,6 +253,7 @@ impl RangeEngine {
             at,
             writes,
             locks,
+            children: Vec::new(),
         };
         let mut batch = WriteBatch::default();
         batch.put(
@@ -273,6 +277,8 @@ impl RangeEngine {
     /// R5-37: Commit(c) writes the prepared versions at c and deletes the record in one batch;
     /// Abort deletes the record if there is one. Either way every lock of `txn` here is
     /// released (E43: even with no prepared record). Repeating it changes nothing.
+    /// R5-82: a record divided at a split first finalizes every child holding a share; a
+    /// child's error leaves everything here as it was (the caller retries).
     pub(super) fn finalize_txn(
         &self,
         txn: ClusterTxnId,
@@ -286,32 +292,31 @@ impl RangeEngine {
             state.prepared.get(&txn).cloned()
         };
         let key = range_local_key(self.descriptor.id, &RangeLocalKey::Prepared(txn.0));
-        let batch = match (&outcome, record) {
-            (Outcome::Commit(c), Some(record)) => {
-                let c = Ts(c.0);
-                if c <= record.at {
+        let batch = match record {
+            // Already finalized, or (Abort) never prepared here.
+            None => None,
+            Some(record) => {
+                if let Outcome::Commit(c) = &outcome
+                    && Ts(c.0) <= record.at
+                {
                     return Err(RangeError::Corrupt(
                         "commit timestamp not above the prepared timestamp".into(),
                     ));
                 }
+                self.finalize_children(txn, &outcome, &record.children)?;
                 let mut batch = WriteBatch::default();
-                for ((ks, key), value) in &record.writes {
-                    let value = match value {
-                        Some(value) => mvcc::encode_live(value),
-                        None => mvcc::encode_tombstone(),
-                    };
-                    batch.put(*ks, codec::user_key_seek_at(key, c), value);
+                if let Outcome::Commit(c) = &outcome {
+                    for ((ks, key), value) in &record.writes {
+                        let value = match value {
+                            Some(value) => mvcc::encode_live(value),
+                            None => mvcc::encode_tombstone(),
+                        };
+                        batch.put(*ks, codec::user_key_seek_at(key, Ts(c.0)), value);
+                    }
                 }
                 batch.delete(Keyspace::Meta, key);
                 Some(batch)
             }
-            (Outcome::Abort, Some(_)) => {
-                let mut batch = WriteBatch::default();
-                batch.delete(Keyspace::Meta, key);
-                Some(batch)
-            }
-            // Already finalized, or (Abort) never prepared here.
-            (_, None) => None,
         };
         if let Some(batch) = batch {
             self.kv

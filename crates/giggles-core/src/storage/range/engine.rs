@@ -33,12 +33,13 @@ use super::home::{HomeRecords, RecoveryConfig};
 use super::kv::RangeKv;
 use super::local::local_interval;
 use super::oracle::SystemRange;
-use super::store::RangeStore;
+use super::store::{RangeStore, child_route, epoch_refusal, stale_descriptor};
 use super::txn_record::resolve_prepared;
 use crate::storage::engine::{
     commit::{Sequencer, SequencerConfig, ServedGate, SystemClock, TsSource},
     hlc::Ts,
-    kv::{Direction, Keyspace, Kv, KvBackend, KvRead},
+    kv::{Direction, Keyspace, Kv, KvBackend, KvError, KvRead},
+    kv_rocksdb::RocksKv,
     locks::{LockConfig, LockError, LockManager, TxnId},
     meta::{RangeLocalKey, parse_range_local_key},
     txn::TxnError,
@@ -52,12 +53,14 @@ use crate::storage::replicated::BatchSink;
 
 mod home_log;
 mod locking;
-mod prepared;
+pub(super) mod prepared;
 mod read;
 mod txns;
 
 #[cfg(test)]
 mod client_tests;
+#[cfg(test)]
+mod split_tests;
 #[cfg(test)]
 mod tests;
 
@@ -112,6 +115,8 @@ struct EngineState {
 pub(crate) struct RangeEngine {
     descriptor: RangeDescriptor,
     kv: Arc<Kv>,
+    /// The node's store, for the stored descriptor and split lineage (R5-80).
+    stored: Arc<RocksKv>,
     seq: Arc<Sequencer>,
     gate: Arc<ServedGate>,
     locks: LockManager,
@@ -148,10 +153,12 @@ fn lock_error(error: LockError) -> RangeError {
 }
 
 /// A sequencer or KV failure. Fenced = nothing was written in this term; a KV write error
-/// = the replication outcome is unknown.
+/// = the replication outcome is unknown, except a fenced KV (RangeKv: the sink said
+/// NotLeader, or the handle was already fenced), which wrote nothing (R5-81).
 fn txn_error(error: TxnError) -> RangeError {
     match error {
         TxnError::Fenced => RangeError::Aborted("range engine fenced".into()),
+        TxnError::Kv(KvError::Fenced) => RangeError::NotLeader { hint: None },
         TxnError::Kv(error) => RangeError::Unknown(error.to_string()),
         TxnError::CommitAmbiguous => RangeError::Unknown("commit outcome unknown".into()),
         TxnError::Deadlock => RangeError::Deadlock,
@@ -221,6 +228,7 @@ impl RangeEngine {
         let engine = Arc::new(Self {
             descriptor,
             kv,
+            stored: store.kv().clone(),
             seq,
             gate,
             locks: LockManager::new(LockConfig::default()),
@@ -279,6 +287,36 @@ impl RangeEngine {
         }
     }
 
+    /// R5-82: finalizes `txn` on every range that took a share of its prepared record at a
+    /// split of this one, before this range's own share goes: the coordinator Forgets the
+    /// home record after this range acks, and a child asking a forgotten home would presume
+    /// abort (Track D's B2). Without a client nothing is forwarded: `Unavailable`.
+    /// The client is first taught each child's descriptor (review B1): a routed client reaches
+    /// a range by id only through its cache, and nothing else puts a fresh child there.
+    fn finalize_children(
+        &self,
+        txn: ClusterTxnId,
+        outcome: &Outcome,
+        children: &[RangeId],
+    ) -> Result<(), RangeError> {
+        if children.is_empty() {
+            return Ok(());
+        }
+        let client = self.client().ok_or_else(|| {
+            RangeError::Unavailable("no range client to finalize split children".into())
+        })?;
+        for &child in children {
+            match child_route(self.stored.as_ref(), self.descriptor.id, child) {
+                Ok(Some(descriptor)) => client.learn(&descriptor),
+                // No record of it here: the client may still know a route.
+                Ok(None) => {}
+                Err(e) => return Err(RangeError::Corrupt(format!("{e:?}"))),
+            }
+            client.finalize(child, txn, outcome.clone())?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
@@ -290,13 +328,27 @@ impl RangeEngine {
         Ok(())
     }
 
-    fn check_epoch(&self, epoch: Epoch) -> Result<(), RangeError> {
-        if epoch != self.descriptor.epoch {
-            return Err(RangeError::StaleEpoch {
-                descriptor: self.descriptor.clone(),
-            });
+    /// A request at another epoch than the engine's: `Unavailable` while the engine is about
+    /// to be reopened at that epoch, else `StaleEpoch` naming the range holding `key`
+    /// (R5-81, split.rs `epoch_refusal`).
+    fn check_epoch(&self, epoch: Epoch, key: Option<&[u8]>) -> Result<(), RangeError> {
+        if epoch == self.descriptor.epoch {
+            return Ok(());
         }
-        Ok(())
+        Err(
+            epoch_refusal(self.stored.as_ref(), &self.descriptor, epoch, key)
+                .unwrap_or_else(|e| RangeError::Corrupt(format!("{e:?}"))),
+        )
+    }
+
+    /// R5-80: once the stored descriptor's epoch moved (a split applied under this engine), a
+    /// read or lock gets StaleEpoch with the descriptor of the range now holding `key`.
+    fn check_stored(&self, key: Option<&[u8]>) -> Result<(), RangeError> {
+        match stale_descriptor(self.stored.as_ref(), &self.descriptor, key) {
+            Ok(None) => Ok(()),
+            Ok(Some(descriptor)) => Err(RangeError::StaleEpoch { descriptor }),
+            Err(e) => Err(RangeError::Corrupt(format!("{e:?}"))),
+        }
     }
 
     /// Design.md Changes 10:40Z (c): a transaction whose grants came from another lock table
@@ -449,7 +501,7 @@ impl RangeService for RangeEngine {
     }
     fn home(&self, epoch: Epoch, op: HomeOp) -> Result<HomeReply, RangeError> {
         self.check_open()?;
-        self.check_epoch(epoch)?;
+        self.check_epoch(epoch, None)?;
         self.home
             .get()
             .ok_or_else(|| RangeError::Unavailable("home records not open".into()))?

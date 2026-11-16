@@ -28,6 +28,9 @@ pub(crate) enum RangeLocalKey {
     Home(u64),
     /// `marker/` || xid BE8; value is a commit ts BE8.
     Marker(u64),
+    /// `child/` || child range id BE8: split lineage (R5-80); value is the child's
+    /// `RangeDescriptor::encode` as at the split.
+    Child(u64),
 }
 
 /// `range/` || id BE8 || `/`.
@@ -54,6 +57,7 @@ pub(crate) fn range_local_key(id: RangeId, sub: &RangeLocalKey) -> Vec<u8> {
         RangeLocalKey::Prepared(txn) => (b"prepared/", Some(txn)),
         RangeLocalKey::Home(txn) => (b"home/", Some(txn)),
         RangeLocalKey::Marker(xid) => (b"marker/", Some(xid)),
+        RangeLocalKey::Child(child) => (b"child/", Some(child)),
     };
     let mut key = range_local_prefix(id);
     key.extend_from_slice(name);
@@ -85,7 +89,8 @@ pub(crate) fn parse_range_local_key(key: &[u8]) -> Option<(RangeId, RangeLocalKe
         b"install" => RangeLocalKey::Install,
         _ => keyed(b"prepared/", RangeLocalKey::Prepared)
             .or_else(|| keyed(b"home/", RangeLocalKey::Home))
-            .or_else(|| keyed(b"marker/", RangeLocalKey::Marker))?,
+            .or_else(|| keyed(b"marker/", RangeLocalKey::Marker))
+            .or_else(|| keyed(b"child/", RangeLocalKey::Child))?,
     };
     Some((RangeId(id), sub))
 }
@@ -129,6 +134,14 @@ pub(crate) fn check_range_value(
                 RangeDescriptor::decode(value).map_err(|e| corrupt(format!("range {e}")))?;
             if descriptor.id != id {
                 return Err(corrupt("range descriptor id mismatch"));
+            }
+            Ok(())
+        }
+        RangeLocalKey::Child(child) => {
+            let descriptor =
+                RangeDescriptor::decode(value).map_err(|e| corrupt(format!("range child {e}")))?;
+            if *child == 0 || descriptor.id.0 != *child || *child == id.0 {
+                return Err(corrupt("range child id mismatch"));
             }
             Ok(())
         }

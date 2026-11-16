@@ -292,7 +292,8 @@ fn every_non_membership_point_is_covered() {
             WRITE.contains(&point)
                 || INSTALL.contains(&point)
                 || point.starts_with("node.conf.")
-                || point.starts_with("node.admin."),
+                || point.starts_with("node.admin.")
+                || point.starts_with("range.split."), // split_lifecycle.rs
             "uncovered failpoint: {point}"
         );
     }

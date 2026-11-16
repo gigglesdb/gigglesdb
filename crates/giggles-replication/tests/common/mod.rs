@@ -1,6 +1,7 @@
 pub mod certs;
 pub mod groups;
 pub mod net_cluster;
+pub mod range_net;
 use giggles_replication::{
     error::Result,
     log_store::LogStore,

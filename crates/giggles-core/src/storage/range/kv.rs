@@ -22,7 +22,7 @@ use crate::storage::engine::{
     meta::{RangeLocalKey, range_local_key},
 };
 use crate::storage::range_api::{RangeDescriptor, RangeId};
-use crate::storage::replicated::BatchSink;
+use crate::storage::replicated::{BatchSink, ReplicateError};
 
 /// Node-wide Meta keys the sequencer reads and writes, and their range-local homes.
 const MAPPED: [(&[u8], RangeLocalKey); 3] = [
@@ -160,12 +160,17 @@ impl KvBackend for RangeKv {
             KvError::Corrupt(format!("write refused before proposal: {reason}"))
         })?;
         // The Raft log is the durable record; only the sink applies to the store.
-        self.sink.replicate(batch.encode()).map_err(|e| {
-            eprintln!(
-                "range {}: write not confirmed, commit outcome unknown: {e}",
-                self.descriptor.id.0
-            );
-            KvError::Io(format!("replication: {e}"))
+        self.sink.replicate(batch.encode()).map_err(|e| match e {
+            // Definitely not applied (never proposed in this term, or refused at apply):
+            // a fenced KV, never an unknown outcome (R5-81).
+            ReplicateError::NotLeader => KvError::Fenced,
+            ReplicateError::Unavailable(_) => {
+                eprintln!(
+                    "range {}: write not confirmed, commit outcome unknown: {e}",
+                    self.descriptor.id.0
+                );
+                KvError::Io(format!("replication: {e}"))
+            }
         })
     }
 

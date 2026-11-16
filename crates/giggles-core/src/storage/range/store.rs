@@ -28,6 +28,11 @@ use crate::storage::range_api::{RangeDescriptor, RangeId};
 use crate::storage::replicated::AppliedPosition;
 use crate::storage::{io, v2};
 
+#[path = "split.rs"]
+mod split;
+pub use split::SplitOutcome;
+pub(super) use split::{child_route, epoch_refusal, stale_descriptor};
+
 /// Whether a committed entry changed this range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeApplyOutcome {
@@ -188,35 +193,9 @@ impl RangeStore {
         let _guard = lock
             .lock()
             .map_err(|_| CoreError::Corrupt("range apply lock poisoned".into()))?;
-        if self
-            .kv
-            .get(
-                Keyspace::Meta,
-                &range_local_key(range, &RangeLocalKey::Install),
-            )?
-            .is_some()
-        {
-            return Err(CoreError::Corrupt(format!(
-                "range {} has an unfinished install",
-                range.0
-            )));
-        }
-        let descriptor = self
-            .descriptor(range)?
-            .ok_or_else(|| CoreError::Corrupt(format!("unknown range {}", range.0)))?;
-        let cur = self.applied(range)?;
-        if cur.is_some_and(|c| at.index <= c.index) {
+        let Some(descriptor) = self.next_entry(range, at)? else {
             return Ok(RangeApplyOutcome::Skipped);
-        }
-        let expected = cur.map_or(1, |c| c.index + 1);
-        if at.index != expected {
-            return Err(CoreError::Corrupt(format!(
-                "range {} replication gap: applied {}, got {}",
-                range.0,
-                cur.map_or(0, |c| c.index),
-                at.index
-            )));
-        }
+        };
         let batch = match encoded {
             Some(bytes) => {
                 WriteBatch::decode(bytes).map_err(|e| CoreError::Corrupt(e.to_string()))?
@@ -264,6 +243,45 @@ impl RangeStore {
                 Ok(RangeApplyOutcome::Applied)
             }
         }
+    }
+
+    /// The apply contract, under the range's apply lock: an unfinished install or a gap is an
+    /// error; None = `at` is at or below the applied position (skip); else the descriptor.
+    fn next_entry(
+        &self,
+        range: RangeId,
+        at: AppliedPosition,
+    ) -> Result<Option<RangeDescriptor>, CoreError> {
+        if self
+            .kv
+            .get(
+                Keyspace::Meta,
+                &range_local_key(range, &RangeLocalKey::Install),
+            )?
+            .is_some()
+        {
+            return Err(CoreError::Corrupt(format!(
+                "range {} has an unfinished install",
+                range.0
+            )));
+        }
+        let descriptor = self
+            .descriptor(range)?
+            .ok_or_else(|| CoreError::Corrupt(format!("unknown range {}", range.0)))?;
+        let cur = self.applied(range)?;
+        if cur.is_some_and(|c| at.index <= c.index) {
+            return Ok(None);
+        }
+        let expected = cur.map_or(1, |c| c.index + 1);
+        if at.index != expected {
+            return Err(CoreError::Corrupt(format!(
+                "range {} replication gap: applied {}, got {}",
+                range.0,
+                cur.map_or(0, |c| c.index),
+                at.index
+            )));
+        }
+        Ok(Some(descriptor))
     }
 
     /// Flush all applied batches to durable storage.
@@ -370,12 +388,13 @@ pub(crate) fn check_batch(
 ) -> Result<BatchCheck, BatchError> {
     let outside = BatchError::Outside;
     let id = descriptor.id;
-    // `applied` and `install` belong to the store; the descriptor may be replaced (split) but
-    // never removed, or every later apply of the range would fail on every replica.
+    // `applied`, `install` and the split lineage (`child/*`, split.rs) belong to the store; the
+    // descriptor may be replaced but never removed, or every later apply of the range would
+    // fail on every replica.
     let own_key = |key: &[u8], delete: bool| -> Result<RangeLocalKey, BatchError> {
         match parse_range_local_key(key) {
             Some((owner, sub)) if owner == id => match sub {
-                RangeLocalKey::Applied | RangeLocalKey::Install => {
+                RangeLocalKey::Applied | RangeLocalKey::Install | RangeLocalKey::Child(_) => {
                     Err(outside(format!("batch writes range {} {sub:?}", id.0)))
                 }
                 RangeLocalKey::Descriptor if delete => {
@@ -434,6 +453,13 @@ pub(crate) fn check_batch(
                         )));
                     }
                 }
+                let (child_lo, child_hi) = split::child_interval(id);
+                if start < &child_hi && &child_lo < end {
+                    return Err(outside(format!(
+                        "meta delete-range covers range {} lineage",
+                        id.0
+                    )));
+                }
             }
             Op::Put { ks, key, .. } | Op::Delete { ks, key } => {
                 if !contains_raw(descriptor, *ks, key).map_err(|e| outside(format!("{e:?}")))? {
@@ -454,6 +480,9 @@ pub(crate) fn check_batch(
         descriptor: replaces_descriptor,
     })
 }
+
+#[path = "size.rs"]
+mod size;
 
 #[cfg(test)]
 #[path = "store_tests.rs"]

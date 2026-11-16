@@ -703,7 +703,7 @@ fn process_counter(
     }
     super::catalog_codec::decode_counter(&key, &value, &definition)
         .map_err(|_| TxnError::Misuse)?;
-    let native = super::native_content::NativeContent::load(kv).map_err(|_| TxnError::Misuse)?;
+    let native = load_native(kv)?;
     native.validate(next, load_subversion(kv)?).map_err(|_| TxnError::Misuse)?;
     let mut batch = WriteBatch::default();
     batch.put(Keyspace::Seq, key, value);
@@ -711,9 +711,27 @@ fn process_counter(
         super::meta::put_features(&mut batch, next).map_err(|_| TxnError::Misuse)?;
     }
     kv.write(batch, Durability::Sync)
-        .map_err(|_| TxnError::CommitAmbiguous)?;
+        .map_err(|error| write_error(&error))?;
     *features = next;
     Ok(())
+}
+
+/// The native-content record. Its read fails on a KV fenced after the worker's fence check
+/// (a range engine closed by a leader change or a split, GD-0075 P9-5b): nothing of the
+/// group was written, so that is `Fenced`, never `Misuse`.
+fn load_native(kv: &Kv) -> Result<super::native_content::NativeContent, TxnError> {
+    super::native_content::NativeContent::load(kv).map_err(|_| {
+        if kv.is_fenced() { TxnError::Fenced } else { TxnError::Misuse }
+    })
+}
+
+/// A failed sequencer write: ambiguous, except a fenced KV, which wrote nothing (a range
+/// backend reports a sink's definite NotLeader that way, GD-0075 R5-81).
+fn write_error(error: &super::kv::KvError) -> TxnError {
+    match error {
+        super::kv::KvError::Fenced => TxnError::Fenced,
+        _ => TxnError::CommitAmbiguous,
+    }
 }
 
 // Returns whether an ambiguous backend result requires fencing subsequent groups.
@@ -767,9 +785,13 @@ fn process_group(
     let mut accepted = Vec::new();
     let mut decision = None;
     let mut deferred_log = None;
-    let Ok(mut native) = super::native_content::NativeContent::load(kv) else {
-        for pending in group { let _ = pending.reply.send(Err(TxnError::Misuse)); }
-        return false;
+    let mut native = match load_native(kv) {
+        Ok(native) => native,
+        Err(error) => {
+            let fenced = error == TxnError::Fenced;
+            for pending in group { let _ = pending.reply.send(Err(error.clone())); }
+            return fenced;
+        }
     };
     let mut pending_features = *features;
     let mut pending_subversion = *subversion;
@@ -929,9 +951,12 @@ fn process_group(
         hlc.last = ts;
         log.append(ts, keys);
     }
-    if !batch.is_empty() && kv.write(batch, Durability::Sync).is_err() {
+    if !batch.is_empty()
+        && let Err(error) = kv.write(batch, Durability::Sync)
+    {
+        let error = write_error(&error);
         for (reply, _) in accepted {
-            let _ = reply.send(Err(TxnError::CommitAmbiguous));
+            let _ = reply.send(Err(error.clone()));
         }
         return true;
     }

@@ -7,14 +7,14 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 use giggles_core::{
-    range_api::{Epoch, RangeDescriptor, RangeId},
-    replicated::{RangeApplyOutcome, RangeStore},
+    range_api::{Epoch, RangeDescriptor, RangeId, SYSTEM_RANGE},
+    replicated::{RangeApplyOutcome, RangeStore, SplitOutcome},
 };
 
 use crate::state::{AppliedPosition, ApplyOutcome, StateError, StateMachine};
@@ -35,6 +35,17 @@ pub trait RangeStoreOps: Send + Sync {
         at: AppliedPosition,
     ) -> Result<ApplyOutcome, StateError>;
     fn apply_noop(&self, range: RangeId, at: AppliedPosition) -> Result<ApplyOutcome, StateError>;
+    /// Applies a split entry of `range` (giggles-core `RangeStore::split`): the
+    /// range keeps `[start, at_key)`, the new range `right` gets `[at_key, end)`,
+    /// both at epoch + 1; a refusal changes nothing but the position.
+    fn split(
+        &self,
+        range: RangeId,
+        epoch: Epoch,
+        at_key: &[u8],
+        right: RangeId,
+        at: AppliedPosition,
+    ) -> Result<SplitOutcome, StateError>;
     fn export(&self, range: RangeId, target: &Path) -> Result<AppliedPosition, StateError>;
     fn install(&self, range: RangeId, source: &Path) -> Result<AppliedPosition, StateError>;
     fn flush(&self) -> Result<(), StateError>;
@@ -85,6 +96,16 @@ impl RangeStoreOps for RangeStore {
             .map(range_outcome)
             .map_err(state_error)
     }
+    fn split(
+        &self,
+        range: RangeId,
+        epoch: Epoch,
+        at_key: &[u8],
+        right: RangeId,
+        at: AppliedPosition,
+    ) -> Result<SplitOutcome, StateError> {
+        RangeStore::split(self, range, epoch, at_key, right, core_position(at)).map_err(state_error)
+    }
     fn export(&self, range: RangeId, target: &Path) -> Result<AppliedPosition, StateError> {
         RangeStore::export(self, range, target)
             .map(local_position)
@@ -101,6 +122,8 @@ impl RangeStoreOps for RangeStore {
 }
 
 const PROPOSAL_VERSION: u8 = 1;
+const PROPOSAL_V2: u8 = 2;
+const SPLIT_KIND: u8 = 1;
 const PROPOSAL_HEADER: usize = 9;
 const MAX_REFUSALS: usize = 1024;
 
@@ -130,6 +153,51 @@ pub fn decode_proposal(bytes: &[u8]) -> Result<(Epoch, &[u8]), StateError> {
     Ok((Epoch(epoch), &bytes[PROPOSAL_HEADER..]))
 }
 
+/// A decoded range proposal (envelope v1 or v2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeProposal<'a> {
+    /// v1: an encoded write batch.
+    Batch(&'a [u8]),
+    /// v2 kind 1: split the range at `at_key` into itself and the new range `right`.
+    Split { at_key: &'a [u8], right: RangeId },
+}
+
+/// Split proposal, envelope v2 (GD-0075 R5-80), persisted in Raft logs:
+/// `[version u8 = 2][epoch u64 BE][kind u8 = 1][at_key: len u32 BE + bytes][right u64 BE]`.
+/// Strict: an unknown kind, a truncation or trailing bytes fail to decode.
+pub fn encode_split_proposal(epoch: Epoch, at_key: &[u8], right: RangeId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PROPOSAL_HEADER + 13 + at_key.len());
+    out.push(PROPOSAL_V2);
+    out.extend_from_slice(&epoch.0.to_be_bytes());
+    out.push(SPLIT_KIND);
+    put_bytes(&mut out, at_key);
+    out.extend_from_slice(&right.0.to_be_bytes());
+    out
+}
+
+/// Decodes a v1 (`decode_proposal`) or v2 range proposal.
+pub fn decode_range_proposal(bytes: &[u8]) -> Result<(Epoch, RangeProposal<'_>), StateError> {
+    if bytes.first() != Some(&PROPOSAL_V2) {
+        return decode_proposal(bytes).map(|(epoch, batch)| (epoch, RangeProposal::Batch(batch)));
+    }
+    let truncated = |_| StateError("truncated range proposal".into());
+    let mut r = &bytes[1..];
+    let epoch = Epoch(take_u64(&mut r).map_err(truncated)?);
+    let kind = take(&mut r, 1).map_err(truncated)?[0];
+    if kind != SPLIT_KIND {
+        return Err(StateError(format!("unknown range proposal kind {kind}")));
+    }
+    let at_key = take_bytes(&mut r).map_err(truncated)?;
+    let right = RangeId(take_u64(&mut r).map_err(truncated)?);
+    if !r.is_empty() {
+        return Err(StateError("trailing range proposal bytes".into()));
+    }
+    Ok((epoch, RangeProposal::Split { at_key, right }))
+}
+
+/// Called with the new right descriptor after a split entry applied, on the applying thread.
+pub type SplitListener = Arc<dyn Fn(&RangeDescriptor) + Send + Sync>;
+
 /// RAII marker for a live leader engine of one range; installs are refused
 /// while any guard lives.
 pub struct EngineGuard(Arc<AtomicUsize>);
@@ -145,6 +213,10 @@ pub struct RangeStateMachine {
     store: Arc<dyn RangeStoreOps>,
     engines: Arc<AtomicUsize>,
     refusals: Mutex<VecDeque<(u64, String)>>,
+    split_listener: OnceLock<SplitListener>,
+    /// The epoch the last split applied here moved the range to (0: none). A leader engine
+    /// of an older epoch reads it to report itself fenced (GD-0075 R5-81).
+    moved: Arc<AtomicU64>,
 }
 impl RangeStateMachine {
     pub fn new(range: RangeId, store: Arc<dyn RangeStoreOps>) -> Self {
@@ -153,7 +225,17 @@ impl RangeStateMachine {
             store,
             engines: Arc::default(),
             refusals: Mutex::default(),
+            split_listener: OnceLock::new(),
+            moved: Arc::default(),
         }
+    }
+    /// Shared with this range's leader engines: the epoch a split moved the range to.
+    pub(crate) fn moved_epoch(&self) -> Arc<AtomicU64> {
+        self.moved.clone()
+    }
+    /// Sets the split listener once; a later call is ignored.
+    pub fn set_split_listener(&self, listener: SplitListener) {
+        let _ = self.split_listener.set(listener);
     }
     pub fn range(&self) -> RangeId {
         self.range
@@ -170,13 +252,44 @@ impl RangeStateMachine {
         refusals.push_back((index, reason));
         Ok(ApplyOutcome::Refused)
     }
+    /// A split carries its own epoch check (in the store).
+    fn apply_split(
+        &self,
+        epoch: Epoch,
+        at_key: &[u8],
+        right: RangeId,
+        at: AppliedPosition,
+    ) -> Result<ApplyOutcome, StateError> {
+        match self.store.split(self.range, epoch, at_key, right, at)? {
+            SplitOutcome::Applied { left, right } => {
+                // Every replica marks the parent's leader engine (if any) as moved; the role
+                // manager's thread fences and reopens it. Never fenced here: an in-flight
+                // writer of that engine may be waiting on this very apply.
+                self.moved.fetch_max(left.epoch.0, Ordering::SeqCst);
+                if let Some(listener) = self.split_listener.get() {
+                    listener(&right);
+                }
+                Ok(ApplyOutcome::Applied)
+            }
+            SplitOutcome::Skipped => Ok(ApplyOutcome::Skipped),
+            SplitOutcome::Refused(reason) => self.refuse(
+                at.index,
+                format!("range {} refused the split: {reason}", self.range.0),
+            ),
+        }
+    }
 }
 impl StateMachine for RangeStateMachine {
     fn applied(&self) -> Result<Option<AppliedPosition>, StateError> {
         self.store.applied(self.range)
     }
     fn apply(&self, encoded_batch: &[u8], at: AppliedPosition) -> Result<ApplyOutcome, StateError> {
-        let (epoch, batch) = decode_proposal(encoded_batch)?;
+        let (epoch, batch) = match decode_range_proposal(encoded_batch)? {
+            (epoch, RangeProposal::Batch(batch)) => (epoch, batch),
+            (epoch, RangeProposal::Split { at_key, right }) => {
+                return self.apply_split(epoch, at_key, right, at);
+            }
+        };
         let current = self.store.descriptor(self.range)?.map(|d| d.epoch);
         if current != Some(epoch) {
             let outcome = self.store.apply_noop(self.range, at)?;
@@ -401,6 +514,62 @@ impl RangeStoreOps for MemRangeStore {
         }
         r.applied = Some(at);
         Ok(ApplyOutcome::Applied)
+    }
+    /// Moves the keys `>= at_key` into a new range `right`. Refused (position
+    /// advances) on a stale epoch, a key not strictly inside the range, or a
+    /// right id that is 0, 1, u64::MAX, the range's own or already present.
+    fn split(
+        &self,
+        range: RangeId,
+        epoch: Epoch,
+        at_key: &[u8],
+        right: RangeId,
+        at: AppliedPosition,
+    ) -> Result<SplitOutcome, StateError> {
+        let mut state = self.0.lock().map_err(state_error)?;
+        let right_exists = state.ranges.contains_key(&right);
+        let (r, done) = Self::admit(&mut state, range, at)?;
+        if done.is_some() {
+            return Ok(SplitOutcome::Skipped);
+        }
+        r.applied = Some(at);
+        let desc = r.descriptor.clone();
+        let refusal = if epoch != desc.epoch {
+            Some(format!(
+                "stale epoch {} (range is at {})",
+                epoch.0, desc.epoch.0
+            ))
+        } else if at_key <= desc.start.as_slice() || !desc.contains(at_key) {
+            Some("split key not strictly inside the range".to_owned())
+        } else if right_exists || [0, SYSTEM_RANGE.0, u64::MAX, range.0].contains(&right.0) {
+            Some(format!("invalid right range id {}", right.0))
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            return Ok(SplitOutcome::Refused(reason));
+        }
+        let next = Epoch(desc.epoch.0 + 1);
+        let left = RangeDescriptor {
+            epoch: next,
+            end: Some(at_key.to_vec()),
+            ..desc.clone()
+        };
+        let child = RangeDescriptor {
+            id: right,
+            epoch: next,
+            start: at_key.to_vec(),
+            ..desc
+        };
+        let data = r.data.split_off(at_key);
+        r.descriptor = left.clone();
+        let moved = MemRange {
+            applied: Some(at),
+            descriptor: child.clone(),
+            data,
+        };
+        state.ranges.insert(right, moved);
+        Ok(SplitOutcome::Applied { left, right: child })
     }
     /// File: `[index BE8][term BE8][descriptor][count BE8][(key, value)]*`,
     /// variable fields as `len u32 BE + bytes`.

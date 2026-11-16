@@ -555,3 +555,46 @@ fn stale_epoch_returned_for_read_but_retried_for_release() {
     client.invalidate(&new);
     assert_eq!(client.descriptor_for(&key(5)), Ok(old));
 }
+
+/// A split child the directory does not list yet (GD-0075 R5-82, review B1): by-id calls have
+/// no route until the client learns its descriptor, then reach its replicas. Learning the same
+/// or an older epoch keeps the cached one; a newer epoch replaces it.
+#[test]
+fn learned_descriptor_routes_by_id_and_older_epochs_are_ignored() {
+    let parent = desc(10, 2, first_user_key(), Some(key(50)), &[2]);
+    let child = desc(12, 2, key(50), None, &[3]);
+    let (net, _) = Net::new(std::slice::from_ref(&parent));
+    net.host(2, FakeRange::new(parent.clone(), None));
+    net.host(3, FakeRange::new(child.clone(), None));
+    let client = net.client(9);
+    assert_eq!(client.descriptor_for(&key(10)), Ok(parent.clone()));
+    let commit = Outcome::Commit(Timestamp(8));
+    let err = client
+        .finalize(child.id, txn(), commit.clone())
+        .unwrap_err();
+    assert_eq!(err, RangeError::Unavailable("no route to range 12".into()));
+    assert!(net.calls("Finalize").is_empty());
+
+    client.learn(&child);
+    assert_eq!(client.finalize(child.id, txn(), commit), Ok(()));
+    assert_eq!(client.heartbeat(child.id, txn()), Ok(()));
+    assert_eq!(
+        (net.calls("Finalize"), net.calls("Heartbeat")),
+        (vec![3], vec![3])
+    );
+    // The learned descriptor also answers key lookups without a directory read.
+    assert_eq!(client.descriptor_for(&key(60)), Ok(child.clone()));
+
+    // An older or equal epoch is ignored: it neither replaces the child nor drops the
+    // parent it would overlap.
+    client.learn(&desc(12, 1, key(40), None, &[4]));
+    client.learn(&desc(12, 2, key(40), None, &[4]));
+    assert_eq!(client.descriptor_for(&key(60)), Ok(child.clone()));
+    assert_eq!(client.descriptor_for(&key(45)), Ok(parent.clone()));
+    // A newer epoch replaces it.
+    let narrowed = desc(12, 3, key(50), Some(key(70)), &[3]);
+    client.learn(&narrowed);
+    assert_eq!(client.descriptor_for(&key(60)), Ok(narrowed));
+    assert_eq!(client.descriptor_for(&key(45)), Ok(parent));
+    assert_eq!(net.calls("Read"), vec![1]);
+}
