@@ -222,3 +222,8 @@ mod fk_section_network;
 #[path = "replication_process.rs"] mod replication_process;
 
 #[path = "replication_replace_process.rs"] mod replication_replace_process;
+#[path = "replication_harness.rs"] pub(crate) mod replication_harness;
+#[path = "replication_lost_reply.rs"] mod replication_lost_reply;
+#[path = "replication_history.rs"] mod replication_history;
+
+#[path = "xact_status_network.rs"] mod xact_status_network;
