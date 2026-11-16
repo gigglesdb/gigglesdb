@@ -1031,11 +1031,15 @@ directions, filter presence, typed stages and limits. Estimates are unknown
 database open. JSON output has an exact 65,536-byte preflight before output copies;
 this is separate from core's logical metadata budget. No human renderer is added.
 
-Explain performs an actual whole-state physical storage read and validation.
+Legacy explain performs a whole-state physical storage read and validation;
+v2 explain inspects a rows-free catalog snapshot.
 It performs no logical business-row read, mutation or commit. The described read
-path completely materializes the table within the 1024-row ceiling, conditionally
-certifies completeness with a reverse-primary-key probe when that page is full,
-then filters, orders, projects and pages in memory. It does not imply indexed
+path on legacy materializes within a 1024-row ceiling and certifies completeness
+with a reverse-primary-key probe when full. V2 streams complete table input
+without that row ceiling; explicit read limits may exceed 1024. Both retain the
+default output page of 100 and filter/order/project in memory. V2 explain uses
+`StreamingCompleteTableMaterialization` and `input_rows: usize::MAX` to denote
+no fixed row ceiling. Mutation and once-receipt limits are unchanged. It does not imply indexed
 optimization, task authorization or an access credential. The manifest separately
 advertises `bounded_simple_read_static_explain`; full reference explain,
 `local_core_bundle` and `index_creation` remain unqualified.

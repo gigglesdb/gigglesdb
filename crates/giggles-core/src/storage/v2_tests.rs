@@ -695,6 +695,8 @@ fn bounded_native_complete_reads() {
             let initial = reader.complete_table_engine(&table);
             if count <= MAX_ROWS { assert!(initial.is_ok()); }
             else { reader.rollback_native().unwrap(); reader.begin_native().unwrap(); }
+            let pinned_read = (count <= MAX_ROWS)
+                .then(|| reader.complete_read_table_engine(&table).unwrap());
             if count == MAX_ROWS {
                 let concurrent = admin.clone();
                 std::thread::spawn(move || concurrent.sql_session()
@@ -702,6 +704,9 @@ fn bounded_native_complete_reads() {
                     .join().unwrap();
             }
             with_sql_parser_forbidden(|| {
+                if let Some(relation) = pinned_read {
+                    assert_eq!(reader.consume_complete_engine(relation, &table).unwrap().len(), count);
+                }
                 let result = reader.complete_table_engine(&table);
                 if count > MAX_ROWS {
                     assert!(matches!(result, Err(CoreError::Limit)));
@@ -711,9 +716,21 @@ fn bounded_native_complete_reads() {
                 }
                 reader.rollback_native().unwrap();
                 reader.begin_native().unwrap();
+                let complete_read = reader.complete_read_table_engine(&table);
+                let visible = count + usize::from(count == MAX_ROWS);
+                if backend == Engine::V2 {
+                    assert_eq!(reader.consume_complete_engine(complete_read.unwrap(), &table).unwrap().len(), visible);
+                } else if visible > MAX_ROWS {
+                    assert!(matches!(complete_read, Err(CoreError::Limit)));
+                    assert!(reader.is_aborted());
+                } else {
+                    assert_eq!(reader.consume_complete_engine(complete_read.unwrap(), &table).unwrap().len(), visible);
+                }
+                reader.rollback_native().unwrap();
+                reader.begin_native().unwrap();
                 let cancelled = crate::Cancellation::default();
                 cancelled.cancel();
-                assert!(matches!(cancelled.scope(|| reader.complete_table_engine(&table)), Err(CoreError::Cancelled)));
+                assert!(matches!(cancelled.scope(|| reader.complete_read_table_engine(&table)), Err(CoreError::Cancelled)));
                 assert!(reader.is_aborted());
                 reader.rollback_native().unwrap();
                 if count == MAX_ROWS {
@@ -724,14 +741,14 @@ fn bounded_native_complete_reads() {
             });
             if count == 0 {
                 reader.begin_native().unwrap();
-                let relation = reader.complete_table_engine(&table).unwrap();
+                let relation = reader.complete_read_table_engine(&table).unwrap();
                 reader.execute("INSERT INTO bounded VALUES (9)", &[], None).unwrap();
                 assert_eq!(reader.consume_complete_engine(relation, &table),
                     Err(CoreError::Sql(relational::SqlError::StaleSchema)));
                 reader.rollback_native().unwrap();
                 if backend == Engine::V2 {
                     reader.begin_native().unwrap();
-                    let relation = reader.complete_table_engine(&table).unwrap();
+                    let relation = reader.complete_read_table_engine(&table).unwrap();
                     writer.execute("INSERT INTO bounded VALUES (10)", &[], None).unwrap();
                     reader.execute("SELECT * FROM bounded", &[], None).unwrap();
                     assert_eq!(reader.consume_complete_engine(relation, &table),

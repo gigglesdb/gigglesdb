@@ -22,6 +22,39 @@ pub(crate) struct CompleteRelation {
 }
 
 impl SqlSession {
+    /// V2 read input is complete without imposing the legacy table capacity.
+    /// The physical visitor decodes one row at a time; native order/filter
+    /// evaluation retains the resulting relation, independently of output pages.
+    pub(crate) fn complete_read_table_engine(
+        &mut self,
+        table: &TableDef,
+    ) -> Result<CompleteRelation, CoreError> {
+        if !self.is_v2_engine() {
+            return self.complete_table_engine(table);
+        }
+        let result = (|| {
+            let snapshot = self.complete_snapshot(table)?;
+            let mut rows = Vec::new();
+            let mut retained = crate::relational::scan::Retention::new(
+                crate::relational::scan::MAX_RETAINED_BYTES,
+            );
+            self.visit_native_page(table, &mut |row| {
+                retained.charge(std::mem::size_of::<SqlRow>()).map_err(CoreError::Sql)?;
+                for value in &row.values {
+                    retained.charge(std::mem::size_of_val(value) + crate::relational::value_bytes(value))
+                        .map_err(CoreError::Sql)?;
+                }
+                rows.push(row.clone());
+                Ok(())
+            }, |error| error)?;
+            Ok(CompleteRelation { snapshot, rows })
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
     /// Stream one statement snapshot without asserting full-table boundedness.
     pub(crate) fn visit_native_page<E>(
         &mut self, table: &TableDef,

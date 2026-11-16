@@ -706,15 +706,18 @@ and cost estimates are `None` (unknown). Literal and parameter values are absent
 The stages describe `execute_operation`: whole-state transaction snapshot,
 bounded complete-table materialization and reverse-primary-key completeness
 certification, then in-memory filter/order/field projection/output page. There
-is no claimed indexed optimization. The logical input ceiling is 1024 even for
-selective filters or a small output limit; output defaults to 100 and accepts
-0 through 1024. Limits also report the actual Admin admission/selected-key
+is no claimed indexed optimization. Legacy input and output retain their 1024-row
+ceilings. V2 streams complete table input and accepts nonnegative read limits
+that fit `usize`; output still defaults to 100. V2 explain reports
+`StreamingCompleteTableMaterialization` and `input_rows: usize::MAX` (no fixed
+row ceiling). Filter/order evaluation still materializes complete input in memory;
+byte budgets and mutation/once limits remain. Limits also report the Admin admission/selected-key
 configuration and engine byte/expression/binding ceilings.
 
 Explain itself borrows committed catalog metadata and does not call `run`,
-`complete_table_engine`, a SQL parser/routine, mutation or commit. Storage still
-acquires, decodes and validates whole bounded state including stored rows; this
-is not metadata-only physical I/O. There is no extra transaction-state clone,
+`complete_table_engine`, a SQL parser/routine, mutation or commit. Legacy storage
+still decodes and validates whole bounded state including stored rows; v2
+borrows a rows-free catalog snapshot. There is no extra transaction-state clone,
 logical business-row scan, relation materialization or publication for explain.
 It sees committed catalog changes on every call, not staged DDL in another
 session. Trusted Admin access is not generic task authorization.

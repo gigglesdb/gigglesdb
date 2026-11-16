@@ -13,6 +13,7 @@ pub enum ReadExplainStage {
     InMemoryOrder,
     FieldProjection,
     OutputPage,
+    StreamingCompleteTableMaterialization,
     /// Additional access after the complete input admission above; no avoided
     /// full materialization or estimated cost is claimed.
     SecondaryIndexCandidates {
@@ -115,6 +116,7 @@ impl Engine {
         validate_request(request)?;
         validate_bindings(bindings)?;
         let configured = self.admin.explain_limits_engine();
+        let v2 = self.admin.engine() == crate::Engine::V2;
         self.admin
             .inspect_secondary_catalog_engine(|domain, epoch, tables, descriptors| {
                 let table = tables
@@ -148,7 +150,7 @@ impl Engine {
                     limit,
                     projection,
                     ..
-                } = binder.bind(request)?
+                } = binder.bind(request, if v2 { usize::MAX } else { MAX_ROWS })?
                 else {
                     return Err(Error::Unsupported);
                 };
@@ -161,6 +163,9 @@ impl Engine {
                     ReadExplainStage::BoundedCompleteTableMaterialization,
                     ReadExplainStage::ReversePrimaryKeyCompletenessCertification,
                 ];
+                if v2 {
+                    stages = vec![ReadExplainStage::StreamingCompleteTableMaterialization];
+                }
                 if let Some(id) = secondary_selector::choose(table, &bound_filter)
                     .and_then(|choice| choice.descriptor(table, descriptors))
                 {
@@ -192,7 +197,7 @@ impl Engine {
                     has_filter: filter.is_some(),
                     stages,
                     limits: ReadExplainLimits {
-                        input_rows: MAX_ROWS,
+                        input_rows: if v2 { usize::MAX } else { MAX_ROWS },
                         output_rows: limit,
                         row_bytes: crate::relational::MAX_ROW_BYTES,
                         result_bytes: crate::relational::MAX_RESULT_BYTES,

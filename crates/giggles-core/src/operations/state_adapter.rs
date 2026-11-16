@@ -5,6 +5,7 @@ use crate::storage::State;
 
 pub(super) trait Context {
     type Input;
+    fn max_read_rows(&self) -> usize { MAX_ROWS }
     fn coerce_column(&self, column: &ColumnDef, value: Value) -> Result<Value> {
         if matches!(column.data_type, DataType::Varchar | DataType::Bpchar) {
             return Err(Error::Unsupported);
@@ -52,6 +53,9 @@ pub(super) trait Context {
 }
 impl Context for SqlSession {
     type Input = CompleteRelation;
+    fn max_read_rows(&self) -> usize {
+        if self.is_v2_engine() { usize::MAX } else { MAX_ROWS }
+    }
     fn coerce_column(&self, column: &ColumnDef, value: Value) -> Result<Value> {
         self.coerce_column_engine(column, assign_number(value, column)?).map_err(core)
     }

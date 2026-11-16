@@ -576,6 +576,100 @@ fn v2_native_read_matches_sql() {
 
 #[cfg(feature = "engine-rocksdb")]
 #[test]
+fn native_large_reads_keep_v2_parity_and_legacy_cap() {
+    for storage in [StorageEngine::Legacy, StorageEngine::V2] {
+        let (_db, admin) = Database::fresh(storage);
+        let mut writer = admin.sql_session();
+        writer.execute("create table items(tenant bigint,id bigint,n bigint,primary key(tenant,id))", &[], None).unwrap();
+        writer.execute("create table tenants(tenant bigint primary key,note bigint)", &[], None).unwrap();
+        writer.execute("insert into tenants values(7,42)", &[], None).unwrap();
+        if storage == StorageEngine::V2 {
+            writer.execute("create index items_n on items(n)", &[], None).unwrap();
+        }
+        let engine = Engine::with_version(admin.clone(), LanguageVersion::Embedded020);
+        let simple = Engine::with_version(admin.clone(), LanguageVersion::Embedded07);
+        let mut seeded = 0;
+        for count in [1024, 1025, 5000] {
+            writer.execute("BEGIN", &[], None).unwrap();
+            while seeded < count {
+                let end = (seeded + 500).min(count);
+                let tuples = (seeded..end).map(|id| format!("(7,{id},1)")).collect::<Vec<_>>().join(",");
+                writer.execute(&format!("insert into items values{tuples}"), &[], None).unwrap();
+                seeded = end;
+            }
+            writer.execute("COMMIT", &[], None).unwrap();
+            let read = |text: &str| with_sql_parser_forbidden(|| simple.execute_text(text, &Bindings::new()));
+            if storage == StorageEngine::Legacy && count > 1024 {
+                assert_eq!(read("items order by tenant,id limit 1024"), Err(Error::Limit));
+                assert_eq!(read(&format!("items limit {count}")), Err(Error::Type));
+                continue;
+            }
+            for (native, sql) in [
+                (format!("items order by tenant,id limit {count}"), "select * from items order by tenant,id"),
+                (format!("items where n=1 order by id desc limit {count}"), "select * from items where n=1 order by id desc"),
+                (format!("items where id>=1023 order by id desc limit {count} select id+1 as next"), "select id+1 as next from items where id>=1023 order by id desc"),
+            ] {
+                let actual = read(&native).unwrap();
+                let sql = if storage == StorageEngine::Legacy { format!("{sql} limit {count}") } else { sql.into() };
+                let expected = writer.execute(&sql, &[], None).unwrap();
+                assert_eq!(values(actual.rows), values(expected.rows), "{storage:?}, {count}: {native}");
+                assert!(actual.complete);
+            }
+            if storage == StorageEngine::V2 {
+                let default_page = read("items order by tenant,id").unwrap();
+                assert_eq!((default_page.rows.len(), default_page.matched, default_page.complete), (100, count, false));
+                for (native, sql) in [
+                    ("items select count(*) as n,sum(id) as total", "select count(*) as n,sum(id) as total from items"),
+                    ("items a join tenants b on a.tenant=b.tenant order by a.id select a.id,b.note", "select a.id,b.note from items a join tenants b on a.tenant=b.tenant order by a.id"),
+                ] {
+                    let actual = with_sql_parser_forbidden(|| engine.execute_text(native, &Bindings::new())).unwrap();
+                    let expected = writer.execute(sql, &[], None).unwrap();
+                    assert_eq!(values(actual.rows), values(expected.rows), "{count}: {native}");
+                }
+                let prepared = simple.prepare_bound_text(&format!("items order by tenant,id limit {count}"), &Bindings::new()).unwrap();
+                assert_eq!(with_sql_parser_forbidden(|| simple.execute_bound(&prepared)).unwrap().rows.len(), count);
+                let page = with_sql_parser_forbidden(|| engine.read_page_text(
+                    &format!("page items order by tenant,id limit {count}"), &Bindings::new(),
+                )).unwrap();
+                assert_eq!(page.outcome.rows.len(), count);
+                assert!(page.next.is_none());
+                let block = with_sql_parser_forbidden(|| simple.execute_transaction_text(
+                    &format!("transaction {{ let r=(items order by tenant,id limit {count}); emit @r.rows }}"), &Bindings::new(),
+                )).unwrap();
+                assert!(matches!(&block.emitted[0], giggles_language::EmittedValue::Rows { rows, complete: true, .. } if rows.len() == count));
+                let explain = giggles_core::operations::Engine::new(admin.clone()).explain_read(
+                    &giggles_core::operations::Request::Read { table: "items".into(), filter: None, order: vec![], limit: None, projection: vec![] },
+                    &Bindings::new(),
+                ).unwrap();
+                assert_eq!(explain.limits.input_rows, usize::MAX);
+                assert!(explain.stages.contains(&giggles_core::operations::ReadExplainStage::StreamingCompleteTableMaterialization));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_native_input_streams_past_result_byte_budget() {
+    let (_db, admin) = Database::fresh(StorageEngine::V2);
+    let mut writer = admin.sql_session();
+    writer.execute("create table items(id bigint primary key,note text)", &[], None).unwrap();
+    writer.execute("BEGIN", &[], None).unwrap();
+    for start in (0..1100).step_by(500) {
+        let tuples = (start..(start + 500).min(1100)).map(|id| format!("({id},$1)")).collect::<Vec<_>>().join(",");
+        writer.execute(&format!("insert into items values{tuples}"), &[Value::Text("x".repeat(1000))], None).unwrap();
+    }
+    writer.execute("COMMIT", &[], None).unwrap();
+    let engine = Engine::with_version(admin, LanguageVersion::Embedded07);
+    with_sql_parser_forbidden(|| {
+        assert_eq!(engine.execute_text("items order by id limit 1100 select id", &Bindings::new()).unwrap().rows.len(), 1100);
+        assert_eq!(engine.execute_text("items order by id", &Bindings::new()).unwrap().rows.len(), 100);
+        assert_eq!(engine.execute_text("items limit 1100", &Bindings::new()), Err(Error::Limit));
+    });
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
 fn v2_native_insert_matches_sql() {
     let (left_db, left) = Database::fresh(StorageEngine::V2);
     let (right_db, right) = Database::fresh(StorageEngine::V2);

@@ -156,7 +156,7 @@ impl Admin {
             &[relational::secondary_index::Descriptor],
         ) -> T,
     ) -> Result<T, CoreError> {
-        self.inner.inspect(|state| {
+        self.inner.inspect_metadata(|state| {
             crate::cancellation::check()?;
             let result = inspect(
                 state.view.domain,

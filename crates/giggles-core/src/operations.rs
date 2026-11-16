@@ -586,7 +586,7 @@ fn read_page(session: &mut SqlSession, request: &Request, after: Option<&[Value]
     // Keyset pages need a primary key, so they read tables only.
     let key = native_relation_key(request.table()?);
     let table = session.resolve_table_engine(&key).map_err(core)?;
-    let (table, operation) = bind_table(table, request, bindings)?;
+    let (table, operation) = bind_table(table, request, bindings, session.max_read_rows())?;
     let Request::Read { order: requested, .. } = request else { return Err(Error::Unsupported); };
     let Operation::Read { filter, order, limit, projection } = operation else { return Err(Error::Unsupported); };
     if requested.len() < table.primary_key.len()
@@ -690,7 +690,7 @@ fn bind_request(
 ) -> Result<(TableDef, Operation)> {
     let key = native_relation_key(request.table()?);
     let table = resolve_relation(session, &key, request)?;
-    bind_table(table, request, bindings)
+    bind_table(table, request, bindings, session.max_read_rows())
 }
 /// Resolve a request's target. Reads may name a view, as SQL FROM may; every
 /// other request, and any unknown name, keeps the table resolution and 42P01.
@@ -716,6 +716,7 @@ fn bind_table(
     table: TableDef,
     request: &Request,
     bindings: &Bindings,
+    max_read_rows: usize,
 ) -> Result<(TableDef, Operation)> {
     if table.hidden_rowid().is_some() {
         return Err(Error::Unsupported);
@@ -729,7 +730,7 @@ fn bind_table(
         used: BTreeSet::new(),
         remaining_value_bytes: MAX_BOUND_VALUE_BYTES,
     };
-    let operation = binder.bind(request)?;
+    let operation = binder.bind(request, max_read_rows)?;
     // Every recorded name resolved successfully, so used is a subset. Counts
     // establish exact membership without copying any unused caller-owned keys.
     if binder.used.len() != bindings.len() {
@@ -1111,8 +1112,11 @@ impl Binder<'_> {
         Ok(value.clone())
     }
     fn count(&mut self, e: &ValueExpr) -> Result<usize> {
+        self.read_count(e, MAX_ROWS)
+    }
+    fn read_count(&mut self, e: &ValueExpr, maximum: usize) -> Result<usize> {
         match self.value(e)? {
-            Value::Int(n) if (0..=MAX_ROWS as i64).contains(&n) => Ok(n as usize),
+            Value::Int(n) => usize::try_from(n).ok().filter(|n| *n <= maximum).ok_or(Error::Type),
             _ => Err(Error::Type),
         }
     }
@@ -1500,7 +1504,7 @@ impl Binder<'_> {
             }
         })
     }
-    fn bind(&mut self, s: &Request) -> Result<Operation> {
+    fn bind(&mut self, s: &Request, max_read_rows: usize) -> Result<Operation> {
         let RequestParts {
             body: s,
             returning,
@@ -1517,7 +1521,7 @@ impl Binder<'_> {
                 let filter = self.optional(filter)?;
                 let order = self.order(order)?;
                 let limit = match limit {
-                    Some(v) => self.count(v)?,
+                    Some(v) => self.read_count(v, max_read_rows)?,
                     None => 100,
                 };
                 let projection = if projection.is_empty() {
@@ -1551,7 +1555,7 @@ impl Binder<'_> {
                 filter: self.optional(filter)?,
                 order: self.order(order)?,
                 limit: match limit {
-                    Some(value) => self.count(value)?,
+                    Some(value) => self.read_count(value, max_read_rows)?,
                     None => 100,
                 },
                 projection: self.projections(projection)?,
@@ -2211,9 +2215,11 @@ fn read_rows<C: Context>(
                 .iter()
                 .map(|i| t.columns[*i].name.clone())
                 .collect();
+            let mut remaining = crate::relational::MAX_RESULT_BYTES;
             for row in rows.iter().take(limit) {
                 s.checkpoint().map_err(core)?;
                 for index in &projection {
+                    charge_value(&mut remaining, &row.values[*index])?;
                     charge_retained(&mut retained, &row.values[*index])?;
                 }
             }
@@ -2302,7 +2308,11 @@ fn run_complete(
     {
         return run_view(session, table, operation, rows, retained);
     }
-    let input = session.complete_table_engine(table).map_err(limit)?;
+    let input = if matches!(operation, Operation::Read { .. } | Operation::ReadExpressions { .. }) {
+        session.complete_read_table_engine(table)
+    } else {
+        session.complete_table_engine(table)
+    }.map_err(limit)?;
     run(session, table, operation, input, retained)
 }
 fn run<C: Context>(

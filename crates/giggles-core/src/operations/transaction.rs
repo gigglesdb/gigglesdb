@@ -385,7 +385,7 @@ pub(super) fn bind_transaction(
                 }
                 binder.table = Some(table);
                 binder.allow_fields = true;
-                let operation = binder.bind(request)?;
+                let operation = binder.bind(request, session.max_read_rows())?;
                 let table_index = *table_indices.entry(table.id).or_insert_with(|| {
                     tables.push(table.clone());
                     tables.len() - 1
