@@ -1,3 +1,5 @@
+// v2-only: these tests need the RocksDB engine.
+#![cfg(feature = "engine-rocksdb")]
 //! R2-PGLIMITS-3: a v2 ORDER BY past work_mem spills sorted runs, and the
 //! cursor streams the spilled result over pgwire; every row arrives in order.
 use giggles_core::{Admin, Engine, Limits, roles::NewRole};

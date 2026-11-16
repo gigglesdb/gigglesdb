@@ -1,3 +1,5 @@
+// v2-only: these tests need the RocksDB engine.
+#![cfg(feature = "engine-rocksdb")]
 //! R2-PGLIMITS-2: v2 DML RETURNING past 1 MiB streams every row over pgwire
 //! (simple, extended and suspended portals) from the core spill file.
 use giggles_core::{Admin, Engine, Limits, roles::NewRole};
