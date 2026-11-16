@@ -412,7 +412,10 @@ impl Session {
                         let (domain, _) = p.plan.tokenize.as_ref().ok_or_else(protocol)?;
                         let ty = p.token_ty.as_ref().ok_or_else(protocol)?;
                         let settings = p.policy.domains.get(domain).ok_or_else(protocol)?;
-                        let TokenizeSetting::On { limit_per_task } = settings.tokenize else {
+                        let TokenizeSetting::On {
+                            limit_per_session, ..
+                        } = settings.tokenize
+                        else {
                             return Err(failure(NyCode::StatementNotAllowed));
                         };
                         self.ctx
@@ -422,12 +425,12 @@ impl Session {
                         let mut record = self.record(&p.sql, Outcome::Allowed);
                         self.ctx.readlog.write(&record)?;
                         if let Some(id) = self.task {
-                            self.ctx.tasks.count_tokenize(&id, domain, limit_per_task)?;
+                            self.ctx.tasks.count_tokenize(&id, domain, limit_per_session)?;
                         } else {
                             let count = self.counts.entry(domain.clone()).or_default();
                             *count = count
                                 .checked_add(1)
-                                .filter(|n| *n <= limit_per_task)
+                                .filter(|n| *n <= limit_per_session)
                                 .ok_or_else(|| failure(NyCode::TokenizeLimit))?;
                         }
                         let token = self.ctx.codec.encode(

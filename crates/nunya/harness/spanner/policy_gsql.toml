@@ -3,7 +3,9 @@ snapshot_max_age_ms = 60000
 sink = "stdout"
 [domains.email]
 tokenize = "on"
-tokenize_limit_per_task = 20
+tokenize_limit_per_session = 20
+tokenize_limit_per_principal = 200
+tokenize_principal_window = "24h"
 [[column]]
 table = ".Customers"
 name = "Email"

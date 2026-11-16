@@ -352,7 +352,11 @@ mod tests {
                     (
                         domain(name),
                         DomainSettings {
-                            tokenize: TokenizeSetting::On { limit_per_task: 0 },
+                            tokenize: TokenizeSetting::On {
+                                limit_per_session: 0,
+                                limit_per_principal: 1,
+                                principal_window: std::time::Duration::from_secs(86400),
+                            },
                             range: None,
                         },
                     )

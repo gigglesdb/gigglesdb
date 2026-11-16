@@ -295,17 +295,20 @@ impl Session {
                     return Err(failure(NyCode::NotAnalysable));
                 };
                 let settings = policy.domains.get(domain).ok_or_else(protocol)?;
-                let TokenizeSetting::On { limit_per_task } = settings.tokenize else {
+                let TokenizeSetting::On {
+                    limit_per_session, ..
+                } = settings.tokenize
+                else {
                     return Err(failure(NyCode::StatementNotAllowed));
                 };
                 let value = values::decode_text(&ty, text.as_bytes())?;
                 if let Some(id) = self.task {
-                    self.ctx.tasks.count_tokenize(&id, domain, limit_per_task)?;
+                    self.ctx.tasks.count_tokenize(&id, domain, limit_per_session)?;
                 } else {
                     let count = self.counts.entry(domain.clone()).or_default();
                     *count = count
                         .checked_add(1)
-                        .filter(|n| *n <= limit_per_task)
+                        .filter(|n| *n <= limit_per_session)
                         .ok_or_else(|| failure(NyCode::TokenizeLimit))?;
                 }
                 let encoded = self.ctx.codec.encode(
@@ -1165,7 +1168,11 @@ mod tests {
                 domains: [(
                     domain,
                     DomainSettings {
-                        tokenize: TokenizeSetting::On { limit_per_task: 2 },
+                        tokenize: TokenizeSetting::On {
+                            limit_per_session: 2,
+                            limit_per_principal: 20,
+                            principal_window: std::time::Duration::from_secs(86400),
+                        },
                         range: None,
                     },
                 )]

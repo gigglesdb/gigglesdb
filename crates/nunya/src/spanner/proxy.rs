@@ -425,7 +425,9 @@ impl NunyaSpanner {
         };
         let setting = policy.domains.get(domain).ok_or_else(denied)?;
         let limit = match setting.tokenize {
-            TokenizeSetting::On { limit_per_task } => limit_per_task,
+            TokenizeSetting::On {
+                limit_per_session, ..
+            } => limit_per_session,
             TokenizeSetting::Off => return Err(denied()),
         };
         let (ty, value) = match arg {
@@ -1383,7 +1385,11 @@ mod tests {
                 domains: BTreeMap::from([(
                     domain(),
                     DomainSettings {
-                        tokenize: TokenizeSetting::On { limit_per_task: 10 },
+                        tokenize: TokenizeSetting::On {
+                            limit_per_session: 10,
+                            limit_per_principal: 100,
+                            principal_window: std::time::Duration::from_secs(86400),
+                        },
                         range: None,
                     },
                 )]),

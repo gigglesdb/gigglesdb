@@ -150,7 +150,11 @@ fn cross_domain_policy_rules() {
     policy.domains.insert(
         phone,
         DomainSettings {
-            tokenize: TokenizeSetting::On { limit_per_task: 20 },
+            tokenize: TokenizeSetting::On {
+                limit_per_session: 20,
+                limit_per_principal: 200,
+                principal_window: std::time::Duration::from_secs(86400),
+            },
             range: None,
         },
     );

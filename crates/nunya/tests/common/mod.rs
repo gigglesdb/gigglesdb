@@ -81,7 +81,11 @@ pub fn harness_fixture() -> (Snapshot, Policy) {
         domains: BTreeMap::from([(
             domain,
             DomainSettings {
-                tokenize: TokenizeSetting::On { limit_per_task: 20 },
+                tokenize: TokenizeSetting::On {
+                    limit_per_session: 20,
+                    limit_per_principal: 200,
+                    principal_window: std::time::Duration::from_secs(86400),
+                },
                 range: None,
             },
         )]),

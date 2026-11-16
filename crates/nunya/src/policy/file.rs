@@ -49,7 +49,9 @@ struct RawLog {
 #[serde(deny_unknown_fields)]
 struct RawDomain {
     tokenize: Option<Value>,
-    tokenize_limit_per_task: Option<Value>,
+    tokenize_limit_per_session: Option<Value>,
+    tokenize_limit_per_principal: Option<Value>,
+    tokenize_principal_window: Option<Value>,
     range: Option<Value>,
 }
 #[derive(Deserialize)]
@@ -167,6 +169,27 @@ fn parse_log(value: Option<Value>, errors: &mut Vec<PolicyError>) -> ReadLogSink
         None => ReadLogSink::Stdout,
     }
 }
+fn tokenize_limit(
+    value: Option<Value>,
+    max: u32,
+    context: &str,
+    missing: &str,
+    invalid: &str,
+    errors: &mut Vec<PolicyError>,
+) -> Option<u32> {
+    let Some(value) = value else {
+        error(errors, context, missing);
+        return None;
+    };
+    let limit = value
+        .as_integer()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| (1..=max).contains(n));
+    if limit.is_none() {
+        error(errors, context, invalid);
+    }
+    limit
+}
 fn parse_domains(
     value: Option<Value>,
     errors: &mut Vec<PolicyError>,
@@ -186,7 +209,13 @@ fn parse_domains(
         }
         let Some(raw): Option<RawDomain> = table(
             value,
-            &["tokenize", "tokenize_limit_per_task", "range"],
+            &[
+                "tokenize",
+                "tokenize_limit_per_session",
+                "tokenize_limit_per_principal",
+                "tokenize_principal_window",
+                "range",
+            ],
             &context,
             errors,
         ) else {
@@ -194,27 +223,77 @@ fn parse_domains(
         };
         let tokenize: Option<String> =
             field(raw.tokenize, &context, "tokenize must be off or on", errors);
-        let limit: Option<u32> = field(
-            raw.tokenize_limit_per_task,
-            &context,
-            "tokenize limit must be in 1..=100000",
-            errors,
-        );
         let tokenize = match tokenize.as_deref() {
-            None | Some("off") => TokenizeSetting::Off,
-            Some("on") => match limit {
-                Some(limit) if (1..=100000).contains(&limit) => TokenizeSetting::On {
-                    limit_per_task: limit,
-                },
-                _ => {
-                    error(
-                        errors,
-                        &context,
-                        "tokenize on requires a limit in 1..=100000",
-                    );
-                    TokenizeSetting::Off
+            None | Some("off") => {
+                for present in [
+                    raw.tokenize_limit_per_session.is_some(),
+                    raw.tokenize_limit_per_principal.is_some(),
+                    raw.tokenize_principal_window.is_some(),
+                ] {
+                    if present {
+                        error(errors, &context, "tokenize limits require tokenize on");
+                    }
                 }
-            },
+                TokenizeSetting::Off
+            }
+            Some("on") => {
+                let session = tokenize_limit(
+                    raw.tokenize_limit_per_session,
+                    100000,
+                    &context,
+                    "missing tokenize_limit_per_session",
+                    "tokenize session limit must be in 1..=100000",
+                    errors,
+                );
+                let principal = tokenize_limit(
+                    raw.tokenize_limit_per_principal,
+                    100000000,
+                    &context,
+                    "missing tokenize_limit_per_principal",
+                    "tokenize principal limit must be in 1..=100000000",
+                    errors,
+                );
+                let window = match raw.tokenize_principal_window {
+                    None => {
+                        error(errors, &context, "missing tokenize_principal_window");
+                        None
+                    }
+                    Some(value) => {
+                        let window = value
+                            .as_str()
+                            .and_then(crate::config::parse_duration)
+                            .filter(|window| (60..=31 * 86400).contains(&window.as_secs()));
+                        if window.is_none() {
+                            error(
+                                errors,
+                                &context,
+                                "tokenize principal window must be a duration in 1m..=31d",
+                            );
+                        }
+                        window
+                    }
+                };
+                match (session, principal, window) {
+                    (Some(session), Some(principal), _) if principal < session => {
+                        error(
+                            errors,
+                            &context,
+                            "tokenize principal limit must be at least session limit",
+                        );
+                        TokenizeSetting::Off
+                    }
+                    (
+                        Some(limit_per_session),
+                        Some(limit_per_principal),
+                        Some(principal_window),
+                    ) => TokenizeSetting::On {
+                        limit_per_session,
+                        limit_per_principal,
+                        principal_window,
+                    },
+                    _ => TokenizeSetting::Off,
+                }
+            }
             Some(_) => {
                 error(errors, &context, "tokenize must be off or on");
                 TokenizeSetting::Off
@@ -410,7 +489,9 @@ sink = "file"
 path = "/var/log/nunya/read.log"
 [domains.email]
 tokenize = "on"
-tokenize_limit_per_task = 20
+tokenize_limit_per_session = 20
+tokenize_limit_per_principal = 200
+tokenize_principal_window = "24h"
 [[column]]
 table = "public.customers"
 name = "email"
@@ -421,6 +502,169 @@ name = "country"
 masked = true
 placeholder = "**"
 "#;
+    const LIMIT_LINES: [&str; 3] = [
+        "tokenize_limit_per_session = 20\n",
+        "tokenize_limit_per_principal = 200\n",
+        "tokenize_principal_window = \"24h\"\n",
+    ];
+    fn without_limits() -> String {
+        LIMIT_LINES
+            .iter()
+            .fold(EXAMPLE.to_owned(), |text, line| text.replace(line, ""))
+    }
+    fn assert_problem(text: &str, problem: &str) {
+        let errors = parse_policy(text).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, format!("domain email: {problem}"));
+    }
+    #[test]
+    fn each_tokenize_limit_is_required() {
+        for (line, problem) in LIMIT_LINES.into_iter().zip([
+            "missing tokenize_limit_per_session",
+            "missing tokenize_limit_per_principal",
+            "missing tokenize_principal_window",
+        ]) {
+            assert_problem(&EXAMPLE.replace(line, ""), problem);
+        }
+        assert_eq!(parse_policy(&without_limits()).unwrap_err().len(), 3);
+    }
+    #[test]
+    fn each_tokenize_limit_requires_on() {
+        for line in LIMIT_LINES {
+            for setting in ["tokenize = \"off\"", ""] {
+                let text =
+                    without_limits().replace("tokenize = \"on\"", &format!("{setting}\n{line}"));
+                assert_problem(&text, "tokenize limits require tokenize on");
+            }
+        }
+        assert_eq!(
+            parse_policy(&EXAMPLE.replace("tokenize = \"on\"", "tokenize = \"off\""))
+                .unwrap_err()
+                .len(),
+            3
+        );
+    }
+    #[test]
+    fn obsolete_tokenize_key_is_unknown() {
+        let key = concat!("tokenize_limit_per_", "task");
+        let extra = format!("tokenize = \"on\"\n{key} = 987654321");
+        assert_problem(&EXAMPLE.replace("tokenize = \"on\"", &extra), "unknown key");
+        let errors =
+            parse_policy(&without_limits().replace("tokenize = \"on\"", &extra)).unwrap_err();
+        assert_eq!(errors.len(), 4);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message == "domain email: unknown key")
+        );
+        assert!(
+            errors
+                .iter()
+                .all(|e| !e.message.contains(key) && !e.message.contains("987654321"))
+        );
+    }
+    #[test]
+    fn principal_limit_must_cover_session() {
+        assert_problem(
+            &EXAMPLE.replace(
+                "tokenize_limit_per_principal = 200",
+                "tokenize_limit_per_principal = 19",
+            ),
+            "tokenize principal limit must be at least session limit",
+        );
+        assert!(
+            parse_policy(&EXAMPLE.replace(
+                "tokenize_limit_per_principal = 200",
+                "tokenize_limit_per_principal = 20"
+            ))
+            .is_ok()
+        );
+    }
+    #[test]
+    fn tokenize_window_bounds_and_types() {
+        for value in [
+            "\"24\"",
+            "\"0h\"",
+            "\"32d\"",
+            "\"1.5h\"",
+            "86400",
+            "\"59s\"",
+            "\"private_window\"",
+            "true",
+        ] {
+            assert_problem(
+                &EXAMPLE.replace(
+                    "tokenize_principal_window = \"24h\"",
+                    &format!("tokenize_principal_window = {value}"),
+                ),
+                "tokenize principal window must be a duration in 1m..=31d",
+            );
+        }
+        for value in ["1m", "60s", "31d"] {
+            assert!(
+                parse_policy(&EXAMPLE.replace(
+                    "tokenize_principal_window = \"24h\"",
+                    &format!("tokenize_principal_window = \"{value}\"")
+                ))
+                .is_ok()
+            );
+        }
+    }
+    #[test]
+    fn tokenize_limit_bounds_and_types() {
+        for (key, original, problem) in [
+            (
+                "tokenize_limit_per_session",
+                "20",
+                "tokenize session limit must be in 1..=100000",
+            ),
+            (
+                "tokenize_limit_per_principal",
+                "200",
+                "tokenize principal limit must be in 1..=100000000",
+            ),
+        ] {
+            for value in ["0", "-1", "4294967296", "\"private_limit\"", "1.5", "true"] {
+                assert_problem(
+                    &EXAMPLE.replace(
+                        &format!("{key} = {original}\n"),
+                        &format!("{key} = {value}\n"),
+                    ),
+                    problem,
+                );
+            }
+        }
+        assert_problem(
+            &EXAMPLE.replace(
+                "tokenize_limit_per_session = 20",
+                "tokenize_limit_per_session = 100001",
+            ),
+            "tokenize session limit must be in 1..=100000",
+        );
+        assert_problem(
+            &EXAMPLE.replace(
+                "tokenize_limit_per_principal = 200",
+                "tokenize_limit_per_principal = 100000001",
+            ),
+            "tokenize principal limit must be in 1..=100000000",
+        );
+        for (session, principal) in [(1, 1), (100000, 100000000)] {
+            assert!(
+                parse_policy(
+                    &EXAMPLE
+                        .replace(
+                            "tokenize_limit_per_session = 20",
+                            &format!("tokenize_limit_per_session = {session}")
+                        )
+                        .replace(
+                            "tokenize_limit_per_principal = 200",
+                            &format!("tokenize_limit_per_principal = {principal}")
+                        )
+                )
+                .is_ok()
+            );
+        }
+    }
     #[test]
     fn empty_schema_requires_leading_dot() {
         let policy = parse_policy(&EXAMPLE.replace("public.customers", ".Customers")).unwrap();
@@ -445,7 +689,11 @@ placeholder = "**"
         );
         assert_eq!(
             policy.domains[&DomainName("email".into())].tokenize,
-            TokenizeSetting::On { limit_per_task: 20 }
+            TokenizeSetting::On {
+                limit_per_session: 20,
+                limit_per_principal: 200,
+                principal_window: std::time::Duration::from_secs(86400)
+            }
         );
         assert_eq!(policy.columns.len(), 2);
         let c = ColumnRef {
@@ -460,7 +708,8 @@ placeholder = "**"
             })
         );
         let off =
-            parse_policy(&EXAMPLE.replace("tokenize = \"on\"", "tokenize = \"off\"")).unwrap();
+            parse_policy(&without_limits().replace("tokenize = \"on\"", "tokenize = \"off\""))
+                .unwrap();
         assert_eq!(
             off.domains[&DomainName("email".into())].tokenize,
             TokenizeSetting::Off
@@ -478,26 +727,26 @@ placeholder = "**"
             format!(
                 "{EXAMPLE}\n[[column]]\ntable = \"public.customers\"\nname = \"email\"\nmasked = true"
             ),
-            EXAMPLE.replace("tokenize_limit_per_task = 20", ""),
+            EXAMPLE.replace("tokenize_limit_per_session = 20", ""),
             EXAMPLE.replace(
-                "tokenize_limit_per_task = 20",
-                "tokenize_limit_per_task = 0",
+                "tokenize_limit_per_session = 20",
+                "tokenize_limit_per_session = 0",
             ),
             EXAMPLE.replace(
-                "tokenize_limit_per_task = 20",
-                "tokenize_limit_per_task = -1",
+                "tokenize_limit_per_session = 20",
+                "tokenize_limit_per_session = -1",
             ),
             EXAMPLE.replace(
-                "tokenize_limit_per_task = 20",
-                "tokenize_limit_per_task = 4294967296",
+                "tokenize_limit_per_session = 20",
+                "tokenize_limit_per_session = 4294967296",
             ),
             EXAMPLE.replace(
-                "tokenize_limit_per_task = 20",
-                "tokenize_limit_per_task = 100001",
+                "tokenize_limit_per_session = 20",
+                "tokenize_limit_per_session = 100001",
             ),
             EXAMPLE.replace(
-                "tokenize_limit_per_task = 20",
-                "tokenize_limit_per_task = 20\nrange = { min = 2, max = 1 }",
+                "tokenize_limit_per_session = 20",
+                "tokenize_limit_per_session = 20\nrange = { min = 2, max = 1 }",
             ),
             EXAMPLE.replace("path = \"/var/log/nunya/read.log\"", "max_bytes = 0"),
             EXAMPLE.replace("path = \"/var/log/nunya/read.log\"", ""),
@@ -510,8 +759,8 @@ placeholder = "**"
     fn collects_errors_and_redacts_arbitrary_values() {
         let text = EXAMPLE
             .replace(
-                "tokenize_limit_per_task = 20",
-                "tokenize_limit_per_task = 0",
+                "tokenize_limit_per_session = 20",
+                "tokenize_limit_per_session = 0",
             )
             .replace("path = \"/var/log/nunya/read.log\"", "max_bytes = 0")
             .replace("placeholder = \"**\"", "placeholder = 1987654321");

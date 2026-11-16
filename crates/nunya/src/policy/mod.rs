@@ -33,10 +33,14 @@ pub enum TokenizeSetting {
     #[default]
     /// Off.
     Off,
-    /// Enable explicit tokenization with a per-task limit.
+    /// Enable explicit tokenization with session and principal limits.
     On {
-        /// Maximum explicit tokenizations in one task.
-        limit_per_task: u32,
+        /// Maximum explicit tokenizations in one session.
+        limit_per_session: u32,
+        /// Maximum explicit tokenizations per principal window.
+        limit_per_principal: u32,
+        /// Fixed window length for the principal limit.
+        principal_window: std::time::Duration,
     },
 }
 /// Inclusive format-preserving encryption range in the units of SqlValue.
