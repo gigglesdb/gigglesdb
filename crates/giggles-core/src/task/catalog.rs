@@ -1210,7 +1210,7 @@ impl TaskCatalog {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "store_tests.rs"]
 mod store_tests;
 
