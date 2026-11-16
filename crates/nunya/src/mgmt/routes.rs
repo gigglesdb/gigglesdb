@@ -144,9 +144,8 @@ fn audit_unavailable() -> Response<Bytes> {
     error(StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable")
 }
 fn session_view(ctx: &MgmtContext, s: &AccessSession) -> Value {
-    let params = ctx.authority.session_scram_params(s.id);
-    json!({"scram_salt":params.as_ref().map(|(salt, _)| data_encoding::BASE64.encode(salt)),
-        "scram_iterations":params.map(|(_, iterations)| iterations), "id":s.id, "principal":s.principal, "route":s.route, "mode":s.mode,
+    json!({"policy_revision":ctx.status.policy_revision(),
+        "config_revision":ctx.status.config_revision(), "id":s.id, "principal":s.principal, "route":s.route, "mode":s.mode,
         "state":s.state, "created_ms":s.created_ms, "expires_ms":s.expires_ms,
         "idle_timeout_ms":s.idle_timeout_ms, "last_used_ms":s.last_used_ms,
         "revoke_reason":s.revoke_reason.map(EndReason::as_str), "label":s.label,
@@ -361,6 +360,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
     if !allowed {
         return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
     }
+    let mut authorized_session = None;
     match ep {
         Sessions if method == "POST" => {
             if caller.principal.is_none() {
@@ -377,6 +377,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
             if caller.principal != Some(s.principal) && (!caller.admin || matches!(ep, Renew(_))) {
                 return error(StatusCode::NOT_FOUND, "not_found");
             }
+            authorized_session = Some(s);
         }
         Sessions => {}
         Principals
@@ -430,6 +431,30 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     None => None,
                 };
                 replay = ctx.authority.renewal_recorded(principal, key);
+                if !replay {
+                    let Some(s) = authorized_session.as_ref() else {
+                        return error(StatusCode::NOT_FOUND, "not_found");
+                    };
+                    // Ended sessions cannot renew; retain their refusal without requiring audit health.
+                    if s.state != crate::state::model::SessionState::Active
+                        || ctx.authority.now_ms() >= s.expires_ms
+                    {
+                        let _ = record_session(
+                            ctx,
+                            &caller,
+                            origin,
+                            s,
+                            LifecycleKind::ResumeRefused,
+                            "session_ended",
+                        );
+                        return authority_error(AuthorityError::SessionEnded);
+                    }
+                    if record_session(ctx, &caller, origin, s, LifecycleKind::Renewed, "renewed")
+                        .is_err()
+                    {
+                        return audit_unavailable();
+                    }
+                }
                 match ctx
                     .authority
                     .renew_idempotent(principal, id, request.mode, add, key)
@@ -623,7 +648,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
         if let Ok(s) = &result {
             let (kind, reason, revoke_on_failure) = match ep {
                 Sessions => (LifecycleKind::Issued, "issued", true),
-                Renew(_) => (LifecycleKind::Renewed, "renewed", true),
+                Renew(_) => (LifecycleKind::Renewed, "renewed", false),
                 Revoke(_) => (
                     LifecycleKind::Revoked,
                     s.revoke_reason.unwrap_or(EndReason::AdminRevoked).as_str(),
@@ -631,7 +656,10 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                 ),
                 _ => return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
             };
-            if !replay && record_session(ctx, &caller, origin, s, kind, reason).is_err() {
+            if !replay
+                && !matches!(ep, Renew(_))
+                && record_session(ctx, &caller, origin, s, kind, reason).is_err()
+            {
                 if revoke_on_failure {
                     let _ = ctx.authority.revoke(s.id, EndReason::AdminRevoked);
                 } else if matches!(ep, Revoke(_)) {

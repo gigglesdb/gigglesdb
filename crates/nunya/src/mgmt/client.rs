@@ -136,6 +136,10 @@ pub struct SessionSecret {
     pub verifier: String,
     /// Lowercase SHA-256 of the secret's UTF-8 bytes.
     pub sha256_hex: String,
+    /// Standard base64 SCRAM salt used to derive this credential.
+    pub scram_salt: String,
+    /// SCRAM iteration count used to derive this credential.
+    pub scram_iterations: u32,
 }
 impl SessionSecret {
     /// Generate a fresh credential using existing public SCRAM parameters.
@@ -152,6 +156,8 @@ impl SessionSecret {
             secret,
             verifier,
             sha256_hex,
+            scram_salt: data_encoding::BASE64.encode(salt),
+            scram_iterations: iterations,
         })
     }
     /// Generate a fresh credential; abort with a fixed message if OS entropy fails.
@@ -167,6 +173,8 @@ impl SessionSecret {
             secret,
             verifier,
             sha256_hex,
+            scram_salt: data_encoding::BASE64.encode(&salt),
+            scram_iterations: 4096,
         }
     }
 }
@@ -204,10 +212,12 @@ pub struct SessionCredential {
 /// Public session projection.
 #[derive(Debug, Deserialize)]
 pub struct SessionView {
-    /// Standard base64 salt of the active session credential.
-    pub scram_salt: Option<String>,
-    /// Iteration count of the active session credential.
-    pub scram_iterations: Option<u32>,
+    /// Current policy revision.
+    #[serde(default)]
+    pub policy_revision: Option<String>,
+    /// Current configuration revision.
+    #[serde(default)]
+    pub config_revision: Option<String>,
     /// Session hex identifier.
     pub id: String,
     /// Principal hex identifier.

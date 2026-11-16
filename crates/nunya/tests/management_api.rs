@@ -606,11 +606,15 @@ fn rotation_parameter_mismatch_is_atomic() -> TransportResult {
         None,
     );
     let detail_value = value(&detail);
-    assert_eq!(
-        detail_value["scram_salt"],
-        data_encoding::BASE64.encode(&params.0)
-    );
-    assert_eq!(detail_value["scram_iterations"], params.1);
+    assert!(detail_value.get("scram_salt").is_none());
+    assert!(detail_value.get("scram_iterations").is_none());
+    assert!(detail_value.get("policy_revision").is_some());
+    assert!(detail_value.get("config_revision").is_some());
+    let list = value(&f.request(Origin::Network, Some(ALICE), "GET", "/v1/sessions", None));
+    for session in list.as_array().ok_or("missing session list")? {
+        assert!(session.get("scram_salt").is_none());
+        assert!(session.get("scram_iterations").is_none());
+    }
     let original = ScramVerifier::from_password("rotation-original", &params.0, params.1);
     for key in [original.stored_key, original.server_key] {
         assert!(
@@ -646,8 +650,13 @@ fn rotation_parameter_mismatch_is_atomic() -> TransportResult {
         &format!("/v1/sessions/{sid}"),
         None,
     ));
-    assert!(expired["scram_salt"].is_null());
-    assert!(expired["scram_iterations"].is_null());
+    assert!(expired.get("scram_salt").is_none());
+    assert!(expired.get("scram_iterations").is_none());
+    let list = value(&f.request(Origin::Network, Some(ALICE), "GET", "/v1/sessions", None));
+    for session in list.as_array().ok_or("missing session list")? {
+        assert!(session.get("scram_salt").is_none());
+        assert!(session.get("scram_iterations").is_none());
+    }
     Ok(())
 }
 
@@ -1496,30 +1505,30 @@ fn lifecycle_sink_failure_closes_access_and_preserves_refusal() {
         409,
         "session_ended",
     );
-    let renew = format!("/v1/sessions/{}/renew", f.sessions[0].to_hex());
+    let renew_id = f.sessions[0];
+    let renew = format!("/v1/sessions/{}/renew", renew_id.to_hex());
+    let before = f.ctx().authority.session(renew_id).unwrap();
+    let (salt, iterations) = f.ctx().authority.session_scram_params(renew_id).unwrap();
+    let rotation = nunya::mgmt::client::SessionSecret::generate_with(&salt, iterations).unwrap();
+    let renew_body = serde_json::json!({"mode":"read_only", "add_credential": {
+        "verifier":rotation.verifier, "secret_sha256":rotation.sha256_hex
+    }});
+    f.clock.fetch_add(100, Ordering::SeqCst);
     error_is(
-        f.post(ALICE, &renew, "failed-renew", serde_json::json!({})),
+        f.post(ALICE, &renew, "failed-renew", renew_body.clone()),
         503,
         "audit_unavailable",
     );
-    assert_eq!(
-        f.ctx()
-            .authority
-            .session(f.sessions[0])
-            .unwrap()
-            .revoke_reason,
-        Some(EndReason::AdminRevoked)
-    );
+    let after = f.ctx().authority.session(renew_id).unwrap();
+    assert_eq!(after.state, SessionState::Active);
+    assert_eq!(after.revoke_reason, None);
+    assert_eq!(after.expires_ms, before.expires_ms);
+    assert_eq!(after.last_used_ms, before.last_used_ms);
+    assert_eq!(after.mode, before.mode);
     assert!(
-        f.ctx()
+        !f.ctx()
             .authority
-            .admit(f.sessions[0], Operation::Read)
-            .is_err()
-    );
-    error_is(
-        f.post(ALICE, &renew, "failed-renew", serde_json::json!({})),
-        409,
-        "session_ended",
+            .check_session_secret(renew_id, rotation.secret.as_bytes())
     );
     let revoke = format!("/v1/sessions/{}/revoke", f.sessions[1].to_hex());
     error_is(
@@ -1581,6 +1590,56 @@ fn lifecycle_sink_failure_closes_access_and_preserves_refusal() {
         assert_eq!(records[0].kind, LifecycleKind::Revoked);
         assert_eq!(records[1].kind, LifecycleKind::PrincipalDisabled);
     }
+}
+
+#[test]
+fn renewal_audit_recovery_retries_same_key_once() -> TransportResult {
+    let f = Fixture::new();
+    let id = f.sessions[0];
+    let path = format!("/v1/sessions/{}/renew", id.to_hex());
+    let before = f.ctx().authority.session(id).ok_or("missing session")?;
+    let (salt, iterations) = f
+        .ctx()
+        .authority
+        .session_scram_params(id)
+        .ok_or("missing parameters")?;
+    let rotation = nunya::mgmt::client::SessionSecret::generate_with(&salt, iterations)?;
+    let body = serde_json::json!({"mode":"read_only", "add_credential": {
+        "verifier":rotation.verifier, "secret_sha256":rotation.sha256_hex
+    }});
+    f.clock.fetch_add(100, Ordering::SeqCst);
+    f.audit.failing.store(true, Ordering::SeqCst);
+    error_is(
+        f.post(ALICE, &path, "retry-renew", body.clone()),
+        503,
+        "audit_unavailable",
+    );
+    let after = f.ctx().authority.session(id).ok_or("missing session")?;
+    assert_eq!(after.state, SessionState::Active);
+    assert_eq!(after.expires_ms, before.expires_ms);
+    assert_eq!(after.last_used_ms, before.last_used_ms);
+    assert_eq!(after.mode, before.mode);
+    assert!(
+        !f.ctx()
+            .authority
+            .check_session_secret(id, rotation.secret.as_bytes())
+    );
+    assert!(assert_audit_material(&f).is_empty());
+    f.audit.failing.store(false, Ordering::SeqCst);
+    for _ in 0..2 {
+        let response = f.post(ALICE, &path, "retry-renew", body.clone());
+        assert_eq!(response.status(), 200);
+        assert_eq!(value(&response)["mode"], "read_only");
+        assert!(
+            f.ctx()
+                .authority
+                .check_session_secret(id, rotation.secret.as_bytes())
+        );
+        let records = assert_audit_material(&f);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, LifecycleKind::Renewed);
+    }
+    Ok(())
 }
 
 fn api_client(

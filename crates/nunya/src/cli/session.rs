@@ -24,6 +24,8 @@ const ENDED: &str = "the stored session has ended and its token scope was replac
 pub enum HelperError {
     /// Stored scope cannot be resumed.
     ScopeReplaced,
+    /// Rotation requires parameters from this helper's acquisition.
+    RotationUnavailable,
     /// Storage unavailable or insecure.
     Store,
     /// Unsupported helper format.
@@ -43,6 +45,9 @@ impl fmt::Display for HelperError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::ScopeReplaced => ENDED,
+            Self::RotationUnavailable => {
+                "this session was not acquired by this helper; acquire a new session instead"
+            }
             Self::Store => "session helper store unavailable or insecure",
             Self::Version => "unsupported session helper version",
             Self::Missing => "session context not found",
@@ -89,6 +94,12 @@ pub struct Context {
     /// Credential protected on drop.
     #[serde(with = "secret_serde")]
     pub secret: Zeroizing<String>,
+    /// Standard base64 SCRAM salt retained from acquisition.
+    #[serde(default)]
+    pub scram_salt: Option<String>,
+    /// SCRAM iteration count retained from acquisition.
+    #[serde(default)]
+    pub scram_iterations: Option<u32>,
     /// Scope identifier.
     pub scope: String,
     /// Expiration timestamp.
@@ -505,6 +516,8 @@ pub async fn acquire_or_resume(
         route: view.route,
         session_id: view.id,
         secret: secret.secret,
+        scram_salt: Some(secret.scram_salt),
+        scram_iterations: Some(secret.scram_iterations),
         scope: view.scope,
         expires_ms: view.expires_ms,
         pg_host: opts.pg_host.clone(),
@@ -515,6 +528,19 @@ pub async fn acquire_or_resume(
     store.put(&ctx)?;
     Ok(ctx)
 }
+fn rotation_parameters(ctx: &Context) -> Result<(Vec<u8>, u32), HelperError> {
+    let salt = ctx
+        .scram_salt
+        .as_deref()
+        .ok_or(HelperError::RotationUnavailable)?;
+    let iterations = ctx
+        .scram_iterations
+        .ok_or(HelperError::RotationUnavailable)?;
+    let salt = data_encoding::BASE64
+        .decode(salt.as_bytes())
+        .map_err(|_| ClientError::Decode)?;
+    Ok((salt, iterations))
+}
 /// Rotate a stored session credential while preserving its session and scope.
 pub async fn rotate(
     client: &MgmtClient,
@@ -522,15 +548,12 @@ pub async fn rotate(
     ctx: &mut Context,
     mode: Option<Mode>,
 ) -> Result<(), HelperError> {
+    let (salt, iterations) = rotation_parameters(ctx)?;
     let current = client.session(&ctx.session_id).await?;
     if current.state != SessionState::Active || current.scope != ctx.scope {
         return Err(HelperError::ScopeReplaced);
     }
-    let salt = data_encoding::BASE64
-        .decode(current.scram_salt.ok_or(ClientError::Decode)?.as_bytes())
-        .map_err(|_| ClientError::Decode)?;
-    let secret =
-        SessionSecret::generate_with(&salt, current.scram_iterations.ok_or(ClientError::Decode)?)?;
+    let secret = SessionSecret::generate_with(&salt, iterations)?;
     let view = client
         .renew(
             &ctx.session_id,
@@ -704,6 +727,8 @@ mod tests {
             route: "postgres".into(),
             session_id: "12".repeat(16),
             secret: Zeroizing::new("private-session-secret".into()),
+            scram_salt: None,
+            scram_iterations: None,
             scope: "34".repeat(16),
             expires_ms: 12345,
             pg_host: "localhost".into(),
@@ -711,6 +736,29 @@ mod tests {
             isolated: false,
             label: None,
         }
+    }
+    #[test]
+    fn rotation_requires_locally_stored_parameters() -> Result<(), Box<dyn std::error::Error>> {
+        let old = serde_json::to_value(context())?;
+        let mut old = old.as_object().ok_or("missing context object")?.clone();
+        old.remove("scram_salt");
+        old.remove("scram_iterations");
+        let mut ctx: Context = serde_json::from_value(serde_json::Value::Object(old))?;
+        for (salt, iterations) in [
+            (None, None),
+            (Some("c2FsdA==".into()), None),
+            (None, Some(4096)),
+        ] {
+            ctx.scram_salt = salt;
+            ctx.scram_iterations = iterations;
+            let err = rotation_parameters(&ctx).unwrap_err();
+            assert_eq!(err, HelperError::RotationUnavailable);
+            assert_eq!(
+                err.to_string(),
+                "this session was not acquired by this helper; acquire a new session instead"
+            );
+        }
+        Ok(())
     }
     #[test]
     fn management_refusal_display() {
