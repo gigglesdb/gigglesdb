@@ -480,3 +480,5 @@ mod parity_insert_duplicate_column;
 #[path = "parity_sequence_schema.rs"] mod parity_sequence_schema;
 
 #[path = "parity_native_check.rs"] mod parity_native_check;
+#[path = "isolation_levels.rs"]
+mod isolation_levels;

@@ -20,14 +20,6 @@ pub(super) fn hydrate(
     budget: &mut scan::Retention,
     parents_only: bool,
 ) -> Result<usize, CoreError> {
-    if edges
-        .values()
-        .flatten()
-        .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. }))
-    {
-        // Also reached by validate_pending at COMMIT / SET CONSTRAINTS.
-        sink.check_fk_snapshot()?;
-    }
     let mut added = 0;
     for (child_id, cs) in edges {
         for c in cs {
@@ -139,7 +131,7 @@ pub(super) fn hydrate(
                         || matches!(action, catalog_ext::Action::NoAction)
                             && *deferral == catalog_ext::Deferral::NotDeferrable);
                     let mut witnessed = false;
-                    sink.lookup(
+                    sink.fk_lookup(
                         &target,
                         target_columns,
                         converted.as_deref(),
@@ -201,10 +193,6 @@ pub(super) fn paged_pending(
     state: &Relational, deferred: &mut DeferralState, names: &[String], mode: bool,
     sink: &mut impl RowSink,
 ) -> Result<SqlResult, CoreError> {
-    // The isolation fence applies even when pending keys are absent at this snapshot.
-    if state.ext.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. })) {
-        sink.check_fk_snapshot()?;
-    }
     let mut selected = DeferralState { modes: deferred.modes.clone(), pending: BTreeMap::new() };
     state.set_constraints(&mut selected, names, mode, || crate::cancellation::check().is_err())
         .map_err(CoreError::Sql)?;
@@ -215,7 +203,7 @@ pub(super) fn paged_pending(
                     c.id == *id && (names.is_empty() || names.contains(&c.name))))).collect::<Vec<_>>();
             if checks.is_empty() { continue; }
             let mut after = None;
-            while let Some((last, rows)) = sink.read_page(table, after.take())? {
+            while let Some((last, rows)) = sink.fk_read_page(table, after.take())? {
                 after = Some(last);
                 let mut pending = DeferralState { modes: deferred.modes.clone(), pending: BTreeMap::new() };
                 for ((id, table_id), keys) in &checks {

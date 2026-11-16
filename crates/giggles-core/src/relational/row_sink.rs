@@ -55,9 +55,39 @@ pub(crate) trait RowSink {
     ) -> Result<BTreeSet<Vec<u8>>, CoreError> {
         Err(CoreError::Sql(SqlError::Unsupported))
     }
-    /// FK witnesses need a fresh snapshot after acquiring their table locks.
-    fn check_fk_snapshot(&self) -> Result<(), CoreError> {
-        Ok(())
+    /// FK witness lookup: `parent` probes the referenced row of a child row,
+    /// otherwise the referencing rows of a changed parent key. Sinks whose
+    /// snapshot can predate the FK table locks (REPEATABLE READ, SERIALIZABLE)
+    /// read witnesses as PostgreSQL's RI checks do (GD-0075 R5-76).
+    fn fk_lookup(
+        &mut self,
+        table: &TableDef,
+        columns: &[u64],
+        values: Option<&[Value]>,
+        parent: bool,
+        visit: &mut dyn FnMut(SqlRow) -> R<()>,
+    ) -> Result<(), CoreError> {
+        self.lookup(table, columns, values, parent, visit)
+    }
+    /// `read_page` of referencing rows queued for a NO ACTION check, read like
+    /// `fk_lookup`'s referencing rows.
+    fn fk_read_page(
+        &mut self,
+        table: &TableDef,
+        after: Option<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        self.read_page(table, after)
+    }
+    /// `child_page` for FK action discovery, read like `fk_lookup`'s
+    /// referencing rows.
+    fn fk_child_page(
+        &mut self,
+        table: &TableDef,
+        columns: &[u64],
+        values: &[Value],
+        after: Option<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        self.child_page(table, columns, values, after)
     }
 
     fn scan(

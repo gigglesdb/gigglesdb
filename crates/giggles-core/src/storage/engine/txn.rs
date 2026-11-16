@@ -165,6 +165,9 @@ pub(crate) struct Transaction {
     undo_bytes: usize,
     locked: BTreeSet<(Keyspace, Vec<u8>)>,
     reads: ReadSet,
+    /// The transaction snapshot, set aside while FK crosscheck reads run at the
+    /// latest committed state (GD-0075 R5-76); see `begin_latest`.
+    set_aside: Option<SnapshotHandle>,
     validation_config: ValidationConfig,
 }
 impl Transaction {
@@ -195,6 +198,7 @@ impl Transaction {
             undo_bytes: 0,
             locked: BTreeSet::new(),
             reads: ReadSet::default(),
+            set_aside: None,
             validation_config: ValidationConfig::default(),
         };
         if isolation == Isolation::ReadCommitted {
@@ -284,6 +288,39 @@ impl Transaction {
         }
         Ok(())
     }
+    /// Re-levels a transaction that has written, locked for write and recorded
+    /// no reads yet (SET TRANSACTION before the first query, GD-0075 R5-76).
+    /// The next read takes a fresh snapshot, as PostgreSQL takes it at the
+    /// first statement rather than at BEGIN.
+    pub(crate) fn set_isolation(&mut self, isolation: Isolation) -> Result<(), TxnError> {
+        if !self.writes.is_empty()
+            || !self.raw.is_empty()
+            || !self.locked.is_empty()
+            || !self.reads.points.is_empty()
+            || !self.reads.ranges.is_empty()
+        {
+            return Err(TxnError::Misuse);
+        }
+        self.isolation = isolation;
+        self.snapshot = None;
+        self.begin_statement();
+        Ok(())
+    }
+    /// Forgets the snapshot a statement took when PostgreSQL would run it
+    /// without one (LOCK TABLE before the first query, as pg_dump does): the
+    /// next statement then snapshots after the lock wait. Only for a
+    /// REPEATABLE READ or SERIALIZABLE transaction that has written and
+    /// locked no rows; reads recorded at the forgotten snapshot go too.
+    pub(crate) fn forget_unused_snapshot(&mut self) {
+        if self.isolation != Isolation::ReadCommitted
+            && self.writes.is_empty()
+            && self.raw.is_empty()
+            && self.locked.is_empty()
+        {
+            self.snapshot = None;
+            self.reads = ReadSet::default();
+        }
+    }
     pub(crate) fn begin_statement(&mut self) {
         if self.isolation == Isolation::ReadCommitted {
             self.snapshot = Some(self.seq.snapshot());
@@ -342,9 +379,29 @@ impl Transaction {
         self.locks.acquire(self.id, key, mode, deadline, cancel)?;
         Ok(())
     }
+    /// Reads at the latest committed state until `end_latest`, recording no
+    /// SERIALIZABLE reads; returns the transaction snapshot. FK checks at
+    /// REPEATABLE READ and SERIALIZABLE use it for PostgreSQL's RI crosscheck:
+    /// referencing rows are found in the latest state and fail with 40001 if
+    /// newer than the transaction snapshot (GD-0075 R5-76).
+    pub(crate) fn begin_latest(&mut self) -> Ts {
+        let ts = self.snapshot_ts();
+        debug_assert!(self.set_aside.is_none(), "nested latest-state reads");
+        self.set_aside = self.snapshot.replace(self.seq.snapshot());
+        ts
+    }
+    pub(crate) fn end_latest(&mut self) {
+        if let Some(snapshot) = self.set_aside.take() {
+            self.snapshot = Some(snapshot);
+        }
+    }
+    /// Whether a committed version of `key` is newer than `ts`.
+    pub(crate) fn changed_since(&self, ks: Keyspace, key: &[u8], ts: Ts) -> Result<bool, TxnError> {
+        Ok(mvcc::latest_version(self.seq.kv(), ks, key)?.is_some_and(|(latest, _)| latest > ts))
+    }
     pub(crate) fn get(&mut self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
         let ts = self.snapshot_ts();
-        if self.isolation == Isolation::Serializable {
+        if self.isolation == Isolation::Serializable && self.set_aside.is_none() {
             self.reads.points.insert((ks, key.to_vec()));
         }
         if let Some(value) = self.writes.get(&(ks, key.to_vec())) {
@@ -549,7 +606,7 @@ impl Transaction {
         Ok(TxnScan {
             base,
             own: own.peekable(),
-            reads: if self.isolation == Isolation::Serializable {
+            reads: if self.isolation == Isolation::Serializable && self.set_aside.is_none() {
                 Some(&mut self.reads)
             } else {
                 None

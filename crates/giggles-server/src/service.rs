@@ -433,6 +433,12 @@ impl Session {
     pub(crate) fn set_extra_float_digits(&mut self, value: i32) {
         self.sql.set_extra_float_digits(value);
     }
+    /// The level of transactions this session begins next (BEGIN without a
+    /// level, and statements outside a block): `default_transaction_isolation`.
+    pub(crate) fn set_default_isolation(&mut self, settings: &crate::pg_settings::Settings) {
+        self.sql
+            .set_isolation(crate::pg_transaction::sql_isolation(settings.default_isolation));
+    }
     fn reconcile_sequence_owners(&mut self) -> Result<(), CoreError> {
         if self.sql.in_transaction() || self.sequence_owner_candidates.is_empty() {
             return Ok(());

@@ -1558,26 +1558,34 @@ mod table_free_tests;
 mod ident_tests;
 
 #[test]
-fn fk_validation_rejects_non_read_committed_snapshot() {
+fn fk_validation_at_fixed_snapshots_crosschecks_witnesses() {
+    // GD-0075 R5-76: FK checks at REPEATABLE READ/SERIALIZABLE run at the
+    // transaction snapshot and fail 40001 only when a witness changed since it.
     for isolation in [Isolation::RepeatableRead, Isolation::Serializable] {
         let f = Fixture::new();
         f.execute("CREATE TABLE p(id int PRIMARY KEY)");
         f.execute("CREATE TABLE c(id int PRIMARY KEY, p int REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)");
-        f.execute("INSERT INTO p VALUES(1)");
+        f.execute("CREATE TABLE u(id int PRIMARY KEY)");
+        f.execute("INSERT INTO p VALUES(1),(2)");
         let mut s = f.admin().sql_session();
         s.execute("BEGIN", &[], None).unwrap();
         s.v2_transaction = Some(f.db().begin(isolation));
-        assert_eq!(
-            s.execute("INSERT INTO c VALUES(1,1)", &[], None),
-            Err(CoreError::Sql(SqlError::Conflict))
-        );
-        s.execute("ROLLBACK", &[], None).unwrap();
-        s.execute("BEGIN", &[], None).unwrap();
+        s.execute("INSERT INTO u VALUES(1)", &[], None).unwrap();
         s.execute("INSERT INTO c VALUES(1,1)", &[], None).unwrap();
         let mut pending = s.deferral.clone();
         let mut txn = f.db().begin(isolation);
+        validate_pending(f.db(), &mut txn, &mut pending).unwrap();
+        drop(txn);
+        s.execute("COMMIT", &[], None).unwrap();
+        // A parent deleted after the snapshot. PostgreSQL 18.6 fails the
+        // deferred check at COMMIT; the parent probe runs at the INSERT, so it
+        // fails there (published divergence, GD-0075 R5-77): same outcome, earlier.
+        s.execute("BEGIN", &[], None).unwrap();
+        s.v2_transaction = Some(f.db().begin(isolation));
+        s.execute("SELECT count(*) FROM u", &[], None).unwrap();
+        f.execute("DELETE FROM p WHERE id = 2");
         assert_eq!(
-            validate_pending(f.db(), &mut txn, &mut pending),
+            s.execute("INSERT INTO c VALUES(2,2)", &[], None),
             Err(CoreError::Sql(SqlError::Conflict))
         );
         s.execute("ROLLBACK", &[], None).unwrap();

@@ -406,9 +406,6 @@ pub(super) fn cascade(
     clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink,
     deferred: Option<&mut DeferralState>, version_end: u64,
 ) -> Result<SqlResult, CoreError> {
-    if state.ext.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. })) {
-        sink.check_fk_snapshot()?;
-    }
     let pk_move = moves_primary_key(state, prepared);
     let pending = deferred.as_deref().cloned().unwrap_or_default();
     let table = state.tables[prepared.table().unwrap()].clone();
@@ -478,7 +475,7 @@ pub(super) fn cascade(
                 let child = state.tables.values().find(|t| t.id == child_id).unwrap().clone();
                 let mut no_action = DeferralState::default();
                 let mut after = None;
-                while let Some((last, rows)) = sink.child_page(&child, columns, &values, after)? {
+                while let Some((last, rows)) = sink.fk_child_page(&child, columns, &values, after)? {
                     after = Some(last);
                     if !rows.is_empty() && *action == catalog_ext::Action::Restrict {
                         return Err(CoreError::Sql(SqlError::RestrictViolation));

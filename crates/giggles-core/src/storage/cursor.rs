@@ -138,9 +138,12 @@ impl SqlSession {
                 Backend::V2(db) => {
                     // The existing transaction API cannot fork its write overlay.
                     // Keep read-your-writes correct via the bounded bridge fallback.
+                    // SERIALIZABLE reads must enter the read set validated at COMMIT,
+                    // which the snapshot source below bypasses (GD-0075 R5-76).
                     if self.v2_transaction.as_ref().is_some_and(|t| {
                         t.writes_keyspace(engine::kv::Keyspace::Rows)
                             || t.writes_keyspace(engine::kv::Keyspace::Index)
+                            || t.isolation() == engine::txn::Isolation::Serializable
                     }) {
                         return self.buffer_cursor(&p, params, clock, buffer_limit);
                     }

@@ -219,6 +219,9 @@ impl SqlSession {
                                 .iter()
                                 .map(|(&id, def)| (id, def.incarnation))
                                 .collect();
+                            // The baseline read used a READ COMMITTED snapshot; the
+                            // requested level takes its own at the first statement.
+                            txn.set_isolation(self.isolation.engine())?;
                             inner
                                 .sql_transactions
                                 .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -326,7 +329,7 @@ impl SqlSession {
                     let mut implicit = None;
                     let txn = match &mut self.v2_transaction {
                         Some(txn) => txn,
-                        None => implicit.insert(db.begin(Isolation::ReadCommitted)),
+                        None => implicit.insert(db.begin(self.isolation.engine())),
                     };
                     if !self.copy_input.as_ref().is_some_and(|input| input.started) {
                         txn.begin_statement();
@@ -463,8 +466,8 @@ impl SqlSession {
                             && let Some(table) =
                                 target_name.as_ref().and_then(|name| parts.tables.get(name))
                         {
-                            // Shared bounded writers still exclude every paged,
-                            // unsupported conflict/action, COPY and fixed-snapshot writer. Actual
+                            // Shared bounded writers still exclude every READ COMMITTED
+                            // paged, unsupported conflict/action and COPY writer. Actual
                             // target rows are locked in physical order BEFORE refreshing.
                             let candidates = (expected_version.is_none()
                                 && self.copy_input.is_none()
@@ -507,7 +510,16 @@ impl SqlSession {
                                 } else { BTreeSet::new() };
                                 Some((physical, witnesses))
                             }).flatten();
-                            let shared = append || candidates.is_some() || upsert.is_some();
+                            // REPEATABLE READ and SERIALIZABLE writers lock rows, not the
+                            // table: lock_for_write fails with 40001 on any row changed
+                            // since their fixed snapshot, so concurrent writers of other
+                            // rows proceed, as in PostgreSQL (GD-0075 R5-76). READ
+                            // COMMITTED paged writers re-read latest rows and need the
+                            // exclusive sentinel.
+                            let fixed_snapshot = txn.isolation() != Isolation::ReadCommitted
+                                && expected_version.is_none()
+                                && self.copy_input.is_none();
+                            let shared = fixed_snapshot || append || candidates.is_some() || upsert.is_some();
                             txn.lock_sql_sentinel(table.id,
                                 if shared { LockMode::Shared } else { LockMode::Exclusive },
                                 &|| crate::cancellation::check().is_err())?;
@@ -971,6 +983,32 @@ fn charge_mutation_point(table: &TableDef, row: &SqlRow,
     Ok(retention.charge(bytes).is_ok() && retention.used() <= 256 * 1024)
 }
 
+impl SqlRows<'_> {
+    /// Whether the committed version of `row` is newer than `ts`.
+    fn fk_changed(&self, table: &TableDef, row: &[relational::Value], ts: engine::hlc::Ts)
+        -> Result<bool, CoreError> {
+        let pk = table.primary_key.iter().map(|i| row[*i].clone()).collect::<Vec<_>>();
+        let mut physical = table.id.to_be_bytes().to_vec();
+        physical.extend(codec::pk_bytes(&pk)?);
+        Ok(self.txn.changed_since(Keyspace::Rows, &physical, ts)?)
+    }
+    /// Runs `read` at the latest committed state when the snapshot is fixed
+    /// (REPEATABLE READ, SERIALIZABLE), as PostgreSQL's RI queries for
+    /// referencing rows do: a referencing row committed since the snapshot is a
+    /// witness (23503/23001), and an action that writes it fails with 40001 in
+    /// lock_for_write. READ COMMITTED's statement snapshot is already latest.
+    fn at_latest<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T, CoreError>)
+        -> Result<T, CoreError> {
+        if self.txn.isolation() == Isolation::ReadCommitted {
+            return read(self);
+        }
+        self.txn.begin_latest();
+        let result = read(self);
+        self.txn.end_latest();
+        result
+    }
+}
+
 impl RowSink for SqlRows<'_> {
     fn mutation_keys(
         &mut self, state: &relational::Relational, prepared: &relational::Prepared,
@@ -985,11 +1023,48 @@ impl RowSink for SqlRows<'_> {
         if let Some(error) = source.error.into_inner() { return Err(error); }
         result.map_err(CoreError::Sql)
     }
-    fn check_fk_snapshot(&self) -> Result<(), CoreError> {
-        if self.txn.isolation() != Isolation::ReadCommitted {
-            return Err(CoreError::Sql(SqlError::Conflict));
+    // READ COMMITTED takes the statement snapshot after every FK table lock, so
+    // witnesses are current. A REPEATABLE READ or SERIALIZABLE snapshot can
+    // predate commits by the writers those locks waited for. The Share and
+    // RowExclusive locks are held to transaction end, so the latest committed
+    // state of every FK-connected table is final for this transaction. As in
+    // PostgreSQL 18 (r5/e/oracle/fk-race.out): the parent row of a child is
+    // read at the snapshot and fails with 40001 if changed since (FOR KEY
+    // SHARE); referencing rows of a parent key are read at the latest state.
+    fn fk_lookup(
+        &mut self, table: &TableDef, columns: &[u64], values: Option<&[relational::Value]>,
+        parent: bool, visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
+    ) -> Result<(), CoreError> {
+        if self.txn.isolation() == Isolation::ReadCommitted {
+            return self.lookup(table, columns, values, parent, visit);
         }
-        Ok(())
+        let ts = self.txn.snapshot_ts();
+        if parent {
+            // A parent the snapshot sees must not have changed since. One
+            // inserted later stays invisible, and the child fails with 23503.
+            let mut seen = Vec::new();
+            self.lookup(table, columns, values, true, &mut |row| {
+                seen.push(row.values.clone());
+                visit(row)
+            })?;
+            for values in seen {
+                if self.fk_changed(table, &values, ts)? {
+                    return Err(CoreError::Sql(SqlError::Conflict));
+                }
+            }
+            return Ok(());
+        }
+        self.at_latest(|rows| rows.lookup(table, columns, values, false, visit))
+    }
+    fn fk_child_page(
+        &mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
+        after: Option<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        self.at_latest(|rows| rows.child_page(table, columns, values, after))
+    }
+    fn fk_read_page(&mut self, table: &TableDef, after: Option<Vec<u8>>)
+        -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        self.at_latest(|rows| rows.read_page(table, after))
     }
 
     fn streams_index_builds(&self) -> bool {
