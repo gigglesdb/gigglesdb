@@ -6,6 +6,7 @@ setup can provision an already-running emulator via its loopback REST endpoint.
 """
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -164,18 +165,21 @@ def run(task_root, spike, cargo_test=""):
             bash = shutil.which("bash", path=str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin")) or "bash"
             if cargo_test:
                 env["SKEDADDLE_SPANNER_CONFIG"] = str(config_path)
-                # Match the caller's stable lane; never run concurrent cargo there.
-                lock = Path("J:/gigglesdb-work/lead-a/build.lock")
-                with lock.open("x", encoding="utf-8") as owner:
-                    owner.write(str(os.getpid()))
-                    owner.flush()
+                # A caller holding its lane lock may explicitly skip reacquisition.
+                lock = Path(env.get("SKEDADDLE_LANE_LOCK") or task / "build.lock")
+                held = env.get("SKEDADDLE_LANE_LOCK_HELD") == "1"
+                with nullcontext() if held else lock.open("x", encoding="utf-8") as owner:
                     try:
+                        if owner is not None:
+                            owner.write(str(os.getpid()))
+                            owner.flush()
                         subprocess.run([bash, "J:/gigglesdb-work/r2/buildslot2.sh", "cargo", "test",
                                         *shlex.split(cargo_test)], cwd=HARNESS.parent,
                                        env=env, stderr=subprocess.STDOUT, check=True)
                     finally:
-                        owner.close()
-                        lock.unlink()
+                        if owner is not None:
+                            owner.close()
+                            lock.unlink()
             else:
                 subprocess.run([bash, "J:/gigglesdb-work/r2/buildslot2.sh", "cargo", "run",
                                 "--locked", "--manifest-path", str(Path(spike).resolve())],

@@ -10,6 +10,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub struct Client {
     database: DatabaseClient,
     endpoint: SpannerEndpoint,
+    host: Option<String>,
 }
 impl Client {
     /// Explicit host takes precedence over SPANNER_EMULATOR_HOST; otherwise ADC.
@@ -22,6 +23,7 @@ impl Client {
             return Err("emulator endpoint requires a host".into());
         }
         let mut builder = Spanner::builder();
+        let mut resolved_host = None;
         if let Some(host) = host {
             let host = host.trim();
             if host.is_empty() {
@@ -32,6 +34,7 @@ impl Client {
             } else {
                 format!("http://{host}")
             };
+            resolved_host = Some(url.clone());
             builder = builder.with_endpoint(url).with_credentials(
                 google_cloud_auth::credentials::anonymous::Builder::new().build(),
             );
@@ -44,7 +47,11 @@ impl Client {
         Ok(Self {
             database: spanner.database_client(name).build().await?,
             endpoint: endpoint.clone(),
+            host: resolved_host,
         })
+    }
+    pub(crate) fn snapshot_connection(&self) -> (&DatabaseClient, &SpannerEndpoint, Option<&str>) {
+        (&self.database, &self.endpoint, self.host.as_deref())
     }
     /// The bounded query includes its start timestamp, including on reconnect.
     pub async fn change_stream(

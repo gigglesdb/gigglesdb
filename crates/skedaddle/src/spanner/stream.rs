@@ -90,7 +90,30 @@ fn recovery(error: &ClientError) -> bool {
 }
 enum Message {
     Record(Token, Record),
-    Done(Token, Result<(), ClientError>),
+    Done(Token, Timestamp, Result<(), ClientError>),
+}
+fn query_start(p: &Partition, completed: &BTreeMap<Token, Timestamp>) -> Timestamp {
+    completed
+        .get(&p.token)
+        .copied()
+        .unwrap_or(p.processed_ts)
+        .max(p.processed_ts)
+}
+fn certify(progress: &mut BTreeMap<Token, Timestamp>, token: Token, ts: Timestamp, data: bool) {
+    let ts = if data { ts.saturating_sub(1) } else { ts };
+    progress
+        .entry(token)
+        .and_modify(|old| *old = (*old).max(ts))
+        .or_insert(ts);
+}
+fn can_finish(frontier: &Frontier, token: &[u8]) -> bool {
+    let mut children = frontier
+        .records()
+        .values()
+        .filter(|p| p.parents.contains(token))
+        .peekable();
+    children.peek().is_some()
+        && children.all(|p| frontier.records()[token].processed_ts >= p.start_ts)
 }
 fn readable(
     frontier: &Frontier,
@@ -118,6 +141,11 @@ pub struct PartitionReader {
     config: Config,
     snapshot: Timestamp,
     frontier: Frontier,
+    certified: BTreeMap<Token, Timestamp>,
+    // Successful bounded queries consumed their whole interval, even if they
+    // returned only data. Keep their next read bound separate from observed
+    // progress: completion alone must never certify a durable frontier.
+    completed_queries: BTreeMap<Token, Timestamp>,
     duplicates: DuplicateFilter,
     tx: mpsc::Sender<Message>,
     rx: mpsc::Receiver<Message>,
@@ -154,11 +182,27 @@ impl PartitionReader {
             return Err(Error::InvalidConfig);
         }
         let (tx, rx) = mpsc::channel(config.channel_capacity);
+        let certified = frontier
+            .records()
+            .iter()
+            .map(|(t, p)| {
+                (
+                    t.clone(),
+                    if p.state == State::Finished {
+                        p.processed_ts
+                    } else {
+                        p.processed_ts.saturating_sub(1).max(snapshot)
+                    },
+                )
+            })
+            .collect();
         Ok(Self {
             client,
             config,
             snapshot,
             frontier,
+            certified,
+            completed_queries: BTreeMap::new(),
             duplicates,
             tx,
             rx,
@@ -172,18 +216,36 @@ impl PartitionReader {
     pub fn duplicate_drops(&self) -> u64 {
         self.duplicates.drops
     }
+    /// Data alone never certifies the rest of its commit timestamp. Children
+    /// start conservatively, including on inclusive restart. Raw progress stays
+    /// unchanged; only actual heartbeat timestamps certify, even after retries.
+    pub fn certified_ts(&self) -> Result<Option<Timestamp>, Error> {
+        self.frontier.resolved_ts()?;
+        Ok(self
+            .frontier
+            .records()
+            .values()
+            .filter(|p| p.state != State::Finished)
+            .map(|p| {
+                self.certified
+                    .get(&p.token)
+                    .copied()
+                    .unwrap_or(p.start_ts.saturating_sub(1).max(self.snapshot))
+            })
+            .min())
+    }
     fn schedule(&mut self) -> Result<(), Error> {
         let ready = readable(&self.frontier, &self.tasks)?;
         for p in ready
             .into_iter()
             .take(self.config.concurrency.saturating_sub(self.tasks.len()))
         {
-            let start = cloud(p.processed_ts)?;
-            let end = cloud(
-                p.processed_ts
-                    .checked_add(self.config.query_window.as_nanos() as i128)
-                    .ok_or(Error::InvalidConfig)?,
-            )?;
+            let start_ts = query_start(&p, &self.completed_queries);
+            let start = cloud(start_ts)?;
+            let end_ts = start_ts
+                .checked_add(self.config.query_window.as_nanos() as i128)
+                .ok_or(Error::InvalidConfig)?;
+            let end = cloud(end_ts)?;
             let token = if p.token.is_empty() {
                 None
             } else {
@@ -225,7 +287,7 @@ impl PartitionReader {
                         Ok(())
                     }
                     .await;
-                    let _ = tx.send(Message::Done(key, result)).await;
+                    let _ = tx.send(Message::Done(key, end_ts, result)).await;
                 }),
             );
         }
@@ -246,6 +308,7 @@ impl PartitionReader {
                     if ts <= self.snapshot {
                         continue;
                     }
+                    certify(&mut self.certified, token.clone(), ts, true);
                     if !self.duplicates.admit(
                         record.server_transaction_id.as_bytes().to_vec(),
                         record.record_sequence.as_bytes().to_vec(),
@@ -257,6 +320,12 @@ impl PartitionReader {
                     return Ok(Event::Data(record, token));
                 }
                 Message::Record(token, Record::Heartbeat(record)) => {
+                    certify(
+                        &mut self.certified,
+                        token.clone(),
+                        timestamp(record.timestamp),
+                        false,
+                    );
                     let ts = timestamp(record.timestamp)
                         .max(self.frontier.records()[&token].processed_ts);
                     self.frontier.advance(&token, ts)?;
@@ -289,10 +358,12 @@ impl PartitionReader {
                     )?;
                     return Ok(Event::Children(token, start, record.child_partitions));
                 }
-                Message::Done(token, result) => {
+                Message::Done(token, end_ts, result) => {
                     self.tasks.remove(&token);
                     match result {
                         Err(cause) => {
+                            // Failed reads retry inclusively from observed progress.
+                            self.completed_queries.remove(&token);
                             if recovery(&cause) {
                                 return Err(Error::RecoveryRequired { token, cause });
                             }
@@ -308,15 +379,23 @@ impl PartitionReader {
                         }
                         Ok(()) => {
                             self.retries.remove(&token);
-                            if self
-                                .frontier
-                                .records()
-                                .values()
-                                .any(|p| p.parents.contains(&token))
-                            {
+                            // A clamped restart retains children ahead of this
+                            // bounded query. Re-read up to their start before ending.
+                            if can_finish(&self.frontier, &token) {
+                                self.completed_queries.remove(&token);
                                 self.frontier.finish(&token)?;
+                                certify(
+                                    &mut self.certified,
+                                    token.clone(),
+                                    self.frontier.records()[&token].processed_ts,
+                                    false,
+                                );
                                 return Ok(Event::PartitionEnd(token));
                             }
+                            // Done follows every record from this worker. Reuse
+                            // the inclusive end as the next start, retaining any
+                            // records exactly on the shared window boundary.
+                            self.completed_queries.insert(token, end_ts);
                         }
                     }
                 }
@@ -334,7 +413,72 @@ impl Drop for PartitionReader {
 
 #[cfg(test)]
 mod tests {
+    use super::super::frontier::SpannerPosition;
     use super::*;
+    #[test]
+    fn completed_window_advances_queries_without_certifying_or_changing_restart() {
+        let mut raw = Frontier::new(10);
+        raw.mark_reading(b"").unwrap();
+        raw.advance(b"", 20).unwrap();
+        let mut certified = BTreeMap::new();
+        certify(&mut certified, vec![], 20, true);
+        let mut completed = BTreeMap::new();
+        assert_eq!(query_start(&raw.records()[&vec![]], &completed), 20);
+
+        // A data-only query over [10,30] ended successfully. Re-reading [20,30]
+        // forever can keep returning the final data record without a heartbeat.
+        completed.insert(vec![], 30);
+        assert_eq!(query_start(&raw.records()[&vec![]], &completed), 30);
+        assert_eq!(raw.resolved_ts().unwrap(), Some(20));
+        assert_eq!(certified[&vec![]], 19, "completion is not certification");
+        raw.advance(b"", 30).unwrap();
+        assert_eq!(
+            query_start(&raw.records()[&vec![]], &completed),
+            30,
+            "the common window endpoint stays inclusive"
+        );
+
+        // A partial failed read must retry its last timestamp inclusively.
+        raw.advance(b"", 40).unwrap();
+        completed.remove(&vec![]);
+        assert_eq!(query_start(&raw.records()[&vec![]], &completed), 40);
+        let SpannerPosition::Frontier(restored) =
+            SpannerPosition::decode(&SpannerPosition::Frontier(raw).encode()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            query_start(&restored.records()[&vec![]], &BTreeMap::new()),
+            40,
+            "restart discards in-memory query bounds and rereads inclusively"
+        );
+    }
+    #[test]
+    fn clamped_parent_rereads_before_finishing() {
+        let mut raw = Frontier::new(0);
+        raw.mark_reading(b"").unwrap();
+        raw.advance(b"", 30).unwrap();
+        raw.register_children(b"", vec![child(b"a", &[b""], 30)])
+            .unwrap();
+        raw.finish(b"").unwrap();
+        let mut replay = raw.clamped(10).unwrap();
+        assert!(!can_finish(&replay, b""));
+        replay.advance(b"", 20).unwrap();
+        assert!(!can_finish(&replay, b""));
+        replay.advance(b"", 30).unwrap();
+        assert!(can_finish(&replay, b""));
+        replay.finish(b"").unwrap();
+    }
+    #[test]
+    fn data_and_actual_heartbeat_certification() {
+        let mut progress = BTreeMap::new();
+        certify(&mut progress, vec![], 10, true);
+        assert_eq!(progress[&vec![]], 9);
+        certify(&mut progress, vec![], 8, false);
+        assert_eq!(progress[&vec![]], 9);
+        certify(&mut progress, vec![], 10, false);
+        assert_eq!(progress[&vec![]], 10);
+    }
     fn child(t: &[u8], parents: &[&[u8]], ts: Timestamp) -> Partition {
         Partition::registered(t.to_vec(), parents.iter().map(|p| p.to_vec()).collect(), ts)
     }

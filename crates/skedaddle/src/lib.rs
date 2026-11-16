@@ -20,6 +20,7 @@ pub mod rollback;
 pub mod runner;
 pub mod security;
 pub mod spanner;
+pub mod spanner_dest;
 pub mod status;
 pub mod verify;
 

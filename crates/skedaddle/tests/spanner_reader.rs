@@ -1,3 +1,6 @@
+#[path = "support/spanner.rs"]
+mod spanner_support;
+
 use serde_json::Value;
 use skedaddle::{
     definition::{SecretRef, SpannerDialect, SpannerEndpoint},
@@ -28,6 +31,8 @@ async fn both_dialects_reader() -> Result<(), Box<dyn std::error::Error + Send +
         ("GOOGLE_STANDARD_SQL", SpannerDialect::GoogleSql),
         ("POSTGRESQL", SpannerDialect::Postgresql),
     ] {
+        let isolated = spanner_support::Database::create(config.clone(), name).await?;
+        let config = isolated.config();
         let endpoint = SpannerEndpoint {
             project: config["project"].as_str().unwrap().into(),
             instance: config["instance"].as_str().unwrap().into(),

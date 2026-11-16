@@ -1,5 +1,6 @@
 """GD-0064 M1: one real MySQL variant, with exact-label teardown in finally."""
 import datetime
+from contextlib import nullcontext
 import json
 import os
 import pathlib
@@ -139,12 +140,14 @@ def main():
                        "--default-character-set=utf8mb4", "-Nse", sql)
         save("setup-probe.txt", probe.stdout)
         if cargo_test:
-            # The fixed lane must never overlap another build in this coordinator.
-            lane_lock = pathlib.Path(os.environ.get("SKEDADDLE_LANE_LOCK", "J:/gigglesdb-work/lead-a/build.lock"))
-            with lane_lock.open("x", encoding="utf8") as owner:
+            # A caller holding its lane lock may explicitly skip reacquisition.
+            lane_lock = pathlib.Path(env.get("SKEDADDLE_LANE_LOCK") or task / "build.lock")
+            held = env.get("SKEDADDLE_LANE_LOCK_HELD") == "1"
+            with nullcontext() if held else lane_lock.open("x", encoding="utf8") as owner:
                 try:
-                    owner.write(str(os.getpid()))
-                    owner.flush()
+                    if owner is not None:
+                        owner.write(str(os.getpid()))
+                        owner.flush()
                     args = ["C:/Program Files/Git/bin/bash.exe",
                             "J:/gigglesdb-work/r2/buildslot2.sh", "cargo", "test", "-p", "skedaddle",
                             *shlex.split(cargo_test)]
@@ -153,8 +156,9 @@ def main():
                     print(result.stderr, file=sys.stderr, end="", flush=True)
                     return result.returncode
                 finally:
-                    owner.close()
-                    lane_lock.unlink()
+                    if owner is not None:
+                        owner.close()
+                        lane_lock.unlink()
         spike = pathlib.Path(spike_arg) if spike_arg else None
         if not spike or not spike.is_file():
             print("SKIP Rust client spike: supply -MysqlSpike <built standalone spike.exe>", flush=True)

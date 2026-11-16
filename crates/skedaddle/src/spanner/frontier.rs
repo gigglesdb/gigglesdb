@@ -68,6 +68,45 @@ impl Frontier {
     pub fn records(&self) -> &BTreeMap<Token, Partition> {
         &self.records
     }
+    /// D-A3/D-A3.1: inclusive restart, retaining read-ahead lineage.
+    pub fn clamped(&self, boundary: Timestamp) -> Result<Self> {
+        self.validate()?;
+        self.resolved_ts()?;
+        let mut next = self.clone();
+        for p in next.records.values_mut() {
+            if p.state == State::Finished && p.processed_ts > boundary {
+                p.state = State::Reading;
+            }
+            p.processed_ts = p.processed_ts.min(boundary.max(p.start_ts));
+        }
+        let mut visited = BTreeSet::new();
+        while visited.len() < next.records.len() {
+            let ready: Vec<_> = next
+                .records
+                .values()
+                .filter(|p| !visited.contains(&p.token) && p.parents.is_subset(&visited))
+                .map(|p| p.token.clone())
+                .collect();
+            if ready.is_empty() {
+                return Err(Error::Encoding);
+            }
+            for token in ready {
+                let p = &next.records[&token];
+                if p.state != State::Registered
+                    && p.parents
+                        .iter()
+                        .any(|t| next.records[t].processed_ts < p.start_ts)
+                {
+                    let p = next.records.get_mut(&token).unwrap();
+                    p.state = State::Registered;
+                    p.processed_ts = p.start_ts;
+                }
+                visited.insert(token);
+            }
+        }
+        next.validate()?;
+        Ok(next)
+    }
     fn partition(&self, token: &[u8]) -> Result<&Partition> {
         self.records
             .get(token)
@@ -664,6 +703,66 @@ mod tests {
             Err(Error::MissingPartition(b"missing".to_vec()))
         );
         assert!(f.finish(b"a").is_err());
+    }
+    #[test]
+    fn clamp_read_ahead_lineage_needs_a_child_state_decision() {
+        for finished in [false, true] {
+            let mut f = Frontier::new(0);
+            f.mark_reading(b"").unwrap();
+            f.register_children(
+                b"",
+                vec![child(b"branch", &[b""], 0), child(b"slow", &[b""], 0)],
+            )
+            .unwrap();
+            f.finish(b"").unwrap();
+            f.mark_reading(b"branch").unwrap();
+            f.advance(b"branch", 10).unwrap();
+            f.register_children(b"branch", vec![child(b"a", &[b"branch"], 10)])
+                .unwrap();
+            f.finish(b"branch").unwrap();
+            f.mark_reading(b"a").unwrap();
+            f.advance(b"a", 30).unwrap();
+            if finished {
+                f.register_children(b"a", vec![child(b"next", &[b"a"], 30)])
+                    .unwrap();
+                f.finish(b"a").unwrap();
+                f.mark_reading(b"next").unwrap();
+                f.advance(b"next", 40).unwrap();
+            }
+            f.mark_reading(b"slow").unwrap();
+            f.advance(b"slow", 5).unwrap();
+            f.validate().unwrap();
+            assert_eq!(f.resolved_ts().unwrap(), Some(5));
+
+            let clamped = f.clamped(5).unwrap();
+            assert_eq!(clamped.records.len(), f.records.len());
+            assert_eq!(clamped.records[b"branch".as_slice()].state, State::Reading);
+            assert_eq!(clamped.records[b"a".as_slice()].state, State::Registered);
+            assert_eq!(clamped.records[b"a".as_slice()].processed_ts, 10);
+            if finished {
+                assert_eq!(clamped.records[b"next".as_slice()].state, State::Registered);
+                assert_eq!(clamped.records[b"next".as_slice()].processed_ts, 30);
+            }
+            let encoded = SpannerPosition::Frontier(clamped.clone()).encode();
+            assert_eq!(
+                SpannerPosition::decode(&encoded).unwrap(),
+                SpannerPosition::Frontier(clamped.clone())
+            );
+            for boundary in [5, 10, 20, 30] {
+                let next = f.clamped(boundary).unwrap();
+                assert!(matches!(
+                    compare(
+                        SpannerPosition::Frontier(clamped.clone()),
+                        SpannerPosition::Frontier(next)
+                    ),
+                    Ok(Ordering::Less | Ordering::Equal)
+                ));
+            }
+            assert_eq!(
+                f.clamped(10).unwrap().records[b"branch".as_slice()].state,
+                State::Finished
+            );
+        }
     }
     #[test]
     fn duplicate_count_restore_and_memory_bound() {

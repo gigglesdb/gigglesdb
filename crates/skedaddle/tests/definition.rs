@@ -1455,3 +1455,24 @@ fn destination_acknowledgments_are_optional_strict_and_digest_compatible() {
     value["fence_plan"]["unknown_destination_field"] = json!([]);
     assert!(matches!(parse_value(&value), Err(DefinitionError::Json(_))));
 }
+
+#[tokio::test]
+async fn live_spanner_seam_without_connections_preserves_offline_report() {
+    for dialect in ["google-sql", "postgresql"] {
+        for side in ["source", "destination"] {
+            let mut value = example_value();
+            value[side] = spanner_connection(dialect);
+            let definition = parse_value(&value).unwrap();
+            let offline = CapabilityReport::from_definition(&definition).unwrap();
+            let live = CapabilityReport::inspect_spanner(
+                &definition,
+                None,
+                &skedaddle::spanner::preflight::Options::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(offline, live);
+        }
+    }
+}

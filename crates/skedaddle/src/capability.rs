@@ -1,5 +1,5 @@
-//! Offline capability declarations. An accepted definition is not proof of
-//! database readiness; P1 cannot produce live inspection evidence.
+//! Offline declarations and explicit live Spanner inspection. An accepted
+//! definition or emulator result is not proof of production readiness.
 
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,75 @@ pub struct CapabilityReport {
 }
 
 impl CapabilityReport {
+    /// Explicit live inspection seam. Missing connections preserve the offline
+    /// declarations; inspection errors fail closed and never qualify production.
+    /// Caller binds the destination DatabaseClient to the declared database (the
+    /// official client exposes no database-name accessor).
+    pub async fn inspect_spanner(
+        definition: &MigrationDefinition,
+        source: Option<&crate::spanner::client::Client>,
+        source_options: &crate::spanner::preflight::Options,
+        destination: Option<(
+            &crate::pg::preflight::Snapshot,
+            &crate::spanner_dest::apply::Destination,
+            &crate::spanner_dest::preflight::Options,
+        )>,
+    ) -> Result<Self, crate::spanner::client::Error> {
+        let mut report = Self::from_definition(definition)?;
+        let replace = |items: &mut Vec<CapabilityItem>, side: &str| {
+            items.retain(|i| {
+                ![
+                    "connector_cdc_ordering",
+                    "snapshot_consistency",
+                    "schema_type_mapping",
+                ]
+                .iter()
+                .any(|c| i.id == format!("{side}.spanner.{c}"))
+            });
+        };
+        if let Some(client) = source {
+            let declared = definition
+                .source
+                .spanner
+                .as_ref()
+                .ok_or("source is not Spanner")?;
+            if definition.source.engine != Engine::Spanner
+                || client.snapshot_connection().1 != declared
+            {
+                return Err("live source endpoint differs from definition".into());
+            }
+            let source_report = crate::spanner::preflight::inspect(
+                client,
+                &definition.selected_objects,
+                source_options,
+            )
+            .await?;
+            replace(&mut report.items, "source");
+            report.items.extend(source_report.capability_items());
+        }
+        if let Some((snapshot, connection, options)) = destination {
+            let declared = definition
+                .destination
+                .spanner
+                .as_ref()
+                .ok_or("destination is not Spanner")?;
+            if definition.destination.engine != Engine::Spanner
+                || connection.dialect != declared.dialect
+            {
+                return Err("live destination endpoint differs from definition".into());
+            }
+            let destination_report = crate::spanner_dest::preflight::inspect(
+                snapshot,
+                &definition.selected_objects,
+                connection,
+                options,
+            )
+            .await?;
+            replace(&mut report.items, "destination");
+            report.items.extend(destination_report.capability_items());
+        }
+        Ok(report)
+    }
     /// All critical items except the two affirmative statuses block preflight,
     /// regardless of whether evidence was sampled.
     pub fn blocking(&self) -> Vec<&CapabilityItem> {
