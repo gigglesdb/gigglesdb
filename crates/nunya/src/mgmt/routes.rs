@@ -3,7 +3,7 @@ use super::auth::{Origin, authenticate};
 use crate::{
     pgwire::auth::ScramVerifier,
     state::{
-        authority::{Authority, AuthorityError},
+        authority::{AcquireRequest, Authority, AuthorityError},
         model::*,
     },
     token::{PrincipalId, SessionId},
@@ -13,7 +13,7 @@ use http::{
     HeaderMap, Request, Response, StatusCode,
     header::{CONTENT_TYPE, WWW_AUTHENTICATE},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{fmt, sync::Arc};
 
@@ -115,6 +115,95 @@ fn session_view(ctx: &MgmtContext, s: &AccessSession) -> Value {
         "idle_timeout_ms":s.idle_timeout_ms, "last_used_ms":s.last_used_ms,
         "revoke_reason":s.revoke_reason.map(EndReason::as_str), "label":s.label,
         "isolated":s.isolated, "scope":s.scope, "scope_continuity":ctx.authority.scope_continuous(s)})
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcquireBody {
+    route: String,
+    mode: Option<Mode>,
+    lifetime: Option<String>,
+    #[serde(default)]
+    isolated: bool,
+    label: Option<String>,
+    verifier: String,
+    secret_sha256: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialBody {
+    verifier: String,
+    secret_sha256: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenewBody {
+    mode: Option<Mode>,
+    add_credential: Option<CredentialBody>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeBody {}
+impl fmt::Debug for AcquireBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AcquireBody { [REDACTED] }")
+    }
+}
+impl fmt::Debug for CredentialBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CredentialBody { [REDACTED] }")
+    }
+}
+impl fmt::Debug for RenewBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RenewBody { [REDACTED] }")
+    }
+}
+impl fmt::Debug for RevokeBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RevokeBody {}")
+    }
+}
+fn credential(verifier: String, digest: &str) -> Option<(Verifier, [u8; 32])> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let mut hash = [0; 32];
+    data_encoding::HEXLOWER
+        .decode_mut(digest.as_bytes(), &mut hash)
+        .ok()?;
+    Some((Verifier::try_from(verifier).ok()?, hash))
+}
+fn acquire_body(bytes: &[u8], key: &str) -> Option<AcquireRequest> {
+    let body: AcquireBody = serde_json::from_slice(bytes).ok()?;
+    let route = RouteId::new(&body.route)?;
+    if body
+        .label
+        .as_ref()
+        .is_some_and(|l| l.len() > 256 || l.chars().any(char::is_control))
+    {
+        return None;
+    }
+    let lifetime_ms = match body.lifetime.as_deref() {
+        Some(s) => {
+            Some(u64::try_from(crate::config::parse_duration(s)?.as_millis()).unwrap_or(u64::MAX))
+        }
+        None => None,
+    };
+    let (verifier, secret_sha256) = credential(body.verifier, &body.secret_sha256)?;
+    Some(AcquireRequest {
+        route,
+        mode: body.mode,
+        lifetime_ms,
+        isolated: body.isolated,
+        label: body.label,
+        idempotency_key: key.to_owned(),
+        verifier,
+        secret_sha256,
+    })
 }
 #[derive(Clone, Copy)]
 enum Endpoint {
@@ -229,12 +318,86 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
         }
     }
     if matches!(method, "POST" | "PUT" | "DELETE") {
-        if idempotency_key(req.headers()).is_none() {
+        let Some(key) = idempotency_key(req.headers()) else {
             return error(StatusCode::BAD_REQUEST, "idempotency_key_required");
-        }
-        // B5b: session acquisition, renewal and revocation mutations.
-        // B5c: principal, credential and grant mutations.
-        return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+        };
+        let bad_request = || error(StatusCode::BAD_REQUEST, "bad_request");
+        let body = if req.body().is_empty() {
+            b"{}".as_slice()
+        } else {
+            req.body().as_ref()
+        };
+        let result = match ep {
+            Sessions => {
+                let Some(principal) = caller.principal else {
+                    return error(StatusCode::FORBIDDEN, "forbidden");
+                };
+                let Some(request) = acquire_body(body, key) else {
+                    return bad_request();
+                };
+                ctx.authority.acquire_session(principal, request)
+            }
+            Renew(id) => {
+                let Some(principal) = caller.principal else {
+                    return error(StatusCode::FORBIDDEN, "forbidden");
+                };
+                let Ok(request) = serde_json::from_slice::<RenewBody>(body) else {
+                    return bad_request();
+                };
+                let add = match request.add_credential {
+                    Some(c) => match credential(c.verifier, &c.secret_sha256) {
+                        Some(c) => Some(c),
+                        None => return bad_request(),
+                    },
+                    None => None,
+                };
+                ctx.authority
+                    .renew_idempotent(principal, id, request.mode, add, key)
+            }
+            Revoke(id) => {
+                if serde_json::from_slice::<RevokeBody>(body).is_err() {
+                    return bad_request();
+                }
+                let Some(s) = ctx.authority.session(id) else {
+                    return error(StatusCode::NOT_FOUND, "not_found");
+                };
+                let reason = if caller.principal == Some(s.principal) {
+                    EndReason::Requested
+                } else {
+                    EndReason::AdminRevoked
+                };
+                ctx.authority.revoke_idempotent(
+                    caller.principal.unwrap_or(PrincipalId([0; 16])),
+                    id,
+                    reason,
+                    key,
+                )
+            }
+            // B5c: principal, credential and grant mutations.
+            Principals
+            | Principal(_)
+            | Disable(_)
+            | Enable(_)
+            | Credentials(_)
+            | Credential(_, _)
+            | Grants(_)
+            | Session(_)
+            | Connections
+            | Status => {
+                return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+            }
+        };
+        return match result {
+            Ok(s) => json_response(
+                if matches!(ep, Sessions) {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
+                session_view(ctx, &s),
+            ),
+            Err(e) => authority_error(e),
+        };
     }
     let result = match ep {
         Sessions => {

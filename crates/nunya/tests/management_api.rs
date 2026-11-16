@@ -151,6 +151,17 @@ impl Fixture {
         path: &str,
         key: Option<&str>,
     ) -> Response<Bytes> {
+        self.request_body(origin, auth, method, path, key, Bytes::new())
+    }
+    fn request_body(
+        &self,
+        origin: Origin,
+        auth: Option<&str>,
+        method: &str,
+        path: &str,
+        key: Option<&str>,
+        body: Bytes,
+    ) -> Response<Bytes> {
         let mut req = Request::builder().method(method).uri(path);
         if let Some(auth) = auth {
             req = req.header("Authorization", auth);
@@ -158,7 +169,7 @@ impl Fixture {
         if let Some(key) = key {
             req = req.header("Idempotency-Key", key);
         }
-        let r = routes::handle(self.ctx(), origin, req.body(Bytes::new()).unwrap());
+        let r = routes::handle(self.ctx(), origin, req.body(body).unwrap());
         let text = std::str::from_utf8(r.body()).unwrap();
         for secret in &self.forbidden {
             assert!(!text.contains(secret), "response leaked fixture material");
@@ -179,7 +190,7 @@ fn endpoint_authorization_matrix_and_uniform_auth_failures() {
     let cid = CredentialId([6; 16]).to_hex();
     // Expected statuses for owner, other principal, store admin, config admin, socket.
     let rows = vec![
-        ("POST", "/v1/sessions".into(), [503, 503, 503, 403, 403]),
+        ("POST", "/v1/sessions".into(), [400, 400, 400, 403, 403]),
         (
             "GET",
             format!("/v1/sessions/{sid}"),
@@ -188,12 +199,12 @@ fn endpoint_authorization_matrix_and_uniform_auth_failures() {
         (
             "POST",
             format!("/v1/sessions/{sid}/renew"),
-            [503, 404, 404, 403, 403],
+            [200, 404, 404, 403, 403],
         ),
         (
             "POST",
             format!("/v1/sessions/{sid}/revoke"),
-            [503, 404, 503, 503, 503],
+            [200, 404, 200, 200, 200],
         ),
         ("GET", "/v1/sessions".into(), [200, 200, 200, 200, 200]),
         ("POST", "/v1/principals".into(), [403, 403, 503, 503, 503]),
@@ -267,7 +278,11 @@ fn endpoint_authorization_matrix_and_uniform_auth_failures() {
                 statuses[i],
                 "{method} {path} caller {i}"
             );
-            if method != "GET" && statuses[i] == 503 {
+            if method != "GET"
+                && (statuses[i] == 503
+                    || statuses[i] == 200
+                    || (path == "/v1/sessions" && statuses[i] == 400))
+            {
                 let r = f.request(origin, auth, method, &path, None);
                 assert_eq!(r.status(), 400);
                 assert_eq!(
@@ -395,5 +410,255 @@ fn invalid_routes_keys_disabled_credentials_and_admin_shadowing() {
         f.request(Origin::Network, Some(BOB), "GET", "/v1/sessions", None)
             .status(),
         401
+    );
+}
+
+impl Fixture {
+    fn session_body(&mut self, secret: &str) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let verifier = ScramVerifier::from_password(secret, b"session-mutation-salt", 4096);
+        let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(secret.as_bytes()));
+        self.forbidden.extend([
+            secret.into(),
+            verifier.to_pg_string(),
+            hash.clone(),
+            data_encoding::HEXLOWER.encode(&verifier.stored_key),
+            data_encoding::HEXLOWER.encode(&verifier.server_key),
+            data_encoding::BASE64.encode(&verifier.salt),
+        ]);
+        serde_json::json!({"route":"postgres", "verifier":verifier.to_pg_string(), "secret_sha256":hash})
+    }
+    fn post(&self, auth: &str, path: &str, key: &str, body: serde_json::Value) -> Response<Bytes> {
+        self.request_body(
+            Origin::Network,
+            Some(auth),
+            "POST",
+            path,
+            Some(key),
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+    }
+}
+fn value(response: &Response<Bytes>) -> serde_json::Value {
+    serde_json::from_slice(response.body()).unwrap()
+}
+fn error_is(response: Response<Bytes>, status: u16, code: &str) {
+    assert_eq!(response.status().as_u16(), status);
+    assert_eq!(value(&response), serde_json::json!({"error":code}));
+}
+#[test]
+fn acquire_mutations_validation_idempotency_and_secret_checks() {
+    let mut f = Fixture::new();
+    let body = f.session_body("acquired-private.secret");
+    let other = f.session_body("different-private.secret");
+    let response = f.post(ALICE, "/v1/sessions", "new", body.clone());
+    assert_eq!(response.status(), 201);
+    let session = value(&response);
+    let id = SessionId::from_hex(session["id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        f.post(ALICE, "/v1/sessions", "new", body.clone()).body(),
+        response.body()
+    );
+    assert!(
+        f.ctx()
+            .authority
+            .check_session_secret(id, b"acquired-private.secret")
+    );
+    assert!(
+        !f.ctx()
+            .authority
+            .check_session_secret(id, b"wrong-private.secret")
+    );
+    error_is(
+        f.post(ALICE, "/v1/sessions", "new", other),
+        409,
+        "idempotency_conflict",
+    );
+    f.ctx().authority.revoke(id, EndReason::Requested).unwrap();
+    error_is(
+        f.post(ALICE, "/v1/sessions", "new", body.clone()),
+        409,
+        "session_ended",
+    );
+    for (field, replacement) in [
+        ("verifier", serde_json::json!("malformed")),
+        ("secret_sha256", serde_json::json!("AB".repeat(32))),
+        ("secret_sha256", serde_json::json!("ab".repeat(31))),
+        ("secret_sha256", serde_json::json!("gg".repeat(32))),
+        ("unknown", serde_json::json!(true)),
+        ("label", serde_json::json!("x".repeat(257))),
+        ("label", serde_json::json!("bad\nlabel")),
+        ("lifetime", serde_json::json!("not-a-duration")),
+        ("route", serde_json::json!("")),
+        ("mode", serde_json::json!("unknown")),
+    ] {
+        let mut bad = body.clone();
+        bad[field] = replacement;
+        error_is(
+            f.post(ALICE, "/v1/sessions", "bad", bad),
+            400,
+            "bad_request",
+        );
+    }
+    let mut too_long = body.clone();
+    too_long["lifetime"] = serde_json::json!("9h");
+    error_is(
+        f.post(ALICE, "/v1/sessions", "long", too_long),
+        400,
+        "lifetime_too_long",
+    );
+    let mut no_grant = body.clone();
+    no_grant["route"] = serde_json::json!("other");
+    error_is(
+        f.post(ALICE, "/v1/sessions", "no-grant", no_grant),
+        403,
+        "no_grant",
+    );
+    f.ctx()
+        .authority
+        .set_grants(
+            f.principals[0],
+            vec![(RouteId::new("postgres").unwrap(), Mode::ReadOnly)],
+        )
+        .unwrap();
+    let mut wide = body.clone();
+    wide["mode"] = serde_json::json!("read_write");
+    error_is(
+        f.post(ALICE, "/v1/sessions", "wide", wide),
+        403,
+        "mode_exceeds_grant",
+    );
+    let mut valid = body;
+    valid["mode"] = serde_json::json!("read_only");
+    valid["lifetime"] = serde_json::json!("30m");
+    valid["isolated"] = serde_json::json!(true);
+    valid["label"] = serde_json::json!("audit label");
+    let r = f.post(ALICE, "/v1/sessions", "valid", valid);
+    assert_eq!(r.status(), 201);
+    assert_eq!(value(&r)["expires_ms"], 1_801_000);
+    assert_eq!(value(&r)["isolated"], true);
+}
+#[test]
+fn renew_mutations_credentials_narrowing_and_ownership() {
+    let mut f = Fixture::new();
+    let acquire = f.session_body("original-private.secret");
+    let additional = f.session_body("additional-private.secret");
+    let acquired = value(&f.post(ALICE, "/v1/sessions", "renew-acquire", acquire));
+    let id = SessionId::from_hex(acquired["id"].as_str().unwrap()).unwrap();
+    let path = format!("/v1/sessions/{}/renew", id.to_hex());
+    let body = serde_json::json!({"mode":"read_only", "add_credential": {
+        "verifier":additional["verifier"], "secret_sha256":additional["secret_sha256"]}});
+    let r = f.post(ALICE, &path, "renew", body.clone());
+    assert_eq!(r.status(), 200);
+    assert_eq!(value(&r)["mode"], "read_only");
+    assert_eq!(f.post(ALICE, &path, "renew", body).body(), r.body());
+    assert!(
+        f.ctx()
+            .authority
+            .check_session_secret(id, b"original-private.secret")
+    );
+    assert!(
+        f.ctx()
+            .authority
+            .check_session_secret(id, b"additional-private.secret")
+    );
+    error_is(
+        f.post(ALICE, &path, "renew", serde_json::json!({})),
+        409,
+        "idempotency_conflict",
+    );
+    error_is(
+        f.post(ADMIN, &path, "admin-renew", serde_json::json!({})),
+        404,
+        "not_found",
+    );
+    for bad in [
+        serde_json::json!({"unknown":true}),
+        serde_json::json!({"add_credential":{"verifier":"bad","secret_sha256":"bad"}}),
+    ] {
+        error_is(f.post(ALICE, &path, "bad-renew", bad), 400, "bad_request");
+    }
+    assert_eq!(
+        f.request(
+            Origin::Network,
+            Some(ALICE),
+            "POST",
+            &path,
+            Some("empty-renew")
+        )
+        .status(),
+        200
+    );
+    f.ctx().authority.revoke(id, EndReason::Requested).unwrap();
+    error_is(
+        f.post(ALICE, &path, "ended-renew", serde_json::json!({})),
+        409,
+        "session_ended",
+    );
+    error_is(
+        f.post(
+            ALICE,
+            &path,
+            "renew",
+            serde_json::json!({"mode":"read_only", "add_credential":{
+        "verifier":additional["verifier"], "secret_sha256":additional["secret_sha256"]}}),
+        ),
+        409,
+        "session_ended",
+    );
+}
+#[test]
+fn revoke_mutations_owner_admin_retry_and_admission() {
+    use nunya::state::authority::Operation;
+    let f = Fixture::new();
+    let path = format!("/v1/sessions/{}/revoke", f.sessions[0].to_hex());
+    error_is(
+        f.post(BOB, &path, "other", serde_json::json!({})),
+        404,
+        "not_found",
+    );
+    error_is(
+        f.post(ALICE, &path, "bad", serde_json::json!({"reason":"secret"})),
+        400,
+        "bad_request",
+    );
+    let r = f.post(ALICE, &path, "owner", serde_json::json!({}));
+    assert_eq!(r.status(), 200);
+    assert_eq!(value(&r)["revoke_reason"], "requested");
+    assert_eq!(
+        f.request(Origin::Network, Some(ALICE), "POST", &path, Some("owner"))
+            .body(),
+        r.body()
+    );
+    assert!(
+        f.ctx()
+            .authority
+            .admit(f.sessions[0], Operation::Read)
+            .is_err()
+    );
+    let path = format!("/v1/sessions/{}/revoke", f.sessions[1].to_hex());
+    let r = f.request(Origin::Network, Some(ADMIN), "POST", &path, Some("admin"));
+    assert_eq!(r.status(), 200);
+    assert_eq!(value(&r)["revoke_reason"], "admin_revoked");
+    assert_eq!(
+        f.post(ADMIN, &path, "admin", serde_json::json!({})).body(),
+        r.body()
+    );
+    assert!(
+        f.ctx()
+            .authority
+            .admit(f.sessions[1], Operation::Read)
+            .is_err()
+    );
+    let other_path = format!("/v1/sessions/{}/revoke", f.sessions[2].to_hex());
+    error_is(
+        f.post(ADMIN, &other_path, "admin", serde_json::json!({})),
+        409,
+        "idempotency_conflict",
+    );
+    assert_eq!(
+        f.request(Origin::Socket, None, "POST", &other_path, Some("socket"))
+            .status(),
+        200
     );
 }
