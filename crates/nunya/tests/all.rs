@@ -31,6 +31,8 @@ mod corpus;
 mod noninterference;
 #[path = "serve_pg.rs"]
 mod serve_pg;
+#[path = "access_sessions.rs"]
+mod access_sessions;
 
 #[path = "spanner_native.rs"]
 mod spanner_native;
