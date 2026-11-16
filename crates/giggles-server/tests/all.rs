@@ -199,3 +199,6 @@ mod write_fence_termination_network;
 
 #[path = "privilege_functions_network.rs"]
 mod privilege_functions_network;
+
+#[path = "fk_section_network.rs"]
+mod fk_section_network;

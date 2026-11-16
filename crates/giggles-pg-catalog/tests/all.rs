@@ -127,3 +127,6 @@ mod union_type_resolution;
 #[path = "fk_conindid.rs"] mod fk_conindid;
 #[path = "privilege_functions.rs"]
 mod privilege_functions;
+
+#[path = "lateral_unnest.rs"]
+mod lateral_unnest;

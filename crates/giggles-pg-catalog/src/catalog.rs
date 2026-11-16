@@ -1381,6 +1381,21 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         all.get_mut(name).unwrap().rows.push(row);
     };
     add("pg_description", vec![I(2200), I(2615), I(0), s("standard public schema"), N]);
+    // PG18 equality operators already referenced by pg_constraint.conpfeqop.
+    // Keep their descriptors joinable even when no user FK currently exists.
+    // Source: PostgreSQL REL_18_STABLE pg_operator.dat and pg_proc.dat.
+    for (oid, ty, negate, code) in [
+        (91, 16, 85, 60), (94, 21, 519, 63), (96, 23, 518, 65),
+        (410, 20, 411, 467), (98, 25, 531, 67), (1054, 1042, 1057, 1048),
+        (2972, 2950, 2973, 2956), (3240, 3802, 3241, 4043), (1955, 17, 1956, 1948),
+        (1752, 1700, 1753, 1718), (620, 700, 621, 287), (670, 701, 671, 293),
+        (1093, 1082, 1094, 1086), (1108, 1083, 1109, 1145), (1550, 1266, 1551, 1352),
+        (2060, 1114, 2061, 2052), (1320, 1184, 1321, 1152), (1330, 1186, 1331, 1162),
+        (1070, 2277, 1071, 744),
+    ] {
+        add("pg_operator", vec![I(oid), s("="), I(11), I(10), s("b"), B(true), B(true),
+            I(ty), I(ty), I(16), I(oid), I(negate), N, I(code), I(101), I(105)]);
+    }
     for table in &snapshot.tables {
         for (&(id, column), description) in &snapshot.comments {
             if id != table.id { continue; }

@@ -154,6 +154,7 @@ enum Source {
     FlatUnion(Vec<Query>),
     Series(E, E),
     Unnest(E, bool),
+    ZipUnnest(Vec<E>, bool),
     Scalar(E),
     Options(E),
     Filtered(Box<Source>, E),
@@ -651,6 +652,51 @@ fn plan_inner(
         .filter(|t| !matches!(t, Token::Whitespace(_)))
         .collect::<Vec<_>>();
     let mut i = 0;
+    // sqlparser parses explicit LATERAL calls differently from ordinary table
+    // functions, and that path cannot consume WITH ORDINALITY. These supported
+    // functions already have implicit-lateral semantics. Normalize only calls
+    // in a table position; identifier quoting is preserved, and literals and
+    // comments cannot be mistaken for keywords.
+    fn token_name(token: Option<&Token>) -> Option<String> {
+        let Token::Word(word) = token? else { return None };
+        Some(if word.quote_style.is_none() {
+            word.value.to_ascii_lowercase()
+        } else {
+            word.value.clone()
+        })
+    }
+    let mut table_context = vec![false];
+    while i < tokens.len() {
+        match &tokens[i] {
+            Token::LParen => table_context.push(false),
+            Token::RParen if table_context.len() > 1 => { table_context.pop(); }
+            Token::Word(w) if w.keyword == Keyword::FROM => *table_context.last_mut().unwrap() = true,
+            Token::Word(w) if matches!(w.keyword, Keyword::SELECT | Keyword::WHERE | Keyword::GROUP
+                | Keyword::HAVING | Keyword::ORDER | Keyword::LIMIT | Keyword::UNION | Keyword::EXCEPT
+                | Keyword::INTERSECT | Keyword::WINDOW | Keyword::OFFSET | Keyword::FETCH) =>
+                *table_context.last_mut().unwrap() = false,
+            _ => {}
+        }
+        let table_position = i > 0 && ((tokens[i - 1] == Token::Comma && *table_context.last().unwrap())
+            || matches!(&tokens[i - 1], Token::Word(w)
+                if matches!(w.keyword, Keyword::FROM | Keyword::JOIN)));
+        let mut name = i + 1;
+        if token_name(tokens.get(name)).as_deref() == Some("pg_catalog")
+            && tokens.get(name + 1) == Some(&Token::Period)
+        {
+            name += 2;
+        }
+        if table_position
+            && matches!(&tokens[i], Token::Word(w) if w.keyword == Keyword::LATERAL)
+            && matches!(token_name(tokens.get(name)).as_deref(),
+                Some("unnest" | "generate_series" | "generate_subscripts" | "aclexplode"))
+            && tokens.get(name + 1) == Some(&Token::LParen)
+        {
+            tokens.remove(i);
+        }
+        i += 1;
+    }
+    let mut i = 0;
     while i + 5 < tokens.len() {
         if matches!(&tokens[i], Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("operator"))
             && tokens[i + 1] == Token::LParen
@@ -1105,9 +1151,13 @@ impl Compiler {
                 reject_local_series_reference(&from.relation, &schema)?;
             }
             let mut function_outer = schema.clone();
-            function_outer.extend(outer.iter().cloned());
-            let table_outer = if matches!(&from.relation, a::TableFactor::Table { name, args: Some(_), .. }
-                if object(name).last().is_some_and(|n| n == "pg_get_sequence_data"))
+            append_outer(&mut function_outer, outer)?;
+            let table_outer = if matches!(&from.relation, a::TableFactor::UNNEST { .. })
+                || matches!(&from.relation, a::TableFactor::Table { name, args: Some(_), .. }
+                    if object(name).last().is_some_and(|n| matches!(n.as_str(),
+                        "pg_get_sequence_data" | "unnest" | "generate_subscripts" | "aclexplode")))
+                || matches!(&from.relation, a::TableFactor::Function { name, .. }
+                    if object(name).last().is_some_and(|n| n == "aclexplode"))
             {
                 &function_outer
             } else {
@@ -1125,13 +1175,14 @@ impl Compiler {
                 schema = rs;
             } else {
                 let width = rs.len();
+                let lateral = matches!(rhs, Source::Unnest(..) | Source::ZipUnnest(..));
                 source = Source::Join(
                     Box::new(source),
                     Box::new(rhs),
                     truth(),
                     false,
                     width,
-                    false,
+                    lateral,
                 );
                 schema.extend(rs)
             }
@@ -1139,7 +1190,7 @@ impl Compiler {
             if has_natural
                 && matches!(
                     source,
-                    Source::Unnest(..) | Source::Options(_) | Source::Scalar(_)
+                    Source::Unnest(..) | Source::ZipUnnest(..) | Source::Options(_) | Source::Scalar(_)
                 )
             {
                 return Err(Error::Unsupported);
@@ -1166,7 +1217,7 @@ impl Compiler {
                     })?;
                 let lateral = matches!(
                     rhs,
-                    Source::Unnest(..) | Source::Options(_) | Source::Scalar(_)
+                    Source::Unnest(..) | Source::ZipUnnest(..) | Source::Options(_) | Source::Scalar(_)
                 );
                 if has_natural && lateral {
                     return Err(Error::Unsupported);
@@ -1514,12 +1565,25 @@ impl Compiler {
             .collect(),
         ))
     }
+    fn unnest_source(es: Vec<E>, ordinality: bool) -> R<(Source, Vec<Field>)> {
+        if es.is_empty() {
+            return Err(Error::Unsupported);
+        }
+        let mut fields = es.iter().map(|e| {
+            no_set_or_window(e)?;
+            Ok(Field { name: "unnest".into(), data_type: array_element(e.ty)? })
+        }).collect::<R<Vec<_>>>()?;
+        if ordinality {
+            fields.push(Field { name: "ordinality".into(), data_type: PgType::Int8 });
+        }
+        Ok((Source::ZipUnnest(es, ordinality), fields))
+    }
     fn table(&mut self, t: &a::TableFactor, outer: &Schema) -> R<(Source, Schema)> {
         if let a::TableFactor::NestedJoin { table_with_joins: from, alias: None } = t {
             let (mut source, mut schema) = self.table(&from.relation, outer)?;
             for join in &from.joins {
                 let (rhs, rs) = self.table(&join.relation, outer)?;
-                if matches!(rhs, Source::Unnest(..) | Source::Options(_) | Source::Scalar(_)) {
+                if matches!(rhs, Source::Unnest(..) | Source::ZipUnnest(..) | Source::Options(_) | Source::Scalar(_)) {
                     return Err(Error::Unsupported);
                 }
                 let width = rs.len();
@@ -1572,7 +1636,7 @@ impl Compiler {
             } => {
                 if !with_hints.is_empty()
                     || version.is_some()
-                    || *with_ordinality
+                    || (*with_ordinality && object(name).last().is_none_or(|n| n != "unnest"))
                     || !partitions.is_empty()
                     || json_path.is_some()
                 {
@@ -1712,20 +1776,10 @@ impl Compiler {
                             alias,
                             n,
                         )
-                    } else if n == "unnest" && args.args.len() == 1 && args.settings.is_none() {
-                        let mut es = self.args(&args.args, outer)?;
-                        let e = es.remove(0);
-                        no_set_or_window(&e)?;
-                        let ty = array_element(e.ty)?;
-                        (
-                            Source::Unnest(e, false),
-                            vec![Field {
-                                name: n.clone(),
-                                data_type: ty,
-                            }],
-                            alias,
-                            n,
-                        )
+                    } else if n == "unnest" && args.settings.is_none() {
+                        let es = self.args(&args.args, outer)?;
+                        let (source, fields) = Self::unnest_source(es, *with_ordinality)?;
+                        (source, fields, alias, n)
                     } else if n == "pg_indexam_has_property" && args.settings.is_none() {
                         let args = self.args(&args.args, outer)?;
                         let mut e = E {
@@ -1810,28 +1864,12 @@ impl Compiler {
                 with_offset_alias,
                 with_ordinality,
             } => {
-                if array_exprs.len() != 1 || *with_offset || with_offset_alias.is_some() {
+                if *with_offset || with_offset_alias.is_some() {
                     return Err(Error::Unsupported);
                 }
-                let e = self.expr(&array_exprs[0], outer)?;
-                no_set_or_window(&e)?;
-                let ty = array_element(e.ty)?;
-                let mut fields = vec![Field {
-                    name: "unnest".into(),
-                    data_type: ty,
-                }];
-                if *with_ordinality {
-                    fields.push(Field {
-                        name: "ordinality".into(),
-                        data_type: PgType::Int8,
-                    });
-                }
-                (
-                    Source::Unnest(e, *with_ordinality),
-                    fields,
-                    alias,
-                    "unnest".into(),
-                )
+                let es = array_exprs.iter().map(|e| self.expr(e, outer)).collect::<R<Vec<_>>>()?;
+                let (source, fields) = Self::unnest_source(es, *with_ordinality)?;
+                (source, fields, alias, "unnest".into())
             }
             _ => return Err(Error::Unsupported),
         };
@@ -3433,6 +3471,11 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
                 expr(b, types, None)?
             }
             Source::Unnest(e, _) | Source::Options(e) | Source::Scalar(e) => expr(e, types, None)?,
+            Source::ZipUnnest(es, _) => {
+                for e in es {
+                    expr(e, types, None)?;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -3621,6 +3664,29 @@ impl Runtime<'_> {
                 }
                 _ => Err(Error::Type),
             },
+            Source::ZipUnnest(es, ordinality) => {
+                let arrays = es.iter().map(|e| {
+                    match self.eval(e, outer, None, 0, &[], None)? {
+                        Value::Null => Ok(vec![]),
+                        Value::Array(values) => Ok(values),
+                        _ => Err(Error::Type),
+                    }
+                }).collect::<R<Vec<_>>>()?;
+                let len = arrays.iter().map(Vec::len).max().unwrap_or(0);
+                let mut out = vec![];
+                let mut bytes = 0;
+                for i in 0..len {
+                    self.charge(arrays.len())?;
+                    let mut row = arrays.iter().map(|a| a.get(i).cloned().unwrap_or(Value::Null))
+                        .collect::<Vec<_>>();
+                    if *ordinality {
+                        row.push(Value::Int(i as i64 + 1));
+                    }
+                    admit(&out, &row, &mut bytes)?;
+                    out.push(row);
+                }
+                Ok(out)
+            }
             Source::Unnest(e, ordinality) => match self.eval(e, outer, None, 0, &[], None)? {
                 Value::Null => Ok(vec![]),
                 Value::Array(values) => {
