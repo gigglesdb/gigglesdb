@@ -299,10 +299,11 @@ fn a_lock_cycle_across_ranges_and_gateways_ends_with_one_deadlock() {
 }
 
 /// R5-45: a gateway streams range pages, so an aggregate that keeps no rows runs over any
-/// amount of data, and one whose retained input passes the 64 MiB budget fails with the same
-/// limit error as on one node, never by exhausting memory.
+/// amount of data, and one whose grouped input passes the 64 MiB retention budget spills to
+/// temp files like on one node (R2-PGLIMITS-4, PostgreSQL HashAgg spill), never exhausting
+/// memory and never failing with 54000.
 #[test]
-fn a_gateway_aggregate_over_the_retention_budget_fails_with_the_limit_error() {
+fn a_gateway_aggregate_over_the_retention_budget_spills() {
     let cluster = LocalCluster::new(&splits());
     let a = gateway(&cluster, 1);
     let mut s = a.admin.sql_session();
@@ -331,16 +332,22 @@ fn a_gateway_aggregate_over_the_retention_budget_fails_with_the_limit_error() {
         .execute_at("SELECT count(*) FROM big", &[], None, &clock())
         .unwrap();
     assert_eq!(ints(&count), vec![vec![17_000]]);
-    let error = s
+    let duplicates = s
         .execute_at(
             "SELECT payload FROM big GROUP BY payload HAVING count(*) > 1",
             &[],
             None,
             &clock(),
         )
-        .unwrap_err();
-    assert_eq!(
-        error,
-        crate::CoreError::Sql(crate::relational::SqlError::Limit)
-    );
+        .unwrap();
+    assert!(duplicates.rows.is_empty());
+    let groups = s
+        .execute_at(
+            "SELECT count(DISTINCT payload) FROM big",
+            &[],
+            None,
+            &clock(),
+        )
+        .unwrap();
+    assert_eq!(ints(&groups), vec![vec![17_000]]);
 }
