@@ -13,7 +13,10 @@ use super::{
 use crate::{
     buffer::writer::{BufferWriter, DurableManifestRef, WriterCheckpoint},
     coordinator::{Error, Result},
-    engine::{Capture, Captured, CapturedMarker},
+    engine::{
+        Capture, Captured, CapturedMarker, ConnectorSchemaStop, SchemaBoundary, SchemaState,
+        SchemaStopKind,
+    },
     event::{AssembledTxn, Position, PositionOrder, Row, SourceIdentity},
     mapping::mysql::{MysqlPgColumn, plan_column, to_pg_opaque},
 };
@@ -78,6 +81,7 @@ struct RetryState {
 }
 
 pub struct MysqlCapture {
+    evidence: Option<crate::verify::mysql::input::CaptureEvidenceGuard>,
     descriptors: Vec<TableDescriptor>,
     lower_case_table_names: u8,
     stop_reason: Option<CaptureStopReason>,
@@ -104,6 +108,46 @@ pub struct MysqlCapture {
     failed: bool,
 }
 impl MysqlCapture {
+    /// Register once, before driving capture. The input must be polled alongside
+    /// capture; both share a bounded queue, never the engine's delivery channel.
+    pub fn evidence_input(
+        &mut self,
+        config: MysqlConfig,
+        max_bytes: usize,
+        max_commits: usize,
+    ) -> MysqlResult<crate::verify::mysql::input::MysqlCaptureInput> {
+        if self.evidence.is_some()
+            || self.pending.is_some()
+            || self.failed
+            || self.stopped
+            || max_bytes == 0
+            || max_commits == 0
+        {
+            return Err(MysqlError::Invalid("invalid evidence subscription"));
+        }
+        let keys = self
+            .descriptors
+            .iter()
+            .map(|d| (format!("{}.{}", d.schema, d.table), d.primary_key.clone()))
+            .collect();
+        let capture = crate::verify::mysql::input::CaptureEvidence::new(
+            self.safe.clone(),
+            self.order.clone(),
+            keys,
+        );
+        self.evidence = Some(crate::verify::mysql::input::CaptureEvidenceGuard(
+            capture.clone(),
+        ));
+        Ok(crate::verify::mysql::input::MysqlCaptureInput {
+            source: self.source.clone(),
+            capture,
+            config,
+            id: uuid::Uuid::new_v4().to_string(),
+            attempt: 0,
+            max_bytes,
+            max_commits,
+        })
+    }
     /// `source.engine` is mysql; system_id is the caller's stable cluster ID,
     /// lineage its replication incarnation, db_name the selected database/set,
     /// stream the configured capture name. Keep all five stable across failover;
@@ -206,6 +250,7 @@ impl MysqlCapture {
         descriptors.extend(control::apply_descriptors());
         let assembler = Assembler::new(source.clone(), descriptors, start, gtid, max_row_bytes)?;
         Ok(Self {
+            evidence: None,
             descriptors: selected,
             lower_case_table_names,
             stop_reason: None,
@@ -244,6 +289,9 @@ impl MysqlCapture {
     }
 
     async fn reconnect(&mut self, mut last: MysqlError) -> MysqlResult<()> {
+        if let Some(e) = &self.evidence {
+            e.invalidate(crate::verify::mysql::evidence::ContinuityEvent::Reconnect);
+        }
         let Some((config, server_id)) = self.reconnect.clone() else {
             return Err(match last {
                 MysqlError::StreamEnded => {
@@ -311,7 +359,49 @@ impl MysqlCapture {
         self.stop_reason.as_ref()
     }
 
+    fn schema_snapshot(&self) -> SchemaState {
+        let blocked_boundary = self.stop_reason.as_ref().map(|reason| {
+            let (kind, table, diagnostic) = match reason {
+                CaptureStopReason::Ddl { tables, statement } => (
+                    SchemaStopKind::Ddl,
+                    (tables.len() == 1).then(|| format!("{}.{}", tables[0].0, tables[0].1)),
+                    statement.clone(),
+                ),
+                CaptureStopReason::UnknownDdl { statement, reason } => (
+                    SchemaStopKind::UnknownDdl,
+                    None,
+                    format!("{statement}: {reason}"),
+                ),
+                CaptureStopReason::TableMap {
+                    schema,
+                    table,
+                    change,
+                } => (
+                    SchemaStopKind::TableMapChanged,
+                    Some(format!("{schema}.{table}")),
+                    format!("{change:?}"),
+                ),
+            };
+            SchemaBoundary::Connector(ConnectorSchemaStop {
+                connector: "mysql".into(),
+                kind,
+                table,
+                diagnostic,
+                // DDL uses its completed query boundary; TABLE_MAP retains the
+                // last safe commit, never an in-flight transaction coordinate.
+                position: self.safe.clone(),
+            })
+        });
+        SchemaState {
+            blocked_boundary,
+            unknown_schema_job: false,
+        }
+    }
+
     fn stop(&mut self, reason: CaptureStopReason) -> Captured {
+        if let Some(e) = &self.evidence {
+            e.invalidate(crate::verify::mysql::evidence::ContinuityEvent::CaptureStop);
+        }
         self.stopped = true;
         self.stop_reason = Some(reason);
         self.boundary = None;
@@ -441,14 +531,31 @@ impl MysqlCapture {
                 match output {
                     AssemblerOutput::Txn { txn, control_rows } => {
                         let mut watermarks = Vec::new();
+                        let mut verify_markers = Vec::new();
                         let mut own_apply = false;
                         let mut apply_control = false;
                         for row in &control_rows {
                             if let Some(marker) = control::decode_apply(row)? {
                                 own_apply |= marker;
                                 apply_control = true;
+                            } else if control::is_verify_marker(row)? {
+                                verify_markers.push(
+                                    control::decode_verify_marker(row)?.expect("verified route"),
+                                );
                             } else if let Some(marker) = control::decode_watermark(row)? {
                                 watermarks.push(marker);
+                            }
+                        }
+                        if let Some(e) = &self.evidence {
+                            match self.mapped(txn.clone()) {
+                                Ok(mapped) => e.commit(
+                                    &mapped.commit_position,
+                                    &mapped.events,
+                                    &verify_markers,
+                                ),
+                                Err(_) => e.invalidate(
+                                    crate::verify::mysql::evidence::ContinuityEvent::Gap,
+                                ),
                             }
                         }
                         // Apply is single-writer: the receipt authenticates the entire
@@ -487,6 +594,9 @@ impl MysqlCapture {
                             p.encode().map_err(MysqlError::from)?,
                         );
                         self.boundary = None;
+                        if let Some(e) = &self.evidence {
+                            e.commit(&self.safe, &[], &[]);
+                        }
                         if self.last_progress.elapsed() >= Duration::from_secs(1) {
                             self.last_progress = Instant::now();
                             return Ok(Captured {
@@ -528,6 +638,9 @@ impl MysqlCapture {
                                 CaptureStopReason::UnknownDdl { statement, reason }
                             }
                             DdlImpact::Unselected => {
+                                if let Some(e) = &self.evidence {
+                                    e.commit(&self.safe, &[], &[]);
+                                }
                                 self.last_progress = Instant::now();
                                 return Ok(Captured {
                                     durable_position: Some(self.safe.clone()),
@@ -595,6 +708,20 @@ fn txn_position(batch: &Captured) -> Result<&Position> {
         .ok_or_else(|| recovery("MySQL batch missing durable position"))
 }
 impl Capture for MysqlCapture {
+    fn schema_state(&self) -> Option<SchemaState> {
+        Some(self.schema_snapshot())
+    }
+
+    async fn prepare_schema(
+        &mut self,
+        _journal: &crate::coordinator::journal::Journal,
+        _runtime: &crate::engine::Runtime,
+    ) -> Result<()> {
+        // MySQL descriptors are qualified before the stream is opened. There
+        // is no persisted MySQL schema baseline to restore in this adapter.
+        Ok(())
+    }
+
     fn position_order(&self) -> Arc<dyn PositionOrder + Send + Sync> {
         self.order.clone()
     }
@@ -631,7 +758,12 @@ impl Capture for MysqlCapture {
                     self.delivered = position.clone();
                 }
             }
-            Err(_) => self.failed = true,
+            Err(_) => {
+                self.failed = true;
+                if let Some(e) = &self.evidence {
+                    e.invalidate(crate::verify::mysql::evidence::ContinuityEvent::Gap);
+                }
+            }
         }
         result
     }

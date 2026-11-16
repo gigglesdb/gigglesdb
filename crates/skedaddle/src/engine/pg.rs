@@ -855,6 +855,24 @@ struct ReaderMarker {
     position: Option<(String, Vec<u8>)>,
     source: Option<(String, String, String, String, String, bool)>,
 }
+#[cfg(test)]
+pub(crate) fn test_reader_checkpoint(
+    source: crate::event::SourceIdentity,
+    position: Position,
+    epoch: u64,
+) -> ReaderCheckpoint {
+    ReaderCheckpoint {
+        version: 3,
+        next_mseq: 1,
+        prev_digest: [1; 32],
+        last_epoch: epoch,
+        last_position: Some(position),
+        last_record: Some(format::RecordBoundary {
+            source,
+            chunk_rows: false,
+        }),
+    }
+}
 pub fn encode_reader_checkpoint(c: &ReaderCheckpoint) -> Result<String> {
     Ok(serde_json::to_string(&ReaderMarker {
         version: c.version,

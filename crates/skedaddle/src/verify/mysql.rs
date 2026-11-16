@@ -1,6 +1,10 @@
 //! Independent InnoDB snapshot reads in capture's mapped PostgreSQL value domain.
 //! KeyOrder must be qualified for BOTH endpoints; canonical bytes are not a
 //! MySQL collation comparator. Durable reports remain refused by the V1 boundary.
+pub mod checkpoint;
+pub mod evidence;
+pub mod input;
+pub mod publication;
 use std::{cmp::Ordering, collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;

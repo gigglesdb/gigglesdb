@@ -100,7 +100,7 @@ pub fn descriptor() -> TableDescriptor {
 }
 
 /// Non-control data is not a marker. Every unknown control route fails closed.
-pub fn decode_watermark(row: &ControlRow) -> Result<Option<Watermark>> {
+fn payload(row: &ControlRow) -> Result<Option<Vec<u8>>> {
     if !row.table.starts_with("_skedaddle.") {
         return Ok(None);
     }
@@ -135,12 +135,82 @@ pub fn decode_watermark(row: &ControlRow) -> Result<Option<Watermark>> {
     if bytes.len() > 64 * 1024 {
         return Err(MysqlError::Control("watermark too large"));
     }
+    Ok(Some(bytes))
+}
+
+pub fn decode_watermark(row: &ControlRow) -> Result<Option<Watermark>> {
+    let Some(bytes) = payload(row)? else {
+        return Ok(None);
+    };
     let marker: Watermark = serde_json::from_slice(&bytes)
         .map_err(|_| MysqlError::Control("malformed watermark payload"))?;
     marker
         .encode()
         .map_err(|_| MysqlError::Control("invalid watermark identity"))?;
     Ok(Some(marker))
+}
+
+/// Disjoint, versioned payload; unknown versions and chunk payloads are errors.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyMarker {
+    version: u8,
+    pub verify: String,
+    pub attempt: u64,
+}
+impl VerifyMarker {
+    pub fn new(verify: String, attempt: u64) -> Result<Self> {
+        let marker = Self {
+            version: 1,
+            verify,
+            attempt,
+        };
+        marker.encode()?;
+        Ok(marker)
+    }
+    pub fn encode(&self) -> Result<String> {
+        if self.version != 1
+            || self.attempt == 0
+            || self.verify.is_empty()
+            || self.verify.len() > 128
+        {
+            return Err(MysqlError::Control("invalid verification marker"));
+        }
+        serde_json::to_string(self).map_err(|_| MysqlError::Control("invalid verification marker"))
+    }
+}
+pub fn decode_verify_marker(row: &ControlRow) -> Result<Option<VerifyMarker>> {
+    let Some(bytes) = payload(row)? else {
+        return Ok(None);
+    };
+    let marker: VerifyMarker = serde_json::from_slice(&bytes)
+        .map_err(|_| MysqlError::Control("malformed verification marker"))?;
+    marker.encode()?;
+    Ok(Some(marker))
+}
+pub(crate) fn is_verify_marker(row: &ControlRow) -> Result<bool> {
+    let Some(bytes) = payload(row)? else {
+        return Ok(false);
+    };
+    let json: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| MysqlError::Control("invalid watermark JSON"))?;
+    Ok(json.get("verify").is_some())
+}
+/// Caller must supply a dedicated idle connection (the evidence input creates
+/// a fresh connection); never reuse a snapshot transaction here.
+pub async fn emit_verify_marker(conn: &mut mysql_async::Conn, marker: &VerifyMarker) -> Result<()> {
+    use mysql_async::prelude::Queryable;
+    if conn.query_first::<u8, _>("SELECT @@autocommit").await? != Some(1) {
+        return Err(MysqlError::Control(
+            "verification marker needs idle autocommit connection",
+        ));
+    }
+    conn.exec_drop(
+        "INSERT INTO _skedaddle.watermark(marker) VALUES(?)",
+        (marker.encode()?,),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Fixed M10 replay-table contracts. Capture owns these independently of selection.

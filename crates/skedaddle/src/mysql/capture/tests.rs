@@ -368,6 +368,84 @@ fn marker() -> Watermark {
         attempt: 1,
     }
 }
+
+#[test]
+fn verification_marker_is_versioned_and_isolated_from_chunks() {
+    use crate::mysql::{assembly::ControlRow, value::to_opaque};
+    let row = |payload| {
+        let d = control::descriptor();
+        ControlRow {
+            table: "_skedaddle.watermark".into(),
+            kind: crate::event::EventKind::Insert,
+            before: None,
+            after: Some(
+                [
+                    (
+                        "id".into(),
+                        to_opaque(&d.columns[0], &V::Unsigned(1)).unwrap(),
+                    ),
+                    (
+                        "marker".into(),
+                        to_opaque(&d.columns[1], &V::Json(payload)).unwrap(),
+                    ),
+                ]
+                .into(),
+            ),
+        }
+    };
+    let m = control::VerifyMarker::new("attempt-id".into(), 2).unwrap();
+    let r = row(serde_json::from_str(&m.encode().unwrap()).unwrap());
+    assert_eq!(control::decode_verify_marker(&r).unwrap(), Some(m));
+    assert!(control::decode_watermark(&r).is_err());
+    assert!(control::decode_verify_marker(&row(serde_json::to_value(marker()).unwrap())).is_err());
+    for payload in [
+        serde_json::json!({"version":2,"verify":"id","attempt":1}),
+        serde_json::json!({"version":1,"verify":"id","attempt":0}),
+        serde_json::json!({"version":1,"verify":"id","attempt":1,"extra":true}),
+    ] {
+        assert!(control::decode_verify_marker(&row(payload)).is_err());
+    }
+}
+
+#[tokio::test]
+async fn verification_marker_capture_uses_exact_commit_and_keeps_marker_event() {
+    use crate::verify::mysql::evidence::MysqlEvidenceInput;
+    let p = start(false);
+    let (w, mut reader, root) = writer(&p).await;
+    let m = control::VerifyMarker::new("session".into(), 1).unwrap();
+    let events = control_events(serde_json::to_value(&m).unwrap(), RowKind::Write);
+    let mut capture = MysqlCapture::from_stream(
+        source(),
+        p,
+        vec![zoo()],
+        w,
+        futures::stream::iter(events.into_iter().map(Ok)),
+        10000,
+    )
+    .unwrap();
+    // No connection is opened: this exercises capture and the actual subscription.
+    let config = serde_json::from_value(serde_json::json!({"host":"unused","port":0,"ca":"unused","user":"unused","password":"unused","profile":"unused","gtid":"OFF","container_id":"unused","max_decompressed_bytes":10000})).unwrap();
+    let mut input = capture.evidence_input(config, 10000, 10).unwrap();
+    let range = crate::verify::RangePlan {
+        id: marker().chunk,
+        lo: None,
+        hi: None,
+    };
+    input.arm(&range).await.unwrap();
+    let batch = capture.step().await.unwrap();
+    assert!(batch.watermarks.is_empty());
+    let crate::verify::mysql::evidence::EvidenceEvent::Commit { position, changes } =
+        input.next().await.unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(Some(position), batch.durable_position);
+    assert!(changes.is_empty());
+    assert_eq!(reader.next_txn().await.unwrap(), batch.transaction);
+    drop(capture);
+    drop(reader);
+    std::fs::remove_dir_all(root).unwrap();
+}
 fn control_events(payload: serde_json::Value, kind: RowKind) -> Vec<PositionedEvent> {
     let row = vec![V::Unsigned(1), V::Json(payload)];
     vec![
@@ -701,11 +779,37 @@ async fn ddl_classification_stops_selected_and_unknown_at_query_boundary() {
                 None => assert!(!stop),
                 other => panic!("unexpected reason {other:?}"),
             }
+            let state = c.schema_state().unwrap();
+            assert!(!state.unknown_schema_job);
             if stop {
+                let Some(SchemaBoundary::Connector(boundary)) = &state.blocked_boundary else {
+                    panic!("expected typed MySQL stop: {state:?}");
+                };
+                assert_eq!(boundary.connector, "mysql");
+                assert_eq!(
+                    boundary.kind,
+                    if unknown {
+                        SchemaStopKind::UnknownDdl
+                    } else {
+                        SchemaStopKind::Ddl
+                    }
+                );
+                assert_eq!(
+                    boundary.table.as_deref(),
+                    if unknown { None } else { Some("type_zoo.zoo") }
+                );
+                assert!(boundary.diagnostic.contains(sql));
+                assert_eq!(Some(&boundary.position), batch.durable_position.as_ref());
                 assert!(
                     matches!(c.step().await, Err(Error::RecoveryRequired(reason)) if reason.contains(sql))
                 );
             }
+            assert_eq!(
+                c.schema_state(),
+                Some(state.clone()),
+                "stop must survive a later step"
+            );
+            assert_eq!(state.blocked_boundary.is_some(), stop);
             assert_eq!(c.writer_checkpoint().unwrap().unwrap().next_mseq, 0);
             drop(c);
             std::fs::remove_dir_all(root).unwrap();
@@ -812,9 +916,22 @@ async fn fixture_table_map_drift_stops_before_rows_and_preserves_last_commit() {
             assert!(
                 matches!(c.stop_reason(), Some(CaptureStopReason::TableMap { schema, table, .. }) if schema == "type_zoo" && table == "zoo")
             );
+            let state = c.schema_state().unwrap();
+            let Some(SchemaBoundary::Connector(boundary)) = &state.blocked_boundary else {
+                panic!("expected TABLE_MAP boundary: {state:?}");
+            };
+            assert_eq!(boundary.connector, "mysql");
+            assert_eq!(boundary.kind, SchemaStopKind::TableMapChanged);
+            assert_eq!(boundary.table.as_deref(), Some("type_zoo.zoo"));
+            assert!(!boundary.diagnostic.is_empty());
+            assert_eq!(
+                Some(&boundary.position),
+                committed.durable_position.as_ref()
+            );
             assert_eq!(c.writer_checkpoint().unwrap().unwrap().next_mseq, 1);
             assert!(reader.next_txn().await.unwrap().is_none());
             assert!(c.step().await.is_err());
+            assert_eq!(c.schema_state(), Some(state));
             drop(c);
             drop(reader);
             std::fs::remove_dir_all(root).unwrap();

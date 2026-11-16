@@ -71,6 +71,7 @@ fn probe(gtid: bool) -> MysqlReadinessProbe {
         expiry_seconds: 100,
         logs: Some(logs),
         retention_issue: None,
+        schema: None,
     }
 }
 fn applied(p: &MysqlReadinessProbe, n: u64) -> Position {
@@ -250,5 +251,38 @@ fn four_real_fixture_gtid_timestamps_present_including_payloads() {
         }
         assert!(found.len() >= 3, "{variant}");
         assert!(found.iter().all(|n| *n > 1_700_000_000_000_000));
+    }
+}
+
+#[test]
+fn schema_stop_is_typed_and_survives_a_clear_snapshot() {
+    use crate::engine::{ConnectorSchemaStop, SchemaBoundary, SchemaStopKind};
+    for kind in [
+        SchemaStopKind::Ddl,
+        SchemaStopKind::UnknownDdl,
+        SchemaStopKind::TableMapChanged,
+    ] {
+        let p = probe(true);
+        let a = applied(&p, 10);
+        let clear = SchemaState {
+            blocked_boundary: None,
+            unknown_schema_job: false,
+        };
+        let blocked = SchemaState {
+            blocked_boundary: Some(SchemaBoundary::Connector(ConnectorSchemaStop {
+                connector: "mysql".into(),
+                kind,
+                table: Some("type_zoo.zoo".into()),
+                diagnostic: "schema changed".into(),
+                position: a.clone(),
+            })),
+            unknown_schema_job: false,
+        };
+        let p = p.with_schema_state(clear.clone());
+        assert_eq!(p.sample(&a, None).unwrap().schema, Some(clear.clone()));
+        let p = p.with_schema_state(blocked.clone());
+        assert_eq!(p.sample(&a, None).unwrap().schema, Some(blocked.clone()));
+        let p = p.with_schema_state(clear);
+        assert_eq!(p.sample(&a, None).unwrap().schema, Some(blocked));
     }
 }

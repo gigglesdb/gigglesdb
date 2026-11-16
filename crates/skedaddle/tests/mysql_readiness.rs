@@ -7,7 +7,7 @@ use skedaddle::{
         backends::ObjectBufferStore,
         writer::{BufferWriter, WriterConfig},
     },
-    engine::{Capture, Captured, ReadinessProbe},
+    engine::{Capture, Captured, ReadinessProbe, SchemaBoundary, SchemaStopKind},
     event::{PositionOrder, SourceIdentity},
     mysql::{
         MysqlOrder, MysqlPosition,
@@ -134,7 +134,9 @@ async fn idle_burst_and_file_rotation_readiness() -> Result<(), Box<dyn std::err
     assert!(txn.commit_time.is_some());
     let mut applied = txn.commit_position.clone();
     let native = MysqlPosition::decode(applied.bytes())?;
-    let idle = MysqlReadinessProbe::observe(&config, source.clone(), &native, 6512).await?;
+    let idle = MysqlReadinessProbe::observe(&config, source.clone(), &native, 6512)
+        .await?
+        .with_schema_state(capture.schema_state().unwrap());
     assert_eq!(
         idle.tip().compare(&applied, order.as_ref())?,
         std::cmp::Ordering::Equal
@@ -163,7 +165,9 @@ async fn idle_burst_and_file_rotation_readiness() -> Result<(), Box<dyn std::err
             admin.conn.query_drop("FLUSH BINARY LOGS").await?;
         }
     }
-    let burst = MysqlReadinessProbe::observe(&config, source.clone(), &native, 6512).await?;
+    let burst = MysqlReadinessProbe::observe(&config, source.clone(), &native, 6512)
+        .await?
+        .with_schema_state(capture.schema_state().unwrap());
     assert!(
         burst.observed_at().elapsed() < Duration::from_secs(1),
         "burst probe must be fresh"
@@ -244,10 +248,54 @@ async fn idle_burst_and_file_rotation_readiness() -> Result<(), Box<dyn std::err
     assert_eq!(sample.lag.unwrap().value, 0);
     assert_eq!(sample.oldest_unapplied_age_ms, Some(0));
     assert!(sample.retention.unwrap().history_available);
-    assert!(
-        sample.schema.is_none(),
-        "schema observation deferred by P14 scope cut"
+    let clear_state = sample.schema.expect("capture supplied schema state");
+    assert!(clear_state.blocked_boundary.is_none());
+    assert!(!clear_state.unknown_schema_job);
+    admin
+        .conn
+        .query_drop("ALTER TABLE type_zoo.readiness_probe ADD COLUMN added BIGINT")
+        .await?;
+    let stopped = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let batch = capture.step().await.expect("DDL capture step");
+            if batch.stop {
+                break batch;
+            }
+        }
+    })
+    .await?;
+    let blocked = capture.schema_state().expect("MySQL schema classifier");
+    let Some(SchemaBoundary::Connector(boundary)) = &blocked.blocked_boundary else {
+        panic!("expected typed MySQL DDL stop: {blocked:?}");
+    };
+    assert_eq!(boundary.connector, "mysql");
+    assert_eq!(boundary.kind, SchemaStopKind::Ddl);
+    assert_eq!(boundary.table.as_deref(), Some("type_zoo.readiness_probe"));
+    assert!(boundary.diagnostic.contains("ADD COLUMN added"));
+    let stopped_position = stopped.durable_position.unwrap();
+    assert_eq!(boundary.position, stopped_position);
+    let native = MysqlPosition::decode(stopped_position.bytes())?;
+    let probe = MysqlReadinessProbe::observe(&config, source.clone(), &native, 6512)
+        .await?
+        .with_schema_state(blocked.clone());
+    assert_eq!(
+        probe.sample(&stopped_position, None)?.schema,
+        Some(blocked.clone())
     );
+    let clear = MysqlReadinessProbe::observe(&config, source, &native, 6512)
+        .await?
+        .with_schema_state(clear_state.clone());
+    assert_eq!(
+        clear.sample(&stopped_position, None)?.schema,
+        Some(clear_state)
+    );
+    assert!(capture.step().await.is_err());
+    assert_eq!(capture.schema_state(), Some(blocked.clone()));
+    let probe = probe.with_schema_state(skedaddle::engine::SchemaState {
+        blocked_boundary: None,
+        unknown_schema_job: false,
+    });
+    assert_eq!(probe.sample(&stopped_position, None)?.schema, Some(blocked));
     drop(capture);
     // Harness owns teardown of this labelled source and task-owned buffer data.
     Ok(())

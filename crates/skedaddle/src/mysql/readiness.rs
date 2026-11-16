@@ -2,15 +2,15 @@
 //!
 //! Register this probe before emitting its transactional watermark. The engine
 //! admits the tip only when that exact marker is manifest-durably captured.
-//! Schema is deliberately None until the neutral schema-boundary seam exists:
-//! M8 DDL stops still stop capture, preventing the run from reaching readiness.
+//! Carry capture schema evidence with `with_schema_state`; source status alone
+//! cannot classify schema changes in the selected capture stream.
 use super::{
     GtidSet, MysqlOrder, MysqlPosition,
     client::{MysqlConfig, MysqlError, MysqlStatus, Result},
     resume,
 };
 use crate::{
-    engine::{LagMeasure, ReadinessProbe, ReadinessProbeSample, RetentionMargin},
+    engine::{LagMeasure, ReadinessProbe, ReadinessProbeSample, RetentionMargin, SchemaState},
     event::{EventError, Position, PositionOrder, SourceIdentity},
 };
 use futures::StreamExt;
@@ -39,6 +39,7 @@ pub struct MysqlReadinessProbe {
     expiry_seconds: u64,
     logs: Option<Vec<LogEvidence>>,
     retention_issue: Option<String>,
+    schema: Option<SchemaState>,
 }
 impl MysqlReadinessProbe {
     /// Uses separate TLS connections for bounded binlog header reads. Missing
@@ -160,7 +161,22 @@ impl MysqlReadinessProbe {
             expiry_seconds,
             logs,
             retention_issue,
+            schema: None,
         })
+    }
+
+    /// Attach the capture classifier snapshot. A source-status observation on
+    /// its own has unknown schema state. Once attached, a stop cannot be cleared
+    /// by a later clear snapshot; reconstruct capture with a new baseline.
+    pub fn with_schema_state(mut self, schema: SchemaState) -> Self {
+        if self
+            .schema
+            .as_ref()
+            .is_none_or(|state| state.blocked_boundary.is_none())
+        {
+            self.schema = Some(schema);
+        }
+        self
     }
 
     /// Header acquisition failures explain unknown retention without granting it.
@@ -274,7 +290,7 @@ impl ReadinessProbe for MysqlReadinessProbe {
             lag,
             oldest_unapplied_age_ms: now.and_then(|now| commit_age(now, oldest_commit)),
             retention: now.and_then(|now| self.retention(applied, &native, now)),
-            schema: None,
+            schema: self.schema.clone(),
             observed_at: self.started,
         })
     }
