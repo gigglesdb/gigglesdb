@@ -1233,7 +1233,7 @@ async fn jdbc_startup_presentation_hints_are_bounded_and_do_not_grant_authority(
                     break;
                 }
             }
-            assert!(statuses.iter().any(|v| v == "DateStyle\0ISO\0"));
+            assert!(statuses.iter().any(|v| v == "DateStyle\0ISO, MDY\0"));
             let expected_timezone = statuses
                 .iter()
                 .find_map(|v| v.strip_prefix("TimeZone\0"))
@@ -3001,7 +3001,7 @@ mod lifecycle_network;
 async fn installed_datagrip_detection_and_startup_queries() {
     let f = Fixture::new().await;
     let (pg, conn) = f.pg(f.app.clone()).await;
-    for (sql, expected) in [("show DateStyle", "ISO"), ("SHOW TimeZone", "UTC")] {
+    for (sql, expected) in [("show DateStyle", "ISO, MDY"), ("SHOW TimeZone", "UTC")] {
         assert_eq!(
             pg.query_one(sql, &[]).await.unwrap().get::<_, String>(0),
             expected
@@ -3027,7 +3027,7 @@ async fn installed_datagrip_detection_and_startup_queries() {
     assert_eq!(pg.query(&typed, &[&28i64]).await.unwrap().len(), 1);
 
     let version: String = pg.query_one("select version()", &[]).await.unwrap().get(0);
-    assert!(version.starts_with("PostgreSQL 18.0 (GigglesDB "));
+    assert!(version.starts_with("PostgreSQL 18.6 (GigglesDB "));
     let sql = "select round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC')) as startup_time";
     let p = pg.prepare(sql).await.unwrap();
     let first: i64 = pg.query_one(&p, &[]).await.unwrap().get(0);

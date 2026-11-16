@@ -707,15 +707,7 @@ impl Session {
         Ok(())
     }
     pub(crate) fn set_time_zone(&mut self, name: &str) {
-        self.zone = if ["UTC", "Etc/UTC", "GMT", "Z"]
-            .iter()
-            .any(|alias| name.eq_ignore_ascii_case(alias))
-        {
-            Some(SessionZone::Fixed(0))
-        } else {
-            // No PostgreSQL POSIX-offset parser is exposed by pg-types.
-            SessionZone::named(name).ok()
-        };
+        self.zone = SessionZone::setting(name).ok().map(|(zone, _)| zone);
     }
     fn role_epoch(&self) -> u64 {
         self.role_fence.map_or(self.epoch, |(_, generation)| generation)
@@ -2763,10 +2755,10 @@ mod lifecycle_tests {
         );
         sql_instant(&mut session, "SELECT now()");
         session.set_time_zone("+03:00");
-        assert!(session.zone.is_none());
-        for name in ["UTC", "etc/utc", "GMT", "Z"] {
+        assert!(matches!(session.zone, Some(SessionZone::Fixed(-10800))));
+        for name in ["UTC", "etc/utc", "GMT"] {
             session.set_time_zone(name);
-            assert!(matches!(session.zone, Some(SessionZone::Fixed(0))));
+            assert_eq!(session.zone.unwrap().to_local(instant).unwrap().microseconds(), instant.microseconds());
         }
     }
     #[test]

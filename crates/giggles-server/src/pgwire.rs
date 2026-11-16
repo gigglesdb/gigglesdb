@@ -133,6 +133,7 @@ struct Diagnostic {
     phase: &'static str,
     message: Option<&'static str>,
     wire_message: Option<String>,
+    wire_detail: Option<&'static str>,
     query_id: Option<String>,
 }
 impl Diagnostic {
@@ -215,7 +216,7 @@ fn diagnostic_error(
     );
     if let Some(detail) = detail {
         b.push(b'D');
-        z(&detail, &mut b);
+        z(diagnostic.and_then(|d| d.wire_detail).unwrap_or(&detail), &mut b);
     }
     if code == "0A000" && diagnostic.and_then(|d| d.wire_message.as_deref()) == Some("view projection bindings unavailable; recreate the view") {
         b.push(b'H');
@@ -2155,12 +2156,12 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     let key = [backend.pid.to_be_bytes(), backend.secret.to_be_bytes()].concat();
     frame(b'K', &key, &mut out).map_err(io::Error::other)?;
     for (key, value) in [
-        ("server_version", "18.0"),
+        ("server_version", "18.6"),
         ("client_encoding", "UTF8"),
         ("server_encoding", "UTF8"),
         ("standard_conforming_strings", "on"),
         ("integer_datetimes", "on"),
-        ("DateStyle", "ISO"),
+        ("DateStyle", "ISO, MDY"),
         ("TimeZone", timezone.as_str()),
     ]
     .into_iter()
@@ -2345,6 +2346,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
             }
         };
         state.diagnostic = Diagnostic {
+            wire_detail: None,
             wire_message: None,
             message: None,
             phase: match tag {

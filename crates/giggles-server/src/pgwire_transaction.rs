@@ -40,7 +40,8 @@ pub(super) fn execute_mode(
         return Err("42501");
     }
     match command {
-        Command::Begin(modes) => {
+        Command::Begin(modes) | Command::Start(modes) => {
+            let start_tag = matches!(command, Command::Start(_));
             let starting = !session.in_transaction() || *implicit;
             let actual = execute_control("BEGIN", session, implicit, settings, out)?;
             if starting {
@@ -57,7 +58,7 @@ pub(super) fn execute_mode(
                     settings.current.transaction_read_only = read_only;
                 }
             }
-            Ok(actual)
+            Ok(if start_tag { "START TRANSACTION" } else { actual })
         }
         Command::Commit => execute_control("COMMIT", session, implicit, settings, out),
         Command::Rollback => execute_control("ROLLBACK", session, implicit, settings, out),

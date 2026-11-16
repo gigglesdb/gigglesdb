@@ -34,7 +34,7 @@ pub(super) fn plan_class(plan: &Plan) -> Option<StatementClass> {
         Plan::Admin(A::Error(_) | A::Create(..) | A::Alter(..) | A::Drop(..) | A::Grant { .. }) => {
             StatementClass::RoleStatement
         }
-        Plan::Control(C::Begin(_) | C::Commit | C::Rollback | C::Set(_) | C::Session(_)) => {
+        Plan::Control(C::Begin(_) | C::Start(_) | C::Commit | C::Rollback | C::Set(_) | C::Session(_)) => {
             StatementClass::TransactionControl
         }
         Plan::Control(C::Savepoint(_) | C::Release(_) | C::RollbackTo(_)) => {

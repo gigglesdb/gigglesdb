@@ -166,7 +166,7 @@ impl Fixture {
             .connect(NoTls)
             .await
             .unwrap();
-        assert_eq!(connection.parameter("server_version"), Some("18.0"));
+        assert_eq!(connection.parameter("server_version"), Some("18.6"));
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -226,7 +226,7 @@ async fn build_identity_and_capabilities_agree_across_protocol_surfaces() {
     let build_id = giggles_pg_catalog::BUILD_ID;
     assert!(build_id == "unknown" || (build_id.len() == 12
         && build_id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))));
-    let expected = format!("PostgreSQL 18.0 (GigglesDB 0.1.0+{build_id})");
+    let expected = format!("PostgreSQL 18.6 (GigglesDB 0.1.0+{build_id})");
     for sql in ["SELECT version()", "SELECT pg_catalog.version() FROM pg_catalog.pg_roles LIMIT 1"] {
         assert_eq!(values(&client.simple_query(sql).await.unwrap()), [expected.as_str()], "{sql}");
         assert_eq!(client.query_one(sql, &[]).await.unwrap().get::<_, String>(0), expected, "{sql}");
@@ -276,7 +276,7 @@ async fn server_encoding_is_utf8_and_read_only_across_protocol_surfaces() {
 async fn postgres_18_version_settings_agree_across_protocol_surfaces() {
     let fixture = Fixture::new().await;
     let client = fixture.client().await;
-    for (name, expected) in [("server_version", "18.0"), ("server_version_num", "180000")] {
+    for (name, expected) in [("server_version", "18.6"), ("server_version_num", "180006")] {
         for sql in [
             format!("SHOW {name}"),
             format!("SELECT current_setting('{name}')"),
@@ -301,8 +301,8 @@ async fn postgres_18_version_settings_agree_across_protocol_surfaces() {
         .await
         .unwrap()
         .get(0);
-    assert!(version.starts_with("PostgreSQL 18.0 (GigglesDB "));
-    for (path, expected) in [("", "{}"), ("missing, public, public", r#"{"public"}"#)] {
+    assert!(version.starts_with("PostgreSQL 18.6 (GigglesDB "));
+    for (path, expected) in [("", "{}"), ("missing, public, public", r#"{public}"#)] {
         client
             .batch_execute(&format!("SET search_path = '{path}'"))
             .await
@@ -711,7 +711,7 @@ async fn transaction_local_reset_and_multi_statement_settings() {
         ["batch", "GMT"]
     );
     c.query("RESET ALL", &[]).await.unwrap();
-    assert_eq!(values(&c.simple_query("SHOW application_name; SHOW TimeZone; SHOW DateStyle; SHOW search_path; SHOW extra_float_digits").await.unwrap()), ["", "UTC", "ISO", default_path, "1"]);
+    assert_eq!(values(&c.simple_query("SHOW application_name; SHOW TimeZone; SHOW DateStyle; SHOW search_path; SHOW extra_float_digits").await.unwrap()), ["", "UTC", "ISO, MDY", default_path, "1"]);
     drop(c);
     f.stop().await;
 }
@@ -878,7 +878,7 @@ async fn orm_interval_output_and_readonly_presets() {
     for (schema, expected) in [("public", true), ("missing", false)] {
         let row = c.query_one(sql, &[&schema]).await.unwrap();
         assert_eq!(row.get::<_, bool>(0), expected);
-        assert_eq!(row.get::<_, i32>(2), 180000);
+        assert_eq!(row.get::<_, i32>(2), 180006);
     }
     drop(c);
     f.stop().await;
@@ -999,4 +999,117 @@ async fn pgadmin_numeric_settings_inventory_shapes() {
     assert!(client.simple_query("SELECT name,setting::numeric AS setting FROM pg_show_all_settings() WHERE name IN ('AUTOVACUUM_VACUUM_THRESHOLD') ORDER BY name").await.unwrap().iter().all(|m| !matches!(m, SimpleQueryMessage::Row(_))));
     drop(client);
     fixture.stop().await;
+}
+
+
+#[tokio::test]
+async fn pgparity_timezone_forms_drive_output_and_conversions() {
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    c.batch_execute("CREATE TABLE zone_probe (id int); INSERT INTO zone_probe VALUES (1)").await.unwrap();
+    for (input, label, output) in [
+        ("'America/New_York'", "America/New_York", "2024-01-01 22:04:05-05"),
+        ("'+05:30'", "+05:30", "2024-01-01 21:34:05-05:30"),
+        ("'05:30'", "05:30", "2024-01-01 21:34:05-05:30"),
+        ("'UTC+3'", "UTC+3", "2024-01-02 00:04:05-03"),
+        ("'UTC-05:30'", "UTC-05:30", "2024-01-02 08:34:05+05:30"),
+        ("'UTC+99'", "UTC+99", "2023-12-29 00:04:05-99"),
+        ("'UTC+15'", "UTC+15", "2024-01-01 12:04:05-15"),
+        ("'PST8PDT'", "PST8PDT", "2024-01-01 19:04:05-08"),
+        ("'-03'", "<-03>+03", "2024-01-02 00:04:05-03"),
+        ("'+5'", "<+05>-05", "2024-01-02 08:04:05+05"),
+        ("2", "<+02>-02", "2024-01-02 05:04:05+02"),
+        ("-2.5", "<-02:30>+02:30", "2024-01-02 00:34:05-02:30"),
+        ("2.25", "<+02:15>-02:15", "2024-01-02 05:19:05+02:15"),
+        ("15", "<+15>-15", "2024-01-02 18:04:05+15"),
+        ("16", "<+16>-16", "2024-01-02 19:04:05+16"),
+        ("-15", "<-15>+15", "2024-01-01 12:04:05-15"),
+        ("INTERVAL '+05:30' HOUR TO MINUTE", "<+05:30>-05:30", "2024-01-02 08:34:05+05:30"),
+        ("INTERVAL '-08:00'", "<-08>+08", "2024-01-01 19:04:05-08"),
+        ("'utc'", "UTC", "2024-01-02 03:04:05+00"),
+        ("'europe/paris'", "Europe/Paris", "2024-01-02 04:04:05+01"),
+        ("'GMT'", "GMT", "2024-01-02 03:04:05+00"),
+        ("'Etc/GMT+3'", "Etc/GMT+3", "2024-01-02 00:04:05-03"),
+    ] {
+        c.batch_execute(&format!("SET TIME ZONE {input}")).await.unwrap();
+        assert_eq!(values(&c.simple_query("SHOW TimeZone").await.unwrap()), [label], "{input}");
+        for suffix in ["", " FROM zone_probe"] {
+            let sql = format!("SELECT TIMESTAMPTZ '2024-01-02 03:04:05+00'{suffix}");
+            assert_eq!(values(&c.simple_query(&sql).await.unwrap()), [output], "{input} {sql}");
+            let sql = format!("SELECT (TIMESTAMPTZ '2024-01-02 03:04:05+00')::timestamp{suffix}");
+            assert_eq!(values(&c.simple_query(&sql).await.unwrap()), [&output[..19]], "{input} cast");
+            let sql = format!("SELECT timezone('{label}', TIMESTAMPTZ '2024-01-02 03:04:05+00'){suffix}");
+            assert_eq!(values(&c.simple_query(&sql).await.unwrap()), [&output[..19]], "{input} timezone()");
+            let sql = format!("SELECT (TIMESTAMPTZ '2024-01-02 03:04:05+00')::date{suffix}");
+            assert_eq!(values(&c.simple_query(&sql).await.unwrap()), [&output[..10]], "{input} date cast");
+            let sql = format!("SELECT now()::timestamp = localtimestamp{suffix}");
+            assert_eq!(values(&c.simple_query(&sql).await.unwrap()), ["t"], "{input} now()");
+            let sql = format!("SELECT (TIMESTAMP '{}')::timestamptz{suffix}", &output[..19]);
+            assert_eq!(values(&c.simple_query(&sql).await.unwrap()), [output], "{input} inverse cast");
+        }
+    }
+    for (zone, output) in [("XYZ-3:30", "2024-07-02 06:34:05+03:30"), ("EST5EDT", "2024-07-01 23:04:05-04")] {
+        c.batch_execute(&format!("SET TIME ZONE '{zone}'")).await.unwrap();
+        assert_eq!(values(&c.simple_query("SELECT TIMESTAMPTZ '2024-07-02 03:04:05+00'").await.unwrap()), [output]);
+    }
+    for sql in ["SET TIME ZONE 'Not/AZone'", "SET TIME ZONE 'Z'", "SET TIME ZONE 'zulu'", "SET TIME ZONE 'PST'", "SET TIME ZONE 'abc'", "SET TIME ZONE ''", "SET TIME ZONE INTERVAL '1 day'"] {
+        let e = c.simple_query(sql).await.unwrap_err();
+        let db = e.as_db_error().unwrap();
+        assert_eq!(db.message(), "invalid value for parameter \"TimeZone\"", "{sql}");
+        if sql.contains("INTERVAL") {
+            assert_eq!(db.detail(), Some("Cannot specify days in time zone interval"));
+        }
+        assert_eq!(code(e), "22023", "{sql}");
+        assert_eq!(values(&c.simple_query("SHOW TimeZone").await.unwrap()), ["EST5EDT"]);
+    }
+    assert_eq!(code(c.simple_query("SET TIME ZONE INTERVAL '+05:30:15' HOUR TO SECOND").await.unwrap_err()), "42601");
+    for sql in ["SET TIME ZONE LOCAL", "SET TIME ZONE DEFAULT", "RESET TimeZone"] {
+        c.batch_execute(sql).await.unwrap();
+        assert_eq!(values(&c.simple_query("SHOW TimeZone").await.unwrap()), ["UTC"]);
+    }
+    c.batch_execute("SET TimeZone = '+05:30'").await.unwrap();
+    assert_eq!(values(&c.simple_query("SHOW TimeZone").await.unwrap()), ["+05:30"]);
+    c.batch_execute("SET TimeZone TO 'utc'").await.unwrap();
+    drop(c); f.stop().await;
+}
+
+#[tokio::test]
+async fn pgparity_version_datestyle_schemas_and_tags() {
+    fn all_values(messages: &[SimpleQueryMessage]) -> Vec<String> {
+        messages.iter().flat_map(|m| match m {
+            SimpleQueryMessage::Row(row) => (0..row.len()).map(|i| row.get(i).unwrap().to_owned()).collect(),
+            _ => Vec::new(),
+        }).collect()
+    }
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    for (sql, expected) in [
+        ("SHOW server_version_num", vec!["180006"]),
+        ("SELECT current_setting('server_version_num')", vec!["180006"]),
+        ("SHOW server_version", vec!["18.6"]),
+        ("SELECT split_part(version(), ' ', 1), split_part(version(), ' ', 2)", vec!["PostgreSQL", "18.6"]),
+        ("SHOW DateStyle", vec!["ISO, MDY"]),
+        ("SELECT current_setting('DateStyle')", vec!["ISO, MDY"]),
+        ("SELECT current_schemas(false), current_schemas(true)", vec!["{public}", "{pg_catalog,public}"]),
+    ] {
+        assert_eq!(all_values(&c.simple_query(sql).await.unwrap()), expected, "{sql}");
+    }
+    c.batch_execute("SET DateStyle='ISO'; CREATE SCHEMA r0c_s; SET search_path TO r0c_s, public").await.unwrap();
+    assert_eq!(all_values(&c.simple_query("SHOW DateStyle; SELECT current_schemas(false), current_schemas(true)").await.unwrap()), ["ISO, MDY", "{r0c_s,public}", "{pg_catalog,r0c_s,public}"]);
+    c.batch_execute("SET DateStyle='ISO, DMY'").await.unwrap();
+    assert_eq!(all_values(&c.simple_query("SHOW DateStyle; SELECT current_setting('DateStyle')").await.unwrap()), ["ISO, DMY", "ISO, DMY"]);
+    let mut stream = TcpStream::connect(f.pg.address).await.unwrap();
+    let startup = b"\0\x03\0\0user\0owner\0database\0postgres\0\0";
+    stream.write_u32((startup.len() + 4) as u32).await.unwrap();
+    stream.write_all(startup).await.unwrap();
+    let statuses = wire_cycle(&mut stream).await;
+    assert!(statuses.iter().any(|(tag, b)| *tag == b'S' && b == b"server_version\x0018.6\0"));
+    assert!(statuses.iter().any(|(tag, b)| *tag == b'S' && b == b"DateStyle\0ISO, MDY\0"));
+    for (begin, end) in [("START TRANSACTION", "END"), ("START TRANSACTION READ ONLY", "END WORK"), ("BEGIN", "COMMIT WORK"), ("BEGIN WORK", "ABORT"), ("BEGIN TRANSACTION", "ABORT WORK"), ("BEGIN", "ROLLBACK WORK")] {
+        for (sql, expected) in [(begin, if begin.starts_with("START") { "START TRANSACTION" } else { "BEGIN" }), (end, if end.starts_with("ABORT") || end.starts_with("ROLLBACK") { "ROLLBACK" } else { "COMMIT" })] {
+            let messages = wire_query(&mut stream, sql).await;
+            assert!(messages.iter().any(|(tag, body)| *tag == b'C' && body == format!("{expected}\0").as_bytes()), "{sql} {messages:?}");
+        }
+    }
+    drop(c); f.stop().await;
 }

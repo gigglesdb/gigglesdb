@@ -672,7 +672,22 @@ pub(super) fn parse_settings(
     diagnostic: &mut Diagnostic,
 ) -> R<Option<Vec<crate::pg_settings::Setting>>> {
     if matches!(session.role, Role::Database { .. }) {
-        diagnostic.settings(crate::pg_settings::parse_database(sql))
+        let result = diagnostic.settings(crate::pg_settings::parse_database(sql));
+        if matches!(result, Err("22023"))
+            && let Ok(tokens) = crate::pg_settings::database::lex(sql) {
+                use crate::pg_settings::database::Token;
+                let mut p = crate::pg_settings::database::Parser { tokens, at: 0 };
+                p.kw("SET");
+                if !p.kw("SESSION") { p.kw("LOCAL"); }
+                let zone = p.kw("TIMEZONE") || (p.kw("TIME") && p.kw("ZONE"));
+                if zone {
+                    diagnostic.wire_message = Some("invalid value for parameter \"TimeZone\"".into());
+                    if p.tokens.iter().any(|t| matches!(t, Token::Word(w) if w.eq_ignore_ascii_case("INTERVAL"))) {
+                        diagnostic.wire_detail = Some("Cannot specify days in time zone interval");
+                    }
+                }
+            }
+        result
     } else {
         crate::pg_settings::parse(sql)
     }

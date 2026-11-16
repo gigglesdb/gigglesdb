@@ -2633,8 +2633,8 @@ impl Compiler {
                         let value = match name.to_ascii_lowercase().as_str() {
                             "giggles_capabilities" => crate::CAPABILITIES,
                             "server_encoding" => "UTF8",
-                            "server_version" => "18.0",
-                            "server_version_num" => "180000",
+                            "server_version" => "18.6",
+                            "server_version_num" => "180006",
                             "max_identifier_length" => "63",
                             "max_index_keys" => "32",
                             "block_size" => "8192",
@@ -3224,6 +3224,11 @@ fn check_expr(e: &mut E) -> R<()> {
             "pg_get_function_arguments" | "pg_get_function_result" | "pg_get_function_sqlbody" => {
                 expect(&mut args[0], PgType::Oid)?;
             }
+            "split_part" => {
+                expect(&mut args[0], PgType::Text)?;
+                expect(&mut args[1], PgType::Text)?;
+                expect(&mut args[2], PgType::Int4)?;
+            }
             "current_schemas" => expect(&mut args[0], PgType::Bool)?,
             "encode" => {
                 expect(&mut args[0], PgType::Bytea)?;
@@ -3353,7 +3358,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         ("greatest", n) if n > 0 => common_type(a.iter())?,
         ("concat", n) if n > 0 && a.iter().all(|e| textual(e.ty)) => PgType::Text,
         ("btrim" | "ltrim" | "rtrim", 2) => PgType::Text,
-        ("version", 0) => PgType::Text,
+        ("version", 0) | ("split_part", 3) => PgType::Text,
         ("pg_is_in_recovery" | "pg_is_wal_replay_paused", 0) => PgType::Bool,
         ("current_schemas", 1) => PgType::NameArray,
         ("acldefault", 2) => PgType::AclItemArray,
@@ -4958,7 +4963,7 @@ impl Runtime<'_> {
                 S(output)
             }
             "version" => S(concat!(
-                "PostgreSQL 18.0 (GigglesDB ",
+                "PostgreSQL 18.6 (GigglesDB ",
                 env!("CARGO_PKG_VERSION"),
                 "+",
                 env!("GIGGLES_BUILD_ID"),
@@ -4989,6 +4994,15 @@ impl Runtime<'_> {
                     path.insert(0, "pg_catalog".into());
                 }
                 Value::Array(path.into_iter().map(S).collect())
+            }
+            "split_part" => {
+                let s = text(v[0].clone())?;
+                let delimiter = text(v[1].clone())?;
+                let index = integer(v[2].clone())?;
+                if index == 0 { return Err(Error::Unsupported); }
+                let parts = if delimiter.is_empty() { vec![s.as_str()] } else { s.split(&delimiter).collect::<Vec<_>>() };
+                let at = if index > 0 { index - 1 } else { parts.len() as i64 + index };
+                S(usize::try_from(at).ok().and_then(|at| parts.get(at)).unwrap_or(&"").to_string())
             }
             "replace" => {
                 let s = text(v[0].clone())?;

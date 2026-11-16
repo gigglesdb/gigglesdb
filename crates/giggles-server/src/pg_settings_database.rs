@@ -255,6 +255,20 @@ pub(crate) fn parse_database(sql: &str) -> Result<Option<Vec<Setting>>> {
         if p.kw("DEFAULT") || (name == Show::TimeZone && p.kw("LOCAL")) {
             p.end()?;
             None
+        } else if name == Show::TimeZone && p.kw("INTERVAL") {
+            let interval = match p.tokens.get(p.at) {
+                Some(Token::Text(s)) => s.clone(),
+                _ => return Err("42601"),
+            };
+            p.at += 1;
+            if p.kw("HOUR") { p.need("TO")?; p.need("MINUTE")?; }
+            p.end()?;
+            let interval = giggles_pg_types::temporal::Interval::parse(&interval).map_err(|_| "22023")?;
+            let (months, days, micros) = (interval.months(), interval.days(), interval.microseconds());
+            if months != 0 || days != 0 { return Err("22023"); }
+            let seconds = i32::try_from(micros / 1_000_000).map_err(|_| "22023")?;
+            Some(giggles_pg_types::temporal::SessionZone::interval_setting(seconds)
+                .map_err(|_| "22023")?.1)
         } else {
             Some(validate(name, p.values()?)?)
         }
@@ -300,15 +314,8 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
             .filter(|n| (-15..=3).contains(n))
             .map(|n| n.to_string())
             .ok_or("22023"),
-        Show::TimeZone
-            if !value.is_empty()
-                && value.len() <= 128
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"/_+-:.".contains(&b)) =>
-        {
-            Ok(value)
-        }
+        Show::TimeZone => giggles_pg_types::temporal::SessionZone::setting(&value)
+            .map(|(_, label)| label).map_err(|_| "22023"),
         Show::DateStyle => {
             let parts: Vec<_> = lower.split(',').map(str::trim).collect();
             match parts.as_slice() {

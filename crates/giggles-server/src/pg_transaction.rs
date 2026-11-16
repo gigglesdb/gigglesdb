@@ -65,6 +65,7 @@ pub(crate) struct Modes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Begin(Modes),
+    Start(Modes),
     Commit,
     Rollback,
     Savepoint(String),
@@ -180,7 +181,7 @@ pub(crate) fn parse(sql: &str) -> Result<Option<Command>> {
         Command::Begin(modes(&mut p, false)?)
     } else if p.kw("START") {
         p.need("TRANSACTION")?;
-        Command::Begin(modes(&mut p, false)?)
+        Command::Start(modes(&mut p, false)?)
     } else if p.kw("COMMIT") || p.kw("END") {
         if !p.kw("WORK") {
             p.kw("TRANSACTION");

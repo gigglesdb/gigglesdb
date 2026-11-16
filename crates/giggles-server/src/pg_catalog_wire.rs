@@ -837,15 +837,10 @@ fn encode_with_extra(
                             {
                                 return Err("54000");
                             }
-                            // Always quote text, including the string "NULL".
-                            if matches!(
-                                scalar,
-                                PgType::Text
-                                    | PgType::Varchar
-                                    | PgType::Name
-                                    | PgType::Char
-                                    | PgType::Bytea
-                            ) {
+                            // array_out quotes empty, NULL-like and delimiter-bearing elements.
+                            let quote = item.is_empty() || item.eq_ignore_ascii_case(b"NULL")
+                                || item.iter().any(|b| b.is_ascii_whitespace() || matches!(b, b',' | b'{' | b'}' | b'"' | b'\\'));
+                            if quote || matches!(scalar, PgType::Text | PgType::Varchar | PgType::Char | PgType::Bytea) {
                                 encoded.push(b'"');
                                 for byte in item {
                                     if matches!(byte, b'"' | b'\\') {

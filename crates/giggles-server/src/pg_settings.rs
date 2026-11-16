@@ -55,7 +55,7 @@ impl Default for Settings {
             statement_timeout: 0,
             extra_float_digits: 1,
             timezone: "UTC".into(),
-            datestyle: "ISO".into(),
+            datestyle: "ISO, MDY".into(),
             intervalstyle: "postgres".into(),
             search_path: r#""$user", public"#.into(),
             client_min_messages: "notice".into(),
@@ -338,8 +338,8 @@ impl Show {
                 "giggles_capabilities",
                 giggles_pg_catalog::CAPABILITIES.into(),
             ),
-            Self::ServerVersion => ("server_version", "18.0".into()),
-            Self::ServerVersionNum => ("server_version_num", "180000".into()),
+            Self::ServerVersion => ("server_version", "18.6".into()),
+            Self::ServerVersionNum => ("server_version_num", "180006".into()),
             Self::MaxIdentifierLength => ("max_identifier_length", "63".into()),
             Self::BlockSize => ("block_size", "8192".into()),
             Self::IntegerDatetimes => ("integer_datetimes", "on".into()),
@@ -656,7 +656,7 @@ mod tests {
         );
         assert_eq!(
             Show::DateStyle.value(&settings),
-            ("DateStyle", "ISO".into())
+            ("DateStyle", "ISO, MDY".into())
         );
         assert_eq!(Show::TimeZone.value(&settings).1, "UTC");
         settings.timezone = "America/Chicago".into();

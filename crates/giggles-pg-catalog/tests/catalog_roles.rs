@@ -41,9 +41,9 @@ fn build_identity_and_immutable_capabilities_are_pinned() {
         assert_eq!(result.fields[0].data_type, PgType::Text, "{sql}");
         assert_eq!(result.rows, vec![vec![s(CAPABILITIES)]], "{sql}");
     }
-    let expected = format!("PostgreSQL 18.0 (GigglesDB 0.1.0+{BUILD_ID})");
+    let expected = format!("PostgreSQL 18.6 (GigglesDB 0.1.0+{BUILD_ID})");
     assert!(
-        regex::Regex::new(r"^PostgreSQL 18\.0 \(GigglesDB 0\.1\.0\+([0-9a-f]{12}|unknown)\)$")
+        regex::Regex::new(r"^PostgreSQL 18\.6 \(GigglesDB 0\.1\.0\+([0-9a-f]{12}|unknown)\)$")
             .unwrap()
             .is_match(&expected)
     );
