@@ -80,6 +80,15 @@ async fn stopped(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
         }
     }
 }
+/// Shared state assigned to a configured native Spanner route.
+pub struct RouteState {
+    /// Shared durable authority.
+    pub authority: Arc<crate::state::authority::Authority>,
+    /// Shared connection registry.
+    pub registry: crate::state::runtime::Registry,
+    /// Validated configured route identifier.
+    pub route: crate::state::model::RouteId,
+}
 /// Serve native Spanner requests until shutdown, retaining old snapshots on refresh failures.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_spanner(
@@ -87,6 +96,7 @@ pub async fn run_spanner(
     policy: Arc<Policy>,
     root_key: RootKey,
     tasks: TaskStore,
+    state: RouteState,
     readlog: Box<dyn ReadLog>,
     standing: BTreeMap<String, ScramVerifier>,
     _policy_path: PathBuf,
@@ -94,7 +104,7 @@ pub async fn run_spanner(
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     run_spanner_with_hub(
-        section, policy, root_key, tasks, readlog, standing, None, tls, shutdown,
+        section, policy, root_key, tasks, state, readlog, standing, None, tls, shutdown,
     )
     .await
 }
@@ -104,6 +114,7 @@ pub(crate) async fn run_spanner_with_hub(
     policy: Arc<Policy>,
     root_key: RootKey,
     tasks: TaskStore,
+    state: RouteState,
     readlog: Box<dyn ReadLog>,
     standing: BTreeMap<String, ScramVerifier>,
     hub: Option<Arc<crate::reload::Hub>>,
@@ -144,6 +155,9 @@ pub(crate) async fn run_spanner_with_hub(
                 .map_err(|_| "spanner: policy validation failed".to_owned())?;
         }
         let ctx = Arc::new(SpannerContext {
+            authority: state.authority,
+            registry: state.registry,
+            route: state.route,
             policy: RwLock::new(policy),
             snapshot: RwLock::new(Arc::new(snapshot)),
             root_key,

@@ -56,6 +56,12 @@ pub enum SpannerUpstream {
 }
 /// Shared resources for native Spanner requests.
 pub struct SpannerContext {
+    /// Shared durable session authority.
+    pub authority: Arc<crate::state::authority::Authority>,
+    /// Shared live connection registry.
+    pub registry: crate::state::runtime::Registry,
+    /// Validated route identifier.
+    pub route: crate::state::model::RouteId,
     /// Reloadable policy.
     pub policy: RwLock<Arc<Policy>>,
     /// Reloadable schema.
@@ -1415,7 +1421,17 @@ mod tests {
                 vec!["".into()],
                 0,
             );
+            let runtime = crate::state::runtime::StateRuntime::open(
+                &dir.join("state"),
+                &RootKey::from_hex(&"00".repeat(32)).unwrap(),
+                &crate::config::SessionSettings::default(),
+                &[],
+            )
+            .unwrap();
             let ctx = Arc::new(SpannerContext {
+                authority: runtime.authority.clone(),
+                registry: runtime.registry.clone(),
+                route: crate::state::model::RouteId::new("spanner-native").unwrap(),
                 policy: RwLock::new(Arc::new(policy)),
                 snapshot: RwLock::new(Arc::new(snapshot)),
                 root_key: RootKey::from_hex(&"00".repeat(32)).unwrap(),

@@ -106,6 +106,18 @@ async fn standing_worked_example() {
     };
     let tasks = nunya::task::TaskStore::open_dir(&dir.join("tasks")).unwrap();
     let root = nunya::token::keys::RootKey::from_hex(&"ab".repeat(32)).unwrap();
+    let runtime = nunya::state::runtime::StateRuntime::open(
+        &dir.join("state"),
+        &root,
+        &nunya::config::SessionSettings::default(),
+        &[],
+    )
+    .unwrap();
+    let state = nunya::spanner_serve::RouteState {
+        authority: runtime.authority.clone(),
+        registry: runtime.registry.clone(),
+        route: nunya::state::model::RouteId::new("spanner-native").unwrap(),
+    };
     let standing = BTreeMap::from([(
         "agent".into(),
         nunya::pgwire::auth::ScramVerifier::from_password(
@@ -121,6 +133,7 @@ async fn standing_worked_example() {
             Arc::new(policy),
             root,
             tasks,
+            state,
             log,
             standing,
             PathBuf::new(),

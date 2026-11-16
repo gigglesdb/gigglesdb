@@ -61,6 +61,12 @@ type CancelMap = HashMap<(i32, [u8; 4]), (i32, Vec<u8>)>;
 
 /// Gateway resources and configuration shared by sessions.
 pub struct GatewayContext {
+    /// Shared durable session authority.
+    pub authority: Arc<crate::state::authority::Authority>,
+    /// Shared live connection registry.
+    pub registry: crate::state::runtime::Registry,
+    /// Validated route identifier.
+    pub route: crate::state::model::RouteId,
     /// Reloadable policy.
     pub policy: RwLock<Arc<Policy>>,
     /// Reloadable schema snapshot.

@@ -267,6 +267,38 @@ pub(crate) async fn hangup() {
 
 /// Serve agents until a shutdown signal, draining active sessions for thirty seconds.
 pub async fn run(mut config: Config) -> Result<(), String> {
+    let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
+    let root_key =
+        crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
+    let runtime = crate::state::runtime::StateRuntime::open(
+        &config.state_dir,
+        &root_key,
+        &config.session,
+        &config.standing,
+    )?;
+    // GD-0081 integration: start mgmt::server here (not started yet; lead 5 builds it).
+    let postgres_route = if config.upstream.is_some() {
+        Some(
+            config
+                .postgres_route_id
+                .as_deref()
+                .and_then(crate::state::model::RouteId::new)
+                .ok_or("PostgreSQL route id unavailable")?,
+        )
+    } else {
+        None
+    };
+    let spanner_route = if config.spanner_native.is_some() {
+        Some(
+            config
+                .spanner_route_id
+                .as_deref()
+                .and_then(crate::state::model::RouteId::new)
+                .ok_or("Spanner route id unavailable")?,
+        )
+    } else {
+        None
+    };
     let hub = crate::reload::Hub::new(&config.policy, config.policy_watch_ms)?;
     let policy = hub.policy();
     let (reload_tx, reload_rx) = mpsc::channel(1);
@@ -288,6 +320,11 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let mut routes = JoinSet::new();
     if let Some(section) = config.spanner_native.take() {
+        let state = crate::spanner_serve::RouteState {
+            authority: runtime.authority.clone(),
+            registry: runtime.registry.clone(),
+            route: spanner_route.ok_or("Spanner route id unavailable")?,
+        };
         let readlog = Box::new(hub.log.clone());
         let tls = config
             .tls
@@ -325,6 +362,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 policy,
                 root_key,
                 tasks,
+                state,
                 readlog,
                 standing,
                 Some(route_hub),
@@ -334,11 +372,20 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             .await
         });
     }
-    if config.upstream.is_some() {
+    if let Some(route) = postgres_route {
+        let runtime = runtime.clone();
         let rx = rx.clone();
         routes.spawn(async move {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let work = run_postgres(config, policy, tasks, rx.clone(), ready_tx, hub);
+            let work = run_postgres(
+                config,
+                policy,
+                tasks,
+                rx.clone(),
+                ready_tx,
+                hub,
+                (runtime, route),
+            );
             tokio::pin!(work);
             tokio::select! {
                 biased;
@@ -350,14 +397,17 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     }
     let supervision = supervise(routes, shutdown.clone());
     tokio::pin!(supervision);
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut supervision => result,
         _ = &mut admin.0 => {
             let _ = shutdown.send(true);
             let _ = supervision.await;
             Err("admin listener stopped".into())
         }
-    }
+    };
+    // Retain exclusive state ownership until all routes have drained.
+    drop(runtime);
+    result
 }
 async fn stopped(mut rx: tokio::sync::watch::Receiver<bool>) {
     loop {
@@ -392,6 +442,10 @@ async fn run_postgres(
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ready: tokio::sync::oneshot::Sender<()>,
     hub: Arc<crate::reload::Hub>,
+    state: (
+        Arc<crate::state::runtime::StateRuntime>,
+        crate::state::model::RouteId,
+    ),
 ) -> Result<(), String> {
     let log = hub.log.clone();
     let upstream = config
@@ -414,6 +468,9 @@ async fn run_postgres(
     let root_key =
         crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
     let ctx = Arc::new(GatewayContext {
+        authority: state.0.authority.clone(),
+        registry: state.0.registry.clone(),
+        route: state.1,
         policy: RwLock::new(policy),
         snapshot: RwLock::new(Arc::new(first)),
         root_key,

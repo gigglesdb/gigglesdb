@@ -427,7 +427,17 @@ mod tests {
         h.attempt(&policy_path, Ok(bytes.to_vec()));
         assert_eq!(h.state.lock().unwrap().attempts, 2);
         assert_eq!(h.state.lock().unwrap().hash, hash(bytes));
+        let runtime = crate::state::runtime::StateRuntime::open(
+            &dir.join("state"),
+            &RootKey::from_hex(&"ab".repeat(32)).unwrap(),
+            &crate::config::SessionSettings::default(),
+            &[],
+        )
+        .unwrap();
         let ctx = Arc::new(SpannerContext {
+            authority: runtime.authority.clone(),
+            registry: runtime.registry.clone(),
+            route: crate::state::model::RouteId::new("spanner-native").unwrap(),
             policy: RwLock::new(Arc::new(policy())),
             snapshot: RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec![], 0))),
             root_key: RootKey::from_hex(&"ab".repeat(32)).unwrap(),
@@ -465,6 +475,7 @@ mod tests {
         assert!(!std::fs::read(dir.join("audit.log")).unwrap().is_empty());
         drop(h);
         drop(ctx);
+        drop(runtime);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

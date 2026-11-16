@@ -1206,7 +1206,17 @@ mod tests {
             let fail = Arc::new(AtomicBool::new(false));
             let records = Arc::new(Mutex::new(vec![]));
             let allowed_records = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let runtime = crate::state::runtime::StateRuntime::open(
+                &dir.join("state"),
+                &RootKey::from_hex(&"00".repeat(32)).unwrap(),
+                &crate::config::SessionSettings::default(),
+                &[],
+            )
+            .unwrap();
             let ctx = Arc::new(GatewayContext {
+                authority: runtime.authority.clone(),
+                registry: runtime.registry.clone(),
+                route: crate::state::model::RouteId::new("postgres").unwrap(),
                 policy: RwLock::new(Arc::new(policy)),
                 snapshot: RwLock::new(Arc::new(snapshot)),
                 root_key: RootKey::from_hex(&"00".repeat(32)).unwrap(),

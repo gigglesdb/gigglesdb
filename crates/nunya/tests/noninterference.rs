@@ -58,7 +58,17 @@ async fn gateway(url: &str, side: &str) -> TestResult<Gateway> {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos()
     ));
+    let runtime = nunya::state::runtime::StateRuntime::open(
+        &dir.join("state"),
+        &RootKey::from_hex(&"42".repeat(32)).unwrap(),
+        &nunya::config::SessionSettings::default(),
+        &[],
+    )
+    .unwrap();
     let context = Arc::new(GatewayContext {
+        authority: runtime.authority.clone(),
+        registry: runtime.registry.clone(),
+        route: nunya::state::model::RouteId::new("postgres").unwrap(),
         policy: RwLock::new(Arc::new(policy)),
         snapshot: RwLock::new(Arc::new(snapshot)),
         // serve_tcp chooses a fresh random scope salt for standing credentials.

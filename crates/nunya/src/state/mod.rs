@@ -10,3 +10,6 @@ pub mod store;
 
 /// In-memory authoritative view with write-through.
 pub mod authority;
+
+/// Service-lifetime state ownership and revocation wiring.
+pub mod runtime;
