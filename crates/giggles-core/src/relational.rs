@@ -299,6 +299,8 @@ pub enum DataType {
     IntArray,
     BigIntArray,
     TextArray,
+    /// Expression-only regtype; never admitted by the column type grammar.
+    RegType,
 }
 impl Serialize for DataType {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -308,6 +310,7 @@ impl Serialize for DataType {
             Self::Integer => (2, "Integer"),
             Self::BigInt => (3, "BigInt"),
             Self::Text
+            | Self::RegType
             | Self::Varchar
             | Self::Bpchar
             | Self::Uuid

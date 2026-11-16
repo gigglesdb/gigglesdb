@@ -1228,6 +1228,7 @@ impl Relational {
         }
         for (id, (_, column)) in &columns {
             let expected = match column.data_type {
+                DataType::RegType => return Err(SqlError::Unsupported),
                 DataType::Varchar => Some(TextKind::Varchar),
                 DataType::Bpchar => Some(TextKind::Bpchar),
 

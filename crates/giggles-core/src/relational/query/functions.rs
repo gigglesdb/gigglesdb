@@ -1,6 +1,7 @@
 //! Typed scalar projection binding. No SQL generation or catalog emulation.
 use super::*;
 mod arithmetic;
+mod concat;
 pub(in crate::relational) mod assignment;
 mod binary;
 mod cast;
@@ -9,10 +10,12 @@ mod comparison;
 #[cfg(test)]
 mod cross_binding_tests;
 mod pg18_types;
+mod typeof_expr;
 pub(super) use comparison::{comparable, compare_cross, cross_compare};
 mod datetime_input;
 mod degree_math;
 mod greatest;
+pub(super) mod enum_order;
 #[cfg(test)]
 mod integer_cast_tests;
 mod integer_formats;
@@ -1182,6 +1185,9 @@ impl Scalar {
             Self::Call(name, args) if name == "overlay" => {
                 return Self::bind_overlay(args, resolve, tables, parameters);
             }
+            Self::Call(name, args) if name == "pg_typeof" => {
+                return typeof_expr::bind(args, resolve, tables, parameters);
+            }
             Self::Call(name, args) if greatest::known_name(name) => {
                 return greatest::bind(name, args, resolve, tables, parameters);
             }
@@ -1849,13 +1855,14 @@ impl BoundScalar {
                         DataType::Integer => "int4",
                         DataType::BigInt => "int8",
                         DataType::Text => "text",
+                        DataType::RegType => "regtype",
                         DataType::Varchar => "varchar",
                         DataType::Bpchar => "bpchar",
                         DataType::Uuid => "uuid",
                         DataType::Jsonb => "jsonb",
-                        DataType::IntArray => "integer[]",
-                        DataType::BigIntArray => "bigint[]",
-                        DataType::TextArray => "text[]",
+                        DataType::IntArray => "int4",
+                        DataType::BigIntArray => "int8",
+                        DataType::TextArray => "text",
 
                         DataType::Boolean => "bool",
                         DataType::Bytes => "bytea",
@@ -2038,6 +2045,9 @@ impl BoundScalar {
                 Ok(v.clone())
             }
             Node::Call(n, args) => {
+                if n == "pg_typeof" {
+                    return args[0].eval(row, params, budget);
+                }
                 if arithmetic::internal_name(n) {
                     let values = args
                         .iter()
@@ -2071,7 +2081,7 @@ impl BoundScalar {
                     .map(|a| a.eval(row, params, budget))
                     .collect::<R<Vec<_>>>()?;
                 if greatest::known_name(n) {
-                    return Ok(greatest::eval(n, values));
+                    return Ok(greatest::eval(n, values, args.first()));
                 }
                 if n != "concat"
                     && n != "format"
@@ -2338,6 +2348,7 @@ fn cast_type(p: &mut Parser) -> R<(DataType, Option<i32>)> {
             _ => return Err(SqlError::Unsupported),
         };
     }
+    while p.sym('[') { p.punct(']')?; }
     Ok((ty, modifier))
 }
 fn integer_from_float(value: f64, ty: &DataType) -> R<i64> {
@@ -2359,6 +2370,9 @@ fn integer_from_float(value: f64, ty: &DataType) -> R<i64> {
 pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value> {
     if v == Value::Null {
         return Ok(v);
+    }
+    if *ty == DataType::RegType {
+        return typeof_expr::regtype(v);
     }
     if ty.is_extended_text() {
         let out = crate::relational::logical_types::coerce(v, ty)?;

@@ -197,6 +197,9 @@ fn signature(
     let a = a.map(|ty| if ty == Varchar { Text } else { ty });
     let b = b.map(|ty| if ty == Varchar { Text } else { ty });
     if op == BinaryOp::Concat {
+        if let Some(signature) = concat::signature(a.as_ref(), b.as_ref()) {
+            return signature;
+        }
         let (a, b) = match (a, b) {
             (None, None) => (Text, Text),
             (None, Some(Bytes)) | (Some(Bytes), None) => (Bytes, Bytes),
@@ -362,7 +365,7 @@ pub(super) fn bind(
                 }
             }
             Ok(BoundScalar {
-                ty,
+                ty: ty.clone(),
                 node: if matches!(
                     (*op, args[0].ty.clone(), args[1].ty.clone()),
                     (
@@ -373,7 +376,10 @@ pub(super) fn bind(
                 ) {
                     Node::ZonedOperator(name(*op).into(), args, None)
                 } else {
-                    Node::Call(name(*op).into(), args)
+                    Node::Call(
+                        if *op == BinaryOp::Concat { concat::name(&at, &bt, &ty).unwrap_or(name(*op)) } else { name(*op) }.into(),
+                        args,
+                    )
                 },
             })
         }
@@ -389,6 +395,9 @@ fn checked_integer(value: i64, ty: &DataType) -> R<Value> {
     Ok(Value::Int(value))
 }
 pub(super) fn eval(name: &str, ty: &DataType, values: &[Value], budget: &mut usize) -> R<Value> {
+    if let Some(result) = concat::eval(name, values, budget) {
+        return result;
+    }
     if values.contains(&Value::Null) {
         return Ok(Value::Null);
     }

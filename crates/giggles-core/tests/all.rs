@@ -497,3 +497,9 @@ mod v2_group_spill;
 mod v2_per_value_limits;
 #[path = "v2_insert_select_spill.rs"]
 mod v2_insert_select_spill;
+#[path = "pgparity_ordering.rs"] mod pgparity_ordering;
+
+#[path = "pgparity_concat.rs"]
+mod pgparity_concat;
+#[path = "pgparity_typeof.rs"]
+mod pgparity_typeof;

@@ -892,6 +892,7 @@ fn type_name(ty: &DataType) -> &'static str {
         DataType::Real => "real",
         DataType::DoublePrecision => "double precision",
         DataType::Text => "text",
+        DataType::RegType => "regtype",
         DataType::Varchar => "varchar",
         DataType::Bpchar => "bpchar",
         DataType::Uuid => "uuid",

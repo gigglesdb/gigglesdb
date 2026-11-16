@@ -95,6 +95,12 @@ pub(super) fn bind(
     parameters: &[Option<DataType>],
 ) -> R<BoundScalar> {
     let ty = hint(args, resolve, tables, parameters)?;
+    let enum_ty = args
+        .iter()
+        .map(|arg| arg.bind(resolve, tables, parameters))
+        .collect::<R<Vec<_>>>()?
+        .iter()
+        .find_map(|arg| arg.enum_type(tables));
     let args = args
         .iter()
         .map(|arg| {
@@ -117,25 +123,37 @@ pub(super) fn bind(
             })
         })
         .collect::<R<Vec<_>>>()?;
+    let args = args
+        .into_iter()
+        .map(|arg| {
+            if let Some(ty) = &enum_ty {
+                arg.with_enum(ty)
+            } else {
+                arg
+            }
+        })
+        .collect();
     Ok(BoundScalar {
         ty,
         node: Node::Call(name.into(), args),
     })
 }
 
-pub(super) fn eval(name: &str, values: Vec<Value>) -> Value {
+pub(super) fn eval(name: &str, values: Vec<Value>, input: Option<&BoundScalar>) -> Value {
     let mut best = Value::Null;
     for value in values {
         if value == Value::Null {
             continue;
         }
         if best == Value::Null
-            || cmp(&value, &best)
-                == if name == "greatest" {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
+            || input.map_or_else(
+                || cmp(&value, &best),
+                |input| input.compare_values(&value, &best),
+            ) == if name == "greatest" {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
         {
             best = value;
         }

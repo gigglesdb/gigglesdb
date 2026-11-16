@@ -80,6 +80,7 @@ fn oid(ty: &DataType) -> u32 {
         DataType::Varchar => 1043, DataType::Bpchar => 1042, DataType::Uuid => 2950,
         DataType::Jsonb => 3802, DataType::IntArray => 1007, DataType::BigIntArray => 1016,
         DataType::TextArray => 1009,
+        DataType::RegType => 2206,
     }
 }
 fn quote(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }

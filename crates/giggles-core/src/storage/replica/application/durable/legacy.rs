@@ -40,7 +40,8 @@ fn colty(c: &ColumnDef) -> Ty {
     match c.data_type {
         DataType::Boolean => Ty::Bool,
         DataType::SmallInt | DataType::Integer | DataType::BigInt => Ty::Int,
-        DataType::Uuid
+        DataType::RegType
+        | DataType::Uuid
         | DataType::Jsonb
         | DataType::IntArray
         | DataType::BigIntArray

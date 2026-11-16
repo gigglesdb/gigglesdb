@@ -1186,6 +1186,10 @@ impl Filter {
             Self::Compare(a, op, b) => {
                 let mut av = bind(a)?;
                 let mut bv = bind(b)?;
+                if let Some(ty) = av.enum_type(tables).or_else(|| bv.enum_type(tables)) {
+                    av = av.enum_rank(&ty)?;
+                    bv = bv.enum_rank(&ty)?;
+                }
                 if av.ty == DataType::Bpchar || bv.ty == DataType::Bpchar {
                     return Err(SqlError::Unsupported);
                 }
@@ -3607,6 +3611,7 @@ impl Query {
         classify_plain_columns: bool,
         outer: &[&[Source]],
     ) -> R<BoundQuery<'a>> {
+        let _enum_scope = functions::enum_order::Scope::enter(state);
         if parameters.len() > MAX_PARAMS {
             return Err(SqlError::Limit);
         }
@@ -3964,7 +3969,14 @@ impl Query {
                         .as_ref()
                         .map(|e| e.bind(&resolve, &tables, &parameters))
                         .transpose()?;
+                    let c = c.map(|e| {
+                        if let Some(ty) = e.enum_type(&tables) { e.with_enum(&ty) } else { e }
+                    });
                     let ty = c.as_ref().map(|e| e.ty.clone());
+                    if matches!(a.base(), Aggregate::Min | Aggregate::Max) && ty == Some(DataType::Uuid) {
+                        user_types::view_replace_error(format!("function {}(uuid) does not exist", a.name()));
+                        return Err(SqlError::UndefinedFunction);
+                    }
                     if ty == Some(DataType::Bpchar) {
                         return Err(SqlError::Unsupported);
                     }
@@ -6034,6 +6046,7 @@ fn update_filtered_aggregates(
                     | DataType::SmallInt
                     | DataType::Integer
                     | DataType::Text
+                    | DataType::RegType
                     | DataType::Uuid
                     | DataType::Jsonb
                     | DataType::IntArray
@@ -6053,8 +6066,8 @@ fn update_filtered_aggregates(
             Aggregate::Min | Aggregate::Max => {
                 let v = v.ok_or(SqlError::Type)?;
                 if value == Value::Null
-                    || (matches!(a.base(), Aggregate::Min) && cmp(v, &value) == Ordering::Less)
-                    || (matches!(a.base(), Aggregate::Max) && cmp(v, &value) == Ordering::Greater)
+                    || (matches!(a.base(), Aggregate::Min) && c.as_ref().ok_or(SqlError::Type)?.compare_values(v, &value) == Ordering::Less)
+                    || (matches!(a.base(), Aggregate::Max) && c.as_ref().ok_or(SqlError::Type)?.compare_values(v, &value) == Ordering::Greater)
                 {
                     value = evaluated.ok_or(SqlError::Type)?;
                 }

@@ -238,6 +238,7 @@ pub fn oid(t: &DataType) -> u32 {
         DataType::IntArray => 1007,
         DataType::BigIntArray => 1016,
         DataType::TextArray => 1009,
+        DataType::RegType => 2206,
 
         DataType::Bytes => 17,
         DataType::Numeric => 1700,
@@ -253,6 +254,7 @@ pub fn oid(t: &DataType) -> u32 {
 }
 fn size(t: &DataType) -> i16 {
     match t {
+        DataType::RegType => 4,
         DataType::Uuid => 16,
         DataType::Jsonb | DataType::IntArray | DataType::BigIntArray | DataType::TextArray => -1,
         DataType::Boolean => 1,
@@ -340,6 +342,7 @@ pub fn decode_in_zone(
     if format == 0 {
         let s = std::str::from_utf8(b).map_err(|_| "22021")?;
         return match ty {
+            DataType::RegType => Err("0A000"),
             DataType::Boolean => {
                 let s = s.trim_ascii();
                 let prefix = |word: &str| {

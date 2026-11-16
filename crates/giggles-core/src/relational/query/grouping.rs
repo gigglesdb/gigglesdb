@@ -774,7 +774,16 @@ pub(super) fn bind<'a>(
         .transpose()?;
     let order = order_syntax
         .iter()
-        .map(|(s, d, n)| Ok((s.bind(&slot_resolve, &slot_tables, &parameters)?, *d, *n)))
+        .enumerate()
+        .map(|(i, (s, d, n))| {
+            let original = output_order(q, &q.order[i].0, &projection, resolve, tables)?
+                .bind(resolve, tables, &parameters);
+            let bound = s.bind(&slot_resolve, &slot_tables, &parameters)?;
+            let bound = if let Some(ty) = original.ok().and_then(|s| s.enum_type(tables)) {
+                bound.with_enum(&ty)
+            } else { bound };
+            Ok((bound, *d, *n))
+        })
         .collect::<R<Vec<_>>>()?;
     let filter = q
         .where_filter()
@@ -1228,7 +1237,7 @@ impl Grouping {
             return Ok(result);
         }
         rows.sort_by(|(_, a), (_, b)| {
-            for ((_, desc, first), (a, b)) in self.order.iter().zip(a.iter().zip(b)) {
+            for ((scalar, desc, first), (a, b)) in self.order.iter().zip(a.iter().zip(b)) {
                 let ord = match (a, b) {
                     (Value::Null, Value::Null) => Ordering::Equal,
                     (Value::Null, _) => {
@@ -1246,7 +1255,7 @@ impl Grouping {
                         }
                     }
                     _ => {
-                        let o = cmp(a, b);
+                        let o = scalar.compare_values(a, b);
                         if *desc { o.reverse() } else { o }
                     }
                 };

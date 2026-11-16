@@ -180,6 +180,7 @@ fn generic(p: &mut Parser, name: &str) -> R<(DataType, Option<i32>)> {
         "interval" => DataType::Interval,
         "varchar" => DataType::Varchar,
         "uuid" => DataType::Uuid,
+        "regtype" => DataType::RegType,
         "jsonb" => DataType::Jsonb,
         "bpchar" => DataType::Bpchar,
         _ => {

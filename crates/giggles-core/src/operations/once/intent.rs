@@ -186,7 +186,8 @@ impl Writer {
             DataType::SmallInt => 1,
             DataType::Integer => 2,
             DataType::BigInt => 3,
-            DataType::Uuid
+            DataType::RegType
+            | DataType::Uuid
             | DataType::Jsonb
             | DataType::IntArray
             | DataType::BigIntArray

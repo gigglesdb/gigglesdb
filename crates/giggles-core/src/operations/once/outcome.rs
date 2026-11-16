@@ -225,7 +225,8 @@ impl Kind {
             DataType::SmallInt => Self::SmallInt,
             DataType::Integer => Self::Integer,
             DataType::BigInt => Self::BigInt,
-            DataType::Uuid
+            DataType::RegType
+            | DataType::Uuid
             | DataType::Jsonb
             | DataType::IntArray
             | DataType::BigIntArray

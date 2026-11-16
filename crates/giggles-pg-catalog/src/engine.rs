@@ -647,6 +647,10 @@ fn plan_inner(
     if constructors > 256 && !bounded_projection(&tokens) {
         return flat_union::plan(tokens, gateway);
     }
+    // Core owns pg_typeof expression typing, including nested regtype results.
+    if tokens.windows(2).any(|pair| matches!(&pair[0], Token::Word(w) if w.value.eq_ignore_ascii_case("pg_typeof")) && pair[1] == Token::LParen) {
+        return Ok(None);
+    }
     // sqlparser 0.53 cannot parse OPERATOR(pg_catalog.=) ANY (...).
     // Normalize only this built-in qualified operator, on tokens so literals
     // and comments cannot be rewritten.
@@ -723,6 +727,31 @@ fn plan_inner(
     let mut scan = Scan::new();
     if let ControlFlow::Break(e) = statements.visit(&mut scan) {
         return Err(e);
+    }
+    struct CoreConcat(bool);
+    impl a::Visitor for CoreConcat {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &A) -> ControlFlow<()> {
+            fn typed(expr: &A) -> bool {
+                match expr {
+                    A::Nested(expr) => typed(expr),
+                    A::Cast { data_type, .. } => {
+                        let name = data_type.to_string().to_ascii_lowercase();
+                        name.ends_with(']') || matches!(name.as_str(), "jsonb" | "pg_catalog.jsonb")
+                    }
+                    _ => false,
+                }
+            }
+            if let A::BinaryOp { left, op: Op::StringConcat, right } = expr {
+                self.0 |= typed(left) || typed(right);
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut core_concat = CoreConcat(false);
+    let _ = statements.visit(&mut core_concat);
+    if core_concat.0 && !scan.explicit_catalog {
+        return Ok(None);
     }
     let introspection = scan.introspection && scan.introspection_only && !scan.has_relations;
     scan.catalog |= introspection;
@@ -2109,6 +2138,11 @@ impl Compiler {
                 ) {
                     return Err(Error::Unsupported);
                 }
+                if op == Op::StringConcat
+                    && (lhs.ty.array_element().is_some() || rhs.ty.array_element().is_some())
+                {
+                    return Err(Error::Unsupported);
+                }
                 return Ok(binary(lhs, op, rhs));
             }
             A::UnaryOp { op, expr } => {
@@ -2903,6 +2937,11 @@ fn validate_group(e: &E, group: &[E]) -> R<()> {
     Ok(())
 }
 fn cast_type(n: &str) -> R<PgType> {
+    let normalized;
+    let n = if n.ends_with("[][]") {
+        normalized = format!("{}[]", n.trim_end_matches("[]"));
+        normalized.as_str()
+    } else { n };
     Ok(match n {
         "bool" | "boolean" => PgType::Bool,
         "smallint" | "int2" => PgType::Int2,
@@ -2915,6 +2954,7 @@ fn cast_type(n: &str) -> R<PgType> {
         "double precision" | "float8" => PgType::Float8,
         "int[]" | "integer[]" | "int4[]" => PgType::Int4Array,
         "int2[]" | "smallint[]" => PgType::Int2Array,
+        "bigint[]" | "int8[]" => PgType::Int8Array,
         "oid[]" => PgType::OidArray,
         "text[]" => PgType::TextArray,
         "text" | "varchar" | "character varying" => PgType::Text,
@@ -5768,7 +5808,25 @@ fn projection_name(expr: &A) -> R<String> {
         A::Identifier(n) => ident(n),
         A::CompoundIdentifier(p) => ident(p.last().unwrap()),
         A::Function(f) => function(&f.name)?,
-        A::Nested(e) | A::Cast { expr: e, .. } | A::Collate { expr: e, .. } => projection_name(e)?,
+        A::Nested(e) | A::Collate { expr: e, .. } => projection_name(e)?,
+        A::Cast { expr, data_type, .. } => {
+            let mut inner = expr.as_ref();
+            while let A::Nested(e) | A::Cast { expr: e, .. } = inner { inner = e; }
+            let name = projection_name(inner)?;
+            if name != "?column?" { name } else {
+                let spelling = data_type.to_string().to_ascii_lowercase();
+                let base = spelling.trim_end_matches("[]");
+                match base {
+                    "integer" | "int" | "int4" => "int4",
+                    "bigint" | "int8" => "int8",
+                    "smallint" | "int2" => "int2",
+                    "boolean" => "bool",
+                    "real" => "float4",
+                    "double precision" => "float8",
+                    _ => base,
+                }.to_owned()
+            }
+        },
         A::Case {
             else_result: Some(e),
             ..
@@ -5822,6 +5880,30 @@ mod relation_dependency_tests {
             "WITH x AS (SELECT oid FROM pg_catalog.pg_class) SELECT * FROM x",
         ] {
             assert!(plan(sql).unwrap().unwrap().depends_on_relations(), "{sql}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pgparity_cast_names {
+    use super::*;
+    #[test]
+    fn cast_names_use_internal_element_type() {
+        for (expr, name) in [("'{1,2}'::integer[]", "int4"), ("'{a}'::text[]", "text"), ("'{1}'::int8[]", "int8"), ("'{1}'::int[][]", "int4"), ("1::integer", "int4"), ("1::bigint", "int8"), ("1::numeric", "numeric")] {
+            let p = plan(&format!("SELECT {expr}")).unwrap().unwrap();
+            assert_eq!(crate::describe(&p).unwrap()[0].name, name, "{expr}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pgparity_concat_routing {
+    use super::*;
+    #[test]
+    fn typed_concat_declines_to_core() {
+        for sql in ["SELECT '{a}'::text[] || '{b}'", "SELECT 1 || '{2}'::int[]", "SELECT '{}'::jsonb || '1'", "SELECT '{}'::jsonb || '{}'::jsonb"] {
+            assert!(plan(sql).unwrap().is_none(), "{sql}");
+            assert!(plan_gateway(sql).unwrap().is_none(), "{sql}");
         }
     }
 }

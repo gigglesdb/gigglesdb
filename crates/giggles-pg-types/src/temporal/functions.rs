@@ -148,6 +148,9 @@ impl Date {
         if self == Self::INFINITY || self == Self::NEG_INFINITY {
             return infinity(f, self == Self::NEG_INFINITY);
         }
+        if f == TemporalField::Julian {
+            return Ok(Some(integer(i128::from(self.0) + 2451545)));
+        }
         if f == TemporalField::Epoch {
             return Ok(Some(integer((i128::from(self.0) + 10957) * 86400)));
         }
@@ -692,5 +695,23 @@ impl TimeTz {
             + (i64::from(seconds) - i64::from(self.offset_east())) * 1_000_000)
             .rem_euclid(USECS_PER_DAY);
         range(Self::new(range(Time::from_microseconds(time))?, seconds))
+    }
+}
+
+#[cfg(test)]
+mod pgparity_julian {
+    use super::*;
+    #[test]
+    fn date_is_integral_timestamp_keeps_fraction() {
+        for (date, expected) in [("2024-05-06","2460437"),("2000-01-01","2451545"),("1900-01-01","2415021"),("4713-11-24 BC","366"),("infinity","Infinity")] {
+            let date = Date::parse(date, &super::super::ParserSettings::default()).unwrap();
+            assert_eq!(date.extract(TemporalField::Julian).unwrap().unwrap().to_string(), expected);
+        }
+        let date = Date::parse("2000-01-01", &super::super::ParserSettings::default()).unwrap();
+        assert_eq!(date.date_part(TemporalField::Julian).unwrap().unwrap().value(), 2451545.0);
+        let t = Timestamp::parse("2000-01-01 00:00", &super::super::ParserSettings::default()).unwrap();
+        assert_eq!(t.extract(TemporalField::Julian).unwrap().unwrap().to_string(), "2451545.0000000000000000000000000000");
+        let t = TimestampTz::parse("2024-02-29 13:04:05.123456+00", &super::super::ParserSettings::default()).unwrap();
+        assert_eq!(t.extract(TemporalField::Julian, SessionZone::Fixed(0)).unwrap().unwrap().to_string(), "2460370.54450374370370370370");
     }
 }
