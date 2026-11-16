@@ -125,6 +125,32 @@ impl Session {
             rollback_on_sync: false,
         }
     }
+    /// Whether a forwarded write or commit still awaits completion.
+    pub(crate) fn write_in_flight(&self) -> bool {
+        let indeterminate =
+            |active: &Active| writes(&active.kind) || matches!(active.kind, StatementKind::Commit);
+        self.active.iter().any(indeterminate)
+            || self.pending.iter().any(|pending| match pending {
+                Pending::Execute(active, _) => indeterminate(active),
+                Pending::Local(_)
+                | Pending::Ack(_, _, _)
+                | Pending::Hidden(_)
+                | Pending::RefusalError
+                | Pending::Describe(_, _, _)
+                | Pending::Sync => false,
+            })
+    }
+    /// Audit and close an ended connection, preserving uncertain write outcomes.
+    pub(crate) fn end(&mut self) -> Actions {
+        let code = if self.write_in_flight() {
+            NyCode::WriteOutcomeUnknown
+        } else {
+            NyCode::SessionEnded
+        };
+        let mut actions = self.refuse("", code, false);
+        actions.close = true;
+        actions
+    }
     fn admit(&self) -> Result<Mode, Refusal> {
         self.ctx
             .authority
@@ -967,6 +993,18 @@ pub async fn serve_tcp(tcp: tokio::net::TcpStream, ctx: Arc<GatewayContext>) {
     }
     let _ = agent.io.shutdown().await;
 }
+async fn end_connection(
+    agent: &mut Agent,
+    upstream: &mut Upstream,
+    session: &mut Session,
+) -> Result<(), Refusal> {
+    if session.waiting || session.write_in_flight() {
+        let (pid, secret) = upstream.backend_key();
+        let _ = send_cancel(&session.ctx.upstream, pid, &secret).await;
+    }
+    let actions = session.end();
+    agent.send(&actions.client).await
+}
 async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusal> {
     let mut tls = false;
     let user = loop {
@@ -1111,6 +1149,20 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
         ctx: ctx.clone(),
         key,
     };
+    let deadline = ctx.authority.session(id).map(|row| {
+        tokio::time::Instant::now()
+            + std::time::Duration::from_millis(row.expires_ms.saturating_sub(crate::serve::now()))
+    });
+    let (_connection_guard, mut end) =
+        ctx.registry
+            .register(id, login.principal, ctx.route.as_str(), deadline);
+    let mut session = Session::new(ctx.clone(), keys, id, login.principal, user);
+    // Recheck after registration so revocation between login and registration cannot be missed.
+    if ctx.authority.admit(id, Operation::Read).is_err() {
+        let actions = session.refuse("", NyCode::SessionEnded, false);
+        agent.send(&actions.client).await?;
+        return Ok(());
+    }
     agent
         .send(&[
             Backend::BackendKeyData {
@@ -1120,12 +1172,20 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
             Backend::ReadyForQuery(b'I'),
         ])
         .await?;
-    let mut session = Session::new(ctx.clone(), keys, id, login.principal, user);
     let mut deferred = VecDeque::new();
     let mut deferred_bytes = 0usize;
     loop {
+        if end.try_ended().is_some() {
+            end_connection(agent, &mut upstream, &mut session).await?;
+            return Ok(());
+        }
         let actions = if session.waiting {
             tokio::select! {
+                biased;
+                _=end.ended()=>{
+                    end_connection(agent, &mut upstream, &mut session).await?;
+                    return Ok(());
+                }
                 response=upstream.recv()=>session.backend(response?),
                 request=agent.recv()=>{
                     let request=request?;
@@ -1144,6 +1204,11 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
             session.frontend(request)
         } else {
             tokio::select! {
+                biased;
+                _=end.ended()=>{
+                    end_connection(agent, &mut upstream, &mut session).await?;
+                    return Ok(());
+                }
                 response=upstream.recv()=>session.backend(response?),
                 request=agent.recv()=>session.frontend(request?),
             }
@@ -1712,6 +1777,150 @@ mod tests {
                 [Backend::ReadyForQuery(b'I')]
             ));
         }
+    }
+    #[test]
+    fn write_in_flight_tracks_simple_and_extended_completion() {
+        let f = Fixture::new();
+        let mut s = f.session();
+        assert!(!s.write_in_flight());
+        for (sql, tag, expected) in [
+            ("INSERT INTO items(value) VALUES (NULL)", "INSERT 0 1", true),
+            ("COMMIT", "COMMIT", true),
+            ("SELECT value FROM items", "SELECT 0", false),
+        ] {
+            let out = s.frontend(Frontend::Query(sql.into()));
+            assert!(matches!(out.upstream.as_slice(), [Frontend::Query(_)]));
+            assert_eq!(s.write_in_flight(), expected);
+            s.backend(Backend::CommandComplete(tag.into()));
+            assert!(!s.write_in_flight());
+            s.backend(Backend::ReadyForQuery(b'I'));
+            assert!(!s.write_in_flight());
+        }
+        prepare_admission_portal(&mut s, "INSERT INTO items(value) VALUES (NULL)");
+        assert!(!s.write_in_flight());
+        let out = s.frontend(Frontend::Execute {
+            portal: "p".into(),
+            max_rows: 0,
+        });
+        assert!(matches!(
+            out.upstream.as_slice(),
+            [Frontend::Execute { .. }]
+        ));
+        assert!(s.write_in_flight());
+        s.backend(Backend::CommandComplete("INSERT 0 1".into()));
+        assert!(!s.write_in_flight());
+    }
+    #[test]
+    fn end_audits_commit_uncertainty_and_select_revocation() {
+        for (sql, expected) in [("COMMIT", "NY012"), ("SELECT value FROM items", "NY011")] {
+            let f = Fixture::new();
+            let mut s = f.session();
+            assert!(!s.frontend(Frontend::Query(sql.into())).upstream.is_empty());
+            f.ctx
+                .authority
+                .revoke(s.session, crate::state::model::EndReason::AdminRevoked)
+                .unwrap();
+            let before = f.records.lock().unwrap().len();
+            let out = s.end();
+            assert_eq!(code(&out), expected);
+            assert!(out.close);
+            assert!(out.upstream.is_empty());
+            assert_eq!(out.client.len(), 1);
+            assert_eq!(f.records.lock().unwrap().len(), before + 1);
+        }
+    }
+    #[test]
+    fn end_audit_failure_returns_ny009() {
+        let f = Fixture::new();
+        let mut s = f.session();
+        s.frontend(Frontend::Query("COMMIT".into()));
+        f.fail.store(true, Ordering::Relaxed);
+        let out = s.end();
+        assert_eq!(code(&out), "NY009");
+        assert!(out.close);
+        assert!(out.upstream.is_empty());
+        assert_eq!(out.client.len(), 1);
+    }
+    #[tokio::test]
+    async fn registered_connection_receives_authority_revocation() {
+        let f = Fixture::new();
+        let s = f.session();
+        let deadline = f.ctx.authority.session(s.session).map(|row| {
+            tokio::time::Instant::now()
+                + std::time::Duration::from_millis(
+                    row.expires_ms.saturating_sub(crate::serve::now()),
+                )
+        });
+        let (_guard, mut end) =
+            f.ctx
+                .registry
+                .register(s.session, s.principal, f.ctx.route.as_str(), deadline);
+        assert!(f.ctx.authority.admit(s.session, Operation::Read).is_ok());
+        assert!(end.try_ended().is_none());
+        f.ctx
+            .authority
+            .revoke(s.session, crate::state::model::EndReason::AdminRevoked)
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), end.ended())
+                .await
+                .unwrap(),
+            crate::state::registry::EndReason::Revoked,
+        );
+    }
+    #[tokio::test]
+    async fn tcp_revocation_cancels_forwarded_commit_with_ny012() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut f = Fixture::new();
+            let (id, _) = acquire_login(&f, "postgres");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let ctx = Arc::get_mut(&mut f.ctx).unwrap();
+            ctx.upstream.host = "127.0.0.1".into();
+            ctx.upstream.port = listener.local_addr().unwrap().port();
+            ctx.upstream.connect_timeout_ms = 5000;
+            let fake_ctx = f.ctx.clone();
+            let (forwarded_tx, forwarded_rx) = tokio::sync::oneshot::channel();
+            let fake = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut wire = Agent { io: Box::new(stream), buffer: BytesMut::new(), ctx: fake_ctx.clone() };
+                assert!(matches!(wire.startup().await.unwrap(), StartupMessage::Startup { .. }));
+                wire.send(&[
+                    Backend::AuthenticationOk,
+                    Backend::BackendKeyData { pid: 123, secret: vec![1, 2, 3, 4] },
+                    Backend::ReadyForQuery(b'I'),
+                ]).await.unwrap();
+                assert!(matches!(wire.recv().await.unwrap(), Frontend::Query(_)));
+                wire.send(&[Backend::CommandComplete("SET".into()), Backend::ReadyForQuery(b'I')]).await.unwrap();
+                assert!(matches!(wire.recv().await.unwrap(), Frontend::Query(sql) if sql == "COMMIT"));
+                forwarded_tx.send(()).unwrap();
+                let (cancel, _) = listener.accept().await.unwrap();
+                let mut cancel = Agent { io: Box::new(cancel), buffer: BytesMut::new(), ctx: fake_ctx };
+                assert!(matches!(cancel.startup().await.unwrap(), StartupMessage::CancelRequest { pid: 123, secret } if secret == [1, 2, 3, 4]));
+                // Keep the operation transport open until the gateway closes it.
+                let mut byte = [0];
+                assert_eq!(wire.io.read(&mut byte).await.unwrap(), 0);
+            });
+            let gateway = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = gateway.local_addr().unwrap();
+            let ctx = f.ctx.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = gateway.accept().await.unwrap();
+                serve_tcp(stream, ctx).await;
+            });
+            let (client, connection) = tokio_postgres::Config::new()
+                .host("127.0.0.1").port(address.port())
+                .user(&format!("session:{}", id.to_hex())).password("login-secret")
+                .dbname("app").connect(tokio_postgres::NoTls).await.unwrap();
+            let connection = tokio::spawn(connection);
+            let query = tokio::spawn(async move { client.batch_execute("COMMIT").await });
+            forwarded_rx.await.unwrap();
+            f.ctx.authority.revoke(id, crate::state::model::EndReason::AdminRevoked).unwrap();
+            let error = query.await.unwrap().unwrap_err();
+            assert_eq!(error.code().map(|code| code.code()), Some("NY012"));
+            server.await.unwrap();
+            fake.await.unwrap();
+            let _ = connection.await.unwrap();
+        }).await.unwrap();
     }
     fn code(actions: &Actions) -> &str {
         let Backend::ErrorResponse(fields) = &actions.client[0] else {
