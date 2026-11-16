@@ -4,6 +4,7 @@
 mod native_paging;
 #[path = "alter_add_column_if_not_exists.rs"]
 mod alter_add_column_if_not_exists;
+#[path = "native_once_v2_replay.rs"] mod native_once_v2_replay;
 #[path = "typed_leaf_read.rs"]
 mod typed_leaf_read;
 #[path = "view_select.rs"]
@@ -460,3 +461,8 @@ mod fk_target_codec;
 #[path = "fk_drop_durability.rs"] mod fk_drop_durability;
 
 #[path = "fk_integration_main.rs"] mod fk_integration_main;
+#[path = "native_once_v2_format.rs"]
+mod native_once_v2_format;
+
+#[path = "native_once_v2_execute.rs"] mod native_once_v2_execute;
+#[path = "native_once_v2_terminal.rs"] mod native_once_v2_terminal;

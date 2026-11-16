@@ -6,6 +6,7 @@ use super::{
     kv::{Direction, Keyspace, Kv, KvError},
     locks::{CATALOG_NAME_INDEX, LockKey, LockManager, LockMode},
     mvcc,
+    once_guard::CommitGuard,
     seq::SequenceAllocator,
     txn::{Isolation, SerializationReason, Transaction, TxnError},
 };
@@ -806,6 +807,15 @@ impl Catalog {
 
     /// Retain the transaction (and therefore its locks) through cache publication.
     pub(crate) fn commit_ddl(&self, txn: Transaction) -> Result<Ts, TxnError> {
+        self.commit_ddl_inner(txn, None)
+    }
+    pub(crate) fn commit_ddl_guarded(&self, txn: Transaction, guard: CommitGuard) -> Result<Ts, TxnError> {
+        self.commit_ddl_inner(txn, Some(guard))
+    }
+    fn commit_ddl_inner(&self, txn: Transaction, guard: Option<CommitGuard>) -> Result<Ts, TxnError> {
+        fn finish(txn: Transaction, guard: Option<CommitGuard>, publish: impl FnOnce(Ts) -> Result<(), TxnError>) -> Result<Ts, TxnError> {
+            match guard { Some(guard) => txn.commit_guarded(guard, publish), None => txn.commit_then(publish) }
+        }
         self.check()?;
         // Data-only and read-only commits cannot change any cached catalog
         // version. Do not rebuild or republish an identical view, and do not
@@ -813,7 +823,7 @@ impl Catalog {
         // DDL still holds it across sequencer success and publication below:
         // a reader at the newly visible timestamp must never use the old view.
         if txn.catalog_writes().next().is_none() {
-            return txn.commit_then(|_| Ok(()));
+            return finish(txn, guard, |_| Ok(()));
         }
         let mut cache = self.cache.lock().map_err(|_| TxnError::Misuse)?;
         cache.ensure_live()?;
@@ -845,7 +855,7 @@ impl Catalog {
         }
         // Reject limit/corruption before committing anything durably.
         overlay_view(latest, txn.catalog_writes()).map_err(commit_error)?;
-        txn.commit_then(|ts| {
+        finish(txn, guard, |ts| {
             let view = match load_view(self.sequencer.kv(), ts) {
                 Ok(view) => view,
                 Err(_) => {

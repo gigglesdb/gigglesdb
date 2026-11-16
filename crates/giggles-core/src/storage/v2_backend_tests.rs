@@ -107,7 +107,7 @@ fn single_node_creation_preserves_initial_meta() {
         (b"family".to_vec(), 2u32.to_be_bytes().to_vec()),
         (
             b"subversion".to_vec(),
-            engine::meta::CURRENT_SUBVERSION.to_be_bytes().to_vec(),
+            engine::meta::INITIAL_SUBVERSION.to_be_bytes().to_vec(),
         ),
         (b"domain".to_vec(), db.meta.domain.to_vec()),
         (b"engine".to_vec(), b"rocksdb".to_vec()),

@@ -30,6 +30,11 @@ pub(crate) struct KernelImage(pub(crate) storage::State);
 
 pub(crate) struct Kernel;
 
+pub(crate) struct KernelPresence {
+    pub(crate) metadata: bool,
+    pub(crate) ledger: bool,
+}
+
 /// Unforgeable borrowing evidence of successful kernel lock acquisition.
 /// Dropping this borrow does not release the lock: the transaction owns it until
 /// commit, rollback, or drop. Business row writes use `transaction()` and share
@@ -72,7 +77,7 @@ impl KernelAccess for KernelGuard<'_> {
     }
 }
 
-fn valid_key(key: &[u8]) -> bool {
+pub(super) fn valid_key(key: &[u8]) -> bool {
     match key.first() {
         Some(0 | 7 | 9) => key.len() == 1,
         Some(1 | 3) => key.len() == 17,
@@ -145,6 +150,13 @@ impl Kernel {
         })
     }
 
+    pub(crate) fn probe(txn: &mut Transaction) -> Result<KernelPresence, CoreError> {
+        Ok(KernelPresence {
+            metadata: txn.get(Keyspace::Kernel, &[0])?.is_some(),
+            ledger: txn.get(Keyspace::Kernel, &[7])?.is_some(),
+        })
+    }
+
     pub(crate) fn load(txn: &mut Transaction) -> Result<KernelImage, CoreError> {
         let mut out = BTreeMap::new();
         for item in txn.scan(
@@ -185,9 +197,24 @@ impl Kernel {
         before: &KernelImage,
         after: &KernelImage,
     ) -> Result<usize, CoreError> {
+        Self::stage_from(access, Some(before), after)
+    }
+
+    pub(crate) fn stage_from(
+        access: &mut impl KernelAccess,
+        before: Option<&KernelImage>,
+        after: &KernelImage,
+    ) -> Result<usize, CoreError> {
         let txn = access.guarded_transaction()?;
-        let before = records(before)?;
+        let before = before.map(records).transpose()?.unwrap_or_default();
         let after = records(after)?;
+        if after.contains_key(&vec![7]) {
+            let metadata: storage::Metadata = storage::decode(&after[&vec![0]])?;
+            let (family, _, _, temporal, _) = storage::envelope_family(metadata.format)?;
+            txn.require_features(super::meta::NATIVE_OUTCOMES
+                | u64::from(family.typed_scalars) | (u64::from(temporal) << 4));
+            txn.require_subversion(super::meta::NATIVE_SUBVERSION);
+        }
         let mut count = 0;
         for key in before.keys().filter(|key| !after.contains_key(*key)) {
             txn.delete(Keyspace::Kernel, key.clone())?;

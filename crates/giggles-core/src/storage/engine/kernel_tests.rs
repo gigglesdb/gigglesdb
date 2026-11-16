@@ -508,9 +508,9 @@ fn absent_metadata_and_every_disallowed_namespace_or_length_are_corrupt() {
     }
     for key in malformed {
         let env = Env::new();
-        let mut txn = env.txn(1);
-        txn.put(Keyspace::Kernel, key, vec![0]).unwrap();
-        txn.commit().unwrap();
+        let mut batch = super::super::kv::WriteBatch::default();
+        batch.put(Keyspace::Kernel, codec::user_key_seek_at(&key, super::super::hlc::Ts(0)), mvcc::encode_live(&[0]));
+        env.kv.write(batch, super::super::kv::Durability::Sync).unwrap();
         assert!(matches!(
             Kernel::load(&mut env.txn(2)),
             Err(CoreError::Corrupt(_))
@@ -693,10 +693,9 @@ fn mutation_stamp_tracks_commit_timestamp_and_noop_writes_nothing() {
 fn malformed_stamp_value_is_rejected_by_load_and_lock() {
     let env = Env::new();
     env.seed(&fixture());
-    let mut txn = env.txn(2);
-    txn.put(Keyspace::Kernel, STAMP_KEY.to_vec(), vec![1])
-        .unwrap();
-    txn.commit().unwrap();
+    let mut batch = super::super::kv::WriteBatch::default();
+    batch.put(Keyspace::Kernel, codec::user_key_seek_at(STAMP_KEY, env.seq.visible_ts()), mvcc::encode_live(&[1]));
+    env.kv.write(batch, super::super::kv::Durability::Sync).unwrap();
     assert!(matches!(
         Kernel::load(&mut env.txn(3)),
         Err(CoreError::Corrupt(_))

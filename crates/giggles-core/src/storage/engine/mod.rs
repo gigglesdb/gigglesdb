@@ -20,6 +20,7 @@ pub(crate) mod commit;
 pub(crate) mod content_check;
 pub(crate) mod gc;
 pub(crate) mod mvcc;
+pub(crate) mod once_guard;
 pub(crate) mod txn;
 
 pub(crate) mod catalog;
@@ -39,3 +40,4 @@ pub(crate) mod meta;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "write_tripwire_tests.rs"]
 mod write_tripwire_tests;
+mod native_content;

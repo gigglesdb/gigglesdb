@@ -284,3 +284,40 @@ fn foreign_key_identity_replicates_and_reopens() {
         assert_eq!(admin.sql_session().foreign_key_targets().unwrap(), targets);
     }
 }
+
+#[test]
+fn native_once_apis_refuse_replicated_database_without_writes() {
+    use crate::operations::{Bindings, Engine as NativeEngine, Error, Request, ValueExpr,
+        once::{ONCE_CONTRACT_VERSION, OnceBody, OnceError, OnceIdentity, OnceRequest,
+            OnceTime, OnceClockUnavailable}};
+    struct Loopback(Arc<ReplicaStore>);
+    impl BatchSink for Loopback {
+        fn replicate(&self, bytes: Vec<u8>) -> Result<(), ReplicateError> {
+            let next = self.0.applied().unwrap().map_or(1, |p| p.index + 1);
+            self.0.apply(&bytes, pos(next, 1))
+                .map(|_| ()).map_err(|e| ReplicateError::Unavailable(e.to_string()))
+        }
+    }
+    let dir = Dir::new();
+    let store = Arc::new(ReplicaStore::create(&dir.0, [9; 16]).unwrap());
+    let admin = store.open_admin(Arc::new(Loopback(store.clone())), Limits::default(),
+        v2::DEFAULT_WRITE_SET_BYTES).unwrap();
+    admin.sql_session().execute("CREATE TABLE t(id int PRIMARY KEY)", &[], None).unwrap();
+    let request = OnceRequest { contract_version: ONCE_CONTRACT_VERSION,
+        identity: OnceIdentity { database_domain: admin.authority_metadata().unwrap().0,
+            tenant: 1, namespace: "replicated".into(), key: vec![1] }, retention_seconds: 60,
+        body: OnceBody::Operation(Request::Insert { table: "t".into(), values: vec![
+            ("id".into(), ValueExpr::Literal(Value::Int(1)))] }) };
+    let engine = NativeEngine::new(admin);
+    let clock = || -> Result<OnceTime, OnceClockUnavailable> { panic!("clock called") };
+    let before = contents(&store);
+    let unsupported = OnceError::Operation(Error::Unsupported);
+    assert_eq!(engine.execute_once(&request, &Bindings::new(), &clock), Err(unsupported.clone()));
+    assert_eq!(engine.outcome(&request.identity), Err(unsupported.clone()));
+    assert_eq!(engine.compact_outcomes(&clock), Err(unsupported));
+    assert_eq!(contents(&store), before);
+    let info = crate::storage::engine::meta::open_checks(store.kv.as_ref()).unwrap();
+    assert_eq!(info.subversion, 1);
+    assert_eq!(info.features & crate::storage::engine::meta::NATIVE_OUTCOMES, 0);
+    assert!(crate::storage::engine::mvcc::latest_version(store.kv.as_ref(), Keyspace::Kernel, &[7]).unwrap().is_none());
+}

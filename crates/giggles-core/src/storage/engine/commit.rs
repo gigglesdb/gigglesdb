@@ -3,6 +3,7 @@ use super::{
     hlc::{HlcClock, Ts},
     kv::{Durability, Keyspace, Kv, KvRead, WriteBatch},
     txn::TxnError,
+    once_guard::CommitGuard,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -141,6 +142,7 @@ pub(crate) struct CommitRequest {
     pub(crate) snapshot: Ts,
     pub(crate) writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
     pub(crate) features_or: u64,
+    pub(crate) minimum_subversion: u32,
     pub(crate) raw: Vec<RawOp>,
     // Hooks inspect the worker-owned log; no snapshot mutex is held during validation.
     pub(crate) validation: Option<Validation>,
@@ -183,6 +185,7 @@ impl Drop for SnapshotHandle {
 }
 struct Pending {
     request: CommitRequest,
+    guard: Option<CommitGuard>,
     reply: mpsc::Sender<Result<Ts, TxnError>>,
 }
 enum Message {
@@ -209,6 +212,7 @@ impl Sequencer {
         config: SequencerConfig,
     ) -> Result<Arc<Self>, TxnError> {
         let features = load_features(kv.as_ref())?;
+        let subversion = load_subversion(kv.as_ref())?;
         let seed = match kv
             .get(Keyspace::Meta, b"last_commit_ts")
             .map_err(TxnError::Kv)?
@@ -240,6 +244,7 @@ impl Sequencer {
                 worker_shared,
                 seed,
                 features,
+                subversion,
             )
         });
         Ok(Arc::new(Self {
@@ -288,7 +293,14 @@ impl Sequencer {
         }
         let (reply, receive) = mpsc::channel();
         self.sender
-            .send(Message::Commit(Pending { request, reply }))
+            .send(Message::Commit(Pending { request, guard: None, reply }))
+            .map_err(|_| TxnError::Fenced)?;
+        receive.recv().unwrap_or(Err(TxnError::Fenced))
+    }
+    pub(crate) fn submit_guarded(&self, request: CommitRequest, guard: CommitGuard) -> Result<Ts, TxnError> {
+        if self.kv.is_fenced() { return Err(TxnError::Fenced); }
+        let (reply, receive) = mpsc::channel();
+        self.sender.send(Message::Commit(Pending { request, guard: Some(guard), reply }))
             .map_err(|_| TxnError::Fenced)?;
         receive.recv().unwrap_or(Err(TxnError::Fenced))
     }
@@ -332,6 +344,15 @@ fn load_features(kv: &dyn KvRead) -> Result<u64, TxnError> {
         .map_err(|e| TxnError::Kv(super::kv::KvError::Corrupt(e.to_string())))?;
     Ok(bits)
 }
+fn load_subversion(kv: &dyn KvRead) -> Result<u32, TxnError> {
+    let version = match kv.get(Keyspace::Meta, b"subversion")? {
+        None => super::meta::INITIAL_SUBVERSION, // bare engine fixtures
+        Some(bytes) => u32::from_be_bytes(bytes.try_into().map_err(|_| TxnError::Misuse)?),
+    };
+    super::meta::check_subversion(version, super::meta::CURRENT_SUBVERSION)
+        .map_err(|_| TxnError::Misuse)?;
+    Ok(version)
+}
 impl Drop for Sequencer {
     fn drop(&mut self) {
         let _ = self.sender.send(Message::Shutdown);
@@ -364,6 +385,9 @@ fn gather(
     receiver: &mpsc::Receiver<Message>,
     config: &SequencerConfig,
 ) -> (Vec<Pending>, Option<Message>, bool) {
+    if first.guard.is_some() {
+        return (vec![first], None, false);
+    }
     let mut bytes = config
         .group_max_bytes
         .map(|_| request_bytes(&first.request));
@@ -396,6 +420,9 @@ fn gather(
             }
         };
         match message {
+            guarded @ Message::Commit(Pending { guard: Some(_), .. }) => {
+                return (group, Some(guarded), false);
+            }
             Message::Commit(pending) => {
                 if let (Some(cap), Some(total)) = (config.group_max_bytes, bytes.as_mut()) {
                     let size = request_bytes(&pending.request);
@@ -413,6 +440,7 @@ fn gather(
     (group, None, false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     receiver: mpsc::Receiver<Message>,
     kv: Arc<Kv>,
@@ -421,6 +449,7 @@ fn run(
     shared: Arc<Shared>,
     seed: Ts,
     mut features: u64,
+    mut subversion: u32,
 ) {
     let mut hlc = HlcClock::new(seed);
     let mut log = RecentLog::new(config.recent_log_bytes);
@@ -466,6 +495,7 @@ fn run(
             &mut hlc,
             &mut log,
             &mut features,
+            &mut subversion,
         );
     }
     for message in receiver.try_iter() {
@@ -510,6 +540,8 @@ fn process_counter(
     }
     super::catalog_codec::decode_counter(&key, &value, &definition)
         .map_err(|_| TxnError::Misuse)?;
+    let native = super::native_content::NativeContent::load(kv).map_err(|_| TxnError::Misuse)?;
+    native.validate(next, load_subversion(kv)?).map_err(|_| TxnError::Misuse)?;
     let mut batch = WriteBatch::default();
     batch.put(Keyspace::Seq, key, value);
     if next != *features {
@@ -522,6 +554,7 @@ fn process_counter(
 }
 
 // Returns whether an ambiguous backend result requires fencing subsequent groups.
+#[allow(clippy::too_many_arguments)]
 fn process_group(
     group: Vec<Pending>,
     kv: &Kv,
@@ -530,6 +563,7 @@ fn process_group(
     hlc: &mut HlcClock,
     log: &mut RecentLog,
     features: &mut u64,
+    subversion: &mut u32,
 ) -> bool {
     let visible = shared
         .snap
@@ -539,11 +573,23 @@ fn process_group(
     let mut max = visible;
     let mut batch = WriteBatch::default();
     let mut accepted = Vec::new();
+    let mut decision = None;
+    let mut deferred_log = None;
+    let Ok(mut native) = super::native_content::NativeContent::load(kv) else {
+        for pending in group { let _ = pending.reply.send(Err(TxnError::Misuse)); }
+        return false;
+    };
     let mut pending_features = *features;
+    let mut pending_subversion = *subversion;
     for pending in group {
         let request = &pending.request;
         let next_features = pending_features | request.features_or;
-        if super::meta::check_features(next_features).is_err()
+        let next_subversion = pending_subversion.max(request.minimum_subversion);
+        let mut next_native = native.clone();
+        if super::meta::check_subversion(next_subversion, super::meta::CURRENT_SUBVERSION).is_err()
+            || super::meta::check_features(next_features).is_err()
+            || next_native.apply(&request.writes).is_err()
+            || next_native.validate(next_features, next_subversion).is_err()
             || request.writes.iter().any(|((space, key), value)| {
                 // Defense in depth: versioned writes never target unversioned
                 // keyspaces, so counters cannot bypass write_counter's bit 8.
@@ -588,6 +634,12 @@ fn process_group(
             let _ = pending.reply.send(Err(TxnError::Misuse));
             continue;
         }
+        if let Some(guard) = &pending.guard
+            && let Err(error) = guard.check_fence(visible)
+        {
+            let _ = pending.reply.send(Err(TxnError::Guard(error)));
+            continue;
+        }
         let ts = if request.writes.is_empty() {
             visible
         } else {
@@ -606,7 +658,6 @@ fn process_group(
             continue;
         }
         if !request.writes.is_empty() {
-            hlc.last = ts;
             let keys: Keys = request.writes.keys().cloned().collect::<Vec<_>>().into();
             for ((ks, key), value) in &request.writes {
                 let versioned = super::codec::user_key_seek_at(key, ts);
@@ -619,7 +670,12 @@ fn process_group(
             // Later requests in this group validate against accepted predecessors.
             // Unpublished entries on Sync failure are harmless: the permanent
             // fence prevents every subsequent group from consulting this log.
-            log.append(ts, keys);
+            if pending.guard.is_some() {
+                deferred_log = Some((ts, keys));
+            } else {
+                hlc.last = ts;
+                log.append(ts, keys);
+            }
             max = ts;
         }
         for op in &request.raw {
@@ -636,28 +692,45 @@ fn process_group(
             }
         }
         pending_features = next_features;
+        pending_subversion = next_subversion;
+        native = next_native;
+        decision = pending.guard;
         accepted.push((pending.reply, ts));
     }
     if pending_features != *features {
         super::meta::put_features(&mut batch, pending_features)
             .expect("validated pending features");
     }
-    if !batch.is_empty() {
-        if max != visible {
-            batch.put(
-                Keyspace::Meta,
-                b"last_commit_ts".to_vec(),
-                max.0.to_be_bytes().to_vec(),
-            );
+    if pending_subversion != *subversion {
+        batch.put(Keyspace::Meta, b"subversion".to_vec(), pending_subversion.to_be_bytes().to_vec());
+    }
+    if max != visible {
+        batch.put(
+            Keyspace::Meta,
+            b"last_commit_ts".to_vec(),
+            max.0.to_be_bytes().to_vec(),
+        );
+    }
+    if let Some(guard) = decision
+        && let Err(error) = guard.decide()
+    {
+        for (reply, _) in accepted {
+            let _ = reply.send(Err(TxnError::Guard(error)));
         }
-        if kv.write(batch, Durability::Sync).is_err() {
-            for (reply, _) in accepted {
-                let _ = reply.send(Err(TxnError::CommitAmbiguous));
-            }
-            return true;
+        return false;
+    }
+    if let Some((ts, keys)) = deferred_log {
+        hlc.last = ts;
+        log.append(ts, keys);
+    }
+    if !batch.is_empty() && kv.write(batch, Durability::Sync).is_err() {
+        for (reply, _) in accepted {
+            let _ = reply.send(Err(TxnError::CommitAmbiguous));
         }
+        return true;
     }
     *features = pending_features;
+    *subversion = pending_subversion;
     // Publish only after Sync succeeds; capture retention state in the same
     // short critical section, then trim and acknowledge without the mutex.
     let (visible, oldest) = {
@@ -693,7 +766,7 @@ impl Sequencer {
             .map(|request| {
                 let (reply, receive) = mpsc::channel();
                 receives.push(receive);
-                Pending { request, reply }
+                Pending { request, guard: None, reply }
             })
             .collect();
         let mut hlc = HlcClock::new(self.visible_ts());
@@ -704,6 +777,7 @@ impl Sequencer {
                 .collect();
         }
         let mut features = load_features(self.kv.as_ref()).unwrap();
+        let mut subversion = load_subversion(self.kv.as_ref()).unwrap();
         process_group(
             group,
             &self.kv,
@@ -712,6 +786,7 @@ impl Sequencer {
             &mut hlc,
             log,
             &mut features,
+            &mut subversion,
         );
         receives
             .into_iter()
@@ -725,9 +800,17 @@ impl Sequencer {
 mod guard_tests;
 
 #[cfg(test)]
+#[path = "commit_decision_tests.rs"]
+mod decision_tests;
+
+#[cfg(test)]
 #[path = "commit_batch_tests.rs"]
 mod batch_tests;
 
 #[cfg(test)]
 #[path = "commit_cap_tests.rs"]
 mod cap_tests;
+
+#[cfg(test)]
+#[path = "native_format_tests.rs"]
+mod native_format_tests;

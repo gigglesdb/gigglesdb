@@ -11,6 +11,7 @@ fn request(n: u64) -> CommitRequest {
         snapshot: Ts(0),
         writes: BTreeMap::from([((Keyspace::Rows, n.to_be_bytes().to_vec()), Some(vec![1]))]),
         features_or: 0,
+        minimum_subversion: 0,
         raw: Vec::new(),
         validation: None,
     }
@@ -21,6 +22,7 @@ fn pending(n: u64) -> (Pending, mpsc::Receiver<Result<Ts, TxnError>>) {
     (
         Pending {
             request: request(n),
+            guard: None,
             reply,
         },
         receive,

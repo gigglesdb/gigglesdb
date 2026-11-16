@@ -35,7 +35,7 @@ fn owner(admin: &Admin, key: &NativeOnceKey) -> NativeOnceOwner {
         NativeOnceAdmission::Replay(_) => panic!("new owner expected"),
     }
 }
-fn clock(lower: u64, upper: u64) -> NativeResult<NativeClockLease> {
+pub(super) fn clock(lower: u64, upper: u64) -> NativeResult<NativeClockLease> {
     Ok(NativeClockLease {
         lower_unix_seconds: lower,
         upper_unix_seconds: upper,
@@ -45,7 +45,7 @@ fn clock(lower: u64, upper: u64) -> NativeResult<NativeClockLease> {
 fn bytes(admin: &Admin) -> Vec<u8> {
     encode(&records(&admin.inner.read().unwrap()).unwrap()).unwrap()
 }
-fn terminal_payload() -> Vec<u8> {
+pub(super) fn terminal_payload() -> Vec<u8> {
     use crate::operations::once::{OnceDescription, OnceSchema};
     crate::operations::once::outcome::encode(
         &OnceDescription {
@@ -94,7 +94,7 @@ fn publish(
     if let Some(sql) = sql {
         session.execute(sql, &[], None).unwrap();
     }
-    session.publish_native_once_engine(owner, [2; 32], terminal_payload(), 10, mode, &mut || {
+    session.publish_native_once_engine(None, owner, [2; 32], terminal_payload(), 10, mode, &mut || {
         clock(100, 110)
     })
 }
@@ -156,6 +156,7 @@ fn success_terminal_and_replay_preserve_atomic_state_and_slot_cleanup() {
     session.abort();
     session
         .publish_native_once_engine(
+            None,
             owner,
             [2; 32],
             terminal_payload(),
@@ -236,6 +237,7 @@ fn unrelated_commit_conflicts_but_retained_receipt_wins_over_stale_generation() 
     let saved = bytes(&admin);
     assert_eq!(
         session.publish_native_once_engine(
+            None,
             held,
             [2; 32],
             terminal_payload(),
@@ -271,6 +273,7 @@ fn unrelated_commit_conflicts_but_retained_receipt_wins_over_stale_generation() 
     let saved = bytes(&admin);
     let (record, replayed) = session
         .publish_native_once_engine(
+            None,
             held,
             [2; 32],
             terminal_payload(),
@@ -380,6 +383,7 @@ fn clock_failure_and_both_decision_lease_checks_leave_handle_usable() {
             .unwrap();
         let saved = bytes(&admin);
         let result = session.publish_native_once_engine(
+            None,
             held,
             [2; 32],
             terminal_payload(),
@@ -456,6 +460,7 @@ fn before_decision_pause_expires_the_real_clock_lease_without_fencing() {
         }
     })));
     let result = session.publish_native_once_engine(
+        None,
         held,
         [2; 32],
         terminal_payload(),
@@ -731,6 +736,7 @@ fn malformed_result_codec_rejects_before_publication_and_on_record_decode() {
             .unwrap();
         assert!(matches!(
             session.publish_native_once_engine(
+                None,
                 held,
                 [2; 32],
                 malformed.clone(),
@@ -880,6 +886,7 @@ fn permanent_tombstones_and_concurrent_owners_share_the_last_key_slot() {
     session.begin_engine().unwrap();
     session
         .publish_native_once_engine(
+            None,
             held,
             [2; 32],
             terminal_payload(),

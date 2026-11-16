@@ -662,6 +662,7 @@ fn probe(t: &Transaction, seq: &Sequencer) -> usize {
             hook.validate(log, kv, snapshot)
         })),
         features_or: 0,
+        minimum_subversion: 0,
         raw: Vec::new(),
     });
     if let Err(e) = result {

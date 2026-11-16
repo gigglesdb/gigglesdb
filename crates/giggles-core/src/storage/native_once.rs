@@ -6,6 +6,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod receipt;
+mod v2;
+#[cfg(feature = "engine-rocksdb")]
+mod v2_publish;
+#[cfg(feature = "engine-rocksdb")]
+mod v2_compact;
+
+struct LedgerView<'a> {
+    domain: u128,
+    ledger: Option<&'a NativeOutcomes>,
+}
+impl LedgerView<'_> {
+    fn borrow(state: &State) -> LedgerView<'_> {
+        LedgerView { domain: state.view.domain, ledger: state.native_outcomes.as_ref() }
+    }
+}
+use receipt::certify_lease;
+
 pub(crate) const MAX_NATIVE_IDENTITY_BYTES: usize = 512;
 pub(crate) const MAX_NATIVE_RESULT_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_NATIVE_RECORDS: usize = 1024;
@@ -284,8 +302,8 @@ impl Drop for NativeOnceOwner {
     }
 }
 
-fn check_key(state: &State, key: &NativeOnceKey) -> NativeResult<()> {
-    if state.view.domain != key.database_domain {
+fn check_key(state: &LedgerView<'_>, key: &NativeOnceKey) -> NativeResult<()> {
+    if state.domain != key.database_domain {
         return Err(NativeOnceError::DomainMismatch);
     }
     if key.identity.is_empty() || key.identity.len() > MAX_NATIVE_IDENTITY_BYTES {
@@ -293,13 +311,8 @@ fn check_key(state: &State, key: &NativeOnceKey) -> NativeResult<()> {
     }
     Ok(())
 }
-fn retained<'a>(state: &'a State, key: &NativeOnceKey) -> Option<&'a NativeOnceRecord> {
-    state
-        .native_outcomes
-        .as_ref()?
-        .entries
-        .get(key)
-        .map(|entry| &entry.record)
+fn retained<'a>(state: &LedgerView<'a>, key: &NativeOnceKey) -> Option<&'a NativeOnceRecord> {
+    state.ledger?.retained(key)
 }
 fn replay(record: &NativeOnceRecord, submitted: [u8; 32]) -> NativeResult<NativeOnceRecord> {
     if record.submitted_fingerprint != submitted {
@@ -311,23 +324,9 @@ fn certify(
     state: &State,
     clock: &mut dyn FnMut() -> NativeResult<NativeClockLease>,
 ) -> NativeResult<NativeClockLease> {
-    let lease = clock()?;
-    let now = Instant::now();
-    if lease.lower_unix_seconds > lease.upper_unix_seconds
-        || lease.upper_unix_seconds
-            < state
-                .native_outcomes
-                .as_ref()
-                .map_or(0, |l| l.upper_watermark_unix_seconds)
-        || lease.valid_until <= now
-        || now
-            .checked_add(Duration::from_secs(MAX_NATIVE_CLOCK_LEASE_SECONDS))
-            .is_none_or(|maximum| lease.valid_until > maximum)
-    {
-        return Err(NativeOnceError::ClockUncertain);
-    }
-    Ok(lease)
+    certify_lease(state.native_outcomes.as_ref(), clock()?)
 }
+
 fn persistence(error: GuardedPersistError) -> NativeOnceError {
     match error {
         GuardedPersistError::Core(CoreError::Limit) => NativeOnceError::RetentionUnavailable,
@@ -336,6 +335,15 @@ fn persistence(error: GuardedPersistError) -> NativeOnceError {
     }
 }
 impl Inner {
+    fn check_native_once_supported(&self) -> Result<(), CoreError> {
+        if let Backend::V2(db) = &self.backend
+            && db.meta.features & engine::meta::REPLICATED != 0
+        {
+            return Err(CoreError::Unsupported);
+        }
+        Ok(())
+    }
+
     fn native_once_locked<T>(
         &self,
         work: impl FnOnce(&mut State) -> NativeResult<T>,
@@ -360,7 +368,7 @@ impl Admin {
         key: NativeOnceKey,
         submitted_fingerprint: [u8; 32],
     ) -> NativeResult<NativeOnceAdmission> {
-        self.inner.native_once_locked(|state| {
+        self.inner.native_once_view(|state| {
             check_key(state, &key)?;
             if let Some(record) = retained(state, &key) {
                 return replay(record, submitted_fingerprint).map(NativeOnceAdmission::Replay);
@@ -377,8 +385,7 @@ impl Admin {
                 return Err(CoreError::Busy.into());
             }
             if state
-                .native_outcomes
-                .as_ref()
+                .ledger
                 .map_or(0, |l| l.entries.len())
                 .saturating_add(owners.len())
                 >= MAX_NATIVE_RECORDS
@@ -406,7 +413,7 @@ impl Admin {
         &self,
         key: &NativeOnceKey,
     ) -> NativeResult<NativeOnceLookup> {
-        self.inner.native_once_locked(|state| {
+        self.inner.native_once_view(|state| {
             check_key(state, key)?;
             if let Some(record) = retained(state, key) {
                 return Ok(if record.result.is_some() {
@@ -431,25 +438,19 @@ impl Admin {
         &self,
         clock: &mut dyn FnMut() -> NativeResult<NativeClockLease>,
     ) -> NativeResult<usize> {
+        self.inner.check_native_once_supported()?;
+        #[cfg(feature = "engine-rocksdb")]
+        if matches!(&self.inner.backend, Backend::V2(_)) { return self.compact_native_once_v2(clock); }
         self.inner.native_once_locked(|state| {
             if state.native_outcomes.is_none() {
                 return Ok(0);
             }
             let lease = certify(state, clock)?;
             let ledger = state.native_outcomes.as_mut().expect("checked");
-            let mut count = 0;
-            for entry in ledger.entries.values_mut() {
-                if entry.record.result.is_some()
-                    && lease.lower_unix_seconds > entry.record.retry_until_seconds
-                {
-                    entry.record.result = None;
-                    count += 1;
-                }
-            }
+            let count = ledger.compact(lease);
             if count == 0 {
                 return Ok(0);
             }
-            ledger.upper_watermark_unix_seconds = lease.upper_unix_seconds;
             // Compaction changes only the outcome ledger, never the catalog.
             self.inner
                 .persist_checked(state, None, true, &mut || {
@@ -465,6 +466,7 @@ impl SqlSession {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_native_once_engine(
         mut self,
+        setup: Option<once_session::OnceSetup>,
         owner: NativeOnceOwner,
         accepted_fingerprint: [u8; 32],
         result: Vec<u8>,
@@ -480,6 +482,12 @@ impl SqlSession {
         {
             return Err(NativeOnceError::RetentionUnavailable);
         }
+        #[cfg(feature = "engine-rocksdb")]
+        if self.is_v2_engine() {
+            let setup = setup.ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+            return self.publish_native_once_v2(setup, owner, accepted_fingerprint, result, retention_seconds, mode, clock);
+        }
+        let _ = setup;
         if self.staged.is_none() || self.transaction_id.is_none() {
             return Err(CoreError::Sql(relational::SqlError::Transaction).into());
         }
@@ -488,8 +496,8 @@ impl SqlSession {
         }
         let inner = self.admin.inner.clone();
         inner.native_once_locked(|state| {
-            check_key(state, &owner.key)?;
-            if let Some(record) = retained(state, &owner.key) {
+            check_key(&LedgerView::borrow(state), &owner.key)?;
+            if let Some(record) = retained(&LedgerView::borrow(state), &owner.key) {
                 return replay(record, owner.submitted).map(|r| (r, true));
             }
             if !crate::cancellation::lock(&inner.native_once_owners)?
@@ -505,16 +513,6 @@ impl SqlSession {
                 return Err(CoreError::Sql(relational::SqlError::Conflict).into());
             }
             let lease = certify(state, clock)?;
-            let retry_until_seconds = lease
-                .upper_unix_seconds
-                .checked_add(retention_seconds)
-                .ok_or(NativeOnceError::ClockUncertain)?;
-            let record = NativeOnceRecord {
-                submitted_fingerprint: owner.submitted,
-                accepted_fingerprint,
-                retry_until_seconds,
-                result: Some(result),
-            };
             let previous_relations = relation_names(state);
             // Keep the old snapshot in self for normal slot cleanup. The terminal
             // branch keeps current state and discards all earlier staged effects.
@@ -524,26 +522,13 @@ impl SqlSession {
             let ledger = state
                 .native_outcomes
                 .get_or_insert_with(NativeOutcomes::default);
-            ledger.upper_watermark_unix_seconds = lease.upper_unix_seconds;
-            ledger.entries.insert(
-                owner.key.clone(),
-                Entry {
-                    record,
-                    retention_seconds,
-                    decided_lower_unix_seconds: lease.lower_unix_seconds,
-                    decided_upper_unix_seconds: lease.upper_unix_seconds,
-                },
-            );
-            ledger.validate().map_err(|e| {
-                if e == CoreError::Limit {
-                    NativeOnceError::RetentionUnavailable
-                } else {
-                    e.into()
-                }
-            })?;
+            ledger.insert_outcome(
+                owner.key.clone(), owner.submitted, accepted_fingerprint,
+                result, retention_seconds, lease,
+            )?;
             // Result validation checks the stream without materializing the
             // application DTO. Finish response allocation before persistence.
-            let response = retained(state, &owner.key)
+            let response = retained(&LedgerView::borrow(state), &owner.key)
                 .expect("accepted record")
                 .clone();
             inner
@@ -558,3 +543,6 @@ impl SqlSession {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+mod v2_publish_tests;

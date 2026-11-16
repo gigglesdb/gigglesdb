@@ -400,6 +400,7 @@ fn snapshots_log_horizon_and_validation_order() {
     let (s, r) = mpsc::channel();
     let result = seq.submit(CommitRequest {
         features_or: 0,
+        minimum_subversion: 0,
         raw: Vec::new(),
         snapshot: Ts(0),
         writes: BTreeMap::new(),
@@ -418,6 +419,7 @@ fn snapshots_log_horizon_and_validation_order() {
     let assigned = seq
         .submit(CommitRequest {
             features_or: 0,
+            minimum_subversion: 0,
             raw: Vec::new(),
             snapshot: before,
             writes: BTreeMap::from([((Keyspace::Rows, key(8)), Some(vec![8]))]),
@@ -491,6 +493,7 @@ fn sequencer_read_only_clock_overflow_and_malformed_metadata() {
     assert_eq!(
         seq.submit(CommitRequest {
             features_or: 0,
+            minimum_subversion: 0,
             raw: Vec::new(),
             snapshot: Ts(0),
             writes: writes(),
@@ -507,6 +510,7 @@ fn sequencer_read_only_clock_overflow_and_malformed_metadata() {
     let first = seq
         .submit(CommitRequest {
             features_or: 0,
+            minimum_subversion: 0,
             raw: Vec::new(),
             snapshot: Ts(0),
             writes: writes(),
@@ -517,6 +521,7 @@ fn sequencer_read_only_clock_overflow_and_malformed_metadata() {
     assert_eq!(
         seq.submit(CommitRequest {
             features_or: 0,
+            minimum_subversion: 0,
             raw: Vec::new(),
             snapshot: first,
             writes: BTreeMap::new(),
@@ -528,6 +533,7 @@ fn sequencer_read_only_clock_overflow_and_malformed_metadata() {
     assert_eq!(
         seq.submit(CommitRequest {
             features_or: 0,
+            minimum_subversion: 0,
             raw: Vec::new(),
             snapshot: first,
             writes: writes(),
@@ -620,6 +626,7 @@ fn concurrent_validation_observes_accepted_predecessors_only() {
                 let reject = n % 3 == 0;
                 let result = seq.submit(CommitRequest {
                     features_or: 0,
+                    minimum_subversion: 0,
                     raw: Vec::new(),
                     snapshot: Ts(0),
                     writes: BTreeMap::from([((Keyspace::Rows, key(n)), Some(vec![n as u8]))]),
@@ -742,6 +749,7 @@ fn deterministic_group_hook_order_single_sync_and_ambiguous_all() {
                 let args = args.clone();
                 CommitRequest {
                     features_or: 0,
+                    minimum_subversion: 0,
                     raw: Vec::new(),
                     snapshot: Ts(0),
                     writes: if n == 4 {
@@ -798,6 +806,7 @@ fn deterministic_group_hook_order_single_sync_and_ambiguous_all() {
                 seq.process_group_for_test(
                     vec![CommitRequest {
                         features_or: 0,
+                        minimum_subversion: 0,
                         raw: Vec::new(),
                         snapshot: Ts(0),
                         writes: BTreeMap::new(),
@@ -1046,6 +1055,7 @@ fn group_ack_waits_for_sync_and_empty_scan_has_no_predicate() {
     let worker = thread::spawn(move || {
         let result = worker_seq.submit(CommitRequest {
             features_or: 0,
+            minimum_subversion: 0,
             raw: Vec::new(),
             snapshot: Ts(0),
             writes: BTreeMap::from([((Keyspace::Rows, key(1)), Some(vec![1]))]),
@@ -1131,6 +1141,7 @@ fn two_thousand_commits_retain_exact_active_history() {
         let ts = seq
             .submit(CommitRequest {
                 features_or: 0,
+                minimum_subversion: 0,
                 raw: Vec::new(),
                 snapshot: old.ts(),
                 writes: BTreeMap::from([(
@@ -1145,6 +1156,7 @@ fn two_thousand_commits_retain_exact_active_history() {
     let last = seq
         .submit(CommitRequest {
             features_or: 0,
+            minimum_subversion: 0,
             raw: Vec::new(),
             snapshot: old.ts(),
             writes: BTreeMap::new(),
@@ -1195,6 +1207,7 @@ fn concurrent_snapshot_registration_retains_every_needed_timestamp() {
                     let ts = seq
                         .submit(CommitRequest {
                             features_or: 0,
+                            minimum_subversion: 0,
                             raw: Vec::new(),
                             snapshot,
                             writes: BTreeMap::from([((Keyspace::Rows, key(1)), Some(vec![1]))]),
@@ -1451,6 +1464,7 @@ fn serializable_disjoint_writers_stress_and_read_only_paths() {
 fn store_failed(seq: &Arc<Sequencer>) -> Result<Ts, TxnError> {
     seq.submit(CommitRequest {
         features_or: 0,
+        minimum_subversion: 0,
         raw: Vec::new(),
         snapshot: Ts(0),
         writes: BTreeMap::from([((Keyspace::Rows, key(1)), Some(vec![1]))]),
@@ -1473,6 +1487,7 @@ fn commit_with_observed_validator(
     let check = validator.clone();
     let result = t.seq.submit(CommitRequest {
         features_or: 0,
+        minimum_subversion: 0,
         raw: Vec::new(),
         snapshot,
         writes: std::mem::take(&mut t.writes),
@@ -1546,6 +1561,7 @@ fn grouped_serializable_fallback_sees_unpublished_accepted_write() {
             .enumerate()
             .map(|(n, validator)| CommitRequest {
                 features_or: 0,
+                minimum_subversion: 0,
                 raw: Vec::new(),
                 snapshot: Ts(0),
                 writes: if n == 0 {
@@ -1578,6 +1594,7 @@ fn serializable_fallback_budget_counts_old_raw_versions() {
     for n in 0..100 {
         seq.submit(CommitRequest {
             features_or: 0,
+            minimum_subversion: 0,
             raw: Vec::new(),
             snapshot: seq.visible_ts(),
             writes: BTreeMap::from([((Keyspace::Rows, key(1)), Some(vec![n]))]),
@@ -1714,6 +1731,7 @@ mod f8a_commit_tests {
             snapshot: Ts(0),
             writes: BTreeMap::new(),
             features_or: bits,
+            minimum_subversion: 0,
             raw: Vec::new(),
             validation: None,
         }

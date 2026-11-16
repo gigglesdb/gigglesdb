@@ -6,6 +6,7 @@ use super::{
     kv::{Direction, Keyspace, KvError},
     locks::{LockError, LockKey, LockManager, LockMode, TxnId},
     mvcc,
+    once_guard::{CommitGuard, GuardRejection},
     ssi_validate::{ValidationConfig, Validator},
 };
 use std::{
@@ -28,6 +29,7 @@ pub(crate) enum TxnError {
     Deadlock,
     LockTimeout,
     Cancelled,
+    Guard(super::once_guard::GuardRejection),
     LockLimit,
     WriteSetLimit,
     SnapshotTooOld,
@@ -46,7 +48,9 @@ impl TxnError {
             Self::Serialization(_) | Self::SnapshotTooOld => "40001",
             Self::Deadlock => "40P01",
             Self::LockTimeout => "55P03",
-            Self::Cancelled => "57014",
+            Self::Guard(GuardRejection::SnapshotMoved) => "40001",
+            Self::Guard(GuardRejection::Cancelled) | Self::Cancelled => "57014",
+            Self::Guard(GuardRejection::LeaseExpired) => "XX000",
             Self::LockLimit | Self::WriteSetLimit => "53200",
             Self::CommitAmbiguous => "08007",
             Self::SequenceGone => "42P01",
@@ -82,7 +86,10 @@ impl From<TxnError> for crate::CoreError {
         match e {
             TxnError::Kv(e) => e.into(),
             TxnError::Codec(e) => e.into(),
-            TxnError::Cancelled => Self::Cancelled,
+            TxnError::Guard(GuardRejection::SnapshotMoved) => Self::Sql(crate::relational::SqlError::Conflict),
+            TxnError::Guard(GuardRejection::Cancelled) | TxnError::Cancelled => Self::Cancelled,
+            // The once layer maps LeaseExpired to ClockUncertain before conversion; no wire tag.
+            TxnError::Guard(GuardRejection::LeaseExpired) => Self::Busy,
             TxnError::Fenced => Self::Fenced,
             TxnError::LockLimit | TxnError::WriteSetLimit => Self::Limit,
             TxnError::Serialization(_) | TxnError::SnapshotTooOld => {
@@ -128,6 +135,7 @@ pub(crate) struct Savepoint {
     undo_len: usize,
     raw_len: usize,
     features_or: u64,
+    minimum_subversion: u32,
 }
 struct UndoWrite {
     key: (Keyspace, Vec<u8>),
@@ -145,6 +153,7 @@ pub(crate) struct Transaction {
     writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
     catalog_generation: u64,
     features_or: u64,
+    minimum_subversion: u32,
     pub(crate) reclaim_after_commit: bool,
     raw: Vec<RawOp>,
     xact: Option<super::xact::XactGuard>,
@@ -173,6 +182,7 @@ impl Transaction {
             snapshot: None,
             writes: BTreeMap::new(),
             features_or: 0,
+            minimum_subversion: 0,
             catalog_generation: 0,
             reclaim_after_commit: false,
             raw: Vec::new(),
@@ -219,6 +229,7 @@ impl Transaction {
             undo_len: self.undo.len(),
             raw_len: self.raw.len(),
             features_or: self.features_or,
+            minimum_subversion: self.minimum_subversion,
         };
         self.savepoints.push((mark.sequence, mark.undo_len));
         mark
@@ -260,6 +271,7 @@ impl Transaction {
         self.savepoints.truncate(index + 1);
         self.raw.truncate(mark.raw_len);
         self.features_or = mark.features_or;
+        self.minimum_subversion = mark.minimum_subversion;
         Ok(())
     }
     /// Keeps writes while invalidating this mark and all later marks.
@@ -557,6 +569,9 @@ impl Transaction {
     pub(crate) fn require_features(&mut self, bits: u64) {
         self.features_or |= bits;
     }
+    pub(crate) fn require_subversion(&mut self, version: u32) {
+        self.minimum_subversion = self.minimum_subversion.max(version);
+    }
     /// Existing counter bytes, committed atomically with their new definition.
     pub(crate) fn put_counter(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), TxnError> {
         if !valid_counter_key(&key) || value.len() != 25 {
@@ -584,15 +599,29 @@ impl Transaction {
     /// A callback error occurs after a successful durable commit: do not retry
     /// the transaction. Drop releases locks on every return path.
     pub(crate) fn commit_then<F: FnOnce(Ts) -> Result<(), TxnError>>(
-        mut self,
+        self,
         publish: F,
     ) -> Result<Ts, TxnError> {
+        self.commit_inner(None, publish)
+    }
+    pub(crate) fn commit_guarded<F: FnOnce(Ts) -> Result<(), TxnError>>(
+        self, guard: CommitGuard, publish: F,
+    ) -> Result<Ts, TxnError> {
+        self.commit_inner(Some(guard), publish)
+    }
+    fn commit_inner<F: FnOnce(Ts) -> Result<(), TxnError>>(
+        mut self, guard: Option<CommitGuard>, publish: F,
+    ) -> Result<Ts, TxnError> {
+        if guard.as_ref().is_some_and(|g| g.is_fenced() && self.current_snapshot_ts() != Some(g.fence())) {
+            return Err(TxnError::Misuse);
+        }
         if let Some(xid) = self.xact_id() {
             self.raw.push(RawOp::XactCommitted { xid });
         }
-        if self.writes.is_empty()
+        if guard.is_none() && self.writes.is_empty()
             && self.raw.is_empty()
             && self.features_or == 0
+            && self.minimum_subversion == 0
             && self.isolation != Isolation::Serializable
         {
             let ts = self.seq.visible_ts();
@@ -608,10 +637,11 @@ impl Transaction {
         });
         // The owned validator reads only the worker's supplied log and KV handle.
         // Drop releases locks and unregisters the snapshot on success or error.
-        let ts = self.seq.submit(CommitRequest {
+        let request = CommitRequest {
             snapshot,
             writes: std::mem::take(&mut self.writes),
             features_or: self.features_or,
+            minimum_subversion: self.minimum_subversion,
             raw: std::mem::take(&mut self.raw),
             validation: validator.map(|validator| {
                 Box::new(
@@ -621,7 +651,11 @@ impl Transaction {
                           _commit| { validator.validate(log, kv, snapshot) },
                 ) as _
             }),
-        })?;
+        };
+        let ts = match guard {
+            Some(guard) => self.seq.submit_guarded(request, guard)?,
+            None => self.seq.submit(request)?,
+        };
         publish(ts)?;
         Ok(ts)
     }

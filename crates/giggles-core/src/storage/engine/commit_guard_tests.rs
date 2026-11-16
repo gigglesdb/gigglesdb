@@ -11,7 +11,7 @@ use crate::{
 };
 use std::ops::Bound;
 
-fn fixture() -> (Arc<MemKv>, Arc<Sequencer>) {
+pub(super) fn fixture() -> (Arc<MemKv>, Arc<Sequencer>) {
     let mem = Arc::new(MemKv::new());
     let mut batch = WriteBatch::default();
     for (key, value) in [
@@ -35,11 +35,12 @@ fn reopen(mem: Arc<MemKv>) -> Arc<Sequencer> {
     )
     .unwrap()
 }
-fn request(bits: u64) -> CommitRequest {
+pub(super) fn request(bits: u64) -> CommitRequest {
     CommitRequest {
         snapshot: Ts(0),
         writes: BTreeMap::new(),
         features_or: bits,
+        minimum_subversion: 0,
         raw: Vec::new(),
         validation: None,
     }

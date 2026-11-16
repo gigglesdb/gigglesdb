@@ -762,6 +762,7 @@ fn unique_once_replay_and_terminal_receipt_protected_deltas() {
     };
     let (receipt, _) = tx
         .publish_native_once_engine(
+            None,
             owner,
             [2; 32],
             payload,
@@ -813,6 +814,7 @@ fn unique_once_replay_and_terminal_receipt_protected_deltas() {
     )
     .unwrap();
     tx.publish_native_once_engine(
+        None,
         owner,
         [4; 32],
         payload,

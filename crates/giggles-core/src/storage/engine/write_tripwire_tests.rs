@@ -133,6 +133,29 @@ fn every_engine_write_goes_through_kv_backend_write() {
         );
     }
     drop(session);
+    {
+        use crate::operations::{Bindings, Engine, Request, ValueExpr,
+            once::{ONCE_CONTRACT_VERSION, OnceBody, OnceIdentity, OnceRequest, OnceTime}};
+        use std::time::{Duration, Instant};
+        let engine = Engine::new(admin.clone());
+        let request = OnceRequest { contract_version: ONCE_CONTRACT_VERSION,
+            identity: OnceIdentity { database_domain: admin.authority_metadata().unwrap().0,
+                tenant: 1, namespace: "tripwire".into(), key: vec![1] }, retention_seconds: 60,
+            body: OnceBody::Operation(Request::Insert { table: "t".into(), values: vec![
+                ("id".into(), ValueExpr::Literal(Value::Int(4))),
+                ("v".into(), ValueExpr::Literal(Value::Text("four".into())))] }) };
+        let clock = |seconds| move || Ok(OnceTime { lower_unix_seconds: seconds,
+            upper_unix_seconds: seconds, valid_until: Instant::now() + Duration::from_secs(10) });
+        let before_once = rec.log.lock().unwrap().len();
+        assert!(engine.execute_once(&request, &Bindings::new(), &clock(1000)).unwrap().outcome.is_ok());
+        let before_compact = rec.log.lock().unwrap().len();
+        assert_eq!(engine.compact_outcomes(&clock(2000)).unwrap(), 1);
+        let log = rec.log.lock().unwrap();
+        assert!(touched(&log[before_once..before_compact]).contains(&Keyspace::Meta));
+        assert!(touched(&log[before_once..before_compact]).contains(&Keyspace::Kernel));
+        assert!(touched(&log[before_compact..]).contains(&Keyspace::Kernel));
+        assert_eq!(super::meta::open_checks(rec.as_ref()).unwrap().subversion, 2);
+    }
     drop(admin);
     let reopened =
         Admin::attach_v2_backend(rec.clone(), Limits::default(), DEFAULT_WRITE_SET_BYTES).unwrap();
@@ -149,6 +172,7 @@ fn every_engine_write_goes_through_kv_backend_write() {
         vec![
             vec![Value::Int(2), Value::Text("updated".into())],
             vec![Value::Int(3), Value::Text("three".into())],
+            vec![Value::Int(4), Value::Text("four".into())],
         ]
     );
     drop(reopened);
@@ -178,6 +202,7 @@ fn every_engine_write_goes_through_kv_backend_write() {
         Keyspace::Rows,
         Keyspace::Index,
         Keyspace::Seq,
+        Keyspace::Kernel,
     ] {
         assert!(written.contains(&ks), "workload did not write {ks:?}");
     }

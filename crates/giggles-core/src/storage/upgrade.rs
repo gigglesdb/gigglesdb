@@ -376,7 +376,7 @@ fn build(path: &Path, s: &State, roles: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(
         (b"family".as_slice(), 2u32.to_be_bytes().to_vec()),
         (
             b"subversion",
-            engine::meta::CURRENT_SUBVERSION.to_be_bytes().to_vec(),
+            engine::meta::INITIAL_SUBVERSION.to_be_bytes().to_vec(),
         ),
         (b"domain", s.view.domain.to_be_bytes().to_vec()),
         (b"engine", b"rocksdb".to_vec()),

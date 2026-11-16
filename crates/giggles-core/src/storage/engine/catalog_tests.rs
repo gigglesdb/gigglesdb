@@ -694,8 +694,10 @@ fn transaction_catalog_tombstones_require_commit_then_and_release_locks_on_rejec
     let (_, seq, locks, _) = catalog_setup();
     let mut txn = transaction(&seq, &locks, 1, Isolation::ReadCommitted);
     assert!(!txn.writes_keyspace(Keyspace::Catalog));
-    txn.put(Keyspace::Kernel, vec![4; 8], vec![9]).unwrap();
-    assert!(txn.writes_keyspace(Keyspace::Kernel));
+    let row_key = [91u64.to_be_bytes().as_slice(), &[1]].concat();
+    txn.lock_for_write(Keyspace::Rows, &row_key, None, &|| false).unwrap();
+    txn.put(Keyspace::Rows, row_key.clone(), vec![9]).unwrap();
+    assert!(txn.writes_keyspace(Keyspace::Rows));
     assert!(!txn.writes_keyspace(Keyspace::Catalog));
     txn.delete(Keyspace::Catalog, vec![5; 8]).unwrap();
     assert!(txn.writes_keyspace(Keyspace::Catalog));
@@ -704,7 +706,7 @@ fn transaction_catalog_tombstones_require_commit_then_and_release_locks_on_rejec
     assert!(locks.held(TxnId(1)).is_empty());
     assert_eq!(seq.visible_ts(), super::super::hlc::Ts(0));
     assert_eq!(
-        super::super::mvcc::read_at(seq.kv(), Keyspace::Kernel, &[4; 8], seq.visible_ts()).unwrap(),
+        super::super::mvcc::read_at(seq.kv(), Keyspace::Rows, &row_key, seq.visible_ts()).unwrap(),
         None
     );
 }

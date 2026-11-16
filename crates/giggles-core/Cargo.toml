@@ -38,6 +38,11 @@ name = "once"
 path = "tests/once.rs"
 
 [[test]]
+name = "native_once_v2_recovery"
+path = "tests/native_once_v2_recovery.rs"
+required-features = ["engine-rocksdb"]
+
+[[test]]
 name = "process"
 path = "tests/process.rs"
 

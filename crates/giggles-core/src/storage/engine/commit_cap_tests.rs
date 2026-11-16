@@ -10,6 +10,7 @@ fn pending(id: u64) -> Pending {
                 ((Keyspace::Rows, vec![6]), None),
             ]),
             features_or: 0,
+            minimum_subversion: 0,
             raw: vec![
                 RawOp::DeleteCounter { key: vec![7, 8] },
                 RawOp::PutCounter {
@@ -19,6 +20,7 @@ fn pending(id: u64) -> Pending {
             ],
             validation: None,
         },
+        guard: None,
         reply,
     }
 }
@@ -168,4 +170,80 @@ fn cap_preserves_counter_and_shutdown_handling() {
             matches!(receive.try_recv(), Ok(Message::Commit(p)) if p.request.snapshot == Ts(2))
         );
     }
+}
+
+fn guarded(id: u64) -> Pending {
+    let mut p = pending(id);
+    p.guard = Some(CommitGuard::capture(Ts(id), Instant::now() + Duration::from_secs(60)));
+    p
+}
+
+#[test]
+fn oversized_guarded_first_leaves_ordinary_queue_untouched() {
+    let (send, receive) = mpsc::channel();
+    send.send(Message::Commit(pending(1))).unwrap();
+    let config = SequencerConfig { group_max_bytes: Some(1), ..Default::default() };
+    let (group, deferred, shutdown) = gather(guarded(0), &receive, &config);
+    assert_eq!(ids(&group), [0]);
+    assert!(deferred.is_none());
+    assert!(!shutdown);
+    assert!(matches!(receive.try_recv(), Ok(Message::Commit(p)) if p.request.snapshot == Ts(1)));
+}
+
+#[test]
+fn fitting_ordinaries_defer_guard_before_ordinary_tail() {
+    let (send, receive) = mpsc::channel();
+    for p in [pending(1), pending(2), guarded(3), pending(4)] {
+        send.send(Message::Commit(p)).unwrap();
+    }
+    let config = SequencerConfig { group_max_bytes: Some(48), ..Default::default() };
+    let (group, deferred, shutdown) = gather(pending(0), &receive, &config);
+    assert_eq!(ids(&group), [0, 1, 2]);
+    assert!(matches!(deferred, Some(Message::Commit(p)) if p.guard.is_some() && p.request.snapshot == Ts(3)));
+    assert!(!shutdown);
+    assert!(matches!(receive.try_recv(), Ok(Message::Commit(p)) if p.request.snapshot == Ts(4)));
+}
+
+#[test]
+fn overflow_ordinary_precedes_guard_and_both_remain_singletons() {
+    let (send, receive) = mpsc::channel();
+    let mut oversized = pending(1);
+    oversized.request.writes.insert((Keyspace::Rows, vec![0; 30]), None);
+    send.send(Message::Commit(oversized)).unwrap();
+    send.send(Message::Commit(guarded(2))).unwrap();
+    let config = SequencerConfig { group_max_bytes: Some(24), ..Default::default() };
+    let (group, next, shutdown) = gather(pending(0), &receive, &config);
+    assert_eq!(ids(&group), [0]);
+    assert!(!shutdown);
+    let Some(Message::Commit(next)) = next else { panic!("expected oversized ordinary") };
+    assert_eq!(next.request.snapshot, Ts(1));
+    assert!(request_bytes(&next.request) > 24);
+    let (group, next, shutdown) = gather(next, &receive, &config);
+    assert_eq!(ids(&group), [1]);
+    assert!(!shutdown);
+    let Some(Message::Commit(next)) = next else { panic!("expected guarded commit") };
+    assert_eq!(next.request.snapshot, Ts(2));
+    assert!(next.guard.is_some());
+    let (group, deferred, shutdown) = gather(next, &receive, &config);
+    assert_eq!(ids(&group), [2]);
+    assert!(deferred.is_none());
+    assert!(!shutdown);
+}
+
+#[test]
+fn sequencer_accepts_oversized_guarded_request_with_small_cap() {
+    let (mem, old) = super::guard_tests::fixture();
+    drop(old);
+    let seq = Sequencer::open(
+        Arc::new(Kv::new(mem)),
+        Arc::new(ManualClock::new(10)),
+        SequencerConfig { group_max_bytes: Some(1), ..Default::default() },
+    ).unwrap();
+    let mut request = super::guard_tests::request(0);
+    request.writes.insert((Keyspace::Rows, 1u64.to_be_bytes().to_vec()), Some(vec![42]));
+    assert!(request_bytes(&request) > 1);
+    let guard = CommitGuard::capture(Ts(0), Instant::now() + Duration::from_secs(60));
+    let worker = seq.clone();
+    assert!(thread::spawn(move || worker.submit_guarded(request, guard)).join().unwrap().is_ok());
+    drop(seq);
 }

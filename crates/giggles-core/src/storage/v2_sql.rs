@@ -8,7 +8,7 @@ use relational::{
 };
 use std::{collections::BTreeSet, ops::Bound};
 #[path = "v2_sql_sequences.rs"]
-mod sql_sequences;
+pub(super) mod sql_sequences;
 #[path = "v2_sql_xact.rs"]
 mod sql_xact;
 #[cfg(all(test, feature = "engine-rocksdb"))]
@@ -875,7 +875,7 @@ fn acknowledge_sql_commit(point: CrashPoint) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn validate_pending(
+pub(super) fn validate_pending(
     db: &v2::V2Db,
     txn: &mut Transaction,
     deferred: &mut relational::DeferralState,

@@ -3,6 +3,7 @@ mod catalog_inspection;
 mod cursor;
 mod drop_table;
 mod engine;
+mod once_session;
 pub(crate) use engine::{catalog::CatalogParts, catalog_codec::sql_views::{SqlViewDef, SqlViewColumn, SqlViewDependency}};
 mod feature_envelope;
 mod format_policy;

@@ -71,7 +71,8 @@ fn immutable_image_is_reused_across_data_timestamps_at_ten_and_fifty_tables() {
         fork.validate().unwrap();
         for n in 0..20 {
             let mut data = txn(&seq, &locks, 200 + n);
-            data.put(Keyspace::Kernel, vec![1], vec![n as u8]).unwrap();
+            data.lock_for_write(Keyspace::Rows, &[1; 8], None, &|| false).unwrap();
+            data.put(Keyspace::Rows, vec![1; 8], vec![n as u8]).unwrap();
             catalog.commit_ddl(data).unwrap();
             reader.begin_statement();
             assert!(reader.snapshot_ts() > catalog_version);
@@ -313,7 +314,9 @@ fn concurrent_catalog_and_data_commits_share_only_complete_validated_images() {
                     let image = snapshot.image().unwrap();
                     assert_eq!(image.tables, snapshot.parts.tables);
                     image.validate().unwrap();
-                    tx.put(Keyspace::Kernel, vec![client as u8], vec![n as u8])
+                    tx.lock_for_write(Keyspace::Rows, &[client as u8; 8], None, &|| false)
+                        .unwrap();
+                    tx.put(Keyspace::Rows, vec![client as u8; 8], vec![n as u8])
                         .unwrap();
                     catalog.commit_ddl(tx).unwrap();
                 }

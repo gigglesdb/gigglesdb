@@ -183,6 +183,7 @@ fn key(identity: &OnceIdentity) -> OnceResult<NativeOnceKey> {
 
 fn storage_error(error: NativeOnceError) -> OnceError {
     match error {
+        NativeOnceError::Core(CoreError::Unsupported) => OnceError::Operation(Error::Unsupported),
         NativeOnceError::Core(error) => OnceError::Operation(core(error)),
         NativeOnceError::DomainMismatch => OnceError::DomainMismatch,
         NativeOnceError::InProgress => OnceError::InProgress,
@@ -257,7 +258,18 @@ impl Engine {
             NativeOnceAdmission::Owner(owner) => owner,
         };
         let mut session = self.admin.sql_session();
-        session.begin_engine().map_err(core)?;
+        #[cfg(feature = "engine-rocksdb")]
+        let setup = if session.is_v2_engine() {
+            Some(session.begin_once_engine().map_err(core)?)
+        } else {
+            session.begin_engine().map_err(core)?;
+            None
+        };
+        #[cfg(not(feature = "engine-rocksdb"))]
+        let setup = {
+            session.begin_engine().map_err(core)?;
+            None
+        };
         let (database_domain, catalog_epoch) = session.snapshot_identity_engine().map_err(core)?;
         if database_domain != request.identity.database_domain {
             return Err(OnceError::DomainMismatch);
@@ -317,6 +329,7 @@ impl Engine {
         let encoded = outcome::encode(&description, &result)?;
         let (record, replayed) = session
             .publish_native_once_engine(
+                setup,
                 owner,
                 accepted,
                 encoded,

@@ -109,7 +109,7 @@ pub(super) fn callback(
     })
 }
 
-pub(super) fn stage_pending(
+pub(in crate::storage) fn stage_pending(
     db: &v2::V2Db,
     txn: &mut Transaction,
     pending: &sequences::Pending,

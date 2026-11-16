@@ -350,13 +350,15 @@ fn pin_admission_drop_active_snapshot_and_ten_second_retention() {
     let held = seq.snapshot();
     let old = held.ts();
     let mut writes = BTreeMap::new();
-    writes.insert((Keyspace::Kernel, b"clock".to_vec()), Some(vec![1]));
+    // Kernel commits now pass the native-content gate; any versioned keyspace advances the clock.
+    writes.insert((Keyspace::Rows, b"clock".to_vec()), Some(vec![1]));
     let committed = seq
         .submit(crate::storage::engine::commit::CommitRequest {
             snapshot: old,
             writes,
             validation: None,
             features_or: 0,
+            minimum_subversion: 0,
             raw: Vec::new(),
         })
         .unwrap();

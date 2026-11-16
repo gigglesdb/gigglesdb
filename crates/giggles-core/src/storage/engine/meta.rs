@@ -8,7 +8,11 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) const CURRENT_SUBVERSION: u32 = 1;
+// Reader capability is separate from the version written by receipt-free stores.
+pub(crate) const INITIAL_SUBVERSION: u32 = 1;
+pub(crate) const CURRENT_SUBVERSION: u32 = 2;
+pub(crate) const NATIVE_SUBVERSION: u32 = 2;
+pub(crate) const NATIVE_OUTCOMES: u64 = 1 << 1;
 pub(crate) const SECONDARY_INDEXES: u64 = 1 << 2;
 pub(crate) const TEXT_BACKED_COLUMN_TYPES: u64 = 1 << 10;
 pub(crate) const SCHEMAS_AND_USER_TYPES: u64 = 1 << 12;
@@ -208,12 +212,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
         return Err(FormatError::Unsupported("family".into()));
     }
     let subversion = u32::from_be_bytes(fixed(kv, b"subversion")?);
-    if subversion == 0 {
-        return Err(corrupt("zero subversion"));
-    }
-    if subversion > CURRENT_SUBVERSION {
-        return Err(FormatError::Unsupported("subversion".into()));
-    }
+    check_subversion(subversion, CURRENT_SUBVERSION)?;
     let features = u64::from_be_bytes(fixed(kv, b"features")?);
     check_features(features)?;
     if let Some(applied) = kv.get(Keyspace::Meta, b"raft_applied").map_err(corrupt)? {
@@ -275,6 +274,15 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
         gc_watermark: optional(kv, b"gc_watermark")?,
     })
 }
+pub(crate) fn check_subversion(version: u32, supported: u32) -> Result<(), FormatError> {
+    if version == 0 {
+        return Err(corrupt("zero subversion"));
+    }
+    if version > supported {
+        return Err(FormatError::Unsupported("subversion".into()));
+    }
+    Ok(())
+}
 pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
     check_features_allowed(bits, 0x3FFF | SQL_VIEWS | RELATION_COMMENTS | REPLICATED | KEY_DEPENDENCY_IDENTITY)
 }
@@ -295,6 +303,7 @@ fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
 }
 pub(crate) fn open_checks(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     let mut info = validate_meta(kv)?;
+    super::native_content::check(kv, info.features, info.subversion)?;
     info.stale_counters = super::content_check::check(kv, info.features)?;
     Ok(info)
 }
@@ -345,7 +354,7 @@ pub(crate) fn write_initial_meta(
     let mut batch = WriteBatch::default();
     for (key, value) in [
         (b"family".as_slice(), 2u32.to_be_bytes().to_vec()),
-        (b"subversion", CURRENT_SUBVERSION.to_be_bytes().to_vec()),
+        (b"subversion", INITIAL_SUBVERSION.to_be_bytes().to_vec()),
         (b"domain", domain.to_vec()),
         (b"engine", b"rocksdb".to_vec()),
     ] {

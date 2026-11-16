@@ -123,7 +123,8 @@ fn no_catalog_commits_do_not_scan_or_publish_at_ten_and_fifty_tables() {
         backend.catalog_ranges.store(0, Ordering::Relaxed);
         catalog.commit_ddl(txn(&seq, &locks, count + 1)).unwrap();
         let mut dml = txn(&seq, &locks, count + 2);
-        dml.put(Keyspace::Kernel, vec![1], vec![2]).unwrap();
+        dml.lock_for_write(Keyspace::Rows, &[1; 8], None, &|| false).unwrap();
+        dml.put(Keyspace::Rows, vec![1; 8], vec![2]).unwrap();
         catalog.commit_ddl(dml).unwrap();
         assert_eq!(
             backend.catalog_ranges.load(Ordering::Relaxed),
@@ -145,7 +146,8 @@ fn data_commit_releases_catalog_mutex_while_waiting_for_sequencer() {
     let (release_tx, release_rx) = mpsc::channel();
     *backend.pause.lock().unwrap() = Some((entered_tx, release_rx));
     let mut dml = txn(&seq, &locks, 1);
-    dml.put(Keyspace::Kernel, vec![1], vec![2]).unwrap();
+    dml.lock_for_write(Keyspace::Rows, &[1; 8], None, &|| false).unwrap();
+    dml.put(Keyspace::Rows, vec![1; 8], vec![2]).unwrap();
     let committing = catalog.clone();
     let worker = thread::spawn(move || committing.commit_ddl(dml));
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -295,7 +297,9 @@ fn concurrent_ddl_and_data_commits_keep_published_catalog_coherent() {
                     let mut data = txn(seq, locks, 1000 + client * 100 + i);
                     let parts = catalog.parts(&mut data).unwrap();
                     assert!(parts.tables.values().all(|t| t.columns.len() == 1));
-                    data.put(Keyspace::Kernel, vec![client as u8], vec![i as u8])
+                    data.lock_for_write(Keyspace::Rows, &[client as u8; 8], None, &|| false)
+                        .unwrap();
+                    data.put(Keyspace::Rows, vec![client as u8; 8], vec![i as u8])
                         .unwrap();
                     catalog.commit_ddl(data).unwrap();
                 }

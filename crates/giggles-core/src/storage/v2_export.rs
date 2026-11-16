@@ -107,6 +107,11 @@ fn export_inner(
         })
         .transpose()?
         .unwrap_or(Ts(0));
+    if u64::from_be_bytes(features) & engine::meta::NATIVE_OUTCOMES != 0
+        || read.range(Keyspace::Kernel, Bound::Included(&[7]), Bound::Excluded(&[8]), Direction::Forward)?.next().transpose()?.is_some()
+    {
+        return Err(CoreError::Unsupported);
+    }
     let checked = engine::meta::open_checks(read.as_ref()).map_err(v2::format_error)?;
     after_snapshot(ts);
     let stage = staging(path)?;
@@ -218,6 +223,9 @@ impl ExportRead {
             ts: Ts(u64::from_be_bytes(header[20..28].try_into().unwrap())),
             domain: [0; 16],
         };
+        if read.features & engine::meta::NATIVE_OUTCOMES != 0 {
+            return Err(CoreError::Unsupported);
+        }
         let mut offset = HEADER;
         let domain = read
             .record(&mut offset)?
@@ -471,7 +479,7 @@ pub(super) fn restore(
         (b"family".as_slice(), 2u32.to_be_bytes().to_vec()),
         (
             b"subversion",
-            engine::meta::CURRENT_SUBVERSION.to_be_bytes().to_vec(),
+            engine::meta::INITIAL_SUBVERSION.to_be_bytes().to_vec(),
         ),
         (b"domain", domain.to_vec()),
         (b"engine", b"rocksdb".to_vec()),
@@ -513,3 +521,7 @@ pub(super) fn restore(
 #[cfg(test)]
 #[path = "v2_export_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "v2_export_native_tests.rs"]
+mod native_tests;

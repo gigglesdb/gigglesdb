@@ -185,7 +185,8 @@ fn undo_budget_bounds_repeated_overwrites_and_tombstones() {
     for initial in [Some(vec![0; 100]), None] {
         let (seq, locks) = setup(512);
         let mut t = txn(&seq, &locks, 1);
-        t.write(Keyspace::Kernel, vec![1], initial.clone()).unwrap();
+        t.lock_for_write(Keyspace::Rows, &key(1), None, &|| false).unwrap();
+        t.write(Keyspace::Rows, key(1), initial.clone()).unwrap();
         let mark = t.savepoint();
         let mut limited = false;
         for n in 1..100 {
@@ -197,7 +198,7 @@ fn undo_budget_bounds_repeated_overwrites_and_tombstones() {
             } else {
                 value
             };
-            match t.write(Keyspace::Kernel, vec![1], value) {
+            match t.write(Keyspace::Rows, key(1), value) {
                 Ok(()) => {}
                 Err(TxnError::WriteSetLimit) => {
                     limited = true;
@@ -208,17 +209,18 @@ fn undo_budget_bounds_repeated_overwrites_and_tombstones() {
         }
         assert!(limited);
         t.rollback_to(&mark).unwrap();
-        assert_eq!(t.writes.get(&(Keyspace::Kernel, vec![1])), Some(&initial));
+        assert_eq!(t.writes.get(&(Keyspace::Rows, key(1))), Some(&initial));
         assert_eq!(t.undo_bytes, 0);
         t.release(mark).unwrap();
     }
     let (seq, locks) = setup(512);
     let mut t = txn(&seq, &locks, 1);
     let mark = t.savepoint();
-    t.delete(Keyspace::Kernel, vec![1]).unwrap();
+    t.lock_for_write(Keyspace::Rows, &key(1), None, &|| false).unwrap();
+    t.delete(Keyspace::Rows, key(1)).unwrap();
     let bytes = t.undo_bytes;
     for _ in 0..1000 {
-        t.delete(Keyspace::Kernel, vec![1]).unwrap();
+        t.delete(Keyspace::Rows, key(1)).unwrap();
     }
     assert_eq!(t.undo_bytes, bytes);
     assert_eq!(t.undo.len(), 1);
