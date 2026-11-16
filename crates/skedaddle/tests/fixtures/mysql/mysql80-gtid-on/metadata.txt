@@ -1,0 +1,11 @@
+profile=mysql80
+gtid=ON
+image=mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
+settings(version,gtid,format,row_image,row_metadata)=8.0.46	ON	ROW	FULL	FULL
+zoo(rows,nulls,min_wide_bytes,max_wide_bytes)=1	1	20480	20480
+8.0.46	2329026a-e122-11f1-aa98-0242ac120002:1-14		2329026a-e122-11f1-aa98-0242ac120002
+mysql-bin.000001	180	No
+mysql-bin.000002	3373846	No
+mysql-bin.000003	244	No
+mysql-bin.000004	197	No
+mysql-bin.000004	197			2329026a-e122-11f1-aa98-0242ac120002:1-14

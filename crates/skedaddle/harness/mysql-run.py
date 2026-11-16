@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,7 +15,9 @@ ROOT = pathlib.Path(__file__).resolve().parent
 
 def main():
     profile, task_arg, gtid = sys.argv[1:4]
-    spike_arg = sys.argv[4] if len(sys.argv) > 4 else ""
+    # Explicit prefixes preserve empty optional arguments in Windows PowerShell.
+    spike_arg = sys.argv[4].removeprefix("--spike=") if len(sys.argv) > 4 else ""
+    cargo_test = sys.argv[5].removeprefix("--cargo-test=") if len(sys.argv) > 5 else ""
     task = pathlib.Path(task_arg).resolve()
     if profile not in ("mysql80", "mysql84") or gtid not in ("ON", "OFF"):
         raise ValueError("expected mysql80/mysql84 and ON/OFF")
@@ -27,7 +30,10 @@ def main():
     env = os.environ.copy()
     env.update(RUN_ID=run, MYSQL_GTID_MODE=gtid, TEMP=str(task / "tmp"),
                TMP=str(task / "tmp"), SKEDADDLE_TEST_ROOT=str(task / "scratch"),
-               CARGO_TARGET_DIR="J:/gigglesdb-work/conn-target-m1")
+               CARGO_TARGET_DIR=env.get("CARGO_TARGET_DIR") or str(task / "target"),
+               RUSTC_WRAPPER="J:/gigglesdb-work/tools/bin/sccache.exe",
+               SCCACHE_DIR="J:/gigglesdb-work/sccache-cache", SCCACHE_CACHE_SIZE="100G",
+               CARGO_INCREMENTAL="0", CARGO_BUILD_JOBS="4")
     lock = json.loads((ROOT / "images.lock").read_text())["images"]
     for name in ("mysql80", "mysql84"):
         env[name.upper() + "_IMAGE"] = lock[name]["ref"]
@@ -81,6 +87,11 @@ def main():
         env.update(M1_PORT=address.rsplit(":", 1)[1], M1_CA=str(task / "ca.pem"),
                    M1_OUTPUT=str(task), M1_PROFILE=profile, M1_GTID=gtid,
                    M1_CONTAINER_ID=cid)
+        config_path = task / "mysql-config.json"
+        save("mysql-config.json", json.dumps(dict(host="localhost", port=int(env["M1_PORT"]),
+             ca=env["M1_CA"], user="root", password="skedaddle", profile=profile, gtid=gtid,
+             container_id=cid, max_decompressed_bytes=16 * 1024 * 1024)))
+        env["SKEDADDLE_MYSQL_CONFIG"] = str(config_path)
         sql = ("SELECT @@version,@@gtid_mode,@@binlog_format,@@binlog_row_image,@@binlog_row_metadata; "
                "SELECT COUNT(*) FROM type_zoo.zoo; "
                "SELECT HEX(cv),HEX(JSON_UNQUOTE(JSON_EXTRACT(jv,'$.nested[3]'))),OCTET_LENGTH(wide_row) FROM type_zoo.zoo WHERE id=1;")
@@ -88,6 +99,34 @@ def main():
                        "--ssl-mode=VERIFY_CA", "--ssl-ca=/var/lib/mysql/harness/tls/ca.pem",
                        "--default-character-set=utf8mb4", "-Nse", sql)
         save("setup-probe.txt", probe.stdout)
+        if cargo_test:
+            # The fixed lane must never overlap another build in this coordinator.
+            lane_lock = pathlib.Path("J:/gigglesdb-work/lead-a/build.lock")
+            with lane_lock.open("x", encoding="utf8") as owner:
+                try:
+                    owner.write(str(os.getpid()))
+                    owner.flush()
+                    args = ["C:/Program Files/Git/bin/bash.exe",
+                            "J:/gigglesdb-work/r2/buildslot2.sh", "cargo", "test", "-p", "skedaddle",
+                            *shlex.split(cargo_test)]
+                    process = subprocess.Popen(args, env=env, cwd=ROOT.parent, stdout=subprocess.PIPE,
+                                               stderr=subprocess.PIPE, encoding="utf8", errors="replace")
+                    try:
+                        stdout, stderr = process.communicate(timeout=1800)
+                    except subprocess.TimeoutExpired:
+                        # Killing only bash would leave cargo/test children using the lane.
+                        subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                                       env=env, capture_output=True, check=False)
+                        process.communicate()
+                        raise RuntimeError("MySQL cargo lane exceeded 30 minutes; killed process tree")
+                    result = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+                    save("cargo-test.log", result.stdout + result.stderr)
+                    print(result.stdout, end="", flush=True)
+                    print(result.stderr, file=sys.stderr, end="", flush=True)
+                    return result.returncode
+                finally:
+                    owner.close()
+                    lane_lock.unlink()
         spike = pathlib.Path(spike_arg) if spike_arg else None
         if not spike or not spike.is_file():
             print("SKIP Rust client spike: supply -MysqlSpike <built standalone spike.exe>", flush=True)

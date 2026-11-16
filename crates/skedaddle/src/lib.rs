@@ -14,10 +14,12 @@ pub mod event;
 pub mod fsconfine;
 pub mod hooks;
 pub mod mapping;
+pub mod mysql;
 pub mod pg;
 pub mod rollback;
 pub mod runner;
 pub mod security;
+pub mod spanner;
 pub mod status;
 pub mod verify;
 

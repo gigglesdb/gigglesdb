@@ -1,0 +1,105 @@
+[
+  {
+    "type": "FORMAT_DESCRIPTION_EVENT",
+    "capture": "FORMAT_DESCRIPTION_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 4,
+    "size": 123,
+    "sha256": "09da8d9301edbb4ae775a645570c519a0403cb428436226302085e76d87586f0"
+  },
+  {
+    "type": "PREVIOUS_GTIDS_EVENT",
+    "capture": "PREVIOUS_GTIDS_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 127,
+    "size": 71,
+    "sha256": "ee8564823bb0b258e208ab0dcfed832f70d1591f7c327e1523c01262d882a47b"
+  },
+  {
+    "type": "GTID_EVENT",
+    "capture": "GTID_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 198,
+    "size": 77,
+    "sha256": "2ed7319cfdda225352e54f668198dfb7d279ea4e361ca9f80fbc34e1b5279a55"
+  },
+  {
+    "type": "QUERY_EVENT",
+    "capture": "QUERY_DDL_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 275,
+    "size": 159,
+    "sha256": "81f3d6da609adcb4dedb00361d23fedc59908520c055223c3a97916b202cb596"
+  },
+  {
+    "type": "QUERY_EVENT",
+    "capture": "QUERY_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 514,
+    "size": 79,
+    "sha256": "cd09456b71b7f5639b49e2a075c75ea429513d03b8fb9736273d5dd8ef3180de"
+  },
+  {
+    "type": "TABLE_MAP_EVENT",
+    "capture": "TABLE_MAP_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 593,
+    "size": 280,
+    "sha256": "b96461ce5d698de71c11c8da822626a0925898edb4f63149d349de5ca9b37e37"
+  },
+  {
+    "type": "WRITE_ROWS_EVENT",
+    "capture": "WRITE_ROWS_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 873,
+    "size": 20735,
+    "sha256": "dd69fb94f116903bcb01de6ef7bb6955d2954b1eb690dc49912d833789904728"
+  },
+  {
+    "type": "UPDATE_ROWS_EVENT",
+    "capture": "UPDATE_ROWS_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 21888,
+    "size": 41444,
+    "sha256": "d5504762717fdec09971d9d23289c3e59abdad23505938284d2c07955fa80384"
+  },
+  {
+    "type": "DELETE_ROWS_EVENT",
+    "capture": "DELETE_ROWS_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 63612,
+    "size": 20743,
+    "sha256": "66028af93368b702dbb749a2d506afd2105078e80ae10b8b2271b38012ae007c"
+  },
+  {
+    "type": "XID_EVENT",
+    "capture": "XID_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 84511,
+    "size": 31,
+    "sha256": "f6bde4ff3b193e17ee62f957e4eeaf91ead884f6b7929cf3e108c4989ab1a140"
+  },
+  {
+    "type": "TRANSACTION_PAYLOAD_EVENT",
+    "capture": "TRANSACTION_PAYLOAD_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 84621,
+    "size": 572,
+    "sha256": "8e7e2ebeba74cdf555d2ef221d9117b256daa0ed24e075e7b4fd5fdd842c91a3"
+  },
+  {
+    "type": "ROTATE_EVENT",
+    "capture": "ROTATE_EVENT.bin",
+    "file": "mysql-bin.000004",
+    "offset": 85193,
+    "size": 47,
+    "sha256": "42ec4e5a878f0bb03e7b8074ce15ca1416380b395248406de8361b5c53cb15c5"
+  },
+  {
+    "type": "HEARTBEAT_EVENT",
+    "file": "replication-wire",
+    "offset": null,
+    "size": 39,
+    "sha256": "07eaac167f0a321c0c4d590d0d3f798930855a99f9825c91daa7d95acc8f8f06"
+  }
+]

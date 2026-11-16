@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import time
 from urllib.error import HTTPError, URLError
@@ -98,11 +99,17 @@ def command(args, env):
                                    text=True, encoding="utf-8").strip()
 
 
-def run(task_root, spike):
+def run(task_root, spike, cargo_test=""):
     task = Path(task_root).resolve()
     if not task.as_posix().lower().startswith("j:/gigglesdb-work/"):
         raise ValueError("task root must stay under J:/gigglesdb-work")
     task.mkdir(parents=True, exist_ok=True)
+    if cargo_test:
+        required = ("CARGO_TARGET_DIR", "RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE",
+                    "CARGO_INCREMENTAL", "CARGO_BUILD_JOBS", "TEMP", "TMP")
+        missing = [key for key in required if not os.environ.get(key)]
+        if missing:
+            raise ValueError("cargo-test requires caller build environment: " + ", ".join(missing))
     if shutil.disk_usage(task).free < 2 * 1024**3:
         raise RuntimeError("at least 2 GiB free disk required before pulling the emulator")
     run_id = "s1-" + uuid.uuid4().hex[:12]
@@ -116,6 +123,14 @@ def run(task_root, spike):
         env.setdefault(key, image)
     compose = ["docker", "compose", "-f", str(HARNESS / "compose.yaml"),
                "-p", "skedaddle-" + run_id, "--profile", "spanner-emulator"]
+    # This opt-in applies only to the repository reader test lane. Preserve the
+    # normal emulator service and all of its labels, limits and loopback ports.
+    if cargo_test and os.environ.get("SKEDADDLE_SPANNER_SHORT_PARTITIONS") == "1":
+        override = task / "short-partitions.json"
+        override.write_text(json.dumps({"services": {"spanner-emulator": {"command": [
+            "./gateway_main", "--hostname", "0.0.0.0",
+            "--override_change_stream_partition_token_alive_seconds=1"]}}}), encoding="utf-8")
+        compose[4:4] = ["-f", str(override)]
     try:
         command(compose + ["config", "--format", "json"], env)
         subprocess.run(compose + ["up", "-d", "spanner-emulator"], env=env,
@@ -136,19 +151,35 @@ def run(task_root, spike):
                     raise TimeoutError("Spanner emulator did not become ready")
                 time.sleep(0.25)
         config = {"endpoint": endpoint, "grpc_endpoint": port(9010), "run_id": run_id,
+                  "project": PROJECT, "instance": INSTANCE, "stream": "changes",
                   "databases": setup(endpoint)}
         config_path = task / "spanner-config.json"
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         print("SPANNER_CONFIG=" + str(config_path), flush=True)
-        if spike:
+        if spike or cargo_test:
             env["SPANNER_EMULATOR_HOST"] = config["grpc_endpoint"]
             env["S1_CONFIG"] = str(config_path)
             env["S1_OUTPUT"] = str(task / "spike-results.json")
             # Windows' system bash.exe may be a WSL launcher without a distro.
             bash = shutil.which("bash", path=str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin")) or "bash"
-            subprocess.run([bash, "J:/gigglesdb-work/r2/buildslot2.sh", "cargo", "run",
-                            "--locked", "--manifest-path", str(Path(spike).resolve())],
-                           env=env, stderr=subprocess.STDOUT, check=True)
+            if cargo_test:
+                env["SKEDADDLE_SPANNER_CONFIG"] = str(config_path)
+                # Match the caller's stable lane; never run concurrent cargo there.
+                lock = Path("J:/gigglesdb-work/lead-a/build.lock")
+                with lock.open("x", encoding="utf-8") as owner:
+                    owner.write(str(os.getpid()))
+                    owner.flush()
+                    try:
+                        subprocess.run([bash, "J:/gigglesdb-work/r2/buildslot2.sh", "cargo", "test",
+                                        *shlex.split(cargo_test)], cwd=HARNESS.parent,
+                                       env=env, stderr=subprocess.STDOUT, check=True)
+                    finally:
+                        owner.close()
+                        lock.unlink()
+            else:
+                subprocess.run([bash, "J:/gigglesdb-work/r2/buildslot2.sh", "cargo", "run",
+                                "--locked", "--manifest-path", str(Path(spike).resolve())],
+                               env=env, stderr=subprocess.STDOUT, check=True)
     finally:
         logs = subprocess.run(compose + ["logs", "--no-color", "spanner-emulator"], env=env,
                               text=True, encoding="utf-8", capture_output=True)
@@ -163,11 +194,14 @@ def main():
     runner = sub.add_parser("run")
     runner.add_argument("--task-root", required=True)
     runner.add_argument("--spike", default="")
+    runner.add_argument("--cargo-test", default="")
     provision = sub.add_parser("setup")
     provision.add_argument("--endpoint", required=True)
     args = parser.parse_args()
     if args.action == "run":
-        run(args.task_root, args.spike)
+        if args.spike and args.cargo_test:
+            parser.error("choose --spike or --cargo-test")
+        run(args.task_root, args.spike, args.cargo_test)
     else:
         print(json.dumps(setup(args.endpoint), indent=2))
 

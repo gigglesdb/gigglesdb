@@ -7,8 +7,10 @@ param(
     [ValidateSet('16','17','18')][string]$PgVersion='16',
     # Optional standalone S1 spike; never adds a dependency to skedaddle.
     [string]$SpannerSpike='',
+    [string]$SpannerCargoTest='',
     [ValidateSet('ON','OFF')][string]$MysqlGtid='ON',
-    [string]$MysqlSpike=''
+    [string]$MysqlSpike='',
+    [string]$MysqlCargoTest=''
 )
 $ErrorActionPreference='Stop'
 $resolved=[IO.Path]::GetFullPath($TaskRoot).Replace('\','/')
@@ -22,6 +24,7 @@ $env:TEMP="$resolved/tmp"
 $env:TMP=$env:TEMP
 $env:CARGO_BUILD_JOBS='4'
 $env:SKEDADDLE_TEST_ROOT="$resolved/scratch"
+$spannerCallerCargoHome=$env:CARGO_HOME
 $env:CARGO_HOME="$resolved/cargo-home"
 $env:PYTHONDONTWRITEBYTECODE='1'
 $env:SKEDADDLE_MUTANTS_FILTER=$MutationFilter
@@ -29,9 +32,11 @@ $env:SKEDADDLE_MUTATION_SUITE=$MutationSuite
 $env:SKEDADDLE_PG_VERSION=$PgVersion
 New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
 if ($Phase -eq 'spanner-emulator') {
+    # Repository tests reuse the caller's Cargo cache rather than an empty cache.
+    if ($SpannerCargoTest) { $env:CARGO_HOME=$spannerCallerCargoHome }
     $spannerResult=1
     try {
-        & python -I -X "pycache_prefix=$resolved/pycache" (Join-Path $PSScriptRoot 'spanner-setup.py') run --task-root $resolved "--spike=$SpannerSpike"
+        & python -I -X "pycache_prefix=$resolved/pycache" (Join-Path $PSScriptRoot 'spanner-setup.py') run --task-root $resolved "--spike=$SpannerSpike" "--cargo-test=$SpannerCargoTest"
         $spannerResult=$LASTEXITCODE
     }
     finally {
@@ -46,14 +51,14 @@ if ($Phase -eq 'spanner-emulator') {
 }
 # GD-0064 M1: a separate runner keeps the PostgreSQL matrix untouched.
 if ($Phase -in @('mysql80','mysql84')) {
-    $env:CARGO_TARGET_DIR='J:/gigglesdb-work/conn-target-m1'
+    if ($MysqlCargoTest) { $env:CARGO_HOME=$spannerCallerCargoHome }
     $mysqlResult=1
     $savedErrorPreference=$ErrorActionPreference
     try {
         # Windows PowerShell treats redirected native stderr as an error record.
         # Preserve the process exit code and always reach teardown verification.
         $ErrorActionPreference='Continue'
-        & python -I -X "pycache_prefix=$resolved/pycache" (Join-Path $PSScriptRoot 'mysql-run.py') $Phase $resolved $MysqlGtid $MysqlSpike
+        & python -I -X "pycache_prefix=$resolved/pycache" (Join-Path $PSScriptRoot 'mysql-run.py') $Phase $resolved $MysqlGtid "--spike=$MysqlSpike" "--cargo-test=$MysqlCargoTest"
         $mysqlResult=$LASTEXITCODE
     } finally {
         & (Join-Path $PSScriptRoot 'cleanup.ps1') -Check -TaskRoot $resolved

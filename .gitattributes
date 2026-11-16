@@ -1,1 +1,3 @@
 crates/giggles-core/tests/fixtures/r1_legacy/*.redb binary
+crates/skedaddle/tests/fixtures/mysql/**/*.bin binary
+crates/skedaddle/tests/fixtures/mysql/**/*.binlog binary
