@@ -9,7 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const JOURNAL_FORMAT_VERSION: u16 = 2;
+pub const JOURNAL_FORMAT_VERSION: u16 = 3;
 
 fn validate_version(format: &'static str, found: Option<u16>) -> Result<()> {
     if found != Some(JOURNAL_FORMAT_VERSION) {
@@ -1184,6 +1184,27 @@ mod tests {
     fn checkpoint_requires_a_committed_nonzero_sequence() {
         let cp = Checkpoint::new(&Materialized::default(), None).unwrap();
         assert!(matches!(cp.validate(), Err(Error::RecoveryRequired(_))));
+    }
+    #[test]
+    fn generation_two_is_rejected_before_decoding() {
+        for (format, error) in [
+            (
+                "journal-entry",
+                decode::<Entry>(br#"{"version":2}"#).unwrap_err(),
+            ),
+            (
+                "journal-checkpoint",
+                decode::<Checkpoint>(br#"{"version":2}"#).unwrap_err(),
+            ),
+            (
+                "journal-checkpoint-head",
+                decode::<CheckpointHead>(br#"{"version":2}"#).unwrap_err(),
+            ),
+        ] {
+            assert!(
+                matches!(error, Error::UnsupportedFormatVersion { format: found_format, found: Some(2), expected: 3 } if found_format == format)
+            );
+        }
     }
     #[test]
     fn sequence_filename_contract() {

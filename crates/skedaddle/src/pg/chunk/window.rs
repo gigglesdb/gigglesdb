@@ -1,7 +1,7 @@
 use super::{ChunkError, ChunkId, ChunkRange, Key, MESSAGE_PREFIX, Result, TableKey, key_bytes};
 use crate::{
     buffer::format::SegmentRecord,
-    event::{AssembledTxn, Event, EventKind, Position, Row, SourceIdentity, TxnId},
+    event::{AssembledTxn, Event, EventKind, Position, PositionOrder, Row, SourceIdentity, TxnId},
     mapping::Value,
     pg::pgoutput::Message,
 };
@@ -130,29 +130,59 @@ pub fn unfinished_chunks(
     Ok(unfinished)
 }
 
+/// Canonical row-key seam. Implementations validate and return the key columns
+/// plus their collision-free identity; the kernel never orders source values.
+pub trait KeyIdentity: Send {
+    fn key(&self, row: &Row) -> Result<(Vec<u8>, Row)>;
+}
+impl KeyIdentity for TableKey {
+    fn key(&self, row: &Row) -> Result<(Vec<u8>, Row)> {
+        let bytes = key_bytes(&row_key(self, row)?)?;
+        let key = self
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), row[&c.name].clone()))
+            .collect();
+        Ok((bytes, key))
+    }
+}
+
 // Avoid ordering PG values: rows were already selected by PostgreSQL's range
 // predicate. Removing all touched identities among these rows is exactly the
 // intersection with [lo,hi), including key changes into/out of the range.
 pub struct Window {
-    table: TableKey,
+    table: String,
+    identity: Box<dyn KeyIdentity>,
     chunk: ChunkRange,
     attempt: u64,
     rows: Vec<(Vec<u8>, Row)>,
     keys: BTreeSet<Vec<u8>>,
     touched: BTreeSet<Vec<u8>>,
-    low: Option<u64>,
-    high: Option<u64>,
+    low: Option<Position>,
+    high: Option<Position>,
     failed: bool,
 }
 impl Window {
     pub fn new(table: TableKey, chunk: ChunkRange, rows: Vec<Row>, attempt: u64) -> Result<Self> {
         table.read_query(&chunk)?;
+        Self::with_keys(table.table.clone(), Box::new(table), chunk, rows, attempt)
+    }
+    pub fn with_keys(
+        table: String,
+        identity: Box<dyn KeyIdentity>,
+        chunk: ChunkRange,
+        rows: Vec<Row>,
+        attempt: u64,
+    ) -> Result<Self> {
+        chunk.id.validate()?;
+        if table != chunk.id.table {
+            return Err(ChunkError::Invalid("chunk table identity"));
+        }
         let mut unique = BTreeSet::new();
         let rows = rows
             .into_iter()
             .map(|row| {
-                let key = row_key(&table, &row)?;
-                let bytes = key_bytes(&key)?;
+                let (bytes, _) = identity.key(&row)?;
                 if !unique.insert(bytes.clone()) {
                     return Err(ChunkError::Invalid("duplicate snapshot key"));
                 }
@@ -161,6 +191,7 @@ impl Window {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             table,
+            identity,
             chunk,
             attempt,
             rows,
@@ -172,40 +203,75 @@ impl Window {
         })
     }
 
-    /// Feed committed stream markers in order. Markers for other chunks are
-    /// validated and ignored, allowing concurrent chunk readers in one stream.
-    /// commit_lsn is the COMMIT boundary of the transaction containing the
-    /// marker, matching assembled-event positions. Using the earlier logical
-    /// message LSN could place a chunk before an in-window concurrent commit.
-    pub fn watermark(&mut self, message: &Message<'_>, commit_lsn: u64) -> Result<()> {
-        let result = self.watermark_inner(message, commit_lsn);
+    /// PG wrapper: parsing and logical-message versus COMMIT checks stay here.
+    pub fn watermark(
+        &mut self,
+        message: &Message<'_>,
+        commit_lsn: u64,
+        order: &dyn PositionOrder,
+    ) -> Result<()> {
+        let result = (|| {
+            let wm = Watermark::parse(message)?;
+            if wm.chunk != self.chunk.id || wm.attempt != self.attempt {
+                return Ok(());
+            }
+            let Message::LogicalMessage { lsn, .. } = message else {
+                unreachable!()
+            };
+            if *lsn == 0 || commit_lsn < *lsn {
+                return Err(ChunkError::Invalid("watermark commit boundary"));
+            }
+            self.marker(
+                &wm,
+                Position::new(order.domain(), commit_lsn.to_be_bytes()),
+                order,
+            )
+        })();
         if result.is_err() {
             self.failed = true;
         }
         result
     }
-    fn watermark_inner(&mut self, message: &Message<'_>, commit_lsn: u64) -> Result<()> {
+    /// Exact native COMMIT boundary, delivered after its transaction's events.
+    pub fn marker(
+        &mut self,
+        wm: &Watermark,
+        commit: Position,
+        order: &dyn PositionOrder,
+    ) -> Result<()> {
+        let result = self.marker_inner(wm, commit, order);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn marker_inner(
+        &mut self,
+        wm: &Watermark,
+        commit: Position,
+        order: &dyn PositionOrder,
+    ) -> Result<()> {
         if self.failed {
             return Err(ChunkError::Invalid("window poisoned; replay required"));
         }
-        let wm = Watermark::parse(message)?;
+        wm.chunk.validate()?;
+        commit.compare(&commit, order)?;
         if wm.chunk != self.chunk.id || wm.attempt != self.attempt {
             return Ok(());
         }
-        let Message::LogicalMessage { lsn, .. } = message else {
-            unreachable!()
-        };
-        if *lsn == 0 || commit_lsn < *lsn {
-            return Err(ChunkError::Invalid("watermark commit boundary"));
-        }
         match wm.wm {
             WatermarkKind::Low if self.low.is_none() && self.high.is_none() => {
-                self.low = Some(commit_lsn)
+                self.low = Some(commit)
             }
-            WatermarkKind::High
-                if self.high.is_none() && self.low.is_some_and(|low| commit_lsn > low) =>
-            {
-                self.high = Some(commit_lsn)
+            WatermarkKind::High if self.high.is_none() => {
+                let low = self
+                    .low
+                    .as_ref()
+                    .ok_or(ChunkError::Invalid("watermark order/replay mismatch"))?;
+                if commit.compare(low, order)? != std::cmp::Ordering::Greater {
+                    return Err(ChunkError::Invalid("watermark order/replay mismatch"));
+                }
+                self.high = Some(commit);
             }
             _ => return Err(ChunkError::Invalid("watermark order/replay mismatch")),
         }
@@ -230,12 +296,12 @@ impl Window {
             return Ok(());
         }
         if let EventKind::Truncate { relations, .. } = &event.kind {
-            if relations.contains(&self.table.table) {
+            if relations.contains(&self.table) {
                 self.rows.clear();
             }
             return Ok(());
         }
-        if event.table.as_deref() != Some(&self.table.table) {
+        if event.table.as_deref() != Some(&self.table) {
             return Ok(());
         }
         if !matches!(
@@ -262,7 +328,7 @@ impl Window {
         Ok(())
     }
     fn touch(&mut self, row: &Row) -> Result<()> {
-        let bytes = key_bytes(&row_key(&self.table, row)?)?;
+        let (bytes, _) = self.identity.key(row)?;
         // Bound memory by the chunk, regardless of stream-window activity.
         if self.keys.contains(&bytes) {
             self.touched.insert(bytes);
@@ -285,27 +351,22 @@ impl Window {
         let high = self
             .high
             .ok_or(ChunkError::Invalid("high watermark not observed"))?;
-        if order_domain.is_empty() {
+        if order_domain.is_empty() || high.order_domain() != order_domain {
             return Err(ChunkError::Invalid("position domain"));
         }
-        let position = Position::new(order_domain, high.to_be_bytes());
+        let position = high;
         let mut identity = Sha256::new();
         identity.update(b"skedaddle-chunk-record-v1\0");
         identity.update(serde_json::to_vec(&self.chunk.id)?);
         identity.update(self.attempt.to_be_bytes());
-        identity.update(high.to_be_bytes());
+        identity.update(position.bytes());
         let txn = TxnId(identity.finalize().to_vec());
         let mut events = Vec::new();
         for (bytes, row) in self.rows {
             if self.touched.contains(&bytes) {
                 continue;
             }
-            let key = self
-                .table
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), row[&c.name].clone()))
-                .collect();
+            let (_, key) = self.identity.key(&row)?;
             events.push(Event {
                 source: source.clone(),
                 txn: txn.clone(),
@@ -313,7 +374,7 @@ impl Window {
                 position: position.clone(),
                 schema_version,
                 kind: EventKind::ChunkRows,
-                table: Some(self.table.table.clone()),
+                table: Some(self.table.clone()),
                 key,
                 before: None,
                 after: Some(row),

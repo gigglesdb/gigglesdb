@@ -461,6 +461,7 @@ mod opaque_capture {
     struct FrontierCapture {
         writer: BufferWriter,
         steps: VecDeque<Captured>,
+        incoming: Option<mpsc::Receiver<Captured>>,
         drained: Option<oneshot::Sender<()>>,
         buffered_markers: AtomicU64,
         // Inject shutdown precisely after admission, before durable publication.
@@ -480,7 +481,14 @@ mod opaque_capture {
             Ok(format!("manifest-durable:{}", checkpoint.next_mseq))
         }
         async fn step(&mut self) -> Result<Captured> {
-            let Some(batch) = self.steps.pop_front() else {
+            let next = match self.steps.pop_front() {
+                Some(batch) => Some(batch),
+                None => match self.incoming.as_mut() {
+                    Some(incoming) => incoming.recv().await,
+                    None => None,
+                },
+            };
+            let Some(batch) = next else {
                 if let Some(drained) = self.drained.take() {
                     let _ = drained.send(());
                 }
@@ -500,6 +508,18 @@ mod opaque_capture {
             high.compare(&rows.commit_position, self.position_order().as_ref())
                 .map_err(recovery)?;
             assert_eq!(high, rows.commit_position);
+            if rows
+                .events
+                .iter()
+                .any(|e| matches!(e.kind, crate::event::EventKind::ChunkRows))
+            {
+                return self
+                    .writer
+                    .append_chunk_rows(rows, Instant::now())
+                    .await
+                    .map(|(_, reference)| reference)
+                    .map_err(recovery);
+            }
             self.writer
                 .append(rows, Instant::now())
                 .await
@@ -542,7 +562,18 @@ mod opaque_capture {
                 "test",
                 Duration::from_secs(3),
             )
-            .unwrap();
+            .unwrap()
+            .with_chunk_buffer(
+                store.clone(),
+                ReaderConfig {
+                    prefix: "seam".into(),
+                    migration_id: "test".into(),
+                    stream: "frontier".into(),
+                    limits: format::Limits::default(),
+                    required_next_mseq: 0,
+                },
+                Arc::new(FrontierOrder),
+            );
             let mut coordinator = Coordinator::observer(
                 journal.clone(),
                 Local::create(root.join("local")).unwrap(),
@@ -588,6 +619,7 @@ mod opaque_capture {
                         ..Captured::default()
                     })
                     .collect(),
+                incoming: None,
                 drained: None,
                 buffered_markers: AtomicU64::new(0),
                 interrupt: None,
@@ -652,6 +684,348 @@ mod opaque_capture {
             )
             .await
             .unwrap();
+    }
+
+    struct FrontierDatabase {
+        tx: mpsc::Sender<Captured>,
+        boundary: u8,
+        stall: bool,
+        reads: Arc<AtomicU64>,
+    }
+    impl ChunkDatabase for FrontierDatabase {
+        async fn emit(&mut self, marker: Watermark) -> Result<()> {
+            self.boundary += 1;
+            let bytes = vec![1; self.boundary as usize];
+            let txn = transaction(&bytes);
+            self.tx
+                .send(Captured {
+                    watermarks: vec![CapturedMarker::Chunk {
+                        marker,
+                        commit: txn.commit_position.clone(),
+                        committed_events: txn.events.clone(),
+                    }],
+                    durable_position: Some(txn.commit_position.clone()),
+                    transaction: Some(txn),
+                    stop: false,
+                })
+                .await
+                .map_err(recovery)
+        }
+        async fn read(&mut self, _: &ChunkPlan, _: &ChunkRange) -> Result<Vec<Row>> {
+            self.reads.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.stall {
+                return std::future::pending().await;
+            }
+            Ok(vec![
+                ([(
+                    "id".into(),
+                    OpaqueValue {
+                        type_id: "int4".into(),
+                        bytes: Some(Value::Int4(7).canonical_bytes().unwrap()),
+                    },
+                )])
+                .into(),
+            ])
+        }
+    }
+    async fn setup_copy(seam: &Seam) {
+        seam.engine
+            .runtime
+            .lifecycle(Event::Advance {
+                to: State::Assessed,
+            })
+            .await
+            .unwrap();
+        seam.engine
+            .start(&mut Setup(Arc::new(AtomicU64::new(0))))
+            .await
+            .unwrap();
+        seam.engine.plan(&plan()).await.unwrap();
+    }
+    async fn native_copy(
+        seam: &Seam,
+        capture: &mut FrontierCapture,
+        database: &mut FrontierDatabase,
+    ) {
+        let runtime = seam.engine.runtime();
+        let config = CopyConfig {
+            source: identity(),
+            order_domain: FrontierOrder.domain().into(),
+            ..super::config()
+        };
+        let (commands, receive) = mpsc::channel(1);
+        let (stop, stopped) = watch::channel(false);
+        let mut budget = budget();
+        let (captured, copied, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                capture_loop(capture, receive, stopped.clone(), &runtime, &config),
+                copy_loop(
+                    database,
+                    commands,
+                    stopped,
+                    &runtime,
+                    &seam.journal,
+                    &config,
+                    &mut budget
+                ),
+                async {
+                    while runtime.snapshot().lifecycle.state != State::CatchingUp {
+                        tokio::task::yield_now().await;
+                    }
+                    stop.send_replace(true);
+                }
+            )
+        })
+        .await
+        .unwrap();
+        captured.unwrap();
+        copied.unwrap();
+    }
+    #[tokio::test]
+    async fn native_chunk_completes_and_authenticates_done_after_restart() {
+        let seam = Seam::new().await;
+        setup_copy(&seam).await;
+        let (tx, rx) = mpsc::channel(8);
+        let mut capture = seam.capture(VecDeque::new()).await;
+        capture.incoming = Some(rx);
+        let mut db = FrontierDatabase {
+            tx,
+            boundary: 0,
+            stall: false,
+            reads: Arc::new(AtomicU64::new(0)),
+        };
+        native_copy(&seam, &mut capture, &mut db).await;
+        let state = seam.journal.load(false).await.unwrap();
+        let done = state
+            .chunk_attempts
+            .values()
+            .next()
+            .unwrap()
+            .done
+            .as_ref()
+            .unwrap();
+        assert_eq!(done.high, Position::new(FrontierOrder.domain(), [1, 1]));
+        assert!(state.unfinished_chunks(&plan()).unwrap().is_empty());
+        seam.journal.checkpoint(&state).await.unwrap();
+        assert_eq!(
+            seam.journal.load(true).await.unwrap().chunk_attempts,
+            state.chunk_attempts
+        );
+        let mut restarted = Coordinator::observer(
+            seam.journal.clone(),
+            Local::create(seam.root.join("restart")).unwrap(),
+            "restart",
+        )
+        .unwrap();
+        restarted.acquire().await.unwrap();
+        assert_eq!(restarted.state().chunk_attempts, state.chunk_attempts);
+        // A changed native H cannot borrow the original manifest's identity.
+        let attempt = state.chunk_attempts.values().next().unwrap();
+        let altered = Transition::ChunkDone {
+            chunk: attempt.chunk.clone(),
+            attempt: attempt.attempt,
+            high: Position::new(FrontierOrder.domain(), [1, 1, 1]),
+            chunk_rows: done.chunk_rows.clone(),
+        };
+        assert!(
+            seam.journal
+                .validate_chunk_objects(&state, &altered)
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .progress
+                .keys()
+                .all(|key| !key.starts_with("engine-final-marker"))
+        );
+        let root = seam.root.clone();
+        drop(restarted);
+        drop(capture);
+        drop(seam);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn native_unfinished_copy_restarts_with_new_attempt() {
+        let mut seam = Seam::new().await;
+        setup_copy(&seam).await;
+        let (tx, rx) = mpsc::channel(8);
+        let mut capture = seam.capture(VecDeque::new()).await;
+        capture.incoming = Some(rx);
+        let reads = Arc::new(AtomicU64::new(0));
+        let mut db = FrontierDatabase {
+            tx,
+            boundary: 0,
+            stall: true,
+            reads: reads.clone(),
+        };
+        {
+            let run = native_copy(&seam, &mut capture, &mut db);
+            tokio::pin!(run);
+            tokio::select! { _ = &mut run => panic!("unfinished read returned"), _ = async { while reads.load(AtomicOrdering::SeqCst) == 0 { tokio::task::yield_now().await; } } => {} }
+        }
+        drop(capture);
+        let old = seam.journal.load(false).await.unwrap();
+        assert_eq!(old.chunk_attempts.values().next().unwrap().attempt, 1);
+        assert!(old.chunk_attempts.values().all(|a| a.done.is_none()));
+        let mut restarted = Coordinator::observer(
+            seam.journal.clone(),
+            Local::create(seam.root.join("retry")).unwrap(),
+            "retry",
+        )
+        .unwrap();
+        restarted.acquire().await.unwrap();
+        seam.engine = Engine::new(restarted, seam.journal.clone());
+        let (tx, rx) = mpsc::channel(8);
+        db.tx = tx;
+        db.stall = false;
+        let mut capture = seam.capture(VecDeque::new()).await;
+        capture.incoming = Some(rx);
+        native_copy(&seam, &mut capture, &mut db).await;
+        let state = seam.journal.load(false).await.unwrap();
+        let attempt = state.chunk_attempts.values().next().unwrap();
+        assert_eq!(attempt.attempt, 2);
+        assert_eq!(
+            attempt.done.as_ref().unwrap().high,
+            Position::new(FrontierOrder.domain(), [1, 1, 1])
+        );
+        let root = seam.root.clone();
+        drop(capture);
+        drop(seam);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn neutral_chunk_marker_never_creates_pg_final_marker_evidence() {
+        let seam = Seam::new().await;
+        let batch = Captured {
+            watermarks: vec![CapturedMarker::Chunk {
+                marker: Watermark {
+                    wm: WatermarkKind::High,
+                    chunk: plan().ranges[0].id.clone(),
+                    attempt: 1,
+                },
+                commit: Position::new(FrontierOrder.domain(), [1, 2, 3]),
+                committed_events: vec![],
+            }],
+            ..Captured::default()
+        };
+        seam.engine
+            .runtime
+            .capture_final_marker(&batch, None)
+            .await
+            .unwrap();
+        assert!(seam.journal.load(false).await.unwrap().progress.is_empty());
+        let root = seam.root.clone();
+        drop(seam);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn neutral_key_identity_handles_non_pg_values_and_empty_result() {
+        struct RawKey;
+        impl crate::pg::chunk::KeyIdentity for RawKey {
+            fn key(&self, row: &Row) -> crate::pg::chunk::Result<(Vec<u8>, Row)> {
+                Ok((row["native"].bytes.clone().unwrap(), row.clone()))
+            }
+        }
+        let p = plan();
+        let row: Row = [(
+            "native".into(),
+            OpaqueValue {
+                type_id: "native-key".into(),
+                bytes: Some(vec![9, 8, 7]),
+            },
+        )]
+        .into();
+        let mut w = Window::with_keys(
+            "rows".into(),
+            Box::new(RawKey),
+            p.ranges[0].clone(),
+            vec![row.clone()],
+            1,
+        )
+        .unwrap();
+        let wm = |wm| Watermark {
+            wm,
+            chunk: p.ranges[0].id.clone(),
+            attempt: 1,
+        };
+        w.marker(
+            &wm(WatermarkKind::Low),
+            Position::new(FrontierOrder.domain(), [1]),
+            &FrontierOrder,
+        )
+        .unwrap();
+        let event = crate::event::Event {
+            source: identity(),
+            txn: crate::event::TxnId(vec![1]),
+            ordinal_in_txn: 0,
+            position: Position::new(FrontierOrder.domain(), [1, 0]),
+            schema_version: 1,
+            kind: crate::event::EventKind::Delete,
+            table: Some("rows".into()),
+            key: row,
+            before: None,
+            after: None,
+            unchanged_cols: Default::default(),
+        };
+        w.event(&event).unwrap();
+        let high = Position::new(FrontierOrder.domain(), [1, 1]);
+        w.marker(&wm(WatermarkKind::High), high.clone(), &FrontierOrder)
+            .unwrap();
+        let SegmentRecord::ChunkRows(txn) =
+            w.finish(identity(), FrontierOrder.domain(), 1).unwrap()
+        else {
+            panic!()
+        };
+        assert!(txn.events.is_empty());
+        assert_eq!(txn.commit_position, high);
+    }
+    #[test]
+    fn native_window_rejects_nonincreasing_wrong_domain_and_incomparable_boundaries() {
+        use crate::pg::chunk::ChunkError;
+        let p = plan();
+        for high in [vec![1], vec![], vec![0]] {
+            let mut window = Window::new(p.table.clone(), p.ranges[0].clone(), vec![], 1).unwrap();
+            let marker = |wm| Watermark {
+                wm,
+                chunk: p.ranges[0].id.clone(),
+                attempt: 1,
+            };
+            window
+                .marker(
+                    &marker(WatermarkKind::Low),
+                    Position::new(FrontierOrder.domain(), [1]),
+                    &FrontierOrder,
+                )
+                .unwrap();
+            let error = window
+                .marker(
+                    &marker(WatermarkKind::High),
+                    Position::new(FrontierOrder.domain(), high),
+                    &FrontierOrder,
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ChunkError::Invalid("watermark order/replay mismatch")
+                    | ChunkError::Event(EventError::InvalidEncoding("incomparable test frontiers"))
+            ));
+            assert!(
+                window
+                    .finish(identity(), FrontierOrder.domain(), 1)
+                    .is_err()
+            );
+        }
+        let mut window = Window::new(p.table.clone(), p.ranges[0].clone(), vec![], 1).unwrap();
+        let marker = Watermark {
+            wm: WatermarkKind::Low,
+            chunk: p.ranges[0].id.clone(),
+            attempt: 1,
+        };
+        assert!(matches!(
+            window.marker(&marker, Position::new("foreign", [1]), &FrontierOrder),
+            Err(ChunkError::Event(EventError::PositionDomainMismatch))
+        ));
     }
 
     #[tokio::test]
@@ -1233,7 +1607,7 @@ async fn chunk_done_follows_durable_rows_and_slot_precedes_first_chunk() {
         txns.push(txn);
     }
     assert_eq!(txns.len(), 3);
-    assert_eq!(done.high_lsn.to_be_bytes(), txns[2].commit_position.bytes());
+    assert_eq!(done.high.bytes(), txns[2].commit_position.bytes());
     assert!(matches!(
         txns[2].events[0].kind,
         crate::event::EventKind::ChunkRows
@@ -1323,7 +1697,7 @@ async fn chunk_done_without_durable_rows_is_rejected() {
             .commit(Transition::ChunkDone {
                 chunk,
                 attempt: 1,
-                high_lsn: 20,
+                high: Position::new("engine-test", 20u64.to_be_bytes()),
                 chunk_rows: ChunkRowsRef {
                     mseq: 0,
                     manifest_digest: [0; 32]

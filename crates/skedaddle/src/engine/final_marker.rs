@@ -612,6 +612,9 @@ impl Runtime {
         checkpoint: Option<&WriterCheckpoint>,
     ) -> super::Result<()> {
         for watermark in &batch.watermarks {
+            let super::CapturedMarker::Pg(watermark) = watermark else {
+                continue;
+            };
             decode_marker_payload(&watermark.content, watermark.message_lsn).map_err(recovery)?;
         }
         let Some(txn) = &batch.transaction else {

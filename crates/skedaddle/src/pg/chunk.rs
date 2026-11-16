@@ -8,7 +8,9 @@
 mod sql;
 mod window;
 pub use sql::{ChunkQuery, Direction, KeyColumn, QualifiedName, TableKey};
-pub use window::{ChunkTransition, Watermark, WatermarkKind, Window, unfinished_chunks};
+pub use window::{
+    ChunkTransition, KeyIdentity, Watermark, WatermarkKind, Window, unfinished_chunks,
+};
 
 /// Exact logical-message route, distinct from the DDL route.
 pub const MESSAGE_PREFIX: &str = "skedaddle.wm";

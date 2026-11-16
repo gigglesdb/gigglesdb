@@ -58,7 +58,7 @@ async fn typed_done_without_publication_is_rejected_during_journal_recovery() {
         Transition::ChunkDone {
             chunk: plan.ranges[0].clone(),
             attempt: 1,
-            high_lsn: 100,
+            high: skedaddle::event::Position::new("pg-chunk-test", 100u64.to_be_bytes()),
             chunk_rows: chunk::ChunkRowsRef {
                 mseq: 0,
                 manifest_digest: [0; 32],
@@ -238,7 +238,7 @@ async fn typed_chunk_codec_and_durable_done_roundtrip() {
         Transition::ChunkDone {
             chunk: plan.ranges[1].clone(),
             attempt: 1,
-            high_lsn: 100,
+            high: skedaddle::event::Position::new("pg-chunk-test", 100u64.to_be_bytes()),
             chunk_rows,
         },
     ] {
@@ -302,7 +302,7 @@ async fn typed_chunk_stale_attempt_and_foreign_bounds_fail_closed() {
         c.commit(Transition::ChunkDone {
             chunk: plan.ranges[0].clone(),
             attempt: 1,
-            high_lsn: 100,
+            high: skedaddle::event::Position::new("pg-chunk-test", 100u64.to_be_bytes()),
             chunk_rows: chunk::ChunkRowsRef {
                 mseq: 1,
                 manifest_digest: [0; 32]
@@ -387,7 +387,7 @@ async fn typed_chunk_done_requires_durable_matching_chunk_rows() {
         c.commit(Transition::ChunkDone {
             chunk: chunk.clone(),
             attempt: 1,
-            high_lsn: 100,
+            high: skedaddle::event::Position::new("pg-chunk-test", 100u64.to_be_bytes()),
             chunk_rows: missing.clone()
         })
         .await
@@ -400,7 +400,7 @@ async fn typed_chunk_done_requires_durable_matching_chunk_rows() {
         c.commit(Transition::ChunkDone {
             chunk: chunk.clone(),
             attempt: 1,
-            high_lsn: 100,
+            high: skedaddle::event::Position::new("pg-chunk-test", 100u64.to_be_bytes()),
             chunk_rows: wrong
         })
         .await
@@ -417,7 +417,7 @@ async fn typed_chunk_done_requires_durable_matching_chunk_rows() {
         c.commit(Transition::ChunkDone {
             chunk: chunk.clone(),
             attempt: 2,
-            high_lsn: 201,
+            high: skedaddle::event::Position::new("pg-chunk-test", 201u64.to_be_bytes()),
             chunk_rows: durable.clone()
         })
         .await
@@ -429,7 +429,7 @@ async fn typed_chunk_done_requires_durable_matching_chunk_rows() {
         c.commit(Transition::ChunkDone {
             chunk: chunk.clone(),
             attempt: 2,
-            high_lsn: 200,
+            high: skedaddle::event::Position::new("pg-chunk-test", 200u64.to_be_bytes()),
             chunk_rows: wrong_digest
         })
         .await
@@ -438,7 +438,7 @@ async fn typed_chunk_done_requires_durable_matching_chunk_rows() {
     c.commit(Transition::ChunkDone {
         chunk,
         attempt: 2,
-        high_lsn: 200,
+        high: skedaddle::event::Position::new("pg-chunk-test", 200u64.to_be_bytes()),
         chunk_rows: durable,
     })
     .await
@@ -2943,10 +2943,15 @@ async fn put_json(store: &Arc<dyn ObjectStore>, key: &Path, value: &serde_json::
 }
 
 fn assert_unsupported_version(error: Error, format: &str, found: Option<u16>) {
+    let expected = if format.starts_with("journal-") {
+        JOURNAL_FORMAT_VERSION
+    } else {
+        skedaddle::buffer::format::FORMAT_VERSION
+    };
     assert!(
         matches!(&error, Error::UnsupportedFormatVersion {
-            format: actual, found: actual_found, expected: JOURNAL_FORMAT_VERSION,
-        } if *actual == format && *actual_found == found),
+            format: actual, found: actual_found, expected: actual_expected,
+        } if *actual == format && *actual_found == found && *actual_expected == expected),
         "{error:?}"
     );
 }
@@ -2965,7 +2970,7 @@ async fn journal_versions_are_rejected_before_payload_decode_and_raw_rebuild() {
         "journal-checkpoint",
         "journal-checkpoint-head",
     ] {
-        for found in [None, Some(1), Some(3)] {
+        for found in [None, Some(1), Some(2), Some(4)] {
             for minimal in [false, true] {
                 let store = fs_store(scratch("unsupported-journal-version"));
                 let j = journal(store.clone(), "migration");
@@ -3131,7 +3136,7 @@ async fn buffer_version_error_survives_chunk_publication_and_journal_replay() {
         let done = Transition::ChunkDone {
             chunk,
             attempt: 1,
-            high_lsn: 100,
+            high: skedaddle::event::Position::new("pg-chunk-test", 100u64.to_be_bytes()),
             chunk_rows: rows,
         };
         assert_unsupported_version(c.commit(done.clone()).await.unwrap_err(), format, Some(1));

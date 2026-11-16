@@ -84,6 +84,7 @@ fn marker(window: &mut Window, id: &ChunkId, wm: WatermarkKind, lsn: u64) -> Res
             content: &bytes,
         },
         lsn,
+        &ChunkTestOrder,
     )
 }
 fn finish(window: Window) -> Vec<i32> {
@@ -294,6 +295,7 @@ fn abandoned_attempt_markers_do_not_open_replacement_window() {
                 content: &bytes,
             },
             lsn,
+            &ChunkTestOrder,
         )
         .unwrap();
         if kind == WatermarkKind::Low {
@@ -323,7 +325,8 @@ fn marker_requires_its_transaction_commit_boundary() {
                 prefix: MESSAGE_PREFIX,
                 content: &bytes
             },
-            19
+            19,
+            &ChunkTestOrder,
         )
         .is_err()
     );
@@ -461,4 +464,65 @@ fn invalid_keys_and_identifiers_fail_closed() {
     );
     t.columns[0].name = "\0".into();
     assert!(t.sampling_query(2).is_err());
+}
+
+struct ChunkTestOrder;
+impl crate::event::PositionOrder for ChunkTestOrder {
+    fn domain(&self) -> &str {
+        "pg"
+    }
+    fn compare(
+        &self,
+        a: &[u8],
+        b: &[u8],
+    ) -> std::result::Result<std::cmp::Ordering, crate::event::EventError> {
+        Ok(a.cmp(b))
+    }
+}
+
+#[test]
+fn pg_chunk_rows_identity_matches_original_lsn_recipe() {
+    let t = table(&[Direction::Asc]);
+    let c = ChunkRange {
+        id: ChunkId {
+            table: t.table.clone(),
+            plan: "0".repeat(64),
+            ordinal: 7,
+        },
+        lo: None,
+        hi: None,
+    };
+    let mut w = Window::new(t, c.clone(), vec![row(1)], 3).unwrap();
+    for (wm, commit) in [
+        (WatermarkKind::Low, 1),
+        (WatermarkKind::High, 0x1020304050607080),
+    ] {
+        let marker = Watermark {
+            wm,
+            chunk: c.id.clone(),
+            attempt: 3,
+        };
+        w.watermark(
+            &Message::LogicalMessage {
+                transactional: true,
+                lsn: commit,
+                prefix: MESSAGE_PREFIX,
+                content: &marker.encode().unwrap(),
+            },
+            commit,
+            &ChunkTestOrder,
+        )
+        .unwrap();
+    }
+    let SegmentRecord::ChunkRows(txn) = w.finish(source(), "pg", 1).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        txn.txn
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        "096585fec5270cd4f10ef4b240ed1ca32a7e2b5ae8d08cfc5dac8b4a7149ca9a"
+    );
 }

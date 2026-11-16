@@ -279,6 +279,9 @@ impl Hub {
             }
         }
         for watermark in &batch.watermarks {
+            let super::CapturedMarker::Pg(watermark) = watermark else {
+                continue;
+            };
             for arm in state.arms.values_mut() {
                 if arm.failure.is_some() || arm.through.is_some() {
                     continue;

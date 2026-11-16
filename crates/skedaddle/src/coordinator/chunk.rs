@@ -104,7 +104,8 @@ pub struct ChunkAttempt {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkCompletion {
-    pub high_lsn: u64,
+    #[serde(with = "position_wire")]
+    pub high: Position,
     pub chunk_rows: ChunkRowsRef,
 }
 
@@ -171,11 +172,9 @@ impl Materialized {
                         );
                     }
                     Transition::ChunkDone {
-                        high_lsn,
-                        chunk_rows,
-                        ..
+                        high, chunk_rows, ..
                     } => {
-                        if *high_lsn == 0
+                        if high.order_domain().is_empty()
                             || !old.is_some_and(|old| old.attempt == *attempt && old.done.is_none())
                         {
                             return Err(invalid("Done without matching unfinished Started"));
@@ -184,7 +183,7 @@ impl Materialized {
                             .get_mut(&key)
                             .expect("checked Started")
                             .done = Some(ChunkCompletion {
-                            high_lsn: *high_lsn,
+                            high: high.clone(),
                             chunk_rows: chunk_rows.clone(),
                         });
                     }
@@ -292,12 +291,12 @@ impl Journal {
                 }
                 if let Transition::ChunkDone {
                     attempt,
-                    high_lsn,
+                    high,
                     chunk_rows,
                     ..
                 } = transition
                 {
-                    self.validate_chunk_rows(chunk, *attempt, *high_lsn, chunk_rows)
+                    self.validate_chunk_rows(chunk, *attempt, high, chunk_rows)
                         .await?;
                 }
             }
@@ -309,13 +308,14 @@ impl Journal {
         &self,
         chunk: &ChunkRange,
         attempt: u64,
-        high: u64,
+        high: &Position,
         reference: &ChunkRowsRef,
     ) -> Result<()> {
         let buffer = self
             .chunk_buffer
             .as_ref()
             .ok_or_else(|| invalid("Done requires an authoritative buffer binding"))?;
+        high.compare(high, buffer.order.as_ref()).map_err(invalid)?;
         let bytes = buffer
             .store
             .get(&buffer.config.manifest_key(reference.mseq))
@@ -360,14 +360,14 @@ impl Journal {
         identity.update(b"skedaddle-chunk-record-v1\0");
         identity.update(serde_json::to_vec(&chunk.id)?);
         identity.update(attempt.to_be_bytes());
-        identity.update(high.to_be_bytes());
+        identity.update(high.bytes());
         let expected: Vec<u8> = identity.finalize().to_vec();
-        let position = Position::new(buffer.order.domain(), high.to_be_bytes());
+        let position = high;
         let mut matches = 0;
         while let Some(record) = decoder.next_record().map_err(invalid_format)? {
             if let format::SegmentRecord::ChunkRows(txn) = record
                 && txn.txn.0 == expected
-                && txn.commit_position == position
+                && &txn.commit_position == position
                 && txn
                     .events
                     .iter()
@@ -380,5 +380,18 @@ impl Journal {
             return Err(invalid("manifest has no unique matching ChunkRows at H"));
         }
         Ok(())
+    }
+}
+
+/// Position's JSON wire is versioned by the enclosing journal generation.
+pub(crate) mod position_wire {
+    use crate::event::{Position, PositionWireV1};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(position: &Position, serializer: S) -> Result<S::Ok, S::Error> {
+        PositionWireV1::from(position).serialize(serializer)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Position, D::Error> {
+        Position::try_from(PositionWireV1::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
     }
 }

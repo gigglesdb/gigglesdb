@@ -243,7 +243,7 @@ impl source::WatermarkSink for Sink {
         Ok(())
     }
     fn watermark(&mut self, watermark: source::Watermark) -> source::Result<()> {
-        self.0.watermarks.push(watermark);
+        self.0.watermarks.push(watermark.into());
         Ok(())
     }
 }

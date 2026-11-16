@@ -151,10 +151,25 @@ pub trait Installer {
 #[derive(Default)]
 pub struct Captured {
     pub transaction: Option<AssembledTxn>,
-    pub watermarks: Vec<source::Watermark>,
+    pub watermarks: Vec<CapturedMarker>,
     /// Connector-durable restart/ack boundary, which may follow the commit.
     pub durable_position: Option<Position>,
     pub stop: bool,
+}
+/// PG logical-message evidence stays PG-specific. Chunk-only connectors cannot
+/// manufacture final-marker receipts through the neutral control route.
+pub enum CapturedMarker {
+    Pg(source::Watermark),
+    Chunk {
+        marker: Watermark,
+        commit: Position,
+        committed_events: Vec<crate::event::Event>,
+    },
+}
+impl From<source::Watermark> for CapturedMarker {
+    fn from(marker: source::Watermark) -> Self {
+        Self::Pg(marker)
+    }
 }
 pub trait Capture {
     fn position_order(&self) -> Arc<dyn PositionOrder + Send + Sync>;
@@ -1060,7 +1075,7 @@ async fn cancel_on_exit<F: Future<Output = Result<()>>>(
     result
 }
 
-type Completion = (u64, DurableManifestRef);
+type Completion = (Position, DurableManifestRef);
 enum Command {
     Begin {
         plan: Box<ChunkPlan>,
@@ -1086,7 +1101,7 @@ struct Active {
     journaled: oneshot::Receiver<()>,
 }
 impl Active {
-    fn feed(&mut self, captured: &Captured) -> Result<Option<u64>> {
+    fn feed(&mut self, captured: &Captured, order: &dyn PositionOrder) -> Result<Option<Position>> {
         let window = self.window.as_mut().expect("installed window");
         if let Some(txn) = &captured.transaction {
             for event in &txn.events {
@@ -1095,20 +1110,42 @@ impl Active {
         }
         let mut high = None;
         for watermark in &captured.watermarks {
-            let CapturedControl::Chunk(marker) =
-                decode_marker_payload(&watermark.content, watermark.message_lsn)
-                    .map_err(recovery)?
-            else {
-                continue;
+            let (marker, commit) = match watermark {
+                CapturedMarker::Pg(w) => {
+                    let CapturedControl::Chunk(marker) =
+                        decode_marker_payload(&w.content, w.message_lsn).map_err(recovery)?
+                    else {
+                        continue;
+                    };
+                    window
+                        .watermark(&w.message(), w.commit_lsn, order)
+                        .map_err(recovery)?;
+                    (
+                        marker,
+                        Position::new(order.domain(), w.commit_lsn.to_be_bytes()),
+                    )
+                }
+                CapturedMarker::Chunk {
+                    marker,
+                    commit,
+                    committed_events,
+                } => {
+                    if !captured.transaction.as_ref().is_some_and(|txn| {
+                        txn.commit_position == *commit && txn.events == *committed_events
+                    }) {
+                        return Err(recovery("chunk marker transaction binding"));
+                    }
+                    window
+                        .marker(marker, commit.clone(), order)
+                        .map_err(recovery)?;
+                    (marker.clone(), commit.clone())
+                }
             };
-            window
-                .watermark(&watermark.message(), watermark.commit_lsn)
-                .map_err(recovery)?;
             if marker.chunk == self.chunk.id
                 && marker.attempt == self.attempt
                 && marker.wm == WatermarkKind::High
             {
-                high = Some(watermark.commit_lsn);
+                high = Some(commit);
             }
         }
         Ok(high)
@@ -1128,6 +1165,7 @@ fn capture_loop(
         let _verification = VerificationCaptureGuard(runtime.6.clone());
         let _live = LiveReadinessGuard(runtime.7.clone());
         let mut schema_tick = tokio::time::interval(Duration::from_millis(50));
+        let order = capture.position_order();
         let mut active: Option<Active> = None;
         let mut last_buffered_position = runtime
             .snapshot()
@@ -1162,7 +1200,7 @@ fn capture_loop(
                                 let current = active.as_mut().ok_or_else(|| recovery("rows without Started"))?;
                                 current.window = Some(Window::new(current.plan.table.clone(), current.chunk.clone(),
                                     rows, current.attempt).map_err(recovery)?);
-                                while let Some(batch) = current.backlog.pop_front() { current.feed(&batch)?; }
+                                while let Some(batch) = current.backlog.pop_front() { current.feed(&batch, order.as_ref())?; }
                                 let _ = ready.send(());
                             },
                             None => break None,
@@ -1260,7 +1298,7 @@ fn capture_loop(
                     return Err(recovery("copy window backlog limit"));
                 }
                 current.backlog.push_back(batch);
-            } else if let Some(high) = current.feed(&batch)? {
+            } else if let Some(high) = current.feed(&batch, order.as_ref())? {
                 let current = active.take().expect("active high");
                 let SegmentRecord::ChunkRows(rows) = current
                     .window
@@ -1275,8 +1313,7 @@ fn capture_loop(
                     unreachable!()
                 };
                 // No next capture step can pass H until this durable hook returns.
-                let position = Position::new(capture.position_order().domain(), high.to_be_bytes());
-                let reference = capture.publish(position, rows).await?;
+                let reference = capture.publish(high.clone(), rows).await?;
                 runtime.queue_writer(capture.writer_checkpoint()?).await;
                 let _ = current.complete.send(Ok((high, reference)));
                 // Do not publish post-H WAL until Done is visible to the
@@ -1434,7 +1471,7 @@ fn copy_loop(
                         attempt,
                     })
                     .await?;
-                let (high_lsn, reference) = tokio::select! {
+                let (high, reference) = tokio::select! {
                     biased;
                     _ = cancelled(&mut cancel) => return Ok(()),
                     done = completion => match done {
@@ -1446,7 +1483,7 @@ fn copy_loop(
                     .commit(Transition::ChunkDone {
                         chunk,
                         attempt,
-                        high_lsn,
+                        high,
                         chunk_rows: ChunkRowsRef {
                             mseq: reference.mseq,
                             manifest_digest: reference.manifest_digest,

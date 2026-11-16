@@ -202,6 +202,9 @@ impl Hub {
         if let Some(tip) = state.awaiting.as_ref()
             && position >= tip.lsn
             && batch.watermarks.iter().any(|w| {
+                let super::CapturedMarker::Pg(w) = w else {
+                    return false;
+                };
                 w.transactional
                     && w.commit_lsn == position
                     && Watermark::parse(&w.message()).is_ok_and(|m| m == tip.marker)

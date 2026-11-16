@@ -601,7 +601,7 @@ fn durable_done_does_not_complete_transactions_at_or_before_high() {
         RangeStatus::InWindow
     );
     state.chunk_attempts.get_mut(&id).unwrap().done = Some(ChunkCompletion {
-        high_lsn: 100,
+        high: Position::new("pg:test", 100u64.to_be_bytes()),
         chunk_rows: ChunkRowsRef {
             mseq: 1,
             manifest_digest: Sha256::digest(b"catalog test").into(),
@@ -862,13 +862,13 @@ async fn live_server_planner_range_and_transaction_qualification() -> TestResult
                 let mut partial = planned(plan);
                 partial.chunk_attempts.insert(serde_json::to_string(&range.id)?, ChunkAttempt {
                     chunk: range.clone(), attempt: 1, done: Some(ChunkCompletion {
-                        high_lsn:100, chunk_rows:ChunkRowsRef { mseq:1, manifest_digest:Sha256::digest(b"server membership proof").into() }
+                        high:Position::new("pg:k2b",100u64.to_be_bytes()), chunk_rows:ChunkRowsRef { mseq:1, manifest_digest:Sha256::digest(b"server membership proof").into() }
                     })
                 });
                 let members=c.read_chunk(&mut source,range).await?;
                 let expected=rows.iter().map(|r|if members.contains(r){RangeStatus::Done}else{RangeStatus::NotYet}).collect::<Vec<_>>();
                 assert_eq!(planner.classify_keys(&c.key.table,rows,&pos(101),&partial).await?,expected,"server membership must match this exact chunk predicate");
-                state.chunk_attempts.insert(serde_json::to_string(&range.id)?,ChunkAttempt{chunk:range.clone(),attempt:1,done:Some(ChunkCompletion{high_lsn:100,chunk_rows:ChunkRowsRef{mseq:1,manifest_digest:Sha256::digest(b"server planner").into()}})});
+                state.chunk_attempts.insert(serde_json::to_string(&range.id)?,ChunkAttempt{chunk:range.clone(),attempt:1,done:Some(ChunkCompletion{high:Position::new("pg:k2b",100u64.to_be_bytes()),chunk_rows:ChunkRowsRef{mseq:1,manifest_digest:Sha256::digest(b"server planner").into()}})});
             }
             for lsn in [99,100,101] {
                 assert_eq!(planner.classify_keys(&c.key.table,rows,&pos(lsn),&state).await?,vec![if lsn>100{RangeStatus::Done}else{RangeStatus::InWindow};rows.len()]);

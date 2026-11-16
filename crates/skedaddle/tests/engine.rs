@@ -781,7 +781,7 @@ fn copy_table(
             let completed = state
                 .chunk_attempts
                 .values()
-                .any(|a| a.done.as_ref().is_some_and(|d| lsn > d.high_lsn));
+                .any(|a| a.done.as_ref().is_some_and(|d| lsn > u64::from_be_bytes(d.high.bytes().try_into().unwrap())));
             let plan = apply::plan_transaction_with_ddl(
                 txn,
                 &tables,

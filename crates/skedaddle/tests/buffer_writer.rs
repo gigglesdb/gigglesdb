@@ -2149,7 +2149,7 @@ async fn chunk_rows_manifest_authentication(tampered_key: bool) {
         reference.manifest_digest = entry.digest().unwrap();
     }
     for (index, attempt, high, bad_digest, succeeds) in [
-        (0, 1, 100, false, true),
+        (0, 1, 100u64, false, true),
         (1, 1, 100, false, false),
         (0, 2, 100, false, false),
         (0, 1, 101, false, false),
@@ -2200,7 +2200,7 @@ async fn chunk_rows_manifest_authentication(tampered_key: bool) {
             Transition::ChunkDone {
                 chunk: range,
                 attempt,
-                high_lsn: high,
+                high: Position::new("pg:test", high.to_be_bytes()),
                 chunk_rows: ChunkRowsRef {
                     mseq: reference.mseq,
                     manifest_digest: digest,

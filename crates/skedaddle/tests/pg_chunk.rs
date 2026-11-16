@@ -222,6 +222,7 @@ impl Fixture {
                                 content: &bytes,
                             },
                             commit.commit_lsn,
+                            &ChunkTestOrder,
                         )?;
                     }
                     continue;
@@ -618,4 +619,18 @@ async fn tls_connect(
     assert!(transport.encrypted());
     assert!(transport.warnings.is_empty());
     Ok((client, driver))
+}
+
+struct ChunkTestOrder;
+impl skedaddle::event::PositionOrder for ChunkTestOrder {
+    fn domain(&self) -> &str {
+        "pg"
+    }
+    fn compare(
+        &self,
+        a: &[u8],
+        b: &[u8],
+    ) -> Result<std::cmp::Ordering, skedaddle::event::EventError> {
+        Ok(a.cmp(b))
+    }
 }

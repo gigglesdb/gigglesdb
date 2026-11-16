@@ -6,7 +6,7 @@ use crate::{
         reader::{BufferReader, ReaderCheckpoint, ReaderConfig},
         writer::WriterConfig,
     },
-    event::{EventError, PositionOrder},
+    event::{EventError, Position, PositionOrder},
     mapping::{PgType, Value},
     pg::{
         frame::FrameBuffer,
@@ -974,7 +974,7 @@ async fn chunk_publication_at_high_precedes_next_commit_and_validates_in_journal
         }
         fn watermark(&mut self, mark: Watermark) -> Result<()> {
             self.window
-                .watermark(&mark.message(), mark.commit_lsn)
+                .watermark(&mark.message(), mark.commit_lsn, &Order)
                 .unwrap();
             self.marks.push(mark);
             Ok(())
@@ -1089,7 +1089,7 @@ async fn chunk_publication_at_high_precedes_next_commit_and_validates_in_journal
         Transition::ChunkDone {
             chunk: range,
             attempt: 1,
-            high_lsn: 30,
+            high: Position::new("pg-test", 30u64.to_be_bytes()),
             chunk_rows: ChunkRowsRef {
                 mseq: reference.mseq,
                 manifest_digest: reference.manifest_digest,

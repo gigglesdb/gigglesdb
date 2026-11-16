@@ -509,7 +509,8 @@ pub enum Transition {
     ChunkDone {
         chunk: crate::pg::chunk::ChunkRange,
         attempt: u64,
-        high_lsn: u64,
+        #[serde(with = "chunk::position_wire")]
+        high: crate::event::Position,
         chunk_rows: chunk::ChunkRowsRef,
     },
     VerifierRange {

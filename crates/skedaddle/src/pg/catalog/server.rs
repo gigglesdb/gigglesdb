@@ -133,7 +133,20 @@ impl ServerTable {
             if attempt
                 .done
                 .as_ref()
-                .is_some_and(|done| lsn > done.high_lsn)
+                .map(|done| {
+                    if done.high.order_domain() != self.order_domain {
+                        return Err(invalid("catalog Done position domain mismatch"));
+                    }
+                    let high = u64::from_be_bytes(
+                        done.high
+                            .bytes()
+                            .try_into()
+                            .map_err(|_| invalid("PostgreSQL LSN width"))?,
+                    );
+                    Ok(lsn > high)
+                })
+                .transpose()?
+                .unwrap_or(false)
             {
                 RangeStatus::Done
             } else {
