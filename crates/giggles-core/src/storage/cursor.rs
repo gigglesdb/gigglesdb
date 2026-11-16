@@ -19,6 +19,11 @@ enum Data {
         plan: Box<Plan>,
     },
     Buffered(VecDeque<SqlRow>),
+    /// A v2 result past the in-memory threshold, read from its temp file.
+    Spilled(relational::spill::SpilledRows, Option<SqlRow>),
+}
+fn row_size(row: &SqlRow) -> usize {
+    row.values.iter().map(relational::value_bytes).sum()
 }
 impl Cursor {
     /// Fetch a bounded chunk. A row larger than max_bytes returns 54000 without
@@ -36,11 +41,7 @@ impl Cursor {
                     let Some(row) = rows.front() else {
                         break;
                     };
-                    let size = row
-                        .values
-                        .iter()
-                        .map(relational::value_bytes)
-                        .sum::<usize>();
+                    let size = row_size(row);
                     if bytes.saturating_add(size) > max_bytes {
                         if result.is_empty() {
                             return Err(CoreError::Sql(SqlError::Limit));
@@ -49,6 +50,30 @@ impl Cursor {
                     }
                     bytes += size;
                     result.push(rows.pop_front().expect("front exists"));
+                }
+                Ok(result)
+            }
+            Data::Spilled(rows, pending) => {
+                let mut result = Vec::new();
+                let mut bytes = 0usize;
+                while result.len() < max_rows {
+                    let row = match pending.take() {
+                        Some(row) => row,
+                        None => match rows.next() {
+                            Some(row) => row?,
+                            None => break,
+                        },
+                    };
+                    let size = row_size(&row);
+                    if bytes.saturating_add(size) > max_bytes {
+                        *pending = Some(row);
+                        if result.is_empty() {
+                            return Err(CoreError::Sql(SqlError::Limit));
+                        }
+                        break;
+                    }
+                    bytes += size;
+                    result.push(row);
                 }
                 Ok(result)
             }
@@ -79,6 +104,7 @@ impl Cursor {
     pub fn is_exhausted(&self) -> bool {
         match &self.data {
             Data::Buffered(rows) => rows.is_empty(),
+            Data::Spilled(rows, pending) => pending.is_none() && rows.is_empty(),
             Data::Scan { plan, .. } => plan.progress.exhausted(),
         }
     }
@@ -257,12 +283,18 @@ impl SqlSession {
         clock: Option<&relational::StatementClock>,
         limit: usize,
     ) -> Result<Cursor, CoreError> {
-        let result = scan::with_cursor_limit(limit, || match clock {
-            Some(clock) => self.execute_prepared_at(p, params, None, clock),
-            None => self.execute_prepared(p, params, None),
-        })?;
+        let (result, spilled) = relational::spill::streaming(|| {
+            scan::with_cursor_limit(limit, || match clock {
+                Some(clock) => self.execute_prepared_at(p, params, None, clock),
+                None => self.execute_prepared(p, params, None),
+            })
+        });
+        let result = result?;
         Ok(Cursor {
-            data: Data::Buffered(result.rows.into()),
+            data: match spilled {
+                Some(rows) => Data::Spilled(rows, None),
+                None => Data::Buffered(result.rows.into()),
+            },
             clock: None,
         })
     }

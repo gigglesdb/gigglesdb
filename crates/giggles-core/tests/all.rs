@@ -489,3 +489,5 @@ mod isolation_levels;
 mod v2_sum_avg_unbounded;
 #[path = "v2_returning_spill.rs"]
 mod v2_returning_spill;
+#[path = "v2_sort_spill.rs"]
+mod v2_sort_spill;

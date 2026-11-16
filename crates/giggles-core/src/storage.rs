@@ -3572,8 +3572,8 @@ impl SqlSession {
     ) -> Result<relational::SqlResult, CoreError> {
         self.execute_bound_clocked(p, params, expected_version, None)
     }
-    // A spilled v2 RETURNING result is materialised here unless the caller
-    // streams it (`relational::spill::streaming`); errors drop the spill.
+    // A spilled v2 RETURNING or SELECT result is materialised here unless the
+    // caller streams it (`relational::spill::streaming`); errors and unwinds drop it.
     fn execute_bound_clocked(
         &mut self,
         p: &relational::Prepared,
@@ -3581,8 +3581,7 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
-        relational::spill::clear();
-        relational::spill::settle(self.execute_bound_clocked_once(p, params, expected_version, clock))
+        relational::spill::statement(|| self.execute_bound_clocked_once(p, params, expected_version, clock))
     }
     fn execute_bound_clocked_once(
         &mut self,

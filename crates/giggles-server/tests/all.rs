@@ -252,3 +252,5 @@ mod agent_pg_profile;
 mod agent_pg_operations;
 #[path = "returning_spill_network.rs"]
 mod returning_spill_network;
+#[path = "sort_spill_network.rs"]
+mod sort_spill_network;

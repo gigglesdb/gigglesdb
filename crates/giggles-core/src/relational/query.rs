@@ -4104,6 +4104,7 @@ pub(super) struct BoundQuery<'a> {
     subqueries: Subplans<'a>,
     declared: Vec<Option<DataType>>,
 }
+#[derive(Serialize, Deserialize)]
 struct Tuple {
     values: Vec<Vec<Value>>,
     version: u64,
@@ -5305,10 +5306,7 @@ impl BoundQuery<'_> {
                     Ok((row, keys, stable_key))
                 });
                 let mut retention = RetentionScope::new(execution);
-                let sorted = scan::sort_bounded(
-                    keyed,
-                    page.keep(),
-                    |(row, keys, stable_key)| {
+                let size = |(row, keys, stable_key): &(Tuple, Vec<Value>, Option<Vec<u8>>)| {
                         let payload: usize = row.values
                             .iter()
                             .flatten()
@@ -5325,8 +5323,9 @@ impl BoundQuery<'_> {
                                 + stable_key.as_ref().map_or(0, Vec::len)
                         } else { 0 };
                         payload + overhead
-                    },
-                    |(_, a, a_key), (_, b, b_key)| {
+                    };
+                let compare = |(_, a, a_key): &(Tuple, Vec<Value>, Option<Vec<u8>>),
+                               (_, b, b_key): &(Tuple, Vec<Value>, Option<Vec<u8>>)| {
                         for ((_, desc, first), (a, b)) in self.order.iter().zip(a.iter().zip(b)) {
                             let ord = match (a, b) {
                                 (Value::Null, Value::Null) => Ordering::Equal,
@@ -5354,14 +5353,31 @@ impl BoundQuery<'_> {
                             }
                         }
                         a_key.cmp(b_key)
-                    },
-                    &mut retention,
-                )?;
-                Box::new(sorted.into_iter().map(|(row, _, _)| Ok(row)))
+                    };
+                // v2 full sorts spill sorted runs past work_mem (PostgreSQL's
+                // external sort); top-N sorts keep only OFFSET + LIMIT rows.
+                if source.streams_reductions() && limit.is_none() {
+                    let sorted = spill::sort_external(keyed, size, compare, &mut retention)?;
+                    Box::new(sorted.map(|item| item.map(|(row, _, _)| row)))
+                } else {
+                    let sorted = scan::sort_bounded(keyed, page.keep(), size, compare, &mut retention)?;
+                    Box::new(sorted.into_iter().map(|(row, _, _)| Ok(row)))
+                }
             };
+            // A v2 SqlSession statement's own output spills past SPILL_BYTES like
+            // a tuplestore, so it has no row or byte ceiling; each row still does.
+            let mut output = (source.streams_reductions() && !subquery && !insert_source && spill::armed())
+                .then(|| spill::RowBuffer::new(Vec::new()))
+                .transpose()
+                .map_err(spill::sql_error)?;
             for row in page.apply(rows) {
                 let row = row?;
                 let mut scalar_work_bytes = 0usize;
+                if let Some(output) = output.as_mut() {
+                    let row = self.project_tuple(&row, params, &mut scalar_work_bytes, &mut 0)?;
+                    output.push(row).map_err(spill::sql_error)?;
+                    continue;
+                }
                 if result.rows.len() >= scan::query_row_limit() {
                     return Err(SqlError::Limit);
                 }
@@ -5371,6 +5387,9 @@ impl BoundQuery<'_> {
                     &mut scalar_work_bytes,
                     &mut result_bytes,
                 )?);
+            }
+            if let Some(output) = output {
+                output.finish(&mut result).map_err(spill::sql_error)?;
             }
         }
         if self.aggregate && cancel() {

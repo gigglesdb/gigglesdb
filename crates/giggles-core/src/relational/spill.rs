@@ -1,29 +1,56 @@
-//! Spillable v2 RETURNING rows (PostgreSQL's tuplestore past work_mem).
+//! Spillable v2 statement output and sorts (PostgreSQL's tuplestore and
+//! external sort past work_mem).
 //!
 //! Rows stay in memory up to `SPILL_BYTES`, then move to a private temp file
 //! that is deleted on drop, so error, rollback and unwind paths clean up.
 //! A completed spill reaches the caller through a thread-local slot: callers
 //! inside [`streaming`] read it sequentially; every other SqlSession caller
 //! gets the rows materialised into `SqlResult::rows` (never truncated).
-use super::{SqlResult, SqlRow, searched};
+//! [`sort_external`] keeps `SORT_BYTES` of sort input in memory, writes sorted
+//! runs past that and merges them, stable in input order.
+use super::{SqlError, SqlResult, SqlRow, scan, searched};
 use crate::CoreError;
+use serde::{Serialize, de::DeserializeOwned};
 use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 /// In-memory threshold before rows move to disk.
 pub const SPILL_BYTES: usize = super::MAX_RESULT_BYTES;
+/// Sort input kept in memory before sorted runs spill (PostgreSQL's default work_mem).
+pub const SORT_BYTES: usize = 4 * 1024 * 1024;
+/// Runs merged at once; more runs are first merged into longer runs.
+const MERGE_FAN_IN: usize = 64;
 
 thread_local! {
     static STREAMING: Cell<bool> = const { Cell::new(false) };
+    static ARMED: Cell<bool> = const { Cell::new(false) };
     static SLOT: RefCell<Option<SpilledRows>> = const { RefCell::new(None) };
+    static ERROR: RefCell<Option<CoreError>> = const { RefCell::new(None) };
     static DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
 fn io(error: std::io::Error) -> CoreError {
-    CoreError::Storage(format!("RETURNING spill: {error}"))
+    CoreError::Storage(format!("spill file: {error}"))
+}
+
+/// Carry a non-SQL spill error through SQL execution; [`statement`] restores it.
+pub(crate) fn sql_error(error: CoreError) -> SqlError {
+    match error {
+        CoreError::Sql(error) => error,
+        error => {
+            ERROR.set(Some(error));
+            SqlError::Unsupported
+        }
+    }
+}
+
+/// True inside a SqlSession statement, whose boundary settles a published spill.
+pub(crate) fn armed() -> bool {
+    ARMED.get()
 }
 
 /// Removes the file when dropped; declared after the handle that uses it.
@@ -34,7 +61,7 @@ impl Drop for TempPath {
     }
 }
 
-/// Run `f` with spilled RETURNING rows left on disk for the caller.
+/// Run `f` with spilled rows left on disk for the caller.
 /// The returned handle yields every row in statement order.
 pub fn streaming<T>(f: impl FnOnce() -> T) -> (T, Option<SpilledRows>) {
     struct Reset(bool);
@@ -60,6 +87,31 @@ pub(crate) fn clear() {
     SLOT.take();
 }
 
+/// One SqlSession statement: arms SELECT output spills, settles the slot, and
+/// drops any spill when `f` errors or unwinds (the slot never outlives it).
+pub(crate) fn statement(f: impl FnOnce() -> Result<SqlResult, CoreError>) -> Result<SqlResult, CoreError> {
+    struct Armed(bool);
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            ARMED.set(self.0);
+            if std::thread::panicking() {
+                SLOT.take();
+                ERROR.take();
+            }
+        }
+    }
+    clear();
+    ERROR.take();
+    let armed = Armed(ARMED.replace(true));
+    let result = f();
+    drop(armed);
+    let stashed = ERROR.take();
+    settle(result.map_err(|error| match (error, stashed) {
+        (CoreError::Sql(SqlError::Unsupported), Some(stashed)) => stashed,
+        (error, _) => error,
+    }))
+}
+
 /// Statement boundary: drop a spill on error; materialise it unless streaming.
 pub(crate) fn settle(result: Result<SqlResult, CoreError>) -> Result<SqlResult, CoreError> {
     let mut result = match result {
@@ -80,7 +132,7 @@ pub(crate) fn settle(result: Result<SqlResult, CoreError>) -> Result<SqlResult, 
     Ok(result)
 }
 
-/// Statement RETURNING output with no fixed ceiling.
+/// Statement output (RETURNING or SELECT rows) with no fixed ceiling.
 pub(crate) struct RowBuffer {
     rows: Vec<SqlRow>,
     bytes: usize,
@@ -96,38 +148,28 @@ impl RowBuffer {
     }
 
     pub(crate) fn extend(&mut self, rows: Vec<SqlRow>) -> Result<(), CoreError> {
-        for row in rows {
-            self.count += 1;
-            if let Some((writer, _)) = &mut self.file {
-                write_row(writer, &row)?;
-                continue;
-            }
-            let bytes = searched::retained_row_bytes(&[], &row).map_err(CoreError::Sql)?;
-            self.bytes = self.bytes.saturating_add(bytes);
-            self.rows.push(row);
-            if self.bytes > SPILL_BYTES {
-                self.spill()?;
-            }
+        rows.into_iter().try_for_each(|row| self.push(row))
+    }
+
+    pub(crate) fn push(&mut self, row: SqlRow) -> Result<(), CoreError> {
+        self.count += 1;
+        if let Some((writer, _)) = &mut self.file {
+            return write_item(writer, &row);
+        }
+        let bytes = searched::retained_row_bytes(&[], &row).map_err(CoreError::Sql)?;
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.rows.push(row);
+        if self.bytes > SPILL_BYTES {
+            self.spill()?;
         }
         Ok(())
     }
 
     fn spill(&mut self) -> Result<(), CoreError> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = DIR.with_borrow(Clone::clone).unwrap_or_else(std::env::temp_dir);
-        let mut nonce = [0u8; 8];
-        getrandom::fill(&mut nonce).map_err(|e| CoreError::Storage(e.to_string()))?;
-        let path = dir.join(format!(
-            "giggles-returning-{}-{}-{:016x}.spill",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed),
-            u64::from_le_bytes(nonce)
-        ));
-        let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).map_err(io)?;
-        let temp = TempPath(path);
+        let (file, temp) = create("returning")?;
         let mut writer = BufWriter::new(file);
         for row in std::mem::take(&mut self.rows) {
-            write_row(&mut writer, &row)?;
+            write_item(&mut writer, &row)?;
         }
         self.bytes = 0;
         self.file = Some((writer, temp));
@@ -148,11 +190,35 @@ impl RowBuffer {
     }
 }
 
-fn write_row(writer: &mut BufWriter<File>, row: &SqlRow) -> Result<(), CoreError> {
-    let bytes = bincode::serialize(row).map_err(|e| CoreError::Storage(e.to_string()))?;
-    let len = u32::try_from(bytes.len()).map_err(|_| CoreError::Sql(super::SqlError::Limit))?;
+/// A new private temp file in this thread's spill directory, removed on drop.
+fn create(kind: &str) -> Result<(File, TempPath), CoreError> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = DIR.with_borrow(Clone::clone).unwrap_or_else(std::env::temp_dir);
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).map_err(|e| CoreError::Storage(e.to_string()))?;
+    let path = dir.join(format!(
+        "giggles-{kind}-{}-{}-{:016x}.spill",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        u64::from_le_bytes(nonce)
+    ));
+    let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).map_err(io)?;
+    Ok((file, TempPath(path)))
+}
+
+fn write_item<T: Serialize>(writer: &mut BufWriter<File>, item: &T) -> Result<(), CoreError> {
+    let bytes = bincode::serialize(item).map_err(|e| CoreError::Storage(e.to_string()))?;
+    let len = u32::try_from(bytes.len()).map_err(|_| CoreError::Sql(SqlError::Limit))?;
     writer.write_all(&len.to_le_bytes()).map_err(io)?;
     writer.write_all(&bytes).map_err(io)
+}
+
+fn read_item<T: DeserializeOwned>(reader: &mut BufReader<File>) -> Result<T, CoreError> {
+    let mut len = [0u8; 4];
+    reader.read_exact(&mut len).map_err(io)?;
+    let mut bytes = vec![0; u32::from_le_bytes(len) as usize];
+    reader.read_exact(&mut bytes).map_err(io)?;
+    bincode::deserialize(&bytes).map_err(|e| CoreError::Storage(e.to_string()))
 }
 
 /// Rows of one completed statement, read once in order from a temp file.
@@ -189,12 +255,7 @@ impl Iterator for SpilledRows {
             return None;
         }
         self.remaining -= 1;
-        let mut len = [0u8; 4];
-        let row = self.reader.read_exact(&mut len).map_err(io).and_then(|()| {
-            let mut bytes = vec![0; u32::from_le_bytes(len) as usize];
-            self.reader.read_exact(&mut bytes).map_err(io)?;
-            bincode::deserialize(&bytes).map_err(|e| CoreError::Storage(e.to_string()))
-        });
+        let row = read_item(&mut self.reader);
         if row.is_err() {
             self.remaining = 0;
         }
@@ -203,5 +264,235 @@ impl Iterator for SpilledRows {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let n = usize::try_from(self.remaining).unwrap_or(usize::MAX);
         (n, Some(n))
+    }
+}
+
+/// One sorted run on disk.
+pub(crate) struct Run {
+    reader: BufReader<File>,
+    remaining: u64,
+    _temp: TempPath,
+}
+
+fn write_run<T: Serialize>(items: impl Iterator<Item = Result<T, SqlError>>) -> Result<Run, SqlError> {
+    let (file, temp) = create("sort").map_err(sql_error)?;
+    let mut writer = BufWriter::new(file);
+    let mut remaining = 0;
+    for item in items {
+        write_item(&mut writer, &item?).map_err(sql_error)?;
+        remaining += 1;
+    }
+    let mut file = writer.into_inner().map_err(|e| sql_error(io(e.into_error())))?;
+    file.seek(SeekFrom::Start(0)).map_err(|e| sql_error(io(e)))?;
+    Ok(Run { reader: BufReader::new(file), remaining, _temp: temp })
+}
+
+pub(crate) enum Input<T> {
+    Run(Run),
+    Memory(std::vec::IntoIter<T>),
+}
+impl<T: DeserializeOwned> Input<T> {
+    fn next(&mut self) -> Result<Option<T>, SqlError> {
+        match self {
+            Self::Memory(rows) => Ok(rows.next()),
+            Self::Run(run) if run.remaining == 0 => Ok(None),
+            Self::Run(run) => {
+                run.remaining -= 1;
+                read_item(&mut run.reader).map(Some).map_err(sql_error)
+            }
+        }
+    }
+}
+
+/// Merges sorted inputs; equal keys come from the earliest input.
+pub(crate) struct Merge<T, C> {
+    inputs: Vec<Input<T>>,
+    heads: Vec<Option<T>>,
+    cmp: C,
+    emitted: u64,
+    done: bool,
+}
+
+impl<T: DeserializeOwned, C: Fn(&T, &T) -> Ordering> Merge<T, C> {
+    fn new(mut inputs: Vec<Input<T>>, cmp: C) -> Result<Self, SqlError> {
+        let heads = inputs.iter_mut().map(Input::next).collect::<Result<_, _>>()?;
+        Ok(Self { inputs, heads, cmp, emitted: 0, done: false })
+    }
+}
+
+impl<T: DeserializeOwned, C: Fn(&T, &T) -> Ordering> Iterator for Merge<T, C> {
+    type Item = Result<T, SqlError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        self.emitted += 1;
+        if self.emitted.is_multiple_of(4096) && crate::cancellation::check().is_err() {
+            self.done = true;
+            return Some(Err(SqlError::Aborted));
+        }
+        let mut best: Option<usize> = None;
+        for (index, head) in self.heads.iter().enumerate() {
+            let Some(head) = head else { continue };
+            if best.is_none_or(|b| {
+                (self.cmp)(head, self.heads[b].as_ref().expect("head")) == Ordering::Less
+            }) {
+                best = Some(index);
+            }
+        }
+        let Some(best) = best else {
+            self.done = true;
+            return None;
+        };
+        let row = self.heads[best].take();
+        match self.inputs[best].next() {
+            Ok(next) => self.heads[best] = next,
+            Err(error) => {
+                self.done = true;
+                return Some(Err(error));
+            }
+        }
+        row.map(Ok)
+    }
+}
+
+/// Sorted rows, in memory or merged from spilled runs. Dropping it removes the runs.
+pub(crate) enum Sorted<T, C> {
+    Memory(std::vec::IntoIter<T>),
+    Merge(Merge<T, C>),
+}
+
+impl<T: DeserializeOwned, C: Fn(&T, &T) -> Ordering> Iterator for Sorted<T, C> {
+    type Item = Result<T, SqlError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Memory(rows) => rows.next().map(Ok),
+            Self::Merge(merge) => merge.next(),
+        }
+    }
+}
+
+/// Stable full sort with no size ceiling. Up to `SORT_BYTES` of input (by
+/// `size`) is charged to `retention` while held; beyond that, sorted runs
+/// spill to temp files and are merged.
+pub(crate) fn sort_external<T, C>(
+    rows: impl Iterator<Item = Result<T, SqlError>>,
+    size: impl Fn(&T) -> usize,
+    cmp: C,
+    retention: &mut impl scan::RetentionBudget,
+) -> Result<Sorted<T, C>, SqlError>
+where
+    T: Serialize + DeserializeOwned,
+    C: Fn(&T, &T) -> Ordering + Copy,
+{
+    let mut memory = Vec::new();
+    let mut runs = Vec::new();
+    let mut bytes = 0usize;
+    let fill = || -> Result<(), SqlError> {
+        for row in rows {
+            let row = row?;
+            let n = size(&row);
+            if !memory.is_empty() && bytes.saturating_add(n) > SORT_BYTES {
+                memory.sort_by(cmp);
+                runs.push(write_run(memory.drain(..).map(Ok))?);
+                retention.release(bytes);
+                bytes = 0;
+            }
+            retention.charge(n)?;
+            bytes += n;
+            memory.push(row);
+        }
+        Ok(())
+    };
+    let filled = fill();
+    retention.release(bytes);
+    filled?;
+    memory.sort_by(cmp);
+    if runs.is_empty() {
+        return Ok(Sorted::Memory(memory.into_iter()));
+    }
+    while runs.len() >= MERGE_FAN_IN {
+        let first = runs.drain(..MERGE_FAN_IN).map(Input::Run).collect();
+        let merged = write_run(Merge::new(first, cmp)?)?;
+        runs.insert(0, merged);
+    }
+    let mut inputs: Vec<_> = runs.into_iter().map(Input::Run).collect();
+    inputs.push(Input::Memory(memory.into_iter()));
+    Ok(Sorted::Merge(Merge::new(inputs, cmp)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Budget(usize);
+    impl scan::RetentionBudget for Budget {
+        fn charge(&mut self, bytes: usize) -> Result<(), SqlError> {
+            self.0 += bytes;
+            assert!(self.0 <= SORT_BYTES, "sort retention stays within work_mem");
+            Ok(())
+        }
+        fn release(&mut self, bytes: usize) {
+            self.0 -= bytes;
+        }
+    }
+
+    fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        set_thread_dir(Some(dir.clone()));
+        dir
+    }
+
+    fn files(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    #[test]
+    fn external_sort_is_stable_across_many_runs_and_removes_them() {
+        let dir = dir("giggles-sort-unit");
+        let cmp = |a: &(u64, u64), b: &(u64, u64)| a.0.cmp(&b.0);
+        let mut budget = Budget(0);
+        // 300k rows charged 1 KiB each: ~73 runs, so one extra merge pass.
+        let rows = (0..300_000u64).map(|i| Ok(((i * 7919) % 1000, i)));
+        let sorted = sort_external(rows, |_| 1024, cmp, &mut budget).unwrap();
+        assert!(files(&dir) > 1);
+        let out = sorted.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!((out.len(), budget.0), (300_000, 0));
+        assert!(out.windows(2).all(|w| w[0].0 < w[1].0 || (w[0].0 == w[1].0 && w[0].1 < w[1].1)));
+        assert_eq!(files(&dir), 0);
+
+        // An input error and an early drop both remove the spilled runs.
+        let failing = (0..20_000u64).map(|i| if i == 19_999 { Err(SqlError::Aborted) } else { Ok((i, i)) });
+        assert!(matches!(sort_external(failing, |_| 1024, cmp, &mut budget), Err(SqlError::Aborted)));
+        let rows = (0..20_000u64).rev().map(|i| Ok((i, i)));
+        let mut partial = sort_external(rows, |_| 1024, cmp, &mut budget).unwrap();
+        assert_eq!(partial.next().unwrap().unwrap(), (0, 0));
+        drop(partial);
+        assert_eq!((files(&dir), budget.0), (0, 0));
+        set_thread_dir(None);
+    }
+
+    #[test]
+    fn statement_unwind_clears_a_published_spill() {
+        let dir = dir("giggles-spill-unwind");
+        let unwound = std::panic::catch_unwind(|| {
+            statement(|| {
+                let mut buffer = RowBuffer::new(Vec::new())?;
+                for i in 0..20_000 {
+                    let value = super::super::Value::Text(format!("{i:0>64}"));
+                    buffer.push(SqlRow { values: vec![value], version: 0 })?;
+                }
+                let mut result = SqlResult::default();
+                buffer.finish(&mut result)?;
+                assert!(SLOT.with_borrow(Option::is_some) && files(&dir) == 1);
+                panic!("injected after publishing a spill");
+            })
+        });
+        assert!(unwound.is_err());
+        assert!(SLOT.with_borrow(Option::is_none) && !armed());
+        assert_eq!(files(&dir), 0);
+        set_thread_dir(None);
     }
 }
