@@ -968,6 +968,34 @@ impl NunyaSpanner {
         }
         Ok(result)
     }
+    fn prepare_mutation(
+        &self,
+        who: &Authenticated,
+        policy: &Policy,
+        snapshot: &Snapshot,
+        mutation: &mut Mutation,
+    ) -> Result<(), Status> {
+        let lowered =
+            spanner_struct::lower_mutation(mutation, snapshot, policy).map_err(status)?;
+        let plan = check(&lowered.stmt, policy, snapshot).map_err(status)?;
+        if let Some(mutation::Operation::Delete(delete)) = &mutation.operation {
+            check_key_tokens(
+                delete.key_set.as_ref(),
+                policy,
+                &plan,
+                &lowered.positions,
+                true,
+            )?;
+        }
+        let rewrites = self.structured(who, policy, &plan, &lowered.positions, |p| {
+            mutation_value(mutation, p)
+        })?;
+        for (index, value) in rewrites {
+            *mutation_value_mut(mutation, &lowered.positions[index]).ok_or_else(invalid)? =
+                value;
+        }
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     fn stream(
         &self,
@@ -989,6 +1017,7 @@ impl NunyaSpanner {
             let mut tokens = vec![];
             let work = async {
                 let mut reassembler = Reassembler::new();
+                let mut precommit = stream::Precommit::default();
                 let mut types = None;
                 loop {
                     let part = tokio::select! {
@@ -1002,8 +1031,10 @@ impl NunyaSpanner {
                     ctx.authority
                         .admit(who.session, Operation::Read)
                         .map_err(|_| ended_status(write))?;
+                    let mut part = part.map_err(remote)?;
+                    precommit.observe(&mut part);
                     let (events, resume) =
-                        reassembler.push(part.map_err(remote)?).map_err(|e| after_forward(status(e), write))?;
+                        reassembler.push(part).map_err(|e| after_forward(status(e), write))?;
                     let mut chunk_tokens = vec![];
                     let mut metadata = None;
                     let mut rows = vec![];
@@ -1035,10 +1066,12 @@ impl NunyaSpanner {
                     if metadata.is_some() || !rows.is_empty() || stats.is_some() || resume.is_some()
                     {
                         let row_count = rows.len() as u64;
+                        let mut output = stream::emit(metadata, rows, resume, stats);
+                        precommit.attach(&mut output);
                         tokio::select! {
                             biased;
                             _ = ended(&mut signal) => return Err(ended_status(write)),
-                            result = tx.send(Ok(stream::emit(metadata, rows, resume, stats))) => {
+                            result = tx.send(Ok(output)) => {
                                 result.map_err(|_| after_forward(Status::cancelled("stream closed"), write))?;
                             }
                         }
@@ -1047,6 +1080,15 @@ impl NunyaSpanner {
                     }
                 }
                 reassembler.finish().map_err(|e| after_forward(status(e), write))?;
+                if let Some(output) = precommit.finish() {
+                    tokio::select! {
+                        biased;
+                        _ = ended(&mut signal) => return Err(ended_status(write)),
+                        result = tx.send(Ok(output)) => {
+                            result.map_err(|_| after_forward(Status::cancelled("stream closed"), write))?;
+                        }
+                    }
+                }
                 Ok::<(), Status>(())
             }
             .await;
@@ -1473,9 +1515,14 @@ impl SpannerService for NunyaSpanner {
         req: Request<BeginTransactionRequest>,
     ) -> Result<Response<Transaction>, Status> {
         let who = self.authenticate(&req)?;
-        let req = req.into_inner();
+        let mut req = req.into_inner();
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
+        if let Some(mutation) = &mut req.mutation_key {
+            self.admit_write(&who)?;
+            let (policy, snapshot, _) = self.configuration()?;
+            self.prepare_mutation(&who, &policy, &snapshot, mutation)?;
+        }
         Ok(Response::new(
             cancellable(
                 &mut signal,
@@ -1516,33 +1563,25 @@ impl SpannerService for NunyaSpanner {
             self.admit_write(&who)?;
         }
         for mutation in &mut req.mutations {
-            let lowered =
-                spanner_struct::lower_mutation(mutation, &snapshot, &policy).map_err(status)?;
-            let plan = check(&lowered.stmt, &policy, &snapshot).map_err(status)?;
-            if let Some(mutation::Operation::Delete(delete)) = &mutation.operation {
-                check_key_tokens(
-                    delete.key_set.as_ref(),
-                    &policy,
-                    &plan,
-                    &lowered.positions,
-                    true,
-                )?;
-            }
-            let rewrites = self.structured(&who, &policy, &plan, &lowered.positions, |p| {
-                mutation_value(mutation, p)
-            })?;
-            for (index, value) in rewrites {
-                *mutation_value_mut(mutation, &lowered.positions[index]).ok_or_else(invalid)? =
-                    value;
-            }
+            self.prepare_mutation(&who, &policy, &snapshot, mutation)?;
         }
         Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Commit", 0, vec![])?;
         let mut client = self.client().await?;
         let session = req.session.clone();
         let result = cancellable(&mut signal, true, client.commit(req)).await;
-        self.clear_dml(&session)
-            .map_err(|e| after_forward(e, true))?;
-        Ok(Response::new(result?.into_inner()))
+        let retry = result.as_ref().is_ok_and(|response| matches!(
+            response.get_ref().multiplexed_session_retry,
+            Some(commit_response::MultiplexedSessionRetry::PrecommitToken(_))
+        ));
+        if !retry {
+            self.clear_dml(&session)
+                .map_err(|e| after_forward(e, true))?;
+        }
+        let response = result?.into_inner();
+        if !retry && response.commit_timestamp.is_none() {
+            return Err(nunya_status(NyCode::WriteOutcomeUnknown));
+        }
+        Ok(Response::new(response))
     }
     async fn partition_query(
         &self,
@@ -1769,6 +1808,10 @@ mod tests {
     }
     #[derive(Default)]
     struct Fake {
+        result_token: Mutex<Option<MultiplexedSessionPrecommitToken>>,
+        next_commit: Mutex<Option<CommitResponse>>,
+        begins: Mutex<Vec<BeginTransactionRequest>>,
+        parts: Mutex<Option<Vec<PartialResultSet>>>,
         seen: Mutex<Vec<ExecuteSqlRequest>>,
         commits: Mutex<Vec<CommitRequest>>,
         deleted: Mutex<Vec<String>>,
@@ -1860,6 +1903,9 @@ mod tests {
             &self,
             req: Request<ExecuteSqlRequest>,
         ) -> Result<Response<ResultStream>, Status> {
+            if let Some(parts) = self.parts.lock().unwrap().take() {
+                return Ok(Response::new(Box::pin(futures::stream::iter(parts.into_iter().map(Ok)))));
+            }
             self.streaming
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let hold = self.hold_stream.load(std::sync::atomic::Ordering::Relaxed);
@@ -1951,7 +1997,7 @@ mod tests {
                 self.release.notified().await;
             }
             if dml {
-                return Ok(Response::new(ResultSet::default()));
+                return Ok(Response::new(ResultSet { precommit_token: self.result_token.lock().unwrap().clone(), ..Default::default() }));
             }
             Ok(Response::new(ResultSet {
                 metadata: Some(ResultSetMetadata {
@@ -1966,6 +2012,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
+                precommit_token: self.result_token.lock().unwrap().clone(),
                 rows: vec![ListValue {
                     values: vec![text("private@example.com")],
                 }],
@@ -1977,7 +2024,17 @@ mod tests {
             req: Request<ExecuteBatchDmlRequest>,
         ) -> Result<Response<ExecuteBatchDmlResponse>, Status> {
             self.batches.lock().unwrap().push(req.into_inner());
-            Ok(Response::new(ExecuteBatchDmlResponse::default()))
+            Ok(Response::new(ExecuteBatchDmlResponse { precommit_token: self.result_token.lock().unwrap().clone(), ..Default::default() }))
+        }
+        async fn begin_transaction(&self, req: Request<BeginTransactionRequest>) -> Result<Response<Transaction>, Status> {
+            self.begins.lock().unwrap().push(req.into_inner());
+            Ok(Response::new(Transaction { precommit_token: self.result_token.lock().unwrap().clone(), ..Default::default() }))
+        }
+        async fn read(&self, _: Request<ReadRequest>) -> Result<Response<ResultSet>, Status> {
+            self.execute_sql(Request::new(ExecuteSqlRequest::default())).await
+        }
+        async fn streaming_read(&self, _: Request<ReadRequest>) -> Result<Response<ResultStream>, Status> {
+            self.execute_streaming_sql(Request::new(ExecuteSqlRequest::default())).await
         }
         async fn commit(
             &self,
@@ -1987,7 +2044,10 @@ mod tests {
             if self.hold_commit.load(std::sync::atomic::Ordering::Relaxed) {
                 self.release.notified().await;
             }
-            Ok(Response::new(CommitResponse::default()))
+            Ok(Response::new(self.next_commit.lock().unwrap().take().unwrap_or(CommitResponse {
+                commit_timestamp: Some(prost_types::Timestamp { seconds: 1, nanos: 0 }),
+                ..Default::default()
+            })))
         }
     }
     fn text(s: &str) -> Value {
@@ -2564,6 +2624,269 @@ mod tests {
         assert_eq!(result.code(), tonic::Code::AlreadyExists);
         assert!(!result.message().contains("private@example.com"));
         assert!(result.details().is_empty());
+    }
+    fn precommit(seq_num: i32) -> MultiplexedSessionPrecommitToken {
+        MultiplexedSessionPrecommitToken {
+            precommit_token: vec![0, 255, seq_num as u8],
+            seq_num,
+        }
+    }
+    async fn customer_read(f: &Fixture) -> ReadRequest {
+        ReadRequest {
+            session: f.session().await,
+            table: "customers".into(),
+            columns: vec!["email".into()],
+            key_set: Some(KeySet {
+                all: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+    #[tokio::test]
+    async fn unary_precommit_tokens_pass_through() {
+        let f = Fixture::new().await;
+        let token = Some(precommit(7));
+        *f.fake.result_token.lock().unwrap() = token.clone();
+        let query = f.query("SELECT email FROM customers").await;
+        let result = f
+            .svc
+            .execute_sql(f.request(query, "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.precommit_token, token);
+        let result = f
+            .svc
+            .read(f.request(customer_read(&f).await, "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.precommit_token, token);
+        let mut query = f.query("UPDATE customers SET email = @v").await;
+        query.params = Some(prost_types::Struct {
+            fields: [("v".into(), f.token())].into(),
+        });
+        let result = f
+            .svc
+            .execute_batch_dml(f.request(
+                ExecuteBatchDmlRequest {
+                    session: query.session,
+                    statements: vec![execute_batch_dml_request::Statement {
+                        sql: query.sql,
+                        params: query.params,
+                        param_types: query.param_types,
+                    }],
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.precommit_token, token);
+    }
+    #[tokio::test]
+    async fn commit_precommit_retry_and_unknown_outcome() {
+        let f = Fixture::new().await;
+        let session = f.session().await;
+        f.svc.mark_dml(&session).unwrap();
+        let retry = CommitResponse {
+            multiplexed_session_retry: Some(
+                commit_response::MultiplexedSessionRetry::PrecommitToken(precommit(8)),
+            ),
+            ..Default::default()
+        };
+        *f.fake.next_commit.lock().unwrap() = Some(retry.clone());
+        let request = CommitRequest {
+            session: session.clone(),
+            precommit_token: Some(precommit(7)),
+            ..Default::default()
+        };
+        let result = f
+            .svc
+            .commit(f.request(request, "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result, retry);
+        assert_eq!(
+            f.fake.commits.lock().unwrap()[0].precommit_token,
+            Some(precommit(7))
+        );
+        assert!(f.svc.dml_sessions.lock().unwrap().contains(&session));
+        reduce_grant(&f);
+        assert_read_only(
+            f.svc
+                .commit(f.request(
+                    CommitRequest {
+                        session,
+                        ..Default::default()
+                    },
+                    "alice",
+                ))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(f.fake.commits.lock().unwrap().len(), 1);
+
+        let f = Fixture::new().await;
+        let session = f.session().await;
+        f.svc.mark_dml(&session).unwrap();
+        *f.fake.next_commit.lock().unwrap() = Some(CommitResponse::default());
+        let error = f
+            .svc
+            .commit(f.request(
+                CommitRequest {
+                    session: session.clone(),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unknown);
+        assert!(error.message().contains("NY012"));
+        assert!(!f.svc.dml_sessions.lock().unwrap().contains(&session));
+        assert!(
+            f.svc
+                .commit(f.request(
+                    CommitRequest {
+                        session,
+                        ..Default::default()
+                    },
+                    "alice"
+                ))
+                .await
+                .unwrap()
+                .get_ref()
+                .commit_timestamp
+                .is_some()
+        );
+    }
+    #[tokio::test]
+    async fn begin_mutation_key_is_checked_and_decrypted() {
+        let f = Fixture::new().await;
+        let session = f.session().await;
+        *f.fake.result_token.lock().unwrap() = Some(precommit(7));
+        let mutation = Mutation {
+            operation: Some(mutation::Operation::Insert(mutation::Write {
+                table: "customers".into(),
+                columns: vec!["email".into()],
+                values: vec![ListValue {
+                    values: vec![f.token()],
+                }],
+            })),
+        };
+        let result = f
+            .svc
+            .begin_transaction(f.request(
+                BeginTransactionRequest {
+                    session: session.clone(),
+                    mutation_key: Some(mutation),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.precommit_token, Some(precommit(7)));
+        assert_eq!(
+            mutation_value(
+                f.fake.begins.lock().unwrap()[0]
+                    .mutation_key
+                    .as_ref()
+                    .unwrap(),
+                &ValuePosition::MutationValue { row: 0, column: 0 }
+            ),
+            Some(&text("private@example.com"))
+        );
+        assert!(
+            f.svc
+                .begin_transaction(f.request(
+                    BeginTransactionRequest {
+                        session,
+                        mutation_key: Some(Mutation::default()),
+                        ..Default::default()
+                    },
+                    "alice"
+                ))
+                .await
+                .is_err()
+        );
+        assert_eq!(f.fake.begins.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn streaming_precommit_tokens_and_last_survive_reassembly() {
+        for read in [false, true] {
+            let f = Fixture::new().await;
+            let metadata = ResultSetMetadata {
+                row_type: Some(StructType {
+                    fields: vec![struct_type::Field {
+                        name: "email".into(),
+                        r#type: Some(Type {
+                            code: TypeCode::String as i32,
+                            ..Default::default()
+                        }),
+                    }],
+                }),
+                ..Default::default()
+            };
+            *f.fake.parts.lock().unwrap() = Some(vec![
+                PartialResultSet {
+                    metadata: Some(metadata),
+                    values: vec![text("private@example.com")],
+                    precommit_token: Some(precommit(7)),
+                    ..Default::default()
+                },
+                PartialResultSet {
+                    values: vec![text("private@")],
+                    chunked_value: true,
+                    precommit_token: Some(precommit(8)),
+                    ..Default::default()
+                },
+                PartialResultSet {
+                    values: vec![text("example.com")],
+                    ..Default::default()
+                },
+                PartialResultSet {
+                    precommit_token: Some(precommit(9)),
+                    last: true,
+                    ..Default::default()
+                },
+            ]);
+            let mut stream = if read {
+                f.svc
+                    .streaming_read(f.request(customer_read(&f).await, "alice"))
+                    .await
+                    .unwrap()
+                    .into_inner()
+            } else {
+                f.svc
+                    .execute_streaming_sql(
+                        f.request(f.query("SELECT email FROM customers").await, "alice"),
+                    )
+                    .await
+                    .unwrap()
+                    .into_inner()
+            };
+            let mut tokens = vec![];
+            let mut values = vec![];
+            let mut last = false;
+            while let Some(part) = stream.next().await {
+                let part = part.unwrap();
+                assert!(!last);
+                if let Some(token) = part.precommit_token {
+                    tokens.push(token);
+                }
+                values.extend(part.values);
+                last = part.last;
+            }
+            assert_eq!(tokens, vec![precommit(7), precommit(8), precommit(9)]);
+            assert_eq!(values, vec![f.token(), f.token()]);
+            assert!(last);
+        }
     }
     #[tokio::test]
     async fn commit_blind_insert_is_decrypted() {

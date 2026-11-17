@@ -8,6 +8,42 @@ use crate::{
 };
 use googleapis_tonic_google_spanner_v1::google::spanner::v1::{PartialResultSet, ResultSetMetadata, ResultSetStats};
 use prost_types::{value::Kind, Value};
+/// Multiplexed-session tokens held until a safe outgoing stream message.
+#[derive(Default)]
+pub(super) struct Precommit {
+    pending: Option<
+        googleapis_tonic_google_spanner_v1::google::spanner::v1::MultiplexedSessionPrecommitToken,
+    >,
+    highest: Option<i32>,
+    last: bool,
+}
+impl Precommit {
+    /// Hold the latest token and remember upstream completion.
+    pub(super) fn observe(&mut self, part: &mut PartialResultSet) {
+        self.last |= std::mem::take(&mut part.last);
+        if let Some(token) = part.precommit_token.take()
+            && self.highest.is_none_or(|seq| token.seq_num >= seq)
+        {
+            self.highest = Some(token.seq_num);
+            self.pending = Some(token);
+        }
+    }
+    /// Attach the held token to a complete outgoing message.
+    pub(super) fn attach(&mut self, part: &mut PartialResultSet) {
+        part.precommit_token = self.pending.take();
+    }
+    /// Flush control fields after normal row reassembly completes.
+    pub(super) fn finish(self) -> Option<PartialResultSet> {
+        if self.pending.is_none() && !self.last {
+            return None;
+        }
+        Some(PartialResultSet {
+            precommit_token: self.pending,
+            last: self.last,
+            ..Default::default()
+        })
+    }
+}
 fn bad() -> Refusal {
     Refusal::new(NyCode::NotAnalysable, "malformed Spanner stream")
 }
@@ -238,6 +274,55 @@ mod tests {
             resume_token: vec![1],
             ..Default::default()
         }
+    }
+    fn precommit(
+        seq_num: i32,
+    ) -> googleapis_tonic_google_spanner_v1::google::spanner::v1::MultiplexedSessionPrecommitToken
+    {
+        googleapis_tonic_google_spanner_v1::google::spanner::v1::MultiplexedSessionPrecommitToken {
+            seq_num,
+            precommit_token: vec![0, 255, seq_num as u8],
+        }
+    }
+    #[test]
+    fn held_precommit_on_fragment_only_last_is_flushed() {
+        let mut forwarding = Precommit::default();
+        let mut fragment = part(vec![s("fragment")], true);
+        fragment.precommit_token = Some(precommit(7));
+        fragment.last = true;
+        forwarding.observe(&mut fragment);
+        assert!(fragment.precommit_token.is_none());
+        assert!(!fragment.last);
+        let final_part = forwarding.finish().unwrap();
+        assert_eq!(final_part.precommit_token, Some(precommit(7)));
+        assert!(final_part.last);
+        assert!(final_part.values.is_empty());
+    }
+    #[test]
+    fn precommit_keeps_highest_and_never_reorders_lower() {
+        let mut forwarding = Precommit::default();
+        for seq in [7, 9, 8] {
+            forwarding.observe(&mut PartialResultSet {
+                precommit_token: Some(precommit(seq)),
+                ..Default::default()
+            });
+        }
+        let mut output = PartialResultSet::default();
+        forwarding.attach(&mut output);
+        assert_eq!(output.precommit_token, Some(precommit(9)));
+        forwarding.observe(&mut PartialResultSet {
+            precommit_token: Some(precommit(7)),
+            ..Default::default()
+        });
+        assert!(forwarding.finish().is_none());
+        let mut forwarding = Precommit::default();
+        forwarding.observe(&mut PartialResultSet {
+            last: true,
+            ..Default::default()
+        });
+        let output = forwarding.finish().unwrap();
+        assert!(output.last);
+        assert!(output.precommit_token.is_none());
     }
     #[test]
     fn string_chunks_and_tokens() {
