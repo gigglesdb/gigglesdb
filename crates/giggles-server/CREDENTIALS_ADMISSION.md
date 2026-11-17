@@ -120,8 +120,10 @@ and never moves the refill anchor backward. There is no wall-clock token expiry.
 
 ## Finite capacity worksheet
 
-Core persisted State is at most16MiB encoded. Eight staged SQL snapshots share
-one database cap, at most8x16=128MiB in encoded-state equivalents; decoded Rust
+Core persisted State is at most16MiB encoded. On legacy, eight staged SQL snapshots
+share one database cap, at most8x16=128MiB in encoded-state equivalents (v2
+admits 128 transactions, each holding an engine snapshot and its own write set,
+not a State copy); decoded Rust
 objects, candidate copies, storage buffers and allocator overhead add memory.
 Core SQL bounds remain1024rows/1MiB raw result values,64KiB row,64columns,
 256parameters and128tables. A result can expand when serialized (control-character
@@ -150,7 +152,8 @@ blocking32 runner above with native and PostgreSQL. A further Service-owned pool
 admits at most128 API calls before buffering/decoding, including malformed routes.
 There is no reserved Close capacity. Logical API sessions are separate:32 by
 default, configurable1..128, with no socket held while idle. Their real SQL
-sessions still share the existing database-wide eight staged snapshots.
+sessions still share the existing database-wide transaction cap (eight staged
+snapshots on legacy, 128 transactions on v2).
 
 Typed native operations and atomic blocks use these same call, worker and
 snapshot pools. Native and SQL work in one API session share one transaction;

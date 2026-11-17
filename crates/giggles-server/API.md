@@ -366,7 +366,8 @@ delay a started synchronous decision; there is no hard shutdown-time guarantee.
 For 128 calls, input reservations total at most 32 MiB and encoded response
 reservations at most 1024 MiB; these overlap with bounded engine results and
 decoded representations. The separate logical session cap does not multiply
-the database's existing eight staged snapshots. Typed operations and SQL share
+the database's existing transaction cap (eight staged snapshots on legacy, 128
+v2 transactions). Typed operations and SQL share
 those snapshots; an atomic block inside a session does not allocate a second
 outer transaction. The core's raw-value byte limits are not heap-object limits:
 many empty values can still produce substantial object and wire overhead. The

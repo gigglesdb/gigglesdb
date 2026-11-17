@@ -100,7 +100,7 @@ fn idle_bridge_matches_embedded_engine_and_releases_transaction_slots() {
         assert_eq!(actual, expected);
         assert!(!session.in_transaction());
     }
-    let mut held: Vec<_> = (0..crate::relational::MAX_TRANSACTIONS)
+    let mut held: Vec<_> = (0..right.max_transactions())
         .map(|_| right.sql_session())
         .collect();
     for session in &mut held {

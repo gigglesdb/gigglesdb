@@ -729,7 +729,7 @@ fn bounded_native_scan_matches_expected_composite_results() {
 fn transaction_slots_released_on_rollback_drop_commit_and_abort() {
     let (_, a, mut main) = db();
     run(&mut main, "CREATE TABLE slots (id BIGINT PRIMARY KEY)");
-    let mut sessions = (0..MAX_TRANSACTIONS)
+    let mut sessions = (0..a.max_transactions())
         .map(|_| {
             let mut s = a.sql_session();
             run(&mut s, "BEGIN");

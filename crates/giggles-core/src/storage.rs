@@ -749,6 +749,13 @@ impl Inner {
         }
     }
 
+    fn max_transactions(&self) -> usize {
+        match &self.backend {
+            Backend::Legacy(_) => relational::LEGACY_MAX_TRANSACTIONS,
+            Backend::V2(_) => relational::MAX_TRANSACTIONS,
+        }
+    }
+
     /// Inspect metadata only. Native/task operations must keep using `db(feature)`.
     fn inspect_metadata<T>(
         &self,
@@ -1408,6 +1415,11 @@ impl Admin {
             Backend::Legacy(_) => Engine::Legacy,
             Backend::V2(_) => Engine::V2,
         }
+    }
+    /// Concurrent explicit SQL/native transactions this database admits before
+    /// `BEGIN` returns `Busy`.
+    pub fn max_transactions(&self) -> usize {
+        self.inner.max_transactions()
     }
     pub fn authority_metadata(&self) -> Result<(u128, u64, u64, Option<u128>), CoreError> {
         // V2 has a durable SQL authority domain, but no native approval clock/ledger.
@@ -3978,7 +3990,7 @@ impl SqlSession {
                         .inner
                         .sql_transactions
                         .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                            if n < relational::MAX_TRANSACTIONS {
+                            if n < relational::LEGACY_MAX_TRANSACTIONS {
                                 Some(n + 1)
                             } else {
                                 None
@@ -4902,7 +4914,7 @@ mod typed_session_tests {
             session.rollback();
             assert!(scan(&mut session).rows.is_empty());
 
-            let mut sessions: Vec<_> = (0..relational::MAX_TRANSACTIONS)
+            let mut sessions: Vec<_> = (0..admin.max_transactions())
                 .map(|_| admin.sql_session())
                 .collect();
             for active in &mut sessions {

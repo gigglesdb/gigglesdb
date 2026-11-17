@@ -6,7 +6,7 @@ use giggles_core::{
         Bindings, Compare, Engine, Error, Expr, MAX_BINDING_BYTES, MAX_BINDINGS,
         MAX_BOUND_VALUE_BYTES, Request, ValueExpr,
     },
-    relational::{MAX_TRANSACTIONS, SqlRow, Value as V},
+    relational::{SqlRow, Value as V},
 };
 
 fn fixture() -> (Admin, Engine) {
@@ -220,7 +220,7 @@ fn balanced_boolean_filters_accept_256_names_and_reject_257_before_catalog_looku
 #[test]
 fn supplied_resource_limits_are_checked_before_transaction_admission() {
     let (admin, engine) = fixture();
-    let mut sessions: Vec<_> = (0..MAX_TRANSACTIONS).map(|_| admin.sql_session()).collect();
+    let mut sessions: Vec<_> = (0..admin.max_transactions()).map(|_| admin.sql_session()).collect();
     for session in &mut sessions {
         session.execute("BEGIN", &[], None).unwrap();
     }

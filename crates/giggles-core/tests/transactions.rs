@@ -8,7 +8,7 @@ use giggles_core::{
         MAX_EMIT_VALUES, MAX_EXPRESSION_NODES, MAX_INPUT, MAX_RETAINED_LOCAL_BYTES,
         MAX_TRANSACTION_ITEMS, Projection, Request, Sort, Transaction, TransactionStep, ValueExpr,
     },
-    relational::{DataType, MAX_TRANSACTIONS, SqlRow, Value as V},
+    relational::{DataType, SqlRow, Value as V},
 };
 use std::{
     collections::BTreeSet,
@@ -482,7 +482,7 @@ fn transaction_read_only_count_and_rows_preserve_snapshot_and_completeness() {
 fn transaction_uses_one_session_and_one_publication_without_leaking_slots() {
     let (_, admin, engine) = fixture();
     let mut held = Vec::new();
-    for _ in 0..MAX_TRANSACTIONS - 1 {
+    for _ in 0..admin.max_transactions() - 1 {
         let mut s = admin.sql_session();
         s.execute("BEGIN", &[], None).unwrap();
         held.push(s);

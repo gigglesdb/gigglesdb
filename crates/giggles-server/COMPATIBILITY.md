@@ -75,7 +75,7 @@ names63bytes, SQL64KiB. Parameter payloads retained by portals and materialized
 results share one8MiB aggregate limit per session; results are admitted
 before caching or emitting rows. A single bounded result can temporarily exceed retained
 capacity before rejection. Prepared SQL is at most32x64KiB per session. Core
-parameters256, row64KiB, result1024rows/1MiB raw values;8 staged transactions shared
+parameters256, row64KiB, result1024rows/1MiB raw values;8 staged transactions (legacy) or 128 transactions (v2) shared
 by the database; admitted core calls default32; whole persisted State16MiB.
 These finite limits are not a low-memory or overload-latency qualification.
 

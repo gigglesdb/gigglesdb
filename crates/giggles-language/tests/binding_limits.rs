@@ -306,7 +306,7 @@ fn supplied_binding_limits_precede_transaction_admission() {
     let (admin, engine) = fixture();
     let before = rows(&admin);
     let mut sessions = Vec::new();
-    for _ in 0..giggles_core::relational::MAX_TRANSACTIONS {
+    for _ in 0..admin.max_transactions() {
         let mut session = admin.sql_session();
         session.execute("begin", &[], None).unwrap();
         sessions.push(session);

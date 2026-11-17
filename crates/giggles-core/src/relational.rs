@@ -90,7 +90,16 @@ pub const MAX_COLUMNS: usize = 64;
 pub const MAX_PARAMS: usize = 65_535;
 pub const MAX_TABLES: usize = 128;
 pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
-pub const MAX_TRANSACTIONS: usize = 8;
+/// Concurrent explicit SQL/native transactions per v2 database. A v2
+/// transaction holds an engine snapshot and its own write set (bounded by the
+/// per-transaction write-set budget), not a copy of the database, so the cap
+/// matches the server's 128-connection limit. Use [`crate::Admin::max_transactions`]
+/// for the cap of a particular database.
+pub const MAX_TRANSACTIONS: usize = 128;
+/// Concurrent explicit transactions per legacy database. Each one stages a
+/// whole copy of the persisted State (up to 16 MiB encoded) plus up to 64 MiB of
+/// savepoint captures, so this stays small.
+pub const LEGACY_MAX_TRANSACTIONS: usize = 8;
 
 #[cfg(any(test, feature = "test-sql-parser-trap"))]
 thread_local! {

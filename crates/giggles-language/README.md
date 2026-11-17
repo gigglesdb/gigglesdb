@@ -516,7 +516,9 @@ statement byte budget (`insert_text_bytes`) and flat-tuple token budget
 tuple has its own 4,096-node budget. The manifest exposes separate
 `insert_input_rows` and `insert_proposed_bytes` fields for 0.6 and later; the
 legacy-valued row fields are kept, and `engine_rows.legacy` / `engine_rows.v2` give
-per-engine row ceilings (`null`: no fixed ceiling). On V2, filtered native reads,
+per-engine row ceilings (`null`: no fixed ceiling) and per-engine
+`concurrent_explicit_sessions` (legacy 8, v2 128; the top-level field keeps the
+legacy 8). On V2, filtered native reads,
 updates and deletes retain only matching rows while streaming, and a filter that
 fixes the full primary key with literals reads that one key.
 

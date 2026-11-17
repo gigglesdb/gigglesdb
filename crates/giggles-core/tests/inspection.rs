@@ -7,7 +7,7 @@ use giggles_core::{
         InspectionOutcome, InspectionRequest, InspectionResult, MAX_INSPECTION_METADATA_BYTES,
         Request, TableSummary,
     },
-    relational::{DataType, MAX_COLUMNS, MAX_ROWS, MAX_TABLES, MAX_TRANSACTIONS, Value},
+    relational::{DataType, MAX_COLUMNS, MAX_ROWS, MAX_TABLES, Value},
 };
 use std::path::PathBuf;
 
@@ -320,7 +320,7 @@ fn inspection_errors_and_cancellation_preserve_durable_state() {
 fn inspection_uses_no_sql_transaction_slot() {
     let (_, admin, engine) = database();
     let mut sessions = Vec::new();
-    for _ in 0..MAX_TRANSACTIONS {
+    for _ in 0..admin.max_transactions() {
         let mut sql = admin.sql_session();
         sql.execute("BEGIN", &[], None).unwrap();
         sessions.push(sql);

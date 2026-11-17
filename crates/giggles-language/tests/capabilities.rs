@@ -275,7 +275,16 @@ fn advertised_limits_are_enforced() {
     assert_eq!(engine.execute(&tree, &Bindings::new()), Err(Error::Limit));
 
     let mut sessions = Vec::new();
-    for _ in 0..limits.concurrent_explicit_sessions {
+    let per_engine = match admin.engine() {
+        giggles_core::Engine::Legacy => &limits.engine_rows.legacy,
+        giggles_core::Engine::V2 => &limits.engine_rows.v2,
+    };
+    assert_eq!(per_engine.concurrent_explicit_sessions, admin.max_transactions());
+    assert_eq!(
+        limits.concurrent_explicit_sessions,
+        giggles_core::relational::LEGACY_MAX_TRANSACTIONS
+    );
+    for _ in 0..admin.max_transactions() {
         let mut session = admin.sql_session();
         session.execute("begin", &[], None).unwrap();
         sessions.push(session);

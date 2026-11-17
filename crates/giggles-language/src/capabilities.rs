@@ -157,12 +157,14 @@ pub struct CapabilityLimits {
     /// flat-tuple token budget instead of text_bytes and text_tokens.
     pub insert_text_bytes: usize,
     pub insert_text_tokens: usize,
-    /// Row ceilings by storage engine. The single-valued row fields above keep
-    /// the conservative legacy values for existing clients.
+    /// Row and transaction ceilings by storage engine. The single-valued fields
+    /// above (including `concurrent_explicit_sessions`) keep the conservative
+    /// legacy values for existing clients.
     pub engine_rows: EngineRowLimits,
 }
 
-/// Row ceilings for the operations that the selected version supports.
+/// Row ceilings for the operations that the selected version supports, and the
+/// per-engine concurrent explicit transaction cap.
 #[derive(Clone, Debug, Serialize)]
 pub struct EngineRowLimits {
     pub legacy: EngineRows,
@@ -176,15 +178,19 @@ pub struct EngineRows {
     pub result_page_rows: Option<usize>,
     pub mutation_rows: Option<usize>,
     pub insert_input_rows: Option<usize>,
+    /// Concurrent explicit SQL/native transactions per database on this engine.
+    pub concurrent_explicit_sessions: usize,
 }
 
 impl EngineRows {
     fn legacy() -> Self {
         Self { native_table_rows: Some(MAX_ROWS), result_page_rows: Some(MAX_ROWS),
-            mutation_rows: Some(MAX_ROWS), insert_input_rows: Some(crate::MAX_INSERT_ROWS) }
+            mutation_rows: Some(MAX_ROWS), insert_input_rows: Some(crate::MAX_INSERT_ROWS),
+            concurrent_explicit_sessions: relational::LEGACY_MAX_TRANSACTIONS }
     }
     fn v2() -> Self {
-        Self { native_table_rows: None, result_page_rows: None, mutation_rows: None, insert_input_rows: None }
+        Self { native_table_rows: None, result_page_rows: None, mutation_rows: None, insert_input_rows: None,
+            concurrent_explicit_sessions: relational::MAX_TRANSACTIONS }
     }
 }
 
@@ -1804,7 +1810,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
                 .then_some(giggles_core::operations::MAX_INSPECTION_METADATA_BYTES),
             columns_per_table: relational::MAX_COLUMNS,
             catalog_tables: relational::MAX_TABLES,
-            concurrent_explicit_sessions: relational::MAX_TRANSACTIONS,
+            concurrent_explicit_sessions: relational::LEGACY_MAX_TRANSACTIONS,
             insert_text_bytes: crate::MAX_INSERT_INPUT.max(MAX_INPUT),
             insert_text_tokens: crate::MAX_INSERT_TOKENS,
             engine_rows: EngineRowLimits { legacy: EngineRows::legacy(), v2: EngineRows::v2() },
