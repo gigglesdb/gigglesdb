@@ -38,11 +38,11 @@ if [[ $mode == spanner ]]; then
   read -r _ || true
   exit
 fi
-if ! nunya_exe=$(command -v "$nunya_exe"); then
-  echo 'Nunya executable not found; set NUNYA_EXE or --nunya-exe' >&2
-  exit 1
-fi
 if [[ $mode == private ]]; then
+  if ! nunya_exe=$(command -v "$nunya_exe"); then
+    echo 'Nunya executable not found; set NUNYA_EXE or --nunya-exe' >&2
+    exit 1
+  fi
   source "$source_dir/private/run.sh"
   private_main
   exit

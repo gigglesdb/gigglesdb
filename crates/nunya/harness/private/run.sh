@@ -39,11 +39,72 @@ scenario_bootstrap() {
     "$child_bash" -c "$child" bootstrap "$NUNYA_PG_PORT") || return 1
   [[ $first =~ ^session:[0-9a-f]{32}$ && $first == "$second" ]]
 }
+# Run the driver behind exec, keeping session credentials out of argv and logs.
+scenario_psycopg_driver() {
+  local mode=$1 context=$2 ttl=$3 line pid input output status=0 control=0 summary=0
+  local counted_pass=0 counted_fail=0
+  scenario_pass=0 scenario_fail=1
+  coproc PSYCOPG {
+    "$nunya_exe" exec "${helper_opts[@]}" --context "$context" --ttl "$ttl" -- \
+      "${NUNYA_PYTHON:-python}" -I "$(native_path "$source_dir/drivers/psycopg_check.py")" --mode "$mode"
+  }
+  pid=$PSYCOPG_PID
+  # Duplicates remain valid after bash unsets the coprocess variables on exit.
+  exec {output}<&"${PSYCOPG[0]}" {input}>&"${PSYCOPG[1]}"
+  while IFS= read -r -t 120 line <&"$output"; do
+    line=${line%$'\r'}
+    printf '%s\n' "$line"
+    case "$line" in
+      'PASS step '*) counted_pass=$((counted_pass + 1)) ;;
+      'FAIL step '*) counted_fail=$((counted_fail + 1)) ;;
+      'WAIT restart')
+        if [[ $mode != main || $control != 0 ]]; then status=1; break; fi
+        "${compose[@]}" restart nunya >"$run/restart.log" 2>&1 || { status=1; break; }
+        "${compose[@]}" up -d --wait --wait-timeout 180 --no-recreate nunya \
+          >>"$run/restart.log" 2>&1 || { status=1; break; }
+        control=1
+        printf 'GO\n' >&"$input" || { status=1; break; }
+        ;;
+      'WAIT revoke')
+        if [[ $mode != main || $control != 1 ]]; then status=1; break; fi
+        "$nunya_exe" session revoke "${helper_opts[@]:0:8}" --context "$context" \
+          >"$run/revoke.log" 2>&1 || { status=1; break; }
+        control=2
+        printf 'GO\n' >&"$input" || { status=1; break; }
+        ;;
+      'WAIT expiry')
+        if [[ $mode != expiry || $control != 0 ]]; then status=1; break; fi
+        # TTL starts before the first query; 25s from here includes 5s margin.
+        sleep 25
+        control=1
+        printf 'GO\n' >&"$input" || { status=1; break; }
+        ;;
+      *)
+        if [[ $line =~ ^([0-9]+)\ passed\;\ ([0-9]+)\ failed$ ]]; then
+          scenario_pass=${BASH_REMATCH[1]} scenario_fail=${BASH_REMATCH[2]}
+          summary=$((summary + 1))
+        else status=1; break; fi
+        ;;
+    esac
+  done
+  exec {input}>&- {output}<&-
+  wait "$pid" || status=1
+  [[ $summary == 1 && $scenario_pass == "$counted_pass" && $scenario_fail == "$counted_fail" ]] || status=1
+  if [[ $mode == main ]]; then
+    [[ $control == 2 && $((counted_pass + counted_fail)) == 12 ]] || status=1
+  else
+    [[ $control == 1 && $((counted_pass + counted_fail)) == 3 ]] || status=1
+  fi
+  (( status == 0 && scenario_fail == 0 ))
+}
+scenario_psycopg() { scenario_psycopg_driver main d1-psycopg 1h; }
+scenario_psycopg_expiry() { scenario_psycopg_driver expiry d1-psycopg-exp 20s; }
 run_scenario() {
   local name=$1 pass=0 fail=0
+  local scenario_pass= scenario_fail=
   if "scenario_$name" >"$run/scenario-$name.log" 2>&1; then pass=1; else fail=1; fi
   if (( pass )); then printf 'SCENARIO %s: PASS\n' "$name"; else printf 'SCENARIO %s: FAIL\n' "$name"; fi
-  printf 'SUMMARY %s %s %s\n' "$name" "$pass" "$fail"
+  printf 'SUMMARY %s %s %s\n' "$name" "${scenario_pass:-$pass}" "${scenario_fail:-$fail}"
   (( fail == 0 ))
 }
 private_main() {
@@ -94,6 +155,6 @@ private_main() {
     --pg-host 127.0.0.1 --pg-port "$NUNYA_PG_PORT")
   # Later items add one function and one name here per scenario.
   local failed=0 scenario
-  for scenario in bootstrap; do run_scenario "$scenario" || failed=1; done
+  for scenario in bootstrap psycopg psycopg_expiry; do run_scenario "$scenario" || failed=1; done
   return "$failed"
 }
