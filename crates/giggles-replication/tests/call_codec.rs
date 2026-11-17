@@ -10,8 +10,8 @@ use giggles_core::range_api::{
 };
 use giggles_replication::{
     call_codec::{
-        CallCounts, GatewayCall, GatewayReply, NodeCall, NodeReport, PeerCall, PeerReply,
-        RangeReport, RangeRole, decode_call, decode_reply, encode_call, encode_reply,
+        CallCounts, GatewayCall, GatewayReply, MoveReply, NodeCall, NodeReport, PeerCall,
+        PeerReply, RangeReport, RangeRole, decode_call, decode_reply, encode_call, encode_reply,
     },
     client::{RangeCall, RangeReply},
 };
@@ -225,6 +225,11 @@ fn calls() -> Vec<PeerCall> {
         PeerCall::Gateway(GatewayCall::Blockers(txn)),
         PeerCall::Gateway(GatewayCall::CancelWait(txn)),
         PeerCall::Gateway(GatewayCall::TxnLive(txn)),
+        PeerCall::Node(NodeCall::MoveRange {
+            range: RangeId(2),
+            from: 3,
+            to: 4,
+        }),
         PeerCall::Node(NodeCall::Status),
         PeerCall::Node(NodeCall::HostRange(desc())),
     ]);
@@ -247,6 +252,7 @@ fn node_report() -> NodeReport {
         },
         recent,
         window_ms: 60_000,
+        move_step: Some("CatchUp".into()),
     };
     NodeReport {
         node: 4,
@@ -315,6 +321,17 @@ fn replies() -> Vec<Result<PeerReply, RangeError>> {
     .collect();
     out.extend([
         Ok(PeerReply::Gateway(GatewayReply::Done)),
+        Ok(PeerReply::Moving(MoveReply::default())),
+        Ok(PeerReply::Moving(MoveReply {
+            leader: Some(2),
+            step: Some("CatchUp".into()),
+            done: false,
+            error: Some("failed".into()),
+        })),
+        Ok(PeerReply::Moving(MoveReply {
+            done: true,
+            ..MoveReply::default()
+        })),
         Ok(PeerReply::Hosted(true)),
         Ok(PeerReply::Hosted(false)),
         Ok(PeerReply::Gateway(GatewayReply::Live(true))),
@@ -354,7 +371,7 @@ fn assert_strict<T: std::fmt::Debug>(
     longer.push(0);
     assert!(decode(&longer).is_err(), "trailing byte after {bytes:?}");
     let mut version = bytes.to_vec();
-    version[0] = 2;
+    version[0] = 255;
     assert!(decode(&version).is_err());
 }
 
@@ -447,4 +464,30 @@ fn zero_timestamp_requests_and_inverted_leases_are_rejected() {
         end: 3,
     })));
     assert!(decode_reply(&encode_reply(&reply).unwrap()).is_err());
+}
+
+#[test]
+fn legacy_node_report_decodes_without_move_step() {
+    let report = NodeReport {
+        node: 4,
+        ranges: node_report().ranges[..1].to_vec(),
+    };
+    let mut bytes = encode_reply(&Ok(PeerReply::Node(report.clone()))).unwrap();
+    assert_eq!(bytes[0], 2);
+    bytes[0] = 1;
+    bytes.truncate(bytes.len() - (1 + 4 + "CatchUp".len()));
+    let mut expected = report;
+    expected.ranges[0].move_step = None;
+    assert_eq!(
+        decode_reply(&bytes).unwrap().unwrap(),
+        PeerReply::Node(expected)
+    );
+}
+
+#[test]
+fn move_reply_rejects_invalid_flags_and_utf8() {
+    assert!(decode_reply(&[1, 0, 50, 2]).is_err());
+    assert!(decode_reply(&[1, 0, 50, 0, 0, 2, 0]).is_err());
+    assert!(decode_reply(&[1, 0, 50, 0, 1, 0, 0, 0, 1, 255, 0, 0]).is_err());
+    assert!(decode_reply(&[2, 0, 50, 0, 0, 0, 0]).is_err());
 }

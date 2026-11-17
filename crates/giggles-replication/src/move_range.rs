@@ -39,9 +39,31 @@ pub fn move_replica(
     to: u64,
     timeout: Duration,
 ) -> Result<MoveOutcome> {
+    run_move(
+        node.node_id(),
+        node.host(),
+        node.client(),
+        node.transport(),
+        range,
+        from,
+        to,
+        timeout,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_move(
+    node_id: u64,
+    host: &std::sync::Arc<crate::host::RangeHost>,
+    client: &std::sync::Arc<crate::client::RoutedRangeClient>,
+    transport: &std::sync::Arc<crate::transport::Transport>,
+    range: RangeId,
+    from: u64,
+    to: u64,
+    timeout: Duration,
+) -> Result<MoveOutcome> {
     let start = Instant::now();
-    let handle = node
-        .host()
+    let handle = host
         .group(range)
         .ok_or_else(|| Error::Identity("range not hosted".into()))?;
     let not_leader = || MoveOutcome::NotLeader {
@@ -50,8 +72,7 @@ pub fn move_replica(
     if handle.role().state != StateRole::Leader {
         return Ok(not_leader());
     }
-    let store = node
-        .host()
+    let store = host
         .store()
         .ok_or_else(|| Error::Identity("range store missing".into()))?;
     let read = || {
@@ -74,13 +95,13 @@ pub fn move_replica(
         && status.membership.active.is_none()
     {
         // Also repairs a crash after Retire but before directory publication.
-        Splitter::new(node.host().clone(), node.client().clone()).reconcile(Some(range))?;
+        Splitter::new(host.clone(), client.clone()).reconcile(Some(range))?;
         return Ok(MoveOutcome::Done(desc));
     }
     if from == to {
         return Err(Error::Identity("source and target must differ".into()));
     }
-    if node.node_id() == from {
+    if node_id == from {
         let target = desc
             .replicas
             .iter()
@@ -88,15 +109,10 @@ pub fn move_replica(
                 r.node != from && r.role == ReplicaRole::Voter && status.reachable.contains(&r.node)
             })
             .min_by_key(|r| {
-                let leaderships = node
-                    .host()
+                let leaderships = host
                     .groups()
                     .iter()
-                    .filter(|id| {
-                        node.host()
-                            .group(**id)
-                            .is_some_and(|h| h.role().leader == r.node)
-                    })
+                    .filter(|id| host.group(**id).is_some_and(|h| h.role().leader == r.node))
                     .count();
                 (r.node != to, leaderships, r.node)
             })
@@ -111,13 +127,13 @@ pub fn move_replica(
         }
         return Ok(not_leader());
     }
-    let target = registry::read_all(&**node.client())
+    let target = registry::read_all(&**client)
         .map_err(|e| Error::Apply(e.to_string()))?
         .into_iter()
         .find(|r| r.id == to && r.state == NodeState::Active)
         .ok_or_else(|| Error::Identity("target is not active in the registry".into()))?;
     if status.membership.active.is_none() {
-        Splitter::new(node.host().clone(), node.client().clone()).reconcile(Some(range))?;
+        Splitter::new(host.clone(), client.clone()).reconcile(Some(range))?;
     }
     if !desc.replicas.iter().any(|r| r.node == to) {
         desc.replicas.push(ReplicaDesc {
@@ -130,7 +146,7 @@ pub fn move_replica(
             .checked_add(1)
             .ok_or_else(|| Error::Identity("epoch exhausted".into()))?;
     }
-    node.transport()
+    transport
         .calls()
         .host_range(to, desc)
         .map_err(|e| Error::Apply(e.to_string()))?;
@@ -147,6 +163,6 @@ pub fn move_replica(
         Err(ReplaceError::NotLeader { leader }) => return Ok(MoveOutcome::NotLeader { leader }),
         Err(e) => return Err(Error::Apply(e.to_string())),
     }
-    Splitter::new(node.host().clone(), node.client().clone()).reconcile(Some(range))?;
+    Splitter::new(host.clone(), client.clone()).reconcile(Some(range))?;
     Ok(MoveOutcome::Done(read()?))
 }

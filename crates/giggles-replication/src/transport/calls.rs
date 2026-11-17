@@ -12,7 +12,7 @@ use crate::call_codec::{
 use crate::client::{self, LocalRanges, RangeCall, RangeReply, RangeTransport};
 use crate::error::{Error, Result};
 use giggles_core::range_api::{
-    ClusterTxnId, DeadlockProbe, GatewayPeer, GatewayService, RangeError,
+    ClusterTxnId, DeadlockProbe, GatewayPeer, GatewayService, RangeError, RangeId,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -202,9 +202,9 @@ impl PeerCalls {
     fn timeout(&self, call: &RangeCall) -> Duration {
         let base = self.limits.read().unwrap().timeout;
         match call {
-            RangeCall::Lock(req) => base.saturating_add(
-                req.timeout_ms.map_or(LOCK_BACKSTOP, Duration::from_millis),
-            ),
+            RangeCall::Lock(req) => {
+                base.saturating_add(req.timeout_ms.map_or(LOCK_BACKSTOP, Duration::from_millis))
+            }
             _ => base,
         }
     }
@@ -364,6 +364,14 @@ async fn connection(peers: Arc<Peers>, node: u64, mut rx: mpsc::Receiver<Outgoin
 /// Answers `NodeCall::Status` (R5-64): every range this node replicates.
 pub trait NodeService: Send + Sync {
     fn status(&self) -> NodeReport;
+    fn move_range(
+        &self,
+        _range: RangeId,
+        _from: u64,
+        _to: u64,
+    ) -> std::result::Result<call_codec::MoveReply, RangeError> {
+        Err(RangeError::Unavailable("range move unavailable".into()))
+    }
     fn host_range(
         &self,
         _desc: giggles_core::range_api::RangeDescriptor,
@@ -416,7 +424,7 @@ impl CallServer {
 
     /// Serves one call connection from its first request on; `authorized` rechecks the
     /// caller's identity against the current peer table for every frame. A connection that
-    /// presents this node's own certificate (an operator CLI) may only ask for node status.
+    /// presents this node's own certificate (an operator CLI) may ask for status or request a range move.
     pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         stream: &mut S,
@@ -467,7 +475,13 @@ impl CallServer {
         tx: &mpsc::Sender<(u64, Vec<u8>)>,
     ) {
         let call = match call_codec::decode_call(body) {
-            Ok(call) if node_only && !matches!(call, PeerCall::Node(NodeCall::Status)) => {
+            Ok(call)
+                if node_only
+                    && !matches!(
+                        call,
+                        PeerCall::Node(NodeCall::Status | NodeCall::MoveRange { .. })
+                    ) =>
+            {
                 let refused = Err(RangeError::Unavailable("not a peer node".into()));
                 let _ = tx.send((id, reply_body(&refused))).await;
                 return;
@@ -530,6 +544,12 @@ fn handle(handlers: &Handlers, call: PeerCall) -> Reply {
                 GatewayCall::TxnLive(txn) => GatewayReply::Live(gateway.txn_live(txn)),
             }))
         }
+        PeerCall::Node(NodeCall::MoveRange { range, from, to }) => handlers
+            .node
+            .as_ref()
+            .ok_or_else(|| missing("node move"))?
+            .move_range(range, from, to)
+            .map(PeerReply::Moving),
         PeerCall::Node(NodeCall::HostRange(desc)) => handlers
             .node
             .as_ref()
@@ -572,8 +592,24 @@ mod tests {
         let body = call_codec::encode_call(&PeerCall::Node(NodeCall::HostRange(desc))).unwrap();
         server.start(1, &body, true, &tx).await;
         let (_, reply) = rx.recv().await.unwrap();
-        assert_eq!(call_codec::decode_reply(&reply).unwrap(),
-            Err(RangeError::Unavailable("not a peer node".into())));
+        assert_eq!(
+            call_codec::decode_reply(&reply).unwrap(),
+            Err(RangeError::Unavailable("not a peer node".into()))
+        );
+        let body = call_codec::encode_call(&PeerCall::Node(NodeCall::MoveRange {
+            range: RangeId(2),
+            from: 3,
+            to: 4,
+        }))
+        .unwrap();
+        server.start(3, &body, true, &tx).await;
+        let (_, reply) = rx.recv().await.unwrap();
+        assert_eq!(
+            call_codec::decode_reply(&reply).unwrap(),
+            Err(RangeError::Unavailable(
+                "no node move handler on this node".into()
+            ))
+        );
         let body = call_codec::encode_call(&PeerCall::Node(NodeCall::Status)).unwrap();
         server.start(2, &body, true, &tx).await;
         let (_, reply) = rx.recv().await.unwrap();

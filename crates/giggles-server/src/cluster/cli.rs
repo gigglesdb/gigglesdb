@@ -245,6 +245,7 @@ mod tests {
 
     fn range(id: u64, end: Option<Vec<u8>>, role: RangeRole, size: Option<u64>) -> RangeReport {
         RangeReport {
+            move_step: None,
             descriptor: RangeDescriptor {
                 id: RangeId(id),
                 epoch: Epoch(1),

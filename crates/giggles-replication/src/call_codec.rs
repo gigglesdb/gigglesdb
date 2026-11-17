@@ -4,7 +4,8 @@
 //! `[version u8 = 1][0][reply tag u8][fields]` or `[version u8 = 1][1][error tag u8][fields]`.
 //! Integers are big-endian u64 unless noted; byte strings and lists carry a u32 BE length or
 //! count; options and bounds carry a u8 flag. Version 1 is strict: unknown tags or versions,
-//! truncation and trailing bytes are rejected. Not persisted (peer frames only).
+//! truncation and trailing bytes are rejected. Node reports are emitted with version 2
+//! (adding move_step); version 1 reports still decode. Not persisted (peer frames only).
 use std::ops::{Bound, Range};
 
 use giggles_core::range_api::{
@@ -42,6 +43,16 @@ pub enum GatewayReply {
 pub enum NodeCall {
     Status,
     HostRange(RangeDescriptor),
+    MoveRange { range: RangeId, from: u64, to: u64 },
+}
+
+/// Progress or redirection for an operator's resumable move.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MoveReply {
+    pub leader: Option<u64>,
+    pub step: Option<String>,
+    pub done: bool,
+    pub error: Option<String>,
 }
 
 /// A replica's Raft role (a pre-candidate reports as candidate).
@@ -85,6 +96,7 @@ pub struct RangeReport {
     /// Calls served within the last `window_ms` (about a minute).
     pub recent: u64,
     pub window_ms: u64,
+    pub move_step: Option<String>,
 }
 
 impl RangeReport {
@@ -118,6 +130,7 @@ pub enum PeerReply {
     Gateway(GatewayReply),
     Node(NodeReport),
     Hosted(bool),
+    Moving(MoveReply),
 }
 
 fn corrupt(what: &str) -> RangeError {
@@ -229,7 +242,9 @@ impl<'a> Reader<'a> {
         Ok(self.take(1)?[0])
     }
     fn u64(&mut self) -> Result<u64, RangeError> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().expect("8 bytes")))
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("8 bytes"),
+        ))
     }
     /// A count of items that each take at least `min` bytes (bounds the allocation).
     fn count(&mut self, min: usize) -> Result<usize, RangeError> {
@@ -695,6 +710,12 @@ pub fn encode_call(call: &PeerCall) -> Result<Vec<u8>, RangeError> {
                 w.u64(txn.0);
             }
         },
+        PeerCall::Node(NodeCall::MoveRange { range, from, to }) => {
+            w.u8(50);
+            w.u64(range.0);
+            w.u64(*from);
+            w.u64(*to);
+        }
         PeerCall::Node(NodeCall::Status) => w.u8(48),
         PeerCall::Node(NodeCall::HostRange(desc)) => {
             w.u8(49);
@@ -727,6 +748,11 @@ pub fn decode_call(bytes: &[u8]) -> Result<PeerCall, RangeError> {
         34 => PeerCall::Gateway(GatewayCall::Blockers(r.txn()?)),
         35 => PeerCall::Gateway(GatewayCall::CancelWait(r.txn()?)),
         36 => PeerCall::Gateway(GatewayCall::TxnLive(r.txn()?)),
+        50 => PeerCall::Node(NodeCall::MoveRange {
+            range: RangeId(r.u64()?),
+            from: r.u64()?,
+            to: r.u64()?,
+        }),
         48 => PeerCall::Node(NodeCall::Status),
         49 => PeerCall::Node(NodeCall::HostRange(r.descriptor()?)),
         tag => PeerCall::Range(range_call(tag, &mut r)?),
@@ -983,14 +1009,22 @@ fn put_node_report(w: &mut Writer, report: &NodeReport) -> Result<(), RangeError
         w.u64(range.applied);
         w.opt_u64(range.size);
         let c = &range.calls;
-        for v in [c.reads, c.locks, c.writes, c.other, range.recent, range.window_ms] {
+        for v in [
+            c.reads,
+            c.locks,
+            c.writes,
+            c.other,
+            range.recent,
+            range.window_ms,
+        ] {
             w.u64(v);
         }
+        w.opt_bytes(range.move_step.as_deref().map(str::as_bytes))?;
     }
     Ok(())
 }
 
-fn node_report(r: &mut Reader<'_>) -> Result<NodeReport, RangeError> {
+fn node_report(r: &mut Reader<'_>, version: u8) -> Result<NodeReport, RangeError> {
     let node = r.u64()?;
     // Each range takes at least 4 + 1 + 3 * 8 + 1 + 6 * 8 bytes.
     let n = r.count(78)?;
@@ -1016,10 +1050,21 @@ fn node_report(r: &mut Reader<'_>) -> Result<NodeReport, RangeError> {
                 },
                 recent: r.u64()?,
                 window_ms: r.u64()?,
+                move_step: if version == 1 {
+                    None
+                } else {
+                    optional_string(r)?
+                },
             })
         })
         .collect::<Result<_, RangeError>>()?;
     Ok(NodeReport { node, ranges })
+}
+
+fn optional_string(r: &mut Reader<'_>) -> Result<Option<String>, RangeError> {
+    r.opt_bytes()?
+        .map(|b| String::from_utf8(b).map_err(|_| corrupt("invalid UTF-8")))
+        .transpose()
 }
 
 /// Encodes a reply body.
@@ -1044,12 +1089,21 @@ pub fn encode_reply(reply: &Result<PeerReply, RangeError>) -> Result<Vec<u8>, Ra
             w.u8(34);
             w.u8(u8::from(*live));
         }
+        Ok(PeerReply::Moving(reply)) => {
+            w.u8(0);
+            w.u8(50);
+            w.opt_u64(reply.leader);
+            w.opt_bytes(reply.step.as_deref().map(str::as_bytes))?;
+            w.u8(u8::from(reply.done));
+            w.opt_bytes(reply.error.as_deref().map(str::as_bytes))?;
+        }
         Ok(PeerReply::Hosted(created)) => {
             w.u8(0);
             w.u8(49);
             w.u8(u8::from(*created));
         }
         Ok(PeerReply::Node(report)) => {
+            w.0[0] = 2; // Extended reports: old strict decoders reject the version.
             w.u8(0);
             w.u8(48);
             put_node_report(&mut w, report)?;
@@ -1065,8 +1119,12 @@ pub fn encode_reply(reply: &Result<PeerReply, RangeError>) -> Result<Vec<u8>, Ra
 /// Decodes a reply body. The outer `Err` means the body itself is invalid.
 pub fn decode_reply(bytes: &[u8]) -> Result<Result<PeerReply, RangeError>, RangeError> {
     let mut r = Reader(bytes);
-    if r.u8()? != VERSION {
+    let version = r.u8()?;
+    if version != VERSION && version != 2 {
         return Err(corrupt("unknown version"));
+    }
+    if version == 2 && !bytes.starts_with(&[2, 0, 48]) {
+        return Err(corrupt("version 2 is only for node reports"));
     }
     let reply = if r.flag()? {
         Err(error(&mut r)?)
@@ -1075,7 +1133,13 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Result<PeerReply, RangeError>, Range
             32 => PeerReply::Gateway(GatewayReply::Done),
             33 => PeerReply::Gateway(GatewayReply::Blockers(r.txns()?)),
             34 => PeerReply::Gateway(GatewayReply::Live(r.flag()?)),
-            48 => PeerReply::Node(node_report(&mut r)?),
+            48 => PeerReply::Node(node_report(&mut r, version)?),
+            50 => PeerReply::Moving(MoveReply {
+                leader: r.opt_u64()?,
+                step: optional_string(&mut r)?,
+                done: r.flag()?,
+                error: optional_string(&mut r)?,
+            }),
             49 => PeerReply::Hosted(r.flag()?),
             tag => PeerReply::Range(range_reply(tag, &mut r)?),
         })

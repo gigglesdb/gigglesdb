@@ -11,7 +11,7 @@ use giggles_replication::{
     bootstrap::presplit,
     call_codec::{NodeCall, PeerCall},
     client::{LocalRanges, RangeTransport, RoutedRangeClient},
-    cluster_node::{ClusterNode, ClusterNodeConfig, RegistryWatcher},
+    cluster_node::{ClusterNode, ClusterNodeConfig, RegistryWatcher, query_status, request_move},
     move_range::{MoveOutcome, move_replica},
     registry::{self, NodeRecord, NodeState},
     transport::CallLimits,
@@ -49,7 +49,12 @@ fn eventually(mut ready: impl FnMut() -> bool) {
     }
 }
 
-fn start() -> (Root, Vec<ClusterNode>, Vec<RegistryWatcher>) {
+fn start() -> (
+    Root,
+    Vec<ClusterNode>,
+    Vec<RegistryWatcher>,
+    Vec<ClusterNodeConfig>,
+) {
     let root = Root(std::env::temp_dir().join(format!(
         "range-move-{}-{}",
         std::process::id(),
@@ -67,6 +72,7 @@ fn start() -> (Root, Vec<ClusterNode>, Vec<RegistryWatcher>) {
         .collect();
     drop(listeners);
     let layout = presplit(&[], &MEMBERS, 3).unwrap();
+    let mut configs = Vec::new();
     let nodes: Vec<_> = NODES
         .iter()
         .map(|&node| {
@@ -74,7 +80,7 @@ fn start() -> (Root, Vec<ClusterNode>, Vec<RegistryWatcher>) {
             if node != 4 {
                 transport.peers.retain(|id, _| *id != 4);
             }
-            ClusterNode::start(ClusterNodeConfig {
+            let config = ClusterNodeConfig {
                 transport,
                 data_dir: root.0.join(format!("n{node}/data")),
                 log_dir: root.0.join(format!("n{node}/log")),
@@ -91,8 +97,9 @@ fn start() -> (Root, Vec<ClusterNode>, Vec<RegistryWatcher>) {
                     timeout: CALL,
                     ..CallLimits::default()
                 }),
-            })
-            .unwrap()
+            };
+            configs.push(config.clone());
+            ClusterNode::start(config).unwrap()
         })
         .collect();
     assert!(nodes[3].host().groups().is_empty());
@@ -119,13 +126,10 @@ fn start() -> (Root, Vec<ClusterNode>, Vec<RegistryWatcher>) {
     .unwrap();
     watchers.push(nodes[3].start_registry_watcher(Duration::from_millis(100)));
     eventually(|| {
-        nodes[0]
-            .transport()
-            .calls()
-            .call(4, PeerCall::Node(NodeCall::Status), CALL)
-            .is_ok()
+        nodes[..3].iter().all(|node| node.transport().calls()
+            .call(4, PeerCall::Node(NodeCall::Status), CALL).is_ok())
     });
-    (root, nodes, watchers)
+    (root, nodes, watchers, configs)
 }
 
 fn leader(nodes: &[ClusterNode]) -> &ClusterNode {
@@ -140,7 +144,7 @@ fn leader(nodes: &[ClusterNode]) -> &ClusterNode {
 }
 
 fn exercise(move_leader: bool) {
-    let (_root, nodes, mut watchers) = start();
+    let (_root, nodes, mut watchers, _) = start();
     let range = RangeId(2);
     if !move_leader && leader(&nodes).node_id() == 3 {
         leader(&nodes)
@@ -293,4 +297,69 @@ fn moves_follower_to_unhosted_node() {
 #[test]
 fn transfers_leadership_before_moving_leader() {
     exercise(true);
+}
+
+#[test]
+fn admin_move_redirects_and_resumes_after_leader_restart() {
+    let (_root, mut nodes, mut watchers, configs) = start();
+    let range = RangeId(2);
+    let leader_id = leader(&nodes).node_id();
+    let follower = MEMBERS.iter().copied().find(|id| *id != leader_id).unwrap();
+    let mut admin = configs[(follower - 1) as usize].transport.clone();
+    admin.peers.extend(configs[3].transport.peers.clone());
+    let from = follower;
+    // An own-certificate connection to this follower must redirect to the leader.
+    let reply = request_move(&admin, &[follower], range, from, 4, READY).unwrap();
+    assert_eq!(reply.leader, Some(leader_id));
+    assert!(reply.step.is_some());
+    assert!(!reply.done);
+    // Wait for a durable replacement step, not just the background job's Starting
+    // reply. The elected successor must resume this membership state.
+    let handle = leader(&nodes).host().group(range).unwrap();
+    let deadline = Instant::now() + READY;
+    while giggles_replication::move_range::move_status(&handle).is_none() {
+        assert!(Instant::now() < deadline, "no persisted move step observed");
+        thread::sleep(Duration::from_millis(1));
+    }
+    drop(handle);
+    let index = nodes.iter().position(|n| n.node_id() == leader_id).unwrap();
+    watchers[index].stop();
+    nodes.remove(index).stop();
+    let replacement_leader = leader(&nodes).node_id();
+    assert_ne!(replacement_leader, leader_id);
+    let restarted = ClusterNode::start(configs[(leader_id - 1) as usize].clone()).unwrap();
+    let watcher = restarted.start_registry_watcher(Duration::from_millis(100));
+    nodes.push(restarted);
+    watchers.push(watcher);
+    eventually(|| {
+        let handle = leader(&nodes).host().group(range).unwrap();
+        giggles_replication::replace::status(&handle).is_ok_and(|s|
+            s.reachable.contains(&leader_id) && s.reachable.iter().filter(|&&id| id != from).count() >= 2)
+    });
+    let deadline = Instant::now() + READY;
+    loop {
+        if let Ok(reply) = request_move(&admin, &[replacement_leader], range, from, 4, CALL * 3)
+        {
+            assert!(reply.error.is_none(), "{reply:?}");
+            if reply.done {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "admin move did not resume");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let reports = query_status(&admin, &MEMBERS, CALL).unwrap();
+    assert!(
+        reports
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok())
+            .flat_map(|r| &r.ranges)
+            .any(|r| r.descriptor.id == range && r.descriptor.replicas.iter().any(|r| r.node == 4))
+    );
+    for watcher in &mut watchers {
+        watcher.stop();
+    }
+    for node in nodes {
+        node.stop();
+    }
 }

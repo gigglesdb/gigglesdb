@@ -6,7 +6,8 @@
 use crate::{
     bootstrap::{directory_records, hosted_by},
     call_codec::{
-        self, CallCounts, NodeCall, NodeReport, PeerCall, PeerReply, RangeReport, RangeRole,
+        self, CallCounts, MoveReply, NodeCall, NodeReport, PeerCall, PeerReply, RangeReport,
+        RangeRole,
     },
     client::{LocalRanges, RangeTransport, RoutedRangeClient},
     directory,
@@ -273,6 +274,16 @@ struct StatusService {
     host: Weak<RangeHost>,
     store: Arc<RangeStore>,
     load: Arc<LoadCounters>,
+    client: Weak<RoutedRangeClient>,
+    transport: Weak<Transport>,
+    moves: Mutex<HashMap<RangeId, MoveJob>>,
+}
+
+struct MoveJob {
+    from: u64,
+    to: u64,
+    thread: thread::JoinHandle<()>,
+    error: Arc<Mutex<Option<String>>>,
 }
 
 impl StatusService {
@@ -302,6 +313,9 @@ impl StatusService {
                 calls,
                 recent,
                 window_ms,
+                move_step: (role.state == raft::StateRole::Leader)
+                    .then(|| crate::move_range::move_status(&handle))
+                    .flatten(),
             });
         }
         NodeReport {
@@ -312,6 +326,117 @@ impl StatusService {
 }
 
 impl NodeService for StatusService {
+    fn move_range(
+        &self,
+        range: RangeId,
+        from: u64,
+        to: u64,
+    ) -> std::result::Result<MoveReply, RangeError> {
+        let unavailable = |s: &str| RangeError::Unavailable(s.into());
+        let host = self
+            .host
+            .upgrade()
+            .ok_or_else(|| unavailable("host stopped"))?;
+        let handle = host
+            .group(range)
+            .ok_or_else(|| unavailable("range not hosted"))?;
+        let role = handle.role();
+        let mut reply = MoveReply {
+            leader: (role.leader != 0).then_some(role.leader),
+            ..MoveReply::default()
+        };
+        if role.state != raft::StateRole::Leader {
+            return Ok(reply);
+        }
+        reply.leader = Some(self.node_id);
+        reply.step = crate::move_range::move_status(&handle);
+        let mut jobs = self.moves.lock().unwrap();
+        if let Some(job) = jobs.get(&range) {
+            if job.from != from || job.to != to {
+                if !job.thread.is_finished() {
+                    reply.error = Some("another move is running for this range".into());
+                    return Ok(reply);
+                }
+            } else {
+                reply.error = job.error.lock().unwrap().clone();
+                let finished = job.thread.is_finished();
+                if reply.error.is_some() {
+                    // Deliver the failure before allowing an operator's next request
+                    // to retry the persisted step with a fresh driver.
+                    if finished {
+                        jobs.remove(&range);
+                    }
+                    return Ok(reply);
+                }
+                if !finished {
+                    return Ok(reply);
+                }
+            }
+        }
+        let desc = self
+            .store
+            .descriptor(range)
+            .map_err(|e| unavailable(&e.to_string()))?;
+        reply.done = reply.step.is_none()
+            && desc.is_some_and(|d| {
+                d.replicas
+                    .iter()
+                    .any(|r| r.node == to && r.role == giggles_core::range_api::ReplicaRole::Voter)
+                    && !d.replicas.iter().any(|r| r.node == from)
+            });
+        if reply.done {
+            return Ok(reply);
+        }
+        let transport = self
+            .transport
+            .upgrade()
+            .ok_or_else(|| unavailable("transport stopped"))?;
+        let client = self
+            .client
+            .upgrade()
+            .ok_or_else(|| unavailable("node stopped"))?;
+        let node_id = self.node_id;
+        let error = Arc::new(Mutex::new(None));
+        let saved_error = error.clone();
+        let thread = thread::spawn(move || {
+            loop {
+                match crate::move_range::run_move(
+                    node_id,
+                    &host,
+                    &client,
+                    &transport,
+                    range,
+                    from,
+                    to,
+                    Duration::from_secs(60),
+                ) {
+                    Ok(crate::move_range::MoveOutcome::Done(_)) => break,
+                    Ok(crate::move_range::MoveOutcome::NotLeader { .. }) => {
+                        if handle.role().state != raft::StateRole::Leader {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => {
+                        *saved_error.lock().unwrap() = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+        });
+        jobs.insert(
+            range,
+            MoveJob {
+                from,
+                to,
+                thread,
+                error,
+            },
+        );
+        reply.step.get_or_insert_with(|| "Starting".into());
+        Ok(reply)
+    }
+
     fn host_range(&self, desc: RangeDescriptor) -> std::result::Result<bool, RangeError> {
         self.host
             .upgrade()
@@ -413,7 +538,9 @@ impl ClusterNode {
         } else {
             let store = RangeStore::open(&config.data_dir).map_err(core)?;
             if store.domain() != cluster {
-                return Err(Error::Identity("range store belongs to another cluster".into()));
+                return Err(Error::Identity(
+                    "range store belongs to another cluster".into(),
+                ));
             }
             store
         };
@@ -472,6 +599,9 @@ impl ClusterNode {
             host: Arc::downgrade(&host),
             store,
             load,
+            client: Arc::downgrade(&client),
+            transport: Arc::downgrade(&transport),
+            moves: Mutex::default(),
         });
         transport.set_node_handler(Some(status.clone() as Arc<dyn NodeService>));
         Ok(Self {
@@ -749,7 +879,11 @@ impl ClusterNode {
 
     /// Stops every group and the transport.
     pub fn stop(self) {
+        self.transport.set_node_handler(None);
         self.host.stop();
+        for (_, job) in self.status.moves.lock().unwrap().drain() {
+            let _ = job.thread.join();
+        }
     }
 }
 
@@ -810,5 +944,83 @@ pub fn query_status(
         }
         answers.sort_by_key(|(i, _, _)| *i);
         Ok(answers.into_iter().map(|(_, t, a)| (t, a)).collect())
+    })
+}
+
+/// Requests a move using the operator certificate, following the range leader hint.
+/// The timeout bounds the complete request, including redirects and unavailable members.
+pub fn request_move(
+    config: &TransportConfig,
+    members: &[u64],
+    range: RangeId,
+    from: u64,
+    to: u64,
+    timeout: Duration,
+) -> Result<MoveReply> {
+    let (_, connector) = transport::tls(config)?;
+    let body = call_codec::encode_call(&PeerCall::Node(NodeCall::MoveRange { range, from, to }))
+        .map_err(core)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let ask = async {
+            let mut targets: std::collections::VecDeque<_> = members.iter().copied().collect();
+            let mut visited = std::collections::BTreeSet::new();
+            let mut last = "no reachable range leader".to_string();
+            while let Some(target) = targets.pop_front() {
+                if !visited.insert(target) {
+                    continue;
+                }
+                let exchange = async {
+                    let mut stream =
+                        transport::tls::connect_admin(config, &connector, target).await?;
+                    let out = Header {
+                        cluster: config.cluster,
+                        from: config.node_id,
+                        to: target,
+                    };
+                    transport::write_frame(
+                        &mut stream,
+                        &transport::encode(
+                            &out,
+                            &Body::CallRequest {
+                                id: 1,
+                                body: body.clone(),
+                            },
+                        )?,
+                    )
+                    .await?;
+                    let back = Header {
+                        from: target,
+                        to: config.node_id,
+                        ..out
+                    };
+                    match transport::decode(&back, &transport::read_frame(&mut stream).await?)? {
+                        Body::CallResponse { id: 1, body } => {
+                            call_codec::decode_reply(&body).map_err(core)?.map_err(core)
+                        }
+                        _ => Err(Error::Corrupt("unexpected move reply frame".into())),
+                    }
+                };
+                match tokio::time::timeout(Duration::from_secs(1), exchange).await {
+                    Ok(Ok(PeerReply::Moving(reply))) => {
+                        if reply.leader == Some(target) {
+                            return Ok(reply);
+                        }
+                        if let Some(leader) = reply.leader {
+                            targets.push_front(leader);
+                        }
+                    }
+                    Ok(Ok(_)) => return Err(Error::Corrupt("mismatched move reply".into())),
+                    Ok(Err(e)) => last = e.to_string(),
+                    Err(_) => last = "move request timed out".into(),
+                }
+            }
+            Err(Error::Apply(last))
+        };
+        tokio::time::timeout(timeout, ask)
+            .await
+            .map_err(|_| Error::Apply("move request timed out".into()))?
     })
 }
