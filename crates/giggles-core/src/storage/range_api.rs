@@ -320,11 +320,24 @@ pub struct ReadPage {
     pub resume: Option<Bound<Vec<u8>>>,
     pub range_end: Option<Vec<u8>>,
 }
-/// Key lock or per-table writer sentinel.
+/// Key lock, per-table writer sentinel, or gap lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockTarget {
-    Key { space: RangeSpace, key: Vec<u8> },
-    TableSentinel { table: u64 },
+    Key {
+        space: RangeSpace,
+        key: Vec<u8>,
+    },
+    TableSentinel {
+        table: u64,
+    },
+    /// GD-0075 R5-72: a Shared gap lock over the user keys of `space` (Rows or Index) within
+    /// [start, end], which must lie inside the range (the gateway clips it per range). It
+    /// conflicts with other transactions' Exclusive key locks inside it.
+    Interval {
+        space: RangeSpace,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+    },
 }
 /// Shared or exclusive range lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

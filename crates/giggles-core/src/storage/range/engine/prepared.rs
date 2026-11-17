@@ -7,21 +7,29 @@
 //! value: len BE4 + bytes if put)]*n [n locks BE4][(lock tag u8 (1 row, 2 unique), id BE8,
 //! key bytes: len BE4 + bytes, mode u8 (0 shared, 1 exclusive))]*n`.
 //! Writes are user keys of the range's spaces (keyspace tag = RangeSpace tag); locks are the
-//! transaction's row and unique locks in this range at prepare.
+//! transaction's row and unique locks in this range at prepare, one per key at its strongest
+//! mode.
 //!
 //! Version 2 (R5-82) = the v1 layout with version byte 2, then `[n children BE4][range BE8]*n`,
 //! n >= 1, distinct, none 0, 1 or u64::MAX: the ranges that took a share of the record at a
 //! split of this range, finalized before this range's own share. A record without children
 //! is always written as v1.
+//!
+//! GD-0075 R5-73 adds lock tag 3, a SERIALIZABLE gap lock: `[3][space u8 (1 row, 2 unique)]
+//! [start bound][end bound][mode u8 = 0 shared]`, a bound being `[0]` (unbounded), `[1]` +
+//! len BE4 + bytes (included) or `[2]` + len BE4 + bytes (excluded), over `id BE8 || tail`.
+//! Only a transaction holding gap locks writes it; a build without R5-73 refuses such a record,
+//! so every node must run R5-73 before SERIALIZABLE transactions run in a cluster.
 use std::collections::BTreeMap;
 
 use super::super::keys::{is_versioned, keyspace_of, space_of};
 use crate::storage::engine::{
     hlc::Ts,
     kv::Keyspace,
-    locks::{LockKey, LockMode},
+    locks::{LockKey, LockMode, LockSpace},
 };
 use crate::storage::range_api::{RangeError, RangeId, RangeSpace, SYSTEM_RANGE, range_key};
+use std::ops::Bound;
 
 const V1: u8 = 1;
 const V2: u8 = 2;
@@ -70,6 +78,21 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), RangeError> {
     Ok(())
 }
 
+fn put_bound(out: &mut Vec<u8>, bound: &Bound<Vec<u8>>) -> Result<(), RangeError> {
+    match bound {
+        Bound::Unbounded => out.push(0),
+        Bound::Included(bytes) => {
+            out.push(1);
+            put_bytes(out, bytes)?;
+        }
+        Bound::Excluded(bytes) => {
+            out.push(2);
+            put_bytes(out, bytes)?;
+        }
+    }
+    Ok(())
+}
+
 struct Reader<'a>(&'a [u8]);
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], RangeError> {
@@ -92,6 +115,14 @@ impl<'a> Reader<'a> {
     fn bytes(&mut self) -> Result<Vec<u8>, RangeError> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
+    }
+    fn bound(&mut self) -> Result<Bound<Vec<u8>>, RangeError> {
+        Ok(match self.u8()? {
+            0 => Bound::Unbounded,
+            1 => Bound::Included(self.bytes()?),
+            2 => Bound::Excluded(self.bytes()?),
+            _ => return Err(corrupt("bad bound flag")),
+        })
     }
 }
 
@@ -143,17 +174,44 @@ impl Prepared {
                 }
             }
         }
-        // Locks in byte order, so one record has one encoding.
-        let mut locks = Vec::with_capacity(self.locks.len());
+        // One lock per key at its strongest mode (a key held Shared, then upgraded, is held in
+        // both modes), in byte order, so one record has one encoding.
+        let mut strongest: Vec<(&LockKey, LockMode)> = Vec::with_capacity(self.locks.len());
         for (key, mode) in &self.locks {
-            let (tag, id, bytes) = match key {
-                LockKey::Row { table, pk } => (1u8, *table, pk),
-                LockKey::Unique { index, tuple } => (2u8, *index, tuple),
+            match strongest.iter_mut().find(|(held, _)| *held == key) {
+                Some(entry) if *mode == LockMode::Exclusive => entry.1 = LockMode::Exclusive,
+                Some(_) => {}
+                None => strongest.push((key, *mode)),
+            }
+        }
+        let mut locks = Vec::with_capacity(strongest.len());
+        for (key, mode) in strongest {
+            let mut lock = Vec::new();
+            match key {
+                LockKey::Row { table, pk } => {
+                    lock.push(1u8);
+                    lock.extend_from_slice(&table.to_be_bytes());
+                    put_bytes(&mut lock, pk)?;
+                }
+                LockKey::Unique { index, tuple } => {
+                    lock.push(2u8);
+                    lock.extend_from_slice(&index.to_be_bytes());
+                    put_bytes(&mut lock, tuple)?;
+                }
+                LockKey::Interval { space, start, end } => {
+                    if mode != LockMode::Shared {
+                        return Err(corrupt("gap lock mode"));
+                    }
+                    lock.push(3u8);
+                    lock.push(match space {
+                        LockSpace::Row => 1,
+                        LockSpace::Unique => 2,
+                    });
+                    put_bound(&mut lock, start)?;
+                    put_bound(&mut lock, end)?;
+                }
                 LockKey::Table(_) => return Err(corrupt("table lock")),
-            };
-            let mut lock = vec![tag];
-            lock.extend_from_slice(&id.to_be_bytes());
-            put_bytes(&mut lock, bytes)?;
+            }
             lock.push(match mode {
                 LockMode::Shared => 0,
                 LockMode::Exclusive => 1,
@@ -204,14 +262,23 @@ impl Prepared {
         }
         let mut locks: Vec<(LockKey, LockMode)> = Vec::new();
         for _ in 0..r.u32()? {
-            let tag = r.u8()?;
-            let id = r.u64()?;
-            let key = r.bytes()?;
-            let key = match tag {
-                1 => LockKey::Row { table: id, pk: key },
+            let key = match r.u8()? {
+                1 => LockKey::Row {
+                    table: r.u64()?,
+                    pk: r.bytes()?,
+                },
                 2 => LockKey::Unique {
-                    index: id,
-                    tuple: key,
+                    index: r.u64()?,
+                    tuple: r.bytes()?,
+                },
+                3 => LockKey::Interval {
+                    space: match r.u8()? {
+                        1 => LockSpace::Row,
+                        2 => LockSpace::Unique,
+                        _ => return Err(corrupt("bad gap lock space")),
+                    },
+                    start: r.bound()?,
+                    end: r.bound()?,
                 },
                 _ => return Err(corrupt("bad lock tag")),
             };
@@ -220,6 +287,9 @@ impl Prepared {
                 1 => LockMode::Exclusive,
                 _ => return Err(corrupt("bad lock mode")),
             };
+            if matches!(key, LockKey::Interval { .. }) && mode != LockMode::Shared {
+                return Err(corrupt("gap lock mode"));
+            }
             if locks.iter().any(|(held, _)| *held == key) {
                 return Err(corrupt("duplicate lock"));
             }

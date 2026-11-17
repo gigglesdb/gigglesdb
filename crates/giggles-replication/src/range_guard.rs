@@ -28,22 +28,32 @@ pub fn check_epoch(desc: &RangeDescriptor, epoch: Epoch) -> Result<(), RangeErro
 /// The read's `[start, end)` raw-key bounds must lie inside the range.
 pub fn check_read(desc: &RangeDescriptor, req: &ReadRequest) -> Result<(), RangeError> {
     check_epoch(desc, req.epoch)?;
-    let start_ok = match &req.start {
-        Bound::Unbounded => range_key(req.space, &[]) >= desc.start,
-        Bound::Included(k) => range_key(req.space, k) >= desc.start,
+    require(desc, inside(desc, req.space, &req.start, &req.end))
+}
+
+/// Whether the raw-key bounds `[start, end)` of `space` lie inside the range.
+fn inside(
+    desc: &RangeDescriptor,
+    space: RangeSpace,
+    start: &Bound<Vec<u8>>,
+    end: &Bound<Vec<u8>>,
+) -> bool {
+    let start_ok = match start {
+        Bound::Unbounded => range_key(space, &[]) >= desc.start,
+        Bound::Included(k) => range_key(space, k) >= desc.start,
         Bound::Excluded(k) => {
-            let mut next = range_key(req.space, k);
+            let mut next = range_key(space, k);
             next.push(0);
             next >= desc.start
         }
     };
-    let end_ok = match (&req.end, &desc.end) {
+    let end_ok = match (end, &desc.end) {
         (_, None) => true,
-        (Bound::Unbounded, Some(end)) => after_space(req.space) <= *end,
-        (Bound::Included(k), Some(end)) => range_key(req.space, k) < *end,
-        (Bound::Excluded(k), Some(end)) => range_key(req.space, k) <= *end,
+        (Bound::Unbounded, Some(end)) => after_space(space) <= *end,
+        (Bound::Included(k), Some(end)) => range_key(space, k) < *end,
+        (Bound::Excluded(k), Some(end)) => range_key(space, k) <= *end,
     };
-    require(desc, start_ok && end_ok)
+    start_ok && end_ok
 }
 
 /// A key lock needs its key inside the range; a table sentinel needs the
@@ -52,6 +62,9 @@ pub fn check_lock(desc: &RangeDescriptor, req: &LockRequest) -> Result<(), Range
     check_epoch(desc, req.epoch)?;
     match &req.target {
         LockTarget::Key { space, key } => require(desc, desc.contains(&range_key(*space, key))),
+        LockTarget::Interval { space, start, end } => {
+            require(desc, inside(desc, *space, start, end))
+        }
         LockTarget::TableSentinel { table } => {
             let lo = range_key(RangeSpace::Rows, &table.to_be_bytes());
             let hi = table.checked_add(1).map_or_else(

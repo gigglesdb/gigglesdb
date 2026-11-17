@@ -441,6 +441,12 @@ fn put_range_call(w: &mut Writer, call: &RangeCall) -> Result<(), RangeError> {
                     w.u8(1);
                     w.u64(*table);
                 }
+                LockTarget::Interval { space, start, end } => {
+                    w.u8(2);
+                    w.u8(space.tag());
+                    w.bound(start)?;
+                    w.bound(end)?;
+                }
             }
             w.u8(match req.mode {
                 RangeLockMode::Shared => 0,
@@ -578,6 +584,11 @@ fn range_call(tag: u8, r: &mut Reader<'_>) -> Result<RangeCall, RangeError> {
                     key: r.bytes()?,
                 },
                 1 => LockTarget::TableSentinel { table: r.u64()? },
+                2 => LockTarget::Interval {
+                    space: r.space()?,
+                    start: r.bound()?,
+                    end: r.bound()?,
+                },
                 _ => return Err(corrupt("invalid lock target")),
             },
             mode: match r.u8()? {

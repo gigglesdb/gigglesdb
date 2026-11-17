@@ -92,6 +92,33 @@ fn calls() -> Vec<PeerCall> {
             mode: RangeLockMode::Exclusive,
             timeout_ms: None,
         }),
+        // GD-0075 R5-72: gap locks.
+        RangeCall::Lock(LockRequest {
+            range,
+            epoch,
+            txn,
+            priority: Timestamp(5),
+            target: LockTarget::Interval {
+                space: RangeSpace::Rows,
+                start: Bound::Excluded(vec![1; 9]),
+                end: Bound::Unbounded,
+            },
+            mode: RangeLockMode::Shared,
+            timeout_ms: Some(0),
+        }),
+        RangeCall::Lock(LockRequest {
+            range,
+            epoch,
+            txn,
+            priority: Timestamp(5),
+            target: LockTarget::Interval {
+                space: RangeSpace::Index,
+                start: Bound::Unbounded,
+                end: Bound::Included(vec![2; 10]),
+            },
+            mode: RangeLockMode::Shared,
+            timeout_ms: None,
+        }),
         RangeCall::Blockers { range, txn },
         RangeCall::CancelWait { range, txn },
         RangeCall::Release { range, txn },

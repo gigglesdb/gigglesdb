@@ -834,3 +834,125 @@ fn a_commit_fenced_as_its_group_starts_is_aborted_not_corrupt() {
     );
     assert_eq!(f.store.applied(B).unwrap(), applied, "nothing proposed");
 }
+
+/// A Shared gap lock over Rows keys `from..=to` of the fixture table.
+fn gap(
+    e: &RangeEngine,
+    t: ClusterTxnId,
+    from: u64,
+    to: u64,
+    timeout_ms: Option<u64>,
+) -> Result<LockGrant, RangeError> {
+    e.lock(LockRequest {
+        range: B,
+        epoch: epoch(e),
+        txn: t,
+        priority: Timestamp(0),
+        target: LockTarget::Interval {
+            space: RangeSpace::Rows,
+            start: Bound::Included(key(from)),
+            end: Bound::Included(key(to)),
+        },
+        mode: RangeLockMode::Shared,
+        timeout_ms,
+    })
+}
+
+/// GD-0075 R5-72/R5-73, porting the prototype's
+/// predicate_gap_locks_prevent_phantoms_cas_revalidates_complete_before_images (transactions.rs
+/// 369) to range engines: a gap lock blocks an insert into the gap but not outside it, and a
+/// gap request waits for a writer inside it. Prepared with its transaction, the gap lock is
+/// re-taken by the next leader (here an engine reopened under a new lock generation), so the
+/// phantom stays blocked across the leader change until the outcome; afterwards the writer
+/// locks, prepares and commits.
+#[test]
+fn gap_locks_block_phantoms_and_survive_a_leader_change() {
+    let f = fixture();
+    let e = f.open_at(1);
+    // Keys 1..=10 hold no rows: the reader's gap lock covers the empty interval.
+    let grant = gap(&e, txn(1), 1, 10, Some(0)).unwrap();
+    assert_eq!(grant.latest, None);
+    assert_eq!(lock(&e, txn(2), 5, Some(50)), Err(RangeError::LockTimeout));
+    lock(&e, txn(2), 20, Some(0)).unwrap();
+    // A gap request over a key another transaction holds Exclusive waits for it.
+    assert_eq!(
+        gap(&e, txn(3), 15, 25, Some(50)),
+        Err(RangeError::LockTimeout)
+    );
+    gap(&e, txn(3), 11, 19, Some(0)).unwrap();
+    // Only Shared gap locks exist.
+    let exclusive = e.lock(LockRequest {
+        range: B,
+        epoch: epoch(&e),
+        txn: txn(4),
+        priority: Timestamp(0),
+        target: LockTarget::Interval {
+            space: RangeSpace::Rows,
+            start: Bound::Included(key(1)),
+            end: Bound::Unbounded,
+        },
+        mode: RangeLockMode::Exclusive,
+        timeout_ms: Some(0),
+    });
+    assert!(exclusive.is_err(), "{exclusive:?}");
+    // The reader prepares with no writes: its gap lock goes into the prepared record.
+    let p = e.prepare(epoch(&e), txn(1), B, vec![], Some(1)).unwrap();
+    e.close();
+    let e = f.open_at(2);
+    // New leader: unprepared locks are gone (txn 2's key 20), the prepared gap lock is back.
+    lock(&e, txn(5), 20, Some(0)).unwrap();
+    assert_eq!(lock(&e, txn(6), 5, Some(50)), Err(RangeError::LockTimeout));
+    assert_eq!(e.prepare(epoch(&e), txn(1), B, vec![], None).unwrap(), p);
+    // Abort releases it: the writer goes ahead.
+    e.finalize(txn(1), Outcome::Abort).unwrap();
+    let grant = lock(&e, txn(6), 5, Some(1000)).unwrap();
+    let c = e
+        .commit(
+            epoch(&e),
+            txn(6),
+            vec![write(5, b"phantom")],
+            None,
+            Some(grant.generation),
+        )
+        .unwrap();
+    assert!(c.0 > p.0);
+    let rows = read_all(&e, Timestamp(c.0 + 1), ReadDirection::Forward, 1 << 20);
+    assert_eq!(rows, vec![(5, Some(b"phantom".to_vec()))]);
+}
+
+/// R5-73: a prepared record holding a gap lock round-trips; Shared plus Exclusive on one key is
+/// stored once, as Exclusive; a gap lock in Exclusive mode is refused both ways.
+#[test]
+fn prepared_records_carry_gap_locks() {
+    use crate::storage::engine::locks::LockSpace;
+    let gap = LockKey::Interval {
+        space: LockSpace::Unique,
+        start: Bound::Excluded(vec![0, 0, 0, 0, 0, 0, 0, 9, 1]),
+        end: Bound::Unbounded,
+    };
+    let row = LockKey::Row {
+        table: T,
+        pk: vec![1],
+    };
+    let record = prepared::Prepared {
+        home: B,
+        at: Ts(7),
+        writes: prepared::Writes::new(),
+        locks: vec![
+            (gap.clone(), LockMode::Shared),
+            (row.clone(), LockMode::Shared),
+            (row.clone(), LockMode::Exclusive),
+        ],
+    };
+    let back = prepared::Prepared::decode(&record.encode().unwrap()).unwrap();
+    let mut locks = back.locks.clone();
+    locks.sort_by_key(|(key, _)| format!("{key:?}"));
+    let mut want = vec![(gap.clone(), LockMode::Shared), (row, LockMode::Exclusive)];
+    want.sort_by_key(|(key, _)| format!("{key:?}"));
+    assert_eq!(locks, want);
+    let bad = prepared::Prepared {
+        locks: vec![(gap, LockMode::Exclusive)],
+        ..back
+    };
+    assert!(bad.encode().is_err());
+}

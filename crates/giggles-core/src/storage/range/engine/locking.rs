@@ -3,14 +3,15 @@ use std::time::{Duration, Instant};
 
 use super::{RangeEngine, TxnEntry, lock_error, txn_id};
 use crate::storage::engine::{
-    locks::{LockError, LockKey, LockMode},
+    locks::{LockError, LockKey, LockMode, LockSpace, locks_conflict},
     mvcc,
 };
-use crate::storage::range::keys::keyspace_of;
+use crate::storage::range::keys::{cf_interval, keyspace_of};
 use crate::storage::range_api::{
     ClusterTxnId, LockGrant, LockRequest, LockTarget, RangeError, RangeId, RangeLockMode,
     RangeSpace, Timestamp, range_key,
 };
+use std::ops::Bound;
 
 impl RangeEngine {
     /// The `LockManager` key of a target, if this range owns it.
@@ -38,6 +39,23 @@ impl RangeEngine {
                     }),
                     _ => Err(RangeError::Corrupt(format!("no locks in {space:?}"))),
                 }
+            }
+            LockTarget::Interval { space, start, end } => {
+                // R5-72: the gateway clips a gap lock to each range it spans.
+                let lock_space = match space {
+                    RangeSpace::Rows => LockSpace::Row,
+                    RangeSpace::Index => LockSpace::Unique,
+                    _ => return Err(RangeError::Corrupt(format!("no gap locks in {space:?}"))),
+                };
+                let (lo, hi) = cf_interval(&self.descriptor, *space).ok_or_else(stale)?;
+                if !bound_within(start, &lo, true) || !bound_within(end, &hi, false) {
+                    return Err(stale());
+                }
+                Ok(LockKey::Interval {
+                    space: lock_space,
+                    start: start.clone(),
+                    end: end.clone(),
+                })
             }
             LockTarget::TableSentinel { table } => {
                 // Design 3.1: a sentinel lives on every range intersecting the table's rows.
@@ -134,7 +152,7 @@ impl RangeEngine {
         }
         self.touch(req.txn);
         let latest = match &req.target {
-            LockTarget::TableSentinel { .. } => None,
+            LockTarget::TableSentinel { .. } | LockTarget::Interval { .. } => None,
             LockTarget::Key { space, key } => {
                 mvcc::latest_version(self.kv.as_ref(), keyspace_of(*space), key)
                     .map_err(super::txn_error)?
@@ -155,10 +173,10 @@ impl RangeEngine {
             .prepared
             .iter()
             .filter(|(_, record)| {
-                record.locks.iter().any(|(held, held_mode)| {
-                    held == key
-                        && (mode == LockMode::Exclusive || *held_mode == LockMode::Exclusive)
-                })
+                record
+                    .locks
+                    .iter()
+                    .any(|(held, held_mode)| locks_conflict(held, *held_mode, key, mode))
             })
             .map(|(txn, record)| (*txn, record.home))
             .collect()
@@ -237,6 +255,24 @@ impl RangeEngine {
         };
         for txn in expired {
             self.locks.release_all(txn_id(txn));
+        }
+    }
+}
+
+/// Whether `bound` (a lower bound when `lower`) lies within the range side `limit`.
+fn bound_within(bound: &Bound<Vec<u8>>, limit: &Bound<Vec<u8>>, lower: bool) -> bool {
+    match (bound, limit) {
+        (_, Bound::Unbounded) => true,
+        (Bound::Unbounded, _) => false,
+        (Bound::Included(b) | Bound::Excluded(b), Bound::Included(l) | Bound::Excluded(l)) => {
+            if lower {
+                // Range starts are inclusive.
+                b >= l
+            } else {
+                // Range ends are exclusive: an included end must be below it.
+                matches!(bound, Bound::Included(_)) && b < l
+                    || matches!(bound, Bound::Excluded(_)) && b <= l
+            }
         }
     }
 }

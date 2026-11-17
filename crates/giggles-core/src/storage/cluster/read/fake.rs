@@ -370,6 +370,9 @@ impl FakeCluster {
             let inside = match &req.target {
                 LockTarget::Key { space, key } => range.desc.contains(&range_key(*space, key)),
                 LockTarget::TableSentinel { table } => table_overlaps(&range.desc, *table),
+                LockTarget::Interval { .. } => {
+                    return Err(RangeError::Corrupt("fake: no gap locks".into()));
+                }
             };
             if !inside {
                 return Err(range.stale());
@@ -407,6 +410,7 @@ impl FakeCluster {
                 },
                 None,
             ),
+            LockTarget::Interval { .. } => unreachable!("refused above"),
         };
         let mode = match req.mode {
             RangeLockMode::Shared => LockMode::Shared,
