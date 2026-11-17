@@ -264,4 +264,5 @@ mod sort_spill_network;
 
 #[path = "cluster_harness.rs"] pub(crate) mod cluster_harness;
 #[path = "cluster_process.rs"] mod cluster_process;
+#[path = "cluster_isolation.rs"] mod cluster_isolation;
 #[path = "viewdef_parity.rs"] mod viewdef_parity;

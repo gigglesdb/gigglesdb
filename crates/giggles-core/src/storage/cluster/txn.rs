@@ -693,6 +693,9 @@ impl ClusterTxnServices {
     }
 }
 
+/// A user-key interval [start, end] of one keyspace.
+type UserInterval = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+
 /// The part of the user-key interval [start, end] of `space` inside `desc`, if they meet.
 /// Range bounds are whole user keys or id prefixes (design.md Changes, Track A (g)).
 fn clip_interval(
@@ -700,7 +703,7 @@ fn clip_interval(
     space: RangeSpace,
     start: &Bound<Vec<u8>>,
     end: &Bound<Vec<u8>>,
-) -> Option<(Bound<Vec<u8>>, Bound<Vec<u8>>)> {
+) -> Option<UserInterval> {
     let tag = space.tag();
     let lo = match desc.start.split_first() {
         None => Bound::Unbounded,
