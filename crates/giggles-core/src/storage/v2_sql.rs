@@ -2346,7 +2346,7 @@ thread_local! {
     static AFTER_INDEX_CHUNK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     static CRASH_AFTER_INDEX_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AFTER_TABLE_SCAN: std::cell::RefCell<Option<TableScanHook>> = const { std::cell::RefCell::new(None) };
-    static USED_INDEX_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static USED_INDEX_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_AFTER_ROW_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
