@@ -296,7 +296,7 @@ fn sql_insert_null_fill_not_null_arity_and_type_match_existing_insert() {
     fail(
         &mut s,
         "INSERT INTO items (id,n) VALUES (1,10),(2)",
-        SqlError::Type,
+        SqlError::Syntax,
     );
     fail(
         &mut s,
@@ -927,9 +927,9 @@ fn sql_insert_admission_rejects_arity_before_materialization() {
     let mut state = snapshot(&mut session);
     let mut insert = admission_insert();
     insert.rows[1].pop();
-    assert_admission_rejected_without_copy(&mut state, &insert, &[], SqlError::Type);
+    assert_admission_rejected_without_copy(&mut state, &insert, &[], SqlError::Syntax);
     insert.rows[1] = vec![Expr::Literal(Value::Null); MAX_COLUMNS + 1];
-    assert_admission_rejected_without_copy(&mut state, &insert, &[], SqlError::Type);
+    assert_admission_rejected_without_copy(&mut state, &insert, &[], SqlError::Syntax);
 }
 
 #[test]

@@ -514,3 +514,5 @@ mod pgparity_typeof;
 #[path = "task_protected_commit.rs"] mod task_protected_commit;
 #[path = "task_prepare_rules.rs"] mod task_prepare_rules;
 #[path = "replica_role_fk.rs"] mod replica_role_fk;
+#[path = "insert_trailing_columns.rs"]
+mod insert_trailing_columns;

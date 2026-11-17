@@ -386,11 +386,13 @@ fn indexes(insert: &Insert, table: &TableDef) -> R<Vec<usize>> {
             return Err(SqlError::Syntax);
         }
         vec![]
-    } else {
+    } else if insert.source.is_some() || insert.rows.is_empty() {
         insert_indexes(table, &insert.columns)?
+    } else {
+        insert_value_indexes(table, &insert.columns, insert.rows.first().map_or(0, Vec::len))?
     };
     if insert.source.is_none() && insert.rows.iter().any(|row| row.len() != indexes.len()) {
-        return Err(SqlError::Type);
+        return Err(SqlError::Syntax);
     }
     Ok(indexes)
 }
@@ -1245,7 +1247,7 @@ fn admit_statement(insert: &Insert, params: &[Value]) -> R<()> {
         if row.len() > MAX_COLUMNS
             || !insert.columns.is_empty() && row.len() != insert.columns.len()
         {
-            return Err(SqlError::Type);
+            return Err(SqlError::Syntax);
         }
         admission.row();
         for (slot, expression) in row.iter().enumerate() {
@@ -1433,22 +1435,11 @@ pub(super) fn execute_declared(
         .tables
         .get(&insert.table)
         .ok_or(SqlError::UnknownTable)?;
-    // With no column list, actual table width can only be checked after the
-    // borrowed raw admission; this still precedes every input-sized copy.
-    let logical_width = table.logical_columns().count();
-    if !insert.default_values
-        && insert.columns.is_empty()
-        && insert.rows.iter().any(|row| {
-            row.len() > logical_width || insert.conflict.is_none() && row.len() != logical_width
-        })
-    {
-        return Err(SqlError::Type);
-    }
+    let indexes = indexes(insert, table)?;
     #[cfg(test)]
     Relational::sql_insert_test_event(0);
     let table = table.clone();
     let hidden_rowid = table.hidden_rowid();
-    let indexes = indexes(insert, &table)?;
     #[cfg(test)]
     Relational::sql_insert_test_event(1);
     let mut incoming = Vec::with_capacity(insert.rows.len());

@@ -14,6 +14,10 @@ struct BoundValues {
     parameters: Vec<DataType>,
 }
 impl InsertExpressions {
+    pub(in super::super) fn supplied_indexes(&self, table: &TableDef) -> R<Vec<usize>> {
+        insert_value_indexes(table, &self.columns, self.values.len())
+    }
+
     pub(super) fn bind_value_schema_names(
         &mut self,
         bind: &impl Fn(&mut String),
@@ -406,10 +410,7 @@ impl InsertExpressions {
         if count > MAX_PARAMS || self.values.len() > MAX_COLUMNS {
             return Err(SqlError::Limit);
         }
-        let indexes = insert_indexes(table, &self.columns)?;
-        if indexes.len() != self.values.len() {
-            return Err(SqlError::Type);
-        }
+        let indexes = self.supplied_indexes(table)?;
         let no_columns = |_: &ColumnRef, _: usize| Err(SqlError::UnknownColumn);
         let mut parameters = vec![None; count];
         if declared.len() > count {

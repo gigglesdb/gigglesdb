@@ -2492,10 +2492,7 @@ impl Prepared {
                     values,
                     ..
                 } => {
-                    let indexes = insert_indexes(t, names)?;
-                    if indexes.len() != values.len() {
-                        return Err(SqlError::Type);
-                    }
+                    let indexes = insert_value_indexes(t, names, values.len())?;
                     for (i, e) in indexes.into_iter().zip(values) {
                         infer_mutation_parameter(
                             e,
@@ -2925,13 +2922,12 @@ impl Prepared {
             Ok(())
         };
         match &self.statement {
-            Statement::Insert { name, columns, .. } => {
+            Statement::Insert { name, columns, values, .. } => {
                 let table = state.tables.get(name).ok_or(SqlError::UnknownTable)?;
-                if !columns.is_empty() {
-                    for column in table.logical_columns() {
-                        if !columns.contains(&column.name) {
-                            add(column)?;
-                        }
+                let supplied = insert_value_indexes(table, columns, values.len())?;
+                for index in table.logical_offsets() {
+                    if !supplied.contains(&index) {
+                        add(&table.columns[index])?;
                     }
                 }
             }
@@ -2940,11 +2936,10 @@ impl Prepared {
                     .tables
                     .get(&values.name)
                     .ok_or(SqlError::UnknownTable)?;
-                if !values.columns.is_empty() {
-                    for column in table.logical_columns() {
-                        if !values.columns.contains(&column.name) {
-                            add(column)?;
-                        }
+                let supplied = values.supplied_indexes(table)?;
+                for index in table.logical_offsets() {
+                    if !supplied.contains(&index) {
+                        add(&table.columns[index])?;
                     }
                 }
             }
@@ -3310,6 +3305,15 @@ fn insert_indexes(table: &TableDef, columns: &[String]) -> R<Vec<usize>> {
         columns.iter().map(|name| col(table, name)).collect::<R<Vec<_>>>()?
     };
     unique(&indexes).map_err(|_| SqlError::DuplicateColumn)?;
+    Ok(indexes)
+}
+/// Resolve supplied leading columns, leaving trailing columns to their defaults.
+fn insert_value_indexes(table: &TableDef, columns: &[String], width: usize) -> R<Vec<usize>> {
+    let mut indexes = insert_indexes(table, columns)?;
+    if width > indexes.len() || !columns.is_empty() && width != indexes.len() {
+        return Err(SqlError::Syntax);
+    }
+    indexes.truncate(width);
     Ok(indexes)
 }
 fn unique<T: Ord>(v: impl IntoIterator<Item = T>) -> R<()> {
@@ -4203,10 +4207,7 @@ impl Relational {
                     return Err(SqlError::Unsupported);
                 }
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
-                let indexes = insert_indexes(t, columns)?;
-                if indexes.len() != values.len() {
-                    return Err(SqlError::Type);
-                }
+                let indexes = insert_value_indexes(t, columns, values.len())?;
                 for index in &indexes {
                     defaults::check_explicit(self, &t.columns[*index])?;
                 }

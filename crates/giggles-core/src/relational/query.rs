@@ -46,7 +46,6 @@ pub(super) fn result_typmod(state: &Relational, source: TypmodSource<'_>) -> i32
 
 // Syntax node budget for INSERT expressions and IN/BETWEEN lowering; not a scan work cap.
 const MAX_WORK: usize = 4096;
-const MAX_SOURCES: usize = 8;
 
 #[derive(Debug, Clone)]
 struct ColumnRef {
@@ -2479,9 +2478,6 @@ impl Query {
                 aliased_sources.push(sources.len());
             }
             sources.push(source);
-            if sources.len() > MAX_SOURCES {
-                return Err(SqlError::Limit);
-            }
             p.need("on")?;
             let on = Filter::parse(p, 0, 0)?;
             joins.push(Join { left, on });

@@ -87,8 +87,7 @@ fn expression(tokens: &[Token], owner: &mut Parser, depth: usize) -> R<Plan> {
         split = positions
             .iter()
             .copied()
-            .filter(|i| *i < tail && word(&tokens[*i], "intersect"))
-            .next_back();
+            .rfind(|i| *i < tail && word(&tokens[*i], "intersect"));
     }
     let mut plan = if let Some(i) = split {
         let op = if word(&tokens[i], "union") {

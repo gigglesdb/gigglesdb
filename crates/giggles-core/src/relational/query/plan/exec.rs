@@ -85,7 +85,6 @@ impl Plan {
             affected: 0,
         })
     }
-    #[expect(clippy::too_many_arguments, reason = "shared query execution context")]
     pub(super) fn run<'a>(
         &self,
         state: &Relational,
