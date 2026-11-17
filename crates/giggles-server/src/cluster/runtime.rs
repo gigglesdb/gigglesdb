@@ -9,15 +9,17 @@ use super::config::ClusterValidated;
 use giggles_core::{
     Admin, Limits,
     cluster_node::{ClusterGateway, EngineSettings, GatewaySettings},
+    range_api::RangeClient,
 };
 use giggles_replication::{
     bootstrap::presplit,
     cluster_node::{ClusterNode, ClusterNodeConfig, RegistryWatcher},
     liveness::LivenessConfig,
     sink::SnapshotPolicy,
+    split::{SizePolicy, SizeSplitter, Splitter},
     transport::{CallLimits, PeerConfig, TransportConfig, fingerprint},
 };
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 /// How long a starting node waits for the directory and every range's leader.
 const READY_TIMEOUT: Duration = Duration::from_secs(600);
@@ -33,6 +35,7 @@ pub struct ClusterRuntime {
     gateway: ClusterGateway,
     node: ClusterNode,
     registry_watcher: RegistryWatcher,
+    size_splitter: Option<SizeSplitter>,
 }
 
 /// The peer transport of this node: every member, with this node's own certificate.
@@ -124,10 +127,22 @@ impl ClusterRuntime {
         if bootstrap && let Some(owner) = &v.owner {
             bootstrap_owner(&gateway.admin, owner)?;
         }
+        let size_splitter = v.split_policy.map(|policy| {
+            let client: Arc<dyn RangeClient> = node.client().clone();
+            SizeSplitter::start(
+                Arc::new(Splitter::new(node.host().clone(), client)),
+                SizePolicy {
+                    threshold: policy.threshold,
+                    interval: policy.interval,
+                    cooldown: policy.cooldown,
+                },
+            )
+        });
         Ok(Self {
             gateway,
             node,
             registry_watcher,
+            size_splitter,
         })
     }
 
@@ -140,6 +155,9 @@ impl ClusterRuntime {
     }
 
     pub fn stop(mut self) {
+        if let Some(splitter) = &mut self.size_splitter {
+            splitter.stop();
+        }
         self.registry_watcher.stop();
         drop(self.gateway);
         self.node.stop();

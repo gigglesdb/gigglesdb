@@ -43,6 +43,21 @@ pub struct ClusterConfig {
     /// gateways); below the range lock lease. Default 6000 (range failover under load must fit in it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_lease_ms: Option<u64>,
+    /// Enable live range splits at this approximate size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_cooldown_ms: Option<u64>,
+}
+
+/// Validated independently of the optional RocksDB replication runtime.
+#[derive(Clone, Copy, Debug)]
+pub struct SplitPolicy {
+    pub threshold: u64,
+    pub interval: Duration,
+    pub cooldown: Duration,
 }
 
 /// Default gateway membership lease.
@@ -76,6 +91,7 @@ pub struct ClusterValidated {
     pub owner: Option<String>,
     /// Below the range lock lease the runtime's engines use (`LOCK_LEASE`).
     pub gateway_lease: Duration,
+    pub split_policy: Option<SplitPolicy>,
 }
 
 impl ClusterValidated {
@@ -137,6 +153,31 @@ impl ClusterConfig {
                 LOCK_LEASE.as_millis()
             ));
         }
+        let split_policy = if let Some(threshold) = self.split_size_bytes {
+            if threshold < 65536 {
+                return Err("cluster.split_size_bytes: must be at least 65536".into());
+            }
+            let interval = self.split_interval_ms.unwrap_or(1000);
+            if !(100..=3600000).contains(&interval) {
+                return Err("cluster.split_interval_ms: must be between 100 and 3600000".into());
+            }
+            let cooldown = self.split_cooldown_ms.unwrap_or(10000);
+            if cooldown > 86400000 {
+                return Err("cluster.split_cooldown_ms: must be at most 86400000".into());
+            }
+            Some(SplitPolicy {
+                threshold,
+                interval: Duration::from_millis(interval),
+                cooldown: Duration::from_millis(cooldown),
+            })
+        } else {
+            if self.split_interval_ms.is_some() || self.split_cooldown_ms.is_some() {
+                return Err(
+                    "cluster.split_size_bytes: required with split interval or cooldown".into(),
+                );
+            }
+            None
+        };
         let (log_dir, snapshot_dir) = resolve_dirs(
             "cluster",
             &self.log_dir,
@@ -221,6 +262,7 @@ impl ClusterConfig {
             split_keys,
             owner: self.owner.clone(),
             gateway_lease,
+            split_policy,
         })
     }
 }
@@ -255,6 +297,9 @@ mod tests {
             split_keys: Vec::new(),
             owner: None,
             gateway_lease_ms: None,
+            split_size_bytes: None,
+            split_interval_ms: None,
+            split_cooldown_ms: None,
         }
     }
 
@@ -482,8 +527,63 @@ mod tests {
     }
 
     #[test]
+    fn split_policy_defaults_and_bounds() {
+        let mut c = config();
+        assert!(validate(&c).unwrap().split_policy.is_none());
+        c.split_size_bytes = Some(65536);
+        let policy = validate(&c).unwrap().split_policy.unwrap();
+        assert_eq!(policy.threshold, 65536);
+        assert_eq!(policy.interval, Duration::from_millis(1000));
+        assert_eq!(policy.cooldown, Duration::from_millis(10000));
+        for (interval, cooldown) in [(100, 0), (3600000, 86400000)] {
+            c.split_interval_ms = Some(interval);
+            c.split_cooldown_ms = Some(cooldown);
+            let policy = validate(&c).unwrap().split_policy.unwrap();
+            assert_eq!(policy.interval, Duration::from_millis(interval));
+            assert_eq!(policy.cooldown, Duration::from_millis(cooldown));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_split_policy() {
+        let mut c = config();
+        for size in [0, 65535] {
+            c.split_size_bytes = Some(size);
+            reject(&c, "cluster.split_size_bytes:");
+        }
+        c.split_size_bytes = Some(65536);
+        for interval in [0, 99, 3600001, u64::MAX] {
+            c.split_interval_ms = Some(interval);
+            reject(&c, "cluster.split_interval_ms:");
+        }
+        c.split_interval_ms = None;
+        for cooldown in [86400001, u64::MAX] {
+            c.split_cooldown_ms = Some(cooldown);
+            reject(&c, "cluster.split_cooldown_ms:");
+        }
+        c.split_size_bytes = None;
+        c.split_cooldown_ms = Some(1000);
+        reject(&c, "cluster.split_size_bytes:");
+        c.split_cooldown_ms = None;
+        c.split_interval_ms = Some(200);
+        reject(&c, "cluster.split_size_bytes:");
+    }
+
+    #[test]
     fn serde_round_trip_defaults_and_unknown_fields() {
         let value = serde_json::to_value(config()).unwrap();
+        for field in ["split_size_bytes", "split_interval_ms", "split_cooldown_ms"] {
+            assert!(value.get(field).is_none(), "{field} should be omitted");
+        }
+        let mut enabled = config();
+        enabled.split_size_bytes = Some(65536);
+        enabled.split_interval_ms = Some(200);
+        enabled.split_cooldown_ms = Some(1000);
+        let enabled: ClusterConfig =
+            serde_json::from_value(serde_json::to_value(enabled).unwrap()).unwrap();
+        assert_eq!(enabled.split_size_bytes, Some(65536));
+        assert_eq!(enabled.split_interval_ms, Some(200));
+        assert_eq!(enabled.split_cooldown_ms, Some(1000));
         let back: ClusterConfig = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(&back).unwrap(), value);
         let minimal = serde_json::json!({

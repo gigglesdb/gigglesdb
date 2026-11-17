@@ -305,6 +305,8 @@ mod sort_spill_network;
 
 #[path = "cluster_harness.rs"] pub(crate) mod cluster_harness;
 #[path = "cluster_process.rs"] mod cluster_process;
+#[cfg(feature = "engine-rocksdb")]
+#[path = "cluster_split_policy.rs"] mod cluster_split_policy;
 #[path = "cluster_isolation.rs"] mod cluster_isolation;
 #[path = "viewdef_parity.rs"] mod viewdef_parity;
 
