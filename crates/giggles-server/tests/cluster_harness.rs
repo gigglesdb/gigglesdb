@@ -48,6 +48,8 @@ struct Node {
     reader: Option<JoinHandle<()>>,
     /// The stdout line announcing a serving gateway, since the last start.
     ready: Option<String>,
+    /// Extra environment for the node's next starts.
+    env: Vec<(String, String)>,
 }
 
 /// `n` cluster-mode server processes (node ids 1..=n; node 1 bootstraps) with persistent node
@@ -104,6 +106,7 @@ impl ClusterProcs {
                 listen: reservations[1].local_addr().unwrap(),
                 reservations,
                 child: None,
+                env: Vec::new(),
                 reader: None,
                 ready: None,
             });
@@ -181,6 +184,7 @@ impl ClusterProcs {
         let mut child = Command::new(env!("CARGO_BIN_EXE_giggles-server"))
             .arg(node.dir.join("config.json"))
             .env("GIGGLES_OWNER_PASSWORD", "cluster-test-only")
+            .envs(node.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -245,6 +249,34 @@ impl ClusterProcs {
         }
         self.refresh();
         self.nodes[i].ready = None;
+    }
+
+    /// Sets an environment variable for node i's later starts (for example a crash hook).
+    pub(crate) fn set_env(&mut self, i: usize, key: &str, value: &str) {
+        self.nodes[i].env.push((key.into(), value.into()));
+    }
+
+    /// Waits until node i's process exits on its own (a crash hook); panics after `wait`.
+    pub(crate) async fn exited(&mut self, i: usize, wait: Duration) {
+        let deadline = Instant::now() + wait;
+        loop {
+            let child = self.nodes[i].child.as_mut().expect("node not started");
+            if child.try_wait().unwrap().is_some() {
+                self.kill(i);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node {} still runs after {wait:?}",
+                i + 1
+            );
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// Node i's stderr log, across its starts.
+    pub(crate) fn stderr(&self, i: usize) -> String {
+        std::fs::read_to_string(self.nodes[i].dir.join("stderr.log")).unwrap_or_default()
     }
 
     /// Kills node i if it runs, starts it again over its directories and waits until it serves.

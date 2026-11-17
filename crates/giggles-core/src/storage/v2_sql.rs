@@ -7,6 +7,10 @@ use relational::{
     row_sink::{DdlRows, RowSink},
 };
 use std::{collections::BTreeSet, ops::Bound};
+/// Encoded primary-key bounds of a read (GD-0075 P8-0).
+type KeyBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+/// One side of an integer key range: (value, inclusive).
+type KeySide = (i64, bool);
 #[path = "v2_sql_sequences.rs"]
 pub(super) mod sql_sequences;
 #[path = "v2_sql_xact.rs"]
@@ -1577,6 +1581,27 @@ impl RowSink for SqlRows<'_> {
             heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
         };
+        if let Some((lo, hi)) = self.primary_key_bounds(table) {
+            // GD-0075 P8-0: mandatory comparisons on an integer primary key read only the rows
+            // in their key range (the full WHERE is applied afterwards), so a point or key-range
+            // SELECT on a cluster gateway waits only on prepared writes inside that range.
+            for pair in self.db.rows.scan(
+                self.txn,
+                &entry,
+                lo,
+                hi,
+                engine::kv::Direction::Forward,
+                None,
+            )? {
+                let (_, row) = pair?;
+                visit(SqlRow {
+                    values: row.values,
+                    version: row.version,
+                })
+                .map_err(CoreError::Sql)?;
+            }
+            return Ok(());
+        }
         let candidate = self.scan_index(table);
         let Some((descriptor, lo, hi)) = candidate else {
             return self.scan_all(&entry, visit);
@@ -2013,6 +2038,74 @@ impl SqlRows<'_> {
             .map_err(CoreError::Sql)?;
         }
         Ok(())
+    }
+    /// Encoded bounds from a read statement's mandatory comparisons (=, <, <=, >, >=) on a
+    /// one-column integer primary key, if it has any (a heap table's row id is not one).
+    fn primary_key_bounds(&self, table: &TableDef) -> Option<KeyBounds> {
+        use relational::{DataType, Value};
+        let [index] = table.primary_key.as_slice() else {
+            return None;
+        };
+        let column = table.columns.get(*index)?;
+        if self.writing
+            || self.parts.heap.contains(&table.id)
+            || !matches!(
+                column.data_type,
+                DataType::SmallInt | DataType::Integer | DataType::BigInt
+            )
+            || self
+                .parts
+                .ext
+                .columns
+                .get(&column.id)
+                .is_some_and(|c| c.type_id.is_some())
+        {
+            return None;
+        }
+        // (value, inclusive) for each side; the tighter bound wins.
+        let (mut lo, mut hi): (Option<KeySide>, Option<KeySide>) = (None, None);
+        let tighter_lo = |old: Option<KeySide>, new: KeySide| match old {
+            Some(old) if old.0 > new.0 || (old.0 == new.0 && !old.1) => Some(old),
+            _ => Some(new),
+        };
+        let tighter_hi = |old: Option<KeySide>, new: KeySide| match old {
+            Some(old) if old.0 < new.0 || (old.0 == new.0 && !old.1) => Some(old),
+            _ => Some(new),
+        };
+        for (name, op, value) in self.prepared.v2_index_predicates(self.params) {
+            let Value::Int(n) = value else { continue };
+            if name != column.name || relational::check(&value, column).is_err() {
+                continue;
+            }
+            match op.as_str() {
+                "=" => {
+                    lo = tighter_lo(lo, (n, true));
+                    hi = tighter_hi(hi, (n, true));
+                }
+                ">" => lo = tighter_lo(lo, (n, false)),
+                ">=" => lo = tighter_lo(lo, (n, true)),
+                "<" => hi = tighter_hi(hi, (n, false)),
+                "<=" => hi = tighter_hi(hi, (n, true)),
+                _ => {}
+            }
+        }
+        if lo.is_none() && hi.is_none() {
+            return None;
+        }
+        let bound = |side: Option<KeySide>| -> Option<Bound<Vec<u8>>> {
+            Some(match side {
+                None => Bound::Unbounded,
+                Some((n, inclusive)) => {
+                    let key = codec::pk_bytes(&[Value::Int(n)]).ok()?;
+                    if inclusive {
+                        Bound::Included(key)
+                    } else {
+                        Bound::Excluded(key)
+                    }
+                }
+            })
+        };
+        Some((bound(lo)?, bound(hi)?))
     }
     fn scan_index(&self, table: &TableDef) -> Option<IndexRange> {
         self.scan_index_predicates(table, &self.prepared.v2_index_predicates(self.params))

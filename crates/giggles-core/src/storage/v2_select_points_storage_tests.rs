@@ -83,3 +83,61 @@ fn cursor_points_chunked_domains() {
     }
     DISABLE_SELECT_POINTS.set(false);
 }
+/// GD-0075 P8-0: a read whose WHERE bounds an integer primary key reads that key range, not
+/// the whole table (a cluster gateway then waits only on a prepared write of that row). Other
+/// predicates still read the table; results are the same either way.
+#[test]
+fn primary_key_equality_reads_one_row_not_the_table() {
+    let f = Fixture::new();
+    let mut s = f.admin().sql_session();
+    for t in ["SMALLINT", "INT", "BIGINT"] {
+        s.execute(
+            &format!("CREATE TABLE p{t}(id {t} PRIMARY KEY, v INT)"),
+            &[],
+            None,
+        )
+        .unwrap();
+        s.execute(
+            &format!("INSERT INTO p{t} VALUES (1, 10), (2, 20)"),
+            &[],
+            None,
+        )
+        .unwrap();
+        for (sql, rows, table_reads) in [
+            (format!("SELECT v FROM p{t} WHERE id = 1"), 1, 0),
+            (format!("SELECT * FROM p{t} WHERE id = 2 AND v = 20"), 1, 0),
+            (format!("SELECT v FROM p{t} WHERE id = 3"), 0, 0),
+            (format!("SELECT v FROM p{t} WHERE id = 1 AND id = 2"), 0, 0),
+            (format!("SELECT v FROM p{t} WHERE id >= 2"), 1, 0),
+            (format!("SELECT v FROM p{t} WHERE id > 0 AND id < 2"), 1, 0),
+            (format!("SELECT v FROM p{t} WHERE id <= 1 AND id > 1"), 0, 0),
+            (format!("SELECT v FROM p{t} WHERE v = 10"), 1, 1),
+            (format!("SELECT v FROM p{t} WHERE id = 1 OR id = 2"), 2, 1),
+        ] {
+            let scans = std::rc::Rc::new(std::cell::Cell::new(0));
+            let seen = scans.clone();
+            crate::storage::v2_sql::AFTER_TABLE_SCAN.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |_: &str| seen.set(seen.get() + 1)))
+            });
+            let got = s.execute(&sql, &[], None).unwrap().rows.len();
+            crate::storage::v2_sql::AFTER_TABLE_SCAN.with(|h| *h.borrow_mut() = None);
+            assert_eq!((got, scans.get()), (rows, table_reads), "{sql}");
+        }
+    }
+    // Own uncommitted writes are seen through the key read.
+    for sql in [
+        "BEGIN",
+        "UPDATE pINT SET v = 11 WHERE id = 1",
+        "INSERT INTO pINT VALUES (5, 50)",
+    ] {
+        s.execute(sql, &[], None).unwrap();
+    }
+    for (sql, want) in [
+        ("SELECT v FROM pINT WHERE id = 1", 11),
+        ("SELECT v FROM pINT WHERE id = 5", 50),
+    ] {
+        let rows = s.execute(sql, &[], None).unwrap().rows;
+        assert_eq!(rows[0].values[0], Value::Int(want), "{sql}");
+    }
+    s.execute("ROLLBACK", &[], None).unwrap();
+}

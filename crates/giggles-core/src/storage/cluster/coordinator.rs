@@ -159,6 +159,17 @@ fn abort(
     Err(CommitError::Aborted(cause))
 }
 
+/// Process-level crash hook for recovery tests (GD-0075 P8-0): when the environment variable
+/// `GIGGLES_CORE_FAILPOINT` names `point`, the process aborts there, as a gateway that dies.
+fn crash_point(point: &str) {
+    static ARMED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let armed = ARMED.get_or_init(|| std::env::var("GIGGLES_CORE_FAILPOINT").ok());
+    if armed.as_deref() == Some(point) {
+        eprintln!("failpoint crash: {point}");
+        std::process::abort();
+    }
+}
+
 /// Commits `plan` atomically across its participant ranges (GD-0075 Track D protocol,
 /// coordinator steps 1-6). Returns the commit timestamp only once Commit is durable at home.
 pub(crate) fn commit_cross_range(
@@ -226,6 +237,7 @@ pub(crate) fn commit_cross_range(
     if let Some(e) = results.into_iter().find_map(Result::err) {
         return abort(client, &plan, Some(incarnation), e);
     }
+    crash_point("gateway.commit.prepared");
     // 4. Fresh c after every vote, so c > every p_i.
     let c = match client.oracle().next(1) {
         Ok(c) => c,

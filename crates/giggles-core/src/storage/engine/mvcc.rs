@@ -68,7 +68,19 @@ fn version_at(
 ) -> Result<Option<Version>, TxnError> {
     validate_key(ks, user_key)?;
     let seek = codec::user_key_seek_at(user_key, snapshot);
-    let Some((key, value)) = kv.seek_ge(ks, &seek)? else {
+    // Bounded to this key's versions: a routed read (GD-0075 P8-0) then waits only on prepared
+    // writes of this key, never on ones above it in the same range.
+    let upper = codec::user_key_upper_bound(user_key);
+    let Some((key, value)) = kv
+        .range(
+            ks,
+            Bound::Included(&seek),
+            Bound::Excluded(&upper),
+            Direction::Forward,
+        )?
+        .next()
+        .transpose()?
+    else {
         return Ok(None);
     };
     let (found, ts) = codec::split_versioned(&key)?;

@@ -483,3 +483,131 @@ fn role_writes_through_two_gateways_serialize() {
     assert_eq!(listed.len(), 16);
     assert_eq!(listed.iter().map(|r| r.1).collect::<BTreeSet<_>>().len(), 16);
 }
+
+/// Raw Rows user keys (version suffix stripped) through `client` at a fresh timestamp.
+fn row_keys(cluster: &Arc<LocalCluster>) -> BTreeSet<Vec<u8>> {
+    use crate::storage::cluster::read::RoutedKvRead;
+    use crate::storage::engine::{
+        codec,
+        hlc::Ts,
+        kv::{Direction, Keyspace, KvRead},
+    };
+    use crate::storage::range_api::RangeClient;
+    use std::ops::Bound;
+    let at = cluster.oracle().next(1).unwrap();
+    let reader = RoutedKvRead::new(cluster.clone(), Ts(at.0), 1 << 20);
+    reader
+        .range(
+            Keyspace::Rows,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            Direction::Forward,
+        )
+        .unwrap()
+        .map(|pair| {
+            let (key, _) = pair.unwrap();
+            codec::split_versioned(&key).unwrap().0.to_vec()
+        })
+        .collect()
+}
+
+/// GD-0075 P8-0: a prepared write whose outcome stays open (its gateway died mid-commit) holds
+/// up only reads of its own key. Point reads and bounded scans below it answer at once through
+/// another gateway; a read of that key waits and then sees the outcome.
+#[test]
+fn a_prepared_write_above_a_row_does_not_delay_point_reads_through_a_gateway() {
+    use crate::storage::range_api::{
+        ClusterTxnId, HomeOp, HomeReply, LockRequest, LockTarget, Outcome, RangeClient,
+        RangeLockMode, RangeWrite,
+    };
+    use std::time::Instant;
+    let cluster = LocalCluster::new(&splits());
+    let a = gateway(&cluster, 1);
+    let mut sa = a.admin.sql_session();
+    run(&mut sa, "CREATE TABLE p(id INT PRIMARY KEY, v INT)");
+    run(&mut sa, "INSERT INTO p VALUES (1, 10), (2, 20)");
+    let before = row_keys(&cluster);
+    run(&mut sa, "INSERT INTO p VALUES (9, 90)");
+    let added: Vec<Vec<u8>> = row_keys(&cluster).difference(&before).cloned().collect();
+    let [key9] = added.as_slice() else {
+        panic!("one new row key, got {added:?}");
+    };
+    // A transaction of a dead gateway: home record open (never decided), key 9 prepared.
+    let range = cluster.range_of(RangeSpace::Rows, key9);
+    let epoch = cluster
+        .descriptor_for(&range_key(RangeSpace::Rows, key9))
+        .unwrap()
+        .epoch;
+    let txn = ClusterTxnId::new(77, 1);
+    let opened = cluster.home(range, epoch, HomeOp::Open { txn }).unwrap();
+    assert!(matches!(opened, HomeReply::Opened { .. }), "{opened:?}");
+    let grant = cluster
+        .lock(LockRequest {
+            range,
+            epoch,
+            txn,
+            priority: crate::storage::range_api::Timestamp(0),
+            target: LockTarget::Key {
+                space: RangeSpace::Rows,
+                key: key9.clone(),
+            },
+            mode: RangeLockMode::Exclusive,
+            timeout_ms: Some(1000),
+        })
+        .unwrap();
+    let write = RangeWrite {
+        space: RangeSpace::Rows,
+        key: key9.clone(),
+        value: Some(b"never applied".to_vec()),
+    };
+    cluster
+        .prepare(
+            range,
+            epoch,
+            txn,
+            range,
+            vec![write],
+            Some(grant.generation),
+        )
+        .unwrap();
+
+    // Another gateway: reads below key 9 answer well inside read_wait (2 s).
+    let b = gateway(&cluster, 2);
+    let mut sb = b.admin.sql_session();
+    for (sql, want) in [
+        ("SELECT v FROM p WHERE id = 1", vec![vec![10]]),
+        ("SELECT v FROM p WHERE id = 2", vec![vec![20]]),
+        ("SELECT v FROM p WHERE id = 5", vec![]),
+        (
+            "SELECT id FROM p WHERE id >= 1 AND id < 3 ORDER BY id",
+            vec![vec![1], vec![2]],
+        ),
+    ] {
+        let started = Instant::now();
+        let rows = sb
+            .execute_at(sql, &[], None, &clock())
+            .unwrap_or_else(|e| panic!("{sql}: {e:?} after {:?}", started.elapsed()));
+        assert_eq!(ints(&rows), want, "{sql}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "{sql} took {:?}",
+            started.elapsed()
+        );
+    }
+    // A read of key 9 waits for the outcome; the participant's abort releases it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let b = &b;
+        scope.spawn(move || {
+            let mut session = b.admin.sql_session();
+            let _ = tx.send(ints(&run(&mut session, "SELECT v FROM p WHERE id = 9")));
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a read of the prepared key must wait"
+        );
+        cluster.finalize(range, txn, Outcome::Abort).unwrap();
+        let rows = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(rows, vec![vec![90]]);
+    });
+}

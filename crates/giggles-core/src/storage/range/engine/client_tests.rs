@@ -309,3 +309,107 @@ fn catalog_only_commits_need_no_lock_but_rows_and_expired_leases_still_do() {
         Err(RangeError::Aborted(_))
     ));
 }
+
+/// One page of Rows on B at `ts` over [start, end].
+fn page(
+    e: &RangeEngine,
+    start: Bound<Vec<u8>>,
+    end: Bound<Vec<u8>>,
+    dir: ReadDirection,
+    ts: Timestamp,
+    page_bytes: usize,
+) -> Result<ReadPage, RangeError> {
+    e.read(ReadRequest {
+        range: B,
+        epoch: epoch(e),
+        space: RangeSpace::Rows,
+        start,
+        end,
+        dir,
+        ts,
+        page_bytes,
+    })
+}
+
+/// GD-0075 P8-0: a reader waits only on prepared writes inside what it actually reads. A
+/// prepared write of key 10 whose home never decides must not delay a point read of key 1, nor
+/// a scan page that ends before key 10 (either direction); a read that reaches key 10 waits.
+#[test]
+fn a_prepared_write_above_a_key_does_not_delay_reads_below_it() {
+    let f = fixture();
+    let homes = Homes::new(); // Status stays Open: the prepared record never resolves.
+    let (e, _client) = open_with(&f, &homes);
+    for n in [1, 2, 3, 20] {
+        let t = txn(100 + n);
+        let grant = lock(&e, t, n, Some(1000)).unwrap();
+        e.commit(
+            epoch(&e),
+            t,
+            vec![write(n, b"v")],
+            None,
+            Some(grant.generation),
+        )
+        .unwrap();
+    }
+    let p = prepare(&e, txn(1), 10, b"pending");
+    let at = Timestamp(p.0 + 10);
+    let fast = Duration::from_millis(200); // read_wait is 400 ms
+
+    // A point read (the bounds mvcc::read_at sends): key 1's versions only.
+    let key1 = super::tests::key(1);
+    let started = Instant::now();
+    let got = page(
+        &e,
+        Bound::Included(codec::user_key_seek_at(&key1, ts(at))),
+        Bound::Excluded(codec::user_key_upper_bound(&key1)),
+        ReadDirection::Forward,
+        at,
+        1 << 20,
+    )
+    .unwrap();
+    assert!(started.elapsed() < fast, "{:?}", started.elapsed());
+    assert_eq!(got.pairs.len(), 1);
+
+    // An unbounded forward scan whose first page stops at key 1: that page answers at once.
+    let started = Instant::now();
+    let first = page(
+        &e,
+        Bound::Unbounded,
+        Bound::Unbounded,
+        ReadDirection::Forward,
+        at,
+        1,
+    )
+    .unwrap();
+    assert!(started.elapsed() < fast, "{:?}", started.elapsed());
+    assert_eq!(first.pairs.len(), 1);
+    // A reverse page from the top that stops at key 20 does not reach key 10 either.
+    let started = Instant::now();
+    let top = page(
+        &e,
+        Bound::Unbounded,
+        Bound::Unbounded,
+        ReadDirection::Reverse,
+        at,
+        1,
+    )
+    .unwrap();
+    assert!(started.elapsed() < fast, "{:?}", started.elapsed());
+    assert_eq!(top.pairs.len(), 1);
+
+    // Reading on reaches key 10: that page waits for the outcome, up to read_wait.
+    let mut start = first.resume.unwrap();
+    let started = Instant::now();
+    let reached = loop {
+        match page(&e, start, Bound::Unbounded, ReadDirection::Forward, at, 1) {
+            Ok(next) => start = next.resume.expect("key 10 lies before the end"),
+            Err(err) => break err,
+        }
+    };
+    assert!(matches!(reached, RangeError::Unavailable(_)), "{reached:?}");
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    // A read below p is never blocked by it.
+    let below = read_all(&e, Timestamp(p.0 - 1), ReadDirection::Forward, 1);
+    assert_eq!(below.len(), 4);
+    assert_eq!(e.state().prepared.len(), 1);
+}

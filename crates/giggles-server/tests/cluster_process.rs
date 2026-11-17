@@ -448,3 +448,89 @@ async fn cluster_status_reports_a_running_cluster() {
     }
     eprintln!("cluster_status_reports_a_running_cluster: {:?}", started.elapsed());
 }
+
+/// GD-0075 P8-0: a gateway that dies mid-commit (every participant prepared and voted, no
+/// decision) holds up only reads of the rows it wrote, until recovery decides. Point reads of
+/// every other row answer at once on the other nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateway_dying_mid_commit_stalls_only_its_own_rows() {
+    let started = Instant::now();
+    let mut cluster = ClusterProcs::new(3).await;
+    let c1 = cluster.client(0).await;
+    create_tables(&c1).await;
+    for id in 1..=20 {
+        insert_u(&c1, id, id * 10).await;
+    }
+    // Node 2 comes back armed: its next cross-range COMMIT aborts the process after prepare.
+    cluster.kill(1);
+    cluster.set_env(1, "GIGGLES_CORE_FAILPOINT", "gateway.commit.prepared");
+    cluster.start(1);
+    cluster.ready(1).await;
+    let c2 = cluster.client(1).await;
+    batch(&c2, "BEGIN").await;
+    assert_eq!(exec(&c2, "UPDATE u SET v = -1 WHERE id = 15", &[]).await, 1);
+    insert_t(&c2, 2).await;
+    let commit = tokio::time::timeout(STATEMENT_WAIT, c2.batch_execute("COMMIT")).await;
+    assert!(
+        !matches!(commit, Ok(Ok(()))),
+        "COMMIT must not succeed: {commit:?}"
+    );
+    cluster.exited(1, STATEMENT_WAIT).await;
+    assert!(
+        cluster
+            .stderr(1)
+            .contains("failpoint crash: gateway.commit.prepared"),
+        "node 2 did not die between prepare and decide"
+    );
+    let died = Instant::now();
+
+    // Leaders node 2 held move first: one untimed read per node waits for that.
+    let c3 = cluster.client(2).await;
+    for c in [&c1, &c3] {
+        assert_eq!(
+            rows(c, "SELECT v FROM u WHERE id = 1").await,
+            vec![vec![10]]
+        );
+    }
+    // Every other row, from both surviving gateways, answers well inside read_wait (5 s).
+    let mut slowest = Duration::ZERO;
+    for id in (1..=20_i64).filter(|id| *id != 15) {
+        for c in [&c1, &c3] {
+            let asked = Instant::now();
+            let got = rows(c, &format!("SELECT v FROM u WHERE id = {id}")).await;
+            assert_eq!(got, vec![vec![id * 10]], "row {id}");
+            slowest = slowest.max(asked.elapsed());
+        }
+    }
+    let scan = Instant::now();
+    assert_eq!(
+        rows(&c3, "SELECT count(*) FROM u WHERE id BETWEEN 1 AND 10").await,
+        vec![vec![10]]
+    );
+    slowest = slowest.max(scan.elapsed());
+    let checked = died.elapsed();
+    assert!(slowest < Duration::from_secs(2), "slowest read {slowest:?}");
+    // Still inside recovery's 30 s: the prepared row itself is held up.
+    let c4 = cluster.client(2).await;
+    let held = tokio::time::timeout(
+        Duration::from_secs(2),
+        c4.query("SELECT v FROM u WHERE id = 15", &[]),
+    )
+    .await;
+    assert!(
+        held.is_err() || died.elapsed() >= Duration::from_secs(25),
+        "the prepared row answered at once: {held:?}"
+    );
+    // Recovery aborts the undecided transaction; every node then agrees.
+    assert_eq!(
+        rows(&c1, "SELECT v FROM u WHERE id = 15").await,
+        vec![vec![150]]
+    );
+    assert_eq!(rows(&c3, "SELECT count(*) FROM t").await, vec![vec![0]]);
+    cluster.assert_proxies_unsaturated();
+    eprintln!(
+        "a_gateway_dying_mid_commit_stalls_only_its_own_rows: slowest other read {slowest:?}, \
+         checks done {checked:?} after the crash, total {:?}",
+        started.elapsed()
+    );
+}

@@ -86,8 +86,9 @@ impl Page {
 }
 
 impl RangeEngine {
-    /// O6: raise the served floor to T and wait for reservations at or below T (gate), wait
-    /// for prepared records with p <= T that write inside the span, then read MVCC at T.
+    /// O6: raise the served floor to T and wait for reservations at or below T (gate), read
+    /// MVCC at T, and wait for prepared records with p <= T that write inside the part of the
+    /// span the page covers, reading again after they resolve (P8-0).
     pub(super) fn read_page(&self, req: ReadRequest) -> Result<ReadPage, RangeError> {
         self.check_open()?;
         // A stale reply names the range holding the key the gateway routes this page by:
@@ -127,8 +128,8 @@ impl RangeEngine {
                 "read timestamp is ahead of the timestamp oracle".into(),
             ));
         }
-        let start = max_start(req.start, lo);
-        let end = min_end(req.end, hi);
+        let start = max_start(req.start.clone(), lo);
+        let end = min_end(req.end.clone(), hi);
         let at = ts(req.ts);
         let ks = keyspace_of(req.space);
         let versioned = is_versioned(req.space);
@@ -140,34 +141,84 @@ impl RangeEngine {
         }
         let mut next_resolve = Instant::now() + self.config.resolve_after;
         loop {
+            // P8-0: wait only on prepared writes inside what this page actually read. Records
+            // with p <= T can only leave (the gate above admits no new ones), so the set taken
+            // before reading still covers every write a finalize could add under the page.
+            let pending = self.prepared_at_or_below(at, ks, versioned, &start, &end);
+            let page = self.scan_page(&req, ks, versioned, &start, &end)?;
+            let (from, to) = covered(&start, &end, page.resume.as_ref(), req.dir);
+            let blocking: Vec<ClusterTxnId> = pending
+                .into_iter()
+                .filter(|(_, positions)| positions.iter().any(|pos| inside(pos, &from, &to)))
+                .map(|(txn, _)| txn)
+                .collect();
+            if blocking.is_empty() {
+                self.check_open()?;
+                return Ok(ReadPage {
+                    pairs: page.pairs,
+                    resume: page.resume,
+                    range_end,
+                });
+            }
+            self.await_prepared(&blocking, deadline, &mut next_resolve)?;
+        }
+    }
+
+    /// Prepared records with p <= `at` that write inside [start, end], each with the raw
+    /// positions (seek keys at `at` in a versioned space) of those writes.
+    fn prepared_at_or_below(
+        &self,
+        at: Ts,
+        ks: crate::storage::engine::kv::Keyspace,
+        versioned: bool,
+        start: &Raw,
+        end: &Raw,
+    ) -> Vec<(ClusterTxnId, Vec<Vec<u8>>)> {
+        let state = self.state();
+        state
+            .prepared
+            .iter()
+            .filter(|(_, record)| record.at <= at)
+            .filter_map(|(txn, record)| {
+                let positions: Vec<Vec<u8>> = record
+                    .writes
+                    .keys()
+                    .filter(|(wks, _)| *wks == ks)
+                    .map(|(_, key)| {
+                        if versioned {
+                            codec::user_key_seek_at(key, at)
+                        } else {
+                            key.clone()
+                        }
+                    })
+                    .filter(|pos| inside(pos, start, end))
+                    .collect();
+                (!positions.is_empty()).then_some((*txn, positions))
+            })
+            .collect()
+    }
+
+    /// O6: waits until none of `txns` holds a prepared record here, resolving them through
+    /// their homes (R5-53) at most every `resolve_after`; Unavailable at `deadline`.
+    fn await_prepared(
+        &self,
+        txns: &[ClusterTxnId],
+        deadline: Instant,
+        next_resolve: &mut Instant,
+    ) -> Result<(), RangeError> {
+        loop {
             // Taken outside `self.state`: dropping the last reference runs the client's Drop.
             let client = self.client();
             let blockers = {
                 let mut state = self.state();
                 loop {
                     self.check_open()?;
-                    let blockers: Vec<(ClusterTxnId, RangeId)> = state
-                        .prepared
+                    let blockers: Vec<(ClusterTxnId, RangeId)> = txns
                         .iter()
-                        .filter(|(_, record)| {
-                            record.at <= at
-                                && record.writes.keys().any(|(wks, key)| {
-                                    *wks == ks
-                                        && inside(
-                                            &if versioned {
-                                                codec::user_key_seek_at(key, at)
-                                            } else {
-                                                key.clone()
-                                            },
-                                            &start,
-                                            &end,
-                                        )
-                                })
-                        })
-                        .map(|(txn, record)| (*txn, record.home))
+                        .filter_map(|txn| state.prepared.get(txn).map(|r| (*txn, r.home)))
                         .collect();
                     if blockers.is_empty() {
-                        break blockers;
+                        return Ok(());
                     }
                     let now = Instant::now();
                     if now >= deadline {
@@ -175,11 +226,11 @@ impl RangeEngine {
                             "prepared transaction unresolved".into(),
                         ));
                     }
-                    if client.is_some() && now >= next_resolve {
+                    if client.is_some() && now >= *next_resolve {
                         break blockers;
                     }
                     let until = match client {
-                        Some(_) => deadline.min(next_resolve),
+                        Some(_) => deadline.min(*next_resolve),
                         None => deadline,
                     };
                     state = self
@@ -189,14 +240,26 @@ impl RangeEngine {
                         .0;
                 }
             };
-            let Some(client) = client.filter(|_| !blockers.is_empty()) else {
-                break;
+            let Some(client) = client else {
+                continue;
             };
             // R5-53: Finalized removes the record (check again); Pending or an error waits,
             // asking again at most every `resolve_after`.
             self.resolve_blockers(&*client, &blockers);
-            next_resolve = Instant::now() + self.config.resolve_after;
+            *next_resolve = Instant::now() + self.config.resolve_after;
         }
+    }
+
+    /// One page of MVCC at `req.ts` over [start, end] (already clipped to this range).
+    fn scan_page(
+        &self,
+        req: &ReadRequest,
+        ks: crate::storage::engine::kv::Keyspace,
+        versioned: bool,
+        start: &Raw,
+        end: &Raw,
+    ) -> Result<Page, RangeError> {
+        let at = ts(req.ts);
         let dir = match req.dir {
             ReadDirection::Forward => crate::storage::engine::kv::Direction::Forward,
             ReadDirection::Reverse => crate::storage::engine::kv::Direction::Reverse,
@@ -264,12 +327,21 @@ impl RangeEngine {
                 page.push(k, v, Some(&prev));
             }
         }
-        let Page { pairs, resume, .. } = page;
-        self.check_open()?;
-        Ok(ReadPage {
-            pairs,
-            resume,
-            range_end,
-        })
+        Ok(page)
+    }
+}
+
+/// The part of [start, end] a page read: up to (Forward) or down to (Reverse) its resume
+/// point, which the next page starts from; all of it when the page ends the span.
+fn covered(start: &Raw, end: &Raw, resume: Option<&Raw>, dir: ReadDirection) -> (Raw, Raw) {
+    let flip = |bound: &Raw| match bound {
+        Bound::Included(key) => Bound::Excluded(key.clone()),
+        Bound::Excluded(key) => Bound::Included(key.clone()),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    match (resume, dir) {
+        (None, _) => (start.clone(), end.clone()),
+        (Some(next), ReadDirection::Forward) => (start.clone(), flip(next)),
+        (Some(next), ReadDirection::Reverse) => (flip(next), end.clone()),
     }
 }
