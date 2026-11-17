@@ -140,7 +140,12 @@ impl LoadCounters {
     fn snapshot(&self, range: RangeId) -> (CallCounts, u64, u64) {
         let slot = self.slot();
         let oldest = Duration::from_secs(slot.saturating_sub(SLOTS - 1) * SLOT_SECS);
-        let window = self.start.elapsed().saturating_sub(oldest).as_millis().max(1) as u64;
+        let window = self
+            .start
+            .elapsed()
+            .saturating_sub(oldest)
+            .as_millis()
+            .max(1) as u64;
         let ranges = self.ranges.lock().unwrap_or_else(|p| p.into_inner());
         let mut load = ranges.get(&range).cloned().unwrap_or_default();
         load.advance(slot);
@@ -326,6 +331,35 @@ impl StatusService {
 }
 
 impl NodeService for StatusService {
+    fn registry_update(&self, call: NodeCall) -> std::result::Result<PeerReply, RangeError> {
+        let client = self
+            .client
+            .upgrade()
+            .ok_or_else(|| RangeError::Unavailable("node stopped".into()))?;
+        let result = match call {
+            NodeCall::RetireNode { id } => {
+                registry::retire(&*client, self.node_id, id).map(PeerReply::Retired)
+            }
+            NodeCall::EnrolNode {
+                id,
+                address,
+                fingerprint,
+            } => registry::enrol(
+                &*client,
+                self.node_id,
+                NodeRecord {
+                    id,
+                    address,
+                    fingerprint,
+                    state: NodeState::Active,
+                },
+            )
+            .map(PeerReply::Enrolled),
+            _ => return Err(RangeError::Corrupt("not a registry call".into())),
+        };
+        result.map_err(|e| RangeError::Unavailable(e.to_string()))
+    }
+
     fn move_range(
         &self,
         range: RangeId,
@@ -957,9 +991,27 @@ pub fn request_move(
     to: u64,
     timeout: Duration,
 ) -> Result<MoveReply> {
+    match request_node(
+        config,
+        members,
+        NodeCall::MoveRange { range, from, to },
+        timeout,
+    )? {
+        PeerReply::Moving(reply) => Ok(reply),
+        _ => Err(Error::Corrupt("mismatched move reply".into())),
+    }
+}
+
+/// Send an operator call to a reachable member; move requests follow leader hints.
+pub fn request_node(
+    config: &TransportConfig,
+    members: &[u64],
+    call: NodeCall,
+    timeout: Duration,
+) -> Result<PeerReply> {
+    let moving = matches!(call, NodeCall::MoveRange { .. });
     let (_, connector) = transport::tls(config)?;
-    let body = call_codec::encode_call(&PeerCall::Node(NodeCall::MoveRange { range, from, to }))
-        .map_err(core)?;
+    let body = call_codec::encode_call(&PeerCall::Node(call)).map_err(core)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -1003,15 +1055,25 @@ pub fn request_move(
                         _ => Err(Error::Corrupt("unexpected move reply frame".into())),
                     }
                 };
-                match tokio::time::timeout(Duration::from_secs(1), exchange).await {
+                match tokio::time::timeout(
+                    if moving {
+                        Duration::from_secs(1)
+                    } else {
+                        timeout
+                    },
+                    exchange,
+                )
+                .await
+                {
                     Ok(Ok(PeerReply::Moving(reply))) => {
                         if reply.leader == Some(target) {
-                            return Ok(reply);
+                            return Ok(PeerReply::Moving(reply));
                         }
                         if let Some(leader) = reply.leader {
                             targets.push_front(leader);
                         }
                     }
+                    Ok(Ok(reply)) if !moving => return Ok(reply),
                     Ok(Ok(_)) => return Err(Error::Corrupt("mismatched move reply".into())),
                     Ok(Err(e)) => last = e.to_string(),
                     Err(_) => last = "move request timed out".into(),
@@ -1023,4 +1085,107 @@ pub fn request_move(
             .await
             .map_err(|_| Error::Apply("move request timed out".into()))?
     })
+}
+
+/// Outcome of each sequential range replacement.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplaceOutcome {
+    Moved,
+    Refused(String),
+    Failed(String),
+}
+#[derive(Debug)]
+pub struct ReplaceReport {
+    pub ranges: Vec<(RangeId, ReplaceOutcome)>,
+    pub retired: bool,
+    pub retirement_error: Option<String>,
+}
+
+/// Replace every replica of a lost node, allowing each range its own timeout.
+/// Enrolling the destination first is required. Failed ranges do not block attempts on others.
+pub fn replace_node(
+    config: &TransportConfig,
+    members: &[u64],
+    lost: u64,
+    new: u64,
+    timeout: Duration,
+) -> Result<ReplaceReport> {
+    if lost == new || lost == 0 || new == 0 {
+        return Err(Error::Identity("distinct nonzero node ids required".into()));
+    }
+    let answers = query_status(config, members, timeout.min(Duration::from_secs(5)))?;
+    if !answers.iter().any(|(_, a)| a.is_ok()) {
+        return Err(Error::Apply("no reachable members".into()));
+    }
+    let mut newest = BTreeMap::<u64, RangeDescriptor>::new();
+    for (_, answer) in answers {
+        for r in answer.into_iter().flat_map(|n| n.ranges) {
+            let d = r.descriptor;
+            if newest.get(&d.id.0).is_none_or(|old| old.epoch < d.epoch) {
+                newest.insert(d.id.0, d);
+            }
+        }
+    }
+    let mut report = ReplaceReport {
+        ranges: Vec::new(),
+        retired: false,
+        retirement_error: None,
+    };
+    for d in newest
+        .values()
+        .filter(|d| d.replicas.iter().any(|r| r.node == lost))
+    {
+        let deadline = Instant::now() + timeout;
+        let mut move_retries = 0;
+        let outcome = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break ReplaceOutcome::Failed("move timed out".into());
+            }
+            match request_move(
+                config,
+                members,
+                d.id,
+                lost,
+                new,
+                remaining.min(Duration::from_secs(5)),
+            ) {
+                Ok(reply) => {
+                    if let Some(error) = reply.error {
+                        if error.contains("refused") {
+                            break ReplaceOutcome::Refused(error);
+                        }
+                        if move_retries == 3 {
+                            break ReplaceOutcome::Failed(error);
+                        }
+                        // The move driver resumes its persisted step on the next request.
+                        move_retries += 1;
+                    }
+                    if reply.done {
+                        break ReplaceOutcome::Moved;
+                    }
+                }
+                Err(error) if Instant::now() >= deadline => {
+                    break ReplaceOutcome::Failed(error.to_string());
+                }
+                Err(_) => {} // Leader election and connection loss can be transient after the kill.
+            }
+            thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        };
+        report.ranges.push((d.id, outcome));
+    }
+    if report
+        .ranges
+        .iter()
+        .all(|(_, o)| *o == ReplaceOutcome::Moved)
+    {
+        match request_node(config, members, NodeCall::RetireNode { id: lost }, timeout) {
+            Ok(PeerReply::Retired(_)) => report.retired = true,
+            Ok(_) => report.retirement_error = Some("mismatched retirement reply".into()),
+            Err(e) => report.retirement_error = Some(e.to_string()),
+        }
+    }
+    Ok(report)
 }

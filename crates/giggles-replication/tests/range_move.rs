@@ -126,8 +126,12 @@ fn start() -> (
     .unwrap();
     watchers.push(nodes[3].start_registry_watcher(Duration::from_millis(100)));
     eventually(|| {
-        nodes[..3].iter().all(|node| node.transport().calls()
-            .call(4, PeerCall::Node(NodeCall::Status), CALL).is_ok())
+        nodes[..3].iter().all(|node| {
+            node.transport()
+                .calls()
+                .call(4, PeerCall::Node(NodeCall::Status), CALL)
+                .is_ok()
+        })
     });
     (root, nodes, watchers, configs)
 }
@@ -333,13 +337,14 @@ fn admin_move_redirects_and_resumes_after_leader_restart() {
     watchers.push(watcher);
     eventually(|| {
         let handle = leader(&nodes).host().group(range).unwrap();
-        giggles_replication::replace::status(&handle).is_ok_and(|s|
-            s.reachable.contains(&leader_id) && s.reachable.iter().filter(|&&id| id != from).count() >= 2)
+        giggles_replication::replace::status(&handle).is_ok_and(|s| {
+            s.reachable.contains(&leader_id)
+                && s.reachable.iter().filter(|&&id| id != from).count() >= 2
+        })
     });
     let deadline = Instant::now() + READY;
     loop {
-        if let Ok(reply) = request_move(&admin, &[replacement_leader], range, from, 4, CALL * 3)
-        {
+        if let Ok(reply) = request_move(&admin, &[replacement_leader], range, from, 4, CALL * 3) {
             assert!(reply.error.is_none(), "{reply:?}");
             if reply.done {
                 break;
@@ -355,6 +360,60 @@ fn admin_move_redirects_and_resumes_after_leader_restart() {
             .filter_map(|(_, r)| r.as_ref().ok())
             .flat_map(|r| &r.ranges)
             .any(|r| r.descriptor.id == range && r.descriptor.replicas.iter().any(|r| r.node == 4))
+    );
+    for watcher in &mut watchers {
+        watcher.stop();
+    }
+    for node in nodes {
+        node.stop();
+    }
+}
+
+#[test]
+fn registry_read_retries_after_system_range_move() {
+    let (_root, nodes, mut watchers, _) = start();
+    let old = nodes[0]
+        .client()
+        .descriptor_for(&range_key(RangeSpace::Catalog, &[registry::REGISTRY_TAG]))
+        .unwrap();
+    let stale = RoutedRangeClient::new(
+        nodes[0].node_id(),
+        old.clone(),
+        nodes[0].transport().calls().clone() as Arc<dyn RangeTransport>,
+        nodes[0].host().clone() as Arc<dyn LocalRanges>,
+    );
+    stale.learn(&old);
+    let expected = registry::read_all(&**nodes[0].client()).unwrap();
+    let deadline = Instant::now() + READY;
+    let moved = loop {
+        let leader = nodes
+            .iter()
+            .find(|n| n.host().service(SYSTEM_RANGE).is_some());
+        if let Some(leader) = leader {
+            let from = MEMBERS
+                .iter()
+                .copied()
+                .find(|id| *id != leader.node_id())
+                .unwrap();
+            match move_replica(leader, SYSTEM_RANGE, from, 4, READY).unwrap() {
+                MoveOutcome::Done(desc) => break desc,
+                MoveOutcome::NotLeader { .. } => {}
+            }
+        }
+        assert!(Instant::now() < deadline, "system move did not finish");
+        thread::sleep(Duration::from_millis(50));
+    };
+    let key = range_key(RangeSpace::Catalog, &[registry::REGISTRY_TAG]);
+    assert!(moved.epoch > old.epoch);
+    assert_eq!(stale.descriptor_for(&key).unwrap().epoch, old.epoch);
+    assert_eq!(registry::read_all(&stale).unwrap(), expected);
+    assert_eq!(stale.descriptor_for(&key).unwrap().epoch, moved.epoch);
+    // Retirement also scans the directory after the system range changes.
+    assert!(
+        registry::retire(&stale, 1, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("still a replica")
     );
     for watcher in &mut watchers {
         watcher.stop();

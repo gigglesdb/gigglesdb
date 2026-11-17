@@ -4,7 +4,7 @@ use giggles_replication::call_codec::{NodeReport, RangeReport, RangeRole};
 use serde::Serialize;
 use std::{collections::BTreeMap, fmt::Write, time::Duration};
 
-pub const USAGE: &str = "usage: giggles-server cluster status <config.json> [--json]";
+pub const USAGE: &str = "usage: giggles-server cluster status <config.json> [--json] | cluster enrol <config.json> <id> <address> <fingerprint>";
 /// How long each member gets to answer.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -12,18 +12,44 @@ pub const TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Command {
     pub config: String,
     pub json: bool,
+    pub enrol: Option<(u64, String, String)>,
 }
 
 impl Command {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, &'static str> {
         let mut args = args.into_iter();
-        if args.next().as_deref() != Some("status") {
+        let op = args.next().ok_or(USAGE)?;
+        if op != "status" && op != "enrol" {
             return Err(USAGE);
         }
         let config = args
             .next()
             .filter(|s| !s.is_empty() && !s.starts_with('-'))
             .ok_or(USAGE)?;
+        if op == "enrol" {
+            let id: u64 = args
+                .next()
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse().ok())
+                .filter(|&id| id != 0)
+                .ok_or(USAGE)?;
+            let address = args
+                .next()
+                .filter(|s| s.parse::<std::net::SocketAddr>().is_ok())
+                .ok_or(USAGE)?;
+            let fingerprint = args
+                .next()
+                .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or(USAGE)?;
+            if args.next().is_some() {
+                return Err(USAGE);
+            }
+            return Ok(Self {
+                config,
+                json: false,
+                enrol: Some((id, address, fingerprint.to_ascii_lowercase())),
+            });
+        }
         let json = match args.next().as_deref() {
             None => false,
             Some("--json") => true,
@@ -32,7 +58,11 @@ impl Command {
         if args.next().is_some() {
             return Err(USAGE);
         }
-        Ok(Self { config, json })
+        Ok(Self {
+            config,
+            json,
+            enrol: None,
+        })
     }
 }
 
@@ -194,7 +224,9 @@ pub fn text(summary: &Summary) -> String {
     };
     line(
         &mut out,
-        ["RANGE", "EPOCH", "BOUNDS", "REPLICAS", "LEADER", "SIZE", "CALLS/S"],
+        [
+            "RANGE", "EPOCH", "BOUNDS", "REPLICAS", "LEADER", "SIZE", "CALLS/S",
+        ],
     );
     for r in &summary.ranges {
         let bounds = format!(
@@ -273,13 +305,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_enrol() {
+        let parse = |s: &str| Command::parse(s.split_whitespace().map(str::to_owned));
+        assert!(
+            parse(&format!("enrol cfg 4 127.0.0.1:1234 {}", "ab".repeat(32)))
+                .unwrap()
+                .enrol
+                .is_some()
+        );
+        for bad in [
+            "enrol cfg 0 addr fp",
+            "enrol cfg 4 127.0.0.1:12 bad",
+            "enrol cfg 4",
+            "enrol",
+        ] {
+            assert!(parse(bad).is_err());
+        }
+    }
+
+    #[test]
     fn parses_status_and_json() {
         let parse = |s: &str| Command::parse(s.split_whitespace().map(str::to_owned));
         assert_eq!(
             parse("status cfg.json").unwrap(),
             Command {
                 config: "cfg.json".into(),
-                json: false
+                json: false,
+                enrol: None
             }
         );
         assert!(parse("status cfg.json --json").unwrap().json);

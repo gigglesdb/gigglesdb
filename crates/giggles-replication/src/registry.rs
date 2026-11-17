@@ -110,30 +110,54 @@ fn decode_record(key: &[u8], value: &[u8]) -> std::result::Result<Option<NodeRec
 }
 
 pub fn read_all(client: &dyn RangeClient) -> std::result::Result<Vec<NodeRecord>, RangeError> {
-    let system = client.descriptor_for(&range_key(RangeSpace::Catalog, &[REGISTRY_TAG]))?;
-    let mut req = ReadRequest {
-        range: system.id,
-        epoch: system.epoch,
-        space: RangeSpace::Catalog,
-        start: Bound::Included(vec![REGISTRY_TAG]),
-        end: Bound::Excluded(vec![REGISTRY_TAG + 1]),
-        dir: ReadDirection::Forward,
-        ts: client.oracle().next(1)?,
-        page_bytes: 4096,
-    };
-    let mut records = Vec::new();
-    loop {
-        let page = client.read(req.clone())?;
-        for (key, value) in page.pairs {
-            if let Some(record) = decode_record(&key, &value)? {
-                records.push(record);
+    scan_catalog(client, REGISTRY_TAG, decode_record)
+}
+
+/// Restart the entire scan after routing changes, discarding partial pages and timestamps.
+fn scan_catalog<T>(
+    client: &dyn RangeClient,
+    tag: u8,
+    decode: impl Fn(&[u8], &[u8]) -> std::result::Result<Option<T>, RangeError>,
+) -> std::result::Result<Vec<T>, RangeError> {
+    for attempt in 0..10 {
+        let result = (|| {
+            let system = client.descriptor_for(&range_key(RangeSpace::Catalog, &[tag]))?;
+            let mut req = ReadRequest {
+                range: system.id,
+                epoch: system.epoch,
+                space: RangeSpace::Catalog,
+                start: Bound::Included(vec![tag]),
+                end: Bound::Excluded(vec![tag + 1]),
+                dir: ReadDirection::Forward,
+                ts: client.oracle().next(1)?,
+                page_bytes: 4096,
+            };
+            let mut records = Vec::new();
+            loop {
+                let page = client.read(req.clone())?;
+                for (key, value) in page.pairs {
+                    if let Some(record) = decode(&key, &value)? {
+                        records.push(record);
+                    }
+                }
+                match page.resume {
+                    Some(resume) => req.start = resume,
+                    None => return Ok(records),
+                }
             }
-        }
-        match page.resume {
-            Some(resume) => req.start = resume,
-            None => return Ok(records),
+        })();
+        match result {
+            Err(
+                RangeError::StaleEpoch { .. }
+                | RangeError::NotLeader { .. }
+                | RangeError::Unavailable(_),
+            ) if attempt < 9 => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            result => return result,
         }
     }
+    unreachable!("last failed attempt returns an error")
 }
 
 /// Retry uncertain outcomes only after reading the registry again.
@@ -233,41 +257,18 @@ pub fn retire(client: &dyn RangeClient, node: u64, id: u64) -> Result<bool> {
         if record.state == NodeState::Retired {
             return Ok(None);
         }
-        let tag = crate::directory::DIRECTORY_TAG;
-        let system = client
-            .descriptor_for(&range_key(RangeSpace::Catalog, &[tag]))
-            .map_err(|e| Error::Core(e.to_string()))?;
-        let mut req = ReadRequest {
-            range: system.id,
-            epoch: system.epoch,
-            space: RangeSpace::Catalog,
-            start: Bound::Included(vec![tag]),
-            end: Bound::Excluded(vec![tag + 1]),
-            dir: ReadDirection::Forward,
-            ts: client
-                .oracle()
-                .next(1)
-                .map_err(|e| Error::Core(e.to_string()))?,
-            page_bytes: 4096,
-        };
-        loop {
-            let page = client
-                .read(req.clone())
-                .map_err(|e| Error::Core(e.to_string()))?;
-            for (key, value) in page.pairs {
-                if let Some(desc) = crate::directory::decode_record(&key, &value)
-                    .map_err(|e| Error::Core(e.to_string()))?
-                    && desc.replicas.iter().any(|replica| replica.node == id)
-                {
-                    return Err(Error::Identity(format!(
-                        "node {id} is still a replica of range {}",
-                        desc.id.0
-                    )));
-                }
-            }
-            match page.resume {
-                Some(resume) => req.start = resume,
-                None => break,
+        let descriptors = scan_catalog(
+            client,
+            crate::directory::DIRECTORY_TAG,
+            crate::directory::decode_record,
+        )
+        .map_err(|e| Error::Core(e.to_string()))?;
+        for desc in descriptors {
+            if desc.replicas.iter().any(|replica| replica.node == id) {
+                return Err(Error::Identity(format!(
+                    "node {id} is still a replica of range {}",
+                    desc.id.0
+                )));
             }
         }
         record.state = NodeState::Retired;

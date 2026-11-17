@@ -271,3 +271,5 @@ mod sort_spill_network;
 mod replication_role_setting;
 #[path = "api_role_listener.rs"]
 mod api_role_listener;
+#[path = "cluster_replace.rs"]
+mod cluster_replace;

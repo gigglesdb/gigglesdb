@@ -32,6 +32,8 @@ pub struct ClusterConfig {
     #[serde(default = "default_tick_ms")]
     pub tick_ms: u64,
     pub replication_factor: Option<usize>,
+    /// Initial layout members; excludes a joining spare from bootstrap Raft groups.
+    pub initial_members: Option<Vec<u64>>,
     /// Development only: initial split points as hex range keys.
     #[serde(default)]
     pub split_keys: Vec<String>,
@@ -50,6 +52,7 @@ pub struct ClusterValidated {
     pub listen: SocketAddr,
     /// Every member id including this node, ascending.
     pub members: Vec<u64>,
+    pub initial_members: Vec<u64>,
     pub peers: Vec<(u64, SocketAddr, String)>,
     pub log_dir: PathBuf,
     pub snapshot_dir: PathBuf,
@@ -143,6 +146,18 @@ impl ClusterConfig {
             peers.push((peer.id, peer.address, peer.fingerprint.clone()));
         }
         members.sort_unstable();
+        let initial_members = self
+            .initial_members
+            .clone()
+            .unwrap_or_else(|| members.clone());
+        if initial_members.is_empty()
+            || initial_members.windows(2).any(|w| w[0] >= w[1])
+            || initial_members.iter().any(|id| !members.contains(id))
+        {
+            return Err(
+                "cluster.initial_members: must be sorted, unique configured member ids".into(),
+            );
+        }
         let replication_factor = match self.replication_factor {
             Some(n) if !(1..=members.len()).contains(&n) => {
                 return Err(format!(
@@ -167,6 +182,7 @@ impl ClusterConfig {
             cluster,
             listen: self.listen,
             members,
+            initial_members,
             peers,
             log_dir,
             snapshot_dir,
@@ -213,6 +229,7 @@ mod tests {
             ca: None,
             tick_ms: 100,
             replication_factor: None,
+            initial_members: None,
             split_keys: Vec::new(),
             owner: None,
         }
@@ -234,6 +251,17 @@ mod tests {
 
     fn key(space: RangeSpace, user: &[u8]) -> String {
         hex::encode(range_key(space, user))
+    }
+
+    #[test]
+    fn validates_spare_initial_members() {
+        let mut c = config();
+        c.initial_members = Some(vec![1, 2]);
+        assert_eq!(validate(&c).unwrap().initial_members, [1, 2]);
+        for ids in [vec![], vec![2, 1], vec![1, 1], vec![1, 4]] {
+            c.initial_members = Some(ids);
+            assert!(validate(&c).is_err());
+        }
     }
 
     #[test]

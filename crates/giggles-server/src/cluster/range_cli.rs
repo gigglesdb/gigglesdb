@@ -2,15 +2,20 @@
 use giggles_core::range_api::{RangeId, ReplicaRole};
 use giggles_replication::{
     call_codec::{MoveReply, NodeReport, RangeReport, RangeRole},
-    cluster_node::{query_status, request_move},
+    cluster_node::{query_status, replace_node, request_move},
     transport::TransportConfig,
 };
 use std::{collections::BTreeMap, fmt::Write, time::Duration};
 
-pub const USAGE: &str = "usage: giggles-server range move <config.json> <range> <from> <to> [--wait] | range status <config.json> [<range>]";
+pub const USAGE: &str = "usage: giggles-server range move <config.json> <range> <from> <to> [--wait] | range replace-node <config.json> <lost> <new> [--timeout <s>] | range status <config.json> [<range>]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
+    Replace {
+        lost: u64,
+        new: u64,
+        timeout: Duration,
+    },
     Move {
         range: RangeId,
         from: u64,
@@ -38,6 +43,22 @@ impl Command {
             s.parse().ok().filter(|&n| n != 0).ok_or(USAGE)
         };
         let action = match args.as_slice() {
+            [op, _, lost, new, rest @ ..] if op == "replace-node" => {
+                let seconds = match rest {
+                    [] => 60,
+                    [flag, seconds] if flag == "--timeout" => id(seconds)?.min(86400),
+                    _ => return Err(USAGE),
+                };
+                let (lost, new) = (id(lost)?, id(new)?);
+                if lost == new {
+                    return Err(USAGE);
+                }
+                Action::Replace {
+                    lost,
+                    new,
+                    timeout: Duration::from_secs(seconds),
+                }
+            }
             [op, _, range, from, to, rest @ ..] if op == "move" => {
                 let wait = match rest {
                     [] => false,
@@ -126,6 +147,25 @@ pub fn move_text(reply: &MoveReply) -> String {
 /// Blocking TLS requests; the binary runs this on a blocking thread.
 pub fn run(action: Action, transport: TransportConfig, members: Vec<u64>) -> i32 {
     match action {
+        Action::Replace { lost, new, timeout } => {
+            match replace_node(&transport, &members, lost, new, timeout) {
+                Ok(report) => {
+                    for (range, outcome) in &report.ranges {
+                        println!("range={} {outcome:?}", range.0);
+                    }
+                    println!(
+                        "retired={} error={}",
+                        report.retired,
+                        report.retirement_error.as_deref().unwrap_or("none")
+                    );
+                    i32::from(!report.retired)
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            }
+        }
         Action::Status { range } => match query_status(&transport, &members, super::cli::TIMEOUT) {
             Ok(answers) => {
                 print!("{}", status_text(&answers, range));
@@ -172,6 +212,30 @@ mod tests {
     use super::*;
     use giggles_core::range_api::{Epoch, RangeDescriptor, ReplicaDesc};
     use giggles_replication::call_codec::CallCounts;
+
+    #[test]
+    fn parses_replace_node() {
+        let parse = |s: &str| Command::parse(s.split_whitespace().map(str::to_owned));
+        assert_eq!(
+            parse("replace-node cfg 3 4 --timeout 12").unwrap().action,
+            Action::Replace {
+                lost: 3,
+                new: 4,
+                timeout: Duration::from_secs(12)
+            }
+        );
+        assert!(parse("replace-node cfg 3 4").is_ok());
+        for bad in [
+            "replace-node cfg 0 4",
+            "replace-node cfg 3 3",
+            "replace-node cfg 3 4 --timeout 0",
+            "replace-node cfg 3 4 --timeout x",
+            "replace-node cfg 3",
+            "replace-node cfg 3 4 extra",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn parses_move_and_status() {

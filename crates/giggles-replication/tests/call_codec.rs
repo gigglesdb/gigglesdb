@@ -459,10 +459,11 @@ fn zero_timestamp_requests_and_inverted_leases_are_rejected() {
         n: 0,
     });
     assert!(decode_call(&encode_call(&call).unwrap()).is_err());
-    let reply: Result<PeerReply, RangeError> = Ok(PeerReply::Range(RangeReply::Lease(std::ops::Range {
-        start: 9,
-        end: 3,
-    })));
+    let reply: Result<PeerReply, RangeError> =
+        Ok(PeerReply::Range(RangeReply::Lease(std::ops::Range {
+            start: 9,
+            end: 3,
+        })));
     assert!(decode_reply(&encode_reply(&reply).unwrap()).is_err());
 }
 
@@ -490,4 +491,36 @@ fn move_reply_rejects_invalid_flags_and_utf8() {
     assert!(decode_reply(&[1, 0, 50, 0, 0, 2, 0]).is_err());
     assert!(decode_reply(&[1, 0, 50, 0, 1, 0, 0, 0, 1, 255, 0, 0]).is_err());
     assert!(decode_reply(&[2, 0, 50, 0, 0, 0, 0]).is_err());
+}
+
+#[test]
+fn registry_admin_tags_roundtrip_strictly() {
+    for (tag, call, reply) in [
+        (51, NodeCall::RetireNode { id: 3 }, PeerReply::Retired(true)),
+        (
+            52,
+            NodeCall::EnrolNode {
+                id: 4,
+                address: "127.0.0.1:9004".into(),
+                fingerprint: "ab".repeat(32),
+            },
+            PeerReply::Enrolled(false),
+        ),
+    ] {
+        let call = PeerCall::Node(call);
+        let bytes = encode_call(&call).unwrap();
+        assert_eq!(bytes[1], tag);
+        assert_eq!(decode_call(&bytes).unwrap(), call);
+        for n in 0..bytes.len() {
+            assert!(decode_call(&bytes[..n]).is_err());
+        }
+        let mut extra = bytes;
+        extra.push(0);
+        assert!(decode_call(&extra).is_err());
+        let bytes = encode_reply(&Ok(reply.clone())).unwrap();
+        assert_eq!(bytes[2], tag);
+        assert_eq!(decode_reply(&bytes).unwrap().unwrap(), reply);
+        assert!(decode_reply(&[1, 0, tag, 2]).is_err());
+        assert!(decode_reply(&[1, 0, tag, 0, 0]).is_err());
+    }
 }

@@ -42,8 +42,20 @@ pub enum GatewayReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeCall {
     Status,
+    RetireNode {
+        id: u64,
+    },
+    EnrolNode {
+        id: u64,
+        address: String,
+        fingerprint: String,
+    },
     HostRange(RangeDescriptor),
-    MoveRange { range: RangeId, from: u64, to: u64 },
+    MoveRange {
+        range: RangeId,
+        from: u64,
+        to: u64,
+    },
 }
 
 /// Progress or redirection for an operator's resumable move.
@@ -131,6 +143,8 @@ pub enum PeerReply {
     Node(NodeReport),
     Hosted(bool),
     Moving(MoveReply),
+    Retired(bool),
+    Enrolled(bool),
 }
 
 fn corrupt(what: &str) -> RangeError {
@@ -269,10 +283,18 @@ impl<'a> Reader<'a> {
         }
     }
     fn opt_u64(&mut self) -> Result<Option<u64>, RangeError> {
-        Ok(if self.flag()? { Some(self.u64()?) } else { None })
+        Ok(if self.flag()? {
+            Some(self.u64()?)
+        } else {
+            None
+        })
     }
     fn opt_bytes(&mut self) -> Result<Option<Vec<u8>>, RangeError> {
-        Ok(if self.flag()? { Some(self.bytes()?) } else { None })
+        Ok(if self.flag()? {
+            Some(self.bytes()?)
+        } else {
+            None
+        })
     }
     fn bound(&mut self) -> Result<Bound<Vec<u8>>, RangeError> {
         Ok(match self.u8()? {
@@ -716,6 +738,20 @@ pub fn encode_call(call: &PeerCall) -> Result<Vec<u8>, RangeError> {
             w.u64(*from);
             w.u64(*to);
         }
+        PeerCall::Node(NodeCall::RetireNode { id }) => {
+            w.u8(51);
+            w.u64(*id);
+        }
+        PeerCall::Node(NodeCall::EnrolNode {
+            id,
+            address,
+            fingerprint,
+        }) => {
+            w.u8(52);
+            w.u64(*id);
+            w.str(address)?;
+            w.str(fingerprint)?;
+        }
         PeerCall::Node(NodeCall::Status) => w.u8(48),
         PeerCall::Node(NodeCall::HostRange(desc)) => {
             w.u8(49);
@@ -752,6 +788,12 @@ pub fn decode_call(bytes: &[u8]) -> Result<PeerCall, RangeError> {
             range: RangeId(r.u64()?),
             from: r.u64()?,
             to: r.u64()?,
+        }),
+        51 => PeerCall::Node(NodeCall::RetireNode { id: r.u64()? }),
+        52 => PeerCall::Node(NodeCall::EnrolNode {
+            id: r.u64()?,
+            address: r.string()?,
+            fingerprint: r.string()?,
         }),
         48 => PeerCall::Node(NodeCall::Status),
         49 => PeerCall::Node(NodeCall::HostRange(r.descriptor()?)),
@@ -1097,6 +1139,15 @@ pub fn encode_reply(reply: &Result<PeerReply, RangeError>) -> Result<Vec<u8>, Ra
             w.u8(u8::from(reply.done));
             w.opt_bytes(reply.error.as_deref().map(str::as_bytes))?;
         }
+        Ok(PeerReply::Retired(changed) | PeerReply::Enrolled(changed)) => {
+            w.u8(0);
+            w.u8(if matches!(reply, Ok(PeerReply::Retired(_))) {
+                51
+            } else {
+                52
+            });
+            w.u8(u8::from(*changed));
+        }
         Ok(PeerReply::Hosted(created)) => {
             w.u8(0);
             w.u8(49);
@@ -1141,6 +1192,8 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Result<PeerReply, RangeError>, Range
                 error: optional_string(&mut r)?,
             }),
             49 => PeerReply::Hosted(r.flag()?),
+            51 => PeerReply::Retired(r.flag()?),
+            52 => PeerReply::Enrolled(r.flag()?),
             tag => PeerReply::Range(range_reply(tag, &mut r)?),
         })
     };

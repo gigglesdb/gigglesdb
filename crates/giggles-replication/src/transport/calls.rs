@@ -372,6 +372,11 @@ pub trait NodeService: Send + Sync {
     ) -> std::result::Result<call_codec::MoveReply, RangeError> {
         Err(RangeError::Unavailable("range move unavailable".into()))
     }
+    fn registry_update(&self, _call: NodeCall) -> std::result::Result<PeerReply, RangeError> {
+        Err(RangeError::Unavailable(
+            "registry updates unavailable".into(),
+        ))
+    }
     fn host_range(
         &self,
         _desc: giggles_core::range_api::RangeDescriptor,
@@ -479,7 +484,12 @@ impl CallServer {
                 if node_only
                     && !matches!(
                         call,
-                        PeerCall::Node(NodeCall::Status | NodeCall::MoveRange { .. })
+                        PeerCall::Node(
+                            NodeCall::Status
+                                | NodeCall::MoveRange { .. }
+                                | NodeCall::RetireNode { .. }
+                                | NodeCall::EnrolNode { .. }
+                        )
                     ) =>
             {
                 let refused = Err(RangeError::Unavailable("not a peer node".into()));
@@ -544,6 +554,13 @@ fn handle(handlers: &Handlers, call: PeerCall) -> Reply {
                 GatewayCall::TxnLive(txn) => GatewayReply::Live(gateway.txn_live(txn)),
             }))
         }
+        PeerCall::Node(call @ (NodeCall::RetireNode { .. } | NodeCall::EnrolNode { .. })) => {
+            handlers
+                .node
+                .as_ref()
+                .ok_or_else(|| missing("node registry"))?
+                .registry_update(call)
+        }
         PeerCall::Node(NodeCall::MoveRange { range, from, to }) => handlers
             .node
             .as_ref()
@@ -557,7 +574,10 @@ fn handle(handlers: &Handlers, call: PeerCall) -> Reply {
             .host_range(desc)
             .map(PeerReply::Hosted),
         PeerCall::Node(NodeCall::Status) => {
-            let node = handlers.node.as_ref().ok_or_else(|| missing("node status"))?;
+            let node = handlers
+                .node
+                .as_ref()
+                .ok_or_else(|| missing("node status"))?;
             Ok(PeerReply::Node(node.status()))
         }
     }
@@ -582,9 +602,12 @@ mod tests {
     async fn own_certificate_cannot_host_ranges() {
         let desc = giggles_core::range_api::RangeDescriptor {
             id: giggles_core::range_api::RangeId(2),
-            epoch: giggles_core::range_api::Epoch(1), start: vec![], end: None,
+            epoch: giggles_core::range_api::Epoch(1),
+            start: vec![],
+            end: None,
             replicas: vec![giggles_core::range_api::ReplicaDesc {
-                node: 4, role: giggles_core::range_api::ReplicaRole::Learner,
+                node: 4,
+                role: giggles_core::range_api::ReplicaRole::Learner,
             }],
         };
         let server = CallServer::new();
@@ -613,7 +636,11 @@ mod tests {
         let body = call_codec::encode_call(&PeerCall::Node(NodeCall::Status)).unwrap();
         server.start(2, &body, true, &tx).await;
         let (_, reply) = rx.recv().await.unwrap();
-        assert_eq!(call_codec::decode_reply(&reply).unwrap(),
-            Err(RangeError::Unavailable("no node status handler on this node".into())));
+        assert_eq!(
+            call_codec::decode_reply(&reply).unwrap(),
+            Err(RangeError::Unavailable(
+                "no node status handler on this node".into()
+            ))
+        );
     }
 }

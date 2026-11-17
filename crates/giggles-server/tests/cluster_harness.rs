@@ -65,6 +65,15 @@ pub(crate) struct ClusterProcs {
 impl ClusterProcs {
     /// Writes certificates and configurations, starts every node and waits until each serves.
     pub(crate) async fn new(n: usize) -> Self {
+        Self::build(n, false).await
+    }
+
+    /// Three original members and a CA-signed spare, absent from original peer lists.
+    pub(crate) async fn with_spare() -> Self {
+        Self::build(4, true).await
+    }
+
+    async fn build(n: usize, spare: bool) -> Self {
         assert!((3..=6).contains(&n), "3..=6 nodes, not {n}");
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -130,7 +139,7 @@ impl ClusterProcs {
         let split_keys = split_keys();
         for (i, node) in nodes.iter().enumerate() {
             let peers: Vec<_> = (0..n)
-                .filter(|&j| j != i)
+                .filter(|&j| j != i && (!spare || i == n - 1 || j != n - 1))
                 .map(|j| json!({"id": j + 1, "address": links[&(i, j)].address(), "fingerprint": fingerprints[j]}))
                 .collect();
             let config = json!({
@@ -141,7 +150,8 @@ impl ClusterProcs {
                 "postgresql": {"listen": node.pg, "tls": "disabled", "loopback_trust": true},
                 "cluster": {"node_id": i + 1, "cluster": "0123456789abcdef0123456789abcdef",
                     "listen": node.listen, "log_dir": node.dir.join("raftlog"),
-                    "tick_ms": 50, "owner": "owner", "peers": peers, "split_keys": split_keys}
+                    "tick_ms": 50, "owner": "owner", "peers": peers, "split_keys": split_keys,
+                    "initial_members": (1..=if spare { n - 1 } else { n }).collect::<Vec<_>>()}
             });
             std::fs::write(
                 node.dir.join("config.json"),
@@ -157,13 +167,24 @@ impl ClusterProcs {
             rx,
             root,
         };
-        for i in 0..n {
+        for i in 0..if spare { n - 1 } else { n } {
             cluster.start(i);
         }
-        for i in 0..n {
+        for i in 0..if spare { n - 1 } else { n } {
             cluster.ready(i).await;
         }
         cluster
+    }
+
+    /// Enrolment arguments for the spare, using its actual listening address.
+    pub(crate) fn spare_identity(&self) -> (String, String) {
+        let node = self.nodes.last().unwrap();
+        let pem = std::fs::read(node.dir.join("server.pem")).unwrap();
+        let cert = rustls_pemfile::certs(&mut &pem[..])
+            .next()
+            .unwrap()
+            .unwrap();
+        (node.listen.to_string(), hex::encode(Sha256::digest(cert)))
     }
 
     pub(crate) fn len(&self) -> usize {

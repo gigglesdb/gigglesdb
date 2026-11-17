@@ -355,6 +355,31 @@ async fn cluster_command(args: impl Iterator<Item = String>) -> i32 {
             return 2;
         }
     };
+    if let Some((id, address, fingerprint)) = command.enrol {
+        return match tokio::task::spawn_blocking(move || {
+            giggles_replication::cluster_node::request_node(
+                &transport,
+                &members,
+                giggles_replication::call_codec::NodeCall::EnrolNode {
+                    id,
+                    address,
+                    fingerprint,
+                },
+                cli::TIMEOUT,
+            )
+        })
+        .await
+        {
+            Ok(Ok(giggles_replication::call_codec::PeerReply::Enrolled(changed))) => {
+                println!("enrolled={id} changed={changed}");
+                0
+            }
+            other => {
+                eprintln!("enrol failed: {other:?}");
+                1
+            }
+        };
+    }
     let asked = tokio::task::spawn_blocking(move || {
         giggles_replication::cluster_node::query_status(&transport, &members, cli::TIMEOUT)
     })

@@ -75,7 +75,7 @@ impl ClusterRuntime {
     /// range is served, attaches the gateway and creates the bootstrap owner (bootstrap node,
     /// empty role catalog). Blocking: call from a blocking thread.
     pub fn start(v: &ClusterValidated, database: &Path) -> Result<Self, String> {
-        let layout = presplit(&v.split_keys, &v.members, v.replication_factor)
+        let layout = presplit(&v.split_keys, &v.initial_members, v.replication_factor)
             .map_err(|e| format!("cluster.split_keys: {e}"))?;
         let node = ClusterNode::start(ClusterNodeConfig {
             transport: transport_config(v)?,
