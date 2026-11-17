@@ -21,6 +21,11 @@ pub(super) fn resolve(
     scope: usize,
     slots: &RefCell<Vec<OuterSlot>>,
 ) -> R<BoundColumn> {
+    if let Some(Filter::Clauses(c)) = &query.filter
+        && let Some(namespace) = &c.join_namespace
+    {
+        return namespace.resolve(column).map(|column| BoundColumn { source: 0, column });
+    }
     let mut offset = 0;
     for (depth, sources) in std::iter::once(query.sources.as_slice())
         .chain(outer.iter().copied())

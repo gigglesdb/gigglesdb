@@ -19,7 +19,7 @@ pub(super) fn scalar_type(s: &Scalar, parameters: &mut [Option<DataType>]) -> R<
 }
 /// PostgreSQL's left-to-right common-type selection. Unknowns have already
 /// been removed; actual conversion and scalar evaluation stay in Scalar.
-fn common(types: impl Iterator<Item = DataType>) -> R<DataType> {
+pub(super) fn common(types: impl Iterator<Item = DataType>) -> R<DataType> {
     let types: Vec<_> = types.collect();
     let Some(mut candidate) = types.first().cloned() else {
         return Ok(DataType::Text);
@@ -99,6 +99,15 @@ impl Plan {
         }
         match &self.body {
             Body::Select(select) => {
+                if let Some(from) = &select.from {
+                    from.validate_constants(state, parameters)?;
+                    let shape = from.clone().resolve(state, &mut parameters.to_vec())?;
+                    let catalog = join::catalog(state, &shape)?;
+                    join::prepare(&select.query, &shape)?
+                        .bind_projection_seeded(&catalog, parameters.to_vec())?
+                        .validate_immutable_constants()?;
+                    return Ok(());
+                }
                 let synthetic = if let Some(input) = &select.input {
                     input.query.validate_constants(state, parameters)?;
                     let d = input.query.describe(state, parameters.len(), parameters)?;
@@ -167,14 +176,25 @@ impl Plan {
         let state = catalog.as_ref().unwrap_or(state);
         let meta = match &mut self.body {
             Body::Select(select) => {
-                let synthetic = if let Some(input) = &mut select.input {
+                let shape = select
+                    .from
+                    .as_mut()
+                    .map(|from| from.resolve(state, parameters))
+                    .transpose()?;
+                let synthetic = if let Some(shape) = &shape {
+                    Some(join::catalog(state, shape)?)
+                } else if let Some(input) = &mut select.input {
                     let meta = input.query.resolve(state, parameters)?;
                     Some(input_state(state, input, &meta.columns, &meta.typmods)?)
                 } else {
                     None
                 };
                 let state = synthetic.as_ref().unwrap_or(state);
-                let query = cte::prepare_query(&select.query, state)?;
+                let query = if let Some(shape) = &shape {
+                    join::prepare(&select.query, shape)?
+                } else {
+                    cte::prepare_query(&select.query, state)?
+                };
                 let mut unknown_parameters: Vec<_> = select
                     .query
                     .items
@@ -293,7 +313,11 @@ impl Plan {
                 let mut a = left.resolve(state, parameters)?;
                 let b = right.resolve(state, parameters)?;
                 // bpchar consumers remain closed until DD-0068 comparison semantics land.
-                if a.columns.iter().chain(&b.columns).any(|c| c.data_type == DataType::Bpchar) {
+                if a.columns
+                    .iter()
+                    .chain(&b.columns)
+                    .any(|c| c.data_type == DataType::Bpchar)
+                {
                     return Err(SqlError::Unsupported);
                 }
                 if a.columns.len() != b.columns.len() {

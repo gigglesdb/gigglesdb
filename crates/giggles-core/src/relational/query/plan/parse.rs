@@ -13,7 +13,7 @@ pub(super) fn parser(tokens: &[Token]) -> Parser {
 pub(super) fn word(t: &Token, w: &str) -> bool {
     matches!(t, Token::Word(s) if s == w)
 }
-fn top(tokens: &[Token]) -> R<Vec<usize>> {
+pub(super) fn top(tokens: &[Token]) -> R<Vec<usize>> {
     let mut depth = 0usize;
     let mut out = vec![];
     for (i, t) in tokens.iter().enumerate() {
@@ -177,6 +177,7 @@ fn identity(child: Plan) -> ParseResult<Plan> {
     Ok(Plan::new(Body::Select(Box::new(Select {
         query,
         parameters: BTreeSet::new(),
+        from: None,
         input: Some(Input {
             query: Box::new(child),
             name,
@@ -332,6 +333,18 @@ fn select(
         }
     }
     let mut input = None;
+    // The legacy parser continues to own its established scans and ON joins.
+    // The planner's general FROM tree is used only when that parse declines.
+    let mut probe = parser(&tokens);
+    match Query::parse(&mut probe) {
+        Err(SqlError::Unsupported | SqlError::Syntax | SqlError::Reserved) => {
+            if let Some(plan) = join::parse_select(&tokens, owner, depth, next)? {
+                return Ok(plan);
+            }
+        }
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
     if let Some(from) = positions
         .iter()
         .copied()
@@ -398,5 +411,6 @@ fn select_query(tokens: &[Token], input: Option<Input>, owner: &mut Parser) -> P
         query,
         parameters,
         input,
+        from: None,
     }))))
 }

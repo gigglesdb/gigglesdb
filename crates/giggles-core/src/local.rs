@@ -141,6 +141,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::CardinalityViolation => 56,
                 relational::SqlError::InvalidColumnReference => 57,
                 relational::SqlError::InvalidRecursion => 58,
+                relational::SqlError::DuplicateAlias => 59,
             }
         }
     };

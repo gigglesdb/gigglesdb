@@ -280,7 +280,7 @@ fn names_list(p: &mut Parser, close: bool) -> R<Vec<String>> {
     }
     Ok(names)
 }
-fn remap(plan: &mut Plan, alias: &str, name: &str) {
+pub(super) fn remap(plan: &mut Plan, alias: &str, name: &str) {
     for cte in &mut plan.ctes {
         remap(&mut cte.query, alias, name);
         if let Some(dml) = &mut cte.dml {
@@ -292,6 +292,9 @@ fn remap(plan: &mut Plan, alias: &str, name: &str) {
             remap_query(&mut s.query, alias, name);
             if let Some(i) = &mut s.input {
                 remap(&mut i.query, alias, name);
+            }
+            if let Some(from) = &mut s.from {
+                from.remap(alias, name);
             }
         }
         Body::Set { left, right, .. } => {

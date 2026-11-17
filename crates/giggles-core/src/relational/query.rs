@@ -200,6 +200,7 @@ struct QueryPrefix {
 
 #[derive(Debug, Clone, Default)]
 struct QueryClauses {
+    join_namespace: Option<plan::join::Namespace>,
     view_reads: Vec<String>,
     distinct: bool,
     filter: Option<Filter>,
@@ -2697,6 +2698,7 @@ impl Query {
                 filter
             } else {
                 Some(Filter::Clauses(Box::new(QueryClauses {
+                    join_namespace: None,
                     view_reads: vec![],
                     distinct,
                     filter,
@@ -3980,6 +3982,7 @@ impl Query {
         for (item, alias) in &self.items {
             if let Some(a) = alias
                 && !aliases.insert(a)
+                && self.clauses().is_none_or(|c| c.join_namespace.is_none())
             {
                 return Err(SqlError::Duplicate);
             }

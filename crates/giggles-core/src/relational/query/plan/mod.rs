@@ -5,6 +5,7 @@ mod bind;
 mod cte;
 mod dml;
 mod exec;
+pub(super) mod join;
 mod parse;
 mod setops;
 pub(in crate::relational) use ast::Plan;

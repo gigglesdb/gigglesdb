@@ -47,6 +47,28 @@ fn frozen_parenthesized_set_depth() {
 }
 
 #[test]
+fn frozen_parenthesized_join_depth() {
+    for depth in [33, 1000] {
+        let mut p = parse::parser(
+            &lex(&format!("SELECT {}1{}", "(".repeat(depth), ")".repeat(depth))).unwrap(),
+        );
+        assert_eq!(Query::parse(&mut p).unwrap_err(), SqlError::Limit);
+        assert_parse_limit(&format!(
+            "SELECT * FROM {}a CROSS JOIN b{}",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        ));
+    }
+    // Exercise the recursive descent guard independently of token admission.
+    let tokens = lex("SELECT * FROM (a CROSS JOIN b)").unwrap();
+    let mut p = parse::parser(&tokens);
+    assert!(matches!(
+        join::parse_select(&tokens, &mut p, subplans::MAX_DEPTH, &mut 0),
+        Err(ParseError::Definite(SqlError::Limit))
+    ));
+}
+
+#[test]
 fn frozen_scalar_subquery_depth() {
     let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
     assert_parse_limit(&sql);

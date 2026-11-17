@@ -33,6 +33,7 @@ pub(super) struct Select {
     // A materialized input exposes operator outputs as ordinary scalar columns.
     // Later operators (windows, apply, CTEs) can use the same boundary.
     pub input: Option<Input>,
+    pub from: Option<join::From>,
 }
 #[derive(Debug, Clone)]
 pub(super) struct Input {
@@ -137,6 +138,9 @@ impl Plan {
                 if let Some(i) = &s.input {
                     i.query.visit_queries(f);
                 }
+                if let Some(from) = &s.from {
+                    from.visit_queries(f);
+                }
             }
             Body::Set { left, right, .. } => {
                 left.visit_queries(f);
@@ -145,7 +149,7 @@ impl Plan {
             _ => {}
         }
     }
-    fn visit_scalars(&self, f: &mut impl FnMut(&Scalar)) {
+    pub(super) fn visit_scalars(&self, f: &mut impl FnMut(&Scalar)) {
         for cte in &self.ctes {
             cte.query.visit_scalars(f);
         }
@@ -156,6 +160,9 @@ impl Plan {
             Body::Select(s) => {
                 if let Some(i) = &s.input {
                     i.query.visit_scalars(f);
+                }
+                if let Some(from) = &s.from {
+                    from.visit_scalars(f);
                 }
             }
             Body::Set { left, right, .. } => {
@@ -202,6 +209,9 @@ impl Plan {
                 );
                 if let Some(i) = &mut s.input {
                     i.query.bind_schema_names(bind, state, path)?;
+                }
+                if let Some(from) = &mut s.from {
+                    from.bind_schema_names(bind, state, path)?;
                 }
             }
             Body::Set { left, right, .. } => {

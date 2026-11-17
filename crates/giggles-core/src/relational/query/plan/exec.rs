@@ -104,39 +104,62 @@ impl Plan {
         let mut result = Relation::new(description.columns, description.typmods, execution);
         match &self.body {
             Body::Select(select) => {
-                let input = select
-                    .input
-                    .as_ref()
-                    .map(|i| {
-                        i.query
-                            .run(state, source, params, parameters, clock, execution)
-                    })
-                    .transpose()?;
-                let synthetic = input
-                    .as_ref()
-                    .map(|rows| {
-                        input_state(
-                            state,
-                            select.input.as_ref().unwrap(),
-                            &rows.columns,
-                            &rows.typmods,
-                        )
-                    })
-                    .transpose()?;
-                let state = synthetic.as_ref().unwrap_or(state);
-                let wrapper = input.as_ref().map(|rows| cte::VirtualRows {
-                    base: source,
-                    relations: vec![(select.input.as_ref().unwrap().name.clone(), rows)],
-                });
-                let source: &dyn scan::RowSource = wrapper.as_ref().map_or(source, |rows| rows);
-                let query = cte::prepare_query(&select.query, state)?;
-                let bound = query
-                    .bind_projection_seeded(state, parameters.to_vec())?
-                    .with_clock(clock);
-                let rows = bound
-                    .execute_context(state, source, params, parameters, execution, true, false)?;
-                for row in rows.rows {
-                    result.push(row)?;
+                if let Some(from) = &select.from {
+                    let shape = from.clone().resolve(state, &mut parameters.to_vec())?;
+                    let rows = from.run(state, source, params, parameters, clock, execution)?;
+                    let catalog = join::catalog(state, &shape)?;
+                    let wrapper = cte::VirtualRows {
+                        base: source,
+                        relations: vec![(join::INPUT.into(), &rows)],
+                    };
+                    let query = join::prepare(&select.query, &shape)?;
+                    let bound = query
+                        .bind_projection_seeded(&catalog, parameters.to_vec())?
+                        .with_clock(clock);
+                    for row in bound
+                        .execute_context(
+                            &catalog, &wrapper, params, parameters, execution, true, false,
+                        )?
+                        .rows
+                    {
+                        result.push(row)?;
+                    }
+                } else {
+                    let input = select
+                        .input
+                        .as_ref()
+                        .map(|i| {
+                            i.query
+                                .run(state, source, params, parameters, clock, execution)
+                        })
+                        .transpose()?;
+                    let synthetic = input
+                        .as_ref()
+                        .map(|rows| {
+                            input_state(
+                                state,
+                                select.input.as_ref().unwrap(),
+                                &rows.columns,
+                                &rows.typmods,
+                            )
+                        })
+                        .transpose()?;
+                    let state = synthetic.as_ref().unwrap_or(state);
+                    let wrapper = input.as_ref().map(|rows| cte::VirtualRows {
+                        base: source,
+                        relations: vec![(select.input.as_ref().unwrap().name.clone(), rows)],
+                    });
+                    let source: &dyn scan::RowSource = wrapper.as_ref().map_or(source, |rows| rows);
+                    let query = cte::prepare_query(&select.query, state)?;
+                    let bound = query
+                        .bind_projection_seeded(state, parameters.to_vec())?
+                        .with_clock(clock);
+                    let rows = bound.execute_context(
+                        state, source, params, parameters, execution, true, false,
+                    )?;
+                    for row in rows.rows {
+                        result.push(row)?;
+                    }
                 }
             }
             Body::Values(rows) => {

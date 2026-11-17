@@ -79,6 +79,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::InvalidColumnReference) => "42P10",
         CoreError::Task(e) => e.sqlstate(),
         CoreError::Sql(S::InvalidRecursion) => "42P19",
+        CoreError::Sql(S::DuplicateAlias) => "42712",
         CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
         CoreError::LockNotAvailable => "55P03",
