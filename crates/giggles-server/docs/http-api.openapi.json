@@ -1516,6 +1516,29 @@
         ],
         "additionalProperties": false
       },
+      "TaskPreviewRequest": {
+        "type": "object",
+        "properties": {
+          "text": {"$ref": "#/components/schemas/NativeTextRequest"},
+          "operation": {"$ref": "#/components/schemas/NativeOperationRequest"}
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {"required": ["text"]},
+          {"required": ["operation"]}
+        ],
+        "description": "GD-0061 R3-209: the one native update to preview, as text or as a typed operation. Agent listeners only."
+      },
+      "TaskApplyRequest": {
+        "type": "object",
+        "properties": {
+          "changeId": {"$ref": "#/components/schemas/UInt64"},
+          "digest": {"type": "string", "contentEncoding": "base64", "description": "Base64 of the 32-byte digest the preview returned."}
+        },
+        "required": ["changeId", "digest"],
+        "additionalProperties": false,
+        "description": "GD-0061 R3-209: apply a stored preview. Agent listeners only."
+      },
       "RepairSqlRequest": {
         "type": "object",
         "properties": {
@@ -1646,7 +1669,9 @@
           "nativeError": {
             "$ref": "#/components/schemas/NativeError"
           },
-          "catalogOutcome": {"$ref": "#/components/schemas/NativeCatalogOutcome"}
+          "catalogOutcome": {"$ref": "#/components/schemas/NativeCatalogOutcome"},
+          "taskError": {"type": "string", "description": "GD-0061 R3-209: present only on a task refusal, which keeps HTTP 200; code is its SQLSTATE and taskError its name."},
+          "message": {"type": "string", "description": "GD-0061 R3-209: the fixed text of a task refusal; absent on every other reply."}
         },
         "required": [
           "version",
@@ -1736,7 +1761,11 @@
           "rollbackTo": {"$ref": "#/components/schemas/NativeSavepointRequest"},
           "release": {"$ref": "#/components/schemas/NativeSavepointRequest"},
           "catalog": {"$ref": "#/components/schemas/NativeCatalogRequest"},
-          "sequence": {"$ref": "#/components/schemas/NativeSequenceCall"}
+          "sequence": {"$ref": "#/components/schemas/NativeSequenceCall"},
+          "taskPreview": {"$ref": "#/components/schemas/TaskPreviewRequest"},
+          "taskApply": {"$ref": "#/components/schemas/TaskApplyRequest"},
+          "taskOutcome": {"$ref": "#/components/schemas/Empty"},
+          "operationId": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]{1,128}$", "description": "GD-0061 R3-209: required with a native update and taskApply, read by taskOutcome; invalid on any other request and on every listener but the agent ones."}
         },
         "additionalProperties": false,
         "oneOf": [
@@ -1804,7 +1833,10 @@
           {"required": ["rollbackTo"]},
           {"required": ["release"]},
           {"required": ["catalog"]},
-          {"required": ["sequence"]}
+          {"required": ["sequence"]},
+          {"required": ["taskPreview"]},
+          {"required": ["taskApply"]},
+          {"required": ["taskOutcome"]}
         ],
         "description": "Exactly one request alternative. Duplicate keys, aliases, unknown fields, JSON null, trailing documents and nesting deeper than 128 are rejected by the parser. Raw UTF-8 body limit is 262144 bytes including whitespace. Native request trees are typed directly into the core operation engine; SQL is a separate optional arm. Semantic core failures use nativeError in a successful HTTP 200 reply."
       },

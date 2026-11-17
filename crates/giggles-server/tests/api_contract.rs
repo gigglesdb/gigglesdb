@@ -61,7 +61,11 @@ fn descriptor_publishes_v1_methods_and_result_stream() {
             ("release", 17),
             ("catalog", 18),
             ("sequence", 19),
-            ("budget_ms", 20)
+            ("task_preview", 22),
+            ("task_apply", 23),
+            ("task_outcome", 24),
+            ("budget_ms", 20),
+            ("operation_id", 21)
         ]
     );
     let budget = request
@@ -70,6 +74,12 @@ fn descriptor_publishes_v1_methods_and_result_stream() {
         .find(|f| f.name.as_deref() == Some("budget_ms"))
         .unwrap();
     assert_eq!(budget.proto3_optional, Some(true));
+    let operation_id = request
+        .field
+        .iter()
+        .find(|f| f.name.as_deref() == Some("operation_id"))
+        .unwrap();
+    assert_eq!(operation_id.proto3_optional, Some(true));
     for (message, fields) in [
         ("NativeSavepointRequest", vec!["name"]),
         ("TaskRequest", vec!["operation"]),
@@ -247,6 +257,15 @@ fn native_descriptor_has_complete_typed_arms_and_explicit_presence() {
                 .as_deref(),
             Some("native_result")
         );
+    }
+    for (name, number) in [("task_error", 12), ("message", 13)] {
+        let field = reply
+            .field
+            .iter()
+            .find(|f| f.name.as_deref() == Some(name))
+            .unwrap();
+        assert_eq!(field.number, Some(number));
+        assert_eq!(field.proto3_optional, Some(true), "ExecuteReply.{name}");
     }
 }
 
