@@ -124,7 +124,7 @@
       "unverified": ["Production deployment and arbitrary network/storage failures are not qualified by the local network fixtures."],
       "limit_ids": ["server_frame_bytes", "server_response_bytes", "server_io_timeout_seconds", "server_deadline_ms", "sql_bytes", "sql_params", "sql_transactions"],
       "docs": ["crates/giggles-server/README.md", "crates/giggles-server/COMPATIBILITY.md", "crates/giggles-server/SECURITY.md", "crates/giggles-core/SQL.md"],
-      "sources": [{"path":"crates/giggles-server/src/service.rs","needle":"table != \"giggles_join\" && tables.contains(table)"}, {"path":"crates/giggles-server/src/service.rs","needle":"if matches!(&self.role, Role::Application { .. }) && !p.is_ddl()"}, {"path":"crates/giggles-server/src/service.rs","needle":"session.sql.execute_prepared(p, params, None)"}],
+      "sources": [{"path":"crates/giggles-server/src/service.rs","needle":"table != \"giggles_join\" && tables.contains(table)"}, {"path":"crates/giggles-server/src/service.rs","needle":"if matches!(&self.role, Role::Application { .. }) && !p.is_ddl()"}, {"path":"crates/giggles-server/src/service.rs","needle":"session.sql.execute_prepared_unreleased(p, params, None)"}],
       "evidence": [{"path":"crates/giggles-server/tests/network.rs","test":"native_crud_transactions_and_role_boundaries","scope":"Actual local TLS native CRUD and role separation."}, {"path":"crates/giggles-server/tests/network.rs","test":"authentication_tls_downgrade_unknown_certificate_and_spoof","scope":"TLS and certificate binding negative cases."}, {"path":"crates/giggles-server/tests/network.rs","test":"native_and_task_wire_deadline_before_dispatch_does_not_mutate","scope":"Pre-dispatch deadline behavior."}]
     },
     {

@@ -385,6 +385,17 @@ impl<T> Unreleased<T> {
         self.tag.is_some()
     }
 
+    /// The value of a result produced outside a task session, by reference;
+    /// `None` for a task session's result. For a caller that keeps
+    /// bookkeeping from a plain result (the server's DDL ownership, GD-0061
+    /// R3-310) and still hands the result on unreleased.
+    pub fn untasked_ref(&self) -> Option<&T> {
+        match self.tag {
+            None => Some(&self.value),
+            Some(_) => None,
+        }
+    }
+
     /// Crate-internal split, for exits that carry the tag into another
     /// container (a buffered cursor). Never exposed.
     pub(crate) fn into_parts(self) -> (T, Option<Arc<ReleaseTag>>) {

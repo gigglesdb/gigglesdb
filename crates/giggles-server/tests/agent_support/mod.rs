@@ -550,6 +550,29 @@ impl Wire {
         self.stream.flush().await.unwrap();
     }
 
+    /// Sends `bytes` as they are and returns every byte the server answered,
+    /// up to and including ReadyForQuery (GD-0061 R3-310 recorded exchanges).
+    pub async fn exchange_raw(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.send(bytes).await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut answer = Vec::new();
+            loop {
+                let tag = self.stream.read_u8().await.unwrap();
+                let length = self.stream.read_u32().await.unwrap();
+                let mut body = vec![0; length as usize - 4];
+                self.stream.read_exact(&mut body).await.unwrap();
+                answer.push(tag);
+                answer.extend(length.to_be_bytes());
+                answer.extend(body);
+                if tag == b'Z' {
+                    return answer;
+                }
+            }
+        })
+        .await
+        .expect("no ReadyForQuery")
+    }
+
     /// A simple Query.
     pub async fn simple(&mut self, sql: &str) -> Vec<Msg> {
         let mut body = Vec::new();

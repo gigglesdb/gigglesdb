@@ -10,6 +10,7 @@
 use super::*;
 use crate::agent::statement::{self as protected, ProtectedHead, ProtectedStatement};
 use crate::pg_settings::{Function, Setting, Show};
+use giggles_core::task::readlog::{ENTRY_PGWIRE_EXTENDED, ENTRY_PGWIRE_SIMPLE};
 use giggles_core::task::{StatementClass, TaskError};
 
 fn no_shape() -> Description {
@@ -113,11 +114,14 @@ fn leading_word_is(sql: &str, words: &[&str]) -> bool {
     words.iter().any(|w| word.eq_ignore_ascii_case(w))
 }
 
-/// A refusal of `class` with its fixed message.
+/// A refusal of `class` with its fixed message. It is held in the diagnostic
+/// until the caller logs it with the statement text (R3-309/R3-310).
 fn refuse(diagnostic: &mut Diagnostic, class: StatementClass) -> &'static str {
     let error = TaskError::NotAllowedInTaskSession(class);
     diagnostic.message = Some(error.message());
-    error.sqlstate()
+    let code = error.sqlstate();
+    diagnostic.task_refusal = Some((class, CoreError::Task(error)));
+    code
 }
 
 /// Whether `code` with `message` is already a class refusal from this path.
@@ -130,8 +134,13 @@ fn is_refusal(code: &str, message: Option<&str>) -> bool {
         })
 }
 
+/// `Session::admit`; a refusal is held for the read log like `refuse`.
 fn admit(diagnostic: &mut Diagnostic, session: &mut Session, class: StatementClass) -> R<()> {
-    diagnostic.core(session.admit(class))
+    let admitted = session.admit(class);
+    if let Err(error) = &admitted {
+        diagnostic.task_refusal = Some((class, error.clone()));
+    }
+    diagnostic.core(admitted)
 }
 
 /// A catalog snapshot that holds no relation: enough for a relation-free plan
@@ -157,7 +166,32 @@ fn relation_free_snapshot(
 }
 
 impl State {
+    /// Writes a held refusal (`refuse`, `admit`) to the task's read log as
+    /// one finished record of `sql` (R3-309 `log_refused_task_statement`).
+    fn log_task_refusal(&mut self, session: &Session, sql: &str, param_count: usize) {
+        if let Some((class, error)) = self.diagnostic.task_refusal.take() {
+            session
+                .sql
+                .log_refused_task_statement(sql, class, param_count, &error);
+        }
+    }
+
+    /// Parse (and the simple path's prepare). A refusal is logged here.
     pub(super) fn task_prepare(
+        &mut self,
+        sql: &str,
+        oids: Vec<u32>,
+        session: &mut Session,
+    ) -> R<Statement> {
+        self.diagnostic.task_refusal = None;
+        let result = self.task_prepare_inner(sql, oids.clone(), session);
+        if result.is_err() {
+            self.log_task_refusal(session, sql, oids.len());
+        }
+        result
+    }
+
+    fn task_prepare_inner(
         &mut self,
         sql: &str,
         oids: Vec<u32>,
@@ -424,14 +458,16 @@ impl State {
         session: &mut Session,
         out: &mut Vec<u8>,
     ) -> R<()> {
+        session.sql.set_task_entry(ENTRY_PGWIRE_SIMPLE);
         let statements = simple::split(sql)?;
         match statements.as_slice() {
             [] => frame(b'I', &[], out),
             [statement] => self.task_statement(statement, session, out),
-            _ => Err(refuse(
-                &mut self.diagnostic,
-                StatementClass::TransactionControl,
-            )),
+            _ => {
+                let code = refuse(&mut self.diagnostic, StatementClass::TransactionControl);
+                self.log_task_refusal(session, sql, 0);
+                Err(code)
+            }
         }
     }
 
@@ -457,10 +493,14 @@ impl State {
         session: &mut Session,
         out: &mut Vec<u8>,
     ) -> R<()> {
+        session.sql.set_task_entry(ENTRY_PGWIRE_EXTENDED);
         let portal = self.portals.get(name).ok_or("34000")?;
         self.diagnostic.query_id = portal.s.query_id.clone();
         if max != 0 {
-            return Err(refuse(&mut self.diagnostic, StatementClass::Cursor));
+            let (sql, count) = (portal.s.sql.clone(), portal.params.len());
+            let code = refuse(&mut self.diagnostic, StatementClass::Cursor);
+            self.log_task_refusal(session, &sql, count);
+            return Err(code);
         }
         if portal.result.is_some() {
             return Err("55000");
@@ -482,15 +522,45 @@ impl State {
             out,
         )?;
         if let Some(portal) = self.portals.get_mut(name) {
-            portal.result = Some(SqlResult::default());
+            portal.result = ran();
         }
         Ok(())
     }
 
     /// Runs an admitted statement. The class is admitted again, because the
-    /// task's standing is checked on every call (design-2 section 3).
+    /// task's standing is checked on every call (design-2 section 3). A
+    /// refusal (admission or class) is logged here.
     #[allow(clippy::too_many_arguments)]
     fn task_run(
+        &mut self,
+        s: &Statement,
+        params: &[Value],
+        catalog_params: &[giggles_pg_catalog::Value],
+        formats: &[u16],
+        describe: bool,
+        retained: usize,
+        session: &mut Session,
+        out: &mut Vec<u8>,
+    ) -> R<()> {
+        self.diagnostic.task_refusal = None;
+        let result = self.task_run_inner(
+            s,
+            params,
+            catalog_params,
+            formats,
+            describe,
+            retained,
+            session,
+            out,
+        );
+        if result.is_err() {
+            self.log_task_refusal(session, &s.sql, params.len());
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn task_run_inner(
         &mut self,
         s: &Statement,
         params: &[Value],
@@ -516,11 +586,12 @@ impl State {
         match &s.p {
             Plan::Inspect(show) => {
                 let (description, result) = inspect(*show, &self.settings.current, session)?;
+                let result = result.get();
                 if describe {
                     row_description(&description, &[], out)?;
                 }
-                rows(&self.settings.current, zone, &result, &description, formats, 0, 1, out)?;
-                complete("SHOW", &result, out)
+                rows(&self.settings.current, zone, result, &description, formats, 0, 1, out)?;
+                complete("SHOW", result, out)
             }
             Plan::Settings(settings) => {
                 if !settings.iter().all(setting_allowed) {
@@ -588,26 +659,13 @@ impl State {
             }
             Plan::Sql(prepared) if class == StatementClass::Select => {
                 self.diagnostic.phase = "application execution";
-                let mut cursor = self.diagnostic.core(session.open_cursor(prepared, params))?;
-                if describe {
-                    row_description(&s.d, &[], out)?;
-                }
-                let mut count = 0;
-                while !cursor.is_exhausted() {
-                    let chunk = self.diagnostic.core(session.fetch_cursor(
-                        &mut cursor,
-                        CURSOR_ROWS,
-                        CURSOR_BYTES,
-                    ))?;
-                    let n = chunk.len();
-                    let result = SqlResult {
-                        rows: chunk,
-                        ..SqlResult::default()
-                    };
-                    rows(&self.settings.current, zone, &result, &s.d, formats, 0, n, out)?;
-                    count += n;
-                    flush_output(&self.output, out)?;
-                }
+                // R3-309: the read log records the statement's text.
+                session.sql.set_task_statement_text(&s.sql);
+                let outcome = self.task_select(prepared, s, params, formats, describe, session, out);
+                let count = outcome.map_err(|error| match error {
+                    TaskRun::Core(error) => self.diagnostic.core::<()>(Err(error)).unwrap_err(),
+                    TaskRun::Wire(code) => code,
+                })?;
                 catalog_complete(count, out)
             }
             Plan::Protected(statement) => {
@@ -645,5 +703,84 @@ impl State {
             | Plan::Copy(..)
             | Plan::Task(_) => Err(refuse(&mut self.diagnostic, class)),
         }
+    }
+
+    /// A task SELECT: one cursor, and every chunk fetched unreleased, then
+    /// released (masked, checked and charged), then encoded and flushed
+    /// (GD-0061 R3-310). The statement's read-log entry is finished with the
+    /// outcome while the cursor is still open, on every exit.
+    #[allow(clippy::too_many_arguments)]
+    fn task_select(
+        &mut self,
+        prepared: &Prepared,
+        s: &Statement,
+        params: &[Value],
+        formats: &[u16],
+        describe: bool,
+        session: &mut Session,
+        out: &mut Vec<u8>,
+    ) -> Result<usize, TaskRun> {
+        let mut cursor = match session.open_cursor(prepared, params) {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                session.sql.finish_task_statement(Err(&error));
+                return Err(error.into());
+            }
+        };
+        let outcome = self.task_pages(&mut cursor, s, formats, describe, session, out);
+        // Charges any rows_read no release charged and finalizes the record.
+        session.sql.finish_task_statement(match &outcome {
+            Err(TaskRun::Core(error)) => Err(error),
+            _ => Ok(()),
+        });
+        drop(cursor);
+        outcome
+    }
+
+    fn task_pages(
+        &mut self,
+        cursor: &mut giggles_core::Cursor,
+        s: &Statement,
+        formats: &[u16],
+        describe: bool,
+        session: &mut Session,
+        out: &mut Vec<u8>,
+    ) -> Result<usize, TaskRun> {
+        let zone = session.zone().unwrap_or(SessionZone::Fixed(0));
+        if describe {
+            row_description(&s.d, &[], out)?;
+        }
+        let mut count = 0;
+        while !cursor.is_exhausted() {
+            let chunk = session.fetch_cursor_unreleased(cursor, CURSOR_ROWS, CURSOR_BYTES)?;
+            let page = session.release_page(chunk)?.map(|rows| SqlResult {
+                rows,
+                ..SqlResult::default()
+            });
+            let n = page.get().rows.len();
+            rows(&self.settings.current, zone, page.get(), &s.d, formats, 0, n, out)?;
+            count += n;
+            flush_output(&self.output, out)?;
+        }
+        Ok(count)
+    }
+}
+
+/// An error of a task SELECT: from core (it ends the read-log entry with that
+/// error) or from the wire.
+enum TaskRun {
+    Core(CoreError),
+    Wire(&'static str),
+}
+
+impl From<CoreError> for TaskRun {
+    fn from(error: CoreError) -> Self {
+        TaskRun::Core(error)
+    }
+}
+
+impl From<&'static str> for TaskRun {
+    fn from(code: &'static str) -> Self {
+        TaskRun::Wire(code)
     }
 }

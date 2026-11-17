@@ -3,6 +3,7 @@ use giggles_core::{
     relational::{Prepared, SqlResult, StatementClock, Value},
     *,
 };
+use giggles_core::task::{Page, Released, Unreleased};
 use giggles_pg_types::temporal::SessionZone;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -105,6 +106,13 @@ impl Response {
             },
         }
     }
+}
+/// The refusal of a plain exit in a task session, as core's plain exits give
+/// it (GD-0061 R3-301/R3-310).
+fn task_session_refusal() -> CoreError {
+    CoreError::Task(giggles_core::task::TaskError::NotAllowedInTaskSession(
+        giggles_core::task::StatementClass::Other,
+    ))
 }
 fn digest(effects: &[Effect]) -> String {
     // Stable v1 digest; no raw before/after rows are returned.
@@ -2090,20 +2098,49 @@ impl Session {
             result
         })
     }
+    /// Plain exit for trusted callers: a task session's cursor is refused
+    /// before it advances (GD-0061 R3-310); task callers use
+    /// `fetch_cursor_unreleased` and `release_page`.
     pub(crate) fn fetch_cursor(
         &mut self,
         cursor: &mut Cursor,
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<Vec<giggles_core::relational::SqlRow>, CoreError> {
+        if self.sql.task().is_some() {
+            return Err(task_session_refusal());
+        }
+        self.fetch_cursor_unreleased(cursor, max_rows, max_bytes)?
+            .untasked()
+    }
+    /// `fetch_cursor`, with the chunk held until `release_page`.
+    pub(crate) fn fetch_cursor_unreleased(
+        &mut self,
+        cursor: &mut Cursor,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Unreleased<Vec<giggles_core::relational::SqlRow>>, CoreError> {
         if self.is_aborted() {
             return Err(CoreError::Sql(giggles_core::relational::SqlError::Aborted));
         }
-        let result = cursor.fetch(max_rows, max_bytes);
+        let result = cursor.fetch_unreleased(max_rows, max_bytes);
         if result.is_err() {
             self.abort();
         }
         result
+    }
+    /// Releases one page of this session's results (core
+    /// `SqlSession::release_page`): a move outside a task session; in a task
+    /// session the page is masked, checked and charged before it is handed
+    /// over, and on any error nothing is.
+    pub fn release_page<T: Page>(&self, page: Unreleased<T>) -> Result<Released<T>, CoreError> {
+        self.sql.release_page(page)
+    }
+    /// Validity only (revoked, expired, definition changed), for re-serving
+    /// rows of a page that was already released and charged. No-op outside a
+    /// task session.
+    pub fn still_valid(&self) -> Result<(), CoreError> {
+        self.sql.still_valid()
     }
     pub fn open_cursor(&mut self, p: &Prepared, params: &[Value]) -> Result<Cursor, CoreError> {
         self.authority_scope(|session| {
@@ -2145,11 +2182,32 @@ impl Session {
         }
         Ok(())
     }
+    /// Plain exit for trusted callers: a task session is refused before the
+    /// statement runs (GD-0061 R3-310); task callers use
+    /// `execute_prepared_unreleased` and `release_page`.
     pub fn execute_prepared(
         &mut self,
         p: &Prepared,
         params: &[Value],
     ) -> Result<SqlResult, CoreError> {
+        self.run_prepared(p, params, true)?.untasked()
+    }
+    /// `execute_prepared`, with the result held until `release_page`.
+    pub fn execute_prepared_unreleased(
+        &mut self,
+        p: &Prepared,
+        params: &[Value],
+    ) -> Result<Unreleased<SqlResult>, CoreError> {
+        self.run_prepared(p, params, false)
+    }
+    /// The body of both prepared exits. `plain` refuses a task session where
+    /// the statement would reach core, after the same checks as before.
+    fn run_prepared(
+        &mut self,
+        p: &Prepared,
+        params: &[Value],
+        plain: bool,
+    ) -> Result<Unreleased<SqlResult>, CoreError> {
         self.authority_scope(|session| {
             let bound = session.sql.bind_relation_context(p)?;
             let p = &bound;
@@ -2157,7 +2215,10 @@ impl Session {
             session.authorize(p)?;
             // Recovery must remain available even after the host clock latches.
             if session.sql.is_aborted() && p.command() == "ROLLBACK" {
-                let result = session.sql.execute_prepared(p, params, None);
+                if plain && session.sql.task().is_some() {
+                    return Err(task_session_refusal());
+                }
+                let result = session.sql.execute_prepared_unreleased(p, params, None);
                 if !session.sql.in_transaction() {
                     session.transaction_us = None;
                     session.reconcile_sequence_owners()?;
@@ -2183,10 +2244,18 @@ impl Session {
             };
             session.execute_with_ddl_authority(p.command(), p.table(), p.is_ddl(), p.is_sequence_ddl(),
                 p.sequence_ddl_names().into_iter().map(str::to_owned).collect(), |session| {
-                    let result = session.sql.execute_prepared_at(p, params, None, &clock);
+                    if plain && session.sql.task().is_some() {
+                        return Err(task_session_refusal());
+                    }
+                    let result = session.sql.execute_prepared_at_unreleased(p, params, None, &clock);
                     if !session.sql.in_transaction() { session.transaction_us = None; }
                     else if clock.unavailable.is_none() { session.transaction_us = Some(transaction_us); }
-                    result.map(|result| { let affected = result.affected != 0; (result, affected, true) })
+                    // DDL bookkeeping reads a plain result only; a task
+                    // session runs no DDL (admission refuses the class).
+                    result.map(|result| {
+                        let affected = result.untasked_ref().is_some_and(|r| r.affected != 0);
+                        (result, affected, true)
+                    })
                 })
         })
     }
@@ -2256,14 +2325,27 @@ impl Session {
         self.execute_with_ddl_authority(if table.is_some() { "CREATE TABLE" } else { "" }, table.as_deref(), true, false, vec![],
             |session| { let result = session.sql.execute_catalog_native(request); let succeeded = result.is_ok(); Ok((result, true, succeeded)) })
     }
+    /// Plain exit for trusted callers: a task session is refused before the
+    /// statement runs (GD-0061 R3-310); task callers use
+    /// `execute_sql_unreleased` and `release_page`.
     pub fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<SqlResult, CoreError> {
-        self.authority_scope(|session| session.execute_sql_authorized(sql, params))
+        self.authority_scope(|session| session.execute_sql_authorized(sql, params, true))?
+            .untasked()
+    }
+    /// `execute_sql`, with the result held until `release_page`.
+    pub fn execute_sql_unreleased(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Unreleased<SqlResult>, CoreError> {
+        self.authority_scope(|session| session.execute_sql_authorized(sql, params, false))
     }
     fn execute_sql_authorized(
         &mut self,
         sql: &str,
         params: &[Value],
-    ) -> Result<SqlResult, CoreError> {
+        plain: bool,
+    ) -> Result<Unreleased<SqlResult>, CoreError> {
         // Core's aborted-state ROLLBACK escape must remain reachable.
         if self.sql.is_aborted()
             && sql
@@ -2271,7 +2353,10 @@ impl Session {
                 .trim_end_matches(';')
                 .eq_ignore_ascii_case("rollback")
         {
-            let result = self.sql.execute(sql, params, None);
+            if plain && self.sql.task().is_some() {
+                return Err(task_session_refusal());
+            }
+            let result = self.sql.execute_unreleased(sql, params, None);
             if !self.sql.in_transaction() {
                 self.transaction_us = None;
                 self.reconcile_sequence_owners()?;
@@ -2279,7 +2364,7 @@ impl Session {
             return result;
         }
         let p = self.prepare(sql)?;
-        let result = self.execute_prepared(&p, params);
+        let result = self.run_prepared(&p, params, plain);
         self.api_path.sql_committed = result.is_ok() && p.command() == "COMMIT";
         result
     }

@@ -6,6 +6,7 @@ use crate::{
 use giggles_core::{
     CoreError,
     relational::{DataType, Description, Prepared, SqlResult, Value},
+    task::Released,
 };
 use giggles_pg_types::temporal::SessionZone;
 use std::{collections::BTreeMap, io};
@@ -138,6 +139,9 @@ struct Diagnostic {
     wire_detail: Option<&'static str>,
     wire_hint: Option<&'static str>,
     query_id: Option<String>,
+    /// GD-0061 R3-310: a task-session refusal (class, error) not yet written
+    /// to the read log; the task path logs it with the statement text.
+    task_refusal: Option<(giggles_core::task::StatementClass, CoreError)>,
 }
 fn replication_role_allowed(session: &Session) -> R<bool> {
     match &session.role {
@@ -956,7 +960,9 @@ struct Portal {
     s: Statement,
     params: Vec<Value>,
     formats: Vec<u16>,
-    result: Option<SqlResult>,
+    /// GD-0061 R3-310: a retained result is released (masked and charged)
+    /// once, when it is produced; later slices only revalidate.
+    result: Option<Released<SqlResult>>,
     // v2 RETURNING rows past the in-memory threshold, read once in order.
     spilled: Option<giggles_core::relational::spill::SpilledRows>,
     cursor: Option<giggles_core::Cursor>,
@@ -970,7 +976,7 @@ impl Portal {
         let sql = self
             .result
             .as_ref()
-            .map(|r| serde_json::to_vec(r).map(|b| b.len()))
+            .map(|r| serde_json::to_vec(r.get()).map(|b| b.len()))
             .transpose()
             .map_err(|_| "54000")?
             .unwrap_or(0);
@@ -985,6 +991,20 @@ impl Portal {
             .and_then(|n| n.checked_add(catalog))
             .ok_or("54000")
     }
+}
+/// The marker of a portal that ran and returned no rows: a server-built
+/// result, never core rows.
+fn ran() -> Option<Released<SqlResult>> {
+    Some(Released::synthetic(SqlResult::default()))
+}
+/// GD-0061 R3-310: before a later slice (`at > 0`) of a retained result its
+/// rows are re-served, not released again, so only the task's validity is
+/// checked (revoked, expired, definition changed). No-op outside a task.
+fn revalidate(session: &Session, at: usize, diagnostic: &mut Diagnostic) -> R<()> {
+    if at > 0 {
+        diagnostic.core(session.still_valid())?;
+    }
+    Ok(())
 }
 fn catalog_complete(count: usize, out: &mut Vec<u8>) -> R<()> {
     let mut b = Vec::new();
@@ -1094,7 +1114,7 @@ fn inspect(
     show: crate::pg_settings::Show,
     settings: &crate::pg_settings::Settings,
     session: &Session,
-) -> R<(Description, SqlResult)> {
+) -> R<(Description, Released<SqlResult>)> {
     if !session.role.is_sql() {
         return Err("42501");
     }
@@ -1114,14 +1134,15 @@ fn inspect(
                 not_null: true,
             }],
         },
-        SqlResult {
+        // A setting's value, built here: never core rows.
+        Released::synthetic(SqlResult {
             columns: vec![name.into()],
             rows: vec![giggles_core::relational::SqlRow {
                 values: vec![Value::Text(value)],
                 version: 0,
             }],
             affected: 0,
-        },
+        }),
     ))
 }
 fn execute_control(
@@ -1197,6 +1218,9 @@ impl State {
         // GD-0061 R3-206: a task session admits the class before any catalog
         // or sequence read, on its own path.
         if session.task().is_some() {
+            session
+                .sql
+                .set_task_entry(giggles_core::task::readlog::ENTRY_PGWIRE_EXTENDED);
             return self.task_prepare(sql, oids, session);
         }
         if !is_copy_sql(sql) {
@@ -1727,7 +1751,7 @@ impl State {
                         &self.output,
                         out,
                     )?;
-                    p.result = Some(SqlResult::default());
+                    p.result = ran();
                     return Ok(true);
                 }
                 if let Plan::Copy(copy, prepared) = &p.s.p {
@@ -1738,7 +1762,7 @@ impl State {
                     begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     let copy = copy.clone();
                     let prepared = prepared.clone();
-                    p.result = Some(SqlResult::default());
+                    p.result = ran();
                     self.start_copy(copy, prepared, false, session, out)?;
                     return Ok(true);
                 }
@@ -1754,7 +1778,7 @@ impl State {
                     )?;
                     let tag = session.execute_admin(stmt)?;
                     self.admin_completed = true;
-                    p.result = Some(SqlResult::default());
+                    p.result = ran();
                     complete(tag, &SqlResult::default(), out)?;
                     return Ok(true);
                 }
@@ -1820,9 +1844,13 @@ impl State {
                 if let Plan::Explain(query) = &p.s.p {
                     begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     if p.result.is_none() {
-                        p.result = Some(explain::execute(query, session)?);
+                        // Plan text the server builds (its core reads use the
+                        // plain exits, which refuse a task session).
+                        p.result = Some(Released::synthetic(explain::execute(query, session)?));
+                    } else {
+                        revalidate(session, p.at, &mut self.diagnostic)?;
                     }
-                    let result = p.result.as_ref().unwrap();
+                    let result = p.result.as_ref().unwrap().get();
                     let end = if max == 0 { result.rows.len() }
                         else { p.at.saturating_add(max as usize).min(result.rows.len()) };
                     rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
@@ -1874,7 +1902,7 @@ impl State {
                     if !session.in_transaction() {
                         self.cursors.transaction_end(actual);
                     }
-                    p.result = Some(SqlResult::default());
+                    p.result = ran();
                     complete(actual, &SqlResult::default(), out)?;
                     if !session.in_transaction() {
                         self.portals.clear();
@@ -1905,7 +1933,7 @@ impl State {
                         &mut self.diagnostic,
                         out,
                     )?;
-                    p.result = Some(SqlResult::default());
+                    p.result = ran();
                     return Ok(true);
                 }
                 // Task results are never retained in a portal. Each Execute is a
@@ -1914,13 +1942,13 @@ impl State {
                     // Recheck role/transaction even when releasing cached rows.
                     let (_, current) = inspect(show, &self.settings.current, session)?;
                     if p.result.is_none() {
-                        let bytes = serde_json::to_vec(&current).map_err(|_| "54000")?.len();
+                        let bytes = serde_json::to_vec(current.get()).map_err(|_| "54000")?.len();
                         if retained.checked_add(bytes).ok_or("54000")? > MAX_RESPONSE {
                             return Err("54000");
                         }
                         p.result = Some(current);
                     }
-                    let result = p.result.as_ref().unwrap();
+                    let result = p.result.as_ref().unwrap().get();
                     rows(
                         &self.settings.current,
                         session.zone().unwrap_or(SessionZone::Fixed(0)),
@@ -1939,25 +1967,27 @@ impl State {
                     let request = task.bind(&p.params)?;
                     let response = session.handle_prepared_task(request, received);
                     let value = serde_json::to_string(&response).map_err(|_| "XX000")?;
-                    let result = SqlResult {
+                    // The decision the server built: never core rows.
+                    let result = Released::synthetic(SqlResult {
                         columns: vec!["decision".into()],
                         rows: vec![giggles_core::relational::SqlRow {
                             values: vec![Value::Text(value)],
                             version: 0,
                         }],
                         affected: 0,
-                    };
+                    });
+                    let result = result.get();
                     rows(
                         &self.settings.current,
                         session.zone().unwrap_or(SessionZone::Fixed(0)),
-                        &result,
+                        result,
                         &p.s.d,
                         &p.formats,
                         0,
                         1,
                         out,
                     )?;
-                    complete("SELECT", &result, out)?;
+                    complete("SELECT", result, out)?;
                     return Ok(true);
                 }
                 let Plan::Sql(prepared) = &p.s.p else {
@@ -1976,20 +2006,22 @@ impl State {
                     let cursor = p.cursor.as_mut().expect("opened cursor");
                     let mut remaining = if max == 0 { usize::MAX } else { max as usize };
                     while remaining > 0 && !cursor.is_exhausted() {
-                        let chunk = self.diagnostic.core(session.fetch_cursor(
+                        // GD-0061 R3-310: fetch unreleased, release, then encode.
+                        let chunk = self.diagnostic.core(session.fetch_cursor_unreleased(
                             cursor,
                             remaining.min(CURSOR_ROWS),
                             CURSOR_BYTES,
                         ))?;
-                        let count = chunk.len();
-                        let result = SqlResult {
-                            rows: chunk,
+                        let chunk = self.diagnostic.core(session.release_page(chunk))?;
+                        let result = chunk.map(|rows| SqlResult {
+                            rows,
                             ..SqlResult::default()
-                        };
+                        });
+                        let count = result.get().rows.len();
                         rows(
                             &self.settings.current,
                             session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            &result,
+                            result.get(),
                             &p.s.d,
                             &p.formats,
                             0,
@@ -2021,12 +2053,16 @@ impl State {
                     }
                     let (result, spilled) = if command == "BEGIN" && self.implicit {
                         self.implicit = false;
-                        (SqlResult::default(), None)
+                        (Released::synthetic(SqlResult::default()), None)
                     } else {
                         self.diagnostic.core(session.sync_replication_role(&self.settings))?;
+                        // GD-0061 R3-310: the whole result is released once,
+                        // here. A task session's spill never reaches this
+                        // handle: core materialises it behind the release tag.
                         let (result, spilled) = giggles_core::relational::spill::streaming(
-                            || session.execute_prepared(prepared, &p.params));
-                        (self.diagnostic.core(result)?, spilled)
+                            || session.execute_prepared_unreleased(prepared, &p.params));
+                        let result = self.diagnostic.core(result)?;
+                        (self.diagnostic.core(session.release_page(result))?, spilled)
                     };
                     if !session.in_transaction() {
                         self.implicit = false;
@@ -2036,13 +2072,15 @@ impl State {
                         session.in_transaction(),
                         prepared.command(),
                     );
-                    let bytes = serde_json::to_vec(&result).map_err(|_| "54000")?.len();
+                    let bytes = serde_json::to_vec(result.get()).map_err(|_| "54000")?.len();
                     if retained.checked_add(bytes).ok_or("54000")? > MAX_RESPONSE {
                         return Err("54000");
                     }
                     // Admit retained bytes before caching OR appending any rows.
                     p.result = Some(result);
                     p.spilled = spilled;
+                } else {
+                    revalidate(session, p.at, &mut self.diagnostic)?;
                 }
                 if let Some(spilled) = p.spilled.as_mut() {
                     // Stream spilled rows like a cursor; an exhausted handle replays completion.
@@ -2059,7 +2097,7 @@ impl State {
                         flush_output(&self.output, out)?;
                     }
                     if spilled.is_empty() {
-                        complete(prepared.command(), p.result.as_ref().expect("spilled result"), out)?;
+                        complete(prepared.command(), p.result.as_ref().expect("spilled result").get(), out)?;
                     } else {
                         frame(b's', &[], out)?;
                     }
@@ -2068,7 +2106,7 @@ impl State {
                     }
                     return Ok(true);
                 }
-                let result = p.result.as_ref().unwrap();
+                let result = p.result.as_ref().unwrap().get();
                 let end = if max == 0 {
                     result.rows.len()
                 } else {
@@ -2526,6 +2564,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                 _ => "protocol message",
             },
             query_id: None,
+            task_refusal: None,
         };
         let (output, mut chunks) = tokio::sync::mpsc::channel(2);
         state.output = Some(output);
@@ -2678,6 +2717,10 @@ mod wire_input_contract_tests;
 #[cfg(test)]
 #[path = "pgwire_timetz_tests.rs"]
 mod timetz_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "pgwire_task_release_tests.rs"]
+mod task_release_tests;
 fn logical_binary_output(ty: &DataType, s: &str) -> R<Vec<u8>> {
     use giggles_core::relational::logical_types::array_values;
     if *ty == DataType::Uuid {

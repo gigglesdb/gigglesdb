@@ -416,18 +416,19 @@ impl State {
             complete(actual, &SqlResult::default(), out)?;
         } else if let Some(show) = show_settings(sql, session, &mut self.diagnostic)? {
             let (description, result) = inspect(show, &self.settings.current, session)?;
+            let result = result.get();
             row_description(&description, &[], out)?;
             rows(
                 &self.settings.current,
                 session.zone().unwrap_or(SessionZone::Fixed(0)),
-                &result,
+                result,
                 &description,
                 &[],
                 0,
                 1,
                 out,
             )?;
-            complete("SHOW", &result, out)?;
+            complete("SHOW", result, out)?;
         } else if let Some(settings) = parse_settings(sql, session, &mut self.diagnostic)? {
             if !session.role.is_sql() {
                 return Err("42501");

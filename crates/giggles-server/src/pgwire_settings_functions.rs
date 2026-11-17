@@ -134,9 +134,10 @@ pub(super) fn execute(
         if retained.checked_add(bytes).ok_or("54000")? > MAX_RESPONSE {
             return Err("54000");
         }
-        portal.result = Some(result);
+        // A settings function's value, built here: never core rows.
+        portal.result = Some(Released::synthetic(result));
     }
-    let result = portal.result.as_ref().unwrap();
+    let result = portal.result.as_ref().unwrap().get();
     rows(
         &settings.current,
         session.zone().unwrap_or(SessionZone::Fixed(0)),
