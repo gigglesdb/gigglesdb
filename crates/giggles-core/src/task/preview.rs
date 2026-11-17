@@ -18,30 +18,41 @@
 //!
 //! Nothing a preview refuses is recorded: it has no operation ID. In a task
 //! session the preview writes one read-log record (no rows returned).
+//!
+//! [`apply_stage`] (R3-706, D7.6) is the stored preview as the protected
+//! commit's [`ApplySource`]: step 1 (the header) and step 2 (the stored
+//! statement, its parameters and its pinned clock) run under the hold before
+//! the statement; step 3 ([`matches`]) and step 5 (the approval) are read in
+//! the tracked transaction; step 6 stages the applied header, the consumed
+//! approval and the deletion of the `28` rows in the commit's write set.
+//! Step 4 (policy and caps) is `decide::evaluate` in the commit.
 use super::admit::StatementClass;
 use super::authority;
 use super::columns;
-use super::commit::{catalog_def, engine, hold_error, role_error, standing, unsupported, DefAt};
+use super::approval::{APPROVAL_ACTIVE, APPROVAL_CONSUMED};
+use super::commit::{
+    catalog_def, engine, hold_error, role_error, standing, unsupported, ApplySource, DefAt,
+};
 use super::context::TaskContext;
 use super::decide::{self, ApprovalState, Decision, RequestKind};
-use super::definition::{TaskDef, WallClockMs};
+use super::definition::{RoleName, TaskDef, TaskPrivileges, WallClockMs};
 use super::effects::Effects;
 use super::error::{Budget, DenyRule, TaskError};
 use super::records::{
-    approval_key, mutation_head_key, preview_key, preview_row_key, task_prefix, MutationHead,
-    TaskObjectId,
-    MAX_STATEMENT_TEXT, NS_PREVIEW, NS_PREVIEW_ROW,
+    approval_key, mutation_head_key, preview_key, preview_row_key, task_prefix, ApprovalRecord,
+    MutationHead, TaskObjectId, MAX_STATEMENT_TEXT, NS_PREVIEW, NS_PREVIEW_ROW,
 };
 pub(crate) use super::records::{PreviewHeader, PreviewRow};
 use crate::CoreError;
 use crate::relational::clock::{
     ExecutionClock, StatementClock, OBS_INSTANT, OBS_SEQUENCE, OBS_WALL, OBS_XACT, OBS_ZONE,
 };
-use crate::relational::{SqlRow, TableDef, Value, catalog_ext::Constraint};
+use crate::relational::{Prepared, SqlRow, TableDef, Value, catalog_ext::Constraint};
 use crate::storage::engine::kv::Direction;
-use crate::storage::roles::{table_privileges_txn, TablePrivilege};
+use crate::storage::roles::{role_txn, table_privileges_txn, RoleError, TablePrivilege};
 use crate::storage::{Isolation, Keyspace, ProtectedRun, SqlSession, Transaction, V2Db};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -295,8 +306,17 @@ fn run(
     if text.len() > MAX_STATEMENT_TEXT || u16::try_from(params.len()).is_err() {
         return Err(CoreError::Limit.into());
     }
-    let dry = dry_run(session, &db, ctx, text, params, clock)?;
+    let dry = dry_run(session, &db, ctx, text, params, clock, Policy::Check)?;
     store(&db, ctx, surface, text, params, dry)
+}
+
+/// Whether the dry run decides the policy and the caps. Only the hidden test
+/// seam [`crate::storage::Admin::preview_task_without_policy`] skips them, to
+/// show that apply decides them again (approvals never widen).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Policy {
+    Check,
+    Skip,
 }
 
 /// T1: everything a preview checks, in a Serializable transaction that is
@@ -308,6 +328,7 @@ fn dry_run(
     text: &str,
     params: &[Value],
     clock: &StatementClock,
+    policy: Policy,
 ) -> Result<DryRun, TaskError> {
     let task = ctx.task;
     let sql = |e| TaskError::Core(Box::new(CoreError::Sql(e)));
@@ -385,16 +406,21 @@ fn dry_run(
     // The membership charge is advisory here (no hold) and rolled back.
     let head = authority::load_head(&mut txn, task)?;
     let charge = authority::charge(&mut txn, task, head.next_seq, &effects)?;
-    match decide::evaluate(
-        &state,
-        &def,
-        &table,
-        &head,
-        &effects,
-        &charge,
-        RequestKind::Apply,
-        ApprovalState::Matching,
-    ) {
+    let decision = if policy == Policy::Skip {
+        Decision::Commit(charge)
+    } else {
+        decide::evaluate(
+            &state,
+            &def,
+            &table,
+            &head,
+            &effects,
+            &charge,
+            RequestKind::Apply,
+            ApprovalState::Matching,
+        )
+    };
+    match decision {
         Decision::Commit(_) => {}
         Decision::Denied(rule) => return Err(TaskError::Denied(rule)),
         Decision::BudgetExceeded(budget) => return Err(TaskError::BudgetExceeded(budget)),
@@ -568,6 +594,253 @@ fn sweep(txn: &mut Transaction, task: TaskObjectId, now: u64) -> Result<u32, Cor
     Ok(open)
 }
 
+/// APPLY of the stored change preview `id` for the task `ctx`, requested
+/// with `digest` (D7.6), as the protected commit's [`ApplySource`].
+///
+/// Deviation from plan v5's `apply_stage(tracked, ctx, def, id, digest) ->
+/// ApplyStaged`: there is no `Tracked` type. The stages are the methods of
+/// R3-618's seam, which `protected_commit` calls inside each attempt, under
+/// the hold: [`ApplySource::statement`] is steps 1 and 2,
+/// [`ApplySource::approval_state`] steps 3 and 5 (with step 1 again, in the
+/// tracked transaction) and [`ApplySource::stage_consumed`] step 6. Step 4
+/// is `decide::evaluate` in the commit. The source is resolved once per call;
+/// nothing is read until the first attempt holds the hold.
+pub(crate) fn apply_stage(
+    db: &Arc<V2Db>,
+    ctx: &TaskContext,
+    id: PreviewId,
+    digest: [u8; 32],
+) -> Result<Box<dyn ApplySource>, TaskError> {
+    Ok(Box::new(StoredApply {
+        db: Arc::clone(db),
+        ctx: ctx.clone(),
+        id,
+        digest,
+        header: RefCell::new(None),
+        used: RefCell::new(None),
+    }))
+}
+
+/// D7.6 step 3, exactly: with `effects` (`E`, ascending `(table, pk)`) and
+/// the stored `rows` (`R`, numbered in the same order), the preview is current
+/// only if `len(E) == len(R)` and, for every `i`, the table and primary key
+/// are equal, `E[i].old` is present with `version == R[i].version_read`, and
+/// `E[i].new` is present with `encode(new.values) == R[i].after`. Only
+/// equality is used. The new values are resized to `width` (the table's
+/// column count) first, as the preview stored them. A stored row of another
+/// class never matches.
+pub(crate) fn matches(effects: &Effects, rows: &[PreviewRow], width: usize) -> bool {
+    effects.len() == rows.len()
+        && effects.iter().zip(rows).all(|(effect, row)| {
+            row.class == PreviewClass::Change as u8
+                && effect.table == row.table
+                && effect.pk == row.pk
+                && effect
+                    .old
+                    .as_ref()
+                    .is_some_and(|old| old.version == row.version_read)
+                && effect.new.as_ref().is_some_and(|new| {
+                    let mut values = new.values.clone();
+                    values.resize(width, Value::Null);
+                    encode_after(&values).is_ok_and(|after| after == row.after)
+                })
+        })
+}
+
+/// The stored preview and approval behind one Apply call.
+struct StoredApply {
+    db: Arc<V2Db>,
+    ctx: TaskContext,
+    id: PreviewId,
+    /// The digest the executor sent.
+    digest: [u8; 32],
+    /// The header step 1 accepted in the current attempt.
+    header: RefCell<Option<PreviewHeader>>,
+    /// The approval step 5 used in the current attempt, if one was needed.
+    used: RefCell<Option<ApprovalRecord>>,
+}
+
+/// What step 1 accepted: the header, the table it was taken on and the
+/// definition, all at one snapshot.
+struct Checked {
+    header: PreviewHeader,
+    table: TableDef,
+    def: Arc<TaskDef>,
+}
+
+impl StoredApply {
+    /// D7.6 step 1 at `txn`'s snapshot. `None` (stale) when the header is
+    /// missing, not a change, not open, expired, created by another executor,
+    /// has another digest, or its `def_version`, table or `schema_fp` is not
+    /// the current one.
+    fn checked(&self, txn: &mut Transaction) -> Result<Option<Checked>, CoreError> {
+        let task = self.ctx.task;
+        let Some(value) = txn.get(Keyspace::Kernel, &preview_key(task, self.id.0))? else {
+            return Ok(None);
+        };
+        let header = PreviewHeader::decode(&value)?;
+        if header.kind != PreviewKind::Change as u8
+            || header.state != STATE_OPEN
+            || header.expires_ms <= self.db.wall_now_ms()
+            || header.creator != self.ctx.executor
+            || header.digest != self.digest
+        {
+            return Ok(None);
+        }
+        let Some(def) = catalog_def(&self.db, task, DefAt::Snapshot(txn))? else {
+            return Ok(None);
+        };
+        if header.def_version != def.def_version || header.table != def.table {
+            return Ok(None);
+        }
+        let state = self.db.catalog().snapshot(txn)?.image().map_err(CoreError::Sql)?;
+        let Some(table) = state.tables.values().find(|table| table.id == header.table).cloned()
+        else {
+            return Ok(None);
+        };
+        if schema_fp(&table, state.table_constraints(table.id))? != header.schema_fp {
+            return Ok(None);
+        }
+        Ok(Some(Checked { header, table, def }))
+    }
+
+    /// D7.6 step 5's role test: the approving role still exists (the same
+    /// role, by oid), is not the executor, is the task's named approver when
+    /// there is one, and still holds the approve privilege.
+    fn approver_holds(
+        &self,
+        txn: &mut Transaction,
+        def: &TaskDef,
+        approval: &ApprovalRecord,
+    ) -> Result<bool, CoreError> {
+        let role = match role_txn(txn, &approval.approver) {
+            Ok(Some(role)) => role,
+            Ok(None) => return Ok(false),
+            Err(RoleError::Core(error)) => return Err(error),
+            Err(_) => return Ok(false),
+        };
+        Ok((approval.approver_oid == 0 || role.oid == approval.approver_oid)
+            && role.name != def.executor
+            && def.approver.as_ref().is_none_or(|approver| *approver == role.name)
+            && def.privileges_of(&role).contains(TaskPrivileges::APPROVE))
+    }
+}
+
+impl ApplySource for StoredApply {
+    /// Steps 1 and 2: the header at the latest committed state (the hold
+    /// keeps previews, approvals and applies of this task out), then the
+    /// stored text prepared under the current catalog and the stored
+    /// parameters. The commit applies the task's column rules to it.
+    fn statement(&self, session: &mut SqlSession) -> Result<(Prepared, Vec<Value>), TaskError> {
+        self.header.replace(None);
+        self.used.replace(None);
+        let mut read = self.db.begin(Isolation::ReadCommitted);
+        let checked = self.checked(&mut read)?.ok_or(TaskError::ApprovalStale)?;
+        drop(read);
+        let header = checked.header;
+        if header.surface != Surface::Sql as u8 {
+            return Err(unsupported());
+        }
+        let prepared = session.prepare(&header.text)?;
+        if prepared.task_class() != StatementClass::Update {
+            return Err(TaskError::ApprovalStale);
+        }
+        let params = crate::storage::task_row_values(&header.params)?;
+        self.header.replace(Some(header));
+        Ok((prepared, params))
+    }
+
+    /// The preview's pinned instant (D7.4). A preview that observed no
+    /// instant re-runs with time functions unavailable, so a re-run that
+    /// would read one fails instead of reading a new value.
+    fn clock(&self) -> Option<ExecutionClock> {
+        let pin = self
+            .header
+            .borrow()
+            .as_ref()
+            .map_or(NO_CLOCK_PIN, |header| header.clock_pin);
+        let mut clock = ExecutionClock::pinned(if pin == NO_CLOCK_PIN { 0 } else { pin }, None);
+        if pin == NO_CLOCK_PIN {
+            clock.unavailable = Some(CoreError::Unsupported);
+        }
+        Some(ExecutionClock::new(&clock))
+    }
+
+    /// Step 1 again and step 3 in the tracked transaction (a concurrent DDL
+    /// or row change fails the commit's validation), then step 5 when the
+    /// effects are above the threshold: the `29` record active, with the
+    /// header's digest, from a role that still may approve. At or under the
+    /// threshold no approval is read or consumed (`Missing` commits there).
+    fn approval_state(
+        &self,
+        txn: &mut Transaction,
+        effects: &Effects,
+    ) -> Result<ApprovalState, CoreError> {
+        self.used.replace(None);
+        let Some(Checked { header, table, def }) = self.checked(txn)? else {
+            return Ok(ApprovalState::Stale);
+        };
+        if self.header.borrow().as_ref() != Some(&header) {
+            return Ok(ApprovalState::Stale);
+        }
+        let task = self.ctx.task;
+        let count = stored_rows(&header);
+        let mut rows = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        for row_no in 0..count {
+            let key = preview_row_key(task, self.id.0, row_no);
+            let Some(value) = txn.get(Keyspace::Kernel, &key)? else {
+                return Ok(ApprovalState::Stale);
+            };
+            rows.push(PreviewRow::decode(&value)?);
+        }
+        if !matches(effects, &rows, table.columns.len()) {
+            return Ok(ApprovalState::Stale);
+        }
+        if u64::try_from(effects.len()).unwrap_or(u64::MAX) <= def.approval_threshold {
+            return Ok(ApprovalState::Missing);
+        }
+        let Some(value) = txn.get(Keyspace::Kernel, &approval_key(task, self.id.0))? else {
+            return Ok(ApprovalState::Missing);
+        };
+        let approval = ApprovalRecord::decode(&value)?;
+        if approval.state != APPROVAL_ACTIVE
+            || approval.digest != header.digest
+            || !self.approver_holds(txn, &def, &approval)?
+        {
+            return Ok(ApprovalState::Missing);
+        }
+        self.used.replace(Some(approval));
+        Ok(ApprovalState::Matching)
+    }
+
+    /// Step 6: the header applied at `seq`, its `28` rows deleted and the
+    /// approval, if one was used, consumed at `seq`.
+    fn stage_consumed(&self, txn: &mut Transaction, seq: u64) -> Result<(), CoreError> {
+        let task = self.ctx.task;
+        let mut header = self
+            .header
+            .borrow()
+            .clone()
+            .ok_or_else(|| CoreError::Corrupt("apply without a checked preview".into()))?;
+        for row_no in 0..stored_rows(&header) {
+            txn.delete(Keyspace::Kernel, preview_row_key(task, self.id.0, row_no))?;
+        }
+        header.state = STATE_APPLIED;
+        header.applied_seq = seq;
+        txn.put(Keyspace::Kernel, preview_key(task, self.id.0), header.encode())?;
+        if let Some(mut approval) = self.used.borrow().clone() {
+            approval.state = APPROVAL_CONSUMED;
+            approval.consumed_seq = seq;
+            txn.put(Keyspace::Kernel, approval_key(task, self.id.0), approval.encode())?;
+        }
+        Ok(())
+    }
+
+    fn approver(&self) -> Option<RoleName> {
+        self.used.borrow().as_ref().map(|approval| approval.approver.clone())
+    }
+}
+
 /// One stored preview row, as [`StoredPreview`] shows it.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
@@ -683,6 +956,45 @@ impl crate::storage::Admin {
             previews,
             stored_rows,
         })
+    }
+
+    /// For tests: PREVIEW of `text` for `ctx` whose dry run skips the policy
+    /// and the caps (everything else, the store included, runs as usual), so
+    /// a test can show that apply decides them itself: an approval never
+    /// widens what the task may write.
+    #[doc(hidden)]
+    pub fn preview_task_without_policy(
+        &self,
+        ctx: &TaskContext,
+        text: &str,
+        clock: &StatementClock,
+    ) -> Result<PreviewSummary, TaskError> {
+        let mut session = self.sql_session();
+        let db = session.v2_db().ok_or_else(unsupported)?;
+        let dry = dry_run(&mut session, &db, ctx, text, &[], clock, Policy::Skip)?;
+        store(&db, ctx, Surface::Sql, text, &[], dry)
+    }
+
+    /// For tests: rewrites the stored `def_version` of preview `id` of
+    /// `task`, keeping its digest (R3 has no ALTER TASK, and a revoke
+    /// already stops the executor's session).
+    #[doc(hidden)]
+    pub fn set_task_preview_def_version(
+        &self,
+        task: TaskObjectId,
+        id: PreviewId,
+        def_version: u64,
+    ) -> Result<(), CoreError> {
+        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let mut txn = db.begin(Isolation::ReadCommitted);
+        let value = txn
+            .get(Keyspace::Kernel, &preview_key(task, id.0))?
+            .ok_or_else(|| CoreError::Corrupt("no preview to rewrite".into()))?;
+        let mut header = PreviewHeader::decode(&value)?;
+        header.def_version = def_version;
+        txn.put(Keyspace::Kernel, preview_key(task, id.0), header.encode())?;
+        db.catalog().commit_ddl(txn)?;
+        Ok(())
     }
 }
 
@@ -844,6 +1156,45 @@ mod tests {
         assert_eq!(rows_from_effects(bad).unwrap_err(), TaskError::Denied(DenyRule::PrimaryKeyChange));
         let bad = vec![EffectView { table: 1, pk: &[1], old: Some(&o1), new: None }];
         assert_eq!(rows_from_effects(bad).unwrap_err(), TaskError::Denied(DenyRule::PrimaryKeyChange));
+    }
+
+    #[test]
+    fn matches_is_the_exact_d7_6_comparison() {
+        let r = |v: i64, version: u64| SqlRow { values: vec![Value::Int(v)], version };
+        let key = |pk: u8| {
+            let mut k = 9u64.to_be_bytes().to_vec();
+            k.push(pk);
+            k
+        };
+        let mut effects = Effects::default();
+        effects.record(9, &key(1), Some(&r(1, 10)), Some(&r(2, 11))).unwrap();
+        effects.record(9, &key(2), Some(&r(3, 20)), Some(&r(4, 21))).unwrap();
+        let stored = |pk: u8, version_read: u64, after: i64| PreviewRow {
+            class: 0,
+            table: 9,
+            pk: vec![pk],
+            version_read,
+            aux: 0,
+            after: encode_after(&[Value::Int(after), Value::Null]).unwrap(),
+        };
+        let rows = vec![stored(1, 10, 2), stored(2, 20, 4)];
+        // New values are resized to the table width before encoding.
+        assert!(matches(&effects, &rows, 2));
+        assert!(!matches(&effects, &rows, 1));
+        // A missing or extra row, a changed version, a different new value,
+        // another key or another class are all stale.
+        assert!(!matches(&effects, &rows[..1], 2));
+        assert!(!matches(&effects, &[rows.clone(), vec![stored(3, 30, 6)]].concat(), 2));
+        assert!(!matches(&effects, &[stored(1, 12, 2), stored(2, 20, 4)], 2));
+        assert!(!matches(&effects, &[stored(1, 10, 5), stored(2, 20, 4)], 2));
+        assert!(!matches(&effects, &[stored(1, 10, 2), stored(3, 20, 4)], 2));
+        assert!(!matches(&effects, &[stored(1, 10, 2), PreviewRow { class: 1, ..stored(2, 20, 4) }], 2));
+        assert!(!matches(&effects, &[PreviewRow { table: 8, ..stored(1, 10, 2) }, stored(2, 20, 4)], 2));
+        // An effect without an old or a new row never matches.
+        let mut deleted = Effects::default();
+        deleted.record(9, &key(1), Some(&r(1, 10)), None).unwrap();
+        assert!(!matches(&deleted, &rows[..1], 2));
+        assert!(matches(&Effects::default(), &[], 2));
     }
 
     fn table(id: u64, name: &str, cols: &[&str]) -> TableDef {

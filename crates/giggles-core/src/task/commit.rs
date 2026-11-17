@@ -35,8 +35,11 @@
 //! that Phase 7 implements over the stored preview and approval: the source
 //! supplies the statement to re-run, the approval state of the re-run
 //! effects (step 12) and stages the consumption in the commit's write set
-//! (step 13). Until R3-706 fills in [`stored_apply_source`], an Apply is
-//! `Unsupported`. `Undo` (and `Actor::Undo`) stays `Unsupported` until R3-803,
+//! (step 13). R3-706 fills in [`stored_apply_source`] with
+//! [`super::preview::apply_stage`] (D7.6 steps 1-3, 5 and 6; step 4 is
+//! `decide::evaluate` here). An Apply that consumes its preview takes it out
+//! of the head's `stored_previews` count and names the approval's role in the
+//! receipt. `Undo` (and `Actor::Undo`) stays `Unsupported` until R3-803,
 //! whose arm needs the undo-specific checks, identity and change record.
 //!
 //! R3-619 adds the crash seams (D-I). The commit reuses `CrashPoint`'s
@@ -179,27 +182,32 @@ pub(crate) trait ApplySource {
     /// Stages the preview's applied state and, when one was used, the
     /// approval's consumption under receipt `seq`, in the commit's write set.
     fn stage_consumed(&self, txn: &mut Transaction, seq: u64) -> Result<(), CoreError>;
+    /// The role whose approval this attempt uses, if one was needed; the
+    /// receipt records it.
+    fn approver(&self) -> Option<RoleName> {
+        None
+    }
 }
 
 /// Resolves the [`ApplySource`] of an Apply request, once per call, after
 /// the outcome lookup and the task checks (D-F steps 2 and 3).
 pub(crate) type Sources<'a> = dyn FnMut(
-        &V2Db,
+        &Arc<V2Db>,
         &TaskContext,
         PreviewId,
         &[u8; 32],
     ) -> Result<Box<dyn ApplySource + 'a>, TaskError>
     + 'a;
 
-/// The attachment point for Phase 7: R3-706 returns the stored preview and
-/// approval of `preview` here. Until then an Apply is `Unsupported`.
+/// The attachment point for Phase 7 (R3-706): the stored preview and
+/// approval of `preview`.
 pub(crate) fn stored_apply_source(
-    _db: &V2Db,
-    _ctx: &TaskContext,
-    _preview: PreviewId,
-    _digest: &[u8; 32],
+    db: &Arc<V2Db>,
+    ctx: &TaskContext,
+    preview: PreviewId,
+    digest: &[u8; 32],
 ) -> Result<Box<dyn ApplySource>, TaskError> {
-    Err(unsupported())
+    super::preview::apply_stage(db, ctx, preview, *digest)
 }
 
 /// Where a definition is read.
@@ -746,6 +754,12 @@ fn attempt(
         transitions: head.transitions.saturating_add(u64::from(charge.transitions)),
         next_seq: seq.checked_add(1).ok_or(CoreError::Limit)?,
         last_decided_ms: decided_ms,
+        // The applied preview no longer counts as open (the next preview's
+        // sweep recomputes the count anyway).
+        stored_previews: match work {
+            Work::Direct { .. } => head.stored_previews,
+            Work::Apply { .. } => head.stored_previews.saturating_sub(1),
+        },
         ..head
     };
     let record = ReceiptRecord {
@@ -779,7 +793,10 @@ fn attempt(
         op_id: op.as_bytes().to_vec(),
         issuer: def.issuer.clone(),
         executor: def.executor.clone(),
-        approver: None,
+        approver: match work {
+            Work::Direct { .. } => None,
+            Work::Apply { source, .. } => source.approver(),
+        },
     };
     put(&mut txn, receipt_key(task, seq), record.encode())?;
     // Phase 7: the preview applied and the approval consumed, in this batch.
