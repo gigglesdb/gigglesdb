@@ -191,6 +191,11 @@ impl ClusterProcs {
         self.nodes.len()
     }
 
+    /// Borrow a live child for control-pipe and process-exit assertions.
+    pub(crate) fn child_mut(&mut self, i: usize) -> &mut Child {
+        self.nodes[i].child.as_mut().expect("node not started")
+    }
+
     /// Spawns node i's process (stderr appended to `stderr.log` in its directory).
     pub(crate) fn start(&mut self, i: usize) {
         let node = &mut self.nodes[i];

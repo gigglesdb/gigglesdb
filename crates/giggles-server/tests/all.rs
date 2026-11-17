@@ -276,3 +276,4 @@ mod api_role_listener;
 #[path = "cluster_replace.rs"]
 mod cluster_replace;
 #[path = "cluster_ddl_process.rs"] mod cluster_ddl_process;
+#[path = "stdin_shutdown.rs"] mod stdin_shutdown;

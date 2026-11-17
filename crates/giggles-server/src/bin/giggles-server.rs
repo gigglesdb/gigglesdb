@@ -535,7 +535,11 @@ async fn run_replicated(c: Config) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match reader.next().await {
                 Ok(Some(command)) => {
-                    if tx.send(Ok(command)).await.is_err() {
+                    // Tokio stdin uses an uncancellable blocking read. Do not start
+                    // another read after shutdown: runtime teardown would wait for
+                    // that read until the operator closes stdin.
+                    let shutdown = command.as_slice() == b"shutdown";
+                    if tx.send(Ok(command)).await.is_err() || shutdown {
                         break;
                     }
                 }
