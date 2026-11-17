@@ -1074,7 +1074,10 @@ key_file='key'
             let diff = classify(&a, &b);
             assert_eq!(
                 diff.reloadable,
-                if reloadable { vec![name] } else { vec![] },
+                if path == "search_path" {
+                    // Loading this path also expands the effective capture set.
+                    vec!["schemas", "search_path"]
+                } else if reloadable { vec![name] } else { vec![] },
                 "{path}"
             );
             assert_eq!(
@@ -1320,13 +1323,15 @@ key_file='key'
             reload.attach_catalog(pg.ctx.clone(), Arc::new(move |cfg| {
                 let mut snapshot = source_snapshot.clone();
                 Box::pin(async move {
+                    assert_eq!(cfg.schemas, ["public", "other"]);
+                    assert_eq!(cfg.search_path, ["other"]);
                     if outcome == 0 { return Err("snapshot unavailable"); }
                     if outcome == 1 { snapshot.relations.clear(); }
                     snapshot.search_path = cfg.search_path;
                     Ok(snapshot)
                 })
             }));
-            let edited = edit(&edit(&edit(&edit(&f.text, "search_path", "['other']"), "schemas", "['public','other']"), "snapshot_refresh_ms", "10"), "max_connections", "1");
+            let edited = edit(&edit(&edit(&f.text, "search_path", "['other']"), "snapshot_refresh_ms", "10"), "max_connections", "1");
             f.load(&edited);
             reload.reload().await;
             let current = pg.ctx.snapshot.read().unwrap().clone();
@@ -1336,6 +1341,7 @@ key_file='key'
                 assert!(Arc::ptr_eq(&original, &current));
                 assert_eq!(settings.search_path, ["public"]);
                 assert_eq!(settings.schemas, ["public"]);
+                assert_eq!(reload.state.lock().unwrap().running.schemas, ["public"]);
                 assert_eq!(settings.refresh_ms, 30000);
                 assert_eq!(settings.generation, 0);
                 assert_eq!(transports.connections.0.lock().unwrap().0, 256);
@@ -1344,6 +1350,8 @@ key_file='key'
                 assert_eq!(reload.last_reload(), "applied");
                 assert_eq!(current.search_path, ["other"]);
                 assert_eq!(settings.schemas, ["public", "other"]);
+                assert_eq!(settings.search_path, ["other"]);
+                assert_eq!(reload.state.lock().unwrap().running.schemas, ["public", "other"]);
                 assert_eq!(settings.refresh_ms, 10);
                 assert_eq!(settings.generation, 1);
                 assert_eq!(transports.connections.0.lock().unwrap().0, 1);

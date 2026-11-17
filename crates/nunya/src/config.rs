@@ -326,6 +326,20 @@ fn key(bytes: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
     }
     Some(out)
 }
+/// Include search-path schemas in explicit capture sets, preserving order and all-schema capture.
+fn effective_schemas(schemas: Vec<String>, search_path: &[String]) -> Vec<String> {
+    if schemas.is_empty() {
+        return schemas;
+    }
+    let mut effective = Vec::new();
+    for schema in schemas.iter().chain(search_path) {
+        if !effective.contains(schema) {
+            effective.push(schema.clone());
+        }
+    }
+    effective
+}
+
 /// Read settings and collect independent validation failures without source snippets.
 pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     let text = Zeroizing::new(
@@ -423,7 +437,8 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
             Zeroizing::new([0; 32])
         });
     let schemas = get(&mut m, "schemas", &mut e).unwrap_or_else(|| vec!["public".into()]);
-    let search_path = get(&mut m, "search_path", &mut e).unwrap_or_else(|| vec!["public".into()]);
+    let search_path: Vec<String> = get(&mut m, "search_path", &mut e).unwrap_or_else(|| vec!["public".into()]);
+    let schemas = effective_schemas(schemas, &search_path);
     let snapshot_refresh_ms = get(&mut m, "snapshot_refresh_ms", &mut e).unwrap_or(30000);
     if snapshot_refresh_ms == 0 {
         err(&mut e, "snapshot_refresh_ms", "must be positive");
@@ -850,6 +865,37 @@ password_file = "password"
 tls = "disable"
 "#;
     const NATIVE: &str = "\n[spanner_native]\nlisten='127.0.0.1:6433'\ndatabase='projects/p/instances/i/databases/d'\n";
+    #[test]
+    fn search_path_schemas_are_captured_in_order() {
+        let f = Fixture::new();
+        let text = format!("schemas=['public']\nsearch_path=['other','public']\n{EXAMPLE}");
+        let c = f.load(&text).unwrap();
+        assert_eq!(c.schemas, ["public", "other"]);
+        assert_eq!(c.search_path, ["other", "public"]);
+    }
+    #[test]
+    fn effective_capture_set_has_no_duplicates_and_compares_exactly() {
+        let f = Fixture::new();
+        let text = format!("schemas=['other','public','other']\nsearch_path=['public','other','Other','Other']\n{EXAMPLE}");
+        let c = f.load(&text).unwrap();
+        assert_eq!(c.schemas, ["other", "public", "Other"]);
+        assert_eq!(c.search_path, ["public", "other", "Other", "Other"]);
+    }
+    #[test]
+    fn empty_capture_set_keeps_all_non_system_schemas() {
+        let f = Fixture::new();
+        let text = format!("schemas=[]\nsearch_path=['other','public']\n{EXAMPLE}");
+        let c = f.load(&text).unwrap();
+        assert!(c.schemas.is_empty());
+        assert_eq!(c.search_path, ["other", "public"]);
+    }
+    #[test]
+    fn default_capture_set_and_search_path_stay_public() {
+        let f = Fixture::new();
+        let c = f.load(EXAMPLE).unwrap();
+        assert_eq!(c.schemas, ["public"]);
+        assert_eq!(c.search_path, ["public"]);
+    }
     #[test]
     fn per_route_policy_keys_resolve_against_config_dir() {
         let f = Fixture::new();
