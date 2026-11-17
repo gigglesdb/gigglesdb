@@ -29,7 +29,7 @@ async fn sql(
                     sql: sql.into(),
                     params,
                 })),
-                budget_ms: Some(10_000),
+                budget_ms: Some(10_000), operation_id: None,
             },
         )?)
         .await?

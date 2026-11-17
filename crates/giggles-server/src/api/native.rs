@@ -1,10 +1,11 @@
 //! Authorized typed execution on the existing retained Session.
 use super::codec::Invocation;
 use crate::{Role, Session};
+use crate::agent::statement::OperationId;
 use giggles_core::{
     CoreError, Error, operations as ops,
     relational::SqlError,
-    task::{Released, StatementClass},
+    task::{Released, StatementClass, TaskError},
 };
 
 /// A native result, ready to encode. Rows that came out of core are held as
@@ -64,6 +65,9 @@ fn statement_text(invocation: &Invocation) -> String {
         Invocation::Savepoint(name) => Ok(format!("SAVEPOINT {name}")),
         Invocation::RollbackTo(name) => Ok(format!("ROLLBACK TO SAVEPOINT {name}")),
         Invocation::Release(name) => Ok(format!("RELEASE SAVEPOINT {name}")),
+        Invocation::TaskPreview { request, .. } => serde_json::to_string(request),
+        Invocation::TaskApply { change, .. } => Ok(format!("APPLY CHANGE {change}")),
+        Invocation::TaskOutcome => Ok("SHOW OPERATION".into()),
         Invocation::Legacy(_) | Invocation::Text { .. } => Ok(String::new()),
     };
     json.unwrap_or_default()
@@ -74,7 +78,8 @@ fn binding_count(invocation: &Invocation) -> usize {
     match invocation {
         Invocation::Operation { bindings, .. }
         | Invocation::Page { bindings, .. }
-        | Invocation::Transaction { bindings, .. } => bindings.len(),
+        | Invocation::Transaction { bindings, .. }
+        | Invocation::TaskPreview { bindings, .. } => bindings.len(),
         _ => 0,
     }
 }
@@ -174,33 +179,57 @@ fn catalog_table(session: &Session, request: &ops::CatalogRequest) -> String {
     format!("{schema}.{name}")
 }
 
-/// The task statement class of a native request. A native transaction is an
-/// explicit transaction, so it is `TransactionControl` as a whole.
-fn task_class(invocation: &Invocation) -> Result<StatementClass, CoreError> {
-    fn request_class(request: &ops::Request) -> StatementClass {
-        match request {
-            ops::Request::Read { .. } | ops::Request::ReadExpressions { .. } => {
-                StatementClass::Select
-            }
-            ops::Request::Update { .. } | ops::Request::UpdateExpressions { .. } => {
-                StatementClass::Update
-            }
-            ops::Request::Delete { .. } => StatementClass::Delete,
-            ops::Request::Insert { .. }
-            | ops::Request::InsertExpressions { .. }
-            | ops::Request::InsertMany { .. }
-            | ops::Request::OnConflict { .. } => StatementClass::Insert,
-            ops::Request::Returning { request, .. } => match request.as_ref() {
-                ops::Request::Returning { .. } => StatementClass::Other,
-                inner => request_class(inner),
-            },
+/// The task statement class of one native request (design-2 section 4(c)).
+/// `Returning` is peeled as `table_requirements` peels it; a second
+/// `Returning` is never valid and is `Other`.
+pub(crate) fn request_class(request: &ops::Request) -> StatementClass {
+    match request {
+        ops::Request::Read { .. } | ops::Request::ReadExpressions { .. } => StatementClass::Select,
+        ops::Request::Update { .. } | ops::Request::UpdateExpressions { .. } => {
+            StatementClass::Update
         }
+        ops::Request::Delete { .. } => StatementClass::Delete,
+        ops::Request::Insert { .. }
+        | ops::Request::InsertExpressions { .. }
+        | ops::Request::InsertMany { .. }
+        | ops::Request::OnConflict { .. } => StatementClass::Insert,
+        ops::Request::Returning { request, .. } => match request.as_ref() {
+            ops::Request::Returning { .. } => StatementClass::Other,
+            inner => request_class(inner),
+        },
     }
-    Ok(match invocation {
+}
+
+/// The class of a legacy request: `Ping` is `Show`, everything else `Other`.
+/// A legacy `Sql` request is classified by its statement on the SQL route
+/// instead (R3-208, `Session::authorize`); see [`admit_legacy`].
+fn legacy_class(request: &crate::Request) -> StatementClass {
+    match request {
+        crate::Request::Ping => StatementClass::Show,
+        crate::Request::Sql { .. }
+        | crate::Request::Deadline { .. }
+        | crate::Request::Preview { .. }
+        | crate::Request::Execute { .. }
+        | crate::Request::RepairSql { .. }
+        | crate::Request::Status { .. } => StatementClass::Other,
+    }
+}
+
+/// The task statement class of a native invocation (GD-0061 R3-209,
+/// design-2 section 4(c)). An exhaustive match with no wildcard arm, so a new
+/// `Invocation` or legacy `Request` variant does not compile until it is
+/// classified. A native transaction is an explicit transaction, so it is
+/// `TransactionControl` as a whole, whatever its step count.
+pub(crate) fn class(invocation: &Invocation) -> StatementClass {
+    match invocation {
+        Invocation::Legacy(request) => legacy_class(request),
+        // Lowered at decode (`codec::Invocation::lower`); never reaches here.
+        Invocation::Text { .. } => StatementClass::Other,
         Invocation::Operation { request, .. } | Invocation::Page { request, .. } => {
             request_class(request)
         }
-        Invocation::Read(_) | Invocation::Join(_) => StatementClass::Select,
+        Invocation::Read(_) => StatementClass::Select,
+        Invocation::Join(_) => StatementClass::Other,
         Invocation::Transaction { .. }
         | Invocation::Begin
         | Invocation::Commit
@@ -212,28 +241,145 @@ fn task_class(invocation: &Invocation) -> Result<StatementClass, CoreError> {
         Invocation::Sequence(_) => StatementClass::Other,
         Invocation::SearchPath(None) => StatementClass::Show,
         Invocation::SearchPath(Some(_)) => StatementClass::Set,
-        Invocation::Legacy(_) | Invocation::Text { .. } => return Err(CoreError::Unsupported),
+        Invocation::TaskPreview { .. } => StatementClass::Preview,
+        Invocation::TaskApply { .. } => StatementClass::Apply,
+        Invocation::TaskOutcome => StatementClass::OutcomeLookup,
+    }
+}
+
+/// Admission of a legacy request on a task session (design-2 section 4,
+/// call site 5: the legacy surface admits only `Ping`). A legacy `Sql`
+/// request goes on to the SQL route, where its statement is admitted by its
+/// own class (R3-208). A refusal is logged here, as `run` logs one.
+pub(crate) fn admit_legacy(
+    session: &mut Session,
+    request: &crate::Request,
+) -> Result<(), CoreError> {
+    if session.task().is_none() || matches!(request, crate::Request::Sql { .. }) {
+        return Ok(());
+    }
+    session.check_binding()?;
+    let class = legacy_class(request);
+    session.admit(class).inspect_err(|error| {
+        session.sql.log_refused_task_statement("", class, 0, error);
     })
+}
+
+/// The SQL UPDATE a native update lowers to, with its positional parameters:
+/// R3-708's `lower_preview_update`, the lowering native text preview uses.
+/// Core's request and the language's statement are the same tree; a request
+/// that does not convert, or is not a plain update, is 0A000.
+fn lowered_update(
+    request: &ops::Request,
+    bindings: &ops::Bindings,
+) -> Result<giggles_language::LoweredUpdate, CoreError> {
+    let statement: giggles_language::Statement = serde_json::to_value(request)
+        .and_then(serde_json::from_value)
+        .map_err(|_| CoreError::Unsupported)?;
+    giggles_language::lower_preview_update(&statement, bindings)
+        .map_err(|_| CoreError::Unsupported)
+}
+
+/// GD-0061 R3-209: a protected request of a task session, after admission.
+/// A native update (under its operation ID), a preview, an apply and an
+/// outcome lookup run through `Session::execute_protected`, as the SQL forms
+/// of R3-207 do. The reply is what the server builds (a receipt count, a
+/// preview summary or a stored outcome), never core rows.
+fn protected(
+    session: &mut Session,
+    invocation: Invocation,
+    operation_id: Option<OperationId>,
+) -> Result<NativeResult, CoreError> {
+    use crate::agent::statement::ProtectedStatement;
+    let required = || CoreError::Task(TaskError::OperationIdRequired);
+    let (statement, params) = match invocation {
+        Invocation::Operation { request, bindings } => {
+            let op = operation_id.ok_or_else(required)?;
+            let lowered = lowered_update(&request, &bindings)?;
+            let prepared = session.prepare_protected(StatementClass::Update, &lowered.sql, &[])?;
+            if prepared.task_class() != StatementClass::Update {
+                return Err(CoreError::Unsupported);
+            }
+            let statement = ProtectedStatement::Direct {
+                op,
+                prepared: Box::new(prepared),
+                text: std::sync::Arc::from(lowered.sql),
+            };
+            (statement, lowered.params)
+        }
+        Invocation::TaskPreview { request, bindings } => {
+            if request_class(&request) != StatementClass::Update {
+                return Err(CoreError::Unsupported);
+            }
+            let lowered = lowered_update(&request, &bindings)?;
+            let prepared =
+                session.prepare_protected(StatementClass::Preview, &lowered.sql, &[])?;
+            if prepared.task_class() != StatementClass::Update {
+                return Err(CoreError::Unsupported);
+            }
+            let statement = ProtectedStatement::Preview {
+                prepared: Box::new(prepared),
+                text: std::sync::Arc::from(lowered.sql),
+            };
+            (statement, lowered.params)
+        }
+        Invocation::TaskApply { change, digest } => {
+            let op = operation_id.ok_or_else(required)?;
+            (ProtectedStatement::Apply { op, preview: change, digest }, Vec::new())
+        }
+        Invocation::TaskOutcome => {
+            let op = operation_id.ok_or_else(required)?;
+            (ProtectedStatement::Outcome { op }, Vec::new())
+        }
+        // An update reaches here only as `Operation`; a page is a read.
+        _ => return Err(CoreError::Unsupported),
+    };
+    let result = session.execute_protected(&statement, &params)?;
+    Ok(NativeResult::Sql(Released::synthetic(result)))
 }
 
 pub(crate) fn run(
     session: &mut Session,
     invocation: Invocation,
+    operation_id: Option<OperationId>,
 ) -> Result<NativeResult, CoreError> {
     let result = (|| {
         session.check_binding()?;
-        // GD-0061 R3-208: a task session admits the class before any
-        // resolution, authorization or execution, as on the agent pgwire path.
-        // A refusal here never reaches core, so it is logged here, once
-        // (GD-0061 R3-313; core logs every statement that reaches it).
+        // GD-0061 R3-208/R3-209: a task session admits the class before any
+        // resolution, authorization or execution (no catalog or table lookup),
+        // as on the agent pgwire path. A refusal here never reaches core, so
+        // it is logged here, once (GD-0061 R3-313; core logs every statement
+        // that reaches it).
         if session.task().is_some() {
-            let class = task_class(&invocation)?;
-            if let Err(error) = session.admit_backstop(class) {
+            let class = class(&invocation);
+            let mut admitted = session.admit(class);
+            if admitted.is_ok() && class == StatementClass::Update && operation_id.is_none() {
+                admitted = Err(CoreError::Task(TaskError::OperationIdRequired));
+            }
+            if let Err(error) = admitted {
                 session.sql.log_refused_task_statement(
                     &statement_text(&invocation), class, binding_count(&invocation), &error,
                 );
                 return Err(error);
             }
+            if matches!(
+                class,
+                StatementClass::Update
+                    | StatementClass::Preview
+                    | StatementClass::Apply
+                    | StatementClass::OutcomeLookup
+            ) {
+                return protected(session, invocation, operation_id);
+            }
+        } else if operation_id.is_some()
+            || matches!(
+                invocation,
+                Invocation::TaskPreview { .. } | Invocation::TaskApply { .. } | Invocation::TaskOutcome
+            )
+        {
+            // Only a task session has protected forms; the API runtime
+            // refuses them before this on every other listener.
+            return Err(CoreError::Unsupported);
         }
         if let Invocation::Catalog(request) = &invocation {
             return session.authority_scope(|session| {
@@ -277,7 +423,8 @@ pub(crate) fn run(
             }
             Invocation::Catalog(_) | Invocation::Sequence(_) | Invocation::SearchPath(_) | Invocation::Begin | Invocation::Commit | Invocation::Rollback
             | Invocation::Savepoint(_) | Invocation::RollbackTo(_) | Invocation::Release(_) => {}
-            Invocation::Legacy(_) | Invocation::Text { .. } => return Err(CoreError::Unsupported),
+            Invocation::Legacy(_) | Invocation::Text { .. } | Invocation::TaskPreview { .. }
+            | Invocation::TaskApply { .. } | Invocation::TaskOutcome => return Err(CoreError::Unsupported),
         }
         let reserved = reqs.iter().any(|(table, _)| table == "giggles_join");
         for (table, _) in &mut reqs {
@@ -387,7 +534,8 @@ pub(crate) fn run(
                 session.sql.rollback_native()?;
                 return Ok(NativeResult::Control);
             }
-            Invocation::Legacy(_) | Invocation::Text { .. } => unreachable!(),
+            Invocation::Legacy(_) | Invocation::Text { .. } | Invocation::TaskPreview { .. }
+            | Invocation::TaskApply { .. } | Invocation::TaskOutcome => unreachable!(),
         };
         match result {
             Ok(outcome) => Ok(outcome),
@@ -455,13 +603,13 @@ mod tests {
             for missing in &expected {
                 roles.revoke_table("app", "bound", &[*missing]).unwrap();
                 let mut session = service.session(&fingerprint).unwrap();
-                assert!(matches!(run(&mut session, invocation()), Err(CoreError::Policy(Error::Scope))), "{source}: {missing:?}");
+                assert!(matches!(run(&mut session, invocation(), None), Err(CoreError::Policy(Error::Scope))), "{source}: {missing:?}");
                 roles.grant_table("app", "bound", &[*missing]).unwrap();
             }
             let mut session = service.session(&fingerprint).unwrap();
-            run(&mut session, Invocation::Begin).unwrap();
-            assert!(matches!(run(&mut session, invocation()).unwrap(), NativeResult::Operation(_)), "{source}");
-            run(&mut session, Invocation::Rollback).unwrap();
+            run(&mut session, Invocation::Begin, None).unwrap();
+            assert!(matches!(run(&mut session, invocation(), None).unwrap(), NativeResult::Operation(_)), "{source}");
+            run(&mut session, Invocation::Rollback, None).unwrap();
             roles.revoke_table("app", "bound", &expected).unwrap();
         }
     }
@@ -491,7 +639,7 @@ mod tests {
                 },
                 bindings: ops::Bindings::new(),
             };
-            let result = run(&mut session, invocation).unwrap();
+            let result = run(&mut session, invocation, None).unwrap();
             if table == "app" {
                 assert!(matches!(result, NativeResult::Operation(_)));
             } else {
@@ -502,16 +650,16 @@ mod tests {
             }
         }
         for invocation in [Invocation::Begin, Invocation::Commit, Invocation::Begin, Invocation::Rollback] {
-            assert!(run(&mut session, invocation).is_ok());
+            assert!(run(&mut session, invocation, None).is_ok());
         }
         service.reload_bindings(vec![]).unwrap();
-        assert!(matches!(run(&mut session, Invocation::Begin), Err(CoreError::Policy(Error::Authentication))));
+        assert!(matches!(run(&mut session, Invocation::Begin, None), Err(CoreError::Policy(Error::Authentication))));
         service.reload_bindings(vec![Binding {
             fingerprint: fingerprint.clone(), role: Role::Database { name: "bound".into() }
         }]).unwrap();
         let mut dropped = service.session(&fingerprint).unwrap();
         service.admin.roles().drop("bound").unwrap();
-        assert!(matches!(run(&mut dropped, Invocation::Begin), Err(CoreError::Policy(Error::Authentication))));
+        assert!(matches!(run(&mut dropped, Invocation::Begin, None), Err(CoreError::Policy(Error::Authentication))));
         for sql in ["CREATE SCHEMA app", "CREATE TABLE app.t(id BIGINT PRIMARY KEY)",
             "CREATE TABLE public.t(id BIGINT PRIMARY KEY)"] {
             service.admin.sql_session().execute(sql, &[], None).unwrap();
@@ -524,7 +672,7 @@ mod tests {
         for table in ["t", "public.t"] {
             let result = run(&mut session, Invocation::Operation { request: ops::Request::Read {
                 table: table.into(), filter: None, order: vec![], limit: None, projection: vec![]
-            }, bindings: ops::Bindings::new() });
+            }, bindings: ops::Bindings::new() }, None);
             if table == "t" {
                 assert!(matches!(result.unwrap(), NativeResult::Operation(_)));
             } else {

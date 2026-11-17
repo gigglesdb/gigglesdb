@@ -480,6 +480,6 @@ pub fn sql(query: &str) -> proto::ExecuteRequest {
             sql: query.into(),
             params: vec![],
         })),
-        budget_ms: None,
+        budget_ms: None, operation_id: None,
     }
 }

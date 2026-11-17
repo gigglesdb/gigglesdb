@@ -61,6 +61,7 @@ impl ResponseLease {
 struct Job {
     lease: SessionLease,
     request: Invocation,
+    operation_id: Option<crate::agent::statement::OperationId>,
     context: Cancellation,
     received: Instant,
     encoding: Encoding,
@@ -389,6 +390,20 @@ impl ApiRuntime {
         // Bare role connections pass here; registry.lease checks the stored owner.
         identity.check(&self.service)?;
         let decoded = codec::decode_execute(request)?;
+        // GD-0061 R3-209: operation IDs and the protected forms belong to
+        // task sessions, which only the agent runtime opens. The ordinary and
+        // SQL-role runtimes refuse them as malformed, before any lease.
+        if self.kind != ListenerKind::Agent
+            && (decoded.operation_id.is_some()
+                || matches!(
+                    decoded.request,
+                    Invocation::TaskPreview { .. }
+                        | Invocation::TaskApply { .. }
+                        | Invocation::TaskOutcome
+                ))
+        {
+            return Err(ApiError::InvalidArgument);
+        }
         let deadline = received
             .checked_add(Duration::from_millis(u64::from(decoded.budget_ms)))
             .ok_or(ApiError::InvalidArgument)?;
@@ -401,6 +416,7 @@ impl ApiRuntime {
         let job = Job {
             lease,
             request: decoded.request,
+            operation_id: decoded.operation_id,
             context,
             received,
             encoding,
@@ -529,6 +545,7 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
     let Job {
         mut lease,
         request,
+        operation_id,
         context,
         received,
         encoding,
@@ -554,12 +571,19 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 context.scope(|| {
                     lease.session().authority_scope(|session| {
-                        let stream = stream && !matches!(session.role, crate::Role::Task { .. });
+                        // GD-0061 R3-310/313/314: a task session releases its rows before
+                        // encoding, so it never takes the streaming path. Agent sessions are
+                        // `Role::Database` with `agent` set (Service::agent_session), so the
+                        // role check alone does not cover them.
+                        let stream = stream
+                            && !session.agent
+                            && session.task().is_none()
+                            && !matches!(session.role, crate::Role::Task { .. });
                         let (result, spill) = spill::bounded(|| {
                             if stream {
-                                spill::streaming(|| execute_reply(session, request, received, encoding))
+                                spill::streaming(|| execute_reply(session, request, operation_id, received, encoding))
                             } else {
-                                (execute_reply(session, request, received, encoding), None)
+                                (execute_reply(session, request, operation_id, received, encoding), None)
                             }
                         });
                         Ok(result.and_then(|(mut reply, json)| {
@@ -639,11 +663,12 @@ fn refuse_agent_call(job: Job, error: &giggles_core::CoreError) {
     } else {
         proto::TransactionState::Idle
     };
-    let result = prepare_reply(Response::error(error), state, encoding).map(|(reply, json)| {
+    let result = prepare_encoded(codec::encode_error(error, state), state, encoding).map(|(reply, json)| {
         lease.completed();
         Completion {
             reply,
             json,
+            spill: None,
             lease: ResponseLease {
                 session: lease,
                 _ownership: ownership,
@@ -664,6 +689,7 @@ fn prepare_reply(
 fn execute_reply(
     session: &mut Session,
     request: Invocation,
+    operation_id: Option<crate::agent::statement::OperationId>,
     received: Instant,
     encoding: Encoding,
 ) -> Result<(proto::ExecuteReply, Option<Vec<u8>>), ApiError> {
@@ -673,7 +699,7 @@ fn execute_reply(
         Encoding::Json => giggles_core::task::readlog::ENTRY_HTTP,
         Encoding::Protobuf => giggles_core::task::readlog::ENTRY_GRPC,
     });
-    let reply = execute_released(session, request, received, encoding);
+    let reply = execute_released(session, request, operation_id, received, encoding);
     // After the reply is encoded: charges any rows_read no release charged
     // and finalizes the statement's read-log record (no-op without a task).
     session.sql.finish_task_statement(match &reply {
@@ -689,6 +715,7 @@ fn execute_reply(
 fn execute_released(
     session: &mut Session,
     request: Invocation,
+    operation_id: Option<crate::agent::statement::OperationId>,
     received: Instant,
     encoding: Encoding,
 ) -> Result<(proto::ExecuteReply, Option<Vec<u8>>), ApiError> {
@@ -708,14 +735,23 @@ fn execute_released(
     };
     session.api_path.sql_committed = false;
     let executed = match request {
-        Invocation::Legacy(request) => Executed::Legacy(session.handle_received(request, received)),
+        // GD-0061 R3-209: on a task session the legacy surface admits only
+        // `Ping` (and `Sql`, whose statement is admitted on the SQL route).
+        // A refusal is a native error reply, so it carries its task fields.
+        Invocation::Legacy(request) => match native::admit_legacy(session, &request) {
+            Ok(()) => Executed::Legacy(session.handle_received(request, received)),
+            Err(error) => {
+                session.abort();
+                Executed::Native(Err(error))
+            }
+        },
         request => {
             #[cfg(test)]
             let outcome = giggles_core::relational::with_sql_parser_forbidden(|| {
-                native::run(session, request)
+                native::run(session, request, operation_id)
             });
             #[cfg(not(test))]
-            let outcome = native::run(session, request);
+            let outcome = native::run(session, request, operation_id);
             Executed::Native(outcome)
         }
     };
@@ -777,7 +813,7 @@ fn execute_released(
         Executed::Native(result) => result,
     };
     let result = (|| match native {
-        Err(error) => codec::encode_reply(Response::error(&error), state),
+        Err(error) => codec::encode_error(&error, state),
         Ok(outcome) => {
             let mut reply = codec::encode_reply(Response::code("ok"), state)?;
             use proto::execute_reply::NativeResult as P;

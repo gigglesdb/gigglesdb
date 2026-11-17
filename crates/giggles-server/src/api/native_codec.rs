@@ -263,7 +263,23 @@ pub(crate) fn validate(input: &p::ExecuteRequest) -> R<()> {
             Shape::default().transaction(need(v.transaction.as_ref())?)?;
             check_bindings(&v.bindings)?;
         }
+        // GD-0061 R3-209: a preview names one native operation, never a page.
+        Some(p::execute_request::Request::TaskPreview(v)) => {
+            if let p::task_preview_request::Change::Operation(v) = need(v.change.as_ref())? {
+                Shape::default().request(need(v.request.as_ref())?, 0)?;
+                check_bindings(&v.bindings)?;
+                if v.page.is_some() { return Err(ApiError::InvalidArgument); }
+            }
+        }
+        Some(p::execute_request::Request::TaskApply(v)) => {
+            need(v.change_id)?;
+            if need(v.digest.as_ref())?.len() != 32 { return Err(ApiError::InvalidArgument); }
+        }
         _ => {}
+    }
+    // The operation ID's charset and length, as the SQL prefix's (R3-207).
+    if input.operation_id.as_deref().is_some_and(|id| crate::agent::statement::OperationId::new(id).is_none()) {
+        return Err(ApiError::InvalidArgument);
     }
     Ok(())
 }

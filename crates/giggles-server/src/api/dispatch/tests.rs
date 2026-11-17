@@ -171,7 +171,7 @@ impl Fixture {
 }
 fn sql(text: &str) -> proto::ExecuteRequest {
     proto::ExecuteRequest {
-        budget_ms: None,
+        budget_ms: None, operation_id: None,
         request: Some(proto::execute_request::Request::Sql(proto::SqlRequest {
             sql: text.into(),
             params: vec![],
@@ -180,7 +180,7 @@ fn sql(text: &str) -> proto::ExecuteRequest {
 }
 fn ping() -> proto::ExecuteRequest {
     proto::ExecuteRequest {
-        budget_ms: None,
+        budget_ms: None, operation_id: None,
         request: Some(proto::execute_request::Request::Ping(proto::PingRequest {})),
     }
 }
@@ -500,7 +500,7 @@ async fn invalid_and_zero_budget_requests_leave_transaction_and_fresh_context_us
     );
     let invalid = proto::ExecuteRequest {
         request: None,
-        budget_ms: None,
+        budget_ms: None, operation_id: None,
     };
     assert_eq!(
         f.execute(invalid).await.err(),

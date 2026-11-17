@@ -25,7 +25,7 @@ async fn execute(
             session,
             proto::ExecuteRequest {
                 request: Some(request_variant),
-                budget_ms: Some(10_000),
+                budget_ms: Some(10_000), operation_id: None,
             },
         )?)
         .await?

@@ -133,7 +133,7 @@ pub(super) fn array(value: Json) -> Result<Vec<Json>, ApiError> {
         Err(ApiError::InvalidArgument)
     }
 }
-fn uint(value: Json) -> Result<u64, ApiError> {
+pub(super) fn uint(value: Json) -> Result<u64, ApiError> {
     let value = text(value)?;
     let parsed: u64 = value.parse().map_err(|_| ApiError::InvalidArgument)?;
     if parsed.to_string() == value {
@@ -210,6 +210,8 @@ pub fn decode_open(bytes: &[u8]) -> Result<proto::OpenSessionRequest, ApiError> 
 pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {
     let mut root = Object::new(parse(bytes)?)?;
     let budget_ms = root.optional("budgetMs").map(uint32).transpose()?;
+    // GD-0061 R3-209: checked with the request it goes with (`codec`).
+    let operation_id = root.optional("operationId").map(text).transpose()?;
     let (kind, value) = root.one()?;
     use proto::execute_request::Request as P;
     let request = match kind.as_str() {
@@ -230,6 +232,9 @@ pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {
         "begin" => P::Begin(super::native_json::Decoder::default().begin_request(value)?),
         "commit" => P::Commit(super::native_json::Decoder::default().commit_request(value)?),
         "rollback" => P::Rollback(super::native_json::Decoder::default().rollback_request(value)?),
+        "taskPreview" => P::TaskPreview(super::native_json::Decoder::default().task_preview(value)?),
+        "taskApply" => P::TaskApply(super::native_json::Decoder::default().task_apply(value)?),
+        "taskOutcome" => P::TaskOutcome(super::native_json::Decoder::default().task_outcome(value)?),
         "ping" => {
             empty(value)?;
             P::Ping(proto::PingRequest {})
@@ -292,6 +297,7 @@ pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {
     Ok(proto::ExecuteRequest {
         request: Some(request),
         budget_ms,
+        operation_id,
     })
 }
 
@@ -591,6 +597,12 @@ impl Serialize for JsonReply<'_> {
                     map.serialize_entry("nativeError", v)?
                 }
             }
+        }
+        if let Some(v) = &p.task_error {
+            map.serialize_entry("taskError", v)?;
+        }
+        if let Some(v) = &p.message {
+            map.serialize_entry("message", v)?;
         }
         map.serialize_entry("transactionState", state.as_str_name())?;
         map.end()

@@ -396,6 +396,32 @@ impl Decoder {
         f.finish()?;
         Ok(p::NativeSavepointRequest { name: Some(name) })
     }
+    /// GD-0061 R3-209: `{"text": {..}}` or `{"operation": {..}}`, exactly one.
+    pub(super) fn task_preview(&mut self, v: Json) -> R<p::TaskPreviewRequest> {
+        use p::task_preview_request::Change;
+        let (kind, value) = Object::new(v)?.one()?;
+        let change = match kind.as_str() {
+            "text" => Change::Text(self.native_text_request(value)?),
+            "operation" => Change::Operation(self.native_operation_request(value)?),
+            _ => return Err(ApiError::InvalidArgument),
+        };
+        Ok(p::TaskPreviewRequest { change: Some(change) })
+    }
+    /// `{"changeId": "<uint64>", "digest": "<base64 of 32 bytes>"}`.
+    pub(super) fn task_apply(&mut self, v: Json) -> R<p::TaskApplyRequest> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let mut f = Object::new(v)?;
+        let change_id = super::json::uint(f.required("changeId")?)?;
+        let digest = STANDARD
+            .decode(text(f.required("digest")?)?)
+            .map_err(|_| ApiError::InvalidArgument)?;
+        f.finish()?;
+        Ok(p::TaskApplyRequest { change_id: Some(change_id), digest: Some(digest) })
+    }
+    pub(super) fn task_outcome(&mut self, v: Json) -> R<p::TaskOutcomeRequest> {
+        empty(v)?;
+        Ok(p::TaskOutcomeRequest {})
+    }
     pub(super) fn begin_request(&mut self, v: Json) -> R<p::BeginRequest> {
         empty(v)?;
         Ok(p::BeginRequest {})

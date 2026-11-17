@@ -253,7 +253,7 @@ fn grpc_sql(sql: &str) -> proto::ExecuteRequest {
             sql: sql.into(),
             params: vec![],
         })),
-        budget_ms: None,
+        budget_ms: None, operation_id: None,
     }
 }
 
@@ -264,14 +264,14 @@ fn grpc_text(text: &str) -> proto::ExecuteRequest {
             bindings: vec![],
             language_version: None,
         })),
-        budget_ms: None,
+        budget_ms: None, operation_id: None,
     }
 }
 
 fn grpc_ping() -> proto::ExecuteRequest {
     proto::ExecuteRequest {
         request: Some(proto::execute_request::Request::Ping(proto::PingRequest {})),
-        budget_ms: None,
+        budget_ms: None, operation_id: None,
     }
 }
 

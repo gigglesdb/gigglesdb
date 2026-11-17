@@ -37,6 +37,15 @@ pub enum Invocation {
     Release(String),
     Read(Box<giggles_core::relational::SingleSourceRead>),
     Join(Box<giggles_core::relational::TwoSourceRead>),
+    /// GD-0061 R3-209: preview one native update (text is lowered first).
+    TaskPreview {
+        request: giggles_core::operations::Request,
+        bindings: giggles_core::operations::Bindings,
+    },
+    /// Apply a stored preview under the request's `operation_id`.
+    TaskApply { change: u64, digest: [u8; 32] },
+    /// The stored outcome of the request's `operation_id`.
+    TaskOutcome,
 }
 
 impl Invocation {
@@ -70,9 +79,12 @@ impl Invocation {
 pub struct DecodedExecute {
     pub request: Invocation,
     pub budget_ms: u32,
+    /// GD-0061 R3-209: the client-chosen operation ID of a task request,
+    /// charset-checked as the SQL `OPERATION '<id>'` prefix is (R3-207).
+    pub operation_id: Option<crate::agent::statement::OperationId>,
 }
 
-pub fn decode_execute(input: proto::ExecuteRequest) -> Result<DecodedExecute, ApiError> {
+pub fn decode_execute(mut input: proto::ExecuteRequest) -> Result<DecodedExecute, ApiError> {
     super::native_codec::validate(&input)?;
     if input.encoded_len() > crate::MAX_FRAME {
         return Err(ApiError::PayloadTooLarge);
@@ -81,82 +93,118 @@ pub fn decode_execute(input: proto::ExecuteRequest) -> Result<DecodedExecute, Ap
     if budget_ms > 10_000 {
         return Err(ApiError::InvalidArgument);
     }
+    let operation_id = input
+        .operation_id
+        .take()
+        .map(|id| {
+            crate::agent::statement::OperationId::new(&id).ok_or(ApiError::InvalidArgument)
+        })
+        .transpose()?;
+    let request = decode_request(input.request.ok_or(ApiError::InvalidArgument)?)?;
+    // design-2 section 5: the ID is required with an update and task_apply,
+    // read by task_outcome, and invalid with anything else.
+    let takes_id = match &request {
+        Invocation::Operation { request, .. } => {
+            super::native::request_class(request) == giggles_core::task::StatementClass::Update
+        }
+        Invocation::TaskApply { .. } | Invocation::TaskOutcome => {
+            if operation_id.is_none() {
+                return Err(ApiError::InvalidArgument);
+            }
+            true
+        }
+        _ => false,
+    };
+    if operation_id.is_some() && !takes_id {
+        return Err(ApiError::InvalidArgument);
+    }
+    Ok(DecodedExecute {
+        request,
+        budget_ms,
+        operation_id,
+    })
+}
+
+fn text_invocation(v: proto::NativeTextRequest) -> Result<Invocation, ApiError> {
+    let language_version = v
+        .language_version
+        .map(|v| {
+            serde_json::from_value(serde_json::Value::String(v))
+                .map_err(|_| ApiError::InvalidArgument)
+        })
+        .transpose()?
+        .unwrap_or(giggles_language::LanguageVersion::Embedded01);
+    Invocation::Text {
+        text: v.text,
+        bindings: super::native_codec::bindings(v.bindings)?,
+        language_version,
+    }
+    .lower()
+}
+
+fn operation_invocation(v: proto::NativeOperationRequest) -> Result<Invocation, ApiError> {
+    let request = super::native_codec::request(v.request.ok_or(ApiError::InvalidArgument)?)?;
+    let bindings = super::native_codec::bindings(v.bindings)?;
+    Ok(match v.page {
+        Some(page) => Invocation::Page {
+            request,
+            bindings,
+            after: page.after.into_iter().map(decode_value).collect::<Result<_, _>>()?,
+        },
+        None => Invocation::Operation { request, bindings },
+    })
+}
+
+fn decode_request(input: proto::execute_request::Request) -> Result<Invocation, ApiError> {
     use proto::execute_request::Request as P;
-    let input = input.request.ok_or(ApiError::InvalidArgument)?;
     let request = match input {
-        P::Catalog(v) => return Ok(DecodedExecute { request: Invocation::Catalog(Box::new(super::native_codec::catalog_request(v)?)), budget_ms }),
-        P::Sequence(v) => return Ok(DecodedExecute { request: Invocation::Sequence(super::native_codec::sequence_call(v)?), budget_ms }),
-        P::SearchPath(v) => return Ok(DecodedExecute {
-            request: Invocation::SearchPath(v.set.filter(|v| *v).map(|_| v.schemas)), budget_ms,
-        }),
-        P::TypedRead(v) => return Ok(DecodedExecute {
-            request: super::native_codec::typed_read(v)?, budget_ms,
-        }),
-        P::Text(v) => {
-            let language_version = v
-                .language_version
-                .map(|v| {
-                    serde_json::from_value(serde_json::Value::String(v))
-                        .map_err(|_| ApiError::InvalidArgument)
-                })
-                .transpose()?
-                .unwrap_or(giggles_language::LanguageVersion::Embedded01);
-            return Ok(DecodedExecute {
-                request: Invocation::Text {
-                    text: v.text,
-                    bindings: super::native_codec::bindings(v.bindings)?,
-                    language_version,
-                }
-                .lower()?,
-                budget_ms,
-            });
+        P::Catalog(v) => {
+            return Ok(Invocation::Catalog(Box::new(super::native_codec::catalog_request(v)?)));
         }
-        P::Operation(v) => {
-            let request = super::native_codec::request(v.request.ok_or(ApiError::InvalidArgument)?)?;
-            let bindings = super::native_codec::bindings(v.bindings)?;
-            return Ok(DecodedExecute {
-                request: match v.page {
-                    Some(page) => Invocation::Page {
-                        request, bindings,
-                        after: page.after.into_iter().map(decode_value).collect::<Result<_, _>>()?,
-                    },
-                    None => Invocation::Operation { request, bindings },
-                },
-                budget_ms,
-            });
+        P::Sequence(v) => return Ok(Invocation::Sequence(super::native_codec::sequence_call(v)?)),
+        P::SearchPath(v) => {
+            return Ok(Invocation::SearchPath(v.set.filter(|v| *v).map(|_| v.schemas)));
         }
+        P::TypedRead(v) => return super::native_codec::typed_read(v),
+        P::Text(v) => return text_invocation(v),
+        P::Operation(v) => return operation_invocation(v),
         P::Transaction(v) => {
-            return Ok(DecodedExecute {
-                request: Invocation::Transaction {
-                    transaction: super::native_codec::transaction(
-                        v.transaction.ok_or(ApiError::InvalidArgument)?,
-                    )?,
-                    bindings: super::native_codec::bindings(v.bindings)?,
-                },
-                budget_ms,
+            return Ok(Invocation::Transaction {
+                transaction: super::native_codec::transaction(
+                    v.transaction.ok_or(ApiError::InvalidArgument)?,
+                )?,
+                bindings: super::native_codec::bindings(v.bindings)?,
             });
         }
-        P::Savepoint(v) => return Ok(DecodedExecute { request: Invocation::Savepoint(v.name.ok_or(ApiError::InvalidArgument)?), budget_ms }),
-        P::RollbackTo(v) => return Ok(DecodedExecute { request: Invocation::RollbackTo(v.name.ok_or(ApiError::InvalidArgument)?), budget_ms }),
-        P::Release(v) => return Ok(DecodedExecute { request: Invocation::Release(v.name.ok_or(ApiError::InvalidArgument)?), budget_ms }),
-        P::Begin(_) => {
-            return Ok(DecodedExecute {
-                request: Invocation::Begin,
-                budget_ms,
+        P::Savepoint(v) => return Ok(Invocation::Savepoint(v.name.ok_or(ApiError::InvalidArgument)?)),
+        P::RollbackTo(v) => {
+            return Ok(Invocation::RollbackTo(v.name.ok_or(ApiError::InvalidArgument)?));
+        }
+        P::Release(v) => return Ok(Invocation::Release(v.name.ok_or(ApiError::InvalidArgument)?)),
+        P::Begin(_) => return Ok(Invocation::Begin),
+        P::Commit(_) => return Ok(Invocation::Commit),
+        P::Rollback(_) => return Ok(Invocation::Rollback),
+        // GD-0061 R3-209: the change to preview is exactly one native
+        // operation (no paging, no transaction).
+        P::TaskPreview(v) => {
+            use proto::task_preview_request::Change;
+            let change = match v.change.ok_or(ApiError::InvalidArgument)? {
+                Change::Text(v) => text_invocation(v)?,
+                Change::Operation(v) => operation_invocation(v)?,
+            };
+            let Invocation::Operation { request, bindings } = change else {
+                return Err(ApiError::InvalidArgument);
+            };
+            return Ok(Invocation::TaskPreview { request, bindings });
+        }
+        P::TaskApply(v) => {
+            let digest = v.digest.ok_or(ApiError::InvalidArgument)?;
+            return Ok(Invocation::TaskApply {
+                change: v.change_id.ok_or(ApiError::InvalidArgument)?,
+                digest: digest.try_into().map_err(|_| ApiError::InvalidArgument)?,
             });
         }
-        P::Commit(_) => {
-            return Ok(DecodedExecute {
-                request: Invocation::Commit,
-                budget_ms,
-            });
-        }
-        P::Rollback(_) => {
-            return Ok(DecodedExecute {
-                request: Invocation::Rollback,
-                budget_ms,
-            });
-        }
+        P::TaskOutcome(proto::TaskOutcomeRequest {}) => return Ok(Invocation::TaskOutcome),
         P::Ping(_) => crate::Request::Ping,
         P::Sql(sql) => crate::Request::Sql {
             sql: sql.sql,
@@ -182,10 +230,7 @@ pub fn decode_execute(input: proto::ExecuteRequest) -> Result<DecodedExecute, Ap
             operation: OperationId(p.operation.ok_or(ApiError::InvalidArgument)?),
         },
     };
-    Ok(DecodedExecute {
-        request: Invocation::Legacy(request),
-        budget_ms,
-    })
+    Ok(Invocation::Legacy(request))
 }
 
 pub fn decode_value(value: proto::Value) -> Result<Value, ApiError> {
@@ -329,7 +374,27 @@ pub fn encode_reply(
             affected: sql.affected,
         }),
         transaction_state: transaction_state as i32,
+        task_error: None,
+        message: None,
     })
+}
+
+/// The reply to an error (GD-0061 R3-209, design-2 section 6). `code` is the
+/// SQLSTATE; a task refusal also names itself in `task_error` and carries its
+/// fixed `message` (`TaskError::name`, `TaskError::message`: no values, no
+/// keys, identical to the SQL surface's text). A pass-through error has neither.
+pub fn encode_error(
+    error: &giggles_core::CoreError,
+    transaction_state: proto::TransactionState,
+) -> Result<proto::ExecuteReply, ApiError> {
+    let mut reply = encode_reply(crate::Response::error(error), transaction_state)?;
+    if let giggles_core::CoreError::Task(error) = error
+        && let Some(name) = error.name()
+    {
+        reply.task_error = Some(name.into());
+        reply.message = Some(error.message().into());
+    }
+    Ok(reply)
 }
 
 /// The encoded-length check precedes allocation. No gRPC frame prefix is added.
@@ -388,7 +453,7 @@ mod tests {
                 request: Some(proto::execute_request::Request::Status(
                     proto::StatusRequest { operation },
                 )),
-                budget_ms: Some(0),
+                budget_ms: Some(0), operation_id: None,
             };
             let got = decode_execute(req);
             if let Some(id) = operation {
@@ -514,7 +579,7 @@ mod tests {
                 sql: "x".repeat(crate::MAX_FRAME - 8),
                 params: vec![],
             })),
-            budget_ms: None,
+            budget_ms: None, operation_id: None,
         };
         assert_eq!(request.encoded_len(), crate::MAX_FRAME);
         assert!(decode_execute(request.clone()).is_ok());
@@ -541,7 +606,7 @@ mod tests {
                             approval,
                         },
                     )),
-                    budget_ms,
+                    budget_ms, operation_id: None,
                 };
                 let decoded = decode_execute(request).unwrap();
                 assert_eq!(decoded.budget_ms, budget_ms.unwrap_or(10_000));
@@ -553,7 +618,7 @@ mod tests {
         assert!(
             decode_execute(proto::ExecuteRequest {
                 request: Some(proto::execute_request::Request::Ping(proto::PingRequest {})),
-                budget_ms: Some(10_001),
+                budget_ms: Some(10_001), operation_id: None,
             })
             .is_err()
         );

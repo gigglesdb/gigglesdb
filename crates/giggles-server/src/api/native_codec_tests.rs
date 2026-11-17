@@ -423,7 +423,7 @@ fn direct_protobuf_rejects_missing_presence_unknown_enums_and_excess_collections
                     page: None,
                 },
             )),
-            budget_ms: None,
+            budget_ms: None, operation_id: None,
         };
         // This path does not pass through the JSON decoder or its array checks.
         let wire = input.encode_to_vec();
@@ -480,7 +480,7 @@ fn direct_protobuf_rejects_missing_presence_unknown_enums_and_excess_collections
                 bindings: vec![],
             },
         )),
-        budget_ms: None,
+        budget_ms: None, operation_id: None,
     };
     assert!(codec::decode_execute(missing_transaction).is_err());
     let binding = p::NativeBinding {
@@ -495,7 +495,7 @@ fn direct_protobuf_rejects_missing_presence_unknown_enums_and_excess_collections
                 page: None,
             },
         )),
-        budget_ms: None,
+        budget_ms: None, operation_id: None,
     };
     assert!(codec::decode_execute(duplicates).is_err());
 }

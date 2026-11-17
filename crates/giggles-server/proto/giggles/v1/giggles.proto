@@ -57,9 +57,33 @@ message ExecuteRequest {
     NativeSavepointRequest release = 17;
     NativeCatalogRequest catalog = 18;
     NativeSequenceCall sequence = 19;
+    // GD-0061 R3-209 (design-2 section 5, ruling R2): the protected forms of
+    // an agent session. Only the agent listeners accept them. Field numbers
+    // 14-16 of the design were taken by native requests, so they use 22-24.
+    TaskPreviewRequest task_preview = 22;
+    TaskApplyRequest task_apply = 23;
+    TaskOutcomeRequest task_outcome = 24;
   }
   optional uint32 budget_ms = 20;
+  // GD-0061 R3-209: 1..=128 bytes of [A-Za-z0-9._:-]. Required with a native
+  // update and task_apply, read by task_outcome; INVALID_ARGUMENT on any
+  // other request and on every listener but the agent ones.
+  optional string operation_id = 21;
 }
+// The change to preview: one native update, as text or as a typed operation.
+message TaskPreviewRequest {
+  oneof change {
+    NativeTextRequest text = 1;
+    NativeOperationRequest operation = 2;
+  }
+}
+// Apply a stored preview: its change_id and the 32-byte digest it returned.
+message TaskApplyRequest {
+  optional uint64 change_id = 1;
+  optional bytes digest = 2;
+}
+// The stored outcome of operation_id under the session's task.
+message TaskOutcomeRequest {}
 message NativeTextRequest {
   string text = 1;
   repeated NativeBinding bindings = 2;
@@ -224,6 +248,11 @@ message ExecuteReply {
     NativeError native_error = 10;
     NativeCatalogOutcome catalog_outcome = 11;
   }
+  // GD-0061 R3-209 (design-2 section 6): a task refusal keeps HTTP 200 and
+  // gRPC OK; code is its SQLSTATE, task_error its name (TaskError::name) and
+  // message its fixed text. Both are absent for every other reply.
+  optional string task_error = 12;
+  optional string message = 13;
 }
 message SqlResult {
   repeated string columns = 1;

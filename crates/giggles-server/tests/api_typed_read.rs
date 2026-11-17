@@ -155,7 +155,7 @@ fn protobuf_read_shapes_are_bounded_before_recursive_conversion() {
             table: Some("app".into()), projection: vec![p::NativeReadProjection {
                 expression: Some(expression), alias: None,
             }], ..Default::default()
-        })), budget_ms: None,
+        })), budget_ms: None, operation_id: None,
     };
     let mut deep = leaf.clone();
     for _ in 0..25 { deep = p::NativeReadExpr { expression: Some(E::NotExpr(Box::new(deep))) }; }

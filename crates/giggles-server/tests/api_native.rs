@@ -815,7 +815,7 @@ async fn native_authorization_rejects_tasks_and_late_block_tables_without_earlie
             &token,
             proto::ExecuteRequest {
                 request: Some(proto::execute_request::Request::Ping(proto::PingRequest {})),
-                budget_ms: None,
+                budget_ms: None, operation_id: None,
             },
         ))
         .await

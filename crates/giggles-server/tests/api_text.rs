@@ -116,7 +116,7 @@ async fn text_syntax_catalog_version_and_binding_rejections_are_invalid_argument
     use prost::Message;
     let wire = proto::ExecuteRequest { request: Some(proto::execute_request::Request::Text(proto::NativeTextRequest {
         text: "app select id".into(), bindings: vec![], language_version: None,
-    })), budget_ms: None }.encode_to_vec();
+    })), budget_ms: None, operation_id: None }.encode_to_vec();
     assert_eq!(wire[0], (12 << 3) | 2);
     f.stop().await;
 }

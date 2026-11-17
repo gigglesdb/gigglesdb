@@ -444,7 +444,7 @@ async fn grpc_typed_values_and_close_discard_uncommitted_rows() {
                 .map(|value| proto::Value { value: Some(value) })
                 .collect(),
         })),
-        budget_ms: None,
+        budget_ms: None, operation_id: None,
     };
     assert_eq!(
         client
@@ -729,7 +729,7 @@ async fn task_preview_execute_status_and_role_redaction_cross_protocol() {
                 operation: Some(701),
             },
         )),
-        budget_ms: None,
+        budget_ms: None, operation_id: None,
     };
     let reply = client
         .execute(rpc(&token, status))
@@ -868,7 +868,7 @@ async fn task_approval_retry_conflict_and_repair_sql_use_existing_authority() {
                         approval: None,
                     },
                 )),
-                budget_ms: None,
+                budget_ms: None, operation_id: None,
             },
         ))
         .await
