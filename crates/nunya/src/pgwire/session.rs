@@ -150,8 +150,10 @@ impl Session {
     fn snapshot(&mut self) -> Result<Arc<crate::schema::Snapshot>, Refusal> {
         let current = self.ctx.snapshot.read().map_err(|_| protocol())?.clone();
         if current.search_path == self.pinned_path { return Ok(current); }
-        if let Some((source, pinned)) = &self.snapshot_cache {
-            if Arc::ptr_eq(source, &current) { return Ok(pinned.clone()); }
+        if let Some((source, pinned)) = &self.snapshot_cache
+            && Arc::ptr_eq(source, &current)
+        {
+            return Ok(pinned.clone());
         }
         let mut pinned = (*current).clone();
         pinned.search_path = self.pinned_path.clone();

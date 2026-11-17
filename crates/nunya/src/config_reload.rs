@@ -547,10 +547,10 @@ impl ConfigReloader {
                 if let Some(transports) = self.transports.get() {
                     transports.apply(prepared.route_tls, prepared.management_tls, prepared.config.max_connections);
                 }
-                if let Some(catalog) = self.catalog.get() {
-                    if let Some(snapshot) = candidate {
-                        *catalog.context.snapshot.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(snapshot);
-                    }
+                if let Some(catalog) = self.catalog.get()
+                    && let Some(snapshot) = candidate
+                {
+                    *catalog.context.snapshot.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(snapshot);
                 }
                 if let Some(transports) = self.transports.get() {
                     if prepared.diff.reloadable.iter().any(|s| ["schemas", "search_path", "snapshot_refresh_ms"].contains(s)) {
