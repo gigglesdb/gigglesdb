@@ -1,7 +1,7 @@
 //! R3-206 (GD-0061 design-2 section 4, table 4(b)): the statement profile of a
 //! task session on the agent pgwire listener. Every statement is admitted by
 //! class before it runs; refused classes answer 0A000 with the class message.
-//! In this build `task::admit::ENABLED` is `[Show, Set, Update, OutcomeLookup]`.
+//! In this build `task::admit::ENABLED` is `[Show, Set, Update, OutcomeLookup, Preview, Apply]`.
 #![cfg(feature = "engine-rocksdb")]
 mod agent_support;
 

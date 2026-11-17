@@ -914,6 +914,9 @@ enum Plan {
     Task(crate::task_statement::TaskStatement),
     /// GD-0061 R3-207: a protected form; task sessions only.
     Protected(Box<crate::agent::statement::ProtectedStatement>),
+    /// GD-0061 R3-707: an approver form (SHOW CHANGES, SHOW CHANGE, APPROVE,
+    /// REVOKE APPROVAL); sessions without a task only.
+    Change(Box<giggles_core::task::statements::ChangeStatement>),
 }
 #[derive(Clone)]
 struct Statement {
@@ -952,7 +955,8 @@ impl Statement {
             | Plan::Control(_)
             | Plan::SettingsFunction(_)
             | Plan::Inspect(_)
-            | Plan::Protected(_) => Ok(self.d.clone()),
+            | Plan::Protected(_)
+            | Plan::Change(_) => Ok(self.d.clone()),
         }
     }
 }
@@ -1222,6 +1226,23 @@ impl State {
                 .sql
                 .set_task_entry(giggles_core::task::readlog::ENTRY_PGWIRE_EXTENDED);
             return self.task_prepare(sql, oids, session);
+        }
+        // GD-0061 R3-707: an approver form, before any other grammar reads it.
+        if let Some(change) = crate::agent::preview::approver_statement(sql)? {
+            // The forms take no parameters.
+            if !oids.is_empty() {
+                return Err("08P01");
+            }
+            let d = crate::agent::preview::approver_description(&change);
+            return Ok(Statement {
+                sql_bytes: sql.len(),
+                sql: sql.to_owned(),
+                declared_oids: oids,
+                p: Plan::Change(Box::new(change)),
+                d,
+                parameter_oids: vec![],
+                query_id: self.diagnostic.query_id.clone(),
+            });
         }
         if !is_copy_sql(sql) {
             core(session.authorize_sequence_sql(sql))?;
@@ -1764,6 +1785,32 @@ impl State {
                     let prepared = prepared.clone();
                     p.result = ran();
                     self.start_copy(copy, prepared, false, session, out)?;
+                    return Ok(true);
+                }
+                if let Plan::Change(change) = &p.s.p {
+                    // Runs once; a suspended portal hands out the rest of its
+                    // rows (PostgreSQL's rows of a utility statement).
+                    if p.result.is_none() {
+                        let change = change.clone();
+                        crate::agent::preview::approver_guard(session)?;
+                        self.diagnostic.phase = "approval execution";
+                        let result = self
+                            .diagnostic
+                            .core(crate::agent::preview::execute_approver(session, &change))?;
+                        p.result = Some(Released::synthetic(result));
+                    }
+                    let result = p.result.as_ref().unwrap().get();
+                    let end = if max == 0 { result.rows.len() }
+                        else { p.at.saturating_add(max as usize).min(result.rows.len()) };
+                    rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
+                        result, &p.s.d, &p.formats, p.at, end, out)?;
+                    p.at = end;
+                    if end < result.rows.len() {
+                        frame(b's', &[], out)?;
+                    } else {
+                        let Plan::Change(change) = &p.s.p else { unreachable!() };
+                        complete(crate::agent::preview::approver_command(change), result, out)?;
+                    }
                     return Ok(true);
                 }
                 if let Plan::Admin(stmt) = &p.s.p {

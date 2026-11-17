@@ -810,6 +810,15 @@ impl Session {
     fn role_epoch(&self) -> u64 {
         self.role_fence.map_or(self.epoch, |(_, generation)| generation)
     }
+    /// GD-0061 R3-707 (design-7 D7.1, "PostgreSQL listener only"): the
+    /// database role of a session that is neither certificate bound nor an
+    /// agent session; `None` for every other session.
+    pub(crate) fn postgresql_listener_role(&self) -> Option<&str> {
+        match &self.role {
+            Role::Database { name } if !self.fingerprint_bound && !self.agent => Some(name),
+            _ => None,
+        }
+    }
     /// The task this session is bound to; `None` for every non-agent session.
     pub fn task(&self) -> Option<&giggles_core::task::context::TaskContext> {
         self.sql.task()

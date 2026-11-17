@@ -11,11 +11,13 @@
 //! | `SHOW OPERATION '<id>'`                                    | OutcomeLookup |
 //!
 //! [`protected_seam`] is the one place the Phase 6 and 7 items fill in. The
-//! direct write runs `task::protected_commit` (R3-615) and the outcome lookup
-//! `task::outcome` (R3-617); preview and apply (R3-707) still fail closed with
-//! 0A000. The last Phase 6 item (R3-626) added `Update` and `OutcomeLookup` to
-//! `task::admit::ENABLED` (design-2 section 4), so both forms run over the wire;
-//! `Preview` and `Apply` stay out of it until Phase 7.
+//! direct write runs `task::protected_commit` (R3-615), the outcome lookup
+//! `task::outcome` (R3-617), and preview and apply (R3-707) `task::preview`
+//! and the protected commit of a stored preview (`agent::preview`). R3-626
+//! added `Update` and `OutcomeLookup` to `task::admit::ENABLED` (design-2
+//! section 4) and R3-707 `Preview` and `Apply`, so every form runs over the
+//! wire. A digest that is not 64 hex digits is 22023 (D7.1's form takes a
+//! `'<64 hex>'` value); every other malformed form is 42601.
 
 use giggles_core::{
     CoreError,
@@ -45,7 +47,7 @@ impl OperationId {
     }
     /// The same ID as core's ledger key. Every server ID is a valid core ID
     /// (core accepts any 1..=128 bytes); a mismatch still fails closed.
-    fn to_core(&self) -> Result<giggles_core::task::OperationId, CoreError> {
+    pub(crate) fn to_core(&self) -> Result<giggles_core::task::OperationId, CoreError> {
         giggles_core::task::OperationId::new(self.0.as_bytes())
             .ok_or(CoreError::Task(TaskError::OperationIdRequired))
     }
@@ -78,15 +80,21 @@ impl ProtectedHead {
 /// `Direct` keeps the wrapped `UPDATE`'s text exactly as received (the suffix
 /// of the statement after the `OPERATION '<id>'` prefix): it is fingerprinted
 /// with the parameters, so a resend under the same ID replays.
+/// `Preview` keeps the wrapped `UPDATE`'s text as well: `task::preview`
+/// prepares and stores it (D7.2), and `prepared` is what was admitted and
+/// described.
 #[derive(Clone, Debug)]
-#[allow(dead_code, reason = "the fields are read by the Phase 7 bodies of protected_seam")]
 pub(crate) enum ProtectedStatement {
     Direct {
         op: OperationId,
         prepared: Box<Prepared>,
         text: Arc<str>,
     },
-    Preview { prepared: Box<Prepared> },
+    Preview {
+        #[allow(dead_code, reason = "kept as admitted and described; task::preview re-prepares the text")]
+        prepared: Box<Prepared>,
+        text: Arc<str>,
+    },
     Apply { op: OperationId, preview: u64, digest: [u8; 32] },
     Outcome { op: OperationId },
 }
@@ -157,11 +165,11 @@ pub fn description(head: &ProtectedHead, wrapped: Option<&Description>) -> Descr
 }
 
 /// The seam the Phase 6 and 7 bodies fill in. `Direct` runs
-/// `task::protected_commit` as the session's executor (R3-615) and `Outcome`
-/// runs `task::outcome` (R3-617); `Preview` and `Apply` (R3-707) fail closed with
-/// `NotAllowedInTaskSession(class)` (0A000), even when admission would pass.
-/// It runs inside `Session::execute_protected`, after admission and with the
-/// session's `in_protected` flag set.
+/// `task::protected_commit` as the session's executor (R3-615), `Outcome`
+/// runs `task::outcome` (R3-617), and `Preview` and `Apply` (R3-707) run
+/// `task::preview` and the protected commit of the stored preview
+/// (`agent::preview`). It runs inside `Session::execute_protected`, after
+/// admission and with the session's `in_protected` flag set.
 pub(crate) fn protected_seam(
     session: &mut crate::Session,
     statement: &ProtectedStatement,
@@ -172,9 +180,12 @@ pub(crate) fn protected_seam(
             direct(session, op, prepared, text, params)
         }
         ProtectedStatement::Outcome { op } => show_outcome(session, op),
-        ProtectedStatement::Preview { .. } | ProtectedStatement::Apply { .. } => Err(CoreError::Task(
-            TaskError::NotAllowedInTaskSession(statement.class()),
-        )),
+        ProtectedStatement::Preview { text, .. } => super::preview::preview(session, text, params),
+        ProtectedStatement::Apply {
+            op,
+            preview,
+            digest,
+        } => super::preview::apply(session, op, *preview, *digest),
     }
 }
 
@@ -262,10 +273,10 @@ fn show_outcome(session: &mut crate::Session, op: &OperationId) -> Result<SqlRes
     })
 }
 
-/// Test-only route to the seam for classes admission still keeps out of
-/// `task::admit::ENABLED` (`Preview` and `Apply` until Phase 7): classes listed
-/// here are admitted on this thread by `Session::admit`. Compiled into unit
-/// tests only.
+/// Test-only route to the seam for classes admission keeps out of
+/// `task::admit::ENABLED` (none since R3-707 enabled `Preview` and `Apply`):
+/// classes listed here are admitted on this thread by `Session::admit`.
+/// Compiled into unit tests only.
 #[cfg(test)]
 pub(crate) mod test_route {
     use giggles_core::task::StatementClass;
@@ -286,6 +297,8 @@ pub(crate) mod test_route {
 }
 
 const SYNTAX: &str = "42601";
+/// A digest literal that is not exactly 64 hex digits (invalid_parameter_value).
+const BAD_DIGEST: &str = "22023";
 
 /// A lexer over the leading words; it never parses the wrapped statement.
 struct Lexer<'a> {
@@ -417,11 +430,12 @@ pub fn parse(sql: &str) -> Result<Option<(ProtectedHead, &str)>, &'static str> {
                 return Err(SYNTAX);
             }
             let text = lexer.literal()?;
+            lexer.end()?;
+            // The value is checked once the whole form has parsed.
             let mut digest = [0u8; 32];
             if text.len() != 64 || hex::decode_to_slice(&text, &mut digest).is_err() {
-                return Err(SYNTAX);
+                return Err(BAD_DIGEST);
             }
-            lexer.end()?;
             return Ok(Some((ProtectedHead::Apply { op, change, digest }, "")));
         }
         let wrapped = lexer.wrapped_update()?;
@@ -511,12 +525,16 @@ mod tests {
             format!("OPERATION 'a2' APPLY CHANGE 99999999999999999999 DIGEST '{hex}'"),
             format!("OPERATION 'a2' APPLY PREVIEW 1 DIGEST '{hex}'"),
             format!("OPERATION 'a2' APPLY CHANGE 1 DIGEST '{hex}' trailing"),
-            "OPERATION 'a2' APPLY CHANGE 1 DIGEST 'abc'".to_owned(),
-            format!("OPERATION 'a2' APPLY CHANGE 1 DIGEST '{}'", "zz".repeat(32)),
+            "OPERATION 'a2' APPLY CHANGE 1 DIGEST 'abc' trailing".to_owned(),
             "SHOW OPERATION a2".to_owned(),
             "SHOW OPERATION 'a2' extra".to_owned(),
         ] {
             assert_eq!(parse(&bad), Err("42601"), "{bad}");
+        }
+        // A well-formed APPLY whose digest is not 64 hex digits is 22023.
+        for bad in ["abc".to_owned(), "zz".repeat(32), String::new(), format!("{hex}0")] {
+            let sql = format!("OPERATION 'a2' APPLY CHANGE 1 DIGEST '{bad}'");
+            assert_eq!(parse(&sql), Err("22023"), "{sql}");
         }
         assert!(parse(&format!("OPERATION '{}' UPDATE t SET a = 1", "a".repeat(128))).is_ok());
         assert!(parse("OPERATION 'A-z.0_9:x' UPDATE t SET a = 1").is_ok());

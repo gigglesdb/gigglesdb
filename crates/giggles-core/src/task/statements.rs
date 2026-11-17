@@ -8,7 +8,8 @@
 use super::definition::{
     AllowedWrite, DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText, TaskPrivileges,
 };
-use crate::relational::Value;
+use crate::relational::{SqlError, SqlResult, SqlRow, TimestampTz, Value};
+use crate::CoreError;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -682,4 +683,219 @@ impl Parser<'_> {
             roles,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// R3-707: the preview and approval statements (design-7 D7.1).
+
+/// One of the six SQL forms of D7.1. `PREVIEW` and `APPLY CHANGE` are the
+/// executor's (agent listener; the server adds the operation-ID prefix of
+/// ruling R2 to `APPLY`); the other four are the approver's, on the
+/// PostgreSQL listener only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChangeStatement {
+    /// `PREVIEW <one UPDATE>`: the UPDATE's text, a suffix of the statement,
+    /// so its `$n` numbering is unchanged.
+    Preview { update: String },
+    /// `APPLY CHANGE <id> DIGEST '<64 hex>'`.
+    Apply { change: u64, digest: [u8; 32] },
+    /// `SHOW CHANGES OF TASK <name>`.
+    ShowChanges { task: String },
+    /// `SHOW CHANGE <id> OF TASK <name>`.
+    ShowChange { change: u64, task: String },
+    /// `APPROVE CHANGE <id> OF TASK <name> DIGEST '<64 hex>'`.
+    Approve {
+        change: u64,
+        task: String,
+        digest: [u8; 32],
+    },
+    /// `REVOKE APPROVAL OF CHANGE <id> OF TASK <name>`.
+    RevokeApproval { change: u64, task: String },
+}
+
+impl ChangeStatement {
+    /// The approver forms: never admitted in a task session, and on any
+    /// other session refused unless it passes the PostgreSQL-listener test.
+    pub fn is_approver_form(&self) -> bool {
+        !matches!(self, ChangeStatement::Preview { .. } | ChangeStatement::Apply { .. })
+    }
+}
+
+/// `PREVIEW` result columns (D7.1; ruling R2 names the id `change_id`).
+pub const PREVIEW_COLUMNS: [&str; 4] = ["change_id", "digest", "row_count", "expires_at"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChangeHead {
+    Preview,
+    Apply,
+    Show,
+    Approve,
+    RevokeApproval,
+}
+
+fn change_head(sql: &str) -> Option<ChangeHead> {
+    let words = head_words(sql, 3);
+    let word = |i: usize| words.get(i).map(String::as_str);
+    match (word(0)?, word(1)) {
+        ("preview", Some("update")) => Some(ChangeHead::Preview),
+        ("apply", Some("change")) => Some(ChangeHead::Apply),
+        ("show", Some("changes" | "change")) => Some(ChangeHead::Show),
+        ("approve", Some("change")) => Some(ChangeHead::Approve),
+        // `REVOKE approval FROM r` revokes membership in a role named approval.
+        ("revoke", Some("approval")) if word(2) == Some("of") => Some(ChangeHead::RevokeApproval),
+        _ => None,
+    }
+}
+
+/// Parses the six forms of D7.1. `None` is any other statement, which keeps
+/// its existing path; a malformed form is 42601 (`Syntax`), and a digest that
+/// is not exactly 64 hex digits is 22023 (`InvalidParameterValue`). Task
+/// names are identifiers (`"inc-436"` must be quoted).
+pub fn parse_change_statement(sql: &str) -> Option<Result<ChangeStatement, SqlError>> {
+    let head = change_head(sql)?;
+    let tokens = match tokenize(sql) {
+        Ok(tokens) => tokens,
+        Err(_) => return Some(Err(SqlError::Syntax)),
+    };
+    if head == ChangeHead::Preview {
+        // `PREVIEW` is consumed; the UPDATE is everything after it.
+        return match tokens.get(1) {
+            Some(update) => Some(Ok(ChangeStatement::Preview {
+                update: sql[update.start..].to_owned(),
+            })),
+            None => Some(Err(SqlError::Syntax)),
+        };
+    }
+    let mut p = Parser {
+        sql,
+        tokens,
+        pos: 0,
+    };
+    Some(match head {
+        ChangeHead::Preview | ChangeHead::Apply => p.apply_change(),
+        ChangeHead::Show => p.show_change(),
+        ChangeHead::Approve => p.approve_change(),
+        ChangeHead::RevokeApproval => p.revoke_approval(),
+    })
+}
+
+/// 64 hex digits (either case) as 32 bytes.
+pub fn parse_digest(text: &str) -> Option<[u8; 32]> {
+    let b = text.as_bytes();
+    if b.len() != 64 {
+        return None;
+    }
+    let nibble = |c: u8| (c as char).to_digit(16).and_then(|d| u8::try_from(d).ok());
+    let mut out = [0u8; 32];
+    for (slot, [high, low]) in out.iter_mut().zip(b.as_chunks::<2>().0) {
+        *slot = (nibble(*high)? << 4) | nibble(*low)?;
+    }
+    Some(out)
+}
+
+impl Parser<'_> {
+    /// Runs `f`, then requires the end of the statement; any shape error is
+    /// 42601.
+    fn change_form<T>(&mut self, f: impl FnOnce(&mut Self) -> P<T>) -> Result<T, SqlError> {
+        f(self)
+            .and_then(|value| self.end().map(|()| value))
+            .map_err(|_| SqlError::Syntax)
+    }
+
+    /// `DIGEST '<text>'`: a string literal whose content is checked once the
+    /// whole statement has parsed.
+    fn digest_literal(&mut self) -> P<String> {
+        self.word("digest")?;
+        match self.peek() {
+            Some(Tok::Str(text)) => {
+                let text = text.clone();
+                self.pos += 1;
+                Ok(text)
+            }
+            _ => Err(SYNTAX),
+        }
+    }
+
+    fn of_task(&mut self) -> P<String> {
+        self.words(&["of", "task"])?;
+        self.ident()
+    }
+
+    fn apply_change(&mut self) -> Result<ChangeStatement, SqlError> {
+        let (change, text) = self.change_form(|p| {
+            p.words(&["apply", "change"])?;
+            let change = p.number()?;
+            Ok((change, p.digest_literal()?))
+        })?;
+        let digest = parse_digest(&text).ok_or(SqlError::InvalidParameterValue)?;
+        Ok(ChangeStatement::Apply { change, digest })
+    }
+
+    fn show_change(&mut self) -> Result<ChangeStatement, SqlError> {
+        self.change_form(|p| {
+            p.word("show")?;
+            if p.eat_word("changes") {
+                return Ok(ChangeStatement::ShowChanges { task: p.of_task()? });
+            }
+            p.word("change")?;
+            let change = p.number()?;
+            Ok(ChangeStatement::ShowChange {
+                change,
+                task: p.of_task()?,
+            })
+        })
+    }
+
+    fn approve_change(&mut self) -> Result<ChangeStatement, SqlError> {
+        let (change, task, text) = self.change_form(|p| {
+            p.words(&["approve", "change"])?;
+            let change = p.number()?;
+            let task = p.of_task()?;
+            Ok((change, task, p.digest_literal()?))
+        })?;
+        let digest = parse_digest(&text).ok_or(SqlError::InvalidParameterValue)?;
+        Ok(ChangeStatement::Approve {
+            change,
+            task,
+            digest,
+        })
+    }
+
+    fn revoke_approval(&mut self) -> Result<ChangeStatement, SqlError> {
+        self.change_form(|p| {
+            p.words(&["revoke", "approval", "of", "change"])?;
+            let change = p.number()?;
+            Ok(ChangeStatement::RevokeApproval {
+                change,
+                task: p.of_task()?,
+            })
+        })
+    }
+}
+
+/// The `PREVIEW` result row `(change_id, digest, row_count, expires_at)`
+/// (D7.1). It carries no row values.
+pub fn preview_result(summary: &super::preview::PreviewSummary) -> Result<SqlResult, CoreError> {
+    let overflow = || CoreError::Sql(SqlError::Overflow);
+    let change_id = i64::try_from(summary.id.0).map_err(|_| overflow())?;
+    let expires_us = summary
+        .expires_at
+        .0
+        .checked_sub(super::catalog::PG_EPOCH_UNIX_MS)
+        .and_then(|ms| ms.checked_mul(1000))
+        .ok_or_else(overflow)?;
+    let expires_at = TimestampTz::from_microseconds(expires_us).map_err(|_| overflow())?;
+    Ok(SqlResult {
+        columns: PREVIEW_COLUMNS.map(String::from).to_vec(),
+        rows: vec![SqlRow {
+            values: vec![
+                Value::Int(change_id),
+                Value::Text(super::preview::digest_hex(&summary.digest)),
+                Value::Int(i64::from(summary.rows)),
+                Value::TimestampTz(expires_at),
+            ],
+            version: 0,
+        }],
+        affected: 1,
+    })
 }

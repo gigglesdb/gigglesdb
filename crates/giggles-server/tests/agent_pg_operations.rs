@@ -2,8 +2,10 @@
 //! for operation IDs, preview, apply and outcome lookup on a task session. The
 //! forms parse and are admitted by class. Since R3-626 `Update` and
 //! `OutcomeLookup` are enabled: `OPERATION '<id>' UPDATE ...` runs the protected
-//! commit and `SHOW OPERATION` returns its outcome. Preview and apply (Phase 7)
-//! still refuse with 0A000 and their class message.
+//! commit and `SHOW OPERATION` returns its outcome. Since R3-707 `Preview` and
+//! `Apply` are enabled too: a preview is stored and answers its row, and an
+//! apply runs the protected commit of a stored preview (r3_preview_sql.rs
+//! covers them end to end).
 #![cfg(feature = "engine-rocksdb")]
 mod agent_support;
 
@@ -170,8 +172,13 @@ async fn prefix_survives_extended_parse_with_parameters() {
     let declared = wire.parse_describe(plain, &[25, 20]).await;
     assert_eq!(error_of(&declared), None, "{declared:?}");
     assert!(declared.contains(&Msg::Parameters(vec![25, 20])), "{declared:?}");
+    // R3-707: PREVIEW is admitted; Describe gives the wrapped UPDATE's
+    // parameters and the preview row.
     let previewed = wire.parse_describe(preview, &[25, 20]).await;
-    assert_eq!(error_of(&previewed), Some(not_allowed(StatementClass::Preview)));
+    assert_eq!(error_of(&previewed), None, "{previewed:?}");
+    assert!(previewed.contains(&Msg::Parameters(vec![25, 20])), "{previewed:?}");
+    let columns = ["change_id", "digest", "row_count", "expires_at"].map(String::from).to_vec();
+    assert!(previewed.contains(&Msg::Columns(columns)), "{previewed:?}");
 }
 
 #[tokio::test]
@@ -231,9 +238,11 @@ async fn preview_apply_outcome_forms_parse_and_describe() {
             DataType::TimestampTz
         ]
     );
-    // On the agent listener each form reaches admission. Preview and apply are
-    // refused by their class in both protocols, and Describe is never reached;
-    // the outcome lookup is enabled and answers its columns (no row: unknown ID).
+    // On the agent listener each form reaches admission, and every class is
+    // enabled (R3-707 added preview and apply): none is refused by its class.
+    // The outcome lookup answers its columns (no row: unknown ID). This task
+    // allows no write and has no change 17, so preview and apply fail on the
+    // task's own checks.
     let (_server, _agent, _ordinary, mut wire) = agent_wire().await;
     for (sql, class, columns) in &cases {
         for messages in [
@@ -247,7 +256,7 @@ async fn preview_apply_outcome_forms_parse_and_describe() {
                 assert!(messages.contains(&Msg::Columns(names)), "{sql}: {messages:?}");
                 assert!(!messages.iter().any(|m| matches!(m, Msg::Row(_))), "{sql}");
             } else {
-                assert_eq!(error_of(&messages), Some(not_allowed(*class)), "{sql}");
+                assert_ne!(error_of(&messages), Some(not_allowed(*class)), "{sql}");
             }
             assert_eq!(messages.last(), Some(&Msg::Ready(b'I')), "{sql}");
         }
@@ -314,23 +323,34 @@ async fn apply_digest_must_be_64_hex() {
     for ok in [hex.as_str(), upper.as_str()] {
         let sql = format!("OPERATION 'a3' APPLY CHANGE 5 DIGEST '{ok}'");
         assert!(parse(&sql).unwrap().is_some());
+        // Admitted (R3-707); there is no change 5.
+        let reply = wire.simple(&sql).await;
         assert_eq!(
-            error_of(&wire.simple(&sql).await),
-            Some(not_allowed(StatementClass::Apply))
+            error_of(&reply).map(|e| e.0),
+            Some(TaskError::ApprovalStale.sqlstate().to_owned()),
+            "{reply:?}"
         );
     }
     let short = &hex[..63];
     let long = format!("{hex}0");
     let not_hex = format!("{}g", &hex[..63]);
     let spaced = format!("{} {}", &hex[..32], &hex[32..62]);
+    // R3-707: a digest literal that is not 64 hex digits is 22023 (as in
+    // r3_preview_sql::apply_change_bad_hex_is_22023); a malformed form stays 42601.
     for bad in [
         format!("OPERATION 'a3' APPLY CHANGE 5 DIGEST '{short}'"),
         format!("OPERATION 'a3' APPLY CHANGE 5 DIGEST '{long}'"),
         format!("OPERATION 'a3' APPLY CHANGE 5 DIGEST '{not_hex}'"),
         format!("OPERATION 'a3' APPLY CHANGE 5 DIGEST '{spaced}'"),
-        format!("OPERATION 'a3' APPLY CHANGE 5 DIGEST {hex}"),
         format!("OPERATION 'a3' APPLY CHANGE 5 DIGEST '\\x{}'", &hex[..62]),
         "OPERATION 'a3' APPLY CHANGE 5 DIGEST ''".to_owned(),
+    ] {
+        assert_eq!(parse(&bad), Err("22023"), "{bad}");
+        assert_error(&wire.simple(&bad).await, "22023", &bad);
+        assert_error(&wire.extended(&bad, &[], 0).await, "22023", &bad);
+    }
+    for bad in [
+        format!("OPERATION 'a3' APPLY CHANGE 5 DIGEST {hex}"),
         format!("OPERATION 'a3' APPLY CHANGE 5 '{hex}'"),
         format!("OPERATION 'a3' APPLY 5 DIGEST '{hex}'"),
     ] {
@@ -593,7 +613,7 @@ async fn column_outside_allowed_write_is_refused_and_writes_nothing() {
 }
 
 #[tokio::test]
-async fn bare_update_and_preview_apply_stay_refused_on_a_writable_task() {
+async fn bare_update_stays_refused_and_preview_apply_are_admitted_on_a_writable_task() {
     let (server, mut wire) = writable_wire().await;
     let hex = digest();
     for extended in [false, true] {
@@ -606,15 +626,16 @@ async fn bare_update_and_preview_apply_stay_refused_on_a_writable_task() {
             )),
             "{bare:?}"
         );
+        // R3-707: a preview is stored and writes no user rows; an apply with
+        // a digest that is not the preview's is stale and writes nothing.
         let preview = format!("PREVIEW {REQUEUE}");
-        assert_eq!(
-            error_of(&run(&mut wire, &preview, extended).await),
-            Some(not_allowed(StatementClass::Preview))
-        );
+        let previewed = run(&mut wire, &preview, extended).await;
+        assert_eq!(error_of(&previewed), None, "{previewed:?}");
+        assert!(previewed.iter().any(|m| matches!(m, Msg::Row(_))), "{previewed:?}");
         let apply = format!("OPERATION 'ap' APPLY CHANGE 1 DIGEST '{hex}'");
         assert_eq!(
-            error_of(&run(&mut wire, &apply, extended).await),
-            Some(not_allowed(StatementClass::Apply))
+            error_of(&run(&mut wire, &apply, extended).await).map(|e| e.0),
+            Some(TaskError::ApprovalStale.sqlstate().to_owned())
         );
     }
     assert_eq!(statuses(&server.admin), BEFORE);

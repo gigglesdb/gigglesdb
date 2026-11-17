@@ -52,6 +52,8 @@ pub(super) fn plan_class(plan: &Plan) -> Option<StatementClass> {
         Plan::Catalog(..) => StatementClass::Catalog,
         Plan::Copy(..) => StatementClass::Copy,
         Plan::Task(_) => StatementClass::Other,
+        // R3-707: the approver forms are never admitted in a task session (D7.1).
+        Plan::Change(_) => StatementClass::Other,
         Plan::Sql(p) => p.task_class(),
         Plan::Protected(statement) => statement.class(),
     })
@@ -267,6 +269,11 @@ impl State {
         if let Some((head, wrapped)) = protected::parse(sql)? {
             return self.task_protected(head, wrapped, oids, session);
         }
+        // R3-707: the approver forms, well formed or not, are `Other` in a
+        // task session (design-7 D7.1).
+        if !matches!(crate::agent::preview::approver_statement(sql), Ok(None)) {
+            return Err(refuse(&mut self.diagnostic, StatementClass::Other));
+        }
         let refused = |diagnostic: &mut Diagnostic, plan: &Plan| {
             refuse(diagnostic, plan_class(plan).unwrap_or(StatementClass::Other))
         };
@@ -452,7 +459,10 @@ impl State {
                 prepared,
                 text: std::sync::Arc::from(wrapped),
             },
-            (ProtectedHead::Preview, Some((prepared, _))) => ProtectedStatement::Preview { prepared },
+            (ProtectedHead::Preview, Some((prepared, _))) => ProtectedStatement::Preview {
+                prepared,
+                text: std::sync::Arc::from(wrapped),
+            },
             (ProtectedHead::Apply { op, change, digest }, None) => ProtectedStatement::Apply {
                 op,
                 preview: change,
@@ -744,7 +754,8 @@ impl State {
             | Plan::Control(_)
             | Plan::Sql(_)
             | Plan::Copy(..)
-            | Plan::Task(_) => Err(refuse(&mut self.diagnostic, class)),
+            | Plan::Task(_)
+            | Plan::Change(_) => Err(refuse(&mut self.diagnostic, class)),
         }
     }
 

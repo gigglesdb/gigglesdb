@@ -302,3 +302,128 @@ fn non_task_statements_return_none() {
         assert_eq!(parse(sql), None, "{sql}");
     }
 }
+
+// R3-707: the six D7.1 forms.
+mod change_statements {
+    use super::super::statements::{parse_change_statement, ChangeStatement};
+    use crate::relational::SqlError;
+
+    fn hex() -> String {
+        "0123456789abcdef".repeat(4)
+    }
+
+    fn digest() -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef][i % 8];
+        }
+        out
+    }
+
+    #[test]
+    fn six_forms_parse() {
+        let h = hex();
+        let cases = [
+            (
+                "PREVIEW UPDATE shipments SET status = $1 WHERE id = $2".to_owned(),
+                ChangeStatement::Preview {
+                    update: "UPDATE shipments SET status = $1 WHERE id = $2".into(),
+                },
+            ),
+            (
+                format!("apply change 7 digest '{}';", h.to_ascii_uppercase()),
+                ChangeStatement::Apply {
+                    change: 7,
+                    digest: digest(),
+                },
+            ),
+            (
+                "SHOW CHANGES OF TASK \"inc-436\"".to_owned(),
+                ChangeStatement::ShowChanges {
+                    task: "inc-436".into(),
+                },
+            ),
+            (
+                "show change 3 of task Inc".to_owned(),
+                ChangeStatement::ShowChange {
+                    change: 3,
+                    task: "inc".into(),
+                },
+            ),
+            (
+                format!("APPROVE CHANGE 3 OF TASK \"inc-436\" DIGEST '{h}'"),
+                ChangeStatement::Approve {
+                    change: 3,
+                    task: "inc-436".into(),
+                    digest: digest(),
+                },
+            ),
+            (
+                "REVOKE APPROVAL OF CHANGE 3 OF TASK \"inc-436\" ;".to_owned(),
+                ChangeStatement::RevokeApproval {
+                    change: 3,
+                    task: "inc-436".into(),
+                },
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(parse_change_statement(&sql), Some(Ok(expected.clone())), "{sql}");
+            assert_eq!(
+                expected.is_approver_form(),
+                !matches!(expected, ChangeStatement::Preview { .. } | ChangeStatement::Apply { .. })
+            );
+        }
+    }
+
+    #[test]
+    fn other_statements_keep_their_path() {
+        for sql in [
+            "SHOW TASK \"inc-436\"",
+            "SHOW search_path",
+            "REVOKE approval FROM alice",
+            "REVOKE task FROM alice",
+            "PREVIEW SELECT 1",
+            "APPLY 1",
+            "APPROVE 1",
+            "UPDATE shipments SET status = 'x'",
+            "",
+        ] {
+            assert_eq!(parse_change_statement(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn malformed_forms_are_42601_and_bad_digests_22023() {
+        let h = hex();
+        for sql in [
+            "SHOW CHANGES OF TASK inc-436".to_owned(),
+            "SHOW CHANGES TASK x".to_owned(),
+            "SHOW CHANGE x OF TASK t".to_owned(),
+            "SHOW CHANGE -1 OF TASK t".to_owned(),
+            "SHOW CHANGE 1x OF TASK t".to_owned(),
+            format!("APPROVE CHANGE 1 OF TASK t DIGEST {h}"),
+            format!("APPROVE CHANGE 1 OF TASK t '{h}'"),
+            format!("APPROVE CHANGE 1 OF TASK t DIGEST '{h}' extra"),
+            "APPROVE CHANGE 1 OF TASK t".to_owned(),
+            "REVOKE APPROVAL OF CHANGE 1".to_owned(),
+            format!("APPLY CHANGE 99999999999999999999 DIGEST '{h}'"),
+            "APPLY CHANGE 1 DIGEST 'abc".to_owned(),
+        ] {
+            assert_eq!(parse_change_statement(&sql), Some(Err(SqlError::Syntax)), "{sql}");
+        }
+        let short = &h[..63];
+        let odd = format!("{}g", &h[..63]);
+        for bad in [short.to_owned(), format!("{h}0"), odd, String::new(), format!("\\x{}", &h[..62])] {
+            for sql in [
+                format!("APPLY CHANGE 1 DIGEST '{bad}'"),
+                format!("APPROVE CHANGE 1 OF TASK t DIGEST '{bad}'"),
+            ] {
+                assert_eq!(
+                    parse_change_statement(&sql),
+                    Some(Err(SqlError::InvalidParameterValue)),
+                    "{sql}"
+                );
+            }
+        }
+    }
+}

@@ -1,7 +1,7 @@
 //! R3-207 seam -> R3-615: the direct protected write through
 //! `Session::execute_protected`. `Update` and `OutcomeLookup` are in
-//! `task::admit::ENABLED` (R3-626, design-2 section 4); `Preview` and `Apply`
-//! are not, so the fail-closed test admits them through `test_route`.
+//! `task::admit::ENABLED` (R3-626, design-2 section 4), and since R3-707
+//! `Preview` and `Apply` as well.
 //!
 //! Task "requeue failed for merchant 42, 25 rows" on `shipments` (`deliveries`
 //! is reserved): visible rows `merchant_id = 42`, write `status` from 'failed'
@@ -285,30 +285,44 @@ fn returning_is_refused_before_anything_runs() {
 }
 
 #[test]
-fn preview_and_apply_still_fail_closed() {
+fn preview_and_apply_run_through_the_seam() {
+    // R3-707: both classes are in ENABLED; no route is needed.
     let (service, mut session) = fixture();
-    test_route::enable(&[StatementClass::Preview, StatementClass::Apply]);
+    test_route::enable(&[]);
     let prepared = prepare(&mut session, StatementClass::Preview, REQUEUE).unwrap();
-    let op = OperationId::new("op-1").unwrap();
-    for statement in [
-        ProtectedStatement::Preview {
-            prepared: Box::new(prepared),
-        },
-        ProtectedStatement::Apply {
-            op,
-            preview: 1,
-            digest: [0; 32],
-        },
-    ] {
-        let error = session.execute_protected(&statement, &[]).unwrap_err();
-        assert_eq!(
-            error,
-            CoreError::Task(TaskError::NotAllowedInTaskSession(statement.class()))
-        );
-        assert_eq!(sqlstate(&error), "0A000");
-        assert!(!session.in_protected());
-    }
+    let preview = ProtectedStatement::Preview {
+        prepared: Box::new(prepared),
+        text: Arc::from(REQUEUE),
+    };
+    let result = session.execute_protected(&preview, &[]).unwrap();
+    assert!(!session.in_protected());
+    assert_eq!(result.columns, ["change_id", "digest", "row_count", "expires_at"]);
+    let values = &result.rows[0].values;
+    assert_eq!(values[0], Value::Int(1));
+    assert_eq!(values[2], Value::Int(4));
+    let Value::Text(hex) = &values[1] else { panic!("{values:?}") };
+    let mut digest = [0u8; 32];
+    hex::decode_to_slice(hex, &mut digest).unwrap();
+    // A preview writes no user rows.
     assert_eq!(statuses(&service), BEFORE);
+    let apply = |op: &str, digest: [u8; 32]| ProtectedStatement::Apply {
+        op: OperationId::new(op).unwrap(),
+        preview: 1,
+        digest,
+    };
+    // Another digest is stale and consumes nothing.
+    let error = session.execute_protected(&apply("op-1", [0; 32]), &[]).unwrap_err();
+    assert_eq!(error, CoreError::Task(TaskError::ApprovalStale));
+    assert_eq!(statuses(&service), BEFORE);
+    // 4 rows are within the threshold of 25: no approval is needed.
+    let applied = session.execute_protected(&apply("op-1", digest), &[]).unwrap();
+    assert_eq!(applied.affected, 4);
+    assert!(!session.in_protected());
+    assert_eq!(statuses(&service), AFTER);
+    // The resend replays; a new ID finds the preview applied.
+    assert_eq!(session.execute_protected(&apply("op-1", digest), &[]).unwrap().affected, 4);
+    let error = session.execute_protected(&apply("op-2", digest), &[]).unwrap_err();
+    assert_eq!(error, CoreError::Task(TaskError::ApprovalStale));
 }
 
 #[test]

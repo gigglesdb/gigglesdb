@@ -57,12 +57,16 @@ impl StatementClass {
 }
 
 /// Classes a task session may run in this build. Phase 3 adds `Select`; phase 6 (its last
-/// item, R3-626) has added `Update` and `OutcomeLookup`; phase 7 adds `Preview` and `Apply`.
+/// item, R3-626) has added `Update` and `OutcomeLookup`; phase 7 (R3-707, the item that
+/// wires the SQL statements once preview, approval and apply exist) has added `Preview`
+/// and `Apply`.
 pub const ENABLED: &[StatementClass] = &[
     StatementClass::Show,
     StatementClass::Set,
     StatementClass::Update,
     StatementClass::OutcomeLookup,
+    StatementClass::Preview,
+    StatementClass::Apply,
 ];
 
 /// `None` is not a task session and is always admitted.
@@ -117,6 +121,8 @@ mod tests {
                 StatementClass::Set,
                 StatementClass::Update,
                 StatementClass::OutcomeLookup,
+                StatementClass::Preview,
+                StatementClass::Apply,
             ]
         );
     }

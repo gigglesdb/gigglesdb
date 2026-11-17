@@ -55,10 +55,12 @@ impl State {
         // Role/ACL and DROP TABLE operations publish outside the SQL snapshot.
         // Like CREATE DATABASE in PostgreSQL, these must be the sole statement
         // in a Query message, even if the message contains explicit COMMITs.
-        if statements
-            .iter()
-            .any(|sql| crate::auth::statements::parse(sql).is_some())
-        {
+        // GD-0061 R3-707: so are the approver forms, which write approval
+        // records outside the SQL snapshot.
+        if statements.iter().any(|sql| {
+            crate::auth::statements::parse(sql).is_some()
+                || matches!(crate::agent::preview::approver_statement(sql), Ok(Some(_)))
+        }) {
             return Err("25001");
         }
         let mut statements = statements.into_iter();
@@ -315,6 +317,29 @@ impl State {
     ) -> R<()> {
         if session.task().is_some() {
             return self.task_statement(sql, session, out);
+        }
+        // GD-0061 R3-707: an approver form, before any other grammar reads it.
+        if let Some(change) = crate::agent::preview::approver_statement(sql)? {
+            crate::agent::preview::approver_guard(session)?;
+            self.diagnostic.phase = "approval execution";
+            let result = self
+                .diagnostic
+                .core(crate::agent::preview::execute_approver(session, &change))?;
+            let description = crate::agent::preview::approver_description(&change);
+            if !description.columns.is_empty() {
+                row_description(&description, &[], out)?;
+            }
+            rows(
+                &self.settings.current,
+                session.zone().unwrap_or(SessionZone::Fixed(0)),
+                &result,
+                &description,
+                &[],
+                0,
+                result.rows.len(),
+                out,
+            )?;
+            return complete(crate::agent::preview::approver_command(&change), &result, out);
         }
         if let Some(command) = cursor::parse(sql)? {
             self.cursors.execute(
