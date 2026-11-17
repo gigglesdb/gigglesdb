@@ -22,6 +22,7 @@ pub mod node;
 pub mod range_guard;
 pub mod range_role;
 pub mod range_state;
+pub mod registry;
 pub mod replace;
 pub mod role;
 pub mod route;

@@ -169,3 +169,6 @@ mod gateway_cluster;
 
 #[path = "split_scan.rs"]
 mod split_scan;
+
+#[path = "registry.rs"]
+mod registry;
