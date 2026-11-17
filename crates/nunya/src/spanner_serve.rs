@@ -95,7 +95,7 @@ pub async fn run_spanner(
     state: RouteState,
     readlog: Box<dyn ReadLog>,
     _policy_path: PathBuf,
-    tls: Option<tonic::transport::ServerTlsConfig>,
+    tls: Option<crate::pgwire::context::ReloadableTls>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     run_spanner_with_hub(
@@ -111,7 +111,7 @@ pub(crate) async fn run_spanner_with_hub(
     state: RouteState,
     readlog: Box<dyn ReadLog>,
     hub: Option<Arc<crate::reload::Hub>>,
-    tls: Option<tonic::transport::ServerTlsConfig>,
+    tls: Option<crate::pgwire::context::ReloadableTls>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     if *shutdown.borrow() {

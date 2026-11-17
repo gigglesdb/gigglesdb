@@ -224,18 +224,26 @@ pub async fn spawn(
     ctx: Arc<MgmtContext>,
     section: Option<&ManagementSection>,
     state_dir: &Path,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<ServerHandle, SpawnError> {
-    let (tcp, tls) = if let Some(section) = section {
+    let tls = section.and_then(|s| s.tls.as_ref()).map(config::load_tls).transpose()
+        .map_err(|_| SpawnError::Tls)?;
+    spawn_with_tls(ctx, section, state_dir, shutdown, Arc::new(std::sync::RwLock::new(tls))).await
+}
+
+/// Start listeners using TLS configuration shared with the config reloader.
+pub(crate) async fn spawn_with_tls(
+    ctx: Arc<MgmtContext>, section: Option<&ManagementSection>, state_dir: &Path,
+    mut shutdown: watch::Receiver<bool>, tls: crate::pgwire::context::ReloadableTls,
+) -> Result<ServerHandle, SpawnError> {
+    let tcp = if let Some(section) = section {
         if !section.listen.ip().is_loopback() && section.tls.is_none() {
             return Err(SpawnError::TlsRequired);
         }
-        let tls = section.tls.as_ref().map(config::load_tls).transpose()
-            .map_err(|_| SpawnError::Tls)?.map(TlsAcceptor::from);
         let tcp = TcpListener::bind(section.listen).await.map_err(|_| SpawnError::Bind)?;
-        (Some(tcp), tls)
+        Some(tcp)
     } else {
-        (None, None)
+        None
     };
     let tcp_addr = tcp.as_ref().map(TcpListener::local_addr).transpose().map_err(|_| SpawnError::Bind)?;
     #[cfg(unix)]
@@ -273,7 +281,7 @@ pub async fn spawn(
                     };
                     let Ok(permit) = tcp_permits.clone().try_acquire_owned() else { continue; };
                     let ctx = ctx.clone();
-                    let tls = tls.clone();
+                    let tls = tls.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone().map(TlsAcceptor::from);
                     let mut stop = stop_rx.clone();
                     connections.spawn(async move {
                         let _permit = permit;

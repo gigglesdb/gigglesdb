@@ -1080,7 +1080,8 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
                 if tls {
                     return Err(protocol());
                 }
-                if let Some(config) = &ctx.tls {
+                let current = ctx.tls.read().map_err(|_| protocol())?.clone();
+                if let Some(config) = current {
                     // Reject bytes pipelined ahead of TLS: they cannot be treated as encrypted application data.
                     if !agent.buffer.is_empty() {
                         return Err(protocol());
@@ -1470,7 +1471,7 @@ mod tests {
                 clock: Arc::new(|| 100),
                 cancel_map: Mutex::new(Default::default()),
                 metrics: Metrics::default(),
-                tls: None,
+                tls: Arc::new(std::sync::RwLock::new(None)),
                 allow_plaintext: true,
             });
             Self {
@@ -3564,6 +3565,46 @@ mod tests {
             if local { assert!(matches!(records[0].outcome, Outcome::Refused(NyCode::TokenizeLimit))); }
             assert!(records.iter().all(|r| r.policy_revision.as_deref() == Some("R2")));
         }
+    }
+
+    #[tokio::test]
+    async fn tls_reload_rotates_new_pg_handshakes_and_preserves_old() {
+        use crate::config_reload::{tests::{Fixture as ConfigFixture, certificate, connector}, ConfigReloader, Transports};
+        let config = ConfigFixture::new(); let a = certificate(&config);
+        let hub = config.hub();
+        let reload = ConfigReloader::new(config.load(&config.text), Arc::downgrade(&hub));
+        let fixture = Fixture::new();
+        let mut transports = Transports::new(&config.load(&config.text)).unwrap();
+        *fixture.ctx.tls.write().unwrap() = transports.postgres.read().unwrap().clone();
+        Arc::get_mut(&mut transports).unwrap().postgres = fixture.ctx.tls.clone();
+        reload.attach_transports(transports.clone());
+        let b = certificate(&config);
+        let client = connector(&[a.clone(), b.clone()], false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ctx = fixture.ctx.clone();
+        let server = tokio::spawn(async move {
+            let mut sessions = tokio::task::JoinSet::new();
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let ctx = ctx.clone(); sessions.spawn(async move { serve_tcp(tcp, ctx).await });
+            }
+        });
+        async fn pg_connect(addr: std::net::SocketAddr, client: &tokio_rustls::TlsConnector)
+            -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+            let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            tcp.write_all(&[0,0,0,8,4,210,22,47]).await.unwrap();
+            let mut answer = [0]; tcp.read_exact(&mut answer).await.unwrap(); assert_eq!(answer, *b"S");
+            client.connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), tcp).await.unwrap()
+        }
+        let mut old = pg_connect(addr, &client).await;
+        assert_eq!(old.get_ref().1.peer_certificates().unwrap()[0], a);
+        reload.reload().await; assert_eq!(reload.last_reload(), "applied");
+        let new = pg_connect(addr, &client).await;
+        assert_eq!(new.get_ref().1.peer_certificates().unwrap()[0], b);
+        old.write_all(&[0,0,0,8,4,210,22,48]).await.unwrap();
+        let mut answer = [0]; old.read_exact(&mut answer).await.unwrap(); assert_eq!(answer, *b"N");
+        server.abort(); let _ = server.await;
     }
 
 }

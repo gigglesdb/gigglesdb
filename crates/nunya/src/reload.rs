@@ -1385,7 +1385,7 @@ mod tests {
             },
             search_path: vec!["public".into()], lowering: crate::dialect::pg::PgLowering,
             codec: crate::token::StandardCodec, clock: Arc::new(|| 0), cancel_map: Mutex::new(Default::default()),
-            metrics: Metrics::default(), tls: None, allow_plaintext: true,
+            metrics: Metrics::default(), tls: Arc::new(std::sync::RwLock::new(None)), allow_plaintext: true,
         });
         h.register(Route::Postgres(ctx.clone())).unwrap();
         let (initial, revision) = ctx.policy_snapshot().unwrap();

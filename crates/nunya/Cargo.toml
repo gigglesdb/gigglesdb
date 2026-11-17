@@ -60,4 +60,5 @@ gcp_auth = "0.12.7"
 tokio-stream = "0.1"
 
 [dev-dependencies]
+rcgen = "=0.13.2"
 proptest = "1"

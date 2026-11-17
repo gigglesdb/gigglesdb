@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::{
     io::AsyncWriteExt,
-    sync::{Semaphore, mpsc},
+    sync::mpsc,
     task::{JoinHandle, JoinSet},
 };
 
@@ -400,6 +400,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let config_reload = Arc::new(crate::config_reload::ConfigReloader::new(
         crate::config_reload::copy_config(&config), Arc::downgrade(&hub),
     ));
+    let transports = crate::config_reload::Transports::new(&config)?;
+    config_reload.attach_transports(transports.clone());
     config_reload.attach(runtime.authority.clone(), admins.clone());
     runtime.set_lifecycle_log(Arc::new(hub.log.clone()));
     hub.set_config_revision(&config.revision)?;
@@ -440,8 +442,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             }),
             lifecycle: Arc::new(crate::mgmt::audit::ReadLogSink(hub.log.clone())),
         };
-        Some(crate::mgmt::server::spawn(Arc::new(ctx), config.management.as_ref(),
-            &config.state_dir, rx.clone()).await.map_err(|err| err.to_string())?)
+        Some(crate::mgmt::server::spawn_with_tls(Arc::new(ctx), config.management.as_ref(),
+            &config.state_dir, rx.clone(), transports.management.clone()).await.map_err(|err| err.to_string())?)
     } else { None };
 
     let mut routes = JoinSet::new();
@@ -453,22 +455,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         };
         let readlog = Box::new(hub.route_log(&state.route)?);
         let policy = hub.policy_for(&state.route)?;
-        let tls = config
-            .tls
-            .as_ref()
-            .map(|tls| {
-                let cert = std::fs::read(&tls.cert_file)
-                    .map_err(|_| "tls: cannot load certificate and private key")?;
-                let key = zeroize::Zeroizing::new(
-                    std::fs::read(&tls.key_file)
-                        .map_err(|_| "tls: cannot load certificate and private key")?,
-                );
-                Ok::<_, String>(
-                    tonic::transport::ServerTlsConfig::new()
-                        .identity(tonic::transport::Identity::from_pem(cert, key.as_slice())),
-                )
-            })
-            .transpose()?;
+        let tls = config.tls.as_ref().map(|_| transports.spanner.clone());
         let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
         let root_key =
             crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
@@ -501,6 +488,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 ready_tx,
                 hub,
                 (runtime, route),
+                transports,
             );
             tokio::pin!(work);
             tokio::select! {
@@ -564,6 +552,7 @@ async fn run_postgres(
         Arc<crate::state::runtime::StateRuntime>,
         crate::state::model::RouteId,
     ),
+    transports: Arc<crate::config_reload::Transports>,
 ) -> Result<(), String> {
     let log = hub.route_log(&state.1)?;
     let upstream = config
@@ -577,11 +566,7 @@ async fn run_postgres(
     .await
     .map_err(|_| "upstream schema snapshot timed out")??;
 
-    let tls = config
-        .tls
-        .as_ref()
-        .map(crate::config::load_tls)
-        .transpose()?;
+    let tls = transports.postgres.clone();
     let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
     let root_key =
         crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
@@ -655,7 +640,7 @@ async fn run_postgres(
             }
         }
     }));
-    let permits = Arc::new(Semaphore::new(config.max_connections));
+    let permits = transports.connections.clone();
     let mut sessions = JoinSet::new();
     let shutdown = stopped(shutdown_rx);
     tokio::pin!(shutdown);
@@ -667,9 +652,9 @@ async fn run_postgres(
             accepted = listener.accept() => {
                 let (mut tcp, _) = match accepted { Ok(pair) => pair, Err(_) => break Err("agent listener failed".into()) };
                 if tcp.set_nodelay(true).is_err() { continue; }
-                match permits.clone().try_acquire_owned() {
-                    Ok(permit) => { let ctx = ctx.clone(); sessions.spawn(async move { let _permit = permit; crate::pgwire::session::serve_tcp(tcp, ctx).await; }); }
-                    Err(_) => {
+                match permits.acquire() {
+                    Some(permit) => { let ctx = ctx.clone(); sessions.spawn(async move { let _permit = permit; crate::pgwire::session::serve_tcp(tcp, ctx).await; }); }
+                    None => {
                         let mut bytes = bytes::BytesMut::new();
                         crate::pgwire::codec::encode_backend(&crate::pgwire::codec::Backend::ErrorResponse(crate::pgwire::redact::nunya_error(crate::error::NyCode::ProtocolNotAllowed)), &mut bytes);
                         let _ = tokio::time::timeout(Duration::from_secs(1), tcp.write_all(&bytes)).await;

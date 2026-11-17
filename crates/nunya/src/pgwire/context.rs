@@ -58,6 +58,9 @@ impl Metrics {
 }
 type CancelMap = HashMap<(i32, [u8; 4]), (i32, Vec<u8>)>;
 
+/// Shared TLS configuration captured afresh for each handshake.
+pub type ReloadableTls = Arc<RwLock<Option<Arc<rustls::ServerConfig>>>>;
+
 /// Gateway resources and configuration shared by sessions.
 pub struct GatewayContext {
     /// Shared durable session authority.
@@ -91,7 +94,7 @@ pub struct GatewayContext {
     /// Data-free monitoring counters.
     pub metrics: Metrics,
     /// Optional downstream TLS configuration.
-    pub tls: Option<Arc<rustls::ServerConfig>>,
+    pub tls: ReloadableTls,
     /// Whether unencrypted agent connections are permitted.
     pub allow_plaintext: bool,
 }

@@ -310,19 +310,57 @@ pub(super) async fn connect(
 pub async fn serve(
     addr: SocketAddr,
     svc: NunyaSpanner,
-    tls: Option<tonic::transport::ServerTlsConfig>,
+    tls: Option<crate::pgwire::context::ReloadableTls>,
 ) -> Result<(), Refusal> {
     let mut builder = tonic::transport::Server::builder();
     if let Some(tls) = tls {
-        builder = builder
-            .tls_config(tls)
+        let listener = tokio::net::TcpListener::bind(addr).await
             .map_err(|_| refusal(NyCode::StatementNotAllowed))?;
+        let incoming = tls_incoming(listener, tls);
+        return builder.add_service(SpannerServer::new(svc))
+            .serve_with_incoming(incoming).await
+            .map_err(|_| refusal(NyCode::StatementNotAllowed));
     }
     builder
         .add_service(SpannerServer::new(svc))
         .serve(addr)
         .await
         .map_err(|_| refusal(NyCode::StatementNotAllowed))
+}
+// JoinSet owns handshake tasks, aborting unfinished work when the incoming stream is dropped.
+fn tls_incoming(listener: tokio::net::TcpListener, tls: crate::pgwire::context::ReloadableTls)
+    -> impl futures::Stream<Item = std::io::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>> {
+    futures::stream::unfold((listener, tokio::task::JoinSet::new()), move |(listener, mut pending)| {
+        let tls = tls.clone();
+        async move {
+            loop {
+                tokio::select! {
+                    accepted = listener.accept(), if pending.len() < 64 => {
+                        let (tcp, _) = match accepted {
+                            Ok(pair) => pair,
+                            Err(error) => {
+                                // Tonic continues polling after errors; back off to avoid spinning.
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                return Some((Err(error), (listener, pending)));
+                            }
+                        };
+                        let config = tls.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                        if let Some(config) = config {
+                            pending.spawn(async move {
+                                tokio::time::timeout(std::time::Duration::from_secs(10),
+                                    tokio_rustls::TlsAcceptor::from(config).accept(tcp)).await.ok()?.ok()
+                            });
+                        }
+                    }
+                    result = pending.join_next(), if !pending.is_empty() => {
+                        if let Some(Ok(Some(stream))) = result {
+                            return Some((Ok(stream), (listener, pending)));
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 impl NunyaSpanner {
     fn authenticate<T>(&self, req: &Request<T>) -> Result<Authenticated, Status> {
@@ -3682,5 +3720,43 @@ mod tests {
                 .unwrap_err(),
         );
         assert_eq!(f.fake.seen.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tls_rotation_tests {
+    use super::*;
+    use crate::config_reload::{tests::{Fixture, certificate, connector, connect_tls}, ConfigReloader, Transports};
+    use futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn incoming_rotates_certificates_with_h2_and_independent_handshakes() {
+        let f = Fixture::new(); let a = certificate(&f); let hub = f.hub();
+        let config = f.load(&f.text);
+        let transports = Transports::new(&config).unwrap();
+        let reload = ConfigReloader::new(config, Arc::downgrade(&hub)); reload.attach_transports(transports.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tls_incoming(listener, transports.spanner.clone());
+        let server = tokio::spawn(async move {
+            futures::pin_mut!(incoming);
+            let mut sessions = tokio::task::JoinSet::new();
+            while let Some(Ok(mut io)) = incoming.next().await {
+                sessions.spawn(async move {
+                    let mut byte = [0]; io.read_exact(&mut byte).await.unwrap(); io.write_all(&byte).await.unwrap();
+                });
+            }
+        });
+        let b = certificate(&f); let client = connector(&[a.clone(), b.clone()], true);
+        let stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut old = connect_tls(addr, &client).await;
+        assert_eq!(old.get_ref().1.peer_certificates().unwrap()[0], a);
+        assert_eq!(old.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        reload.reload().await; assert_eq!(reload.last_reload(), "applied");
+        let new = connect_tls(addr, &client).await;
+        assert_eq!(new.get_ref().1.peer_certificates().unwrap()[0], b);
+        assert_eq!(new.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        old.write_all(b"x").await.unwrap(); let mut response = [0]; old.read_exact(&mut response).await.unwrap(); assert_eq!(response, *b"x");
+        drop(stalled); server.abort(); let _ = server.await;
     }
 }

@@ -303,6 +303,62 @@ pub(crate) fn copy_config(c: &Config) -> Config {
             .collect(),
     }
 }
+/// Live transport resources shared with all listener accept loops.
+pub(crate) struct Transports {
+    /// PostgreSQL handshake configuration without HTTP ALPN.
+    pub(crate) postgres: crate::pgwire::context::ReloadableTls,
+    /// Native Spanner handshake configuration advertising HTTP/2.
+    pub(crate) spanner: crate::pgwire::context::ReloadableTls,
+    /// Management handshake configuration.
+    pub(crate) management: crate::pgwire::context::ReloadableTls,
+    /// PostgreSQL connection admission limit and active sessions.
+    pub(crate) connections: Arc<ConnectionLimit>,
+}
+impl Transports {
+    /// Load startup transport settings before listeners and reload processing start.
+    pub(crate) fn new(config: &Config) -> Result<Arc<Self>, String> {
+        let route = config.tls.as_ref().map(crate::config::load_tls).transpose()?;
+        let management = config.management.as_ref().and_then(|m| m.tls.as_ref())
+            .map(crate::config::load_tls).transpose()?;
+        Ok(Arc::new(Self {
+            postgres: Arc::new(std::sync::RwLock::new(route.clone())),
+            spanner: Arc::new(std::sync::RwLock::new(h2_config(route))),
+            management: Arc::new(std::sync::RwLock::new(management)),
+            connections: Arc::new(ConnectionLimit(Mutex::new((config.max_connections, 0)))),
+        }))
+    }
+    fn apply(&self, route: Option<Arc<rustls::ServerConfig>>, management: Option<Arc<rustls::ServerConfig>>, limit: usize) {
+        *self.postgres.write().unwrap_or_else(std::sync::PoisonError::into_inner) = route.clone();
+        *self.spanner.write().unwrap_or_else(std::sync::PoisonError::into_inner) = h2_config(route);
+        *self.management.write().unwrap_or_else(std::sync::PoisonError::into_inner) = management;
+        self.connections.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0 = limit;
+    }
+}
+fn h2_config(config: Option<Arc<rustls::ServerConfig>>) -> Option<Arc<rustls::ServerConfig>> {
+    config.map(|config| {
+        let mut config = (*config).clone();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        Arc::new(config)
+    })
+}
+/// Serialized limit and active count; decreases never revoke an existing guard.
+pub(crate) struct ConnectionLimit(Mutex<(usize, usize)>);
+/// Releases an active connection when the session ends.
+pub(crate) struct ConnectionGuard(Arc<ConnectionLimit>);
+impl ConnectionLimit {
+    /// Admit a connection only while the current active count is below the live limit.
+    pub(crate) fn acquire(self: &Arc<Self>) -> Option<ConnectionGuard> {
+        let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.1 >= state.0 { return None; }
+        state.1 += 1;
+        Some(ConnectionGuard(self.clone()))
+    }
+}
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).1 -= 1;
+    }
+}
 struct State {
     running: Config,
     last: &'static str,
@@ -318,6 +374,7 @@ pub(crate) struct ConfigReloader {
     hub: Weak<Hub>,
     state: Mutex<State>,
     appliers: OnceLock<(Arc<Authority>, Admins)>,
+    transports: OnceLock<Arc<Transports>>,
 }
 /// Prepared configuration; future appliers may add fallible resources here.
 struct Prepared {
@@ -326,6 +383,8 @@ struct Prepared {
     principals: Vec<ConfigPrincipal>,
     limits: SessionLimits,
     admins: Vec<(String, ScramVerifier)>,
+    route_tls: Option<Arc<rustls::ServerConfig>>,
+    management_tls: Option<Arc<rustls::ServerConfig>>,
 }
 fn prepare(running: &Config, config: Config, authority: Option<&Authority>) -> Result<Prepared, &'static str> {
     let admins: Vec<_> = config.management.as_ref().map(|m| m.admins.iter()
@@ -334,7 +393,14 @@ fn prepare(running: &Config, config: Config, authority: Option<&Authority>) -> R
         .is_some_and(|p| p.source == PrincipalSource::Api)) {
         return Err("management admin name taken");
     }
+    // Retain startup TLS enablement; path contents are re-read even without a text diff.
+    let route_tls = running.tls.as_ref().map(|old| crate::config::load_tls(config.tls.as_ref().unwrap_or(old)))
+        .transpose().map_err(|_| "tls: cannot load certificate and private key")?;
+    let management_tls = running.management.as_ref().and_then(|m| m.tls.as_ref()).map(|old| {
+        crate::config::load_tls(config.management.as_ref().and_then(|m| m.tls.as_ref()).unwrap_or(old))
+    }).transpose().map_err(|_| "management.tls: cannot load certificate and private key")?;
     Ok(Prepared {
+        route_tls, management_tls,
         principals: config_principals(&config.standing),
         limits: session_limits(&config.session),
         admins,
@@ -349,6 +415,7 @@ impl ConfigReloader {
             path: config.path.clone(),
             hub,
             appliers: OnceLock::new(),
+            transports: OnceLock::new(),
             state: Mutex::new(State {
                 running: config,
                 last: "none",
@@ -363,6 +430,10 @@ impl ConfigReloader {
     /// Attach live authority and shared management credentials before reloads start.
     pub(crate) fn attach(&self, authority: Arc<Authority>, admins: Admins) {
         assert!(self.appliers.set((authority, admins)).is_ok(), "reload appliers already attached");
+    }
+    /// Attach live transport settings before reload processing starts.
+    pub(crate) fn attach_transports(&self, transports: Arc<Transports>) {
+        assert!(self.transports.set(transports).is_ok(), "transport appliers already attached");
     }
     /// Last applied configuration digest used to seed polling.
     pub(crate) fn revision(&self) -> String {
@@ -403,6 +474,9 @@ impl ConfigReloader {
                     if prepared.diff.reloadable.contains(&"management.admins") {
                         *admins.write().unwrap_or_else(std::sync::PoisonError::into_inner) = prepared.admins;
                     }
+                }
+                if let Some(transports) = self.transports.get() {
+                    transports.apply(prepared.route_tls, prepared.management_tls, prepared.config.max_connections);
                 }
                 self.commit(&mut state, prepared.config, prepared.diff);
                 Ok(())
@@ -606,7 +680,7 @@ key_file='key'
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
-    fn edit(text: &str, path: &str, value: &str) -> String {
+    pub(crate) fn edit(text: &str, path: &str, value: &str) -> String {
         let mut doc: toml::Value = toml::from_str(text).unwrap();
         let keys: Vec<_> = path.split('.').collect();
         let mut table = doc.as_table_mut().unwrap();
@@ -1052,4 +1126,94 @@ key_file='key'
                 .contains(&("nunya_config_reload_failures_total".into(), 0))
         );
     }
+    pub(crate) fn certificate(f: &Fixture) -> rustls::pki_types::CertificateDer<'static> {
+        let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        for name in ["cert", "cert2"] { std::fs::write(f.dir.join(name), cert.pem()).unwrap(); }
+        for name in ["key", "key2"] { std::fs::write(f.dir.join(name), key_pair.serialize_pem()).unwrap(); }
+        cert.der().clone()
+    }
+    pub(crate) fn connector(certs: &[rustls::pki_types::CertificateDer<'static>], h2: bool) -> tokio_rustls::TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in certs { roots.add(cert.clone()).unwrap(); }
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth();
+        if h2 { config.alpn_protocols = vec![b"h2".to_vec()]; }
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+    pub(crate) async fn connect_tls(addr: std::net::SocketAddr, connector: &tokio_rustls::TlsConnector)
+        -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), connector.connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(addr).await.unwrap()))
+            .await.unwrap().unwrap()
+    }
+    #[tokio::test]
+    async fn connection_limit_decrease_preserves_active_and_raise_is_immediate() {
+        let f = Fixture::new();
+        let config = f.load(&edit(&f.text, "max_connections", "2"));
+        let transports = Transports::new(&config).unwrap();
+        let hub = f.hub(); let reload = ConfigReloader::new(config, Arc::downgrade(&hub));
+        reload.attach_transports(transports.clone());
+        let limit = &transports.connections;
+        let a = limit.acquire().unwrap(); let b = limit.acquire().unwrap();
+        f.load(&edit(&f.text, "max_connections", "1"));
+        reload.reload().await; assert_eq!(reload.last_reload(), "applied");
+        assert_eq!(limit.0.lock().unwrap().1, 2);
+        assert!(limit.acquire().is_none());
+        drop(a); assert!(limit.acquire().is_none());
+        drop(b); let c = limit.acquire().unwrap();
+        assert!(limit.acquire().is_none());
+        f.load(&edit(&f.text, "max_connections", "2"));
+        reload.reload().await; assert_eq!(reload.last_reload(), "applied");
+        assert!(limit.acquire().is_some()); drop(c);
+    }
+    #[tokio::test]
+    async fn broken_tls_rejects_every_swap_and_unchanged_text_rotates() {
+        let f = Fixture::new(); let a = certificate(&f);
+        let (_, _hub, reload, admins) = f.live();
+        let transports = Transports::new(&f.load(&f.text)).unwrap();
+        reload.attach_transports(transports.clone());
+        let old = transports.postgres.read().unwrap().clone().unwrap();
+        let b = certificate(&f); assert_ne!(a, b);
+        reload.reload().await; assert_eq!(reload.last_reload(), "applied");
+        let current = transports.postgres.read().unwrap().clone().unwrap();
+        assert!(!Arc::ptr_eq(&old, &current));
+        f.load(&edit(&edit(&f.text, "max_connections", "1"), "management.admin", "[]"));
+        std::fs::write(f.dir.join("key"), "broken").unwrap();
+        reload.reload().await; assert_eq!(reload.last_reload(), "rejected");
+        assert!(Arc::ptr_eq(&current, transports.postgres.read().unwrap().as_ref().unwrap()));
+        assert_eq!(transports.connections.0.lock().unwrap().0, 256);
+        assert!(!admins.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn management_tls_reload_keeps_established_connection() {
+        use crate::mgmt::{routes::MgmtContext, server::spawn_with_tls};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let f = Fixture::new(); let a = certificate(&f);
+        let (runtime, _hub, reload, admins) = f.live();
+        let mut config = f.load(&f.text);
+        config.management.as_mut().unwrap().listen = "127.0.0.1:0".parse().unwrap();
+        let transports = Transports::new(&config).unwrap(); reload.attach_transports(transports.clone());
+        let ctx = Arc::new(MgmtContext { authority: runtime.authority.clone(), admins,
+            connections: Arc::new(Sources), status: Arc::new(Sources), lifecycle: Arc::new(Sources) });
+        let (shutdown, rx) = tokio::sync::watch::channel(false);
+        let server = spawn_with_tls(ctx, config.management.as_ref(), &config.state_dir, rx, transports.management.clone()).await.unwrap();
+        let addr = server.tcp_addr.unwrap();
+        let b = certificate(&f); let client = connector(&[a.clone(), b.clone()], false);
+        let mut old = connect_tls(addr, &client).await;
+        assert_eq!(old.get_ref().1.peer_certificates().unwrap()[0], a);
+        reload.reload().await; assert_eq!(reload.last_reload(), "applied");
+        let new = connect_tls(addr, &client).await;
+        assert_eq!(new.get_ref().1.peer_certificates().unwrap()[0], b);
+        std::fs::write(f.dir.join("key"), "broken").unwrap();
+        reload.reload().await; assert_eq!(reload.last_reload(), "rejected");
+        let after_failure = connect_tls(addr, &client).await;
+        assert_eq!(after_failure.get_ref().1.peer_certificates().unwrap()[0], b);
+        old.write_all(b"GET /unknown HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), old.read_to_end(&mut response)).await.unwrap().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 "));
+        drop(new); drop(after_failure); shutdown.send(true).unwrap(); server.wait().await;
+    }
+
 }

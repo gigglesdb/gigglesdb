@@ -124,7 +124,7 @@ async fn gateway(url: &str, side: &str) -> TestResult<Gateway> {
         clock: Arc::new(|| 0),
         cancel_map: Mutex::new(HashMap::new()),
         metrics: Metrics::default(),
-        tls: None,
+        tls: Arc::new(std::sync::RwLock::new(None)),
         allow_plaintext: true,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
