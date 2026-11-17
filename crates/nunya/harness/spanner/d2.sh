@@ -18,8 +18,11 @@ esac
 scenario=setup
 umask 077
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-work=J:/gigglesdb-work/nunya/gd81-d2
-binary=${NUNYA_D2_NUNYA:-J:/gigglesdb-work/nunya/target-w2/debug/nunya.exe}
+work=${NUNYA_D2_WORK:-}
+[[ -n $work ]] || { echo 'FAIL setup missing-NUNYA_D2_WORK'; exit 1; }
+binary=${NUNYA_D2_NUNYA:-${CARGO_TARGET_DIR:-$here/../../target}/debug/nunya}
+if [[ ! -f $binary && -f $binary.exe ]]; then binary=$binary.exe; fi
+[[ -f $binary ]] || { echo 'FAIL setup missing-nunya-binary'; exit 1; }
 export GOMODCACHE="$work/gomod" GOCACHE="$work/gocache" GOTOOLCHAIN=local GOFLAGS=-mod=mod
 export TEMP="$work/tmp" TMP="$work/tmp" TMPDIR="$work/tmp"
 mkdir -p "$TEMP" "${NUNYA_D2_ROOT:-$work/runs}"
@@ -177,10 +180,10 @@ for scenario in "${expanded[@]}"; do
   fi
   # The trusted CLI emits quoted POSIX exports. Keep exports and bearer private.
   eval "$("$binary" session env "${agent[@]}" --context "$scenario" --format sh 2>"$run/env-$scenario.log" | tr -d '\r')"
-  [[ $PGUSER == session:* && -n $PGPASSWORD ]]
-  export NUNYA_D2_BEARER="nunya.session:${PGUSER#session:}.$PGPASSWORD"
+  [[ $PGUSER == session:* && -n ${NUNYA_SPANNER_BEARER:-} ]]
+  export NUNYA_D2_BEARER="$NUNYA_SPANNER_BEARER"
   scenario_session=${PGUSER#session:}
-  unset PGUSER PGPASSWORD PGHOST PGPORT PGDATABASE
+  unset PGUSER PGPASSWORD PGHOST PGPORT PGDATABASE NUNYA_SPANNER_BEARER
   export NUNYA_D2_REVOKE="$run/revoke-$scenario.sh"
   {
     printf '#!/usr/bin/env bash\nset -euo pipefail\n'

@@ -2,6 +2,8 @@
 set -euo pipefail
 mode=pg
 if [[ ${1:-} == spanner || ${1:-} == private ]]; then mode=$1; shift; fi
+d2=0
+if [[ $mode == spanner && ${1:-} == --d2 ]]; then d2=1; shift; fi
 root=$(mktemp -d)
 nunya_exe=${NUNYA_EXE:-nunya}
 linux_bin=
@@ -10,9 +12,18 @@ while (( $# )); do
     --work-root) root=${2:?missing work root}; shift 2 ;;
     --nunya-exe) nunya_exe=${2:?missing executable}; shift 2 ;;
     --linux-bin) linux_bin=${2:?missing Linux binary}; shift 2 ;;
-    *) echo 'usage: run.sh [spanner|private] [--work-root DIR] [--nunya-exe PATH] [--linux-bin PATH]' >&2; exit 1 ;;
+    *) echo 'usage: run.sh [spanner [--d2]|private] [--work-root DIR] [--nunya-exe PATH] [--linux-bin PATH]' >&2; exit 1 ;;
   esac
 done
+if (( d2 )); then
+  mkdir -p "$root"
+  root=$(cd "$root" && pwd -P)
+  source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  rc=0
+  NUNYA_D2_WORK="$root/d2" bash "$source_dir/spanner/d2.sh" all || rc=1
+  NUNYA_D2_WORK="$root/d2" NUNYA_D2_MUX_RW=off bash "$source_dir/spanner/d2.sh" all || rc=1
+  exit "$rc"
+fi
 mkdir -p "$root"
 root=$(cd "$root" && pwd -P)
 printf 'Work root: %s\n' "$root"

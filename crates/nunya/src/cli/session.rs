@@ -619,9 +619,9 @@ pub async fn rotate(
     println!("The previous secret keeps working until the session expires.");
     Ok(())
 }
-/// PostgreSQL environment values, including the protected password.
+/// Connection environment values, including protected session credentials.
 pub fn pg_env(ctx: &Context) -> Vec<(String, Zeroizing<String>)> {
-    [
+    let mut env: Vec<_> = [
         ("PGHOST", ctx.pg_host.clone()),
         ("PGPORT", ctx.pg_port.to_string()),
         ("PGUSER", format!("session:{}", ctx.session_id)),
@@ -629,7 +629,15 @@ pub fn pg_env(ctx: &Context) -> Vec<(String, Zeroizing<String>)> {
     ]
     .into_iter()
     .map(|(k, v)| (k.into(), Zeroizing::new(v)))
-    .collect()
+    .collect();
+    if ctx.route == "spanner-native" {
+        let mut bearer = Zeroizing::new(String::from("nunya.session:"));
+        bearer.push_str(&ctx.session_id);
+        bearer.push('.');
+        bearer.push_str(&ctx.secret);
+        env.push(("NUNYA_SPANNER_BEARER".into(), bearer));
+    }
+    env
 }
 fn quoted(value: &str, format: EnvFormat) -> Zeroizing<String> {
     Zeroizing::new(match format {
@@ -781,6 +789,35 @@ mod tests {
             isolated: false,
             label: None,
         }
+    }
+    #[test]
+    fn spanner_environment_has_protected_session_bearer() {
+        let mut ctx = context();
+        ctx.route = "spanner-native".into();
+        let env = pg_env(&ctx);
+        let bearer = &env
+            .iter()
+            .find(|(key, _)| key == "NUNYA_SPANNER_BEARER")
+            .unwrap()
+            .1;
+        let mut header = Zeroizing::new(String::from("Bearer "));
+        header.push_str(bearer);
+        let (user, secret) = crate::spanner::auth::parse_authorization(&header).unwrap();
+        assert_eq!(
+            crate::pgwire::auth::parse_session_user(user)
+                .unwrap()
+                .to_hex(),
+            ctx.session_id
+        );
+        assert!(secret == ctx.secret.as_str(), "session credential mismatch");
+        assert!(env.iter().any(|(key, _)| key == "PGPASSWORD"));
+        assert!(!format!("{ctx:?}").contains(ctx.secret.as_str()));
+    }
+    #[test]
+    fn postgres_environment_has_no_spanner_bearer() {
+        let env = pg_env(&context());
+        assert_eq!(env.len(), 4);
+        assert!(!env.iter().any(|(key, _)| key == "NUNYA_SPANNER_BEARER"));
     }
     #[test]
     fn rotation_requires_locally_stored_parameters() -> Result<(), Box<dyn std::error::Error>> {
