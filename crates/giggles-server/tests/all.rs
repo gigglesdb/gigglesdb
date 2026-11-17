@@ -61,6 +61,8 @@ mod in_subquery_authority;
 mod multi_statement_network;
 #[path = "pg_dump_preamble_network.rs"]
 mod pg_dump_preamble_network;
+#[path = "pgwire_pipelined_reply.rs"]
+mod pgwire_pipelined_reply;
 #[path = "postgresql_network.rs"]
 mod postgresql_network;
 #[path = "primary_key_update_network.rs"]

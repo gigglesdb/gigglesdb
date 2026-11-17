@@ -59,6 +59,7 @@ pub async fn serve_postgresql_bound(
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                 incoming = socket.accept() => {
                     let (socket, peer) = incoming?;
+                    crate::transport::no_delay(&socket);
                     let Some(shared) = service.admission.connect() else { continue; };
                     let Ok(permit) = sem.clone().try_acquire_owned() else { continue; };
                     let service = service.clone();

@@ -105,6 +105,7 @@ async fn serve_bound(
                 Some(_) = sockets.join_next(), if !sockets.is_empty() => {},
                 incoming = listener.accept() => {
                     let (socket, _) = incoming?;
+                    crate::transport::no_delay(&socket);
                     let Some(shared) = runtime.service().admission.connect() else { continue; };
                     let Ok(local) = cap.clone().try_acquire_owned() else { continue; };
                     let runtime = runtime.clone();

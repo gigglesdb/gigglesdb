@@ -2147,7 +2147,36 @@ async fn agent_refusal<S: AsyncWrite + Unpin>(s: &mut S) -> io::Result<()> {
     send(s, &out).await
 }
 
+/// Serves one pgwire session through a write buffer. Replies to messages the
+/// client has already pipelined behind are held back and leave in one write
+/// with the next flushed reply (Sync, Query, Flush, or the reply after which
+/// no client byte is waiting), as PostgreSQL does. Wire bytes are unchanged.
 pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut S,
+    session: Session,
+    startup: crate::pgwire_startup::Startup,
+    authenticated_already: bool,
+    extra_status: &[(&str, String)],
+) -> io::Result<()> {
+    let mut s = tokio::io::BufWriter::with_capacity(16 * 1024, s);
+    let served =
+        serve_buffered(&mut s, session, startup, authenticated_already, extra_status).await;
+    // Deliver any held reply before the connection closes.
+    let _ = timeout(IO_TIMEOUT, s.flush()).await;
+    served
+}
+
+/// The next client message tag, if its first byte is already readable.
+async fn ready_tag<S: AsyncRead + Unpin>(s: &mut S) -> Option<io::Result<u8>> {
+    let mut read = std::pin::pin!(s.read_u8());
+    std::future::poll_fn(|cx| match read.as_mut().poll(cx) {
+        std::task::Poll::Ready(tag) => std::task::Poll::Ready(Some(tag)),
+        std::task::Poll::Pending => std::task::Poll::Ready(None),
+    })
+    .await
+}
+
+async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
     mut session: Session,
     startup: crate::pgwire_startup::Startup,
@@ -2484,6 +2513,31 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             return Ok(());
+        }
+        // Hold this reply while the client has already pipelined its next
+        // message (Parse/Bind/Describe/Execute before Sync). Sync, Query and
+        // Flush always flush, as does every other send.
+        if !matches!(tag, b'S' | b'Q' | b'H') {
+            let next = match pending_tag {
+                Some(_) => Some(Ok(0)),
+                None => ready_tag(s).await,
+            };
+            match next {
+                Some(Ok(next)) => {
+                    if pending_tag.is_none() {
+                        pending_tag = Some(next);
+                    }
+                    timeout(IO_TIMEOUT, s.write_all(&response))
+                        .await
+                        .map_err(io::Error::other)??;
+                    continue;
+                }
+                Some(Err(_)) => {
+                    send(s, &response).await?;
+                    return Ok(());
+                }
+                None => {}
+            }
         }
         send(s, &response).await?;
     }

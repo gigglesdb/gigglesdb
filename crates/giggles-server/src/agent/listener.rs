@@ -145,6 +145,7 @@ pub async fn serve_agent_pg_bound(
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                 incoming = listener.accept() => {
                     let (mut socket, _) = incoming?;
+                    crate::transport::no_delay(&socket);
                     let Some(shared) = service.admission.connect() else { continue };
                     let Ok(permit) = sem.clone().try_acquire_owned() else { continue };
                     let accept = accept.clone();

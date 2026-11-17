@@ -12,6 +12,13 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream};
 pub const MAX_FRAME: usize = 256 * 1024;
 pub const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Turns off Nagle on a server or client TCP socket. Replies leave as several
+/// small writes (pgwire message by message, TLS records, frame header then
+/// body); with Nagle on, each one after the first waits for the peer's delayed
+/// ACK, about 40 ms on Linux. Best effort: a failure only costs latency.
+pub fn no_delay(socket: &TcpStream) {
+    let _ = socket.set_nodelay(true);
+}
 pub fn frame_len(n: u32, max: usize) -> io::Result<usize> {
     let n = usize::try_from(n).map_err(io::Error::other)?;
     if n == 0 || n > max {
@@ -157,6 +164,7 @@ async fn serve_listener(
                 Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
                 incoming=listener.accept()=>{
                     let (mut socket,_)=incoming?;
+                    no_delay(&socket);
                     let Some(shared)=service.admission.connect() else {continue};
                     let Ok(permit)=sem.clone().try_acquire_owned() else {continue};
                     let accept=accept.clone();let service=service.clone();
@@ -221,6 +229,7 @@ impl Client {
         let name = ServerName::try_from(name.to_owned()).map_err(io::Error::other)?;
         let stream = timeout(IO_TIMEOUT, async {
             let socket = TcpStream::connect(address).await?;
+            no_delay(&socket);
             TlsConnector::from(config).connect(name, socket).await
         })
         .await
