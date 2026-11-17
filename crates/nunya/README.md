@@ -4,7 +4,7 @@
 
 Nunya is a separate database entry point for AI agents. Applications keep their existing direct database connections, connection strings and drivers. Agents use their own endpoint and access-session credentials; Nunya connects upstream with its own least-privilege role (`[upstream] user`) and replaces protected values with session-scoped tokens. Agents can carry tokens between approved columns without seeing the underlying values. Masked columns return a placeholder or SQL NULL. Unanalysable operations fail closed.
 
-`nunya serve --config <path>` starts the configured routes and snapshot refresh; the service also starts the admin endpoint. Upstream TLS supports `disable`, `require` (encrypted, accepts any certificate), and `verify-full` (hostname verification against `ca_file` as the only trust root). Set `upstream.dialect` to `postgres` (default) or `spanner-pg` for Google PGAdapter. `max_connections` defaults to 256 and permits 1 through 10000 concurrent agent connections. Policies reload across both routes through the admin endpoint or Unix SIGHUP; invalid policies retain the current policy. Optional `policy_watch_ms` (100 through 3600000) polls for changes and waits for two identical consecutive reads before attempting a reload. `GET /status` reports the applied policy hash, timestamps and last reload outcome. Failed or unsafe snapshot refreshes retain the old snapshot until its age causes NY008 refusals. Ctrl-C or SIGTERM stops accepting and allows sessions up to 30 seconds to drain.
+`nunya serve --config <path>` starts the configured routes and snapshot refresh; the service also starts the admin endpoint. Upstream TLS supports `disable`, `require` (encrypted, accepts any certificate), and `verify-full` (hostname verification against `ca_file` as the only trust root). Set `upstream.dialect` to `postgres` (default) or `spanner-pg` for Google PGAdapter. `max_connections` defaults to 256 and permits 1 through 10000 concurrent agent connections. The admin endpoint and Unix SIGHUP attempt each distinct policy file independently; a rejected file leaves only its routes on their last good policy. Routes sharing a file reload together after validation against all their catalogs. Optional `policy_watch_ms` (100 through 3600000) polls every policy file separately and waits for two identical consecutive changed hashes before attempting a reload. `GET /status` reports one line per configured route with its applied policy hash, timestamps and last reload outcome. Failed or unsafe snapshot refreshes retain the old snapshot until its age causes NY008 refusals. Ctrl-C or SIGTERM stops accepting and allows sessions up to 30 seconds to drain.
 
 ## Threat model
 
@@ -86,6 +86,34 @@ nunya session revoke --server http://127.0.0.1:6481 --principal reporting-agent 
 
 See [operations](site/docs/operations.html) for revocation, private-network reachability and recovery. A state restore can bring back revoked sessions: revoke all sessions or disable affected principals before serving traffic after any restore.
 
+## Per-route policies
+
+Each route accepts its own `policy` path; relative paths resolve against the configuration file's directory. The optional top-level `policy` is the fallback for routes without their own key:
+
+```toml
+policy = "policy.toml"          # optional fallback for routes without their own
+
+[upstream]
+policy = "pg-policy.toml"       # PostgreSQL route validates only against the PG catalog
+# ...
+
+[spanner_native]
+policy = "spanner-policy.toml"  # native Spanner route validates only against its catalog
+# ...
+```
+
+These are configuration fragments; add the remaining route settings. A configured route without an effective policy fails startup with `upstream.policy: required path missing (no service-level policy)` or `spanner_native.policy: required path missing (no service-level policy)`. Unknown keys are refused. To use the old single-policy behavior, point both routes to the same file, directly or through the fallback. Files with the same canonical path form one reload unit. `policy_watch_ms` stays top-level and applies to every file. Each route validates its policy only against its own catalog, including during `nunya policy check`, so a column present on only one route can be protected there.
+
+| Per route | Shared by the service |
+| --- | --- |
+| Column treatments, domain definitions and tokenize limits, `snapshot_max_age_ms`, validation, reload outcome and policy revision | Read log (must match), state store, sessions/principals and explicit-tokenize counters |
+
+Principal tokenize counters are keyed by principal and domain name: the same domain name on two routes shares a count. Each route enforces its own limit against that count, and whichever route opens a principal window sets its length. Per-session counters belong to one session, which belongs to one route. Use different domain names to keep route counters independent.
+
+Every file must name the same `[readlog]` sink for statement, lifecycle and management records; startup refuses a mismatch with `policy files name different read logs`. With multiple policy files, a reload that changes the sink is rejected for that file. To move the log, update all files and restart. A single shared file may still change the sink on reload.
+
+`policy_revision` is the SHA-256 of the route's own policy file. Statement records and management session views carry the session route's revision. Management `GET /v1/status` returns `policy_revisions`, an object mapping route IDs to revisions (null if unavailable), instead of `policy_revision`; `config_revision` is unchanged. Admin status fields and route-labeled metrics are documented in [operations](site/docs/operations.html#reload).
+
 ## Policy reference
 
 ```toml
@@ -165,11 +193,12 @@ database = "projects/my-project/instances/my-instance/databases/my-database"
 ```
 
 The native route can run alone (omit `[upstream]` and top-level `listen`) or beside
-the PostgreSQL route. At least one route is required. Both use the same policy,
-root key, durable session store, principals and inbound TLS certificate/key files.
-`policy check` validates the policy against every configured route's catalog.
-Admin reload and Unix SIGHUP reload both routes together after validation against
-every current catalog. Native catalog snapshots still refresh periodically.
+the PostgreSQL route. At least one route is required. Both share the root key,
+durable session store, principals and inbound TLS certificate/key files; each
+route may select its own policy. `policy check` validates each route's policy
+against its own catalog. Admin reload and Unix SIGHUP attempt each distinct file
+independently; routes sharing one file reload together after validation against
+all their catalogs. Native catalog snapshots still refresh periodically.
 
 Agents supply `Authorization: Bearer nunya.session:<32 hex>.<secret>` metadata
 using access-session credentials. Principal credentials authenticate only to the

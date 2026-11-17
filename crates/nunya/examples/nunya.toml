@@ -1,14 +1,16 @@
 listen = "127.0.0.1:6432"
 admin_listen = "127.0.0.1:6480"
-policy = "policy.toml"
+policy = "policy.toml" # Optional fallback for routes without their own policy key.
 state_dir = "state"
 schemas = ["public"]
 search_path = ["public"]
 snapshot_refresh_ms = 30000
+# policy_watch_ms is top-level and watches every distinct policy file independently.
 max_connections = 256
 allow_plaintext = true
 # Supply NUNYA_ROOT_KEY and NUNYA_UPSTREAM_PASSWORD in the environment.
 [upstream]
+# policy = "pg-policy.toml" # Optional override; relative to this config file.
 dialect = "postgres" # Use "spanner-pg" for Google PGAdapter.
 host = "127.0.0.1"
 port = 16432
@@ -18,8 +20,10 @@ tls = "disable"
 connect_timeout_ms = 5000
 application_name = "nunya"
 
+# All policy files must name the same read-log sink; shared files reload together.
 # Optional native GoogleSQL route; omit the upstream section and top-level listen for native only.
 # [spanner_native]
+# policy = "spanner-policy.toml" # Optional override; validates only against this route catalog.
 # listen = "127.0.0.1:6433"
 # database = "projects/my-project/instances/my-instance/databases/my-database"
 # emulator_endpoint = "http://127.0.0.1:9010" # Trusted local emulator only.
