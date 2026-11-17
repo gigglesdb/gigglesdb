@@ -710,3 +710,849 @@ pub async fn ordinary_wire(
     .await;
     (listener, wire)
 }
+
+/// The parity harness (GD-0061 R3-1001): one worked-example server with every
+/// listener up, and one request run on four agent surfaces (pgwire simple,
+/// pgwire extended, HTTP JSON and gRPC), each answer reduced to [`Observed`].
+pub mod parity {
+    use super::{
+        Msg, TestCert, Wire, binding, certificate, connect_raw, now_ms, scratch, timestamptz,
+    };
+    use bytes::Bytes;
+    use giggles_core::{
+        Admin, Engine, Limits,
+        relational::Value as SqlValue,
+        roles::{NewRole, TablePrivilege},
+        task::{
+            Budget, DenyRule, StatementClass, TaskError,
+            definition::WallClockMs,
+            statements::{TaskStatement, parse},
+        },
+    };
+    use giggles_server::{
+        Binding, Role, Running, Service,
+        admission::ServiceLimits,
+        agent::serve_agent_pg_bound,
+        api::{
+            ApiLimits, ApiRuntime, json as wire_json,
+            net::{serve_grpc_bound, serve_http_bound},
+            proto,
+        },
+        auth::{PostgresqlConfig, TlsMode, scram::Verifier, serve_postgresql},
+        clock::Clock,
+        serve_bound, serve_pg_bound, tls,
+    };
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::rt::TokioIo;
+    use rustls::{
+        ServerConfig,
+        pki_types::{PrivatePkcs8KeyDer, ServerName},
+    };
+    use serde_json::{Value, json};
+    use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::watch,
+    };
+    use tokio_postgres::{Client, NoTls, config::SslMode};
+    use tokio_rustls::TlsConnector;
+    use tonic::transport::{Certificate as CaCertificate, Channel, ClientTlsConfig, Identity};
+
+    pub const TASK: &str = "inc-436";
+    pub const TABLE: &str = "shipments";
+    pub const CONTROLLER: &str = "incident_controller";
+    pub const EXECUTOR: &str = "repair_agent";
+    pub const APPROVER: &str = "oncall_lead";
+    pub const APP: &str = "delivery_app";
+    pub const CONTROLLER_PW: &str = "controller-pw";
+    pub const EXECUTOR_PW: &str = "agent-pw";
+    pub const APPROVER_PW: &str = "lead-pw";
+    pub const APP_PW: &str = "app-pw";
+    /// The native text language version the cases are written in.
+    pub const LANGUAGE: &str = "0.16";
+    /// The spec's incident window (section 3, allowed write old row).
+    pub const INCIDENT_START: &str = "2026-11-05 17:00:00+00";
+    pub const INCIDENT_END: &str = "2026-11-05 17:07:00+00";
+    const INCIDENT_START_MS: i64 = 1_793_898_000_000;
+    /// Merchant 42 has failed rows inside the window (ids 1..=31); merchant
+    /// 43 has failed rows (ids 1..=40) outside the task's visible rows.
+    pub const MERCHANT_42_ROWS: usize = 31;
+    pub const MERCHANT_43_ROWS: usize = 40;
+
+    /// The worked-example schema (`deliveries` is reserved, so `shipments`).
+    const SCHEMA: &str = "CREATE TABLE shipments (merchant_id bigint, id bigint, status text, \
+         failed_at timestamptz, attempt_count int, customer_email text, card_token text, \
+         PRIMARY KEY (merchant_id, id))";
+
+    /// Spec section 3's values as a CREATE TASK statement.
+    pub fn inc_436_sql(expires: &str) -> String {
+        format!(
+            "CREATE TASK \"{TASK}\" \
+               EXECUTOR {EXECUTOR} APPROVER {APPROVER} \
+               ON {TABLE} \
+               VISIBLE ROWS WHERE (merchant_id = 42) \
+               READABLE (id, status, failed_at, attempt_count) \
+               MASKED (customer_email) \
+               ALLOW UPDATE (status) \
+                 OLD ROW WHERE (status = 'failed' AND failed_at >= '{INCIDENT_START}' \
+                                AND failed_at < '{INCIDENT_END}') \
+                 NEW ROW WHERE (status = 'queued') \
+                 AT MOST 25 DISTINCT ROWS AND 25 TRANSITIONS \
+                 APPROVE ABOVE 5 \
+               DISCLOSE AT MOST 1000 ROWS READ, 2097152 BYTES RETURNED \
+               WITH (statement_ms = 2000, rows_scanned = 100000, concurrent_statements = 2) \
+               EXPIRES '{expires}'"
+        )
+    }
+
+    /// The next 17:30Z at least an hour after `now` (spec section 3).
+    pub fn next_1730z(now: i64) -> i64 {
+        const DAY: i64 = 86_400_000;
+        let at = now.div_euclid(DAY) * DAY + 17 * 3_600_000 + 30 * 60_000;
+        if at < now + 3_600_000 { at + DAY } else { at }
+    }
+
+    fn seed() -> String {
+        let mut rows = Vec::new();
+        for i in 0..MERCHANT_42_ROWS {
+            let id = i as i64 + 1;
+            rows.push(format!(
+                "(42, {id}, 'failed', '{}', {}, 'customer{id}@example.com', 'tok_42_{id}')",
+                timestamptz(INCIDENT_START_MS + i as i64 * 10_000),
+                1 + i % 3
+            ));
+        }
+        for i in 0..MERCHANT_43_ROWS {
+            let id = i as i64 + 1;
+            rows.push(format!(
+                "(43, {id}, 'failed', '{}', 1, 'buyer{id}@example.com', 'tok_43_{id}')",
+                timestamptz(INCIDENT_START_MS + (i % MERCHANT_42_ROWS) as i64 * 10_000)
+            ));
+        }
+        format!("INSERT INTO {TABLE} VALUES {}", rows.join(", "))
+    }
+
+    /// The four agent surfaces of one request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Surface {
+        PgSimple,
+        PgExtended,
+        HttpText,
+        GrpcText,
+    }
+
+    impl Surface {
+        pub const ALL: [Surface; 4] = [
+            Surface::PgSimple,
+            Surface::PgExtended,
+            Surface::HttpText,
+            Surface::GrpcText,
+        ];
+    }
+
+    /// The native form of a case: native text, or a whole request body for
+    /// the forms native text has no words for (such as `taskOutcome`).
+    #[derive(Clone, Debug)]
+    pub enum Native {
+        Text(String),
+        Request(Value),
+    }
+
+    /// One request in its SQL form and its native form. `operation_id` is
+    /// sent as `operationId` on HTTP and gRPC; the SQL form carries its ID in
+    /// its own text (`OPERATION '<id>' ...`, `SHOW OPERATION '<id>'`).
+    #[derive(Clone, Debug)]
+    pub struct Case {
+        pub sql: String,
+        pub native: Native,
+        pub operation_id: Option<String>,
+    }
+
+    impl Case {
+        /// The same request as SQL and as native text, with no operation ID.
+        pub fn new(sql: impl Into<String>, text: impl Into<String>) -> Self {
+            Self {
+                sql: sql.into(),
+                native: Native::Text(text.into()),
+                operation_id: None,
+            }
+        }
+
+        /// A protected write under `op`: `OPERATION '<op>' <sql>`, and the
+        /// native text with `operationId`.
+        pub fn write(op: &str, sql: &str, text: impl Into<String>) -> Self {
+            Self {
+                sql: format!("OPERATION '{op}' {sql}"),
+                native: Native::Text(text.into()),
+                operation_id: Some(op.into()),
+            }
+        }
+
+        /// The outcome lookup of `op`: `SHOW OPERATION '<op>'` and
+        /// `taskOutcome`.
+        pub fn outcome(op: &str) -> Self {
+            Self {
+                sql: format!("SHOW OPERATION '{op}'"),
+                native: Native::Request(json!({"taskOutcome": {}})),
+                operation_id: Some(op.into()),
+            }
+        }
+
+        /// The HTTP JSON body of the native form. gRPC sends the same
+        /// request, converted by the server's own JSON decoder.
+        pub fn native_body(&self) -> Value {
+            let mut body = match &self.native {
+                Native::Text(text) => {
+                    json!({"text": {"text": text, "languageVersion": LANGUAGE}})
+                }
+                Native::Request(request) => request.clone(),
+            };
+            if let Some(op) = &self.operation_id {
+                body["operationId"] = json!(op);
+            }
+            body
+        }
+    }
+
+    /// What one surface answered, reduced to what every surface can say.
+    ///
+    /// - `sqlstate`: `None` on success.
+    /// - `task_error`, `message`: set for a task refusal only. pgwire has no
+    ///   name field: its name is that of the `TaskError` whose SQLSTATE and
+    ///   fixed message the ErrorResponse carries, and its message is kept
+    ///   only then (native sends `message` for task refusals only).
+    /// - `rows`: values as PostgreSQL text (`None` is NULL).
+    /// - `affected`: the row count of a write that returns no columns
+    ///   (`UPDATE n`); `None` for any result with columns (a read, SHOW or
+    ///   RETURNING, whose rows say it) and for errors. Native fills its
+    ///   `affected` for row results too, so only this reading is common.
+    /// - `transport`: an HTTP status other than 200/201, or a gRPC status
+    ///   other than OK (pgwire reports through SQLSTATE instead).
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Observed {
+        pub sqlstate: Option<String>,
+        pub task_error: Option<String>,
+        pub message: Option<String>,
+        pub columns: Vec<String>,
+        pub rows: Vec<Vec<Option<String>>>,
+        pub affected: Option<u64>,
+        pub transport: Option<String>,
+    }
+
+    /// Every named task error, for reading a pgwire ErrorResponse back.
+    fn task_errors() -> Vec<TaskError> {
+        let mut all = vec![
+            TaskError::ApprovalRequired,
+            TaskError::ApprovalStale,
+            TaskError::Revoked,
+            TaskError::Expired,
+            TaskError::OperationConflict,
+            TaskError::OperationIdRequired,
+            TaskError::Retry,
+        ];
+        all.extend(DenyRule::ALL.map(TaskError::Denied));
+        all.extend(Budget::ALL.map(TaskError::BudgetExceeded));
+        all.extend(StatementClass::ALL.map(TaskError::NotAllowedInTaskSession));
+        all
+    }
+
+    /// The task error name a SQLSTATE and message identify, if any.
+    pub fn task_error_name(sqlstate: &str, message: &str) -> Option<&'static str> {
+        task_errors()
+            .into_iter()
+            .find(|e| e.sqlstate() == sqlstate && e.message() == message)
+            .and_then(|e| e.name())
+    }
+
+    /// The row count of a write's CommandComplete tag.
+    fn tag_count(tag: &str) -> Option<u64> {
+        let mut words = tag.split_whitespace();
+        match words.next()? {
+            "UPDATE" | "DELETE" | "INSERT" | "MERGE" => words.last()?.parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// A pgwire exchange as [`Observed`].
+    pub fn observe_pg(messages: &[Msg]) -> Observed {
+        let mut observed = Observed::default();
+        for message in messages {
+            match message {
+                Msg::Columns(names) => observed.columns = names.clone(),
+                Msg::Row(values) => observed.rows.push(values.clone()),
+                Msg::Complete(tag) => observed.affected = tag_count(tag),
+                Msg::Error { code, message } if observed.sqlstate.is_none() => {
+                    observed.sqlstate = Some(code.clone());
+                    if let Some(name) = task_error_name(code, message) {
+                        observed.task_error = Some(name.into());
+                        observed.message = Some(message.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if observed.sqlstate.is_some() || !observed.columns.is_empty() {
+            observed.affected = None;
+        }
+        observed
+    }
+
+    /// A native value as PostgreSQL text.
+    fn native_text(value: &Value) -> Option<String> {
+        let (kind, inner) = value
+            .as_object()
+            .and_then(|o| o.iter().next())
+            .unwrap_or_else(|| panic!("native value {value}"));
+        match kind.as_str() {
+            "nullValue" => None,
+            "boolValue" => Some(if inner.as_bool().unwrap() { "t" } else { "f" }.into()),
+            "intValue" | "textValue" | "numericValue" => Some(
+                inner
+                    .as_str()
+                    .map_or_else(|| inner.to_string(), str::to_owned),
+            ),
+            "bytesValue" => {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                let bytes = STANDARD.decode(inner.as_str().unwrap()).unwrap();
+                Some(format!(
+                    "\\x{}",
+                    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                ))
+            }
+            other => panic!("the harness does not render native {other} yet: {value}"),
+        }
+    }
+
+    /// A native reply (HTTP JSON, or gRPC shown as JSON) as [`Observed`].
+    pub fn observe_native(reply: &Value) -> Observed {
+        let code = reply["code"].as_str().unwrap_or_else(|| panic!("{reply}"));
+        let text = |key: &str| reply.get(key).and_then(Value::as_str).map(str::to_owned);
+        let mut observed = Observed {
+            sqlstate: (code != "ok").then(|| code.to_owned()),
+            task_error: text("taskError"),
+            message: text("message"),
+            ..Observed::default()
+        };
+        if observed.sqlstate.is_some() {
+            return observed;
+        }
+        let Some(result) = reply.get("sql").or_else(|| reply.get("operationOutcome")) else {
+            return observed;
+        };
+        observed.columns = result["columns"]
+            .as_array()
+            .map(|c| c.iter().map(|c| c.as_str().unwrap().to_owned()).collect())
+            .unwrap_or_default();
+        observed.rows = result["rows"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        row["values"]
+                            .as_array()
+                            .map(|v| v.iter().map(native_text).collect())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // proto3 JSON leaves out a zero count.
+        if observed.columns.is_empty() {
+            observed.affected = Some(result.get("affected").map_or(0, |n| {
+                n.as_str()
+                    .map_or_else(|| n.as_u64(), |n| n.parse().ok())
+                    .unwrap_or_else(|| panic!("affected {n}"))
+            }));
+        }
+        observed
+    }
+
+    /// One HTTP/1.1 call over mTLS: the status and the JSON body (`Null`
+    /// when there is none).
+    pub async fn http_call(
+        address: SocketAddr,
+        (ca, cert): (&TestCert, &TestCert),
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let config = tls::client(
+                vec![cert.cert.der().clone()],
+                PrivatePkcs8KeyDer::from(cert.key.serialize_der()).into(),
+                vec![ca.cert.der().clone()],
+            )
+            .unwrap();
+            let mut config = (*config).clone();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let socket = TcpStream::connect(address).await.unwrap();
+            let stream = TlsConnector::from(Arc::new(config))
+                .connect(ServerName::try_from("localhost").unwrap(), socket)
+                .await
+                .unwrap();
+            let mut request = hyper::Request::builder()
+                .method(method)
+                .uri(format!("https://localhost:{}{path}", address.port()))
+                .header("host", "localhost");
+            if body.is_some() {
+                request = request.header("content-type", "application/json");
+            }
+            if let Some(token) = token {
+                request = request.header("x-giggles-session", token);
+            }
+            let bytes = body.map_or_else(Vec::new, |b| serde_json::to_vec(b).unwrap());
+            let request = request.body(Full::new(Bytes::from(bytes))).unwrap();
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .unwrap();
+            let task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let response = sender.send_request(request).await.unwrap();
+            let status = response.status().as_u16();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            task.abort();
+            let _ = task.await;
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            )
+        })
+        .await
+        .expect("HTTP call finished")
+    }
+
+    /// A gRPC client over mTLS presenting `cert`.
+    pub async fn grpc_client(
+        address: SocketAddr,
+        ca: &TestCert,
+        cert: &TestCert,
+    ) -> proto::giggles_client::GigglesClient<Channel> {
+        let channel = Channel::from_shared(format!("https://127.0.0.1:{}", address.port()))
+            .unwrap()
+            .tls_config(
+                ClientTlsConfig::new()
+                    .domain_name("localhost")
+                    .ca_certificate(CaCertificate::from_pem(ca.cert.pem()))
+                    .identity(Identity::from_pem(
+                        cert.cert.pem(),
+                        cert.key.serialize_pem(),
+                    )),
+            )
+            .unwrap()
+            .connect_timeout(Duration::from_secs(10))
+            .connect()
+            .await
+            .unwrap();
+        proto::giggles_client::GigglesClient::new(channel)
+            .max_decoding_message_size(giggles_server::MAX_RESPONSE)
+    }
+
+    /// A gRPC request carrying the session token.
+    pub fn with_session<T>(token: &str, message: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        request
+            .metadata_mut()
+            .insert("x-giggles-session", token.parse().unwrap());
+        request
+    }
+
+    /// A transport status as [`Observed`].
+    fn refused(transport: String) -> Observed {
+        Observed {
+            transport: Some(transport),
+            ..Observed::default()
+        }
+    }
+
+    /// `user` with `password` on a PostgreSQL password listener.
+    pub async fn connect_password(
+        address: SocketAddr,
+        user: &str,
+        password: &str,
+    ) -> Result<Client, tokio_postgres::Error> {
+        let (client, connection) = tokio_postgres::Config::new()
+            .host("localhost")
+            .hostaddr(address.ip())
+            .port(address.port())
+            .user(user)
+            .password(password)
+            .dbname("postgres")
+            .ssl_mode(SslMode::Disable)
+            .connect_timeout(Duration::from_secs(5))
+            .connect(NoTls)
+            .await?;
+        tokio::spawn(connection);
+        Ok(client)
+    }
+
+    /// The startup parameters of `repair_agent`'s task session.
+    pub const AGENT_STARTUP: &[(&str, &str)] = &[
+        ("user", EXECUTOR),
+        ("database", "giggles"),
+        ("giggles.task", TASK),
+    ];
+
+    /// The parity fixture: a v2 database with the worked example, and every
+    /// listener of one service.
+    ///
+    /// - `postgresql`: the PostgreSQL password listener (SCRAM, no TLS) for
+    ///   `incident_controller`, `oncall_lead` and `delivery_app`;
+    /// - `legacy_pg`, `native`, `http`, `grpc`: the certificate listeners,
+    ///   where `app` is bound to `delivery_app`;
+    /// - `agent_pg`, `agent_http`, `agent_grpc`: the agent listeners, where
+    ///   `agent` is bound to `repair_agent` for `inc-436`.
+    pub struct ParityFixture {
+        pub admin: Admin,
+        pub service: Arc<Service>,
+        pub ca: TestCert,
+        pub server_cert: TestCert,
+        pub agent: TestCert,
+        pub app: TestCert,
+        pub tls: Arc<ServerConfig>,
+        pub ordinary_api: Arc<ApiRuntime>,
+        pub agent_api: Arc<ApiRuntime>,
+        pub postgresql: Running,
+        pub legacy_pg: Running,
+        pub native: Running,
+        pub http: Running,
+        pub grpc: Running,
+        pub agent_pg: Running,
+        pub agent_http: Running,
+        pub agent_grpc: Running,
+        /// `inc-436`'s expiry, Unix ms.
+        pub expires_ms: i64,
+    }
+
+    impl ParityFixture {
+        /// The database, roles and rows, every listener, then `inc-436`.
+        pub async fn start() -> Self {
+            let path = scratch("agent-parity").join("db");
+            let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+            let mut session = admin.sql_session();
+            session.execute(SCHEMA, &[], None).unwrap();
+            session.execute(&seed(), &[], None).unwrap();
+            drop(session);
+            let roles = admin.roles();
+            for (name, task_only, password) in [
+                (CONTROLLER, false, CONTROLLER_PW),
+                (APPROVER, false, APPROVER_PW),
+                (APP, false, APP_PW),
+                (EXECUTOR, true, EXECUTOR_PW),
+            ] {
+                roles
+                    .create(NewRole {
+                        name: name.into(),
+                        login: true,
+                        password: Some(Verifier::generate(password)),
+                        ..NewRole::default()
+                    })
+                    .unwrap();
+                if task_only {
+                    roles.set_task_only(name, true).unwrap();
+                }
+            }
+            use TablePrivilege::{Insert, Select, Update};
+            for (name, privileges) in [
+                (CONTROLLER, &[Select, Update][..]),
+                // Spec section 14: SELECT and UPDATE (status).
+                (EXECUTOR, &[Select, Update][..]),
+                (APPROVER, &[Select, Update][..]),
+                (APP, &[Select, Insert, Update][..]),
+            ] {
+                roles.grant_table(TABLE, name, privileges).unwrap();
+            }
+
+            let ca = certificate(None, false);
+            let server_cert = certificate(Some(&ca), true);
+            let agent = certificate(Some(&ca), false);
+            let app = certificate(Some(&ca), false);
+            let tls = tls::server(
+                vec![server_cert.cert.der().clone()],
+                PrivatePkcs8KeyDer::from(server_cert.key.serialize_der()).into(),
+                vec![ca.cert.der().clone()],
+            )
+            .unwrap();
+            let service = Service::with_agent(
+                admin.clone(),
+                vec![Binding {
+                    fingerprint: app.fingerprint(),
+                    role: Role::Database { name: APP.into() },
+                }],
+                vec![binding(&agent, EXECUTOR, &[TASK])],
+                Clock::new(0, 3600).unwrap(),
+                ServiceLimits::default(),
+            )
+            .unwrap();
+
+            let config = PostgresqlConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                tls: TlsMode::Disabled,
+                certificate: None,
+                private_key: None,
+                client_ca: None,
+                certificates: BTreeMap::new(),
+                databases: vec!["postgres".into()],
+                loopback_trust: false,
+                connections: 32,
+            };
+            let listener = config.build().unwrap();
+            let postgresql = serve_postgresql(config.listen, service.clone(), Arc::new(listener))
+                .await
+                .unwrap();
+            let (_open, gate) = watch::channel(true);
+            let bind = || async { TcpListener::bind("127.0.0.1:0").await.unwrap() };
+            let legacy_pg =
+                serve_pg_bound(bind().await, service.clone(), tls.clone(), 16, gate.clone())
+                    .await
+                    .unwrap();
+            let native = serve_bound(bind().await, service.clone(), tls.clone(), 16, gate.clone())
+                .await
+                .unwrap();
+            let ordinary_api = ApiRuntime::new(service.clone(), ApiLimits::default()).unwrap();
+            let agent_api = ApiRuntime::new_agent(service.clone(), ApiLimits::default()).unwrap();
+            let http = serve_http_bound(
+                bind().await,
+                ordinary_api.clone(),
+                tls.clone(),
+                16,
+                gate.clone(),
+            )
+            .await
+            .unwrap();
+            let grpc = serve_grpc_bound(
+                bind().await,
+                ordinary_api.clone(),
+                tls.clone(),
+                16,
+                gate.clone(),
+            )
+            .await
+            .unwrap();
+            let agent_pg = serve_agent_pg_bound(
+                bind().await,
+                service.clone(),
+                tls.clone(),
+                16,
+                vec!["giggles".into()],
+                gate.clone(),
+            )
+            .await
+            .unwrap();
+            let agent_http = serve_http_bound(
+                bind().await,
+                agent_api.clone(),
+                tls.clone(),
+                16,
+                gate.clone(),
+            )
+            .await
+            .unwrap();
+            let agent_grpc =
+                serve_grpc_bound(bind().await, agent_api.clone(), tls.clone(), 16, gate)
+                    .await
+                    .unwrap();
+            let fixture = Self {
+                admin,
+                service,
+                ca,
+                server_cert,
+                agent,
+                app,
+                tls,
+                ordinary_api,
+                agent_api,
+                postgresql,
+                legacy_pg,
+                native,
+                http,
+                grpc,
+                agent_pg,
+                agent_http,
+                agent_grpc,
+                expires_ms: next_1730z(now_ms()),
+            };
+            fixture.create_inc_436();
+            fixture
+        }
+
+        /// `CREATE TASK "inc-436"` as `incident_controller`. The PostgreSQL
+        /// listener has no route for CREATE TASK yet, so the statement goes
+        /// through core's task parser and `Admin::tasks()`, as R3-901 does.
+        pub fn create_inc_436(&self) {
+            let sql = inc_436_sql(&timestamptz(self.expires_ms));
+            let Some(TaskStatement::Create(new)) = parse(&sql) else {
+                panic!("CREATE TASK did not parse: {sql}");
+            };
+            let issuer = self.admin.roles().get(CONTROLLER).unwrap().unwrap();
+            self.admin
+                .tasks()
+                .create(&issuer, *new, WallClockMs(now_ms()))
+                .unwrap();
+        }
+
+        pub async fn stop(self) {
+            for listener in [
+                self.postgresql,
+                self.legacy_pg,
+                self.native,
+                self.http,
+                self.grpc,
+                self.agent_pg,
+                self.agent_http,
+                self.agent_grpc,
+            ] {
+                listener.shutdown().await.unwrap();
+            }
+            self.ordinary_api.shutdown().await;
+            self.agent_api.shutdown().await;
+        }
+
+        /// Runs `sql` as the administrator and returns its rows.
+        pub fn sql(&self, sql: &str) -> Vec<Vec<SqlValue>> {
+            self.admin
+                .sql_session()
+                .execute(sql, &[], None)
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row.values)
+                .collect()
+        }
+
+        /// `user` with `password` on the PostgreSQL password listener.
+        pub async fn password(
+            &self,
+            user: &str,
+            password: &str,
+        ) -> Result<Client, tokio_postgres::Error> {
+            connect_password(self.postgresql.address, user, password).await
+        }
+
+        /// A raw task session on the agent pgwire listener.
+        pub async fn agent_wire(&self) -> Wire {
+            connect_raw(self.agent_pg.address, &self.ca, &self.agent, AGENT_STARTUP).await
+        }
+
+        /// A raw session for `app` on the legacy certificate pgwire listener.
+        pub async fn legacy_wire(&self) -> Wire {
+            connect_raw(
+                self.legacy_pg.address,
+                &self.ca,
+                &self.app,
+                &[("user", "giggles"), ("database", "giggles")],
+            )
+            .await
+        }
+
+        /// Opens a task session on the agent HTTP listener: its token, or
+        /// the refusal's transport status (`http 401`).
+        pub async fn open_http(&self) -> Result<String, String> {
+            let (status, reply) = http_call(
+                self.agent_http.address,
+                (&self.ca, &self.agent),
+                "POST",
+                "/v1/sessions",
+                None,
+                Some(&json!({"task": TASK})),
+            )
+            .await;
+            match status {
+                201 => Ok(reply["sessionId"].as_str().unwrap().to_owned()),
+                other => Err(format!("http {other}")),
+            }
+        }
+
+        /// Opens a task session on the agent gRPC listener: its token, or the
+        /// refusal's transport status (`grpc Unauthenticated`).
+        pub async fn open_grpc(&self) -> Result<String, String> {
+            let opened = grpc_client(self.agent_grpc.address, &self.ca, &self.agent)
+                .await
+                .open_session(proto::OpenSessionRequest {
+                    task: Some(TASK.into()),
+                    ..Default::default()
+                })
+                .await;
+            match opened {
+                Ok(reply) => Ok(reply.into_inner().session_id),
+                Err(status) => Err(format!("grpc {:?}", status.code())),
+            }
+        }
+
+        /// `case` on `surface`, in a new task session that is closed after
+        /// the call.
+        pub async fn run(&self, surface: Surface, case: &Case) -> Observed {
+            match surface {
+                Surface::PgSimple => observe_pg(&self.agent_wire().await.simple(&case.sql).await),
+                Surface::PgExtended => {
+                    observe_pg(&self.agent_wire().await.extended(&case.sql, &[], 0).await)
+                }
+                Surface::HttpText => {
+                    let token = match self.open_http().await {
+                        Ok(token) => token,
+                        Err(status) => return refused(status),
+                    };
+                    let peer = (&self.ca, &self.agent);
+                    let (status, reply) = http_call(
+                        self.agent_http.address,
+                        peer,
+                        "POST",
+                        "/v1/session/execute",
+                        Some(&token),
+                        Some(&case.native_body()),
+                    )
+                    .await;
+                    let observed = match status {
+                        200 => observe_native(&reply),
+                        other => refused(format!("http {other}")),
+                    };
+                    let address = self.agent_http.address;
+                    http_call(address, peer, "DELETE", "/v1/session", Some(&token), None).await;
+                    observed
+                }
+                Surface::GrpcText => {
+                    let token = match self.open_grpc().await {
+                        Ok(token) => token,
+                        Err(status) => return refused(status),
+                    };
+                    let body = serde_json::to_vec(&case.native_body()).unwrap();
+                    let request = wire_json::decode_execute(&body)
+                        .unwrap_or_else(|error| panic!("{case:?}: {error:?}"));
+                    let mut client =
+                        grpc_client(self.agent_grpc.address, &self.ca, &self.agent).await;
+                    let observed = match client.execute(with_session(&token, request)).await {
+                        Ok(reply) => {
+                            let json = wire_json::encode_reply(&reply.into_inner()).unwrap();
+                            observe_native(&serde_json::from_slice(&json).unwrap())
+                        }
+                        Err(status) => refused(format!("grpc {:?}", status.code())),
+                    };
+                    let close = proto::CloseSessionRequest {};
+                    let _ = client.close_session(with_session(&token, close)).await;
+                    observed
+                }
+            }
+        }
+
+        /// `case` on every surface, in [`Surface::ALL`] order.
+        pub async fn run_all(&self, case: &Case) -> Vec<(Surface, Observed)> {
+            let mut all = Vec::new();
+            for surface in Surface::ALL {
+                all.push((surface, self.run(surface, case).await));
+            }
+            all
+        }
+    }
+
+    /// Asserts that every surface observed the same, and returns it.
+    #[track_caller]
+    pub fn agree(observed: &[(Surface, Observed)]) -> Observed {
+        let (first, expected) = &observed[0];
+        for (surface, seen) in &observed[1..] {
+            assert_eq!(seen, expected, "{surface:?} differs from {first:?}");
+        }
+        expected.clone()
+    }
+}

@@ -276,6 +276,8 @@ mod agent_pg_profile;
 
 #[path = "agent_pg_operations.rs"]
 mod agent_pg_operations;
+#[path = "agent_parity_harness.rs"]
+mod agent_parity_harness;
 #[path = "r3_preview_sql.rs"]
 mod r3_preview_sql;
 #[path = "r3_undo_sql.rs"]
