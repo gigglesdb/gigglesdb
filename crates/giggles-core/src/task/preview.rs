@@ -520,7 +520,7 @@ fn store(
 }
 
 /// The task's stored preview headers, in id order.
-fn headers(
+pub(super) fn headers(
     txn: &mut Transaction,
     task: TaskObjectId,
 ) -> Result<Vec<(PreviewId, PreviewHeader)>, CoreError> {
@@ -546,7 +546,7 @@ fn headers(
 }
 
 /// Rows stored under a header: classes 0, 1 and 2.
-fn stored_rows(header: &PreviewHeader) -> u32 {
+pub(super) fn stored_rows(header: &PreviewHeader) -> u32 {
     header.counts[..3].iter().fold(0u32, |n, c| n.saturating_add(*c))
 }
 

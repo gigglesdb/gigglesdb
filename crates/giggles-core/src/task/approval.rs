@@ -20,17 +20,30 @@
 //! REVOKE APPROVAL is allowed to the approving role or the issuer and sets
 //! state 02; a later APPROVE may make it active again. A consumed approval
 //! can be neither revoked nor approved again (`ApprovalStale`).
+//!
+//! SHOW CHANGES and SHOW CHANGE (R3-705) need the approve or the inspect
+//! privilege on the task; SHOW CHANGE also needs SELECT on the table, checked
+//! as SQL checks it (superuser, owner or grant). The task's column modes
+//! narrow the executor only, so the approver sees every column. Both read
+//! one ReadCommitted snapshot and return an [`Unreleased`] page without a
+//! release tag: they never run in a task session, so releasing it is a move.
 use super::admit::StatementClass;
 use super::commit::{catalog_def, engine, hold_error, role_error, unsupported, DefAt};
 use super::definition::{RoleName, TaskDef, TaskName, TaskPrivileges};
 use super::error::TaskError;
-use super::preview::{PreviewHeader, PreviewId, PreviewKind, STATE_OPEN};
-use super::records::{
-    approval_key, mutation_head_key, preview_key, ApprovalRecord, TaskObjectId,
+use super::catalog::PG_EPOCH_UNIX_MS;
+use super::preview::{
+    digest_hex, headers, stored_rows, PreviewHeader, PreviewId, PreviewKind, PreviewRow,
+    STATE_APPLIED, STATE_OPEN,
 };
+use super::records::{
+    approval_key, mutation_head_key, preview_key, preview_row_key, ApprovalRecord, TaskObjectId,
+};
+use super::release::Unreleased;
 use crate::CoreError;
-use crate::relational::SqlError;
-use crate::storage::roles::role_txn;
+use crate::relational::{output_text, SqlError, SqlResult, SqlRow, TableDef, TimestampTz, Value};
+use crate::storage::engine::codec;
+use crate::storage::roles::{role_txn, table_owner_txn, table_privileges_txn, TablePrivilege};
 use crate::storage::{Isolation, Keyspace, SqlSession, Transaction, V2Db};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -125,6 +138,245 @@ pub fn revoke_approval(
             record.state = APPROVAL_REVOKED;
             put_and_commit(&db, txn, def.id, id, &record)
         }
+    }
+}
+
+/// `SHOW CHANGES` columns (D7.5).
+pub const CHANGES_COLUMNS: [&str; 8] = [
+    "change_id",
+    "kind",
+    "state",
+    "digest",
+    "row_count",
+    "created_at",
+    "expires_at",
+    "approved_by",
+];
+
+/// `SHOW CHANGE` columns (D7.5): one line per changed column.
+pub const CHANGE_COLUMNS: [&str; 5] = ["row_no", "key", "column_name", "old_value", "new_value"];
+
+/// Suffix of `key` when the row's version differs from the one previewed.
+pub const CHANGED_SINCE_PREVIEW: &str = " (changed since preview)";
+
+/// SHOW CHANGES OF TASK `task` as `role` (D7.5): one row per stored preview,
+/// in id order: `(change_id, kind, state, digest, row_count, created_at,
+/// expires_at, approved_by)`. `kind` is `change` or `undo`; `state` is
+/// `applied`, `expired`, `approved` (an active approval) or `open`;
+/// `approved_by` names the role of an active or consumed approval.
+pub fn list_changes(
+    session: &mut SqlSession,
+    role: &RoleName,
+    task: &TaskName,
+) -> Result<Unreleased<SqlResult>, TaskError> {
+    let (db, def) = open(session, task)?;
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    may_show(&def, &mut txn, role)?;
+    let now = db.wall_now_ms();
+    let mut rows = Vec::new();
+    for (id, header) in headers(&mut txn, def.id)? {
+        let approval = load_approval(&mut txn, def.id, id)?;
+        let state = if header.state == STATE_APPLIED {
+            "applied"
+        } else if header.expires_ms <= now {
+            "expired"
+        } else if approval.as_ref().is_some_and(|a| a.state == APPROVAL_ACTIVE) {
+            "approved"
+        } else {
+            "open"
+        };
+        let kind = if header.kind == PreviewKind::Undo as u8 { "undo" } else { "change" };
+        let approved_by = approval
+            .filter(|a| matches!(a.state, APPROVAL_ACTIVE | APPROVAL_CONSUMED))
+            .map_or(Value::Null, |a| Value::Text(a.approver));
+        rows.push(SqlRow {
+            values: vec![
+                int(id.0)?,
+                Value::Text(kind.into()),
+                Value::Text(state.into()),
+                Value::Text(digest_hex(&header.digest)),
+                int(u64::from(header.counts[0]))?,
+                timestamptz(header.created_ms)?,
+                timestamptz(header.expires_ms)?,
+                approved_by,
+            ],
+            version: 0,
+        });
+    }
+    Ok(page(&CHANGES_COLUMNS, rows))
+}
+
+/// SHOW CHANGE `id` OF TASK `task` as `role` (D7.5), in long form: one line
+/// `(row_no, key, column_name, old_value, new_value)` per changed column of
+/// each stored row, in row order then column order; a row whose values do
+/// not change gets one line with a NULL `column_name`. Values are rendered
+/// with PostgreSQL's text output; `row_no` counts from 1.
+///
+/// Old values come from the current row only while its version is still
+/// the one previewed. Otherwise (or when the row is gone) the key is
+/// suffixed [`CHANGED_SINCE_PREVIEW`], `old_value` is NULL and every column
+/// of the previewed row is listed, since what it changed is no longer known.
+pub fn show_change(
+    session: &mut SqlSession,
+    role: &RoleName,
+    task: &TaskName,
+    id: PreviewId,
+) -> Result<Unreleased<SqlResult>, TaskError> {
+    let (db, def) = open(session, task)?;
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    may_show(&def, &mut txn, role)?;
+    let header = load_header(&mut txn, def.id, id)?
+        .filter(|header| header.kind == PreviewKind::Change as u8)
+        .ok_or(CoreError::Sql(SqlError::UndefinedObject))?;
+    let view = db.catalog().committed_view(&mut txn)?;
+    let entry = view
+        .by_id
+        .get(&header.table)
+        .cloned()
+        .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+    may_select(&mut txn, &entry.def.name, role)?;
+    let table = &entry.def;
+    let width = table.columns.len();
+    let offsets = table.logical_offsets();
+    let mut lines = Vec::new();
+    for row_no in 0..stored_rows(&header) {
+        let key = preview_row_key(def.id, id.0, row_no);
+        let Some(value) = txn.get(Keyspace::Kernel, &key).map_err(CoreError::from)? else {
+            continue;
+        };
+        let row = PreviewRow::decode(&value)?;
+        if row.class != 0 {
+            continue;
+        }
+        let mut after = crate::storage::task_row_values(&row.after)?;
+        after.resize(width, Value::Null);
+        let current = current_row(&mut txn, &row)?
+            .filter(|(version, _)| *version == row.version_read)
+            .map(|(_, mut values)| {
+                values.resize(width, Value::Null);
+                values
+            });
+        let mut key = key_text(table, &after)?;
+        if current.is_none() {
+            key.push_str(CHANGED_SINCE_PREVIEW);
+        }
+        let row_no = int(u64::from(row_no) + 1)?;
+        let mut changed = 0usize;
+        for &column in &offsets {
+            let new = &after[column];
+            let old = match &current {
+                Some(values) if values[column] == *new => continue,
+                Some(values) => text(&values[column])?,
+                None => Value::Null,
+            };
+            let name = Value::Text(table.columns[column].name.clone());
+            lines.push(line(&row_no, &key, name, old, text(new)?));
+            changed += 1;
+        }
+        if changed == 0 {
+            lines.push(line(&row_no, &key, Value::Null, Value::Null, Value::Null));
+        }
+    }
+    Ok(page(&CHANGE_COLUMNS, lines))
+}
+
+fn line(row_no: &Value, key: &str, column: Value, old: Value, new: Value) -> SqlRow {
+    SqlRow {
+        values: vec![row_no.clone(), Value::Text(key.to_owned()), column, old, new],
+        version: 0,
+    }
+}
+
+fn page(columns: &[&str], rows: Vec<SqlRow>) -> Unreleased<SqlResult> {
+    Unreleased::new(
+        SqlResult {
+            columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            rows,
+            affected: 0,
+        },
+        None,
+    )
+}
+
+fn int(n: u64) -> Result<Value, TaskError> {
+    Ok(Value::Int(i64::try_from(n).map_err(|_| CoreError::Sql(SqlError::Overflow))?))
+}
+
+/// Unix milliseconds as a timestamptz.
+fn timestamptz(ms: u64) -> Result<Value, TaskError> {
+    let us = i64::try_from(ms)
+        .ok()
+        .and_then(|ms| ms.checked_sub(PG_EPOCH_UNIX_MS))
+        .and_then(|ms| ms.checked_mul(1000))
+        .ok_or(CoreError::Sql(SqlError::Overflow))?;
+    let at = TimestampTz::from_microseconds(us).map_err(|_| CoreError::Sql(SqlError::Overflow))?;
+    Ok(Value::TimestampTz(at))
+}
+
+/// A value in PostgreSQL's text output, NULL as NULL.
+fn text(value: &Value) -> Result<Value, TaskError> {
+    Ok(output_text(value)
+        .map_err(CoreError::Sql)?
+        .map_or(Value::Null, Value::Text))
+}
+
+/// `(a, b)=(1, 2)`, PostgreSQL's key detail spelling.
+fn key_text(table: &TableDef, row: &[Value]) -> Result<String, TaskError> {
+    let mut names = Vec::new();
+    let mut values = Vec::new();
+    for &column in &table.primary_key {
+        names.push(table.columns[column].name.as_str());
+        let value = output_text(&row[column]).map_err(CoreError::Sql)?;
+        values.push(value.unwrap_or_else(|| "null".into()));
+    }
+    Ok(format!("({})=({})", names.join(", "), values.join(", ")))
+}
+
+/// The current version and values of the previewed row, or `None` when it
+/// is gone.
+fn current_row(
+    txn: &mut Transaction,
+    row: &PreviewRow,
+) -> Result<Option<(u64, Vec<Value>)>, CoreError> {
+    let mut key = row.table.to_be_bytes().to_vec();
+    key.extend_from_slice(&row.pk);
+    let Some(value) = txn.get(Keyspace::Rows, &key)? else {
+        return Ok(None);
+    };
+    let record = codec::decode_row(&key, &value)?;
+    Ok((!record.tombstone).then_some((record.row_version, record.values)))
+}
+
+/// SHOW CHANGES and SHOW CHANGE: the approve or the inspect privilege on
+/// the task (42501).
+fn may_show(def: &TaskDef, txn: &mut Transaction, role: &RoleName) -> Result<(), TaskError> {
+    let held = match role_txn(txn, role).map_err(role_error)? {
+        Some(record) => def.privileges_of(&record),
+        None => TaskPrivileges::NONE,
+    };
+    if held.contains(TaskPrivileges::APPROVE) || held.contains(TaskPrivileges::INSPECT) {
+        Ok(())
+    } else {
+        Err(no_privilege())
+    }
+}
+
+/// SELECT on `table` as SQL allows it: a superuser, the owner or a SELECT
+/// grant (the server's `table_privilege_allowed`), else 42501.
+fn may_select(txn: &mut Transaction, table: &str, role: &RoleName) -> Result<(), TaskError> {
+    let superuser = role_txn(txn, role)
+        .map_err(role_error)?
+        .is_some_and(|record| record.superuser);
+    let owner = table_owner_txn(txn, table).map_err(role_error)?;
+    if superuser
+        || owner.as_deref() == Some(role.as_str())
+        || table_privileges_txn(txn, table, role)
+            .map_err(role_error)?
+            .contains(&TablePrivilege::Select)
+    {
+        Ok(())
+    } else {
+        Err(no_privilege())
     }
 }
 

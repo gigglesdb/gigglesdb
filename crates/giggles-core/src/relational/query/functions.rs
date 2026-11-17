@@ -35,6 +35,19 @@ mod quoting;
 pub(super) fn keyword_requires_quotes(name: &str) -> bool {
     quoting::keyword_requires_quotes(name)
 }
+/// PostgreSQL's text output spelling of `value` (the conversion `concat` and
+/// `format` use), or `None` for NULL. GD-0061 R3-705: SHOW CHANGE renders
+/// old and new values with it.
+pub(crate) fn output_text(value: &Value) -> R<Option<String>> {
+    if *value == Value::Null {
+        return Ok(None);
+    }
+    match text::eval("concat", std::slice::from_ref(value), &mut 0) {
+        Some(Ok(Value::Text(s))) => Ok(Some(s)),
+        Some(Err(e)) => Err(e),
+        _ => Err(SqlError::Type),
+    }
+}
 mod format;
 mod substring_order;
 mod temporal;

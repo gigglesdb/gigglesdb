@@ -3,7 +3,7 @@
 //! New task types live here so they never collide with the legacy prototype
 //! names (`crate::types::TaskId`, `policy.rs`, `accounting.rs`).
 pub mod admit;
-// R3-704: APPROVE and REVOKE APPROVAL (D7.5); SHOW CHANGE(S) follow in R3-705.
+// R3-704 / R3-705: APPROVE, REVOKE APPROVAL, SHOW CHANGES and SHOW CHANGE (D7.5).
 pub mod approval;
 // R3-611: consumed by protected_commit (R3-615+), the preview store and undo.
 #[allow(dead_code)]
@@ -46,7 +46,7 @@ pub mod statements;
 mod statements_tests;
 
 pub use admit::StatementClass;
-pub use approval::{approve, revoke_approval};
+pub use approval::{approve, list_changes, revoke_approval, show_change};
 // R3-615 through the agent seam (R3-207): the server's direct protected write.
 pub use commit::{inspect_outcome, outcome, protected_commit, Actor, ProtectedRequest};
 // R3-619: the protected commit's crash seams, armed by `Admin::set_protected_point`.

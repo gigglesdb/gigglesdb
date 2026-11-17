@@ -47,6 +47,7 @@ pub use query::typed_read::{SingleSourceRead, ReadProjection, ReadExpr, ReadPred
     ReadAggregate, ReadClauses, ReadOrder, ReadSource, ReadJoinKind, TwoSourceRead, TypedRead, TypedInsertSelect, ViewRead};
 use query::{TypmodSource, result_typmod};
 pub(crate) use query::row_predicate::RowPredicate;
+pub(crate) use query::output_text;
 pub(crate) mod cursor;
 mod returning;
 pub(crate) mod row_sink;

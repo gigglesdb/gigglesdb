@@ -1,18 +1,22 @@
-//! GD-0061 R3-704: APPROVE and REVOKE APPROVAL (design-7 D7.5), through the
-//! public API, on previews stored by `task::preview`.
+//! GD-0061 R3-704 / R3-705: APPROVE, REVOKE APPROVAL, SHOW CHANGES and SHOW
+//! CHANGE (design-7 D7.5), through the public API, on previews stored by
+//! `task::preview`.
 //!
 //! `deliveries` is reserved, so the table is `shipments`, as in
 //! `task_preview.rs`. The task names `oncall_lead` as its approver,
 //! `incident_controller` issues it and `repair_agent` executes it.
 #![cfg(feature = "engine-rocksdb")]
-use giggles_core::relational::StatementClock;
+use giggles_core::relational::{SqlResult, StatementClock, Value};
 use giggles_core::roles::{NewRole, TablePrivilege};
-use giggles_core::task::approval::StoredApproval;
+use giggles_core::task::approval::{
+    StoredApproval, CHANGED_SINCE_PREVIEW, CHANGES_COLUMNS, CHANGE_COLUMNS,
+};
 use giggles_core::task::context::TaskContext;
-use giggles_core::task::definition::WallClockMs;
+use giggles_core::task::definition::{TaskPrivileges, WallClockMs};
 use giggles_core::task::statements::{parse, TaskStatement};
 use giggles_core::task::{
-    approve, preview, revoke_approval, PreviewId, PreviewSummary, Surface, TaskError,
+    approve, list_changes, preview, revoke_approval, show_change, PreviewId, PreviewSummary,
+    Surface, TaskError,
 };
 use giggles_core::{Admin, Engine, Limits};
 use std::path::PathBuf;
@@ -154,17 +158,18 @@ fn clock() -> StatementClock {
 
 /// The agent previews requeueing rows 1..=10 (above APPROVE ABOVE 5).
 fn stored_preview(admin: &Admin, ctx: &TaskContext) -> PreviewSummary {
+    preview_text(
+        admin,
+        ctx,
+        "UPDATE shipments SET status = 'queued' WHERE status = 'failed' AND id >= 1 AND id <= 10",
+    )
+}
+
+/// The agent previews `text`.
+fn preview_text(admin: &Admin, ctx: &TaskContext, text: &str) -> PreviewSummary {
     let mut agent = admin.sql_session();
     agent.bind_task(ctx.clone()).unwrap();
-    preview(
-        &mut agent,
-        ctx,
-        Surface::Sql,
-        "UPDATE shipments SET status = 'queued' WHERE status = 'failed' AND id >= 1 AND id <= 10",
-        &[],
-        &clock(),
-    )
-    .unwrap()
+    preview(&mut agent, ctx, Surface::Sql, text, &[], &clock()).unwrap()
 }
 
 fn approve_as(
@@ -334,3 +339,263 @@ fn approve_undo_preview_through_approve_change_is_stale() {
     assert_eq!(approval(&admin, &ctx, p.id), None);
 }
 
+
+// ---- R3-705: SHOW CHANGES and SHOW CHANGE ----
+
+/// Milliseconds from the Unix epoch to the PostgreSQL epoch.
+const PG_EPOCH_UNIX_MS: i64 = 946_684_800_000;
+
+type Line = (i64, String, Option<String>, Option<String>, Option<String>);
+type Summary = (i64, String, String, String, i64, Option<String>);
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn opt_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::Text(s) => Some(s.clone()),
+        other => panic!("not text: {other:?}"),
+    }
+}
+
+/// SHOW CHANGE as `role`, released through the session (a plain move).
+fn show_as(
+    admin: &Admin,
+    ctx: &TaskContext,
+    role: &str,
+    id: PreviewId,
+) -> Result<SqlResult, TaskError> {
+    let mut session = admin.sql_session();
+    let page = show_change(&mut session, &role.to_owned(), &ctx.name, id)?;
+    assert!(!page.is_task());
+    Ok(session.release_page(page).unwrap().into_inner())
+}
+
+/// SHOW CHANGES as `role`.
+fn list_as(admin: &Admin, ctx: &TaskContext, role: &str) -> Result<SqlResult, TaskError> {
+    let mut session = admin.sql_session();
+    let page = list_changes(&mut session, &role.to_owned(), &ctx.name)?;
+    assert!(!page.is_task());
+    Ok(session.release_page(page).unwrap().into_inner())
+}
+
+fn lines(result: &SqlResult) -> Vec<Line> {
+    assert_eq!(result.columns, CHANGE_COLUMNS);
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            let Value::Int(row_no) = row.values[0] else {
+                panic!("row_no: {:?}", row.values[0]);
+            };
+            (
+                row_no,
+                opt_text(&row.values[1]).expect("key"),
+                opt_text(&row.values[2]),
+                opt_text(&row.values[3]),
+                opt_text(&row.values[4]),
+            )
+        })
+        .collect()
+}
+
+fn summary(result: &SqlResult) -> Vec<Summary> {
+    assert_eq!(result.columns, CHANGES_COLUMNS);
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            let (Value::Int(id), Value::Int(count)) = (&row.values[0], &row.values[4]) else {
+                panic!("{row:?}");
+            };
+            (
+                *id,
+                opt_text(&row.values[1]).unwrap(),
+                opt_text(&row.values[2]).unwrap(),
+                opt_text(&row.values[3]).unwrap(),
+                *count,
+                opt_text(&row.values[7]),
+            )
+        })
+        .collect()
+}
+
+fn line(row_no: i64, key: &str, column: &str, old: Option<&str>, new: &str) -> Line {
+    (row_no, key.into(), Some(column.into()), old.map(Into::into), Some(new.into()))
+}
+
+fn key(id: i64) -> String {
+    format!("(merchant_id, id)=(42, {id})")
+}
+
+fn assert_42501<T: std::fmt::Debug>(result: Result<T, TaskError>) {
+    let error = result.expect_err("expected 42501");
+    assert_eq!(error.sqlstate(), "42501", "{error:?}");
+}
+
+#[test]
+fn show_change_lists_one_line_per_changed_column() {
+    let (_dir, admin) = setup("");
+    let ctx = context(&admin);
+    // One changed column per row.
+    let p = stored_preview(&admin, &ctx);
+    let shown = lines(&show_as(&admin, &ctx, APPROVER, p.id).unwrap());
+    let expected: Vec<Line> = (1..=10)
+        .map(|id| line(id, &key(id), "status", Some("failed"), "queued"))
+        .collect();
+    assert_eq!(shown, expected);
+    // Two changed columns per row, in column order; a timestamptz in
+    // PostgreSQL's text output.
+    let two = preview_text(
+        &admin,
+        &ctx,
+        "UPDATE shipments SET status = 'queued', failed_at = '2026-11-05 17:05:00+00' \
+         WHERE id >= 11 AND id <= 12",
+    );
+    let shown = lines(&show_as(&admin, &ctx, APPROVER, two.id).unwrap());
+    let mut expected = Vec::new();
+    for (row_no, id) in [(1, 11), (2, 12)] {
+        expected.push(line(row_no, &key(id), "status", Some("failed"), "queued"));
+        expected.push(line(
+            row_no,
+            &key(id),
+            "failed_at",
+            Some("2026-11-05 17:03:00+00"),
+            "2026-11-05 17:05:00+00",
+        ));
+    }
+    assert_eq!(shown, expected);
+    // An unknown change is 42704, and SHOW CHANGE never runs in a task session.
+    let unknown = show_as(&admin, &ctx, APPROVER, PreviewId(99)).unwrap_err();
+    assert_eq!(unknown.sqlstate(), "42704");
+    let mut agent = admin.sql_session();
+    agent.bind_task(ctx.clone()).unwrap();
+    let refused = show_change(&mut agent, &APPROVER.to_owned(), &ctx.name, p.id).unwrap_err();
+    assert_eq!(refused.sqlstate(), "0A000");
+}
+
+#[test]
+fn show_change_without_select_is_42501() {
+    let (_dir, admin) = setup("");
+    let ctx = context(&admin);
+    let p = stored_preview(&admin, &ctx);
+    let roles = admin.roles();
+    // Without a task privilege: the executor and an unrelated role.
+    roles.grant_table("shipments", "auditor", &[TablePrivilege::Select]).unwrap();
+    assert_42501(show_as(&admin, &ctx, EXECUTOR, p.id));
+    assert_42501(show_as(&admin, &ctx, "auditor", p.id));
+    assert_42501(list_as(&admin, &ctx, "auditor"));
+    // INSPECT and SELECT together are enough.
+    let issuer = roles.get(ISSUER).unwrap().unwrap();
+    admin.tasks().grant(&issuer, TASK, "auditor", TaskPrivileges::INSPECT, true).unwrap();
+    assert_eq!(lines(&show_as(&admin, &ctx, "auditor", p.id).unwrap()).len(), 10);
+    // The approver without SELECT on the table: SHOW CHANGE is 42501, while
+    // SHOW CHANGES (no row values) still works.
+    roles.revoke_table("shipments", APPROVER, &[TablePrivilege::Select]).unwrap();
+    assert_42501(show_as(&admin, &ctx, APPROVER, p.id));
+    assert_eq!(list_as(&admin, &ctx, APPROVER).unwrap().rows.len(), 1);
+    // The table owner needs no grant.
+    roles.revoke_table("shipments", "auditor", &[TablePrivilege::Select]).unwrap();
+    assert_42501(show_as(&admin, &ctx, "auditor", p.id));
+    roles.set_table_owner("shipments", "auditor").unwrap();
+    assert_eq!(lines(&show_as(&admin, &ctx, "auditor", p.id).unwrap()).len(), 10);
+}
+
+#[test]
+fn show_change_ignores_task_column_modes() {
+    let (_dir, admin) = setup("");
+    let ctx = context(&admin);
+    let p = stored_preview(&admin, &ctx);
+    // The executor cannot see merchant_id (not READABLE) and sees the
+    // MASKED columns masked; the approver sees both in clear.
+    sql(
+        &admin,
+        "UPDATE shipments SET customer_email = 'new1@example.com' WHERE merchant_id = 42 AND id = 1",
+    );
+    let shown = lines(&show_as(&admin, &ctx, APPROVER, p.id).unwrap());
+    assert!(shown.iter().all(|l| l.1.starts_with("(merchant_id, id)=(42, ")), "{shown:?}");
+    let changed = format!("{}{CHANGED_SINCE_PREVIEW}", key(1));
+    let row1: Vec<&Line> = shown.iter().filter(|l| l.0 == 1).collect();
+    let columns: Vec<&str> = row1.iter().map(|l| l.2.as_deref().unwrap()).collect();
+    assert_eq!(
+        columns,
+        ["merchant_id", "id", "status", "failed_at", "attempt_count", "customer_email", "card_token"]
+    );
+    assert!(row1.iter().all(|l| l.1 == changed && l.3.is_none()), "{row1:?}");
+    // The after-image as previewed, with no mask applied.
+    assert_eq!(row1[0].4.as_deref(), Some("42"));
+    assert_eq!(row1[5].4.as_deref(), Some("c1@example.com"));
+    assert_eq!(row1[6].4.as_deref(), Some("tok_1"));
+}
+
+#[test]
+fn show_change_marks_rows_changed_since_preview() {
+    let (_dir, admin) = setup("");
+    let ctx = context(&admin);
+    let p = stored_preview(&admin, &ctx);
+    sql(&admin, "UPDATE shipments SET attempt_count = 2 WHERE merchant_id = 42 AND id = 3");
+    sql(&admin, "DELETE FROM shipments WHERE merchant_id = 42 AND id = 4");
+    let shown = lines(&show_as(&admin, &ctx, APPROVER, p.id).unwrap());
+    for id in [1, 2, 5, 6, 7, 8, 9, 10] {
+        let row: Vec<&Line> = shown.iter().filter(|l| l.0 == id).collect();
+        assert_eq!(row, [&line(id, &key(id), "status", Some("failed"), "queued")]);
+    }
+    for id in [3, 4] {
+        let row: Vec<&Line> = shown.iter().filter(|l| l.0 == id).collect();
+        assert_eq!(row.len(), 7, "every column of the previewed row: {row:?}");
+        let marked = format!("{}{CHANGED_SINCE_PREVIEW}", key(id));
+        assert!(row.iter().all(|l| l.1 == marked && l.3.is_none()), "{row:?}");
+        // The new values are the previewed ones, not the current row's.
+        assert_eq!(row[2].2.as_deref(), Some("status"));
+        assert_eq!(row[2].4.as_deref(), Some("queued"));
+        assert_eq!(row[4].2.as_deref(), Some("attempt_count"));
+        assert_eq!(row[4].4.as_deref(), Some("1"));
+    }
+    assert_eq!(shown.len(), 8 + 2 * 7);
+}
+
+#[test]
+fn show_changes_lists_digest_state_and_approver() {
+    let (_dir, admin) = setup("");
+    let ctx = context(&admin);
+    let started = now_ms();
+    let p = stored_preview(&admin, &ctx);
+    let q = preview_text(
+        &admin,
+        &ctx,
+        "UPDATE shipments SET status = 'queued' WHERE id >= 11 AND id <= 12",
+    );
+    approve_as(&admin, &ctx, APPROVER, p.id, p.digest).unwrap();
+    let us = |ms: i64| (ms - PG_EPOCH_UNIX_MS) * 1000;
+    let shown = list_as(&admin, &ctx, ISSUER).unwrap();
+    let approved: Summary =
+        (p.id.0 as i64, "change".into(), "approved".into(), hex(&p.digest), 10, Some(APPROVER.into()));
+    let open: Summary = (q.id.0 as i64, "change".into(), "open".into(), hex(&q.digest), 2, None);
+    assert_eq!(summary(&shown), [approved, open]);
+    for (row, preview) in shown.rows.iter().zip([&p, &q]) {
+        let (Value::TimestampTz(created), Value::TimestampTz(expires)) =
+            (&row.values[5], &row.values[6])
+        else {
+            panic!("{row:?}");
+        };
+        assert_eq!(expires.microseconds(), us(preview.expires_at.0));
+        assert!(created.microseconds() >= us(started) && created.microseconds() <= us(now_ms()));
+    }
+    // A revoked approval is no approval; a consumed one still names its approver.
+    revoke_as(&admin, &ctx, APPROVER, p.id).unwrap();
+    let shown = summary(&list_as(&admin, &ctx, APPROVER).unwrap());
+    assert_eq!((shown[0].2.as_str(), shown[0].5.as_deref()), ("open", None));
+    approve_as(&admin, &ctx, APPROVER, p.id, p.digest).unwrap();
+    admin.consume_task_approval(ctx.task, p.id, 9).unwrap();
+    admin.mark_task_preview_undo(ctx.task, q.id).unwrap();
+    let shown = summary(&list_as(&admin, &ctx, APPROVER).unwrap());
+    assert_eq!(shown[0].5.as_deref(), Some(APPROVER));
+    assert_eq!(shown[1].1, "undo");
+    // SHOW CHANGE shows change previews only.
+    let undo = show_as(&admin, &ctx, APPROVER, q.id).unwrap_err();
+    assert_eq!(undo.sqlstate(), "42704");
+    // The executor holds no task privilege.
+    assert_42501(list_as(&admin, &ctx, EXECUTOR));
+}

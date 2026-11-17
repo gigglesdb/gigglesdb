@@ -961,7 +961,7 @@ fn writable(view: &CatalogView, entry: &TableEntry, column: &str) -> Result<(), 
 }
 
 /// Milliseconds from the Unix epoch to the PostgreSQL epoch (2000-01-01).
-const PG_EPOCH_UNIX_MS: i64 = 946_684_800_000;
+pub(crate) const PG_EPOCH_UNIX_MS: i64 = 946_684_800_000;
 
 /// The EXPIRES literal: a finite timestamp with an explicit UTC offset (22007).
 fn parse_expiry(text: &str) -> Result<WallClockMs, TaskDdlError> {

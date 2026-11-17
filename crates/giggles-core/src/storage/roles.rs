@@ -306,6 +306,18 @@ pub(crate) fn role_txn(
         .transpose()
 }
 
+/// `table`'s owner at `txn`'s snapshot, or `None` (GD-0061 R3-705: SHOW
+/// CHANGE checks SELECT as SQL does: superuser, owner or grant).
+pub(crate) fn table_owner_txn(
+    txn: &mut super::engine::txn::Transaction,
+    table: &str,
+) -> Result<Option<String>, RoleError> {
+    let image = engine::load_txn(txn)?;
+    raw_get(&image, &key(b"owner/", table))?
+        .map(|value| String::from_utf8(value).map_err(|error| CoreError::Corrupt(error.to_string()).into()))
+        .transpose()
+}
+
 fn privileges<P: DeserializeOwned + Ord>(value: Option<Vec<u8>>) -> Result<BTreeSet<P>, RoleError> {
     match value {
         Some(value) => Ok(decode::<Vec<P>>(&value)?.into_iter().collect()),
