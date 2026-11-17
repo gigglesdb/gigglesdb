@@ -59,6 +59,8 @@ fn lock_position(key: &LockKey) -> Option<Vec<u8>> {
         LockKey::Row { table, pk } if !pk.is_empty() => at(RangeSpace::Rows, *table, pk),
         LockKey::Unique { index, tuple } => at(RangeSpace::Index, *index, tuple),
         LockKey::Row { .. } | LockKey::Table(_) => None,
+        // TODO(GD-0075 P8-SPLIT): a gap lock straddling the split key must be cut in two.
+        LockKey::Interval { .. } => None,
     }
 }
 

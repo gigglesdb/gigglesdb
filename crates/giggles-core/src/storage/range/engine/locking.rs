@@ -81,6 +81,11 @@ impl RangeEngine {
         let range_key = match &req.target {
             LockTarget::Key { space, key } => Some(range_key(*space, key)),
             LockTarget::TableSentinel { .. } => None,
+            // A gap lock is routed by its start, as a forward read is.
+            LockTarget::Interval { space, start, .. } => Some(match start {
+                Bound::Included(key) | Bound::Excluded(key) => range_key(*space, key),
+                Bound::Unbounded => range_key(*space, &[]),
+            }),
         };
         self.check_epoch(req.epoch, range_key.as_deref())?;
         self.check_stored(range_key.as_deref())?;

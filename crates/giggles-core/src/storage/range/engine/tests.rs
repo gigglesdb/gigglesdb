@@ -943,6 +943,7 @@ fn prepared_records_carry_gap_locks() {
             (row.clone(), LockMode::Shared),
             (row.clone(), LockMode::Exclusive),
         ],
+        children: Vec::new(),
     };
     let back = prepared::Prepared::decode(&record.encode().unwrap()).unwrap();
     let mut locks = back.locks.clone();
