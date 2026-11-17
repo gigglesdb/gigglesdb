@@ -2269,6 +2269,56 @@ impl Session {
         }
         released
     }
+    /// A native keyset page (`SqlSession::read_page`). It has no release twin
+    /// (design-3 section 4), so a task session is refused here, before core
+    /// runs anything (GD-0061 R3-313).
+    pub(crate) fn read_native_page(
+        &mut self,
+        request: &giggles_core::operations::Request,
+        after: Option<&[Value]>,
+        bindings: &giggles_core::operations::Bindings,
+    ) -> Result<giggles_core::operations::Result<giggles_core::operations::Page>, CoreError> {
+        if self.sql.task().is_some() {
+            return Err(task_session_refusal());
+        }
+        Ok(self.sql.read_page(request, after, bindings))
+    }
+    /// SQL text over the API (`Request::Sql`), held until `release_page`. In
+    /// a task session the statement is prepared and admitted first, and a
+    /// refusal there, which never reaches core, is logged once; the read-log
+    /// text is set before the statement runs (GD-0061 R3-313).
+    fn execute_api_sql(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Unreleased<SqlResult>, CoreError> {
+        if self.sql.task().is_none() {
+            return self.execute_sql_unreleased(sql, params);
+        }
+        self.authority_scope(|session| {
+            let refused = |session: &Session, class, error: CoreError| {
+                session
+                    .sql
+                    .log_refused_task_statement(sql, class, params.len(), &error);
+                Err(error)
+            };
+            // `prepare` admits the statement's class itself, before it parses
+            // the whole statement; the refusal is logged with that class.
+            let p = match session.prepare(sql) {
+                Ok(p) => p,
+                Err(error) => {
+                    let class = Prepared::task_class_of_sql(sql)
+                        .unwrap_or(giggles_core::task::StatementClass::Other);
+                    return refused(session, class, error);
+                }
+            };
+            if let Err(error) = session.admit_backstop(p.task_class()) {
+                return refused(session, p.task_class(), error);
+            }
+            session.sql.set_task_statement_text(sql);
+            session.run_prepared(&p, params, false)
+        })
+    }
     /// Validity only (revoked, expired, definition changed), for re-serving
     /// rows of a page that was already released and charged. No-op outside a
     /// task session.
@@ -2631,10 +2681,15 @@ impl Session {
                 {
                     Err(CoreError::Policy(Error::Scope))
                 }
-                Request::Sql { sql, params } => Ok(Response {
-                    sql: Some(self.execute_sql(&sql, &params)?),
-                    ..Response::code("ok")
-                }),
+                // GD-0061 R3-313: the result is released before the Response
+                // that both transports encode is built.
+                Request::Sql { sql, params } => {
+                    let result = self.execute_api_sql(&sql, &params)?;
+                    Ok(Response {
+                        sql: Some(self.release_page(result)?.into_inner()),
+                        ..Response::code("ok")
+                    })
+                }
                 Request::Preview { request } => {
                     let (e, time) = self.executor()?;
                     let p = e.preview_current(&request, time.0, time.1)?;

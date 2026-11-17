@@ -622,6 +622,31 @@ fn execute_reply(
     received: Instant,
     encoding: Encoding,
 ) -> Result<(proto::ExecuteReply, Option<Vec<u8>>), ApiError> {
+    // GD-0061 R3-309/R3-313: the transport a task statement arrived on (HTTP
+    // carries JSON only; gRPC carries protobuf). No-op without a task.
+    session.sql.set_task_entry(match encoding {
+        Encoding::Json => giggles_core::task::readlog::ENTRY_HTTP,
+        Encoding::Protobuf => giggles_core::task::readlog::ENTRY_GRPC,
+    });
+    let reply = execute_released(session, request, received, encoding);
+    // After the reply is encoded: charges any rows_read no release charged
+    // and finalizes the statement's read-log record (no-op without a task).
+    session.sql.finish_task_statement(match &reply {
+        Ok(_) => Ok(()),
+        Err(_) => Err(&giggles_core::CoreError::Limit),
+    });
+    reply
+}
+
+/// `execute_reply` after the entry point is set: runs the request, whose
+/// core rows are released inside `native::run` or `Request::Sql` before
+/// anything below encodes them (GD-0061 R3-313).
+fn execute_released(
+    session: &mut Session,
+    request: Invocation,
+    received: Instant,
+    encoding: Encoding,
+) -> Result<(proto::ExecuteReply, Option<Vec<u8>>), ApiError> {
     enum Executed {
         Legacy(Response),
         Native(Result<native::NativeResult, giggles_core::CoreError>),
@@ -737,13 +762,13 @@ fn execute_reply(
                     None
                 }
                 native::NativeResult::Operation(outcome) => {
-                    Some(P::OperationOutcome(native_codec::encode_outcome(outcome)?))
+                    Some(P::OperationOutcome(native_codec::encode_outcome(outcome.into_inner())?))
                 }
                 native::NativeResult::Page(page) => {
                     Some(P::OperationOutcome(native_codec::encode_page(page)?))
                 }
                 native::NativeResult::Transaction(outcome) => Some(P::TransactionOutcome(
-                    native_codec::encode_transaction_outcome(outcome)?,
+                    native_codec::encode_transaction_outcome(outcome.into_inner())?,
                 )),
                 native::NativeResult::Error(error) => {
                     reply.code = if error == giggles_core::operations::Error::Unknown {
@@ -791,3 +816,6 @@ fn prepare_encoded(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+mod native_release_tests;

@@ -2,17 +2,24 @@
 use super::codec::Invocation;
 use crate::{Role, Session};
 use giggles_core::{
-    CoreError, Error, operations as ops, relational::SqlError, task::StatementClass,
+    CoreError, Error, operations as ops,
+    relational::SqlError,
+    task::{Released, StatementClass},
 };
 
+/// A native result, ready to encode. Rows that came out of core are held as
+/// `Released`: they went through the task release protocol (GD-0061 R3-313)
+/// inside `run`, before any encoder sees them. `Sql` holds only rows the
+/// server builds itself (search path, sequence value); `Page` holds a keyset
+/// page, which a task session never reaches (`Session::read_native_page`).
 pub(crate) enum NativeResult {
     Control,
     Catalog(ops::CatalogOutcome, String),
     SequenceCatalog(u64, String),
     Sql(giggles_core::relational::SqlResult),
-    Operation(ops::Outcome),
+    Operation(Released<ops::Outcome>),
     Page(ops::Page),
-    Transaction(ops::TransactionOutcome),
+    Transaction(Released<ops::TransactionOutcome>),
     Error(ops::Error),
 }
 
@@ -23,7 +30,7 @@ fn read_tables(invocation: &Invocation) -> Vec<String> {
         _ => vec![],
     }
 }
-fn read_outcome(result: Result<giggles_core::relational::SqlResult, CoreError>) -> Result<NativeResult, CoreError> {
+fn read_outcome(result: Result<Released<giggles_core::relational::SqlResult>, CoreError>) -> Result<NativeResult, CoreError> {
     let result = match result {
         Ok(result) => result,
         Err(error @ CoreError::Sql(_)) => {
@@ -32,10 +39,44 @@ fn read_outcome(result: Result<giggles_core::relational::SqlResult, CoreError>) 
         }
         Err(error) => return Err(error),
     };
-    Ok(NativeResult::Operation(ops::Outcome {
+    Ok(NativeResult::Operation(result.map(|result| ops::Outcome {
         matched: result.rows.len(), columns: result.columns, rows: result.rows,
         ..ops::Outcome::default()
-    }))
+    })))
+}
+
+/// The read-log text of a native invocation in a task session: its request
+/// as canonical JSON, as core logs native operations (GD-0061 R3-309).
+fn statement_text(invocation: &Invocation) -> String {
+    let json = match invocation {
+        Invocation::Operation { request, .. } | Invocation::Page { request, .. } => {
+            serde_json::to_string(request)
+        }
+        Invocation::Transaction { transaction, .. } => serde_json::to_string(transaction),
+        Invocation::Read(read) => serde_json::to_string(read),
+        Invocation::Join(read) => serde_json::to_string(read),
+        Invocation::Catalog(request) => serde_json::to_string(request),
+        Invocation::Sequence(call) => serde_json::to_string(call),
+        Invocation::SearchPath(schemas) => serde_json::to_string(schemas),
+        Invocation::Begin => Ok("BEGIN".into()),
+        Invocation::Commit => Ok("COMMIT".into()),
+        Invocation::Rollback => Ok("ROLLBACK".into()),
+        Invocation::Savepoint(name) => Ok(format!("SAVEPOINT {name}")),
+        Invocation::RollbackTo(name) => Ok(format!("ROLLBACK TO SAVEPOINT {name}")),
+        Invocation::Release(name) => Ok(format!("RELEASE SAVEPOINT {name}")),
+        Invocation::Legacy(_) | Invocation::Text { .. } => Ok(String::new()),
+    };
+    json.unwrap_or_default()
+}
+
+/// The number of bindings a native invocation carries.
+fn binding_count(invocation: &Invocation) -> usize {
+    match invocation {
+        Invocation::Operation { bindings, .. }
+        | Invocation::Page { bindings, .. }
+        | Invocation::Transaction { bindings, .. } => bindings.len(),
+        _ => 0,
+    }
 }
 
 // Collect syntactic reads before binding, at the same step as SQL authorization.
@@ -183,8 +224,16 @@ pub(crate) fn run(
         session.check_binding()?;
         // GD-0061 R3-208: a task session admits the class before any
         // resolution, authorization or execution, as on the agent pgwire path.
+        // A refusal here never reaches core, so it is logged here, once
+        // (GD-0061 R3-313; core logs every statement that reaches it).
         if session.task().is_some() {
-            session.admit_backstop(task_class(&invocation)?)?;
+            let class = task_class(&invocation)?;
+            if let Err(error) = session.admit_backstop(class) {
+                session.sql.log_refused_task_statement(
+                    &statement_text(&invocation), class, binding_count(&invocation), &error,
+                );
+                return Err(error);
+            }
         }
         if let Invocation::Catalog(request) = &invocation {
             return session.authority_scope(|session| {
@@ -269,27 +318,50 @@ pub(crate) fn run(
                     affected: 0,
                 }));
             }
+            // GD-0061 R3-313: every result core returns is held until the
+            // session releases it, here, before anything encodes it. Outside
+            // a task session the release is a move. A release error is an
+            // execution error (`Session::release_page` aborts).
             Invocation::Read(read) => {
-                return read_outcome(session.sql.execute_typed_read(*read, None));
+                if session.task().is_some() {
+                    session.sql.set_task_statement_text(&serde_json::to_string(&read).unwrap_or_default());
+                }
+                let result = session.sql.execute_typed_read_unreleased(*read, None);
+                return read_outcome(result.and_then(|result| session.release_page(result)));
             }
             Invocation::Join(read) => {
-                return read_outcome(session.sql.execute_typed_join(*read, None));
+                if session.task().is_some() {
+                    session.sql.set_task_statement_text(&serde_json::to_string(&read).unwrap_or_default());
+                }
+                let result = session.sql.execute_typed_join_unreleased(*read, None);
+                return read_outcome(result.and_then(|result| session.release_page(result)));
             }
-            Invocation::Operation { request, bindings } => session
-                .sql
-                .execute_native(&request, &bindings)
-                .map(NativeResult::Operation),
-            Invocation::Page { request, bindings, after } => session
-                .sql
-                .read_page(&request, (!after.is_empty()).then_some(after.as_slice()), &bindings)
-                .map(NativeResult::Page),
+            Invocation::Operation { request, bindings } => {
+                match session.sql.execute_native_unreleased(&request, &bindings) {
+                    Ok(outcome) => Ok(NativeResult::Operation(session.release_page(outcome)?)),
+                    Err(error) => Err(error),
+                }
+            }
+            Invocation::Page { request, bindings, after } => {
+                let after = (!after.is_empty()).then_some(after.as_slice());
+                match session.read_native_page(&request, after, &bindings) {
+                    Ok(page) => page.map(NativeResult::Page),
+                    Err(error) => {
+                        session.sql.log_refused_task_statement(
+                            &serde_json::to_string(&request).unwrap_or_default(),
+                            StatementClass::Select, bindings.len(), &error,
+                        );
+                        return Err(error);
+                    }
+                }
+            }
             Invocation::Transaction {
                 transaction,
                 bindings,
-            } => session
-                .sql
-                .execute_native_transaction(&transaction, &bindings)
-                .map(NativeResult::Transaction),
+            } => match session.sql.execute_native_transaction_unreleased(&transaction, &bindings) {
+                Ok(outcome) => Ok(NativeResult::Transaction(session.release_page(outcome)?)),
+                Err(error) => Err(error),
+            },
             Invocation::Sequence(call) => {
                 let column = match &call { ops::SequenceCall::Nextval(_) => "nextval", ops::SequenceCall::Currval(_) => "currval", ops::SequenceCall::Setval { .. } => "setval" };
                 session.sql.execute_sequence_native(&call).map(|value| NativeResult::Sql(giggles_core::relational::SqlResult {

@@ -267,6 +267,8 @@ mod agent_pg_operations;
 mod task_release_extended;
 #[path = "task_catalog_visibility.rs"]
 mod task_catalog_visibility;
+#[path = "task_release_native.rs"]
+mod task_release_native;
 #[path = "task_release_simple.rs"]
 mod task_release_simple;
 #[path = "returning_spill_network.rs"]
