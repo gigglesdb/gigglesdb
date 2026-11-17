@@ -34,11 +34,17 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::{Bound, Range},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Instant,
 };
 
 pub(crate) const MAX_TABLES: usize = 100_000;
+
+// Tests exercise reclamation without requiring 1024 follow-up statements.
+const CURRENT_PRUNE_INTERVAL: u32 = if cfg!(test) { 1 } else { 1024 };
+thread_local! {
+    static CURRENT_HITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub(crate) struct TableEntry {
@@ -361,6 +367,7 @@ impl CatalogCache {
 /// held while waiting for a transaction lock.
 pub(crate) struct Catalog {
     cache: Mutex<CatalogCache>,
+    current: RwLock<Option<(Ts, Arc<CatalogSnapshot>)>>,
     services: TxnServices,
     seq: Arc<SequenceAllocator>,
 }
@@ -393,6 +400,7 @@ impl Catalog {
         }
         Ok(Self {
             cache: Mutex::new(cache),
+            current: RwLock::new(None),
             services,
             seq,
         })
@@ -410,6 +418,35 @@ impl Catalog {
             .map_err(|_| TxnError::Misuse)?
             .ensure_live()?;
         Ok(())
+    }
+
+    fn current_for(&self, txn: &Transaction, ts: Ts) -> Option<(Ts, Arc<CatalogSnapshot>)> {
+        if !matches!(self.services, TxnServices::Local { .. })
+            || txn.catalog_writes().next().is_some()
+            || txn.snapshot_error().is_some()
+        {
+            return None;
+        }
+        // DDL clears current before sequencer submission. Its visible Release
+        // store and the reader's snapshot Acquire load precede this RwLock read:
+        // a snapshot at/after that commit sees None or the newly published view.
+        let current = self.current.read().ok()?.as_ref()
+            .filter(|(version, _)| ts >= *version).cloned()?;
+        // Release the RwLock before trying the cache mutex (DDL takes them in
+        // the opposite order). Reclaim after old readers leave, even without DDL;
+        // most acquisitions skip pruning, and periodic ones never wait for DDL.
+        CURRENT_HITS.with(|hits| {
+            let next = hits.get() + 1;
+            let reclaim = next == CURRENT_PRUNE_INTERVAL;
+            hits.set(if reclaim { 0 } else { next });
+            if reclaim
+                && let Ok(mut cache) = self.cache.try_lock()
+                && !cache.poisoned
+            {
+                let _ = self.prune_locked(&mut cache);
+            }
+        });
+        Some(current)
     }
 
     pub(crate) fn reserve_ids(&self, n: u64) -> Result<Range<u64>, CoreError> {
@@ -461,12 +498,15 @@ impl Catalog {
         &self,
         txn: &mut Transaction,
     ) -> Result<Arc<CatalogSnapshot>, CoreError> {
+        let ts = txn.snapshot_ts();
+        if let Some((_, snapshot)) = self.current_for(txn, ts) {
+            return Ok(snapshot);
+        }
         self.check().map_err(CoreError::from)?;
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
-        let ts = txn.snapshot_ts();
         if let Some(error) = txn.snapshot_error() {
             return Err(error.clone().into());
         }
@@ -479,7 +519,6 @@ impl Catalog {
         &self,
         txn: &Transaction,
     ) -> Result<Arc<CatalogSnapshot>, CoreError> {
-        self.check().map_err(CoreError::from)?;
         // Pin the existing visible-timestamp fallback only for this acquisition.
         // Do not assign a transaction snapshot: metadata must still leave an
         // unselected transaction unselected. The pin prevents pruning/GC from
@@ -492,6 +531,10 @@ impl Catalog {
                 pin.ts()
             }
         };
+        if let Some((_, snapshot)) = self.current_for(txn, ts) {
+            return Ok(snapshot);
+        }
+        self.check().map_err(CoreError::from)?;
         let mut cache = self
             .cache
             .lock()
@@ -508,6 +551,9 @@ impl Catalog {
             return None;
         }
         let ts = txn.current_snapshot_ts()?;
+        if let Some((version, _)) = self.current_for(txn, ts) {
+            return Some(version);
+        }
         let cache = self.cache.lock().ok()?;
         let end = cache.versions.partition_point(|(version, _)| *version <= ts);
         end.checked_sub(1).map(|index| cache.versions[index].0)
@@ -519,7 +565,6 @@ impl Catalog {
         &self,
         txn: &Transaction,
     ) -> Result<(Arc<CatalogSnapshot>, Option<Ts>), CoreError> {
-        self.check().map_err(CoreError::from)?;
         let pin;
         let ts = match txn.current_snapshot_ts() {
             Some(ts) => ts,
@@ -528,6 +573,10 @@ impl Catalog {
                 pin.ts()
             }
         };
+        if let Some((version, snapshot)) = self.current_for(txn, ts) {
+            return Ok((snapshot, Some(version)));
+        }
+        self.check().map_err(CoreError::from)?;
         let mut cache = self
             .cache
             .lock()
@@ -547,8 +596,8 @@ impl Catalog {
         ts: Ts,
     ) -> Result<Arc<CatalogSnapshot>, CoreError> {
         cache.ensure_live().map_err(CoreError::from)?;
-        // Acquisition also reclaims derived versions after a long-lived reader
-        // leaves, even when subsequent commits contain no catalog writes.
+        // Mutex acquisitions and periodic fast-path hits reclaim derived versions
+        // after a long-lived reader leaves, even without further catalog writes.
         self.prune_locked(cache)?;
         self.refresh_locked(cache, ts)?;
         let end = cache
@@ -571,11 +620,14 @@ impl Catalog {
             )?)));
         }
         let version = *version;
-        if let Some(snapshot) = cache.snapshots.get(&version) {
-            return Ok(snapshot.clone());
+        let snapshot = cache.snapshots.entry(version)
+            .or_insert_with(|| Arc::new(CatalogSnapshot::new(view))).clone();
+        if matches!(self.services, TxnServices::Local { .. })
+            && cache.versions.last().is_some_and(|(latest, _)| *latest == version)
+        {
+            *self.current.write().map_err(|_| corrupt("catalog current lock poisoned"))? =
+                Some((version, snapshot.clone()));
         }
-        let snapshot = Arc::new(CatalogSnapshot::new(view));
-        cache.snapshots.insert(version, snapshot.clone());
         Ok(snapshot)
     }
     /// Cluster gateways (GD-0075 P7-1): DDL committed through another gateway reaches this
@@ -620,6 +672,9 @@ impl Catalog {
     fn publish_loaded(&self, cache: &mut CatalogCache, ts: Ts) -> Result<(), CoreError> {
         let kv = self.services.read_view(ts);
         let view = load_view_until(&*kv, ts, catalog_end(&self.services))?;
+        if matches!(self.services, TxnServices::Local { .. }) {
+            *self.current.write().map_err(|_| corrupt("catalog current lock poisoned"))? = None;
+        }
         cache.publish(ts, view);
         if matches!(self.services, TxnServices::Cluster(_)) && !cache.poisoned {
             cache.tokens.insert(ts, (generation_token(&*kv, ts)?, ts));
@@ -1103,6 +1158,13 @@ impl Catalog {
             }
             TxnServices::Local { .. } => None,
         };
+        // Clear under the cache mutex BEFORE finish submits to the sequencer:
+        // clear -> submit -> visible Release -> reader snapshot Acquire ->
+        // current RwLock read. New snapshots cannot return the old catalog;
+        // they wait on this mutex until commit and publication are complete.
+        if matches!(self.services, TxnServices::Local { .. }) {
+            *self.current.write().map_err(|_| TxnError::Misuse)? = None;
+        }
         finish(txn, guard, |ts| {
             let view = match self.load_at(ts) {
                 Ok(view) => view,
@@ -1788,6 +1850,10 @@ mod commit_fast_tests;
 #[path = "catalog_snapshot_tests.rs"]
 mod snapshot_tests;
 
+#[cfg(test)]
+#[path = "catalog_current_tests.rs"]
+mod current_tests;
+
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[test]
 fn unknown_binding_fence_fails_closed() {
@@ -1799,7 +1865,11 @@ fn unknown_binding_fence_fails_closed() {
     let Backend::V2(db) = &admin.inner.backend else {
         unreachable!()
     };
-    db.catalog().cache.lock().unwrap().versions.clear();
+    {
+        let mut cache = db.catalog().cache.lock().unwrap();
+        *db.catalog().current.write().unwrap() = None;
+        cache.versions.clear();
+    }
     assert_eq!(
         session.snapshot_identity_engine(),
         Err(CoreError::Sql(relational::SqlError::StaleSchema))
