@@ -513,3 +513,4 @@ mod pgparity_typeof;
 #[path = "task_readlog.rs"] mod task_readlog;
 #[path = "task_protected_commit.rs"] mod task_protected_commit;
 #[path = "task_prepare_rules.rs"] mod task_prepare_rules;
+#[path = "replica_role_fk.rs"] mod replica_role_fk;

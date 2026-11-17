@@ -25,6 +25,7 @@ pub(crate) struct Settings {
     pub timezone: String,
     pub datestyle: String,
     pub intervalstyle: String,
+    pub session_replication_role: String,
     /// Only public contains engine tables; non-public schemas resolve nothing.
     /// Unqualified names still resolve to public even for an empty path, until
     /// schemas exist. This is an intentional restore-compatibility divergence.
@@ -57,6 +58,7 @@ impl Default for Settings {
             timezone: "UTC".into(),
             datestyle: "ISO, MDY".into(),
             intervalstyle: "postgres".into(),
+            session_replication_role: "origin".into(),
             search_path: r#""$user", public"#.into(),
             client_min_messages: "notice".into(),
             check_function_bodies: "on".into(),
@@ -97,6 +99,10 @@ pub(crate) struct SessionSettings {
     savepoints: Vec<SavepointSettings>,
 }
 impl SessionSettings {
+    #[allow(dead_code)] // E8c wires this into the core statement context.
+    pub(crate) fn replication_role_replica(&self) -> bool {
+        self.current.session_replication_role == "replica"
+    }
     pub fn savepoint(&mut self, name: String) {
         self.savepoints.push(SavepointSettings {
             name,
@@ -145,13 +151,21 @@ impl SessionSettings {
             self.current.transaction_isolation = self.current.default_isolation;
         }
     }
+    pub(crate) fn reset_all(&mut self, replication_role_allowed: bool, in_transaction: bool) {
+        for name in RESETTABLE {
+            if *name == Show::SessionReplicationRole && !replication_role_allowed { continue; }
+            self.local.remove(name);
+            self.current.assign(*name, name.value(&self.defaults).1);
+        }
+        if !in_transaction {
+            self.current.transaction_read_only = self.current.default_read_only;
+            self.current.transaction_isolation = self.current.default_isolation;
+        }
+    }
     pub fn apply(&mut self, setting: &Setting, in_transaction: bool) -> bool {
         match setting {
             Setting::ResetAll => {
-                for name in RESETTABLE {
-                    self.local.remove(name);
-                    self.current.assign(*name, name.value(&self.defaults).1);
-                }
+                self.reset_all(true, in_transaction);
             }
             Setting::Database {
                 name, value, local, ..
@@ -200,6 +214,7 @@ impl Settings {
             Show::TimeZone => self.timezone = value,
             Show::DateStyle => self.datestyle = value,
             Show::IntervalStyle => self.intervalstyle = value,
+            Show::SessionReplicationRole => self.session_replication_role = value,
             Show::SearchPath => self.search_path = value,
             Show::ClientMinMessages => self.client_min_messages = value,
             Show::CheckFunctionBodies => self.check_function_bodies = value,
@@ -224,6 +239,7 @@ pub(crate) const RESETTABLE: &[Show] = &[
     Show::ClientEncoding,
     Show::StandardConformingStrings,
     Show::IntervalStyle,
+    Show::SessionReplicationRole,
     Show::ByteaOutput,
     Show::StatementTimeout,
     Show::LockTimeout,
@@ -272,6 +288,7 @@ pub(crate) enum Show {
     DateStyle,
     TimeZone,
     IntervalStyle,
+    SessionReplicationRole,
     ByteaOutput,
     StatementTimeout,
     LockTimeout,
@@ -347,6 +364,7 @@ impl Show {
             Self::DateStyle => ("DateStyle", settings.datestyle.clone()),
             Self::TimeZone => ("TimeZone", settings.timezone.clone()),
             Self::IntervalStyle => ("IntervalStyle", settings.intervalstyle.clone()),
+            Self::SessionReplicationRole => ("session_replication_role", settings.session_replication_role.clone()),
             Self::ByteaOutput => ("bytea_output", "hex".into()),
             Self::TransactionTimeout => ("transaction_timeout", "0".into()),
             Self::ClientMinMessages => {
@@ -748,5 +766,83 @@ mod tests {
         state.current.apply(&Setting::ExtraFloatDigits(3));
         state.transaction(true, false, "ROLLBACK");
         assert_eq!(state.current.extra_float_digits, 1);
+    }
+}
+
+#[cfg(test)]
+mod replication_role_tests {
+    use super::*;
+    fn apply(state: &mut SessionSettings, sql: &str, tx: bool) {
+        let assignments = parse_database(sql).unwrap().unwrap();
+        assert!(!state.apply(&assignments[0], tx));
+    }
+    #[test]
+    fn pg_settings_replication_role_values_and_reset() {
+        let mut s = SessionSettings::default();
+        assert!(!s.replication_role_replica());
+        assert_eq!(show_database("SHOW session_replication_role"), Ok(Some(Show::SessionReplicationRole)));
+        for (value, expected) in [("ORIGIN", "origin"), ("RePlIcA", "replica"), ("LOCAL", "local")] {
+            apply(&mut s, &format!("SET session_replication_role = '{value}'"), false);
+            assert_eq!(Show::SessionReplicationRole.value(&s.current), ("session_replication_role", expected.into()));
+            assert_eq!(s.replication_role_replica(), expected == "replica");
+        }
+        assert_eq!(parse_database("SET session_replication_role = invalid"), Err("22023"));
+        for sql in ["RESET session_replication_role", "SET session_replication_role = DEFAULT", "RESET ALL"] {
+            apply(&mut s, "SET session_replication_role = replica", false);
+            apply(&mut s, sql, false);
+            assert_eq!(s.current.session_replication_role, "origin");
+        }
+        s.transaction(false, true, "BEGIN");
+        apply(&mut s, "SET LOCAL session_replication_role = replica", true);
+        s.reset_all(false, true);
+        assert!(s.replication_role_replica());
+        s.transaction(true, false, "COMMIT");
+        assert!(!s.replication_role_replica());
+        let local = parse_database("SET LOCAL session_replication_role = replica").unwrap().unwrap();
+        assert!(s.apply(&local[0], false));
+        assert!(!s.replication_role_replica());
+    }
+    #[test]
+    fn pg_settings_replication_role_transaction_and_savepoints() {
+        let mut s = SessionSettings::default();
+        s.transaction(false, true, "BEGIN");
+        apply(&mut s, "SET session_replication_role = replica", true);
+        s.savepoint("a".into());
+        apply(&mut s, "SET LOCAL session_replication_role = local", true);
+        s.rollback_to("a");
+        assert!(s.replication_role_replica());
+        s.savepoint("b".into());
+        apply(&mut s, "SET LOCAL session_replication_role = origin", true);
+        s.release("b");
+        s.transaction(true, false, "COMMIT");
+        assert!(s.replication_role_replica());
+        s.transaction(false, true, "BEGIN");
+        apply(&mut s, "SET session_replication_role = local", true);
+        s.transaction(true, false, "ROLLBACK");
+        assert!(s.replication_role_replica());
+        s.transaction(false, true, "BEGIN");
+        apply(&mut s, "SET LOCAL session_replication_role = origin", true);
+        s.transaction(true, false, "ROLLBACK");
+        assert!(s.replication_role_replica());
+        s.transaction(false, true, "BEGIN");
+        apply(&mut s, "SET LOCAL session_replication_role = origin", true);
+        s.transaction(true, false, "COMMIT");
+        assert!(s.replication_role_replica());
+    }
+    #[test]
+    fn pg_settings_replication_role_functions() {
+        let mut s = SessionSettings::default();
+        let call = parse_function("SELECT set_config('session_replication_role', 'REPLICA', false)").unwrap().unwrap();
+        assert_eq!(call.evaluate(&mut s), Ok(Some("replica".into())));
+        let call = parse_function("SELECT current_setting('session_replication_role') AS r, pg_catalog.current_setting('intervalstyle') AS i").unwrap().unwrap();
+        let columns = call.current_columns().unwrap();
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].evaluate(&mut s), Ok(Some("replica".into())));
+        assert_eq!(columns[1].evaluate(&mut s), Ok(Some("postgres".into())));
+        assert_eq!(columns[0].column(), "r");
+        assert_eq!(columns[1].column(), "i");
+        for sql in ["SELECT current_setting('session_replication_role'), set_config('application_name','x',false)", "SELECT current_setting('session_replication_role'), current_setting('intervalstyle') FROM x"] {
+            assert!(parse_function(sql).unwrap().is_none());
+        }
     }
 }

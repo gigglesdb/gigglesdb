@@ -171,6 +171,7 @@ impl State {
         for _ in &columns {
             response.extend(u16::from(binary).to_be_bytes());
         }
+        core(session.sync_replication_role(&self.settings))?;
         let clock = session.copy_clock();
         let streaming = !binary && core(session.sql.begin_copy_input())?;
         if streaming { decoder.stream(); }

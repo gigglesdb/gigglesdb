@@ -2091,6 +2091,16 @@ impl Session {
             result
         })
     }
+    /// Copy the effective pgwire setting after its transaction has started.
+    pub(crate) fn sync_replication_role(
+        &mut self,
+        settings: &crate::pg_settings::SessionSettings,
+    ) -> Result<(), CoreError> {
+        if self.sql.in_transaction() && !self.sql.is_aborted() {
+            self.sql.set_replication_role_replica(settings.replication_role_replica())?;
+        }
+        Ok(())
+    }
     pub fn execute_prepared(
         &mut self,
         p: &Prepared,

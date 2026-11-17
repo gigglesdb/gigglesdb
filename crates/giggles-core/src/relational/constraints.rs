@@ -55,6 +55,8 @@ pub(super) fn canonicalize_create(
 }
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DeferralState {
+    // Transaction-local trigger mode; never part of the persisted catalog.
+    pub(crate) replica: bool,
     pub(crate) modes: BTreeMap<u64, bool>,
     pub(crate) pending: BTreeMap<(u64, u64), BTreeSet<Vec<u8>>>,
 }
@@ -730,6 +732,9 @@ pub(super) fn enforce_with_rows<'a>(
         if affected > MAX_ROWS {
             return Err(SqlError::Limit);
         }
+        if deferred.replica {
+            continue;
+        }
         let mut incoming = state
             .ext
             .constraints
@@ -917,6 +922,9 @@ pub(super) fn enforce_with_rows<'a>(
             })
             .collect::<BTreeSet<_>>();
         for constraint in cs {
+            if deferred.replica && matches!(constraint.kind, ConstraintKind::ForeignKey { .. }) {
+                continue;
+            }
             let changed = if let ConstraintKind::ForeignKey { columns, .. } = &constraint.kind {
                 let positions = id_positions(table, columns)?;
                 changed

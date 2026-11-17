@@ -144,6 +144,7 @@ pub(super) fn execute(
 pub(crate) fn validate_append(state: &Relational, table: &TableDef, first_version: u64,
     version_end: u64, sink: &mut impl RowSink, deferred: Option<&mut DeferralState>, clock: Option<&clock::ExecutionClock>,
 ) -> Result<(), CoreError> {
+        if deferred.as_ref().is_some_and(|state| state.replica) { return Ok(()); }
         let immediate_mode = deferred.is_none();
         let mut immediate = DeferralState::default();
         let pending = match deferred { Some(deferred) => deferred, None => &mut immediate };

@@ -13,6 +13,7 @@ pub(crate) enum Function {
         column: String,
     },
     Current {
+        additional: Vec<Function>,
         name: String,
         missing_ok: bool,
         from_settings: bool,
@@ -20,6 +21,13 @@ pub(crate) enum Function {
     },
 }
 impl Function {
+    pub fn current_columns(&self) -> Option<Vec<&Function>> {
+        if let Self::Current { additional, .. } = self {
+            let mut columns = vec![self];
+            columns.extend(additional);
+            Some(columns)
+        } else { None }
+    }
     pub fn column(&self) -> &str {
         match self {
             Self::Inventory(_) => "setting",
@@ -68,7 +76,7 @@ impl Function {
         }
     }
 }
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Token {
     Word(String),
     Ident(String),
@@ -243,10 +251,36 @@ fn inventory(tokens: Vec<Token>) -> Option<Function> {
     Some(Function::Inventory(ResultSet { fields, rows }))
 }
 fn parse(sql: &str) -> Option<Function> {
-    let mut p = Parser {
-        tokens: lex(sql)?,
-        at: 0,
-    };
+    let tokens = lex(sql)?;
+    let mut depth = 0;
+    let mut start = 1;
+    let mut parts = Vec::new();
+    if tokens.first() != Some(&Token::Word("select".into())) { return None; }
+    for (at, token) in tokens.iter().enumerate().skip(1) {
+        match token {
+            Token::Left => depth += 1,
+            Token::Right => depth -= 1,
+            Token::Comma if depth == 0 => { parts.push(tokens[start..at].to_vec()); start = at + 1; }
+            _ => {}
+        }
+    }
+    if !parts.is_empty() {
+        parts.push(tokens[start..].to_vec());
+        let mut calls = Vec::new();
+        for mut part in parts {
+            part.insert(0, Token::Word("select".into()));
+            let call = parse_tokens(part)?;
+            if !matches!(call, Function::Current { from_settings: false, .. }) { return None; }
+            calls.push(call);
+        }
+        let mut first = calls.remove(0);
+        if let Function::Current { additional, .. } = &mut first { *additional = calls; }
+        return Some(first);
+    }
+    parse_tokens(tokens)
+}
+fn parse_tokens(tokens: Vec<Token>) -> Option<Function> {
+    let mut p = Parser { tokens, at: 0 };
     p.token(Token::Word("select".into()))?;
     let mut function = p.word()?;
     if function == "pg_catalog" {
@@ -269,6 +303,7 @@ fn parse(sql: &str) -> Option<Function> {
         p.token(Token::Equals)?;
         let name = p.text()?;
         return (p.at == p.tokens.len()).then_some(Function::Current {
+            additional: vec![],
             name,
             missing_ok: true,
             from_settings: true,
@@ -326,6 +361,7 @@ fn parse(sql: &str) -> Option<Function> {
             false
         };
         Function::Current {
+            additional: vec![],
             name,
             missing_ok,
             from_settings: false,
@@ -388,7 +424,7 @@ pub(crate) fn parse_function(sql: &str) -> Result<Option<Function>> {
     let Some(call) = parse(sql) else {
         return Ok(None);
     };
-    if call.column().len() > 63 || call.column().is_empty() {
+    if call.current_columns().unwrap_or_else(|| vec![&call]).iter().any(|c| c.column().len() > 63 || c.column().is_empty()) {
         return Err("42601");
     }
     Ok(Some(call))

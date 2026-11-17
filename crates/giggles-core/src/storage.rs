@@ -3260,6 +3260,20 @@ impl SqlSession {
             Some(expected_version),
         )
     }
+    /// Set FK trigger suppression for the active transaction. Call before each
+    /// statement after BEGIN (including an implicit server transaction).
+    /// Existing deferred checks still run at commit; commit/rollback resets it.
+    pub fn set_replication_role_replica(&mut self, on: bool) -> Result<(), CoreError> {
+        if !self.in_transaction() {
+            return Err(CoreError::Sql(relational::SqlError::NoActiveTransaction));
+        }
+        if self.aborted {
+            return Err(CoreError::Sql(relational::SqlError::Aborted));
+        }
+        self.deferral.replica = on;
+        Ok(())
+    }
+
     pub fn in_transaction(&self) -> bool {
         self.staged.is_some() || self.v2_transaction.is_some()
     }

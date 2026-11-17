@@ -193,7 +193,7 @@ pub(super) fn paged_pending(
     state: &Relational, deferred: &mut DeferralState, names: &[String], mode: bool,
     sink: &mut impl RowSink,
 ) -> Result<SqlResult, CoreError> {
-    let mut selected = DeferralState { modes: deferred.modes.clone(), pending: BTreeMap::new() };
+    let mut selected = DeferralState { replica: deferred.replica, modes: deferred.modes.clone(), pending: BTreeMap::new() };
     state.set_constraints(&mut selected, names, mode, || crate::cancellation::check().is_err())
         .map_err(CoreError::Sql)?;
     if !mode {
@@ -205,7 +205,7 @@ pub(super) fn paged_pending(
             let mut after = None;
             while let Some((last, rows)) = sink.fk_read_page(table, after.take())? {
                 after = Some(last);
-                let mut pending = DeferralState { modes: deferred.modes.clone(), pending: BTreeMap::new() };
+                let mut pending = DeferralState { replica: deferred.replica, modes: deferred.modes.clone(), pending: BTreeMap::new() };
                 for ((id, table_id), keys) in &checks {
                     let keys = rows.keys().filter(|key| keys.contains(*key)).cloned().collect::<BTreeSet<_>>();
                     if !keys.is_empty() { pending.pending.insert((*id, *table_id), keys); }

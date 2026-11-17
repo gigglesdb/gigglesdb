@@ -22,7 +22,21 @@ impl State {
             return frame(b'I', &[], out);
         }
         if statements.len() == 1 {
-            return self.simple_statement(&statements[0], session, out, received, &mut implicit);
+            let completed = out.len();
+            let result = self.simple_statement(&statements[0], session, out, received, &mut implicit);
+            if let Err(code) = result {
+                if implicit {
+                    self.simple_failure(code, true, completed, session, out);
+                    return Ok(());
+                }
+                return Err(code);
+            }
+            if implicit && self.copy.is_none()
+                && let Err(code) = execute_control("COMMIT", session, &mut implicit, &mut self.settings, out)
+            {
+                self.simple_failure(code, true, completed, session, out);
+            }
+            return Ok(());
         }
         let output = self.output.take();
         let result = self.simple_batch(statements, session, out, received);
@@ -313,6 +327,9 @@ impl State {
         if is_copy_sql(sql) {
             let (copy, prepared) = core(session.prepare_copy(sql))?;
             read_only_check("INSERT", &self.settings, session, &mut self.diagnostic)?;
+            if self.settings.replication_role_replica() {
+                begin_implicit(session, implicit, &mut self.settings)?;
+            }
             self.settings.queried = session.in_transaction();
             self.start_copy(copy, Box::new(prepared), true, session, out)?;
             if let Some(copy) = self.copy.as_mut() {
@@ -413,6 +430,7 @@ impl State {
                 &mut self.settings,
                 session,
                 session.in_transaction(),
+                &mut self.diagnostic,
                 out,
             )?;
         } else if let Some(function) =
@@ -512,6 +530,12 @@ impl State {
                     catalog_complete(count, out)?;
                     return Ok(());
                 }
+                // Core's autocommit transaction starts inside execution, too late
+                // to set its transaction-local replica flag. Pin it here instead.
+                if self.settings.replication_role_replica() && !matches!(p.command(), "BEGIN" | "COMMIT" | "ROLLBACK") {
+                    begin_implicit(session, implicit, &mut self.settings)?;
+                }
+                self.diagnostic.core(session.sync_replication_role(&self.settings))?;
                 let (result, spilled) = giggles_core::relational::spill::streaming(
                     || session.execute_prepared(&p, &[]));
                 let result = self.diagnostic.core(result)?;
@@ -680,6 +704,27 @@ pub(super) fn parse_settings(
     diagnostic: &mut Diagnostic,
 ) -> R<Option<Vec<crate::pg_settings::Setting>>> {
     if matches!(session.role, Role::Database { .. }) {
+        if let Ok(tokens) = crate::pg_settings::database::lex(sql) {
+            use crate::pg_settings::database::{Parser, Token};
+            let mut p = Parser { tokens, at: 0 };
+            let reset = p.kw("RESET");
+            if reset || p.kw("SET") {
+                if !reset && !p.kw("SESSION") { p.kw("LOCAL"); }
+                if matches!(p.tokens.get(p.at), Some(Token::Word(name) | Token::Ident(name)) if name.eq_ignore_ascii_case("session_replication_role")) {
+                    p.at += 1;
+                    diagnostic.replication_role_authorize(session)?;
+                    if !reset {
+                        if p.tokens.get(p.at) == Some(&Token::Equals) { p.at += 1; }
+                        else { p.need("TO")?; }
+                        if !p.kw("DEFAULT") && p.tokens.len() == p.at + 1
+                            && let Some(Token::Word(value) | Token::Ident(value) | Token::Text(value)) = p.tokens.get(p.at)
+                        {
+                            diagnostic.replication_role_value(value)?;
+                        }
+                    }
+                }
+            }
+        }
         let result = diagnostic.settings(crate::pg_settings::parse_database(sql));
         if matches!(result, Err("22023"))
             && let Ok(tokens) = crate::pg_settings::database::lex(sql) {
@@ -752,6 +797,7 @@ pub(super) fn execute_settings(
     settings: &mut crate::pg_settings::SessionSettings,
     session: &Session,
     local_allowed: bool,
+    diagnostic: &mut Diagnostic,
     out: &mut Vec<u8>,
 ) -> R<()> {
     if !session.role.is_sql() {
@@ -761,15 +807,26 @@ pub(super) fn execute_settings(
         return Err("25P02");
     }
     for assignment in assignments {
+        if matches!(assignment, crate::pg_settings::Setting::Database { name: crate::pg_settings::Show::SessionReplicationRole, .. }) {
+            diagnostic.replication_role_authorize(session)?;
+        }
+    }
+    for assignment in assignments {
         let before = settings.current.clone();
+        // RESET ALL skips superuser-only parameters for unprivileged sessions.
+        let preserve_replication_role = matches!(assignment, crate::pg_settings::Setting::ResetAll)
+            && !replication_role_allowed(session)?;
         let local = matches!(
             assignment,
             crate::pg_settings::Setting::Database { local: true, .. }
         );
-        if settings.apply(
-            assignment,
-            session.in_transaction() && (!local || local_allowed),
-        ) {
+        let warn = if preserve_replication_role {
+            settings.reset_all(false, session.in_transaction());
+            false
+        } else {
+            settings.apply(assignment, session.in_transaction() && (!local || local_allowed))
+        };
+        if warn {
             warning(
                 "SET LOCAL can only be used in transaction blocks",
                 &settings.current,

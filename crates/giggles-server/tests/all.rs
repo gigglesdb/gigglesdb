@@ -266,3 +266,6 @@ mod sort_spill_network;
 #[path = "cluster_process.rs"] mod cluster_process;
 #[path = "cluster_isolation.rs"] mod cluster_isolation;
 #[path = "viewdef_parity.rs"] mod viewdef_parity;
+
+#[path = "replication_role_setting.rs"]
+mod replication_role_setting;

@@ -307,6 +307,7 @@ pub(super) fn execute(
         result.affected += batch.affected;
         output.extend(batch.rows)?;
         for (key, new) in &page.rows[&table.id] {
+            if pending.replica { continue; }
             for c in state.ext.constraints.get(&table.id).into_iter().flatten() {
                 let ConstraintKind::ForeignKey { columns, deferral, .. } = &c.kind else { continue; };
                 if !columns.iter().any(|id| {
@@ -562,6 +563,7 @@ impl ActionWork {
                     }
                 }
             }
+            if self.pending.replica { continue; }
             if let Some(row) = &new {
                 for c in state.ext.constraints.get(&table.id).into_iter().flatten() {
                     let ConstraintKind::ForeignKey { columns, deferral, .. } = &c.kind else { continue; };

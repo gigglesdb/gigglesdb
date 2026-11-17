@@ -13,6 +13,14 @@ pub(super) fn parse(
     diagnostic.settings(crate::pg_settings::parse_function(sql))
 }
 pub(super) fn description(function: &crate::pg_settings::Function) -> Description {
+    if let Some(columns) = function.current_columns() {
+        return Description {
+            type_oids: vec![], typmods: vec![-1; columns.len()], parameters: vec![],
+            columns: columns.iter().map(|call| giggles_core::relational::ColumnDef {
+                id: 0, name: call.column().into(), data_type: DataType::Text, not_null: false,
+            }).collect(),
+        };
+    }
     if let crate::pg_settings::Function::Inventory(result) = function {
         return Description {
             type_oids: result.fields.iter().map(|f| f.data_type.oid()).collect(),
@@ -56,6 +64,19 @@ pub(super) fn evaluate(
                 giggles_pg_catalog::Value::Text(s) => Value::Text(s.clone()), giggles_pg_catalog::Value::Numeric(n) => Value::Numeric(n.clone()),
                 giggles_pg_catalog::Value::Bool(b) => Value::Bool(*b), _ => Value::Null,
             }).collect() }).collect(),
+        });
+    }
+    if function.has_row(settings)
+        && let crate::pg_settings::Function::Set { name, value, .. } = function
+        && name.eq_ignore_ascii_case("session_replication_role") {
+        diagnostic.replication_role_authorize(session)?;
+        diagnostic.replication_role_value(value)?;
+    }
+    if let Some(columns) = function.current_columns() {
+        let values = columns.iter().map(|call| diagnostic.settings(call.evaluate(settings)).map(|v| v.map(Value::Text).unwrap_or(Value::Null))).collect::<R<Vec<_>>>()?;
+        return Ok(SqlResult {
+            columns: columns.iter().map(|c| c.column().into()).collect(),
+            rows: if function.has_row(settings) { vec![giggles_core::relational::SqlRow { values, version: 0 }] } else { vec![] }, affected: 0,
         });
     }
     let before = settings.current.clone();

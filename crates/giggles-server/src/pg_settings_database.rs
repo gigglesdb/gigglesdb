@@ -153,6 +153,7 @@ pub(crate) fn lookup_name(name: &str) -> Result<Show> {
         "standard_conforming_strings" => Ok(Show::StandardConformingStrings),
         "search_path" => Ok(Show::SearchPath),
         "intervalstyle" => Ok(Show::IntervalStyle),
+        "session_replication_role" => Ok(Show::SessionReplicationRole),
         "bytea_output" => Ok(Show::ByteaOutput),
         "statement_timeout" => Ok(Show::StatementTimeout),
         "lock_timeout" => Ok(Show::LockTimeout),
@@ -330,6 +331,7 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
         }
         Show::StandardConformingStrings if lower == "on" => Ok("on".into()),
         Show::IntervalStyle => interval_style(&value),
+        Show::SessionReplicationRole => replication_role(&value),
         Show::ByteaOutput if lower == "hex" => Ok("hex".into()),
         Show::ClientMinMessages
             if matches!(
@@ -439,6 +441,13 @@ fn search_path(values: Vec<Token>) -> Result<String> {
         }
     }
     Ok(schemas.join(", "))
+}
+
+pub(crate) fn replication_role(value: &str) -> Result<String> {
+    match value.to_ascii_lowercase().as_str() {
+        "origin" | "replica" | "local" => Ok(value.to_ascii_lowercase()),
+        _ => Err("22023"),
+    }
 }
 
 pub(crate) fn interval_style(value: &str) -> Result<String> {

@@ -136,7 +136,15 @@ struct Diagnostic {
     message: Option<&'static str>,
     wire_message: Option<String>,
     wire_detail: Option<&'static str>,
+    wire_hint: Option<&'static str>,
     query_id: Option<String>,
+}
+fn replication_role_allowed(session: &Session) -> R<bool> {
+    match &session.role {
+        Role::Database { name } => Ok(session.service.admin.roles().get(name)
+            .map_err(|_| "42501")?.is_some_and(|role| role.superuser)),
+        _ => Ok(false),
+    }
 }
 impl Diagnostic {
     fn core<T>(&mut self, result: Result<T, CoreError>) -> R<T> {
@@ -170,6 +178,20 @@ impl Diagnostic {
                 _ => None,
             };
         })
+    }
+    fn replication_role_value(&mut self, value: &str) -> R<()> {
+        crate::pg_settings::database::replication_role(value).map(|_| ()).inspect_err(|_| {
+            self.wire_message = Some(format!("invalid value for parameter \"session_replication_role\": \"{value}\""));
+            self.wire_hint = Some("Available values: origin, replica, local.");
+        })
+    }
+    fn replication_role_authorize(&mut self, session: &Session) -> R<()> {
+        // The registry has table owners only; CatalogSnapshot.database_owner is
+        // a presentation default (OID 10), not database ownership authority.
+        let allowed = replication_role_allowed(session)?;
+        if allowed { return Ok(()); }
+        self.wire_message = Some("permission denied to set parameter \"session_replication_role\"".into());
+        Err("42501")
     }
     fn query(&mut self, sql: &str) {
         use sha2::{Digest, Sha256};
@@ -219,6 +241,10 @@ fn diagnostic_error(
     if let Some(detail) = detail {
         b.push(b'D');
         z(diagnostic.and_then(|d| d.wire_detail).unwrap_or(&detail), &mut b);
+    }
+    if let Some(hint) = diagnostic.and_then(|d| d.wire_hint) {
+        b.push(b'H');
+        z(hint, &mut b);
     }
     if code == "0A000" && diagnostic.and_then(|d| d.wire_message.as_deref()) == Some("view projection bindings unavailable; recreate the view") {
         b.push(b'H');
@@ -1823,6 +1849,7 @@ impl State {
                         &mut self.settings,
                         session,
                         session.in_transaction() && !self.implicit,
+                        &mut self.diagnostic,
                         out,
                     )?;
                     p.result = Some(SqlResult::default());
@@ -1943,6 +1970,7 @@ impl State {
                         self.implicit = false;
                         (SqlResult::default(), None)
                     } else {
+                        self.diagnostic.core(session.sync_replication_role(&self.settings))?;
                         let (result, spilled) = giggles_core::relational::spill::streaming(
                             || session.execute_prepared(prepared, &p.params));
                         (self.diagnostic.core(result)?, spilled)
@@ -2398,6 +2426,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         };
         state.diagnostic = Diagnostic {
             wire_detail: None,
+            wire_hint: None,
             wire_message: None,
             message: None,
             phase: match tag {
@@ -2779,5 +2808,26 @@ mod catalog_text_cast_input_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod replication_role_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn pg_settings_replication_role_value_diagnostic() {
+        let mut diagnostic = Diagnostic::default();
+        assert_eq!(diagnostic.replication_role_value("REPLICA"), Ok(()));
+        assert!(diagnostic.wire_hint.is_none());
+        assert_eq!(diagnostic.replication_role_value("Bogus"), Err("22023"));
+        assert_eq!(diagnostic.wire_message.as_deref(), Some("invalid value for parameter \"session_replication_role\": \"Bogus\""));
+        assert_eq!(diagnostic.wire_hint, Some("Available values: origin, replica, local."));
+        let mut out = vec![];
+        diagnostic_error("22023", GENERIC_MESSAGE, Some(&diagnostic), &mut out);
+        assert_eq!(out[0], b'E');
+        let fields: Vec<_> = out[5..].split(|b| *b == 0).collect();
+        assert!(fields.contains(&b"HAvailable values: origin, replica, local.".as_slice()));
+        diagnostic_error("42501", GENERIC_MESSAGE, Some(&Diagnostic::default()), &mut out);
+        assert!(!out[5..].split(|b| *b == 0).any(|f| f.first() == Some(&b'H')));
     }
 }

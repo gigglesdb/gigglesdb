@@ -526,7 +526,7 @@ impl State {
                 if !settings.iter().all(setting_allowed) {
                     return Err(refuse(&mut self.diagnostic, StatementClass::Set));
                 }
-                execute_settings(settings, &mut self.settings, session, false, out)
+                execute_settings(settings, &mut self.settings, session, false, &mut self.diagnostic, out)
             }
             Plan::SettingsFunction(function) => {
                 if !function_allowed(function) {
