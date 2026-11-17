@@ -31,21 +31,28 @@
 //!   cancellation (57014), limits and an ambiguous commit (08007) surface
 //!   unchanged.
 //!
-//! `Apply` and `Undo` (and `Actor::Undo`) are `Unsupported` until R3-618.
+//! R3-618 adds the attachment points. `Apply` runs through an [`ApplySource`]
+//! that Phase 7 implements over the stored preview and approval: the source
+//! supplies the statement to re-run, the approval state of the re-run
+//! effects (step 12) and stages the consumption in the commit's write set
+//! (step 13). Until R3-706 fills in [`stored_apply_source`], an Apply is
+//! `Unsupported`. `Undo` (and `Actor::Undo`) stays `Unsupported` until R3-803,
+//! whose arm needs the undo-specific checks, identity and change record.
 use super::authority;
 use super::context::TaskContext;
 use super::decide::{self, ApprovalState, Decision, RequestKind};
 use super::definition::{RoleName, TaskDef};
 use super::effects::Effects;
 use super::error::{Budget, DenyRule, TaskError};
-use super::ledger::{self, OperationId, RequestBody};
+use super::ledger::{self, OperationId, Outcome, RequestBody};
 use super::preview::PreviewId;
-use super::receipt::{self, Receipt, DECISION_COMMITTED};
+use super::receipt::{self, ChangeRecord, Receipt, DECISION_COMMITTED};
 use super::records::{
-    change_header_key, change_row_key, receipt_key, MutationHead, OutcomePayload, OutcomeRecord,
-    ReceiptRecord, TaskObjectId, MAX_STATEMENT_TEXT,
+    change_header_key, change_row_key, receipt_key, ChangeHeader, ChangeRow, MutationHead,
+    OutcomePayload, OutcomeRecord, ReceiptRecord, TaskObjectId, MAX_STATEMENT_TEXT,
 };
 use super::undo::UndoMode;
+use crate::relational::clock::ExecutionClock;
 use crate::relational::{Prepared, SqlError, Value};
 use crate::storage::engine::meta::REPLICATED;
 use crate::storage::engine::txn::{Savepoint, TxnError};
@@ -83,6 +90,51 @@ pub enum ProtectedRequest {
         digest: [u8; 32],
         mode: UndoMode,
     },
+}
+
+/// What Phase 7 (apply) supplies to a protected commit. Every method runs
+/// under the authority hold, inside the attempt; a retried attempt calls
+/// them again.
+pub(crate) trait ApplySource {
+    /// The stored statement to re-run and its parameters, prepared under the
+    /// current catalog. A preview that no longer holds is `ApprovalStale`.
+    fn statement(&self, session: &mut SqlSession) -> Result<(Prepared, Vec<Value>), TaskError>;
+    /// The pinned clock the statement re-runs with (D7.4); `None` is the
+    /// session clock.
+    fn clock(&self) -> Option<ExecutionClock> {
+        None
+    }
+    /// Compares the re-run `effects` with the stored preview and reads the
+    /// approval, through `txn` (tracked reads at the statement snapshot).
+    fn approval_state(
+        &self,
+        txn: &mut Transaction,
+        effects: &Effects,
+    ) -> Result<ApprovalState, CoreError>;
+    /// Stages the preview's applied state and, when one was used, the
+    /// approval's consumption under receipt `seq`, in the commit's write set.
+    fn stage_consumed(&self, txn: &mut Transaction, seq: u64) -> Result<(), CoreError>;
+}
+
+/// Resolves the [`ApplySource`] of an Apply request, once per call, after
+/// the outcome lookup and the task checks (D-F steps 2 and 3).
+pub(crate) type Sources<'a> = dyn FnMut(
+        &V2Db,
+        &TaskContext,
+        PreviewId,
+        &[u8; 32],
+    ) -> Result<Box<dyn ApplySource + 'a>, TaskError>
+    + 'a;
+
+/// The attachment point for Phase 7: R3-706 returns the stored preview and
+/// approval of `preview` here. Until then an Apply is `Unsupported`.
+pub(crate) fn stored_apply_source(
+    _db: &V2Db,
+    _ctx: &TaskContext,
+    _preview: PreviewId,
+    _digest: &[u8; 32],
+) -> Result<Box<dyn ApplySource>, TaskError> {
+    Err(unsupported())
 }
 
 /// Where a definition is read.
@@ -161,16 +213,20 @@ fn role_error(error: RoleError) -> TaskError {
 }
 
 /// Revoked: missing, revoked, another task, another executor or a newer
-/// definition (R3 has no ALTER TASK). Expired: `now >= expires_at`.
+/// definition (R3 has no ALTER TASK).
+fn bound<'d>(def: Option<&'d TaskDef>, ctx: &TaskContext) -> Result<&'d TaskDef, TaskError> {
+    def.filter(|def| {
+        !def.revoked
+            && def.id == ctx.task
+            && def.def_version == ctx.bound_def_version
+            && def.executor == ctx.executor
+    })
+    .ok_or(TaskError::Revoked)
+}
+
+/// [`bound`], then Expired: `now >= expires_at`.
 fn standing(def: Option<&TaskDef>, ctx: &TaskContext, now_ms: u64) -> Result<(), TaskError> {
-    let def = def
-        .filter(|def| {
-            !def.revoked
-                && def.id == ctx.task
-                && def.def_version == ctx.bound_def_version
-                && def.executor == ctx.executor
-        })
-        .ok_or(TaskError::Revoked)?;
+    let def = bound(def, ctx)?;
     if i64::try_from(now_ms).unwrap_or(i64::MAX) >= def.expires_at.0 {
         return Err(TaskError::Expired);
     }
@@ -191,27 +247,121 @@ fn replay(
     if &record.request_fp != fp {
         return Err(TaskError::OperationConflict);
     }
+    match stored_outcome(db, task, &record, View::Minimal)? {
+        Outcome::Committed(receipt) => Ok(Some(receipt)),
+        Outcome::Denied(rule) => Err(TaskError::Denied(rule)),
+        Outcome::BudgetExceeded(budget) => Err(TaskError::BudgetExceeded(budget)),
+    }
+}
+
+/// Which receipt view an outcome lookup returns (D-H).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// The executor's: no roles, versions, after-counters or change record.
+    Minimal,
+    /// The inspector's: the stored record and its change record.
+    Full,
+}
+
+/// Decodes a stored outcome of `task`. A committed outcome reads its
+/// receipt (and, for the full view, its change record) at the latest
+/// committed state; nothing is written and no hold is taken.
+fn stored_outcome(
+    db: &V2Db,
+    task: TaskObjectId,
+    record: &OutcomeRecord,
+    view: View,
+) -> Result<Outcome, TaskError> {
     match record.payload {
         OutcomePayload::Committed { task: stored, seq } if stored == task => {
             let txn = db.begin(Isolation::ReadCommitted);
-            let value = txn
-                .kernel_latest_committed(&receipt_key(task, seq))
-                .map_err(CoreError::from)?
+            let read = |key: &[u8]| -> Result<Option<Vec<u8>>, TaskError> {
+                Ok(txn.kernel_latest_committed(key).map_err(CoreError::from)?)
+            };
+            let value = read(&receipt_key(task, seq))?
                 .ok_or_else(|| corrupt("task outcome without receipt"))?;
-            drop(txn);
             let stored = ReceiptRecord::decode(&value)?;
-            Ok(Some(Receipt::from_record(&stored, None).minimal()))
+            if view == View::Minimal {
+                return Ok(Outcome::Committed(Receipt::from_record(&stored, None).minimal()));
+            }
+            let header = read(&change_header_key(task, seq))?
+                .ok_or_else(|| corrupt("task receipt without change record"))?;
+            let header = ChangeHeader::decode(&header)?;
+            let rows = (0..header.row_count)
+                .map(|row_no| {
+                    let value = read(&change_row_key(task, seq, row_no))?
+                        .ok_or_else(|| corrupt("task change record row missing"))?;
+                    Ok(ChangeRow::decode(&value)?)
+                })
+                .collect::<Result<Vec<_>, TaskError>>()?;
+            let change = ChangeRecord { header, rows };
+            Ok(Outcome::Committed(Receipt::from_record(&stored, Some(change))))
         }
-        OutcomePayload::Denied { task: stored, rule, .. } if stored == task => Err(TaskError::Denied(
+        OutcomePayload::Denied { task: stored, rule, .. } if stored == task => Ok(Outcome::Denied(
             DenyRule::from_code(rule).ok_or_else(|| corrupt("task outcome deny rule"))?,
         )),
         OutcomePayload::BudgetExceeded { task: stored, budget, .. } if stored == task => {
-            Err(TaskError::BudgetExceeded(
+            Ok(Outcome::BudgetExceeded(
                 Budget::from_code(budget).ok_or_else(|| corrupt("task outcome budget"))?,
             ))
         }
         _ => Err(corrupt("task outcome of another kind or task")),
     }
+}
+
+/// The database an outcome lookup reads: v2 only (D9), not replicated (D13).
+fn lookup_db(session: &SqlSession) -> Result<Arc<V2Db>, TaskError> {
+    let db = session.v2_db().ok_or_else(unsupported)?;
+    if db.meta.features & REPLICATED != 0 {
+        return Err(unsupported());
+    }
+    Ok(db)
+}
+
+/// `SHOW OPERATION '<id>'` for the session's executor (D-G): the stored
+/// outcome of `op` under the session's own task, `None` when the ID was never
+/// decided (or its refusal was not recorded). Never writes and takes no hold.
+///
+/// A revoked task (or a definition the session is no longer bound to) is
+/// `Revoked`; an expired task may still look up its outcomes. A committed
+/// outcome returns the minimal receipt.
+pub fn outcome(
+    session: &SqlSession,
+    ctx: &TaskContext,
+    op: &OperationId,
+) -> Result<Option<Outcome>, TaskError> {
+    outcome_with(session, ctx, op, &mut catalog_def)
+}
+
+pub(crate) fn outcome_with(
+    session: &SqlSession,
+    ctx: &TaskContext,
+    op: &OperationId,
+    load_def: &mut LoadDef<'_>,
+) -> Result<Option<Outcome>, TaskError> {
+    let db = lookup_db(session)?;
+    let def = load_def(&db, ctx.task, DefAt::Latest)?;
+    // Revocation only: an expired task may still read its outcomes.
+    bound(def.as_deref(), ctx)?;
+    let key = ledger::task_outcome_key(&db, ctx.task, op);
+    ledger::lookup(&db, &key)?
+        .map(|record| stored_outcome(&db, ctx.task, &record, View::Minimal))
+        .transpose()
+}
+
+/// The inspector's outcome lookup (D-G): no revocation or expiry check, and a
+/// committed outcome returns the full receipt with its change record. The
+/// caller checks the inspection privilege. Never writes and takes no hold.
+pub fn inspect_outcome(
+    session: &SqlSession,
+    task: TaskObjectId,
+    op: &OperationId,
+) -> Result<Option<Outcome>, TaskError> {
+    let db = lookup_db(session)?;
+    let key = ledger::task_outcome_key(&db, task, op);
+    ledger::lookup(&db, &key)?
+        .map(|record| stored_outcome(&db, task, &record, View::Full))
+        .transpose()
 }
 
 /// The fingerprinted body of a Direct request.
@@ -232,13 +382,24 @@ pub(crate) const ATTEMPTS: usize = 3;
 /// plus or minus half (D-F: 2 ms, then 8 ms).
 const BACKOFF_MS: [u64; ATTEMPTS - 1] = [2, 8];
 
+/// What a call runs.
+enum Work<'c> {
+    Direct {
+        statement: &'c Prepared,
+        params: &'c [Value],
+    },
+    Apply {
+        preview: PreviewId,
+        source: &'c dyn ApplySource,
+    },
+}
+
 /// What every attempt of one call shares.
 struct Call<'c> {
     db: Arc<V2Db>,
     ctx: &'c TaskContext,
     op: &'c OperationId,
-    statement: &'c Prepared,
-    params: &'c [Value],
+    work: Work<'c>,
     key: Vec<u8>,
     fp: [u8; 32],
 }
@@ -277,6 +438,18 @@ pub(crate) fn commit_with(
     request: ProtectedRequest,
     load_def: &mut LoadDef<'_>,
 ) -> Result<Receipt, TaskError> {
+    commit_sourced(session, actor, op, request, load_def, &mut stored_apply_source)
+}
+
+/// [`commit_with`] with the Apply source resolved by `sources`.
+pub(crate) fn commit_sourced(
+    session: &mut SqlSession,
+    actor: Actor<'_>,
+    op: &OperationId,
+    request: ProtectedRequest,
+    load_def: &mut LoadDef<'_>,
+    sources: &mut Sources<'_>,
+) -> Result<Receipt, TaskError> {
     // 0. v2 only (D9), not replicated (D13).
     let db = session.v2_db().ok_or_else(unsupported)?;
     if db.meta.features & REPLICATED != 0 {
@@ -286,12 +459,18 @@ pub(crate) fn commit_with(
         Actor::Executor(ctx) => ctx,
         Actor::Undo { .. } => return Err(unsupported()),
     };
-    let ProtectedRequest::Direct { statement, params, text } = &request else {
-        return Err(unsupported());
-    };
     let task = ctx.task;
     // 1. Fingerprint.
-    let fp = ledger::request_fingerprint(task, &direct_body(text, params)?);
+    let body = match &request {
+        ProtectedRequest::Direct { text, params, .. } => direct_body(text, params)?,
+        ProtectedRequest::Apply { preview, digest } => RequestBody::Apply {
+            preview: preview.0,
+            digest: *digest,
+        },
+        // R3-803: identity kind 03 and the undo-specific checks.
+        ProtectedRequest::Undo { .. } => return Err(unsupported()),
+    };
+    let fp = ledger::request_fingerprint(task, &body);
     let key = ledger::task_outcome_key(&db, task, op);
     // 2. Outcome lookup (never writes).
     if let Some(receipt) = replay(&db, task, &key, &fp)? {
@@ -301,7 +480,16 @@ pub(crate) fn commit_with(
     let def = load_def(&db, task, DefAt::Latest)?;
     standing(def.as_deref(), ctx, db.wall_now_ms())?;
     let lock_wait = def.as_ref().map_or(0, |def| def.limits.lock_wait_ms);
-    let call = Call { db, ctx, op, statement, params, key, fp };
+    let source;
+    let work = match &request {
+        ProtectedRequest::Direct { statement, params, .. } => Work::Direct { statement, params },
+        ProtectedRequest::Apply { preview, digest } => {
+            source = sources(&db, ctx, *preview, digest)?;
+            Work::Apply { preview: *preview, source: source.as_ref() }
+        }
+        ProtectedRequest::Undo { .. } => return Err(unsupported()),
+    };
+    let call = Call { db, ctx, op, work, key, fp };
     // Steps 4-15, at most three times. Each attempt is a new transaction;
     // the hold is released between attempts.
     let mut retry = 0;
@@ -327,7 +515,7 @@ fn attempt(
     lock_wait: u64,
     load_def: &mut LoadDef<'_>,
 ) -> Result<Receipt, TaskError> {
-    let Call { db, ctx, op, statement, params, key, fp } = call;
+    let Call { db, ctx, op, work, key, fp } = call;
     let (ctx, fp) = (*ctx, *fp);
     let task = ctx.task;
     // 4. The transaction; 5. the hold, before any snapshot (D1).
@@ -343,9 +531,19 @@ fn attempt(
     // The denial mark: everything after it is discarded on a recorded
     // denial; the hold (a lock) survives the rollback.
     let mark = txn.savepoint();
-    // 7. The statement, through the C1 seam; it never commits.
+    // 7. The statement, through the C1 seam; it never commits. An Apply
+    // re-runs the stored statement with its pinned clock.
+    let stored;
+    let (statement, params, clock) = match work {
+        Work::Direct { statement, params } => (*statement, *params, None),
+        Work::Apply { source, .. } => {
+            let ((statement, params), clock) = (source.statement(session)?, source.clock());
+            stored = (statement, params, clock);
+            (&stored.0, stored.1.as_slice(), stored.2.as_ref())
+        }
+    };
     let run = ProtectedRun { txn, effects: Effects::default() };
-    let (run, result) = session.execute_protected_v2(db, run, statement, params, None);
+    let (run, result) = session.execute_protected_v2(db, run, statement, params, clock);
     let ProtectedRun { mut txn, effects } = run;
     result.map_err(engine)?;
     // 9. Rechecks at the statement snapshot (tracked reads).
@@ -378,6 +576,14 @@ fn attempt(
     let head = authority::load_head(&mut txn, task)?;
     let seq = head.next_seq;
     let charge = authority::charge(&mut txn, task, seq, &effects)?;
+    // The approval state of an Apply, read in the tracked transaction.
+    let (kind, approval) = match work {
+        Work::Direct { .. } => (RequestKind::Direct, ApprovalState::NotApplicable),
+        Work::Apply { source, .. } => (
+            RequestKind::Apply,
+            source.approval_state(&mut txn, &effects).map_err(engine)?,
+        ),
+    };
     // 12. Decide. Denied and BudgetExceeded are recorded; the other refusals
     // leave the operation ID free.
     let charge = match decide::evaluate(
@@ -387,8 +593,8 @@ fn attempt(
         &head,
         &effects,
         &charge,
-        RequestKind::Direct,
-        ApprovalState::NotApplicable,
+        kind,
+        approval,
     ) {
         Decision::Commit(charge) => charge,
         Decision::Denied(rule) => {
@@ -428,7 +634,10 @@ fn attempt(
     };
     let record = ReceiptRecord {
         decision: DECISION_COMMITTED,
-        request_kind: ledger::KIND_DIRECT,
+        request_kind: match work {
+            Work::Direct { .. } => ledger::KIND_DIRECT,
+            Work::Apply { .. } => ledger::KIND_APPLY,
+        },
         flags: 0,
         task,
         seq,
@@ -443,7 +652,10 @@ fn attempt(
         noop_rows: charge.noops,
         distinct_after: next.distinct_rows,
         transitions_after: next.transitions,
-        preview: 0,
+        preview: match work {
+            Work::Direct { .. } => 0,
+            Work::Apply { preview, .. } => preview.0,
+        },
         undo_mode: 0,
         restored: 0,
         conflicts: 0,
@@ -454,6 +666,10 @@ fn attempt(
         approver: None,
     };
     put(&mut txn, receipt_key(task, seq), record.encode())?;
+    // Phase 7: the preview applied and the approval consumed, in this batch.
+    if let Work::Apply { source, .. } = work {
+        source.stage_consumed(&mut txn, seq).map_err(engine)?;
+    }
     let outcome = outcome_record(call, &def, decided_ms, OutcomePayload::Committed { task, seq });
     ledger::stage(&mut txn, key.clone(), &outcome)?;
     authority::stage_head(&mut txn, task, &next)?;
@@ -527,3 +743,11 @@ fn deny(
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "commit_tests.rs"]
 mod commit_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "outcome_tests.rs"]
+mod outcome_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "commit_apply_seam_tests.rs"]
+mod commit_apply_seam_tests;

@@ -40,7 +40,7 @@ mod statements_tests;
 
 pub use admit::StatementClass;
 // R3-615 through the agent seam (R3-207): the server's direct protected write.
-pub use commit::{protected_commit, Actor, ProtectedRequest};
-pub use ledger::OperationId;
+pub use commit::{inspect_outcome, outcome, protected_commit, Actor, ProtectedRequest};
+pub use ledger::{OperationId, Outcome};
 pub use receipt::Receipt;
 pub use error::{Budget, DenyRule, TaskError};

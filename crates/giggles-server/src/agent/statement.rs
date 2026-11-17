@@ -11,15 +11,16 @@
 //! | `SHOW OPERATION '<id>'`                                    | OutcomeLookup |
 //!
 //! [`protected_seam`] is the one place the Phase 6 and 7 items fill in. The
-//! direct write runs `task::protected_commit` (R3-615); outcome lookup (R3-617),
-//! preview and apply (R3-707) still fail closed with 0A000. Admission refuses
-//! `Update` until the last Phase 6 item adds it to `task::admit::ENABLED`
-//! (design-2 section 4), so over the wire the direct form still answers 0A000.
+//! direct write runs `task::protected_commit` (R3-615) and the outcome lookup
+//! `task::outcome` (R3-617); preview and apply (R3-707) still fail closed with
+//! 0A000. Admission refuses `Update` and `OutcomeLookup` until the last Phase 6
+//! item adds them to `task::admit::ENABLED` (design-2 section 4), so over the
+//! wire both forms still answer 0A000.
 
 use giggles_core::{
     CoreError,
-    relational::{ColumnDef, DataType, Description, Prepared, SqlResult, Value},
-    task::{Actor, ProtectedRequest, StatementClass, TaskError},
+    relational::{ColumnDef, DataType, Description, Prepared, SqlResult, SqlRow, Value},
+    task::{Actor, Outcome, ProtectedRequest, StatementClass, TaskError},
 };
 use std::sync::Arc;
 
@@ -156,8 +157,8 @@ pub fn description(head: &ProtectedHead, wrapped: Option<&Description>) -> Descr
 }
 
 /// The seam the Phase 6 and 7 bodies fill in. `Direct` runs
-/// `task::protected_commit` as the session's executor (R3-615); `Outcome`
-/// (R3-617), `Preview` and `Apply` (R3-707) fail closed with
+/// `task::protected_commit` as the session's executor (R3-615) and `Outcome`
+/// runs `task::outcome` (R3-617); `Preview` and `Apply` (R3-707) fail closed with
 /// `NotAllowedInTaskSession(class)` (0A000), even when admission would pass.
 /// It runs inside `Session::execute_protected`, after admission and with the
 /// session's `in_protected` flag set.
@@ -170,9 +171,8 @@ pub(crate) fn protected_seam(
         ProtectedStatement::Direct { op, prepared, text } => {
             direct(session, op, prepared, text, params)
         }
-        ProtectedStatement::Preview { .. }
-        | ProtectedStatement::Apply { .. }
-        | ProtectedStatement::Outcome { .. } => Err(CoreError::Task(
+        ProtectedStatement::Outcome { op } => show_outcome(session, op),
+        ProtectedStatement::Preview { .. } | ProtectedStatement::Apply { .. } => Err(CoreError::Task(
             TaskError::NotAllowedInTaskSession(statement.class()),
         )),
     }
@@ -210,6 +210,55 @@ fn direct(
         columns: Vec::new(),
         rows: Vec::new(),
         affected: u64::from(receipt.rows_affected),
+    })
+}
+
+/// `SHOW OPERATION '<id>'`: the stored outcome of the ID under the session's
+/// task, as one row of [`description`]'s columns (`operation_id`, `decision`,
+/// `row_count`, `receipt_seq`, `effects_digest`), or no row when the ID is
+/// unknown. `decision` is `committed`, `denied` or `budget_exceeded`; the last
+/// three columns are NULL for a denial. A revoked task is 28T01; an expired
+/// one can still look up its outcomes.
+fn show_outcome(session: &mut crate::Session, op: &OperationId) -> Result<SqlResult, CoreError> {
+    let ctx = session
+        .task()
+        .cloned()
+        .ok_or(CoreError::Policy(giggles_core::Error::Scope))?;
+    let core_op = op.to_core()?;
+    let found = giggles_core::task::outcome(&session.sql, &ctx, &core_op).map_err(CoreError::from)?;
+    let rows = found
+        .map(|outcome| {
+            let (decision, row_count, seq, digest) = match outcome {
+                Outcome::Committed(receipt) => (
+                    "committed",
+                    Value::Int(i64::from(receipt.rows_affected)),
+                    Value::Int(i64::try_from(receipt.seq).unwrap_or(i64::MAX)),
+                    Value::Text(receipt.effects_digest.iter().map(|b| format!("{b:02x}")).collect()),
+                ),
+                Outcome::Denied(_) => ("denied", Value::Null, Value::Null, Value::Null),
+                Outcome::BudgetExceeded(_) => {
+                    ("budget_exceeded", Value::Null, Value::Null, Value::Null)
+                }
+            };
+            SqlRow {
+                values: vec![
+                    Value::Text(op.as_str().to_owned()),
+                    Value::Text(decision.to_owned()),
+                    row_count,
+                    seq,
+                    digest,
+                ],
+                version: 0,
+            }
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    Ok(SqlResult {
+        columns: ["operation_id", "decision", "row_count", "receipt_seq", "effects_digest"]
+            .map(String::from)
+            .to_vec(),
+        affected: rows.len() as u64,
+        rows,
     })
 }
 

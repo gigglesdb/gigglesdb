@@ -301,7 +301,7 @@ fn returning_is_refused_before_anything_runs() {
 }
 
 #[test]
-fn preview_apply_and_outcome_still_fail_closed() {
+fn preview_and_apply_still_fail_closed() {
     let (service, mut session) = fixture();
     test_route::enable(&[
         StatementClass::Update,
@@ -316,11 +316,10 @@ fn preview_apply_and_outcome_still_fail_closed() {
             prepared: Box::new(prepared),
         },
         ProtectedStatement::Apply {
-            op: op.clone(),
+            op,
             preview: 1,
             digest: [0; 32],
         },
-        ProtectedStatement::Outcome { op },
     ] {
         let error = session.execute_protected(&statement, &[]).unwrap_err();
         assert_eq!(
@@ -338,4 +337,79 @@ fn protected_flag_is_cleared_after_a_panic() {
     let (_service, mut session) = fixture();
     assert!(!session.panic_in_protected_scope());
     assert_bare_update_needs_operation_id(&mut session);
+}
+
+fn show(session: &mut Session, op: &str) -> Result<SqlResult, CoreError> {
+    let statement = ProtectedStatement::Outcome {
+        op: OperationId::new(op).unwrap(),
+    };
+    let result = session.execute_protected(&statement, &[]);
+    assert!(!session.in_protected(), "in_protected leaked: {result:?}");
+    result
+}
+
+#[test]
+fn show_operation_returns_the_stored_outcome() {
+    let (service, mut session) = fixture();
+    test_route::enable(&[StatementClass::Update, StatementClass::OutcomeLookup]);
+    // Unknown: no row.
+    let unknown = show(&mut session, "op-1").unwrap();
+    assert_eq!(
+        unknown.columns,
+        ["operation_id", "decision", "row_count", "receipt_seq", "effects_digest"]
+    );
+    assert!(unknown.rows.is_empty());
+    // Committed: the receipt's count, seq and digest.
+    assert_eq!(direct(&mut session, "op-1", REQUEUE, &[]).unwrap().affected, 4);
+    let committed = show(&mut session, "op-1").unwrap();
+    assert_eq!(committed.rows.len(), 1);
+    let values = &committed.rows[0].values;
+    assert_eq!(
+        values[..4],
+        [
+            Value::Text("op-1".into()),
+            Value::Text("committed".into()),
+            Value::Int(4),
+            Value::Int(1),
+        ]
+    );
+    match &values[4] {
+        Value::Text(hex) => assert!(hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())),
+        other => panic!("{other:?}"),
+    }
+    // Denied: the decision only.
+    direct(
+        &mut session,
+        "op-2",
+        "UPDATE shipments SET status = 'queued' WHERE merchant_id = 42",
+        &[],
+    )
+    .unwrap_err();
+    let denied = show(&mut session, "op-2").unwrap();
+    assert_eq!(
+        denied.rows[0].values,
+        [
+            Value::Text("op-2".into()),
+            Value::Text("denied".into()),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]
+    );
+    // The lookup ran nothing.
+    assert_eq!(statuses(&service), AFTER);
+}
+
+#[test]
+fn outcome_class_stays_refused_without_the_route() {
+    let (_service, mut session) = fixture();
+    test_route::enable(&[]);
+    let error = show(&mut session, "op-1").unwrap_err();
+    assert_eq!(
+        error,
+        CoreError::Task(TaskError::NotAllowedInTaskSession(
+            StatementClass::OutcomeLookup
+        ))
+    );
+    assert_eq!(sqlstate(&error), "0A000");
 }

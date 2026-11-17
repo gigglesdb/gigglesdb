@@ -13,6 +13,8 @@
 use super::records::{
     MAX_IDENTITY, MAX_OPERATION_ID, MAX_STATEMENT_TEXT, OutcomeRecord, TaskObjectId, outcome_key,
 };
+use super::error::{Budget, DenyRule};
+use super::receipt::Receipt;
 use crate::CoreError;
 use crate::storage::{Isolation, Keyspace, PROTECTED_RECORDS, Transaction, V2Db};
 use sha2::{Digest, Sha256};
@@ -25,6 +27,17 @@ pub(crate) const FINGERPRINT_DOMAIN: &[u8; 10] = b"GDTASKREQ\x01";
 pub(crate) const KIND_DIRECT: u8 = 1;
 pub(crate) const KIND_APPLY: u8 = 2;
 pub(crate) const KIND_UNDO: u8 = 3;
+
+/// What an operation ID's stored outcome says (D-G). Only these three
+/// decisions are recorded; every other refusal leaves the ID free.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The operation committed: its receipt (minimal for an executor, full
+    /// with the change record for an inspector).
+    Committed(Receipt),
+    Denied(DenyRule),
+    BudgetExceeded(Budget),
+}
 
 /// Client-chosen operation ID of a protected write, 1..=128 bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

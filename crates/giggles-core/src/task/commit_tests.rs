@@ -22,12 +22,12 @@ use std::path::PathBuf;
 mod denial;
 
 /// 2026-11-05 17:00:00 UTC; the task expires at 17:30.
-const NOW: u64 = 1_793_898_000_000;
-const EXPIRES: u64 = NOW + 1_800_000;
-const REQUEUE: &str =
+pub(super) const NOW: u64 = 1_793_898_000_000;
+pub(super) const EXPIRES: u64 = NOW + 1_800_000;
+pub(super) const REQUEUE: &str =
     "UPDATE shipments SET status = 'queued' WHERE merchant_id = 42 AND status = 'failed'";
 
-struct Directory(PathBuf);
+pub(super) struct Directory(PathBuf);
 impl Drop for Directory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -40,7 +40,7 @@ fn directory() -> Directory {
     Directory(std::env::temp_dir().join(format!("task-commit-{:032x}", u128::from_be_bytes(id))))
 }
 
-fn sql(admin: &Admin, statement: &str) -> Vec<Vec<Value>> {
+pub(super) fn sql(admin: &Admin, statement: &str) -> Vec<Vec<Value>> {
     admin
         .sql_session()
         .execute(statement, &[], None)
@@ -51,22 +51,22 @@ fn sql(admin: &Admin, statement: &str) -> Vec<Vec<Value>> {
         .collect()
 }
 
-struct Fixture {
-    dir: Directory,
-    admin: Option<Admin>,
-    issuer: crate::roles::CatalogRole,
-    ctx: TaskContext,
-    def: TaskDef,
+pub(super) struct Fixture {
+    pub(super) dir: Directory,
+    pub(super) admin: Option<Admin>,
+    pub(super) issuer: crate::roles::CatalogRole,
+    pub(super) ctx: TaskContext,
+    pub(super) def: TaskDef,
 }
 
 impl Fixture {
-    fn admin(&self) -> &Admin {
+    pub(super) fn admin(&self) -> &Admin {
         self.admin.as_ref().unwrap()
     }
-    fn db(&self) -> Arc<V2Db> {
+    pub(super) fn db(&self) -> Arc<V2Db> {
         self.admin().sql_session().v2_db().unwrap()
     }
-    fn statuses(&self) -> Vec<String> {
+    pub(super) fn statuses(&self) -> Vec<String> {
         sql(self.admin(), "SELECT status FROM shipments ORDER BY id")
             .into_iter()
             .map(|row| match &row[0] {
@@ -75,18 +75,18 @@ impl Fixture {
             })
             .collect()
     }
-    fn reopen(&mut self) {
+    pub(super) fn reopen(&mut self) {
         drop(self.admin.take());
         self.admin = Some(Admin::open(&self.dir.0, Limits::default()).unwrap());
         clock(&self.db(), NOW);
     }
 }
 
-fn clock(db: &V2Db, ms: u64) {
+pub(super) fn clock(db: &V2Db, ms: u64) {
     db.set_wall_clock(Arc::new(ManualClock::new(ms)));
 }
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let dir = directory();
     let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
     sql(
@@ -157,11 +157,11 @@ fn fixture() -> Fixture {
     f
 }
 
-fn op(id: &str) -> OperationId {
+pub(super) fn op(id: &str) -> OperationId {
     OperationId::new(id.as_bytes()).unwrap()
 }
 
-fn direct(session: &mut SqlSession, text: &str) -> ProtectedRequest {
+pub(super) fn direct(session: &mut SqlSession, text: &str) -> ProtectedRequest {
     ProtectedRequest::Direct {
         statement: session.prepare(text).unwrap(),
         params: Vec::new(),
@@ -169,13 +169,13 @@ fn direct(session: &mut SqlSession, text: &str) -> ProtectedRequest {
     }
 }
 
-fn commit_text(f: &Fixture, id: &str, text: &str) -> Result<Receipt, TaskError> {
+pub(super) fn commit_text(f: &Fixture, id: &str, text: &str) -> Result<Receipt, TaskError> {
     let mut session = f.admin().sql_session();
     let request = direct(&mut session, text);
     protected_commit(&mut session, Actor::Executor(&f.ctx), &op(id), request)
 }
 
-fn commit(f: &Fixture, id: &str) -> Result<Receipt, TaskError> {
+pub(super) fn commit(f: &Fixture, id: &str) -> Result<Receipt, TaskError> {
     commit_text(f, id, REQUEUE)
 }
 
@@ -185,13 +185,13 @@ fn commit_loading(f: &Fixture, id: &str, load: &mut LoadDef<'_>) -> Result<Recei
     commit_with(&mut session, Actor::Executor(&f.ctx), &op(id), request, load)
 }
 
-fn kernel(db: &V2Db, key: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn kernel(db: &V2Db, key: &[u8]) -> Option<Vec<u8>> {
     db.begin(Isolation::ReadCommitted)
         .kernel_latest_committed(key)
         .unwrap()
 }
 
-fn scan(db: &V2Db, ns: u8, task: TaskObjectId) -> Vec<(Vec<u8>, Vec<u8>)> {
+pub(super) fn scan(db: &V2Db, ns: u8, task: TaskObjectId) -> Vec<(Vec<u8>, Vec<u8>)> {
     let (start, end) = task_prefix(ns, task);
     let mut txn = db.begin(Isolation::ReadCommitted);
     txn.scan(
@@ -206,7 +206,7 @@ fn scan(db: &V2Db, ns: u8, task: TaskObjectId) -> Vec<(Vec<u8>, Vec<u8>)> {
     .collect()
 }
 
-fn head(f: &Fixture) -> Option<MutationHead> {
+pub(super) fn head(f: &Fixture) -> Option<MutationHead> {
     kernel(&f.db(), &mutation_head_key(f.def.id)).map(|v| MutationHead::decode(&v).unwrap())
 }
 
