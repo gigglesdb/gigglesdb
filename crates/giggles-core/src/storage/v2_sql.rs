@@ -408,6 +408,10 @@ impl SqlSession {
                         if let Some(name) = &target_name {
                             names.insert(name.clone());
                         }
+                        let write_ids = bound.write_tables().into_iter().filter_map(|(name, _)| parts.tables.get(&name).map(|t| t.id)).collect::<BTreeSet<_>>();
+                        if bound.write_tables().iter().any(|(name, _)| binding.view_names.contains_key(name)) {
+                            return Err(CoreError::Sql(E::Unsupported));
+                        }
                         let target_id = target_name
                             .as_ref()
                             .and_then(|name| parts.tables.get(name))
@@ -415,7 +419,7 @@ impl SqlSession {
                         // Include the whole FK component: cascades can mutate children
                         // and probe their other parents. Share conflicts with each
                         // table's RowExclusive writer, while parent witnesses can share.
-                        let mut connected = target_id.into_iter().collect::<BTreeSet<_>>();
+                        let mut connected = target_id.into_iter().chain(write_ids.iter().copied()).collect::<BTreeSet<_>>();
                         if writing {
                             loop {
                                 let count = connected.len();
@@ -459,7 +463,7 @@ impl SqlSession {
                                     id,
                                     if ddl {
                                         LockMode::AccessExclusive
-                                    } else if Some(id) == target_id {
+                                    } else if Some(id) == target_id || write_ids.contains(&id) {
                                         LockMode::RowExclusive
                                     } else {
                                         LockMode::Share
@@ -489,6 +493,14 @@ impl SqlSession {
                                     engine::catalog::CatalogError::Core(e) => e,
                                     engine::catalog::CatalogError::Txn(e) => e.into(),
                                 })?;
+                        }
+                        // A WITH statement can own several mutation targets.
+                        if writing && !ddl && target_name.is_none() {
+                            for id in &write_ids {
+                                txn.lock_sql_sentinel(*id, if txn.isolation() == Isolation::ReadCommitted {
+                                    LockMode::Exclusive
+                                } else { LockMode::Shared }, &|| crate::cancellation::check().is_err())?;
+                            }
                         }
                         if writing
                             && !ddl

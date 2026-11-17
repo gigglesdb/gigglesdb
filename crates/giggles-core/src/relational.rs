@@ -1831,6 +1831,7 @@ impl Prepared {
             Statement::Release(_) => V2Class::Control("release"),
             Statement::RollbackTo(_) => V2Class::Control("rollback_to"),
             Statement::CompositeSelect(_) => V2Class::Read,
+            Statement::Plan(plan) if !plan.write_tables().is_empty() => V2Class::Dml,
             Statement::Select { .. } | Statement::Query(_) | Statement::Plan(_) => V2Class::Read,
             // ON CONFLICT's unique-index dependency requires catalog/private conflict data.
             Statement::InsertMulti(_)
@@ -2657,6 +2658,18 @@ impl Prepared {
             }
     }
 
+    /// Mutation targets and required command privileges, including WITH substatements.
+    pub fn write_tables(&self) -> Vec<(String, &'static str)> {
+        match &self.statement {
+            Statement::Plan(plan) => plan.write_tables(),
+            _ if matches!(self.command(), "INSERT" | "UPDATE" | "DELETE") => {
+                let mut out: Vec<_> = self.table().map(|t| (t.to_owned(), self.command())).into_iter().collect();
+                if let Some(table) = self.authorization_update_table() { out.push((table.to_owned(), "UPDATE")); }
+                out
+            }
+            _ => vec![],
+        }
+    }
     /// Additional command privilege for syntactic ON CONFLICT DO UPDATE.
     pub fn authorization_update_table(&self) -> Option<&str> {
         match &self.statement {
@@ -3287,6 +3300,7 @@ impl Prepared {
         }
     }
     pub(crate) fn is_read(&self) -> bool {
+        if let Statement::Plan(plan) = &self.statement { return plan.write_tables().is_empty(); }
         matches!(
             self.statement,
             Statement::Select { .. } | Statement::Query(_) | Statement::Plan(_) | Statement::CompositeSelect(_)
@@ -3891,6 +3905,9 @@ impl Relational {
             }
             Statement::Plan(plan) => {
                 if expected.is_some() { return Err(SqlError::Unsupported); }
+                if !plan.write_tables().is_empty() {
+                    return plan.execute_dml(self, prepared, params, clock, &mut cancel, events);
+                }
                 let legacy = scan::LegacyRows(&*self);
                 return plan.execute(self, injected_source.unwrap_or(&legacy), prepared.params,
                     params, &prepared.parameter_types, clock, &mut cancel);

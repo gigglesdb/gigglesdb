@@ -1910,7 +1910,7 @@ impl State {
                 let Plan::Sql(prepared) = &p.s.p else {
                     unreachable!()
                 };
-                if prepared.command() == "SELECT" {
+                if prepared.command() == "SELECT" && prepared.write_tables().is_empty() {
                     if p.cursor.is_none() {
                         read_only_check("SELECT", &self.settings, session, &mut self.diagnostic)?;
                         begin_implicit(session, &mut self.implicit, &mut self.settings)?;
@@ -1959,7 +1959,7 @@ impl State {
                 }
                 if p.result.is_none() {
                     let command = prepared.command();
-                    read_only_check(command, &self.settings, session, &mut self.diagnostic)?;
+                    read_only_check(prepared.write_tables().first().map_or(command, |(_, command)| *command), &self.settings, session, &mut self.diagnostic)?;
                     if !matches!(command, "BEGIN" | "COMMIT" | "ROLLBACK") {
                         begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     }

@@ -59,7 +59,35 @@ impl Plan {
                 }
             }
         });
+        for cte in &self.ctes {
+            if let Some(dml) = &cte.dml {
+                for name in dml
+                    .read_tables()
+                    .into_iter()
+                    .chain(dml.table().map(str::to_owned))
+                {
+                    if !name.starts_with("\0plan_") && !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+            }
+            for name in cte.query.read_tables() {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
         out
+    }
+    pub(in crate::relational) fn write_tables(&self) -> Vec<(String, &'static str)> {
+        self.ctes
+            .iter()
+            .flat_map(|cte| {
+                cte.dml
+                    .as_ref()
+                    .map_or_else(|| cte.query.write_tables(), |p| p.write_tables())
+            })
+            .collect()
     }
     pub(in crate::relational) fn authorization_tables(&self) -> R<Vec<String>> {
         let mut out = vec![];
@@ -74,10 +102,27 @@ impl Plan {
             }
             Err(e) => error = Some(e),
         });
+        for cte in &self.ctes {
+            let names = if let Some(dml) = &cte.dml {
+                dml.authorization_tables()?
+            } else {
+                cte.query.authorization_tables()?
+            };
+            for name in names {
+                if !name.starts_with("\0plan_") && !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
         error.map_or(Ok(out), Err)
     }
     pub(in crate::relational) fn sequences(&self) -> Vec<Option<String>> {
         let mut out = vec![];
+        for cte in &self.ctes {
+            if let Some(dml) = &cte.dml {
+                out.extend(dml.sequences());
+            }
+        }
         self.visit_queries(&mut |q| out.extend(q.sequence_dependencies()));
         self.visit_scalars(&mut |s| s.sequence_dependencies(&mut out));
         out
@@ -124,9 +169,14 @@ impl Plan {
         bind: &impl Fn(&mut String),
         state: &Relational,
         path: &[String],
-    ) {
+    ) -> R<()> {
         for cte in &mut self.ctes {
-            cte.query.bind_schema_names(bind, state, path);
+            if let Some(dml) = &mut cte.dml {
+                dml.search_path = path.to_vec();
+                **dml = dml.bind_schemas(state)?;
+            } else {
+                cte.query.bind_schema_names(bind, state, path)?;
+            }
         }
         for (s, _, _) in &mut self.order {
             schema_names::scalar(s, bind, state, path);
@@ -151,13 +201,14 @@ impl Plan {
                     path,
                 );
                 if let Some(i) = &mut s.input {
-                    i.query.bind_schema_names(bind, state, path);
+                    i.query.bind_schema_names(bind, state, path)?;
                 }
             }
             Body::Set { left, right, .. } => {
-                left.bind_schema_names(bind, state, path);
-                right.bind_schema_names(bind, state, path);
+                left.bind_schema_names(bind, state, path)?;
+                right.bind_schema_names(bind, state, path)?;
             }
         }
+        Ok(())
     }
 }

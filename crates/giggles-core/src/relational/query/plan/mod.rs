@@ -3,6 +3,7 @@ use super::*;
 mod ast;
 mod bind;
 mod cte;
+mod dml;
 mod exec;
 mod parse;
 mod setops;

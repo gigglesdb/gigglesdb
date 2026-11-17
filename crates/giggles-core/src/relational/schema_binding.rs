@@ -189,7 +189,7 @@ impl Prepared {
                 }
             }
             Statement::Query(query) => query.bind_schema_names(&read, state, &self.search_path),
-            Statement::Plan(plan) => plan.bind_schema_names(&read, state, &self.search_path),
+            Statement::Plan(plan) => plan.bind_schema_names(&read, state, &self.search_path)?,
             Statement::InsertExpressions(insert) => {
                 insert.bind_schema_names(&read, state, &self.search_path)
             }

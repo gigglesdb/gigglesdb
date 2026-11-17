@@ -497,9 +497,9 @@ impl State {
             } else {
                 let p = core(session.prepare(sql))?;
                 let d = core(session.describe(&p))?;
-                read_only_check(p.command(), &self.settings, session, &mut self.diagnostic)?;
+                read_only_check(p.write_tables().first().map_or(p.command(), |(_, command)| *command), &self.settings, session, &mut self.diagnostic)?;
                 self.settings.queried = session.in_transaction();
-                if p.command() == "SELECT" {
+                if p.command() == "SELECT" && p.write_tables().is_empty() {
                     let mut cursor = self.diagnostic.core(session.open_cursor(&p, &[]))?;
                     row_description(&d, &[], out)?;
                     let mut count = 0;

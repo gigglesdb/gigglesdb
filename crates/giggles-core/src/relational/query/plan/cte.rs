@@ -8,6 +8,8 @@ pub(super) struct Cte {
     name: String,
     aliases: Vec<String>,
     pub query: Plan,
+    pub dml: Option<Box<Prepared>>,
+    dml_parameters: BTreeSet<usize>,
     recursive: bool,
     search: Option<Search>,
     cycle: Option<Cycle>,
@@ -59,7 +61,31 @@ pub(super) fn parse(
         }
         let open = p.at - 1;
         let close = subquery_end(&p.tokens, open)?;
-        let query = parse::expression(&p.tokens[open + 1..close], owner, depth + 1, next)?;
+        let tokens = &p.tokens[open + 1..close];
+        let dml = if tokens.first().is_some_and(|t| {
+            ["insert", "update", "delete"]
+                .iter()
+                .any(|w| parse::word(t, w))
+        }) {
+            if depth != 0 {
+                return Err(SqlError::Unsupported);
+            }
+            Some(Box::new(dml::parse(tokens, owner)?))
+        } else {
+            None
+        };
+        let query = if dml.is_some() {
+            Plan::new(Body::Values(vec![]))
+        } else {
+            parse::expression(tokens, owner, depth + 1, next)?
+        };
+        let dml_parameters = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Token::Param(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
         p.at = close + 1;
         let search = if p.word("search") {
             let depth = if p.word("depth") {
@@ -113,6 +139,8 @@ pub(super) fn parse(
                 name,
                 aliases,
                 query,
+                dml,
+                dml_parameters,
                 recursive: false,
                 search,
                 cycle,
@@ -132,6 +160,9 @@ pub(super) fn parse(
             let (alias, cte) = &definitions[j];
             let (alias, name) = (alias.clone(), cte.name.clone());
             remap(&mut definitions[i].1.query, &alias, &name);
+            if let Some(dml) = &mut definitions[i].1.dml {
+                dml::remap(dml, &alias, &name);
+            }
         }
         let name = definitions[i].1.name.clone();
         definitions[i].1.recursive = references(&definitions[i].1.query, &name) > 0;
@@ -149,6 +180,21 @@ pub(super) fn parse(
     }
     for (alias, cte) in &definitions {
         remap(&mut body, alias, &cte.name);
+    }
+    for (_, cte) in &definitions {
+        if cte.dml.as_ref().is_some_and(|p| p.returning().is_none()) {
+            let referenced = references(&body, &cte.name) > 0
+                || definitions.iter().any(|(_, other)| {
+                    references(&other.query, &cte.name) > 0
+                        || other
+                            .dml
+                            .as_ref()
+                            .is_some_and(|p| p.read_tables().contains(&cte.name))
+                });
+            if referenced {
+                return Err(SqlError::Unsupported);
+            }
+        }
     }
     // The new WITH scope encloses any WITH in its body.
     let mut ctes: Vec<_> = definitions.into_iter().map(|(_, c)| c).collect();
@@ -180,6 +226,9 @@ fn names_list(p: &mut Parser, close: bool) -> R<Vec<String>> {
 fn remap(plan: &mut Plan, alias: &str, name: &str) {
     for cte in &mut plan.ctes {
         remap(&mut cte.query, alias, name);
+        if let Some(dml) = &mut cte.dml {
+            dml::remap(dml, alias, name);
+        }
     }
     match &mut plan.body {
         Body::Select(s) => {
@@ -195,7 +244,7 @@ fn remap(plan: &mut Plan, alias: &str, name: &str) {
         _ => {}
     }
 }
-fn remap_query(q: &mut Query, alias: &str, name: &str) {
+pub(super) fn remap_query(q: &mut Query, alias: &str, name: &str) {
     for source in &mut q.sources {
         if source.name == alias {
             source.name = name.into();
@@ -477,7 +526,11 @@ pub(super) fn resolve(
 ) -> R<Relational> {
     let mut state = catalog(state);
     for cte in ctes {
-        let mut meta = if cte.recursive {
+        let mut meta = if let Some(dml) = &mut cte.dml {
+            let mut meta = dml::resolve(dml, &state, parameters, &cte.dml_parameters)?;
+            aliases(&mut meta, &cte.aliases)?;
+            meta
+        } else if cte.recursive {
             recursive_parts(cte)?;
             let Body::Set { left, right, .. } = &mut cte.query.body else {
                 unreachable!()
@@ -513,6 +566,13 @@ pub(super) fn validate_constants(
     state: &Relational,
     parameters: &[Option<DataType>],
 ) -> R<()> {
+    if let Some(dml) = &cte.dml {
+        let mut dml = (**dml).clone();
+        dml.epoch = state.epoch;
+        dml.params = parameters.len();
+        dml.parameter_types = parameters.to_vec();
+        return dml.validate_immutable_constants(state);
+    }
     if cte.recursive {
         let (seed, step, _) = recursive_parts(cte)?;
         let description = seed.describe(state, parameters.len(), parameters)?;
@@ -605,6 +665,28 @@ pub(super) fn run<'e>(
     clock: Option<&super::super::super::clock::ExecutionClock>,
     execution: &'e Execution<'_>,
 ) -> R<Relation<'e>> {
+    run_inner(
+        plan, state, source, params, parameters, clock, execution, None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared statement snapshot and mutation context"
+)]
+pub(super) fn run_inner<'e>(
+    plan: &Plan,
+    state: &Relational,
+    source: &dyn scan::RowSource,
+    params: &[Value],
+    parameters: &[Option<DataType>],
+    clock: Option<&super::super::super::clock::ExecutionClock>,
+    execution: &'e Execution<'_>,
+    mut writes: Option<(
+        &mut Relational,
+        &mut Vec<crate::relational::constraints::Event>,
+    )>,
+) -> R<Relation<'e>> {
     let mut catalog = catalog(state);
     let mut materialized: Vec<(String, Relation<'e>)> = vec![];
     for cte in &plan.ctes {
@@ -612,7 +694,13 @@ pub(super) fn run<'e>(
             base: source,
             relations: materialized.iter().map(|(n, r)| (n.clone(), r)).collect(),
         };
-        let mut rows = if cte.recursive {
+        let mut rows = if let Some(dml) = &cte.dml {
+            let (target, events) = writes.as_mut().ok_or(SqlError::Unsupported)?;
+            dml::execute(
+                dml, state, &catalog, &wrapper, target, events, params, parameters, clock,
+                execution,
+            )?
+        } else if cte.recursive {
             recurse(
                 cte, &catalog, &wrapper, params, parameters, clock, execution,
             )?

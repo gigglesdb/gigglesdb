@@ -1847,6 +1847,15 @@ impl Session {
             if let Some(table) = update_table {
                 reqs.push((table.to_owned(), roles::TablePrivilege::Update));
             }
+            for (table, command) in p.write_tables() {
+                let privilege = match command {
+                    "INSERT" => roles::TablePrivilege::Insert,
+                    "UPDATE" => roles::TablePrivilege::Update,
+                    "DELETE" => roles::TablePrivilege::Delete,
+                    _ => continue,
+                };
+                reqs.push((table, privilege));
+            }
             allowed = self.table_requirements_allowed(&reqs, false)?;
         }
         if !allowed {

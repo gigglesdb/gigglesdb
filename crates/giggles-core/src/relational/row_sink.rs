@@ -523,7 +523,8 @@ impl Relational {
                 // Binding owns SQL error precedence (including unknown tables).
                 continue;
             };
-            let is_target = prepared.table() == Some(self.table_key(table).as_str());
+            let is_target = prepared.table() == Some(self.table_key(table).as_str())
+                || prepared.write_tables().iter().any(|(name, _)| *name == self.table_key(table));
             // The physical publisher checks PK/UNIQUE occupancy against the
             // transaction, including earlier pages. Inserts need no preimage.
             if append && is_target {
@@ -697,6 +698,12 @@ impl Relational {
                     && matches!(prepared.v2_class(), V2Class::Dml)
                 {
                     sink.check_occupancy(table, &before.rows[&table.id], &self.rows[&table.id])?;
+                }
+                if table.is_none() && matches!(prepared.v2_class(), V2Class::Dml) {
+                    for (name, _) in prepared.write_tables() {
+                        let table = self.tables.get(&name).ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+                        sink.check_occupancy(table, &before.rows[&table.id], &self.rows[&table.id])?;
+                    }
                 }
                 if append {
                     let table = table.as_ref().expect("append target");
