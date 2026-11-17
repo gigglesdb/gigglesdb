@@ -13,6 +13,7 @@ use giggles_replication::{
     call_codec::{NodeCall, PeerCall},
     client::{LocalRanges, RangeTransport, RoutedRangeClient},
     cluster_node::{ClusterNode, ClusterNodeConfig, RegistryWatcher},
+    error::Error,
     move_range::{MoveOutcome, move_replica},
     registry::{self, NodeRecord, NodeState},
     transport::CallLimits,
@@ -50,6 +51,23 @@ fn eventually(mut ready: impl FnMut() -> bool) {
         }
         assert!(Instant::now() < deadline, "registry propagation timed out");
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// Retry routing/election failures without hiding ambiguous transaction outcomes.
+fn retry<T>(mut call: impl FnMut() -> Result<T, RangeError>) -> Result<T, RangeError> {
+    let deadline = Instant::now() + READY;
+    loop {
+        match call() {
+            Err(
+                RangeError::NotLeader { .. }
+                | RangeError::Unavailable(_)
+                | RangeError::StaleEpoch { .. },
+            ) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
     }
 }
 
@@ -173,12 +191,12 @@ fn lock(
     txn: ClusterTxnId,
     key: &[u8],
 ) -> Result<(giggles_core::range_api::RangeDescriptor, u64), RangeError> {
-    let desc = client.descriptor_for(&range_key(RangeSpace::Rows, key))?;
+    let desc = retry(|| client.descriptor_for(&range_key(RangeSpace::Rows, key)))?;
     let grant = client.lock(LockRequest {
         range: desc.id,
         epoch: desc.epoch,
         txn,
-        priority: client.oracle().next(1)?,
+        priority: retry(|| client.oracle().next(1))?,
         target: LockTarget::Key {
             space: RangeSpace::Rows,
             key: key.to_vec(),
@@ -209,8 +227,7 @@ fn retryable(error: &RangeError) -> bool {
 
 // Read all pages at one fresh timestamp. Raw MVCC keys have a version suffix.
 fn rows(client: &dyn RangeClient) -> BTreeMap<Vec<u8>, Vec<u8>> {
-    let desc = client
-        .descriptor_for(&range_key(RangeSpace::Rows, &1_u64.to_be_bytes()))
+    let desc = retry(|| client.descriptor_for(&range_key(RangeSpace::Rows, &1_u64.to_be_bytes())))
         .unwrap();
     let mut req = ReadRequest {
         range: A,
@@ -219,12 +236,18 @@ fn rows(client: &dyn RangeClient) -> BTreeMap<Vec<u8>, Vec<u8>> {
         start: Bound::Included(1_u64.to_be_bytes().to_vec()),
         end: Bound::Excluded(2_u64.to_be_bytes().to_vec()),
         dir: ReadDirection::Forward,
-        ts: client.oracle().next(1).unwrap(),
+        ts: retry(|| client.oracle().next(1)).unwrap(),
         page_bytes: 65536,
     };
     let mut rows = BTreeMap::new();
     loop {
-        let page = client.read(req.clone()).unwrap();
+        let page = retry(|| {
+            req.epoch = client
+                .descriptor_for(&range_key(RangeSpace::Rows, &1_u64.to_be_bytes()))?
+                .epoch;
+            client.read(req.clone())
+        })
+        .unwrap();
         for (key, value) in page.pairs {
             rows.insert(key[..17].to_vec(), value);
         }
@@ -240,19 +263,23 @@ fn preserves_writes_and_prepared_transactions_during_move() {
     let (_root, nodes, mut watchers) = start();
     let client = nodes[0].client();
     let home_key = key(2, 0, 0);
-    let txn = ClusterTxnId::new(1, client.lease(LeaseKind::Xid, 1, 1).unwrap().start);
-    let (home, generation) = lock(&**client, txn, &home_key).unwrap();
+    let txn = ClusterTxnId::new(
+        1,
+        retry(|| client.lease(LeaseKind::Xid, 1, 1)).unwrap().start,
+    );
+    let (home, generation) = retry(|| lock(&**client, txn, &home_key)).unwrap();
     assert_eq!(home.id, B);
-    client
-        .commit(
+    retry(|| {
+        client.commit(
             B,
             home.epoch,
             txn,
-            write(home_key, b"home".to_vec()),
+            write(home_key.clone(), b"home".to_vec()),
             None,
             Some(generation),
         )
-        .unwrap();
+    })
+    .unwrap();
     let stop = AtomicBool::new(false);
     let progress = [AtomicUsize::new(0), AtomicUsize::new(0)];
     let (acked, maybe) = thread::scope(|scope| {
@@ -273,7 +300,7 @@ fn preserves_writes_and_prepared_transactions_during_move() {
                             // Every attempt has a fresh transaction id and descriptor.
                             let txn = ClusterTxnId::new(
                                 1,
-                                client.lease(LeaseKind::Xid, 1, 1).unwrap().start,
+                                retry(|| client.lease(LeaseKind::Xid, 1, 1)).unwrap().start,
                             );
                             let result =
                                 lock(&*client, txn, &key).and_then(|(desc, generation)| {
@@ -318,13 +345,17 @@ fn preserves_writes_and_prepared_transactions_during_move() {
         let _stop_on_unwind = StopWriters(&stop);
         let mut prepared = Vec::new();
         for seq in 0..3 {
-            let txn = ClusterTxnId::new(1, client.lease(LeaseKind::Xid, 1, 1).unwrap().start);
-            let incarnation = match client.home(B, home.epoch, HomeOp::Open { txn }).unwrap() {
-                HomeReply::Opened { incarnation } => incarnation,
-                reply => panic!("unexpected Open: {reply:?}"),
-            };
-            client
-                .home(
+            let txn = ClusterTxnId::new(
+                1,
+                retry(|| client.lease(LeaseKind::Xid, 1, 1)).unwrap().start,
+            );
+            let incarnation =
+                match retry(|| client.home(B, home.epoch, HomeOp::Open { txn })).unwrap() {
+                    HomeReply::Opened { incarnation } => incarnation,
+                    reply => panic!("unexpected Open: {reply:?}"),
+                };
+            retry(|| {
+                client.home(
                     B,
                     home.epoch,
                     HomeOp::Seal {
@@ -333,12 +364,13 @@ fn preserves_writes_and_prepared_transactions_during_move() {
                         participants: vec![A],
                     },
                 )
-                .unwrap();
+            })
+            .unwrap();
             let key = key(1, 2, seq);
             let value = format!("prepared-{seq}").into_bytes();
-            let (desc, generation) = lock(&**client, txn, &key).unwrap();
-            let prepared_at = client
-                .prepare(
+            let (desc, generation) = retry(|| lock(&**client, txn, &key)).unwrap();
+            let prepared_at = retry(|| {
+                client.prepare(
                     A,
                     desc.epoch,
                     txn,
@@ -346,9 +378,10 @@ fn preserves_writes_and_prepared_transactions_during_move() {
                     write(key.clone(), value.clone()),
                     Some(generation),
                 )
-                .unwrap();
-            client
-                .home(
+            })
+            .unwrap();
+            retry(|| {
+                client.home(
                     B,
                     home.epoch,
                     HomeOp::Vote {
@@ -358,7 +391,8 @@ fn preserves_writes_and_prepared_transactions_during_move() {
                         prepared_at,
                     },
                 )
-                .unwrap();
+            })
+            .unwrap();
             prepared.push((txn, incarnation, key, value));
         }
         eventually(|| progress.iter().all(|n| n.load(Ordering::SeqCst) >= 2));
@@ -366,14 +400,31 @@ fn preserves_writes_and_prepared_transactions_during_move() {
         eprintln!("prepared before move: {prepared:02x?}");
         let deadline = Instant::now() + READY;
         let moved = loop {
-            match move_replica(leader(&nodes), A, 3, 4, READY).unwrap() {
-                MoveOutcome::Done(desc) => break desc,
-                MoveOutcome::NotLeader { leader: id } => {
+            match move_replica(
+                leader(&nodes),
+                A,
+                3,
+                4,
+                deadline.saturating_duration_since(Instant::now()),
+            ) {
+                Ok(MoveOutcome::Done(desc)) => break desc,
+                Ok(MoveOutcome::NotLeader { leader: id }) => {
                     eprintln!("move redirected to {id}");
-                    assert!(Instant::now() < deadline, "move stuck");
-                    thread::sleep(Duration::from_millis(20));
                 }
+                Err(Error::NotLeader) => {}
+                // The move driver wraps transport errors in Apply and system-range
+                // errors in Core; retry only explicitly transient failures.
+                Err(Error::Apply(reason) | Error::Core(reason))
+                    if reason.starts_with("unavailable:")
+                        || reason.starts_with("not leader")
+                        || reason.starts_with("stale epoch") =>
+                {
+                    eprintln!("move retry: {reason}");
+                }
+                Err(error) => panic!("move failed: {error}"),
             }
+            assert!(Instant::now() < deadline, "move stuck");
+            thread::sleep(Duration::from_millis(20));
         };
         let mut voters: Vec<_> = moved
             .replicas
@@ -396,12 +447,12 @@ fn preserves_writes_and_prepared_transactions_during_move() {
         );
         for (seq, (txn, incarnation, _, _)) in prepared.iter().enumerate() {
             let outcome = if seq < 2 {
-                Outcome::Commit(client.oracle().next(1).unwrap())
+                Outcome::Commit(retry(|| client.oracle().next(1)).unwrap())
             } else {
                 Outcome::Abort
             };
-            client
-                .home(
+            retry(|| {
+                client.home(
                     B,
                     home.epoch,
                     HomeOp::Decide {
@@ -410,8 +461,9 @@ fn preserves_writes_and_prepared_transactions_during_move() {
                         outcome: outcome.clone(),
                     },
                 )
-                .unwrap();
-            client.finalize(A, *txn, outcome).unwrap();
+            })
+            .unwrap();
+            retry(|| client.finalize(A, *txn, outcome.clone())).unwrap();
         }
         eventually(|| {
             progress
