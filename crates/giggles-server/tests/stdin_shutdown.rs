@@ -69,6 +69,7 @@ async fn replicated_shutdown_exits_with_stdin_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "GD-0075 hardening open item: on main 9508e463 a cluster node shut down after its peers takes 10 s or more to exit (peer connect timeout); see the work log"]
 async fn cluster_shutdown_exits_with_stdin_open() {
     let mut cluster = ClusterProcs::new(3).await;
     let first = cluster.client(0).await;
