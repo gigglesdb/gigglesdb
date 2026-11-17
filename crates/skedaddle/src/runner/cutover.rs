@@ -1339,6 +1339,9 @@ impl Task {
                     | fence::Intent::Save(state)
                     | fence::Intent::Unfence(state),
                 ) => saved.source = *state.clone(),
+                driver::Record::GigglesdbSource(_) => {
+                    return Err("GigglesDB source record in a PostgreSQL cutover journal".into());
+                }
                 driver::Record::Destination(intent) => saved.destination = intent.state.clone(),
                 driver::Record::Drain(counts) => saved.drained = counts.clone(),
             }

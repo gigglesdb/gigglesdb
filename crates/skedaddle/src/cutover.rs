@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod gigglesdb;
 pub mod pg;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -159,6 +160,7 @@ pub enum Record {
     Intent { step: Step, state: State },
     Checkpoint(State),
     Source(crate::pg::fence::Intent),
+    GigglesdbSource(crate::gigglesdb::fence::Intent),
     Destination(crate::pg::activate::Intent),
     Drain(DrainCounts),
 }
