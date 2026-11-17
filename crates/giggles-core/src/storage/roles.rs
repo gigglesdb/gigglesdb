@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    sync::Arc,
-    sync::atomic::Ordering,
+    sync::{Arc, OnceLock, atomic::Ordering},
 };
 
 pub const MAX_ROLE_NAME: usize = 63;
@@ -23,6 +22,62 @@ const NEXT_OID: &[u8] = b"meta/next_oid";
 // Both engines run the same catalog operations on one atomic image.
 #[derive(Clone, Default)]
 pub(crate) struct RoleTable(BTreeMap<Vec<u8>, Vec<u8>>);
+
+/// Immutable raw authority plus role records decoded once on first lookup.
+pub(crate) struct RoleImage {
+    table: RoleTable,
+    decoded: OnceLock<BTreeMap<String, CatalogRole>>,
+}
+impl RoleImage {
+    pub(crate) fn new(table: RoleTable) -> Self {
+        Self {
+            table,
+            decoded: OnceLock::new(),
+        }
+    }
+
+    fn get(&self, name: &str) -> Result<Option<CatalogRole>, RoleError> {
+        let decoded = self.decoded.get_or_init(|| {
+            self.table.0.iter().filter_map(|(key, value)| {
+                let name = std::str::from_utf8(key.strip_prefix(b"role/")?).ok()?;
+                let role = decode::<CatalogRole>(value).ok()?;
+                Some((name.to_owned(), role))
+            }).collect()
+        });
+        if let Some(role) = decoded.get(name) {
+            return Ok(Some(role.clone()));
+        }
+        // Keep absent and corrupt records on the original lookup/error path.
+        raw_get(&self.table, &key(b"role/", name))?
+            .map(|value| decode(&value))
+            .transpose()
+    }
+}
+
+/// A statement's authority image. Cloning shares the immutable role data.
+#[derive(Clone)]
+pub struct RoleCatalogImage {
+    catalog: RoleCatalog,
+    image: Arc<RoleImage>,
+}
+impl RoleCatalogImage {
+    pub fn get(&self, name: &str) -> Result<Option<CatalogRole>, RoleError> {
+        self.catalog.check_fenced()?;
+        validate_name(name)?;
+        self.image.get(name)
+    }
+
+    pub fn table_owner(&self, table: &str) -> Result<Option<String>, RoleError> {
+        self.catalog.check_fenced()?;
+        self.catalog.validate_relation_name(table)?;
+        raw_get(&self.image.table, &key(b"owner/", table))?
+            .map(|value| {
+                String::from_utf8(value)
+                    .map_err(|error| CoreError::Corrupt(error.to_string()).into())
+            })
+            .transpose()
+    }
+}
 struct Bytes<'a>(&'a [u8]);
 impl Bytes<'_> {
     fn value(&self) -> &[u8] {
@@ -371,9 +426,9 @@ impl RoleCatalog {
     ) -> Result<T, RoleError> {
         self.check_fenced()?;
         if let super::Backend::V2(db) = &self.inner.backend {
-            let image = engine::load(db)?;
+            let image = engine::image(db)?;
             self.check_fenced()?;
-            return inspect(Some(&image));
+            return inspect(Some(&image.table));
         }
         let tx = self.inner.db(super::ROLES)?.begin_read().map_err(io)?;
         self.check_fenced()?;
@@ -417,11 +472,21 @@ impl RoleCatalog {
     pub fn get(&self, name: &str) -> Result<Option<CatalogRole>, RoleError> {
         self.check_fenced()?;
         validate_name(name)?;
-        self.read(|table| match table {
-            Some(table) => raw_get(table, &key(b"role/", name))?
-                .map(|value| decode(&value))
-                .transpose(),
-            None => Ok(None),
+        self.image()?.get(name)
+    }
+
+    pub fn image(&self) -> Result<RoleCatalogImage, RoleError> {
+        self.check_fenced()?;
+        let image = if let super::Backend::V2(db) = &self.inner.backend {
+            let image = engine::image(db)?;
+            self.check_fenced()?;
+            image
+        } else {
+            self.read(|table| Ok(Arc::new(RoleImage::new(table.cloned().unwrap_or_default()))))?
+        };
+        Ok(RoleCatalogImage {
+            catalog: self.clone(),
+            image,
         })
     }
 

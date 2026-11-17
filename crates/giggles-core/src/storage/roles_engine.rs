@@ -182,8 +182,29 @@ pub(crate) fn load_txn(txn: &mut Transaction) -> Result<RoleTable, RoleError> {
     }
     Ok(image)
 }
-pub(super) fn load(db: &V2Db) -> Result<RoleTable, RoleError> {
-    load_txn(&mut db.begin(Isolation::ReadCommitted))
+pub(super) fn image(db: &V2Db) -> Result<std::sync::Arc<super::RoleImage>, RoleError> {
+    image_txn(db.catalog(), &mut db.begin(Isolation::ReadCommitted))
+}
+
+pub(super) fn image_txn(
+    catalog: &crate::storage::engine::catalog::Catalog,
+    txn: &mut Transaction,
+) -> Result<std::sync::Arc<super::RoleImage>, RoleError> {
+    txn.snapshot_ts();
+    if let Some(error) = txn.snapshot_error() {
+        return Err(CoreError::from(error.clone()).into());
+    }
+    if txn.catalog_writes().next().is_none() {
+        let (snapshot, version) = catalog.binding_snapshot(txn)?;
+        if version.is_some() {
+            // V is the latest committed catalog version <= this transaction's T.
+            // Every role write publishes a catalog version, so no role write can
+            // commit in (V, T]. load_txn(T) therefore builds exactly V's image.
+            return snapshot.roles(|| load_txn(txn));
+        }
+    }
+    // Private catalog writes and old-snapshot fallbacks have no shared image.
+    Ok(std::sync::Arc::new(super::RoleImage::new(load_txn(txn)?)))
 }
 fn lock(
     txn: &mut Transaction,

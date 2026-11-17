@@ -2,6 +2,289 @@ use super::*;
 use crate::{Engine, Limits, storage::Backend};
 use std::path::PathBuf;
 
+fn version(db: &crate::storage::v2::V2Db) -> crate::storage::engine::hlc::Ts {
+    let txn = db.begin(crate::storage::engine::txn::Isolation::ReadCommitted);
+    db.catalog().binding_snapshot(&txn).unwrap().1.unwrap()
+}
+
+#[test]
+fn role_cache_versions_and_reuse() {
+    let dir = Directory::new();
+    let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
+    let Backend::V2(db) = &admin.inner.backend else {
+        unreachable!()
+    };
+    let roles = admin.roles();
+    let before = version(db);
+    roles.create(role("reader")).unwrap();
+    assert_ne!(before, version(db));
+    assert!(roles.get("reader").unwrap().is_some());
+    let first = roles.image().unwrap();
+    let second = roles.image().unwrap();
+    assert!(Arc::ptr_eq(&first.image, &second.image));
+    first.get("reader").unwrap();
+    assert_eq!(first.image.decoded.get().unwrap().len(), 1);
+    for grant in [true, false, true, false] {
+        let before = version(db);
+        if grant {
+            roles
+                .grant_table("items", "reader", &[TablePrivilege::Select])
+                .unwrap();
+        } else {
+            roles
+                .revoke_table("items", "reader", &[TablePrivilege::Select])
+                .unwrap();
+        }
+        assert_ne!(before, version(db));
+        assert_eq!(
+            roles
+                .table_privileges("items", "reader")
+                .unwrap()
+                .contains(&TablePrivilege::Select),
+            grant
+        );
+    }
+    let before = version(db);
+    roles.set_table_owner("items", "reader").unwrap();
+    assert_ne!(before, version(db));
+    assert_eq!(
+        roles.table_owner("items").unwrap().as_deref(),
+        Some("reader")
+    );
+    assert_eq!(
+        roles.image().unwrap().table_owner("items").unwrap(),
+        roles.table_owner("items").unwrap()
+    );
+    let before = version(db);
+    roles
+        .alter(
+            "reader",
+            RoleChanges {
+                login: Some(false),
+                ..RoleChanges::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(before, version(db));
+    assert!(!roles.get("reader").unwrap().unwrap().login);
+    assert!(first.get("reader").unwrap().unwrap().login);
+    assert!(matches!(first.get(""), Err(RoleError::Invalid)));
+    assert!(matches!(first.table_owner(""), Err(RoleError::Invalid)));
+}
+
+#[test]
+fn role_cache_snapshot_and_private_write_bypass() {
+    use crate::storage::engine::{kv::Keyspace, txn::Isolation};
+    let dir = Directory::new();
+    let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
+    let Backend::V2(db) = &admin.inner.backend else {
+        unreachable!()
+    };
+    let roles = admin.roles();
+    roles.create(role("reader")).unwrap();
+    let mut old = db.begin(Isolation::ReadCommitted);
+    // Leave the old image unbuilt until AFTER the role write.
+    roles
+        .alter(
+            "reader",
+            RoleChanges {
+                login: Some(false),
+                ..RoleChanges::default()
+            },
+        )
+        .unwrap();
+    let old_image = engine::image_txn(db.catalog(), &mut old).unwrap();
+    assert!(old_image.get("reader").unwrap().unwrap().login);
+    assert!(!roles.get("reader").unwrap().unwrap().login);
+    let mut own = db.begin(Isolation::ReadCommitted);
+    let raw = key(b"role/", "reader");
+    let mut changed = roles.get("reader").unwrap().unwrap();
+    changed.login = true;
+    own.put(
+        Keyspace::Catalog,
+        engine::encode_key(&raw).unwrap(),
+        [vec![1], json(&changed).unwrap()].concat(),
+    )
+    .unwrap();
+    let private = engine::image_txn(db.catalog(), &mut own).unwrap();
+    assert_eq!(private.table.0, engine::load_txn(&mut own).unwrap().0);
+    assert!(private.get("reader").unwrap().unwrap().login);
+    assert!(!Arc::ptr_eq(&private, &roles.image().unwrap().image));
+    let again = engine::image_txn(db.catalog(), &mut own).unwrap();
+    assert!(!Arc::ptr_eq(&private, &again));
+}
+
+#[test]
+fn role_cache_old_snapshot_fallback_bypass() {
+    use crate::storage::engine::{catalog::Catalog, locks::LockManager, txn::Isolation};
+    let dir = Directory::new();
+    let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
+    let Backend::V2(db) = &admin.inner.backend else {
+        unreachable!()
+    };
+    let roles = admin.roles();
+    roles.create(role("reader")).unwrap();
+    let mut old = db.begin(Isolation::ReadCommitted);
+    roles
+        .alter(
+            "reader",
+            RoleChanges {
+                login: Some(false),
+                ..RoleChanges::default()
+            },
+        )
+        .unwrap();
+    // Opening at the new visible timestamp leaves the old transaction before
+    // this catalog's earliest known version, exercising the real fallback.
+    let reopened = Catalog::open(
+        db.sequencer.clone(),
+        Arc::new(LockManager::new(Default::default())),
+        db.sequences.clone(),
+    )
+    .unwrap();
+    assert!(reopened.binding_snapshot(&old).unwrap().1.is_none());
+    let image = engine::image_txn(&reopened, &mut old).unwrap();
+    assert_eq!(image.table.0, engine::load_txn(&mut old).unwrap().0);
+    assert!(image.get("reader").unwrap().unwrap().login);
+    assert!(!Arc::ptr_eq(
+        &image,
+        &engine::image_txn(&reopened, &mut old).unwrap()
+    ));
+}
+
+#[test]
+fn role_cache_failed_build_is_retryable() {
+    use crate::storage::engine::txn::Isolation;
+    let dir = Directory::new();
+    let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
+    let Backend::V2(db) = &admin.inner.backend else {
+        unreachable!()
+    };
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    let (snapshot, _) = db.catalog().binding_snapshot(&txn).unwrap();
+    assert!(matches!(
+        snapshot.roles(|| Err(RoleError::Invalid)),
+        Err(RoleError::Invalid)
+    ));
+    let image = snapshot.roles(|| engine::load_txn(&mut txn)).unwrap();
+    let again = snapshot
+        .roles(|| panic!("successful image must be reused"))
+        .unwrap();
+    assert!(Arc::ptr_eq(&image, &again));
+}
+
+#[test]
+fn role_image_session_owner_prefers_own_ddl() {
+    use crate::storage::engine::{kv::Keyspace, txn::Isolation};
+    let dir = Directory::new();
+    let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
+    let Backend::V2(db) = &admin.inner.backend else {
+        unreachable!()
+    };
+    let roles = admin.roles();
+    roles.create(role("owner")).unwrap();
+    roles.set_table_owner("items", "owner").unwrap();
+    let image = roles.image().unwrap();
+    let mut session = admin.sql_session();
+    assert_eq!(
+        session.table_owner_in(&image, "items").unwrap().as_deref(),
+        Some("owner")
+    );
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    let owner_key = engine::encode_key(&key(b"owner/", "items")).unwrap();
+    txn.delete(Keyspace::Catalog, owner_key).unwrap();
+    session.v2_transaction = Some(txn);
+    assert_eq!(session.table_owner_in(&image, "items").unwrap(), None);
+    assert_eq!(
+        session.table_owner_in(&image, "items").unwrap(),
+        session.table_owner("items").unwrap()
+    );
+    assert_eq!(
+        image.table_owner("items").unwrap().as_deref(),
+        Some("owner")
+    );
+}
+
+#[test]
+fn role_image_legacy_and_v2_accessor_parity() {
+    for backend in [Engine::Legacy, Engine::V2] {
+        let dir = Directory::new();
+        let admin = Admin::create_engine(&dir.0, Limits::default(), backend).unwrap();
+        let roles = admin.roles();
+        roles.create(role("reader")).unwrap();
+        roles.set_table_owner("items", "reader").unwrap();
+        let image = roles.image().unwrap();
+        for name in ["reader", "missing"] {
+            assert_eq!(image.get(name).unwrap(), roles.get(name).unwrap());
+        }
+        for table in ["items", "missing"] {
+            assert_eq!(
+                image.table_owner(table).unwrap(),
+                roles.table_owner(table).unwrap()
+            );
+        }
+        assert!(matches!(image.get(""), Err(RoleError::Invalid)));
+        assert!(matches!(image.table_owner(""), Err(RoleError::Invalid)));
+        // Missing schemas are invalid only on legacy, matching RoleCatalog.
+        assert_eq!(
+            image.table_owner("absent\0items").is_err(),
+            roles.table_owner("absent\0items").is_err()
+        );
+    }
+}
+
+#[test]
+fn role_cache_concurrent_grant_revoke() {
+    use std::sync::{Barrier, atomic::AtomicBool};
+    let dir = Directory::new();
+    let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
+    let roles = admin.roles();
+    roles.create(role("reader")).unwrap();
+    let barrier = Barrier::new(9);
+    let expected = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let roles = &roles;
+            let barrier = &barrier;
+            let expected = &expected;
+            scope.spawn(move || {
+                for _ in 0..200 {
+                    assert!(roles.get("reader").unwrap().unwrap().login);
+                    let grants = roles.table_privileges("items", "reader").unwrap();
+                    assert!(
+                        grants.is_empty() || grants == BTreeSet::from([TablePrivilege::Select])
+                    );
+                    // Writer has committed before the first barrier. No next
+                    // write until every reader has checked that commit.
+                    barrier.wait();
+                    assert_eq!(
+                        roles
+                            .table_privileges("items", "reader")
+                            .unwrap()
+                            .contains(&TablePrivilege::Select),
+                        expected.load(Ordering::Acquire)
+                    );
+                    barrier.wait();
+                }
+            });
+        }
+        for i in 0..200 {
+            let grant = i % 2 == 0;
+            if grant {
+                roles
+                    .grant_table("items", "reader", &[TablePrivilege::Select])
+                    .unwrap();
+            } else {
+                roles
+                    .revoke_table("items", "reader", &[TablePrivilege::Select])
+                    .unwrap();
+            }
+            expected.store(grant, Ordering::Release);
+            barrier.wait();
+            barrier.wait();
+        }
+    });
+}
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
@@ -632,4 +915,22 @@ fn extended_type_and_role_feature_bits_coexist_after_reopen() {
     assert_eq!(features(&admin), column_features | engine::FEATURE);
     assert!(admin.roles().get("reader").unwrap().is_some());
     drop(admin);
+}
+
+#[test]
+fn role_cache_decoded_misses_keep_raw_errors() {
+    let good = role("good");
+    let mut table = RoleTable::default();
+    table.0.insert(key(b"role/", "good"), json(&CatalogRole {
+        name: good.name, oid: FIRST_ROLE_OID, superuser: good.superuser,
+        login: good.login, createrole: good.createrole, password: good.password,
+        generation: 1, task_only: false,
+    }).unwrap());
+    table.0.insert(key(b"role/", "broken"), b"not json".to_vec());
+    let image = RoleImage::new(table);
+    assert!(image.get("good").unwrap().is_some());
+    assert_eq!(image.decoded.get().unwrap().len(), 1);
+    assert!(image.get("absent").unwrap().is_none());
+    let expected = decode::<CatalogRole>(b"not json").unwrap_err().to_string();
+    assert_eq!(image.get("broken").unwrap_err().to_string(), expected);
 }

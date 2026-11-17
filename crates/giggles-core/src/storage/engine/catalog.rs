@@ -180,6 +180,8 @@ pub(crate) struct CatalogSnapshot {
     cursor_image: OnceLock<Arc<relational::Relational>>,
     image_build: Mutex<()>,
     allocation_floor: OnceLock<Result<u64, SqlError>>,
+    roles: OnceLock<Arc<crate::storage::roles::RoleImage>>,
+    roles_build: Mutex<()>,
 }
 impl CatalogSnapshot {
     fn new(view: &CatalogView) -> Self {
@@ -189,7 +191,29 @@ impl CatalogSnapshot {
             cursor_image: OnceLock::new(),
             image_build: Mutex::new(()),
             allocation_floor: OnceLock::new(),
+            roles: OnceLock::new(),
+            roles_build: Mutex::new(()),
         }
+    }
+
+    pub(crate) fn roles(
+        &self,
+        load: impl FnOnce()
+            -> Result<crate::storage::roles::RoleTable, crate::storage::roles::RoleError>,
+    ) -> Result<Arc<crate::storage::roles::RoleImage>, crate::storage::roles::RoleError> {
+        if let Some(image) = self.roles.get() {
+            return Ok(image.clone());
+        }
+        let _build = self
+            .roles_build
+            .lock()
+            .map_err(|_| corrupt("role image build mutex poisoned"))?;
+        if let Some(image) = self.roles.get() {
+            return Ok(image.clone());
+        }
+        let image = Arc::new(crate::storage::roles::RoleImage::new(load()?));
+        let _ = self.roles.set(image.clone());
+        Ok(image)
     }
 
     pub(crate) fn image(&self) -> Result<Arc<relational::Relational>, SqlError> {

@@ -1707,7 +1707,8 @@ impl Session {
     }
     fn authorize_sequences(&mut self, dependencies: &[Option<String>]) -> Result<(), CoreError> {
         let sequences = self.sql.sequence_owners()?;
-        let roles = self.service.admin.roles();
+        let image = self.service.admin.roles().image()
+            .map_err(|_| CoreError::Policy(Error::Authentication))?;
         let allowed_table = |table: &str| -> bool {
             match &self.role {
                 Role::Application { tables, .. } => tables.contains(table),
@@ -1716,7 +1717,7 @@ impl Session {
                         .table_authority_name(table)
                         .is_ok_and(|durable_name| {
                             self.sql
-                                .table_owner(&durable_name)
+                                .table_owner_in(&image, &durable_name)
                                 .is_ok_and(|owner| owner.as_deref() == Some(name.as_str()))
                         })
                 }
@@ -1727,7 +1728,7 @@ impl Session {
             matches!(&self.role, Role::Database { .. }) && allowed_table(sequence)
         };
         let superuser = if let Role::Database { name } = &self.role {
-            roles
+            image
                 .get(name)
                 .map_err(role_lookup_error)?
                 .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
@@ -1736,14 +1737,18 @@ impl Session {
         } else {
             false
         };
-        let allowed_tables: BTreeSet<String> = sequences
+        let allowed_tables: BTreeSet<String> = if superuser {
+            BTreeSet::new()
+        } else {
+            sequences
             .iter()
             .filter_map(|(sequence, table)| match table {
                 Some(table) if allowed_table(table) => Some(table.clone()),
                 None if allowed_standalone(sequence) => Some(sequence.clone()),
                 _ => None,
             })
-            .collect();
+            .collect()
+        };
         let live_context = superuser || !allowed_tables.is_empty();
         let allowed = live_context
             && dependencies.iter().all(|dependency| {

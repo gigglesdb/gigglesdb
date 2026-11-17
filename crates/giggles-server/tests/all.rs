@@ -321,3 +321,4 @@ mod cluster_replace;
 
 #[path = "write_fence_holder_network.rs"]
 mod write_fence_holder_network;
+#[path = "role_cache_network.rs"] mod role_cache_network;

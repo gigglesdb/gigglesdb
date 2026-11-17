@@ -2386,6 +2386,20 @@ impl SqlSession {
         self.admin.roles().table_owner(table)
     }
 
+    /// Read authority from a captured image, including this session's own DDL.
+    pub fn table_owner_in(
+        &self,
+        image: &roles::RoleCatalogImage,
+        table: &str,
+    ) -> Result<Option<String>, roles::RoleError> {
+        if let Some(txn) = &self.v2_transaction
+            && let Some(owner) = roles::engine::own_owner(txn, table)?
+        {
+            return Ok(owner);
+        }
+        image.table_owner(table)
+    }
+
     /// Read grants including tombstones staged by v2 DROP/name reuse.
     pub fn table_privileges(
         &self,
