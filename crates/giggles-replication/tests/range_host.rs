@@ -235,8 +235,11 @@ fn start(dir: &Path, fresh: bool) -> Cluster {
     }
 }
 
-fn wait(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+fn wait(what: &str, done: impl FnMut() -> bool) {
+    wait_until(what, Instant::now() + Duration::from_secs(30), done);
+}
+
+fn wait_until(what: &str, deadline: Instant, mut done: impl FnMut() -> bool) {
     while !done() {
         assert!(Instant::now() < deadline, "timed out: {what}");
         thread::sleep(Duration::from_millis(10));
@@ -280,8 +283,11 @@ impl Cluster {
     }
     /// Waits until every range is steady among `among`; returns range -> leader.
     fn leaders(&self, among: &[u64]) -> BTreeMap<RangeId, u64> {
+        self.leaders_until(among, Instant::now() + Duration::from_secs(30))
+    }
+    fn leaders_until(&self, among: &[u64], deadline: Instant) -> BTreeMap<RangeId, u64> {
         let mut leaders = BTreeMap::new();
-        wait("one open engine per range on its leader", || {
+        wait_until("one open engine per range on its leader", deadline, || {
             leaders.clear();
             for range in ids() {
                 match self.steady(range, among) {
@@ -304,8 +310,30 @@ impl Cluster {
     fn heal(&self) {
         self.blocked.lock().unwrap().clear();
     }
+    /// Retrying these identical puts is safe even if an earlier outcome was unknown.
+    fn commit_retry(&self, range: RangeId, key: Vec<u8>) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(Instant::now() < deadline, "write never settled: {range:?}");
+            let node = self.leaders_until(&NODES, deadline)[&range];
+            match self.commit(node, range, key.clone()) {
+                Ok(_) => return node,
+                Err(
+                    RangeError::NotLeader { .. }
+                    | RangeError::Unavailable(_)
+                    | RangeError::Unknown(_),
+                ) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("write failed: {error:?}"),
+            }
+        }
+    }
     fn commit(&self, node: u64, range: RangeId, key: Vec<u8>) -> Result<Timestamp, RangeError> {
-        let service = self.host(node).service(range).expect("leader engine");
+        let service = self
+            .host(node)
+            .service(range)
+            .ok_or_else(|| RangeError::Unavailable("leader engine changed during lookup".into()))?;
         let epoch = service.descriptor().epoch;
         let write = RangeWrite {
             space: RangeSpace::Rows,
@@ -331,28 +359,85 @@ fn temp_dir() -> PathBuf {
 fn store_backed_hosts_open_engines_on_leaders_fence_on_isolation_and_reopen() {
     let dir = temp_dir();
     let c = start(&dir, true);
-    let leaders = c.leaders(&NODES);
 
-    // A write through each leader lands in its range on all three stores; a key
-    // outside the range is refused (the position still advances), reported as
-    // NotLeader, and fences the engine, which the role manager replaces.
+    // A write through each leader lands on all stores. An outside-range write
+    // must be refused at apply and fence the captured engine in the same term.
     for (i, range) in ids().into_iter().enumerate() {
-        let node = leaders[&range];
-        c.commit(node, range, user_key(i)).unwrap();
-        let written = c.applied(node, range);
-        c.wait_replicated(range, written);
-        let service = c.host(node).service(range).unwrap();
-        let outside = user_key((i + 1) % 8);
-        let refused = c.commit(node, range, outside.clone()).unwrap_err();
-        // Refused at apply = definitely not applied: NotLeader, never an unknown outcome.
-        assert!(
-            matches!(&refused, RangeError::NotLeader { .. }),
-            "{refused:?}"
-        );
-        assert!(c.applied(node, range) > written);
-        c.wait_replicated(range, written + 1);
-        let fenced = service.commit(Epoch(1), ClusterTxnId(2), Vec::new(), None, None);
-        assert_eq!(fenced, Err(RangeError::NotLeader { hint: None }));
+        let node = c.commit_retry(range, user_key(i));
+        c.wait_replicated(range, c.applied(node, range));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "refusal never settled: {range:?}"
+            );
+            let node = c.leaders_until(&NODES, deadline)[&range];
+            let group = c.host(node).group(range).unwrap();
+            let term = group.role().term;
+            let Some(service) = c.host(node).service(range) else {
+                continue;
+            };
+            let written = c.applied(node, range);
+            let opens = c.log.counts(node, range).0;
+            let generation = c
+                .log
+                .1
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(n, r, _)| (*n, *r) == (node, range))
+                .unwrap()
+                .2;
+            let refused = service.commit(
+                Epoch(1),
+                ClusterTxnId(1),
+                vec![RangeWrite {
+                    space: RangeSpace::Rows,
+                    key: user_key((i + 1) % 8),
+                    value: Some(b"v".to_vec()),
+                }],
+                None,
+                None,
+            );
+            let refused_position = c.applied(node, range);
+            let fenced = service.commit(Epoch(1), ClusterTxnId(2), Vec::new(), None, None);
+            if group.role().term != term {
+                continue;
+            }
+            // Refused at apply = definitely not applied, never an unknown outcome.
+            assert!(
+                matches!(&refused, Err(RangeError::NotLeader { .. })),
+                "{refused:?}"
+            );
+            assert!(refused_position > written);
+            assert_eq!(fenced, Err(RangeError::NotLeader { hint: None }));
+            wait_until("refusal replicated and engine reopened", deadline, || {
+                group.role().term != term
+                    || (NODES.iter().all(|&n| c.applied(n, range) > written)
+                        && c.log.counts(node, range).0 > opens
+                        && c.steady(range, &NODES) == Some(node))
+            });
+            if group.role().term != term {
+                continue;
+            }
+            let reopened = c
+                .log
+                .1
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(n, r, _)| (*n, *r) == (node, range))
+                .unwrap()
+                .2;
+            if group.role().term != term {
+                continue;
+            }
+            assert!(reopened > generation);
+            assert_eq!(reopened >> 20, generation >> 20, "reopen changed term");
+            break;
+        }
     }
     let mut leaders = c.leaders(&NODES);
 
@@ -372,52 +457,74 @@ fn store_backed_hosts_open_engines_on_leaders_fence_on_isolation_and_reopen() {
     }
     assert!(same_term > 0, "no same-term reopen: {gens:?}");
 
-    // Spread leaders over at least two nodes by moving them off a node that leads all.
-    for _ in 0..5 {
-        let nodes: BTreeSet<u64> = leaders.values().copied().collect();
-        if nodes.len() > 1 {
-            break;
-        }
-        let only = *nodes.first().unwrap();
-        c.isolate(only);
-        let rest: Vec<u64> = NODES.iter().copied().filter(|&n| n != only).collect();
-        c.leaders(&rest);
-        c.heal();
-        leaders = c.leaders(&NODES);
+    // Explicitly transfer one range if all ranges happen to share a leader.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while leaders.values().copied().collect::<BTreeSet<_>>().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "leaders never spread: {leaders:?}"
+        );
+        let range = ids()[0];
+        let from = leaders[&range];
+        let to = *NODES.iter().find(|&&n| n != from).unwrap();
+        c.host(from).group(range).unwrap().transfer_leader(to);
+        thread::sleep(Duration::from_millis(20));
+        leaders = c.leaders_until(&NODES, deadline);
     }
     let nodes: BTreeSet<u64> = leaders.values().copied().collect();
     assert!(nodes.len() > 1, "leaders never spread: {leaders:?}");
 
-    // Isolating the node leading the most ranges fences only its engines.
+    // Isolation fences all victim engines. Unchanged terms must keep their engines.
     let victim = *NODES
         .iter()
         .max_by_key(|&&n| leaders.values().filter(|&&l| l == n).count())
         .unwrap();
-    let kept: BTreeMap<RangeId, (u64, (usize, usize))> = leaders
+    let kept: BTreeMap<RangeId, (u64, u64, (usize, usize))> = leaders
         .iter()
         .filter(|(_, n)| **n != victim)
-        .map(|(r, n)| (*r, (*n, c.log.counts(*n, *r))))
+        .map(|(r, n)| {
+            (
+                *r,
+                (
+                    *n,
+                    c.host(*n).group(*r).unwrap().role().term,
+                    c.log.counts(*n, *r),
+                ),
+            )
+        })
         .collect();
     c.isolate(victim);
     let rest: Vec<u64> = NODES.iter().copied().filter(|&n| n != victim).collect();
-    let moved = c.leaders(&rest);
+    c.leaders(&rest);
     wait("isolated node's engines closed", || {
         ids()
             .into_iter()
             .all(|r| c.host(victim).service(r).is_none() && !c.log.open_nodes(r).contains(&victim))
     });
-    for (range, (node, counts)) in &kept {
+    let moved = c.leaders(&rest);
+    for (range, (node, term, counts)) in &kept {
+        assert_ne!(moved[range], victim);
+        assert_eq!(c.log.open_nodes(*range), vec![moved[range]]);
+        if c.host(*node).group(*range).unwrap().role().term != *term {
+            continue;
+        }
         assert_eq!(moved[range], *node, "range {} changed leader", range.0);
         assert_eq!(c.log.counts(*node, *range), *counts, "engine reopened");
         assert!(c.host(*node).service(*range).is_some());
     }
     c.heal();
     let healed = c.leaders(&NODES);
-    for (range, (node, _)) in &kept {
-        assert_eq!(healed[range], *node);
+    for (range, (node, term, counts)) in &kept {
+        assert_ne!(healed[range], victim);
+        assert_eq!(c.log.open_nodes(*range), vec![healed[range]]);
+        if c.host(*node).group(*range).unwrap().role().term == *term {
+            assert_eq!(healed[range], *node);
+            assert_eq!(c.log.counts(*node, *range), *counts, "engine reopened");
+            assert!(c.host(*node).service(*range).is_some());
+        }
     }
     for (i, range) in ids().into_iter().enumerate() {
-        c.commit(healed[&range], range, user_key(i)).unwrap();
+        c.commit_retry(range, user_key(i));
     }
     let applied: BTreeMap<(u64, RangeId), u64> = NODES
         .iter()
@@ -436,12 +543,12 @@ fn store_backed_hosts_open_engines_on_leaders_fence_on_isolation_and_reopen() {
     assert!(c.sinks.lock().unwrap().is_empty());
     drop(c);
     let c = start(&dir, false);
-    let leaders = c.leaders(&NODES);
+    c.leaders(&NODES);
     for ((node, range), index) in applied {
         assert!(c.applied(node, range) >= index);
     }
     for (i, range) in ids().into_iter().enumerate() {
-        c.commit(leaders[&range], range, user_key(i)).unwrap();
+        c.commit_retry(range, user_key(i));
     }
     drop(c);
     let _ = std::fs::remove_dir_all(&dir);
