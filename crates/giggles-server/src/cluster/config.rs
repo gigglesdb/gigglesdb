@@ -67,10 +67,10 @@ pub struct ClusterValidated {
 }
 
 impl ClusterValidated {
-    /// The smallest member id. That node alone writes the initial range directory and the
+    /// The smallest initial member id. That node alone writes the initial range directory and the
     /// bootstrap owner, so every member agrees on who bootstraps without coordination.
     pub fn bootstrap_node(&self) -> u64 {
-        self.members[0]
+        self.initial_members[0]
     }
 }
 
@@ -159,14 +159,14 @@ impl ClusterConfig {
             );
         }
         let replication_factor = match self.replication_factor {
-            Some(n) if !(1..=members.len()).contains(&n) => {
+            Some(n) if !(1..=initial_members.len()).contains(&n) => {
                 return Err(format!(
-                    "cluster.replication_factor: must be between 1 and {} (the member count)",
-                    members.len()
+                    "cluster.replication_factor: must be between 1 and {} (the initial member count)",
+                    initial_members.len()
                 ));
             }
             Some(n) => n,
-            None => members.len().min(3),
+            None => initial_members.len().min(3),
         };
         let mut split_keys: Vec<Vec<u8>> = Vec::with_capacity(self.split_keys.len());
         for (i, key) in self.split_keys.iter().enumerate() {
@@ -258,6 +258,12 @@ mod tests {
         let mut c = config();
         c.initial_members = Some(vec![1, 2]);
         assert_eq!(validate(&c).unwrap().initial_members, [1, 2]);
+        assert_eq!(validate(&c).unwrap().replication_factor, 2);
+        c.replication_factor = Some(3);
+        assert!(validate(&c).is_err());
+        c.replication_factor = None;
+        c.initial_members = Some(vec![2, 3]);
+        assert_eq!(validate(&c).unwrap().bootstrap_node(), 2);
         for ids in [vec![], vec![2, 1], vec![1, 1], vec![1, 4]] {
             c.initial_members = Some(ids);
             assert!(validate(&c).is_err());

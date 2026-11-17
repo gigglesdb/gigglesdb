@@ -369,6 +369,7 @@ pub trait NodeService: Send + Sync {
         _range: RangeId,
         _from: u64,
         _to: u64,
+        _forwarded: bool,
     ) -> std::result::Result<call_codec::MoveReply, RangeError> {
         Err(RangeError::Unavailable("range move unavailable".into()))
     }
@@ -561,11 +562,16 @@ fn handle(handlers: &Handlers, call: PeerCall) -> Reply {
                 .ok_or_else(|| missing("node registry"))?
                 .registry_update(call)
         }
-        PeerCall::Node(NodeCall::MoveRange { range, from, to }) => handlers
+        PeerCall::Node(NodeCall::MoveRange {
+            range,
+            from,
+            to,
+            forwarded,
+        }) => handlers
             .node
             .as_ref()
             .ok_or_else(|| missing("node move"))?
-            .move_range(range, from, to)
+            .move_range(range, from, to, forwarded)
             .map(PeerReply::Moving),
         PeerCall::Node(NodeCall::HostRange(desc)) => handlers
             .node
@@ -623,6 +629,7 @@ mod tests {
             range: RangeId(2),
             from: 3,
             to: 4,
+            forwarded: false,
         }))
         .unwrap();
         server.start(3, &body, true, &tx).await;

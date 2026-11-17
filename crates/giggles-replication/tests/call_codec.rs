@@ -229,6 +229,13 @@ fn calls() -> Vec<PeerCall> {
             range: RangeId(2),
             from: 3,
             to: 4,
+            forwarded: false,
+        }),
+        PeerCall::Node(NodeCall::MoveRange {
+            range: RangeId(2),
+            from: 3,
+            to: 4,
+            forwarded: true,
         }),
         PeerCall::Node(NodeCall::Status),
         PeerCall::Node(NodeCall::HostRange(desc())),

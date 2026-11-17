@@ -55,6 +55,7 @@ pub enum NodeCall {
         range: RangeId,
         from: u64,
         to: u64,
+        forwarded: bool,
     },
 }
 
@@ -732,11 +733,17 @@ pub fn encode_call(call: &PeerCall) -> Result<Vec<u8>, RangeError> {
                 w.u64(txn.0);
             }
         },
-        PeerCall::Node(NodeCall::MoveRange { range, from, to }) => {
+        PeerCall::Node(NodeCall::MoveRange {
+            range,
+            from,
+            to,
+            forwarded,
+        }) => {
             w.u8(50);
             w.u64(range.0);
             w.u64(*from);
             w.u64(*to);
+            w.u8(u8::from(*forwarded));
         }
         PeerCall::Node(NodeCall::RetireNode { id }) => {
             w.u8(51);
@@ -788,6 +795,11 @@ pub fn decode_call(bytes: &[u8]) -> Result<PeerCall, RangeError> {
             range: RangeId(r.u64()?),
             from: r.u64()?,
             to: r.u64()?,
+            forwarded: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(corrupt("invalid forwarding flag")),
+            },
         }),
         51 => PeerCall::Node(NodeCall::RetireNode { id: r.u64()? }),
         52 => PeerCall::Node(NodeCall::EnrolNode {

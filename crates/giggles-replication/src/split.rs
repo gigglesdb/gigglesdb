@@ -185,7 +185,9 @@ impl Splitter {
                 return;
             }
         };
-        let status = handle.membership_status().ok();
+        let Ok(status) = handle.membership_status() else {
+            return;
+        };
         let mut counts = BTreeMap::<u64, usize>::new();
         for id in self.host.groups() {
             if let Some(group) = self.host.group(id) {
@@ -198,9 +200,7 @@ impl Splitter {
             .filter(|r| {
                 r.node != self.node
                     && r.role == ReplicaRole::Voter
-                    && status
-                        .as_ref()
-                        .is_none_or(|s| s.reachable.contains(&r.node))
+                    && status.reachable.contains(&r.node)
             })
             .min_by_key(|r| (counts.get(&r.node).copied().unwrap_or(0), r.node))
             .map(|r| r.node);

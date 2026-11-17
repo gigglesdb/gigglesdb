@@ -93,6 +93,35 @@ fn unhosted_node_becomes_reachable_then_is_retired() {
     }
     assert_eq!(nodes[0].enrol_members(READY).unwrap(), 3);
     assert_eq!(nodes[0].enrol_members(READY).unwrap(), 0);
+    // A self-enrolled wildcard must never replace a statically configured dial address.
+    {
+        use giggles_core::range_api::{
+            ClusterTxnId, LeaseKind, RangeClient, RangeSpace, range_key,
+        };
+        let client = &**nodes[0].client();
+        let system = client
+            .descriptor_for(&range_key(RangeSpace::Catalog, &[registry::REGISTRY_TAG]))
+            .unwrap();
+        let counter = client
+            .lease(LeaseKind::Xid, (1 << 32) | 1, 1)
+            .unwrap()
+            .start;
+        client
+            .commit(
+                system.id,
+                system.epoch,
+                ClusterTxnId::try_new(1, counter).unwrap(),
+                vec![registry::record_write(&NodeRecord {
+                    id: 1,
+                    state: NodeState::Active,
+                    address: "0.0.0.0:1".into(),
+                    fingerprint: pki.nodes[&1].2.clone(),
+                })],
+                None,
+                None,
+            )
+            .unwrap();
+    }
     let mut watchers: Vec<_> = nodes[..3]
         .iter()
         .map(|node| node.start_registry_watcher(Duration::from_millis(100)))
@@ -133,6 +162,13 @@ fn unhosted_node_becomes_reachable_then_is_retired() {
                 .call(node.node_id(), PeerCall::Node(NodeCall::Status), CALL)
                 .is_ok()
         });
+    }
+    // Registry propagation above forces each watcher through a successful pass.
+    for node in &nodes[1..3] {
+        assert!(
+            matches!(node.transport().calls().call(1, PeerCall::Node(NodeCall::Status), CALL),
+            Ok(PeerReply::Node(report)) if report.node == 1)
+        );
     }
     assert!(registry::retire(&**nodes[0].client(), 1, 4).unwrap());
     // Existing inbound call connections must also lose authorization on retirement.
