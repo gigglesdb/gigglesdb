@@ -37,14 +37,17 @@ pub fn native_input_rows() -> (u64, u64) {
 }
 
 /// `visit` restricted to a task's visible rows (R3-306); every row offered is
-/// counted on `meter`. Without a scope it visits every row.
-fn scoped<'v, E>(
+/// counted on `meter`, and a row past the statement's limits stops the visit
+/// (R3-402). Without a scope it visits every row.
+fn scoped<'v, E: 'v>(
     scope: Option<&'v Scope>,
     meter: &'v StatementMeter,
     visit: &'v mut impl FnMut(&SqlRow) -> Result<(), E>,
+    map: fn(CoreError) -> E,
 ) -> impl FnMut(&SqlRow) -> Result<(), E> + 'v {
-    move |row| match scope {
-        Some(scope) if !scope.keep(row, meter) => Ok(()),
+    move |row| match scope.map(|scope| scope.keep(row, meter)) {
+        Some(Ok(false)) => Ok(()),
+        Some(Err(error)) => Err(map(error.into())),
         _ => visit(row),
     }
 }
@@ -278,11 +281,13 @@ impl SqlSession {
             let snapshot = self.complete_snapshot(table).map_err(map)?;
             let scope = self.native_task_scope(table).map_err(map)?;
             let meter = StatementMeter::default();
-            self.visit_native_key_v2(&db, table, key, &mut scoped(scope.as_ref(), &meter, visit), map)?;
+            let visited =
+                self.visit_native_key_v2(&db, table, key, &mut scoped(scope.as_ref(), &meter, visit, map), map);
             if scope.is_some() {
                 crate::task::rows::record(meter.counts());
                 self.note_task_rows_read(&meter);
             }
+            visited?;
             if self.complete_snapshot(table).map_err(map)? != snapshot {
                 return Err(map(CoreError::Sql(SqlError::StaleSchema)));
             }
@@ -303,20 +308,21 @@ impl SqlSession {
         let snapshot = self.complete_snapshot(table).map_err(map)?;
         let scope = self.native_task_scope(table).map_err(map)?;
         let meter = StatementMeter::default();
-        let visit = &mut scoped(scope.as_ref(), &meter, visit);
+        let visit = &mut scoped(scope.as_ref(), &meter, visit, map);
         #[cfg(feature = "engine-rocksdb")]
-        if let super::Backend::V2(db) = &self.admin.inner.backend {
+        let visited = if let super::Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
-            self.visit_native_page_v2(&db, table, visit, map)?;
+            self.visit_native_page_v2(&db, table, visit, map)
         } else {
-            self.visit_native_page_legacy(table, visit, map)?;
-        }
+            self.visit_native_page_legacy(table, visit, map)
+        };
         #[cfg(not(feature = "engine-rocksdb"))]
-        self.visit_native_page_legacy(table, visit, map)?;
+        let visited = self.visit_native_page_legacy(table, visit, map);
         if scope.is_some() {
             crate::task::rows::record(meter.counts());
-                self.note_task_rows_read(&meter);
+            self.note_task_rows_read(&meter);
         }
+        visited?;
         if self.complete_snapshot(table).map_err(map)? != snapshot {
             return Err(map(CoreError::Sql(SqlError::StaleSchema)));
         }
@@ -437,10 +443,24 @@ impl SqlSession {
                 None => rows,
                 Some(scope) => {
                     let meter = StatementMeter::default();
-                    let rows = rows.into_iter().filter(|row| scope.keep(row, &meter)).collect();
+                    let mut kept = Vec::new();
+                    let mut stopped = None;
+                    for row in rows {
+                        match scope.keep(&row, &meter) {
+                            Ok(true) => kept.push(row),
+                            Ok(false) => {}
+                            Err(error) => {
+                                stopped = Some(error);
+                                break;
+                            }
+                        }
+                    }
                     crate::task::rows::record(meter.counts());
-                self.note_task_rows_read(&meter);
-                    rows
+                    self.note_task_rows_read(&meter);
+                    if let Some(error) = stopped {
+                        return Err(error.into());
+                    }
+                    kept
                 }
             };
             Ok(CompleteRelation { snapshot, rows })

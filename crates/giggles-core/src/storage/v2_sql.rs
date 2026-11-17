@@ -424,9 +424,9 @@ impl SqlSession {
                                 } else {
                                     LockMode::RowExclusive
                                 },
-                                None,
+                                crate::task::limits::lock_deadline(),
                                 &|| crate::cancellation::check().is_err(),
-                            )?;
+                            ).map_err(crate::task::limits::lock_error)?;
                             // Refresh AFTER waiting: DDL may have introduced an FK.
                             if !self.copy_input.as_ref().is_some_and(|input| input.started) {
                                 txn.begin_statement();
@@ -535,16 +535,16 @@ impl SqlSession {
                             .collect();
                         for (id, mode) in locks {
                             if !table_names.contains_key(&id) {
-                                txn.acquire_lock(engine::locks::LockKey::Table(id), mode, None, &|| crate::cancellation::check().is_err())?;
+                                txn.acquire_lock(engine::locks::LockKey::Table(id), mode, crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
                                 continue;
                             }
                             db.catalog()
-                                .resolve(txn, table_names[&id], mode, None, &|| {
+                                .resolve(txn, table_names[&id], mode, crate::task::limits::lock_deadline(), &|| {
                                     crate::cancellation::check().is_err()
                                 })
                                 .map_err(|e| match e {
                                     engine::catalog::CatalogError::Core(e) => e,
-                                    engine::catalog::CatalogError::Txn(e) => e.into(),
+                                    engine::catalog::CatalogError::Txn(e) => crate::task::limits::lock_error(e),
                                 })?;
                         }
                         // A WITH statement can own several mutation targets.
@@ -636,8 +636,8 @@ impl SqlSession {
                                     Ok(physical)
                                 }).collect::<Result<BTreeSet<_>, CoreError>>()?;
                                 for key in physical {
-                                    txn.lock_for_write(Keyspace::Rows, &key, None,
-                                        &|| crate::cancellation::check().is_err())?;
+                                    txn.lock_for_write(Keyspace::Rows, &key, crate::task::limits::lock_deadline(),
+                                        &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
                                 }
                             }
                             if let Some(keys) = candidates {
@@ -652,8 +652,8 @@ impl SqlSession {
                                 let mut retention = relational::scan::Retention::new(retention_limit);
                                 let mut fits = true;
                                 for key in physical {
-                                    let target = txn.lock_for_write(Keyspace::Rows, &key, None,
-                                        &|| crate::cancellation::check().is_err())?;
+                                    let target = txn.lock_for_write(Keyspace::Rows, &key, crate::task::limits::lock_deadline(),
+                                        &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
                                     if let Some(bytes) = target.current {
                                         // Locked targets cannot grow before the final
                                         // snapshot. Reuse the publisher's exact budget.
@@ -693,13 +693,13 @@ impl SqlSession {
                                     }
                                 }
                                 for key in &physical {
-                                    txn.lock_for_write(Keyspace::Rows, key, None,
-                                        &|| crate::cancellation::check().is_err())?;
+                                    txn.lock_for_write(Keyspace::Rows, key, crate::task::limits::lock_deadline(),
+                                        &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
                                 }
                                 let mut upgrade = false;
                                 for key in witnesses {
-                                    let target = txn.lock_for_write(Keyspace::Index, &key, None,
-                                        &|| crate::cancellation::check().is_err())?;
+                                    let target = txn.lock_for_write(Keyspace::Index, &key, crate::task::limits::lock_deadline(),
+                                        &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
                                     if let Some(owner) = target.current {
                                         let mut row = table.id.to_be_bytes().to_vec();
                                         row.extend(owner);
@@ -1181,10 +1181,23 @@ impl<'a> SqlRows<'a> {
     }
     /// Drops the rows of a mutation page outside the task's visible rows, so
     /// neither the statement's expressions nor its writes see them.
-    fn retain_scope(&self, table: &TableDef, rows: &mut DdlRows) {
+    /// A row past the statement's rows-scanned limit or rows-read allowance
+    /// stops the statement (R3-402).
+    fn retain_scope(&self, table: &TableDef, rows: &mut DdlRows) -> Result<(), CoreError> {
         if let Some((scope, meter)) = self.scope_of(table) {
-            rows.retain(|_, row| scope.keep(row, meter));
+            let mut stopped = None;
+            rows.retain(|_, row| {
+                stopped.is_none()
+                    && scope.keep(row, meter).unwrap_or_else(|error| {
+                        stopped = Some(error);
+                        false
+                    })
+            });
+            if let Some(error) = stopped {
+                return Err(error.into());
+            }
         }
+        Ok(())
     }
 }
 
@@ -1281,8 +1294,8 @@ impl RowSink for SqlRows<'_> {
                     None
                 };
                 if let Some((ks, key)) = lock {
-                    self.txn.lock_key_share(ks, &key, None,
-                        &|| crate::cancellation::check().is_err())?;
+                    self.txn.lock_key_share(ks, &key, crate::task::limits::lock_deadline(),
+                        &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
                 }
             }
             let fixed = !self.statement_snapshot_is_latest();
@@ -1372,16 +1385,17 @@ impl RowSink for SqlRows<'_> {
         after: Option<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
         let page = self.read_page_all(table, after)?;
-        Ok(page.map(|(last, mut rows)| {
-            self.retain_scope(table, &mut rows);
-            (last, rows)
-        }))
+        page.map(|(last, mut rows)| {
+            self.retain_scope(table, &mut rows)?;
+            Ok((last, rows))
+        })
+        .transpose()
     }
     fn mutation_candidates(&mut self, table: &TableDef, keys: &[Vec<relational::Value>])
         -> Result<Option<DdlRows>, CoreError> {
         let mut rows = self.mutation_candidates_all(table, keys)?;
         if let Some(rows) = rows.as_mut() {
-            self.retain_scope(table, rows);
+            self.retain_scope(table, rows)?;
         }
         Ok(rows)
     }
@@ -1407,7 +1421,9 @@ impl RowSink for SqlRows<'_> {
                 MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + 1);
                 let row = SqlRow { values: row.values, version: row.version };
                 // R3-306: a key outside the task's visible rows matches nothing.
-                if self.scope_of(table).is_some_and(|(scope, meter)| !scope.keep(&row, meter)) {
+                if let Some((scope, meter)) = self.scope_of(table)
+                    && !scope.keep(&row, meter)?
+                {
                     continue;
                 }
                 let key = relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?;
@@ -1483,7 +1499,7 @@ impl RowSink for SqlRows<'_> {
             }
             // R3-306: a task statement's mutation page holds only visible rows.
             if mutating && self.scope_of(table).is_some() {
-                self.retain_scope(table, &mut rows);
+                self.retain_scope(table, &mut rows)?;
                 if rows.is_empty() {
                     continue;
                 }
@@ -1554,9 +1570,9 @@ impl RowSink for SqlRows<'_> {
             let mut chunk = self.db.begin(Isolation::ReadCommitted);
             chunk.require_features(engine::meta::SECONDARY_INDEXES);
             for (key, pk) in entries {
-                let target = chunk.lock_for_write(Keyspace::Index, &key, None, &|| {
+                let target = chunk.lock_for_write(Keyspace::Index, &key, crate::task::limits::lock_deadline(), &|| {
                     crate::cancellation::check().is_err()
-                })?;
+                }).map_err(crate::task::limits::lock_error)?;
                 if target.current.is_some() {
                     return Err(CoreError::Sql(SqlError::Duplicate));
                 }
@@ -1588,12 +1604,24 @@ impl RowSink for SqlRows<'_> {
         visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
         let scope = self.scope_of(table);
-        self.lookup_all(table, columns, values, unique, &mut |row| {
-            if scope.is_some_and(|(scope, meter)| !scope.keep(&row, meter)) {
-                return Ok(());
+        let mut stopped = None;
+        let result = self.lookup_all(table, columns, values, unique, &mut |row| {
+            if let Some((scope, meter)) = scope {
+                match scope.keep(&row, meter) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(()),
+                    Err(error) => {
+                        stopped = Some(error);
+                        return Err(SqlError::Unsupported);
+                    }
+                }
             }
             visit(row)
-        })
+        });
+        match stopped {
+            Some(error) => Err(error.into()),
+            None => result,
+        }
     }
     fn child_page(&mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
         after: Option<Vec<u8>>) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
@@ -1685,7 +1713,7 @@ impl RowSink for SqlRows<'_> {
             after,
             &self.parts.indexes,
             descriptors,
-            None,
+            crate::task::limits::lock_deadline(),
             &|| crate::cancellation::check().is_err(),
         )?;
         if let Some(new) = after_table
@@ -1707,60 +1735,75 @@ impl RowSink for SqlRows<'_> {
     ) -> Result<(), CoreError> {
         // R3-306: the general DML path loads a task statement's target
         // through here; rows outside the visible rows are not loaded.
+        // A row past the statement's limits stops the scan (R3-402).
         let scope = self.scope_of(table);
+        let stopped = std::cell::Cell::new(None);
         let visit = &mut |row: SqlRow| {
-            if scope.is_some_and(|(scope, meter)| !scope.keep(&row, meter)) {
-                return Ok(());
+            if let Some((scope, meter)) = scope {
+                match scope.keep(&row, meter) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(()),
+                    Err(error) => {
+                        stopped.set(Some(error));
+                        return Err(SqlError::Unsupported);
+                    }
+                }
             }
             visit(row)
         };
-        let entry = TableEntry {
-            primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
-            def: table.clone(),
-            heap: self.parts.heap.contains(&table.id),
-            columns_ext: BTreeMap::new(),
-        };
-        if let Some((lo, hi)) = self.primary_key_bounds(table) {
-            // GD-0075 P8-0: mandatory comparisons on an integer primary key read only the rows
-            // in their key range (the full WHERE is applied afterwards), so a point or key-range
-            // SELECT on a cluster gateway waits only on prepared writes inside that range.
-            for pair in self.db.rows.scan(
-                self.txn,
-                &entry,
-                lo,
-                hi,
-                engine::kv::Direction::Forward,
-                None,
-            )? {
-                let (_, row) = pair?;
+        let result = (|| -> Result<(), CoreError> {
+            let entry = TableEntry {
+                primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
+                def: table.clone(),
+                heap: self.parts.heap.contains(&table.id),
+                columns_ext: BTreeMap::new(),
+            };
+            if let Some((lo, hi)) = self.primary_key_bounds(table) {
+                // GD-0075 P8-0: mandatory comparisons on an integer primary key read only the rows
+                // in their key range (the full WHERE is applied afterwards), so a point or key-range
+                // SELECT on a cluster gateway waits only on prepared writes inside that range.
+                for pair in self.db.rows.scan(
+                    self.txn,
+                    &entry,
+                    lo,
+                    hi,
+                    engine::kv::Direction::Forward,
+                    None,
+                )? {
+                    let (_, row) = pair?;
+                    visit(SqlRow {
+                        values: row.values,
+                        version: row.version,
+                    })
+                    .map_err(CoreError::Sql)?;
+                }
+                return Ok(());
+            }
+            let candidate = self.scan_index(table);
+            let Some((descriptor, lo, hi)) = candidate else {
+                return self.scan_all(&entry, visit);
+            };
+            engine::indexes::visit(self.txn, &entry, &descriptor, lo, hi, &mut |_, row| {
                 visit(SqlRow {
                     values: row.values,
                     version: row.version,
                 })
-                .map_err(CoreError::Sql)?;
-            }
-            return Ok(());
+                .map_err(CoreError::Sql)
+            })?;
+            #[cfg(test)]
+            USED_INDEX_SCAN.set(true);
+            #[cfg(test)]
+            AFTER_TABLE_SCAN.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(&table.name);
+                }
+            });
+            Ok(())
+        })();
+        match stopped.take() {
+            Some(error) => Err(error.into()),
+            None => result,
         }
-        let candidate = self.scan_index(table);
-        let Some((descriptor, lo, hi)) = candidate else {
-            return self.scan_all(&entry, visit);
-        };
-        engine::indexes::visit(self.txn, &entry, &descriptor, lo, hi, &mut |_, row| {
-            visit(SqlRow {
-                values: row.values,
-                version: row.version,
-            })
-            .map_err(CoreError::Sql)
-        })?;
-        #[cfg(test)]
-        USED_INDEX_SCAN.set(true);
-        #[cfg(test)]
-        AFTER_TABLE_SCAN.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().as_mut() {
-                hook(&table.name);
-            }
-        });
-        Ok(())
     }
     fn check_occupancy(
         &mut self,
@@ -1782,9 +1825,9 @@ impl RowSink for SqlRows<'_> {
             )?);
             if self
                 .txn
-                .lock_for_write(Keyspace::Rows, &physical, None, &|| {
+                .lock_for_write(Keyspace::Rows, &physical, crate::task::limits::lock_deadline(), &|| {
                     crate::cancellation::check().is_err()
-                })?
+                }).map_err(crate::task::limits::lock_error)?
                 .current
                 .is_some()
             {
@@ -1823,9 +1866,9 @@ impl RowSink for SqlRows<'_> {
         // deterministic physical key order for re-key and searched mutations.
         for (key, (old, _)) in &changes {
             crate::cancellation::check()?;
-            let target = self.txn.lock_for_write(Keyspace::Rows, key, None, &|| {
+            let target = self.txn.lock_for_write(Keyspace::Rows, key, crate::task::limits::lock_deadline(), &|| {
                 crate::cancellation::check().is_err()
-            })?;
+            }).map_err(crate::task::limits::lock_error)?;
             match (old, target.current) {
                 (None, Some(_)) => return Err(CoreError::Sql(SqlError::Duplicate)),
                 (Some(old), Some(bytes)) => {

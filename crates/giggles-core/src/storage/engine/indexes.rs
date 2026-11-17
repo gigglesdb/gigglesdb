@@ -174,7 +174,9 @@ pub(crate) fn apply(
         .map(|key| (key.clone(), new.get(key).cloned()))
         .collect::<BTreeMap<_, _>>();
     for key in changes.keys() {
-        let target = txn.lock_for_write(Keyspace::Index, key, deadline, cancel)?;
+        let target = txn
+            .lock_for_write(Keyspace::Index, key, deadline, cancel)
+            .map_err(crate::task::limits::lock_error)?;
         if target.current.is_some() && target.current.as_ref() != old.get(key) {
             return Err(CoreError::Sql(SqlError::Duplicate));
         }
@@ -198,8 +200,10 @@ pub(crate) fn check_occupancy(
     let old = entries(table, before, ds)?;
     for (key, pk) in entries(table, after, ds)? {
         if old.get(&key) == Some(&pk) { continue; }
-        let target = txn.lock_for_write(Keyspace::Index, &key, None,
-            &|| crate::cancellation::check().is_err())?;
+        let target = txn
+            .lock_for_write(Keyspace::Index, &key, crate::task::limits::lock_deadline(),
+                &|| crate::cancellation::check().is_err())
+            .map_err(crate::task::limits::lock_error)?;
         if target.current.is_some() && target.current.as_ref() != old.get(&key) {
             return Err(CoreError::Sql(SqlError::Duplicate));
         }

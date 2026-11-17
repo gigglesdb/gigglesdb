@@ -51,6 +51,9 @@ pub(crate) enum TxnError {
     Guard(super::once_guard::GuardRejection),
     LockLimit,
     WriteSetLimit,
+    /// A write past the limit `set_write_limit` set (a task statement's
+    /// `pending_write_bytes`, GD-0061 R3-402); nothing was staged.
+    PendingWriteLimit,
     SnapshotTooOld,
     CommitAmbiguous,
     Fenced,
@@ -76,6 +79,7 @@ impl TxnError {
             Self::Guard(GuardRejection::Cancelled) | Self::Cancelled => "57014",
             Self::Guard(GuardRejection::LeaseExpired) => "XX000",
             Self::LockLimit | Self::WriteSetLimit => "53200",
+            Self::PendingWriteLimit => "54T01",
             Self::CommitAmbiguous => "08007",
             Self::SequenceGone => "42P01",
             Self::DependentObjects => "2BP01",
@@ -119,6 +123,9 @@ impl From<TxnError> for crate::CoreError {
             TxnError::Fenced => Self::Fenced,
             TxnError::WriteFenced { epoch } => Self::WriteFenced { epoch },
             TxnError::LockLimit | TxnError::WriteSetLimit => Self::Limit,
+            TxnError::PendingWriteLimit => Self::Task(crate::task::TaskError::BudgetExceeded(
+                crate::task::Budget::PendingWrite,
+            )),
             TxnError::Serialization(_) | TxnError::SnapshotTooOld => {
                 Self::Sql(crate::relational::SqlError::Conflict)
             }
@@ -430,6 +437,9 @@ pub(crate) struct Transaction {
     raw: Vec<RawOp>,
     xact: Option<super::xact::XactGuard>,
     write_bytes: usize,
+    /// The most `write_bytes` may reach (`set_write_limit`); `None` = only
+    /// the engine's write-set limit.
+    write_limit: Option<usize>,
     savepoint_owner: Arc<()>,
     savepoint_sequence: u64,
     savepoints: Vec<(u64, usize)>,
@@ -478,6 +488,7 @@ impl Transaction {
             raw: Vec::new(),
             xact: None,
             write_bytes: 0,
+            write_limit: None,
             savepoint_owner: Arc::new(()),
             savepoint_sequence: 0,
             savepoints: Vec::new(),
@@ -762,6 +773,13 @@ impl Transaction {
     }
     /// Latest committed Kernel value, ignoring this transaction's snapshot and
     /// its own buffered writes (GD-0061 C6).
+    /// Limits the bytes this transaction may buffer (`write_bytes`: keys and
+    /// values of its pending writes) from now on; `None` lifts the limit. A
+    /// `put` past it fails with `PendingWriteLimit` before anything is
+    /// staged (GD-0061 R3-402).
+    pub(crate) fn set_write_limit(&mut self, limit: Option<usize>) {
+        self.write_limit = limit;
+    }
     pub(crate) fn kernel_latest_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
         // Protected records are local-only (GD-0061); a cluster gateway has no form yet.
         let TxnServices::Local { seq, .. } = &self.services else {
@@ -1040,6 +1058,9 @@ impl Transaction {
             .is_none_or(|n| n > self.services.write_set_bytes())
         {
             return Err(TxnError::WriteSetLimit);
+        }
+        if self.write_limit.is_some_and(|limit| size > limit) {
+            return Err(TxnError::PendingWriteLimit);
         }
         if undo_size == 0 {
             self.writes.insert(write_key, value);

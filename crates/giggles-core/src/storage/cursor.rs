@@ -21,8 +21,9 @@ pub struct Cursor {
     /// open until the cursor is exhausted, expires or is dropped; the guard
     /// records when the cursor was opened.
     guard: Option<crate::task::limits::StatementGuard>,
-    /// A fetch after the statement time closed this cursor.
-    expired: bool,
+    /// The error that closed this task cursor: a fetch after the statement
+    /// time (57014, R3-401) or past a row limit (54T01, R3-402).
+    closed: Option<CoreError>,
 }
 enum Data {
     Scan {
@@ -60,13 +61,15 @@ impl Cursor {
     }
     /// A task cursor's fetch runs within its statement time: a fetch after
     /// `opened_at + statement_ms` fails with 57014 and closes the cursor,
-    /// which gives its slots back, as exhaustion does (GD-0061 R3-401).
+    /// which gives its slots back, as exhaustion does (GD-0061 R3-401). A
+    /// fetch that trips the rows-scanned limit or the rows-read allowance
+    /// closes it the same way (R3-402); later fetches repeat the error.
     fn fetch_rows(&mut self, max_rows: usize, max_bytes: usize) -> Result<Vec<SqlRow>, CoreError> {
-        if self.expired {
-            return Err(CoreError::Cancelled);
+        if let Some(error) = &self.closed {
+            return Err(error.clone());
         }
         if self.guard.as_ref().is_some_and(|guard| guard.expired()) {
-            self.expire();
+            self.close(CoreError::Cancelled);
             return Err(CoreError::Cancelled);
         }
         let active = self
@@ -76,20 +79,28 @@ impl Cursor {
         let result = self.fetch_page(max_rows, max_bytes);
         drop(active);
         match &result {
-            Err(_) if self.guard.as_ref().is_some_and(|guard| guard.expired()) => self.expire(),
+            Err(_) if self.guard.as_ref().is_some_and(|guard| guard.expired()) => {
+                self.close(CoreError::Cancelled)
+            }
+            Err(error @ CoreError::Task(crate::task::TaskError::BudgetExceeded(_)))
+                if self.guard.is_some() =>
+            {
+                self.close(error.clone())
+            }
             Ok(_) if self.is_exhausted() => self.guard = None,
             _ => {}
         }
         result
     }
-    /// Closes an expired task cursor: its rows, snapshot and slots go now.
-    fn expire(&mut self) {
-        self.expired = true;
+    /// Closes a task cursor that failed with `error`: its rows, snapshot and
+    /// slots go now, and its statement is logged with the error.
+    fn close(&mut self, error: CoreError) {
         self.guard = None;
         self.data = Data::Buffered(VecDeque::new());
         if let Some(tag) = &self.tag {
-            tag.fail(&CoreError::Cancelled);
+            tag.fail(&error);
         }
+        self.closed = Some(error);
     }
     fn fetch_page(&mut self, max_rows: usize, max_bytes: usize) -> Result<Vec<SqlRow>, CoreError> {
         crate::cancellation::check()?;
@@ -301,12 +312,14 @@ impl SqlSession {
                                     txn,
                                     &name,
                                     engine::locks::LockMode::AccessShare,
-                                    None,
+                                    crate::task::limits::lock_deadline(),
                                     &|| crate::cancellation::check().is_err(),
                                 )
                                 .map_err(|e| match e {
                                     engine::catalog::CatalogError::Core(e) => e,
-                                    engine::catalog::CatalogError::Txn(e) => e.into(),
+                                    engine::catalog::CatalogError::Txn(e) => {
+                                        crate::task::limits::lock_error(e)
+                                    }
                                 })?;
                         }
                     }
@@ -402,7 +415,7 @@ impl SqlSession {
                     scope,
                     meter: Default::default(),
                     guard: None,
-                    expired: false,
+                    closed: None,
                 }),
                 None => {
                     discard(&tag);
@@ -452,7 +465,7 @@ impl SqlSession {
             scope: None,
             meter: Default::default(),
             guard: None,
-            expired: false,
+            closed: None,
         })
     }
 }

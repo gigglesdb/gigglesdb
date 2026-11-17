@@ -245,6 +245,43 @@ fn write_budget_replacements_and_lock_ownership() {
     assert!(locks.held(TxnId(1)).is_empty());
 }
 #[test]
+fn write_limit_refuses_before_staging() {
+    // GD-0061 R3-402: a task statement's pending_write_bytes.
+    let (_, seq, locks) = setup(SequencerConfig::default());
+    let (k1, k2) = (key(1), key(2));
+    let mut t = txn(&seq, &locks, 1, Isolation::ReadCommitted);
+    for k in [&k1, &k2] {
+        t.lock_for_write(Keyspace::Rows, k, None, &|| false).unwrap();
+    }
+    // A 16-byte key plus a 4-byte value is 20 bytes buffered.
+    t.set_write_limit(Some(30));
+    t.put(Keyspace::Rows, k1.clone(), vec![1; 4]).unwrap();
+    // A replacement is charged its difference only.
+    t.put(Keyspace::Rows, k1.clone(), vec![2; 14]).unwrap();
+    assert_eq!(
+        t.put(Keyspace::Rows, k1.clone(), vec![3; 15]),
+        Err(TxnError::PendingWriteLimit)
+    );
+    assert_eq!(
+        t.put(Keyspace::Rows, k2.clone(), vec![4; 1]),
+        Err(TxnError::PendingWriteLimit)
+    );
+    // Nothing of a refused write was staged.
+    assert_eq!(t.get(Keyspace::Rows, &k1).unwrap(), Some(vec![2; 14]));
+    assert_eq!(t.get(Keyspace::Rows, &k2).unwrap(), None);
+    assert_eq!(TxnError::PendingWriteLimit.sqlstate(), "54T01");
+    assert_eq!(
+        crate::CoreError::from(TxnError::PendingWriteLimit),
+        crate::CoreError::Task(crate::task::TaskError::BudgetExceeded(
+            crate::task::Budget::PendingWrite
+        ))
+    );
+    // Lifting the limit lets the write through.
+    t.set_write_limit(None);
+    t.put(Keyspace::Rows, k2.clone(), vec![4; 1]).unwrap();
+    t.commit().unwrap();
+}
+#[test]
 fn concurrent_increment_isolation() {
     for isolation in [Isolation::ReadCommitted, Isolation::RepeatableRead] {
         let (_, seq, locks) = setup(SequencerConfig::default());

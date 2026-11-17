@@ -60,7 +60,7 @@ use super::authority;
 use super::columns;
 use super::context::TaskContext;
 use super::decide::{self, ApprovalState, Decision, RequestKind};
-use super::definition::{RoleName, TaskDef};
+use super::definition::{LoadLimits, RoleName, TaskDef};
 use super::effects::Effects;
 use super::error::{Budget, DenyRule, TaskError};
 use super::ledger::{self, OperationId, Outcome, RequestBody};
@@ -579,7 +579,15 @@ pub(crate) fn commit_sourced(
     // 3. Latest committed definition.
     let def = load_def(&db, task, DefAt::Latest)?;
     standing(def.as_deref(), ctx, db.wall_now_ms())?;
-    let lock_wait = def.as_ref().map_or(0, |def| def.limits.lock_wait_ms);
+    // The task's statement limits (R3-402): the hold's and the statement's
+    // lock waits, its rows scanned and its pending writes.
+    let limits = def.as_ref().map_or_else(
+        || LoadLimits {
+            lock_wait_ms: 0,
+            ..LoadLimits::default()
+        },
+        |def| def.limits,
+    );
     let source;
     let work = match &request {
         ProtectedRequest::Direct { statement, params, .. } => Work::Direct { statement, params },
@@ -594,7 +602,7 @@ pub(crate) fn commit_sourced(
     // the hold is released between attempts.
     let mut retry = 0;
     loop {
-        match attempt(session, &call, lock_wait, load_def) {
+        match attempt(session, &call, &limits, load_def) {
             Err(error) if retryable(&error) => {
                 retry += 1;
                 if retry >= ATTEMPTS {
@@ -612,7 +620,7 @@ pub(crate) fn commit_sourced(
 fn attempt(
     session: &mut SqlSession,
     call: &Call<'_>,
-    lock_wait: u64,
+    limits: &LoadLimits,
     load_def: &mut LoadDef<'_>,
 ) -> Result<Receipt, TaskError> {
     let Call { db, ctx, op, work, key, fp, faults } = call;
@@ -620,7 +628,7 @@ fn attempt(
     let task = ctx.task;
     // 4. The transaction; 5. the hold, before any snapshot (D1).
     let mut txn = db.begin(Isolation::Serializable);
-    let deadline = Instant::now().checked_add(Duration::from_millis(lock_wait));
+    let deadline = Instant::now().checked_add(Duration::from_millis(limits.lock_wait_ms));
     authority::hold(&txn, task, deadline, &|| crate::cancellation::check().is_err())
         .map_err(hold_error)?;
     faults.at(ProtectedPoint::AfterHold);
@@ -670,14 +678,21 @@ fn attempt(
         Err(error) => return Err(error),
     };
     drop((image, latest_catalog));
+    // R3-402: the statement's writes are held to `pending_write_bytes`
+    // (refused before staging), its scoped reads to `rows_scanned` and its
+    // lock waits to `lock_wait_ms`. The records staged after it are not.
+    super::limits::apply_to_txn(&mut txn, limits);
     let run = ProtectedRun { txn, effects: Effects::default() };
     // The statement runs bound to the executor's task, so it reads and
     // matches only the task's visible rows (R3-306); the session's own
     // binding, if any, is restored after.
     let bound = session.task.replace(ctx.clone());
+    let metered = super::limits::metered(limits);
     let (run, result) = session.execute_protected_v2(db, run, &expanded, params, clock);
+    drop(metered);
     session.task = bound;
     let ProtectedRun { mut txn, effects } = run;
+    txn.set_write_limit(None);
     result.map_err(engine)?;
     faults.at(ProtectedPoint::AfterStatement);
     // 9. Rechecks at the statement snapshot (tracked reads).

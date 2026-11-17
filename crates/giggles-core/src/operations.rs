@@ -459,6 +459,9 @@ fn core(e: CoreError) -> Error {
         CoreError::Sql(_) => Error::Sql {
             sqlstate: crate::sqlstate(&e).into(),
         },
+        // A task statement stopped by a limit inside the read (rows scanned,
+        // rows-read allowance; GD-0061 R3-402) keeps its SQLSTATE.
+        CoreError::Task(e @ crate::task::TaskError::BudgetExceeded(_)) => task_error(e),
         _ => Error::Core(e.to_string()),
     }
 }

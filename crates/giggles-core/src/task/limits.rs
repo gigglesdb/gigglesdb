@@ -1,5 +1,7 @@
-//! Load limits of task statements (GD-0061 R3-401, design-3 section 7):
-//! statement time, concurrent statements per task and the all-agent ceiling.
+//! Load limits of task statements (GD-0061 R3-401, R3-402, design-3 section
+//! 7): statement time, concurrent statements per task and the all-agent
+//! ceiling (R3-401); rows scanned, the statement's rows-read allowance, lock
+//! wait and pending writes (R3-402).
 //!
 //! A task statement enters a `StatementGuard` at `execute_bound_clocked`,
 //! `open_cursor_inner` and `native_scope`. The guard holds one per-task slot
@@ -7,14 +9,23 @@
 //! a dropped cursor gives them back. A session without a task takes one
 //! branch and no lock. A cursor owns its guard from open until it is
 //! exhausted, closed, expired or dropped.
+//!
+//! The guard also carries the statement's [`Meter`]: `activate` installs it
+//! as this thread's meter, so every scoped read of the statement (the
+//! `Scoped` source, the `SqlRows` sink scope and the native filter) counts
+//! into it and is stopped per row at `rows_scanned` or past the rows-read
+//! allowance, and every lock wait of the statement gets `lock_deadline()`.
+//! Outside a task statement no meter is installed: `lock_deadline()` is
+//! `None` and nothing is counted or checked.
 use super::definition::{LoadLimits, TaskObjectId};
 use super::error::{Budget, TaskError};
 use crate::cancellation::{self, Cancellation};
 use crate::storage::SqlSession;
 use crate::CoreError;
-use std::cell::Cell;
+use crate::storage::engine::txn::{Transaction, TxnError};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -103,6 +114,7 @@ pub(crate) struct StatementGuard {
     task: TaskObjectId,
     opened_at: Instant,
     statement: Duration,
+    meter: Arc<Meter>,
 }
 
 impl StatementGuard {
@@ -125,6 +137,7 @@ impl StatementGuard {
             task,
             opened_at: Instant::now(),
             statement: Duration::from_millis(limits.statement_ms),
+            meter: Arc::new(Meter::new(&limits, true)),
         }))
     }
 
@@ -143,7 +156,8 @@ impl StatementGuard {
     /// Runs the statement's work from here until the returned value drops:
     /// the current invocation gets this statement's deadline (an earlier
     /// deadline it already has still wins), or, with no invocation, one is
-    /// installed for the statement; nested statements take no slot.
+    /// installed for the statement; nested statements take no slot. The
+    /// statement's meter is this thread's meter until then.
     pub(crate) fn activate(&self) -> Active {
         let deadline = self.deadline();
         let installed = match Cancellation::current() {
@@ -155,6 +169,7 @@ impl StatementGuard {
         };
         Active {
             nested: ACTIVE.with(|a| a.replace(true)),
+            _metered: Metered::install(self.meter.clone()),
             _installed: installed,
         }
     }
@@ -169,6 +184,7 @@ impl Drop for StatementGuard {
 /// The running part of a guarded statement; see `StatementGuard::activate`.
 pub(crate) struct Active {
     nested: bool,
+    _metered: Metered,
     _installed: Option<cancellation::Installed>,
 }
 
@@ -176,6 +192,141 @@ impl Drop for Active {
     fn drop(&mut self) {
         ACTIVE.with(|a| a.set(self.nested));
     }
+}
+
+/// One task statement's row and lock limits and its running counts, shared
+/// by every scoped read of the statement (a cursor's fetches included).
+#[derive(Debug)]
+pub(crate) struct Meter {
+    scan_limit: u64,
+    lock_wait: Duration,
+    /// Whether the statement is held to a rows-read allowance (not the
+    /// protected commit's statement, which releases nothing).
+    reads: bool,
+    /// Rows the task may still read, set when the statement's first scope
+    /// is taken; `u64::MAX` until then.
+    read_allowance: AtomicU64,
+    scanned: AtomicU64,
+    read: AtomicU64,
+}
+
+impl Meter {
+    fn new(limits: &LoadLimits, reads: bool) -> Self {
+        Self {
+            scan_limit: limits.rows_scanned,
+            lock_wait: Duration::from_millis(limits.lock_wait_ms),
+            reads,
+            read_allowance: AtomicU64::new(u64::MAX),
+            scanned: AtomicU64::new(0),
+            read: AtomicU64::new(0),
+        }
+    }
+}
+
+thread_local! {
+    /// The meter of the task statement running on this thread.
+    static METER: RefCell<Option<Arc<Meter>>> = const { RefCell::new(None) };
+}
+
+fn with_meter<T>(f: impl FnOnce(&Meter) -> T) -> Option<T> {
+    METER.with(|m| m.borrow().as_deref().map(f))
+}
+
+/// This thread's meter from here until the value drops (RAII; the meter it
+/// replaced is restored).
+pub(crate) struct Metered {
+    previous: Option<Arc<Meter>>,
+}
+
+impl Metered {
+    fn install(meter: Arc<Meter>) -> Self {
+        Self {
+            previous: METER.with(|m| m.replace(Some(meter))),
+        }
+    }
+}
+
+impl Drop for Metered {
+    fn drop(&mut self) {
+        METER.with(|m| *m.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Meters the protected commit's statement with the task's `limits`: rows
+/// scanned and lock wait. It releases nothing, so no rows-read allowance
+/// applies.
+pub(crate) fn metered(limits: &LoadLimits) -> Metered {
+    Metered::install(Arc::new(Meter::new(limits, false)))
+}
+
+/// Counts one row a scoped read pulled from the task table; past
+/// `rows_scanned` the statement stops. The engine reads a page of up to 200
+/// rows at a time, so the rows pulled past the limit are at most one page.
+pub(crate) fn count_scanned() -> Result<(), TaskError> {
+    with_meter(|m| {
+        let scanned = m.scanned.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        if scanned > m.scan_limit {
+            return Err(TaskError::BudgetExceeded(Budget::RowsScanned));
+        }
+        Ok(())
+    })
+    .unwrap_or(Ok(()))
+}
+
+/// Counts one row the visible-rows predicate accepted; past the allowance
+/// read at statement start the statement stops (design-3 section 4).
+pub(crate) fn count_read() -> Result<(), TaskError> {
+    with_meter(|m| {
+        let read = m.read.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        if read > m.read_allowance.load(Ordering::SeqCst) {
+            return Err(TaskError::BudgetExceeded(Budget::RowsRead));
+        }
+        Ok(())
+    })
+    .unwrap_or(Ok(()))
+}
+
+/// Whether the running task statement has no rows-read allowance yet.
+pub(crate) fn wants_read_allowance() -> bool {
+    with_meter(|m| m.reads && m.read_allowance.load(Ordering::SeqCst) == u64::MAX).unwrap_or(false)
+}
+
+/// Sets the running statement's rows-read allowance once, at its first
+/// scope; later calls keep the first value.
+pub(crate) fn set_read_allowance(left: u64) {
+    with_meter(|m| {
+        if m.reads {
+            let _ = m
+                .read_allowance
+                .compare_exchange(u64::MAX, left, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    });
+}
+
+/// The deadline of a lock wait starting now: `now + lock_wait_ms` inside a
+/// task statement, `None` (wait as before) everywhere else.
+pub(crate) fn lock_deadline() -> Option<Instant> {
+    with_meter(|m| {
+        let now = Instant::now();
+        now.checked_add(m.lock_wait).unwrap_or(now)
+    })
+}
+
+/// A lock wait's engine error. Inside a task statement a wait that ran past
+/// `lock_deadline()` is 55P03 lock_not_available, as the protected commit's
+/// hold reports it; everywhere else the conversion is unchanged.
+pub(crate) fn lock_error(error: TxnError) -> CoreError {
+    match error {
+        TxnError::LockTimeout if with_meter(|_| ()).is_some() => CoreError::LockNotAvailable,
+        other => other.into(),
+    }
+}
+
+/// Holds `txn` to the task's `pending_write_bytes` (Phase 6 calls it for the
+/// protected commit's statement): a write that would buffer more is refused
+/// before it is staged, with `BudgetExceeded(PendingWrite)`.
+pub(crate) fn apply_to_txn(txn: &mut Transaction, limits: &LoadLimits) {
+    txn.set_write_limit(Some(usize::try_from(limits.pending_write_bytes).unwrap_or(usize::MAX)));
 }
 
 /// The bound task's load limits. A definition that is gone or replaced gets

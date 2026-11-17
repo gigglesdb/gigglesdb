@@ -40,7 +40,8 @@ pub struct RowCounts {
     pub read: u64,
 }
 
-/// Per-statement counters (counts only; limits come with R3-402).
+/// Per-read counters. The statement's limits are checked in the thread's
+/// meter (`limits::count_scanned`, `limits::count_read`, R3-402).
 #[derive(Debug, Default)]
 pub(crate) struct StatementMeter {
     scanned: Cell<u64>,
@@ -109,14 +110,18 @@ impl Scope {
 
     /// Counts one row pulled from the task table and keeps it only when the
     /// predicate accepts it. A predicate that fails to evaluate hides the row
-    /// (fail closed).
-    pub(crate) fn keep(&self, row: &SqlRow, meter: &StatementMeter) -> bool {
+    /// (fail closed). Past the statement's `rows_scanned`, or past its
+    /// rows-read allowance, the row stops the statement (R3-402); the row is
+    /// counted either way, so the read log holds the actual count.
+    pub(crate) fn keep(&self, row: &SqlRow, meter: &StatementMeter) -> Result<bool, TaskError> {
         meter.scanned();
+        super::limits::count_scanned()?;
         let keep = self.predicate.accepts_row(row).unwrap_or(false);
         if keep {
             meter.read();
+            super::limits::count_read()?;
         }
-        keep
+        Ok(keep)
     }
 }
 
@@ -203,6 +208,9 @@ fn scope_with<I: std::borrow::Borrow<Relational>>(
     if def.def_version != ctx.bound_def_version {
         return Err(TaskError::Denied(DenyRule::DefinitionChanged).into());
     }
+    if super::limits::wants_read_allowance() {
+        super::limits::set_read_allowance(read_allowance(txn, &def));
+    }
     let key = db
         .catalog()
         .snapshot_version(txn)
@@ -236,6 +244,20 @@ pub(crate) fn scope_of_def(image: &Relational, def: &TaskDef) -> Result<Scope, C
     Ok(Scope {
         predicate: Arc::new(predicate),
     })
+}
+
+/// The rows the task may still read: its `rows_read` cap less the committed
+/// head, read at the latest committed state without entering the read set.
+/// A head that cannot be read counts as unused; the debit at release still
+/// holds the cap.
+fn read_allowance(txn: &Transaction, def: &super::definition::TaskDef) -> u64 {
+    let head = txn
+        .kernel_latest_committed(&super::records::disclosure_head_key(def.id))
+        .ok()
+        .flatten()
+        .and_then(|value| super::records::DisclosureHead::decode(&value).ok());
+    let used = head.map_or(0, |head| head.rows_read);
+    def.disclosure_caps.rows_read.saturating_sub(used)
 }
 
 /// A `RowSource` that only yields the task's visible rows.
@@ -272,14 +294,23 @@ impl<'a> Scoped<'a> {
         Err(SqlError::Unsupported)
     }
 
-    fn keep(&self, row: &SourceRow<'_>) -> bool {
-        self.scope.keep(&row.row, self.meter)
+    /// Whether to yield `row`; a limit it trips is kept for `take_error`
+    /// and stops the read.
+    fn keep(&self, row: &SourceRow<'_>) -> R<bool> {
+        self.scope.keep(&row.row, self.meter).map_err(|error| {
+            *self.error.borrow_mut() = Some(error);
+            SqlError::Unsupported
+        })
     }
 
     fn filter<'s>(&'s self, rows: SourceRows<'s>) -> SourceRows<'s> {
-        Box::new(rows.filter(move |row| match row {
-            Ok(row) => self.keep(row),
-            Err(_) => true,
+        Box::new(rows.filter_map(move |row| match row {
+            Ok(row) => match self.keep(&row) {
+                Ok(true) => Some(Ok(row)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            },
+            Err(error) => Some(Err(error)),
         }))
     }
 
@@ -348,7 +379,10 @@ impl RowSource for Scoped<'_> {
 
     fn get<'s>(&'s self, table: &TableDef, key: &[u8]) -> R<Option<SourceRow<'s>>> {
         self.table(table)?;
-        Ok(self.inner.get(table, key)?.filter(|row| self.keep(row)))
+        match self.inner.get(table, key)? {
+            Some(row) if self.keep(&row)? => Ok(Some(row)),
+            _ => Ok(None),
+        }
     }
 }
 
