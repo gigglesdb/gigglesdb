@@ -323,6 +323,8 @@ pub(crate) struct LockManager {
     state: Mutex<State>,
     #[cfg(test)]
     waiter_wakeups: AtomicUsize,
+    #[cfg(test)]
+    release_all_calls: AtomicUsize,
 }
 
 impl LockManager {
@@ -332,6 +334,8 @@ impl LockManager {
             state: Mutex::new(State::default()),
             #[cfg(test)]
             waiter_wakeups: AtomicUsize::new(0),
+            #[cfg(test)]
+            release_all_calls: AtomicUsize::new(0),
         }
     }
 
@@ -494,9 +498,16 @@ impl LockManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn release_all_calls(&self) -> usize {
+        self.release_all_calls.load(Ordering::Relaxed)
+    }
+
     /// Release held locks and terminate this transaction's pending calls with
     /// `Cancelled`. Cleanup still operates if the bookkeeping mutex is poisoned.
     pub(crate) fn release_all(&self, txn: TxnId) {
+        #[cfg(test)]
+        self.release_all_calls.fetch_add(1, Ordering::Relaxed);
         // Cleanup/inspection remain useful after poisoning; acquire reports Misuse.
         let mut state = self
             .state

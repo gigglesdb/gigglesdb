@@ -12,7 +12,10 @@ use super::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Bound,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -423,6 +426,9 @@ fn snapshot_view<'a>(services: &'a TxnServices, snapshot: &'a Option<Snapshot>) 
 pub(crate) struct Transaction {
     services: TxnServices,
     id: TxnId,
+    /// Set before acquisition (even failures), or on callback commit paths
+    /// that also promise cleanup of locks acquired externally by transaction id.
+    lock_cleanup_needed: AtomicBool,
     isolation: Isolation,
     snapshot: Option<Snapshot>,
     /// The last failure to obtain a statement timestamp (cluster only).
@@ -476,6 +482,7 @@ impl Transaction {
         let mut txn = Self {
             services,
             id,
+            lock_cleanup_needed: AtomicBool::new(false),
             isolation,
             snapshot: None,
             snapshot_error: None,
@@ -819,6 +826,7 @@ impl Transaction {
         {
             return Err(TxnError::Misuse);
         }
+        self.lock_cleanup_needed.store(true, Ordering::Relaxed);
         self.services.acquire(self.id, key, mode, deadline, cancel)
     }
     /// Reads at the latest committed state until `end_latest`, recording no
@@ -874,6 +882,7 @@ impl Transaction {
         if !matches!(mode, LockMode::Shared | LockMode::Exclusive) {
             return Err(TxnError::Misuse);
         }
+        self.lock_cleanup_needed.store(true, Ordering::Relaxed);
         match &self.services {
             TxnServices::Local { locks, .. } => {
                 locks.acquire(self.id, LockKey::Row { table, pk: Vec::new() }, mode, None, cancel)?
@@ -898,6 +907,7 @@ impl Transaction {
         let TxnServices::Local { locks, .. } = &self.services else {
             return Err(TxnError::Unsupported);
         };
+        self.lock_cleanup_needed.store(true, Ordering::Relaxed);
         locks.acquire(
             self.id,
             LockKey::Row {
@@ -935,6 +945,7 @@ impl Transaction {
         match &self.services {
             TxnServices::Local { .. } => Ok(()),
             TxnServices::Cluster(cluster) => {
+                self.lock_cleanup_needed.store(true, Ordering::Relaxed);
                 cluster.lock_key_shared(self.id, ks, key, deadline, cancel)
             }
         }
@@ -963,6 +974,7 @@ impl Transaction {
             },
             _ => return Err(TxnError::Misuse),
         };
+        self.lock_cleanup_needed.store(true, Ordering::Relaxed);
         let latest = match &self.services {
             TxnServices::Local { seq, locks } => {
                 locks.acquire(self.id, lock, LockMode::Exclusive, deadline, cancel)?;
@@ -1169,7 +1181,7 @@ impl Transaction {
         if self.writes_keyspace(Keyspace::Catalog) {
             return Err(TxnError::Misuse);
         }
-        self.commit_then(|_| Ok(()))
+        self.commit_inner(None, |_| Ok(()))
     }
     /// Runs publication after sequencer success, while this transaction still
     /// owns its locks and snapshot. Catalog writes are allowed on this path.
@@ -1179,11 +1191,15 @@ impl Transaction {
         self,
         publish: F,
     ) -> Result<Ts, TxnError> {
+        // Publication callers may acquire locks externally by transaction id.
+        self.lock_cleanup_needed.store(true, Ordering::Relaxed);
         self.commit_inner(None, publish)
     }
     pub(crate) fn commit_guarded<F: FnOnce(Ts) -> Result<(), TxnError>>(
         self, guard: CommitGuard, publish: F,
     ) -> Result<Ts, TxnError> {
+        // Preserve the same external-lock cleanup contract as commit_then.
+        self.lock_cleanup_needed.store(true, Ordering::Relaxed);
         self.commit_inner(Some(guard), publish)
     }
     fn commit_inner<F: FnOnce(Ts) -> Result<(), TxnError>>(
@@ -1275,7 +1291,12 @@ impl Transaction {
 }
 impl Drop for Transaction {
     fn drop(&mut self) {
-        self.services.release_all(self.id);
+        // Cluster range/prepared holders can acquire by txn id outside this object.
+        if self.lock_cleanup_needed.load(Ordering::Relaxed)
+            || matches!(&self.services, TxnServices::Cluster(_))
+        {
+            self.services.release_all(self.id);
+        }
         self.snapshot.take();
     }
 }
@@ -1394,3 +1415,7 @@ mod f19_mapping_tests {
         assert_eq!(crate::CoreError::from(super::TxnError::LockTimeout), crate::CoreError::Busy);
     }
 }
+
+#[cfg(test)]
+#[path = "txn_drop_tests.rs"]
+mod drop_tests;
