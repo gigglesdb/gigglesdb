@@ -616,6 +616,178 @@ impl Drop for SpannerSessions {
 }
 
 #[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG, NUNYA_TEST_SPANNER_EMULATOR and NUNYA_TEST_SPANNER_DB"]
+async fn per_route_policy_files_two_catalogs() -> ServeResult<()> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn admin_request(addr: &str, method: &str, path: &str) -> ServeResult<String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await?;
+            stream
+                .write_all(
+                    format!(
+                        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await?;
+            let (head, body) = response.split_once("\r\n\r\n").ok_or("missing admin body")?;
+            let expected = if method == "POST" { "202" } else { "200" };
+            assert!(
+                head.split_whitespace().nth(1) == Some(expected),
+                "unexpected admin HTTP status"
+            );
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(body.to_owned())
+        })
+        .await?
+    }
+
+    // The catalogs deliberately use different schemas and identifier casing.
+    let url = std::env::var("NUNYA_TEST_PG")?;
+    let database = std::env::var("NUNYA_TEST_SPANNER_DB")?;
+    let endpoint = format!("http://{}", std::env::var("NUNYA_TEST_SPANNER_EMULATOR")?);
+    let pg_policy = file_sink_policy();
+    let spanner_policy = include_str!("../harness/spanner/policy_gsql.toml")
+        .replace("sink = \"stdout\"", "sink = \"file\"\npath = \"read.log\"");
+    let mut h = ServeHarness::new(
+        &pg_policy,
+        Some(&url),
+        None,
+        Some(super::common::NativeUpstream {
+            database: &database,
+            emulator_endpoint: &endpoint,
+        }),
+        "",
+    )?;
+    let pg_path = h.dir().join("pg-policy.toml");
+    let spanner_path = h.dir().join("spanner-policy.toml");
+    std::fs::write(&pg_path, pg_policy)?;
+    std::fs::write(&spanner_path, spanner_policy)?;
+    let pg_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(std::fs::read(&pg_path)?));
+    let spanner_hash =
+        data_encoding::HEXLOWER.encode(&Sha256::digest(std::fs::read(&spanner_path)?));
+    assert_ne!(pg_hash, spanner_hash);
+    let config_path = h.dir().join("nunya.toml");
+    let mut config: toml::Table = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+    config.remove("policy");
+    config["upstream"]
+        .as_table_mut()
+        .ok_or("missing PG route")?
+        .insert("policy".into(), "pg-policy.toml".into());
+    config["spanner_native"]
+        .as_table_mut()
+        .ok_or("missing native route")?
+        .insert("policy".into(), "spanner-policy.toml".into());
+    let admin_addr = config["admin_listen"]
+        .as_str()
+        .ok_or("missing admin address")?
+        .to_owned();
+    std::fs::write(config_path, toml::to_string(&config)?)?;
+    h.start().await?;
+
+    let (pg, pg_secret, principal) = h
+        .acquire_session("per-route-agent", "postgres", Mode::ReadWrite)
+        .await?;
+    h.admin()
+        .set_grants(
+            &pg.principal,
+            &[
+                ("postgres", Mode::ReadWrite),
+                ("spanner-native", Mode::ReadWrite),
+            ],
+        )
+        .await?;
+    let owner = owner(&h, "per-route-agent", &principal)?;
+    let native_secret = SessionSecret::generate();
+    let native = owner
+        .acquire(AcquireParams {
+            route: "spanner-native".into(),
+            mode: Some(Mode::ReadWrite),
+            lifetime: None,
+            isolated: false,
+            label: None,
+            verifier: native_secret.verifier.clone(),
+            secret_sha256: native_secret.sha256_hex.clone(),
+        })
+        .await?;
+    let (pg_client, _pg_driver) = session_connect(&h, &pg, &pg_secret).await?;
+    let pg_token = token(&pg_client).await?;
+    assert!(
+        !pg_token.is_empty() && pg_token != "alice@example.test",
+        "PG blind value was not tokenized"
+    );
+    let mut native_client =
+        spanner_client(&h, &format!("session:{}", native.id), &native_secret).await?;
+    let mut cleanup = SpannerSessions {
+        endpoint,
+        names: vec![],
+    };
+    let name = native_client
+        .create_session(CreateSessionRequest {
+            database,
+            ..Default::default()
+        })
+        .await?
+        .into_inner()
+        .name;
+    cleanup.names.push(name.clone());
+    let select = spanner_sql(&name, "SELECT Email FROM Customers WHERE Id = 1");
+    let rows = native_cells(&native_client.execute_sql(select.clone()).await?.into_inner())?;
+    assert!(
+        rows.len() == 1
+            && rows[0].len() == 1
+            && !rows[0][0].is_empty()
+            && rows[0][0] != "alice@example.test",
+        "native blind value was not tokenized"
+    );
+    let status = h.admin().status().await?;
+    assert_eq!(
+        status.policy_revisions,
+        std::collections::BTreeMap::from([
+            ("postgres".into(), Some(pg_hash.clone())),
+            ("spanner-native".into(), Some(spanner_hash.clone())),
+        ])
+    );
+
+    std::fs::write(spanner_path, "[invalid TOML")?;
+    admin_request(&admin_addr, "POST", "/reload").await?;
+    // Reload is queued asynchronously; wait for both route outcomes with a bound.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = admin_request(&admin_addr, "GET", "/status").await?;
+            let route_applied = |route: &str, hash: &str, outcome: &str| {
+                status.lines().any(|line| {
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    fields.contains(&format!("route={route}").as_str())
+                        && fields.contains(&format!("policy_sha256={hash}").as_str())
+                        && fields.contains(&format!("last_reload={outcome}").as_str())
+                })
+            };
+            if route_applied("postgres", &pg_hash, "applied")
+                && route_applied("spanner-native", &spanner_hash, "rejected")
+            {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| "per-route reload outcomes did not appear")??;
+    assert!(
+        token(&pg_client).await? == pg_token,
+        "PG policy changed after native reload rejection"
+    );
+    assert!(
+        native_cells(&native_client.execute_sql(select).await?.into_inner())? == rows,
+        "native last good policy was not retained"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_PG"]
 async fn spanner_scope_isolation() -> ServeResult<()> {
     let url = std::env::var("NUNYA_TEST_PG")?;
