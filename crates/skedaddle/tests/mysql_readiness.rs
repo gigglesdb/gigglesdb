@@ -15,7 +15,7 @@ use skedaddle::{
         MysqlOrder, MysqlPosition,
         capture::MysqlCapture,
         client::MysqlConfig,
-        control::{WATERMARK_DDL, emit_watermark},
+        control::{emit_watermark, install_watermark_table},
         readiness::MysqlReadinessProbe,
     },
     pg::chunk::{ChunkId, Watermark, WatermarkKind},
@@ -54,11 +54,7 @@ async fn idle_burst_and_file_rotation_readiness() -> Result<(), Box<dyn std::err
     std::fs::create_dir_all(root.join("buffer"))?;
     let mut admin = config.connect().await?;
     admin.conn.query_drop("CREATE TABLE type_zoo.readiness_probe (id BIGINT PRIMARY KEY, value BIGINT NOT NULL) ENGINE=InnoDB").await?;
-    admin
-        .conn
-        .query_drop("DROP TABLE _skedaddle.watermark")
-        .await?;
-    admin.conn.query_drop(WATERMARK_DDL).await?;
+    install_watermark_table(&mut admin.conn).await?;
     // Build-slot queues can outlast the harness's 600-second expiry policy.
     // Start this scenario from a fresh, genuinely retained binlog baseline.
     admin.conn.query_drop("FLUSH BINARY LOGS").await?;

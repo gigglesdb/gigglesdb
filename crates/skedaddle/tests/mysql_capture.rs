@@ -14,7 +14,7 @@ use skedaddle::{
     mapping::{Value, mysql::plan_column},
     mysql::{
         MysqlOrder, MysqlPosition, capture::MysqlCapture, client::MysqlConfig,
-        control::WATERMARK_DDL, schema::load_descriptors,
+        control::install_watermark_table, schema::load_descriptors,
     },
     pg::chunk::{ChunkId, Watermark, WatermarkKind},
 };
@@ -141,13 +141,7 @@ async fn live_capture_durable_mapping_control_progress_and_restart()
             "CREATE TABLE type_zoo.capture_unselected (id BIGINT PRIMARY KEY) ENGINE=InnoDB",
         )
         .await?;
-    // The harness seeds M2's historical VARCHAR placeholder. This test owns this
-    // labelled stack and recreates its control table with the actual protocol.
-    admin
-        .conn
-        .query_drop("DROP TABLE _skedaddle.watermark")
-        .await?;
-    admin.conn.query_drop(WATERMARK_DDL).await?;
+    install_watermark_table(&mut admin.conn).await?;
     admin.conn.query_drop(
         "CREATE TABLE type_zoo.capture_binary (id INT PRIMARY KEY, b16 BINARY(16), b32 BINARY(32)) ENGINE=InnoDB"
     ).await?;

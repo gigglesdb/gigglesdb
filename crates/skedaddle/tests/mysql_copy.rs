@@ -26,7 +26,7 @@ use skedaddle::{
         chunk::{MysqlChunks, map_row, sample_plan},
         chunk_key::{MysqlKeyColumn, MysqlKeyDirection, MysqlTableKey},
         client::{MysqlClient, MysqlConfig},
-        control::{WATERMARK_DDL, install_watermark_table},
+        control::install_watermark_table,
         planner::{MysqlPlanner, MysqlPlannerTable},
         schema::{TableDescriptor, load_descriptors},
     },
@@ -663,12 +663,6 @@ async fn live_mysql_engine_copy_concurrent_key_moves_and_crash_retry() -> Result
     };
     let cfg: MysqlConfig = serde_json::from_slice(&std::fs::read(path)?)?;
     let mut admin = cfg.connect().await?;
-    // Each run owns its ephemeral labelled harness stack, seeded with the historical placeholder.
-    admin
-        .conn
-        .query_drop("DROP TABLE _skedaddle.watermark")
-        .await?;
-    admin.conn.query_drop(WATERMARK_DDL).await?;
     install_watermark_table(&mut admin.conn).await?;
     admin.conn.disconnect().await?;
     for crash in [false, true] {

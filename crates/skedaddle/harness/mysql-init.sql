@@ -2,9 +2,6 @@ SET NAMES utf8mb4;
 CREATE USER 'migration'@'%' IDENTIFIED BY 'skedaddle' REQUIRE SSL;
 GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'migration'@'%';
 CREATE DATABASE _skedaddle;
-CREATE TABLE _skedaddle.watermark (
-    id BIGINT PRIMARY KEY, marker VARCHAR(128) NOT NULL
-) ENGINE=InnoDB;
 CREATE TABLE _skedaddle.replay (
     source_tx VARCHAR(128) PRIMARY KEY, applied_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6)
 ) ENGINE=InnoDB;

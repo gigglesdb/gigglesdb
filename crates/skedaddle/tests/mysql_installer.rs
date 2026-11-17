@@ -12,6 +12,7 @@ use skedaddle::{
     mysql::{
         MysqlPosition,
         client::MysqlConfig,
+        control::install_watermark_table,
         dest_schema,
         installer::{InstallerError, MysqlInstaller},
         schema::load_descriptors,
@@ -56,13 +57,12 @@ async fn live_engine_install_retry_and_mismatch() -> Result {
             .starts_with("18")
     );
     let mut source = cfg.connect().await?;
-    // The disposable harness preloads an obsolete VARCHAR watermark fixture.
-    // Remove that fixture so this test qualifies fresh installation of the
-    // current JSON/AUTO_INCREMENT control table, rather than legacy adoption.
-    source
-        .conn
-        .query_drop("DROP TABLE IF EXISTS _skedaddle.watermark")
-        .await?;
+    let count: Option<u64> = source.conn.query_first("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='_skedaddle' AND table_name='watermark'").await?;
+    assert_eq!(
+        count,
+        Some(0),
+        "fresh harness must not preload the watermark table"
+    );
     let schema = format!("f3a_{}", uuid::Uuid::new_v4().simple());
     source
         .conn
@@ -110,6 +110,7 @@ async fn live_engine_install_retry_and_mismatch() -> Result {
         assert_eq!(record.start_position()?, expected);
         let count: Option<u64> = source.conn.query_first("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='_skedaddle' AND table_name='watermark'").await?;
         assert_eq!(count, Some(1));
+        install_watermark_table(&mut source.conn).await?;
         for table in [format!("{schema}.items"), "_skedaddle.apply_progress_v3".into(), "_skedaddle.apply_receipts_v3".into()] {
             assert!(pg_client.query_one("SELECT to_regclass($1) IS NOT NULL", &[&table]).await?.get::<_, bool>(0));
         }

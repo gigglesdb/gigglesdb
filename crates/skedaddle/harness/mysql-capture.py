@@ -99,6 +99,8 @@ def heartbeat_fixture(status):
         tls.close()
 
 
+# Historical fixtures use their original control-table layout, independently of installation.
+sql("CREATE TABLE _skedaddle.watermark (id BIGINT PRIMARY KEY, marker VARCHAR(128) NOT NULL) ENGINE=InnoDB")
 # Isolate the workload from entrypoint timezone/system-table initialization.
 sql("FLUSH BINARY LOGS")
 capture_file = sql("SHOW BINARY LOGS").splitlines()[-1].split("\t")[0]
