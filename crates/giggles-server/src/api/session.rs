@@ -43,7 +43,20 @@ pub(crate) struct Registry {
     clock: Arc<dyn Clock>,
     tokens: Arc<dyn Tokens>,
     stopping: AtomicBool,
+    role_runtime: bool,
+    pending_scram: Mutex<HashMap<String, PendingScram>>,
+    idle_timeout: std::time::Duration,
+    max_age: std::time::Duration,
 }
+pub(crate) struct PendingScram {
+    pub exchange: crate::auth::scram::ServerExchange,
+    pub role: String,
+    pub database: String,
+    pub created: Instant,
+    // Informational transport context; continuation deliberately has no peer check.
+    pub _peer: std::net::SocketAddr,
+}
+const SCRAM_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 struct Revoked {
     token: String,
     owner: ConnectionIdentity,
@@ -52,6 +65,8 @@ struct Revoked {
 struct Entry {
     owner: ConnectionIdentity,
     created: Instant,
+    idle_timeout: std::time::Duration,
+    max_age: std::time::Duration,
     _slot: OwnedSemaphorePermit,
     state: Mutex<State>,
 }
@@ -89,7 +104,60 @@ impl Registry {
             clock,
             tokens,
             stopping: AtomicBool::new(false),
+            role_runtime: false,
+            pending_scram: Mutex::new(HashMap::new()),
+            idle_timeout: IDLE_TIMEOUT,
+            max_age: MAX_AGE,
         })
+    }
+
+    pub(crate) fn new_role(
+        service: Arc<Service>,
+        limits: ApiLimits,
+        idle: std::time::Duration,
+        age: std::time::Duration,
+    ) -> Arc<Self> {
+        let mut registry = Self::new(service, limits);
+        let value = Arc::get_mut(&mut registry).expect("new registry");
+        value.role_runtime = true;
+        value.idle_timeout = idle;
+        value.max_age = age;
+        registry
+    }
+
+    pub(crate) fn insert_scram(&self, pending: PendingScram) -> Result<String, ApiError> {
+        let mut map = self.pending_scram.lock().map_err(|_| ApiError::Internal)?;
+        let now = self.now();
+        map.retain(|_, entry| now < entry.created + SCRAM_TTL);
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(ApiError::Unavailable);
+        }
+        if map.len() >= 64 {
+            return Err(ApiError::ResourceExhausted);
+        }
+        for _ in 0..3 {
+            let handle = hex::encode(self.tokens.next()?);
+            if !map.contains_key(&handle) {
+                map.insert(handle.clone(), pending);
+                return Ok(handle);
+            }
+        }
+        Err(ApiError::Internal)
+    }
+
+    pub(crate) fn take_scram(&self, handle: &str) -> Result<PendingScram, ApiError> {
+        let mut map = self.pending_scram.lock().map_err(|_| ApiError::Internal)?;
+        let now = self.now();
+        map.retain(|_, entry| now < entry.created + SCRAM_TTL);
+        map.remove(handle).ok_or(ApiError::Unauthenticated)
+    }
+
+    fn missing(&self) -> ApiError {
+        if self.role_runtime {
+            ApiError::Unauthenticated
+        } else {
+            ApiError::SessionNotFound
+        }
     }
 
     pub(crate) fn now(&self) -> Instant {
@@ -139,10 +207,38 @@ impl Registry {
         if session.epoch != owner.epoch || session.role != owner.role {
             return Err(ApiError::Unauthenticated);
         }
+        self.insert(owner, session, slot)
+    }
+
+    pub(crate) fn open_role(
+        &self,
+        owner: &ConnectionIdentity,
+        session: Session,
+    ) -> Result<String, ApiError> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(ApiError::Unavailable);
+        }
+        owner.check(&self.service)?;
+        let slot = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiError::ResourceExhausted)?;
+        self.insert(owner, session, slot)
+    }
+
+    fn insert(
+        &self,
+        owner: &ConnectionIdentity,
+        session: Session,
+        slot: OwnedSemaphorePermit,
+    ) -> Result<String, ApiError> {
         let now = self.now();
         let entry = Arc::new(Entry {
             owner: owner.clone(),
             created: now,
+            idle_timeout: self.idle_timeout,
+            max_age: self.max_age,
             _slot: slot,
             state: Mutex::new(State {
                 session: Some(session),
@@ -161,7 +257,7 @@ impl Registry {
                     return Err(ApiError::Unavailable);
                 }
                 let mut revoked = self.revoked.lock().map_err(|_| ApiError::Internal)?;
-                revoked.retain(|marker| now < marker.at + IDLE_TIMEOUT);
+                revoked.retain(|marker| now < marker.at + self.idle_timeout);
                 if map.contains_key(&token) || revoked.iter().any(|marker| marker.token == token) {
                     continue;
                 }
@@ -175,6 +271,14 @@ impl Registry {
             return Ok(token);
         }
         Err(ApiError::Internal)
+    }
+
+    pub(crate) fn session_owner(
+        &self,
+        token: &str,
+        connection: &ConnectionIdentity,
+    ) -> Result<ConnectionIdentity, ApiError> {
+        Ok(self.lookup(token, connection)?.owner.clone())
     }
 
     pub(crate) fn valid_token(token: &str) -> bool {
@@ -193,17 +297,16 @@ impl Registry {
             let map = self.entries.lock().map_err(|_| ApiError::Internal)?;
             let mut revoked = self.revoked.lock().map_err(|_| ApiError::Internal)?;
             let now = self.now();
-            revoked.retain(|marker| now < marker.at + IDLE_TIMEOUT);
-            if revoked
-                .iter()
-                .any(|marker| marker.token == token && &marker.owner == owner)
-            {
+            revoked.retain(|marker| now < marker.at + self.idle_timeout);
+            if revoked.iter().any(|marker| {
+                marker.token == token && (self.role_runtime || &marker.owner == owner)
+            }) {
                 return Err(ApiError::Unauthenticated);
             }
-            map.get(token).cloned().ok_or(ApiError::SessionNotFound)?
+            map.get(token).cloned().ok_or(self.missing())?
         };
-        if &entry.owner != owner {
-            return Err(ApiError::SessionNotFound);
+        if !self.role_runtime && &entry.owner != owner {
+            return Err(self.missing());
         }
         if entry.owner.check(&self.service).is_err() {
             let state = entry.state.lock().map_err(|_| ApiError::Internal)?;
@@ -211,7 +314,7 @@ impl Registry {
             drop(state);
             self.invalidate(token, &entry, !expired);
             return Err(if expired {
-                ApiError::SessionNotFound
+                self.missing()
             } else {
                 ApiError::Unauthenticated
             });
@@ -234,7 +337,7 @@ impl Registry {
         if state.closing || expired(&entry, &state, now) {
             drop(state);
             self.invalidate(token, &entry, false);
-            return Err(ApiError::SessionNotFound);
+            return Err(self.missing());
         }
         if state.busy {
             return Err(ApiError::SessionBusy);
@@ -243,8 +346,8 @@ impl Registry {
         let deadline = state
             .transaction_start
             .map(|start| start + TRANSACTION_TIMEOUT)
-            .map_or(entry.created + MAX_AGE, |transaction| {
-                transaction.min(entry.created + MAX_AGE)
+            .map_or(entry.created + entry.max_age, |transaction| {
+                transaction.min(entry.created + entry.max_age)
             });
         cancellation.deadline(deadline);
         state.busy = true;
@@ -269,7 +372,7 @@ impl Registry {
         if found && removed {
             Ok(())
         } else {
-            Err(ApiError::SessionNotFound)
+            Err(self.missing())
         }
     }
 
@@ -291,7 +394,7 @@ impl Registry {
                 if revoked {
                     let now = self.now();
                     let mut markers = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
-                    markers.retain(|marker| now < marker.at + IDLE_TIMEOUT);
+                    markers.retain(|marker| now < marker.at + self.idle_timeout);
                     if markers.len() == self.capacity {
                         markers.pop_front();
                     }
@@ -327,7 +430,7 @@ impl Registry {
             self.revoked
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .retain(|marker| now < marker.at + IDLE_TIMEOUT);
+                .retain(|marker| now < marker.at + self.idle_timeout);
         }
         for (token, entry) in entries {
             let invalid_identity = entry.owner.check(&self.service).is_err();
@@ -357,11 +460,11 @@ impl Registry {
 }
 
 fn expired(entry: &Entry, state: &State, now: Instant) -> bool {
-    now >= entry.created + MAX_AGE
+    now >= entry.created + entry.max_age
         || state
             .transaction_start
             .is_some_and(|at| now >= at + TRANSACTION_TIMEOUT)
-        || (!state.busy && now >= state.last_completed + IDLE_TIMEOUT)
+        || (!state.busy && now >= state.last_completed + entry.idle_timeout)
 }
 
 /// Owns the unique live Session while a call is queued, running, or being sent.
@@ -401,7 +504,7 @@ impl SessionLease {
         self.entry.owner.check(&registry.service)?;
         let state = self.entry.state.lock().map_err(|_| ApiError::Internal)?;
         if state.closing || expired(&self.entry, &state, registry.now()) {
-            Err(ApiError::SessionNotFound)
+            Err(registry.missing())
         } else {
             Ok(())
         }

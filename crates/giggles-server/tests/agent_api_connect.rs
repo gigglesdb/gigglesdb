@@ -232,6 +232,7 @@ impl Fixture {
             .await
             .open_session(proto::OpenSessionRequest {
                 task: task.map(str::to_owned),
+                ..Default::default()
             })
             .await
             .map(|reply| reply.into_inner().session_id)

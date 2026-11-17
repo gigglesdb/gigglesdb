@@ -165,12 +165,46 @@ pub(super) fn empty(value: Json) -> Result<(), ApiError> {
 pub fn decode_empty(bytes: &[u8]) -> Result<(), ApiError> {
     empty(parse(bytes)?)
 }
-/// `{}` or `{"task":"<name>"}` (GD-0061 R3-208).
+/// Decode and validate a binding or SQL-role sign-in request.
 pub fn decode_open(bytes: &[u8]) -> Result<proto::OpenSessionRequest, ApiError> {
     let mut root = Object::new(parse(bytes)?)?;
     let task = root.optional("task").map(text).transpose()?;
+    let role = root.optional("role").map(text).transpose()?;
+    let database = root.optional("database").map(text).transpose()?;
+    let password = root.optional("password").map(text).transpose()?;
+    let scram = root.optional("scram");
+    if password.is_some() && scram.is_some() {
+        return Err(ApiError::InvalidArgument);
+    }
+    use proto::open_session_request::Credential as C;
+    let credential = if let Some(password) = password {
+        Some(C::Password(password))
+    } else if let Some(scram) = scram {
+        let mut scram = Object::new(scram)?;
+        let credential = if let Some(first) = scram.optional("clientFirst") {
+            C::ScramStart(proto::ScramStart {
+                client_first: text(first)?,
+            })
+        } else {
+            C::ScramContinue(proto::ScramContinue {
+                exchange: text(scram.required("exchange")?)?,
+                client_final: text(scram.required("clientFinal")?)?,
+            })
+        };
+        scram.finish()?;
+        Some(credential)
+    } else {
+        None
+    };
     root.finish()?;
-    Ok(proto::OpenSessionRequest { task })
+    let request = proto::OpenSessionRequest {
+        task,
+        role,
+        database,
+        credential,
+    };
+    super::open::classify_open(&request)?;
+    Ok(request)
 }
 
 pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {
@@ -544,7 +578,9 @@ impl Serialize for JsonReply<'_> {
         }
         if let Some(v) = &p.native_result {
             match v {
-                proto::execute_reply::NativeResult::CatalogOutcome(v) => map.serialize_entry("catalogOutcome", v)?,
+                proto::execute_reply::NativeResult::CatalogOutcome(v) => {
+                    map.serialize_entry("catalogOutcome", v)?
+                }
                 proto::execute_reply::NativeResult::OperationOutcome(v) => {
                     map.serialize_entry("operationOutcome", v)?
                 }
@@ -572,6 +608,16 @@ pub fn encode_open(reply: &proto::OpenSessionReply) -> Result<Vec<u8>, ApiError>
         idle_timeout_seconds: u32,
         max_age_seconds: u32,
         transaction_timeout_seconds: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scram: Option<Scram<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scram_server_final: Option<&'a str>,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Scram<'a> {
+        exchange: &'a str,
+        server_first: &'a str,
     }
     encode(
         &Open {
@@ -579,6 +625,11 @@ pub fn encode_open(reply: &proto::OpenSessionReply) -> Result<Vec<u8>, ApiError>
             idle_timeout_seconds: reply.idle_timeout_seconds,
             max_age_seconds: reply.max_age_seconds,
             transaction_timeout_seconds: reply.transaction_timeout_seconds,
+            scram: reply.scram_challenge.as_ref().map(|s| Scram {
+                exchange: &s.exchange,
+                server_first: &s.server_first,
+            }),
+            scram_server_final: reply.scram_server_final.as_deref(),
         },
         crate::MAX_RESPONSE,
     )
@@ -590,6 +641,109 @@ mod tests {
     use crate::api::codec;
     use giggles_core::{OperationId, relational::Value};
     use prost::Message;
+
+    #[test]
+    fn open_request_json_and_protobuf_roundtrips() {
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"task":"t"}),
+            serde_json::json!({"role":"r","database":"d"}),
+            serde_json::json!({"role":"r","database":"d","password":"p"}),
+            serde_json::json!({"role":"r","database":"d","scram":{"clientFirst":"n,,n=r,r=x"}}),
+            serde_json::json!({"scram":{"exchange":"a".repeat(64),"clientFinal":"c=biws,r=x,p=y"}}),
+        ] {
+            let request = decode_open(&serde_json::to_vec(&input).unwrap()).unwrap();
+            let decoded =
+                proto::OpenSessionRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(request, decoded);
+            let mut output = serde_json::Map::new();
+            for (key, value) in [
+                ("task", decoded.task),
+                ("role", decoded.role),
+                ("database", decoded.database),
+            ] {
+                if let Some(value) = value {
+                    output.insert(key.into(), value.into());
+                }
+            }
+            use proto::open_session_request::Credential as C;
+            match decoded.credential {
+                Some(C::Password(p)) => {
+                    output.insert("password".into(), p.into());
+                }
+                Some(C::ScramStart(s)) => {
+                    output.insert(
+                        "scram".into(),
+                        serde_json::json!({"clientFirst":s.client_first}),
+                    );
+                }
+                Some(C::ScramContinue(s)) => {
+                    output.insert(
+                        "scram".into(),
+                        serde_json::json!({"exchange":s.exchange,"clientFinal":s.client_final}),
+                    );
+                }
+                None => {}
+            }
+            assert_eq!(serde_json::Value::Object(output), input);
+        }
+    }
+
+    #[test]
+    fn open_json_rejects_unknown_duplicate_mixed_and_invalid_fields() {
+        for input in [
+            serde_json::json!({"scram":{"foo":"x"}}),
+            serde_json::json!({"role":"r","database":"d","scram":{"clientFirst":"x","foo":"x"}}),
+            serde_json::json!({"role":"r","database":"d","password":"p","scram":{"clientFirst":"x"}}),
+            serde_json::json!({"scram":{"clientFirst":"x","exchange":"a".repeat(64),"clientFinal":"x"}}),
+            serde_json::json!({"scram":{"exchange":"a".repeat(64)}}),
+            serde_json::json!({"task":"t","role":"r","database":"d"}),
+            serde_json::json!({"role":"r"}),
+            serde_json::json!({"database":"d"}),
+            serde_json::json!({"role":"r","database":"d","password":""}),
+            serde_json::json!({"role":null}),
+            serde_json::json!({"scram":{}}),
+            serde_json::json!({"scram_start":{}}),
+        ] {
+            assert_eq!(
+                decode_open(&serde_json::to_vec(&input).unwrap()),
+                Err(ApiError::InvalidArgument),
+                "{input}"
+            );
+        }
+        assert!(decode_open(br#"{"role":"r","role":"s"}"#).is_err());
+    }
+
+    #[test]
+    fn open_reply_json_and_protobuf_roundtrips() {
+        for (challenge, final_message) in [(false, false), (true, false), (false, true)] {
+            let reply = proto::OpenSessionReply {
+                session_id: if challenge { "" } else { "session" }.into(),
+                idle_timeout_seconds: 1,
+                max_age_seconds: 2,
+                transaction_timeout_seconds: 3,
+                scram_challenge: challenge.then(|| proto::ScramChallenge {
+                    exchange: "a".repeat(64),
+                    server_first: "r=x,s=y,i=4096".into(),
+                }),
+                scram_server_final: final_message.then(|| "v=proof".into()),
+            };
+            let decoded =
+                proto::OpenSessionReply::decode(reply.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded, reply);
+            let json: serde_json::Value =
+                serde_json::from_slice(&encode_open(&decoded).unwrap()).unwrap();
+            let mut expected = serde_json::json!({"sessionId":reply.session_id,"idleTimeoutSeconds":1,"maxAgeSeconds":2,"transactionTimeoutSeconds":3});
+            if challenge {
+                expected["scram"] =
+                    serde_json::json!({"exchange":"a".repeat(64),"serverFirst":"r=x,s=y,i=4096"});
+            }
+            if final_message {
+                expected["scramServerFinal"] = "v=proof".into();
+            }
+            assert_eq!(json, expected);
+        }
+    }
 
     #[test]
     fn json_rejects_duplicate_unknown_and_deep_fields() {

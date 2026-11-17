@@ -11,12 +11,26 @@ message OpenSessionRequest {
   // GD-0061 R3-208: the task of an agent session; only the agent listeners
   // accept it.
   optional string task = 1;
+  optional string role = 2;
+  optional string database = 3;
+  oneof credential {
+    string password = 4;
+    ScramStart scram_start = 5;
+    ScramContinue scram_continue = 6;
+  }
 }
+// SCRAM-SHA-256 client-first-message.
+message ScramStart { string client_first = 1; }
+message ScramContinue { string exchange = 1; string client_final = 2; }
+message ScramChallenge { string exchange = 1; string server_first = 2; }
 message OpenSessionReply {
   string session_id = 1;
   uint32 idle_timeout_seconds = 2;
   uint32 max_age_seconds = 3;
   uint32 transaction_timeout_seconds = 4;
+  // Set only on the first SCRAM step; session_id is empty.
+  ScramChallenge scram_challenge = 5;
+  optional string scram_server_final = 6;
 }
 message CloseSessionRequest {}
 message CloseSessionReply {}

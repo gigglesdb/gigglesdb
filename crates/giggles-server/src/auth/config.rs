@@ -131,16 +131,23 @@ pub struct PostgresqlConfig {
     pub connections: usize,
 }
 
-fn default_databases() -> Vec<String> {
+pub(super) fn default_databases() -> Vec<String> {
     vec!["postgres".into()]
 }
 
-fn default_connections() -> usize {
+pub(super) fn default_connections() -> usize {
     32
 }
 
-fn valid_name(name: &str) -> bool {
+pub(super) fn valid_name(name: &str) -> bool {
     (1..=63).contains(&name.len()) && !name.contains('\0')
+}
+
+pub(super) fn valid_fingerprint(fingerprint: &str) -> bool {
+    fingerprint.len() == 64
+        && fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl PostgresqlConfig {
@@ -172,11 +179,7 @@ impl PostgresqlConfig {
             ));
         }
         for (fingerprint, role) in &self.certificates {
-            if fingerprint.len() != 64
-                || !fingerprint
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
+            if !valid_fingerprint(fingerprint) {
                 return Err(io::Error::other(
                     "PostgreSQL certificate fingerprints must be 64 lowercase hexadecimal characters",
                 ));

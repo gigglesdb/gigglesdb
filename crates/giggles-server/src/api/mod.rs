@@ -9,6 +9,7 @@ mod identity;
 pub mod json;
 mod limits;
 mod native;
+mod open;
 pub(crate) mod native_codec;
 mod native_json;
 pub mod net;

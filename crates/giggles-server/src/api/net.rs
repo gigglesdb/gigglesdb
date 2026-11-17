@@ -156,6 +156,104 @@ async fn serve_bound(
     Ok(Running::new(address, stop, task))
 }
 
+/// Transport facts for role sign-in; no authority is granted at accept time.
+#[derive(Clone)]
+pub(crate) struct RoleConnection {
+    pub peer: SocketAddr,
+    pub certificate: Option<String>,
+}
+trait RoleIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> RoleIo for T {}
+
+pub async fn serve_role_bound(
+    listener: TcpListener,
+    runtime: Arc<ApiRuntime>,
+    settings: Arc<crate::auth::RoleApiListener>,
+    mut start: watch::Receiver<bool>,
+    grpc: bool,
+) -> io::Result<Running> {
+    let connections = settings.connections;
+    if !(1..=128).contains(&connections) {
+        return Err(io::Error::other("connection limit"));
+    }
+    let address = listener.local_addr()?;
+    let acceptor = settings.tls_config.as_ref().map(|config| {
+        let mut config = (**config).clone();
+        config.alpn_protocols = if grpc {
+            vec![b"h2".to_vec()]
+        } else {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        };
+        TlsAcceptor::from(Arc::new(config))
+    });
+    let (stop, mut stopped) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        while !*start.borrow_and_update() {
+            tokio::select! {
+                _ = &mut stopped => return Ok(()),
+                changed = start.changed() => if changed.is_err() { return Ok(()); },
+            }
+        }
+        let cap = Arc::new(Semaphore::new(connections));
+        let mut sockets = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut stopped => break,
+                Some(_) = sockets.join_next(), if !sockets.is_empty() => {},
+                incoming = listener.accept() => {
+                    let (socket, peer) = incoming?;
+                    let Some(shared) = runtime.service().admission.connect() else { continue; };
+                    let Ok(local) = cap.clone().try_acquire_owned() else { continue; };
+                    let runtime = runtime.clone();
+                    let acceptor = acceptor.clone();
+                    sockets.spawn(async move {
+                        let _local = local;
+                        let (stream, certificate): (Box<dyn RoleIo>, Option<String>) = if let Some(acceptor) = acceptor {
+                            let Ok(Ok(stream)) = timeout(IO_TIMEOUT, acceptor.accept(socket)).await else { return; };
+                            if grpc && stream.get_ref().1.alpn_protocol() != Some(b"h2") { return; }
+                            let certificate = stream.get_ref().1.peer_certificates().and_then(|chain| chain.first()).map(|cert| tls::fingerprint(cert.as_ref()));
+                            (Box::new(stream), certificate)
+                        } else { (Box::new(socket), None) };
+                        let identity = Ok(ConnectionIdentity::role_connection(RoleConnection { peer, certificate }));
+                        let activity = Arc::new(ConnectionActivity::new());
+                        let monitor = activity.clone();
+                        let handler = service_fn(move |request| {
+                            let headers_received = Instant::now();
+                            handle(request, runtime.clone(), identity.clone(), shared.clone(), activity.clone(), grpc, headers_received)
+                        });
+                        let mut builder = auto::Builder::new(TokioExecutor::new());
+                        builder.http1()
+                            .timer(TokioTimer::new())
+                            .header_read_timeout(IO_TIMEOUT)
+                            .max_headers(MAX_HEADERS)
+                            .max_buf_size(MAX_HEADER_BYTES);
+                        builder.http2()
+                            .timer(TokioTimer::new())
+                            .max_concurrent_streams(16)
+                            .max_header_list_size(MAX_HEADER_BYTES as u32)
+                            .max_frame_size(16 * 1024)
+                            .initial_stream_window_size(64 * 1024)
+                            .initial_connection_window_size(1024 * 1024)
+                            .adaptive_window(false)
+                            .max_send_buf_size(64 * 1024)
+                            .max_pending_accept_reset_streams(16)
+                            .max_local_error_reset_streams(16);
+                        let builder = if grpc { builder.http2_only() } else { builder };
+                        tokio::select! {
+                            _ = builder.serve_connection(TokioIo::new(stream), handler) => {},
+                            _ = monitor.watchdog() => {},
+                        }
+                    });
+                }
+            }
+        }
+        sockets.abort_all();
+        while sockets.join_next().await.is_some() {}
+        Ok(())
+    });
+    Ok(Running::new(address, stop, task))
+}
+
 async fn handle(
     request: Request<Incoming>,
     runtime: Arc<ApiRuntime>,
@@ -175,6 +273,7 @@ async fn handle(
     let mut response = match admission {
         Ok(ownership) => {
             if let Err(error) = validate_request_headers(&request).and_then(|()| {
+                // Bare role connections pass here; token lookup/leases recheck owners.
                 identity
                     .as_ref()
                     .map_err(|error| *error)?
@@ -220,6 +319,8 @@ async fn handle(
     }
     if response.status().is_success()
         && let Some((identity, service)) = release_binding
+        // Role opens carry their signed-in owner; execute replies carry a lease.
+        && identity.connection.is_none()
     {
         response.body_mut().guard_binding(identity, service);
     }

@@ -4,9 +4,9 @@ use giggles_server::{
     agent::{AgentConfig, serve_agent_pg_bound},
     api::{
         ApiLimits, ApiRuntime,
-        net::{serve_grpc_bound, serve_http_bound},
+        net::{serve_grpc_bound, serve_http_bound, serve_role_bound},
     },
-    auth::{PostgresqlConfig, serve_postgresql_bound},
+    auth::{PostgresqlConfig, RoleApiConfig, serve_postgresql_bound},
     clock::Clock,
     serve_bound, serve_pg_bound, tls,
 };
@@ -29,6 +29,8 @@ struct Config {
     postgres: SocketAddr,
     #[serde(default)]
     postgresql: Option<PostgresqlConfig>,
+    #[serde(default)]
+    role_api: Option<RoleApiConfig>,
     #[serde(default)]
     http: Option<SocketAddr>,
     #[serde(default)]
@@ -97,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PostgresqlConfig::build)
         .transpose()?
         .map(std::sync::Arc::new);
+    validate_role_api_startup(&c)?;
     #[cfg(feature = "engine-rocksdb")]
     let mut cluster_runtime = None;
     #[cfg_attr(not(feature = "engine-rocksdb"), allow(unused_mut))]
@@ -165,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listeners,
         api,
         agent_api,
+        role_api,
         addresses,
     } = start_listeners(&c, &service, &config, postgresql, agent_tls, false).await?;
     println!("{} {preview}", addresses.join(" "));
@@ -204,6 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (path, inline, agent) =
                     (c.bindings_file.clone(), c.bindings.clone(), c.agent.clone());
                 let service = service.clone();
+                let role_api = c.role_api.clone();
                 let result = tokio::task::spawn_blocking(
                     move || -> Result<(u64, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
                         let bindings = match path {
@@ -214,6 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Some(agent) => agent.load_bindings()?,
                             None => Vec::new(),
                         };
+                        check_role_api_bindings(role_api.as_ref(), &bindings, &agent)?;
                         let (epoch, _) = service.reload_all_bindings(bindings, agent)?;
                         Ok((epoch, service.stale_agent_bindings()))
                     },
@@ -242,6 +248,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stopped = stop_all(listeners, &api).await;
     if let Some(agent_api) = &agent_api {
         agent_api.shutdown().await;
+    }
+    for runtime in &role_api {
+        runtime.shutdown().await;
     }
     stopped?;
     drop(service);
@@ -425,6 +434,10 @@ async fn run_replicated(c: Config) -> Result<(), Box<dyn std::error::Error>> {
         .map(PostgresqlConfig::build)
         .transpose()?
         .map(Arc::new);
+    validate_role_api_startup(&c)?;
+    if c.role_api.is_some() {
+        return Err("role_api listeners are not supported in replicated mode".into());
+    }
     let mut config = tls::server(
         tls::certs(&c.certificate)?,
         tls::key(&c.private_key)?,
@@ -519,9 +532,11 @@ async fn run_replicated(c: Config) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(service) = &service {
                             if let Some(path) = c.bindings_file.clone() {
                                 let service = service.clone();
+                                let role_api = c.role_api.clone();
                                 let result = tokio::task::spawn_blocking(move || -> Result<_, String> {
-                                    let bindings = serde_json::from_slice(&bounded_file(&path).map_err(|e| e.to_string())?)
+                                    let bindings: Vec<Binding> = serde_json::from_slice(&bounded_file(&path).map_err(|e| e.to_string())?)
                                         .map_err(|e| e.to_string())?;
+                                    check_role_api_bindings(role_api.as_ref(), &bindings, &[]).map_err(|e| e.to_string())?;
                                     service.reload_bindings(bindings).map_err(|e| e.to_string())
                                 }).await?;
                                 match result {
@@ -673,6 +688,7 @@ struct StartedListeners {
     api: std::sync::Arc<ApiRuntime>,
     /// GD-0061 R3-208: the agent HTTP/gRPC runtime, with its own registry.
     agent_api: Option<std::sync::Arc<ApiRuntime>>,
+    role_api: Vec<std::sync::Arc<ApiRuntime>>,
     addresses: Vec<String>,
 }
 
@@ -721,10 +737,35 @@ async fn start_listeners(
         }
         _ => None,
     };
+    let mut role_sockets = Vec::new();
+    if let Some(settings) = &c.role_api {
+        let settings = std::sync::Arc::new(settings.build()?);
+        for (grpc, address) in [(false, settings.http), (true, settings.grpc)] {
+            if let Some(address) = address {
+                let socket = bind_listener(address, retry).await?;
+                let runtime =
+                    ApiRuntime::new_role(service.clone(), c.api_limits, settings.clone())?;
+                role_sockets.push((grpc, socket, settings.clone(), runtime));
+            }
+        }
+    }
+    let role_api: Vec<_> = role_sockets
+        .iter()
+        .map(|(_, _, _, runtime)| runtime.clone())
+        .collect();
     let (start, gate) = watch::channel(false);
     let mut listeners = Vec::new();
     let mut addresses = Vec::new();
     let setup: io::Result<()> = async {
+        for (grpc, socket, settings, runtime) in role_sockets {
+            let listener = serve_role_bound(socket, runtime, settings.clone(), gate.clone(), grpc).await?;
+            let protocol = if grpc { "grpc" } else { "http" };
+            if settings.tls == giggles_server::auth::TlsMode::Disabled {
+                eprintln!("role_api {protocol} listener on {} has TLS disabled; sessions and credentials cross the network in clear", listener.address);
+            }
+            addresses.push(format!("role_{protocol}={}", listener.address));
+            listeners.push(listener);
+        }
         let native = serve_bound(
             native_socket,
             service.clone(),
@@ -819,6 +860,9 @@ async fn start_listeners(
     .await;
     if let Err(error) = setup {
         drop(start);
+        for runtime in &role_api {
+            runtime.shutdown().await;
+        }
         let _ = stop_all(listeners, &api).await;
         if let Some(agent_api) = &agent_api {
             agent_api.shutdown().await;
@@ -830,6 +874,7 @@ async fn start_listeners(
         listeners,
         api,
         agent_api,
+        role_api,
         addresses,
     })
 }
@@ -889,6 +934,70 @@ fn validate_agent(c: &Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Shared by startup and both reload paths; callers check before swapping maps.
+fn check_role_api_bindings(
+    role_api: Option<&RoleApiConfig>,
+    bindings: &[Binding],
+    agent: &[giggles_server::AgentBinding],
+) -> io::Result<()> {
+    let Some(role_api) = role_api else {
+        return Ok(());
+    };
+    for fingerprint in bindings
+        .iter()
+        .map(|b| &b.fingerprint)
+        .chain(agent.iter().map(|b| &b.fingerprint))
+    {
+        if role_api.certificates.contains_key(fingerprint) {
+            return Err(io::Error::other(
+                "role_api certificate fingerprint overlaps ordinary or agent bindings",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_role_api_addresses(c: &Config) -> io::Result<()> {
+    let Some(role_api) = &c.role_api else {
+        return Ok(());
+    };
+    let agent = c.agent.as_ref();
+    let others = [
+        c.http,
+        c.grpc,
+        c.postgresql.as_ref().map(|pg| pg.listen),
+        agent.and_then(|a| a.postgres),
+        agent.and_then(|a| a.http),
+        agent.and_then(|a| a.grpc),
+    ];
+    for address in [role_api.http, role_api.grpc].into_iter().flatten() {
+        if others.contains(&Some(address)) {
+            return Err(io::Error::other(
+                "role_api address overlaps http, grpc, postgresql.listen, or agent listeners",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_role_api_startup(c: &Config) -> io::Result<()> {
+    let Some(role_api) = &c.role_api else {
+        return Ok(());
+    };
+    role_api.build()?;
+    check_role_api_addresses(c)?;
+    let bindings = match &c.bindings_file {
+        Some(path) => serde_json::from_slice(&bounded_file(path)?)?,
+        None => c.bindings.clone(),
+    };
+    let agent = match &c.agent {
+        Some(agent) => agent.load_bindings()?,
+        None => Vec::new(),
+    };
+    check_role_api_bindings(Some(role_api), &bindings, &agent)?;
+    Ok(())
+}
+
 fn bounded_file(path: &str) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
@@ -903,6 +1012,86 @@ fn bounded_file(path: &str) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn role_api_test_config() -> Config {
+        serde_json::from_value(serde_json::json!({
+            "database":"db", "native":"127.0.0.1:1", "postgres":"127.0.0.1:2",
+            "certificate":"unused", "private_key":"unused", "client_ca":"unused",
+            "bindings":[], "connections":32, "skew_seconds":0, "max_pause_seconds":3600,
+            "role_api":{"http":"127.0.0.1:8080", "tls":"disabled"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn role_api_addresses_and_startup_refusal() {
+        let mut c = role_api_test_config();
+        assert!(validate_role_api_startup(&c).is_ok());
+        let address = c.role_api.as_ref().unwrap().http;
+        c.http = address;
+        assert!(check_role_api_addresses(&c).is_err());
+        c.http = None;
+        c.grpc = address;
+        assert!(check_role_api_addresses(&c).is_err());
+        c.grpc = None;
+        c.postgresql = Some(
+            serde_json::from_value(serde_json::json!({"listen":address, "tls":"disabled"}))
+                .unwrap(),
+        );
+        assert!(check_role_api_addresses(&c).is_err());
+        c.postgresql = None;
+        for field in ["postgres", "http", "grpc"] {
+            c.agent = Some(serde_json::from_value(serde_json::json!({field:address})).unwrap());
+            assert!(check_role_api_addresses(&c).is_err());
+        }
+        c.agent = None;
+        c.role_api.as_mut().unwrap().grpc = address;
+        c.role_api.as_mut().unwrap().http = None;
+        c.http = address;
+        assert!(check_role_api_addresses(&c).is_err());
+        c.role_api = None;
+        assert!(validate_role_api_startup(&c).is_ok());
+        let json = serde_json::json!({
+            "database":"db", "native":"127.0.0.1:1", "postgres":"127.0.0.1:2",
+            "certificate":"unused", "private_key":"unused", "client_ca":"unused",
+            "bindings":[], "connections":32, "skew_seconds":0, "max_pause_seconds":3600
+        });
+        assert!(
+            serde_json::from_value::<Config>(json)
+                .unwrap()
+                .role_api
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn role_api_binding_check_used_before_startup_and_reload_swap() {
+        let mut c = role_api_test_config();
+        let role_api = c.role_api.as_mut().unwrap();
+        role_api.certificates.insert("a".repeat(64), "owner".into());
+        let ordinary = Binding {
+            fingerprint: "a".repeat(64),
+            role: giggles_server::Role::Database { name: "db".into() },
+        };
+        let agent = giggles_server::AgentBinding {
+            fingerprint: "a".repeat(64),
+            executor: "worker".into(),
+            tasks: vec![],
+        };
+        assert!(check_role_api_bindings(Some(role_api), &[], &[]).is_ok());
+        assert!(
+            check_role_api_bindings(Some(role_api), std::slice::from_ref(&ordinary), &[]).is_err()
+        );
+        assert!(
+            check_role_api_bindings(Some(role_api), &[], std::slice::from_ref(&agent)).is_err()
+        );
+        let disjoint = Binding {
+            fingerprint: "b".repeat(64),
+            ..ordinary
+        };
+        assert!(check_role_api_bindings(Some(role_api), &[disjoint], &[]).is_ok());
+        assert!(check_role_api_bindings(None, &[], &[agent]).is_ok());
+    }
 
     #[test]
     fn catalog_listener_is_optional_and_explicit() {

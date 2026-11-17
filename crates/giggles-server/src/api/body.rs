@@ -72,7 +72,6 @@ pub(crate) struct ResponseBody {
     inner: tonic::body::Body,
     pending: Bytes,
     delivery: Option<Arc<Mutex<DeliveryOwnership>>>,
-    release_checked: bool,
     done: bool,
 }
 
@@ -113,7 +112,6 @@ impl ResponseBody {
                 binding: None,
                 _ticket: ticket,
             }))),
-            release_checked: false,
             done: false,
         }
     }
@@ -133,9 +131,9 @@ impl ResponseBody {
     }
 
     fn chunk(&mut self) -> Result<Frame<Bytes>, tonic::Status> {
-        // Check only when the first nonempty DATA frame is actually ready.
-        // An inner Pending must not consume the final release check.
-        if !self.release_checked {
+        // Revalidate the retained session owner on every delivered chunk, so
+        // role revocation also stops an already streaming response.
+        {
             let checked = self
                 .delivery
                 .as_ref()
@@ -156,7 +154,6 @@ impl ResponseBody {
                 self.finish();
                 return Err(error.grpc_status());
             }
-            self.release_checked = true;
         }
         let bytes = self.pending.split_to(self.pending.len().min(16 * 1024));
         Ok(Frame::data(Bytes::from_owner(DeliveryChunk {
@@ -348,6 +345,54 @@ mod tests {
         drop(data);
         assert!(call.upgrade().is_none());
         assert!(fixture.runtime.service().admission.connect().is_some());
+        fixture.runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn role_revocation_stops_stream_after_first_chunk() {
+        let fixture = ReleaseFixture::new();
+        let service = fixture.runtime.service();
+        service
+            .admin
+            .roles()
+            .create(giggles_core::roles::NewRole {
+                name: "stream_role".into(),
+                login: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let config: crate::auth::RoleApiConfig = serde_json::from_value(serde_json::json!({
+            "http":"127.0.0.1:0", "tls":"disabled"
+        }))
+        .unwrap();
+        let listener = Arc::new(config.build().unwrap());
+        let mut session = crate::auth::signin::open_role_session(service, "stream_role").unwrap();
+        session.database = Some("postgres".into());
+        let owner = ConnectionIdentity::role_signed_in(&session, listener);
+        let (mut body, _) = fixture.body(tonic::body::Body::new(Full::new(Bytes::from(vec![
+            1;
+            50000
+        ]))));
+        body.guard_binding(owner, service.clone());
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first.len(), 16 * 1024);
+        service
+            .admin
+            .roles()
+            .alter(
+                "stream_role",
+                giggles_core::roles::RoleChanges {
+                    login: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            body.frame().await.unwrap().unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        assert!(body.frame().await.is_none());
+        drop(first);
         fixture.runtime.shutdown().await;
     }
 

@@ -855,3 +855,19 @@ async fn reload_waits_for_exact_commit_scope_then_withholds_unreleased_result() 
         f.runtime.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn existing_listeners_reject_role_signin_before_identity_or_registry() {
+    let fixture = Fixture::new();
+    let agent =
+        ApiRuntime::new_agent(fixture.runtime.service.clone(), ApiLimits::default()).unwrap();
+    let request = json::decode_open(br#"{"role":"r","database":"d","password":"p"}"#).unwrap();
+    for runtime in [&fixture.runtime, &agent] {
+        let error = runtime.open_request(&fixture.owner, &request).unwrap_err();
+        assert_eq!(error, ApiError::InvalidArgument);
+        assert_eq!(error.http_status(), 400);
+        assert_eq!(error.grpc_status().code(), tonic::Code::InvalidArgument);
+    }
+    agent.shutdown().await;
+    fixture.runtime.shutdown().await;
+}

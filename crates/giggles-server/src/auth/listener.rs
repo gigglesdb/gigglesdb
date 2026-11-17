@@ -1,5 +1,8 @@
 //! Role-authenticated PostgreSQL listener, isolated from agent certificate bindings.
-use super::scram::{MECHANISM, ServerExchange, Verifier};
+use super::{
+    scram::{MECHANISM, ServerExchange, Verifier},
+    signin::{self, Method, SigninPolicy},
+};
 use crate::{
     Service,
     pgwire_startup::{StartupPolicy, parse_startup, read_startup_packet, reject_startup},
@@ -161,25 +164,20 @@ async fn connection(
             return reject_startup(&mut stream, code, reason).await;
         }
     };
-    let certificate_auth = certificate
-        .as_ref()
-        .and_then(|fp| listener.certificates.get(fp))
-        .is_some_and(|name| name == &startup.user);
-    if !certificate_auth && !(listener.loopback_trust && peer.ip().is_loopback()) {
-        let verifier = service
-            .admin
-            .roles()
-            .get(&startup.user)
-            .ok()
-            .flatten()
-            .filter(|role| role.login && !role.task_only)
-            .and_then(|role| role.password)
-            .and_then(|password| Verifier::parse(&password));
-        if !authenticate(&mut stream, &startup.user, verifier).await? {
-            return Ok(());
-        }
+    if let Method::Password(verifier) = signin::choose(
+        SigninPolicy {
+            certificates: &listener.certificates,
+            loopback_trust: listener.loopback_trust,
+        },
+        peer,
+        certificate.as_deref(),
+        &startup.user,
+        &service,
+    ) && !authenticate(&mut stream, &startup.user, verifier).await?
+    {
+        return Ok(());
     }
-    let mut session = match service.role_session(&startup.user) {
+    let mut session = match signin::open_role_session(&service, &startup.user) {
         Ok(session) => session,
         Err(_) => return fatal(&mut stream, "28P01", "password authentication failed").await,
     };

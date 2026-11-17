@@ -79,9 +79,11 @@ pub enum ListenerKind {
     /// GD-0061 R3-208: agent HTTP and gRPC; certificates from the agent map
     /// only, and every session is a task session.
     Agent,
+    Role,
 }
 
 pub struct ApiRuntime {
+    role_listener: Option<Arc<crate::auth::RoleApiListener>>,
     kind: ListenerKind,
     service: Arc<Service>,
     registry: Arc<Registry>,
@@ -95,23 +97,41 @@ pub struct ApiRuntime {
 
 impl ApiRuntime {
     pub fn new(service: Arc<Service>, limits: ApiLimits) -> Result<Arc<Self>, ApiError> {
-        Self::with_kind(service, limits, ListenerKind::Ordinary)
+        Self::with_kind(service, limits, ListenerKind::Ordinary, None)
     }
 
     /// The runtime for the agent HTTP and gRPC listeners, built with
     /// `agent.api_limits`.
     pub fn new_agent(service: Arc<Service>, limits: ApiLimits) -> Result<Arc<Self>, ApiError> {
-        Self::with_kind(service, limits, ListenerKind::Agent)
+        Self::with_kind(service, limits, ListenerKind::Agent, None)
+    }
+
+    pub fn new_role(
+        service: Arc<Service>,
+        limits: ApiLimits,
+        listener: Arc<crate::auth::RoleApiListener>,
+    ) -> Result<Arc<Self>, ApiError> {
+        Self::with_kind(service, limits, ListenerKind::Role, Some(listener))
     }
 
     fn with_kind(
         service: Arc<Service>,
         limits: ApiLimits,
         kind: ListenerKind,
+        role_listener: Option<Arc<crate::auth::RoleApiListener>>,
     ) -> Result<Arc<Self>, ApiError> {
         tokio::runtime::Handle::try_current().map_err(|_| ApiError::Unavailable)?;
         let limits = limits.validate()?;
-        let registry = Registry::new(service.clone(), limits);
+        let registry = if let Some(listener) = &role_listener {
+            Registry::new_role(
+                service.clone(),
+                limits,
+                Duration::from_secs(listener.idle_timeout_seconds.into()),
+                Duration::from_secs(listener.max_age_seconds.into()),
+            )
+        } else {
+            Registry::new(service.clone(), limits)
+        };
         let (jobs, receiver) = mpsc::channel(MAX_CALLS);
         let (stop, stopped) = watch::channel(false);
         let supervisor = tokio::spawn(supervise(
@@ -122,6 +142,7 @@ impl ApiRuntime {
         ));
         Ok(Arc::new(Self {
             kind,
+            role_listener,
             service,
             registry,
             jobs,
@@ -141,6 +162,7 @@ impl ApiRuntime {
     pub(crate) fn authenticate(&self, fingerprint: &str) -> Result<ConnectionIdentity, ApiError> {
         match self.kind {
             ListenerKind::Ordinary => ConnectionIdentity::verified(&self.service, fingerprint),
+            ListenerKind::Role => Err(ApiError::Unauthenticated),
             ListenerKind::Agent => ConnectionIdentity::verified_agent(&self.service, fingerprint),
         }
     }
@@ -176,6 +198,134 @@ impl ApiRuntime {
         self.open_task(identity, None)
     }
 
+    /// Validate the complete open request before touching the session registry.
+    pub(crate) fn open_request(
+        &self,
+        identity: &ConnectionIdentity,
+        request: &proto::OpenSessionRequest,
+    ) -> Result<proto::OpenSessionReply, ApiError> {
+        let open = super::open::classify_open(request)?;
+        if let Some(listener) = &self.role_listener {
+            use super::open::{Credential, OpenKind};
+            use crate::auth::scram::{DEFAULT_ITERATIONS, MECHANISM, ServerExchange, Verifier};
+            use crate::auth::signin::{self, Method, SigninPolicy};
+            let connection = identity
+                .connection
+                .as_ref()
+                .ok_or(ApiError::Unauthenticated)?;
+            let mut server_final = None;
+            let (role, database) = match open {
+                OpenKind::Binding { .. } => return Err(ApiError::InvalidArgument),
+                OpenKind::ScramContinue {
+                    exchange,
+                    client_final,
+                } => {
+                    // Consume before proof validation: failures are single-use too.
+                    let mut pending = self.registry.take_scram(&exchange)?;
+                    let final_bytes = pending
+                        .exchange
+                        .client_final(client_final.as_bytes())
+                        .map_err(|_| ApiError::Unauthenticated)?;
+                    server_final =
+                        Some(String::from_utf8(final_bytes).map_err(|_| ApiError::Internal)?);
+                    (pending.role, pending.database)
+                }
+                OpenKind::RoleSignin {
+                    role,
+                    database,
+                    credential,
+                } => {
+                    // Reject plaintext before lookup or any password derivation, including trust.
+                    if matches!(credential, Credential::Password(_))
+                        && listener.tls_config.is_none()
+                    {
+                        return Err(ApiError::Unauthenticated);
+                    }
+                    let method = signin::choose(
+                        SigninPolicy {
+                            certificates: &listener.certificates,
+                            loopback_trust: listener.loopback_trust,
+                        },
+                        connection.peer,
+                        connection.certificate.as_deref(),
+                        &role,
+                        &self.service,
+                    );
+                    match (credential, method) {
+                        (Credential::ScramStart { client_first }, Method::Password(verifier)) => {
+                            let mut exchange = ServerExchange::new(&role, verifier);
+                            let first = exchange
+                                .client_first(MECHANISM, client_first.as_bytes())
+                                .map_err(|_| ApiError::Unauthenticated)?;
+                            let handle =
+                                self.registry.insert_scram(super::session::PendingScram {
+                                    exchange,
+                                    role,
+                                    database,
+                                    created: self.registry.now(),
+                                    _peer: connection.peer,
+                                })?;
+                            return Ok(proto::OpenSessionReply {
+                                scram_challenge: Some(proto::ScramChallenge {
+                                    exchange: handle,
+                                    server_first: String::from_utf8(first)
+                                        .map_err(|_| ApiError::Internal)?,
+                                }),
+                                ..Default::default()
+                            });
+                        }
+                        (Credential::ScramStart { .. }, _) => {
+                            return Err(ApiError::InvalidArgument);
+                        }
+                        (Credential::Password(password), Method::Password(verifier)) => {
+                            // No registry lock is held during the CPU derivation. A missing
+                            // verifier performs the same default work as a generated verifier.
+                            let valid = if let Some(verifier) = verifier {
+                                verifier.verify_password(&password)
+                            } else {
+                                let dummy = Verifier::derive(
+                                    &password,
+                                    b"api-dummy-salt!!",
+                                    DEFAULT_ITERATIONS,
+                                );
+                                std::hint::black_box(dummy);
+                                false
+                            };
+                            if !valid {
+                                return Err(ApiError::Unauthenticated);
+                            }
+                        }
+                        (Credential::None, Method::Password(_)) => {
+                            return Err(ApiError::Unauthenticated);
+                        }
+                        (_, Method::Certificate | Method::LoopbackTrust) => {}
+                    }
+                    (role, database)
+                }
+            };
+            if !listener.databases.contains(&database) {
+                return Err(ApiError::Unauthenticated);
+            }
+            let mut session = signin::open_role_session(&self.service, &role)
+                .map_err(|_| ApiError::Unauthenticated)?;
+            session.database = Some(database);
+            let owner = ConnectionIdentity::role_signed_in(&session, listener.clone());
+            let session_id = self.registry.open_role(&owner, session)?;
+            return Ok(proto::OpenSessionReply {
+                session_id,
+                scram_server_final: server_final,
+                idle_timeout_seconds: listener.idle_timeout_seconds,
+                max_age_seconds: listener.max_age_seconds,
+                transaction_timeout_seconds: TRANSACTION_TIMEOUT.as_secs() as u32,
+                ..Default::default()
+            });
+        }
+        match open {
+            super::open::OpenKind::Binding { task } => self.open_task(identity, task.as_deref()),
+            _ => Err(ApiError::InvalidArgument),
+        }
+    }
+
     /// Opens a session. On the agent runtime it is a task session for `task`
     /// (`Service::agent_session`); a refusal is `Unauthenticated`. A `task` on
     /// the ordinary runtime is `InvalidArgument`.
@@ -196,7 +346,22 @@ impl ApiRuntime {
             idle_timeout_seconds: IDLE_TIMEOUT.as_secs() as u32,
             max_age_seconds: MAX_AGE.as_secs() as u32,
             transaction_timeout_seconds: TRANSACTION_TIMEOUT.as_secs() as u32,
+            ..Default::default()
         })
+    }
+
+    pub(crate) fn open_delivery_owner(
+        &self,
+        identity: &ConnectionIdentity,
+        reply: &proto::OpenSessionReply,
+    ) -> Result<Option<ConnectionIdentity>, ApiError> {
+        if self.kind == ListenerKind::Role && !reply.session_id.is_empty() {
+            self.registry
+                .session_owner(&reply.session_id, identity)
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     pub(crate) fn close(&self, identity: &ConnectionIdentity, token: &str) -> Result<(), ApiError> {
@@ -218,6 +383,7 @@ impl ApiRuntime {
         if self.stopping.load(Ordering::Acquire) {
             return Err(ApiError::Unavailable);
         }
+        // Bare role connections pass here; registry.lease checks the stored owner.
         identity.check(&self.service)?;
         let decoded = codec::decode_execute(request)?;
         let deadline = received
@@ -348,8 +514,9 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
                         // Immutable response construction remains within the lease. The
                         // API materialises whole results, so v2 output keeps the result
                         // budget (54000) instead of spilling (R2-PGLIMITS-5 B2).
-                        Ok(giggles_core::relational::spill::bounded(
-                            || execute_reply(session, request, received, encoding)))
+                        Ok(giggles_core::relational::spill::bounded(|| {
+                            execute_reply(session, request, received, encoding)
+                        }))
                     })
                 })
             }));
@@ -435,31 +602,49 @@ fn execute_reply(
             Executed::Native(outcome)
         }
     };
-    if matches!(&executed, Executed::Native(Ok(native::NativeResult::Control)))
-        && let Some((kind, mut name)) = path_control {
+    if matches!(
+        &executed,
+        Executed::Native(Ok(native::NativeResult::Control))
+    ) && let Some((kind, mut name)) = path_control
+    {
         let mut end = name.len().min(63);
-        while !name.is_char_boundary(end) { end -= 1; }
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
         name.truncate(end);
         if kind == 0 {
             session.api_path.savepoints.push((name, prior_path.clone()));
-        } else if let Some(i) = session.api_path.savepoints.iter().rposition(|(n, _)| n == &name) {
+        } else if let Some(i) = session
+            .api_path
+            .savepoints
+            .iter()
+            .rposition(|(n, _)| n == &name)
+        {
             if kind == 1 {
                 let path = session.api_path.savepoints[i].1.clone();
                 session.set_search_path(if path == "\"\"" { "" } else { &path });
             }
-            session.api_path.savepoints.truncate(i + usize::from(kind == 1));
+            session
+                .api_path
+                .savepoints
+                .truncate(i + usize::from(kind == 1));
         }
     }
     if !was_transaction && session.sql.in_transaction() {
         session.api_path.transaction_start = Some(prior_path);
     } else if was_transaction && !session.sql.in_transaction() {
         session.api_path.savepoints.clear();
-        let committed = !was_aborted && match &executed {
-            Executed::Native(Ok(native::NativeResult::Control)) => native_commit,
-            Executed::Legacy(response) => response.code == "ok" && session.api_path.sql_committed,
-            _ => false,
-        };
-        if let Some(path) = session.api_path.transaction_start.take() && !committed {
+        let committed = !was_aborted
+            && match &executed {
+                Executed::Native(Ok(native::NativeResult::Control)) => native_commit,
+                Executed::Legacy(response) => {
+                    response.code == "ok" && session.api_path.sql_committed
+                }
+                _ => false,
+            };
+        if let Some(path) = session.api_path.transaction_start.take()
+            && !committed
+        {
             session.set_search_path(if path == "\"\"" { "" } else { &path });
         }
     }
@@ -481,18 +666,35 @@ fn execute_reply(
             use proto::execute_reply::NativeResult as P;
             reply.native_result = match outcome {
                 native::NativeResult::Control => None,
-                native::NativeResult::Catalog(outcome, table) => Some(P::CatalogOutcome(native_codec::encode_catalog_outcome(outcome, table))),
-                native::NativeResult::SequenceCatalog(catalog_epoch, table) => Some(P::CatalogOutcome(proto::NativeCatalogOutcome {
-                    catalog_epoch, table, columns: vec![], primary_key: vec![], index_id: None,
-                })),
+                native::NativeResult::Catalog(outcome, table) => Some(P::CatalogOutcome(
+                    native_codec::encode_catalog_outcome(outcome, table),
+                )),
+                native::NativeResult::SequenceCatalog(catalog_epoch, table) => {
+                    Some(P::CatalogOutcome(proto::NativeCatalogOutcome {
+                        catalog_epoch,
+                        table,
+                        columns: vec![],
+                        primary_key: vec![],
+                        index_id: None,
+                    }))
+                }
                 native::NativeResult::Sql(sql) => {
-                    reply.sql = codec::encode_reply(Response { sql: Some(sql), ..Response::code("ok") }, state)?.sql;
+                    reply.sql = codec::encode_reply(
+                        Response {
+                            sql: Some(sql),
+                            ..Response::code("ok")
+                        },
+                        state,
+                    )?
+                    .sql;
                     None
                 }
                 native::NativeResult::Operation(outcome) => {
                     Some(P::OperationOutcome(native_codec::encode_outcome(outcome)?))
                 }
-                native::NativeResult::Page(page) => Some(P::OperationOutcome(native_codec::encode_page(page)?)),
+                native::NativeResult::Page(page) => {
+                    Some(P::OperationOutcome(native_codec::encode_page(page)?))
+                }
                 native::NativeResult::Transaction(outcome) => Some(P::TransactionOutcome(
                     native_codec::encode_transaction_outcome(outcome)?,
                 )),

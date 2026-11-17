@@ -82,11 +82,19 @@ pub(crate) async fn handle(
         Err(error) => return error_response(error, Some(ownership), ticket),
     };
     let received = Instant::now();
+    let mut delivery_owner = None;
     let result = match route {
         Route::Open => json::decode_open(&bytes)
-            .and_then(|open| runtime.open_task(&identity, open.task.as_deref()))
-            .and_then(|reply| json::encode_open(&reply))
-            .map(|bytes| (StatusCode::CREATED, bytes, None)),
+            .and_then(|open| runtime.open_request(&identity, &open))
+            .and_then(|reply| {
+                delivery_owner = runtime.open_delivery_owner(&identity, &reply)?;
+                let status = if reply.scram_challenge.is_some() {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CREATED
+                };
+                json::encode_open(&reply).map(|bytes| (status, bytes, None))
+            }),
         Route::Close => {
             if bytes.is_empty() {
                 runtime
@@ -129,7 +137,15 @@ pub(crate) async fn handle(
         },
     };
     match result {
-        Ok((status, bytes, lease)) => response(status, bytes, Some(ownership), lease, ticket),
+        Ok((status, bytes, lease)) => {
+            let mut response = response(status, bytes, Some(ownership), lease, ticket);
+            if let Some(owner) = delivery_owner {
+                response
+                    .body_mut()
+                    .guard_binding(owner, runtime.service().clone());
+            }
+            response
+        }
         Err(error) => error_response(error, Some(ownership), ticket),
     }
 }

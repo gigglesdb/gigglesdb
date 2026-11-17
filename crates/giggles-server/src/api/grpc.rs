@@ -30,6 +30,7 @@ struct Context {
     deadline: Option<Instant>,
     ownership: Arc<CallOwnership>,
     lease: Arc<Mutex<Option<ResponseLease>>>,
+    delivery_owner: Arc<Mutex<Option<ConnectionIdentity>>>,
 }
 
 struct Rpc {
@@ -47,11 +48,15 @@ impl Giggles for Rpc {
             .get::<Context>()
             .ok_or_else(|| ApiError::Internal.grpc_status())?;
         check_deadline(context)?;
-        let task = request.get_ref().task.as_deref();
-        self.runtime
-            .open_task(&context.identity, task)
-            .map(RpcResponse::new)
-            .map_err(ApiError::grpc_status)
+        let reply = self
+            .runtime
+            .open_request(&context.identity, request.get_ref())
+            .map_err(ApiError::grpc_status)?;
+        *context.delivery_owner.lock().expect("delivery owner lock") = self
+            .runtime
+            .open_delivery_owner(&context.identity, &reply)
+            .map_err(ApiError::grpc_status)?;
+        Ok(RpcResponse::new(reply))
     }
 
     async fn execute(
@@ -197,6 +202,8 @@ pub(crate) async fn handle(
         }) + IO_TIMEOUT,
     );
     let lease = Arc::new(Mutex::new(None));
+    let delivery_owner = Arc::new(Mutex::new(None));
+    let delivery_service = runtime.service().clone();
     let context = Context {
         identity,
         token,
@@ -204,6 +211,7 @@ pub(crate) async fn handle(
         deadline,
         ownership: ownership.clone(),
         lease: lease.clone(),
+        delivery_owner: delivery_owner.clone(),
     };
     let mut request = Request::from_parts(parts, Full::new(bytes));
     request.extensions_mut().insert(context);
@@ -220,10 +228,11 @@ pub(crate) async fn handle(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("no-store"),
     );
-    Response::from_parts(
-        parts,
-        ResponseBody::new(body, Some(ownership), lease, ticket),
-    )
+    let mut body = ResponseBody::new(body, Some(ownership), lease, ticket);
+    if let Some(owner) = delivery_owner.lock().expect("delivery owner lock").take() {
+        body.guard_binding(owner, delivery_service);
+    }
+    Response::from_parts(parts, body)
 }
 
 fn validate_unary(bytes: &[u8]) -> Result<&[u8], ApiError> {

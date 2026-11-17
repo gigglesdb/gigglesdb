@@ -70,6 +70,12 @@ impl Verifier {
             server_key: hmac(&salted, b"Server Key"),
         }
     }
+    /// Verifies a raw UTF-8 password using this verifier's salt and work factor.
+    pub fn verify_password(&self, password: &str) -> bool {
+        let salted = pbkdf2(password.as_bytes(), &self.salt, self.iterations);
+        let stored: [u8; 32] = Sha256::digest(hmac(&salted, b"Client Key")).into();
+        ct_eq(&stored, &self.stored_key)
+    }
     /// Generates an encoded verifier with a random 16-byte salt and default iterations.
     /// Panics if operating system randomness is unavailable.
     pub fn generate(password: &str) -> String {
@@ -349,6 +355,8 @@ mod tests {
     #[test]
     fn verifier_roundtrip_and_redaction() {
         let v = verifier();
+        assert!(v.verify_password("pencil"));
+        assert!(!v.verify_password("wrong"));
         assert_eq!(Verifier::parse(&v.encode()), Some(v.clone()));
         assert!(is_verifier(&v.encode()));
         assert_eq!(format!("{v:?}"), "Verifier { iterations: 4096, .. }");
