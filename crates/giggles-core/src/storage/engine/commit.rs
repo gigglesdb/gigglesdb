@@ -307,6 +307,8 @@ struct Shared {
     max_mixed_group: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     sync_writes: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    highwater_puts: std::sync::atomic::AtomicUsize,
     snap: Mutex<SnapState>,
 }
 pub(crate) struct SnapshotHandle {
@@ -342,6 +344,11 @@ enum Message {
         features_or: u64,
         reply: mpsc::Sender<Result<(), TxnError>>,
     },
+    Highwater {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        reply: mpsc::Sender<Result<(), TxnError>>,
+    },
     Shutdown,
 }
 impl From<Pending> for Message {
@@ -351,14 +358,14 @@ impl Message {
     fn bytes(&self) -> usize {
         match self {
             Self::Commit(p) => request_bytes(&p.request),
-            Self::Counter { key, value, .. } => key.len() + value.len(),
+            Self::Counter { key, value, .. } | Self::Highwater { key, value, .. } => key.len() + value.len(),
             Self::Shutdown => unreachable!("shutdown is never grouped"),
         }
     }
     fn reject(self, error: TxnError) {
         match self {
             Self::Commit(p) => { let _ = p.reply.send(Err(error)); }
-            Self::Counter { reply, .. } => { let _ = reply.send(Err(error)); }
+            Self::Counter { reply, .. } | Self::Highwater { reply, .. } => { let _ = reply.send(Err(error)); }
             Self::Shutdown => unreachable!("shutdown is never grouped"),
         }
     }
@@ -377,6 +384,11 @@ impl Sequencer {
     #[cfg(test)]
     pub(crate) fn max_group_size(&self) -> usize {
         self.shared.max_group.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn highwater_puts(&self) -> usize {
+        self.shared.highwater_puts.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn open(
@@ -405,6 +417,8 @@ impl Sequencer {
             max_mixed_group: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             sync_writes: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            highwater_puts: std::sync::atomic::AtomicUsize::new(0),
             snap: Mutex::new(SnapState {
                 visible: seed,
                 active: BTreeMap::new(),
@@ -500,6 +514,20 @@ impl Sequencer {
         self.sender.send(Message::Commit(Pending { request, guard: Some(guard), reply }))
             .map_err(|_| TxnError::Fenced)?;
         receive.recv().unwrap_or(Err(TxnError::Fenced))
+    }
+    /// Queue an unversioned row-version highwater, acknowledged only after Sync.
+    pub(crate) fn write_highwater_async(
+        &self, key: Vec<u8>, value: Vec<u8>,
+    ) -> Result<mpsc::Receiver<Result<(), TxnError>>, TxnError> {
+        if key.len() != 9 || key[0] != 3 || value.len() != 8
+            || u64::from_be_bytes(value.as_slice().try_into().unwrap()) == 0 {
+            return Err(TxnError::Misuse);
+        }
+        if self.kv.is_fenced() { return Err(TxnError::Fenced); }
+        let (reply, receive) = mpsc::channel();
+        self.sender.send(Message::Highwater { key, value, reply })
+            .map_err(|_| TxnError::Fenced)?;
+        Ok(receive)
     }
     /// A counter reservation is durable independently of any SQL transaction.
     pub(crate) fn write_counter(
@@ -621,7 +649,7 @@ fn gather(
             guarded @ Message::Commit(Pending { guard: Some(_), .. }) => {
                 return (group, Some(guarded), false);
             }
-            item @ (Message::Commit(_) | Message::Counter { .. }) => {
+            item @ (Message::Commit(_) | Message::Counter { .. } | Message::Highwater { .. }) => {
                 if let (Some(cap), Some(total)) = (config.group_max_bytes, bytes.as_mut()) {
                     let size = item.bytes();
                     if *total > cap || size > cap - *total {
@@ -688,7 +716,7 @@ fn run(
             Message::Commit(p) => {
                 let _ = p.reply.send(Err(TxnError::Fenced));
             }
-            Message::Counter { reply, .. } => {
+            Message::Counter { reply, .. } | Message::Highwater { reply, .. } => {
                 let _ = reply.send(Err(TxnError::Fenced));
             }
             Message::Shutdown => {}
@@ -740,6 +768,29 @@ fn load_native(kv: &Kv) -> Result<super::native_content::NativeContent, TxnError
     })
 }
 
+fn validate_highwater(
+    kv: &Kv, key: &[u8], value: &[u8], staged: &BTreeMap<Vec<u8>, u64>,
+) -> Result<u64, TxnError> {
+    if key.len() != 9 || key[0] != 3 || value.len() != 8 {
+        return Err(TxnError::Misuse);
+    }
+    let end = u64::from_be_bytes(value.try_into().unwrap());
+    let current = match staged.get(key) {
+        Some(current) => *current,
+        None => match kv.get(Keyspace::Seq, key)? {
+            None => 1,
+            Some(bytes) => {
+                let bytes = bytes.try_into().map_err(|_| TxnError::Misuse)?;
+                let current = u64::from_be_bytes(bytes);
+                if current == 0 { return Err(TxnError::Misuse); }
+                current
+            }
+        },
+    };
+    if end <= current { return Err(TxnError::Misuse); }
+    Ok(end)
+}
+
 /// A failed sequencer write: ambiguous, except a fenced KV, which wrote nothing (a range
 /// backend reports a sink's definite NotLeader that way, GD-0075 R5-81).
 fn write_error(error: &super::kv::KvError) -> TxnError {
@@ -769,7 +820,7 @@ fn process_group(
     // oracle failure fails every request and writes nothing.
     // Each write request gets its own timestamp of one `next(n)` reservation (first + i).
     #[cfg(test)]
-    if group.iter().any(|p| matches!(p, Message::Counter { .. }))
+    if group.iter().any(|p| matches!(p, Message::Counter { .. } | Message::Highwater { .. }))
         && group.iter().any(|p| matches!(p, Message::Commit(_))) {
         shared.max_mixed_group.fetch_max(group.len(), std::sync::atomic::Ordering::Relaxed);
     }
@@ -806,6 +857,7 @@ fn process_group(
     let mut batch = WriteBatch::default();
     let mut accepted = Vec::new();
     let mut counters = Vec::new();
+    let mut highwaters = BTreeMap::new();
     let mut catalog = BTreeMap::new();
     let mut decision = None;
     let mut deferred_log = None;
@@ -822,6 +874,19 @@ fn process_group(
     for item in group {
         let pending = match item {
             Message::Commit(pending) => pending,
+            Message::Highwater { key, value, reply } => {
+                match validate_highwater(kv, &key, &value, &highwaters) {
+                    Ok(end) => {
+                        highwaters.insert(key.clone(), end);
+                        batch.put(Keyspace::Seq, key, value);
+                        counters.push(reply);
+                        #[cfg(test)]
+                        shared.highwater_puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(error) => { let _ = reply.send(Err(error)); }
+                }
+                continue;
+            }
             Message::Counter { key, value, features_or, reply } => {
                 match validate_counter(kv, &key, &value, features_or, pending_features,
                     pending_subversion, &native, &catalog) {

@@ -7,19 +7,26 @@ use crate::range_api::{LeaseKind, RangeClient, RangeError};
 use std::{
     collections::BTreeMap,
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
 };
 
 const DEFAULT_BLOCK: u64 = 1024;
-// DML reserves 1,000,001 versions per statement. Amortize its Sync over 64
+// DML reserves 1,000,001 versions per statement. Amortize its Sync over 1024
 // statements without allocating memory proportional to the reservation.
-const ROW_VERSION_CHUNK: u64 = 64 * 1_000_001;
+const ROW_VERSION_CHUNK: u64 = 1024 * 1_000_001;
 type SequenceKey = [u8; 9];
 
 #[derive(Default)]
 struct Block {
     cur: u64,
     end: u64,
+    extension: Option<Extension>,
+}
+
+struct Extension {
+    start: u64,
+    end: u64,
+    receive: mpsc::Receiver<Result<(), TxnError>>,
 }
 
 /// Share one allocator for a KV handle: its per-sequence locks serialize reservation
@@ -32,6 +39,9 @@ struct Block {
 /// a `RangeClient::lease` on the system range, which is durable server side.
 pub(crate) struct SequenceAllocator {
     source: Source,
+    sequencer: Option<Arc<super::commit::Sequencer>>,
+    #[cfg(test)]
+    sync_writes: std::sync::atomic::AtomicUsize,
     block: u64,
     blocks: Mutex<BTreeMap<SequenceKey, Arc<Mutex<Block>>>>,
 }
@@ -57,9 +67,55 @@ impl SequenceAllocator {
     fn with_source(source: Source, block: u64) -> Self {
         Self {
             source,
+            sequencer: None,
+            #[cfg(test)]
+            sync_writes: std::sync::atomic::AtomicUsize::new(0),
             block: if block == 0 { DEFAULT_BLOCK } else { block },
             blocks: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(crate) fn set_sequencer(&mut self, sequencer: Arc<super::commit::Sequencer>) {
+        self.sequencer = Some(sequencer);
+    }
+
+    fn persist(&self, kv: &Kv, key: SequenceKey, end: u64) -> Result<(), TxnError> {
+        #[cfg(test)]
+        self.sync_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        persist_highwater(kv, key, end)
+    }
+
+    /// Publish only acknowledged, contiguous extensions. Waiting is reserved for
+    /// exhaustion or operations that would otherwise overwrite their highwater.
+    fn collect(block: &mut Block, wait: bool) -> Result<(), TxnError> {
+        let Some(extension) = &block.extension else { return Ok(()); };
+        let result = if wait {
+            extension.receive.recv().unwrap_or(Err(TxnError::Fenced))
+        } else {
+            match extension.receive.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(mpsc::TryRecvError::Disconnected) => Err(TxnError::Fenced),
+            }
+        };
+        let extension = block.extension.take().unwrap();
+        result?;
+        if block.end != extension.start { return Err(TxnError::Misuse); }
+        block.end = extension.end;
+        Ok(())
+    }
+
+    fn extend(&self, key: SequenceKey, block: &mut Block) -> Result<(), TxnError> {
+        if key[0] != 3 || !matches!(self.source, Source::Kv(_))
+            || block.extension.is_some() || block.end - block.cur > ROW_VERSION_CHUNK / 2 {
+            return Ok(());
+        }
+        if let Some(sequencer) = &self.sequencer {
+            let Some(end) = block.end.checked_add(ROW_VERSION_CHUNK) else { return Ok(()); };
+            let receive = sequencer.write_highwater_async(key.to_vec(), end.to_be_bytes().to_vec())?;
+            block.extension = Some(Extension { start: block.end, end, receive });
+        }
+        Ok(())
     }
 
     /// Reserves a full block synchronously before returning any value from it.
@@ -71,12 +127,13 @@ impl SequenceAllocator {
         let slot = self.slot(key)?;
         let mut block = slot.lock().map_err(|_| TxnError::Misuse)?;
         self.check_live()?;
+        Self::collect(&mut block, true)?;
         if block.cur == block.end {
             let (start, end) = match &self.source {
                 Source::Kv(kv) => {
                     let start = highwater(kv, &key)?;
                     let end = start.checked_add(self.block).ok_or(TxnError::Misuse)?;
-                    persist_highwater(kv, key, end)?;
+                    self.persist(kv, key, end)?;
                     (start, end)
                 }
                 Source::Leases(client) => {
@@ -101,6 +158,7 @@ impl SequenceAllocator {
         let slot = self.slot(key)?;
         let mut block = slot.lock().map_err(|_| TxnError::Misuse)?;
         self.check_live()?;
+        Self::collect(&mut block, true)?;
         if block.cur < block.end {
             return Ok(block.cur);
         }
@@ -132,9 +190,15 @@ impl SequenceAllocator {
         let slot = self.slot(key)?;
         let mut block = slot.lock().map_err(|_| TxnError::Misuse)?;
         self.check_live()?;
+        Self::collect(&mut block, false)?;
+        if n > block.end - block.cur {
+            Self::collect(&mut block, true)?;
+            self.check_live()?;
+        }
         if n <= block.end - block.cur {
             let start = block.cur;
             block.cur += n;
+            self.extend(key, &mut block)?;
             return Ok(start..block.cur);
         }
         let chunk = if kind == 3 && id == 0 {
@@ -148,7 +212,7 @@ impl SequenceAllocator {
                 let end = start.checked_add(n).ok_or(TxnError::Misuse)?;
                 // Near exhaustion reserve the representable tail, provided n fits.
                 let reserved_end = start.saturating_add(n.max(chunk));
-                persist_highwater(kv, key, reserved_end)?;
+                self.persist(kv, key, reserved_end)?;
                 (start, end, reserved_end)
             }
             Source::Leases(client) => {
@@ -160,6 +224,7 @@ impl SequenceAllocator {
         // Publish only after Sync succeeds, just as next() does.
         block.cur = end;
         block.end = reserved_end;
+        self.extend(key, &mut block)?;
         Ok(start..end)
     }
 
@@ -173,11 +238,12 @@ impl SequenceAllocator {
         let slot = self.slot(key)?;
         let mut block = slot.lock().map_err(|_| TxnError::Misuse)?;
         self.check_live()?;
+        Self::collect(&mut block, true)?;
         let client = match &self.source {
             Source::Kv(kv) => {
                 let highwater = highwater(kv, &key)?;
                 if floor > highwater {
-                    persist_highwater(kv, key, floor)?;
+                    self.persist(kv, key, floor)?;
                 }
                 if floor > block.cur {
                     // Refill from the durable highwater on next(), abandoning the old
@@ -292,6 +358,99 @@ mod range_tests {
     use crate::storage::engine::kv_mem::MemKv;
     use std::{collections::BTreeSet, sync::Barrier, thread};
 
+    fn pipelined() -> (Arc<Kv>, Arc<super::super::commit::Sequencer>, Arc<SequenceAllocator>) {
+        use super::super::commit::{ManualClock, Sequencer, SequencerConfig};
+        let kv = Arc::new(Kv::new(Arc::new(MemKv::new())));
+        let sequencer = Sequencer::open(kv.clone(), Arc::new(ManualClock::new(10)), SequencerConfig::default()).unwrap();
+        let mut seq = SequenceAllocator::new(kv.clone(), 7);
+        seq.set_sequencer(sequencer.clone());
+        (kv, sequencer, Arc::new(seq))
+    }
+
+    #[test]
+    fn refill_ahead_golden_and_reopen() {
+        let (kv, sequencer, seq) = pipelined();
+        let key = [3, 0, 0, 0, 0, 0, 0, 0, 0];
+        let first = seq.reserve_range(3, 0, ROW_VERSION_CHUNK / 2 + 1).unwrap();
+        let slot = seq.slot(key).unwrap();
+        SequenceAllocator::collect(&mut slot.lock().unwrap(), true).unwrap();
+        assert_eq!(kv.get(Keyspace::Seq, &key).unwrap(), Some(vec![0, 0, 0, 0, 122, 18, 8, 1]));
+        assert_eq!(sequencer.highwater_puts(), 1);
+        let later = seq.reserve_range(3, 0, ROW_VERSION_CHUNK / 2).unwrap();
+        assert_eq!(later.start, first.end);
+        assert_eq!(seq.sync_writes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // Drain any subsequent extension before simulating a new process.
+        SequenceAllocator::collect(&mut slot.lock().unwrap(), true).unwrap();
+        let durable = highwater(&kv, &key).unwrap();
+        let reopened = SequenceAllocator::new(kv, 7);
+        assert!(reopened.reserve_range(3, 0, 1).unwrap().start >= durable);
+        assert!(durable >= later.end);
+    }
+
+    #[test]
+    fn unacknowledged_or_failed_extension_is_not_published() {
+        let mem = Arc::new(MemKv::new());
+        let kv = Arc::new(Kv::new(mem.clone()));
+        let seq = SequenceAllocator::new(kv.clone(), 7);
+        let handed = seq.reserve_range(3, 0, 1_000_001).unwrap();
+        let slot = seq.slot(sequence_key(3, 0)).unwrap();
+        let (send, receive) = mpsc::channel();
+        let durable = highwater(&kv, &sequence_key(3, 0)).unwrap();
+        {
+            let mut block = slot.lock().unwrap();
+            block.extension = Some(Extension { start: durable, end: durable + ROW_VERSION_CHUNK, receive });
+            SequenceAllocator::collect(&mut block, false).unwrap();
+            assert_eq!(block.end, durable);
+        }
+        let reopened = SequenceAllocator::new(Arc::new(Kv::new(Arc::new(mem.crash()))), 7);
+        assert_eq!(reopened.reserve_range(3, 0, 1).unwrap().start, durable);
+        assert!(durable >= handed.end);
+        send.send(Err(TxnError::CommitAmbiguous)).unwrap();
+        let mut block = slot.lock().unwrap();
+        assert_eq!(SequenceAllocator::collect(&mut block, false), Err(TxnError::CommitAmbiguous));
+        assert_eq!(block.end, durable);
+    }
+
+    #[test]
+    fn failed_refill_fences_without_publishing() {
+        use super::super::commit::{ManualClock, Sequencer, SequencerConfig};
+        let mem = Arc::new(MemKv::new());
+        let kv = Arc::new(Kv::new(mem.clone()));
+        let sequencer = Sequencer::open(kv.clone(), Arc::new(ManualClock::new(10)), SequencerConfig::default()).unwrap();
+        let mut seq = SequenceAllocator::new(kv.clone(), 7);
+        seq.set_sequencer(sequencer);
+        seq.reserve_range(3, 0, 1).unwrap();
+        mem.fail_next_write(KvError::Io("extension sync failed".into()));
+        seq.reserve_range(3, 0, ROW_VERSION_CHUNK / 2).unwrap();
+        let slot = seq.slot(sequence_key(3, 0)).unwrap();
+        let mut block = slot.lock().unwrap();
+        let end = block.end;
+        assert_eq!(SequenceAllocator::collect(&mut block, true), Err(TxnError::CommitAmbiguous));
+        assert_eq!(block.end, end);
+        drop(block);
+        assert!(seq.reserve_range(3, 0, 1).is_err());
+    }
+
+    #[test]
+    fn concurrent_row_version_refills() {
+        let (kv, _sequencer, seq) = pipelined();
+        let barrier = Arc::new(Barrier::new(16));
+        let workers: Vec<_> = (0..16).map(|_| {
+            let seq = seq.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                (0..500).map(|_| seq.reserve_range(3, 0, 1_000_001).unwrap()).collect::<Vec<_>>()
+            })
+        }).collect();
+        let mut ranges: Vec<_> = workers.into_iter().flat_map(|w| w.join().unwrap()).collect();
+        ranges.sort_by_key(|r| r.start);
+        assert_eq!(ranges.len(), 8000);
+        assert!(ranges.windows(2).all(|w| w[0].end <= w[1].start));
+        let durable = highwater(&kv, &sequence_key(3, 0)).unwrap();
+        assert!(ranges.iter().all(|r| r.end <= durable));
+    }
+
     #[test]
     fn concurrent_next_and_ranges_never_overlap_and_survive_reopen() {
         let mem = Arc::new(MemKv::new());
@@ -356,7 +515,7 @@ mod range_tests {
     }
 
     #[test]
-    fn row_version_chunks_serve_64_statements_before_refill() {
+    fn row_version_chunks_serve_1024_statements_before_refill() {
         let mem = Arc::new(MemKv::new());
         let seq = SequenceAllocator::new(Arc::new(Kv::new(mem.clone())), 7);
         let first = seq.reserve_range(3, 0, 1_000_001).unwrap();
@@ -364,7 +523,7 @@ mod range_tests {
         // Leave a write failure armed: cached ranges must perform no writes.
         mem.fail_next_write(KvError::Io("refill boundary".into()));
         let mut end = first.end;
-        for _ in 1..64 {
+        for _ in 1..1024 {
             let range = seq.reserve_range(3, 0, 1_000_001).unwrap();
             assert_eq!(range.start, end);
             end = range.end;

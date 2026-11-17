@@ -432,3 +432,33 @@ fn counter_bytes_and_count_obey_gather_limits() {
         if expected == 1 && maximum > 0 { assert!(matches!(deferred, Some(Message::Commit(_)))); }
     }
 }
+
+#[test]
+fn row_version_highwaters_validate_and_share_commit_sync() {
+    let kv = Arc::new(Kv::new(Arc::new(MemKv::new())));
+    let seq = Sequencer::open(kv.clone(), Arc::new(ManualClock::new(10)), SequencerConfig::default()).unwrap();
+    let key = vec![3, 0, 0, 0, 0, 0, 0, 0, 0];
+    for (key, value) in [(vec![3; 8], 2_u64.to_be_bytes().to_vec()),
+        (vec![2; 9], 2_u64.to_be_bytes().to_vec()),
+        (key.clone(), vec![0; 7]), (key.clone(), 0_u64.to_be_bytes().to_vec())] {
+        assert!(matches!(seq.write_highwater_async(key, value), Err(TxnError::Misuse)));
+    }
+    assert_eq!(seq.write_highwater_async(key.clone(), 1_u64.to_be_bytes().to_vec()).unwrap().recv().unwrap(), Err(TxnError::Misuse));
+    let (reply, receive) = mpsc::channel();
+    let (commit, committed) = pending(42);
+    let group = vec![Message::Highwater { key: key.clone(), value: 100_u64.to_be_bytes().to_vec(), reply }, Message::Commit(commit)];
+    let mut hlc = HlcClock::new(Ts(0));
+    let mut log = RecentLog::new(1_000_000);
+    let mut features = 0;
+    let mut subversion = load_subversion(kv.as_ref()).unwrap();
+    assert!(!process_group(group, &kv, &ManualClock::new(10), &seq.shared, &mut hlc,
+        &mut log, &mut features, &mut subversion, &seq.config.ts_source, &seq.served));
+    receive.recv().unwrap().unwrap();
+    committed.recv().unwrap().unwrap();
+    assert_eq!(seq.shared.sync_writes.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(features, 0);
+    assert_eq!(kv.get(Keyspace::Seq, &key).unwrap(), Some(100_u64.to_be_bytes().to_vec()));
+    for end in [99_u64, 100] {
+        assert_eq!(validate_highwater(&kv, &key, &end.to_be_bytes(), &BTreeMap::new()), Err(TxnError::Misuse));
+    }
+}

@@ -146,7 +146,9 @@ impl V2Db {
             max_row_locks_per_txn: 8_000_000,
             ..Default::default()
         }));
-        let sequences = Arc::new(engine::seq::SequenceAllocator::new(kv.clone(), 0));
+        let mut sequences = engine::seq::SequenceAllocator::new(kv.clone(), 0);
+        sequences.set_sequencer(sequencer.clone());
+        let sequences = Arc::new(sequences);
         let xacts = engine::xact::XactIds::new(kv.clone(), sequences.clone());
         let catalog =
             engine::catalog::Catalog::open(sequencer.clone(), locks.clone(), sequences.clone())?;
