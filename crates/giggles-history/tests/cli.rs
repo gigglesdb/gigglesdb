@@ -2,7 +2,6 @@ mod common;
 use common::*;
 use giggles_history::*;
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -13,8 +12,8 @@ fn run(args: &[&str], input: &[u8]) -> Output {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("artifacts")
+    let dir = std::env::temp_dir()
+        .join("giggles-history-cli")
         .join(format!("cli-{}-{nanos}-{serial}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("input.jsonl"), input).unwrap();
@@ -268,8 +267,8 @@ fn cli_minimize_then_replay_failure() {
 }
 #[test]
 fn cli_real_file_input_and_missing_file() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("artifacts")
+    let dir = std::env::temp_dir()
+        .join("giggles-history-cli")
         .join(format!("file-input-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("history.jsonl");
@@ -300,4 +299,49 @@ fn cli_help_documents_codes() {
     ] {
         assert!(help.contains(expected));
     }
+}
+
+fn control_cases(name: &str) {
+    let mut h = history(vec![
+        scanner("initial", 0, 1, 0, 2, vec![(0, 10), (1, 10)]),
+        tx(
+            "transfer",
+            2,
+            3,
+            vec![Op::Transfer {
+                from: 0,
+                to: 1,
+                amount: 2,
+            }],
+            vec![],
+        ),
+        scanner("final", 4, 5, 0, 2, vec![(0, 8), (1, 12)]),
+    ]);
+    h.initial = State::from([(0, 10), (1, 10)]);
+    let out = run(&["control", name, "-"], &bytes(&h));
+    assert_eq!(out.status.code(), Some(0), "{name}: {:?}", out.stderr);
+    let mutated = parse_jsonl(std::io::Cursor::new(&out.stdout)).unwrap();
+    assert_ne!(mutated, h);
+    assert_eq!(run(&["check", "-"], &out.stdout).status.code(), Some(1));
+    let out = run(&["control", name, "-"], &bytes(&history(vec![])));
+    assert_eq!(out.status.code(), Some(3));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not applicable"));
+}
+
+#[test]
+fn cli_control_stale_read() {
+    control_cases("stale-read");
+}
+#[test]
+fn cli_control_stale_final_read() {
+    control_cases("stale-final-read");
+}
+#[test]
+fn cli_control_aborted_but_visible() {
+    control_cases("aborted-but-visible");
+}
+#[test]
+fn cli_control_duplicate_apply() {
+    control_cases("duplicate-apply");
 }

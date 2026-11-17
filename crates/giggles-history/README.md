@@ -17,6 +17,8 @@ cargo run --manifest-path crates/giggles-history/Cargo.toml -- minimize failing.
 `generate` emits JSONL on stdout; save using a UTF-8 writer (Windows PowerShell
 5 redirection can produce UTF-16, which this parser rejects). `check` and
 `replay` are equivalent and emit one JSON verdict. Use `-` for stdin.
+`control <stale-read|stale-final-read|aborted-but-visible|duplicate-apply> <FILE|->` emits mutated JSONL.
+Exit 0 means applied; exit 3 means not applicable (message on stderr); check the mutation independently.
 `minimize` emits reduced JSONL on stdout and a reduction summary on stderr.
 Its successful exit is 0; a non-FAIL source or invalid input exits 64. Reduction
 removes complete logical transaction groups, retaining initial state,
@@ -188,7 +190,7 @@ histories checked against separately written subset/permutation/timestamp and
 vector-state enumeration (without retries), seeded metamorphic campaigns,
 retry-specific behavioral fixtures, and real child-process CLI tests.
 CLI tests preserve exact inputs, invocation arguments, exit codes and raw
-stdout/stderr in unique ignored `artifacts/cli-*` directories. These are
+stdout/stderr in unique `giggles-history-cli/cli-*` directories under `TEMP`. These are
 synthetic checker tests; system qualification and independent integration
 review remain separate work.
 

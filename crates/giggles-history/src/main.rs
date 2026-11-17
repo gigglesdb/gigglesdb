@@ -1,4 +1,6 @@
-use giggles_history::{Limits, Verdict, check, generate, minimize, parse_jsonl, write_jsonl};
+use giggles_history::{
+    Limits, Verdict, check, generate, minimize, parse_jsonl, record::controls, write_jsonl,
+};
 use std::io::{self, BufReader, Write};
 
 fn main() {
@@ -18,11 +20,30 @@ fn run() -> Result<i32, String> {
     }
     if args.first().is_some_and(|s| s == "--help") && args.len() == 1 {
         println!(
-            "giggles-history check|replay|generate|minimize\n  check|replay FILE|- [--nodes N] [--memory BYTES]\n  generate SEED COUNT\n  minimize FILE|- [--nodes N] [--memory BYTES]\ncheck/replay exits: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 64 invalid input.\nminimize writes reduced JSONL; generate writes synthetic JSONL. No system qualification."
+            "giggles-history check|replay|generate|minimize|control\n  check|replay FILE|- [--nodes N] [--memory BYTES]\n  generate SEED COUNT\n  minimize FILE|- [--nodes N] [--memory BYTES]\n  control stale-read|stale-final-read|aborted-but-visible|duplicate-apply FILE|-\ncheck/replay exits: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 64 invalid input.\ncontrol writes mutated JSONL (0), or exits 3 if not applicable.\nminimize writes reduced JSONL; generate writes synthetic JSONL. No system qualification."
         );
         return Ok(0);
     }
     let command = args.first().ok_or("missing command; use --help")?;
+    if command == "control" {
+        if args.len() != 3 {
+            return Err("control requires NAME FILE|-".into());
+        }
+        let control = match args[1].as_str() {
+            "stale-read" => controls::stale_read,
+            "stale-final-read" => controls::stale_final_read,
+            "aborted-but-visible" => controls::aborted_but_visible,
+            "duplicate-apply" => controls::duplicate_apply,
+            _ => return Err("unknown control".into()),
+        };
+        let h = read_history(&args[2])?;
+        let Some(mutated) = control(&h) else {
+            eprintln!("control {} not applicable to this history", args[1]);
+            return Ok(3);
+        };
+        write_jsonl(&mutated, io::stdout().lock())?;
+        return Ok(0);
+    }
     if command == "generate" {
         if args.len() != 3 {
             return Err("generate requires SEED COUNT".into());
@@ -54,13 +75,7 @@ fn run() -> Result<i32, String> {
             _ => return Err("unknown flag".into()),
         }
     }
-    let h = if args[1] == "-" {
-        parse_jsonl(io::stdin().lock())?
-    } else {
-        parse_jsonl(BufReader::new(
-            std::fs::File::open(&args[1]).map_err(|e| e.to_string())?,
-        ))?
-    };
+    let h = read_history(&args[1])?;
     if command == "minimize" {
         let (reduced, checks) = minimize(&h, limits, 128)?;
         write_jsonl(&reduced, io::stdout().lock())?;
@@ -78,4 +93,14 @@ fn run() -> Result<i32, String> {
         Verdict::Fail => 1,
         Verdict::Inconclusive => 2,
     })
+}
+
+fn read_history(path: &str) -> Result<giggles_history::History, String> {
+    if path == "-" {
+        parse_jsonl(io::stdin().lock())
+    } else {
+        parse_jsonl(BufReader::new(
+            std::fs::File::open(path).map_err(|e| e.to_string())?,
+        ))
+    }
 }
