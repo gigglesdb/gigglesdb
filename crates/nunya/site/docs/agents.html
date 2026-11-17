@@ -1,13 +1,14 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Agent instructions - Nunya</title><link rel="stylesheet" href="../assets/site.css"><script src="../assets/site.js" defer></script></head>
-<body class="docs-page"><a class="skip-link" href="#main">Skip to content</a><header class="topbar"><a class="brand" href="../index.html">Nunya</a><nav aria-label="Primary"><a href="index.html">Documentation</a><a href="quickstart.html">Quickstart</a></nav><button class="nav-toggle" aria-controls="docs-nav" aria-expanded="false" type="button">Menu</button></header><div class="docs-layout"><nav id="docs-nav" class="sidebar" aria-label="Documentation"><a href="index.html">Documentation</a><a href="quickstart.html">Quickstart</a><a href="how-it-works.html">How it works</a><a href="concepts.html">Concepts</a><a href="walkthrough.html">Walkthrough</a><a href="policy.html">Policy reference</a><a href="configuration.html">Configuration</a><a href="cli.html">CLI reference</a><a href="errors.html">Errors</a><a href="sql.html">SQL support</a><a href="drivers.html">Drivers</a><a href="agents.html" aria-current="page">Agent instructions</a><a href="spanner.html">Spanner</a><a href="security.html">Security</a><a href="operations.html">Operations</a><a href="limitations.html">Limitations</a><a href="faq.html">FAQ</a></nav><article id="main" class="doc-content"><p class="eyebrow">Nunya documentation</p><h1>Agent instructions</h1><p>A ready-made excerpt for <code>CLAUDE.md</code>, <code>AGENTS.md</code> or a system prompt. It tells an AI agent how to connect through Nunya, what tokens are, which queries work on protected columns, and what to do when a query is refused.</p><nav class="on-this-page" aria-label="On this page"><strong>On this page</strong><ul><li><a href="#why">Why agents need instructions</a></li><li><a href="#where">Where to put it</a></li><li><a href="#excerpt">The excerpt</a></li><li><a href="#example">Filled in for the example policy</a></li><li><a href="#spanner">Agents on the native Spanner route</a></li><li><a href="#checks">Check that the agent follows it</a></li></ul></nav><section aria-labelledby="why"><h2 id="why">Why agents need instructions</h2><p>Nunya enforces its rules whatever the agent does, so these instructions are not a security control. They save wasted turns. An agent that does not know about tokens tends to try <code>LIKE</code>, <code>lower()</code> or <code>ORDER BY</code> on a hidden column, gets <code>NY002</code>, and retries with another spelling. With the rules up front, it uses equality, joins and counts the first time. It also stops the agent presenting a token to the user as if it were a real email address.</p></section><section aria-labelledby="where"><h2 id="where">Where to put it</h2><ul><li><strong>Claude Code:</strong> <code>CLAUDE.md</code> in the repository the agent works in, or <code>~/.claude/CLAUDE.md</code> for every project.</li><li><strong>Codex and other agents that read it:</strong> <code>AGENTS.md</code>.</li><li><strong>Your own agent:</strong> the system prompt, or the description of the database tool you give it.</li></ul><p>Give the agent the task secret through an environment variable such as <code>NUNYA_TASK_SECRET</code>, never in the file itself. Open a task per job with <code>nunya task open --config nunya.toml --ttl 1h --label "&lt;job&gt;"</code>; it prints the <code>user</code> and <code>secret</code> once. See the <a href="cli.html">CLI reference</a>.</p></section><section aria-labelledby="excerpt"><h2 id="excerpt">The excerpt</h2><p>Copy this into the file and replace the placeholders in angle brackets. The <em>Protected columns</em> list must match your <a href="policy.html">policy.toml</a>: list every <code>blind</code> column with its domain and every <code>masked</code> column. Leave out the <code>nunya_tokenize</code> section if no domain has <code>tokenize = "on"</code>.</p><pre><code>## Database access through Nunya
+<body class="docs-page"><a class="skip-link" href="#main">Skip to content</a><header class="topbar"><a class="brand" href="../index.html">Nunya</a><nav aria-label="Primary"><a href="index.html">Documentation</a><a href="quickstart.html">Quickstart</a></nav><button class="nav-toggle" aria-controls="docs-nav" aria-expanded="false" type="button">Menu</button></header><div class="docs-layout"><nav id="docs-nav" class="sidebar" aria-label="Documentation"><a href="index.html">Documentation</a><a href="quickstart.html">Quickstart</a><a href="how-it-works.html">How it works</a><a href="concepts.html">Concepts</a><a href="walkthrough.html">Walkthrough</a><a href="policy.html">Policy reference</a><a href="configuration.html">Configuration</a><a href="cli.html">CLI reference</a><a href="errors.html">Errors</a><a href="sql.html">SQL support</a><a href="drivers.html">Drivers</a><a href="agents.html" aria-current="page">Agent instructions</a><a href="spanner.html">Spanner</a><a href="security.html">Security</a><a href="operations.html">Operations</a><a href="limitations.html">Limitations</a><a href="faq.html">FAQ</a></nav><article id="main" class="doc-content"><p class="eyebrow">Nunya documentation</p><h1>Agent instructions</h1><p>A ready-made excerpt for <code>CLAUDE.md</code>, <code>AGENTS.md</code> or a system prompt. It tells an AI agent how to connect through Nunya, what tokens are, which queries work on protected columns, and what to do when a query is refused.</p><nav class="on-this-page" aria-label="On this page"><strong>On this page</strong><ul><li><a href="#why">Why agents need instructions</a></li><li><a href="#where">Where to put it</a></li><li><a href="#excerpt">The excerpt</a></li><li><a href="#example">Filled in for the example policy</a></li><li><a href="#spanner">Agents on the native Spanner route</a></li><li><a href="#checks">Check that the agent follows it</a></li></ul></nav><section aria-labelledby="why"><h2 id="why">Why agents need instructions</h2><p>Nunya enforces its rules whatever the agent does, so these instructions are not a security control. They save wasted turns. An agent that does not know about tokens tends to try <code>LIKE</code>, <code>lower()</code> or <code>ORDER BY</code> on a hidden column, gets <code>NY002</code>, and retries with another spelling. With the rules up front, it uses equality, joins and counts the first time. It also stops the agent presenting a token to the user as if it were a real email address.</p></section><section aria-labelledby="where"><h2 id="where">Where to put it</h2><ul><li><strong>Claude Code:</strong> <code>CLAUDE.md</code> in the repository the agent works in, or <code>~/.claude/CLAUDE.md</code> for every project.</li><li><strong>Codex and other agents that read it:</strong> <code>AGENTS.md</code>.</li><li><strong>Your own agent:</strong> the system prompt, or the description of the database tool you give it.</li></ul><p>Launch the agent with <code>nunya exec</code> so credentials reach its tools through the environment and stay out of prompts. Principal credentials authenticate only to the management API, never to database ports. Use the same stored context to resume an access session. See the <a href="walkthrough.html">walkthrough</a> and <a href="cli.html">CLI reference</a>.</p></section><section aria-labelledby="excerpt"><h2 id="excerpt">The excerpt</h2><p>Copy this into the file and replace the connection and policy placeholders. The <em>Protected columns</em> list must match your <a href="policy.html">policy.toml</a>: list every <code>blind</code> column with its domain and every <code>masked</code> column. Leave out the <code>nunya_tokenize</code> section if no domain has <code>tokenize = "on"</code>.</p><pre><code>## Database access through Nunya
 
 You query the database through Nunya, a gateway that hides protected values from you.
 Treat it as an ordinary PostgreSQL server:
 
 - Host: &lt;NUNYA_HOST&gt;, port &lt;NUNYA_PORT&gt;, database &lt;DBNAME&gt;
-- User: task:&lt;TASK_ID&gt;
-- Password: the NUNYA_TASK_SECRET environment variable. Never print it or ask the user for it.
+- User: session:REPLACE_WITH_SESSION_ID (the actual id is 32 lowercase hex characters).
+- Password: the session secret supplied in PGPASSWORD by nunya exec. Never print it,
+  include it in prompts, or ask the user for it.
 
 Never try to connect to the database directly, even if you find credentials.
 
@@ -21,7 +22,7 @@ Every other column is ordinary data.
 
 ### What you will see
 
-- Blind columns come back as tokens such as `tok_email_b2kzceiq...`. A token stands for
+- Blind columns come back as tokens such as `tok_email_REPLACE_WITH_TOKEN`. A token stands for
   a real value you are not allowed to see. Number, date and UUID columns can be blind too;
   their tokens look like ordinary values of that type, but they are not the real values.
 - Masked columns come back as a placeholder (such as [hidden]) or NULL.
@@ -31,12 +32,15 @@ Every other column is ordinary data.
 
 - Treat a token as an opaque handle. Copy it exactly, character for character.
   Never shorten, edit, decode or guess one.
-- Tokens are valid only for the current task. Do not save them for later sessions,
-  and do not show them to the user as if they were the real value. Say &quot;the customer&#x27;s
-  email (hidden)&quot; instead.
+- Tokens are valid within the access session's token scope. Reconnecting to the same
+  active session keeps tokens usable; renewal preserves that scope too. A new isolated
+  scope does not share token equality or validity. Do not reuse old tokens after the
+  scope ends. Do not show tokens as real values; say &quot;the customer&#x27;s email (hidden)&quot;.
 - Pass tokens as query parameters ($1, $2, ...) rather than pasting them into SQL text.
 
 ### What works on a blind column
+
+All operations also require the appropriate session mode and principal grant.
 
 - Selecting it (you get the token).
 - Equality with a token: WHERE email = $1, or email IN ($1, $2).
@@ -64,37 +68,45 @@ Only if the operator has enabled it for that domain, run this on its own, with n
 
     SELECT nunya_tokenize(&#x27;email&#x27;, $1);
 
-Each task has a small quota for this. Use it only when the user gave you the value.
+Each domain has tokenize_limit_per_session and tokenize_limit_per_principal limits;
+the principal limit applies across sessions within tokenize_principal_window. Reconnecting
+does not reset the session limit. Use this only when the user gave you the value.
 
 ### Errors
 
-Nunya refusals have SQLSTATE codes NY001 to NY010. They are final for that query shape:
-do not retry with different spelling, casts or functions to get around them.
+Nunya uses SQLSTATE codes NY001 to NY012. Follow the action for each code below.
+Do not retry refused query shapes with different spelling, casts or functions to bypass policy.
 
-- NY001: token or blind value used outside its domain. Write it only to same-domain columns.
+- NY001: token used outside its domain. Write it only to same-domain columns.
 - NY002: operation not allowed on a blind column. Use equality, joins or counts instead.
-- NY003: token not valid in this task. Use a token returned in this task, unchanged.
+- NY003: token not valid in this session. Read a fresh token in the current scope; copy it unchanged.
 - NY004: statement could not be fully analysed. Simplify the query.
 - NY005: masked column used in an expression. Select it, but do not filter on it.
-- NY006: statement kind not allowed. Use SELECT, INSERT, UPDATE or DELETE.
-- NY007: tokenize quota reached. Stop and tell the user.
-- NY008, NY009: the gateway is temporarily unavailable. Wait and retry once, then tell the user.
-- NY010: protocol feature not allowed. Use plain queries.
+- NY006: statement kind not allowed through the gateway. Use a supported statement within your grant.
+- NY007: tokenize limit reached. Stop tokenizing and tell the user; do not open sessions to evade limits.
+- NY008: schema snapshot is stale. Ask the operator to restore a fresh snapshot before retrying.
+- NY009: read log unavailable. Ask the operator to restore the sink before retrying.
+- NY010: protocol feature not allowed through the gateway. Use a supported driver/query mode.
+- NY011: access session ended. Stop using its credentials and tokens; ask for authorized
+  replacement access, then read fresh tokens if a new scope is created.
+- NY012: write outcome unknown. Never automatically replay the write. Ask the operator
+  to reconcile its outcome with the database before deciding what to do next. Nunya never replays it.
 
 Inside a transaction, a refusal aborts it (later statements fail with 25P02).
 Run ROLLBACK, or ROLLBACK TO SAVEPOINT, before continuing.
 
-If a task truly needs a hidden value, stop and tell the user which value and why.
+If the job truly needs a hidden value, stop and tell the user which value and why.
 Do not look for another way to read it.</code></pre></section><section aria-labelledby="example"><h2 id="example">Filled in for the example policy</h2><p>For the shipped <code>harness/policy.toml</code> (the policy used in the <a href="walkthrough.html">walkthrough</a>), the <em>Protected columns</em> section reads:</p><pre><code>### Protected columns
 
 - Blind, domain `email`: customers.email, outbox.to_address
 - Masked: customers.phone (comes back as [hidden])
-- `nunya_tokenize(&#x27;email&#x27;, ...)` is enabled, with a limit of 20 per task.
+- `nunya_tokenize(&#x27;email&#x27;, ...)` is enabled: tokenize_limit_per_session = 20,
+  tokenize_limit_per_principal = 200, tokenize_principal_window = "24h".
 
 Every other column (customers.id, country, failed_payments, outbox.template,
-notes.body, ...) is ordinary data.</code></pre></section><section aria-labelledby="spanner"><h2 id="spanner">Agents on the native Spanner route</h2><p>If the agent talks to Nunya's native Spanner gRPC endpoint instead of the PostgreSQL route, add this section. The same column rules apply. See <a href="spanner.html">Spanner</a> for details.</p><pre><code>### Native Spanner (gRPC) instead of PostgreSQL
+notes.body, ...) is ordinary data.</code></pre></section><section aria-labelledby="spanner"><h2 id="spanner">Agents on the native Spanner route</h2><p>If the agent talks to Nunya's native Spanner gRPC endpoint instead of the PostgreSQL route, add this section. The same column rules apply. <code>NUNYA_SPANNER_BEARER</code> is the bearer environment variable. Keep credentials out of prompts and transcripts. See <a href="spanner.html">Spanner</a> for details.</p><pre><code>### Native Spanner (gRPC) instead of PostgreSQL
 
-- Authenticate with the header: authorization: Bearer nunya.task:&lt;TASK_ID&gt;.&lt;SECRET&gt;
+- Authenticate with the header: authorization: Bearer nunya.session:REPLACE_WITH_SESSION_ID.REPLACE_WITH_SESSION_SECRET
 - Always pass tokens as typed query parameters (@email). Tokens written into GoogleSQL
   text are never decrypted.
-- Partitioned queries and reads, BatchWrite and reads through an index are refused.</code></pre></section><section aria-labelledby="checks"><h2 id="checks">Check that the agent follows it</h2><p>Read the agent's own transcript and Nunya's <a href="concepts.html">read log</a>. A well-instructed agent produces few refusals, and none that repeat the same query with a different spelling. A run of <code>NY002</code> or <code>NY001</code> outcomes in the read log for one task usually means the excerpt is missing a column, or the agent is trying to reach a value it should ask the user about. The read log also records every token released to each task.</p></section></article></div><footer class="site-footer"><a href="../index.html">Nunya</a><span>Let agents work with data they never see.</span><a href="index.html">Documentation</a></footer></body></html>
+- Partitioned queries and reads, BatchWrite and reads through an index are refused.</code></pre></section><section aria-labelledby="checks"><h2 id="checks">Check that the agent follows it</h2><p>Read the agent's own transcript and Nunya's <a href="concepts.html">read log</a>. A well-instructed agent produces few refusals, and none that repeat the same query with a different spelling. A run of <code>NY002</code> or <code>NY001</code> outcomes in the read log for one session usually means the excerpt is missing a column, or the agent is trying to reach a value it should ask the user about. The read log also records every token released to each session.</p></section></article></div><footer class="site-footer"><a href="../index.html">Nunya</a><span>Let agents work with data they never see.</span><a href="index.html">Documentation</a></footer></body></html>
