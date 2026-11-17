@@ -1195,6 +1195,9 @@ impl NunyaSpanner {
                 }
                 reassembler.finish().map_err(|e| after_forward(status(e), write))?;
                 if let Some(output) = precommit.finish() {
+                    ctx.authority
+                        .admit(who.session, Operation::Read)
+                        .map_err(|_| ended_status(write))?;
                     tokio::select! {
                         biased;
                         _ = ended(&mut signal) => return Err(ended_status(write)),
@@ -3028,6 +3031,110 @@ mod tests {
                 .is_err()
         );
         assert_eq!(f.fake.begins.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn begin_mutation_key_refuses_downgraded_grant() {
+        let f = Fixture::new().await;
+        let session = f.session().await;
+        let mutation = Mutation {
+            operation: Some(mutation::Operation::Insert(mutation::Write {
+                table: "customers".into(),
+                columns: vec!["email".into()],
+                values: vec![ListValue { values: vec![f.token()] }],
+            })),
+        };
+        reduce_grant(&f);
+        let error = f.svc.begin_transaction(f.request(BeginTransactionRequest {
+            session, mutation_key: Some(mutation), ..Default::default()
+        }, "alice")).await.unwrap_err();
+        assert_read_only(error);
+        assert!(f.fake.begins.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn begin_mutation_key_refuses_token_in_unprotected_column() {
+        let f = Fixture::new().await;
+        let session = f.session().await;
+        // The base fixture protects its only column; add an unprotected text column.
+        let mut snapshot = (**f.svc.ctx.snapshot.read().unwrap()).clone();
+        snapshot.relations[0].columns.push(Column {
+            name: "display_name".into(), ty: ColumnType::Text, nullable: true,
+            generated: None, default: None,
+        });
+        *f.svc.ctx.snapshot.write().unwrap() = Arc::new(snapshot);
+        let mutation = Mutation {
+            operation: Some(mutation::Operation::Insert(mutation::Write {
+                table: "customers".into(), columns: vec!["display_name".into()],
+                values: vec![ListValue { values: vec![f.token()] }],
+            })),
+        };
+        let error = f.svc.begin_transaction(f.request(BeginTransactionRequest {
+            session, mutation_key: Some(mutation), ..Default::default()
+        }, "alice")).await.unwrap_err();
+        assert_eq!(error.code(), nunya_status(NyCode::TokenOutsideDomain).code());
+        assert!(error.message().contains("NY001"));
+        assert!(f.fake.begins.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn revocation_before_trailing_precommit_flush_refuses_output() {
+        let f = Fixture::new().await;
+        use prost::Message;
+        use tonic::codec::Codec;
+        let frame = |part: PartialResultSet| {
+            let encoded = part.encode_to_vec();
+            let mut data = vec![0];
+            data.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+            data.extend_from_slice(&encoded);
+            Ok::<_, Status>(hyper::body::Frame::data(bytes::Bytes::from(data)))
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let authority = f.svc.ctx.authority.clone();
+        let session = f.alice;
+        // Revoke synchronously as EOF is polled, after the final control part's
+        // admission check and before finish(). No watcher scheduling is needed.
+        let mut at_eof = false;
+        let body = http_body_util::StreamBody::new(
+            tokio_stream::wrappers::ReceiverStream::new(rx).chain(futures::stream::poll_fn(move |_| {
+                if !at_eof {
+                    at_eof = true;
+                    authority.revoke(session, crate::state::model::EndReason::AdminRevoked).unwrap();
+                }
+                std::task::Poll::Ready(None)
+            })),
+        );
+        let mut codec = tonic::codec::ProstCodec::<PartialResultSet, PartialResultSet>::default();
+        let upstream = tonic::Streaming::new_response(
+            codec.decoder(), body, http::StatusCode::OK, None, None,
+        );
+        tx.send(frame(PartialResultSet {
+            metadata: Some(ResultSetMetadata {
+                row_type: Some(StructType { fields: vec![struct_type::Field {
+                    name: "email".into(), r#type: Some(Type {
+                        code: TypeCode::String as i32, ..Default::default()
+                    }),
+                }] }), ..Default::default()
+            }),
+            values: vec![text("private@example.com")], ..Default::default()
+        })).await.unwrap();
+        let req = f.query("SELECT email FROM customers").await;
+        let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
+        let (policy, snapshot, revision) = f.svc.configuration().unwrap();
+        let (plan, _, _) = f.svc.sql(
+            &who, revision.as_deref(), &req.sql, &mut None, &policy, &snapshot,
+        ).unwrap();
+        // Keep the watcher false to exercise the authoritative recheck itself.
+        let (_signal_tx, signal) = tokio::sync::watch::channel(false);
+        let mut stream = f.svc.stream(
+            who, policy, revision, plan, req.sql, upstream, signal, false, None,
+        );
+        let row = stream.next().await.unwrap().unwrap();
+        assert_eq!(row.values.len(), 1);
+        assert!(row.precommit_token.is_none());
+        tx.send(frame(PartialResultSet {
+            precommit_token: Some(precommit(9)), last: true, ..Default::default()
+        })).await.unwrap();
+        drop(tx);
+        assert_ended(stream.next().await.unwrap().unwrap_err(), false);
+        assert!(stream.next().await.is_none());
     }
     #[tokio::test]
     async fn streaming_precommit_tokens_and_last_survive_reassembly() {

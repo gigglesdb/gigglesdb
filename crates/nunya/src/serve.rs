@@ -327,6 +327,7 @@ struct ManagementStatus {
     config_reload: Option<Arc<crate::config_reload::ConfigReloader>>,
     hub: Arc<crate::reload::Hub>,
     routes: Vec<crate::state::model::RouteId>,
+    spanner_route: Option<crate::state::model::RouteId>,
 }
 impl crate::mgmt::routes::StatusSource for ManagementStatus {
     fn policy_revision(&self, route: &str) -> Option<String> {
@@ -341,6 +342,10 @@ impl crate::mgmt::routes::StatusSource for ManagementStatus {
     }
     fn config_last_reload(&self) -> Option<String> {
         self.config_reload.as_ref().map(|r| r.last_reload())
+    }
+    fn route_kind(&self, route: &str) -> Option<&'static str> {
+        let id = self.routes.iter().find(|id| id.as_str() == route)?;
+        Some(if self.spanner_route.as_ref() == Some(id) { "spanner-native" } else { "postgres" })
     }
     fn route_ids(&self) -> Vec<String> { self.routes.iter().map(|r| r.as_str().into()).collect() }
 }
@@ -438,6 +443,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             status: Arc::new(ManagementStatus {
                 config_reload: Some(config_reload.clone()),
                 hub: hub.clone(),
+                spanner_route: spanner_route.clone(),
                 routes: postgres_route.iter().chain(spanner_route.iter()).cloned().collect(),
             }),
             lifecycle: Arc::new(crate::mgmt::audit::ReadLogSink(hub.log.clone())),
@@ -714,7 +720,7 @@ mod tests {
         let hub = crate::reload::Hub::new(&[(route.clone(), path)], None).unwrap();
         hub.set_config_revision("config").unwrap();
         let revisions = hub.route_log(&route).unwrap().1;
-        let status = ManagementStatus { config_reload: None, hub: hub.clone(), routes: vec![route] };
+        let status = ManagementStatus { config_reload: None, hub: hub.clone(), spanner_route: None, routes: vec![route] };
         let first = status.policy_revision("postgres").unwrap();
         revisions.write().unwrap().policy = "reloaded".into();
         assert_ne!(first, "reloaded");
@@ -751,7 +757,7 @@ mod tests {
         let routes = vec![crate::state::model::RouteId::new("a").unwrap(), crate::state::model::RouteId::new("b").unwrap()];
         let hub = crate::reload::Hub::new(&[(routes[0].clone(), a), (routes[1].clone(), b)], None).unwrap();
         hub.set_config_revision("config").unwrap();
-        let status = ManagementStatus { config_reload: None, hub: hub.clone(), routes: routes.clone() };
+        let status = ManagementStatus { config_reload: None, hub: hub.clone(), spanner_route: None, routes: routes.clone() };
         let first = status.policy_revision("a").unwrap();
         assert_eq!(status.policy_revision("b"), Some(first.clone()));
         hub.route_log(&routes[1]).unwrap().1.write().unwrap().policy = "other".into();

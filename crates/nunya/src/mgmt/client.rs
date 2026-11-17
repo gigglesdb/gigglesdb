@@ -224,6 +224,9 @@ pub struct SessionView {
     pub principal: String,
     /// Route identifier.
     pub route: String,
+    /// Configured route protocol kind, absent on older servers.
+    #[serde(default)]
+    pub route_kind: Option<String>,
     /// Effective access mode.
     pub mode: Mode,
     /// Lifecycle state.

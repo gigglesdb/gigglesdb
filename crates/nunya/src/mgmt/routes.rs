@@ -53,6 +53,8 @@ pub trait StatusSource: Send + Sync {
     fn config_restart_pending(&self) -> Vec<String> { Vec::new() }
     /// Most recent configuration reload outcome, when available.
     fn config_last_reload(&self) -> Option<String> { None }
+    /// Route kind ("postgres" or "spanner-native") for a configured route id.
+    fn route_kind(&self, _route: &str) -> Option<&'static str> { None }
     /// Configured route identifiers.
     fn route_ids(&self) -> Vec<String>;
 }
@@ -170,6 +172,7 @@ fn audit_unavailable() -> Response<Bytes> {
 }
 fn session_view(ctx: &MgmtContext, s: &AccessSession) -> Value {
     json!({"policy_revision":ctx.status.policy_revision(s.route.as_str()),
+        "route_kind":ctx.status.route_kind(s.route.as_str()),
         "config_revision":ctx.status.config_revision(), "id":s.id, "principal":s.principal, "route":s.route, "mode":s.mode,
         "state":s.state, "created_ms":s.created_ms, "expires_ms":s.expires_ms,
         "idle_timeout_ms":s.idle_timeout_ms, "last_used_ms":s.last_used_ms,

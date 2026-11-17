@@ -89,6 +89,9 @@ pub struct Context {
     pub principal: Option<String>,
     /// Route identifier.
     pub route: String,
+    /// Configured route protocol kind, absent in legacy contexts.
+    #[serde(default)]
+    pub route_kind: Option<String>,
     /// Session identifier.
     pub session_id: String,
     /// Credential protected on drop.
@@ -487,6 +490,7 @@ async fn resume(client: &MgmtClient, ctx: &mut Context) -> Result<SessionView, H
             }
         })?;
     ctx.expires_ms = view.expires_ms;
+    ctx.route_kind = view.route_kind.clone();
     Ok(view)
 }
 /// Acquire a new session or authoritatively revalidate a stored session.
@@ -556,6 +560,7 @@ pub async fn acquire_or_resume(
             server: opts.connection.server.clone(),
             principal: opts.connection.principal.clone(),
             route: view.route,
+            route_kind: view.route_kind,
             session_id: view.id,
             secret: secret.secret,
             scram_salt: Some(secret.scram_salt),
@@ -614,6 +619,7 @@ pub async fn rotate(
     let mut updated = ctx.clone();
     updated.secret = secret.secret;
     updated.expires_ms = view.expires_ms;
+    updated.route_kind = view.route_kind;
     store.put(&updated)?;
     *ctx = updated;
     println!("The previous secret keeps working until the session expires.");
@@ -630,7 +636,11 @@ pub fn pg_env(ctx: &Context) -> Vec<(String, Zeroizing<String>)> {
     .into_iter()
     .map(|(k, v)| (k.into(), Zeroizing::new(v)))
     .collect();
-    if ctx.route == "spanner-native" {
+    if ctx
+        .route_kind
+        .as_deref()
+        .map_or(ctx.route == "spanner-native", |kind| kind == "spanner-native")
+    {
         let mut bearer = Zeroizing::new(String::from("nunya.session:"));
         bearer.push_str(&ctx.session_id);
         bearer.push('.');
@@ -645,8 +655,10 @@ fn quoted(value: &str, format: EnvFormat) -> Zeroizing<String> {
         EnvFormat::Powershell => format!("'{}'", value.replace('\'', "''")),
     })
 }
-async fn summary(client: &MgmtClient, ctx: &Context) -> Result<(), HelperError> {
+async fn summary(client: &MgmtClient, store: &HelperStore, ctx: &mut Context) -> Result<(), HelperError> {
     let view = client.session(&ctx.session_id).await?;
+    ctx.route_kind = view.route_kind.clone();
+    store.put(ctx)?;
     println!(
         "id: {}\nroute: {}\nmode: {:?}\nexpires_ms: {}\ncontext: {}",
         view.id, view.route, view.mode, view.expires_ms, ctx.name
@@ -668,13 +680,15 @@ async fn dispatch(command: SessionCommand) -> Result<i32, HelperError> {
         SessionCommand::Acquire { mut opts, isolated } => {
             opts.isolated = isolated;
             let client = opts.connection.client()?;
-            let ctx = acquire_or_resume(&client, &store, &opts).await?;
-            summary(&client, &ctx).await?;
+            let mut ctx = acquire_or_resume(&client, &store, &opts).await?;
+            summary(&client, &store, &mut ctx).await?;
         }
         SessionCommand::Show(connection) => {
             let client = connection.client()?;
-            let ctx = connection.context(&store)?;
+            let mut ctx = connection.context(&store)?;
             let v = client.session(&ctx.session_id).await?;
+            ctx.route_kind = v.route_kind.clone();
+            store.put(&ctx)?;
             println!(
                 "state: {:?}\nmode: {:?}\nexpires_ms: {}\nrevoke_reason: {:?}\nscope_continuity: {}",
                 v.state, v.mode, v.expires_ms, v.revoke_reason, v.scope_continuity
@@ -692,9 +706,10 @@ async fn dispatch(command: SessionCommand) -> Result<i32, HelperError> {
             } else {
                 let view = client.renew(&ctx.session_id, mode, None).await?;
                 ctx.expires_ms = view.expires_ms;
+                ctx.route_kind = view.route_kind.clone();
                 store.put(&ctx)?;
             }
-            summary(&client, &ctx).await?;
+            summary(&client, &store, &mut ctx).await?;
         }
         SessionCommand::Revoke(connection) => {
             let client = connection.client()?;
@@ -778,6 +793,7 @@ mod tests {
             server: "unix:/tmp/nunya.sock".into(),
             principal: None,
             route: "postgres".into(),
+            route_kind: None,
             session_id: "12".repeat(16),
             secret: Zeroizing::new("private-session-secret".into()),
             scram_salt: None,
@@ -793,7 +809,8 @@ mod tests {
     #[test]
     fn spanner_environment_has_protected_session_bearer() {
         let mut ctx = context();
-        ctx.route = "spanner-native".into();
+        ctx.route = "native-renamed".into();
+        ctx.route_kind = Some("spanner-native".into());
         let env = pg_env(&ctx);
         let bearer = &env
             .iter()
@@ -812,6 +829,33 @@ mod tests {
         assert!(secret == ctx.secret.as_str(), "session credential mismatch");
         assert!(env.iter().any(|(key, _)| key == "PGPASSWORD"));
         assert!(!format!("{ctx:?}").contains(ctx.secret.as_str()));
+    }
+    #[test]
+    fn spanner_bearer_respects_kind_and_legacy_fallback() {
+        let mut ctx = context();
+        ctx.route = "spanner-native".into();
+        assert!(pg_env(&ctx).iter().any(|(key, _)| key == "NUNYA_SPANNER_BEARER"));
+        ctx.route_kind = Some("postgres".into());
+        assert!(!pg_env(&ctx).iter().any(|(key, _)| key == "NUNYA_SPANNER_BEARER"));
+        let mut legacy = serde_json::to_value(&ctx).unwrap();
+        legacy.as_object_mut().unwrap().remove("route_kind");
+        let legacy: Context = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.route_kind.is_none());
+        assert!(pg_env(&legacy).iter().any(|(key, _)| key == "NUNYA_SPANNER_BEARER"));
+    }
+    #[test]
+    fn session_view_accepts_route_kind_and_legacy_response() {
+        let mut value = serde_json::json!({
+            "id": "id", "principal": "principal", "route": "native-renamed",
+            "mode": "read_only", "state": "active", "created_ms": 0,
+            "expires_ms": 1, "last_used_ms": 0, "isolated": false,
+            "scope": "scope", "scope_continuity": true
+        });
+        let legacy: SessionView = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.route_kind.is_none());
+        value["route_kind"] = "spanner-native".into();
+        let current: SessionView = serde_json::from_value(value).unwrap();
+        assert_eq!(current.route_kind.as_deref(), Some("spanner-native"));
     }
     #[test]
     fn postgres_environment_has_no_spanner_bearer() {
