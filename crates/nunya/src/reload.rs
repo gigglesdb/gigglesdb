@@ -243,7 +243,14 @@ impl Hub {
             &**snapshot.read().map_err(|_| "snapshot lock unavailable")?,
         )
         .map_err(crate::serve::errors)?;
-        *policy.write().map_err(|_| "policy lock unavailable")? = s.policy.clone();
+        {
+            let mut current = policy.write().map_err(|_| "policy lock unavailable")?;
+            if let Route::Postgres(ctx) = &route {
+                let mut revision = ctx.policy_revision.write().map_err(|_| "revision lock unavailable")?;
+                *revision = Some(s.hash.clone());
+            }
+            *current = s.policy.clone();
+        }
         s.routes.push(route);
         Ok(())
     }
@@ -283,6 +290,12 @@ impl Hub {
                 policies.push(p.write().map_err(|_| "policy lock unavailable")?);
                 snapshots.push(snap.read().map_err(|_| "snapshot lock unavailable")?);
             }
+            let mut route_revisions = Vec::new();
+            for route in &s.routes {
+                if let Route::Postgres(ctx) = route {
+                    route_revisions.push(ctx.policy_revision.write().map_err(|_| "revision lock unavailable")?);
+                }
+            }
             for snapshot in &snapshots {
                 crate::policy::validate::validate(&policy, snapshot)
                     .map_err(crate::serve::errors)?;
@@ -310,6 +323,9 @@ impl Hub {
             }
             for current in &mut policies {
                 **current = policy.clone();
+            }
+            for current in &mut route_revisions {
+                **current = Some(revision.clone());
             }
             revisions.policy = revision.clone();
             Ok::<_, String>(policy)
@@ -1176,4 +1192,41 @@ mod tests {
         )));
         assert!(metrics.contains(&("nunya_policy_applied_unix_ms{route=\"postgres\"}".into(), 1)));
     }
+    #[test]
+    fn postgres_register_and_apply_publish_matching_policy_revision() {
+        use crate::pgwire::{context::{GatewayContext, Metrics}, upstream::UpstreamConfig};
+        let files = Files::new();
+        let runtime = crate::state::runtime::StateRuntime::open(
+            &files.dir.join("state"),
+            &crate::token::keys::RootKey::from_hex(&"00".repeat(32)).unwrap(),
+            &crate::config::SessionSettings::default(), &[],
+        ).unwrap();
+        let h = hub();
+        let ctx = Arc::new(GatewayContext {
+            authority: runtime.authority.clone(), registry: runtime.registry.clone(), route: id("postgres"),
+            policy: RwLock::new(Arc::new(policy())), policy_revision: RwLock::new(None),
+            snapshot: RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec!["public".into()], 0))),
+            root_key: crate::token::keys::RootKey::from_hex(&"00".repeat(32)).unwrap(),
+            readlog: Box::new(h.log.clone()),
+            upstream: UpstreamConfig {
+                host: "unused".into(), port: 5432, user: "unused".into(),
+                password: zeroize::Zeroizing::new(String::new()), dbname: "unused".into(),
+                tls: crate::pgwire::upstream::UpstreamTls::Disable, application_name: "nunya".into(), connect_timeout_ms: 100,
+            },
+            search_path: vec!["public".into()], lowering: crate::dialect::pg::PgLowering,
+            codec: crate::token::StandardCodec, clock: Arc::new(|| 0), cancel_map: Mutex::new(Default::default()),
+            metrics: Metrics::default(), tls: None, allow_plaintext: true,
+        });
+        h.register(Route::Postgres(ctx.clone())).unwrap();
+        let (initial, revision) = ctx.policy_snapshot().unwrap();
+        assert_eq!(revision, Some(hash(b"initial")));
+        let mut next = policy();
+        next.snapshot_max_age_ms = 42;
+        h.apply(0, Ok(next), Some("R2".into())).unwrap();
+        let (current, revision) = ctx.policy_snapshot().unwrap();
+        assert_eq!(revision.as_deref(), Some("R2"));
+        assert_eq!(current.snapshot_max_age_ms, 42);
+        assert_eq!(initial.snapshot_max_age_ms, 60000);
+    }
+
 }

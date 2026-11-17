@@ -97,6 +97,7 @@ async fn gateway(url: &str, side: &str) -> TestResult<Gateway> {
         authority: runtime.authority.clone(),
         registry: runtime.registry.clone(),
         route: nunya::state::model::RouteId::new("postgres").unwrap(),
+        policy_revision: RwLock::new(None),
         policy: RwLock::new(Arc::new(policy)),
         snapshot: RwLock::new(Arc::new(snapshot)),
         root_key: RootKey::from_hex(&"42".repeat(32))?,

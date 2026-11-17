@@ -2432,3 +2432,33 @@ async fn listener_socket_only_without_management_section() -> TransportResult {
     assert!(!path.exists());
     Ok(())
 }
+
+#[test]
+fn status_legacy_revision_is_emitted_only_when_unambiguous() {
+    struct Revisions(Vec<(&'static str, Option<&'static str>)>);
+    impl StatusSource for Revisions {
+        fn route_ids(&self) -> Vec<String> { self.0.iter().map(|(id, _)| (*id).into()).collect() }
+        fn policy_revision(&self, route: &str) -> Option<String> {
+            self.0.iter().find(|(id, _)| *id == route).and_then(|(_, rev)| rev.map(String::from))
+        }
+        fn config_revision(&self) -> Option<String> { None }
+    }
+    for (routes, legacy) in [
+        (vec![("a", Some("R1"))], Some(serde_json::json!("R1"))),
+        (vec![("a", None)], None),
+        (vec![("a", Some("R1")), ("b", Some("R1"))], Some(serde_json::json!("R1"))),
+        (vec![("a", Some("R1")), ("b", Some("R2"))], None),
+        (vec![("a", None), ("b", None)], None),
+        (vec![("a", Some("R1")), ("b", None)], None),
+        (vec![], None),
+    ] {
+        let mut f = Fixture::new();
+        let count = routes.len();
+        f.ctx.as_mut().unwrap().status = Arc::new(Revisions(routes));
+        let response = f.request(Origin::Network, Some(ADMIN), "GET", "/v1/status", None);
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["policy_revisions"].as_object().unwrap().len(), count);
+        assert_eq!(body.get("policy_revision"), legacy.as_ref());
+    }
+}

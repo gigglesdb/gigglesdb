@@ -103,6 +103,7 @@ pub struct Session {
     extended_execute_forwarded: bool,
     rollback_on_sync: bool,
     last_row_refresh_ms: Option<u64>,
+    statement_revision: Option<String>,
     end_requested: Option<crate::state::registry::EndReason>,
 }
 impl Session {
@@ -137,6 +138,7 @@ impl Session {
             extended_execute_forwarded: false,
             rollback_on_sync: false,
             last_row_refresh_ms: None,
+            statement_revision: None,
             end_requested: None,
         }
     }
@@ -218,7 +220,7 @@ impl Session {
             connection: self.connection,
             credential_id: self.credential,
             route: self.ctx.route.as_str().into(),
-            policy_revision: None,
+            policy_revision: self.statement_revision.clone(),
             config_revision: None,
             statement_fingerprint: statement_fingerprint(&statement),
             statement,
@@ -251,12 +253,7 @@ impl Session {
         }
         out
     }
-    fn record_tokenization(&self, domain: &DomainName) -> Result<(), Refusal> {
-        let policy = self
-            .ctx
-            .policy
-            .read()
-            .map_err(|_| failure(NyCode::SessionEnded))?;
+    fn record_tokenization(&self, policy: &Policy, domain: &DomainName) -> Result<(), Refusal> {
         let settings = policy
             .domains
             .get(domain)
@@ -320,10 +317,12 @@ impl Session {
         self.extended_frontend(msg)
     }
     fn query(&mut self, sql: &str) -> Actions {
+        self.statement_revision = None;
         let result = (|| {
             // Admit at processing time so deferred queries use current authority.
             let mode = self.admit()?;
-            let policy = self.ctx.policy.read().map_err(|_| protocol())?.clone();
+            let (policy, revision) = self.ctx.policy_snapshot()?;
+            self.statement_revision = revision;
             let snapshot = self.ctx.snapshot.read().map_err(|_| protocol())?.clone();
             if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms)
                 > policy.snapshot_max_age_ms
@@ -423,7 +422,7 @@ impl Session {
                 };
                 let settings = policy.domains.get(domain).ok_or_else(protocol)?;
                 let value = values::decode_text(&ty, text.as_bytes())?;
-                self.record_tokenization(domain)?;
+                self.record_tokenization(&policy, domain)?;
                 let encoded = self.ctx.codec.encode(
                     &self.keys,
                     domain,
@@ -1444,6 +1443,7 @@ mod tests {
                 authority: runtime.authority.clone(),
                 registry: runtime.registry.clone(),
                 route: crate::state::model::RouteId::new("postgres").unwrap(),
+                policy_revision: RwLock::new(None),
                 policy: RwLock::new(Arc::new(policy)),
                 snapshot: RwLock::new(Arc::new(snapshot)),
                 root_key: RootKey::from_hex(&"00".repeat(32)).unwrap(),
@@ -2851,7 +2851,7 @@ mod tests {
         }
     }
     #[test]
-    fn prepared_tokenize_uses_reloaded_limit_at_execute() {
+    fn prepared_tokenize_retains_snapshot_limit_at_execute() {
         let f = Fixture::new();
         let mut s = f.session();
         assert!(
@@ -2868,11 +2868,13 @@ mod tests {
             result_formats: vec![],
         });
         set_tokenize_limits(&f, 1, 20);
-        let refused = s.frontend(Frontend::Execute {
+        let allowed = s.frontend(Frontend::Execute {
             portal: "next".into(),
             max_rows: 0,
         });
-        assert_eq!(code(&refused), "NY007");
+        assert!(allowed.client.iter().any(|message| matches!(message, Backend::DataRow(_))));
+        // A new Parse captures the tightened limit without resetting durable counters.
+        assert_eq!(code(&tokenize(&mut s, true)), "NY007");
     }
     #[test]
     fn local_tokenize_limit_and_mixed_query() {
@@ -3524,4 +3526,44 @@ mod tests {
         assert_eq!(execute.upstream.len(), 1);
         assert!(matches!(&execute.upstream[0],Frontend::Execute{portal,..} if portal=="c"));
     }
+    #[test]
+    fn statement_snapshot_retains_revision_and_tokenize_limits_across_reload() {
+        for sql in ["SELECT value FROM items", "SELECT nunya_tokenize('secret', 'private')"] {
+            let f = Fixture::new();
+            *f.ctx.policy_revision.write().unwrap() = Some("R1".into());
+            let mut s = f.session();
+            s.frontend(Frontend::Parse { name: "s".into(), query: sql.into(), param_types: vec![] });
+            let local = sql.contains("nunya_tokenize");
+            if !local { s.backend(Backend::ParseComplete); }
+            s.frontend(Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![], params: vec![], result_formats: vec![] });
+            if !local { s.backend(Backend::BindComplete); }
+            {
+                let mut current = f.ctx.policy.write().unwrap();
+                let mut next = (**current).clone();
+                if let TokenizeSetting::On { limit_per_session, .. } = &mut next.domains.get_mut(&DomainName("secret".into())).unwrap().tokenize {
+                    *limit_per_session = 0;
+                }
+                *current = Arc::new(next);
+                *f.ctx.policy_revision.write().unwrap() = Some("R2".into());
+            }
+            let out = s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 });
+            assert!(!out.close);
+            assert!(!out.client.iter().any(|m| matches!(m, Backend::ErrorResponse(_))));
+            if !local {
+                s.backend(Backend::RowDescription(vec![field()]));
+                s.backend(Backend::CommandComplete("SELECT 0".into()));
+            }
+            s.frontend(Frontend::Sync);
+            s.backend(Backend::ReadyForQuery(b'I'));
+            assert!(f.identities.lock().unwrap().iter().all(|r| r.policy_revision.as_deref() == Some("R1")));
+            f.identities.lock().unwrap().clear();
+            let out = s.frontend(Frontend::Query(sql.into()));
+            if local { assert!(out.client.iter().any(|m| matches!(m, Backend::ErrorResponse(_)))); }
+            let records = f.identities.lock().unwrap();
+            assert!(!records.is_empty());
+            if local { assert!(matches!(records[0].outcome, Outcome::Refused(NyCode::TokenizeLimit))); }
+            assert!(records.iter().all(|r| r.policy_revision.as_deref() == Some("R2")));
+        }
+    }
+
 }

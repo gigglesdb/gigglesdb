@@ -311,7 +311,11 @@ pub struct StatusView {
     /// Configured route identifiers.
     pub route_ids: Vec<String>,
     /// Optional policy revisions by configured route identifier.
+    #[serde(default)]
     pub policy_revisions: std::collections::BTreeMap<String, Option<String>>,
+    /// Legacy single revision.
+    #[serde(default)]
+    pub policy_revision: Option<String>,
     /// Optional configuration revision.
     pub config_revision: Option<String>,
 }
@@ -875,4 +879,20 @@ mod tests {
         assert_eq!(client.status().await.unwrap_err(), ClientError::Decode);
         server.await.unwrap();
     }
+    #[test]
+    fn status_accepts_legacy_and_route_revision_shapes() {
+        let old: StatusView = serde_json::from_value(json!({
+            "deployment_id":"id", "store_format":1, "route_ids":["pg"],
+            "policy_revision":"R1", "config_revision":"C1"
+        })).unwrap();
+        assert!(old.policy_revisions.is_empty());
+        assert_eq!(old.policy_revision.as_deref(), Some("R1"));
+        let new: StatusView = serde_json::from_value(json!({
+            "deployment_id":"id", "store_format":1, "route_ids":["pg"],
+            "policy_revisions":{"pg":"R2"}, "config_revision":"C1"
+        })).unwrap();
+        assert_eq!(new.policy_revisions["pg"].as_deref(), Some("R2"));
+        assert_eq!(new.policy_revision, None);
+    }
+
 }

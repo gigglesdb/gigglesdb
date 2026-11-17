@@ -542,6 +542,7 @@ async fn run_postgres(
         authority: state.0.authority.clone(),
         registry: state.0.registry.clone(),
         route: state.1,
+        policy_revision: RwLock::new(None),
         policy: RwLock::new(policy),
         snapshot: RwLock::new(Arc::new(first)),
         root_key,

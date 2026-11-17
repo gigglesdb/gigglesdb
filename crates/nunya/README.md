@@ -112,7 +112,7 @@ Principal tokenize counters are keyed by principal and domain name: the same dom
 
 Every file must name the same `[readlog]` sink for statement, lifecycle and management records; startup refuses a mismatch with `policy files name different read logs`. With multiple policy files, a reload that changes the sink is rejected for that file. To move the log, update all files and restart. A single shared file may still change the sink on reload.
 
-`policy_revision` is the SHA-256 of the route's own policy file. Statement records and management session views carry the session route's revision. Management `GET /v1/status` returns `policy_revisions`, an object mapping route IDs to revisions (null if unavailable), instead of `policy_revision`; `config_revision` is unchanged. Admin status fields and route-labeled metrics are documented in [operations](site/docs/operations.html#reload).
+`policy_revision` is the SHA-256 of the route's own policy file. Statement records and management session views carry the session route's revision. Management `GET /v1/status` returns `policy_revisions`, an object mapping route IDs to revisions (null if unavailable), with the legacy `policy_revision` field present when one route exists or all routes share one revision, for older clients; `config_revision` is unchanged. Admin status fields and route-labeled metrics are documented in [operations](site/docs/operations.html#reload).
 
 ## Policy reference
 

@@ -9,6 +9,7 @@ pub(super) struct Prepared {
     kind: StatementKind,
     param_types: Vec<u32>,
     policy: Arc<Policy>,
+    policy_revision: Option<String>,
     sql: String,
     rewritten: String,
     token_ty: Option<ColumnType>,
@@ -94,8 +95,9 @@ impl Session {
         }
         out
     }
-    fn prepare(&self, sql: &str, param_types: Vec<u32>) -> Result<Prepared, Refusal> {
-        let policy = self.ctx.policy.read().map_err(|_| protocol())?.clone();
+    fn prepare(&mut self, sql: &str, param_types: Vec<u32>) -> Result<Prepared, Refusal> {
+        let (policy, policy_revision) = self.ctx.policy_snapshot()?;
+        self.statement_revision = policy_revision.clone();
         let snapshot = self.ctx.snapshot.read().map_err(|_| protocol())?.clone();
         if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms) > policy.snapshot_max_age_ms
         {
@@ -156,6 +158,7 @@ impl Session {
             kind: statement.kind.clone(),
             param_types,
             policy,
+            policy_revision,
             sql: sql.into(),
             rewritten,
             token_ty,
@@ -200,6 +203,13 @@ impl Session {
                 .map(|p| p.prepared.sql.clone())
                 .unwrap_or_default(),
             _ => String::new(),
+        };
+        self.statement_revision = match &msg {
+            Frontend::Bind { statement, .. } => self.prepared.get(statement).and_then(|p| p.policy_revision.clone()),
+            Frontend::Execute { portal, .. } => self.portals.get(portal).and_then(|p| p.prepared.policy_revision.clone()),
+            Frontend::Describe { kind: b'S', name } => self.prepared.get(name).and_then(|p| p.policy_revision.clone()),
+            Frontend::Describe { kind: b'P', name } => self.portals.get(name).and_then(|p| p.prepared.policy_revision.clone()),
+            _ => None,
         };
         let result = self.ext_request(msg);
         match result {
@@ -415,7 +425,7 @@ impl Session {
                         let (domain, _) = p.plan.tokenize.as_ref().ok_or_else(protocol)?;
                         let ty = p.token_ty.as_ref().ok_or_else(protocol)?;
                         let settings = p.policy.domains.get(domain).ok_or_else(protocol)?;
-                        self.record_tokenization(domain)?;
+                        self.record_tokenization(&p.policy, domain)?;
                         self.ctx
                             .metrics
                             .statements_allowed

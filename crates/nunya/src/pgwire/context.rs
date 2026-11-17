@@ -2,7 +2,7 @@
 use super::upstream::UpstreamConfig;
 use crate::{
     dialect::pg::PgLowering,
-    error::NyCode,
+    error::{NyCode, Refusal},
     policy::Policy,
     readlog::ReadLog,
     schema::Snapshot,
@@ -68,6 +68,8 @@ pub struct GatewayContext {
     pub route: crate::state::model::RouteId,
     /// Reloadable policy.
     pub policy: RwLock<Arc<Policy>>,
+    /// Revision of the currently installed policy.
+    pub policy_revision: RwLock<Option<String>>,
     /// Reloadable schema snapshot.
     pub snapshot: RwLock<Arc<Snapshot>>,
     /// Root token encryption key.
@@ -92,4 +94,18 @@ pub struct GatewayContext {
     pub tls: Option<Arc<rustls::ServerConfig>>,
     /// Whether unencrypted agent connections are permitted.
     pub allow_plaintext: bool,
+}
+
+impl GatewayContext {
+    /// Capture the policy and its revision in one consistent read.
+    pub fn policy_snapshot(&self) -> Result<(Arc<Policy>, Option<String>), Refusal> {
+        // Lock order: policy guard, then revision; writers retain the policy write guard.
+        let policy = self.policy.read().map_err(|_| {
+            Refusal::new(NyCode::ProtocolNotAllowed, "policy unavailable")
+        })?;
+        let revision = self.policy_revision.read().map_err(|_| {
+            Refusal::new(NyCode::ProtocolNotAllowed, "policy unavailable")
+        })?;
+        Ok((policy.clone(), revision.clone()))
+    }
 }

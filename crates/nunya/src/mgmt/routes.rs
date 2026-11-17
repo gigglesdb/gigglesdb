@@ -744,9 +744,16 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
             let policy_revisions: serde_json::Map<String, Value> = route_ids.iter()
                 .map(|route| (route.clone(), json!(ctx.status.policy_revision(route))))
                 .collect();
-            json!({"deployment_id":data_encoding::HEXLOWER.encode(&ctx.authority.deployment_id()),
+            let legacy = policy_revisions.values().next().filter(|first| {
+                first.is_string() && (policy_revisions.len() == 1 || policy_revisions.values().all(|value| value == *first))
+            }).cloned();
+            let mut status = json!({"deployment_id":data_encoding::HEXLOWER.encode(&ctx.authority.deployment_id()),
             "store_format":ctx.authority.store_format_version(), "route_ids":route_ids,
-            "policy_revisions":policy_revisions, "config_revision":ctx.status.config_revision()})
+            "policy_revisions":policy_revisions, "config_revision":ctx.status.config_revision()});
+            if let Some(revision) = legacy {
+                status["policy_revision"] = revision;
+            }
+            status
         }
         Renew(_)
         | Revoke(_)
