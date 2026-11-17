@@ -5,7 +5,7 @@ use super::coordinator::{
     CommitError, CommitPlan, Participant, commit_cross_range,
     deadlock::{DeadlockConfig, DeadlockDetector, DetectorHandle, LocalLocks},
 };
-use super::read::{RoutedKvRead, range_space};
+use super::read::{RoutedKvRead, past_end, range_space};
 use super::xact::{Lookup, XactRecord, read_record, xact_key};
 use crate::range_api::{
     ClusterTxnId, DeadlockProbe, Epoch, GatewayPeer, GatewayService, LeaseKind, LockRequest,
@@ -17,13 +17,16 @@ use crate::storage::engine::{
     hlc::Ts,
     kv::{Keyspace, KvError, KvRead},
     locks::{LockConfig, LockManager, LockMode, TxnId},
+    ssi_validate::{ValidationConfig, Validator},
     txn::{
-        ClusterCommit, ClusterServices, Isolation, LatestVersion, SerializationReason, TxnError,
+        ClusterCommit, ClusterServices, Isolation, LatestVersion, ReadSet, SerializationReason,
+        TxnError,
     },
     xact::XactStatus,
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    ops::Bound,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
@@ -87,6 +90,9 @@ struct TxnState {
     /// Lock generation of the grants held in each range (design.md Changes 10:40Z): passed to
     /// commit and prepare, which refuse it once the range's lock table changed.
     generations: HashMap<RangeId, u64>,
+    /// The epoch of the descriptor each range granted its first lock under (a SERIALIZABLE
+    /// commit prepares lock-only ranges at it, R5-71).
+    epochs: HashMap<RangeId, Epoch>,
     /// Tables with a Shared writer sentinel: taken lazily in each range written.
     shared_sentinels: BTreeSet<u64>,
     /// (table, range) pairs where a sentinel is held (either mode).
@@ -420,12 +426,25 @@ impl ClusterTxnServices {
                 state.waiting = Some(WaitSite::Range(descriptor.id));
             });
             let slice = now_ms(deadline).min(self.config.lock_slice.as_millis() as u64);
+            // A gap lock asks each range for the part of its interval that range holds.
+            let target = match &target {
+                LockTarget::Interval { space, start, end } => {
+                    let (start, end) =
+                        clip_interval(&descriptor, *space, start, end).ok_or(TxnError::Misuse)?;
+                    LockTarget::Interval {
+                        space: *space,
+                        start,
+                        end,
+                    }
+                }
+                other => other.clone(),
+            };
             let result = self.client.lock(LockRequest {
                 range: descriptor.id,
                 epoch: descriptor.epoch,
                 txn: ClusterTxnId(txn.0),
                 priority,
-                target: target.clone(),
+                target,
                 mode,
                 timeout_ms: Some(slice),
             });
@@ -435,6 +454,10 @@ impl ClusterTxnServices {
                     // A second generation from one range means earlier locks there were lost:
                     // the transaction aborts without trying to commit (design.md 10:40Z (b)).
                     let lost = self.state(txn, |state| {
+                        state
+                            .epochs
+                            .entry(descriptor.id)
+                            .or_insert(descriptor.epoch);
                         let held = *state
                             .generations
                             .entry(descriptor.id)
@@ -549,6 +572,74 @@ impl ClusterTxnServices {
     /// generation only where they write, so a leader change on a lock-only range would
     /// otherwise go unseen. A range that no longer knows the transaction, or cannot be
     /// reached, aborts it (40001); its locks may be gone.
+    /// R5-71/R5-72: a SERIALIZABLE writer read at its snapshot. At commit it takes Shared locks
+    /// over what it read of Rows and Index, range by range in key order, then reads again at a
+    /// timestamp taken after the last grant: a version newer than the snapshot fails 40001.
+    /// Under those locks no other commit changes what it read until it ends, so its reads hold
+    /// at its commit timestamp and committed SERIALIZABLE writers serialize in commit-timestamp
+    /// order. A wait that ends in a deadlock is a serialization failure (40001) here.
+    fn validate_reads(&self, txn: TxnId, reads: ReadSet, snapshot: Ts) -> Result<(), TxnError> {
+        let data = |ks: &Keyspace| matches!(ks, Keyspace::Rows | Keyspace::Index);
+        let reads = ReadSet {
+            points: reads
+                .points
+                .into_iter()
+                .filter(|(ks, _)| data(ks))
+                .collect(),
+            ranges: reads.ranges.into_iter().filter(|r| data(&r.ks)).collect(),
+        };
+        let mut targets: Vec<(Vec<u8>, LockTarget)> = Vec::new();
+        for (ks, key) in &reads.points {
+            let space = range_space(*ks).ok_or(TxnError::Misuse)?;
+            targets.push((
+                range_key(space, key),
+                LockTarget::Key {
+                    space,
+                    key: key.clone(),
+                },
+            ));
+        }
+        targets.sort_by(|a, b| a.0.cmp(&b.0));
+        let shared = |rk: &[u8], target: LockTarget| {
+            self.lock_in_range(txn, rk, target, RangeLockMode::Shared, None, &|| false)
+                .map(|(descriptor, _)| descriptor)
+                .map_err(|error| match error {
+                    TxnError::Deadlock => {
+                        TxnError::Serialization(SerializationReason::ReadWriteConflict)
+                    }
+                    other => other,
+                })
+        };
+        for (rk, target) in targets {
+            shared(&rk, target)?;
+        }
+        // R5-72: each scanned interval (to its last key read, or to its end bound when the
+        // scan ran out, which covers the gap after the last key) is gap-locked in every range
+        // it spans, so no insert, update or delete can land inside it before this ends.
+        for range in &reads.ranges {
+            let space = range_space(range.ks).ok_or(TxnError::Misuse)?;
+            let mut route = match &range.start {
+                Bound::Included(key) | Bound::Excluded(key) => range_key(space, key),
+                Bound::Unbounded => range_key(space, &[]),
+            };
+            loop {
+                let target = LockTarget::Interval {
+                    space,
+                    start: range.start.clone(),
+                    end: range.end.clone(),
+                };
+                let descriptor = shared(&route, target)?;
+                match descriptor.end {
+                    Some(next) if !past_end(space, &next, &range.end) => route = next,
+                    _ => break,
+                }
+            }
+        }
+        let at = Ts(self.oracle()?.0);
+        let reader = RoutedKvRead::new(self.client.clone(), at, self.config.page_bytes);
+        Validator::new(reads, ValidationConfig::default()).validate_kv(&reader, snapshot)
+    }
+
     fn check_lock_only(&self, txn: TxnId, written: &[Participant]) -> Result<(), TxnError> {
         let ranges: Vec<RangeId> = self.state(txn, |state| {
             state
@@ -591,6 +682,60 @@ impl ClusterTxnServices {
             }
         }
     }
+}
+
+/// The part of the user-key interval [start, end] of `space` inside `desc`, if they meet.
+/// Range bounds are whole user keys or id prefixes (design.md Changes, Track A (g)).
+fn clip_interval(
+    desc: &RangeDescriptor,
+    space: RangeSpace,
+    start: &Bound<Vec<u8>>,
+    end: &Bound<Vec<u8>>,
+) -> Option<(Bound<Vec<u8>>, Bound<Vec<u8>>)> {
+    let tag = space.tag();
+    let lo = match desc.start.split_first() {
+        None => Bound::Unbounded,
+        Some((&t, _)) if t < tag => Bound::Unbounded,
+        Some((&t, _)) if t > tag => return None,
+        Some((_, [])) => Bound::Unbounded,
+        Some((_, user)) => Bound::Included(user.to_vec()),
+    };
+    let hi = match desc.end.as_deref().map(<[u8]>::split_first) {
+        None => Bound::Unbounded,
+        Some(None) => return None,
+        Some(Some((&t, _))) if t < tag => return None,
+        Some(Some((&t, _))) if t > tag => Bound::Unbounded,
+        Some(Some((_, []))) => return None,
+        Some(Some((_, user))) => Bound::Excluded(user.to_vec()),
+    };
+    let key = |b: &Bound<Vec<u8>>| match b {
+        Bound::Included(k) | Bound::Excluded(k) => Some(k.clone()),
+        Bound::Unbounded => None,
+    };
+    // The tighter lower bound: the larger key; Excluded wins a tie.
+    let start = match (key(start), key(&lo)) {
+        (None, _) => lo,
+        (_, None) => start.clone(),
+        (Some(a), Some(b)) if a > b || (a == b && matches!(start, Bound::Excluded(_))) => {
+            start.clone()
+        }
+        _ => lo,
+    };
+    // The tighter upper bound: the smaller key; Excluded wins a tie.
+    let end = match (key(end), key(&hi)) {
+        (None, _) => hi,
+        (_, None) => end.clone(),
+        (Some(a), Some(b)) if a < b || (a == b && matches!(end, Bound::Excluded(_))) => end.clone(),
+        _ => hi,
+    };
+    let empty = match (&start, &end) {
+        (Bound::Included(a), Bound::Included(b)) => a > b,
+        (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => {
+            a >= b
+        }
+        _ => false,
+    };
+    (!empty).then_some((start, end))
 }
 
 impl Drop for ClusterTxnServices {
@@ -703,9 +848,16 @@ impl ClusterServices for ClusterTxnServices {
     }
     fn commit(&self, txn: TxnId, mut commit: ClusterCommit) -> Result<Ts, TxnError> {
         self.check_live(txn)?;
-        if commit.isolation == Isolation::Serializable {
-            // SERIALIZABLE in a cluster is Phase 8 (shared and gap locks).
-            return Err(TxnError::Unsupported);
+        let serializable = commit.isolation == Isolation::Serializable;
+        if serializable {
+            let reads = commit.reads.take().unwrap_or_default();
+            // R5-70: a read-only SERIALIZABLE transaction read one snapshot. Every SERIALIZABLE
+            // writer validates its reads under shared locks (below), so committed writers are
+            // serializable in commit-timestamp order and a snapshot sees a prefix of that order.
+            if commit.writes.is_empty() && commit.raw.is_empty() {
+                return Ok(commit.snapshot);
+            }
+            self.validate_reads(txn, reads, commit.snapshot)?;
         }
         let mut marker_xid = None;
         let mut dropped_counters = Vec::new();
@@ -747,6 +899,35 @@ impl ClusterServices for ClusterTxnServices {
                     lock_generation: self
                         .state(txn, |state| state.generations.get(&descriptor.id).copied()),
                 }),
+            }
+        }
+        if serializable {
+            // R5-71: ranges where the transaction holds only shared locks prepare too, so those
+            // locks are replicated with the prepared record and held until the decision; a
+            // lost lock table refuses the prepare (lock generation).
+            let held: Vec<(RangeId, Epoch, u64)> = self.state(txn, |state| {
+                let mut held: Vec<_> = state
+                    .generations
+                    .iter()
+                    .filter_map(|(range, generation)| {
+                        state
+                            .epochs
+                            .get(range)
+                            .map(|epoch| (*range, *epoch, *generation))
+                    })
+                    .collect();
+                held.sort();
+                held
+            });
+            for (range, epoch, generation) in held {
+                if !groups.iter().any(|p| p.range == range) {
+                    groups.push(Participant {
+                        range,
+                        epoch,
+                        writes: Vec::new(),
+                        lock_generation: Some(generation),
+                    });
+                }
             }
         }
         self.check_lock_only(txn, &groups)?;

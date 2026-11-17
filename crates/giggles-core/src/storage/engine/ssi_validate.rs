@@ -167,6 +167,13 @@ impl Validator {
         if intersects {
             return Err(conflict());
         }
+        self.validate_kv(kv, snapshot)
+    }
+    /// Fails when `kv` holds a version newer than `snapshot` of any key read: every raw
+    /// version of each point and range, tombstones included. A cluster gateway calls it with
+    /// a reader at a timestamp taken after its shared locks over the read set were granted
+    /// (GD-0075 R5-71), where the reader serves each key's newest version at or below it.
+    pub(crate) fn validate_kv(&self, kv: &dyn KvRead, snapshot: Ts) -> Result<(), TxnError> {
         let mut examined = 0usize;
         for (ks, space) in &self.spaces {
             for key in &space.points {

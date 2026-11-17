@@ -225,6 +225,9 @@ pub(crate) trait ClusterServices: Send + Sync {
 pub(crate) struct ClusterCommit {
     pub(crate) isolation: Isolation,
     pub(crate) snapshot: Ts,
+    /// SERIALIZABLE only: what the transaction read at `snapshot`, validated under shared
+    /// locks at commit (GD-0075 R5-71/R5-72).
+    pub(crate) reads: Option<ReadSet>,
     pub(crate) writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
     pub(crate) features_or: u64,
     pub(crate) raw: Vec<RawOp>,
@@ -1122,6 +1125,8 @@ impl Transaction {
                 ClusterCommit {
                     isolation: self.isolation,
                     snapshot,
+                    reads: (self.isolation == Isolation::Serializable)
+                        .then(|| std::mem::take(&mut self.reads)),
                     writes: std::mem::take(&mut self.writes),
                     features_or: self.features_or,
                     raw: std::mem::take(&mut self.raw),

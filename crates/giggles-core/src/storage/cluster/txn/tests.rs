@@ -347,12 +347,13 @@ fn a_grant_from_a_new_lock_table_aborts_before_commit() {
 }
 
 #[test]
-fn serializable_and_transactional_counters_are_unsupported_in_a_cluster() {
+fn serializable_commits_and_transactional_counters_are_unsupported_in_a_cluster() {
     let cluster = cluster();
     let gw = services(&cluster, ClusterConfig::default());
+    // GD-0075 R5-70/R5-71: SERIALIZABLE runs in a cluster.
     let mut txn = begin(&gw, Isolation::Serializable);
     put_row(&mut txn, 10, b"a", b"x");
-    assert_eq!(txn.commit().unwrap_err(), TxnError::Unsupported);
+    txn.commit().unwrap();
     let mut txn = begin(&gw, Isolation::ReadCommitted);
     let mut key = vec![2];
     key.extend_from_slice(&[0; 24]);

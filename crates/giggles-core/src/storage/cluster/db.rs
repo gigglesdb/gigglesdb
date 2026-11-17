@@ -13,6 +13,8 @@ use crate::storage::{Admin, Backend, Limits, v2::V2Db};
 #[cfg(test)]
 pub(crate) mod local;
 #[cfg(test)]
+mod serializable_tests;
+#[cfg(test)]
 mod tests;
 
 /// A gateway: its SQL admin and its transaction services (for the peer dispatcher).

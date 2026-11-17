@@ -255,7 +255,7 @@ fn upper_route(space: RangeSpace, end: &Bound<Vec<u8>>) -> Vec<u8> {
 }
 
 /// Whether a range starting at `range_start` holds no key of `space` within `end`.
-fn past_end(space: RangeSpace, range_start: &[u8], end: &Bound<Vec<u8>>) -> bool {
+pub(super) fn past_end(space: RangeSpace, range_start: &[u8], end: &Bound<Vec<u8>>) -> bool {
     match end {
         Bound::Included(key) => range_start > range_key(space, key).as_slice(),
         Bound::Excluded(key) => range_start >= range_key(space, key).as_slice(),
