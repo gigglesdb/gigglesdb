@@ -1758,13 +1758,19 @@ impl Session {
         // E939: collect every child dependency before table-free/routine classification.
         // Routine/sequence authority and classification keep their existing gates.
         let read_tables = p.authorization_tables().map_err(CoreError::Sql)?;
+        let write_tables = p.write_tables();
         let update_table = p.authorization_update_table();
+        let relation_free_plan = p.is_planner_statement()
+            && read_tables.is_empty()
+            && write_tables.is_empty();
+        // Planner writes must reach the per-table read/write requirements below.
+        let modifying_plan = p.is_planner_statement() && !write_tables.is_empty();
         let joined_read = !read_tables.is_empty()
             && matches!(p.command(), "SELECT" | "EXPLAIN")
-            && p.table() == Some("giggles_join");
+            && p.is_multi_source_read();
         let allowed = if matches!(&self.role, Role::Application { .. }) && !p.is_ddl() {
             match p.table() {
-                Some("giggles_join") => joined_read,
+                Some(_) if p.is_multi_source_read() => joined_read || relation_free_plan || modifying_plan,
                 Some(table) => self.table_requirements_allowed(
                     &[(table.to_owned(), roles::TablePrivilege::Select)],
                     false,
@@ -1812,8 +1818,8 @@ impl Session {
                         .map_err(|_| CoreError::Policy(Error::Scope))?
                         .contains(&roles::SchemaPrivilege::Create)
             } else if let Some(table) = p.table() {
-                if table == "giggles_join" {
-                    joined_read
+                if p.is_multi_source_read() {
+                    joined_read || relation_free_plan || modifying_plan
                 } else {
                     let privilege = match p.command() {
                         "SELECT" | "EXPLAIN" => Some(roles::TablePrivilege::Select),
@@ -1847,7 +1853,7 @@ impl Session {
             if let Some(table) = update_table {
                 reqs.push((table.to_owned(), roles::TablePrivilege::Update));
             }
-            for (table, command) in p.write_tables() {
+            for (table, command) in write_tables {
                 let privilege = match command {
                     "INSERT" => roles::TablePrivilege::Insert,
                     "UPDATE" => roles::TablePrivilege::Update,

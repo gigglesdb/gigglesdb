@@ -2624,6 +2624,14 @@ impl Prepared {
             _ => None,
         }
     }
+    /// Whether this statement uses the relational planner.
+    pub fn is_planner_statement(&self) -> bool {
+        matches!(self.statement, Statement::Plan(_))
+    }
+    /// Whether authorization must use the individual sources of a query or plan.
+    pub fn is_multi_source_read(&self) -> bool {
+        self.is_planner_statement() || self.table() == Some("giggles_join")
+    }
     /// A concrete single relation target for storage locking and lookup.
     /// Planner statements expose an authorization marker through `table()`;
     /// their actual relations come from `read_tables()` and `write_tables()`.

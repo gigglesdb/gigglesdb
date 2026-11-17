@@ -10,7 +10,7 @@ use rcgen::{
 };
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -69,6 +69,27 @@ impl Protocol {
             .await
             .unwrap_or_else(|e| panic!("{self:?}: {sql}: {e}"));
     }
+    async fn integers(self, client: &Client, sql: &str) -> Vec<i32> {
+        match self {
+            Self::Simple => client
+                .simple_query(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{self:?}: {sql}: {e}"))
+                .into_iter()
+                .filter_map(|message| match message {
+                    SimpleQueryMessage::Row(row) => Some(row.get(0).unwrap().parse().unwrap()),
+                    _ => None,
+                })
+                .collect(),
+            Self::Extended => client
+                .query(sql, &[])
+                .await
+                .unwrap_or_else(|e| panic!("{self:?}: {sql}: {e}"))
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect(),
+        }
+    }
     async fn error(self, client: &Client, sql: &str, expected: &str) {
         let error = self.execute(client, sql).await.unwrap_err();
         assert_eq!(
@@ -113,6 +134,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_tables(&["items"]).await
+    }
+    async fn with_tables(tables: &[&str]) -> Self {
         // Require the task environment rather than silently placing durable fixtures in user TEMP.
         let root = std::path::PathBuf::from(
             std::env::var_os("TEMP").expect("set task TEMP under J:/gigglesdb-work"),
@@ -153,7 +177,7 @@ impl Fixture {
                 fingerprint: tls::fingerprint(app.cert.der()),
                 role: Role::Application {
                     domain: admin.authority_metadata().unwrap().0.to_string(),
-                    tables: BTreeSet::from(["items".into()]),
+                    tables: tables.iter().map(|table| (*table).to_owned()).collect(),
                 },
             }],
             Clock::new(0, 3600).unwrap(),
@@ -207,6 +231,44 @@ impl Fixture {
             Err(error) => error,
         };
         assert_eq!(error.code().unwrap().code(), "28P01");
+    }
+    async fn connect_application(&self) -> (Running, Client) {
+        let server_tls = tls::server(
+            vec![self.server.cert.der().clone()],
+            PrivatePkcs8KeyDer::from(self.server.key.serialize_der()).into(),
+            vec![self.ca.cert.der().clone()],
+        )
+        .unwrap();
+        let agent = serve_pg(
+            "127.0.0.1:0".parse().unwrap(),
+            self.service.clone(),
+            server_tls,
+            8,
+        )
+        .await
+        .unwrap();
+        let client_tls = tls::client(
+            vec![self.app.cert.der().clone()],
+            PrivatePkcs8KeyDer::from(self.app.key.serialize_der()).into(),
+            vec![self.ca.cert.der().clone()],
+        )
+        .unwrap();
+        let mut config = Config::new();
+        config
+            .host("localhost")
+            .hostaddr(agent.address.ip())
+            .port(agent.address.port())
+            .user("giggles")
+            .dbname("giggles")
+            .ssl_mode(SslMode::Require);
+        let (app, connection) = config
+            .connect(MakeRustlsConnect::new((*client_tls).clone()))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        (agent, app)
     }
 }
 
@@ -337,6 +399,257 @@ async fn mutation_column_privileges_match_pg18_simple_and_extended() {
     }
 }
 
+// Verified against PostgreSQL 18.6 with an unprivileged role and an owner-only table.
+#[tokio::test]
+async fn relation_free_plans_need_no_table_privileges_simple_and_extended() {
+    let f = Fixture::new().await;
+    let owner = f.connect("owner", "owner-pw").await;
+    owner
+        .simple_query("CREATE ROLE alice LOGIN PASSWORD 'alice-pw'")
+        .await
+        .unwrap();
+    owner
+        .simple_query("CREATE TABLE t (id INT)")
+        .await
+        .unwrap();
+    let alice = f.connect("alice", "alice-pw").await;
+    let cases: [(&str, &[i32]); 3] = [
+        ("VALUES (1)", &[1]),
+        ("SELECT 1 UNION SELECT 2", &[1, 2]),
+        ("WITH q AS (SELECT 1 AS a) SELECT a FROM q", &[1]),
+    ];
+    for protocol in [Protocol::Simple, Protocol::Extended] {
+        for (sql, expected) in cases {
+            let mut actual: Vec<i32> = match protocol {
+                Protocol::Simple => alice
+                    .simple_query(sql)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        SimpleQueryMessage::Row(row) => Some(row.get(0).unwrap().parse().unwrap()),
+                        _ => None,
+                    })
+                    .collect(),
+                Protocol::Extended => alice
+                    .query(sql, &[])
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.get(0))
+                    .collect(),
+            };
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{protocol:?}: {sql}");
+        }
+        protocol
+            .error(&alice, "SELECT id FROM t UNION SELECT 1", "42501")
+            .await;
+    }
+    // Application bindings use the same planner authorization branch.
+    let mut app = f
+        .service
+        .session(&tls::fingerprint(f.app.cert.der()))
+        .unwrap();
+    for (sql, expected) in cases {
+        let result = app.execute_sql(sql, &[]).unwrap();
+        let mut actual: Vec<_> = result
+            .rows
+            .into_iter()
+            .map(|row| match row.values.as_slice() {
+                [giggles_core::relational::Value::Int(value)] => *value,
+                values => panic!("application: {sql}: unexpected row {values:?}"),
+            })
+            .collect();
+        actual.sort_unstable();
+        let expected: Vec<_> = expected.iter().map(|value| i64::from(*value)).collect();
+        assert_eq!(actual, expected, "application: {sql}");
+    }
+    let error = app
+        .execute_sql("SELECT id FROM t UNION SELECT 1", &[])
+        .unwrap_err();
+    assert_eq!(giggles_server::sqlstate(&error), "42501");
+    drop(app);
+    drop(alice);
+    drop(owner);
+    f.pg.shutdown().await.unwrap();
+}
+
+// PostgreSQL 18.6: INNER/LEFT joins return 1 with both SELECT grants and 42501
+// without the second grant, using simple queries and psql's extended \bind.
+#[tokio::test]
+async fn existing_path_joins_require_every_table_simple_and_extended() {
+    let joins = [
+        "SELECT a.id FROM a JOIN b ON a.id = b.id",
+        "SELECT a.id FROM a LEFT JOIN b ON a.id = b.id",
+    ];
+    for both_tables in [true, false] {
+        let tables: &[&str] = if both_tables { &["a", "b"] } else { &["a"] };
+        let f = Fixture::with_tables(tables).await;
+        let owner = f.connect("owner", "owner-pw").await;
+        for sql in [
+            "CREATE TABLE a (id INT)",
+            "CREATE TABLE b (id INT)",
+            "INSERT INTO a VALUES (1)",
+            "INSERT INTO b VALUES (1)",
+            "CREATE ROLE alice LOGIN PASSWORD 'alice-pw'",
+            "GRANT SELECT ON a TO alice",
+        ] {
+            owner.simple_query(sql).await.unwrap();
+        }
+        if both_tables {
+            owner
+                .simple_query("GRANT SELECT ON b TO alice")
+                .await
+                .unwrap();
+        }
+        let alice = f.connect("alice", "alice-pw").await;
+        let (agent, app) = f.connect_application().await;
+        for protocol in [Protocol::Simple, Protocol::Extended] {
+            for (role, client) in [("database", &alice), ("application", &app)] {
+                for sql in joins {
+                    if !both_tables {
+                        protocol.error(client, sql, "42501").await;
+                        continue;
+                    }
+                    let actual: Vec<i32> = match protocol {
+                        Protocol::Simple => client
+                            .simple_query(sql)
+                            .await
+                            .unwrap()
+                            .into_iter()
+                            .filter_map(|message| match message {
+                                SimpleQueryMessage::Row(row) => {
+                                    Some(row.get(0).unwrap().parse().unwrap())
+                                }
+                                _ => None,
+                            })
+                            .collect(),
+                        Protocol::Extended => client
+                            .query(sql, &[])
+                            .await
+                            .unwrap()
+                            .into_iter()
+                            .map(|row| row.get(0))
+                            .collect(),
+                    };
+                    assert_eq!(actual, [1], "{role}: {protocol:?}: {sql}");
+                }
+            }
+        }
+        drop(app);
+        drop(alice);
+        drop(owner);
+        agent.shutdown().await.unwrap();
+        f.pg.shutdown().await.unwrap();
+    }
+}
+
+// PostgreSQL 18.6, simple and extended: WHERE/RETURNING columns need SELECT;
+// constant RETURNING needs only DELETE. The planner currently requires a SELECT
+// main statement, so the INSERT is a second CTE (whose RETURNING also needs SELECT).
+#[tokio::test]
+async fn modifying_with_requires_read_and_write_privileges_simple_and_extended() {
+    let delete = "WITH d AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT id FROM d";
+    let constant = "WITH d AS (DELETE FROM t RETURNING 1 AS id) SELECT id FROM d";
+    let transfer = "WITH d AS (DELETE FROM t WHERE id = 2 RETURNING id), a AS (INSERT INTO t2 SELECT id FROM d RETURNING id) SELECT id FROM a";
+    for protocol in [Protocol::Simple, Protocol::Extended] {
+        let f = Fixture::new().await;
+        let owner = f.connect("owner", "owner-pw").await;
+        for sql in [
+            "CREATE TABLE t (id INT)",
+            "CREATE TABLE t2 (id INT)",
+            "INSERT INTO t VALUES (1), (2)",
+            "CREATE ROLE alice LOGIN PASSWORD 'alice-pw'",
+        ] {
+            protocol.ok(&owner, sql).await;
+        }
+        let alice = f.connect("alice", "alice-pw").await;
+        protocol.error(&alice, constant, "42501").await;
+        protocol.ok(&owner, "GRANT DELETE ON t TO alice").await;
+        protocol.ok(&alice, "BEGIN").await;
+        assert_eq!(protocol.integers(&alice, constant).await, [1, 1]);
+        protocol.ok(&alice, "ROLLBACK").await;
+        protocol.error(&alice, delete, "42501").await;
+        protocol.ok(&owner, "GRANT SELECT ON t TO alice").await;
+        protocol.ok(&alice, "BEGIN").await;
+        assert_eq!(protocol.integers(&alice, delete).await, [1]);
+        protocol.ok(&alice, "ROLLBACK").await;
+        protocol.ok(&owner, "REVOKE DELETE ON t FROM alice").await;
+        protocol.error(&alice, delete, "42501").await;
+        protocol.ok(&owner, "GRANT DELETE ON t TO alice").await;
+        protocol.ok(&owner, "GRANT INSERT ON t2 TO alice").await;
+        protocol.error(&alice, transfer, "42501").await;
+        protocol.ok(&owner, "GRANT SELECT ON t2 TO alice").await;
+        protocol.ok(&alice, "BEGIN").await;
+        assert_eq!(protocol.integers(&alice, transfer).await, [2]);
+        protocol.ok(&alice, "ROLLBACK").await;
+        protocol.ok(&owner, "REVOKE INSERT ON t2 FROM alice").await;
+        protocol.error(&alice, transfer, "42501").await;
+        assert_eq!(
+            protocol.integers(&owner, "SELECT id FROM t ORDER BY id").await,
+            [1, 2]
+        );
+        assert!(protocol.integers(&owner, "SELECT id FROM t2").await.is_empty());
+        drop(alice);
+        drop(owner);
+        f.pg.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn modifying_with_application_scope_covers_all_tables_simple_and_extended() {
+    let delete = "WITH d AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT id FROM d";
+    let constant = "WITH d AS (DELETE FROM t RETURNING 1 AS id) SELECT id FROM d";
+    let transfer = "WITH d AS (DELETE FROM t WHERE id = 2 RETURNING id), a AS (INSERT INTO t2 SELECT id FROM d RETURNING id) SELECT id FROM a";
+    for tables in [&["outside"][..], &["t"][..], &["t2"][..], &["t", "t2"][..]] {
+        let f = Fixture::with_tables(tables).await;
+        let owner = f.connect("owner", "owner-pw").await;
+        for sql in [
+            "CREATE TABLE t (id INT)",
+            "CREATE TABLE t2 (id INT)",
+            "INSERT INTO t VALUES (1), (2)",
+        ] {
+            owner.simple_query(sql).await.unwrap();
+        }
+        let (agent, app) = f.connect_application().await;
+        for protocol in [Protocol::Simple, Protocol::Extended] {
+            for (sql, expected, allowed) in [
+                (delete, &[1][..], tables.contains(&"t")),
+                (constant, &[1, 1][..], tables.contains(&"t")),
+                (
+                    transfer,
+                    &[2][..],
+                    tables.contains(&"t") && tables.contains(&"t2"),
+                ),
+            ] {
+                if allowed {
+                    protocol.ok(&app, "BEGIN").await;
+                    assert_eq!(
+                        protocol.integers(&app, sql).await,
+                        expected,
+                        "{tables:?}: {protocol:?}: {sql}"
+                    );
+                    protocol.ok(&app, "ROLLBACK").await;
+                } else {
+                    protocol.error(&app, sql, "42501").await;
+                }
+            }
+        }
+        assert_eq!(
+            Protocol::Simple.integers(&owner, "SELECT id FROM t ORDER BY id").await,
+            [1, 2]
+        );
+        assert!(
+            Protocol::Simple.integers(&owner, "SELECT id FROM t2").await.is_empty()
+        );
+        drop(app);
+        drop(owner);
+        agent.shutdown().await.unwrap();
+        f.pg.shutdown().await.unwrap();
+    }
+}
+
 async fn passwords_and_authority(protocol: Protocol) {
     let f = Fixture::new().await;
     let owner = f.connect("owner", "owner-pw").await;
@@ -425,41 +738,7 @@ async fn application(protocol: Protocol) {
         .ok(&owner, "CREATE TABLE items (id BIGINT PRIMARY KEY)")
         .await;
     protocol.ok(&owner, "CREATE ROLE alice").await;
-    let server_tls = tls::server(
-        vec![f.server.cert.der().clone()],
-        PrivatePkcs8KeyDer::from(f.server.key.serialize_der()).into(),
-        vec![f.ca.cert.der().clone()],
-    )
-    .unwrap();
-    let agent = serve_pg(
-        "127.0.0.1:0".parse().unwrap(),
-        f.service.clone(),
-        server_tls,
-        8,
-    )
-    .await
-    .unwrap();
-    let client_tls = tls::client(
-        vec![f.app.cert.der().clone()],
-        PrivatePkcs8KeyDer::from(f.app.key.serialize_der()).into(),
-        vec![f.ca.cert.der().clone()],
-    )
-    .unwrap();
-    let mut config = Config::new();
-    config
-        .host("localhost")
-        .hostaddr(agent.address.ip())
-        .port(agent.address.port())
-        .user("giggles")
-        .dbname("giggles")
-        .ssl_mode(SslMode::Require);
-    let (app, connection) = config
-        .connect(MakeRustlsConnect::new((*client_tls).clone()))
-        .await
-        .unwrap();
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let (agent, app) = f.connect_application().await;
     protocol.error(&app, "CREATE ROLE forbidden", "42501").await;
     protocol
         .error(&app, "GRANT SELECT ON TABLE items TO alice", "42501")
