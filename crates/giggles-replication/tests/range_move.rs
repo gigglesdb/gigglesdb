@@ -384,17 +384,26 @@ fn registry_read_retries_after_system_range_move() {
     );
     stale.learn(&old);
     let expected = registry::read_all(&**nodes[0].client()).unwrap();
+    let mut system_leader = None;
+    eventually(|| {
+        system_leader = nodes
+            .iter()
+            .find(|n| n.host().service(SYSTEM_RANGE).is_some())
+            .map(ClusterNode::node_id);
+        system_leader.is_some()
+    });
+    // Keep the replacement identity stable even if leadership changes mid-move.
+    let from = MEMBERS
+        .iter()
+        .copied()
+        .find(|id| Some(*id) != system_leader)
+        .unwrap();
     let deadline = Instant::now() + READY;
     let moved = loop {
         let leader = nodes
             .iter()
             .find(|n| n.host().service(SYSTEM_RANGE).is_some());
         if let Some(leader) = leader {
-            let from = MEMBERS
-                .iter()
-                .copied()
-                .find(|id| *id != leader.node_id())
-                .unwrap();
             match move_replica(leader, SYSTEM_RANGE, from, 4, READY).unwrap() {
                 MoveOutcome::Done(desc) => break desc,
                 MoveOutcome::NotLeader { .. } => {}
