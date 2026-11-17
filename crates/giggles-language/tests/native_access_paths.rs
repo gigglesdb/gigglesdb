@@ -166,3 +166,65 @@ fn error_terms_scan_and_hook_restores_on_unwind() {
     engine.execute_text("items where id=7", &Bindings::new()).unwrap();
     assert_eq!(native_input_rows().0-before, 1);
 }
+
+#[test]
+fn secondary_index_reads_match_scan_and_sql() {
+    let (_db, admin) = Database::fresh();
+    let (_reference_db, reference) = Database::fresh();
+    for db in [&admin, &reference] {
+        sql(db, "create table users(id bigint primary key, email text unique not null, grp bigint, name text)");
+        let mut writer = db.sql_session();
+        writer.execute("begin", &[], None).unwrap();
+        for start in (0..3000).step_by(300) {
+            let tuples = (start..start+300).rev().map(|id|
+                format!("({id},'user{:04}',{},'name{}')", 2999-id, id%50, id%3)
+            ).collect::<Vec<_>>().join(",");
+            writer.execute(&format!("insert into users values{tuples}"), &[], None).unwrap();
+        }
+        writer.execute("commit", &[], None).unwrap();
+        sql(db, "create index on users(grp)");
+    }
+    let engine = engine(&admin);
+    let bindings = Bindings::from_iter([("email".into(), Value::Text("user2992".into()))]);
+    for (predicate, suffix, decoded) in [
+        ("email=$email", "", 1),
+        ("email=\"user2992\"", "", 1),
+        ("email=\"missing\"", "", 0),
+        ("grp=7", "", 60),
+        ("grp=7", "limit 3", 60),
+        ("grp=7", "order by name desc limit 4", 60),
+        ("grp>=10 and grp<12", "", 120),
+        ("grp=7 and name=\"name1\"", "", 60),
+        ("email>\"user2\"", "", 1000),
+        ("grp=7 or grp=8", "", 3000),
+        ("grp=7 and name is null", "", 3000),
+        ("grp=7 and id+0>=0", "limit 3", 3000),
+        ("7=grp", "limit 2", 60),
+        ("grp>47", "order by name limit 5", 120),
+        ("grp<=1", "limit 4", 120),
+        ("grp=7 and (name=\"name1\" or name=\"name2\")", "limit 3", 60),
+        ("grp=7 and grp=8", "", 0),
+        ("id>=7 and id<10 and grp=7", "", 3),
+    ] {
+        let text = format!("users where {predicate} {suffix}");
+        let bindings = bindings_for(&text, &bindings);
+        let before = native_input_rows().0;
+        let actual = engine.execute_text(&text, &bindings);
+        assert_eq!(native_input_rows().0-before, decoded, "{text}");
+        assert_eq!(actual, force_native_full_scan(|| engine.execute_text(&text, &bindings)), "{text}");
+        let predicate = predicate.replace("$email", "'user2992'").replace('"', "'");
+        let order = if suffix.starts_with("order") {
+            // Native resolves caller-order ties by PK, including before LIMIT.
+            suffix.replace(" limit", ",id limit")
+        } else { format!("order by id {}", if suffix.is_empty() { "limit 100" } else { suffix }) };
+        assert_eq!(values(actual.unwrap().rows), sql(&reference,
+            &format!("select * from users where {predicate} {order}")), "{text}");
+    }
+    let text = "users where grp=7 limit 3 select id+1 as next";
+    let before = native_input_rows().0;
+    let actual = engine.execute_text(text, &Bindings::new());
+    assert_eq!(native_input_rows().0-before, 60);
+    assert_eq!(actual, force_native_full_scan(|| engine.execute_text(text, &Bindings::new())));
+    assert_eq!(values(actual.unwrap().rows), sql(&reference,
+        "select id+1 as next from users where grp=7 order by id limit 3"));
+}

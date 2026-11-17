@@ -170,6 +170,48 @@ impl SqlSession {
         Ok(())
     }
 
+    pub(crate) fn native_index_access(&mut self, table: &TableDef,
+        predicates: &[(String, String, relational::Value)]) -> Result<crate::operations::NativeAccess, CoreError> {
+        let result = (|| {
+            let super::Backend::V2(db) = &self.admin.inner.backend else {
+                return Ok(crate::operations::NativeAccess::Full);
+            };
+            let txn = self.v2_transaction.as_mut().ok_or(CoreError::Sql(SqlError::Transaction))?;
+            let catalog = db.catalog().snapshot(txn)?;
+            Ok(SqlRows::index_range(&catalog.parts, table, predicates)
+                .map_or(crate::operations::NativeAccess::Full, |(d, lo, hi)| crate::operations::NativeAccess::Index(d, lo, hi)))
+        })();
+        if result.is_err() { self.abort(); }
+        result
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn visit_native_index_v2<E>(
+        &mut self, db: &Arc<v2::V2Db>, table: &TableDef,
+        range: (&relational::secondary_index::Descriptor, Bound<Vec<u8>>, Bound<Vec<u8>>),
+        visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
+    ) -> Result<(), E> {
+        let _ticket = self.admin.inner.enter_sql().map_err(map)?;
+        let txn = self.v2_transaction.as_mut().ok_or_else(|| map(CoreError::Sql(SqlError::Transaction)))?;
+        let catalog = db.catalog().snapshot(txn).map_err(map)?;
+        let entry = TableEntry {
+            primary_index_birth: catalog.parts.ext.primary_index_birth.get(&table.id).copied(),
+            def: table.clone(), heap: catalog.parts.heap.contains(&table.id), columns_ext: BTreeMap::new(),
+        };
+        // The engine callback has a CoreError signature; preserve native filter errors separately.
+        let mut error = None;
+        let result = engine::indexes::visit(txn, &entry, range.0, range.1, range.2, &mut |_, row| {
+            crate::cancellation::check()?;
+            if let Err(e) = visit(&SqlRow { values: row.values, version: row.version }) {
+                error = Some(e);
+                return Err(CoreError::Sql(SqlError::Unsupported));
+            }
+            Ok(())
+        });
+        if let Some(error) = error { return Err(error); }
+        result.map_err(map)
+    }
+
     #[cfg(feature = "engine-rocksdb")]
     pub(super) fn visit_native_key_v2<E>(
         &mut self, db: &Arc<v2::V2Db>, table: &TableDef, key: &[relational::Value],

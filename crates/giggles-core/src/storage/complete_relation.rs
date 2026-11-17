@@ -178,7 +178,24 @@ impl SqlSession {
                 return Err(map(CoreError::Sql(SqlError::Unsupported)));
             }
             let snapshot = self.complete_snapshot(table).map_err(map)?;
-            let rows = retain_native_rows(keep, bound, map, |visit| match access {
+            let indexed = matches!(access, crate::operations::NativeAccess::Index(..));
+            let sort_error = std::cell::RefCell::new(None);
+            let cmp = |a: &SqlRow, b: &SqlRow| {
+                bound.1.map_or(std::cmp::Ordering::Equal, |cmp| cmp(a, b)).then_with(|| {
+                    let key = |row: &SqlRow| {
+                        crate::storage::engine::codec::pk_bytes(
+                            &table.primary_key.iter().map(|i| row.values[*i].clone()).collect::<Vec<_>>()
+                        ).map_err(|error| *sort_error.borrow_mut() = Some(error)).ok()
+                    };
+                    key(a).cmp(&key(b))
+                })
+            };
+            let effective = (bound.0, (indexed || bound.1.is_some()).then_some(|a: &SqlRow, b: &SqlRow| {
+                if indexed { cmp(a, b) } else { bound.1.unwrap()(a, b) }
+            }));
+            let mut rows = retain_native_rows(keep, effective, map, |visit| match access {
+                crate::operations::NativeAccess::Index(d, lo, hi) =>
+                    self.visit_native_range_inner(table, lo.clone(), hi.clone(), Some(d), &mut |row| visit(row), map),
                 crate::operations::NativeAccess::Keys(keys) =>
                     self.visit_native_keys(table, keys, &mut |row| visit(row), map),
                 crate::operations::NativeAccess::Range(lo, hi) =>
@@ -186,6 +203,10 @@ impl SqlSession {
                 crate::operations::NativeAccess::Empty => self.visit_native_keys(table, &[], &mut |row| visit(row), map),
                 crate::operations::NativeAccess::Full => self.visit_native_page(table, &mut |row| visit(row), map),
             })?;
+            if indexed { rows.sort_by(cmp); }
+            if let Some(error) = sort_error.into_inner() {
+                return Err(map(error.into()));
+            }
             Ok(CompleteRelation { snapshot, rows })
         })();
         if result.is_err() {
@@ -322,6 +343,16 @@ impl SqlSession {
         lo: std::ops::Bound<Vec<u8>>, hi: std::ops::Bound<Vec<u8>>,
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
     ) -> Result<(), E> {
+        self.visit_native_range_inner(table, lo, hi, None, visit, map)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit_native_range_inner<E>(
+        &mut self, table: &TableDef,
+        lo: std::ops::Bound<Vec<u8>>, hi: std::ops::Bound<Vec<u8>>,
+        index: Option<&crate::relational::secondary_index::Descriptor>,
+        visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
+    ) -> Result<(), E> {
         let snapshot = self.complete_snapshot(table).map_err(map)?;
         let scope = self.native_task_scope(table).map_err(map)?;
         let meter = StatementMeter::default();
@@ -329,12 +360,14 @@ impl SqlSession {
         #[cfg(feature = "engine-rocksdb")]
         let visited = if let super::Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
-            self.visit_native_range_v2(&db, table, lo, hi, visit, map)
+            if let Some(index) = index {
+                self.visit_native_index_v2(&db, table, (index, lo, hi), visit, map)
+            } else { self.visit_native_range_v2(&db, table, lo, hi, visit, map) }
         } else {
             self.visit_native_page_legacy(table, visit, map)
         };
         #[cfg(not(feature = "engine-rocksdb"))]
-        let _ = (lo, hi);
+        let _ = (lo, hi, index);
         #[cfg(not(feature = "engine-rocksdb"))]
         let visited = self.visit_native_page_legacy(table, visit, map);
         if scope.is_some() {

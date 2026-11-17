@@ -2499,8 +2499,8 @@ fn run_complete(
         let access = if FORCE_NATIVE_FULL_SCAN.get() {
             NativeAccess::Full
         } else {
-            native_access(table, &filter, matches!(operation,
-                Operation::Read { .. } | Operation::ReadExpressions { .. }))
+            native_access(session, table, &filter, matches!(operation,
+                Operation::Read { .. } | Operation::ReadExpressions { .. })).map_err(input_error)?
         };
         // Only the rows the result can depend on are retained. A read keeps
         // its top `limit` rows (it counts every match); a write with a
@@ -2647,8 +2647,38 @@ pub(crate) enum NativeAccess {
     Keys(Vec<Vec<Value>>),
     Range(std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>),
     Empty,
+    Index(crate::relational::secondary_index::Descriptor, std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>),
 }
-fn native_access(table: &TableDef, filter: &Bound, reading: bool) -> NativeAccess {
+/// Only mandatory conjuncts can narrow an index visit; OR arms are residuals.
+fn native_access(session: &mut SqlSession, table: &TableDef, filter: &Bound, reading: bool)
+    -> std::result::Result<NativeAccess, CoreError>
+{
+    let primary = primary_native_access(table, filter, reading);
+    if !matches!(primary, NativeAccess::Full) || !reading || !total_filter(table, filter)
+        || table.primary_key.is_empty() || table.hidden_rowid().is_some() {
+        return Ok(primary);
+    }
+    // Index visits restore physical PK order before applying LIMIT. Temporal
+    // keys have no pk_bytes encoding, so preserve the full-scan fallback.
+    if table.primary_key.iter().any(|index| matches!(table.columns[*index].data_type,
+        DataType::Date | DataType::Time | DataType::TimeTz | DataType::Timestamp
+        | DataType::TimestampTz | DataType::Interval)) {
+        return Ok(NativeAccess::Full);
+    }
+    let mut predicates = Vec::new();
+    let mut pending = vec![filter];
+    while let Some(term) = pending.pop() {
+        if let Bound::And(a, b) = term { pending.extend([a.as_ref(), b.as_ref()]); continue; }
+        let Some((i, op, value)) = literal_comparison(term) else { continue };
+        let op = match op {
+            Compare::Eq => "=", Compare::Gt => ">", Compare::Ge => ">=",
+            Compare::Lt => "<", Compare::Le => "<=", _ => continue,
+        };
+        predicates.push((table.columns[i].name.clone(), op.to_string(), value.clone()));
+    }
+    session.native_index_access(table, &predicates)
+}
+fn primary_native_access(table: &TableDef, filter: &Bound, reading: bool) -> NativeAccess {
     use crate::storage::engine::codec::pk_bytes;
     use std::ops::Bound as Side;
     if table.primary_key.is_empty() || table.hidden_rowid().is_some() || !total_filter(table, filter) {
