@@ -551,3 +551,55 @@ fn point_batch_falls_back_and_waits_for_open_writer() {
         assert_eq!(int(&mut sb, "SELECT count(*) FROM log"), i64::from(!commit));
     }
 }
+
+/// HD-4d: SQL equality intervals alone reach batched point validation.
+#[test]
+fn sql_primary_key_reads_use_batch_validation() {
+    for changed in [false, true] {
+        let (_cluster, a, b) = two(
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); CREATE TABLE log (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1, 0), (2, 0), (3, 0)",
+        );
+        let (mut sa, mut sb) = (a.admin.sql_session(), b.admin.sql_session());
+        begin(&mut sa, "SERIALIZABLE");
+        for id in 1..=3 {
+            assert_eq!(int(&mut sa, &format!("SELECT v FROM t WHERE id = {id}")), 0);
+        }
+        if changed {
+            ok(&mut sb, "UPDATE t SET v = 9 WHERE id = 2");
+        }
+        ok(&mut sa, "INSERT INTO log VALUES (1, 1)");
+        let result = exec(&mut sa, "COMMIT");
+        assert_eq!(a.services.batch_counts(), (1, 0));
+        if changed {
+            assert_eq!(code(result), "40001");
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            int(&mut sb, "SELECT count(*) FROM log"),
+            i64::from(!changed)
+        );
+    }
+}
+
+/// Non-point SQL ranges must still protect gaps after equality reads are converted.
+#[test]
+fn sql_primary_key_batch_preserves_range_phantoms() {
+    let (_cluster, a, b) = two(
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT); CREATE TABLE log (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (10, 0), (20, 0)",
+    );
+    let (mut sa, mut sb) = (a.admin.sql_session(), b.admin.sql_session());
+    begin(&mut sa, "SERIALIZABLE");
+    for id in 1..=3 {
+        assert_eq!(int(&mut sa, &format!("SELECT v FROM t WHERE id = {id}")), 0);
+    }
+    assert_eq!(
+        int(&mut sa, "SELECT count(*) FROM t WHERE id BETWEEN 10 AND 20"),
+        2
+    );
+    ok(&mut sb, "INSERT INTO t VALUES (15, 9)");
+    ok(&mut sa, "INSERT INTO log VALUES (1, 1)");
+    assert_eq!(code(exec(&mut sa, "COMMIT")), "40001");
+    assert_eq!(a.services.batch_counts(), (1, 0));
+    assert_eq!(int(&mut sb, "SELECT count(*) FROM log"), 0);
+}

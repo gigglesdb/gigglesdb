@@ -659,7 +659,7 @@ impl ClusterTxnServices {
         mut validation: ValidationConfig,
     ) -> Result<(), TxnError> {
         let data = |ks: &Keyspace| matches!(ks, Keyspace::Rows | Keyspace::Index);
-        let reads = ReadSet {
+        let mut reads = ReadSet {
             points: reads
                 .points
                 .into_iter()
@@ -667,6 +667,22 @@ impl ClusterTxnServices {
                 .collect(),
             ranges: reads.ranges.into_iter().filter(|r| data(&r.ks)).collect(),
         };
+        reads.ranges.retain(|range| {
+            if let (Bound::Included(start), Bound::Included(end)) = (&range.start, &range.end)
+                && start == end
+            {
+                // SQL primary-key equality scans record exactly [k, k]. A Shared Key
+                // lock conflicts with every writer of k: inserts, updates and deletes
+                // all take an Exclusive Key lock. latest_version(k) > snapshot sees
+                // exactly the newer raw versions (including tombstones) that scanning
+                // [k, k] would see. Prefixes and half-open ranges stay gap-locked.
+                // The point path charges one budget unit, even for a missing key.
+                reads.points.insert((range.ks, start.clone()));
+                false
+            } else {
+                true
+            }
+        });
         let mut targets: Vec<(Vec<u8>, LockTarget)> = Vec::new();
         for (ks, key) in &reads.points {
             let space = range_space(*ks).ok_or(TxnError::Misuse)?;
