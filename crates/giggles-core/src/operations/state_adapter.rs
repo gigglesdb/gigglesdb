@@ -241,7 +241,7 @@ pub(crate) fn execute(
     execute_inner(state, request, bindings, None)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn execute_fenced(
     state: &State,
     request: &Request,
@@ -255,15 +255,6 @@ pub(crate) fn execute_fenced(
         bindings,
         Some((description, expected_version)),
     )
-}
-/// Check the snapshot fence and request shape before binding any values.
-pub(crate) fn admit_fenced(
-    state: &State,
-    request: &Request,
-    bindings: &Bindings,
-    description: &BoundDescription,
-) -> Result<()> {
-    admit_inner(state, request, bindings, Some(description))
 }
 fn admit_inner(
     state: &State,

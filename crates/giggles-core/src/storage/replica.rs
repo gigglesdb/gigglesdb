@@ -5,9 +5,7 @@
 use super::*;
 use crate::local::{AdminCommand, Reply};
 
-pub mod application;
 pub mod protected;
-mod projected_admission;
 
 /// Opaque, validated canonical kernel image; not an export that revokes authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -77,17 +75,10 @@ pub enum Command {
         upper: u64,
         action: TaskAction,
     },
-    /// Internal application intent; claims alone confer no authority.
-    Application(application::Command),
-    /// Trusted owner input only. Never expose through a remote dispatch path.
-    ApplicationOwner(application::OwnerCommand),
 }
 impl Command {
     /// Validate the closed command grammar before it can enter a durable log.
     pub fn validate(&self) -> Result<(), CoreError> {
-        if let Self::Application(command) = self {
-            command.validate()?;
-        }
         if let Self::Admin(input) = self {
             if input.len() > local::MAX_INPUT {
                 return Err(CoreError::Limit);
@@ -153,23 +144,6 @@ impl Image {
     /// The Admin handle is constructed and destroyed here; it never escapes.
     pub fn evaluate(&self, command: &Command) -> Result<(Self, Reply), CoreError> {
         command.validate()?;
-        if let Command::Application(application) = command {
-            return match self.evaluate_application(application)? {
-                Ok((image, outcome)) => {
-                    Ok((image, Reply::ok(serde_json::to_value(outcome).map_err(io)?)))
-                }
-                Err(error) => Ok((
-                    self.clone(),
-                    Reply::ok(serde_json::to_value(error).map_err(io)?),
-                )),
-            };
-        }
-        if let Command::ApplicationOwner(owner) = command {
-            return Ok((
-                self.evaluate_application_owner(owner)?,
-                Reply::ok(serde_json::json!({"authorized": true})),
-            ));
-        }
         self.with_admin(|a| self.evaluate_admin(a, command))
     }
     // Share the real storage/Executor path with trusted protected staging.
@@ -204,9 +178,6 @@ impl Image {
     }
     fn evaluate_admin(&self, a: &Admin, command: &Command) -> Result<Reply, CoreError> {
         let reply = match command {
-            Command::Application(_) | Command::ApplicationOwner(_) => {
-                return Err(CoreError::Unsupported);
-            }
             Command::ValidateRelease {
                 task,
                 principal,
@@ -449,10 +420,5 @@ mod heap_gate_tests {
         // Deserialize can bypass Image::from_bytes; all image entry points recheck.
         let image = Image(bytes);
         assert!(matches!(image.snapshot(), Err(CoreError::Unsupported)));
-        let limits = projected_admission::SourceAdmissionLimits::default();
-        let mut budget = projected_admission::SourceBudget::new(projected_admission::SourceAdmissionLimits::default());
-        assert!(matches!(projected_admission::admit_projected_source(
-            &image, &limits, &mut budget, &mut || false
-        ), Err(CoreError::Unsupported)));
     }
 }

@@ -2,31 +2,6 @@
 # The remote gate (gate-remote-runner.sh) treats only these as expected; any other failure fails the gate.
 # Add an entry only with its reason, and remove it when the platform restriction goes.
 #
-# giggles-core: projected-admission budgets accept only Windows x86_64 MSVC type layouts
-# (projector_budget.rs layouts(), projected_admission.rs layouts() return Unsupported elsewhere).
-giggles-core storage::replica::application::partition::admitted_tests::actual_wire_formula_after_source_admission
-giggles-core storage::replica::application::partition::admitted_tests::admitted_encoded_limit_exact_and_mismatch_metadata
-giggles-core storage::replica::application::partition::admitted_tests::admitted_matches_ordinary_and_source_immutable
-giggles-core storage::replica::application::partition::admitted_tests::empty_source_row_map_uses_same_traversal
-giggles-core storage::replica::application::partition::admitted_tests::exact_object_identity_before_consume
-giggles-core storage::replica::application::partition::admitted_tests::exhausted_counters_reject_only_admitted
-giggles-core storage::replica::application::partition::admitted_tests::independent_ledgers_never_refund_on_failure
-giggles-core storage::replica::application::partition::admitted_tests::initial_mid_final_cancel_and_sticky_no_double_poll
-giggles-core storage::replica::application::partition::admitted_tests::maximum_profile_and_mismatched_small_request
-giggles-core storage::replica::application::partition::admitted_tests::original_counters_exceed_empty_projection_max
-giggles-core storage::replica::application::partition::admitted_tests::phase_and_work_n_nplus1_before_helpers
-giggles-core storage::replica::application::partition::projector_budget::tests::actual_layout_and_phase_equations
-giggles-core storage::replica::projected_admission::tests::actual_layouts
-giggles-core storage::replica::projected_admission::tests::admitted_actual_serializer_matches_checked_wire_formula
-giggles-core storage::replica::projected_admission::tests::cancellation_initial_mid_final
-giggles-core storage::replica::projected_admission::tests::canonical_trusted_admin_roundtrip
-giggles-core storage::replica::projected_admission::tests::consuming_move_cancellation
-giggles-core storage::replica::projected_admission::tests::count_and_work_exact_limits
-giggles-core storage::replica::projected_admission::tests::explicit_false_ignores_cancelled_ambient
-giggles-core storage::replica::projected_admission::tests::format_two_catalog_extension_rejected_but_base_admitted
-giggles-core storage::replica::projected_admission::tests::ledger_never_reset
-giggles-core storage::replica::projected_admission::tests::maximum_profile_trusted_admin
-#
 # giggles-server: on Linux, closing a socket with unread client data sends a TCP RST, so the
 # client gets "Connection reset by peer" before the final message (Windows delivers it).
 # Probable Linux product bug; remove once the server drains or half-closes before closing.

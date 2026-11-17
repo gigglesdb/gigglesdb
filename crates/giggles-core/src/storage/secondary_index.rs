@@ -14,12 +14,11 @@ pub(super) fn family(version: u32) -> Result<(format_policy::Features, bool, boo
 pub(super) fn gate(
     records: &BTreeMap<Vec<u8>, Vec<u8>>,
     indexed: bool,
-    applications: bool,
 ) -> Result<(), CoreError> {
     // Reject an unqualified combined family before touching either payload.
     let sidecar = records.keys().any(|k| k.first() == Some(&8));
     let ledger = records.keys().any(|k| k.first() == Some(&9));
-    if (indexed && ledger) || (applications && sidecar) || (sidecar && ledger) {
+    if (indexed && ledger) || (sidecar && ledger) {
         return Err(CoreError::Unsupported);
     }
     if indexed != records.contains_key(&vec![8]) || (!indexed && sidecar) {

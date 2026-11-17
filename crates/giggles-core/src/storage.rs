@@ -30,9 +30,10 @@ pub(crate) use engine::catalog_label_codec::UNTRUSTED_TEXT as UNTRUSTED_TEXT_LAB
 pub(crate) use engine::{catalog::CatalogParts, catalog_codec::sql_views::{SqlViewDef, SqlViewColumn, SqlViewDependency}};
 mod feature_envelope;
 mod format_policy;
+#[cfg(test)]
+mod retired_application_tests;
 mod legacy_open;
 pub(crate) mod native_once;
-pub(crate) mod operation_adapter;
 pub mod replica;
 #[cfg(feature = "engine-rocksdb")]
 pub mod replicated;
@@ -221,7 +222,6 @@ fn recovery(
 pub(crate) struct State {
     #[serde(skip)]
     pub(crate) seq: BTreeMap<u64, sequences::SeqCounter>,
-    pub applications: Option<replica::application::Ledger>,
     pub accounting: BTreeMap<TaskId, TaskAccounting>,
     pub native_outcomes: Option<native_once::NativeOutcomes>,
     pub sql: relational::Relational,
@@ -335,7 +335,6 @@ struct Metadata {
 fn empty(domain: u128) -> State {
     State {
         seq: BTreeMap::new(),
-        applications: None,
         accounting: BTreeMap::new(),
         native_outcomes: None,
         sql: Default::default(),
@@ -366,9 +365,6 @@ fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     let bits = feature_envelope::feature_bits_present(s)?;
     if format == 53 {
         out.insert(vec![10], bits.to_be_bytes().to_vec());
-    }
-    if let Some(ledger) = &s.applications {
-        out.insert(vec![9], ledger.bytes()?);
     }
     if let Some(ledger) = &s.native_outcomes {
         out.insert(vec![7], ledger.to_bytes()?);
@@ -421,9 +417,6 @@ fn state_format(s: &State) -> Result<u32, CoreError> {
 }
 fn contains_temporal(s: &State) -> Result<bool, CoreError> {
     Ok(s.sql.contains_temporal()
-        || s.applications
-            .as_ref()
-            .is_some_and(|a| a.contains_temporal())
         || match &s.native_outcomes {
             Some(n) => n.contains_temporal()?,
             None => false,
@@ -484,19 +477,19 @@ fn from_records_mode(
         None => m.format,
     };
     let (features, indexed, applications, temporal, heap) = envelope_family(legacy)?;
+    if applications {
+        return Err(CoreError::EngineUnsupported {
+            engine: "legacy records",
+            feature: RETIRED_APPLICATION_LEDGER,
+        });
+    }
     let (base_version, _) = format_policy::heap_base(legacy).ok_or(CoreError::Unsupported)?;
-    secondary_index::gate(&records, indexed, applications)?;
+    secondary_index::gate(&records, indexed)?;
     let mut s = empty(m.domain);
-    match records.get(&vec![9]) {
-        Some(v) if applications => {
-            s.applications = Some(replica::application::Ledger::from_bytes(v)?)
-        }
-        None if !applications => {}
-        _ => {
-            return Err(CoreError::Corrupt(
-                "application format/namespace mismatch".into(),
-            ));
-        }
+    if records.contains_key(&vec![9]) {
+        return Err(CoreError::Corrupt(
+            "application format/namespace mismatch".into(),
+        ));
     }
     match records.get(&vec![7]) {
         Some(v) if features.native_outcomes => {
@@ -523,7 +516,6 @@ fn from_records_mode(
     }
     if !features.typed_scalars
         && (s.sql.contains_typed()
-            || s.applications.as_ref().is_some_and(|a| a.contains_typed())
             || s.native_outcomes
                 .as_ref()
                 .is_some_and(|n| n.contains_typed().unwrap_or(true)))
@@ -556,7 +548,6 @@ fn from_records_mode(
             Some(0) if k.len() == 1 => {}
             Some(5) if k.len() == 1 => {}
             Some(7) if k.len() == 1 && features.native_outcomes => {}
-            Some(9) if k.len() == 1 && applications => {}
             Some(8) if k.len() == 1 && indexed => index_payload = Some(v),
             Some(1) if k.len() == 17 => {
                 s.view.rows.insert(
@@ -611,9 +602,6 @@ fn from_records_mode(
 fn validate(s: &State) -> Result<(), CoreError> {
     state_format(s)?;
     sequence_counters::validate(s)?;
-    if let Some(ledger) = &s.applications {
-        ledger.validate()?;
-    }
     if let Some(ledger) = &s.native_outcomes {
         ledger.validate()?;
     }
@@ -703,6 +691,10 @@ const REPLICA: &str = "replica";
 const LEGACY_STORAGE: &str = "legacy storage";
 #[cfg(not(feature = "engine-rocksdb"))]
 const ROCKSDB_NOT_COMPILED: &str = "engine-rocksdb not compiled in";
+
+/// GD-0074 E142: the GD-0052 application reducer was removed; stores holding its
+/// ledger are refused, never migrated or ignored.
+pub(crate) const RETIRED_APPLICATION_LEDGER: &str = "GD-0052 application ledger (legacy format family \"application\", feature bit 3, record namespace 9) was removed; open this store with a GigglesDB build at or before commit 429cbd2c";
 enum Backend {
     Legacy(Database),
     // F8 executes SQL through this handle; until then only tests read it.
@@ -1728,9 +1720,6 @@ impl Admin {
         getrandom::fill(&mut bytes).map_err(io)?;
         s.view.domain = u128::from_be_bytes(bytes);
         s.origin = Some(old);
-        if let Some(ledger) = &mut s.applications {
-            ledger.revoke_all();
-        }
         for t in s.view.tasks.values_mut() {
             t.revoked = true;
         }

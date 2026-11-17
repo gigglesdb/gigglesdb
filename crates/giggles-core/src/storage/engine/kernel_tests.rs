@@ -194,7 +194,6 @@ fn fixture() -> KernelImage {
         },
     );
     state.native_outcomes = Some(Default::default());
-    state.applications = Some(Default::default());
     storage::validate(&state).unwrap();
     KernelImage(state)
 }
@@ -223,7 +222,7 @@ fn legacy_roundtrip_preserves_each_non_sql_record_byte_for_byte() {
     assert_eq!(visible, expected);
     assert_eq!(
         visible.keys().map(|k| k[0]).collect::<BTreeSet<_>>(),
-        BTreeSet::from([0, 1, 2, 3, 4, 6, 7, 9, 255])
+        BTreeSet::from([0, 1, 2, 3, 4, 6, 7, 255])
     );
     let loaded = Kernel::load(&mut txn).unwrap();
     assert_eq!(

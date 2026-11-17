@@ -336,7 +336,7 @@ fn tombstoned_task_key_still_requires_bit() {
 fn bit_20_without_role_catalog_is_corrupt() {
     assert_eq!(TASK_CATALOG, 1 << 20);
     assert!(matches!(meta::check_features(TASK_CATALOG), Err(FormatError::Corrupt(_))));
-    assert!(matches!(meta::check_features(TASK_CATALOG | 0x3FF), Err(FormatError::Corrupt(_))));
+    assert!(matches!(meta::check_features(TASK_CATALOG | 0x3F7), Err(FormatError::Corrupt(_)))); // 0x3FF minus retired bit 8 (GD-0074 E142)
     meta::check_features(TASK_CATALOG | ROLES).unwrap();
     let mut batch = WriteBatch::default();
     assert!(meta::put_features(&mut batch, TASK_CATALOG).is_err());

@@ -190,7 +190,7 @@ mod tests {
             for typed in [false, true] {
                 for temporal in [false, true] {
                     for native in [false, true] {
-                        for (indexed, applications) in [(false, false), (true, false), (false, true)] {
+                        for (indexed, applications) in [(false, false), (true, false)] {
                             let mut s = empty(123);
                             let pk = if heap { "" } else { " PRIMARY KEY" };
                             let extra = if temporal { ",d DATE" } else { "" };
@@ -203,7 +203,6 @@ mod tests {
                                 s.sql.secondary_configure_test(t.id, "by_tag", &[t.columns[1].id], || false).unwrap();
                             }
                             if native { s.native_outcomes = Some(Default::default()); }
-                            if applications { s.applications = Some(Default::default()); }
                             let r = records(&s).unwrap();
                             let mut m: Metadata = decode(&r[&vec![0]]).unwrap();
                             let f = Features { typed_scalars: typed, native_outcomes: native };
@@ -219,8 +218,11 @@ mod tests {
                             assert!(matches!(from_records(forged), Err(CoreError::Corrupt(message)) if message == "heap format mismatch"));
                             // Heap must not weaken the existing index/application refusal.
                             if indexed {
-                                s.applications = Some(Default::default());
-                                assert!(matches!(records(&s), Err(CoreError::Unsupported)));
+                                let mut retired = r.clone();
+                                m.format = 11 + u32::from(native) + 2 * u32::from(typed) + 12 * u32::from(temporal) + 26 * u32::from(heap);
+                                retired.insert(vec![0], encode(&m).unwrap());
+                                retired.insert(vec![9], vec![255]);
+                                assert!(matches!(from_records(retired), Err(CoreError::EngineUnsupported { feature: RETIRED_APPLICATION_LEDGER, .. })));
                             }
                         }
                     }
@@ -336,8 +338,12 @@ mod tests {
                     let restored = from_records(r.clone()).unwrap();
                     assert_eq!(restored.sql, s.sql);
                     assert_eq!(records(&restored).unwrap(), r);
-                    s.applications = Some(Default::default());
-                    assert!(matches!(records(&s), Err(CoreError::Unsupported)));
+                    let mut retired = r;
+                    let mut m = m;
+                    m.format = 23 + u32::from(native) + 2 * u32::from(typed);
+                    retired.insert(vec![0], encode(&m).unwrap());
+                    retired.insert(vec![9], vec![255]);
+                    assert!(matches!(from_records(retired), Err(CoreError::EngineUnsupported { feature: RETIRED_APPLICATION_LEDGER, .. })));
                 }
             }
         }

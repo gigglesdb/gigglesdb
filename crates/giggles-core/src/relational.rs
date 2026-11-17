@@ -1978,6 +1978,7 @@ impl Prepared {
         for source in sources { p.relations.push(schemas::Reference::read(source, None)); }
         Ok(p)
     }
+    #[cfg(test)]
     pub(crate) fn create_engine(
         name: String,
         columns: Vec<ColumnDef>,

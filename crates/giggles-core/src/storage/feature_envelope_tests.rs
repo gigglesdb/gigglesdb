@@ -69,17 +69,13 @@ fn legacy_mapping_canonicalizes_only_aliases() {
 #[test]
 fn legacy_writers_preserve_record_maps() {
     use crate::relational::Prepared;
-    for (applications, indexed, temporal, heap) in [
-        (false, false, false, false),
-        (true, false, false, false),
-        (false, true, false, false),
-        (false, false, true, false),
-        (false, false, false, true),
+    for (indexed, temporal, heap) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
     ] {
         let mut s = empty(17);
-        if applications {
-            s.applications = Some(Default::default());
-        }
         let pk = if heap { "" } else { " PRIMARY KEY" };
         let date = if temporal { ",d DATE" } else { "" };
         let p = Prepared::parse(
@@ -100,11 +96,7 @@ fn legacy_writers_preserve_record_maps() {
             typed_scalars: false,
             native_outcomes: false,
         };
-        let base = if applications {
-            f.version_application(true)
-        } else {
-            f.version_with(indexed)
-        };
+        let base = f.version_with(indexed);
         let version = format_policy::heap_version(
             format_policy::temporal_version(base, temporal).unwrap(),
             heap,
@@ -131,9 +123,6 @@ fn legacy_writers_preserve_record_maps() {
             previous.insert(vec![8], payload);
         } else {
             previous.insert(vec![5], encode(&s.sql).unwrap());
-        }
-        if let Some(a) = &s.applications {
-            previous.insert(vec![9], a.bytes().unwrap());
         }
         assert_eq!(r, previous);
         assert_eq!(records(&from_records(r.clone()).unwrap()).unwrap(), r);

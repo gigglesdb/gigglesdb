@@ -199,7 +199,6 @@ fn refuse(s: &State) -> Result<(), CoreError> {
             "once/outcome ledger",
             usize::from(s.native_outcomes.is_some()),
         ),
-        ("application ledger", usize::from(s.applications.is_some())),
         ("protected operations", s.view.operations.len()),
         ("native schema counter", usize::from(s.view.schema != 0)),
         ("authority clock", usize::from(s.last_time != 0)),

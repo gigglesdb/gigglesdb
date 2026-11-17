@@ -329,6 +329,9 @@ pub(crate) fn check_subversion(version: u32, supported: u32) -> Result<(), Forma
     Ok(())
 }
 pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
+    if bits & 8 != 0 {
+        return Err(FormatError::Unsupported("retired applications feature (GD-0052 application ledger); open with a GigglesDB build at or before commit 429cbd2c".into()));
+    }
     check_features_allowed(
         bits,
         0x3FFF

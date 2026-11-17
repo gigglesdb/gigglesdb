@@ -140,48 +140,14 @@ fn missing_extra_malformed_forged_crosscatalog_and_old_envelopes_reject() {
     assert!(from_records(bad).is_err());
 }
 #[test]
-fn real_combined_application_index_states_fail_all_paths_and_application_identity_survives() {
+fn combined_application_index_records_are_refused() {
     for typed in [false, true] {
         for native in [false, true] {
-            let mut s = fixture(typed, native, false);
-            s.applications = Some(Default::default());
-            assert_eq!(state_format(&s), Err(CoreError::Unsupported));
-            assert_eq!(records(&s), Err(CoreError::Unsupported));
-            assert_eq!(validate(&s), Err(CoreError::Unsupported));
-            assert!(matches!(
-                Admin::create_state(
-                    path("combined"),
-                    Limits::default(),
-                    s.clone(),
-                    RecoveryPoint::None
-                ),
-                Err(CoreError::Unsupported)
-            ));
             let mut r = records(&fixture(typed, native, false)).unwrap();
-            r.insert(vec![9], s.applications.as_ref().unwrap().bytes().unwrap());
-            assert!(matches!(
-                from_records(r.clone()),
-                Err(CoreError::Unsupported)
-            ));
+            r.insert(vec![9], vec![255]);
+            assert!(matches!(from_records(r.clone()), Err(CoreError::Unsupported)));
             metadata(&mut r, 11 + u32::from(native) + 2 * u32::from(typed));
-            assert!(matches!(from_records(r), Err(CoreError::Unsupported)));
-            let mut app = empty(123);
-            app.applications = Some(Default::default());
-            if native {
-                app.native_outcomes = Some(Default::default());
-            }
-            if typed {
-                sql(
-                    &mut app.sql,
-                    "CREATE TABLE typed (id BIGINT PRIMARY KEY, extra NUMERIC)",
-                );
-            }
-            let r = records(&app).unwrap();
-            assert_eq!(
-                state_format(&app).unwrap(),
-                11 + u32::from(native) + 2 * u32::from(typed)
-            );
-            assert_eq!(records(&from_records(r.clone()).unwrap()).unwrap(), r);
+            assert!(matches!(from_records(r), Err(CoreError::EngineUnsupported { feature: RETIRED_APPLICATION_LEDGER, .. })));
         }
     }
 }
@@ -309,22 +275,19 @@ fn write_export(path: &Path, version: u32, values: &BTreeMap<Vec<u8>, Vec<u8>>) 
 fn combined_and_future_export_restore_reject_before_destination_creation() {
     let indexed = fixture(false, false, true);
     let mut r = records(&indexed).unwrap();
-    let mut app = empty(123);
-    app.applications = Some(Default::default());
-    r.insert(vec![9], app.applications.as_ref().unwrap().bytes().unwrap());
+    r.insert(vec![9], vec![255]);
     for version in [7, 11, u32::MAX] {
         metadata(&mut r, version);
         let export = path("badexport");
         let dest = path("badrestore");
         write_export(&export, version, &r);
-        assert!(matches!(
-            Admin::read_export(&export),
-            Err(CoreError::Unsupported)
-        ));
-        assert!(matches!(
-            Admin::restore(&export, &dest, Limits::default()),
-            Err(CoreError::Unsupported)
-        ));
+        for result in [Admin::read_export(&export), Admin::restore(&export, &dest, Limits::default()).map(|admin| admin.inner.read().unwrap().clone())] {
+            if version == 11 {
+                assert!(matches!(result, Err(CoreError::EngineUnsupported { feature: RETIRED_APPLICATION_LEDGER, .. })));
+            } else {
+                assert!(matches!(result, Err(CoreError::Unsupported)));
+            }
+        }
         assert!(!dest.exists());
     }
 }
@@ -554,9 +517,6 @@ fn unique_actual_writer_all_families_export_restore_reopen_fixtures() {
                                 Err(CoreError::Sql(relational::SqlError::Duplicate))
                             );
                         }
-                        let mut combined = s.clone();
-                        combined.applications = Some(Default::default());
-                        assert!(matches!(records(&combined), Err(CoreError::Unsupported)));
                         let mut combined = r.clone();
                         combined.insert(vec![9], vec![]);
                         assert!(matches!(
@@ -691,7 +651,7 @@ fn unique_snapshot_context_checks_before_accepting_unpublished_image() {
         values: vec![("tag".into(), ValueExpr::Literal(Value::Text("a".into())))],
         intent: Intent::One,
     };
-    assert!(operation_adapter::execute(&s, &request, &Bindings::new()).is_err());
+    assert!(crate::operations::state_adapter::execute(&s, &request, &Bindings::new()).is_err());
     assert_eq!(records(&s).unwrap(), before);
     let Request::Update { filter, guard, .. } = request else {
         unreachable!()
@@ -703,11 +663,11 @@ fn unique_snapshot_context_checks_before_accepting_unpublished_image() {
         values: vec![("tag".into(), ValueExpr::Literal(Value::Text("c".into())))],
         intent: Intent::One,
     };
-    let expected = operation_adapter::execute(&s, &request, &Bindings::new()).unwrap();
+    let expected = crate::operations::state_adapter::execute(&s, &request, &Bindings::new()).unwrap();
     let cancelled = crate::cancellation::Cancellation::default();
     cancelled.cancel();
     let actual = cancelled
-        .scope(|| operation_adapter::execute(&s, &request, &Bindings::new()))
+        .scope(|| crate::operations::state_adapter::execute(&s, &request, &Bindings::new()))
         .unwrap();
     assert_eq!(records(&expected.0).unwrap(), records(&actual.0).unwrap());
     assert_eq!(expected.1, actual.1);

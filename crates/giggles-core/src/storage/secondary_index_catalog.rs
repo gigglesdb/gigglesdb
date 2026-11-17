@@ -110,9 +110,6 @@ impl SqlSession {
                 .staged
                 .as_mut()
                 .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
-            if state.applications.is_some() {
-                return Err(CoreError::Unsupported);
-            }
             if table.hidden_rowid().is_some() {
                 if state.sql.tables.get(&state.sql.table_key(table)) != Some(table) {
                     return Err(CoreError::Sql(relational::SqlError::StaleSchema));

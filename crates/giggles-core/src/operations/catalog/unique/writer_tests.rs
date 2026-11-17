@@ -124,9 +124,6 @@ fn public_unique_actual_writer_all_families_export_restore_reopen_fixtures() {
                                 Err(CoreError::Sql(relational::SqlError::Duplicate))
                             );
                         }
-                        let mut combined = s.clone();
-                        combined.applications = Some(Default::default());
-                        assert!(matches!(records(&combined), Err(CoreError::Unsupported)));
                         let mut combined = r.clone();
                         combined.insert(vec![9], vec![]);
                         assert!(matches!(
@@ -145,7 +142,7 @@ fn public_unique_actual_writer_all_families_export_restore_reopen_fixtures() {
 #[test]
 fn public_unique_prepare_and_refusals_preserve_exact_records() {
     use crate::operations::Error as OpError;
-    for kind in ["native", "application", "sql", "rows"] {
+    for kind in ["native", "sql", "rows"] {
         let a = Admin::create(path(kind), Limits::default()).unwrap();
         a.sql_session()
             .execute(
@@ -158,7 +155,6 @@ fn public_unique_prepare_and_refusals_preserve_exact_records() {
             .change_decision(|s| {
                 match kind {
                     "native" => s.native_outcomes = Some(Default::default()),
-                    "application" => s.applications = Some(Default::default()),
                     "sql" => {
                         s.sql
                             .execute(

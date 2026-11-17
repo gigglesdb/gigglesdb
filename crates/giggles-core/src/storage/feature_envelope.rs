@@ -29,14 +29,12 @@ fn role_bootstrap_present(_: &State) -> bool {
 
 pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
     let typed = s.sql.contains_typed()
-        || s.applications.as_ref().is_some_and(|a| a.contains_typed())
         || s.native_outcomes
             .as_ref()
             .is_some_and(|n| n.contains_typed().unwrap_or(true));
     Ok(u64::from(typed)
         | (u64::from(s.native_outcomes.is_some()) << 1)
         | (u64::from(s.sql.has_secondary_indexes_engine()) << 2)
-        | (u64::from(s.applications.is_some()) << 3)
         | (u64::from(contains_temporal(s)?) << 4)
         | (u64::from(s.sql.contains_heap()) << 5)
         | (u64::from(catalog_ext_present(s)) << 6)

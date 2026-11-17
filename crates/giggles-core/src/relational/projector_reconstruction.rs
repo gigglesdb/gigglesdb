@@ -82,6 +82,7 @@ fn allocator_bounds(next_id: u64, next_version: u64) -> R<()> {
 impl Relational {
     /// The relation must already have canonical validated-source provenance.
     /// This scalar-only capture does not scan or allocate to validate a source.
+    #[cfg(test)]
     pub(crate) fn projector_counters_engine(
         &self,
         expected_epoch: u64,

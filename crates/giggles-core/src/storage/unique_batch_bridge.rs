@@ -135,9 +135,6 @@ impl SqlSession {
             {
                 return Err(CoreError::Sql(SqlError::StaleSchema));
             }
-            if staged.applications.is_some() {
-                return Err(CoreError::Unsupported);
-            }
             let next_revision = session
                 .staged_revision
                 .checked_add(1)
