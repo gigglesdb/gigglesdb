@@ -283,13 +283,15 @@ fn fingerprint(version: LanguageVersion) -> (usize, u64) {
 fn profile_0_21_capabilities_unchanged() {
     // Frozen from the 0.20 and 0.21 manifests without profile 0.22: first at
     // 85e0ef27, refrozen at main 3f9a2b1d, whose GD-0001 R2-NOCAP stack rewrote
-    // shared manifest text (+930 bytes in both profiles).
+    // shared manifest text (+930 bytes in both profiles), and refrozen at the
+    // GD-0082 bench stack on main 66ef93ce, whose v2 transaction cap added
+    // engine_rows.*.concurrent_explicit_sessions (+68 bytes in both profiles).
     // The manifest text differs slightly without the v2 engine.
     if cfg!(feature = "engine-rocksdb") {
-        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_897, 0x302b_8e9a_0bae_5f7b));
-        assert_eq!(fingerprint(PREVIOUS), (201_539, 0x3103_b5eb_ae37_24c3));
+        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_965, 0xc438_c348_6eb8_1174));
+        assert_eq!(fingerprint(PREVIOUS), (201_607, 0x0d9e_9262_1dcc_cdb8));
     } else {
-        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_894, 0x8ff3_6dcf_36ca_943e));
-        assert_eq!(fingerprint(PREVIOUS), (201_536, 0x0300_fabd_76e2_f654));
+        assert_eq!(fingerprint(LanguageVersion::Embedded020), (193_962, 0xb32c_a131_11f0_74c3));
+        assert_eq!(fingerprint(PREVIOUS), (201_604, 0xd968_e55d_33aa_3481));
     }
 }
