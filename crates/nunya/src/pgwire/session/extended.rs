@@ -98,7 +98,7 @@ impl Session {
     fn prepare(&mut self, sql: &str, param_types: Vec<u32>) -> Result<Prepared, Refusal> {
         let (policy, policy_revision) = self.ctx.policy_snapshot()?;
         self.statement_revision = policy_revision.clone();
-        let snapshot = self.ctx.snapshot.read().map_err(|_| protocol())?.clone();
+        let snapshot = self.snapshot()?;
         if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms) > policy.snapshot_max_age_ms
         {
             return Err(failure(NyCode::SchemaStale));
@@ -391,7 +391,7 @@ impl Session {
                     if !mode.permits_write() && writes(&p.kind) {
                         return Err(failure(NyCode::StatementNotAllowed));
                     }
-                    let snapshot = self.ctx.snapshot.read().map_err(|_| protocol())?.clone();
+                    let snapshot = self.snapshot()?;
                     if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms)
                         > p.policy.snapshot_max_age_ms
                     {

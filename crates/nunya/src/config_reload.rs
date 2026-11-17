@@ -303,8 +303,39 @@ pub(crate) fn copy_config(c: &Config) -> Config {
             .collect(),
     }
 }
+/// Catalog settings tagged to reject obsolete background results.
+#[derive(Clone)]
+pub(crate) struct RefreshSettings {
+    /// Schemas included in catalog capture.
+    pub(crate) schemas: Vec<String>,
+    /// Resolution path for newly connected sessions.
+    pub(crate) search_path: Vec<String>,
+    /// Background capture period.
+    pub(crate) refresh_ms: u64,
+    /// Settings revision of background captures.
+    pub(crate) generation: u64,
+}
+/// Wait for the current period, restarting the sleep whenever settings change.
+pub(crate) async fn refresh_tick<T: Clone>(rx: &mut tokio::sync::watch::Receiver<T>, period: impl Fn(&T) -> u64) {
+    loop {
+        let ms = period(&rx.borrow_and_update());
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => return,
+            changed = rx.changed() => { if changed.is_err() { std::future::pending::<()>().await; } }
+        }
+    }
+}
+type SnapshotSource = dyn Fn(Config) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::schema::Snapshot, &'static str>> + Send>> + Send + Sync;
+struct CatalogApplier {
+    context: Arc<crate::pgwire::context::GatewayContext>,
+    source: Arc<SnapshotSource>,
+}
 /// Live transport resources shared with all listener accept loops.
 pub(crate) struct Transports {
+    /// Reloadable PostgreSQL catalog settings.
+    pub(crate) refresh: tokio::sync::watch::Sender<RefreshSettings>,
+    /// Reloadable native Spanner capture period.
+    pub(crate) spanner_period: tokio::sync::watch::Sender<u64>,
     /// PostgreSQL handshake configuration without HTTP ALPN.
     pub(crate) postgres: crate::pgwire::context::ReloadableTls,
     /// Native Spanner handshake configuration advertising HTTP/2.
@@ -321,6 +352,11 @@ impl Transports {
         let management = config.management.as_ref().and_then(|m| m.tls.as_ref())
             .map(crate::config::load_tls).transpose()?;
         Ok(Arc::new(Self {
+            refresh: tokio::sync::watch::channel(RefreshSettings {
+                schemas: config.schemas.clone(), search_path: config.search_path.clone(),
+                refresh_ms: config.snapshot_refresh_ms, generation: 0,
+            }).0,
+            spanner_period: tokio::sync::watch::channel(config.spanner_native.as_ref().and_then(|s| s.snapshot_refresh_ms).unwrap_or(30000)).0,
             postgres: Arc::new(std::sync::RwLock::new(route.clone())),
             spanner: Arc::new(std::sync::RwLock::new(h2_config(route))),
             management: Arc::new(std::sync::RwLock::new(management)),
@@ -371,6 +407,8 @@ struct State {
 /// Serialized configuration reloads and data-free operational status.
 pub(crate) struct ConfigReloader {
     path: PathBuf,
+    serial: tokio::sync::Mutex<()>,
+    catalog: OnceLock<CatalogApplier>,
     hub: Weak<Hub>,
     state: Mutex<State>,
     appliers: OnceLock<(Arc<Authority>, Admins)>,
@@ -413,6 +451,8 @@ impl ConfigReloader {
     pub(crate) fn new(config: Config, hub: Weak<Hub>) -> Self {
         Self {
             path: config.path.clone(),
+            serial: tokio::sync::Mutex::new(()),
+            catalog: OnceLock::new(),
             hub,
             appliers: OnceLock::new(),
             transports: OnceLock::new(),
@@ -435,6 +475,10 @@ impl ConfigReloader {
     pub(crate) fn attach_transports(&self, transports: Arc<Transports>) {
         assert!(self.transports.set(transports).is_ok(), "transport appliers already attached");
     }
+    /// Attach the catalog route and its side-effect-free candidate source before reloads.
+    pub(crate) fn attach_catalog(&self, context: Arc<crate::pgwire::context::GatewayContext>, source: Arc<SnapshotSource>) {
+        assert!(self.catalog.set(CatalogApplier { context, source }).is_ok(), "catalog already attached");
+    }
     /// Last applied configuration digest used to seed polling.
     pub(crate) fn revision(&self) -> String {
         self.state
@@ -450,19 +494,44 @@ impl ConfigReloader {
     }
     /// Read, prepare, and commit one complete config reload attempt.
     pub(crate) async fn reload(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.attempts += 1;
-        state.time = crate::serve::now();
+        let _serial = self.serial.lock().await;
+        let running = {
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.attempts += 1;
+            state.time = crate::serve::now();
+            copy_config(&state.running)
+        };
         let prepared = Config::load(&self.path)
             .map_err(|errors| errors.join("; "))
-            .and_then(|new| prepare(&state.running, new, self.appliers.get().map(|(a, _)| a.as_ref())).map_err(str::to_owned));
-        let result = prepared.and_then(|prepared| {
+            .and_then(|new| prepare(&running, new, self.appliers.get().map(|(a, _)| a.as_ref())).map_err(str::to_owned));
+        let candidate = if let (Ok(prepared), Some(catalog)) = (&prepared, self.catalog.get()) {
+            if prepared.diff.reloadable.iter().any(|s| ["schemas", "search_path"].contains(s)) {
+                let mut cfg = copy_config(&running);
+                cfg.schemas = prepared.config.schemas.clone();
+                cfg.search_path = prepared.config.search_path.clone();
+                (catalog.source)(cfg).await.map(Some)
+            } else { Ok(None) }
+        } else if prepared.as_ref().is_ok_and(|p| running.upstream.is_some()
+            && p.diff.reloadable.iter().any(|s| ["schemas", "search_path"].contains(s))) {
+            Err("snapshot unavailable")
+        } else { Ok(None) };
+        let candidate = candidate.and_then(|candidate| {
+            if let (Some(catalog), Some(snapshot)) = (self.catalog.get(), candidate.as_ref()) {
+                let policy = catalog.context.policy.read().map_err(|_| "snapshot unavailable")?;
+                crate::policy::validate::validate(&policy, snapshot).map_err(|_| "snapshot validation failed")?;
+            }
+            Ok(candidate)
+        });
+        let prepared = prepared.and_then(|p| candidate.map(|c| (p, c)).map_err(str::to_owned));
+        let result = prepared.and_then(|(prepared, candidate)| {
             let hub = self.hub.upgrade().ok_or("reload service unavailable")?;
             let revision = prepared.config.revision.clone();
             hub.commit_config_revision(&revision, || {
+                // The Hub publication lock keeps policy attempts from racing this validation.
+                if let (Some(catalog), Some(snapshot)) = (self.catalog.get(), candidate.as_ref()) {
+                    let policy = catalog.context.policy.read().map_err(|_| "snapshot unavailable")?;
+                    crate::policy::validate::validate(&policy, snapshot).map_err(|_| "snapshot validation failed")?;
+                }
                 if let Some((authority, admins)) = self.appliers.get() {
                     if prepared.diff.reloadable.contains(&"standing") {
                         let counts = authority.sync_config_principals(&prepared.principals)
@@ -478,12 +547,31 @@ impl ConfigReloader {
                 if let Some(transports) = self.transports.get() {
                     transports.apply(prepared.route_tls, prepared.management_tls, prepared.config.max_connections);
                 }
+                if let Some(catalog) = self.catalog.get() {
+                    if let Some(snapshot) = candidate {
+                        *catalog.context.snapshot.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(snapshot);
+                    }
+                }
+                if let Some(transports) = self.transports.get() {
+                    if prepared.diff.reloadable.iter().any(|s| ["schemas", "search_path", "snapshot_refresh_ms"].contains(s)) {
+                        let generation = transports.refresh.borrow().generation + 1;
+                        transports.refresh.send_replace(RefreshSettings {
+                            schemas: prepared.config.schemas.clone(), search_path: prepared.config.search_path.clone(),
+                            refresh_ms: prepared.config.snapshot_refresh_ms, generation,
+                        });
+                    }
+                    if prepared.diff.reloadable.contains(&"spanner_native.snapshot_refresh_ms") {
+                        transports.spanner_period.send_replace(prepared.config.spanner_native.as_ref().and_then(|s| s.snapshot_refresh_ms).unwrap_or(30000));
+                    }
+                }
+                let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 self.commit(&mut state, prepared.config, prepared.diff);
                 Ok(())
             })?;
             Ok(())
         });
         if let Err(reason) = result {
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             state.last = "rejected";
             state.failures += 1;
             eprintln!("serve: config reload rejected: {reason}");
@@ -1214,6 +1302,109 @@ key_file='key'
         tokio::time::timeout(std::time::Duration::from_secs(5), old.read_to_end(&mut response)).await.unwrap().unwrap();
         assert!(response.starts_with(b"HTTP/1.1 "));
         drop(new); drop(after_failure); shutdown.send(true).unwrap(); server.wait().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_prepare_rejection_validation_and_commit_are_atomic() {
+        use crate::pgwire::session::tests::Fixture as PgFixture;
+        for outcome in [0, 1, 2] {
+            let f = Fixture::new();
+            let cfg = f.load(&f.text);
+            let transports = Transports::new(&cfg).unwrap();
+            let pg = PgFixture::new();
+            let original = pg.ctx.snapshot.read().unwrap().clone();
+            let hub = Hub::new(&[(pg.ctx.route.clone(), f.dir.join("policy"))], None).unwrap();
+            let reload = ConfigReloader::new(cfg, Arc::downgrade(&hub));
+            reload.attach_transports(transports.clone());
+            let source_snapshot = (*original).clone();
+            reload.attach_catalog(pg.ctx.clone(), Arc::new(move |cfg| {
+                let mut snapshot = source_snapshot.clone();
+                Box::pin(async move {
+                    if outcome == 0 { return Err("snapshot unavailable"); }
+                    if outcome == 1 { snapshot.relations.clear(); }
+                    snapshot.search_path = cfg.search_path;
+                    Ok(snapshot)
+                })
+            }));
+            let edited = edit(&edit(&edit(&edit(&f.text, "search_path", "['other']"), "schemas", "['public','other']"), "snapshot_refresh_ms", "10"), "max_connections", "1");
+            f.load(&edited);
+            reload.reload().await;
+            let current = pg.ctx.snapshot.read().unwrap().clone();
+            let settings = transports.refresh.borrow().clone();
+            if outcome < 2 {
+                assert_eq!(reload.last_reload(), "rejected");
+                assert!(Arc::ptr_eq(&original, &current));
+                assert_eq!(settings.search_path, ["public"]);
+                assert_eq!(settings.schemas, ["public"]);
+                assert_eq!(settings.refresh_ms, 30000);
+                assert_eq!(settings.generation, 0);
+                assert_eq!(transports.connections.0.lock().unwrap().0, 256);
+                assert_eq!(reload.state.lock().unwrap().running.search_path, ["public"]);
+            } else {
+                assert_eq!(reload.last_reload(), "applied");
+                assert_eq!(current.search_path, ["other"]);
+                assert_eq!(settings.schemas, ["public", "other"]);
+                assert_eq!(settings.refresh_ms, 10);
+                assert_eq!(settings.generation, 1);
+                assert_eq!(transports.connections.0.lock().unwrap().0, 1);
+                hub.refresh_if(&crate::reload::Route::Postgres(pg.ctx.clone()), (*original).clone(), || transports.refresh.borrow().generation == 0).unwrap();
+                assert!(Arc::ptr_eq(&current, &pg.ctx.snapshot.read().unwrap()));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn period_only_reload_never_fetches_and_rearms_sleep() {
+        let f = Fixture::new();
+        let cfg = f.load(&f.text);
+        let transports = Transports::new(&cfg).unwrap();
+        let hub = f.hub();
+        let reload = ConfigReloader::new(cfg, Arc::downgrade(&hub));
+        reload.attach_transports(transports.clone());
+        let pg = crate::pgwire::session::tests::Fixture::new();
+        reload.attach_catalog(pg.ctx.clone(), Arc::new(|_| Box::pin(async { panic!("period reload fetched a catalog") })));
+        let original = pg.ctx.snapshot.read().unwrap().clone();
+        let mut rx = transports.refresh.subscribe();
+        let waiting = refresh_tick(&mut rx, |s| s.refresh_ms);
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(5), &mut waiting).await.is_err());
+        f.load(&edit(&edit(&f.text, "snapshot_refresh_ms", "1"), "spanner_native.snapshot_refresh_ms", "2"));
+        reload.reload().await;
+        assert_eq!(reload.last_reload(), "applied");
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting).await.unwrap();
+        assert_eq!(*transports.spanner_period.borrow(), 2);
+        assert!(Arc::ptr_eq(&original, &pg.ctx.snapshot.read().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn in_flight_capture_does_not_lock_status_and_serializes_reload() {
+        let f = Fixture::new();
+        let cfg = f.load(&f.text);
+        let hub = f.hub();
+        let reload = Arc::new(ConfigReloader::new(cfg, Arc::downgrade(&hub)));
+        let pg = crate::pgwire::session::tests::Fixture::new();
+        let captured = pg.ctx.snapshot.read().unwrap().clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let a = started.clone(); let b = release.clone();
+        reload.attach_catalog(pg.ctx.clone(), Arc::new(move |cfg| {
+            let a = a.clone(); let b = b.clone(); let snapshot = captured.clone();
+            Box::pin(async move {
+                a.notify_one(); b.notified().await;
+                let mut snapshot = (*snapshot).clone(); snapshot.search_path = cfg.search_path;
+                Ok(snapshot)
+            })
+        }));
+        f.load(&edit(&f.text, "search_path", "['other']"));
+        let r = reload.clone(); let first = tokio::spawn(async move { r.reload().await; });
+        started.notified().await;
+        assert!(reload.status().contains("last_reload=none"));
+        let r = reload.clone(); let second = tokio::spawn(async move { r.reload().await; });
+        tokio::task::yield_now().await;
+        assert_eq!(reload.state.lock().unwrap().attempts, 1);
+        release.notify_one();
+        first.await.unwrap(); second.await.unwrap();
+        assert_eq!(reload.state.lock().unwrap().attempts, 2);
+        assert_eq!(reload.last_reload(), "applied");
     }
 
 }

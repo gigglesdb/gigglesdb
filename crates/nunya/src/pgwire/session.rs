@@ -83,6 +83,8 @@ struct Active {
 /// Socket-independent simple and extended protocol state with ordered responses.
 pub struct Session {
     ctx: Arc<GatewayContext>,
+    pinned_path: Vec<String>,
+    snapshot_cache: Option<(Arc<crate::schema::Snapshot>, Arc<crate::schema::Snapshot>)>,
     keys: ScopeKeys,
     session: SessionId,
     principal: PrincipalId,
@@ -116,7 +118,10 @@ impl Session {
         credential: Option<crate::state::model::CredentialId>,
         scope: crate::token::ScopeId,
     ) -> Self {
+        let pinned_path = ctx.snapshot.read().unwrap_or_else(std::sync::PoisonError::into_inner).search_path.clone();
         Self {
+            pinned_path,
+            snapshot_cache: None,
             ctx,
             keys,
             session,
@@ -141,6 +146,18 @@ impl Session {
             statement_revision: None,
             end_requested: None,
         }
+    }
+    fn snapshot(&mut self) -> Result<Arc<crate::schema::Snapshot>, Refusal> {
+        let current = self.ctx.snapshot.read().map_err(|_| protocol())?.clone();
+        if current.search_path == self.pinned_path { return Ok(current); }
+        if let Some((source, pinned)) = &self.snapshot_cache {
+            if Arc::ptr_eq(source, &current) { return Ok(pinned.clone()); }
+        }
+        let mut pinned = (*current).clone();
+        pinned.search_path = self.pinned_path.clone();
+        let pinned = Arc::new(pinned);
+        self.snapshot_cache = Some((current, pinned.clone()));
+        Ok(pinned)
     }
     /// Attach the registered connection identifier.
     pub fn set_connection(&mut self, id: u64) {
@@ -323,7 +340,7 @@ impl Session {
             let mode = self.admit()?;
             let (policy, revision) = self.ctx.policy_snapshot()?;
             self.statement_revision = revision;
-            let snapshot = self.ctx.snapshot.read().map_err(|_| protocol())?.clone();
+            let snapshot = self.snapshot()?;
             if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms)
                 > policy.snapshot_max_age_ms
             {
@@ -1192,7 +1209,8 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
         login.scope.route.as_str(),
     )
     .map_err(|_| failure(NyCode::TokenNotValid))?;
-    let mut upstream = Upstream::connect(&ctx.upstream, &ctx.search_path).await?;
+    let pinned_path = ctx.snapshot.read().map_err(|_| protocol())?.search_path.clone();
+    let mut upstream = Upstream::connect(&ctx.upstream, &pinned_path).await?;
     agent
         .send(&[
             Backend::AuthenticationSaslFinal(server_final),
@@ -1229,6 +1247,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
         ctx.registry
             .register(id, login.principal, ctx.route.as_str(), deadline);
     let mut session = Session::new(ctx.clone(), keys, id, login.principal, Some(credential), login.scope.id);
+    session.pinned_path = pinned_path;
     session.set_connection(_connection_guard.id().get());
     // Recheck after registration so revocation between login and registration cannot be missed.
     if ctx.authority.admit(id, Operation::Read).is_err() {
@@ -1312,7 +1331,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::value::ColumnType;
     use crate::{
@@ -1359,9 +1378,9 @@ mod tests {
             Ok(())
         }
     }
-    struct Fixture {
+    pub(crate) struct Fixture {
         access: std::sync::OnceLock<(SessionId, PrincipalId)>,
-        ctx: Arc<GatewayContext>,
+        pub(crate) ctx: Arc<GatewayContext>,
         dir: PathBuf,
         fail: Arc<AtomicBool>,
         allowed_records: Arc<std::sync::atomic::AtomicU64>,
@@ -1375,7 +1394,7 @@ mod tests {
         }
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let domain = DomainName("secret".into());
             let col = ColumnRef {
                 schema: "public".into(),
@@ -1465,7 +1484,6 @@ mod tests {
                     application_name: "nunya".into(),
                     connect_timeout_ms: 100,
                 },
-                search_path: vec!["public".into()],
                 lowering: crate::dialect::pg::PgLowering,
                 codec: StandardCodec,
                 clock: Arc::new(|| 100),
@@ -1526,6 +1544,46 @@ mod tests {
                 )
                 .unwrap();
             self.for_access(row.id, first.principal)
+        }
+    }
+
+    #[test]
+    fn reload_pins_simple_and_extended_resolution_and_caches_each_catalog() {
+        for extended in [false, true] {
+            let f = Fixture::new();
+            let mut snapshot = (**f.ctx.snapshot.read().unwrap()).clone();
+            let mut plain = snapshot.relations[0].clone();
+            plain.schema = "other".into();
+            snapshot.relations.push(plain);
+            *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot.clone());
+            let mut old = f.session();
+            snapshot.search_path = vec!["other".into()];
+            *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot);
+            let cached = old.snapshot().unwrap();
+            assert_eq!(cached.search_path, ["public"]);
+            assert!(Arc::ptr_eq(&cached, &old.snapshot().unwrap()));
+            for (mut session, blind) in [(old, true), (f.session(), false)] {
+                assert_eq!(session.pinned_path, if blind { vec!["public"] } else { vec!["other"] });
+                if extended {
+                    for message in [
+                        Frontend::Parse { name: "s".into(), query: "SELECT value FROM items".into(), param_types: vec![] },
+                        Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![], params: vec![], result_formats: vec![] },
+                        Frontend::Execute { portal: "p".into(), max_rows: 0 },
+                    ] {
+                        let out = session.frontend(message);
+                        assert!(!out.close);
+                        assert_eq!(out.upstream.len(), 1);
+                    }
+                    session.backend(Backend::ParseComplete);
+                    session.backend(Backend::BindComplete);
+                } else {
+                    assert_eq!(session.frontend(Frontend::Query("SELECT value FROM items".into())).upstream.len(), 1);
+                }
+                session.backend(Backend::RowDescription(vec![field()]));
+                let out = session.backend(Backend::DataRow(vec![Some(b"private".to_vec())]));
+                let row = out.client.iter().find_map(|b| match b { Backend::DataRow(r) => Some(r), _ => None }).unwrap();
+                assert_eq!(row[0].as_deref() == Some(b"private"), !blind);
+            }
         }
     }
 
@@ -1765,6 +1823,9 @@ mod tests {
             let ctx = Arc::get_mut(&mut f.ctx).unwrap();
             ctx.upstream.host = "127.0.0.1".into();
             ctx.upstream.port = listener.local_addr().unwrap().port();
+            let expected_path = f.ctx.snapshot.read().unwrap().search_path.iter()
+                .map(|s| format!("\"{}\"", s.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
+            let expected_set = format!("SET search_path = {expected_path}; SET standard_conforming_strings = on; SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'; SET IntervalStyle = 'postgres'");
             let fake_ctx = f.ctx.clone();
             let fake = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -1775,7 +1836,7 @@ mod tests {
                     Backend::BackendKeyData { pid: 123, secret: vec![1, 2, 3, 4] },
                     Backend::ReadyForQuery(b'I'),
                 ]).await.unwrap();
-                assert!(matches!(wire.recv().await.unwrap(), Frontend::Query(sql) if sql.starts_with("SET search_path")));
+                assert!(matches!(wire.recv().await.unwrap(), Frontend::Query(sql) if sql == expected_set));
                 wire.send(&[Backend::CommandComplete("SET".into()), Backend::ReadyForQuery(b'I')]).await.unwrap();
                 let mut byte = [0];
                 while wire.io.read(&mut byte).await.unwrap() != 0 {}
@@ -1810,6 +1871,15 @@ mod tests {
             server.await.unwrap();
             fake.await.unwrap();
         }).await.unwrap();
+    }
+    #[tokio::test]
+    async fn new_connection_sets_current_snapshot_search_path() {
+        let mut f = Fixture::new();
+        let id = acquire_overlap(&f);
+        let mut snapshot = (**f.ctx.snapshot.read().unwrap()).clone();
+        snapshot.search_path = vec!["other".into()];
+        *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot);
+        assert_login_accepted(&mut f, id, "login-secret").await;
     }
     #[tokio::test]
     async fn overlap_accepts_both_session_passwords() {

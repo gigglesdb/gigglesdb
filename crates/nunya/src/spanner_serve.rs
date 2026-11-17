@@ -11,7 +11,7 @@ use crate::{
 use std::{
     path::PathBuf,
     sync::{Arc, RwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 /// Native Spanner transport settings.
 #[derive(serde::Deserialize)]
@@ -99,7 +99,7 @@ pub async fn run_spanner(
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     run_spanner_with_hub(
-        section, policy, root_key, state, readlog, None, tls, shutdown,
+        section, policy, root_key, state, readlog, None, None, tls, shutdown,
     )
     .await
 }
@@ -111,6 +111,7 @@ pub(crate) async fn run_spanner_with_hub(
     state: RouteState,
     readlog: Box<dyn ReadLog>,
     hub: Option<Arc<crate::reload::Hub>>,
+    refresh_period: Option<tokio::sync::watch::Receiver<u64>>,
     tls: Option<crate::pgwire::context::ReloadableTls>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
@@ -168,10 +169,10 @@ pub(crate) async fn run_spanner_with_hub(
             .await
             .map_err(|_| "spanner: upstream unavailable".to_owned())?;
         let refresh = async {
-            let mut interval = tokio::time::interval(Duration::from_millis(period));
-            interval.tick().await;
+            let (_keepalive, fallback) = tokio::sync::watch::channel(period);
+            let mut refresh_period = refresh_period.unwrap_or(fallback);
             loop {
-                interval.tick().await;
+                crate::config_reload::refresh_tick(&mut refresh_period, |ms| *ms).await;
                 if let Ok(snapshot) =
                     crate::schema::spanner_gsql::load_gsql_snapshot(&runner, now()).await
                 {

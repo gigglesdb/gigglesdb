@@ -461,6 +461,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
         let route_hub = hub.clone();
         let rx = rx.clone();
+        let refresh_period = transports.spanner_period.subscribe();
         routes.spawn(async move {
             crate::spanner_serve::run_spanner_with_hub(
                 &section,
@@ -469,6 +470,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 state,
                 readlog,
                 Some(route_hub),
+                Some(refresh_period),
                 tls,
                 rx,
             )
@@ -489,6 +491,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 hub,
                 (runtime, route),
                 transports,
+                config_reload,
             );
             tokio::pin!(work);
             tokio::select! {
@@ -542,6 +545,7 @@ async fn supervise(
     while routes.join_next().await.is_some() {}
     result
 }
+#[allow(clippy::too_many_arguments)]
 async fn run_postgres(
     config: Config,
     policy: Arc<Policy>,
@@ -553,6 +557,7 @@ async fn run_postgres(
         crate::state::model::RouteId,
     ),
     transports: Arc<crate::config_reload::Transports>,
+    config_reload: Arc<crate::config_reload::ConfigReloader>,
 ) -> Result<(), String> {
     let log = hub.route_log(&state.1)?;
     let upstream = config
@@ -582,7 +587,6 @@ async fn run_postgres(
         upstream: config
             .upstream_config()
             .ok_or("PostgreSQL route unavailable")?,
-        search_path: config.search_path.clone(),
         lowering: crate::dialect::pg::PgLowering,
         codec: crate::token::StandardCodec,
         clock: Arc::new(now),
@@ -596,16 +600,24 @@ async fn run_postgres(
             .await
             .map_err(|_| "agent listener unavailable")?;
     hub.register(crate::reload::Route::Postgres(ctx.clone()))?;
+    config_reload.attach_catalog(ctx.clone(), Arc::new(|cfg| Box::pin(async move {
+        let upstream = cfg.upstream_config().ok_or("snapshot unavailable")?;
+        let schema = connect_schema(&upstream).await.map_err(|_| "snapshot unavailable")?;
+        tokio::time::timeout(Duration::from_millis(upstream.connect_timeout_ms), snapshot(&schema.client, &cfg))
+            .await.map_err(|_| "snapshot unavailable")?.map_err(|_| "snapshot unavailable")
+    })));
     let config = Arc::new(config);
     let refresh_config = config.clone();
+    let mut settings_rx = transports.refresh.subscribe();
     let (snapshot_tx, mut snapshot_rx) = mpsc::channel(1);
     let _refresher = AbortTask(tokio::spawn(async move {
         let mut schema = schema;
-        let mut interval =
-            tokio::time::interval(Duration::from_millis(refresh_config.snapshot_refresh_ms));
-        interval.tick().await;
         loop {
-            interval.tick().await;
+            crate::config_reload::refresh_tick(&mut settings_rx, |s| s.refresh_ms).await;
+            let settings = settings_rx.borrow().clone();
+            let mut capture_config = crate::config_reload::copy_config(&refresh_config);
+            capture_config.schemas = settings.schemas;
+            capture_config.search_path = settings.search_path;
             if schema.client.is_closed() {
                 match connect_schema(&upstream).await {
                     Ok(new) => schema = new,
@@ -617,12 +629,12 @@ async fn run_postgres(
             }
             let candidate = tokio::time::timeout(
                 Duration::from_millis(upstream.connect_timeout_ms),
-                snapshot(&schema.client, &refresh_config),
+                snapshot(&schema.client, &capture_config),
             )
             .await;
             match candidate {
                 Ok(Ok(new)) => {
-                    if snapshot_tx.send(new).await.is_err() {
+                    if snapshot_tx.send((settings.generation, new)).await.is_err() {
                         break;
                     }
                 }
@@ -662,8 +674,8 @@ async fn run_postgres(
                 }
             }
             _ = sessions.join_next(), if !sessions.is_empty() => {},
-            Some(new) = snapshot_rx.recv() => {
-                if let Err(e) = hub.refresh(&crate::reload::Route::Postgres(ctx.clone()), new) {
+            Some((generation, new)) = snapshot_rx.recv() => {
+                if let Err(e) = hub.refresh_if(&crate::reload::Route::Postgres(ctx.clone()), new, || transports.refresh.borrow().generation == generation) {
                     eprintln!("serve: refresh validation failed: {e}");
                 }
             }

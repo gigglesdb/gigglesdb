@@ -81,8 +81,6 @@ pub struct GatewayContext {
     pub readlog: Box<dyn ReadLog>,
     /// Upstream connection settings.
     pub upstream: UpstreamConfig,
-    /// Trusted upstream search path.
-    pub search_path: Vec<String>,
     /// SQL lowering implementation.
     pub lowering: PgLowering,
     /// Token codec.

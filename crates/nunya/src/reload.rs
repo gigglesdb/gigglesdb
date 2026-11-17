@@ -273,7 +273,12 @@ impl Hub {
     }
     /// Validate a fresh catalog against this route's policy unit.
     pub(crate) fn refresh(&self, route: &Route, snapshot: Snapshot) -> Result<(), String> {
+        self.refresh_if(route, snapshot, || true)
+    }
+    /// Publish a catalog only if its settings are still current under the publication lock.
+    pub(crate) fn refresh_if(&self, route: &Route, snapshot: Snapshot, current: impl FnOnce() -> bool) -> Result<(), String> {
         let state = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        if !current() { return Ok(()); }
         let s = &state.units[state.unit(route.id())?];
         crate::policy::validate::validate(&s.policy, &snapshot).map_err(crate::serve::errors)?;
         *route
@@ -1383,7 +1388,7 @@ mod tests {
                 password: zeroize::Zeroizing::new(String::new()), dbname: "unused".into(),
                 tls: crate::pgwire::upstream::UpstreamTls::Disable, application_name: "nunya".into(), connect_timeout_ms: 100,
             },
-            search_path: vec!["public".into()], lowering: crate::dialect::pg::PgLowering,
+            lowering: crate::dialect::pg::PgLowering,
             codec: crate::token::StandardCodec, clock: Arc::new(|| 0), cancel_map: Mutex::new(Default::default()),
             metrics: Metrics::default(), tls: Arc::new(std::sync::RwLock::new(None)), allow_plaintext: true,
         });

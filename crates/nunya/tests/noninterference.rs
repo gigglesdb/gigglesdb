@@ -118,7 +118,6 @@ async fn gateway(url: &str, side: &str) -> TestResult<Gateway> {
             application_name: "nunya-ni".into(),
             connect_timeout_ms: 10_000,
         },
-        search_path: vec!["public".into()],
         lowering: PgLowering,
         codec: StandardCodec,
         clock: Arc::new(|| 0),
