@@ -358,6 +358,32 @@ pub struct LockRequest {
     pub mode: RangeLockMode,
     pub timeout_ms: Option<u64>,
 }
+/// Key-only, nonblocking lock batch. Earlier grants remain held on failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockBatchRequest {
+    pub range: RangeId,
+    pub epoch: Epoch,
+    pub txn: ClusterTxnId,
+    pub priority: Timestamp,
+    pub mode: RangeLockMode,
+    pub targets: Vec<LockTarget>,
+}
+impl LockBatchRequest {
+    /// Refuses non-key targets before taking any locks.
+    pub fn check(&self) -> Result<(), RangeError> {
+        if self
+            .targets
+            .iter()
+            .all(|t| matches!(t, LockTarget::Key { .. }))
+        {
+            Ok(())
+        } else {
+            Err(RangeError::Corrupt(
+                "lock batch requires key targets".into(),
+            ))
+        }
+    }
+}
 /// A granted lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockGrant {
@@ -430,6 +456,25 @@ pub trait RangeClient: Send + Sync {
     }
     fn read(&self, req: ReadRequest) -> Result<ReadPage, RangeError>;
     fn lock(&self, req: LockRequest) -> Result<LockGrant, RangeError>;
+    /// Tries each key in order without waiting; partial grants remain held.
+    fn lock_batch(&self, req: LockBatchRequest) -> Result<Vec<LockGrant>, RangeError> {
+        req.check()?;
+        req.targets
+            .into_iter()
+            .map(|target| {
+                self.lock(LockRequest {
+                    range: req.range,
+                    epoch: req.epoch,
+                    txn: req.txn,
+                    priority: req.priority,
+                    target,
+                    mode: req.mode,
+                    timeout_ms: Some(0),
+                })
+            })
+            .collect()
+    }
+
     /// Holders and conflicting waiters queued ahead; empty if txn is not waiting there.
     fn blockers(&self, range: RangeId, txn: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError>;
     /// Makes txn's pending request return RangeError::Deadlock; no-op if not waiting.
@@ -485,6 +530,25 @@ pub trait RangeService: Send + Sync {
     fn descriptor(&self) -> RangeDescriptor;
     fn read(&self, req: ReadRequest) -> Result<ReadPage, RangeError>;
     fn lock(&self, req: LockRequest) -> Result<LockGrant, RangeError>;
+    /// Tries each key in order without waiting; partial grants remain held.
+    fn lock_batch(&self, req: LockBatchRequest) -> Result<Vec<LockGrant>, RangeError> {
+        req.check()?;
+        req.targets
+            .into_iter()
+            .map(|target| {
+                self.lock(LockRequest {
+                    range: req.range,
+                    epoch: req.epoch,
+                    txn: req.txn,
+                    priority: req.priority,
+                    target,
+                    mode: req.mode,
+                    timeout_ms: Some(0),
+                })
+            })
+            .collect()
+    }
+
     /// Holders and conflicting waiters queued ahead; empty if txn is not waiting there.
     fn blockers(&self, txn: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError>;
     /// Makes txn's pending request return RangeError::Deadlock; no-op if not waiting.

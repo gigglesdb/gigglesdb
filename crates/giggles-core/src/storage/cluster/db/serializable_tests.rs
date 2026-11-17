@@ -456,3 +456,72 @@ fn point_grants_consume_the_shared_validation_budget() {
         ))
     ));
 }
+
+/// HD-4b: five point reads in one range use the batch validation path.
+#[test]
+fn five_point_reads_validate_in_one_range() {
+    for changed in [false, true] {
+        let (_cluster, a, b) = two(
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); CREATE TABLE log (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)",
+        );
+        let (mut sa, mut sb) = (a.admin.sql_session(), b.admin.sql_session());
+        begin(&mut sa, "SERIALIZABLE");
+        for id in 1..=5 {
+            assert_eq!(int(&mut sa, &format!("SELECT v FROM t WHERE id = {id}")), 0);
+        }
+        if changed {
+            ok(&mut sb, "UPDATE t SET v = 9 WHERE id = 3");
+        }
+        ok(&mut sa, "INSERT INTO log VALUES (1, 1)");
+        let result = exec(&mut sa, "COMMIT");
+        if changed {
+            assert_eq!(code(result), "40001");
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            int(&mut sb, "SELECT count(*) FROM log"),
+            i64::from(!changed)
+        );
+    }
+}
+
+/// A partially granted batch falls back to the existing waiting lock path.
+#[test]
+fn point_batch_falls_back_and_waits_for_open_writer() {
+    for commit in [false, true] {
+        let (_cluster, a, b) = two(
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); CREATE TABLE log (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)",
+        );
+        let (mut sa, mut sb) = (a.admin.sql_session(), b.admin.sql_session());
+        begin(&mut sa, "SERIALIZABLE");
+        for id in 1..=5 {
+            assert_eq!(int(&mut sa, &format!("SELECT v FROM t WHERE id = {id}")), 0);
+        }
+        ok(&mut sa, "INSERT INTO log VALUES (1, 1)");
+        begin(&mut sb, "READ COMMITTED");
+        ok(&mut sb, "UPDATE t SET v = 9 WHERE id = 3");
+        std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::channel();
+            scope.spawn(move || {
+                tx.send(
+                    exec(&mut sa, "COMMIT")
+                        .map(|_| ())
+                        .map_err(|e| crate::sqlstate(&e).to_string()),
+                )
+                .unwrap();
+            });
+            assert!(
+                matches!(
+                    rx.recv_timeout(Duration::from_millis(300)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "commit must wait for the open writer"
+            );
+            ok(&mut sb, if commit { "COMMIT" } else { "ROLLBACK" });
+            let result = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            assert_eq!(result, if commit { Err("40001".into()) } else { Ok(()) });
+        });
+        assert_eq!(int(&mut sb, "SELECT count(*) FROM log"), i64::from(!commit));
+    }
+}

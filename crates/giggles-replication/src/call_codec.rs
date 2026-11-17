@@ -10,10 +10,10 @@
 use std::ops::{Bound, Range};
 
 use giggles_core::range_api::{
-    ClusterTxnId, DeadlockProbe, Epoch, HomeOp, HomeReply, HomeStatus, LeaseKind, LockGrant,
-    LockRequest, LockTarget, Outcome, RangeDescriptor, RangeError, RangeId, RangeLockMode,
-    RangeSpace, RangeWrite, ReadDirection, ReadPage, ReadRequest, SequenceOp, SequenceReply,
-    Timestamp,
+    ClusterTxnId, DeadlockProbe, Epoch, HomeOp, HomeReply, HomeStatus, LeaseKind, LockBatchRequest,
+    LockGrant, LockRequest, LockTarget, Outcome, RangeDescriptor, RangeError, RangeId,
+    RangeLockMode, RangeSpace, RangeWrite, ReadDirection, ReadPage, ReadRequest, SequenceOp,
+    SequenceReply, Timestamp,
 };
 
 use crate::client::{RangeCall, RangeReply};
@@ -588,6 +588,26 @@ fn put_range_call(w: &mut Writer, call: &RangeCall) -> Result<(), RangeError> {
             w.u64(*id);
             w.u64(*count);
         }
+        RangeCall::LockBatch(req) => {
+            req.check()?;
+            w.u8(15);
+            w.u64(req.range.0);
+            w.u64(req.epoch.0);
+            w.u64(req.txn.0);
+            w.u64(req.priority.0);
+            w.u8(match req.mode {
+                RangeLockMode::Shared => 0,
+                RangeLockMode::Exclusive => 1,
+            });
+            w.len(req.targets.len())?;
+            for target in &req.targets {
+                let LockTarget::Key { space, key } = target else {
+                    unreachable!()
+                };
+                w.u8(space.tag());
+                w.bytes(key)?;
+            }
+        }
         RangeCall::Sequence {
             range,
             id,
@@ -716,6 +736,31 @@ fn range_call(tag: u8, r: &mut Reader<'_>) -> Result<RangeCall, RangeError> {
                 _ => return Err(corrupt("unknown sequence op")),
             },
         },
+        15 => {
+            let (range, epoch, txn, priority) = (r.range()?, Epoch(r.u64()?), r.txn()?, r.ts()?);
+            let mode = match r.u8()? {
+                0 => RangeLockMode::Shared,
+                1 => RangeLockMode::Exclusive,
+                _ => return Err(corrupt("invalid lock mode")),
+            };
+            let n = r.count(5)?;
+            let targets = (0..n)
+                .map(|_| {
+                    Ok(LockTarget::Key {
+                        space: r.space()?,
+                        key: r.bytes()?,
+                    })
+                })
+                .collect::<Result<_, RangeError>>()?;
+            RangeCall::LockBatch(LockBatchRequest {
+                range,
+                epoch,
+                txn,
+                priority,
+                mode,
+                targets,
+            })
+        }
         _ => return Err(corrupt("unknown call")),
     })
 }
@@ -954,6 +999,21 @@ fn put_range_reply(w: &mut Writer, reply: &RangeReply) -> Result<(), RangeError>
             }
             w.u64(grant.generation);
         }
+        RangeReply::LockBatch(grants) => {
+            w.u8(15);
+            w.len(grants.len())?;
+            for grant in grants {
+                match &grant.latest {
+                    None => w.u8(0),
+                    Some((ts, value)) => {
+                        w.u8(1);
+                        w.u64(ts.0);
+                        w.opt_bytes(value.as_deref())?;
+                    }
+                }
+                w.u64(grant.generation);
+            }
+        }
         RangeReply::Blockers(txns) => {
             w.u8(4);
             w.txns(txns)?;
@@ -1095,6 +1155,23 @@ fn range_reply(tag: u8, r: &mut Reader<'_>) -> Result<RangeReply, RangeError> {
             3 => SequenceReply::OutOfRange,
             _ => return Err(corrupt("unknown sequence reply")),
         }),
+        15 => {
+            let n = r.count(9)?;
+            RangeReply::LockBatch(
+                (0..n)
+                    .map(|_| {
+                        Ok(LockGrant {
+                            latest: if r.flag()? {
+                                Some((r.ts()?, r.opt_bytes()?))
+                            } else {
+                                None
+                            },
+                            generation: r.u64()?,
+                        })
+                    })
+                    .collect::<Result<_, RangeError>>()?,
+            )
+        }
         _ => return Err(corrupt("unknown reply")),
     })
 }

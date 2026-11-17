@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use giggles_core::range_api::{
-    ClusterTxnId, Epoch, HomeOp, HomeReply, LeaseKind, LockGrant, LockRequest, Outcome,
-    RangeClient, RangeDescriptor, RangeError, RangeId, RangeService, RangeWrite, ReadPage,
+    ClusterTxnId, Epoch, HomeOp, HomeReply, LeaseKind, LockBatchRequest, LockGrant, LockRequest,
+    Outcome, RangeClient, RangeDescriptor, RangeError, RangeId, RangeService, RangeWrite, ReadPage,
     ReadRequest, SYSTEM_RANGE, SequenceOp, SequenceReply, SystemService, Timestamp, TsOracle,
 };
 
@@ -30,6 +30,7 @@ pub enum RangeCall {
     },
     Read(ReadRequest),
     Lock(LockRequest),
+    LockBatch(LockBatchRequest),
     Blockers {
         range: RangeId,
         txn: ClusterTxnId,
@@ -98,6 +99,7 @@ impl RangeCall {
         match self {
             Self::Read(req) => req.range,
             Self::Lock(req) => req.range,
+            Self::LockBatch(req) => req.range,
             Self::Descriptor { range }
             | Self::Blockers { range, .. }
             | Self::CancelWait { range, .. }
@@ -118,6 +120,7 @@ impl RangeCall {
             self,
             Self::Read(_)
                 | Self::Lock(_)
+                | Self::LockBatch(_)
                 | Self::Commit { .. }
                 | Self::Prepare { .. }
                 | Self::Home { .. }
@@ -137,6 +140,7 @@ pub enum RangeReply {
     Descriptor(RangeDescriptor),
     Read(ReadPage),
     Lock(LockGrant),
+    LockBatch(Vec<LockGrant>),
     Blockers(Vec<ClusterTxnId>),
     CancelWait,
     Release,
@@ -176,6 +180,11 @@ pub fn dispatch(local: &dyn LocalRanges, call: RangeCall) -> Result<RangeReply, 
         RangeCall::Descriptor { range } => RangeReply::Descriptor(service(range)?.descriptor()),
         RangeCall::Read(req) => RangeReply::Read(service(req.range)?.read(req)?),
         RangeCall::Lock(req) => RangeReply::Lock(service(req.range)?.lock(req)?),
+        RangeCall::LockBatch(req) => {
+            let service = service(req.range)?;
+            crate::range_guard::check_lock_batch(&service.descriptor(), &req)?;
+            RangeReply::LockBatch(service.lock_batch(req)?)
+        }
         RangeCall::Blockers { range, txn } => RangeReply::Blockers(service(range)?.blockers(txn)?),
         RangeCall::CancelWait { range, txn } => {
             service(range)?.cancel_wait(txn)?;
@@ -515,6 +524,9 @@ impl RangeClient for RoutedRangeClient {
     }
     fn lock(&self, req: LockRequest) -> Result<LockGrant, RangeError> {
         routed!(self.router, RangeCall::Lock(req), RangeReply::Lock(grant) => grant)
+    }
+    fn lock_batch(&self, req: LockBatchRequest) -> Result<Vec<LockGrant>, RangeError> {
+        routed!(self.router, RangeCall::LockBatch(req), RangeReply::LockBatch(grants) => grants)
     }
     fn blockers(&self, range: RangeId, txn: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError> {
         routed!(self.router, RangeCall::Blockers { range, txn }, RangeReply::Blockers(txns) => txns)

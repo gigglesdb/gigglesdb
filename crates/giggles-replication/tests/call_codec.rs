@@ -3,10 +3,10 @@
 use std::ops::Bound;
 
 use giggles_core::range_api::{
-    ClusterTxnId, DeadlockProbe, Epoch, HomeOp, HomeReply, HomeStatus, LeaseKind, LockGrant,
-    LockRequest, LockTarget, Outcome, RangeDescriptor, RangeError, RangeId, RangeLockMode,
-    RangeSpace, RangeWrite, ReadDirection, ReadPage, ReadRequest, ReplicaDesc, ReplicaRole,
-    SequenceOp, SequenceReply, Timestamp,
+    ClusterTxnId, DeadlockProbe, Epoch, HomeOp, HomeReply, HomeStatus, LeaseKind, LockBatchRequest,
+    LockGrant, LockRequest, LockTarget, Outcome, RangeDescriptor, RangeError, RangeId,
+    RangeLockMode, RangeSpace, RangeWrite, ReadDirection, ReadPage, ReadRequest, ReplicaDesc,
+    ReplicaRole, SequenceOp, SequenceReply, Timestamp,
 };
 use giggles_replication::{
     call_codec::{
@@ -51,6 +51,23 @@ fn calls() -> Vec<PeerCall> {
         },
     ];
     let mut out: Vec<PeerCall> = [
+        RangeCall::LockBatch(LockBatchRequest {
+            range,
+            epoch,
+            txn,
+            priority: Timestamp(5),
+            mode: RangeLockMode::Shared,
+            targets: vec![
+                LockTarget::Key {
+                    space: RangeSpace::Rows,
+                    key: vec![1],
+                },
+                LockTarget::Key {
+                    space: RangeSpace::Index,
+                    key: vec![2, 3],
+                },
+            ],
+        }),
         RangeCall::Descriptor { range },
         RangeCall::Read(ReadRequest {
             range,
@@ -286,6 +303,21 @@ fn node_report() -> NodeReport {
 
 fn replies() -> Vec<Result<PeerReply, RangeError>> {
     let mut out: Vec<Result<PeerReply, RangeError>> = [
+        RangeReply::LockBatch(vec![
+            LockGrant {
+                latest: None,
+                generation: 9,
+            },
+            LockGrant {
+                latest: Some((Timestamp(8), None)),
+                generation: 9,
+            },
+            LockGrant {
+                latest: Some((Timestamp(7), Some(vec![1, 2]))),
+                generation: 9,
+            },
+        ]),
+        RangeReply::LockBatch(vec![]),
         RangeReply::Descriptor(desc()),
         RangeReply::Read(ReadPage {
             pairs: vec![(vec![1, 2], vec![0, 9]), (vec![3], vec![1])],
@@ -431,7 +463,11 @@ fn unknown_tags_and_huge_counts_are_rejected() {
     huge.extend_from_slice(&u32::MAX.to_be_bytes());
     assert!(decode_reply(&huge).is_err());
     // An unknown keyspace tag in a read.
-    let mut read = encode_call(&calls()[1]).unwrap();
+    let read = calls()
+        .into_iter()
+        .find(|call| matches!(call, PeerCall::Range(RangeCall::Read(_))))
+        .unwrap();
+    let mut read = encode_call(&read).unwrap();
     read[1 + 1 + 16] = 0x11;
     assert!(decode_call(&read).is_err());
     // An unknown sequence op and an unknown sequence reply.
@@ -578,5 +614,41 @@ fn registry_admin_tags_roundtrip_strictly() {
         assert_eq!(decode_reply(&bytes).unwrap().unwrap(), reply);
         assert!(decode_reply(&[1, 0, tag, 2]).is_err());
         assert!(decode_reply(&[1, 0, tag, 0, 0]).is_err());
+    }
+}
+
+#[test]
+fn lock_batch_rejects_non_keys_and_invalid_wire_fields() {
+    let mut req = LockBatchRequest {
+        range: RangeId(7),
+        epoch: Epoch(3),
+        txn: ClusterTxnId(1),
+        priority: Timestamp(5),
+        mode: RangeLockMode::Shared,
+        targets: vec![LockTarget::Key {
+            space: RangeSpace::Rows,
+            key: vec![1],
+        }],
+    };
+    let bytes = encode_call(&PeerCall::Range(RangeCall::LockBatch(req.clone()))).unwrap();
+    assert_eq!(bytes[1], 15);
+    for (offset, invalid) in [(34, 2), (39, 0xff)] {
+        let mut bad = bytes.clone();
+        bad[offset] = invalid;
+        assert!(matches!(decode_call(&bad), Err(RangeError::Corrupt(_))));
+    }
+    for target in [
+        LockTarget::TableSentinel { table: 1 },
+        LockTarget::Interval {
+            space: RangeSpace::Rows,
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+        },
+    ] {
+        req.targets = vec![target];
+        assert!(matches!(
+            encode_call(&PeerCall::Range(RangeCall::LockBatch(req.clone()))),
+            Err(RangeError::Corrupt(_))
+        ));
     }
 }

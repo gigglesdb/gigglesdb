@@ -4,8 +4,8 @@
 use std::ops::Bound;
 
 use giggles_core::range_api::{
-    Epoch, LockRequest, LockTarget, RangeDescriptor, RangeError, RangeSpace, RangeWrite,
-    ReadRequest, range_key,
+    Epoch, LockBatchRequest, LockRequest, LockTarget, RangeDescriptor, RangeError, RangeSpace,
+    RangeWrite, ReadRequest, range_key,
 };
 
 fn stale(desc: &RangeDescriptor) -> RangeError {
@@ -75,6 +75,27 @@ pub fn check_lock(desc: &RangeDescriptor, req: &LockRequest) -> Result<(), Range
             require(desc, below_end && hi > desc.start)
         }
     }
+}
+
+/// Checks every key before a nonblocking batch is served.
+pub fn check_lock_batch(desc: &RangeDescriptor, req: &LockBatchRequest) -> Result<(), RangeError> {
+    req.check()?;
+    check_epoch(desc, req.epoch)?;
+    for target in &req.targets {
+        check_lock(
+            desc,
+            &LockRequest {
+                range: req.range,
+                epoch: req.epoch,
+                txn: req.txn,
+                priority: req.priority,
+                target: target.clone(),
+                mode: req.mode,
+                timeout_ms: Some(0),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 pub fn check_writes(

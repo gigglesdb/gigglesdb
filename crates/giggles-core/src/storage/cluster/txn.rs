@@ -8,9 +8,9 @@ use super::coordinator::{
 use super::read::{RoutedKvRead, past_end, range_space};
 use super::xact::{Lookup, XactRecord, read_record, xact_key};
 use crate::range_api::{
-    ClusterTxnId, DeadlockProbe, Epoch, GatewayPeer, GatewayService, LeaseKind, LockRequest,
-    LockTarget, RangeClient, RangeDescriptor, RangeError, RangeId, RangeLockMode, RangeSpace,
-    RangeWrite, SequenceOp, Timestamp, WaitSite, range_key,
+    ClusterTxnId, DeadlockProbe, Epoch, GatewayPeer, GatewayService, LeaseKind, LockBatchRequest,
+    LockRequest, LockTarget, RangeClient, RangeDescriptor, RangeError, RangeId, RangeLockMode,
+    RangeSpace, RangeWrite, SequenceOp, Timestamp, WaitSite, range_key,
 };
 use crate::storage::engine::{
     commit::RawOp,
@@ -500,25 +500,7 @@ impl ClusterTxnServices {
             self.state(txn, |state| state.waiting = None);
             match result {
                 Ok(grant) => {
-                    // A second generation from one range means earlier locks there were lost:
-                    // the transaction aborts without trying to commit (design.md 10:40Z (b)).
-                    let lost = self.state(txn, |state| {
-                        state
-                            .epochs
-                            .entry(descriptor.id)
-                            .or_insert(descriptor.epoch);
-                        let held = *state
-                            .generations
-                            .entry(descriptor.id)
-                            .or_insert(grant.generation);
-                        if held != grant.generation {
-                            state.aborted = true;
-                        }
-                        held != grant.generation
-                    });
-                    if lost {
-                        return Err(TxnError::Serialization(SerializationReason::WriteConflict));
-                    }
+                    self.record_lock_grant(txn, &descriptor, grant.generation)?;
                     return Ok((descriptor, grant.latest));
                 }
                 Err(RangeError::Deadlock) => return Err(TxnError::Deadlock),
@@ -546,6 +528,35 @@ impl ClusterTxnServices {
                 Err(error) => return Err(txn_error(error)),
             }
         }
+    }
+
+    /// Remembers the epoch and refuses grants from a replacement lock table.
+    fn record_lock_grant(
+        &self,
+        txn: TxnId,
+        descriptor: &RangeDescriptor,
+        generation: u64,
+    ) -> Result<(), TxnError> {
+        self.state(txn, |state| {
+            state.ranges.insert(descriptor.id);
+        });
+        // A second generation from one range means earlier locks there were lost:
+        // the transaction aborts without trying to commit (design.md 10:40Z (b)).
+        let lost = self.state(txn, |state| {
+            state
+                .epochs
+                .entry(descriptor.id)
+                .or_insert(descriptor.epoch);
+            let held = *state.generations.entry(descriptor.id).or_insert(generation);
+            if held != generation {
+                state.aborted = true;
+            }
+            held != generation
+        });
+        if lost {
+            return Err(TxnError::Serialization(SerializationReason::WriteConflict));
+        }
+        Ok(())
     }
 
     /// Takes the Shared writer sentinel of `table` in the range holding `rk`, once.
@@ -664,9 +675,50 @@ impl ClusterTxnServices {
                     other => other,
                 })
         };
-        for (rk, target) in targets {
-            let (_, latest) = shared(&rk, target)?;
-            validation.validate_locked_point(latest.map(|(ts, _)| Ts(ts.0)), snapshot)?;
+        let mut at = 0;
+        while at < targets.len() {
+            self.check_live(txn)?;
+            if cancel() {
+                return Err(TxnError::Cancelled);
+            }
+            let descriptor = self.descriptor(&targets[at].0)?;
+            let mut end = at + 1;
+            while end < targets.len() && descriptor.contains(&targets[end].0) {
+                end += 1;
+            }
+            let group = &targets[at..end];
+            let grants = if group.len() >= 2 {
+                // Even a partial batch can hold locks: remember the range for release.
+                self.state(txn, |state| {
+                    state.ranges.insert(descriptor.id);
+                });
+                self.client
+                    .lock_batch(LockBatchRequest {
+                        range: descriptor.id,
+                        epoch: descriptor.epoch,
+                        txn: ClusterTxnId(txn.0),
+                        priority: self.priority(txn)?,
+                        mode: RangeLockMode::Shared,
+                        targets: group.iter().map(|(_, target)| target.clone()).collect(),
+                    })
+                    .ok()
+                    .filter(|grants| grants.len() == group.len())
+            } else {
+                None
+            };
+            if let Some(grants) = grants {
+                for grant in grants {
+                    self.record_lock_grant(txn, &descriptor, grant.generation)?;
+                    validation
+                        .validate_locked_point(grant.latest.map(|(ts, _)| Ts(ts.0)), snapshot)?;
+                }
+            } else {
+                for (rk, target) in group {
+                    let (_, latest) = shared(rk, target.clone())?;
+                    validation.validate_locked_point(latest.map(|(ts, _)| Ts(ts.0)), snapshot)?;
+                }
+            }
+            at = end;
         }
         // R5-72: each scanned interval (to its last key read, or to its end bound when the
         // scan ran out, which covers the gap after the last key) is gap-locked in every range
@@ -944,7 +996,10 @@ impl ClusterServices for ClusterTxnServices {
         self.lock_in_range(
             txn,
             &range_key(space, key),
-            LockTarget::Key { space, key: key.to_vec() },
+            LockTarget::Key {
+                space,
+                key: key.to_vec(),
+            },
             RangeLockMode::Shared,
             deadline,
             cancel,

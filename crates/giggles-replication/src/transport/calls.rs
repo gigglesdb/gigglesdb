@@ -82,6 +82,7 @@ fn lost(call: &PeerCall, what: String) -> RangeError {
             | RangeCall::Finalize { .. }
             | RangeCall::Home { .. },
         ) => RangeError::Unknown(what),
+        PeerCall::Range(RangeCall::LockBatch(_)) => RangeError::Unavailable(what),
         _ => RangeError::Unavailable(what),
     }
 }
