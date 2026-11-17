@@ -266,6 +266,8 @@ pub enum SqlError {
     CardinalityViolation,
     /// 42P10 invalid_column_reference
     InvalidColumnReference,
+    /// 42P19 invalid_recursion
+    InvalidRecursion,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

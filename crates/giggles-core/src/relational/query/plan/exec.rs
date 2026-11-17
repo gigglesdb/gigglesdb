@@ -7,7 +7,7 @@ pub(super) struct Relation<'a> {
     pub columns: Vec<ColumnDef>,
     pub typmods: Vec<i32>,
     pub rows: Vec<SqlRow>,
-    scope: RetentionScope<'a>,
+    pub(super) scope: RetentionScope<'a>,
 }
 impl<'a> Relation<'a> {
     pub fn new(columns: Vec<ColumnDef>, typmods: Vec<i32>, execution: &'a Execution<'_>) -> Self {
@@ -97,6 +97,9 @@ impl Plan {
         if execution.cancelled() {
             return Err(SqlError::Aborted);
         }
+        if !self.ctes.is_empty() {
+            return cte::run(self, state, source, params, parameters, clock, execution);
+        }
         let description = self.describe(state, parameters.len(), parameters)?;
         let mut result = Relation::new(description.columns, description.typmods, execution);
         match &self.body {
@@ -112,13 +115,22 @@ impl Plan {
                 let synthetic = input
                     .as_ref()
                     .map(|rows| {
-                        input_state(select.input.as_ref().unwrap(), &rows.columns, &rows.typmods)
+                        input_state(
+                            state,
+                            select.input.as_ref().unwrap(),
+                            &rows.columns,
+                            &rows.typmods,
+                        )
                     })
                     .transpose()?;
                 let state = synthetic.as_ref().unwrap_or(state);
-                let source: &dyn scan::RowSource = input.as_ref().map_or(source, |rows| rows);
-                let bound = select
-                    .query
+                let wrapper = input.as_ref().map(|rows| cte::VirtualRows {
+                    base: source,
+                    relations: vec![(select.input.as_ref().unwrap().name.clone(), rows)],
+                });
+                let source: &dyn scan::RowSource = wrapper.as_ref().map_or(source, |rows| rows);
+                let query = cte::prepare_query(&select.query, state)?;
+                let bound = query
                     .bind_projection_seeded(state, parameters.to_vec())?
                     .with_clock(clock);
                 let rows = bound

@@ -4,6 +4,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(in crate::relational) struct Plan {
     pub(super) body: Body,
+    pub(super) ctes: Vec<cte::Cte>,
     pub(super) order: Vec<(Scalar, bool, bool)>,
     pub(super) limit: Option<Scalar>,
     pub(super) offset: Option<Scalar>,
@@ -43,6 +44,7 @@ impl Plan {
     pub(super) fn new(body: Body) -> Self {
         Self {
             body,
+            ctes: vec![],
             order: vec![],
             limit: None,
             offset: None,
@@ -80,7 +82,10 @@ impl Plan {
         self.visit_scalars(&mut |s| s.sequence_dependencies(&mut out));
         out
     }
-    fn visit_queries(&self, f: &mut impl FnMut(&Query)) {
+    pub(super) fn visit_queries(&self, f: &mut impl FnMut(&Query)) {
+        for cte in &self.ctes {
+            cte.query.visit_queries(f);
+        }
         match &self.body {
             Body::Select(s) => {
                 f(&s.query);
@@ -96,6 +101,9 @@ impl Plan {
         }
     }
     fn visit_scalars(&self, f: &mut impl FnMut(&Scalar)) {
+        for cte in &self.ctes {
+            cte.query.visit_scalars(f);
+        }
         self.order.iter().for_each(|(s, _, _)| f(s));
         self.limit.iter().chain(&self.offset).for_each(&mut *f);
         match &self.body {
@@ -117,6 +125,9 @@ impl Plan {
         state: &Relational,
         path: &[String],
     ) {
+        for cte in &mut self.ctes {
+            cte.query.bind_schema_names(bind, state, path);
+        }
         for (s, _, _) in &mut self.order {
             schema_names::scalar(s, bind, state, path);
         }

@@ -1,6 +1,6 @@
 use super::*;
 
-fn parser(tokens: &[Token]) -> Parser {
+pub(super) fn parser(tokens: &[Token]) -> Parser {
     Parser {
         tokens: tokens.to_vec(),
         at: 0,
@@ -8,7 +8,7 @@ fn parser(tokens: &[Token]) -> Parser {
         relations: vec![],
     }
 }
-fn word(t: &Token, w: &str) -> bool {
+pub(super) fn word(t: &Token, w: &str) -> bool {
     matches!(t, Token::Word(s) if s == w)
 }
 fn top(tokens: &[Token]) -> R<Vec<usize>> {
@@ -35,7 +35,7 @@ fn top(tokens: &[Token]) -> R<Vec<usize>> {
 }
 impl Plan {
     pub(in crate::relational) fn claims(tokens: &[Token]) -> bool {
-        matches!(tokens.first(), Some(Token::Word(w)) if ["select", "values", "table", "explain"].contains(&w.as_str()))
+        matches!(tokens.first(), Some(Token::Word(w)) if ["select", "values", "table", "explain", "with"].contains(&w.as_str()))
             || tokens.first() == Some(&Token::Symbol('('))
     }
     pub(in crate::relational) fn parse(p: &mut Parser) -> R<Self> {
@@ -46,7 +46,7 @@ impl Plan {
         if tokens.len() > MAX_WORK * 8 {
             return Err(SqlError::Limit);
         }
-        let plan = expression(&tokens, p, 0)?;
+        let plan = expression(&tokens, p, 0, &mut 0)?;
         // Query's normalizer may rewrite tokens; collect original parameter numbers.
         p.params.extend(tokens.iter().filter_map(|t| {
             if let Token::Param(n) = t {
@@ -59,12 +59,20 @@ impl Plan {
         Ok(plan)
     }
 }
-fn expression(tokens: &[Token], owner: &mut Parser, depth: usize) -> R<Plan> {
+pub(super) fn expression(
+    tokens: &[Token],
+    owner: &mut Parser,
+    depth: usize,
+    next: &mut usize,
+) -> R<Plan> {
     if depth > 32 {
         return Err(SqlError::Limit);
     }
     if tokens.is_empty() {
         return Err(SqlError::Syntax);
+    }
+    if tokens.first().is_some_and(|t| word(t, "with")) {
+        return cte::parse(tokens, owner, depth, next);
     }
     let positions = top(tokens)?;
     let tail = positions
@@ -102,11 +110,12 @@ fn expression(tokens: &[Token], owner: &mut Parser, depth: usize) -> R<Plan> {
         Plan::new(Body::Set {
             op,
             all,
-            left: Box::new(expression(&body[..i], owner, depth + 1)?),
+            left: Box::new(expression(&body[..i], owner, depth + 1, next)?),
             right: Box::new(expression(
                 &body[i + 1 + usize::from(modifier)..],
                 owner,
                 depth + 1,
+                next,
             )?),
         })
     } else if body.first() == Some(&Token::Symbol('(')) {
@@ -114,7 +123,7 @@ fn expression(tokens: &[Token], owner: &mut Parser, depth: usize) -> R<Plan> {
             return Err(SqlError::Syntax);
         }
         // Keep both pagination boundaries, even for ((SELECT ...) LIMIT ...).
-        let child = expression(&body[1..body.len() - 1], owner, depth + 1)?;
+        let child = expression(&body[1..body.len() - 1], owner, depth + 1, next)?;
         if tail == tokens.len() {
             return Ok(child);
         }
@@ -177,7 +186,7 @@ fn expression(tokens: &[Token], owner: &mut Parser, depth: usize) -> R<Plan> {
         }
         Plan::new(Body::Values(rows))
     } else {
-        return select(tokens, owner, depth);
+        return select(tokens, owner, depth, next);
     };
     let mut p = parser(&tokens[tail..]);
     if p.word("order") {
@@ -239,7 +248,7 @@ fn expression(tokens: &[Token], owner: &mut Parser, depth: usize) -> R<Plan> {
     }
     Ok(plan)
 }
-fn select(tokens: &[Token], owner: &mut Parser, depth: usize) -> R<Plan> {
+fn select(tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize) -> R<Plan> {
     let mut tokens = tokens.to_vec();
     if tokens.first().is_some_and(|t| word(t, "table")) {
         tokens.splice(
@@ -287,7 +296,7 @@ fn select(tokens: &[Token], owner: &mut Parser, depth: usize) -> R<Plan> {
     {
         let open = from + 1;
         let close = subquery_end(&tokens, open)?;
-        let child = expression(&tokens[open + 1..close], owner, depth + 1)?;
+        let child = expression(&tokens[open + 1..close], owner, depth + 1, next)?;
         let mut p = parser(&tokens[close + 1..]);
         let explicit = p.word("as");
         let alias = if explicit

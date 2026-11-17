@@ -82,18 +82,31 @@ impl Plan {
         let parameters: Vec<_> = bound.description.parameters.into_iter().map(Some).collect();
         bound.plan.validate_constants(state, &parameters)
     }
-    fn validate_constants(&self, state: &Relational, parameters: &[Option<DataType>]) -> R<()> {
+    pub(super) fn validate_constants(
+        &self,
+        state: &Relational,
+        parameters: &[Option<DataType>],
+    ) -> R<()> {
+        if !self.ctes.is_empty() {
+            let mut plan = self.clone();
+            let mut parameters = parameters.to_vec();
+            let catalog = cte::resolve(&mut plan.ctes, state, &mut parameters)?;
+            for cte in &plan.ctes {
+                cte::validate_constants(cte, &catalog, &parameters)?;
+            }
+            plan.ctes.clear();
+            return plan.validate_constants(&catalog, &parameters);
+        }
         match &self.body {
             Body::Select(select) => {
                 let synthetic = if let Some(input) = &select.input {
                     input.query.validate_constants(state, parameters)?;
                     let d = input.query.describe(state, parameters.len(), parameters)?;
-                    Some(input_state(input, &d.columns, &d.typmods)?)
+                    Some(input_state(state, input, &d.columns, &d.typmods)?)
                 } else {
                     None
                 };
-                select
-                    .query
+                cte::prepare_query(&select.query, synthetic.as_ref().unwrap_or(state))?
                     .bind_projection_seeded(
                         synthetic.as_ref().unwrap_or(state),
                         parameters.to_vec(),
@@ -141,16 +154,27 @@ impl Plan {
             },
         })
     }
-    fn resolve(&mut self, state: &Relational, parameters: &mut [Option<DataType>]) -> R<Meta> {
+    pub(super) fn resolve(
+        &mut self,
+        state: &Relational,
+        parameters: &mut [Option<DataType>],
+    ) -> R<Meta> {
+        let catalog = if self.ctes.is_empty() {
+            None
+        } else {
+            Some(cte::resolve(&mut self.ctes, state, parameters)?)
+        };
+        let state = catalog.as_ref().unwrap_or(state);
         let meta = match &mut self.body {
             Body::Select(select) => {
                 let synthetic = if let Some(input) = &mut select.input {
                     let meta = input.query.resolve(state, parameters)?;
-                    Some(input_state(input, &meta.columns, &meta.typmods)?)
+                    Some(input_state(state, input, &meta.columns, &meta.typmods)?)
                 } else {
                     None
                 };
                 let state = synthetic.as_ref().unwrap_or(state);
+                let query = cte::prepare_query(&select.query, state)?;
                 let mut unknown_parameters: Vec<_> = select
                     .query
                     .items
@@ -173,7 +197,7 @@ impl Plan {
                         *slot = Some(DataType::Text);
                     }
                 }
-                let bound = match select.query.bind_projection_seeded(state, seeded.clone()) {
+                let bound = match query.bind_projection_seeded(state, seeded.clone()) {
                     Ok(bound) => {
                         unknown_parameters.clear();
                         bound
@@ -182,13 +206,16 @@ impl Plan {
                         for n in &unknown_parameters {
                             seeded[*n - 1] = Some(DataType::Text);
                         }
-                        select.query.bind_projection_seeded(state, seeded)?
+                        query.bind_projection_seeded(state, seeded)?
                     }
                     Err(error) => return Err(error),
                 };
-                let description = bound.description(state);
-                let unknown = select
-                    .query
+                let mut description = bound.description(state);
+                let oids = cte::projection_oids(&bound);
+                if oids.iter().any(|oid| *oid != 0) {
+                    description.type_oids = oids;
+                }
+                let unknown = query
                     .insert_outputs(state)?
                     .iter()
                     .map(Option::is_some)
@@ -216,7 +243,13 @@ impl Plan {
                 }
                 // Synthetic IDs exist only to carry typmods inside the temporary
                 // binder catalog. Never expose them to the real catalog's OID lookup.
-                if select.input.is_some() {
+                if select.input.is_some()
+                    || select
+                        .query
+                        .sources
+                        .iter()
+                        .any(|s| s.name.starts_with("\0plan_"))
+                {
                     for column in &mut meta.columns {
                         column.id = 0;
                     }
@@ -387,7 +420,12 @@ pub(super) fn order_column(c: &ColumnRef, table: &TableDef) -> R<BoundColumn> {
     }
     output_column(c, table)
 }
-pub(super) fn input_state(input: &Input, columns: &[ColumnDef], typmods: &[i32]) -> R<Relational> {
+pub(super) fn input_state(
+    base: &Relational,
+    input: &Input,
+    columns: &[ColumnDef],
+    typmods: &[i32],
+) -> R<Relational> {
     if input.aliases.len() > columns.len() {
         return Err(SqlError::InvalidColumnReference);
     }
@@ -398,26 +436,7 @@ pub(super) fn input_state(input: &Input, columns: &[ColumnDef], typmods: &[i32])
             column.name = alias.clone();
         }
     }
-    let mut state = Relational::default();
-    for (column, typmod) in columns.iter().zip(typmods) {
-        if *typmod >= 0 {
-            state.ext.columns.insert(
-                column.id,
-                catalog_ext::ColumnExt {
-                    typmod: Some(*typmod),
-                    ..Default::default()
-                },
-            );
-        }
-    }
-    state.tables.insert(
-        input.name.clone(),
-        TableDef {
-            id: 0,
-            name: input.name.clone(),
-            columns,
-            primary_key: vec![],
-        },
-    );
+    let mut state = cte::catalog(base);
+    cte::install(&mut state, &input.name, &columns, typmods)?;
     Ok(state)
 }

@@ -2711,7 +2711,7 @@ impl Query {
                 .iter()
                 .map(|i| keys.get(i).cloned())
                 .collect::<Option<Vec<_>>>();
-            let scan = key.is_none();
+            let scan = tables[right].primary_key.is_empty() || key.is_none();
             let key = key.unwrap_or_default();
             joins.push(BoundJoin {
                 left: join.left,

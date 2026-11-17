@@ -2,6 +2,7 @@
 use super::*;
 mod ast;
 mod bind;
+mod cte;
 mod exec;
 mod parse;
 mod setops;
