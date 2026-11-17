@@ -114,15 +114,18 @@ impl Plan {
                 let synthetic = if let Some(input) = &select.input {
                     input.query.validate_constants(state, parameters)?;
                     let d = input.query.describe(state, parameters.len(), parameters)?;
-                    Some(input_state(state, input, &d.columns, &d.typmods)?)
+                    let columns =
+                        window::columns(&select.windows, &d.columns, &mut parameters.to_vec())?;
+                    let mut typmods = d.typmods;
+                    typmods.resize(columns.len(), -1);
+                    Some(input_state(state, input, &columns, &typmods)?)
                 } else {
                     None
                 };
-                cte::prepare_query(&select.query, synthetic.as_ref().unwrap_or(state))?
-                    .bind_projection_seeded(
-                        synthetic.as_ref().unwrap_or(state),
-                        parameters.to_vec(),
-                    )?
+                let state = synthetic.as_ref().unwrap_or(state);
+                let query = window::prepare(select, state)?;
+                cte::prepare_query(&query, state)?
+                    .bind_projection_seeded(state, parameters.to_vec())?
                     .validate_immutable_constants()?;
             }
             Body::Values(rows) => {
@@ -191,7 +194,10 @@ impl Plan {
                     Some(join::catalog(state, shape)?)
                 } else if let Some(input) = &mut select.input {
                     let meta = input.query.resolve(state, parameters)?;
-                    Some(input_state(state, input, &meta.columns, &meta.typmods)?)
+                    let columns = window::columns(&select.windows, &meta.columns, parameters)?;
+                    let mut typmods = meta.typmods;
+                    typmods.resize(columns.len(), -1);
+                    Some(input_state(state, input, &columns, &typmods)?)
                 } else {
                     None
                 };
@@ -199,7 +205,8 @@ impl Plan {
                 let query = if let Some(shape) = &shape {
                     join::prepare(&select.query, shape)?
                 } else {
-                    cte::prepare_query(&select.query, state)?
+                    let q = window::prepare(select, state)?;
+                    cte::prepare_query(&q, state)?
                 };
                 let mut unknown_parameters: Vec<_> = select
                     .query

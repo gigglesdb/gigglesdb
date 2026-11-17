@@ -10,6 +10,7 @@ mod parse;
 mod setops;
 pub(super) mod subquery;
 mod srf;
+mod window;
 pub(in crate::relational) use ast::Plan;
 use ast::*;
 

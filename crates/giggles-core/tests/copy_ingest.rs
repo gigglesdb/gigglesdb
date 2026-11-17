@@ -242,8 +242,32 @@ fn copy_error_append_contract() {
     assert_eq!(be.serialize(&E::DuplicateAlias).unwrap(), [0, 0, 0, 59]);
     assert_eq!(local::failure(CoreError::Sql(E::DuplicateAlias)).code, 259);
     assert_eq!(serde_json::to_string(&E::DuplicateAlias).unwrap(), "\"DuplicateAlias\"");
-    assert!(le.deserialize::<E>(&[60, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<E>(&[0, 0, 0, 60]).is_err());
+    assert_eq!(le.deserialize::<E>(&[60, 0, 0, 0]).unwrap(), E::WindowingError);
+    assert_eq!(be.deserialize::<E>(&[0, 0, 0, 60]).unwrap(), E::WindowingError);
+    assert_eq!(le.serialize(&E::WindowingError).unwrap(), [60, 0, 0, 0]);
+    assert_eq!(be.serialize(&E::WindowingError).unwrap(), [0, 0, 0, 60]);
+    assert_eq!(local::failure(CoreError::Sql(E::WindowingError)).code, 260);
+    assert_eq!(serde_json::to_string(&E::WindowingError).unwrap(), "\"WindowingError\"");
+    assert_eq!(le.deserialize::<E>(&[61, 0, 0, 0]).unwrap(), E::InvalidFrameOffset);
+    assert_eq!(be.deserialize::<E>(&[0, 0, 0, 61]).unwrap(), E::InvalidFrameOffset);
+    assert_eq!(le.serialize(&E::InvalidFrameOffset).unwrap(), [61, 0, 0, 0]);
+    assert_eq!(be.serialize(&E::InvalidFrameOffset).unwrap(), [0, 0, 0, 61]);
+    assert_eq!(local::failure(CoreError::Sql(E::InvalidFrameOffset)).code, 261);
+    assert_eq!(serde_json::to_string(&E::InvalidFrameOffset).unwrap(), "\"InvalidFrameOffset\"");
+    assert_eq!(le.deserialize::<E>(&[62, 0, 0, 0]).unwrap(), E::InvalidNtileArgument);
+    assert_eq!(be.deserialize::<E>(&[0, 0, 0, 62]).unwrap(), E::InvalidNtileArgument);
+    assert_eq!(le.serialize(&E::InvalidNtileArgument).unwrap(), [62, 0, 0, 0]);
+    assert_eq!(be.serialize(&E::InvalidNtileArgument).unwrap(), [0, 0, 0, 62]);
+    assert_eq!(local::failure(CoreError::Sql(E::InvalidNtileArgument)).code, 262);
+    assert_eq!(serde_json::to_string(&E::InvalidNtileArgument).unwrap(), "\"InvalidNtileArgument\"");
+    assert_eq!(le.deserialize::<E>(&[63, 0, 0, 0]).unwrap(), E::InvalidNthValueArgument);
+    assert_eq!(be.deserialize::<E>(&[0, 0, 0, 63]).unwrap(), E::InvalidNthValueArgument);
+    assert_eq!(le.serialize(&E::InvalidNthValueArgument).unwrap(), [63, 0, 0, 0]);
+    assert_eq!(be.serialize(&E::InvalidNthValueArgument).unwrap(), [0, 0, 0, 63]);
+    assert_eq!(local::failure(CoreError::Sql(E::InvalidNthValueArgument)).code, 263);
+    assert_eq!(serde_json::to_string(&E::InvalidNthValueArgument).unwrap(), "\"InvalidNthValueArgument\"");
+    assert!(le.deserialize::<E>(&[64, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<E>(&[0, 0, 0, 64]).is_err());
     assert_eq!(
         serde_json::to_string(&error).unwrap(),
         "\"BadCopyFileFormat\""

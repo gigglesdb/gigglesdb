@@ -62,6 +62,7 @@ pub(super) fn parse(
         let mut select = Select {
             query,
             applies,
+            windows: vec![],
             parameters: original
                 .iter()
                 .filter_map(|t| {

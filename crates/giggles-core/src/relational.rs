@@ -270,6 +270,14 @@ pub enum SqlError {
     InvalidRecursion,
     /// 42712 duplicate_alias
     DuplicateAlias,
+    /// 42P20 windowing_error
+    WindowingError,
+    /// 22013 invalid_preceding_or_following_size
+    InvalidFrameOffset,
+    /// 22014 invalid_argument_for_ntile_function
+    InvalidNtileArgument,
+    /// 22016 invalid_argument_for_nth_value_function
+    InvalidNthValueArgument,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

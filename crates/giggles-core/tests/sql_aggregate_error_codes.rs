@@ -124,6 +124,10 @@ fn current_closed_sql_errors_decode_only_literal_unit_variants() {
         (27, "SubstringError", E::SubstringError),
         (58, "InvalidRecursion", E::InvalidRecursion),
         (59, "DuplicateAlias", E::DuplicateAlias),
+        (60, "WindowingError", E::WindowingError),
+        (61, "InvalidFrameOffset", E::InvalidFrameOffset),
+        (62, "InvalidNtileArgument", E::InvalidNtileArgument),
+        (63, "InvalidNthValueArgument", E::InvalidNthValueArgument),
     ];
     for (tag, name, expected) in identities {
         let le = bincode::DefaultOptions::new()
@@ -178,7 +182,7 @@ fn current_closed_sql_errors_decode_only_literal_unit_variants() {
         assert!(serde_json::from_str::<E>(&format!("{json} null")).is_err());
         assert!(serde_json::from_str::<E>(&json[..json.len() - 1]).is_err());
     }
-    for tag in [60u32, u32::MAX] {
+    for tag in [64u32, u32::MAX] {
         assert!(
             bincode::DefaultOptions::new()
                 .with_fixint_encoding()

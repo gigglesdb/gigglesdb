@@ -142,6 +142,10 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidColumnReference => 57,
                 relational::SqlError::InvalidRecursion => 58,
                 relational::SqlError::DuplicateAlias => 59,
+                relational::SqlError::WindowingError => 60,
+                relational::SqlError::InvalidFrameOffset => 61,
+                relational::SqlError::InvalidNtileArgument => 62,
+                relational::SqlError::InvalidNthValueArgument => 63,
             }
         }
     };

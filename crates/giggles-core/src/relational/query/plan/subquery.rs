@@ -301,7 +301,7 @@ fn map_filter(p: &mut Filter, f: &mut impl FnMut(&mut Scalar) -> R<()>) -> R<()>
     }
     Ok(())
 }
-fn map_query(q: &mut Query, f: &mut impl FnMut(&mut Scalar) -> R<()>) -> R<()> {
+pub(super) fn map_query(q: &mut Query, f: &mut impl FnMut(&mut Scalar) -> R<()>) -> R<()> {
     for (item, _) in &mut q.items {
         if let Item::Scalar(s) | Item::Aggregate(_, Some(s)) = item {
             map_scalar(s, f)?;
@@ -477,6 +477,9 @@ pub(super) fn instantiate_scoped(
             }
             Body::Select(s) => {
                 map_query(&mut s.query, &mut replace)?;
+                for window in &mut s.windows {
+                    window.map_scalars(&mut replace)?;
+                }
                 // Correlation can turn an indexed outer-column predicate into
                 // a constant. The full filter remains the source of truth.
                 s.query.predicates.clear();
@@ -1272,6 +1275,7 @@ fn promote(mut query: Query, next: &mut usize) -> Plan {
                 query: leaf,
                 parameters: BTreeSet::new(),
                 applies: vec![],
+                windows: vec![],
                 input: None,
                 from: None,
             })))
@@ -1312,6 +1316,7 @@ fn promote(mut query: Query, next: &mut usize) -> Plan {
         query,
         parameters,
         applies,
+        windows: vec![],
         input: None,
         from,
     })))

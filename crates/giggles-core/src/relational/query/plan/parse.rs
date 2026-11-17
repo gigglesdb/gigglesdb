@@ -90,7 +90,8 @@ impl Plan {
             probe.extend_from_slice(&tokens[start..end]);
             Query::parse(&mut parser(&probe)).ok().map(|_| start + 1)
         });
-        if subquery::quantified(tokens)
+        if tokens.iter().any(|t| word(t, "over") || word(t, "window"))
+            || subquery::quantified(tokens)
             || tokens.windows(2).enumerate().any(|(i, pair)| {
                 Some(i) != legacy_derived
                     && pair[0] == Token::Symbol('(')
@@ -283,6 +284,7 @@ fn identity(child: Plan) -> ParseResult<Plan> {
     query.sources[0].name = name.clone();
     Ok(Plan::new(Body::Select(Box::new(Select {
         applies: vec![],
+        windows: vec![],
         query,
         parameters: BTreeSet::new(),
         from: None,
@@ -335,7 +337,7 @@ fn values(body: &[Token]) -> ParseResult<Plan> {
     Ok(Plan::new(Body::Values(rows)))
 }
 
-fn pagination(mut plan: Plan, tokens: &[Token]) -> ParseResult<Plan> {
+pub(super) fn pagination(mut plan: Plan, tokens: &[Token]) -> ParseResult<Plan> {
     let mut p = parser(tokens);
     if p.word("order") {
         p.need("by")?;
@@ -517,6 +519,7 @@ fn select_query(tokens: &[Token], input: Option<Input>, owner: &mut Parser) -> P
     );
     Ok(Plan::new(Body::Select(Box::new(Select {
         applies: vec![],
+        windows: vec![],
         query,
         parameters,
         input,
@@ -524,12 +527,15 @@ fn select_query(tokens: &[Token], input: Option<Input>, owner: &mut Parser) -> P
     }))))
 }
 
-fn select(
+pub(super) fn select(
     tokens: &[Token],
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
 ) -> ParseResult<Plan> {
+    if let Some(plan) = window::parse(tokens, owner, depth, next)? {
+        return Ok(plan);
+    }
     let (rewritten, applies) = subquery::rewrite(tokens, owner, depth, next)?;
     let mut plan = if !applies.is_empty() {
         // Rewriting must not let the FROM planner bypass a definite parser error.

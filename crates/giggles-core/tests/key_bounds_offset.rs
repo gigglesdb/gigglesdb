@@ -172,6 +172,10 @@ fn row_count_error_protocol_identities() {
         (57, SqlError::InvalidColumnReference),
         (58, SqlError::InvalidRecursion),
         (59, SqlError::DuplicateAlias),
+        (60, SqlError::WindowingError),
+        (61, SqlError::InvalidFrameOffset),
+        (62, SqlError::InvalidNtileArgument),
+        (63, SqlError::InvalidNthValueArgument),
     ] {
         let le = bincode::DefaultOptions::new()
             .with_fixint_encoding()
@@ -193,7 +197,7 @@ fn row_count_error_protocol_identities() {
             giggles_core::local::failure(CoreError::Sql(error)).code,
             200 + tag
         );
-        assert!(le.deserialize::<SqlError>(&60u32.to_le_bytes()).is_err());
-        assert!(be.deserialize::<SqlError>(&60u32.to_be_bytes()).is_err());
+        assert!(le.deserialize::<SqlError>(&64u32.to_le_bytes()).is_err());
+        assert!(be.deserialize::<SqlError>(&64u32.to_be_bytes()).is_err());
     }
 }

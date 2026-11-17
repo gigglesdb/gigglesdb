@@ -122,6 +122,10 @@ fn integer_input_27_closed_errors_reject_unknown_tags_and_payloads() {
         (43, "DivisionByZero", E::DivisionByZero),
         (58, "InvalidRecursion", E::InvalidRecursion),
         (59, "DuplicateAlias", E::DuplicateAlias),
+        (60, "WindowingError", E::WindowingError),
+        (61, "InvalidFrameOffset", E::InvalidFrameOffset),
+        (62, "InvalidNtileArgument", E::InvalidNtileArgument),
+        (63, "InvalidNthValueArgument", E::InvalidNthValueArgument),
     ];
     assert_eq!(local::failure(CoreError::Sql(E::DivisionByZero)).code, 243);
     for (tag, name, expected) in identities {
@@ -177,7 +181,7 @@ fn integer_input_27_closed_errors_reject_unknown_tags_and_payloads() {
         assert!(serde_json::from_str::<E>(&format!("{json} null")).is_err());
         assert!(serde_json::from_str::<E>(&json[..json.len() - 1]).is_err());
     }
-    for tag in [60u32, u32::MAX] {
+    for tag in [64u32, u32::MAX] {
         assert!(
             bincode::DefaultOptions::new()
                 .with_fixint_encoding()

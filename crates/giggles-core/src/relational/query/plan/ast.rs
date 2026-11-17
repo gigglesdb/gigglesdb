@@ -29,6 +29,7 @@ pub(super) enum SetOp {
 #[derive(Debug, Clone)]
 pub(super) struct Select {
     pub applies: Vec<subquery::Apply>,
+    pub windows: Vec<window::Call>,
     pub query: Query,
     pub parameters: BTreeSet<usize>,
     // A materialized input exposes operator outputs as ordinary scalar columns.
@@ -165,6 +166,9 @@ impl Plan {
                 for apply in &s.applies {
                     apply.visit_scalars(f);
                 }
+                for window in &s.windows {
+                    window.visit_scalars(f);
+                }
                 if let Some(i) = &s.input {
                     i.query.visit_scalars(f);
                 }
@@ -207,6 +211,12 @@ impl Plan {
             Body::Select(s) => {
                 for apply in &mut s.applies {
                     apply.bind_schema_names(bind, state, path)?;
+                }
+                for window in &mut s.windows {
+                    window.map_scalars(&mut |s| {
+                        schema_names::scalar(s, bind, state, path);
+                        Ok(())
+                    })?;
                 }
                 s.query.bind_schema_names(
                     &|name| {

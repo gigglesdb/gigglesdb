@@ -129,7 +129,7 @@ impl Plan {
                         result.push(row)?;
                     }
                 } else {
-                    let input = select
+                    let mut input = select
                         .input
                         .as_ref()
                         .map(|i| {
@@ -137,6 +137,9 @@ impl Plan {
                                 .run(state, source, params, parameters, clock, execution)
                         })
                         .transpose()?;
+                    if let Some(rows) = &mut input {
+                        window::run(&select.windows, rows, params, parameters, clock, execution)?;
+                    }
                     let synthetic = input
                         .as_ref()
                         .map(|rows| {
@@ -154,7 +157,8 @@ impl Plan {
                         relations: vec![(select.input.as_ref().unwrap().name.clone(), rows)],
                     });
                     let source: &dyn scan::RowSource = wrapper.as_ref().map_or(source, |rows| rows);
-                    let query = cte::prepare_query(&select.query, state)?;
+                    let projection = window::prepare(select, state)?;
+                    let query = cte::prepare_query(&projection, state)?;
                     let bound = query
                         .bind_projection_seeded(state, parameters.to_vec())?
                         .with_clock(clock);

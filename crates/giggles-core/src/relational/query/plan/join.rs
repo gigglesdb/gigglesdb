@@ -258,6 +258,7 @@ fn item(
     Ok(From::Leaf {
         query: Box::new(Plan::new(Body::Select(Box::new(Select {
             applies: vec![],
+            windows: vec![],
             query,
             parameters: BTreeSet::new(),
             input: None,
@@ -439,6 +440,7 @@ pub(super) fn parse_select(
         .collect();
     Ok(Some(Plan::new(Body::Select(Box::new(Select {
         applies: vec![],
+        windows: vec![],
         query,
         parameters,
         input: None,
