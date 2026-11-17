@@ -517,3 +517,6 @@ mod pgparity_typeof;
 #[path = "insert_trailing_columns.rs"]
 mod insert_trailing_columns;
 #[path = "aggregate_cast_parity.rs"] mod aggregate_cast_parity;
+
+#[path = "v2_on_conflict_caps.rs"]
+mod v2_on_conflict_caps;

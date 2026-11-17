@@ -412,8 +412,7 @@ pub(super) fn cascade(
     let (template, keys) = selection(state, prepared, params, clock, sink)?;
     let prepared = &template;
     let first_version = state.next_version;
-    let mut work = ActionWork { queue: std::collections::VecDeque::new(),
-        retention: scan::Retention::new(scan::retention_limit()), visited: BTreeSet::new(), pending, immediate: DeferralState::default() };
+    let mut work = ActionWork::new(pending);
     let mut output = spill::RowBuffer::new(std::mem::take(&mut result.rows))?;
     let candidates = if !pk_move && keys.is_none() {
         searched::target(prepared).and_then(|q| q.mutation_primary_keys(state, &table, params))
@@ -454,19 +453,99 @@ pub(super) fn cascade(
             work.publish(state, sink, &table, rows, page.rows.remove(&table.id).unwrap(), events, None, &descriptors, version_end)?;
         }
     }
-    while let Some((parent_id, old, new)) = work.queue.pop_front() {
-        crate::cancellation::check()?;
-        let parent = state.tables.values().find(|t| t.id == parent_id).unwrap().clone();
-        let mut incoming = state.ext.constraints.iter().flat_map(|(id, cs)| cs.iter().map(move |c| (*id, c.clone()))).collect::<Vec<_>>();
+    work.drain(state, sink, clock, &descriptors, version_end, false)?;
+    paged_pending(state, &mut work.immediate, &[], false, sink)?;
+    if deferred.is_none() { paged_pending(state, &mut work.pending, &[], false, sink)?; }
+    if let Some(d) = deferred { *d = work.pending; }
+    output.finish(&mut result)?;
+    Ok(result)
+}
+
+
+pub(super) struct ActionWork {
+    queue: std::collections::VecDeque<(u64, SqlRow, Option<SqlRow>)>,
+    visited: BTreeSet<(u64, u64)>,
+    retention: scan::Retention,
+    pending: DeferralState,
+    immediate: DeferralState,
+}
+impl ActionWork {
+    pub(super) fn new(pending: DeferralState) -> Self {
+        Self { queue: std::collections::VecDeque::new(), visited: BTreeSet::new(),
+            retention: scan::Retention::new(scan::retention_limit()), pending,
+            immediate: DeferralState::default() }
+    }
+    pub(super) fn finish(mut self, state: &Relational, sink: &mut impl RowSink,
+        deferred: Option<&mut DeferralState>,
+    ) -> Result<(), CoreError> {
+        Self::validate_pending(state, &mut self.immediate, sink)?;
+        if let Some(deferred) = deferred { *deferred = self.pending; }
+        else { Self::validate_pending(state, &mut self.pending, sink)?; }
+        Ok(())
+    }
+    // Action checks already carry child keys. Probe final physical parents
+    // directly instead of certifying a transient parent sidecar per child.
+    fn validate_pending(state: &Relational, pending: &mut DeferralState,
+        sink: &mut impl RowSink,
+    ) -> Result<(), CoreError> {
+        for table in state.tables.values() {
+            let checks = pending.pending.iter().filter_map(|((id, table_id), keys)| {
+                if *table_id != table.id { return None; }
+                let c = state.ext.constraints.get(table_id)?.iter().find(|c| c.id == *id)?;
+                Some((c, keys))
+            }).collect::<Vec<_>>();
+            if checks.is_empty() { continue; }
+            let mut after = None;
+            while let Some((last, rows)) = sink.fk_read_page(table, after.take())? {
+                after = Some(last);
+                for (c, keys) in &checks {
+                    let ConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } = &c.kind
+                        else { continue; };
+                    let parent = state.tables.values().find(|t| t.id == *ref_table)
+                        .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+                    let positions = columns.iter().zip(ref_columns).map(|(child, parent_id)| (
+                        table.columns.iter().position(|c| c.id == *child).unwrap(),
+                        parent.columns.iter().position(|c| c.id == *parent_id).unwrap(),
+                    )).collect::<Vec<_>>();
+                    for (key, row) in &rows {
+                        if !keys.contains(key) { continue; }
+                        crate::cancellation::check()?;
+                        if positions.iter().any(|(i, _)| row.values[*i] == Value::Null) { continue; }
+                        let values = positions.iter().map(|(i, j)| query::constraint_key(
+                            &row.values[*i], &table.columns[*i].data_type, &parent.columns[*j].data_type,
+                        )).collect::<R<Option<Vec<_>>>>().map_err(CoreError::Sql)?
+                            .ok_or(CoreError::Sql(SqlError::ForeignKeyViolation))?;
+                        let mut found = false;
+                        sink.fk_lookup(parent, ref_columns, Some(&values), true, &mut |_| {
+                            found = true;
+                            Ok(())
+                        })?;
+                        if !found { return Err(CoreError::Sql(SqlError::ForeignKeyViolation)); }
+                    }
+                }
+            }
+        }
+        pending.pending.clear();
+        Ok(())
+    }
+    pub(super) fn drain(&mut self, state: &mut Relational, sink: &mut impl RowSink,
+        clock: Option<&clock::ExecutionClock>, descriptors: &[secondary_index::Descriptor],
+        version_end: u64, statement_end: bool,
+    ) -> Result<(), CoreError> {
+        let mut incoming = state.ext.constraints.iter().flat_map(|(id, cs)|
+            cs.iter().map(move |c| (*id, c.clone()))).collect::<Vec<_>>();
         incoming.sort_by_key(|(_, c)| c.id);
-        for (child_id, c) in incoming {
+        while let Some((parent_id, old, new)) = self.queue.pop_front() {
+            crate::cancellation::check()?;
+            let parent = state.tables.values().find(|t| t.id == parent_id).unwrap().clone();
+            for (child_id, c) in &incoming {
                 let ConstraintKind::ForeignKey { ref_table, columns, ref_columns, on_delete, on_update, .. } = &c.kind else { continue; };
                 if *ref_table != parent_id { continue; }
                 let values = ref_columns.iter().map(|id| old.values[parent.columns.iter().position(|c| c.id == *id).unwrap()].clone()).collect::<Vec<_>>();
                 let new_values = new.as_ref().map(|row| ref_columns.iter().map(|id| row.values[parent.columns.iter().position(|c| c.id == *id).unwrap()].clone()).collect::<Vec<_>>());
                 if values.contains(&Value::Null) || new_values.as_ref() == Some(&values) { continue; }
                 let action = if new.is_some() { on_update } else { on_delete };
-                let child = state.tables.values().find(|t| t.id == child_id).unwrap().clone();
+                let child = state.tables.values().find(|t| t.id == *child_id).unwrap().clone();
                 let mut no_action = DeferralState::default();
                 let mut after = None;
                 while let Some((last, rows)) = sink.fk_child_page(&child, columns, &values, after)? {
@@ -476,12 +555,12 @@ pub(super) fn cascade(
                     }
                     if *action == catalog_ext::Action::NoAction {
                         let ConstraintKind::ForeignKey { deferral, .. } = &c.kind else { unreachable!() };
-                        let deferred = *deferral != Deferral::NotDeferrable && work.pending.modes.get(&c.id)
+                        let deferred = *deferral != Deferral::NotDeferrable && self.pending.modes.get(&c.id)
                             .copied().unwrap_or(*deferral == Deferral::DeferrableDeferred);
-                        let pending = if deferred { &mut work.pending } else { &mut no_action };
+                        let pending = if deferred { &mut self.pending } else if statement_end { &mut self.immediate } else { &mut no_action };
                         for key in rows.keys() {
-                            work.retention.charge(key.len() + 96).map_err(CoreError::Sql)?;
-                            pending.pending.entry((c.id, child_id)).or_default().insert(key.clone());
+                            self.retention.charge(key.len() + 96).map_err(CoreError::Sql)?;
+                            pending.pending.entry((c.id, *child_id)).or_default().insert(key.clone());
                         }
                         continue;
                     }
@@ -508,32 +587,22 @@ pub(super) fn cascade(
                             }
                         }
                     }
-                    work.publish(state, sink, &child, rows, changed, events, Some(c.id), &descriptors, version_end)?;
+                    self.publish(state, sink, &child, rows, changed, events, Some(c.id), descriptors, version_end)?;
                 }
                 // Definition order decides NO ACTION versus a later RESTRICT.
                 if !no_action.pending.is_empty() { paged_pending(state, &mut no_action, &[], false, sink)?; }
+            }
+            self.retention.release(searched::retained_row_bytes(&[], &old).map_err(CoreError::Sql)?
+                + new.as_ref().map(|r| searched::retained_row_bytes(&[], r)).transpose().map_err(CoreError::Sql)?.unwrap_or(0));
         }
-        work.retention.release(searched::retained_row_bytes(&[], &old).map_err(CoreError::Sql)?
-            + new.as_ref().map(|r| searched::retained_row_bytes(&[], r)).transpose().map_err(CoreError::Sql)?.unwrap_or(0));
+        // A drained page cannot encounter its old versions again. Keep the
+        // cycle guard bounded to the page and its referential-action chain.
+        self.retention.release(self.visited.len() * 96);
+        self.visited.clear();
+        Ok(())
     }
-    paged_pending(state, &mut work.immediate, &[], false, sink)?;
-    if deferred.is_none() { paged_pending(state, &mut work.pending, &[], false, sink)?; }
-    if let Some(d) = deferred { *d = work.pending; }
-    output.finish(&mut result)?;
-    Ok(result)
-}
-
-
-struct ActionWork {
-    queue: std::collections::VecDeque<(u64, SqlRow, Option<SqlRow>)>,
-    visited: BTreeSet<(u64, u64)>,
-    retention: scan::Retention,
-    pending: DeferralState,
-    immediate: DeferralState,
-}
-impl ActionWork {
     #[expect(clippy::too_many_arguments, reason = "bounded action page and statement reservation")]
-    fn publish(&mut self, state: &Relational, sink: &mut impl RowSink, table: &TableDef,
+    pub(super) fn publish(&mut self, state: &Relational, sink: &mut impl RowSink, table: &TableDef,
         before: DdlRows, after: DdlRows, mut events: Vec<constraints::Event>, force: Option<u64>, descriptors: &[secondary_index::Descriptor], version_end: u64,
     ) -> Result<(), CoreError> {
         if state.next_version > version_end { return Err(CoreError::Sql(SqlError::Limit)); }

@@ -429,8 +429,7 @@ impl Insert {
     }
 
     pub(super) fn can_witness(&self, state: &Relational) -> bool {
-        state.tables.get(&self.table).is_some_and(|table|
-            self.conflict.is_some() && table.hidden_rowid().is_none())
+        state.tables.contains_key(&self.table) && self.conflict.is_some()
     }
     fn check_explicit(&self, state: &Relational, table: &TableDef, indexes: &[usize]) -> R<()> {
         if let Some(update) = self.conflict.as_ref().and_then(|c| c.update.as_ref()) {

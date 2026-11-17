@@ -5,12 +5,12 @@ use super::*;
 pub(crate) const SHARED_WRITE_ROWS: usize = 200;
 
 pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
-    let Some(table) = prepared.table().and_then(|name| state.tables.get(name)) else {
+    if prepared.table().and_then(|name| state.tables.get(name)).is_none() {
         return false;
-    };
+    }
     if let Statement::InsertMulti(i) = &prepared.statement
         && !i.append_only()
-        && (!i.can_witness(state) || !i.stable_referenced_keys(state, table)) {
+        && !i.can_witness(state) {
         return false;
     }
     matches!(&prepared.statement, Statement::InsertMulti(i) if i.needs_pages()
@@ -55,6 +55,8 @@ pub(super) fn execute(
     let first_version = state.next_version;
     if insert.updates_conflicts() { sink.begin_conflict_pages(first_version); }
     let table = state.tables[&insert.table].clone();
+    let mut actions = (!insert.stable_referenced_keys(state, &table))
+        .then(|| paged_dml::ActionWork::new(deferred.as_deref().cloned().unwrap_or_default()));
     let foreign_keys = state.ext.constraints.get(&table.id).into_iter().flatten()
         .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. }));
     let stored = match &insert.source {
@@ -108,16 +110,16 @@ pub(super) fn execute(
         };
 
         let mut page = state.clone();
-        // FK triggers run after all input has passed immediate uniqueness and
-        // row checks, including proposals on later pages (PostgreSQL timing).
-        if foreign_keys {
+        // Outgoing FK checks see all input at statement end. Referenced-key
+        // updates instead publish through the bounded referential-action queue.
+        if foreign_keys && actions.is_none() {
             page.ext.constraints.get_mut(&table.id).expect("FK constraints")
                 .retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
         }
         let mut batch = template.clone();
         batch.statement = Statement::InsertMulti(Box::new(input));
         batch.preserve_page_target();
-        let part = page.execute_with_sink(
+        let part = page.execute_with_sink_actions(
             &batch,
             params,
             None,
@@ -125,14 +127,21 @@ pub(super) fn execute(
             sink,
             version_end,
             deferred.as_deref_mut(),
+            actions.as_mut(),
         )?;
         state.next_version = page.next_version;
+        if let Some(actions) = &mut actions {
+            actions.drain(state, sink, clock, &sink.indexes(), version_end, true)?;
+        }
         result.columns = part.columns;
         result.affected += part.affected;
         output.extend(part.rows)?;
         if done {
             break;
         }
+    }
+    if let Some(actions) = actions {
+        actions.finish(state, sink, deferred.as_deref_mut())?;
     }
     if foreign_keys {
         validate_append(state, &table, first_version, state.next_version, sink, deferred, clock)?;

@@ -292,6 +292,15 @@ impl Relational {
         version_end: u64,
         deferred: Option<&mut DeferralState>,
     ) -> Result<SqlResult, CoreError> {
+        self.execute_with_sink_actions(prepared, params, expected, clock, sink, version_end, deferred, None)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "statement inputs plus paged referential actions")]
+    fn execute_with_sink_actions(
+        &mut self, prepared: &Prepared, params: &[Value], expected: Option<u64>,
+        clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink, version_end: u64,
+        deferred: Option<&mut DeferralState>, actions: Option<&mut paged_dml::ActionWork>,
+    ) -> Result<SqlResult, CoreError> {
         let returning_scope = sink.streams_index_builds().then(spill::returning_unbounded);
         let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
         let prepared = &bound;
@@ -652,7 +661,7 @@ impl Relational {
                 }
             }
         }
-        if writing {
+        if writing && actions.is_none() {
             while hydrate(
                 &self.clone(),
                 &edges,
@@ -692,6 +701,12 @@ impl Relational {
                     &mut events,
                 )
                 .map_err(CoreError::Sql)?;
+            if let Some(actions) = actions {
+                let table = table.as_ref().expect("conflict page target");
+                actions.publish(self, sink, table, before.rows.remove(&table.id).unwrap(),
+                    self.rows[&table.id].clone(), events, None, &sink.indexes(), version_end)?;
+                return Ok(result);
+            }
             if writing {
                 if !append
                     && let Some(table) = &table
