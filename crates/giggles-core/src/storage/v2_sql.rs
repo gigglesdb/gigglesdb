@@ -144,15 +144,24 @@ impl SqlSession {
     }
 
     #[cfg(feature = "engine-rocksdb")]
-    pub(super) fn visit_native_page_v2<E>(
+    pub(super) fn visit_native_range_v2<E>(
         &mut self, db: &Arc<v2::V2Db>, table: &TableDef,
+        lo: Bound<Vec<u8>>, hi: Bound<Vec<u8>>,
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
     ) -> Result<(), E> {
         let _ticket = self.admin.inner.enter_sql().map_err(map)?;
         let txn = self.v2_transaction.as_mut()
             .ok_or_else(|| map(CoreError::Sql(SqlError::Transaction)))?;
         let entry = TableEntry { primary_index_birth: None, def: table.clone(), heap: false, columns_ext: BTreeMap::new() };
-        for pair in db.rows.scan(txn, &entry, Bound::Unbounded, Bound::Unbounded,
+        // User-defined SQL types can order differently from their storage class.
+        let (lo, hi) = if let [index] = table.primary_key.as_slice()
+            && (!matches!(lo, Bound::Unbounded) || !matches!(hi, Bound::Unbounded))
+            && db.catalog().snapshot(txn).map_err(map)?.parts.ext.columns
+                .get(&table.columns[*index].id).is_some_and(|c| c.type_id.is_some())
+        {
+            (Bound::Unbounded, Bound::Unbounded)
+        } else { (lo, hi) };
+        for pair in db.rows.scan(txn, &entry, lo, hi,
             engine::kv::Direction::Forward, None).map_err(map)? {
             crate::cancellation::check().map_err(map)?;
             let (_, row) = pair.map_err(map)?;

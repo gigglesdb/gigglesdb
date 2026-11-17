@@ -27,6 +27,7 @@ mod insert_many;
 mod inspection;
 #[path = "inspection_capabilities.rs"]
 mod inspection_capabilities;
+#[path = "native_access_paths.rs"] mod native_access_paths;
 #[path = "native_alter_parity.rs"]
 mod native_alter_parity;
 #[path = "native_block_query_parity.rs"] mod native_block_query_parity;

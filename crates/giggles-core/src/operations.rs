@@ -11,6 +11,20 @@
 
 pub use crate::relational::{SqlRow, Value};
 pub use crate::storage::native_input_rows;
+thread_local! {
+    static FORCE_NATIVE_FULL_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Run a test with native access-path narrowing disabled, restoring it on unwind.
+#[doc(hidden)]
+pub fn force_native_full_scan<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) { FORCE_NATIVE_FULL_SCAN.set(self.0); }
+    }
+    let _restore = Restore(FORCE_NATIVE_FULL_SCAN.replace(true));
+    f()
+}
+
 #[cfg(test)]
 mod case_tests;
 mod catalog;
@@ -2482,7 +2496,12 @@ fn run_complete(
         // depends only on matching rows; run re-applies the same filter.
         let mut filter = filter.clone();
         filter.coerce_equality(session, table)?;
-        let key = primary_key_point(table, &filter);
+        let access = if FORCE_NATIVE_FULL_SCAN.get() {
+            NativeAccess::Full
+        } else {
+            native_access(table, &filter, matches!(operation,
+                Operation::Read { .. } | Operation::ReadExpressions { .. }))
+        };
         // Only the rows the result can depend on are retained. A read keeps
         // its top `limit` rows (it counts every match); a write with a
         // cardinality cap keeps one row past it, which run reports as
@@ -2498,7 +2517,7 @@ fn run_complete(
         let mut matched = 0usize;
         let input = session.complete_read_table_where(
             table,
-            key.as_deref(),
+            &access,
             &mut |row| {
                 let accepted = filter.accepts(row)?;
                 matched += usize::from(accepted);
@@ -2553,29 +2572,135 @@ fn primary_key_point(table: &TableDef, filter: &Bound) -> Option<Vec<Value>> {
             },
             _ => return None,
         };
-        let column = table.columns.get(index)?;
-        // Numeric keys use the scale-insensitive key codec, so a numeric
-        // literal finds exactly the rows numeric equality accepts. A uuid
-        // literal was already canonicalised by coerce_equality. Temporal values
-        // have no key encoding (encode_key rejects them), so they stream.
-        let value = match (&column.data_type, value) {
-            (DataType::Boolean, Value::Bool(_))
-            | (DataType::SmallInt | DataType::Integer | DataType::BigInt, Value::Int(_))
-            | (DataType::Text | DataType::Varchar | DataType::Uuid, Value::Text(_))
-            | (DataType::Numeric, Value::Numeric(_))
-            | (DataType::Bytes, Value::Bytes(_)) => value.clone(),
-            _ => return None,
-        };
-        crate::relational::check(&value, column).ok()?;
+        comparison_literal(table, index, value)?;
         if op == Compare::Eq
             && let Some(slot) = table.primary_key.iter().position(|p| *p == index)
-            && key[slot].replace(value).is_some()
+            && key[slot].replace(value.clone()).is_some()
         {
             return None;
         }
     }
     key.into_iter().collect()
 }
+/// Only comparisons whose storage classes agree are total on every stored row.
+/// Keep this shared with the explain point classifier.
+fn comparison_literal<'a>(table: &TableDef, index: usize, value: &'a Value) -> Option<&'a Value> {
+    let column = table.columns.get(index)?;
+    match (&column.data_type, value) {
+        (DataType::Boolean, Value::Bool(_))
+        | (DataType::SmallInt | DataType::Integer | DataType::BigInt, Value::Int(_))
+        | (DataType::Text | DataType::Varchar | DataType::Uuid, Value::Text(_))
+        | (DataType::Numeric, Value::Numeric(_))
+        | (DataType::Bytes, Value::Bytes(_)) => {}
+        _ => return None,
+    }
+    crate::relational::check(value, column).ok()?;
+    Some(value)
+}
+fn literal_comparison(bound: &Bound) -> Option<(usize, Compare, &Value)> {
+    let Bound::Compare(a, op, b) = bound else { return None };
+    match (a.as_ref(), b.as_ref()) {
+        (Bound::Field(i), Bound::Value(v)) => Some((*i, *op, v)),
+        (Bound::Value(v), Bound::Field(i)) => Some((*i, match op {
+            Compare::Lt => Compare::Gt, Compare::Le => Compare::Ge,
+            Compare::Gt => Compare::Lt, Compare::Ge => Compare::Le,
+            other => *other,
+        }, v)),
+        _ => None,
+    }
+}
+fn total_filter(table: &TableDef, filter: &Bound) -> bool {
+    match filter {
+        Bound::And(a, b) | Bound::Or(a, b) => total_filter(table, a) && total_filter(table, b),
+        _ => literal_comparison(filter)
+            .is_some_and(|(i, _, v)| comparison_literal(table, i, v).is_some()),
+    }
+}
+/// Mandatory key sets may come from either conjunct; every OR arm must have one.
+fn primary_key_points(table: &TableDef, filter: &Bound) -> Option<Vec<Vec<Value>>> {
+    let mut key = vec![None; table.primary_key.len()];
+    let mut pending = vec![filter];
+    while let Some(term) = pending.pop() {
+        if let Bound::And(a, b) = term {
+            pending.extend([a.as_ref(), b.as_ref()]);
+        } else if let Some((index, Compare::Eq, value)) = literal_comparison(term)
+            && let Some(slot) = table.primary_key.iter().position(|p| *p == index)
+        {
+            key[slot] = Some(value.clone());
+        }
+    }
+    if let Some(key) = key.into_iter().collect::<Option<Vec<_>>>() {
+        return Some(vec![key]);
+    }
+    match filter {
+        Bound::And(a, b) => primary_key_points(table, a).or_else(|| primary_key_points(table, b)),
+        Bound::Or(a, b) => {
+            let mut keys = primary_key_points(table, a)?;
+            keys.extend(primary_key_points(table, b)?);
+            Some(keys)
+        }
+        _ => None,
+    }
+}
+pub(crate) enum NativeAccess {
+    Full,
+    Keys(Vec<Vec<Value>>),
+    Range(std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>),
+    Empty,
+}
+fn native_access(table: &TableDef, filter: &Bound, reading: bool) -> NativeAccess {
+    use crate::storage::engine::codec::pk_bytes;
+    use std::ops::Bound as Side;
+    if table.primary_key.is_empty() || table.hidden_rowid().is_some() || !total_filter(table, filter) {
+        return NativeAccess::Full;
+    }
+    if let Some(keys) = primary_key_points(table, filter) {
+        let sorted = keys.into_iter().map(|key| Some((pk_bytes(&key).ok()?, key)))
+            .collect::<Option<BTreeMap<_, _>>>();
+        // NULL and temporal keys have no encoding: preserve the scan fallback.
+        return sorted.map_or(NativeAccess::Full, |keys| NativeAccess::Keys(keys.into_values().collect()));
+    }
+    let [index] = table.primary_key.as_slice() else { return NativeAccess::Full };
+    if !reading || !matches!(table.columns[*index].data_type,
+        DataType::SmallInt | DataType::Integer | DataType::BigInt) {
+        return NativeAccess::Full;
+    }
+    let mut lo: Option<(i64, bool)> = None;
+    let mut hi: Option<(i64, bool)> = None;
+    let mut pending = vec![filter];
+    while let Some(term) = pending.pop() {
+        if let Bound::And(a, b) = term { pending.extend([a.as_ref(), b.as_ref()]); continue; }
+        let Some((i, op, Value::Int(n))) = literal_comparison(term) else { continue };
+        if i != *index { continue; }
+        if matches!(op, Compare::Eq | Compare::Gt | Compare::Ge) {
+            let next = (*n, op != Compare::Gt);
+            if lo.is_none_or(|old| next.0 > old.0 || (next.0 == old.0 && !next.1)) { lo = Some(next); }
+        }
+        if matches!(op, Compare::Eq | Compare::Lt | Compare::Le) {
+            let next = (*n, op != Compare::Lt);
+            if hi.is_none_or(|old| next.0 < old.0 || (next.0 == old.0 && !next.1)) { hi = Some(next); }
+        }
+    }
+    if lo.is_none() && hi.is_none() { return NativeAccess::Full; }
+    if let (Some(lo), Some(hi)) = (lo, hi)
+        && (lo.0 > hi.0 || (lo.0 == hi.0 && !(lo.1 && hi.1))) {
+        return NativeAccess::Empty;
+    }
+    let encode = |side: Option<(i64, bool)>| -> Option<Side<Vec<u8>>> {
+        Some(match side {
+            None => Side::Unbounded,
+            Some((n, inclusive)) => {
+                let bytes = pk_bytes(&[Value::Int(n)]).ok()?;
+                if inclusive { Side::Included(bytes) } else { Side::Excluded(bytes) }
+            }
+        })
+    };
+    match (encode(lo), encode(hi)) {
+        (Some(lo), Some(hi)) => NativeAccess::Range(lo, hi),
+        _ => NativeAccess::Full,
+    }
+}
+
 fn run<C: Context>(
     s: &mut C,
     t: &TableDef,

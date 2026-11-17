@@ -153,8 +153,8 @@ impl SqlSession {
 
     /// V2 complete input restricted to the rows `keep` accepts. Rows are
     /// decoded one at a time and only kept rows are retained, so the logical
-    /// budget applies to the matching set. With `key`, the full primary key is
-    /// read directly instead of scanning the table. The caller must re-apply
+    /// budget applies to the matching set. Key batches and integer ranges can
+    /// narrow the physical input instead of scanning the table. The caller must re-apply
     /// its filter: the relation is complete only with respect to `keep`.
     ///
     /// `bound` keeps at most `limit` rows: whenever the retained set reaches
@@ -165,7 +165,7 @@ impl SqlSession {
     pub(crate) fn complete_read_table_where<E, C>(
         &mut self,
         table: &TableDef,
-        key: Option<&[crate::relational::Value]>,
+        access: &crate::operations::NativeAccess,
         keep: &mut impl FnMut(&SqlRow) -> Result<bool, E>,
         bound: (usize, Option<C>),
         map: fn(CoreError) -> E,
@@ -178,9 +178,13 @@ impl SqlSession {
                 return Err(map(CoreError::Sql(SqlError::Unsupported)));
             }
             let snapshot = self.complete_snapshot(table).map_err(map)?;
-            let rows = retain_native_rows(keep, bound, map, |visit| match key {
-                Some(key) => self.visit_native_key(table, key, &mut |row| visit(row), map),
-                None => self.visit_native_page(table, &mut |row| visit(row), map),
+            let rows = retain_native_rows(keep, bound, map, |visit| match access {
+                crate::operations::NativeAccess::Keys(keys) =>
+                    self.visit_native_keys(table, keys, &mut |row| visit(row), map),
+                crate::operations::NativeAccess::Range(lo, hi) =>
+                    self.visit_native_range(table, lo.clone(), hi.clone(), &mut |row| visit(row), map),
+                crate::operations::NativeAccess::Empty => self.visit_native_keys(table, &[], &mut |row| visit(row), map),
+                crate::operations::NativeAccess::Full => self.visit_native_page(table, &mut |row| visit(row), map),
             })?;
             Ok(CompleteRelation { snapshot, rows })
         })();
@@ -268,10 +272,10 @@ impl SqlSession {
         Err(TaskError::Revoked.into())
     }
 
-    /// Visit the row with this full primary key, if any, in the statement snapshot.
+    /// Visit a sorted key batch in one statement snapshot and task scope.
     /// In a task session a row outside the visible rows is not visited.
-    fn visit_native_key<E>(
-        &mut self, table: &TableDef, key: &[crate::relational::Value],
+    fn visit_native_keys<E>(
+        &mut self, table: &TableDef, keys: &[Vec<crate::relational::Value>],
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>,
         map: fn(CoreError) -> E,
     ) -> Result<(), E> {
@@ -281,8 +285,13 @@ impl SqlSession {
             let snapshot = self.complete_snapshot(table).map_err(map)?;
             let scope = self.native_task_scope(table).map_err(map)?;
             let meter = StatementMeter::default();
-            let visited =
-                self.visit_native_key_v2(&db, table, key, &mut scoped(scope.as_ref(), &meter, visit, map), map);
+            let visited: Result<(), E> = (|| {
+                for key in keys {
+                    self.visit_native_key_v2(&db, table, key,
+                        &mut scoped(scope.as_ref(), &meter, visit, map), map)?;
+                }
+                Ok(())
+            })();
             if scope.is_some() {
                 crate::task::rows::record(meter.counts());
                 self.note_task_rows_read(&meter);
@@ -293,7 +302,7 @@ impl SqlSession {
             }
             return Ok(());
         }
-        let _ = (table, key, visit);
+        let _ = (table, keys, visit);
         Err(map(CoreError::Sql(SqlError::Unsupported)))
     }
 
@@ -305,6 +314,14 @@ impl SqlSession {
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>,
         map: fn(CoreError) -> E,
     ) -> Result<(), E> {
+        self.visit_native_range(table, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, visit, map)
+    }
+
+    fn visit_native_range<E>(
+        &mut self, table: &TableDef,
+        lo: std::ops::Bound<Vec<u8>>, hi: std::ops::Bound<Vec<u8>>,
+        visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
+    ) -> Result<(), E> {
         let snapshot = self.complete_snapshot(table).map_err(map)?;
         let scope = self.native_task_scope(table).map_err(map)?;
         let meter = StatementMeter::default();
@@ -312,10 +329,12 @@ impl SqlSession {
         #[cfg(feature = "engine-rocksdb")]
         let visited = if let super::Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
-            self.visit_native_page_v2(&db, table, visit, map)
+            self.visit_native_range_v2(&db, table, lo, hi, visit, map)
         } else {
             self.visit_native_page_legacy(table, visit, map)
         };
+        #[cfg(not(feature = "engine-rocksdb"))]
+        let _ = (lo, hi);
         #[cfg(not(feature = "engine-rocksdb"))]
         let visited = self.visit_native_page_legacy(table, visit, map);
         if scope.is_some() {
