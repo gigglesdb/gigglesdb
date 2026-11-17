@@ -312,70 +312,66 @@ fn committed_lookahead_writes_only_on_refill_setval_and_cycle_wrap() {
 #[cfg(feature = "engine-rocksdb")]
 #[test]
 fn concurrent_explicit_commits_with_nextval_do_not_reuse_values() {
-    for engine in [Engine::V2] {
-        let f = Fixture::new(engine);
-        run(&mut f.session(), "CREATE SEQUENCE explicit_ids");
-        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
-        let workers: Vec<_> = (0..8)
-            .map(|_| {
-                let admin = f.admin.as_ref().unwrap().clone();
-                let start = start.clone();
-                thread::spawn(move || {
-                    let mut s = admin.sql_session();
-                    start.wait();
-                    let values: Vec<_> = (0..50)
-                        .map(|_| {
-                            run(&mut s, "BEGIN");
-                            let value = scalar(&mut s, "SELECT nextval('explicit_ids')");
-                            run(&mut s, "COMMIT");
-                            value
-                        })
-                        .collect();
-                    assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
-                    values
-                })
+    let f = Fixture::new(Engine::V2);
+    run(&mut f.session(), "CREATE SEQUENCE explicit_ids");
+    let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let admin = f.admin.as_ref().unwrap().clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                let mut s = admin.sql_session();
+                start.wait();
+                let values: Vec<_> = (0..50)
+                    .map(|_| {
+                        run(&mut s, "BEGIN");
+                        let value = scalar(&mut s, "SELECT nextval('explicit_ids')");
+                        run(&mut s, "COMMIT");
+                        value
+                    })
+                    .collect();
+                assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+                values
             })
-            .collect();
-        let values: Vec<_> = workers
-            .into_iter()
-            .flat_map(|w| w.join().unwrap())
-            .collect();
-        assert_eq!(values.len(), 400);
-        assert_eq!(values.into_iter().collect::<BTreeSet<_>>().len(), 400);
-    }
+        })
+        .collect();
+    let values: Vec<_> = workers
+        .into_iter()
+        .flat_map(|w| w.join().unwrap())
+        .collect();
+    assert_eq!(values.len(), 400);
+    assert_eq!(values.into_iter().collect::<BTreeSet<_>>().len(), 400);
 }
 
 #[cfg(feature = "engine-rocksdb")]
 #[test]
 fn concurrent_explicit_commits_publish_new_sequence_positions() {
-    for engine in [Engine::V2] {
-        let f = Fixture::new(engine);
-        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
-        let workers: Vec<_> = (0..8)
-            .map(|id| {
-                let admin = f.admin.as_ref().unwrap().clone();
-                let start = start.clone();
-                thread::spawn(move || {
-                    let mut s = admin.sql_session();
-                    start.wait();
-                    run(&mut s, "BEGIN");
-                    run(&mut s, &format!("CREATE SEQUENCE s_{id}"));
-                    let sql = format!("SELECT nextval('s_{id}')");
-                    for expected in 1..=5 {
-                        assert_eq!(scalar(&mut s, &sql), expected);
-                    }
-                    run(&mut s, "COMMIT");
-                    let mut other = admin.sql_session();
-                    assert!(scalar(&mut other, &sql) > 5);
-                    // The creator must also observe any advancement by the other session.
-                    let last = scalar(&mut other, &sql);
-                    assert!(scalar(&mut s, &sql) > last);
-                })
+    let f = Fixture::new(Engine::V2);
+    let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let workers: Vec<_> = (0..8)
+        .map(|id| {
+            let admin = f.admin.as_ref().unwrap().clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                let mut s = admin.sql_session();
+                start.wait();
+                run(&mut s, "BEGIN");
+                run(&mut s, &format!("CREATE SEQUENCE s_{id}"));
+                let sql = format!("SELECT nextval('s_{id}')");
+                for expected in 1..=5 {
+                    assert_eq!(scalar(&mut s, &sql), expected);
+                }
+                run(&mut s, "COMMIT");
+                let mut other = admin.sql_session();
+                assert!(scalar(&mut other, &sql) > 5);
+                // The creator must also observe any advancement by the other session.
+                let last = scalar(&mut other, &sql);
+                assert!(scalar(&mut s, &sql) > last);
             })
-            .collect();
-        for worker in workers {
-            worker.join().unwrap();
-        }
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
     }
 }
 
