@@ -526,7 +526,8 @@ fn transient_errors_retry_then_fail() {
         mvcc::read_at(&reader, rows, &row, Ts(ts.0)).unwrap(),
         Some(vec![45; 10])
     );
-    for _ in 0..20 {
+    // Enough failures to outlast FAILOVER_WINDOW at the 100 ms backoff cap.
+    for _ in 0..400 {
         cluster.fail_next(RangeId(2), RangeError::Unavailable("down".into()));
     }
     assert!(

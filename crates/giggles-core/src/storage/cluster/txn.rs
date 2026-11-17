@@ -46,7 +46,7 @@ const TXN_ID_SPACE: u64 = 1 << 32;
 const TXN_ID_BLOCK: u64 = 1 << 20;
 /// How long a range call keeps being retried on NotLeader/Unavailable: past liveness declaring
 /// a leader's node dead (1 s) plus an election.
-const FAILOVER_WINDOW: Duration = Duration::from_secs(5);
+pub(super) const FAILOVER_WINDOW: Duration = Duration::from_secs(5);
 
 /// Gateway settings. Defaults follow design.md 3.2 (`lock_wait_backstop` 5 min).
 #[derive(Clone, Debug)]

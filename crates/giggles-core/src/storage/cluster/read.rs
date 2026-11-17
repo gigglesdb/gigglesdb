@@ -9,7 +9,14 @@
 //! Scans prefetch the first pages of the next K ranges in parallel (R5-44, `prefetch.rs`): at
 //! most K pages per scan are queued, a memory bound of about K * page_bytes beyond the page being
 //! consumed. K = 4 by default; `with_prefetch(0)` reads strictly sequentially.
-use std::{ops::Bound, sync::Arc, thread, time::Duration};
+use std::{
+    ops::Bound,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
+
+use super::txn::FAILOVER_WINDOW;
 
 use crate::storage::{
     engine::{
@@ -29,11 +36,57 @@ mod prefetch;
 #[cfg(test)]
 mod tests;
 
-/// NotLeader / Unavailable: attempts per request, with doubling backoff: about 0.9 s in all,
-/// so a scan outlasts a new split child's first election (R5-84).
+/// NotLeader / Unavailable: at least this many attempts per request, with doubling backoff
+/// (about 0.9 s, a new split child's first election, R5-84), and at least `FAILOVER_WINDOW`
+/// (a leader's node dying: `Transient`).
 const TRANSIENT_ATTEMPTS: u32 = 16;
 const FIRST_BACKOFF: Duration = Duration::from_millis(1);
 const MAX_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Paces retries of NotLeader / Unavailable: at least `TRANSIENT_ATTEMPTS` tries and for at
+/// least `FAILOVER_WINDOW`, so a read outlasts a leader's node dying and a new election.
+struct Transient {
+    attempt: u32,
+    backoff: Duration,
+    started: Instant,
+}
+
+impl Transient {
+    fn new() -> Self {
+        Self {
+            attempt: 1,
+            backoff: FIRST_BACKOFF,
+            started: Instant::now(),
+        }
+    }
+
+    /// Pauses before another try; false once both the attempts and the window are spent.
+    fn again(&mut self) -> bool {
+        if self.attempt >= TRANSIENT_ATTEMPTS && self.started.elapsed() >= FAILOVER_WINDOW {
+            return false;
+        }
+        self.attempt += 1;
+        thread::sleep(self.backoff);
+        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+        true
+    }
+}
+
+/// The descriptor of the range containing `route`. A cache miss reads the directory on the
+/// system range, whose leader may be failing over too: paced like a range request.
+fn descriptor(client: &dyn RangeClient, route: &[u8]) -> Result<RangeDescriptor, KvError> {
+    let mut transient = Transient::new();
+    loop {
+        match client.descriptor_for(route) {
+            Err(e @ (RangeError::NotLeader { .. } | RangeError::Unavailable(_))) => {
+                if !transient.again() {
+                    return Err(kv_error(e));
+                }
+            }
+            result => return result.map_err(kv_error),
+        }
+    }
+}
 /// Route changes (StaleEpoch) tolerated while fetching one page.
 const STALE_ATTEMPTS: u32 = 64;
 /// Ranges whose first page a scan fetches ahead (R5-44).
@@ -104,7 +157,7 @@ impl RoutedKvRead {
         dir: ReadDirection,
     ) -> Result<ReadPage, KvError> {
         for _ in 0..STALE_ATTEMPTS {
-            let desc = self.client.descriptor_for(route).map_err(kv_error)?;
+            let desc = descriptor(&*self.client, route)?;
             if let Some(page) = self.send(&desc, space, start, end, dir)? {
                 return Ok(page);
             }
@@ -121,8 +174,7 @@ impl RoutedKvRead {
         end: &Bound<Vec<u8>>,
         dir: ReadDirection,
     ) -> Result<Option<ReadPage>, KvError> {
-        let mut backoff = FIRST_BACKOFF;
-        let mut attempt = 1;
+        let mut transient = Transient::new();
         loop {
             match self.client.read(self.request(desc, space, start, end, dir)) {
                 Ok(page) => return Ok(Some(page)),
@@ -132,12 +184,9 @@ impl RoutedKvRead {
                 }
                 Err(e @ (RangeError::NotLeader { .. } | RangeError::Unavailable(_))) => {
                     self.client.invalidate(desc);
-                    if attempt >= TRANSIENT_ATTEMPTS {
+                    if !transient.again() {
                         return Err(kv_error(e));
                     }
-                    attempt += 1;
-                    thread::sleep(backoff);
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
                     // R5-84: a routed client picks replicas from its cached descriptor, so look
                     // the range up again (a new split child may simply have no leader yet).
                     // Only a newer epoch at the key is a route change (txn.rs `reroute`'s rule;
@@ -361,7 +410,7 @@ impl Scan<'_> {
         let mut key = lower_route(self.space, &self.start);
         let mut plan = Vec::new();
         loop {
-            let desc = self.reader.client.descriptor_for(&key).map_err(kv_error)?;
+            let desc = descriptor(&*self.reader.client, &key)?;
             let next = desc.end.clone();
             plan.push(desc);
             match next {
