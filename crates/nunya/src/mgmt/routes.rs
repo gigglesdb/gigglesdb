@@ -520,15 +520,14 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     },
                     None => None,
                 };
-                if ctx.admins.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(name, _)| name == &request.name) {
-                    return authority_error(AuthorityError::NameTaken);
-                }
-                let p = match ctx.authority.create_principal_by(
+                let p = match ctx.authority.create_principal_by_unless(
                     idempotency_owner(&caller, origin),
                     &request.name,
                     request.kind,
                     request.admin,
                     key,
+                    |name| ctx.admins.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter().any(|(admin, _)| admin == name),
                 ) {
                     Ok(p) => p,
                     Err(e) => return authority_error(e),
@@ -772,4 +771,47 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
         | Grants(_) => return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
     };
     json_response(StatusCode::OK, result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mgmt::audit::LifecycleRecord;
+    use crate::state::{authority::SessionLimits, store::RedbStore};
+    use crate::token::keys::RootKey;
+
+    struct Sources;
+    impl ConnectionSource for Sources {
+        fn list(&self) -> Vec<ConnectionView> { vec![] }
+    }
+    impl StatusSource for Sources {
+        fn policy_revision(&self, _: &str) -> Option<String> { None }
+        fn config_revision(&self) -> Option<String> { None }
+        fn route_ids(&self) -> Vec<String> { vec![] }
+    }
+    impl LifecycleSink for Sources {
+        fn record(&self, _: &LifecycleRecord) -> Result<(), AuditUnavailable> { Ok(()) }
+    }
+    #[test]
+    fn configured_admin_name_refuses_principal_creation() {
+        let dir = std::env::temp_dir().join(format!("routes-{}", SessionId::random().to_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(RedbStore::open(&dir, &RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap());
+        let authority = Authority::load(store, SessionLimits::default()).unwrap();
+        let ctx = MgmtContext {
+            authority,
+            admins: Arc::new(RwLock::new(vec![("reserved".into(),
+                ScramVerifier::from_password("fixture", b"salt", 1))])),
+            connections: Arc::new(Sources), status: Arc::new(Sources), lifecycle: Arc::new(Sources),
+        };
+        let request = Request::builder().method("POST").uri("/v1/principals")
+            .header("idempotency-key", "create-reserved")
+            .body(Bytes::from_static(br#"{"name":"reserved","kind":"agent"}"#)).unwrap();
+        let response = handle(&ctx, Origin::Socket, request);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(serde_json::from_slice::<Value>(response.body()).unwrap()["error"], "name_taken");
+        assert!(ctx.authority.principal_by_name("reserved").is_none());
+        drop(ctx);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

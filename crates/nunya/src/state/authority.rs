@@ -423,6 +423,18 @@ impl Authority {
         admin: bool,
         idem_key: &str,
     ) -> Result<Principal, AuthorityError> {
+        self.create_principal_by_unless(owner, name, kind, admin, idem_key, |_| false)
+    }
+    /// Create a principal unless its name is reserved, checking under the writer lock.
+    pub fn create_principal_by_unless(
+        &self,
+        owner: PrincipalId,
+        name: &str,
+        kind: PrincipalKind,
+        admin: bool,
+        idem_key: &str,
+        reserved: impl FnOnce(&str) -> bool,
+    ) -> Result<Principal, AuthorityError> {
         let _writer = self.writer.lock().unwrap();
         if !valid_name(name) {
             return Err(AuthorityError::NameInvalid);
@@ -439,7 +451,8 @@ impl Authority {
                     .and_then(|id| v.principals.get(&id).cloned())
                     .ok_or(AuthorityError::Store);
             }
-            if v.principals.values().any(|p| p.name == name) {
+            // Successful retries retain their original result even if reservations changed.
+            if reserved(name) || v.principals.values().any(|p| p.name == name) {
                 return Err(AuthorityError::NameTaken);
             }
         }
@@ -470,6 +483,14 @@ impl Authority {
         v.principals.insert(p.id, p.clone());
         v.idempotency.insert((owner, key), r);
         Ok(p)
+    }
+    /// Run a name-source lookup callback while excluding principal writers.
+    pub fn with_principal_names_locked<R>(
+        &self,
+        f: impl FnOnce(&dyn Fn(&str) -> Option<PrincipalSource>) -> R,
+    ) -> R {
+        let _writer = self.writer.lock().unwrap();
+        f(&|name| self.principal_by_name(name).map(|p| p.source))
     }
     /// Enable or disable a principal, atomically persisting all affected sessions.
     pub fn set_principal_enabled(
@@ -1424,6 +1445,25 @@ mod tests {
         f.a = Authority::load(store.clone(), SessionLimits::default()).unwrap();
         f.a.set_hook(f.hook.clone());
         store
+    }
+    #[test]
+    fn reserved_principal_name_refuses_new_create_but_preserves_replay() {
+        let f = Fixture::new();
+        let owner = PrincipalId([0; 16]);
+        assert_eq!(f.a.create_principal_by_unless(owner, "reserved", PrincipalKind::Agent,
+            false, "blocked", |_| true).unwrap_err(), AuthorityError::NameTaken);
+        assert!(f.a.principal_by_name("reserved").is_none());
+        let original = f.a.create_principal_by(owner, "reserved", PrincipalKind::Agent,
+            false, "blocked").unwrap();
+        let replay = f.a.create_principal_by_unless(owner, "reserved", PrincipalKind::Agent,
+            false, "blocked", |_| true).unwrap();
+        assert_eq!(original.id, replay.id);
+        assert_eq!(f.a.create_principal_by_unless(owner, "different", PrincipalKind::Agent,
+            false, "blocked", |_| true).unwrap_err(), AuthorityError::IdempotencyConflict);
+        f.a.with_principal_names_locked(|source| {
+            assert_eq!(source("reserved"), Some(PrincipalSource::Api));
+            assert_eq!(source("missing"), None);
+        });
     }
     #[test]
     fn ended_acquisition_replays_are_refused() {

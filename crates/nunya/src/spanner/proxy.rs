@@ -327,34 +327,69 @@ pub async fn serve(
         .await
         .map_err(|_| refusal(NyCode::StatementNotAllowed))
 }
+const TLS_PENDING_CAP: usize = 1024;
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 // JoinSet owns handshake tasks, aborting unfinished work when the incoming stream is dropped.
 fn tls_incoming(listener: tokio::net::TcpListener, tls: crate::pgwire::context::ReloadableTls)
     -> impl futures::Stream<Item = std::io::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>> {
-    futures::stream::unfold((listener, tokio::task::JoinSet::new()), move |(listener, mut pending)| {
+    tls_incoming_with(listener, tls, TLS_PENDING_CAP, TLS_HANDSHAKE_TIMEOUT)
+}
+fn tls_incoming_with(
+    listener: tokio::net::TcpListener,
+    tls: crate::pgwire::context::ReloadableTls,
+    cap: usize,
+    timeout: std::time::Duration,
+) -> impl futures::Stream<Item = std::io::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>> {
+    let fifo = std::collections::VecDeque::<tokio::task::AbortHandle>::new();
+    futures::stream::unfold((listener, tokio::task::JoinSet::new(), fifo, std::collections::VecDeque::new()), move |(listener, mut pending, mut fifo, mut ready)| {
         let tls = tls.clone();
         async move {
             loop {
+                if let Some(stream) = ready.pop_front() {
+                    return Some((Ok(stream), (listener, pending, fifo, ready)));
+                }
+                // Reap cancelled/completed tasks before accepting more work. Successful
+                // handshakes are yielded, never discarded when clearing the pending set.
+                fifo.retain(|handle| !handle.is_finished());
+                while let Some(result) = pending.try_join_next() {
+                    if let Ok(Some(stream)) = result {
+                        return Some((Ok(stream), (listener, pending, fifo, ready)));
+                    }
+                }
                 tokio::select! {
-                    accepted = listener.accept(), if pending.len() < 64 => {
+                    accepted = listener.accept() => {
                         let (tcp, _) = match accepted {
                             Ok(pair) => pair,
                             Err(error) => {
                                 // Tonic continues polling after errors; back off to avoid spinning.
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                return Some((Err(error), (listener, pending)));
+                                return Some((Err(error), (listener, pending, fifo, ready)));
                             }
                         };
                         let config = tls.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                         if let Some(config) = config {
-                            pending.spawn(async move {
-                                tokio::time::timeout(std::time::Duration::from_secs(10),
+                            fifo.retain(|handle| !handle.is_finished());
+                            if fifo.len() >= cap && let Some(oldest) = fifo.pop_front() {
+                                oldest.abort();
+                            }
+                            // Aborted tasks still count in JoinSet until joined. Drain enough
+                            // to enforce its cap too, preserving any completed TLS sessions.
+                            while pending.len() >= cap {
+                                if let Some(Ok(Some(stream))) = pending.join_next().await {
+                                    ready.push_back(stream);
+                                }
+                            }
+                            fifo.retain(|handle| !handle.is_finished());
+                            fifo.push_back(pending.spawn(async move {
+                                tokio::time::timeout(timeout,
                                     tokio_rustls::TlsAcceptor::from(config).accept(tcp)).await.ok()?.ok()
-                            });
+                            }));
                         }
                     }
                     result = pending.join_next(), if !pending.is_empty() => {
                         if let Some(Ok(Some(stream))) = result {
-                            return Some((Ok(stream), (listener, pending)));
+                            return Some((Ok(stream), (listener, pending, fifo, ready)));
                         }
                     }
                 }
@@ -362,6 +397,7 @@ fn tls_incoming(listener: tokio::net::TcpListener, tls: crate::pgwire::context::
         }
     })
 }
+
 impl NunyaSpanner {
     fn authenticate<T>(&self, req: &Request<T>) -> Result<Authenticated, Status> {
         auth::authenticate(
@@ -3729,6 +3765,54 @@ mod tls_rotation_tests {
     use crate::config_reload::{tests::{Fixture, certificate, connector, connect_tls}, ConfigReloader, Transports};
     use futures::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn stalled_clients_do_not_block(cap: usize, count: usize, check_oldest: bool) {
+        let f = Fixture::new();
+        let cert = certificate(&f);
+        let config = f.load(&f.text);
+        let transports = Transports::new(&config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tls_incoming_with(listener, transports.spanner.clone(), cap, TLS_HANDSHAKE_TIMEOUT);
+        let server = tokio::spawn(async move {
+            futures::pin_mut!(incoming);
+            while let Some(Ok(mut io)) = incoming.next().await {
+                let mut byte = [0];
+                if io.read_exact(&mut byte).await.is_ok() {
+                    let _ = io.write_all(&byte).await;
+                }
+            }
+        });
+        let mut stalled = Vec::new();
+        for _ in 0..count {
+            stalled.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        let client = connector(&[cert], true);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut io = connect_tls(addr, &client).await;
+            io.write_all(b"x").await.unwrap();
+            let mut response = [0];
+            io.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, *b"x");
+            if check_oldest {
+                let result = stalled[0].read(&mut response).await;
+                assert!(matches!(result, Ok(0)) || result.is_err());
+                // FIFO eviction preserves the other stalled socket.
+                assert!(matches!(stalled[1].try_read(&mut response), Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock));
+            }
+        }).await;
+        server.abort();
+        let _ = server.await;
+        assert!(result.is_ok(), "TLS client was blocked by stalled handshakes");
+    }
+    #[tokio::test]
+    async fn seventy_stalled_connections_allow_prompt_tls_echo() {
+        stalled_clients_do_not_block(TLS_PENDING_CAP, 70, false).await;
+    }
+    #[tokio::test]
+    async fn handshake_cap_evicts_oldest_stalled_connection() {
+        stalled_clients_do_not_block(2, 2, true).await;
+    }
     #[tokio::test]
     async fn incoming_rotates_certificates_with_h2_and_independent_handshakes() {
         let f = Fixture::new(); let a = certificate(&f); let hub = f.hub();

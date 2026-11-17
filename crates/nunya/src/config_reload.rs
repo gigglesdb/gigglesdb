@@ -541,7 +541,13 @@ impl ConfigReloader {
                     }
                     authority.set_session_limits(prepared.limits);
                     if prepared.diff.reloadable.contains(&"management.admins") {
-                        *admins.write().unwrap_or_else(std::sync::PoisonError::into_inner) = prepared.admins;
+                        authority.with_principal_names_locked(|source| {
+                            if prepared.admins.iter().any(|(name, _)| source(name) == Some(PrincipalSource::Api)) {
+                                return Err("management admin name taken");
+                            }
+                            *admins.write().unwrap_or_else(std::sync::PoisonError::into_inner) = prepared.admins;
+                            Ok(())
+                        })?;
                     }
                 }
                 if let Some(transports) = self.transports.get() {
@@ -901,6 +907,30 @@ key_file='key'
         assert_eq!(hub.log.1.read().unwrap().config, revision);
         assert_eq!(admins.read().unwrap()[0].0, "admin");
         assert_eq!(runtime.authority.principal_by_name("agent").unwrap().state, PrincipalState::Enabled);
+    }
+    #[tokio::test]
+    async fn admin_collision_after_prepare_rejects_commit() {
+        let f = Fixture::new();
+        let (runtime, hub, reload, admins) = f.live();
+        let revision = reload.revision();
+        let pg = crate::pgwire::session::tests::Fixture::new();
+        let captured = pg.ctx.snapshot.read().unwrap().clone();
+        let authority = runtime.authority.clone();
+        // The source is called after prepare has checked the admin names.
+        reload.attach_catalog(pg.ctx.clone(), Arc::new(move |cfg| {
+            authority.create_principal("raced", PrincipalKind::Agent, false, "race").unwrap();
+            let mut snapshot = (*captured).clone();
+            snapshot.search_path = cfg.search_path;
+            Box::pin(async move { Ok(snapshot) })
+        }));
+        f.load(&edit(&edit(&f.text, "search_path", "['other']"),
+            "management.admin", &entries(&["raced"], "changed")));
+        reload.reload().await;
+        assert!(runtime.authority.principal_by_name("raced").is_some());
+        assert_eq!(reload.last_reload(), "rejected");
+        assert_eq!(reload.revision(), revision);
+        assert_eq!(hub.log.1.read().unwrap().config, revision);
+        assert_eq!(admins.read().unwrap()[0].0, "admin");
     }
     #[tokio::test]
     async fn session_limits_only_affect_new_acquisitions() {
