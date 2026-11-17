@@ -74,9 +74,9 @@ nunya session acquire --server http://127.0.0.1:6481 --principal reporting-agent
 nunya exec --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --context reporting -- psql -d app -c "SELECT 1"
 ```
 
-Database ports accept only session credentials: PostgreSQL user `session:<32 hex>` and the session secret. Principal credentials work only on management. `nunya session env --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --context reporting --format sh` prints credentials for other clients; choose `--format powershell` on Windows and treat the output as secret. Protect the helper's private `sessions.json`.
+Database ports accept only session credentials: PostgreSQL user `session:REPLACE_WITH_SESSION_ID` (the ID is 32 lowercase hex characters) and the session secret. Principal credentials work only on management. `nunya session env --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --context reporting --format sh` prints credentials for other clients; choose `--format powershell` on Windows and treat the output as secret. Protect the helper's private `sessions.json` in the per-user state directory, or the directory selected by `NUNYA_HOME`. The default route is `postgres`, with PostgreSQL at `127.0.0.1:6432`.
 
-Reconnects and renewals preserve the token scope. If a stored session has ended, the helper requires `--new-scope` before replacement; obtain fresh tokens for the new scope. Default lifetimes are 8 hours absolute and 1 hour idle. Shorten them with `[session] max_lifetime`, `idle_timeout`, or a shorter acquisition `--ttl`.
+Reconnects and renewals preserve the persisted token scope, so equal values in the same domain keep equal tokens across connections. `nunya session show` displays public details; `nunya session renew` renews access, and `--rotate` rotates the credential while keeping the scope. Use `nunya session acquire --isolated` to create a separate scope in a new context, then `nunya exec --context <that context>` to use it. If a stored session has ended, the helper requires `--new-scope` before replacement; obtain fresh tokens for the new scope. Default lifetimes are 8 hours absolute and 1 hour idle. Shorten them with `[session] max_lifetime`, `idle_timeout`, or a shorter acquisition `--ttl`.
 
 Revoke while the service is still running, then stop it with Ctrl-C:
 
@@ -84,7 +84,7 @@ Revoke while the service is still running, then stop it with Ctrl-C:
 nunya session revoke --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --context reporting
 ```
 
-See [operations](site/docs/operations.html) for revocation, private-network reachability and recovery, and the [reload settings table](site/docs/configuration.html#reload) before changing a running service. A state restore can bring back revoked sessions: revoke all sessions or disable affected principals before serving traffic after any restore.
+Revocation or expiry ends active work and closes PostgreSQL connections. NY011 reports that access ended; NY012 reports a forwarded write whose outcome was not observed. Reconcile an uncertain write before retrying; Nunya never replays it. See [operations](site/docs/operations.html) for revocation, private-network reachability and recovery, and the [reload settings table](site/docs/configuration.html#reload) before changing a running service. A state restore can bring back revoked sessions: revoke all sessions or disable affected principals before serving traffic after any restore.
 
 ## Per-route policies
 
@@ -174,9 +174,13 @@ Build from the repository root using `docker build -f crates/nunya/Dockerfile -t
 
 For a service, use a dedicated unprivileged account, a private configuration directory, and a writable private state directory. Run `nunya serve --config /etc/nunya/nunya.toml`. Exit 0 means clean shutdown; exit 1 means a configuration or service error.
 
-## Local PostgreSQL harness
+## Local harness
 
-`bash harness/run.sh` starts PostgreSQL 16, 17 and 18, waits for health checks, and removes containers and volumes on exit. Press Enter to stop. Host ports are 16432, 17432 and 18432; change the config port to select a version. Use `NUNYA_UPSTREAM_PASSWORD=nunya-harness-only` and a freshly generated `NUNYA_ROOT_KEY`. Seed credentials are for isolated local tests only. It uses the official `postgres:16-alpine`, `postgres:17-alpine` and `postgres:18-alpine` images. The script prints a fresh temporary task root for run logs and temporary files; optionally choose any directory with `--task-root /path/to/runs`.
+`bash harness/run.sh --work-root /path/to/private/work` starts PostgreSQL 16, 17 and 18, waits for health checks, and removes containers and volumes on exit. Press Enter to stop. Host ports are 16432, 17432 and 18432; change the config port to select a version. Use `NUNYA_UPSTREAM_PASSWORD=nunya-harness-only` and a freshly generated `NUNYA_ROOT_KEY`. Seed credentials are for isolated local tests only. It uses the official `postgres:16-alpine`, `postgres:17-alpine` and `postgres:18-alpine` images. Each run creates a unique subdirectory under the work root for logs, data and temporary files.
+
+`bash harness/run.sh private --work-root /path/to/private/work` runs the private-network, session, driver, restart, revocation and expiry checks against PostgreSQL 18.6. The database stays on the private container network; the gateway publishes loopback PostgreSQL port 26432 and management port 26481, overridable with `NUNYA_PG_PORT` and `NUNYA_MGMT_PORT`. Set `NUNYA_EXE` (or `--nunya-exe`) to the host binary, `NUNYA_PYTHON` to the Python executable and `NUNYA_JDBC_JARS` to the JDBC dependency directory. The private runner uses `build-linux.sh` unless `--linux-bin` supplies a Linux binary; that build helper accepts `NUNYA_BUILD_WRAPPER` as an optional command prefix for its Docker build invocation. The top-level runner delegates these settings to its helpers. Private mode exits after its scenarios and removes its Compose resources.
+
+`bash harness/run.sh spanner --work-root /path/to/private/work` starts the Spanner emulator and PGAdapter harness and waits for Enter before cleanup. See the [driver guide](site/docs/drivers.html#harness) for private-harness prerequisites and the [Spanner guide](site/docs/spanner.html) for route setup.
 
 ## Spanner
 
@@ -200,7 +204,7 @@ against its own catalog. Admin reload and Unix SIGHUP attempt each distinct file
 independently; routes sharing one file reload together after validation against
 all their catalogs. Native catalog snapshots still refresh periodically.
 
-Agents supply `Authorization: Bearer nunya.session:<32 hex>.<secret>` metadata
+Agents supply `Authorization: Bearer nunya.session:REPLACE_WITH_SESSION_ID.REPLACE_WITH_SESSION_SECRET` metadata
 using access-session credentials. Principal credentials authenticate only to the
 management API. Pass GoogleSQL tokens as query parameters; literals are never
 decrypted. `PartitionQuery` and `PartitionRead` RPCs are refused; read-only
