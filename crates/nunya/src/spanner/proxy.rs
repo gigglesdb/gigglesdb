@@ -26,7 +26,7 @@ use futures::{Stream, StreamExt};
 use googleapis_tonic_google_spanner_v1::google::spanner::v1::{spanner_client::SpannerClient, *};
 use prost_types::{ListValue, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex, RwLock},
@@ -124,8 +124,77 @@ pub struct NunyaSpanner {
     channel: Channel,
     sessions: Arc<Mutex<HashMap<String, SessionId>>>,
     watchers: Arc<Mutex<HashMap<SessionId, SessionWatcher>>>,
-    dml_sessions: Arc<Mutex<HashSet<String>>>,
+    transactions: Arc<Mutex<Transactions>>,
     provider: Option<Arc<dyn gcp_auth::TokenProvider>>,
+}
+type Transactions = HashMap<(String, Vec<u8>), TrackedTransaction>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TxnState {
+    Clean,
+    Dml,
+}
+#[derive(Clone, Copy)]
+struct TrackedTransaction {
+    owner: SessionId,
+    state: TxnState,
+}
+fn read_write(options: Option<&TransactionOptions>) -> bool {
+    matches!(
+        options.and_then(|o| o.mode.as_ref()),
+        Some(transaction_options::Mode::ReadWrite(_))
+    )
+}
+fn inline_read_write(selector: Option<&TransactionSelector>) -> bool {
+    matches!(selector.and_then(|s| s.selector.as_ref()), Some(transaction_selector::Selector::Begin(o)) if read_write(Some(o)))
+}
+fn track_transaction(
+    transactions: &Mutex<Transactions>,
+    owner: SessionId,
+    session: &str,
+    id: &[u8],
+    state: TxnState,
+) -> Result<(), Status> {
+    if id.is_empty() {
+        return Ok(());
+    }
+    let mut transactions = transactions.lock().map_err(|_| invalid())?;
+    let key = (session.to_owned(), id.to_vec());
+    // Globally cap tracking at 4096 entries; evicted transactions require write admission.
+    if !transactions.contains_key(&key)
+        && transactions.len() >= 4096
+        && let Some(key) = transactions.keys().next().cloned()
+    {
+        transactions.remove(&key);
+    }
+    transactions
+        .entry(key)
+        .and_modify(|entry| {
+            if state == TxnState::Dml {
+                entry.state = state;
+            }
+        })
+        .or_insert(TrackedTransaction { owner, state });
+    Ok(())
+}
+async fn best_effort_rollback(
+    channel: Channel,
+    provider: Option<Arc<dyn gcp_auth::TokenProvider>>,
+    session: String,
+    transaction_id: Vec<u8>,
+) {
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        upstream_client(&channel, &provider)
+            .await?
+            .rollback(RollbackRequest {
+                session,
+                transaction_id,
+            })
+            .await
+    })
+    .await;
+    if !matches!(result, Ok(Ok(_))) {
+        eprintln!("spanner: best-effort rollback after refused commit failed");
+    }
 }
 struct SessionWatcher {
     connection: u64,
@@ -267,7 +336,7 @@ pub async fn build(ctx: Arc<SpannerContext>) -> Result<NunyaSpanner, Refusal> {
         channel,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         watchers: Arc::new(Mutex::new(HashMap::new())),
-        dml_sessions: Arc::new(Mutex::new(HashSet::new())),
+        transactions: Arc::new(Mutex::new(HashMap::new())),
         provider,
     })
 }
@@ -461,7 +530,7 @@ impl NunyaSpanner {
             let (ended_tx, ended) = tokio::sync::watch::channel(false);
             entry.insert(SessionWatcher { connection: guard.id().get(), stop, ended });
             let sessions = self.sessions.clone();
-            let dml_sessions = self.dml_sessions.clone();
+            let transactions = self.transactions.clone();
             let watchers = Arc::downgrade(&self.watchers);
             let channel = self.channel.clone();
             let provider = self.provider.clone();
@@ -502,15 +571,18 @@ impl NunyaSpanner {
                         for name in &names {
                             sessions.remove(name);
                         }
-                        dml_sessions
-                            .lock()
-                            .map_err(|_| invalid())?
-                            .retain(|name| !names.contains(name));
                         if let Some(watchers) = watchers.upgrade() {
                             watchers.lock().map_err(|_| invalid())?.remove(&session);
                         }
                         names
                     };
+                    let tracked: Vec<_> = transactions.lock().map_err(|_| invalid())?
+                        .iter().filter(|(_, txn)| txn.owner == session)
+                        .map(|(key, _)| key.clone()).collect();
+                    for (name, id) in &tracked {
+                        best_effort_rollback(channel.clone(), provider.clone(), name.clone(), id.clone()).await;
+                    }
+                    transactions.lock().map_err(|_| invalid())?.retain(|_, txn| txn.owner != session);
                     for name in names {
                         let _ = tokio::time::timeout(Duration::from_secs(5), async {
                             upstream_client(&channel, &provider)
@@ -577,19 +649,54 @@ impl NunyaSpanner {
         }
         Ok(())
     }
-    fn mark_dml(&self, session: &str) -> Result<(), Status> {
-        self.dml_sessions
-            .lock()
-            .map_err(|_| invalid())?
-            .insert(session.into());
+    fn mark_dml(&self, session: &str, id: &[u8], owner: SessionId) -> Result<(), Status> {
+        track_transaction(&self.transactions, owner, session, id, TxnState::Dml)
+    }
+    fn mark_selector_dml(
+        &self,
+        session: &str,
+        selector: Option<&TransactionSelector>,
+        owner: SessionId,
+    ) -> Result<(), Status> {
+        if let Some(transaction_selector::Selector::Id(id)) =
+            selector.and_then(|s| s.selector.as_ref())
+        {
+            self.mark_dml(session, id, owner)?;
+        }
         Ok(())
     }
-    fn clear_dml(&self, session: &str) -> Result<(), Status> {
-        self.dml_sessions
-            .lock()
-            .map_err(|_| invalid())?
-            .remove(session);
+    fn record_inline(
+        &self,
+        session: &str,
+        owner: SessionId,
+        inline: bool,
+        write: bool,
+        metadata: Option<&ResultSetMetadata>,
+    ) -> Result<(), Status> {
+        if inline && let Some(transaction) = metadata.and_then(|m| m.transaction.as_ref()) {
+            track_transaction(
+                &self.transactions,
+                owner,
+                session,
+                &transaction.id,
+                if write {
+                    TxnState::Dml
+                } else {
+                    TxnState::Clean
+                },
+            )?;
+        }
         Ok(())
+    }
+    fn refused_commit_rollback(&self, req: &CommitRequest) {
+        if let Some(commit_request::Transaction::TransactionId(id)) = &req.transaction {
+            tokio::spawn(best_effort_rollback(
+                self.channel.clone(),
+                self.provider.clone(),
+                req.session.clone(),
+                id.clone(),
+            ));
+        }
     }
     async fn delete_unrecorded(&self, name: &str) {
         let _ = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1007,9 +1114,11 @@ impl NunyaSpanner {
         mut upstream: tonic::Streaming<PartialResultSet>,
         mut signal: tokio::sync::watch::Receiver<bool>,
         write: bool,
+        mut inline_session: Option<String>,
     ) -> ResultStream {
         let ctx = self.ctx.clone();
         let watchers = self.watchers.clone();
+        let transactions = self.transactions.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let client_signal = signal.clone();
         tokio::spawn(async move {
@@ -1032,6 +1141,11 @@ impl NunyaSpanner {
                         .admit(who.session, Operation::Read)
                         .map_err(|_| ended_status(write))?;
                     let mut part = part.map_err(remote)?;
+                    if let Some(session) = inline_session.as_ref()
+                        && let Some(transaction) = part.metadata.as_ref().and_then(|m| m.transaction.as_ref()) {
+                        track_transaction(&transactions, who.session, session, &transaction.id, if write { TxnState::Dml } else { TxnState::Clean })?;
+                        inline_session = None;
+                    }
                     precommit.observe(&mut part);
                     let (events, resume) =
                         reassembler.push(part).map_err(|e| after_forward(status(e), write))?;
@@ -1239,7 +1353,7 @@ impl SpannerService for NunyaSpanner {
         let mut sessions = self.sessions.lock().map_err(|_| invalid())?;
         let mut watchers = self.watchers.lock().map_err(|_| invalid())?;
         sessions.remove(&req.name);
-        self.clear_dml(&req.name)?;
+        self.transactions.lock().map_err(|_| invalid())?.retain(|(name, _), _| name != &req.name);
         if !sessions.values().any(|owner| *owner == who.session)
             && let Some(stop) = watchers.remove(&who.session)
         {
@@ -1265,6 +1379,7 @@ impl SpannerService for NunyaSpanner {
         );
         match kind {
             StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {
+                self.mark_selector_dml(&req.session, req.transaction.as_ref(), who.session)?;
                 self.admit_write(&who)?
             }
             StatementKind::Select | StatementKind::Tokenize { .. } => {}
@@ -1293,12 +1408,12 @@ impl SpannerService for NunyaSpanner {
             return Ok(Response::new(result));
         }
         let mut client = self.client().await?;
-        if write {
-            self.mark_dml(&req.session)?;
-        }
+        let inline = inline_read_write(req.transaction.as_ref());
+        let session = req.session.clone();
         let mut result = cancellable(&mut signal, write, client.execute_sql(req))
             .await?
             .into_inner();
+        self.record_inline(&session, who.session, inline, write, result.metadata.as_ref())?;
         let tokens = self
             .rows(&who, &policy, &plan, &mut result)
             .map_err(|e| after_forward(e, write))?;
@@ -1325,6 +1440,7 @@ impl SpannerService for NunyaSpanner {
         );
         match kind {
             StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {
+                self.mark_selector_dml(&req.session, req.transaction.as_ref(), who.session)?;
                 self.admit_write(&who)?
             }
             StatementKind::Select | StatementKind::Tokenize { .. } => {}
@@ -1359,14 +1475,13 @@ impl SpannerService for NunyaSpanner {
             )]))));
         }
         let mut client = self.client().await?;
-        if write {
-            self.mark_dml(&req.session)?;
-        }
+        let inline = inline_read_write(req.transaction.as_ref());
+        let session = req.session.clone();
         let upstream = cancellable(&mut signal, write, client.execute_streaming_sql(req))
             .await?
             .into_inner();
         Ok(Response::new(
-            self.stream(who, policy, revision, plan, label, upstream, signal, write),
+            self.stream(who, policy, revision, plan, label, upstream, signal, write, inline.then_some(session)),
         ))
     }
     async fn execute_batch_dml(
@@ -1407,15 +1522,18 @@ impl SpannerService for NunyaSpanner {
             }
             plans.push(plan);
         }
+        self.mark_selector_dml(&req.session, req.transaction.as_ref(), who.session)?;
         self.admit_write(&who)?;
         for label in &labels {
             Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), label, 0, vec![])?;
         }
         let mut client = self.client().await?;
-        self.mark_dml(&req.session)?;
+        let inline = inline_read_write(req.transaction.as_ref());
+        let session = req.session.clone();
         let mut result = cancellable(&mut signal, true, client.execute_batch_dml(req))
             .await?
             .into_inner();
+        self.record_inline(&session, who.session, inline, true, result.result_sets.first().and_then(|set| set.metadata.as_ref()))?;
         if result.result_sets.len() > plans.len() {
             return Err(ended_status(true));
         }
@@ -1462,9 +1580,12 @@ impl SpannerService for NunyaSpanner {
             *read_value_mut(&mut req, &lowered.positions[index]).ok_or_else(invalid)? = value;
         }
         Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Read", 0, vec![])?;
+        let inline = inline_read_write(req.transaction.as_ref());
+        let session = req.session.clone();
         let mut result = cancellable(&mut signal, false, self.client().await?.read(req))
             .await?
             .into_inner();
+        self.record_inline(&session, who.session, inline, false, result.metadata.as_ref())?;
         let tokens = self.rows(&who, &policy, &plan, &mut result)?;
         Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Read", result.rows.len() as u64, tokens)?;
         self.check_response(&who, &signal, false)?;
@@ -1496,6 +1617,8 @@ impl SpannerService for NunyaSpanner {
             *read_value_mut(&mut req, &lowered.positions[index]).ok_or_else(invalid)? = value;
         }
         Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Read", 0, vec![])?;
+        let inline = inline_read_write(req.transaction.as_ref());
+        let session = req.session.clone();
         let upstream = cancellable(&mut signal, false, self.client().await?.streaming_read(req))
             .await?
             .into_inner();
@@ -1508,6 +1631,7 @@ impl SpannerService for NunyaSpanner {
             upstream,
             signal,
             false,
+            inline.then_some(session),
         )))
     }
     async fn begin_transaction(
@@ -1523,25 +1647,39 @@ impl SpannerService for NunyaSpanner {
             let (policy, snapshot, _) = self.configuration()?;
             self.prepare_mutation(&who, &policy, &snapshot, mutation)?;
         }
-        Ok(Response::new(
-            cancellable(
-                &mut signal,
-                false,
-                self.client().await?.begin_transaction(req),
-            )
-            .await?
-            .into_inner(),
-        ))
+        let track = read_write(req.options.as_ref());
+        let session = req.session.clone();
+        let transaction = cancellable(
+            &mut signal,
+            false,
+            self.client().await?.begin_transaction(req),
+        )
+        .await?
+        .into_inner();
+        if track {
+            track_transaction(
+                &self.transactions,
+                who.session,
+                &session,
+                &transaction.id,
+                TxnState::Clean,
+            )?;
+        }
+        Ok(Response::new(transaction))
     }
+
     async fn rollback(&self, req: Request<RollbackRequest>) -> Result<Response<()>, Status> {
         let who = self.authenticate(&req)?;
         let req = req.into_inner();
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
         let mut client = self.client().await?;
-        let session = req.session.clone();
+        let key = (req.session.clone(), req.transaction_id.clone());
         let result = cancellable(&mut signal, false, client.rollback(req)).await;
-        self.clear_dml(&session)?;
+        self.transactions
+            .lock()
+            .map_err(|_| invalid())?
+            .remove(&key);
         result?;
         Ok(Response::new(()))
     }
@@ -1552,29 +1690,55 @@ impl SpannerService for NunyaSpanner {
         let who = self.authenticate(&req)?;
         let mut req = req.into_inner();
         self.session(&req.session, &who)?;
-        let mut signal = self.end_signal(&who)?;
+        let mut signal = self
+            .end_signal(&who)
+            .inspect_err(|_| self.refused_commit_rollback(&req))?;
         let (policy, snapshot, revision) = self.configuration()?;
-        let dml_forwarded = self
-            .dml_sessions
-            .lock()
-            .map_err(|_| invalid())?
-            .contains(&req.session);
-        if !req.mutations.is_empty() || dml_forwarded {
-            self.admit_write(&who)?;
+        let key = match &req.transaction {
+            Some(commit_request::Transaction::TransactionId(id)) => {
+                Some((req.session.clone(), id.clone()))
+            }
+            Some(commit_request::Transaction::SingleUseTransaction(_)) => None,
+            None => None,
+        };
+        let state = if let Some(key) = &key {
+            self.transactions.lock().map_err(|_| invalid())?.remove(key)
+        } else {
+            None
+        };
+        let clean = match &req.transaction {
+            Some(commit_request::Transaction::TransactionId(_)) => {
+                state.is_some_and(|t| t.state == TxnState::Clean)
+            }
+            Some(commit_request::Transaction::SingleUseTransaction(_)) => true,
+            None => false,
+        };
+        if !req.mutations.is_empty() || !clean {
+            self.admit_write(&who)
+                .inspect_err(|_| self.refused_commit_rollback(&req))?;
         }
         for mutation in &mut req.mutations {
             self.prepare_mutation(&who, &policy, &snapshot, mutation)?;
         }
-        Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Commit", 0, vec![])?;
+        Self::audit(
+            &self.ctx,
+            &self.watchers,
+            &who,
+            revision.as_deref(),
+            "Commit",
+            0,
+            vec![],
+        )?;
         let mut client = self.client().await?;
-        let session = req.session.clone();
         let result = cancellable(&mut signal, true, client.commit(req)).await;
-        let retry = result.as_ref().is_ok_and(|response| matches!(
-            response.get_ref().multiplexed_session_retry,
-            Some(commit_response::MultiplexedSessionRetry::PrecommitToken(_))
-        ));
-        if !retry {
-            self.clear_dml(&session)
+        let retry = result.as_ref().is_ok_and(|response| {
+            matches!(
+                response.get_ref().multiplexed_session_retry,
+                Some(commit_response::MultiplexedSessionRetry::PrecommitToken(_))
+            )
+        });
+        if retry && let (Some((session, id)), Some(state)) = (key, state) {
+            track_transaction(&self.transactions, state.owner, &session, &id, state.state)
                 .map_err(|e| after_forward(e, true))?;
         }
         let response = result?.into_inner();
@@ -1811,6 +1975,9 @@ mod tests {
         result_token: Mutex<Option<MultiplexedSessionPrecommitToken>>,
         next_commit: Mutex<Option<CommitResponse>>,
         begins: Mutex<Vec<BeginTransactionRequest>>,
+        rollbacks: Mutex<Vec<(String, Vec<u8>)>>,
+        next_transaction: std::sync::atomic::AtomicUsize,
+        hold_rollback: std::sync::atomic::AtomicBool,
         parts: Mutex<Option<Vec<PartialResultSet>>>,
         seen: Mutex<Vec<ExecuteSqlRequest>>,
         commits: Mutex<Vec<CommitRequest>>,
@@ -1827,6 +1994,21 @@ mod tests {
         burst_stream: std::sync::atomic::AtomicBool,
         emitted: Arc<std::sync::atomic::AtomicUsize>,
         wrong_database: std::sync::atomic::AtomicBool,
+    }
+    impl Fake {
+        fn transaction(&self) -> Transaction {
+            Transaction {
+                id: self
+                    .next_transaction
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .to_be_bytes()
+                    .to_vec(),
+                ..Default::default()
+            }
+        }
+        fn inline_transaction(&self, selector: Option<&TransactionSelector>) -> Option<Transaction> {
+            inline_read_write(selector).then(|| self.transaction())
+        }
     }
     #[tonic::async_trait]
     impl SpannerService for Fake {
@@ -1908,11 +2090,13 @@ mod tests {
             }
             self.streaming
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let transaction = self.inline_transaction(req.get_ref().transaction.as_ref());
             let hold = self.hold_stream.load(std::sync::atomic::Ordering::Relaxed);
             let burst = self.burst_stream.load(std::sync::atomic::Ordering::Relaxed);
             if hold || burst {
                 let mut first = PartialResultSet {
                     metadata: Some(ResultSetMetadata {
+                        transaction,
                         row_type: Some(StructType {
                             fields: vec![struct_type::Field {
                                 name: "email".into(),
@@ -1953,9 +2137,16 @@ mod tests {
                     futures::stream::iter([Ok(first)]).chain(futures::stream::pending()),
                 )));
             }
+            if req.get_ref().sql.starts_with("UPDATE ") {
+                return Ok(Response::new(Box::pin(futures::stream::iter([Ok(PartialResultSet {
+                    metadata: Some(ResultSetMetadata { transaction, ..Default::default() }),
+                    stats: Some(ResultSetStats::default()), ..Default::default()
+                })]))));
+            }
             Ok(Response::new(Box::pin(futures::stream::iter(vec![
                 Ok(PartialResultSet {
                     metadata: Some(ResultSetMetadata {
+                        transaction,
                         row_type: Some(StructType {
                             fields: vec![struct_type::Field {
                                 name: "email".into(),
@@ -1989,6 +2180,7 @@ mod tests {
             req: Request<ExecuteSqlRequest>,
         ) -> Result<Response<ResultSet>, Status> {
             let req = req.into_inner();
+            let transaction = self.inline_transaction(req.transaction.as_ref());
             let dml = req.sql.starts_with("UPDATE ")
                 || req.sql.starts_with("INSERT ")
                 || req.sql.starts_with("DELETE ");
@@ -1997,10 +2189,11 @@ mod tests {
                 self.release.notified().await;
             }
             if dml {
-                return Ok(Response::new(ResultSet { precommit_token: self.result_token.lock().unwrap().clone(), ..Default::default() }));
+                return Ok(Response::new(ResultSet { metadata: transaction.map(|transaction| ResultSetMetadata { transaction: Some(transaction), ..Default::default() }), precommit_token: self.result_token.lock().unwrap().clone(), ..Default::default() }));
             }
             Ok(Response::new(ResultSet {
                 metadata: Some(ResultSetMetadata {
+                    transaction,
                     row_type: Some(StructType {
                         fields: vec![struct_type::Field {
                             name: "email".into(),
@@ -2023,18 +2216,33 @@ mod tests {
             &self,
             req: Request<ExecuteBatchDmlRequest>,
         ) -> Result<Response<ExecuteBatchDmlResponse>, Status> {
-            self.batches.lock().unwrap().push(req.into_inner());
-            Ok(Response::new(ExecuteBatchDmlResponse { precommit_token: self.result_token.lock().unwrap().clone(), ..Default::default() }))
+            let req = req.into_inner();
+            let transaction = self.inline_transaction(req.transaction.as_ref());
+            self.batches.lock().unwrap().push(req);
+            Ok(Response::new(ExecuteBatchDmlResponse {
+                result_sets: transaction.map(|transaction| ResultSet {
+                    metadata: Some(ResultSetMetadata { transaction: Some(transaction), ..Default::default() }), ..Default::default()
+                }).into_iter().collect(),
+                precommit_token: self.result_token.lock().unwrap().clone(), ..Default::default()
+            }))
         }
         async fn begin_transaction(&self, req: Request<BeginTransactionRequest>) -> Result<Response<Transaction>, Status> {
             self.begins.lock().unwrap().push(req.into_inner());
-            Ok(Response::new(Transaction { precommit_token: self.result_token.lock().unwrap().clone(), ..Default::default() }))
+            Ok(Response::new(Transaction { precommit_token: self.result_token.lock().unwrap().clone(), ..self.transaction() }))
         }
-        async fn read(&self, _: Request<ReadRequest>) -> Result<Response<ResultSet>, Status> {
-            self.execute_sql(Request::new(ExecuteSqlRequest::default())).await
+        async fn read(&self, req: Request<ReadRequest>) -> Result<Response<ResultSet>, Status> {
+            self.execute_sql(Request::new(ExecuteSqlRequest { transaction: req.into_inner().transaction, ..Default::default() })).await
         }
-        async fn streaming_read(&self, _: Request<ReadRequest>) -> Result<Response<ResultStream>, Status> {
-            self.execute_streaming_sql(Request::new(ExecuteSqlRequest::default())).await
+        async fn streaming_read(&self, req: Request<ReadRequest>) -> Result<Response<ResultStream>, Status> {
+            self.execute_streaming_sql(Request::new(ExecuteSqlRequest { transaction: req.into_inner().transaction, ..Default::default() })).await
+        }
+        async fn rollback(&self, req: Request<RollbackRequest>) -> Result<Response<()>, Status> {
+            let req = req.into_inner();
+            self.rollbacks.lock().unwrap().push((req.session, req.transaction_id));
+            if self.hold_rollback.load(std::sync::atomic::Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
+            Ok(Response::new(()))
         }
         async fn commit(
             &self,
@@ -2690,7 +2898,7 @@ mod tests {
     async fn commit_precommit_retry_and_unknown_outcome() {
         let f = Fixture::new().await;
         let session = f.session().await;
-        f.svc.mark_dml(&session).unwrap();
+        f.svc.mark_dml(&session, b"txn", f.alice).unwrap();
         let retry = CommitResponse {
             multiplexed_session_retry: Some(
                 commit_response::MultiplexedSessionRetry::PrecommitToken(precommit(8)),
@@ -2699,6 +2907,7 @@ mod tests {
         };
         *f.fake.next_commit.lock().unwrap() = Some(retry.clone());
         let request = CommitRequest {
+                        transaction: Some(commit_request::Transaction::TransactionId(b"txn".to_vec())),
             session: session.clone(),
             precommit_token: Some(precommit(7)),
             ..Default::default()
@@ -2714,12 +2923,13 @@ mod tests {
             f.fake.commits.lock().unwrap()[0].precommit_token,
             Some(precommit(7))
         );
-        assert!(f.svc.dml_sessions.lock().unwrap().contains(&session));
+        assert!(f.svc.transactions.lock().unwrap().contains_key(&(session.clone(), b"txn".to_vec())));
         reduce_grant(&f);
         assert_read_only(
             f.svc
                 .commit(f.request(
                     CommitRequest {
+                        transaction: Some(commit_request::Transaction::TransactionId(b"txn".to_vec())),
                         session,
                         ..Default::default()
                     },
@@ -2732,12 +2942,13 @@ mod tests {
 
         let f = Fixture::new().await;
         let session = f.session().await;
-        f.svc.mark_dml(&session).unwrap();
+        f.svc.mark_dml(&session, b"txn", f.alice).unwrap();
         *f.fake.next_commit.lock().unwrap() = Some(CommitResponse::default());
         let error = f
             .svc
             .commit(f.request(
                 CommitRequest {
+                        transaction: Some(commit_request::Transaction::TransactionId(b"txn".to_vec())),
                     session: session.clone(),
                     ..Default::default()
                 },
@@ -2747,11 +2958,12 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unknown);
         assert!(error.message().contains("NY012"));
-        assert!(!f.svc.dml_sessions.lock().unwrap().contains(&session));
+        assert!(!f.svc.transactions.lock().unwrap().contains_key(&(session.clone(), b"txn".to_vec())));
         assert!(
             f.svc
                 .commit(f.request(
                     CommitRequest {
+                        transaction: Some(commit_request::Transaction::TransactionId(b"txn".to_vec())),
                         session,
                         ..Default::default()
                     },
@@ -3652,6 +3864,231 @@ mod tests {
                 .contains_key("projects/p/instances/i/databases/d/sessions/recorded")
         );
     }
+    fn rw_options() -> TransactionOptions {
+        TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadWrite(Default::default())),
+            ..Default::default()
+        }
+    }
+    fn id_selector(id: &[u8]) -> TransactionSelector {
+        TransactionSelector {
+            selector: Some(transaction_selector::Selector::Id(id.to_vec())),
+        }
+    }
+    async fn begin_rw(f: &Fixture, session: &str) -> Vec<u8> {
+        f.svc
+            .begin_transaction(f.request(
+                BeginTransactionRequest {
+                    session: session.into(),
+                    options: Some(rw_options()),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .id
+    }
+    async fn txn_dml(f: &Fixture, session: &str, id: &[u8]) {
+        let mut req = f.query("UPDATE customers SET email = @v").await;
+        req.session = session.into();
+        req.transaction = Some(id_selector(id));
+        req.params = Some(prost_types::Struct {
+            fields: [("v".into(), f.token())].into(),
+        });
+        f.svc.execute_sql(f.request(req, "alice")).await.unwrap();
+    }
+    fn txn_commit(session: &str, id: &[u8]) -> CommitRequest {
+        CommitRequest {
+            session: session.into(),
+            transaction: Some(commit_request::Transaction::TransactionId(id.to_vec())),
+            ..Default::default()
+        }
+    }
+    async fn other_transaction_ends(commit_b: bool) {
+        let f = Fixture::new().await;
+        let session = f.session().await;
+        let a = begin_rw(&f, &session).await;
+        txn_dml(&f, &session, &a).await;
+        let b = begin_rw(&f, &session).await;
+        assert_ne!(a, b);
+        if commit_b {
+            f.svc
+                .commit(f.request(txn_commit(&session, &b), "alice"))
+                .await
+                .unwrap();
+        } else {
+            f.svc
+                .rollback(f.request(
+                    RollbackRequest {
+                        session: session.clone(),
+                        transaction_id: b,
+                    },
+                    "alice",
+                ))
+                .await
+                .unwrap();
+        }
+        reduce_grant(&f);
+        assert_read_only(
+            f.svc
+                .commit(f.request(txn_commit(&session, &a), "alice"))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            f.fake
+                .commits
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|c| c.transaction
+                    != Some(commit_request::Transaction::TransactionId(a.clone())))
+        );
+        wait_for(|| {
+            f.fake
+                .rollbacks
+                .lock()
+                .unwrap()
+                .contains(&(session.clone(), a.clone()))
+        })
+        .await;
+    }
+    #[tokio::test]
+    async fn multiplexed_rollback_of_b_keeps_dml_of_a() {
+        other_transaction_ends(false).await;
+    }
+    #[tokio::test]
+    async fn empty_commit_of_b_keeps_dml_of_a() {
+        other_transaction_ends(true).await;
+    }
+    #[tokio::test]
+    async fn clean_transaction_commits_after_downgrade() {
+        let f = Fixture::new().await;
+        let mut req = f.query("SELECT email FROM customers").await;
+        let session = req.session.clone();
+        let id = begin_rw(&f, &session).await;
+        req.transaction = Some(id_selector(&id));
+        f.svc.execute_sql(f.request(req, "alice")).await.unwrap();
+        reduce_grant(&f);
+        f.svc
+            .commit(f.request(txn_commit(&session, &id), "alice"))
+            .await
+            .unwrap();
+        assert_eq!(f.fake.commits.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn unknown_transaction_commit_requires_write() {
+        let f = Fixture::new().await;
+        let session = f.session().await;
+        reduce_grant(&f);
+        assert_read_only(
+            f.svc
+                .commit(f.request(txn_commit(&session, b"unknown"), "alice"))
+                .await
+                .unwrap_err(),
+        );
+        assert!(f.fake.commits.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn inline_begin_dml_is_tracked() {
+        for streaming in [false, true] {
+            let f = Fixture::new().await;
+            let mut req = f.query("UPDATE customers SET email = @v").await;
+            let session = req.session.clone();
+            req.transaction = Some(TransactionSelector {
+                selector: Some(transaction_selector::Selector::Begin(rw_options())),
+            });
+            req.params = Some(prost_types::Struct {
+                fields: [("v".into(), f.token())].into(),
+            });
+            let id = if streaming {
+                let mut stream = f
+                    .svc
+                    .execute_streaming_sql(f.request(req, "alice"))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let part = stream.next().await.unwrap().unwrap();
+                part.metadata.unwrap().transaction.unwrap().id
+            } else {
+                f.svc
+                    .execute_sql(f.request(req, "alice"))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .metadata
+                    .unwrap()
+                    .transaction
+                    .unwrap()
+                    .id
+            };
+            reduce_grant(&f);
+            assert_read_only(
+                f.svc
+                    .commit(f.request(txn_commit(&session, &id), "alice"))
+                    .await
+                    .unwrap_err(),
+            );
+            assert!(f.fake.commits.lock().unwrap().is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn revocation_rolls_back_tracked_transactions() {
+        let f = Fixture::new().await;
+        let session = f.session().await;
+        let id = begin_rw(&f, &session).await;
+        txn_dml(&f, &session, &id).await;
+        let clean = begin_rw(&f, &session).await;
+        revoke(&f);
+        wait_for(|| {
+            f.fake
+                .rollbacks
+                .lock()
+                .unwrap()
+                .contains(&(session.clone(), id.clone()))
+        })
+        .await;
+        wait_for(|| {
+            f.fake
+                .rollbacks
+                .lock()
+                .unwrap()
+                .contains(&(session.clone(), clean.clone()))
+        })
+        .await;
+        wait_for(|| f.fake.deleted.lock().unwrap().contains(&session)).await;
+        assert!(f.svc.transactions.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn refused_commit_does_not_wait_for_rollback() {
+        let f = Fixture::new().await;
+        let session = f.session().await;
+        let id = begin_rw(&f, &session).await;
+        txn_dml(&f, &session, &id).await;
+        f.fake
+            .hold_rollback
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        reduce_grant(&f);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            f.svc.commit(f.request(txn_commit(&session, &id), "alice")),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_read_only(error);
+        wait_for(|| {
+            f.fake
+                .rollbacks
+                .lock()
+                .unwrap()
+                .contains(&(session.clone(), id.clone()))
+        })
+        .await;
+        assert!(f.fake.commits.lock().unwrap().is_empty());
+    }
     #[tokio::test]
     async fn commit_after_dml_requires_write_admission() {
         for write in [false, true] {
@@ -3664,6 +4101,8 @@ mod tests {
                 })
                 .await;
             let session = req.session.clone();
+            let id = begin_rw(&f, &session).await;
+            req.transaction = Some(id_selector(&id));
             if write {
                 req.params = Some(prost_types::Struct {
                     fields: [("v".into(), f.token())].into(),
@@ -3675,6 +4114,7 @@ mod tests {
                 .svc
                 .commit(f.request(
                     CommitRequest {
+                        transaction: Some(commit_request::Transaction::TransactionId(id)),
                         session,
                         ..Default::default()
                     },
@@ -4051,6 +4491,7 @@ mod tests {
         f.svc
             .commit(f.request(
                 CommitRequest {
+                    transaction: Some(commit_request::Transaction::SingleUseTransaction(rw_options())),
                     session,
                     ..Default::default()
                 },
