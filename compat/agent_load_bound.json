@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "source": "GD-0061 design-3 section 7, latency benchmark; plan v5 open question 7",
+  "percentile": 99,
+  "ratio": 1.25,
+  "slack_ms": 2.0,
+  "max_application_errors": 0,
+  "checked_phases": ["B", "C"],
+  "operations": ["select", "update", "insert"],
+  "agent_max_concurrent_statements": 8,
+  "full": {
+    "rows": 1000000,
+    "application_connections": 16,
+    "phase_seconds": 120,
+    "mix": {"select": 80, "update": 15, "insert": 5},
+    "phase_b_tasks": 4,
+    "phase_c_tasks": 32
+  },
+  "smoke": {
+    "rows": 10000,
+    "phase_seconds": 5
+  }
+}

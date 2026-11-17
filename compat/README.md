@@ -628,3 +628,55 @@ It keys client checks by (client, check) and corpus cases by (area, case),
 prints both runs' identities and outcome totals plus a table of every record
 whose outcome differs or exists on one side only, and exits 0 when identical,
 1 when different, 2 for invalid input.
+
+## Application latency bound under agent load (R3-404)
+
+`agent_load.py` measures whether AI-agent task sessions at their limits slow
+the application down (GD-0061 design-3 section 7). It runs one real
+`giggles-server` and drives it from separate client processes over the
+PostgreSQL wire protocol (a small stdlib client; no Docker and no driver
+install):
+
+```powershell
+python -I compat/agent_load.py --server-bin J:/gigglesdb-work/<task>/target/debug/giggles-server.exe
+```
+
+- **Setup** (`--dev --trust-local`): table `shipments(id bigint primary key,
+  merchant_id bigint, status text, failed_at timestamptz, attempt_count int,
+  customer_email text, card_token text, note text)`, 1,000,000 rows in
+  1,000-row merchant blocks, an index on `(merchant_id, status)`, the task-only
+  executor `agent_exec` and 36 tasks (each sees one merchant block).
+- **Load server**: the same database in config-file mode, with a trusted
+  loopback PostgreSQL listener and the agent listener (client certificates from
+  a throwaway CA, `agent.max_concurrent_statements` 8). The shared request
+  bucket is raised to 1,000,000/s so it does not close connections.
+- **Workload**: 16 application connections, closed loop, 80% point SELECT,
+  15% single-row UPDATE, 5% INSERT, after an unmeasured 30 s warm-up. Phase A
+  has no agents; phase B adds 8 agent sessions over 4 tasks; phase C adds 32
+  sessions over 32 tasks. Each agent session loops: an unfiltered sorted SELECT
+  (rows-scanned limit), a protected UPDATE of a row the harness holds locked
+  (lock wait, 55P03), and keyset pages over its block until the rows-returned
+  cap. Phases run 120 s each.
+- **Bound**: `agent_load_bound.json`. For each application operation
+  `p99(B) <= max(1.25 x p99(A), p99(A) + 2 ms)`, the same for C, and zero
+  application errors. Change the constants only in a reviewed commit.
+
+The report goes to `compat/reports/<sha8>/agent-load.json` (`--report` to
+override): p50, p99, p99.9 and max per operation and phase, agent outcomes per
+step and SQLSTATE (54T01 split by budget), and the verdict with each measured
+ratio. Exit 0 passes, 2 means application errors, 3 means the bound failed and
+1 is a harness failure. Data, logs and client results go to a new
+`run-*` folder under `--work` (default `J:/gigglesdb-work/agent-load`, which
+must stay under `J:/gigglesdb-work`); the database is deleted afterwards unless
+`--keep-data`. Run it alone on the machine: other builds and tests distort p99.
+
+`--smoke` uses 10,000 rows, 5 s phases and a 2 s warm-up, and writes its report
+into the run folder. `compat/tests/test_agent_load.py` runs it when
+`GIGGLES_SERVER_BIN` names a built server (`AGENT_LOAD_WORK` sets the work
+folder). A smoke run is too short to judge the bound, so the test accepts exit 0
+or 3 and requires zero application errors and every agent limit reached.
+
+Until CREATE TASK runs over SQL (R3-110), pass `--task-tool TOOL` (or set
+`AGENT_LOAD_TASK_TOOL` for the test): after the setup server stops, the harness
+runs `TOOL <database> postgres <file of CREATE TASK statements>` to create the
+tasks in the stopped database.
