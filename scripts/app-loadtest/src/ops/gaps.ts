@@ -15,6 +15,10 @@ export const gaps: Op[] = [
   kind: kind as "read" | "write",
   doc: name,
   matrixOnly: true,
+  native: {
+    unsupported:
+      "SQL syntax/catalog-function probe with no native-language counterpart",
+  },
   async run({ q }) {
     await q(
       sql,
@@ -29,6 +33,10 @@ gaps.push({
   kind: "write",
   doc: "Correlated total update",
   matrixOnly: true,
+  native: {
+    unsupported:
+      "no correlated subquery or join aggregate in native SET expressions",
+  },
   async run({ q }) {
     const before = (await q("SELECT total FROM {s}orders WHERE id=$1", [1]))
       .rows[0].total;

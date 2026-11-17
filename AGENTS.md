@@ -297,6 +297,18 @@ and per machine hour). The rules below cap what anyone starts.
   `gigglesdb-gate-base`, and at most once a day, or when the toolchain or
   native dependencies change.
 
+### Benchmarks on boat
+
+Agreed with the user on 2026-11-16 (GD-0082). Besides landing gates, boxes
+may run end-to-end benchmarks through `scripts/bench-remote.sh`, which
+follows every rule above: the daily start cap, account-wide slots, START and
+END lines in `usage.log` (marked `bench`), `large` boxes only, a TTL of 2
+hours at most, code sent as a git bundle, and the box deleted as soon as the
+results are copied back. Benchmark boxes start from the saved snapshot
+`gigglesdb-bench-base`, not `gigglesdb-gate-base`. Run a benchmark only for
+a planned measurement (a baseline or a before/after comparison), never to
+iterate on code.
+
 ## Landing with scripts/land-commit.sh
 
 `scripts/land-commit.sh` performs the steps of "Committing in the shared

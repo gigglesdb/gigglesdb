@@ -5,11 +5,15 @@ import { stats } from "./stats.js";
 import { ops } from "./ops/index.js";
 import { random, type Kind } from "./ops/types.js";
 import { selected } from "./matrix.js";
+import { NativeSession, type NativeOptions } from "./native.js";
+import { nativeQ, type Frontend } from "./frontend.js";
 export async function load(
   owner: pg.Client,
   url: string,
   schema: string,
   opt: (k: string, d?: string) => string,
+  frontend: Frontend = "pg",
+  nativeOptions?: NativeOptions,
 ) {
   const root = query(owner, schema),
     rows = Number(opt("rows", "1000")),
@@ -19,11 +23,19 @@ export async function load(
     Number.isInteger(clients) && clients > 0,
     "clients must be positive integer",
   );
-  const protocols = opt("protocols", "simple,extended,prepared").split(",");
   assert(
-    protocols.length > 0 &&
-      new Set(protocols).size === protocols.length &&
-      protocols.every((p) => ["simple", "extended", "prepared"].includes(p)),
+    frontend === "pg" || !opt("protocols"),
+    "--protocols applies only to --frontend pg",
+  );
+  const protocols =
+    frontend === "native"
+      ? ["native"]
+      : opt("protocols", "simple,extended,prepared").split(",");
+  assert(
+    frontend === "native" ||
+      (protocols.length > 0 &&
+        new Set(protocols).size === protocols.length &&
+        protocols.every((p) => ["simple", "extended", "prepared"].includes(p))),
     "invalid protocols",
   );
   const weights: Record<Kind, number> = { read: 0, write: 0, tx: 0, error: 0 };
@@ -42,9 +54,18 @@ export async function load(
     seen.add(k);
     weights[k as Kind] = Number(v);
   }
-  const catalog = ops.filter(
+  const eligible = ops.filter(
     (o) => !o.matrixOnly && selected(o.name, opt("ops")),
   );
+  // Ops with no native equivalent are excluded and listed as n/a, never run as SQL.
+  const notApplicable = Object.fromEntries(
+    frontend === "native"
+      ? eligible.flatMap((o) =>
+          "unsupported" in o.native ? [[o.name, o.native.unsupported]] : [],
+        )
+      : [],
+  );
+  const catalog = eligible.filter((o) => !(o.name in notApplicable));
   const groups = Object.fromEntries(
     Object.keys(weights).map((k) => [k, catalog.filter((o) => o.kind === k)]),
   ) as Record<Kind, typeof ops>;
@@ -86,11 +107,15 @@ export async function load(
   try {
     await Promise.all(
       Array.from({ length: clients }, async (_, client) => {
-        const c = new pg.Client({ connectionString: url });
-        await c.connect();
+        const c =
+          frontend === "pg" ? new pg.Client({ connectionString: url }) : null;
+        const session =
+          frontend === "native" ? new NativeSession(nativeOptions!) : null;
+        await c?.connect();
+        await session?.open();
         const rng = random(Number(opt("seed", "1")) + client * 1009);
         const queries = Object.fromEntries(
-          protocols.map((p) => [p, query(c, schema, p)]),
+          c ? protocols.map((p) => [p, query(c, schema, p)]) : [],
         );
         let seq = 0;
         try {
@@ -107,44 +132,55 @@ export async function load(
             const group = groups[kind];
             const op = group[Math.floor(rng() * group.length)];
             const protocol = protocols[Math.floor(rng() * protocols.length)];
+            const timed = (label: string) => {
+              const started = performance.now();
+              statementsPerOp[op.name] = (statementsPerOp[op.name] ?? 0) + 1;
+              return () =>
+                (perStatement[op.name + "/" + label] ??= []).push(
+                  performance.now() - started,
+                );
+            };
+            const keyword = (text: string) =>
+              text
+                .match(/^\s*([A-Za-z]+(?:\s+[A-Za-z]+)?)/)?.[1]
+                .toUpperCase() ?? "SQL";
             const base = queries[protocol];
             const q = Object.assign(
               async (sql: string, values?: unknown[]) => {
-                const label =
-                  op.name +
-                  "/" +
-                  (sql
-                    .match(/^\s*([A-Za-z]+(?:\s+[A-Za-z]+)?)/)?.[1]
-                    .toUpperCase() ?? "SQL");
-                const started = performance.now();
-                statementsPerOp[op.name] = (statementsPerOp[op.name] ?? 0) + 1;
+                const done = timed(keyword(sql));
                 try {
                   return await base(sql, values);
                 } finally {
                   q.lastSQL = base.lastSQL;
-                  (perStatement[label] ??= []).push(
-                    performance.now() - started,
-                  );
+                  done();
                 }
               },
               { schema, lastSQL: "" },
             );
+            const nq = session
+              ? nativeQ(session, schema, (text) => timed(keyword(text)))
+              : null;
+            const rollback = () => (nq ? nq.rollback() : q("ROLLBACK"));
             const n = op.batched ? [1, 10, 100][Math.floor(rng() * 3)] : 1;
             const t = performance.now();
             for (let attempt = 0; ; attempt++) {
               try {
-                await op.run({
-                  q,
+                const ctx = {
                   rng,
                   n,
                   rows,
                   uniq: () => `${schema}-${client}-${++seq}`,
                   counters,
-                });
+                };
+                if (nq && "text" in op.native)
+                  await op.native.run({ ...ctx, nq }, op.native.text);
+                else await op.run({ ...ctx, q });
                 break;
               } catch (e) {
                 const f = failure(e, q);
-                await q("ROLLBACK").catch(() => {});
+                if (nq && !(e as { statement?: string }).statement)
+                  f.sql = nq.lastSQL;
+                await rollback().catch(() => {});
                 if (["40001", "40P01"].includes(f.code) && attempt < 5) {
                   retries++;
                   continue;
@@ -162,7 +198,8 @@ export async function load(
             perProtocol[op.name + "/" + protocol].push(ms);
           }
         } finally {
-          await c.end();
+          await c?.end();
+          await session?.close();
         }
       }),
     );
@@ -210,6 +247,8 @@ export async function load(
         .slice(0, 10),
     );
   return {
+    frontend,
+    notApplicable,
     perOpBatch: Object.fromEntries(
       Object.entries(perOpBatch).map(([k, v]) => [k, stats(v)]),
     ),

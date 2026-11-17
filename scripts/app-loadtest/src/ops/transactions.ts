@@ -1,6 +1,20 @@
 import { assert } from "../db.js";
 import type { Account } from "../rows.js";
 import { id, type Ctx, type Op } from "./types.js";
+import { Numeric } from "../native.js";
+/** Exact numeric(12,2) text <-> integer cents; native text has no decimal arithmetic. */
+export const cents = (v: unknown) => {
+  const [w, f = ""] = String(v).split(".");
+  const neg = w.startsWith("-");
+  const c = BigInt(w.replace("-", "")) * 100n + BigInt((f + "00").slice(0, 2));
+  return neg ? -c : c;
+};
+export const decimal = (c: bigint) => {
+  const m = c < 0n ? -c : c;
+  return new Numeric(
+    (c < 0n ? "-" : "") + m / 100n + "." + String(m % 100n).padStart(2, "0"),
+  );
+};
 async function place(c: Ctx) {
   const user = id(c);
   const r = await c.q(
@@ -53,6 +67,34 @@ export const transactions: Op[] = [
       ]);
       await c.q("COMMIT");
     },
+    native: {
+      // No FOR UPDATE and no decimal arithmetic: read both balances inside the
+      // transaction, compute exactly, assign. Concurrent writers to the same rows
+      // fail with a conflict (mapped to 40001 and retried like SQL).
+      text: [
+        "BEGIN (typed control)",
+        "{s}accounts where id=$a or id=$b order by id select id,balance",
+        "update {s}accounts where id=$id set balance=$balance",
+        "update {s}accounts where id=$id set balance=$balance",
+        "COMMIT (typed control)",
+      ],
+      async run(c, [, read, debit, credit]) {
+        const a = id(c);
+        let b = id(c);
+        if (a === b) b = (a % c.rows) + 1;
+        await c.nq.begin();
+        const r = await c.nq(read, { a, b });
+        assert(r.rowCount === 2);
+        const from = cents(r.rows.find((u) => Number(u.id) === a)!.balance);
+        const to = cents(r.rows.find((u) => Number(u.id) === b)!.balance);
+        const amount =
+          BigInt(Math.min(Number(from / 100n), 1 + Math.floor(c.rng() * 10))) *
+          100n;
+        await c.nq(debit, { id: a, balance: decimal(from - amount) });
+        await c.nq(credit, { id: b, balance: decimal(to + amount) });
+        await c.nq.commit();
+      },
+    },
   },
   {
     name: "place_order",
@@ -63,6 +105,10 @@ export const transactions: Op[] = [
       await c.q("BEGIN");
       await place(c);
       await c.q("COMMIT");
+    },
+    native: {
+      unsupported:
+        "order_items has no primary key; native reads and writes refuse keyless tables (NATIVE_ERROR_CLASS_UNSUPPORTED)",
     },
   },
   {
@@ -86,6 +132,10 @@ export const transactions: Op[] = [
       );
       await c.q("COMMIT");
     },
+    native: {
+      unsupported:
+        "order_items has no primary key; native reads and writes refuse keyless tables (NATIVE_ERROR_CLASS_UNSUPPORTED)",
+    },
   },
   {
     name: "rollback",
@@ -103,6 +153,21 @@ export const transactions: Op[] = [
         (await c.q("SELECT id FROM {s}users WHERE email=$1", [email]))
           .rowCount === 0,
       );
+    },
+    native: {
+      text: [
+        "BEGIN (typed control)",
+        'insert into {s}users(email,name,created_at) values($email,"Abandoned",$now)',
+        "ROLLBACK (typed control)",
+        "{s}users where email=$email select id",
+      ],
+      async run(c, [, insert, , read]) {
+        const email = c.uniq() + "@example.com";
+        await c.nq.begin();
+        await c.nq(insert, { email, now: new Date() });
+        await c.nq.rollback();
+        assert((await c.nq(read, { email })).rowCount === 0);
+      },
     },
   },
   {
@@ -123,6 +188,25 @@ export const transactions: Op[] = [
           .rowCount === 0,
       );
       await c.q("COMMIT");
+    },
+    native: {
+      text: [
+        "BEGIN (typed control)",
+        "SAVEPOINT optional (typed control)",
+        'insert into {s}users(email,name,created_at) values($email,"Optional",$now)',
+        "ROLLBACK TO optional (typed control)",
+        "{s}users where email=$email select id",
+        "COMMIT (typed control)",
+      ],
+      async run(c, [, , insert, , read]) {
+        const email = c.uniq() + "@example.com";
+        await c.nq.begin();
+        await c.nq.savepoint("optional");
+        await c.nq(insert, { email, now: new Date() });
+        await c.nq.rollbackTo("optional");
+        assert((await c.nq(read, { email })).rowCount === 0);
+        await c.nq.commit();
+      },
     },
   },
 ];

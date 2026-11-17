@@ -1,10 +1,13 @@
 import { ops } from "./ops/index.js";
+import { LANGUAGE_VERSION } from "./native.js";
 import pg from "pg";
 import { query, failure, assert } from "./db.js";
 import { setup, seed } from "./schema.js";
 import { matrix } from "./matrix.js";
 import { load } from "./load.js";
 import { save } from "./report.js";
+import type { Frontend } from "./frontend.js";
+import type { NativeOptions } from "./native.js";
 const args = process.argv.slice(2);
 const mode = args.shift();
 function opt(k: string, d = "") {
@@ -13,12 +16,12 @@ function opt(k: string, d = "") {
 }
 if (args.includes("--help") || mode === "--help") {
   console.log(
-    "Usage: npm run matrix|load -- --url URL [--ops GLOB] [--variants GLOB] [--protocols simple,extended,prepared] [--mix read=60,write=25,tx=10,error=5] [--rows N] [--seed N] [--clients N] [--duration 30s|--iterations N] [--max-error-rate 0] [--report FILE] [--keep]",
+    "Usage: npm run matrix|load -- --url URL [--frontend pg|native] [--native-endpoint https://localhost:7434] [--native-ca FILE] [--native-cert FILE] [--native-key FILE] [--ops GLOB] [--variants GLOB] [--protocols simple,extended,prepared] [--mix read=60,write=25,tx=10,error=5] [--rows N] [--seed N] [--clients N] [--duration 30s|--iterations N] [--max-error-rate 0] [--report FILE] [--keep]",
   );
   process.exit(0);
 }
 const flags = new Set(
-  "url ops variants protocols mix rows seed clients duration iterations max-error-rate report keep".split(
+  "url frontend native-endpoint native-ca native-cert native-key ops variants protocols mix rows seed clients duration iterations max-error-rate report keep".split(
     " ",
   ),
 );
@@ -41,11 +44,23 @@ if (mode === "ops") {
 }
 const url = opt("url", process.env.DATABASE_URL);
 if (!url) throw Error("--url or DATABASE_URL required");
+const frontend = opt("frontend", "pg") as Frontend;
+if (frontend !== "pg" && frontend !== "native")
+  throw Error("--frontend must be pg or native");
+for (const k of ["native-endpoint", "native-ca", "native-cert", "native-key"])
+  if (frontend === "pg" && opt(k))
+    throw Error(`--${k} requires --frontend native`);
+const nativeOptions: NativeOptions = {
+  url: opt("native-endpoint", "https://localhost:7434"),
+  ca: opt("native-ca") || undefined,
+  cert: opt("native-cert") || undefined,
+  key: opt("native-key") || undefined,
+};
 const schema =
   "app_lt_" + Date.now() + "_" + Math.random().toString(16).slice(2, 8);
 const c = new pg.Client({ connectionString: url });
 const q = query(c, schema);
-let report: Record<string, unknown> = { schema, mode };
+let report: Record<string, unknown> = { schema, mode, frontend };
 try {
   await c.connect();
   await setup(q);
@@ -89,9 +104,9 @@ try {
           return { smoke: true };
         })()
       : mode === "matrix"
-        ? await matrix(c, schema, opt)
+        ? await matrix(c, schema, opt, frontend, nativeOptions)
         : mode === "load"
-          ? await load(c, url, schema, opt)
+          ? await load(c, url, schema, opt, frontend, nativeOptions)
           : (() => {
               throw Error("expected matrix or load");
             })()),

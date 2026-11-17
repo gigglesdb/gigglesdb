@@ -1,6 +1,7 @@
 import { assert } from "../db.js";
 import type { User } from "../rows.js";
-import type { Ctx, Op } from "./types.js";
+import { anyOf, type Ctx, type NativeCtx, type Op } from "./types.js";
+import type { Binding } from "../native.js";
 export async function signup(c: Ctx, n = c.n) {
   const token = c.uniq();
   const values = Array.from({ length: n }, (_, i) => [
@@ -19,6 +20,38 @@ export async function signup(c: Ctx, n = c.n) {
   c.counters.created += n;
   return r.rows as User[];
 }
+/** Native signup text: one multirow VALUES insert of n users, returning all columns. */
+export function nativeSignupText(n: number) {
+  if (n === 1) return SIGNUP1;
+  return (
+    "insert many into {s}users(email,name,created_at) values " +
+    Array.from({ length: n }, (_, i) => `($e${i},$n${i},$now)`).join(",") +
+    " at most $cap return *"
+  );
+}
+export async function nativeSignup(c: NativeCtx, n = c.n) {
+  const token = c.uniq();
+  // Native inserts cannot evaluate the now() column default (0A000), so the
+  // client supplies created_at; SQL uses the server default.
+  const b: Record<string, Binding> = {
+    now: new Date(),
+    ...(n === 1 ? {} : { cap: n }),
+  };
+  for (let i = 0; i < n; i++) {
+    b["e" + i] = `${token}-${i}@example.com`;
+    b["n" + i] = "Owned";
+  }
+  const r = await c.nq(nativeSignupText(n), b);
+  assert(r.rowCount === n);
+  c.counters.created += n;
+  return r.rows;
+}
+const SIGNUP1 =
+  "insert into {s}users(email,name,created_at) values($e0,$n0,$now) return *";
+const SIGNUP =
+  "n=1: " +
+  SIGNUP1 +
+  "; n>1: insert many into {s}users(email,name,created_at) values ($e0,$n0,$now),... at most $cap return *";
 export const writes: Op[] = [
   {
     name: "insert_returning",
@@ -26,6 +59,12 @@ export const writes: Op[] = [
     doc: "Signup: create a user and return its generated id",
     async run(c) {
       assert(Number((await signup(c, 1))[0].id) > c.rows);
+    },
+    native: {
+      text: [SIGNUP],
+      async run(c) {
+        assert(Number((await nativeSignup(c, 1))[0].id) > c.rows);
+      },
     },
   },
   {
@@ -35,6 +74,12 @@ export const writes: Op[] = [
     doc: "Import: sign up a batch in one multi row insert",
     async run(c) {
       await signup(c);
+    },
+    native: {
+      text: [SIGNUP],
+      async run(c) {
+        await nativeSignup(c);
+      },
     },
   },
   {
@@ -49,6 +94,14 @@ export const writes: Op[] = [
       );
       assert(r.rows[0].name === "Updated");
     },
+    native: {
+      text: [SIGNUP, "update {s}users where id=$id set name=$name return name"],
+      async run(c, [, t]) {
+        const u = (await nativeSignup(c, 1))[0];
+        const r = await c.nq(t, { id: Number(u.id), name: "Updated" });
+        assert(r.rows[0].name === "Updated");
+      },
+    },
   },
   {
     name: "optimistic",
@@ -60,6 +113,18 @@ export const writes: Op[] = [
         "UPDATE {s}users SET version=version+1 WHERE id=$1 AND version=0";
       assert((await c.q(sql, [u.id])).rowCount === 1);
       assert((await c.q(sql, [u.id])).rowCount === 0);
+    },
+    native: {
+      // A singular update with no match is NotFound; the bulk form reports changed=0 like SQL rowCount.
+      text: [
+        SIGNUP,
+        "update many {s}users where id=$id and version=0 set version=version+1 at most 1",
+      ],
+      async run(c, [, t]) {
+        const u = (await nativeSignup(c, 1))[0];
+        assert((await c.nq(t, { id: Number(u.id) })).changed === 1);
+        assert((await c.nq(t, { id: Number(u.id) })).changed === 0);
+      },
     },
   },
   {
@@ -82,6 +147,10 @@ export const writes: Op[] = [
       assert(
         (await c.q(sql + " ON CONFLICT DO NOTHING", values)).rowCount === 0,
       );
+    },
+    native: {
+      unsupported:
+        "native ON CONFLICT targets only the full primary key; email is a secondary unique key",
     },
   },
   {
@@ -111,6 +180,10 @@ export const writes: Op[] = [
       );
       assert(n.rows[0].v === "0.30" && n.rows[0].t);
     },
+    native: {
+      unsupported:
+        "no octet_length, numeric casts/arithmetic or now() in native text",
+    },
   },
   {
     name: "bulk_delete",
@@ -127,6 +200,25 @@ export const writes: Op[] = [
       );
       assert(r.rowCount === c.n);
       c.counters.deleted += c.n;
+    },
+    native: {
+      // No IN-list syntax: a balanced OR of id equalities (n <= 100 stays under 256 bindings).
+      text: [
+        SIGNUP,
+        "delete many {s}users where (id=$i0 or id=$i1 ...) at most $cap return id",
+      ],
+      async run(c) {
+        const users = await nativeSignup(c);
+        const names = users.map((_, i) => "i" + i);
+        const b: Record<string, Binding> = { cap: c.n };
+        users.forEach((u, i) => (b[names[i]] = Number(u.id)));
+        const r = await c.nq(
+          `delete many {s}users where ${anyOf("id", names)} at most $cap return id`,
+          b,
+        );
+        assert(r.rowCount === c.n);
+        c.counters.deleted += c.n;
+      },
     },
   },
   {
@@ -150,6 +242,10 @@ export const writes: Op[] = [
       );
       await c.q("DROP TABLE {s}batch_b");
       await c.q("DROP TABLE {s}batch_a");
+    },
+    native: {
+      unsupported:
+        "the server text arm refuses catalog text and has no multi-statement batches",
     },
   },
 ];

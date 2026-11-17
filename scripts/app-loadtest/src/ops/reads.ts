@@ -11,6 +11,14 @@ export const reads: Op[] = [
       const r = await c.q("SELECT * FROM {s}users WHERE id=$1", [i]);
       assert((r.rows[0] as User).name === `User ${i}`);
     },
+    native: {
+      text: ["{s}users where id=$id"],
+      async run(c, [t]) {
+        const i = id(c);
+        const r = await c.nq(t, { id: i });
+        assert(r.rows[0].name === `User ${i}`);
+      },
+    },
   },
   {
     name: "email",
@@ -22,6 +30,14 @@ export const reads: Op[] = [
         `user${i}@example.com`,
       ]);
       assert(Number((r.rows[0] as User).id) === i);
+    },
+    native: {
+      text: ["{s}users where email=$email"],
+      async run(c, [t]) {
+        const i = id(c);
+        const r = await c.nq(t, { email: `user${i}@example.com` });
+        assert(Number(r.rows[0].id) === i);
+      },
     },
   },
   {
@@ -39,6 +55,10 @@ export const reads: Op[] = [
         assert(Number((u as User).id) === offset + i + 1),
       );
     },
+    native: {
+      unsupported:
+        "native reads have no OFFSET; ordered paging is keyset only (see keyset)",
+    },
   },
   {
     name: "keyset",
@@ -53,6 +73,17 @@ export const reads: Op[] = [
       assert(r.rowCount === Math.min(5, c.rows - i));
       r.rows.forEach((u, k) => assert(Number((u as User).id) === i + k + 1));
     },
+    native: {
+      text: [
+        "{s}users where id>$after and id<=$max order by id limit 5 select id",
+      ],
+      async run(c, [t]) {
+        const i = Math.max(1, id(c) - 5);
+        const r = await c.nq(t, { after: i, max: c.rows });
+        assert(r.rowCount === Math.min(5, c.rows - i));
+        r.rows.forEach((u, k) => assert(Number(u.id) === i + k + 1));
+      },
+    },
   },
   {
     name: "search",
@@ -64,6 +95,10 @@ export const reads: Op[] = [
       ]);
       assert(r.rows.length > 0);
       assert(r.rows.every((u) => (u as User).name?.startsWith("User 1")));
+    },
+    native: {
+      unsupported:
+        "no ILIKE/LIKE pattern match and no LOWER/UPPER in native text",
     },
   },
   {
@@ -78,6 +113,17 @@ export const reads: Op[] = [
       );
       assert(r.rowCount === (i === c.rows ? 1 : 2));
     },
+    native: {
+      // Native has no BETWEEN or IN-list syntax: spelled as comparisons.
+      text: [
+        "{s}users where id>=$lo and id<=$hi and (id=$lo or id=$hi) select id",
+      ],
+      async run(c, [t]) {
+        const i = id(c);
+        const r = await c.nq(t, { lo: i, hi: Math.min(c.rows, i + 1) });
+        assert(r.rowCount === (i === c.rows ? 1 : 2));
+      },
+    },
   },
   {
     name: "count_exists",
@@ -89,6 +135,10 @@ export const reads: Op[] = [
         [c.rows],
       );
       assert(Number(r.rows[0].n) === c.rows && r.rows[0].e);
+    },
+    native: {
+      unsupported:
+        "0.19 aggregate/EXISTS typed queries are not lowered by the server text arm (lower_text returns Unsupported for typed queries: HTTP 400)",
     },
   },
   {
@@ -106,6 +156,10 @@ export const reads: Op[] = [
         ),
       );
     },
+    native: {
+      unsupported:
+        "joins with GROUP BY/sum are 0.19 typed queries, which the server text arm does not lower (HTTP 400)",
+    },
   },
   {
     name: "cte",
@@ -122,6 +176,7 @@ export const reads: Op[] = [
         ),
       );
     },
+    native: { unsupported: "no common table expressions in native text" },
   },
   {
     name: "window",
@@ -141,6 +196,7 @@ export const reads: Op[] = [
         previous = user;
       }
     },
+    native: { unsupported: "no window functions in native text" },
   },
   {
     name: "large_in",
@@ -155,6 +211,10 @@ export const reads: Op[] = [
         ids,
       );
       assert(r.rowCount === Math.min(1000, c.rows));
+    },
+    native: {
+      unsupported:
+        "no IN-list syntax, and 1000 bound ids exceed the 256-binding limit",
     },
   },
 ];

@@ -12,6 +12,10 @@ export const truncates: Op[] = [
   matrixOnly: true,
   ownsTx: true,
   doc: mode,
+  native: {
+    unsupported:
+      "no TRUNCATE in native text; the server text arm refuses catalog text",
+  },
   async run({ q }) {
     if (mode === "restrict_fk") {
       let code = "";
