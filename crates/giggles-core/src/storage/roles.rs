@@ -294,6 +294,18 @@ pub(crate) fn table_privileges_txn(
     privileges(raw_get(&image, &grant_key(b"tgrant/", table, role))?)
 }
 
+/// `name`'s role record at `txn`'s snapshot, or `None` (GD-0061 R3-704:
+/// APPROVE reads the approver's role under the task hold).
+pub(crate) fn role_txn(
+    txn: &mut super::engine::txn::Transaction,
+    name: &str,
+) -> Result<Option<CatalogRole>, RoleError> {
+    let image = engine::load_txn(txn)?;
+    raw_get(&image, &key(b"role/", name))?
+        .map(|value| decode(&value))
+        .transpose()
+}
+
 fn privileges<P: DeserializeOwned + Ord>(value: Option<Vec<u8>>) -> Result<BTreeSet<P>, RoleError> {
     match value {
         Some(value) => Ok(decode::<Vec<P>>(&value)?.into_iter().collect()),
