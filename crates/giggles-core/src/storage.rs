@@ -3694,7 +3694,7 @@ impl SqlSession {
         // GD-0061 R3-308: in a task session a write runs only inside the
         // protected commit; any other write is refused before it runs.
         self.refuse_task_write(p)?;
-        let (tag, expanded) = self.statement_tag(p);
+        let (tag, expanded) = self.statement_tag(p)?;
         let p = expanded.as_ref().unwrap_or(p);
         self.execute_bound_kernel(p, params, expected_version, clock)
             .map(|result| crate::task::release::Unreleased::new(result, tag))
@@ -3713,13 +3713,17 @@ impl SqlSession {
     /// The release tag of a statement starting now, and the statement to run
     /// in its place (`SELECT *` expanded to the task's columns). A read
     /// carries the output plan of the task's column rules (R3-303's
-    /// `apply_in_catalog`, on the session's catalog view); a denial is kept
-    /// in the tag and refuses every page at release. Other statements return
-    /// no task rows and get an empty plan, so any row would fail closed.
+    /// `apply_in_catalog`, on the session's catalog view). A denial refuses
+    /// the statement here, before it runs: no row is read, nothing is
+    /// debited, and no execution error (22012, casts, overflow) or timing
+    /// can tell the caller anything about a column it may not read. Other
+    /// statements return no task rows and get an empty plan, so any row
+    /// would fail closed.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn statement_tag(
         &self,
         p: &relational::Prepared,
-    ) -> (Option<Arc<crate::task::release::ReleaseTag>>, Option<relational::Prepared>) {
+    ) -> Result<(Option<Arc<crate::task::release::ReleaseTag>>, Option<relational::Prepared>), CoreError> {
         let mut expanded = None;
         let tag = self.release_tag_with(|| {
             if !p.is_read() {
@@ -3729,7 +3733,10 @@ impl SqlSession {
             expanded = Some(statement);
             Ok(plan)
         });
-        (tag, expanded)
+        if let Some(tag) = &tag {
+            tag.refuse_denied()?;
+        }
+        Ok((tag, expanded))
     }
     fn task_output_plan(
         &self,

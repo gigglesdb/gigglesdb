@@ -193,13 +193,24 @@ fn plain_exit_fails_closed_in_task_session() {
     assert_eq!(ids(&admin).len(), 3);
     // The twin runs, but its page is tagged and cannot be unwrapped or released.
     let select = admin.sql_session().prepare("SELECT id FROM shipments").unwrap();
-    let page = sql.execute_prepared_unreleased(&select, &[], None).unwrap();
-    assert!(page.is_task());
-    assert_eq!(format!("{page:?}"), "Unreleased { task: true, .. }");
-    assert_eq!(page.untasked(), Err(refused.clone()));
+    #[cfg(feature = "engine-rocksdb")]
+    {
+        let page = sql.execute_prepared_unreleased(&select, &[], None).unwrap();
+        assert!(page.is_task());
+        assert_eq!(format!("{page:?}"), "Unreleased { task: true, .. }");
+        assert_eq!(page.untasked(), Err(refused.clone()));
+    }
+    // The synthetic legacy context names no catalog task: the column rules at
+    // statement start refuse it as revoked before anything runs.
+    #[cfg(not(feature = "engine-rocksdb"))]
+    assert_eq!(
+        sql.execute_prepared_unreleased(&select, &[], None).map(|_| ()),
+        Err(CoreError::Task(TaskError::Revoked))
+    );
     // R3-308: the twin's page is released through the protocol. On v2 the
     // task's visible rows (merchant 42) come out; the synthetic legacy
     // context names no catalog task, so its page is refused as revoked.
+    #[cfg(feature = "engine-rocksdb")]
     let page = sql.execute_unreleased("SELECT id FROM shipments ORDER BY id", &[], None).unwrap();
     #[cfg(feature = "engine-rocksdb")]
     assert_eq!(
@@ -213,7 +224,10 @@ fn plain_exit_fails_closed_in_task_session() {
         vec![vec![Value::Int(1)], vec![Value::Int(2)]]
     );
     #[cfg(not(feature = "engine-rocksdb"))]
-    assert_eq!(sql.release_page(page).map(|_| ()), Err(CoreError::Task(TaskError::Revoked)));
+    assert_eq!(
+        sql.execute_unreleased("SELECT id FROM shipments ORDER BY id", &[], None).map(|_| ()),
+        Err(CoreError::Task(TaskError::Revoked))
+    );
     // Cursors: the plain fetch is refused before the cursor advances. (A legacy
     // cursor refuses a task session at open: tasks are v2 only.)
     #[cfg(feature = "engine-rocksdb")]

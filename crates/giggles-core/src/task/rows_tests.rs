@@ -118,10 +118,11 @@ fn other_table_is_denied() {
     for cursor in [false, true] {
         let mut s = agent(&admin);
         let sql = "SELECT id FROM carriers";
+        // The column rules refuse another table when the cursor opens,
+        // before any row is read (R3-308 follow-up), not at the first fetch.
         let error = if cursor {
             let p = s.prepare(sql).unwrap();
-            let mut c = s.open_cursor(&p, &[]).unwrap();
-            c.fetch_unreleased(10, 4096).map(|_| ()).unwrap_err()
+            s.open_cursor(&p, &[]).map(|_| ()).unwrap_err()
         } else {
             s.execute_unreleased(sql, &[], None).map(|_| ()).unwrap_err()
         };

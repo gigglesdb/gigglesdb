@@ -7,7 +7,9 @@ mod common;
 use giggles_core::{
     Admin, CoreError, CrashPoint, Engine, Limits, SqlSession,
     cancellation::Cancellation,
-    operations::{Bindings, Request},
+    operations::{
+        Arithmetic, Bindings, Compare, Expr, Request, Transaction, TransactionStep, ValueExpr,
+    },
     relational::{SqlResult, SqlRow, Value},
     roles::{NewRole, TablePrivilege},
     task::{
@@ -18,6 +20,7 @@ use giggles_core::{
             WallClockMs,
         },
         release::{Disclosure, row_cost, value_cost, with_release_probe},
+        rows::{RowCounts, take_last_counts},
     },
     task::definition::TaskObjectId,
 };
@@ -403,8 +406,8 @@ fn definition_change_denies() {
     let mut s = f.admin().sql_session();
     s.bind_task(ctx).unwrap();
     let changed = task(TaskError::Denied(DenyRule::DefinitionChanged));
-    // A table read is refused when it binds its scope; a table-free one runs,
-    // and its page is refused at release.
+    // Both are refused at statement start, before they run: the column rules
+    // see the version mismatch for a table read and a table-free one alike.
     assert_eq!(release(&mut s, ALL).map(|_| ()), Err(changed.clone()));
     assert_eq!(release(&mut s, "SELECT 1").map(|_| ()), Err(changed.clone()));
     assert_eq!(s.still_valid(), Err(changed));
@@ -592,4 +595,249 @@ fn cost_is_fixed_per_value_type() {
     // masked value costs what replaced it.
     assert_eq!(value_cost(&Value::Text("****".into())), 5);
     assert_eq!(value_cost(&Value::Int(i64::MIN)), value_cost(&Value::Int(0)));
+}
+
+// R3-308 follow-up: a statement the column rules deny is refused before it
+// runs. No row is read and nothing is debited, so no execution error (22012,
+// 22P02) or timing can tell the agent about a column it may not read.
+
+/// Denied reads, each with the SQLSTATE it raises when it runs outside a
+/// task. `merchant_id` is hidden and is 42 on every visible row, so
+/// `merchant_id - 42` is zero on an in-scope row; `card_token` is masked and
+/// does not cast to int; `ledger` is not the task table and `ledger.n` is 0.
+const DENIED: &[(&str, DenyRule, &str)] = &[
+    (
+        "SELECT id FROM shipments WHERE 1 / (merchant_id - 42) > 0",
+        DenyRule::ColumnNotAvailable,
+        "22012",
+    ),
+    (
+        "SELECT id FROM shipments ORDER BY 1 / (merchant_id - 42)",
+        DenyRule::ColumnNotAvailable,
+        "22012",
+    ),
+    (
+        "SELECT id, 1 / (merchant_id - 42) FROM shipments",
+        DenyRule::ColumnNotAvailable,
+        "22012",
+    ),
+    (
+        "SELECT sum(1 / (merchant_id - 42)) FROM shipments",
+        DenyRule::ColumnNotAvailable,
+        "22012",
+    ),
+    (
+        "SELECT id FROM shipments WHERE card_token::int > 0",
+        DenyRule::MaskedColumnPosition,
+        "22P02",
+    ),
+    (
+        "SELECT id, card_token::int FROM shipments",
+        DenyRule::MaskedColumnPosition,
+        "22P02",
+    ),
+    ("SELECT 1 / n FROM ledger", DenyRule::OtherTable, "22012"),
+];
+
+fn with_ledger(f: &Fixture) {
+    let mut admin = f.admin().sql_session();
+    admin
+        .execute("CREATE TABLE ledger (id bigint primary key, n bigint)", &[], None)
+        .unwrap();
+    admin.execute("INSERT INTO ledger VALUES (1, 0)", &[], None).unwrap();
+    f.admin()
+        .roles()
+        .grant_table("ledger", "repair_agent", &[TablePrivilege::Select])
+        .unwrap();
+}
+
+/// Runs `sql` in `s` on the buffered path (`cursor == false`) or through a
+/// cursor, releasing every page.
+fn run_released(s: &mut SqlSession, sql: &str, cursor: bool) -> Result<(), CoreError> {
+    if !cursor {
+        let page = s.execute_unreleased(sql, &[], None)?;
+        return s.release_page(page).map(|_| ());
+    }
+    let p = s.prepare(sql)?;
+    let mut cursor = s.open_cursor(&p, &[])?;
+    while !cursor.is_exhausted() {
+        let page = cursor.fetch_unreleased(2, 1 << 20)?;
+        s.release_page(page)?;
+    }
+    Ok(())
+}
+
+fn int(value: i64) -> Expr {
+    Expr::Value(ValueExpr::Literal(Value::Int(value)))
+}
+
+/// `1 / (field - at) >= 0`: a division by zero on the row where `field = at`.
+fn inverse_at(field: &str, at: i64) -> Expr {
+    let difference = Expr::Arithmetic(
+        Box::new(Expr::Field(field.into())),
+        Arithmetic::Subtract,
+        Box::new(int(at)),
+    );
+    let quotient = Expr::Arithmetic(Box::new(int(1)), Arithmetic::Divide, Box::new(difference));
+    Expr::Compare(Box::new(quotient), Compare::Ge, Box::new(int(0)))
+}
+
+fn read_ids(filter: Expr) -> Request {
+    Request::Read {
+        table: "shipments".into(),
+        filter: Some(filter),
+        order: Vec::new(),
+        limit: None,
+        projection: vec!["id".into()],
+    }
+}
+
+#[test]
+fn denied_read_never_executes() {
+    let f = Fixture::new("task-release-denied-exec", caps(1000, 1000, 1 << 20));
+    with_ledger(&f);
+    for &(sql, rule, untasked) in DENIED {
+        // Outside a task the statement runs and fails on a row.
+        let e = f.admin().sql_session().execute(sql, &[], None).unwrap_err();
+        assert_eq!(giggles_core::sqlstate(&e), untasked, "{sql}: {e:?}");
+        // In the task session the denial wins over the execution error, on
+        // the buffered path and on the cursor path.
+        for cursor in [false, true] {
+            assert_eq!(
+                run_released(&mut f.exact(), sql, cursor),
+                Err(task(TaskError::Denied(rule))),
+                "{sql} cursor={cursor}"
+            );
+        }
+        // The refusal comes at statement start: no page is made.
+        assert_eq!(
+            f.exact().execute_unreleased(sql, &[], None).map(|_| ()),
+            Err(task(TaskError::Denied(rule))),
+            "{sql}"
+        );
+    }
+    // The same probe on a readable column still runs in the scope.
+    for cursor in [false, true] {
+        let e = run_released(
+            &mut f.exact(),
+            "SELECT id FROM shipments WHERE 1 / (id - 3) > 0",
+            cursor,
+        )
+        .unwrap_err();
+        assert_eq!(giggles_core::sqlstate(&e), "22012", "{e:?}");
+    }
+    // Native: a request the rules deny is refused at binding (R3-304), never
+    // with the 22012 its filter raises outside a task.
+    let read = read_ids(inverse_at("merchant_id", 42));
+    let e = f
+        .admin()
+        .sql_session()
+        .execute_native(&read, &Bindings::new())
+        .unwrap_err();
+    assert_eq!(e.sqlstate(), Some("22012"), "{e:?}");
+    let e = f
+        .exact()
+        .execute_native_unreleased(&read, &Bindings::new())
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(e.sqlstate(), Some("42501"), "{e:?}");
+}
+
+#[test]
+fn denied_read_reads_no_rows() {
+    let f = Fixture::new("task-release-denied-rows", caps(1000, 1000, 1 << 20));
+    with_ledger(&f);
+    // An allowed read is counted by the scope.
+    let _ = take_last_counts();
+    run_released(&mut f.exact(), ALL, false).unwrap();
+    assert_eq!(take_last_counts(), Some(RowCounts { scanned: 6, read: 3 }));
+    for &(sql, rule, _) in DENIED {
+        for cursor in [false, true] {
+            let _ = take_last_counts();
+            let e = run_released(&mut f.exact(), sql, cursor).unwrap_err();
+            assert_eq!(e, task(TaskError::Denied(rule)), "{sql}");
+            // No scoped source was opened: not one row was pulled.
+            assert_eq!(take_last_counts(), None, "{sql} cursor={cursor}");
+        }
+    }
+    // A denied native request pulls no row either.
+    let _ = take_last_counts();
+    let read = read_ids(inverse_at("merchant_id", 42));
+    assert!(f.exact().execute_native_unreleased(&read, &Bindings::new()).is_err());
+    assert_eq!(take_last_counts(), None);
+    // A native transaction block has no output plan yet: it is refused once
+    // its steps are bound, before any step reads a row. Outside a task the
+    // same block reaches row 3 and divides by zero.
+    let block = Transaction {
+        read_only: true,
+        steps: vec![TransactionStep::Execute(read_ids(inverse_at("id", 3)))],
+        emit: None,
+    };
+    let e = f
+        .admin()
+        .sql_session()
+        .execute_native_transaction(&block, &Bindings::new())
+        .unwrap_err();
+    assert_eq!(e.sqlstate(), Some("22012"), "{e:?}");
+    let _ = take_last_counts();
+    let e = f
+        .exact()
+        .execute_native_transaction_unreleased(&block, &Bindings::new())
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(e.sqlstate(), Some("0A000"), "{e:?}");
+    assert_eq!(take_last_counts(), None);
+    // A step the rules deny keeps its own refusal.
+    let denied_step = Transaction {
+        read_only: true,
+        steps: vec![TransactionStep::Execute(read_ids(inverse_at("merchant_id", 42)))],
+        emit: None,
+    };
+    let e = f
+        .exact()
+        .execute_native_transaction_unreleased(&denied_step, &Bindings::new())
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(e.sqlstate(), Some("42501"), "{e:?}");
+    assert_eq!(take_last_counts(), None);
+}
+
+#[test]
+fn denied_read_writes_no_debit() {
+    let f = Fixture::new("task-release-denied-debit", caps(1000, 1000, 1 << 20));
+    with_ledger(&f);
+    for session in [Fixture::exact, Fixture::agent] {
+        for &(sql, rule, _) in DENIED {
+            for cursor in [false, true] {
+                let mut s = session(&f);
+                let e = run_released(&mut s, sql, cursor).unwrap_err();
+                assert_eq!(e, task(TaskError::Denied(rule)), "{sql}");
+                // The statement's end charges no `rows_read`: none was read.
+                s.finish_task_statement(Err(&e));
+                assert_eq!(s.task_reservation(), Some(Default::default()), "{sql}");
+                drop(s);
+                // No head, no debit, no read-log record.
+                assert_eq!(f.disclosure(), Disclosure::default(), "{sql} cursor={cursor}");
+            }
+        }
+    }
+    // A refused native block charges nothing either.
+    let block = Transaction {
+        read_only: true,
+        steps: vec![TransactionStep::Execute(read_ids(inverse_at("id", 99)))],
+        emit: None,
+    };
+    let s = &mut f.exact();
+    assert!(s.execute_native_transaction_unreleased(&block, &Bindings::new()).is_err());
+    s.finish_task_statement(Ok(()));
+    assert_eq!(f.disclosure(), Disclosure::default());
+    // An allowed read in a session after a refusal is charged as usual.
+    let mut s = f.exact();
+    let e = run_released(&mut s, DENIED[0].0, false).unwrap_err();
+    s.finish_task_statement(Err(&e));
+    run_released(&mut s, ALL, false).unwrap();
+    s.finish_task_statement(Ok(()));
+    let d = f.disclosure();
+    assert_eq!((d.rows_read, d.rows_returned), (3, 3), "{d:?}");
+    reconciles(&d);
 }

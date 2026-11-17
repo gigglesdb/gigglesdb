@@ -292,6 +292,15 @@ impl ReleaseTag {
     pub(crate) fn add_rows_read(&self, rows: u64) {
         self.state.add_rows_read(rows);
     }
+
+    /// The denial the statement's column rules gave, as the error that
+    /// refuses the statement before it runs (GD-0061 R3-308 follow-up).
+    pub(crate) fn refuse_denied(&self) -> Result<(), CoreError> {
+        match &self.plan {
+            Ok(_) => Ok(()),
+            Err(e) => Err(CoreError::Task(e.clone())),
+        }
+    }
 }
 
 /// A result produced by a core exit that has not been released.

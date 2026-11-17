@@ -744,6 +744,13 @@ fn bind_request_planned(
 fn task_error(e: crate::task::TaskError) -> Error {
     Error::Sql { sqlstate: e.sqlstate().into() }
 }
+/// `core`, except that a task refusal keeps its SQLSTATE (`task_error`).
+fn core_or_task(e: CoreError) -> Error {
+    match e {
+        CoreError::Task(e) => task_error(e),
+        other => core(other),
+    }
+}
 /// The column rules of the session's task; `None` outside a task session and
 /// for contexts that are not a SQL session.
 fn task_rules(

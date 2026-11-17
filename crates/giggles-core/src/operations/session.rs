@@ -60,7 +60,9 @@ impl SqlSession {
         bindings: &Bindings,
     ) -> Result<crate::task::release::Unreleased<TransactionOutcome>> {
         // A block's emitted values have no per-column plan yet: in a task
-        // session its page is refused at release (fail closed, R3-308).
+        // session the block is refused (fail closed, R3-308). Its steps are
+        // still bound first, so a step's own column-rule denial keeps its
+        // SQLSTATE, but no step runs and no row is read.
         let tag = self.release_tag_with(|| {
             Err(crate::task::TaskError::NotAllowedInTaskSession(
                 crate::task::StatementClass::TransactionControl,
@@ -75,6 +77,9 @@ impl SqlSession {
             },
             |session| {
                 let plan = transaction::bind_transaction(session, block, bindings)?;
+                if let Some(tag) = &tag {
+                    tag.refuse_denied().map_err(core_or_task)?;
+                }
                 transaction::run_transaction(session, &plan)
             },
         )

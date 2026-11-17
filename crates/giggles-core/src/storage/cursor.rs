@@ -196,8 +196,9 @@ impl SqlSession {
             let mut p = p.clone();
             p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
             // A task cursor's tag carries the output plan; `SELECT *` runs
-            // expanded to the task's columns (GD-0061 R3-308).
-            let (tag, expanded) = self.statement_tag(&p);
+            // expanded to the task's columns (GD-0061 R3-308). A denied
+            // statement is refused here, before any row is read.
+            let (tag, expanded) = self.statement_tag(&p)?;
             if let Some(expanded) = expanded {
                 p = expanded;
             }

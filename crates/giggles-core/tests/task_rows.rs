@@ -10,6 +10,10 @@
 //! rows the scoped source pulled and kept. Every case runs on the streaming
 //! cursor path and on the buffered path. Writes are observed through the
 //! receipt's `rows_affected` and the rows an untasked session reads afterwards.
+//!
+//! A statement the column rules deny (a hidden column outside the plain
+//! output, a subquery, another table) is refused before it runs, so the
+//! probes use only the task's readable columns and no subqueries.
 #![cfg(feature = "engine-rocksdb")]
 mod common;
 use giggles_core::{
@@ -20,7 +24,7 @@ use giggles_core::{
     relational::Value,
     roles::{NewRole, TablePrivilege},
     task::{
-        Actor, OperationId, ProtectedRequest, Receipt, TaskError,
+        Actor, DenyRule, OperationId, ProtectedRequest, Receipt, TaskError,
         context::open_context,
         definition::{
             AllowedWrite, DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText,
@@ -85,6 +89,12 @@ fn fixture(name: &str) -> Fixture {
     fixture_with(name, false)
 }
 
+/// The read-only fixture with `merchant_id` readable too, so a statement may
+/// filter on the scope's own column.
+fn fixture_reading_merchant(name: &str) -> Fixture {
+    fixture_of(name, false, &["id", "merchant_id", "status", "attempt_count"])
+}
+
 /// The fixture with the worked example's write: `status` from 'failed' to
 /// 'queued', and the executor holding SELECT and UPDATE. It expires far
 /// ahead of the real wall clock, which the protected commit checks.
@@ -93,6 +103,10 @@ fn writable(name: &str) -> Fixture {
 }
 
 fn fixture_with(name: &str, write: bool) -> Fixture {
+    fixture_of(name, write, &["id", "status", "attempt_count"])
+}
+
+fn fixture_of(name: &str, write: bool, readable: &[&str]) -> Fixture {
     let path = common::fresh(name);
     let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
     let f = Fixture {
@@ -138,7 +152,7 @@ fn fixture_with(name: &str, write: bool) -> Fixture {
                 schema: None,
                 table: "shipments".into(),
                 visible_rows: PredicateText("merchant_id = 42".into()),
-                readable: ["id", "status", "attempt_count"].map(String::from).to_vec(),
+                readable: readable.iter().map(|c| c.to_string()).collect(),
                 masked: Vec::new(),
                 untrusted_text: Vec::new(),
                 allowed_write: write.then(|| AllowedWrite {
@@ -220,6 +234,18 @@ fn divides_by_zero(f: &Fixture, path: Path, sql: &str) {
     }
 }
 
+/// `sql` is refused by the column rules with `rule` in a fresh task session
+/// on `path`, before any row is read.
+fn denied(f: &Fixture, path: Path, sql: &str, rule: DenyRule) {
+    let _ = take_last_counts();
+    assert_eq!(
+        run(&mut f.agent(), path, sql),
+        Err(CoreError::Task(TaskError::Denied(rule))),
+        "{path:?} {sql}"
+    );
+    assert_eq!(take_last_counts(), None, "{path:?} {sql}");
+}
+
 /// Whether the row with `id` reaches a statement expression.
 fn sees(f: &Fixture, path: Path, id: i64) -> bool {
     let sql = format!("SELECT 1 / (id - {id}) FROM shipments");
@@ -297,24 +323,31 @@ fn erroring_expression_never_sees_out_of_scope_row() {
 fn order_limit_within_scope() {
     let f = fixture("task-rows-order-limit");
     for path in PATHS {
-        // The first two scope rows by id are 1 and 3 (not 1 and 2).
-        divides_by_zero(
+        // A derived table is refused by the column rules before it runs
+        // (R3-308 follow-up), so the windows are probed without one.
+        denied(
             &f,
             path,
             "SELECT 1 / (max(id) - 3) FROM (SELECT id FROM shipments ORDER BY id LIMIT 2) s",
+            DenyRule::Subquery,
         );
-        divides_by_zero(
-            &f,
-            path,
-            "SELECT 1 / (min(id) - 5) FROM (SELECT id FROM shipments ORDER BY id DESC LIMIT 1) s",
-        );
-        divides_by_zero(
-            &f,
-            path,
-            "SELECT 1 / (min(id) - 3) FROM \
-             (SELECT id FROM shipments ORDER BY id LIMIT 1 OFFSET 1) s",
-        );
+        // The first two scope rows by id are 1 and 3 (not 1 and 2).
         divides_by_zero(&f, path, "SELECT 1 / (id - 3) FROM shipments ORDER BY id LIMIT 2");
+        ok(&f, path, "SELECT 1 / (id - 2) FROM shipments ORDER BY id LIMIT 2");
+        // The last scope row by id is 5 (not 6).
+        divides_by_zero(
+            &f,
+            path,
+            "SELECT 1 / (id - 5) FROM shipments ORDER BY id DESC LIMIT 1",
+        );
+        ok(&f, path, "SELECT 1 / (id - 6) FROM shipments ORDER BY id DESC LIMIT 1");
+        // The second scope row by id is 3 (not 2).
+        divides_by_zero(
+            &f,
+            path,
+            "SELECT 1 / (id - 3) FROM shipments ORDER BY id LIMIT 1 OFFSET 1",
+        );
+        ok(&f, path, "SELECT 1 / (id - 2) FROM shipments ORDER BY id LIMIT 1 OFFSET 1");
         let counts = ok(&f, path, "SELECT 1 / (id - 5) FROM shipments ORDER BY id LIMIT 2");
         if matches!(path, Path::Cursor) {
             // The streaming cursor stops at the second scope row.
@@ -325,7 +358,8 @@ fn order_limit_within_scope() {
 
 #[test]
 fn secondary_index_used_with_pushdown() {
-    let f = fixture("task-rows-index");
+    // `merchant_id` is readable here so a statement may filter on it.
+    let f = fixture_reading_merchant("task-rows-index");
     let values: Vec<String> = (100..300)
         .map(|id| format!("({id}, {}, 'other', 0)", 1000 + id))
         .collect();
@@ -364,20 +398,24 @@ fn null_predicate_is_invisible() {
     for path in PATHS {
         // Row 4's predicate is NULL, not true: it is invisible.
         assert!(!sees(&f, path, 4), "{path:?}");
-        divides_by_zero(
+        // `merchant_id` is hidden: a filter on it is refused before it runs
+        // (R3-308 follow-up), so row 4 is counted by its id instead.
+        denied(
             &f,
             path,
             "SELECT 1 / count(*) FROM shipments WHERE merchant_id IS NULL",
+            DenyRule::ColumnNotAvailable,
         );
+        divides_by_zero(&f, path, "SELECT 1 / count(*) FROM shipments WHERE id = 4");
         ok(&f, path, "SELECT 1 / (id - 4) FROM shipments WHERE id = 4");
         // Outside a task session the row is there.
         let mut admin = f.admin().sql_session();
-        run(
-            &mut admin,
-            path,
+        for sql in [
             "SELECT 1 / count(*) FROM shipments WHERE merchant_id IS NULL",
-        )
-        .unwrap();
+            "SELECT 1 / count(*) FROM shipments WHERE id = 4",
+        ] {
+            run(&mut admin, path, sql).unwrap_or_else(|e| panic!("{path:?} {sql}: {e:?}"));
+        }
     }
 }
 
