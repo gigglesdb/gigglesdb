@@ -65,6 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if path == "cluster" {
         std::process::exit(cluster_command(args).await);
     }
+    if path == "range" {
+        std::process::exit(range_command(args).await);
+    }
     if path == "--dev" {
         let options = giggles_server::dev::Options::parse(args).unwrap_or_else(|usage| {
             eprintln!("{usage}");
@@ -285,6 +288,46 @@ fn cluster_validate(
 async fn cluster_command(_args: impl Iterator<Item = String>) -> i32 {
     eprintln!("cluster requires the engine-rocksdb feature");
     2
+}
+
+#[cfg(not(feature = "engine-rocksdb"))]
+async fn range_command(_args: impl Iterator<Item = String>) -> i32 {
+    eprintln!("range requires the engine-rocksdb feature");
+    2
+}
+
+#[cfg(feature = "engine-rocksdb")]
+async fn range_command(args: impl Iterator<Item = String>) -> i32 {
+    use giggles_server::cluster::{range_cli, runtime::transport_config};
+    let command = match range_cli::Command::parse(args) {
+        Ok(command) => command,
+        Err(usage) => {
+            eprintln!("{usage}");
+            return 2;
+        }
+    };
+    let setup = || -> Result<_, Box<dyn std::error::Error>> {
+        let c: Config = serde_json::from_slice(&bounded_file(&command.config)?)?;
+        let cluster = c.cluster.as_ref().ok_or("cluster section is required")?;
+        let v = cluster_validate(&c, cluster)?;
+        Ok((transport_config(&v)?, v.members))
+    };
+    let (transport, members) = match setup() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}\n{}", range_cli::USAGE);
+            return 2;
+        }
+    };
+    match tokio::task::spawn_blocking(move || range_cli::run(command.action, transport, members))
+        .await
+    {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("transport error: {error}");
+            1
+        }
+    }
 }
 
 /// `cluster status <config.json> [--json]`: every member's ranges, leaders and load, asked

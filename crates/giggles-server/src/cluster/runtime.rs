@@ -11,7 +11,7 @@ use giggles_core::{
 };
 use giggles_replication::{
     bootstrap::presplit,
-    cluster_node::{ClusterNode, ClusterNodeConfig},
+    cluster_node::{ClusterNode, ClusterNodeConfig, RegistryWatcher},
     liveness::LivenessConfig,
     sink::SnapshotPolicy,
     transport::{CallLimits, PeerConfig, TransportConfig, fingerprint},
@@ -31,11 +31,13 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct ClusterRuntime {
     gateway: ClusterGateway,
     node: ClusterNode,
+    registry_watcher: RegistryWatcher,
 }
 
 /// The peer transport of this node: every member, with this node's own certificate.
 pub fn transport_config(v: &ClusterValidated) -> Result<TransportConfig, String> {
-    let cert = crate::tls::certs(&v.certificate).map_err(|e| format!("cluster.certificate: {e}"))?;
+    let cert =
+        crate::tls::certs(&v.certificate).map_err(|e| format!("cluster.certificate: {e}"))?;
     let cert = cert.first().ok_or("cluster.certificate: no certificates")?;
     let mut peers: std::collections::BTreeMap<_, _> = v
         .peers
@@ -95,7 +97,11 @@ impl ClusterRuntime {
         if bootstrap {
             node.bootstrap_directory(READY_TIMEOUT)
                 .map_err(|e| format!("cluster bootstrap: {e}"))?;
+            if let Err(error) = node.enrol_members(READY_TIMEOUT) {
+                eprintln!("cluster registry enrolment: {error}");
+            }
         }
+        let registry_watcher = node.start_registry_watcher(Duration::from_secs(1));
         node.wait_ready(READY_TIMEOUT)
             .map_err(|e| format!("cluster: {e}"))?;
         let gateway = node
@@ -110,7 +116,11 @@ impl ClusterRuntime {
         if bootstrap && let Some(owner) = &v.owner {
             bootstrap_owner(&gateway.admin, owner)?;
         }
-        Ok(Self { gateway, node })
+        Ok(Self {
+            gateway,
+            node,
+            registry_watcher,
+        })
     }
 
     pub fn admin(&self) -> &Admin {
@@ -121,7 +131,8 @@ impl ClusterRuntime {
         self.node.node_id()
     }
 
-    pub fn stop(self) {
+    pub fn stop(mut self) {
+        self.registry_watcher.stop();
         drop(self.gateway);
         self.node.stop();
     }

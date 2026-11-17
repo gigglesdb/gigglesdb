@@ -4,3 +4,5 @@ pub mod cli;
 pub mod config;
 #[cfg(feature = "engine-rocksdb")]
 pub mod runtime;
+#[cfg(feature = "engine-rocksdb")]
+pub mod range_cli;
