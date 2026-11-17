@@ -19,7 +19,7 @@ use http::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::{Arc, RwLock}};
 
 fn idempotency_owner(caller: &Caller, origin: Origin) -> PrincipalId {
     if let Some(id) = caller.principal {
@@ -68,12 +68,15 @@ pub struct ConnectionView {
     /// Route identifier.
     pub route: String,
 }
+/// Reloadable configuration administrator credentials.
+pub type Admins = Arc<RwLock<Vec<(String, ScramVerifier)>>>;
+
 /// Shared management services and configured administrators.
 pub struct MgmtContext {
     /// Durable authority.
     pub authority: Arc<Authority>,
     /// Configuration administrator verifiers.
-    pub admins: Vec<(String, ScramVerifier)>,
+    pub admins: Admins,
     /// Active connection snapshot provider.
     pub connections: Arc<dyn ConnectionSource>,
     /// Runtime revision provider.
@@ -517,7 +520,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                     },
                     None => None,
                 };
-                if ctx.admins.iter().any(|(name, _)| name == &request.name) {
+                if ctx.admins.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(name, _)| name == &request.name) {
                     return authority_error(AuthorityError::NameTaken);
                 }
                 let p = match ctx.authority.create_principal_by(

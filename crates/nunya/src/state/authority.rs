@@ -177,7 +177,7 @@ pub struct AuthorityCounters {
 /// Authoritative memory view with serialized write-through mutations.
 pub struct Authority {
     store: Arc<dyn Store>,
-    limits: SessionLimits,
+    limits: RwLock<SessionLimits>,
     view: RwLock<View>,
     // This mutex coordinates writers only; admission never takes it.
     writer: Mutex<()>,
@@ -370,7 +370,7 @@ impl Authority {
         }
         Ok(Arc::new(Self {
             store,
-            limits,
+            limits: RwLock::new(limits),
             view: RwLock::new(v),
             writer: Mutex::new(()),
             hook: RwLock::new(None),
@@ -399,6 +399,10 @@ impl Authority {
             return Err(AuthorityError::ConfigManaged);
         }
         Ok(p)
+    }
+    /// Replace bounds for future sessions without changing existing sessions.
+    pub fn set_session_limits(&self, limits: SessionLimits) {
+        *self.limits.write().unwrap_or_else(std::sync::PoisonError::into_inner) = limits;
     }
     /// Create an API principal with the legacy global retry owner.
     pub fn create_principal(
@@ -773,8 +777,9 @@ impl Authority {
         if mode.min(grant) != mode {
             return Err(AuthorityError::ModeExceedsGrant);
         }
-        let lifetime = req.lifetime_ms.unwrap_or(self.limits.max_lifetime_ms);
-        if lifetime > self.limits.max_lifetime_ms {
+        let limits = *self.limits.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lifetime = req.lifetime_ms.unwrap_or(limits.max_lifetime_ms);
+        if lifetime > limits.max_lifetime_ms {
             return Err(AuthorityError::LifetimeTooLong);
         }
         let now = self.store.now_ms();
@@ -799,7 +804,7 @@ impl Authority {
             scope: scope.id,
             created_ms: now,
             expires_ms: expires,
-            idle_timeout_ms: self.limits.idle_timeout_ms,
+            idle_timeout_ms: limits.idle_timeout_ms,
             last_used_ms: now,
             state: SessionState::Active,
             revoke_reason: None,

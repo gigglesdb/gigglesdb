@@ -88,7 +88,8 @@ pub fn authenticate(
     }
     let (name, secret) = bearer(headers)?;
     let principal = ctx.authority.principal_by_name(name);
-    let admin = ctx.admins.iter().find(|(n, _)| n == name);
+    let admins = ctx.admins.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let admin = admins.iter().find(|(n, _)| n == name);
     let stored = principal
         .as_ref()
         .filter(|p| p.state == PrincipalState::Enabled)
@@ -191,7 +192,7 @@ mod tests {
         }
         let ctx = MgmtContext {
             authority,
-            admins: vec![("configured".into(), verifier)],
+            admins: Arc::new(std::sync::RwLock::new(vec![("configured".into(), verifier)])),
             connections: Arc::new(Sources),
             status: Arc::new(Sources),
             lifecycle: Arc::new(Sources),

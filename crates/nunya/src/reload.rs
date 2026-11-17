@@ -197,12 +197,26 @@ impl Hub {
     }
     /// Set the service config revision on every unit and the lifecycle log.
     pub(crate) fn set_config_revision(&self, config: &str) -> Result<(), String> {
+        self.commit_config_revision(config, || Ok(()))
+    }
+    /// Check publication availability before applying configuration, then publish infallibly.
+    pub(crate) fn commit_config_revision(
+        &self, config: &str, apply: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
         let state = self.state.lock().map_err(|_| "policy lock unavailable")?;
-        // Acquire every publication lock before changing any revision.
-        let mut revisions = state.units.iter().map(|unit| {
-            unit.revisions.write().map_err(|_| "revision lock unavailable")
-        }).collect::<Result<Vec<_>, _>>()?;
-        let mut service = self.log.1.write().map_err(|_| "revision lock unavailable")?;
+        // Validate all locks before the only fallible applier. Release revision guards
+        // during apply: principal revocation emits lifecycle records using these locks.
+        {
+            let _revisions = state.units.iter().map(|unit| {
+                unit.revisions.write().map_err(|_| "revision lock unavailable")
+            }).collect::<Result<Vec<_>, _>>()?;
+            let _service = self.log.1.write().map_err(|_| "revision lock unavailable")?;
+        }
+        apply()?;
+        let mut revisions: Vec<_> = state.units.iter().map(|unit| {
+            unit.revisions.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+        }).collect();
+        let mut service = self.log.1.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         for revision in &mut revisions { revision.config = config.into(); }
         service.config = config.into();
         Ok(())

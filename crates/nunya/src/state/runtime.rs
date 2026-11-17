@@ -279,10 +279,7 @@ impl StateRuntime {
         let ends = Arc::new(EndCounters::default());
         let authority = Authority::load(
             store,
-            SessionLimits {
-                max_lifetime_ms: millis(session.max_lifetime),
-                idle_timeout_ms: session.idle_timeout.map(millis),
-            },
+            session_limits(session),
         )
         .map_err(|e| format!("state authority load failed: {e}"))?;
         let registry = Registry::new();
@@ -290,18 +287,7 @@ impl StateRuntime {
         authority.set_hook(Arc::new(RegistryHook {
             registry: registry.clone(), authority: Arc::downgrade(&authority), log: lifecycle_log.clone(), ends: ends.clone(),
         }));
-        let principals: Vec<_> = standing
-            .iter()
-            .map(|entry| ConfigPrincipal {
-                name: entry.name.clone(),
-                verifier: Verifier(crate::pgwire::auth::ScramVerifier {
-                    salt: entry.verifier.salt.clone(),
-                    iterations: entry.verifier.iterations,
-                    stored_key: entry.verifier.stored_key,
-                    server_key: entry.verifier.server_key,
-                }),
-            })
-            .collect();
+        let principals = config_principals(standing);
         authority
             .sync_config_principals(&principals)
             .map_err(|e| format!("config principal sync failed: {e}"))?;
@@ -312,6 +298,30 @@ impl StateRuntime {
             store_health,
             ends,
         }))
+    }
+}
+
+/// Convert configured standing credentials identically at startup and reload.
+pub(crate) fn config_principals(standing: &[StandingSection]) -> Vec<ConfigPrincipal> {
+    standing
+        .iter()
+        .map(|entry| ConfigPrincipal {
+            name: entry.name.clone(),
+            verifier: Verifier(crate::pgwire::auth::ScramVerifier {
+                salt: entry.verifier.salt.clone(),
+                iterations: entry.verifier.iterations,
+                stored_key: entry.verifier.stored_key,
+                server_key: entry.verifier.server_key,
+            }),
+        })
+        .collect()
+}
+
+/// Convert configured session durations into authority bounds.
+pub(crate) fn session_limits(session: &SessionSettings) -> SessionLimits {
+    SessionLimits {
+        max_lifetime_ms: millis(session.max_lifetime),
+        idle_timeout_ms: session.idle_timeout.map(millis),
     }
 }
 

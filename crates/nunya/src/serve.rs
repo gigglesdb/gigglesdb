@@ -388,9 +388,19 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         }
     }
     let hub = crate::reload::Hub::new(&policy_routes, config.policy_watch_ms)?;
+    let admins: crate::mgmt::routes::Admins = Arc::new(std::sync::RwLock::new(config.management.as_ref().map(|m| {
+        m.admins.iter().map(|a| (a.name.clone(), crate::pgwire::auth::ScramVerifier {
+            salt: a.verifier.salt.clone(), iterations: a.verifier.iterations,
+            stored_key: a.verifier.stored_key, server_key: a.verifier.server_key,
+        })).collect()
+    }).unwrap_or_default()));
+    if admins.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(name, _)| {
+        runtime.authority.principal_by_name(name).is_some_and(|p| p.source == crate::state::model::PrincipalSource::Api)
+    }) { return Err("management admin name taken".into()); }
     let config_reload = Arc::new(crate::config_reload::ConfigReloader::new(
         crate::config_reload::copy_config(&config), Arc::downgrade(&hub),
     ));
+    config_reload.attach(runtime.authority.clone(), admins.clone());
     runtime.set_lifecycle_log(Arc::new(hub.log.clone()));
     hub.set_config_revision(&config.revision)?;
     let (reload_tx, reload_rx) = mpsc::channel(1);
@@ -420,9 +430,6 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     }));
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let management = if config.management.is_some() || cfg!(unix) {
-        let admins = config.management.as_mut().map(|section| {
-            std::mem::take(&mut section.admins).into_iter().map(|admin| (admin.name, admin.verifier)).collect()
-        }).unwrap_or_default();
         let ctx = crate::mgmt::routes::MgmtContext {
             authority: runtime.authority.clone(), admins,
             connections: Arc::new(ManagementConnections(runtime.registry.clone())),

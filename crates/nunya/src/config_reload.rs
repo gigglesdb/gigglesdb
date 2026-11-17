@@ -3,10 +3,12 @@ use crate::{
     config::{Config, TlsSection},
     pgwire::{auth::ScramVerifier, upstream::UpstreamTls},
     reload::Hub,
+    mgmt::routes::Admins,
+    state::{authority::{Authority, ConfigPrincipal, SessionLimits}, model::PrincipalSource, runtime::{config_principals, session_limits}},
 };
 use std::{
     path::{Path, PathBuf},
-    sync::{Mutex, Weak},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 /// Changed setting names, divided by whether a restart is required.
@@ -315,14 +317,27 @@ pub(crate) struct ConfigReloader {
     path: PathBuf,
     hub: Weak<Hub>,
     state: Mutex<State>,
+    appliers: OnceLock<(Arc<Authority>, Admins)>,
 }
 /// Prepared configuration; future appliers may add fallible resources here.
 struct Prepared {
     config: Config,
     diff: Diff,
+    principals: Vec<ConfigPrincipal>,
+    limits: SessionLimits,
+    admins: Vec<(String, ScramVerifier)>,
 }
-fn prepare(running: &Config, config: Config) -> Result<Prepared, &'static str> {
+fn prepare(running: &Config, config: Config, authority: Option<&Authority>) -> Result<Prepared, &'static str> {
+    let admins: Vec<_> = config.management.as_ref().map(|m| m.admins.iter()
+        .map(|a| (a.name.clone(), copy_verifier(&a.verifier))).collect()).unwrap_or_default();
+    if admins.iter().any(|(name, _)| authority.and_then(|a| a.principal_by_name(name))
+        .is_some_and(|p| p.source == PrincipalSource::Api)) {
+        return Err("management admin name taken");
+    }
     Ok(Prepared {
+        principals: config_principals(&config.standing),
+        limits: session_limits(&config.session),
+        admins,
         diff: classify(running, &config),
         config,
     })
@@ -333,6 +348,7 @@ impl ConfigReloader {
         Self {
             path: config.path.clone(),
             hub,
+            appliers: OnceLock::new(),
             state: Mutex::new(State {
                 running: config,
                 last: "none",
@@ -343,6 +359,10 @@ impl ConfigReloader {
                 failures: 0,
             }),
         }
+    }
+    /// Attach live authority and shared management credentials before reloads start.
+    pub(crate) fn attach(&self, authority: Arc<Authority>, admins: Admins) {
+        assert!(self.appliers.set((authority, admins)).is_ok(), "reload appliers already attached");
     }
     /// Last applied configuration digest used to seed polling.
     pub(crate) fn revision(&self) -> String {
@@ -367,12 +387,26 @@ impl ConfigReloader {
         state.time = crate::serve::now();
         let prepared = Config::load(&self.path)
             .map_err(|errors| errors.join("; "))
-            .and_then(|new| prepare(&state.running, new).map_err(str::to_owned));
+            .and_then(|new| prepare(&state.running, new, self.appliers.get().map(|(a, _)| a.as_ref())).map_err(str::to_owned));
         let result = prepared.and_then(|prepared| {
             let hub = self.hub.upgrade().ok_or("reload service unavailable")?;
-            // Revision publication is the only fallible commit operation today.
-            hub.set_config_revision(&prepared.config.revision)?;
-            self.commit(&mut state, prepared);
+            let revision = prepared.config.revision.clone();
+            hub.commit_config_revision(&revision, || {
+                if let Some((authority, admins)) = self.appliers.get() {
+                    if prepared.diff.reloadable.contains(&"standing") {
+                        let counts = authority.sync_config_principals(&prepared.principals)
+                            .map_err(|error| format!("standing {error:?}"))?;
+                        eprintln!("serve: config reload: standing created={} updated={} re_enabled={} disabled={}",
+                            counts.created, counts.updated, counts.re_enabled, counts.disabled);
+                    }
+                    authority.set_session_limits(prepared.limits);
+                    if prepared.diff.reloadable.contains(&"management.admins") {
+                        *admins.write().unwrap_or_else(std::sync::PoisonError::into_inner) = prepared.admins;
+                    }
+                }
+                self.commit(&mut state, prepared.config, prepared.diff);
+                Ok(())
+            })?;
             Ok(())
         });
         if let Err(reason) = result {
@@ -381,8 +415,7 @@ impl ConfigReloader {
             eprintln!("serve: config reload rejected: {reason}");
         }
     }
-    fn commit(&self, state: &mut State, prepared: Prepared) {
-        let Prepared { config: new, diff } = prepared;
+    fn commit(&self, state: &mut State, new: Config, diff: Diff) {
         state.restart_pending = diff.restart_only;
         state.applied = diff.reloadable;
         for name in &state.restart_pending {
@@ -589,6 +622,188 @@ key_file='key'
         }
         toml::to_string(&doc).unwrap()
     }
+
+    use crate::state::{
+        authority::{AcquireRequest, AuthorityError, Operation},
+        model::{AccessSession, EndReason, Mode, PrincipalKind, PrincipalState, RouteId, Verifier},
+        runtime::StateRuntime,
+    };
+    impl Fixture {
+        fn live(&self) -> (Arc<StateRuntime>, Arc<Hub>, ConfigReloader, Admins) {
+            let config = self.load(&self.text);
+            let root = crate::token::keys::RootKey::from_hex(&"01".repeat(32)).unwrap();
+            let runtime = StateRuntime::open(&config.state_dir, &root, &config.session, &config.standing).unwrap();
+            let admins = Arc::new(std::sync::RwLock::new(config.management.as_ref().unwrap().admins.iter()
+                .map(|a| (a.name.clone(), copy_verifier(&a.verifier))).collect()));
+            let hub = self.hub();
+            runtime.set_lifecycle_log(Arc::new(hub.log.clone()));
+            let reloader = ConfigReloader::new(config, Arc::downgrade(&hub));
+            reloader.attach(runtime.authority.clone(), admins.clone());
+            (runtime, hub, reloader, admins)
+        }
+    }
+    fn acquire(a: &Authority, name: &str, key: &str) -> Result<AccessSession, AuthorityError> {
+        let p = a.principal_by_name(name).unwrap();
+        let route = RouteId::new("pg").unwrap();
+        a.set_grants(p.id, vec![(route.clone(), Mode::ReadOnly)]).unwrap();
+        a.acquire_session(p.id, AcquireRequest {
+            route, mode: None, lifetime_ms: None, isolated: false, label: None,
+            idempotency_key: key.into(), verifier: Verifier(ScramVerifier::from_password("session", b"salt", 1)),
+            secret_sha256: [3; 32],
+        })
+    }
+    fn entries(names: &[&str], password: &str) -> String {
+        let v = ScramVerifier::from_password(password, b"salt", 1).to_pg_string();
+        format!("[{}]", names.iter().map(|name| format!("{{name='{name}',verifier='{v}'}}"))
+            .collect::<Vec<_>>().join(","))
+    }
+    #[tokio::test]
+    async fn standing_removal_revokes_connection_and_new_sessions() {
+        let f = Fixture::new();
+        let (runtime, _hub, r, _) = f.live();
+        let a = &runtime.authority;
+        let session = acquire(a, "agent", "first").unwrap();
+        let (_guard, signal) = runtime.registry.register(session.id, session.principal, "pg", None);
+        f.load(&edit(&f.text, "standing", "[]"));
+        r.reload().await;
+        assert_eq!(r.last_reload(), "applied");
+        assert_eq!(a.principal(session.principal).unwrap().state, PrincipalState::Disabled);
+        assert_eq!(a.session(session.id).unwrap().revoke_reason, Some(EndReason::ConfigRemoved));
+        assert_eq!(signal.try_ended(), Some(crate::state::registry::EndReason::Revoked));
+        assert!(a.admit(session.id, Operation::Read).is_err());
+        assert_eq!(acquire(a, "agent", "second").unwrap_err(), AuthorityError::PrincipalDisabled);
+    }
+    #[tokio::test]
+    async fn verifier_rotation_preserves_identity_session_and_scope() {
+        let f = Fixture::new();
+        let (runtime, _hub, r, _) = f.live();
+        let a = &runtime.authority;
+        let session = acquire(a, "agent", "first").unwrap();
+        let scope = a.scope(session.scope).unwrap();
+        let old = a.principal_credential_verifiers(session.principal)[0].0.to_pg_string();
+        let new = ScramVerifier::from_password("changed", b"salt", 1).to_pg_string();
+        f.load(&edit(&f.text, "standing", &entries(&["agent"], "changed")));
+        r.reload().await;
+        assert_eq!(r.last_reload(), "applied");
+        assert_eq!(a.principal_by_name("agent").unwrap().id, session.principal);
+        assert_eq!(a.admit(session.id, Operation::Read).unwrap().scope, session.scope);
+        let after = a.scope(session.scope).unwrap();
+        assert_eq!(scope.id, after.id);
+        assert!(scope.salt == after.salt);
+        let verifiers = a.principal_credential_verifiers(session.principal);
+        assert_eq!(verifiers.len(), 1);
+        assert!(verifiers[0].0.to_pg_string() != old);
+        assert!(verifiers[0].0.to_pg_string() == new);
+    }
+    #[tokio::test]
+    async fn standing_addition_is_usable() {
+        let f = Fixture::new();
+        let (runtime, _hub, r, _) = f.live();
+        f.load(&edit(&f.text, "standing", &entries(&["agent", "added"], "fixture")));
+        r.reload().await;
+        assert_eq!(r.last_reload(), "applied");
+        assert_eq!(runtime.authority.principal_by_name("added").unwrap().state, PrincipalState::Enabled);
+        assert!(acquire(&runtime.authority, "added", "first").is_ok());
+    }
+    #[tokio::test]
+    async fn standing_collision_rejects_all_appliers() {
+        let f = Fixture::new();
+        let (runtime, hub, r, admins) = f.live();
+        let a = &runtime.authority;
+        a.create_principal("api", PrincipalKind::Agent, false, "create").unwrap();
+        let revision = r.revision();
+        let edited = edit(&edit(&edit(&f.text, "standing", &entries(&["api", "added"], "changed")),
+            "session.max_lifetime", "'1h'"), "management.admin", &entries(&["replacement"], "changed"));
+        f.load(&edited);
+        r.reload().await;
+        assert_eq!(r.last_reload(), "rejected");
+        assert_eq!(r.revision(), revision);
+        assert_eq!(hub.log.1.read().unwrap().config, revision);
+        assert_eq!(r.state.lock().unwrap().failures, 1);
+        assert!(a.principal_by_name("added").is_none());
+        assert_eq!(a.principal_by_name("agent").unwrap().state, PrincipalState::Enabled);
+        assert_eq!(admins.read().unwrap()[0].0, "admin");
+        let session = acquire(a, "agent", "after").unwrap();
+        assert_eq!(session.expires_ms - session.created_ms, 8 * 3600 * 1000);
+    }
+    #[tokio::test]
+    async fn admin_api_collision_is_rejected_before_standing_sync() {
+        let f = Fixture::new();
+        let (runtime, hub, r, admins) = f.live();
+        runtime.authority.create_principal("api", PrincipalKind::Agent, false, "create").unwrap();
+        let revision = r.revision();
+        f.load(&edit(&edit(&f.text, "standing", "[]"), "management.admin", &entries(&["api"], "changed")));
+        r.reload().await;
+        assert_eq!(r.last_reload(), "rejected");
+        assert_eq!(r.revision(), revision);
+        assert_eq!(hub.log.1.read().unwrap().config, revision);
+        assert_eq!(admins.read().unwrap()[0].0, "admin");
+        assert_eq!(runtime.authority.principal_by_name("agent").unwrap().state, PrincipalState::Enabled);
+    }
+    #[tokio::test]
+    async fn session_limits_only_affect_new_acquisitions() {
+        let f = Fixture::new();
+        let (runtime, _hub, r, _) = f.live();
+        let a = &runtime.authority;
+        let old = acquire(a, "agent", "old").unwrap();
+        f.load(&edit(&f.text, "session.max_lifetime", "'1h'"));
+        r.reload().await;
+        assert_eq!(r.last_reload(), "applied");
+        let new = acquire(a, "agent", "new").unwrap();
+        assert_eq!(new.expires_ms - new.created_ms, 3600 * 1000);
+        assert_eq!(a.session(old.id).unwrap().expires_ms, old.expires_ms);
+    }
+    #[tokio::test]
+    async fn unrelated_reload_does_not_sync_standing() {
+        let f = Fixture::new();
+        let (runtime, _hub, r, _) = f.live();
+        // Disabling out of band makes an accidental sync observable: it would re-enable it.
+        runtime.authority.sync_config_principals(&[]).unwrap();
+        let before = runtime.authority.principal_by_name("agent").unwrap();
+        f.load(&edit(&f.text, "max_connections", "999"));
+        r.reload().await;
+        let after = runtime.authority.principal_by_name("agent").unwrap();
+        assert_eq!(r.last_reload(), "applied");
+        assert_eq!(before.revision, after.revision);
+        assert_eq!(after.state, PrincipalState::Disabled);
+    }
+    struct Sources;
+    impl crate::mgmt::routes::ConnectionSource for Sources {
+        fn list(&self) -> Vec<crate::mgmt::routes::ConnectionView> { vec![] }
+    }
+    impl crate::mgmt::routes::StatusSource for Sources {
+        fn policy_revision(&self, _: &str) -> Option<String> { None }
+        fn config_revision(&self) -> Option<String> { None }
+        fn route_ids(&self) -> Vec<String> { vec![] }
+    }
+    impl crate::mgmt::audit::LifecycleSink for Sources {
+        fn record(&self, _: &crate::mgmt::audit::LifecycleRecord) -> Result<(), crate::mgmt::audit::AuditUnavailable> { Ok(()) }
+    }
+    #[tokio::test]
+    async fn admins_removal_and_rotation_apply_on_next_request() {
+        use crate::mgmt::{auth::{authenticate, Origin}, routes::MgmtContext};
+        let f = Fixture::new();
+        let (runtime, _hub, r, admins) = f.live();
+        let ctx = MgmtContext { authority: runtime.authority.clone(), admins,
+            connections: Arc::new(Sources), status: Arc::new(Sources), lifecycle: Arc::new(Sources) };
+        let auth = |name: &str, secret: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::AUTHORIZATION, format!("Bearer nunya.{name}.{secret}").parse().unwrap());
+            authenticate(&ctx, Origin::Network, &headers).is_ok()
+        };
+        assert!(auth("admin", "fixture"));
+        let rotated = edit(&f.text, "management.admin", &entries(&["admin"], "changed"));
+        f.load(&rotated);
+        r.reload().await;
+        assert_eq!(r.last_reload(), "applied");
+        assert!(!auth("admin", "fixture"));
+        assert!(auth("admin", "changed"));
+        f.load(&edit(&rotated, "management.admin", &entries(&["replacement"], "new")));
+        r.reload().await;
+        assert_eq!(r.last_reload(), "applied");
+        assert!(!auth("admin", "changed"));
+        assert!(auth("replacement", "new"));
+    }
     #[test]
     fn every_setting_is_classified_individually() {
         let f = Fixture::new();
@@ -735,11 +950,11 @@ key_file='key'
     #[tokio::test]
     async fn revision_publication_failure_rejects_without_partial_changes() {
         let f = Fixture::new();
-        let startup = f.load(&f.text);
-        let hub = f.hub();
-        let original = startup.revision.clone();
-        let r = ConfigReloader::new(startup, Arc::downgrade(&hub));
-        f.load(&edit(&f.text, "max_connections", "999"));
+        let (runtime, hub, r, admins) = f.live();
+        let original = r.revision();
+        let old_session = acquire(&runtime.authority, "agent", "before").unwrap();
+        f.load(&edit(&edit(&edit(&edit(&f.text, "max_connections", "999"),
+            "standing", "[]"), "session.max_lifetime", "'1h'"), "management.admin", "[]"));
         let lock = hub.log.1.clone();
         let _ = std::thread::spawn(move || {
             let _guard = lock.write().unwrap();
@@ -750,6 +965,10 @@ key_file='key'
         assert_eq!(s.last, "rejected");
         assert_eq!(s.running.max_connections, 256);
         assert_eq!(s.running.revision, original);
+        assert_eq!(admins.read().unwrap()[0].0, "admin");
+        assert!(runtime.authority.admit(old_session.id, Operation::Read).is_ok());
+        let new = acquire(&runtime.authority, "agent", "after").unwrap();
+        assert_eq!(new.expires_ms - new.created_ms, 8 * 3600 * 1000);
         // The earlier unit lock was acquired, but its revision was never changed.
         let route = crate::state::model::RouteId::new("pg").unwrap();
         assert_eq!(hub.route_log(&route).unwrap().1.read().unwrap().config, original);

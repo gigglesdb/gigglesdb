@@ -161,7 +161,7 @@ impl Fixture {
         let audit = Arc::new(AuditSink::default());
         let ctx = MgmtContext {
             authority,
-            admins: vec![("config-admin".into(), admin.0)],
+            admins: Arc::new(std::sync::RwLock::new(vec![("config-admin".into(), admin.0)])),
             connections: Arc::new(Sources),
             status: Arc::new(Sources),
             lifecycle: audit.clone(),
@@ -456,7 +456,7 @@ fn invalid_routes_keys_disabled_credentials_and_admin_shadowing() {
         data_encoding::HEXLOWER.encode(&shadow.stored_key),
         data_encoding::HEXLOWER.encode(&shadow.server_key),
     ]);
-    f.ctx.as_mut().unwrap().admins.push(("bob".into(), shadow));
+    f.ctx.as_mut().unwrap().admins.write().unwrap().push(("bob".into(), shadow));
     assert_eq!(
         f.request(Origin::Network, Some(BOB), "GET", "/v1/sessions", None)
             .status(),
@@ -2254,7 +2254,7 @@ fn credential_limit_and_replay() {
 #[test]
 fn config_admin_names_reserved_and_retry_owners_separate() {
     let mut f = Fixture::new();
-    f.ctx.as_mut().unwrap().admins.push((
+    f.ctx.as_mut().unwrap().admins.write().unwrap().push((
         "second-admin".into(),
         ScramVerifier::from_password("second-secret", b"second-salt", 4096),
     ));
