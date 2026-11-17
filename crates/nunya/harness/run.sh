@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ ${1:-} == agent ]]; then
+  shift
+  exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agent/run.sh" "$@"
+fi
 mode=pg
 if [[ ${1:-} == spanner || ${1:-} == private ]]; then mode=$1; shift; fi
 d2=0
