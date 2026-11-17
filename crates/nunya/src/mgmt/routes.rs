@@ -516,6 +516,15 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                 let Ok(request) = serde_json::from_slice::<CreateBody>(body) else {
                     return bad_request();
                 };
+                if ctx
+                    .admins
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .any(|(name, _)| name == &request.name)
+                {
+                    return authority_error(AuthorityError::NameTaken);
+                }
                 let verifier = match request.verifier {
                     Some(v) => match Verifier::try_from(v) {
                         Ok(v) => Some(v),
