@@ -296,9 +296,6 @@ impl SqlSession {
                             }
                         }
                         "commit" => {
-                            // Publish live sequence positions before another session can
-                            // allocate from the newly committed durable reservation.
-                            let mut live = crate::cancellation::lock(&db.sql_counters)?;
                             let txn = self
                                 .v2_transaction
                                 .take()
@@ -315,7 +312,6 @@ impl SqlSession {
                                     Ok(())
                                 });
                             if validation.is_err() {
-                                drop(live);
                                 self.rollback();
                                 return validation.map(|()| Default::default());
                             }
@@ -324,14 +320,26 @@ impl SqlSession {
                                 sql_sequences::stage_pending(db, &mut txn, &self.pending_sequences)
                                     .and_then(|()| commit_sql(db, txn, point));
                             if committed.is_ok() {
-                                live.extend(
-                                    self.pending_sequences
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .clone(),
-                                );
+                                // Never allocate from a reservation before it is durable:
+                                // committed live positions follow a Sync write_counter ack
+                                // in the sequence callback, or this commit's durable ack.
+                                // Pending incarnations were not committed before this txn.
+                                // A session finding no live entry reads the durable Seq
+                                // counter, now equal to our staged counter, and may advance it.
+                                // Keep any same-incarnation entry: it is at least as new.
+                                let mut live = crate::cancellation::lock(&db.sql_counters)?;
+                                for (id, counter) in self.pending_sequences
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .iter()
+                                {
+                                    if live.get(id).is_none_or(|current| {
+                                        current.incarnation != counter.incarnation
+                                    }) {
+                                        live.insert(*id, counter.clone());
+                                    }
+                                }
                             }
-                            drop(live);
                             self.rollback();
                             committed?;
                             acknowledge_sql_commit(point)?;

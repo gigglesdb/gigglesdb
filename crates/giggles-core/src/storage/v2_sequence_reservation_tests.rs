@@ -308,3 +308,147 @@ fn committed_lookahead_writes_only_on_refill_setval_and_cycle_wrap() {
     assert_eq!(scalar(&mut s, "SELECT nextval('tiny')"), 1);
     assert_ne!(db.kv.get(Keyspace::Seq, &tiny).unwrap(), first);
 }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn concurrent_explicit_commits_with_nextval_do_not_reuse_values() {
+    for engine in [Engine::V2] {
+        let f = Fixture::new(engine);
+        run(&mut f.session(), "CREATE SEQUENCE explicit_ids");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let admin = f.admin.as_ref().unwrap().clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    let mut s = admin.sql_session();
+                    start.wait();
+                    let values: Vec<_> = (0..50)
+                        .map(|_| {
+                            run(&mut s, "BEGIN");
+                            let value = scalar(&mut s, "SELECT nextval('explicit_ids')");
+                            run(&mut s, "COMMIT");
+                            value
+                        })
+                        .collect();
+                    assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+                    values
+                })
+            })
+            .collect();
+        let values: Vec<_> = workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect();
+        assert_eq!(values.len(), 400);
+        assert_eq!(values.into_iter().collect::<BTreeSet<_>>().len(), 400);
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn concurrent_explicit_commits_publish_new_sequence_positions() {
+    for engine in [Engine::V2] {
+        let f = Fixture::new(engine);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|id| {
+                let admin = f.admin.as_ref().unwrap().clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    let mut s = admin.sql_session();
+                    start.wait();
+                    run(&mut s, "BEGIN");
+                    run(&mut s, &format!("CREATE SEQUENCE s_{id}"));
+                    let sql = format!("SELECT nextval('s_{id}')");
+                    for expected in 1..=5 {
+                        assert_eq!(scalar(&mut s, &sql), expected);
+                    }
+                    run(&mut s, "COMMIT");
+                    let mut other = admin.sql_session();
+                    assert!(scalar(&mut other, &sql) > 5);
+                    // The creator must also observe any advancement by the other session.
+                    let last = scalar(&mut other, &sql);
+                    assert!(scalar(&mut s, &sql) > last);
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn explicit_commit_crash_worker() {
+    let Some(path) = std::env::var_os("F2_EXPLICIT_CRASH_PATH") else {
+        return;
+    };
+    let point = match std::env::var("F2_EXPLICIT_CRASH_POINT").unwrap().as_str() {
+        "before" => CrashPoint::BeforeCommit,
+        "after" => CrashPoint::AfterCommit,
+        "before_ack" => CrashPoint::BeforeAck,
+        "error_before" => CrashPoint::ErrorBeforeCommit,
+        "error_after" => CrashPoint::ErrorAfterCommit,
+        "acknowledged" => CrashPoint::None,
+        other => panic!("unknown crash point {other}"),
+    };
+    let admin = Admin::open(PathBuf::from(path), Limits::default()).unwrap();
+    let mut s = admin.sql_session();
+    run(&mut s, "BEGIN");
+    run(&mut s, "CREATE SEQUENCE crash_pending");
+    for expected in 1..=5 {
+        assert_eq!(scalar(&mut s, "SELECT nextval('crash_pending')"), expected);
+    }
+    admin.set_crash_point(point).unwrap();
+    let committed = s.execute_at("COMMIT", &[], None, &clock());
+    match point {
+        CrashPoint::None => assert!(committed.is_ok()),
+        CrashPoint::ErrorBeforeCommit | CrashPoint::ErrorAfterCommit => {
+            assert!(matches!(committed, Err(CoreError::Storage(_))));
+        }
+        _ => panic!("crash point did not terminate the worker"),
+    }
+    crate::storage::crash_now();
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn abrupt_explicit_commit_preserves_pending_sequence_reservations() {
+    for (point, durable) in [
+        ("before", false),
+        ("error_before", false),
+        ("after", true),
+        ("before_ack", true),
+        ("error_after", true),
+        ("acknowledged", true),
+    ] {
+        let mut f = Fixture::new(Engine::V2);
+        f.admin.take();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::v2_sql::sql_sequences::reservation_tests::explicit_commit_crash_worker",
+                "--nocapture",
+            ])
+            .env("F2_EXPLICIT_CRASH_PATH", &f.path)
+            .env("F2_EXPLICIT_CRASH_POINT", point)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(86), "{point}: {output:?}");
+        f.reopen();
+        let mut s = f.session();
+        if durable {
+            let first = scalar(&mut s, "SELECT nextval('crash_pending')");
+            assert!(first > 5, "{point}: reused {first}");
+            assert!(scalar(&mut s, "SELECT nextval('crash_pending')") > first);
+        } else {
+            assert_eq!(
+                s.execute_at("SELECT nextval('crash_pending')", &[], None, &clock()),
+                Err(CoreError::Sql(SqlError::UnknownTable)),
+                "{point}",
+            );
+        }
+    }
+}
