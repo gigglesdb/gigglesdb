@@ -42,8 +42,14 @@ fn string_data_right_truncation_has_append_only_protocol_identity() {
         error
     );
     assert_eq!(local::failure(CoreError::Sql(error)).code, 251);
-    assert!(le.deserialize::<SqlError>(&[58, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<SqlError>(&[0, 0, 0, 58]).is_err());
+    assert_eq!(le.deserialize::<SqlError>(&[58, 0, 0, 0]).unwrap(), SqlError::InvalidRecursion);
+    assert_eq!(be.deserialize::<SqlError>(&[0, 0, 0, 58]).unwrap(), SqlError::InvalidRecursion);
+    assert_eq!(le.serialize(&SqlError::InvalidRecursion).unwrap(), [58, 0, 0, 0]);
+    assert_eq!(be.serialize(&SqlError::InvalidRecursion).unwrap(), [0, 0, 0, 58]);
+    assert_eq!(local::failure(CoreError::Sql(SqlError::InvalidRecursion)).code, 258);
+    assert_eq!(serde_json::to_string(&SqlError::InvalidRecursion).unwrap(), "\"InvalidRecursion\"");
+    assert!(le.deserialize::<SqlError>(&[59, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<SqlError>(&[0, 0, 0, 59]).is_err());
 }
 
 #[test]

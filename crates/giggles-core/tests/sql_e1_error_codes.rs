@@ -135,8 +135,14 @@ fn e1_error_names_and_local_codes() {
         assert_eq!(be.deserialize::<E>(&be_bytes).unwrap(), error);
         assert_eq!(local::failure(CoreError::Sql(error)).code, code);
     }
-    assert!(le.deserialize::<E>(&[58, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<E>(&[0, 0, 0, 58]).is_err());
+    assert_eq!(le.deserialize::<E>(&[58, 0, 0, 0]).unwrap(), E::InvalidRecursion);
+    assert_eq!(be.deserialize::<E>(&[0, 0, 0, 58]).unwrap(), E::InvalidRecursion);
+    assert_eq!(le.serialize(&E::InvalidRecursion).unwrap(), [58, 0, 0, 0]);
+    assert_eq!(be.serialize(&E::InvalidRecursion).unwrap(), [0, 0, 0, 58]);
+    assert_eq!(local::failure(CoreError::Sql(E::InvalidRecursion)).code, 258);
+    assert_eq!(serde_json::to_string(&E::InvalidRecursion).unwrap(), "\"InvalidRecursion\"");
+    assert!(le.deserialize::<E>(&[59, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<E>(&[0, 0, 0, 59]).is_err());
 }
 
 #[test]

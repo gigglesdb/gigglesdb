@@ -122,6 +122,7 @@ fn current_closed_sql_errors_decode_only_literal_unit_variants() {
             E::InvalidTextRepresentation,
         ),
         (27, "SubstringError", E::SubstringError),
+        (58, "InvalidRecursion", E::InvalidRecursion),
     ];
     for (tag, name, expected) in identities {
         let le = bincode::DefaultOptions::new()
@@ -176,7 +177,7 @@ fn current_closed_sql_errors_decode_only_literal_unit_variants() {
         assert!(serde_json::from_str::<E>(&format!("{json} null")).is_err());
         assert!(serde_json::from_str::<E>(&json[..json.len() - 1]).is_err());
     }
-    for tag in [58u32, u32::MAX] {
+    for tag in [59u32, u32::MAX] {
         assert!(
             bincode::DefaultOptions::new()
                 .with_fixint_encoding()

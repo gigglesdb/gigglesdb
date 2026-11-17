@@ -225,10 +225,11 @@ fn exercise(engine: Engine) {
         query(&mut s, "SELECT q.* FROM (SELECT test FROM table_name) q ORDER BY test", &["test"]),
         query(&mut s, "SELECT * FROM (SELECT test FROM table_name) q ORDER BY test", &["test"]),
     );
-    // CTEs remain outside the supported query profile.
-    let expected = s.execute("WITH q AS (SELECT test FROM table_name) SELECT * FROM q", &[], None);
-    assert!(expected.is_err());
-    assert_eq!(s.execute("WITH q AS (SELECT test FROM table_name) SELECT q.* FROM q", &[], None), expected);
+    let expected = s.execute("WITH q AS (SELECT test FROM table_name) SELECT * FROM q ORDER BY test", &[], None).unwrap();
+    let qualified = s.execute("WITH q AS (SELECT test FROM table_name) SELECT q.* FROM q ORDER BY test", &[], None).unwrap();
+    assert_eq!(qualified, expected);
+    assert_eq!(expected.rows.iter().map(|r| r.values.clone()).collect::<Vec<_>>(),
+        vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]]);
     drop(s);
     drop(admin);
     if path.is_dir() {

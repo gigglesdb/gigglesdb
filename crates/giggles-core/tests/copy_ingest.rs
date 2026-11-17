@@ -230,8 +230,14 @@ fn copy_error_append_contract() {
     assert_eq!(be.serialize(&error).unwrap(), [0, 0, 0, 50]);
     assert_eq!(le.deserialize::<E>(&[50, 0, 0, 0]).unwrap(), error);
     assert_eq!(be.deserialize::<E>(&[0, 0, 0, 50]).unwrap(), error);
-    assert!(le.deserialize::<E>(&[58, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<E>(&[0, 0, 0, 58]).is_err());
+    assert_eq!(le.deserialize::<E>(&[58, 0, 0, 0]).unwrap(), E::InvalidRecursion);
+    assert_eq!(be.deserialize::<E>(&[0, 0, 0, 58]).unwrap(), E::InvalidRecursion);
+    assert_eq!(le.serialize(&E::InvalidRecursion).unwrap(), [58, 0, 0, 0]);
+    assert_eq!(be.serialize(&E::InvalidRecursion).unwrap(), [0, 0, 0, 58]);
+    assert_eq!(local::failure(CoreError::Sql(E::InvalidRecursion)).code, 258);
+    assert_eq!(serde_json::to_string(&E::InvalidRecursion).unwrap(), "\"InvalidRecursion\"");
+    assert!(le.deserialize::<E>(&[59, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<E>(&[0, 0, 0, 59]).is_err());
     assert_eq!(
         serde_json::to_string(&error).unwrap(),
         "\"BadCopyFileFormat\""

@@ -41,5 +41,11 @@ fn restrict_violation_appends_wire_tag_46() {
     assert_eq!(be.deserialize::<SqlError>(&[0, 0, 0, 47]).unwrap(), SqlError::WrongObjectType);
     assert_eq!(local::failure(CoreError::Sql(SqlError::WrongObjectType)).code, 247);
     assert_eq!(serde_json::to_string(&SqlError::WrongObjectType).unwrap(), "\"WrongObjectType\"");
-    assert!(le.deserialize::<SqlError>(&[58, 0, 0, 0]).is_err());
+    assert_eq!(le.deserialize::<SqlError>(&[58, 0, 0, 0]).unwrap(), SqlError::InvalidRecursion);
+    assert_eq!(be.deserialize::<SqlError>(&[0, 0, 0, 58]).unwrap(), SqlError::InvalidRecursion);
+    assert_eq!(le.serialize(&SqlError::InvalidRecursion).unwrap(), [58, 0, 0, 0]);
+    assert_eq!(be.serialize(&SqlError::InvalidRecursion).unwrap(), [0, 0, 0, 58]);
+    assert_eq!(local::failure(CoreError::Sql(SqlError::InvalidRecursion)).code, 258);
+    assert_eq!(serde_json::to_string(&SqlError::InvalidRecursion).unwrap(), "\"InvalidRecursion\"");
+    assert!(le.deserialize::<SqlError>(&[59, 0, 0, 0]).is_err());
 }

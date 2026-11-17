@@ -2599,7 +2599,8 @@ impl Prepared {
         match &self.statement {
             Statement::View(ddl) => ddl.names.first().map(String::as_str),
             Statement::Truncate { names, .. } | Statement::DropTable { names, .. } => names.first().map(String::as_str),
-            Statement::Plan(_) => None,
+            // Planner operators are not scalar table-free proofs.
+            Statement::Plan(_) => Some("giggles_join"),
             Statement::Query(q) => {
                 if q.is_table_free() {
                     None
@@ -2621,6 +2622,15 @@ impl Prepared {
             | Statement::UpdateExpressions { name, .. }
             | Statement::Delete { name, .. } => Some(name),
             _ => None,
+        }
+    }
+    /// A concrete single relation target for storage locking and lookup.
+    /// Planner statements expose an authorization marker through `table()`;
+    /// their actual relations come from `read_tables()` and `write_tables()`.
+    pub(crate) fn storage_table(&self) -> Option<&str> {
+        match &self.statement {
+            Statement::Plan(_) => None,
+            _ => self.table(),
         }
     }
     /// Tables whose rows are read by this statement, in first-seen order.

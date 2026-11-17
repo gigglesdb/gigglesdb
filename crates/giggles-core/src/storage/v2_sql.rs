@@ -398,7 +398,7 @@ impl SqlSession {
                             }
                         })?;
                         let bound = p.bind_schemas(&binding).map_err(CoreError::Sql)?;
-                        let target_name = bound.table().map(str::to_owned);
+                        let target_name = bound.storage_table().map(str::to_owned);
                         if writing && !ddl && target_name.as_ref().is_some_and(|n| binding.view_names.contains_key(n)) { return Err(CoreError::Sql(E::Unsupported)); }
                         let mut names = bound.read_tables().into_iter().collect::<BTreeSet<_>>();
                         let truncating = bound.command() == "TRUNCATE TABLE";
@@ -495,8 +495,8 @@ impl SqlSession {
                                 })?;
                         }
                         // A WITH statement can own several mutation targets.
-                        if writing && !ddl && target_name.is_none() {
-                            for id in &write_ids {
+                        if writing && !ddl {
+                            for id in write_ids.iter().filter(|id| Some(**id) != target_id) {
                                 txn.lock_sql_sentinel(*id, if txn.isolation() == Isolation::ReadCommitted {
                                     LockMode::Exclusive
                                 } else { LockMode::Shared }, &|| crate::cancellation::check().is_err())?;

@@ -49,13 +49,17 @@ fn only_proven_table_free_scalar_queries_have_no_gateway_target() {
         "SELECT unknown_function()",
         "SELECT public.abs(-2)",
         "SELECT (SELECT id FROM a)",
-        "WITH x AS (SELECT id FROM a) SELECT id FROM x",
     ] {
         if let Ok(p) = s.prepare(sql) {
             assert!(p.table().is_some(), "{sql}");
             assert!(s.describe(&p).is_err(), "{sql}");
         }
     }
+    let p = s.prepare("WITH x AS (SELECT id FROM a) SELECT id FROM x").unwrap();
+    assert!(p.table().is_some());
+    let description = s.describe(&p).unwrap();
+    assert_eq!(description.columns.len(), 1);
+    assert_eq!(description.columns[0].name, "id");
 }
 
 #[test]

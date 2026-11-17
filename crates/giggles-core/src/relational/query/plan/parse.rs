@@ -173,7 +173,7 @@ pub(super) fn expression(
                 .first()
                 .is_some_and(|r: &Vec<Scalar>| r.len() != row.len())
             {
-                return Err(SqlError::Syntax.into());
+                return Err(ParseError::Definite(SqlError::Syntax));
             }
             rows.push(row);
             if rows.len() > MAX_WORK {
@@ -202,7 +202,7 @@ pub(super) fn expression(
                         p.at += 1;
                         desc
                     }
-                    _ => return Err(SqlError::UndefinedFunction.into()),
+                    _ => return Err(ParseError::Definite(SqlError::UndefinedFunction)),
                 }
             } else {
                 let desc = p.word("desc");
@@ -279,7 +279,7 @@ fn select(tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize) 
             if word(&tokens[i], "using") {
                 let desc = match &tokens[i + 1] {
                     Token::Op(op) if op == "<" || op == ">" => op == ">",
-                    _ => return Err(SqlError::UndefinedFunction.into()),
+                    _ => return Err(ParseError::Definite(SqlError::UndefinedFunction)),
                 };
                 tokens.splice(
                     i..i + 2,

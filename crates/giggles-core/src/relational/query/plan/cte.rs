@@ -43,7 +43,7 @@ pub(super) fn parse(
     loop {
         let alias = p.name()?;
         if !names.insert(alias.clone()) {
-            return Err(SqlError::DuplicateTable.into());
+            return Err(ParseError::Definite(SqlError::DuplicateTable));
         }
         let aliases = if p.sym('(') {
             names_list(&mut p, true)?
@@ -167,14 +167,14 @@ pub(super) fn parse(
         let name = definitions[i].1.name.clone();
         definitions[i].1.recursive = references(&definitions[i].1.query, &name) > 0;
         if definitions[i].1.recursive {
-            recursive_parts(&definitions[i].1)?;
+            recursive_parts(&definitions[i].1).map_err(ParseError::Definite)?;
         } else if definitions[i].1.search.is_some() || definitions[i].1.cycle.is_some() {
-            return Err(SqlError::InvalidRecursion.into());
+            return Err(ParseError::Definite(SqlError::InvalidRecursion));
         }
         // A forward reference is either mutual recursion or an unsupported dependency cycle.
         for (_, later) in &definitions[i + 1..] {
             if references(&definitions[i].1.query, &later.name) > 0 {
-                return Err(SqlError::InvalidRecursion.into());
+                return Err(ParseError::Definite(SqlError::InvalidRecursion));
             }
         }
     }

@@ -14,6 +14,104 @@ use engine::{
 };
 use std::ops::Bound;
 
+#[test]
+fn with_dml_locks_hold_plain_dml_sentinel_until_commit_or_rollback() {
+    use crate::relational::Value;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    for mutation in [
+        "DELETE FROM t WHERE n>=0 RETURNING id",
+        "UPDATE t SET n=n+1 WHERE n>=0 RETURNING id",
+    ] {
+        for with in [false, true] {
+            for commit in [false, true] {
+                let f = Fixture::new();
+                f.execute("CREATE TABLE t(id bigint PRIMARY KEY,n bigint)");
+                f.execute("INSERT INTO t VALUES(1,0)");
+                let mut holder = f.admin().sql_session();
+                holder.execute("BEGIN", &[], None).unwrap();
+                assert_eq!(
+                    holder.v2_transaction.as_ref().unwrap().isolation(),
+                    Isolation::ReadCommitted
+                );
+                let sql = if with {
+                    format!("WITH d AS ({mutation}) SELECT * FROM d")
+                } else {
+                    mutation.to_owned()
+                };
+                holder.execute(&sql, &[], None).unwrap();
+
+                // A fresh primary key cannot conflict on a row lock. It must
+                // wait on the scan writer's sentinel, including for WITH DML.
+                let admin = f.admin().clone();
+                let (send, done) = mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    let result = admin
+                        .sql_session()
+                        .execute("INSERT INTO t VALUES(2,0)", &[], None);
+                    send.send(result).unwrap();
+                });
+                let until = Instant::now() + Duration::from_secs(10);
+                loop {
+                    assert!(
+                        matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                        "writer completed before {sql} ended"
+                    );
+                    if holder.v2_transaction.as_ref().unwrap().sql_waiting_count() > 0 {
+                        break;
+                    }
+                    assert!(Instant::now() < until, "writer never waited for {sql}");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                holder
+                    .execute(if commit { "COMMIT" } else { "ROLLBACK" }, &[], None)
+                    .unwrap();
+                assert_eq!(
+                    done.recv_timeout(Duration::from_secs(20))
+                        .unwrap()
+                        .unwrap()
+                        .affected,
+                    1
+                );
+                worker.join().unwrap();
+                let rows = f
+                    .admin()
+                    .sql_session()
+                    .execute("SELECT id,n FROM t ORDER BY id", &[], None)
+                    .unwrap()
+                    .rows;
+                let mut expected = Vec::new();
+                if !commit || mutation.starts_with("UPDATE") {
+                    expected.push(vec![Value::Int(1), Value::Int(i64::from(commit))]);
+                }
+                expected.push(vec![Value::Int(2), Value::Int(0)]);
+                assert_eq!(
+                    rows.into_iter().map(|r| r.values).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn with_dml_locks_authorization_marker_is_not_a_storage_target() {
+    for sql in [
+        "WITH d AS (DELETE FROM t RETURNING id) SELECT * FROM d",
+        "WITH d AS (UPDATE t SET n=n+1 RETURNING id) SELECT * FROM d",
+        "WITH q AS (SELECT * FROM t) SELECT * FROM q",
+    ] {
+        let prepared = relational::Prepared::parse(sql, 1, 0).unwrap();
+        assert_eq!(prepared.table(), Some("giggles_join"));
+        assert_eq!(prepared.storage_table(), None);
+        assert!(!prepared.read_tables().iter().any(|name| name == "giggles_join"));
+        assert!(!prepared.write_tables().iter().any(|(name, _)| name == "giggles_join"));
+    }
+    let plain = relational::Prepared::parse("DELETE FROM t RETURNING id", 1, 0).unwrap();
+    assert_eq!(plain.storage_table(), Some("t"));
+}
+
 #[path = "v2_large_ddl_tests.rs"]
 mod large_ddl;
 #[path = "v2_large_dml_tests.rs"]
