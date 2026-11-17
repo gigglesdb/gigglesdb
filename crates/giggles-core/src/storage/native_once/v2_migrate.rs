@@ -12,10 +12,16 @@
 //! 4. `require_features(PROTECTED_RECORDS)`.
 //!
 //! Readers use `[07]` while `26 00` is absent and the `22` records once it is
-//! present ([`lookup_v2`]). A crash before the commit leaves the blob exactly
-//! as it was; a second run finds `26 00` and writes nothing.
-// R3-625 wires publication, compaction and lookups to these entry points.
-#![cfg_attr(not(all(test, feature = "engine-rocksdb")), allow(dead_code))]
+//! present. A crash before the commit leaves the blob exactly as it was; a
+//! second run finds `26 00` and writes nothing.
+//!
+//! R3-625: the first `once` publication or compaction on a local store stages
+//! the migration under the kernel lock it already holds, then writes its own
+//! outcome as a `22` record and updates `26 00` ([`stage_outcome`],
+//! [`stage_compaction`]). Admission and lookup read the `22` records once
+//! `26 00` exists ([`shared_record`]).
+// Publication and compaction (the callers) are engine-rocksdb only.
+#![cfg_attr(not(feature = "engine-rocksdb"), allow(dead_code))]
 use super::*;
 use crate::storage::engine::{
     kernel::{Kernel, KernelGuard},
@@ -24,9 +30,10 @@ use crate::storage::engine::{
     txn::{Isolation, Transaction, TxnError},
 };
 use crate::task::records::{
-    LEDGER_HEADER_KEY, LedgerHeader, OUTCOME_PAYLOAD_BLANKED, OutcomePayload, OutcomeRecord,
-    outcome_key,
+    LEDGER_HEADER_KEY, LedgerHeader, NS_OUTCOME, OUTCOME_PAYLOAD_BLANKED, OutcomePayload,
+    OutcomeRecord, outcome_key,
 };
+use std::ops::Bound;
 
 /// What one migration attempt found.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,26 +102,167 @@ pub(crate) fn ledger_header(txn: &mut Transaction) -> Result<Option<LedgerHeader
         .transpose()
 }
 
+/// True for identities that carry a task (`02`) or undo (`03`) tag: native
+/// `once` identities start with `01` (`operations/once.rs` `key`).
+pub(super) fn reserved_identity(identity: &[u8]) -> bool {
+    matches!(
+        identity.first(),
+        Some(&crate::task::ledger::TASK_IDENTITY_TAG | &crate::task::ledger::UNDO_IDENTITY_TAG)
+    )
+}
+
+/// The `22` key of a native identity, in the identity's own domain.
+fn native_outcome_key(key: &NativeOnceKey) -> Vec<u8> {
+    outcome_key(key.database_domain.to_be_bytes(), &key.identity)
+}
+
+/// Decode the `22` value at `key`'s outcome key as a native record.
+fn decode_native(key: &NativeOnceKey, value: &[u8]) -> Result<NativeOnceRecord, CoreError> {
+    let record = OutcomeRecord::decode(value)?;
+    if record.identity != key.identity {
+        return Err(CoreError::Corrupt("outcome identity does not match its key".into()));
+    }
+    native_record(&record)
+}
+
+/// Latest committed `22` record for `key` (the shared ledger; `26 00` exists).
+pub(super) fn shared_record(db: &crate::storage::v2::V2Db, key: &NativeOnceKey) -> Result<Option<NativeOnceRecord>, CoreError> {
+    let mut txn = db.begin(Isolation::RepeatableRead);
+    let value = txn.get(Keyspace::Kernel, &native_outcome_key(key))?;
+    drop(txn);
+    value.map(|value| decode_native(key, &value)).transpose()
+}
+
 /// Latest committed record for `key`: from `[07]` while `26 00` is absent,
 /// from its `22` record once the ledger has been migrated.
+#[cfg(test)]
 pub(super) fn lookup_v2(db: &crate::storage::v2::V2Db, key: &NativeOnceKey) -> Result<Option<NativeOnceRecord>, CoreError> {
-    let mut txn = db.begin(Isolation::RepeatableRead);
-    if ledger_header(&mut txn)?.is_none() {
-        drop(txn);
-        return Ok(v2::read_v2_ledger(db)?.and_then(|ledger| ledger.retained(key).cloned()));
+    let (ledger, header) = v2::read_v2_view(db)?;
+    match header {
+        Some(_) => shared_record(db, key),
+        None => Ok(ledger.and_then(|ledger| ledger.retained(key).cloned())),
     }
-    let value = txn.get(Keyspace::Kernel, &outcome_key(key.database_domain.to_be_bytes(), &key.identity))?;
-    drop(txn);
-    match value {
-        None => Ok(None),
-        Some(value) => {
-            let record = OutcomeRecord::decode(&value)?;
-            if record.identity != key.identity {
-                return Err(CoreError::Corrupt("outcome identity does not match its key".into()));
-            }
-            native_record(&record).map(Some)
+}
+
+/// The header a shared-ledger write starts from: migrate `[07]` first (under
+/// the caller's kernel lock); a store that never had a ledger starts empty.
+/// The flag is true when this call staged the migration.
+pub(super) fn shared_header(guard: &mut KernelGuard<'_>) -> Result<(Option<LedgerHeader>, bool), CoreError> {
+    Ok(match stage_migration(guard)? {
+        Migration::NoLedger => (None, false),
+        Migration::AlreadyMigrated(header) => (Some(header), false),
+        Migration::Migrated(header) => (Some(header), true),
+    })
+}
+
+fn put_header(guard: &mut KernelGuard<'_>, header: &LedgerHeader) -> Result<(), CoreError> {
+    let txn = guard.transaction();
+    txn.put(Keyspace::Kernel, LEDGER_HEADER_KEY.to_vec(), header.encode())?;
+    txn.require_features(PROTECTED_RECORDS);
+    Kernel::touch(guard)
+}
+
+/// Stage one new outcome as a kind-1 `22` record and count it in `26 00`.
+/// Same rules as the v1 `insert_outcome`: the 1,024-identity cap (blanked
+/// identities count), retention 1..=7 days, payload <= 2 MiB and a valid
+/// GDOU receipt, and `retry_until = decided_upper + retention`. Returns the
+/// record the caller answers with.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stage_outcome(
+    guard: &mut KernelGuard<'_>,
+    header: &LedgerHeader,
+    key: &NativeOnceKey,
+    submitted: [u8; 32],
+    accepted: [u8; 32],
+    result: Vec<u8>,
+    retention_seconds: u64,
+    lease: NativeClockLease,
+) -> NativeResult<NativeOnceRecord> {
+    if key.identity.is_empty() || key.identity.len() > MAX_NATIVE_IDENTITY_BYTES || reserved_identity(&key.identity) {
+        return Err(NativeOnceError::RetentionUnavailable);
+    }
+    let raw_key = native_outcome_key(key);
+    if guard.transaction().get(Keyspace::Kernel, &raw_key).map_err(CoreError::from)?.is_some() {
+        return Err(NativeOnceError::IdempotencyConflict);
+    }
+    if !(1..=MAX_NATIVE_RETENTION_SECONDS).contains(&retention_seconds)
+        || result.is_empty()
+        || result.len() > MAX_NATIVE_RESULT_BYTES
+        || header.once_identities >= MAX_NATIVE_RECORDS as u64
+    {
+        return Err(NativeOnceError::RetentionUnavailable);
+    }
+    let retry_until_seconds = lease.upper_unix_seconds.checked_add(retention_seconds)
+        .ok_or(NativeOnceError::ClockUncertain)?;
+    let ms = |seconds: u64| seconds.checked_mul(1000).ok_or(NativeOnceError::ClockUncertain);
+    crate::operations::once::outcome::validate(&result)?;
+    let wide = crate::operations::once::outcome::is_wide(&result);
+    let record = OutcomeRecord {
+        flags: 0,
+        identity: key.identity.clone(),
+        request_fp: submitted,
+        accepted_fp: accepted,
+        decided_lower_ms: ms(lease.lower_unix_seconds)?,
+        decided_upper_ms: ms(lease.upper_unix_seconds)?,
+        retain_until_ms: ms(retry_until_seconds)?,
+        payload: OutcomePayload::Once(result),
+    };
+    let response = native_record(&record)?;
+    let txn = guard.transaction();
+    txn.put(Keyspace::Kernel, raw_key, record.encode()).map_err(CoreError::from)?;
+    if wide {
+        txn.require_features(crate::storage::engine::meta::WIDE_ONCE_RECEIPTS);
+    }
+    put_header(guard, &LedgerHeader {
+        once_upper_watermark_s: lease.upper_unix_seconds,
+        once_identities: header.once_identities + 1,
+        migrated_v1: header.migrated_v1,
+    })?;
+    Ok(response)
+}
+
+/// Blank every kind-1 `22` payload whose retry window ended before
+/// `lease.lower` (flags bit 0 set, payload emptied; identity, fingerprints
+/// and times kept, so the identity still counts and still answers Expired).
+/// Task outcomes (kinds 2-4) are never touched. Returns the count; on a
+/// nonzero count `26 00` takes the lease's upper bound as its watermark.
+pub(super) fn stage_compaction(
+    guard: &mut KernelGuard<'_>,
+    header: &LedgerHeader,
+    lease: NativeClockLease,
+) -> Result<usize, CoreError> {
+    let txn = guard.transaction();
+    let mut blanked = Vec::new();
+    for item in txn.scan(
+        Keyspace::Kernel,
+        Bound::Included(&[NS_OUTCOME][..]),
+        Bound::Excluded(&[NS_OUTCOME + 1][..]),
+        crate::storage::engine::kv::Direction::Forward,
+        None,
+    )? {
+        let (key, value) = item?;
+        let mut record = OutcomeRecord::decode(&value)?;
+        if !matches!(record.payload, OutcomePayload::Once(_))
+            || record.flags & OUTCOME_PAYLOAD_BLANKED != 0
+            || lease.lower_unix_seconds <= record.retain_until_ms / 1000
+        {
+            continue;
         }
+        record.flags |= OUTCOME_PAYLOAD_BLANKED;
+        record.payload = OutcomePayload::Once(Vec::new());
+        blanked.push((key, record));
     }
+    if blanked.is_empty() {
+        return Ok(0);
+    }
+    for (key, record) in &blanked {
+        txn.put(Keyspace::Kernel, key.clone(), record.encode())?;
+    }
+    put_header(guard, &LedgerHeader {
+        once_upper_watermark_s: lease.upper_unix_seconds,
+        ..header.clone()
+    })?;
+    Ok(blanked.len())
 }
 
 /// Stage the migration in the guarded transaction (the caller commits it).
@@ -155,6 +303,8 @@ pub(crate) fn stage_migration(guard: &mut KernelGuard<'_>) -> Result<Migration, 
 impl Admin {
     /// Run the migration in its own transaction. Refused (`Unsupported`) on a
     /// replicated store or a cluster gateway, like every protected record.
+    // Standalone admin entry point; publication and compaction migrate inline.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn migrate_native_once_v2(&self) -> Result<Migration, CoreError> {
         let inner = &self.inner;
         let Backend::V2(db) = &inner.backend else { return Err(CoreError::Unsupported) };

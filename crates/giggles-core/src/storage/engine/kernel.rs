@@ -208,6 +208,15 @@ impl Kernel {
         Self::stage_from(access, Some(before), after)
     }
 
+    /// Write the mutation stamp for kernel writes made outside `stage_from`
+    /// (the shared `once` ledger records, GD-0061 R3-625), so a later lock
+    /// holder with an older snapshot is refused or refreshed.
+    pub(crate) fn touch(access: &mut impl KernelAccess) -> Result<(), CoreError> {
+        let txn = access.guarded_transaction()?;
+        txn.put(Keyspace::Kernel, STAMP_KEY.to_vec(), Vec::new())?;
+        Ok(())
+    }
+
     pub(crate) fn stage_from(
         access: &mut impl KernelAccess,
         before: Option<&KernelImage>,

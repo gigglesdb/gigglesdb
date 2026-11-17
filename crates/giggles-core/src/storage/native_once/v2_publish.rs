@@ -39,28 +39,45 @@ impl SqlSession {
             inner.decision_point(DecisionPoint::WaitingLock)
         })?;
         if inner.fenced.load(Ordering::Acquire) { return Err(CoreError::Fenced.into()); }
-        let ledger = v2::read_v2_ledger(db).inspect_err(|_| { inner.fenced.store(true, Ordering::Release); })?;
-        let view = LedgerView { domain: u128::from_be_bytes(db.meta.domain), ledger: ledger.as_ref() };
+        let (ledger, header) = v2::read_v2_view(db).inspect_err(|_| { inner.fenced.store(true, Ordering::Release); })?;
+        let view = v2::v2_view(db, ledger.as_ref(), header);
         check_key(&view, &owner.key)?;
-        if let Some(record) = retained(&view, &owner.key) {
-            return replay(record, owner.submitted).map(|record| (record, true));
+        if let Some(record) = retained(&view, &owner.key)? {
+            return replay(&record, owner.submitted).map(|record| (record, true));
         }
         if !crate::cancellation::lock(&inner.native_once_owners)?.get(&owner.key)
             .is_some_and(|entry| Arc::ptr_eq(&entry.token, &owner.token)) {
             return Err(CoreError::Fenced.into());
         }
-        let lease = certify_lease(setup.image.0.native_outcomes.as_ref(), clock()?)?;
-        let mut after = setup.image.clone();
-        after.0.native_outcomes.get_or_insert_with(NativeOutcomes::default).insert_outcome(
-            owner.key.clone(), owner.submitted, accepted_fingerprint, result, retention_seconds, lease,
-        )?;
-        let response = retained(&LedgerView::borrow(&after.0), &owner.key).expect("accepted record").clone();
-        {
+        let (lease, response) = {
             // OnceSetup holds this covering lock already, so reacquisition cannot wait under the gate.
             let mut guard = Kernel::lock(self.v2_transaction.as_mut().expect("active transaction"), &db.kv,
                 None, &|| crate::cancellation::check().is_err())?;
-            Kernel::stage_from(&mut guard, setup.before.as_ref(), &after)?;
-        }
+            if db.task_kernel_unsupported() {
+                // A replicated store keeps the v1 `[07]` ledger (no protected records).
+                let lease = certify_lease(setup.image.0.native_outcomes.as_ref(), clock()?)?;
+                let mut after = setup.image.clone();
+                after.0.native_outcomes.get_or_insert_with(NativeOutcomes::default).insert_outcome(
+                    owner.key.clone(), owner.submitted, accepted_fingerprint, result, retention_seconds, lease,
+                )?;
+                let response = retained(&LedgerView::borrow(&after.0), &owner.key)?.expect("accepted record");
+                Kernel::stage_from(&mut guard, setup.before.as_ref(), &after)?;
+                (lease, response)
+            } else {
+                // Shared ledger (R3-625): migrate `[07]` in this transaction if
+                // needed, keep `[07]` as the empty v1 ledger beside the metadata,
+                // and write this outcome as a `22` record counted in `26 00`.
+                let (header, _) = v2_migrate::shared_header(&mut guard)?;
+                let header = header.unwrap_or_default();
+                let lease = certify_watermark(header.once_upper_watermark_s, clock()?)?;
+                let mut after = setup.image.clone();
+                after.0.native_outcomes = Some(NativeOutcomes::default());
+                Kernel::stage_from(&mut guard, setup.before.as_ref(), &after)?;
+                let response = v2_migrate::stage_outcome(&mut guard, &header, &owner.key, owner.submitted,
+                    accepted_fingerprint, result, retention_seconds, lease)?;
+                (lease, response)
+            }
+        };
         let point = *inner.crash.lock().map_err(|_| CoreError::Fenced)?;
         if point == CrashPoint::BeforeCommit { crash_now(); }
         if point == CrashPoint::ErrorBeforeCommit { return Err(CoreError::Storage("injected before commit".into()).into()); }

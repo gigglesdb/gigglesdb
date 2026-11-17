@@ -156,7 +156,8 @@ fn terminal_aborted_session_discards_sequences_features_and_prior_writes() {
     assert_eq!(admin.inner.sql_transactions.load(Ordering::Acquire), 0);
     assert!(admin.sql_session().execute("SELECT * FROM items WHERE n=10", &[], None).unwrap().rows.is_empty());
     let after_meta = meta::validate_meta(db(&admin).kv.as_ref()).unwrap();
-    assert_eq!(after_meta.features, before_meta.features | meta::NATIVE_OUTCOMES);
+    // R3-625: the outcome is a `22` record, so PROTECTED_RECORDS joins NATIVE_OUTCOMES.
+    assert_eq!(after_meta.features, before_meta.features | meta::NATIVE_OUTCOMES | meta::PROTECTED_RECORDS);
     assert_eq!(after_meta.subversion, 2);
     assert!(pending.lock().unwrap().is_empty());
     assert!(db(&admin).begin(Isolation::RepeatableRead).get(Keyspace::Seq, &counter_key).unwrap().is_none());

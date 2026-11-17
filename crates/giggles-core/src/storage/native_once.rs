@@ -17,13 +17,22 @@ mod v2_compact;
 struct LedgerView<'a> {
     domain: u128,
     ledger: Option<&'a NativeOutcomes>,
+    /// A v2 store whose ledger header `26 00` exists: identities live in
+    /// per-identity `22` records (GD-0061 R3-625) and `ledger` is unused.
+    shared: Option<SharedLedger<'a>>,
+}
+struct SharedLedger<'a> {
+    db: &'a crate::storage::v2::V2Db,
+    header: crate::task::records::LedgerHeader,
 }
 impl LedgerView<'_> {
     fn borrow(state: &State) -> LedgerView<'_> {
-        LedgerView { domain: state.view.domain, ledger: state.native_outcomes.as_ref() }
+        LedgerView { domain: state.view.domain, ledger: state.native_outcomes.as_ref(), shared: None }
     }
 }
 use receipt::certify_lease;
+#[cfg(feature = "engine-rocksdb")]
+use receipt::certify_watermark;
 
 pub(crate) const MAX_NATIVE_IDENTITY_BYTES: usize = 512;
 pub(crate) const MAX_NATIVE_RESULT_BYTES: usize = 2 * 1024 * 1024;
@@ -319,10 +328,25 @@ fn check_key(state: &LedgerView<'_>, key: &NativeOnceKey) -> NativeResult<()> {
     if key.identity.is_empty() || key.identity.len() > MAX_NATIVE_IDENTITY_BYTES {
         return Err(NativeOnceError::RetentionUnavailable);
     }
+    // On the shared ledger a once identity must not take a task or undo
+    // identity's tag, so the two kinds can never share a `22` key.
+    if state.shared.is_some() && v2_migrate::reserved_identity(&key.identity) {
+        return Err(NativeOnceError::RetentionUnavailable);
+    }
     Ok(())
 }
-fn retained<'a>(state: &LedgerView<'a>, key: &NativeOnceKey) -> Option<&'a NativeOnceRecord> {
-    state.ledger?.retained(key)
+fn retained(state: &LedgerView<'_>, key: &NativeOnceKey) -> NativeResult<Option<NativeOnceRecord>> {
+    match &state.shared {
+        Some(shared) => Ok(v2_migrate::shared_record(shared.db, key)?),
+        None => Ok(state.ledger.and_then(|ledger| ledger.retained(key)).cloned()),
+    }
+}
+/// Identities counted against [`MAX_NATIVE_RECORDS`]; blanked ones included.
+fn identities(state: &LedgerView<'_>) -> usize {
+    match &state.shared {
+        Some(shared) => usize::try_from(shared.header.once_identities).unwrap_or(usize::MAX),
+        None => state.ledger.map_or(0, |ledger| ledger.entries.len()),
+    }
 }
 fn replay(record: &NativeOnceRecord, submitted: [u8; 32]) -> NativeResult<NativeOnceRecord> {
     if record.submitted_fingerprint != submitted {
@@ -371,8 +395,8 @@ impl Admin {
     ) -> NativeResult<NativeOnceAdmission> {
         self.inner.native_once_view(|state| {
             check_key(state, &key)?;
-            if let Some(record) = retained(state, &key) {
-                return replay(record, submitted_fingerprint).map(NativeOnceAdmission::Replay);
+            if let Some(record) = retained(state, &key)? {
+                return replay(&record, submitted_fingerprint).map(NativeOnceAdmission::Replay);
             }
             let mut owners = crate::cancellation::lock(&self.inner.native_once_owners)?;
             if let Some(owner) = owners.get(&key) {
@@ -385,12 +409,7 @@ impl Admin {
             if owners.len() >= self.inner.limits.admitted {
                 return Err(CoreError::Busy.into());
             }
-            if state
-                .ledger
-                .map_or(0, |l| l.entries.len())
-                .saturating_add(owners.len())
-                >= MAX_NATIVE_RECORDS
-            {
+            if identities(state).saturating_add(owners.len()) >= MAX_NATIVE_RECORDS {
                 return Err(NativeOnceError::RetentionUnavailable);
             }
             let token = Arc::new(());
@@ -416,9 +435,9 @@ impl Admin {
     ) -> NativeResult<NativeOnceLookup> {
         self.inner.native_once_view(|state| {
             check_key(state, key)?;
-            if let Some(record) = retained(state, key) {
+            if let Some(record) = retained(state, key)? {
                 return Ok(if record.result.is_some() {
-                    NativeOnceLookup::Retained(record.clone())
+                    NativeOnceLookup::Retained(record)
                 } else {
                     NativeOnceLookup::Expired {
                         retry_until_seconds: record.retry_until_seconds,
@@ -497,8 +516,8 @@ impl SqlSession {
         let inner = self.admin.inner.clone();
         inner.native_once_locked(|state| {
             check_key(&LedgerView::borrow(state), &owner.key)?;
-            if let Some(record) = retained(&LedgerView::borrow(state), &owner.key) {
-                return replay(record, owner.submitted).map(|r| (r, true));
+            if let Some(record) = retained(&LedgerView::borrow(state), &owner.key)? {
+                return replay(&record, owner.submitted).map(|r| (r, true));
             }
             if !crate::cancellation::lock(&inner.native_once_owners)?
                 .get(&owner.key)
@@ -528,9 +547,8 @@ impl SqlSession {
             )?;
             // Result validation checks the stream without materializing the
             // application DTO. Finish response allocation before persistence.
-            let response = retained(&LedgerView::borrow(state), &owner.key)
-                .expect("accepted record")
-                .clone();
+            let response = retained(&LedgerView::borrow(state), &owner.key)?
+                .expect("accepted record");
             inner
                 .persist_checked(state, Some(&previous_relations), true, &mut || {
                     Instant::now() < lease.valid_until
@@ -546,3 +564,6 @@ mod tests;
 
 #[cfg(all(test, feature = "engine-rocksdb"))]
 mod v2_publish_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+mod v2_ledger_tests;

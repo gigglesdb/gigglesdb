@@ -166,11 +166,38 @@ pub(crate) fn required_bits_for_kernel_write(
             "protected records in a replicated database".into(),
         ));
     }
-    records::classify_key(key).map_err(corrupt)?;
+    let namespace = records::classify_key(key).map_err(corrupt)?;
+    let mut bits = super::meta::PROTECTED_RECORDS;
     if let Some(value) = value {
         records::validate(key, value).map_err(corrupt)?;
+        if namespace == records::Namespace::Outcome {
+            bits |= once_payload_bits(value)?;
+        }
     }
-    Ok(super::meta::PROTECTED_RECORDS)
+    Ok(bits)
+}
+
+/// The bits a native `once` receipt in a kind-1 `22` record needs, matching
+/// what `native_content` asks of the same receipt in `[07]` (GD-0061 R3-625):
+/// a valid GDOU payload, NATIVE_OUTCOMES, and WIDE_ONCE_RECEIPTS for a
+/// version 2 receipt. (The typed/temporal rule compares the receipt with the
+/// kernel metadata format, which this per-key gate does not see.) A blanked
+/// payload and task outcomes need nothing more.
+fn once_payload_bits(value: &[u8]) -> Result<u64, FormatError> {
+    let record = records::OutcomeRecord::decode(value).map_err(corrupt)?;
+    let records::OutcomePayload::Once(payload) = &record.payload else {
+        return Ok(0);
+    };
+    if payload.is_empty() {
+        return Ok(0);
+    }
+    use crate::operations::once::outcome;
+    outcome::validate(payload).map_err(corrupt)?;
+    let mut bits = super::meta::NATIVE_OUTCOMES;
+    if outcome::is_wide(payload) {
+        bits |= super::meta::WIDE_ONCE_RECEIPTS;
+    }
+    Ok(bits)
 }
 
 /// Raw Kernel entries in `0x20..0x2C` the open check inspects; full decoding

@@ -1,5 +1,4 @@
 use super::*;
-use crate::operations::{Bindings, Engine as NativeEngine, Request, once::*};
 use crate::storage::engine::meta;
 use crate::task::records::{self, Namespace};
 
@@ -26,20 +25,21 @@ fn db(admin: &Admin) -> &crate::storage::v2::V2Db {
 fn domain(admin: &Admin) -> u128 {
     u128::from_be_bytes(db(admin).meta.domain)
 }
-fn at(lower: u64, upper: u64) -> Result<OnceTime, OnceClockUnavailable> {
-    Ok(OnceTime { lower_unix_seconds: lower, upper_unix_seconds: upper,
-        valid_until: Instant::now() + Duration::from_secs(10) })
-}
-/// A real `once` insert of row `id`, retained for `retention` seconds.
-fn insert_once(admin: &Admin, engine: &NativeEngine, id: i64, retention: u64) -> OnceIdentity {
-    let identity = OnceIdentity { database_domain: domain(admin), tenant: 7, namespace: "orders".into(),
-        key: format!("order-{id}").into_bytes() };
-    let request = OnceRequest { contract_version: ONCE_CONTRACT_VERSION, retention_seconds: retention,
-        identity: identity.clone(),
-        body: OnceBody::Operation(Request::Insert { table: "items".into(), values: vec![
-            ("id".into(), crate::operations::ValueExpr::Literal(relational::Value::Int(id)))] }) };
-    engine.execute_once(&request, &Bindings::new(), &|| at(100, 110)).unwrap();
-    identity
+/// A v1 `[07]` ledger as V2ONCE wrote it (publication now writes `22`
+/// records, R3-625): one entry per retention, decided at [100, 110], then
+/// compacted at `compact_at` when given.
+fn v1_ledger(admin: &Admin, retentions: &[u64], compact_at: Option<(u64, u64)>) -> NativeOutcomes {
+    let mut v1 = NativeOutcomes::default();
+    for (n, retention) in retentions.iter().enumerate() {
+        let key = NativeOnceKey { database_domain: domain(admin), identity: vec![1, n as u8] };
+        v1.insert_outcome(key, [n as u8; 32], [2; 32], super::super::tests::terminal_payload(), *retention,
+            super::super::tests::clock(100, 110).unwrap()).unwrap();
+    }
+    if let Some((lower, upper)) = compact_at {
+        v1.compact(super::super::tests::clock(lower, upper).unwrap());
+    }
+    seed(admin, &v1);
+    v1
 }
 fn kernel_get(admin: &Admin, key: &[u8]) -> Option<Vec<u8>> {
     db(admin).begin(Isolation::RepeatableRead).get(Keyspace::Kernel, key).unwrap()
@@ -83,12 +83,8 @@ fn assert_moved(admin: &Admin, before: &NativeOutcomes) {
 #[test]
 fn all_entries_and_tombstones_move() {
     let (_dir, admin) = fixture();
-    let engine = NativeEngine::new(admin.clone());
-    insert_once(&admin, &engine, 1, 10);
-    insert_once(&admin, &engine, 2, 10);
-    insert_once(&admin, &engine, 3, 600);
     // Retry window of the two short entries ends at 120; compaction blanks them.
-    assert_eq!(engine.compact_outcomes(&|| at(121, 125)), Ok(2));
+    v1_ledger(&admin, &[10, 10, 600], Some((121, 125)));
     let before = ledger(&admin);
     assert_eq!(before.entries.len(), 3);
     assert_eq!(before.entries.values().filter(|e| e.record.result.is_none()).count(), 2);
@@ -143,9 +139,7 @@ fn watermark_and_count_preserved() {
 #[test]
 fn crash_before_commit_leaves_blob() {
     let (dir, admin) = fixture();
-    let engine = NativeEngine::new(admin.clone());
-    insert_once(&admin, &engine, 1, 10);
-    insert_once(&admin, &engine, 2, 600);
+    v1_ledger(&admin, &[10, 600], None);
     let blob = kernel_get(&admin, &[7]).unwrap();
     let visible = db(&admin).sequencer.visible_ts();
     admin.set_crash_point(CrashPoint::ErrorBeforeCommit).unwrap();
@@ -159,7 +153,6 @@ fn crash_before_commit_leaves_blob() {
     }
     assert_eq!(features(&admin) & PROTECTED_RECORDS, 0);
     // Reopened, the store is the unmigrated one, and the next run moves it.
-    drop(engine);
     drop(admin);
     let admin = Admin::open(&dir.0, Limits::default()).unwrap();
     assert_eq!(kernel_get(&admin, &[7]).unwrap(), blob);
@@ -175,8 +168,7 @@ fn second_run_is_noop() {
     assert_eq!(admin.migrate_native_once_v2().unwrap(), Migration::NoLedger);
     assert_eq!(db(&admin).sequencer.visible_ts(), visible);
     assert_eq!(kernel_get(&admin, &LEDGER_HEADER_KEY), None);
-    let engine = NativeEngine::new(admin.clone());
-    insert_once(&admin, &engine, 1, 10);
+    v1_ledger(&admin, &[10], None);
     let Migration::Migrated(header) = admin.migrate_native_once_v2().unwrap() else { panic!("migrated") };
     let visible = db(&admin).sequencer.visible_ts();
     assert_eq!(admin.migrate_native_once_v2().unwrap(), Migration::AlreadyMigrated(header));
@@ -187,13 +179,9 @@ fn second_run_is_noop() {
 #[test]
 fn open_checks_pass_after_migration() {
     let (dir, admin) = fixture();
-    let engine = NativeEngine::new(admin.clone());
-    insert_once(&admin, &engine, 1, 10);
-    insert_once(&admin, &engine, 2, 600);
-    assert_eq!(engine.compact_outcomes(&|| at(121, 125)), Ok(1));
+    v1_ledger(&admin, &[10, 600], Some((121, 125)));
     let before = ledger(&admin);
     assert!(matches!(admin.migrate_native_once_v2().unwrap(), Migration::Migrated(_)));
-    drop(engine);
     drop(admin);
     // Open runs the bounded protected scan and the native content check.
     let admin = Admin::open(&dir.0, Limits::default()).unwrap();

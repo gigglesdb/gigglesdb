@@ -5,9 +5,18 @@ pub(super) fn certify_lease(
     ledger: Option<&NativeOutcomes>,
     lease: NativeClockLease,
 ) -> NativeResult<NativeClockLease> {
+    certify_watermark(ledger.map_or(0, |l| l.upper_watermark_unix_seconds), lease)
+}
+
+/// Certify `lease` against an upper watermark (the v1 ledger's, or the shared
+/// ledger header's `once_upper_watermark_s`).
+pub(super) fn certify_watermark(
+    watermark: u64,
+    lease: NativeClockLease,
+) -> NativeResult<NativeClockLease> {
     let now = Instant::now();
     if lease.lower_unix_seconds > lease.upper_unix_seconds
-        || lease.upper_unix_seconds < ledger.map_or(0, |l| l.upper_watermark_unix_seconds)
+        || lease.upper_unix_seconds < watermark
         || lease.valid_until <= now
         || now
             .checked_add(Duration::from_secs(MAX_NATIVE_CLOCK_LEASE_SECONDS))

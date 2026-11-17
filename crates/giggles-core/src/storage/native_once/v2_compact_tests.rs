@@ -24,6 +24,14 @@ fn request(admin: &Admin) -> OnceRequest {
             tenant: 1, namespace: "compact".into(), key: vec![1] },
         body: OnceBody::Operation(Request::Insert { table: "items".into(), values: vec![("id".into(), crate::operations::ValueExpr::Literal(relational::Value::Int(1)))] }) }
 }
+/// The kind-1 `22` records (R3-625: the shared ledger holds the outcomes).
+fn once_records(txn: &mut crate::storage::engine::txn::Transaction) -> Vec<crate::task::records::OutcomeRecord> {
+    use crate::task::records::{NS_OUTCOME, OutcomePayload, OutcomeRecord};
+    txn.scan(Keyspace::Kernel, std::ops::Bound::Included(&[NS_OUTCOME][..]),
+        std::ops::Bound::Excluded(&[NS_OUTCOME + 1][..]), crate::storage::engine::kv::Direction::Forward, None)
+        .unwrap().map(|item| OutcomeRecord::decode(&item.unwrap().1).unwrap())
+        .filter(|record| matches!(record.payload, OutcomePayload::Once(_))).collect()
+}
 fn start(admin: &Admin) -> (NativeEngine, OnceRequest) {
     let engine = NativeEngine::new(admin.clone()); let request = request(admin);
     engine.execute_once(&request, &Bindings::new(), &|| at(100, 110)).unwrap();
@@ -33,13 +41,15 @@ fn start(admin: &Admin) -> (NativeEngine, OnceRequest) {
 fn boundary_expiry_reopen_watermark_and_pinned_gc() {
     let (dir, admin) = fixture(); let (engine, request) = start(&admin);
     let mut pinned = db(&admin).begin(Isolation::RepeatableRead);
-    let prior = pinned.get(Keyspace::Kernel, &[7]).unwrap().unwrap();
+    let prior = once_records(&mut pinned);
+    assert_eq!(prior.len(), 1);
+    assert_eq!(prior[0].flags, 0);
     let visible = db(&admin).sequencer.visible_ts();
     assert_eq!(engine.compact_outcomes(&|| at(120, 125)), Ok(0));
     assert_eq!(db(&admin).sequencer.visible_ts(), visible);
     assert!(matches!(engine.outcome(&request.identity), Ok(OnceStatus::Retained(_))));
     assert_eq!(engine.compact_outcomes(&|| at(121, 125)), Ok(1));
-    assert_eq!(pinned.get(Keyspace::Kernel, &[7]).unwrap(), Some(prior));
+    assert_eq!(once_records(&mut pinned), prior);
     assert_eq!(engine.outcome(&request.identity), Ok(OnceStatus::Expired { retry_until_seconds: 120 }));
     let visible = db(&admin).sequencer.visible_ts();
     assert_eq!(engine.execute_once(&request, &Bindings::new(), &|| panic!("body must not run")),
@@ -50,8 +60,14 @@ fn boundary_expiry_reopen_watermark_and_pinned_gc() {
     gc.advance().unwrap();
     while !gc.step(Keyspace::Kernel, 100).unwrap().wrapped {}
     let mut latest = db(&admin).begin(Isolation::RepeatableRead);
+    let records = once_records(&mut latest);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].flags, crate::task::records::OUTCOME_PAYLOAD_BLANKED);
+    assert_eq!(records[0].identity, prior[0].identity);
+    assert_eq!(records[0].retain_until_ms, 120_000);
+    // `[07]` stays the empty v1 ledger beside `26 00`.
     let bytes = latest.get(Keyspace::Kernel, &[7]).unwrap().unwrap();
-    assert!(NativeOutcomes::from_bytes(&bytes).unwrap().entries.values().all(|e| e.record.result.is_none()));
+    assert!(NativeOutcomes::from_bytes(&bytes).unwrap().is_empty());
     drop(latest); drop(gc); drop(engine); drop(admin);
     let admin = Admin::open(&dir.0, Limits::default()).unwrap(); let engine = NativeEngine::new(admin.clone());
     assert_eq!(engine.outcome(&request.identity), Ok(OnceStatus::Expired { retry_until_seconds: 120 }));
