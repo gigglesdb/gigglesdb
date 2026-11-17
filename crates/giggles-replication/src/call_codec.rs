@@ -41,6 +41,7 @@ pub enum GatewayReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeCall {
     Status,
+    HostRange(RangeDescriptor),
 }
 
 /// A replica's Raft role (a pre-candidate reports as candidate).
@@ -116,6 +117,7 @@ pub enum PeerReply {
     Range(RangeReply),
     Gateway(GatewayReply),
     Node(NodeReport),
+    Hosted(bool),
 }
 
 fn corrupt(what: &str) -> RangeError {
@@ -694,6 +696,10 @@ pub fn encode_call(call: &PeerCall) -> Result<Vec<u8>, RangeError> {
             }
         },
         PeerCall::Node(NodeCall::Status) => w.u8(48),
+        PeerCall::Node(NodeCall::HostRange(desc)) => {
+            w.u8(49);
+            w.descriptor(desc)?;
+        }
     }
     Ok(w.0)
 }
@@ -722,6 +728,7 @@ pub fn decode_call(bytes: &[u8]) -> Result<PeerCall, RangeError> {
         35 => PeerCall::Gateway(GatewayCall::CancelWait(r.txn()?)),
         36 => PeerCall::Gateway(GatewayCall::TxnLive(r.txn()?)),
         48 => PeerCall::Node(NodeCall::Status),
+        49 => PeerCall::Node(NodeCall::HostRange(r.descriptor()?)),
         tag => PeerCall::Range(range_call(tag, &mut r)?),
     };
     r.finish(call)
@@ -1037,6 +1044,11 @@ pub fn encode_reply(reply: &Result<PeerReply, RangeError>) -> Result<Vec<u8>, Ra
             w.u8(34);
             w.u8(u8::from(*live));
         }
+        Ok(PeerReply::Hosted(created)) => {
+            w.u8(0);
+            w.u8(49);
+            w.u8(u8::from(*created));
+        }
         Ok(PeerReply::Node(report)) => {
             w.u8(0);
             w.u8(48);
@@ -1064,6 +1076,7 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Result<PeerReply, RangeError>, Range
             33 => PeerReply::Gateway(GatewayReply::Blockers(r.txns()?)),
             34 => PeerReply::Gateway(GatewayReply::Live(r.flag()?)),
             48 => PeerReply::Node(node_report(&mut r)?),
+            49 => PeerReply::Hosted(r.flag()?),
             tag => PeerReply::Range(range_reply(tag, &mut r)?),
         })
     };

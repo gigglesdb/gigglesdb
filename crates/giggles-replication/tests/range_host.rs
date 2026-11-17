@@ -553,3 +553,32 @@ fn store_backed_hosts_open_engines_on_leaders_fence_on_isolation_and_reopen() {
     drop(c);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn learner_waits_for_snapshot_with_empty_voters_across_restart() {
+    let dir = temp_dir();
+    let store = Arc::new(RangeStore::create(dir.join("data"), CLUSTER).unwrap());
+    let config = RangeHostConfig {
+        node_id: 4, cluster: CLUSTER, log_dir: dir.join("log"), snap_dir: dir.join("snap"),
+        tick: Duration::from_millis(10), policy: None, liveness: None,
+    };
+    let network = Arc::new(MemNet {
+        node: 4, sinks: Arc::default(), blocked: Arc::default(), snaps: Default::default(),
+    });
+    let mut desc = descriptors()[0].clone();
+    let host = RangeHost::open(config.clone(), network.clone(), store.clone(), None).unwrap();
+    assert!(host.host_learner(&desc).is_err());
+    assert!(host.groups().is_empty());
+    desc.replicas.push(ReplicaDesc { node: 4, role: ReplicaRole::Learner });
+    assert!(host.host_learner(&desc).unwrap());
+    assert!(!host.host_learner(&desc).unwrap());
+    assert!(store.needs_snapshot(desc.id).unwrap());
+    assert!(host.group(desc.id).unwrap().membership_status().unwrap().conf.voters.is_empty());
+    drop(host);
+    let host = RangeHost::open(config, network, store.clone(), None).unwrap();
+    assert!(host.group(desc.id).unwrap().membership_status().unwrap().conf.voters.is_empty());
+    assert!(store.needs_snapshot(desc.id).unwrap());
+    drop(host);
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
+}

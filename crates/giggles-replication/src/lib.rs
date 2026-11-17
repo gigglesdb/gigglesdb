@@ -24,6 +24,7 @@ pub mod range_role;
 pub mod range_state;
 pub mod registry;
 pub mod replace;
+pub mod move_range;
 pub mod role;
 pub mod route;
 pub mod sink;

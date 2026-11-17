@@ -312,6 +312,14 @@ impl StatusService {
 }
 
 impl NodeService for StatusService {
+    fn host_range(&self, desc: RangeDescriptor) -> std::result::Result<bool, RangeError> {
+        self.host
+            .upgrade()
+            .ok_or_else(|| RangeError::Unavailable("host stopped".into()))?
+            .host_learner(&desc)
+            .map_err(|e| RangeError::Unavailable(e.to_string()))
+    }
+
     fn status(&self) -> NodeReport {
         self.report()
     }

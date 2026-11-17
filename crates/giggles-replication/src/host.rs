@@ -232,6 +232,33 @@ impl RangeHost {
             .ok_or_else(|| Error::Identity("range host is stopped".into()))
     }
 
+    /// Starts a learner with no bootstrap voters, ready for the leader's snapshot.
+    pub fn host_learner(&self, desc: &RangeDescriptor) -> Result<bool> {
+        let inner = &self.inner;
+        let stopped = inner.stopped.lock().expect("range host mutex poisoned");
+        if *stopped {
+            return Err(Error::Identity("range host is stopped".into()));
+        }
+        if inner.group(desc.id).is_some() {
+            return Ok(false);
+        }
+        if !desc
+            .replicas
+            .iter()
+            .any(|r| r.node == self.node_id() && r.role == ReplicaRole::Learner)
+        {
+            return Err(Error::Identity("hosting requires a local learner".into()));
+        }
+        let store = inner
+            .roles
+            .store()
+            .ok_or_else(|| Error::Identity("range host has no range store".into()))?;
+        store.create_needs_snapshot(desc).map_err(core)?;
+        let handle = inner.create_group(desc.id, &[])?;
+        inner.roles.start(desc.id, handle, inner.config.tick);
+        Ok(true)
+    }
+
     /// Splits `range` at `at_key` (GD-0075 R5-80): the range keeps `[start, at_key)`
     /// and the new range `right` gets `[at_key, end)`, both at the next epoch. Only on
     /// the range's current leader; the split entry is proposed at the stored
@@ -369,7 +396,21 @@ impl Inner {
             .filter(|r| r.role == ReplicaRole::Voter)
             .map(|r| r.node)
             .collect();
-        let handle = self.create_group(descriptor.id, &voters)?;
+        let needs_snapshot = match self.roles.store() {
+            Some(store) => store.needs_snapshot(descriptor.id).map_err(core)?,
+            None => false,
+        };
+        let awaiting_learner = descriptor
+            .replicas
+            .iter()
+            .any(|r| r.node == self.config.node_id && r.role == ReplicaRole::Learner)
+            && !descriptor
+                .replicas
+                .iter()
+                .any(|r| r.node == self.config.node_id && r.role == ReplicaRole::Voter)
+            && needs_snapshot;
+        let handle =
+            self.create_group(descriptor.id, if awaiting_learner { &[] } else { &voters })?;
         self.roles
             .start(descriptor.id, handle.clone(), self.config.tick);
         Ok(Some(handle))

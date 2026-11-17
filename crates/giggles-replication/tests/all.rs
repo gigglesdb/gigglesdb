@@ -177,3 +177,6 @@ mod registry;
 mod registry_join;
 #[path = "range_conf.rs"]
 mod range_conf;
+
+#[path = "range_move.rs"]
+mod range_move;

@@ -452,6 +452,17 @@ impl RangeStore {
         Ok(true)
     }
 
+    /// Whether this range is fenced while waiting for a snapshot install.
+    pub fn needs_snapshot(&self, range: RangeId) -> Result<bool, CoreError> {
+        Ok(self
+            .kv()
+            .get(
+                Keyspace::Meta,
+                &range_local_key(range, &RangeLocalKey::Install),
+            )?
+            .is_some())
+    }
+
     /// The install fences; run under the range's apply lock before the marker is written.
     fn can_install(&self, range: RangeId, manifest: &Manifest) -> Result<(), CoreError> {
         if manifest.range != range {

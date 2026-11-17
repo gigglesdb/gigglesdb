@@ -226,6 +226,7 @@ fn calls() -> Vec<PeerCall> {
         PeerCall::Gateway(GatewayCall::CancelWait(txn)),
         PeerCall::Gateway(GatewayCall::TxnLive(txn)),
         PeerCall::Node(NodeCall::Status),
+        PeerCall::Node(NodeCall::HostRange(desc())),
     ]);
     out
 }
@@ -314,6 +315,8 @@ fn replies() -> Vec<Result<PeerReply, RangeError>> {
     .collect();
     out.extend([
         Ok(PeerReply::Gateway(GatewayReply::Done)),
+        Ok(PeerReply::Hosted(true)),
+        Ok(PeerReply::Hosted(false)),
         Ok(PeerReply::Gateway(GatewayReply::Live(true))),
         Ok(PeerReply::Gateway(GatewayReply::Live(false))),
         Ok(PeerReply::Node(node_report())),
@@ -380,6 +383,7 @@ fn unknown_tags_and_huge_counts_are_rejected() {
     assert!(decode_call(&[1, 37]).is_err());
     assert!(decode_call(&[1, 49]).is_err());
     assert!(decode_reply(&[1, 0, 49]).is_err());
+    assert!(decode_reply(&[1, 0, 49, 2]).is_err());
     assert!(decode_reply(&[1, 0, 0]).is_err());
     assert!(decode_reply(&[1, 1, 10]).is_err());
     assert!(decode_reply(&[1, 2]).is_err());

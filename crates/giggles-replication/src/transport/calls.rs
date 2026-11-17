@@ -136,6 +136,19 @@ impl PeerCalls {
         }
     }
 
+    /// Idempotently asks a peer to start an empty learner group.
+    pub fn host_range(
+        &self,
+        node: u64,
+        desc: giggles_core::range_api::RangeDescriptor,
+    ) -> std::result::Result<bool, RangeError> {
+        let timeout = self.limits.read().unwrap().timeout;
+        match self.call(node, PeerCall::Node(NodeCall::HostRange(desc)), timeout)? {
+            PeerReply::Hosted(created) => Ok(created),
+            _ => Err(RangeError::Corrupt("expected hosting reply".into())),
+        }
+    }
+
     /// Queues `call` without waiting for its reply (a deadlock probe).
     pub fn send(&self, node: u64, call: PeerCall) -> std::result::Result<(), RangeError> {
         self.enqueue(node, &call, None).map(drop)
@@ -351,6 +364,12 @@ async fn connection(peers: Arc<Peers>, node: u64, mut rx: mpsc::Receiver<Outgoin
 /// Answers `NodeCall::Status` (R5-64): every range this node replicates.
 pub trait NodeService: Send + Sync {
     fn status(&self) -> NodeReport;
+    fn host_range(
+        &self,
+        _desc: giggles_core::range_api::RangeDescriptor,
+    ) -> std::result::Result<bool, RangeError> {
+        Err(RangeError::Unavailable("range hosting unavailable".into()))
+    }
 }
 
 /// Server side: the registered handlers and the bounded worker pool.
@@ -448,7 +467,7 @@ impl CallServer {
         tx: &mpsc::Sender<(u64, Vec<u8>)>,
     ) {
         let call = match call_codec::decode_call(body) {
-            Ok(PeerCall::Range(_) | PeerCall::Gateway(_)) if node_only => {
+            Ok(call) if node_only && !matches!(call, PeerCall::Node(NodeCall::Status)) => {
                 let refused = Err(RangeError::Unavailable("not a peer node".into()));
                 let _ = tx.send((id, reply_body(&refused))).await;
                 return;
@@ -511,6 +530,12 @@ fn handle(handlers: &Handlers, call: PeerCall) -> Reply {
                 GatewayCall::TxnLive(txn) => GatewayReply::Live(gateway.txn_live(txn)),
             }))
         }
+        PeerCall::Node(NodeCall::HostRange(desc)) => handlers
+            .node
+            .as_ref()
+            .ok_or_else(|| missing("node hosting"))?
+            .host_range(desc)
+            .map(PeerReply::Hosted),
         PeerCall::Node(NodeCall::Status) => {
             let node = handlers.node.as_ref().ok_or_else(|| missing("node status"))?;
             Ok(PeerReply::Node(node.status()))
@@ -526,5 +551,33 @@ fn reply_body(reply: &Reply) -> Vec<u8> {
             "peer call reply exceeds the frame limit".into(),
         )))
         .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn own_certificate_cannot_host_ranges() {
+        let desc = giggles_core::range_api::RangeDescriptor {
+            id: giggles_core::range_api::RangeId(2),
+            epoch: giggles_core::range_api::Epoch(1), start: vec![], end: None,
+            replicas: vec![giggles_core::range_api::ReplicaDesc {
+                node: 4, role: giggles_core::range_api::ReplicaRole::Learner,
+            }],
+        };
+        let server = CallServer::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        let body = call_codec::encode_call(&PeerCall::Node(NodeCall::HostRange(desc))).unwrap();
+        server.start(1, &body, true, &tx).await;
+        let (_, reply) = rx.recv().await.unwrap();
+        assert_eq!(call_codec::decode_reply(&reply).unwrap(),
+            Err(RangeError::Unavailable("not a peer node".into())));
+        let body = call_codec::encode_call(&PeerCall::Node(NodeCall::Status)).unwrap();
+        server.start(2, &body, true, &tx).await;
+        let (_, reply) = rx.recv().await.unwrap();
+        assert_eq!(call_codec::decode_reply(&reply).unwrap(),
+            Err(RangeError::Unavailable("no node status handler on this node".into())));
     }
 }
