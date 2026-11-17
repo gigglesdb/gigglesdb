@@ -3259,7 +3259,25 @@ impl SqlSession {
         p.transaction.is_none() || p.transaction == self.transaction_id
     }
 
+    /// Parses and binds a statement. In a task session the task's column
+    /// rules (R3-303) run here too, before anything describes or binds the
+    /// statement's columns: a hidden column and a nonexistent one get the same
+    /// rule error, never a binder error (42703, an unknown function, a type
+    /// error) that tells them apart (design-3 section 2, call site 1). A
+    /// session without a task does no extra work.
     pub fn prepare(&mut self, sql: &str) -> Result<relational::Prepared, CoreError> {
+        let p = self.prepare_unruled(sql)?;
+        if self.task.is_none() {
+            return Ok(p);
+        }
+        // A refusal here is the statement's outcome in the read log
+        // (R3-309), when the caller set its text first.
+        self.task_column_rules(&p).inspect_err(|error| {
+            self.log_unstarted_task_failure(p.task_class(), p.parameter_count(), error);
+            self.abort();
+        })
+    }
+    fn prepare_unruled(&mut self, sql: &str) -> Result<relational::Prepared, CoreError> {
         if let Backend::V2(db) = &self.admin.inner.backend {
             return self.prepare_v2(sql, u128::from_be_bytes(db.meta.domain));
         }

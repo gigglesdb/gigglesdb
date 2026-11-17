@@ -482,8 +482,15 @@ const REQUEUED: [&str; 6] = ["queued", "failed", "queued", "failed", "queued", "
 fn commit(f: &Fixture, op: &str, text: &str) -> Result<Receipt, TaskError> {
     let mut agent = f.agent();
     let ctx = agent.task().unwrap().clone();
+    // The column rules run at prepare too (design-3 call site 1), so a
+    // refused statement is refused there, before the commit is attempted.
+    let statement = match agent.prepare(text) {
+        Ok(statement) => statement,
+        Err(CoreError::Task(e)) => return Err(e),
+        Err(e) => panic!("{text}: {e:?}"),
+    };
     let request = ProtectedRequest::Direct {
-        statement: agent.prepare(text).unwrap(),
+        statement,
         params: Vec::new(),
         text: Arc::from(text),
     };

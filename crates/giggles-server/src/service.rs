@@ -1257,6 +1257,14 @@ impl Session {
             }
         }
         self.authority_scope(|session| {
+            // GD-0061: a task session admits the statement's class before the
+            // prepare-time column rules run, as on the agent pgwire path (an
+            // UPDATE without OPERATION is 42T04, not a column-rule error).
+            if session.sql.task().is_some()
+                && let Ok(class) = Prepared::task_class_of_sql(sql)
+            {
+                session.admit_backstop(class)?;
+            }
             if relational::Copy::is_copy(sql) {
                 session.authorize_copy_sql(sql)?;
                 let result = relational::Copy::parse(sql).map_err(CoreError::Sql);
@@ -1338,6 +1346,17 @@ impl Session {
                         .map_err(|error| parse_error(session, error))?,
                     declared_types,
                 )?;
+                // The committed-catalog session has no task: run the task's
+                // column rules before describe binds the columns, as
+                // SqlSession::prepare does (no 42703 vs rule-error oracle).
+                let p = if session.sql.task().is_some() {
+                    session
+                        .sql
+                        .task_column_rules(&p)
+                        .inspect_err(|_| session.sql.abort())?
+                } else {
+                    p
+                };
                 session.sql.describe(&p)?;
                 p
             } else {

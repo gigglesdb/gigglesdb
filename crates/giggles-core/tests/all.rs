@@ -508,3 +508,4 @@ mod pgparity_typeof;
 #[path = "task_release.rs"] mod task_release;
 #[path = "task_readlog.rs"] mod task_readlog;
 #[path = "task_protected_commit.rs"] mod task_protected_commit;
+#[path = "task_prepare_rules.rs"] mod task_prepare_rules;
