@@ -227,6 +227,8 @@ pub struct Service {
     agent: std::sync::Mutex<crate::agent::bindings::AgentCredentials>,
     outcome_retention_ms: std::sync::atomic::AtomicU64,
     pub(crate) admission: crate::admission::Admission,
+    /// GD-0061 R3-403: agent requests take a slot here before `Blocking::admit`.
+    pub(crate) agent_admission: crate::agent::limits::AgentAdmission,
 }
 struct Credentials {
     next: u64,
@@ -275,6 +277,17 @@ impl Service {
                 (fp, (entry, next))
             })
             .collect();
+        // GD-0061 R3-403: core's default ceiling, min(8, admitted / 2), and the
+        // agent admission sized to match it.
+        let agent_admission = crate::agent::limits::AgentAdmission::default();
+        let mut agent_limits = agent_admission.limits();
+        if let Some(n) = (1..=agent_limits.max_concurrent_statements)
+            .rev()
+            .find(|n| admin.set_agent_statement_ceiling(*n).is_ok())
+        {
+            agent_limits.max_concurrent_statements = n;
+            agent_admission.apply(agent_limits);
+        }
         Ok(Arc::new(Self {
             advisory: crate::advisory::Locks::default(),
             blocking: crate::blocking::Blocking::new(),
@@ -293,6 +306,7 @@ impl Service {
                 crate::agent::DEFAULT_OUTCOME_RETENTION_MS,
             ),
             admission: crate::admission::Admission::new(limits)?,
+            agent_admission,
             admin,
             clock,
         }))
@@ -303,6 +317,31 @@ impl Service {
         limits: crate::admission::RoleStatementLimits,
     ) -> Result<(), CoreError> {
         self.admission.set_role_limits(limits)
+    }
+    /// GD-0061 R3-403: installs the `agent` load settings, at startup and on
+    /// reload. Refuses (`CoreError::Limit`, prior settings kept) a ceiling of 0,
+    /// above `MAX_BLOCKING / 2` or above half the engine's admitted operations.
+    /// Chunk settings apply to task sessions opened afterwards.
+    pub fn set_agent_limits(&self, limits: crate::agent::AgentLimits) -> Result<(), CoreError> {
+        limits.validate().map_err(|_| CoreError::Limit)?;
+        self.admin
+            .set_agent_statement_ceiling(limits.max_concurrent_statements)?;
+        self.agent_admission.apply(limits);
+        Ok(())
+    }
+    /// The `agent` load settings in force.
+    pub fn agent_limits(&self) -> crate::agent::AgentLimits {
+        self.agent_admission.limits()
+    }
+    /// For tests: agent requests holding an agent slot now.
+    #[doc(hidden)]
+    pub fn agent_requests_admitted(&self) -> usize {
+        self.agent_admission.held()
+    }
+    /// For tests: blocking-pool permits held now, by any listener.
+    #[doc(hidden)]
+    pub fn blocking_permits_held(&self) -> usize {
+        self.blocking.in_use()
     }
     pub fn set_statement_gate(&self, gate: StatementGate) -> Result<(), StatementGate> {
         self.statement_gate.set(gate)
@@ -682,6 +721,8 @@ impl Service {
         let ctx = open_context(&sql, &name, &role.name, digest, now, retention)
             .map_err(|_| refused())?;
         sql.bind_task(ctx)?;
+        let chunk = self.agent_admission.limits();
+        sql.set_disclosure_chunk(chunk.disclosure_chunk_rows, chunk.disclosure_chunk_bytes);
         let mut session = Session {
             surface: Surface::Native,
             backend_pid: 0,
@@ -736,7 +777,7 @@ pub struct Session {
     // Trusted pgwire sessions pin role identity without a certificate binding.
     fingerprint_bound: bool,
     // An agent (task) session: bound through the agent map, never the ordinary one.
-    agent: bool,
+    pub(crate) agent: bool,
     // Set only by `execute_protected` while the protected seam runs; the
     // `authorize` backstop lets a task session's UPDATE through only then.
     in_protected: bool,

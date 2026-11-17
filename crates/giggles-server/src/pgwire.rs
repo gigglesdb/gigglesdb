@@ -2562,25 +2562,37 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                     || (tag == b'S' && state.implicit && !session.is_aborted()),
             )
         });
+        // GD-0061 R3-403: an agent request takes an agent slot first, with no
+        // queue (54T01 when full), then the role pool and the blocking pool.
+        // Release is the reverse: blocking and role permits, then the slot.
+        let agent_slot = if session.agent {
+            session.service.agent_admission.try_admit().map(Some)
+        } else {
+            Ok(None)
+        };
         // GD-0075 R5-103: the role's statement pool sits in front of the
         // service-wide blocking pool; only COPY retains it between frames.
-        let role_admission =
-            if matches!(tag, b'Q' | b'E') && !session.is_aborted() && !state.drain
+        let role_admission = if agent_slot.is_err() {
+                // The refusal ends any COPY, so its retained role permit goes too.
+                state.copy_permit = None;
+                Ok(None)
+            } else if matches!(tag, b'Q' | b'E') && !session.is_aborted() && !state.drain
                 && state.copy.is_none() && !state.admission_exempt(tag, &b) {
                 let admission = &session.service.admission;
                 admission.statement(&session.role, Some(&active.context)).await.map(Some)
             } else {
                 Ok(state.copy_permit.take())
             };
-        let admitted = match role_admission {
-            Ok(role) => blocking
+        let admitted = match (agent_slot, role_admission) {
+            (Err(e), _) => Err((crate::service::sqlstate(&e), None)),
+            (Ok(agent_slot), Ok(role)) => blocking
                 .admit(&active.context)
                 .await
-                .map(|permit| (role, permit))
+                .map(|permit| (agent_slot, role, permit))
                 .map_err(|e| (crate::service::sqlstate(&e), None)),
-            Err(refusal) => Err((refusal.sqlstate(), Some(refusal.message()))),
+            (Ok(_), Err(refusal)) => Err((refusal.sqlstate(), Some(refusal.message()))),
         };
-        let (role_permit, permit) = match admitted {
+        let (agent_slot, role_permit, permit) = match admitted {
             Ok(admitted) => admitted,
             Err((code, message)) => {
                 session.abort();
@@ -2648,6 +2660,8 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
             first: state.copy.is_none(),
         });
         let work = async move { tokio::task::spawn_blocking(move || {
+            // Dropped last, after `execution_admission` (R3-403 release order).
+            let _agent_slot = agent_slot;
             let mut out = Vec::new();
             let keep = match active.context.scope(|| {
                 active

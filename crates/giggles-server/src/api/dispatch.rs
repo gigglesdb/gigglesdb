@@ -480,6 +480,16 @@ async fn supervise(
 }
 
 async fn run_job(service: Arc<Service>, mut job: Job) {
+    // GD-0061 R3-403: an agent call takes an agent slot before it waits for a
+    // blocking worker; a full admission answers the all-agents error at once.
+    let agent_slot = if job.lease.session().agent {
+        match service.agent_admission.try_admit() {
+            Ok(slot) => Some(slot),
+            Err(error) => return refuse_agent_call(job, &error),
+        }
+    } else {
+        None
+    };
     // GD-0075 R5-103: per-role statement admission before the blocking pool.
     let role = job.lease.session().role.clone();
     let exempt = job.lease.session().is_aborted() || match &job.request {
@@ -533,6 +543,8 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
     let result = service
         .blocking
         .run_admitted(permit, move || {
+            // Drop order: role permit first, then the agent slot (reverse of admission).
+            let _agent_slot = agent_slot;
             let _role_permit = role_permit;
             #[cfg(test)]
             if let Some(barrier) = before {
@@ -606,6 +618,39 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
     if let Some(finished) = finished {
         let _ = finished.send(());
     }
+}
+
+/// The reply to an agent call refused at agent admission: the statement never
+/// ran. As on the PostgreSQL listener, the refusal aborts an open transaction.
+fn refuse_agent_call(job: Job, error: &giggles_core::CoreError) {
+    let Job {
+        mut lease,
+        encoding,
+        ownership,
+        reply,
+        ..
+    } = job;
+    let session = lease.session();
+    session.abort();
+    let state = if session.is_aborted() {
+        proto::TransactionState::Aborted
+    } else if session.in_transaction() {
+        proto::TransactionState::InTransaction
+    } else {
+        proto::TransactionState::Idle
+    };
+    let result = prepare_reply(Response::error(error), state, encoding).map(|(reply, json)| {
+        lease.completed();
+        Completion {
+            reply,
+            json,
+            lease: ResponseLease {
+                session: lease,
+                _ownership: ownership,
+            },
+        }
+    });
+    let _ = reply.send(result);
 }
 
 fn prepare_reply(

@@ -256,6 +256,9 @@ mod role_switch_guard;
 #[path = "agent_api_connect.rs"]
 mod agent_api_connect;
 
+#[path = "agent_limits.rs"]
+mod agent_limits;
+
 #[path = "agent_bindings.rs"]
 mod agent_bindings;
 

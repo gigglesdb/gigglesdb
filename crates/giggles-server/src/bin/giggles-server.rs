@@ -167,6 +167,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         c.service_limits,
     )?;
     service.set_role_statement_limits(c.role_statements)?;
+    // GD-0061 R3-403: the agent ceiling and chunk settings, before any listener.
+    if let Some(agent) = &c.agent {
+        service
+            .set_agent_limits(agent.limits())
+            .map_err(|_| AGENT_CEILING_REJECTED)?;
+    }
     let mut config = tls::server(
         tls::certs(&c.certificate)?,
         tls::key(&c.private_key)?,
@@ -227,6 +233,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(error) => eprintln!(
                         "PostgreSQL TLS reload rejected; prior certificate retained: {error}"
                     ),
+                }
+            }
+            // GD-0061 R3-403: the agent load settings are re-read from the config
+            // file; a rejected file keeps the prior settings.
+            if c.agent.is_some() {
+                match reload_agent_limits(&path, &service) {
+                    Ok(limits) => println!(
+                        "agent limits reloaded max_concurrent_statements={}",
+                        limits.max_concurrent_statements
+                    ),
+                    Err(error) => {
+                        eprintln!("agent limits reload rejected; prior limits retained: {error}")
+                    }
                 }
             }
             let agent_file = c.agent.as_ref().and_then(|a| a.bindings_file.as_ref());
@@ -1020,6 +1039,24 @@ async fn stop_all(listeners: Vec<Running>, api: &ApiRuntime) -> io::Result<()> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+const AGENT_CEILING_REJECTED: &str =
+    "agent max_concurrent_statements must be at most half the engine's admitted operations";
+
+/// Re-reads `agent` from the config file and installs its load settings.
+fn reload_agent_limits(
+    path: &str,
+    service: &Service,
+) -> Result<giggles_server::agent::AgentLimits, Box<dyn std::error::Error>> {
+    let c: Config = serde_json::from_slice(&bounded_file(path)?)?;
+    let agent = c.agent.ok_or("agent section removed")?;
+    agent.validate()?;
+    let limits = agent.limits();
+    service
+        .set_agent_limits(limits)
+        .map_err(|_| AGENT_CEILING_REJECTED)?;
+    Ok(limits)
 }
 
 /// The `agent` section on its own, plus what R3 does not serve yet.

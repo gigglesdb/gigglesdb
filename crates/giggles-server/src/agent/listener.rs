@@ -5,7 +5,7 @@
 //! certificates in the agent binding map and builds only task sessions
 //! (`Service::agent_session`); the ordinary listeners never build one.
 
-use super::AgentBinding;
+use super::{AgentBinding, AgentLimits};
 use crate::{
     Service,
     api::ApiLimits,
@@ -53,6 +53,28 @@ pub struct AgentConfig {
     /// Limits for the agent HTTP and gRPC listeners (R3-208).
     #[serde(default)]
     pub api_limits: ApiLimits,
+    /// Statements all agent sessions run at once (R3-403); 1 to
+    /// `MAX_BLOCKING / 2` and at most half the engine's admitted operations.
+    #[serde(default = "default_max_concurrent_statements")]
+    pub max_concurrent_statements: usize,
+    /// Reservation chunk in rows for each task session (R3-403); 0 is exact.
+    #[serde(default = "default_disclosure_chunk_rows")]
+    pub disclosure_chunk_rows: u64,
+    /// Reservation chunk in bytes for each task session (R3-403); 0 is exact.
+    #[serde(default = "default_disclosure_chunk_bytes")]
+    pub disclosure_chunk_bytes: u64,
+}
+
+fn default_max_concurrent_statements() -> usize {
+    super::limits::DEFAULT_MAX_CONCURRENT_STATEMENTS
+}
+
+fn default_disclosure_chunk_rows() -> u64 {
+    super::limits::DEFAULT_DISCLOSURE_CHUNK_ROWS
+}
+
+fn default_disclosure_chunk_bytes() -> u64 {
+    super::limits::DEFAULT_DISCLOSURE_CHUNK_BYTES
 }
 
 fn default_databases() -> Vec<String> {
@@ -91,7 +113,16 @@ impl AgentConfig {
         self.api_limits
             .validate()
             .map_err(|_| "agent api_limits.sessions must be 1 to 128".to_owned())?;
-        Ok(())
+        self.limits().validate()
+    }
+
+    /// The agent load settings of this section (R3-403).
+    pub fn limits(&self) -> AgentLimits {
+        AgentLimits {
+            max_concurrent_statements: self.max_concurrent_statements,
+            disclosure_chunk_rows: self.disclosure_chunk_rows,
+            disclosure_chunk_bytes: self.disclosure_chunk_bytes,
+        }
     }
 
     /// The agent bindings: `bindings_file` when set, else the inline list.

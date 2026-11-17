@@ -12,6 +12,11 @@ impl Blocking {
         Self(Arc::new(Semaphore::new(MAX_BLOCKING)))
     }
 
+    /// Permits held now (admitted and not yet returned).
+    pub(crate) fn in_use(&self) -> usize {
+        MAX_BLOCKING - self.0.available_permits()
+    }
+
     /// Cancellation remains observable before any worker is submitted.
     pub(crate) async fn admit(
         &self,

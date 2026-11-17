@@ -4,12 +4,14 @@
 //! ordinary ones; this module holds the parts that are agent-only.
 
 pub mod bindings;
+pub mod limits;
 pub mod listener;
 pub(crate) mod preview;
 pub mod statement;
 pub(crate) mod undo;
 
 pub use bindings::AgentBinding;
+pub use limits::AgentLimits;
 pub use listener::{AgentConfig, serve_agent_pg_bound};
 
 use giggles_core::{
