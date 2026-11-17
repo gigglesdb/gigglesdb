@@ -14,6 +14,59 @@ struct Subplan<'a> {
     mode: SubplanMode,
     query: BoundQuery<'a>,
 }
+
+impl Execution<'_> {
+    /// A correlated membership set belongs to this outer row (or group), never
+    /// to the statement cache used by uncorrelated IN children.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn correlated_membership(
+        &self,
+        child: &BoundQuery<'_>,
+        value: &BoundScalar,
+        column_type: &DataType,
+        negated: bool,
+        clock: Option<&super::super::clock::ExecutionClock>,
+        row: &Tuple,
+        state: &Relational,
+        source: &dyn scan::RowSource,
+        params: &[Value],
+        work: &mut usize,
+    ) -> R<Option<bool>> {
+        let lhs = value.eval(row, params, work)?;
+        let scope = RetentionScope::new(self);
+        let frame_bytes = std::mem::size_of_val(row.values.as_slice())
+            + row.values.iter().map(|v| std::mem::size_of_val(v.as_slice())
+                + v.iter().map(value_bytes).sum::<usize>()).sum::<usize>();
+        scope.borrow().charge(frame_bytes)?;
+        self.frames.borrow_mut().push(row.values.clone());
+        let result = self.capture_subquery(|| child.execute_context(
+            state, source, params, &self.declared, self, true, false,
+        ));
+        self.frames.borrow_mut().pop();
+        let (result, captured) = result?;
+        if captured.is_none() {
+            scope.borrow().charge(result.rows.iter().map(|r|
+                std::mem::size_of::<SqlRow>() + std::mem::size_of_val(r.values.as_slice())
+                    + r.values.iter().map(value_bytes).sum::<usize>()).sum())?;
+        }
+        let mut unknown = false;
+        for candidate in subquery_rows(&result, captured.as_ref())? {
+            if self.cancelled() {
+                return Err(SqlError::Aborted);
+            }
+            let candidate = candidate?;
+            let rhs = candidate.values.first().ok_or(SqlError::Syntax)?;
+            self.comparison()?;
+            if lhs == Value::Null || *rhs == Value::Null {
+                unknown = true;
+            } else if functions::join_equal(&lhs, &value.ty, rhs, column_type, clock)? {
+                return Ok(Some(!negated));
+            }
+        }
+        Ok(if unknown { None } else { Some(negated) })
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Subplans<'a> {
     entries: Vec<Subplan<'a>>,

@@ -438,11 +438,13 @@ fn strict_rejection_matrix_and_resource_bounds() {
     for q in [
         "CREATE TABLE timestamps (id TIMESTAMPTZ PRIMARY KEY)",
         "SELECT * FROM safe; DELETE FROM safe WHERE id=1",
-        "SELECT * FROM safe WHERE id=(SELECT id FROM safe)",
         "WITH x AS (DELETE FROM safe) SELECT * FROM x",
     ] {
         err(&mut s, q, E::Unsupported);
     }
+    let scalar_subquery = run(&mut s, "SELECT * FROM safe WHERE id=(SELECT id FROM safe)");
+    assert!(scalar_subquery.rows.is_empty());
+    assert_eq!(scalar_subquery.columns, ["id", "n"]);
     err(
         &mut s,
         "CREATE TABLE dup (id BIGINT, id TEXT, PRIMARY KEY(id))",

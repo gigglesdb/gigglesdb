@@ -1421,6 +1421,13 @@ impl BoundFilter {
                 negated,
                 clock,
             } => {
+                let child = owner.subqueries.get(*query, SubplanMode::In)?;
+                if child.correlated(0) {
+                    return execution.correlated_membership(
+                        child, value, column_type, *negated, clock.as_ref(),
+                        row, state, source, params, bytes,
+                    );
+                }
                 if !execution.subqueries.borrow().contains_key(query) {
                     let child = owner.subqueries.get(*query, SubplanMode::In)?;
                     let (result, captured) = execution.capture_subquery(|| child.execute_context(
@@ -5135,12 +5142,9 @@ impl BoundQuery<'_> {
         }
         let materialized = self.materialize_derived(state, source, params, declared, execution)?;
         let source: &dyn scan::RowSource = materialized.as_ref().map_or(source, |rows| rows);
-        if !self.outer_slots.is_empty() {
-            return Err(SqlError::Unsupported); // C4 supplies outer tuples.
+        if self.outer_slots.iter().any(|slot| slot.depth > execution.frames.borrow().len()) {
+            return Err(SqlError::Unsupported);
         }
-        self.subqueries.visit(&mut |mode, child| {
-            if mode == SubplanMode::Exists || !child.correlated(0) { Ok(()) } else { Err(SqlError::Unsupported) }
-        })?;
         let mut cancel_impl = || execution.cancelled();
         let cancel = &mut cancel_impl;
         if self.aggregate && cancel() {
@@ -5206,7 +5210,7 @@ impl BoundQuery<'_> {
                 affected: 0,
             });
         }
-        if self.tables.is_empty() {
+        if self.query.sources.is_empty() {
             if self.aggregate || self.query.explain {
                 return Err(SqlError::Unsupported);
             }
@@ -5217,7 +5221,7 @@ impl BoundQuery<'_> {
             };
             if limit != Some(0) && offset == 0 {
                 let row = Tuple {
-                    values: vec![],
+                    values: self.outer_values(execution),
                     version: 0,
                 };
                 let mut work = 0;
@@ -5344,7 +5348,8 @@ impl BoundQuery<'_> {
         } else {
             scan::Meter::new(cancel)
         };
-        let joined = join_rows(self, source, input, params, &mut meter, &execution.visits, &[], false, state, execution);
+        let outer = self.outer_values(execution);
+        let joined = join_rows(self, source, input, params, &mut meter, &execution.visits, &outer, false, state, execution);
         let filtered = joined.filter_map(|row| {
             let row = match row {
                 Ok(row) => row,

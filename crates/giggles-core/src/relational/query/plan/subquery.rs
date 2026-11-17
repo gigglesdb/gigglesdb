@@ -1174,7 +1174,11 @@ fn needs_membership_apply(query: &Query, state: &Relational, outer: &[Lexical]) 
 }
 impl Plan {
     pub(in crate::relational) fn correlated_in(query: &Query, state: &Relational) -> Option<Self> {
-        if query.explain || !query.has_in_subquery() || !needs_membership_apply(query, state, &[]) {
+        // HAVING children consume the reconstructed group frame. Turning them
+        // into input apply columns would both run them per row and make their
+        // synthetic results look like ungrouped input columns.
+        if query.explain || query.having().is_some() || !query.has_in_subquery()
+            || !needs_membership_apply(query, state, &[]) {
             return None;
         }
         Some(promote(query.clone(), &mut 0))
@@ -1540,6 +1544,59 @@ mod tests {
         let resolved = path.canonicalize().unwrap();
         assert!(resolved.starts_with(&parent));
         std::fs::remove_dir_all(resolved).unwrap();
+    }
+    #[test]
+    fn correlated_having_uses_group_frames_and_rejects_ungrouped_columns() {
+        let mut state = Relational::default();
+        let mut run = |sql: &str| {
+            let p = Prepared::parse(sql, 1, state.epoch)?;
+            state.execute(&p, &[], None)
+        };
+        for sql in [
+            "CREATE TABLE orders(id int PRIMARY KEY,item text,qty int,price numeric)",
+            "CREATE TABLE items(id text PRIMARY KEY,name text)",
+            "INSERT INTO orders VALUES(1,'a',1,1.5),(2,'a',2,2.5),(3,'b',5,NULL),(4,'c',NULL,3)",
+            "INSERT INTO items VALUES('a','A'),('b','B'),('d','D')",
+        ] {
+            run(sql).unwrap();
+        }
+        // PG18.6: each child captures orders.item from the completed group.
+        for predicate in [
+            "item IN(SELECT id FROM items WHERE items.id=orders.item)",
+            "EXISTS(SELECT 1 FROM items WHERE items.id=orders.item)",
+            "item IN(SELECT id FROM items WHERE EXISTS(SELECT 1 FROM items i WHERE i.id=orders.item))",
+        ] {
+            let sql = format!("SELECT item,count(*) FROM orders GROUP BY item::text HAVING {predicate} ORDER BY item");
+            assert_eq!(
+                run(&sql).unwrap_or_else(|e| panic!("{sql}: {e:?}")).rows
+                    .into_iter().map(|r| r.values).collect::<Vec<_>>(),
+                vec![vec![Value::Text("a".into()), I(2)], vec![Value::Text("b".into()), I(1)]],
+                "{sql}",
+            );
+        }
+        for (predicate, expected) in [
+            ("item NOT IN(SELECT NULL::text FROM items WHERE items.id=orders.item)",
+                vec![vec![Value::Text("c".into()), I(1)]]),
+            ("NULL::text NOT IN(SELECT id FROM items WHERE items.id=orders.item)",
+                vec![vec![Value::Text("c".into()), I(1)]]),
+            ("item IN(SELECT orders.item)",
+                vec![vec![Value::Text("a".into()), I(2)], vec![Value::Text("b".into()), I(1)],
+                    vec![Value::Text("c".into()), I(1)]]),
+        ] {
+            let sql = format!("SELECT item,count(*) FROM orders GROUP BY item HAVING {predicate} ORDER BY item");
+            assert_eq!(run(&sql).unwrap_or_else(|e| panic!("{sql}: {e:?}")).rows
+                .into_iter().map(|r| r.values).collect::<Vec<_>>(), expected, "{sql}");
+        }
+        for predicate in [
+            "item IN(SELECT id FROM items WHERE items.id=orders.qty::text)",
+            "EXISTS(SELECT 1 FROM items WHERE items.id=orders.qty::text)",
+            // PG18.6 rejects count(*) in this inner WHERE with 42803; it
+            // does not implicitly become an aggregate of the outer group.
+            "EXISTS(SELECT 1 FROM items WHERE items.id=orders.item AND count(*)>1)",
+        ] {
+            let sql = format!("SELECT item,count(*) FROM orders GROUP BY item HAVING {predicate}");
+            assert_eq!(run(&sql), Err(SqlError::GroupingError), "{sql}");
+        }
     }
     #[test]
     fn apply_dependencies_and_cancellation() {

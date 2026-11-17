@@ -34,11 +34,16 @@ fn exercise(engine: Engine) {
         ("EXISTS(SELECT nosuch FROM items)", SqlError::UnknownColumn),
         ("qty IN(SELECT n FROM u)", SqlError::GroupingError),
         ("EXISTS(SELECT 1 FROM items WHERE items.id=orders.qty::text)", SqlError::GroupingError),
-        ("item IN(SELECT id FROM items WHERE items.id=orders.item)", SqlError::Unsupported),
     ] {
         let sql = format!("SELECT item,count(*) FROM orders GROUP BY item HAVING {predicate}");
         assert_eq!(s.execute(&sql, &[], None), Err(CoreError::Sql(error)), "{sql}");
     }
+    let sql = "SELECT item,count(*) FROM orders GROUP BY item HAVING item IN(SELECT id FROM items WHERE items.id=orders.item)";
+    let actual = s.execute(sql, &[], None).unwrap();
+    let actual = actual.rows.into_iter().map(|r| r.values).collect::<Vec<_>>();
+    let expected_rows = expected(&[("a",2),("b",1)]);
+    assert_eq!(actual.len(), expected_rows.len());
+    assert!(expected_rows.iter().all(|row| actual.contains(row)), "{sql}: {actual:?}");
     assert_eq!(s.execute("SELECT item || 'x',count(*) FROM orders GROUP BY item || 'x' HAVING EXISTS(SELECT 1 FROM items WHERE items.id=orders.item)", &[], None),
         Err(CoreError::Sql(SqlError::GroupingError)));
     for predicate in [ReadPredicate::In { expr: ReadExpr::Column("item".into()),
