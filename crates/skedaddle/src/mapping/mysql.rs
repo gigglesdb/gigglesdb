@@ -36,8 +36,8 @@ pub struct MysqlPgColumn {
     pub type_modifier: i32,
     pub type_id: String,
     pub generated: bool,
-    args: Vec<u32>,
-    labels: Vec<Vec<u8>>,
+    pub(crate) args: Vec<u32>,
+    pub(crate) labels: Vec<Vec<u8>>,
 }
 fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))

@@ -1,4 +1,6 @@
 //! Real dual-engine data-path rollback after simulated activation; no access restoration.
+#[path = "../src/mysql/capture/test_support.rs"]
+mod startup_support;
 use mysql_async::prelude::Queryable;
 use skedaddle::pg::fence::Connection as _;
 use skedaddle::{
@@ -366,6 +368,9 @@ async fn live_forward_reverse_exact_stop_receipt_replay_and_echo() -> Result {
     };
     let (_, fw) = writer(&root, "forward", forward_cfg, order.clone()).await?;
     let mut capture = MysqlCapture::new(&cfg, source, start, &names, fw, 6495).await?;
+    capture = startup_support::install(capture, &cfg, &names, &root.join("startup"))
+        .await
+        .0;
     let positions = apply::SourcePositions::new(order.clone(), apply::OriginPolicy::Opaque);
     let mut executor = executor::Executor::new(
         pgcfg.clone(),

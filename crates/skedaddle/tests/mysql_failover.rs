@@ -1,4 +1,6 @@
 //! Real primary/replica failover. The harness owns both servers and their data.
+#[path = "../src/mysql/capture/test_support.rs"]
+mod startup_support;
 use mysql_async::prelude::Queryable;
 use serde::Deserialize;
 use skedaddle::{
@@ -113,7 +115,7 @@ async fn capture(
     start: &MysqlPosition,
     root: &Path,
 ) -> Result<MysqlCapture, MysqlError> {
-    MysqlCapture::new(
+    let c = MysqlCapture::new(
         config,
         source(),
         start.clone(),
@@ -121,7 +123,15 @@ async fn capture(
         writer(root, start).await,
         6495,
     )
+    .await?;
+    Ok(startup_support::install(
+        c,
+        config,
+        &[("type_zoo".into(), "failover_rows".into())],
+        &root.join("startup"),
+    )
     .await
+    .0)
 }
 
 async fn next(capture: &mut MysqlCapture, expected: i64) -> MysqlPosition {

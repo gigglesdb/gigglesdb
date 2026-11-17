@@ -1,3 +1,5 @@
+#[path = "../src/mysql/capture/test_support.rs"]
+mod startup_support;
 use futures::StreamExt;
 use mysql_async::prelude::Queryable;
 use skedaddle::{
@@ -190,6 +192,9 @@ async fn live_capture_durable_mapping_control_progress_and_restart()
         6421,
     )
     .await?;
+    let (prepared, _, _, _) =
+        startup_support::install(capture, &cfg, &tables, &root.join("journal-first")).await;
+    capture = prepared;
     let mut reader = BufferReader::new(
         Arc::new(ObjectBufferStore::local(
             root.join("buffer"),
@@ -437,6 +442,9 @@ async fn live_capture_durable_mapping_control_progress_and_restart()
         6422,
     )
     .await?;
+    let (prepared, _, _, _) =
+        startup_support::install(capture, &cfg, &tables, &root.join("journal-restart")).await;
+    capture = prepared;
     admin
         .conn
         .query_drop(format!(

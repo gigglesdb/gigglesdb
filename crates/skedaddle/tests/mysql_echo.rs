@@ -1,3 +1,5 @@
+#[path = "../src/mysql/capture/test_support.rs"]
+mod startup_support;
 use mysql_async::prelude::Queryable;
 use skedaddle::{
     buffer::{
@@ -146,6 +148,9 @@ async fn live_apply_echo_concurrent_user_gc_and_dump_reconnect()
     )
     .await?;
     let mut capture = MysqlCapture::new(&cfg, source, start, &tables, writer, 6491).await?;
+    capture = startup_support::install(capture, &cfg, &tables, &root.join("startup"))
+        .await
+        .0;
     // Each round's applier and ordinary writer run concurrently with capture.
     // Keep the collector alive across KILL so reconnect uses delivered progress.
     let collect = async {

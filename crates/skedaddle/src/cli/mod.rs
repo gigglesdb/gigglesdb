@@ -536,32 +536,78 @@ fn run(cli: &Cli) -> impl std::future::Future<Output = Result<(Outcome, Value)>>
                     return Err(error);
                 }
                 if def.source.engine == crate::definition::Engine::Mysql {
-                    let report = crate::runner::assess_mysql(
-                        def,
-                        crate::mysql::preflight::Options {
-                            estimated_copy_seconds: estimated_copy_seconds.unwrap_or(0),
-                            planned_catchup_seconds: planned_catchup_seconds.unwrap_or(0),
-                            max_decompressed_bytes: max_decompressed_bytes.unwrap_or(0),
-                            selected_tables: vec![],
+                    let _lock = lock(root, id)?;
+                    let state = journal(root, id).await?.load(true).await?;
+                    if !matches!(state.lifecycle.state, State::Defined | State::Assessed) {
+                        return Err(fail(
+                            Outcome::IllegalTransition,
+                            "MySQL assessment requires Defined or Assessed",
+                            "Assessment must precede installation",
+                            "Use a fresh migration for changed planning inputs.",
+                        ));
+                    }
+                    let options = crate::mysql::preflight::Options {
+                        estimated_copy_seconds: estimated_copy_seconds.unwrap_or(0),
+                        planned_catchup_seconds: planned_catchup_seconds.unwrap_or(0),
+                        max_decompressed_bytes: max_decompressed_bytes.unwrap_or(0),
+                        selected_tables: vec![],
+                    };
+                    let report = crate::runner::assess_mysql(def, options.clone())
+                        .await
+                        .map_err(|e| {
+                            fail(
+                                match e.kind {
+                                    crate::runner::FailureKind::InvalidInput => {
+                                        Outcome::InvalidInput
+                                    }
+                                    crate::runner::FailureKind::Infrastructure => {
+                                        Outcome::Infrastructure
+                                    }
+                                    crate::runner::FailureKind::Blocked => Outcome::Blocked,
+                                    crate::runner::FailureKind::NotWired => Outcome::NotWired,
+                                },
+                                e.what,
+                                "Live MySQL preflight failed.",
+                                &e.next_step,
+                            )
+                        })?;
+                    let result = capability(report)?;
+                    let marker = crate::runner::mysql_forward::Assessment::encode(&options)
+                        .map_err(|e| {
+                            fail(
+                                Outcome::InvalidInput,
+                                e.what,
+                                "Invalid assessment inputs",
+                                &e.next_step,
+                            )
+                        })?;
+                    if state.source_binding.is_none() {
+                        let binding = crate::runner::SourceBinding::for_definition(id, def)?;
+                        mutate(root, id, Transition::SourceBindingV1 { binding }).await?;
+                    }
+                    mutate(
+                        root,
+                        id,
+                        Transition::Progress {
+                            stream: "mysql-assessment".into(),
+                            marker,
+                            position: "assessed".into(),
                         },
                     )
-                    .await
-                    .map_err(|e| {
-                        fail(
-                            match e.kind {
-                                crate::runner::FailureKind::InvalidInput => Outcome::InvalidInput,
-                                crate::runner::FailureKind::Infrastructure => {
-                                    Outcome::Infrastructure
-                                }
-                                crate::runner::FailureKind::Blocked => Outcome::Blocked,
-                                crate::runner::FailureKind::NotWired => Outcome::NotWired,
+                    .await?;
+                    if state.lifecycle.state == State::Defined {
+                        mutate(
+                            root,
+                            id,
+                            Transition::Lifecycle {
+                                event: Event::Advance {
+                                    to: State::Assessed,
+                                },
                             },
-                            e.what,
-                            "Live MySQL preflight failed.",
-                            &e.next_step,
                         )
-                    })?;
-                    return capability(report);
+                        .await?;
+                    }
+                    return Ok(result);
                 }
                 capability(report)
             }

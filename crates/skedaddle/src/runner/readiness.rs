@@ -53,7 +53,38 @@ pub(super) struct Facts {
     #[serde(default)]
     pub schema_boundary: Option<Blocker>,
 }
+pub(super) fn mysql_source(state: &crate::coordinator::Materialized) -> bool {
+    state
+        .source_binding
+        .as_ref()
+        .is_some_and(|binding| binding.connector == crate::coordinator::SourceConnector::Mysql)
+}
+
+/// Process-local producer gap; never added to journaled ReadinessFacts.
+pub(super) fn mysql_missing(code: &str, producer: &str) -> Fact {
+    missing(
+        code,
+        "MySQL source binding; no authoritative live producer wired.",
+        &format!("MySQL source: {producer} producer not implemented; Unverified."),
+        "Implement and qualify the MySQL live readiness producer before retrying readiness.",
+    )
+}
+
 impl Facts {
+    pub(super) fn compose_binding(&mut self, state: &crate::coordinator::Materialized) {
+        if !mysql_source(state) {
+            return;
+        }
+        let checks = super::destination_readiness::Checks::unverified(
+            super::destination_readiness::Unverified::MysqlProducerMissing,
+        );
+        self.destination_expires_at_ms = None;
+        self.destination_validity = checks.validity;
+        self.sequences_syncable = checks.sequences;
+        self.reverse_prerequisites = checks.reverse;
+        self.fence_risks = mysql_missing("fence-risk-unacknowledged", "fence");
+    }
+
     pub(super) fn compose_live(
         &mut self,
         definition: Option<&MigrationDefinition>,
@@ -210,6 +241,53 @@ mod tests {
     use super::*;
     use crate::{buffer::backends::ObjectBufferStore, definition::LocalFsOptions};
     use std::{path::PathBuf, time::Duration};
+
+    #[test]
+    fn mysql_overrides_positive_pg_facts_but_pg_diagnostics_are_unchanged() {
+        use crate::coordinator::{Materialized, SourceBinding, SourceConnector};
+        let mut facts = Facts::sample(None, None);
+        for fact in [
+            &mut facts.destination_validity,
+            &mut facts.sequences_syncable,
+            &mut facts.reverse_prerequisites,
+            &mut facts.fence_risks,
+        ] {
+            fact.ready = true;
+            fact.blocker = None;
+        }
+        let before = serde_json::to_vec(&facts).unwrap();
+        let mut state = Materialized::default();
+        facts.compose_binding(&state);
+        assert_eq!(before, serde_json::to_vec(&facts).unwrap());
+        state.source_binding = Some(SourceBinding {
+            version: 1,
+            connector: SourceConnector::Postgres,
+            order_domain: "pg".into(),
+            stream: "slot".into(),
+        });
+        facts.compose_binding(&state);
+        assert_eq!(before, serde_json::to_vec(&facts).unwrap());
+        state.source_binding.as_mut().unwrap().connector = SourceConnector::Mysql;
+        facts.compose_binding(&state);
+        for (fact, producer) in [
+            (
+                &facts.destination_validity,
+                "live destination schema readiness",
+            ),
+            (&facts.sequences_syncable, "sequence synchronization"),
+            (
+                &facts.reverse_prerequisites,
+                "forward-reverse prerequisites",
+            ),
+            (&facts.fence_risks, "fence"),
+        ] {
+            assert!(!fact.ready);
+            assert_eq!(
+                fact.blocker.as_ref().unwrap().reason,
+                format!("MySQL source: {producer} producer not implemented; Unverified.")
+            );
+        }
+    }
 
     fn schema_live(schema: crate::engine::SchemaState) -> crate::engine::LiveReadinessObservation {
         crate::engine::LiveReadinessObservation {

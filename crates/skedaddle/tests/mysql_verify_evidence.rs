@@ -1,5 +1,7 @@
 //! Real MySQL capture/marker qualification. Applied wait uses an in-test source:
 //! this lane has no live PostgreSQL destination applier.
+#[path = "../src/mysql/capture/test_support.rs"]
+mod startup_support;
 use async_trait::async_trait;
 use futures::FutureExt;
 use mysql_async::prelude::Queryable;
@@ -430,6 +432,7 @@ async fn live_complete_evidence_marker_and_reconnect() -> Result<(), Box<dyn std
         6482,
     )
     .await?;
+    capture = startup_support::install(capture, &config, &[("verify_evidence".into(), "rows_live".into())], &root.join("startup")).await.0;
     let input = capture.evidence_input(config.clone(), 1_000_000, 100)?;
     let mut evidence = MysqlChangeEvidence::new(input, order(&start), IntegerOrder, LIMIT, 100)?;
     let range = RangePlan {

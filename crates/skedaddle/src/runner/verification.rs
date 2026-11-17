@@ -144,8 +144,10 @@ fn now_ms() -> Option<u64> {
 }
 fn readiness_status(root: &Path, id: &str, state: &Materialized) -> super::readiness::Facts {
     // PG control files cannot certify a native report/capture identity.
-    if state.verification.native_report.is_some() {
-        return super::readiness::Facts::sample(state.definition.as_ref(), None);
+    if super::readiness::mysql_source(state) || state.verification.native_report.is_some() {
+        let mut facts = super::readiness::Facts::sample(state.definition.as_ref(), None);
+        facts.compose_binding(state);
+        return facts;
     }
     let valid = (|| -> Option<super::readiness::Facts> {
         let generation = active(root).ok()??;
@@ -696,6 +698,7 @@ impl Readiness {
                 });
             }
         }
+        facts.compose_binding(state);
         facts
     }
     fn destination_checks(
@@ -1840,6 +1843,28 @@ mod tests {
         let path = root.join("readiness-status.json");
         write_json(&path, &status).unwrap();
         assert!(readiness_status(&root, "m", &state).buffer_contract.ready);
+        // A MySQL binding must reject even an otherwise trusted PG control file,
+        // before any native report exists.
+        assert!(state.verification.native_report.is_none());
+        state.source_binding = Some(coordinator::SourceBinding {
+            version: 1,
+            connector: coordinator::SourceConnector::Mysql,
+            order_domain: "mysql".into(),
+            stream: "binlog".into(),
+        });
+        let mysql = readiness_status(&root, "m", &state);
+        assert!(!mysql.buffer_contract.ready);
+        for fact in [
+            mysql.destination_validity,
+            mysql.sequences_syncable,
+            mysql.reverse_prerequisites,
+            mysql.fence_risks,
+        ] {
+            assert!(!fact.ready);
+            assert!(fact.blocker.unwrap().reason.starts_with("MySQL source:"));
+        }
+        state.source_binding = None;
+
         state
             .progress
             .insert("buffered".into(), ("manifest-durable".into(), "123".into()));

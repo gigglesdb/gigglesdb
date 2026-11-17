@@ -22,4 +22,6 @@ pub mod readiness;
 
 pub mod reverse_resolver;
 
+pub mod installer;
 pub mod reverse;
+pub mod startup;

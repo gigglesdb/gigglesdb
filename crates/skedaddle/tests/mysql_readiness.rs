@@ -1,6 +1,8 @@
 //! Probe qualification on a real TLS binlog stream. The cursor below advances
 //! only over complete, manifest-durable captured transactions. Engine marker
 //! admission is independently owned/tested by the connector-neutral hub.
+#[path = "../src/mysql/capture/test_support.rs"]
+mod startup_support;
 use mysql_async::prelude::Queryable;
 use skedaddle::{
     buffer::{
@@ -118,6 +120,14 @@ async fn idle_burst_and_file_rotation_readiness() -> Result<(), Box<dyn std::err
         6511,
     )
     .await?;
+    capture = startup_support::install(
+        capture,
+        &config,
+        &[("type_zoo".into(), "readiness_probe".into())],
+        &root.join("startup"),
+    )
+    .await
+    .0;
     let marker = Watermark {
         chunk: ChunkId {
             table: "type_zoo.readiness_probe".into(),

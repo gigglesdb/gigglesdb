@@ -1168,3 +1168,155 @@ fn apply_table_map_malformed_shape_is_typed_control_error() {
         Err(MysqlError::Control(_))
     ));
 }
+
+fn startup_inputs() -> StartupInputs {
+    let d = zoo();
+    StartupInputs {
+        selected: vec![SelectedTable {
+            schema: d.schema,
+            table: d.table,
+            columns: d.columns.iter().map(|c| c.name.clone()).collect(),
+            primary_key: d.primary_key,
+        }],
+        mapping_versions: vec!["mysql.v1".into(), "skva.v1".into()],
+        gtid_mode: GtidMode::OFF,
+        version: MysqlVersion::V84,
+    }
+}
+async fn startup_journal(
+    root: &std::path::Path,
+) -> (crate::coordinator::journal::Journal, crate::engine::Runtime) {
+    use crate::coordinator::{self, epoch::Coordinator, journal::Journal, local::Local};
+    std::fs::create_dir_all(root.join("journal")).unwrap();
+    let journal = Journal::new(
+        Arc::new(coordinator::journal::local_store(root.join("journal")).unwrap()),
+        "capture",
+        "startup",
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    let mut coordinator = Coordinator::observer(
+        journal.clone(),
+        Local::create(root.join("local")).unwrap(),
+        "test",
+    )
+    .unwrap();
+    coordinator.acquire().await.unwrap();
+    let runtime = crate::engine::Engine::new(coordinator, journal.clone()).runtime();
+    (journal, runtime)
+}
+async fn startup_capture(d: TableDescriptor) -> (MysqlCapture, PathBuf) {
+    let (w, _, root) = writer(&start(false)).await;
+    // Actual recorded events, instrumented to fail if an admission check polls.
+    let stream = futures::stream::iter(fixture("mysql84-gtid-off").into_iter().map(|_| {
+        panic!("stream read before startup admission");
+        #[allow(unreachable_code)]
+        Ok(at(MysqlEvent::Heartbeat, 4))
+    }));
+    (
+        MysqlCapture::from_stream(source(), start(false), vec![d], w, stream, 1_000_000)
+            .unwrap()
+            .with_startup_inputs(startup_inputs()),
+        root,
+    )
+}
+#[tokio::test]
+async fn startup_missing_malformed_and_drift_refuse_before_stream_read() {
+    let (mut c, root) = startup_capture(zoo()).await;
+    let (journal, runtime) = startup_journal(&root).await;
+    assert!(matches!(
+        c.prepare_schema(&journal, &runtime).await,
+        Err(Error::Mysql(MysqlError::CaptureStartup(
+            CaptureStartupError::MissingRecord
+        )))
+    ));
+    runtime
+        .marker("source-startup", "{}".into(), String::new())
+        .await
+        .unwrap();
+    assert!(matches!(
+        c.prepare_schema(&journal, &runtime).await,
+        Err(Error::Mysql(MysqlError::CaptureStartup(
+            CaptureStartupError::Record(_)
+        )))
+    ));
+    runtime
+        .marker(
+            "source-startup",
+            c.startup_record().unwrap().encode().unwrap(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+    c.descriptors[0].columns[1].nullable = false;
+    assert!(matches!(
+        c.prepare_schema(&journal, &runtime).await,
+        Err(Error::Mysql(MysqlError::CaptureStartup(
+            CaptureStartupError::Drift(StartupDrift::DescriptorChanged { .. })
+        )))
+    ));
+    c.descriptors = vec![zoo()];
+    c.startup_inputs.as_mut().unwrap().gtid_mode = GtidMode::ON;
+    assert!(matches!(
+        c.prepare_schema(&journal, &runtime).await,
+        Err(Error::Mysql(MysqlError::CaptureStartup(
+            CaptureStartupError::Drift(StartupDrift::GtidModeChanged)
+        )))
+    ));
+    drop(c);
+    drop(runtime);
+    drop(journal);
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[tokio::test]
+async fn startup_schema_stop_is_durable_sticky_and_conflicts_are_typed() {
+    let (mut c, root) = startup_capture(zoo()).await;
+    let (journal, runtime) = startup_journal(&root).await;
+    runtime
+        .marker(
+            "source-startup",
+            c.startup_record().unwrap().encode().unwrap(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+    c.prepare_schema(&journal, &runtime).await.unwrap();
+    let reason = CaptureStopReason::Ddl {
+        tables: vec![("type_zoo".into(), "zoo".into())],
+        statement: "TRUNCATE type_zoo.zoo".into(),
+    };
+    let batch = c.stop(reason.clone()).await.unwrap();
+    assert!(batch.stop);
+    assert!(
+        journal
+            .load(true)
+            .await
+            .unwrap()
+            .progress
+            .contains_key("mysql-schema-stop")
+    );
+    let blocked = c.schema_state().unwrap();
+    drop(c);
+    let (mut restarted, restart_root) = startup_capture(zoo()).await;
+    restarted.prepare_schema(&journal, &runtime).await.unwrap();
+    assert_eq!(restarted.schema_state().unwrap(), blocked);
+    assert!(restarted.step().await.is_err());
+    restarted.persist_stop(&reason).await.unwrap();
+    assert!(matches!(
+        restarted
+            .persist_stop(&CaptureStopReason::UnknownDdl {
+                statement: "other".into(),
+                reason: "unknown".into()
+            })
+            .await,
+        Err(Error::Mysql(MysqlError::CaptureStartup(
+            CaptureStartupError::ConflictingStop
+        )))
+    ));
+    assert_eq!(restarted.schema_state().unwrap(), blocked);
+    drop(restarted);
+    drop(runtime);
+    drop(journal);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(restart_root).unwrap();
+}

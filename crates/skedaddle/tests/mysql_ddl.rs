@@ -1,3 +1,5 @@
+#[path = "../src/mysql/capture/test_support.rs"]
+mod startup_support;
 use mysql_async::prelude::Queryable;
 use skedaddle::{
     buffer::{
@@ -42,7 +44,7 @@ fn position(s: &MysqlStatus) -> MysqlPosition {
         }
     }
 }
-async fn capture(
+async fn raw_capture(
     cfg: &MysqlConfig,
     start: MysqlPosition,
     tables: &[(String, String)],
@@ -77,6 +79,21 @@ async fn capture(
     MysqlCapture::new(cfg, source(), start, tables, writer, server_id)
         .await
         .unwrap()
+}
+async fn capture(
+    cfg: &MysqlConfig,
+    start: MysqlPosition,
+    tables: &[(String, String)],
+    root: &Path,
+    server_id: u32,
+) -> (
+    MysqlCapture,
+    skedaddle::coordinator::journal::Journal,
+    skedaddle::engine::Runtime,
+    skedaddle::mysql::capture::StartupInputs,
+) {
+    let c = raw_capture(cfg, start, tables, root, server_id).await;
+    startup_support::install(c, cfg, tables, root).await
 }
 async fn transaction(c: &mut MysqlCapture) -> Captured {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -117,7 +134,7 @@ async fn live_ddl_unselected_progress_and_selected_typed_stops()
         .query_drop("CREATE TABLE type_zoo.ddl_other LIKE type_zoo.zoo")
         .await?;
     let start = position(&admin.status().await?);
-    let mut c = capture(
+    let (mut c, _, _, _) = capture(
         &cfg,
         start,
         &[("type_zoo".into(), "zoo".into())],
@@ -197,9 +214,9 @@ async fn live_ddl_unselected_progress_and_selected_typed_stops()
             .await?;
         let start = position(&admin.status().await?);
         let tables = vec![("type_zoo".into(), table)];
-        let mut c = capture(
+        let (mut c, journal, runtime, inputs) = capture(
             &cfg,
-            start,
+            start.clone(),
             &tables,
             &root.join(format!("selected-{i}")),
             6482 + i as u32,
@@ -229,7 +246,25 @@ async fn live_ddl_unselected_progress_and_selected_typed_stops()
         }
         assert_eq!(c.writer_checkpoint()?.unwrap().next_mseq, 0);
         assert!(c.step().await.is_err());
+        let blocked = c.schema_state().unwrap();
         drop(c);
+        // TRUNCATE leaves a fresh, clear descriptor identical to the startup
+        // schema. Only the durable stop can keep readiness blocked on restart.
+        if i == 2 {
+            let restarted_root = root.join("restart");
+            let mut restarted = raw_capture(&cfg, start, &tables, &restarted_root, 6500).await;
+            restarted = restarted.with_startup_inputs(inputs);
+            restarted.prepare_schema(&journal, &runtime).await?;
+            assert_eq!(restarted.schema_state().unwrap(), blocked);
+            assert!(restarted.step().await.is_err());
+            assert!(
+                journal
+                    .load(true)
+                    .await?
+                    .progress
+                    .contains_key("mysql-schema-stop")
+            );
+        }
     }
     admin.conn.disconnect().await?;
     std::fs::remove_dir_all(root)?;

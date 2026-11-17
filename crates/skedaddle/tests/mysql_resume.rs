@@ -1,3 +1,5 @@
+#[path = "../src/mysql/capture/test_support.rs"]
+mod startup_support;
 use mysql_async::prelude::Queryable;
 use skedaddle::{
     buffer::{
@@ -168,6 +170,9 @@ async fn live_killed_connections_exactly_once_purged_history_and_source_divergen
         budget: Duration::from_secs(45),
         ..Default::default()
     })?;
+    capture = startup_support::install(capture, &cfg, &tables, &root.join("startup"))
+        .await
+        .0;
     admin
         .conn
         .query_drop("INSERT INTO type_zoo.resume_rows VALUES(1)")

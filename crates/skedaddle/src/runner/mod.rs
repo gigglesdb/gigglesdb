@@ -7,6 +7,7 @@ mod activation_baseline;
 mod destination_readiness;
 mod fence_readiness;
 mod finalize;
+pub mod mysql_forward;
 mod operational;
 mod post_activation;
 pub(crate) use finalize::allowed as finalize_allowed;
@@ -431,6 +432,55 @@ pub async fn assess_mysql_source(
 ) -> Result<crate::CapabilityReport, Failure> {
     assess_mysql_endpoints(definition, options, false).await
 }
+fn mysql_config(
+    definition: &MigrationDefinition,
+    max_decompressed_bytes: usize,
+    redactor: &mut Redactor,
+) -> Result<crate::mysql::client::MysqlConfig, Failure> {
+    let endpoint = definition.source.mysql.as_ref().ok_or_else(|| {
+        failure(
+            FailureKind::InvalidInput,
+            "MySQL endpoint missing",
+            "Set the mysql endpoint block.",
+        )
+    })?;
+    let mut resolve = |reference: &crate::definition::SecretRef| -> Result<String, Failure> {
+        let secret = security::resolve(reference).map_err(|_| {
+            failure(
+                FailureKind::Infrastructure,
+                "MySQL endpoint secret unavailable",
+                "Restore the referenced UTF-8 secret and retry.",
+            )
+        })?;
+        redactor.register(&secret);
+        Ok(secret.expose_secret().to_owned())
+    };
+    let user = resolve(&endpoint.user)?;
+    let password = resolve(&endpoint.password)?;
+    let ca = match &definition.source.tls_ca_ref {
+        Some(reference) => PathBuf::from(resolve(reference)?),
+        None => {
+            return Err(failure(
+                FailureKind::Blocked,
+                "MySQL live connector requires TLS CA trust",
+                "Use TLS require with an explicit CA path reference; plaintext transport is not qualified.",
+            ));
+        }
+    };
+    let mysql_config = crate::mysql::client::MysqlConfig {
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        ca,
+        user,
+        password,
+        profile: String::new(),
+        gtid: String::new(),
+        container_id: String::new(),
+        max_decompressed_bytes,
+    };
+    Ok(mysql_config)
+}
+
 async fn assess_mysql_endpoints(
     definition: &MigrationDefinition,
     mut options: crate::mysql::preflight::Options,
@@ -439,7 +489,7 @@ async fn assess_mysql_endpoints(
     use crate::{
         capability::{CapabilityItem, Criticality, Evidence, ItemStatus},
         definition::MysqlGtidMode,
-        mysql::{client::MysqlConfig, preflight as mysql_preflight, schema::load_descriptors},
+        mysql::{preflight as mysql_preflight, schema::load_descriptors},
     };
     let mut report = crate::CapabilityReport::from_definition(definition).map_err(|_| {
         failure(
@@ -479,47 +529,7 @@ async fn assess_mysql_endpoints(
         .cloned()
         .collect();
     let mut redactor = Redactor::default();
-    let endpoint = definition.source.mysql.as_ref().ok_or_else(|| {
-        failure(
-            FailureKind::InvalidInput,
-            "MySQL endpoint missing",
-            "Set the mysql endpoint block.",
-        )
-    })?;
-    let mut resolve = |reference: &crate::definition::SecretRef| -> Result<String, Failure> {
-        let secret = security::resolve(reference).map_err(|_| {
-            failure(
-                FailureKind::Infrastructure,
-                "MySQL endpoint secret unavailable",
-                "Restore the referenced UTF-8 secret and retry.",
-            )
-        })?;
-        redactor.register(&secret);
-        Ok(secret.expose_secret().to_owned())
-    };
-    let user = resolve(&endpoint.user)?;
-    let password = resolve(&endpoint.password)?;
-    let ca = match &definition.source.tls_ca_ref {
-        Some(reference) => PathBuf::from(resolve(reference)?),
-        None => {
-            return Err(failure(
-                FailureKind::Blocked,
-                "MySQL live connector requires TLS CA trust",
-                "Use TLS require with an explicit CA path reference; plaintext transport is not qualified.",
-            ));
-        }
-    };
-    let mysql_config = MysqlConfig {
-        host: endpoint.host.clone(),
-        port: endpoint.port,
-        ca,
-        user,
-        password,
-        profile: String::new(),
-        gtid: String::new(),
-        container_id: String::new(),
-        max_decompressed_bytes: options.max_decompressed_bytes,
-    };
+    let mysql_config = mysql_config(definition, options.max_decompressed_bytes, &mut redactor)?;
     let make_item =
         |id: &str, object, status, description: String, remediation: &str| CapabilityItem {
             id: id.into(),
@@ -565,7 +575,7 @@ async fn assess_mysql_endpoints(
             format!("Observed version family: {actual_family}"),
             "Review the observed server and correct the declared version family.",
         ));
-        if let Some(declared) = endpoint.gtid_mode {
+        if let Some(declared) = definition.source.mysql.as_ref().and_then(|e| e.gtid_mode) {
             let observations: Vec<_> = snapshot
                 .observations
                 .iter()
@@ -588,8 +598,12 @@ async fn assess_mysql_endpoints(
                 format!("Declared mode: {expected}; observed mode: {}", observed.unwrap_or("unverified")),
                 "Review the observed GTID mode; correct the declaration or finish the documented server transition, then recollect."));
         }
+        let mut projected = Vec::new();
+        let mut mapping_error = None;
         for object in &definition.selected_objects {
             if object.kind != ObjectKind::Table {
+                mapping_error =
+                    Some("Selected non-table object has no MySQL mapping adapter.".into());
                 report.items.push(make_item(
                     "source.mysql.object_kind",
                     Some(object.clone()),
@@ -607,28 +621,117 @@ async fn assess_mysql_endpoints(
             match descriptors {
                 Ok(descriptors) if descriptors.len() == 1 => {
                     let descriptor = &descriptors[0];
-                    if object.exclude_columns.iter().any(|name| descriptor.primary_key.contains(name) || !descriptor.columns.iter().any(|c| &c.name == name)) {
-                        report.items.push(make_item("source.mysql.projection", Some(object.clone()), ItemStatus::Unsupported,
-                            "Excluded column is missing or is an operational primary key.".into(), "Retain every primary-key column and correct excluded column names."));
+                    if object.exclude_columns.iter().any(|name| {
+                        descriptor.primary_key.contains(name)
+                            || !descriptor.columns.iter().any(|c| &c.name == name)
+                    }) {
+                        report.items.push(make_item(
+                            "source.mysql.projection",
+                            Some(object.clone()),
+                            ItemStatus::Unsupported,
+                            "Excluded column is missing or is an operational primary key.".into(),
+                            "Retain every primary-key column and correct excluded column names.",
+                        ));
                     }
-                    for column in descriptor.columns.iter().filter(|c| !object.exclude_columns.contains(&c.name)) {
+                    for column in descriptor
+                        .columns
+                        .iter()
+                        .filter(|c| !object.exclude_columns.contains(&c.name))
+                    {
                         if let Err(error) = crate::mapping::mysql::plan_column(column) {
                             report.items.push(make_item(&format!("source.mysql.mapping.{}", column.name), Some(object.clone()), ItemStatus::Unsupported,
                                 format!("Column {}: {error}", column.name), "Convert the column to a qualified MySQL/PG mapping or explicitly exclude this non-key column; preserve its data separately."));
                         }
                     }
+                    let mut descriptor = descriptor.clone();
+                    match mysql_forward::project_descriptor(object, &mut descriptor, &redactor) {
+                        Ok(()) => projected.push(descriptor),
+                        Err(error) => mapping_error = Some(error.what),
+                    }
                 }
-                _ => report.items.push(make_item("source.mysql.mapping", Some(object.clone()), ItemStatus::Unverified,
-                    "Selected-table descriptor collection failed (details redacted).".into(), "Restore catalog visibility and an existing table with a primary key, then recollect every column.")),
+                _ => {
+                    mapping_error = Some(
+                        "Selected-table descriptor collection failed (details redacted).".into(),
+                    );
+                    report.items.push(make_item("source.mysql.mapping", Some(object.clone()), ItemStatus::Unverified,
+                        "Selected-table descriptor collection failed (details redacted).".into(), "Restore catalog visibility and an existing table with a primary key, then recollect every column."));
+                }
             }
         }
         let _ = client.conn.disconnect().await;
-        // Receiver checks deliberately exclude source WAL, replication, slot and
-        // replica-identity requirements. Mapped destination DDL is a later item.
+        let mapped = match mapping_error {
+            Some(error) => Err(error),
+            None => crate::mysql::dest_schema::build(&projected).map_err(|e| e.to_string()),
+        };
+        // Receiver checks exclude source WAL, replication, slot and identity requirements.
         if inspect_destination {
             let destination = config(&definition.destination, &mut redactor)?;
             let mut destination = Box::pin(session(&destination, &definition.destination)).await?;
             settings(&destination.client).await?;
+            if let Ok(mapped) = &mapped {
+                for warning in mapped.omitted_defaults() {
+                    let mut item = make_item(
+                        "destination.pg.mapped_schema.omitted_default",
+                        None,
+                        ItemStatus::SupportedWithTransformation,
+                        format!(
+                            "{}: default {} omitted: {}",
+                            warning.object, warning.value, warning.reason
+                        ),
+                        "Review the omitted default; source row values are copied explicitly.",
+                    );
+                    item.criticality = Criticality::Advisory;
+                    report.items.push(item);
+                }
+                for descriptor in &projected {
+                    let object = definition
+                        .selected_objects
+                        .iter()
+                        .find(|o| o.schema == descriptor.schema && o.name == descriptor.table)
+                        .cloned();
+                    let exists: bool = destination.client.query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2)",
+                        &[&descriptor.schema, &descriptor.table],
+                    ).await.map_err(|_| infrastructure())?.get(0);
+                    let (status, detail) = if exists {
+                        let schema =
+                            crate::mysql::dest_schema::build(std::slice::from_ref(descriptor))
+                                .expect("full mapped schema already built");
+                        let mismatches = crate::mysql::dest_schema::verify_destination(
+                            &mut destination.client,
+                            &schema,
+                        )
+                        .await
+                        .map_err(|_| infrastructure())?;
+                        if mismatches.is_empty() {
+                            (
+                                ItemStatus::Supported,
+                                "Existing destination matches mapped schema".into(),
+                            )
+                        } else {
+                            (
+                                ItemStatus::Unsupported,
+                                format!(
+                                    "Destination {}.{} mismatches mapped schema: {mismatches:?}",
+                                    descriptor.schema, descriptor.table
+                                ),
+                            )
+                        }
+                    } else {
+                        (
+                            ItemStatus::Supported,
+                            "created at start by engine-install-destination-schema-v1".into(),
+                        )
+                    };
+                    report.items.push(make_item(
+                        "destination.pg.mapped_schema",
+                        object,
+                        status,
+                        detail,
+                        "Align existing destination tables with the mapped schema before start.",
+                    ));
+                }
+            }
             let mut snapshot = Box::pin(preflight::collect(&mut destination.client, &[]))
                 .await
                 .map_err(|_| infrastructure())?;
@@ -661,13 +764,23 @@ async fn assess_mysql_endpoints(
                 "Supply destination secrets and run combined live preflight.",
             ));
         }
-        report.items.push(make_item(
-            "destination.pg.mapped_schema",
-            None,
-            ItemStatus::Unverified,
-            "Mapped destination schema and apply compatibility have not been qualified.".into(),
-            "Qualify mapped destination DDL and apply adapters before starting the migration.",
-        ));
+        if let Err(blocker) = mapped {
+            report.items.push(make_item(
+                "destination.pg.mapped_schema",
+                None,
+                ItemStatus::Unsupported,
+                blocker,
+                "Correct the projected schema mapping before start.",
+            ));
+        } else if !inspect_destination {
+            report.items.push(make_item(
+                "destination.pg.mapped_schema",
+                None,
+                ItemStatus::Unverified,
+                "Source-only inspection; mapped destination schema was not checked.".into(),
+                "Run combined live preflight with destination credentials.",
+            ));
+        }
         Ok(report)
     };
     let mut report: crate::CapabilityReport =

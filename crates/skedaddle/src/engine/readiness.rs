@@ -166,6 +166,11 @@ pub(super) async fn assemble(
             }
         }
     }
+    // Missing MySQL producers cannot be supplied by PG-shaped observations.
+    let mysql = state
+        .source_binding
+        .as_ref()
+        .is_some_and(|binding| binding.connector == coordinator::SourceConnector::Mysql);
     Ok(ReadinessFacts {
         all_chunks_done: chunks_done,
         capture_healthy: sample.capture.as_ref().is_some_and(|c| c.healthy)
@@ -182,16 +187,21 @@ pub(super) async fn assemble(
             .dead_letters
             .unwrap_or(1)
             .max(state.verifier_exceptions.len() as u64),
-        indexes_constraints_valid: sample.verification.as_ref().is_some_and(|r| {
-            clean(&r.schema) && clean(&r.indexes) && clean(&r.constraints) && clean(&r.foreign_keys)
-        }),
-        sequences_syncable: sample.sequences_syncable == Some(true)
+        indexes_constraints_valid: !mysql
+            && sample.verification.as_ref().is_some_and(|r| {
+                clean(&r.schema)
+                    && clean(&r.indexes)
+                    && clean(&r.constraints)
+                    && clean(&r.foreign_keys)
+            }),
+        sequences_syncable: !mysql
+            && sample.sequences_syncable == Some(true)
             && sample
                 .verification
                 .as_ref()
                 .is_some_and(|r| clean(&r.sequences)),
-        reverse_prerequisites: sample.reverse_prerequisites.unwrap_or(false),
-        fence_risks_acknowledged: sample.fence_risks_acknowledged.unwrap_or(false),
+        reverse_prerequisites: !mysql && sample.reverse_prerequisites.unwrap_or(false),
+        fence_risks_acknowledged: !mysql && sample.fence_risks_acknowledged.unwrap_or(false),
         buffer_contract_matches: sample.buffer_contract_matches.unwrap_or(false),
     })
 }

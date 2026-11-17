@@ -3,12 +3,17 @@
 use super::{
     assembly::{Assembler, AssemblerOutput},
     binlog::{MysqlEvent, PositionedEvent},
+    client::MysqlVersion,
     client::{MysqlConfig, MysqlError, Result as MysqlResult},
     control,
     ddl::{DdlImpact, classify},
     position::{MysqlOrder, MysqlPosition},
     resume,
     schema::{TableDescriptor, TableMapChange, compare_table_map, load_descriptors},
+    startup::{
+        GtidMode, MysqlSchemaStopRecord, MysqlStartupRecord, ObservedStartup, SelectedTable,
+        StartupDrift, StartupError,
+    },
 };
 use crate::{
     buffer::writer::{BufferWriter, DurableManifestRef, WriterCheckpoint},
@@ -80,7 +85,42 @@ struct RetryState {
     delay: Duration,
 }
 
+/// Installer-supplied projection and mapping module identities. Replay inputs
+/// also describe the observed server; live capture uses its loaded status instead.
+#[derive(Clone, Debug)]
+pub struct StartupInputs {
+    pub selected: Vec<SelectedTable>,
+    pub mapping_versions: Vec<String>,
+    pub gtid_mode: GtidMode,
+    pub version: MysqlVersion,
+}
+#[derive(Debug)]
+pub enum CaptureStartupError {
+    MissingRecord,
+    MissingInputs,
+    NotPrepared,
+    Record(StartupError),
+    Drift(StartupDrift),
+    ConflictingStop,
+}
+impl std::fmt::Display for CaptureStartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for CaptureStartupError {}
+fn startup_error(e: CaptureStartupError) -> Error {
+    MysqlError::CaptureStartup(e).into()
+}
+fn record_error(e: StartupError) -> Error {
+    startup_error(CaptureStartupError::Record(e))
+}
+
 pub struct MysqlCapture {
+    startup_inputs: Option<StartupInputs>,
+    observed_server: Option<(GtidMode, MysqlVersion, resume::ResumePlan, String)>,
+    runtime: Option<crate::engine::Runtime>,
+    needs_open: bool,
     evidence: Option<crate::verify::mysql::input::CaptureEvidenceGuard>,
     descriptors: Vec<TableDescriptor>,
     lower_case_table_names: u8,
@@ -165,16 +205,22 @@ impl MysqlCapture {
     ) -> MysqlResult<Self> {
         validate_source(&source)?;
         let mut client = config.connect().await?;
-        resume::check(&start, &client.status().await?)?;
+        let status = client.status().await?;
+        let resume_plan = resume::check(&start, &status)?;
+        let mode = if status.gtid_on {
+            GtidMode::ON
+        } else {
+            GtidMode::OFF
+        };
+        let version = client.version;
         let lower_case_table_names: u8 = client
             .conn
             .query_first("SELECT @@lower_case_table_names")
             .await?
             .ok_or(MysqlError::Invalid("missing lower_case_table_names"))?;
         let descriptors = load_descriptors(&mut client.conn, tables).await?;
-        let stream = client
-            .open_stream(&start, server_id, Duration::from_secs(1))
-            .await?;
+        // The dump request is deferred until the journal baseline is checked.
+        let stream = futures::stream::empty();
         let mut capture = Self::from_stream_with_case_mode(
             source,
             start,
@@ -185,6 +231,8 @@ impl MysqlCapture {
             lower_case_table_names,
         )?;
         capture.reconnect = Some((config.clone(), server_id));
+        capture.observed_server = Some((mode, version, resume_plan, status.server_uuid));
+        capture.needs_open = true;
         Ok(capture)
     }
 
@@ -250,6 +298,10 @@ impl MysqlCapture {
         descriptors.extend(control::apply_descriptors());
         let assembler = Assembler::new(source.clone(), descriptors, start, gtid, max_row_bytes)?;
         Ok(Self {
+            startup_inputs: None,
+            observed_server: None,
+            runtime: None,
+            needs_open: false,
             evidence: None,
             descriptors: selected,
             lower_case_table_names,
@@ -274,6 +326,70 @@ impl MysqlCapture {
             stopped: false,
             failed: false,
         })
+    }
+
+    pub fn with_startup_inputs(mut self, inputs: StartupInputs) -> Self {
+        self.startup_inputs = Some(inputs);
+        self
+    }
+
+    /// Reconstruct startup truth from loaded metadata, never from the journal.
+    pub fn startup_record(&self) -> Result<MysqlStartupRecord> {
+        let inputs = self
+            .startup_inputs
+            .as_ref()
+            .ok_or_else(|| startup_error(CaptureStartupError::MissingInputs))?;
+        let (mode, version) = self
+            .observed_server
+            .as_ref()
+            .map(|(m, v, _, _)| (m.clone(), *v))
+            .unwrap_or((inputs.gtid_mode.clone(), inputs.version));
+        let mut start = MysqlPosition::decode(self.delivered.bytes()).map_err(MysqlError::from)?;
+        if let Some((_, _, _, uuid)) = &self.observed_server {
+            match &mut start {
+                MysqlPosition::Gtid { server_uuid, .. }
+                | MysqlPosition::File { server_uuid, .. } => *server_uuid = uuid.clone(),
+            }
+        }
+        MysqlStartupRecord::build(
+            &self.source,
+            mode,
+            version,
+            &start,
+            &inputs.selected,
+            &self.descriptors,
+            inputs.mapping_versions.clone(),
+        )
+        .map_err(record_error)
+    }
+
+    async fn persist_stop(&mut self, reason: &CaptureStopReason) -> Result<()> {
+        let record = MysqlSchemaStopRecord::new(
+            reason,
+            &MysqlPosition::decode(self.safe.bytes()).map_err(MysqlError::from)?,
+        )
+        .map_err(record_error)?;
+        if let Some(runtime) = &self.runtime {
+            // marker() commits an immutable journal entry before returning. Do not
+            // use the coalesced progress queue for this admission barrier.
+            let state = runtime.state().await;
+            if let Some((marker, _)) = state.progress.get("mysql-schema-stop") {
+                if MysqlSchemaStopRecord::decode(marker).map_err(record_error)? != record {
+                    return Err(startup_error(CaptureStartupError::ConflictingStop));
+                }
+                return Ok(());
+            }
+            runtime
+                .marker(
+                    "mysql-schema-stop",
+                    record.encode().map_err(record_error)?,
+                    String::new(),
+                )
+                .await?;
+        } else if self.reconnect.is_some() {
+            return Err(startup_error(CaptureStartupError::NotPrepared));
+        }
+        Ok(())
     }
 
     pub fn with_reconnect_policy(mut self, policy: ReconnectPolicy) -> MysqlResult<Self> {
@@ -398,18 +514,20 @@ impl MysqlCapture {
         }
     }
 
-    fn stop(&mut self, reason: CaptureStopReason) -> Captured {
+    async fn stop(&mut self, reason: CaptureStopReason) -> Result<Captured> {
         if let Some(e) = &self.evidence {
             e.invalidate(crate::verify::mysql::evidence::ContinuityEvent::CaptureStop);
         }
         self.stopped = true;
-        self.stop_reason = Some(reason);
+        self.stop_reason = Some(reason.clone());
         self.boundary = None;
-        Captured {
+        // Cancellation during the durable write must leave this instance blocked.
+        self.persist_stop(&reason).await?;
+        Ok(Captured {
             durable_position: Some(self.safe.clone()),
             stop: true,
             ..Default::default()
-        }
+        })
     }
 
     // Inspect compressed payloads too, before any changed rows can be decoded
@@ -517,6 +635,9 @@ impl MysqlCapture {
                 || "MySQL capture stopped; reconstruct and replay".into(),
                 |reason| reason.to_string(),
             )));
+        }
+        if self.needs_open {
+            return Err(startup_error(CaptureStartupError::NotPrepared));
         }
         if self.pending_chunk.is_some() {
             return Err(recovery(
@@ -648,7 +769,7 @@ impl MysqlCapture {
                                 });
                             }
                         };
-                        return Ok(self.stop(reason));
+                        return self.stop(reason).await;
                     }
                 }
                 continue;
@@ -670,7 +791,7 @@ impl MysqlCapture {
                 Err(error) => return Err(error.into()),
             };
             if let Some(reason) = self.table_map_change(&mut event.event) {
-                return Ok(self.stop(reason));
+                return self.stop(reason).await;
             }
             let heartbeat = matches!(event.event, MysqlEvent::Heartbeat);
             self.outputs.extend(self.assembler.push(event)?);
@@ -714,11 +835,49 @@ impl Capture for MysqlCapture {
 
     async fn prepare_schema(
         &mut self,
-        _journal: &crate::coordinator::journal::Journal,
-        _runtime: &crate::engine::Runtime,
+        journal: &crate::coordinator::journal::Journal,
+        runtime: &crate::engine::Runtime,
     ) -> Result<()> {
-        // MySQL descriptors are qualified before the stream is opened. There
-        // is no persisted MySQL schema baseline to restore in this adapter.
+        let state = journal.load(true).await?;
+        let (marker, _) = state
+            .progress
+            .get("source-startup")
+            .ok_or_else(|| startup_error(CaptureStartupError::MissingRecord))?;
+        let baseline = MysqlStartupRecord::decode(marker).map_err(record_error)?;
+        let observed = ObservedStartup {
+            record: self.startup_record()?,
+            resume_plan: self.observed_server.as_ref().map(|(_, _, p, _)| p.clone()),
+        };
+        baseline
+            .check_restart(&observed)
+            .map_err(|e| startup_error(CaptureStartupError::Drift(e)))?;
+        if let Some((marker, _)) = state.progress.get("mysql-schema-stop") {
+            let record = MysqlSchemaStopRecord::decode(marker).map_err(record_error)?;
+            self.safe = Position::new(
+                self.order.domain(),
+                record
+                    .boundary()
+                    .map_err(record_error)?
+                    .encode()
+                    .map_err(MysqlError::from)?,
+            );
+            self.delivered = self.safe.clone();
+            self.stop_reason = Some(record.reason());
+            self.stopped = true;
+            self.boundary = None;
+        }
+        self.runtime = Some(runtime.clone());
+        if self.needs_open && !self.stopped {
+            let (config, server_id) = self.reconnect.as_ref().expect("live capture config");
+            let client = config.connect().await?;
+            let start = MysqlPosition::decode(self.delivered.bytes()).map_err(MysqlError::from)?;
+            self.stream = Box::pin(
+                client
+                    .open_stream(&start, *server_id, Duration::from_secs(1))
+                    .await?,
+            );
+            self.needs_open = false;
+        }
         Ok(())
     }
 

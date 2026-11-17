@@ -719,3 +719,71 @@ async fn identical_readiness_still_authenticates_owner_before_suppressing_write(
     assert!(f.engine.evaluate_sample(&sample).await.is_err());
     assert_eq!(f.journal.load(false).await.unwrap().applied_seq, before);
 }
+
+#[tokio::test]
+async fn mysql_binding_blocks_missing_producers_despite_positive_samples() {
+    use crate::coordinator::{SourceBinding, SourceConnector};
+    let f = completed().await;
+    let sample = snapshot();
+    let pg = super::super::readiness::assemble(&f.engine.runtime, &f.journal, &sample)
+        .await
+        .unwrap();
+    assert!(pg.blockers().is_empty());
+    f.engine.runtime.1.write().unwrap().source_binding = Some(SourceBinding {
+        version: 1,
+        connector: SourceConnector::Postgres,
+        order_domain: "engine-test".into(),
+        stream: "slot".into(),
+    });
+    let explicit_pg = super::super::readiness::assemble(&f.engine.runtime, &f.journal, &sample)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&pg).unwrap(),
+        serde_json::to_vec(&explicit_pg).unwrap()
+    );
+    f.engine
+        .runtime
+        .1
+        .write()
+        .unwrap()
+        .source_binding
+        .as_mut()
+        .unwrap()
+        .connector = SourceConnector::Mysql;
+    let mysql = super::super::readiness::assemble(&f.engine.runtime, &f.journal, &sample)
+        .await
+        .unwrap();
+    assert!(!mysql.indexes_constraints_valid);
+    assert!(!mysql.sequences_syncable);
+    assert!(!mysql.reverse_prerequisites);
+    assert!(!mysql.fence_risks_acknowledged);
+    // Isolate the four producer gaps: even every other positive fact cannot pass.
+    let mut otherwise_ready = pg;
+    otherwise_ready.indexes_constraints_valid = mysql.indexes_constraints_valid;
+    otherwise_ready.sequences_syncable = mysql.sequences_syncable;
+    otherwise_ready.reverse_prerequisites = mysql.reverse_prerequisites;
+    otherwise_ready.fence_risks_acknowledged = mysql.fence_risks_acknowledged;
+    assert_eq!(
+        otherwise_ready.blockers(),
+        vec![
+            "destination-schema-invalid",
+            "sequences-not-syncable",
+            "reverse-prerequisites-missing",
+            "fence-risk-unacknowledged",
+        ]
+    );
+    // Owner refresh correctly replaces injected snapshots from the journal.
+    // Apply the assembled fail-closed facts through the real lifecycle instead.
+    f.engine
+        .runtime
+        .lifecycle(Event::Readiness {
+            facts: otherwise_ready,
+        })
+        .await
+        .unwrap();
+    assert_ne!(
+        f.engine.runtime.snapshot().lifecycle.state,
+        State::VerifiedReady
+    );
+}

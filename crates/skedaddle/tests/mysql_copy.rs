@@ -1,4 +1,6 @@
 //! D15: real engine/capture/chunk/journal/buffer; replay follows PG apply row semantics.
+#[path = "../src/mysql/capture/test_support.rs"]
+mod startup_support;
 use mysql_async::{Params, prelude::Queryable};
 use skedaddle::{
     budget::{Limits, RateLimit, ReadLimits, SystemClock, ThroughputBudget},
@@ -476,6 +478,16 @@ async fn scenario(cfg: &MysqlConfig, crash: bool) -> Result {
         6480,
     )
     .await?;
+    let startup_inputs = startup_support::inputs(cfg, &selected).await;
+    capture = capture.with_startup_inputs(startup_inputs.clone());
+    engine
+        .runtime()
+        .marker(
+            "source-startup",
+            capture.startup_record()?.encode()?,
+            String::new(),
+        )
+        .await?;
     let schedule = Arc::new(Schedule::default());
     let mut chunks = ScheduledChunks {
         inner: MysqlChunks::connect(cfg, tables.clone()).await?,
@@ -535,6 +547,7 @@ async fn scenario(cfg: &MysqlConfig, crash: bool) -> Result {
             6481,
         )
         .await?;
+        capture = capture.with_startup_inputs(startup_inputs);
         let mut retry = MysqlChunks::connect(cfg, tables.clone()).await?;
         finish(
             &engine,

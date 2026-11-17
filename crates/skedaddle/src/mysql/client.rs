@@ -19,6 +19,8 @@ use std::{
 
 #[derive(Debug)]
 pub enum MysqlError {
+    CaptureStartup(super::capture::CaptureStartupError),
+    Installer(Box<super::installer::InstallerError>),
     Io(std::io::Error),
     Driver(mysql_async::Error),
     UnsupportedVersion(String),

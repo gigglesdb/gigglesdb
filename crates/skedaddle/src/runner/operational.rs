@@ -42,6 +42,7 @@ const READ_ROWS: u64 = 1000;
 
 enum ExclusionBackend<'a> {
     Source(&'a tls::Config, &'a crate::security::TlsPolicy),
+    Destination(&'a tls::Config, &'a crate::security::TlsPolicy),
     #[cfg(test)]
     File(&'a Path),
 }
@@ -50,13 +51,25 @@ fn migration_exclusion(
     backend: ExclusionBackend<'_>,
 ) -> coordinator::Result<Arc<coordinator::exclusion::MigrationExclusion>> {
     use coordinator::exclusion::MigrationExclusion;
-    if binding.connector != SourceConnector::Postgres {
+    let supported = matches!(
+        (&binding.connector, &backend),
+        (SourceConnector::Postgres, ExclusionBackend::Source(..))
+            | (SourceConnector::Mysql, ExclusionBackend::Destination(..))
+    );
+    #[cfg(test)]
+    let supported = supported
+        || matches!(
+            (&binding.connector, &backend),
+            (SourceConnector::Postgres, ExclusionBackend::File(..))
+        );
+    if !supported {
         return Err(coordinator::Error::SourceBinding(
             SourceBindingError::ExclusionUnsupported(binding.connector),
         ));
     }
     match backend {
-        ExclusionBackend::Source(config, policy) => {
+        ExclusionBackend::Source(config, policy)
+        | ExclusionBackend::Destination(config, policy) => {
             Ok(MigrationExclusion::postgres(config.clone(), *policy))
         }
         #[cfg(test)]
@@ -477,6 +490,46 @@ pub fn run(
         let binding = SourceBinding::for_definition(id, definition)?;
         let initial = open_journal(root, id).await?.load(true).await?;
         binding.validate_state(id, &initial)?;
+        if binding.connector == SourceConnector::Mysql
+            && definition.destination.engine == Engine::Postgresql
+        {
+            let options =
+                mysql_forward::Assessment::from_state(&initial).map_err(RunError::Preparation)?;
+            let destination = config(&definition.destination, &mut Redactor::default())
+                .map_err(RunError::Preparation)?;
+            let exclusion = migration_exclusion(
+                &binding,
+                ExclusionBackend::Destination(&destination, &definition.destination.tls),
+            )?;
+            let _guard = exclusion.acquire(id).await.map_err(recovery)?;
+            match record_unwired_binding(root, id, &binding).await {
+                Err(coordinator::Error::SourceBinding(SourceBindingError::NotWired(
+                    SourceConnector::Mysql,
+                ))) => {}
+                other => {
+                    other?;
+                }
+            }
+            let prepared = mysql_forward::prepare(definition, options)
+                .await
+                .map_err(RunError::Preparation)?;
+            mysql_forward::run_until_copying(
+                root,
+                id,
+                definition,
+                prepared,
+                exclusion.clone(),
+                &_guard,
+                binding.position_order(id, definition)?,
+            )
+            .await?;
+            return Err(
+                coordinator::Error::SourceBinding(SourceBindingError::NotWired(
+                    SourceConnector::Mysql,
+                ))
+                .into(),
+            );
+        }
         if binding.connector != SourceConnector::Postgres {
             record_unwired_binding(root, id, &binding).await?;
         }
@@ -1276,6 +1329,10 @@ mod exclusion_tests {
         let binding = SourceBinding::for_definition("mysql", &definition).unwrap();
         let owner = defined_journal(&root, "mysql", definition.clone()).await;
         drop(owner);
+        assert_binding_error(
+            record_unwired_binding(&root, "mysql", &binding).await,
+            SourceBindingError::NotWired(SourceConnector::Mysql),
+        );
         for resume in [false, true] {
             let (_send, pause) = watch::channel(false);
             let result = run(
@@ -1289,9 +1346,10 @@ mod exclusion_tests {
             .await;
             assert!(matches!(
                 result,
-                Err(RunError::Engine(coordinator::Error::SourceBinding(
-                    SourceBindingError::NotWired(SourceConnector::Mysql)
-                )))
+                Err(RunError::Preparation(Failure {
+                    kind: FailureKind::InvalidInput,
+                    ..
+                }))
             ));
         }
         let journal = open_journal(&root, "mysql").await.unwrap();
@@ -1481,6 +1539,21 @@ mod exclusion_tests {
         let binding = SourceBinding::for_definition("mysql", &definition).unwrap();
         assert_binding_error(
             migration_exclusion(&binding, ExclusionBackend::File(&root.join("locks"))),
+            SourceBindingError::ExclusionUnsupported(SourceConnector::Mysql),
+        );
+        let config = tls::Config::new(tokio_postgres::Config::new(), PathBuf::new());
+        assert!(
+            migration_exclusion(
+                &binding,
+                ExclusionBackend::Destination(&config, &crate::security::TlsPolicy::Required)
+            )
+            .is_ok()
+        );
+        assert_binding_error(
+            migration_exclusion(
+                &binding,
+                ExclusionBackend::Source(&config, &crate::security::TlsPolicy::Required),
+            ),
             SourceBindingError::ExclusionUnsupported(SourceConnector::Mysql),
         );
         definition.source.engine = Engine::Spanner;

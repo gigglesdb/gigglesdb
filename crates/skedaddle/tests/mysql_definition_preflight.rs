@@ -75,6 +75,13 @@ async fn assess(
 }
 #[tokio::test]
 async fn mysql_definition_preflight_clean_mapping_and_declared_mode() {
+    exercise(false).await;
+}
+#[tokio::test]
+async fn mysql_forward_prepare_projects_columns_and_refuses_primary_key_exclusion() {
+    exercise(true).await;
+}
+async fn exercise(prepare: bool) {
     let Some(path) = std::env::var_os("SKEDADDLE_MYSQL_CONFIG") else {
         eprintln!(
             "MYSQL SKIPPED: SKEDADDLE_MYSQL_CONFIG absent; use a mysql80|mysql84 harness lane"
@@ -115,7 +122,10 @@ async fn mysql_definition_preflight_clean_mapping_and_declared_mode() {
         "password":secret(&root,"mysql-password",&config.password), "gtid_mode":observed.as_str()}});
     let destination = if let Some(path) = std::env::var_os("SKEDADDLE_TEST_CONFIG") {
         let pg: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        if let (Some(dsn), Some(ca)) = (pg["pg_apply"].as_str(), pg["ca_pem"].as_str()) {
+        if let (Some(dsn), Some(ca)) = (
+            pg["pg_apply"].as_str().or_else(|| pg["dsn"].as_str()),
+            pg["ca_pem"].as_str(),
+        ) {
             value["destination"]["connection_ref"] = json!(secret(&root, "pg-dsn", dsn));
             value["destination"]["tls_ca_ref"] = json!(secret(&root, "pg-ca", ca));
             true
@@ -132,8 +142,8 @@ async fn mysql_definition_preflight_clean_mapping_and_declared_mode() {
         false
     };
     let names = vec![
-        format!("f2_clean_{}", std::process::id()),
-        format!("f2_bad_{}", std::process::id()),
+        format!("f2_clean_{}_{}", std::process::id(), prepare as u8),
+        format!("f2_bad_{}_{}", std::process::id(), prepare as u8),
     ];
     let cleanup = Tables {
         config: config.clone(),
@@ -152,6 +162,53 @@ async fn mysql_definition_preflight_clean_mapping_and_declared_mode() {
         .unwrap_or_else(|_| panic!("disconnect failed (redacted)"));
     value["selected_objects"] = json!([{"schema":"type_zoo","name":names[0],"kind":"table"}]);
     let def = MigrationDefinition::from_json(&value.to_string()).unwrap();
+    if prepare {
+        if !destination {
+            eprintln!(
+                "MYSQL SKIPPED: prepare requires SKEDADDLE_TEST_CONFIG PG destination; enable SKEDADDLE_MYSQL_WITH_PG=1"
+            );
+            return;
+        }
+        let mut projected = def.clone();
+        projected.selected_objects[0].exclude_columns = vec!["body".into()];
+        let prepared = skedaddle::runner::mysql_forward::prepare(&projected, options(&config))
+            .await
+            .unwrap_or_else(|e| panic!("prepare failed: {}", e.what));
+        assert_eq!(
+            prepared.descriptors[0]
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id"]
+        );
+        assert_eq!(prepared.startup_inputs.selected[0].columns, ["id"]);
+        assert_eq!(
+            prepared.mapped_schema.digest(),
+            skedaddle::mysql::dest_schema::build(&prepared.descriptors)
+                .unwrap()
+                .digest()
+        );
+        assert!(
+            prepared
+                .mapped_schema
+                .statements()
+                .iter()
+                .all(|s| !s.contains("\"body\""))
+        );
+        projected.selected_objects[0].exclude_columns = vec!["id".into()];
+        let Err(error) =
+            skedaddle::runner::mysql_forward::prepare(&projected, options(&config)).await
+        else {
+            panic!("excluded key accepted")
+        };
+        assert!(matches!(
+            error.kind,
+            skedaddle::runner::FailureKind::Blocked
+        ));
+        assert_eq!(error.column.as_deref(), Some("id"));
+        return;
+    }
     let report = assess(&def, &config, destination).await;
     assert_eq!(report.definition_digest, def.canonical_digest().unwrap());
     let blockers: Vec<_> = report
@@ -179,6 +236,71 @@ async fn mysql_definition_preflight_clean_mapping_and_declared_mode() {
                 .iter()
                 .any(|i| i.id == "destination.pg.preflight")
         );
+    }
+    if destination {
+        assert!(
+            report.blocking().is_empty(),
+            "clean paired assessment blocked: {:?}",
+            report.blocking()
+        );
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|i| i.id == "destination.pg.mapped_schema"
+                    && i.status == ItemStatus::Supported
+                    && i.evidence.iter().any(|e| e.description
+                        == "created at start by engine-install-destination-schema-v1"))
+        );
+        let prepared = skedaddle::runner::mysql_forward::prepare(&def, options(&config))
+            .await
+            .unwrap_or_else(|e| panic!("prepare failed: {}", e.what));
+        let ddl = format!(
+            "CREATE SCHEMA IF NOT EXISTS type_zoo; CREATE TABLE type_zoo.\"{}\" (id TEXT PRIMARY KEY)",
+            names[0]
+        );
+        prepared.destination().batch_execute(&ddl).await.unwrap();
+        let mismatched = assess(&def, &config, true).await;
+        prepared
+            .destination()
+            .batch_execute(&format!("DROP TABLE type_zoo.\"{}\"", names[0]))
+            .await
+            .unwrap();
+        assert!(
+            mismatched
+                .blocking()
+                .iter()
+                .any(|i| i.id == "destination.pg.mapped_schema"
+                    && i.status == ItemStatus::Unsupported
+                    && i.object.as_ref().is_some_and(|o| o.name == names[0])
+                    && i.evidence.iter().any(|e| e.description.contains(&names[0]))),
+            "mismatching destination must block mapped-schema assessment"
+        );
+        for statement in prepared.mapped_schema.statements() {
+            prepared
+                .destination()
+                .batch_execute(statement)
+                .await
+                .unwrap();
+        }
+        let matching = assess(&def, &config, true).await;
+        prepared
+            .destination()
+            .batch_execute(&format!("DROP TABLE type_zoo.\"{}\"", names[0]))
+            .await
+            .unwrap();
+        assert!(
+            matching.blocking().is_empty(),
+            "matching destination blocked: {:?}",
+            matching.blocking()
+        );
+        assert!(matching.items.iter().any(|i| {
+            i.id == "destination.pg.mapped_schema"
+                && i.status == ItemStatus::Supported
+                && i.evidence
+                    .iter()
+                    .any(|e| e.description == "Existing destination matches mapped schema")
+        }));
     }
     value["source"]["mysql"]["gtid_mode"] = json!(opposite);
     let report = assess(
@@ -251,29 +373,26 @@ async fn mysql_definition_preflight_clean_mapping_and_declared_mode() {
         receiver,
     )
     .await;
-    assert!(
-        matches!(
-            result,
-            Err(skedaddle::runner::RunError::Engine(
-                skedaddle::coordinator::Error::SourceBinding(
-                    skedaddle::runner::SourceBindingError::NotWired(
-                        skedaddle::runner::SourceConnector::Mysql
-                    )
-                )
-            ))
-        ),
-        "MySQL runtime must refuse with typed NotWired"
-    );
+    // Missing durable assessment refuses before any connection or binding effect.
+    match result {
+        Err(skedaddle::runner::RunError::Preparation(error)) => {
+            assert!(matches!(
+                &error.kind,
+                skedaddle::runner::FailureKind::InvalidInput
+            ));
+        }
+        _ => panic!("MySQL run must reach a typed preparation failure"),
+    }
+    if !destination {
+        return;
+    }
     let state = skedaddle::runner::open_journal(&root, "unwired")
         .await
         .unwrap()
         .load(true)
         .await
         .unwrap();
-    assert_eq!(
-        state.source_binding.as_ref().unwrap().connector,
-        skedaddle::runner::SourceConnector::Mysql
-    );
+    assert_eq!(state.source_binding, None);
     assert_eq!(
         state.lifecycle.state,
         skedaddle::coordinator::State::Defined

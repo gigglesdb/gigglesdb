@@ -21,7 +21,31 @@ fn fact(code: &str, source: &str, gaps: Vec<String>, next: &str) -> Fact {
         }),
     }
 }
+/// A typed missing-producer outcome, not a successful empty catalog probe.
+pub(super) enum Unverified {
+    MysqlProducerMissing,
+}
 impl Checks {
+    pub(super) fn unverified(reason: Unverified) -> Self {
+        match reason {
+            Unverified::MysqlProducerMissing => Self {
+                expires_at_ms: None,
+                validity: super::readiness::mysql_missing(
+                    "destination-invalid",
+                    "live destination schema readiness",
+                ),
+                sequences: super::readiness::mysql_missing(
+                    "sequences-not-syncable",
+                    "sequence synchronization",
+                ),
+                reverse: super::readiness::mysql_missing(
+                    "reverse-prerequisites-missing",
+                    "forward-reverse prerequisites",
+                ),
+            },
+        }
+    }
+
     pub fn missing() -> Self {
         Self {
             expires_at_ms: None,
@@ -163,6 +187,13 @@ pub(super) async fn refresh(
     request: Request<'_>,
 ) {
     *retained.lock().expect("destination readiness poisoned") = None;
+    if super::readiness::mysql_source(request.state) {
+        *retained.lock().expect("destination readiness poisoned") = Observation::new(
+            request,
+            Checks::unverified(Unverified::MysqlProducerMissing),
+        );
+        return;
+    }
     let mut checks = Checks::missing();
     let scope = request
         .scope
@@ -234,6 +265,44 @@ mod tests {
                 .unwrap(),
             ),
             ..Default::default()
+        }
+    }
+    #[tokio::test]
+    async fn mysql_refresh_is_unverified_before_any_pg_probe() {
+        let mut state = state();
+        state.source_binding = Some(crate::coordinator::SourceBinding {
+            version: 1,
+            connector: crate::coordinator::SourceConnector::Mysql,
+            order_domain: "mysql".into(),
+            stream: "binlog".into(),
+        });
+        let retained = std::sync::Mutex::new(None);
+        refresh(
+            &retained,
+            None,
+            None,
+            "mysql",
+            Request {
+                state: &state,
+                owner: "owner".into(),
+                scope: vec!["db.t".into()],
+                started: Instant::now(),
+            },
+        )
+        .await;
+        let checks = retained
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .checks(&state, Some("owner"), true)
+            .unwrap();
+        for fact in [checks.validity, checks.sequences, checks.reverse] {
+            assert!(!fact.ready);
+            let reason = fact.blocker.unwrap().reason;
+            assert!(reason.starts_with("MySQL source:"));
+            assert!(reason.contains("not implemented; Unverified"));
+            assert!(!reason.contains("endpoint connection unavailable"));
         }
     }
     #[test]
