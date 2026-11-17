@@ -56,11 +56,19 @@ scenario_private_network() {
         name='tool reaches Nunya with tokenized output'
         ;;
       2)
-        # getent and psql return 2 on lookup/connection failure; reject timeouts.
-        timeout 20 "${compose[@]}" exec -T -e PGPASSWORD=nunya-harness-only tool \
-          sh -c 'timeout 8 getent hosts db >/dev/null 2>&1; dns=$?
-            timeout 10 psql "host=db port=5432 user=nunya dbname=app connect_timeout=5" -XAtc "SELECT 1" >/dev/null 2>&1; pg=$?
-            [ "$dns" -eq 2 ] && [ "$pg" -eq 2 ]' || status=1
+        # Require both missing DNS and a resolution failure from the raw probe.
+        timeout 20 "${compose[@]}" exec -T -e LC_ALL=C tool \
+          bash -c 'dns=0; addresses=$(timeout 5 getent hosts db 2>/dev/null) || dns=$?
+            [[ $dns == 2 && -z $addresses ]] || exit 1
+            tcp=0; error=$(timeout 5 bash -c "exec 3<>/dev/tcp/db/5432" 2>&1) || tcp=$?
+            [[ $tcp == 1 ]] || exit 1
+            case "$error" in
+              *"Name or service not known"*|*"Temporary failure in name resolution"*) ;;
+              *) exit 1 ;;
+            esac' || status=1
+        # The same probe must work on the network that can reach the database.
+        timeout 20 "${compose[@]}" exec -T app \
+          timeout 5 bash -c 'exec 3<>/dev/tcp/db/5432' || status=1
         name='tool cannot resolve or connect to database by name'
         ;;
       3)
@@ -72,8 +80,19 @@ scenario_private_network() {
             "$db_container" 2>/dev/null) || status=1
         fi
         if [[ $db_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          timeout 20 "${compose[@]}" exec -T -e PGPASSWORD=nunya-harness-only tool \
-            sh -c 'timeout 10 psql "host=$1 port=5432 user=nunya dbname=app connect_timeout=5" -XAtc "SELECT 1" >/dev/null 2>&1; [ "$?" -eq 2 ]' sh "$db_ip" || status=1
+          timeout 20 "${compose[@]}" exec -T -e LC_ALL=C tool \
+            bash -c 'tcp=0; error=$(timeout 5 bash -c '\''exec 3<>/dev/tcp/"$1"/5432'\'' probe "$1" 2>&1) || tcp=$?
+              case "$tcp" in
+                124) ;;
+                1)
+                  case "$error" in
+                    *"No route to host"*|*"Network is unreachable"*) ;;
+                    *) exit 1 ;;
+                  esac ;;
+                *) exit 1 ;;
+              esac' probe "$db_ip" || status=1
+          timeout 20 "${compose[@]}" exec -T app \
+            timeout 5 bash -c 'exec 3<>/dev/tcp/"$1"/5432' probe "$db_ip" || status=1
         else status=1; fi
         name='tool cannot connect to database by address'
         ;;
