@@ -54,6 +54,8 @@ pub(super) fn plan_class(plan: &Plan) -> Option<StatementClass> {
         Plan::Task(_) => StatementClass::Other,
         // R3-707: the approver forms are never admitted in a task session (D7.1).
         Plan::Change(_) => StatementClass::Other,
+        // R3-110: task statements are authorization DDL, never run by a task.
+        Plan::TaskDdl(_) => StatementClass::RoleStatement,
         Plan::Sql(p) => p.task_class(),
         Plan::Protected(statement) => statement.class(),
     })
@@ -285,6 +287,11 @@ impl State {
         }
         if let Some(command) = cursor::parse(sql)? {
             return Err(refused(&mut self.diagnostic, &Plan::Cursor(command)));
+        }
+        // R3-110: task statements, well formed or not, before the role
+        // parser, which claims every GRANT and REVOKE head.
+        if let Some(stmt) = crate::task_ddl::parse(sql) {
+            return Err(refused(&mut self.diagnostic, &Plan::TaskDdl(Box::new(stmt))));
         }
         if let Some(stmt) = crate::auth::statements::parse(sql) {
             return Err(refused(&mut self.diagnostic, &Plan::Admin(stmt)));
@@ -765,7 +772,8 @@ impl State {
             | Plan::Sql(_)
             | Plan::Copy(..)
             | Plan::Task(_)
-            | Plan::Change(_) => Err(refuse(&mut self.diagnostic, class)),
+            | Plan::Change(_)
+            | Plan::TaskDdl(_) => Err(refuse(&mut self.diagnostic, class)),
         }
     }
 

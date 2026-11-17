@@ -151,6 +151,11 @@ fn replication_role_allowed(session: &Session) -> R<bool> {
     }
 }
 impl Diagnostic {
+    /// GD-0061 R3-110: a task statement's error keeps its SQLSTATE and message.
+    fn task_ddl(&mut self, error: giggles_core::task::catalog::TaskDdlError) -> &'static str {
+        self.wire_message = Some(error.message);
+        error.sqlstate
+    }
     fn core<T>(&mut self, result: Result<T, CoreError>) -> R<T> {
         let message = giggles_core::relational::take_sql_error_message();
         if matches!(
@@ -922,6 +927,9 @@ enum Plan {
     /// GD-0061 R3-707: an approver form (SHOW CHANGES, SHOW CHANGE, APPROVE,
     /// REVOKE APPROVAL); sessions without a task only.
     Change(Box<giggles_core::task::statements::ChangeStatement>),
+    /// GD-0061 R3-110: a task statement (CREATE TASK, REVOKE TASK, SHOW TASK,
+    /// GRANT / REVOKE ... ON TASK); sessions without a task only.
+    TaskDdl(Box<giggles_core::task::statements::TaskStatement>),
 }
 #[derive(Clone)]
 struct Statement {
@@ -961,7 +969,8 @@ impl Statement {
             | Plan::SettingsFunction(_)
             | Plan::Inspect(_)
             | Plan::Protected(_)
-            | Plan::Change(_) => Ok(self.d.clone()),
+            | Plan::Change(_)
+            | Plan::TaskDdl(_) => Ok(self.d.clone()),
         }
     }
 }
@@ -1248,6 +1257,27 @@ impl State {
                 sql: sql.to_owned(),
                 declared_oids: oids,
                 p: Plan::Change(Box::new(change)),
+                d,
+                parameter_oids: vec![],
+                query_id: self.diagnostic.query_id.clone(),
+            });
+        }
+        // GD-0061 R3-110: a task statement, before the role parser, which
+        // claims every GRANT and REVOKE head.
+        if let Some(stmt) = crate::task_ddl::parse(sql) {
+            if let giggles_core::task::statements::TaskStatement::Error(code) = stmt {
+                return Err(code);
+            }
+            // The statements take no parameters.
+            if !oids.is_empty() {
+                return Err("08P01");
+            }
+            let d = crate::task_ddl::description(&stmt);
+            return Ok(Statement {
+                sql_bytes: sql.len(),
+                sql: sql.to_owned(),
+                declared_oids: oids,
+                p: Plan::TaskDdl(Box::new(stmt)),
                 d,
                 parameter_oids: vec![],
                 query_id: self.diagnostic.query_id.clone(),
@@ -1820,6 +1850,53 @@ impl State {
                     } else {
                         let Plan::Change(change) = &p.s.p else { unreachable!() };
                         complete(crate::agent::preview::approver_command(change), result, out)?;
+                    }
+                    return Ok(true);
+                }
+                if let Plan::TaskDdl(stmt) = &p.s.p {
+                    let stmt = stmt.clone();
+                    if p.result.is_none() {
+                        if crate::task_ddl::writes(&stmt) {
+                            read_only_check(
+                                crate::task_ddl::command(&stmt),
+                                &self.settings,
+                                session,
+                                &mut self.diagnostic,
+                            )?;
+                        }
+                        self.diagnostic.phase = "task statement execution";
+                        let outcome = session
+                            .execute_task_ddl(&stmt)
+                            .map_err(|error| self.diagnostic.task_ddl(error))?;
+                        match outcome {
+                            giggles_core::task::statements::TaskOutcome::Tag(tag) => {
+                                self.admin_completed = true;
+                                p.result = ran();
+                                complete(tag, &empty(), out)?;
+                                return Ok(true);
+                            }
+                            // The SHOW result the server builds from catalog
+                            // and Kernel records: never core rows.
+                            giggles_core::task::statements::TaskOutcome::Rows(_, result) => {
+                                p.result = Some(Released::synthetic(result));
+                            }
+                        }
+                    } else if crate::task_ddl::writes(&stmt) {
+                        return Err("55000");
+                    }
+                    // Runs once; a suspended portal hands out the rest of its
+                    // rows, as for the approver forms.
+                    let result = p.result.as_ref().unwrap();
+                    let total = result.get().rows.len();
+                    let end = if max == 0 { total }
+                        else { p.at.saturating_add(max as usize).min(total) };
+                    rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
+                        result, &p.s.d, &p.formats, p.at, end, out)?;
+                    p.at = end;
+                    if end < total {
+                        frame(b's', &[], out)?;
+                    } else {
+                        complete(crate::task_ddl::command(&stmt), result, out)?;
                     }
                     return Ok(true);
                 }

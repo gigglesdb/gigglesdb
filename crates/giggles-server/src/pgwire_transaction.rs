@@ -233,6 +233,8 @@ pub(super) fn read_only_check(
         "DROP ROLE" => "cannot execute DROP ROLE in a read-only transaction",
         "GRANT" => "cannot execute GRANT in a read-only transaction",
         "REVOKE" => "cannot execute REVOKE in a read-only transaction",
+        "CREATE TASK" => "cannot execute CREATE TASK in a read-only transaction",
+        "REVOKE TASK" => "cannot execute REVOKE TASK in a read-only transaction",
         _ => return Ok(()),
     });
     Err("25006")

@@ -1112,6 +1112,49 @@ impl Session {
     pub fn is_aborted(&self) -> bool {
         self.sql.is_aborted()
     }
+    /// GD-0061 R3-110: one task statement (design-1 section 5) as this
+    /// session's database role. Standalone like role DDL: 25001 inside a
+    /// transaction block, 25P02 when aborted. A task session is refused by
+    /// class (RoleStatement) before anything else; the agent path refuses it
+    /// earlier, so this is the backstop. Errors keep their SQLSTATE and
+    /// message.
+    pub(crate) fn execute_task_ddl(
+        &mut self,
+        stmt: &giggles_core::task::statements::TaskStatement,
+    ) -> Result<giggles_core::task::statements::TaskOutcome, giggles_core::task::catalog::TaskDdlError>
+    {
+        use crate::task_ddl::from_core;
+        let fail = |sqlstate: &'static str, message: &str| giggles_core::task::catalog::TaskDdlError {
+            sqlstate,
+            message: message.to_owned(),
+        };
+        self.admit_backstop(giggles_core::task::StatementClass::RoleStatement)
+            .map_err(from_core)?;
+        let Role::Database { name } = &self.role else {
+            return Err(fail("42501", "task statements need a database role"));
+        };
+        let name = name.clone();
+        self.check_binding().map_err(from_core)?;
+        if self.in_transaction() {
+            return Err(fail("25001", "task statements cannot run inside a transaction block"));
+        }
+        if self.is_aborted() {
+            return Err(fail(
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ));
+        }
+        let actor = self
+            .service
+            .admin
+            .roles()
+            .get(&name)
+            .map_err(|e| from_core(role_lookup_error(e)))?
+            .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
+            .ok_or_else(|| fail("28000", "role is not permitted to log in"))?;
+        let now = crate::agent::wall_now(&self.service.clock).map_err(from_core)?;
+        crate::task_ddl::run(self, &actor, stmt, now)
+    }
     pub(crate) fn execute_admin(
         &mut self,
         stmt: &crate::auth::statements::AdminStatement,

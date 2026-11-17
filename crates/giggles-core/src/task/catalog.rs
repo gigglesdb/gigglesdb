@@ -491,7 +491,7 @@ impl TaskCatalog {
     }
 
     /// The committed catalog view now.
-    fn view(&self) -> Result<Arc<CatalogView>, TaskDdlError> {
+    pub(crate) fn view(&self) -> Result<Arc<CatalogView>, TaskDdlError> {
         let db = self.db()?;
         let mut txn = db.begin(Isolation::ReadCommitted);
         Ok(db.catalog().committed_view(&mut txn)?)

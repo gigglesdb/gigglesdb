@@ -56,9 +56,10 @@ impl State {
         // Like CREATE DATABASE in PostgreSQL, these must be the sole statement
         // in a Query message, even if the message contains explicit COMMITs.
         // GD-0061 R3-707: so are the approver forms, which write approval
-        // records outside the SQL snapshot.
+        // records outside the SQL snapshot, and (R3-110) the task statements.
         if statements.iter().any(|sql| {
             crate::auth::statements::parse(sql).is_some()
+                || crate::task_ddl::parse(sql).is_some()
                 || matches!(crate::agent::preview::approver_statement(sql), Ok(Some(_)))
         }) {
             return Err("25001");
@@ -342,6 +343,48 @@ impl State {
                 out,
             )?;
             return complete(crate::agent::preview::approver_command(&change), &result, out);
+        }
+        // GD-0061 R3-110: a task statement, before the role parser, which
+        // claims every GRANT and REVOKE head.
+        if let Some(stmt) = crate::task_ddl::parse(sql) {
+            if let giggles_core::task::statements::TaskStatement::Error(code) = stmt {
+                return Err(code);
+            }
+            if crate::task_ddl::writes(&stmt) {
+                read_only_check(
+                    crate::task_ddl::command(&stmt),
+                    &self.settings,
+                    session,
+                    &mut self.diagnostic,
+                )?;
+            }
+            self.diagnostic.phase = "task statement execution";
+            let outcome = session
+                .execute_task_ddl(&stmt)
+                .map_err(|error| self.diagnostic.task_ddl(error))?;
+            return match outcome {
+                giggles_core::task::statements::TaskOutcome::Tag(tag) => {
+                    self.admin_completed = true;
+                    complete(tag, &empty(), out)
+                }
+                giggles_core::task::statements::TaskOutcome::Rows(description, result) => {
+                    // The SHOW result the server builds from catalog and
+                    // Kernel records: never core rows.
+                    let result = Released::synthetic(result);
+                    row_description(&description, &[], out)?;
+                    rows(
+                        &self.settings.current,
+                        session.zone().unwrap_or(SessionZone::Fixed(0)),
+                        &result,
+                        &description,
+                        &[],
+                        0,
+                        result.get().rows.len(),
+                        out,
+                    )?;
+                    complete(crate::task_ddl::command(&stmt), &result, out)
+                }
+            };
         }
         if let Some(command) = cursor::parse(sql)? {
             self.cursors.execute(

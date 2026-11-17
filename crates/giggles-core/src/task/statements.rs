@@ -1164,3 +1164,308 @@ pub fn undo_receipt_result(receipt: &Receipt) -> Result<SqlResult, CoreError> {
         ],
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Execute half (R3-108, design-1 section 5): CREATE TASK, REVOKE TASK,
+// GRANT / REVOKE { UNDO | INSPECT } ON TASK and SHOW TASK(S) against the task
+// catalog, as `actor`. SHOW TASK READS and SHOW TASK EXPOSURE read a session
+// (`readlog::show_reads`, `exposure::show_exposure`, `exposure::draft_exposure`):
+// `description` gives their shapes, and `execute` refuses them with 0A000.
+
+/// What a task statement produced: a command tag, or a SHOW result.
+#[derive(Clone, Debug)]
+pub enum TaskOutcome {
+    Tag(&'static str),
+    Rows(crate::relational::Description, SqlResult),
+}
+
+/// The SHOW TASK / SHOW TASKS columns, in order (design-1 section 5).
+pub const SHOW_TASK_COLUMNS: [&str; 25] = [
+    "task",
+    "id",
+    "def_version",
+    "issuer",
+    "executor",
+    "approver",
+    "table_name",
+    "visible_rows",
+    "readable",
+    "masked",
+    "untrusted_text",
+    "write_columns",
+    "old_row",
+    "new_row",
+    "max_distinct_rows",
+    "max_transitions",
+    "max_rows_read",
+    "max_rows_returned",
+    "max_bytes_returned",
+    "limits",
+    "approve_above",
+    "expires_at",
+    "revoked",
+    "expired",
+    "grants",
+];
+
+fn show_task_types() -> [crate::relational::DataType; 25] {
+    use crate::relational::DataType::{BigInt, Boolean, Text, TimestampTz as Tz};
+    [
+        Text, BigInt, BigInt, Text, Text, Text, Text, Text, Text, Text, Text, Text, Text, Text,
+        BigInt, BigInt, BigInt, BigInt, BigInt, Text, BigInt, Tz, Boolean, Boolean, Text,
+    ]
+}
+
+/// The types of `readlog::SHOW_COLUMNS`, as `readlog`'s `show_row` builds them.
+fn read_types() -> Vec<crate::relational::DataType> {
+    use crate::relational::DataType::{BigInt, Text};
+    (0..super::readlog::SHOW_COLUMNS.len())
+        .map(|i| {
+            if matches!(i, 3 | 8 | 10 | 13 | 24 | 25 | 29) {
+                Text
+            } else {
+                BigInt
+            }
+        })
+        .collect()
+}
+
+/// The result shape of `stmt`: empty unless it is a SHOW form.
+pub fn description(stmt: &TaskStatement) -> crate::relational::Description {
+    use crate::relational::DataType::{BigInt, Text};
+    let columns: Vec<(&str, crate::relational::DataType)> = match stmt {
+        TaskStatement::Show(_) => SHOW_TASK_COLUMNS
+            .iter()
+            .copied()
+            .zip(show_task_types())
+            .collect(),
+        TaskStatement::ShowReads { .. } => super::readlog::SHOW_COLUMNS
+            .iter()
+            .copied()
+            .zip(read_types())
+            .collect(),
+        TaskStatement::ShowExposure(_) | TaskStatement::ShowExposureDraft(_) => {
+            super::exposure::COLUMNS
+                .iter()
+                .copied()
+                .zip([Text, Text, Text, BigInt])
+                .collect()
+        }
+        TaskStatement::Error(_)
+        | TaskStatement::Create(_)
+        | TaskStatement::Revoke(_)
+        | TaskStatement::Grant { .. } => Vec::new(),
+    };
+    crate::relational::Description {
+        type_oids: vec![],
+        parameters: vec![],
+        typmods: vec![-1; columns.len()],
+        columns: columns
+            .into_iter()
+            .map(|(name, data_type)| crate::relational::ColumnDef {
+                id: 0,
+                name: name.to_owned(),
+                data_type,
+                not_null: false,
+            })
+            .collect(),
+    }
+}
+
+/// Runs `stmt` as `actor` at wall time `now`. The caller has already checked
+/// the session: not in a transaction block, and not a task session.
+pub fn execute(
+    admin: &crate::Admin,
+    actor: &crate::roles::CatalogRole,
+    stmt: &TaskStatement,
+    now: super::definition::WallClockMs,
+) -> Result<TaskOutcome, super::catalog::TaskDdlError> {
+    use super::catalog::TaskDdlError;
+    let fail = |sqlstate: &'static str, message: String| TaskDdlError { sqlstate, message };
+    let tasks = admin.tasks();
+    match stmt {
+        TaskStatement::Error(code) => Err(fail(code, "invalid task statement".into())),
+        TaskStatement::Create(new) => {
+            tasks.create(actor, (**new).clone(), now)?;
+            Ok(TaskOutcome::Tag(command_tag(stmt)))
+        }
+        TaskStatement::Revoke(name) => {
+            tasks.revoke(actor, name)?;
+            Ok(TaskOutcome::Tag(command_tag(stmt)))
+        }
+        TaskStatement::Grant {
+            grant,
+            bits,
+            task,
+            roles,
+        } => {
+            for role in roles {
+                tasks.grant(actor, task, role, *bits, *grant)?;
+            }
+            Ok(TaskOutcome::Tag(command_tag(stmt)))
+        }
+        TaskStatement::Show(name) => {
+            let view = tasks.view()?;
+            let visible = |def: &super::definition::TaskDef| {
+                def.privileges_of(actor).contains(TaskPrivileges::INSPECT)
+            };
+            let defs: Vec<_> = match name {
+                // Unknown and not visible are the same 42704: existence
+                // does not leak.
+                Some(name) => vec![view
+                    .task_names
+                    .get(name)
+                    .and_then(|id| view.tasks.get(id))
+                    .filter(|def| visible(def))
+                    .cloned()
+                    .ok_or_else(|| fail("42704", format!("task \"{name}\" does not exist")))?],
+                // `task_names` is ordered by name.
+                None => view
+                    .task_names
+                    .values()
+                    .filter_map(|id| view.tasks.get(id))
+                    .filter(|def| visible(def))
+                    .cloned()
+                    .collect(),
+            };
+            let rows = defs
+                .iter()
+                .map(|def| show_row(&view, def, now))
+                .collect::<Result<Vec<_>, CoreError>>()?;
+            Ok(TaskOutcome::Rows(
+                description(stmt),
+                SqlResult {
+                    columns: SHOW_TASK_COLUMNS.iter().map(|c| (*c).to_owned()).collect(),
+                    rows,
+                    affected: 0,
+                },
+            ))
+        }
+        TaskStatement::ShowReads { .. }
+        | TaskStatement::ShowExposure(_)
+        | TaskStatement::ShowExposureDraft(_) => Err(fail(
+            UNSUPPORTED,
+            "SHOW TASK READS and SHOW TASK EXPOSURE run on a session".into(),
+        )),
+    }
+}
+
+fn joined<'a>(names: impl IntoIterator<Item = &'a String>) -> String {
+    names
+        .into_iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn masked_text(name: &str, constant: Option<&Value>) -> String {
+    match constant {
+        None => name.to_owned(),
+        Some(Value::Text(text)) => format!("{name} = '{}'", text.replace('\'', "''")),
+        Some(other) => format!(
+            "{name} = {}",
+            crate::relational::output_text(other)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "NULL".into())
+        ),
+    }
+}
+
+fn show_row(
+    view: &crate::storage::engine::catalog::CatalogView,
+    def: &super::definition::TaskDef,
+    now: super::definition::WallClockMs,
+) -> Result<SqlRow, CoreError> {
+    use super::definition::ColumnMode;
+    let table_name = match view.by_id.get(&def.table) {
+        Some(entry) => {
+            let (schema, bare) = crate::relational::split_key(&entry.def.name);
+            if schema == "public" {
+                bare.to_owned()
+            } else {
+                format!("{schema}.{bare}")
+            }
+        }
+        None => format!("(dropped {})", def.table),
+    };
+    let readable = joined(
+        def.columns
+            .iter()
+            .filter(|(_, mode)| matches!(mode, ColumnMode::Readable))
+            .map(|(name, _)| name),
+    );
+    let masked = def
+        .columns
+        .iter()
+        .filter_map(|(name, mode)| match mode {
+            ColumnMode::Masked { constant } => Some(masked_text(name, constant.as_ref())),
+            ColumnMode::Readable | ColumnMode::Hidden => None,
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let write = def.allowed_write.as_ref();
+    let l = def.limits;
+    let limits = format!(
+        "statement_ms = {}, rows_scanned = {}, concurrent_statements = {}, lock_wait_ms = {}, \
+         pending_write_bytes = {}, stored_previews = {}, preview_ttl_s = {}",
+        l.statement_ms,
+        l.rows_scanned,
+        l.concurrent_statements,
+        l.lock_wait_ms,
+        l.pending_write_bytes,
+        l.stored_previews,
+        l.preview_ttl_s
+    );
+    let grants = def
+        .grants
+        .iter()
+        .map(|(role, bits)| {
+            let mut held = Vec::new();
+            if bits.contains(TaskPrivileges::UNDO) {
+                held.push("undo");
+            }
+            if bits.contains(TaskPrivileges::INSPECT) {
+                held.push("inspect");
+            }
+            format!("{role} ({})", held.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let expires_ms =
+        u64::try_from(def.expires_at.0).map_err(|_| CoreError::Sql(SqlError::Overflow))?;
+    Ok(SqlRow {
+        values: vec![
+            Value::Text(def.name.as_str().to_owned()),
+            int_value(def.id.0)?,
+            int_value(def.def_version)?,
+            Value::Text(def.issuer.clone()),
+            Value::Text(def.executor.clone()),
+            def.approver.clone().map_or(Value::Null, Value::Text),
+            Value::Text(table_name),
+            Value::Text(def.visible_rows.0.clone()),
+            Value::Text(readable),
+            Value::Text(masked),
+            Value::Text(joined(&def.untrusted_allowed)),
+            write.map_or(Value::Null, |w| Value::Text(joined(&w.columns))),
+            write.map_or(Value::Null, |w| Value::Text(w.old_row.0.clone())),
+            write.map_or(Value::Null, |w| Value::Text(w.new_row.0.clone())),
+            int_value(def.mutation_caps.distinct_rows)?,
+            int_value(def.mutation_caps.transitions)?,
+            int_value(def.disclosure_caps.rows_read)?,
+            int_value(def.disclosure_caps.rows_returned)?,
+            int_value(def.disclosure_caps.bytes_returned)?,
+            Value::Text(limits),
+            if write.is_some() {
+                int_value(def.approval_threshold)?
+            } else {
+                Value::Null
+            },
+            ms_timestamptz(expires_ms)?,
+            Value::Bool(def.revoked),
+            Value::Bool(now >= def.expires_at),
+            Value::Text(grants),
+        ],
+        version: 0,
+    })
+}
