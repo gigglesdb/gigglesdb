@@ -92,7 +92,9 @@ pub(super) fn execute_mode(
             );
             let prepared = core(session.prepare(&sql))?;
             let before = settings.current.clone();
-            if let Err(error) = session.execute_prepared(&prepared, &[]) {
+            // GD-0061 R3-311: a savepoint command returns no rows; the
+            // unreleased result is discarded.
+            if let Err(error) = session.execute_prepared_unreleased(&prepared, &[]) {
                 let code = crate::service::sqlstate(&error);
                 if code == "3B001" {
                     diagnostic.wire_message = Some(format!("savepoint \"{name}\" does not exist"));

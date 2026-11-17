@@ -107,7 +107,7 @@ impl State {
         Ok(())
     }
 
-    fn copy_stdout(
+    pub(super) fn copy_stdout(
         &mut self,
         options: &crate::auth::statements::CopyOutput,
         session: &mut Session,
@@ -119,8 +119,13 @@ impl State {
         // PostgreSQL streams COPY TO STDOUT: a spilled v2 result is read from its
         // temp file in chunks and flushed as it goes, never materialised.
         let (result, spilled) = giggles_core::relational::spill::streaming(
-            || session.execute_prepared(&prepared, &[]));
+            || session.execute_prepared_unreleased(&prepared, &[]));
+        // GD-0061 R3-311: the whole result is one page, released (masked,
+        // checked and charged) before the CopyOut header is written. A task
+        // session's spill never reaches this handle: core materialises it
+        // behind the release tag. Outside a task session this is a move.
         let result = core(result)?;
+        let result = core(session.release_page(result))?.into_inner();
         let rows: Box<dyn Iterator<Item = Result<giggles_core::relational::SqlRow, giggles_core::CoreError>>> =
             match spilled {
                 Some(spilled) => Box::new(spilled),
@@ -501,10 +506,13 @@ impl State {
                     .trim_end_matches(';')
                     .eq_ignore_ascii_case("rollback")
             {
-                let result = core(session.execute_sql(sql, &[]))?;
+                // GD-0061 R3-311: ROLLBACK returns no rows; its completion is
+                // built by the server and the core result is discarded.
+                drop(core(session.execute_sql_unreleased(sql, &[]))?);
                 self.settings
                     .transaction(was_transaction, session.in_transaction(), "ROLLBACK");
-                complete("ROLLBACK", &result, out)?;
+                let result = Released::synthetic(SqlResult::default());
+                complete("ROLLBACK", result.get(), out)?;
             } else {
                 let p = core(session.prepare(sql))?;
                 let d = core(session.describe(&p))?;
@@ -515,20 +523,24 @@ impl State {
                     row_description(&d, &[], out)?;
                     let mut count = 0;
                     while !cursor.is_exhausted() {
-                        let chunk = self.diagnostic.core(session.fetch_cursor(
+                        // GD-0061 R3-311: fetch unreleased, release, then encode.
+                        let chunk = self.diagnostic.core(session.fetch_cursor_unreleased(
                             &mut cursor,
                             CURSOR_ROWS,
                             CURSOR_BYTES,
                         ))?;
-                        let n = chunk.len();
-                        let result = SqlResult {
-                            rows: chunk,
-                            ..SqlResult::default()
-                        };
+                        let result = self
+                            .diagnostic
+                            .core(session.release_page(chunk))?
+                            .map(|rows| SqlResult {
+                                rows,
+                                ..SqlResult::default()
+                            });
+                        let n = result.get().rows.len();
                         rows(
                             &self.settings.current,
                             session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            &result,
+                            result.get(),
                             &d,
                             &[],
                             0,
@@ -547,9 +559,12 @@ impl State {
                     begin_implicit(session, implicit, &mut self.settings)?;
                 }
                 self.diagnostic.core(session.sync_replication_role(&self.settings))?;
+                // GD-0061 R3-311: the whole result is released once, here,
+                // before any row is encoded (a move outside a task session).
                 let (result, spilled) = giggles_core::relational::spill::streaming(
-                    || session.execute_prepared(&p, &[]));
+                    || session.execute_prepared_unreleased(&p, &[]));
                 let result = self.diagnostic.core(result)?;
+                let result = self.diagnostic.core(session.release_page(result))?.into_inner();
                 self.settings
                     .transaction(was_transaction, session.in_transaction(), p.command());
                 if let Some(mut spilled) = spilled {

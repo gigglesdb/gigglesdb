@@ -2098,22 +2098,9 @@ impl Session {
             result
         })
     }
-    /// Plain exit for trusted callers: a task session's cursor is refused
-    /// before it advances (GD-0061 R3-310); task callers use
-    /// `fetch_cursor_unreleased` and `release_page`.
-    pub(crate) fn fetch_cursor(
-        &mut self,
-        cursor: &mut Cursor,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> Result<Vec<giggles_core::relational::SqlRow>, CoreError> {
-        if self.sql.task().is_some() {
-            return Err(task_session_refusal());
-        }
-        self.fetch_cursor_unreleased(cursor, max_rows, max_bytes)?
-            .untasked()
-    }
-    /// `fetch_cursor`, with the chunk held until `release_page`.
+    /// One chunk of `cursor`, held until `release_page` (GD-0061 R3-310). Every
+    /// server caller releases it before encoding; there is no plain exit
+    /// (R3-311 removed the last caller).
     pub(crate) fn fetch_cursor_unreleased(
         &mut self,
         cursor: &mut Cursor,
@@ -2132,9 +2119,17 @@ impl Session {
     /// Releases one page of this session's results (core
     /// `SqlSession::release_page`): a move outside a task session; in a task
     /// session the page is masked, checked and charged before it is handed
-    /// over, and on any error nothing is.
-    pub fn release_page<T: Page>(&self, page: Unreleased<T>) -> Result<Released<T>, CoreError> {
-        self.sql.release_page(page)
+    /// over, and on any error nothing is. A release error is an execution
+    /// error: it aborts an open transaction like any other (GD-0061 R3-311).
+    pub fn release_page<T: Page>(
+        &mut self,
+        page: Unreleased<T>,
+    ) -> Result<Released<T>, CoreError> {
+        let released = self.sql.release_page(page);
+        if released.is_err() {
+            self.abort();
+        }
+        released
     }
     /// Validity only (revoked, expired, definition changed), for re-serving
     /// rows of a page that was already released and charged. No-op outside a

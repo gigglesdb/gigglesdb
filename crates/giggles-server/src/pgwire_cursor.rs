@@ -296,21 +296,24 @@ impl Cursors {
                 }
                 let mut fetched = 0usize;
                 while fetched < *count && !c.result.is_exhausted() {
-                    let chunk = core(session.fetch_cursor(
+                    // GD-0061 R3-311: every chunk is released before it is
+                    // encoded. A MOVE releases too: its rows were read and
+                    // are charged as read, though none is sent.
+                    let chunk = core(session.fetch_cursor_unreleased(
                         &mut c.result,
                         (*count - fetched).min(CURSOR_ROWS),
                         CURSOR_BYTES,
                     ))?;
-                    let n = chunk.len();
+                    let result = core(session.release_page(chunk))?.map(|rows| SqlResult {
+                        rows,
+                        ..SqlResult::default()
+                    });
+                    let n = result.get().rows.len();
                     if !moving {
-                        let result = SqlResult {
-                            rows: chunk,
-                            ..SqlResult::default()
-                        };
                         rows(
                             &settings.current,
                             session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            &result,
+                            result.get(),
                             &c.description,
                             formats,
                             0,

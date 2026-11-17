@@ -303,3 +303,212 @@ fn cached_returning_result_revalidated_per_slice() {
     assert_eq!(revalidate(&plain, 5, &mut diagnostic), Ok(()));
     test_route::enable(&[]);
 }
+
+// GD-0061 R3-311: the simple-query path, SQL cursors and COPY TO STDOUT.
+
+/// A simple Query; the bytes answered (through ReadyForQuery), or the first
+/// error with what reached the wire before it kept in `DATA_BEFORE_ERROR`.
+fn simple(state: &mut State, session: &mut Session, sql: &str) -> R<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut body = Vec::new();
+    cstr(sql, &mut body);
+    match state.handle(b'Q', &body, session, &mut out, std::time::Instant::now()) {
+        Ok(_) => Ok(out),
+        Err(code) => {
+            DATA_BEFORE_ERROR.with(|d| *d.borrow_mut() = out);
+            Err(code)
+        }
+    }
+}
+
+fn debits(service: &Service) -> Vec<u64> {
+    service
+        .admin
+        .task_disclosure(service.admin.tasks().get("inc-436").unwrap().unwrap().id)
+        .unwrap()
+        .debits
+        .iter()
+        .map(|d| d.rows_returned)
+        .collect()
+}
+
+fn returned(service: &Service) -> u64 {
+    service
+        .admin
+        .task_disclosure(service.admin.tasks().get("inc-436").unwrap().unwrap().id)
+        .unwrap()
+        .rows_returned
+}
+
+/// A task SELECT sent as a simple Query is fetched chunk by chunk, each chunk
+/// released before it is encoded: 600 rows in three pages with their own
+/// debits, masked on the wire, one read-log record from the simple entry.
+/// Over budget, the first page goes out and the second is refused (54T01)
+/// with none of its rows on the wire.
+#[test]
+fn simple_select_released_per_chunk() {
+    test_route::enable(&[StatementClass::Select]);
+    let (service, mut session) = fixture(10_000);
+    let mut state = self::state();
+    let out = simple(&mut state, &mut session, SELECT).unwrap();
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), ROWS as usize);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row, &[Some((i + 1).to_string()), Some("***".to_owned())], "row {i}");
+    }
+    assert_eq!(debits(&service), [256, 256, 88]);
+    let task = service.admin.tasks().get("inc-436").unwrap().unwrap().id;
+    let records = service.admin.task_read_log(task).unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record.text, SELECT);
+    assert_eq!(record.entry, giggles_core::task::readlog::ENTRY_PGWIRE_SIMPLE);
+    assert_eq!(record.class, class_code(StatementClass::Select));
+    assert_eq!(record.pages, 3);
+    assert_eq!(record.released_rows, ROWS as u64);
+
+    let (service, mut session) = fixture(300);
+    let mut state = self::state();
+    assert_eq!(simple(&mut state, &mut session, SELECT), Err("54T01"));
+    let sent = DATA_BEFORE_ERROR.with(|d| d.borrow().clone());
+    assert_eq!(data_rows(&sent).len(), 256);
+    // Only the page that went out is charged as returned (rows read by the
+    // refused page may still be debited, with no rows returned).
+    assert_eq!(returned(&service), 256);
+    test_route::enable(&[]);
+}
+
+/// Runs one SQL cursor command through `Cursors::execute` as the simple path
+/// would. On the wire a task session's cursor commands are refused before
+/// this point (`task_detect`); calling it directly proves the cursor code
+/// itself releases every chunk, so no task row could reach the wire from it.
+fn cursor_command(
+    state: &mut State,
+    session: &mut Session,
+    sql: &str,
+    out: &mut Vec<u8>,
+) -> R<()> {
+    let command = cursor::parse(sql)?.expect("a cursor command");
+    state.cursors.execute(
+        &command,
+        session,
+        &[],
+        &[],
+        &mut state.settings,
+        true,
+        &state.output,
+        out,
+    )
+}
+
+/// Every FETCH chunk is released before it is encoded, and a MOVE releases
+/// the rows it skips (they were read, so they are charged). With 300 rows of
+/// budget: FETCH 200 (charged 200), MOVE 50 (charged 50, nothing sent), then
+/// FETCH 100 is refused with 54T01 and none of its rows reaches the wire. A
+/// MOVE that charged nothing would have let it through.
+#[test]
+fn declare_fetch_released_per_fetch() {
+    test_route::enable(&[StatementClass::Select]);
+    let declare = format!("DECLARE c CURSOR WITH HOLD FOR {SELECT}");
+    let (service, mut session) = fixture(10_000);
+    let mut state = self::state();
+    let mut out = Vec::new();
+    cursor_command(&mut state, &mut session, &declare, &mut out).unwrap();
+    assert_eq!(debits(&service), Vec::<u64>::new());
+    let mut out = Vec::new();
+    cursor_command(&mut state, &mut session, "FETCH 300 c", &mut out).unwrap();
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 300);
+    assert!(rows.iter().all(|row| row[1].as_deref() == Some("***")), "masked");
+    assert_eq!(debits(&service), [256, 44]);
+    let mut out = Vec::new();
+    cursor_command(&mut state, &mut session, "MOVE 100 c", &mut out).unwrap();
+    assert!(data_rows(&out).is_empty());
+    assert_eq!(debits(&service), [256, 44, 100]);
+    let mut out = Vec::new();
+    cursor_command(&mut state, &mut session, "FETCH ALL c", &mut out).unwrap();
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 200);
+    assert_eq!(rows[0][0].as_deref(), Some("401"));
+    assert_eq!(debits(&service), [256, 44, 100, 200]);
+
+    let (service, mut session) = fixture(300);
+    let mut state = self::state();
+    let mut out = Vec::new();
+    cursor_command(&mut state, &mut session, &declare, &mut out).unwrap();
+    let mut out = Vec::new();
+    cursor_command(&mut state, &mut session, "FETCH 200 c", &mut out).unwrap();
+    assert_eq!(data_rows(&out).len(), 200);
+    let mut out = Vec::new();
+    cursor_command(&mut state, &mut session, "MOVE 50 c", &mut out).unwrap();
+    assert_eq!(debits(&service), [200, 50]);
+    let mut out = Vec::new();
+    assert_eq!(
+        cursor_command(&mut state, &mut session, "FETCH 100 c", &mut out),
+        Err("54T01")
+    );
+    assert!(data_rows(&out).is_empty(), "a refused page is never encoded");
+    assert_eq!(returned(&service), 250);
+    test_route::enable(&[]);
+}
+
+/// COPY TO STDOUT releases the whole result as one page before the
+/// CopyOutResponse header: the rows go out masked under one debit, and a
+/// result over budget is refused with nothing written at all.
+#[test]
+fn copy_out_released_before_first_byte() {
+    test_route::enable(&[StatementClass::Select]);
+    let sql = format!("COPY ({SELECT}) TO STDOUT");
+    let options = crate::auth::statements::copy_stdout_select(&sql)
+        .unwrap()
+        .expect("COPY TO STDOUT");
+    let (service, mut session) = fixture(10_000);
+    let mut state = self::state();
+    let mut out = Vec::new();
+    state.copy_stdout(&options, &mut session, &mut out).unwrap();
+    assert_eq!(out.first(), Some(&b'H'));
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("1\t***\n") && text.contains("600\t***\n"), "masked");
+    assert!(!text.contains("failed") && !text.contains("secret"), "masked");
+    assert_eq!(debits(&service), [ROWS as u64]);
+
+    let (service, mut session) = fixture(300);
+    let mut state = self::state();
+    let mut out = Vec::new();
+    assert_eq!(
+        state.copy_stdout(&options, &mut session, &mut out),
+        Err("54T01")
+    );
+    assert!(out.is_empty(), "nothing before the release: {out:?}");
+    assert_eq!(returned(&service), 0);
+    test_route::enable(&[]);
+}
+
+/// Outside a task session the converted paths are unchanged: a simple SELECT,
+/// a cursor MOVE/FETCH and COPY TO STDOUT send their rows unmasked, and
+/// release is a move (no disclosure records).
+#[test]
+fn non_task_simple_cursor_and_copy_release_is_a_move() {
+    let (service, _task) = fixture(10_000);
+    let mut session = service.role_session("incident_controller").unwrap();
+    let mut state = self::state();
+    let out = simple(&mut state, &mut session, SELECT).unwrap();
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), ROWS as usize);
+    assert_eq!(rows[0][1].as_deref(), Some("failed"));
+    let declare = format!("DECLARE c CURSOR WITH HOLD FOR {SELECT}");
+    let mut out = Vec::new();
+    cursor_command(&mut state, &mut session, &declare, &mut out).unwrap();
+    cursor_command(&mut state, &mut session, "MOVE 10 c", &mut out).unwrap();
+    let mut out = Vec::new();
+    cursor_command(&mut state, &mut session, "FETCH 5 c", &mut out).unwrap();
+    assert_eq!(data_rows(&out)[0][0].as_deref(), Some("11"));
+    let options =
+        crate::auth::statements::copy_stdout_select(&format!("COPY ({SELECT}) TO STDOUT"))
+            .unwrap()
+            .unwrap();
+    let mut out = Vec::new();
+    state.copy_stdout(&options, &mut session, &mut out).unwrap();
+    assert!(String::from_utf8_lossy(&out).contains("600\tfailed\n"));
+    assert_eq!(debits(&service), Vec::<u64>::new());
+}
