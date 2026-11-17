@@ -1707,17 +1707,20 @@ impl Session {
     }
     fn authorize_sequences(&mut self, dependencies: &[Option<String>]) -> Result<(), CoreError> {
         let sequences = self.sql.sequence_owners()?;
-        let image = self.service.admin.roles().image()
-            .map_err(|_| CoreError::Policy(Error::Authentication))?;
+        let image = match &self.role {
+            Role::Database { .. } => Some(self.service.admin.roles().image()
+                .map_err(|_| CoreError::Policy(Error::Authentication))?),
+            _ => None,
+        };
         let allowed_table = |table: &str| -> bool {
-            match &self.role {
-                Role::Application { tables, .. } => tables.contains(table),
-                Role::Database { name } => {
+            match (&self.role, &image) {
+                (Role::Application { tables, .. }, _) => tables.contains(table),
+                (Role::Database { name }, Some(image)) => {
                     self.sql
                         .table_authority_name(table)
                         .is_ok_and(|durable_name| {
                             self.sql
-                                .table_owner_in(&image, &durable_name)
+                                .table_owner_in(image, &durable_name)
                                 .is_ok_and(|owner| owner.as_deref() == Some(name.as_str()))
                         })
                 }
@@ -1727,7 +1730,7 @@ impl Session {
         let allowed_standalone = |sequence: &str| -> bool {
             matches!(&self.role, Role::Database { .. }) && allowed_table(sequence)
         };
-        let superuser = if let Role::Database { name } = &self.role {
+        let superuser = if let (Role::Database { name }, Some(image)) = (&self.role, &image) {
             image
                 .get(name)
                 .map_err(role_lookup_error)?

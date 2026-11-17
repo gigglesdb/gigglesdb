@@ -10,7 +10,7 @@ use serde_json::json;
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -156,16 +156,22 @@ async fn concurrent_grant_revoke_visibility() {
         clients.push(Fixture::connect(&f.pg, "r").await);
     }
     let done = Arc::new(AtomicBool::new(false));
+    let epoch = Arc::new(AtomicU64::new(0));
+    let completed = Arc::new(std::array::from_fn::<_, 16, _>(|_| AtomicU64::new(0)));
     let barrier = Arc::new(tokio::sync::Barrier::new(17));
     let mut readers = Vec::new();
     for (i, client) in clients.into_iter().enumerate() {
         let done = done.clone();
         let barrier = barrier.clone();
+        let epoch = epoch.clone();
+        let completed = completed.clone();
         readers.push(tokio::spawn(async move {
             let extended = i % 2 != 0;
             let mut observations = Vec::new();
             barrier.wait().await;
             while !done.load(Ordering::Acquire) {
+                // An acquired epoch is published only after that flip completes.
+                let observed_epoch = epoch.load(Ordering::Acquire);
                 let start = Instant::now();
                 let ok = if extended {
                     outcome(client.query("SELECT id FROM t", &[]).await)
@@ -173,6 +179,14 @@ async fn concurrent_grant_revoke_visibility() {
                     outcome(client.simple_query("SELECT id FROM t").await)
                 };
                 observations.push((start, Instant::now(), ok));
+                completed[i].store(observed_epoch, Ordering::Release);
+                // One observation per epoch avoids exhausting the fixture's
+                // admission budget while the coordinator waits for peers.
+                while epoch.load(Ordering::Acquire) == observed_epoch
+                    && !done.load(Ordering::Acquire)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
             }
             observations
         }));
@@ -184,8 +198,27 @@ async fn concurrent_grant_revoke_visibility() {
         let start = Instant::now();
         f.flip(grant).await;
         flips.push((start, Instant::now(), grant));
-        // Provide a measurable stable interval between committed changes.
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        let current_epoch = u64::try_from(k).unwrap() + 1;
+        epoch.store(current_epoch, Ordering::Release);
+        // Keep this state stable until every reader finishes a SELECT that
+        // started after the flip ended, regardless of debug-build latency.
+        let wait = tokio::time::timeout(Duration::from_secs(10), async {
+            while completed
+                .iter()
+                .any(|reader| reader.load(Ordering::Acquire) < current_epoch)
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            wait.is_ok(),
+            "timed out waiting for post-flip SELECTs after flip {k} (grant={grant}); reader epochs: {:?}",
+            completed
+                .iter()
+                .map(|reader| reader.load(Ordering::Acquire))
+                .collect::<Vec<_>>()
+        );
     }
     done.store(true, Ordering::Release);
     let mut checked = [0, 0];
