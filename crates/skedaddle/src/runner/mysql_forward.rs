@@ -1,4 +1,4 @@
-//! Read-only preparation for the MySQL forward runner.
+//! Preparation and joined copy/capture/apply for the MySQL forward runner.
 use super::*;
 use crate::{
     capability::ItemStatus,
@@ -301,7 +301,8 @@ impl Assessment {
 }
 
 /// Caller retains the destination exclusion capability for this entire operation.
-pub(super) async fn run_until_copying(
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run(
     root: &std::path::Path,
     id: &str,
     definition: &MigrationDefinition,
@@ -309,7 +310,10 @@ pub(super) async fn run_until_copying(
     exclusion: std::sync::Arc<crate::coordinator::exclusion::MigrationExclusion>,
     guard: &crate::coordinator::exclusion::ExclusionGuard,
     order: std::sync::Arc<dyn crate::event::PositionOrder + Send + Sync>,
-) -> Result<(), RunError> {
+    resume: bool,
+    stop: crate::engine::StopAt,
+    pause: tokio::sync::watch::Receiver<bool>,
+) -> Result<crate::engine::Reached, RunError> {
     use crate::{
         coordinator::chunk::SourceTableKey,
         coordinator::{self, State, epoch::Coordinator, journal::Journal, local::Local},
@@ -339,7 +343,7 @@ pub(super) async fn run_until_copying(
         id,
         Duration::from_secs(30),
     )?
-    .with_chunk_buffer(store, config, order);
+    .with_chunk_buffer(store.clone(), config.clone(), order.clone());
     let path = root.join(format!("{id}.local"));
     let local = if path.exists() {
         Local::open_journal(&path, &journal).await?
@@ -356,7 +360,10 @@ pub(super) async fn run_until_copying(
     .with_exclusion(exclusion.clone());
     owner.acquire_with_guard(guard).await?;
     let state = owner.state().clone();
-    if !matches!(state.lifecycle.state, State::Assessed | State::Copying) {
+    if !matches!(
+        state.lifecycle.state,
+        State::Assessed | State::Copying | State::CatchingUp | State::Paused
+    ) {
         return Err(coordinator::Error::Rejected(
             "MySQL startup requires Assessed or Copying".into(),
         )
@@ -372,7 +379,7 @@ pub(super) async fn run_until_copying(
     let mut installer = MysqlInstaller::new(
         prepared.mysql_config.clone(),
         prepared.destination_config.clone(),
-        identity,
+        identity.clone(),
         prepared.descriptors.clone(),
         prepared.startup_inputs.selected.clone(),
     )
@@ -388,10 +395,59 @@ pub(super) async fn run_until_copying(
         )
         .into());
     }
-    let engine = engine::Engine::new_with_exclusion(owner, journal.clone(), exclusion);
+    let holder = Arc::new(tokio::sync::Mutex::new(owner));
+    let authority = crate::coordinator::gc_authority::CoordinatorGcJournal::new(
+        holder.clone(),
+        store.clone(),
+        config.clone(),
+        order.clone(),
+    )
+    .await?;
+    let writer_checkpoint = authority.writer_checkpoint().await?;
+    let reader_checkpoint = super::operational::restart_reader_checkpoint(
+        &state,
+        authority.reader_checkpoint().await?,
+    )?;
+    drop(authority);
+    let mut owner = Arc::try_unwrap(holder)
+        .map_err(|_| coordinator::Error::RecoveryRequired("MySQL coordinator retained".into()))?
+        .into_inner();
+    // Opaque apply still uses a PG origin session as an exclusion identity;
+    // only native PG positions may use replication_origin_xact_setup.
+    let origin = format!("skedaddle_{id}");
+    owner
+        .effect(
+            coordinator::EffectKind::BufferPublication,
+            format!("runner-origin:{origin}"),
+            |_| async {
+                if prepared
+                    .destination
+                    .client
+                    .query_opt(
+                        "SELECT 1 FROM pg_replication_origin WHERE roname=$1",
+                        &[&origin],
+                    )
+                    .await?
+                    .is_none()
+                {
+                    prepared
+                        .destination
+                        .client
+                        .query_one("SELECT pg_replication_origin_create($1)", &[&origin])
+                        .await?;
+                }
+                Ok(())
+            },
+        )
+        .await?;
+    let engine = engine::Engine::new_with_exclusion(owner, journal.clone(), exclusion)
+        .with_pause_control(engine::PauseControl::new(
+            root.join(format!("{id}.control")),
+        )?);
     if state.lifecycle.state == State::Assessed {
         engine.start(&mut installer).await?;
     }
+    let mut plans = Vec::new();
     let mut connection = None;
     for table in &prepared.descriptors {
         let mut columns = Vec::new();
@@ -429,6 +485,7 @@ pub(super) async fn run_until_copying(
                 )
                 .into());
             }
+            plans.push(saved);
         } else {
             if connection.is_none() {
                 connection = Some(
@@ -439,13 +496,312 @@ pub(super) async fn run_until_copying(
                         .map_err(|e| adapter_error(&e))?,
                 );
             }
-            let plan = chunk::sample_plan(&mut connection.as_mut().unwrap().conn, &key, 1000)
+            // Leave headroom for concurrent inserts and key moves. The engine
+            // still enforces its 1,000-row reservation; no overfull read is admitted.
+            let plan = chunk::sample_plan(&mut connection.as_mut().unwrap().conn, &key, 500)
                 .await
                 .map_err(|e| adapter_error(&e))?;
             engine.plan(&plan).await?;
+            plans.push(plan);
         }
     }
-    Ok(())
+    // Setup sessions are released before admitting the live worker set.
+    if let Some(connection) = connection {
+        connection
+            .conn
+            .disconnect()
+            .await
+            .map_err(|e| adapter_error(&e))?;
+    }
+    drop(installer);
+    drive(
+        root,
+        id,
+        definition,
+        prepared,
+        engine,
+        store,
+        config,
+        order,
+        identity,
+        plans,
+        writer_checkpoint,
+        reader_checkpoint,
+        resume,
+        stop,
+        pause,
+    )
+    .await
+}
+
+// Deliberately local: PG's runner also owns fencing/cutover and verification
+// services. MySQL admits only the common Engine copy/capture/apply workers.
+#[allow(clippy::too_many_arguments)]
+async fn drive(
+    root: &std::path::Path,
+    id: &str,
+    definition: &MigrationDefinition,
+    prepared: MysqlPrepared,
+    engine: crate::engine::Engine,
+    store: std::sync::Arc<crate::buffer::backends::ObjectBufferStore>,
+    config: crate::buffer::reader::ReaderConfig,
+    order: std::sync::Arc<dyn crate::event::PositionOrder + Send + Sync>,
+    identity: crate::event::SourceIdentity,
+    plans: Vec<crate::coordinator::chunk::ChunkPlan>,
+    writer_checkpoint: Option<crate::buffer::writer::WriterCheckpoint>,
+    reader_checkpoint: Option<crate::buffer::reader::ReaderCheckpoint>,
+    resume: bool,
+    stop: crate::engine::StopAt,
+    pause: tokio::sync::watch::Receiver<bool>,
+) -> Result<crate::engine::Reached, RunError> {
+    use crate::{
+        budget::{Limits, RateLimit, ReadLimits, SystemClock, ThroughputBudget},
+        buffer::{
+            gc::RetentionPolicy,
+            reader::BufferReader,
+            writer::{BufferWriter, WriterConfig},
+        },
+        coordinator::{self, State},
+        engine::{CopyConfig, PgApplier},
+        event::PositionOrder,
+        mysql::{
+            capture::MysqlCapture,
+            chunk::MysqlChunks,
+            planner::{MysqlPlanner, MysqlPlannerTable},
+            position::{MysqlOrder, MysqlPosition},
+            startup::MysqlStartupRecord,
+        },
+        pg::apply::{self, executor::Executor},
+    };
+    use std::sync::Arc;
+    fn recovery(_: impl std::fmt::Display) -> coordinator::Error {
+        coordinator::Error::RecoveryRequired(
+            "MySQL forward worker failed; preserve state and inspect prerequisites".into(),
+        )
+    }
+    let state = engine.runtime().state().await;
+    let startup = MysqlStartupRecord::decode(
+        &state
+            .progress
+            .get("source-startup")
+            .ok_or_else(|| recovery("missing startup"))?
+            .0,
+    )
+    .map_err(recovery)?;
+    let start = startup.start_position().map_err(recovery)?;
+    let native_order = match &start {
+        MysqlPosition::Gtid { .. } => MysqlOrder::gtid(id),
+        MysqlPosition::File { server_uuid, .. } => MysqlOrder::file(server_uuid),
+    }
+    .map_err(recovery)?;
+    if native_order.domain() != order.domain() {
+        return Err(coordinator::Error::RecoveryRequired("MySQL startup/binding order domain mismatch; file-position binding must be qualified before GTID OFF can run".into()).into());
+    }
+    let max_bytes = definition
+        .budgets
+        .max_snapshot_bytes
+        .clamp(1, 16 * 1024 * 1024);
+    let scratch = root.join(format!("{id}.scratch"));
+    std::fs::create_dir_all(&scratch)?;
+    let (feedback, _receive) = std::sync::mpsc::channel();
+    let writer = Box::pin(BufferWriter::open_from_checkpoint(
+        store.clone(),
+        WriterConfig {
+            prefix: "runner".into(),
+            migration_id: id.into(),
+            stream: config.stream.clone(),
+            epoch: state.epoch,
+            segment_bytes: max_bytes,
+            segment_transactions: 100,
+            segment_age: Duration::from_secs(1),
+            max_transaction_bytes: max_bytes,
+        },
+        writer_checkpoint.unwrap_or_default(),
+        order.clone(),
+        feedback,
+        scratch,
+    ))
+    .await
+    .map_err(recovery)?;
+    let recovered = writer.checkpoint().map_err(recovery)?;
+    let restart = recovered
+        .last_position
+        .as_ref()
+        .map(|p| MysqlPosition::decode(p.bytes()).map_err(recovery))
+        .transpose()?
+        .unwrap_or(start);
+    let tables = prepared
+        .descriptors
+        .iter()
+        .map(|t| (t.schema.clone(), t.table.clone()))
+        .collect::<Vec<_>>();
+    // Concurrent migrations on one server must not share a dump server ID.
+    use sha2::{Digest, Sha256};
+    let server_hash = Sha256::digest(id.as_bytes());
+    let server_id = u32::from_be_bytes(server_hash[..4].try_into().expect("hash width")).max(1);
+    let mut capture = Box::pin(MysqlCapture::new(
+        &prepared.mysql_config,
+        identity.clone(),
+        restart,
+        &tables,
+        writer,
+        server_id,
+    ))
+    .await
+    .map_err(recovery)?
+    .with_startup_inputs(prepared.startup_inputs);
+    let mut planner_tables = Vec::new();
+    for (descriptor, plan) in prepared.descriptors.iter().zip(plans) {
+        let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let statement = prepared
+            .destination
+            .client
+            .prepare(&format!(
+                "SELECT {} FROM {}.{} LIMIT 0",
+                descriptor
+                    .columns
+                    .iter()
+                    .map(|c| quote(&c.name))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                quote(&descriptor.schema),
+                quote(&descriptor.table),
+            ))
+            .await
+            .map_err(recovery)?;
+        let columns = descriptor
+            .columns
+            .iter()
+            .zip(statement.columns())
+            .map(|(c, wire)| {
+                let mapped = crate::mapping::mysql::plan_column(c).map_err(recovery)?;
+                Ok(apply::Column {
+                    name: c.name.clone(),
+                    type_id: mapped.type_id,
+                    pg_type: mapped.pg_type,
+                    wire_type: wire.type_().clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, coordinator::Error>>()?;
+        planner_tables.push(
+            MysqlPlannerTable::new(
+                plan,
+                apply::Table {
+                    event_table: format!("{}.{}", descriptor.schema, descriptor.table),
+                    schema: descriptor.schema.clone(),
+                    name: descriptor.table.clone(),
+                    schema_version: 1,
+                    columns,
+                    key: descriptor.primary_key.clone(),
+                },
+            )
+            .map_err(recovery)?,
+        );
+    }
+    let stream = config.stream.clone();
+    let origin = format!("skedaddle_{id}");
+    let planner = MysqlPlanner::connect(
+        &prepared.mysql_config,
+        planner_tables,
+        native_order,
+        stream.clone(),
+        origin.clone(),
+        1000,
+    )
+    .await
+    .map_err(recovery)?;
+    let mut chunks = MysqlChunks::connect(&prepared.mysql_config, prepared.descriptors)
+        .await
+        .map_err(recovery)?;
+    let connector = super::operational::Connect {
+        config: prepared.destination_config,
+        connection: definition.destination.clone(),
+        drivers: vec![],
+    };
+    let positions = apply::SourcePositions::new(order.clone(), apply::OriginPolicy::Opaque);
+    let executor =
+        Executor::new(connector, stream.clone(), origin, 1000, positions).map_err(recovery)?;
+    let mut reader_config = config.clone();
+    reader_config.required_next_mseq = recovered.next_mseq;
+    let mut applier = PgApplier::new(
+        BufferReader::new(
+            store.clone(),
+            reader_config,
+            reader_checkpoint.unwrap_or_default(),
+            order.clone(),
+        )
+        .map_err(recovery)?,
+        stream,
+        executor,
+        planner,
+    );
+    engine
+        .enable_retention(
+            store,
+            config,
+            order.clone(),
+            RetentionPolicy {
+                retained_for_ms: definition.buffer_retention.min_seconds.saturating_mul(1000),
+                orphan_grace_ms: definition.buffer_retention.max_seconds.saturating_mul(1000),
+            },
+            Duration::from_secs(2),
+        )
+        .await?;
+    let rate = RateLimit {
+        per_second: max_bytes,
+        burst: max_bytes,
+    };
+    let reads = ReadLimits {
+        rows: RateLimit {
+            per_second: 1000,
+            burst: 1000,
+        },
+        bytes: rate,
+    };
+    let mut budget = ThroughputBudget::new(
+        Limits {
+            chunk_reads: reads,
+            verification_reads: reads,
+            applier_transactions: rate,
+            connections: Default::default(),
+            in_memory_segments: 2,
+        },
+        Arc::new(SystemClock::default()),
+    )
+    .map_err(recovery)?;
+    if resume && state.lifecycle.state == State::Paused {
+        engine.resume().await?;
+    }
+    let result = engine
+        .run_until(
+            &mut capture,
+            &mut chunks,
+            &mut applier,
+            CopyConfig {
+                source: identity,
+                order_domain: order.domain().into(),
+                schema_version: 1,
+                read_rows: 1000,
+                read_bytes: max_bytes,
+                window_bytes: max_bytes as usize,
+            },
+            &mut budget,
+            pause,
+            stop,
+        )
+        .await;
+    let close = applier.destination.close().await.map_err(recovery);
+    let disconnect = chunks.disconnect().await.map_err(recovery);
+    result
+        .and_then(|mut reached| {
+            close?;
+            disconnect?;
+            reached
+                .blockers
+                .push("buffer-budget-accounting-unavailable".into());
+            Ok(reached)
+        })
+        .map_err(RunError::Engine)
 }
 
 #[cfg(test)]

@@ -513,7 +513,14 @@ pub fn run(
             let prepared = mysql_forward::prepare(definition, options)
                 .await
                 .map_err(RunError::Preparation)?;
-            mysql_forward::run_until_copying(
+            if matches!(stop, StopAt::VerifiedReady) {
+                return Err(RunError::Preparation(failure(
+                    FailureKind::Blocked,
+                    "MySQL verified-ready evidence producers are unavailable",
+                    "Use --until catching-up; MySQL cutover readiness remains blocked.",
+                )));
+            }
+            return Box::pin(mysql_forward::run(
                 root,
                 id,
                 definition,
@@ -521,14 +528,11 @@ pub fn run(
                 exclusion.clone(),
                 &_guard,
                 binding.position_order(id, definition)?,
-            )
-            .await?;
-            return Err(
-                coordinator::Error::SourceBinding(SourceBindingError::NotWired(
-                    SourceConnector::Mysql,
-                ))
-                .into(),
-            );
+                resume,
+                stop,
+                pause,
+            ))
+            .await;
         }
         if binding.connector != SourceConnector::Postgres {
             record_unwired_binding(root, id, &binding).await?;
@@ -1082,7 +1086,7 @@ pub fn run(
 
 // Receipt collection follows ordinary durable apply progress, not GC cadence.
 // Restarting behind it could require receipts that were correctly collected.
-fn restart_reader_checkpoint(
+pub(super) fn restart_reader_checkpoint(
     state: &Materialized,
     retained: Option<ReaderCheckpoint>,
 ) -> engine::Result<Option<ReaderCheckpoint>> {
