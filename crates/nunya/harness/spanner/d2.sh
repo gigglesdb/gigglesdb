@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# D2 native Spanner scenarios. Own only the emulator started here and our server.
+[[ ${1:-} == resume && $# == 1 ]] || { echo 'FAIL resume arguments expected-resume'; exit 1; }
+umask 077
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+work=J:/gigglesdb-work/nunya/gd81-d2
+binary=${NUNYA_D2_NUNYA:-J:/gigglesdb-work/nunya/target-w2/debug/nunya.exe}
+export GOMODCACHE="$work/gomod" GOCACHE="$work/gocache" GOTOOLCHAIN=local GOFLAGS=-mod=mod
+export TEMP="$work/tmp" TMP="$work/tmp" TMPDIR="$work/tmp"
+mkdir -p "$TEMP" "${NUNYA_D2_ROOT:-$work/runs}"
+run=$(mktemp -d "${NUNYA_D2_ROOT:-$work/runs}/resume-XXXXXXXX")
+export NUNYA_HOME="$run/home"
+mkdir -p "$NUNYA_HOME" "$run/state"
+owned_emulator=false
+server_pid=
+stage=setup
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  if [[ -n $server_pid ]]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
+  if $owned_emulator; then
+    docker rm -fv gd81-d2-emulator >"$run/docker-cleanup.log" 2>&1 || rc=1
+  fi
+  if [[ $rc != 0 ]]; then printf 'FAIL resume %s see-run-evidence\n' "$stage"; fi
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+wait_port() {
+  python - "$1" <<'PY'
+import socket, sys, time
+host, port = sys.argv[1].removeprefix('http://').rsplit(':', 1)
+for _ in range(300):
+    try:
+        with socket.create_connection((host, int(port)), timeout=.2):
+            sys.exit(0)
+    except OSError:
+        time.sleep(.1)
+sys.exit(1)
+PY
+}
+if [[ -z ${NUNYA_D2_EMULATOR_GRPC:-} && -z ${NUNYA_D2_EMULATOR_REST:-} ]]; then
+  docker run -d --name gd81-d2-emulator --label gd81-d2=1 \
+    -p 127.0.0.1:19010:9010 -p 127.0.0.1:19020:9020 \
+    gcr.io/cloud-spanner-emulator/emulator:1.5.41 >"$run/docker-start.log" 2>&1
+  owned_emulator=true
+  export NUNYA_D2_EMULATOR_GRPC=127.0.0.1:19010 NUNYA_D2_EMULATOR_REST=http://127.0.0.1:19020
+  wait_port "$NUNYA_D2_EMULATOR_REST"
+  NUNYA_SPANNER_REST="$NUNYA_D2_EMULATOR_REST" bash "$here/setup.sh" >"$run/emulator-setup.log" 2>&1
+elif [[ -z ${NUNYA_D2_EMULATOR_GRPC:-} || -z ${NUNYA_D2_EMULATOR_REST:-} ]]; then
+  exit 1
+fi
+# Reserve three distinct ports together; release them immediately before startup.
+read -r admin_port mgmt_port native_port < <(python - <<'PY' | tr -d '\r'
+import socket
+sockets = [socket.socket() for _ in range(3)]
+for s in sockets: s.bind(('127.0.0.1', 0))
+print(*(s.getsockname()[1] for s in sockets))
+for s in sockets: s.close()
+PY
+)
+python - "$run/bootstrap.secret" <<'PY'
+import os, secrets, sys
+with open(sys.argv[1], 'w', encoding='ascii') as f: f.write(secrets.token_hex(32)+'\n')
+os.chmod(sys.argv[1], 0o600)
+PY
+"$binary" key generate >"$run/root.key" 2>"$run/key.log"
+verifier=$("$binary" standing hash <"$run/bootstrap.secret" 2>"$run/hash.log" | tr -d '\r\n')
+cp "$here/policy_gsql.toml" "$run/policy.toml"
+cat >"$run/nunya.toml" <<EOF
+admin_listen = '127.0.0.1:$admin_port'
+policy = 'policy.toml'
+state_dir = 'state'
+root_key_file = 'root.key'
+allow_plaintext = true
+[management]
+listen = '127.0.0.1:$mgmt_port'
+[[management.admin]]
+name = 'bootstrap'
+verifier = '$verifier'
+[spanner_native]
+listen = '127.0.0.1:$native_port'
+database = 'projects/test-project/instances/test-instance/databases/gsql'
+emulator_endpoint = 'http://${NUNYA_D2_EMULATOR_GRPC#http://}'
+[session]
+max_lifetime = '1h'
+idle_timeout = 'off'
+EOF
+unset verifier
+"$binary" policy check --config "$run/nunya.toml" >"$run/policy-check.log" 2>&1
+start_server() {
+  "$binary" serve --config "$run/nunya.toml" >"$run/serve-$1.log" 2>&1 &
+  server_pid=$!
+  wait_port "127.0.0.1:$mgmt_port"
+  wait_port "127.0.0.1:$native_port"
+  kill -0 "$server_pid"
+}
+start_server before
+server="http://127.0.0.1:$mgmt_port"
+bootstrap=(--server "$server" --principal bootstrap --principal-secret-file "$run/bootstrap.secret")
+"$binary" principal create "${bootstrap[@]}" --kind agent --generate-secret d2-agent >"$run/principal-issued" 2>"$run/principal.log"
+python - "$run/principal-issued" "$run/agent.secret" <<'PY'
+import os, sys
+lines = open(sys.argv[1], encoding='utf-8').read().splitlines()
+if len(lines) != 2 or len(lines[1]) != 64 or any(c not in '0123456789abcdef' for c in lines[1]):
+    sys.exit('unexpected principal output format')
+with open(sys.argv[2], 'w', encoding='ascii') as f: f.write(lines[1]+'\n')
+os.chmod(sys.argv[2], 0o600)
+os.remove(sys.argv[1])
+PY
+"$binary" principal grant "${bootstrap[@]}" d2-agent --route spanner-native=read-write >"$run/grant.log" 2>&1
+agent=(--server "$server" --principal d2-agent --principal-secret-file "$run/agent.secret")
+"$binary" session acquire "${agent[@]}" --route spanner-native --mode read-write >"$run/acquire.log" 2>&1
+# The trusted CLI emits quoted POSIX exports. Keep both exports and bearer private.
+eval "$("$binary" session env "${agent[@]}" --format sh 2>"$run/env.log" | tr -d '\r')"
+[[ $PGUSER == session:* && -n $PGPASSWORD ]]
+export NUNYA_D2_BEARER="nunya.session:${PGUSER#session:}.$PGPASSWORD"
+unset PGUSER PGPASSWORD PGHOST PGPORT PGDATABASE
+export NUNYA_D2_NATIVE="127.0.0.1:$native_port"
+export NUNYA_D2_DATABASE=projects/test-project/instances/test-instance/databases/gsql
+export SPANNER_DISABLE_BUILTIN_METRICS=true
+stage=build
+(cd "$here/client" && go build -o "$run/client.exe" .) >"$run/go-build.log" 2>&1
+stage=before
+"$run/client.exe" resume before --reference "$run/token-reference"
+stage=restart
+kill "$server_pid"
+wait "$server_pid" 2>/dev/null || true
+server_pid=
+start_server after
+stage=after
+"$run/client.exe" resume after --reference "$run/token-reference"
