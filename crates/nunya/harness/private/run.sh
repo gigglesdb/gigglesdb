@@ -39,6 +39,71 @@ scenario_bootstrap() {
     "$child_bash" -c "$child" bootstrap "$NUNYA_PG_PORT") || return 1
   [[ $first =~ ^session:[0-9a-f]{32}$ && $first == "$second" ]]
 }
+scenario_private_network() {
+  local output db_container db_ip status=0 step name
+  scenario_pass=0 scenario_fail=0
+  for step in 1 2 3 4 5; do
+    status=0
+    case "$step" in
+      1)
+        output=$(timeout 40 "${compose[@]}" exec -T -e NUNYA_HOME=/tmp/nunya-home tool \
+          timeout 30 /opt/nunya/nunya exec --server https://nunya:6481 \
+          --ca-file /etc/nunya/ca.pem --principal d1-agent \
+          --principal-secret-file /etc/nunya/principal.secret --context d1-tool \
+          --pg-host nunya --pg-port 6432 -- \
+          psql -d app -XAtc "SELECT email FROM customers WHERE id = 3" 2>/dev/null) || status=1
+        [[ $output == tok_email_* ]] || status=1
+        name='tool reaches Nunya with tokenized output'
+        ;;
+      2)
+        # getent and psql return 2 on lookup/connection failure; reject timeouts.
+        timeout 20 "${compose[@]}" exec -T -e PGPASSWORD=nunya-harness-only tool \
+          sh -c 'timeout 8 getent hosts db >/dev/null 2>&1; dns=$?
+            timeout 10 psql "host=db port=5432 user=nunya dbname=app connect_timeout=5" -XAtc "SELECT 1" >/dev/null 2>&1; pg=$?
+            [ "$dns" -eq 2 ] && [ "$pg" -eq 2 ]' || status=1
+        name='tool cannot resolve or connect to database by name'
+        ;;
+      3)
+        db_container=$(timeout 15 "${compose[@]}" ps -q db) || status=1
+        db_ip=
+        if [[ -n $db_container ]]; then
+          db_ip=$(timeout 15 docker inspect --format \
+            "{{with index .NetworkSettings.Networks \"${project}_db\"}}{{.IPAddress}}{{end}}" \
+            "$db_container" 2>/dev/null) || status=1
+        fi
+        if [[ $db_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          timeout 20 "${compose[@]}" exec -T -e PGPASSWORD=nunya-harness-only tool \
+            sh -c 'timeout 10 psql "host=$1 port=5432 user=nunya dbname=app connect_timeout=5" -XAtc "SELECT 1" >/dev/null 2>&1; [ "$?" -eq 2 ]' sh "$db_ip" || status=1
+        else status=1; fi
+        name='tool cannot connect to database by address'
+        ;;
+      4)
+        output=$(timeout 20 "${compose[@]}" exec -T -e PGPASSWORD=nunya-harness-only app \
+          timeout 10 psql "host=db port=5432 user=nunya dbname=app connect_timeout=5" \
+          -XAtc "SELECT email FROM customers WHERE id = 3" 2>/dev/null) || status=1
+        [[ $output == carol@example.test ]] || status=1
+        name='app reaches database directly'
+        ;;
+      5)
+        db_container=$(timeout 15 "${compose[@]}" ps -q db) || status=1
+        if [[ -n $db_container ]]; then
+          output=$(timeout 15 docker port "$db_container" 2>/dev/null) || status=1
+          [[ -z $output ]] || status=1
+        else status=1; fi
+        name='database has no published host port'
+        ;;
+      *) return 1 ;;
+    esac
+    if (( status == 0 )); then
+      scenario_pass=$((scenario_pass + 1))
+      printf 'PASS step %s: %s\n' "$step" "$name"
+    else
+      scenario_fail=$((scenario_fail + 1))
+      printf 'FAIL step %s: %s\n' "$step" "$name"
+    fi
+  done
+  (( scenario_fail == 0 ))
+}
 # Run the driver behind exec, keeping session credentials out of argv and logs.
 scenario_session_driver() {
   local driver=$1 mode=$2 context=$3 ttl=$4 line pid input output status=0 control=0 summary=0
@@ -138,7 +203,9 @@ private_main() {
   project="gd81-d1-$$-$RANDOM"
   compose=(docker compose -p "$project" -f "$run/compose.yaml" --profile private)
   trap private_cleanup EXIT
-  mkdir -p "$run/config" "$run/bin" "$run/data/db" "$run/home"
+  mkdir -p "$run/config" "$run/bin" "$run/data/db" "$run/home" "$run/tool"
+  # Create the bind source before Compose starts; only tool mounts this copy.
+  : >"$run/tool/principal.secret"
   chmod 700 "$run/home"
   cp "$source_dir/compose.yaml" "$source_dir/seed.sql" "$run/"
   cp "$source_dir/private/nunya.toml" "$run/config/"
@@ -169,6 +236,8 @@ private_main() {
   printf '%s\n' "${BASH_REMATCH[1]}" >"$run/principal.secret"
   unset credential
   chmod 600 "$run/principal.secret"
+  cp "$run/principal.secret" "$run/tool/principal.secret"
+  chmod 600 "$run/tool/principal.secret"
   export NUNYA_HOME
   NUNYA_HOME=$(native_path "$run/home")
   helper_opts=(--server "https://127.0.0.1:$NUNYA_MGMT_PORT" --ca-file "$(native_path "$run/ca.pem")"
@@ -176,6 +245,6 @@ private_main() {
     --pg-host 127.0.0.1 --pg-port "$NUNYA_PG_PORT")
   # Later items add one function and one name here per scenario.
   local failed=0 scenario
-  for scenario in bootstrap psycopg psycopg_expiry jdbc jdbc_expiry; do run_scenario "$scenario" || failed=1; done
+  for scenario in bootstrap private_network psycopg psycopg_expiry jdbc jdbc_expiry; do run_scenario "$scenario" || failed=1; done
   return "$failed"
 }
