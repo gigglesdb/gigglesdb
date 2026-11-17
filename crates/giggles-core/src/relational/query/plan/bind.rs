@@ -87,7 +87,7 @@ impl Plan {
         state: &Relational,
         parameters: &[Option<DataType>],
     ) -> R<()> {
-        if self.mutation.is_some() { return Ok(()); }
+        if self.mutation.is_some() || self.merge.is_some() { return Ok(()); }
         if !self.ctes.is_empty() {
             let mut plan = self.clone();
             let mut parameters = parameters.to_vec();
@@ -182,6 +182,7 @@ impl Plan {
         };
         let state = catalog.as_ref().unwrap_or(state);
         if let Some(m) = &mut self.mutation { return m.resolve(state, parameters); }
+        if let Some(m) = &mut self.merge { return m.resolve(state, parameters); }
         let meta = match &mut self.body {
             Body::Select(select) if !select.applies.is_empty() => {
                 subquery::resolve(select, state, parameters)?

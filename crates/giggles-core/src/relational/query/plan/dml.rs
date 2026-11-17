@@ -16,7 +16,7 @@ pub(super) fn parse(tokens: &[Token], owner: &mut Parser) -> R<Prepared> {
             p.relations.clear();
             Statement::InsertExpressions(InsertExpressions::parse(&mut p)?)
         }
-        Err(_) if mutation::claims(tokens) => {
+        Err(_) if mutation::claims(tokens) || merge::claims(tokens) => {
             p = parse::parser(tokens);
             Statement::Plan(Plan::parse(&mut p).map_err(|e| match e { ParseError::Definite(e)=>e, ParseError::Decline=>SqlError::Unsupported })?)
         }
@@ -114,9 +114,9 @@ pub(super) fn execute<'e>(
         }
     }
     candidate.ext.columns = catalog.ext.columns.clone();
-    // INSERT occupancy includes earlier CTE writes, while its SELECT source
+    // INSERT and MERGE occupancy includes earlier CTE writes, while their source
     // still reads the statement snapshot through the injected RowSource.
-    if p.command() == "INSERT"
+    if matches!(p.command(), "INSERT" | "MERGE")
         && let Some(table) = p.table().and_then(|n| candidate.tables.get(n))
     {
         candidate
@@ -154,7 +154,7 @@ pub(super) fn execute<'e>(
     // this accumulating write image; RETURNING is the communication channel.
     for table in snapshot.tables.values() {
         let old =
-            if p.command() == "INSERT" && p.table() == Some(snapshot.table_key(table).as_str()) {
+            if matches!(p.command(), "INSERT" | "MERGE") && p.table() == Some(snapshot.table_key(table).as_str()) {
                 &target.rows[&table.id]
             } else {
                 &snapshot.rows[&table.id]
@@ -205,6 +205,7 @@ impl Plan {
         source: Option<&dyn scan::RowSource>,
     ) -> R<SqlResult> {
         if self.ctes.is_empty() && let Some(m) = &self.mutation { return m.execute(state, prepared, params, clock, cancel, events, source); }
+        if self.ctes.is_empty() && let Some(m) = &self.merge { return m.execute(state, prepared, params, clock, cancel, events, source); }
         let bound = self.bind(state, prepared.params, &prepared.parameter_types)?;
         let parameters: Vec<_> = bound.description.parameters.into_iter().map(Some).collect();
         let snapshot = state.clone();

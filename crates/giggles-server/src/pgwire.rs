@@ -758,7 +758,7 @@ fn complete(command: &str, r: &Released<SqlResult>, out: &mut Vec<u8>) -> R<()> 
     let tag = match command {
         "SELECT" => format!("SELECT {}", r.rows.len()),
         "INSERT" => format!("INSERT 0 {}", r.affected),
-        "UPDATE" | "DELETE" => format!("{command} {}", r.affected),
+        "UPDATE" | "DELETE" | "MERGE" => format!("{command} {}", r.affected),
         _ => command.into(),
     };
     let mut b = vec![];

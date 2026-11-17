@@ -212,6 +212,7 @@ pub(super) fn read_only_check(
         "INSERT" => "cannot execute INSERT in a read-only transaction",
         "UPDATE" => "cannot execute UPDATE in a read-only transaction",
         "DELETE" => "cannot execute DELETE in a read-only transaction",
+        "MERGE" => "cannot execute MERGE in a read-only transaction",
         "TRUNCATE TABLE" => "cannot execute TRUNCATE in a read-only transaction",
         "CREATE TABLE" => "cannot execute CREATE TABLE in a read-only transaction",
         "CREATE VIEW" => "cannot execute CREATE VIEW in a read-only transaction",

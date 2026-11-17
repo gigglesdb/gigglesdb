@@ -1,21 +1,22 @@
 //! Joined mutations retain their statement snapshot and reuse the ordinary publisher.
 use super::*;
 use std::borrow::Cow;
-const KEY: &str = "\0mutation_key";
+type Publisher<'a> = dyn FnMut(&Prepared) -> R<()> + 'a;
+pub(super) const KEY: &str = "\0mutation_key";
 #[derive(Debug, Clone)]
 pub(in crate::relational) struct Mutation {
     pub target: String,
-    alias: String,
-    deleting: bool,
-    from: join::From,
-    predicate: Plan,
-    groups: Vec<(Vec<String>, Option<Plan>)>,
-    returning: Option<Plan>,
-    images: [String; 2],
+    pub(super) alias: String,
+    pub(super) deleting: bool,
+    pub(super) from: join::From,
+    pub(super) predicate: Plan,
+    pub(super) groups: Vec<(Vec<String>, Option<Plan>)>,
+    pub(super) returning: Option<Plan>,
+    pub(super) images: [String; 2],
 }
 impl Plan {
     pub(in crate::relational) fn mutation_command(&self) -> Option<&'static str> {
-        self.mutation.as_ref().map(|m| m.command())
+        self.mutation.as_ref().map(|m| m.command()).or_else(|| self.merge.as_ref().map(|_| "MERGE"))
     }
 }
 pub(super) fn claims(tokens: &[Token]) -> bool {
@@ -56,7 +57,7 @@ pub(super) fn claims(tokens: &[Token]) -> bool {
                 && tokens[pair[1]] == Token::Symbol('(')
         })
 }
-fn splits(tokens: &[Token]) -> R<Vec<&[Token]>> {
+pub(super) fn splits(tokens: &[Token]) -> R<Vec<&[Token]>> {
     let mut start = 0;
     let mut out = vec![];
     for i in parse::top(tokens)? {
@@ -68,7 +69,7 @@ fn splits(tokens: &[Token]) -> R<Vec<&[Token]>> {
     out.push(&tokens[start..]);
     Ok(out)
 }
-fn projection(
+pub(super) fn projection(
     tokens: &[Token],
     owner: &mut Parser,
     depth: usize,
@@ -80,10 +81,8 @@ fn projection(
     if let Body::Select(select) = &mut plan.body {
         select.query.allow_duplicate_outputs();
         for (item, alias) in &mut select.query.items {
-            if alias.is_none() {
-                if let Item::Scalar(Scalar::Column(c)) = item {
-                    *alias = Some(c.name.clone());
-                }
+            if alias.is_none() && let Item::Scalar(Scalar::Column(c)) = item {
+                *alias = Some(c.name.clone());
             }
         }
     }
@@ -108,9 +107,7 @@ pub(super) fn parse(
     p.word("only");
     let target = p.table_name()?;
     p.sym('*');
-    let alias = if p.word("as") {
-        p.name()?
-    } else if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if !["set", "using", "where", "returning"].contains(&w.as_str()))
+    let alias = if p.word("as") || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if !["set", "using", "where", "returning"].contains(&w.as_str()))
         || matches!(p.tokens.get(p.at), Some(Token::QuotedIdent(_)))
     {
         p.name()?
@@ -350,7 +347,7 @@ impl Mutation {
         }
         Ok(())
     }
-    fn catalog(&self, state: &Relational) -> R<Relational> {
+    pub(super) fn catalog(&self, state: &Relational) -> R<Relational> {
         let mut catalog = state.clone();
         let table = catalog
             .tables
@@ -364,7 +361,7 @@ impl Mutation {
         });
         Ok(catalog)
     }
-    fn returning_shape(&self, shape: &join::Shape, table: &TableDef) -> join::Shape {
+    pub(super) fn returning_shape(&self, shape: &join::Shape, table: &TableDef) -> join::Shape {
         let mut out = shape.clone();
         for alias in &self.images {
             let mut qualified = vec![];
@@ -396,6 +393,9 @@ impl Mutation {
     ) -> R<bind::Meta> {
         let catalog = self.catalog(state)?;
         let shape = self.from.resolve(&catalog, parameters)?;
+        self.resolve_shape(state, parameters, &shape)
+    }
+    pub(super) fn resolve_shape(&mut self, state: &Relational, parameters: &mut [Option<DataType>], shape: &join::Shape) -> R<bind::Meta> {
         let table = &state.tables[&self.target];
         let names = self
             .groups
@@ -415,19 +415,18 @@ impl Mutation {
             if let Some(plan) = plan {
                 if let Body::Select(s) = &plan.body {
                     for ((item, _), name) in s.query.items.iter().zip(names.iter()) {
-                        if let Item::Scalar(Scalar::Param(n)) = item {
-                            if parameters[*n - 1].is_none() {
+                        if let Item::Scalar(Scalar::Param(n)) = item
+                            && parameters[*n - 1].is_none() {
                                 parameters[*n - 1] = Some(
                                     table.columns[super::super::super::col(table, name)?]
                                         .data_type
                                         .clone(),
                                 );
-                            }
                         }
                     }
                 }
                 let (mut instantiated, _) =
-                    subquery::instantiate(plan, &shape, None, state, parameters)?;
+                    subquery::instantiate(plan, shape, None, state, parameters)?;
                 let meta = instantiated.resolve(state, parameters)?;
                 if meta.columns.len() != names.len() {
                     return Err(SqlError::Syntax);
@@ -445,10 +444,10 @@ impl Mutation {
             }
         }
         let (mut filter, _) =
-            subquery::instantiate(&self.predicate, &shape, None, state, parameters)?;
+            subquery::instantiate(&self.predicate, shape, None, state, parameters)?;
         filter.resolve(state, parameters)?;
         if let Some(returning) = &self.returning {
-            let shape = self.returning_shape(&shape, table);
+            let shape = self.returning_shape(shape, table);
             let (mut plan, _) = subquery::instantiate(returning, &shape, None, state, parameters)?;
             let mut meta = plan.resolve(state, parameters)?;
             if let Body::Select(select) = &returning.body {
@@ -622,7 +621,7 @@ impl Mutation {
         cancel: &mut dyn FnMut() -> bool,
         events: &mut Vec<super::super::super::constraints::Event>,
         injected_source: Option<&dyn scan::RowSource>,
-        mut publish: Option<&mut dyn FnMut(&Prepared) -> R<()>>,
+        mut publish: Option<&mut Publisher<'_>>,
     ) -> R<SqlResult> {
         let description = prepared.describe(state)?;
         let parameters = description
@@ -865,9 +864,9 @@ impl Mutation {
         Ok(result)
     }
 }
-struct Keys<'a> {
-    base: &'a dyn scan::RowSource,
-    target: u64,
+pub(super) struct Keys<'a> {
+    pub(super) base: &'a dyn scan::RowSource,
+    pub(super) target: u64,
 }
 impl scan::RowSource for Keys<'_> {
     fn scan<'s>(

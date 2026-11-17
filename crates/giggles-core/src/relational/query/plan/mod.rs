@@ -5,6 +5,7 @@ mod bind;
 mod cte;
 mod dml;
 mod mutation;
+mod merge;
 mod exec;
 pub(super) mod join;
 mod parse;

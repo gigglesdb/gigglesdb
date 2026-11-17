@@ -72,14 +72,13 @@ impl Query {
     ) -> R<bool> {
         let mut images = false;
         for (item, alias) in &mut self.items {
-            if let Item::Scalar(Scalar::Column(c)) = item {
-                if alias.is_none()
+            if let Item::Scalar(Scalar::Column(c)) = item
+                && alias.is_none()
                     && aliases.iter().any(|(a, _)| {
                         c.qualifier.as_ref() == Some(a) || c.qualifier.is_none() && &c.name == a
                     })
                 {
                     *alias = Some(c.name.clone());
-                }
             }
         }
         plan::subquery::map_query(self, &mut |s| {

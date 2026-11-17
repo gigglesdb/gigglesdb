@@ -347,6 +347,12 @@ impl Relational {
         }
         if expected.is_none() && sink.streams_index_builds()
             && let Statement::Plan(plan)=&prepared.statement
+            && let Some(merge)=plan.paged_merge(self)
+        {
+            return merge.paged(self,prepared,params,clock,sink,version_end,deferred);
+        }
+        if expected.is_none() && sink.streams_index_builds()
+            && let Statement::Plan(plan)=&prepared.statement
             && let Some(mutation)=plan.paged_mutation()
         {
             return mutation.paged(self,prepared,params,clock,sink,version_end,deferred);

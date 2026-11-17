@@ -2961,6 +2961,7 @@ impl Prepared {
         if let Statement::InsertMulti(insert) = &self.statement {
             return insert.implicit_sequences(state);
         }
+        if let Statement::Plan(plan) = &self.statement { return plan.implicit_sequences(state); }
         let mut dependencies = vec![];
         let mut add = |column: &ColumnDef| -> R<()> {
             if let Some(sql) = defaults::default_sql(state, column) {

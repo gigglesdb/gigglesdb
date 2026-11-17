@@ -11,6 +11,8 @@ pub(super) enum Kind {
     Left,
     Right,
     Full,
+    // MERGE uses full-join candidate selection with unrestricted ON predicates.
+    MergeFull,
 }
 #[derive(Debug, Clone)]
 pub(super) enum Condition {
@@ -835,13 +837,13 @@ fn join_shape(
             offset + right.columns.len() + merged.len() - 1,
         ));
     }
-    if matches!(kind, Kind::Right | Kind::Full) {
+    if matches!(kind, Kind::Right | Kind::Full | Kind::MergeFull) {
         for c in &mut left.columns {
             c.not_null = false;
         }
     }
     let mut right_columns = right.columns;
-    if matches!(kind, Kind::Left | Kind::Full) {
+    if matches!(kind, Kind::Left | Kind::Full | Kind::MergeFull) {
         for c in &mut right_columns {
             c.not_null = false;
         }
@@ -1163,7 +1165,7 @@ impl From {
                     )?;
                 }
             }
-            if !found && matches!(kind, Kind::Left | Kind::Full) {
+            if !found && matches!(kind, Kind::Left | Kind::Full | Kind::MergeFull) {
                 emit(
                     pair(Some(row), None, offset, right_width),
                     row.version,
@@ -1175,7 +1177,7 @@ impl From {
                 )?;
             }
         }
-        if matches!(kind, Kind::Right | Kind::Full) {
+        if matches!(kind, Kind::Right | Kind::Full | Kind::MergeFull) {
             for (row, matched) in b.rows.iter().zip(matched) {
                 execution.comparison()?;
                 if !matched {
@@ -1211,7 +1213,7 @@ fn emit(
     for (a, b, ty) in &spec.merged {
         let value = match kind {
             Kind::Right => &values[offset + b],
-            Kind::Full if values[*a] == Value::Null => &values[offset + b],
+            Kind::Full | Kind::MergeFull if values[*a] == Value::Null => &values[offset + b],
             _ => &values[*a],
         };
         values.push(functions::coerce_clocked(value.clone(), ty, clock)?);
@@ -1314,7 +1316,7 @@ fn lateral_run<'a>(
     clock: Option<&super::super::super::clock::ExecutionClock>,
     execution: &'a Execution<'_>,
 ) -> R<Relation<'a>> {
-    if matches!(kind, Kind::Right | Kind::Full) {
+    if matches!(kind, Kind::Right | Kind::Full | Kind::MergeFull) {
         return Err(SqlError::Unsupported);
     }
     let mut inferred = parameters.to_vec();

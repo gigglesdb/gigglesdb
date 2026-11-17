@@ -625,6 +625,15 @@ impl Insert {
         }
         dependencies
     }
+    /// One evaluated MERGE INSERT action; defaults and identity stay in INSERT.
+    pub(super) fn merge_row(table: String, columns: Vec<String>, values: Vec<Option<Value>>, overriding: Option<bool>) -> Self {
+        let default_values = values.is_empty();
+        let defaults = vec![values.iter().map(Option::is_none).collect()];
+        Self { table, columns, source: None, alias: None, copy_input: None,
+            normalized: None, source_types: None,
+            rows: vec![values.into_iter().map(|v| Expr::Literal(v.unwrap_or(Value::Null))).collect()],
+            casts: BTreeMap::new(), defaults, default_values, overriding, conflict: None, returning: None }
+    }
     pub(super) fn from_query(table: String, columns: Vec<String>, source: query::Query) -> Self {
         Self { table, columns, source: Some(Box::new(source)), alias: None,
             copy_input: None, normalized: None, source_types: None, rows: vec![],

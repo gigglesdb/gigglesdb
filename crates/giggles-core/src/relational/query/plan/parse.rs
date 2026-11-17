@@ -41,7 +41,7 @@ impl Plan {
             // Parenthesized query expressions are owned by the planner.
             return true;
         }
-        if mutation::claims(tokens) { return true; }
+        if mutation::claims(tokens) || merge::claims(tokens) { return true; }
         if !tokens.first().is_some_and(|t| word(t, "select")) {
             return tokens
                 .first()
@@ -196,6 +196,7 @@ pub(super) fn expression(
     if tokens.is_empty() {
         return Err(SqlError::Syntax.into());
     }
+    if merge::claims(tokens) { return merge::parse(tokens, owner, depth, next); }
     if mutation::claims(tokens) { return mutation::parse(tokens, owner, depth, next); }
     if tokens.first().is_some_and(|t| word(t, "with")) {
         return cte::parse(tokens, owner, depth, next);
@@ -211,6 +212,9 @@ fn query_expression(
     depth: usize,
     next: &mut usize,
 ) -> ParseResult<Plan> {
+    if merge::action_call(tokens) && !tokens.windows(2).any(|t| word(&t[0], "merge") && word(&t[1], "into")) {
+        return Err(ParseError::Definite(SqlError::Syntax));
+    }
     let positions = top(tokens)?;
     let tail = positions
         .iter()

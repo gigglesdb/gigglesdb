@@ -171,15 +171,11 @@ fn sql_insert_select_on_conflict_do_nothing() {
 
 #[test]
 fn sql_insert_grammar_unsupported_matrix() {
-    for text in [
-        "INSERT INTO items VALUES (abs(1),'a','x',10),(2,'b','y',20)",
-        "INSERT INTO items VALUES (1+1,'a','x',10),(2,'b','y',20)",
-    ] {
-        assert_eq!(Prepared::parse(text, 1, 0).unwrap_err(), SqlError::Unsupported, "{text}");
-    }
     // PG18.6 accepts the INSERT alias and expressions over target/EXCLUDED columns in DO UPDATE
     // SET/WHERE (e1-sql/evidence/oracle-pg186-upsert-expressions.txt), so these now parse.
     for text in [
+        "INSERT INTO items VALUES (abs(1),'a','x',10),(2,'b','y',20)",
+        "INSERT INTO items VALUES (1+1,'a','x',10),(2,'b','y',20)",
         "INSERT INTO items AS t VALUES (1,'a','x',10),(2,'b','y',20)",
         "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=abs(items.n)",
         "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=items.n+1",

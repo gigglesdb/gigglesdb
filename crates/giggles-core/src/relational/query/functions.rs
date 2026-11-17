@@ -777,6 +777,8 @@ impl Scalar {
                 } else {
                     (format!("{UNDEFINED_ROUTINE_PREFIX}{name}"), quoted)
                 };
+                // MERGE RETURNING rewrites this contextual expression before scalar parsing.
+                if name == "merge_action" { return Err(SqlError::Syntax); }
                 p.punct('(')?;
                 if name == "position" && !qualified_call && !quoted {
                     if matches!(
