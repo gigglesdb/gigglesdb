@@ -219,13 +219,8 @@ impl SqlSession {
             });
             let (image, source, context, scope) = match &self.admin.inner.backend {
                 Backend::V2(db) => {
-                    // The snapshot source below reads the local store directly; a cluster
-                    // gateway buffers the result of the normal execution path instead
-                    // (GD-0075 P7-2; streaming over ranges is later work).
-                    if db.cluster_services().is_some() {
-                        discard(&tag);
-                        return self.buffer_cursor(&p, params, clock, buffer_limit);
-                    }
+                    // Stream through the local store or the gateway's paged range reader.
+                    // Correctness-sensitive statement shapes still use bounded buffering.
                     // The existing transaction API cannot fork its write overlay.
                     // Keep read-your-writes correct via the bounded bridge fallback.
                     // SERIALIZABLE reads must enter the read set validated at COMMIT,
@@ -238,9 +233,14 @@ impl SqlSession {
                         discard(&tag);
                         return self.buffer_cursor(&p, params, clock, buffer_limit);
                     }
+                    // V2 prepare normalizes the presentation epoch to zero, including
+                    // gateway catalog-version epochs; match normal v2 execution.
                     if p.domain != u128::from_be_bytes(db.meta.domain) || p.epoch != 0 {
                         return Err(CoreError::Sql(SqlError::StaleSchema));
                     }
+                    // The implicit read transaction drops on every exit (including errors
+                    // and fallbacks), releasing cluster locks, liveness and heartbeats.
+                    // The cursor retains only the fixed-timestamp reader below.
                     let mut implicit = None;
                     let txn = self.v2_transaction.as_mut().unwrap_or_else(|| {
                         implicit.insert(db.begin(engine::txn::Isolation::ReadCommitted))
@@ -267,6 +267,9 @@ impl SqlSession {
                     let guard = db.sequencer.snapshot();
                     txn.begin_statement();
                     let ts = txn.snapshot_ts();
+                    if let Some(error) = txn.snapshot_error() {
+                        return Err(error.clone().into());
+                    }
                     let catalog = db.catalog().snapshot(txn)?;
                     // Cursors allocate no catalog IDs. Match metadata snapshots:
                     // include every validated schema/type/enum-label ID without
@@ -291,7 +294,11 @@ impl SqlSession {
                             #[cfg(test)]
                             index_reads: std::cell::Cell::new(0),
                             indexes: catalog.parts.indexes.clone(),
-                            db: db.clone(),
+                            _db: db.clone(),
+                            kv: db.cluster_services().map_or_else(
+                                || db.kv.clone() as Arc<dyn engine::kv::KvRead>,
+                                |services| services.reader(ts),
+                            ),
                             _guard: guard,
                             ts,
                             error: RefCell::new(None),
@@ -398,7 +405,9 @@ struct V2Snapshot {
     #[cfg(test)]
     index_reads: std::cell::Cell<usize>,
     indexes: Vec<relational::secondary_index::Descriptor>,
-    db: Arc<v2::V2Db>,
+    // Keep the engine and its maintenance alive for local cursors as before.
+    _db: Arc<v2::V2Db>,
+    kv: Arc<dyn engine::kv::KvRead>,
     _guard: engine::commit::SnapshotHandle,
     ts: engine::hlc::Ts,
     error: RefCell<Option<CoreError>>,
@@ -462,7 +471,7 @@ impl RowSource for V2Snapshot {
             }
         });
         let iter = engine::mvcc::VersionedRange::new(
-            self.db.kv.as_ref(),
+            self.kv.as_ref(),
             engine::kv::Keyspace::Index,
             lower.as_ref().map(Vec::as_slice),
             Bound::Excluded(hi.as_slice()),
@@ -514,7 +523,7 @@ impl RowSource for V2Snapshot {
             scan::Direction::Reverse => engine::kv::Direction::Reverse,
         };
         let iter = engine::mvcc::VersionedRange::new(
-            self.db.kv.as_ref(),
+            self.kv.as_ref(),
             engine::kv::Keyspace::Rows,
             lo.as_ref().map(Vec::as_slice),
             hi.as_ref().map(Vec::as_slice),

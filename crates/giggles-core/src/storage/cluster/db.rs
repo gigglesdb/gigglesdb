@@ -18,6 +18,8 @@ mod matrix_tests;
 mod serializable_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod stream_tests;
 
 /// A gateway: its SQL admin and its transaction services (for the peer dispatcher).
 pub(crate) struct Gateway {

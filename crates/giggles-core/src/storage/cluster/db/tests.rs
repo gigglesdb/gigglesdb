@@ -11,7 +11,7 @@ use crate::storage::range_api::{
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-fn clock() -> StatementClock {
+pub(super) fn clock() -> StatementClock {
     StatementClock {
         unavailable: None,
         transaction_us: 100,
@@ -33,7 +33,7 @@ fn splits() -> Vec<Vec<u8>> {
     splits
 }
 
-fn gateway(cluster: &Arc<LocalCluster>, node: u16) -> Gateway {
+pub(super) fn gateway(cluster: &Arc<LocalCluster>, node: u16) -> Gateway {
     attach_with(
         cluster,
         ClusterConfig {
@@ -417,8 +417,8 @@ fn a_gateway_sees_ddl_committed_through_another_gateway() {
     );
 }
 
-/// P7-2: the PostgreSQL wire path on a gateway. SELECTs run through cursors (buffered on a
-/// gateway), and two metadata reads share an epoch while no catalog change is published
+/// P7-2: the PostgreSQL wire path on a gateway. SELECTs run through cursors,
+/// and two metadata reads share an epoch while no catalog change is published
 /// between them, although each read draws a fresh oracle timestamp; DDL changes the epoch.
 #[test]
 fn a_gateway_serves_cursors_and_stable_metadata_epochs() {
