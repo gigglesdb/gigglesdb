@@ -434,3 +434,40 @@ fn routed_write_racing_the_split_fence_has_one_complete_outcome() {
         node.stop();
     }
 }
+
+#[test]
+fn split_refuses_an_enrolled_replacement() {
+    use giggles_replication::membership::{AdminCommand, PeerRecord};
+    let (_root, nodes) = start();
+    let node = leader(&nodes, PARENT);
+    let handle = node.host().group(PARENT).unwrap();
+    let lost = NODES.into_iter().find(|&id| id != node.node_id()).unwrap();
+    handle
+        .propose_admin(AdminCommand::Enrol {
+            lost,
+            peer: PeerRecord {
+                id: 4,
+                address: "127.0.0.1:4444".into(),
+                fingerprint: "04".repeat(32),
+            },
+        })
+        .unwrap();
+    assert!(
+        handle
+            .membership_status()
+            .unwrap()
+            .membership
+            .active
+            .is_some()
+    );
+    assert!(
+        splitter(node)
+            .split(PARENT, &table(50))
+            .unwrap_err()
+            .to_string()
+            .contains("membership change")
+    );
+    for node in nodes {
+        node.stop();
+    }
+}

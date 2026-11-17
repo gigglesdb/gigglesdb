@@ -34,7 +34,7 @@ impl RangeStore {
             applied_key(range),
             encode_applied(at).to_vec(),
         );
-        if replicas == descriptor.replicas {
+        if replicas_match(&replicas, &descriptor.replicas) {
             self.kv.write(batch, Durability::NoSync)?;
             return Ok(None);
         }
@@ -61,6 +61,12 @@ impl RangeStore {
         self.kv.write(batch, Durability::NoSync)?;
         Ok(Some(descriptor))
     }
+}
+
+fn replicas_match(sorted: &[ReplicaDesc], stored: &[ReplicaDesc]) -> bool {
+    let mut stored = stored.to_vec();
+    stored.sort();
+    sorted == stored
 }
 
 #[cfg(test)]
@@ -103,6 +109,9 @@ mod tests {
             Some(b"value".to_vec())
         );
         assert_eq!(store.children(range).unwrap().len(), 1);
+        let mut unsorted = new.replicas.clone();
+        unsorted.reverse();
+        assert!(replicas_match(&new.replicas, &unsorted));
         assert!(
             store
                 .change_replicas(range, new.replicas.clone(), true, pos(2, 1))
@@ -118,6 +127,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(store.descriptor(range).unwrap(), Some(new.clone()));
+        assert_eq!(store.descriptor(range).unwrap().unwrap().epoch, new.epoch);
         assert!(
             store
                 .change_replicas(range, vec![], true, pos(4, 1))

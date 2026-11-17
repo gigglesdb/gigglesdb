@@ -30,10 +30,10 @@ use crate::storage::range_api::{DIRECTORY_TAG, RangeDescriptor, RangeId, SYSTEM_
 use crate::storage::replicated::AppliedPosition;
 use crate::storage::{io, v2};
 
-#[path = "split.rs"]
-mod split;
 #[path = "membership.rs"]
 mod membership;
+#[path = "split.rs"]
+mod split;
 pub use split::SplitOutcome;
 pub(super) use split::{child_route, epoch_refusal, stale_descriptor};
 
@@ -207,10 +207,18 @@ impl RangeStore {
             None => WriteBatch::default(),
         };
         let (mut batch, outcome) = match check_batch(&descriptor, &batch) {
-            Ok(_) if range == SYSTEM_RANGE && self.directory_regression(&batch)?.is_some() => {
-                (WriteBatch::default(), None)
+            Ok(check) => {
+                if let Some(reason) = if range == SYSTEM_RANGE {
+                    self.directory_regression(&batch)?
+                } else {
+                    None
+                } {
+                    eprintln!("range {} batch at {} refused: {reason}", range.0, at.index);
+                    (WriteBatch::default(), None)
+                } else {
+                    (batch, Some(check))
+                }
             }
-            Ok(check) => (batch, Some(check)),
             Err(BatchError::Outside(_)) => (WriteBatch::default(), None),
             // A value this build cannot validate (for example a feature bit from a newer
             // build) stops the range instead of being refused: refusing would drop data that

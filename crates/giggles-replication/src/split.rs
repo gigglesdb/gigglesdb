@@ -106,6 +106,17 @@ impl Splitter {
         range: RangeId,
         at_key: &[u8],
     ) -> Result<(RangeDescriptor, RangeDescriptor)> {
+        let handle = self
+            .host
+            .group(range)
+            .ok_or_else(|| Error::Apply(format!("range {} is not hosted", range.0)))?;
+        let status = crate::replace::status(&handle).map_err(|e| Error::Apply(e.to_string()))?;
+        if membership_changing(&status.membership, &status.conf) {
+            return Err(Error::Apply(format!(
+                "range {}: cannot split during a membership change",
+                range.0
+            )));
+        }
         self.reconcile(Some(range))?;
         let stored = self.stored(range)?;
         let found = self.retry(|| {
@@ -406,5 +417,51 @@ impl SizeSplitter {
 impl Drop for SizeSplitter {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+fn membership_changing(
+    membership: &crate::membership::Membership,
+    conf: &raft::eraftpb::ConfState,
+) -> bool {
+    membership.active.is_some()
+        || !conf.voters_outgoing.is_empty()
+        || !conf.learners.is_empty()
+        || !conf.learners_next.is_empty()
+}
+
+#[cfg(test)]
+mod membership_guard_tests {
+    use super::*;
+    use crate::membership::{Membership, PeerRecord, Replacement, Step};
+    use raft::eraftpb::ConfState;
+
+    #[test]
+    fn split_guard_covers_replacement_joint_and_learners_and_clears_when_idle() {
+        let mut membership = Membership::default();
+        let conf = ConfState::default();
+        assert!(!membership_changing(&membership, &conf));
+        membership.active = Some(Replacement {
+            lost: 3,
+            new: PeerRecord {
+                id: 4,
+                address: "four".into(),
+                fingerprint: "04".repeat(32),
+            },
+            step: Step::Enrolled,
+            started_at: 1,
+        });
+        assert!(membership_changing(&membership, &conf));
+        membership.active = None;
+        assert!(!membership_changing(&membership, &conf));
+        for kind in 0..3 {
+            let mut conf = ConfState::default();
+            match kind {
+                0 => conf.voters_outgoing.push(3),
+                1 => conf.learners.push(4),
+                _ => conf.learners_next.push(4),
+            }
+            assert!(membership_changing(&membership, &conf));
+        }
     }
 }

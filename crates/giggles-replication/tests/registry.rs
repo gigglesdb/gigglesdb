@@ -31,8 +31,7 @@ fn start() -> (Root, Vec<ClusterNode>, Vec<NodeRecord>) {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        )),
-    );
+        )));
     let layout = presplit(&[], &NODES, 3).unwrap();
     let pki = make_pki(&root.0.join("pki"), &NODES);
     let listeners: Vec<_> = NODES
@@ -120,6 +119,14 @@ fn enrol_read_and_retire() {
             .to_string()
             .contains("another active")
     );
+    for id in NODES {
+        assert!(
+            registry::retire(client, 1, id)
+                .unwrap_err()
+                .to_string()
+                .contains("still a replica")
+        );
+    }
     assert!(registry::retire(client, 1, 4).unwrap());
     assert!(!registry::retire(client, 1, 4).unwrap());
     assert!(

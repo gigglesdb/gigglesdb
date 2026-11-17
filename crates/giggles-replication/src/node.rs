@@ -566,10 +566,15 @@ impl Replica {
                 EntryType::EntryConfChangeV2 => {
                     let cc = ConfChangeV2::parse_from_bytes(&e.data)
                         .map_err(|e| Error::Corrupt(e.to_string()))?;
-                    let pending = e.index > self.log().conf_index()?;
-                    let accepted = !pending || self.membership.accept_conf_change(&cc, e.index);
-                    let result = self.state.apply_conf_change(accepted.then_some(&cc), at)
-                        .map_err(|e| Error::Apply(e.to_string()))?;
+                    let conf_index = self.log().conf_index()?;
+                    let pending = e.index > conf_index;
+                    let accepted = if pending {
+                        self.membership.accept_conf_change(&cc, e.index)
+                    } else {
+                        // Below conf_index the state was flushed before the later conf
+                        // was persisted, so it cannot be behind; None is the safe no-op.
+                        e.index == conf_index
+                    };
                     if pending {
                         if accepted {
                             let cs = self.raw.apply_conf_change(&cc).map_err(Error::Raft)?;
@@ -578,6 +583,9 @@ impl Replica {
                                 Some(self.node_id),
                                 "node.conf.before",
                             );
+                            self.state
+                                .flush()
+                                .map_err(|e| Error::Apply(e.to_string()))?;
                             self.log()
                                 .apply_conf(&cs, e.index, &self.membership.encode())?;
                             crate::failpoint::hit(
@@ -590,7 +598,7 @@ impl Replica {
                             refused = Some("unexpected membership configuration change".to_owned());
                         }
                     }
-                    Ok(result)
+                    self.state.apply_conf_change(accepted.then_some(&cc), at)
                 }
                 EntryType::EntryConfChange => self.state.apply_noop(at),
                 EntryType::EntryNormal if e.data.is_empty() => self.state.apply_noop(at),
@@ -608,9 +616,10 @@ impl Replica {
                             if result == Ok(ApplyOutcome::Refused) {
                                 // A range group refused the batch at apply time (stale
                                 // epoch or a key outside its bounds): nothing changed.
-                                refused = Some(self.state.take_refusal(e.index).unwrap_or_else(
-                                    || "the batch was refused at apply time".to_owned(),
-                                ));
+                                refused =
+                                    Some(self.state.take_refusal(e.index).unwrap_or_else(|| {
+                                        "the batch was refused at apply time".to_owned()
+                                    }));
                             }
                             if result.is_ok() {
                                 crate::failpoint::hit(
@@ -967,5 +976,119 @@ mod wiped_peer_tests {
             .unwrap();
         assert_eq!(peer.matched, 0);
         assert_eq!(peer.next_idx, 51);
+    }
+}
+
+#[cfg(test)]
+mod conf_order_tests {
+    use super::*;
+    use crate::membership::PeerRecord;
+    use crate::state::{MemStateMachine, StateError};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingState {
+        inner: MemStateMachine,
+        calls: Mutex<Vec<&'static str>>,
+    }
+    impl StateMachine for RecordingState {
+        fn applied(&self) -> std::result::Result<Option<AppliedPosition>, StateError> {
+            self.inner.applied()
+        }
+        fn apply(
+            &self,
+            bytes: &[u8],
+            at: AppliedPosition,
+        ) -> std::result::Result<ApplyOutcome, StateError> {
+            self.inner.apply(bytes, at)
+        }
+        fn apply_noop(&self, at: AppliedPosition) -> std::result::Result<ApplyOutcome, StateError> {
+            self.inner.apply_noop(at)
+        }
+        fn apply_conf_change(
+            &self,
+            cc: Option<&ConfChangeV2>,
+            _: AppliedPosition,
+        ) -> std::result::Result<ApplyOutcome, StateError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(if cc.is_some() { "some" } else { "none" });
+            Ok(ApplyOutcome::Applied)
+        }
+        fn flush(&self) -> std::result::Result<(), StateError> {
+            self.calls.lock().unwrap().push("flush");
+            self.inner.flush()
+        }
+        fn checkpoint(&self, p: &Path) -> std::result::Result<AppliedPosition, StateError> {
+            self.inner.checkpoint(p)
+        }
+        fn install(&self, p: &Path) -> std::result::Result<AppliedPosition, StateError> {
+            self.inner.install(p)
+        }
+    }
+
+    #[test]
+    fn conf_crash_order_and_replay_selection() {
+        for (n, point) in ["node.conf.before", "node.conf.after"]
+            .into_iter()
+            .enumerate()
+        {
+            let cluster = [171 + n as u8; 16];
+            let dir = std::env::temp_dir().join(format!("conf-order-{}-{n}", std::process::id()));
+            let state = Arc::new(RecordingState::default());
+            let mut replica = Replica::new(
+                LogStore::open(&dir, cluster, 1).unwrap(),
+                state.clone(),
+                &[1, 2, 3],
+            )
+            .unwrap();
+            let mut out = replica.drive().unwrap();
+            replica
+                .membership
+                .apply_admin(
+                    &AdminCommand::Enrol {
+                        lost: 3,
+                        peer: PeerRecord {
+                            id: 4,
+                            address: "four".into(),
+                            fingerprint: "04".repeat(32),
+                        },
+                    },
+                    &replica.log().conf_state().unwrap(),
+                    1,
+                )
+                .unwrap();
+            let cc = replica.membership.expected_conf_change().unwrap();
+            let mut entry = Entry {
+                index: 2,
+                term: 1,
+                data: cc.write_to_bytes().unwrap().into(),
+                ..Default::default()
+            };
+            entry.set_entry_type(EntryType::EntryConfChangeV2);
+            crate::failpoint::arm(cluster, point, 1);
+            let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                replica.apply(std::slice::from_ref(&entry), &mut out)
+            }));
+            crate::failpoint::disarm(cluster);
+            assert!(crash.is_err());
+            // Neither crash boundary may consume the configuration in the state machine.
+            assert_eq!(state.applied().unwrap(), None);
+            if n == 0 {
+                assert!(state.calls.lock().unwrap().is_empty());
+                assert_eq!(replica.log().conf_index().unwrap(), 0);
+            } else {
+                assert_eq!(*state.calls.lock().unwrap(), vec!["flush"]);
+                assert_eq!(replica.log().conf_index().unwrap(), 2);
+                assert!(replica.log().conf_state().unwrap().learners.contains(&4));
+                replica.apply(std::slice::from_ref(&entry), &mut out).unwrap();
+                entry.index = 1;
+                replica.apply(&[entry], &mut out).unwrap();
+                assert_eq!(*state.calls.lock().unwrap(), vec!["flush", "some", "none"]);
+            }
+            drop(replica);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

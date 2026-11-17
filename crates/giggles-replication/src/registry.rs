@@ -233,6 +233,43 @@ pub fn retire(client: &dyn RangeClient, node: u64, id: u64) -> Result<bool> {
         if record.state == NodeState::Retired {
             return Ok(None);
         }
+        let tag = crate::directory::DIRECTORY_TAG;
+        let system = client
+            .descriptor_for(&range_key(RangeSpace::Catalog, &[tag]))
+            .map_err(|e| Error::Core(e.to_string()))?;
+        let mut req = ReadRequest {
+            range: system.id,
+            epoch: system.epoch,
+            space: RangeSpace::Catalog,
+            start: Bound::Included(vec![tag]),
+            end: Bound::Excluded(vec![tag + 1]),
+            dir: ReadDirection::Forward,
+            ts: client
+                .oracle()
+                .next(1)
+                .map_err(|e| Error::Core(e.to_string()))?,
+            page_bytes: 4096,
+        };
+        loop {
+            let page = client
+                .read(req.clone())
+                .map_err(|e| Error::Core(e.to_string()))?;
+            for (key, value) in page.pairs {
+                if let Some(desc) = crate::directory::decode_record(&key, &value)
+                    .map_err(|e| Error::Core(e.to_string()))?
+                    && desc.replicas.iter().any(|replica| replica.node == id)
+                {
+                    return Err(Error::Identity(format!(
+                        "node {id} is still a replica of range {}",
+                        desc.id.0
+                    )));
+                }
+            }
+            match page.resume {
+                Some(resume) => req.start = resume,
+                None => break,
+            }
+        }
         record.state = NodeState::Retired;
         Ok(Some(record))
     })
