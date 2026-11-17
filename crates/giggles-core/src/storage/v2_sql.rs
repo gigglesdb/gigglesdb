@@ -835,7 +835,10 @@ impl SqlSession {
                             _ => None,
                         };
                         let meter = crate::task::rows::StatementMeter::default();
-                        if !writing && (scope.is_some() || image.streaming_reduction(&bound)) {
+                        // Plain view reads also need the physical source: their
+                        // expanded output must not inherit the legacy image cap.
+                        let reads_view = names.iter().any(|name| binding.view_names.contains_key(name));
+                        if !writing && (scope.is_some() || image.streaming_reduction(&bound) || reads_view) {
                             let source = reduction::Source::new(SqlRows {
                                 conflict_floor: None, db, txn, parts: old,
                                 writing, prepared: &bound, params, effects: None, scope: None,

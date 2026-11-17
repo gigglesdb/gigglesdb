@@ -2743,7 +2743,7 @@ impl SqlSession {
     }
     /// Rows of a current view through SQL's own expansion (`SELECT * FROM`),
     /// in this transaction's snapshot. None when `view` is not a current view.
-    /// Like a native table, the relation must fit in one complete input.
+    /// Legacy input keeps its bounded materialization and row ceiling.
     pub(crate) fn native_view_rows_engine(&mut self, view: &relational::TableDef)
         -> Result<Option<Vec<relational::SqlRow>>, CoreError> {
         let Some(key) = self.native_view_key(view)? else { return Ok(None) };
@@ -2752,6 +2752,41 @@ impl SqlSession {
         let rows = relational::spill::bounded(|| self.execute_bound_engine(&p, &[], None))?.rows;
         if rows.len() > relational::MAX_ROWS { return Err(CoreError::Limit); }
         Ok(Some(rows))
+    }
+    /// V2 view input captures its SQL spill locally, then filters and retains
+    /// only the native read's top bound. No raw view spill escapes to an API caller.
+    pub(crate) fn native_view_rows_where<E, C>(
+        &mut self,
+        view: &relational::TableDef,
+        keep: &mut impl FnMut(&relational::SqlRow) -> Result<bool, E>,
+        bound: (usize, Option<C>),
+        map: fn(CoreError) -> E,
+    ) -> Result<Option<Vec<relational::SqlRow>>, E>
+    where
+        C: Fn(&relational::SqlRow, &relational::SqlRow) -> std::cmp::Ordering + Copy,
+    {
+        let result = (|| {
+            if !self.is_v2_engine() {
+                return Err(map(CoreError::Sql(relational::SqlError::Unsupported)));
+            }
+            let Some(key) = self.native_view_key(view).map_err(map)? else { return Ok(None) };
+            let p = self.prepare_typed_read(vec![key.clone()], |domain, epoch|
+                relational::Prepared::from_relation_read(domain, epoch, key)).map_err(map)?;
+            let (result, spilled) = relational::spill::streaming(|| self.execute_bound_engine(&p, &[], None));
+            let result = result.map_err(map)?;
+            complete_relation::retain_native_rows(keep, bound, map, |visit| {
+                if let Some(spilled) = spilled {
+                    for row in spilled {
+                        visit(&row.map_err(map)?)?;
+                    }
+                } else {
+                    for row in &result.rows { visit(row)?; }
+                }
+                Ok(())
+            }).map(Some)
+        })();
+        if result.is_err() { self.abort(); }
+        result
     }
     /// Whether `view` still describes a current view of this snapshot.
     pub(crate) fn native_view_engine_current(&self, view: &relational::TableDef) -> Result<bool, CoreError> {

@@ -1,5 +1,5 @@
 #![cfg(feature = "engine-rocksdb")]
-//! Heap arbiters and referenced-key updates retain statement-wide semantics
+//! With a 1,000-row test cap and 4,000-row fixtures, heap arbiters and referenced-key updates retain statement-wide semantics
 //! across v2 insert pages; legacy retains its complete-image admission limit.
 mod common;
 use giggles_core::{
@@ -13,6 +13,7 @@ impl SpillDir {
     fn new(name: &str) -> Self {
         let dir = common::fresh(&format!("{name}-spill"));
         std::fs::create_dir_all(&dir).unwrap();
+        spill::set_query_row_limit(Some(1_000));
         spill::set_thread_dir(Some(dir.clone()));
         Self(dir)
     }
@@ -22,6 +23,7 @@ impl SpillDir {
 }
 impl Drop for SpillDir {
     fn drop(&mut self) {
+        spill::set_query_row_limit(None);
         spill::set_thread_dir(None);
         let _ = std::fs::remove_dir_all(&self.0);
     }
@@ -66,47 +68,47 @@ fn heap_conflicts_and_legacy_cap() {
     {
         let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
         let mut s = admin.sql_session();
-        load(&mut s, 150_000);
+        load(&mut s, 4_000);
         affected(&mut s, "CREATE TABLE u (k int UNIQUE, v int)");
         assert_eq!(
             affected(&mut s, "INSERT INTO u SELECT id, id FROM t"),
-            150_000
+            4_000
         );
         assert_eq!(
             affected(
                 &mut s,
                 "INSERT INTO u SELECT id, id FROM t ON CONFLICT (k) DO UPDATE SET v = excluded.v + u.v"
             ),
-            150_000
+            4_000
         );
         let before = ints(&mut s, "SELECT count(*), sum(v) FROM u");
-        assert_eq!(before, [150_000, 22_500_150_000]);
-        let err = s.execute("INSERT INTO u SELECT CASE WHEN id = 100001 THEN 1 ELSE id END, id FROM t ON CONFLICT (k) DO UPDATE SET v = excluded.v + u.v", &[], None).unwrap_err();
+        assert_eq!(before, [4_000, 16_004_000]);
+        let err = s.execute("INSERT INTO u SELECT CASE WHEN id = 3001 THEN 1 ELSE id END, id FROM t ON CONFLICT (k) DO UPDATE SET v = excluded.v + u.v", &[], None).unwrap_err();
         assert_eq!(giggles_core::sqlstate(&err), "21000");
         assert_eq!(ints(&mut s, "SELECT count(*), sum(v) FROM u"), before);
         assert_eq!(
             affected(
                 &mut s,
-                "INSERT INTO u SELECT id + 150000, id FROM t ON CONFLICT ON CONSTRAINT u_k_key DO NOTHING"
+                "INSERT INTO u SELECT id + 4000, id FROM t ON CONFLICT ON CONSTRAINT u_k_key DO NOTHING"
             ),
-            150_000
+            4_000
         );
         assert_eq!(
             ints(&mut s, "SELECT count(*), sum(v) FROM u"),
-            [300_000, 33_750_225_000]
+            [8_000, 24_006_000]
         );
         // NULL arbiters do not witness a conflict, and fresh rowids must also
         // avoid existing heap rows omitted from the witness image.
         assert_eq!(
             affected(
                 &mut s,
-                "INSERT INTO u VALUES (NULL,1),(NULL,2),(300001,3) ON CONFLICT (k) DO UPDATE SET v = excluded.v"
+                "INSERT INTO u VALUES (NULL,1),(NULL,2),(8001,3) ON CONFLICT (k) DO UPDATE SET v = excluded.v"
             ),
             3
         );
         assert_eq!(
             ints(&mut s, "SELECT count(*), count(k) FROM u"),
-            [300_003, 300_001]
+            [8_003, 8_001]
         );
         assert_eq!(dir.files(), 0);
     }
@@ -115,7 +117,7 @@ fn heap_conflicts_and_legacy_cap() {
     {
         let admin = Admin::create_engine(&path, Limits::default(), Engine::Legacy).unwrap();
         let mut s = admin.sql_session();
-        load(&mut s, 280);
+        load(&mut s, 80);
         affected(&mut s, "CREATE TABLE u (k int UNIQUE, v int)");
         let err = s.execute("INSERT INTO u SELECT a.id * 1000 + b.id, a.id FROM t a JOIN t b ON b.id >= 0 ON CONFLICT (k) DO UPDATE SET v = excluded.v", &[], None).unwrap_err();
         assert!(matches!(err, CoreError::Sql(SqlError::Limit)), "{err:?}");
@@ -133,7 +135,7 @@ fn referenced_key_actions_across_pages() {
     {
         let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
         let mut s = admin.sql_session();
-        load(&mut s, 150_000);
+        load(&mut s, 4_000);
         affected(&mut s, "CREATE TABLE p (id int PRIMARY KEY, k int UNIQUE)");
         affected(&mut s, "INSERT INTO p SELECT id, id FROM t");
         affected(
@@ -144,7 +146,7 @@ fn referenced_key_actions_across_pages() {
         // Small fixture batches avoid the pre-existing quadratic certification
         // of a large outgoing-FK append, while retaining the original FK schema.
         affected(&mut s, "BEGIN");
-        for start in (1..=150_000).step_by(8) {
+        for start in (1..=4_000).step_by(8) {
             let values = (start..start + 8)
                 .map(|id| format!("({id})"))
                 .collect::<Vec<_>>()
@@ -158,32 +160,32 @@ fn referenced_key_actions_across_pages() {
                 &mut s,
                 "INSERT INTO p SELECT id, id FROM t ON CONFLICT (id) DO UPDATE SET k = p.k + 1000000"
             ),
-            150_000
+            4_000
         );
         assert_eq!(
             ints(&mut s, "SELECT count(*), min(pk), max(pk) FROM c_cas"),
-            [150_000, 1_000_001, 1_150_000]
+            [4_000, 1_000_001, 1_004_000]
         );
         affected(&mut s, "CREATE TABLE c_na (pk int REFERENCES p(k))");
         affected(&mut s, "INSERT INTO c_na VALUES (1000005)");
         let before = ints(&mut s, "SELECT count(*), sum(k) FROM p");
-        let err = s.execute("INSERT INTO p SELECT id, id FROM t WHERE id <= 70000 ON CONFLICT (id) DO UPDATE SET k = CASE WHEN p.id = 5 THEN p.k + 1000000 ELSE p.k END", &[], None).unwrap_err();
+        let err = s.execute("INSERT INTO p SELECT id, id FROM t WHERE id <= 3000 ON CONFLICT (id) DO UPDATE SET k = CASE WHEN p.id = 5 THEN p.k + 1000000 ELSE p.k END", &[], None).unwrap_err();
         assert_eq!(giggles_core::sqlstate(&err), "23503");
         assert_eq!(ints(&mut s, "SELECT count(*), sum(k) FROM p"), before);
         assert_eq!(
             ints(&mut s, "SELECT count(*), min(pk), max(pk) FROM c_cas"),
-            [150_000, 1_000_001, 1_150_000]
+            [4_000, 1_000_001, 1_004_000]
         );
         assert_eq!(
             affected(
                 &mut s,
-                "INSERT INTO p SELECT id, CASE WHEN id = 5 THEN 20000005 WHEN id = 70000 THEN 1000005 ELSE id + 1000000 END FROM t WHERE id <= 70000 ON CONFLICT (id) DO UPDATE SET k = excluded.k"
+                "INSERT INTO p SELECT id, CASE WHEN id = 5 THEN 20000005 WHEN id = 3000 THEN 1000005 ELSE id + 1000000 END FROM t WHERE id <= 3000 ON CONFLICT (id) DO UPDATE SET k = excluded.k"
             ),
-            70_000
+            3_000
         );
         assert_eq!(ints(&mut s, "SELECT k FROM p WHERE id = 5"), [20_000_005]);
         assert_eq!(
-            ints(&mut s, "SELECT k FROM p WHERE id = 70000"),
+            ints(&mut s, "SELECT k FROM p WHERE id = 3000"),
             [1_000_005]
         );
         assert_eq!(ints(&mut s, "SELECT pk FROM c_na"), [1_000_005]);

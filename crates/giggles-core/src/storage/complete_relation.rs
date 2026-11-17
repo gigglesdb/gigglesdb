@@ -56,6 +56,64 @@ fn retained_bytes(row: &SqlRow) -> usize {
     })
 }
 
+/// Shared complete native input retention for physical tables and expanded views.
+/// The producer visits every row, while only the filtered top bound is retained.
+pub(super) fn retain_native_rows<E, C>(
+    keep: &mut impl FnMut(&SqlRow) -> Result<bool, E>,
+    bound: (usize, Option<C>),
+    map: fn(CoreError) -> E,
+    visit_rows: impl FnOnce(&mut dyn FnMut(&SqlRow) -> Result<(), E>) -> Result<(), E>,
+) -> Result<Vec<SqlRow>, E>
+where
+    C: Fn(&SqlRow, &SqlRow) -> std::cmp::Ordering + Copy,
+{
+    let (limit, order) = bound;
+    let cmp = |a: &SqlRow, b: &SqlRow| order.map_or(std::cmp::Ordering::Equal, |cmp| cmp(a, b));
+    let threshold = limit.saturating_mul(2).max(64);
+    let mut rows = Vec::new();
+    let mut retained = crate::relational::scan::Retention::new(
+        crate::relational::scan::MAX_RETAINED_BYTES,
+    );
+    let mut sorter = (order.is_some() && limit > 10_000)
+        .then(crate::relational::spill::Sorter::new);
+    let mut visit = |row: &SqlRow| {
+        crate::cancellation::check().map_err(map)?;
+        NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0 + 1, n.get().1)));
+        if !keep(row)? {
+            return Ok(());
+        }
+        if let Some(sorter) = &mut sorter {
+            return sorter.push(row.clone(), retained_bytes(row), cmp, &mut retained)
+                .map_err(|e| map(CoreError::Sql(e)));
+        }
+        retained.charge(retained_bytes(row)).map_err(|e| map(CoreError::Sql(e)))?;
+        rows.push(row.clone());
+        if rows.len() >= threshold {
+            rows.sort_by(cmp);
+            for dropped in rows.drain(limit..) {
+                retained.release(retained_bytes(&dropped));
+            }
+        }
+        Ok(())
+    };
+    visit_rows(&mut visit)?;
+    crate::cancellation::check().map_err(map)?;
+    if let Some(sorter) = sorter {
+        let sorted = sorter.finish(cmp, &mut retained).map_err(|e| map(CoreError::Sql(e)))?;
+        for row in sorted.take(limit) {
+            let row = row.map_err(|e| map(CoreError::Sql(e)))?;
+            retained.charge(retained_bytes(&row)).map_err(|e| map(CoreError::Sql(e)))?;
+            rows.push(row);
+        }
+    }
+    if rows.len() > limit {
+        rows.sort_by(cmp);
+        rows.truncate(limit);
+    }
+    NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0, n.get().1 + rows.len() as u64)));
+    Ok(rows)
+}
+
 impl SqlSession {
     /// V2 read input is complete without imposing the legacy table capacity.
     /// The physical visitor decodes one row at a time; native order/filter
@@ -112,56 +170,15 @@ impl SqlSession {
     where
         C: Fn(&SqlRow, &SqlRow) -> std::cmp::Ordering + Copy,
     {
-        let (limit, order) = bound;
-        let cmp = |a: &SqlRow, b: &SqlRow| order.map_or(std::cmp::Ordering::Equal, |cmp| cmp(a, b));
-        let threshold = limit.saturating_mul(2).max(64);
         let result = (|| {
             if !self.is_v2_engine() {
                 return Err(map(CoreError::Sql(SqlError::Unsupported)));
             }
             let snapshot = self.complete_snapshot(table).map_err(map)?;
-            let mut rows = Vec::new();
-            let mut retained = crate::relational::scan::Retention::new(
-                crate::relational::scan::MAX_RETAINED_BYTES,
-            );
-            let mut sorter = (order.is_some() && limit > 10_000)
-                .then(crate::relational::spill::Sorter::new);
-            let mut visit = |row: &SqlRow| {
-                NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0 + 1, n.get().1)));
-                if !keep(row)? {
-                    return Ok(());
-                }
-                if let Some(sorter) = &mut sorter {
-                    return sorter.push(row.clone(), retained_bytes(row), cmp, &mut retained)
-                        .map_err(|e| map(CoreError::Sql(e)));
-                }
-                retained.charge(retained_bytes(row)).map_err(|e| map(CoreError::Sql(e)))?;
-                rows.push(row.clone());
-                if rows.len() >= threshold {
-                    rows.sort_by(cmp);
-                    for dropped in rows.drain(limit..) {
-                        retained.release(retained_bytes(&dropped));
-                    }
-                }
-                Ok(())
-            };
-            match key {
-                Some(key) => self.visit_native_key(table, key, &mut visit, map)?,
-                None => self.visit_native_page(table, &mut visit, map)?,
-            }
-            if let Some(sorter) = sorter {
-                let sorted = sorter.finish(cmp, &mut retained).map_err(|e| map(CoreError::Sql(e)))?;
-                for row in sorted.take(limit) {
-                    let row = row.map_err(|e| map(CoreError::Sql(e)))?;
-                    retained.charge(retained_bytes(&row)).map_err(|e| map(CoreError::Sql(e)))?;
-                    rows.push(row);
-                }
-            }
-            if rows.len() > limit {
-                rows.sort_by(cmp);
-                rows.truncate(limit);
-            }
-            NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0, n.get().1 + rows.len() as u64)));
+            let rows = retain_native_rows(keep, bound, map, |visit| match key {
+                Some(key) => self.visit_native_key(table, key, &mut |row| visit(row), map),
+                None => self.visit_native_page(table, &mut |row| visit(row), map),
+            })?;
             Ok(CompleteRelation { snapshot, rows })
         })();
         if result.is_err() {
@@ -609,6 +626,176 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), 0);
         drop(engine);
+        drop(session);
+        drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn native_view_reads_filter_complete_spilled_input_and_clean_up() {
+        use crate::operations::{
+            Bindings, Compare, Engine, Expr, Projection, Request, Sort, ValueExpr,
+        };
+        use crate::relational::spill;
+
+        let mut token = [0; 16];
+        getrandom::fill(&mut token).unwrap();
+        let path = crate::test_artifact_root()
+            .join(format!("native-view-{:032x}", u128::from_be_bytes(token)));
+        let spill_dir = path.join("spills");
+        std::fs::create_dir_all(&spill_dir).unwrap();
+        let admin =
+            Admin::create_engine(path.join("db"), Limits::default(), crate::Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        session
+            .execute(
+                "CREATE TABLE items (id BIGINT PRIMARY KEY, note TEXT)",
+                &[],
+                None,
+            )
+            .unwrap();
+        let insert = session.prepare("INSERT INTO items VALUES ($1,$2)").unwrap();
+        for start in (0..6000).step_by(100) {
+            session.execute("BEGIN", &[], None).unwrap();
+            for id in start..start + 100 {
+                session
+                    .execute_prepared(&insert, &[V::Int(id), V::Text("x".repeat(1000))], None)
+                    .unwrap();
+            }
+            session.execute("COMMIT", &[], None).unwrap();
+        }
+        session
+            .execute(
+                "CREATE VIEW item_view AS SELECT id,note FROM items",
+                &[],
+                None,
+            )
+            .unwrap();
+        session
+            .execute("CREATE VIEW small_view AS SELECT id FROM items", &[], None)
+            .unwrap();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                spill::set_thread_dir(None);
+            }
+        }
+        let _reset = Reset;
+        spill::set_thread_dir(Some(spill_dir.clone()));
+        let engine = Engine::new(admin.clone());
+        let filter = Expr::Compare(
+            Box::new(Expr::Field("id".into())),
+            Compare::Gt,
+            Box::new(Expr::Value(ValueExpr::Literal(V::Int(5996)))),
+        );
+        for (table, filter, limit, matched, complete) in [
+            ("item_view", Some(filter.clone()), 5, 3, true),
+            ("item_view", None, 5, 6000, false),
+            ("small_view", None, 10, 6000, false),
+            ("item_view", None, 0, 6000, false),
+        ] {
+            let request = Request::Read {
+                table: table.into(),
+                filter,
+                order: vec![Sort {
+                    field: "id".into(),
+                    descending: true,
+                }],
+                limit: Some(ValueExpr::Literal(V::Int(limit))),
+                projection: vec!["id".into()],
+            };
+            let (result, escaped) = spill::streaming(|| engine.execute(&request, &Bindings::new()));
+            assert!(
+                escaped.is_none(),
+                "only the native projection may reach the outer caller"
+            );
+            let result = result.unwrap();
+            assert_eq!(result.matched, matched);
+            assert_eq!(result.complete, complete);
+            assert_eq!(result.columns, vec!["id"]);
+            assert_eq!(result.rows.len(), (limit as usize).min(matched));
+            for (offset, row) in result.rows.iter().enumerate() {
+                assert_eq!(row.values, vec![V::Int(5999 - offset as i64)]);
+            }
+            assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), 0);
+        }
+        let expressions = Request::ReadExpressions {
+            table: "item_view".into(),
+            filter: Some(filter),
+            order: vec![Sort {
+                field: "id".into(),
+                descending: true,
+            }],
+            limit: Some(ValueExpr::Literal(V::Int(2))),
+            projection: vec![Projection {
+                expression: Expr::Field("id".into()),
+                alias: Some("key".into()),
+            }],
+        };
+        let result = engine.execute(&expressions, &Bindings::new()).unwrap();
+        assert_eq!((result.matched, result.complete), (3, false));
+        assert_eq!(result.columns, vec!["key"]);
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .map(|r| r.values.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![V::Int(5999)], vec![V::Int(5998)]]
+        );
+        // Input may spill, but a native operation's projected reply remains bounded.
+        assert_eq!(
+            engine
+                .execute(
+                    &Request::Read {
+                        table: "item_view".into(),
+                        filter: None,
+                        order: vec![],
+                        limit: Some(ValueExpr::Literal(V::Int(6000))),
+                        projection: vec!["note".into()],
+                    },
+                    &Bindings::new()
+                ),
+            Err(crate::operations::Error::Limit)
+        );
+        assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), 0);
+        drop(engine);
+
+        // Fail after expansion has spilled, both on a filter error and on cancellation.
+        for cancel in [false, true] {
+            session.begin_engine().unwrap();
+            let view = session.native_view_engine("item_view").unwrap().unwrap();
+            let cancellation = Cancellation::default();
+            let mut visited = 0;
+            let result = cancellation.scope(|| {
+                session.native_view_rows_where(
+                    &view,
+                    &mut |_| {
+                        visited += 1;
+                        assert_ne!(std::fs::read_dir(&spill_dir).unwrap().count(), 0);
+                        if cancel {
+                            cancellation.cancel();
+                            Ok(true)
+                        } else {
+                            Err(CoreError::Sql(SqlError::UndefinedFunction))
+                        }
+                    },
+                    (5, None::<fn(&SqlRow, &SqlRow) -> std::cmp::Ordering>),
+                    |e| e,
+                )
+            });
+            assert!(visited > 0);
+            assert!(matches!(result, Err(CoreError::Cancelled)) == cancel);
+            if !cancel {
+                assert!(matches!(
+                    result,
+                    Err(CoreError::Sql(SqlError::UndefinedFunction))
+                ));
+            }
+            assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), 0);
+            session.rollback();
+        }
         drop(session);
         drop(admin);
         std::fs::remove_dir_all(path).unwrap();

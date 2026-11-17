@@ -1,6 +1,6 @@
 #![cfg(feature = "engine-rocksdb")]
 //! Spilled API results retain the unary document and release temp files on every exit.
-mod api_support;
+pub(crate) mod api_support;
 use api_support::{Fixture, rpc, sql};
 use bytes::Bytes;
 use giggles_core::Engine;
@@ -18,12 +18,12 @@ pub(crate) static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 
 // Match a fixture-specific marker before truncating anything: other modules in
 // the merged test binary may also have spills open in this process.
-struct SpillProbe {
-    marker: String,
+pub(crate) struct SpillProbe {
+    pub(crate) marker: String,
     known: BTreeSet<PathBuf>,
 }
 impl SpillProbe {
-    fn spill_files(&mut self) -> Vec<PathBuf> {
+    pub(crate) fn spill_files(&mut self) -> Vec<PathBuf> {
         let prefix = format!("giggles-returning-{}-", std::process::id());
         for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
             if !entry.file_name().to_string_lossy().starts_with(&prefix) {
@@ -45,7 +45,7 @@ impl SpillProbe {
             .cloned()
             .collect()
     }
-    async fn cleaned(&mut self) {
+    pub(crate) async fn cleaned(&mut self) {
         tokio::time::timeout(Duration::from_secs(3), async {
             while !self.spill_files().is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -56,13 +56,13 @@ impl SpillProbe {
     }
 }
 
-async fn stop(f: Fixture) {
+pub(crate) async fn stop(f: Fixture) {
     let path = f.path.clone();
     f.stop().await;
     std::fs::remove_dir_all(path).unwrap();
 }
 
-async fn seed(f: &Fixture, count: usize, width: usize) -> SpillProbe {
+pub(crate) async fn seed(f: &Fixture, count: usize, width: usize) -> SpillProbe {
     let marker = f.path.file_name().unwrap().to_string_lossy().into_owned();
     let payload = format!("{marker}{}", "x".repeat(width - marker.len()));
     let admin = f.admin.clone();
@@ -94,7 +94,7 @@ async fn seed(f: &Fixture, count: usize, width: usize) -> SpillProbe {
     }
 }
 
-async fn http_stream(
+pub(crate) async fn http_stream(
     f: &Fixture,
     token: &str,
     request: Value,
@@ -143,14 +143,14 @@ async fn http_stream(
     (response.into_body(), task)
 }
 
-fn typed_read() -> Value {
+pub(crate) fn typed_read() -> Value {
     json!({"typedRead":{"table":"app","projection":[
         {"expression":{"column":{"name":"id"}}},
         {"expression":{"column":{"name":"body"}}}],
         "orderBy":[{"expression":{"column":{"name":"id"}},"descending":false}]}})
 }
 
-fn check_rows(rows: &[Value], count: usize, width: usize, marker: &str) {
+pub(crate) fn check_rows(rows: &[Value], count: usize, width: usize, marker: &str) {
     let expected = format!("{marker}{}", "x".repeat(width - marker.len()));
     assert_eq!(rows.len(), count);
     assert_eq!(rows[0]["values"][0]["intValue"], "1");

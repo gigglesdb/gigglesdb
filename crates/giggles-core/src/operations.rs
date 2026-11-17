@@ -2443,9 +2443,32 @@ fn run_complete(
     };
     if table.primary_key.is_empty()
         && matches!(operation, Operation::Read { .. } | Operation::ReadExpressions { .. })
-        && let Some(rows) = session.native_view_rows_engine(table).map_err(limit)?
     {
-        return run_view(session, table, operation, rows, retained);
+        if session.is_v2_engine() && session.native_view_engine_current(table).map_err(limit)? {
+            let mut operation = operation;
+            let (filter, order, limit) = match &mut operation {
+                Operation::Read { filter, order, limit, .. }
+                | Operation::ReadExpressions { filter, order, limit, .. } => (filter, order, *limit),
+                _ => unreachable!(),
+            };
+            filter.coerce_equality(session, table)?;
+            let mut matched = 0usize;
+            let rows = session.native_view_rows_where(table, &mut |row| {
+                let accepted = filter.accepts(row)?;
+                matched += usize::from(accepted);
+                Ok(accepted)
+            }, (limit, (!order.is_empty()).then_some(|a: &SqlRow, b: &SqlRow| compare_rows(a, b, order))),
+                input_error)?.ok_or_else(|| core(CoreError::Sql(SqlError::StaleSchema)))?;
+            let mut outcome = read_rows(session, table, operation, rows, retained)?;
+            outcome.complete = matched <= limit;
+            outcome.matched = matched;
+            return Ok(outcome);
+        }
+        if !session.is_v2_engine()
+            && let Some(rows) = session.native_view_rows_engine(table).map_err(limit)?
+        {
+            return run_view(session, table, operation, rows, retained);
+        }
     }
     if session.is_v2_engine()
         && let Operation::Read { filter, .. } | Operation::ReadExpressions { filter, .. }

@@ -42,6 +42,7 @@ thread_local! {
     static SLOT: RefCell<Option<SpilledRows>> = const { RefCell::new(None) };
     static ERROR: RefCell<Option<CoreError>> = const { RefCell::new(None) };
     static DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static QUERY_ROW_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
     static IN_HASH_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
@@ -173,6 +174,16 @@ pub fn set_thread_dir(dir: Option<PathBuf>) {
 #[doc(hidden)]
 pub fn set_in_hash_bytes(bytes: Option<usize>) {
     IN_HASH_BYTES.set(bytes);
+}
+
+/// Test-only: lowers the per-thread complete-image row cap.
+#[doc(hidden)]
+pub fn set_query_row_limit(rows: Option<usize>) {
+    QUERY_ROW_LIMIT.set(rows);
+}
+
+pub(crate) fn query_row_limit(current: usize) -> usize {
+    QUERY_ROW_LIMIT.get().map_or(current, |rows| rows.min(current))
 }
 
 pub(crate) fn in_hash_bytes() -> usize {

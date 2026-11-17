@@ -1,7 +1,7 @@
 #![cfg(feature = "engine-rocksdb")]
 //! R2-PGLIMITS-9: on v2, INSERT ... SELECT from a view, into a self-referencing
 //! FK table with forward references, and ON CONFLICT over a view source have
-//! no 65,536-row cap. FKs are checked at statement end like PG18 (23503,
+//! no complete-image cap (4,000 rows against a 1,000-row test cap). FKs are checked at statement end like PG18 (23503,
 //! nothing inserted); a second affect raises 21000. Legacy keeps 54000 (it has no views).
 mod common;
 use giggles_core::{
@@ -15,6 +15,7 @@ impl SpillDir {
     fn new(name: &str) -> Self {
         let dir = common::fresh(&format!("{name}-spill"));
         std::fs::create_dir_all(&dir).unwrap();
+        spill::set_query_row_limit(Some(1_000));
         spill::set_thread_dir(Some(dir.clone()));
         Self(dir)
     }
@@ -24,6 +25,7 @@ impl SpillDir {
 }
 impl Drop for SpillDir {
     fn drop(&mut self) {
+        spill::set_query_row_limit(None);
         spill::set_thread_dir(None);
         let _ = std::fs::remove_dir_all(&self.0);
     }
@@ -33,7 +35,7 @@ fn load(s: &mut SqlSession, rows: i64) {
     s.execute("CREATE TABLE t (id int PRIMARY KEY, x int, w text)", &[], None).unwrap();
     for start in (0..rows).step_by(10_000) {
         let values = (start..(start + 10_000).min(rows))
-            .map(|i| format!("({i},{},'w{i:0>20}')", i % 70_000))
+            .map(|i| format!("({i},{},'w{i:0>20}')", i % 3_000))
             .collect::<Vec<_>>()
             .join(",");
         s.execute(&format!("INSERT INTO t VALUES {values}"), &[], None).unwrap();
@@ -59,20 +61,20 @@ fn view_selfref_and_conflicts() {
     {
         let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
         let mut s = admin.sql_session();
-        load(&mut s, 150_000);
+        load(&mut s, 4_000);
         s.execute("CREATE VIEW v AS SELECT id, x FROM t WHERE id >= 0", &[], None).unwrap();
         s.execute("CREATE TABLE tree (id int PRIMARY KEY, parent int REFERENCES tree(id))", &[], None).unwrap();
-        assert_eq!(affected(&mut s, "INSERT INTO tree SELECT id, CASE WHEN id < 149999 THEN id + 1 END FROM v"), 150_000);
-        assert_eq!(ints(&mut s, "SELECT count(*), count(parent) FROM tree"), [150_000, 149_999]);
+        assert_eq!(affected(&mut s, "INSERT INTO tree SELECT id, CASE WHEN id < 3999 THEN id + 1 END FROM v"), 4_000);
+        assert_eq!(ints(&mut s, "SELECT count(*), count(parent) FROM tree"), [4_000, 3_999]);
         s.execute("CREATE TABLE tree2 (id int PRIMARY KEY, parent int REFERENCES tree2(id))", &[], None).unwrap();
-        let err = s.execute("INSERT INTO tree2 SELECT id, CASE WHEN id = 60000 THEN 999999 WHEN id < 69999 THEN id + 1 END FROM v WHERE id < 70000", &[], None).unwrap_err();
+        let err = s.execute("INSERT INTO tree2 SELECT id, CASE WHEN id = 800 THEN 999999 WHEN id < 2999 THEN id + 1 END FROM v WHERE id < 3000", &[], None).unwrap_err();
         assert_eq!(giggles_core::sqlstate(&err), "23503");
         assert_eq!(ints(&mut s, "SELECT count(*) FROM tree2"), [0]);
         for name in ["c", "c2"] {
             s.execute(&format!("CREATE TABLE {name} (id int PRIMARY KEY, n int)"), &[], None).unwrap();
         }
-        assert_eq!(affected(&mut s, "INSERT INTO c SELECT id % 60000, id FROM v WHERE id < 70000 ON CONFLICT (id) DO NOTHING"), 60_000);
-        let err = s.execute("INSERT INTO c2 SELECT id % 60000, id FROM v WHERE id < 70000 ON CONFLICT (id) DO UPDATE SET n = excluded.n", &[], None).unwrap_err();
+        assert_eq!(affected(&mut s, "INSERT INTO c SELECT id % 800, id FROM v WHERE id < 3000 ON CONFLICT (id) DO NOTHING"), 800);
+        let err = s.execute("INSERT INTO c2 SELECT id % 800, id FROM v WHERE id < 3000 ON CONFLICT (id) DO UPDATE SET n = excluded.n", &[], None).unwrap_err();
         assert_eq!(giggles_core::sqlstate(&err), "21000");
         assert_eq!(ints(&mut s, "SELECT count(*) FROM c2"), [0]);
         assert_eq!(dir.files(), 0);
@@ -82,11 +84,12 @@ fn view_selfref_and_conflicts() {
 
 #[test]
 fn legacy_self_fk_keeps_cap() {
+    let _dir = SpillDir::new("legacy-self-fk-cap");
     let path = common::fresh("legacy-self-fk-cap");
     {
         let admin = Admin::create_engine(&path, Limits::default(), Engine::Legacy).unwrap();
         let mut s = admin.sql_session();
-        load(&mut s, 300);
+        load(&mut s, 80);
         s.execute("CREATE TABLE tree (id int PRIMARY KEY, parent int REFERENCES tree(id))", &[], None).unwrap();
         assert!(matches!(s.execute("INSERT INTO tree SELECT a.id * 1000 + b.id, NULL FROM t a JOIN t b ON b.id >= 0 ORDER BY 1", &[], None), Err(CoreError::Sql(SqlError::Limit))));
         assert_eq!(ints(&mut s, "SELECT count(*) FROM tree"), [0]);

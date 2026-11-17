@@ -382,8 +382,8 @@ pub(crate) fn retention_limit() -> usize {
     CURSOR_LIMIT.with(|c| c.get().unwrap_or(MAX_RETAINED_BYTES))
 }
 pub(crate) fn query_row_limit() -> usize {
-    CURSOR_LIMIT.with(|c| {
+    super::spill::query_row_limit(CURSOR_LIMIT.with(|c| {
         c.get()
             .map_or(MAX_QUERY_ROWS, |n| n / std::mem::size_of::<SqlRow>())
-    })
+    }))
 }

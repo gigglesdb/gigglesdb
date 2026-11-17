@@ -23,6 +23,8 @@ mod alter_table_ownership;
 mod ambiguous_column_error;
 #[path = "api_result_stream.rs"]
 mod api_result_stream;
+#[path = "api_view_read_stream.rs"]
+mod api_view_read_stream;
 #[path = "api_contract.rs"]
 mod api_contract;
 #[path = "api_native.rs"]
