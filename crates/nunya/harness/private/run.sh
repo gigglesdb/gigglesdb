@@ -40,17 +40,34 @@ scenario_bootstrap() {
   [[ $first =~ ^session:[0-9a-f]{32}$ && $first == "$second" ]]
 }
 # Run the driver behind exec, keeping session credentials out of argv and logs.
-scenario_psycopg_driver() {
-  local mode=$1 context=$2 ttl=$3 line pid input output status=0 control=0 summary=0
+scenario_session_driver() {
+  local driver=$1 mode=$2 context=$3 ttl=$4 line pid input output status=0 control=0 summary=0
   local counted_pass=0 counted_fail=0
   scenario_pass=0 scenario_fail=1
-  coproc PSYCOPG {
-    "$nunya_exe" exec "${helper_opts[@]}" --context "$context" --ttl "$ttl" -- \
-      "${NUNYA_PYTHON:-python}" -I "$(native_path "$source_dir/drivers/psycopg_check.py")" --mode "$mode"
+  local command=() jar_dir classpath= separator=: name url sha
+  case "$driver" in
+    psycopg)
+      command=("${NUNYA_PYTHON:-python}" -I "$(native_path "$source_dir/drivers/psycopg_check.py")" --mode "$mode")
+      ;;
+    jdbc)
+      jar_dir=${NUNYA_JDBC_JARS:-$run/jars}
+      bash "$source_dir/drivers/fetch-jdbc.sh" "$jar_dir" || return 1
+      # Native Windows Java uses a semicolon, Unix Java a colon.
+      if command -v cygpath >/dev/null; then separator=';'; fi
+      while read -r name url sha; do
+        [[ -z $name || $name == \#* ]] && continue
+        classpath+=${classpath:+$separator}$(native_path "$jar_dir/$name")
+      done < "$source_dir/drivers/jdbc-jars.txt"
+      command=(java --class-path "$classpath" "$(native_path "$source_dir/drivers/jdbc_check.java")" "$mode")
+      ;;
+    *) return 1 ;;
+  esac
+  coproc DRIVER {
+    "$nunya_exe" exec "${helper_opts[@]}" --context "$context" --ttl "$ttl" -- "${command[@]}"
   }
-  pid=$PSYCOPG_PID
+  pid=$DRIVER_PID
   # Duplicates remain valid after bash unsets the coprocess variables on exit.
-  exec {output}<&"${PSYCOPG[0]}" {input}>&"${PSYCOPG[1]}"
+  exec {output}<&"${DRIVER[0]}" {input}>&"${DRIVER[1]}"
   while IFS= read -r -t 120 line <&"$output"; do
     line=${line%$'\r'}
     printf '%s\n' "$line"
@@ -91,14 +108,18 @@ scenario_psycopg_driver() {
   wait "$pid" || status=1
   [[ $summary == 1 && $scenario_pass == "$counted_pass" && $scenario_fail == "$counted_fail" ]] || status=1
   if [[ $mode == main ]]; then
-    [[ $control == 2 && $((counted_pass + counted_fail)) == 12 ]] || status=1
+    local expected_steps=12
+    [[ $driver != jdbc ]] || expected_steps=13
+    [[ $control == 2 && $((counted_pass + counted_fail)) == "$expected_steps" ]] || status=1
   else
     [[ $control == 1 && $((counted_pass + counted_fail)) == 3 ]] || status=1
   fi
   (( status == 0 && scenario_fail == 0 ))
 }
-scenario_psycopg() { scenario_psycopg_driver main d1-psycopg 1h; }
-scenario_psycopg_expiry() { scenario_psycopg_driver expiry d1-psycopg-exp 20s; }
+scenario_psycopg() { scenario_session_driver psycopg main d1-psycopg 1h; }
+scenario_psycopg_expiry() { scenario_session_driver psycopg expiry d1-psycopg-exp 20s; }
+scenario_jdbc() { scenario_session_driver jdbc main d1-jdbc 1h; }
+scenario_jdbc_expiry() { scenario_session_driver jdbc expiry d1-jdbc-exp 20s; }
 run_scenario() {
   local name=$1 pass=0 fail=0
   local scenario_pass= scenario_fail=
@@ -155,6 +176,6 @@ private_main() {
     --pg-host 127.0.0.1 --pg-port "$NUNYA_PG_PORT")
   # Later items add one function and one name here per scenario.
   local failed=0 scenario
-  for scenario in bootstrap psycopg psycopg_expiry; do run_scenario "$scenario" || failed=1; done
+  for scenario in bootstrap psycopg psycopg_expiry jdbc jdbc_expiry; do run_scenario "$scenario" || failed=1; done
   return "$failed"
 }

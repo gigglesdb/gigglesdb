@@ -1,16 +1,28 @@
-// Single-file source launcher (Java 17+); supply pgJDBC as check-pg-clients.sh does:
-// java --class-path /path/to/postgresql-42.7.3.jar jdbc_check.java JDBC_URL TASK_ID SECRET
-// Use a freshly seeded harness. Never print returned values or exception messages.
+// Single-file Java 21 launcher. PG* environment variables supply session credentials.
+// Never print returned values, credentials, tokens, or exception messages.
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.sql.*;
 import java.util.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 class jdbc_check {
-    static Connection connection;
+    static String url;
+    static final Properties properties = new Properties();
+    static HikariDataSource pool;
+    static final List<Connection> fallbackConnections = Arrays.asList(null, null);
+    static boolean fallback;
+    static String detail = "";
+    static Connection connectionC;
     static String token;
-    static int failures;
+    static int passed, failures;
+    static final BufferedReader input = new BufferedReader(new InputStreamReader(System.in));
     interface Check { boolean run() throws Exception; }
 
-    static List<List<String>> query(String sql, String... params) throws SQLException {
+    static List<List<String>> query(Connection connection, String sql, String... params) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             for (int i = 0; i < params.length; i++) statement.setString(i + 1, params[i]);
             try (ResultSet result = statement.executeQuery()) {
@@ -25,69 +37,207 @@ class jdbc_check {
         }
     }
 
-    static int update(String sql, String value) throws SQLException {
+    static class Lease implements AutoCloseable {
+        final Connection connection;
+        Lease(Connection connection) { this.connection = connection; }
+        /** Return a pooled connection while retaining fixed fallback connections. */
+        public void close() throws SQLException { if (!fallback) connection.close(); }
+    }
+
+    static Lease borrow(int slot) throws SQLException {
+        if (!fallback) return new Lease(pool.getConnection());
+        Connection connection = fallbackConnections.get(slot);
+        if (connection == null || !connection.isValid(5)) {
+            if (connection != null) try { connection.close(); } catch (SQLException ignored) { }
+            connection = DriverManager.getConnection(url, properties);
+            fallbackConnections.set(slot, connection);
+            connection.setAutoCommit(true);
+        }
+        return new Lease(connection);
+    }
+
+    static String sqlState(Throwable error) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable cause = error; cause != null && seen.add(cause); cause = cause.getCause()) {
+            if (cause instanceof SQLException sqlError && sqlError.getSQLState() != null) {
+                String state = sqlError.getSQLState();
+                return state.matches("[A-Z0-9]{5}") ? state : "null";
+            }
+        }
+        return "null";
+    }
+
+    static List<List<String>> pooledQuery(String sql, String... params) throws SQLException {
+        try (Lease lease = borrow(0)) { return query(lease.connection, sql, params); }
+    }
+
+    static int update(Connection connection, String sql, String value) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, value);
             return statement.executeUpdate();
         }
     }
 
-    static boolean refused(String sql, String value, String state) throws SQLException {
-        try {
-            if (value == null) query(sql); else update(sql, value);
-        } catch (SQLException error) {
-            return state.equals(error.getSQLState());
+    static int pooledUpdate(String sql, String value) throws SQLException {
+        try (Lease lease = borrow(0)) { return update(lease.connection, sql, value); }
+    }
+
+    static boolean refused(Check action, String expected) throws Exception {
+        try { action.run(); }
+        catch (SQLException error) {
+            String state = sqlState(error);
+            detail = " (observed SQLSTATE " + state + ")";
+            return expected.equals(state);
         }
+        detail = " (observed SQLSTATE null)";
         return false;
     }
 
-    static void step(int number, String name, Check check) {
+    static void step(String name, Check check) {
         boolean ok;
+        detail = "";
         try { ok = check.run(); } catch (Exception error) { ok = false; }
-        System.out.println((ok ? "PASS" : "FAIL") + " step " + number + ": " + name);
-        if (!ok) failures++;
+        System.out.println((ok ? "PASS" : "FAIL") + " step " + (passed + failures + 1) + ": " + name +
+            (fallback ? " [DriverManager fallback]" : "") + detail);
+        System.out.flush();
+        if (ok) passed++; else failures++;
     }
 
-    public static void main(String[] args) {
-        if (args.length != 3) {
-            System.err.println("usage: java --class-path PGJDBC_JAR jdbc_check.java JDBC_URL TASK_ID SECRET");
-            System.exit(2);
-        }
-        Properties properties = new Properties();
-        properties.setProperty("user", "task:" + args[1]);
-        properties.setProperty("password", args[2]);
-        properties.setProperty("preferQueryMode", "extended");
-        properties.setProperty("prepareThreshold", "1");
-        properties.setProperty("binaryTransfer", "false");
-        properties.setProperty("stringtype", "unspecified");
-        try (Connection opened = DriverManager.getConnection(args[0], properties)) {
-            connection = opened;
-            connection.setAutoCommit(true);
-            step(1, "read blind emails as tokens", () -> {
-                var rows = query("SELECT id, email FROM customers WHERE failed_payments >= 2 ORDER BY id");
+    static boolean waitFor(String event) throws Exception {
+        System.out.println("WAIT " + event);
+        System.out.flush();
+        return "GO".equals(input.readLine());
+    }
+
+    static boolean openC() throws SQLException {
+        connectionC = DriverManager.getConnection(url, properties);
+        connectionC.setAutoCommit(true);
+        return query(connectionC, "SELECT country FROM customers WHERE id = 3").equals(List.of(List.of("US")));
+    }
+
+    static void endSession(String event) throws Exception {
+        boolean ready = waitFor(event);
+        step(event + " ends open connection (NY011)", () -> ready && refused(() -> {
+            query(connectionC, "SELECT country FROM customers WHERE id = 3"); return true;
+        }, "NY011"));
+        step(event + " refuses new connection (NY003 expected)", () -> ready && refused(() -> {
+            try (Connection ignored = DriverManager.getConnection(url, properties)) { return true; }
+        }, "NY003"));
+    }
+
+    static void mainChecks() throws Exception {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(url);
+        config.setDataSourceProperties(properties);
+        config.setMaximumPoolSize(2);
+        config.setMinimumIdle(2);
+        config.setAutoCommit(true);
+        config.setConnectionTimeout(30000);
+        config.setValidationTimeout(5000);
+        step("HikariCP pool starts", () -> {
+            try {
+                pool = new HikariDataSource(config);
+                return true;
+            } catch (Exception error) {
+                detail = " (observed SQLSTATE " + sqlState(error) + ")";
+                return false;
+            }
+        });
+        fallback = pool == null;
+        try {
+            step("read blind emails as tokens", () -> {
+                var rows = pooledQuery("SELECT id, email FROM customers WHERE failed_payments >= 2 ORDER BY id");
                 if (rows.size() != 2 || !"3".equals(rows.get(0).get(0)) || !"5".equals(rows.get(1).get(0))) return false;
                 for (var row : rows) if (row.get(1) == null || !row.get(1).startsWith("tok_email_")) return false;
                 token = rows.get(0).get(1);
                 return true;
             });
-            step(2, "write token to same domain", () -> token != null && update(
+            step("write token to same domain", () -> token != null && pooledUpdate(
                 "INSERT INTO outbox (to_address, template) VALUES (?, 'reminder')", token) == 1);
-            step(3, "read same-domain token unchanged", () -> token != null &&
-                query("SELECT to_address FROM outbox").contains(List.of(token)));
-            step(4, "refuse token into plain notes (NY001)", () -> token != null && refused(
-                "UPDATE notes SET body = ? WHERE id = 3", token, "NY001"));
-            step(5, "refuse blind LIKE (NY002)", () -> refused(
-                "SELECT id FROM customers WHERE email LIKE 'a%'", null, "NY002"));
-            // country is plain in harness policy; seed contains no id 17.
-            step(6, "plain country query for absent id", () -> query(
-                "SELECT country FROM customers WHERE id = 17").isEmpty());
-            step(7, "mask phone output", () -> query("SELECT phone FROM customers WHERE id = 3")
+            step("read same-domain token unchanged", () -> token != null &&
+                pooledQuery("SELECT to_address FROM outbox").contains(List.of(token)));
+            step("refuse token into plain notes (NY001)", () -> token != null && refused(() ->
+                pooledUpdate("UPDATE notes SET body = ? WHERE id = 3", token) == 1, "NY001"));
+            step("refuse blind LIKE (NY002)", () -> refused(() -> {
+                pooledQuery("SELECT id FROM customers WHERE email LIKE 'a%'"); return true;
+            }, "NY002"));
+            step("plain country query for absent id", () ->
+                pooledQuery("SELECT country FROM customers WHERE id = 17").isEmpty());
+            step("mask phone output", () -> pooledQuery("SELECT phone FROM customers WHERE id = 3")
                 .equals(List.of(List.of("[hidden]"))));
-        } catch (Exception error) {
-            System.out.println("FAIL connection/setup (details suppressed)");
-            System.exit(1);
+            step("pooled token round trip on distinct connections", () -> {
+                try (Lease leaseA = borrow(0)) {
+                    Connection a = leaseA.connection;
+                    var rows = query(a, "SELECT email FROM customers WHERE id = 3");
+                    if (rows.size() != 1 || rows.get(0).get(0) == null ||
+                        !rows.get(0).get(0).startsWith("tok_email_")) return false;
+                    token = rows.get(0).get(0);
+                    try (Lease leaseB = borrow(1)) {
+                        Connection b = leaseB.connection;
+                        int inserted = update(b, "INSERT INTO outbox (to_address, template) VALUES (?, 'pooled')", token);
+                        var returned = query(b, "SELECT to_address FROM outbox WHERE to_address = ?", token);
+                        return a != b && inserted == 1 && !returned.isEmpty() &&
+                            returned.stream().allMatch(row -> row.equals(List.of(token)));
+                    }
+                }
+            });
+            step("same token after gateway restart and pool recovery", () -> {
+                if (!waitFor("restart") || token == null) return false;
+                // Validate both old physical connections, replacing any broken one before the read.
+                if (fallback) {
+                    try (Lease a = borrow(0); Lease b = borrow(1)) {
+                        if (a.connection == b.connection) return false;
+                    }
+                } else {
+                    try (Connection a = pool.getConnection(); Connection b = pool.getConnection()) {
+                        if (!a.isValid(5)) pool.evictConnection(a);
+                        if (!b.isValid(5)) pool.evictConnection(b);
+                    }
+                }
+                return pooledQuery("SELECT email FROM customers WHERE id = 3").equals(List.of(List.of(token)));
+            });
+            step("open revocation connection", jdbc_check::openC);
+            endSession("revoke");
+        } finally {
+            if (pool != null) pool.close();
+            for (Connection connection : fallbackConnections) {
+                if (connection != null) try { connection.close(); } catch (SQLException ignored) { }
+            }
         }
-        System.out.println((7 - failures) + " passed; " + failures + " failed");
+    }
+
+    public static void main(String[] args) {
+        // Disable diagnostics before pgJDBC/Hikari initialize; they can contain server data.
+        Logger.getLogger("org.postgresql").setLevel(Level.OFF);
+        System.setProperty("slf4j.internal.verbosity", "ERROR");
+        try {
+            if (args.length != 1 || !(args[0].equals("main") || args[0].equals("expiry"))) throw new Exception();
+            url = "jdbc:postgresql://" + System.getenv("PGHOST") + ":" + System.getenv("PGPORT") + "/app";
+            properties.setProperty("user", System.getenv("PGUSER"));
+            properties.setProperty("password", System.getenv("PGPASSWORD"));
+            properties.setProperty("preferQueryMode", "extended");
+            properties.setProperty("prepareThreshold", "1");
+            properties.setProperty("binaryTransfer", "false");
+            properties.setProperty("stringtype", "unspecified");
+            properties.setProperty("connectTimeout", "10");
+            if (args[0].equals("expiry")) {
+                step("open expiry connection", jdbc_check::openC);
+                endSession("expiry");
+            } else mainChecks();
+        } catch (Exception error) {
+            String name = "connection/setup";
+            for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+                name += " " + cause.getClass().getSimpleName();
+                if (cause instanceof SQLException sqlError) {
+                    String state = sqlError.getSQLState();
+                    name += " SQLSTATE " + (state != null && state.matches("[A-Z0-9]{5}") ? state : "null");
+                }
+            }
+            step(name, () -> false);
+        } finally {
+            if (connectionC != null) try { connectionC.close(); } catch (SQLException ignored) { }
+        }
+        System.out.println(passed + " passed; " + failures + " failed");
         System.exit(failures == 0 ? 0 : 1);
     }
 }

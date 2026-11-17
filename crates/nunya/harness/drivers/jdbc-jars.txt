@@ -1,0 +1,4 @@
+# filename Maven-Central-URL SHA-256
+postgresql-42.7.14.jar https://repo.maven.apache.org/maven2/org/postgresql/postgresql/42.7.14/postgresql-42.7.14.jar 73914527305a40cce504b0d3d90b23caf565136912d607ae8ae7c5895512332c
+HikariCP-7.1.0.jar https://repo.maven.apache.org/maven2/com/zaxxer/HikariCP/7.1.0/HikariCP-7.1.0.jar 2be45c641b841e81df87292e181f2c203500c5f0e9a1676f135927387f3cf40b
+slf4j-api-2.0.17.jar https://repo.maven.apache.org/maven2/org/slf4j/slf4j-api/2.0.17/slf4j-api-2.0.17.jar 7b751d952061954d5abfed7181c1f645d336091b679891591d63329c622eb832
