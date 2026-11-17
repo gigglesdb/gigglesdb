@@ -69,27 +69,41 @@ async fn validate(path: &Path) -> Result<(), Vec<String>> {
     if let Some(tls) = &cfg.tls {
         crate::config::load_tls(tls).map_err(|e| vec![e])?;
     }
-    let mut policy = crate::policy::file::load_policy(&cfg.policy).map_err(|errors| {
-        errors
-            .into_iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-    })?;
-    if let crate::policy::ReadLogSink::File { path, .. } = &mut policy.readlog
-        && path.is_relative()
-    {
-        *path = cfg.policy.parent().unwrap_or(Path::new(".")).join(&*path);
+    fn load_policy(path: &Path) -> Result<crate::policy::Policy, Vec<String>> {
+        let mut policy = crate::policy::file::load_policy(path).map_err(|errors| {
+            errors.into_iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        })?;
+        if let crate::policy::ReadLogSink::File { path: sink, .. } = &mut policy.readlog
+            && sink.is_relative()
+        {
+            *sink = path.parent().unwrap_or(Path::new(".")).join(&*sink);
+        }
+        Ok(policy)
     }
+    let postgres_policy = cfg.postgres_policy.as_deref().map(load_policy).transpose()?;
+    let spanner_policy = cfg.spanner_policy.as_deref().map(load_policy).transpose()?;
+    if let (Some(pg), Some(spanner)) = (&postgres_policy, &spanner_policy)
+        && pg.readlog != spanner.readlog
+    {
+        return Err(vec!["policy files name different read logs".into()]);
+    }
+    let policy = postgres_policy
+        .as_ref()
+        .or(spanner_policy.as_ref())
+        .ok_or_else(|| vec!["route policy unavailable".into()])?;
     let _sink = crate::readlog::open_sink(&policy.readlog)
         .map_err(|_| vec!["read log unavailable".into()])?;
     if let Some(upstream) = cfg.upstream_config() {
+        let policy = postgres_policy
+            .as_ref()
+            .ok_or_else(|| vec!["route policy unavailable".into()])?;
         let schema = crate::serve::connect_schema(&upstream)
             .await
             .map_err(|e| vec![e])?;
         let snapshot = crate::serve::snapshot(&schema.client, &cfg)
             .await
             .map_err(|e| vec![e])?;
-        crate::policy::validate::validate(&policy, &snapshot).map_err(|errors| {
+        crate::policy::validate::validate(policy, &snapshot).map_err(|errors| {
             errors
                 .into_iter()
                 .map(|e| e.to_string())
@@ -97,6 +111,9 @@ async fn validate(path: &Path) -> Result<(), Vec<String>> {
         })?;
     }
     if let Some(section) = &cfg.spanner_native {
+        let policy = spanner_policy
+            .as_ref()
+            .ok_or_else(|| vec!["route policy unavailable".into()])?;
         use crate::spanner::proxy::SpannerUpstream;
         let upstream = match &section.emulator_endpoint {
             Some(endpoint) => SpannerUpstream::Emulator {
@@ -116,7 +133,7 @@ async fn validate(path: &Path) -> Result<(), Vec<String>> {
         let snapshot = crate::schema::spanner_gsql::load_gsql_snapshot(&runner, 0)
             .await
             .map_err(|_| vec!["spanner: catalog unavailable".into()])?;
-        crate::policy::validate::validate(&policy, &snapshot).map_err(|errors| {
+        crate::policy::validate::validate(policy, &snapshot).map_err(|errors| {
             errors
                 .into_iter()
                 .map(|e| e.to_string())

@@ -348,7 +348,15 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     } else {
         None
     };
-    let hub = crate::reload::Hub::new(&config.policy, config.policy_watch_ms)?;
+    if let (Some(pg), Some(spanner)) = (&config.postgres_policy, &config.spanner_policy)
+        && !matches!((std::fs::canonicalize(pg), std::fs::canonicalize(spanner)),
+            (Ok(pg), Ok(spanner)) if pg == spanner)
+    {
+        return Err("per-route policy files are not supported by this build yet".into());
+    }
+    let policy_path = config.postgres_policy.as_ref().or(config.spanner_policy.as_ref())
+        .ok_or("route policy unavailable")?;
+    let hub = crate::reload::Hub::new(policy_path, config.policy_watch_ms)?;
     hub.configure_routes(postgres_route.iter().chain(spanner_route.iter()).cloned().collect())?;
     runtime.set_lifecycle_log(Arc::new(hub.log.clone()));
     hub.log.1.write().map_err(|_| "read log lock unavailable")?.config = config.revision.clone();
@@ -371,7 +379,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         Arc::new(move || ready_hub.readiness(ready_hub.log.last_write_ok(), ready_runtime.store_last_write_ok())),
     )));
     let reload_hub = hub.clone();
-    let reload_path = config.policy.clone();
+    let reload_path = policy_path.clone();
     let _reload = AbortTask(tokio::spawn(async move {
         reload_hub.run(reload_path, reload_rx).await
     }));

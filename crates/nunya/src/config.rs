@@ -147,8 +147,10 @@ pub struct Config {
     pub listen: Option<SocketAddr>,
     /// Administration listener.
     pub admin_listen: SocketAddr,
-    /// Resolved policy path.
-    pub policy: PathBuf,
+    /// Effective PostgreSQL route policy path, when configured.
+    pub postgres_policy: Option<PathBuf>,
+    /// Effective native Spanner route policy path, when configured.
+    pub spanner_policy: Option<PathBuf>,
     /// Root key bytes erased on drop.
     pub root_key: Zeroizing<[u8; 32]>,
     /// Resolved state directory.
@@ -237,7 +239,7 @@ strict_section!(RawConfig,
 strict_section!(RawUpstream,
     _dialect=>"dialect", _host=>"host", _port=>"port", _user=>"user", _password=>"password_file",
     _dbname=>"dbname", _tls=>"tls", _ca=>"ca_file", _timeout=>"connect_timeout_ms",
-    _application=>"application_name", _route=>"route_id");
+    _application=>"application_name", _route=>"route_id", _policy=>"policy");
 fn err(e: &mut Vec<String>, field: &str, why: &str) {
     e.push(format!("{field}: {why}"));
 }
@@ -362,9 +364,12 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     if has_upstream && listen.is_none() {
         err(&mut e, "listen", "valid address required for upstream");
     }
+    let has_spanner = m.contains_key("spanner_native");
+    let mut spanner_policy = None;
     let mut spanner_route_id = None;
     let spanner_native = m.remove("spanner_native").and_then(|mut v| {
         if let Value::Table(t) = &mut v {
+            spanner_policy = route_policy(t, "spanner_native.policy", base, &mut e);
             spanner_route_id = Some(route_id(
                 t.remove("route_id"),
                 "spanner-native",
@@ -396,13 +401,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     }
     let admin_listen =
         get(&mut m, "admin_listen", &mut e).unwrap_or(SocketAddr::from(([127, 0, 0, 1], 6480)));
-    let policy = resolve(
-        base,
-        path_field(&mut m, "policy", &mut e).unwrap_or_else(|| {
-            err(&mut e, "policy", "required path missing");
-            PathBuf::new()
-        }),
-    );
+    let policy = path_field(&mut m, "policy", &mut e).map(|p| resolve(base, p));
     let state_dir = resolve(
         base,
         path_field(&mut m, "state_dir", &mut e).unwrap_or_else(|| {
@@ -442,6 +441,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     if !allow_plaintext && tls.is_none() {
         err(&mut e, "tls", "required unless allow_plaintext is true");
     }
+    let mut postgres_policy = None;
     let mut postgres_route_id = None;
     let mut dialect = UpstreamDialect::default();
     let upstream = m.remove("upstream").map(|uv| {
@@ -449,6 +449,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
             uv,
             &[
                 "route_id",
+                "policy",
                 "dialect",
                 "host",
                 "port",
@@ -466,6 +467,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         if Value::Table(u.clone()).try_into::<RawUpstream>().is_err() {
             err(&mut e, "upstream", "invalid fields");
         }
+        postgres_policy = route_policy(&mut u, "upstream.policy", base, &mut e);
         postgres_route_id = Some(route_id(
             u.remove("route_id"),
             "postgres",
@@ -531,6 +533,17 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
             application_name,
         }
     });
+    for (configured, effective, field) in [
+        (has_upstream, &mut postgres_policy, "upstream.policy"),
+        (has_spanner, &mut spanner_policy, "spanner_native.policy"),
+    ] {
+        if configured && effective.is_none() {
+            *effective = policy.clone();
+            if effective.is_none() {
+                err(&mut e, field, "required path missing (no service-level policy)");
+            }
+        }
+    }
     let mut standing = Vec::new();
     let mut names = std::collections::BTreeSet::new();
     if let Some(v) = m.remove("standing") {
@@ -649,7 +662,8 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         spanner_route_id,
         listen,
         admin_listen,
-        policy,
+        postgres_policy,
+        spanner_policy,
         state_dir,
         root_key,
         schemas,
@@ -664,6 +678,17 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         upstream,
         spanner_native,
     })
+}
+fn route_policy(
+    table: &mut Map<String, Value>,
+    field: &str,
+    base: &Path,
+    e: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let value = table.remove("policy")?;
+    let mut field_table = Map::new();
+    field_table.insert(field.into(), value);
+    path_field(&mut field_table, field, e).map(|p| resolve(base, p))
 }
 fn route_id(value: Option<Value>, default: &str, field: &str, e: &mut Vec<String>) -> String {
     let id = match value {
@@ -822,6 +847,66 @@ password_file = "password"
 tls = "disable"
 "#;
     const NATIVE: &str = "\n[spanner_native]\nlisten='127.0.0.1:6433'\ndatabase='projects/p/instances/i/databases/d'\n";
+    #[test]
+    fn per_route_policy_keys_resolve_against_config_dir() {
+        let f = Fixture::new();
+        let text = EXAMPLE.replace("policy = \"policy.toml\"\n", "")
+            .replace("[upstream]", "[upstream]\npolicy='pg.toml'");
+        let c = f.load(&format!("{text}{NATIVE}policy='spanner.toml'\n")).unwrap();
+        assert_eq!(c.postgres_policy, Some(f.0.join("pg.toml")));
+        assert_eq!(c.spanner_policy, Some(f.0.join("spanner.toml")));
+        let native_only = format!("{}{NATIVE}policy='native.toml'\n", text.split("[upstream]").next().unwrap());
+        let c = f.load(&native_only).unwrap();
+        assert_eq!(c.postgres_policy, None);
+        assert_eq!(c.spanner_policy, Some(f.0.join("native.toml")));
+    }
+    #[test]
+    fn route_without_own_policy_falls_back_to_service_level() {
+        let f = Fixture::new();
+        let text = EXAMPLE.replace("[upstream]", "[upstream]\npolicy='pg.toml'");
+        let c = f.load(&format!("{text}{NATIVE}")).unwrap();
+        assert_eq!(c.postgres_policy, Some(f.0.join("pg.toml")));
+        assert_eq!(c.spanner_policy, Some(f.0.join("policy.toml")));
+        let c = f.load(&format!("{EXAMPLE}{NATIVE}")).unwrap();
+        assert_eq!(c.postgres_policy, Some(f.0.join("policy.toml")));
+        assert_eq!(c.spanner_policy, c.postgres_policy);
+    }
+    #[test]
+    fn missing_route_policy_is_a_clear_error() {
+        let f = Fixture::new();
+        let text = EXAMPLE.replace("policy = \"policy.toml\"\n", "");
+        let pg_error = "upstream.policy: required path missing (no service-level policy)";
+        let spanner_error = "spanner_native.policy: required path missing (no service-level policy)";
+        assert_eq!(f.load(&text).unwrap_err(), vec![pg_error]);
+        assert_eq!(f.load(&format!("{text}{NATIVE}policy='s.toml'\n")).unwrap_err(), vec![pg_error]);
+        let pg_own = text.replace("[upstream]", "[upstream]\npolicy='p.toml'");
+        assert_eq!(f.load(&format!("{pg_own}{NATIVE}")).unwrap_err(), vec![spanner_error]);
+        let native_only = format!("{}{NATIVE}", text.split("[upstream]").next().unwrap());
+        assert_eq!(f.load(&native_only).unwrap_err(), vec![spanner_error]);
+    }
+    #[test]
+    fn route_policy_key_invalid_or_unknown_neighbour_refused() {
+        let f = Fixture::new();
+        for value in ["5", "''", "['DO_NOT_LEAK']"] {
+            for (text, field) in [
+                (EXAMPLE.replace("[upstream]", &format!("[upstream]\npolicy={value}")), "upstream.policy"),
+                (format!("{EXAMPLE}{NATIVE}policy={value}\n"), "spanner_native.policy"),
+            ] {
+                let errors = f.load(&text).unwrap_err();
+                assert!(errors.iter().any(|e| e.starts_with(&format!("{field}:"))));
+                assert!(!errors.join(";").contains("DO_NOT_LEAK"));
+            }
+        }
+        for text in [
+            EXAMPLE.replace("[upstream]", "[upstream]\npolicy='pg.toml'\nunknown='DO_NOT_LEAK'"),
+            format!("{EXAMPLE}{NATIVE}policy='s.toml'\nunknown='DO_NOT_LEAK'\n"),
+            EXAMPLE.replace("[upstream]", "[upstream]\npolicy_watch_ms=100"),
+            format!("{EXAMPLE}{NATIVE}policy_watch_ms=100\n"),
+        ] {
+            let errors = f.load(&text).unwrap_err();
+            assert!(!errors.join(";").contains("DO_NOT_LEAK"));
+        }
+    }
     #[test]
     fn startup_revision_hashes_exact_config_bytes() {
         use sha2::{Digest, Sha256};
@@ -1124,7 +1209,8 @@ tls = "disable"
     fn example_parses_paths_resolve_and_debug_redacts() {
         let f = Fixture::new();
         let c = f.load(EXAMPLE).unwrap();
-        assert_eq!(c.policy, f.0.join("policy.toml"));
+        assert_eq!(c.postgres_policy, Some(f.0.join("policy.toml")));
+        assert_eq!(c.spanner_policy, None);
         assert_eq!(c.state_dir, f.0.join("state"));
         assert_eq!(
             c.upstream.as_ref().unwrap().password.as_str(),
