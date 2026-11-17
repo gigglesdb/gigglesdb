@@ -85,7 +85,7 @@ fn zero_wait_drains_queued_commits_up_to_the_additional_request_limit() {
 }
 
 #[test]
-fn gather_defers_counters_and_preserves_shutdown() {
+fn gather_includes_counters_and_preserves_shutdown() {
     for shutdown in [false, true] {
         let (send, receive) = mpsc::channel();
         let (first, _reply) = pending(0);
@@ -104,10 +104,11 @@ fn gather_defers_counters_and_preserves_shutdown() {
         .unwrap();
         send.send(Message::Commit(pending(2).0)).unwrap();
         let (group, deferred, stopping) = gather(first, &receive, &SequencerConfig::default());
-        assert_eq!(group.len(), 2);
+        assert_eq!(group.len(), if shutdown { 2 } else { 4 });
         assert_eq!(stopping, shutdown);
-        assert_eq!(matches!(deferred, Some(Message::Counter { .. })), !shutdown);
-        assert!(matches!(receive.try_recv(), Ok(Message::Commit(_))));
+        assert!(deferred.is_none());
+        if shutdown { assert!(matches!(receive.try_recv(), Ok(Message::Commit(_)))); }
+        else { assert!(matches!(group[2], Message::Counter { .. })); }
     }
 }
 
@@ -291,4 +292,143 @@ fn concurrent_rocks_commits_drain_arrivals_during_sync() {
     assert_durable_rows(&recovered);
     drop(recovered);
     std::fs::remove_dir_all(path).unwrap();
+}
+
+
+fn counter_fixture() -> (Arc<Sequencer>, Vec<u8>, Vec<u8>) {
+    use crate::relational::{DataType, catalog_ext::SequenceDef};
+    let seq = Sequencer::open(
+        Arc::new(Kv::new(Arc::new(MemKv::new()))),
+        Arc::new(ManualClock::new(10)),
+        SequencerConfig { group_wait: Duration::from_millis(10), ..Default::default() },
+    ).unwrap();
+    let definition = SequenceDef {
+        name: "mixed_sequence".into(), data_type: DataType::BigInt,
+        start: 1, increment: 1, min: 1, max: 99, cache: 4, cycle: false,
+        owned_by: None, identity: false, incarnation: 7,
+    };
+    let mut create = request(900);
+    create.features_or = 64;
+    create.writes.insert((Keyspace::Catalog, super::super::catalog_codec::sequence_key(1)),
+        Some(super::super::catalog_codec::encode_sequence(&definition).unwrap()));
+    seq.submit(create).unwrap();
+    let key = super::super::catalog_codec::counter_key(1, 7);
+    let value = super::super::catalog_codec::encode_counter(
+        &crate::storage::sequences::SeqCounter {
+            incarnation: 7, last_value: 8, is_called: true, log_hw: 8, stamp: 3,
+        }, &definition).unwrap();
+    (seq, key, value)
+}
+
+fn counter_message(key: Vec<u8>, value: Vec<u8>) -> (Message, mpsc::Receiver<Result<(), TxnError>>) {
+    let (reply, receive) = mpsc::channel();
+    (Message::Counter { key, value, features_or: 0, reply }, receive)
+}
+
+// Predetermined mixed groups exercise the exact worker publication path. The
+// worker remains idle after fixture creation and is never submitted more work.
+fn process_mixed_group_for_test(seq: &Sequencer, group: Vec<Message>) {
+    let mut hlc = HlcClock::new(seq.visible_ts());
+    let mut log = RecentLog::new(seq.config.recent_log_bytes);
+    let mut features = load_features(seq.kv.as_ref()).unwrap();
+    let mut subversion = load_subversion(seq.kv.as_ref()).unwrap();
+    assert!(!process_group(group, &seq.kv, &ManualClock::new(20), &seq.shared,
+        &mut hlc, &mut log, &mut features, &mut subversion, &seq.config.ts_source, &seq.served));
+}
+
+fn drop_sequence(key: &[u8]) -> (Pending, mpsc::Receiver<Result<Ts, TxnError>>) {
+    let (mut drop, receive) = pending(901);
+    drop.request.writes.insert((Keyspace::Catalog, super::super::catalog_codec::sequence_key(1)), None);
+    drop.request.raw.push(RawOp::DeleteCounter { key: key.to_vec() });
+    (drop, receive)
+}
+
+#[test]
+fn mixed_group_uses_one_sync() {
+    let (seq, key, value) = counter_fixture();
+    let before = seq.shared.sync_writes.load(std::sync::atomic::Ordering::Relaxed);
+    let (a, ar) = pending(1);
+    let (counter, cr) = counter_message(key.clone(), value.clone());
+    let (b, br) = pending(2);
+    process_mixed_group_for_test(&seq, vec![Message::Commit(a), counter, Message::Commit(b)]);
+    assert!(ar.recv().unwrap().is_ok());
+    assert_eq!(cr.recv().unwrap(), Ok(()));
+    assert!(br.recv().unwrap().is_ok());
+    assert_eq!(seq.kv.get(Keyspace::Seq, &key).unwrap(), Some(value));
+    assert_eq!(seq.shared.sync_writes.load(std::sync::atomic::Ordering::Relaxed) - before, 1);
+}
+
+#[test]
+fn drop_before_counter_rejects_only_counter() {
+    let (seq, key, value) = counter_fixture();
+    let (drop, dr) = drop_sequence(&key);
+    let (counter, cr) = counter_message(key.clone(), value);
+    process_mixed_group_for_test(&seq, vec![Message::Commit(drop), counter]);
+    assert!(dr.recv().unwrap().is_ok());
+    assert_eq!(cr.recv().unwrap(), Err(TxnError::SequenceGone));
+    assert_eq!(seq.kv.get(Keyspace::Seq, &key).unwrap(), None);
+}
+
+#[test]
+fn counter_before_drop_is_deleted() {
+    let (seq, key, value) = counter_fixture();
+    let (drop, dr) = drop_sequence(&key);
+    let (counter, cr) = counter_message(key.clone(), value);
+    process_mixed_group_for_test(&seq, vec![counter, Message::Commit(drop)]);
+    assert_eq!(cr.recv().unwrap(), Ok(()));
+    assert!(dr.recv().unwrap().is_ok());
+    assert_eq!(seq.kv.get(Keyspace::Seq, &key).unwrap(), None);
+}
+
+#[test]
+fn bad_counter_incarnation_does_not_fail_commits() {
+    let (seq, _, value) = counter_fixture();
+    let key = super::super::catalog_codec::counter_key(1, 8);
+    let (a, ar) = pending(1);
+    let (counter, cr) = counter_message(key.clone(), value);
+    let (b, br) = pending(2);
+    process_mixed_group_for_test(&seq, vec![Message::Commit(a), counter, Message::Commit(b)]);
+    assert!(ar.recv().unwrap().is_ok());
+    assert_eq!(cr.recv().unwrap(), Err(TxnError::SequenceGone));
+    assert!(br.recv().unwrap().is_ok());
+    assert_eq!(seq.kv.get(Keyspace::Seq, &key).unwrap(), None);
+}
+
+#[test]
+fn concurrent_commits_and_counters_share_groups() {
+    let (seq, key, value) = counter_fixture();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let workers: Vec<_> = (0..8).map(|n| {
+        let (seq, key, value, barrier) = (seq.clone(), key.clone(), value.clone(), barrier.clone());
+        thread::spawn(move || {
+            for round in 0..8 {
+                barrier.wait();
+                if (n + round) % 2 == 0 {
+                    seq.submit(request(1000 + n * 8 + round)).unwrap();
+                    seq.write_counter(key.clone(), value.clone(), 0).unwrap();
+                } else {
+                    seq.write_counter(key.clone(), value.clone(), 0).unwrap();
+                    seq.submit(request(1000 + n * 8 + round)).unwrap();
+                }
+            }
+        })
+    }).collect();
+    for worker in workers { worker.join().unwrap(); }
+    assert!(seq.max_group_size() >= 2);
+    assert!(seq.shared.max_mixed_group.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+    assert_eq!(seq.kv.get(Keyspace::Seq, &key).unwrap(), Some(value));
+}
+
+#[test]
+fn counter_bytes_and_count_obey_gather_limits() {
+    for (cap, maximum, expected) in [(Some(20), 9, 1), (Some(21), 9, 2), (None, 0, 1)] {
+        let (send, receive) = mpsc::channel();
+        let (first, _) = counter_message(vec![0; 5], vec![0; 7]);
+        send.send(Message::Commit(pending(1).0)).unwrap(); // nine bytes
+        let (group, deferred, shutdown) = gather(first, &receive,
+            &SequencerConfig { group_max_bytes: cap, group_max: maximum, ..Default::default() });
+        assert_eq!(group.len(), expected);
+        assert!(!shutdown);
+        if expected == 1 && maximum > 0 { assert!(matches!(deferred, Some(Message::Commit(_)))); }
+    }
 }

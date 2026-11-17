@@ -46,10 +46,10 @@ fn gather_isolates_guarded_requests_without_draining_followers() {
     }
     let (group, next, stop) = gather(pending(0, false), &rx, &SequencerConfig::default());
     assert!(!stop);
-    assert_eq!(group.iter().map(id).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(group.iter().map(|p| match p { Message::Commit(p) => id(p), _ => panic!("expected commit") }).collect::<Vec<_>>(), [0, 1]);
     let Some(Message::Commit(g)) = next else { panic!("guard must be deferred") };
     let (group, next, stop) = gather(g, &rx, &SequencerConfig::default());
-    assert_eq!(group.iter().map(id).collect::<Vec<_>>(), [2]);
+    assert_eq!(group.iter().map(|p| match p { Message::Commit(p) => id(p), _ => panic!("expected commit") }).collect::<Vec<_>>(), [2]);
     assert!(next.is_none() && !stop);
     let Message::Commit(o2) = rx.try_recv().unwrap() else { panic!() };
     assert_eq!(id(&o2), 3);

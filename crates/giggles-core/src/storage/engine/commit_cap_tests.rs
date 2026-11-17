@@ -25,8 +25,8 @@ fn pending(id: u64) -> Pending {
     }
 }
 
-fn ids(group: &[Pending]) -> Vec<u64> {
-    group.iter().map(|p| p.request.snapshot.0).collect()
+fn ids(group: &[Message]) -> Vec<u64> {
+    group.iter().map(|p| match p { Message::Commit(p) => p.request.snapshot.0, _ => panic!("expected commit") }).collect()
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn capped_groups_defer_overflow_and_preserve_order() {
     assert_eq!(
         group
             .iter()
-            .map(|p| request_bytes(&p.request))
+            .map(Message::bytes)
             .sum::<usize>(),
         24
     );
@@ -93,7 +93,7 @@ fn capped_groups_defer_overflow_and_preserve_order() {
     assert_eq!(
         group
             .iter()
-            .map(|p| request_bytes(&p.request))
+            .map(Message::bytes)
             .sum::<usize>(),
         24
     );

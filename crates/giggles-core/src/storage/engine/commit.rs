@@ -303,6 +303,10 @@ struct SnapState {
 struct Shared {
     #[cfg(test)]
     max_group: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    max_mixed_group: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    sync_writes: std::sync::atomic::AtomicUsize,
     snap: Mutex<SnapState>,
 }
 pub(crate) struct SnapshotHandle {
@@ -340,6 +344,26 @@ enum Message {
     },
     Shutdown,
 }
+impl From<Pending> for Message {
+    fn from(pending: Pending) -> Self { Self::Commit(pending) }
+}
+impl Message {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Commit(p) => request_bytes(&p.request),
+            Self::Counter { key, value, .. } => key.len() + value.len(),
+            Self::Shutdown => unreachable!("shutdown is never grouped"),
+        }
+    }
+    fn reject(self, error: TxnError) {
+        match self {
+            Self::Commit(p) => { let _ = p.reply.send(Err(error)); }
+            Self::Counter { reply, .. } => { let _ = reply.send(Err(error)); }
+            Self::Shutdown => unreachable!("shutdown is never grouped"),
+        }
+    }
+}
+
 pub(crate) struct Sequencer {
     kv: Arc<Kv>,
     config: SequencerConfig,
@@ -377,6 +401,10 @@ impl Sequencer {
         let shared = Arc::new(Shared {
             #[cfg(test)]
             max_group: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            max_mixed_group: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            sync_writes: std::sync::atomic::AtomicUsize::new(0),
             snap: Mutex::new(SnapState {
                 visible: seed,
                 active: BTreeMap::new(),
@@ -550,16 +578,17 @@ fn request_bytes(request: &CommitRequest) -> usize {
 }
 
 fn gather(
-    first: Pending,
+    first: impl Into<Message>,
     receiver: &mpsc::Receiver<Message>,
     config: &SequencerConfig,
-) -> (Vec<Pending>, Option<Message>, bool) {
-    if first.guard.is_some() {
+) -> (Vec<Message>, Option<Message>, bool) {
+    let first = first.into();
+    if matches!(&first, Message::Commit(Pending { guard: Some(_), .. })) {
         return (vec![first], None, false);
     }
     let mut bytes = config
         .group_max_bytes
-        .map(|_| request_bytes(&first.request));
+        .map(|_| first.bytes());
     let mut group = vec![first];
     // Windows timed receives can round a sub-millisecond wait up to a roughly
     // 15 ms timer tick. Drain without waiting by default, and only opt into a
@@ -592,17 +621,16 @@ fn gather(
             guarded @ Message::Commit(Pending { guard: Some(_), .. }) => {
                 return (group, Some(guarded), false);
             }
-            Message::Commit(pending) => {
+            item @ (Message::Commit(_) | Message::Counter { .. }) => {
                 if let (Some(cap), Some(total)) = (config.group_max_bytes, bytes.as_mut()) {
-                    let size = request_bytes(&pending.request);
+                    let size = item.bytes();
                     if *total > cap || size > cap - *total {
-                        return (group, Some(Message::Commit(pending)), false);
+                        return (group, Some(item), false);
                     }
                     *total += size;
                 }
-                group.push(pending);
+                group.push(item);
             }
-            counter @ Message::Counter { .. } => return (group, Some(counter), false),
             Message::Shutdown => return (group, None, true),
         }
     }
@@ -627,29 +655,14 @@ fn run(
     let mut deferred = None;
     while let Some(message) = deferred.take().or_else(|| receiver.recv().ok()) {
         let first = match message {
-            Message::Commit(first) => first,
-            Message::Counter {
-                key,
-                value,
-                features_or,
-                reply,
-            } => {
-                let result = if fenced || kv.is_fenced() {
-                    Err(TxnError::Fenced)
-                } else {
-                    process_counter(&kv, key, value, features_or, &mut features)
-                };
-                fenced |= matches!(result, Err(TxnError::CommitAmbiguous | TxnError::Fenced));
-                let _ = reply.send(result);
-                continue;
-            }
             Message::Shutdown => break,
+            item => item,
         };
         let (group, next, shutdown) = gather(first, &receiver, &config);
         deferred = next;
         if shutdown || fenced || kv.is_fenced() {
             for p in group {
-                let _ = p.reply.send(Err(TxnError::Fenced));
+                p.reject(TxnError::Fenced);
             }
             if shutdown {
                 break;
@@ -682,47 +695,40 @@ fn run(
         }
     }
 }
-fn process_counter(
+#[allow(clippy::too_many_arguments)]
+fn validate_counter(
     kv: &Kv,
-    key: Vec<u8>,
-    value: Vec<u8>,
+    key: &[u8],
+    value: &[u8],
     features_or: u64,
-    features: &mut u64,
-) -> Result<(), TxnError> {
-    let next = *features | features_or | 256;
-    if !valid_counter_key(&key) || super::meta::check_features(next).is_err() {
+    features: u64,
+    subversion: u32,
+    native: &super::native_content::NativeContent,
+    catalog: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+) -> Result<u64, TxnError> {
+    let next = features | features_or | 256;
+    if !valid_counter_key(key) || super::meta::check_features(next).is_err() {
         return Err(TxnError::Misuse);
     }
     let seq_id = u64::from_be_bytes(key[1..9].try_into().expect("validated counter key"));
     let incarnation = u128::from_be_bytes(key[9..25].try_into().expect("validated counter key"));
-    // This worker serializes commit groups and counter messages, so no DROP
-    // can interleave between this latest-physical-version check and the write.
-    // A latest tombstone hides every older live definition.
-    let definition = super::mvcc::latest_version(
-        kv,
-        Keyspace::Catalog,
-        &super::catalog_codec::sequence_key(seq_id),
-    )?
-    .and_then(|(_, value)| value)
-    .ok_or(TxnError::SequenceGone)?;
+    // Accepted predecessors are not yet visible in KV. A staged tombstone
+    // must hide the persisted definition just as a committed tombstone does.
+    let catalog_key = super::catalog_codec::sequence_key(seq_id);
+    let definition = match catalog.get(&catalog_key) {
+        Some(value) => value.clone(),
+        None => super::mvcc::latest_version(kv, Keyspace::Catalog, &catalog_key)?
+            .and_then(|(_, value)| value),
+    }.ok_or(TxnError::SequenceGone)?;
     let definition = super::catalog_codec::decode_sequence(&definition)
         .map_err(|error| TxnError::Kv(super::kv::KvError::Corrupt(error.to_string())))?;
     if definition.incarnation != incarnation {
         return Err(TxnError::SequenceGone);
     }
-    super::catalog_codec::decode_counter(&key, &value, &definition)
+    super::catalog_codec::decode_counter(key, value, &definition)
         .map_err(|_| TxnError::Misuse)?;
-    let native = load_native(kv)?;
-    native.validate(next, load_subversion(kv)?).map_err(|_| TxnError::Misuse)?;
-    let mut batch = WriteBatch::default();
-    batch.put(Keyspace::Seq, key, value);
-    if next != *features {
-        super::meta::put_features(&mut batch, next).map_err(|_| TxnError::Misuse)?;
-    }
-    kv.write(batch, Durability::Sync)
-        .map_err(|error| write_error(&error))?;
-    *features = next;
-    Ok(())
+    native.validate(next, subversion).map_err(|_| TxnError::Misuse)?;
+    Ok(next)
 }
 
 /// The native-content record. Its read fails on a KV fenced after the worker's fence check
@@ -746,7 +752,7 @@ fn write_error(error: &super::kv::KvError) -> TxnError {
 // Returns whether an ambiguous backend result requires fencing subsequent groups.
 #[allow(clippy::too_many_arguments)]
 fn process_group(
-    group: Vec<Pending>,
+    group: Vec<Message>,
     kv: &Kv,
     clock: &dyn Clock,
     shared: &Shared,
@@ -762,7 +768,12 @@ fn process_group(
     // Oracle mode reserves the group's timestamps before anything is staged, so an
     // oracle failure fails every request and writes nothing.
     // Each write request gets its own timestamp of one `next(n)` reservation (first + i).
-    let writers = group.iter().filter(|p| !p.request.writes.is_empty()).count();
+    #[cfg(test)]
+    if group.iter().any(|p| matches!(p, Message::Counter { .. }))
+        && group.iter().any(|p| matches!(p, Message::Commit(_))) {
+        shared.max_mixed_group.fetch_max(group.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+    let writers = group.iter().filter(|p| matches!(p, Message::Commit(p) if !p.request.writes.is_empty())).count();
     // The reservation stays in flight (readers at or above it wait) until this group ends.
     let mut _reservation = None;
     let mut group_ts = match ts_source {
@@ -778,7 +789,7 @@ fn process_group(
                 }
                 Err(error) => {
                     for p in group {
-                        let _ = p.reply.send(Err(error.clone()));
+                        p.reject(error.clone());
                     }
                     return false;
                 }
@@ -794,19 +805,37 @@ fn process_group(
     let mut max = visible;
     let mut batch = WriteBatch::default();
     let mut accepted = Vec::new();
+    let mut counters = Vec::new();
+    let mut catalog = BTreeMap::new();
     let mut decision = None;
     let mut deferred_log = None;
     let mut native = match load_native(kv) {
         Ok(native) => native,
         Err(error) => {
             let fenced = error == TxnError::Fenced;
-            for pending in group { let _ = pending.reply.send(Err(error.clone())); }
+            for pending in group { pending.reject(error.clone()); }
             return fenced;
         }
     };
     let mut pending_features = *features;
     let mut pending_subversion = *subversion;
-    for pending in group {
+    for item in group {
+        let pending = match item {
+            Message::Commit(pending) => pending,
+            Message::Counter { key, value, features_or, reply } => {
+                match validate_counter(kv, &key, &value, features_or, pending_features,
+                    pending_subversion, &native, &catalog) {
+                    Ok(next) => {
+                        batch.put(Keyspace::Seq, key, value);
+                        pending_features = next;
+                        counters.push(reply);
+                    }
+                    Err(error) => { let _ = reply.send(Err(error)); }
+                }
+                continue;
+            }
+            Message::Shutdown => unreachable!("shutdown is never grouped"),
+        };
         let request = &pending.request;
         let next_features = pending_features | request.features_or;
         let next_subversion = pending_subversion.max(request.minimum_subversion);
@@ -905,6 +934,9 @@ fn process_group(
                     None => super::mvcc::encode_tombstone(),
                 };
                 batch.put(*ks, versioned, tagged);
+                if *ks == Keyspace::Catalog {
+                    catalog.insert(key.clone(), value.clone());
+                }
             }
             // Later requests in this group validate against accepted predecessors.
             // Unpublished entries on Sync failure are harmless: the permanent
@@ -962,6 +994,10 @@ fn process_group(
         hlc.last = ts;
         log.append(ts, keys);
     }
+    #[cfg(test)]
+    if !batch.is_empty() {
+        shared.sync_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if !batch.is_empty()
         && let Err(error) = kv.write(batch, Durability::Sync)
     {
@@ -969,6 +1005,7 @@ fn process_group(
         for (reply, _) in accepted {
             let _ = reply.send(Err(error.clone()));
         }
+        for reply in counters { let _ = reply.send(Err(error.clone())); }
         return true;
     }
     *features = pending_features;
@@ -984,7 +1021,10 @@ fn process_group(
     // snapshots registered after this capture are >= captured visible. Normal
     // trim removes only <= min(visible, oldest), preserving every live reader's
     // needed history; forced budget eviction instead records the lost horizon.
-    log.trim(Some(visible.min(oldest.unwrap_or(visible))));
+    if !accepted.is_empty() {
+        log.trim(Some(visible.min(oldest.unwrap_or(visible))));
+    }
+    for reply in counters { let _ = reply.send(Ok(())); }
     for (reply, ts) in accepted {
         let _ = reply.send(Ok(ts));
     }
@@ -1008,7 +1048,7 @@ impl Sequencer {
             .map(|request| {
                 let (reply, receive) = mpsc::channel();
                 receives.push(receive);
-                Pending { request, guard: None, reply }
+                Message::Commit(Pending { request, guard: None, reply })
             })
             .collect();
         let mut hlc = HlcClock::new(self.visible_ts());
