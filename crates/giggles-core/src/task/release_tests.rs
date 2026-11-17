@@ -204,9 +204,21 @@ fn plain_exit_fails_closed_in_task_session() {
     let native = crate::operations::Error::Core(refused.to_string());
     assert_eq!(sql.execute_native(&read, &bindings), Err(native.clone()));
     assert_eq!(sql.read_page(&read, None, &bindings), Err(native.clone()));
-    let page = sql.execute_native_unreleased(&read, &bindings).unwrap();
-    assert!(page.is_task());
-    assert_eq!(page.untasked(), Err(refused.clone()));
+    // The native twin binds under the task's column rules (R3-304). On v2 the
+    // session holds a real task (R3-305), so the twin runs and its page is
+    // tagged; the synthetic legacy context names no catalog task, so it is
+    // refused as revoked.
+    #[cfg(feature = "engine-rocksdb")]
+    {
+        let page = sql.execute_native_unreleased(&read, &bindings).unwrap();
+        assert!(page.is_task());
+        assert_eq!(page.untasked(), Err(refused.clone()));
+    }
+    #[cfg(not(feature = "engine-rocksdb"))]
+    assert_eq!(
+        sql.execute_native_unreleased(&read, &bindings).map(|_| ()),
+        Err(crate::operations::Error::Sql { sqlstate: "28T01".into() })
+    );
     // Outside a task session the same calls work.
     let mut plain = admin.sql_session();
     assert_eq!(plain.execute("SELECT id FROM shipments", &[], None).unwrap().rows.len(), 3);

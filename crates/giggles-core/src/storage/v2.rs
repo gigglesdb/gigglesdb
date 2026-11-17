@@ -371,6 +371,15 @@ impl V2Db {
         })
     }
 
+    /// The column labels of the catalog snapshot `inspect_metadata` reads
+    /// (GD-0061 R3-304: native task requests take their marks from it).
+    pub(super) fn column_labels(
+        &self,
+        txn: Option<&engine::txn::Transaction>,
+    ) -> Result<std::collections::BTreeMap<(u64, u64), u8>, CoreError> {
+        self.with_metadata_catalog(txn, |catalog, _, _| Ok(catalog.parts.column_labels.clone()))
+    }
+
     /// Metadata helpers borrow the validated image rather than cloning all its
     /// tables for every name, type, default or authorization dependency lookup.
     pub(super) fn inspect_metadata<T>(

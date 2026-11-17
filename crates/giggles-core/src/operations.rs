@@ -721,9 +721,48 @@ fn bind_request(
     request: &Request,
     bindings: &Bindings,
 ) -> Result<(TableDef, Operation)> {
+    if let Some(rules) = task_rules(session)? {
+        let (table, request) = task_target(session, &rules, request)?;
+        return bind_table(table, &request, bindings, session.max_read_rows());
+    }
     let key = native_relation_key(request.table()?);
     let table = resolve_relation(session, &key, request)?;
     bind_table(table, request, bindings, session.max_read_rows())
+}
+/// A task refusal on the native surface keeps its SQLSTATE.
+fn task_error(e: crate::task::TaskError) -> Error {
+    Error::Sql { sqlstate: e.sqlstate().into() }
+}
+/// The column rules of the session's task; `None` outside a task session and
+/// for contexts that are not a SQL session.
+fn task_rules(
+    session: &mut impl Context,
+) -> Result<Option<crate::task::columns::NativeRules>> {
+    match session.session() {
+        Ok(sql) => crate::task::columns::NativeRules::load(sql).map_err(task_error),
+        Err(_) => Ok(None),
+    }
+}
+/// GD-0061 R3-304: a task request is refused by class before resolution,
+/// resolves only as a table (a view or unknown name is another relation), and
+/// binds the request `apply_native` returns (empty projections expanded).
+fn task_target(
+    session: &mut impl Context,
+    rules: &crate::task::columns::NativeRules,
+    request: &Request,
+) -> Result<(TableDef, Request)> {
+    use crate::task::{DenyRule, TaskError};
+    rules.admit(request).map_err(task_error)?;
+    let key = native_relation_key(request.table()?);
+    let table = match session.resolve_table_engine(&key) {
+        Ok(table) => table,
+        Err(CoreError::Sql(SqlError::UnknownTable)) => {
+            return Err(task_error(TaskError::Denied(DenyRule::OtherTable)));
+        }
+        Err(e) => return Err(core(e)),
+    };
+    let request = rules.apply(&table, request).map_err(task_error)?;
+    Ok((table, request))
 }
 /// Resolve a request's target. Reads may name a view, as SQL FROM may; every
 /// other request, and any unknown name, keeps the table resolution and 42P01.

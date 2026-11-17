@@ -29,3 +29,20 @@ impl Admin {
         Ok(out)
     }
 }
+
+impl super::SqlSession {
+    /// Column labels of this session's catalog snapshot (its open transaction,
+    /// else the committed catalog), keyed by (table id, column id). Legacy
+    /// databases have none. GD-0061 R3-304.
+    pub(crate) fn task_column_labels(
+        &self,
+    ) -> Result<std::collections::BTreeMap<(u64, u64), u8>, CoreError> {
+        match &self.admin.inner.backend {
+            Backend::Legacy(_) => Ok(std::collections::BTreeMap::new()),
+            Backend::V2(db) => {
+                let _ticket = self.admin.inner.enter()?;
+                db.column_labels(self.v2_transaction.as_ref())
+            }
+        }
+    }
+}

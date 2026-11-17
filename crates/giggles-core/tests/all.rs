@@ -504,3 +504,4 @@ mod pgparity_concat;
 #[path = "pgparity_typeof.rs"]
 mod pgparity_typeof;
 #[path = "task_rows.rs"] mod task_rows;
+#[path = "task_columns_native.rs"] mod task_columns_native;

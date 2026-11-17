@@ -372,6 +372,7 @@ pub(super) fn bind_transaction(
     bindings: &Bindings,
 ) -> Result<BoundTransaction> {
     let (database_domain, catalog_epoch) = session.snapshot_identity_engine().map_err(core)?;
+    let rules = task_rules(session)?;
     let mut tables = Vec::new();
     let mut table_indices = BTreeMap::new();
     let mut locals: Vec<LocalShape> = Vec::new();
@@ -396,8 +397,21 @@ pub(super) fn bind_transaction(
                 BoundStep::Require(binder.predicate(expression)?)
             }
             TransactionStep::Execute(request) | TransactionStep::Let { request, .. } => {
-                let name = request.table()?;
-                bound_table = resolve_relation(session, &native_relation_key(name), request)?;
+                // GD-0061 R3-304: in a task session every step is checked (and
+                // its empty projections expanded) here, before any step runs.
+                let checked;
+                let request = match &rules {
+                    Some(rules) => {
+                        (bound_table, checked) = task_target(session, rules, request)?;
+                        &checked
+                    }
+                    None => {
+                        let name = request.table()?;
+                        bound_table =
+                            resolve_relation(session, &native_relation_key(name), request)?;
+                        request
+                    }
+                };
                 let table = &bound_table;
                 if table.hidden_rowid().is_some() {
                     return Err(Error::Unsupported);
