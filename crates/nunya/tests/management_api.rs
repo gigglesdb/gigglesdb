@@ -49,14 +49,18 @@ impl ConnectionSource for Sources {
     }
 }
 impl StatusSource for Sources {
-    fn policy_revision(&self) -> Option<String> {
-        Some("policy-1".into())
+    fn policy_revision(&self, route: &str) -> Option<String> {
+        match route {
+            "postgres" => Some("policy-1".into()),
+            "route-b" => Some("policy-b".into()),
+            _ => None,
+        }
     }
     fn config_revision(&self) -> Option<String> {
         Some("config-2".into())
     }
     fn route_ids(&self) -> Vec<String> {
-        vec!["postgres".into()]
+        vec!["postgres".into(), "route-b".into(), "unavailable".into()]
     }
 }
 struct Fixture {
@@ -385,8 +389,11 @@ fn reads_are_scoped_sorted_and_secret_free() {
         status["store_format"],
         f.ctx().authority.store_format_version()
     );
-    assert_eq!(status["route_ids"], serde_json::json!(["postgres"]));
-    assert_eq!(status["policy_revision"], "policy-1");
+    assert_eq!(status["route_ids"], serde_json::json!(["postgres", "route-b", "unavailable"]));
+    assert_eq!(status["policy_revisions"], serde_json::json!({
+        "postgres": "policy-1", "route-b": "policy-b", "unavailable": null
+    }));
+    assert!(status.get("policy_revision").is_none());
     assert_eq!(status["config_revision"], "config-2");
 }
 #[test]
@@ -489,6 +496,48 @@ fn error_is(response: Response<Bytes>, status: u16, code: &str) {
     assert_eq!(response.status().as_u16(), status);
     assert_eq!(value(&response), serde_json::json!({"error":code}));
 }
+#[test]
+fn session_revisions_follow_the_session_route() {
+    let mut f = Fixture::new();
+    f.ctx().authority.set_grants(f.principals[0], vec![
+        (RouteId::new("postgres").unwrap(), Mode::ReadWrite),
+        (RouteId::new("route-b").unwrap(), Mode::ReadWrite),
+    ]).unwrap();
+    let mut body = f.session_body("route-b-private.secret");
+    body["route"] = serde_json::json!("route-b");
+    let acquired = f.post(ALICE, "/v1/sessions", "route-b-revision", body);
+    assert_eq!(acquired.status(), 201);
+    let acquired = value(&acquired);
+    assert_eq!(acquired["route"], "route-b");
+    assert_eq!(acquired["policy_revision"], "policy-b");
+    assert_eq!(acquired["config_revision"], "config-2");
+    let id = acquired["id"].as_str().unwrap();
+    let detail = f.request(Origin::Network, Some(ALICE), "GET",
+        &format!("/v1/sessions/{id}"), None);
+    assert_eq!(detail.status(), 200);
+    assert_eq!(value(&detail)["policy_revision"], "policy-b");
+    let list = f.request(Origin::Network, Some(ALICE), "GET", "/v1/sessions", None);
+    assert_eq!(list.status(), 200);
+    let list = value(&list);
+    let sessions = list.as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    for session in sessions {
+        let revision = match session["route"].as_str() {
+            Some("postgres") => "policy-1",
+            Some("route-b") => "policy-b",
+            _ => panic!("unexpected session route"),
+        };
+        assert_eq!(session["policy_revision"], revision);
+    }
+    let status = f.request(Origin::Network, Some(ADMIN), "GET", "/v1/status", None);
+    assert_eq!(status.status(), 200);
+    let status = value(&status);
+    assert_eq!(status["policy_revisions"], serde_json::json!({
+        "postgres": "policy-1", "route-b": "policy-b", "unavailable": null
+    }));
+    assert!(status.get("policy_revision").is_none());
+}
+
 #[test]
 fn acquire_mutations_validation_idempotency_and_secret_checks() {
     let mut f = Fixture::new();
@@ -607,7 +656,7 @@ fn rotation_parameter_mismatch_is_atomic() -> TransportResult {
     let detail_value = value(&detail);
     assert!(detail_value.get("scram_salt").is_none());
     assert!(detail_value.get("scram_iterations").is_none());
-    assert!(detail_value.get("policy_revision").is_some());
+    assert_eq!(detail_value["policy_revision"], "policy-1");
     assert!(detail_value.get("config_revision").is_some());
     let list = value(&f.request(Origin::Network, Some(ALICE), "GET", "/v1/sessions", None));
     for session in list.as_array().ok_or("missing session list")? {
@@ -1754,8 +1803,12 @@ async fn client_all_methods_and_session_secret() -> TransportResult {
     );
     assert_eq!(admin.connections().await?[0].id, 7);
     let status = admin.status().await?;
-    assert_eq!(status.route_ids, ["postgres"]);
-    assert_eq!(status.policy_revision.as_deref(), Some("policy-1"));
+    assert_eq!(status.route_ids, ["postgres", "route-b", "unavailable"]);
+    assert_eq!(status.policy_revisions, std::collections::BTreeMap::from([
+        ("postgres".into(), Some("policy-1".into())),
+        ("route-b".into(), Some("policy-b".into())),
+        ("unavailable".into(), None),
+    ]));
     let err = alice.status().await.unwrap_err();
     assert_eq!(
         err,
@@ -1851,7 +1904,7 @@ async fn client_unix_socket() -> TransportResult {
         None,
         Credentials::None,
     )?;
-    assert_eq!(client.status().await?.route_ids, ["postgres"]);
+    assert_eq!(client.status().await?.route_ids, ["postgres", "route-b", "unavailable"]);
     finish_server(tx, server).await
 }
 #[tokio::test]
@@ -2345,7 +2398,8 @@ async fn serve_management_acquire_and_pg_login() -> TransportResult {
     let connections = admin.connections().await?;
     assert!(connections.iter().any(|c| c.session == session.id && c.principal == session.principal && c.route == "postgres"));
     let status = admin.status().await?;
-    for revision in [status.policy_revision, status.config_revision] {
+    for revision in status.policy_revisions.values().chain(std::iter::once(&status.config_revision)) {
+        let revision = revision.as_deref();
         let revision = revision.ok_or("missing revision")?;
         assert_eq!(revision.len(), 64);
         assert!(revision.bytes().all(|b| b.is_ascii_hexdigit()));

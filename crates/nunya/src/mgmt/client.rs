@@ -310,8 +310,8 @@ pub struct StatusView {
     pub store_format: u32,
     /// Configured route identifiers.
     pub route_ids: Vec<String>,
-    /// Optional policy revision.
-    pub policy_revision: Option<String>,
+    /// Optional policy revisions by configured route identifier.
+    pub policy_revisions: std::collections::BTreeMap<String, Option<String>>,
     /// Optional configuration revision.
     pub config_revision: Option<String>,
 }

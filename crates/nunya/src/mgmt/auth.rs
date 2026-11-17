@@ -151,7 +151,7 @@ mod tests {
             }
         }
         impl StatusSource for Sources {
-            fn policy_revision(&self) -> Option<String> {
+            fn policy_revision(&self, _route: &str) -> Option<String> {
                 None
             }
             fn config_revision(&self) -> Option<String> {

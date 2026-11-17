@@ -45,8 +45,8 @@ pub trait ConnectionSource: Send + Sync {
 }
 /// Read-only runtime revision adapter.
 pub trait StatusSource: Send + Sync {
-    /// Current policy revision.
-    fn policy_revision(&self) -> Option<String>;
+    /// Current policy revision for a route, or None when unknown or unavailable.
+    fn policy_revision(&self, route: &str) -> Option<String>;
     /// Current configuration revision.
     fn config_revision(&self) -> Option<String>;
     /// Configured route identifiers.
@@ -162,7 +162,7 @@ fn audit_unavailable() -> Response<Bytes> {
     error(StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable")
 }
 fn session_view(ctx: &MgmtContext, s: &AccessSession) -> Value {
-    json!({"policy_revision":ctx.status.policy_revision(),
+    json!({"policy_revision":ctx.status.policy_revision(s.route.as_str()),
         "config_revision":ctx.status.config_revision(), "id":s.id, "principal":s.principal, "route":s.route, "mode":s.mode,
         "state":s.state, "created_ms":s.created_ms, "expires_ms":s.expires_ms,
         "idle_timeout_ms":s.idle_timeout_ms, "last_used_ms":s.last_used_ms,
@@ -740,9 +740,13 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
         },
         Connections => json!(ctx.connections.list()),
         Status => {
+            let route_ids = ctx.status.route_ids();
+            let policy_revisions: serde_json::Map<String, Value> = route_ids.iter()
+                .map(|route| (route.clone(), json!(ctx.status.policy_revision(route))))
+                .collect();
             json!({"deployment_id":data_encoding::HEXLOWER.encode(&ctx.authority.deployment_id()),
-            "store_format":ctx.authority.store_format_version(), "route_ids":ctx.status.route_ids(),
-            "policy_revision":ctx.status.policy_revision(), "config_revision":ctx.status.config_revision()})
+            "store_format":ctx.authority.store_format_version(), "route_ids":route_ids,
+            "policy_revisions":policy_revisions, "config_revision":ctx.status.config_revision()})
         }
         Renew(_)
         | Revoke(_)

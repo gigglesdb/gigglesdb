@@ -303,10 +303,9 @@ struct ManagementStatus {
     routes: Vec<crate::state::model::RouteId>,
 }
 impl crate::mgmt::routes::StatusSource for ManagementStatus {
-    fn policy_revision(&self) -> Option<String> {
-        let mut routes = self.routes.iter();
-        let revision = self.hub.policy_revision_for(routes.next()?)?;
-        routes.all(|route| self.hub.policy_revision_for(route).as_ref() == Some(&revision)).then_some(revision)
+    fn policy_revision(&self, route: &str) -> Option<String> {
+        let route = self.routes.iter().find(|id| id.as_str() == route)?;
+        self.hub.policy_revision_for(route)
     }
     fn config_revision(&self) -> Option<String> {
         self.hub.log.1.read().ok().map(|r| r.config.clone())
@@ -671,17 +670,17 @@ mod tests {
         hub.set_config_revision("config").unwrap();
         let revisions = hub.route_log(&route).unwrap().1;
         let status = ManagementStatus { hub: hub.clone(), routes: vec![route] };
-        let first = status.policy_revision().unwrap();
+        let first = status.policy_revision("postgres").unwrap();
         revisions.write().unwrap().policy = "reloaded".into();
         assert_ne!(first, "reloaded");
-        assert_eq!(status.policy_revision().as_deref(), Some("reloaded"));
+        assert_eq!(status.policy_revision("postgres").as_deref(), Some("reloaded"));
         assert_eq!(status.config_revision().as_deref(), Some("config"));
         assert_eq!(status.route_ids(), ["postgres"]);
         let _ = std::thread::spawn(move || {
             let _guard = revisions.write().unwrap();
             panic!("poison revision lock");
         }).join();
-        assert_eq!(status.policy_revision(), None);
+        assert_eq!(status.policy_revision("postgres"), None);
         let service_revisions = hub.log.1.clone();
         let _ = std::thread::spawn(move || {
             let _guard = service_revisions.write().unwrap();
@@ -694,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn management_status_requires_agreement_across_route_revisions() {
+    fn management_status_returns_each_routes_revision() {
         use crate::mgmt::routes::StatusSource;
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).unwrap();
@@ -708,9 +707,12 @@ mod tests {
         let hub = crate::reload::Hub::new(&[(routes[0].clone(), a), (routes[1].clone(), b)], None).unwrap();
         hub.set_config_revision("config").unwrap();
         let status = ManagementStatus { hub: hub.clone(), routes: routes.clone() };
-        assert!(status.policy_revision().is_some());
+        let first = status.policy_revision("a").unwrap();
+        assert_eq!(status.policy_revision("b"), Some(first.clone()));
         hub.route_log(&routes[1]).unwrap().1.write().unwrap().policy = "other".into();
-        assert_eq!(status.policy_revision(), None);
+        assert_eq!(status.policy_revision("a"), Some(first));
+        assert_eq!(status.policy_revision("b").as_deref(), Some("other"));
+        assert_eq!(status.policy_revision("unknown"), None);
         assert_eq!(status.config_revision().as_deref(), Some("config"));
         assert_eq!(status.route_ids(), ["a", "b"]);
         drop(status);
