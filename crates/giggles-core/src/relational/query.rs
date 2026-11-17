@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 mod aggregate_filter;
 mod functions;
+pub(super) mod plan;
 pub(super) mod typed_read;
 pub(super) use functions::assignment;
 pub(super) mod conflict;
@@ -2439,6 +2440,7 @@ impl Query {
         let explain = p.word("explain");
         p.need("select")?;
         let distinct = p.word("distinct");
+        if !distinct { p.word("all"); }
         if distinct && p.word("on") {
             return Err(SqlError::Unsupported);
         }

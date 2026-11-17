@@ -985,6 +985,7 @@ enum Statement {
     DropIndex(sql_index::DropIndex),
     InsertMulti(Box<sql_insert::Insert>),
     Query(query::Query),
+    Plan(query::plan::Plan),
     Create {
         name: String,
         optional: bool,
@@ -1828,7 +1829,7 @@ impl Prepared {
             Statement::Release(_) => V2Class::Control("release"),
             Statement::RollbackTo(_) => V2Class::Control("rollback_to"),
             Statement::CompositeSelect(_) => V2Class::Read,
-            Statement::Select { .. } | Statement::Query(_) => V2Class::Read,
+            Statement::Select { .. } | Statement::Query(_) | Statement::Plan(_) => V2Class::Read,
             // ON CONFLICT's unique-index dependency requires catalog/private conflict data.
             Statement::InsertMulti(_)
             | Statement::InsertExpressions(_)
@@ -2355,6 +2356,9 @@ impl Prepared {
                 &this.parameter_types,
             );
         }
+        if let Statement::Plan(plan) = &this.statement {
+            return plan.validate_immutable_constants(state, this.params, &this.parameter_types);
+        }
         if let Statement::Query(q) = &this.statement {
             return q
                 .bind(state, this.params, &this.parameter_types)?
@@ -2428,6 +2432,9 @@ impl Prepared {
         }
         if let Statement::InsertExpressions(values) = &self.statement {
             return returning::describe_insert(values, state, self.params, &self.parameter_types);
+        }
+        if let Statement::Plan(plan) = &self.statement {
+            return plan.describe(state, self.params, &self.parameter_types);
         }
         if let Statement::Query(q) = &self.statement {
             if !q.is_table_free() && state.sequence_by_name(q.target()).is_some() {
@@ -2592,6 +2599,7 @@ impl Prepared {
         match &self.statement {
             Statement::View(ddl) => ddl.names.first().map(String::as_str),
             Statement::Truncate { names, .. } | Statement::DropTable { names, .. } => names.first().map(String::as_str),
+            Statement::Plan(_) => None,
             Statement::Query(q) => {
                 if q.is_table_free() {
                     None
@@ -2621,6 +2629,7 @@ impl Prepared {
         match &self.statement {
             Statement::View(ddl) => ddl.query.as_ref().map_or_else(Vec::new, query::Query::read_tables),
             Statement::Query(query) => query.read_tables(),
+            Statement::Plan(plan) => plan.read_tables(),
             Statement::InsertMulti(insert) => insert
                 .source
                 .as_ref()
@@ -2659,6 +2668,7 @@ impl Prepared {
 
     /// Complete syntactic reads, collected before gateway classification or binding.
     pub fn authorization_tables(&self) -> R<Vec<String>> {
+        if let Statement::Plan(plan) = &self.statement { return plan.authorization_tables(); }
         let query = match &self.statement {
             Statement::View(ddl) => ddl.query.as_ref(),
             Statement::Query(query) => Some(query),
@@ -2732,7 +2742,7 @@ impl Prepared {
                 }
             }
             Statement::TypeDdl(ref ddl) => ddl.command(),
-            Statement::CompositeSelect(_) => "SELECT",
+            Statement::CompositeSelect(_) | Statement::Plan(_) => "SELECT",
             Statement::Sequence(ref ddl) => match ddl {
                 defaults::SequenceDdl::Create { .. } => "CREATE SEQUENCE",
                 defaults::SequenceDdl::Alter { .. } => "ALTER SEQUENCE",
@@ -2852,6 +2862,7 @@ impl Prepared {
         if matches!(
             self.statement,
             Statement::Query(_)
+                | Statement::Plan(_)
                 | Statement::Insert { .. }
                 | Statement::InsertMulti(_)
                 | Statement::InsertExpressions(_)
@@ -2875,6 +2886,7 @@ impl Prepared {
     pub fn sequences(&self) -> Vec<Option<String>> {
         let mut dependencies = match &self.statement {
             Statement::Query(query) => query.sequence_dependencies(),
+            Statement::Plan(plan) => plan.sequences(),
             Statement::InsertExpressions(values) => values.sequence_dependencies(),
             Statement::InsertMulti(insert) => insert.sequence_dependencies(),
             Statement::AlterTable(alter) => alter.sequence_dependencies(),
@@ -3178,7 +3190,8 @@ impl Prepared {
             params: BTreeSet::new(),
             relations: Vec::new(),
         };
-        let statement = if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "select" || word == "explain")
+        let original_tokens = p.tokens.clone();
+        let existing = (|| -> R<Statement> { Ok(if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "select" || word == "explain")
         {
             if user_types::CompositeSelect::claims(&p) {
                 Statement::CompositeSelect(user_types::CompositeSelect::parse(&mut p)?)
@@ -3197,6 +3210,20 @@ impl Prepared {
                     Statement::InsertExpressions(query::InsertExpressions::parse(&mut p)?)
                 }
                 Err(error) => return Err(error),
+            }
+        }) })();
+        let statement = match existing {
+            Ok(statement) => statement,
+            Err(error) => {
+                if !query::plan::Plan::claims(&original_tokens) { return Err(error); }
+                p.tokens = original_tokens;
+                p.at = 0;
+                p.params.clear();
+                p.relations.clear();
+                match query::plan::Plan::parse(&mut p) {
+                    Ok(plan) => Statement::Plan(plan),
+                    Err(planner) => return Err(if matches!(error, SqlError::Unsupported | SqlError::Syntax) { planner } else { error }),
+                }
             }
         };
         if let Statement::AlterTable(alter) = &statement
@@ -3265,7 +3292,7 @@ impl Prepared {
     pub(crate) fn is_read(&self) -> bool {
         matches!(
             self.statement,
-            Statement::Select { .. } | Statement::Query(_) | Statement::CompositeSelect(_)
+            Statement::Select { .. } | Statement::Query(_) | Statement::Plan(_) | Statement::CompositeSelect(_)
         )
     }
 }
@@ -3855,6 +3882,12 @@ impl Relational {
             }
             Statement::CompositeSelect(select) => {
                 return select.execute(self, params, &prepared.search_path);
+            }
+            Statement::Plan(plan) => {
+                if expected.is_some() { return Err(SqlError::Unsupported); }
+                let legacy = scan::LegacyRows(&*self);
+                return plan.execute(self, injected_source.unwrap_or(&legacy), prepared.params,
+                    params, &prepared.parameter_types, clock, &mut cancel);
             }
             Statement::Query(q) => {
                 if expected.is_some() {

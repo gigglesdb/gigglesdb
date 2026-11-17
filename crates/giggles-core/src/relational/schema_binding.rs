@@ -101,6 +101,7 @@ impl Prepared {
     pub(crate) fn bind_schemas(&self, state: &Relational) -> R<Self> {
         let mut bound = self.clone();
         if self.relations.is_empty()
+            && !matches!(&self.statement, Statement::Plan(_))
             && !matches!(&self.statement, Statement::Query(q) if q.has_domain_expression())
         {
             return Ok(bound);
@@ -188,6 +189,7 @@ impl Prepared {
                 }
             }
             Statement::Query(query) => query.bind_schema_names(&read, state, &self.search_path),
+            Statement::Plan(plan) => plan.bind_schema_names(&read, state, &self.search_path),
             Statement::InsertExpressions(insert) => {
                 insert.bind_schema_names(&read, state, &self.search_path)
             }
