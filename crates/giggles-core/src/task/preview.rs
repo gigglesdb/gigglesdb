@@ -258,8 +258,11 @@ struct DryRun {
 /// is the pin. In a task session the preview is logged as one read-log
 /// record with its outcome.
 ///
-/// Only `Surface::Sql` is prepared here; native text is 0A000 until a
-/// native preparer reaches core.
+/// Core has no native parser: for `Surface::Native`, `text` is the SQL
+/// UPDATE that the native front end (giggles-language profile 0.22) lowered
+/// the native `update` to, and it is prepared, stored and re-run at apply as
+/// SQL. The header's `surface` byte records where it came from, so the same
+/// UPDATE previewed from SQL and from native text has different digests.
 pub fn preview(
     session: &mut SqlSession,
     ctx: &TaskContext,
@@ -299,9 +302,6 @@ fn run(
     }
     if session.task().is_some_and(|bound| bound.task != ctx.task) {
         return Err(TaskError::Revoked);
-    }
-    if surface != Surface::Sql {
-        return Err(unsupported());
     }
     if text.len() > MAX_STATEMENT_TEXT || u16::try_from(params.len()).is_err() {
         return Err(CoreError::Limit.into());
@@ -787,7 +787,8 @@ impl ApplySource for StoredApply {
         let checked = self.checked(&mut read)?.ok_or(TaskError::ApprovalStale)?;
         drop(read);
         let header = checked.header;
-        if header.surface != Surface::Sql as u8 {
+        // Native previews store their SQL lowering (see `preview`).
+        if header.surface != Surface::Sql as u8 && header.surface != Surface::Native as u8 {
             return Err(unsupported());
         }
         let prepared = session.prepare(&header.text)?;

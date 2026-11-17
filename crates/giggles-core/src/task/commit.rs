@@ -84,7 +84,7 @@ use std::time::{Duration, Instant};
 
 /// How long an operation's outcome is kept after the later of its decision
 /// and the task's expiry (D5 default; a server setting later).
-pub(crate) const OUTCOME_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+pub const OUTCOME_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// The protected commit's own crash seams (D-I), armed only through the
 /// trusted `Admin::set_protected_point`, never by environment. Each one

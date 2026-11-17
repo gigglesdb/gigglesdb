@@ -26,6 +26,7 @@ mod explain;
 mod inspection;
 pub mod once;
 mod parser;
+mod preview;
 mod task;
 pub use capabilities::{
     Capability, CapabilityInterface, CapabilityLimits, CapabilityManifest, CapabilityState,
@@ -34,6 +35,10 @@ pub use capabilities::{
 };
 pub use execute::{BoundCatalogOperation, BoundOperation, BoundTransaction, Engine, Lowered, lower_text};
 pub use giggles_core::operations::ReadExplainOutcome;
+pub use preview::{
+    ChangeOutcome, ChangeStatement, LoweredUpdate, execute_change, lower_preview_update,
+    parse_change_with_version, task_error,
+};
 pub use task::parse_task_with_version;
 pub use inspection::InspectionOutcome;
 pub use once::{OnceError, OnceResult, OnceScope};

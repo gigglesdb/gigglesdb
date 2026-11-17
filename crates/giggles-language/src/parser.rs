@@ -892,7 +892,7 @@ impl Parser {
         }
         self.value()
     }
-    fn retention(&mut self) -> Result<DurationLiteral> {
+    pub(crate) fn retention(&mut self) -> Result<DurationLiteral> {
         let microseconds = match self.peek() {
             Some(Token::Duration(microseconds)) => {
                 let microseconds = *microseconds;
@@ -997,7 +997,7 @@ impl Parser {
         };
         Ok(Some((target, action)))
     }
-    fn base_statement(&mut self) -> Result<Statement> {
+    pub(crate) fn base_statement(&mut self) -> Result<Statement> {
         if self.word("insert") {
             let many = self.version.supports_insert_many() && self.word("many");
             let into = if many { self.need("into")?; true } else { self.word("into") };

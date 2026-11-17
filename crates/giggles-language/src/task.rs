@@ -6,7 +6,9 @@
 //! both languages store identical bytes. Dispatch is on the head words only:
 //! the general statement parser never sees these words.
 use crate::parser::{Parser, Token, lex};
-use crate::{Arithmetic, Compare, Error, Expr, LanguageVersion, Result, ScalarFunction, Value, ValueExpr};
+use crate::{
+    Arithmetic, Bindings, Compare, Error, Expr, LanguageVersion, Result, ScalarFunction, Value, ValueExpr,
+};
 use giggles_core::task::definition::{
     AllowedWrite, DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText, TaskPrivileges,
 };
@@ -188,7 +190,7 @@ impl TaskParser {
             }
         }
         let mut sql = String::new();
-        render(&expr, 0, &mut sql)?;
+        render(&expr, 0, &mut sql, &mut Params::constant())?;
         Ok(PredicateText(sql))
     }
 
@@ -464,19 +466,53 @@ fn level(expr: &Expr) -> u8 {
     }
 }
 
-fn render(expr: &Expr, min: u8, out: &mut String) -> Result<()> {
+/// The parameters of rendered text. A task predicate is a stored constant
+/// with no bindings; a previewed UPDATE (R3-708) renders each native `$name`
+/// as a positional `$n`, numbered by first use, with its bound value.
+pub(crate) struct Params<'a> {
+    bindings: Option<&'a Bindings>,
+    names: Vec<String>,
+    pub(crate) values: Vec<Value>,
+}
+
+impl<'a> Params<'a> {
+    pub(crate) fn constant() -> Self {
+        Params { bindings: None, names: Vec::new(), values: Vec::new() }
+    }
+
+    pub(crate) fn bound(bindings: &'a Bindings) -> Self {
+        Params { bindings: Some(bindings), names: Vec::new(), values: Vec::new() }
+    }
+
+    fn placeholder(&mut self, name: &str, out: &mut String) -> Result<()> {
+        let bindings = self.bindings.ok_or(Error::Unsupported)?;
+        let position = match self.names.iter().position(|seen| seen == name) {
+            Some(position) => position,
+            None => {
+                let value = bindings.get(name).ok_or_else(|| Error::Bind(name.to_owned()))?;
+                self.names.push(name.to_owned());
+                self.values.push(value.clone());
+                self.names.len() - 1
+            }
+        };
+        out.push_str(&format!("${}", position + 1));
+        Ok(())
+    }
+}
+
+pub(crate) fn render(expr: &Expr, min: u8, out: &mut String, params: &mut Params) -> Result<()> {
     let wrap = level(expr) < min;
     if wrap {
         out.push('(');
     }
     match expr {
-        Expr::Value(value) => literal(value, out)?,
+        Expr::Value(value) => literal(value, out, params)?,
         Expr::Field(name) => identifier(name, out),
-        Expr::Or(a, b) => binary(a, 1, " OR ", b, 2, out)?,
-        Expr::And(a, b) => binary(a, 2, " AND ", b, 3, out)?,
+        Expr::Or(a, b) => binary(a, 1, " OR ", b, 2, out, params)?,
+        Expr::And(a, b) => binary(a, 2, " AND ", b, 3, out, params)?,
         Expr::Not(e) => {
             out.push_str("NOT ");
-            render(e, 3, out)?;
+            render(e, 3, out, params)?;
         }
         Expr::Compare(a, op, b) => {
             let op = match op {
@@ -487,10 +523,10 @@ fn render(expr: &Expr, min: u8, out: &mut String) -> Result<()> {
                 Compare::Gt => " > ",
                 Compare::Ge => " >= ",
             };
-            binary(a, 5, op, b, 5, out)?;
+            binary(a, 5, op, b, 5, out, params)?;
         }
         Expr::IsNull(e, negated) => {
-            render(e, 5, out)?;
+            render(e, 5, out, params)?;
             out.push_str(if *negated { " IS NOT NULL" } else { " IS NULL" });
         }
         Expr::Arithmetic(a, op, b) => {
@@ -501,11 +537,11 @@ fn render(expr: &Expr, min: u8, out: &mut String) -> Result<()> {
                 Arithmetic::Divide => (" / ", 6),
                 Arithmetic::Remainder => (" % ", 6),
             };
-            binary(a, l, text, b, l + 1, out)?;
+            binary(a, l, text, b, l + 1, out, params)?;
         }
         Expr::Negate(e) => {
             out.push('-');
-            render(e, 8, out)?;
+            render(e, 8, out, params)?;
         }
         Expr::Call {
             function,
@@ -520,7 +556,7 @@ fn render(expr: &Expr, min: u8, out: &mut String) -> Result<()> {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                render(argument, 1, out)?;
+                render(argument, 1, out, params)?;
             }
             out.push(')');
         }
@@ -532,17 +568,17 @@ fn render(expr: &Expr, min: u8, out: &mut String) -> Result<()> {
             out.push_str("CASE");
             if let Some(operand) = operand {
                 out.push(' ');
-                render(operand, 1, out)?;
+                render(operand, 1, out, params)?;
             }
             for (condition, result) in arms {
                 out.push_str(" WHEN ");
-                render(condition, 1, out)?;
+                render(condition, 1, out, params)?;
                 out.push_str(" THEN ");
-                render(result, 1, out)?;
+                render(result, 1, out, params)?;
             }
             if let Some(else_expr) = else_expr {
                 out.push_str(" ELSE ");
-                render(else_expr, 1, out)?;
+                render(else_expr, 1, out, params)?;
             }
             out.push_str(" END");
         }
@@ -555,16 +591,24 @@ fn render(expr: &Expr, min: u8, out: &mut String) -> Result<()> {
     Ok(())
 }
 
-fn binary(a: &Expr, la: u8, op: &str, b: &Expr, lb: u8, out: &mut String) -> Result<()> {
-    render(a, la, out)?;
+fn binary(
+    a: &Expr,
+    la: u8,
+    op: &str,
+    b: &Expr,
+    lb: u8,
+    out: &mut String,
+    params: &mut Params,
+) -> Result<()> {
+    render(a, la, out, params)?;
     out.push_str(op);
-    render(b, lb, out)
+    render(b, lb, out, params)
 }
 
-fn literal(value: &ValueExpr, out: &mut String) -> Result<()> {
+fn literal(value: &ValueExpr, out: &mut String, params: &mut Params) -> Result<()> {
     match value {
         // A task definition is a stored constant; it has no bindings.
-        ValueExpr::Parameter(_) => return Err(Error::Unsupported),
+        ValueExpr::Parameter(name) => params.placeholder(name, out)?,
         ValueExpr::Literal(Value::Null) => out.push_str("NULL"),
         ValueExpr::Literal(Value::Bool(b)) => out.push_str(if *b { "TRUE" } else { "FALSE" }),
         // Parenthesised so `a - -1` never renders as a `--` comment.
@@ -583,7 +627,7 @@ fn literal(value: &ValueExpr, out: &mut String) -> Result<()> {
 /// Native field names are already lower-case `[a-z][a-z0-9_]*`. SQL keywords
 /// are double-quoted; core re-renders canonical text, so over-quoting is
 /// harmless while under-quoting would change the predicate.
-fn identifier(name: &str, out: &mut String) {
+pub(crate) fn identifier(name: &str, out: &mut String) {
     const KEYWORDS: &[&str] = &[
         "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric", "authorization",
         "between", "bigint", "binary", "bit", "boolean", "both", "case", "cast", "char", "character",

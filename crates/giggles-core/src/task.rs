@@ -50,7 +50,9 @@ mod statements_tests;
 pub use admit::StatementClass;
 pub use approval::{approve, list_changes, revoke_approval, show_change};
 // R3-615 through the agent seam (R3-207): the server's direct protected write.
-pub use commit::{inspect_outcome, outcome, protected_commit, Actor, ProtectedRequest};
+pub use commit::{
+    inspect_outcome, outcome, protected_commit, Actor, ProtectedRequest, OUTCOME_RETENTION_MS,
+};
 // R3-619: the protected commit's crash seams, armed by `Admin::set_protected_point`.
 #[doc(hidden)]
 pub use commit::ProtectedPoint;
