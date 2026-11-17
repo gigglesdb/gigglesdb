@@ -642,7 +642,10 @@ async fn identical_readiness_is_coalesced_change_and_heartbeat_are_immediate() {
         .await
         .unwrap();
     let mut sample = snapshot();
-    f.engine.evaluate_sample(&sample).await.unwrap();
+    // Coalescing compares readiness facts, not a lag observation that can expire.
+    // Missing lag produces stable conservative facts even under machine load.
+    sample.apply_lag = None;
+    let baseline = f.engine.evaluate_sample(&sample).await.unwrap();
     let before = f.journal.load(false).await.unwrap().applied_seq;
     assert_eq!(
         f.journal.load(false).await.unwrap().progress["buffered"].1,
@@ -659,8 +662,10 @@ async fn identical_readiness_is_coalesced_change_and_heartbeat_are_immediate() {
         .as_mut()
         .unwrap()
         .1 = std::time::Instant::now() + Duration::from_secs(60);
+    // Cross the lag freshness window; identical facts must remain coalesced.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     for _ in 0..32 {
-        f.engine.evaluate_sample(&sample).await.unwrap();
+        assert_eq!(f.engine.evaluate_sample(&sample).await.unwrap(), baseline);
     }
     assert_eq!(f.journal.load(false).await.unwrap().applied_seq, before);
     sample.dead_letters = Some(1);
