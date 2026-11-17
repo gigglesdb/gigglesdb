@@ -395,3 +395,32 @@ fn bpchar_set_consumers_fail_closed_even_without_rows() {
         );
     }
 }
+
+#[test]
+fn deeply_nested_scalar_subqueries_preserve_parser_depth_error() {
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
+    let mut parser = parse::parser(&lex(&sql).unwrap());
+    let parser_error = Query::parse(&mut parser).unwrap_err();
+    assert_eq!(parser_error, SqlError::Limit);
+    assert_eq!(Prepared::parse(&sql, 1, 0).unwrap_err(), parser_error);
+    assert_parse_limit(&sql);
+
+    // Check guarded descents even when called without top-level token admission.
+    for sql in [
+        "SELECT (SELECT 1)",
+        "SELECT 1 = ANY (SELECT 1)",
+        "SELECT 1 = ANY (ARRAY[1])",
+        "SELECT * FROM LATERAL (SELECT 1) q",
+        "SELECT * FROM generate_series(1,(SELECT 2))",
+    ] {
+        let tokens = lex(sql).unwrap();
+        let mut owner = parse::parser(&tokens);
+        assert!(
+            matches!(
+                parse::expression(&tokens, &mut owner, subplans::MAX_DEPTH, &mut 0),
+                Err(ParseError::Definite(SqlError::Limit))
+            ),
+            "{sql}"
+        );
+    }
+}

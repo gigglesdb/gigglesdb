@@ -175,6 +175,7 @@ fn identity(child: Plan) -> ParseResult<Plan> {
     let mut query = Query::parse(&mut p)?;
     query.sources[0].name = name.clone();
     Ok(Plan::new(Body::Select(Box::new(Select {
+        applies: vec![],
         query,
         parameters: BTreeSet::new(),
         from: None,
@@ -288,7 +289,7 @@ fn pagination(mut plan: Plan, tokens: &[Token]) -> ParseResult<Plan> {
     }
     Ok(plan)
 }
-fn select(
+fn select_inner(
     tokens: &[Token],
     owner: &mut Parser,
     depth: usize,
@@ -408,9 +409,39 @@ fn select_query(tokens: &[Token], input: Option<Input>, owner: &mut Parser) -> P
             .filter(|r| input.is_none() || r.name != "plan_input"),
     );
     Ok(Plan::new(Body::Select(Box::new(Select {
+        applies: vec![],
         query,
         parameters,
         input,
         from: None,
     }))))
+}
+
+fn select(
+    tokens: &[Token],
+    owner: &mut Parser,
+    depth: usize,
+    next: &mut usize,
+) -> ParseResult<Plan> {
+    let (rewritten, applies) = subquery::rewrite(tokens, owner, depth, next)?;
+    let mut plan = if !applies.is_empty() {
+        // Rewriting must not let the FROM planner bypass a definite parser error.
+        let mut probe = parser(&rewritten);
+        match Query::parse(&mut probe) {
+            Ok(_) | Err(SqlError::Unsupported | SqlError::Syntax | SqlError::Reserved) => {}
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(plan) = join::parse_select(&rewritten, owner, depth, next)? {
+            plan
+        } else {
+            select_inner(&rewritten, owner, depth, next)?
+        }
+    } else {
+        select_inner(&rewritten, owner, depth, next)?
+    };
+    if let Body::Select(s) = &mut plan.body {
+        s.applies = applies;
+        subquery::internalize(s)?;
+    }
+    Ok(plan)
 }

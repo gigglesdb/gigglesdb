@@ -103,6 +103,10 @@ impl Plan {
         let description = self.describe(state, parameters.len(), parameters)?;
         let mut result = Relation::new(description.columns, description.typmods, execution);
         match &self.body {
+            Body::Select(select) if !select.applies.is_empty() => {
+                result =
+                    subquery::run(select, state, source, params, parameters, clock, execution)?;
+            }
             Body::Select(select) => {
                 if let Some(from) = &select.from {
                     let shape = from.clone().resolve(state, &mut parameters.to_vec())?;

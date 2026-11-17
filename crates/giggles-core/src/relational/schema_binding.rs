@@ -218,6 +218,11 @@ impl Prepared {
         if let Some(returning) = bound.returning_mut() {
             returning.bind_schema_names(&read, state, &self.search_path);
         }
+        if let Statement::Query(query) = &bound.statement
+            && let Some(plan) = query::plan::Plan::correlated_in(query, state)
+        {
+            bound.statement = Statement::Plan(plan);
+        }
         Ok(bound)
     }
 }

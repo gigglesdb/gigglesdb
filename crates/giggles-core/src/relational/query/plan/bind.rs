@@ -98,6 +98,9 @@ impl Plan {
             return plan.validate_constants(&catalog, &parameters);
         }
         match &self.body {
+            Body::Select(select) if !select.applies.is_empty() => {
+                subquery::resolve(select, state, &mut parameters.to_vec())?;
+            }
             Body::Select(select) => {
                 if let Some(from) = &select.from {
                     from.validate_constants(state, parameters)?;
@@ -175,6 +178,9 @@ impl Plan {
         };
         let state = catalog.as_ref().unwrap_or(state);
         let meta = match &mut self.body {
+            Body::Select(select) if !select.applies.is_empty() => {
+                subquery::resolve(select, state, parameters)?
+            }
             Body::Select(select) => {
                 let shape = select
                     .from

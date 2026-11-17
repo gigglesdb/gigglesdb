@@ -8,6 +8,8 @@ mod exec;
 pub(super) mod join;
 mod parse;
 mod setops;
+pub(super) mod subquery;
+mod srf;
 pub(in crate::relational) use ast::Plan;
 use ast::*;
 

@@ -1,6 +1,7 @@
 //! Typed scalar projection binding. No SQL generation or catalog emulation.
 use super::*;
 mod arithmetic;
+mod array_constructor;
 mod concat;
 pub(in crate::relational) mod assignment;
 mod binary;
@@ -613,6 +614,11 @@ impl Scalar {
         if depth > 32 {
             return Err(SqlError::Limit);
         }
+        if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "array")
+            && p.tokens.get(p.at+1) == Some(&Token::Symbol('['))
+        {
+            return array_constructor::parse(p,depth,aggregate_argument);
+        }
         if p.word("case") {
             let operand = if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "when") {
                 None
@@ -1165,6 +1171,11 @@ impl Scalar {
             ),
             Self::SubstringOrder(args) => {
                 return Self::bind_substring_order(args, resolve, tables, parameters);
+            }
+            Self::Call(name, args) if name == array_constructor::NAME => return array_constructor::bind(args,resolve,tables,parameters),
+            Self::Call(name, args) if name == "\0plan_cardinality" && args.len() == 1 => {
+                let inner = args[0].bind(resolve, tables, parameters)?;
+                (inner.ty.clone(), Node::Call(name.clone(), vec![inner]))
             }
             Self::Call(name, args) if name == CAST_TYPMOD => {
                 let [inner, Self::Literal(Value::Int(modifier))] = args.as_slice() else {
@@ -1826,6 +1837,7 @@ impl BoundScalar {
         match &self.node {
             Node::EnumSort(..) | Node::Predicate(_) | Node::ZonedOperator(..) => None,
             Node::Case(..) => Some("case"),
+            Node::Call(name, _) if name == array_constructor::NAME => Some("array"),
             Node::Call(name, args) if name == "\0array_subscript" => args[0].strong_name(),
             Node::Call(name, _) if name.starts_with("\0json_") => None,
             Node::Call(name, _) if arithmetic::internal_name(name) => None,
@@ -1881,6 +1893,7 @@ impl BoundScalar {
             Node::Column(_, name) => name,
             Node::Literal(_) => "?column?",
             Node::Call(n, args) if n == "\0array_subscript" => args[0].name(),
+            Node::Call(n, _) if n == array_constructor::NAME => "array",
             Node::Call(n, _) if n.starts_with("\0json_") => "?column?",
             Node::Call(n, _) if arithmetic::internal_name(n) => "?column?",
             Node::Call(n, _) | Node::Clock(n, ..) | Node::Sequence(n, ..) | Node::Xact(n, ..) => n,
@@ -2044,6 +2057,7 @@ impl BoundScalar {
                 charge(budget, v)?;
                 Ok(v.clone())
             }
+            Node::Call(n, _) if n == "\0plan_cardinality" => Err(SqlError::CardinalityViolation),
             Node::Call(n, args) => {
                 if n == "pg_typeof" {
                     return args[0].eval(row, params, budget);
@@ -2083,6 +2097,7 @@ impl BoundScalar {
                 if greatest::known_name(n) {
                     return Ok(greatest::eval(n, values, args.first()));
                 }
+                if n == array_constructor::NAME { return array_constructor::eval(&values,budget); }
                 if n != "concat"
                     && n != "format"
                     && n != "concat_ws"
@@ -2704,6 +2719,10 @@ impl Scalar {
                     None
                 };
                 args[1].infer(hint, parameters, resolve, tables)?;
+            }
+            Self::Call(n, args) if n == array_constructor::NAME => array_constructor::infer(args,parameters,resolve,tables)?,
+            Self::Call(n, args) if n == "\0plan_cardinality" && args.len() == 1 => {
+                args[0].infer(expected, parameters, resolve, tables)?;
             }
             Self::Call(n, args) if n == CAST_TYPMOD => {
                 let [inner, Self::Literal(Value::Int(_))] = args.as_slice() else {

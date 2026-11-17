@@ -1321,6 +1321,7 @@ struct Execution<'a> {
     cancel: RefCell<&'a mut dyn FnMut() -> bool>,
     visits: Cell<usize>,
     subqueries: RefCell<BTreeMap<usize, MaterializedSubquery>>,
+    plan_applies: RefCell<BTreeMap<String, plan::subquery::Cached>>,
     retention: RefCell<scan::Retention>,
     declared: Vec<Option<DataType>>,
     exists: RefCell<BTreeMap<usize, bool>>,
@@ -1341,6 +1342,7 @@ impl<'a> Execution<'a> {
             frames: RefCell::new(Vec::new()),
             visits: Cell::new(0),
             subqueries: RefCell::new(BTreeMap::new()),
+            plan_applies: RefCell::new(BTreeMap::new()),
             retention: RefCell::new(scan::Retention::new(scan::retention_limit())),
             capture: Cell::new(false),
             captured: RefCell::new(None),
@@ -2472,6 +2474,9 @@ impl Query {
     }
     pub(super) fn parse(p: &mut Parser) -> R<Self> {
         admit_subquery_depth(&p.tokens[p.at..])?;
+        if plan::subquery::quantified(&p.tokens[p.at..]) {
+            return Err(SqlError::Unsupported);
+        }
         admit_subquery_forms(&p.tokens[p.at..], true)?;
         let explain = p.word("explain");
         p.need("select")?;

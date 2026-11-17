@@ -290,6 +290,7 @@ pub(super) fn remap(plan: &mut Plan, alias: &str, name: &str) {
     match &mut plan.body {
         Body::Select(s) => {
             remap_query(&mut s.query, alias, name);
+            for apply in &mut s.applies { apply.remap(alias, name); }
             if let Some(i) = &mut s.input {
                 remap(&mut i.query, alias, name);
             }

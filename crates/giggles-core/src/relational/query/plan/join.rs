@@ -21,6 +21,12 @@ pub(super) enum Condition {
 }
 #[derive(Debug, Clone)]
 pub(super) enum From {
+    Function {
+        function: srf::Function,
+        alias: String,
+        aliases: Vec<String>,
+    },
+    Lateral(Box<From>),
     Leaf {
         query: Box<Plan>,
         alias: String,
@@ -43,8 +49,9 @@ pub(super) enum From {
 /// retain the original sides even when USING produces a separate merged value.
 #[derive(Debug, Clone, Default)]
 pub(in crate::relational::query) struct Namespace {
-    visible: Vec<(String, usize)>,
-    qualified: Vec<(String, Vec<(String, usize)>)>,
+    pub(super) visible: Vec<(String, usize)>,
+    pub(super) hidden: Vec<(String, usize)>,
+    pub(super) qualified: Vec<(String, Vec<(String, usize)>)>,
 }
 impl Namespace {
     pub(in crate::relational::query) fn resolve(&self, c: &ColumnRef) -> R<usize> {
@@ -54,7 +61,8 @@ impl Namespace {
                 .strip_prefix("\0join_column_")
                 .and_then(|n| n.parse().ok())
         {
-            return if self.visible.iter().any(|(_, i)| *i == n)
+            return if self.hidden.iter().any(|(_, i)| *i == n)
+                || self.visible.iter().any(|(_, i)| *i == n)
                 || self
                     .qualified
                     .iter()
@@ -64,6 +72,11 @@ impl Namespace {
             } else {
                 Err(SqlError::UnknownColumn)
             };
+        }
+        if c.qualifier.is_none()
+            && let Some((_, n)) = self.hidden.iter().find(|(name, _)| *name == c.name)
+        {
+            return Ok(*n);
         }
         let columns = if let Some(alias) = &c.qualifier {
             &self
@@ -91,6 +104,8 @@ impl Namespace {
             return Err(SqlError::DuplicateAlias);
         }
         let mut out = self.clone();
+        out.hidden
+            .extend(right.hidden.iter().map(|(n, i)| (n.clone(), i + offset)));
         out.visible
             .extend(right.visible.iter().map(|(n, i)| (n.clone(), i + offset)));
         out.qualified
@@ -106,7 +121,7 @@ impl Namespace {
 pub(super) struct Shape {
     pub columns: Vec<ColumnDef>,
     pub typmods: Vec<i32>,
-    namespace: Namespace,
+    pub(super) namespace: Namespace,
 }
 struct JoinShape {
     shape: Shape,
@@ -148,6 +163,23 @@ fn item(
 ) -> parse::ParseResult<From> {
     if depth > subplans::MAX_DEPTH {
         return Err(SqlError::Limit.into());
+    }
+    if p.word("lateral") {
+        let parenthesized = p.tokens.get(p.at) == Some(&Token::Symbol('('));
+        let query = parenthesized
+            && p.tokens.get(p.at + 1).is_some_and(|t| {
+                ["select", "values", "table", "with"]
+                    .iter()
+                    .any(|w| parse::word(t, w))
+            });
+        if depth >= subplans::MAX_DEPTH {
+            return Err(SqlError::Limit.into());
+        }
+        let input = item(p, owner, depth + 1, next)?;
+        if !query && (parenthesized || !matches!(input, From::Function { .. })) {
+            return Err(ParseError::Definite(SqlError::Syntax));
+        }
+        return Ok(From::Lateral(Box::new(input)));
     }
     if p.sym('(') {
         // Admit the child before reserving another join-tree or query frame.
@@ -199,7 +231,19 @@ fn item(
         return Ok(result);
     }
     let begin = p.at;
+    let refs = p.relations.len();
     let name = p.table_name()?;
+    if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
+        p.relations.truncate(refs);
+        let function = srf::parse(p, &name, owner, depth, next).map_err(ParseError::Definite)?;
+        let (alias, aliases) =
+            alias(p)?.unwrap_or_else(|| (split_key(&name).1.to_string(), vec![]));
+        return Ok(From::Function {
+            function,
+            alias,
+            aliases,
+        });
+    }
     let table_tokens = p.tokens[begin..p.at].to_vec();
     let (alias, aliases) = alias(p)?.unwrap_or_else(|| (split_key(&name).1.to_string(), vec![]));
     let mut tokens = vec![
@@ -213,6 +257,7 @@ fn item(
     owner.relations.extend(leaf.relations);
     Ok(From::Leaf {
         query: Box::new(Plan::new(Body::Select(Box::new(Select {
+            applies: vec![],
             query,
             parameters: BTreeSet::new(),
             input: None,
@@ -316,7 +361,8 @@ fn list(
 fn joined(left: From, right: From, kind: Kind, condition: Condition) -> R<From> {
     fn height(from: &From) -> usize {
         match from {
-            From::Leaf { .. } => 1,
+            From::Leaf { .. } | From::Function { .. } => 1,
+            From::Lateral(input) => height(input) + 1,
             From::Alias { input, .. } => height(input) + 1,
             From::Join { left, right, .. } => height(left).max(height(right)) + 1,
         }
@@ -392,6 +438,7 @@ pub(super) fn parse_select(
         })
         .collect();
     Ok(Some(Plan::new(Body::Select(Box::new(Select {
+        applies: vec![],
         query,
         parameters,
         input: None,
@@ -405,7 +452,8 @@ impl From {
     fn push_where_equalities(&mut self, filter: &Filter) {
         fn inner(from: &From) -> bool {
             match from {
-                From::Leaf { .. } => true,
+                From::Leaf { .. } | From::Function { .. } => true,
+                From::Lateral(input) => inner(input),
                 From::Alias { input, .. } => inner(input),
                 From::Join {
                     left, right, kind, ..
@@ -414,7 +462,10 @@ impl From {
         }
         fn has(from: &From, alias: &str) -> bool {
             match from {
-                From::Leaf { alias: a, .. } | From::Alias { alias: a, .. } => a == alias,
+                From::Leaf { alias: a, .. }
+                | From::Alias { alias: a, .. }
+                | From::Function { alias: a, .. } => a == alias,
+                From::Lateral(input) => has(input, alias),
                 From::Join { left, right, .. } => has(left, alias) || has(right, alias),
             }
         }
@@ -478,7 +529,12 @@ impl From {
                     });
                 }
             }
-            Self::Alias { input, .. } => input.visit_queries(f),
+            Self::Function { function, .. } => {
+                if let Some(input) = &function.input {
+                    input.visit_queries(f);
+                }
+            }
+            Self::Lateral(input) | Self::Alias { input, .. } => input.visit_queries(f),
         }
     }
     pub(super) fn visit_scalars(&self, f: &mut impl FnMut(&Scalar)) {
@@ -496,7 +552,15 @@ impl From {
                     f(&Scalar::Predicate(on.clone()));
                 }
             }
-            Self::Alias { input, .. } => input.visit_scalars(f),
+            Self::Function { function, .. } => {
+                if let Some(input) = &function.input {
+                    input.visit_scalars(f);
+                }
+                for s in &function.args {
+                    f(s);
+                }
+            }
+            Self::Lateral(input) | Self::Alias { input, .. } => input.visit_scalars(f),
         }
     }
     pub(super) fn remap(&mut self, alias: &str, name: &str) {
@@ -506,7 +570,12 @@ impl From {
                 left.remap(alias, name);
                 right.remap(alias, name);
             }
-            Self::Alias { input, .. } => input.remap(alias, name),
+            Self::Function { function, .. } => {
+                if let Some(input) = &mut function.input {
+                    cte::remap(input, alias, name);
+                }
+            }
+            Self::Lateral(input) | Self::Alias { input, .. } => input.remap(alias, name),
         }
     }
     pub(super) fn bind_schema_names(
@@ -534,7 +603,18 @@ impl From {
                 }
                 Ok(())
             }
-            Self::Alias { input, .. } => input.bind_schema_names(bind, state, path),
+            Self::Function { function, .. } => {
+                if let Some(input) = &mut function.input {
+                    input.bind_schema_names(bind, state, path)?;
+                }
+                for s in &mut function.args {
+                    schema_names::scalar(s, bind, state, path);
+                }
+                Ok(())
+            }
+            Self::Lateral(input) | Self::Alias { input, .. } => {
+                input.bind_schema_names(bind, state, path)
+            }
         }
     }
     pub(super) fn resolve(
@@ -543,6 +623,15 @@ impl From {
         parameters: &mut [Option<DataType>],
     ) -> R<Shape> {
         match self {
+            Self::Function {
+                function,
+                alias,
+                aliases,
+            } => {
+                let (columns, typmods) = function.resolve(state, parameters)?;
+                leaf_shape(columns, typmods, alias, aliases)
+            }
+            Self::Lateral(input) => input.resolve(state, parameters),
             Self::Leaf {
                 query,
                 alias,
@@ -566,7 +655,13 @@ impl From {
                 condition,
             } => {
                 let left = left.resolve(state, parameters)?;
-                let right = right.resolve(state, parameters)?;
+                let right = if right.lateral() {
+                    let mut right = (**right).clone();
+                    right.instantiate(&left, None, state, parameters, &[], &mut false)?;
+                    right.resolve(state, parameters)?
+                } else {
+                    right.resolve(state, parameters)?
+                };
                 Ok(join_shape(left, right, *kind, condition, parameters)?.shape)
             }
         }
@@ -578,13 +673,19 @@ impl From {
     ) -> R<()> {
         match self {
             Self::Leaf { query, .. } => query.validate_constants(state, parameters),
-            Self::Alias { input, .. } => input.validate_constants(state, parameters),
+            Self::Function { .. } => Ok(()),
+            Self::Lateral(input) | Self::Alias { input, .. } => {
+                input.validate_constants(state, parameters)
+            }
             Self::Join {
                 left,
                 right,
                 kind,
                 condition,
             } => {
+                if right.lateral() {
+                    return Ok(());
+                }
                 left.validate_constants(state, parameters)?;
                 right.validate_constants(state, parameters)?;
                 let mut parameters = parameters.to_vec();
@@ -597,7 +698,7 @@ impl From {
         }
     }
 }
-fn leaf_shape(
+pub(super) fn leaf_shape(
     mut columns: Vec<ColumnDef>,
     typmods: Vec<i32>,
     alias: &str,
@@ -618,6 +719,7 @@ fn leaf_shape(
         columns,
         typmods,
         namespace: Namespace {
+            hidden: vec![],
             qualified: vec![(alias.into(), visible.clone())],
             visible,
         },
@@ -633,7 +735,7 @@ fn alias_shape(mut shape: Shape, alias: &str, aliases: &[String]) -> R<Shape> {
     shape.namespace.qualified = vec![(alias.into(), shape.namespace.visible.clone())];
     Ok(shape)
 }
-fn col(n: usize) -> Scalar {
+pub(super) fn col(n: usize) -> Scalar {
     Scalar::Column(ColumnRef {
         qualifier: None,
         name: format!("\0join_column_{n}"),
@@ -918,12 +1020,20 @@ impl From {
                 Self::Leaf { query, .. } => {
                     query.run(state, source, params, parameters, clock, execution)
                 }
-                Self::Alias { input, .. } => {
+                Self::Function { function, .. } => {
+                    function.run(state, source, params, parameters, clock, execution)
+                }
+                Self::Lateral(input) | Self::Alias { input, .. } => {
                     input.run(state, source, params, parameters, clock, execution)
                 }
                 _ => unreachable!(),
             };
         };
+        if right.lateral() {
+            return lateral_run(
+                left, right, *kind, condition, state, source, params, parameters, clock, execution,
+            );
+        }
         let mut inferred = parameters.to_vec();
         let a = left.clone().resolve(state, &mut inferred)?;
         let b = right.clone().resolve(state, &mut inferred)?;
@@ -1104,6 +1214,166 @@ fn emit(
         values.push(functions::coerce_clocked(value.clone(), ty, clock)?);
     }
     out.push(SqlRow { values, version })
+}
+
+impl From {
+    fn lateral(&self) -> bool {
+        match self {
+            Self::Function { .. } | Self::Lateral(_) => true,
+            Self::Alias { input, .. } => input.lateral(),
+            Self::Join { left, right, .. } => left.lateral() || right.lateral(),
+            _ => false,
+        }
+    }
+    pub(super) fn locals(
+        &self,
+        state: &Relational,
+        parameters: &[Option<DataType>],
+        out: &mut Vec<(String, Vec<String>)>,
+    ) {
+        match self {
+            Self::Join { left, right, .. } => {
+                left.locals(state, parameters, out);
+                right.locals(state, parameters, out);
+            }
+            Self::Lateral(input) => input.locals(state, parameters, out),
+            Self::Leaf { alias, .. } | Self::Function { alias, .. } | Self::Alias { alias, .. } => {
+                let columns = self
+                    .clone()
+                    .resolve(state, &mut parameters.to_vec())
+                    .map(|s| s.namespace.visible.into_iter().map(|(n, _)| n).collect())
+                    .unwrap_or_default();
+                out.push((alias.clone(), columns));
+            }
+        }
+    }
+    pub(super) fn instantiate(
+        &mut self,
+        shape: &Shape,
+        row: Option<&SqlRow>,
+        state: &Relational,
+        parameters: &[Option<DataType>],
+        blocked: &[(String, Vec<String>)],
+        used: &mut bool,
+    ) -> R<()> {
+        match self {
+            Self::Leaf { query, .. } => {
+                let (p, c) =
+                    subquery::instantiate_scoped(query, shape, row, state, parameters, blocked)?;
+                **query = p;
+                *used |= c;
+            }
+            Self::Function { function, .. } => {
+                if let Some(input) = &mut function.input {
+                    let (p, c) = subquery::instantiate_scoped(
+                        input, shape, row, state, parameters, blocked,
+                    )?;
+                    **input = p;
+                    *used |= c;
+                }
+                for s in &mut function.args {
+                    *used |= subquery::outer_scoped(s, shape, row, blocked)?;
+                }
+            }
+            Self::Alias { input, .. } | Self::Lateral(input) => {
+                input.instantiate(shape, row, state, parameters, blocked, used)?
+            }
+            Self::Join {
+                left,
+                right,
+                condition,
+                ..
+            } => {
+                left.instantiate(shape, row, state, parameters, blocked, used)?;
+                right.instantiate(shape, row, state, parameters, blocked, used)?;
+                if let Condition::On(on) = condition {
+                    let mut s = Scalar::Predicate(on.clone());
+                    *used |= subquery::outer_scoped(&mut s, shape, row, blocked)?;
+                    if let Scalar::Predicate(on2) = s {
+                        *on = on2;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+#[expect(clippy::too_many_arguments, reason = "shared query execution context")]
+fn lateral_run<'a>(
+    left: &From,
+    right: &From,
+    kind: Kind,
+    condition: &Condition,
+    state: &Relational,
+    source: &dyn scan::RowSource,
+    params: &[Value],
+    parameters: &[Option<DataType>],
+    clock: Option<&super::super::super::clock::ExecutionClock>,
+    execution: &'a Execution<'_>,
+) -> R<Relation<'a>> {
+    if matches!(kind, Kind::Right | Kind::Full) {
+        return Err(SqlError::Unsupported);
+    }
+    let mut inferred = parameters.to_vec();
+    let a = left.clone().resolve(state, &mut inferred)?;
+    let mut probe = right.clone();
+    probe.instantiate(&a, None, state, &inferred, &[], &mut false)?;
+    let b = probe.resolve(state, &mut inferred)?;
+    let aw = a.columns.len();
+    let bw = b.columns.len();
+    let spec = join_shape(
+        left.clone().resolve(state, &mut inferred)?,
+        b,
+        kind,
+        condition,
+        &mut inferred,
+    )?;
+    let mut on = bound_on(&spec, parameters)?;
+    on.attach_clock(clock);
+    let mut out = Relation::new(
+        spec.shape.columns.clone(),
+        spec.shape.typmods.clone(),
+        execution,
+    );
+    let left = left.run(state, source, params, parameters, clock, execution)?;
+    for row in &left.rows {
+        execution.comparison()?;
+        let mut bound = right.clone();
+        bound.instantiate(&a, Some(row), state, parameters, &[], &mut false)?;
+        let right = bound.run(state, source, params, parameters, clock, execution)?;
+        let mut matched = false;
+        for r in &right.rows {
+            execution.comparison()?;
+            let tuple = Tuple {
+                values: vec![pair(Some(row), Some(r), aw, bw)],
+                version: row.version.max(r.version),
+            };
+            if on.eval(&tuple, params, &mut 0)? == Some(true) {
+                matched = true;
+                emit(
+                    tuple.values.into_iter().next().unwrap(),
+                    tuple.version,
+                    &spec,
+                    kind,
+                    aw,
+                    clock,
+                    &mut out,
+                )?;
+            }
+        }
+        if !matched && matches!(kind, Kind::Left) {
+            emit(
+                pair(Some(row), None, aw, bw),
+                row.version,
+                &spec,
+                kind,
+                aw,
+                clock,
+                &mut out,
+            )?;
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

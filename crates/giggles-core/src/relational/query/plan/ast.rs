@@ -28,6 +28,7 @@ pub(super) enum SetOp {
 }
 #[derive(Debug, Clone)]
 pub(super) struct Select {
+    pub applies: Vec<subquery::Apply>,
     pub query: Query,
     pub parameters: BTreeSet<usize>,
     // A materialized input exposes operator outputs as ordinary scalar columns.
@@ -135,6 +136,9 @@ impl Plan {
         match &self.body {
             Body::Select(s) => {
                 f(&s.query);
+                for apply in &s.applies {
+                    apply.visit_queries(f);
+                }
                 if let Some(i) = &s.input {
                     i.query.visit_queries(f);
                 }
@@ -158,6 +162,9 @@ impl Plan {
         match &self.body {
             Body::Values(rows) => rows.iter().flatten().for_each(f),
             Body::Select(s) => {
+                for apply in &s.applies {
+                    apply.visit_scalars(f);
+                }
                 if let Some(i) = &s.input {
                     i.query.visit_scalars(f);
                 }
@@ -198,6 +205,9 @@ impl Plan {
                 }
             }
             Body::Select(s) => {
+                for apply in &mut s.applies {
+                    apply.bind_schema_names(bind, state, path)?;
+                }
                 s.query.bind_schema_names(
                     &|name| {
                         if !name.starts_with("\0plan_") {
