@@ -717,8 +717,7 @@ impl NunyaSpanner {
         snapshot: &Snapshot,
         plan: &RewritePlan,
         names: &[String],
-        params: &Option<prost_types::Struct>,
-        param_types: &HashMap<String, Type>,
+        req: &ExecuteSqlRequest,
     ) -> Result<Option<ResultSet>, Status> {
         let Some((domain, arg)) = &plan.tokenize else {
             return Ok(None);
@@ -750,12 +749,12 @@ impl NunyaSpanner {
                     .checked_sub(1)
                     .and_then(|i| names.get(i as usize))
                     .ok_or_else(invalid)?;
-                let value = params
+                let value = req.params
                     .as_ref()
                     .and_then(|p| p.fields.get(name))
                     .ok_or_else(invalid)?
                     .clone();
-                if let Some(declared) = param_types.get(name) {
+                if let Some(declared) = req.param_types.get(name) {
                     let declared = values::column_type(declared);
                     if declared != ty && !(declared.is_textual() && ty.is_textual()) {
                         return Err(invalid());
@@ -1109,7 +1108,7 @@ impl SpannerService for NunyaSpanner {
             Self::audit(&self.ctx, &self.watchers, &who, &label, 0, vec![])?;
         }
         if let Some(result) =
-            self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req.params, &req.param_types)?
+            self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req)?
         {
             Self::audit(&self.ctx, &self.watchers, &who, &label, 1, local_tokens(&result)?)?;
             return Ok(Response::new(result));
@@ -1168,7 +1167,7 @@ impl SpannerService for NunyaSpanner {
             Self::audit(&self.ctx, &self.watchers, &who, &label, 0, vec![])?;
         }
         if let Some(result) =
-            self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req.params, &req.param_types)?
+            self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req)?
         {
             Self::audit(&self.ctx, &self.watchers, &who, &label, 1, local_tokens(&result)?)?;
             return Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(
@@ -2524,7 +2523,7 @@ mod tests {
         };
         let tokenize = || {
             f.svc
-                .local_tokenize(&who, &policy, &snapshot, &plan, &[], &None, &HashMap::new())
+                .local_tokenize(&who, &policy, &snapshot, &plan, &[], &ExecuteSqlRequest::default())
         };
         for _ in 0..10 {
             assert!(tokenize().unwrap().is_some());
