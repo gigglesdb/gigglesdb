@@ -5,6 +5,7 @@ use super::{
     meta, mvcc,
 };
 use crate::storage::{self, native_once::NativeOutcomes};
+use crate::task::records;
 use meta::FormatError;
 use std::{collections::BTreeMap, ops::Bound};
 
@@ -16,18 +17,24 @@ fn corrupt(error: impl std::fmt::Debug) -> FormatError {
 pub(super) struct NativeContent {
     metadata: Option<Vec<u8>>,
     ledger: Option<Vec<u8>>,
+    /// The ledger header `26 00` (GD-0061 R3-624). Once it exists, `[07]`
+    /// must be the empty v1 ledger: the identities live in `22` records.
+    header: Option<Vec<u8>>,
 }
 impl NativeContent {
     pub(super) fn load(kv: &dyn KvRead) -> Result<Self, FormatError> {
         let latest = |key: &[u8]| -> Result<Option<Vec<u8>>, FormatError> {
             match mvcc::latest_version(kv, Keyspace::Kernel, key).map_err(corrupt)? {
-                Some((_, None)) if key == [7] => Err(corrupt("native MVCC tombstone")),
+                Some((_, None)) if key == [7] || key == records::LEDGER_HEADER_KEY => {
+                    Err(corrupt("native MVCC tombstone"))
+                }
                 version => Ok(version.and_then(|(_, value)| value)),
             }
         };
         Ok(Self {
             metadata: latest(&[0])?,
             ledger: latest(&[7])?,
+            header: latest(&records::LEDGER_HEADER_KEY)?,
         })
     }
     pub(super) fn apply(
@@ -36,6 +43,14 @@ impl NativeContent {
     ) -> Result<(), FormatError> {
         for ((space, key), value) in writes {
             if *space != Keyspace::Kernel {
+                continue;
+            }
+            if key.as_slice() == records::LEDGER_HEADER_KEY {
+                self.header = Some(
+                    value
+                        .clone()
+                        .ok_or_else(|| corrupt("native MVCC tombstone"))?,
+                );
                 continue;
             }
             // Protected task records (0x20..=0x2B) are gated by content_check.
@@ -63,6 +78,15 @@ impl NativeContent {
         Ok(())
     }
     pub(super) fn validate(&self, features: u64, version: u32) -> Result<(), FormatError> {
+        if let Some(header) = &self.header {
+            records::LedgerHeader::decode(header).map_err(corrupt)?;
+            // A migrated store keeps `[07]` only as the empty v1 ledger.
+            if let Some(ledger) = &self.ledger
+                && !NativeOutcomes::from_bytes(ledger).map_err(corrupt)?.is_empty()
+            {
+                return Err(corrupt("native ledger entries beside the ledger header"));
+            }
+        }
         if self.ledger.is_none() && features & meta::NATIVE_OUTCOMES == 0 {
             return Ok(());
         }

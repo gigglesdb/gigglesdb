@@ -8,6 +8,7 @@ use std::{
 
 mod receipt;
 mod v2;
+mod v2_migrate;
 #[cfg(feature = "engine-rocksdb")]
 mod v2_publish;
 #[cfg(feature = "engine-rocksdb")]
