@@ -326,3 +326,5 @@ mod write_fence_holder_network;
 mod user_collation_network;
 
 #[path="column_collation_network.rs"] mod column_collation_network;
+#[path = "implicit_block_oracle_network.rs"]
+mod implicit_block_oracle_network;
