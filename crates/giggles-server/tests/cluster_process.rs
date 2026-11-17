@@ -552,7 +552,8 @@ async fn a_gateway_dying_mid_commit_stalls_only_its_own_rows() {
     );
     slowest = slowest.max(scan.elapsed());
     let checked = died.elapsed();
-    assert!(slowest < Duration::from_secs(2), "slowest read {slowest:?}");
+    // A read held by the prepared row waits read_wait (5 s); 4 s leaves room for slow boxes.
+    assert!(slowest < Duration::from_secs(4), "slowest read {slowest:?}");
     // Still inside recovery's 30 s: the prepared row itself is held up.
     let c4 = cluster.client(2).await;
     let held = tokio::time::timeout(
