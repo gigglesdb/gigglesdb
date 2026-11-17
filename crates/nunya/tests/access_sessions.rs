@@ -1476,38 +1476,207 @@ async fn spanner_revoke_and_expiry_on_rpcs() -> ServeResult<()> {
     );
     Ok(())
 }
-async fn native_tokenize_refused(client: &mut NativeClient, name: &str) {
+fn native_parameter(
+    request: &mut ExecuteSqlRequest,
+    name: &str,
+    value: &str,
+    code: google_cloud_googleapis::spanner::v1::TypeCode,
+) {
+    request.params = Some(prost_types::Struct {
+        fields: std::collections::BTreeMap::from([(
+            name.into(),
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue(value.into())),
+            },
+        )]),
+    });
+    request.param_types.insert(
+        name.into(),
+        google_cloud_googleapis::spanner::v1::Type {
+            code: code as i32,
+            ..Default::default()
+        },
+    );
+}
+
+fn native_tokenize_cell(
+    result: &google_cloud_googleapis::spanner::v1::ResultSet,
+    code: google_cloud_googleapis::spanner::v1::TypeCode,
+) -> ServeResult<String> {
+    let fields = &result
+        .metadata
+        .as_ref()
+        .ok_or("missing native metadata")?
+        .row_type
+        .as_ref()
+        .ok_or("missing native row type")?
+        .fields;
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name, "nunya_tokenize");
+    assert_eq!(
+        fields[0].r#type.as_ref().ok_or("missing native type")?.code,
+        code as i32
+    );
+    let cells = native_cells(result)?;
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0].len(), 1);
+    Ok(cells[0][0].clone())
+}
+
+async fn native_tokenize(
+    client: &mut NativeClient,
+    name: &str,
+    value: &str,
+) -> ServeResult<String> {
+    use google_cloud_googleapis::spanner::v1::TypeCode;
+    let mut request = spanner_sql(name, "SELECT nunya_tokenize('email', @v)");
+    native_parameter(&mut request, "v", value, TypeCode::String);
+    native_tokenize_cell(
+        &client.execute_sql(request).await?.into_inner(),
+        TypeCode::String,
+    )
+}
+
+async fn native_limited(client: &mut NativeClient, name: &str) {
     let result = client
-        .execute_sql(spanner_sql(name, "SELECT nunya_tokenize('email', 'x')"))
+        .execute_sql(spanner_sql(
+            name,
+            "SELECT nunya_tokenize('email', 'over-limit@x.test')",
+        ))
         .await;
     let error = match result {
         Err(error) => error,
-        Ok(_) => panic!("native explicit tokenization accepted"),
+        Ok(_) => panic!("native tokenization limit bypassed"),
+    };
+    assert_eq!(error.code(), Code::PermissionDenied);
+    assert!(
+        error.message().contains("NY007"),
+        "unexpected native quota refusal"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_SPANNER_REST"]
+async fn spanner_explicit_tokenize_matches_blind_read() -> ServeResult<()> {
+    use google_cloud_googleapis::spanner::v1::{ResultSet, TypeCode};
+    let f = NativeFixture::new(
+        "email STRING(MAX), number INT64",
+        "email, number",
+        "'alice@example.test', 42",
+        false,
+    )
+    .await?;
+    let mut h = f.harness(&f.policy(&["email", "number"], 20, 200), None, "")?;
+    h.start().await?;
+    let (access, secret, _) = h
+        .acquire_session("native-tokenize", "spanner-native", Mode::ReadWrite)
+        .await?;
+    let mut cleanup = f.sessions();
+    let (mut client, name) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
+    let blind = native_cells(
+        &client
+            .execute_sql(spanner_sql(
+                &name,
+                &format!("SELECT email, number FROM {}.t WHERE id = 1", f.schema),
+            ))
+            .await?
+            .into_inner(),
+    )?;
+    assert_eq!(blind.len(), 1);
+    assert_eq!(blind[0].len(), 2);
+    assert!(blind[0][0] != "alice@example.test", "email was not blinded");
+    assert!(blind[0][1] != "42", "number was not blinded");
+    let mut email_token = None;
+    for (domain, value, code, expected) in [
+        (
+            "email",
+            "alice@example.test",
+            TypeCode::String,
+            &blind[0][0],
+        ),
+        ("number", "42", TypeCode::Int64, &blind[0][1]),
+    ] {
+        for parameterized in [false, true] {
+            let sql = if parameterized {
+                format!("SELECT nunya_tokenize('{domain}', @v)")
+            } else {
+                format!("SELECT nunya_tokenize('{domain}', '{value}')")
+            };
+            let mut request = spanner_sql(&name, &sql);
+            if parameterized {
+                native_parameter(&mut request, "v", value, code);
+            }
+            let token = native_tokenize_cell(
+                &client.execute_sql(request.clone()).await?.into_inner(),
+                code,
+            )?;
+            assert!(&token == expected, "explicit token differs from blind read");
+            if domain == "email" {
+                email_token = Some(token);
+            }
+            let mut stream = client.execute_streaming_sql(request).await?.into_inner();
+            let mut result = ResultSet::default();
+            let mut values = Vec::new();
+            while let Some(part) = stream.message().await? {
+                assert!(!part.chunked_value, "unexpected chunked scalar token");
+                if let Some(metadata) = part.metadata {
+                    assert!(result.metadata.is_none(), "duplicate streaming metadata");
+                    result.metadata = Some(metadata);
+                }
+                values.extend(part.values);
+            }
+            result.rows.push(prost_types::ListValue { values });
+            assert!(
+                &native_tokenize_cell(&result, code)? == expected,
+                "streaming explicit token differs from blind read",
+            );
+        }
+    }
+    let mut predicate = spanner_sql(
+        &name,
+        &format!("SELECT id FROM {}.t WHERE email = @t", f.schema),
+    );
+    native_parameter(
+        &mut predicate,
+        "t",
+        &email_token.ok_or("missing email token")?,
+        TypeCode::String,
+    );
+    assert!(
+        native_cells(&client.execute_sql(predicate).await?.into_inner())?
+            == vec![vec!["1".to_owned()]],
+        "explicit token predicate did not decrypt"
+    );
+    let mut wrong_type = spanner_sql(&name, "SELECT nunya_tokenize('number', @v)");
+    native_parameter(&mut wrong_type, "v", "42", TypeCode::String);
+    let error = match client.execute_sql(wrong_type).await {
+        Err(error) => error,
+        Ok(_) => panic!("STRING parameter accepted for INT64 domain"),
     };
     assert_eq!(error.code(), Code::InvalidArgument);
     assert!(
         error.message().contains("NY004"),
-        "unexpected native refusal"
+        "unexpected parameter type refusal"
     );
+    Ok(())
 }
+
 #[tokio::test]
 #[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_SPANNER_REST"]
-async fn spanner_explicit_tokenize_refused() -> ServeResult<()> {
-    // src/dialect/googlesql has no nunya_tokenize lowering; local_tokenize in
-    // src/spanner/proxy.rs is reachable only from unit-built plans. The native
-    // offering in site/docs/spanner.html has no explicit tokenization, so this
-    // route cannot bypass per-session or per-principal tokenization limits.
+async fn spanner_quota_continuity_reconnect_rotation_reacquire() -> ServeResult<()> {
     let f = NativeFixture::new("email STRING(MAX)", "email", "'alice@example.test'", false).await?;
     let mut h = f.harness(&f.policy(&["email"], 3, 5), None, "")?;
     h.start().await?;
     let (access, secret, principal) = h
-        .acquire_session("native-refusal", "spanner-native", Mode::ReadWrite)
+        .acquire_session("native-quota", "spanner-native", Mode::ReadWrite)
         .await?;
-    let owner = owner(&h, "native-refusal", &principal)?;
+    let owner = owner(&h, "native-quota", &principal)?;
     let mut cleanup = f.sessions();
     let (mut one, name_one) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
-    native_tokenize_refused(&mut one, &name_one).await;
+    native_tokenize(&mut one, &name_one, "quota-one@x.test").await?;
     drop(one);
+    let (mut two, name_two) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
+    native_tokenize(&mut two, &name_two, "quota-two@x.test").await?;
     let salt = data_encoding::BASE64.decode(secret.scram_salt.as_bytes())?;
     let rotated = SessionSecret::generate_with(&salt, secret.scram_iterations)?;
     owner
@@ -1520,11 +1689,65 @@ async fn spanner_explicit_tokenize_refused() -> ServeResult<()> {
             }),
         )
         .await?;
-    // Both bearers must remain valid during the rotation overlap, on new channels.
     let (mut old, name_old) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
     let (mut new, name_new) = native_open(&h, &access, &rotated, &f.database, &mut cleanup).await?;
-    native_tokenize_refused(&mut old, &name_old).await;
-    native_tokenize_refused(&mut new, &name_new).await;
+    native_tokenize(&mut new, &name_new, "quota-three@x.test").await?;
+    native_limited(&mut old, &name_old).await;
+    native_limited(&mut new, &name_new).await;
+    let (next, next_secret) = native_acquire(&owner, false, None).await?;
+    assert_ne!(next.id, access.id);
+    let (mut next_client, next_name) =
+        native_open(&h, &next, &next_secret, &f.database, &mut cleanup).await?;
+    native_tokenize(&mut next_client, &next_name, "quota-four@x.test").await?;
+    let (isolated, isolated_secret) = native_acquire(&owner, true, None).await?;
+    assert_ne!(isolated.scope, access.scope);
+    let (mut isolated_client, isolated_name) =
+        native_open(&h, &isolated, &isolated_secret, &f.database, &mut cleanup).await?;
+    native_tokenize(&mut isolated_client, &isolated_name, "quota-five@x.test").await?;
+    native_limited(&mut next_client, &next_name).await;
+    native_limited(&mut isolated_client, &isolated_name).await;
+    let (last, last_secret) = native_acquire(&owner, false, None).await?;
+    let (mut last_client, last_name) =
+        native_open(&h, &last, &last_secret, &f.database, &mut cleanup).await?;
+    native_limited(&mut last_client, &last_name).await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_SPANNER_REST"]
+async fn spanner_quota_continuity_across_restart() -> ServeResult<()> {
+    let f = NativeFixture::new("email STRING(MAX)", "email", "'alice@example.test'", false).await?;
+    let policy = f.policy(&["email"], 3, 5);
+    let mut h = f.harness(&policy, None, "")?;
+    h.start().await?;
+    let (access, secret, principal) = h
+        .acquire_session("native-restart-quota", "spanner-native", Mode::ReadWrite)
+        .await?;
+    let owner = owner(&h, "native-restart-quota", &principal)?;
+    let mut cleanup = f.sessions();
+    let (mut client, name) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
+    native_tokenize(&mut client, &name, "restart-one@x.test").await?;
+    native_tokenize(&mut client, &name, "restart-two@x.test").await?;
+    drop(client);
+    h.restart().await?;
+    let (mut client, name) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
+    native_tokenize(&mut client, &name, "restart-three@x.test").await?;
+    native_limited(&mut client, &name).await;
+    let (next, next_secret) = native_acquire(&owner, false, None).await?;
+    let (mut next_client, next_name) =
+        native_open(&h, &next, &next_secret, &f.database, &mut cleanup).await?;
+    native_tokenize(&mut next_client, &next_name, "restart-four@x.test").await?;
+    native_tokenize(&mut next_client, &next_name, "restart-five@x.test").await?;
+    drop(client);
+    drop(next_client);
+    h.restart().await?;
+    let (mut next_client, next_name) =
+        native_open(&h, &next, &next_secret, &f.database, &mut cleanup).await?;
+    native_limited(&mut next_client, &next_name).await;
+    let (last, last_secret) = native_acquire(&owner, false, None).await?;
+    let (mut last_client, last_name) =
+        native_open(&h, &last, &last_secret, &f.database, &mut cleanup).await?;
+    native_limited(&mut last_client, &last_name).await;
     Ok(())
 }
 
