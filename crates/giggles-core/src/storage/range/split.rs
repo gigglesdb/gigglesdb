@@ -405,3 +405,7 @@ impl RangeStore {
 #[cfg(test)]
 #[path = "split_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "change_dump_tests.rs"]
+mod change_dump_tests;
