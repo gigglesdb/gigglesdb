@@ -61,6 +61,8 @@ pub struct SpannerContext {
     pub route: crate::state::model::RouteId,
     /// Reloadable policy.
     pub policy: RwLock<Arc<Policy>>,
+    /// Revision of the currently installed policy.
+    pub policy_revision: RwLock<Option<String>>,
     /// Reloadable schema.
     pub snapshot: RwLock<Arc<Snapshot>>,
     /// Root token key.
@@ -114,6 +116,7 @@ impl Interceptor for AuthInterceptor {
 }
 /// Trusted intercepted upstream client.
 pub(super) type Client = SpannerClient<InterceptedService<Channel, AuthInterceptor>>;
+type ConfigurationSnapshot = (Arc<Policy>, Arc<Snapshot>, Option<String>);
 type ResultStream = Pin<Box<dyn Stream<Item = Result<PartialResultSet, Status>> + Send + 'static>>;
 /// Native Spanner service and its gateway-created session ownership registry.
 pub struct NunyaSpanner {
@@ -526,29 +529,35 @@ impl NunyaSpanner {
     async fn client(&self) -> Result<Client, Status> {
         upstream_client(&self.channel, &self.provider).await
     }
-    fn configuration(&self) -> Result<(Arc<Policy>, Arc<Snapshot>), Status> {
-        let policy = self.ctx.policy.read().map_err(|_| invalid())?.clone();
+    fn configuration(&self) -> Result<ConfigurationSnapshot, Status> {
+        // Lock order: policy, then revision; writers retain the policy write guard.
+        let policy = self.ctx.policy.read().map_err(|_| invalid())?;
+        let revision = self.ctx.policy_revision.read().map_err(|_| invalid())?.clone();
         let snapshot = self.ctx.snapshot.read().map_err(|_| invalid())?.clone();
         if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms) > policy.snapshot_max_age_ms
         {
             return Err(nunya_status(NyCode::SchemaStale));
         }
-        Ok((policy, snapshot))
+        Ok((policy.clone(), snapshot, revision))
     }
+    #[allow(clippy::too_many_arguments)]
     fn audit(
         ctx: &SpannerContext,
         watchers: &Mutex<HashMap<SessionId, SessionWatcher>>,
         who: &Authenticated,
+        revision: Option<&str>,
         label: &str,
         rows: u64,
         tokens: Vec<String>,
     ) -> Result<(), Status> {
-        Self::audit_outcome(ctx, watchers, who, label, rows, tokens, Outcome::Allowed)
+        Self::audit_outcome(ctx, watchers, who, revision, label, rows, tokens, Outcome::Allowed)
     }
+    #[allow(clippy::too_many_arguments)]
     fn audit_outcome(
         ctx: &SpannerContext,
         watchers: &Mutex<HashMap<SessionId, SessionWatcher>>,
         who: &Authenticated,
+        revision: Option<&str>,
         label: &str,
         rows: u64,
         tokens: Vec<String>,
@@ -564,7 +573,7 @@ impl NunyaSpanner {
                 credential_id: Some(who.credential),
                 connection: watchers.lock().map_err(|_| nunya_status(NyCode::ReadLogUnavailable))?.get(&who.session).map(|w| w.connection),
                 route: ctx.route.as_str().into(),
-                policy_revision: None,
+                policy_revision: revision.map(str::to_owned),
                 config_revision: None,
                 statement_fingerprint: statement_fingerprint(
                     &crate::readlog::redact_tokenize_args(label),
@@ -576,9 +585,9 @@ impl NunyaSpanner {
             })
             .map_err(|_| nunya_status(NyCode::ReadLogUnavailable))
     }
-    fn refuse_tokenize(&self, who: &Authenticated, code: NyCode) -> Status {
+    fn refuse_tokenize(&self, who: &Authenticated, revision: Option<&str>, code: NyCode) -> Status {
         match Self::audit_outcome(
-            &self.ctx, &self.watchers, who, "Spanner nunya_tokenize", 0, vec![],
+            &self.ctx, &self.watchers, who, revision, "Spanner nunya_tokenize", 0, vec![],
             Outcome::Refused(code),
         ) {
             Ok(()) => nunya_status(code),
@@ -607,9 +616,11 @@ impl NunyaSpanner {
         .map_err(status)?;
         values::to_proto(wire_ty, &result).map_err(status)
     }
+    #[allow(clippy::too_many_arguments)]
     fn sql(
         &self,
         who: &Authenticated,
+        revision: Option<&str>,
         sql: &str,
         params: &mut Option<prost_types::Struct>,
         policy: &Policy,
@@ -617,7 +628,7 @@ impl NunyaSpanner {
     ) -> Result<(RewritePlan, Vec<String>, StatementKind), Status> {
         let refusal = |error: Refusal| {
             if sql.to_ascii_lowercase().contains("nunya_tokenize") {
-                self.refuse_tokenize(who, error.code)
+                self.refuse_tokenize(who, revision, error.code)
             } else {
                 status(error)
             }
@@ -726,9 +737,11 @@ impl NunyaSpanner {
         }
         Ok(tokens)
     }
+    #[allow(clippy::too_many_arguments)]
     fn local_tokenize(
         &self,
         who: &Authenticated,
+        revision: Option<&str>,
         policy: &Policy,
         snapshot: &Snapshot,
         plan: &RewritePlan,
@@ -740,7 +753,7 @@ impl NunyaSpanner {
         };
         self.local_tokenize_inner(who, policy, snapshot, (domain, arg), names, req)
             .map(Some)
-            .map_err(|code| self.refuse_tokenize(who, code))
+            .map_err(|code| self.refuse_tokenize(who, revision, code))
     }
     fn local_tokenize_inner(
         &self,
@@ -886,6 +899,7 @@ impl NunyaSpanner {
         &self,
         who: Authenticated,
         policy: Arc<Policy>,
+        revision: Option<String>,
         plan: RewritePlan,
         label: String,
         mut upstream: tonic::Streaming<PartialResultSet>,
@@ -964,7 +978,7 @@ impl NunyaSpanner {
             .await;
             drop(upstream);
             let audit =
-                Self::audit(&ctx, &watchers, &who, &label, count, tokens).map_err(|e| after_forward(e, write));
+                Self::audit(&ctx, &watchers, &who, revision.as_deref(), &label, count, tokens).map_err(|e| after_forward(e, write));
             // A failed audit after a forwarded write is indeterminate even if the
             // upstream also failed. For reads, preserve an NY011 cancellation.
             let work = if write {
@@ -1126,9 +1140,9 @@ impl SpannerService for NunyaSpanner {
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
         sql_features(&req)?;
-        let (policy, snapshot) = self.configuration()?;
+        let (policy, snapshot, revision) = self.configuration()?;
         let label = req.sql.clone();
-        let (plan, names, kind) = self.sql(&who, &req.sql, &mut req.params, &policy, &snapshot)?;
+        let (plan, names, kind) = self.sql(&who, revision.as_deref(), &req.sql, &mut req.params, &policy, &snapshot)?;
         let write = matches!(
             kind,
             StatementKind::Insert | StatementKind::Update | StatementKind::Delete
@@ -1153,12 +1167,12 @@ impl SpannerService for NunyaSpanner {
             label
         };
         if plan.tokenize.is_none() {
-            Self::audit(&self.ctx, &self.watchers, &who, &label, 0, vec![])?;
+            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 0, vec![])?;
         }
         if let Some(result) =
-            self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req)?
+            self.local_tokenize(&who, revision.as_deref(), &policy, &snapshot, &plan, &names, &req)?
         {
-            Self::audit(&self.ctx, &self.watchers, &who, &label, 1, local_tokens(&result)?)?;
+            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 1, local_tokens(&result)?)?;
             self.check_response(&who, &signal, false)?;
             return Ok(Response::new(result));
         }
@@ -1172,7 +1186,7 @@ impl SpannerService for NunyaSpanner {
         let tokens = self
             .rows(&who, &policy, &plan, &mut result)
             .map_err(|e| after_forward(e, write))?;
-        Self::audit(&self.ctx, &self.watchers, &who, &label, result.rows.len() as u64, tokens)
+        Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, result.rows.len() as u64, tokens)
             .map_err(|e| after_forward(e, write))?;
         self.check_response(&who, &signal, write)?;
         Ok(Response::new(result))
@@ -1186,9 +1200,9 @@ impl SpannerService for NunyaSpanner {
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
         sql_features(&req)?;
-        let (policy, snapshot) = self.configuration()?;
+        let (policy, snapshot, revision) = self.configuration()?;
         let label = req.sql.clone();
-        let (plan, names, kind) = self.sql(&who, &req.sql, &mut req.params, &policy, &snapshot)?;
+        let (plan, names, kind) = self.sql(&who, revision.as_deref(), &req.sql, &mut req.params, &policy, &snapshot)?;
         let write = matches!(
             kind,
             StatementKind::Insert | StatementKind::Update | StatementKind::Delete
@@ -1213,12 +1227,12 @@ impl SpannerService for NunyaSpanner {
             label
         };
         if plan.tokenize.is_none() {
-            Self::audit(&self.ctx, &self.watchers, &who, &label, 0, vec![])?;
+            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 0, vec![])?;
         }
         if let Some(result) =
-            self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req)?
+            self.local_tokenize(&who, revision.as_deref(), &policy, &snapshot, &plan, &names, &req)?
         {
-            Self::audit(&self.ctx, &self.watchers, &who, &label, 1, local_tokens(&result)?)?;
+            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 1, local_tokens(&result)?)?;
             self.check_response(&who, &signal, false)?;
             return Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(
                 PartialResultSet {
@@ -1236,7 +1250,7 @@ impl SpannerService for NunyaSpanner {
             .await?
             .into_inner();
         Ok(Response::new(
-            self.stream(who, policy, plan, label, upstream, signal, write),
+            self.stream(who, policy, revision, plan, label, upstream, signal, write),
         ))
     }
     async fn execute_batch_dml(
@@ -1247,13 +1261,14 @@ impl SpannerService for NunyaSpanner {
         let mut req = req.into_inner();
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
-        let (policy, snapshot) = self.configuration()?;
+        let (policy, snapshot, revision) = self.configuration()?;
         let mut plans = vec![];
         let mut labels = vec![];
         for statement in &mut req.statements {
             labels.push(statement.sql.clone());
             let (plan, _, kind) = self.sql(
                 &who,
+                revision.as_deref(),
                 &statement.sql,
                 &mut statement.params,
                 &policy,
@@ -1262,7 +1277,7 @@ impl SpannerService for NunyaSpanner {
             match kind {
                 StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {}
                 StatementKind::Tokenize { .. } => {
-                    return Err(self.refuse_tokenize(&who, NyCode::NotAnalysable));
+                    return Err(self.refuse_tokenize(&who, revision.as_deref(), NyCode::NotAnalysable));
                 }
                 StatementKind::Select
                 | StatementKind::Begin
@@ -1278,7 +1293,7 @@ impl SpannerService for NunyaSpanner {
         }
         self.admit_write(&who)?;
         for label in &labels {
-            Self::audit(&self.ctx, &self.watchers, &who, label, 0, vec![])?;
+            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), label, 0, vec![])?;
         }
         let mut client = self.client().await?;
         self.mark_dml(&req.session)?;
@@ -1292,7 +1307,7 @@ impl SpannerService for NunyaSpanner {
             let tokens = self
                 .rows(&who, &policy, &plans[i], set)
                 .map_err(|e| after_forward(e, true))?;
-            Self::audit(&self.ctx, &self.watchers, &who, &labels[i], set.rows.len() as u64, tokens)
+            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &labels[i], set.rows.len() as u64, tokens)
                 .map_err(|e| after_forward(e, true))?;
         }
         if let Some(s) = &mut result.status {
@@ -1314,7 +1329,7 @@ impl SpannerService for NunyaSpanner {
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
         read_features(&req)?;
-        let (policy, snapshot) = self.configuration()?;
+        let (policy, snapshot, revision) = self.configuration()?;
         let lowered = spanner_struct::lower_read(&req, &snapshot, &policy).map_err(status)?;
         let plan = check(&lowered.stmt, &policy, &snapshot).map_err(status)?;
         check_key_tokens(
@@ -1330,12 +1345,12 @@ impl SpannerService for NunyaSpanner {
         for (index, value) in rewrites {
             *read_value_mut(&mut req, &lowered.positions[index]).ok_or_else(invalid)? = value;
         }
-        Self::audit(&self.ctx, &self.watchers, &who, "Read", 0, vec![])?;
+        Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Read", 0, vec![])?;
         let mut result = cancellable(&mut signal, false, self.client().await?.read(req))
             .await?
             .into_inner();
         let tokens = self.rows(&who, &policy, &plan, &mut result)?;
-        Self::audit(&self.ctx, &self.watchers, &who, "Read", result.rows.len() as u64, tokens)?;
+        Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Read", result.rows.len() as u64, tokens)?;
         self.check_response(&who, &signal, false)?;
         Ok(Response::new(result))
     }
@@ -1348,7 +1363,7 @@ impl SpannerService for NunyaSpanner {
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
         read_features(&req)?;
-        let (policy, snapshot) = self.configuration()?;
+        let (policy, snapshot, revision) = self.configuration()?;
         let lowered = spanner_struct::lower_read(&req, &snapshot, &policy).map_err(status)?;
         let plan = check(&lowered.stmt, &policy, &snapshot).map_err(status)?;
         check_key_tokens(
@@ -1364,13 +1379,14 @@ impl SpannerService for NunyaSpanner {
         for (index, value) in rewrites {
             *read_value_mut(&mut req, &lowered.positions[index]).ok_or_else(invalid)? = value;
         }
-        Self::audit(&self.ctx, &self.watchers, &who, "Read", 0, vec![])?;
+        Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Read", 0, vec![])?;
         let upstream = cancellable(&mut signal, false, self.client().await?.streaming_read(req))
             .await?
             .into_inner();
         Ok(Response::new(self.stream(
             who,
             policy,
+            revision,
             plan,
             "Read".into(),
             upstream,
@@ -1416,7 +1432,7 @@ impl SpannerService for NunyaSpanner {
         let mut req = req.into_inner();
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
-        let (policy, snapshot) = self.configuration()?;
+        let (policy, snapshot, revision) = self.configuration()?;
         let dml_forwarded = self
             .dml_sessions
             .lock()
@@ -1446,7 +1462,7 @@ impl SpannerService for NunyaSpanner {
                     value;
             }
         }
-        Self::audit(&self.ctx, &self.watchers, &who, "Commit", 0, vec![])?;
+        Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Commit", 0, vec![])?;
         let mut client = self.client().await?;
         let session = req.session.clone();
         let result = cancellable(&mut signal, true, client.commit(req)).await;
@@ -2054,6 +2070,7 @@ mod tests {
                 registry: runtime.registry.clone(),
                 route: crate::state::model::RouteId::new("spanner-native").unwrap(),
                 policy: RwLock::new(Arc::new(policy)),
+                policy_revision: RwLock::new(None),
                 snapshot: RwLock::new(Arc::new(snapshot)),
                 root_key: RootKey::from_hex(&"00".repeat(32)).unwrap(),
                 readlog,
@@ -2124,6 +2141,85 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn statement_snapshot_retains_revision_across_reload() {
+        let records = Arc::new(Mutex::new(vec![]));
+        let f = Fixture::with_log(Box::new(CaptureLog(
+            records.clone(), Arc::new(Mutex::new(vec![])),
+        ))).await;
+        let install = |revision: &str| {
+            let mut policy = f.svc.ctx.policy.write().unwrap();
+            *f.svc.ctx.policy_revision.write().unwrap() = Some(revision.into());
+            *policy = Arc::new((**policy).clone());
+        };
+        install("R1");
+        let req = f.query("SELECT email FROM customers").await;
+        f.fake.hold_sql.store(true, std::sync::atomic::Ordering::Relaxed);
+        let rpc = f.svc.execute_sql(f.request(req, "alice"));
+        let reload = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while f.fake.seen.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            install("R2");
+            f.fake.release.notify_one();
+        };
+        let (result, ()) = tokio::join!(rpc, reload);
+        result.unwrap();
+        {
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 2);
+            assert!(records.iter().all(|r| r.policy_revision.as_deref() == Some("R1")));
+        }
+        records.lock().unwrap().clear();
+        f.fake.hold_sql.store(false, std::sync::atomic::Ordering::Relaxed);
+        let req = f.query("SELECT email FROM customers").await;
+        f.svc.execute_sql(f.request(req, "alice")).await.unwrap();
+        {
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 2);
+            assert!(records.iter().all(|r| r.policy_revision.as_deref() == Some("R2")));
+        }
+
+        // Local tokenize has no await between configuration and audit. Exercise
+        // those same helpers directly to install a revision at that boundary.
+        records.lock().unwrap().clear();
+        install("R1");
+        let mut req = f.query("SELECT nunya_tokenize('email', 'private@example.com')").await;
+        let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
+        let (policy, snapshot, revision) = f.svc.configuration().unwrap();
+        let (plan, names, _) = f.svc.sql(
+            &who, revision.as_deref(), &req.sql, &mut req.params, &policy, &snapshot,
+        ).unwrap();
+        install("R2");
+        let result = f.svc.local_tokenize(
+            &who, revision.as_deref(), &policy, &snapshot, &plan, &names, &req,
+        ).unwrap().unwrap();
+        NunyaSpanner::audit(
+            &f.svc.ctx, &f.svc.watchers, &who, revision.as_deref(),
+            "Spanner nunya_tokenize", 1, local_tokens(&result).unwrap(),
+        ).unwrap();
+        assert_eq!(records.lock().unwrap()[0].policy_revision.as_deref(), Some("R1"));
+        records.lock().unwrap().clear();
+        req.resume_token = vec![1];
+        f.svc.local_tokenize(
+            &who, revision.as_deref(), &policy, &snapshot, &plan, &names, &req,
+        ).unwrap_err();
+        {
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(matches!(records[0].outcome, Outcome::Refused(NyCode::NotAnalysable)));
+            assert_eq!(records[0].policy_revision.as_deref(), Some("R1"));
+        }
+        records.lock().unwrap().clear();
+        req.resume_token.clear();
+        f.svc.execute_sql(f.request(req, "alice")).await.unwrap();
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].policy_revision.as_deref(), Some("R2"));
+    }
+
+    #[tokio::test]
     async fn revocation_audits_watcher_connection() {
         let records = Arc::new(Mutex::new(vec![]));
         let lifecycle = Arc::new(Mutex::new(vec![]));
@@ -2160,7 +2256,7 @@ mod tests {
             let request = session_request((), f.alice, secret);
             let who = f.svc.authenticate(&request).unwrap();
             f.svc.record_session(&name, &who).unwrap();
-            NunyaSpanner::audit(&f.svc.ctx, &f.svc.watchers, &who, "Read", 0, vec![]).unwrap();
+            NunyaSpanner::audit(&f.svc.ctx, &f.svc.watchers, &who, None, "Read", 0, vec![]).unwrap();
             let records = records.lock().unwrap();
             let record = records.last().unwrap();
             assert_eq!(record.principal, row.principal);
@@ -2575,7 +2671,7 @@ mod tests {
         };
         let tokenize = || {
             f.svc
-                .local_tokenize(&who, &policy, &snapshot, &plan, &[], &ExecuteSqlRequest::default())
+                .local_tokenize(&who, None, &policy, &snapshot, &plan, &[], &ExecuteSqlRequest::default())
         };
         for _ in 0..10 {
             assert!(tokenize().unwrap().is_some());

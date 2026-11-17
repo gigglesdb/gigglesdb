@@ -247,9 +247,14 @@ impl Hub {
         .map_err(crate::serve::errors)?;
         {
             let mut current = policy.write().map_err(|_| "policy lock unavailable")?;
-            if let Route::Postgres(ctx) = &route {
-                let mut revision = ctx.policy_revision.write().map_err(|_| "revision lock unavailable")?;
-                *revision = Some(s.hash.clone());
+            let revision = match &route {
+                Route::Postgres(ctx) => Some(&ctx.policy_revision),
+                Route::Spanner(ctx) => Some(&ctx.policy_revision),
+                #[cfg(test)]
+                Route::Test(..) => None,
+            };
+            if let Some(revision) = revision {
+                *revision.write().map_err(|_| "revision lock unavailable")? = Some(s.hash.clone());
             }
             *current = s.policy.clone();
         }
@@ -294,8 +299,14 @@ impl Hub {
             }
             let mut route_revisions = Vec::new();
             for route in &s.routes {
-                if let Route::Postgres(ctx) = route {
-                    route_revisions.push(ctx.policy_revision.write().map_err(|_| "revision lock unavailable")?);
+                let revision = match route {
+                    Route::Postgres(ctx) => Some(&ctx.policy_revision),
+                    Route::Spanner(ctx) => Some(&ctx.policy_revision),
+                    #[cfg(test)]
+                    Route::Test(..) => None,
+                };
+                if let Some(revision) = revision {
+                    route_revisions.push(revision.write().map_err(|_| "revision lock unavailable")?);
                 }
             }
             for snapshot in &snapshots {
@@ -1162,6 +1173,7 @@ mod tests {
             registry: runtime.registry.clone(),
             route: crate::state::model::RouteId::new("spanner-native").unwrap(),
             policy: RwLock::new(Arc::new(policy())),
+            policy_revision: RwLock::new(None),
             snapshot: RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec![], 0))),
             root_key: RootKey::from_hex(&"ab".repeat(32)).unwrap(),
             readlog: Box::new(h.route_log(&id("spanner-native")).unwrap()),
@@ -1175,6 +1187,7 @@ mod tests {
         assert!(!h.readiness(true, true).0);
         *ctx.snapshot.write().unwrap() = Arc::new(Snapshot::new(vec![], vec![], vec![], now()));
         h.register(Route::Spanner(ctx.clone())).unwrap();
+        assert_eq!(ctx.policy_revision.read().unwrap().as_deref(), Some(hash(bytes).as_str()));
         assert!(!h.readiness(true, true).0);
         h.register(Route::Test(
             id("postgres"),
@@ -1193,7 +1206,8 @@ mod tests {
             path: dir.join("audit.log"),
             max_bytes: 1024,
         };
-        h.apply(0, Ok(new), Some(hash(b"native"))).unwrap();
+        h.apply(0, Ok(new), Some("R2".into())).unwrap();
+        assert_eq!(ctx.policy_revision.read().unwrap().as_deref(), Some("R2"));
         assert_eq!(ctx.policy.read().unwrap().snapshot_max_age_ms, 123);
         ctx.readlog
             .write(&crate::readlog::ReadLogRecord {
@@ -1215,7 +1229,7 @@ mod tests {
             .unwrap();
         let logged: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("audit.log")).unwrap()).unwrap();
-        assert_eq!(logged["policy_revision"], hash(b"native"));
+        assert_eq!(logged["policy_revision"], "R2");
         assert_eq!(logged["config_revision"], "config-test");
         let mut next = (*h.policy_for(&id("spanner-native")).unwrap()).clone();
         next.snapshot_max_age_ms = 124;

@@ -152,6 +152,7 @@ pub(crate) async fn run_spanner_with_hub(
             registry: state.registry,
             route: state.route,
             policy: RwLock::new(policy),
+            policy_revision: RwLock::new(None),
             snapshot: RwLock::new(Arc::new(snapshot)),
             root_key,
             readlog,
