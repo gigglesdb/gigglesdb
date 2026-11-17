@@ -21,10 +21,16 @@ import (
 
 // rpcCounter counts attempts at the transport boundary, including library retries.
 type rpcCounter struct {
-	mu            sync.Mutex
-	calls         map[string]int
-	commitSession string
-	commitTx      []byte
+	mu       sync.Mutex
+	calls    map[string]int
+	sessions map[string]bool
+	commits  []commitObservation
+}
+
+// commitObservation records only transport metadata, never token contents.
+type commitObservation struct {
+	session   string
+	precommit bool
 }
 
 func (c *rpcCounter) count(method string) {
@@ -38,11 +44,30 @@ func (c *rpcCounter) unary(bearer string) grpc.UnaryClientInterceptor {
 		c.count(method)
 		if commit, ok := req.(*sppb.CommitRequest); ok {
 			c.mu.Lock()
-			c.commitSession = commit.GetSession()
-			c.commitTx = append([]byte(nil), commit.GetTransactionId()...)
+			c.commits = append(c.commits, commitObservation{session: commit.GetSession(), precommit: commit.GetPrecommitToken() != nil})
 			c.mu.Unlock()
 		}
-		return invoke(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+bearer), method, req, reply, cc, opts...)
+		err := invoke(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+bearer), method, req, reply, cc, opts...)
+		if err == nil {
+			c.mu.Lock()
+			if c.sessions == nil {
+				c.sessions = make(map[string]bool)
+			}
+			switch request := req.(type) {
+			case *sppb.CreateSessionRequest:
+				if session, ok := reply.(*sppb.Session); ok {
+					c.sessions[session.GetName()] = request.GetSession().GetMultiplexed()
+				}
+			case *sppb.BatchCreateSessionsRequest:
+				if batch, ok := reply.(*sppb.BatchCreateSessionsResponse); ok {
+					for _, session := range batch.GetSession() {
+						c.sessions[session.GetName()] = false
+					}
+				}
+			}
+			c.mu.Unlock()
+		}
+		return err
 	}
 }
 

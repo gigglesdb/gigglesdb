@@ -10,8 +10,9 @@ for scenario in "$@"; do
   esac
 done
 [[ ${#scenarios[@]} != 0 ]] || { echo 'FAIL setup arguments missing-scenario'; exit 1; }
-case "${NUNYA_D2_MUX_RW:-on}" in
-  on) echo 'INFO mux-rw=on' ;;
+export NUNYA_D2_MUX_RW=${NUNYA_D2_MUX_RW:-on}
+case "$NUNYA_D2_MUX_RW" in
+  on) export GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS_FOR_RW=true; echo 'INFO mux-rw=on' ;;
   off) export GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS_FOR_RW=false; echo 'INFO mux-rw=off' ;;
   *) echo 'FAIL setup invalid-mux-rw'; exit 1 ;;
 esac
@@ -41,7 +42,7 @@ cleanup() {
     wait "$server_pid" 2>/dev/null || true
   fi
   if $owned_emulator; then
-    docker rm -fv gd81-d2b-emulator >"$run/docker-cleanup.log" 2>&1 || rc=1
+    docker rm -fv "$NUNYA_D2_CONTAINER" >"$run/docker-cleanup.log" 2>&1 || rc=1
   fi
   if [[ $rc != 0 ]]; then printf 'FAIL %s %s see-run-evidence\n' "$scenario" "$stage"; fi
   exit "$rc"
@@ -63,11 +64,16 @@ sys.exit(1)
 PY
 }
 if [[ -z ${NUNYA_D2_EMULATOR_GRPC:-} && -z ${NUNYA_D2_EMULATOR_REST:-} ]]; then
-  docker run -d --name gd81-d2b-emulator --label gd81-d2b=1 \
-    -p 127.0.0.1:19010:9010 -p 127.0.0.1:19020:9020 \
+  [[ -n ${NUNYA_D2_CONTAINER:-} ]] || { echo 'FAIL setup missing-NUNYA_D2_CONTAINER'; exit 1; }
+  label=nunya-d2=1
+  if [[ $NUNYA_D2_CONTAINER == gd81-d2c-* ]]; then label=gd81-d2c=1; fi
+  docker run -d --name "$NUNYA_D2_CONTAINER" --label "$label" \
+    -p 127.0.0.1::9010 -p 127.0.0.1::9020 \
     gcr.io/cloud-spanner-emulator/emulator:1.5.41 >"$run/docker-start.log" 2>&1
   owned_emulator=true
-  export NUNYA_D2_EMULATOR_GRPC=127.0.0.1:19010 NUNYA_D2_EMULATOR_REST=http://127.0.0.1:19020
+  NUNYA_D2_EMULATOR_GRPC=$(docker port "$NUNYA_D2_CONTAINER" 9010/tcp | tr -d '\r')
+  NUNYA_D2_EMULATOR_REST=http://$(docker port "$NUNYA_D2_CONTAINER" 9020/tcp | tr -d '\r')
+  export NUNYA_D2_EMULATOR_GRPC NUNYA_D2_EMULATOR_REST
   wait_port "$NUNYA_D2_EMULATOR_REST"
   NUNYA_SPANNER_REST="$NUNYA_D2_EMULATOR_REST" bash "$here/setup.sh" >"$run/emulator-setup.log" 2>&1
 elif [[ -z ${NUNYA_D2_EMULATOR_GRPC:-} || -z ${NUNYA_D2_EMULATOR_REST:-} ]]; then
@@ -161,11 +167,12 @@ fi
 expanded=()
 for scenario in "${scenarios[@]}"; do
   if [[ $scenario == commit ]]; then
-    expanded+=(commit-control commit-revoked commit-expired commit-restart)
+    expanded+=(commit-control commit-stream-dml commit-revoked commit-expired commit-restart)
   else
     expanded+=("$scenario")
   fi
 done
+echo 'INFO ny012 covered-by-unit-tests-only (the emulator never returns an OK Commit without timestamp)'
 commit_started=$SECONDS
 for scenario in "${expanded[@]}"; do
   if [[ $scenario == commit-control ]]; then commit_started=$SECONDS; fi

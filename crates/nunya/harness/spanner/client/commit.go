@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
-	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
@@ -60,29 +59,9 @@ func commitCount(ctx context.Context, base int64) (int64, error) {
 	return count, nil
 }
 
-// rollbackAbandoned releases the emulator's single-transaction slot after refusal.
-// This direct harness cleanup is outside the measured client RPC counts.
-func rollbackAbandoned(ctx context.Context, calls *rpcCounter) error {
-	calls.mu.Lock()
-	session, tx := calls.commitSession, append([]byte(nil), calls.commitTx...)
-	calls.mu.Unlock()
-	if session == "" || len(tx) == 0 {
-		return errors.New("missing cleanup transaction")
-	}
-	conn, err := grpc.NewClient(strings.TrimPrefix(os.Getenv("NUNYA_D2_EMULATOR_GRPC"), "http://"), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	_, err = sppb.NewSpannerClient(conn).Rollback(cleanupCtx, &sppb.RollbackRequest{Session: session, TransactionId: tx})
-	return err
-}
-
 func commitAction(ctx context.Context, name string) error {
 	switch name {
-	case "control":
+	case "control", "stream-dml":
 		return nil
 	case "revoked", "restart":
 		variable := "NUNYA_D2_REVOKE"
@@ -126,6 +105,8 @@ func commitScenario(ctx context.Context, name string) error {
 	switch name {
 	case "control":
 		base = 600000
+	case "stream-dml":
+		base = 640000
 	case "revoked":
 		base = 610000
 	case "expired":
@@ -143,13 +124,31 @@ func commitScenario(ctx context.Context, name string) error {
 	defer client.Close()
 	var runs atomic.Int64
 	var dmlErr, actionErr error
+	var rowCount int64
 	_, ended := client.ReadWriteTransaction(ctx, func(bodyCtx context.Context, tx *spanner.ReadWriteTransaction) error {
 		n := runs.Add(1)
 		callCtx, cancel := context.WithTimeout(bodyCtx, 10*time.Second)
-		_, dmlErr = tx.Update(callCtx, spanner.Statement{
+		statement := spanner.Statement{
 			SQL:    fmt.Sprintf("INSERT INTO Notes (Id, Body) VALUES (@id, 'd2-%s')", name),
 			Params: map[string]any{"id": base + n},
-		})
+		}
+		if name == "stream-dml" {
+			rows := tx.Query(callCtx, statement)
+			for {
+				_, nextErr := rows.Next()
+				if nextErr == iterator.Done {
+					break
+				}
+				if nextErr != nil {
+					dmlErr = nextErr
+					break
+				}
+			}
+			rowCount = rows.RowCount
+			rows.Stop()
+		} else {
+			rowCount, dmlErr = tx.Update(callCtx, statement)
+		}
 		cancel()
 		if dmlErr != nil {
 			return dmlErr
@@ -157,11 +156,6 @@ func commitScenario(ctx context.Context, name string) error {
 		actionErr = commitAction(bodyCtx, name)
 		return actionErr
 	})
-	var cleanupErr error
-	if ended != nil && calls.methodCount("Commit") > 0 {
-		cleanupErr = rollbackAbandoned(ctx, calls)
-		fmt.Printf("INFO commit %s direct-rollback-code=%s\n", name, resultCode(cleanupErr))
-	}
 	count, countErr := commitCount(ctx, base)
 	commits := calls.methodCount("Commit")
 	fmt.Printf("INFO commit %s table=Notes code=%s ny=%s runs=%d ExecuteSql=%d ExecuteStreamingSql=%d BeginTransaction=%d Commit=%d Rollback=%d upstream-count=%d count-code=%s dml-code=%s action-code=%s\n",
@@ -175,22 +169,53 @@ func commitScenario(ctx context.Context, name string) error {
 		}
 		fmt.Printf("%s commit %s %s\n", verdict, name, label)
 	}
-	okStatus := ended != nil && (status.Code(ended) == codes.PermissionDenied || status.Code(ended) == codes.Unknown)
-	okCount := count >= 0 && count <= 1
-	okCommits := commits <= 1
-	if name == "restart" {
-		okStatus = true // Restart outcome is recorded, but must never replay the body.
-	}
-	if name == "control" {
-		okStatus = ended == nil
-		okCount = count == 1
-		okCommits = commits == 1
+	okStatus, okCount := false, false
+	switch name {
+	case "control", "stream-dml":
+		okStatus, okCount = ended == nil, count == 1
+	case "revoked", "expired":
+		okStatus = status.Code(ended) == codes.PermissionDenied && nyCode(ended) == "NY003"
+		okCount = count == 0
+	case "restart":
+		switch {
+		case ended == nil:
+			okStatus, okCount = true, count == 1
+		case nyCode(ended) == "NY011" || nyCode(ended) == "NY012":
+			okStatus, okCount = true, count >= 0 && count <= 1
+		case status.Code(ended) == codes.PermissionDenied && nyCode(ended) == "NY003":
+			okStatus, okCount = true, count == 0
+		}
 	}
 	check("status", okStatus && dmlErr == nil && actionErr == nil)
 	check("ran-once", runs.Load() == 1)
-	check("commit-attempts", okCommits)
+	check("commit-attempts", commits == 1)
 	check("upstream-count", countErr == nil && okCount)
-	check("cleanup", cleanupErr == nil)
+	if name == "control" || name == "stream-dml" {
+		calls.mu.Lock()
+		mux, regular := 0, 0
+		for _, multiplexed := range calls.sessions {
+			if multiplexed {
+				mux++
+			} else {
+				regular++
+			}
+		}
+		muxOK := len(calls.commits) == 1
+		if muxOK {
+			commit := calls.commits[0]
+			multiplexed, known := calls.sessions[commit.session]
+			wantMux := os.Getenv("NUNYA_D2_MUX_RW") != "off"
+			muxOK = known && multiplexed == wantMux && commit.precommit == wantMux
+			fmt.Printf("INFO commit %s mux-session=%t precommit-token=%t\n", name, multiplexed, commit.precommit)
+		}
+		calls.mu.Unlock()
+		fmt.Printf("INFO mux created-multiplexed=%d created-regular=%d\n", mux, regular)
+		check("mux", muxOK)
+	}
+	if name == "stream-dml" {
+		fmt.Printf("INFO commit stream-dml RowCount=%d\n", rowCount)
+		check("streaming-dml", calls.methodCount("ExecuteStreamingSql") >= 1 && calls.methodCount("ExecuteSql") == 0 && rowCount == 1)
+	}
 	if failed {
 		return errors.New("commit assertions failed")
 	}
