@@ -42,6 +42,16 @@ pub struct Reference {
     pub position: Position,
 }
 
+/// One result column of a statement's own select list or RETURNING list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputItem {
+    /// A bare column (`Output` or `Returning` position), with any alias.
+    Column(String),
+    /// Any other item: an expression, call, aggregate or literal. Lists the
+    /// columns it reads, each also recorded in `refs` at its own position.
+    Computed(Vec<String>),
+}
+
 /// Syntactic shape of one statement, collected before binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementShape {
@@ -67,6 +77,10 @@ pub struct StatementShape {
     /// `RETURNING *` or `RETURNING t.*`.
     pub returning_star: bool,
     pub explain: bool,
+    /// The statement's result columns in output order, one per select item
+    /// (or RETURNING item), duplicates kept. A star item adds nothing here;
+    /// `apply` expands stars first, so the checked shape has none.
+    pub outputs: Vec<OutputItem>,
 }
 
 impl StatementShape {
@@ -82,7 +96,40 @@ impl StatementShape {
             star: false,
             returning_star: false,
             explain: false,
+            outputs: Vec::new(),
         }
+    }
+
+    /// Merge `other`, a shape collected for one part of this statement,
+    /// into this one, keeping first-seen order and the dedup rules.
+    pub fn absorb(&mut self, other: StatementShape) {
+        for t in &other.tables {
+            self.add_table(t);
+        }
+        for r in &other.refs {
+            self.add_ref(&r.column, r.position);
+        }
+        for f in &other.functions {
+            self.add_function(f);
+        }
+        self.casts_user_type |= other.casts_user_type;
+        self.subqueries += other.subqueries;
+        self.joins += other.joins;
+        self.star |= other.star;
+        self.returning_star |= other.returning_star;
+        self.explain |= other.explain;
+        self.outputs.extend(other.outputs);
+    }
+
+    /// The distinct column names referenced anywhere in this shape.
+    pub fn columns(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for r in &self.refs {
+            if !out.contains(&r.column) {
+                out.push(r.column.clone());
+            }
+        }
+        out
     }
 
     pub fn add_ref(&mut self, column: &str, position: Position) {
@@ -289,8 +336,10 @@ fn same_table(written: &str, table: &str) -> bool {
 
 /// Judge one statement shape against the task definition (design section 2).
 ///
-/// For a SELECT the plan's `outputs` follow the plain-column select items in
-/// order; `apply` runs this after the star rewrite.
+/// The plan's `outputs` has one mode per entry of `shape.outputs` (the
+/// select list, or the RETURNING list of an UPDATE), in output order; a
+/// column selected twice gets two entries. `apply` runs this after the star
+/// rewrite.
 pub(crate) fn check(
     def: &TaskDef,
     marks: &ColumnMarks,
@@ -354,13 +403,29 @@ pub(crate) fn check(
             None => plan.refs.push((id, position_bit(r.position))),
         }
     }
-    if shape.class == StatementClass::Select {
-        for r in shape.refs.iter().filter(|r| r.position == Position::Output) {
-            plan.outputs
-                .push(output_mode(&effective_mode(def, marks, &r.column)));
-        }
-    }
+    plan.outputs = shape
+        .outputs
+        .iter()
+        .map(|item| match item {
+            OutputItem::Column(column) => output_mode(&effective_mode(def, marks, column)),
+            OutputItem::Computed(columns) => computed_mode(def, marks, columns),
+        })
+        .collect();
     Ok(plan)
+}
+
+/// Release mode of one computed output. Its columns were already checked at
+/// an expression position, where a masked or withheld column is refused, so
+/// they are all readable: counted when one is untrusted and allowed.
+fn computed_mode(def: &TaskDef, marks: &ColumnMarks, columns: &[String]) -> OutputMode {
+    if columns
+        .iter()
+        .any(|c| effective_mode(def, marks, c).untrusted_released)
+    {
+        OutputMode::CountUntrusted
+    } else {
+        OutputMode::Plain
+    }
 }
 
 fn output_mode(eff: &EffectiveMode) -> OutputMode {
@@ -549,8 +614,16 @@ fn projection_refs(
 ) {
     for item in items {
         match &item.expression {
-            Expr::Field(column) => out.add_ref(column, bare),
-            other => expr_refs(out, other, expr),
+            Expr::Field(column) => {
+                out.add_ref(column, bare);
+                out.outputs.push(OutputItem::Column(column.clone()));
+            }
+            other => {
+                let mut part = StatementShape::new(out.class);
+                expr_refs(&mut part, other, expr);
+                out.outputs.push(OutputItem::Computed(part.columns()));
+                out.absorb(part);
+            }
         }
     }
 }
@@ -602,6 +675,7 @@ pub fn native_shape(request: &Request) -> StatementShape {
             out.star = projection.is_empty();
             for column in projection {
                 out.add_ref(column, Position::Output);
+                out.outputs.push(OutputItem::Column(column.clone()));
             }
             if let Some(filter) = filter {
                 expr_refs(&mut out, filter, Position::Filter);
@@ -661,6 +735,8 @@ pub fn native_shape(request: &Request) -> StatementShape {
     }
     if let Some(projection) = returning {
         out.returning_star = projection.is_empty();
+        // The result columns are the RETURNING list's, not the body's.
+        out.outputs.clear();
         projection_refs(&mut out, projection, Position::Returning, Position::ReturningExpr);
     }
     out
@@ -693,46 +769,6 @@ fn native_expand(request: &Request, star: &[String], returning: &[String]) -> Re
     out
 }
 
-/// Release mode of one computed output: counted when it reads an untrusted
-/// column the task may see (a withheld column never reaches an expression).
-fn expression_mode(def: &TaskDef, marks: &ColumnMarks, expr: &Expr) -> OutputMode {
-    let mut shape = StatementShape::new(StatementClass::Select);
-    expr_refs(&mut shape, expr, Position::Expression);
-    if shape
-        .refs
-        .iter()
-        .any(|r| effective_mode(def, marks, &r.column).untrusted_released)
-    {
-        OutputMode::CountUntrusted
-    } else {
-        OutputMode::Plain
-    }
-}
-
-fn projection_modes(def: &TaskDef, marks: &ColumnMarks, items: &[Projection]) -> Vec<OutputMode> {
-    items
-        .iter()
-        .map(|item| match &item.expression {
-            Expr::Field(column) => output_mode(&effective_mode(def, marks, column)),
-            other => expression_mode(def, marks, other),
-        })
-        .collect()
-}
-
-/// One mode per result column of an expanded, checked request.
-fn native_outputs(def: &TaskDef, marks: &ColumnMarks, request: &Request) -> Vec<OutputMode> {
-    match request {
-        Request::Read { projection, .. } => projection
-            .iter()
-            .map(|column| output_mode(&effective_mode(def, marks, column)))
-            .collect(),
-        Request::ReadExpressions { projection, .. } | Request::Returning { projection, .. } => {
-            projection_modes(def, marks, projection)
-        }
-        _ => Vec::new(),
-    }
-}
-
 /// Check a native request, expand its empty projections and build its plan
 /// (design section 2; the native twin of `apply`).
 ///
@@ -759,8 +795,7 @@ pub fn apply_native(
         return Err(denied(DenyRule::ColumnNotAvailable));
     }
     let expanded = native_expand(request, &star, &returning);
-    let mut plan = check(def, marks, table, &native_shape(&expanded))?;
-    plan.outputs = native_outputs(def, marks, &expanded);
+    let plan = check(def, marks, table, &native_shape(&expanded))?;
     Ok((expanded, plan))
 }
 

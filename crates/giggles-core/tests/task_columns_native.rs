@@ -724,6 +724,63 @@ fn same_denials_as_sql() {
     let sql = apply_sql_text(&d, 1, &marks, &t, "SELECT status FROM shipments").unwrap();
     let (_, native) = apply_native(&d, 1, &marks, &t, &read(&["status"], None, vec![])).unwrap();
     assert_eq!(sql.outputs, native.outputs);
+    // A duplicated column gets one mode per output on both surfaces, and an
+    // expression over a readable column lines up with the bare columns.
+    let mask = OutputMode::Mask(Value::Null);
+    let sql = apply_sql_text(
+        &d,
+        1,
+        &m,
+        &t,
+        "SELECT id, customer_email, id, customer_email FROM shipments",
+    )
+    .unwrap();
+    let (_, native) = apply_native(
+        &d,
+        1,
+        &m,
+        &t,
+        &read(&["id", "customer_email", "id", "customer_email"], None, vec![]),
+    )
+    .unwrap();
+    let expected = [OutputMode::Plain, mask.clone(), OutputMode::Plain, mask.clone()];
+    assert_eq!(sql.outputs, expected);
+    assert_eq!(native.outputs, expected);
+    // Withheld (untrusted, not allowed): an expression over it is refused on
+    // both surfaces; allowed, the expression output is counted like the column.
+    let mixed_sql = "SELECT status, length(status), customer_email, id, status FROM shipments";
+    let mixed = read_exprs(vec![
+        item(field("status"), None),
+        item(len("status"), None),
+        item(field("customer_email"), None),
+        item(field("id"), None),
+        item(field("status"), None),
+    ]);
+    denied(
+        apply_sql_text(&d, 1, &marks, &t, mixed_sql),
+        DenyRule::MaskedColumnPosition,
+        "sql expression over withheld",
+    );
+    denied(
+        apply_native(&d, 1, &marks, &t, &mixed),
+        DenyRule::MaskedColumnPosition,
+        "native expression over withheld",
+    );
+    let mut allowed = d.clone();
+    allowed.untrusted_allowed.insert("status".into());
+    let sql = apply_sql_text(&allowed, 1, &marks, &t, mixed_sql).unwrap();
+    let (_, native) = apply_native(&allowed, 1, &marks, &t, &mixed).unwrap();
+    assert_eq!(
+        sql.outputs,
+        [
+            OutputMode::CountUntrusted,
+            OutputMode::CountUntrusted,
+            mask,
+            OutputMode::Plain,
+            OutputMode::CountUntrusted,
+        ]
+    );
+    assert_eq!(sql.outputs, native.outputs);
 }
 
 /// The rules run in `bind_request` for a session bound to a task.

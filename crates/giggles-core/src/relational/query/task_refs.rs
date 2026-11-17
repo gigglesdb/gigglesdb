@@ -1,7 +1,7 @@
 //! Syntactic column-reference walk of a query for task statements (GD-0061).
 //! Read-only over the unbound AST; nothing here binds, evaluates or refuses.
 use super::*;
-use crate::task::columns::{Position, StatementShape};
+use crate::task::columns::{OutputItem, Position, StatementShape};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -177,6 +177,9 @@ impl Query {
             Mode::Returning => Some(Position::Returning),
             Mode::Search => None,
         };
+        // The statement's own select list and a RETURNING list are its result
+        // columns: one `outputs` entry per item, duplicates kept.
+        let results = matches!(mode, Mode::Top | Mode::Returning);
         if let Some(at) = item_at {
             for (item, _) in &self.items {
                 match item {
@@ -187,12 +190,30 @@ impl Query {
                             out.star = true;
                         }
                     }
-                    Item::Scalar(s) => scalar(s, at, out),
-                    Item::Aggregate(a, arg) => {
-                        out.add_function(&a.call_name());
-                        if let Some(s) = arg {
-                            scalar(s, Position::Aggregate, out);
+                    Item::Scalar(Scalar::Column(c)) => {
+                        out.add_ref(&c.name, at);
+                        if results {
+                            out.outputs.push(OutputItem::Column(c.name.clone()));
                         }
+                    }
+                    Item::Scalar(s) => {
+                        let mut part = StatementShape::new(out.class);
+                        scalar(s, at, &mut part);
+                        if results {
+                            out.outputs.push(OutputItem::Computed(part.columns()));
+                        }
+                        out.absorb(part);
+                    }
+                    Item::Aggregate(a, arg) => {
+                        let mut part = StatementShape::new(out.class);
+                        part.add_function(&a.call_name());
+                        if let Some(s) = arg {
+                            scalar(s, Position::Aggregate, &mut part);
+                        }
+                        if results {
+                            out.outputs.push(OutputItem::Computed(part.columns()));
+                        }
+                        out.absorb(part);
                     }
                 }
             }

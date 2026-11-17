@@ -2,7 +2,7 @@
 //! design section 3.2). Syntactic only: it reads the statement as parsed and
 //! never binds, so it runs before any row or catalog value is touched.
 use super::*;
-use crate::task::columns::{Position, StatementShape};
+use crate::task::columns::{OutputItem, Position, StatementShape};
 
 impl Prepared {
     /// Collect the column references and shape facts of this statement.
@@ -26,6 +26,7 @@ impl Prepared {
                 out.star = projection.is_empty();
                 for column in projection {
                     out.add_ref(column, Position::Output);
+                    out.outputs.push(OutputItem::Column(column.clone()));
                 }
                 for p in predicates {
                     out.add_ref(&p.column, Position::Filter);
