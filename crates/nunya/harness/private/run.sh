@@ -1,6 +1,6 @@
 # Private harness orchestration; sourced by ../run.sh.
 # Usage: run.sh private [--work-root DIR] [--nunya-exe PATH] [--linux-bin PATH]
-# Env: NUNYA_EXE, NUNYA_BUILD_WRAPPER, NUNYA_PG_PORT, NUNYA_MGMT_PORT.
+# Env: NUNYA_EXE, NUNYA_BUILD_WRAPPER, NUNYA_PG_PORT, NUNYA_MGMT_PORT, NUNYA_PYTHON, NUNYA_JDBC_JARS, NUNYA_PROJECT_PREFIX.
 native_path() {
   if command -v cygpath >/dev/null; then cygpath -am "$1"; else printf '%s\n' "$1"; fi
 }
@@ -200,7 +200,11 @@ private_main() {
   nunya_exe=$(native_path "$nunya_exe")
   export MSYS_NO_PATHCONV=1
   export NUNYA_PG_PORT=${NUNYA_PG_PORT:-26432} NUNYA_MGMT_PORT=${NUNYA_MGMT_PORT:-26481}
-  project="gd81-d1-$$-$RANDOM"
+  project="${NUNYA_PROJECT_PREFIX:-gd81-d1}-$$-$RANDOM"
+  if [[ ! $project =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    printf 'Invalid NUNYA_PROJECT_PREFIX: use lowercase letters, digits, underscores or hyphens, starting with a letter or digit\n' >&2
+    return 1
+  fi
   compose=(docker compose -p "$project" -f "$run/compose.yaml" --profile private)
   trap private_cleanup EXIT
   mkdir -p "$run/config" "$run/bin" "$run/data/db" "$run/home" "$run/tool"

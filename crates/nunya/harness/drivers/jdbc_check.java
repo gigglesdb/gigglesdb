@@ -13,8 +13,6 @@ class jdbc_check {
     static String url;
     static final Properties properties = new Properties();
     static HikariDataSource pool;
-    static final List<Connection> fallbackConnections = Arrays.asList(null, null);
-    static boolean fallback;
     static String detail = "";
     static Connection connectionC;
     static String token;
@@ -40,20 +38,12 @@ class jdbc_check {
     static class Lease implements AutoCloseable {
         final Connection connection;
         Lease(Connection connection) { this.connection = connection; }
-        /** Return a pooled connection while retaining fixed fallback connections. */
-        public void close() throws SQLException { if (!fallback) connection.close(); }
+        /** Return the connection to the pool. */
+        public void close() throws SQLException { connection.close(); }
     }
 
     static Lease borrow(int slot) throws SQLException {
-        if (!fallback) return new Lease(pool.getConnection());
-        Connection connection = fallbackConnections.get(slot);
-        if (connection == null || !connection.isValid(5)) {
-            if (connection != null) try { connection.close(); } catch (SQLException ignored) { }
-            connection = DriverManager.getConnection(url, properties);
-            fallbackConnections.set(slot, connection);
-            connection.setAutoCommit(true);
-        }
-        return new Lease(connection);
+        return new Lease(pool.getConnection());
     }
 
     static String sqlState(Throwable error) {
@@ -98,7 +88,7 @@ class jdbc_check {
         detail = "";
         try { ok = check.run(); } catch (Exception error) { ok = false; }
         System.out.println((ok ? "PASS" : "FAIL") + " step " + (passed + failures + 1) + ": " + name +
-            (fallback ? " [DriverManager fallback]" : "") + detail);
+            detail);
         System.out.flush();
         if (ok) passed++; else failures++;
     }
@@ -143,7 +133,7 @@ class jdbc_check {
                 return false;
             }
         });
-        fallback = pool == null;
+        if (pool == null) return;
         try {
             step("read blind emails as tokens", () -> {
                 var rows = pooledQuery("SELECT id, email FROM customers WHERE failed_payments >= 2 ORDER BY id");
@@ -184,15 +174,9 @@ class jdbc_check {
             step("same token after gateway restart and pool recovery", () -> {
                 if (!waitFor("restart") || token == null) return false;
                 // Validate both old physical connections, replacing any broken one before the read.
-                if (fallback) {
-                    try (Lease a = borrow(0); Lease b = borrow(1)) {
-                        if (a.connection == b.connection) return false;
-                    }
-                } else {
-                    try (Connection a = pool.getConnection(); Connection b = pool.getConnection()) {
-                        if (!a.isValid(5)) pool.evictConnection(a);
-                        if (!b.isValid(5)) pool.evictConnection(b);
-                    }
+                try (Connection a = pool.getConnection(); Connection b = pool.getConnection()) {
+                    if (!a.isValid(5)) pool.evictConnection(a);
+                    if (!b.isValid(5)) pool.evictConnection(b);
                 }
                 return pooledQuery("SELECT email FROM customers WHERE id = 3").equals(List.of(List.of(token)));
             });
@@ -200,9 +184,6 @@ class jdbc_check {
             endSession("revoke");
         } finally {
             if (pool != null) pool.close();
-            for (Connection connection : fallbackConnections) {
-                if (connection != null) try { connection.close(); } catch (SQLException ignored) { }
-            }
         }
     }
 
