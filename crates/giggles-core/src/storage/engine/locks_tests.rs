@@ -646,6 +646,7 @@ fn queued_limit_error_removes_waiter_and_drains_followers() {
     let lm = Arc::new(LockManager::new(LockConfig {
         max_row_locks_per_txn: 1,
         deadlock_recheck: Duration::from_millis(5),
+        deadlock_timeout: Duration::ZERO,
     }));
     acquire(&lm, 1, row(1), LockMode::Exclusive);
     acquire(&lm, 2, row(2), LockMode::Shared);

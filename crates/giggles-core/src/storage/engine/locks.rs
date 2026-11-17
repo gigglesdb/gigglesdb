@@ -1,9 +1,13 @@
 //! In-memory transaction locks. All bookkeeping is protected by one mutex.
 //!
-//! A shared condition variable deliberately wakes every waiter when a queue changes:
-//! each waiter checks its own result under the mutex, so notifications cannot grant
-//! a lock twice or bypass FIFO. Cancellation callbacks run outside that mutex and
-//! are polled at `deadlock_recheck`, since the callback has no notification channel.
+//! Each queued request has its own condition variable and checks its terminal result
+//! under the mutex, so completion cannot be missed or bypass FIFO. Only completed
+//! or cancelled requests are woken, except when a grant to a transaction with another
+//! pending request can close a cycle: its requests and the granted key's queue and
+//! overlapping queues are woken too. A new cycle includes either a newly queued
+//! request (checked at queue time) or such a grant, so no cycle notification is lost.
+//! Optional deferred detection waits until `deadlock_timeout`; callbacks still run
+//! outside the mutex and are polled at `deadlock_recheck`.
 //!
 //! Interval (gap) locks: `LockKey::Interval` is a Shared lock over a byte range of
 //! one `LockSpace`. It conflicts with other transactions' Exclusive point locks
@@ -16,7 +20,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// `Unique { index: CATALOG_NAME_INDEX, tuple: name }` in `Exclusive` mode
@@ -236,6 +242,7 @@ impl HeldModes {
 pub(crate) struct LockConfig {
     pub(crate) max_row_locks_per_txn: usize,
     pub(crate) deadlock_recheck: Duration,
+    pub(crate) deadlock_timeout: Duration,
 }
 
 impl Default for LockConfig {
@@ -243,6 +250,7 @@ impl Default for LockConfig {
         Self {
             max_row_locks_per_txn: 1_000_000,
             deadlock_recheck: Duration::from_millis(100),
+            deadlock_timeout: Duration::ZERO,
         }
     }
 }
@@ -283,12 +291,16 @@ struct Waiter {
     upgrade: bool,
     // Set by `cancel_wait`: the request ends `Deadlock` instead of being granted.
     cancelled: bool,
+    changed: Arc<Condvar>,
+    #[cfg(test)]
+    sleeping: bool,
 }
 
 #[derive(Debug, Default)]
 struct State {
     keys: HashMap<LockKey, KeyState>,
     waiters: HashMap<u64, Waiter>,
+    by_txn: HashMap<TxnId, Vec<u64>>,
     // A removed waiter keeps its terminal result until its acquiring thread
     // observes it. In particular release_all terminates pending calls Cancelled.
     completed: HashMap<u64, Result<(), LockError>>,
@@ -309,7 +321,8 @@ struct State {
 pub(crate) struct LockManager {
     config: LockConfig,
     state: Mutex<State>,
-    changed: Condvar,
+    #[cfg(test)]
+    waiter_wakeups: AtomicUsize,
 }
 
 impl LockManager {
@@ -317,7 +330,8 @@ impl LockManager {
         Self {
             config,
             state: Mutex::new(State::default()),
-            changed: Condvar::new(),
+            #[cfg(test)]
+            waiter_wakeups: AtomicUsize::new(0),
         }
     }
 
@@ -367,7 +381,7 @@ impl LockManager {
         if immediate {
             state.grant(txn, &key, mode, self.config.max_row_locks_per_txn)?;
             state.drain_queue(&key, self.config.max_row_locks_per_txn);
-            self.changed.notify_all();
+            state.notify_grant(txn, &key);
             return Ok(());
         }
 
@@ -388,6 +402,9 @@ impl LockManager {
         } else {
             state.keys[&key].queue.len()
         };
+        let queued_at = Instant::now();
+        let changed = Arc::new(Condvar::new());
+        state.by_txn.entry(txn).or_default().push(id);
         state.waiters.insert(
             id,
             Waiter {
@@ -396,6 +413,9 @@ impl LockManager {
                 mode,
                 upgrade,
                 cancelled: false,
+                changed: Arc::clone(&changed),
+                #[cfg(test)]
+                sleeping: false,
             },
         );
         state
@@ -405,10 +425,9 @@ impl LockManager {
             .queue
             .insert(position, id);
         state.index(&key, mode);
-        if state.has_cycle(txn) {
+        if self.config.deadlock_timeout.is_zero() && state.has_cycle(txn) {
             state.remove_waiter(id, Err(LockError::Deadlock));
             state.drain_queue(&key, self.config.max_row_locks_per_txn);
-            self.changed.notify_all();
         }
 
         loop {
@@ -422,6 +441,7 @@ impl LockManager {
             if let Some(result) = state.completed.remove(&id) {
                 return result;
             }
+            let waited = queued_at.elapsed();
             let error = if state
                 .waiters
                 .get(&id)
@@ -432,7 +452,7 @@ impl LockManager {
                 Some(LockError::Cancelled)
             } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 Some(LockError::Timeout)
-            } else if state.has_cycle(txn) {
+            } else if waited >= self.config.deadlock_timeout && state.has_cycle(txn) {
                 Some(LockError::Deadlock)
             } else {
                 None
@@ -440,22 +460,37 @@ impl LockManager {
             if let Some(error) = error {
                 state.remove_waiter(id, Err(error));
                 state.drain_queue(&key, self.config.max_row_locks_per_txn);
-                self.changed.notify_all();
                 return state
                     .completed
                     .remove(&id)
                     .expect("removed waiter has result");
             }
-            let interval = deadline.map_or(self.config.deadlock_recheck, |deadline| {
-                self.config
-                    .deadlock_recheck
-                    .min(deadline.saturating_duration_since(Instant::now()))
-            });
-            let (next, _) = self
-                .changed
+            let now = Instant::now();
+            let mut interval = self.config.deadlock_recheck;
+            if waited < self.config.deadlock_timeout {
+                interval = interval.min(
+                    self.config.deadlock_timeout.saturating_sub(now.duration_since(queued_at)),
+                );
+            }
+            if let Some(deadline) = deadline {
+                interval = interval.min(deadline.saturating_duration_since(now));
+            }
+            #[cfg(test)]
+            {
+                state.waiters.get_mut(&id).expect("pending waiter").sleeping = true;
+            }
+            let (next, _) = changed
                 .wait_timeout(state, interval)
                 .map_err(|_| LockError::Misuse)?;
+            #[cfg(test)]
+            {
+                self.waiter_wakeups.fetch_add(1, Ordering::Relaxed);
+            }
             state = next;
+            #[cfg(test)]
+            if let Some(waiter) = state.waiters.get_mut(&id) {
+                waiter.sleeping = false;
+            }
         }
     }
 
@@ -480,11 +515,7 @@ impl LockManager {
         }
         affected.extend(unblocked);
         state.row_counts.remove(&txn);
-        let pending: Vec<_> = state
-            .waiters
-            .iter()
-            .filter_map(|(&id, waiter)| (waiter.txn == txn).then_some(id))
-            .collect();
+        let pending = state.by_txn.get(&txn).cloned().unwrap_or_default();
         for id in pending {
             affected.insert(state.waiters[&id].key.clone());
             state.remove_waiter(id, Err(LockError::Cancelled));
@@ -496,7 +527,6 @@ impl LockManager {
             state.drain_queue(&key, self.config.max_row_locks_per_txn);
             state.settle(&key);
         }
-        self.changed.notify_all();
     }
 
     /// Transactions blocking `txn`'s pending request(s): conflicting holders plus
@@ -508,14 +538,7 @@ impl LockManager {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let mut blockers = Vec::new();
-        for (&id, waiter) in state.waiters.iter().filter(|(_, waiter)| waiter.txn == txn) {
-            let Some(locks) = state.keys.get(&waiter.key) else {
-                continue;
-            };
-            if let Some(position) = locks.queue.iter().position(|&queued| queued == id) {
-                state.queue_blockers(locks, position, &mut blockers);
-            }
-        }
+        state.txn_blockers(txn, &mut blockers);
         blockers.sort_unstable();
         blockers.dedup();
         blockers
@@ -529,17 +552,10 @@ impl LockManager {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let mut any = false;
-        for waiter in state
-            .waiters
-            .values_mut()
-            .filter(|waiter| waiter.txn == txn)
-        {
+        for id in state.by_txn.get(&txn).cloned().unwrap_or_default() {
+            let waiter = state.waiters.get_mut(&id).expect("indexed waiter");
             waiter.cancelled = true;
-            any = true;
-        }
-        if any {
-            self.changed.notify_all();
+            waiter.changed.notify_one();
         }
     }
 
@@ -622,11 +638,17 @@ impl State {
 
     fn remove_waiter(&mut self, id: u64, result: Result<(), LockError>) {
         if let Some(waiter) = self.waiters.remove(&id) {
+            let pending = self.by_txn.get_mut(&waiter.txn).expect("indexed waiter");
+            pending.retain(|&pending| pending != id);
+            if pending.is_empty() {
+                self.by_txn.remove(&waiter.txn);
+            }
             if let Some(locks) = self.keys.get_mut(&waiter.key) {
                 locks.queue.retain(|&queued| queued != id);
             }
             self.settle(&waiter.key);
             self.completed.insert(id, result);
+            waiter.changed.notify_one();
         }
     }
 
@@ -800,6 +822,9 @@ impl State {
             }
             let result = self.grant(txn, key, mode, limit);
             self.remove_waiter(id, result);
+            if result.is_ok() {
+                self.notify_grant(txn, key);
+            }
         }
     }
 
@@ -824,22 +849,53 @@ impl State {
         self.cross_holders(waiter.txn, &waiter.key, waiter.mode, blockers);
     }
 
-    fn has_cycle(&self, requester: TxnId) -> bool {
-        let mut edges: HashMap<TxnId, Vec<TxnId>> = HashMap::new();
-        for locks in self.keys.values() {
-            for (position, id) in locks.queue.iter().enumerate() {
-                let blockers = edges.entry(self.waiters[id].txn).or_default();
+    /// A grant can add wait-for edges to its owner. If the owner is itself
+    /// waiting, wake both ends of every potentially new edge to recheck cycles.
+    fn notify_grant(&self, txn: TxnId, key: &LockKey) {
+        let Some(pending) = self.by_txn.get(&txn) else {
+            return;
+        };
+        let mut notify: HashSet<u64> = pending.iter().copied().collect();
+        let mut keys = vec![key.clone()];
+        self.cross_queued(key, &mut keys);
+        for key in keys {
+            if let Some(locks) = self.keys.get(&key) {
+                notify.extend(locks.queue.iter().copied());
+            }
+        }
+        for id in notify {
+            self.waiters[&id].changed.notify_one();
+        }
+    }
+
+    fn txn_blockers(&self, txn: TxnId, blockers: &mut Vec<TxnId>) {
+        for id in self.by_txn.get(&txn).into_iter().flatten() {
+            let waiter = &self.waiters[id];
+            let locks = &self.keys[&waiter.key];
+            if let Some(position) = locks.queue.iter().position(|queued| queued == id) {
                 self.queue_blockers(locks, position, blockers);
             }
         }
-        let mut visited = HashMap::new();
-        let mut stack = edges.get(&requester).cloned().unwrap_or_default();
+    }
+
+    fn has_cycle(&self, requester: TxnId) -> bool {
+        let mut visited = HashSet::new();
+        let mut stack = vec![requester];
+        let mut blockers = Vec::new();
         while let Some(txn) = stack.pop() {
-            if txn == requester {
-                return true;
+            if !visited.insert(txn) {
+                continue;
             }
-            if visited.insert(txn, ()).is_none() {
-                stack.extend(edges.get(&txn).into_iter().flatten().copied());
+            // Compute edges only for reachable transactions, never all held keys.
+            blockers.clear();
+            self.txn_blockers(txn, &mut blockers);
+            for &blocker in &blockers {
+                if blocker == requester {
+                    return true;
+                }
+                if !visited.contains(&blocker) {
+                    stack.push(blocker);
+                }
             }
         }
         false
@@ -857,3 +913,7 @@ mod deadlock_tests;
 #[cfg(test)]
 #[path = "locks_interval_tests.rs"]
 mod interval_tests;
+
+#[cfg(test)]
+#[path = "locks_wakeup_tests.rs"]
+mod wakeup_tests;
