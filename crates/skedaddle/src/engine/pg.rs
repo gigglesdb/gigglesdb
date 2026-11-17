@@ -59,6 +59,13 @@ impl Installer for PgInstaller {
     }
     async fn install(&mut self, step: Installation) -> Result<()> {
         match step {
+            Installation::ControlSchema
+            | Installation::SourceStartup
+            | Installation::DestinationSchema => {
+                return Err(recovery(
+                    "connector-neutral installation step is not supported by PgInstaller",
+                ));
+            }
             Installation::Publication => {
                 if self.tables.is_empty() {
                     return Err(recovery("empty publication"));

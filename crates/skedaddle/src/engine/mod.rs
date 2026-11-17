@@ -121,14 +121,16 @@ pub fn decode_buffered_position(
     Ok(position)
 }
 
-/// All four effects must be idempotent and verify an existing installation.
-/// The engine journals each intent before calling the database adapter.
+/// Disclosed installation effects, with stable journal payload names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Installation {
     Publication,
     DdlTrigger,
     Slot,
     ProgressTables,
+    ControlSchema,
+    SourceStartup,
+    DestinationSchema,
 }
 impl Installation {
     fn name(self) -> &'static str {
@@ -137,10 +139,65 @@ impl Installation {
             Self::DdlTrigger => "engine-install-ddl-trigger-v1",
             Self::Slot => "engine-install-slot-v1",
             Self::ProgressTables => "engine-install-progress-tables-v2",
+            Self::ControlSchema => "engine-install-control-schema-v1",
+            Self::SourceStartup => "engine-install-source-startup-v1",
+            Self::DestinationSchema => "engine-install-destination-schema-v1",
         }
     }
 }
+/// Invalid disclosed plans are rejected before any installation intent or effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallationPlanError {
+    Empty,
+    Duplicate(Installation),
+    MissingProgressTables,
+}
+impl std::fmt::Display for InstallationPlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid installation plan: {self:?}")
+    }
+}
+impl std::error::Error for InstallationPlanError {}
+
+/// Marker emitted after an installation effect has completed durably.
+pub struct StartupMarker {
+    pub stream: String,
+    pub marker: String,
+    pub label: String,
+}
+
+/// Each effect must be idempotent and verify an existing installation on restart.
+/// The engine journals each intent before calling the database adapter. Defaults
+/// preserve the PG installation protocol; other connectors override both hooks.
 pub trait Installer {
+    fn plan(&self) -> &'static [Installation] {
+        &[
+            Installation::Publication,
+            Installation::DdlTrigger,
+            Installation::Slot,
+            Installation::ProgressTables,
+        ]
+    }
+    fn markers_after(&self, step: Installation) -> Result<Vec<StartupMarker>> {
+        let mut markers = Vec::new();
+        if step == Installation::Slot {
+            if let Some(marker) = self.schema_baseline() {
+                markers.push(StartupMarker {
+                    stream: crate::pg::ddl::BASELINE_STREAM.into(),
+                    marker,
+                    label: "slot-double-sample".into(),
+                });
+            }
+            if let Some(marker) = self.slot_marker()? {
+                markers.push(StartupMarker {
+                    stream: "source-slot".into(),
+                    marker,
+                    label: "installed".into(),
+                });
+            }
+        }
+        Ok(markers)
+    }
     fn schema_baseline(&self) -> Option<String> {
         None
     }
@@ -543,12 +600,25 @@ impl Engine {
                     "engine start requires assessed".into(),
                 ));
             }
-            for step in [
-                Installation::Publication,
-                Installation::DdlTrigger,
-                Installation::Slot,
-                Installation::ProgressTables,
-            ] {
+            let plan = installer.plan();
+            if plan.is_empty() {
+                return Err(coordinator::Error::InstallationPlan(
+                    InstallationPlanError::Empty,
+                ));
+            }
+            for (index, step) in plan.iter().enumerate() {
+                if plan[..index].contains(step) {
+                    return Err(coordinator::Error::InstallationPlan(
+                        InstallationPlanError::Duplicate(*step),
+                    ));
+                }
+            }
+            if !plan.contains(&Installation::ProgressTables) {
+                return Err(coordinator::Error::InstallationPlan(
+                    InstallationPlanError::MissingProgressTables,
+                ));
+            }
+            for &step in plan {
                 let payload = format!("{}:{}", step.name(), installer.identity());
                 let mut coordinator = self.runtime.0.lock().await;
                 let outcome = coordinator
@@ -560,22 +630,9 @@ impl Engine {
                     coordinator.state().clone();
                 drop(coordinator);
                 outcome?;
-                if step == Installation::Slot
-                    && let Some(baseline) = installer.schema_baseline()
-                {
+                for marker in installer.markers_after(step)? {
                     self.runtime
-                        .marker(
-                            crate::pg::ddl::BASELINE_STREAM,
-                            baseline,
-                            "slot-double-sample".into(),
-                        )
-                        .await?;
-                }
-                if step == Installation::Slot
-                    && let Some(marker) = installer.slot_marker()?
-                {
-                    self.runtime
-                        .marker("source-slot", marker, "installed".into())
+                        .marker(&marker.stream, marker.marker, marker.label)
                         .await?;
                 }
             }
@@ -1621,3 +1678,243 @@ mod fenced_resume_tests;
 
 #[cfg(test)]
 mod schema_restore_tests;
+
+#[cfg(test)]
+mod installer_plan_tests {
+    use super::*;
+    use crate::coordinator::local::Local;
+
+    pub(super) async fn assessed() -> (Engine, Journal, std::path::PathBuf) {
+        let root = std::path::PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
+            .join(format!("installer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("journal")).unwrap();
+        let journal = Journal::new(
+            Arc::new(coordinator::journal::local_store(root.join("journal")).unwrap()),
+            "installer",
+            "test",
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let mut coordinator = Coordinator::observer(
+            journal.clone(),
+            Local::create(root.join("local")).unwrap(),
+            "installer-test",
+        )
+        .unwrap();
+        coordinator.acquire().await.unwrap();
+        coordinator
+            .commit(Transition::Lifecycle {
+                event: Event::Advance {
+                    to: State::Assessed,
+                },
+            })
+            .await
+            .unwrap();
+        (Engine::new(coordinator, journal.clone()), journal, root)
+    }
+
+    // Exercises the PG startup protocol, not database SQL. The live engine test
+    // qualifies the actual PG installer against PostgreSQL.
+    struct PgProtocol;
+    impl Installer for PgProtocol {
+        fn identity(&self) -> String {
+            "pg-test".into()
+        }
+        fn schema_baseline(&self) -> Option<String> {
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+        }
+        fn slot_marker(&self) -> Result<Option<String>> {
+            Ok(Some("checkpoint".into()))
+        }
+        async fn install(&mut self, _: Installation) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn pg_start_journal_bytes_unchanged() {
+        let (engine, journal, root) = assessed().await;
+        engine.start(&mut PgProtocol).await.unwrap();
+        let transitions: Vec<_> = journal
+            .history_page(2, 128)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.transition)
+            .collect();
+        let bytes = serde_json::to_vec(&transitions).unwrap();
+        assert_eq!(bytes, br##"[{"kind":"intent","effect":"buffer-publication","payload":"engine-install-publication-v1:pg-test"},{"kind":"effect-completed","intent_seq":3},{"kind":"intent","effect":"buffer-publication","payload":"engine-install-ddl-trigger-v1:pg-test"},{"kind":"effect-completed","intent_seq":5},{"kind":"intent","effect":"buffer-publication","payload":"engine-install-slot-v1:pg-test"},{"kind":"effect-completed","intent_seq":7},{"kind":"progress","stream":"scoped-schema-baseline-v1","marker":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","position":"slot-double-sample"},{"kind":"progress","stream":"source-slot","marker":"checkpoint","position":"installed"},{"kind":"intent","effect":"buffer-publication","payload":"engine-install-progress-tables-v2:pg-test"},{"kind":"effect-completed","intent_seq":11},{"kind":"lifecycle","event":{"event":"advance","to":"copying"}}]"##);
+        assert_eq!(engine.runtime.state().await.lifecycle.state, State::Copying);
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+#[cfg(test)]
+mod connector_installer_tests {
+    use super::installer_plan_tests::assessed;
+    use super::*;
+
+    const PLAN: &[Installation] = &[
+        Installation::ControlSchema,
+        Installation::SourceStartup,
+        Installation::DestinationSchema,
+        Installation::ProgressTables,
+    ];
+    struct ConnectorInstaller {
+        journal: Journal,
+        plan: &'static [Installation],
+        called: Vec<Installation>,
+        fail: Option<Installation>,
+    }
+    impl Installer for ConnectorInstaller {
+        fn identity(&self) -> String {
+            "connector-test".into()
+        }
+        fn plan(&self) -> &'static [Installation] {
+            self.plan
+        }
+        fn markers_after(&self, step: Installation) -> Result<Vec<StartupMarker>> {
+            Ok(if step == Installation::SourceStartup {
+                vec![StartupMarker {
+                    stream: "source-startup".into(),
+                    marker: "native-position".into(),
+                    label: "installed".into(),
+                }]
+            } else {
+                vec![]
+            })
+        }
+        async fn install(&mut self, step: Installation) -> Result<()> {
+            // Read the real durable journal inside the adapter: its intent must
+            // already exist and must be the last entry before the effect runs.
+            let history = self.journal.history_page(2, 128).await?;
+            assert_eq!(
+                history.last().unwrap().transition,
+                Transition::Intent {
+                    effect: EffectKind::BufferPublication,
+                    payload: format!("{}:connector-test", step.name()),
+                }
+            );
+            let intents: Vec<_> = history
+                .iter()
+                .filter_map(|e| match &e.transition {
+                    Transition::Intent { payload, .. } => Some(payload.clone()),
+                    _ => None,
+                })
+                .collect();
+            self.called.push(step);
+            assert_eq!(
+                intents,
+                self.called
+                    .iter()
+                    .map(|step| format!("{}:connector-test", step.name()))
+                    .collect::<Vec<_>>()
+            );
+            if self.fail == Some(step) {
+                return Err(recovery("injected installer failure"));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn connector_plan_orders_durable_intents_effects_and_markers() {
+        let (engine, journal, root) = assessed().await;
+        let mut installer = ConnectorInstaller {
+            journal: journal.clone(),
+            plan: PLAN,
+            called: vec![],
+            fail: None,
+        };
+        engine.start(&mut installer).await.unwrap();
+        assert_eq!(installer.called, PLAN);
+        let history = journal.history_page(2, 128).await.unwrap();
+        assert_eq!(history.len(), 10);
+        assert!(matches!(
+            &history[3].transition,
+            Transition::EffectCompleted { .. }
+        ));
+        assert_eq!(
+            history[4].transition,
+            Transition::Progress {
+                stream: "source-startup".into(),
+                marker: "native-position".into(),
+                position: "installed".into(),
+            }
+        );
+        assert!(
+            matches!(&history[5].transition, Transition::Intent { payload, .. } if payload == "engine-install-destination-schema-v1:connector-test")
+        );
+        assert_eq!(engine.runtime.state().await.lifecycle.state, State::Copying);
+        drop(installer);
+        drop(engine);
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failing_step_has_no_completion_or_later_intent() {
+        let (engine, journal, root) = assessed().await;
+        let mut installer = ConnectorInstaller {
+            journal: journal.clone(),
+            plan: PLAN,
+            called: vec![],
+            fail: Some(Installation::SourceStartup),
+        };
+        assert!(engine.start(&mut installer).await.is_err());
+        assert_eq!(installer.called, PLAN[..2]);
+        let history = journal.history_page(2, 128).await.unwrap();
+        assert_eq!(history.len(), 3);
+        assert!(
+            matches!(&history[2].transition, Transition::Intent { payload, .. } if payload == "engine-install-source-startup-v1:connector-test")
+        );
+        assert_eq!(
+            engine.runtime.state().await.lifecycle.state,
+            State::Assessed
+        );
+        drop(installer);
+        drop(engine);
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_plans_rejected_before_intents_or_effects() {
+        for (plan, expected) in [
+            (&[][..], InstallationPlanError::Empty),
+            (
+                &[
+                    Installation::ControlSchema,
+                    Installation::ControlSchema,
+                    Installation::ProgressTables,
+                ][..],
+                InstallationPlanError::Duplicate(Installation::ControlSchema),
+            ),
+            (
+                &[Installation::SourceStartup][..],
+                InstallationPlanError::MissingProgressTables,
+            ),
+        ] {
+            let (engine, journal, root) = assessed().await;
+            let mut installer = ConnectorInstaller {
+                journal: journal.clone(),
+                plan,
+                called: vec![],
+                fail: None,
+            };
+            assert!(
+                matches!(engine.start(&mut installer).await, Err(coordinator::Error::InstallationPlan(error)) if error == expected)
+            );
+            assert!(installer.called.is_empty());
+            assert!(journal.history_page(2, 128).await.unwrap().is_empty());
+            assert_eq!(
+                engine.runtime.state().await.lifecycle.state,
+                State::Assessed
+            );
+            drop(installer);
+            drop(engine);
+            drop(journal);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}

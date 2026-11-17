@@ -28,6 +28,7 @@ pub enum Error {
     BudgetExceeded(budget::Blocker),
     SourceBinding(SourceBindingError),
     NativeVerification(verification::native::Error),
+    InstallationPlan(crate::engine::InstallationPlanError),
     RecoveryRequired(String),
     UnsupportedFormatVersion {
         format: &'static str,
@@ -52,6 +53,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InstallationPlan(error) => error.fmt(f),
             Self::SourceBinding(error) => error.fmt(f),
             Self::NativeVerification(error) => error.fmt(f),
             Self::BudgetExceeded(b) => write!(

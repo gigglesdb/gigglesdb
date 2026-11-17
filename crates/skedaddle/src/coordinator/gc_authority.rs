@@ -618,6 +618,7 @@ pub fn coordinator_gc_error(error: Error) -> reader::Error {
         Error::RecoveryRequired(_)
         | Error::SourceBinding(_)
         | Error::NativeVerification(_)
+        | Error::InstallationPlan(_)
         | Error::UnsupportedFormatVersion { .. }
         | Error::Rejected(_)
         | Error::Lifecycle(_)
