@@ -4,9 +4,23 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(super) struct Returning {
     query: query::Query,
+    images: bool,
+    materialized: Option<(Description, BTreeMap<Vec<u8>, SqlRow>)>,
 }
 
 impl Returning {
+    pub(super) fn materialized(
+        table: &str,
+        mut description: Description,
+        rows: BTreeMap<Vec<u8>, SqlRow>,
+    ) -> Self {
+        description.parameters.clear();
+        Self {
+            query: query::Query::materialized_returning(table, &description.columns),
+            images: false,
+            materialized: Some((description, rows)),
+        }
+    }
     pub(super) fn bind_schema_names(
         &mut self,
         bind: &impl Fn(&mut String),
@@ -24,6 +38,31 @@ impl Returning {
         &mut self.query
     }
 
+    pub(super) fn apply_type_oids(
+        &self,
+        state: &Relational,
+        description: &mut Description,
+    ) -> R<()> {
+        if let Some((d, _)) = &self.materialized {
+            description.type_oids.clone_from(&d.type_oids);
+        }
+        if self.images {
+            let oid = type_oid(state.tables[self.query.target()].id)?
+                .checked_add(3)
+                .ok_or(SqlError::Limit)?;
+            for (slot, whole) in description
+                .type_oids
+                .iter_mut()
+                .zip(self.query.image_whole_columns(state)?)
+            {
+                if whole {
+                    *slot = oid;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn reads_columns(&self) -> bool {
         self.query.projection_reads_columns()
     }
@@ -35,9 +74,55 @@ impl Returning {
         if !p.word("returning") {
             return Ok(None);
         }
+        let mut aliases = [("old".to_owned(), "old"), ("new".to_owned(), "new")];
+        if p.word("with") {
+            p.punct('(')?;
+            loop {
+                let image = if p.word("old") {
+                    0
+                } else {
+                    p.need("new")?;
+                    1
+                };
+                p.need("as")?;
+                aliases[image].0 = p.name()?;
+                if !p.sym(',') {
+                    break;
+                }
+            }
+            p.punct(')')?;
+        }
+        let mut query = query::Query::returning(p, table)?;
+        let images = query.rewrite_returning_images(&aliases)?;
         Ok(Some(Self {
-            query: query::Query::returning(p, table)?,
+            query,
+            images,
+            materialized: None,
         }))
+    }
+
+    fn image_catalog(&self, state: &Relational) -> R<Relational> {
+        let mut catalog = state.clone();
+        let table = catalog
+            .tables
+            .get_mut(self.query.target())
+            .ok_or(SqlError::UnknownTable)?;
+        let columns = table.logical_columns().cloned().collect::<Vec<_>>();
+        for image in ["old", "new"] {
+            for column in &columns {
+                let mut column = column.clone();
+                column.name = format!("\0returning_{image}_{}", column.name);
+                column.not_null = false;
+                table.columns.push(column);
+            }
+            table.columns.push(ColumnDef {
+                id: 0,
+                name: format!("\0returning_{image}"),
+                data_type: DataType::Text,
+                not_null: false,
+            });
+        }
+        Ok(catalog)
     }
 
     pub(super) fn describe(
@@ -45,10 +130,16 @@ impl Returning {
         state: &Relational,
         seed: Vec<Option<DataType>>,
     ) -> R<(Vec<ColumnDef>, Vec<DataType>, Vec<i32>)> {
+        if let Some((d, _)) = &self.materialized {
+            return Ok((d.columns.clone(), d.parameters.clone(), d.typmods.clone()));
+        }
+        let catalog = self.images.then(|| self.image_catalog(state)).transpose()?;
+        let binding = catalog.as_ref().unwrap_or(state);
         let description = self
             .query
-            .bind_projection_seeded(state, seed)?
-            .description(state);
+            .image_projection(self.images, state)?
+            .bind_projection_seeded(binding, seed)?
+            .description(binding);
         Ok((
             description.columns,
             description.parameters,
@@ -74,7 +165,11 @@ impl Returning {
         seed: Vec<Option<DataType>>,
         clock: Option<&super::clock::ExecutionClock>,
     ) -> R<Vec<SqlRow>> {
-        let bound = self.query.bind_seeded(state, seed)?.with_clock(clock);
+        let catalog = self.images.then(|| self.image_catalog(state)).transpose()?;
+        let projection = self.query.image_projection(self.images, state)?;
+        let bound = projection
+            .bind_seeded(catalog.as_ref().unwrap_or(state), seed)?
+            .with_clock(clock);
         let mut bytes = 0usize;
         let mut work = 0usize;
         let unbounded = spill::returning_is_unbounded();
@@ -200,6 +295,7 @@ pub(super) struct Plan<'a> {
     returning: &'a Returning,
     description: Description,
     clock: Option<super::clock::ExecutionClock>,
+    command: &'static str,
 }
 impl<'a> Plan<'a> {
     pub(super) fn new(
@@ -227,6 +323,7 @@ impl<'a> Plan<'a> {
             returning,
             description,
             clock: clock.cloned(),
+            command: prepared.command(),
         }))
     }
 }
@@ -237,13 +334,66 @@ pub(super) fn project(
     params: &[Value],
     rows: &[&SqlRow],
 ) -> R<Vec<SqlRow>> {
+    let Some(bound) = plan else {
+        return Ok(vec![]);
+    };
+    let pairs = rows
+        .iter()
+        .map(|row| match bound.command {
+            "DELETE" => (Some(*row), None),
+            "INSERT" => (None, Some(*row)),
+            _ => (Some(*row), Some(*row)),
+        })
+        .collect::<Vec<_>>();
+    project_pairs(plan, state, params, &pairs)
+}
+
+pub(super) fn project_pairs(
+    plan: &Option<Plan<'_>>,
+    state: &Relational,
+    params: &[Value],
+    rows: &[(Option<&SqlRow>, Option<&SqlRow>)],
+) -> R<Vec<SqlRow>> {
     let Some(plan) = plan else {
         return Ok(vec![]);
     };
-    let inputs = rows
-        .iter()
-        .map(|row| row.values.as_slice())
-        .collect::<Vec<_>>();
+    let table = &state.tables[plan.returning.query.target()];
+    if let Some((_, materialized)) = &plan.returning.materialized {
+        return rows
+            .iter()
+            .map(|(old, new)| {
+                let source = old.or(*new).ok_or(SqlError::UnknownColumn)?;
+                let mut row = materialized
+                    .get(&pk(table, &source.values)?)
+                    .cloned()
+                    .ok_or(SqlError::UnknownColumn)?;
+                row.version = new.or(*old).map_or(0, |r| r.version);
+                Ok(row)
+            })
+            .collect();
+    }
+    let mut owned = vec![];
+    for (old, new) in rows {
+        let primary = new.or(*old).ok_or(SqlError::UnknownColumn)?;
+        let mut values = primary.values.clone();
+        if plan.returning.images {
+            for image in [old, new] {
+                let logical = table
+                    .logical_offsets()
+                    .into_iter()
+                    .map(|i| image.map_or(Value::Null, |r| r.values[i].clone()))
+                    .collect::<Vec<_>>();
+                values.extend(logical.iter().cloned());
+                values.push(if image.is_some() {
+                    Value::Text(query::plan::record(&logical)?)
+                } else {
+                    Value::Null
+                });
+            }
+        }
+        owned.push(values);
+    }
+    let inputs = owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
     let seed = plan
         .description
         .parameters
@@ -255,7 +405,7 @@ pub(super) fn project(
         plan.returning
             .project_seeded(state, params, &inputs, seed, plan.clock.as_ref())?;
     for (projected, source) in output.iter_mut().zip(rows) {
-        projected.version = source.version;
+        projected.version = source.1.or(source.0).map_or(0, |r| r.version);
     }
     Ok(output)
 }

@@ -207,17 +207,17 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
                 } else {
                     let start = p.at;
                     let parameters = p.params.clone();
-                    let plain = value(p)?;
-                    if p.tokens.get(p.at) == Some(&Token::Symbol(':')) {
+                    let plain = value(p);
+                    if plain.is_err() || !matches!(p.tokens.get(p.at), Some(Token::Symbol(',' | ')'))) {
                         p.at = start;
                         p.params = parameters;
                         casts.insert(
                             (rows.len(), row.len()),
-                            query::conflict::Expression::input_cast(p)?,
+                            query::conflict::Expression::input(p)?,
                         );
                         Expr::Literal(Value::Null)
                     } else {
-                        plain
+                        plain?
                     }
                 });
                 if !p.sym(',') {
@@ -925,8 +925,8 @@ fn input_value(
     if let Some(expression) = insert.casts.get(&(row_index, slot)) {
         let parameters = insert.describe(state, params.len(), declared)?.parameters
             .into_iter().map(Some).collect::<Vec<_>>();
-        expression.bind(table, None, &table.columns[index].data_type, &parameters, clock)?
-            .evaluate(&SqlRow { values: vec![], version: 0 }, &[], params, &mut 0)
+        let bound = expression.bind(table, None, &table.columns[index].data_type, &parameters, clock)?;
+        bound.evaluate(&SqlRow { values: vec![], version: 0 }, &[], params, &mut 0)
     } else if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some)) {
         assign::plain_value(state, expression, &table.columns[index], declared, params, clock)
     } else {

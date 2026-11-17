@@ -7,6 +7,7 @@ pub(super) struct Relation<'a> {
     pub columns: Vec<ColumnDef>,
     pub typmods: Vec<i32>,
     pub rows: Vec<SqlRow>,
+    pub affected: u64,
     pub(super) scope: RetentionScope<'a>,
 }
 impl<'a> Relation<'a> {
@@ -15,6 +16,7 @@ impl<'a> Relation<'a> {
             columns,
             typmods,
             rows: vec![],
+            affected: 0,
             scope: RetentionScope::new(execution),
         }
     }

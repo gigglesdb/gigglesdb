@@ -301,7 +301,7 @@ fn map_filter(p: &mut Filter, f: &mut impl FnMut(&mut Scalar) -> R<()>) -> R<()>
     }
     Ok(())
 }
-pub(super) fn map_query(q: &mut Query, f: &mut impl FnMut(&mut Scalar) -> R<()>) -> R<()> {
+pub(in crate::relational::query) fn map_query(q: &mut Query, f: &mut impl FnMut(&mut Scalar) -> R<()>) -> R<()> {
     for (item, _) in &mut q.items {
         if let Item::Scalar(s) | Item::Aggregate(_, Some(s)) = item {
             map_scalar(s, f)?;

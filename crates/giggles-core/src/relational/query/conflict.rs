@@ -61,22 +61,25 @@ impl Expression {
         self.0.sequence_dependencies(&mut dependencies);
         dependencies
     }
-    // Multi-row VALUES keeps its existing literal grammar, with explicit casts
-    // admitted through the same scalar cast implementation as UPDATE.
-    pub(in crate::relational) fn input_cast(p: &mut Parser) -> R<Self> {
+    /// Input-only VALUES expressions share INSERT's scalar admission and assignment.
+    pub(in crate::relational) fn input(p: &mut Parser) -> R<Self> {
         let expression = Self::parse(p)?;
-        fn input(value: &Scalar) -> bool {
-            match value {
-                Scalar::Cast(value, _) | Scalar::Domain(value, ..) | Scalar::Unary(_, value) => {
-                    input(value)
+        fn input(s: &Scalar) -> R<()> {
+            match s {
+                Scalar::Column(_) => Err(SqlError::UnknownColumn),
+                Scalar::Cast(s,_) | Scalar::Domain(s,..) | Scalar::Unary(_,s) => input(s),
+                Scalar::Binary(_,a,b) => { input(a)?; input(b) }
+                Scalar::Call(_,args) => args.iter().try_for_each(input),
+                Scalar::SubstringOrder(args) => args.iter().try_for_each(|s| input(s)),
+                Scalar::Predicate(f) => f.visit_scalars(&mut input),
+                Scalar::Case(c) => {
+                    for (f,s) in &c.arms { f.visit_scalars(&mut input)?; input(s)?; }
+                    c.otherwise.as_ref().map_or(Ok(()),input)
                 }
-                Scalar::Literal(_) | Scalar::Param(_) => true,
-                _ => false,
+                _ => Ok(()),
             }
         }
-        if !matches!(expression.0, Scalar::Cast(..)) || !input(&expression.0) {
-            return Err(SqlError::Unsupported);
-        }
+        input(&expression.0)?;
         Ok(expression)
     }
     pub(in crate::relational) fn parse(p: &mut Parser) -> R<Self> {

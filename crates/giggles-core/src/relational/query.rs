@@ -2,6 +2,7 @@
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
+mod returning_images;
 mod aggregate_filter;
 mod functions;
 pub(super) mod plan;
@@ -201,6 +202,8 @@ struct QueryPrefix {
 
 #[derive(Debug, Clone, Default)]
 struct QueryClauses {
+    allow_duplicate_outputs: bool,
+    mutation_keys: Option<std::sync::Arc<BTreeSet<Vec<u8>>>>,
     join_namespace: Option<plan::join::Namespace>,
     view_reads: Vec<String>,
     distinct: bool,
@@ -2711,6 +2714,8 @@ impl Query {
                 filter
             } else {
                 Some(Filter::Clauses(Box::new(QueryClauses {
+                    allow_duplicate_outputs: false,
+                    mutation_keys: None,
                     join_namespace: None,
                     view_reads: vec![],
                     distinct,
@@ -3995,7 +4000,7 @@ impl Query {
         for (item, alias) in &self.items {
             if let Some(a) = alias
                 && !aliases.insert(a)
-                && self.clauses().is_none_or(|c| c.join_namespace.is_none())
+                && self.clauses().is_none_or(|c| c.join_namespace.is_none() && !c.allow_duplicate_outputs)
             {
                 return Err(SqlError::Duplicate);
             }
@@ -5047,6 +5052,7 @@ impl BoundQuery<'_> {
         let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
         let mut meter = scan::Meter::per_row(cancel);
         let filtered = scan::filtered(input, &mut meter, |row| {
+            if !self.query.mutation_input_contains(&row.key) { return Ok(None); }
             let mut work = 0;
             let tuple = Tuple {
                 values: vec![row.row.values.clone()],

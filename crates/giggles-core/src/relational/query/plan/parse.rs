@@ -41,6 +41,7 @@ impl Plan {
             // Parenthesized query expressions are owned by the planner.
             return true;
         }
+        if mutation::claims(tokens) { return true; }
         if !tokens.first().is_some_and(|t| word(t, "select")) {
             return tokens
                 .first()
@@ -195,6 +196,7 @@ pub(super) fn expression(
     if tokens.is_empty() {
         return Err(SqlError::Syntax.into());
     }
+    if mutation::claims(tokens) { return mutation::parse(tokens, owner, depth, next); }
     if tokens.first().is_some_and(|t| word(t, "with")) {
         return cte::parse(tokens, owner, depth, next);
     }

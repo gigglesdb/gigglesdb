@@ -4,6 +4,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(in crate::relational) struct Plan {
     pub(super) body: Body,
+    pub(super) mutation: Option<Box<mutation::Mutation>>,
     pub(super) ctes: Vec<cte::Cte>,
     pub(super) order: Vec<(Scalar, bool, bool)>,
     pub(super) limit: Option<Scalar>,
@@ -47,14 +48,18 @@ impl Plan {
     pub(super) fn new(body: Body) -> Self {
         Self {
             body,
+            mutation: None,
             ctes: vec![],
             order: vec![],
             limit: None,
             offset: None,
         }
     }
+    pub(in crate::relational) fn paged_mutation(&self) -> Option<&mutation::Mutation> {
+        self.ctes.is_empty().then_some(self.mutation.as_deref()).flatten()
+    }
     pub(in crate::relational) fn read_tables(&self) -> Vec<String> {
-        let mut out = vec![];
+        let mut out = self.mutation.as_ref().map_or_else(Vec::new, |m| m.read_tables());
         self.visit_queries(&mut |q| {
             for name in q.read_tables() {
                 if !name.starts_with("\0plan_") && !out.contains(&name) {
@@ -83,17 +88,19 @@ impl Plan {
         out
     }
     pub(in crate::relational) fn write_tables(&self) -> Vec<(String, &'static str)> {
-        self.ctes
+        let mut tables: Vec<_> = self.ctes
             .iter()
             .flat_map(|cte| {
                 cte.dml
                     .as_ref()
                     .map_or_else(|| cte.query.write_tables(), |p| p.write_tables())
             })
-            .collect()
+            .collect();
+        if let Some(m) = &self.mutation { tables.push((m.target.clone(),m.command())); }
+        tables
     }
     pub(in crate::relational) fn authorization_tables(&self) -> R<Vec<String>> {
-        let mut out = vec![];
+        let mut out = self.mutation.as_ref().map_or_else(Vec::new, |m| m.read_tables());
         let mut error = None;
         self.visit_queries(&mut |q| match q.authorization_tables() {
             Ok(names) => {
@@ -120,7 +127,7 @@ impl Plan {
         error.map_or(Ok(out), Err)
     }
     pub(in crate::relational) fn sequences(&self) -> Vec<Option<String>> {
-        let mut out = vec![];
+        let mut out = self.mutation.as_ref().map_or_else(Vec::new, |m| m.sequences());
         for cte in &self.ctes {
             if let Some(dml) = &cte.dml {
                 out.extend(dml.sequences());
@@ -188,6 +195,7 @@ impl Plan {
         state: &Relational,
         path: &[String],
     ) -> R<()> {
+        if let Some(m) = &mut self.mutation { m.bind_schema_names(bind, state, path)?; }
         for cte in &mut self.ctes {
             if let Some(dml) = &mut cte.dml {
                 dml.search_path = path.to_vec();

@@ -4,6 +4,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(super) enum Value {
     Default,
+    Rows(std::sync::Arc<BTreeMap<Vec<u8>, super::Value>>),
     Plain(Expr),
     Scalar(Box<query::Query>),
 }
@@ -88,7 +89,7 @@ pub(super) fn indexes(
     sets.iter()
         .map(|(name, value)| {
             let index = col(table, name)?;
-            if !matches!(value, Value::Default) {
+            if !matches!(value, Value::Default | Value::Rows(_)) {
                 defaults::check_explicit(state, &table.columns[index])?;
             }
             Ok(index)
@@ -157,7 +158,7 @@ pub(super) fn describe(
     for ((_, value), index) in sets.iter().zip(indexes) {
         let target = &table.columns[index].data_type;
         match value {
-            Value::Default => {}
+            Value::Default | Value::Rows(_) => {}
             Value::Plain(value) => {
                 infer_mutation_parameter(value, target, &mut parameters, declared, true)?
             }
@@ -209,6 +210,7 @@ pub(super) fn admit_literals(sets: &[(String, Value)]) -> R<()> {
     for (_, value) in sets {
         match value {
             Value::Default => {}
+            Value::Rows(values) => { for value in values.values() { Relational::secondary_admit_values(std::iter::once(value))?; payload_bound(std::iter::once(value))?; } }
             Value::Plain(Expr::Literal(value)) => {
                 Relational::secondary_admit_values(std::iter::once(value))?;
                 payload_bound(std::iter::once(value))?;
@@ -225,6 +227,7 @@ pub(super) fn admit_literals(sets: &[(String, Value)]) -> R<()> {
 }
 
 enum BoundValue<'a> {
+    Rows(&'a BTreeMap<Vec<u8>, super::Value>),
     Default(Option<String>, Option<clock::ExecutionClock>),
     Plain(super::Value),
     Scalar(Box<query::BoundQuery<'a>>),
@@ -295,6 +298,7 @@ impl<'a> Plan<'a> {
             .zip(indexes)
             .map(|((_, value), index)| {
                 let value = match value {
+                    Value::Rows(values) => BoundValue::Rows(values),
                     Value::Default => BoundValue::Default(
                         defaults::default_sql(state, &table.columns[index]),
                         clock.cloned(),
@@ -363,6 +367,7 @@ impl<'a> Plan<'a> {
                 return Err(SqlError::Aborted);
             }
             let value = match value {
+                BoundValue::Rows(values) => values.get(&pk(table,&old.values)?).cloned().ok_or(SqlError::UnknownColumn)?,
                 BoundValue::Default(sql, clock) => match sql {
                     Some(sql) => defaults::evaluate_sql(
                         sql,

@@ -4,6 +4,7 @@ mod ast;
 mod bind;
 mod cte;
 mod dml;
+mod mutation;
 mod exec;
 pub(super) mod join;
 mod parse;
@@ -33,3 +34,5 @@ impl From<SqlError> for ParseError {
         }
     }
 }
+
+pub(in crate::relational) use super::returning_images::record;

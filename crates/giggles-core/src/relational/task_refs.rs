@@ -60,6 +60,7 @@ impl Prepared {
                     out.add_ref(column, Position::AssignTarget);
                     match value {
                         assign::Value::Scalar(q) => q.task_assign_refs(&mut out),
+                        assign::Value::Rows(_) => out.class=crate::task::StatementClass::Other,
                         assign::Value::Plain(_) | assign::Value::Default => {}
                     }
                 }

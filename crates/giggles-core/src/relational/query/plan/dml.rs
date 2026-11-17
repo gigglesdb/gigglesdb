@@ -16,6 +16,10 @@ pub(super) fn parse(tokens: &[Token], owner: &mut Parser) -> R<Prepared> {
             p.relations.clear();
             Statement::InsertExpressions(InsertExpressions::parse(&mut p)?)
         }
+        Err(_) if mutation::claims(tokens) => {
+            p = parse::parser(tokens);
+            Statement::Plan(Plan::parse(&mut p).map_err(|e| match e { ParseError::Definite(e)=>e, ParseError::Decline=>SqlError::Unsupported })?)
+        }
         Err(error) => return Err(error),
     };
     let mut prepared = Prepared::engine(statement, 0, 0);
@@ -33,6 +37,7 @@ pub(super) fn parse(tokens: &[Token], owner: &mut Parser) -> R<Prepared> {
 }
 
 pub(super) fn remap(p: &mut Prepared, alias: &str, name: &str) {
+    if let Statement::Plan(plan) = &mut p.statement { cte::remap(plan, alias, name); }
     if let Statement::InsertMulti(insert) = &mut p.statement
         && let Some(source) = &mut insert.source
     {
@@ -180,6 +185,7 @@ pub(super) fn execute<'e>(
     target.secondary =
         target.secondary_build_complete_engine(&descriptors, || execution.cancelled())?;
     let mut relation = Relation::new(description.columns, description.typmods, execution);
+    relation.affected = output.affected;
     for row in output.rows {
         relation.push(row)?;
     }
@@ -187,6 +193,7 @@ pub(super) fn execute<'e>(
 }
 
 impl Plan {
+    #[expect(clippy::too_many_arguments, reason = "shared statement snapshot and optional injected source")]
     pub(in crate::relational) fn execute_dml(
         &self,
         state: &mut Relational,
@@ -195,7 +202,9 @@ impl Plan {
         clock: Option<&super::super::super::clock::ExecutionClock>,
         cancel: &mut dyn FnMut() -> bool,
         events: &mut Vec<crate::relational::constraints::Event>,
+        source: Option<&dyn scan::RowSource>,
     ) -> R<SqlResult> {
+        if self.ctes.is_empty() && let Some(m) = &self.mutation { return m.execute(state, prepared, params, clock, cancel, events, source); }
         let bound = self.bind(state, prepared.params, &prepared.parameter_types)?;
         let parameters: Vec<_> = bound.description.parameters.into_iter().map(Some).collect();
         let snapshot = state.clone();
@@ -203,7 +212,7 @@ impl Plan {
         let relation = cte::run_inner(
             &bound.plan,
             &snapshot,
-            &scan::LegacyRows(&snapshot),
+            source.unwrap_or(&scan::LegacyRows(&snapshot)),
             params,
             &parameters,
             clock,
@@ -217,7 +226,7 @@ impl Plan {
         Ok(SqlResult {
             columns: relation.columns.into_iter().map(|c| c.name).collect(),
             rows: relation.rows,
-            affected: 0,
+            affected: relation.affected,
         })
     }
 }

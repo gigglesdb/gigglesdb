@@ -118,6 +118,7 @@ impl Namespace {
         Ok(out)
     }
 }
+#[derive(Clone)]
 pub(super) struct Shape {
     pub columns: Vec<ColumnDef>,
     pub typmods: Vec<i32>,

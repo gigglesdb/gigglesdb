@@ -137,12 +137,9 @@ pub(super) fn route(
             postimages.push(row);
         }
     }
-    let projected = if updating {
-        postimages.iter().collect::<Vec<_>>()
-    } else {
-        matched.iter().map(|(_, row)| row).collect()
-    };
-    let returned = returning::project(returning, state, params, &projected)?;
+    let pairs = matched.iter().enumerate().map(|(i, (_, old))|
+        (Some(old), if updating { Some(&postimages[i]) } else { None })).collect::<Vec<_>>();
+    let returned = returning::project_pairs(returning, state, params, &pairs)?;
     // Consolidate physical changes by key, keeping the central publisher's
     // immutable-key witness contract even when logical rows move between keys.
     let final_by_key = postkeys
@@ -246,7 +243,7 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
             for ((_, value), index) in sets.iter().zip(indexes) {
                 let ty = &table.columns[index].data_type;
                 match value {
-                    assign::Value::Default => {}
+                    assign::Value::Default | assign::Value::Rows(_) => {}
                     assign::Value::Plain(value) => infer(value, ty, &mut parameters)?,
                     assign::Value::Scalar(value) => {
                         value.infer_assignment(

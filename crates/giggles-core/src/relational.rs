@@ -1078,7 +1078,7 @@ impl Parser {
         } else {
             match self.tokens.get(self.at) {
                 Some(Token::QuotedIdent(_)) => Some(self.name()?),
-                Some(Token::Word(w)) if !["set", "where", "returning"].contains(&w.as_str()) => {
+                Some(Token::Word(w)) if !["set", "using", "where", "returning"].contains(&w.as_str()) => {
                     Some(self.name()?)
                 }
                 _ => None,
@@ -2406,6 +2406,7 @@ impl Prepared {
         if description.type_oids.is_empty() {
             description.type_oids = vec![0; description.columns.len()];
         }
+        if let Some(returning) = this.returning() { returning.apply_type_oids(state, &mut description)?; }
         for (oid, column) in description.type_oids.iter_mut().zip(&description.columns) {
             if *oid == 0
                 && let Some(id) = state.ext.columns.get(&column.id).and_then(|c| c.type_id)
@@ -2784,6 +2785,7 @@ impl Prepared {
                 }
             }
             Statement::TypeDdl(ref ddl) => ddl.command(),
+            Statement::Plan(ref plan) if plan.mutation_command().is_some() => plan.mutation_command().unwrap(),
             Statement::CompositeSelect(_) | Statement::Plan(_) => "SELECT",
             Statement::Sequence(ref ddl) => match ddl {
                 defaults::SequenceDdl::Create { .. } => "CREATE SEQUENCE",
@@ -3941,7 +3943,7 @@ impl Relational {
             Statement::Plan(plan) => {
                 if expected.is_some() { return Err(SqlError::Unsupported); }
                 if !plan.write_tables().is_empty() {
-                    return plan.execute_dml(self, prepared, params, clock, &mut cancel, events);
+                    return plan.execute_dml(self, prepared, params, clock, &mut cancel, events, injected_source);
                 }
                 let legacy = scan::LegacyRows(&*self);
                 return plan.execute(self, injected_source.unwrap_or(&legacy), prepared.params,
@@ -4460,7 +4462,7 @@ impl Relational {
                     // existing final-batch validation is exact here; no UpdateUnique occupancy needed.
                     let mut next_version = self.next_version;
                     row.version = allocate(&mut next_version)?;
-                    returned_rows = returning::project(&returning, self, params, &[&row])?;
+                    returned_rows = returning::project_pairs(&returning, self, params, &[(Some(&old), Some(&row))])?;
                     events.push(constraints::Event {
                         table: table_id,
                         old: old.clone(),

@@ -336,8 +336,9 @@ type MutationSelection = (Prepared, Option<BTreeSet<Vec<u8>>>);
 fn selection(state: &Relational, prepared: &Prepared, params: &[Value],
     clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink,
 ) -> Result<MutationSelection, CoreError> {
-    let keys = searched::target(prepared).filter(|q| moves_primary_key(state, prepared) || q.has_in_subquery())
-        .map(|_| sink.mutation_keys(state, prepared, params, clock)).transpose()?;
+    let supplied = searched::target(prepared).and_then(query::Query::mutation_input_keys);
+    let keys = if supplied.is_some() { supplied } else { searched::target(prepared).filter(|q| moves_primary_key(state, prepared) || q.has_in_subquery())
+        .map(|_| sink.mutation_keys(state, prepared, params, clock)).transpose()? };
     let mut template = prepared.clone();
     if keys.is_some() {
         template.parameter_types = prepared.describe(state).map_err(CoreError::Sql)?

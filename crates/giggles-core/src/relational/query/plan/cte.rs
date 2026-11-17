@@ -234,7 +234,7 @@ fn finish(
         remap(&mut body, alias, &cte.name);
     }
     for (_, cte) in &definitions {
-        if cte.dml.as_ref().is_some_and(|p| p.returning().is_none()) {
+        if cte.dml.as_ref().is_some_and(|p| p.returning().is_none() && !matches!(&p.statement, Statement::Plan(plan) if plan.mutation.as_ref().is_some_and(|m| m.has_returning()))) {
             let referenced = references(&body, &cte.name) > 0
                 || definitions.iter().any(|(_, other)| {
                     references(&other.query, &cte.name) > 0
@@ -281,6 +281,7 @@ fn names_list(p: &mut Parser, close: bool) -> R<Vec<String>> {
     Ok(names)
 }
 pub(super) fn remap(plan: &mut Plan, alias: &str, name: &str) {
+    if let Some(m) = &mut plan.mutation { m.remap(alias, name); }
     for cte in &mut plan.ctes {
         remap(&mut cte.query, alias, name);
         if let Some(dml) = &mut cte.dml {
@@ -786,6 +787,11 @@ pub(super) fn run_inner<'e>(
     };
     let mut body = plan.clone();
     body.ctes.clear();
+    if body.mutation.is_some() {
+        let (target,events)=writes.as_mut().ok_or(SqlError::Unsupported)?;
+        let prepared=Prepared::engine(Statement::Plan(body),0,state.epoch);
+        return dml::execute(&prepared,state,&catalog,&wrapper,target,events,params,parameters,clock,execution);
+    }
     body.run(&catalog, &wrapper, params, parameters, clock, execution)
 }
 type PathKey = Vec<Vec<Value>>;
