@@ -333,7 +333,7 @@ fn process_mixed_group_for_test(seq: &Sequencer, group: Vec<Message>) {
     let mut features = load_features(seq.kv.as_ref()).unwrap();
     let mut subversion = load_subversion(seq.kv.as_ref()).unwrap();
     assert!(!process_group(group, &seq.kv, &ManualClock::new(20), &seq.shared,
-        &mut hlc, &mut log, &mut features, &mut subversion, &seq.config.ts_source, &seq.served));
+        &mut hlc, &mut log, &mut features, &mut subversion, &seq.config.ts_source, &seq.served, &FenceAccess::default()));
 }
 
 fn drop_sequence(key: &[u8]) -> (Pending, mpsc::Receiver<Result<Ts, TxnError>>) {
@@ -452,7 +452,7 @@ fn row_version_highwaters_validate_and_share_commit_sync() {
     let mut features = 0;
     let mut subversion = load_subversion(kv.as_ref()).unwrap();
     assert!(!process_group(group, &kv, &ManualClock::new(10), &seq.shared, &mut hlc,
-        &mut log, &mut features, &mut subversion, &seq.config.ts_source, &seq.served));
+        &mut log, &mut features, &mut subversion, &seq.config.ts_source, &seq.served, &FenceAccess::default()));
     receive.recv().unwrap().unwrap();
     committed.recv().unwrap().unwrap();
     assert_eq!(seq.shared.sync_writes.load(std::sync::atomic::Ordering::Relaxed), 1);

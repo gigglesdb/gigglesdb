@@ -29,9 +29,11 @@ pub(crate) const WIDE_ONCE_RECEIPTS: u64 = 1 << 19;
 pub(crate) const TASK_CATALOG: u64 = 1 << 20;
 /// Kernel namespaces 0x20..=0x2B hold protected task records (GD-0061 R3-600).
 pub(crate) const PROTECTED_RECORDS: u64 = 1 << 21;
+/// A persisted embedded write-fence record is present.
+pub(crate) const WRITE_FENCE: u64 = 1 << 22;
 /// Feature bits whose databases export and restore refuse (GD-0061 D8, R3-111).
 pub(crate) const EXPORT_REFUSED: u64 = TASK_CATALOG | PROTECTED_RECORDS;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 22] = [
+pub(crate) const FEATURE_TABLE: [(u64, &str); 23] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -54,6 +56,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 22] = [
     (WIDE_ONCE_RECEIPTS, "wide_once_receipts"),
     (TASK_CATALOG, "task_catalog"),
     (PROTECTED_RECORDS, "protected_records"),
+    (WRITE_FENCE, "write_fence"),
 ];
 #[path = "meta_range.rs"]
 mod range_local;
@@ -184,6 +187,7 @@ pub(crate) struct MetaInfo {
     pub(crate) engine: String,
     pub(crate) last_commit_ts: Option<u64>,
     pub(crate) gc_watermark: Option<u64>,
+    pub(crate) write_fence: Option<super::write_fence::WriteFenceRecord>,
 }
 fn fixed<const N: usize>(kv: &dyn KvRead, key: &[u8]) -> Result<[u8; N], FormatError> {
     kv.get(Keyspace::Meta, key)
@@ -269,6 +273,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
                 | b"last_commit_ts"
                 | b"gc_watermark"
                 | b"raft_applied"
+                | b"write_fence"
         ) {
             return Err(FormatError::Unsupported("unknown metadata key".into()));
         }
@@ -291,6 +296,14 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
             ));
         }
     }
+    let fence_bytes = kv.get(Keyspace::Meta, b"write_fence").map_err(corrupt)?;
+    if (features & WRITE_FENCE != 0) != fence_bytes.is_some() {
+        return Err(corrupt("write_fence feature/key mismatch"));
+    }
+    let write_fence = fence_bytes
+        .as_deref()
+        .map(super::write_fence::WriteFenceRecord::decode)
+        .transpose()?;
     let domain = fixed(kv, b"domain")?;
     if kv
         .get(Keyspace::Meta, b"engine")
@@ -310,6 +323,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     }
     Ok(MetaInfo {
         stale_counters: Vec::new(),
+        write_fence,
         family,
         subversion,
         features,
@@ -342,7 +356,8 @@ pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
             | RANGES
             | WIDE_ONCE_RECEIPTS
             | TASK_CATALOG
-            | PROTECTED_RECORDS,
+            | PROTECTED_RECORDS
+            | WRITE_FENCE,
     )
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {

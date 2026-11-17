@@ -662,3 +662,14 @@ needs ownership; calls need ownership of the sequence or of the table that
 owns it (Application roles: a table in their allowlist). Refused requests,
 including ones naming a missing sequence, return `42501`. The creator owns a
 natively created sequence, as with SQL.
+
+### Write fence holder
+
+The server JSON accepts `"write_fence_token_file": "/secure/holder-token"`.
+When set, the server reads at most 1 MiB from that file, removes one trailing
+newline (LF or CRLF), rejects an empty token, and opens the database as the
+write fence holder. Keep the file private. The token is never a CLI value or
+logged. This option cannot be combined with cluster or replication mode.
+Without the option, a fenced database still permits reads; writes fail with
+SQLSTATE `25006`, `database is write-fenced (epoch N)`. A wrong token also
+leaves writes fenced. Omit the option for ordinary startup.

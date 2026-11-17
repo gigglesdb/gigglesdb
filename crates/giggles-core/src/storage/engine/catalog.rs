@@ -1742,6 +1742,7 @@ fn commit_error(error: CoreError) -> TxnError {
         CoreError::Sql(SqlError::DependentObjects) => TxnError::DependentObjects,
         CoreError::Limit => TxnError::WriteSetLimit,
         CoreError::Fenced => TxnError::Fenced,
+        CoreError::WriteFenced { epoch } => TxnError::WriteFenced { epoch },
         CoreError::Storage(message) => TxnError::Kv(KvError::Io(message)),
         error => TxnError::Kv(KvError::Corrupt(format!("{error:?}"))),
     }

@@ -1,5 +1,7 @@
 // Each file keeps its own `mod common;`, exactly as when it was its own binary.
 #![allow(clippy::duplicate_mod)]
+#[path = "write_fence_embedded.rs"]
+mod write_fence_embedded;
 #[path = "native_paging.rs"]
 mod native_paging;
 #[path = "alter_add_column_if_not_exists.rs"]

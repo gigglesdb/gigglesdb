@@ -133,6 +133,8 @@ fn export_inner(
         RecoveryPoint::CrashExportWrite,
     )?;
     write_hashed(&mut file, &mut hash, &1u32.to_be_bytes())?;
+    // Meta records are not copied: exports intentionally drop the local fence.
+    let features = (u64::from_be_bytes(features) & !engine::meta::WRITE_FENCE).to_be_bytes();
     write_hashed(&mut file, &mut hash, &features)?;
     write_hashed(&mut file, &mut hash, &ts.0.to_be_bytes())?;
     write_record(&mut file, &mut hash, 0, b"domain", &db.meta.domain)?;
@@ -223,6 +225,9 @@ impl ExportRead {
         }
         if u64::from_be_bytes(header[12..20].try_into().unwrap()) & engine::meta::EXPORT_REFUSED != 0 {
             return Err(CoreError::Unsupported);
+        }
+        if u64::from_be_bytes(header[12..20].try_into().unwrap()) & engine::meta::WRITE_FENCE != 0 {
+            return Err(corrupt("write_fence feature in export"));
         }
         let mut read = Self {
             file: Arc::new(Mutex::new(file)),

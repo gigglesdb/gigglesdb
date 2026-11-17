@@ -31,6 +31,11 @@ name = "all"
 path = "tests/all.rs"
 
 [[test]]
+name = "write_fence_crash"
+path = "tests/write_fence_crash.rs"
+required-features = ["engine-rocksdb"]
+
+[[test]]
 name = "accounting"
 path = "tests/accounting.rs"
 

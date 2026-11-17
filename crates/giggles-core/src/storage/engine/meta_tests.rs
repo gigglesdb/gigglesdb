@@ -153,11 +153,19 @@ fn real_legacy_directory_has_no_rocks_files() {
 fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
-        0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES | WIDE_ONCE_RECEIPTS | TASK_CATALOG | PROTECTED_RECORDS
+        0x1FFFF
+            | KEY_DEPENDENCY_IDENTITY
+            | RANGES
+            | WIDE_ONCE_RECEIPTS
+            | TASK_CATALOG
+            | PROTECTED_RECORDS
+            | WRITE_FENCE
     );
-    assert_eq!(FEATURE_TABLE.len(), 22);
+    assert_eq!(FEATURE_TABLE.len(), 23);
     assert_eq!(FEATURE_TABLE[21], (PROTECTED_RECORDS, "protected_records"));
     assert_eq!(PROTECTED_RECORDS, 1 << 21);
+    assert_eq!(FEATURE_TABLE[22], (WRITE_FENCE, "write_fence"));
+    assert_eq!(WRITE_FENCE, 1 << 22);
     assert_eq!(TASK_CATALOG, 1 << 20);
     for (i, (bit, _)) in FEATURE_TABLE[..14].iter().enumerate() {
         assert_eq!(*bit, 1u64 << i);
@@ -193,7 +201,7 @@ fn feature_positions_and_validation() {
     put(&kv, b"features", &PROTECTED_RECORDS.to_be_bytes());
     assert_eq!(validate_meta(&kv).unwrap().features, PROTECTED_RECORDS);
     assert!(check_features(PROTECTED_RECORDS).is_ok());
-    for i in 22..64 {
+    for i in 23..64 {
         put(&kv, b"features", &(1u64 << i).to_be_bytes());
         assert!(matches!(
             validate_meta(&kv),
@@ -316,9 +324,9 @@ fn features_share_caller_atomic_batch() {
 #[test]
 fn invalid_features_leave_batch_unchanged() {
     for (bits, expected) in [
-        (1 << 22, FormatError::Unsupported("feature bits".into())),
+        (1 << 23, FormatError::Unsupported("feature bits".into())),
         (
-            (1 << 22) | 0xC00,
+            (1 << 23) | 0xC00,
             FormatError::Unsupported("feature bits".into()),
         ),
         (256, corrupt("sequence counters require catalog_ext")),
@@ -506,8 +514,11 @@ fn replicated_creation_is_v2() {
 fn key_dependency_feature_requires_catalog_ext_and_is_monotone() {
     assert!(check_features(64 | KEY_DEPENDENCY_IDENTITY).is_ok());
     assert!(matches!(check_features(KEY_DEPENDENCY_IDENTITY), Err(FormatError::Corrupt(_))));
-    for unknown in [1 << 22, 1 << 40] {
-        assert!(matches!(check_features(unknown | KEY_DEPENDENCY_IDENTITY), Err(FormatError::Unsupported(_))));
+    for unknown in [1 << 23, 1 << 40] {
+        assert!(matches!(
+            check_features(unknown | KEY_DEPENDENCY_IDENTITY),
+            Err(FormatError::Unsupported(_))
+        ));
     }
     let kv = base();
     put(&kv, b"features", &(64 | KEY_DEPENDENCY_IDENTITY).to_be_bytes());
@@ -671,7 +682,7 @@ fn validate_meta_checks_range_local_values() {
         ),
         (
             raw_range_key(2, b"features"),
-            (1u64 << 22).to_be_bytes().to_vec(),
+            (1u64 << 23).to_be_bytes().to_vec(),
             FormatError::Unsupported("feature bits".into()),
         ),
         (child.clone(), descriptor(6), corrupt("range child id mismatch")),
@@ -726,4 +737,36 @@ fn range_keys_are_unknown_without_ranges_feature() {
     put(&kv, b"features", &[0; 7]);
     put(&kv, &key, &[0; 16]);
     assert_eq!(validate_meta(&kv).unwrap_err(), unknown);
+}
+
+#[test]
+fn write_fence_bit_key_agreement_and_decode_at_open() {
+    use super::super::write_fence::{FenceState, WriteFenceRecord, holder_digest};
+    let kv = base();
+    assert!(open_checks(&kv).unwrap().write_fence.is_none());
+    put(&kv, b"features", &WRITE_FENCE.to_be_bytes());
+    assert!(matches!(open_checks(&kv), Err(FormatError::Corrupt(_))));
+    let record = WriteFenceRecord {
+        state: FenceState::Fenced,
+        epoch: 1,
+        holder_digest: holder_digest(b"holder"),
+        changed_at: 42,
+        label: "test".into(),
+    };
+    put(&kv, b"write_fence", &record.encode());
+    assert_eq!(open_checks(&kv).unwrap().write_fence, Some(record));
+    put(&kv, b"features", &0u64.to_be_bytes());
+    assert!(matches!(open_checks(&kv), Err(FormatError::Corrupt(_))));
+    put(&kv, b"features", &WRITE_FENCE.to_be_bytes());
+    put(&kv, b"write_fence", &[1]);
+    assert!(matches!(open_checks(&kv), Err(FormatError::Corrupt(_))));
+}
+
+#[test]
+fn write_fence_old_binary_refuses_feature() {
+    let allowed = FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit);
+    assert_eq!(
+        check_features_allowed(WRITE_FENCE, allowed & !WRITE_FENCE),
+        Err(FormatError::Unsupported("feature bits".into()))
+    );
 }

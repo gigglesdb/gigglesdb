@@ -281,3 +281,6 @@ mod api_role_listener;
 mod cluster_replace;
 #[path = "cluster_ddl_process.rs"] mod cluster_ddl_process;
 #[path = "stdin_shutdown.rs"] mod stdin_shutdown;
+
+#[path = "write_fence_holder_network.rs"]
+mod write_fence_holder_network;

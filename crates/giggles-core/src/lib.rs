@@ -16,7 +16,7 @@ pub use storage::replicated;
 pub use storage::roles;
 pub use storage::{
     Admin, CoreError, CrashPoint, DecisionPoint, Engine, Executor, IndexInfo, Limits, ReclaimStats,
-    RecoveryPoint, SqlIsolation, UpgradePoint, UpgradeReport,
+    RecoveryPoint, SqlIsolation, UpgradePoint, UpgradeReport, WriteFenceStatus,
 };
 pub use storage::{Cursor, SqlSession, SqlTableLockMode};
 mod sqlstate;

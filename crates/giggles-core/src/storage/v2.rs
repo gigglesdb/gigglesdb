@@ -94,7 +94,7 @@ impl V2Db {
     }
     #[cfg(feature = "engine-rocksdb")]
     fn from_kv(kv: Arc<engine::kv::Kv>) -> Result<Self, CoreError> {
-        Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false)
+        Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, None)
     }
     #[cfg(feature = "engine-rocksdb")]
     pub(crate) fn from_backend(
@@ -105,6 +105,7 @@ impl V2Db {
             Arc::new(engine::kv::Kv::new(backend)),
             write_set_bytes,
             true,
+            None,
         )
     }
     #[cfg(feature = "engine-rocksdb")]
@@ -112,6 +113,7 @@ impl V2Db {
         kv: Arc<engine::kv::Kv>,
         write_set_bytes: usize,
         replicated_allowed: bool,
+        token: Option<&[u8]>,
     ) -> Result<Self, CoreError> {
         let meta = engine::meta::open_checks(kv.as_ref()).map_err(format_error)?;
         if meta.features & engine::meta::REPLICATED != 0 && !replicated_allowed {
@@ -136,10 +138,11 @@ impl V2Db {
         if let Some(bytes) = TEST_RECENT_LOG_BYTES.get() {
             config.recent_log_bytes = bytes;
         }
-        let sequencer = engine::commit::Sequencer::open(
+        let sequencer = engine::commit::Sequencer::open_with_holder(
             kv.clone(),
             Arc::new(engine::commit::SystemClock),
             config,
+            token,
         )?;
         let locks = Arc::new(engine::locks::LockManager::new(engine::locks::LockConfig {
             // One million rows plus old/new keys for secondary indexes.
@@ -237,6 +240,7 @@ impl V2Db {
                 engine: "cluster".into(),
                 last_commit_ts: None,
                 gc_watermark: None,
+                write_fence: None,
             },
             sequencer,
             locks: Arc::new(engine::locks::LockManager::new(Default::default())),
@@ -489,6 +493,11 @@ impl V2Db {
     }
 
     pub(crate) fn open(path: &Path) -> Result<Self, CoreError> {
+        Self::open_with_holder(path, None)
+    }
+    pub(crate) fn open_with_holder(path: &Path, token: Option<&[u8]>) -> Result<Self, CoreError> {
+        #[cfg(not(feature = "engine-rocksdb"))]
+        let _ = token;
         if engine::meta::classify_dir(path).map_err(format_error)? != engine::meta::DirClass::V2 {
             return Err(CoreError::Corrupt("not a v2 directory".into()));
         }
@@ -504,7 +513,7 @@ impl V2Db {
             let kv = Arc::new(engine::kv::Kv::new(Arc::new(
                 engine::kv_rocksdb::RocksKv::open(path, 64 * 1024 * 1024)?,
             )));
-            Self::from_kv(kv)
+            Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, token)
         }
     }
 }

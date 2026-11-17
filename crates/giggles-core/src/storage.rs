@@ -2,6 +2,8 @@ use crate::*;
 mod catalog_inspection;
 mod cursor;
 mod drop_table;
+mod write_fence_admin;
+pub use write_fence_admin::WriteFenceStatus;
 pub(crate) mod engine;
 mod once_session;
 /// Task preview `schema_fp` input (GD-0061 R3-701): the catalog encodings of
@@ -114,6 +116,9 @@ pub enum CoreError {
     Deadlock,
     LockNotAvailable,
     Fenced,
+    WriteFenced {
+        epoch: u64,
+    },
     Cancelled,
     Limit,
     Policy(Error),
@@ -127,6 +132,9 @@ pub enum CoreError {
 }
 impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::WriteFenced { epoch } = self {
+            return write!(f, "database is write-fenced (epoch {epoch})");
+        }
         write!(f, "{self:?}")
     }
 }
@@ -1339,12 +1347,22 @@ impl Admin {
     }
     /// Existing database only: no initialization or replacement on damage.
     pub fn open(path: impl AsRef<Path>, limits: Limits) -> Result<Self, CoreError> {
-        upgrade::check_startup(path.as_ref())?;
-        if v2::has_traces(path.as_ref()) {
-            match engine::meta::classify_dir(path.as_ref()).map_err(v2::format_error)? {
+        Self::open_with_holder_token(path.as_ref(), limits, None)
+    }
+    fn open_with_holder_token(
+        path: &Path,
+        limits: Limits,
+        token: Option<&[u8]>,
+    ) -> Result<Self, CoreError> {
+        upgrade::check_startup(path)?;
+        if v2::has_traces(path) {
+            match engine::meta::classify_dir(path).map_err(v2::format_error)? {
                 engine::meta::DirClass::V2 => {
                     return Self::attach_backend(
-                        Backend::V2(Arc::new(v2::V2Db::open(path.as_ref())?)),
+                        Backend::V2(Arc::new(match token {
+                            Some(token) => v2::V2Db::open_with_holder(path, Some(token))?,
+                            None => v2::V2Db::open(path)?,
+                        })),
                         limits,
                     );
                 }
@@ -1354,7 +1372,7 @@ impl Admin {
                 }
             }
         }
-        Self::open_legacy(path.as_ref(), limits, true)
+        Self::open_legacy(path, limits, true)
     }
 
     /// Read legacy data without accepting admission. Buffered redb writes,

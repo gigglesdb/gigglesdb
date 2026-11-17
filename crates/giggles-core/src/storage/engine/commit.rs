@@ -3,8 +3,9 @@ use super::{
     codec::CodecError,
     hlc::{HlcClock, Ts},
     kv::{Durability, Keyspace, Kv, KvRead, WriteBatch},
-    txn::TxnError,
     once_guard::CommitGuard,
+    txn::TxnError,
+    write_fence::{FenceState, WriteFenceRecord, holder_digest},
 };
 use crate::storage::range_api::TsOracle;
 use std::{
@@ -349,6 +350,10 @@ enum Message {
         value: Vec<u8>,
         reply: mpsc::Sender<Result<(), TxnError>>,
     },
+    Fence {
+        action: FenceAction,
+        reply: mpsc::Sender<Result<Option<WriteFenceRecord>, TxnError>>,
+    },
     Shutdown,
 }
 impl From<Pending> for Message {
@@ -359,18 +364,42 @@ impl Message {
         match self {
             Self::Commit(p) => request_bytes(&p.request),
             Self::Counter { key, value, .. } | Self::Highwater { key, value, .. } => key.len() + value.len(),
-            Self::Shutdown => unreachable!("shutdown is never grouped"),
+            Self::Fence { .. } | Self::Shutdown => unreachable!("fence actions and shutdown are never grouped"),
         }
     }
     fn reject(self, error: TxnError) {
         match self {
             Self::Commit(p) => { let _ = p.reply.send(Err(error)); }
             Self::Counter { reply, .. } | Self::Highwater { reply, .. } => { let _ = reply.send(Err(error)); }
-            Self::Shutdown => unreachable!("shutdown is never grouped"),
+            Self::Fence { .. } | Self::Shutdown => unreachable!("fence actions and shutdown are never grouped"),
         }
     }
 }
 
+// Only digests enter the queue; holder tokens are never retained or formatted.
+enum FenceAction {
+    Install { digest: [u8; 32], label: String },
+    Release { digest: [u8; 32], epoch: u64 },
+    Status,
+}
+#[derive(Default)]
+struct FenceAccess {
+    record: Option<WriteFenceRecord>,
+    holder: bool,
+}
+impl FenceAccess {
+    fn check(&self) -> Result<(), TxnError> {
+        if let Some(record) = &self.record
+            && record.state == FenceState::Fenced
+            && !self.holder
+        {
+            return Err(TxnError::WriteFenced {
+                epoch: record.epoch,
+            });
+        }
+        Ok(())
+    }
+}
 pub(crate) struct Sequencer {
     kv: Arc<Kv>,
     config: SequencerConfig,
@@ -396,6 +425,23 @@ impl Sequencer {
         clock: Arc<dyn Clock>,
         config: SequencerConfig,
     ) -> Result<Arc<Self>, TxnError> {
+        Self::open_with_holder(kv, clock, config, None)
+    }
+    pub(crate) fn open_with_holder(
+        kv: Arc<Kv>,
+        clock: Arc<dyn Clock>,
+        config: SequencerConfig,
+        token: Option<&[u8]>,
+    ) -> Result<Arc<Self>, TxnError> {
+        let record = kv
+            .get(Keyspace::Meta, b"write_fence")?
+            .map(|bytes| WriteFenceRecord::decode(&bytes))
+            .transpose()
+            .map_err(|e| TxnError::Kv(super::kv::KvError::Corrupt(e.to_string())))?;
+        let holder = record
+            .as_ref()
+            .is_some_and(|r| token.is_some_and(|t| holder_digest(t) == r.holder_digest));
+        let fence = FenceAccess { record, holder };
         let features = load_features(kv.as_ref())?;
         let subversion = load_subversion(kv.as_ref())?;
         let seed = match kv
@@ -441,6 +487,7 @@ impl Sequencer {
                 seed,
                 features,
                 subversion,
+                fence,
             )
         });
         Ok(Arc::new(Self {
@@ -451,6 +498,34 @@ impl Sequencer {
             sender,
             worker: Mutex::new(Some(worker)),
         }))
+    }
+    fn fence_action(&self, action: FenceAction) -> Result<Option<WriteFenceRecord>, TxnError> {
+        let (reply, receive) = mpsc::channel();
+        self.sender
+            .send(Message::Fence { action, reply })
+            .map_err(|_| TxnError::Fenced)?;
+        receive.recv().unwrap_or(Err(TxnError::Fenced))
+    }
+    pub(crate) fn install_write_fence(&self, token: &[u8], label: &str) -> Result<u64, TxnError> {
+        if label.len() > 256 {
+            return Err(TxnError::WriteSetLimit);
+        }
+        self.fence_action(FenceAction::Install {
+            digest: holder_digest(token),
+            label: label.into(),
+        })?
+        .map(|r| r.epoch)
+        .ok_or(TxnError::Misuse)
+    }
+    pub(crate) fn release_write_fence(&self, token: &[u8], epoch: u64) -> Result<(), TxnError> {
+        self.fence_action(FenceAction::Release {
+            digest: holder_digest(token),
+            epoch,
+        })?;
+        Ok(())
+    }
+    pub(crate) fn write_fence_status(&self) -> Result<Option<WriteFenceRecord>, TxnError> {
+        self.fence_action(FenceAction::Status)
     }
     pub(crate) fn kv(&self) -> &Kv {
         &self.kv
@@ -659,6 +734,7 @@ fn gather(
                 }
                 group.push(item);
             }
+            fence @ Message::Fence { .. } => return (group, Some(fence), false),
             Message::Shutdown => return (group, None, true),
         }
     }
@@ -676,6 +752,7 @@ fn run(
     seed: Ts,
     mut features: u64,
     mut subversion: u32,
+    mut fence: FenceAccess,
 ) {
     let mut hlc = HlcClock::new(seed);
     let mut log = RecentLog::new(config.recent_log_bytes);
@@ -683,6 +760,23 @@ fn run(
     let mut deferred = None;
     while let Some(message) = deferred.take().or_else(|| receiver.recv().ok()) {
         let first = match message {
+            Message::Fence { action, reply } => {
+                let result = if fenced || kv.is_fenced() {
+                    Err(TxnError::Fenced)
+                } else {
+                    process_fence(
+                        &kv,
+                        action,
+                        &mut fence,
+                        &mut features,
+                        &mut hlc,
+                        clock.as_ref(),
+                    )
+                };
+                fenced |= matches!(result, Err(TxnError::CommitAmbiguous | TxnError::Fenced));
+                let _ = reply.send(result);
+                continue;
+            }
             Message::Shutdown => break,
             item => item,
         };
@@ -709,6 +803,7 @@ fn run(
             &mut subversion,
             &config.ts_source,
             &served,
+            &fence,
         );
     }
     for message in receiver.try_iter() {
@@ -719,9 +814,84 @@ fn run(
             Message::Counter { reply, .. } | Message::Highwater { reply, .. } => {
                 let _ = reply.send(Err(TxnError::Fenced));
             }
+            Message::Fence { reply, .. } => {
+                let _ = reply.send(Err(TxnError::Fenced));
+            }
             Message::Shutdown => {}
         }
     }
+}
+fn process_fence(
+    kv: &Kv,
+    action: FenceAction,
+    fence: &mut FenceAccess,
+    features: &mut u64,
+    hlc: &mut HlcClock,
+    clock: &dyn Clock,
+) -> Result<Option<WriteFenceRecord>, TxnError> {
+    if matches!(action, FenceAction::Status) {
+        return Ok(fence.record.clone());
+    }
+    if *features & super::meta::REPLICATED != 0 {
+        return Err(TxnError::Unsupported);
+    }
+    let current_epoch = fence.record.as_ref().map_or(0, |r| r.epoch);
+    let rejected = || TxnError::WriteFenced {
+        epoch: current_epoch,
+    };
+    let mut record = match action {
+        FenceAction::Install { digest, label } => {
+            if label.len() > 256 {
+                return Err(TxnError::WriteSetLimit);
+            }
+            if fence
+                .record
+                .as_ref()
+                .is_some_and(|r| r.state == FenceState::Fenced && r.holder_digest != digest)
+            {
+                return Err(rejected());
+            }
+            WriteFenceRecord {
+                state: FenceState::Fenced,
+                epoch: current_epoch
+                    .checked_add(1)
+                    .ok_or(TxnError::WriteSetLimit)?,
+                holder_digest: digest,
+                changed_at: 0,
+                label,
+            }
+        }
+        FenceAction::Release { digest, epoch } => {
+            let r = fence.record.as_ref().ok_or_else(rejected)?;
+            if r.state != FenceState::Fenced || r.holder_digest != digest || r.epoch != epoch {
+                return Err(rejected());
+            }
+            let mut r = r.clone();
+            r.state = FenceState::Released;
+            r
+        }
+        FenceAction::Status => unreachable!(),
+    };
+    // Publish the record, feature bit and clock seed in one durable batch.
+    let mut next_clock = HlcClock::new(hlc.last);
+    record.changed_at = next_clock.next(clock.now_ms())?.0;
+    let next_features = *features | super::meta::WRITE_FENCE;
+    let mut batch = WriteBatch::default();
+    batch.put(Keyspace::Meta, b"write_fence".to_vec(), record.encode());
+    super::meta::put_features(&mut batch, next_features).map_err(|_| TxnError::Misuse)?;
+    batch.put(
+        Keyspace::Meta,
+        b"last_commit_ts".to_vec(),
+        record.changed_at.to_be_bytes().to_vec(),
+    );
+    kv.write(batch, Durability::Sync)
+        .map_err(|e| write_error(&e))?;
+    // A failed Sync leaves all worker-owned fence state unchanged.
+    *hlc = next_clock;
+    *features = next_features;
+    fence.holder = record.state == FenceState::Fenced;
+    fence.record = Some(record.clone());
+    Ok(Some(record))
 }
 #[allow(clippy::too_many_arguments)]
 fn validate_counter(
@@ -813,9 +983,34 @@ fn process_group(
     subversion: &mut u32,
     ts_source: &TsSource,
     served: &ServedGate,
+    fence: &FenceAccess,
 ) -> bool {
     #[cfg(test)]
     shared.max_group.fetch_max(group.len(), std::sync::atomic::Ordering::Relaxed);
+    // Reject each writer before timestamp reservation, validation or staging;
+    // read-only requests from the same group can still complete. Counter
+    // reservations now share this group path instead of process_counter.
+    // Highwater only advances the row-version allocator's recovery floor; it
+    // publishes no user data. The statement using that range is fenced here
+    // when its Commit arrives, even if its allocator refill has already synced.
+    let group: Vec<_> = group
+        .into_iter()
+        .filter_map(|item| {
+            let writes = match &item {
+                Message::Commit(p) => !p.request.writes.is_empty() || !p.request.raw.is_empty(),
+                Message::Counter { .. } => true,
+                _ => false,
+            };
+            if writes && let Err(error) = fence.check() {
+                item.reject(error);
+                return None;
+            }
+            Some(item)
+        })
+        .collect();
+    if group.is_empty() {
+        return false;
+    }
     // Oracle mode reserves the group's timestamps before anything is staged, so an
     // oracle failure fails every request and writes nothing.
     // Each write request gets its own timestamp of one `next(n)` reservation (first + i).
@@ -899,7 +1094,9 @@ fn process_group(
                 }
                 continue;
             }
-            Message::Shutdown => unreachable!("shutdown is never grouped"),
+            Message::Fence { .. } | Message::Shutdown => {
+                unreachable!("fence actions and shutdown are never grouped")
+            }
         };
         let request = &pending.request;
         let next_features = pending_features | request.features_or;
@@ -1136,6 +1333,7 @@ impl Sequencer {
             &mut subversion,
             &self.config.ts_source,
             &self.served,
+            &FenceAccess::default(),
         );
         receives
             .into_iter()
@@ -1167,3 +1365,7 @@ mod native_format_tests;
 #[cfg(test)]
 #[path = "commit_tssource_tests.rs"]
 mod tssource_tests;
+
+#[cfg(test)]
+#[path = "write_fence_commit_tests.rs"]
+mod write_fence_tests;

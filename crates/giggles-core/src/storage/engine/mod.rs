@@ -40,6 +40,7 @@ mod task_kind_tests;
 
 pub(crate) mod kernel;
 pub(crate) mod meta;
+pub(crate) mod write_fence;
 
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "write_tripwire_tests.rs"]

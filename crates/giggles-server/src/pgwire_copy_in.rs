@@ -126,7 +126,11 @@ impl State {
             copy.failed = true;
             copy.rows.clear();
             copy.remaining.clear();
-            error(code, out);
+            if code == "25006" {
+                diagnostic_error(code, GENERIC_MESSAGE, Some(&self.diagnostic), out);
+            } else {
+                error(code, out);
+            }
             if copy.simple {
                 if copy.simple_implicit {
                     session.sql.rollback();
@@ -230,15 +234,22 @@ impl State {
                         let rows = copy.decoder.finish()?;
                         copy.convert(rows, session)?;
                         let result = if copy.streaming {
-                            if !copy.rows.is_empty() { copy.flush_page(session, copy.rows.len())?; }
-                            core(session.finish_copy_input(&copy.prepared,
-                                copy.normalized.as_ref().unwrap_or(&copy.prepared), &copy.clock))?
-                        } else { core(session.ingest_normalized_copy(
-                            &copy.prepared,
-                            copy.normalized.as_ref().unwrap_or(&copy.prepared),
-                            std::mem::take(&mut copy.rows),
-                            &copy.clock,
-                        ))? };
+                            if !copy.rows.is_empty() {
+                                copy.flush_page(session, copy.rows.len())?;
+                            }
+                            self.diagnostic.core(session.finish_copy_input(
+                                &copy.prepared,
+                                copy.normalized.as_ref().unwrap_or(&copy.prepared),
+                                &copy.clock,
+                            ))?
+                        } else {
+                            self.diagnostic.core(session.ingest_normalized_copy(
+                                &copy.prepared,
+                                copy.normalized.as_ref().unwrap_or(&copy.prepared),
+                                std::mem::take(&mut copy.rows),
+                                &copy.clock,
+                            ))?
+                        };
                         let mut body = vec![];
                         z(&format!("COPY {}", result.affected), &mut body);
                         if copy.simple {
@@ -262,7 +273,11 @@ impl State {
                 copy.failed = true;
                 copy.rows.clear();
                 copy.remaining.clear();
-                error(code, out);
+                if code == "25006" {
+                    diagnostic_error(code, GENERIC_MESSAGE, Some(&self.diagnostic), out);
+                } else {
+                    error(code, out);
+                }
                 if copy.simple {
                     if copy.simple_implicit {
                         session.sql.rollback();

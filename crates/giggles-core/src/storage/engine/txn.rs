@@ -54,6 +54,9 @@ pub(crate) enum TxnError {
     SnapshotTooOld,
     CommitAmbiguous,
     Fenced,
+    WriteFenced {
+        epoch: u64,
+    },
     Misuse,
     /// Not available on this path yet (cluster mode before a later R5 item).
     Unsupported,
@@ -77,6 +80,7 @@ impl TxnError {
             Self::SequenceGone => "42P01",
             Self::DependentObjects => "2BP01",
             Self::Fenced | Self::Misuse => "XX000",
+            Self::WriteFenced { .. } => "25006",
             Self::Unsupported => "0A000",
             Self::Kv(_) | Self::Codec(_) => "XX000",
         }
@@ -113,6 +117,7 @@ impl From<TxnError> for crate::CoreError {
             // The once layer maps LeaseExpired to ClockUncertain before conversion; no wire tag.
             TxnError::Guard(GuardRejection::LeaseExpired) => Self::Busy,
             TxnError::Fenced => Self::Fenced,
+            TxnError::WriteFenced { epoch } => Self::WriteFenced { epoch },
             TxnError::LockLimit | TxnError::WriteSetLimit => Self::Limit,
             TxnError::Serialization(_) | TxnError::SnapshotTooOld => {
                 Self::Sql(crate::relational::SqlError::Conflict)

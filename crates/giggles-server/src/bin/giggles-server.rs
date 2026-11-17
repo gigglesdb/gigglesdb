@@ -49,6 +49,8 @@ struct Config {
     role_statements: giggles_server::admission::RoleStatementLimits,
     #[serde(default)]
     bindings_file: Option<String>,
+    #[serde(default)]
+    write_fence_token_file: Option<String>,
     skew_seconds: u64,
     max_pause_seconds: u64,
     /// GD-0061 R3-205: agent (task) listeners and their binding map.
@@ -90,6 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     if c.replication.is_some() {
+        if c.write_fence_token_file.is_some() {
+            return Err("write_fence_token_file cannot be combined with replication".into());
+        }
         #[cfg(not(feature = "engine-rocksdb"))]
         return Err("replication requires the engine-rocksdb feature".into());
         #[cfg(feature = "engine-rocksdb")]
@@ -128,7 +133,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(feature = "engine-rocksdb"))]
         Some(_) => unreachable!("cluster_validate refuses without engine-rocksdb"),
-        None => Admin::open(&c.database, Limits::default())?,
+        None => match &c.write_fence_token_file {
+            Some(path) => {
+                let mut token = bounded_file(path)?;
+                if token.last() == Some(&b'\n') {
+                    token.pop();
+                    if token.last() == Some(&b'\r') {
+                        token.pop();
+                    }
+                }
+                if token.is_empty() {
+                    return Err("write fence holder token file is empty".into());
+                }
+                eprintln!("write fence holder token loaded from file");
+                Admin::open_as_fence_holder(&c.database, Limits::default(), &token)?
+            }
+            None => Admin::open(&c.database, Limits::default())?,
+        },
     };
     let bindings = match &c.bindings_file {
         Some(path) => serde_json::from_slice(&bounded_file(path)?)?,
@@ -274,6 +295,9 @@ fn cluster_validate(
     cluster: &giggles_server::cluster::config::ClusterConfig,
 ) -> Result<giggles_server::cluster::config::ClusterValidated, String> {
     use std::path::Path;
+    if c.write_fence_token_file.is_some() {
+        return Err("cluster: cannot be combined with write_fence_token_file".into());
+    }
     if c.replication.is_some() {
         return Err("cluster: cannot be combined with replication".into());
     }

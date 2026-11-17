@@ -75,6 +75,8 @@ pub fn failure(e: CoreError) -> Reply {
         CoreError::LockNotAvailable => 20,
         CoreError::Deadlock => 19,
         CoreError::Fenced => 15,
+        // Next free code in the CoreError band (10..=22).
+        CoreError::WriteFenced { .. } => 22,
         CoreError::Limit => 16,
         CoreError::Cancelled => 17,
         CoreError::DuplicateSchema => 18,

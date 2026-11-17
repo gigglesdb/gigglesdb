@@ -161,6 +161,9 @@ impl Diagnostic {
         ) {
             self.wire_message = message;
         }
+        if let Err(error @ CoreError::WriteFenced { .. }) = &result {
+            self.wire_message = Some(error.to_string());
+        }
         if let Err(CoreError::Task(task)) = &result
             && task.name().is_some()
         {
@@ -1485,6 +1488,9 @@ impl State {
                             self.cursors.transaction_end("ROLLBACK");
                             self.settings.transaction(true, false, "ROLLBACK");
                             self.portals.clear();
+                            if matches!(&error, CoreError::WriteFenced { .. }) {
+                                self.diagnostic.wire_message = Some(error.to_string());
+                            }
                             return Err(crate::service::sqlstate(&error));
                         }
                         self.settings.transaction(true, false, "COMMIT");

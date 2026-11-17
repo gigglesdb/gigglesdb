@@ -323,3 +323,90 @@ fn streaming_export_exceeds_legacy_limit_and_detects_corruption() {
     drop(admin);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn export_omits_write_fence_and_restore_has_no_record() {
+    use engine::write_fence::{FenceState, WriteFenceRecord, holder_digest};
+    let root = directory();
+    fs::create_dir(&root).unwrap();
+    let source = Admin::create_engine(root.join("db"), Limits::default(), Engine::V2).unwrap();
+    let Backend::V2(db) = &source.inner.backend else {
+        panic!("expected v2")
+    };
+    let features = engine::meta::validate_meta(db.kv.as_ref())
+        .unwrap()
+        .features;
+    let record = WriteFenceRecord {
+        state: FenceState::Fenced,
+        epoch: 7,
+        holder_digest: holder_digest(b"holder"),
+        changed_at: 42,
+        label: "export test".into(),
+    };
+    let mut batch = WriteBatch::default();
+    batch.put(Keyspace::Meta, b"write_fence".to_vec(), record.encode());
+    engine::meta::put_features(&mut batch, features | engine::meta::WRITE_FENCE).unwrap();
+    db.kv.write(batch, Durability::Sync).unwrap();
+    assert!(
+        engine::meta::open_checks(db.kv.as_ref())
+            .unwrap()
+            .write_fence
+            .is_some()
+    );
+    source.export(root.join("backup")).unwrap();
+    let bytes = fs::read(root.join("backup")).unwrap();
+    assert_eq!(
+        u64::from_be_bytes(bytes[12..20].try_into().unwrap()),
+        features
+    );
+    let restored = Admin::restore(
+        root.join("backup"),
+        root.join("restored"),
+        Limits::default(),
+    )
+    .unwrap();
+    let Backend::V2(copy) = &restored.inner.backend else {
+        panic!("expected v2")
+    };
+    assert!(
+        copy.kv
+            .get(Keyspace::Meta, b"write_fence")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        engine::meta::open_checks(copy.kv.as_ref())
+            .unwrap()
+            .write_fence
+            .is_none()
+    );
+    drop(restored);
+    drop(source);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restore_refuses_export_with_write_fence_bit() {
+    let root = directory();
+    fs::create_dir(&root).unwrap();
+    let source = Admin::create_engine(root.join("db"), Limits::default(), Engine::V2).unwrap();
+    source.export(root.join("backup")).unwrap();
+    drop(source);
+    let mut bytes = fs::read(root.join("backup")).unwrap();
+    let features = u64::from_be_bytes(bytes[12..20].try_into().unwrap());
+    bytes[12..20].copy_from_slice(&(features | engine::meta::WRITE_FENCE).to_be_bytes());
+    let end = bytes.len() - 32;
+    let digest = Sha256::digest(&bytes[..end]);
+    bytes[end..].copy_from_slice(&digest);
+    fs::write(root.join("tagged"), bytes).unwrap();
+    assert!(matches!(
+        Admin::restore(
+            root.join("tagged"),
+            root.join("restored"),
+            Limits::default()
+        ),
+        Err(CoreError::Corrupt(_))
+    ));
+    assert!(!root.join("restored").exists());
+    fs::remove_dir_all(root).unwrap();
+}
