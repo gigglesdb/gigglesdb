@@ -526,3 +526,4 @@ mod v2_on_conflict_caps;
 #[path = "task_preview.rs"] mod task_preview;
 #[path = "task_apply.rs"] mod task_apply;
 #[path = "task_undo.rs"] mod task_undo;
+#[path = "task_limits.rs"] mod task_limits;

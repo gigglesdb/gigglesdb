@@ -17,6 +17,12 @@ pub struct Cursor {
     /// and for buffered cursors, whose rows were scoped when they were read.
     scope: Option<crate::task::rows::Scope>,
     meter: crate::task::rows::StatementMeter,
+    /// The task statement's slots and time limit (GD-0061 R3-401), held from
+    /// open until the cursor is exhausted, expires or is dropped; the guard
+    /// records when the cursor was opened.
+    guard: Option<crate::task::limits::StatementGuard>,
+    /// A fetch after the statement time closed this cursor.
+    expired: bool,
 }
 enum Data {
     Scan {
@@ -52,7 +58,40 @@ impl Cursor {
         let rows = self.fetch_rows(max_rows, max_bytes)?;
         Ok(crate::task::release::Unreleased::new(rows, self.tag.clone()))
     }
+    /// A task cursor's fetch runs within its statement time: a fetch after
+    /// `opened_at + statement_ms` fails with 57014 and closes the cursor,
+    /// which gives its slots back, as exhaustion does (GD-0061 R3-401).
     fn fetch_rows(&mut self, max_rows: usize, max_bytes: usize) -> Result<Vec<SqlRow>, CoreError> {
+        if self.expired {
+            return Err(CoreError::Cancelled);
+        }
+        if self.guard.as_ref().is_some_and(|guard| guard.expired()) {
+            self.expire();
+            return Err(CoreError::Cancelled);
+        }
+        let active = self
+            .guard
+            .as_ref()
+            .map(crate::task::limits::StatementGuard::activate);
+        let result = self.fetch_page(max_rows, max_bytes);
+        drop(active);
+        match &result {
+            Err(_) if self.guard.as_ref().is_some_and(|guard| guard.expired()) => self.expire(),
+            Ok(_) if self.is_exhausted() => self.guard = None,
+            _ => {}
+        }
+        result
+    }
+    /// Closes an expired task cursor: its rows, snapshot and slots go now.
+    fn expire(&mut self) {
+        self.expired = true;
+        self.guard = None;
+        self.data = Data::Buffered(VecDeque::new());
+        if let Some(tag) = &self.tag {
+            tag.fail(&CoreError::Cancelled);
+        }
+    }
+    fn fetch_page(&mut self, max_rows: usize, max_bytes: usize) -> Result<Vec<SqlRow>, CoreError> {
         crate::cancellation::check()?;
         if max_rows == 0 || max_bytes == 0 {
             return Err(CoreError::Sql(SqlError::Limit));
@@ -185,6 +224,9 @@ impl SqlSession {
         // The statement's tag, kept until the outcome is known so a failure
         // is logged as the statement's outcome (GD-0061 R3-309).
         let mut started: Option<Arc<crate::task::release::ReleaseTag>> = None;
+        // Its slots (GD-0061 R3-401): handed to the cursor, or released here
+        // on error or unwind.
+        let mut held: Option<crate::task::limits::StatementGuard> = None;
         let result = (|| {
             crate::cancellation::check()?;
             if self.aborted {
@@ -203,6 +245,10 @@ impl SqlSession {
             // statement is refused here, before any row is read.
             let (tag, expanded) = self.statement_tag(&p)?;
             started = tag.clone();
+            held = crate::task::limits::StatementGuard::enter(self)?;
+            let _active = held
+                .as_ref()
+                .map(crate::task::limits::StatementGuard::activate);
             if let Some(expanded) = expanded {
                 p = expanded;
             }
@@ -355,6 +401,8 @@ impl SqlSession {
                     tag,
                     scope,
                     meter: Default::default(),
+                    guard: None,
+                    expired: false,
                 }),
                 None => {
                     discard(&tag);
@@ -369,7 +417,12 @@ impl SqlSession {
             self.abort();
         }
         drop(started);
-        result
+        result.map(|mut cursor| {
+            if !cursor.is_exhausted() {
+                cursor.guard = held.take();
+            }
+            cursor
+        })
     }
     fn buffer_cursor(
         &mut self,
@@ -398,6 +451,8 @@ impl SqlSession {
             tag,
             scope: None,
             meter: Default::default(),
+            guard: None,
+            expired: false,
         })
     }
 }

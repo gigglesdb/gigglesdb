@@ -162,6 +162,10 @@ impl SqlSession {
         if self.is_aborted() {
             return Err(core(CoreError::Sql(SqlError::Aborted)));
         }
+        // GD-0061 R3-401: a task request's slots and time limit, released on
+        // return, error or unwind.
+        let guard = crate::task::limits::StatementGuard::enter(self).map_err(task_error)?;
+        let _active = guard.as_ref().map(crate::task::limits::StatementGuard::activate);
         let owned = !self.in_transaction();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             validate()?;

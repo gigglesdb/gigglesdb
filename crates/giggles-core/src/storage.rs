@@ -718,6 +718,8 @@ struct Inner {
     admitted: AtomicUsize,
     sql_transactions: AtomicUsize,
     sql_operations: AtomicUsize,
+    /// Statement slots of task sessions (GD-0061 R3-401).
+    task_load: Arc<crate::task::limits::TaskLoad>,
     fenced: AtomicBool,
     limits: Limits,
     crash: Mutex<CrashPoint>,
@@ -1129,6 +1131,11 @@ pub use v2::maintenance::MaintenanceStats;
 pub use v2::reclaim::ReclaimStats;
 
 impl Admin {
+    /// Statement slots of task sessions (GD-0061 R3-401).
+    pub(crate) fn task_load(&self) -> &Arc<crate::task::limits::TaskLoad> {
+        &self.inner.task_load
+    }
+
     /// Runs one deterministic MVCC GC round on a v2 database (Kernel, then
     /// Catalog, Rows and Index), as the background thread does over several
     /// ticks. Legacy storage and replicated databases run no GC.
@@ -1227,6 +1234,7 @@ impl Admin {
                 admitted: AtomicUsize::new(0),
                 sql_transactions: AtomicUsize::new(0),
                 sql_operations: AtomicUsize::new(0),
+                task_load: Arc::new(crate::task::limits::TaskLoad::new(limits.admitted)),
                 fenced: AtomicBool::new(false),
                 limits,
                 crash: Mutex::new(CrashPoint::None),
@@ -3873,11 +3881,16 @@ impl SqlSession {
         let p = expanded.as_ref().unwrap_or(p);
         // A task statement's spill reaches only a task cursor, whose pages
         // carry this tag; any other caller gets it materialised behind the tag.
-        let result = self.refuse_task_write(p).and_then(|()| match tag {
-            Some(_) => relational::spill::task_statement(|| {
-                self.execute_bound_kernel(p, params, expected_version, clock)
-            }),
-            None => self.execute_bound_kernel(p, params, expected_version, clock),
+        let result = self.refuse_task_write(p).and_then(|()| {
+            // GD-0061 R3-401: the task statement's slots and time limit.
+            let guard = crate::task::limits::StatementGuard::enter(self)?;
+            let _active = guard.as_ref().map(crate::task::limits::StatementGuard::activate);
+            match tag {
+                Some(_) => relational::spill::task_statement(|| {
+                    self.execute_bound_kernel(p, params, expected_version, clock)
+                }),
+                None => self.execute_bound_kernel(p, params, expected_version, clock),
+            }
         });
         match result {
             Ok(result) => Ok(crate::task::release::Unreleased::new(result, tag)),
@@ -3888,6 +3901,14 @@ impl SqlSession {
                 Err(error)
             }
         }
+    }
+    /// Statement slots of task sessions on this engine (GD-0061 R3-401).
+    pub(crate) fn task_load(&self) -> &Arc<crate::task::limits::TaskLoad> {
+        self.admin.task_load()
+    }
+    /// Whether this session runs inside the protected commit.
+    pub(crate) fn in_protected_run(&self) -> bool {
+        self.protected.is_some()
     }
     /// Refuses a statement that writes (DML or DDL) in a task session outside
     /// the protected commit (GD-0061 R3-308).

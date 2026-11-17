@@ -19,6 +19,8 @@ pub mod context;
 pub(crate) mod decide;
 pub mod definition;
 pub mod effects;
+// R3-401: statement time, concurrent statements per task, all-agent ceiling.
+pub(crate) mod limits;
 pub mod error;
 // Consumed by the protected commit path (R3-613+); until then only its tests use it.
 #[allow(dead_code)]

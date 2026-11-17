@@ -81,6 +81,21 @@ impl Cancellation {
         work()
     }
 }
+/// Installs `context` as the current invocation until the returned value
+/// drops, which restores the previous one (LIFO, like `Cancellation::scope`).
+pub(crate) fn install(context: Cancellation) -> Installed {
+    Installed(Some(CURRENT.with(|c| c.replace(Some(context)))))
+}
+pub(crate) struct Installed(Option<Option<Cancellation>>);
+impl Drop for Installed {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            CURRENT.with(|c| {
+                c.replace(previous);
+            });
+        }
+    }
+}
 pub fn check() -> Result<(), CoreError> {
     CURRENT.with(|c| c.borrow().as_ref().map_or(Ok(()), Cancellation::check))
 }

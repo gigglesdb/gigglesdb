@@ -226,6 +226,8 @@ pub(crate) struct TaskSessionState {
     pub(crate) pending_text: Mutex<Option<Arc<str>>>,
     /// The statement started last; `finish_task_statement` ends it.
     pub(crate) current: Mutex<Option<Weak<StatementEntry>>>,
+    /// The task's load limits, read once from its definition (R3-401).
+    limits: std::sync::OnceLock<super::definition::LoadLimits>,
 }
 
 impl TaskSessionState {
@@ -240,7 +242,23 @@ impl TaskSessionState {
             entry: AtomicU8::new(super::readlog::ENTRY_PGWIRE_SIMPLE),
             pending_text: Mutex::new(None),
             current: Mutex::new(None),
+            limits: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The task's load limits (R3-401), read by `load` the first time; the
+    /// defaults while the definition cannot be read (not kept).
+    pub(crate) fn load_limits(
+        &self,
+        load: impl FnOnce() -> Result<Option<super::definition::LoadLimits>, TaskError>,
+    ) -> Result<super::definition::LoadLimits, TaskError> {
+        if let Some(limits) = self.limits.get() {
+            return Ok(*limits);
+        }
+        Ok(match load()? {
+            Some(limits) => *self.limits.get_or_init(|| limits),
+            None => super::definition::LoadLimits::default(),
+        })
     }
 
     pub(crate) fn ctx(&self) -> &TaskContext {
