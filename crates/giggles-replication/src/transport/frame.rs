@@ -192,8 +192,12 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Resu
     if bytes.is_empty() || bytes.len() > MAX_FRAME {
         return Err(corrupt());
     }
-    w.write_u32(bytes.len() as u32).await?;
-    w.write_all(bytes).await?;
+    // One write per frame: a separate length write becomes its own TLS record and TCP
+    // segment, and the body then waits on the peer's delayed ACK wherever Nagle applies.
+    let mut out = Vec::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+    w.write_all(&out).await?;
     w.flush().await?;
     Ok(())
 }

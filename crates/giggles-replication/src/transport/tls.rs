@@ -84,6 +84,7 @@ pub(crate) async fn connect_admin(
         .get(&id)
         .ok_or_else(|| Error::Identity(format!("peers[{id}]: unknown or own node")))?;
     let tcp = TcpStream::connect(&peer.address).await?;
+    tcp.set_nodelay(true)?;
     let stream = connector
         .connect(
             ServerName::try_from("localhost").expect("static DNS name"),
@@ -109,6 +110,7 @@ pub async fn accept(
     acceptor: &TlsAcceptor,
     tcp: TcpStream,
 ) -> Result<(u64, tokio_rustls::server::TlsStream<TcpStream>)> {
+    tcp.set_nodelay(true)?;
     let stream = acceptor.accept(tcp).await?;
     let id = stream
         .get_ref()

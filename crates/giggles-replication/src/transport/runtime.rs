@@ -318,6 +318,9 @@ impl Transport {
                                 continue;
                             }
                         };
+                        // Peer traffic is small request/reply frames: without NODELAY, Nagle
+                        // holds each reply for the peer's delayed ACK (40 ms on Linux).
+                        if tcp.set_nodelay(true).is_err() { continue }
                         let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
                         let config = config.clone();
                         let shared = accept_shared.clone();
