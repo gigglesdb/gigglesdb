@@ -187,6 +187,9 @@ impl SqlSession {
     ) -> Result<relational::SqlResult, CoreError> {
         use relational::{SqlError as E, V2Class};
         p.clear_view_diagnostics();
+        // R3-308: where a task read's accepted rows go (pending `rows_read`);
+        // the protected commit's reads are not disclosure.
+        let read_state = if self.protected.is_none() { self.task_state.clone() } else { None };
         if self
             .copy_input
             .as_ref()
@@ -756,6 +759,7 @@ impl SqlSession {
                                     |s| s as &dyn relational::scan::RowSource));
                             if let Some(scoped) = &scoped {
                                 crate::task::rows::record(meter.counts());
+                                if let Some(state) = &read_state { state.add_rows_read(meter.take_read_delta()); }
                                 if let Some(error) = scoped.take_error() { return Err(error.into()); }
                             }
                             if let Some(error) = source.error.take() { return Err(error); }
@@ -788,6 +792,7 @@ impl SqlSession {
                         ) };
                         if scope.is_some() {
                             crate::task::rows::record(meter.counts());
+                            if let Some(state) = &read_state { state.add_rows_read(meter.take_read_delta()); }
                         }
                         if let Some(error) = context.as_ref().and_then(|clock| clock.take_error()) {
                             return Err(error);

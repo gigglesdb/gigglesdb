@@ -186,6 +186,14 @@ fn update_and_native_outcomes_count_only_scope_rows() {
     use crate::operations::{Bindings, Compare, Expr, Intent, Request, ValueExpr};
     let (path, admin) = admin();
     let literal = |value: i64| ValueExpr::Literal(Value::Int(value));
+    // A task session refuses writes outside the protected commit (R3-308);
+    // this test lifts that on its thread to see the scoped results.
+    let refused = agent(&admin)
+        .execute_unreleased("UPDATE shipments SET attempt_count = 5", &[], None)
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(crate::sqlstate(&refused), "0A000");
+    crate::task::release::allow_task_writes_for_test(true);
     // SQL, outside the protected commit: the statement result is scoped too.
     let (result, tag) = agent(&admin)
         .execute_unreleased("UPDATE shipments SET attempt_count = attempt_count + 1", &[], None)
@@ -210,6 +218,32 @@ fn update_and_native_outcomes_count_only_scope_rows() {
         .into_parts();
     assert!(tag.is_some());
     assert_eq!((outcome.matched, outcome.affected), (2, 2));
+    // An invisible key is not found, and a single-row intent whose filter
+    // also matches an invisible row matches exactly the visible one.
+    let update_where = |op: Compare, id: i64| Request::Update {
+        table: "shipments".into(),
+        filter: Expr::Compare(
+            Box::new(Expr::Field("id".into())),
+            op,
+            Box::new(Expr::Value(literal(id))),
+        ),
+        guard: None,
+        values: vec![("attempt_count".into(), literal(9))],
+        intent: Intent::One,
+    };
+    assert_eq!(
+        agent(&admin)
+            .execute_native_unreleased(&update_where(Compare::Eq, 2), &Bindings::new())
+            .map(|_| ()),
+        Err(crate::operations::Error::NotFound)
+    );
+    let one = update_where(Compare::Le, 2);
+    let (outcome, _) = agent(&admin)
+        .execute_native_unreleased(&one, &Bindings::new())
+        .unwrap()
+        .into_parts();
+    assert_eq!((outcome.matched, outcome.affected), (1, 1));
+    crate::task::release::allow_task_writes_for_test(false);
     let read = Request::Read {
         table: "shipments".into(),
         filter: None,

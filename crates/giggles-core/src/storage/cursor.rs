@@ -123,6 +123,9 @@ impl Cursor {
                 );
                 if let Some(scoped) = &scoped {
                     crate::task::rows::record(self.meter.counts());
+                    if let Some(tag) = &self.tag {
+                        tag.add_rows_read(self.meter.take_read_delta());
+                    }
                     if let Some(error) = scoped.take_error() {
                         return Err(error.into());
                     }
@@ -192,6 +195,12 @@ impl SqlSession {
             }
             let mut p = p.clone();
             p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+            // A task cursor's tag carries the output plan; `SELECT *` runs
+            // expanded to the task's columns (GD-0061 R3-308).
+            let (tag, expanded) = self.statement_tag(&p);
+            if let Some(expanded) = expanded {
+                p = expanded;
+            }
             let context = clock.map(|c| {
                 relational::clock::ExecutionClock::new(c)
                     .with_extra_float_digits(self.extra_float_digits)
@@ -321,7 +330,7 @@ impl SqlSession {
                         plan: Box::new(plan),
                     },
                     clock: context,
-                    tag: self.release_tag(),
+                    tag,
                     scope,
                     meter: Default::default(),
                 }),

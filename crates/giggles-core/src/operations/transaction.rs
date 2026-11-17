@@ -402,7 +402,7 @@ pub(super) fn bind_transaction(
                 let checked;
                 let request = match &rules {
                     Some(rules) => {
-                        (bound_table, checked) = task_target(session, rules, request)?;
+                        (bound_table, checked, _) = task_target(session, rules, request)?;
                         &checked
                     }
                     None => {

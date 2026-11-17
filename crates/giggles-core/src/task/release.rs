@@ -1,4 +1,4 @@
-//! Release of task-session results (GD-0061 R3-301, design-3 section 4).
+//! Release of task-session results (GD-0061 R3-301 and R3-308, design-3 section 4).
 //!
 //! Every core exit that can hand rows to a caller has an `*_unreleased` twin
 //! returning [`Unreleased<T>`]. An `Unreleased` value exposes nothing: the only
@@ -9,11 +9,64 @@
 //! The plain exits (`execute`, `execute_prepared`, `Cursor::fetch`,
 //! `execute_native`, ...) are kept for trusted local callers. They refuse a task
 //! session before running anything, so a caller that was never converted to the
-//! twins cannot leak a task's rows.
+//! twins cannot leak a task's rows. A write in a task session is refused by the
+//! twins too, before it runs: the only write path of a task is the protected
+//! commit (`task::commit`).
 //!
-//! This item is pass-through: without a task, `release_page` is a move. With a task
-//! it fails closed (`CoreError::Unsupported`) until the release protocol
-//! (R3-308) lands; `still_valid` and `finish_task_statement` are no-ops.
+//! Without a task, `release_page` is a move: no lock, catalog read,
+//! transaction or allocation. A task page goes through the release protocol
+//! (R3-308), in this order, and nothing reaches an encoder before the last
+//! step:
+//!
+//! 1. the statement deadline (`cancellation::check`);
+//! 2. masking in memory with the statement's [`OutputPlan`] ([`mask_page`]);
+//!    the cost is taken after masking;
+//! 3. validity from the cached catalog view and the database wall clock
+//!    (revoked, then expired, then definition changed), on every page;
+//! 4. unless the session's reservation covers the page and no `rows_read` is
+//!    pending: a transaction of its own takes the engine lock on the
+//!    disclosure head `20|task|01`, re-checks validity at its snapshot, checks
+//!    the head plus the need against the disclosure caps (nothing is written
+//!    or released when one is exceeded), and writes the new head, the debit
+//!    `2B|task|read_seq|page_no` and, on the statement's first debit, the
+//!    read-log record `2A|task|read_seq` (outcome open; R3-309 fills its
+//!    fields), then commits synced;
+//! 5. hand-over.
+//!
+//! A crash before the commit leaves nothing charged and nothing sent; a crash
+//! after it leaves the page charged and possibly not received. No ordering
+//! leaves a sent page uncharged.
+//!
+//! # Byte cost
+//!
+//! Fixed and independent of `relational::value_bytes` (an internal memory
+//! cap that may change):
+//!
+//! `row_cost(row) = 8 + Σ (1 + size(v))`, where `size` is 0 for NULL, 1 for
+//! Bool, 8 for Int, Float8, Time, Timestamp and TimestampTz, 4 for Float4 and
+//! Date, 12 for TimeTz, 16 for Interval, the length of the decimal string for
+//! Numeric, the UTF-8 length for Text and the length for Bytes. A masked
+//! value costs whatever replaced it. The cost is the same on every wire format.
+//!
+//! # Reservation
+//!
+//! With chunking on ([`SqlSession::set_disclosure_chunk`], defaults
+//! [`DEFAULT_CHUNK_ROWS`] and [`DEFAULT_CHUNK_BYTES`]; zero means exact
+//! debits), a durable debit takes `max(need, min(chunk, remaining / 8))`
+//! returned rows and bytes, never more than `remaining`. The surplus is held
+//! in session memory and used by later pages of the same session only.
+//! `rows_read` is always debited exactly (the debit record has no reserved
+//! read rows). Session end, a release error or a crash forfeit the
+//! reservation: there is no refund path anywhere, including for a cancelled
+//! or failed statement. The debit record carries `reserved_rows` and
+//! `reserved_bytes`, so the head always equals the sum of the debits.
+//!
+//! # `rows_read`
+//!
+//! The scoped row sources count the rows the visible-rows predicate accepted.
+//! The count is pending on the session until a release debits it; a
+//! statement that ends without a release debits it in
+//! [`SqlSession::finish_task_statement`], saturating at the cap.
 //!
 //! ```compile_fail
 //! // `Unreleased` has no public field and no public constructor.
@@ -41,40 +94,203 @@
 //!     serde_json::to_string(page).unwrap()
 //! }
 //! ```
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use super::admit::StatementClass;
-use super::columns::OutputPlan;
+use super::columns::{OutputMode, OutputPlan};
+use super::commit::{catalog_def, DefAt};
 use super::context::TaskContext;
-use super::error::TaskError;
+use super::definition::{DisclosureCaps, TaskDef};
+use super::error::{Budget, DenyRule, TaskError};
+use super::records::{
+    debit_key, disclosure_head_key, read_log_key, task_prefix, DebitRecord, DisclosureHead,
+    ReadLogRecord, NS_DEBIT, NS_READ_LOG,
+};
 use super::records::TaskObjectId;
 use crate::operations::{EmittedValue, Outcome, TransactionOutcome};
 use crate::relational::{SqlResult, SqlRow, Value};
-use crate::storage::{CoreError, SqlSession};
+use crate::storage::engine::kv::Direction;
+use crate::storage::engine::meta::REPLICATED;
+use crate::storage::engine::txn::TxnError;
+use crate::storage::{
+    CoreError, Isolation, Keyspace, SqlSession, Transaction, V2Db, PROTECTED_RECORDS,
+};
+use crate::CrashPoint;
+
+/// Default reservation chunk, returned rows (`agent.disclosure_chunk_rows`).
+pub const DEFAULT_CHUNK_ROWS: u64 = 256;
+/// Default reservation chunk, returned bytes (`agent.disclosure_chunk_bytes`).
+pub const DEFAULT_CHUNK_BYTES: u64 = 262_144;
+
+/// The cost of one value: `1 + size(v)` (see the module docs).
+pub fn value_cost(value: &Value) -> u64 {
+    let size = match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int(_)
+        | Value::Float8(_)
+        | Value::Time(_)
+        | Value::Timestamp(_)
+        | Value::TimestampTz(_) => 8,
+        Value::Float4(_) | Value::Date(_) => 4,
+        Value::TimeTz(_) => 12,
+        Value::Interval(_) => 16,
+        Value::Numeric(n) => n.to_string().len() as u64,
+        Value::Text(text) => text.len() as u64,
+        Value::Bytes(bytes) => bytes.len() as u64,
+    };
+    1 + size
+}
+
+/// The cost of one released row: 8 plus the cost of each of its values.
+pub fn row_cost(row: &[Value]) -> u64 {
+    row.iter()
+        .fold(8u64, |sum, value| sum.saturating_add(value_cost(value)))
+}
+
+/// What masking one page did, and what the page costs after masking.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub rows: u64,
+    pub bytes: u64,
+    /// Values replaced by a masked column's NULL or constant.
+    pub masked: u64,
+    /// Untrusted values withheld as NULL.
+    pub withheld: u64,
+    /// Untrusted values released because the task allows them.
+    pub untrusted_released: u64,
+}
+
+/// Applies `plan` to every row of `page` in place and returns the counts.
+///
+/// A row whose width differs from the plan cannot be masked by it: every
+/// value of such a row is replaced by NULL and the page is refused (fail
+/// closed), so the caller releases nothing.
+pub fn mask_page<T: Page + ?Sized>(page: &mut T, plan: &OutputPlan) -> Result<Counts, CoreError> {
+    let mut counts = Counts::default();
+    let mut misaligned = false;
+    page.for_each_row_mut(&mut |row| {
+        if row.len() != plan.outputs.len() {
+            misaligned = true;
+            row.iter_mut().for_each(|value| *value = Value::Null);
+            return;
+        }
+        for (value, mode) in row.iter_mut().zip(&plan.outputs) {
+            match mode {
+                OutputMode::Plain => {}
+                OutputMode::Mask(constant) => {
+                    *value = constant.clone();
+                    counts.masked += 1;
+                }
+                OutputMode::Withhold => {
+                    *value = Value::Null;
+                    counts.withheld += 1;
+                }
+                OutputMode::CountUntrusted => counts.untrusted_released += 1,
+            }
+        }
+        counts.rows += 1;
+        counts.bytes = counts.bytes.saturating_add(row_cost(row));
+    });
+    if misaligned {
+        return Err(CoreError::Task(TaskError::Denied(DenyRule::ColumnNotAvailable)));
+    }
+    Ok(counts)
+}
+
+/// Returned rows and bytes debited ahead of use, held in session memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reservation {
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+/// One statement's place in the read log: its `read_seq` (taken on its first
+/// debit) and the next page number.
+#[derive(Debug, Default)]
+pub(crate) struct StatementLog {
+    read_seq: Option<u64>,
+    pages: u32,
+}
+
+/// The release state of one task session, created by `bind_task`.
+#[derive(Debug)]
+pub(crate) struct TaskSessionState {
+    ctx: TaskContext,
+    reservation: Mutex<Reservation>,
+    /// Rows the scope accepted that no debit has charged yet.
+    pending_rows_read: AtomicU64,
+    chunk_rows: AtomicU64,
+    chunk_bytes: AtomicU64,
+    /// The statement started last; `finish_task_statement` ends it.
+    current: Mutex<Option<Arc<Mutex<StatementLog>>>>,
+}
+
+impl TaskSessionState {
+    pub(crate) fn new(ctx: TaskContext) -> Self {
+        Self {
+            ctx,
+            reservation: Mutex::new(Reservation::default()),
+            pending_rows_read: AtomicU64::new(0),
+            chunk_rows: AtomicU64::new(DEFAULT_CHUNK_ROWS),
+            chunk_bytes: AtomicU64::new(DEFAULT_CHUNK_BYTES),
+            current: Mutex::new(None),
+        }
+    }
+
+    /// Adds rows the visible-rows scope accepted to the pending `rows_read`.
+    pub(crate) fn add_rows_read(&self, rows: u64) {
+        if rows > 0 {
+            self.pending_rows_read.fetch_add(rows, Ordering::SeqCst);
+        }
+    }
+
+    fn reservation(&self) -> MutexGuard<'_, Reservation> {
+        lock(&self.reservation)
+    }
+}
+
+impl Drop for TaskSessionState {
+    /// Session end forfeits the reservation: it was charged when it was
+    /// debited, and nothing ever refunds it.
+    fn drop(&mut self) {
+        *self.reservation() = Reservation::default();
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// What the release of one task statement needs. Created when the statement
 /// starts in a task session and shared by every page it produces.
-///
-/// R3-301 only carries the binding; R3-308 adds the read sequence, statement
-/// fingerprint and text, snapshot timestamp and meter, and R3-303 supplies the
-/// `OutputPlan` from `columns::apply_in_catalog`.
 #[derive(Debug)]
 pub struct ReleaseTag {
-    #[allow(dead_code, reason = "read by the release protocol (R3-308)")]
-    task: TaskObjectId,
-    #[allow(dead_code, reason = "read by the release protocol (R3-308)")]
-    bound_def_version: u64,
-    #[allow(dead_code, reason = "filled by R3-303, read by R3-308")]
-    plan: OutputPlan,
+    state: Arc<TaskSessionState>,
+    /// The statement's output plan (R3-303 for SQL, R3-304 for native), or
+    /// the denial its column rules gave; a denied plan refuses every page.
+    plan: Result<OutputPlan, TaskError>,
+    log: Arc<Mutex<StatementLog>>,
 }
 
 impl ReleaseTag {
-    pub(crate) fn new(ctx: &TaskContext, plan: OutputPlan) -> Self {
+    pub(crate) fn new(state: &Arc<TaskSessionState>, plan: Result<OutputPlan, TaskError>) -> Self {
+        let log = Arc::new(Mutex::new(StatementLog::default()));
+        *lock(&state.current) = Some(log.clone());
         Self {
-            task: ctx.task,
-            bound_def_version: ctx.bound_def_version,
+            state: state.clone(),
             plan,
+            log,
         }
+    }
+
+    /// Adds rows the scope accepted while this statement produced its pages.
+    pub(crate) fn add_rows_read(&self, rows: u64) {
+        self.state.add_rows_read(rows);
     }
 }
 
@@ -214,13 +430,456 @@ pub(crate) fn refusal() -> CoreError {
     CoreError::Task(TaskError::NotAllowedInTaskSession(StatementClass::Other))
 }
 
+/// The refusal of a write outside the protected commit in a task session.
+pub(crate) fn write_refusal(class: StatementClass) -> CoreError {
+    CoreError::Task(TaskError::NotAllowedInTaskSession(class))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TASK_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Lib tests that observe the scope of a task write outside the protected
+/// commit (R3-306) lift the write refusal on their own thread.
+#[cfg(all(test, feature = "engine-rocksdb"))]
+pub(crate) fn allow_task_writes_for_test(on: bool) {
+    TEST_TASK_WRITES.set(on);
+}
+
+/// Whether a write outside the protected commit is refused in a task
+/// session: always, except in a lib test that lifted it.
+pub(crate) fn task_writes_refused() -> bool {
+    #[cfg(test)]
+    {
+        !TEST_TASK_WRITES.get()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+type Probe = Box<dyn FnMut()>;
+
+thread_local! {
+    static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` with `probe` called after each durable debit of this thread's
+/// releases commits and before the page is handed over. For tests that show
+/// the debit precedes the hand-over.
+#[doc(hidden)]
+pub fn with_release_probe<R>(probe: impl FnMut() + 'static, f: impl FnOnce() -> R) -> R {
+    let previous = PROBE.replace(Some(Box::new(probe)));
+    let out = f();
+    PROBE.replace(previous);
+    out
+}
+
+fn run_probe() {
+    // Taken out while it runs, so a probe that releases does not recurse.
+    if let Some(mut probe) = PROBE.take() {
+        probe();
+        PROBE.with_borrow_mut(|slot| {
+            if slot.is_none() {
+                *slot = Some(probe);
+            }
+        });
+    }
+}
+
+/// One debit of the task's disclosure head, as stored.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DebitView {
+    pub read_seq: u64,
+    pub page_no: u32,
+    pub rows_read: u64,
+    pub rows_returned: u64,
+    pub bytes: u64,
+    pub reserved_rows: u64,
+    pub reserved_bytes: u64,
+}
+
+/// The committed disclosure records of one task: the head `20|task|01`, the
+/// debits `2B` in key order and the number of read-log records `2A`.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Disclosure {
+    pub rows_read: u64,
+    pub rows_returned: u64,
+    pub bytes_returned: u64,
+    pub next_read_seq: u64,
+    pub debits: Vec<DebitView>,
+    pub read_logs: u64,
+}
+
+impl crate::storage::Admin {
+    /// The committed disclosure records of `task` (v2 only). For tests and
+    /// the exposure report.
+    #[doc(hidden)]
+    pub fn task_disclosure(&self, task: TaskObjectId) -> Result<Disclosure, CoreError> {
+        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let mut txn = db.begin(Isolation::ReadCommitted);
+        let mut out = match txn.get(Keyspace::Kernel, &disclosure_head_key(task))? {
+            Some(value) => {
+                let head = DisclosureHead::decode(&value)?;
+                Disclosure {
+                    rows_read: head.rows_read,
+                    rows_returned: head.rows_returned,
+                    bytes_returned: head.bytes_returned,
+                    next_read_seq: head.next_read_seq,
+                    ..Disclosure::default()
+                }
+            }
+            None => Disclosure::default(),
+        };
+        for (key, value) in scan(&mut txn, NS_DEBIT, task)? {
+            let record = DebitRecord::decode(&value)?;
+            let read_seq = u64::from_be_bytes(key[9..17].try_into().expect("debit key"));
+            let page_no = u32::from_be_bytes(key[17..21].try_into().expect("debit key"));
+            out.debits.push(DebitView {
+                read_seq,
+                page_no,
+                rows_read: record.rows_read,
+                rows_returned: record.rows_returned,
+                bytes: record.bytes,
+                reserved_rows: record.reserved_rows,
+                reserved_bytes: record.reserved_bytes,
+            });
+        }
+        out.read_logs = scan(&mut txn, NS_READ_LOG, task)?.len() as u64;
+        Ok(out)
+    }
+}
+
+/// A Kernel key and its value.
+type Entry = (Vec<u8>, Vec<u8>);
+
+fn scan(txn: &mut Transaction, ns: u8, task: TaskObjectId) -> Result<Vec<Entry>, CoreError> {
+    let (start, end) = task_prefix(ns, task);
+    let rows = txn.scan(
+        Keyspace::Kernel,
+        Bound::Included(&start),
+        Bound::Excluded(&end),
+        Direction::Forward,
+        None,
+    )?;
+    let mut out = Vec::new();
+    for entry in rows {
+        out.push(entry?);
+    }
+    Ok(out)
+}
+
+/// Validity of the session's binding: revoked (missing, revoked, another
+/// task or executor), then expired (`expires_at <= now`), then a changed
+/// definition.
+fn valid(def: Option<&TaskDef>, ctx: &TaskContext, now_ms: u64) -> Result<(), TaskError> {
+    let def = def
+        .filter(|def| !def.revoked && def.id == ctx.task && def.executor == ctx.executor)
+        .ok_or(TaskError::Revoked)?;
+    if i64::try_from(now_ms).unwrap_or(i64::MAX) >= def.expires_at.0 {
+        return Err(TaskError::Expired);
+    }
+    if def.def_version != ctx.bound_def_version {
+        return Err(TaskError::Denied(DenyRule::DefinitionChanged));
+    }
+    Ok(())
+}
+
+/// What one release (or a statement's end) asks to debit.
+#[derive(Clone, Copy, Debug, Default)]
+struct Need {
+    rows_read: u64,
+    rows: u64,
+    bytes: u64,
+}
+
+/// The session-side inputs of one debit.
+#[derive(Clone, Copy)]
+struct Budgeting {
+    reservation: Reservation,
+    chunk: Reservation,
+    need: Need,
+    finish: bool,
+}
+
+/// What a staged debit charges, applied to the session after the commit.
+struct Staged {
+    read_seq: u64,
+    page_no: u32,
+    reserved: Reservation,
+    /// The part of the session's reservation this page used.
+    used: Reservation,
+}
+
+/// Reservation arithmetic: with `need > 0`, `max(need, min(chunk, remaining
+/// / 8))`, never more than `remaining`; `need` itself when chunking is off.
+/// The caller has checked `need <= remaining`.
+pub(crate) fn grant(need: u64, chunk: u64, remaining: u64) -> u64 {
+    if need == 0 || chunk == 0 {
+        return need;
+    }
+    need.max(chunk.min(remaining / 8)).min(remaining)
+}
+
+fn lock_error(error: TxnError) -> CoreError {
+    match error {
+        TxnError::LockTimeout => CoreError::LockNotAvailable,
+        other => other.into(),
+    }
+}
+
+/// Steps 3 and 4 of the protocol for one page (or, with `finish`, a
+/// statement's pending `rows_read`, saturating at the cap and without the
+/// validity check). Pending `rows_read` that no commit charged is put back.
+fn debit(
+    db: &V2Db,
+    state: &TaskSessionState,
+    log: Option<&Mutex<StatementLog>>,
+    need: Need,
+    finish: bool,
+    crash: CrashPoint,
+) -> Result<(), CoreError> {
+    let result = debit_inner(db, state, log, need, finish, crash);
+    if let Err((_, false)) = &result {
+        state.add_rows_read(need.rows_read);
+    }
+    result.map_err(|(error, _)| error)
+}
+
+/// The error, and whether the debit had committed.
+type DebitResult = Result<(), (CoreError, bool)>;
+
+fn debit_inner(
+    db: &V2Db,
+    state: &TaskSessionState,
+    log: Option<&Mutex<StatementLog>>,
+    need: Need,
+    finish: bool,
+    crash: CrashPoint,
+) -> DebitResult {
+    let ctx = &state.ctx;
+    let before = |error: CoreError| (error, false);
+    if db.meta.features & REPLICATED != 0 {
+        return Err(before(CoreError::Unsupported));
+    }
+    let now = db.wall_now_ms();
+    // 3. Validity on every page, from the cached view and the clock.
+    let latest = catalog_def(db, ctx.task, DefAt::Latest).map_err(before)?;
+    if !finish {
+        valid(latest.as_deref(), ctx, now).map_err(|e| before(e.into()))?;
+    }
+    let mut reservation = state.reservation();
+    if !finish && need.rows_read == 0 && reservation.rows >= need.rows && reservation.bytes >= need.bytes {
+        reservation.rows -= need.rows;
+        reservation.bytes -= need.bytes;
+        return Ok(());
+    }
+    // 4. A transaction of its own; the head lock serializes this task's sessions.
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    let wait = latest.as_ref().map_or(0, |def| def.limits.lock_wait_ms);
+    let deadline = Instant::now().checked_add(Duration::from_millis(wait));
+    let (pages, read_seq) = log.map_or((0, None), |log| {
+        let log = lock(log);
+        (log.pages, log.read_seq)
+    });
+    let chunk = Reservation {
+        rows: state.chunk_rows.load(Ordering::SeqCst),
+        bytes: state.chunk_bytes.load(Ordering::SeqCst),
+    };
+    let staged = stage(
+        &mut txn,
+        db,
+        ctx,
+        Budgeting { reservation: *reservation, chunk, need, finish },
+        now,
+        deadline,
+        (pages, read_seq),
+    );
+    let staged = match staged {
+        Ok(Some(staged)) => staged,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            if !finish {
+                *reservation = Reservation::default();
+            }
+            return Err(before(error));
+        }
+    };
+    match crash {
+        CrashPoint::BeforeCommit => crate::storage::crash_now(),
+        CrashPoint::ErrorBeforeCommit => {
+            *reservation = Reservation::default();
+            return Err(before(CoreError::Storage("injected before commit".into())));
+        }
+        _ => {}
+    }
+    if let Err(error) = db.catalog().commit_ddl(txn) {
+        *reservation = Reservation::default();
+        return Err(before(error.into()));
+    }
+    // Committed: the page is charged whatever happens next.
+    if let Some(log) = log {
+        let mut log = lock(log);
+        log.read_seq = Some(staged.read_seq);
+        log.pages = staged.page_no.saturating_add(1);
+    }
+    reservation.rows = reservation.rows - staged.used.rows + staged.reserved.rows;
+    reservation.bytes = reservation.bytes - staged.used.bytes + staged.reserved.bytes;
+    match crash {
+        CrashPoint::AfterCommit | CrashPoint::BeforeAck => crate::storage::crash_now(),
+        CrashPoint::ErrorAfterCommit => {
+            *reservation = Reservation::default();
+            return Err((CoreError::Storage("injected lost commit response".into()), true));
+        }
+        _ => {}
+    }
+    drop(reservation);
+    run_probe();
+    Ok(())
+}
+
+/// Locks the head, re-checks validity at the snapshot, checks the caps and
+/// stages the head, the debit and (first debit of a statement) the read-log
+/// record. `None`: nothing to write.
+fn stage(
+    txn: &mut Transaction,
+    db: &V2Db,
+    ctx: &TaskContext,
+    budgeting: Budgeting,
+    now: u64,
+    deadline: Option<Instant>,
+    (pages, read_seq): (u32, Option<u64>),
+) -> Result<Option<Staged>, CoreError> {
+    let Budgeting { reservation, chunk, need, finish } = budgeting;
+    let task = ctx.task;
+    let head_key = disclosure_head_key(task);
+    txn.lock_kernel_key(&head_key, deadline, &|| crate::cancellation::check().is_err())
+        .map_err(lock_error)?;
+    // A snapshot taken after the lock: the head read below is exact, since
+    // only holders of this lock write it.
+    txn.begin_statement();
+    let def = catalog_def(db, task, DefAt::Snapshot(txn))?;
+    if !finish {
+        valid(def.as_deref(), ctx, now)?;
+    }
+    let caps = def.as_ref().map_or(
+        DisclosureCaps {
+            rows_read: u64::MAX,
+            rows_returned: u64::MAX,
+            bytes_returned: u64::MAX,
+        },
+        |def| def.disclosure_caps,
+    );
+    let mut head = match txn.get(Keyspace::Kernel, &head_key)? {
+        Some(value) => DisclosureHead::decode(&value)?,
+        None => DisclosureHead {
+            next_read_seq: 1,
+            ..DisclosureHead::default()
+        },
+    };
+    let left_read = caps.rows_read.saturating_sub(head.rows_read);
+    let left_rows = caps.rows_returned.saturating_sub(head.rows_returned);
+    let left_bytes = caps.bytes_returned.saturating_sub(head.bytes_returned);
+    let used = Reservation {
+        rows: need.rows.min(reservation.rows),
+        bytes: need.bytes.min(reservation.bytes),
+    };
+    let rows = need.rows - used.rows;
+    let bytes = need.bytes - used.bytes;
+    let rows_read = if finish {
+        need.rows_read.min(left_read)
+    } else {
+        need.rows_read
+    };
+    let exceeded = |budget| Err(TaskError::BudgetExceeded(budget).into());
+    if rows_read > left_read {
+        return exceeded(Budget::RowsRead);
+    }
+    if rows > left_rows {
+        return exceeded(Budget::RowsReturned);
+    }
+    if bytes > left_bytes {
+        return exceeded(Budget::BytesReturned);
+    }
+    if rows_read == 0 && rows == 0 && bytes == 0 {
+        // Only at a statement's end whose delta saturated: nothing to charge.
+        return Ok(None);
+    }
+    let granted_rows = grant(rows, chunk.rows, left_rows);
+    let granted_bytes = grant(bytes, chunk.bytes, left_bytes);
+    let reserved = Reservation {
+        rows: granted_rows - rows,
+        bytes: granted_bytes - bytes,
+    };
+    let overflow = || CoreError::Corrupt("task disclosure head overflow".into());
+    let (read_seq, first) = match read_seq {
+        Some(read_seq) => (read_seq, false),
+        None => {
+            let read_seq = head.next_read_seq;
+            head.next_read_seq = read_seq.checked_add(1).ok_or_else(overflow)?;
+            (read_seq, true)
+        }
+    };
+    head.rows_read = head.rows_read.checked_add(rows_read).ok_or_else(overflow)?;
+    head.rows_returned = head.rows_returned.checked_add(granted_rows).ok_or_else(overflow)?;
+    head.bytes_returned = head.bytes_returned.checked_add(granted_bytes).ok_or_else(overflow)?;
+    if first {
+        // Created open by the statement's first debit; R3-309 fills the
+        // statement fields and finalizes it.
+        let record = ReadLogRecord {
+            wall_ms: now,
+            snapshot_ts: txn.current_snapshot_ts().map_or(0, |ts| ts.0),
+            credential_fingerprint: ctx.credential_fingerprint,
+            def_version: ctx.bound_def_version,
+            table_id: def.as_ref().map_or(0, |def| def.table),
+            charged_rows_read: rows_read,
+            charged_rows_returned: granted_rows,
+            charged_bytes: granted_bytes,
+            pages: 1,
+            ..ReadLogRecord::default()
+        };
+        txn.put(Keyspace::Kernel, read_log_key(task, read_seq), record.encode())?;
+    }
+    let debit = DebitRecord {
+        wall_ms: now,
+        rows_read,
+        rows_returned: rows,
+        bytes,
+        reserved_rows: reserved.rows,
+        reserved_bytes: reserved.bytes,
+    };
+    txn.put(Keyspace::Kernel, debit_key(task, read_seq, pages), debit.encode())?;
+    txn.put(Keyspace::Kernel, head_key, head.encode())?;
+    txn.require_features(PROTECTED_RECORDS);
+    Ok(Some(Staged {
+        read_seq,
+        page_no: pages,
+        reserved,
+        used,
+    }))
+}
+
 impl SqlSession {
-    /// The tag for a statement starting now; `None` outside a task session
-    /// (no allocation).
+    /// The tag for a statement starting now, with an empty output plan (a
+    /// statement that returns no rows); `None` outside a task session (no
+    /// allocation).
     pub(crate) fn release_tag(&self) -> Option<Arc<ReleaseTag>> {
-        self.task
+        self.release_tag_with(|| Ok(OutputPlan::default()))
+    }
+
+    /// The tag for a statement starting now, with the plan its column rules
+    /// give; `plan` runs only in a task session.
+    pub(crate) fn release_tag_with(
+        &self,
+        plan: impl FnOnce() -> Result<OutputPlan, TaskError>,
+    ) -> Option<Arc<ReleaseTag>> {
+        self.task_state
             .as_ref()
-            .map(|ctx| Arc::new(ReleaseTag::new(ctx, OutputPlan::default())))
+            .map(|state| Arc::new(ReleaseTag::new(state, plan())))
     }
 
     /// Guard for the plain exits: a task session must use the twins.
@@ -233,22 +892,80 @@ impl SqlSession {
 
     /// Releases one page (named `release_page` because `release` is the
     /// savepoint RELEASE). Without a task this is a move: no lock, catalog
-    /// read, transaction or allocation. A task's page fails closed until the
-    /// release protocol (R3-308) lands.
+    /// read, transaction or allocation. A task page goes through the release
+    /// protocol (module docs); on any error nothing is handed over.
     pub fn release_page<T: Page>(&self, page: Unreleased<T>) -> Result<Released<T>, CoreError> {
-        match page.tag {
-            None => Ok(Released(page.value)),
-            Some(_) => Err(CoreError::Unsupported),
-        }
+        let Unreleased { mut value, tag } = page;
+        let Some(tag) = tag else {
+            return Ok(Released(value));
+        };
+        // 1. The statement deadline.
+        crate::cancellation::check()?;
+        // 2. Mask in memory; the cost is taken after masking.
+        let plan = tag.plan.as_ref().map_err(|e| CoreError::Task(e.clone()))?;
+        let counts = mask_page(&mut value, plan)?;
+        // 3 and 4. Validity, then the durable debit (or the reservation).
+        let db = self.v2_db().ok_or(CoreError::Unsupported)?;
+        let crash = self.fault_points()?.0;
+        let need = Need {
+            rows_read: tag.state.pending_rows_read.swap(0, Ordering::SeqCst),
+            rows: counts.rows,
+            bytes: counts.bytes,
+        };
+        debit(&db, &tag.state, Some(&tag.log), need, false, crash)?;
+        // 5. Hand over.
+        Ok(Released(value))
     }
 
-    /// Validity only, for re-serving an already charged page. No-op until R3-308.
+    /// Validity only, for re-serving an already charged page.
     pub fn still_valid(&self) -> Result<(), CoreError> {
+        let Some(state) = &self.task_state else {
+            return Ok(());
+        };
+        let db = self.v2_db().ok_or(CoreError::Unsupported)?;
+        let def = catalog_def(&db, state.ctx.task, DefAt::Latest)?;
+        valid(def.as_deref(), &state.ctx, db.wall_now_ms())?;
         Ok(())
     }
 
-    /// Read-log finalisation of a task statement. No-op until R3-308/R3-309.
-    pub fn finish_task_statement(&self, _outcome: Result<(), &CoreError>) {}
+    /// Ends the session's current task statement: a `rows_read` delta no
+    /// release charged is debited, saturating at the cap. The read-log fields
+    /// are R3-309's. No-op without a task; a failure leaves the delta pending.
+    pub fn finish_task_statement(&self, _outcome: Result<(), &CoreError>) {
+        let Some(state) = &self.task_state else {
+            return;
+        };
+        let log = lock(&state.current).take();
+        let rows_read = state.pending_rows_read.swap(0, Ordering::SeqCst);
+        if rows_read == 0 {
+            return;
+        }
+        let Some(db) = self.v2_db() else {
+            return;
+        };
+        let crash = self.fault_points().map_or(CrashPoint::None, |points| points.0);
+        let need = Need {
+            rows_read,
+            ..Need::default()
+        };
+        let _ = debit(&db, state, log.as_deref(), need, true, crash);
+    }
+
+    /// Sets the session's reservation chunk (`agent.disclosure_chunk_rows`
+    /// and `agent.disclosure_chunk_bytes`); zero means exact debits. No-op
+    /// without a task.
+    pub fn set_disclosure_chunk(&self, rows: u64, bytes: u64) {
+        if let Some(state) = &self.task_state {
+            state.chunk_rows.store(rows, Ordering::SeqCst);
+            state.chunk_bytes.store(bytes, Ordering::SeqCst);
+        }
+    }
+
+    /// The session's unused reservation; `None` without a task.
+    #[doc(hidden)]
+    pub fn task_reservation(&self) -> Option<Reservation> {
+        self.task_state.as_ref().map(|state| *state.reservation())
+    }
 }
 
 #[cfg(test)]

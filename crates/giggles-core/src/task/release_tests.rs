@@ -98,6 +98,10 @@ fn real_task(admin: &crate::storage::Admin) -> TaskContext {
         )
         .unwrap();
     let sql = admin.sql_session();
+    // Release checks expiry against the database clock: pin it to `now`.
+    sql.v2_db().unwrap().set_wall_clock(std::sync::Arc::new(
+        crate::storage::engine::commit::ManualClock::new(now.0 as u64),
+    ));
     crate::task::context::open_context(&sql, &context().name, &"agent_exec".to_string(), [7; 32], now, 0)
         .unwrap()
 }
@@ -124,7 +128,9 @@ fn row(values: &[i64]) -> SqlRow {
 fn no_task_release_is_move() {
     let admin = admin();
     let sql = admin.sql_session();
-    // A released page is the producer's buffer itself: no copy, no allocation.
+    // A released page is the producer's buffer itself: no copy, no allocation,
+    // and no engine operation (no transaction, read, write or scan).
+    let ops = crate::storage::engine::txn::engine_ops();
     for i in 0..10_000 {
         let rows = vec![row(&[i, i + 1])];
         let buffer = rows.as_ptr();
@@ -133,6 +139,17 @@ fn no_task_release_is_move() {
         let released = sql.release_page(page).unwrap();
         assert_eq!(released.get().as_ptr(), buffer);
         assert_eq!(released.into_inner(), vec![row(&[i, i + 1])]);
+        sql.still_valid().unwrap();
+        sql.finish_task_statement(Ok(()));
+    }
+    assert_eq!(crate::storage::engine::txn::engine_ops(), ops);
+    // The counter does count: one transaction with one read.
+    #[cfg(feature = "engine-rocksdb")]
+    {
+        let db = sql.v2_db().unwrap();
+        let mut txn = db.begin(crate::storage::Isolation::ReadCommitted);
+        txn.get(crate::storage::Keyspace::Kernel, b"x").unwrap();
+        assert!(crate::storage::engine::txn::engine_ops() >= ops + 2);
     }
     // A real exit outside a task session releases the same rows `execute` returns.
     let mut sql = admin.sql_session();
@@ -180,8 +197,23 @@ fn plain_exit_fails_closed_in_task_session() {
     assert!(page.is_task());
     assert_eq!(format!("{page:?}"), "Unreleased { task: true, .. }");
     assert_eq!(page.untasked(), Err(refused.clone()));
-    let page = sql.execute_unreleased("SELECT id FROM shipments", &[], None).unwrap();
-    assert_eq!(sql.release_page(page).map(|_| ()), Err(CoreError::Unsupported));
+    // R3-308: the twin's page is released through the protocol. On v2 the
+    // task's visible rows (merchant 42) come out; the synthetic legacy
+    // context names no catalog task, so its page is refused as revoked.
+    let page = sql.execute_unreleased("SELECT id FROM shipments ORDER BY id", &[], None).unwrap();
+    #[cfg(feature = "engine-rocksdb")]
+    assert_eq!(
+        sql.release_page(page)
+            .unwrap()
+            .into_inner()
+            .rows
+            .into_iter()
+            .map(|row| row.values)
+            .collect::<Vec<_>>(),
+        vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+    );
+    #[cfg(not(feature = "engine-rocksdb"))]
+    assert_eq!(sql.release_page(page).map(|_| ()), Err(CoreError::Task(TaskError::Revoked)));
     // Cursors: the plain fetch is refused before the cursor advances. (A legacy
     // cursor refuses a task session at open: tasks are v2 only.)
     #[cfg(feature = "engine-rocksdb")]
@@ -289,4 +321,64 @@ fn synthetic_round_trip() {
     assert_eq!(native.row_count(), 2);
     assert_eq!(result.row_count(), 1);
     assert_eq!(result.rows.row_count(), 1);
+}
+
+/// R3-308 (R3-301 open item): a write in a task session runs only inside the
+/// protected commit. The twins refuse it before it runs: nothing is written.
+#[test]
+fn task_write_refused_before_it_runs() {
+    let admin = admin();
+    let mut sql = task_session(&admin);
+    let insert = CoreError::Task(TaskError::NotAllowedInTaskSession(StatementClass::Insert));
+    assert_eq!(
+        sql.execute_unreleased("INSERT INTO shipments VALUES (4, 42, 'queued')", &[], None)
+            .map(|_| ()),
+        Err(insert)
+    );
+    let update = admin
+        .sql_session()
+        .prepare("UPDATE shipments SET status = 'queued' WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        sql.execute_prepared_unreleased(&update, &[], None).map(|_| ()),
+        Err(CoreError::Task(TaskError::NotAllowedInTaskSession(StatementClass::Update)))
+    );
+    for ddl in ["DELETE FROM shipments", "CREATE TABLE carriers (id bigint primary key)", "DROP TABLE shipments"] {
+        let e = sql.execute_unreleased(ddl, &[], None).map(|_| ()).unwrap_err();
+        assert_eq!(crate::sqlstate(&e), "0A000", "{ddl}: {e:?}");
+    }
+    // A cursor over a write never opens a write either.
+    let e = sql.open_cursor(&update, &[]).map(|_| ()).unwrap_err();
+    assert_ne!(crate::sqlstate(&e), "00000");
+    // Native writes: refused after the column rules, before anything runs.
+    #[cfg(feature = "engine-rocksdb")]
+    {
+        use crate::operations::{Expr, Intent, ValueExpr};
+        let request = Request::Update {
+            table: "shipments".into(),
+            filter: Expr::Value(ValueExpr::Literal(Value::Bool(true))),
+            guard: None,
+            values: vec![("status".into(), ValueExpr::Literal(Value::Text("queued".into())))],
+            intent: Intent::Many { cap: ValueExpr::Literal(Value::Int(10)) },
+        };
+        let e = sql.execute_native_unreleased(&request, &Bindings::new()).map(|_| ()).unwrap_err();
+        assert!(matches!(e.sqlstate(), Some("42501" | "0A000")), "{e:?}");
+    }
+    // Nothing was written.
+    let statuses = admin
+        .sql_session()
+        .execute("SELECT id, status FROM shipments ORDER BY id", &[], None)
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|row| row.values)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        vec![
+            vec![Value::Int(1), Value::Text("failed".into())],
+            vec![Value::Int(2), Value::Text("delivered".into())],
+            vec![Value::Int(3), Value::Text("failed".into())],
+        ]
+    );
 }

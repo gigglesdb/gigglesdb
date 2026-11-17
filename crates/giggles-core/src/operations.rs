@@ -721,13 +721,24 @@ fn bind_request(
     request: &Request,
     bindings: &Bindings,
 ) -> Result<(TableDef, Operation)> {
+    bind_request_planned(session, request, bindings).map(|(table, operation, _)| (table, operation))
+}
+/// `bind_request`, with the output plan of a task session's column rules
+/// (`None` outside a task session), for the request's release tag (R3-308).
+fn bind_request_planned(
+    session: &mut impl Context,
+    request: &Request,
+    bindings: &Bindings,
+) -> Result<(TableDef, Operation, Option<crate::task::columns::OutputPlan>)> {
     if let Some(rules) = task_rules(session)? {
-        let (table, request) = task_target(session, &rules, request)?;
-        return bind_table(table, &request, bindings, session.max_read_rows());
+        let (table, request, plan) = task_target(session, &rules, request)?;
+        let (table, operation) = bind_table(table, &request, bindings, session.max_read_rows())?;
+        return Ok((table, operation, Some(plan)));
     }
     let key = native_relation_key(request.table()?);
     let table = resolve_relation(session, &key, request)?;
-    bind_table(table, request, bindings, session.max_read_rows())
+    let (table, operation) = bind_table(table, request, bindings, session.max_read_rows())?;
+    Ok((table, operation, None))
 }
 /// A task refusal on the native surface keeps its SQLSTATE.
 fn task_error(e: crate::task::TaskError) -> Error {
@@ -746,11 +757,13 @@ fn task_rules(
 /// GD-0061 R3-304: a task request is refused by class before resolution,
 /// resolves only as a table (a view or unknown name is another relation), and
 /// binds the request `apply_native` returns (empty projections expanded).
+/// R3-308: a write is then refused (the protected commit is a task's only
+/// write path), and the plan is returned for the release tag.
 fn task_target(
     session: &mut impl Context,
     rules: &crate::task::columns::NativeRules,
     request: &Request,
-) -> Result<(TableDef, Request)> {
+) -> Result<(TableDef, Request, crate::task::columns::OutputPlan)> {
     use crate::task::{DenyRule, TaskError};
     rules.admit(request).map_err(task_error)?;
     let key = native_relation_key(request.table()?);
@@ -761,8 +774,9 @@ fn task_target(
         }
         Err(e) => return Err(core(e)),
     };
-    let request = rules.apply(&table, request).map_err(task_error)?;
-    Ok((table, request))
+    let (request, plan) = rules.apply(&table, request).map_err(task_error)?;
+    rules.refuse_write(&request).map_err(task_error)?;
+    Ok((table, request, plan))
 }
 /// Resolve a request's target. Reads may name a view, as SQL FROM may; every
 /// other request, and any unknown name, keeps the table resolution and 42P01.

@@ -73,21 +73,25 @@ impl Prepared {
     /// Rewrite `SELECT *` (and `t.*`) to `columns`, and `RETURNING *` to
     /// `returning`, before bind (R3-303). Statements without a star are
     /// returned unchanged, so the rewrite is idempotent.
+    ///
+    /// The statement kept for rebinding is rewritten too, so a statement
+    /// rebound at execution runs expanded (R3-308).
     pub(crate) fn task_expand_star(&self, columns: &[String], returning: &[String]) -> Prepared {
         let mut out = self.clone();
-        let expand_returning = |r: &mut Option<Returning>| {
-            if let Some(r) = r {
-                r.query_mut().task_expand_star(returning);
-            }
-        };
-        match &mut out.statement {
+        let expand = |statement: &mut Statement| match statement {
             Statement::Query(q) => q.task_expand_star(columns),
             Statement::Select { projection, .. } if projection.is_empty() => {
                 projection.extend(columns.iter().cloned());
             }
-            Statement::Update { returning: r, .. }
-            | Statement::UpdateExpressions { returning: r, .. } => expand_returning(r),
+            Statement::Update { returning: Some(r), .. }
+            | Statement::UpdateExpressions { returning: Some(r), .. } => {
+                r.query_mut().task_expand_star(returning)
+            }
             _ => {}
+        };
+        expand(&mut out.statement);
+        if let Some(unbound) = out.unbound_statement.as_deref_mut() {
+            expand(unbound);
         }
         out
     }

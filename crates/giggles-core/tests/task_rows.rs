@@ -670,18 +670,29 @@ fn native_read_and_update_scope() {
         ),
     )));
     assert_eq!(native(&f, &visible), Err(NativeError::DivisionByZero));
-    // An update of an invisible key finds nothing and changes nothing.
-    for id in [2, 4, 6] {
-        let request = native_requeue(id_is(id), Intent::One);
-        assert_eq!(native(&f, &request), Err(NativeError::NotFound), "id {id}");
+    // R3-308: a native write in a task session runs only through the
+    // protected commit; the native exit refuses it before it runs, visible
+    // key or not. (Its scoped matching is shown in the lib test
+    // `task::rows::tests::update_and_native_outcomes_count_only_scope_rows`.)
+    for request in [
+        native_requeue(id_is(2), Intent::One),
+        native_requeue(id_is(1), Intent::One),
+        native_requeue(and(failed(), inverse_attempts()), many(10)),
+    ] {
+        assert_eq!(native(&f, &request), Err(refused_write()), "{request:?}");
     }
     assert_eq!(statuses(&f), BEFORE);
-    // A filter whose zero lies only outside the scope updates the visible rows;
-    // the last read is the keyed write of row 5.
+    // Outside the task the same filter reaches the out-of-scope zero.
     let request = native_requeue(and(failed(), inverse_attempts()), many(10));
     untasked_native_fails(&f, &request, NativeError::DivisionByZero);
-    assert_eq!(native(&f, &request), Ok(RowCounts { scanned: 1, read: 1 }));
-    assert_eq!(statuses(&f), REQUEUED);
+    assert_eq!(statuses(&f), BEFORE);
+}
+
+/// A native write refused in a task session (0A000, before it runs).
+fn refused_write() -> NativeError {
+    NativeError::Sql {
+        sqlstate: "0A000".into(),
+    }
 }
 
 #[test]
@@ -698,14 +709,14 @@ fn native_matched_count_excludes_out_of_scope() {
     );
     untasked_native_fails(&f, &one, NativeError::AmbiguousMatch);
     assert_eq!(statuses(&f), BEFORE);
-    // In the task only the two visible rows match, so the cap holds. The
-    // matching read of the same filter pulls six rows and keeps three.
+    // The matching read of the same filter pulls six rows and keeps three;
+    // the native write itself is refused in the task session (R3-308).
     assert_eq!(
         native(&f, &native_read(Some(failed()))),
         Ok(RowCounts { scanned: 6, read: 3 })
     );
-    native(&f, &request).unwrap();
-    assert_eq!(statuses(&f), REQUEUED);
+    assert_eq!(native(&f, &request), Err(refused_write()));
+    assert_eq!(statuses(&f), BEFORE);
     // The SQL path on an identical table affects the same two rows (worked
     // example step 15, SQL and native alike), from the same scoped read.
     let g = writable("task-rows-native-matched-sql");
@@ -717,11 +728,4 @@ fn native_matched_count_excludes_out_of_scope() {
     );
     assert_eq!(statuses(&g), REQUEUED);
     assert_eq!(sql_counts, RowCounts { scanned: 6, read: 3 });
-    // And Intent::One matches exactly the one visible row.
-    let h = writable("task-rows-native-matched-one");
-    native(&h, &one).unwrap();
-    assert_eq!(
-        statuses(&h),
-        ["queued", "failed", "queued", "failed", "failed", "done"]
-    );
 }

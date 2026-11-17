@@ -99,6 +99,9 @@ impl SqlSession {
         if self.task.is_some() {
             return Err(CoreError::Fenced);
         }
+        self.task_state = Some(std::sync::Arc::new(
+            super::release::TaskSessionState::new(ctx.clone()),
+        ));
         self.task = Some(ctx);
         Ok(())
     }

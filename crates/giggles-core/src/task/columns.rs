@@ -847,15 +847,29 @@ impl NativeRules {
 
     /// `apply_native` on the request's resolved relation, which must be the
     /// task's table.
-    pub(crate) fn apply(&self, table: &TableDef, request: &Request) -> Result<Request, TaskError> {
+    /// The plan goes into the request's `ReleaseTag` (R3-308).
+    pub(crate) fn apply(
+        &self,
+        table: &TableDef,
+        request: &Request,
+    ) -> Result<(Request, OutputPlan), TaskError> {
         if table.id != self.def.table {
             return Err(denied(DenyRule::OtherTable));
         }
         let marks = ColumnMarks::from_labels(table, &self.labels);
-        // The plan goes into the statement's ReleaseTag with the release
-        // protocol (R3-308); until then a task page fails closed at release.
         apply_native(&self.def, self.bound_def_version, &marks, table, request)
-            .map(|(request, _plan)| request)
+    }
+
+    /// A native write in a task session runs only through the protected
+    /// commit; through the native exits it is refused before it runs
+    /// (R3-308). Checked after the column rules, so a request they deny
+    /// keeps its denial.
+    pub(crate) fn refuse_write(&self, request: &Request) -> Result<(), TaskError> {
+        match native_class(request) {
+            StatementClass::Select => Ok(()),
+            _ if !super::release::task_writes_refused() => Ok(()),
+            class => Err(TaskError::NotAllowedInTaskSession(class)),
+        }
     }
 }
 

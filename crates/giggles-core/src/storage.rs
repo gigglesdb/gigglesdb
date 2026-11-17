@@ -2055,6 +2055,10 @@ pub struct SqlSession {
     isolation: SqlIsolation,
     /// The task this session is bound to (GD-0061 R3-202); set once by `bind_task`.
     pub(crate) task: Option<crate::task::context::TaskContext>,
+    /// The release state of a task session (GD-0061 R3-308): reservation,
+    /// pending `rows_read` and the current statement. Set with `task` by
+    /// `bind_task`; the protected commit's temporary binding leaves it alone.
+    pub(crate) task_state: Option<Arc<crate::task::release::TaskSessionState>>,
 }
 mod complete_relation;
 pub(crate) use complete_relation::CompleteRelation;
@@ -2088,6 +2092,7 @@ impl Admin {
             deferral: Default::default(),
             isolation: SqlIsolation::ReadCommitted,
             task: None,
+            task_state: None,
         }
     }
     /// Catalog preflight for the lossless logical archive profile. Refuse catalog
@@ -3686,9 +3691,78 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
-        let tag = self.release_tag();
+        // GD-0061 R3-308: in a task session a write runs only inside the
+        // protected commit; any other write is refused before it runs.
+        self.refuse_task_write(p)?;
+        let (tag, expanded) = self.statement_tag(p);
+        let p = expanded.as_ref().unwrap_or(p);
         self.execute_bound_kernel(p, params, expected_version, clock)
             .map(|result| crate::task::release::Unreleased::new(result, tag))
+    }
+    /// Refuses a statement that writes (DML or DDL) in a task session outside
+    /// the protected commit (GD-0061 R3-308).
+    pub(crate) fn refuse_task_write(&self, p: &relational::Prepared) -> Result<(), CoreError> {
+        if self.task.is_none() || self.protected.is_some() || !crate::task::release::task_writes_refused() {
+            return Ok(());
+        }
+        match p.v2_class() {
+            relational::V2Class::Read | relational::V2Class::Control(_) => Ok(()),
+            _ => Err(crate::task::release::write_refusal(p.task_class())),
+        }
+    }
+    /// The release tag of a statement starting now, and the statement to run
+    /// in its place (`SELECT *` expanded to the task's columns). A read
+    /// carries the output plan of the task's column rules (R3-303's
+    /// `apply_in_catalog`, on the session's catalog view); a denial is kept
+    /// in the tag and refuses every page at release. Other statements return
+    /// no task rows and get an empty plan, so any row would fail closed.
+    pub(crate) fn statement_tag(
+        &self,
+        p: &relational::Prepared,
+    ) -> (Option<Arc<crate::task::release::ReleaseTag>>, Option<relational::Prepared>) {
+        let mut expanded = None;
+        let tag = self.release_tag_with(|| {
+            if !p.is_read() {
+                return Ok(Default::default());
+            }
+            let (statement, plan) = self.task_output_plan(p)?;
+            expanded = Some(statement);
+            Ok(plan)
+        });
+        (tag, expanded)
+    }
+    fn task_output_plan(
+        &self,
+        p: &relational::Prepared,
+    ) -> Result<(relational::Prepared, crate::task::columns::OutputPlan), crate::task::TaskError> {
+        use crate::task::TaskError;
+        let core = |e: CoreError| TaskError::Core(Box::new(e));
+        let ctx = self.task.as_ref().ok_or(TaskError::Revoked)?;
+        let def = self
+            .tasks()
+            .lookup(ctx.name.as_str())
+            .map_err(core)?
+            .filter(|def| def.id == ctx.task && !def.revoked)
+            .ok_or(TaskError::Revoked)?;
+        let labels = self.task_column_labels().map_err(core)?;
+        let plan = self.inspect_metadata(|s| {
+            Ok(crate::task::columns::apply_in_catalog(
+                &def,
+                ctx.bound_def_version,
+                &labels,
+                &s.sql,
+                p,
+            ))
+        });
+        plan.map_err(core)?
+    }
+    /// Adds rows a task statement's scope accepted to the session's pending
+    /// `rows_read` (R3-308). The protected commit's reads are not disclosure.
+    pub(crate) fn note_task_rows_read(&self, meter: &crate::task::rows::StatementMeter) {
+        let rows = meter.take_read_delta();
+        if let (None, Some(state)) = (&self.protected, &self.task_state) {
+            state.add_rows_read(rows);
+        }
     }
     fn execute_bound_kernel(
         &mut self,

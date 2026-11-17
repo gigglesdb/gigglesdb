@@ -248,6 +248,7 @@ impl SqlSession {
             self.visit_native_key_v2(&db, table, key, &mut scoped(scope.as_ref(), &meter, visit), map)?;
             if scope.is_some() {
                 crate::task::rows::record(meter.counts());
+                self.note_task_rows_read(&meter);
             }
             if self.complete_snapshot(table).map_err(map)? != snapshot {
                 return Err(map(CoreError::Sql(SqlError::StaleSchema)));
@@ -281,6 +282,7 @@ impl SqlSession {
         self.visit_native_page_legacy(table, visit, map)?;
         if scope.is_some() {
             crate::task::rows::record(meter.counts());
+                self.note_task_rows_read(&meter);
         }
         if self.complete_snapshot(table).map_err(map)? != snapshot {
             return Err(map(CoreError::Sql(SqlError::StaleSchema)));
@@ -404,6 +406,7 @@ impl SqlSession {
                     let meter = StatementMeter::default();
                     let rows = rows.into_iter().filter(|row| scope.keep(row, &meter)).collect();
                     crate::task::rows::record(meter.counts());
+                self.note_task_rows_read(&meter);
                     rows
                 }
             };

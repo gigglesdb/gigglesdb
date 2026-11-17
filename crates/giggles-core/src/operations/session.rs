@@ -17,20 +17,24 @@ impl SqlSession {
         request: &Request,
         bindings: &Bindings,
     ) -> Result<crate::task::release::Unreleased<Outcome>> {
-        let tag = self.release_tag();
         let v2 = self.is_v2_engine();
-        self.native_scope(
+        // The tag carries the plan the task's column rules gave at binding
+        // (GD-0061 R3-304/R3-308); a request refused there makes no page.
+        let mut plan = None;
+        let outcome = self.native_scope(
             false,
             || {
                 validate_request(request, Admission::engine(v2))?;
                 validate_bindings(bindings)
             },
             |session| {
-                let (table, operation) = bind_request(session, request, bindings)?;
+                let (table, operation, bound) = bind_request_planned(session, request, bindings)?;
+                plan = bound;
                 run_complete(session, &table, operation, None)
             },
-        )
-        .map(|outcome| crate::task::release::Unreleased::new(outcome, tag))
+        )?;
+        let tag = self.release_tag_with(|| plan.ok_or(crate::task::TaskError::Revoked));
+        Ok(crate::task::release::Unreleased::new(outcome, tag))
     }
 
     /// A block stages as a unit into an outer transaction. Failure aborts that
@@ -55,7 +59,13 @@ impl SqlSession {
         block: &Transaction,
         bindings: &Bindings,
     ) -> Result<crate::task::release::Unreleased<TransactionOutcome>> {
-        let tag = self.release_tag();
+        // A block's emitted values have no per-column plan yet: in a task
+        // session its page is refused at release (fail closed, R3-308).
+        let tag = self.release_tag_with(|| {
+            Err(crate::task::TaskError::NotAllowedInTaskSession(
+                crate::task::StatementClass::TransactionControl,
+            ))
+        });
         let v2 = self.is_v2_engine();
         self.native_scope(
             block.read_only,

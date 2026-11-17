@@ -16,6 +16,22 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+thread_local! {
+    static ENGINE_OPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Test-only count of this thread's engine operations: transactions begun and
+/// reads, writes and scans issued (each takes the snapshot first). GD-0061
+/// R3-308 shows a no-task release does none.
+#[cfg(test)]
+pub(crate) fn engine_ops() -> u64 {
+    ENGINE_OPS.get()
+}
+#[cfg(test)]
+fn count_engine_op() {
+    ENGINE_OPS.set(ENGINE_OPS.get() + 1);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SerializationReason {
     WriteConflict,
@@ -404,6 +420,8 @@ impl Transaction {
         )
     }
     pub(crate) fn begin_with(services: TxnServices, id: TxnId, isolation: Isolation) -> Self {
+        #[cfg(test)]
+        count_engine_op();
         let mut txn = Self {
             services,
             id,
@@ -558,6 +576,8 @@ impl Transaction {
         }
     }
     fn try_snapshot_ts(&mut self) -> Result<Ts, TxnError> {
+        #[cfg(test)]
+        count_engine_op();
         if self.snapshot.is_none() {
             match self.services.take_snapshot(self.id) {
                 Ok(snapshot) => {
