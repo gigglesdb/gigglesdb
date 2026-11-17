@@ -10,7 +10,11 @@ use super::{
 use crate::storage::range_api::TsOracle;
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -297,9 +301,10 @@ pub(crate) enum RawOp {
 pub(crate) fn valid_counter_key(key: &[u8]) -> bool {
     key.len() == 25 && key.first() == Some(&2)
 }
-struct SnapState {
-    visible: Ts,
-    active: BTreeMap<Ts, usize>,
+const SNAPSHOT_SHARDS: usize = 16;
+static NEXT_SNAPSHOT_SHARD: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static SNAPSHOT_SHARD: usize = NEXT_SNAPSHOT_SHARD.fetch_add(1, Ordering::Relaxed) % SNAPSHOT_SHARDS;
 }
 struct Shared {
     #[cfg(test)]
@@ -310,10 +315,12 @@ struct Shared {
     sync_writes: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     highwater_puts: std::sync::atomic::AtomicUsize,
-    snap: Mutex<SnapState>,
+    visible: AtomicU64,
+    active: [Mutex<BTreeMap<Ts, usize>>; SNAPSHOT_SHARDS],
 }
 pub(crate) struct SnapshotHandle {
     shared: Arc<Shared>,
+    shard: usize,
     ts: Ts,
 }
 impl SnapshotHandle {
@@ -323,15 +330,35 @@ impl SnapshotHandle {
 }
 impl Drop for SnapshotHandle {
     fn drop(&mut self) {
-        let mut state = self.shared.snap.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(count) = state.active.get_mut(&self.ts) {
+        let mut active = self.shared.active[self.shard].lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = active.get_mut(&self.ts) {
             *count -= 1;
             if *count == 0 {
-                state.active.remove(&self.ts);
+                active.remove(&self.ts);
             }
         }
     }
 }
+fn oldest_active(shared: &Shared) -> Option<Ts> {
+    shared
+        .active
+        .iter()
+        .filter_map(|shard| {
+            shard.lock().unwrap_or_else(|p| p.into_inner()).keys().next().copied()
+        })
+        .min()
+}
+
+/// Called only by the single sequencer publisher, with monotonic timestamps.
+fn publish_visible(shared: &Shared, max: Ts) -> Ts {
+    // Store visible (Release) FIRST, then lock each shard to scan registrations.
+    // snapshot() locks its shard BEFORE loading visible (Acquire). Any snapshot
+    // missed by this scan registered after its shard was released and therefore
+    // read visible >= max, so min(max, oldest) never passes a live snapshot.
+    shared.visible.store(max.0, Ordering::Release);
+    max.min(oldest_active(shared).unwrap_or(max))
+}
+
 struct Pending {
     request: CommitRequest,
     guard: Option<CommitGuard>,
@@ -465,10 +492,8 @@ impl Sequencer {
             sync_writes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             highwater_puts: std::sync::atomic::AtomicUsize::new(0),
-            snap: Mutex::new(SnapState {
-                visible: seed,
-                active: BTreeMap::new(),
-            }),
+            visible: AtomicU64::new(seed.0),
+            active: std::array::from_fn(|_| Mutex::new(BTreeMap::new())),
         });
         let served = Arc::new(ServedGate::new(Ts(0)));
         let worker_served = served.clone();
@@ -548,28 +573,23 @@ impl Sequencer {
         self.config.write_set_bytes
     }
     pub(crate) fn visible_ts(&self) -> Ts {
-        self.shared
-            .snap
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .visible
+        Ts(self.shared.visible.load(Ordering::Acquire))
     }
     pub(crate) fn oldest_active(&self) -> Option<Ts> {
-        self.shared
-            .snap
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .active
-            .keys()
-            .next()
-            .copied()
+        oldest_active(&self.shared)
     }
     pub(crate) fn snapshot(&self) -> SnapshotHandle {
-        let mut state = self.shared.snap.lock().unwrap_or_else(|p| p.into_inner());
-        let ts = state.visible;
-        *state.active.entry(ts).or_default() += 1;
+        let shard = SNAPSHOT_SHARD.with(|shard| *shard);
+        let mut active = self.shared.active[shard].lock().unwrap_or_else(|p| p.into_inner());
+        // Lock the shard BEFORE loading visible (Acquire) and registering. The
+        // publisher stores visible FIRST, then scans the shards. A snapshot the
+        // scan misses registered after its shard was released, so reads at least
+        // the published timestamp and cannot be passed by that trim bound.
+        let ts = Ts(self.shared.visible.load(Ordering::Acquire));
+        *active.entry(ts).or_default() += 1;
         SnapshotHandle {
             shared: self.shared.clone(),
+            shard,
             ts,
         }
     }
@@ -1043,11 +1063,7 @@ fn process_group(
         }
         _ => None,
     };
-    let visible = shared
-        .snap
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .visible;
+    let visible = Ts(shared.visible.load(Ordering::Acquire));
     let mut max = visible;
     let mut batch = WriteBatch::default();
     let mut accepted = Vec::new();
@@ -1272,19 +1288,10 @@ fn process_group(
     }
     *features = pending_features;
     *subversion = pending_subversion;
-    // Publish only after Sync succeeds; capture retention state in the same
-    // short critical section, then trim and acknowledge without the mutex.
-    let (visible, oldest) = {
-        let mut snap = shared.snap.lock().unwrap_or_else(|p| p.into_inner());
-        snap.visible = max;
-        (snap.visible, snap.active.keys().next().copied())
-    };
-    // A live snapshot S needs only writes > S. Visibility is monotonic, and
-    // snapshots registered after this capture are >= captured visible. Normal
-    // trim removes only <= min(visible, oldest), preserving every live reader's
-    // needed history; forced budget eviction instead records the lost horizon.
+    // Publish only after Sync succeeds, then trim and acknowledge.
+    let trim_bound = publish_visible(shared, max);
     if !accepted.is_empty() {
-        log.trim(Some(visible.min(oldest.unwrap_or(visible))));
+        log.trim(Some(trim_bound));
     }
     for reply in counters { let _ = reply.send(Ok(())); }
     for (reply, ts) in accepted {
@@ -1369,3 +1376,7 @@ mod tssource_tests;
 #[cfg(test)]
 #[path = "write_fence_commit_tests.rs"]
 mod write_fence_tests;
+
+#[cfg(test)]
+#[path = "commit_snapshot_tests.rs"]
+mod snapshot_tests;
