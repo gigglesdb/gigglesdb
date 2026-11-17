@@ -1,7 +1,8 @@
 //! Explicit, loopback-only development server provisioning.
 use crate::{
     Service,
-    auth::{PostgresqlConfig, TlsMode, scram::Verifier, serve_postgresql_bound},
+    api::{ApiLimits, ApiRuntime, net::serve_role_bound},
+    auth::{PostgresqlConfig, RoleApiConfig, TlsMode, scram::Verifier, serve_postgresql_bound},
     clock::Clock,
 };
 use giggles_core::{
@@ -19,7 +20,7 @@ const DEFAULT_ENGINE: Engine = Engine::V2;
 #[cfg(not(feature = "engine-rocksdb"))]
 const DEFAULT_ENGINE: Engine = Engine::Legacy;
 
-pub const USAGE: &str = "usage: giggles-server CONFIG.json | --dev [--data DIR] [--port N] [--engine legacy|v2] [--owner NAME] [--database NAME] [--trust-local] [--reset-owner-password] (creation default: v2 with engine-rocksdb, otherwise legacy)";
+pub const USAGE: &str = "usage: giggles-server CONFIG.json | --dev [--data DIR] [--port N] [--engine legacy|v2] [--owner NAME] [--database NAME] [--trust-local] [--no-api] [--reset-owner-password] (creation default: v2 with engine-rocksdb, otherwise legacy)";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
@@ -30,6 +31,7 @@ pub struct Options {
     pub owner: String,
     pub database: String,
     pub trust_local: bool,
+    pub no_api: bool,
     pub reset_owner_password: bool,
 }
 
@@ -42,12 +44,14 @@ impl Options {
             owner: "postgres".into(),
             database: "postgres".into(),
             trust_local: false,
+            no_api: false,
             reset_owner_password: false,
         };
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             match flag.as_str() {
                 "--trust-local" => options.trust_local = true,
+                "--no-api" => options.no_api = true,
                 "--reset-owner-password" => options.reset_owner_password = true,
                 "--data" | "--port" | "--owner" | "--database" | "--engine" => {
                     let value = args
@@ -77,7 +81,10 @@ impl Options {
                 _ => return Err(USAGE),
             }
         }
-        if !valid_name(&options.owner) || !valid_name(&options.database) {
+        if !valid_name(&options.owner)
+            || !valid_name(&options.database)
+            || (!options.no_api && options.port > u16::MAX - 2)
+        {
             return Err(USAGE);
         }
         Ok(options)
@@ -261,8 +268,59 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     };
     let listener = std::sync::Arc::new(config.build()?);
     let socket = TcpListener::bind(config.listen).await?;
+    // Bind every socket before starting accept tasks, so partial bind failures are clean.
+    let mut api_sockets = Vec::new();
+    if !options.no_api {
+        for grpc in [false, true] {
+            let port = if options.port == 0 {
+                0
+            } else {
+                options.port + if grpc { 2 } else { 1 }
+            };
+            let address = ([127, 0, 0, 1], port).into();
+            let config = RoleApiConfig {
+                http: (!grpc).then_some(address),
+                grpc: grpc.then_some(address),
+                tls: TlsMode::Disabled,
+                certificate: None,
+                private_key: None,
+                client_ca: None,
+                certificates: Default::default(),
+                databases: config.databases.clone(),
+                loopback_trust: config.loopback_trust,
+                connections: config.connections,
+                idle_timeout_seconds: None,
+                max_age_seconds: None,
+            };
+            let settings = std::sync::Arc::new(config.build()?);
+            let runtime =
+                ApiRuntime::new_role(service.clone(), ApiLimits::default(), settings.clone())?;
+            api_sockets.push((grpc, TcpListener::bind(address).await?, settings, runtime));
+        }
+    }
     let (start, gate) = watch::channel(false);
-    let running = serve_postgresql_bound(socket, service, listener, gate).await?;
+    let running = serve_postgresql_bound(socket, service, listener, gate.clone()).await?;
+    let mut api_listeners = Vec::new();
+    let mut api_runtimes = Vec::new();
+    let setup: io::Result<()> = async {
+        for (grpc, socket, settings, runtime) in api_sockets {
+            api_runtimes.push(runtime.clone());
+            let listener = serve_role_bound(socket, runtime, settings, gate.clone(), grpc).await?;
+            api_listeners.push((grpc, listener));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = setup {
+        for (_, listener) in api_listeners {
+            let _ = listener.shutdown().await;
+        }
+        for runtime in api_runtimes {
+            runtime.shutdown().await;
+        }
+        let _ = running.shutdown().await;
+        return Err(error.into());
+    }
     start.send_replace(true);
     let address = running.address;
     let output = (|| -> io::Result<()> {
@@ -280,6 +338,27 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         if password.is_some() {
             password_notice(&options);
         }
+        for (grpc, listener) in &api_listeners {
+            let protocol = if *grpc { "grpc" } else { "http" };
+            if *grpc {
+                writeln!(stdout, "grpc: {} (h2c)", listener.address)?;
+            } else {
+                writeln!(
+                    stdout,
+                    "http: http://{}/v1/sessions (role sign-in)",
+                    listener.address
+                )?;
+            }
+            eprintln!(
+                "role_api {protocol} listener on {} has TLS disabled; sessions and credentials cross the network in clear",
+                listener.address
+            );
+        }
+        if !options.no_api && !options.trust_local {
+            eprintln!(
+                "hint: over plain HTTP, sign in with SCRAM (plain passwords need TLS), or restart with --trust-local for password-free local access"
+            );
+        }
         if options.trust_local {
             eprintln!(
                 "WARNING: --trust-local lets any local process connect as any role without a password, including Docker containers (they arrive via 127.0.0.1) and port-forwarded peers. Use only on a single-user machine."
@@ -287,13 +366,23 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
         stdout.flush()
     })();
-    if let Err(error) = output {
-        running.shutdown().await?;
-        return Err(error.into());
+    let control = match output {
+        Ok(()) => control().await,
+        Err(error) => Err(error),
+    };
+    let mut stopped = Ok(());
+    for (_, listener) in api_listeners {
+        if let Err(error) = listener.shutdown().await {
+            stopped = Err(error);
+        }
     }
-    let control = control().await;
-    running.shutdown().await?;
+    for runtime in api_runtimes {
+        runtime.shutdown().await;
+    }
+    let pg_stopped = running.shutdown().await;
     control?;
+    stopped?;
+    pg_stopped?;
     Ok(())
 }
 
@@ -371,6 +460,9 @@ mod tests {
         assert_eq!(defaults.database, "postgres");
         assert_eq!(defaults.data, PathBuf::from("giggles-data"));
         assert!(!defaults.trust_local);
+        assert!(!defaults.no_api);
+        assert!(parse(&["--no-api", "--port", "65535"]).unwrap().no_api);
+        assert_eq!(parse(&["--port", "65533"]).unwrap().port, 65533);
         assert!(!defaults.reset_owner_password);
         assert!(
             parse(&["--reset-owner-password"])
@@ -467,6 +559,8 @@ mod tests {
             vec!["--engine", "rocks"],
             vec!["--data"],
             vec!["--port", "65536"],
+            vec!["--port", "65534"],
+            vec!["--port", "65535"],
             vec!["--port", "-1"],
             vec!["--port", "+1"],
             vec!["--owner", "1bad"],

@@ -1,3 +1,7 @@
+mod api_role_support;
+use api_role_support::{FIRST, http, proof};
+use serde_json::json;
+use std::net::SocketAddr;
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
@@ -17,15 +21,18 @@ const RESET_PASSWORD: &str = "Reset-pass_2";
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 
 fn fixture() -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "dev-process-{}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        SERIAL.fetch_add(1, Ordering::Relaxed),
-    ));
+    let root = std::env::var_os("GIGGLES_DEV_PROCESS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!(
+            "dev-process-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            SERIAL.fetch_add(1, Ordering::Relaxed),
+        ));
     for subdir in ["cwd", "tmp"] {
         std::fs::create_dir_all(root.join(subdir)).unwrap();
     }
@@ -47,10 +54,18 @@ fn command(root: &Path) -> Command {
 }
 
 // Keep ownership through every assertion and timeout, including startup failures.
-struct Server(Child, PathBuf);
+struct Server(Child, PathBuf, Option<SocketAddr>, Option<SocketAddr>);
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.0.start_kill();
+        if self.0.try_wait().ok().flatten().is_none() {
+            #[cfg(windows)]
+            if let Some(pid) = self.0.id() {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .output();
+            }
+            let _ = self.0.start_kill();
+        }
     }
 }
 impl Server {
@@ -80,7 +95,7 @@ impl Server {
         } else {
             command.env_remove("GIGGLES_OWNER_PASSWORD");
         }
-        let mut server = Self(command.spawn().unwrap(), root.join("stderr"));
+        let mut server = Self(command.spawn().unwrap(), root.join("stderr"), None, None);
         let mut lines = BufReader::new(server.0.stdout.take().unwrap()).lines();
         let (address_line, url) = timeout(BOUND, async {
             let address = lines
@@ -108,7 +123,38 @@ impl Server {
         assert_ne!(address.port(), 0);
         let credentials = if first { "owner:Dev-pass_1" } else { "owner" };
         assert_eq!(url, format!("postgres://{credentials}@{address}/app"));
-        (server, format!("postgres://owner:{PASSWORD}@{address}/app"))
+        let http = timeout(BOUND, lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        server.2 = Some(
+            http.strip_prefix("http: http://")
+                .unwrap()
+                .strip_suffix("/v1/sessions (role sign-in)")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        let grpc = timeout(BOUND, lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        server.3 = Some(
+            grpc.strip_prefix("grpc: ")
+                .unwrap()
+                .strip_suffix(" (h2c)")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        let connection_url = if first {
+            url
+        } else {
+            format!("postgres://owner:{PASSWORD}@{address}/app")
+        };
+        (server, connection_url)
     }
 
     async fn shutdown(mut self) -> String {
@@ -260,6 +306,8 @@ async fn invalid_argument_exits_with_usage_status() {
     let mut process = Server(
         command(&root).arg("--bogus").spawn().unwrap(),
         root.join("stderr"),
+        None,
+        None,
     );
     let status = timeout(BOUND, process.0.wait())
         .await
@@ -294,7 +342,12 @@ async fn reset(root: &Path, owner: &str, port: u16) -> (std::process::ExitStatus
     command.stderr(Stdio::from(
         std::fs::File::create(root.join("reset-stderr")).unwrap(),
     ));
-    let mut process = Server(command.spawn().unwrap(), root.join("reset-stderr"));
+    let mut process = Server(
+        command.spawn().unwrap(),
+        root.join("reset-stderr"),
+        None,
+        None,
+    );
     let status = timeout(BOUND, process.0.wait())
         .await
         .expect("offline reset exceeded 30 seconds")
@@ -396,4 +449,120 @@ async fn default_server_preserves_existing_legacy_engine_and_content() {
     );
     drop(admin);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn dev_role_apis_trust_crud_h2c_and_scram() {
+    use giggles_server::api::{json::decode_execute, proto};
+    timeout(BOUND * 4, async {
+        let root = fixture();
+        let (server, _) = Server::start_mode(&root, true, true).await;
+        let addr = server.2.unwrap();
+        let open = json!({"role":"owner","database":"app"});
+        let (status, reply) = http(addr, "POST", "/v1/sessions", None, open.clone()).await;
+        assert_eq!(status, 201, "{reply}");
+        let token = reply["sessionId"].as_str().unwrap();
+        for sql in [
+            "CREATE TABLE api_items (id BIGINT PRIMARY KEY, body TEXT)",
+            "INSERT INTO api_items VALUES (1, 'hello')",
+            "SELECT * FROM api_items",
+        ] {
+            let (status, reply) = http(
+                addr,
+                "POST",
+                "/v1/session/execute",
+                Some(token),
+                json!({"sql":{"sql":sql}}),
+            )
+            .await;
+            assert_eq!(status, 200, "{reply}");
+            assert_eq!(reply["code"], "ok", "{reply}");
+            if sql.starts_with("SELECT") {
+                assert_eq!(
+                    reply["sql"]["rows"][0]["values"],
+                    json!([{"intValue":"1"},{"textValue":"hello"}])
+                );
+            }
+        }
+        assert_eq!(
+            http(addr, "DELETE", "/v1/session", Some(token), json!(null))
+                .await
+                .0,
+            204
+        );
+        assert_eq!(
+            http(
+                addr,
+                "POST",
+                "/v1/sessions",
+                None,
+                json!({"role":"owner","database":"app","password":PASSWORD})
+            )
+            .await
+            .0,
+            401
+        );
+        let mut grpc =
+            proto::giggles_client::GigglesClient::connect(format!("http://{}", server.3.unwrap()))
+                .await
+                .unwrap();
+        let opened = grpc
+            .open_session(proto::OpenSessionRequest {
+                role: Some("owner".into()),
+                database: Some("app".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut request =
+            tonic::Request::new(decode_execute(br#"{"sql":{"sql":"SELECT 1"}}"#).unwrap());
+        request
+            .metadata_mut()
+            .insert("x-giggles-session", opened.session_id.parse().unwrap());
+        let reply = grpc.execute(request).await.unwrap().into_inner();
+        assert_eq!(reply.code, "ok");
+        assert_eq!(reply.sql.unwrap().rows.len(), 1);
+        drop(grpc);
+        server.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
+
+        let root = fixture();
+        let (server, url) = Server::start(&root, true).await;
+        let addr = server.2.unwrap();
+        assert_eq!(http(addr, "POST", "/v1/sessions", None, open).await.0, 401);
+        let (status, reply) = http(
+            addr,
+            "POST",
+            "/v1/sessions",
+            None,
+            json!({"role":"owner","database":"app","scram":{"clientFirst":FIRST}}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let challenge = &reply["scram"];
+        // Read the credential printed by the actual child, rather than deriving a verifier.
+        let password = url
+            .strip_prefix("postgres://owner:")
+            .unwrap()
+            .split('@')
+            .next()
+            .unwrap();
+        let (final_message, expected) = proof(password, challenge["serverFirst"].as_str().unwrap());
+        let (status, reply) = http(
+            addr,
+            "POST",
+            "/v1/sessions",
+            None,
+            json!({"scram":{"exchange":challenge["exchange"],"clientFinal":final_message}}),
+        )
+        .await;
+        assert_eq!(status, 201, "{reply}");
+        assert_eq!(reply["scramServerFinal"], expected);
+        let stderr = server.shutdown().await;
+        assert!(stderr.contains("sign in with SCRAM"));
+        std::fs::remove_dir_all(root).unwrap();
+    })
+    .await
+    .expect("dev API scenario exceeded bound");
 }
