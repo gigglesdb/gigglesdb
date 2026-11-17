@@ -35,6 +35,8 @@ pub(crate) mod undo;
 #[allow(dead_code)]
 pub(crate) mod receipt;
 pub mod release;
+// R3-622: driven by the v2 maintenance thread.
+pub(crate) mod retention;
 pub mod rows;
 pub mod statements;
 #[cfg(test)]
@@ -49,4 +51,5 @@ pub use commit::ProtectedPoint;
 pub use ledger::{OperationId, Outcome};
 pub use receipt::Receipt;
 pub use release::{Page, ReleaseTag, Released, Unreleased};
+pub use retention::{RetentionConfig, RetentionStats};
 pub use error::{Budget, DenyRule, TaskError};

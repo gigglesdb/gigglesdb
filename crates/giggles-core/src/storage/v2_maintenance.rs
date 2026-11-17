@@ -5,19 +5,23 @@
 //! heads live in Kernel and are rewritten on every commit, so Kernel is
 //! collected on every tick. The thread waits on a condvar so dropping the
 //! database stops it promptly, and the drop joins it before the KV closes.
+//!
+//! The same thread runs the task retention sweeper (GD-0061 D5, R3-622) every
+//! `RetentionConfig::interval_ms` once the owning `Arc<V2Db>` is attached.
 #![cfg_attr(not(feature = "engine-rocksdb"), allow(dead_code))]
 use super::{CoreError, V2Db, engine};
+use crate::task::retention::{self, RetentionConfig, RetentionStats};
 use engine::{
     gc::{Gc, StepStats},
     kv::Keyspace,
 };
 use std::{
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Default `GcConfig.retention`: protects readers using an unpinned timestamp.
@@ -51,12 +55,27 @@ struct Stop {
     wake: Condvar,
 }
 
+/// The retention sweeper's database handle and settings. The handle is weak
+/// so the thread never keeps the database open.
+#[derive(Default)]
+struct Retention {
+    db: Mutex<Option<Weak<V2Db>>>,
+    config: Mutex<RetentionConfig>,
+}
+
+impl Retention {
+    fn config(&self) -> RetentionConfig {
+        *self.config.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 pub(crate) struct Maintenance {
     stop: Arc<Stop>,
     thread: Option<JoinHandle<()>>,
     replicated: bool,
     budget: Arc<AtomicUsize>,
     errors: Arc<AtomicU64>,
+    retention: Arc<Retention>,
 }
 
 impl Maintenance {
@@ -68,15 +87,21 @@ impl Maintenance {
         });
         let budget = Arc::new(AtomicUsize::new(BUDGET));
         let errors = Arc::new(AtomicU64::new(0));
+        let retention = Arc::new(Retention::default());
         let thread = if replicated {
             None
         } else {
-            let (gc, stop, budget, errors) =
-                (gc.clone(), stop.clone(), budget.clone(), errors.clone());
+            let (gc, stop, budget, errors, retention) = (
+                gc.clone(),
+                stop.clone(),
+                budget.clone(),
+                errors.clone(),
+                retention.clone(),
+            );
             Some(
                 std::thread::Builder::new()
                     .name("giggles-v2-gc".into())
-                    .spawn(move || run(&gc, &stop, &budget, &errors))
+                    .spawn(move || run(&gc, &stop, &budget, &errors, &retention))
                     .map_err(|error| CoreError::Storage(error.to_string()))?,
             )
         };
@@ -86,6 +111,7 @@ impl Maintenance {
             replicated,
             budget,
             errors,
+            retention,
         })
     }
 
@@ -105,14 +131,20 @@ impl Drop for Maintenance {
         *self.stop.stopped.lock().unwrap_or_else(|p| p.into_inner()) = true;
         self.stop.wake.notify_all();
         if let Some(thread) = self.thread.take() {
-            // A panicking GC thread has nothing left to clean up.
-            let _ = thread.join();
+            // The retention sweep upgrades its weak handle; if it held the
+            // last reference, the database drops on this very thread, which
+            // then exits on the stop flag without joining itself.
+            if thread.thread().id() != std::thread::current().id() {
+                // A panicking GC thread has nothing left to clean up.
+                let _ = thread.join();
+            }
         }
     }
 }
 
-fn run(gc: &Gc, stop: &Stop, budget: &AtomicUsize, errors: &AtomicU64) {
+fn run(gc: &Gc, stop: &Stop, budget: &AtomicUsize, errors: &AtomicU64, retention: &Retention) {
     let mut rotation = 0;
+    let mut last_sweep = Instant::now();
     loop {
         let stopped = stop.stopped.lock().unwrap_or_else(|p| p.into_inner());
         let (stopped, _) = stop
@@ -131,6 +163,21 @@ fn run(gc: &Gc, stop: &Stop, budget: &AtomicUsize, errors: &AtomicU64) {
         if result.is_err() {
             // A fenced or failing KV keeps failing; the next tick retries.
             errors.fetch_add(1, Ordering::Relaxed);
+        }
+        let config = retention.config();
+        if last_sweep.elapsed() >= Duration::from_millis(config.interval_ms) {
+            last_sweep = Instant::now();
+            let db = retention
+                .db
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .and_then(Weak::upgrade);
+            if let Some(db) = db
+                && retention::sweep(&db, &config).is_err()
+            {
+                errors.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -167,5 +214,31 @@ impl V2Db {
 
     pub(crate) fn set_gc_retention(&self, retention: Duration) {
         self.gc.set_retention(retention);
+    }
+
+    /// Lets the maintenance thread run the retention sweeper on this database.
+    pub(crate) fn attach_retention(self: &Arc<Self>) {
+        *self
+            .maintenance
+            .retention
+            .db
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(self));
+    }
+
+    /// Replaces the retention settings; the next background pass uses them.
+    pub(crate) fn set_task_retention(&self, config: RetentionConfig) {
+        *self
+            .maintenance
+            .retention
+            .config
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = config;
+    }
+
+    /// One retention pass now, with the current settings.
+    #[cfg_attr(not(all(test, feature = "engine-rocksdb")), allow(dead_code))]
+    pub(crate) fn retention_step(&self) -> Result<RetentionStats, CoreError> {
+        retention::sweep(self, &self.maintenance.retention.config())
     }
 }

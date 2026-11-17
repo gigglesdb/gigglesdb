@@ -1139,6 +1139,17 @@ impl Admin {
         }
         Ok(())
     }
+
+    /// Sets the task retention sweeper's settings (GD-0061 D5): read-log,
+    /// before-values and outcome windows, the pass interval and the batch
+    /// size. The next background pass uses them. No effect on legacy storage.
+    pub fn set_task_retention(&self, config: crate::task::RetentionConfig) -> Result<(), CoreError> {
+        let _ticket = self.inner.enter_sql()?;
+        if let Backend::V2(db) = &self.inner.backend {
+            db.set_task_retention(config);
+        }
+        Ok(())
+    }
 }
 
 impl Admin {
@@ -1194,6 +1205,9 @@ impl Admin {
     fn attach_backend(backend: Backend, limits: Limits) -> Result<Self, CoreError> {
         if limits.admitted == 0 || limits.selected_keys == 0 {
             return Err(CoreError::Limit);
+        }
+        if let Backend::V2(db) = &backend {
+            db.attach_retention();
         }
         Ok(Self {
             inner: Arc::new(Inner {
