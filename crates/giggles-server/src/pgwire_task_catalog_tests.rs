@@ -145,6 +145,8 @@ fn state() -> State {
         copy: None,
         copy_completion: vec![],
         copy_active: None,
+        copy_permit: None,
+        execution_admission: None,
     }
 }
 
