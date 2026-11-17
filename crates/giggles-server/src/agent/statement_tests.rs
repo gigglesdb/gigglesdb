@@ -156,6 +156,7 @@ fn direct(
         op: OperationId::new(op).unwrap(),
         prepared: Box::new(prepared),
         text: Arc::from(sql),
+        bound: None,
     };
     let result = session.execute_protected(&statement, params);
     assert!(!session.in_protected(), "in_protected leaked: {result:?}");

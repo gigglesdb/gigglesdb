@@ -504,3 +504,36 @@ fn reopen_preserves_everything() {
     let next = commit(&f, "requeue-2").unwrap();
     assert_eq!((next.seq, next.rows_affected, next.distinct_charged), (2, 1, 1));
 }
+
+/// A caller's row bound (the native intent) on the real affected count.
+fn commit_bounded(f: &Fixture, id: &str, at_most: usize) -> Result<Receipt, TaskError> {
+    let mut session = f.admin().sql_session();
+    let request = direct(&mut session, REQUEUE);
+    let check = |rows: usize| {
+        if rows > at_most {
+            Err(TaskError::Sql(SqlError::CardinalityViolation))
+        } else {
+            Ok(())
+        }
+    };
+    protected_commit_checked(&mut session, Actor::Executor(&f.ctx), &op(id), request, &check)
+}
+
+#[test]
+fn row_check_refusal_records_nothing_and_leaves_the_id_free() {
+    let f = fixture();
+    // Four rows match; a bound of one (and of three) refuses before staging.
+    for bound in [1, 3] {
+        assert_eq!(
+            commit_bounded(&f, "requeue-1", bound),
+            Err(TaskError::Sql(SqlError::CardinalityViolation))
+        );
+        nothing_recorded(&f, "requeue-1");
+    }
+    // The ID stayed free: the same request under a bound of four commits.
+    let receipt = commit_bounded(&f, "requeue-1", 4).unwrap();
+    assert_eq!(receipt.rows_affected, 4);
+    assert_eq!(f.statuses(), ["queued", "queued", "queued", "queued", "delivered", "failed"]);
+    // A replay returns the stored receipt; the check does not run again.
+    assert_eq!(commit_bounded(&f, "requeue-1", 0).unwrap(), receipt);
+}

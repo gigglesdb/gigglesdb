@@ -245,6 +245,36 @@ pub fn protected_commit(
     commit_with(session, actor, op, request, &mut catalog_def)
 }
 
+/// A caller's check of the statement's affected row count (the native
+/// intent's row bound: exactly one row, or at most `n`). It sees the real
+/// count of the attempt that would commit.
+pub type RowCheck<'a> = dyn Fn(usize) -> Result<(), TaskError> + 'a;
+
+/// [`protected_commit`] with `check` applied to the affected row count of
+/// each attempt, after the statement ran and before anything is staged. A
+/// refusal from `check` is returned as is and is not recorded: the
+/// statement's writes are rolled back with the transaction, and no outcome,
+/// head, membership, change record or receipt is written, so the operation
+/// ID stays free. A replayed outcome (the ID already decided) is returned
+/// without the check, as for every other replay.
+pub fn protected_commit_checked(
+    session: &mut SqlSession,
+    actor: Actor<'_>,
+    op: &OperationId,
+    request: ProtectedRequest,
+    check: &RowCheck<'_>,
+) -> Result<Receipt, TaskError> {
+    commit_checked(
+        session,
+        actor,
+        op,
+        request,
+        &mut catalog_def,
+        &mut stored_apply_source,
+        Some(check),
+    )
+}
+
 /// The task's definition from the task catalog (kind 19).
 pub(crate) fn catalog_def(
     db: &V2Db,
@@ -487,6 +517,7 @@ struct Call<'c> {
     key: Vec<u8>,
     fp: [u8; 32],
     faults: Faults,
+    check: Option<&'c RowCheck<'c>>,
 }
 
 /// A serialization failure or a deadlock: the attempt is retried in a new
@@ -534,6 +565,19 @@ pub(crate) fn commit_sourced(
     request: ProtectedRequest,
     load_def: &mut LoadDef<'_>,
     sources: &mut Sources<'_>,
+) -> Result<Receipt, TaskError> {
+    commit_checked(session, actor, op, request, load_def, sources, None)
+}
+
+/// [`commit_sourced`] with an optional row-count check (an undo has none).
+fn commit_checked(
+    session: &mut SqlSession,
+    actor: Actor<'_>,
+    op: &OperationId,
+    request: ProtectedRequest,
+    load_def: &mut LoadDef<'_>,
+    sources: &mut Sources<'_>,
+    check: Option<&RowCheck<'_>>,
 ) -> Result<Receipt, TaskError> {
     // 0. v2 only (D9), not replicated (D13).
     let db = session.v2_db().ok_or_else(unsupported)?;
@@ -597,7 +641,7 @@ pub(crate) fn commit_sourced(
         }
         ProtectedRequest::Undo { .. } => return Err(unsupported()),
     };
-    let call = Call { db, ctx, op, work, key, fp, faults };
+    let call = Call { db, ctx, op, work, key, fp, faults, check };
     // Steps 4-15, at most three times. Each attempt is a new transaction;
     // the hold is released between attempts.
     let mut retry = 0;
@@ -623,7 +667,7 @@ fn attempt(
     limits: &LoadLimits,
     load_def: &mut LoadDef<'_>,
 ) -> Result<Receipt, TaskError> {
-    let Call { db, ctx, op, work, key, fp, faults } = call;
+    let Call { db, ctx, op, work, key, fp, faults, check } = call;
     let (ctx, fp) = (*ctx, *fp);
     let task = ctx.task;
     // 4. The transaction; 5. the hold, before any snapshot (D1).
@@ -732,6 +776,12 @@ fn attempt(
     }
     // 10. Every buffered row write is an effect and vice versa.
     crate::storage::cross_check_effects(&effects, &txn)?;
+    // The caller's row bound on the real affected count, before anything is
+    // charged or staged: a refusal drops the transaction (rows and hold) and
+    // records nothing.
+    if let Some(check) = check {
+        check(effects.len())?;
+    }
     // 11. Head (exact under the hold) and the membership charge.
     let head = authority::load_head(&mut txn, task)?;
     let seq = head.next_seq;

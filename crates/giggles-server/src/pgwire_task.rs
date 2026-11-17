@@ -458,6 +458,7 @@ impl State {
                 op,
                 prepared,
                 text: std::sync::Arc::from(wrapped),
+                bound: None,
             },
             (ProtectedHead::Preview, Some((prepared, _))) => ProtectedStatement::Preview {
                 prepared,

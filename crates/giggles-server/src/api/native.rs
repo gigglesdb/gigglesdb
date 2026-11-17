@@ -280,6 +280,40 @@ fn lowered_update(
         .map_err(|_| CoreError::Unsupported)
 }
 
+/// The row bound of a native update's intent (R3-708's `intent_bound`):
+/// `one`, or `many` with a cap that is a non-negative integer (else `Type`).
+/// A `claim` never lowers (0A000 from [`lowered_update`]).
+fn row_limit(
+    request: &ops::Request,
+    bindings: &ops::Bindings,
+) -> Result<Option<crate::agent::statement::RowLimit>, ops::Error> {
+    use crate::agent::statement::RowLimit;
+    let intent = match request {
+        ops::Request::Update { intent, .. } | ops::Request::UpdateExpressions { intent, .. } => {
+            intent
+        }
+        _ => return Ok(None),
+    };
+    Ok(match intent {
+        ops::Intent::One => Some(RowLimit::One),
+        ops::Intent::Many { cap } => {
+            let cap = match cap {
+                ops::ValueExpr::Literal(value) => value,
+                ops::ValueExpr::Parameter(name) => {
+                    bindings.get(name).ok_or_else(|| ops::Error::Bind(name.clone()))?
+                }
+            };
+            match cap {
+                ops::Value::Int(cap) => {
+                    Some(RowLimit::AtMost(u64::try_from(*cap).map_err(|_| ops::Error::Type)?))
+                }
+                _ => return Err(ops::Error::Type),
+            }
+        }
+        ops::Intent::Claim { .. } => None,
+    })
+}
+
 /// GD-0061 R3-209: a protected request of a task session, after admission.
 /// A native update (under its operation ID), a preview, an apply and an
 /// outcome lookup run through `Session::execute_protected`, as the SQL forms
@@ -290,12 +324,20 @@ fn protected(
     invocation: Invocation,
     operation_id: Option<OperationId>,
 ) -> Result<NativeResult, CoreError> {
-    use crate::agent::statement::ProtectedStatement;
+    use crate::agent::statement::{ProtectedStatement, RowBound};
     let required = || CoreError::Task(TaskError::OperationIdRequired);
+    // The native intent's bound: checked by the protected commit on the real
+    // affected count (an update), or on the preview's row count (a preview).
+    let mut bound = None;
+    let mut preview_limit = None;
     let (statement, params) = match invocation {
         Invocation::Operation { request, bindings } => {
             let op = operation_id.ok_or_else(required)?;
             let lowered = lowered_update(&request, &bindings)?;
+            match row_limit(&request, &bindings) {
+                Ok(limit) => bound = limit.map(RowBound::new),
+                Err(error) => return Ok(NativeResult::Error(error)),
+            }
             let prepared = session.prepare_protected(StatementClass::Update, &lowered.sql, &[])?;
             if prepared.task_class() != StatementClass::Update {
                 return Err(CoreError::Unsupported);
@@ -304,6 +346,7 @@ fn protected(
                 op,
                 prepared: Box::new(prepared),
                 text: std::sync::Arc::from(lowered.sql),
+                bound: bound.clone(),
             };
             (statement, lowered.params)
         }
@@ -312,6 +355,10 @@ fn protected(
                 return Err(CoreError::Unsupported);
             }
             let lowered = lowered_update(&request, &bindings)?;
+            match row_limit(&request, &bindings) {
+                Ok(limit) => preview_limit = limit,
+                Err(error) => return Ok(NativeResult::Error(error)),
+            }
             let prepared =
                 session.prepare_protected(StatementClass::Preview, &lowered.sql, &[])?;
             if prepared.task_class() != StatementClass::Update {
@@ -334,7 +381,27 @@ fn protected(
         // An update reaches here only as `Operation`; a page is a read.
         _ => return Err(CoreError::Unsupported),
     };
-    let result = session.execute_protected(&statement, &params)?;
+    let result = match session.execute_protected(&statement, &params) {
+        Ok(result) => result,
+        // The commit refused on the intent's bound: nothing was recorded.
+        Err(error) => {
+            return match bound.as_ref().and_then(RowBound::refused) {
+                Some(refused) => Ok(NativeResult::Error(refused)),
+                None => Err(error),
+            };
+        }
+    };
+    // As R3-708's native preview: a preview that breaks the intent is stored,
+    // but its change ID and digest are not returned.
+    if let Some(limit) = preview_limit {
+        let rows = match result.rows.first().and_then(|row| row.values.get(2)) {
+            Some(ops::Value::Int(rows)) => u64::try_from(*rows).unwrap_or(u64::MAX),
+            _ => return Err(CoreError::Corrupt("preview row count".into())),
+        };
+        if let Err(error) = limit.check(rows) {
+            return Ok(NativeResult::Error(error));
+        }
+    }
     Ok(NativeResult::Sql(Released::synthetic(result)))
 }
 

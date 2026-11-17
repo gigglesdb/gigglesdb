@@ -844,3 +844,81 @@ async fn refusal_precedes_table_lookup() {
         f.stop().await;
     }
 }
+
+/// The native intent bound of a refused protected update: a native error,
+/// with nothing committed or recorded.
+#[track_caller]
+fn assert_intent_refused(reply: &Value, kind: &str) {
+    assert_eq!(reply["code"], "native_error", "{reply}");
+    assert_eq!(reply["nativeError"]["kind"], kind, "{reply}");
+    assert!(reply.get("taskError").is_none() && reply.get("sql").is_none(), "{reply}");
+}
+
+/// No outcome is stored under `id` (a refusal that was not recorded).
+async fn no_outcome(f: &Fixture, token: &str, id: &str) {
+    let reply = f
+        .call(token, &with_operation(json!({"taskOutcome": {}}), id))
+        .await
+        .reply();
+    assert_eq!(reply["code"], "ok", "{reply}");
+    assert!(reply["sql"]["rows"].as_array().is_none_or(|rows| rows.is_empty()), "{id}: {reply}");
+}
+
+#[tokio::test]
+async fn native_intent_bounds_the_protected_commit() {
+    // Four rows (1-4) match; the intent is checked on the real affected count
+    // at commit time, before anything is staged.
+    let one = "update shipments where merchant_id = 42 and status = \"failed\" set status = \"queued\"";
+    let at_most = |n: u32| {
+        format!(
+            "update many shipments where merchant_id = 42 and status = \"failed\" \
+             set status = \"queued\" at most {n}"
+        )
+    };
+    for grpc in [false, true] {
+        let f = Fixture::start(grpc).await;
+        let token = f.open().await;
+        // At most 3 with 4 matches: refused, nothing recorded.
+        let request = with_operation(text(&at_most(3)), "many.3");
+        let reply = f.call(&token, &request).await.reply();
+        assert_intent_refused(&reply, "NATIVE_ERROR_CLASS_TOO_MANY_MATCHES");
+        assert_eq!(f.statuses(), BEFORE);
+        no_outcome(&f, &token, "many.3").await;
+        // At most 4 with exactly 4 matches commits.
+        let request = with_operation(text(&at_most(4)), "many.4");
+        assert_eq!(affected(&f.call(&token, &request).await.reply()), "4");
+        assert_eq!(f.statuses(), AFTER);
+        f.admin
+            .sql_session()
+            .execute("UPDATE shipments SET status = 'failed' WHERE id < 5", &[], None)
+            .unwrap();
+        // Intent one with 4 matches: refused, nothing recorded; a preview of
+        // it returns no change ID either.
+        let request = with_operation(text(one), "one.1");
+        let reply = f.call(&token, &request).await.reply();
+        assert_intent_refused(&reply, "NATIVE_ERROR_CLASS_AMBIGUOUS_MATCH");
+        assert_eq!(f.statuses(), BEFORE);
+        no_outcome(&f, &token, "one.1").await;
+        let preview = json!({"taskPreview": {"text": {"text": one, "languageVersion": "0.16"}}});
+        let reply = f.call(&token, &preview).await.reply();
+        assert_intent_refused(&reply, "NATIVE_ERROR_CLASS_AMBIGUOUS_MATCH");
+        // A refused attempt is not recorded, so its ID stays free: the same
+        // request is refused again while 4 rows match, and commits once one
+        // row matches.
+        let reply = f.call(&token, &request).await.reply();
+        assert_intent_refused(&reply, "NATIVE_ERROR_CLASS_AMBIGUOUS_MATCH");
+        assert_eq!(f.statuses(), BEFORE);
+        no_outcome(&f, &token, "one.1").await;
+        f.admin
+            .sql_session()
+            .execute("UPDATE shipments SET status = 'delivered' WHERE id IN (2, 3, 4)", &[], None)
+            .unwrap();
+        assert_eq!(affected(&f.call(&token, &request).await.reply()), "1");
+        let outcome = with_operation(json!({"taskOutcome": {}}), "one.1");
+        let row = single_row(&f.call(&token, &outcome).await.reply());
+        assert_eq!(row[1]["textValue"], "committed");
+        assert_eq!(row[2]["intValue"], "1");
+        assert_eq!(f.statuses()[..5], ["queued", "delivered", "delivered", "delivered", "delivered"]);
+        f.stop().await;
+    }
+}

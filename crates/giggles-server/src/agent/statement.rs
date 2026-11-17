@@ -21,10 +21,61 @@
 
 use giggles_core::{
     CoreError,
-    relational::{ColumnDef, DataType, Description, Prepared, SqlResult, SqlRow, Value},
+    operations as ops,
+    relational::{ColumnDef, DataType, Description, Prepared, SqlError, SqlResult, SqlRow, Value},
     task::{Actor, Outcome, ProtectedRequest, StatementClass, TaskError},
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// The row bound of a native update's intent: `one` is exactly one row,
+/// `many .. at most n` at most `n` (R3-708's `intent_bound`, with the same
+/// native errors).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowLimit {
+    One,
+    AtMost(u64),
+}
+
+impl RowLimit {
+    /// `NotFound` or `AmbiguousMatch` for `One`, `TooManyMatches` past `n`.
+    pub(crate) fn check(self, rows: u64) -> Result<(), ops::Error> {
+        match self {
+            RowLimit::One if rows == 0 => Err(ops::Error::NotFound),
+            RowLimit::One if rows > 1 => Err(ops::Error::AmbiguousMatch),
+            RowLimit::AtMost(cap) if rows > cap => Err(ops::Error::TooManyMatches),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A native update's [`RowLimit`], checked by the protected commit on the
+/// real affected count of the attempt that would commit
+/// (`task::protected_commit_checked`). A refusal records nothing; the native
+/// error is kept here for the caller, which answers it as a native error.
+#[derive(Clone, Debug)]
+pub(crate) struct RowBound {
+    limit: RowLimit,
+    refused: Arc<Mutex<Option<ops::Error>>>,
+}
+
+impl RowBound {
+    pub(crate) fn new(limit: RowLimit) -> Self {
+        RowBound { limit, refused: Arc::default() }
+    }
+    /// The commit's check: a refusal leaves its native error in `self` and
+    /// returns 21000 (cardinality_violation) to the commit.
+    fn check(&self, rows: usize) -> Result<(), TaskError> {
+        let rows = u64::try_from(rows).unwrap_or(u64::MAX);
+        self.limit.check(rows).map_err(|error| {
+            *self.refused.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(error);
+            TaskError::Sql(SqlError::CardinalityViolation)
+        })
+    }
+    /// The native error of the commit's refusal, if it refused.
+    pub(crate) fn refused(&self) -> Option<ops::Error> {
+        self.refused.lock().unwrap_or_else(|poison| poison.into_inner()).take()
+    }
+}
 
 /// The longest operation ID, in bytes (`task::ledger::MAX_OPERATION_ID`).
 pub const MAX_OPERATION_ID: usize = 128;
@@ -89,6 +140,8 @@ pub(crate) enum ProtectedStatement {
         op: OperationId,
         prepared: Box<Prepared>,
         text: Arc<str>,
+        /// The native intent's bound; `None` for SQL (`OPERATION '<id>' UPDATE`).
+        bound: Option<RowBound>,
     },
     Preview {
         #[allow(dead_code, reason = "kept as admitted and described; task::preview re-prepares the text")]
@@ -176,8 +229,8 @@ pub(crate) fn protected_seam(
     params: &[Value],
 ) -> Result<SqlResult, CoreError> {
     match statement {
-        ProtectedStatement::Direct { op, prepared, text } => {
-            direct(session, op, prepared, text, params)
+        ProtectedStatement::Direct { op, prepared, text, bound } => {
+            direct(session, op, prepared, text, params, bound.as_ref())
         }
         ProtectedStatement::Outcome { op } => show_outcome(session, op),
         ProtectedStatement::Preview { text, .. } => super::preview::preview(session, text, params),
@@ -198,6 +251,7 @@ fn direct(
     prepared: &Prepared,
     text: &Arc<str>,
     params: &[Value],
+    bound: Option<&RowBound>,
 ) -> Result<SqlResult, CoreError> {
     let ctx = session
         .task()
@@ -214,9 +268,18 @@ fn direct(
         params: params.to_vec(),
         text: text.clone(),
     };
-    let receipt =
-        giggles_core::task::protected_commit(&mut session.sql, Actor::Executor(&ctx), &op, request)
-            .map_err(CoreError::from)?;
+    let actor = Actor::Executor(&ctx);
+    let receipt = match bound {
+        None => giggles_core::task::protected_commit(&mut session.sql, actor, &op, request),
+        Some(bound) => giggles_core::task::protected_commit_checked(
+            &mut session.sql,
+            actor,
+            &op,
+            request,
+            &|rows| bound.check(rows),
+        ),
+    }
+    .map_err(CoreError::from)?;
     Ok(SqlResult {
         columns: Vec::new(),
         rows: Vec::new(),
