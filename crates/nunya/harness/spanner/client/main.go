@@ -125,6 +125,21 @@ func main() {
 	_ = os.Setenv("SPANNER_DISABLE_AFE_SERVER_TIMING", "true")
 	_ = os.Setenv("SPANNER_DISABLE_DIRECT_ACCESS_GRPC_BUILTIN_METRICS", "true")
 	_ = os.Setenv("GOOGLE_CLOUD_SPANNER_DISABLE_LOG_CLIENT_OPTIONS", "true")
+	if len(os.Args) == 2 && (os.Args[1] == "upstream" || os.Args[1] == "stream") {
+		ctx, cancel := context.WithTimeout(context.Background(), 110*time.Second)
+		defer cancel()
+		var err error
+		if os.Args[1] == "upstream" {
+			err = upstream(ctx)
+		} else {
+			err = streamScenario(ctx)
+		}
+		if err != nil {
+			fmt.Printf("FAIL %s execution status-%s\n", os.Args[1], status.Code(err))
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) != 5 || os.Args[1] != "resume" || (os.Args[2] != "before" && os.Args[2] != "after") || os.Args[3] != "--reference" {
 		fmt.Println("FAIL resume arguments expected-resume-before-or-after-and-reference")
 		os.Exit(1)

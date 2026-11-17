@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # D2 native Spanner scenarios. Own only the emulator started here and our server.
-[[ ${1:-} == resume && $# == 1 ]] || { echo 'FAIL resume arguments expected-resume'; exit 1; }
+scenarios=()
+for scenario in "$@"; do
+  case "$scenario" in
+    resume|stream) scenarios+=("$scenario") ;;
+    all) scenarios+=(resume stream) ;;
+    *) echo 'FAIL setup arguments expected-resume-stream-or-all'; exit 1 ;;
+  esac
+done
+[[ ${#scenarios[@]} != 0 ]] || { echo 'FAIL setup arguments missing-scenario'; exit 1; }
+scenario=setup
 umask 077
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 work=J:/gigglesdb-work/nunya/gd81-d2
@@ -9,7 +18,7 @@ binary=${NUNYA_D2_NUNYA:-J:/gigglesdb-work/nunya/target-w2/debug/nunya.exe}
 export GOMODCACHE="$work/gomod" GOCACHE="$work/gocache" GOTOOLCHAIN=local GOFLAGS=-mod=mod
 export TEMP="$work/tmp" TMP="$work/tmp" TMPDIR="$work/tmp"
 mkdir -p "$TEMP" "${NUNYA_D2_ROOT:-$work/runs}"
-run=$(mktemp -d "${NUNYA_D2_ROOT:-$work/runs}/resume-XXXXXXXX")
+run=$(mktemp -d "${NUNYA_D2_ROOT:-$work/runs}/d2-XXXXXXXX")
 export NUNYA_HOME="$run/home"
 mkdir -p "$NUNYA_HOME" "$run/state"
 owned_emulator=false
@@ -25,7 +34,7 @@ cleanup() {
   if $owned_emulator; then
     docker rm -fv gd81-d2-emulator >"$run/docker-cleanup.log" 2>&1 || rc=1
   fi
-  if [[ $rc != 0 ]]; then printf 'FAIL resume %s see-run-evidence\n' "$stage"; fi
+  if [[ $rc != 0 ]]; then printf 'FAIL %s %s see-run-evidence\n' "$scenario" "$stage"; fi
   exit "$rc"
 }
 trap cleanup EXIT
@@ -71,7 +80,10 @@ os.chmod(sys.argv[1], 0o600)
 PY
 "$binary" key generate >"$run/root.key" 2>"$run/key.log"
 verifier=$("$binary" standing hash <"$run/bootstrap.secret" 2>"$run/hash.log" | tr -d '\r\n')
-cp "$here/policy_gsql.toml" "$run/policy.toml"
+# This scenario must reach revocation rather than the worked-example token budget.
+sed -e 's/tokenize_limit_per_session = 20$/tokenize_limit_per_session = 100000/' \
+    -e 's/tokenize_limit_per_principal = 200$/tokenize_limit_per_principal = 1000000/' \
+    "$here/policy_gsql.toml" >"$run/policy.toml"
 cat >"$run/nunya.toml" <<EOF
 admin_listen = '127.0.0.1:$admin_port'
 policy = 'policy.toml'
@@ -115,23 +127,73 @@ os.remove(sys.argv[1])
 PY
 "$binary" principal grant "${bootstrap[@]}" d2-agent --route spanner-native=read-write >"$run/grant.log" 2>&1
 agent=(--server "$server" --principal d2-agent --principal-secret-file "$run/agent.secret")
-"$binary" session acquire "${agent[@]}" --route spanner-native --mode read-write >"$run/acquire.log" 2>&1
-# The trusted CLI emits quoted POSIX exports. Keep both exports and bearer private.
-eval "$("$binary" session env "${agent[@]}" --format sh 2>"$run/env.log" | tr -d '\r')"
-[[ $PGUSER == session:* && -n $PGPASSWORD ]]
-export NUNYA_D2_BEARER="nunya.session:${PGUSER#session:}.$PGPASSWORD"
-unset PGUSER PGPASSWORD PGHOST PGPORT PGDATABASE
 export NUNYA_D2_NATIVE="127.0.0.1:$native_port"
 export NUNYA_D2_DATABASE=projects/test-project/instances/test-instance/databases/gsql
 export SPANNER_DISABLE_BUILTIN_METRICS=true
 stage=build
 (cd "$here/client" && go build -o "$run/client.exe" .) >"$run/go-build.log" 2>&1
-stage=before
-"$run/client.exe" resume before --reference "$run/token-reference"
-stage=restart
-kill "$server_pid"
-wait "$server_pid" 2>/dev/null || true
-server_pid=
-start_server after
-stage=after
-"$run/client.exe" resume after --reference "$run/token-reference"
+if [[ " ${scenarios[*]} " == *" stream "* ]]; then
+  stage=upstream
+  "$run/client.exe" upstream
+fi
+for scenario in "${scenarios[@]}"; do
+  stage=acquire
+  "$binary" session acquire "${agent[@]}" --context "$scenario" --route spanner-native --mode read-write >"$run/acquire-$scenario.log" 2>&1
+  # The trusted CLI emits quoted POSIX exports. Keep exports and bearer private.
+  eval "$("$binary" session env "${agent[@]}" --context "$scenario" --format sh 2>"$run/env-$scenario.log" | tr -d '\r')"
+  [[ $PGUSER == session:* && -n $PGPASSWORD ]]
+  export NUNYA_D2_BEARER="nunya.session:${PGUSER#session:}.$PGPASSWORD"
+  scenario_session=${PGUSER#session:}
+  unset PGUSER PGPASSWORD PGHOST PGPORT PGDATABASE
+  export NUNYA_D2_REVOKE="$run/revoke-$scenario.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf '%q ' "$binary" session revoke "${agent[@]}" --context "$scenario"
+    printf '> %q 2>&1\n' "$run/revoke-$scenario.log"
+  } >"$NUNYA_D2_REVOKE"
+  chmod 0700 "$NUNYA_D2_REVOKE"
+  case "$scenario" in
+    resume)
+      stage=before
+      "$run/client.exe" resume before --reference "$run/token-reference"
+      # Resume's persistence check intentionally restarts the shared gateway.
+      stage=restart
+      kill "$server_pid"
+      wait "$server_pid" 2>/dev/null || true
+      server_pid=
+      start_server after
+      stage=after
+      "$run/client.exe" resume after --reference "$run/token-reference"
+      ;;
+    stream)
+      stage=query
+      "$run/client.exe" stream
+      stage=gateway-stopped
+      python - "$run" "$scenario_session" <<'PY'
+import json, pathlib, sys
+run, session = pathlib.Path(sys.argv[1]), sys.argv[2]
+ended, statement = None, None
+for path in run.glob('serve-*.log'):
+    with path.open(encoding='utf-8') as source:
+        for line in source:
+            try:
+                record = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if record.get('session') != session:
+                continue
+            if record.get('kind') == 'lifecycle' and record.get('event') == 'session_ended':
+                ended = record.get('ts')
+            if record.get('kind') == 'statement' and isinstance(record.get('rows'), int):
+                if statement is None or record['rows'] > statement['rows']:
+                    statement = record
+rows = statement['rows'] if statement is not None else 'missing'
+print(f'INFO stream gateway-rows={rows}')
+ok = (ended is not None and statement is not None
+      and statement.get('ts', -1) >= ended and statement['rows'] < 20000)
+print(f'{"PASS" if ok else "FAIL"} stream gateway-stopped')
+sys.exit(0 if ok else 1)
+PY
+      ;;
+  esac
+done
