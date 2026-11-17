@@ -9,7 +9,7 @@ user = &quot;nunya&quot;
 dbname = &quot;pgdb&quot;
 tls = &quot;disable&quot;
 connect_timeout_ms = 5000
-application_name = &quot;nunya&quot;</code></pre><p>Use the lowercase PostgreSQL harness policy (<code>harness/policy.toml</code>) and supply the root key and upstream password as in the quickstart. Run policy check, open a task, then serve. The agent still connects to Nunya on port 6432 using a PostgreSQL driver. Catalog loading uses the Spanner PostgreSQL dialect.</p></section><section aria-labelledby="native"><h2 id="native">Native listener configuration</h2><p>Create a private configuration directory. Copy <code>harness/spanner/policy_gsql.toml</code> there as policy.toml, generate a root key, and use this local-only configuration:</p><pre><code>policy = &quot;policy.toml&quot;
+application_name = &quot;nunya&quot;</code></pre><p>Use the lowercase PostgreSQL harness policy (<code>harness/policy.toml</code>) and supply the root key and upstream password as in the quickstart. Run policy check, then serve, and acquire a session with <code>nunya session acquire</code>. The agent still connects to Nunya on port 6432 using a PostgreSQL driver. Catalog loading uses the Spanner PostgreSQL dialect.</p></section><section aria-labelledby="native"><h2 id="native">Native listener configuration</h2><p>Create a private configuration directory. Copy <code>harness/spanner/policy_gsql.toml</code> there as policy.toml, generate a root key, and use this local-only configuration:</p><pre><code>policy = &quot;policy.toml&quot;
 state_dir = &quot;state&quot;
 root_key_file = &quot;root.key&quot;
 allow_plaintext = true
