@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
@@ -20,8 +21,10 @@ import (
 
 // rpcCounter counts attempts at the transport boundary, including library retries.
 type rpcCounter struct {
-	mu    sync.Mutex
-	calls map[string]int
+	mu            sync.Mutex
+	calls         map[string]int
+	commitSession string
+	commitTx      []byte
 }
 
 func (c *rpcCounter) count(method string) {
@@ -33,6 +36,12 @@ func (c *rpcCounter) count(method string) {
 func (c *rpcCounter) unary(bearer string) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoke grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		c.count(method)
+		if commit, ok := req.(*sppb.CommitRequest); ok {
+			c.mu.Lock()
+			c.commitSession = commit.GetSession()
+			c.commitTx = append([]byte(nil), commit.GetTransactionId()...)
+			c.mu.Unlock()
+		}
 		return invoke(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+bearer), method, req, reply, cc, opts...)
 	}
 }
@@ -125,6 +134,24 @@ func main() {
 	_ = os.Setenv("SPANNER_DISABLE_AFE_SERVER_TIMING", "true")
 	_ = os.Setenv("SPANNER_DISABLE_DIRECT_ACCESS_GRPC_BUILTIN_METRICS", "true")
 	_ = os.Setenv("GOOGLE_CLOUD_SPANNER_DISABLE_LOG_CLIENT_OPTIONS", "true")
+	if len(os.Args) == 2 && os.Args[1] == "probe" {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		if err := probeScenario(ctx); err != nil {
+			fmt.Printf("FAIL probe execution status-%s\n", status.Code(err))
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) == 3 && os.Args[1] == "commit" {
+		ctx, cancel := context.WithTimeout(context.Background(), 55*time.Second)
+		defer cancel()
+		if err := commitScenario(ctx, os.Args[2]); err != nil {
+			fmt.Printf("FAIL commit %s execution status-%s\n", os.Args[2], status.Code(err))
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) == 2 && (os.Args[1] == "upstream" || os.Args[1] == "stream") {
 		ctx, cancel := context.WithTimeout(context.Background(), 110*time.Second)
 		defer cancel()

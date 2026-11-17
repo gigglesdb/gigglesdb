@@ -4,12 +4,17 @@ set -euo pipefail
 scenarios=()
 for scenario in "$@"; do
   case "$scenario" in
-    resume|stream) scenarios+=("$scenario") ;;
-    all) scenarios+=(resume stream) ;;
-    *) echo 'FAIL setup arguments expected-resume-stream-or-all'; exit 1 ;;
+    resume|stream|probe|commit) scenarios+=("$scenario") ;;
+    all) scenarios+=(probe resume stream commit) ;;
+    *) echo 'FAIL setup arguments expected-resume-stream-probe-commit-or-all'; exit 1 ;;
   esac
 done
 [[ ${#scenarios[@]} != 0 ]] || { echo 'FAIL setup arguments missing-scenario'; exit 1; }
+case "${NUNYA_D2_MUX_RW:-on}" in
+  on) echo 'INFO mux-rw=on' ;;
+  off) export GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS_FOR_RW=false; echo 'INFO mux-rw=off' ;;
+  *) echo 'FAIL setup invalid-mux-rw'; exit 1 ;;
+esac
 scenario=setup
 umask 077
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -27,12 +32,13 @@ stage=setup
 cleanup() {
   local rc=$?
   trap - EXIT
+  if [[ -f $run/server.pid ]]; then server_pid=$(cat "$run/server.pid"); fi
   if [[ -n $server_pid ]]; then
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
   if $owned_emulator; then
-    docker rm -fv gd81-d2-emulator >"$run/docker-cleanup.log" 2>&1 || rc=1
+    docker rm -fv gd81-d2b-emulator >"$run/docker-cleanup.log" 2>&1 || rc=1
   fi
   if [[ $rc != 0 ]]; then printf 'FAIL %s %s see-run-evidence\n' "$scenario" "$stage"; fi
   exit "$rc"
@@ -54,7 +60,7 @@ sys.exit(1)
 PY
 }
 if [[ -z ${NUNYA_D2_EMULATOR_GRPC:-} && -z ${NUNYA_D2_EMULATOR_REST:-} ]]; then
-  docker run -d --name gd81-d2-emulator --label gd81-d2=1 \
+  docker run -d --name gd81-d2b-emulator --label gd81-d2b=1 \
     -p 127.0.0.1:19010:9010 -p 127.0.0.1:19020:9020 \
     gcr.io/cloud-spanner-emulator/emulator:1.5.41 >"$run/docker-start.log" 2>&1
   owned_emulator=true
@@ -108,10 +114,23 @@ unset verifier
 start_server() {
   "$binary" serve --config "$run/nunya.toml" >"$run/serve-$1.log" 2>&1 &
   server_pid=$!
+  printf '%s\n' "$server_pid" >"$run/server.pid"
   wait_port "127.0.0.1:$mgmt_port"
   wait_port "127.0.0.1:$native_port"
   kill -0 "$server_pid"
 }
+# The hook is a separate process: retain the current pid on disk for cleanup.
+export NUNYA_D2_RESTART="$run/restart.sh"
+{
+  printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+  declare -f wait_port start_server
+  printf 'binary=%q\nrun=%q\nmgmt_port=%q\nnative_port=%q\n' "$binary" "$run" "$mgmt_port" "$native_port"
+  printf 'kill "$(cat "$run/server.pid")"\n'
+  # A stopped listener can briefly remain open; wait for the old process to exit.
+  printf 'for ((i=0; i<100; i++)); do kill -0 "$(cat "$run/server.pid")" 2>/dev/null || break; sleep .1; done\n'
+  printf 'start_server commit-restart\n'
+} >"$NUNYA_D2_RESTART"
+chmod 0700 "$NUNYA_D2_RESTART"
 start_server before
 server="http://127.0.0.1:$mgmt_port"
 bootstrap=(--server "$server" --principal bootstrap --principal-secret-file "$run/bootstrap.secret")
@@ -136,9 +155,26 @@ if [[ " ${scenarios[*]} " == *" stream "* ]]; then
   stage=upstream
   "$run/client.exe" upstream
 fi
+expanded=()
 for scenario in "${scenarios[@]}"; do
+  if [[ $scenario == commit ]]; then
+    expanded+=(commit-control commit-revoked commit-expired commit-restart)
+  else
+    expanded+=("$scenario")
+  fi
+done
+commit_started=$SECONDS
+for scenario in "${expanded[@]}"; do
+  if [[ $scenario == commit-control ]]; then commit_started=$SECONDS; fi
   stage=acquire
-  "$binary" session acquire "${agent[@]}" --context "$scenario" --route spanner-native --mode read-write >"$run/acquire-$scenario.log" 2>&1
+  ttl=()
+  if [[ $scenario == commit-expired ]]; then ttl=(--ttl 20s); fi
+  "$binary" session acquire "${agent[@]}" --context "$scenario" --route spanner-native --mode read-write "${ttl[@]}" >"$run/acquire-$scenario.log" 2>&1
+  if [[ $scenario == commit-expired ]]; then
+    "$binary" session show "${agent[@]}" --context "$scenario" >"$run/expiry.log" 2>&1
+    export NUNYA_D2_EXPIRES_MS=$(sed -n 's/^expires_ms: //p' "$run/expiry.log" | tr -d '\r')
+    [[ $NUNYA_D2_EXPIRES_MS =~ ^[0-9]+$ ]]
+  fi
   # The trusted CLI emits quoted POSIX exports. Keep exports and bearer private.
   eval "$("$binary" session env "${agent[@]}" --context "$scenario" --format sh 2>"$run/env-$scenario.log" | tr -d '\r')"
   [[ $PGUSER == session:* && -n $PGPASSWORD ]]
@@ -153,6 +189,15 @@ for scenario in "${scenarios[@]}"; do
   } >"$NUNYA_D2_REVOKE"
   chmod 0700 "$NUNYA_D2_REVOKE"
   case "$scenario" in
+    probe)
+      stage=probe
+      "$run/client.exe" probe
+      ;;
+    commit-*)
+      stage=transaction
+      "$run/client.exe" commit "${scenario#commit-}"
+      [[ $((SECONDS - commit_started)) -lt 180 ]]
+      ;;
     resume)
       stage=before
       "$run/client.exe" resume before --reference "$run/token-reference"
