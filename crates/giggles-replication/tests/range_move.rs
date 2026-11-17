@@ -49,7 +49,9 @@ fn eventually(mut ready: impl FnMut() -> bool) {
     }
 }
 
-fn start() -> (
+fn start(
+    members: [u64; 3],
+) -> (
     Root,
     Vec<ClusterNode>,
     Vec<RegistryWatcher>,
@@ -71,14 +73,15 @@ fn start() -> (
         .map(|(&id, l)| (id, l.local_addr().unwrap().to_string()))
         .collect();
     drop(listeners);
-    let layout = presplit(&[], &MEMBERS, 3).unwrap();
+    let spare = *NODES.iter().find(|id| !members.contains(id)).unwrap();
+    let layout = presplit(&[], &members, 3).unwrap();
     let mut configs = Vec::new();
     let nodes: Vec<_> = NODES
         .iter()
         .map(|&node| {
             let mut transport = config_for(&pki, node, [91; 16], &addresses);
-            if node != 4 {
-                transport.peers.retain(|id, _| *id != 4);
+            if node != spare {
+                transport.peers.retain(|id, _| *id != spare);
             }
             let config = ClusterNodeConfig {
                 transport,
@@ -102,36 +105,41 @@ fn start() -> (
             ClusterNode::start(config).unwrap()
         })
         .collect();
-    assert!(nodes[3].host().groups().is_empty());
+    let spare_node = &nodes[(spare - 1) as usize];
+    assert!(spare_node.host().groups().is_empty());
     nodes[0].bootstrap_directory(READY).unwrap();
-    for node in &nodes[..3] {
+    for node in nodes.iter().filter(|n| members.contains(&n.node_id())) {
         node.wait_ready(READY).unwrap();
     }
     assert_eq!(nodes[0].enrol_members(READY).unwrap(), 3);
     assert_eq!(nodes[0].enrol_members(READY).unwrap(), 0);
-    let mut watchers: Vec<_> = nodes[..3]
+    let mut watchers: Vec<_> = nodes
         .iter()
+        .filter(|n| members.contains(&n.node_id()))
         .map(|node| node.start_registry_watcher(Duration::from_millis(100)))
         .collect();
     registry::enrol(
         &**nodes[0].client(),
         1,
         NodeRecord {
-            id: 4,
+            id: spare,
             state: NodeState::Active,
-            address: addresses[&4].clone(),
-            fingerprint: pki.nodes[&4].2.clone(),
+            address: addresses[&spare].clone(),
+            fingerprint: pki.nodes[&spare].2.clone(),
         },
     )
     .unwrap();
-    watchers.push(nodes[3].start_registry_watcher(Duration::from_millis(100)));
+    watchers.push(spare_node.start_registry_watcher(Duration::from_millis(100)));
     eventually(|| {
-        nodes[..3].iter().all(|node| {
-            node.transport()
-                .calls()
-                .call(4, PeerCall::Node(NodeCall::Status), CALL)
-                .is_ok()
-        })
+        nodes
+            .iter()
+            .filter(|n| members.contains(&n.node_id()))
+            .all(|node| {
+                node.transport()
+                    .calls()
+                    .call(spare, PeerCall::Node(NodeCall::Status), CALL)
+                    .is_ok()
+            })
     });
     (root, nodes, watchers, configs)
 }
@@ -147,8 +155,10 @@ fn leader(nodes: &[ClusterNode]) -> &ClusterNode {
     &nodes[id.unwrap()]
 }
 
-fn exercise(move_leader: bool) {
-    let (_root, nodes, mut watchers, _) = start();
+fn exercise(move_leader: bool, lower_target: bool) {
+    let (_root, nodes, mut watchers, _) = start(if lower_target { [1, 3, 4] } else { MEMBERS });
+    let to = if lower_target { 2 } else { 4 };
+    let target = &nodes[(to - 1) as usize];
     let range = RangeId(2);
     if !move_leader && leader(&nodes).node_id() == 3 {
         leader(&nodes)
@@ -203,7 +213,7 @@ fn exercise(move_leader: bool) {
     let mut redirects = 0;
     let moved = loop {
         let n = leader(&nodes);
-        match move_replica(n, range, from, 4, READY).unwrap() {
+        match move_replica(n, range, from, to, READY).unwrap() {
             MoveOutcome::Done(desc) => break desc,
             MoveOutcome::NotLeader { .. } => {
                 redirects += 1;
@@ -218,7 +228,8 @@ fn exercise(move_leader: bool) {
     assert!(moved.epoch > desc.epoch);
     let mut want = vec![1, 2, 3, 4];
     want.retain(|id| *id != from);
-    let mut got: Vec<_> = moved
+    moved.validate().unwrap();
+    let got: Vec<_> = moved
         .replicas
         .iter()
         .map(|r| {
@@ -226,7 +237,6 @@ fn exercise(move_leader: bool) {
             r.node
         })
         .collect();
-    got.sort();
     assert_eq!(got, want);
     assert_eq!(
         leader(&nodes)
@@ -238,29 +248,29 @@ fn exercise(move_leader: bool) {
         Some(moved.clone())
     );
     assert_eq!(
-        move_replica(leader(&nodes), range, from, 4, READY).unwrap(),
+        move_replica(leader(&nodes), range, from, to, READY).unwrap(),
         MoveOutcome::Done(moved.clone())
     );
     assert_eq!(
-        nodes[3].host().store().unwrap().descriptor(range).unwrap(),
+        target.host().store().unwrap().descriptor(range).unwrap(),
         Some(moved.clone())
     );
     leader(&nodes)
         .host()
         .group(range)
         .unwrap()
-        .transfer_leader(4);
-    eventually(|| nodes[3].host().service(range).is_some());
+        .transfer_leader(target.node_id());
+    eventually(|| target.host().service(range).is_some());
     let fresh = RoutedRangeClient::new(
-        nodes[3].node_id(),
-        nodes[3]
+        target.node_id(),
+        target
             .layout()
             .iter()
             .find(|d| d.id == SYSTEM_RANGE)
             .unwrap()
             .clone(),
-        nodes[3].transport().calls().clone() as Arc<dyn RangeTransport>,
-        nodes[3].host().clone() as Arc<dyn LocalRanges>,
+        target.transport().calls().clone() as Arc<dyn RangeTransport>,
+        target.host().clone() as Arc<dyn LocalRanges>,
     );
     assert_eq!(
         fresh
@@ -295,17 +305,22 @@ fn exercise(move_leader: bool) {
 
 #[test]
 fn moves_follower_to_unhosted_node() {
-    exercise(false);
+    exercise(false, false);
+}
+
+#[test]
+fn moves_replica_to_lower_node_id_and_preserves_data() {
+    exercise(false, true);
 }
 
 #[test]
 fn transfers_leadership_before_moving_leader() {
-    exercise(true);
+    exercise(true, false);
 }
 
 #[test]
 fn admin_move_redirects_and_resumes_after_leader_restart() {
-    let (_root, mut nodes, mut watchers, configs) = start();
+    let (_root, mut nodes, mut watchers, configs) = start(MEMBERS);
     let range = RangeId(2);
     let leader_id = leader(&nodes).node_id();
     let follower = MEMBERS.iter().copied().find(|id| *id != leader_id).unwrap();
@@ -371,7 +386,7 @@ fn admin_move_redirects_and_resumes_after_leader_restart() {
 
 #[test]
 fn registry_read_retries_after_system_range_move() {
-    let (_root, nodes, mut watchers, _) = start();
+    let (_root, nodes, mut watchers, _) = start(MEMBERS);
     let old = nodes[0]
         .client()
         .descriptor_for(&range_key(RangeSpace::Catalog, &[registry::REGISTRY_TAG]))

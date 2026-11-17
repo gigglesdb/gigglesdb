@@ -140,6 +140,7 @@ pub(crate) fn run_move(
             node: to,
             role: ReplicaRole::Learner,
         });
+        desc.replicas.sort_by_key(|r| r.node);
         desc.epoch.0 = desc
             .epoch
             .0

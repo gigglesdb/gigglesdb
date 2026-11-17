@@ -392,6 +392,7 @@ impl StateMachine for RangeStateMachine {
             };
             replicas.push(ReplicaDesc { node, role });
         }
+        replicas.sort_by_key(|r| r.node);
         if let Some(new) = self
             .store
             .change_replicas(self.range, replicas, clear_lineage, at)?
@@ -770,6 +771,52 @@ fn take_bytes<'a>(r: &mut &'a [u8]) -> Result<&'a [u8], StateError> {
 #[cfg(test)]
 mod membership_tests {
     use super::*;
+    #[test]
+    fn lower_node_learner_and_promotion_keep_descriptor_sorted() {
+        let dir = std::env::temp_dir().join(format!("lower-node-conf-{}", std::process::id()));
+        let store = Arc::new(RangeStore::create(&dir, [93; 16]).unwrap());
+        let range = RangeId(2);
+        store
+            .create_range(&RangeDescriptor {
+                id: range,
+                epoch: Epoch(7),
+                start: vec![],
+                end: None,
+                replicas: [3, 4]
+                    .map(|node| ReplicaDesc {
+                        node,
+                        role: ReplicaRole::Voter,
+                    })
+                    .to_vec(),
+            })
+            .unwrap();
+        let state = RangeStateMachine::new(range, store.clone());
+        let mut cc = ConfChangeV2::default();
+        cc.mut_changes().push(raft::eraftpb::ConfChangeSingle {
+            node_id: 2,
+            ..Default::default()
+        });
+        for (index, change, role) in [
+            (1, ConfChangeType::AddLearnerNode, ReplicaRole::Learner),
+            (2, ConfChangeType::AddNode, ReplicaRole::Voter),
+        ] {
+            cc.mut_changes()[0].set_change_type(change);
+            state
+                .apply_conf_change(Some(&cc), AppliedPosition { index, term: 1 })
+                .unwrap();
+            let desc = store.descriptor(range).unwrap().unwrap();
+            desc.validate().unwrap();
+            assert_eq!(
+                desc.replicas.iter().map(|r| r.node).collect::<Vec<_>>(),
+                [2, 3, 4]
+            );
+            assert_eq!(desc.replicas[0].role, role);
+        }
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn membership_updates_moved_epoch() {
         let dir = std::env::temp_dir().join(format!("moved-conf-{}", std::process::id()));
