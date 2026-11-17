@@ -56,13 +56,16 @@ impl StatementClass {
     ];
 }
 
-/// Classes a task session may run in this build. Phase 3 adds `Select`; phase 6 (its last
-/// item, R3-626) has added `Update` and `OutcomeLookup`; phase 7 (R3-707, the item that
-/// wires the SQL statements once preview, approval and apply exist) has added `Preview`
-/// and `Apply`.
+/// Classes a task session may run in this build. Phase 3's last item (R3-315) has added
+/// `Select` and `Catalog` (catalog queries are filtered by R3-312, coordinator ruling D11);
+/// phase 6 (its last item, R3-626) has added `Update` and `OutcomeLookup`; phase 7 (R3-707,
+/// the item that wires the SQL statements once preview, approval and apply exist) has added
+/// `Preview` and `Apply`.
 pub const ENABLED: &[StatementClass] = &[
     StatementClass::Show,
     StatementClass::Set,
+    StatementClass::Select,
+    StatementClass::Catalog,
     StatementClass::Update,
     StatementClass::OutcomeLookup,
     StatementClass::Preview,
@@ -119,6 +122,8 @@ mod tests {
             &[
                 StatementClass::Show,
                 StatementClass::Set,
+                StatementClass::Select,
+                StatementClass::Catalog,
                 StatementClass::Update,
                 StatementClass::OutcomeLookup,
                 StatementClass::Preview,

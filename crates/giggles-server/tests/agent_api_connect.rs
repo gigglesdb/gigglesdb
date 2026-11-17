@@ -313,12 +313,16 @@ async fn agent_api_statements_reach_admission() {
     let address = f.agent_http.address;
     let token = session_id(&f.open_http(address, &f.agent, json!({"task": "inc-436"}), false).await);
     for (body, code) in [
-        (json!({"sql": {"sql": "SELECT id FROM shipments"}}), "0A000"),
+        // `Select` is admitted since R3-315; the executor holds no SELECT
+        // grant here, so the privilege intersection refuses it.
+        (json!({"sql": {"sql": "SELECT id FROM shipments"}}), "42501"),
         (json!({"sql": {"sql": "BEGIN"}}), "0A000"),
         (json!({"sql": {"sql": "INSERT INTO shipments VALUES (1, 42, 'new')"}}), "0A000"),
         (json!({"sql": {"sql": UPDATE_SQL}}), "42T04"),
         (json!({"text": {"text": UPDATE_TEXT}}), "42T04"),
-        (json!({"text": {"text": "shipments where id=1"}}), "0A000"),
+        // A native text read is a `Select`: admitted, then refused by the
+        // privilege intersection (no SELECT grant here).
+        (json!({"text": {"text": "shipments where id=1"}}), "42501"),
         (json!({"begin": {}}), "0A000"),
         (json!({"searchPath": {"set": true, "schemas": ["public"]}}), "ok"),
     ] {
@@ -329,7 +333,8 @@ async fn agent_api_statements_reach_admission() {
     let token = f.open_grpc(grpc_address, &f.agent, None).await.unwrap();
     let mut client = f.grpc(grpc_address, &f.agent).await;
     for (request, code) in [
-        (grpc_sql("SELECT 1"), "0A000"),
+        // A relation-free probe is a `Select` and is admitted (R3-315).
+        (grpc_sql("SELECT 1"), "ok"),
         (grpc_sql(UPDATE_SQL), "42T04"),
         (grpc_text(UPDATE_TEXT), "42T04"),
     ] {

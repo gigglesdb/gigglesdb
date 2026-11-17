@@ -5,23 +5,20 @@
 //! the release protocol. A non-task session's catalog answers are unchanged
 //! byte for byte.
 //!
-//! `Catalog` (and `Select`) are not yet in `task::admit::ENABLED` (R3-315
-//! enables them at the Phase 3 close), so over the agent listener a catalog
-//! query that names a relation is refused as `Catalog` before any catalog
-//! read. These wire tests prove that refusal is logged once, charges nothing
-//! and puts no hidden name on the wire. The filtered catalog itself is proven
-//! by the server-lib tests of the same names (`pgwire::task_catalog_tests`),
-//! which admit `Catalog` and `Select` through the cfg(test) route.
+//! `Catalog` and `Select` are in `task::admit::ENABLED` since R3-315 (the
+//! Phase 3 close), so these wire tests run catalog queries over the agent
+//! listener, in the simple and the extended protocol, and check the filtered
+//! answers: the task (readable `id` and `status`, hidden `merchant_id`) sees
+//! only its table and shown columns, and no hidden name reaches the wire.
+//! The server-lib tests of the same names (`pgwire::task_catalog_tests`)
+//! cover a richer fixture (masked and labelled columns, comments, defaults).
 #![cfg(feature = "engine-rocksdb")]
 mod agent_support;
 
 use agent_support::{AgentServer, Msg, agent_wire, error_of, ordinary_wire};
 use giggles_core::{
     roles::TablePrivilege,
-    task::{
-        StatementClass, TaskError,
-        readlog::{ENTRY_PGWIRE_EXTENDED, ENTRY_PGWIRE_SIMPLE, class_code, outcome_of},
-    },
+    task::readlog::{ENTRY_PGWIRE_EXTENDED, ENTRY_PGWIRE_SIMPLE},
 };
 
 /// Names a task session must never see: the hidden column of `shipments`,
@@ -48,7 +45,8 @@ const INDEXES: &str =
     "SELECT indexname, indexdef FROM pg_catalog.pg_indexes WHERE schemaname = 'public' ORDER BY indexname";
 
 /// Task rows, another table, an index and comments that name hidden things,
-/// and SELECT on both tables for the ordinary login.
+/// SELECT on both tables for the ordinary login and on `shipments` for the
+/// executor.
 fn seed(server: &AgentServer) {
     let mut sql = server.admin.sql_session();
     for statement in [
@@ -69,6 +67,11 @@ fn seed(server: &AgentServer) {
             .grant_table(table, "oncall_lead", &[TablePrivilege::Select])
             .unwrap();
     }
+    server
+        .admin
+        .roles()
+        .grant_table("shipments", "agent_exec", &[TablePrivilege::Select])
+        .unwrap();
 }
 
 /// Every text the answer carries, lower-cased: no hidden name may occur.
@@ -79,61 +82,84 @@ fn assert_no_hidden(messages: &[Msg]) {
     }
 }
 
-/// A catalog query naming a relation is refused as `Catalog` on both entry
-/// points before any catalog read: the same refusal, logged once per
-/// statement with its text, class and entry point, nothing charged, and no
-/// hidden name in the answer.
-async fn refused_on_both_paths(sql: &str) {
+fn rows(messages: &[Msg]) -> Vec<Vec<String>> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            Msg::Row(values) => Some(values.iter().map(|v| v.clone().unwrap_or_default()).collect()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A catalog query on both entry points answers `expected` from the task's
+/// filtered catalog, with no hidden name in the answer. Returns the server,
+/// for checks of what was charged and logged.
+async fn filtered_on_both_paths(sql: &str, expected: &[&[&str]]) -> AgentServer {
     let (server, _agent, _ordinary, mut wire) = agent_wire().await;
     seed(&server);
-    let refusal = Some((
-        "0A000".to_owned(),
-        TaskError::NotAllowedInTaskSession(StatementClass::Catalog)
-            .message()
-            .to_owned(),
-    ));
+    let expected: Vec<Vec<String>> = expected
+        .iter()
+        .map(|row| row.iter().map(|v| v.to_string()).collect())
+        .collect();
     let simple = wire.simple(sql).await;
-    assert_eq!(error_of(&simple), refusal, "{simple:?}");
-    assert_no_hidden(&simple);
     let extended = wire.extended(sql, &[], 0).await;
-    assert_eq!(error_of(&extended), refusal, "{extended:?}");
-    assert_no_hidden(&extended);
     for messages in [&simple, &extended] {
-        assert!(!messages.iter().any(|m| matches!(m, Msg::Row(_))), "{messages:?}");
+        assert_eq!(error_of(messages), None, "{messages:?}");
+        assert_no_hidden(messages);
+        assert_eq!(rows(messages), expected, "{sql}: {messages:?}");
     }
+    server
+}
+
+/// A catalog query that reads no application row charges nothing.
+async fn filtered_uncharged(sql: &str, expected: &[&[&str]]) {
+    let server = filtered_on_both_paths(sql, expected).await;
     let task = server.admin.tasks().get("inc-436").unwrap().unwrap().id;
     let disclosure = server.admin.task_disclosure(task).unwrap();
-    assert_eq!(disclosure.rows_returned, 0);
-    assert!(disclosure.debits.is_empty(), "{disclosure:?}");
-    let records = server.admin.task_read_log(task).unwrap();
-    assert_eq!(records.len(), 2, "{records:?}");
-    for (record, entry) in records.iter().zip([ENTRY_PGWIRE_SIMPLE, ENTRY_PGWIRE_EXTENDED]) {
-        assert_eq!(record.text, sql);
-        assert_eq!(record.class, class_code(StatementClass::Catalog));
-        assert_eq!(record.entry, entry);
-        assert_eq!(record.outcome, outcome_of("0A000"));
-        assert_eq!(record.released_rows, 0);
-    }
+    assert_eq!((disclosure.rows_returned, disclosure.debits.len()), (0, 0), "{disclosure:?}");
 }
 
 #[tokio::test]
 async fn pg_attribute_lists_only_readable_and_masked() {
-    refused_on_both_paths(PG_ATTRIBUTE).await;
+    filtered_uncharged(
+        PG_ATTRIBUTE,
+        &[&["id", "1", "20"], &["status", "2", "25"], &["id", "1", "20"]],
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn pg_class_lists_only_task_table() {
-    refused_on_both_paths(PG_CLASS).await;
+    filtered_uncharged(PG_CLASS, &[&["shipments", "r"], &["shipments_pkey", "i"]]).await;
 }
 
 #[tokio::test]
 async fn information_schema_columns_filtered() {
-    refused_on_both_paths(COLUMNS).await;
+    filtered_uncharged(
+        COLUMNS,
+        &[&["shipments", "id", "bigint"], &["shipments", "status", "text"]],
+    )
+    .await;
 }
 
+/// The application rows of a mixed catalog query are only the task's rows
+/// (two of merchant 42), released, charged and logged with the catalog
+/// query's text on each entry point.
 #[tokio::test]
 async fn user_relation_rows_in_catalog_query_are_charged() {
-    refused_on_both_paths(MIXED).await;
+    let server = filtered_on_both_paths(MIXED, &[&["shipments", "2"]]).await;
+    let task = server.admin.tasks().get("inc-436").unwrap().unwrap().id;
+    let records = server.admin.task_read_log(task).unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    for (record, entry) in records.iter().zip([ENTRY_PGWIRE_SIMPLE, ENTRY_PGWIRE_EXTENDED]) {
+        assert_eq!((record.text.as_str(), record.entry), (MIXED, entry), "{record:?}");
+        assert_eq!((record.pages, record.released_rows), (1, 2), "{record:?}");
+        assert_eq!(record.sqlstate_text(), "00000", "{record:?}");
+    }
+    let disclosure = server.admin.task_disclosure(task).unwrap();
+    assert!(disclosure.rows_returned >= 4, "{disclosure:?}");
+    assert_eq!(disclosure.debits.len(), 2, "{disclosure:?}");
 }
 
 /// The catalog exchanges a non-task session sends, each in the simple and the

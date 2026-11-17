@@ -1,14 +1,11 @@
 //! GD-0061 R3-313: the native API, typed reads and the SQL reply through the
 //! release protocol, over the real agent and ordinary HTTP and gRPC
-//! listeners. `Select` is not yet in `task::admit::ENABLED`, so on an agent
-//! listener every read is refused by admission today: these tests check that
-//! such a refusal is logged once (with its entry point and text), charges
-//! nothing and puts no row value on the wire. The released paths themselves
-//! (masking, debits, one page per read) are proven by lib tests of the same
-//! names in `src/api/dispatch/native_release_tests.rs`, which admit `Select`
-//! through the cfg(test) route. `non_task_native_unchanged` compares an
+//! listeners. Since R3-315 `Select` is in `task::admit::ENABLED`, so these
+//! tests read through the agent listeners: every read is masked, charged and
+//! logged once with its entry point before anything is encoded, and a write
+//! is refused before it runs. `non_task_native_unchanged` compares an
 //! ordinary session's replies byte-for-byte with bytes recorded on BASE
-//! ac5b6466, before this item.
+//! ac5b6466, before R3-313.
 #![cfg(feature = "engine-rocksdb")]
 mod agent_support;
 
@@ -55,7 +52,7 @@ const SQL: &str = "SELECT id, status FROM shipments ORDER BY id";
 /// Ordinary and agent HTTP and gRPC listeners over one service. `shipments`
 /// holds three rows of merchant 42 (status `failed`) and one of merchant 7
 /// (status `secret`); task `inc-436` sees merchant 42, reads `id` and
-/// `merchant_id` and gets `status` masked.
+/// `merchant_id` and gets `status` masked. The executor holds SELECT.
 struct Fixture {
     admin: giggles_core::Admin,
     ca: TestCert,
@@ -84,6 +81,10 @@ impl Fixture {
         admin
             .roles()
             .grant_table("shipments", "incident_controller", &[TablePrivilege::Insert])
+            .unwrap();
+        admin
+            .roles()
+            .grant_table("shipments", "agent_exec", &[TablePrivilege::Select])
             .unwrap();
         let issuer = admin.roles().get("incident_controller").unwrap().unwrap();
         admin
@@ -352,71 +353,109 @@ fn code(body: &[u8]) -> String {
     body["code"].as_str().unwrap_or_default().to_owned()
 }
 
-/// No row value of `shipments` (masked or out of scope) is in `bytes`.
+/// No unmasked or out-of-scope row value of `shipments` is in `bytes`.
 fn no_row_values(bytes: &[u8]) {
     let text = String::from_utf8_lossy(bytes);
-    for value in ["failed", "secret", "***"] {
+    for value in ["failed", "secret"] {
         assert!(!text.contains(value), "{value} on the wire: {text}");
     }
 }
 
-/// Nothing was charged to the task.
-fn nothing_charged(f: &Fixture) {
-    let disclosure = f.admin.task_disclosure(f.task()).unwrap();
-    assert_eq!(
-        (disclosure.rows_returned, disclosure.bytes_returned, disclosure.debits.len()),
-        (0, 0, 0),
-        "{disclosure:?}"
-    );
+/// The `(id, status)` pairs of a JSON reply's rows (operation outcome or SQL).
+fn rows(body: &[u8]) -> Vec<(String, String)> {
+    let view: Value = serde_json::from_slice(body).unwrap();
+    let rows = view["operationOutcome"]["rows"]
+        .as_array()
+        .or_else(|| view["sql"]["rows"].as_array())
+        .unwrap_or_else(|| panic!("no rows: {view}"));
+    rows.iter()
+        .map(|row| {
+            let values = &row["values"];
+            (
+                values[0]["intValue"].as_str().unwrap().to_owned(),
+                values[1]["textValue"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
 }
 
-/// A typed read on the agent listener is refused by admission before it
-/// runs: one read-log record (HTTP entry, Select, its text), no page,
-/// nothing charged, no row value in the reply.
+/// The task's three rows, `status` masked.
+fn masked_rows() -> Vec<(String, String)> {
+    (1..=3).map(|id| (id.to_string(), "***".to_owned())).collect()
+}
+
+/// A gRPC reply in its JSON form, for `rows`.
+fn grpc_json(reply: &proto::ExecuteReply) -> Vec<u8> {
+    wire_json::encode_reply(reply).unwrap()
+}
+
+/// A typed read on the agent listener is released exactly once: masked
+/// values on the wire, one page, one debit, one read-log record of the HTTP
+/// entry, and no row outside the task's scope.
+/// What a task was charged: the head's counters and the debit records.
+fn charge(
+    d: &giggles_core::task::release::Disclosure,
+) -> (u64, u64, u64, Vec<giggles_core::task::release::DebitView>) {
+    (d.rows_read, d.rows_returned, d.bytes_returned, d.debits.clone())
+}
+
 #[tokio::test]
 async fn typed_read_released_once() {
     let f = Fixture::start().await;
     let address = f.agent_http.address;
     let token = f.open_http(address, &f.agent).await;
     let body = f.exec_http(address, &f.agent, &token, &typed_read(), false).await;
-    assert_eq!(code(&body), "0A000", "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code(&body), "ok", "{}", String::from_utf8_lossy(&body));
+    assert_eq!(rows(&body), masked_rows());
     no_row_values(&body);
     let records = f.admin.task_read_log(f.task()).unwrap();
     assert_eq!(records.len(), 1, "{records:?}");
     let record = &records[0];
     assert_eq!(record.entry, ENTRY_HTTP);
     assert_eq!(record.class, class_code(StatementClass::Select));
-    assert_eq!((record.pages, record.released_rows), (0, 0));
-    assert_eq!(record.sqlstate_text(), "0A000");
+    assert_eq!((record.pages, record.released_rows, record.masked_values), (1, 3, 3));
     assert!(record.text.contains("shipments"), "{}", record.text);
-    nothing_charged(&f);
+    let disclosure = f.admin.task_disclosure(f.task()).unwrap();
+    assert_eq!(disclosure.debits.len(), 1, "{disclosure:?}");
+    assert!(disclosure.rows_returned >= 3, "{disclosure:?}");
     f.stop().await;
 }
 
-/// A native read and a native INSERT ... RETURNING on the agent listener:
-/// both refused by admission, each logged once with its class, nothing
-/// charged, no row inserted and no row value in either reply.
+/// A native read on the agent listener is masked and charged before it is
+/// encoded. A native INSERT ... RETURNING is refused by admission before it
+/// runs: logged once with its class, no row inserted, nothing more charged
+/// and no row value in its reply.
 #[tokio::test]
 async fn native_returning_masked_and_charged() {
     let f = Fixture::start().await;
     let address = f.agent_http.address;
     let token = f.open_http(address, &f.agent).await;
-    for request in [native_read(), native_insert_returning(50)] {
-        let body = f.exec_http(address, &f.agent, &token, &request, false).await;
-        assert_eq!(code(&body), "0A000", "{}", String::from_utf8_lossy(&body));
-        no_row_values(&body);
-    }
+    let body = f.exec_http(address, &f.agent, &token, &native_read(), false).await;
+    assert_eq!(code(&body), "ok", "{}", String::from_utf8_lossy(&body));
+    assert_eq!(rows(&body), masked_rows());
+    no_row_values(&body);
+    let charged = f.admin.task_disclosure(f.task()).unwrap();
+    assert_eq!(charged.debits.len(), 1, "{charged:?}");
+    let body = f
+        .exec_http(address, &f.agent, &token, &native_insert_returning(50), false)
+        .await;
+    assert_eq!(code(&body), "0A000", "{}", String::from_utf8_lossy(&body));
+    no_row_values(&body);
+    assert!(!String::from_utf8_lossy(&body).contains("***"));
     let records = f.admin.task_read_log(f.task()).unwrap();
     assert_eq!(
-        records.iter().map(|r| (r.class, r.entry, r.pages)).collect::<Vec<_>>(),
+        records
+            .iter()
+            .map(|r| (r.class, r.entry, r.pages, r.released_rows))
+            .collect::<Vec<_>>(),
         [
-            (class_code(StatementClass::Select), ENTRY_HTTP, 0),
-            (class_code(StatementClass::Insert), ENTRY_HTTP, 0),
+            (class_code(StatementClass::Select), ENTRY_HTTP, 1, 3),
+            (class_code(StatementClass::Insert), ENTRY_HTTP, 0, 0),
         ],
         "{records:?}"
     );
     assert!(records[1].text.contains("Returning"), "{}", records[1].text);
-    nothing_charged(&f);
+    assert_eq!(charge(&f.admin.task_disclosure(f.task()).unwrap()), charge(&charged));
     let count = f
         .admin
         .sql_session()
@@ -426,9 +465,9 @@ async fn native_returning_masked_and_charged() {
     f.stop().await;
 }
 
-/// The same refused request over HTTP/1.1, HTTP/2 and gRPC: the same reply
-/// code, one record per call with its transport's entry point, and the same
-/// (zero) charge.
+/// The same read over HTTP/1.1, HTTP/2 and gRPC: the same rows, one record
+/// per call with its transport's entry point, and the same charge (released
+/// rows and bytes) for each.
 #[tokio::test]
 async fn http_and_grpc_same_charge() {
     let f = Fixture::start().await;
@@ -436,64 +475,70 @@ async fn http_and_grpc_same_charge() {
     let token = f.open_http(address, &f.agent).await;
     for h2 in [false, true] {
         let body = f.exec_http(address, &f.agent, &token, &native_read(), h2).await;
-        assert_eq!(code(&body), "0A000");
+        assert_eq!(code(&body), "ok");
+        assert_eq!(rows(&body), masked_rows());
         no_row_values(&body);
     }
     let mut client = f.grpc(f.agent_grpc.address, &f.agent).await;
     let token = f.open_grpc(&mut client).await;
     let reply = exec_grpc(&mut client, &token, &native_read()).await;
-    assert_eq!(reply.code, "0A000");
-    assert!(reply.native_result.is_none(), "{reply:?}");
+    assert_eq!(reply.code, "ok");
+    no_row_values(&reply.encode_to_vec());
+    assert_eq!(rows(&grpc_json(&reply)), masked_rows());
     let records = f.admin.task_read_log(f.task()).unwrap();
     assert_eq!(
         records.iter().map(|r| r.entry).collect::<Vec<_>>(),
         [ENTRY_HTTP, ENTRY_HTTP, ENTRY_GRPC],
         "{records:?}"
     );
-    assert!(records.iter().all(|r| r.text == records[0].text && r.charged_rows_returned == 0));
-    nothing_charged(&f);
+    for record in &records {
+        assert_eq!(
+            (&record.text, record.pages, record.released_rows, record.released_bytes),
+            (&records[0].text, 1, 3, records[0].released_bytes),
+            "{records:?}"
+        );
+    }
+    assert!(records[0].released_bytes > 0);
     f.stop().await;
 }
 
 /// SQL over the agent API (the framed `Request::Sql` reply): a SELECT is
-/// refused by admission and logged once with its text and class, over HTTP
-/// and gRPC; a statement that does not parse is refused and logged once too;
-/// nothing is charged.
+/// masked, charged and logged once with its text and class, over HTTP and
+/// gRPC; a statement that does not parse is refused, logged once and
+/// charges nothing.
 #[tokio::test]
 async fn framed_sql_reply_released() {
     let f = Fixture::start().await;
     let address = f.agent_http.address;
     let token = f.open_http(address, &f.agent).await;
     let body = f.exec_http(address, &f.agent, &token, &sql(SQL), false).await;
-    assert_eq!(code(&body), "0A000");
+    assert_eq!(code(&body), "ok", "{}", String::from_utf8_lossy(&body));
+    assert_eq!(rows(&body), masked_rows());
     no_row_values(&body);
+    let charged = f.admin.task_disclosure(f.task()).unwrap();
     let body = f.exec_http(address, &f.agent, &token, &sql("SELEC id"), false).await;
-    // Admission (by its leading word) answers before the parser does.
-    assert_eq!(code(&body), "0A000", "{}", String::from_utf8_lossy(&body));
+    assert_ne!(code(&body), "ok", "{}", String::from_utf8_lossy(&body));
+    assert_eq!(charge(&f.admin.task_disclosure(f.task()).unwrap()), charge(&charged));
     let mut client = f.grpc(f.agent_grpc.address, &f.agent).await;
     let token = f.open_grpc(&mut client).await;
     let reply = exec_grpc(&mut client, &token, &sql(SQL)).await;
-    assert_eq!(reply.code, "0A000");
-    assert!(reply.sql.is_none_or(|sql| sql.rows.is_empty()));
+    assert_eq!(reply.code, "ok");
+    no_row_values(&reply.encode_to_vec());
+    assert_eq!(rows(&grpc_json(&reply)), masked_rows());
     let records = f.admin.task_read_log(f.task()).unwrap();
     assert_eq!(
         records
             .iter()
-            .map(|r| (r.text.as_str(), r.entry, r.sqlstate_text()))
+            .map(|r| (r.text.as_str(), r.entry, r.released_rows))
             .collect::<Vec<_>>(),
-        [
-            (SQL, ENTRY_HTTP, "0A000".to_owned()),
-            ("SELEC id", ENTRY_HTTP, "0A000".to_owned()),
-            (SQL, ENTRY_GRPC, "0A000".to_owned()),
-        ],
+        [(SQL, ENTRY_HTTP, 3), ("SELEC id", ENTRY_HTTP, 0), (SQL, ENTRY_GRPC, 3)],
         "{records:?}"
     );
     assert_eq!(
-        (records[0].class, records[2].class, records[0].pages),
-        (class_code(StatementClass::Select), class_code(StatementClass::Select), 0),
+        (records[0].class, records[2].class, records[0].pages, records[1].pages),
+        (class_code(StatementClass::Select), class_code(StatementClass::Select), 1, 0),
         "{records:?}"
     );
-    nothing_charged(&f);
     f.stop().await;
 }
 

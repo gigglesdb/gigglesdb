@@ -279,6 +279,8 @@ mod task_catalog_visibility;
 mod task_release_native;
 #[path = "task_release_simple.rs"]
 mod task_release_simple;
+#[path = "task_safe_read_network.rs"]
+mod task_safe_read_network;
 #[path = "returning_spill_network.rs"]
 mod returning_spill_network;
 #[path = "sort_spill_network.rs"]

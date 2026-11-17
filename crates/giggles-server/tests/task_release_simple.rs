@@ -3,14 +3,14 @@
 //! the wire unreleased, and a non-task session's exchange is unchanged byte
 //! for byte.
 //!
-//! Over the agent listener a task session reaches only what admission lets
-//! through: `Select` is not yet in `task::admit::ENABLED`, and DECLARE, FETCH,
-//! MOVE and COPY are refused as their class before any table read. These wire
-//! tests prove those refusals are logged once, charge nothing and put no row
-//! (and no CopyOut header) on the wire. The per-chunk, per-fetch and
-//! before-the-header releases of a task's rows are proven by the server-lib
-//! tests of the same names (`pgwire::task_release_tests`), which admit
-//! `Select` through the cfg(test) route.
+//! Over the agent listener a task SELECT runs (`Select` is in
+//! `task::admit::ENABLED` since R3-315) and is released before it is
+//! encoded; DECLARE, FETCH, MOVE and COPY are refused as their class before
+//! any table read. These wire tests prove the release and that those
+//! refusals are logged once, charge nothing and put no row (and no CopyOut
+//! header) on the wire. The per-chunk, per-fetch and before-the-header
+//! releases of a task's rows are also proven by the server-lib tests of the
+//! same names (`pgwire::task_release_tests`).
 #![cfg(feature = "engine-rocksdb")]
 mod agent_support;
 
@@ -24,7 +24,7 @@ use giggles_core::{
 };
 
 /// Five task-visible rows and one other, readable and updatable by the
-/// ordinary login.
+/// ordinary login; the executor holds SELECT.
 fn seed(server: &AgentServer) {
     server
         .admin
@@ -44,6 +44,11 @@ fn seed(server: &AgentServer) {
             "oncall_lead",
             &[TablePrivilege::Select, TablePrivilege::Update],
         )
+        .unwrap();
+    server
+        .admin
+        .roles()
+        .grant_table("shipments", "agent_exec", &[TablePrivilege::Select])
         .unwrap();
 }
 
@@ -91,18 +96,49 @@ async fn refused_once(server: &AgentServer, wire: &mut Wire, sql: &str, class: S
     assert_eq!(record.released_rows, 0, "{sql}");
 }
 
-/// A task SELECT on the simple path: refused at admission (Select is not
-/// enabled), logged once, nothing charged. (Per-chunk release is proven by
-/// the lib test `pgwire::task_release_tests::simple_select_released_per_chunk`.)
-/// The same SELECT from an ordinary session streams all its rows.
+/// A task SELECT on the simple path: only the task's rows reach the wire,
+/// released, charged and logged once as a simple-query statement. A task
+/// SELECT naming the hidden `merchant_id` is refused before it runs. (Per-
+/// chunk release of a long result is proven by the lib test
+/// `pgwire::task_release_tests::simple_select_released_per_chunk`.) The same
+/// SELECT from an ordinary session streams all its rows.
+/// What a task was charged: the head's counters and the debit records.
+fn charge(
+    d: &giggles_core::task::release::Disclosure,
+) -> (u64, u64, u64, Vec<giggles_core::task::release::DebitView>) {
+    (d.rows_read, d.rows_returned, d.bytes_returned, d.debits.clone())
+}
+
 #[tokio::test]
 async fn simple_select_released_per_chunk() {
     let (server, _agent, ordinary, mut wire) = agent_wire().await;
     seed(&server);
-    let sql = "SELECT id, status FROM shipments WHERE merchant_id = 42 ORDER BY id";
-    refused_once(&server, &mut wire, sql, StatementClass::Select).await;
+    let task_sql = "SELECT id, status FROM shipments ORDER BY id";
+    let messages = wire.simple(task_sql).await;
+    assert_eq!(error_of(&messages), None, "{messages:?}");
+    let ids: Vec<_> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Msg::Row(values) => values[0].clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, ["1", "2", "3", "4", "5"], "{messages:?}");
     let task = server.admin.tasks().get("inc-436").unwrap().unwrap().id;
-    assert_eq!(server.admin.task_read_log(task).unwrap().len(), 1);
+    let records = server.admin.task_read_log(task).unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        (records[0].text.as_str(), records[0].entry, records[0].class),
+        (task_sql, ENTRY_PGWIRE_SIMPLE, class_code(StatementClass::Select))
+    );
+    assert_eq!((records[0].pages, records[0].released_rows), (1, 5));
+    let charged = server.admin.task_disclosure(task).unwrap();
+    assert!(charged.rows_returned >= 5, "{charged:?}");
+    let sql = "SELECT id, status FROM shipments WHERE merchant_id = 42 ORDER BY id";
+    let messages = wire.simple(sql).await;
+    assert_eq!(error_of(&messages).map(|e| e.0), Some("42501".to_owned()), "{messages:?}");
+    assert!(!messages.iter().any(|m| matches!(m, Msg::Row(_))), "{messages:?}");
+    assert_eq!(charge(&server.admin.task_disclosure(task).unwrap()), charge(&charged));
 
     let (_listener, mut ordinary) = ordinary_wire(&server, &ordinary).await;
     let messages = ordinary.simple(sql).await;

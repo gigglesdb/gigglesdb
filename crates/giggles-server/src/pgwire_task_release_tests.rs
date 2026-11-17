@@ -1,9 +1,8 @@
 //! GD-0061 R3-310: the Execute path of a task session through the release
 //! protocol, driven through `State::handle` with real Parse, Bind and Execute
-//! bodies. `Select` is not yet in `task::admit::ENABLED`, so these tests admit
-//! it through the cfg(test) route (`agent::statement::test_route`).
+//! bodies. `Select` is in `task::admit::ENABLED` since R3-315.
 use super::*;
-use crate::{AgentBinding, Service, agent::statement::test_route};
+use crate::{AgentBinding, Service};
 use giggles_core::{
     Admin, Engine, Limits,
     roles::{NewRole, TablePrivilege},
@@ -203,7 +202,6 @@ fn data_rows(out: &[u8]) -> Vec<Vec<Option<String>>> {
 /// pages and its text.
 #[test]
 fn portal_paging_releases_each_fetch() {
-    test_route::enable(&[StatementClass::Select]);
     let (service, mut session) = fixture(10_000);
     let mut state = state();
     let out = extended(&mut state, &mut session, SELECT).unwrap();
@@ -237,7 +235,6 @@ fn portal_paging_releases_each_fetch() {
     assert_eq!(record.pages, 3);
     assert_eq!(record.released_rows, ROWS as u64);
     assert_eq!(record.masked_values, ROWS as u64);
-    test_route::enable(&[]);
 }
 
 /// A page the release refuses is never encoded: with 300 rows of budget the
@@ -245,7 +242,6 @@ fn portal_paging_releases_each_fetch() {
 /// of its rows reach the wire.
 #[test]
 fn page_over_budget_is_never_encoded() {
-    test_route::enable(&[StatementClass::Select]);
     let (service, mut session) = fixture(300);
     let mut state = state();
     assert_eq!(extended(&mut state, &mut session, SELECT), Err("54T01"));
@@ -258,7 +254,6 @@ fn page_over_budget_is_never_encoded() {
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].released_rows, 256);
     assert_eq!(records[0].sqlstate_text(), "54T01");
-    test_route::enable(&[]);
 }
 
 /// A retained result is released once; before each later slice (`at > 0`)
@@ -267,7 +262,6 @@ fn page_over_budget_is_never_encoded() {
 /// task the check is a no-op.
 #[test]
 fn cached_returning_result_revalidated_per_slice() {
-    test_route::enable(&[StatementClass::Select]);
     let (service, mut session) = fixture(10_000);
     let prepared = session.prepare(SELECT).unwrap();
     let unreleased = session.execute_prepared_unreleased(&prepared, &[]).unwrap();
@@ -301,7 +295,6 @@ fn cached_returning_result_revalidated_per_slice() {
     assert!(!unreleased.is_task());
     assert_eq!(plain.release_page(unreleased).unwrap().get().rows.len(), 1);
     assert_eq!(revalidate(&plain, 5, &mut diagnostic), Ok(()));
-    test_route::enable(&[]);
 }
 
 // GD-0061 R3-311: the simple-query path, SQL cursors and COPY TO STDOUT.
@@ -347,7 +340,6 @@ fn returned(service: &Service) -> u64 {
 /// with none of its rows on the wire.
 #[test]
 fn simple_select_released_per_chunk() {
-    test_route::enable(&[StatementClass::Select]);
     let (service, mut session) = fixture(10_000);
     let mut state = self::state();
     let out = simple(&mut state, &mut session, SELECT).unwrap();
@@ -375,7 +367,6 @@ fn simple_select_released_per_chunk() {
     // Only the page that went out is charged as returned (rows read by the
     // refused page may still be debited, with no rows returned).
     assert_eq!(returned(&service), 256);
-    test_route::enable(&[]);
 }
 
 /// Runs one SQL cursor command through `Cursors::execute` as the simple path
@@ -408,7 +399,6 @@ fn cursor_command(
 /// MOVE that charged nothing would have let it through.
 #[test]
 fn declare_fetch_released_per_fetch() {
-    test_route::enable(&[StatementClass::Select]);
     let declare = format!("DECLARE c CURSOR WITH HOLD FOR {SELECT}");
     let (service, mut session) = fixture(10_000);
     let mut state = self::state();
@@ -449,7 +439,6 @@ fn declare_fetch_released_per_fetch() {
     );
     assert!(data_rows(&out).is_empty(), "a refused page is never encoded");
     assert_eq!(returned(&service), 250);
-    test_route::enable(&[]);
 }
 
 /// COPY TO STDOUT releases the whole result as one page before the
@@ -457,7 +446,6 @@ fn declare_fetch_released_per_fetch() {
 /// result over budget is refused with nothing written at all.
 #[test]
 fn copy_out_released_before_first_byte() {
-    test_route::enable(&[StatementClass::Select]);
     let sql = format!("COPY ({SELECT}) TO STDOUT");
     let options = crate::auth::statements::copy_stdout_select(&sql)
         .unwrap()
@@ -481,7 +469,6 @@ fn copy_out_released_before_first_byte() {
     );
     assert!(out.is_empty(), "nothing before the release: {out:?}");
     assert_eq!(returned(&service), 0);
-    test_route::enable(&[]);
 }
 
 /// Outside a task session the converted paths are unchanged: a simple SELECT,

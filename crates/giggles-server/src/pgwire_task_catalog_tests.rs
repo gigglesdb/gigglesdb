@@ -1,17 +1,12 @@
 //! GD-0061 R3-312: catalog queries in a task session, driven through
 //! `State::handle` with real Query, Parse, Bind and Execute bodies. `Catalog`
-//! and `Select` are not yet in `task::admit::ENABLED` (R3-315 enables them),
-//! so these tests admit them through the cfg(test) route
-//! (`agent::statement::test_route`).
+//! and `Select` are in `task::admit::ENABLED` since R3-315.
 use super::*;
-use crate::{AgentBinding, Binding, Role, Service, agent::statement::test_route};
+use crate::{AgentBinding, Binding, Role, Service};
 use giggles_core::{
     Admin, Engine, Limits,
     roles::{NewRole, TablePrivilege},
-    task::{
-        StatementClass,
-        definition::{DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText},
-    },
+    task::definition::{DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText},
 };
 use std::sync::Arc;
 
@@ -284,7 +279,6 @@ const SWEEP: &[&str] = &[
 /// table order, and nothing hidden.
 #[test]
 fn pg_attribute_lists_only_readable_and_masked() {
-    test_route::enable(&[StatementClass::Catalog, StatementClass::Select]);
     let (_service, mut session, _) = fixture();
     let mut state = state();
     let rows = task_query(&mut state, &mut session, PG_ATTRIBUTE);
@@ -297,13 +291,11 @@ fn pg_attribute_lists_only_readable_and_masked() {
     for sql in SWEEP {
         task_query(&mut state, &mut session, sql);
     }
-    test_route::enable(&[]);
 }
 
 /// `pg_class` lists the task table and only the indexes on shown columns.
 #[test]
 fn pg_class_lists_only_task_table() {
-    test_route::enable(&[StatementClass::Catalog, StatementClass::Select]);
     let (_service, mut session, _) = fixture();
     let mut state = state();
     let rows = task_query(&mut state, &mut session, PG_CLASS);
@@ -324,14 +316,12 @@ fn pg_class_lists_only_task_table() {
         "SELECT description FROM pg_catalog.pg_description WHERE objoid <> 2200 ORDER BY objsubid",
     );
     assert_eq!(rows, [vec!["current status".to_owned()]]);
-    test_route::enable(&[]);
 }
 
 /// `information_schema.columns` lists the shown columns of the task table;
 /// a default that names a hidden column is dropped.
 #[test]
 fn information_schema_columns_filtered() {
-    test_route::enable(&[StatementClass::Catalog, StatementClass::Select]);
     let (_service, mut session, _) = fixture();
     let mut state = state();
     let rows = task_query(&mut state, &mut session, COLUMNS);
@@ -345,7 +335,6 @@ fn information_schema_columns_filtered() {
         ]
         .map(|r| r.map(String::from).to_vec())
     );
-    test_route::enable(&[]);
 }
 
 /// Application rows a mixed catalog query reads go through the release
@@ -354,7 +343,6 @@ fn information_schema_columns_filtered() {
 /// name.
 #[test]
 fn user_relation_rows_in_catalog_query_are_charged() {
-    test_route::enable(&[StatementClass::Catalog, StatementClass::Select]);
     let (service, mut session, _) = fixture();
     let mut state = state();
     let task = service.admin.tasks().get("inc-436").unwrap().unwrap().id;
@@ -404,14 +392,12 @@ fn user_relation_rows_in_catalog_query_are_charged() {
         );
     }
     assert_eq!(service.admin.task_disclosure(task).unwrap().rows_returned, 6);
-    test_route::enable(&[]);
 }
 
 /// A non-task session's catalog is not filtered: the same queries show the
 /// other table, the hidden columns and their comments, index and default.
 #[test]
 fn non_task_catalog_unchanged() {
-    test_route::enable(&[StatementClass::Catalog, StatementClass::Select]);
     let (_service, _agent, mut session) = fixture();
     let mut state = state();
     let out = simple(&mut state, &mut session, PG_CLASS).unwrap();
@@ -453,5 +439,4 @@ fn non_task_catalog_unchanged() {
         [["quokka customers"], ["current status"], ["zebracomment"]]
             .map(|r| r.map(String::from).to_vec())
     );
-    test_route::enable(&[]);
 }

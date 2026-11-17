@@ -3,12 +3,12 @@
 //! (masked, checked and charged) first, and a non-task session's exchange is
 //! unchanged byte for byte.
 //!
-//! `Select` is not yet in `task::admit::ENABLED`, so a task SELECT cannot run
-//! over the agent listener. The task-session paging and revalidation proofs
-//! that need it run as server-lib tests with the cfg(test) admission route
-//! (`pgwire::task_release_tests`); these wire tests cover what the listener
-//! reaches today: the refusal is logged once and charges nothing, and the
-//! non-task path is identical to a recorded exchange.
+//! `Select` is in `task::admit::ENABLED` since R3-315, so a task SELECT runs
+//! over the agent listener and is released before it is encoded. A task
+//! portal is never suspended (Execute with a row limit is refused as a
+//! cursor), so the per-page paging and revalidation proofs stay in the
+//! server-lib tests (`pgwire::task_release_tests`); the non-task path is
+//! identical to a recorded exchange.
 #![cfg(feature = "engine-rocksdb")]
 mod agent_support;
 
@@ -72,7 +72,7 @@ fn sync(out: &mut Vec<u8>) {
 }
 
 /// Five task-visible rows and one other, readable and updatable by the
-/// ordinary login.
+/// ordinary login; the executor holds SELECT.
 fn seed(server: &AgentServer) {
     server
         .admin
@@ -92,6 +92,11 @@ fn seed(server: &AgentServer) {
             "oncall_lead",
             &[TablePrivilege::Select, TablePrivilege::Update],
         )
+        .unwrap();
+    server
+        .admin
+        .roles()
+        .grant_table("shipments", "agent_exec", &[TablePrivilege::Select])
         .unwrap();
 }
 
@@ -149,40 +154,64 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A task SELECT on the extended path. `Select` is not enabled, so admission
-/// refuses it at Parse before any catalog or table read: no page is produced,
-/// nothing is charged, and the refusal is logged once with its text, class and
-/// entry point. (The page-per-fetch release is proven by the lib test
+/// A task SELECT on the extended path runs over the agent listener: only
+/// the task's rows reach the wire, released in one page, charged and logged
+/// once with its text, class and entry point. The same SELECT with a row
+/// limit is refused as a cursor before it runs and charges nothing. (The
+/// page-per-fetch release of a long result is proven by the lib test
 /// `pgwire::task_release_tests::portal_paging_releases_each_fetch`.)
+/// What a task was charged: the head's counters and the debit records.
+fn charge(
+    d: &giggles_core::task::release::Disclosure,
+) -> (u64, u64, u64, Vec<giggles_core::task::release::DebitView>) {
+    (d.rows_read, d.rows_returned, d.bytes_returned, d.debits.clone())
+}
+
 #[tokio::test]
 async fn portal_paging_releases_each_fetch() {
     let (server, _agent, _ordinary, mut wire) = agent_wire().await;
     seed(&server);
-    let sql = "SELECT id, status FROM shipments WHERE merchant_id = 42";
+    let sql = "SELECT id, status FROM shipments ORDER BY id";
     let messages = wire.extended(sql, &[], 0).await;
-    assert_eq!(
-        error_of(&messages),
-        Some((
-            "0A000".to_owned(),
-            TaskError::NotAllowedInTaskSession(StatementClass::Select)
-                .message()
-                .to_owned()
-        )),
-        "{messages:?}"
-    );
-    assert!(!messages.iter().any(|m| matches!(m, Msg::Row(_))), "{messages:?}");
+    assert_eq!(error_of(&messages), None, "{messages:?}");
+    let rows: Vec<_> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Msg::Row(values) => values[0].clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows, ["1", "2", "3", "4", "5"], "{messages:?}");
     let task = server.admin.tasks().get("inc-436").unwrap().unwrap().id;
-    let disclosure = server.admin.task_disclosure(task).unwrap();
-    assert_eq!(disclosure.rows_returned, 0);
-    assert!(disclosure.debits.is_empty(), "{disclosure:?}");
+    let charged = server.admin.task_disclosure(task).unwrap();
+    assert!(charged.rows_returned >= 5, "{charged:?}");
+    assert_eq!(charged.debits.len(), 1, "{charged:?}");
     let records = server.admin.task_read_log(task).unwrap();
     assert_eq!(records.len(), 1, "{records:?}");
     let record = &records[0];
     assert_eq!(record.text, sql);
     assert_eq!(record.class, class_code(StatementClass::Select));
     assert_eq!(record.entry, ENTRY_PGWIRE_EXTENDED);
-    assert_eq!(record.outcome, outcome_of("0A000"));
-    assert_eq!(record.released_rows, 0);
+    assert_eq!((record.pages, record.released_rows), (1, 5));
+    assert_eq!(record.sqlstate_text(), "00000");
+
+    let messages = wire.extended(sql, &[], 2).await;
+    assert_eq!(
+        error_of(&messages),
+        Some((
+            "0A000".to_owned(),
+            TaskError::NotAllowedInTaskSession(StatementClass::Cursor)
+                .message()
+                .to_owned()
+        )),
+        "{messages:?}"
+    );
+    assert!(!messages.iter().any(|m| matches!(m, Msg::Row(_))), "{messages:?}");
+    assert_eq!(charge(&server.admin.task_disclosure(task).unwrap()), charge(&charged));
+    let records = server.admin.task_read_log(task).unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[1].outcome, outcome_of("0A000"));
+    assert_eq!(records[1].released_rows, 0);
 }
 
 /// A task portal never retains a result to serve in slices: Execute with a

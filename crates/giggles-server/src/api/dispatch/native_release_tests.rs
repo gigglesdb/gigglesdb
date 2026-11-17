@@ -2,8 +2,9 @@
 //! session go through the release protocol inside `native::run` (or the
 //! `Request::Sql` arm) before anything encodes them, and the read log records
 //! the transport. Driven through `execute_reply`, the function both HTTP and
-//! gRPC call. `Select` is not yet in `task::admit::ENABLED`, so these tests
-//! admit it through the cfg(test) route (`agent::statement::test_route`).
+//! gRPC call. `Select` is in `task::admit::ENABLED` since R3-315; the
+//! cfg(test) route (`agent::statement::test_route`) admits only `Insert`
+//! here, to reach core's own refusal of a task write.
 use super::*;
 use crate::{AgentBinding, agent::statement::test_route};
 use giggles_core::{
@@ -182,7 +183,6 @@ fn masked_rows() -> Vec<(String, String)> {
 /// row outside the task's scope.
 #[test]
 fn typed_read_released_once() {
-    test_route::enable(&[StatementClass::Select]);
     let service = fixture();
     let mut session = agent(&service);
     let (reply, view) = exec(&mut session, &typed_read(), Encoding::Json);
@@ -206,7 +206,6 @@ fn typed_read_released_once() {
     // The plain exits stay refused in a task session.
     let Invocation::Read(read) = invocation(&typed_read()) else { panic!("typed read") };
     assert!(session.sql.execute_typed_read(*read, None).is_err());
-    test_route::enable(&[]);
 }
 
 /// A native operation's rows are masked and charged before encoding. A
@@ -214,7 +213,7 @@ fn typed_read_released_once() {
 /// is inserted, nothing is charged, and its refusal is logged once.
 #[test]
 fn native_returning_masked_and_charged() {
-    test_route::enable(&[StatementClass::Select, StatementClass::Insert]);
+    test_route::enable(&[StatementClass::Insert]);
     let service = fixture();
     let mut session = agent(&service);
     let (reply, view) = exec(&mut session, &native_read(), Encoding::Json);
@@ -257,7 +256,6 @@ fn native_returning_masked_and_charged() {
 /// equal debits and equal replies; only the read-log entry differs.
 #[test]
 fn http_and_grpc_same_charge() {
-    test_route::enable(&[StatementClass::Select]);
     let service = fixture();
     let task = task_id(&service);
     for request in [native_read(), typed_read(), sql(SQL)] {
@@ -292,7 +290,6 @@ fn http_and_grpc_same_charge() {
             (pair[1].released_rows, pair[1].released_bytes, &pair[1].text)
         );
     }
-    test_route::enable(&[]);
 }
 
 /// SQL over the API (`Request::Sql`, the framed reply both transports
@@ -301,7 +298,6 @@ fn http_and_grpc_same_charge() {
 /// nothing.
 #[test]
 fn framed_sql_reply_released() {
-    test_route::enable(&[StatementClass::Select]);
     let service = fixture();
     let task = task_id(&service);
     let mut session = agent(&service);
@@ -327,14 +323,18 @@ fn framed_sql_reply_released() {
         assert_eq!((record.pages, record.released_rows), (1, ROWS as u64));
     }
     assert_eq!(records[0].entry, ENTRY_HTTP);
-    // Refused by admission: one record, nothing charged.
-    test_route::enable(&[]);
-    let (reply, _) = exec(&mut session, &sql(SQL), Encoding::Protobuf);
+    // Refused by admission (DELETE is not enabled): one record, nothing
+    // charged.
+    const DELETE: &str = "DELETE FROM shipments WHERE id = 1";
+    let (reply, _) = exec(&mut session, &sql(DELETE), Encoding::Protobuf);
     assert_eq!(reply.code, "0A000");
     assert!(reply.sql.is_none_or(|sql| sql.rows.is_empty()));
     let records = service.admin.task_read_log(task).unwrap();
     assert_eq!(records.len(), 3, "{records:?}");
-    assert_eq!((records[2].entry, records[2].pages, records[2].text.as_str()), (ENTRY_GRPC, 0, SQL));
+    assert_eq!(
+        (records[2].entry, records[2].pages, records[2].text.as_str()),
+        (ENTRY_GRPC, 0, DELETE)
+    );
     let after = service.admin.task_disclosure(task).unwrap();
     assert_eq!((after.rows_returned, after.debits.len()), (2 * ROWS as u64, 2));
 }

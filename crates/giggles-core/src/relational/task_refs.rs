@@ -215,6 +215,41 @@ mod tests {
         assert_eq!(f.functions, ["count"]);
     }
 
+    /// R3-315: an ORDER BY or GROUP BY ordinal or output name, and DISTINCT,
+    /// make the named select items sort or grouping keys.
+    #[test]
+    fn ordinal_alias_and_distinct_keys_name_select_items() {
+        let s = shape("SELECT id, customer_email FROM shipments ORDER BY 2");
+        assert_eq!(at(&s, "customer_email"), [Position::Output, Position::Sort]);
+        assert_eq!(at(&s, "id"), [Position::Output]);
+        let s = shape("SELECT id, customer_email AS e FROM shipments ORDER BY e DESC");
+        assert!(has(&s, "customer_email", Position::Sort));
+        let s = shape("SELECT customer_email AS status, id FROM shipments ORDER BY status");
+        assert!(has(&s, "customer_email", Position::Sort));
+        assert!(has(&s, "status", Position::Sort));
+        let s = shape("SELECT customer_email, count(*) FROM shipments GROUP BY 1");
+        assert!(has(&s, "customer_email", Position::Group));
+        let s = shape("SELECT customer_email AS e, count(*) FROM shipments GROUP BY e");
+        assert_eq!(at(&s, "customer_email"), [Position::Output, Position::Group]);
+        let s = shape("SELECT DISTINCT id, customer_email FROM shipments");
+        assert!(has(&s, "customer_email", Position::Group));
+        assert!(has(&s, "id", Position::Group));
+        // An ordinal past the list, zero, or over an unexpanded star names
+        // nothing; a qualified name is a column, not an alias.
+        for sql in [
+            "SELECT id FROM shipments ORDER BY 3",
+            "SELECT id FROM shipments ORDER BY 0",
+            "SELECT * FROM shipments ORDER BY 2",
+        ] {
+            assert!(!shape(sql).refs.iter().any(|r| r.position == Position::Sort), "{sql}");
+        }
+        let s = shape("SELECT customer_email AS e FROM shipments d ORDER BY d.e");
+        assert_eq!(at(&s, "customer_email"), [Position::Output]);
+        // Without DISTINCT, ordinals or aliases nothing changes.
+        let s = shape("SELECT id, customer_email FROM shipments ORDER BY id");
+        assert_eq!(at(&s, "customer_email"), [Position::Output]);
+    }
+
     #[test]
     fn update_targets_sources_returning() {
         let s = shape(

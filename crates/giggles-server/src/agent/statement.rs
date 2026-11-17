@@ -274,7 +274,8 @@ fn show_outcome(session: &mut crate::Session, op: &OperationId) -> Result<SqlRes
 }
 
 /// Test-only route to the seam for classes admission keeps out of
-/// `task::admit::ENABLED` (none since R3-707 enabled `Preview` and `Apply`):
+/// `task::admit::ENABLED` (since R3-707 and R3-315 only the classes a task
+/// never runs, such as `Insert`, used to reach core's own refusals):
 /// classes listed here are admitted on this thread by `Session::admit`.
 /// Compiled into unit tests only.
 #[cfg(test)]

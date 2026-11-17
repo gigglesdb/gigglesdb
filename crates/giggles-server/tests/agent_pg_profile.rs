@@ -1,7 +1,9 @@
 //! R3-206 (GD-0061 design-2 section 4, table 4(b)): the statement profile of a
 //! task session on the agent pgwire listener. Every statement is admitted by
 //! class before it runs; refused classes answer 0A000 with the class message.
-//! In this build `task::admit::ENABLED` is `[Show, Set, Update, OutcomeLookup, Preview, Apply]`.
+//! In this build `task::admit::ENABLED` is
+//! `[Show, Set, Select, Catalog, Update, OutcomeLookup, Preview, Apply]` (R3-315
+//! added `Select` and `Catalog` at the Phase 3 close).
 #![cfg(feature = "engine-rocksdb")]
 mod agent_support;
 
@@ -90,16 +92,16 @@ const REFUSED: &[(&str, StatementClass)] = &[
     ("RELEASE SAVEPOINT a", StatementClass::Savepoint),
     ("ROLLBACK TO SAVEPOINT a", StatementClass::Savepoint),
     ("SELECT pg_advisory_lock(1)", StatementClass::Lock),
+    // The settings inventory stays refused as `Catalog` by the pgwire profile
+    // itself (design-2 table 4(b)), although `Catalog` is now admitted.
     (
         "SELECT name,setting::numeric AS setting FROM pg_show_all_settings() WHERE name IN ('autovacuum_analyze_threshold') ORDER BY name",
         StatementClass::Catalog,
     ),
-    ("SELECT relname FROM pg_catalog.pg_class", StatementClass::Catalog),
     ("COPY shipments TO STDOUT", StatementClass::Copy),
     ("COPY (SELECT id FROM shipments) TO STDOUT", StatementClass::Copy),
     ("COPY shipments FROM STDIN", StatementClass::Copy),
     ("GIGGLES {\"kind\":\"ping\"}", StatementClass::Other),
-    ("SELECT id FROM shipments", StatementClass::Select),
     ("INSERT INTO shipments VALUES (1, 42, 'new')", StatementClass::Insert),
     ("DELETE FROM shipments WHERE id = 1", StatementClass::Delete),
     ("TRUNCATE shipments", StatementClass::Delete),
@@ -209,17 +211,33 @@ async fn explain_declare_fetch_lock_refused() {
     }
 }
 
+/// Since R3-315 `Catalog` is admitted: catalog queries answer from the
+/// task's filtered catalog (R3-312), which shows the task table with its
+/// readable columns and nothing hidden. `merchant_id` is hidden by the
+/// fixture's task (readable `id`, `status`).
 #[tokio::test]
-async fn pg_catalog_and_information_schema_refused_but_select_1_version_allowed() {
+async fn pg_catalog_and_information_schema_filtered_and_select_1_version_allowed() {
     let (_server, _agent, _ordinary, mut wire) = agent_wire().await;
     for sql in [
         "SELECT relname FROM pg_catalog.pg_class",
         "SELECT * FROM pg_class",
         "SELECT table_name FROM information_schema.tables",
-        "SELECT column_name FROM information_schema.columns WHERE table_name = 'shipments'",
         "SELECT rolname FROM pg_roles",
     ] {
-        refused_both(&mut wire, sql, StatementClass::Catalog).await;
+        for messages in both(&mut wire, sql).await {
+            assert_ok(&messages, sql);
+            let text = format!("{messages:?}");
+            assert!(!text.contains("merchant_id"), "{sql}: {text}");
+        }
+    }
+    let sql = "SELECT column_name FROM information_schema.columns WHERE table_name = 'shipments'                ORDER BY ordinal_position";
+    for messages in both(&mut wire, sql).await {
+        assert_ok(&messages, sql);
+        assert_eq!(
+            rows(&messages),
+            [Some("id".to_owned()), Some("status".to_owned())].map(|c| vec![c]),
+            "{sql}"
+        );
     }
     for (sql, expected) in [
         ("SELECT 1", Some("1".to_owned())),

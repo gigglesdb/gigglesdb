@@ -230,6 +230,67 @@ impl Query {
         for (s, _, _) in &self.order {
             scalar(s, Position::Sort, out);
         }
+        // An ORDER BY or GROUP BY ordinal or output name names a select item,
+        // and DISTINCT groups by every item: those items are sort and grouping
+        // keys too. A masked column there would order, group or count rows by
+        // its real value (R3-315 masking matrix).
+        if matches!(mode, Mode::Top | Mode::Nested) {
+            for (s, _, _) in &self.order {
+                if let Some(item) = self.output_key(s) {
+                    item_refs(item, Position::Sort, out);
+                }
+            }
+            if let Some(c) = self.clauses() {
+                for s in &c.group {
+                    if let Some(item) = self.output_key(s) {
+                        item_refs(item, Position::Group, out);
+                    }
+                }
+                if c.distinct {
+                    for (item, _) in &self.items {
+                        item_refs(item, Position::Group, out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The select item an ORDER BY or GROUP BY key names: a 1-based integer
+    /// ordinal, or an unqualified name equal to an item's alias. `None` while
+    /// a star is unexpanded (ordinals count expanded columns; the rules run
+    /// again on the expanded statement).
+    fn output_key(&self, key: &Scalar) -> Option<&Item> {
+        if self
+            .items
+            .iter()
+            .any(|(i, _)| matches!(i, Item::Star | Item::QualifiedStar { .. }))
+        {
+            return None;
+        }
+        match key {
+            Scalar::Literal(Value::Int(k)) if *k >= 1 => {
+                self.items.get(usize::try_from(*k - 1).ok()?).map(|(i, _)| i)
+            }
+            Scalar::Column(c) if c.qualifier.is_none() => self
+                .items
+                .iter()
+                .find(|(_, alias)| alias.as_deref() == Some(c.name.as_str()))
+                .map(|(i, _)| i),
+            _ => None,
+        }
+    }
+}
+
+/// The column references of one select item, at `at`.
+fn item_refs(item: &Item, at: Position, out: &mut StatementShape) {
+    match item {
+        Item::Scalar(s) => scalar(s, at, out),
+        Item::Aggregate(_, arg) => {
+            if let Some(s) = arg {
+                scalar(s, Position::Aggregate, out);
+            }
+        }
+        Item::Star | Item::QualifiedStar { .. } => {}
     }
 }
 
