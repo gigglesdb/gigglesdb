@@ -835,3 +835,7 @@ mod outcome_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "commit_apply_seam_tests.rs"]
 mod commit_apply_seam_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "commit_race_tests.rs"]
+mod commit_race_tests;
