@@ -82,7 +82,7 @@ pub struct AuthInterceptor {
     /// Gateway-only bearer token.
     pub(super) token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
-fn tokenize_type_code(ty: &ColumnType) -> Result<TypeCode, Status> {
+fn tokenize_type_code(ty: &ColumnType) -> Result<TypeCode, NyCode> {
     match ty {
         ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => Ok(TypeCode::String),
         ColumnType::Int8 => Ok(TypeCode::Int64),
@@ -91,7 +91,7 @@ fn tokenize_type_code(ty: &ColumnType) -> Result<TypeCode, Status> {
         ColumnType::Int2 | ColumnType::Int4 | ColumnType::Uuid | ColumnType::Timestamp
         | ColumnType::Bool | ColumnType::Numeric | ColumnType::Bytea | ColumnType::Json
         | ColumnType::Jsonb | ColumnType::Array(_) | ColumnType::Enum(_)
-        | ColumnType::Other(_) => Err(invalid()),
+        | ColumnType::Other(_) => Err(NyCode::NotAnalysable),
     }
 }
 
@@ -576,6 +576,15 @@ impl NunyaSpanner {
             })
             .map_err(|_| nunya_status(NyCode::ReadLogUnavailable))
     }
+    fn refuse_tokenize(&self, who: &Authenticated, code: NyCode) -> Status {
+        match Self::audit_outcome(
+            &self.ctx, &self.watchers, who, "Spanner nunya_tokenize", 0, vec![],
+            Outcome::Refused(code),
+        ) {
+            Ok(()) => nunya_status(code),
+            Err(error) => error,
+        }
+    }
     fn convert(
         &self,
         who: &Authenticated,
@@ -606,8 +615,15 @@ impl NunyaSpanner {
         policy: &Policy,
         snapshot: &Snapshot,
     ) -> Result<(RewritePlan, Vec<String>, StatementKind), Status> {
-        let (stmt, names) = lower_gsql(sql, snapshot, policy).map_err(status)?;
-        let plan = check(&stmt, policy, snapshot).map_err(status)?;
+        let refusal = |error: Refusal| {
+            if sql.to_ascii_lowercase().contains("nunya_tokenize") {
+                self.refuse_tokenize(who, error.code)
+            } else {
+                status(error)
+            }
+        };
+        let (stmt, names) = lower_gsql(sql, snapshot, policy).map_err(refusal)?;
+        let plan = check(&stmt, policy, snapshot).map_err(refusal)?;
 
         if plan.tokenize.is_none()
             && let Some(params) = params.as_ref()
@@ -722,7 +738,42 @@ impl NunyaSpanner {
         let Some((domain, arg)) = &plan.tokenize else {
             return Ok(None);
         };
-        let setting = policy.domains.get(domain).ok_or_else(denied)?;
+        self.local_tokenize_inner(who, policy, snapshot, (domain, arg), names, req)
+            .map(Some)
+            .map_err(|code| self.refuse_tokenize(who, code))
+    }
+    fn local_tokenize_inner(
+        &self,
+        who: &Authenticated,
+        policy: &Policy,
+        snapshot: &Snapshot,
+        tokenize: (&DomainName, &ValueSource),
+        names: &[String],
+        req: &ExecuteSqlRequest,
+    ) -> Result<ResultSet, NyCode> {
+        let (domain, arg) = tokenize;
+        if !req.resume_token.is_empty() {
+            return Err(NyCode::NotAnalysable);
+        }
+        let selector = match &req.transaction {
+            None => None,
+            Some(transaction) => Some(transaction.selector.as_ref().ok_or(NyCode::NotAnalysable)?),
+        };
+        match selector {
+            None => {}
+            Some(transaction_selector::Selector::SingleUse(options)) => match &options.mode {
+                Some(transaction_options::Mode::ReadOnly(_)) => {}
+                Some(transaction_options::Mode::ReadWrite(_))
+                | Some(transaction_options::Mode::PartitionedDml(_))
+                | None => return Err(NyCode::NotAnalysable),
+            },
+            Some(transaction_selector::Selector::Begin(_)) => return Err(NyCode::NotAnalysable),
+            Some(transaction_selector::Selector::Id(id)) if id.is_empty() => {
+                return Err(NyCode::NotAnalysable);
+            }
+            Some(transaction_selector::Selector::Id(_)) => {}
+        }
+        let setting = policy.domains.get(domain).ok_or(NyCode::StatementNotAllowed)?;
         let limits = match setting.tokenize {
             TokenizeSetting::On {
                 limit_per_session,
@@ -734,30 +785,30 @@ impl NunyaSpanner {
                 principal_window_ms: u64::try_from(principal_window.as_millis())
                     .unwrap_or(u64::MAX),
             },
-            TokenizeSetting::Off => return Err(denied()),
+            TokenizeSetting::Off => return Err(NyCode::StatementNotAllowed),
         };
         let ty = policy.columns.iter().find_map(|(column, treatment)| match treatment {
             Treatment::Blind { domain: d } if d == domain => {
                 snapshot.column(column).map(|column| column.ty.clone())
             }
             _ => None,
-        }).ok_or_else(invalid)?;
+        }).ok_or(NyCode::NotAnalysable)?;
         let code = tokenize_type_code(&ty)?;
         let value = match arg {
             ValueSource::Param(index) => {
                 let name = index
                     .checked_sub(1)
                     .and_then(|i| names.get(i as usize))
-                    .ok_or_else(invalid)?;
+                    .ok_or(NyCode::NotAnalysable)?;
                 let value = req.params
                     .as_ref()
                     .and_then(|p| p.fields.get(name))
-                    .ok_or_else(invalid)?
+                    .ok_or(NyCode::NotAnalysable)?
                     .clone();
                 if let Some(declared) = req.param_types.get(name) {
                     let declared = values::column_type(declared);
                     if declared != ty && !(declared.is_textual() && ty.is_textual()) {
-                        return Err(invalid());
+                        return Err(NyCode::NotAnalysable);
                     }
                 }
                 value
@@ -766,24 +817,21 @@ impl NunyaSpanner {
                 kind: Some(prost_types::value::Kind::StringValue(text.clone())),
             },
             ValueSource::Column { .. } | ValueSource::Null | ValueSource::Computed(_) => {
-                return Err(invalid());
+                return Err(NyCode::NotAnalysable);
             }
         };
-        let value = self.convert(who, policy, domain, &ty, &value, false)?;
-        self.ctx
-            .authority
-            .record_tokenization(who.session, domain, &limits)
-            .map_err(|error| {
-                let code = tokenize_refusal(error);
-                match Self::audit_outcome(
-                    &self.ctx, &self.watchers, who, "Spanner nunya_tokenize", 0, vec![],
-                    Outcome::Refused(code),
-                ) {
-                    Ok(()) => nunya_status(code),
-                    Err(error) => error,
-                }
-            })?;
-        Ok(Some(ResultSet {
+        if matches!(value.kind, None | Some(prost_types::value::Kind::NullValue(_))) {
+            return Err(NyCode::NotAnalysable);
+        }
+        let wire_ty = if ty.is_textual() { &ColumnType::Text } else { &ty };
+        let value = values::from_proto(wire_ty, &value).map_err(|e| e.code)?;
+        let value = self.ctx.codec.encode(
+            &who.keys, domain, &ty, setting.range.as_ref(), &value,
+        ).map_err(|e| e.code)?;
+        let value = values::to_proto(wire_ty, &value).map_err(|e| e.code)?;
+        self.ctx.authority.record_tokenization(who.session, domain, &limits)
+            .map_err(tokenize_refusal)?;
+        Ok(ResultSet {
             metadata: Some(ResultSetMetadata {
                 row_type: Some(StructType {
                     fields: vec![struct_type::Field {
@@ -800,7 +848,7 @@ impl NunyaSpanner {
                 values: vec![value],
             }],
             ..Default::default()
-        }))
+        })
     }
     fn structured<'a>(
         &self,
@@ -1111,6 +1159,7 @@ impl SpannerService for NunyaSpanner {
             self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req)?
         {
             Self::audit(&self.ctx, &self.watchers, &who, &label, 1, local_tokens(&result)?)?;
+            self.check_response(&who, &signal, false)?;
             return Ok(Response::new(result));
         }
         let mut client = self.client().await?;
@@ -1170,6 +1219,7 @@ impl SpannerService for NunyaSpanner {
             self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req)?
         {
             Self::audit(&self.ctx, &self.watchers, &who, &label, 1, local_tokens(&result)?)?;
+            self.check_response(&who, &signal, false)?;
             return Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(
                 PartialResultSet {
                     metadata: result.metadata,
@@ -1211,6 +1261,9 @@ impl SpannerService for NunyaSpanner {
             )?;
             match kind {
                 StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {}
+                StatementKind::Tokenize { .. } => {
+                    return Err(self.refuse_tokenize(&who, NyCode::NotAnalysable));
+                }
                 StatementKind::Select
                 | StatementKind::Begin
                 | StatementKind::Commit
@@ -1219,7 +1272,6 @@ impl SpannerService for NunyaSpanner {
                 | StatementKind::ReleaseSavepoint
                 | StatementKind::RollbackToSavepoint
                 | StatementKind::SessionNoop { .. }
-                | StatementKind::Tokenize { .. }
                 | StatementKind::Refused(_) => return Err(denied()),
             }
             plans.push(plan);
@@ -2776,6 +2828,187 @@ mod tests {
         assert_eq!(tokenize_count(&f), 10);
         assert_no_tokenize_upstream(&f);
     }
+    async fn tokenize_selector_case(selector: Option<transaction_selector::Selector>, accepted: bool) {
+        for streaming in [false, true] {
+            let records = Arc::new(Mutex::new(vec![]));
+            let f = Fixture::with_log(Box::new(CaptureLog(
+                records.clone(), Arc::new(Mutex::new(vec![])),
+            ))).await;
+            let mut req = f.query("SELECT nunya_tokenize('email', 'private@example.com')").await;
+            req.transaction = selector.clone().map(|selector| TransactionSelector { selector: Some(selector) });
+            let result = tokenize_rpc(&f, req, streaming).await;
+            if accepted {
+                let result = result.unwrap();
+                assert_eq!(local_tokens(&result).unwrap().len(), 1);
+                assert_eq!(tokenize_count(&f), 1);
+                let records = records.lock().unwrap();
+                assert_eq!(records.len(), 1);
+                assert!(matches!(records[0].outcome, Outcome::Allowed));
+            } else {
+                assert_tokenize_error(result.unwrap_err(), NyCode::NotAnalysable);
+                assert_eq!(tokenize_count(&f), 0);
+                assert_tokenize_refused(&records, NyCode::NotAnalysable);
+            }
+            assert_no_tokenize_upstream(&f);
+        }
+    }
+    fn assert_tokenize_refused(records: &Mutex<Vec<ReadLogRecord>>, code: NyCode) {
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert!(matches!(record.outcome, Outcome::Refused(c) if c == code));
+        assert_eq!(record.rows, 0);
+        assert!(record.tokens_released.is_empty());
+        assert_eq!(record.statement_fingerprint, statement_fingerprint("Spanner nunya_tokenize"));
+        assert!(!record.statement.contains("private@example.com"));
+        assert!(!record.statement.contains("email"));
+    }
+    fn single_use(mode: Option<transaction_options::Mode>) -> transaction_selector::Selector {
+        transaction_selector::Selector::SingleUse(TransactionOptions { mode, ..Default::default() })
+    }
+    #[tokio::test]
+    async fn tokenize_selector_none() { tokenize_selector_case(None, true).await; }
+    #[tokio::test]
+    async fn tokenize_selector_single_read_only() {
+        tokenize_selector_case(Some(single_use(Some(transaction_options::Mode::ReadOnly(Default::default())))), true).await;
+    }
+    #[tokio::test]
+    async fn tokenize_selector_single_read_write() {
+        tokenize_selector_case(Some(single_use(Some(transaction_options::Mode::ReadWrite(Default::default())))), false).await;
+    }
+    #[tokio::test]
+    async fn tokenize_selector_single_partitioned() {
+        tokenize_selector_case(Some(single_use(Some(transaction_options::Mode::PartitionedDml(Default::default())))), false).await;
+    }
+    #[tokio::test]
+    async fn tokenize_selector_single_missing_mode() {
+        tokenize_selector_case(Some(single_use(None)), false).await;
+    }
+    #[tokio::test]
+    async fn tokenize_selector_begin_read_only() {
+        tokenize_selector_case(Some(transaction_selector::Selector::Begin(TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadOnly(Default::default())), ..Default::default()
+        })), false).await;
+    }
+    #[tokio::test]
+    async fn tokenize_selector_begin_read_write() {
+        tokenize_selector_case(Some(transaction_selector::Selector::Begin(TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadWrite(Default::default())), ..Default::default()
+        })), false).await;
+    }
+    #[tokio::test]
+    async fn tokenize_selector_id() {
+        tokenize_selector_case(Some(transaction_selector::Selector::Id(vec![1])), true).await;
+    }
+    #[tokio::test]
+    async fn tokenize_selector_empty_id() {
+        tokenize_selector_case(Some(transaction_selector::Selector::Id(vec![])), false).await;
+    }
+    #[tokio::test]
+    async fn tokenize_resume_and_null_refuse_before_counter() {
+        for streaming in [false, true] {
+            for mode in 0..5 {
+                let records = Arc::new(Mutex::new(vec![]));
+                let f = Fixture::with_log(Box::new(CaptureLog(
+                    records.clone(), Arc::new(Mutex::new(vec![])),
+                ))).await;
+                let mut req = f.query("SELECT nunya_tokenize('email', @v)").await;
+                req.params = Some(prost_types::Struct { fields: BTreeMap::from([(
+                    "v".into(), match mode {
+                        1 => Value { kind: Some(prost_types::value::Kind::NullValue(0)) },
+                        2 => Value { kind: None },
+                        _ => text("private@example.com"),
+                    },
+                )]) });
+                if mode == 0 { req.resume_token = vec![1]; }
+                if mode == 3 { req.transaction = Some(TransactionSelector { selector: None }); }
+                if mode == 4 { req.params = None; }
+                assert_tokenize_error(tokenize_rpc(&f, req, streaming).await.unwrap_err(), NyCode::NotAnalysable);
+                assert_eq!(tokenize_count(&f), 0);
+                assert_tokenize_refused(&records, NyCode::NotAnalysable);
+                assert_no_tokenize_upstream(&f);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn tokenize_analysis_refusals_audit_once() {
+        for streaming in [false, true] {
+            for mode in 0..3 {
+                let records = Arc::new(Mutex::new(vec![]));
+                let f = Fixture::with_log(Box::new(CaptureLog(
+                    records.clone(), Arc::new(Mutex::new(vec![])),
+                ))).await;
+                let sql = if mode == 1 {
+                    "SELECT NUNYA_TOKENIZE('email', 'private@example.com', 'extra')"
+                } else { "SELECT nunya_tokenize('email', @v)" };
+                let mut req = f.query(sql).await;
+                req.params = Some(prost_types::Struct { fields: BTreeMap::from([("v".into(), text("private@example.com"))]) });
+                let code = if mode == 0 {
+                    let mut policy = (**f.svc.ctx.policy.read().unwrap()).clone();
+                    policy.domains.get_mut(&domain()).unwrap().tokenize = TokenizeSetting::Off;
+                    *f.svc.ctx.policy.write().unwrap() = Arc::new(policy);
+                    NyCode::StatementNotAllowed
+                } else {
+                    if mode == 2 { req.param_types.insert("v".into(), Type { code: TypeCode::Int64 as i32, ..Default::default() }); }
+                    NyCode::NotAnalysable
+                };
+                assert_tokenize_error(tokenize_rpc(&f, req, streaming).await.unwrap_err(), code);
+                assert_tokenize_refused(&records, code);
+                assert_eq!(tokenize_count(&f), 0);
+                assert_no_tokenize_upstream(&f);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn tokenize_batch_refusal_audits() {
+        let records = Arc::new(Mutex::new(vec![]));
+        let f = Fixture::with_log(Box::new(CaptureLog(records.clone(), Arc::new(Mutex::new(vec![]))))).await;
+        let query = f.query("SELECT nunya_tokenize('email', 'private@example.com')").await;
+        let req = ExecuteBatchDmlRequest {
+            session: query.session,
+            statements: vec![execute_batch_dml_request::Statement { sql: query.sql, ..Default::default() }],
+            ..Default::default()
+        };
+        assert_tokenize_error(f.svc.execute_batch_dml(f.request(req, "alice")).await.unwrap_err(), NyCode::NotAnalysable);
+        assert_tokenize_refused(&records, NyCode::NotAnalysable);
+        assert_eq!(tokenize_count(&f), 0);
+        assert_no_tokenize_upstream(&f);
+    }
+    struct EndOnAllowedLog {
+        authority: Arc<Mutex<Option<Arc<crate::state::authority::Authority>>>>,
+        records: Arc<Mutex<Vec<ReadLogRecord>>>,
+    }
+    impl ReadLog for EndOnAllowedLog {
+        fn write(&self, record: &ReadLogRecord) -> Result<(), Refusal> {
+            self.records.lock().unwrap().push(record.clone());
+            if matches!(record.outcome, Outcome::Allowed) {
+                let guard = self.authority.lock().unwrap();
+                let authority = guard.as_ref().unwrap();
+                assert_eq!(authority.session_tokenizations(record.session, &domain()).unwrap(), 1);
+                authority.revoke(record.session, crate::state::model::EndReason::AdminRevoked).unwrap();
+            }
+            Ok(())
+        }
+        fn write_lifecycle(&self, _: &LifecycleRecord) -> Result<(), Refusal> { Ok(()) }
+    }
+    #[tokio::test]
+    async fn tokenize_rechecks_revocation_after_allowed_audit() {
+        for streaming in [false, true] {
+            let authority = Arc::new(Mutex::new(None));
+            let records = Arc::new(Mutex::new(vec![]));
+            let f = Fixture::with_log(Box::new(EndOnAllowedLog {
+                authority: authority.clone(), records: records.clone(),
+            })).await;
+            *authority.lock().unwrap() = Some(f.svc.ctx.authority.clone());
+            let req = f.query("SELECT nunya_tokenize('email', 'private@example.com')").await;
+            assert_tokenize_error(tokenize_rpc(&f, req, streaming).await.unwrap_err(), NyCode::SessionEnded);
+            assert_eq!(tokenize_count(&f), 1);
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(matches!(records[0].outcome, Outcome::Allowed));
+            assert_no_tokenize_upstream(&f);
+        }
+    }
     #[test]
     fn tokenize_result_type_is_explicit() {
         for ty in [
@@ -2784,7 +3017,7 @@ mod tests {
             ColumnType::Jsonb, ColumnType::Array(Box::new(ColumnType::Text)),
             ColumnType::Enum("e".into()), ColumnType::Other("unknown".into()),
         ] {
-            assert_tokenize_error(tokenize_type_code(&ty).unwrap_err(), NyCode::NotAnalysable);
+            assert_eq!(tokenize_type_code(&ty).unwrap_err(), NyCode::NotAnalysable);
         }
     }
     async fn wait_for(mut ready: impl FnMut() -> bool) {
