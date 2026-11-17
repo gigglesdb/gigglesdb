@@ -31,6 +31,50 @@ impl Role {
         matches!(self, Role::Application { .. } | Role::Database { .. })
     }
 }
+/// GD-0061 R3-312: the part of the catalog a task session sees
+/// (`Session::task_catalog_view`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TaskCatalogView {
+    /// The task's table.
+    pub(crate) table: u64,
+    /// Its schema.
+    pub(crate) schema: String,
+    /// Shown column IDs: readable, masked, and the storage-only heap key.
+    pub(crate) columns: BTreeSet<u64>,
+    /// Lower-cased names the task never sees: its hidden columns and every
+    /// other relation. Text that contains one is dropped.
+    pub(crate) hidden: Vec<String>,
+}
+impl TaskCatalogView {
+    /// Whether `text` mentions a hidden column or another relation. A
+    /// substring match, so it errs towards dropping.
+    pub(crate) fn mentions_hidden(&self, text: &str) -> bool {
+        let text = text.to_lowercase();
+        self.hidden.iter().any(|name| text.contains(name.as_str()))
+    }
+    /// `table` with only the shown columns; its primary key is remapped, or
+    /// cleared when a key column is hidden.
+    pub(crate) fn filter_table(&self, mut table: relational::TableDef) -> relational::TableDef {
+        let mut positions = Vec::with_capacity(table.columns.len());
+        let mut next = 0;
+        for column in &table.columns {
+            if self.columns.contains(&column.id) {
+                positions.push(Some(next));
+                next += 1;
+            } else {
+                positions.push(None);
+            }
+        }
+        table.primary_key = table
+            .primary_key
+            .iter()
+            .map(|i| positions.get(*i).copied().flatten())
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        table.columns.retain(|column| self.columns.contains(&column.id));
+        table
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
@@ -1126,6 +1170,9 @@ impl Session {
             if session.is_aborted() {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
+            if session.sql.task().is_some() {
+                return session.task_catalog_snapshot();
+            }
             let tables = match &session.role {
                 Role::Application { domain, tables } => {
                     if session.service.admin.authority_metadata()?.0.to_string() != *domain {
@@ -1186,6 +1233,97 @@ impl Session {
             let (epoch, visible) = session.validate_catalog_snapshot(epoch, visible)?;
             Ok((epoch, visible, indexes))
         })
+    }
+    /// GD-0061 R3-312: what a task session's catalog shows. Only the task's
+    /// table, with its readable and masked columns (and the storage-only heap
+    /// key, which `pg_catalog_wire::snapshot` strips as for every session).
+    /// Its primary key survives only when every key column is shown.
+    pub(crate) fn task_catalog_view(&self) -> Result<TaskCatalogView, CoreError> {
+        use giggles_core::task::{
+            DenyRule, TaskError,
+            columns::{ColumnMarks, effective_mode},
+            context::TaskDefinitions,
+            definition::ColumnMode,
+        };
+        let ctx = self.sql.task().ok_or(CoreError::Policy(Error::Scope))?;
+        let def = self
+            .sql
+            .task_definition(&ctx.name)
+            .map_err(CoreError::Task)?
+            .filter(|def| def.id == ctx.task)
+            .ok_or(CoreError::Policy(Error::Scope))?;
+        if def.def_version != ctx.bound_def_version {
+            return Err(CoreError::Task(TaskError::Denied(DenyRule::DefinitionChanged)));
+        }
+        let metadata = self.sql.catalog_metadata()?;
+        let table = metadata
+            .tables
+            .iter()
+            .find(|table| table.id == def.table)
+            .ok_or(CoreError::Policy(Error::Scope))?;
+        // Marks only turn a shown column into a withheld (masked) one; they
+        // never show a hidden column, so the definition alone decides.
+        let marks = ColumnMarks::new(std::iter::empty::<String>());
+        let rowid = table.hidden_rowid();
+        let mut columns = BTreeSet::new();
+        let mut hidden = Vec::new();
+        for (i, column) in table.columns.iter().enumerate() {
+            if Some(i) == rowid
+                || effective_mode(&def, &marks, &column.name).mode != ColumnMode::Hidden
+            {
+                columns.insert(column.id);
+            } else {
+                hidden.push(column.name.to_lowercase());
+            }
+        }
+        hidden.extend(
+            metadata
+                .tables
+                .iter()
+                .filter(|other| other.id != table.id)
+                .map(|other| other.name.to_lowercase()),
+        );
+        hidden.retain(|name| !name.is_empty());
+        Ok(TaskCatalogView {
+            table: table.id,
+            schema: metadata
+                .schemas
+                .tables
+                .get(&table.id)
+                .cloned()
+                .unwrap_or_else(|| "public".into()),
+            columns,
+            hidden,
+        })
+    }
+    /// `catalog_snapshot` of a task session: the task table filtered by
+    /// `task_catalog_view`, and its indexes on shown columns only.
+    fn task_catalog_snapshot(
+        &mut self,
+    ) -> Result<(u64, Vec<relational::TableDef>, Vec<giggles_core::IndexInfo>), CoreError> {
+        let view = self.task_catalog_view()?;
+        let metadata = self.sql.catalog_metadata()?;
+        let epoch = metadata.presentation.epoch;
+        let visible = metadata
+            .tables
+            .into_iter()
+            .filter(|table| table.id == view.table)
+            .filter(|table| !self.sql.table_dropped_in_transaction(table.id))
+            .map(|table| view.filter_table(table))
+            .collect::<Vec<_>>();
+        let indexes = metadata
+            .indexes
+            .into_iter()
+            .filter(|index| {
+                index.table == view.table
+                    && index.columns.iter().all(|id| view.columns.contains(id))
+                    && !view.mentions_hidden(&index.name)
+            })
+            .collect();
+        // The generated `SELECT *` is expanded by the task's column rules, so
+        // it describes exactly the shown columns.
+        let (epoch, visible) = self.validate_catalog_snapshot(epoch, visible)?;
+        Ok((epoch, visible, indexes))
     }
     #[allow(clippy::type_complexity)]
     pub(crate) fn catalog_snapshot_with_typmods(

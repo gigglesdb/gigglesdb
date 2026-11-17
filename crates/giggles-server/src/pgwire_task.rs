@@ -332,9 +332,12 @@ impl State {
         self.task_sql(sql, oids, session)
     }
 
-    /// `catalog_plan` without its snapshot: a plan that names a relation, or
-    /// mixes catalog and application relations, is refused as `Catalog`
-    /// before any catalog read; a relation-free plan is a `Show`.
+    /// `catalog_plan` for a task session. The class is admitted before any
+    /// catalog read: a plan that names a relation (or mixes catalog and
+    /// application relations) is `Catalog`, a relation-free plan is `Show`.
+    /// An admitted `Catalog` plan is planned against the task's filtered
+    /// catalog (GD-0061 R3-312), so it can name only the task's table and
+    /// its shown columns.
     fn task_catalog_plan(
         &mut self,
         sql: &str,
@@ -346,21 +349,33 @@ impl State {
         {
             return Ok(None);
         }
-        let plan = match giggles_pg_catalog::plan_gateway(sql) {
+        let planned = match giggles_pg_catalog::plan_gateway(sql) {
+            Err(giggles_pg_catalog::Error::MixedRelations) => {
+                admit(&mut self.diagnostic, session, StatementClass::Catalog)?;
+                let (epoch, tables, indexes, typmods, types) =
+                    self.diagnostic.core(session.catalog_snapshot_with_typmods())?;
+                let snapshot =
+                    catalog_wire::snapshot(session, epoch, tables, indexes, typmods, types)?;
+                let relations = catalog_wire::application_schemas(session, &snapshot);
+                giggles_pg_catalog::plan_gateway_with_relations(sql, &relations)
+            }
+            other => other,
+        };
+        let plan = match planned {
             Ok(Some(plan)) => plan,
             Ok(None) if Prepared::rejects_unsupported_table_free_scalar(sql) => {
                 return Err(catalog_wire::error(giggles_pg_catalog::Error::Unsupported));
             }
             Ok(None) | Err(giggles_pg_catalog::Error::Syntax) => return Ok(None),
-            Err(giggles_pg_catalog::Error::MixedRelations) => {
-                return Err(refuse(&mut self.diagnostic, StatementClass::Catalog));
-            }
             Err(error) => return Err(catalog_wire::error(error)),
         };
-        if plan.depends_on_relations() {
-            return Err(refuse(&mut self.diagnostic, StatementClass::Catalog));
-        }
-        admit(&mut self.diagnostic, session, StatementClass::Show)?;
+        let epoch = if plan.depends_on_relations() {
+            admit(&mut self.diagnostic, session, StatementClass::Catalog)?;
+            self.diagnostic.core(session.catalog_snapshot())?.0
+        } else {
+            admit(&mut self.diagnostic, session, StatementClass::Show)?;
+            0
+        };
         let fields = giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
         let d = Description {
             type_oids: vec![],
@@ -376,7 +391,7 @@ impl State {
                 })
                 .collect(),
         };
-        Ok(Some((Plan::Catalog(Box::new(plan), fields, 0), d)))
+        Ok(Some((Plan::Catalog(Box::new(plan), fields, epoch), d)))
     }
 
     /// Application SQL: classified from its text, admitted, then prepared. A
@@ -657,6 +672,35 @@ impl State {
                 )?;
                 catalog_complete(result.rows.len(), out)
             }
+            Plan::Catalog(plan, fields, epoch) => {
+                self.diagnostic.phase = "catalog execution";
+                // R3-309: the read log records the catalog query's text for
+                // the application rows it reads.
+                session.sql.set_task_statement_text(&s.sql);
+                let outcome =
+                    self.task_catalog(plan, fields, *epoch, catalog_params, retained, session);
+                session.sql.finish_task_statement(match &outcome {
+                    Err(TaskRun::Core(error)) => Err(error),
+                    _ => Ok(()),
+                });
+                let result = outcome.map_err(|error| match error {
+                    TaskRun::Core(error) => self.diagnostic.core::<()>(Err(error)).unwrap_err(),
+                    TaskRun::Wire(code) => code,
+                })?;
+                let result = result.get();
+                if describe {
+                    catalog_wire::description(&result.fields, &[], out)?;
+                }
+                catalog_wire::rows(
+                    self.settings.current.extra_float_digits,
+                    result,
+                    formats,
+                    0,
+                    result.rows.len(),
+                    out,
+                )?;
+                catalog_complete(result.rows.len(), out)
+            }
             Plan::Sql(prepared) if class == StatementClass::Select => {
                 self.diagnostic.phase = "application execution";
                 // R3-309: the read log records the statement's text.
@@ -698,11 +742,47 @@ impl State {
             | Plan::AccessShare(_)
             | Plan::Admin(_)
             | Plan::Control(_)
-            | Plan::Catalog(..)
             | Plan::Sql(_)
             | Plan::Copy(..)
             | Plan::Task(_) => Err(refuse(&mut self.diagnostic, class)),
         }
+    }
+
+    /// A catalog query that names a relation, against the task's filtered
+    /// catalog. Application rows it reads were released (scoped, masked and
+    /// charged) by `with_application_rows`; the result the catalog engine
+    /// builds from them and the filtered snapshot is synthetic.
+    fn task_catalog(
+        &mut self,
+        plan: &giggles_pg_catalog::Plan,
+        fields: &[giggles_pg_catalog::Field],
+        epoch: u64,
+        catalog_params: &[giggles_pg_catalog::Value],
+        retained: usize,
+        session: &mut Session,
+    ) -> Result<Released<giggles_pg_catalog::ResultSet>, TaskRun> {
+        let (current, tables, indexes, typmods, types) = session.catalog_snapshot_with_typmods()?;
+        if current != epoch && !plan.refreshes_view_definitions() {
+            return Err(TaskRun::Wire("0A000"));
+        }
+        let snapshot = catalog_wire::with_search_path(
+            catalog_wire::snapshot(session, current, tables, indexes, typmods, types)?,
+            &self.settings.current.search_path,
+        );
+        let snapshot = catalog_wire::with_application_rows(session, plan, snapshot)?;
+        let result = catalog_wire::execute(plan, &snapshot, catalog_params)
+            .map_err(catalog_wire::error)?;
+        if result.fields != fields {
+            return Err(TaskRun::Wire("0A000"));
+        }
+        if retained
+            .checked_add(catalog_wire::retained_bytes(&result)?)
+            .ok_or("54000")?
+            > MAX_RESPONSE
+        {
+            return Err(TaskRun::Wire("54000"));
+        }
+        Ok(Released::synthetic(result))
     }
 
     /// A task SELECT: one cursor, and every chunk fetched unreleased, then

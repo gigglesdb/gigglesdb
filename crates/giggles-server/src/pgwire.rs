@@ -2721,6 +2721,10 @@ mod timetz_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "pgwire_task_release_tests.rs"]
 mod task_release_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "pgwire_task_catalog_tests.rs"]
+mod task_catalog_tests;
 fn logical_binary_output(ty: &DataType, s: &str) -> R<Vec<u8>> {
     use giggles_core::relational::logical_types::array_values;
     if *ty == DataType::Uuid {

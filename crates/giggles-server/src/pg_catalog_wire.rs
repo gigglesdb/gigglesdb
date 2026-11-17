@@ -213,7 +213,7 @@ pub(crate) fn snapshot(
     presentation.primary_names.retain(|id, _| visible.contains(id));
     presentation.comments.retain(|(table, column), _| visible.contains(table)
         && (*column == 0 || columns.contains(column)));
-    Ok(giggles_pg_catalog::CatalogSnapshot {
+    let snapshot = giggles_pg_catalog::CatalogSnapshot {
         timezone: session.zone().unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0)),
         views: presentation.views.into_iter().map(|(id, v)| (id, v.definition)).collect(),
         comments: presentation.comments,
@@ -313,7 +313,81 @@ pub(crate) fn snapshot(
             .collect(),
         // Forward-compatible with CatalogSnapshot fields added by giggles-pg-catalog (track G).
         ..giggles_pg_catalog::CatalogSnapshot::default()
-    })
+    };
+    if session.task().is_none() {
+        return Ok(snapshot);
+    }
+    let view = session
+        .task_catalog_view()
+        .map_err(|e| crate::service::sqlstate(&e))?;
+    Ok(task_filtered(snapshot, &view))
+}
+
+/// GD-0061 R3-312: a task session's catalog. `tables` already holds only the
+/// task's table with its shown columns (`Session::task_catalog_snapshot`);
+/// this drops everything else that could name a hidden column or another
+/// relation: constraints, indexes, comments, defaults and key names that
+/// mention one, views, other schemas, other roles and their grants, and user
+/// types no shown column uses.
+fn task_filtered(
+    mut snapshot: giggles_pg_catalog::CatalogSnapshot,
+    view: &crate::service::TaskCatalogView,
+) -> giggles_pg_catalog::CatalogSnapshot {
+    let shown = |id: &u64| view.columns.contains(id);
+    snapshot.tables.retain(|table| table.id == view.table);
+    let keyed = snapshot
+        .tables
+        .iter()
+        .any(|table| !table.primary_key.is_empty());
+    snapshot.views.clear();
+    snapshot.comments.retain(|(table, column), text| {
+        *table == view.table && (*column == 0 || shown(column)) && !view.mentions_hidden(text)
+    });
+    snapshot
+        .column_defaults
+        .retain(|id, text| shown(id) && !view.mentions_hidden(text));
+    snapshot.column_identities.retain(|id, _| shown(id));
+    snapshot
+        .primary_names
+        .retain(|table, name| keyed && *table == view.table && !view.mentions_hidden(name));
+    snapshot.constraints.retain(|c| {
+        c.table == view.table
+            && c.columns.iter().all(shown)
+            && (c.foreign_table == 0
+                || (c.foreign_table == view.table && c.foreign_columns.iter().all(shown)))
+            && !view.mentions_hidden(&c.name)
+            && c.expression.as_deref().is_none_or(|e| !view.mentions_hidden(e))
+    });
+    snapshot.indexes.retain(|index| {
+        index.table == view.table
+            && index.columns.iter().all(shown)
+            && !view.mentions_hidden(&index.name)
+    });
+    snapshot.table_locks.retain(|(_, table, _, _, _)| *table == view.table);
+    snapshot.table_schemas.retain(|table, _| *table == view.table);
+    snapshot
+        .schemas
+        .retain(|name, _| *name == view.schema || name == "public");
+    let owner = snapshot.table_owners.get(&view.table).copied();
+    let user = snapshot.user.clone();
+    snapshot
+        .roles
+        .retain(|role| role.oid == 10 || role.name == user || Some(role.oid) == owner);
+    let roles: std::collections::BTreeSet<u32> = snapshot.roles.iter().map(|r| r.oid).collect();
+    snapshot.table_owners.retain(|table, _| *table == view.table);
+    snapshot.table_acls.retain(|table, _| *table == view.table);
+    for acl in snapshot.table_acls.values_mut() {
+        acl.retain(|entry| roles.contains(&entry.grantee));
+    }
+    snapshot.column_acls.retain(|(table, column), _| *table == view.table && shown(column));
+    for acl in snapshot.column_acls.values_mut() {
+        acl.retain(|entry| roles.contains(&entry.grantee));
+    }
+    snapshot.column_type_oids.retain(|id, _| shown(id));
+    snapshot.column_typmods.retain(|id, _| shown(id));
+    let used: std::collections::BTreeSet<u32> = snapshot.column_type_oids.values().copied().collect();
+    snapshot.user_types.retain(|ty| used.contains(&ty.oid));
+    snapshot
 }
 
 /// Only the finite catalog scalar types can enter its evaluator.
@@ -404,9 +478,17 @@ pub(crate) fn with_application_rows(
             "SELECT * FROM {target} LIMIT {}",
             giggles_pg_catalog::MAX_ROWS + 1
         );
-        let result = session
-            .execute_sql(&sql, &[])
+        // GD-0061 R3-312: the rows go through the release protocol before
+        // they are read. In a task session the generated `SELECT *` is
+        // expanded to the shown columns by the task's column rules, and the
+        // rows are scoped, masked and charged; elsewhere release is a move.
+        let unreleased = session
+            .execute_sql_unreleased(&sql, &[])
             .map_err(|e| crate::service::sqlstate(&e))?;
+        let result = session
+            .release_page(unreleased)
+            .map_err(|e| crate::service::sqlstate(&e))?
+            .into_inner();
         if result.rows.len() > giggles_pg_catalog::MAX_ROWS {
             return Err("54000");
         }
