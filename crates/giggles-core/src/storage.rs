@@ -2593,6 +2593,55 @@ impl SqlSession {
         }
         result
     }
+    #[cfg(all(test, feature = "engine-rocksdb"))]
+    pub(crate) fn v2_max_commit_group_size(&self) -> usize {
+        match &self.admin.inner.backend {
+            Backend::V2(db) => db.sequencer.max_group_size(),
+            _ => panic!("v2 sequencer required"),
+        }
+    }
+
+    pub(crate) fn begin_native_implicit(&mut self) -> Result<(), CoreError> {
+        self.native_implicit_control(true)
+    }
+
+    pub(crate) fn commit_native_implicit(&mut self) -> Result<(), CoreError> {
+        self.native_implicit_control(false)
+    }
+
+    fn native_implicit_control(&mut self, begin: bool) -> Result<(), CoreError> {
+        let inner = self.admin.inner.clone();
+        let Backend::V2(db) = &inner.backend else {
+            return if begin { self.begin_engine() } else { self.commit_engine() };
+        };
+        // These are the Control checks from execute_v2. No external Prepared,
+        // parameters, version or schema context can be stale on this path.
+        if self.copy_input.as_ref().is_some_and(|input| !input.executing) {
+            self.abort();
+            return Err(CoreError::Sql(relational::SqlError::Transaction));
+        }
+        if self.aborted { return Err(CoreError::Sql(relational::SqlError::Aborted)); }
+        let _ticket = match inner.enter_sql() {
+            Ok(ticket) => ticket,
+            Err(error) => { self.abort(); return Err(error); }
+        };
+        let result = crate::cancellation::check().and_then(|()| {
+            if begin {
+                self.begin_v2_transaction(db)?;
+                self.staged_revision = 0;
+                Ok(())
+            } else {
+                self.commit_v2_transaction(db)
+            }
+        });
+        if result.is_err() { self.abort(); }
+        if self.v2_transaction.is_none() {
+            self.xact.lock().unwrap_or_else(|e| e.into_inner()).take();
+            self.transaction_clock_us = None;
+        }
+        result
+    }
+
     pub(crate) fn begin_engine(&mut self) -> Result<(), CoreError> {
         if let Backend::V2(db) = &self.admin.inner.backend {
             let prepared =

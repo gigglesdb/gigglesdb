@@ -37,6 +37,110 @@ thread_local! {
 }
 
 impl SqlSession {
+
+    pub(crate) fn begin_v2_transaction(
+        &mut self, db: &Arc<v2::V2Db>,
+    ) -> Result<(), CoreError> {
+        let inner = self.admin.inner.clone();
+        if self.v2_transaction.is_some() {
+            return Err(CoreError::Sql(SqlError::Transaction));
+        }
+        let mut token = [0u8; 16];
+        getrandom::fill(&mut token).map_err(io)?;
+        let mut txn = db.begin(Isolation::ReadCommitted);
+        self.sequence_baseline = db
+            .catalog()
+            .snapshot(&mut txn)?
+            .parts.ext
+            .sequences
+            .iter()
+            .map(|(&id, def)| (id, def.incarnation))
+            .collect();
+        // The baseline read used a READ COMMITTED snapshot; the
+        // requested level takes its own at the first statement.
+        txn.set_isolation(self.isolation.engine())?;
+        inner
+            .sql_transactions
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                if n < relational::MAX_TRANSACTIONS {
+                    Some(n + 1)
+                } else {
+                    None
+                }
+            })
+            .map_err(|_| CoreError::Busy)?;
+        self.v2_transaction = Some(txn);
+        self.transaction_id = Some(u128::from_be_bytes(token));
+        Ok(())
+    }
+
+    pub(crate) fn commit_v2_transaction(
+        &mut self, db: &Arc<v2::V2Db>,
+    ) -> Result<(), CoreError> {
+        let inner = self.admin.inner.clone();
+        let txn = self.v2_transaction.take().ok_or(CoreError::Sql(SqlError::Transaction))?;
+        inner.sql_transactions.fetch_sub(1, Ordering::AcqRel);
+        self.publish_v2_sql(db, &inner, txn, true)
+    }
+
+    // Preserve explicit transaction cleanup before acknowledgement (including a
+    // lost response), while sharing publication with statement autocommit.
+    fn publish_v2_sql(&mut self, db: &Arc<v2::V2Db>, inner: &Inner, txn: Transaction, explicit: bool) -> Result<(), CoreError> {
+        // Statement autocommit historically samples the crash point before attaching.
+        let point = if explicit { None } else { Some(*inner.crash.lock().map_err(|_| CoreError::Fenced)?) };
+        let mut txn = txn;
+        let validation = (if explicit {
+            validate_pending(db, &mut txn, &mut self.deferral)
+        } else { Ok(()) })
+            .and_then(|()| {
+                if let Some(guard) = self.xact.lock()
+                    .map_err(|_| CoreError::Fenced)?.take()
+                {
+                    txn.attach_xact(guard)?;
+                }
+                Ok(())
+            });
+        if validation.is_err() {
+            if explicit { self.rollback(); }
+            return validation;
+        }
+        let point = match point {
+            Some(point) => point,
+            None => *inner.crash.lock().map_err(|_| CoreError::Fenced)?,
+        };
+        let committed = if explicit {
+            sql_sequences::stage_pending(db, &mut txn, &self.pending_sequences)
+                .and_then(|()| commit_sql(db, txn, point))
+        } else {
+            commit_sql(db, txn, point)
+        };
+        if explicit && committed.is_ok() {
+            // Never allocate from a reservation before it is durable:
+            // committed live positions follow a Sync write_counter ack
+            // in the sequence callback, or this commit's durable ack.
+            // Pending incarnations were not committed before this txn.
+            // A session finding no live entry reads the durable Seq
+            // counter, now equal to our staged counter, and may advance it.
+            // Keep any same-incarnation entry: it is at least as new.
+            let mut live = crate::cancellation::lock(&db.sql_counters)?;
+            for (id, counter) in self.pending_sequences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+            {
+                if live.get(id).is_none_or(|current| {
+                    current.incarnation != counter.incarnation
+                }) {
+                    live.insert(*id, counter.clone());
+                }
+            }
+        }
+        if explicit { self.rollback(); }
+        committed?;
+        acknowledge_sql_commit(point)?;
+        Ok(())
+    }
+
     #[cfg(feature = "engine-rocksdb")]
     pub(super) fn visit_native_page_v2<E>(
         &mut self, db: &Arc<v2::V2Db>, table: &TableDef,
@@ -232,35 +336,7 @@ impl SqlSession {
                     }
                     match control {
                         "begin" => {
-                            if self.v2_transaction.is_some() {
-                                return Err(CoreError::Sql(E::Transaction));
-                            }
-                            let mut token = [0u8; 16];
-                            getrandom::fill(&mut token).map_err(io)?;
-                            let mut txn = db.begin(Isolation::ReadCommitted);
-                            self.sequence_baseline = db
-                                .catalog()
-                                .snapshot(&mut txn)?
-                                .parts.ext
-                                .sequences
-                                .iter()
-                                .map(|(&id, def)| (id, def.incarnation))
-                                .collect();
-                            // The baseline read used a READ COMMITTED snapshot; the
-                            // requested level takes its own at the first statement.
-                            txn.set_isolation(self.isolation.engine())?;
-                            inner
-                                .sql_transactions
-                                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                                    if n < relational::MAX_TRANSACTIONS {
-                                        Some(n + 1)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .map_err(|_| CoreError::Busy)?;
-                            self.v2_transaction = Some(txn);
-                            self.transaction_id = Some(u128::from_be_bytes(token));
+                            self.begin_v2_transaction(db)?;
                         }
                         "savepoint" | "release" | "rollback_to" => {
                             let txn = self
@@ -296,53 +372,7 @@ impl SqlSession {
                             }
                         }
                         "commit" => {
-                            let txn = self
-                                .v2_transaction
-                                .take()
-                                .ok_or(CoreError::Sql(E::Transaction))?;
-                            inner.sql_transactions.fetch_sub(1, Ordering::AcqRel);
-                            let mut txn = txn;
-                            let validation = validate_pending(db, &mut txn, &mut self.deferral)
-                                .and_then(|()| {
-                                    if let Some(guard) = self.xact.lock()
-                                        .map_err(|_| CoreError::Fenced)?.take()
-                                    {
-                                        txn.attach_xact(guard)?;
-                                    }
-                                    Ok(())
-                                });
-                            if validation.is_err() {
-                                self.rollback();
-                                return validation.map(|()| Default::default());
-                            }
-                            let point = *inner.crash.lock().map_err(|_| CoreError::Fenced)?;
-                            let committed =
-                                sql_sequences::stage_pending(db, &mut txn, &self.pending_sequences)
-                                    .and_then(|()| commit_sql(db, txn, point));
-                            if committed.is_ok() {
-                                // Never allocate from a reservation before it is durable:
-                                // committed live positions follow a Sync write_counter ack
-                                // in the sequence callback, or this commit's durable ack.
-                                // Pending incarnations were not committed before this txn.
-                                // A session finding no live entry reads the durable Seq
-                                // counter, now equal to our staged counter, and may advance it.
-                                // Keep any same-incarnation entry: it is at least as new.
-                                let mut live = crate::cancellation::lock(&db.sql_counters)?;
-                                for (id, counter) in self.pending_sequences
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .iter()
-                                {
-                                    if live.get(id).is_none_or(|current| {
-                                        current.incarnation != counter.incarnation
-                                    }) {
-                                        live.insert(*id, counter.clone());
-                                    }
-                                }
-                            }
-                            self.rollback();
-                            committed?;
-                            acknowledge_sql_commit(point)?;
+                            self.commit_v2_transaction(db)?;
                             return Ok(Default::default());
                         }
                         "rollback" => {
@@ -950,15 +980,8 @@ impl SqlSession {
                     }
                     txn.release(mark).map_err(CoreError::from)?;
                     if self.v2_transaction.is_none() && !protected && result.is_ok() {
-                        let point = *inner.crash.lock().map_err(|_| CoreError::Fenced)?;
-                        let mut txn = implicit.take().expect("implicit transaction");
-                        if let Some(guard) = self.xact.lock()
-                            .map_err(|_| CoreError::Fenced)?.take()
-                        {
-                            txn.attach_xact(guard)?;
-                        }
-                        commit_sql(db, txn, point)?;
-                        acknowledge_sql_commit(point)?;
+                        let txn = implicit.take().expect("implicit transaction");
+                        self.publish_v2_sql(db, &inner, txn, false)?;
                     }
                     result
                 }

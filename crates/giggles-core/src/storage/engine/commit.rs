@@ -301,6 +301,8 @@ struct SnapState {
     active: BTreeMap<Ts, usize>,
 }
 struct Shared {
+    #[cfg(test)]
+    max_group: std::sync::atomic::AtomicUsize,
     snap: Mutex<SnapState>,
 }
 pub(crate) struct SnapshotHandle {
@@ -348,6 +350,11 @@ pub(crate) struct Sequencer {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 impl Sequencer {
+    #[cfg(test)]
+    pub(crate) fn max_group_size(&self) -> usize {
+        self.shared.max_group.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn open(
         kv: Arc<Kv>,
         clock: Arc<dyn Clock>,
@@ -368,6 +375,8 @@ impl Sequencer {
             None => Ts(0),
         };
         let shared = Arc::new(Shared {
+            #[cfg(test)]
+            max_group: std::sync::atomic::AtomicUsize::new(0),
             snap: Mutex::new(SnapState {
                 visible: seed,
                 active: BTreeMap::new(),
@@ -748,6 +757,8 @@ fn process_group(
     ts_source: &TsSource,
     served: &ServedGate,
 ) -> bool {
+    #[cfg(test)]
+    shared.max_group.fetch_max(group.len(), std::sync::atomic::Ordering::Relaxed);
     // Oracle mode reserves the group's timestamps before anything is staged, so an
     // oracle failure fails every request and writes nothing.
     // Each write request gets its own timestamp of one `next(n)` reservation (first + i).

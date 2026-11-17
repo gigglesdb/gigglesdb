@@ -166,7 +166,11 @@ impl SqlSession {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             validate()?;
             if owned {
-                self.begin_engine().map_err(core)?;
+                if self.is_v2_engine() {
+                    self.begin_native_implicit().map_err(core)?;
+                } else {
+                    self.begin_engine().map_err(core)?;
+                }
             }
             let result = work(self)?;
             // Active outer transactions have no publication fence in this call.
@@ -175,7 +179,12 @@ impl SqlSession {
                 if read_only {
                     self.rollback();
                 } else {
-                    self.commit_engine().map_err(|error| match error {
+                    let committed = if self.is_v2_engine() {
+                        self.commit_native_implicit()
+                    } else {
+                        self.commit_engine()
+                    };
+                    committed.map_err(|error| match error {
                         CoreError::Storage(_) => Error::Unknown,
                         other => core(other),
                     })?;

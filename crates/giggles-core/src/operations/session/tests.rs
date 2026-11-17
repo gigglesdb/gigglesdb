@@ -322,3 +322,61 @@ fn failed_commit_is_ambiguous_with_owned_cleanup_and_outer_abort() {
         }
     }
 }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_native_autocommit_groups_and_scope_atomicity() {
+    let mut token = [0; 16];
+    getrandom::fill(&mut token).unwrap();
+    let path = crate::test_artifact_root().join(format!(
+        "native-autocommit-{:032x}", u128::from_be_bytes(token)));
+    let admin = Admin::create_engine(&path, Limits::default(), crate::Engine::V2).unwrap();
+    let mut session = admin.sql_session();
+    session.execute("CREATE TABLE app (id BIGINT PRIMARY KEY)", &[], None).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+    std::thread::scope(|scope| {
+        for worker in 0..16 {
+            let admin = admin.clone();
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                let mut session = admin.sql_session();
+                barrier.wait();
+                for row in 0..50 {
+                    with_sql_parser_forbidden(|| session.execute_native(
+                        &insert(worker * 50 + row), &Bindings::new())).unwrap();
+                    assert!(!session.in_transaction());
+                }
+            });
+        }
+    });
+    let rows = session.execute("SELECT id FROM app ORDER BY id", &[], None).unwrap().rows;
+    assert_eq!(rows.len(), 800);
+    for (id, row) in rows.iter().enumerate() {
+        assert_eq!(row.values, vec![Value::Int(id as i64)]);
+    }
+    assert!(session.v2_max_commit_group_size() > 1, "native commits must group");
+
+    // The owned scope spans both successful work and a later failure.
+    let failed = Transaction {
+        read_only: false,
+        steps: vec![
+            TransactionStep::Execute(insert(800)),
+            TransactionStep::Execute(insert(801)),
+            TransactionStep::Require(Expr::Value(ValueExpr::Literal(Value::Bool(false)))),
+        ],
+        emit: None,
+    };
+    assert_eq!(session.execute_native_transaction(&failed, &Bindings::new()),
+        Err(Error::RequirementFailed));
+    assert!(!session.in_transaction());
+    assert!(session.execute("SELECT id FROM app WHERE id >= 800", &[], None).unwrap().rows.is_empty());
+    session.begin_native().unwrap();
+    session.execute_native(&insert(800), &Bindings::new()).unwrap();
+    session.execute_native(&insert(801), &Bindings::new()).unwrap();
+    assert!(admin.sql_session().execute("SELECT id FROM app WHERE id >= 800", &[], None).unwrap().rows.is_empty());
+    session.commit_native().unwrap();
+    assert_eq!(session.execute("SELECT id FROM app WHERE id >= 800", &[], None).unwrap().rows.len(), 2);
+    drop(session);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
