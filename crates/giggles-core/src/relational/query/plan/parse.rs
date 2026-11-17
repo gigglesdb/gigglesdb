@@ -25,7 +25,7 @@ fn top(tokens: &[Token]) -> R<Vec<usize>> {
         }
         if *t == Token::Symbol('(') {
             depth += 1;
-            if depth > 32 {
+            if depth > subplans::MAX_DEPTH {
                 return Err(SqlError::Limit);
             }
         }
@@ -45,9 +45,12 @@ impl Plan {
         if tokens.last() == Some(&Token::Symbol(';')) {
             tokens.pop();
         }
-        if tokens.len() > MAX_WORK * 8 {
+        if tokens.len() > MAX_WORK {
             return Err(SqlError::Limit.into());
         }
+        admit_subquery_depth(&tokens)?;
+        // Admit parentheses before entering WITH or any recursive planner frame.
+        top(&tokens)?;
         let plan = expression(&tokens, p, 0, &mut 0)?;
         // Query's normalizer may rewrite tokens; collect original parameter numbers.
         p.params.extend(tokens.iter().filter_map(|t| {
@@ -61,13 +64,24 @@ impl Plan {
         Ok(plan)
     }
 }
+pub(super) fn child_expression(
+    tokens: &[Token],
+    owner: &mut Parser,
+    depth: usize,
+    next: &mut usize,
+) -> ParseResult<Plan> {
+    if depth >= subplans::MAX_DEPTH {
+        return Err(SqlError::Limit.into());
+    }
+    expression(tokens, owner, depth + 1, next)
+}
 pub(super) fn expression(
     tokens: &[Token],
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
 ) -> ParseResult<Plan> {
-    if depth > 32 {
+    if depth > subplans::MAX_DEPTH {
         return Err(SqlError::Limit.into());
     }
     if tokens.is_empty() {
@@ -76,6 +90,17 @@ pub(super) fn expression(
     if tokens.first().is_some_and(|t| word(t, "with")) {
         return cte::parse(tokens, owner, depth, next);
     }
+    query_expression(tokens, owner, depth, next)
+}
+
+// Keep WITH dispatch out of this larger frame: nested WITH bodies must not
+// reserve space for unrelated VALUES, pagination and SELECT parsing locals.
+fn query_expression(
+    tokens: &[Token],
+    owner: &mut Parser,
+    depth: usize,
+    next: &mut usize,
+) -> ParseResult<Plan> {
     let positions = top(tokens)?;
     let tail = positions
         .iter()
@@ -99,7 +124,7 @@ pub(super) fn expression(
             .copied()
             .rfind(|i| *i < tail && word(&tokens[*i], "intersect"));
     }
-    let mut plan = if let Some(i) = split {
+    let plan = if let Some(i) = split {
         let op = if word(&tokens[i], "union") {
             SetOp::Union
         } else if word(&tokens[i], "except") {
@@ -112,11 +137,11 @@ pub(super) fn expression(
         Plan::new(Body::Set {
             op,
             all,
-            left: Box::new(expression(&body[..i], owner, depth + 1, next)?),
-            right: Box::new(expression(
+            left: Box::new(child_expression(&body[..i], owner, depth, next)?),
+            right: Box::new(child_expression(
                 &body[i + 1 + usize::from(modifier)..],
                 owner,
-                depth + 1,
+                depth,
                 next,
             )?),
         })
@@ -125,72 +150,84 @@ pub(super) fn expression(
             return Err(SqlError::Syntax.into());
         }
         // Keep both pagination boundaries, even for ((SELECT ...) LIMIT ...).
-        let child = expression(&body[1..body.len() - 1], owner, depth + 1, next)?;
+        let child = child_expression(&body[1..body.len() - 1], owner, depth, next)?;
         if tail == tokens.len() {
             return Ok(child);
         }
-        // An identity SELECT is an ordinary materialized-input operator.
-        let name = "\0plan_input".to_string();
-        let mut p = parser(&[
-            Token::Word("select".into()),
-            Token::Symbol('*'),
-            Token::Word("from".into()),
-            Token::QuotedIdent("plan_input".into()),
-        ]);
-        let mut query = Query::parse(&mut p)?;
-        query.sources[0].name = name.clone();
-        Plan::new(Body::Select(Box::new(Select {
-            query,
-            parameters: BTreeSet::new(),
-            input: Some(Input {
-                query: Box::new(child),
-                name,
-                aliases: vec![],
-            }),
-        })))
+        identity(child)?
     } else if body.first().is_some_and(|t| word(t, "values")) {
-        let mut p = parser(body);
-        p.need("values")?;
-        let mut rows = vec![];
+        values(body)?
+    } else {
+        return select(tokens, owner, depth, next);
+    };
+    pagination(plan, &tokens[tail..])
+}
+
+fn identity(child: Plan) -> ParseResult<Plan> {
+    // An identity SELECT is an ordinary materialized-input operator.
+    let name = "\0plan_input".to_string();
+    let mut p = parser(&[
+        Token::Word("select".into()),
+        Token::Symbol('*'),
+        Token::Word("from".into()),
+        Token::QuotedIdent("plan_input".into()),
+    ]);
+    let mut query = Query::parse(&mut p)?;
+    query.sources[0].name = name.clone();
+    Ok(Plan::new(Body::Select(Box::new(Select {
+        query,
+        parameters: BTreeSet::new(),
+        input: Some(Input {
+            query: Box::new(child),
+            name,
+            aliases: vec![],
+        }),
+    }))))
+}
+
+fn values(body: &[Token]) -> ParseResult<Plan> {
+    let mut p = parser(body);
+    p.need("values")?;
+    let mut rows = vec![];
+    loop {
+        if !p.sym('(') {
+            return Err(SqlError::Syntax.into());
+        }
+        let mut row = vec![];
         loop {
-            if !p.sym('(') {
-                return Err(SqlError::Syntax.into());
-            }
-            let mut row = vec![];
-            loop {
-                row.push(Scalar::parse_expr(&mut p, 0, false)?);
-                if row.len() > MAX_COLUMNS {
-                    return Err(SqlError::Limit.into());
-                }
-                if !p.sym(',') {
-                    break;
-                }
-            }
-            if !p.sym(')') {
-                return Err(SqlError::Syntax.into());
-            }
-            if rows
-                .first()
-                .is_some_and(|r: &Vec<Scalar>| r.len() != row.len())
-            {
-                return Err(ParseError::Definite(SqlError::Syntax));
-            }
-            rows.push(row);
-            if rows.len() > MAX_WORK {
+            row.push(Scalar::parse_expr(&mut p, 0, false)?);
+            if row.len() > MAX_COLUMNS {
                 return Err(SqlError::Limit.into());
             }
             if !p.sym(',') {
                 break;
             }
         }
-        if p.at != p.tokens.len() {
+        if !p.sym(')') {
             return Err(SqlError::Syntax.into());
         }
-        Plan::new(Body::Values(rows))
-    } else {
-        return select(tokens, owner, depth, next);
-    };
-    let mut p = parser(&tokens[tail..]);
+        if rows
+            .first()
+            .is_some_and(|r: &Vec<Scalar>| r.len() != row.len())
+        {
+            return Err(ParseError::Definite(SqlError::Syntax));
+        }
+        rows.push(row);
+        if rows.len() > MAX_WORK {
+            return Err(SqlError::Limit.into());
+        }
+        if !p.sym(',') {
+            break;
+        }
+    }
+    if p.at != p.tokens.len() {
+        return Err(SqlError::Syntax.into());
+    }
+    Ok(Plan::new(Body::Values(rows)))
+}
+
+fn pagination(mut plan: Plan, tokens: &[Token]) -> ParseResult<Plan> {
+    let mut p = parser(tokens);
     if p.word("order") {
         p.need("by")?;
         loop {
@@ -250,7 +287,12 @@ pub(super) fn expression(
     }
     Ok(plan)
 }
-fn select(tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize) -> ParseResult<Plan> {
+fn select(
+    tokens: &[Token],
+    owner: &mut Parser,
+    depth: usize,
+    next: &mut usize,
+) -> ParseResult<Plan> {
     let mut tokens = tokens.to_vec();
     if tokens.first().is_some_and(|t| word(t, "table")) {
         tokens.splice(
@@ -298,7 +340,7 @@ fn select(tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize) 
     {
         let open = from + 1;
         let close = subquery_end(&tokens, open)?;
-        let child = expression(&tokens[open + 1..close], owner, depth + 1, next)?;
+        let child = child_expression(&tokens[open + 1..close], owner, depth, next)?;
         let mut p = parser(&tokens[close + 1..]);
         let explicit = p.word("as");
         let alias = if explicit
@@ -336,7 +378,11 @@ fn select(tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize) 
             aliases,
         });
     }
-    let mut p = parser(&tokens);
+    select_query(&tokens, input, owner)
+}
+
+fn select_query(tokens: &[Token], input: Option<Input>, owner: &mut Parser) -> ParseResult<Plan> {
+    let mut p = parser(tokens);
     let mut query = Query::parse(&mut p)?;
     if let Some(input) = &input {
         query.sources[0].name = input.name.clone();

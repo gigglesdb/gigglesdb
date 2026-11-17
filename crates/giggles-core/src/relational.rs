@@ -3243,7 +3243,11 @@ impl Prepared {
         let statement = match existing {
             Ok(statement) => statement,
             Err(error) => {
-                if !query::plan::Plan::claims(&original_tokens) { return Err(error); }
+                if !matches!(error, SqlError::Unsupported | SqlError::Syntax | SqlError::Reserved)
+                    || !query::plan::Plan::claims(&original_tokens)
+                {
+                    return Err(error);
+                }
                 p.tokens = original_tokens;
                 p.at = 0;
                 p.params.clear();

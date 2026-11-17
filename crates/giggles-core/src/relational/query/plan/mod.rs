@@ -20,9 +20,12 @@ pub(in crate::relational) enum ParseError {
     Definite(SqlError),
 }
 impl From<SqlError> for ParseError {
-    fn from(_error: SqlError) -> Self {
-        // Shared parser failures do not prove recognition of the grammar.
-        // Deliberate PostgreSQL diagnostics are marked Definite at their origin.
-        Self::Decline
+    fn from(error: SqlError) -> Self {
+        // Only recognition failures permit a decline. Resource and semantic
+        // errors from the shared parser must survive planner fallback unchanged.
+        match error {
+            SqlError::Unsupported | SqlError::Syntax | SqlError::Reserved => Self::Decline,
+            error => Self::Definite(error),
+        }
     }
 }

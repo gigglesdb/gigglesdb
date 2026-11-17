@@ -188,6 +188,16 @@ impl Query {
     }
 }
 
+struct QueryPrefix {
+    explain: bool,
+    distinct: bool,
+    aggregate_filters: Vec<Scalar>,
+    items: Vec<(Item, Option<String>)>,
+    sources: Vec<Source>,
+    aliased_sources: Vec<usize>,
+    derived: Option<Box<Query>>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct QueryClauses {
     view_reads: Vec<String>,
@@ -803,99 +813,148 @@ impl Filter {
                 negated: false,
             }
         } else {
-            let parse_scalar = |p: &mut Parser, depth| {
-                if aggregate_argument {
-                    Scalar::parse_aggregate_argument(p, depth)
-                } else {
-                    Scalar::parse(p, depth)
-                }
-            };
             // A comma at the outer parenthesis level distinguishes a row from
             // scalar grouping. Lower rows here, keeping scalar and wire types unchanged.
             let a = if Self::starts_row(p) {
                 Scalar::Predicate(Box::new(Self::row_filter(p, depth, aggregate_argument)?))
-            } else { parse_scalar(p, depth)? };
-            let not = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not")
-                && matches!(p.tokens.get(p.at + 1), Some(Token::Word(w)) if w == "in" || w == "between" || w == "like" || w == "ilike");
-            if not {
-                p.at += 1;
-            }
-            if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "like" || w == "ilike") {
-                let insensitive = p.word("ilike");
-                if !insensitive {
-                    p.need("like")?;
-                }
-                let pattern = parse_scalar(p, depth + 1)?;
-                let escape = if p.word("escape") {
-                    Some(parse_scalar(p, depth + 1)?)
-                } else {
-                    None
-                };
-                Self::Like {
-                    value: a,
-                    pattern,
-                    escape,
-                    insensitive,
-                    negated: not,
-                }
-            } else if p.word("in") {
-                p.punct('(')?;
-                if p.sym(')') {
-                    return Err(SqlError::Syntax);
-                }
-                if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "select") {
-                    let query = Self::parse_child(p)?;
-                    Self::InSubquery {
-                        value: a,
-                        query,
-                        negated: not,
-                    }
-                } else {
-                    let mut values = vec![parse_scalar(p, depth + 1)?];
-                    while p.sym(',') {
-                        values.push(parse_scalar(p, depth + 1)?);
-                    }
-                    p.punct(')')?;
-                    admit_expansion(&a, values.len())?;
-                    Self::membership(&a, &values, not)
-                }
-            } else if p.word("between") {
-                if p.word("symmetric") {
-                    return Err(SqlError::Unsupported);
-                }
-                p.word("asymmetric");
-                let lower = parse_scalar(p, depth + 1)?;
-                p.need("and")?;
-                let upper = parse_scalar(p, depth + 1)?;
-                admit_expansion(&a, 2)?;
-                Self::Logic(
-                    Box::new(Self::Compare(
-                        a.clone(),
-                        if not { "<" } else { ">=" }.into(),
-                        lower,
-                    )),
-                    !not,
-                    Box::new(Self::Compare(a, if not { ">" } else { "<=" }.into(), upper)),
-                )
-            } else if let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() {
-                if !["=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()) {
-                    return Err(SqlError::Unsupported);
-                }
-                p.at += 1;
-                if matches!(
-                    p.tokens.get(p.at),
-                    None | Some(Token::Symbol(')' | ',' | ';'))
-                ) {
-                    return Err(SqlError::Syntax);
-                }
-                Self::Compare(a, op, parse_scalar(p, depth + 1)?)
+            } else if aggregate_argument {
+                Scalar::parse_aggregate_argument(p, depth)?
             } else {
-                match a {
-                    Scalar::Predicate(f) => *f,
-                    a => Self::Scalar(a),
-                }
+                Scalar::parse(p, depth)?
+            };
+            Self::parse_comparison(p, a, depth, aggregate_argument)?
+        };
+        f = Self::parse_is_suffix(p, f, depth, aggregate_argument)?;
+        loop {
+            let and = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "and");
+            let or = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "or");
+            let level = if and {
+                2
+            } else if or {
+                1
+            } else {
+                break;
+            };
+            if level <= precedence {
+                break;
+            }
+            p.at += 1;
+            f = Self::Logic(
+                Box::new(f),
+                and,
+                Box::new(Self::parse_context(
+                    p,
+                    level,
+                    depth + 1,
+                    aggregate_argument,
+                )?),
+            );
+        }
+        Ok(f)
+    }
+    // Keep comparison and IS construction off the recursive CASE/scalar path.
+    // Their temporary Filter trees otherwise consume stack at every scalar level.
+    fn parse_comparison(
+        p: &mut Parser,
+        a: Scalar,
+        depth: usize,
+        aggregate_argument: bool,
+    ) -> R<Self> {
+        let parse_scalar = |p: &mut Parser, depth| {
+            if aggregate_argument {
+                Scalar::parse_aggregate_argument(p, depth)
+            } else {
+                Scalar::parse(p, depth)
             }
         };
+        let not = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not")
+            && matches!(p.tokens.get(p.at + 1), Some(Token::Word(w)) if w == "in" || w == "between" || w == "like" || w == "ilike");
+        if not {
+            p.at += 1;
+        }
+        Ok(if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "like" || w == "ilike") {
+            let insensitive = p.word("ilike");
+            if !insensitive {
+                p.need("like")?;
+            }
+            let pattern = parse_scalar(p, depth + 1)?;
+            let escape = if p.word("escape") {
+                Some(parse_scalar(p, depth + 1)?)
+            } else {
+                None
+            };
+            Self::Like {
+                value: a,
+                pattern,
+                escape,
+                insensitive,
+                negated: not,
+            }
+        } else if p.word("in") {
+            p.punct('(')?;
+            if p.sym(')') {
+                return Err(SqlError::Syntax);
+            }
+            if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "select") {
+                let query = Self::parse_child(p)?;
+                Self::InSubquery {
+                    value: a,
+                    query,
+                    negated: not,
+                }
+            } else {
+                let mut values = vec![parse_scalar(p, depth + 1)?];
+                while p.sym(',') {
+                    values.push(parse_scalar(p, depth + 1)?);
+                }
+                p.punct(')')?;
+                admit_expansion(&a, values.len())?;
+                Self::membership(&a, &values, not)
+            }
+        } else if p.word("between") {
+            if p.word("symmetric") {
+                return Err(SqlError::Unsupported);
+            }
+            p.word("asymmetric");
+            let lower = parse_scalar(p, depth + 1)?;
+            p.need("and")?;
+            let upper = parse_scalar(p, depth + 1)?;
+            admit_expansion(&a, 2)?;
+            Self::Logic(
+                Box::new(Self::Compare(
+                    a.clone(),
+                    if not { "<" } else { ">=" }.into(),
+                    lower,
+                )),
+                !not,
+                Box::new(Self::Compare(a, if not { ">" } else { "<=" }.into(), upper)),
+            )
+        } else if let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() {
+            if !["=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()) {
+                return Err(SqlError::Unsupported);
+            }
+            p.at += 1;
+            if matches!(
+                p.tokens.get(p.at),
+                None | Some(Token::Symbol(')' | ',' | ';'))
+            ) {
+                return Err(SqlError::Syntax);
+            }
+            Self::Compare(a, op, parse_scalar(p, depth + 1)?)
+        } else {
+            match a {
+                Scalar::Predicate(f) => *f,
+                a => Self::Scalar(a),
+            }
+        })
+    }
+
+    fn parse_is_suffix(
+        p: &mut Parser,
+        mut f: Self,
+        depth: usize,
+        aggregate_argument: bool,
+    ) -> R<Self> {
         // IS binds more tightly than prefix NOT and the logical operators.
         let mut suffixes = depth;
         while p.word("is") {
@@ -955,33 +1014,9 @@ impl Filter {
                 f = Self::Is(Box::new(f), target, negated);
             }
         }
-        loop {
-            let and = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "and");
-            let or = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "or");
-            let level = if and {
-                2
-            } else if or {
-                1
-            } else {
-                break;
-            };
-            if level <= precedence {
-                break;
-            }
-            p.at += 1;
-            f = Self::Logic(
-                Box::new(f),
-                and,
-                Box::new(Self::parse_context(
-                    p,
-                    level,
-                    depth + 1,
-                    aggregate_argument,
-                )?),
-            );
-        }
         Ok(f)
     }
+
     fn row_filter(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
         let a = Self::row(p, depth, aggregate_argument)?;
         let not = p.word("not");
@@ -2460,6 +2495,17 @@ impl Query {
             }
             sources.push(source);
         }
+        Self::parse_tail(p, QueryPrefix {
+            explain, distinct, aggregate_filters, items, sources, aliased_sources, derived,
+        })
+    }
+    // Derived children parse before this frame is entered. Keep the later
+    // clauses' temporary scalar/filter trees off every derived-query level.
+    fn parse_tail(p: &mut Parser, prefix: QueryPrefix) -> R<Self> {
+        let QueryPrefix {
+            explain, distinct, aggregate_filters, mut items, mut sources,
+            mut aliased_sources, derived,
+        } = prefix;
         let mut joins = vec![];
         loop {
             let left = if p.word("left") {

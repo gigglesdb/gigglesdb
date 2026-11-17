@@ -29,12 +29,48 @@ struct Cycle {
     default: Scalar,
 }
 
+struct Scope {
+    definitions: Vec<(String, Cte)>,
+    recursive: bool,
+    names: BTreeSet<String>,
+}
+
 pub(super) fn parse(
     tokens: &[Token],
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
 ) -> parse::ParseResult<Plan> {
+    // WITH bodies form a continuation chain. Store those scopes on the heap
+    // so scalar parsing in the innermost body has the same stack as a root query.
+    let mut remaining = tokens;
+    let mut depth = depth;
+    let mut scopes = Vec::new();
+    loop {
+        let (scope, at) = parse_scope(remaining, owner, depth, next)?;
+        scopes.push(scope);
+        remaining = &remaining[at..];
+        if depth >= subplans::MAX_DEPTH {
+            return Err(SqlError::Limit.into());
+        }
+        depth += 1;
+        if !remaining.first().is_some_and(|t| parse::word(t, "with")) {
+            break;
+        }
+    }
+    let mut body = parse::expression(remaining, owner, depth, next)?;
+    for scope in scopes.into_iter().rev() {
+        body = finish(scope.definitions, scope.recursive, scope.names, body, owner)?;
+    }
+    Ok(body)
+}
+
+fn parse_scope(
+    tokens: &[Token],
+    owner: &mut Parser,
+    depth: usize,
+    next: &mut usize,
+) -> parse::ParseResult<(Scope, usize)> {
     let mut p = parse::parser(tokens);
     p.need("with")?;
     let recursive = p.word("recursive");
@@ -70,14 +106,14 @@ pub(super) fn parse(
             if depth != 0 {
                 return Err(ParseError::Definite(SqlError::Unsupported));
             }
-            Some(Box::new(dml::parse(tokens, owner)?))
+            Some(parse_dml(tokens, owner)?)
         } else {
             None
         };
         let query = if dml.is_some() {
             Plan::new(Body::Values(vec![]))
         } else {
-            parse::expression(tokens, owner, depth + 1, next)?
+            parse::child_expression(tokens, owner, depth, next)?
         };
         let dml_parameters = tokens
             .iter()
@@ -153,7 +189,23 @@ pub(super) fn parse(
             break;
         }
     }
-    let mut body = parse::expression(&p.tokens[p.at..], owner, depth + 1, next)?;
+    Ok((
+        Scope {
+            definitions,
+            recursive,
+            names,
+        },
+        p.at,
+    ))
+}
+
+fn finish(
+    mut definitions: Vec<(String, Cte)>,
+    recursive: bool,
+    names: BTreeSet<String>,
+    mut body: Plan,
+    owner: &mut Parser,
+) -> parse::ParseResult<Plan> {
     for i in 0..definitions.len() {
         let scope = if recursive { definitions.len() } else { i };
         for j in 0..scope {
@@ -207,6 +259,11 @@ pub(super) fn parse(
     });
     Ok(body)
 }
+// Keep Prepared construction out of every recursive WITH parse frame.
+fn parse_dml(tokens: &[Token], owner: &mut Parser) -> R<Box<Prepared>> {
+    Ok(Box::new(dml::parse(tokens, owner)?))
+}
+
 fn names_list(p: &mut Parser, close: bool) -> R<Vec<String>> {
     let mut names = vec![];
     loop {

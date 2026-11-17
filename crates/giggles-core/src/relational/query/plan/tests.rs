@@ -1,4 +1,92 @@
 use super::*;
+
+fn assert_parse_limit(sql: &str) {
+    let started = std::time::Instant::now();
+    assert_eq!(Prepared::parse(sql, 1, 0).unwrap_err(), SqlError::Limit);
+    // Exercise planner admission independently of the legacy parser's fallback guard.
+    let mut tokens = vec![];
+    lex_into(sql, &mut tokens, true).unwrap();
+    let mut p = parse::parser(&tokens);
+    assert!(matches!(
+        Plan::parse(&mut p),
+        Err(ParseError::Definite(SqlError::Limit))
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn frozen_case_depth_in_every_planner_operand() {
+    let case = format!(
+        "{}1{}",
+        "CASE WHEN true THEN ".repeat(40),
+        " END".repeat(40)
+    );
+    // Confirm that the legacy parser already rejects this before fallback.
+    let mut p = parse::parser(&lex(&format!("SELECT {case}")).unwrap());
+    assert_eq!(Query::parse(&mut p).unwrap_err(), SqlError::Limit);
+    for sql in [
+        format!("SELECT {case}"),
+        format!("SELECT 1 UNION SELECT {case}"),
+        format!("WITH q AS (SELECT {case}) SELECT * FROM q"),
+        format!("VALUES ({case})"),
+    ] {
+        assert_parse_limit(&sql);
+    }
+}
+
+#[test]
+fn frozen_parenthesized_set_depth() {
+    for depth in [33, 1000] {
+        let sql = format!(
+            "{}SELECT 1{}",
+            "(".repeat(depth),
+            ") UNION (SELECT 2)".repeat(depth)
+        );
+        assert_parse_limit(&sql);
+    }
+}
+
+#[test]
+fn frozen_scalar_subquery_depth() {
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
+    assert_parse_limit(&sql);
+}
+
+#[test]
+fn frozen_scalar_caps_in_values_and_pagination() {
+    for scalar in [
+        format!("CASE {}END", "WHEN false THEN 0 ".repeat(MAX_COLUMNS + 1)),
+        format!("{}1{}", "(".repeat(40), ")".repeat(40)),
+        format!("{}1", "- ".repeat(40)),
+        format!("1{}", "::integer".repeat(40)),
+    ] {
+        assert_parse_limit(&format!("VALUES ({scalar})"));
+        assert_parse_limit(&format!("SELECT 1 UNION SELECT 2 ORDER BY {scalar}"));
+        assert_parse_limit(&format!("VALUES (1) LIMIT {scalar}"));
+    }
+}
+
+#[test]
+fn frozen_depth_through_cte_bodies_and_derived_inputs() {
+    let case = format!(
+        "{}1{}",
+        "CASE WHEN true THEN ".repeat(40),
+        " END".repeat(40)
+    );
+    let mut cte = format!("SELECT {case}");
+    let mut derived = cte.clone();
+    let mut definitions = cte.clone();
+    for _ in 0..subplans::MAX_DEPTH {
+        cte = format!("WITH q AS (VALUES(1)) {cte}");
+        derived = format!("SELECT * FROM ({derived}) q");
+        definitions = format!("WITH q AS ({definitions}) SELECT * FROM q");
+    }
+    assert_parse_limit(&cte);
+    assert_parse_limit(&derived);
+    assert_parse_limit(&definitions);
+    assert_parse_limit(&format!("WITH q AS (VALUES(1)) {cte}"));
+}
+
 fn run(state: &mut Relational, sql: &str) -> SqlResult {
     let p = Prepared::parse(sql, 1, state.epoch).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     state
@@ -278,6 +366,10 @@ fn bpchar_set_consumers_fail_closed_even_without_rows() {
         "WITH RECURSIVE t(c) AS (SELECT c FROM plan_bpchar UNION SELECT c FROM t) SELECT c FROM t",
     ] {
         let p = Prepared::parse(sql, 1, state.epoch).unwrap();
-        assert_eq!(state.execute(&p, &[], None), Err(SqlError::Unsupported), "{sql}");
+        assert_eq!(
+            state.execute(&p, &[], None),
+            Err(SqlError::Unsupported),
+            "{sql}"
+        );
     }
 }
