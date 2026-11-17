@@ -243,7 +243,7 @@ pub(crate) fn catalog_def(
     Ok(view.tasks.get(&task.0).cloned())
 }
 
-fn unsupported() -> TaskError {
+pub(crate) fn unsupported() -> TaskError {
     TaskError::Core(Box::new(CoreError::Unsupported))
 }
 
@@ -254,7 +254,7 @@ fn corrupt(message: &str) -> TaskError {
 /// Engine errors: a serialization failure or a deadlock is `Retry`, which
 /// the attempt loop retries; everything else (55P03, 57014, limits, 08007)
 /// passes through unchanged.
-fn engine(error: CoreError) -> TaskError {
+pub(crate) fn engine(error: CoreError) -> TaskError {
     match error {
         CoreError::Sql(SqlError::Conflict) | CoreError::Deadlock => TaskError::Retry,
         other => other.into(),
@@ -263,14 +263,14 @@ fn engine(error: CoreError) -> TaskError {
 
 /// The hold's lock wait ran past the task's `lock_wait_ms`: 55P03
 /// lock_not_available, as `LOCK ... NOWAIT` reports it (not 53300 `Busy`).
-fn hold_error(error: TxnError) -> TaskError {
+pub(crate) fn hold_error(error: TxnError) -> TaskError {
     match error {
         TxnError::LockTimeout => CoreError::LockNotAvailable.into(),
         other => engine(other.into()),
     }
 }
 
-fn role_error(error: RoleError) -> TaskError {
+pub(crate) fn role_error(error: RoleError) -> TaskError {
     match error {
         RoleError::Core(core) => engine(core),
         _ => TaskError::Denied(DenyRule::RolePrivilege),
@@ -290,7 +290,7 @@ fn bound<'d>(def: Option<&'d TaskDef>, ctx: &TaskContext) -> Result<&'d TaskDef,
 }
 
 /// [`bound`], then Expired: `now >= expires_at`.
-fn standing(def: Option<&TaskDef>, ctx: &TaskContext, now_ms: u64) -> Result<(), TaskError> {
+pub(crate) fn standing(def: Option<&TaskDef>, ctx: &TaskContext, now_ms: u64) -> Result<(), TaskError> {
     let def = bound(def, ctx)?;
     if i64::try_from(now_ms).unwrap_or(i64::MAX) >= def.expires_at.0 {
         return Err(TaskError::Expired);

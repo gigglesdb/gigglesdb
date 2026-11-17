@@ -25,10 +25,10 @@ pub(crate) mod ledger;
 // receipt, preview, approval, read log); until they land only the format gates use them.
 #[allow(dead_code)]
 pub(crate) mod records;
-// R3-701 / R3-801: consumed by the preview store and apply (R3-703..R3-706)
-// and the undo dry run and commit (R3-802..R3-804).
+// R3-701 / R3-801: the preview store (R3-703); apply (R3-706) and the undo
+// dry run and commit (R3-802..R3-804) consume the rest.
 #[allow(dead_code)]
-pub(crate) mod preview;
+pub mod preview;
 #[allow(dead_code)]
 pub(crate) mod undo;
 // R3-613: consumed by protected_commit (R3-615+) and outcome lookup.
@@ -50,6 +50,7 @@ pub use commit::{inspect_outcome, outcome, protected_commit, Actor, ProtectedReq
 #[doc(hidden)]
 pub use commit::ProtectedPoint;
 pub use ledger::{OperationId, Outcome};
+pub use preview::{preview, PreviewId, PreviewSummary, Surface};
 pub use receipt::Receipt;
 pub use readlog::{fingerprint_and_cap, show_reads, ReadRecord, Reconciliation};
 pub use release::{Page, ReleaseTag, Released, Unreleased};

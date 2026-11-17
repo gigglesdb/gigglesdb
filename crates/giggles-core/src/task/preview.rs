@@ -1,14 +1,50 @@
-//! Preview identity, schema fingerprint and digest (GD-0061 R3-701, design D7.2/D7.3).
+//! PREVIEW (GD-0061 design D7.2-D7.4): identity, schema fingerprint and
+//! digest (R3-701), and the preview itself, a dry run then a store (R3-703).
 //!
 //! The stored header (`27`) and row (`28`) structs and their codecs live in
 //! [`super::records`]; this module re-exports them and defines the values
 //! that go into them.
-use super::error::{DenyRule, TaskError};
-use super::records::TaskObjectId;
+//!
+//! [`preview`] is two transactions and writes no user rows:
+//! - T1, the dry run (no hold; a preview is advisory and apply rechecks it
+//!   in full): the task's standing, the column rules, the statement through
+//!   the protected seam bound to the task (visible rows) with a clock pinned
+//!   at the transaction instant, the clock observations (D7.4), the policy
+//!   and the caps on the effects, the 10,000-row ceiling; then roll back.
+//! - T2, the store (ReadCommitted, under the authority hold): the standing
+//!   again, the sweep of expired and applied previews (headers, rows and
+//!   approvals), the `stored_previews` limit, the id from the head, then the
+//!   header, its rows and the head in one commit.
+//!
+//! Nothing a preview refuses is recorded: it has no operation ID. In a task
+//! session the preview writes one read-log record (no rows returned).
+use super::admit::StatementClass;
+use super::authority;
+use super::columns;
+use super::commit::{catalog_def, engine, hold_error, role_error, standing, unsupported, DefAt};
+use super::context::TaskContext;
+use super::decide::{self, ApprovalState, Decision, RequestKind};
+use super::definition::{TaskDef, WallClockMs};
+use super::effects::Effects;
+use super::error::{Budget, DenyRule, TaskError};
+use super::records::{
+    approval_key, mutation_head_key, preview_key, preview_row_key, task_prefix, MutationHead,
+    TaskObjectId,
+    MAX_STATEMENT_TEXT, NS_PREVIEW, NS_PREVIEW_ROW,
+};
 pub(crate) use super::records::{PreviewHeader, PreviewRow};
 use crate::CoreError;
+use crate::relational::clock::{
+    ExecutionClock, StatementClock, OBS_INSTANT, OBS_SEQUENCE, OBS_WALL, OBS_XACT, OBS_ZONE,
+};
 use crate::relational::{SqlRow, TableDef, Value, catalog_ext::Constraint};
+use crate::storage::engine::kv::Direction;
+use crate::storage::roles::{table_privileges_txn, TablePrivilege};
+use crate::storage::{Isolation, Keyspace, ProtectedRun, SqlSession, Transaction, V2Db};
 use sha2::{Digest, Sha256};
+use std::ops::Bound;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Per-task preview number (`head.next_preview`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -175,6 +211,479 @@ pub(crate) fn rows_from_effects<'a>(
 /// The row payload encoding of a full row (`params` and `after`).
 pub(crate) fn encode_after(values: &[Value]) -> Result<Vec<u8>, CoreError> {
     crate::storage::task_row_payload(values)
+}
+
+/// Where the preview's text came from (header `surface`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Surface {
+    Sql = 0,
+    Native = 1,
+}
+
+/// What PREVIEW returns: `(change_id, digest, row_count, expires_at)` (D7.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreviewSummary {
+    pub id: PreviewId,
+    pub digest: [u8; 32],
+    pub rows: u32,
+    pub expires_at: WallClockMs,
+}
+
+/// Clock observations a preview cannot fix in advance (D7.4).
+const NOT_MATERIALIZABLE: u8 = OBS_WALL | OBS_ZONE | OBS_SEQUENCE | OBS_XACT;
+
+/// What the dry run hands the store.
+struct DryRun {
+    def: Arc<TaskDef>,
+    schema_fp: [u8; 32],
+    clock_pin: i64,
+    rows: Vec<PreviewRow>,
+}
+
+/// PREVIEW of one UPDATE for the task `ctx` (D7.2): T1, the dry run, then
+/// T2, the store. `text` is the UPDATE exactly as received and `params` its
+/// parameters; `clock` is the statement's clock, whose transaction instant
+/// is the pin. In a task session the preview is logged as one read-log
+/// record with its outcome.
+///
+/// Only `Surface::Sql` is prepared here; native text is 0A000 until a
+/// native preparer reaches core.
+pub fn preview(
+    session: &mut SqlSession,
+    ctx: &TaskContext,
+    surface: Surface,
+    text: &str,
+    params: &[Value],
+    clock: &StatementClock,
+) -> Result<PreviewSummary, TaskError> {
+    let entry = if session.task().is_some() {
+        session.set_task_statement_text(text);
+        session.start_task_statement(StatementClass::Preview, params.len())
+    } else {
+        None
+    };
+    let result = run(session, ctx, surface, text, params, clock);
+    if let Some(entry) = entry {
+        if let Err(error) = &result {
+            entry.fail_with(error.sqlstate());
+        }
+        entry.finish();
+    }
+    result
+}
+
+fn run(
+    session: &mut SqlSession,
+    ctx: &TaskContext,
+    surface: Surface,
+    text: &str,
+    params: &[Value],
+    clock: &StatementClock,
+) -> Result<PreviewSummary, TaskError> {
+    // v2 only, never on a cluster gateway or a replicated store.
+    let db = session.v2_db().ok_or_else(unsupported)?;
+    if db.task_kernel_unsupported() {
+        return Err(unsupported());
+    }
+    if session.task().is_some_and(|bound| bound.task != ctx.task) {
+        return Err(TaskError::Revoked);
+    }
+    if surface != Surface::Sql {
+        return Err(unsupported());
+    }
+    if text.len() > MAX_STATEMENT_TEXT || u16::try_from(params.len()).is_err() {
+        return Err(CoreError::Limit.into());
+    }
+    let dry = dry_run(session, &db, ctx, text, params, clock)?;
+    store(&db, ctx, surface, text, params, dry)
+}
+
+/// T1: everything a preview checks, in a Serializable transaction that is
+/// always rolled back.
+fn dry_run(
+    session: &mut SqlSession,
+    db: &Arc<V2Db>,
+    ctx: &TaskContext,
+    text: &str,
+    params: &[Value],
+    clock: &StatementClock,
+) -> Result<DryRun, TaskError> {
+    let task = ctx.task;
+    let sql = |e| TaskError::Core(Box::new(CoreError::Sql(e)));
+    // 1. Not revoked, not expired, bound to the current definition.
+    let latest = catalog_def(db, task, DefAt::Latest)?;
+    standing(latest.as_deref(), ctx, db.wall_now_ms())?;
+    let latest = latest.ok_or(TaskError::Revoked)?;
+    // 2. One UPDATE, under the column rules (design-3 section 2).
+    let prepared = session.prepare(text)?;
+    let class = prepared.task_class();
+    if class != StatementClass::Update {
+        return Err(TaskError::NotAllowedInTaskSession(class));
+    }
+    let expanded = {
+        let mut read = db.begin(Isolation::ReadCommitted);
+        let catalog = db.catalog().snapshot(&mut read)?;
+        let image = catalog.image().map_err(sql)?;
+        columns::apply_in_catalog(
+            &latest,
+            ctx.bound_def_version,
+            &catalog.parts.column_labels,
+            &image,
+            &prepared,
+        )?
+        .0
+    };
+    // 3. The statement through the protected seam, bound to the task so it
+    // matches only the visible rows, with every instant pinned at the
+    // transaction instant (what apply re-runs with) and no wall clock.
+    let mut txn = db.begin(Isolation::Serializable);
+    let mark = txn.savepoint();
+    let mut pinned = ExecutionClock::pinned(clock.transaction_us, clock.zone);
+    pinned.unavailable = clock.unavailable.clone();
+    let execution = ExecutionClock::new(&pinned);
+    let bound = session.task.replace(ctx.clone());
+    let (run, result) = session.execute_protected_v2(
+        db,
+        ProtectedRun { txn, effects: Effects::default() },
+        &expanded,
+        params,
+        Some(&execution),
+    );
+    session.task = bound;
+    let ProtectedRun { mut txn, effects } = run;
+    // D7.4 first: a refused source may also have failed the statement.
+    let observed = execution.observed();
+    if observed & NOT_MATERIALIZABLE != 0 {
+        return Err(TaskError::Denied(DenyRule::NotMaterializable));
+    }
+    result.map_err(engine)?;
+    crate::storage::cross_check_effects(&effects, &txn)?;
+    // Rechecks at the statement snapshot, as the protected commit does.
+    let def = catalog_def(db, task, DefAt::Snapshot(&mut txn))?;
+    standing(def.as_deref(), ctx, db.wall_now_ms())?;
+    let def = def.ok_or(TaskError::Revoked)?;
+    let view = db.catalog().committed_view(&mut txn)?;
+    let relation = view
+        .by_id
+        .get(&def.table)
+        .map(|entry| entry.def.name.clone())
+        .ok_or(TaskError::Denied(DenyRule::DefinitionChanged))?;
+    let held = table_privileges_txn(&mut txn, &relation, &ctx.executor).map_err(role_error)?;
+    if !held.contains(&TablePrivilege::Update) {
+        return Err(TaskError::Denied(DenyRule::RolePrivilege));
+    }
+    let state = db.catalog().snapshot(&mut txn)?.image().map_err(sql)?;
+    let table = state
+        .tables
+        .values()
+        .find(|table| table.id == def.table)
+        .ok_or(TaskError::Denied(DenyRule::DefinitionChanged))?
+        .clone();
+    // 5 and 6. The policy and the caps, decided as an approved apply would
+    // be: structure, visible rows, allowed write, caps; never the threshold.
+    // The membership charge is advisory here (no hold) and rolled back.
+    let head = authority::load_head(&mut txn, task)?;
+    let charge = authority::charge(&mut txn, task, head.next_seq, &effects)?;
+    match decide::evaluate(
+        &state,
+        &def,
+        &table,
+        &head,
+        &effects,
+        &charge,
+        RequestKind::Apply,
+        ApprovalState::Matching,
+    ) {
+        Decision::Commit(_) => {}
+        Decision::Denied(rule) => return Err(TaskError::Denied(rule)),
+        Decision::BudgetExceeded(budget) => return Err(TaskError::BudgetExceeded(budget)),
+        Decision::ApprovalRequired => return Err(TaskError::ApprovalRequired),
+        Decision::ApprovalStale => return Err(TaskError::ApprovalStale),
+    }
+    if effects.len() > MAX_PREVIEW_ROWS {
+        return Err(TaskError::Denied(DenyRule::PreviewTooLarge));
+    }
+    // After-values are full rows, resized to the table's width.
+    let width = table.columns.len();
+    let resized: Vec<Option<SqlRow>> = effects
+        .iter()
+        .map(|effect| {
+            effect.new.as_ref().map(|new| {
+                let mut new = new.clone();
+                new.values.resize(width, Value::Null);
+                new
+            })
+        })
+        .collect();
+    let rows = rows_from_effects(effects.iter().zip(&resized).map(|(effect, new)| EffectView {
+        table: effect.table,
+        pk: &effect.pk,
+        old: effect.old.as_ref(),
+        new: new.as_ref(),
+    }))?;
+    let schema_fp = schema_fp(&table, state.table_constraints(table.id))?;
+    let clock_pin = if observed & OBS_INSTANT != 0 {
+        clock.transaction_us
+    } else {
+        NO_CLOCK_PIN
+    };
+    // 4. Discard the writes; dropping the transaction releases the locks.
+    txn.rollback_to(&mark).map_err(|e| engine(e.into()))?;
+    drop(txn);
+    Ok(DryRun { def, schema_fp, clock_pin, rows })
+}
+
+/// T2: the store, under the authority hold.
+fn store(
+    db: &Arc<V2Db>,
+    ctx: &TaskContext,
+    surface: Surface,
+    text: &str,
+    params: &[Value],
+    dry: DryRun,
+) -> Result<PreviewSummary, TaskError> {
+    let task = ctx.task;
+    // 1. The hold, then a statement snapshot taken after it, then the head.
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    let deadline = Instant::now().checked_add(Duration::from_millis(dry.def.limits.lock_wait_ms));
+    txn.lock_kernel_key(&mutation_head_key(task), deadline, &|| {
+        crate::cancellation::check().is_err()
+    })
+    .map_err(hold_error)?;
+    txn.begin_statement();
+    let head = authority::load_head(&mut txn, task)?;
+    // 2. Revoked, expired and the definition version again.
+    let now = db.wall_now_ms();
+    let def = catalog_def(db, task, DefAt::Snapshot(&mut txn))?;
+    standing(def.as_deref(), ctx, now)?;
+    let def = def.ok_or(TaskError::Revoked)?;
+    if def.def_version != dry.def.def_version || def.table != dry.def.table {
+        return Err(TaskError::Revoked);
+    }
+    // 3. Sweep this task's expired and applied previews.
+    let open = sweep(&mut txn, task, now)?;
+    // 4. The limit on open previews.
+    if open >= def.limits.stored_previews {
+        return Err(TaskError::BudgetExceeded(Budget::StoredPreviews));
+    }
+    // 5. The id.
+    let id = PreviewId(head.next_preview);
+    let overflow = || TaskError::from(CoreError::Limit);
+    let rows = u32::try_from(dry.rows.len()).map_err(|_| overflow())?;
+    let ttl_ms = def.limits.preview_ttl_s.saturating_mul(1000);
+    let task_expiry = u64::try_from(def.expires_at.0).unwrap_or(0);
+    let expires_ms = now.saturating_add(ttl_ms).min(task_expiry);
+    let mut header = PreviewHeader {
+        kind: PreviewKind::Change as u8,
+        state: STATE_OPEN,
+        created_ms: now,
+        expires_ms,
+        def_version: def.def_version,
+        table: def.table,
+        schema_fp: dry.schema_fp,
+        clock_pin: dry.clock_pin,
+        digest: [0; 32],
+        counts: [rows, 0, 0, 0],
+        applied_seq: 0,
+        creator: ctx.executor.clone(),
+        scope: None,
+        surface: surface as u8,
+        text: text.to_owned(),
+        params: encode_after(params)?,
+    };
+    header.digest = digest(db.meta.domain, task, id, &header, &dry.rows);
+    // 6. Header, rows (ascending (table, pk)) and head, in one commit.
+    let put = |txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>| -> Result<(), TaskError> {
+        txn.put(Keyspace::Kernel, key, value).map_err(CoreError::from)?;
+        Ok(())
+    };
+    put(&mut txn, preview_key(task, id.0), header.encode())?;
+    for (row_no, row) in dry.rows.iter().enumerate() {
+        let row_no = u32::try_from(row_no).map_err(|_| overflow())?;
+        put(&mut txn, preview_row_key(task, id.0, row_no), row.encode())?;
+    }
+    let next = MutationHead {
+        def_version: def.def_version,
+        next_preview: id.0.checked_add(1).ok_or_else(overflow)?,
+        stored_previews: open.checked_add(1).ok_or_else(overflow)?,
+        ..head
+    };
+    authority::stage_head(&mut txn, task, &next)?;
+    db.catalog().commit_ddl(txn).map_err(|e| engine(e.into()))?;
+    Ok(PreviewSummary {
+        id,
+        digest: header.digest,
+        rows,
+        expires_at: WallClockMs(i64::try_from(expires_ms).unwrap_or(i64::MAX)),
+    })
+}
+
+/// The task's stored preview headers, in id order.
+fn headers(
+    txn: &mut Transaction,
+    task: TaskObjectId,
+) -> Result<Vec<(PreviewId, PreviewHeader)>, CoreError> {
+    let (start, end) = task_prefix(NS_PREVIEW, task);
+    let scan = txn.scan(
+        Keyspace::Kernel,
+        Bound::Included(start.as_slice()),
+        Bound::Excluded(end.as_slice()),
+        Direction::Forward,
+        None,
+    )?;
+    let mut out = Vec::new();
+    for entry in scan {
+        let (key, value) = entry?;
+        let id = key
+            .get(9..17)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_be_bytes)
+            .ok_or_else(|| CoreError::Corrupt("task preview key".into()))?;
+        out.push((PreviewId(id), PreviewHeader::decode(&value)?));
+    }
+    Ok(out)
+}
+
+/// Rows stored under a header: classes 0, 1 and 2.
+fn stored_rows(header: &PreviewHeader) -> u32 {
+    header.counts[..3].iter().fold(0u32, |n, c| n.saturating_add(*c))
+}
+
+/// Deletes the task's expired and applied previews with their rows and
+/// approvals; returns how many stay open.
+fn sweep(txn: &mut Transaction, task: TaskObjectId, now: u64) -> Result<u32, CoreError> {
+    let mut open = 0u32;
+    for (id, header) in headers(txn, task)? {
+        if header.state == STATE_OPEN && header.expires_ms > now {
+            open = open.saturating_add(1);
+            continue;
+        }
+        for row_no in 0..stored_rows(&header) {
+            txn.delete(Keyspace::Kernel, preview_row_key(task, id.0, row_no))?;
+        }
+        txn.delete(Keyspace::Kernel, approval_key(task, id.0))?;
+        txn.delete(Keyspace::Kernel, preview_key(task, id.0))?;
+    }
+    Ok(open)
+}
+
+/// One stored preview row, as [`StoredPreview`] shows it.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct StoredPreviewRow {
+    pub class: u8,
+    pub table: u64,
+    pub pk: Vec<u8>,
+    pub version_read: u64,
+    pub aux: u64,
+    /// The decoded after-values (class 00), empty otherwise.
+    pub after: Vec<Value>,
+}
+
+/// One stored preview header and its rows. For tests.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct StoredPreview {
+    pub id: PreviewId,
+    pub kind: u8,
+    pub state: u8,
+    pub created_ms: u64,
+    pub expires_ms: u64,
+    pub def_version: u64,
+    pub table: u64,
+    pub schema_fp: [u8; 32],
+    /// `None` when the statement observed no instant.
+    pub clock_pin: Option<i64>,
+    pub digest: [u8; 32],
+    pub counts: [u32; 4],
+    pub creator: String,
+    pub surface: u8,
+    pub text: String,
+    pub params: Vec<Value>,
+    pub rows: Vec<StoredPreviewRow>,
+}
+
+/// The preview store of one task: the head's counters and the stored previews.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct PreviewStore {
+    pub next_preview: u64,
+    pub stored_previews: u32,
+    pub previews: Vec<StoredPreview>,
+    /// Every `28` row record of the task, under any header or none.
+    pub stored_rows: u64,
+}
+
+impl crate::storage::Admin {
+    /// The stored previews of `task` and the head's preview counters, at the
+    /// latest committed state (v2 only). For tests.
+    #[doc(hidden)]
+    pub fn task_previews(&self, task: TaskObjectId) -> Result<PreviewStore, CoreError> {
+        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        let mut txn = db.begin(Isolation::ReadCommitted);
+        let head = authority::load_head(&mut txn, task)?;
+        let mut previews = Vec::new();
+        for (id, header) in headers(&mut txn, task)? {
+            let mut rows = Vec::new();
+            for row_no in 0..stored_rows(&header) {
+                let key = preview_row_key(task, id.0, row_no);
+                let Some(value) = txn.get(Keyspace::Kernel, &key)? else {
+                    continue;
+                };
+                let row = PreviewRow::decode(&value)?;
+                let after = if row.after.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::storage::task_row_values(&row.after)?
+                };
+                rows.push(StoredPreviewRow {
+                    class: row.class,
+                    table: row.table,
+                    pk: row.pk,
+                    version_read: row.version_read,
+                    aux: row.aux,
+                    after,
+                });
+            }
+            previews.push(StoredPreview {
+                id,
+                kind: header.kind,
+                state: header.state,
+                created_ms: header.created_ms,
+                expires_ms: header.expires_ms,
+                def_version: header.def_version,
+                table: header.table,
+                schema_fp: header.schema_fp,
+                clock_pin: (header.clock_pin != NO_CLOCK_PIN).then_some(header.clock_pin),
+                digest: header.digest,
+                counts: header.counts,
+                creator: header.creator,
+                surface: header.surface,
+                text: header.text,
+                params: crate::storage::task_row_values(&header.params)?,
+                rows,
+            });
+        }
+        let (start, end) = task_prefix(NS_PREVIEW_ROW, task);
+        let mut stored_rows = 0u64;
+        for entry in txn.scan(
+            Keyspace::Kernel,
+            Bound::Included(start.as_slice()),
+            Bound::Excluded(end.as_slice()),
+            Direction::Forward,
+            None,
+        )? {
+            entry?;
+            stored_rows += 1;
+        }
+        Ok(PreviewStore {
+            next_preview: head.next_preview,
+            stored_previews: head.stored_previews,
+            previews,
+            stored_rows,
+        })
+    }
 }
 
 #[cfg(test)]

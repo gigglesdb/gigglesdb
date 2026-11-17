@@ -522,3 +522,4 @@ mod insert_trailing_columns;
 
 #[path = "v2_on_conflict_caps.rs"]
 mod v2_on_conflict_caps;
+#[path = "task_preview.rs"] mod task_preview;

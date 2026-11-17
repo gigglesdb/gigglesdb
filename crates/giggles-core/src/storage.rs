@@ -28,6 +28,10 @@ pub(crate) fn task_schema_bytes(
 pub(crate) fn task_row_payload(values: &[crate::relational::Value]) -> Result<Vec<u8>, CoreError> {
     encode(&values)
 }
+/// The inverse of [`task_row_payload`] (GD-0061 R3-703: stored preview after-values).
+pub(crate) fn task_row_values(payload: &[u8]) -> Result<Vec<crate::relational::Value>, CoreError> {
+    decode(payload)
+}
 pub(crate) use engine::catalog_label_codec::UNTRUSTED_TEXT as UNTRUSTED_TEXT_LABEL;
 pub(crate) use engine::{catalog::CatalogParts, catalog_codec::sql_views::{SqlViewDef, SqlViewColumn, SqlViewDependency}};
 mod feature_envelope;
