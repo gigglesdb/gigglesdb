@@ -11,6 +11,8 @@ engine-rocksdb = ["dep:rocksdb"]
 upgrade-fault-injection = []
 # Instrumentation proving native execution avoids SQL parsing/public dispatch.
 test-sql-parser-trap = []
+# Scoped metadata acquisition instrumentation for protocol tests.
+test-metadata-counts = []
 
 [dependencies]
 giggles-icu = { path = "../giggles-icu" }

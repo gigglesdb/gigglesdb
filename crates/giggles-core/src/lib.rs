@@ -39,3 +39,19 @@ fn test_artifact_root() -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("giggles-core-artifacts"))
 }
+
+/// Test-only counters: transaction, cluster and local metadata acquisitions,
+/// provenance reads, and transactions opened for local metadata, respectively.
+#[cfg(feature = "test-metadata-counts")]
+#[doc(hidden)]
+pub mod metadata_read_counts {
+    thread_local! {
+        static COUNTS: std::cell::Cell<[usize; 5]> = const { std::cell::Cell::new([0; 5]) };
+    }
+    pub(crate) fn increment(index: usize) {
+        COUNTS.with(|counts| { let mut n = counts.get(); n[index] += 1; counts.set(n); });
+    }
+    pub fn take() -> [usize; 5] {
+        COUNTS.with(|counts| counts.replace([0; 5]))
+    }
+}

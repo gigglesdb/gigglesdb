@@ -432,6 +432,23 @@ impl Catalog {
         {
             return None;
         }
+        self.current_at(ts)
+    }
+
+    /// A pinned, committed local image without constructing a Transaction. A
+    /// caller must retain the pin through all MVCC reads derived from this view.
+    /// None asks the caller to use the ordinary snapshot path during publication.
+    pub(crate) fn current_local_metadata(
+        &self,
+    ) -> Result<Option<(Arc<CatalogSnapshot>, super::txn::Pin)>, CoreError> {
+        if !matches!(self.services, TxnServices::Local { .. }) {
+            return Ok(None);
+        }
+        let pin = self.services.pin()?;
+        Ok(self.current_at(pin.ts()).map(|(_, snapshot)| (snapshot, pin)))
+    }
+
+    fn current_at(&self, ts: Ts) -> Option<(Ts, Arc<CatalogSnapshot>)> {
         // DDL clears current before sequencer submission. Its visible Release
         // store and the reader's snapshot Acquire load precede this RwLock read:
         // a snapshot at/after that commit sees None or the newly published view.

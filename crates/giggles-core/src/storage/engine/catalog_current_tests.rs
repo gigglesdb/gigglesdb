@@ -216,3 +216,32 @@ fn stress_ddl_vs_fast_catalog_snapshot() {
         assert!(final_snapshot.parts.tables.contains_key(name));
     }
 }
+
+#[test]
+fn local_metadata_keeps_timestamp_and_image_and_pin() {
+    let (seq, locks, catalog) = setup();
+    // A cold cache uses the ordinary snapshot loader.
+    assert!(catalog.current_local_metadata().unwrap().is_none());
+    let mut reader = txn(&seq, &locks, 1);
+    let expected = catalog.snapshot(&mut reader).unwrap();
+    let expected_ts = reader.snapshot_ts();
+    drop(reader);
+    let cache = catalog.cache.lock().unwrap();
+    let (image, pin) = catalog.current_local_metadata().unwrap().unwrap();
+    drop(cache);
+    assert!(Arc::ptr_eq(&expected, &image));
+    assert_eq!(pin.ts(), expected_ts);
+    assert_eq!(seq.oldest_active(), Some(expected_ts));
+    drop(pin);
+    assert_eq!(seq.oldest_active(), None);
+    let mut ddl = txn(&seq, &locks, 2);
+    create(&catalog, &mut ddl, "new_table");
+    catalog.commit_ddl(ddl).unwrap();
+    assert!(catalog.current_local_metadata().unwrap().is_none());
+    let mut reader = txn(&seq, &locks, 3);
+    let expected = catalog.snapshot(&mut reader).unwrap();
+    let (image, pin) = catalog.current_local_metadata().unwrap().unwrap();
+    assert!(Arc::ptr_eq(&image, &expected));
+    assert!(image.parts.tables.contains_key("new_table"));
+    assert_eq!(pin.ts(), reader.snapshot_ts());
+}

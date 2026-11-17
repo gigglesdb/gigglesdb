@@ -152,3 +152,89 @@ fn timezone_set_local_and_rollback_refresh_memo() {
     simple(&mut state, &mut session, "ROLLBACK").unwrap();
     assert_eq!(text_rows(&simple(&mut state, &mut session, sql).unwrap()), india);
 }
+
+fn metadata_parse(state: &mut State, session: &mut Session, name: &str) {
+    let mut body = Vec::new();
+    cstr(name, &mut body);
+    cstr("SELECT v FROM t WHERE id = $1", &mut body);
+    body.extend(0u16.to_be_bytes());
+    state.handle(b'P', &body, session, &mut Vec::new(), std::time::Instant::now()).unwrap();
+}
+fn metadata_bind(state: &mut State, session: &mut Session, name: &str) {
+    let mut body = Vec::new();
+    cstr("", &mut body);
+    cstr(name, &mut body);
+    body.extend(0u16.to_be_bytes());
+    body.extend(1u16.to_be_bytes());
+    body.extend(1i32.to_be_bytes());
+    body.push(b'1');
+    body.extend(0u16.to_be_bytes());
+    state.handle(b'B', &body, session, &mut Vec::new(), std::time::Instant::now()).unwrap();
+}
+fn metadata_describe_execute(state: &mut State, session: &mut Session) -> R<Vec<u8>> {
+    let mut out = Vec::new();
+    let now = std::time::Instant::now();
+    state.handle(b'D', &[b'P', 0], session, &mut out, now)?;
+    state.handle(b'E', &[0, 0, 0, 0, 0], session, &mut out, now)?;
+    state.handle(b'S', &[], session, &mut out, now)?;
+    Ok(out)
+}
+#[test]
+fn metadata_cycle_counts() {
+    let mut session = fixture();
+    session.execute_sql("CREATE TABLE t (id int PRIMARY KEY, v int)", &[]).unwrap();
+    session.execute_sql("INSERT INTO t VALUES (1, 7)", &[]).unwrap();
+    session.execute_sql("CREATE TABLE serial_t (id serial PRIMARY KEY, v int)", &[]).unwrap();
+    let mut state = state();
+    for name in ["", "named"] {
+        giggles_core::metadata_read_counts::take();
+        metadata_parse(&mut state, &mut session, name);
+        metadata_bind(&mut state, &mut session, name);
+        assert_eq!(text_rows(&metadata_describe_execute(&mut state, &mut session).unwrap()), vec![vec!["7"]]);
+        assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 12, 19, 0], "cycle {name:?}");
+        if !name.is_empty() {
+            metadata_bind(&mut state, &mut session, name);
+            metadata_describe_execute(&mut state, &mut session).unwrap();
+            assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 7, 14, 0]);
+        }
+    }
+    simple(&mut state, &mut session, "SELECT v FROM t WHERE id = 1").unwrap();
+    assert_eq!(giggles_core::metadata_read_counts::take(), [0, 0, 9, 9, 0]);
+    extended(&mut state, &mut session, "INSERT INTO serial_t (v) VALUES (8)").unwrap();
+    assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 12, 19, 0]);
+}
+#[test]
+fn metadata_ddl_between_bind_and_execute() {
+    for name in ["", "named"] {
+        for ddl in ["ALTER TABLE t ADD COLUMN w int", "DROP TABLE t; CREATE TABLE t (id int PRIMARY KEY, v text)"] {
+            let mut session = fixture();
+            session.execute_sql("CREATE TABLE t (id int PRIMARY KEY, v int)", &[]).unwrap();
+            session.execute_sql("INSERT INTO t VALUES (1, 7)", &[]).unwrap();
+            let mut state = state();
+            metadata_parse(&mut state, &mut session, name);
+            metadata_bind(&mut state, &mut session, name);
+            let mut other = session.service.role_session("owner").unwrap();
+            let mut other_state = self::state();
+            for statement in ddl.split("; ") {
+                simple(&mut other_state, &mut other, statement).unwrap();
+            }
+            // Pinned on 26fe7e55 before the fast path: a bound portal describes
+            // the new table and executes successfully, even after replacement.
+            let out = metadata_describe_execute(&mut state, &mut session).unwrap();
+            assert_eq!(out[0], b'T');
+            let mut description = Reader { b: &out[5..], at: 0 };
+            assert_eq!(description.u16().unwrap(), 1);
+            assert_eq!(description.text().unwrap(), "v");
+            description.u32().unwrap(); // table oid
+            description.u16().unwrap(); // attribute number
+            let oid = description.u32().unwrap();
+            if ddl.starts_with("ALTER") {
+                assert_eq!(text_rows(&out), vec![vec!["7"]]);
+                assert_eq!(oid, 23);
+            } else {
+                assert!(text_rows(&out).is_empty());
+                assert_eq!(oid, 25);
+            }
+        }
+    }
+}

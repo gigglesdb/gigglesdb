@@ -438,6 +438,8 @@ impl V2Db {
             engine::hlc::Ts,
         ) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
+        #[cfg(feature = "test-metadata-counts")]
+        crate::metadata_read_counts::increment(if txn.is_some() { 0 } else if self.cluster.is_some() { 1 } else { 2 });
         let mut committed;
         let cluster = self.cluster.is_some();
         let (catalog, ts, version) = match txn {
@@ -463,6 +465,18 @@ impl V2Db {
                 (catalog, ts, version)
             }
             None => {
+                if let Some((catalog, pin)) = self.catalog.current_local_metadata()? {
+                    let ts = pin.ts();
+                    // Both this pin and a fresh READ COMMITTED transaction use
+                    // Sequencer::snapshot(): identical epoch and read timestamp
+                    // for the same committed state. Keep the pin through inspect
+                    // (including origin_at), so GC cannot pass that timestamp.
+                    let result = inspect(catalog, ts.0, ts);
+                    drop(pin);
+                    return result;
+                }
+                #[cfg(feature = "test-metadata-counts")]
+                crate::metadata_read_counts::increment(4);
                 committed = self.begin(engine::txn::Isolation::ReadCommitted);
                 let catalog = self.catalog.snapshot(&mut committed)?;
                 (catalog, committed.snapshot_ts(), None)
@@ -473,6 +487,8 @@ impl V2Db {
     /// Older SQL-only v2 databases have no kernel image. When present, its
     /// existing metadata record carries restore provenance.
     pub(super) fn origin_at(&self, ts: engine::hlc::Ts) -> Result<Option<u128>, CoreError> {
+        #[cfg(feature = "test-metadata-counts")]
+        crate::metadata_read_counts::increment(3);
         let bytes = match &self.cluster {
             Some(services) => engine::mvcc::read_at(
                 &*services.reader(ts),
