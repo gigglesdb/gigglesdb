@@ -299,17 +299,19 @@ impl crate::mgmt::routes::ConnectionSource for ManagementConnections {
     }
 }
 struct ManagementStatus {
-    revisions: Arc<RwLock<Revisions>>,
-    routes: Vec<String>,
+    hub: Arc<crate::reload::Hub>,
+    routes: Vec<crate::state::model::RouteId>,
 }
 impl crate::mgmt::routes::StatusSource for ManagementStatus {
     fn policy_revision(&self) -> Option<String> {
-        self.revisions.read().ok().map(|r| r.policy.clone())
+        let mut routes = self.routes.iter();
+        let revision = self.hub.policy_revision_for(routes.next()?)?;
+        routes.all(|route| self.hub.policy_revision_for(route).as_ref() == Some(&revision)).then_some(revision)
     }
     fn config_revision(&self) -> Option<String> {
-        self.revisions.read().ok().map(|r| r.config.clone())
+        self.hub.log.1.read().ok().map(|r| r.config.clone())
     }
-    fn route_ids(&self) -> Vec<String> { self.routes.clone() }
+    fn route_ids(&self) -> Vec<String> { self.routes.iter().map(|r| r.as_str().into()).collect() }
 }
 
 /// Serve agents until a shutdown signal, draining active sessions for thirty seconds.
@@ -348,19 +350,15 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     } else {
         None
     };
-    if let (Some(pg), Some(spanner)) = (&config.postgres_policy, &config.spanner_policy)
-        && !matches!((std::fs::canonicalize(pg), std::fs::canonicalize(spanner)),
-            (Ok(pg), Ok(spanner)) if pg == spanner)
-    {
-        return Err("per-route policy files are not supported by this build yet".into());
+    let mut policy_routes = Vec::new();
+    for (route, path) in [(&postgres_route, &config.postgres_policy), (&spanner_route, &config.spanner_policy)] {
+        if let Some(route) = route {
+            policy_routes.push((route.clone(), path.clone().ok_or("route policy unavailable")?));
+        }
     }
-    let policy_path = config.postgres_policy.as_ref().or(config.spanner_policy.as_ref())
-        .ok_or("route policy unavailable")?;
-    let hub = crate::reload::Hub::new(policy_path, config.policy_watch_ms)?;
-    hub.configure_routes(postgres_route.iter().chain(spanner_route.iter()).cloned().collect())?;
+    let hub = crate::reload::Hub::new(&policy_routes, config.policy_watch_ms)?;
     runtime.set_lifecycle_log(Arc::new(hub.log.clone()));
-    hub.log.1.write().map_err(|_| "read log lock unavailable")?.config = config.revision.clone();
-    let policy = hub.policy();
+    hub.set_config_revision(&config.revision)?;
     let (reload_tx, reload_rx) = mpsc::channel(1);
     let admin_hub = hub.clone();
     let status_hub = hub.clone();
@@ -379,9 +377,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         Arc::new(move || ready_hub.readiness(ready_hub.log.last_write_ok(), ready_runtime.store_last_write_ok())),
     )));
     let reload_hub = hub.clone();
-    let reload_path = policy_path.clone();
     let _reload = AbortTask(tokio::spawn(async move {
-        reload_hub.run(reload_path, reload_rx).await
+        reload_hub.run(reload_rx).await
     }));
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let management = if config.management.is_some() || cfg!(unix) {
@@ -392,8 +389,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             authority: runtime.authority.clone(), admins,
             connections: Arc::new(ManagementConnections(runtime.registry.clone())),
             status: Arc::new(ManagementStatus {
-                revisions: hub.log.1.clone(),
-                routes: postgres_route.iter().chain(spanner_route.iter()).map(|r| r.as_str().to_owned()).collect(),
+                hub: hub.clone(),
+                routes: postgres_route.iter().chain(spanner_route.iter()).cloned().collect(),
             }),
             lifecycle: Arc::new(crate::mgmt::audit::ReadLogSink(hub.log.clone())),
         };
@@ -408,7 +405,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             registry: runtime.registry.clone(),
             route: spanner_route.ok_or("Spanner route id unavailable")?,
         };
-        let readlog = Box::new(hub.log.clone());
+        let readlog = Box::new(hub.route_log(&state.route)?);
+        let policy = hub.policy_for(&state.route)?;
         let tls = config
             .tls
             .as_ref()
@@ -428,7 +426,6 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
         let root_key =
             crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
-        let policy = policy.clone();
         let route_hub = hub.clone();
         let rx = rx.clone();
         routes.spawn(async move {
@@ -446,6 +443,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         });
     }
     if let Some(route) = postgres_route {
+        let policy = hub.policy_for(&route)?;
         let runtime = runtime.clone();
         let rx = rx.clone();
         routes.spawn(async move {
@@ -521,7 +519,7 @@ async fn run_postgres(
         crate::state::model::RouteId,
     ),
 ) -> Result<(), String> {
-    let log = hub.log.clone();
+    let log = hub.route_log(&state.1)?;
     let upstream = config
         .upstream_config()
         .ok_or("PostgreSQL route unavailable")?;
@@ -662,10 +660,20 @@ mod tests {
     #[test]
     fn management_status_tracks_live_revisions_and_refuses_poisoned_lock() {
         use crate::mgmt::routes::StatusSource;
-        let revisions = Arc::new(RwLock::new(Revisions { policy: "first".into(), config: "config".into() }));
-        let status = ManagementStatus { revisions: revisions.clone(), routes: vec!["postgres".into()] };
-        assert_eq!(status.policy_revision().as_deref(), Some("first"));
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let dir = std::env::temp_dir().join(format!("nunya-management-status-{}", data_encoding::HEXLOWER.encode(&nonce)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        std::fs::write(&path, "[readlog]\nsink='stdout'\n").unwrap();
+        let route = crate::state::model::RouteId::new("postgres").unwrap();
+        let hub = crate::reload::Hub::new(&[(route.clone(), path)], None).unwrap();
+        hub.set_config_revision("config").unwrap();
+        let revisions = hub.route_log(&route).unwrap().1;
+        let status = ManagementStatus { hub: hub.clone(), routes: vec![route] };
+        let first = status.policy_revision().unwrap();
         revisions.write().unwrap().policy = "reloaded".into();
+        assert_ne!(first, "reloaded");
         assert_eq!(status.policy_revision().as_deref(), Some("reloaded"));
         assert_eq!(status.config_revision().as_deref(), Some("config"));
         assert_eq!(status.route_ids(), ["postgres"]);
@@ -674,7 +682,40 @@ mod tests {
             panic!("poison revision lock");
         }).join();
         assert_eq!(status.policy_revision(), None);
+        let service_revisions = hub.log.1.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = service_revisions.write().unwrap();
+            panic!("poison revision lock");
+        }).join();
         assert_eq!(status.config_revision(), None);
+        drop(status);
+        drop(hub);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn management_status_requires_agreement_across_route_revisions() {
+        use crate::mgmt::routes::StatusSource;
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let dir = std::env::temp_dir().join(format!("nunya-management-units-{}", data_encoding::HEXLOWER.encode(&nonce)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.toml");
+        let b = dir.join("b.toml");
+        std::fs::write(&a, "[readlog]\nsink='stdout'\n").unwrap();
+        std::fs::write(&b, "[readlog]\nsink='stdout'\n").unwrap();
+        let routes = vec![crate::state::model::RouteId::new("a").unwrap(), crate::state::model::RouteId::new("b").unwrap()];
+        let hub = crate::reload::Hub::new(&[(routes[0].clone(), a), (routes[1].clone(), b)], None).unwrap();
+        hub.set_config_revision("config").unwrap();
+        let status = ManagementStatus { hub: hub.clone(), routes: routes.clone() };
+        assert!(status.policy_revision().is_some());
+        hub.route_log(&routes[1]).unwrap().1.write().unwrap().policy = "other".into();
+        assert_eq!(status.policy_revision(), None);
+        assert_eq!(status.config_revision().as_deref(), Some("config"));
+        assert_eq!(status.route_ids(), ["a", "b"]);
+        drop(status);
+        drop(hub);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn management_connections_excludes_ended_snapshots() {

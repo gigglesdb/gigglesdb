@@ -2,8 +2,8 @@
 use crate::{
     policy::Policy,
     schema::Snapshot,
-    state::model::RouteId,
     serve::{ReloadableLog, now, parse_policy_bytes},
+    state::model::RouteId,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -15,11 +15,12 @@ use std::{
 type PolicyLock = RwLock<Arc<Policy>>;
 type SnapshotLock = RwLock<Arc<Snapshot>>;
 
+/// A serving route and its policy/catalog locks.
 pub(crate) enum Route {
     Postgres(Arc<crate::pgwire::context::GatewayContext>),
     Spanner(Arc<crate::spanner::proxy::SpannerContext>),
     #[cfg(test)]
-    Test(PolicyLock, SnapshotLock),
+    Test(RouteId, PolicyLock, SnapshotLock),
 }
 impl Route {
     fn id(&self) -> &str {
@@ -27,7 +28,7 @@ impl Route {
             Self::Postgres(c) => c.route.as_str(),
             Self::Spanner(c) => c.route.as_str(),
             #[cfg(test)]
-            Self::Test(_, _) => "postgres",
+            Self::Test(id, _, _) => id.as_str(),
         }
     }
 
@@ -36,14 +37,15 @@ impl Route {
             Self::Postgres(c) => (&c.policy, &c.snapshot),
             Self::Spanner(c) => (&c.policy, &c.snapshot),
             #[cfg(test)]
-            Self::Test(p, s) => (p, s),
+            Self::Test(_, p, s) => (p, s),
         }
     }
 }
-struct State {
+struct Unit {
+    path: PathBuf,
+    revisions: Arc<RwLock<crate::serve::Revisions>>,
     policy: Arc<Policy>,
     routes: Vec<Route>,
-    configured: Vec<RouteId>,
     hash: String,
     applied: u64,
     last: &'static str,
@@ -51,8 +53,23 @@ struct State {
     attempts: u64,
     failures: u64,
 }
+struct State {
+    units: Vec<Unit>,
+    configured: Vec<(RouteId, usize)>,
+}
+impl State {
+    fn unit(&self, id: &str) -> Result<usize, String> {
+        self.configured
+            .iter()
+            .find(|(route, _)| route.as_str() == id)
+            .map(|(_, unit)| *unit)
+            .ok_or_else(|| "route policy unavailable".into())
+    }
+}
+/// Policy units and their shared audit sink.
 pub(crate) struct Hub {
     state: Mutex<State>,
+    /// Service lifecycle and management audit log.
     pub(crate) log: ReloadableLog,
     watch_ms: Option<u64>,
 }
@@ -63,34 +80,43 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<Policy, String> {
     parse_policy_bytes(path, bytes).map_err(crate::serve::errors)
 }
 impl Hub {
-    /// Record configured routes before their catalogs finish loading.
-    pub(crate) fn configure_routes(&self, routes: Vec<RouteId>) -> Result<(), String> {
-        self.state.lock().map_err(|_| "policy lock unavailable")?.configured = routes;
-        Ok(())
-    }
     /// Report data-free readiness for every configured route.
     pub(crate) fn readiness(&self, audit_ok: bool, store_ok: bool) -> (bool, String) {
-        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let policy_available = !self.state.is_poisoned();
         let mut ready = policy_available && !state.configured.is_empty();
         let mut body = String::new();
         let at = now();
-        for id in &state.configured {
-            let route = state.routes.iter().find(|r| r.id() == id.as_str());
+        for (id, unit) in &state.configured {
+            let unit = &state.units[*unit];
+            let route = unit.routes.iter().find(|r| r.id() == id.as_str());
             let mut policy_ok = policy_available;
             let catalog = match route {
                 Some(route) => {
                     let (policy, snapshot) = route.locks();
                     match (policy.read(), snapshot.read()) {
                         (Ok(policy), Ok(snapshot)) => {
-                            policy_ok &= Arc::ptr_eq(&policy, &state.policy);
-                            if at.saturating_sub(snapshot.taken_at_unix_ms) > policy.snapshot_max_age_ms {
+                            policy_ok &= Arc::ptr_eq(&policy, &unit.policy);
+                            if at.saturating_sub(snapshot.taken_at_unix_ms)
+                                > policy.snapshot_max_age_ms
+                            {
                                 "stale"
-                            } else { "ok" }
+                            } else {
+                                "ok"
+                            }
                         }
-                        (Err(_), Ok(_)) => { policy_ok = false; "unavailable" }
+                        (Err(_), Ok(_)) => {
+                            policy_ok = false;
+                            "unavailable"
+                        }
                         (Ok(_), Err(_)) => "unavailable",
-                        (Err(_), Err(_)) => { policy_ok = false; "unavailable" }
+                        (Err(_), Err(_)) => {
+                            policy_ok = false;
+                            "unavailable"
+                        }
                     }
                 }
                 None => "unavailable",
@@ -98,41 +124,119 @@ impl Hub {
             ready &= policy_ok && catalog == "ok" && audit_ok && store_ok;
             use std::fmt::Write;
             let available = |ok| if ok { "ok" } else { "unavailable" };
-            let _ = writeln!(body, "route={} policy={} catalog={} audit={} store={}",
-                id.as_str(), available(policy_ok), catalog, available(audit_ok), available(store_ok));
+            let _ = writeln!(
+                body,
+                "route={} policy={} catalog={} audit={} store={}",
+                id.as_str(),
+                available(policy_ok),
+                catalog,
+                available(audit_ok),
+                available(store_ok)
+            );
         }
         (ready, body)
     }
 
-    pub(crate) fn new(path: &Path, watch_ms: Option<u64>) -> Result<Arc<Self>, String> {
-        let bytes = std::fs::read(path).map_err(|_| "policy file unavailable")?;
-        let policy = Arc::new(parse(path, &bytes)?);
-        let log = crate::readlog::open_sink(&policy.readlog).map_err(|_| "read log unavailable")?;
+    /// Load one unit for each distinct canonical policy file and configure its routes.
+    pub(crate) fn new(
+        routes: &[(RouteId, PathBuf)],
+        watch_ms: Option<u64>,
+    ) -> Result<Arc<Self>, String> {
+        let mut units: Vec<Unit> = Vec::new();
+        let mut configured = Vec::new();
+        for (route, path) in routes {
+            if configured.iter().any(|(id, _)| id == route) {
+                return Err("duplicate policy route".into());
+            }
+            let path = std::fs::canonicalize(path).map_err(|_| "policy file unavailable")?;
+            let index = if let Some(index) = units.iter().position(|unit| unit.path == path) {
+                index
+            } else {
+                let bytes = std::fs::read(&path).map_err(|_| "policy file unavailable")?;
+                let policy = Arc::new(parse(&path, &bytes)?);
+                if units
+                    .first()
+                    .is_some_and(|unit| unit.policy.readlog != policy.readlog)
+                {
+                    return Err("policy files name different read logs".into());
+                }
+                let digest = hash(&bytes);
+                units.push(Unit {
+                    path,
+                    policy,
+                    routes: vec![],
+                    revisions: Arc::new(RwLock::new(crate::serve::Revisions {
+                        policy: digest.clone(),
+                        config: String::new(),
+                    })),
+                    hash: digest,
+                    applied: now(),
+                    last: "none",
+                    last_time: 0,
+                    attempts: 0,
+                    failures: 0,
+                });
+                units.len() - 1
+            };
+            configured.push((route.clone(), index));
+        }
+        let first = units.first().ok_or("route policy unavailable")?;
+        let sink =
+            crate::readlog::open_sink(&first.policy.readlog).map_err(|_| "read log unavailable")?;
         Ok(Arc::new(Self {
-            state: Mutex::new(State {
-                policy,
-                routes: vec![],
-                configured: vec![],
-                hash: hash(&bytes),
-                applied: now(),
-                last: "none",
-                last_time: 0,
-                attempts: 0,
-                failures: 0,
-            }),
-            log: ReloadableLog(Arc::new(RwLock::new(log)), Arc::new(RwLock::new(crate::serve::Revisions { policy: hash(&bytes), config: String::new() })), Arc::new(AtomicBool::new(true))),
+            log: ReloadableLog(
+                Arc::new(RwLock::new(sink)),
+                Arc::new(RwLock::new(crate::serve::Revisions::default())),
+                Arc::new(AtomicBool::new(true)),
+            ),
+            state: Mutex::new(State { units, configured }),
             watch_ms,
         }))
     }
-    pub(crate) fn policy(&self) -> Arc<Policy> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .policy
-            .clone()
+    /// Set the service config revision on every unit and the lifecycle log.
+    pub(crate) fn set_config_revision(&self, config: &str) -> Result<(), String> {
+        let state = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        for unit in &state.units {
+            unit.revisions
+                .write()
+                .map_err(|_| "revision lock unavailable")?
+                .config = config.into();
+        }
+        self.log
+            .1
+            .write()
+            .map_err(|_| "revision lock unavailable")?
+            .config = config.into();
+        Ok(())
     }
+    /// Return the configured route's current policy.
+    pub(crate) fn policy_for(&self, route: &RouteId) -> Result<Arc<Policy>, String> {
+        let state = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        Ok(state.units[state.unit(route.as_str())?].policy.clone())
+    }
+    /// Return a route's current revision, refusing unavailable locks or routes.
+    pub(crate) fn policy_revision_for(&self, route: &RouteId) -> Option<String> {
+        let state = self.state.lock().ok()?;
+        state.units[state.unit(route.as_str()).ok()?]
+            .revisions
+            .read()
+            .ok()
+            .map(|r| r.policy.clone())
+    }
+    /// Share the audit sink while stamping this route's unit revisions.
+    pub(crate) fn route_log(&self, route: &RouteId) -> Result<ReloadableLog, String> {
+        let state = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        Ok(ReloadableLog(
+            self.log.0.clone(),
+            state.units[state.unit(route.as_str())?].revisions.clone(),
+            self.log.2.clone(),
+        ))
+    }
+    /// Validate and install the configured unit policy before publishing a route.
     pub(crate) fn register(&self, route: Route) -> Result<(), String> {
-        let mut s = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        let mut state = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        let index = state.unit(route.id())?;
+        let s = &mut state.units[index];
         let (policy, snapshot) = route.locks();
         crate::policy::validate::validate(
             &s.policy,
@@ -143,8 +247,10 @@ impl Hub {
         s.routes.push(route);
         Ok(())
     }
+    /// Validate a fresh catalog against this route's policy unit.
     pub(crate) fn refresh(&self, route: &Route, snapshot: Snapshot) -> Result<(), String> {
-        let s = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        let state = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        let s = &state.units[state.unit(route.id())?];
         crate::policy::validate::validate(&s.policy, &snapshot).map_err(crate::serve::errors)?;
         *route
             .locks()
@@ -155,14 +261,20 @@ impl Hub {
     }
     fn apply(
         &self,
+        unit: usize,
         candidate: Result<Policy, String>,
         digest: Option<String>,
     ) -> Result<(), String> {
-        let mut s = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        let mut state = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        let independent = state.units.len() > 1;
+        let s = &mut state.units[unit];
         s.attempts += 1;
         s.last_time = now();
         let result = (|| {
             let policy = Arc::new(candidate?);
+            if independent && policy.readlog != s.policy.readlog {
+                return Err("policy files name different read logs".into());
+            }
             // Hold every policy and snapshot lock through validation and publication.
             let mut policies = Vec::new();
             let mut snapshots = Vec::new();
@@ -188,7 +300,10 @@ impl Hub {
                 .0
                 .write()
                 .map_err(|_| "read log lock unavailable")?;
-            let mut revisions = self.log.1.write().map_err(|_| "revision lock unavailable")?;
+            let mut revisions = s
+                .revisions
+                .write()
+                .map_err(|_| "revision lock unavailable")?;
             let revision = digest.as_ref().ok_or("policy digest unavailable")?;
             if let Some(replacement) = replacement {
                 *log = replacement;
@@ -214,12 +329,12 @@ impl Hub {
             }
         }
     }
-    fn attempt(&self, path: &Path, bytes: Result<Vec<u8>, std::io::Error>) {
+    fn attempt(&self, unit: usize, path: &Path, bytes: Result<Vec<u8>, std::io::Error>) {
         let digest = bytes.as_ref().ok().map(|b| hash(b));
         let candidate = bytes
             .map_err(|_| "policy file unavailable".to_owned())
             .and_then(|b| parse(path, &b));
-        match self.apply(candidate, digest) {
+        match self.apply(unit, candidate, digest) {
             Ok(()) => eprintln!("serve: policy reloaded"),
             Err(e) => eprintln!(
                 "serve: policy reload failed: {}",
@@ -227,32 +342,47 @@ impl Hub {
             ),
         }
     }
+    /// Report each configured route in configuration order.
     pub(crate) fn status(&self) -> String {
         let s = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        format!(
-            "policy_sha256={}\npolicy_applied_unix_ms={}\nlast_reload={}\nlast_reload_unix_ms={}\npolicy_watch={}\n",
-            s.hash,
-            s.applied,
-            s.last,
-            s.last_time,
-            self.watch_ms
-                .map_or_else(|| "off".into(), |v| v.to_string())
-        )
+        s.configured.iter().map(|(id, index)| {
+            let unit = &s.units[*index];
+            format!("route={} policy_sha256={} policy_applied_unix_ms={} last_reload={} last_reload_unix_ms={} policy_watch={}\n",
+                id.as_str(), unit.hash, unit.applied, unit.last, unit.last_time,
+                self.watch_ms.map_or_else(|| "off".into(), |v| v.to_string()))
+        }).collect()
     }
+    /// Report per-route policy counters and existing PostgreSQL connection counters.
     pub(crate) fn metrics(&self) -> Vec<(String, u64)> {
         let s = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut values = vec![
-            ("nunya_policy_reloads_total".into(), s.attempts),
-            ("nunya_policy_reload_failures_total".into(), s.failures),
-            ("nunya_policy_applied_unix_ms".into(), s.applied),
-        ];
-        for route in &s.routes {
+        let mut values = Vec::new();
+        for (id, index) in &s.configured {
+            let unit = &s.units[*index];
+            values.extend([
+                (
+                    format!("nunya_policy_reloads_total{{route=\"{}\"}}", id.as_str()),
+                    unit.attempts,
+                ),
+                (
+                    format!(
+                        "nunya_policy_reload_failures_total{{route=\"{}\"}}",
+                        id.as_str()
+                    ),
+                    unit.failures,
+                ),
+                (
+                    format!("nunya_policy_applied_unix_ms{{route=\"{}\"}}", id.as_str()),
+                    unit.applied,
+                ),
+            ]);
+        }
+        for route in s.units.iter().flat_map(|unit| &unit.routes) {
             if let Route::Postgres(ctx) = route {
                 let m = ctx.metrics.snapshot();
                 values.extend([
@@ -273,38 +403,59 @@ impl Hub {
         }
         values
     }
-    pub(crate) async fn run(&self, path: PathBuf, mut reload: tokio::sync::mpsc::Receiver<()>) {
-        let mut watcher = Watcher {
-            attempted: self
+    /// Reload every unit manually, or just changed units after watcher debounce.
+    pub(crate) async fn run(&self, mut reload: tokio::sync::mpsc::Receiver<()>) {
+        let mut files: Vec<_> = {
+            let state = self
                 .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .hash
-                .clone(),
-            previous: None,
-            readable: true,
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .units
+                .iter()
+                .map(|unit| {
+                    (
+                        unit.path.clone(),
+                        Watcher {
+                            attempted: unit.hash.clone(),
+                            previous: None,
+                            readable: true,
+                        },
+                    )
+                })
+                .collect()
         };
         let mut interval =
             tokio::time::interval(Duration::from_millis(self.watch_ms.unwrap_or(3600000)));
         interval.tick().await;
         let hup = crate::serve::hangup();
         tokio::pin!(hup);
+        let mut reload_open = true;
         loop {
-            tokio::select! {
-                _ = async { tokio::select! { _ = reload.recv() => {}, _ = &mut hup => {} } } => {
-                    hup.set(crate::serve::hangup());
-                    let bytes = std::fs::read(&path);
-                    if let Ok(bytes) = &bytes { watcher.attempted = hash(bytes); }
-                    self.attempt(&path, bytes);
+            let manual = tokio::select! {
+                message = reload.recv(), if reload_open => {
+                    if message.is_none() { reload_open = false; continue; }
+                    true
                 }
-                _ = interval.tick(), if self.watch_ms.is_some() => {
-                    let bytes = std::fs::read(&path);
-                    if watcher.poll(bytes.as_deref().ok()) { self.attempt(&path, bytes); }
+                _ = &mut hup => { hup.set(crate::serve::hangup()); true }
+                _ = interval.tick(), if self.watch_ms.is_some() => false,
+            };
+            for (index, (path, watcher)) in files.iter_mut().enumerate() {
+                let bytes = std::fs::read(&*path);
+                if manual {
+                    if let Ok(bytes) = &bytes {
+                        watcher.attempted = hash(bytes);
+                    }
+                    watcher.previous = None;
+                }
+                if manual || watcher.poll(bytes.as_deref().ok()) {
+                    self.attempt(index, path, bytes);
                 }
             }
         }
     }
 }
+
 struct Watcher {
     attempted: String,
     previous: Option<String>,
@@ -347,44 +498,436 @@ mod tests {
             readlog: ReadLogSink::Stdout,
         }
     }
+    fn id(name: &str) -> RouteId {
+        RouteId::new(name).unwrap()
+    }
     fn hub() -> Hub {
         let p = policy();
         Hub {
-            log: ReloadableLog(Arc::new(RwLock::new(
-                crate::readlog::open_sink(&p.readlog).unwrap(),
-            )), Arc::new(RwLock::new(crate::serve::Revisions { policy: hash(b"initial"), config: "config-test".into() })), Arc::new(AtomicBool::new(true))),
+            log: ReloadableLog(
+                Arc::new(RwLock::new(crate::readlog::open_sink(&p.readlog).unwrap())),
+                Arc::new(RwLock::new(crate::serve::Revisions::default())),
+                Arc::new(AtomicBool::new(true)),
+            ),
             state: Mutex::new(State {
-                policy: Arc::new(p),
-                routes: vec![],
-                configured: vec![],
-                hash: hash(b"initial"),
-                applied: 1,
-                last: "none",
-                last_time: 0,
-                attempts: 0,
-                failures: 0,
+                units: vec![Unit {
+                    path: PathBuf::new(),
+                    revisions: Arc::new(RwLock::new(crate::serve::Revisions {
+                        policy: hash(b"initial"),
+                        config: "config-test".into(),
+                    })),
+                    policy: Arc::new(p),
+                    routes: vec![],
+                    hash: hash(b"initial"),
+                    applied: 1,
+                    last: "none",
+                    last_time: 0,
+                    attempts: 0,
+                    failures: 0,
+                }],
+                configured: vec![(id("postgres"), 0)],
             }),
             watch_ms: None,
+        }
+    }
+    struct Files {
+        dir: PathBuf,
+        a: PathBuf,
+        b: PathBuf,
+    }
+    impl Files {
+        fn new() -> Self {
+            let mut nonce = [0; 16];
+            getrandom::fill(&mut nonce).unwrap();
+            let dir = std::env::temp_dir().join(format!(
+                "nunya-units-{}",
+                data_encoding::HEXLOWER.encode(&nonce)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let files = Self {
+                a: dir.join("a.toml"),
+                b: dir.join("b.toml"),
+                dir,
+            };
+            files.write(&files.a, 60000);
+            files.write(&files.b, 60001);
+            files
+        }
+        fn write(&self, path: &Path, age: u64) {
+            std::fs::write(
+                path,
+                format!("snapshot_max_age_ms={age}\n[readlog]\nsink='stdout'\n"),
+            )
+            .unwrap();
+        }
+        fn hub(&self) -> Arc<Hub> {
+            Hub::new(
+                &[(id("a"), self.a.clone()), (id("b"), self.b.clone())],
+                None,
+            )
+            .unwrap()
+        }
+    }
+    impl Drop for Files {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
+    }
+    fn test_route(name: &str, snapshot: Snapshot) -> Route {
+        Route::Test(
+            id(name),
+            RwLock::new(Arc::new(policy())),
+            RwLock::new(Arc::new(snapshot)),
+        )
+    }
+    fn empty_snapshot() -> Snapshot {
+        Snapshot::new(vec![], vec![], vec![], now())
+    }
+    async fn manual_reload(h: &Arc<Hub>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let worker = h.clone();
+        let task = tokio::spawn(async move { worker.run(rx).await });
+        tx.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if h.state
+                    .lock()
+                    .unwrap()
+                    .units
+                    .iter()
+                    .all(|u| u.attempts == 1)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+    #[test]
+    fn separate_files_validate_only_their_own_catalog() {
+        let files = Files::new();
+        let bytes =
+            "[readlog]\nsink='stdout'\n[[column]]\ntable='public.t'\nname='secret'\nmasked=true\n";
+        std::fs::write(&files.a, bytes).unwrap();
+        let snapshot = Snapshot::new(
+            vec![crate::schema::Relation {
+                schema: "public".into(),
+                name: "t".into(),
+                kind: crate::schema::RelationKind::Table,
+                columns: vec![crate::schema::Column {
+                    name: "secret".into(),
+                    ty: crate::value::ColumnType::Text,
+                    nullable: true,
+                    generated: None,
+                    default: None,
+                }],
+                view_definition: None,
+                primary_key: vec![],
+            }],
+            vec![],
+            vec![],
+            now(),
+        );
+        let h = files.hub();
+        h.register(test_route("a", snapshot.clone())).unwrap();
+        h.register(test_route("b", empty_snapshot())).unwrap();
+        assert!(h.readiness(true, true).0);
+        let b = test_route("b", empty_snapshot());
+        h.refresh(&b, empty_snapshot()).unwrap();
+        let shared = Hub::new(
+            &[
+                (id("a"), files.a.clone()),
+                (id("b"), files.dir.join(".").join("a.toml")),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(shared.state.lock().unwrap().units.len(), 1);
+        shared.register(test_route("a", snapshot)).unwrap();
+        assert!(shared.register(test_route("b", empty_snapshot())).is_err());
+        assert!(
+            shared
+                .refresh(&test_route("b", empty_snapshot()), empty_snapshot())
+                .is_err()
+        );
+        assert!(h.register(test_route("unknown", empty_snapshot())).is_err());
+        assert!(
+            h.refresh(&test_route("unknown", empty_snapshot()), empty_snapshot())
+                .is_err()
+        );
+        assert!(h.policy_for(&id("unknown")).is_err());
+        assert!(h.route_log(&id("unknown")).is_err());
+        assert_eq!(h.policy_revision_for(&id("unknown")), None);
+    }
+    #[tokio::test]
+    async fn independent_reload_per_unit_manual_also_applies_unchanged_bytes() {
+        let files = Files::new();
+        let h = files.hub();
+        h.register(test_route("a", empty_snapshot())).unwrap();
+        h.register(test_route("b", empty_snapshot())).unwrap();
+        let a = h.policy_for(&id("a")).unwrap();
+        let b = h.policy_for(&id("b")).unwrap();
+        let old_a = h.policy_revision_for(&id("a"));
+        let old_b = h.policy_revision_for(&id("b"));
+        files.write(&files.a, 70000);
+        manual_reload(&h).await;
+        assert_ne!(h.policy_revision_for(&id("a")), old_a);
+        assert_eq!(h.policy_revision_for(&id("b")), old_b);
+        assert_eq!(a.snapshot_max_age_ms, 60000);
+        assert_eq!(h.policy_for(&id("a")).unwrap().snapshot_max_age_ms, 70000);
+        assert_eq!(
+            h.policy_for(&id("b")).unwrap().snapshot_max_age_ms,
+            b.snapshot_max_age_ms
+        );
+        // A manual reload republishes B's identical bytes, so its Arc and attempt
+        // counter change, while its effective policy and revision stay unchanged.
+        let metrics = h.metrics();
+        for name in ["a", "b"] {
+            assert!(
+                metrics.contains(&(format!("nunya_policy_reloads_total{{route=\"{name}\"}}"), 1))
+            );
+        }
+        assert!(h.readiness(true, true).0);
+        let state = h.state.lock().unwrap();
+        for unit in &state.units {
+            assert!(Arc::ptr_eq(
+                &unit.policy,
+                &unit.routes[0].locks().0.read().unwrap()
+            ));
+        }
+    }
+    #[tokio::test]
+    async fn bad_edit_on_one_route_keeps_last_good_and_other_unaffected() {
+        let files = Files::new();
+        let h = files.hub();
+        let old = h.policy_for(&id("a")).unwrap();
+        let revision = h.policy_revision_for(&id("a"));
+        std::fs::write(&files.a, [255]).unwrap();
+        files.write(&files.b, 70000);
+        manual_reload(&h).await;
+        assert!(Arc::ptr_eq(&old, &h.policy_for(&id("a")).unwrap()));
+        assert_eq!(h.policy_revision_for(&id("a")), revision);
+        assert_eq!(h.policy_for(&id("b")).unwrap().snapshot_max_age_ms, 70000);
+        assert!(
+            h.status()
+                .lines()
+                .next()
+                .unwrap()
+                .contains("last_reload=rejected ")
+        );
+        assert!(
+            h.status()
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("last_reload=applied ")
+        );
+        assert!(
+            h.metrics()
+                .contains(&("nunya_policy_reload_failures_total{route=\"a\"}".into(), 1))
+        );
+        assert!(
+            h.metrics()
+                .contains(&("nunya_policy_reload_failures_total{route=\"b\"}".into(), 0))
+        );
+    }
+    #[test]
+    fn readlog_must_agree_across_units() {
+        let files = Files::new();
+        let h = files.hub();
+        let revision = h.policy_revision_for(&id("a"));
+        let bytes = b"[readlog]\nsink='file'\npath='audit.log'\n";
+        std::fs::write(&files.a, bytes).unwrap();
+        assert_eq!(files.hub_error(), "policy files name different read logs");
+        let candidate = parse(&files.a, bytes).unwrap();
+        assert_eq!(
+            h.apply(0, Ok(candidate), Some(hash(bytes))).unwrap_err(),
+            "policy files name different read logs"
+        );
+        assert_eq!(h.policy_revision_for(&id("a")), revision);
+        assert_eq!(h.state.lock().unwrap().units[0].failures, 1);
+        // Distinct files with the same resolved relative audit path agree.
+        std::fs::write(&files.b, bytes).unwrap();
+        let shared_sink = files.hub();
+        drop(shared_sink);
+        // A single canonical unit (two routes) may still replace the sink.
+        files.write(&files.a, 60000);
+        let single = Hub::new(
+            &[(id("a"), files.a.clone()), (id("b"), files.a.clone())],
+            None,
+        )
+        .unwrap();
+        single
+            .apply(0, Ok(parse(&files.a, bytes).unwrap()), Some(hash(bytes)))
+            .unwrap();
+        assert_eq!(
+            single.policy_revision_for(&id("a")),
+            single.policy_revision_for(&id("b"))
+        );
+        assert!(
+            single
+                .metrics()
+                .contains(&("nunya_policy_reloads_total{route=\"b\"}".into(), 1))
+        );
+    }
+    impl Files {
+        fn hub_error(&self) -> String {
+            match Hub::new(
+                &[(id("a"), self.a.clone()), (id("b"), self.b.clone())],
+                None,
+            ) {
+                Ok(_) => panic!("expected audit sink mismatch"),
+                Err(e) => e,
+            }
+        }
+    }
+    #[test]
+    fn route_log_stamps_its_own_route_revision() {
+        use crate::readlog::ReadLog;
+        let files = Files::new();
+        let log = "[readlog]\nsink='file'\npath='audit.log'\n";
+        std::fs::write(&files.a, format!("snapshot_max_age_ms=60000\n{log}")).unwrap();
+        std::fs::write(&files.b, format!("snapshot_max_age_ms=60001\n{log}")).unwrap();
+        let h = files.hub();
+        h.set_config_revision("config").unwrap();
+        assert_ne!(
+            h.policy_revision_for(&id("a")),
+            h.policy_revision_for(&id("b"))
+        );
+        for name in ["a", "b"] {
+            let route_log = h.route_log(&id(name)).unwrap();
+            assert!(Arc::ptr_eq(&route_log.0, &h.log.0));
+            assert!(Arc::ptr_eq(&route_log.2, &h.log.2));
+            route_log
+                .write(&crate::readlog::ReadLogRecord {
+                    ts_unix_ms: 1,
+                    principal: crate::token::PrincipalId([1; 16]),
+                    session: crate::token::SessionId([2; 16]),
+                    scope: crate::token::ScopeId([3; 16]),
+                    connection: None,
+                    credential_id: None,
+                    route: name.into(),
+                    policy_revision: None,
+                    config_revision: None,
+                    statement_fingerprint: "test".into(),
+                    statement: "test".into(),
+                    outcome: crate::readlog::Outcome::Allowed,
+                    rows: 0,
+                    tokens_released: vec![],
+                })
+                .unwrap();
+        }
+        let bytes = std::fs::read_to_string(files.dir.join("audit.log")).unwrap();
+        let records: Vec<serde_json::Value> = bytes
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        for (record, route) in records.iter().zip(["a", "b"]) {
+            assert_eq!(
+                record["policy_revision"],
+                h.policy_revision_for(&id(route)).unwrap()
+            );
+            assert_eq!(record["config_revision"], "config");
+        }
+    }
+    #[tokio::test]
+    async fn watcher_debounces_each_unit_without_attempting_unchanged_routes() {
+        let files = Files::new();
+        let h = Hub::new(
+            &[(id("a"), files.a.clone()), (id("b"), files.b.clone())],
+            Some(5),
+        )
+        .unwrap();
+        let b = h.policy_for(&id("b")).unwrap();
+        files.write(&files.a, 70000);
+        let worker = h.clone();
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move { worker.run(rx).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if h.state.lock().unwrap().units[0].attempts == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(h.policy_for(&id("a")).unwrap().snapshot_max_age_ms, 70000);
+        assert!(Arc::ptr_eq(&b, &h.policy_for(&id("b")).unwrap()));
+        let state = h.state.lock().unwrap();
+        assert_eq!(state.units[0].attempts, 1);
+        assert_eq!(state.units[1].attempts, 0);
+    }
+    #[test]
+    fn two_route_status_and_metrics_format() {
+        let files = Files::new();
+        let h = files.hub();
+        let state = h.state.lock().unwrap();
+        let expected: String = state.configured.iter().map(|(route, index)| {
+            let unit = &state.units[*index];
+            format!("route={} policy_sha256={} policy_applied_unix_ms={} last_reload=none last_reload_unix_ms=0 policy_watch=off\n", route.as_str(), unit.hash, unit.applied)
+        }).collect();
+        drop(state);
+        assert_eq!(h.status(), expected);
+        assert_eq!(h.metrics().len(), 6);
+        for name in ["a", "b"] {
+            assert!(
+                h.metrics()
+                    .contains(&(format!("nunya_policy_reloads_total{{route=\"{name}\"}}"), 0))
+            );
+            assert!(h.metrics().contains(&(
+                format!("nunya_policy_reload_failures_total{{route=\"{name}\"}}"),
+                0
+            )));
         }
     }
     #[test]
     fn postgres_readiness_tracks_loading_staleness_and_dependencies() {
         let h = hub();
-        h.configure_routes(vec![RouteId::new("postgres").unwrap()]).unwrap();
-        assert_eq!(h.readiness(true, true), (false,
-            "route=postgres policy=ok catalog=unavailable audit=ok store=ok\n".into()));
-        h.register(Route::Test(RwLock::new(Arc::new(policy())),
-            RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec![], now()))))).unwrap();
-        assert_eq!(h.readiness(true, true), (true,
-            "route=postgres policy=ok catalog=ok audit=ok store=ok\n".into()));
+        assert_eq!(
+            h.readiness(true, true),
+            (
+                false,
+                "route=postgres policy=ok catalog=unavailable audit=ok store=ok\n".into()
+            )
+        );
+        h.register(Route::Test(
+            id("postgres"),
+            RwLock::new(Arc::new(policy())),
+            RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec![], now()))),
+        ))
+        .unwrap();
+        assert_eq!(
+            h.readiness(true, true),
+            (
+                true,
+                "route=postgres policy=ok catalog=ok audit=ok store=ok\n".into()
+            )
+        );
         assert!(!h.readiness(false, true).0);
         assert!(h.readiness(false, true).1.contains("audit=unavailable"));
         assert!(!h.readiness(true, false).0);
         assert!(h.readiness(true, false).1.contains("store=unavailable"));
-        *h.state.lock().unwrap().routes[0].locks().1.write().unwrap() =
-            Arc::new(Snapshot::new(vec![], vec![], vec![], 0));
-        assert_eq!(h.readiness(true, true), (false,
-            "route=postgres policy=ok catalog=stale audit=ok store=ok\n".into()));
+        *h.state.lock().unwrap().units[0].routes[0]
+            .locks()
+            .1
+            .write()
+            .unwrap() = Arc::new(Snapshot::new(vec![], vec![], vec![], 0));
+        assert_eq!(
+            h.readiness(true, true),
+            (
+                false,
+                "route=postgres policy=ok catalog=stale audit=ok store=ok\n".into()
+            )
+        );
     }
 
     #[test]
@@ -445,6 +988,7 @@ mod tests {
         assert!(crate::policy::validate::validate(&candidate, &second).is_err());
         for snapshot in [first, second] {
             h.register(Route::Test(
+                id("postgres"),
                 RwLock::new(Arc::new(policy())),
                 RwLock::new(Arc::new(snapshot)),
             ))
@@ -452,8 +996,8 @@ mod tests {
         }
         let mut valid = policy();
         valid.snapshot_max_age_ms = 12345;
-        h.apply(Ok(valid.clone()), Some(hash(b"valid"))).unwrap();
-        assert!(h.apply(Ok(candidate), Some(hash(b"invalid"))).is_err());
+        h.apply(0, Ok(valid.clone()), Some(hash(b"valid"))).unwrap();
+        assert!(h.apply(0, Ok(candidate), Some(hash(b"invalid"))).is_err());
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).unwrap();
         let missing_parent = std::env::temp_dir().join(format!(
@@ -465,13 +1009,15 @@ mod tests {
             path: missing_parent.join("readlog"),
             max_bytes: 1024,
         };
-        assert!(h.apply(Ok(bad_log), Some(hash(b"bad-log"))).is_err());
+        assert!(h.apply(0, Ok(bad_log), Some(hash(b"bad-log"))).is_err());
         h.register(Route::Test(
+            id("postgres"),
             RwLock::new(Arc::new(policy())),
             RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec![], 0))),
         ))
         .unwrap();
-        let state = h.state.lock().unwrap();
+        let guard = h.state.lock().unwrap();
+        let state = &guard.units[0];
         for route in &state.routes {
             assert_eq!(route.locks().0.read().unwrap().snapshot_max_age_ms, 12345);
         }
@@ -494,17 +1040,24 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let bytes = b"snapshot_max_age_ms = 60000\n[readlog]\nsink = 'stdout'\n";
         std::fs::write(&policy_path, bytes).unwrap();
-        let h = Hub::new(&policy_path, Some(100)).unwrap();
-        h.log.1.write().unwrap().config = "config-test".into();
-        assert_eq!(h.state.lock().unwrap().hash, hash(bytes));
+        let h = Hub::new(
+            &[
+                (id("postgres"), policy_path.clone()),
+                (id("spanner-native"), policy_path.clone()),
+            ],
+            Some(100),
+        )
+        .unwrap();
+        h.set_config_revision("config-test").unwrap();
+        assert_eq!(h.state.lock().unwrap().units[0].hash, hash(bytes));
         assert!(h.status().ends_with("policy_watch=100\n"));
         // Manual reloads apply unchanged bytes, and parse exactly the supplied
         // capture even if the path has already been replaced by another editor.
         std::fs::write(&policy_path, "invalid = [").unwrap();
-        h.attempt(&policy_path, Ok(bytes.to_vec()));
-        h.attempt(&policy_path, Ok(bytes.to_vec()));
-        assert_eq!(h.state.lock().unwrap().attempts, 2);
-        assert_eq!(h.state.lock().unwrap().hash, hash(bytes));
+        h.attempt(0, &policy_path, Ok(bytes.to_vec()));
+        h.attempt(0, &policy_path, Ok(bytes.to_vec()));
+        assert_eq!(h.state.lock().unwrap().units[0].attempts, 2);
+        assert_eq!(h.state.lock().unwrap().units[0].hash, hash(bytes));
         let runtime = crate::state::runtime::StateRuntime::open(
             &dir.join("state"),
             &RootKey::from_hex(&"ab".repeat(32)).unwrap(),
@@ -519,7 +1072,7 @@ mod tests {
             policy: RwLock::new(Arc::new(policy())),
             snapshot: RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec![], 0))),
             root_key: RootKey::from_hex(&"ab".repeat(32)).unwrap(),
-            readlog: Box::new(h.log.clone()),
+            readlog: Box::new(h.route_log(&id("spanner-native")).unwrap()),
             codec: StandardCodec,
             database: "test".into(),
             clock: Arc::new(now),
@@ -527,16 +1080,16 @@ mod tests {
                 endpoint: "http://127.0.0.1:1".into(),
             },
         });
-        h.configure_routes(vec![ctx.route.clone()]).unwrap();
         assert!(!h.readiness(true, true).0);
         *ctx.snapshot.write().unwrap() = Arc::new(Snapshot::new(vec![], vec![], vec![], now()));
         h.register(Route::Spanner(ctx.clone())).unwrap();
-        assert_eq!(h.readiness(true, true), (true,
-            "route=spanner-native policy=ok catalog=ok audit=ok store=ok\n".into()));
-        h.configure_routes(vec![RouteId::new("postgres").unwrap(), ctx.route.clone()]).unwrap();
         assert!(!h.readiness(true, true).0);
-        h.register(Route::Test(RwLock::new(Arc::new(policy())),
-            RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec![], now()))))).unwrap();
+        h.register(Route::Test(
+            id("postgres"),
+            RwLock::new(Arc::new(policy())),
+            RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec![], now()))),
+        ))
+        .unwrap();
         let (ready, body) = h.readiness(true, true);
         assert!(ready);
         assert_eq!(body.lines().count(), 2);
@@ -548,7 +1101,7 @@ mod tests {
             path: dir.join("audit.log"),
             max_bytes: 1024,
         };
-        h.apply(Ok(new), Some(hash(b"native"))).unwrap();
+        h.apply(0, Ok(new), Some(hash(b"native"))).unwrap();
         assert_eq!(ctx.policy.read().unwrap().snapshot_max_age_ms, 123);
         ctx.readlog
             .write(&crate::readlog::ReadLogRecord {
@@ -568,24 +1121,34 @@ mod tests {
                 tokens_released: vec![],
             })
             .unwrap();
-        let logged: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("audit.log")).unwrap()).unwrap();
+        let logged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("audit.log")).unwrap()).unwrap();
         assert_eq!(logged["policy_revision"], hash(b"native"));
         assert_eq!(logged["config_revision"], "config-test");
-        let mut next = (*h.policy()).clone();
+        let mut next = (*h.policy_for(&id("spanner-native")).unwrap()).clone();
         next.snapshot_max_age_ms = 124;
-        h.apply(Ok(next), Some(hash(b"next"))).unwrap();
-        ctx.readlog.write(&crate::readlog::ReadLogRecord {
-            ts_unix_ms: 2,
-            principal: crate::token::PrincipalId([1; 16]),
-            session: crate::token::SessionId([2; 16]),
-            scope: crate::token::ScopeId([3; 16]),
-            connection: None, credential_id: None, route: ctx.route.as_str().into(),
-            policy_revision: None, config_revision: None,
-            statement_fingerprint: "test".into(), statement: "test".into(),
-            outcome: crate::readlog::Outcome::Allowed, rows: 0, tokens_released: vec![],
-        }).unwrap();
+        h.apply(0, Ok(next), Some(hash(b"next"))).unwrap();
+        ctx.readlog
+            .write(&crate::readlog::ReadLogRecord {
+                ts_unix_ms: 2,
+                principal: crate::token::PrincipalId([1; 16]),
+                session: crate::token::SessionId([2; 16]),
+                scope: crate::token::ScopeId([3; 16]),
+                connection: None,
+                credential_id: None,
+                route: ctx.route.as_str().into(),
+                policy_revision: None,
+                config_revision: None,
+                statement_fingerprint: "test".into(),
+                statement: "test".into(),
+                outcome: crate::readlog::Outcome::Allowed,
+                rows: 0,
+                tokens_released: vec![],
+            })
+            .unwrap();
         let bytes = std::fs::read_to_string(dir.join("audit.log")).unwrap();
-        let logged: serde_json::Value = serde_json::from_str(bytes.lines().last().unwrap()).unwrap();
+        let logged: serde_json::Value =
+            serde_json::from_str(bytes.lines().last().unwrap()).unwrap();
         assert_eq!(logged["policy_revision"], hash(b"next"));
         assert_eq!(logged["config_revision"], "config-test");
         drop(h);
@@ -599,15 +1162,18 @@ mod tests {
         assert_eq!(
             h.status(),
             format!(
-                "policy_sha256={}\npolicy_applied_unix_ms=1\nlast_reload=none\nlast_reload_unix_ms=0\npolicy_watch=off\n",
+                "route=postgres policy_sha256={} policy_applied_unix_ms=1 last_reload=none last_reload_unix_ms=0 policy_watch=off\n",
                 hash(b"initial")
             )
         );
-        h.apply(Err("invalid".into()), None).unwrap_err();
-        assert!(h.status().contains("last_reload=rejected\n"));
+        h.apply(0, Err("invalid".into()), None).unwrap_err();
+        assert!(h.status().contains("last_reload=rejected "));
         let metrics = h.metrics();
-        assert!(metrics.contains(&("nunya_policy_reloads_total".into(), 1)));
-        assert!(metrics.contains(&("nunya_policy_reload_failures_total".into(), 1)));
-        assert!(metrics.contains(&("nunya_policy_applied_unix_ms".into(), 1)));
+        assert!(metrics.contains(&("nunya_policy_reloads_total{route=\"postgres\"}".into(), 1)));
+        assert!(metrics.contains(&(
+            "nunya_policy_reload_failures_total{route=\"postgres\"}".into(),
+            1
+        )));
+        assert!(metrics.contains(&("nunya_policy_applied_unix_ms{route=\"postgres\"}".into(), 1)));
     }
 }
