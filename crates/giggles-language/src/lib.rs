@@ -39,7 +39,7 @@ pub use preview::{
     ChangeOutcome, ChangeStatement, LoweredUpdate, execute_change, lower_preview_update,
     parse_change_with_version, task_error,
 };
-pub use task::parse_task_with_version;
+pub use task::{parse_task_with_version, show_task};
 pub use inspection::InspectionOutcome;
 pub use once::{OnceError, OnceResult, OnceScope};
 pub use parser::{

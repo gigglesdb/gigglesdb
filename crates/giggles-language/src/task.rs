@@ -15,6 +15,11 @@ use giggles_core::task::definition::{
 use giggles_core::task::statements::TaskStatement;
 use std::collections::{BTreeMap, BTreeSet};
 
+// R3-502: `show task exposure` and `show task reads`.
+#[path = "task_exposure.rs"]
+mod exposure;
+pub use exposure::show_task;
+
 const LIMIT_NAMES: [&str; 7] = [
     "statement_ms",
     "rows_scanned",
@@ -124,7 +129,7 @@ impl TaskParser {
             }
             (Some("show"), Some("task")) => {
                 self.p.pos += 2;
-                Ok(TaskStatement::Show(Some(self.ident()?)))
+                self.show_task()
             }
             (Some("grant" | "revoke"), Some("undo" | "inspect" | "approve")) => self.privileges(),
             _ => Err(self.p.error()),

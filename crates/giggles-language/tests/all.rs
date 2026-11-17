@@ -48,6 +48,7 @@ mod native_parity;
 #[path = "native_schema_parity.rs"]
 mod native_schema_parity;
 #[path = "native_task_definition.rs"] mod native_task_definition;
+#[path = "task_exposure.rs"] mod task_exposure;
 #[path = "native_sqlstate_parity.rs"]
 mod native_sqlstate_parity;
 #[path = "native_view_parity.rs"]

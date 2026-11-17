@@ -17,7 +17,7 @@ pub use listener::{AgentConfig, serve_agent_pg_bound};
 use giggles_core::{
     task::{
         context::Standing,
-        definition::WallClockMs,
+        definition::{TaskName, WallClockMs},
         StatementClass, TaskError,
     },
     CoreError,
@@ -35,6 +35,25 @@ const PG_EPOCH_UNIX_MS: i64 = 946_684_800_000;
 pub(crate) fn wall_now(clock: &crate::clock::Clock) -> Result<WallClockMs, CoreError> {
     let micros = clock.sql_micros()?;
     Ok(WallClockMs(micros.div_euclid(1000).saturating_add(PG_EPOCH_UNIX_MS)))
+}
+
+/// The server's `listener` rows for the exposure report of `task` (R3-502,
+/// design-3 section 8): one `credential` row per agent credential bound to
+/// the task, as the first 8 hex of its fingerprint and its executor role, in
+/// fingerprint order. Pass them as `extra` to `task::exposure::report`,
+/// `show_exposure` or `draft_exposure`. An invalid task name has none.
+pub fn exposure_listener_rows(service: &crate::Service, task: &str) -> Vec<(String, String)> {
+    let Ok(name) = TaskName::new(task) else {
+        return Vec::new();
+    };
+    let mut bound = service.agent_bindings_for(&name);
+    bound.sort();
+    bound
+        .into_iter()
+        .map(|(fingerprint, executor)| {
+            ("credential".to_owned(), format!("{fingerprint} as {executor}"))
+        })
+        .collect()
 }
 
 /// Step 3 of per-call revalidation: an expired task may still look up outcomes,

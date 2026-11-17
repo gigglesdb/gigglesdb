@@ -1,5 +1,6 @@
 //! The exposure report of an existing task (GD-0061 R3-501, design-3
-//! section 8): `SHOW TASK EXPOSURE <task>`.
+//! section 8): `SHOW TASK EXPOSURE <task>`, and of a draft (R3-502):
+//! `SHOW TASK EXPOSURE FOR CREATE TASK ...`.
 //!
 //! One result of `(section, item, detail, value)` rows in a fixed order: the
 //! definition (who, which table, each column's mode, the visible rows and
@@ -19,12 +20,19 @@
 //! approver, a role granted INSPECT, or a superuser; 42501 otherwise) and is
 //! refused in a task session (0A000). The caller passes the role it
 //! authenticated, as for `SHOW TASK READS`.
+//!
+//! A draft runs CREATE TASK's locks and validation with the caller as issuer
+//! ([`TaskCatalog::draft`](super::catalog::TaskCatalog::draft)), stores
+//! nothing, and reports the unsaved definition (`id` 0, `def_version` 0)
+//! without the `charged` and `changed` sections. Any role that could run the
+//! CREATE TASK may see it; a failed validation is CREATE TASK's own error.
 use std::borrow::Cow;
 use std::ops::Bound;
 
 use super::admit::StatementClass;
+use super::catalog::TaskDdlError;
 use super::columns::ColumnMarks;
-use super::definition::{ColumnMode, TaskDef, TaskPrivileges};
+use super::definition::{ColumnMode, NewTask, TaskDef, TaskPrivileges, WallClockMs};
 use super::error::TaskError;
 use super::readlog::{records, verify};
 use super::records::{disclosure_head_key, mutation_head_key, DisclosureHead, MutationHead};
@@ -75,6 +83,39 @@ pub fn report(
     if !def.privileges_of(role).contains(TaskPrivileges::INSPECT) {
         return Err(CoreError::Policy(crate::Error::Scope));
     }
+    build(session, role, def, extra, Kind::Saved)
+}
+
+/// `SHOW TASK EXPOSURE FOR CREATE TASK ...` for `role`: validates `new` as
+/// CREATE TASK would with `role` as issuer at `now`, stores nothing, and
+/// reports the draft. `extra` is as for [`report`]. Every failure, including
+/// validation, is reported as CREATE TASK reports it.
+pub fn draft_exposure(
+    session: &SqlSession,
+    role: &CatalogRole,
+    new: &NewTask,
+    now: WallClockMs,
+    extra: &[(String, String)],
+) -> Result<SqlResult, TaskDdlError> {
+    refuse_in_task(session)?;
+    let def = session.tasks().draft(role, new, now)?;
+    Ok(build(session, role, &def, extra, Kind::Draft)?)
+}
+
+/// Whether the definition is stored; a draft has nothing charged or changed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Saved,
+    Draft,
+}
+
+fn build(
+    session: &SqlSession,
+    role: &CatalogRole,
+    def: &TaskDef,
+    extra: &[(String, String)],
+    kind: Kind,
+) -> Result<SqlResult, CoreError> {
     let db = session.v2_db().ok_or(CoreError::Unsupported)?;
     let mut txn = db.begin(Isolation::ReadCommitted);
     let image = db.catalog().snapshot(&mut txn)?.image().map_err(CoreError::Sql)?;
@@ -156,6 +197,9 @@ pub fn report(
     for (item, detail) in extra {
         out.text("listener", item, detail);
     }
+    if kind == Kind::Draft {
+        return Ok(out.result());
+    }
     // charged: the disclosure head and the read log
     let head = match txn.get(Keyspace::Kernel, &disclosure_head_key(def.id))? {
         Some(value) => DisclosureHead::decode(&value)?,
@@ -182,11 +226,7 @@ pub fn report(
     out.number("changed", "transitions", mutation.transitions);
     // Seqs start at 1: every committed operation (change or undo) took one.
     out.number("changed", "operations", mutation.next_seq.saturating_sub(1));
-    Ok(SqlResult {
-        columns: COLUMNS.iter().map(|c| c.to_string()).collect(),
-        rows: out.0,
-        affected: 0,
-    })
+    Ok(out.result())
 }
 
 fn refuse_in_task(session: &SqlSession) -> Result<(), CoreError> {
@@ -354,6 +394,14 @@ impl Rows {
 
     fn number(&mut self, section: &str, item: &str, value: u64) {
         self.push(section, item, None, Some(clamp(value)));
+    }
+
+    fn result(self) -> SqlResult {
+        SqlResult {
+            columns: COLUMNS.iter().map(|c| c.to_string()).collect(),
+            rows: self.0,
+            affected: 0,
+        }
     }
 }
 

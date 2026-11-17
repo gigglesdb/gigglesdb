@@ -13,8 +13,11 @@ mod common;
 use giggles_core::relational::{SqlResult, SqlRow, Value};
 use giggles_core::roles::{CatalogRole, NewRole, TablePrivilege};
 use giggles_core::task::context::{open_context, TaskContext};
-use giggles_core::task::definition::{TaskName, TaskObjectId, TaskPrivileges, WallClockMs};
-use giggles_core::task::exposure::{report, show_exposure, LISTENER_DETAIL};
+use giggles_core::task::definition::{
+    NewTask, TaskName, TaskObjectId, TaskPrivileges, WallClockMs,
+};
+use giggles_core::task::catalog::TaskDdlError;
+use giggles_core::task::exposure::{draft_exposure, report, show_exposure, LISTENER_DETAIL};
 use giggles_core::task::statements::{parse, TaskStatement};
 use giggles_core::task::{
     protected_commit, Actor, Budget, OperationId, ProtectedRequest, ReadRecord, StatementClass,
@@ -69,9 +72,16 @@ impl Fixture {
     }
 
     fn with(name: &str, disclose: &str, mutate: &str) -> Self {
+        let mut f = Self::bare(name);
+        f.create(disclose, mutate);
+        f
+    }
+
+    /// The table, its rows, labels, roles and grants; no task.
+    fn bare(name: &str) -> Self {
         let path = common::fresh(name);
         let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
-        let mut f = Self {
+        let f = Self {
             path,
             admin: Some(admin),
             task: TaskObjectId(0),
@@ -136,17 +146,22 @@ impl Fixture {
                 )
                 .unwrap();
         }
-        let issuer = roles.get("incident_controller").unwrap().unwrap();
+        f
+    }
+
+    /// Creates the task from its CREATE TASK text and grants INSPECT to the
+    /// auditor.
+    fn create(&mut self, disclose: &str, mutate: &str) {
+        let issuer = self.role("incident_controller");
         let Some(TaskStatement::Create(new)) = parse(&create_task_sql(disclose, mutate)) else {
             panic!("CREATE TASK did not parse");
         };
-        let tasks = f.admin().tasks();
+        let tasks = self.admin().tasks();
         tasks.create(&issuer, *new, WallClockMs(now_ms())).unwrap();
         tasks
             .grant(&issuer, TASK, "auditor", TaskPrivileges::INSPECT, true)
             .unwrap();
-        f.task = tasks.get(TASK).unwrap().unwrap().id;
-        f
+        self.task = tasks.get(TASK).unwrap().unwrap().id;
     }
 
     fn admin(&self) -> &Admin {
@@ -657,4 +672,178 @@ fn live_count_not_charged_to_task() {
     );
     assert_eq!(f.records(), records);
     assert!(f.admin().task_read_verify(f.task).unwrap().ok());
+}
+
+// ---------------------------------------------------------------------------
+// R3-502: the report of a draft, `SHOW TASK EXPOSURE FOR CREATE TASK ...`.
+
+/// The worked example's draft statement, parsed.
+fn draft_statement(disclose: &str, mutate: &str) -> NewTask {
+    let sql = format!("SHOW TASK EXPOSURE FOR {}", create_task_sql(disclose, mutate));
+    match parse(&sql) {
+        Some(TaskStatement::ShowExposureDraft(new)) => *new,
+        other => panic!("not a draft: {other:?}"),
+    }
+}
+
+impl Fixture {
+    fn draft(&self, role: &str, new: &NewTask) -> Result<SqlResult, TaskDdlError> {
+        draft_exposure(
+            &self.admin().sql_session(),
+            &self.role(role),
+            new,
+            WallClockMs(now_ms()),
+            &[],
+        )
+    }
+}
+
+/// The rows a draft and a created task share: everything except the
+/// `charged` and `changed` sections, `def_version` and the listener rows.
+fn comparable(result: &SqlResult) -> Vec<Line> {
+    lines(result)
+        .into_iter()
+        .filter(|l| {
+            !matches!(l.0.as_str(), "charged" | "changed" | "listener")
+                && !(l.0 == "task" && l.1 == "def_version")
+        })
+        .collect()
+}
+
+#[test]
+fn draft_parses() {
+    let new = draft_statement(DISCLOSE, MUTATE);
+    let Some(TaskStatement::Create(created)) = parse(&create_task_sql(DISCLOSE, MUTATE)) else {
+        panic!("CREATE TASK did not parse");
+    };
+    assert_eq!(new, *created);
+    assert_eq!(
+        giggles_core::task::statements::command_tag(&TaskStatement::ShowExposureDraft(
+            Box::new(new)
+        )),
+        "SHOW"
+    );
+    // A task named for; a draft cut short; a draft with trailing text.
+    assert_eq!(
+        parse("SHOW TASK EXPOSURE for"),
+        Some(TaskStatement::ShowExposure("for".into()))
+    );
+    assert_eq!(
+        parse("SHOW TASK EXPOSURE FOR CREATE TASK"),
+        Some(TaskStatement::Error("42601"))
+    );
+    let trailing = format!(
+        "SHOW TASK EXPOSURE FOR {} extra",
+        create_task_sql(DISCLOSE, MUTATE)
+    );
+    assert_eq!(parse(&trailing), Some(TaskStatement::Error("42601")));
+}
+
+#[test]
+fn draft_report_equals_report_after_create() {
+    let mut f = Fixture::bare("task-exposure-draft-equal");
+    let new = draft_statement(DISCLOSE, MUTATE);
+    let draft = f.draft("incident_controller", &new).unwrap();
+    let got = lines(&draft);
+    // A draft has no charged or changed rows, and version 0.
+    assert!(
+        got.iter().all(|l| l.0 != "charged" && l.0 != "changed"),
+        "{got:?}"
+    );
+    assert_eq!(value(&draft, "task", "def_version"), Some(0));
+    assert_eq!(detail(&draft, "listener", "agent").as_deref(), Some(LISTENER_DETAIL));
+    assert_eq!(value(&draft, "visible_rows", "matching_now"), Some(31));
+    f.create(DISCLOSE, MUTATE);
+    let created = f.issuer_report();
+    assert_eq!(value(&created, "task", "def_version"), Some(1));
+    assert_eq!(comparable(&draft), comparable(&created));
+    // The draft is the created report's prefix up to the listener, with
+    // version 0; the created report adds 7 charged and 3 changed rows.
+    let mut prefix = lines(&created);
+    assert_eq!(prefix.len(), got.len() + 7 + 3);
+    prefix.truncate(got.len());
+    for l in &mut prefix {
+        if l.0 == "task" && l.1 == "def_version" {
+            l.3 = Some(0);
+        }
+    }
+    assert_eq!(got, prefix);
+}
+
+#[test]
+fn draft_stores_nothing() {
+    let mut f = Fixture::bare("task-exposure-draft-stores-nothing");
+    let new = draft_statement(DISCLOSE, MUTATE);
+    for role in ["incident_controller", "dba"] {
+        f.draft(role, &new)
+            .unwrap_or_else(|e| panic!("{role}: {e:?}"));
+    }
+    let tasks = f.admin().tasks();
+    assert!(tasks.get(TASK).unwrap().is_none());
+    assert!(tasks.list().unwrap().is_empty());
+    // No id was allocated: the task created afterwards gets the id a fresh
+    // database gives its first task.
+    f.create(DISCLOSE, MUTATE);
+    let mut fresh = Fixture::bare("task-exposure-draft-stores-nothing-fresh");
+    fresh.create(DISCLOSE, MUTATE);
+    assert_eq!(f.task, fresh.task);
+    // Nothing was charged to the new task either.
+    assert_eq!(value(&f.issuer_report(), "charged", "statements"), Some(0));
+    assert!(f.records().is_empty());
+}
+
+#[test]
+fn draft_invalid_definition_same_error_as_create() {
+    let mut f = Fixture::bare("task-exposure-draft-invalid");
+    let issuer = "incident_controller";
+    let worked = create_task_sql(DISCLOSE, MUTATE);
+    let cases: Vec<(&str, String)> = vec![
+        // Row 9: a column that does not exist.
+        (issuer, worked.replace("READABLE (id,", "READABLE (id, nope,")),
+        // Row 6: the executor must be task-only.
+        (issuer, worked.replace("EXECUTOR repair_agent", "EXECUTOR stranger")),
+        // Row 5: an unknown approver.
+        (issuer, worked.replace("APPROVER oncall_lead", "APPROVER nobody")),
+        // Row 4: an unknown table.
+        (issuer, worked.replace("ON shipments", "ON parcels")),
+        // Row 14: an expiry in the past.
+        (issuer, worked.replace("2099-12-31", "2001-01-01")),
+        // Row 10: a writable column must be readable.
+        (
+            issuer,
+            worked.replace("ALLOW UPDATE (status)", "ALLOW UPDATE (customer_email)"),
+        ),
+        // Row 8: the issuer must hold SELECT and UPDATE on the table.
+        ("auditor", worked.clone()),
+        // A task-only role cannot issue tasks.
+        ("repair_agent", worked.clone()),
+    ];
+    for (role, sql) in &cases {
+        let Some(TaskStatement::Create(new)) = parse(sql) else {
+            panic!("did not parse: {sql}");
+        };
+        let draft = f.draft(role, &new).unwrap_err();
+        let create = f
+            .admin()
+            .tasks()
+            .create(&f.role(role), (*new).clone(), WallClockMs(now_ms()))
+            .unwrap_err();
+        assert_eq!(draft, create, "{role}: {sql}");
+    }
+    assert!(f.admin().tasks().list().unwrap().is_empty());
+    // A duplicate name, once the task exists.
+    f.create(DISCLOSE, MUTATE);
+    let new = draft_statement(DISCLOSE, MUTATE);
+    let draft = f.draft(issuer, &new).unwrap_err();
+    let create = f
+        .admin()
+        .tasks()
+        .create(&f.role(issuer), new.clone(), WallClockMs(now_ms()))
+        .unwrap_err();
+    assert_eq!(draft, create);
+    assert_eq!(draft.sqlstate, "42710");
+    // In a task session the draft is refused as every task SHOW is.
+    let s = f.agent();
+    let e = draft_exposure(&s, &f.role(issuer), &new, WallClockMs(now_ms()), &[]).unwrap_err();
+    assert_eq!(e.sqlstate, "0A000");
 }

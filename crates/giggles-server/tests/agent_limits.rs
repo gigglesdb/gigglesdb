@@ -490,3 +490,100 @@ async fn application_statements_admitted_while_agents_saturated() {
     until("all slots to return", || f.held() == (0, 0)).await;
     assert_eq!(f.admin.task_statement_slots(), (0, 0));
 }
+
+/// R3-502: the exposure report lists each agent credential bound to the
+/// task, from the server's bindings, after the fixed listener row; a draft
+/// of the same task lists them too, and a task with no binding lists none.
+#[test]
+fn exposure_lists_bound_credentials() {
+    use giggles_core::{
+        relational::{SqlResult, Value},
+        task::{
+            exposure::{LISTENER_DETAIL, draft_exposure, show_exposure},
+            statements::{TaskStatement, parse},
+        },
+    };
+    use giggles_server::agent::{AgentBinding, exposure_listener_rows};
+
+    let admin = admin_with(Limits::default());
+    let agent = |fp: &str, tasks: &[&str]| AgentBinding {
+        fingerprint: fp.repeat(32),
+        executor: "agent_exec".into(),
+        tasks: tasks.iter().map(|t| t.to_string()).collect(),
+    };
+    let service = Service::with_agent(
+        admin.clone(),
+        vec![],
+        vec![
+            agent("bb", &["inc-436"]),
+            agent("aa", &["inc-436", "inc-437"]),
+            agent("cc", &["inc-437"]),
+        ],
+        Clock::new(0, 3600).unwrap(),
+        ServiceLimits::default(),
+    )
+    .unwrap();
+    let listener = |result: &SqlResult| -> Vec<(String, Option<String>)> {
+        result
+            .rows
+            .iter()
+            .filter(|row| row.values[0] == Value::Text("listener".into()))
+            .map(|row| {
+                let Value::Text(item) = &row.values[1] else { panic!("{row:?}") };
+                let detail = match &row.values[2] {
+                    Value::Text(t) => Some(t.clone()),
+                    _ => None,
+                };
+                (item.clone(), detail)
+            })
+            .collect()
+    };
+    let issuer = admin.roles().get("incident_controller").unwrap().unwrap();
+    let rows = exposure_listener_rows(&service, "inc-436");
+    assert_eq!(
+        rows,
+        vec![
+            ("credential".to_string(), "aaaaaaaa as agent_exec".to_string()),
+            ("credential".to_string(), "bbbbbbbb as agent_exec".to_string()),
+        ]
+    );
+    let shown = show_exposure(&admin.sql_session(), &issuer, "inc-436", &rows).unwrap();
+    assert_eq!(
+        listener(&shown),
+        vec![
+            ("agent".to_string(), Some(LISTENER_DETAIL.to_string())),
+            ("credential".to_string(), Some("aaaaaaaa as agent_exec".to_string())),
+            ("credential".to_string(), Some("bbbbbbbb as agent_exec".to_string())),
+        ]
+    );
+    // A draft of a task that is bound but not yet created.
+    let draft = format!(
+        "SHOW TASK EXPOSURE FOR CREATE TASK \"inc-437\" EXECUTOR agent_exec ON shipments \
+         VISIBLE ROWS WHERE (merchant_id = 42) READABLE (id, status) \
+         DISCLOSE AT MOST 10 ROWS READ, 10 ROWS RETURNED, 4096 BYTES RETURNED EXPIRES '{}'",
+        timestamptz(now_ms() + DAY_MS)
+    );
+    let Some(TaskStatement::ShowExposureDraft(new)) = parse(&draft) else {
+        panic!("not a draft: {draft}");
+    };
+    let rows = exposure_listener_rows(&service, "inc-437");
+    let drafted = draft_exposure(
+        &admin.sql_session(),
+        &issuer,
+        &new,
+        WallClockMs(now_ms()),
+        &rows,
+    )
+    .unwrap();
+    assert_eq!(
+        listener(&drafted),
+        vec![
+            ("agent".to_string(), Some(LISTENER_DETAIL.to_string())),
+            ("credential".to_string(), Some("aaaaaaaa as agent_exec".to_string())),
+            ("credential".to_string(), Some("cccccccc as agent_exec".to_string())),
+        ]
+    );
+    // No binding, or no valid name: only the fixed row.
+    assert!(exposure_listener_rows(&service, "inc-999").is_empty());
+    assert!(exposure_listener_rows(&service, "").is_empty());
+}

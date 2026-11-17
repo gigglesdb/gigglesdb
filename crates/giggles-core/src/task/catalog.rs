@@ -574,6 +574,28 @@ impl TaskCatalog {
         Ok(def)
     }
 
+    /// A CREATE TASK draft (R3-502): the same locks and validation as
+    /// [`Self::create`], so it fails with the same error, but nothing is
+    /// allocated or written. The result has `id` 0 and `def_version` 0.
+    pub fn draft(
+        &self,
+        issuer: &CatalogRole,
+        new: &NewTask,
+        now: WallClockMs,
+    ) -> Result<TaskDef, TaskDdlError> {
+        let db = Arc::clone(self.db()?);
+        let schema = new.schema.as_deref().unwrap_or("public");
+        let key = crate::relational::relation_key(schema, &new.table);
+        let (mut txn, resolved) = self.begin_write(Some(&key))?;
+        let view = db.catalog().committed_view(&mut txn)?;
+        let checked = Checked { view: &view, key: &key, resolved };
+        let mut def = self.validate(issuer, new, now, &checked, &db, &mut txn)?;
+        // Dropping the transaction uncommitted releases its locks.
+        drop(txn);
+        def.def_version = 0;
+        Ok(def)
+    }
+
     fn validate(
         &self,
         issuer: &CatalogRole,
