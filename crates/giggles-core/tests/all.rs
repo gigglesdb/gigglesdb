@@ -499,6 +499,8 @@ mod v2_in_spill;
 mod v2_per_value_limits;
 #[path = "v2_insert_select_spill.rs"]
 mod v2_insert_select_spill;
+#[path = "v2_insert_select_view_selfref.rs"]
+mod v2_insert_select_view_selfref;
 #[path = "pgparity_ordering.rs"] mod pgparity_ordering;
 
 #[path = "pgparity_concat.rs"]

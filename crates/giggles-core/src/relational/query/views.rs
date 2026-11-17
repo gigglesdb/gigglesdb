@@ -75,7 +75,7 @@ fn expand(state: &Relational, definitions: &BTreeMap<u64, SqlViewDef>, id: u64, 
     cache.insert(key, result.clone());
     Ok(result)
 }
-pub(super) fn projection<'a>(state: &'a Relational, name: &str) -> R<Option<&'a Projection>> {
+pub(in crate::relational) fn projection<'a>(state: &'a Relational, name: &str) -> R<Option<&'a Projection>> {
     if state.tables.contains_key(name) { return Ok(None); }
     state.view_names.get(name).map(|(_, p)| p.as_ref().map_err(|e| {
         if *e == SqlError::Unsupported { user_types::view_recreate_error(); }

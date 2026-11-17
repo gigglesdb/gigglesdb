@@ -8,21 +8,6 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
     let Some(table) = prepared.table().and_then(|name| state.tables.get(name)) else {
         return false;
     };
-    // A later input page may supply a self-referencing FK's parent. Keep that
-    // statement on the complete-image executor for final checks.
-    if state
-        .ext
-        .constraints
-        .get(&table.id)
-        .into_iter()
-        .flatten()
-        .any(|c| {
-            matches!(c.kind, ConstraintKind::ForeignKey { ref_table, .. }
-            if ref_table == table.id)
-        })
-    {
-        return false;
-    }
     if let Statement::InsertMulti(i) = &prepared.statement
         && !i.append_only()
         && (!i.can_witness(state) || !i.stable_referenced_keys(state, table)) {
@@ -44,7 +29,8 @@ fn paged_source(state: &Relational, insert: &sql_insert::Insert, query: &query::
 /// so the insert never sees its own rows (PostgreSQL's statement snapshot).
 fn stored_source(state: &Relational, query: &query::Query) -> bool {
     let tables = query.read_tables();
-    !tables.is_empty() && tables.iter().all(|name| state.tables.contains_key(name))
+    !tables.is_empty() && tables.iter().all(|name| state.tables.contains_key(name)
+        || matches!(query::views::projection(state, name), Ok(Some(_))))
 }
 
 pub(super) fn execute(
@@ -170,8 +156,10 @@ pub(crate) fn validate_append(state: &Relational, table: &TableDef, first_versio
             page.rows.insert(table.id, rows);
             let mut before = state.clone();
             let mut retention = scan::Retention::new(scan::retention_limit());
-            while hydrate(&page.clone(), &state.ext.constraints, &mut before, &mut page,
-                sink, &mut retention, true)? > 0 {}
+            // Only new rows need outgoing witnesses. Hydrated parents are identical
+            // in before/page; recursively expanding them walks self-FK chains.
+            hydrate(&page.clone(), &state.ext.constraints, &mut before, &mut page,
+                sink, &mut retention, true)?;
             rebuild(&mut page, &sink.indexes())?;
             constraints::enforce(&mut page, &before, Vec::new(), pending,
                 &mut || crate::cancellation::check().is_err(), clock).map_err(CoreError::Sql)?;
