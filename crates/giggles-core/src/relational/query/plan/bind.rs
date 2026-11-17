@@ -292,6 +292,10 @@ impl Plan {
             Body::Set { left, right, .. } => {
                 let mut a = left.resolve(state, parameters)?;
                 let b = right.resolve(state, parameters)?;
+                // bpchar consumers remain closed until DD-0068 comparison semantics land.
+                if a.columns.iter().chain(&b.columns).any(|c| c.data_type == DataType::Bpchar) {
+                    return Err(SqlError::Unsupported);
+                }
                 if a.columns.len() != b.columns.len() {
                     return Err(SqlError::Syntax);
                 }

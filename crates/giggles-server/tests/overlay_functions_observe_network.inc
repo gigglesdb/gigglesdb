@@ -101,12 +101,6 @@ const OVERLAY_ADVERSARIAL_DEVIATIONS: &[(&str, Option<&str>, &str, &str)] = &[
         "GD-0001 Q8 decided (DD-0068 F9): pgwire follows PG18 42883 for deferred-routine-only queries; native surfaces keep 42501.",
     ),
     (
-        "overlay_column",
-        Some("42601"),
-        "parse",
-        "Derived table FROM (VALUES ...) alias(column) is not supported by the parser. PG18 returns the row.",
-    ),
-    (
         "overlay_cast_order",
         Some("22P02"),
         "execute",

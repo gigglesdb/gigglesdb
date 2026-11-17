@@ -17,7 +17,7 @@
       "implemented": ["Typed positional parameters, CREATE TABLE with primary key, single-row INSERT, full-primary-key UPDATE/DELETE, bounded SELECT, explicit transactions and expected-version writes.", "Bounded aliases, indexed inner/left joins, global COUNT/SUM/MIN/MAX, qualified scalar sorting and EXPLAIN use the relational query engine.", "Prepared handles are fenced by database domain, catalog epoch and transaction identity; failed explicit transactions require rollback."],
       "restrictions": ["Only bool, signed int2/int4/int8, text, bytea and NULL; no coercive type fallback, timestamps, decimal, JSON or UUID.", "No unbounded reads or writes, generic DDL evolution, multi-row INSERT, expression assignments, PK changes, comments, multi-statements, upsert or RETURNING.", "Successful SQL equal-value UPDATE still advances the row version. Native no-op preservation does not redefine this SQL contract.", "Distinct-table joins report the reserved giggles_join authorization target; gateways must not authorize only the first source."],
       "unverified": ["General PostgreSQL compatibility and proposed native v1 language coverage are outside this implemented profile."],
-      "limit_ids": ["sql_bytes", "sql_rows", "sql_value_bytes", "sql_columns", "sql_params", "sql_tables", "sql_result_bytes", "sql_transactions", "query_work", "query_sources"],
+      "limit_ids": ["sql_bytes", "sql_rows", "sql_value_bytes", "sql_columns", "sql_params", "sql_tables", "sql_result_bytes", "sql_transactions", "query_work"],
       "docs": ["crates/giggles-core/SQL.md", "crates/giggles-core/README.md"],
       "sources": [{"path":"crates/giggles-core/src/storage.rs","needle":"pub fn sql_session(&self) -> SqlSession"}, {"path":"crates/giggles-core/src/relational/query.rs","needle":"\"giggles_join\""}],
       "evidence": [
@@ -194,7 +194,6 @@
     {"id":"sql_result_bytes","value":1048576,"unit":"raw result value bytes","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const MAX_RESULT_BYTES: usize = 1024 * 1024;"}},
     {"id":"sql_transactions","value":8,"unit":"staged transactions shared per legacy database (v2 databases admit relational::MAX_TRANSACTIONS = 128)","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const LEGACY_MAX_TRANSACTIONS: usize = 8;"}},
     {"id":"query_work","value":4096,"unit":"bounded query candidate work","source":{"path":"crates/giggles-core/src/relational/query.rs","needle":"const MAX_WORK: usize = 4096;"}},
-    {"id":"query_sources","value":8,"unit":"query sources","source":{"path":"crates/giggles-core/src/relational/query.rs","needle":"const MAX_SOURCES: usize = 8;"}},
     {"id":"repair_sql_bytes","value":4096,"unit":"finite repair SQL bytes","source":{"path":"crates/giggles-core/src/sql.rs","needle":"sql.len() > 4096"}},
     {"id":"local_input_bytes","value":1048576,"unit":"local JSON input bytes","source":{"path":"crates/giggles-core/src/local.rs","needle":"pub const MAX_INPUT: usize = 1024 * 1024;"}},
     {"id":"local_output_bytes","value":67108864,"unit":"local JSON output bytes","source":{"path":"crates/giggles-core/src/local.rs","needle":"pub const MAX_OUTPUT: usize = 64 * 1024 * 1024;"}},

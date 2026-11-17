@@ -1120,12 +1120,24 @@ fn legacy_unsupported_read_forms_keep_exact_errors() {
             .unwrap().rows[0].values,
         vec![relational::Value::Int(1)],
     );
+    for (sql, expected) in [
+        ("SELECT id FROM a UNION SELECT id FROM b", vec![1, 2]),
+        ("SELECT id FROM a UNION ALL SELECT id FROM b", vec![1, 2]),
+        ("SELECT id FROM a INTERSECT SELECT id FROM b", vec![]),
+        ("SELECT id FROM a EXCEPT SELECT id FROM b", vec![1]),
+        ("WITH q AS (SELECT id FROM a) SELECT id FROM q", vec![1]),
+    ] {
+        for session in [&mut a, &mut b] {
+            let result = session.execute(sql, &[], None).unwrap();
+            let mut rows: Vec<_> = result.rows.into_iter().map(|r| {
+                let [relational::Value::Int(id)] = r.values.as_slice() else { panic!("{sql}: {r:?}") };
+                *id
+            }).collect();
+            rows.sort_unstable();
+            assert_eq!(rows, expected, "{sql}");
+        }
+    }
     for sql in [
-        "SELECT id FROM a UNION SELECT id FROM b",
-        "SELECT id FROM a UNION ALL SELECT id FROM b",
-        "SELECT id FROM a INTERSECT SELECT id FROM b",
-        "SELECT id FROM a EXCEPT SELECT id FROM b",
-        "WITH q AS (SELECT id FROM a) SELECT id FROM q",
         "SELECT a.id,b.id FROM a RIGHT JOIN b ON a.id=b.id",
         "SELECT a.id,b.id FROM a FULL OUTER JOIN b ON a.id=b.id",
         "SELECT (SELECT id FROM b) FROM a",

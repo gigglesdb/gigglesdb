@@ -22,7 +22,7 @@ fn derived_aggregates_preserve_inner_pages_and_projection_scope() {
             assert_eq!(s.execute(sql, &args, None).unwrap_or_else(|e| panic!("{engine:?}: {sql}: {e:?}")).rows[0].values, expected.into_iter().map(Value::Int).collect::<Vec<_>>());
         }
         assert!(matches!(s.execute("SELECT v FROM (SELECT id FROM users) sub", &[], None), Err(giggles_core::CoreError::Sql(SqlError::UnknownColumn))));
-        assert!(s.prepare("SELECT count(*) FROM (SELECT count(*) FROM users) sub").is_err());
+        assert_eq!(s.execute("SELECT count(*) FROM (SELECT count(*) FROM users) sub", &[], None).unwrap().rows[0].values, [Value::Int(1)]);
         drop(s); drop(admin); std::fs::remove_dir_all(path).unwrap();
     }
 }

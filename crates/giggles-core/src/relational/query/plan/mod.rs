@@ -12,3 +12,19 @@ use ast::*;
 
 #[cfg(test)]
 mod tests;
+
+/// A planner decline preserves the original parser error; a recognized error does not.
+#[derive(Debug)]
+pub(in crate::relational) enum ParseError {
+    Decline,
+    Definite(SqlError),
+}
+impl From<SqlError> for ParseError {
+    fn from(error: SqlError) -> Self {
+        if error == SqlError::Unsupported {
+            Self::Decline
+        } else {
+            Self::Definite(error)
+        }
+    }
+}

@@ -125,7 +125,7 @@ fn heap_catalog_insert_visibility_and_descriptions() {
     );
     assert_eq!(
         s.execute("INSERT INTO h VALUES (1, 'x', 9)", &[], None),
-        Err(CoreError::Sql(E::Type))
+        Err(CoreError::Sql(E::Syntax))
     );
     let select = s.prepare("SELECT * FROM h").unwrap();
     let description = s.describe(&select).unwrap();
@@ -597,7 +597,14 @@ fn heap_logical_arity_matches_keyed_errors_and_not_null_is_enforced() {
     let (_a, mut s) = db();
     run(&mut s, "CREATE TABLE h (a BIGINT NOT NULL, b TEXT)");
     run(&mut s, "CREATE TABLE keyed (a BIGINT PRIMARY KEY, b TEXT)");
-    for values in ["(1), (2)", "(1, 'x', 9), (2, 'y', 8)", "(1, 'x', 'extra')"] {
+    for suffix in ["", " ON CONFLICT DO NOTHING"] {
+        for table in ["h", "keyed"] {
+            assert_eq!(s.execute(&format!("INSERT INTO {table} VALUES (1), (2){suffix}"), &[], None).unwrap().affected, 2);
+            assert_eq!(run(&mut s, &format!("SELECT * FROM {table} ORDER BY a")), vec![vec![V::Int(1), V::Null], vec![V::Int(2), V::Null]]);
+            run(&mut s, &format!("DELETE FROM {table}"));
+        }
+    }
+    for values in ["(1, 'x', 9), (2, 'y', 8)", "(1, 'x', 'extra')"] {
         for suffix in ["", " ON CONFLICT DO NOTHING"] {
             let heap_error = s
                 .execute(&format!("INSERT INTO h VALUES {values}{suffix}"), &[], None)
@@ -605,7 +612,7 @@ fn heap_logical_arity_matches_keyed_errors_and_not_null_is_enforced() {
             let keyed_error = s
                 .execute(&format!("INSERT INTO keyed VALUES {values}{suffix}"), &[], None)
                 .unwrap_err();
-            assert_eq!(heap_error, CoreError::Sql(E::Type));
+            assert_eq!(heap_error, CoreError::Sql(E::Syntax));
             assert_eq!(heap_error, keyed_error);
         }
     }

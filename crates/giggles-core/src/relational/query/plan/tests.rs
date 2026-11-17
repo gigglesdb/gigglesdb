@@ -265,3 +265,19 @@ fn cancellation_and_retention_are_statement_scoped() {
     ));
     assert_eq!(execution.retention.borrow().used(), 0);
 }
+
+#[test]
+fn bpchar_set_consumers_fail_closed_even_without_rows() {
+    let mut state = Relational::default();
+    run(&mut state, "CREATE TABLE plan_bpchar(c char(3))");
+    for sql in [
+        "SELECT c FROM plan_bpchar UNION SELECT c FROM plan_bpchar",
+        "SELECT c FROM plan_bpchar UNION ALL SELECT c FROM plan_bpchar",
+        "SELECT c FROM plan_bpchar INTERSECT ALL SELECT c FROM plan_bpchar",
+        "SELECT c FROM plan_bpchar EXCEPT SELECT c FROM plan_bpchar",
+        "WITH RECURSIVE t(c) AS (SELECT c FROM plan_bpchar UNION SELECT c FROM t) SELECT c FROM t",
+    ] {
+        let p = Prepared::parse(sql, 1, state.epoch).unwrap();
+        assert_eq!(state.execute(&p, &[], None), Err(SqlError::Unsupported), "{sql}");
+    }
+}

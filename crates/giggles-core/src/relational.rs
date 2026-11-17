@@ -3232,7 +3232,8 @@ impl Prepared {
                 p.relations.clear();
                 match query::plan::Plan::parse(&mut p) {
                     Ok(plan) => Statement::Plan(plan),
-                    Err(planner) => return Err(if matches!(error, SqlError::Unsupported | SqlError::Syntax) { planner } else { error }),
+                    Err(query::plan::ParseError::Decline) => return Err(error),
+                    Err(query::plan::ParseError::Definite(planner)) => return Err(planner),
                 }
             }
         };

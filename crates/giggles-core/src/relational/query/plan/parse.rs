@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) type ParseResult<T> = Result<T, ParseError>;
+
 pub(super) fn parser(tokens: &[Token]) -> Parser {
     Parser {
         tokens: tokens.to_vec(),
@@ -35,16 +37,16 @@ fn top(tokens: &[Token]) -> R<Vec<usize>> {
 }
 impl Plan {
     pub(in crate::relational) fn claims(tokens: &[Token]) -> bool {
-        matches!(tokens.first(), Some(Token::Word(w)) if ["select", "values", "table", "explain", "with"].contains(&w.as_str()))
+        matches!(tokens.first(), Some(Token::Word(w)) if ["select", "values", "table", "with"].contains(&w.as_str()))
             || tokens.first() == Some(&Token::Symbol('('))
     }
-    pub(in crate::relational) fn parse(p: &mut Parser) -> R<Self> {
+    pub(in crate::relational) fn parse(p: &mut Parser) -> ParseResult<Self> {
         let mut tokens = p.tokens[p.at..].to_vec();
         if tokens.last() == Some(&Token::Symbol(';')) {
             tokens.pop();
         }
         if tokens.len() > MAX_WORK * 8 {
-            return Err(SqlError::Limit);
+            return Err(SqlError::Limit.into());
         }
         let plan = expression(&tokens, p, 0, &mut 0)?;
         // Query's normalizer may rewrite tokens; collect original parameter numbers.
@@ -64,12 +66,12 @@ pub(super) fn expression(
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
-) -> R<Plan> {
+) -> ParseResult<Plan> {
     if depth > 32 {
-        return Err(SqlError::Limit);
+        return Err(SqlError::Limit.into());
     }
     if tokens.is_empty() {
-        return Err(SqlError::Syntax);
+        return Err(SqlError::Syntax.into());
     }
     if tokens.first().is_some_and(|t| word(t, "with")) {
         return cte::parse(tokens, owner, depth, next);
@@ -120,7 +122,7 @@ pub(super) fn expression(
         })
     } else if body.first() == Some(&Token::Symbol('(')) {
         if body.last() != Some(&Token::Symbol(')')) {
-            return Err(SqlError::Syntax);
+            return Err(SqlError::Syntax.into());
         }
         // Keep both pagination boundaries, even for ((SELECT ...) LIMIT ...).
         let child = expression(&body[1..body.len() - 1], owner, depth + 1, next)?;
@@ -152,37 +154,37 @@ pub(super) fn expression(
         let mut rows = vec![];
         loop {
             if !p.sym('(') {
-                return Err(SqlError::Syntax);
+                return Err(SqlError::Syntax.into());
             }
             let mut row = vec![];
             loop {
                 row.push(Scalar::parse_expr(&mut p, 0, false)?);
                 if row.len() > MAX_COLUMNS {
-                    return Err(SqlError::Limit);
+                    return Err(SqlError::Limit.into());
                 }
                 if !p.sym(',') {
                     break;
                 }
             }
             if !p.sym(')') {
-                return Err(SqlError::Syntax);
+                return Err(SqlError::Syntax.into());
             }
             if rows
                 .first()
                 .is_some_and(|r: &Vec<Scalar>| r.len() != row.len())
             {
-                return Err(SqlError::Syntax);
+                return Err(SqlError::Syntax.into());
             }
             rows.push(row);
             if rows.len() > MAX_WORK {
-                return Err(SqlError::Limit);
+                return Err(SqlError::Limit.into());
             }
             if !p.sym(',') {
                 break;
             }
         }
         if p.at != p.tokens.len() {
-            return Err(SqlError::Syntax);
+            return Err(SqlError::Syntax.into());
         }
         Plan::new(Body::Values(rows))
     } else {
@@ -200,7 +202,7 @@ pub(super) fn expression(
                         p.at += 1;
                         desc
                     }
-                    _ => return Err(SqlError::UndefinedFunction),
+                    _ => return Err(SqlError::UndefinedFunction.into()),
                 }
             } else {
                 let desc = p.word("desc");
@@ -244,11 +246,11 @@ pub(super) fn expression(
         }
     }
     if p.at != p.tokens.len() {
-        return Err(SqlError::Unsupported);
+        return Err(SqlError::Unsupported.into());
     }
     Ok(plan)
 }
-fn select(tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize) -> R<Plan> {
+fn select(tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize) -> ParseResult<Plan> {
     let mut tokens = tokens.to_vec();
     if tokens.first().is_some_and(|t| word(t, "table")) {
         tokens.splice(
@@ -261,7 +263,7 @@ fn select(tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize) 
         );
     }
     if !tokens.first().is_some_and(|t| word(t, "select")) {
-        return Err(SqlError::Unsupported);
+        return Err(SqlError::Unsupported.into());
     }
     if tokens.get(1).is_some_and(|t| word(t, "all")) {
         tokens.remove(1);
@@ -277,7 +279,7 @@ fn select(tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize) 
             if word(&tokens[i], "using") {
                 let desc = match &tokens[i + 1] {
                     Token::Op(op) if op == "<" || op == ">" => op == ">",
-                    _ => return Err(SqlError::UndefinedFunction),
+                    _ => return Err(SqlError::UndefinedFunction.into()),
                 };
                 tokens.splice(
                     i..i + 2,
@@ -316,7 +318,7 @@ fn select(tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize) 
                 }
             }
             if !p.sym(')') {
-                return Err(SqlError::Syntax);
+                return Err(SqlError::Syntax.into());
             }
         }
         let name = "\0plan_input".to_string();

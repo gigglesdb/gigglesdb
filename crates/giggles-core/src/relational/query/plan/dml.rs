@@ -225,12 +225,15 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "engine-rocksdb")]
     use crate::{Admin, Engine as StorageEngine, Limits, SqlSession};
 
+    #[cfg(feature = "engine-rocksdb")]
     struct Fixture {
         admin: Option<Admin>,
         path: std::path::PathBuf,
     }
+    #[cfg(feature = "engine-rocksdb")]
     impl Fixture {
         fn new() -> Self {
             let mut nonce = [0; 16];
@@ -248,19 +251,23 @@ mod tests {
             self.admin.as_ref().unwrap().sql_session()
         }
     }
+    #[cfg(feature = "engine-rocksdb")]
     impl Drop for Fixture {
         fn drop(&mut self) {
             self.admin.take();
             std::fs::remove_dir_all(&self.path).unwrap();
         }
     }
+    #[cfg(feature = "engine-rocksdb")]
     fn run(s: &mut SqlSession, sql: &str) -> SqlResult {
         s.execute(sql, &[], None)
             .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
     }
+    #[cfg(feature = "engine-rocksdb")]
     fn values(s: &mut SqlSession, sql: &str) -> Vec<Vec<Value>> {
         run(s, sql).rows.into_iter().map(|r| r.values).collect()
     }
+    #[cfg(feature = "engine-rocksdb")]
     #[test]
     fn unreferenced_dml_executes_once_and_classifies_as_write() {
         let f = Fixture::new();
@@ -293,6 +300,7 @@ mod tests {
             vec![vec![Value::Int(11)]]
         );
     }
+    #[cfg(feature = "engine-rocksdb")]
     #[test]
     fn main_and_sibling_queries_read_the_statement_snapshot() {
         let f = Fixture::new();
@@ -320,6 +328,7 @@ mod tests {
             vec![vec![Value::Int(1)]]
         );
     }
+    #[cfg(feature = "engine-rocksdb")]
     #[test]
     fn move_rows_passes_returning_to_later_mutation() {
         let f = Fixture::new();
@@ -349,6 +358,7 @@ mod tests {
             vec![vec![Value::Int(2)]]
         );
     }
+    #[cfg(feature = "engine-rocksdb")]
     #[test]
     fn parameters_aliases_defaults_and_returning_expressions() {
         let f = Fixture::new();
@@ -377,6 +387,7 @@ mod tests {
             ]
         );
     }
+    #[cfg(feature = "engine-rocksdb")]
     #[test]
     fn later_update_can_read_an_earlier_returning_relation() {
         let f = Fixture::new();
@@ -405,6 +416,7 @@ mod tests {
             assert_eq!(crate::sqlstate(&crate::CoreError::Sql(e)), "0A000", "{sql}");
         }
     }
+    #[cfg(feature = "engine-rocksdb")]
     #[test]
     fn rollback_and_statement_failure_leave_no_mutations_on_v2() {
         let f = Fixture::new();

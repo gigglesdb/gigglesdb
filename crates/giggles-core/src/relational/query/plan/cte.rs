@@ -34,7 +34,7 @@ pub(super) fn parse(
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
-) -> R<Plan> {
+) -> parse::ParseResult<Plan> {
     let mut p = parse::parser(tokens);
     p.need("with")?;
     let recursive = p.word("recursive");
@@ -43,7 +43,7 @@ pub(super) fn parse(
     loop {
         let alias = p.name()?;
         if !names.insert(alias.clone()) {
-            return Err(SqlError::DuplicateTable);
+            return Err(SqlError::DuplicateTable.into());
         }
         let aliases = if p.sym('(') {
             names_list(&mut p, true)?
@@ -57,7 +57,7 @@ pub(super) fn parse(
             p.word("materialized");
         }
         if !p.sym('(') {
-            return Err(SqlError::Syntax);
+            return Err(SqlError::Syntax.into());
         }
         let open = p.at - 1;
         let close = subquery_end(&p.tokens, open)?;
@@ -68,7 +68,7 @@ pub(super) fn parse(
                 .any(|w| parse::word(t, w))
         }) {
             if depth != 0 {
-                return Err(SqlError::Unsupported);
+                return Err(ParseError::Definite(SqlError::Unsupported));
             }
             Some(Box::new(dml::parse(tokens, owner)?))
         } else {
@@ -147,7 +147,7 @@ pub(super) fn parse(
             },
         ));
         if definitions.len() > MAX_WORK {
-            return Err(SqlError::Limit);
+            return Err(SqlError::Limit.into());
         }
         if !p.sym(',') {
             break;
@@ -169,12 +169,12 @@ pub(super) fn parse(
         if definitions[i].1.recursive {
             recursive_parts(&definitions[i].1)?;
         } else if definitions[i].1.search.is_some() || definitions[i].1.cycle.is_some() {
-            return Err(SqlError::InvalidRecursion);
+            return Err(SqlError::InvalidRecursion.into());
         }
         // A forward reference is either mutual recursion or an unsupported dependency cycle.
         for (_, later) in &definitions[i + 1..] {
             if references(&definitions[i].1.query, &later.name) > 0 {
-                return Err(SqlError::InvalidRecursion);
+                return Err(SqlError::InvalidRecursion.into());
             }
         }
     }
@@ -192,7 +192,7 @@ pub(super) fn parse(
                             .is_some_and(|p| p.read_tables().contains(&cte.name))
                 });
             if referenced {
-                return Err(SqlError::Unsupported);
+                return Err(ParseError::Definite(SqlError::Unsupported));
             }
         }
     }
@@ -536,6 +536,9 @@ pub(super) fn resolve(
                 unreachable!()
             };
             let mut meta = left.resolve(&state, parameters)?;
+            if meta.columns.iter().any(|c| c.data_type == DataType::Bpchar) {
+                return Err(SqlError::Unsupported);
+            }
             aliases(&mut meta, &cte.aliases)?;
             install(&mut state, &cte.name, &meta.columns, &meta.typmods)?;
             let step = right.resolve(&state, parameters)?;

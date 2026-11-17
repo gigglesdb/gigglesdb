@@ -148,7 +148,7 @@ fn route_shape_and_catalog_keeps() {
     assert_eq!(giggles_core::sqlstate(&sql.execute("INSERT INTO t(id) VALUES(id)",&[],None).unwrap_err()),"42703");
     let malformed=Request::InsertMany { table:"t".into(),columns:vec!["id".into(),"v".into()],rows:vec![vec![expr(V::Int(1))]],cap:lit(V::Int(1)) };
     assert_eq!(engine.execute(&malformed,&Bindings::new()).unwrap_err(),Error::Type);
-    assert_eq!(giggles_core::sqlstate(&sql.execute("INSERT INTO t(id,v) VALUES(1)",&[],None).unwrap_err()),"42804");
+    assert_eq!(giggles_core::sqlstate(&sql.execute("INSERT INTO t(id,v) VALUES(1)",&[],None).unwrap_err()),"42601");
     let mut negative=read("t",None); if let Request::Read { limit,.. }=&mut negative { *limit=Some(lit(V::Int(-1))); }
     assert_eq!(engine.execute(&negative,&Bindings::new()).unwrap_err(),Error::Type);
     assert_eq!(giggles_core::sqlstate(&sql.execute("SELECT * FROM t LIMIT -1",&[],None).unwrap_err()),"2201W");
