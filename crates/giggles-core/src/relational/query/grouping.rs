@@ -313,9 +313,14 @@ fn cast_output_name(s: &Scalar) -> Option<String> {
     match s {
         Scalar::Cast(inner, _) | Scalar::Domain(inner, ..) => cast_output_name(inner),
         Scalar::Column(c) => Some(c.name.clone()),
-        Scalar::Call(name, _) => aggregate_filter::kind(s)
-            .or_else(|| aggregate(name))
-            .map(|a| a.name().into()),
+        Scalar::Call(name, args) if name == functions::CAST_TYPMOD => {
+            args.first().and_then(cast_output_name)
+        }
+        Scalar::Call(name, _) => Some(
+            aggregate_filter::kind(s)
+                .or_else(|| aggregate(name))
+                .map_or_else(|| name.clone(), |a| a.name().into()),
+        ),
         _ => None,
     }
 }
@@ -733,8 +738,10 @@ pub(super) fn bind<'a>(
         .iter()
         .zip(&outputs)
         .map(|((i, _), b)| match i {
-            Item::Scalar(s @ (Scalar::Cast(..) | Scalar::Domain(..)))
-                if contains_aggregate(s) => {
+            Item::Scalar(s)
+                if contains_aggregate(s)
+                    && (matches!(s, Scalar::Cast(..) | Scalar::Domain(..))
+                        || matches!(s, Scalar::Call(name, _) if name == functions::CAST_TYPMOD)) => {
                     Ok(cast_output_name(s).unwrap_or_else(|| b.name().to_owned()))
                 }
             Item::Scalar(s) if !contains_aggregate(s) => {

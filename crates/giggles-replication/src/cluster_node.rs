@@ -25,7 +25,7 @@ use giggles_core::{
     Limits,
     cluster_node::{ClusterGateway, EngineSettings, GatewaySettings, NodeEngines, attach_gateway},
     range_api::{
-        ClusterTxnId, Epoch, GatewayPeer, HomeOp, HomeReply, LeaseKind, LockGrant, LockRequest,
+        ClusterTxnId, Epoch, GatewayPeer, HomeOp, HomeReply, LeaseKind, LockBatchRequest, LockGrant, LockRequest,
         Outcome, RangeClient, RangeDescriptor, RangeError, RangeId, RangeService, RangeSpace,
         RangeWrite, ReadDirection, ReadPage, ReadRequest, SYSTEM_RANGE, SequenceOp, SequenceReply,
         SystemService, Timestamp, TsOracle,
@@ -178,6 +178,10 @@ impl RangeService for Counted {
     }
     fn lock(&self, req: LockRequest) -> Res<LockGrant> {
         self.count(Kind::Lock).lock(req)
+    }
+    fn lock_batch(&self, req: LockBatchRequest) -> Res<Vec<LockGrant>> {
+        // Count the batch once, as one served lock call.
+        self.count(Kind::Lock).lock_batch(req)
     }
     fn blockers(&self, txn: ClusterTxnId) -> Res<Vec<ClusterTxnId>> {
         self.count(Kind::Other).blockers(txn)

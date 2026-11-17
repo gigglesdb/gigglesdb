@@ -18,7 +18,7 @@ use crate::{
 };
 use giggles_core::{
     range_api::{
-        ClusterTxnId, Epoch, HomeOp, HomeReply, LeaseKind, LockGrant, LockRequest, Outcome,
+        ClusterTxnId, Epoch, HomeOp, HomeReply, LeaseKind, LockBatchRequest, LockGrant, LockRequest, Outcome,
         RangeDescriptor, RangeEngineOpener, RangeError, RangeId, RangeService, RangeWrite,
         ReadPage, ReadRequest, SYSTEM_RANGE, SequenceOp, SequenceReply, SystemService, Timestamp,
         TsOracle,
@@ -120,6 +120,11 @@ impl RangeService for ConfirmedService {
     fn lock(&self, req: LockRequest) -> Result<LockGrant, RangeError> {
         confirm_leader(&self.handle, self.term)?;
         self.inner.lock(req)
+    }
+    fn lock_batch(&self, req: LockBatchRequest) -> Result<Vec<LockGrant>, RangeError> {
+        // A batch never waits, so one leadership confirmation covers all grants.
+        confirm_leader(&self.handle, self.term)?;
+        self.inner.lock_batch(req)
     }
     fn blockers(&self, txn: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError> {
         self.inner.blockers(txn)

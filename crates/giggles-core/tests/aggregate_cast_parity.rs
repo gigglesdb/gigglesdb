@@ -58,11 +58,46 @@ fn aggregate_cast_values_names_and_types_in_both_execution_paths() {
     let path = std::env::temp_dir().join(format!("hd6a-aggregate-cast-{}", std::process::id()));
     let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
     let mut s = admin.sql_session();
-    s.execute("CREATE TABLE t(a int)", &[], None).unwrap();
-    s.execute("INSERT INTO t VALUES (1),(2)", &[], None)
+    s.execute("CREATE TABLE t(a int, b text)", &[], None)
+        .unwrap();
+    s.execute("INSERT INTO t VALUES (1, 'a'),(2, 'b')", &[], None)
         .unwrap();
     for (expression, name, ty, value) in [
         ("count(*)::bigint", "count", T::BigInt, V::Int(2)),
+        ("(count(*)+1)::bigint", "int8", T::BigInt, V::Int(3)),
+        (
+            "coalesce(sum(a),0)::bigint",
+            "coalesce",
+            T::BigInt,
+            V::Int(3),
+        ),
+        ("upper(max(b))::text", "upper", T::Text, V::Text("B".into())),
+        (
+            "(sum(a)*2)::numeric",
+            "numeric",
+            T::Numeric,
+            V::Numeric(giggles_core::relational::Numeric::parse("6").unwrap()),
+        ),
+        ("(count(*))::int4", "count", T::Integer, V::Int(2)),
+        ("count(*)::numeric::int8", "count", T::BigInt, V::Int(2)),
+        (
+            "count(*)::varchar(10)",
+            "count",
+            T::Varchar,
+            V::Text("2".into()),
+        ),
+        (
+            "cast(max(a) + 1 as text)",
+            "text",
+            T::Text,
+            V::Text("3".into()),
+        ),
+        (
+            "max(a)::text || 'z'",
+            "?column?",
+            T::Text,
+            V::Text("2z".into()),
+        ),
         ("count(*)::int8", "count", T::BigInt, V::Int(2)),
         ("count(a)::bigint", "count", T::BigInt, V::Int(2)),
         ("sum(a)::bigint", "sum", T::BigInt, V::Int(3)),
@@ -101,6 +136,13 @@ fn aggregate_cast_values_names_and_types_in_both_execution_paths() {
             &[vec![V::Int(1)], vec![V::Int(2)]],
         );
     }
+    parity(
+        &mut s,
+        "SELECT (a+1)::bigint FROM t ORDER BY a",
+        &["int8"],
+        &[T::BigInt],
+        &[vec![V::Int(2)], vec![V::Int(3)]],
+    );
     for sql in [
         "SELECT a,count(*)::bigint FROM t GROUP BY a ORDER BY a",
         "SELECT a,count(*)::bigint FROM t GROUP BY a ORDER BY count(*)::bigint,a",

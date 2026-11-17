@@ -125,6 +125,10 @@ struct TxnState {
 
 /// One per gateway database. Transactions are keyed by TxnId (= ClusterTxnId.0).
 pub(crate) struct ClusterTxnServices {
+    #[cfg(test)]
+    batch_successes: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    batch_fallbacks: std::sync::atomic::AtomicU64,
     client: Arc<dyn RangeClient>,
     gateway: Arc<LockManager>,
     config: ClusterConfig,
@@ -247,6 +251,13 @@ pub(crate) fn txn_error(error: RangeError) -> TxnError {
 }
 
 impl ClusterTxnServices {
+    #[cfg(test)]
+    pub(crate) fn batch_counts(&self) -> (u64, u64) {
+        (
+            self.batch_successes.load(Ordering::Relaxed),
+            self.batch_fallbacks.load(Ordering::Relaxed),
+        )
+    }
     /// A gateway without peers: no cross-range deadlock detection (each range still breaks
     /// its own cycles, and every wait ends at `lock_backstop`).
     pub(crate) fn new(client: Arc<dyn RangeClient>, config: ClusterConfig) -> Arc<Self> {
@@ -285,6 +296,10 @@ impl ClusterTxnServices {
             services: std::sync::OnceLock::new(),
         });
         let services = Arc::new(Self {
+            #[cfg(test)]
+            batch_successes: Default::default(),
+            #[cfg(test)]
+            batch_fallbacks: Default::default(),
             client,
             gateway,
             config,
@@ -706,6 +721,15 @@ impl ClusterTxnServices {
             } else {
                 None
             };
+            #[cfg(test)]
+            if group.len() >= 2 {
+                if grants.is_some() {
+                    &self.batch_successes
+                } else {
+                    &self.batch_fallbacks
+                }
+                .fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(grants) = grants {
                 for grant in grants {
                     self.record_lock_grant(txn, &descriptor, grant.generation)?;

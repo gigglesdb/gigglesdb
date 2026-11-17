@@ -5,7 +5,7 @@
 use super::local::LocalCluster;
 use super::*;
 use crate::relational::{SqlResult, StatementClock, Value};
-use crate::storage::SqlSession;
+use crate::storage::{SqlSession, engine::kv::Keyspace};
 use crate::storage::range_api::{RangeSpace, range_key};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -468,12 +468,25 @@ fn five_point_reads_validate_in_one_range() {
         begin(&mut sa, "SERIALIZABLE");
         for id in 1..=5 {
             assert_eq!(int(&mut sa, &format!("SELECT v FROM t WHERE id = {id}")), 0);
+            // SQL uses an interval scan here. Record actual point reads too,
+            // so this test exercises batched point validation at commit.
+            let mut key = 1_u64.to_be_bytes().to_vec();
+            key.extend(crate::storage::engine::codec::pk_bytes(&[Value::Int(id)]).unwrap());
+            assert!(
+                sa.v2_transaction
+                    .as_mut()
+                    .unwrap()
+                    .get(Keyspace::Rows, &key)
+                    .unwrap()
+                    .is_some()
+            );
         }
         if changed {
             ok(&mut sb, "UPDATE t SET v = 9 WHERE id = 3");
         }
         ok(&mut sa, "INSERT INTO log VALUES (1, 1)");
         let result = exec(&mut sa, "COMMIT");
+        assert_eq!(a.services.batch_counts(), (1, 0));
         if changed {
             assert_eq!(code(result), "40001");
         } else {
@@ -497,6 +510,18 @@ fn point_batch_falls_back_and_waits_for_open_writer() {
         begin(&mut sa, "SERIALIZABLE");
         for id in 1..=5 {
             assert_eq!(int(&mut sa, &format!("SELECT v FROM t WHERE id = {id}")), 0);
+            // SQL uses an interval scan here. Record actual point reads too,
+            // so this test exercises batched point validation at commit.
+            let mut key = 1_u64.to_be_bytes().to_vec();
+            key.extend(crate::storage::engine::codec::pk_bytes(&[Value::Int(id)]).unwrap());
+            assert!(
+                sa.v2_transaction
+                    .as_mut()
+                    .unwrap()
+                    .get(Keyspace::Rows, &key)
+                    .unwrap()
+                    .is_some()
+            );
         }
         ok(&mut sa, "INSERT INTO log VALUES (1, 1)");
         begin(&mut sb, "READ COMMITTED");
@@ -522,6 +547,7 @@ fn point_batch_falls_back_and_waits_for_open_writer() {
             let result = rx.recv_timeout(Duration::from_secs(30)).unwrap();
             assert_eq!(result, if commit { Err("40001".into()) } else { Ok(()) });
         });
+        assert_eq!(a.services.batch_counts(), (0, 1));
         assert_eq!(int(&mut sb, "SELECT count(*) FROM log"), i64::from(!commit));
     }
 }

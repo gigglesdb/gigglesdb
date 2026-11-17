@@ -192,6 +192,13 @@ impl PeerCalls {
         match rx.recv_timeout(timeout) {
             // A reply that cannot be decoded or was replaced at the server says nothing
             // about whether a write ran: its outcome is unknown (design.md 2).
+            // An older node can refuse tag 15: preserve the refusal so the
+            // gateway falls back without retries or evicting its cached leader.
+            Ok(Err(error @ RangeError::Corrupt(_)))
+                if matches!(call, PeerCall::Range(RangeCall::LockBatch(_))) =>
+            {
+                Err(error)
+            }
             Ok(Err(RangeError::Corrupt(why))) => Err(lost(&call, why)),
             Ok(reply) => reply,
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
