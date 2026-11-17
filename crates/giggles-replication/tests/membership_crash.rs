@@ -2,6 +2,8 @@ use crate::common::Cluster;
 use giggles_replication::membership::{AdminCommand, CATCH_UP_DISTANCE, Next, PeerRecord};
 use raft::eraftpb::ConfState;
 
+pub(super) const ADMIN: &[&str] = &["node.admin.before", "node.admin.after"];
+
 fn conf(c: &Cluster, id: u64) -> ConfState {
     let mut conf = c.nodes[&id].conf_state();
     conf.voters.sort_unstable();
@@ -124,6 +126,116 @@ fn finish(c: &mut Cluster, expected: &mut Vec<Vec<u8>>) {
         write(c, expected);
     }
     panic!("replacement did not finish in six transitions");
+}
+
+#[test]
+fn crash_inside_admin_apply_at_every_step() {
+    use crate::common::CLUSTER;
+    use giggles_replication::{failpoint, membership::Membership};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // The shared harness uses one cluster identity. A child running only this test
+    // keeps its failpoints from crashing concurrently running membership tests.
+    const CHILD: &str = "GIGGLES_ADMIN_CRASH_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "membership_crash::crash_inside_admin_apply_at_every_step",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "admin crash scenarios failed: {status}");
+        return;
+    }
+    for (k, next) in [
+        (0, Next::AddLearner),
+        (2, Next::EnterJoint),
+        (5, Next::Idle),
+    ] {
+        for &point in ADMIN {
+            for victim in [2, 3] {
+                let (mut c, mut expected) = setup(&format!("admin-crash-{k}-{point}-{victim}"));
+                for _ in 0..k {
+                    assert!(advance(&mut c, 1, peer()));
+                    write(&mut c, &mut expected);
+                }
+                let before = c.nodes[&victim].membership().clone();
+                let conf_before = conf(&c, victim);
+                let conf_index = c.nodes[&victim].log().conf_index().unwrap();
+                let fired = failpoint::fired(CLUSTER).len();
+                failpoint::arm_node(CLUSTER, point, 1, victim);
+                let crash = catch_unwind(AssertUnwindSafe(|| advance(&mut c, 1, peer())));
+                failpoint::disarm(CLUSTER);
+                let panic = crash.expect_err("admin entry did not crash");
+                assert_eq!(
+                    panic.downcast_ref::<String>().map(String::as_str),
+                    Some(format!("failpoint crash: {point}").as_str()),
+                    "k={k}, point={point}, node={victim}"
+                );
+                assert_eq!(failpoint::fired(CLUSTER)[fired..], [(point, Some(victim))]);
+                assert_eq!(failpoint::hits(CLUSTER, point), 1);
+                let after = c.nodes[&victim].membership().clone();
+                assert_ne!(after, before);
+                assert_eq!(after.next(), next);
+                assert_eq!(after.completed, u64::from(k == 5));
+                let persisted = if point == "node.admin.before" {
+                    &before
+                } else {
+                    &after
+                };
+                let log = c.nodes[&victim].log();
+                let disk = log
+                    .membership()
+                    .unwrap()
+                    .map_or_else(Membership::default, |bytes| {
+                        Membership::decode(&bytes).unwrap()
+                    });
+                assert_eq!(&disk, persisted, "k={k}, point={point}, node={victim}");
+                if point == "node.admin.before" {
+                    assert_eq!(log.conf_index().unwrap(), conf_index);
+                } else {
+                    assert!(log.conf_index().unwrap() > conf_index);
+                }
+                c.crash(victim);
+                c.restart(victim);
+                // Replica::new loads the durable membership without replaying entries.
+                assert_eq!(c.nodes[&victim].membership(), persisted);
+                assert_eq!(conf(&c, victim), conf_before);
+                c.pump();
+                leader(&mut c);
+                c.tick_all(2);
+                for id in [2, 3] {
+                    assert_eq!(c.nodes[&id].membership(), &after, "replay on node {id}");
+                }
+                assert_writes(&c, &expected, &[2, 3]);
+                finish(&mut c, &mut expected);
+                for id in [2, 3, 4] {
+                    assert_eq!(c.nodes[&id].membership().completed, 1);
+                    assert_eq!(
+                        c.nodes[&id]
+                            .membership()
+                            .retired
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>(),
+                        vec![1]
+                    );
+                    let saved = c.nodes[&id].membership().clone();
+                    c.crash(id);
+                    c.restart(id);
+                    assert_eq!(
+                        c.nodes[&id].membership(),
+                        &saved,
+                        "final restart on node {id}"
+                    );
+                }
+                assert_writes(&c, &expected, &[2, 3, 4]);
+            }
+        }
+    }
 }
 
 #[test]
