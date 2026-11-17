@@ -110,7 +110,7 @@ impl Context for SqlSession {
         SqlSession::row_version_engine(self, table, key)
     }
     fn scan(&mut self, scan: Scan) -> std::result::Result<SqlResult, CoreError> {
-        SqlSession::scan(self, scan)
+        SqlSession::scan_engine(self, scan)
     }
 }
 struct SnapshotContext {

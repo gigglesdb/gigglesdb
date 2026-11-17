@@ -562,7 +562,9 @@ impl SqlSession {
     /// Read within the current transaction, or a temporary read-only snapshot.
     /// `limit` is the page size (default 100); a zero size has no continuation.
     /// `matched` counts eligible rows after the key; `complete` means no more rows.
+    /// No server caller and no twin: refused in a task session (GD-0061 R3-301).
     pub fn read_page(&mut self, request: &Request, after: Option<&[Value]>, bindings: &Bindings) -> Result<Page> {
+        self.refuse_task_session().map_err(core)?;
         if self.is_aborted() { return Err(core(CoreError::Sql(SqlError::Aborted))); }
         let owned = !self.in_transaction();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

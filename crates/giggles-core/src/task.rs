@@ -34,6 +34,7 @@ pub(crate) mod undo;
 // R3-613: consumed by protected_commit (R3-615+) and outcome lookup.
 #[allow(dead_code)]
 pub(crate) mod receipt;
+pub mod release;
 pub mod statements;
 #[cfg(test)]
 mod statements_tests;
@@ -43,4 +44,5 @@ pub use admit::StatementClass;
 pub use commit::{inspect_outcome, outcome, protected_commit, Actor, ProtectedRequest};
 pub use ledger::{OperationId, Outcome};
 pub use receipt::Receipt;
+pub use release::{Page, ReleaseTag, Released, Unreleased};
 pub use error::{Budget, DenyRule, TaskError};

@@ -2498,7 +2498,14 @@ impl SqlSession {
             self.aborted = true;
         }
     }
+    /// A row exit with no twin: refused in a task session (GD-0061 R3-301).
     pub fn scan(&mut self, scan: relational::Scan) -> Result<relational::SqlResult, CoreError> {
+        self.refuse_task_session()?;
+        self.scan_engine(scan)
+    }
+    /// `scan` for crate-internal steps (complete native inputs, claims), whose
+    /// own exits carry the release tag.
+    pub(crate) fn scan_engine(&mut self, scan: relational::Scan) -> Result<relational::SqlResult, CoreError> {
         #[cfg(feature = "engine-rocksdb")]
         if let Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
@@ -3398,6 +3405,7 @@ impl SqlSession {
         prepared: &relational::Prepared,
         rows: Vec<Vec<relational::Value>>,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.refuse_task_session()?;
         let prepared = match prepared.copy_rows(rows, None) {
             Ok(p) => p,
             Err(e) => {
@@ -3413,6 +3421,7 @@ impl SqlSession {
         rows: Vec<Vec<relational::Value>>,
         clock: &relational::StatementClock,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.refuse_task_session()?;
         let context = relational::clock::ExecutionClock::new(clock);
         let prepared = match prepared.copy_rows(rows, Some(&context)) {
             Ok(p) => p,
@@ -3423,12 +3432,23 @@ impl SqlSession {
         };
         self.execute_prepared_at(&prepared, &[], None, clock)
     }
+    /// Plain exit for trusted local callers. A task session is refused before
+    /// anything runs (GD-0061 R3-301); task callers use `execute_unreleased`.
     pub fn execute(
         &mut self,
         sql: &str,
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.refuse_task_session()?;
+        self.execute_unreleased(sql, params, expected_version)?.untasked()
+    }
+    pub fn execute_unreleased(
+        &mut self,
+        sql: &str,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+    ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         relational::assert_sql_frontend_allowed();
         // ROLLBACK remains available after any parse/bind/statement/commit error.
         if self.aborted {
@@ -3440,12 +3460,13 @@ impl SqlSession {
                 return Err(CoreError::Sql(relational::SqlError::Parameters));
             }
             if p.control() == Some("rollback") {
+                let tag = self.release_tag();
                 self.rollback();
-                return Ok(Default::default());
+                return Ok(crate::task::release::Unreleased::new(Default::default(), tag));
             }
         }
         let p = self.prepare(sql)?;
-        self.execute_prepared(&p, params, expected_version)
+        self.execute_prepared_unreleased(&p, params, expected_version)
     }
     /// Execute using caller-supplied transaction, statement and wall time.
     pub fn execute_at(
@@ -3455,10 +3476,20 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: &relational::StatementClock,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.refuse_task_session()?;
+        self.execute_at_unreleased(sql, params, expected_version, clock)?.untasked()
+    }
+    pub fn execute_at_unreleased(
+        &mut self,
+        sql: &str,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: &relational::StatementClock,
+    ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         relational::assert_sql_frontend_allowed();
         self.guard_clock(clock)?;
         let p = self.prepare(sql)?;
-        self.execute_prepared_at(&p, params, expected_version, clock)
+        self.execute_prepared_at_unreleased(&p, params, expected_version, clock)
     }
     pub fn execute_prepared_at(
         &mut self,
@@ -3467,6 +3498,16 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: &relational::StatementClock,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.refuse_task_session()?;
+        self.execute_prepared_at_unreleased(p, params, expected_version, clock)?.untasked()
+    }
+    pub fn execute_prepared_at_unreleased(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: &relational::StatementClock,
+    ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         relational::assert_sql_frontend_allowed();
         self.guard_clock(clock)?;
         let context = relational::clock::ExecutionClock::new(clock)
@@ -3516,8 +3557,17 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.refuse_task_session()?;
+        self.execute_prepared_unreleased(p, params, expected_version)?.untasked()
+    }
+    pub fn execute_prepared_unreleased(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+    ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         relational::assert_sql_frontend_allowed();
-        self.execute_bound_engine(p, params, expected_version)
+        self.execute_bound_clocked(p, params, expected_version, None)
     }
     /// Trusted Admin entry point. Gateways must authorize the typed source first.
     pub fn describe_typed_read(&mut self, read: relational::SingleSourceRead) -> Result<relational::Description, CoreError> {
@@ -3527,10 +3577,15 @@ impl SqlSession {
     }
     /// Typed leaf reads use the same transaction/snapshot kernel as prepared SQL.
     pub fn execute_typed_read(&mut self, read: relational::SingleSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
+        self.refuse_task_session()?;
+        self.execute_typed_read_unreleased(read, expected_version)?.untasked()
+    }
+    pub fn execute_typed_read_unreleased(&mut self, read: relational::SingleSourceRead, expected_version: Option<u64>)
+        -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         let p = self.prepare_typed_read(vec![read.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_single_source_read(domain, epoch, read))?;
         // Native reads materialise their whole result: keep the result budget.
-        relational::spill::bounded(|| self.execute_bound_engine(&p, &[], expected_version))
+        relational::spill::bounded(|| self.execute_bound_clocked(&p, &[], expected_version, None))
     }
     /// Trusted Admin entry point; gateways must authorize both source tables first.
     pub fn describe_typed_join(&mut self, read: relational::TwoSourceRead) -> Result<relational::Description, CoreError> {
@@ -3539,13 +3594,20 @@ impl SqlSession {
         self.describe_bound_engine(&p)
     }
     pub fn execute_typed_join(&mut self, read: relational::TwoSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
+        self.refuse_task_session()?;
+        self.execute_typed_join_unreleased(read, expected_version)?.untasked()
+    }
+    pub fn execute_typed_join_unreleased(&mut self, read: relational::TwoSourceRead, expected_version: Option<u64>)
+        -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         let p = self.prepare_typed_read(vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_two_source_read(domain, epoch, read))?;
-        relational::spill::bounded(|| self.execute_bound_engine(&p, &[], expected_version))
+        relational::spill::bounded(|| self.execute_bound_clocked(&p, &[], expected_version, None))
     }
     /// Trusted Admin entry point; gateways authorize the target and every source first.
     pub fn execute_typed_insert_select(&mut self, insert: relational::TypedInsertSelect,
         expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
+        // Counts only, and refused by `admit()`: the guard, no twin (R3-301).
+        self.refuse_task_session()?;
         let target = insert.table.replace('.', "\0");
         let p = self.prepare_typed_read(vec![target], |domain, epoch|
             relational::Prepared::from_typed_insert_select(domain, epoch, insert))?;
@@ -3576,23 +3638,39 @@ impl SqlSession {
     // Both frontends enter this kernel after constructing typed operations.
     // Keep SQL's public prepared-call boundary separate so native execution
     // cannot acquire a dependency on SQL routine dispatch or frontend policy.
+    // Crate-internal steps only (transaction control, typed DDL, native
+    // steps and views): they run inside an exit that carries the release tag
+    // or refuses a task session, so their intermediate rows never leave core.
     fn execute_bound_engine(
         &mut self,
         p: &relational::Prepared,
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
-        self.execute_bound_clocked(p, params, expected_version, None)
+        self.execute_bound_kernel(p, params, expected_version, None)
     }
-    // A spilled v2 RETURNING or SELECT result is materialised here unless the
-    // caller streams it (`relational::spill::streaming`); errors and unwinds drop it.
+    /// The statement kernel. Its result carries the task's release tag
+    /// (GD-0061 R3-301); only `release` or `untasked` take the value out.
     fn execute_bound_clocked(
         &mut self,
         p: &relational::Prepared,
         params: &[relational::Value],
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
+    ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
+        let tag = self.release_tag();
+        self.execute_bound_kernel(p, params, expected_version, clock)
+            .map(|result| crate::task::release::Unreleased::new(result, tag))
+    }
+    fn execute_bound_kernel(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
+        // A spilled v2 RETURNING or SELECT result is materialised here unless the
+        // caller streams it (`relational::spill::streaming`); errors and unwinds drop it.
         relational::spill::statement(|| self.execute_bound_clocked_once(p, params, expected_version, clock))
     }
     fn execute_bound_clocked_once(

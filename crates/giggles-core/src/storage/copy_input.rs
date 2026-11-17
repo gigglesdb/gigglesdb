@@ -18,6 +18,8 @@ impl SqlSession {
     /// Start bounded COPY input on v2. Legacy callers retain buffered ingestion.
     /// Abort or dropping this session discards unfinished input.
     pub fn begin_copy_input(&mut self) -> Result<bool, CoreError> {
+        // COPY is refused by `admit()`; the guard backs it (GD-0061 R3-301).
+        self.refuse_task_session()?;
         if !matches!(self.admin.inner.backend, Backend::V2(_)) {
             return Ok(false);
         }
@@ -40,6 +42,7 @@ impl SqlSession {
     pub fn feed_copy_input_at(&mut self, prepared: &relational::Prepared,
         rows: Vec<Vec<relational::Value>>, clock: &relational::StatementClock,
     ) -> Result<(), CoreError> {
+        self.refuse_task_session()?;
         if self.copy_input.is_none() || rows.len() > 200 {
             self.abort();
             return Err(CoreError::Sql(relational::SqlError::Limit));
@@ -59,6 +62,7 @@ impl SqlSession {
     pub fn finish_copy_input_at(&mut self, prepared: &relational::Prepared,
         clock: &relational::StatementClock,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.refuse_task_session()?;
         self.copy_input.as_mut().ok_or(CoreError::Sql(relational::SqlError::Transaction))?.finishing = true;
         self.copy_input.as_mut().expect("active COPY").executing = true;
         let result = self.ingest_copy_at(prepared, vec![], clock);

@@ -11,6 +11,8 @@ pub const DEFAULT_CURSOR_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 pub struct Cursor {
     data: Data,
     clock: Option<relational::clock::ExecutionClock>,
+    /// The task statement's release tag (GD-0061 R3-301); `None` outside a task session.
+    tag: Option<Arc<crate::task::release::ReleaseTag>>,
 }
 enum Data {
     Scan {
@@ -28,7 +30,25 @@ fn row_size(row: &SqlRow) -> usize {
 impl Cursor {
     /// Fetch a bounded chunk. A row larger than max_bytes returns 54000 without
     /// dropping that row. Zero budgets are rejected. Exhaustion is sticky.
+    ///
+    /// Plain exit for trusted local callers: a task session's cursor is refused
+    /// before it advances. Task callers use `fetch_unreleased`.
     pub fn fetch(&mut self, max_rows: usize, max_bytes: usize) -> Result<Vec<SqlRow>, CoreError> {
+        if self.tag.is_some() {
+            return Err(crate::task::release::refusal());
+        }
+        self.fetch_unreleased(max_rows, max_bytes)?.untasked()
+    }
+    /// `fetch`, with the chunk held until `SqlSession::release_page`.
+    pub fn fetch_unreleased(
+        &mut self,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<crate::task::release::Unreleased<Vec<SqlRow>>, CoreError> {
+        let rows = self.fetch_rows(max_rows, max_bytes)?;
+        Ok(crate::task::release::Unreleased::new(rows, self.tag.clone()))
+    }
+    fn fetch_rows(&mut self, max_rows: usize, max_bytes: usize) -> Result<Vec<SqlRow>, CoreError> {
         crate::cancellation::check()?;
         if max_rows == 0 || max_bytes == 0 {
             return Err(CoreError::Sql(SqlError::Limit));
@@ -271,6 +291,7 @@ impl SqlSession {
                         plan: Box::new(plan),
                     },
                     clock: context,
+                    tag: self.release_tag(),
                 }),
                 None => self.buffer_cursor(&p, params, clock, buffer_limit),
             }
@@ -289,17 +310,20 @@ impl SqlSession {
     ) -> Result<Cursor, CoreError> {
         let (result, spilled) = relational::spill::streaming(|| {
             scan::with_cursor_limit(limit, || match clock {
-                Some(clock) => self.execute_prepared_at(p, params, None, clock),
-                None => self.execute_prepared(p, params, None),
+                Some(clock) => self.execute_prepared_at_unreleased(p, params, None, clock),
+                None => self.execute_prepared_unreleased(p, params, None),
             })
         });
-        let result = result?;
+        // A spilled result keeps the statement's tag: every page still goes
+        // through `release_page` (GD-0061 R3-301).
+        let (result, tag) = result?.into_parts();
         Ok(Cursor {
             data: match spilled {
                 Some(rows) => Data::Spilled(rows, None),
                 None => Data::Buffered(result.rows.into()),
             },
             clock: None,
+            tag,
         })
     }
 }

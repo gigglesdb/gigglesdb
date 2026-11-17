@@ -28,6 +28,7 @@ pub mod local;
 pub mod operations;
 pub mod relational;
 pub mod task;
+pub use task::release::{ReleaseTag, Released, Unreleased};
 
 pub mod cancellation;
 pub use cancellation::Cancellation;

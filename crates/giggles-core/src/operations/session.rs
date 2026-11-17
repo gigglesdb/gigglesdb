@@ -4,7 +4,20 @@ use super::*;
 impl SqlSession {
     /// Execute against this session's snapshot. An idle session owns its
     /// transaction; an existing transaction remains provisional until COMMIT.
+    ///
+    /// Plain exit for trusted local callers: a task session is refused before
+    /// anything runs (GD-0061 R3-301). Task callers use `execute_native_unreleased`.
     pub fn execute_native(&mut self, request: &Request, bindings: &Bindings) -> Result<Outcome> {
+        self.refuse_task_session().map_err(core)?;
+        self.execute_native_unreleased(request, bindings)?.untasked().map_err(core)
+    }
+
+    pub fn execute_native_unreleased(
+        &mut self,
+        request: &Request,
+        bindings: &Bindings,
+    ) -> Result<crate::task::release::Unreleased<Outcome>> {
+        let tag = self.release_tag();
         let v2 = self.is_v2_engine();
         self.native_scope(
             false,
@@ -17,17 +30,32 @@ impl SqlSession {
                 run_complete(session, &table, operation, None)
             },
         )
+        .map(|outcome| crate::task::release::Unreleased::new(outcome, tag))
     }
 
     /// A block stages as a unit into an outer transaction. Failure aborts that
     /// transaction; this API does not introduce nested commits or savepoints.
     /// V2 binds all steps upfront, then runs each with a fresh READ COMMITTED
     /// snapshot plus its own writes. Legacy retains one snapshot for the block.
+    ///
+    /// Plain exit; refused in a task session like `execute_native`.
     pub fn execute_native_transaction(
         &mut self,
         block: &Transaction,
         bindings: &Bindings,
     ) -> Result<TransactionOutcome> {
+        self.refuse_task_session().map_err(core)?;
+        self.execute_native_transaction_unreleased(block, bindings)?
+            .untasked()
+            .map_err(core)
+    }
+
+    pub fn execute_native_transaction_unreleased(
+        &mut self,
+        block: &Transaction,
+        bindings: &Bindings,
+    ) -> Result<crate::task::release::Unreleased<TransactionOutcome>> {
+        let tag = self.release_tag();
         let v2 = self.is_v2_engine();
         self.native_scope(
             block.read_only,
@@ -40,6 +68,7 @@ impl SqlSession {
                 transaction::run_transaction(session, &plan)
             },
         )
+        .map(|outcome| crate::task::release::Unreleased::new(outcome, tag))
     }
 
     pub(super) fn native_scope<T>(
