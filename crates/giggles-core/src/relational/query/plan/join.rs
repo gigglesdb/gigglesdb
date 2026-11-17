@@ -1531,7 +1531,10 @@ mod tests {
         assert_eq!(
             Prepared::task_class_of_sql("SELECT * FROM ja CROSS JOIN information_schema.tables")
                 .unwrap(),
-            crate::task::StatementClass::Catalog
+            // GD-0061: agents admit Catalog, and the planner path has no task
+            // catalog filtering or row scope yet, so every planner statement is
+            // Other in a task session, catalog relations included.
+            crate::task::StatementClass::Other
         );
     }
     #[test]
