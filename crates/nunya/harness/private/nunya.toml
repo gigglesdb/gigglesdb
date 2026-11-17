@@ -1,0 +1,20 @@
+listen = "0.0.0.0:6432"
+allow_plaintext = true
+admin_listen = "127.0.0.1:6480"
+policy = "/etc/nunya/policy.toml"
+state_dir = "/var/lib/nunya"
+root_key_file = "/etc/nunya/root.key"
+schemas = ["public"]
+search_path = ["public"]
+[upstream]
+host = "db"
+port = 5432
+user = "nunya"
+dbname = "app"
+tls = "disable"
+password_file = "/etc/nunya/upstream.password"
+[management]
+listen = "0.0.0.0:6481"
+[management.tls]
+cert_file = "/etc/nunya/management.pem"
+key_file = "/etc/nunya/management.key"

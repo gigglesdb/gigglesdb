@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 mode=pg
-if [[ ${1:-} == spanner ]]; then mode=spanner; shift; fi
-if [[ $# == 0 ]]; then
-  root=$(mktemp -d)
-elif [[ $# == 2 && $1 == --task-root ]]; then
-  root=$2
-else
-  echo 'usage: run.sh [spanner] [--task-root <directory>]' >&2; exit 1
-fi
+if [[ ${1:-} == spanner || ${1:-} == private ]]; then mode=$1; shift; fi
+root=$(mktemp -d)
+nunya_exe=${NUNYA_EXE:-nunya}
+linux_bin=
+while (( $# )); do
+  case "$1" in
+    --work-root) root=${2:?missing work root}; shift 2 ;;
+    --nunya-exe) nunya_exe=${2:?missing executable}; shift 2 ;;
+    --linux-bin) linux_bin=${2:?missing Linux binary}; shift 2 ;;
+    *) echo 'usage: run.sh [spanner|private] [--work-root DIR] [--nunya-exe PATH] [--linux-bin PATH]' >&2; exit 1 ;;
+  esac
+done
 mkdir -p "$root"
 root=$(cd "$root" && pwd -P)
-printf 'Task root: %s\n' "$root"
+printf 'Work root: %s\n' "$root"
 run="$root/nunya-harness-$$-$RANDOM"
 mkdir "$run" "$run/tmp"
 mkdir -p "$run/data/pg16/data" "$run/data/pg17/data" "$run/data/pg18"
@@ -34,9 +38,18 @@ if [[ $mode == spanner ]]; then
   read -r _ || true
   exit
 fi
+if ! nunya_exe=$(command -v "$nunya_exe"); then
+  echo 'Nunya executable not found; set NUNYA_EXE or --nunya-exe' >&2
+  exit 1
+fi
+if [[ $mode == private ]]; then
+  source "$source_dir/private/run.sh"
+  private_main
+  exit
+fi
 cp "$source_dir/compose.yaml" "$source_dir/seed.sql" "$run/"
 project="nunya-$$-$RANDOM"
-compose=(docker compose -p "$project" -f "$run/compose.yaml")
+compose=(docker compose -p "$project" -f "$run/compose.yaml" --profile dev)
 cleanup() { "${compose[@]}" down -v >"$run/down.log" 2>&1; }
 trap cleanup EXIT
 "${compose[@]}" up -d --wait --wait-timeout 180 >"$run/up.log" 2>&1

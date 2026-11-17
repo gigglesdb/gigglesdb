@@ -12,6 +12,7 @@ x-pg: &pg
     retries: 60
 services:
   pg16:
+    profiles: [dev]
     <<: *pg
     image: postgres:16-alpine
     volumes:
@@ -20,6 +21,7 @@ services:
       - ./data/pg16/data:/var/lib/postgresql/data
     ports: ["127.0.0.1:16432:5432"]
   pg17:
+    profiles: [dev]
     <<: *pg
     image: postgres:17-alpine
     volumes:
@@ -28,9 +30,51 @@ services:
       - ./data/pg17/data:/var/lib/postgresql/data
     ports: ["127.0.0.1:17432:5432"]
   pg18:
+    profiles: [dev]
     <<: *pg
     image: postgres:18-alpine
     volumes:
       - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
       - ./data/pg18:/var/lib/postgresql
     ports: ["127.0.0.1:18432:5432"]
+  db:
+    <<: *pg
+    profiles: [private]
+    image: postgres:18.6
+    pull_policy: never
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+      - ./data/db:/var/lib/postgresql
+    networks: [db]
+  nunya:
+    profiles: [private]
+    image: postgres:18.6
+    pull_policy: never
+    entrypoint: [/opt/nunya/nunya, serve, --config, /etc/nunya/nunya.toml]
+    volumes:
+      - ./bin/nunya:/opt/nunya/nunya:ro
+      - ./config:/etc/nunya:ro
+      - state:/var/lib/nunya
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [db, tool, edge]
+    ports:
+      - "127.0.0.1:${NUNYA_PG_PORT:-26432}:6432"
+      - "127.0.0.1:${NUNYA_MGMT_PORT:-26481}:6481"
+    healthcheck:
+      test: [CMD, /opt/nunya/nunya, principal, list, --server, "unix:/var/lib/nunya/nunya.sock"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+volumes:
+  state:
+    labels:
+      gd81-d1: "1"
+networks:
+  db:
+    internal: true
+  tool:
+    internal: true
+  edge:
+    driver: bridge
