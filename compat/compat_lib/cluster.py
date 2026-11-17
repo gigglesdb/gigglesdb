@@ -15,6 +15,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -176,6 +177,60 @@ def node_configs(root, pki, ports, fingerprints, cluster_id, tick_ms=TICK_MS):
     return configs
 
 
+def validate_ranges(nodes, gateway):
+    if not 3 <= nodes <= 6:
+        raise ValueError('--cluster-nodes must be between 3 and 6')
+    if not 1 <= gateway <= nodes:
+        raise ValueError('--gateway must be between 1 and --cluster-nodes')
+
+
+def range_node_configs(root, pki, ports, fingerprints, cluster_id):
+    """Copy the R5 config logic from scripts/cluster-exit/kit.py (no import)."""
+    validate_ranges(len(ports), 1)
+    configs = node_configs(root, pki, ports, fingerprints, cluster_id)
+    split_keys = [(bytes([tag]) + n.to_bytes(8, 'big')).hex()
+                  for tag in (0x80, 0x90) for n in range(1, 9)]
+    for config in configs:
+        config['cluster'] = config.pop('replication')
+        config['cluster'].update(initial_members=list(range(1, len(ports) + 1)), split_keys=split_keys)
+        config['postgresql'].update(loopback_trust=True)
+        config['postgresql'].pop('databases')
+    return configs
+
+
+def select_one(port, timeout):
+    """Stdlib-only PostgreSQL simple-query readiness probe for loopback trust."""
+    with socket.create_connection(('127.0.0.1', port), timeout=timeout) as connection:
+        deadline = time.monotonic() + timeout
+        def receive(size):
+            data = b''
+            while len(data) < size:
+                connection.settimeout(max(.001, deadline - time.monotonic()))
+                part = connection.recv(size - len(data))
+                if not part:
+                    raise OSError('EOF during PostgreSQL readiness')
+                data += part
+            return data
+        startup = b'\x00\x03\x00\x00user\x00postgres\x00database\x00postgres\x00\x00'
+        connection.sendall(struct.pack('!I', len(startup) + 4) + startup)
+        querying, rows = False, []
+        while True:
+            kind, length = receive(1), struct.unpack('!I', receive(4))[0]
+            if not 4 <= length <= 1024 * 1024:
+                raise OSError('invalid PostgreSQL readiness frame')
+            payload = receive(length - 4)
+            if kind == b'E' or (kind == b'R' and payload != b'\x00' * 4):
+                return False
+            if kind == b'D':
+                rows.append(payload)
+            if kind == b'Z':
+                if querying:
+                    return rows == [b'\x00\x01\x00\x00\x00\x011']
+                query = b'SELECT 1\x00'
+                connection.sendall(b'Q' + struct.pack('!I', len(query) + 4) + query)
+                querying = True
+
+
 def unique_leader(latest, alive):
     """Index of the single announced leader once every live node has announced."""
     if not all(latest[i] for i in range(len(latest)) if alive[i]):
@@ -201,6 +256,10 @@ class _Group:
 
 
 class ClusterServer:
+    nodes = NODES
+    config_builder = staticmethod(node_configs)
+    announcement = staticmethod(role_line)
+
     def __init__(self, source, run, env, password, server_args=()):
         if server_args:
             raise ValueError('--server-arg is not supported with --cluster (config-file mode has no --dev flags)')
@@ -216,7 +275,7 @@ class ClusterServer:
         self.binary = frozen
         self.meta = dict(binary_sha256=hashlib.sha256(frozen.read_bytes()).hexdigest(),
                          binary_size=frozen.stat().st_size, server_mode='replicated-3-leader')
-        self.cluster = dict(nodes=NODES, owner=OWNER, database=DATABASE, tick_ms=TICK_MS)
+        self.cluster = dict(mode='replication', nodes=self.nodes, owner=OWNER, database=DATABASE, tick_ms=TICK_MS)
         self.meta['cluster'] = self.cluster
 
     def _drain(self, index, process):
@@ -224,7 +283,7 @@ class ClusterServer:
             with (self.run/f'server-node{index + 1}.stdout.log').open('w', encoding='utf-8') as log:
                 for line in process.stdout:
                     log.write(redact(line, [self.password])); log.flush()
-                    values = role_line(line)
+                    values = self.announcement(line)
                     if values is not None:
                         record = dict(at=utc(), node=index + 1, line=redact(line.rstrip(), [self.password]))
                         with self.lock:
@@ -247,12 +306,12 @@ class ClusterServer:
         pki = root/'pki'
         root.mkdir(parents=True)
         from . import pins
-        self.cluster['pki'] = generate_pki(pki, self.env, pins.reference(pins.load()['postgres']))
-        fingerprints = [der_fingerprint((pki/f'node{n}.pem').read_text(encoding='utf-8')) for n in range(1, NODES + 1)]
-        flat = reserve_ports(NODES * 2)
-        ports = [(flat[2*i], flat[2*i + 1]) for i in range(NODES)]
+        self.cluster['pki'] = generate_pki(pki, self.env, pins.reference(pins.load()['postgres']), self.nodes)
+        fingerprints = [der_fingerprint((pki/f'node{n}.pem').read_text(encoding='utf-8')) for n in range(1, self.nodes + 1)]
+        flat = reserve_ports(self.nodes * 2)
+        ports = [(flat[2*i], flat[2*i + 1]) for i in range(self.nodes)]
         cluster_id = secrets.token_hex(16)
-        configs = node_configs(root, pki, ports, fingerprints, cluster_id)
+        configs = self.config_builder(root, pki, ports, fingerprints, cluster_id)
         self.cluster.update(cluster_id=cluster_id, fingerprints=fingerprints,
                             postgresql_ports=[p[0] for p in ports], replication_ports=[p[1] for p in ports])
         self.env['GIGGLES_OWNER_PASSWORD'] = self.password
@@ -268,6 +327,9 @@ class ClusterServer:
             self.processes.append(process)
             self._drain(i, process)
         self.process = _Group(self.processes)
+        return self._wait_ready(ports)
+
+    def _wait_ready(self, ports):
         latest, alive = [None]*NODES, [True]*NODES
         started = time.monotonic()
         deadline = started + READY_SECONDS
@@ -288,7 +350,7 @@ class ClusterServer:
         if values.get('postgresql') != f'127.0.0.1:{port}':
             raise RuntimeError('leader announced an unexpected PostgreSQL address: '+str(values.get('postgresql')))
         self.leader = leader
-        self.cluster.update(leader_node=leader + 1, leader_term=int(values.get('term', 0) or 0),
+        self.cluster.update(gateway=leader + 1, leader_node=leader + 1, leader_term=int(values.get('term', 0) or 0),
                             ready_s=round(time.monotonic() - started, 3), ready_at=utc())
         with self.lock:
             self.ready_events = len(self.history)
@@ -338,3 +400,54 @@ class ClusterServer:
         # moved mid-run, so later clients would reach a refusing follower port.
         self.cluster['role_events_after_ready'] = during
         self.cluster['leader_changes_after_ready'] = len(during)
+
+
+class RangeClusterServer(ClusterServer):
+    config_builder = staticmethod(range_node_configs)
+
+    def __init__(self, source, run, env, password, server_args=(), nodes=3, gateway=2):
+        validate_ranges(nodes, gateway)
+        self.nodes, self.gateway = nodes, gateway
+        super().__init__(source, run, env, password, server_args)
+        self.meta['server_mode'] = 'ranges'
+        self.cluster.update(mode='ranges', gateway=gateway)
+
+    @staticmethod
+    def announcement(line):
+        values = tokens(line)
+        return values if values.get('preview') == 'cluster' else None
+
+    def _wait_ready(self, ports):
+        started = time.monotonic()
+        deadline, announced = started + READY_SECONDS, set()
+        while len(announced) < self.nodes:
+            try:
+                index, values = self.events.get(timeout=max(.01, deadline - time.monotonic()))
+            except queue.Empty as exc:
+                raise RuntimeError('range cluster readiness timed out') from exc
+            if values is None:
+                raise RuntimeError(f'node {index + 1} exited before range readiness')
+            if (values.get('node'), values.get('postgresql')) != (str(index + 1), f'127.0.0.1:{ports[index][0]}'):
+                raise RuntimeError(f'node {index + 1} announced an unexpected identity or port')
+            announced.add(index)
+        pending = set(announced)
+        while pending:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('range cluster SELECT 1 readiness timed out')
+            for index in list(pending):
+                if self.processes[index].poll() is not None:
+                    raise RuntimeError(f'node {index + 1} exited during range readiness')
+                try:
+                    if select_one(ports[index][0], min(2, max(.01, deadline - time.monotonic()))):
+                        pending.remove(index)
+                except OSError:
+                    pass
+            if pending:
+                time.sleep(.05)
+        self.cluster.update(ready_s=round(time.monotonic() - started, 3), ready_at=utc(),
+                            process_ids=[process.pid for process in self.processes],
+                            select_one_nodes=list(range(1, self.nodes + 1)))
+        with self.lock:
+            self.ready_events = len(self.history)
+            self.meta['stdout_banner'] = [record['line'] for record in self.history]
+        return ports[self.gateway - 1][0]

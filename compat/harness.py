@@ -39,6 +39,9 @@ def parser():
         run.add_argument('--'+flag, action='store_true')
     run.add_argument('--cluster', action='store_true',
                      help='run every client against the leader of a three-process replicated cluster')
+    run.add_argument('--cluster-mode', choices=('replication', 'ranges'), default='replication')
+    run.add_argument('--cluster-nodes', type=int, choices=range(3, 7), default=3)
+    run.add_argument('--gateway', type=int, default=2, help='range gateway node (1..N; default 2)')
     observer = sub.add_parser('watch')
     observer.add_argument('--state', type=Path, default=Path('J:/gigglesdb-work/r0-harness/watch/state.json'))
     observer.add_argument('--seed-report', type=Path)
@@ -272,7 +275,12 @@ def _run(args, capture):
             raise RuntimeError('pinned oracle image unavailable: '+pins.reference(pinned['postgres'])+'; use --pull to permit fetching')
         network, pg_host, data['oracle'] = oracle.start(engine, pinned)
         if getattr(args, 'cluster', False):
-            server = cluster.ClusterServer(binary.resolve(strict=True), run, env, password, server_args=args.server_arg)
+            options = dict(server_args=args.server_arg)
+            server_class = cluster.ClusterServer
+            if args.cluster_mode == 'ranges':
+                server_class = cluster.RangeClusterServer
+                options.update(nodes=args.cluster_nodes, gateway=args.gateway)
+            server = server_class(binary.resolve(strict=True), run, env, password, **options)
         else:
             server = gigglesdb.Server(binary.resolve(strict=True), run, env, password, server_args=args.server_arg)
             data['build']['server_mode'] = 'single-node-dev'
@@ -372,6 +380,14 @@ def _run(args, capture):
 
 def run_once(argv=None, *, fail_if_build_busy=False):
     args = parser().parse_args(argv)
+    try:
+        cluster.validate_ranges(args.cluster_nodes, args.gateway)
+        if not args.cluster and (args.cluster_mode != 'replication' or args.cluster_nodes != 3 or args.gateway != 2):
+            raise ValueError('--cluster-mode, --cluster-nodes and --gateway require --cluster')
+        if args.cluster_mode == 'replication' and (args.cluster_nodes != 3 or args.gateway != 2):
+            raise ValueError('--cluster-nodes and --gateway overrides require --cluster-mode ranges')
+    except ValueError as exc:
+        parser().error(str(exc))
     capture = []
     try:
         try:

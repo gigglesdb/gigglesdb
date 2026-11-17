@@ -587,6 +587,10 @@ removes its temporary psql container before exiting. No product files change.
 
 ## Replicated cluster mode
 
+`--cluster-mode replication` is the default and retains the three-node leader gateway.
+`--cluster --cluster-mode ranges --cluster-nodes N` starts 3..6 range-cluster nodes (default 3).
+`--gateway K` chooses the range gateway, 1..N (default 2); reports record mode, N, K and all ports.
+
 `run --cluster` replaces the single `giggles-server --dev` process with three
 replicated `giggles-server` processes started from the same frozen binary
 (`compat_lib/cluster.py`) and runs every selected client and corpus case against

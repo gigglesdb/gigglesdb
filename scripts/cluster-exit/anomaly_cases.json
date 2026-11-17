@@ -1,0 +1,666 @@
+{
+  "source": "crates/giggles-server/tests/cluster_isolation.rs (git blob 06838ec0fcb2bbe20959a8673ecc882d68826cb9)",
+  "levels": [
+    "READ COMMITTED",
+    "REPEATABLE READ",
+    "SERIALIZABLE"
+  ],
+  "step_wait_s": 2,
+  "end_wait_s": 30,
+  "findings": [
+    [
+      "parent_delete_then_child_insert",
+      0
+    ],
+    [
+      "parent_delete_then_child_insert",
+      1
+    ],
+    [
+      "child_insert_then_parent_delete",
+      0
+    ],
+    [
+      "child_insert_then_parent_delete",
+      1
+    ]
+  ],
+  "again": [
+    "nonrepeatable_read",
+    "write_skew_row_reads",
+    "read_only_anomaly"
+  ],
+  "forms": [
+    "begin",
+    "session",
+    "set_transaction",
+    "set_transaction_batched"
+  ],
+  "union_finding": {
+    "setup": "CREATE TABLE p (id INT PRIMARY KEY); CREATE TABLE c (id INT PRIMARY KEY, p INT REFERENCES p (id)); INSERT INTO p VALUES (1), (2); INSERT INTO c VALUES (1, 1);",
+    "sql": "SELECT 'p', id FROM p UNION ALL SELECT 'c', id FROM c ORDER BY 1, 2",
+    "spec": "c|1,p|1,p|2"
+  },
+  "cases": [
+    {
+      "name": "parent_delete_then_child_insert",
+      "setup": "CREATE TABLE p (id INT PRIMARY KEY); CREATE TABLE c (id INT PRIMARY KEY, p INT REFERENCES p (id)); INSERT INTO p VALUES (1), (2);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "B",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "SELECT count(*) FROM p",
+          "2"
+        ],
+        [
+          "B",
+          "SELECT count(*) FROM c",
+          "0"
+        ],
+        [
+          "A",
+          "DELETE FROM p WHERE id = 1",
+          "DELETE 1"
+        ],
+        [
+          "B",
+          "INSERT INTO c VALUES (1, 1)",
+          "~E:23503;~E:40001;~E:40001 or INSERT 0 1"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT"
+        ],
+        [
+          "B",
+          "COMMIT",
+          "ROLLBACK;ROLLBACK;ROLLBACK or E:40001"
+        ]
+      ],
+      "fin": [
+        "SELECT 'c', id FROM c ORDER BY 2; SELECT 'p', id FROM p ORDER BY 2",
+        "p|2"
+      ]
+    },
+    {
+      "name": "child_insert_then_parent_delete",
+      "setup": "CREATE TABLE p (id INT PRIMARY KEY); CREATE TABLE c (id INT PRIMARY KEY, p INT REFERENCES p (id)); INSERT INTO p VALUES (1), (2);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "B",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "SELECT count(*) FROM p",
+          "2"
+        ],
+        [
+          "B",
+          "SELECT count(*) FROM c",
+          "0"
+        ],
+        [
+          "B",
+          "INSERT INTO c VALUES (1, 1)",
+          "INSERT 0 1"
+        ],
+        [
+          "A",
+          "DELETE FROM p WHERE id = 1",
+          "~E:23503;~E:23503;~E:23503 or DELETE 1"
+        ],
+        [
+          "B",
+          "COMMIT",
+          "COMMIT;COMMIT;COMMIT or ~E:40001 or E:40001"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "ROLLBACK;ROLLBACK;ROLLBACK or COMMIT"
+        ]
+      ],
+      "fin": [
+        "SELECT 'c', id FROM c ORDER BY 2; SELECT 'p', id FROM p ORDER BY 2",
+        "c|1,p|1,p|2;c|1,p|1,p|2;c|1,p|1,p|2 or p|2"
+      ]
+    },
+    {
+      "name": "lost_update",
+      "setup": "CREATE TABLE t (id int PRIMARY KEY, v int); INSERT INTO t VALUES (1, 0);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "B",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "SELECT v FROM t WHERE id = 1",
+          "0"
+        ],
+        [
+          "B",
+          "SELECT v FROM t WHERE id = 1",
+          "0"
+        ],
+        [
+          "A",
+          "UPDATE t SET v = v + 1 WHERE id = 1",
+          "UPDATE 1"
+        ],
+        [
+          "B",
+          "UPDATE t SET v = v + 1 WHERE id = 1",
+          "~UPDATE 1;~E:40001;~E:40001"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT"
+        ],
+        [
+          "B",
+          "COMMIT",
+          "COMMIT;ROLLBACK;ROLLBACK"
+        ]
+      ],
+      "fin": [
+        "SELECT v FROM t",
+        "2;1;1"
+      ]
+    },
+    {
+      "name": "write_skew",
+      "setup": "CREATE TABLE doctors (id int PRIMARY KEY, oncall boolean); INSERT INTO doctors VALUES (1, true), (2, true);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "B",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "SELECT count(*) FROM doctors WHERE oncall",
+          "2"
+        ],
+        [
+          "B",
+          "SELECT count(*) FROM doctors WHERE oncall",
+          "2"
+        ],
+        [
+          "A",
+          "UPDATE doctors SET oncall = false WHERE id = 1",
+          "UPDATE 1"
+        ],
+        [
+          "B",
+          "UPDATE doctors SET oncall = false WHERE id = 2",
+          "UPDATE 1"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT;COMMIT;COMMIT or ~COMMIT"
+        ],
+        [
+          "B",
+          "COMMIT",
+          "COMMIT;COMMIT;E:40001 or ~E:40001"
+        ]
+      ],
+      "fin": [
+        "SELECT count(*) FROM doctors WHERE oncall",
+        "0;0;1"
+      ]
+    },
+    {
+      "name": "write_skew_row_reads",
+      "setup": "CREATE TABLE t (id int PRIMARY KEY, v int); INSERT INTO t VALUES (1, 0), (2, 0);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "B",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "SELECT v FROM t WHERE id = 1",
+          "0"
+        ],
+        [
+          "B",
+          "SELECT v FROM t WHERE id = 2",
+          "0"
+        ],
+        [
+          "A",
+          "UPDATE t SET v = 1 WHERE id = 2",
+          "UPDATE 1"
+        ],
+        [
+          "B",
+          "UPDATE t SET v = 1 WHERE id = 1",
+          "UPDATE 1"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT;COMMIT;COMMIT or ~COMMIT"
+        ],
+        [
+          "B",
+          "COMMIT",
+          "COMMIT;COMMIT;E:40001 or ~E:40001"
+        ]
+      ],
+      "fin": [
+        "SELECT sum(v) FROM t",
+        "2;2;1"
+      ]
+    },
+    {
+      "name": "phantom_read",
+      "setup": "CREATE TABLE t (id int PRIMARY KEY, g int); INSERT INTO t VALUES (1, 1);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "SELECT count(*) FROM t WHERE g = 1",
+          "1"
+        ],
+        [
+          "B",
+          "INSERT INTO t VALUES (2, 1)",
+          "INSERT 0 1"
+        ],
+        [
+          "A",
+          "SELECT count(*) FROM t WHERE g = 1",
+          "2;1;1"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT"
+        ]
+      ],
+      "fin": [
+        "SELECT count(*) FROM t",
+        "2"
+      ]
+    },
+    {
+      "name": "phantom_write_skew",
+      "setup": "CREATE TABLE t (id int PRIMARY KEY, g int); INSERT INTO t VALUES (1, 1), (2, 2);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "B",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "SELECT count(*) FROM t WHERE g = 1",
+          "1"
+        ],
+        [
+          "B",
+          "SELECT count(*) FROM t WHERE g = 2",
+          "1"
+        ],
+        [
+          "A",
+          "INSERT INTO t VALUES (3, 2)",
+          "INSERT 0 1"
+        ],
+        [
+          "B",
+          "INSERT INTO t VALUES (4, 1)",
+          "INSERT 0 1"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT;COMMIT;COMMIT or ~COMMIT"
+        ],
+        [
+          "B",
+          "COMMIT",
+          "COMMIT;COMMIT;E:40001 or ~E:40001"
+        ]
+      ],
+      "fin": [
+        "SELECT count(*) FROM t",
+        "4;4;3"
+      ]
+    },
+    {
+      "name": "nonrepeatable_read",
+      "setup": "CREATE TABLE t (id int PRIMARY KEY, v int); INSERT INTO t VALUES (1, 0);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "SELECT v FROM t WHERE id = 1",
+          "0"
+        ],
+        [
+          "B",
+          "UPDATE t SET v = 7 WHERE id = 1",
+          "UPDATE 1"
+        ],
+        [
+          "A",
+          "SELECT v FROM t WHERE id = 1",
+          "7;0;0"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT"
+        ]
+      ],
+      "fin": [
+        "SELECT v FROM t",
+        "7"
+      ]
+    },
+    {
+      "name": "snapshot_at_first_statement",
+      "setup": "CREATE TABLE t (id int PRIMARY KEY, v int); INSERT INTO t VALUES (1, 0);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "B",
+          "UPDATE t SET v = 9 WHERE id = 1",
+          "UPDATE 1"
+        ],
+        [
+          "A",
+          "SELECT v FROM t WHERE id = 1",
+          "9"
+        ],
+        [
+          "B",
+          "UPDATE t SET v = 10 WHERE id = 1",
+          "UPDATE 1"
+        ],
+        [
+          "A",
+          "SELECT v FROM t WHERE id = 1",
+          "10;9;9"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT"
+        ]
+      ],
+      "fin": [
+        "SELECT v FROM t",
+        "10"
+      ]
+    },
+    {
+      "name": "read_only_anomaly",
+      "setup": "CREATE TABLE acct (id int PRIMARY KEY, bal int); INSERT INTO acct VALUES (1, 0), (2, 0);",
+      "steps": [
+        [
+          "B",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "B",
+          "SELECT sum(bal) FROM acct",
+          "0"
+        ],
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "UPDATE acct SET bal = bal + 20 WHERE id = 2",
+          "UPDATE 1"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT"
+        ],
+        [
+          "C",
+          "BEGIN ISOLATION LEVEL @LEVEL@ READ ONLY",
+          "BEGIN"
+        ],
+        [
+          "C",
+          "SELECT id, bal FROM acct ORDER BY id",
+          "1|0,2|20"
+        ],
+        [
+          "C",
+          "COMMIT",
+          "COMMIT"
+        ],
+        [
+          "B",
+          "UPDATE acct SET bal = bal - 11 WHERE id = 1",
+          "UPDATE 1;UPDATE 1;E:40001 or UPDATE 1"
+        ],
+        [
+          "B",
+          "COMMIT",
+          "COMMIT;COMMIT;ROLLBACK or E:40001"
+        ]
+      ],
+      "fin": [
+        "SELECT id, bal FROM acct ORDER BY id",
+        "1|-11,2|20;1|-11,2|20;1|0,2|20"
+      ]
+    },
+    {
+      "name": "delete_conflict",
+      "setup": "CREATE TABLE t (id int PRIMARY KEY, v int); INSERT INTO t VALUES (1, 0);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "B",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "SELECT v FROM t WHERE id = 1",
+          "0"
+        ],
+        [
+          "B",
+          "SELECT v FROM t WHERE id = 1",
+          "0"
+        ],
+        [
+          "A",
+          "DELETE FROM t WHERE id = 1",
+          "DELETE 1"
+        ],
+        [
+          "B",
+          "UPDATE t SET v = 5 WHERE id = 1",
+          "~UPDATE 0;~E:40001;~E:40001"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT"
+        ],
+        [
+          "B",
+          "SELECT v FROM t WHERE id = 1",
+          ";E:25P02;E:25P02"
+        ],
+        [
+          "B",
+          "COMMIT",
+          "COMMIT;ROLLBACK;ROLLBACK"
+        ]
+      ],
+      "fin": [
+        "SELECT count(*) FROM t",
+        "0"
+      ]
+    },
+    {
+      "name": "insert_conflict",
+      "setup": "CREATE TABLE t (id int PRIMARY KEY, v int);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "B",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "SELECT count(*) FROM t",
+          "0"
+        ],
+        [
+          "B",
+          "SELECT count(*) FROM t",
+          "0"
+        ],
+        [
+          "A",
+          "INSERT INTO t VALUES (1, 1)",
+          "INSERT 0 1"
+        ],
+        [
+          "B",
+          "INSERT INTO t VALUES (1, 2)",
+          "~E:23505;~E:23505 or ~E:40001;~E:40001"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT"
+        ],
+        [
+          "B",
+          "COMMIT",
+          "ROLLBACK"
+        ]
+      ],
+      "fin": [
+        "SELECT v FROM t",
+        "1"
+      ]
+    },
+    {
+      "name": "delete_recreate",
+      "setup": "CREATE TABLE t (id int PRIMARY KEY, v int); INSERT INTO t VALUES (1, 0);",
+      "steps": [
+        [
+          "A",
+          "BEGIN ISOLATION LEVEL @LEVEL@",
+          "BEGIN"
+        ],
+        [
+          "A",
+          "SELECT v FROM t WHERE id = 1",
+          "0"
+        ],
+        [
+          "B",
+          "DELETE FROM t WHERE id = 1",
+          "DELETE 1"
+        ],
+        [
+          "B",
+          "INSERT INTO t VALUES (1, 5)",
+          "INSERT 0 1"
+        ],
+        [
+          "A",
+          "SELECT v FROM t WHERE id = 1",
+          "5;0;0"
+        ],
+        [
+          "A",
+          "UPDATE t SET v = v + 1 WHERE id = 1",
+          "UPDATE 1;E:40001;E:40001"
+        ],
+        [
+          "A",
+          "COMMIT",
+          "COMMIT;ROLLBACK;ROLLBACK"
+        ]
+      ],
+      "fin": [
+        "SELECT v FROM t",
+        "6;5;5"
+      ]
+    }
+  ]
+}

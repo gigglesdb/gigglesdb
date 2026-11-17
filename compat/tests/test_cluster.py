@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -72,6 +73,60 @@ class ClusterTests(unittest.TestCase):
         import harness
         self.assertTrue(harness.parser().parse_args(['run', '--cluster']).cluster)
         self.assertFalse(harness.parser().parse_args(['run']).cluster)
+
+    def test_range_configs_three_to_six_nodes(self):
+        for nodes in range(3, 7):
+            ports = [(100 + n * 2, 101 + n * 2) for n in range(nodes)]
+            fingerprints = [str(n) * 64 for n in range(nodes)]
+            configs = cluster.range_node_configs(Path('root'), Path('pki'), ports, fingerprints, 'a' * 32)
+            self.assertEqual(len(configs), nodes)
+            for n, config in enumerate(configs):
+                self.assertNotIn('replication', config)
+                group = config['cluster']
+                self.assertEqual(group['node_id'], n + 1)
+                self.assertEqual(group['initial_members'], list(range(1, nodes + 1)))
+                self.assertEqual((group['cluster'], group['tick_ms'], group['owner']), ('a' * 32, 100, 'postgres'))
+                self.assertEqual(group['split_keys'],
+                                 [f'{tag:02x}{table:016x}' for tag in (0x80, 0x90) for table in range(1, 9)])
+                self.assertEqual(group['listen'], f'127.0.0.1:{ports[n][1]}')
+                self.assertEqual(group['peers'], [dict(id=j + 1, address=f'127.0.0.1:{ports[j][1]}',
+                                                     fingerprint=fingerprints[j]) for j in range(nodes) if j != n])
+                self.assertEqual(config['postgresql'], dict(listen=f'127.0.0.1:{ports[n][0]}',
+                                                           tls='disabled', loopback_trust=True))
+
+    def test_range_argument_validation_without_startup(self):
+        import harness
+        defaults = harness.parser().parse_args(['run', '--cluster'])
+        self.assertEqual((defaults.cluster_mode, defaults.cluster_nodes, defaults.gateway), ('replication', 3, 2))
+        for nodes in range(3, 7):
+            for gateway in range(1, nodes + 1):
+                cluster.validate_ranges(nodes, gateway)
+        for flags in (['--cluster-nodes', '2'], ['--cluster-nodes', '7'], ['--gateway', '0'],
+                      ['--gateway', '4'], ['--cluster-mode', 'invalid'], ['--cluster-mode', 'ranges'],
+                      ['--cluster', '--cluster-nodes', '4'], ['--cluster', '--gateway', '1']):
+            with self.subTest(flags=flags), self.assertRaises(SystemExit), patch('compat_lib.util.output_root') as output:
+                harness.run_once(['run', *flags])
+            output.assert_not_called()
+
+    def test_range_readiness_probes_every_node_and_returns_gateway(self):
+        with tempfile.TemporaryDirectory(dir=_STORAGE.root) as directory:
+            server = cluster.RangeClusterServer(Path(__file__), Path(directory), {}, 'pw', nodes=6, gateway=4)
+            ports = [(100 + n * 2, 101 + n * 2) for n in range(6)]
+            server.processes = [Mock(pid=n + 1000, poll=Mock(return_value=None)) for n in range(6)]
+            for n in reversed(range(6)):
+                values = server.announcement(f'preview=cluster node={n + 1} postgresql=127.0.0.1:{ports[n][0]}')
+                server.events.put((n, values))
+            with patch.object(cluster, 'select_one', return_value=True) as probe:
+                self.assertEqual(server._wait_ready(ports), ports[3][0])
+            self.assertEqual({call.args[0] for call in probe.call_args_list}, {p[0] for p in ports})
+            self.assertEqual((server.cluster['mode'], server.cluster['nodes'], server.cluster['gateway']), ('ranges', 6, 4))
+            self.assertEqual(server.cluster['select_one_nodes'], list(range(1, 7)))
+            self.assertIsNone(server.announcement('preview=replicated role=leader'))
+
+    def test_range_constructor_rejects_invalid_sizes_before_writing(self):
+        for nodes, gateway in ((2, 1), (7, 1), (3, 0), (3, 4)):
+            with self.assertRaises(ValueError):
+                cluster.RangeClusterServer(Path(__file__), Path('never-created'), {}, 'pw', nodes=nodes, gateway=gateway)
 
 
 if __name__ == '__main__':
