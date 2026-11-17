@@ -156,8 +156,12 @@ impl TsOracle for SystemRange {
         self.check_open()?;
         let n = u64::from(n.max(1));
         let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
+        // R5-101: timestamps follow the leader's clock (never below now_ms << 16), so a
+        // timestamp's ms part is a wall time the GC TTL (engine/reclaim.rs) can compare with.
+        let now = (self.now_ms)() << 16;
+        window.next = window.next.max(now);
         if window.next.saturating_add(n) > window.limit {
-            let from = ((self.now_ms)() << 16).max(window.limit).max(window.next);
+            let from = now.max(window.limit).max(window.next);
             let limit = from
                 .checked_add(self.width.max(n))
                 .ok_or_else(|| RangeError::Corrupt("timestamp space exhausted".into()))?;

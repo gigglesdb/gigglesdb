@@ -459,7 +459,10 @@ fn engine(store: &RangeStore, descriptor: RangeDescriptor) -> Arc<RangeEngine> {
         descriptor,
         Arc::new(NoSink),
         oracle,
-        EngineConfig::default(),
+        EngineConfig {
+            gc_ttl: std::time::Duration::MAX,
+            ..EngineConfig::default()
+        },
         1,
     )
     .unwrap()

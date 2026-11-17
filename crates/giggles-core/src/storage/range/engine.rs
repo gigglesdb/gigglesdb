@@ -22,7 +22,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -55,6 +55,7 @@ mod home_log;
 mod locking;
 pub(super) mod prepared;
 mod read;
+pub(crate) mod reclaim;
 mod txns;
 
 #[cfg(test)]
@@ -80,6 +81,11 @@ pub(crate) struct EngineConfig {
     pub(crate) recovery: RecoveryConfig,
     /// Period of the recovery worker.
     pub(crate) recovery_tick: Duration,
+    /// R5-101: reads older than now - gc_ttl are refused, and dropped tables' and indexes'
+    /// key runs whose drop is older than that are reclaimed (as CockroachDB's gc.ttl).
+    pub(crate) gc_ttl: Duration,
+    /// How often the reclaim worker runs a pass on every open engine.
+    pub(crate) reclaim_every: Duration,
 }
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -90,6 +96,8 @@ impl Default for EngineConfig {
             resolve_after: Duration::from_millis(250),
             recovery: RecoveryConfig::default(),
             recovery_tick: Duration::from_secs(1),
+            gc_ttl: Duration::from_secs(4 * 60 * 60),
+            reclaim_every: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -510,8 +518,8 @@ impl RangeService for RangeEngine {
 }
 
 /// R5-52: one home-record recovery pass on every open engine each `tick`, until the sender of
-/// `stop` (the `RangeEngines`) is dropped. Holds only weak references; errors wait for the
-/// next tick.
+/// `stop` (the `RangeEngines`) is dropped.
+/// Holds only weak references; errors wait for the next tick.
 fn spawn_recovery(
     open: Weak<OpenEngines>,
     client: Weak<dyn RangeClient>,
@@ -558,6 +566,8 @@ pub(crate) struct RangeEngines {
     client: OnceLock<Weak<dyn RangeClient>>,
     /// Dropped with `self`, which stops the recovery worker.
     recovery_stop: OnceLock<mpsc::Sender<()>>,
+    reclaim_stop: OnceLock<mpsc::Sender<()>>,
+    pub(crate) reclaim_errors: Arc<AtomicU64>,
 }
 
 impl RangeEngines {
@@ -575,12 +585,15 @@ impl RangeEngines {
             system: Mutex::new(None),
             client: OnceLock::new(),
             recovery_stop: OnceLock::new(),
+            reclaim_stop: OnceLock::new(),
+            reclaim_errors: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Gives the node's engines a client for other ranges: engines opened from now on resolve
     /// prepared records through their homes (R5-53), and one worker thread runs home-record
-    /// recovery (R5-52) on every open engine each `recovery_tick` until `self` is dropped.
+    /// recovery (R5-52) on every open engine each `recovery_tick`, and a separate worker reclaims
+    /// every `reclaim_every`, until `self` is dropped.
     /// Weak, because the client normally owns the engines. Set once; later calls are ignored.
     pub(crate) fn set_client(&self, client: Weak<dyn RangeClient>) {
         if self.client.set(client.clone()).is_err() {
@@ -588,12 +601,23 @@ impl RangeEngines {
         }
         let (stop, stopped) = mpsc::channel();
         let _ = self.recovery_stop.set(stop);
+        #[cfg(test)]
+        reclaim::hooks::register(&client, &self.open, &self.store, &self.reclaim_errors);
         spawn_recovery(
             Arc::downgrade(&self.open),
-            client,
+            client.clone(),
             stopped,
             self.config.recovery,
             self.config.recovery_tick,
+        );
+        let (stop, stopped) = mpsc::channel();
+        let _ = self.reclaim_stop.set(stop);
+        reclaim::spawn(
+            Arc::downgrade(&self.open),
+            client,
+            stopped,
+            self.config.reclaim_every,
+            self.reclaim_errors.clone(),
         );
     }
 

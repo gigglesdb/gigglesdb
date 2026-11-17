@@ -35,6 +35,10 @@ pub struct EngineSettings {
     pub finish_after: Duration,
     /// Period of the home-record recovery worker.
     pub recovery_tick: Duration,
+    /// Reads older than this TTL are refused.
+    pub gc_ttl: Duration,
+    /// Period of the independent dropped-object reclaim worker.
+    pub reclaim_every: Duration,
 }
 
 impl Default for EngineSettings {
@@ -48,6 +52,8 @@ impl Default for EngineSettings {
             recover_after: config.recovery.recover_after,
             finish_after: config.recovery.finish_after,
             recovery_tick: config.recovery_tick,
+            gc_ttl: config.gc_ttl,
+            reclaim_every: config.reclaim_every,
         }
     }
 }
@@ -64,6 +70,8 @@ impl EngineSettings {
                 finish_after: self.finish_after,
             },
             recovery_tick: self.recovery_tick,
+            gc_ttl: self.gc_ttl,
+            reclaim_every: self.reclaim_every,
         }
     }
 }

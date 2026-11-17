@@ -80,6 +80,9 @@ pub(super) fn config() -> EngineConfig {
         resolve_after: Duration::from_millis(50),
         recovery: RecoveryConfig::default(),
         recovery_tick: Duration::from_millis(20),
+        // The fake oracle's timestamps are far below any wall-clock floor.
+        gc_ttl: Duration::MAX,
+        ..EngineConfig::default()
     }
 }
 impl Fixture {

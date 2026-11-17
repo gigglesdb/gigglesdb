@@ -572,6 +572,7 @@ fn a_coordinator_killed_at_every_step_leaves_one_outcome_readers_resolve() {
                 finish_after: Duration::from_millis(100),
             },
             recovery_tick: Duration::from_millis(50),
+            ..engine_config()
         },
     );
     let reader = services(&cluster, ClusterConfig::default());

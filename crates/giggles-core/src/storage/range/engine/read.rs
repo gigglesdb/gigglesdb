@@ -2,6 +2,7 @@
 use std::ops::Bound;
 use std::time::Instant;
 
+use super::reclaim::MAX_CLOCK_OFFSET;
 use super::{RangeEngine, ts, txn_error};
 use crate::storage::engine::{codec, hlc::Ts, kv::KvRead};
 use crate::storage::range::keys::{cf_interval, is_versioned, keyspace_of};
@@ -10,10 +11,6 @@ use crate::storage::range_api::{
 };
 
 type Raw = Bound<Vec<u8>>;
-
-/// How far a read timestamp may be ahead of this node's wall clock (oracle timestamps are
-/// `ms << 16 | logical` refilled from the system leader's clock).
-const MAX_AHEAD_MS: u64 = 10 * 60 * 1000;
 
 /// The tighter of two lower bounds.
 fn max_start(a: Raw, b: Raw) -> Raw {
@@ -121,12 +118,19 @@ impl RangeEngine {
         // served floor for good and stop every later commit here (E67 S4).
         let horizon = (crate::storage::engine::commit::Clock::now_ms(
             &crate::storage::engine::commit::SystemClock,
-        ) + MAX_AHEAD_MS)
+        ) + MAX_CLOCK_OFFSET)
             << 16;
         if req.ts.0 > horizon {
             return Err(RangeError::Corrupt(
                 "read timestamp is ahead of the timestamp oracle".into(),
             ));
+        }
+        // R5-101: data retired before now - gc_ttl may be reclaimed; never serve below it.
+        if req.ts.0 < super::reclaim::floor_now(self.config.gc_ttl) {
+            return Err(RangeError::Conflict(format!(
+                "snapshot older than the GC TTL ({:?})",
+                self.config.gc_ttl
+            )));
         }
         let start = max_start(req.start.clone(), lo);
         let end = min_end(req.end.clone(), hi);
@@ -264,6 +268,13 @@ impl RangeEngine {
             ReadDirection::Forward => crate::storage::engine::kv::Direction::Forward,
             ReadDirection::Reverse => crate::storage::engine::kv::Direction::Reverse,
         };
+        // Waits may have crossed the GC floor; check again before taking the KV snapshot.
+        if req.ts.0 < super::reclaim::floor_now(self.config.gc_ttl) {
+            return Err(RangeError::Conflict(format!(
+                "snapshot older than the GC TTL ({:?})",
+                self.config.gc_ttl
+            )));
+        }
         let iter = KvRead::range(
             self.kv.as_ref(),
             ks,

@@ -1166,3 +1166,7 @@ fn a_single_member_without_a_peer_can_run_ddl() {
 #[cfg(feature = "engine-rocksdb")]
 #[path = "index_build_tests.rs"]
 mod index_build_tests;
+
+#[cfg(feature = "engine-rocksdb")]
+#[path = "reclaim_tests.rs"]
+mod reclaim_tests;
