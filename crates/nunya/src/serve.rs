@@ -246,6 +246,31 @@ pub(crate) fn parse_policy_bytes(path: &Path, bytes: &[u8]) -> Result<Policy, Ve
     }
     Ok(policy)
 }
+/// Normalize an audit destination for startup and reload comparisons.
+pub(crate) fn readlog_key(sink: &crate::policy::ReadLogSink) -> crate::policy::ReadLogSink {
+    use crate::policy::ReadLogSink;
+    match sink {
+        ReadLogSink::Stdout => ReadLogSink::Stdout,
+        ReadLogSink::File { path, max_bytes } => {
+            let canonical = std::fs::canonicalize(path)
+                .or_else(|error| {
+                    let parent = path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or(Path::new("."));
+                    match path.file_name() {
+                        Some(name) => std::fs::canonicalize(parent).map(|p| p.join(name)),
+                        None => Err(error),
+                    }
+                })
+                .unwrap_or_else(|_| path.clone());
+            ReadLogSink::File {
+                path: canonical,
+                max_bytes: *max_bytes,
+            }
+        }
+    }
+}
 #[cfg(test)]
 fn reload_decision(
     candidate: Result<Policy, Vec<PolicyError>>,
@@ -801,6 +826,35 @@ mod tests {
             snapshot_max_age_ms: 60000,
             readlog: crate::policy::ReadLogSink::Stdout,
         }
+    }
+    #[test]
+    fn readlog_comparison_normalizes_existing_and_missing_files() {
+        use crate::policy::ReadLogSink;
+        let dir = std::env::temp_dir().join(format!(
+            "readlog-key-{}",
+            crate::token::SessionId::random().to_hex()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = |path| ReadLogSink::File {
+            path,
+            max_bytes: 10,
+        };
+        let plain = sink(dir.as_path().join("read.log"));
+        let dotted = sink(dir.as_path().join("./read.log"));
+        assert_eq!(readlog_key(&plain), readlog_key(&dotted));
+        std::fs::write(dir.as_path().join("read.log"), "").unwrap();
+        assert_eq!(readlog_key(&plain), readlog_key(&dotted));
+        let missing = sink(dir.as_path().join("missing/read.log"));
+        assert_eq!(readlog_key(&missing), missing);
+        assert_ne!(
+            readlog_key(&plain),
+            readlog_key(&ReadLogSink::File {
+                path: dir.as_path().join("read.log"),
+                max_bytes: 11,
+            })
+        );
+        assert_eq!(readlog_key(&ReadLogSink::Stdout), ReadLogSink::Stdout);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn captured_policy_bytes_resolve_relative_readlog() {

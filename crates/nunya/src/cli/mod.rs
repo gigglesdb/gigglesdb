@@ -64,26 +64,24 @@ enum StandingCommand {
 enum KeyCommand {
     Generate,
 }
+fn load_policy(path: &Path) -> Result<crate::policy::Policy, Vec<String>> {
+    let bytes = std::fs::read(path).map_err(|_| vec!["policy file unavailable".into()])?;
+    crate::serve::parse_policy_bytes(path, &bytes).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    })
+}
 async fn validate(path: &Path) -> Result<(), Vec<String>> {
     let cfg = Config::load(path)?;
     if let Some(tls) = &cfg.tls {
         crate::config::load_tls(tls).map_err(|e| vec![e])?;
     }
-    fn load_policy(path: &Path) -> Result<crate::policy::Policy, Vec<String>> {
-        let mut policy = crate::policy::file::load_policy(path).map_err(|errors| {
-            errors.into_iter().map(|e| e.to_string()).collect::<Vec<_>>()
-        })?;
-        if let crate::policy::ReadLogSink::File { path: sink, .. } = &mut policy.readlog
-            && sink.is_relative()
-        {
-            *sink = path.parent().unwrap_or(Path::new(".")).join(&*sink);
-        }
-        Ok(policy)
-    }
     let postgres_policy = cfg.postgres_policy.as_deref().map(load_policy).transpose()?;
     let spanner_policy = cfg.spanner_policy.as_deref().map(load_policy).transpose()?;
     if let (Some(pg), Some(spanner)) = (&postgres_policy, &spanner_policy)
-        && pg.readlog != spanner.readlog
+        && crate::serve::readlog_key(&pg.readlog) != crate::serve::readlog_key(&spanner.readlog)
     {
         return Err(vec!["policy files name different read logs".into()]);
     }
@@ -236,6 +234,29 @@ pub fn run() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn policy_check_uses_serving_path_resolution() {
+        let dir = std::env::temp_dir().join(format!(
+            "readlog-key-{}",
+            crate::token::SessionId::random().to_hex()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.as_path().join("policy.toml");
+        std::fs::write(&path, "[readlog]\nsink='file'\npath='./read.log'\n").unwrap();
+        let checked = load_policy(&path).unwrap();
+        let served =
+            crate::serve::parse_policy_bytes(&path, &std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(checked.readlog, served.readlog);
+        let absolute = crate::policy::ReadLogSink::File {
+            path: dir.as_path().join("read.log"),
+            max_bytes: 104857600,
+        };
+        assert_eq!(
+            crate::serve::readlog_key(&checked.readlog),
+            crate::serve::readlog_key(&absolute)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn session_commands() {
         for verb in ["show", "renew", "revoke", "env"] {

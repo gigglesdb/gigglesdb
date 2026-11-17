@@ -1864,3 +1864,250 @@ async fn quota_continuity_across_restart() -> ServeResult<()> {
     limited(&client3).await;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG, NUNYA_TEST_PG_ADMIN, NUNYA_TEST_SPANNER_EMULATOR and NUNYA_TEST_SPANNER_DB"]
+async fn per_route_policy_files_reload_and_audit() -> ServeResult<()> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn admin_request(addr: &str, method: &str, path: &str) -> ServeResult<String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await?;
+            stream
+                .write_all(
+                    format!(
+                        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await?;
+            let (head, body) = response.split_once("\r\n\r\n").ok_or("missing admin body")?;
+            let expected = if method == "POST" { "202" } else { "200" };
+            assert!(
+                head.split_whitespace().nth(1) == Some(expected),
+                "unexpected admin HTTP status"
+            );
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(body.to_owned())
+        })
+        .await?
+    }
+
+    // The catalogs deliberately use different schemas and identifier casing.
+    let url = std::env::var("NUNYA_TEST_PG")?;
+    let database = std::env::var("NUNYA_TEST_SPANNER_DB")?;
+    let endpoint = format!("http://{}", std::env::var("NUNYA_TEST_SPANNER_EMULATOR")?);
+    let admin_url = std::env::var("NUNYA_TEST_PG_ADMIN")?;
+    let pg_only_table = format!(
+        "per_route_pg_only_{}",
+        nunya::token::SessionId::random().to_hex()
+    );
+    let _table = TableGuard {
+        url: admin_url.clone(),
+        name: pg_only_table.clone(),
+    };
+    let (admin, connection) = tokio_postgres::connect(&admin_url, NoTls).await?;
+    let _admin_driver = Driver(tokio::spawn(async move {
+        let _ = connection.await;
+    }));
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE public.{pg_only_table} (id int PRIMARY KEY, secret text); \
+             INSERT INTO public.{pg_only_table} VALUES (1, 'pg-only-secret@example.test'); \
+             GRANT SELECT ON public.{pg_only_table} TO nunya"
+        ))
+        .await?;
+    let pg_policy = format!(
+        "{}\n[[column]]\ntable = 'public.{pg_only_table}'\nname = 'secret'\nblind = 'email'\n",
+        file_sink_policy()
+    );
+    let spanner_policy = include_str!("../harness/spanner/policy_gsql.toml")
+        .replace("sink = \"stdout\"", "sink = \"file\"\npath = \"read.log\"");
+    let mut h = ServeHarness::new(
+        &pg_policy,
+        Some(&url),
+        None,
+        Some(super::common::NativeUpstream {
+            database: &database,
+            emulator_endpoint: &endpoint,
+        }),
+        "",
+    )?;
+    let pg_path = h.dir().join("pg-policy.toml");
+    let spanner_path = h.dir().join("spanner-policy.toml");
+    std::fs::write(&pg_path, pg_policy)?;
+    std::fs::write(&spanner_path, &spanner_policy)?;
+    let pg_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(std::fs::read(&pg_path)?));
+    let spanner_hash =
+        data_encoding::HEXLOWER.encode(&Sha256::digest(std::fs::read(&spanner_path)?));
+    assert_ne!(pg_hash, spanner_hash);
+    let config_path = h.dir().join("nunya.toml");
+    let mut config: toml::Table = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+    config.remove("policy");
+    config["upstream"]
+        .as_table_mut()
+        .ok_or("missing PG route")?
+        .insert("policy".into(), "pg-policy.toml".into());
+    config["spanner_native"]
+        .as_table_mut()
+        .ok_or("missing native route")?
+        .insert("policy".into(), "spanner-policy.toml".into());
+    let admin_addr = config["admin_listen"]
+        .as_str()
+        .ok_or("missing admin address")?
+        .to_owned();
+    std::fs::write(config_path, toml::to_string(&config)?)?;
+    h.start().await?;
+
+    let (pg, pg_secret, principal) = h
+        .acquire_session("per-route-audit-agent", "postgres", Mode::ReadWrite)
+        .await?;
+    h.admin()
+        .set_grants(
+            &pg.principal,
+            &[
+                ("postgres", Mode::ReadWrite),
+                ("spanner-native", Mode::ReadWrite),
+            ],
+        )
+        .await?;
+    let owner = owner(&h, "per-route-audit-agent", &principal)?;
+    let native_secret = SessionSecret::generate();
+    let native = owner
+        .acquire(AcquireParams {
+            route: "spanner-native".into(),
+            mode: Some(Mode::ReadWrite),
+            lifetime: None,
+            isolated: false,
+            label: None,
+            verifier: native_secret.verifier.clone(),
+            secret_sha256: native_secret.sha256_hex.clone(),
+        })
+        .await?;
+    let (pg_client, _pg_driver) = session_connect(&h, &pg, &pg_secret).await?;
+    let pg_only_rows = values(
+        &pg_client,
+        &format!("SELECT secret FROM {pg_only_table} WHERE id = 1"),
+    )
+    .await?;
+    assert!(
+        pg_only_rows.len() == 1
+            && pg_only_rows[0].len() == 1
+            && !pg_only_rows[0][0].is_empty()
+            && pg_only_rows[0][0] != "pg-only-secret@example.test",
+        "PG-only blind value was not tokenized"
+    );
+    let pg_token = token(&pg_client).await?;
+    assert!(
+        !pg_token.is_empty() && pg_token != "alice@example.test",
+        "PG blind value was not tokenized"
+    );
+    let mut native_client =
+        spanner_client(&h, &format!("session:{}", native.id), &native_secret).await?;
+    let mut cleanup = SpannerSessions {
+        endpoint,
+        names: vec![],
+    };
+    let name = native_client
+        .create_session(CreateSessionRequest {
+            database,
+            ..Default::default()
+        })
+        .await?
+        .into_inner()
+        .name;
+    cleanup.names.push(name.clone());
+    let select = spanner_sql(&name, "SELECT Email FROM Customers WHERE Id = 1");
+    let rows = native_cells(
+        &native_client
+            .execute_sql(select.clone())
+            .await?
+            .into_inner(),
+    )?;
+    assert!(
+        rows.len() == 1
+            && rows[0].len() == 1
+            && !rows[0][0].is_empty()
+            && rows[0][0] != "alice@example.test",
+        "native blind value was not tokenized"
+    );
+    let status = h.admin().status().await?;
+    assert_eq!(
+        status.policy_revisions,
+        std::collections::BTreeMap::from([
+            ("postgres".into(), Some(pg_hash.clone())),
+            ("spanner-native".into(), Some(spanner_hash.clone())),
+        ])
+    );
+
+    let revised = format!("# successful native policy reload\n{spanner_policy}");
+    let new_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(revised.as_bytes()));
+    std::fs::write(&spanner_path, revised)?;
+    admin_request(&admin_addr, "POST", "/reload").await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = admin_request(&admin_addr, "GET", "/status").await?;
+            let applied = |route: &str, hash: &str| {
+                status.lines().any(|line| {
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    fields.contains(&format!("route={route}").as_str())
+                        && fields.contains(&format!("policy_sha256={hash}").as_str())
+                        && fields.contains(&"last_reload=applied")
+                })
+            };
+            if applied("postgres", &pg_hash) && applied("spanner-native", &new_hash) {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| "successful per-route reload did not appear")??;
+    assert_eq!(
+        h.admin().status().await?.policy_revisions,
+        std::collections::BTreeMap::from([
+            ("postgres".into(), Some(pg_hash.clone())),
+            ("spanner-native".into(), Some(new_hash.clone())),
+        ])
+    );
+    assert!(
+        token(&pg_client).await? == pg_token,
+        "PG tokens changed on native reload"
+    );
+    assert!(
+        native_cells(&native_client.execute_sql(select).await?.into_inner())? == rows,
+        "native tokens changed on comment-only reload"
+    );
+    // Reads complete only after statement auditing; parse records rather than text fragments.
+    let records = std::fs::read_to_string(h.dir().join("read.log"))?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut pg_count = 0;
+    let mut native_revisions = Vec::new();
+    for record in records.iter().filter(|r| r["kind"] == "statement") {
+        match record["route"].as_str() {
+            Some("postgres") => {
+                assert!(
+                    record["policy_revision"] == pg_hash,
+                    "wrong PG audit revision"
+                );
+                pg_count += 1;
+            }
+            Some("spanner-native") => native_revisions.push(
+                record["policy_revision"]
+                    .as_str()
+                    .ok_or("missing native audit revision")?
+                    .to_owned(),
+            ),
+            _ => return Err("unexpected statement route".into()),
+        }
+    }
+    assert!(pg_count >= 3, "missing PG statement records");
+    // Native execution can emit multiple statement records per request.
+    native_revisions.dedup();
+    assert_eq!(native_revisions, vec![spanner_hash, new_hash]);
+    Ok(())
+}

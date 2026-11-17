@@ -2,7 +2,7 @@
 use crate::{
     policy::Policy,
     schema::Snapshot,
-    serve::{ReloadableLog, now, parse_policy_bytes},
+    serve::{ReloadableLog, now, parse_policy_bytes, readlog_key},
     state::model::RouteId,
 };
 use sha2::{Digest, Sha256};
@@ -42,6 +42,7 @@ impl Route {
     }
 }
 struct Unit {
+    identity: PathBuf,
     path: PathBuf,
     revisions: Arc<RwLock<crate::serve::Revisions>>,
     policy: Arc<Policy>,
@@ -148,21 +149,22 @@ impl Hub {
             if configured.iter().any(|(id, _)| id == route) {
                 return Err("duplicate policy route".into());
             }
-            let path = std::fs::canonicalize(path).map_err(|_| "policy file unavailable")?;
-            let index = if let Some(index) = units.iter().position(|unit| unit.path == path) {
+            let identity = std::fs::canonicalize(path).map_err(|_| "policy file unavailable")?;
+            let index = if let Some(index) = units.iter().position(|unit| unit.identity == identity) {
                 index
             } else {
-                let bytes = std::fs::read(&path).map_err(|_| "policy file unavailable")?;
-                let policy = Arc::new(parse(&path, &bytes)?);
+                let bytes = std::fs::read(path).map_err(|_| "policy file unavailable")?;
+                let policy = Arc::new(parse(path, &bytes)?);
                 if units
                     .first()
-                    .is_some_and(|unit| unit.policy.readlog != policy.readlog)
+                    .is_some_and(|unit| readlog_key(&unit.policy.readlog) != readlog_key(&policy.readlog))
                 {
                     return Err("policy files name different read logs".into());
                 }
                 let digest = hash(&bytes);
                 units.push(Unit {
-                    path,
+                    identity,
+                    path: path.clone(),
                     policy,
                     routes: vec![],
                     revisions: Arc::new(RwLock::new(crate::serve::Revisions {
@@ -279,7 +281,7 @@ impl Hub {
         s.last_time = now();
         let result = (|| {
             let policy = Arc::new(candidate?);
-            if independent && policy.readlog != s.policy.readlog {
+            if independent && readlog_key(&policy.readlog) != readlog_key(&s.policy.readlog) {
                 return Err("policy files name different read logs".into());
             }
             // Hold every policy and snapshot lock through validation and publication.
@@ -300,7 +302,7 @@ impl Hub {
                 crate::policy::validate::validate(&policy, snapshot)
                     .map_err(crate::serve::errors)?;
             }
-            let replacement = if policy.readlog != s.policy.readlog {
+            let replacement = if readlog_key(&policy.readlog) != readlog_key(&s.policy.readlog) {
                 Some(
                     crate::readlog::open_sink(&policy.readlog)
                         .map_err(|_| "read log unavailable")?,
@@ -527,6 +529,7 @@ mod tests {
             ),
             state: Mutex::new(State {
                 units: vec![Unit {
+                    identity: PathBuf::new(),
                     path: PathBuf::new(),
                     revisions: Arc::new(RwLock::new(crate::serve::Revisions {
                         policy: hash(b"initial"),
@@ -750,6 +753,79 @@ mod tests {
             h.metrics()
                 .contains(&("nunya_policy_reload_failures_total{route=\"b\"}".into(), 0))
         );
+    }
+    #[tokio::test]
+    async fn readlog_spellings_agree_at_startup_and_reload() {
+        let files = Files::new();
+        let policy = |path: &str| format!("[readlog]\nsink='file'\npath='{path}'\n");
+        std::fs::write(&files.a, policy("read.log")).unwrap();
+        std::fs::write(
+            &files.b,
+            policy(&files.dir.join("read.log").to_string_lossy()),
+        )
+        .unwrap();
+        let hub = files.hub();
+        std::fs::write(&files.a, policy("./read.log")).unwrap();
+        manual_reload(&hub).await;
+        assert!(
+            hub.state
+                .lock()
+                .unwrap()
+                .units
+                .iter()
+                .all(|u| u.last == "applied")
+        );
+        let changed = parse(
+            &files.a,
+            b"[readlog]\nsink='file'\npath='read.log'\nmax_bytes=1\n",
+        )
+        .unwrap();
+        assert!(hub.apply(0, Ok(changed), Some(hash(b"changed"))).is_err());
+    }
+
+    #[tokio::test]
+    async fn unit_retains_named_path_for_reload() {
+        let files = Files::new();
+        let named = files.dir.join("./a.toml");
+        let hub = Hub::new(&[(id("a"), named.clone())], None).unwrap();
+        assert_eq!(hub.state.lock().unwrap().units[0].path, named);
+        assert_eq!(hub.state.lock().unwrap().units[0].identity, std::fs::canonicalize(&named).unwrap());
+        files.write(&files.a, 70000);
+        manual_reload(&hub).await;
+        assert_eq!(hub.policy_for(&id("a")).unwrap().snapshot_max_age_ms, 70000);
+    }
+
+    #[tokio::test]
+    async fn symlink_policy_uses_named_directory_at_startup_and_reload() {
+        let files = Files::new();
+        let target_dir = files.dir.join("target");
+        std::fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("policy.toml");
+        let named = files.dir.join("named.toml");
+        std::fs::write(&target, "[readlog]\nsink='file'\npath='read.log'\n").unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &named) {
+            if error.raw_os_error() == Some(1314) {
+                eprintln!("symlink regression requires Windows symlink privilege (1314)");
+                return;
+            }
+            panic!("cannot create policy symlink: {error}");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &named).unwrap();
+        let hub = Hub::new(&[(id("a"), named.clone()), (id("b"), target.clone())], None).unwrap();
+        assert_eq!(hub.state.lock().unwrap().units.len(), 1);
+        assert!(files.dir.join("read.log").exists());
+        assert!(!target_dir.join("read.log").exists());
+        std::fs::write(
+            &target,
+            "snapshot_max_age_ms=70000\n[readlog]\nsink='file'\npath='./read.log'\n",
+        )
+        .unwrap();
+        manual_reload(&hub).await;
+        assert_eq!(hub.policy_for(&id("a")).unwrap().snapshot_max_age_ms, 70000);
+        assert_eq!(hub.state.lock().unwrap().units[0].path, named);
+        assert!(!target_dir.join("read.log").exists());
     }
     #[test]
     fn readlog_must_agree_across_units() {
