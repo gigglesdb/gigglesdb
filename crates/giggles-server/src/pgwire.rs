@@ -1136,7 +1136,7 @@ fn begin_implicit(
 ) -> R<()> {
     if !session.in_transaction() {
         session.set_default_isolation(&settings.current);
-        core(session.run_control("BEGIN"))?;
+        core(session.begin_implicit_block())?;
         settings.transaction(false, true, "BEGIN");
         *implicit = true;
     }
@@ -1184,11 +1184,24 @@ fn inspect(
     ))
 }
 fn execute_control(
+    command: &'static str, session: &mut Session, implicit: &mut bool,
+    settings: &mut crate::pg_settings::SessionSettings, out: &mut Vec<u8>,
+) -> R<&'static str> {
+    execute_control_inner(command, session, implicit, settings, out, false)
+}
+fn execute_implicit_commit(
+    session: &mut Session, implicit: &mut bool,
+    settings: &mut crate::pg_settings::SessionSettings, out: &mut Vec<u8>,
+) -> R<&'static str> {
+    execute_control_inner("COMMIT", session, implicit, settings, out, true)
+}
+fn execute_control_inner(
     command: &'static str,
     session: &mut Session,
     implicit: &mut bool,
     settings: &mut crate::pg_settings::SessionSettings,
     out: &mut Vec<u8>,
+    implicit_commit: bool,
 ) -> R<&'static str> {
     if !session.role.is_sql() {
         return Err("42501");
@@ -1208,7 +1221,9 @@ fn execute_control(
             session.set_default_isolation(&settings.current);
             core(session.run_control("BEGIN"))?;
         }
-    } else if was && let Err(error) = session.run_control(actual) {
+    } else if was && let Err(error) = if implicit_commit && *implicit && actual == "COMMIT" {
+        session.commit_implicit_block()
+    } else { session.run_control(actual) } {
         session.sql.rollback();
         settings.transaction(true, false, "ROLLBACK");
         *implicit = false;
@@ -1582,7 +1597,7 @@ impl State {
                         self.cursors.transaction_end("ROLLBACK");
                         self.settings.transaction(true, false, "ROLLBACK");
                     } else {
-                        let commit = if session.in_transaction() { session.run_control("COMMIT") } else { Ok(()) };
+                        let commit = if session.in_transaction() { session.commit_implicit_block() } else { Ok(()) };
                         if let Err(error) = commit {
                             session.sql.rollback();
                             self.cursors.transaction_end("ROLLBACK");
@@ -3181,3 +3196,6 @@ mod collation_diagnostic_tests {
         if path.is_dir() { std::fs::remove_dir_all(path).unwrap(); } else { std::fs::remove_file(path).unwrap(); }
     }
 }
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "pgwire_implicit_block_tests.rs"]
+mod implicit_block_tests;

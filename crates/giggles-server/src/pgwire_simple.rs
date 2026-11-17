@@ -32,7 +32,7 @@ impl State {
                 return Err(code);
             }
             if implicit && self.copy.is_none()
-                && let Err(code) = execute_control("COMMIT", session, &mut implicit, &mut self.settings, out)
+                && let Err(code) = execute_implicit_commit(session, &mut implicit, &mut self.settings, out)
             {
                 self.simple_failure(code, true, completed, session, out);
             }
@@ -102,7 +102,7 @@ impl State {
         if implicit {
             let completed = out.len();
             if let Err(code) =
-                execute_control("COMMIT", session, &mut implicit, &mut self.settings, out)
+                execute_implicit_commit(session, &mut implicit, &mut self.settings, out)
             {
                 self.simple_failure(code, true, completed, session, out);
             }

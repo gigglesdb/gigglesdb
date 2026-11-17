@@ -325,7 +325,7 @@ impl State {
                 return Ok(true);
             }
             if implicit {
-                execute_control("COMMIT", session, &mut implicit, &mut self.settings, out)?;
+                execute_implicit_commit(session, &mut implicit, &mut self.settings, out)?;
             }
         }
         if !copy.failed {

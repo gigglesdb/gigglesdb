@@ -187,13 +187,11 @@ impl State {
             complete("SELECT", &result, out)
         })();
         if own_transaction {
-            let ending = execute_control(
-                if result.is_ok() { "COMMIT" } else { "ROLLBACK" },
-                session,
-                implicit,
-                &mut self.settings,
-                out,
-            );
+            let ending = if result.is_ok() {
+                execute_implicit_commit(session, implicit, &mut self.settings, out)
+            } else {
+                execute_control("ROLLBACK", session, implicit, &mut self.settings, out)
+            };
             if result.is_ok() {
                 ending?;
             }

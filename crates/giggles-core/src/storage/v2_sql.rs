@@ -38,6 +38,46 @@ thread_local! {
 
 impl SqlSession {
 
+    /// BEGIN without parsing SQL; legacy and task sessions retain the SQL path.
+    pub fn begin_block(&mut self) -> Result<(), CoreError> {
+        self.control_block(false)
+    }
+
+    /// COMMIT without parsing SQL. Like SQL COMMIT, an aborted block is refused.
+    pub fn commit_block(&mut self) -> Result<(), CoreError> {
+        self.control_block(true)
+    }
+
+    /// Clocked counterpart of the direct transaction controls.
+    pub fn control_block_at(&mut self, commit: bool, clock: &relational::StatementClock) -> Result<(), CoreError> {
+        self.guard_clock(clock)?;
+        let result = self.control_block(commit);
+        if result.is_ok() && !commit && clock.unavailable.is_none() {
+            self.transaction_clock_us = Some(clock.transaction_us);
+        }
+        result
+    }
+
+    /// Immutable transaction-control syntax for caller authorization, without SQL parsing.
+    pub fn block_control(commit: bool) -> relational::Prepared {
+        if commit { relational::Prepared::commit_engine(0, 0) }
+        else { relational::Prepared::begin_engine(0, 0) }
+    }
+
+    /// Whether transaction controls can bypass the legacy SQL engine.
+    pub fn has_native_transaction_blocks(&self) -> bool {
+        matches!(self.admin.inner.backend, Backend::V2(_))
+    }
+
+    fn control_block(&mut self, commit: bool) -> Result<(), CoreError> {
+        self.refuse_task_session()?;
+        if !self.has_native_transaction_blocks() {
+            return self.execute(if commit { "COMMIT" } else { "BEGIN" }, &[], None).map(drop);
+        }
+        // Shares execute_v2's copy/abort/ticket/cancellation/error cleanup guards.
+        self.native_implicit_control(!commit)
+    }
+
     pub(crate) fn begin_v2_transaction(
         &mut self, db: &Arc<v2::V2Db>,
     ) -> Result<(), CoreError> {

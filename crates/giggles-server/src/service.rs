@@ -547,6 +547,12 @@ impl Service {
             },
             zone: Some(SessionZone::Fixed(0)),
             transaction_us: None,
+            zone_setting: None,
+            implicit_ddl: false,
+            #[cfg(test)]
+            control_calls: 0,
+            #[cfg(test)]
+            fast_control_calls: 0,
             sequence_owner_candidates: BTreeSet::new(),
             search_path: String::new(),
             api_path: ApiPathState::default(),
@@ -595,6 +601,12 @@ impl Service {
             },
             zone: Some(SessionZone::Fixed(0)),
             transaction_us: None,
+            zone_setting: None,
+            implicit_ddl: false,
+            #[cfg(test)]
+            control_calls: 0,
+            #[cfg(test)]
+            fast_control_calls: 0,
             sequence_owner_candidates: BTreeSet::new(),
             search_path: String::new(),
             api_path: ApiPathState::default(),
@@ -742,6 +754,12 @@ impl Service {
             sql,
             zone: Some(SessionZone::Fixed(0)),
             transaction_us: None,
+            zone_setting: None,
+            implicit_ddl: false,
+            #[cfg(test)]
+            control_calls: 0,
+            #[cfg(test)]
+            fast_control_calls: 0,
             sequence_owner_candidates: BTreeSet::new(),
             search_path: String::new(),
             api_path: ApiPathState::default(),
@@ -788,6 +806,12 @@ pub struct Session {
     pub(crate) sql: SqlSession,
     zone: Option<SessionZone>,
     transaction_us: Option<i64>,
+    zone_setting: Option<String>,
+    implicit_ddl: bool,
+    #[cfg(test)]
+    pub(crate) control_calls: usize,
+    #[cfg(test)]
+    pub(crate) fast_control_calls: usize,
     sequence_owner_candidates: BTreeSet<String>,
     pub(crate) search_path: String,
     pub(crate) api_path: ApiPathState,
@@ -867,7 +891,9 @@ impl Session {
         Ok(())
     }
     pub(crate) fn set_time_zone(&mut self, name: &str) {
+        if self.zone_setting.as_deref() == Some(name) { return; }
         self.zone = SessionZone::setting(name).ok().map(|(zone, _)| zone);
+        self.zone_setting = Some(name.to_owned());
     }
     fn role_epoch(&self) -> u64 {
         self.role_fence.map_or(self.epoch, |(_, generation)| generation)
@@ -2608,6 +2634,7 @@ impl Session {
         &mut self, command: &str, table: Option<&str>, ddl: bool, sequence_ddl: bool,
         sequences: Vec<String>, execute: impl FnOnce(&mut Self) -> Result<(T, bool, bool), CoreError>,
     ) -> Result<T, CoreError> {
+        if ddl && self.sql.in_transaction() { self.implicit_ddl = true; }
         let transactional = self.sql.set_ddl_owner(match &self.role { Role::Database { name } => Some(name), _ => None });
         let candidates = if ddl && !transactional { self.sql.sequence_owners()?.into_iter().map(|(name, _)| name).collect::<Vec<_>>() } else { vec![] };
         let preexisting = command == "CREATE TABLE" && table.map(|t| self.sql.relation_exists(t)).transpose()?.unwrap_or(false);
@@ -2679,12 +2706,58 @@ impl Session {
         self.authority_scope(|session| session.execute_sql_authorized(sql, params, true))?
             .untasked()
     }
+    /// Open a pgwire implicit block, retaining the ordinary authorization scope.
+    pub(crate) fn begin_implicit_block(&mut self) -> Result<(), CoreError> {
+        self.implicit_block(false)
+    }
+    pub(crate) fn commit_implicit_block(&mut self) -> Result<(), CoreError> {
+        self.implicit_block(true)
+    }
+    fn implicit_block(&mut self, commit: bool) -> Result<(), CoreError> {
+        self.authority_scope(|session| {
+            // Preserve task admission, legacy bookkeeping, aborted-state ordering,
+            // and DDL/sequence-owner publication through the ordinary SQL path.
+            if !session.sql.has_native_transaction_blocks() || session.agent || session.sql.task().is_some()
+                || !session.role.is_sql() || session.sql.is_aborted()
+                || !session.sequence_owner_candidates.is_empty() || (commit && session.implicit_ddl)
+            {
+                return session.run_control(if commit { "COMMIT" } else { "BEGIN" });
+            }
+            #[cfg(test)]
+            { session.fast_control_calls += 1; }
+            // Retain existing authorization checks using control syntax built without parsing.
+            session.authorize(&SqlSession::block_control(commit))?;
+            session.sql.set_ddl_owner(match &session.role {
+                Role::Database { name } => Some(name), _ => None,
+            });
+            if !session.sql.in_transaction() { session.transaction_us = None; }
+            let (statement_us, unavailable) = match session.service.clock.sql_micros() {
+                Ok(sample) => (sample, None),
+                Err(error) => (session.transaction_us.unwrap_or(0), Some(error)),
+            };
+            let transaction_us = session.transaction_us.unwrap_or(statement_us);
+            let clock = StatementClock {
+                unavailable, transaction_us, statement_us, zone: session.zone, wall: None,
+            };
+            let result = session.sql.control_block_at(commit, &clock);
+            if !session.sql.in_transaction() { session.transaction_us = None; }
+            else if clock.unavailable.is_none() { session.transaction_us = Some(transaction_us); }
+            session.api_path.sql_committed = result.is_ok() && commit;
+            if result.is_ok() {
+                if !commit { session.implicit_ddl = false; }
+                session.reconcile_sequence_owners()?;
+            }
+            result
+        })
+    }
     /// A statement the server issues itself (transaction control, the admin
     /// path's `DROP TABLE`), whose result is never encoded. It runs through
     /// the unreleased twin and is taken with `untasked`: a task session is
     /// refused before the statement runs, as by the plain exit, and the
     /// result is dropped here (GD-0061 R3-314).
     pub(crate) fn run_control(&mut self, sql: &str) -> Result<(), CoreError> {
+        #[cfg(test)]
+        { self.control_calls += 1; }
         self.authority_scope(|session| session.execute_sql_authorized(sql, &[], true))?
             .untasked()
             .map(drop)

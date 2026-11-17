@@ -147,3 +147,29 @@ fn commit_reply_loss_and_failure_are_durable() {
         fs::remove_dir_all(path).unwrap();
     }
 }
+
+#[test]
+fn direct_blocks_match_sql_controls() {
+    let path = directory();
+    let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+    let mut observer = admin.sql_session();
+    run(&mut observer, "CREATE TABLE direct_blocks (id INT PRIMARY KEY)");
+    for direct in [false, true] {
+        let mut s = admin.sql_session();
+        if direct { s.begin_block().unwrap(); } else { run(&mut s, "BEGIN"); }
+        assert!(s.in_transaction());
+        run(&mut s, if direct { "INSERT INTO direct_blocks VALUES (2)" } else { "INSERT INTO direct_blocks VALUES (1)" });
+        let before = run(&mut observer, "SELECT id FROM direct_blocks").rows.len();
+        if direct { s.commit_block().unwrap(); } else { run(&mut s, "COMMIT"); }
+        assert!(!s.in_transaction());
+        assert_eq!(run(&mut observer, "SELECT id FROM direct_blocks").rows.len(), before + 1);
+        if direct { s.begin_block().unwrap(); } else { run(&mut s, "BEGIN"); }
+        assert!(execute(&mut s, "SELECT 1 / 0").is_err());
+        assert!(s.is_aborted());
+        let error = if direct { s.commit_block() } else { execute(&mut s, "COMMIT").map(drop) };
+        assert_eq!(error, Err(CoreError::Sql(SqlError::Aborted)));
+        assert!(s.in_transaction() && s.is_aborted());
+        run(&mut s, "ROLLBACK");
+        assert!(!s.in_transaction() && !s.is_aborted());
+    }
+}
