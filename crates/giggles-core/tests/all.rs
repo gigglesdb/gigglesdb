@@ -528,3 +528,4 @@ mod v2_on_conflict_caps;
 #[path = "task_undo.rs"] mod task_undo;
 #[path = "task_limits.rs"] mod task_limits;
 #[path = "task_exposure.rs"] mod task_exposure;
+#[path = "task_statements.rs"] mod task_statements;
