@@ -403,3 +403,176 @@ fn unparsable_ddl_classifier_stays_fail_closed() {
         );
     }
 }
+
+#[test]
+fn exact_tokenize_shape() {
+    let (snapshot, mut policy) = fixture();
+    let domain = DomainName("email".into());
+    for sql in [
+        "SELECT nunya_tokenize('email', @v)",
+        "SELECT `nunya_tokenize`('email', @v)",
+        "SELECT nunya_tokenize('email', @v) AS t",
+        "SELECT nunya_tokenize('email', @v);",
+    ] {
+        let (stmt, names) = lower_gsql(sql, &snapshot, &policy).unwrap();
+        let arg = ValueSource::Param(1);
+        assert_eq!(
+            stmt.kind,
+            StatementKind::Tokenize {
+                domain: domain.clone(),
+                arg: arg.clone()
+            },
+            "{sql}"
+        );
+        assert_eq!(stmt.plain_params, [1], "{sql}");
+        assert_eq!(stmt.param_count, 1, "{sql}");
+        assert_eq!(names, ["v"], "{sql}");
+        assert!(
+            stmt.outputs.is_empty() && stmt.uses.is_empty() && stmt.writes.is_empty(),
+            "{sql}"
+        );
+        policy.domains.insert(
+            domain.clone(),
+            crate::policy::DomainSettings {
+                tokenize: crate::policy::TokenizeSetting::On {
+                    limit_per_session: 10,
+                    limit_per_principal: 10,
+                    principal_window: std::time::Duration::from_secs(60),
+                },
+                range: None,
+            },
+        );
+        assert_eq!(
+            crate::ir::check::check(&stmt, &policy, &snapshot)
+                .unwrap()
+                .tokenize,
+            Some((domain.clone(), arg))
+        );
+        policy.domains.get_mut(&domain).unwrap().tokenize = crate::policy::TokenizeSetting::Off;
+        assert_eq!(
+            crate::ir::check::check(&stmt, &policy, &snapshot)
+                .unwrap_err()
+                .code,
+            NyCode::StatementNotAllowed
+        );
+    }
+    for (sql, domain_text, text) in [
+        (
+            r#"select NUNYA_TOKENIZE("email", 'bob@x.com')"#,
+            "email",
+            "bob@x.com",
+        ),
+        (
+            r#"SELECT nunya_tokenize('Email', "bob@x.com")"#,
+            "Email",
+            "bob@x.com",
+        ),
+        ("SELECT nunya_tokenize('email', 'a''b')", "email", "a'b"),
+    ] {
+        let (stmt, names) = lower_gsql(sql, &snapshot, &policy).unwrap();
+        assert_eq!(
+            stmt.kind,
+            StatementKind::Tokenize {
+                domain: DomainName(domain_text.into()),
+                arg: ValueSource::Literal {
+                    span: Span {
+                        start: 0,
+                        end: sql.len()
+                    },
+                    text: text.into()
+                },
+            },
+            "{sql}"
+        );
+        assert!(stmt.plain_params.is_empty() && names.is_empty(), "{sql}");
+        assert_eq!(stmt.param_count, 0);
+        assert!(stmt.outputs.is_empty() && stmt.uses.is_empty() && stmt.writes.is_empty());
+    }
+}
+
+#[test]
+fn tokenize_unsupported_shapes_fail_closed() {
+    let (snapshot, policy) = fixture();
+    for sql in [
+        "SELECT nunya.nunya_tokenize('email',@v)",
+        "SELECT nunya_tokenize('email')",
+        "SELECT nunya_tokenize('email',@v,@w)",
+        "SELECT nunya_tokenize('email',1)",
+        "SELECT nunya_tokenize('email',NULL)",
+        "SELECT nunya_tokenize('email',TRUE)",
+        "SELECT nunya_tokenize('email',DATE '2020-01-01')",
+        "SELECT nunya_tokenize('email',r'x')",
+        "SELECT nunya_tokenize('email',b'x')",
+        "SELECT nunya_tokenize('email','''x''')",
+        r#"SELECT nunya_tokenize('email',"""x""")"#,
+        "SELECT nunya_tokenize('email',@a || 'x')",
+        "SELECT nunya_tokenize('email',CONCAT('a','b'))",
+        "SELECT nunya_tokenize('email',?)",
+        "SELECT nunya_tokenize(email,@v)",
+        "SELECT nunya_tokenize(@d,@v)",
+        "SELECT nunya_tokenize(1,@v)",
+        "SELECT nunya_tokenize(r'email',@v)",
+        "SELECT nunya_tokenize(b'email',@v)",
+        "SELECT nunya_tokenize('''email''',@v)",
+        r"SELECT nunya_tokenize('email','a\nb')",
+        r"SELECT nunya_tokenize('em\ail',@v)",
+        r"SELECT nunya_tokenize('email',@v) /* \ */",
+        "SELECT nunya_tokenize('email',@v) FROM Customers",
+        "SELECT nunya_tokenize('email',@v) WHERE TRUE",
+        "SELECT nunya_tokenize('email',@v) ORDER BY 1",
+        "SELECT nunya_tokenize('email',@v) LIMIT 1",
+        "SELECT nunya_tokenize('email',@v) LIMIT 1 OFFSET 1",
+        "SELECT DISTINCT nunya_tokenize('email',@v)",
+        "SELECT AS STRUCT nunya_tokenize('email',@v)",
+        "SELECT AS VALUE nunya_tokenize('email',@v)",
+        "SELECT nunya_tokenize('email',@v), 1",
+        "SELECT nunya_tokenize('email',@v) UNION ALL SELECT 1",
+        "WITH x AS (SELECT 1) SELECT nunya_tokenize('email',@v)",
+        "SELECT UPPER(nunya_tokenize('email',@v))",
+        "SELECT (SELECT nunya_tokenize('email',@v))",
+        "SELECT Id FROM Customers WHERE Email = nunya_tokenize('email',@v)",
+        "INSERT INTO Notes (Id, Body) VALUES (1, nunya_tokenize('email',@v))",
+        "WITH x AS (SELECT nunya_tokenize('email',@v)) SELECT * FROM x",
+        "SELECT COUNT(nunya_tokenize('email',@v))",
+        "SELECT nunya_tokenize(DISTINCT 'email',@v)",
+        "SELECT nunya_tokenize(ALL 'email',@v)",
+        "SELECT nunya_tokenize('email',@v) OVER ()",
+        "SELECT nunya_tokenize('email',@v) FILTER (WHERE TRUE)",
+        "SELECT nunya_tokenize('email',@v) WITHIN GROUP (ORDER BY 1)",
+        "SELECT nunya_tokenize('email',@v) GROUP BY 1",
+        "SELECT nunya_tokenize('email',@v) HAVING TRUE",
+        "SELECT nunya_tokenize('email',@v) QUALIFY TRUE",
+        "SELECT nunya_tokenize('email',@v) WINDOW w AS ()",
+    ] {
+        assert_eq!(
+            lower_gsql(sql, &snapshot, &policy).unwrap_err().code,
+            NyCode::NotAnalysable,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn tokenize_in_view_definition_fails_closed() {
+    let (mut snapshot, policy) = fixture();
+    snapshot.relations.push(Relation {
+        schema: String::new(),
+        name: "TokenView".into(),
+        kind: RelationKind::View,
+        columns: vec![Column {
+            name: "Value".into(),
+            ty: ColumnType::Text,
+            nullable: false,
+            generated: None,
+            default: None,
+        }],
+        view_definition: Some("SELECT nunya_tokenize('email','x') AS Value".into()),
+        primary_key: vec![],
+    });
+    assert_eq!(
+        lower_gsql("SELECT * FROM TokenView", &snapshot, &policy)
+            .unwrap_err()
+            .code,
+        NyCode::NotAnalysable,
+    );
+}

@@ -395,6 +395,14 @@ impl State<'_> {
                 Ok(e)
             }
             X::Function(f) => {
+                // Explicit tokenization is only valid as the entire top-level statement.
+                if f.name
+                    .0
+                    .iter()
+                    .any(|n| n.value.eq_ignore_ascii_case("nunya_tokenize"))
+                {
+                    return Err(refuse());
+                }
                 if f.name.0.len() != 1
                     || f.uses_odbc_syntax
                     || f.parameters != a::FunctionArguments::None

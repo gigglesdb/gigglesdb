@@ -544,10 +544,113 @@ impl State<'_> {
         });
         Ok(())
     }
+    /// Recognize only the exact top-level explicit-tokenization shape.
+    fn tokenize(&mut self, q: &a::Query) -> Result<bool> {
+        let s = match q.body.as_ref() {
+            a::SetExpr::Select(s) => s,
+            _ => return Ok(false),
+        };
+        let e = match s.projection.as_slice() {
+            [a::SelectItem::UnnamedExpr(e) | a::SelectItem::ExprWithAlias { expr: e, .. }] => e,
+            _ => return Ok(false),
+        };
+        let f = match e {
+            a::Expr::Function(f) => f,
+            _ => return Ok(false),
+        };
+        if !f
+            .name
+            .0
+            .iter()
+            .any(|n| n.value.eq_ignore_ascii_case("nunya_tokenize"))
+        {
+            return Ok(false);
+        }
+        if f.name.0.len() != 1
+            || self.sql_has_backslash
+            || q.with.is_some()
+            || q.order_by.is_some()
+            || q.limit.is_some()
+            || q.offset.is_some()
+            || !q.limit_by.is_empty()
+            || q.fetch.is_some()
+            || !q.locks.is_empty()
+            || q.for_clause.is_some()
+            || q.settings.is_some()
+            || q.format_clause.is_some()
+            || s.top.is_some()
+            || s.into.is_some()
+            || !s.from.is_empty()
+            || s.selection.is_some()
+            || s.having.is_some()
+            || s.distinct.is_some()
+            || !s.lateral_views.is_empty()
+            || s.prewhere.is_some()
+            || !s.cluster_by.is_empty()
+            || !s.distribute_by.is_empty()
+            || !s.sort_by.is_empty()
+            || !s.named_window.is_empty()
+            || s.qualify.is_some()
+            || s.value_table_mode.is_some()
+            || s.connect_by.is_some()
+            || f.parameters != a::FunctionArguments::None
+            || f.filter.is_some()
+            || f.null_treatment.is_some()
+            || f.over.is_some()
+            || !f.within_group.is_empty()
+            || f.uses_odbc_syntax
+        {
+            return Err(refuse());
+        }
+        match &s.group_by {
+            a::GroupByExpr::Expressions(es, mods) if es.is_empty() && mods.is_empty() => {}
+            _ => return Err(refuse()),
+        }
+        let args = match &f.args {
+            a::FunctionArguments::List(l)
+                if l.clauses.is_empty() && l.duplicate_treatment.is_none() =>
+            {
+                &l.args
+            }
+            _ => return Err(refuse()),
+        };
+        let (domain, value) = match args.as_slice() {
+            [
+                a::FunctionArg::Unnamed(a::FunctionArgExpr::Expr(domain)),
+                a::FunctionArg::Unnamed(a::FunctionArgExpr::Expr(value)),
+            ] => (domain, value),
+            _ => return Err(refuse()),
+        };
+        let domain = match domain {
+            a::Expr::Value(a::Value::SingleQuotedString(s) | a::Value::DoubleQuotedString(s)) => {
+                crate::policy::DomainName(s.clone())
+            }
+            _ => return Err(refuse()),
+        };
+        let arg = match value {
+            a::Expr::Value(a::Value::Placeholder(_)) => {
+                let e = self.expression(value, &vec![], &Context::Other)?;
+                self.plain.extend(e.params);
+                e.value
+            }
+            a::Expr::Value(a::Value::SingleQuotedString(s) | a::Value::DoubleQuotedString(s)) => {
+                ValueSource::Literal {
+                    span: self.stmt.source_span.clone(),
+                    text: s.clone(),
+                }
+            }
+            _ => return Err(refuse()),
+        };
+        self.stmt.kind = StatementKind::Tokenize { domain, arg };
+        Ok(true)
+    }
     /// Dispatch explicitly supported statement families.
     pub(super) fn statement(&mut self, s: &a::Statement) -> Result<()> {
         match s {
             a::Statement::Query(q) => {
+                if self.tokenize(q)? {
+                    return Ok(());
+                }
                 self.stmt.outputs = self.query(q)?.into_iter().map(|o| o.ir).collect()
             }
             a::Statement::Insert(i) => {

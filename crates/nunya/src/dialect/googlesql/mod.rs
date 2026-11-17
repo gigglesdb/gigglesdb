@@ -50,6 +50,7 @@ struct State<'a> {
     outers: Vec<Scope>,
     depth: usize,
     view_depth: usize,
+    sql_has_backslash: bool,
 }
 /// Lower exactly one GoogleSQL statement, returning parameter names in textual occurrence order.
 pub fn lower_gsql(
@@ -149,6 +150,7 @@ pub fn lower_gsql(
         outers: vec![],
         depth: 0,
         view_depth: 0,
+        sql_has_backslash: sql.contains('\\'),
     };
     s.statement(&parsed[0])?;
     s.stmt.plain_params = s.plain.into_iter().collect();
