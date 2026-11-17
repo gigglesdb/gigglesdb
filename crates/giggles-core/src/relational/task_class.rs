@@ -55,6 +55,16 @@ impl Prepared {
                     StatementClass::Select
                 }
             }
+            Statement::Plan(plan) => {
+                if plan.read_tables().iter().any(|name| is_catalog_relation(name))
+                    || plan.write_tables().iter().any(|(name, _)| is_catalog_relation(name))
+                {
+                    StatementClass::Catalog
+                } else {
+                    // Planner shapes do not yet participate in task-session column rules.
+                    StatementClass::Other
+                }
+            }
             Statement::CompositeSelect(_) => StatementClass::Other,
             Statement::Update { .. } | Statement::UpdateExpressions { .. } => {
                 StatementClass::Update
@@ -110,6 +120,17 @@ mod tests {
                 StatementClass::Other,
             ),
             ("SELECT ROW(1, 'a')::pair", StatementClass::Other),
+            ("SELECT id FROM shipments UNION SELECT id FROM others", StatementClass::Other),
+            ("WITH q AS (SELECT id FROM shipments) SELECT id FROM q", StatementClass::Other),
+            ("VALUES (1)", StatementClass::Other),
+            (
+                "SELECT id FROM shipments UNION SELECT table_name FROM information_schema.tables",
+                StatementClass::Catalog,
+            ),
+            (
+                "WITH d AS (DELETE FROM shipments WHERE id = 1 RETURNING id) SELECT id FROM d",
+                StatementClass::Other,
+            ),
             ("SELECT * FROM information_schema.tables", StatementClass::Catalog),
             (
                 "SELECT id FROM shipments WHERE status IN (SELECT table_name FROM information_schema.tables)",
