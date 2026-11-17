@@ -307,6 +307,18 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
         })
     }
 }
+// Preserve the argument's SQL name before aggregate lowering creates slots.
+// PostgreSQL FigureColname recursively looks through casts.
+fn cast_output_name(s: &Scalar) -> Option<String> {
+    match s {
+        Scalar::Cast(inner, _) | Scalar::Domain(inner, ..) => cast_output_name(inner),
+        Scalar::Column(c) => Some(c.name.clone()),
+        Scalar::Call(name, _) => aggregate_filter::kind(s)
+            .or_else(|| aggregate(name))
+            .map(|a| a.name().into()),
+        _ => None,
+    }
+}
 fn output_scalar(item: &Item) -> R<Scalar> {
     match item {
         Item::Scalar(s) => Ok(s.clone()),
@@ -721,6 +733,10 @@ pub(super) fn bind<'a>(
         .iter()
         .zip(&outputs)
         .map(|((i, _), b)| match i {
+            Item::Scalar(s @ (Scalar::Cast(..) | Scalar::Domain(..)))
+                if contains_aggregate(s) => {
+                    Ok(cast_output_name(s).unwrap_or_else(|| b.name().to_owned()))
+                }
             Item::Scalar(s) if !contains_aggregate(s) => {
                 Ok(s.bind(resolve, tables, &parameters)?.name().to_owned())
             }

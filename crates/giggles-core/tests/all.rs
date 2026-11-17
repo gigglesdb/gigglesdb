@@ -516,3 +516,4 @@ mod pgparity_typeof;
 #[path = "replica_role_fk.rs"] mod replica_role_fk;
 #[path = "insert_trailing_columns.rs"]
 mod insert_trailing_columns;
+#[path = "aggregate_cast_parity.rs"] mod aggregate_cast_parity;

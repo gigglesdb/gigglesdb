@@ -2222,7 +2222,8 @@ impl Query {
                 }
             };
             if matches!(item, Item::Aggregate(..))
-                && (matches!(p.tokens.get(p.at), Some(Token::Op(op)) if ["+", "-", "*", "/", "%", "||", "=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()))
+                && (p.tokens.get(p.at) == Some(&Token::Symbol(':'))
+                    || matches!(p.tokens.get(p.at), Some(Token::Op(op)) if ["+", "-", "*", "/", "%", "||", "=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()))
                     || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["and", "or", "is", "not", "between", "in", "like", "ilike"].contains(&w.as_str())))
             {
                 let mut skip_until = item_start;
