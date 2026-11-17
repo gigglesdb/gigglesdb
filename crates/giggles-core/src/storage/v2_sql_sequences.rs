@@ -19,15 +19,21 @@ pub(super) fn callback(
             .iter()
             .find(|(_, def)| def.name == name)
             .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
-        let mut live = crate::cancellation::lock(&db.sql_counters)?;
-        let mut check = db.begin(Isolation::ReadCommitted);
-        // Preserve the fresh committed-incarnation check without cloning every
-        // table, constraint and sequence into CatalogParts on every value.
-        let committed = check
-            .get(Keyspace::Catalog, &engine::catalog_codec::sequence_key(id))?
-            .map(|bytes| engine::catalog_codec::decode_sequence(&bytes))
-            .transpose()?
-            .is_some_and(|current| current.incarnation == def.incarnation);
+        let committed = if db.cluster_services().is_some() {
+            // Gateways retain the routed fresh read; their cache can lag remote DDL.
+            let mut check = db.begin(Isolation::ReadCommitted);
+            check
+                .get(Keyspace::Catalog, &engine::catalog_codec::sequence_key(id))?
+                .map(|bytes| engine::catalog_codec::decode_sequence(&bytes))
+                .transpose()?
+                .is_some_and(|current| current.incarnation == def.incarnation)
+        } else {
+            db.catalog()
+                .current_local_view()?
+                .sequences
+                .get(&id)
+                .is_some_and(|current| current.incarnation == def.incarnation)
+        };
         if !committed && baseline.get(&id) == Some(&def.incarnation) {
             return Err(CoreError::Sql(SqlError::UnknownTable));
         }
@@ -72,13 +78,30 @@ pub(super) fn callback(
             }
             return Ok(relational::Value::Int(result));
         }
+        // Release the directory before waiting on an individual sequence or I/O.
+        let slot = if committed {
+            let mut live = crate::cancellation::lock(&db.sql_counters)?;
+            Some(live.entry(id).or_default().clone())
+        } else {
+            None
+        };
+        let mut live = slot
+            .as_ref()
+            .map(|slot| crate::cancellation::lock(&slot.counter))
+            .transpose()?;
         let mut state = empty(0);
         state.sql = image.clone();
-        let mut pending = pending.lock().map_err(|_| CoreError::Fenced)?;
+        let mut pending = if committed {
+            None
+        } else {
+            Some(pending.lock().map_err(|_| CoreError::Fenced)?)
+        };
         let key = engine::catalog_codec::counter_key(id, def.incarnation);
         let prior = if committed {
             match live
-                .get(&id)
+                .as_ref()
+                .expect("committed slot")
+                .as_ref()
                 .filter(|counter| counter.incarnation == def.incarnation)
             {
                 Some(counter) => Some(counter.clone()),
@@ -89,7 +112,11 @@ pub(super) fn callback(
                     .transpose()?,
             }
         } else {
-            pending.get(&id).cloned()
+            pending
+                .as_ref()
+                .expect("private sequence")
+                .get(&id)
+                .cloned()
         };
         if let Some(counter) = &prior {
             state.seq.insert(id, counter.clone());
@@ -130,9 +157,12 @@ pub(super) fn callback(
                     256,
                 )?;
             }
-            live.insert(id, counter);
+            **live.as_mut().expect("committed slot") = Some(counter);
         } else {
-            pending.insert(id, counter);
+            pending
+                .as_mut()
+                .expect("private sequence")
+                .insert(id, counter);
         }
         if operation == "nextval" || called {
             values

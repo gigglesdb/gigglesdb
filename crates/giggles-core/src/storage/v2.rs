@@ -12,6 +12,12 @@ pub(super) mod reclaim;
 #[path = "v2_maintenance.rs"]
 pub(super) mod maintenance;
 
+/// A stable allocation identity: entries are never replaced while the DB is open.
+#[derive(Default)]
+pub(crate) struct SeqSlot {
+    pub(crate) counter: std::sync::Mutex<Option<super::sequences::SeqCounter>>,
+}
+
 #[allow(dead_code)]
 pub(crate) struct V2Db {
     // First field: dropping it stops and joins the GC thread before the rest
@@ -27,7 +33,7 @@ pub(crate) struct V2Db {
     pub(crate) sequences: Arc<engine::seq::SequenceAllocator>,
     pub(crate) xacts: engine::xact::XactIds,
     pub(crate) sql_counters:
-        std::sync::Mutex<std::collections::BTreeMap<u64, super::sequences::SeqCounter>>,
+        std::sync::Mutex<std::collections::BTreeMap<u64, Arc<SeqSlot>>>,
     reclaim: std::sync::Mutex<reclaim::Registry>,
     pub(super) reclaim_errors: AtomicU64,
     binding_fences: std::sync::Mutex<std::collections::BTreeMap<(u64, u64, u64), u64>>,

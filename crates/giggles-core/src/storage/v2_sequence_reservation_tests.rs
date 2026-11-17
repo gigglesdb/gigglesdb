@@ -452,3 +452,204 @@ fn abrupt_explicit_commit_preserves_pending_sequence_reservations() {
         }
     }
 }
+
+#[test]
+fn counter_golden_bytes() {
+    let def = relational::catalog_ext::SequenceDef {
+        name: "golden".into(),
+        data_type: relational::DataType::BigInt,
+        start: 1,
+        increment: 1,
+        min: 1,
+        max: i64::MAX,
+        cache: 1,
+        cycle: false,
+        owned_by: None,
+        identity: false,
+        incarnation: 42,
+    };
+    let counter = sequences::SeqCounter {
+        incarnation: 42,
+        last_value: 7,
+        is_called: true,
+        log_hw: 33,
+        stamp: 7,
+    };
+    let bytes = engine::catalog_codec::encode_counter(&counter, &def).unwrap();
+    // Captured by running encode_counter on HEAD 51059fda before the slot change.
+    assert_eq!(
+        bytes,
+        vec![
+            0, 0, 0, 0, 0, 0, 0, 33, 1, 0, 0, 0, 0, 0, 0, 0, 33, 0, 0, 0, 0, 0, 0, 0, 7
+        ]
+    );
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn four_sequence_contention() {
+    let f = Fixture::new(Engine::V2);
+    for id in 0..4 {
+        run(&mut f.session(), &format!("CREATE SEQUENCE contended_{id}"));
+    }
+    let start = Arc::new(std::sync::Barrier::new(16));
+    let workers: Vec<_> = (0..16)
+        .map(|worker| {
+            let admin = f.admin.as_ref().unwrap().clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                let mut s = admin.sql_session();
+                let mut values: [Vec<i64>; 4] = Default::default();
+                start.wait();
+                for n in 0..200 {
+                    let id = (worker + n) % 4;
+                    values[id].push(scalar(&mut s, &format!("SELECT nextval('contended_{id}')")));
+                }
+                for sequence in &values {
+                    assert!(sequence.windows(2).all(|w| w[0] < w[1]));
+                }
+                values
+            })
+        })
+        .collect();
+    let mut values: [BTreeSet<i64>; 4] = Default::default();
+    for worker in workers {
+        for (id, sequence) in worker.join().unwrap().into_iter().enumerate() {
+            for value in sequence {
+                assert!(values[id].insert(value));
+            }
+        }
+    }
+    assert!(values.iter().all(|sequence| sequence.len() == 800));
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn cached_callback_observes_drop_and_restart() {
+    let f = Fixture::new(Engine::V2);
+    let mut s1 = f.session();
+    let mut s2 = f.session();
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
+        unreachable!()
+    };
+    for ddl in [
+        "DROP SEQUENCE freshness",
+        "ALTER SEQUENCE freshness RESTART WITH 700",
+    ] {
+        run(&mut s1, "CREATE SEQUENCE freshness");
+        let image = db.metadata_state(None).unwrap().sql;
+        let baseline = image
+            .catalog_ext()
+            .sequences
+            .iter()
+            .map(|(id, def)| (*id, def.incarnation))
+            .collect();
+        let cb = callback(
+            db.clone(),
+            image,
+            baseline,
+            Default::default(),
+            Default::default(),
+            vec!["public".into()],
+        );
+        assert_eq!(
+            cb("nextval", "freshness", None, false).unwrap(),
+            Value::Int(1)
+        );
+        run(&mut s2, ddl);
+        assert_eq!(
+            cb("nextval", "freshness", None, false),
+            Err(CoreError::Sql(SqlError::UnknownTable))
+        );
+        if ddl.starts_with("ALTER") {
+            assert_eq!(scalar(&mut s1, "SELECT nextval('freshness')"), 700);
+            run(&mut s2, "DROP SEQUENCE freshness");
+        } else {
+            assert_eq!(
+                s1.execute_at("SELECT nextval('freshness')", &[], None, &clock()),
+                Err(CoreError::Sql(SqlError::UnknownTable))
+            );
+        }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn durable_counter_bytes_follow_original_lookahead() {
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE SEQUENCE durable_bytes");
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
+        unreachable!()
+    };
+    let view = db.catalog().current_local_view().unwrap();
+    let (&id, def) = view
+        .sequences
+        .iter()
+        .find(|(_, d)| d.name == "durable_bytes")
+        .unwrap();
+    let key = engine::catalog_codec::counter_key(id, def.incarnation);
+    for n in 1..=70 {
+        assert_eq!(scalar(&mut s, "SELECT nextval('durable_bytes')"), n);
+        // Reservations are written on calls 1, 34, 67, with 32 steps ahead.
+        let refill = 1 + ((n - 1) / 33) * 33;
+        let expected = sequences::SeqCounter {
+            incarnation: def.incarnation,
+            last_value: refill,
+            is_called: true,
+            log_hw: refill + 32,
+            stamp: refill as u64,
+        };
+        assert_eq!(
+            db.kv.get(Keyspace::Seq, &key).unwrap().unwrap(),
+            engine::catalog_codec::encode_counter(&expected, def).unwrap()
+        );
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn blocked_sequence_does_not_block_another() {
+    use std::{sync::mpsc, time::Duration};
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    for name in ["blocked_a", "independent_b"] {
+        run(&mut s, &format!("CREATE SEQUENCE {name}"));
+    }
+    // A's first allocation must refill. Hold its slot while B refills independently.
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
+        unreachable!()
+    };
+    let view = db.catalog().current_local_view().unwrap();
+    let (&id, _) = view
+        .sequences
+        .iter()
+        .find(|(_, d)| d.name == "blocked_a")
+        .unwrap();
+    let slot = db
+        .sql_counters
+        .lock()
+        .unwrap()
+        .entry(id)
+        .or_default()
+        .clone();
+    let guard = slot.counter.lock().unwrap();
+    let (started, waiting) = mpsc::channel();
+    let admin = f.admin.as_ref().unwrap().clone();
+    let a = thread::spawn(move || {
+        started.send(()).unwrap();
+        scalar(&mut admin.sql_session(), "SELECT nextval('blocked_a')")
+    });
+    waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let admin = f.admin.as_ref().unwrap().clone();
+    let b = thread::spawn(move || {
+        let value = scalar(&mut admin.sql_session(), "SELECT nextval('independent_b')");
+        tx.send(value).unwrap();
+    });
+    let result = rx.recv_timeout(Duration::from_secs(2));
+    drop(guard);
+    assert_eq!(a.join().unwrap(), 1);
+    b.join().unwrap();
+    assert_eq!(result.unwrap(), 1);
+}

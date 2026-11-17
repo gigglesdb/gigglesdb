@@ -82,7 +82,13 @@ impl SqlSession {
             }
             other => CoreError::from(other).into(),
         })?;
-        live.extend(self.pending_sequences.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        for (id, counter) in self.pending_sequences.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let slot = live.entry(*id).or_default();
+            let mut current = crate::cancellation::lock(&slot.counter)?;
+            if current.as_ref().is_none_or(|current| current.incarnation != counter.incarnation) {
+                *current = Some(counter.clone());
+            }
+        }
         drop(live);
         self.rollback();
         if reclaim { let _ = db.reclaim_background(); }

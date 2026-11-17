@@ -122,16 +122,18 @@ impl SqlSession {
             // A session finding no live entry reads the durable Seq
             // counter, now equal to our staged counter, and may advance it.
             // Keep any same-incarnation entry: it is at least as new.
-            let mut live = crate::cancellation::lock(&db.sql_counters)?;
             for (id, counter) in self.pending_sequences
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
             {
-                if live.get(id).is_none_or(|current| {
-                    current.incarnation != counter.incarnation
-                }) {
-                    live.insert(*id, counter.clone());
+                let slot = {
+                    let mut live = crate::cancellation::lock(&db.sql_counters)?;
+                    live.entry(*id).or_default().clone()
+                };
+                let mut current = crate::cancellation::lock(&slot.counter)?;
+                if current.as_ref().is_none_or(|current| current.incarnation != counter.incarnation) {
+                    *current = Some(counter.clone());
                 }
             }
         }

@@ -393,6 +393,20 @@ impl Catalog {
         Ok(self.snapshot(txn)?.parts.clone())
     }
 
+    /// Fresh local view without allocating/registering a transaction. DDL holds
+    /// this mutex across commit and publication, so a visible DDL timestamp
+    /// cannot select the previous view. Read the timestamp under the same lock
+    /// to avoid racing cache pruning. Gateways must use their routed read path.
+    pub(crate) fn current_local_view(&self) -> Result<Arc<CatalogView>, CoreError> {
+        self.check().map_err(CoreError::from)?;
+        let cache = self.cache.lock().map_err(|_| corrupt("catalog cache mutex poisoned"))?;
+        cache.ensure_live().map_err(CoreError::from)?;
+        let TxnServices::Local { seq, .. } = &self.services else {
+            return Err(corrupt("local catalog view requested on gateway"));
+        };
+        cache.view_at(seq.visible_ts()).ok_or_else(|| corrupt("missing current catalog view"))
+    }
+
     /// The committed catalog view at `txn`'s snapshot (task catalog reads,
     /// GD-0061). Ignores the transaction's own uncommitted catalog writes.
     pub(crate) fn committed_view(&self, txn: &mut Transaction) -> Result<Arc<CatalogView>, CoreError> {
