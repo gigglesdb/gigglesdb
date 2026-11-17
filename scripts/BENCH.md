@@ -139,3 +139,34 @@ data stays on `/home/user`, and both summary.md and meta.json say so.
   so only `common` compares all three targets.
 - Client and servers share one box. The client is pinned to two cores, which
   can limit very high client counts.
+
+## Optional profiling (`--profile`)
+
+Add `--profile` for one extra diagnostic repeat per selected GigglesDB target
+and client count, after all normal repeats. It uses the first selected mix
+and protocol group (native uses native). These 210 s loads are separate from
+`results.jsonl` and measured summary medians. The TTL estimate adds 300 s per
+extra repeat. Normal repeats never run under perf. Only profile builds export
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, changing the server cache key.
+
+The runner installs kernel perf tools if missing, enables perf permissions,
+and attempts 60 s CPU sampling at 999 Hz with DWARF stacks, 30 s BPF lock
+contention (falling back to lock record/report), and 30 s off-CPU stacks via
+`offcputime-bpfcc` (falling back to 20 s perf sched plus timehist). Missing
+packages, kernel support, or permissions are logged and never fail the bench.
+No cargo tools are installed for profiling.
+
+`profiles/` is included in `logs.tar.gz` and extracted beside `summary.md`:
+`top-<target>-c<clients>.txt`, `lock-...txt`, `offcpu-...txt`, and
+`folded-...txt`; `flame-...svg` is produced when `inferno-flamegraph` or
+`flamegraph.pl` is already on PATH. Otherwise retain the folded stacks for
+rendering later. Raw perf data is deleted on the box and excluded from download.
+`meta.json` adds `profile_requested`, `profiling_ran` (at least one successful
+CPU capture), and `perf_version`. Failures are in `logs/profile-*.capture.txt`
+and `logs/perf-*`.
+
+Each measured JSONL record also includes `ops` and `protocols` aggregates:
+count, p50_ms, p95_ms, p99_ms, max_ms, errors. Counts include failed operations;
+errors count terminal failures after retries, preserving existing semantics.
+Warmup is a separate invocation and is excluded. The summary includes a
+per-operation table for each measured run.

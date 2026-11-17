@@ -1,7 +1,7 @@
 import pg from "pg";
 import { query, assert, failure } from "./db.js";
 import { seed } from "./schema.js";
-import { stats } from "./stats.js";
+import { stats, LatencyRecorder } from "./stats.js";
 import { ops } from "./ops/index.js";
 import { random, type Kind } from "./ops/types.js";
 import { selected } from "./matrix.js";
@@ -92,6 +92,8 @@ export async function load(
     statementsPerOp: Record<string, number> = {},
     errors: Record<string, number> = {},
     details: unknown[] = [];
+  const opLatency = new LatencyRecorder(),
+    protocolLatency = new LatencyRecorder();
   const counters = { created: 0, deleted: 0 };
   let retries = 0,
     count = 0;
@@ -162,6 +164,7 @@ export async function load(
               : null;
             const rollback = () => (nq ? nq.rollback() : q("ROLLBACK"));
             const n = op.batched ? [1, 10, 100][Math.floor(rng() * 3)] : 1;
+            let failed = false;
             const t = performance.now();
             for (let attempt = 0; ; attempt++) {
               try {
@@ -185,6 +188,7 @@ export async function load(
                   retries++;
                   continue;
                 }
+                failed = true;
                 const key = op.name + ":" + f.code;
                 errors[key] = (errors[key] ?? 0) + 1;
                 if (details.length < 100)
@@ -193,6 +197,8 @@ export async function load(
               }
             }
             const ms = performance.now() - t;
+            opLatency.record(op.name, ms, failed);
+            protocolLatency.record(protocol, ms, failed);
             perOp[op.name].push(ms);
             (perOpBatch[op.name + "/" + n] ??= []).push(ms);
             perProtocol[op.name + "/" + protocol].push(ms);
@@ -248,6 +254,8 @@ export async function load(
     );
   return {
     frontend,
+    ops: opLatency.summary(),
+    protocols: protocolLatency.summary(),
     notApplicable,
     perOpBatch: Object.fromEntries(
       Object.entries(perOpBatch).map(([k, v]) => [k, stats(v)]),

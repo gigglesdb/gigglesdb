@@ -24,6 +24,8 @@
 #   --server-cpus 0-5 --client-cpus 6-7   taskset split (default: all but the
 #                           last two cores for servers, last two for the client)
 # Other options:
+#   --profile               extra diagnostic repeat per GigglesDB target/client
+#                           after normal repeats (first mix/protocol group)
 #   --ttl <seconds>         box lifetime, at most 7200 (default 7200)
 #   --slot-wait <seconds>   how long to wait for a free slot (default 1800)
 #   --data-root <box path>  server data parent dir on the box (default: probe
@@ -48,7 +50,7 @@ gate_snapshot=gigglesdb-gate-base
 max_starts=200   # plan-included starts per day, all agents
 max_boxes=${GATE_MAX_BOXES:-10}   # concurrent boxes, account-wide, shared with gates
 type=large       # benches run on large only
-tip='' who='' ttl=7200 slot_wait=1800 build_snapshot=0
+tip='' who='' ttl=7200 slot_wait=1800 build_snapshot=0 profile=0
 targets=pg,giggles-sql clients=8,32 mixes=read,write,tx protocols=all opset=common data_root=''
 warmup=30 duration=300 repeats=3 rows=1000 server_cpus='' client_cpus=''
 while [ $# -gt 0 ]; do
@@ -57,6 +59,7 @@ while [ $# -gt 0 ]; do
     --who) who=$2; shift 2 ;;
     --ttl) ttl=$2; shift 2 ;;
     --slot-wait) slot_wait=$2; shift 2 ;;
+    --profile) profile=1; shift ;;
     --build-snapshot) build_snapshot=1; shift ;;
     --targets) targets=$2; shift 2 ;;
     --clients) clients=$2; shift 2 ;;
@@ -100,6 +103,14 @@ nt=$(count "$targets"); per=$(( nt * $(count "$protocols") ))
 [[ ",$targets," == *",giggles-native,"* ]] && per=$(( (nt - 1) * $(count "$protocols") + 1 ))
 runs=$(( per * $(count "$clients") * $(count "$mixes") * repeats ))
 est=$(( runs * (warmup + duration + 30) ))
+# Extra diagnostic load, readiness and server lifecycle allowance.
+profile_runs=0
+if [ "$profile" = 1 ]; then
+  for t in ${targets//,/ }; do
+    [ "$t" = pg ] || profile_runs=$(( profile_runs + $(count "$clients") ))
+  done
+fi
+est=$(( est + profile_runs * 300 ))
 budget=$(( ttl - 1200 ))
 if [ $build_snapshot = 0 ] && [ "$est" -gt "$budget" ]; then
   echo "matrix of $runs runs needs ~$(( est / 60 )) min, over the $(( budget / 60 )) min a ${ttl}s box leaves after 20 min of build/setup." >&2
@@ -217,7 +228,7 @@ if [ $build_snapshot = 1 ]; then
 fi
 
 # 6. Run the bench in the background on the box and wait for it.
-envs="TARGETS=$targets CLIENTS=$clients MIXES=$mixes PROTOCOLS=$protocols OPSET=$opset WARMUP=$warmup DURATION=$duration REPEATS=$repeats ROWS=$rows"
+envs="PROFILE=$profile TARGETS=$targets CLIENTS=$clients MIXES=$mixes PROTOCOLS=$protocols OPSET=$opset WARMUP=$warmup DURATION=$duration REPEATS=$repeats ROWS=$rows"
 [ -n "$data_root" ] && envs+=" DATA_ROOT=$data_root"
 [ -n "$server_cpus" ] && envs+=" SERVER_CPUS=$server_cpus"
 [ -n "$client_cpus" ] && envs+=" CLIENT_CPUS=$client_cpus"
@@ -226,11 +237,13 @@ log "bench running: $runs runs, ~$(( est / 60 )) min after the build"
 wait_for /home/user/bench/done /home/user/bench/progress
 
 # 7. Copy results back.
-bexec "$box" "cd /home/user && tar czf bench-logs.tar.gz bench bench.out" >/dev/null
+bexec "$box" "cd /home/user && tar --exclude='*.data' --exclude='*.data.old' --exclude='raw-*' -czf bench-logs.tar.gz bench bench.out" >/dev/null
 ( cd "$run" && bj scp "$box:/home/user/bench-logs.tar.gz" logs.tar.gz >/dev/null 2>&1 ) || log "WARNING: log download failed"
 for f in summary.md results.jsonl meta.json; do
   tar -xzOf "$run/logs.tar.gz" "bench/$f" > "$run/$f" 2>/dev/null || bexec "$box" "cat /home/user/bench/$f" > "$run/$f" || true
 done
+# Small profile artifacts are also directly available beside the summary.
+tar -xzf "$run/logs.tar.gz" -C "$run" --strip-components=1 bench/profiles 2>/dev/null || true
 cat "$run/summary.md"
 grc=$(echo "$st" | grep -o '^rc=[0-9]*' | cut -d= -f2)
 log "bench rc=$grc; results in $run"

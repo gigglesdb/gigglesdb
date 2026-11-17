@@ -2,6 +2,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test": "tsx --test src/*.test.ts",
     "matrix": "tsx src/cli.ts matrix",
     "load": "tsx src/cli.ts load",
     "typecheck": "tsc --noEmit",

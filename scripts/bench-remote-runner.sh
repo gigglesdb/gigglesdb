@@ -16,6 +16,9 @@ source "$HOME/bench.env"
 repo=/home/user/gigglesdb
 out=/home/user/bench
 OPSET=${OPSET:-common}
+PROFILE=${PROFILE:-0}
+profile_ran=0
+perf_version=""
 rm -rf "$out"; mkdir -p "$out/logs"
 progress() { echo "$(date -u +%T) $*" >> "$out/progress"; }
 fail_setup() { progress "SETUP FAILED: $*"; echo "setup failed: $*" > "$out/summary.md"; declare -F stop_all >/dev/null && stop_all; echo "rc=2" > "$out/done"; exit 2; }
@@ -87,6 +90,7 @@ native_support=0
 grep -q -- 'frontend' "$lt/src/cli.ts" && native_support=1
 
 # 2. Release build.
+[ "$PROFILE" = 1 ] && export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 progress "cargo build --release giggles-server"
 command -v sccache >/dev/null 2>&1 && export RUSTC_WRAPPER=$(command -v sccache)
 s=$(date +%s)
@@ -299,7 +303,7 @@ line = {"target": t, "clients": int(c), "mix": m, "protocol": p, "repeat": int(r
         "opset": meta["opset"], "duration_s": meta["matrix"]["duration_s"], "warmup_s": meta["matrix"]["warmup_s"],
         "rows": meta["matrix"]["rows"], "nproc": meta["nproc"], "cpu_model": meta["cpu_model"],
         "server_cpus": meta["server_cpus"], "client_cpus": meta["client_cpus"], "commit": meta["commit"],
-        "data_fstype": meta["data_fstype"]}
+        "data_fstype": meta["data_fstype"], "ops": {}, "protocols": {}}
 if skip:
     line["skipped"] = skip
 else:
@@ -313,6 +317,7 @@ else:
                      "max_ms": lat.get("max"), "errors": errs, "error_detail": d.get("errors"),
                      "error_rate": (errs / n) if n else None,
                      "retries": d.get("retries"), "invariants": d.get("invariants"),
+                     "ops": d.get("ops", {}), "protocols": d.get("protocols", {}),
                      "not_applicable": sorted((d.get("notApplicable") or {}).keys()),
                      "failed": bool(d.get("failed")) or int(rc) != 0, "blocker": d.get("blocker")})
     except Exception as e:
@@ -320,6 +325,97 @@ else:
 open(res, "a").write(json.dumps(line) + "\n")
 PY
 done; done; done; done; done
+
+bench_profile() (
+set -uo pipefail
+pid=$1 out=$2 key=$3
+mkdir -p "$out"
+raw=$(mktemp -d "$out/raw-XXXXXX") || exit 0
+trap 'rm -rf "$raw"' EXIT
+log() { echo "profile $key: $*" >&2; }
+if sudo -n perf record -F 999 -g --call-graph dwarf,16384 -p "$pid" -o "$raw/perf.data" -- sleep 60; then
+  touch "$out/ran-$key"
+  sudo -n perf report -i "$raw/perf.data" --stdio --no-children --percent-limit 0.5 > "$out/top-$key.txt" || log "report failed"
+  # Fold leaf-first frames into root-first stacks without installing tools.
+  sudo -n perf script -i "$raw/perf.data" | awk '
+    function flush(    i,s) {
+      if(n) { s=f[n]; for(i=n-1;i>0;i--) s=s ";" f[i]; count[s]++ }
+      n=0
+    }
+    /^[[:space:]]*$/ { flush(); next }
+    /^[[:space:]]+[[:xdigit:]]+[[:space:]]/ {
+      line=$0; sub(/^[[:space:]]*[[:xdigit:]]+[[:space:]]+/, "", line)
+      sub(/[[:space:]]+\(.*$/, "", line); sub(/\+0x[[:xdigit:]]+$/, "", line)
+      gsub(/;/, ":", line); f[++n]=line
+    }
+    END { flush(); for(s in count) print s " " count[s] }
+  ' > "$out/folded-$key.txt" || log "fold failed"
+  if [ -s "$out/folded-$key.txt" ]; then
+    if command -v inferno-flamegraph >/dev/null 2>&1; then
+      inferno-flamegraph < "$out/folded-$key.txt" > "$out/flame-$key.svg" || log "inferno failed"
+    elif command -v flamegraph.pl >/dev/null 2>&1; then
+      flamegraph.pl < "$out/folded-$key.txt" > "$out/flame-$key.svg" || log "flamegraph failed"
+    else log "no renderer; keeping folded stacks"
+    fi
+  fi
+else log "CPU capture failed; trying other captures"
+fi
+if ! sudo -n perf lock contention -a -b -E 30 -- sleep 30 > "$out/lock-$key.txt"; then
+  log "BPF contention unavailable; trying lock record/report"
+  sudo -n perf lock record -o "$raw/lock.data" -- sleep 30 &&
+    sudo -n perf lock report -i "$raw/lock.data" > "$out/lock-$key.txt" || log "lock fallback failed"
+fi
+if command -v offcputime-bpfcc >/dev/null 2>&1; then
+  sudo -n offcputime-bpfcc -df -p "$pid" 30 > "$out/offcpu-$key.txt" || log "offcputime failed"
+else
+  sudo -n perf sched record -o "$raw/sched.data" -- sleep 20 &&
+    sudo -n perf sched timehist -i "$raw/sched.data" -s > "$out/offcpu-$key.txt" || log "sched fallback failed"
+fi
+exit 0
+)
+
+# Diagnostics follow ALL normal repeats; one per GigglesDB target/client count.
+if [ "$PROFILE" = 1 ] && { has giggles-sql || has giggles-native; }; then
+  profile_ready=1
+  if ! perf --version > "$out/logs/perf-version.txt" 2>&1; then
+    sudo -n apt-get install -y "linux-tools-$(uname -r)" linux-tools-common > "$out/logs/perf-install.txt" 2>&1 || {
+      progress "perf installation failed; skipping profiles"; profile_ready=0;
+    }
+  fi
+  if [ "$profile_ready" = 1 ]; then
+    perf_version=$(perf --version 2>/dev/null) || profile_ready=0
+    sudo -n sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 > "$out/logs/perf-sysctl.txt" 2>&1 || progress "perf sysctl failed (captures may be unavailable)"
+  fi
+  if [ "$profile_ready" = 1 ]; then
+    for c in "${C[@]}"; do for t in "${T[@]}"; do
+      [ "$t" = pg ] && continue
+      [ "$t" = giggles-native ] && [ "$native_support" = 0 ] && continue
+      tag="profile-$t-c$c"
+      if start_server "$t" "$tag"; then
+        progress "$tag mix=${M[0]} protocol=${P[0]}"
+        # Covers CPU, lock (including fallback), and off-CPU capture windows.
+        loadtest "$t" "$out/logs/$tag.json" "$out/logs/$tag.log" 210 "$c" "$(mixarg "${M[0]}")" "$(protoarg "${P[0]}")" &
+        load_pid=$!
+        # First progress line is after schema setup and seeding.
+        if wait_line "$out/logs/$tag.log" 'completed=' 60; then
+          bench_profile "$gg_pid" "$out/profiles" "$t-c$c" > "$out/logs/$tag.capture.txt" 2>&1 || progress "$tag capture failed (nonfatal)"
+        else progress "$tag load not ready; skipping captures"
+        fi
+        wait "$load_pid" || progress "$tag diagnostic load failed (nonfatal)"
+      else progress "$tag server start failed (nonfatal)"
+      fi
+      stop_server
+    done; done
+    if compgen -G "$out/profiles/ran-*" >/dev/null; then profile_ran=1; fi
+  fi
+fi
+python3 - "$out/meta.json" "$PROFILE" "$profile_ran" "$perf_version" <<'PYMETA'
+import json, sys
+path, requested, ran, version = sys.argv[1:]
+meta = json.load(open(path))
+meta.update(profile_requested=requested == "1", profiling_ran=ran == "1", perf_version=version or None)
+json.dump(meta, open(path, "w"), indent=1)
+PYMETA
 
 # 7. Summary (median of repeats per config). Failed runs stay in the table.
 python3 - "$out" "$build_s" <<'PY'
@@ -365,6 +461,12 @@ for (t, c, m, p), g in groups.items():
              f"{' / '.join(f(r.get('ops_per_s')) for r in ok)} | {'; '.join(notes)} |")
 L += ["", "Medians across repeats. Latency is per app operation (all statements, retries, commit), in ms.",
       "Compare ratios between targets within one box; absolute numbers vary between cloud boxes."]
+for r in rows:
+    L += ["", f"## Operations: {r['target']}, {r['clients']} clients, {r['mix']}, {r['protocol']}, repeat {r['repeat']}", "",
+          "| target | clients | mix | op | count | p50 ms | p99 ms |",
+          "|---|---|---|---|---|---|---|"]
+    for op, v in sorted(r.get("ops", {}).items()):
+        L.append(f"| {r['target']} | {r['clients']} | {r['mix']} | {op} | {v['count']} | {f(v['p50_ms'],2)} | {f(v['p99_ms'],2)} |")
 open(out + "/summary.md", "w").write("\n".join(L) + "\n")
 PY
 progress "done rc=$overall"
