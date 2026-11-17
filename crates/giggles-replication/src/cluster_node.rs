@@ -261,10 +261,9 @@ impl LocalRanges for CountedRanges {
     }
 }
 
-/// Approximate bytes the store holds for `range`. `RangeStore::approximate_size` arrives with
-/// GD-0075 Phase 9; until then the size is unknown.
-fn range_size(_store: &RangeStore, _range: RangeId) -> Option<u64> {
-    None
+/// Approximate bytes the store holds for `range`.
+fn range_size(store: &RangeStore, range: RangeId) -> Option<u64> {
+    store.approximate_size(range).ok()
 }
 
 /// Answers node-status calls; holds the host weakly (the transport's handlers outlive it).

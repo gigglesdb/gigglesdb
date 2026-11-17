@@ -345,7 +345,7 @@ fn every_node_reports_its_ranges_with_one_leader_each_and_counts_served_calls() 
                 assert_eq!(range.leader, report.node);
                 assert!(range.applied > 0, "{range:?}");
             }
-            assert!(range.window_ms > 0 && range.size.is_none());
+            assert!(range.window_ms > 0 && range.size.is_some());
         }
     }
     // wait_ready read every range through its leader: counters already moved.

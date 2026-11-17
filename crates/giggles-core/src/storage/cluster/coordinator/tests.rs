@@ -39,6 +39,9 @@ struct FakeCluster {
     logs: Mutex<HashMap<RangeId, Arc<MemLog>>>,
     fail_prepare: Option<RangeId>,
     home_down: AtomicBool,
+    home_ready_at: Option<Instant>,
+    prepare_fault: Mutex<Option<(RangeId, usize, RangeError)>>,
+    prepare_calls: AtomicUsize,
     /// When non-zero, home ops with another epoch are refused as stale.
     home_epoch: AtomicU64,
     lose_decide_reply: AtomicBool,
@@ -62,6 +65,9 @@ impl FakeCluster {
             logs: Mutex::new(HashMap::new()),
             fail_prepare: None,
             home_down: AtomicBool::new(false),
+            home_ready_at: None,
+            prepare_fault: Mutex::new(None),
+            prepare_calls: AtomicUsize::new(0),
             home_epoch: AtomicU64::new(0),
             lose_decide_reply: AtomicBool::new(false),
             after_lost_reply: Mutex::new(None),
@@ -96,7 +102,9 @@ impl FakeCluster {
     /// Runs recovery on every home range as if `after` had passed since the last operation.
     fn recover(&self, after: Duration) {
         let cfg = RecoveryConfig {
-            recover_after: Duration::from_secs(5),
+            // Coordinator failover retries can now consume five real seconds. Keep the
+            // synthetic one-second recovery below the timeout; sixty seconds still expires it.
+            recover_after: Duration::from_secs(60),
             finish_after: Duration::from_secs(1),
         };
         let homes: Vec<_> = self.homes.lock().unwrap().values().cloned().collect();
@@ -189,6 +197,15 @@ impl RangeClient for Link<'_> {
         lock_generation: Option<u64>,
     ) -> Result<Timestamp, RangeError> {
         self.call()?;
+        self.cluster.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some((target, remaining, error)) =
+            self.cluster.prepare_fault.lock().unwrap().as_mut()
+            && *target == range
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Err(error.clone());
+        }
         if self.cluster.fail_prepare == Some(range) {
             return Err(RangeError::Aborted("injected prepare failure".into()));
         }
@@ -226,6 +243,13 @@ impl RangeClient for Link<'_> {
     }
     fn home(&self, range: RangeId, epoch: Epoch, op: HomeOp) -> Result<HomeReply, RangeError> {
         self.call()?;
+        if self
+            .cluster
+            .home_ready_at
+            .is_some_and(|at| Instant::now() < at)
+        {
+            return Err(not_leader());
+        }
         if self.cluster.home_down.load(Ordering::SeqCst) {
             return Err(RangeError::Unavailable("home down".into()));
         }
@@ -429,7 +453,17 @@ fn single_participant_commits_and_forgets_home() {
 fn home_unreachable_before_open_is_a_definite_abort_and_releases_locks() {
     let fake = FakeCluster::new(&ids(&[1, 2, 3]), TXN);
     fake.home_down.store(true, Ordering::SeqCst);
+    let start = Instant::now();
     let err = commit_cross_range(&Link::up(&fake), plan(&[1, 2], &[3])).unwrap_err();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= FAILOVER_WINDOW,
+        "returned too early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < FAILOVER_WINDOW + Duration::from_secs(1),
+        "{elapsed:?}"
+    );
     assert!(matches!(err, CommitError::Aborted(_)), "{err:?}");
     assert_clean(&fake);
 }
@@ -594,4 +628,47 @@ fn home_records_stay_bounded_under_sustained_commits() {
             .all(|rs| rs.prepared.is_empty() && rs.locks.is_empty())
     );
     assert!(ranges.values().all(|rs| rs.versions.len() == 200));
+}
+
+fn not_leader() -> RangeError {
+    RangeError::NotLeader { hint: None }
+}
+
+#[test]
+fn home_becomes_leader_after_300ms_and_commit_succeeds() {
+    let mut fake = FakeCluster::new(&ids(&[1, 2]), TXN);
+    let start = Instant::now();
+    fake.home_ready_at = Some(start + Duration::from_millis(300));
+    let c = commit_cross_range(&Link::up(&fake), plan(&[1, 2], &[])).unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(300));
+    assert_eq!(applied(&fake, &[1, 2]), Some(c));
+    assert_clean(&fake);
+}
+
+#[test]
+fn participant_prepare_not_leader_twice_then_commits() {
+    let fake = FakeCluster::new(&ids(&[1, 2]), TXN);
+    *fake.prepare_fault.lock().unwrap() = Some((RangeId(2), 2, not_leader()));
+    let c = commit_cross_range(&Link::up(&fake), plan(&[1, 2], &[])).unwrap();
+    assert_eq!(fake.prepare_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(applied(&fake, &[1, 2]), Some(c));
+    assert_clean(&fake);
+}
+
+#[test]
+fn unknown_prepare_is_not_retried() {
+    let fake = FakeCluster::new(&ids(&[1]), TXN);
+    *fake.prepare_fault.lock().unwrap() = Some((
+        RangeId(1),
+        2,
+        RangeError::Unknown("prepare reply lost".into()),
+    ));
+    let err = commit_cross_range(&Link::up(&fake), plan(&[1], &[])).unwrap_err();
+    assert!(
+        matches!(err, CommitError::Aborted(RangeError::Unknown(_))),
+        "{err:?}"
+    );
+    assert_eq!(fake.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(applied(&fake, &[1]), None);
+    assert_clean(&fake);
 }

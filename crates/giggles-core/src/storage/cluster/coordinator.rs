@@ -14,8 +14,34 @@ use crate::range_api::{
     Timestamp,
 };
 
-/// Bounded attempts for one home or finalize operation on retryable errors.
-const RETRIES: usize = 5;
+use std::time::{Duration, Instant};
+
+use super::txn::FAILOVER_WINDOW;
+
+/// Retry transient failures long enough for a replacement leader to become ready.
+fn backoff_retry<T>(
+    mut op: impl FnMut() -> Result<T, RangeError>,
+    retry: impl Fn(&RangeError) -> bool,
+) -> Result<T, RangeError> {
+    let deadline = Instant::now() + FAILOVER_WINDOW;
+    let mut delay = Duration::from_millis(5);
+    loop {
+        match op() {
+            Err(e) if retry(&e) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(e);
+                }
+                std::thread::sleep(delay.min(remaining));
+                if Instant::now() >= deadline {
+                    return Err(e);
+                }
+                delay = (delay * 2).min(Duration::from_millis(200));
+            }
+            result => return result,
+        }
+    }
+}
 
 /// One range the transaction wrote, with its writes there.
 pub(crate) struct Participant {
@@ -58,21 +84,23 @@ fn home_op(
     op: HomeOp,
 ) -> Result<HomeReply, RangeError> {
     let mut epoch = epoch;
-    let mut last = RangeError::Unavailable("no attempt".into());
-    for _ in 0..RETRIES {
-        match client.home(home, epoch, op.clone()) {
-            Ok(reply) => return Ok(reply),
-            Err(RangeError::StaleEpoch { descriptor })
-                if descriptor.id == home && descriptor.epoch != epoch =>
-            {
-                epoch = descriptor.epoch;
-                last = RangeError::StaleEpoch { descriptor };
+    let updated_epoch = std::cell::Cell::new(false);
+    backoff_retry(
+        || {
+            updated_epoch.set(false);
+            match client.home(home, epoch, op.clone()) {
+                Err(RangeError::StaleEpoch { descriptor })
+                    if descriptor.id == home && descriptor.epoch != epoch =>
+                {
+                    updated_epoch.set(true);
+                    epoch = descriptor.epoch;
+                    Err(RangeError::StaleEpoch { descriptor })
+                }
+                result => result,
             }
-            Err(e) if retryable(&e) => last = e,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(last)
+        },
+        |e| retryable(e) || updated_epoch.get(),
+    )
 }
 
 fn finalize(
@@ -81,14 +109,23 @@ fn finalize(
     txn: ClusterTxnId,
     outcome: &Outcome,
 ) -> bool {
-    for _ in 0..RETRIES {
-        match client.finalize(range, txn, outcome.clone()) {
-            Ok(()) => return true,
-            Err(e) if retryable(&e) => continue,
-            Err(_) => return false,
-        }
-    }
-    false
+    backoff_retry(|| client.finalize(range, txn, outcome.clone()), retryable).is_ok()
+}
+
+/// Only retry prepare refusals that guarantee no prepared record was applied.
+fn prepare_with_retry(
+    client: &dyn RangeClient,
+    range: RangeId,
+    epoch: Epoch,
+    txn: ClusterTxnId,
+    home: RangeId,
+    writes: Vec<RangeWrite>,
+    lock_generation: Option<u64>,
+) -> Result<Timestamp, RangeError> {
+    backoff_retry(
+        || client.prepare(range, epoch, txn, home, writes.clone(), lock_generation),
+        |e| matches!(e, RangeError::NotLeader { .. } | RangeError::Unavailable(_)),
+    )
 }
 
 /// Releases T's unprepared locks on every participant and lock-only range. Called on every
@@ -208,7 +245,8 @@ pub(crate) fn commit_cross_range(
             .iter()
             .map(|p| {
                 s.spawn(move || {
-                    let prepared_at = client.prepare(
+                    let prepared_at = prepare_with_retry(
+                        client,
                         p.range,
                         p.epoch,
                         txn,
