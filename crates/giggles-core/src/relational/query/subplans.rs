@@ -304,7 +304,7 @@ mod tests {
             .get(match q.where_filter().unwrap() { Filter::InSubquery { query, .. } => query.as_ref() as *const Query as usize,
                 _ => panic!("IN child") }, SubplanMode::In).unwrap().outer_slots.len(), 1);
         let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
-        assert!(matches!(state.execute_with_cancel(&prepared, &[], None, || false), Err(SqlError::Unsupported)));
+        assert!(state.execute_with_cancel(&prepared, &[], None, || false).unwrap().rows.is_empty());
     }
 
     #[test]

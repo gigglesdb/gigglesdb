@@ -30,11 +30,11 @@ fn exists_public_oracle_on_each_engine() {
             ("SELECT id FROM o WHERE EXISTS(SELECT missing FROM i)", SqlError::UnknownColumn),
             ("SELECT id FROM o WHERE EXISTS(SELECT nosuchfn() FROM i)", SqlError::UndefinedFunction),
         ] { assert_eq!(s.execute(sql, &[], None), Err(CoreError::Sql(expected))); }
+        for sql in ["SELECT (SELECT 1)", "SELECT id FROM o WHERE id=(SELECT 1)"] {
+            assert_eq!(run(&mut s, sql).rows.into_iter().map(|r| r.values).collect::<Vec<_>>(), vec![vec![V::Int(1)]], "{engine:?}: {sql}");
+        }
         assert_eq!(run(&mut s, "UPDATE o SET id=10 WHERE EXISTS(SELECT NULL FROM i WHERE k=o.id)").affected, 2);
         assert_eq!(run(&mut s, "DELETE FROM o WHERE NOT EXISTS(SELECT NULL FROM i WHERE k=o.id)").affected, 4);
-        for sql in ["SELECT (SELECT 1)", "SELECT id FROM o WHERE id=(SELECT 1)"] {
-            assert_eq!(s.execute(sql, &[], None), Err(CoreError::Sql(SqlError::Unsupported)));
-        }
         assert_eq!(s.prepare("SELECT 1 WHERE EXISTS(SELECT abs(-1))").unwrap().table(), None);
         assert!(s.prepare("SELECT 1 WHERE EXISTS(SELECT nosuchfn())").unwrap().table().is_some());
         drop(s); drop(admin); std::fs::remove_dir_all(path).unwrap();

@@ -1245,13 +1245,14 @@ fn legacy_unsupported_read_forms_keep_exact_errors() {
         let result = parity(&mut a, &mut b, sql, &[]).unwrap();
         assert_eq!(result.rows.into_iter().map(|r| r.values).collect::<Vec<_>>(), expected, "{sql}");
     }
-    for sql in [
-        "SELECT (SELECT id FROM b) FROM a",
-        "SELECT id FROM a WHERE id=(SELECT id FROM b)",
-        "INSERT INTO b SELECT id FROM a UNION SELECT id FROM b",
+    for (sql, expected) in [
+        ("SELECT (SELECT id FROM b) FROM a", vec![vec![relational::Value::Int(2)]]),
+        ("SELECT id FROM a WHERE id=(SELECT id FROM b)", vec![]),
     ] {
-        parity(&mut a, &mut b, sql, &[]).unwrap_err();
+        let result = parity(&mut a, &mut b, sql, &[]).unwrap();
+        assert_eq!(result.rows.into_iter().map(|r| r.values).collect::<Vec<_>>(), expected, "{sql}");
     }
+    parity(&mut a, &mut b, "INSERT INTO b SELECT id FROM a UNION SELECT id FROM b", &[]).unwrap_err();
     drop((a, b, legacy));
     fs::remove_dir_all(path).unwrap();
 }

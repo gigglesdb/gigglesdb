@@ -172,12 +172,12 @@ fn binding_arity_types_and_correlation_errors() {
     ] {
         assert_eq!(rows(s, sql), ints(&[2]));
     }
-    for sql in [
-        "SELECT id FROM t WHERE id IN (SELECT u.id FROM u WHERE u.id=t.id)",
-        "SELECT id FROM t WHERE id IN (SELECT id FROM u WHERE x=t.id)",
-        "SELECT v FROM t WHERE id IN (SELECT id FROM u WHERE v='a')",
+    for (sql, expected) in [
+        ("SELECT id FROM t WHERE id IN (SELECT u.id FROM u WHERE u.id=t.id)", ints(&[2])),
+        ("SELECT id FROM t WHERE id IN (SELECT id FROM u WHERE x=t.id)", vec![]),
+        ("SELECT v FROM t WHERE id IN (SELECT id FROM u WHERE v='a')", vec![]),
     ] {
-        error(s, sql, E::Unsupported);
+        assert_eq!(rows(s, sql), expected, "{sql}");
     }
     error(
         s,
@@ -288,19 +288,31 @@ fn unsupported_subquery_positions_remain_unsupported() {
     let mut db = Db::new();
     let s = db.session();
     fixture(s);
+    error(s, "SELECT (SELECT id FROM u) FROM t", E::CardinalityViolation);
+    for (sql, expected) in [
+        ("SELECT id FROM t WHERE id = ANY (SELECT id FROM u)", ints(&[2])),
+        ("SELECT id FROM t WHERE id = ALL (SELECT id FROM u)", vec![]),
+        ("SELECT id,id IN (SELECT id FROM u) AS m FROM t ORDER BY id",
+         vec![vec![V::Int(1), V::Bool(false)], vec![V::Int(2), V::Bool(true)], vec![V::Int(3), V::Bool(false)]]),
+        ("SELECT (id IN (SELECT n FROM u)) IS NULL AS unk,id FROM t ORDER BY id",
+         vec![vec![V::Bool(true), V::Int(1)], vec![V::Bool(true), V::Int(2)], vec![V::Bool(false), V::Int(3)]]),
+        ("SELECT NULL::int IN (SELECT id FROM u WHERE false)", vec![vec![V::Bool(false)]]),
+        ("SELECT '2' IN (SELECT id FROM u) AS lit", vec![vec![V::Bool(true)]]),
+        ("SELECT CASE WHEN id IN (SELECT id FROM u) THEN 1 ELSE 0 END FROM t", ints(&[0, 1, 0])),
+        ("SELECT id FROM t WHERE CASE WHEN id IN (SELECT id FROM u) THEN true ELSE false END", ints(&[2])),
+        ("SELECT count(*) FILTER (WHERE id IN (SELECT id FROM u)) FROM t", ints(&[1])),
+    ] {
+        assert_eq!(rows(s, sql), expected, "{sql}");
+    }
+    let mut ordered = rows(s, "SELECT id FROM t ORDER BY id IN (SELECT id FROM u)");
+    assert_eq!(ordered.pop(), Some(vec![V::Int(2)]));
+    ordered.sort_by_key(|row| match row.as_slice() {
+        [V::Int(id)] => *id,
+        _ => panic!("{row:?}"),
+    });
+    assert_eq!(ordered, ints(&[1, 3]));
     for sql in [
-        "SELECT (SELECT id FROM u) FROM t",
-        "SELECT id FROM t WHERE id = ANY (SELECT id FROM u)",
-        "SELECT id FROM t WHERE id = ALL (SELECT id FROM u)",
-        "SELECT id,id IN (SELECT id FROM u) AS m FROM t ORDER BY id",
-        "SELECT (id IN (SELECT n FROM u)) IS NULL AS unk,id FROM t ORDER BY id",
-        "SELECT NULL::int IN (SELECT id FROM u WHERE false)",
-        "SELECT '2' IN (SELECT id FROM u) AS lit",
         "SELECT id FROM t WHERE (id,v) IN (SELECT id,'b' FROM u)",
-        "SELECT CASE WHEN id IN (SELECT id FROM u) THEN 1 ELSE 0 END FROM t",
-        "SELECT id FROM t WHERE CASE WHEN id IN (SELECT id FROM u) THEN true ELSE false END",
-        "SELECT count(*) FILTER (WHERE id IN (SELECT id FROM u)) FROM t",
-        "SELECT id FROM t ORDER BY id IN (SELECT id FROM u)",
         "UPDATE t SET v=CASE WHEN id IN (SELECT id FROM u) THEN 'z' ELSE v END",
         "DELETE FROM t RETURNING id IN (SELECT id FROM u)",
         "UPDATE t SET v='z' RETURNING id IN (SELECT id FROM u)",

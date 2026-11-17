@@ -37,8 +37,115 @@ pub(super) fn top(tokens: &[Token]) -> R<Vec<usize>> {
 }
 impl Plan {
     pub(in crate::relational) fn claims(tokens: &[Token]) -> bool {
-        matches!(tokens.first(), Some(Token::Word(w)) if ["select", "values", "table", "with"].contains(&w.as_str()))
-            || tokens.first() == Some(&Token::Symbol('('))
+        if tokens.first() == Some(&Token::Symbol('(')) {
+            // Parenthesized query expressions are owned by the planner.
+            return true;
+        }
+        if !tokens.first().is_some_and(|t| word(t, "select")) {
+            return tokens
+                .first()
+                .is_some_and(|t| ["values", "table", "with"].iter().any(|w| word(t, w)));
+        }
+        // Claim detection must still see a planner construct when a later
+        // operand exceeds the depth limit. Plan::parse owns validation.
+        let mut depth = 0usize;
+        let positions: Vec<_> = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                if *t == Token::Symbol(')') {
+                    depth = depth.saturating_sub(1);
+                }
+                let position = (depth == 0).then_some(i);
+                if *t == Token::Symbol('(') {
+                    depth += 1;
+                }
+                position
+            })
+            .collect();
+        // A simple derived scan already belongs to Query. Probe just FROM so
+        // an unrelated rejected projection cannot make that scan a claim.
+        let legacy_derived = positions.iter().copied().find_map(|start| {
+            if !word(&tokens[start], "from")
+                || start
+                    .checked_sub(1)
+                    .is_some_and(|p| word(&tokens[p], "distinct"))
+                || tokens.get(start + 1) != Some(&Token::Symbol('('))
+            {
+                return None;
+            }
+            let end = positions
+                .iter()
+                .copied()
+                .find(|i| {
+                    *i > start
+                        && [
+                            "where", "group", "having", "order", "limit", "offset", "fetch", "for",
+                        ]
+                        .iter()
+                        .any(|w| word(&tokens[*i], w))
+                })
+                .unwrap_or(tokens.len());
+            let mut probe = vec![Token::Word("select".into()), Token::Symbol('*')];
+            probe.extend_from_slice(&tokens[start..end]);
+            Query::parse(&mut parser(&probe)).ok().map(|_| start + 1)
+        });
+        if subquery::quantified(tokens)
+            || tokens.windows(2).enumerate().any(|(i, pair)| {
+                Some(i) != legacy_derived
+                    && pair[0] == Token::Symbol('(')
+                    && ["select", "values", "table", "with"]
+                        .iter()
+                        .any(|w| word(&pair[1], w))
+            })
+        {
+            return true;
+        }
+        let mut from = false;
+        let mut from_item = false;
+        let mut order = false;
+        for i in positions {
+            let t = &tokens[i];
+            if ["union", "intersect", "except"].iter().any(|w| word(t, w)) {
+                return true;
+            }
+            if word(t, "from")
+                && !i
+                    .checked_sub(1)
+                    .is_some_and(|p| word(&tokens[p], "distinct"))
+            {
+                from = true;
+                from_item = true;
+            } else if [
+                "where", "group", "having", "order", "limit", "offset", "fetch", "for",
+            ]
+            .iter()
+            .any(|w| word(t, w))
+            {
+                from = false;
+            }
+            if from && word(t, "join") {
+                from_item = true;
+            } else if word(t, "on") {
+                from_item = false;
+            }
+            // Ordinary scans and INNER/LEFT ON joins stay with the legacy path.
+            // Parentheses here cover FROM functions, alias lists and join trees.
+            if from
+                && (*t == Token::Symbol(',')
+                    || from_item && *t == Token::Symbol('(') && Some(i) != legacy_derived
+                    || ["lateral", "natural", "right", "full", "cross", "using"]
+                        .iter()
+                        .any(|w| word(t, w)))
+            {
+                return true;
+            }
+            order |= word(t, "order");
+            if order && word(t, "using") {
+                return true;
+            }
+        }
+        false
     }
     pub(in crate::relational) fn parse(p: &mut Parser) -> ParseResult<Self> {
         let mut tokens = p.tokens[p.at..].to_vec();

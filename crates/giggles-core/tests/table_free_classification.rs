@@ -52,7 +52,17 @@ fn only_proven_table_free_scalar_queries_have_no_gateway_target() {
     ] {
         if let Ok(p) = s.prepare(sql) {
             assert!(p.table().is_some(), "{sql}");
-            assert!(s.describe(&p).is_err(), "{sql}");
+            if let Some(data_type) = match sql {
+                "SELECT format('%s',(SELECT id FROM a))" => Some(giggles_core::relational::DataType::Text),
+                "SELECT greatest(1,(SELECT id FROM a))" | "SELECT (SELECT id FROM a)" => Some(giggles_core::relational::DataType::BigInt),
+                _ => None,
+            } {
+                let description = s.describe(&p).unwrap();
+                assert_eq!(description.columns.len(), 1, "{sql}");
+                assert_eq!(description.columns[0].data_type, data_type, "{sql}");
+            } else {
+                assert!(s.describe(&p).is_err(), "{sql}");
+            }
         }
     }
     let p = s.prepare("WITH x AS (SELECT id FROM a) SELECT id FROM x").unwrap();

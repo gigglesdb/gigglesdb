@@ -1,5 +1,52 @@
 use super::*;
 
+#[test]
+fn claims_only_planner_constructs() {
+    for sql in [
+        "SELECT 1",
+        "SELECT 1 IS DISTINCT FROM abs(nextval('s'))",
+        "SELECT abs(nextval('s')) FROM a",
+        "SELECT id FROM (SELECT id FROM a) q",
+        "SELECT abs(nextval('s')) FROM (SELECT id FROM a) q",
+        "SELECT a.id FROM a JOIN b ON a.id=b.id",
+        "SELECT a.id FROM a LEFT OUTER JOIN b ON a.id=b.id",
+        "SELECT a.id FROM a JOIN b ON (a.id=b.id)",
+        "SELECT a.id FROM a JOIN b ON a.id=abs(nextval('s'))",
+        "SELECT 'union lateral using (select)'",
+        "SELECT \"union\" FROM \"lateral\"",
+        "UPDATE a SET id=1",
+    ] {
+        assert!(!Plan::claims(&lex(sql).unwrap()), "{sql}");
+    }
+    for sql in [
+        "SELECT 1 UNION SELECT 2",
+        "SELECT 1 INTERSECT SELECT 2",
+        "SELECT 1 EXCEPT SELECT 2",
+        "WITH q AS (SELECT 1) SELECT * FROM q",
+        "VALUES (1)",
+        "TABLE a",
+        "(SELECT 1)",
+        "SELECT (SELECT 1)",
+        "SELECT 1 IN (SELECT 1)",
+        "SELECT 1 = ANY (ARRAY[1])",
+        "SELECT 1 = ALL (SELECT 1)",
+        "SELECT 1 = SOME (SELECT 1)",
+        "SELECT * FROM LATERAL (SELECT 1) q",
+        "SELECT * FROM pg_catalog.generate_series(1,2)",
+        "SELECT * FROM a RIGHT JOIN b ON a.id=b.id",
+        "SELECT * FROM a FULL JOIN b ON a.id=b.id",
+        "SELECT * FROM a CROSS JOIN b",
+        "SELECT * FROM a NATURAL JOIN b",
+        "SELECT * FROM a JOIN b USING(id)",
+        "SELECT * FROM a,b",
+        "SELECT * FROM (a JOIN b ON a.id=b.id) q",
+        "SELECT * FROM (SELECT 1) q(n)",
+        "SELECT 1 ORDER BY 1 USING >",
+    ] {
+        assert!(Plan::claims(&lex(sql).unwrap()), "{sql}");
+    }
+}
+
 fn assert_parse_limit(sql: &str) {
     let started = std::time::Instant::now();
     assert_eq!(Prepared::parse(sql, 1, 0).unwrap_err(), SqlError::Limit);
