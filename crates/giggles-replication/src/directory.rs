@@ -136,3 +136,14 @@ pub fn decode_record(
     }
     Ok(Some(desc))
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn directory_tag_matches_core_apply_guard() {
+        assert_eq!(
+            super::DIRECTORY_TAG,
+            giggles_core::range_api::DIRECTORY_TAG
+        );
+    }
+}

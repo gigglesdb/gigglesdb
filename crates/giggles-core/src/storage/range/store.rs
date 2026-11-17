@@ -20,11 +20,13 @@ use super::keys::{contains_raw, interval_in_range};
 use super::local::{applied_key, decode_applied, encode_applied, local_interval};
 use crate::CoreError;
 use crate::storage::engine::{
-    kv::{Durability, Keyspace, KvBackend, KvRead, Op, WriteBatch},
+    codec,
+    hlc::Ts,
+    kv::{Direction, Durability, Keyspace, KvBackend, KvRead, Op, WriteBatch},
     kv_rocksdb::{RocksKv, WriterLock},
     meta::{self, RangeLocalKey, check_range_value, parse_range_local_key, range_local_key},
 };
-use crate::storage::range_api::{RangeDescriptor, RangeId};
+use crate::storage::range_api::{DIRECTORY_TAG, RangeDescriptor, RangeId, SYSTEM_RANGE};
 use crate::storage::replicated::AppliedPosition;
 use crate::storage::{io, v2};
 
@@ -39,7 +41,7 @@ pub enum RangeApplyOutcome {
     Applied,
     /// At or below the applied position; nothing changed.
     Skipped,
-    /// A batch op was outside the range: no data changed, the position advanced.
+    /// A batch failed an apply-time guard: no data changed, the position advanced.
     Refused,
 }
 
@@ -203,6 +205,9 @@ impl RangeStore {
             None => WriteBatch::default(),
         };
         let (mut batch, outcome) = match check_batch(&descriptor, &batch) {
+            Ok(_) if range == SYSTEM_RANGE && self.directory_regression(&batch)?.is_some() => {
+                (WriteBatch::default(), None)
+            }
             Ok(check) => (batch, Some(check)),
             Err(BatchError::Outside(_)) => (WriteBatch::default(), None),
             // A value this build cannot validate (for example a feature bit from a newer
@@ -243,6 +248,61 @@ impl RangeStore {
                 Ok(RangeApplyOutcome::Applied)
             }
         }
+    }
+
+    /// Along a directory end key, splits and membership changes only increase the epoch.
+    /// Check under the system range's apply lock so a stale publisher cannot replace a newer
+    /// descriptor, or change a descriptor at the same epoch. Malformed values retain their
+    /// existing behaviour; only live, decodable descriptors participate in this guard.
+    fn directory_regression(&self, batch: &WriteBatch) -> Result<Option<String>, CoreError> {
+        use std::ops::Bound::Included;
+
+        for op in batch.ops() {
+            let Op::Put {
+                ks: Keyspace::Catalog,
+                key,
+                value,
+            } = op
+            else {
+                continue;
+            };
+            let Ok((user, _)) = codec::split_versioned(key) else {
+                continue;
+            };
+            if user.first() != Some(&DIRECTORY_TAG) || value.first() != Some(&0) {
+                continue;
+            }
+            let Ok(new) = RangeDescriptor::decode(&value[1..]) else {
+                continue;
+            };
+            let lower = codec::user_key_seek_at(user, Ts(u64::MAX));
+            let upper = codec::user_key_seek_at(user, Ts(0));
+            for item in self.kv.range(
+                Keyspace::Catalog,
+                Included(&lower),
+                Included(&upper),
+                Direction::Forward,
+            )? {
+                let (stored_key, stored_value) = item?;
+                // Ignore other user keys even if a non-directory key shares this prefix.
+                if !codec::split_versioned(&stored_key).is_ok_and(|(key, _)| key == user) {
+                    continue;
+                }
+                if stored_value.first() == Some(&0)
+                    && let Ok(stored) = RangeDescriptor::decode(&stored_value[1..])
+                    && (stored.epoch > new.epoch
+                        || (stored.epoch == new.epoch && stored_value != *value))
+                {
+                    return Ok(Some(format!(
+                        "directory epoch regression: stored {}, proposed {}",
+                        stored.epoch.0, new.epoch.0
+                    )));
+                }
+                // Only the newest version matters, including a tombstone or invalid value.
+                break;
+            }
+        }
+        Ok(None)
     }
 
     /// The apply contract, under the range's apply lock: an unfinished install or a gap is an

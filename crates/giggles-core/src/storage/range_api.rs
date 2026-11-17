@@ -104,6 +104,8 @@ pub fn first_user_key() -> Vec<u8> {
     range_key(RangeSpace::Rows, &[])
 }
 
+/// Catalog directory-record tag; must match `giggles_replication::directory::DIRECTORY_TAG`.
+pub const DIRECTORY_TAG: u8 = 0xF0;
 /// Catalog user-key tag of transaction-status records `XACT/<xid>` in the system range
 /// (GD-0075 R5-55), next to Track B's directory tags 0xF0..=0xF2.
 pub const XACT_TAG: u8 = 0xF3;

@@ -291,3 +291,116 @@ fn invalid_range_values_stop_the_range_instead_of_being_refused() {
     assert_eq!(store.apply(a, &outside, pos(1, 1)).unwrap(), RangeApplyOutcome::Refused);
     assert_eq!(store.applied(a).unwrap(), Some(pos(1, 1)));
 }
+
+/// Distinct commit timestamps model two publishers that read before either commits.
+fn directory_value(desc: &RangeDescriptor) -> Vec<u8> {
+    let mut value = vec![0];
+    value.extend(desc.encode().unwrap());
+    value
+}
+fn directory_put(value: &[u8], ts: u64) -> Vec<u8> {
+    let key = codec::user_key_seek_at(&[DIRECTORY_TAG, 0xFF, 0xFF], Ts(ts));
+    put(Keyspace::Catalog, key, value)
+}
+
+#[test]
+fn directory_publish_epochs_are_monotonic_at_apply() {
+    let dir = Dir::new("directory-epoch");
+    let store = two_ranges(&dir);
+    let mut older = descriptors()[1].clone();
+    older.epoch = Epoch(5);
+    let old = directory_value(&older);
+    let mut newer = older.clone();
+    newer.epoch = Epoch(6);
+    let new = directory_value(&newer);
+    let apply = |value: &[u8], index| {
+        store
+            .apply(SYSTEM_RANGE, &directory_put(value, index), pos(index, 1))
+            .unwrap()
+    };
+    assert_eq!(apply(&old, 1), RangeApplyOutcome::Applied);
+    assert_eq!(apply(&new, 2), RangeApplyOutcome::Applied);
+    let before = rows(&store, Keyspace::Catalog);
+    // The stale publisher commits last, with a newer MVCC timestamp but an older epoch.
+    let mut stale = WriteBatch::decode(&directory_put(&old, 3)).unwrap();
+    stale.put(
+        Keyspace::Catalog,
+        codec::user_key_seek_at(b"other", Ts(3)),
+        vec![0, 7],
+    );
+    assert_eq!(
+        store
+            .apply(SYSTEM_RANGE, &stale.encode(), pos(3, 1))
+            .unwrap(),
+        RangeApplyOutcome::Refused
+    );
+    assert_eq!(rows(&store, Keyspace::Catalog), before);
+    assert_eq!(store.applied(SYSTEM_RANGE).unwrap(), Some(pos(3, 1)));
+    assert_eq!(apply(&new, 4), RangeApplyOutcome::Applied);
+    let before = rows(&store, Keyspace::Catalog);
+    newer.replicas[0].node = 2;
+    assert_eq!(
+        apply(&directory_value(&newer), 5),
+        RangeApplyOutcome::Refused
+    );
+    assert_eq!(rows(&store, Keyspace::Catalog), before);
+    assert_eq!(store.applied(SYSTEM_RANGE).unwrap(), Some(pos(5, 1)));
+    // Same epoch with different bounds is also refused (byte equality, not replica equality).
+    newer.replicas[0].node = 1;
+    newer.start.push(1);
+    assert_eq!(
+        apply(&directory_value(&newer), 6),
+        RangeApplyOutcome::Refused
+    );
+    drop(store);
+    let reopened = RangeStore::open(dir.sub("db")).unwrap();
+    assert_eq!(reopened.applied(SYSTEM_RANGE).unwrap(), Some(pos(6, 1)));
+    assert_eq!(rows(&reopened, Keyspace::Catalog), before);
+}
+
+#[test]
+fn directory_guard_uses_only_newest_live_decodable_value() {
+    for replacement in [vec![1], vec![0, 42]] {
+        let dir = Dir::new("directory-tombstone");
+        let store = two_ranges(&dir);
+        let mut desc = descriptors()[1].clone();
+        desc.epoch = Epoch(9);
+        let values = [directory_value(&desc), replacement, {
+            desc.epoch = Epoch(1);
+            directory_value(&desc)
+        }];
+        for (i, value) in values.iter().enumerate() {
+            let index = i as u64 + 1;
+            assert_eq!(
+                store
+                    .apply(SYSTEM_RANGE, &directory_put(value, index), pos(index, 1))
+                    .unwrap(),
+                RangeApplyOutcome::Applied
+            );
+        }
+    }
+}
+
+#[test]
+fn directory_looking_keys_outside_system_range_are_unaffected() {
+    let dir = Dir::new("directory-user-range");
+    let store = RangeStore::create(dir.sub("db"), [7; 16]).unwrap();
+    let mut desc = descriptors()[1].clone();
+    // This non-system test range owns Catalog as well as user data.
+    desc.start.clear();
+    store.create_range(&desc).unwrap();
+    for (index, epoch) in [(1, 9), (2, 1)] {
+        desc.epoch = Epoch(epoch);
+        assert_eq!(
+            store
+                .apply(
+                    desc.id,
+                    &directory_put(&directory_value(&desc), index),
+                    pos(index, 1)
+                )
+                .unwrap(),
+            RangeApplyOutcome::Applied
+        );
+    }
+    assert_eq!(rows(&store, Keyspace::Catalog).len(), 2);
+}

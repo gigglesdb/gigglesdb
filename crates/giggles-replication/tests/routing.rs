@@ -6,7 +6,7 @@ use giggles_core::range_api::*;
 use giggles_replication::client::{
     LocalRanges, RangeCall, RangeReply, RangeTransport, RoutedRangeClient, dispatch,
 };
-use giggles_replication::directory::*;
+use giggles_replication::directory::{DIRECTORY_TAG, *};
 
 fn key(n: u8) -> Vec<u8> {
     range_key(RangeSpace::Rows, &[n])
