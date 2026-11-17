@@ -171,6 +171,7 @@ fn gateway(node: &ClusterNode) -> ClusterGateway {
     let settings = GatewaySettings {
         node: node.node_id() as u16,
         heartbeat: Duration::from_millis(500),
+        gateway_lease: Duration::from_secs(1),
         ..GatewaySettings::default()
     };
     node.attach_gateway(settings, Limits::default()).unwrap()

@@ -211,6 +211,23 @@ async fn an_isolated_node_rejoins() {
     let c2 = cluster.client(1).await;
     let c3 = cluster.client(2).await;
     let mut expected = vec![insert_t(&c3, 3).await];
+    // For the record: the ranges node 3 leads when it is cut off ("last" holds the gateway
+    // liveness and DDL locks; range 1 is the system range).
+    let (_, status) = cluster_status(&cluster.config_path(0));
+    let led: Vec<String> = status["ranges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|range| range["leader"] == 3)
+        .map(|range| {
+            if range["end"].is_null() {
+                "last".to_string()
+            } else {
+                range["id"].to_string()
+            }
+        })
+        .collect();
+    eprintln!("node 3 leads ranges {led:?} when it is cut off");
 
     cluster.isolate(2);
     for _ in 0..5 {
@@ -219,6 +236,18 @@ async fn an_isolated_node_rejoins() {
     }
     expected.sort();
     assert_eq!(ids(&c2).await, expected);
+    // Healthy gateways stay members while node 3 is cut off: no refusal on nodes 1 and 2
+    // (a fenced gateway refuses with 40001; before that, the range-unavailable 08007).
+    for node in [0, 1] {
+        let refused: Vec<usize> = ["sqlstate=40001", "sqlstate=08007"]
+            .iter()
+            .map(|code| cluster.stderr_lines(node, code))
+            .collect();
+        eprintln!(
+            "node {} refusals (40001, 08007) while node 3 was cut off: {refused:?}",
+            node + 1
+        );
+    }
 
     cluster.heal();
     let deadline = Instant::now() + CONVERGE_WAIT;
@@ -269,8 +298,22 @@ async fn texts(c: &Client, sql: &str) -> Vec<String> {
 /// Asks `c` for the status of transaction `xid` until it is definite or `until` passes.
 async fn xact_status(c: &Client, xid: u64, until: Instant) -> String {
     loop {
-        let status = texts(c, &format!("SELECT pg_xact_status({xid})")).await;
-        let status = status.into_iter().next().expect("one row");
+        let sql = format!("SELECT pg_xact_status({xid})");
+        let result = tokio::time::timeout(STATEMENT_WAIT, c.query_one(&sql, &[]))
+            .await
+            .unwrap_or_else(|_| panic!("{sql}: no answer within {STATEMENT_WAIT:?}"));
+        let status: String = match result {
+            Ok(row) => row.get(0),
+            Err(e)
+                if e.code()
+                    .is_some_and(|code| matches!(code.code(), "40001" | "08007"))
+                    && Instant::now() < until =>
+            {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            Err(e) => panic!("{sql}: {e:?}"),
+        };
         if status != "in progress" || Instant::now() >= until {
             return status;
         }
@@ -352,7 +395,7 @@ async fn commit_outcome(kill: Kill) {
     }
     // Every gateway agrees once the owner is back.
     let c3 = cluster.client(2).await;
-    assert_eq!(xact_status(&c3, xid, Instant::now()).await, status);
+    assert_eq!(xact_status(&c3, xid, Instant::now() + STATUS_WAIT).await, status);
     cluster.assert_proxies_unsaturated();
     eprintln!(
         "commit_outcome_survives_the_gateway {kill:?}: {status} in {:?}",

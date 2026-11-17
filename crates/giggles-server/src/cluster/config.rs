@@ -39,7 +39,17 @@ pub struct ClusterConfig {
     pub split_keys: Vec<String>,
     /// Bootstrap superuser, as `replication.owner`.
     pub owner: Option<String>,
+    /// How long a gateway serves after its last renewed cluster membership (DDL across
+    /// gateways); below the range lock lease. Default 6000 (range failover under load must fit in it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_lease_ms: Option<u64>,
 }
+
+/// Default gateway membership lease.
+const DEFAULT_GATEWAY_LEASE: Duration = Duration::from_secs(6);
+/// The range lock lease the runtime's engines use (`EngineSettings::default().lease`, also
+/// rechecked when the gateway attaches); a gateway lease must stay below it.
+const LOCK_LEASE: Duration = Duration::from_secs(10);
 
 fn default_tick_ms() -> u64 {
     100
@@ -64,6 +74,8 @@ pub struct ClusterValidated {
     /// Strictly increasing range keys, each above `range_api::first_user_key()`.
     pub split_keys: Vec<Vec<u8>>,
     pub owner: Option<String>,
+    /// Below the range lock lease the runtime's engines use (`LOCK_LEASE`).
+    pub gateway_lease: Duration,
 }
 
 impl ClusterValidated {
@@ -115,6 +127,15 @@ impl ClusterConfig {
         }
         if !(10..=1000).contains(&self.tick_ms) {
             return Err("cluster.tick_ms: must be between 10 and 1000".into());
+        }
+        let gateway_lease = self
+            .gateway_lease_ms
+            .map_or(DEFAULT_GATEWAY_LEASE, Duration::from_millis);
+        if gateway_lease < Duration::from_millis(100) || gateway_lease >= LOCK_LEASE {
+            return Err(format!(
+                "cluster.gateway_lease_ms: must be at least 100 and below the range lock lease ({} ms)",
+                LOCK_LEASE.as_millis()
+            ));
         }
         let (log_dir, snapshot_dir) = resolve_dirs(
             "cluster",
@@ -199,6 +220,7 @@ impl ClusterConfig {
             replication_factor,
             split_keys,
             owner: self.owner.clone(),
+            gateway_lease,
         })
     }
 }
@@ -232,6 +254,7 @@ mod tests {
             initial_members: None,
             split_keys: Vec::new(),
             owner: None,
+            gateway_lease_ms: None,
         }
     }
 
@@ -293,6 +316,7 @@ mod tests {
         assert_eq!(v.ca, Path::new("ca.pem"));
         assert_eq!(v.split_keys[0], range_key(RangeSpace::Rows, b"m"));
         assert_eq!(v.owner.as_deref(), Some("owner"));
+        assert_eq!(v.gateway_lease, Duration::from_secs(6));
         c.replication_factor = Some(2);
         assert_eq!(validate(&c).unwrap().replication_factor, 2);
         c.peers.extend([peer(4, 7104, "04"), peer(5, 7105, "05")]);
@@ -385,6 +409,21 @@ mod tests {
                 ..config()
             },
             "cluster.owner:",
+        );
+        for lease in [0, 99, 10_000, u64::MAX] {
+            let c = ClusterConfig {
+                gateway_lease_ms: Some(lease),
+                ..config()
+            };
+            reject(&c, "cluster.gateway_lease_ms:");
+        }
+        let c = ClusterConfig {
+            gateway_lease_ms: Some(1500),
+            ..config()
+        };
+        assert_eq!(
+            validate(&c).unwrap().gateway_lease,
+            Duration::from_millis(1500)
         );
     }
 

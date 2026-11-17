@@ -114,6 +114,28 @@ fn digest(effects: &[Effect]) -> String {
 }
 pub use giggles_core::sqlstate;
 
+/// Whether `error` is transient: the cluster gateway is fenced or a range is unavailable
+/// (GD-0075 Phase 11), a serialization failure or deadlock, or admission is busy. A session
+/// reports it and stays open; it never means the role is gone.
+pub(crate) fn transient(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Sql(relational::SqlError::Conflict)
+            | CoreError::Deadlock
+            | CoreError::Storage(_)
+            | CoreError::Busy
+    )
+}
+
+/// The per-statement role recheck failed: a transient failure stays that failure (the
+/// statement fails, the session stays); anything else is an authentication failure.
+pub(crate) fn role_lookup_error(error: roles::RoleError) -> CoreError {
+    match error {
+        roles::RoleError::Core(error) if transient(&error) => error,
+        _ => CoreError::Policy(Error::Authentication),
+    }
+}
+
 pub type StatementGate = std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 pub struct Service {
@@ -868,7 +890,7 @@ impl Session {
             .admin
             .roles()
             .get(name)
-            .map_err(|_| CoreError::Policy(Error::Authentication))?
+            .map_err(role_lookup_error)?
             .filter(|role| {
                 crate::agent::bindings::executor_role(role)
                     && self.role_fence.is_some_and(|(oid, generation)| {
@@ -892,7 +914,7 @@ impl Session {
                 .admin
                 .roles()
                 .get(name)
-                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .map_err(role_lookup_error)?
                 .filter(|role| {
                     role.login
                         && !role.task_only
@@ -998,7 +1020,7 @@ impl Session {
             .admin
             .roles()
             .get(name)
-            .map_err(|_| "28000")?
+            .map_err(|e| sqlstate(&role_lookup_error(e)))?
             .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
             .ok_or("28000")?;
         // Serialize SQL password rotations and publish aliases before returning to wire checks.
@@ -1102,7 +1124,7 @@ impl Session {
                         .admin
                         .roles()
                         .get(name)
-                        .map_err(|_| CoreError::Policy(Error::Authentication))?
+                        .map_err(role_lookup_error)?
                         .filter(|role| {
                             role.login
                                 && session.service.role_generation_matches(role, session.role_epoch())
@@ -1393,7 +1415,7 @@ impl Session {
             let roles = self.service.admin.roles();
             let role = roles
                 .get(name)
-                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .map_err(role_lookup_error)?
                 .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             role.superuser
@@ -1433,7 +1455,7 @@ impl Session {
         let superuser = if let Role::Database { name } = &self.role {
             roles
                 .get(name)
-                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .map_err(role_lookup_error)?
                 .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
                 .ok_or(CoreError::Policy(Error::Authentication))?
                 .superuser
@@ -1488,7 +1510,7 @@ impl Session {
             let roles = self.service.admin.roles();
             let role = roles
                 .get(name)
-                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .map_err(role_lookup_error)?
                 .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             if role.superuser {
@@ -1535,7 +1557,7 @@ impl Session {
                             .admin
                             .roles()
                             .get(name)
-                            .map_err(|_| CoreError::Policy(Error::Authentication))?
+                            .map_err(role_lookup_error)?
                             .ok_or(CoreError::Policy(Error::Authentication))?;
                         // PG18 accepts any of SELECT/INSERT/UPDATE/DELETE,
                         // TRUNCATE or MAINTAIN; the latter two are not modeled.
@@ -1593,7 +1615,7 @@ impl Session {
             .admin
             .roles()
             .get(name)
-            .map_err(|_| CoreError::Policy(Error::Authentication))?
+            .map_err(role_lookup_error)?
             .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
             .map(|role| role.superuser)
             .ok_or(CoreError::Policy(Error::Authentication))
@@ -1706,7 +1728,7 @@ impl Session {
                 let roles = self.service.admin.roles();
                 let role = roles
                     .get(name)
-                    .map_err(|_| CoreError::Policy(Error::Authentication))?
+                    .map_err(role_lookup_error)?
                     .filter(|r| r.login && self.service.role_generation_matches(r, self.role_epoch()))
                     .ok_or(CoreError::Policy(Error::Authentication))?;
                 if let Some(owner) = owner
@@ -1902,7 +1924,7 @@ impl Session {
                 .admin
                 .roles()
                 .get(name)
-                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .map_err(role_lookup_error)?
                 .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
                 .ok_or(CoreError::Policy(Error::Authentication))?
                 .superuser
@@ -2440,6 +2462,23 @@ impl Session {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    /// GD-0075 P11-5: a role recheck that fails transiently (a fenced gateway's 40001, an
+    /// unavailable range's 08007) keeps its own SQLSTATE; other failures stay 28000.
+    #[test]
+    fn transient_role_lookup_failures_are_not_authentication_failures() {
+        use giggles_core::roles::RoleError;
+        let code = |error: RoleError| sqlstate(&role_lookup_error(error));
+        let conflict = CoreError::Sql(relational::SqlError::Conflict);
+        assert_eq!(code(RoleError::Core(conflict)), "40001");
+        assert_eq!(code(RoleError::Core(CoreError::Deadlock)), "40P01");
+        assert_eq!(code(RoleError::Core(CoreError::Storage("range".into()))), "08007");
+        assert_eq!(code(RoleError::Core(CoreError::Fenced)), "28000");
+        assert_eq!(code(RoleError::Missing), "28000");
+        assert_eq!(code(RoleError::Invalid), "28000");
+        assert!(transient(&CoreError::Busy));
+        assert!(!transient(&CoreError::Policy(Error::Authentication)));
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     fn fixture() -> (Arc<Service>, Vec<Binding>) {
         let path = crate::test_support::fixture_root().join(format!(

@@ -2,8 +2,9 @@
 //! (`giggles_replication::cluster_node`), and its SQL gateway. Every node is a gateway: the
 //! server binds its PostgreSQL listeners over the gateway's `Admin` on every node.
 //!
-//! DDL: until Phase 11, run DDL from one gateway. Other gateways see DDL committed before they
-//! attached; concurrent DDL from two gateways is not coordinated.
+//! DDL across gateways (GD-0075 Phase 11): every member joins as a gateway; a DDL statement on
+//! one gateway closes the others (drains their writers and the readers of its tables) until
+//! it ends, and a gateway that loses its membership lease stops serving until it rejoins.
 use super::config::ClusterValidated;
 use giggles_core::{
     Admin, Limits,
@@ -108,6 +109,13 @@ impl ClusterRuntime {
             .attach_gateway(
                 GatewaySettings {
                     node: u16::try_from(v.node_id).map_err(|_| "cluster.node_id: above 65535")?,
+                    gateways: v
+                        .members
+                        .iter()
+                        .map(|&id| u16::try_from(id))
+                        .collect::<Result<_, _>>()
+                        .map_err(|_| "cluster member id above 65535")?,
+                    gateway_lease: v.gateway_lease,
                     ..GatewaySettings::default()
                 },
                 Limits::default(),

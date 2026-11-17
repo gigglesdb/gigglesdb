@@ -10,7 +10,8 @@ use giggles_core::range_api::{
 };
 use giggles_replication::{
     call_codec::{
-        CallCounts, GatewayCall, GatewayReply, MoveReply, NodeCall, NodeReport, PeerCall,
+        CallCounts, GatewayCall, GatewayReply, MAX_DDL_TABLES, MoveReply, NodeCall, NodeReport,
+        PeerCall,
         PeerReply, RangeReport, RangeRole, decode_call, decode_reply, encode_call, encode_reply,
     },
     client::{RangeCall, RangeReply},
@@ -237,6 +238,18 @@ fn calls() -> Vec<PeerCall> {
             to: 4,
             forwarded: true,
         }),
+        PeerCall::Gateway(GatewayCall::DdlClose {
+            txn,
+            priority: Timestamp(11),
+            tables: vec![0, 7, u64::MAX],
+        }),
+        PeerCall::Gateway(GatewayCall::DdlClose {
+            txn,
+            priority: Timestamp(1),
+            tables: Vec::new(),
+        }),
+        PeerCall::Gateway(GatewayCall::DdlOpen(txn)),
+        PeerCall::Gateway(GatewayCall::DdlLive(txn)),
         PeerCall::Node(NodeCall::Status),
         PeerCall::Node(NodeCall::HostRange(desc())),
     ]);
@@ -343,6 +356,8 @@ fn replies() -> Vec<Result<PeerReply, RangeError>> {
         Ok(PeerReply::Hosted(false)),
         Ok(PeerReply::Gateway(GatewayReply::Live(true))),
         Ok(PeerReply::Gateway(GatewayReply::Live(false))),
+        Ok(PeerReply::Gateway(GatewayReply::Closed(true))),
+        Ok(PeerReply::Gateway(GatewayReply::Closed(false))),
         Ok(PeerReply::Node(node_report())),
         Ok(PeerReply::Node(NodeReport {
             node: 1,
@@ -404,7 +419,7 @@ fn every_reply_and_error_round_trips_and_decoding_is_strict() {
 fn unknown_tags_and_huge_counts_are_rejected() {
     assert!(decode_call(&[1, 0]).is_err());
     assert!(decode_call(&[1, 15]).is_err());
-    assert!(decode_call(&[1, 37]).is_err());
+    assert!(decode_call(&[1, 40]).is_err());
     assert!(decode_call(&[1, 49]).is_err());
     assert!(decode_reply(&[1, 0, 49]).is_err());
     assert!(decode_reply(&[1, 0, 49, 2]).is_err());
@@ -435,6 +450,40 @@ fn unknown_tags_and_huge_counts_are_rejected() {
     .unwrap();
     *bytes.last_mut().unwrap() = 4;
     assert!(decode_reply(&bytes).is_err());
+}
+
+/// DDL close calls (Phase 11) cap their table list; flags are 0 or 1.
+#[test]
+fn ddl_calls_cap_tables_and_reject_bad_flags() {
+    let txn = ClusterTxnId(5);
+    let close = |n: usize| {
+        PeerCall::Gateway(GatewayCall::DdlClose {
+            txn,
+            priority: Timestamp(2),
+            tables: (0..n as u64).collect(),
+        })
+    };
+    let at_cap = encode_call(&close(MAX_DDL_TABLES)).unwrap();
+    assert_eq!(decode_call(&at_cap).unwrap(), close(MAX_DDL_TABLES));
+    assert!(encode_call(&close(MAX_DDL_TABLES + 1)).is_err());
+    // A hand-built frame over the cap, and one claiming 2^32-1 tables, are refused.
+    let mut over = vec![1, 37];
+    over.extend_from_slice(&5_u64.to_be_bytes());
+    over.extend_from_slice(&2_u64.to_be_bytes());
+    over.extend_from_slice(&((MAX_DDL_TABLES + 1) as u32).to_be_bytes());
+    for table in 0..=MAX_DDL_TABLES as u64 {
+        over.extend_from_slice(&table.to_be_bytes());
+    }
+    assert!(decode_call(&over).is_err());
+    let mut huge = vec![1, 37];
+    huge.extend_from_slice(&[0; 16]);
+    huge.extend_from_slice(&u32::MAX.to_be_bytes());
+    assert!(decode_call(&huge).is_err());
+    // Closed carries a flag byte: anything but 0 or 1 is refused.
+    let mut closed = encode_reply(&Ok(PeerReply::Gateway(GatewayReply::Closed(true)))).unwrap();
+    assert_eq!(closed[2], 35);
+    *closed.last_mut().unwrap() = 2;
+    assert!(decode_reply(&closed).is_err());
 }
 
 #[test]

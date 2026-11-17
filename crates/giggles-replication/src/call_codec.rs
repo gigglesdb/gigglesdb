@@ -1,4 +1,5 @@
-//! Wire codec of range, gateway and node-status calls between nodes (GD-0075 R5-21, R5-64).
+//! Wire codec of range, gateway and node-status calls between nodes (GD-0075 R5-21, R5-64;
+//! DDL across gateways, Phase 11).
 //!
 //! A call body is `[version u8 = 1][call tag u8][fields]`; a reply body is
 //! `[version u8 = 1][0][reply tag u8][fields]` or `[version u8 = 1][1][error tag u8][fields]`.
@@ -18,6 +19,8 @@ use giggles_core::range_api::{
 use crate::client::{RangeCall, RangeReply};
 
 const VERSION: u8 = 1;
+/// Most tables one `DdlClose` names (a DDL statement locks a handful).
+pub const MAX_DDL_TABLES: usize = 4096;
 
 /// A deadlock-detection call to a gateway (design.md 3.2, `GatewayPeer`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +31,17 @@ pub enum GatewayCall {
     CancelWait(ClusterTxnId),
     /// Whether the gateway still runs the transaction (R5-55 status of another gateway's xid).
     TxnLive(ClusterTxnId),
+    /// DDL across gateways (Phase 11): close the gateway for DDL transaction `txn` on `tables`
+    /// (at most `MAX_DDL_TABLES`); answered `Closed`.
+    DdlClose {
+        txn: ClusterTxnId,
+        priority: Timestamp,
+        tables: Vec<u64>,
+    },
+    /// Reopen the gateway after DDL transaction `txn` ended; answered `Done`.
+    DdlOpen(ClusterTxnId),
+    /// Whether DDL transaction `txn` still runs on the gateway; answered `Live`.
+    DdlLive(ClusterTxnId),
 }
 
 /// Result of a `GatewayCall`.
@@ -36,6 +50,8 @@ pub enum GatewayReply {
     Done,
     Blockers(Vec<ClusterTxnId>),
     Live(bool),
+    /// `DdlClose`: true once closed, false while the gateway still drains.
+    Closed(bool),
 }
 
 /// An operator call to a node (R5-64 `giggles-server cluster status`).
@@ -720,15 +736,35 @@ pub fn encode_call(call: &PeerCall) -> Result<Vec<u8>, RangeError> {
                 }
                 w.u64(p.target.0);
             }
+            GatewayCall::DdlClose {
+                txn,
+                priority,
+                tables,
+            } => {
+                if tables.len() > MAX_DDL_TABLES {
+                    return Err(corrupt("too many DDL tables"));
+                }
+                w.u8(37);
+                w.u64(txn.0);
+                w.u64(priority.0);
+                w.len(tables.len())?;
+                for table in tables {
+                    w.u64(*table);
+                }
+            }
             GatewayCall::Abort(txn)
             | GatewayCall::Blockers(txn)
             | GatewayCall::CancelWait(txn)
-            | GatewayCall::TxnLive(txn) => {
+            | GatewayCall::TxnLive(txn)
+            | GatewayCall::DdlOpen(txn)
+            | GatewayCall::DdlLive(txn) => {
                 w.u8(match call {
                     GatewayCall::Abort(_) => 33,
                     GatewayCall::Blockers(_) => 34,
                     GatewayCall::CancelWait(_) => 35,
-                    _ => 36,
+                    GatewayCall::TxnLive(_) => 36,
+                    GatewayCall::DdlOpen(_) => 38,
+                    _ => 39,
                 });
                 w.u64(txn.0);
             }
@@ -807,6 +843,21 @@ pub fn decode_call(bytes: &[u8]) -> Result<PeerCall, RangeError> {
             address: r.string()?,
             fingerprint: r.string()?,
         }),
+        37 => {
+            let (txn, priority) = (r.txn()?, r.ts()?);
+            let n = r.count(8)?;
+            if n > MAX_DDL_TABLES {
+                return Err(corrupt("too many DDL tables"));
+            }
+            let tables = (0..n).map(|_| r.u64()).collect::<Result<_, RangeError>>()?;
+            PeerCall::Gateway(GatewayCall::DdlClose {
+                txn,
+                priority,
+                tables,
+            })
+        }
+        38 => PeerCall::Gateway(GatewayCall::DdlOpen(r.txn()?)),
+        39 => PeerCall::Gateway(GatewayCall::DdlLive(r.txn()?)),
         48 => PeerCall::Node(NodeCall::Status),
         49 => PeerCall::Node(NodeCall::HostRange(r.descriptor()?)),
         tag => PeerCall::Range(range_call(tag, &mut r)?),
@@ -1165,6 +1216,11 @@ pub fn encode_reply(reply: &Result<PeerReply, RangeError>) -> Result<Vec<u8>, Ra
             w.u8(49);
             w.u8(u8::from(*created));
         }
+        Ok(PeerReply::Gateway(GatewayReply::Closed(closed))) => {
+            w.u8(0);
+            w.u8(35);
+            w.u8(u8::from(*closed));
+        }
         Ok(PeerReply::Node(report)) => {
             w.0[0] = 2; // Extended reports: old strict decoders reject the version.
             w.u8(0);
@@ -1196,6 +1252,7 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Result<PeerReply, RangeError>, Range
             32 => PeerReply::Gateway(GatewayReply::Done),
             33 => PeerReply::Gateway(GatewayReply::Blockers(r.txns()?)),
             34 => PeerReply::Gateway(GatewayReply::Live(r.flag()?)),
+            35 => PeerReply::Gateway(GatewayReply::Closed(r.flag()?)),
             48 => PeerReply::Node(node_report(&mut r, version)?),
             50 => PeerReply::Moving(MoveReply {
                 leader: r.opt_u64()?,

@@ -104,6 +104,7 @@ fn gateway(node: &ClusterNode) -> ClusterGateway {
         GatewaySettings {
             node: node.node_id() as u16,
             heartbeat: Duration::from_millis(500),
+            gateway_lease: Duration::from_secs(1),
             page_bytes: PAGE_BYTES,
             ..GatewaySettings::default()
         },

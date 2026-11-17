@@ -146,6 +146,8 @@ fn gateway(node: &ClusterNode) -> ClusterGateway {
         GatewaySettings {
             node: node.node_id() as u16,
             heartbeat: Duration::from_millis(500),
+            // Below the engines' 3 s lock lease (every member is a gateway, Phase 11).
+            gateway_lease: Duration::from_secs(1),
             ..GatewaySettings::default()
         },
         Limits::default(),

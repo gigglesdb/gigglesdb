@@ -12,7 +12,7 @@ use crate::call_codec::{
 use crate::client::{self, LocalRanges, RangeCall, RangeReply, RangeTransport};
 use crate::error::{Error, Result};
 use giggles_core::range_api::{
-    ClusterTxnId, DeadlockProbe, GatewayPeer, GatewayService, RangeError, RangeId,
+    ClusterTxnId, DeadlockProbe, GatewayPeer, GatewayService, RangeError, RangeId, Timestamp,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -29,8 +29,20 @@ use tokio::{
 /// Frame header (41) plus call id (8).
 const MAX_BODY: usize = MAX_FRAME - 49;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Must stay below the range lock lease minus the gateway's eviction margin (10 s lease
+/// today), so a write is either sent promptly or never.
+const MAX_WRITE_QUEUE_AGE: Duration = Duration::from_secs(5);
 /// A lock request without its own timeout waits at most `lock_wait_backstop` (design.md 3.2).
 const LOCK_BACKSTOP: Duration = Duration::from_secs(300);
+/// Reply deadline of a DDL membership call (close waits ~200 ms on the receiver). Short, so a
+/// DDL notices an unreachable member within seconds and a proxy's watchdog never stalls the
+/// membership thread long; such a timeout keeps the connection (other calls ride on it).
+const DDL_CALL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Reply margin of a call that is quick on a live leader and safe to lose: a lock request
+/// with its own wait (the deadline is this plus the wait) and a timestamp request. A cut-off
+/// leader then costs its callers seconds, not the base call timeout, before the router tries
+/// another replica (GD-0075 P11-5; gateway liveness probes are such lock requests).
+const LOCK_CALL_MARGIN: Duration = Duration::from_secs(2);
 
 /// Bounds of the call path.
 #[derive(Clone, Copy, Debug)]
@@ -41,6 +53,7 @@ pub struct CallLimits {
     pub workers: usize,
     /// Inbound lock requests waiting at once, in their own pool so that waiting locks never
     /// keep out the calls that end them (commit, release, heartbeat, deadlock detection).
+    /// `DdlClose` (which waits up to ~200 ms on the receiving gateway) shares this pool.
     /// Keep `workers + lock_waits` under the runtime's blocking-thread limit (512).
     pub lock_waits: usize,
     /// Reply deadline of a call (a lock call adds its own wait).
@@ -74,8 +87,49 @@ fn lost(call: &PeerCall, what: String) -> RangeError {
 }
 
 struct Outgoing {
+    enqueued_at: Instant,
+    lease_sensitive: bool,
     body: Vec<u8>,
     reply: Option<(std_mpsc::SyncSender<Reply>, Instant)>,
+}
+
+impl Outgoing {
+    fn new(
+        call: &PeerCall,
+        body: Vec<u8>,
+        reply: Option<(std_mpsc::SyncSender<Reply>, Instant)>,
+    ) -> Self {
+        Self {
+            enqueued_at: Instant::now(),
+            lease_sensitive: matches!(
+                call,
+                PeerCall::Range(
+                    RangeCall::Commit { .. }
+                        | RangeCall::Prepare { .. }
+                        | RangeCall::Heartbeat { .. }
+                )
+            ),
+            body,
+            reply,
+        }
+    }
+
+    /// Expired while queued: no bytes went out; the caller sees Unavailable("not sent").
+    fn ready(self, now: Instant) -> Option<Self> {
+        if self
+            .reply
+            .as_ref()
+            .is_some_and(|(_, deadline)| *deadline <= now)
+            || (self.lease_sensitive
+                && now.saturating_duration_since(self.enqueued_at) >= MAX_WRITE_QUEUE_AGE)
+        {
+            if let Some((reply, _)) = self.reply {
+                let _ = reply.try_send(Err(RangeError::Unavailable("not sent".into())));
+            }
+            return None;
+        }
+        Some(self)
+    }
 }
 
 struct Conn {
@@ -114,6 +168,21 @@ impl PeerCalls {
 
     /// Sends `call` to `node` and waits up to `timeout` for its reply.
     pub fn call(&self, node: u64, call: PeerCall, timeout: Duration) -> Reply {
+        let drop_on_timeout = match &call {
+            PeerCall::Range(call) => drop_range_on_timeout(call),
+            _ => true,
+        };
+        self.call_with(node, call, timeout, drop_on_timeout)
+    }
+
+    /// As `call`; a timeout drops the connection only with `drop_on_timeout`.
+    fn call_with(
+        &self,
+        node: u64,
+        call: PeerCall,
+        timeout: Duration,
+        drop_on_timeout: bool,
+    ) -> Reply {
         let (tx, rx) = std_mpsc::sync_channel(1);
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -127,7 +196,9 @@ impl PeerCalls {
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
                 // A black-holed peer would make every later call wait out its timeout
                 // too: drop the connection so they fail fast (never sent = Unavailable).
-                self.conns.lock().unwrap().remove(&node);
+                if drop_on_timeout {
+                    self.conns.lock().unwrap().remove(&node);
+                }
                 Err(lost(&call, format!("call to node {node} timed out")))
             }
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
@@ -167,7 +238,7 @@ impl PeerCalls {
         let conn = self.conn(node)?;
         let full = || RangeError::Unavailable("call queue full".into());
         let slot = conn.slots.clone().try_acquire_owned().map_err(|_| full())?;
-        match conn.tx.try_send(Outgoing { body, reply }) {
+        match conn.tx.try_send(Outgoing::new(call, body, reply)) {
             Ok(()) => Ok(slot),
             Err(mpsc::error::TrySendError::Full(_)) => Err(full()),
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -200,13 +271,7 @@ impl PeerCalls {
     }
 
     fn timeout(&self, call: &RangeCall) -> Duration {
-        let base = self.limits.read().unwrap().timeout;
-        match call {
-            RangeCall::Lock(req) => {
-                base.saturating_add(req.timeout_ms.map_or(LOCK_BACKSTOP, Duration::from_millis))
-            }
-            _ => base,
-        }
+        call_deadline(self.limits.read().unwrap().timeout, call)
     }
 
     fn gateway(
@@ -215,7 +280,21 @@ impl PeerCalls {
         call: GatewayCall,
     ) -> std::result::Result<GatewayReply, RangeError> {
         let timeout = self.limits.read().unwrap().timeout;
-        match PeerCalls::call(self, node, PeerCall::Gateway(call), timeout)? {
+        let ddl = matches!(
+            call,
+            GatewayCall::DdlClose { .. } | GatewayCall::DdlOpen(_) | GatewayCall::DdlLive(_)
+        );
+        let reply = if ddl {
+            self.call_with(
+                node,
+                PeerCall::Gateway(call),
+                timeout.min(DDL_CALL_TIMEOUT),
+                false,
+            )
+        } else {
+            PeerCalls::call(self, node, PeerCall::Gateway(call), timeout)
+        };
+        match reply? {
             PeerReply::Gateway(reply) => Ok(reply),
             _ => Err(mismatched()),
         }
@@ -234,6 +313,43 @@ impl RangeTransport for PeerCalls {
             _ => Err(mismatched()),
         }
     }
+    fn unreachable(&self, node: u64, error: &RangeError) -> bool {
+        unreachable(node, error)
+    }
+}
+
+fn drop_range_on_timeout(call: &RangeCall) -> bool {
+    !matches!(call, RangeCall::Lock(_) | RangeCall::OracleNext { .. })
+}
+
+/// Reply deadline of a range call with base deadline `base`.
+fn call_deadline(base: Duration, call: &RangeCall) -> Duration {
+    match call {
+        RangeCall::Lock(req) => match req.timeout_ms {
+            Some(wait) => base
+                .min(LOCK_CALL_MARGIN)
+                .saturating_add(Duration::from_millis(wait)),
+            None => base.saturating_add(LOCK_BACKSTOP),
+        },
+        RangeCall::OracleNext { .. } => base.min(LOCK_CALL_MARGIN),
+        _ => base,
+    }
+}
+
+/// Whether `error` is this transport's own report that `node` was not reached (a timed-out
+/// call, a failed or lost connection), not an error the node answered.
+fn unreachable(node: u64, error: &RangeError) -> bool {
+    let (RangeError::Unavailable(what) | RangeError::Unknown(what)) = error else {
+        return false;
+    };
+    [
+        format!("call to node {node} timed out"),
+        format!("call connection to node {node} lost"),
+        format!("call connection to node {node} closed"),
+        format!("no call connection to node {node}: "),
+    ]
+    .iter()
+    .any(|prefix| what.starts_with(prefix.as_str()))
 }
 
 impl GatewayPeer for PeerCalls {
@@ -264,6 +380,35 @@ impl GatewayPeer for PeerCalls {
     }
     fn txn_live(&self, node: u64, txn: ClusterTxnId) -> std::result::Result<bool, RangeError> {
         match self.gateway(node, GatewayCall::TxnLive(txn))? {
+            GatewayReply::Live(live) => Ok(live),
+            _ => Err(mismatched()),
+        }
+    }
+    fn ddl_close(
+        &self,
+        node: u64,
+        txn: ClusterTxnId,
+        priority: Timestamp,
+        tables: &[u64],
+    ) -> std::result::Result<bool, RangeError> {
+        let call = GatewayCall::DdlClose {
+            txn,
+            priority,
+            tables: tables.to_vec(),
+        };
+        match self.gateway(node, call)? {
+            GatewayReply::Closed(closed) => Ok(closed),
+            _ => Err(mismatched()),
+        }
+    }
+    fn ddl_open(&self, node: u64, txn: ClusterTxnId) -> std::result::Result<(), RangeError> {
+        match self.gateway(node, GatewayCall::DdlOpen(txn))? {
+            GatewayReply::Done => Ok(()),
+            _ => Err(mismatched()),
+        }
+    }
+    fn ddl_live(&self, node: u64, txn: ClusterTxnId) -> std::result::Result<bool, RangeError> {
+        match self.gateway(node, GatewayCall::DdlLive(txn))? {
             GatewayReply::Live(live) => Ok(live),
             _ => Err(mismatched()),
         }
@@ -319,6 +464,9 @@ async fn connection(peers: Arc<Peers>, node: u64, mut rx: mpsc::Receiver<Outgoin
                         Some(o) => o,
                         None => return,
                     },
+                };
+                let Some(o) = o.ready(Instant::now()) else {
+                    continue;
                 };
                 next_id += 1;
                 if let Some(reply) = o.reply {
@@ -503,7 +651,12 @@ impl CallServer {
                 return;
             }
         };
-        let pool = if matches!(call, PeerCall::Range(RangeCall::Lock(_))) {
+        // Calls that wait (a lock, a DDL close draining this gateway) take the waits pool, so
+        // they never keep out the calls that end their waits.
+        let pool = if matches!(
+            call,
+            PeerCall::Range(RangeCall::Lock(_)) | PeerCall::Gateway(GatewayCall::DdlClose { .. })
+        ) {
             self.waits.read().unwrap().clone()
         } else {
             self.pool.read().unwrap().clone()
@@ -553,6 +706,16 @@ fn handle(handlers: &Handlers, call: PeerCall) -> Reply {
                     GatewayReply::Done
                 }
                 GatewayCall::TxnLive(txn) => GatewayReply::Live(gateway.txn_live(txn)),
+                GatewayCall::DdlClose {
+                    txn,
+                    priority,
+                    tables,
+                } => GatewayReply::Closed(gateway.ddl_close(txn, priority, &tables)?),
+                GatewayCall::DdlOpen(txn) => {
+                    gateway.ddl_open(txn);
+                    GatewayReply::Done
+                }
+                GatewayCall::DdlLive(txn) => GatewayReply::Live(gateway.ddl_live(txn)),
             }))
         }
         PeerCall::Node(call @ (NodeCall::RetireNode { .. } | NodeCall::EnrolNode { .. })) => {
@@ -649,5 +812,160 @@ mod tests {
                 "no node status handler on this node".into()
             ))
         );
+    }
+
+    use giggles_core::range_api::{Epoch, LockRequest, LockTarget, RangeId, RangeLockMode};
+
+    fn lock(timeout_ms: Option<u64>) -> RangeCall {
+        RangeCall::Lock(LockRequest {
+            range: RangeId(2),
+            epoch: Epoch(1),
+            txn: ClusterTxnId(7),
+            priority: Timestamp(1),
+            target: LockTarget::TableSentinel { table: 9 },
+            mode: RangeLockMode::Shared,
+            timeout_ms,
+        })
+    }
+
+    #[test]
+    fn transport_failures_are_unreachable_answers_are_not() {
+        let call = PeerCall::Range(lock(None));
+        for error in [
+            lost(&call, "call to node 3 timed out".into()),
+            RangeError::Unknown("call to node 3 timed out".into()),
+            lost(&call, "call connection to node 3 lost".into()),
+            RangeError::Unavailable("call connection to node 3 closed".into()),
+            RangeError::Unavailable("no call connection to node 3: refused".into()),
+        ] {
+            assert!(unreachable(3, &error), "{error:?}");
+            assert!(!unreachable(4, &error), "{error:?}");
+        }
+        for error in [
+            RangeError::Unavailable("call queue full".into()),
+            RangeError::Unavailable("overloaded".into()),
+            // Node 3's own answer about a call it made to node 4.
+            RangeError::Unavailable("range 5: no leader (call to node 4 timed out)".into()),
+            RangeError::NotLeader { hint: Some(3) },
+            RangeError::LockTimeout,
+        ] {
+            assert!(!unreachable(3, &error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn short_deadlines_for_lock_waits_and_timestamps_only() {
+        let peers = |call: &RangeCall| call_deadline(Duration::from_secs(15), call);
+        assert_eq!(peers(&lock(Some(250))), Duration::from_millis(2250));
+        assert_eq!(peers(&lock(None)), Duration::from_secs(15) + LOCK_BACKSTOP);
+        assert_eq!(
+            peers(&RangeCall::OracleNext {
+                range: RangeId(1),
+                n: 1
+            }),
+            LOCK_CALL_MARGIN
+        );
+        let release = RangeCall::Release {
+            range: RangeId(2),
+            txn: ClusterTxnId(7),
+        };
+        assert_eq!(peers(&release), Duration::from_secs(15));
+        // A base below the margin is kept.
+        let peers = |call: &RangeCall| call_deadline(Duration::from_secs(1), call);
+        assert_eq!(peers(&lock(Some(250))), Duration::from_millis(1250));
+    }
+    #[test]
+    fn lock_and_oracle_timeouts_keep_other_calls_connected() {
+        assert!(!drop_range_on_timeout(&lock(Some(500))));
+        assert!(!drop_range_on_timeout(&lock(None)));
+        assert!(!drop_range_on_timeout(&RangeCall::OracleNext {
+            range: RangeId(1),
+            n: 1
+        }));
+        assert!(drop_range_on_timeout(&RangeCall::Commit {
+            range: RangeId(2),
+            epoch: Epoch(1),
+            txn: ClusterTxnId(7),
+            writes: vec![],
+            marker_xid: None,
+            lock_generation: None,
+        }));
+    }
+
+    #[test]
+    fn expired_queued_call_is_never_sent() {
+        let now = Instant::now();
+        let (tx, rx) = std_mpsc::sync_channel(1);
+        let outgoing = Outgoing::new(&PeerCall::Range(lock(None)), vec![1], Some((tx, now)));
+        assert!(outgoing.ready(now).is_none());
+        assert_eq!(
+            rx.recv().unwrap(),
+            Err(RangeError::Unavailable("not sent".into()))
+        );
+        let (tx, _rx) = std_mpsc::sync_channel(1);
+        assert!(
+            Outgoing::new(
+                &PeerCall::Range(lock(None)),
+                vec![1],
+                Some((tx, now + Duration::from_secs(1))),
+            )
+            .ready(now)
+            .is_some()
+        );
+        assert!(
+            Outgoing::new(&PeerCall::Range(lock(None)), vec![1], None)
+                .ready(now)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn lease_sensitive_calls_are_never_sent_after_queue_age_limit() {
+        let range = RangeId(2);
+        let epoch = Epoch(1);
+        let txn = ClusterTxnId(7);
+        let calls = [
+            RangeCall::Commit {
+                range,
+                epoch,
+                txn,
+                writes: vec![],
+                marker_xid: None,
+                lock_generation: None,
+            },
+            RangeCall::Prepare {
+                range,
+                epoch,
+                txn,
+                home: range,
+                writes: vec![],
+                lock_generation: None,
+            },
+            RangeCall::Heartbeat { range, txn },
+            lock(None),
+            RangeCall::OracleNext { range, n: 1 },
+        ];
+        for (index, call) in calls.into_iter().enumerate() {
+            let lease_sensitive = index < 3;
+            for age in [
+                MAX_WRITE_QUEUE_AGE - Duration::from_nanos(1),
+                MAX_WRITE_QUEUE_AGE,
+                MAX_WRITE_QUEUE_AGE + Duration::from_secs(1),
+            ] {
+                let (tx, rx) = std_mpsc::sync_channel(1);
+                let call = PeerCall::Range(call.clone());
+                let mut outgoing = Outgoing::new(&call, vec![1], None);
+                let now = outgoing.enqueued_at + age;
+                outgoing.reply = Some((tx, now + Duration::from_secs(30)));
+                let expired = lease_sensitive && age >= MAX_WRITE_QUEUE_AGE;
+                assert_eq!(outgoing.ready(now).is_none(), expired, "{call:?}, {age:?}");
+                if expired {
+                    assert_eq!(
+                        rx.recv().unwrap(),
+                        Err(RangeError::Unavailable("not sent".into()))
+                    );
+                }
+            }
+        }
     }
 }

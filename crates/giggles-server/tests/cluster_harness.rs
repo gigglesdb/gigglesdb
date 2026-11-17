@@ -349,6 +349,16 @@ impl ClusterProcs {
         }
     }
 
+    /// Lines of node i's `stderr.log` that contain `needle` (statement errors are logged
+    /// there with their SQLSTATE).
+    pub(crate) fn stderr_lines(&self, i: usize, needle: &str) -> usize {
+        std::fs::read_to_string(self.nodes[i].dir.join("stderr.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
     fn print_stderr_tails(&self) {
         for (i, node) in self.nodes.iter().enumerate() {
             let text = std::fs::read_to_string(node.dir.join("stderr.log")).unwrap_or_default();

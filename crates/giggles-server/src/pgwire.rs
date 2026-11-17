@@ -2302,7 +2302,12 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
             {
                 binding_changes.borrow_and_update();
                 binding_check_pending = false;
-                if session.check_binding().is_err() {
+                // A transient failure (the gateway fenced, a range unavailable) is not a lost
+                // binding: the next statement rechecks and reports it.
+                if session
+                    .check_binding()
+                    .is_err_and(|e| !crate::service::transient(&e))
+                {
                     session.abort();
                     // Absorb late client writes so the peer observes EOF without a reset.
                     let _ = timeout(std::time::Duration::from_secs(2), async {
@@ -2533,7 +2538,10 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         if !keep? {
             return Ok(());
         }
-        if session.check_binding().is_err() {
+        if session
+            .check_binding()
+            .is_err_and(|e| !crate::service::transient(&e))
+        {
             if state.admin_completed {
                 send(s, &response).await?;
                 if tag == b'E' {

@@ -888,7 +888,7 @@ pub(super) fn validate_lock(
                     let roles = session.service.admin.roles();
                     let role = roles
                         .get(name)
-                        .map_err(|_| CoreError::Policy(Error::Authentication))?
+                        .map_err(crate::service::role_lookup_error)?
                         .ok_or(CoreError::Policy(Error::Authentication))?;
                     let authority = session.sql.table_authority_name(table)?;
                     let owner = roles

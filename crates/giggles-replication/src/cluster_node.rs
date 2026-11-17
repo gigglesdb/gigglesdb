@@ -561,6 +561,10 @@ pub struct ClusterNode {
     /// The system range's descriptor as this node last learned it: the layout's at start,
     /// then the one a StaleEpoch refusal from the system range carried (review S6).
     system: Mutex<RangeDescriptor>,
+    /// Every member of the cluster (the transport's peers, this node included).
+    members: Vec<u64>,
+    /// The range engines' lock lease; a gateway's liveness lease must stay below it.
+    lock_lease: Duration,
 }
 
 /// Registry polling thread. Dropping it stops polling and joins an in-flight pass.
@@ -616,6 +620,8 @@ impl ClusterNode {
     pub fn start(config: ClusterNodeConfig) -> Result<Self> {
         let node_id = config.transport.node_id;
         let cluster = config.transport.cluster;
+        let members: Vec<u64> = config.transport.peers.keys().copied().collect();
+        let lock_lease = config.engine.lease;
         let system = config
             .layout
             .iter()
@@ -713,6 +719,8 @@ impl ClusterNode {
             client,
             ranges,
             status,
+            members,
+            lock_lease,
         })
     }
 
@@ -960,13 +968,38 @@ impl ClusterNode {
         Ok(())
     }
 
-    /// This node's SQL gateway; its deadlock service answers other gateways' probes.
+    /// This node's SQL gateway; its deadlock service answers other gateways' probes. Every
+    /// member of the cluster is a gateway (DDL across gateways, GD-0075 Phase 11): an empty
+    /// `settings.gateways` becomes every member id, and the gateway joins before it returns.
+    /// `settings.gateway_lease` must stay below the engines' lock lease.
     pub fn attach_gateway(
         &self,
-        settings: GatewaySettings,
+        mut settings: GatewaySettings,
         limits: Limits,
     ) -> Result<ClusterGateway> {
+        if settings.gateways.is_empty() {
+            settings.gateways = self
+                .members
+                .iter()
+                .map(|&id| u16::try_from(id))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|_| Error::Identity("a member id is above 65535".into()))?;
+        }
+        if !settings.gateways.contains(&settings.node) {
+            return Err(Error::Identity(format!(
+                "gateway {} is not among the gateways {:?}",
+                settings.node, settings.gateways
+            )));
+        }
+        if settings.gateway_lease.is_zero() || settings.gateway_lease >= self.lock_lease {
+            return Err(Error::Core(format!(
+                "gateway lease {:?} must be positive and below the lock lease {:?}",
+                settings.gateway_lease, self.lock_lease
+            )));
+        }
+        settings.lock_lease = self.lock_lease;
         let peer: Arc<dyn GatewayPeer> = self.transport.calls().clone();
+        let static_members = settings.gateways.clone();
         let gateway = attach_gateway(
             self.client.clone() as Arc<dyn RangeClient>,
             settings,
@@ -975,6 +1008,22 @@ impl ClusterNode {
             limits,
         )
         .map_err(core)?;
+        let client = self.client.clone();
+        gateway.set_member_source(Box::new(move || {
+            let records = registry::read_all(&*client)?;
+            if records.is_empty() {
+                return Ok(static_members.clone());
+            }
+            records
+                .into_iter()
+                .filter(|record| record.state == NodeState::Active)
+                .map(|record| {
+                    u16::try_from(record.id).map_err(|_| {
+                        RangeError::Unavailable("an active gateway id is above 65535".into())
+                    })
+                })
+                .collect()
+        }));
         self.transport
             .set_call_handlers(Some(self.ranges.clone()), gateway.gateway_service.clone());
         Ok(gateway)

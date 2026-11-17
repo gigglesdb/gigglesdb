@@ -273,3 +273,4 @@ mod replication_role_setting;
 mod api_role_listener;
 #[path = "cluster_replace.rs"]
 mod cluster_replace;
+#[path = "cluster_ddl_process.rs"] mod cluster_ddl_process;
