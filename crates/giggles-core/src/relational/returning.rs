@@ -77,11 +77,16 @@ impl Returning {
         let bound = self.query.bind_seeded(state, seed)?.with_clock(clock);
         let mut bytes = 0usize;
         let mut work = 0usize;
-        if rows.len() > MAX_ROWS {
+        let unbounded = spill::returning_is_unbounded();
+        if !unbounded && rows.len() > MAX_ROWS {
             return Err(SqlError::Limit);
         }
         let mut output = Vec::with_capacity(rows.len());
         for row in rows {
+            if unbounded {
+                bytes = 0;
+                work = 0;
+            }
             let values = bound.project_row(row, 0, params, &mut work, &mut bytes)?;
             output.push(SqlRow { values, version: 0 });
         }

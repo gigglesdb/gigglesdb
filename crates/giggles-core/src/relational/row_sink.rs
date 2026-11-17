@@ -292,6 +292,7 @@ impl Relational {
         version_end: u64,
         deferred: Option<&mut DeferralState>,
     ) -> Result<SqlResult, CoreError> {
+        let returning_scope = sink.streams_index_builds().then(spill::returning_unbounded);
         let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
         let prepared = &bound;
         prepared.validate_schemas(self).map_err(CoreError::Sql)?;
@@ -665,7 +666,7 @@ impl Relational {
         rebuild(&mut before, &sink.indexes())?;
         rebuild(self, &sink.indexes())?;
         let mut pending = deferred.as_deref().cloned().unwrap_or_default();
-        let result = if let Some((names, mode)) = prepared.set_constraints() {
+        let mut result = if let Some((names, mode)) = prepared.set_constraints() {
             if deferred.is_none() {
                 return Err(CoreError::Sql(SqlError::NoActiveTransaction));
             }
@@ -795,6 +796,11 @@ impl Relational {
         }
         if let Some(deferred) = deferred {
             *deferred = pending;
+        }
+        if prepared.returning().is_some()
+            && returning_scope.as_ref().is_some_and(spill::ReturningScope::outermost)
+        {
+            spill::RowBuffer::new(std::mem::take(&mut result.rows))?.finish(&mut result)?;
         }
         Ok(result)
     }

@@ -38,9 +38,11 @@ thread_local! {
     static TAGGED: Cell<bool> = const { Cell::new(false) };
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static BOUNDED: Cell<bool> = const { Cell::new(false) };
+    static RETURNING_DEPTH: Cell<usize> = const { Cell::new(0) };
     static SLOT: RefCell<Option<SpilledRows>> = const { RefCell::new(None) };
     static ERROR: RefCell<Option<CoreError>> = const { RefCell::new(None) };
     static DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static IN_HASH_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// A temp-file failure: 53100 disk_full when the device is full, else 58030.
@@ -62,6 +64,32 @@ pub(crate) fn sql_error(error: CoreError) -> SqlError {
 /// True inside a SqlSession statement, whose boundary settles a published spill.
 pub(crate) fn armed() -> bool {
     ARMED.get()
+}
+
+/// V2 RETURNING bounds each projected row, while RowBuffer owns the total.
+/// Keep nested insert pages in memory for their outer executor to collect.
+pub(crate) struct ReturningScope(usize);
+
+impl ReturningScope {
+    pub(crate) fn outermost(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl Drop for ReturningScope {
+    fn drop(&mut self) {
+        RETURNING_DEPTH.set(self.0);
+    }
+}
+
+pub(crate) fn returning_unbounded() -> ReturningScope {
+    let depth = RETURNING_DEPTH.get();
+    RETURNING_DEPTH.set(depth + 1);
+    ReturningScope(depth)
+}
+
+pub(crate) fn returning_is_unbounded() -> bool {
+    RETURNING_DEPTH.get() > 0
 }
 
 /// Removes the file when dropped; declared after the handle that uses it.
@@ -139,6 +167,16 @@ pub fn bounded<T>(f: impl FnOnce() -> T) -> T {
 /// Override this thread's spill directory (default: the process temp dir).
 pub fn set_thread_dir(dir: Option<PathBuf>) {
     DIR.set(dir);
+}
+
+/// Override this thread's IN-subquery hash threshold for spill qualification.
+#[doc(hidden)]
+pub fn set_in_hash_bytes(bytes: Option<usize>) {
+    IN_HASH_BYTES.set(bytes);
+}
+
+pub(crate) fn in_hash_bytes() -> usize {
+    IN_HASH_BYTES.get().unwrap_or(4 * SORT_BYTES)
 }
 
 /// One SqlSession statement: arms SELECT output spills, settles the slot, and
@@ -603,6 +641,88 @@ where
 
 pub(crate) type StoreIter<'a, T> = Box<dyn Iterator<Item = Result<Cow<'a, T>, SqlError>> + 'a>;
 
+type CachedKeys = (usize, Vec<u8>, Vec<std::ops::Range<usize>>);
+/// Sorted, deduplicated membership keys: one sparse entry per ~64 KiB block.
+pub(crate) struct KeyFile {
+    file: RefCell<File>,
+    blocks: Vec<(Vec<u8>, u64, usize)>,
+    cache: RefCell<CachedKeys>,
+    _temp: TempPath,
+}
+
+pub(crate) struct KeyFileBuilder(Sorter<Vec<u8>>);
+impl KeyFileBuilder {
+    pub(crate) fn new() -> Self { Self(Sorter::new()) }
+
+    pub(crate) fn push(&mut self, key: Vec<u8>, retention: &mut impl scan::RetentionBudget) -> Result<(), SqlError> {
+        let bytes = key.len() + std::mem::size_of::<Vec<u8>>();
+        self.0.push(key, bytes, Vec::cmp, retention)
+    }
+
+    pub(crate) fn finish(self, retention: &mut impl scan::RetentionBudget) -> Result<KeyFile, SqlError> {
+        let sorted = self.0.finish(Vec::cmp, retention)?;
+        let (file, temp) = create("inkeys").map_err(sql_error)?;
+        let mut writer = BufWriter::new(file);
+        let mut blocks: Vec<(Vec<u8>, u64, usize)> = Vec::new();
+        let mut offset = 0u64;
+        let mut block = Vec::new();
+        let mut last = None;
+        for key in sorted {
+            let key = key?;
+            if last.as_ref() == Some(&key) { continue; }
+            if !block.is_empty() && block.len() + 4 + key.len() > 64 * 1024 {
+                writer.write_all(&block).map_err(|e| sql_error(io(e)))?;
+                blocks.last_mut().expect("block").2 = block.len();
+                offset += block.len() as u64;
+                block.clear();
+            }
+            if block.is_empty() {
+                retention.charge(key.len() + std::mem::size_of::<(Vec<u8>, u64, usize)>())?;
+                blocks.push((key.clone(), offset, 0));
+            }
+            let len = u32::try_from(key.len()).map_err(|_| SqlError::Limit)?;
+            block.extend_from_slice(&len.to_le_bytes());
+            block.extend_from_slice(&key);
+            last = Some(key);
+        }
+        if let Some(entry) = blocks.last_mut() {
+            writer.write_all(&block).map_err(|e| sql_error(io(e)))?;
+            entry.2 = block.len();
+        }
+        let file = writer.into_inner().map_err(|e| sql_error(io(e.into_error())))?;
+        Ok(KeyFile { file: RefCell::new(file), blocks, cache: RefCell::new((usize::MAX, Vec::new(), Vec::new())), _temp: temp })
+    }
+}
+
+impl KeyFile {
+    pub(crate) fn contains(&self, key: &[u8]) -> Result<bool, SqlError> {
+        let Some(index) = self.blocks.partition_point(|b| b.0.as_slice() <= key).checked_sub(1) else {
+            return Ok(false);
+        };
+        let mut cache = self.cache.borrow_mut();
+        if cache.0 != index {
+            let (_, offset, len) = &self.blocks[index];
+            let mut bytes = vec![0; *len];
+            let mut file = self.file.borrow_mut();
+            file.seek(SeekFrom::Start(*offset)).and_then(|_| file.read_exact(&mut bytes)).map_err(|e| sql_error(io(e)))?;
+            let mut input = bytes.as_slice();
+            let mut keys = Vec::new();
+            while !input.is_empty() {
+                let mut len = [0; 4];
+                input.read_exact(&mut len).map_err(|e| sql_error(io(e)))?;
+                let len = u32::from_le_bytes(len) as usize;
+                let start = bytes.len() - input.len();
+                input = input.get(len..).ok_or_else(|| {
+                    sql_error(io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)))
+                })?;
+                keys.push(start..start + len);
+            }
+            *cache = (index, bytes, keys);
+        }
+        Ok(cache.2.binary_search_by(|range| cache.1[range.clone()].cmp(key)).is_ok())
+    }
+}
+
 /// Rewindable materialised items (PostgreSQL's tuplestore): memory up to
 /// `SPILL_BYTES`, then a temp file that each [`Store::iter`] re-reads.
 pub(crate) struct Store<T> {
@@ -669,6 +789,22 @@ impl<T: Serialize + DeserializeOwned + Clone> Store<T> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn returning_scope_restores_depth_after_nested_unwind() {
+        assert!(!returning_is_unbounded());
+        let outer = returning_unbounded();
+        assert!(outer.outermost());
+        let panic = std::panic::catch_unwind(|| {
+            let nested = returning_unbounded();
+            assert!(!nested.outermost());
+            panic!("unwind a nested RETURNING executor");
+        });
+        assert!(panic.is_err());
+        assert!(returning_is_unbounded());
+        drop(outer);
+        assert!(!returning_is_unbounded());
+    }
+
     struct Budget(usize);
     impl scan::RetentionBudget for Budget {
         fn charge(&mut self, bytes: usize) -> Result<(), SqlError> {
@@ -691,6 +827,38 @@ mod tests {
 
     fn files(dir: &Path) -> usize {
         std::fs::read_dir(dir).unwrap().count()
+    }
+
+    #[test]
+    fn key_file_indexes_blocks_deduplicates_and_cleans_up() {
+        let dir = dir("giggles-inkeys-unit");
+        let key = |n: u64| { let mut key = n.to_be_bytes().to_vec(); key.resize(64, 0); key };
+        let mut budget = scan::Retention::new(32 * 1024 * 1024);
+        let mut builder = KeyFileBuilder::new();
+        for n in (1..=80_000).rev() {
+            for _ in 0..2 { builder.push(key(2 * n), &mut budget).unwrap(); }
+        }
+        let keys = builder.finish(&mut budget).unwrap();
+        assert!(keys.blocks.len() > 2);
+        assert_eq!(keys.blocks.iter().map(|block| block.2).sum::<usize>(), 80_000 * 68);
+        assert!(budget.used() > 0 && budget.used() < 128 * 1024);
+        assert_eq!(files(&dir), 1);
+        for n in 1..=80_000 { assert!(keys.contains(&key(2 * n)).unwrap()); }
+        for block in &keys.blocks {
+            assert!(keys.contains(&block.0).unwrap());
+            let first = u64::from_be_bytes(block.0[..8].try_into().unwrap());
+            assert!(!keys.contains(&key(first - 1)).unwrap());
+            if first > 2 { assert!(keys.contains(&key(first - 2)).unwrap()); }
+        }
+        for n in [0, 1, 999, 160_001, u64::MAX] { assert!(!keys.contains(&key(n)).unwrap()); }
+        drop(keys);
+        assert_eq!(files(&dir), 0);
+        let empty = KeyFileBuilder::new().finish(&mut budget).unwrap();
+        assert!(!empty.contains(&[]).unwrap() && !empty.contains(&key(2)).unwrap());
+        drop(empty);
+        assert_eq!(files(&dir), 0);
+        set_thread_dir(None);
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

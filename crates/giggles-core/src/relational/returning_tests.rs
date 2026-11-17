@@ -19,6 +19,24 @@ fn state() -> Relational {
 }
 
 #[test]
+fn v2_projection_removes_row_count_cap_but_keeps_single_row_bound() {
+    let state = state();
+    let prepared = prepare(&state, "DELETE FROM r RETURNING txt");
+    let returning = prepared.returning().unwrap();
+    let row = [Value::Int(1), Value::Int(2), Value::Text("x".into())];
+    let rows = vec![row.as_slice(); MAX_ROWS + 1];
+    assert_eq!(returning.project(&state, &[], &rows), Err(SqlError::Limit));
+    {
+        let _scope = spill::returning_unbounded();
+        assert_eq!(returning.project(&state, &[], &rows).unwrap().len(), rows.len());
+        let wide = [Value::Int(1), Value::Int(2), Value::Text("x".repeat(40_000))];
+        let projection = prepare(&state, &format!("DELETE FROM r RETURNING {}", ["txt"; 27].join(",")));
+        assert_eq!(projection.returning().unwrap().project(&state, &[], &[&wide]), Err(SqlError::Limit));
+    }
+    assert_eq!(returning.project(&state, &[], &rows), Err(SqlError::Limit));
+}
+
+#[test]
 fn returning_uses_select_metadata_and_new_old_row_versions() {
     let mut state = state();
     let insert = prepare(

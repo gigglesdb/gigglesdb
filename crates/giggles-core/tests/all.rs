@@ -493,6 +493,8 @@ mod v2_returning_spill;
 mod v2_sort_spill;
 #[path = "v2_group_spill.rs"]
 mod v2_group_spill;
+#[path = "v2_in_spill.rs"]
+mod v2_in_spill;
 #[path = "v2_per_value_limits.rs"]
 mod v2_per_value_limits;
 #[path = "v2_insert_select_spill.rs"]

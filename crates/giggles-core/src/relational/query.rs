@@ -1271,9 +1271,14 @@ impl Filter {
     }
 }
 
+enum InKeys {
+    Hash(std::collections::HashSet<Vec<u8>>),
+    File(spill::KeyFile),
+    None,
+}
 struct MaterializedSubquery {
     values: spill::Store<Value>,
-    keys: Option<std::collections::HashSet<Vec<u8>>>,
+    keys: InKeys,
     has_null: bool,
 }
 struct Execution<'a> {
@@ -1392,9 +1397,9 @@ impl BoundFilter {
                     let mut values = spill::Store::new();
                     let mut keys = functions::join_key_supported(&value.ty, column_type)
                         .then(std::collections::HashSet::new);
+                    let mut key_file = None;
                     let mut has_null = false;
-                    // A spill-backed v2 result keeps its hash keys while they fit
-                    // 4 * work_mem, then probes the stored values like an unhashed subplan.
+                    // V2 switches to a sorted membership file past the hash budget.
                     let mut key_bytes = 0usize;
                     for result_row in subquery_rows(&result, captured.as_ref())? {
                         if execution.cancelled() {
@@ -1410,23 +1415,33 @@ impl BoundFilter {
                             execution.retention.borrow_mut().charge(element_bytes)?;
                         }
                         has_null |= element == Value::Null;
-                        if element != Value::Null
-                            && let Some(set) = &mut keys
-                        {
+                        if element != Value::Null && (keys.is_some() || key_file.is_some()) {
                             let key = encode_key(std::slice::from_ref(&element))?;
                             let bytes = key.len() + 4 * std::mem::size_of::<usize>();
-                            if captured.is_some() && key_bytes + bytes > 4 * spill::SORT_BYTES {
-                                execution.retention.borrow_mut().release(key_bytes);
-                                keys = None;
+                            let mut retention = execution.retention.borrow_mut();
+                            if captured.is_some() && keys.is_some() && key_bytes + bytes > spill::in_hash_bytes() {
+                                retention.release(key_bytes);
+                                let mut builder = spill::KeyFileBuilder::new();
+                                for key in keys.take().expect("hash keys") {
+                                    builder.push(key, &mut *retention)?;
+                                }
+                                key_file = Some(builder);
+                            }
+                            if let Some(builder) = &mut key_file {
+                                builder.push(key, &mut *retention)?;
                             } else {
-                                execution.retention.borrow_mut().charge(bytes)?;
+                                retention.charge(bytes)?;
                                 key_bytes += bytes;
-                                set.insert(key);
+                                keys.as_mut().expect("hash keys").insert(key);
                             }
                         }
                         values.push(element, element_bytes)?;
                     }
                     values.finish()?;
+                    let keys = match key_file {
+                        Some(builder) => InKeys::File(builder.finish(&mut *execution.retention.borrow_mut())?),
+                        None => keys.map_or(InKeys::None, InKeys::Hash),
+                    };
                     execution.subqueries.borrow_mut().insert(
                         *query,
                         MaterializedSubquery {
@@ -1444,9 +1459,19 @@ impl BoundFilter {
                 } else if lhs == Value::Null {
                     None
                 } else {
-                    let found = if let Some(keys) = &materialized.keys {
+                    let found = if !matches!(materialized.keys, InKeys::None) {
+                        if matches!(materialized.keys, InKeys::File(_)) {
+                            execution.comparison()?;
+                        }
                         match functions::join_key(&lhs, &value.ty, column_type)? {
-                            Some(key) => keys.contains(&encode_key(&[key])?),
+                            Some(key) => {
+                                let key = encode_key(&[key])?;
+                                match &materialized.keys {
+                                    InKeys::Hash(keys) => keys.contains(&key),
+                                    InKeys::File(keys) => keys.contains(&key)?,
+                                    InKeys::None => unreachable!(),
+                                }
+                            }
                             None => false,
                         }
                     } else {

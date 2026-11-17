@@ -135,3 +135,91 @@ fn legacy_returning_keeps_the_one_mebibyte_limit() {
         Err(CoreError::Sql(SqlError::Limit))
     );
 }
+
+const WIDE_ROWS: i64 = 400;
+
+fn insert_values(start: i64, end: i64) -> String {
+    // Keep input below its separate budget; RETURNING widens each output row.
+    (start..end).map(|i| format!("({i},{},'x')", i * 10))
+        .collect::<Vec<_>>().join(",")
+}
+
+fn assert_wide(affected: u64, rows: Vec<SqlRow>, start: i64, end: i64, dir: &SpillDir) {
+    assert_eq!((affected, rows.len()), ((end - start) as u64, (end - start) as usize));
+    for row in [&rows[0], &rows[rows.len() / 2], &rows[rows.len() - 1]] {
+        assert_eq!(row.values[1], Value::Text("x".repeat(8000)));
+    }
+    assert_eq!(ids(rows), (start..end).collect::<Vec<_>>());
+    assert_eq!(dir.files(), 0);
+}
+
+#[test]
+fn wide_returning_covers_paged_dml_and_cascade_paths() {
+    let dir = SpillDir::new("v2-wide-dml");
+    let admin = Admin::create_engine(common::fresh("v2-wide-dml"), Limits::default(), Engine::V2).unwrap();
+    let mut s = admin.sql_session();
+    load(&mut s, "t", WIDE_ROWS, 200);
+    let result = s.execute("UPDATE t SET w = 'x' RETURNING id, repeat(w,8000), v", &[], None).unwrap();
+    assert_eq!(result.rows[123].values[2], Value::Int(1230));
+    assert_wide(result.affected, result.rows, 0, WIDE_ROWS, &dir);
+
+    // A key move selects the cascade executor, even with no referencing table.
+    let result = s.execute("UPDATE t SET id = id + 1000 RETURNING id, repeat(w,8000)", &[], None).unwrap();
+    assert_wide(result.affected, result.rows, 1000, 1000 + WIDE_ROWS, &dir);
+    let (affected, rows) = streamed(&mut s, "DELETE FROM t RETURNING id, repeat(w,8000)", &dir.0);
+    assert_wide(affected, rows, 1000, 1000 + WIDE_ROWS, &dir);
+
+    s.execute(&format!("INSERT INTO t VALUES {}", insert_values(0, WIDE_ROWS)), &[], None).unwrap();
+    s.execute("CREATE TABLE child (id int PRIMARY KEY, parent int REFERENCES t(id) ON DELETE CASCADE)", &[], None).unwrap();
+    s.execute("INSERT INTO child SELECT id, id FROM t", &[], None).unwrap();
+    let result = s.execute("DELETE FROM t RETURNING id, repeat(w,8000)", &[], None).unwrap();
+    assert_wide(result.affected, result.rows, 0, WIDE_ROWS, &dir);
+    assert_eq!(s.execute("SELECT count(*) FROM child", &[], None).unwrap().rows[0].values, [Value::Int(0)]);
+}
+
+#[test]
+fn wide_returning_covers_insert_pages_conflicts_and_complete_image() {
+    let dir = SpillDir::new("v2-wide-insert");
+    let admin = Admin::create_engine(common::fresh("v2-wide-insert"), Limits::default(), Engine::V2).unwrap();
+    let mut s = admin.sql_session();
+    s.execute("CREATE TABLE t (id int PRIMARY KEY, v bigint, w text)", &[], None).unwrap();
+    // Each nested 200-row VALUES page projects more than 1 MiB. Its rows must
+    // stay available to the outer executor instead of publishing a spill slot.
+    let result = s.execute(&format!("INSERT INTO t VALUES {} RETURNING id, repeat(w,8000)", insert_values(0, WIDE_ROWS)), &[], None).unwrap();
+    assert_wide(result.affected, result.rows, 0, WIDE_ROWS, &dir);
+    s.execute("CREATE TABLE u (id int PRIMARY KEY, v bigint, w text)", &[], None).unwrap();
+    let (affected, rows) = streamed(&mut s, "INSERT INTO u SELECT * FROM t RETURNING id, repeat(w,8000)", &dir.0);
+    assert_wide(affected, rows, 0, WIDE_ROWS, &dir);
+
+    // 350 conflicts and 50 new rows; check both the row order and updated value.
+    let result = s.execute(&format!("INSERT INTO t VALUES {} ON CONFLICT (id) DO UPDATE SET v = excluded.v + 1 RETURNING id, repeat(w,8000), v", insert_values(50, 450)), &[], None).unwrap();
+    assert_eq!(result.rows[0].values[2], Value::Int(501));
+    assert_eq!(result.rows[399].values[2], Value::Int(4490));
+    assert_wide(result.affected, result.rows, 50, 450, &dir);
+    let result = s.execute(&format!("INSERT INTO t VALUES {} ON CONFLICT DO NOTHING RETURNING id, repeat(w,8000)", insert_values(50, 850)), &[], None).unwrap();
+    assert_wide(result.affected, result.rows, 450, 850, &dir);
+
+    // Self-referencing FKs reject the paged insert path, even when NULL.
+    s.execute("CREATE TABLE complete (id int PRIMARY KEY, parent int REFERENCES complete(id), w text)", &[], None).unwrap();
+    let (affected, rows) = streamed(&mut s, "INSERT INTO complete SELECT id, NULL::integer, w FROM u RETURNING id, repeat(w,8000)", &dir.0);
+    assert_wide(affected, rows, 0, WIDE_ROWS, &dir);
+}
+
+#[test]
+fn wide_returning_keeps_bounded_and_legacy_limits_and_cleans_up() {
+    let dir = SpillDir::new("wide-returning-limits");
+    for engine in [Engine::V2, Engine::Legacy] {
+        let admin = Admin::create_engine(common::fresh("wide-returning-limits"), Limits::default(), engine).unwrap();
+        let mut s = admin.sql_session();
+        load(&mut s, "t", WIDE_ROWS, 200);
+        let sql = "UPDATE t SET v = v + 1 RETURNING id, repeat('x',8000)";
+        let result = if engine == Engine::V2 {
+            spill::bounded(|| s.execute(sql, &[], None))
+        } else {
+            s.execute(sql, &[], None)
+        };
+        assert_eq!(result, Err(CoreError::Sql(SqlError::Limit)));
+        assert_eq!(dir.files(), 0);
+        assert_eq!(s.execute("SELECT v FROM t WHERE id = 7", &[], None).unwrap().rows[0].values, [Value::Int(70)]);
+    }
+}
