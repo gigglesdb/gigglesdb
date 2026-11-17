@@ -8,6 +8,9 @@
 use super::definition::{
     AllowedWrite, DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText, TaskPrivileges,
 };
+use super::ledger::OperationId;
+use super::receipt::{Receipt, DECISION_COMMITTED, DECISION_UNDO_COMPLETE, DECISION_UNDO_PARTIAL};
+use super::undo::{UndoMode, UndoSummary};
 use crate::relational::{SqlError, SqlResult, SqlRow, TimestampTz, Value};
 use crate::CoreError;
 use std::collections::BTreeSet;
@@ -711,13 +714,39 @@ pub enum ChangeStatement {
     },
     /// `REVOKE APPROVAL OF CHANGE <id> OF TASK <name>`.
     RevokeApproval { change: u64, task: String },
+    /// R3-804: `PREVIEW UNDO OF TASK <name> [OPERATION '<op id>']`.
+    PreviewUndo {
+        task: String,
+        operation: Option<OperationId>,
+    },
+    /// R3-804: `SHOW UNDO <id> OF TASK <name>`.
+    ShowUndo { undo: u64, task: String },
+    /// R3-804: `APPROVE UNDO <id> OF TASK <name> DIGEST '<64 hex>' MODE
+    /// {COMPLETE | PARTIAL}`. The mode keyword is required.
+    ApproveUndo {
+        undo: u64,
+        task: String,
+        digest: [u8; 32],
+        mode: UndoMode,
+    },
 }
 
 impl ChangeStatement {
-    /// The approver forms: never admitted in a task session, and on any
-    /// other session refused unless it passes the PostgreSQL-listener test.
+    /// The approver forms, and the undo forms of R3-804: never admitted in a
+    /// task session, and on any other session refused unless it passes the
+    /// PostgreSQL-listener test.
     pub fn is_approver_form(&self) -> bool {
         !matches!(self, ChangeStatement::Preview { .. } | ChangeStatement::Apply { .. })
+    }
+
+    /// The three undo forms (R3-804).
+    pub fn is_undo_form(&self) -> bool {
+        matches!(
+            self,
+            ChangeStatement::PreviewUndo { .. }
+                | ChangeStatement::ShowUndo { .. }
+                | ChangeStatement::ApproveUndo { .. }
+        )
     }
 }
 
@@ -731,6 +760,9 @@ enum ChangeHead {
     Show,
     Approve,
     RevokeApproval,
+    PreviewUndo,
+    ShowUndo,
+    ApproveUndo,
 }
 
 fn change_head(sql: &str) -> Option<ChangeHead> {
@@ -738,6 +770,9 @@ fn change_head(sql: &str) -> Option<ChangeHead> {
     let word = |i: usize| words.get(i).map(String::as_str);
     match (word(0)?, word(1)) {
         ("preview", Some("update")) => Some(ChangeHead::Preview),
+        ("preview", Some("undo")) => Some(ChangeHead::PreviewUndo),
+        ("show", Some("undo")) => Some(ChangeHead::ShowUndo),
+        ("approve", Some("undo")) => Some(ChangeHead::ApproveUndo),
         ("apply", Some("change")) => Some(ChangeHead::Apply),
         ("show", Some("changes" | "change")) => Some(ChangeHead::Show),
         ("approve", Some("change")) => Some(ChangeHead::Approve),
@@ -747,7 +782,8 @@ fn change_head(sql: &str) -> Option<ChangeHead> {
     }
 }
 
-/// Parses the six forms of D7.1. `None` is any other statement, which keeps
+/// Parses the six forms of D7.1 and the three undo forms (R3-804). `None` is
+/// any other statement, which keeps
 /// its existing path; a malformed form is 42601 (`Syntax`), and a digest that
 /// is not exactly 64 hex digits is 22023 (`InvalidParameterValue`). Task
 /// names are identifiers (`"inc-436"` must be quoted).
@@ -776,6 +812,9 @@ pub fn parse_change_statement(sql: &str) -> Option<Result<ChangeStatement, SqlEr
         ChangeHead::Show => p.show_change(),
         ChangeHead::Approve => p.approve_change(),
         ChangeHead::RevokeApproval => p.revoke_approval(),
+        ChangeHead::PreviewUndo => p.preview_undo(),
+        ChangeHead::ShowUndo => p.show_undo(),
+        ChangeHead::ApproveUndo => p.approve_undo(),
     })
 }
 
@@ -861,6 +900,67 @@ impl Parser<'_> {
         })
     }
 
+    /// `PREVIEW UNDO OF TASK <name> [OPERATION '<op id>']`; an operation ID
+    /// that is empty or longer than 128 bytes is 42601, as on the agent
+    /// listener.
+    fn preview_undo(&mut self) -> Result<ChangeStatement, SqlError> {
+        self.change_form(|p| {
+            p.words(&["preview", "undo"])?;
+            let task = p.of_task()?;
+            let operation = if p.eat_word("operation") {
+                let op = match p.peek() {
+                    Some(Tok::Str(text)) => OperationId::new(text.as_bytes()).ok_or(SYNTAX)?,
+                    _ => return Err(SYNTAX),
+                };
+                p.pos += 1;
+                Some(op)
+            } else {
+                None
+            };
+            Ok(ChangeStatement::PreviewUndo { task, operation })
+        })
+    }
+
+    /// `SHOW UNDO <id> OF TASK <name>`.
+    fn show_undo(&mut self) -> Result<ChangeStatement, SqlError> {
+        self.change_form(|p| {
+            p.words(&["show", "undo"])?;
+            let undo = p.number()?;
+            Ok(ChangeStatement::ShowUndo {
+                undo,
+                task: p.of_task()?,
+            })
+        })
+    }
+
+    /// `APPROVE UNDO <id> OF TASK <name> DIGEST '<hex>' MODE {COMPLETE |
+    /// PARTIAL}`. A missing or unknown mode is 42601; the digest is checked
+    /// (22023) once the whole form has parsed.
+    fn approve_undo(&mut self) -> Result<ChangeStatement, SqlError> {
+        let (undo, task, text, mode) = self.change_form(|p| {
+            p.words(&["approve", "undo"])?;
+            let undo = p.number()?;
+            let task = p.of_task()?;
+            let text = p.digest_literal()?;
+            p.word("mode")?;
+            let mode = if p.eat_word("complete") {
+                UndoMode::Complete
+            } else if p.eat_word("partial") {
+                UndoMode::Partial
+            } else {
+                return Err(SYNTAX);
+            };
+            Ok((undo, task, text, mode))
+        })?;
+        let digest = parse_digest(&text).ok_or(SqlError::InvalidParameterValue)?;
+        Ok(ChangeStatement::ApproveUndo {
+            undo,
+            task,
+            digest,
+            mode,
+        })
+    }
+
     fn revoke_approval(&mut self) -> Result<ChangeStatement, SqlError> {
         self.change_form(|p| {
             p.words(&["revoke", "approval", "of", "change"])?;
@@ -898,4 +998,147 @@ pub fn preview_result(summary: &super::preview::PreviewSummary) -> Result<SqlRes
         }],
         affected: 1,
     })
+}
+
+// ---------------------------------------------------------------------------
+// R3-804: the result rows of the undo forms (design-7 D7.1, D8).
+
+/// `PREVIEW UNDO` result columns: the stored undo preview's id (the id
+/// `SHOW CHANGES` lists with kind `undo`), its digest and the four counts.
+pub const UNDO_PREVIEW_COLUMNS: [&str; 7] = [
+    "change_id",
+    "digest",
+    "restorable",
+    "conflicts",
+    "superseded",
+    "settled",
+    "expires_at",
+];
+
+/// `SHOW UNDO` columns (plan v5 R3-804): one line per restored column, and
+/// one per conflict or superseded write.
+pub const UNDO_COLUMNS: [&str; 6] = [
+    "class",
+    "key",
+    "column_name",
+    "current_value",
+    "restored_value",
+    "reason",
+];
+
+/// `APPROVE UNDO` result columns: the full receipt of the undo commit.
+pub const UNDO_RECEIPT_COLUMNS: [&str; 20] = [
+    "operation_id",
+    "decision",
+    "receipt_seq",
+    "change_id",
+    "mode",
+    "restored",
+    "conflicts",
+    "superseded",
+    "row_count",
+    "distinct_charged",
+    "transitions_charged",
+    "distinct_after",
+    "transitions_after",
+    "effects_digest",
+    "request_fp",
+    "issuer",
+    "executor",
+    "undone_by",
+    "def_version",
+    "decided_at",
+];
+
+fn int_value(n: u64) -> Result<Value, CoreError> {
+    i64::try_from(n)
+        .map(Value::Int)
+        .map_err(|_| CoreError::Sql(SqlError::Overflow))
+}
+
+/// Unix milliseconds as a timestamptz value.
+fn ms_timestamptz(ms: u64) -> Result<Value, CoreError> {
+    let overflow = || CoreError::Sql(SqlError::Overflow);
+    let us = i64::try_from(ms)
+        .ok()
+        .and_then(|ms| ms.checked_sub(super::catalog::PG_EPOCH_UNIX_MS))
+        .and_then(|ms| ms.checked_mul(1000))
+        .ok_or_else(overflow)?;
+    Ok(Value::TimestampTz(
+        TimestampTz::from_microseconds(us).map_err(|_| overflow())?,
+    ))
+}
+
+fn one_row(columns: &[&str], values: Vec<Value>) -> SqlResult {
+    SqlResult {
+        columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+        rows: vec![SqlRow { values, version: 0 }],
+        affected: 1,
+    }
+}
+
+/// The `PREVIEW UNDO` row `(change_id, digest, restorable, conflicts,
+/// superseded, settled, expires_at)`. It carries no row values.
+pub fn undo_preview_result(summary: &UndoSummary) -> Result<SqlResult, CoreError> {
+    Ok(one_row(
+        &UNDO_PREVIEW_COLUMNS,
+        vec![
+            int_value(summary.id.0)?,
+            Value::Text(super::preview::digest_hex(&summary.digest)),
+            int_value(u64::from(summary.restorable))?,
+            int_value(u64::from(summary.conflicts))?,
+            int_value(u64::from(summary.superseded))?,
+            int_value(u64::from(summary.settled))?,
+            ms_timestamptz(summary.expires_at)?,
+        ],
+    ))
+}
+
+/// The `APPROVE UNDO` row: every field of the full receipt
+/// ([`UNDO_RECEIPT_COLUMNS`]). `decision` is `committed`, `undo_complete`
+/// or `undo_partial`; `mode` is `complete` or `partial` (NULL for a receipt
+/// that is not an undo's); `undone_by` is the receipt's approver, the undo
+/// role. A minimal receipt is refused (`Unsupported`): the undo role always
+/// gets the full view.
+pub fn undo_receipt_result(receipt: &Receipt) -> Result<SqlResult, CoreError> {
+    let record = receipt.record().ok_or(CoreError::Unsupported)?;
+    let decision = match record.decision {
+        DECISION_COMMITTED => "committed",
+        DECISION_UNDO_COMPLETE => "undo_complete",
+        DECISION_UNDO_PARTIAL => "undo_partial",
+        _ => return Err(CoreError::Corrupt("receipt decision".into())),
+    };
+    let mode = if record.undo_mode == UndoMode::Complete as u8 {
+        Value::Text("complete".into())
+    } else if record.undo_mode == UndoMode::Partial as u8 {
+        Value::Text("partial".into())
+    } else {
+        Value::Null
+    };
+    let preview = receipt.preview().map_or(Ok(Value::Null), int_value)?;
+    Ok(one_row(
+        &UNDO_RECEIPT_COLUMNS,
+        vec![
+            Value::Text(String::from_utf8_lossy(&record.op_id).into_owned()),
+            Value::Text(decision.into()),
+            int_value(record.seq)?,
+            preview,
+            mode,
+            int_value(u64::from(record.restored))?,
+            int_value(u64::from(record.conflicts))?,
+            int_value(u64::from(record.superseded))?,
+            int_value(u64::from(record.rows_affected))?,
+            int_value(u64::from(record.distinct_charged))?,
+            int_value(u64::from(record.transitions_charged))?,
+            int_value(record.distinct_after)?,
+            int_value(record.transitions_after)?,
+            Value::Text(super::preview::digest_hex(&record.effects_digest)),
+            Value::Text(super::preview::digest_hex(&record.request_fp)),
+            Value::Text(record.issuer.clone()),
+            Value::Text(record.executor.clone()),
+            record.approver.clone().map_or(Value::Null, Value::Text),
+            int_value(record.def_version)?,
+            ms_timestamptz(record.decided_ms)?,
+        ],
+    ))
 }

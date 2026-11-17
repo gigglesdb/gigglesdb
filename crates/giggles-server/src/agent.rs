@@ -7,6 +7,7 @@ pub mod bindings;
 pub mod listener;
 pub(crate) mod preview;
 pub mod statement;
+pub(crate) mod undo;
 
 pub use bindings::AgentBinding;
 pub use listener::{AgentConfig, serve_agent_pg_bound};

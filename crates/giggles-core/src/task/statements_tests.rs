@@ -426,4 +426,78 @@ mod change_statements {
             }
         }
     }
+
+    // R3-804: the three undo forms.
+    #[test]
+    fn undo_forms_parse() {
+        use crate::task::{OperationId, UndoMode};
+        let h = hex();
+        let cases = [
+            (
+                "PREVIEW UNDO OF TASK \"inc-436\"".to_owned(),
+                ChangeStatement::PreviewUndo { task: "inc-436".into(), operation: None },
+            ),
+            (
+                "preview undo of task t operation 'a1';".to_owned(),
+                ChangeStatement::PreviewUndo {
+                    task: "t".into(),
+                    operation: OperationId::new("a1"),
+                },
+            ),
+            (
+                "SHOW UNDO 4 OF TASK \"inc-436\"".to_owned(),
+                ChangeStatement::ShowUndo { undo: 4, task: "inc-436".into() },
+            ),
+            (
+                format!("APPROVE UNDO 4 OF TASK t DIGEST '{h}' MODE COMPLETE"),
+                ChangeStatement::ApproveUndo {
+                    undo: 4,
+                    task: "t".into(),
+                    digest: digest(),
+                    mode: UndoMode::Complete,
+                },
+            ),
+            (
+                format!("approve undo 4 of task t digest '{h}' mode partial ;"),
+                ChangeStatement::ApproveUndo {
+                    undo: 4,
+                    task: "t".into(),
+                    digest: digest(),
+                    mode: UndoMode::Partial,
+                },
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(parse_change_statement(&sql), Some(Ok(expected.clone())), "{sql}");
+            assert!(expected.is_approver_form() && expected.is_undo_form(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn undo_mode_keyword_is_required() {
+        let h = hex();
+        for sql in [
+            format!("APPROVE UNDO 4 OF TASK t DIGEST '{h}'"),
+            format!("APPROVE UNDO 4 OF TASK t DIGEST '{h}' COMPLETE"),
+            format!("APPROVE UNDO 4 OF TASK t DIGEST '{h}' MODE"),
+            format!("APPROVE UNDO 4 OF TASK t DIGEST '{h}' MODE FULL"),
+            format!("APPROVE UNDO 4 OF TASK t MODE COMPLETE DIGEST '{h}'"),
+            format!("APPROVE UNDO 4 OF TASK t DIGEST '{h}' MODE PARTIAL extra"),
+            "PREVIEW UNDO OF TASK".to_owned(),
+            "PREVIEW UNDO TASK t".to_owned(),
+            "PREVIEW UNDO OF TASK t OPERATION".to_owned(),
+            "PREVIEW UNDO OF TASK t OPERATION ''".to_owned(),
+            "PREVIEW UNDO OF TASK t OPERATION a1".to_owned(),
+            format!("PREVIEW UNDO OF TASK t OPERATION '{}'", "x".repeat(129)),
+            "SHOW UNDO OF TASK t".to_owned(),
+            "SHOW UNDO 1 OF TASK".to_owned(),
+        ] {
+            assert_eq!(parse_change_statement(&sql), Some(Err(SqlError::Syntax)), "{sql}");
+        }
+        // The digest is checked once the form has parsed.
+        assert_eq!(
+            parse_change_statement("APPROVE UNDO 4 OF TASK t DIGEST 'xyz' MODE COMPLETE"),
+            Some(Err(SqlError::InvalidParameterValue))
+        );
+    }
 }

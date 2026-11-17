@@ -269,6 +269,8 @@ mod agent_pg_profile;
 mod agent_pg_operations;
 #[path = "r3_preview_sql.rs"]
 mod r3_preview_sql;
+#[path = "r3_undo_sql.rs"]
+mod r3_undo_sql;
 #[path = "task_release_extended.rs"]
 mod task_release_extended;
 #[path = "task_catalog_visibility.rs"]

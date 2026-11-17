@@ -443,6 +443,14 @@ pub fn parse(sql: &str) -> Result<Option<(ProtectedHead, &str)>, &'static str> {
     }
     if first.eq_ignore_ascii_case("preview") {
         lexer.word("preview");
+        // R3-804: `PREVIEW UNDO ..` is an undo form, not a protected one; the
+        // task path refuses it as `Other`.
+        if lexer
+            .peek_word()
+            .is_some_and(|(word, _)| word.eq_ignore_ascii_case("undo"))
+        {
+            return Ok(None);
+        }
         let wrapped = lexer.wrapped_update()?;
         return Ok(Some((ProtectedHead::Preview, wrapped)));
     }

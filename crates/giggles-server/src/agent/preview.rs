@@ -30,12 +30,16 @@ use giggles_core::{
     },
 };
 
-/// The approver forms of D7.1 on a session without a task. `Ok(None)` is any
-/// other statement. PREVIEW and APPLY CHANGE are `None` too: off the agent
-/// listener they keep the reply of an unknown statement (R3-206).
+/// The approver forms of D7.1, and the undo forms (R3-804, `agent::undo`),
+/// on a session without a task. `Ok(None)` is any other statement. PREVIEW
+/// and APPLY CHANGE are `None` too: off the agent listener they keep the
+/// reply of an unknown statement (R3-206). `PREVIEW UNDO` is an undo form.
 pub(crate) fn approver_statement(sql: &str) -> Result<Option<ChangeStatement>, &'static str> {
-    let first = sql.split_whitespace().next().unwrap_or("");
-    if first.eq_ignore_ascii_case("preview") || first.eq_ignore_ascii_case("apply") {
+    let mut words = sql.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let preview_undo = first.eq_ignore_ascii_case("preview")
+        && words.next().is_some_and(|w| w.eq_ignore_ascii_case("undo"));
+    if (first.eq_ignore_ascii_case("preview") && !preview_undo) || first.eq_ignore_ascii_case("apply") {
         return Ok(None);
     }
     match parse_change_statement(sql) {
@@ -59,6 +63,18 @@ fn column(name: &str, data_type: DataType) -> ColumnDef {
 /// and SHOW CHANGE, none for APPROVE and REVOKE APPROVAL.
 pub(crate) fn approver_description(statement: &ChangeStatement) -> Description {
     use DataType::{BigInt, Text, TimestampTz};
+    if let Some(columns) = super::undo::columns(statement) {
+        let columns: Vec<_> = columns
+            .into_iter()
+            .map(|(name, data_type)| column(name, data_type))
+            .collect();
+        return Description {
+            type_oids: vec![],
+            typmods: vec![-1; columns.len()],
+            parameters: vec![],
+            columns,
+        };
+    }
     let types: &[DataType] = match statement {
         ChangeStatement::ShowChanges { .. } => {
             &[BigInt, Text, Text, Text, BigInt, TimestampTz, TimestampTz, Text]
@@ -86,6 +102,9 @@ pub(crate) fn approver_description(statement: &ChangeStatement) -> Description {
 
 /// The CommandComplete word of an approver form.
 pub(crate) fn approver_command(statement: &ChangeStatement) -> &'static str {
+    if let Some(command) = super::undo::command(statement) {
+        return command;
+    }
     match statement {
         ChangeStatement::Approve { .. } => "APPROVE",
         ChangeStatement::RevokeApproval { .. } => "REVOKE APPROVAL",
@@ -150,6 +169,11 @@ pub(crate) fn execute_approver(
                 task::revoke_approval(sql, &role, &name(task)?, PreviewId(*change))
                     .map_err(CoreError::from)?;
                 Ok(SqlResult::default())
+            }
+            ChangeStatement::PreviewUndo { task, .. }
+            | ChangeStatement::ShowUndo { task, .. }
+            | ChangeStatement::ApproveUndo { task, .. } => {
+                super::undo::execute(sql, &role, &name(task)?, statement)
             }
             ChangeStatement::Preview { .. } | ChangeStatement::Apply { .. } => {
                 Err(CoreError::Unsupported)

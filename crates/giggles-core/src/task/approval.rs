@@ -33,8 +33,8 @@ use super::definition::{RoleName, TaskDef, TaskName, TaskPrivileges};
 use super::error::TaskError;
 use super::catalog::PG_EPOCH_UNIX_MS;
 use super::preview::{
-    digest_hex, headers, stored_rows, PreviewHeader, PreviewId, PreviewKind, PreviewRow,
-    STATE_APPLIED, STATE_OPEN,
+    digest_hex, headers, stored_rows, PreviewClass, PreviewHeader, PreviewId, PreviewKind,
+    PreviewRow, STATE_APPLIED, STATE_OPEN,
 };
 use super::records::{
     approval_key, mutation_head_key, preview_key, preview_row_key, ApprovalRecord, TaskObjectId,
@@ -278,6 +278,148 @@ pub fn show_change(
         }
     }
     Ok(page(&CHANGE_COLUMNS, lines))
+}
+
+/// Text of an undo conflict reason (`aux` of a class-01 row).
+fn conflict_reason(aux: u64) -> String {
+    use super::undo::ConflictReason as R;
+    let reasons = [
+        R::ChangedSince,
+        R::RowMissing,
+        R::Constraint,
+        R::BeforeValuesExpired,
+        R::SchemaChanged,
+    ];
+    let names = [
+        "changed_since",
+        "row_missing",
+        "constraint",
+        "before_values_expired",
+        "schema_changed",
+    ];
+    reasons
+        .iter()
+        .zip(names)
+        .find(|(reason, _)| **reason as u64 == aux)
+        .map_or_else(|| format!("conflict {aux}"), |(_, name)| name.to_owned())
+}
+
+/// SHOW UNDO `id` OF TASK `task` as `role` (R3-804, design-7 D8): the stored
+/// undo preview in long form, `(class, key, column_name, current_value,
+/// restored_value, reason)`, in stored row order.
+///
+/// - `restore`: one line per column whose current value differs from the
+///   value the undo restores; a row with no difference gets one line with a
+///   NULL `column_name`. When the row's version is no longer the one the
+///   preview read (or the row is gone), every column is listed with a NULL
+///   `current_value` and `reason` [`CHANGED_SINCE_PREVIEW`]
+///   without its parentheses.
+/// - `conflict`: one line with the conflict reason (`changed_since`,
+///   `row_missing`, `constraint`, `before_values_expired`,
+///   `schema_changed`) and the current value of no column.
+/// - `superseded`: one line, reason `superseded (seq N)`, `N` being the
+///   change record whose write a later, unlinked write replaced.
+///
+/// Needs the undo or the inspect privilege on the task and SELECT on its
+/// table (42501). A missing id, or one that is not an undo preview, is
+/// 42704. The key is PostgreSQL's key detail spelling from the restored or
+/// current row; a row that is gone and has no restore values shows its
+/// stored key bytes as `\x<hex>`.
+pub fn show_undo(
+    session: &mut SqlSession,
+    role: &RoleName,
+    task: &TaskName,
+    id: PreviewId,
+) -> Result<Unreleased<SqlResult>, TaskError> {
+    let (db, def) = open(session, task)?;
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    let held = match role_txn(&mut txn, role).map_err(role_error)? {
+        Some(record) => def.privileges_of(&record),
+        None => TaskPrivileges::NONE,
+    };
+    if !held.contains(TaskPrivileges::UNDO) && !held.contains(TaskPrivileges::INSPECT) {
+        return Err(no_privilege());
+    }
+    let header = load_header(&mut txn, def.id, id)?
+        .filter(|header| header.kind == PreviewKind::Undo as u8)
+        .ok_or(CoreError::Sql(SqlError::UndefinedObject))?;
+    let view = db.catalog().committed_view(&mut txn)?;
+    let entry = view
+        .by_id
+        .get(&header.table)
+        .cloned()
+        .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+    may_select(&mut txn, &entry.def.name, role)?;
+    let table = &entry.def;
+    let width = table.columns.len();
+    let offsets = table.logical_offsets();
+    let stale_reason = CHANGED_SINCE_PREVIEW.trim().trim_matches(['(', ')']);
+    let mut lines = Vec::new();
+    let undo_line = |class: &str, key: &str, column: Value, current: Value, restored: Value, reason: Value| SqlRow {
+        values: vec![
+            Value::Text(class.to_owned()),
+            Value::Text(key.to_owned()),
+            column,
+            current,
+            restored,
+            reason,
+        ],
+        version: 0,
+    };
+    for row_no in 0..stored_rows(&header) {
+        let key = preview_row_key(def.id, id.0, row_no);
+        let Some(value) = txn.get(Keyspace::Kernel, &key).map_err(CoreError::from)? else {
+            continue;
+        };
+        let row = PreviewRow::decode(&value)?;
+        let current = current_row(&mut txn, &row)?.map(|(version, mut values)| {
+            values.resize(width, Value::Null);
+            (version, values)
+        });
+        let restored = if row.class == PreviewClass::Change as u8 {
+            let mut values = crate::storage::task_row_values(&row.after)?;
+            values.resize(width, Value::Null);
+            Some(values)
+        } else {
+            None
+        };
+        let key = match restored.as_ref().or(current.as_ref().map(|(_, values)| values)) {
+            Some(values) => key_text(table, values)?,
+            None => format!("\\x{}", row.pk.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        };
+        if let Some(restored) = restored {
+            let fresh = current
+                .filter(|(version, _)| *version == row.version_read)
+                .map(|(_, values)| values);
+            let reason = if fresh.is_some() {
+                Value::Null
+            } else {
+                Value::Text(stale_reason.to_owned())
+            };
+            let mut listed = 0usize;
+            for &column in &offsets {
+                let new = &restored[column];
+                let old = match &fresh {
+                    Some(values) if values[column] == *new => continue,
+                    Some(values) => text(&values[column])?,
+                    None => Value::Null,
+                };
+                let name = Value::Text(table.columns[column].name.clone());
+                lines.push(undo_line("restore", &key, name, old, text(new)?, reason.clone()));
+                listed += 1;
+            }
+            if listed == 0 {
+                lines.push(undo_line("restore", &key, Value::Null, Value::Null, Value::Null, reason));
+            }
+        } else if row.class == PreviewClass::Conflict as u8 {
+            let reason = Value::Text(conflict_reason(row.aux));
+            lines.push(undo_line("conflict", &key, Value::Null, Value::Null, Value::Null, reason));
+        } else {
+            let reason = Value::Text(format!("superseded (seq {})", row.aux));
+            lines.push(undo_line("superseded", &key, Value::Null, Value::Null, Value::Null, reason));
+        }
+    }
+    Ok(page(&super::statements::UNDO_COLUMNS, lines))
 }
 
 fn line(row_no: &Value, key: &str, column: Value, old: Value, new: Value) -> SqlRow {
