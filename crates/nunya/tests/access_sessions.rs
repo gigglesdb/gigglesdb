@@ -2451,3 +2451,416 @@ async fn per_route_policy_files_reload_and_audit() -> ServeResult<()> {
     assert_eq!(native_revisions, vec![spanner_hash, new_hash]);
     Ok(())
 }
+
+// Wait for this reload, even when only a certificate or policy file changed.
+async fn reload_admin_request(h: &ServeHarness, method: &str, path: &str) -> ServeResult<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let config: toml::Table =
+        toml::from_str(&std::fs::read_to_string(h.dir().join("nunya.toml"))?)?;
+    let addr = config["admin_listen"]
+        .as_str()
+        .ok_or("missing admin address")?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        stream.write_all(format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await?;
+        let (head, body) = response.split_once("\r\n\r\n").ok_or("missing admin response body")?;
+        assert_eq!(head.split_whitespace().nth(1), Some(if method == "POST" { "202" } else { "200" }));
+        Ok(body.to_owned())
+    }).await?
+}
+
+async fn reload_applied(h: &ServeHarness) -> ServeResult<()> {
+    fn config_line(status: &str) -> ServeResult<&str> {
+        status
+            .lines()
+            .find(|line| line.starts_with("config revision="))
+            .ok_or_else(|| "missing config status".into())
+    }
+    let before = reload_admin_request(h, "GET", "/status").await?;
+    let before = config_line(&before)?.to_owned();
+    // Reload timestamps are millisecond resolution, including TLS-only reloads.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    reload_admin_request(h, "POST", "/reload").await?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status = reload_admin_request(h, "GET", "/status").await?;
+            let line = config_line(&status)?;
+            if line != before && line.split_whitespace().any(|s| s == "last_reload=applied") {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| "reload did not report a fresh applied config outcome")?
+}
+
+fn reload_config(h: &ServeHarness) -> ServeResult<toml::Table> {
+    Ok(toml::from_str(&std::fs::read_to_string(
+        h.dir().join("nunya.toml"),
+    )?)?)
+}
+
+fn write_reload_config(h: &ServeHarness, config: &toml::Table) -> ServeResult<()> {
+    Ok(std::fs::write(
+        h.dir().join("nunya.toml"),
+        toml::to_string(config)?,
+    )?)
+}
+
+fn standing_entry(name: &str, secret: &SessionSecret) -> toml::Value {
+    toml::Value::Table(toml::Table::from_iter([
+        ("name".into(), name.into()),
+        ("verifier".into(), secret.verifier.clone().into()),
+    ]))
+}
+
+async fn grant_standing(h: &ServeHarness, name: &str, routes: &[(&str, Mode)]) -> ServeResult<()> {
+    let principal = h
+        .admin()
+        .principals()
+        .await?
+        .into_iter()
+        .find(|p| p.name == name)
+        .ok_or("missing config principal")?;
+    h.admin().set_grants(&principal.id, routes).await?;
+    Ok(())
+}
+
+fn replace_reload_certificate(h: &ServeHarness) -> ServeResult<()> {
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+    std::fs::write(h.dir().join("reload.crt"), cert.pem())?;
+    std::fs::write(h.dir().join("reload.key"), key_pair.serialize_pem())?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG pointing at harness database"]
+async fn reload_continuity_every_kind() -> ServeResult<()> {
+    let url = std::env::var("NUNYA_TEST_PG")?;
+    let keep = SessionSecret::generate();
+    let other = SessionSecret::generate();
+    let policy = file_sink_policy().replace(
+        "tokenize_limit_per_session = 20",
+        "tokenize_limit_per_session = 5",
+    );
+    let mut h = ServeHarness::new(&policy, Some(&url), None, None, "")?;
+    replace_reload_certificate(&h)?;
+    let mut config = reload_config(&h)?;
+    config.insert(
+        "standing".into(),
+        vec![
+            standing_entry("keep", &keep),
+            standing_entry("other", &other),
+        ]
+        .into(),
+    );
+    config.insert(
+        "tls".into(),
+        toml::Value::Table(toml::Table::from_iter([
+            ("cert_file".into(), "reload.crt".into()),
+            ("key_file".into(), "reload.key".into()),
+        ])),
+    );
+    config.insert("max_connections".into(), 10.into());
+    // Both schemas exist in a stock seeded PostgreSQL database.
+    config.insert(
+        "schemas".into(),
+        vec!["public", "information_schema"].into(),
+    );
+    config.insert(
+        "search_path".into(),
+        vec!["public", "information_schema"].into(),
+    );
+    config.insert("snapshot_refresh_ms".into(), 30000.into());
+    write_reload_config(&h, &config)?;
+    h.start().await?;
+    grant_standing(&h, "keep", &[("postgres", Mode::ReadWrite)]).await?;
+    let owner = owner(&h, "keep", &keep)?;
+    let (session, secret) = acquire(&owner, false, None).await?;
+    let before = owner.session(&session.id).await?;
+    let (client, _driver) = session_connect(&h, &session, &secret).await?;
+    let original = token(&client).await?;
+    assert!(
+        !original.is_empty() && original != "alice@example.test",
+        "email was not protected"
+    );
+    tokenize(&client, "before-one").await?;
+    tokenize(&client, "before-two").await?;
+
+    replace_reload_certificate(&h)?;
+    reload_applied(&h).await?;
+    assert!(
+        token(&client).await? == original,
+        "TLS reload changed token"
+    );
+
+    let (second, second_driver) = session_connect(&h, &session, &secret).await?;
+    assert_eq!(
+        h.admin()
+            .connections()
+            .await?
+            .iter()
+            .filter(|c| c.session == session.id)
+            .count(),
+        2
+    );
+    config.insert("max_connections".into(), 1.into());
+    write_reload_config(&h, &config)?;
+    reload_applied(&h).await?;
+    assert!(
+        token(&client).await? == original,
+        "lowered cap changed token"
+    );
+    assert!(
+        token(&second).await? == original,
+        "lowered cap ended existing connection"
+    );
+    config.insert("max_connections".into(), 10.into());
+    write_reload_config(&h, &config)?;
+    reload_applied(&h).await?;
+    assert!(
+        token(&client).await? == original,
+        "raised cap changed token"
+    );
+    drop(second);
+    drop(second_driver);
+
+    std::fs::write(
+        h.dir().join("policy.toml"),
+        policy.replace("[hidden]", "[redacted]"),
+    )?;
+    reload_applied(&h).await?;
+    assert!(
+        token(&client).await? == original,
+        "policy reload changed token"
+    );
+    assert_eq!(
+        values(&client, "SELECT phone FROM customers WHERE id = 1").await?,
+        vec![vec!["[redacted]".to_owned()]]
+    );
+
+    config.insert(
+        "schemas".into(),
+        vec!["information_schema", "public"].into(),
+    );
+    config.insert(
+        "search_path".into(),
+        vec!["information_schema", "public"].into(),
+    );
+    write_reload_config(&h, &config)?;
+    reload_applied(&h).await?;
+    assert!(
+        token(&client).await? == original,
+        "schema reload changed token"
+    );
+
+    let rotated = SessionSecret::generate();
+    config.insert(
+        "standing".into(),
+        vec![
+            standing_entry("keep", &keep),
+            standing_entry("other", &rotated),
+        ]
+        .into(),
+    );
+    write_reload_config(&h, &config)?;
+    reload_applied(&h).await?;
+    assert!(
+        token(&client).await? == original,
+        "other verifier rotation changed token"
+    );
+    config.insert(
+        "standing".into(),
+        vec![standing_entry("keep", &keep)].into(),
+    );
+    write_reload_config(&h, &config)?;
+    reload_applied(&h).await?;
+    assert!(
+        token(&client).await? == original,
+        "other removal changed token"
+    );
+
+    let (new, _new_driver) = session_connect(&h, &session, &secret).await?;
+    assert!(
+        token(&new).await? == original,
+        "new connection changed token"
+    );
+    for label in ["after-three", "after-four", "after-five"] {
+        tokenize(&new, label).await?;
+    }
+    limited(&new).await;
+    let after = owner.session(&session.id).await?;
+    assert_eq!(before.id, after.id);
+    assert_eq!(before.scope, after.scope);
+    assert_eq!(before.expires_ms, after.expires_ms);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG, NUNYA_TEST_SPANNER_EMULATOR and NUNYA_TEST_SPANNER_DB"]
+async fn reload_removed_standing_ends_pg_and_native_sessions() -> ServeResult<()> {
+    let f = NativeFixture::new(
+        "email STRING(MAX), payload STRING(MAX)",
+        "email, payload",
+        "'alice@example.test', 'small'",
+        false,
+    )
+    .await?;
+    // Exceed HTTP/2 flow-control buffers so the admitted stream stays in flight.
+    f.insert(&format!("INSERT INTO {}.t (id, email, payload) SELECT n, 'alice@example.test', REPEAT('x', 65536) FROM UNNEST(GENERATE_ARRAY(2, 513)) AS n", f.schema)).await?;
+    let url = std::env::var("NUNYA_TEST_PG")?;
+    let database = std::env::var("NUNYA_TEST_SPANNER_DB")?;
+    let endpoint = format!("http://{}", std::env::var("NUNYA_TEST_SPANNER_EMULATOR")?);
+    let principal_secret = SessionSecret::generate();
+    let mut h = ServeHarness::new(
+        &file_sink_policy(),
+        Some(&url),
+        None,
+        Some(super::common::NativeUpstream {
+            database: &database,
+            emulator_endpoint: &endpoint,
+        }),
+        "",
+    )?;
+    let native_policy = include_str!("../harness/spanner/policy_gsql.toml")
+        .replace("sink = \"stdout\"", "sink = \"file\"\npath = \"read.log\"");
+    std::fs::write(
+        h.dir().join("spanner-policy.toml"),
+        format!(
+            "{native_policy}\n[[column]]\ntable = '{}.t'\nname = 'email'\nblind = 'email'\n",
+            f.schema
+        ),
+    )?;
+    let mut config = reload_config(&h)?;
+    config.remove("policy");
+    config["upstream"]
+        .as_table_mut()
+        .ok_or("missing PG config")?
+        .insert("policy".into(), "policy.toml".into());
+    config["spanner_native"]
+        .as_table_mut()
+        .ok_or("missing native config")?
+        .insert("policy".into(), "spanner-policy.toml".into());
+    config.insert(
+        "standing".into(),
+        vec![standing_entry("agent", &principal_secret)].into(),
+    );
+    write_reload_config(&h, &config)?;
+    h.start().await?;
+    grant_standing(
+        &h,
+        "agent",
+        &[
+            ("postgres", Mode::ReadWrite),
+            ("spanner-native", Mode::ReadWrite),
+        ],
+    )
+    .await?;
+    let owner = owner(&h, "agent", &principal_secret)?;
+    let (pg, pg_secret) = acquire(&owner, false, None).await?;
+    let (native, native_secret) = native_acquire(&owner, false, None).await?;
+    let (pg_client, _pg_driver) = session_connect(&h, &pg, &pg_secret).await?;
+    let protected = token(&pg_client).await?;
+    assert!(
+        !protected.is_empty() && protected != "alice@example.test",
+        "PG email was not protected"
+    );
+    let mut cleanup = SpannerSessions {
+        endpoint,
+        names: vec![],
+    };
+    // native_open uses the default REGULAR (not multiplexed) session request.
+    let (mut native_client, name) =
+        native_open(&h, &native, &native_secret, &database, &mut cleanup).await?;
+    let query = spanner_sql(&name, "SELECT Email FROM Customers WHERE Id = 1");
+    let rows = native_cells(&native_client.execute_sql(query.clone()).await?.into_inner())?;
+    assert!(
+        rows.len() == 1
+            && rows[0].len() == 1
+            && !rows[0][0].is_empty()
+            && rows[0][0] != "alice@example.test",
+        "native email was not protected"
+    );
+
+    let mut stream = native_client
+        .execute_streaming_sql(spanner_sql(
+            &name,
+            &format!("SELECT email, payload FROM {}.t", f.schema),
+        ))
+        .await?
+        .into_inner();
+    let first = stream
+        .message()
+        .await?
+        .ok_or("stream ended before standing removal")?;
+    let mut completed_values = first.values.len() - usize::from(first.chunked_value);
+
+    config.remove("standing");
+    write_reload_config(&h, &config)?;
+    reload_applied(&h).await?;
+    ended(
+        pg_client
+            .simple_query("SELECT email FROM customers WHERE id = 1")
+            .await,
+    );
+    // Already buffered chunks may arrive, but the admitted stream must end NY011.
+    let stream_status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.message().await {
+                Ok(Some(part)) => {
+                    completed_values += part.values.len() - usize::from(part.chunked_value);
+                }
+                Err(status) => break status,
+                Ok(None) => panic!("standing-removed stream completed normally"),
+            }
+        }
+    })
+    .await?;
+    // Keep all refusal probes independent so a product failure cannot hide later evidence.
+    let native_result = native_client.execute_sql(query).await;
+    let pg_login = connect(&h, &format!("session:{}", pg.id), &pg_secret).await;
+    let mut new_native =
+        spanner_client(&h, &format!("session:{}", native.id), &native_secret).await?;
+    let native_login = new_native
+        .create_session(CreateSessionRequest {
+            database,
+            ..Default::default()
+        })
+        .await;
+    let acquire_result = acquire(&owner, false, None).await;
+    let stderr = std::fs::read_to_string(h.dir().join("stderr-1.log"))?;
+    for secret in [&principal_secret, &pg_secret, &native_secret] {
+        assert!(
+            !stderr.contains(secret.secret.as_str()),
+            "serve stderr exposed a secret"
+        );
+        assert!(
+            !stderr.contains(&secret.verifier),
+            "serve stderr exposed a verifier"
+        );
+    }
+    assert!(
+        !stderr.contains(&format!(
+            "Bearer nunya.session:{}.{}",
+            native.id, *native_secret.secret
+        )),
+        "serve stderr exposed a bearer"
+    );
+    assert!(pg_login.is_err(), "removed standing PG login accepted");
+    spanner_denied(native_login, "NY003");
+    assert!(
+        matches!(acquire_result.as_ref().err().and_then(|e| e.downcast_ref::<ClientError>()), Some(ClientError::Api { status: 401, .. })),
+        "removed principal acquired a session or wrong refusal"
+    );
+    spanner_denied::<()>(Err(stream_status), "NY011");
+    assert!(
+        completed_values / 2 < 513,
+        "standing-removed stream delivered every row"
+    );
+    spanner_denied(native_result, "NY003");
+    Ok(())
+}
