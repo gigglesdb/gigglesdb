@@ -75,6 +75,8 @@ mod qualified_routine_network;
 mod role_sessions;
 #[path = "role_sql_network.rs"]
 mod role_sql_network;
+#[path = "role_admission_network.rs"]
+mod role_admission_network;
 #[path = "savepoints_network.rs"]
 mod savepoints_network;
 #[path = "secondary_index_catalog_network.rs"]

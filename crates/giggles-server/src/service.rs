@@ -224,6 +224,13 @@ impl Service {
             clock,
         }))
     }
+    /// GD-0075 R5-103: per-role statement limits on this node (startup config).
+    pub fn set_role_statement_limits(
+        &self,
+        limits: crate::admission::RoleStatementLimits,
+    ) -> Result<(), CoreError> {
+        self.admission.set_role_limits(limits)
+    }
     pub fn set_statement_gate(&self, gate: StatementGate) -> Result<(), StatementGate> {
         self.statement_gate.set(gate)
     }

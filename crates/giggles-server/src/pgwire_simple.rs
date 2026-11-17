@@ -276,6 +276,13 @@ impl State {
         received: std::time::Instant,
         implicit: &mut bool,
     ) -> R<()> {
+        if let Some(admission) = self.execution_admission.as_mut()
+            && let Err(refusal) = admission.statement(sql, session)
+        {
+            session.abort();
+            self.diagnostic.wire_message = Some(refusal.message());
+            return Err(refusal.sqlstate());
+        }
         // A multi-statement Query needs settings changes before its next SQL
         // statement, rather than only at the enclosing protocol-frame boundary.
         session.set_time_zone(&self.settings.current.timezone);
@@ -283,6 +290,9 @@ impl State {
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         super::statement_deadline(&self.settings.current);
         let result = self.simple_statement_inner(sql, session, out, received, implicit);
+        if !self.copy_receiving() && let Some(admission) = self.execution_admission.as_mut() {
+            admission.role_permit = None;
+        }
         if !session.in_transaction() && !*implicit { session.service.advisory.release(session.backend_pid, true); }
         session.set_time_zone(&self.settings.current.timezone);
         session.set_search_path(&self.settings.current.search_path);

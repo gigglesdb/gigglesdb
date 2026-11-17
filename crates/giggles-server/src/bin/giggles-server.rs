@@ -44,6 +44,9 @@ struct Config {
     connections: usize,
     #[serde(default)]
     service_limits: giggles_server::admission::ServiceLimits,
+    /// GD-0075 R5-103: per-role statement admission, applied to every role.
+    #[serde(default)]
+    role_statements: giggles_server::admission::RoleStatementLimits,
     #[serde(default)]
     bindings_file: Option<String>,
     skew_seconds: u64,
@@ -142,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Clock::new(c.skew_seconds, c.max_pause_seconds)?,
         c.service_limits,
     )?;
+    service.set_role_statement_limits(c.role_statements)?;
     let mut config = tls::server(
         tls::certs(&c.certificate)?,
         tls::key(&c.private_key)?,
@@ -687,6 +691,7 @@ async fn setup_role(
                 };
                 let leader = Service::with_limits(admin, bindings,
                     Clock::new(c.skew_seconds, c.max_pause_seconds)?, c.service_limits)?;
+                leader.set_role_statement_limits(c.role_statements)?;
                 leader.set_statement_gate(repl.statement_gate(engine))
                     .map_err(|_| "statement gate already set")?;
                 let started = start_listeners(c, &leader, config, postgresql.clone(), None, true).await?;

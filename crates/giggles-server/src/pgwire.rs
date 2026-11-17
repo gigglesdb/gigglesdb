@@ -1015,6 +1015,53 @@ struct State {
     copy: Option<CopyIn>,
     copy_completion: Vec<u8>,
     copy_active: Option<crate::cancel::Active>,
+    copy_permit: Option<crate::admission::RolePermit>,
+    execution_admission: Option<ExecutionAdmission>,
+}
+pub(crate) fn admission_exempt(sql: &str) -> bool {
+    simple::split(sql).is_ok_and(|statements| statements.iter().all(|sql| {
+        crate::pg_transaction::parse(sql).ok().flatten()
+            .is_some_and(|command| crate::admission::control_exempt(&command))
+    }))
+}
+// A Simple Query batch may contain recovery controls followed by ordinary SQL.
+// Release both pools between its statements before waiting for the next role
+// permit. Waiting here uses a Tokio worker but never a shared blocking-pool slot.
+struct ExecutionAdmission {
+    role_permit: Option<crate::admission::RolePermit>,
+    blocking: Option<tokio::sync::OwnedSemaphorePermit>,
+    runtime: tokio::runtime::Handle,
+    context: giggles_core::Cancellation,
+    first: bool,
+}
+impl ExecutionAdmission {
+    fn statement(&mut self, sql: &str, session: &Session) -> Result<(), crate::admission::StatementRefusal> {
+        if std::mem::take(&mut self.first) { return Ok(()); }
+        self.role_permit = None;
+        self.blocking = None;
+        self.runtime.block_on(async {
+            if !session.is_aborted() && !admission_exempt(sql) {
+                self.role_permit = Some(session.service.admission.statement(&session.role, Some(&self.context)).await?);
+            }
+            self.blocking = Some(session.service.blocking.admit(&self.context).await
+                .map_err(crate::admission::StatementRefusal::Core)?);
+            Ok(())
+        })
+    }
+}
+impl State {
+    fn admission_exempt(&self, tag: u8, body: &[u8]) -> bool {
+        let mut reader = Reader { b: body, at: 0 };
+        let Ok(text) = reader.text() else { return false; };
+        if tag == b'Q' {
+            return simple::split(&text).is_ok_and(|statements| {
+                statements.first().is_none_or(|sql| admission_exempt(sql))
+            });
+        }
+        self.portals.get(&text).is_some_and(|portal| {
+            matches!(&portal.s.p, Plan::Control(command) if crate::admission::control_exempt(command))
+        })
+    }
 }
 fn statement_deadline(settings: &crate::pg_settings::Settings) {
     if settings.statement_timeout > 0 && let Some(context) = giggles_core::Cancellation::current() {
@@ -2275,6 +2322,8 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         copy: None,
         copy_completion: vec![],
         copy_active: None,
+        copy_permit: None,
+        execution_admission: None,
     };
     startup_settings.timezone = timezone;
     // Preserve the locked agent profile's existing presentation default.
@@ -2398,15 +2447,42 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                     || (tag == b'S' && state.implicit && !session.is_aborted()),
             )
         });
-        let permit = match blocking.admit(&active.context).await {
-            Ok(permit) => permit,
-            Err(e) => {
+        // GD-0075 R5-103: the role's statement pool sits in front of the
+        // service-wide blocking pool; only COPY retains it between frames.
+        let role_admission =
+            if matches!(tag, b'Q' | b'E') && !session.is_aborted() && !state.drain
+                && state.copy.is_none() && !state.admission_exempt(tag, &b) {
+                let admission = &session.service.admission;
+                admission.statement(&session.role, Some(&active.context)).await.map(Some)
+            } else {
+                Ok(state.copy_permit.take())
+            };
+        let admitted = match role_admission {
+            Ok(role) => blocking
+                .admit(&active.context)
+                .await
+                .map(|permit| (role, permit))
+                .map_err(|e| (crate::service::sqlstate(&e), None)),
+            Err(refusal) => Err((refusal.sqlstate(), Some(refusal.message()))),
+        };
+        let (role_permit, permit) = match admitted {
+            Ok(admitted) => admitted,
+            Err((code, message)) => {
                 session.abort();
                 let mut out = Vec::new();
                 if state.copy.is_some() {
-                    state.copy_error(crate::service::sqlstate(&e), &mut session, &mut out);
+                    state.copy_error(code, &mut session, &mut out);
                 } else {
-                    error(crate::service::sqlstate(&e), &mut out);
+                    if message.is_some() {
+                        let diagnostic = Diagnostic {
+                            phase: "admission",
+                            wire_message: message,
+                            ..Diagnostic::default()
+                        };
+                        diagnostic_error(code, GENERIC_MESSAGE, Some(&diagnostic), &mut out);
+                    } else {
+                        error(code, &mut out);
+                    }
                     if tag == b'S' && state.implicit {
                         session.sql.rollback();
                         state.settings.transaction(true, false, "ROLLBACK");
@@ -2448,7 +2524,14 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         let (output, mut chunks) = tokio::sync::mpsc::channel(2);
         state.output = Some(output);
         let connection_closed = session.connection_closed.clone();
-        let work = blocking.run_admitted(permit, move || {
+        state.execution_admission = Some(ExecutionAdmission {
+            role_permit,
+            blocking: Some(permit),
+            runtime: tokio::runtime::Handle::current(),
+            context: active.context.clone(),
+            first: state.copy.is_none(),
+        });
+        let work = async move { tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
             let keep = match active.context.scope(|| {
                 active
@@ -2508,12 +2591,14 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
             if !session.in_transaction() && !state.implicit { session.service.advisory.release(session.backend_pid, true); }
             if state.copy_receiving() {
                 state.copy_active = Some(active);
+                state.copy_permit = state.execution_admission.as_mut().and_then(|a| a.role_permit.take());
             } else {
                 drop(active);
             }
+            state.execution_admission = None;
             state.output = None;
             (session, state, out, keep)
-        });
+        }).await.map_err(io::Error::other) };
         tokio::pin!(work);
         let completed = loop {
             tokio::select! {

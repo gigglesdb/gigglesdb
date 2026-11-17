@@ -195,8 +195,23 @@ async fn serve_listener(
                         while let Ok(b)=read_frame(&mut stream,MAX_FRAME).await {
                             if !service.admission.request() { return; }
                             let received=std::time::Instant::now();
+                            // GD-0075 R5-103: per-role statement admission.
+                            let request=serde_json::from_slice::<Request>(&b);
+                            let exempt=session.is_aborted() || request.as_ref().is_ok_and(crate::admission::request_exempt);
+                            let role_permit=if exempt {
+                                None
+                            } else { match service.admission.statement(&session.role,None).await {
+                                Ok(permit)=>Some(permit),
+                                Err(refusal)=>{
+                                    session.abort();
+                                    let Ok(b)=serde_json::to_vec(&Response::code(refusal.sqlstate())) else {break};
+                                    if write_frame(&mut stream,&b,MAX_RESPONSE).await.is_err(){break;}
+                                    continue;
+                                }
+                            }};
                             let Ok((returned,encoded))=blocking.run(move || {
-                                let response=match serde_json::from_slice::<Request>(&b) {
+                                let _role_permit=role_permit;
+                                let response=match request {
                                     Ok(request)=>session.handle_received(request,received),
                                     Err(_)=>{session.abort();Response::code("08P01")},
                                 };

@@ -476,6 +476,31 @@ async fn supervise(
 }
 
 async fn run_job(service: Arc<Service>, mut job: Job) {
+    // GD-0075 R5-103: per-role statement admission before the blocking pool.
+    let role = job.lease.session().role.clone();
+    let exempt = job.lease.session().is_aborted() || match &job.request {
+        Invocation::Commit | Invocation::Rollback | Invocation::Savepoint(_)
+        | Invocation::RollbackTo(_) | Invocation::Release(_) => true,
+        Invocation::Legacy(request) => crate::admission::request_exempt(request),
+        _ => false,
+    };
+    let role_permit = if exempt {
+        None
+    } else { tokio::select! {
+        biased;
+        _ = job.reply.closed() => return,
+        admitted = service.admission.statement(&role, Some(&job.context)) => match admitted {
+            Ok(permit) => Some(permit),
+            Err(refusal) => {
+                let error = match refusal {
+                    crate::admission::StatementRefusal::Core(_) => ApiError::DeadlineExceeded,
+                    _ => ApiError::ResourceExhausted,
+                };
+                let _ = job.reply.send(Err(error));
+                return;
+            }
+        }
+    }};
     let permit = tokio::select! {
         biased;
         _ = job.reply.closed() => return,
@@ -503,6 +528,7 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
     let result = service
         .blocking
         .run_admitted(permit, move || {
+            let _role_permit = role_permit;
             #[cfg(test)]
             if let Some(barrier) = before {
                 barrier.wait();
