@@ -13,9 +13,9 @@
 //! [`protected_seam`] is the one place the Phase 6 and 7 items fill in. The
 //! direct write runs `task::protected_commit` (R3-615) and the outcome lookup
 //! `task::outcome` (R3-617); preview and apply (R3-707) still fail closed with
-//! 0A000. Admission refuses `Update` and `OutcomeLookup` until the last Phase 6
-//! item adds them to `task::admit::ENABLED` (design-2 section 4), so over the
-//! wire both forms still answer 0A000.
+//! 0A000. The last Phase 6 item (R3-626) added `Update` and `OutcomeLookup` to
+//! `task::admit::ENABLED` (design-2 section 4), so both forms run over the wire;
+//! `Preview` and `Apply` stay out of it until Phase 7.
 
 use giggles_core::{
     CoreError,
@@ -262,9 +262,10 @@ fn show_outcome(session: &mut crate::Session, op: &OperationId) -> Result<SqlRes
     })
 }
 
-/// Test-only route to the seam while admission keeps `Update` out of
-/// `task::admit::ENABLED`: classes listed here are admitted on this thread by
-/// `Session::admit`. Compiled into unit tests only.
+/// Test-only route to the seam for classes admission still keeps out of
+/// `task::admit::ENABLED` (`Preview` and `Apply` until Phase 7): classes listed
+/// here are admitted on this thread by `Session::admit`. Compiled into unit
+/// tests only.
 #[cfg(test)]
 pub(crate) mod test_route {
     use giggles_core::task::StatementClass;

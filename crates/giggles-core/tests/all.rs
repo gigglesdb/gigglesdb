@@ -506,3 +506,4 @@ mod pgparity_typeof;
 #[path = "task_rows.rs"] mod task_rows;
 #[path = "task_columns_native.rs"] mod task_columns_native;
 #[path = "task_release.rs"] mod task_release;
+#[path = "task_protected_commit.rs"] mod task_protected_commit;

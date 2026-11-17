@@ -56,9 +56,14 @@ impl StatementClass {
     ];
 }
 
-/// Classes a task session may run in this build. Phase 3 adds `Select`; phase 6 adds
-/// `Update` and `OutcomeLookup`; phase 7 adds `Preview` and `Apply`.
-pub const ENABLED: &[StatementClass] = &[StatementClass::Show, StatementClass::Set];
+/// Classes a task session may run in this build. Phase 3 adds `Select`; phase 6 (its last
+/// item, R3-626) has added `Update` and `OutcomeLookup`; phase 7 adds `Preview` and `Apply`.
+pub const ENABLED: &[StatementClass] = &[
+    StatementClass::Show,
+    StatementClass::Set,
+    StatementClass::Update,
+    StatementClass::OutcomeLookup,
+];
 
 /// `None` is not a task session and is always admitted.
 pub fn admit(ctx: Option<&TaskContext>, class: StatementClass) -> Result<(), TaskError> {
@@ -105,6 +110,14 @@ mod tests {
                 );
             }
         }
-        assert_eq!(ENABLED, &[StatementClass::Show, StatementClass::Set]);
+        assert_eq!(
+            ENABLED,
+            &[
+                StatementClass::Show,
+                StatementClass::Set,
+                StatementClass::Update,
+                StatementClass::OutcomeLookup,
+            ]
+        );
     }
 }

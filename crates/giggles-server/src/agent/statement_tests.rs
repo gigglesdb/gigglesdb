@@ -1,7 +1,7 @@
 //! R3-207 seam -> R3-615: the direct protected write through
-//! `Session::execute_protected`. `Update` is not in `task::admit::ENABLED` yet
-//! (design-2 section 4: the last Phase 6 item adds it), so these tests admit it
-//! through `test_route` and drive the session directly.
+//! `Session::execute_protected`. `Update` and `OutcomeLookup` are in
+//! `task::admit::ENABLED` (R3-626, design-2 section 4); `Preview` and `Apply`
+//! are not, so the fail-closed test admits them through `test_route`.
 //!
 //! Task "requeue failed for merchant 42, 25 rows" on `shipments` (`deliveries`
 //! is reserved): visible rows `merchant_id = 42`, write `status` from 'failed'
@@ -172,7 +172,6 @@ fn assert_bare_update_needs_operation_id(session: &mut Session) {
 #[test]
 fn direct_update_commits_and_returns_the_receipt_count() {
     let (service, mut session) = fixture();
-    test_route::enable(&[StatementClass::Update]);
     let result = direct(&mut session, "inc-436:requeue.1", REQUEUE, &[]).unwrap();
     assert_eq!(result.affected, 4);
     assert!(result.columns.is_empty() && result.rows.is_empty());
@@ -193,7 +192,6 @@ fn direct_update_commits_and_returns_the_receipt_count() {
 #[test]
 fn update_outside_allowed_columns_is_denied_and_writes_nothing() {
     let (service, mut session) = fixture();
-    test_route::enable(&[StatementClass::Update]);
     let error = direct(
         &mut session,
         "inc-436:bad.1",
@@ -224,7 +222,6 @@ fn update_outside_allowed_columns_is_denied_and_writes_nothing() {
 #[test]
 fn reused_operation_id_replays_or_conflicts() {
     let (service, mut session) = fixture();
-    test_route::enable(&[StatementClass::Update]);
     assert_eq!(direct(&mut session, "op-1", REQUEUE, &[]).unwrap().affected, 4);
     // Make the rows match again: a replay must not run the statement.
     service
@@ -265,33 +262,20 @@ fn reused_operation_id_replays_or_conflicts() {
 }
 
 #[test]
-fn update_class_stays_refused_without_the_route() {
+fn update_class_is_admitted_without_the_route() {
     let (service, mut session) = fixture();
-    let refused = CoreError::Task(TaskError::NotAllowedInTaskSession(StatementClass::Update));
-    assert_eq!(
-        prepare(&mut session, StatementClass::Update, REQUEUE).map(|_| ()),
-        Err(refused.clone())
-    );
-    assert_eq!(sqlstate(&refused), "0A000");
-    // A statement prepared under the route is still refused at execution.
-    test_route::enable(&[StatementClass::Update]);
-    let prepared = prepare(&mut session, StatementClass::Update, REQUEUE).unwrap();
     test_route::enable(&[]);
-    let statement = ProtectedStatement::Direct {
-        op: OperationId::new("op-1").unwrap(),
-        prepared: Box::new(prepared),
-        text: Arc::from(REQUEUE),
-    };
-    assert_eq!(session.execute_protected(&statement, &[]), Err(refused));
-    assert!(!session.in_protected());
-    assert_eq!(statuses(&service), BEFORE);
+    assert_eq!(session.admit(StatementClass::Update), Ok(()));
+    // Prepared and run with no route: the protected commit runs.
+    let result = direct(&mut session, "op-1", REQUEUE, &[]).unwrap();
+    assert_eq!(result.affected, 4);
+    assert_eq!(statuses(&service), AFTER);
     assert_bare_update_needs_operation_id(&mut session);
 }
 
 #[test]
 fn returning_is_refused_before_anything_runs() {
     let (service, mut session) = fixture();
-    test_route::enable(&[StatementClass::Update]);
     let error = direct(&mut session, "op-r", &format!("{REQUEUE} RETURNING id"), &[]).unwrap_err();
     assert_eq!(error, CoreError::Unsupported);
     assert_eq!(sqlstate(&error), "0A000");
@@ -303,12 +287,7 @@ fn returning_is_refused_before_anything_runs() {
 #[test]
 fn preview_and_apply_still_fail_closed() {
     let (service, mut session) = fixture();
-    test_route::enable(&[
-        StatementClass::Update,
-        StatementClass::Preview,
-        StatementClass::Apply,
-        StatementClass::OutcomeLookup,
-    ]);
+    test_route::enable(&[StatementClass::Preview, StatementClass::Apply]);
     let prepared = prepare(&mut session, StatementClass::Preview, REQUEUE).unwrap();
     let op = OperationId::new("op-1").unwrap();
     for statement in [
@@ -351,7 +330,6 @@ fn show(session: &mut Session, op: &str) -> Result<SqlResult, CoreError> {
 #[test]
 fn show_operation_returns_the_stored_outcome() {
     let (service, mut session) = fixture();
-    test_route::enable(&[StatementClass::Update, StatementClass::OutcomeLookup]);
     // Unknown: no row.
     let unknown = show(&mut session, "op-1").unwrap();
     assert_eq!(
@@ -401,15 +379,9 @@ fn show_operation_returns_the_stored_outcome() {
 }
 
 #[test]
-fn outcome_class_stays_refused_without_the_route() {
+fn outcome_class_is_admitted_without_the_route() {
     let (_service, mut session) = fixture();
     test_route::enable(&[]);
-    let error = show(&mut session, "op-1").unwrap_err();
-    assert_eq!(
-        error,
-        CoreError::Task(TaskError::NotAllowedInTaskSession(
-            StatementClass::OutcomeLookup
-        ))
-    );
-    assert_eq!(sqlstate(&error), "0A000");
+    assert_eq!(session.admit(StatementClass::OutcomeLookup), Ok(()));
+    assert!(show(&mut session, "op-1").unwrap().rows.is_empty());
 }

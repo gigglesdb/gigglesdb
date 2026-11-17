@@ -436,12 +436,14 @@ fn expired_allows_only_show_set_outcome() {
     for class in StatementClass::ALL {
         let got = session.admit(class);
         match class {
-            StatementClass::Show | StatementClass::Set => got.unwrap(),
-            // Not enabled in this build; once phase 6 enables it, standing lets it through.
-            StatementClass::OutcomeLookup => assert_eq!(
-                got,
-                Err(CoreError::Task(TaskError::NotAllowedInTaskSession(class)))
-            ),
+            // Enabled, and standing lets them through after expiry.
+            StatementClass::Show | StatementClass::Set | StatementClass::OutcomeLookup => {
+                got.unwrap()
+            }
+            // Enabled, but refused as expired.
+            StatementClass::Update => {
+                assert_eq!(got, Err(CoreError::Task(TaskError::Expired)))
+            }
             _ => assert!(
                 matches!(
                     got,
