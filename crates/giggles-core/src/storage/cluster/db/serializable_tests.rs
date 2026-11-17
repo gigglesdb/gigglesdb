@@ -394,3 +394,65 @@ fn phantom_write_skew_across_two_ranges_of_one_table() {
     assert_eq!((first, second), (Ok(()), Err("40001".to_string())));
     assert_eq!(int(&mut s, "SELECT count(*) FROM t"), 3);
 }
+
+/// HD-4a: three primary-key reads validate their grants, with and without a newer commit.
+#[test]
+fn point_reads_validate_from_lock_grants() {
+    for changed in [false, true] {
+        let (_cluster, a, b) = two(
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); CREATE TABLE log (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1, 0), (2, 0), (3, 0)",
+        );
+        let (mut sa, mut sb) = (a.admin.sql_session(), b.admin.sql_session());
+        begin(&mut sa, "SERIALIZABLE");
+        for id in 1..=3 {
+            assert_eq!(int(&mut sa, &format!("SELECT v FROM t WHERE id = {id}")), 0);
+        }
+        if changed {
+            ok(&mut sb, "UPDATE t SET v = 9 WHERE id = 2");
+        }
+        ok(&mut sa, "INSERT INTO log VALUES (1, 1)");
+        let result = exec(&mut sa, "COMMIT");
+        if changed {
+            assert_eq!(code(result), "40001");
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            int(&mut sb, "SELECT count(*) FROM log"),
+            i64::from(!changed)
+        );
+    }
+}
+
+/// The SQL gateway has no validation-config setter: exercise the grant helper directly.
+#[test]
+fn point_grants_consume_the_shared_validation_budget() {
+    use crate::storage::engine::{
+        hlc::Ts,
+        ssi_validate::ValidationConfig,
+        txn::{SerializationReason, TxnError},
+    };
+    let mut config = ValidationConfig { scan_budget: 2 };
+    // Missing keys and versions at the snapshot both cost one unit.
+    config.validate_locked_point(None, Ts(10)).unwrap();
+    config.validate_locked_point(Some(Ts(10)), Ts(10)).unwrap();
+    assert_eq!(
+        config.scan_budget, 0,
+        "no budget remains for interval versions"
+    );
+    let error = config
+        .validate_locked_point(Some(Ts(9)), Ts(10))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        TxnError::Serialization(SerializationReason::ValidationBudget)
+    ));
+    assert_eq!(crate::sqlstate(&crate::CoreError::from(error)), "40001");
+    let mut config = ValidationConfig { scan_budget: 2 };
+    assert!(matches!(
+        config.validate_locked_point(Some(Ts(11)), Ts(10)),
+        Err(TxnError::Serialization(
+            SerializationReason::ReadWriteConflict
+        ))
+    ));
+}

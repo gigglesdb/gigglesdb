@@ -26,6 +26,26 @@ impl Default for ValidationConfig {
         }
     }
 }
+impl ValidationConfig {
+    /// Charges one locked point (even if missing) and checks its grant's latest version.
+    /// The remaining budget can then be used for interval validation alone.
+    pub(crate) fn validate_locked_point(
+        &mut self,
+        latest: Option<Ts>,
+        snapshot: Ts,
+    ) -> Result<(), TxnError> {
+        self.scan_budget = self
+            .scan_budget
+            .checked_sub(1)
+            .ok_or(TxnError::Serialization(
+                SerializationReason::ValidationBudget,
+            ))?;
+        if latest.is_some_and(|ts| ts > snapshot) {
+            return Err(conflict());
+        }
+        Ok(())
+    }
+}
 struct Interval {
     start: Bound<Vec<u8>>,
     end: Bound<Vec<u8>>,

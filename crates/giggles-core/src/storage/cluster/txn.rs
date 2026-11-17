@@ -617,8 +617,10 @@ impl ClusterTxnServices {
     }
 
     /// R5-71/R5-72: a SERIALIZABLE writer read at its snapshot. At commit it takes Shared locks
-    /// over what it read of Rows and Index, range by range in key order, then reads again at a
-    /// timestamp taken after the last grant: a version newer than the snapshot fails 40001.
+    /// over what it read of Rows and Index, range by range in key order. Point reads validate
+    /// from each lock grant's latest committed version; intervals are read again at a timestamp
+    /// taken after the last grant. A version newer than the snapshot fails 40001. Points and
+    /// scanned versions share one budget; point-only validation needs no reader or oracle call.
     /// Under those locks no other commit changes what it read until it ends, so its reads hold
     /// at its commit timestamp and committed SERIALIZABLE writers serialize in commit-timestamp
     /// order. A wait that ends in a deadlock or at the lock backstop is a serialization failure
@@ -628,7 +630,7 @@ impl ClusterTxnServices {
         txn: TxnId,
         reads: ReadSet,
         snapshot: Ts,
-        validation: ValidationConfig,
+        mut validation: ValidationConfig,
     ) -> Result<(), TxnError> {
         let data = |ks: &Keyspace| matches!(ks, Keyspace::Rows | Keyspace::Index);
         let reads = ReadSet {
@@ -654,7 +656,6 @@ impl ClusterTxnServices {
         let cancel = || crate::cancellation::check().is_err();
         let shared = |rk: &[u8], target: LockTarget| {
             self.lock_in_range(txn, rk, target, RangeLockMode::Shared, None, &cancel)
-                .map(|(descriptor, _)| descriptor)
                 .map_err(|error| match error {
                     // PostgreSQL reports neither at COMMIT: the read set could not be kept.
                     TxnError::Deadlock | TxnError::LockTimeout => {
@@ -664,7 +665,8 @@ impl ClusterTxnServices {
                 })
         };
         for (rk, target) in targets {
-            shared(&rk, target)?;
+            let (_, latest) = shared(&rk, target)?;
+            validation.validate_locked_point(latest.map(|(ts, _)| Ts(ts.0)), snapshot)?;
         }
         // R5-72: each scanned interval (to its last key read, or to its end bound when the
         // scan ran out, which covers the gap after the last key) is gap-locked in every range
@@ -681,16 +683,23 @@ impl ClusterTxnServices {
                     start: range.start.clone(),
                     end: range.end.clone(),
                 };
-                let descriptor = shared(&route, target)?;
+                let (descriptor, _) = shared(&route, target)?;
                 match descriptor.end {
                     Some(next) if !past_end(space, &next, &range.end) => route = next,
                     _ => break,
                 }
             }
         }
+        if !reads.ranges.iter().any(|r| !empty(&r.start, &r.end)) {
+            return Ok(());
+        }
         let at = Ts(self.oracle()?.0);
         let reader = RoutedKvRead::new(self.client.clone(), at, self.config.page_bytes);
-        Validator::new(reads, validation).validate_kv(&reader, snapshot)
+        let intervals = ReadSet {
+            points: BTreeSet::new(),
+            ranges: reads.ranges,
+        };
+        Validator::new(intervals, validation).validate_kv(&reader, snapshot)
     }
 
     /// Locks held on ranges the commit does not write (FOR UPDATE / FOR SHARE rows, table
