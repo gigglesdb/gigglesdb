@@ -592,7 +592,7 @@ fn native_results_preserve_counts_versions_types_conflicts_and_empty_collections
         ],
         version: u64::MAX,
     };
-    let outcome = encode_outcome(o::Outcome {
+    let outcome = encode_outcome(Released::synthetic(o::Outcome {
         columns: vec!["id".into()],
         rows: vec![row()],
         matched: usize::MAX,
@@ -600,7 +600,7 @@ fn native_results_preserve_counts_versions_types_conflicts_and_empty_collections
         changed: 0,
         complete: false,
         conflict_results: Some(vec![conflict()]),
-    })
+    }))
     .unwrap();
     let v = serde_json::to_value(&outcome).unwrap();
     assert_eq!(v["matched"], usize::MAX.to_string());
@@ -626,7 +626,7 @@ fn native_results_preserve_counts_versions_types_conflicts_and_empty_collections
             not_null: n == 0,
         })
         .collect();
-    let outcome = encode_transaction_outcome(o::TransactionOutcome {
+    let outcome = encode_transaction_outcome(Released::synthetic(o::TransactionOutcome {
         summaries: vec![o::StepSummary {
             item_index: 2,
             matched: 1,
@@ -647,7 +647,7 @@ fn native_results_preserve_counts_versions_types_conflicts_and_empty_collections
                 complete: true,
             },
         ],
-    })
+    }))
     .unwrap();
     let v = serde_json::to_value(outcome).unwrap();
     assert_eq!(v["summaries"][0]["itemIndex"], "2");

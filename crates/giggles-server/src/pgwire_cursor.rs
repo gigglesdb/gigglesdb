@@ -279,7 +279,7 @@ impl Cursors {
                     },
                 );
                 settings.queried = session.in_transaction();
-                complete("DECLARE CURSOR", &SqlResult::default(), out)
+                complete("DECLARE CURSOR", &empty(), out)
             }
             Command::Fetch {
                 name,
@@ -313,7 +313,7 @@ impl Cursors {
                         rows(
                             &settings.current,
                             session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            result.get(),
+                            &result,
                             &c.description,
                             formats,
                             0,
@@ -335,7 +335,7 @@ impl Cursors {
                 c.at += fetched;
                 complete(
                     &format!("{} {count}", if *moving { "MOVE" } else { "FETCH" }),
-                    &SqlResult::default(),
+                    &empty(),
                     out,
                 )
             }
@@ -345,7 +345,7 @@ impl Cursors {
                 } else {
                     self.0.clear();
                 }
-                complete("CLOSE CURSOR", &SqlResult::default(), out)
+                complete("CLOSE CURSOR", &empty(), out)
             }
         }
     }

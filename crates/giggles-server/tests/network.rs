@@ -1,3 +1,5 @@
+// Tests may call the plain exits `clippy.toml` bans in server sources (GD-0061 R3-314).
+#![allow(clippy::disallowed_methods)]
 #[path = "wire_support/mod.rs"]
 mod wire_support;
 use wire_support::{bind, cstr, execute, parse, parse_oids, pg_read, pg_send, pg_sync};

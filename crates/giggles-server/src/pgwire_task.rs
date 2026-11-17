@@ -611,7 +611,7 @@ impl State {
         match &s.p {
             Plan::Inspect(show) => {
                 let (description, result) = inspect(*show, &self.settings.current, session)?;
-                let result = result.get();
+                let result = &result;
                 if describe {
                     row_description(&description, &[], out)?;
                 }
@@ -636,6 +636,8 @@ impl State {
                     out,
                 )?;
                 fits(&result)?;
+                // A settings function's value, built here: never core rows.
+                let result = Released::synthetic(result);
                 if describe {
                     row_description(&s.d, &[], out)?;
                 }
@@ -646,7 +648,7 @@ impl State {
                     &s.d,
                     formats,
                     0,
-                    result.rows.len(),
+                    result.get().rows.len(),
                     out,
                 )?;
                 complete("SELECT", &result, out)
@@ -672,15 +674,18 @@ impl State {
                 if describe {
                     catalog_wire::description(&result.fields, &[], out)?;
                 }
+                let total = result.rows.len();
+                // A relation-free catalog result: built from no application
+                // row, so there is nothing to release.
                 catalog_wire::rows(
                     self.settings.current.extra_float_digits,
-                    &result,
+                    &Released::synthetic(result),
                     formats,
                     0,
-                    result.rows.len(),
+                    total,
                     out,
                 )?;
-                catalog_complete(result.rows.len(), out)
+                catalog_complete(total, out)
             }
             Plan::Catalog(plan, fields, epoch) => {
                 self.diagnostic.phase = "catalog execution";
@@ -697,19 +702,19 @@ impl State {
                     TaskRun::Core(error) => self.diagnostic.core::<()>(Err(error)).unwrap_err(),
                     TaskRun::Wire(code) => code,
                 })?;
-                let result = result.get();
+                let total = result.get().rows.len();
                 if describe {
-                    catalog_wire::description(&result.fields, &[], out)?;
+                    catalog_wire::description(&result.get().fields, &[], out)?;
                 }
                 catalog_wire::rows(
                     self.settings.current.extra_float_digits,
-                    result,
+                    &result,
                     formats,
                     0,
-                    result.rows.len(),
+                    total,
                     out,
                 )?;
-                catalog_complete(result.rows.len(), out)
+                catalog_complete(total, out)
             }
             Plan::Sql(prepared) if class == StatementClass::Select => {
                 self.diagnostic.phase = "application execution";
@@ -728,6 +733,10 @@ impl State {
                     .diagnostic
                     .core(session.execute_protected(statement, params))?;
                 fits(&result)?;
+                // A receipt count, a stored outcome or a preview summary the
+                // server builds (`agent::statement::protected_seam`): never
+                // core rows.
+                let result = Released::synthetic(result);
                 if !s.d.columns.is_empty() {
                     if describe {
                         row_description(&s.d, &[], out)?;
@@ -739,7 +748,7 @@ impl State {
                         &s.d,
                         formats,
                         0,
-                        result.rows.len(),
+                        result.get().rows.len(),
                         out,
                     )?;
                 }
@@ -849,7 +858,7 @@ impl State {
                 ..SqlResult::default()
             });
             let n = page.get().rows.len();
-            rows(&self.settings.current, zone, page.get(), &s.d, formats, 0, n, out)?;
+            rows(&self.settings.current, zone, &page, &s.d, formats, 0, n, out)?;
             count += n;
             flush_output(&self.output, out)?;
         }

@@ -238,7 +238,7 @@ impl State {
         frame(b'c', &[], out)?;
         complete(
             &format!("COPY {count}"),
-            &SqlResult::default(),
+            &empty(),
             out,
         )
     }
@@ -322,9 +322,11 @@ impl State {
         if let Some(change) = crate::agent::preview::approver_statement(sql)? {
             crate::agent::preview::approver_guard(session)?;
             self.diagnostic.phase = "approval execution";
-            let result = self
-                .diagnostic
-                .core(crate::agent::preview::execute_approver(session, &change))?;
+            // The approval summary the server builds: never core rows.
+            let result = Released::synthetic(
+                self.diagnostic
+                    .core(crate::agent::preview::execute_approver(session, &change))?,
+            );
             let description = crate::agent::preview::approver_description(&change);
             if !description.columns.is_empty() {
                 row_description(&description, &[], out)?;
@@ -336,7 +338,7 @@ impl State {
                 &description,
                 &[],
                 0,
-                result.rows.len(),
+                result.get().rows.len(),
                 out,
             )?;
             return complete(crate::agent::preview::approver_command(&change), &result, out);
@@ -359,7 +361,7 @@ impl State {
                 return Err("25P01");
             }
             validate_lock(session, &tables.tables, tables.mode, tables.nowait)?;
-            return complete("LOCK TABLE", &SqlResult::default(), out);
+            return complete("LOCK TABLE", &empty(), out);
         }
         if let Some(select) = crate::auth::statements::copy_stdout_select(sql)? {
             return self.copy_stdout(&select, session, out);
@@ -399,14 +401,15 @@ impl State {
                     not_null: true,
                 }],
             };
-            let result = SqlResult {
+            // The decision the server built: never core rows.
+            let result = Released::synthetic(SqlResult {
                 columns: vec!["decision".into()],
                 rows: vec![giggles_core::relational::SqlRow {
                     values: vec![Value::Text(value)],
                     version: 0,
                 }],
                 affected: 0,
-            };
+            });
             row_description(&d, &[], out)?;
             rows(
                 &self.settings.current,
@@ -428,7 +431,7 @@ impl State {
             )?;
             let tag = session.execute_admin(&stmt)?;
             self.admin_completed = true;
-            complete(tag, &SqlResult::default(), out)?;
+            complete(tag, &empty(), out)?;
         } else if crate::pg_settings::empty_sql(sql)? {
             frame(b'I', &[], out)?;
         } else if let Some(command) = parse_control(sql, session, &mut self.diagnostic)? {
@@ -443,10 +446,10 @@ impl State {
             if !session.in_transaction() {
                 self.cursors.transaction_end(actual);
             }
-            complete(actual, &SqlResult::default(), out)?;
+            complete(actual, &empty(), out)?;
         } else if let Some(show) = show_settings(sql, session, &mut self.diagnostic)? {
             let (description, result) = inspect(show, &self.settings.current, session)?;
-            let result = result.get();
+            let result = &result;
             row_description(&description, &[], out)?;
             rows(
                 &self.settings.current,
@@ -486,11 +489,12 @@ impl State {
             return Err("42501");
         } else if let Some(query) = explain::prepare(sql, session)? {
             self.settings.queried = session.in_transaction();
-            let result = explain::execute(&query, session)?;
+            // Plan text the server builds (its core reads refuse a task session).
+            let result = Released::synthetic(explain::execute(&query, session)?);
             let description = explain::description();
             row_description(&description, &[], out)?;
             rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
-                &result, &description, &[], 0, result.rows.len(), out)?;
+                &result, &description, &[], 0, result.get().rows.len(), out)?;
             complete("EXPLAIN", &result, out)?;
         } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic, session)? {
             self.diagnostic.phase = "catalog execution";
@@ -512,15 +516,18 @@ impl State {
             .map_err(catalog_wire::error)?;
             catalog_wire::retained_bytes(&result)?;
             catalog_wire::description(&result.fields, &[], out)?;
+            let total = result.rows.len();
+            // Built from the catalog snapshot, whose application rows were
+            // released as they were read (`with_application_rows`, R3-312).
             catalog_wire::rows(
                 self.settings.current.extra_float_digits,
-                &result,
+                &Released::synthetic(result),
                 &[],
                 0,
-                result.rows.len(),
+                total,
                 out,
             )?;
-            catalog_complete(result.rows.len(), out)?;
+            catalog_complete(total, out)?;
         } else {
             self.diagnostic.phase = "application SQL";
             let was_transaction = session.in_transaction();
@@ -536,8 +543,7 @@ impl State {
                 drop(core(session.execute_sql_unreleased(sql, &[]))?);
                 self.settings
                     .transaction(was_transaction, session.in_transaction(), "ROLLBACK");
-                let result = Released::synthetic(SqlResult::default());
-                complete("ROLLBACK", result.get(), out)?;
+                complete("ROLLBACK", &empty(), out)?;
             } else {
                 let p = core(session.prepare(sql))?;
                 let d = core(session.describe(&p))?;
@@ -565,7 +571,7 @@ impl State {
                         rows(
                             &self.settings.current,
                             session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            result.get(),
+                            &result,
                             &d,
                             &[],
                             0,
@@ -589,17 +595,25 @@ impl State {
                 let (result, spilled) = giggles_core::relational::spill::streaming(
                     || session.execute_prepared_unreleased(&p, &[]));
                 let result = self.diagnostic.core(result)?;
-                let result = self.diagnostic.core(session.release_page(result))?.into_inner();
+                let result = self.diagnostic.core(session.release_page(result))?;
                 self.settings
                     .transaction(was_transaction, session.in_transaction(), p.command());
                 if let Some(mut spilled) = spilled {
+                    // A task session never reaches this path (`task_statement`
+                    // above), and its spill is materialised behind its release
+                    // tag (core): a spill handle holds a plain session's rows
+                    // (GD-0061 R3-314).
+                    if session.task().is_some() {
+                        return Err("XX000");
+                    }
                     // v2 RETURNING past the in-memory threshold streams from its spill file.
                     row_description(&d, &[], out)?;
                     while !spilled.is_empty() {
                         let chunk = spilled.by_ref().take(CURSOR_ROWS).collect::<Result<Vec<_>, _>>();
-                        let chunk = SqlResult { rows: self.diagnostic.core(chunk)?, ..SqlResult::default() };
+                        // Released as a plain session's release is: a move.
+                        let chunk = Released::synthetic(SqlResult { rows: self.diagnostic.core(chunk)?, ..SqlResult::default() });
                         rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            &chunk, &d, &[], 0, chunk.rows.len(), out)?;
+                            &chunk, &d, &[], 0, chunk.get().rows.len(), out)?;
                         flush_output(&self.output, out)?;
                     }
                 } else if !d.columns.is_empty() {
@@ -611,7 +625,7 @@ impl State {
                         &d,
                         &[],
                         0,
-                        result.rows.len(),
+                        result.get().rows.len(),
                         out,
                     )?;
                 }
@@ -885,7 +899,7 @@ pub(super) fn execute_settings(
             )?;
         }
         settings_status(&before, settings, session, out)?;
-        complete(assignment.tag(), &SqlResult::default(), out)?;
+        complete(assignment.tag(), &empty(), out)?;
     }
     Ok(())
 }

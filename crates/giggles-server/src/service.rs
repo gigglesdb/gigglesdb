@@ -136,6 +136,27 @@ impl Response {
     pub fn error(e: &CoreError) -> Self {
         Self::code(sqlstate(e))
     }
+    /// An `ok` response carrying a released SQL result. Server sources build
+    /// `Response.sql` only here, so both API transports encode only released
+    /// rows (GD-0061 R3-314; `tests/release_seal.rs` checks it).
+    ///
+    /// A released result is accepted:
+    /// ```
+    /// use giggles_core::{relational::SqlResult, task::Released};
+    /// let response = giggles_server::Response::released_sql(Released::synthetic(SqlResult::default()));
+    /// assert_eq!(response.code, "ok");
+    /// ```
+    /// A plain `SqlResult` does not compile (`encoders_accept_only_released`):
+    /// ```compile_fail
+    /// use giggles_core::relational::SqlResult;
+    /// let response = giggles_server::Response::released_sql(SqlResult::default());
+    /// ```
+    pub fn released_sql(result: Released<SqlResult>) -> Self {
+        Self {
+            sql: Some(result.into_inner()),
+            ..Self::code("ok")
+        }
+    }
     fn decision(operation: OperationId, d: Decision) -> Self {
         match d {
             Ok(r) => Self {
@@ -1074,7 +1095,7 @@ impl Session {
                 format!("{}.{}", quote(schema), quote(table))
             } else { quote(name) }).collect::<Vec<_>>().join(", ");
             let sql = format!("DROP TABLE {}{target}", if *optional { "IF EXISTS " } else { "" });
-            self.execute_sql(&sql, &[]).map_err(|e| sqlstate(&e))?;
+            self.run_control(&sql).map_err(|e| sqlstate(&e))?;
             return Ok("DROP TABLE");
         }
         if self.in_transaction() {
@@ -2374,15 +2395,25 @@ impl Session {
         }
         Ok(())
     }
-    /// Plain exit for trusted callers: a task session is refused before the
-    /// statement runs (GD-0061 R3-310); task callers use
-    /// `execute_prepared_unreleased` and `release_page`.
+    /// Plain exit, for tests only: a task session is refused before the
+    /// statement runs (GD-0061 R3-310). Server sources never call it
+    /// (`clippy.toml`, `tests/release_seal.rs`, GD-0061 R3-314); they use
+    /// `execute_prepared_unreleased` and `release_page`, or `explain_facts`.
+    /// It stays public for the integration tests.
     pub fn execute_prepared(
         &mut self,
         p: &Prepared,
         params: &[Value],
     ) -> Result<SqlResult, CoreError> {
         self.run_prepared(p, params, true)?.untasked()
+    }
+    /// The plan facts of an `EXPLAIN` read the server prepared itself: the
+    /// first value of the unreleased result, taken with `untasked`. A task
+    /// session is refused before the statement runs, as by the plain exit,
+    /// and no core row leaves this function (GD-0061 R3-314).
+    pub(crate) fn explain_facts(&mut self, p: &Prepared) -> Result<Option<Value>, CoreError> {
+        let result = self.run_prepared(p, &[], true)?.untasked()?;
+        Ok(result.rows.into_iter().next().and_then(|row| row.values.into_iter().next()))
     }
     /// `execute_prepared`, with the result held until `release_page`.
     pub fn execute_prepared_unreleased(
@@ -2517,12 +2548,24 @@ impl Session {
         self.execute_with_ddl_authority(if table.is_some() { "CREATE TABLE" } else { "" }, table.as_deref(), true, false, vec![],
             |session| { let result = session.sql.execute_catalog_native(request); let succeeded = result.is_ok(); Ok((result, true, succeeded)) })
     }
-    /// Plain exit for trusted callers: a task session is refused before the
-    /// statement runs (GD-0061 R3-310); task callers use
-    /// `execute_sql_unreleased` and `release_page`.
+    /// Plain exit, for tests only: a task session is refused before the
+    /// statement runs (GD-0061 R3-310). Server sources never call it
+    /// (`clippy.toml`, `tests/release_seal.rs`, GD-0061 R3-314); they use
+    /// `execute_sql_unreleased` and `release_page`, or `run_control`. It
+    /// stays public for the integration tests.
     pub fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<SqlResult, CoreError> {
         self.authority_scope(|session| session.execute_sql_authorized(sql, params, true))?
             .untasked()
+    }
+    /// A statement the server issues itself (transaction control, the admin
+    /// path's `DROP TABLE`), whose result is never encoded. It runs through
+    /// the unreleased twin and is taken with `untasked`: a task session is
+    /// refused before the statement runs, as by the plain exit, and the
+    /// result is dropped here (GD-0061 R3-314).
+    pub(crate) fn run_control(&mut self, sql: &str) -> Result<(), CoreError> {
+        self.authority_scope(|session| session.execute_sql_authorized(sql, &[], true))?
+            .untasked()
+            .map(drop)
     }
     /// `execute_sql`, with the result held until `release_page`.
     pub fn execute_sql_unreleased(
@@ -2694,10 +2737,7 @@ impl Session {
                 // that both transports encode is built.
                 Request::Sql { sql, params } => {
                     let result = self.execute_api_sql(&sql, &params)?;
-                    Ok(Response {
-                        sql: Some(self.release_page(result)?.into_inner()),
-                        ..Response::code("ok")
-                    })
+                    Ok(Response::released_sql(self.release_page(result)?))
                 }
                 Request::Preview { request } => {
                     let (e, time) = self.executor()?;

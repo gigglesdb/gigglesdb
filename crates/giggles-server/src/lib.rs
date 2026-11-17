@@ -1,4 +1,7 @@
 //! Single-host service preview. Filesystem/provisioning and host time are trusted.
+// GD-0061 R3-314: `clippy.toml` bans the plain core exits in server sources;
+// unit tests may call them.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 mod blocking;
 pub mod clock;
 mod pg_catalog_wire;

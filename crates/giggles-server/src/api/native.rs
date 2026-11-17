@@ -16,7 +16,7 @@ pub(crate) enum NativeResult {
     Control,
     Catalog(ops::CatalogOutcome, String),
     SequenceCatalog(u64, String),
-    Sql(giggles_core::relational::SqlResult),
+    Sql(Released<giggles_core::relational::SqlResult>),
     Operation(Released<ops::Outcome>),
     Page(ops::Page),
     Transaction(Released<ops::TransactionOutcome>),
@@ -312,11 +312,12 @@ pub(crate) fn run(
                     let path = schemas.iter().map(|s| format!("\"{}\"", s.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
                     session.set_search_path(&path);
                 }
-                return Ok(NativeResult::Sql(giggles_core::relational::SqlResult {
+                // The session's own search path: built here, never core rows.
+                return Ok(NativeResult::Sql(Released::synthetic(giggles_core::relational::SqlResult {
                     columns: vec!["search_path".into()],
                     rows: vec![giggles_core::relational::SqlRow { values: vec![giggles_core::relational::Value::Text(session.search_path.clone())], version: 0 }],
                     affected: 0,
-                }));
+                })));
             }
             // GD-0061 R3-313: every result core returns is held until the
             // session releases it, here, before anything encodes it. Outside
@@ -364,11 +365,12 @@ pub(crate) fn run(
             },
             Invocation::Sequence(call) => {
                 let column = match &call { ops::SequenceCall::Nextval(_) => "nextval", ops::SequenceCall::Currval(_) => "currval", ops::SequenceCall::Setval { .. } => "setval" };
-                session.sql.execute_sequence_native(&call).map(|value| NativeResult::Sql(giggles_core::relational::SqlResult {
+                // A sequence value, built into a row here: never table rows.
+                session.sql.execute_sequence_native(&call).map(|value| NativeResult::Sql(Released::synthetic(giggles_core::relational::SqlResult {
                     columns: vec![column.into()],
                     rows: vec![giggles_core::relational::SqlRow { values: vec![giggles_core::relational::Value::Int(value)], version: 0 }],
                     affected: 1,
-                }))
+                })))
             }
             Invocation::Savepoint(name) => { session.sql.savepoint(&name)?; return Ok(NativeResult::Control); }
             Invocation::RollbackTo(name) => { session.sql.rollback_to(&name)?; return Ok(NativeResult::Control); }

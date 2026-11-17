@@ -137,7 +137,8 @@ pub(super) fn execute(
         // A settings function's value, built here: never core rows.
         portal.result = Some(Released::synthetic(result));
     }
-    let result = portal.result.as_ref().unwrap().get();
+    let result = portal.result.as_ref().unwrap();
+    let total = result.get().rows.len();
     rows(
         &settings.current,
         session.zone().unwrap_or(SessionZone::Fixed(0)),
@@ -145,10 +146,10 @@ pub(super) fn execute(
         &portal.s.d,
         &portal.formats,
         portal.at,
-        result.rows.len(),
+        total,
         out,
     )?;
-    portal.at = result.rows.len();
+    portal.at = total;
     complete("SELECT", result, out)
 }
 impl State {
@@ -163,13 +164,14 @@ impl State {
         if !matches!(function, crate::pg_settings::Function::Advisory { .. }) { begin_implicit(session, implicit, &mut self.settings)?; }
         self.settings.queried = true;
         let result = (|| {
-            let result = evaluate(
+            // A settings function's value, built here: never core rows.
+            let result = Released::synthetic(evaluate(
                 function,
                 &mut self.settings,
                 session,
                 &mut self.diagnostic,
                 out,
-            )?;
+            )?);
             let description = description(function);
             row_description(&description, &[], out)?;
             rows(
@@ -179,7 +181,7 @@ impl State {
                 &description,
                 &[],
                 0,
-                result.rows.len(),
+                result.get().rows.len(),
                 out,
             )?;
             complete("SELECT", &result, out)

@@ -2,6 +2,7 @@
 //! executable application SQL or bypass the session's authority gate.
 use crate::{pgwire, transport::MAX_RESPONSE};
 use giggles_pg_catalog::{Field, PgType, ResultSet, Value};
+use giggles_core::task::Released;
 type Result<T> = std::result::Result<T, &'static str>;
 pub(crate) fn value_bytes(value: &Value) -> Result<usize> {
     let extra = match value {
@@ -1025,14 +1026,17 @@ pub(crate) fn retained_bytes(result: &ResultSet) -> Result<usize> {
     Ok(total)
 }
 
+/// Encodes rows `start..end` of a released catalog result as DataRow
+/// messages. It takes only `Released` (GD-0061 R3-314).
 pub(crate) fn rows(
     extra: i32,
-    result: &ResultSet,
+    result: &Released<ResultSet>,
     formats: &[u16],
     start: usize,
     end: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let result = result.get();
     let rows = result.rows.get(start..end).ok_or("XX000")?;
     for row in rows {
         if row.len() != result.fields.len() {
@@ -1607,10 +1611,10 @@ mod tests {
             let mut actual = vec![];
             rows(
                 0,
-                &ResultSet {
+                &Released::synthetic(ResultSet {
                     fields: fields.clone(),
                     rows: vec![vec![Value::Null, Value::Null]],
-                },
+                }),
                 &[format],
                 0,
                 1,

@@ -1,5 +1,9 @@
 // Each file keeps its own support modules, exactly as when it was its own binary.
 #![allow(clippy::duplicate_mod)]
+// Tests may call the plain exits `clippy.toml` bans in server sources (GD-0061 R3-314).
+#![allow(clippy::disallowed_methods)]
+#[path = "release_seal.rs"]
+mod release_seal;
 #[path = "explain_text_network.rs"]
 mod explain_text_network;
 #[path = "view_select_network.rs"]

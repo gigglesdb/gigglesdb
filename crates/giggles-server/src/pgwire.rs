@@ -682,17 +682,20 @@ fn encode(
     }))
 }
 #[allow(clippy::too_many_arguments)]
+/// Encodes rows `start..end` of a released result as DataRow messages. It
+/// takes only `Released`: core rows reach it only through the release
+/// protocol (GD-0061 R3-314).
 fn rows(
     settings: &crate::pg_settings::Settings,
     zone: SessionZone,
-    result: &SqlResult,
+    result: &Released<SqlResult>,
     d: &Description,
     formats: &[u16],
     start: usize,
     end: usize,
     out: &mut Vec<u8>,
 ) -> R<()> {
-    for row in &result.rows[start..end] {
+    for row in &result.get().rows[start..end] {
         let mut b = vec![];
         b.extend((row.values.len() as u16).to_be_bytes());
         for (i, v) in row.values.iter().enumerate() {
@@ -714,7 +717,9 @@ fn rows(
     }
     Ok(())
 }
-fn complete(command: &str, r: &SqlResult, out: &mut Vec<u8>) -> R<()> {
+/// The notices and CommandComplete of a released result (GD-0061 R3-314).
+fn complete(command: &str, r: &Released<SqlResult>, out: &mut Vec<u8>) -> R<()> {
+    let r = r.get();
     for message in giggles_core::relational::take_sql_warnings() {
         let mut body = vec![];
         for (field, value) in [
@@ -971,7 +976,7 @@ struct Portal {
     spilled: Option<giggles_core::relational::spill::SpilledRows>,
     cursor: Option<giggles_core::Cursor>,
     catalog_params: Vec<giggles_pg_catalog::Value>,
-    catalog_result: Option<giggles_pg_catalog::ResultSet>,
+    catalog_result: Option<Released<giggles_pg_catalog::ResultSet>>,
     parameter_bytes: usize,
     at: usize,
 }
@@ -987,7 +992,7 @@ impl Portal {
         let catalog = self
             .catalog_result
             .as_ref()
-            .map(catalog_wire::retained_bytes)
+            .map(|r| catalog_wire::retained_bytes(r.get()))
             .transpose()?
             .unwrap_or(0);
         self.parameter_bytes
@@ -999,7 +1004,11 @@ impl Portal {
 /// The marker of a portal that ran and returned no rows: a server-built
 /// result, never core rows.
 fn ran() -> Option<Released<SqlResult>> {
-    Some(Released::synthetic(SqlResult::default()))
+    Some(empty())
+}
+/// The empty result of a completion the server builds itself: no rows.
+fn empty() -> Released<SqlResult> {
+    Released::synthetic(SqlResult::default())
 }
 /// GD-0061 R3-310: before a later slice (`at > 0`) of a retained result its
 /// rows are re-served, not released again, so only the task's validity is
@@ -1102,7 +1111,7 @@ fn begin_implicit(
 ) -> R<()> {
     if !session.in_transaction() {
         session.set_default_isolation(&settings.current);
-        core(session.execute_sql("BEGIN", &[]))?;
+        core(session.run_control("BEGIN"))?;
         settings.transaction(false, true, "BEGIN");
         *implicit = true;
     }
@@ -1172,9 +1181,9 @@ fn execute_control(
         }
         if !was {
             session.set_default_isolation(&settings.current);
-            core(session.execute_sql("BEGIN", &[]))?;
+            core(session.run_control("BEGIN"))?;
         }
-    } else if was && let Err(error) = session.execute_sql(actual, &[]) {
+    } else if was && let Err(error) = session.run_control(actual) {
         session.sql.rollback();
         settings.transaction(true, false, "ROLLBACK");
         *implicit = false;
@@ -1527,7 +1536,7 @@ impl State {
                         self.cursors.transaction_end("ROLLBACK");
                         self.settings.transaction(true, false, "ROLLBACK");
                     } else {
-                        let commit = if session.in_transaction() { session.execute_sql("COMMIT", &[]) } else { Ok(SqlResult::default()) };
+                        let commit = if session.in_transaction() { session.run_control("COMMIT") } else { Ok(()) };
                         if let Err(error) = commit {
                             session.sql.rollback();
                             self.cursors.transaction_end("ROLLBACK");
@@ -1799,13 +1808,14 @@ impl State {
                             .core(crate::agent::preview::execute_approver(session, &change))?;
                         p.result = Some(Released::synthetic(result));
                     }
-                    let result = p.result.as_ref().unwrap().get();
-                    let end = if max == 0 { result.rows.len() }
-                        else { p.at.saturating_add(max as usize).min(result.rows.len()) };
+                    let result = p.result.as_ref().unwrap();
+                    let total = result.get().rows.len();
+                    let end = if max == 0 { total }
+                        else { p.at.saturating_add(max as usize).min(total) };
                     rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
                         result, &p.s.d, &p.formats, p.at, end, out)?;
                     p.at = end;
-                    if end < result.rows.len() {
+                    if end < total {
                         frame(b's', &[], out)?;
                     } else {
                         let Plan::Change(change) = &p.s.p else { unreachable!() };
@@ -1826,7 +1836,7 @@ impl State {
                     let tag = session.execute_admin(stmt)?;
                     self.admin_completed = true;
                     p.result = ran();
-                    complete(tag, &SqlResult::default(), out)?;
+                    complete(tag, &empty(), out)?;
                     return Ok(true);
                 }
                 if let Plan::Catalog(plan, fields, epoch) = &p.s.p {
@@ -1864,13 +1874,17 @@ impl State {
                         {
                             return Err("54000");
                         }
-                        p.catalog_result = Some(result);
+                        // Built from the catalog snapshot, whose application
+                        // rows were released as they were read
+                        // (`with_application_rows`, GD-0061 R3-312).
+                        p.catalog_result = Some(Released::synthetic(result));
                     }
                     let result = p.catalog_result.as_ref().unwrap();
+                    let total = result.get().rows.len();
                     let end = if max == 0 {
-                        result.rows.len()
+                        total
                     } else {
-                        p.at.saturating_add(max as usize).min(result.rows.len())
+                        p.at.saturating_add(max as usize).min(total)
                     };
                     catalog_wire::rows(
                         self.settings.current.extra_float_digits,
@@ -1881,10 +1895,10 @@ impl State {
                         out,
                     )?;
                     p.at = end;
-                    if end < result.rows.len() {
+                    if end < total {
                         frame(b's', &[], out)?;
                     } else {
-                        catalog_complete(result.rows.len(), out)?;
+                        catalog_complete(total, out)?;
                     }
                     return Ok(true);
                 }
@@ -1897,13 +1911,14 @@ impl State {
                     } else {
                         revalidate(session, p.at, &mut self.diagnostic)?;
                     }
-                    let result = p.result.as_ref().unwrap().get();
-                    let end = if max == 0 { result.rows.len() }
-                        else { p.at.saturating_add(max as usize).min(result.rows.len()) };
+                    let result = p.result.as_ref().unwrap();
+                    let total = result.get().rows.len();
+                    let end = if max == 0 { total }
+                        else { p.at.saturating_add(max as usize).min(total) };
                     rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
                         result, &p.s.d, &p.formats, p.at, end, out)?;
                     p.at = end;
-                    if end < result.rows.len() { frame(b's', &[], out)?; }
+                    if end < total { frame(b's', &[], out)?; }
                     else { complete("EXPLAIN", result, out)?; }
                     return Ok(true);
                 }
@@ -1928,7 +1943,7 @@ impl State {
                         return Err("25P01");
                     }
                     simple::validate_lock(session, &tables.tables, tables.mode, tables.nowait)?;
-                    complete("LOCK TABLE", &SqlResult::default(), out)?;
+                    complete("LOCK TABLE", &empty(), out)?;
                     return Ok(true);
                 }
                 if let Plan::Control(command) = &p.s.p {
@@ -1950,7 +1965,7 @@ impl State {
                         self.cursors.transaction_end(actual);
                     }
                     p.result = ran();
-                    complete(actual, &SqlResult::default(), out)?;
+                    complete(actual, &empty(), out)?;
                     if !session.in_transaction() {
                         self.portals.clear();
                     }
@@ -1995,7 +2010,8 @@ impl State {
                         }
                         p.result = Some(current);
                     }
-                    let result = p.result.as_ref().unwrap().get();
+                    let result = p.result.as_ref().unwrap();
+                    let total = result.get().rows.len();
                     rows(
                         &self.settings.current,
                         session.zone().unwrap_or(SessionZone::Fixed(0)),
@@ -2003,10 +2019,10 @@ impl State {
                         &p.s.d,
                         &p.formats,
                         p.at,
-                        result.rows.len(),
+                        total,
                         out,
                     )?;
-                    p.at = result.rows.len();
+                    p.at = total;
                     complete("SHOW", result, out)?;
                     return Ok(true);
                 }
@@ -2023,7 +2039,7 @@ impl State {
                         }],
                         affected: 0,
                     });
-                    let result = result.get();
+                    let result = &result;
                     rows(
                         &self.settings.current,
                         session.zone().unwrap_or(SessionZone::Fixed(0)),
@@ -2068,7 +2084,7 @@ impl State {
                         rows(
                             &self.settings.current,
                             session.zone().unwrap_or(SessionZone::Fixed(0)),
-                            result.get(),
+                            &result,
                             &p.s.d,
                             &p.formats,
                             0,
@@ -2130,13 +2146,20 @@ impl State {
                     revalidate(session, p.at, &mut self.diagnostic)?;
                 }
                 if let Some(spilled) = p.spilled.as_mut() {
+                    // A task session's spill is materialised behind its
+                    // release tag (core), so a spill handle only ever holds
+                    // the rows of a plain session (GD-0061 R3-314).
+                    if session.task().is_some() {
+                        return Err("XX000");
+                    }
                     // Stream spilled rows like a cursor; an exhausted handle replays completion.
                     let mut remaining = if max == 0 { usize::MAX } else { max as usize };
                     while remaining > 0 && !spilled.is_empty() {
                         let chunk = spilled.by_ref().take(remaining.min(CURSOR_ROWS))
                             .collect::<Result<Vec<_>, _>>();
-                        let chunk = SqlResult { rows: self.diagnostic.core(chunk)?, ..SqlResult::default() };
-                        let count = chunk.rows.len();
+                        // Released as a plain session's release is: a move.
+                        let chunk = Released::synthetic(SqlResult { rows: self.diagnostic.core(chunk)?, ..SqlResult::default() });
+                        let count = chunk.get().rows.len();
                         rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
                             &chunk, &p.s.d, &p.formats, 0, count, out)?;
                         p.at += count;
@@ -2144,7 +2167,7 @@ impl State {
                         flush_output(&self.output, out)?;
                     }
                     if spilled.is_empty() {
-                        complete(prepared.command(), p.result.as_ref().expect("spilled result").get(), out)?;
+                        complete(prepared.command(), p.result.as_ref().expect("spilled result"), out)?;
                     } else {
                         frame(b's', &[], out)?;
                     }
@@ -2153,11 +2176,12 @@ impl State {
                     }
                     return Ok(true);
                 }
-                let result = p.result.as_ref().unwrap().get();
+                let result = p.result.as_ref().unwrap();
+                let total = result.get().rows.len();
                 let end = if max == 0 {
-                    result.rows.len()
+                    total
                 } else {
-                    p.at.saturating_add(max as usize).min(result.rows.len())
+                    p.at.saturating_add(max as usize).min(total)
                 };
                 rows(
                     &self.settings.current,
@@ -2170,7 +2194,7 @@ impl State {
                     out,
                 )?;
                 p.at = end;
-                if end < result.rows.len() {
+                if end < total {
                     frame(b's', &[], out)?;
                 } else {
                     complete(prepared.command(), result, out)?;

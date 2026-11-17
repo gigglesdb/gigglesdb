@@ -1,0 +1,20 @@
+# GD-0061 R3-314: the release seal. Server sources reach core only through the
+# unreleased exits (`*_unreleased`, `Cursor::fetch_unreleased`), release the
+# result with `Session::release_page`, and encode only `Released<..>`. The plain
+# core exits below hand a result out without the release protocol, so they are
+# banned outside tests (`lib.rs` allows them under `cfg(test)`; integration
+# tests allow them in `tests/all.rs` and `tests/network.rs`).
+# `tests/release_seal.rs` scans `src/` for the same names as a second net.
+disallowed-methods = [
+    { path = "giggles_core::SqlSession::execute", reason = "plain core exit: use execute_unreleased and release_page (GD-0061 R3-314)" },
+    { path = "giggles_core::SqlSession::execute_at", reason = "plain core exit: use execute_at_unreleased and release_page (GD-0061 R3-314)" },
+    { path = "giggles_core::SqlSession::execute_prepared", reason = "plain core exit: use execute_prepared_unreleased and release_page (GD-0061 R3-314)" },
+    { path = "giggles_core::SqlSession::execute_prepared_at", reason = "plain core exit: use execute_prepared_at_unreleased and release_page (GD-0061 R3-314)" },
+    { path = "giggles_core::SqlSession::execute_typed_read", reason = "plain core exit: use execute_typed_read_unreleased and release_page (GD-0061 R3-314)" },
+    { path = "giggles_core::SqlSession::execute_typed_join", reason = "plain core exit: use execute_typed_join_unreleased and release_page (GD-0061 R3-314)" },
+    { path = "giggles_core::SqlSession::execute_native", reason = "plain core exit: use execute_native_unreleased and release_page (GD-0061 R3-314)" },
+    { path = "giggles_core::SqlSession::execute_native_transaction", reason = "plain core exit: use execute_native_transaction_unreleased and release_page (GD-0061 R3-314)" },
+    { path = "giggles_core::Cursor::fetch", reason = "plain core exit: use Session::fetch_cursor_unreleased and release_page (GD-0061 R3-314)" },
+    { path = "giggles_server::service::Session::execute_sql", reason = "plain server exit, for tests only: use execute_sql_unreleased and release_page, or run_control (GD-0061 R3-314)" },
+    { path = "giggles_server::service::Session::execute_prepared", reason = "plain server exit, for tests only: use execute_prepared_unreleased and release_page (GD-0061 R3-314)" },
+]

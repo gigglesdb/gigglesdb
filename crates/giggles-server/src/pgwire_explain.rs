@@ -68,8 +68,7 @@ pub(super) fn execute(query: &ExplainQuery, session: &mut Session) -> R<SqlResul
     } else if let Some(table) = &query.table {
         let p = core(session.prepare(&format!("EXPLAIN {}", query.read_sql)))?;
         let table_key = p.table().ok_or("0A000")?.to_owned();
-        let result = core(session.execute_prepared(&p, &[]))?;
-        let Some(Value::Text(facts)) = result.rows.first().and_then(|r| r.values.first()) else {
+        let Some(Value::Text(facts)) = core(session.explain_facts(&p))? else {
             return Err("0A000");
         };
         // Grouping uses an ordered BTreeMap, not PostgreSQL's HashAggregate.

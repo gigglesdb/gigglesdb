@@ -3,6 +3,7 @@ use super::{codec, error::ApiError, proto as p};
 use giggles_core::{
     operations as o,
     relational::{ColumnDef, DataType},
+    task::Released,
 };
 
 #[cfg(test)]
@@ -644,12 +645,19 @@ fn conflicts(v: Option<Vec<o::ConflictTupleOutcome>>) -> R<Option<p::NativeConfl
     })
     .transpose()
 }
+/// A native keyset page. A task session never reaches one: core's keyset
+/// read has no release twin, so `Session::read_native_page` refuses a task
+/// session before core runs (GD-0061 R3-313).
 pub(crate) fn encode_page(v: o::Page) -> R<p::NativeOutcome> {
-    let mut outcome = encode_outcome(v.outcome)?;
+    let mut outcome = outcome(v.outcome)?;
     outcome.next_page = v.next.map(|after| p::NativePage { after: after.into_iter().map(codec::encode_value).collect() });
     Ok(outcome)
 }
-pub(crate) fn encode_outcome(v: o::Outcome) -> R<p::NativeOutcome> {
+/// A released operation outcome. It takes only `Released` (GD-0061 R3-314).
+pub(crate) fn encode_outcome(v: Released<o::Outcome>) -> R<p::NativeOutcome> {
+    outcome(v.into_inner())
+}
+fn outcome(v: o::Outcome) -> R<p::NativeOutcome> {
     Ok(p::NativeOutcome {
         columns: v.columns,
         rows: v.rows.into_iter().map(row).collect(),
@@ -693,9 +701,12 @@ fn column(v: ColumnDef) -> p::NativeColumn {
         not_null: v.not_null,
     }
 }
+/// A released native transaction outcome. It takes only `Released`
+/// (GD-0061 R3-314).
 pub(crate) fn encode_transaction_outcome(
-    v: o::TransactionOutcome,
+    v: Released<o::TransactionOutcome>,
 ) -> R<p::NativeTransactionOutcome> {
+    let v = v.into_inner();
     Ok(p::NativeTransactionOutcome {
         summaries: list(v.summaries, |v| {
             Ok(p::NativeStepSummary {

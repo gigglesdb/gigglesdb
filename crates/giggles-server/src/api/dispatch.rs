@@ -751,24 +751,17 @@ fn execute_released(
                     }))
                 }
                 native::NativeResult::Sql(sql) => {
-                    reply.sql = codec::encode_reply(
-                        Response {
-                            sql: Some(sql),
-                            ..Response::code("ok")
-                        },
-                        state,
-                    )?
-                    .sql;
+                    reply.sql = codec::encode_reply(Response::released_sql(sql), state)?.sql;
                     None
                 }
                 native::NativeResult::Operation(outcome) => {
-                    Some(P::OperationOutcome(native_codec::encode_outcome(outcome.into_inner())?))
+                    Some(P::OperationOutcome(native_codec::encode_outcome(outcome)?))
                 }
                 native::NativeResult::Page(page) => {
                     Some(P::OperationOutcome(native_codec::encode_page(page)?))
                 }
                 native::NativeResult::Transaction(outcome) => Some(P::TransactionOutcome(
-                    native_codec::encode_transaction_outcome(outcome.into_inner())?,
+                    native_codec::encode_transaction_outcome(outcome)?,
                 )),
                 native::NativeResult::Error(error) => {
                     reply.code = if error == giggles_core::operations::Error::Unknown {
