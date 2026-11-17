@@ -371,14 +371,16 @@ impl SqlSession {
         clock: Option<&relational::StatementClock>,
         limit: usize,
     ) -> Result<Cursor, CoreError> {
-        let (result, spilled) = relational::spill::streaming(|| {
+        // A task statement's spill is handed only to this tagged stream: the
+        // cursor keeps the statement's tag, so every spilled page goes through
+        // `release_page` (masking, validity, debit) like a buffered one, and
+        // its rows were scoped when the statement read them (GD-0061).
+        let (result, spilled) = relational::spill::streaming_tagged(|| {
             scan::with_cursor_limit(limit, || match clock {
                 Some(clock) => self.execute_prepared_at_unreleased(p, params, None, clock),
                 None => self.execute_prepared_unreleased(p, params, None),
             })
         });
-        // A spilled result keeps the statement's tag: every page still goes
-        // through `release_page` (GD-0061 R3-301).
         let (result, tag) = result?.into_parts();
         Ok(Cursor {
             data: match spilled {

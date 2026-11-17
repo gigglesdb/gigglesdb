@@ -3750,9 +3750,14 @@ impl SqlSession {
         // protected commit; any other write is refused before it runs (and
         // logged, R3-309).
         let p = expanded.as_ref().unwrap_or(p);
-        let result = self
-            .refuse_task_write(p)
-            .and_then(|()| self.execute_bound_kernel(p, params, expected_version, clock));
+        // A task statement's spill reaches only a task cursor, whose pages
+        // carry this tag; any other caller gets it materialised behind the tag.
+        let result = self.refuse_task_write(p).and_then(|()| match tag {
+            Some(_) => relational::spill::task_statement(|| {
+                self.execute_bound_kernel(p, params, expected_version, clock)
+            }),
+            None => self.execute_bound_kernel(p, params, expected_version, clock),
+        });
         match result {
             Ok(result) => Ok(crate::task::release::Unreleased::new(result, tag)),
             Err(error) => {

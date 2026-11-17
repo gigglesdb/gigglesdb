@@ -62,7 +62,6 @@ use super::records::{
 use super::undo::UndoMode;
 use crate::relational::clock::ExecutionClock;
 use crate::relational::{Prepared, SqlError, Value};
-use crate::storage::engine::meta::REPLICATED;
 use crate::storage::engine::txn::{Savepoint, TxnError};
 use crate::storage::roles::{table_privileges_txn, RoleError, TablePrivilege};
 use crate::storage::{Isolation, Keyspace, ProtectedRun, SqlSession, Transaction, V2Db};
@@ -378,7 +377,7 @@ fn stored_outcome(
 /// The database an outcome lookup reads: v2 only (D9), not replicated (D13).
 fn lookup_db(session: &SqlSession) -> Result<Arc<V2Db>, TaskError> {
     let db = session.v2_db().ok_or_else(unsupported)?;
-    if db.meta.features & REPLICATED != 0 {
+    if db.task_kernel_unsupported() {
         return Err(unsupported());
     }
     Ok(db)
@@ -519,7 +518,7 @@ pub(crate) fn commit_sourced(
 ) -> Result<Receipt, TaskError> {
     // 0. v2 only (D9), not replicated (D13).
     let db = session.v2_db().ok_or_else(unsupported)?;
-    if db.meta.features & REPLICATED != 0 {
+    if db.task_kernel_unsupported() {
         return Err(unsupported());
     }
     let (crash, point) = session.fault_points()?;

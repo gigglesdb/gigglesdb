@@ -858,3 +858,140 @@ fn denied_read_writes_no_debit() {
     assert_eq!((d.rows_read, d.rows_returned), (3, 3), "{d:?}");
     reconciles(&d);
 }
+
+/// Spill tests (R2-PGLIMITS x GD-0061): enough visible rows that a task
+/// SELECT's output passes the 1 MiB in-memory threshold and spills.
+const SPILL_QUERY: &str =
+    "SELECT id, status, customer_email, card_token FROM shipments ORDER BY attempt_count, id";
+
+/// Adds 6,000 rows with a 400-byte status; two in three belong to merchant
+/// 42. Returns the visible ids (including the fixture's 1, 3 and 5), sorted.
+fn load_spill_rows(f: &Fixture) -> Vec<i64> {
+    let mut s = f.admin().sql_session();
+    let pad = "x".repeat(400);
+    for start in (100..6100).step_by(500) {
+        let values = (start..start + 500)
+            .map(|i| {
+                let merchant = if i % 3 == 0 { 7 } else { 42 };
+                format!("({i}, {merchant}, '{pad}', {}, 'p{i}@shop.example', 'tok_live_{i}')", i % 97)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        s.execute(&format!("INSERT INTO shipments VALUES {values}"), &[], None).unwrap();
+    }
+    let mut visible = vec![1, 3, 5];
+    visible.extend((100..6100).filter(|i| i % 3 != 0));
+    visible
+}
+
+/// This thread's spill directory for one test, reset on drop.
+struct SpillDir(PathBuf);
+impl SpillDir {
+    fn new(name: &str) -> Self {
+        let dir = common::fresh(&format!("{name}-spill"));
+        std::fs::create_dir_all(&dir).unwrap();
+        giggles_core::relational::spill::set_thread_dir(Some(dir.clone()));
+        Self(dir)
+    }
+    fn files(&self) -> usize {
+        std::fs::read_dir(&self.0).unwrap().count()
+    }
+}
+impl Drop for SpillDir {
+    fn drop(&mut self) {
+        giggles_core::relational::spill::set_thread_dir(None);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Released spilled rows: only visible rows, masked values replaced.
+fn scoped_and_masked(rows: &[SqlRow], visible: &[i64]) {
+    let mut ids = rows
+        .iter()
+        .map(|row| match row.values[0] {
+            Value::Int(id) => id,
+            ref other => panic!("{other:?}"),
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, visible);
+    for row in rows {
+        assert_eq!(row.values[2], Value::Null);
+        assert_eq!(row.values[3], Value::Text("****".into()));
+    }
+}
+
+#[test]
+fn spilled_task_select_is_scoped_masked_and_debited() {
+    let dir = SpillDir::new("task-release-spill-select");
+    let f = Fixture::new("task-release-spill-select", caps(1_000_000, 1_000_000, 1 << 30));
+    let visible = load_spill_rows(&f);
+    // Control: outside a task the same statement spills to a streaming caller.
+    let mut plain = f.admin().sql_session();
+    let (result, spilled) = giggles_core::relational::spill::streaming(|| plain.execute(SPILL_QUERY, &[], None));
+    assert!(result.unwrap().rows.is_empty());
+    assert!(spilled.is_some_and(|rows| rows.len() > visible.len() as u64));
+    // A task statement: a plain streaming caller never receives the spill;
+    // the rows stay behind the release tag.
+    let mut s = f.exact();
+    let (page, spilled) =
+        giggles_core::relational::spill::streaming(|| s.execute_unreleased(SPILL_QUERY, &[], None));
+    assert!(spilled.is_none());
+    let page = page.unwrap();
+    assert!(page.is_task());
+    let released = s.release_page(page).unwrap().into_inner();
+    scoped_and_masked(&released.rows, &visible);
+    assert_eq!(dir.files(), 0);
+    // Every released row and byte was debited; rows read are the visible rows.
+    let d = f.disclosure();
+    let bytes: u64 = released.rows.iter().map(|row| row_cost(&row.values)).sum();
+    assert_eq!(d.rows_returned, visible.len() as u64, "{d:?}");
+    assert_eq!(d.bytes_returned, bytes);
+    assert_eq!(d.rows_read, visible.len() as u64);
+    assert_eq!(d.read_logs, 1);
+    reconciles(&d);
+}
+
+#[test]
+fn spilled_task_cursor_pages_carry_the_tag() {
+    let dir = SpillDir::new("task-release-spill-cursor");
+    let f = Fixture::new("task-release-spill-cursor", caps(1_000_000, 1_000_000, 1 << 30));
+    let visible = load_spill_rows(&f);
+    let mut s = f.exact();
+    let p = s.prepare(SPILL_QUERY).unwrap();
+    let mut cursor = s.open_cursor(&p, &[]).unwrap();
+    // The result spilled to the cursor's temp file.
+    assert!(dir.files() > 0);
+    // The plain exit refuses a task cursor before it advances.
+    assert!(matches!(
+        cursor.fetch(10, 1 << 20),
+        Err(CoreError::Task(TaskError::NotAllowedInTaskSession(_)))
+    ));
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    while !cursor.is_exhausted() {
+        let page = cursor.fetch_unreleased(1000, 1 << 20).unwrap();
+        assert!(page.is_task());
+        let before = f.disclosure();
+        let rows = s.release_page(page).unwrap().into_inner();
+        // Each spilled page is debited before it is handed over.
+        let after = f.disclosure();
+        assert_eq!(after.rows_returned - before.rows_returned, rows.len() as u64);
+        assert_eq!(
+            after.bytes_returned - before.bytes_returned,
+            rows.iter().map(|row| row_cost(&row.values)).sum::<u64>()
+        );
+        pages += 1;
+        seen.extend(rows);
+    }
+    assert!(pages > 1);
+    scoped_and_masked(&seen, &visible);
+    drop(cursor);
+    assert_eq!(dir.files(), 0);
+    let d = f.disclosure();
+    assert_eq!(d.rows_returned, visible.len() as u64, "{d:?}");
+    assert_eq!(d.rows_read, visible.len() as u64);
+    assert_eq!(d.debits.len(), pages);
+    assert_eq!(d.read_logs, 1);
+    reconciles(&d);
+}

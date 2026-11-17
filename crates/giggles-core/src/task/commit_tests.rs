@@ -441,7 +441,7 @@ fn dummy_ctx() -> TaskContext {
 fn replicated_database_refused_0a000() {
     use crate::storage::engine::kv::{Durability, KvBackend, WriteBatch};
     let backend = Arc::new(crate::storage::engine::kv_mem::MemKv::new());
-    crate::storage::engine::meta::write_initial_meta(backend.as_ref(), [3; 16], REPLICATED).unwrap();
+    crate::storage::engine::meta::write_initial_meta(backend.as_ref(), [3; 16], crate::storage::engine::meta::REPLICATED).unwrap();
     let mut batch = WriteBatch::default();
     batch.put(Keyspace::Meta, b"raft_applied".to_vec(), vec![0; 16]);
     backend.write(batch, Durability::Sync).unwrap();

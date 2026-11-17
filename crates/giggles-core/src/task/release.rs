@@ -115,7 +115,6 @@ use super::records::TaskObjectId;
 use crate::operations::{EmittedValue, Outcome, TransactionOutcome};
 use crate::relational::{SqlResult, SqlRow, Value};
 use crate::storage::engine::kv::Direction;
-use crate::storage::engine::meta::REPLICATED;
 use crate::storage::engine::txn::TxnError;
 use crate::storage::{
     CoreError, Isolation, Keyspace, SqlSession, Transaction, V2Db, PROTECTED_RECORDS,
@@ -725,7 +724,7 @@ fn debit_inner(
 ) -> DebitResult {
     let ctx = &state.ctx;
     let before = |error: CoreError| (error, false);
-    if db.meta.features & REPLICATED != 0 {
+    if db.task_kernel_unsupported() {
         return Err(before(CoreError::Unsupported));
     }
     let now = db.wall_now_ms();

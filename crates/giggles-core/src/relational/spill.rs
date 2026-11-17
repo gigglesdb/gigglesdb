@@ -35,6 +35,7 @@ const MERGE_FAN_IN: usize = 64;
 
 thread_local! {
     static STREAMING: Cell<bool> = const { Cell::new(false) };
+    static TAGGED: Cell<bool> = const { Cell::new(false) };
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static BOUNDED: Cell<bool> = const { Cell::new(false) };
     static SLOT: RefCell<Option<SpilledRows>> = const { RefCell::new(None) };
@@ -85,6 +86,40 @@ pub fn streaming<T>(f: impl FnOnce() -> T) -> (T, Option<SpilledRows>) {
     SLOT.take();
     let value = f();
     (value, SLOT.take())
+}
+
+/// [`streaming`] for a task-session cursor (GD-0061): the spill it receives
+/// is read back only through that cursor, whose pages carry the statement's
+/// release tag and go through `release_page` like buffered rows.
+pub(crate) fn streaming_tagged<T>(f: impl FnOnce() -> T) -> (T, Option<SpilledRows>) {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TAGGED.set(self.0);
+        }
+    }
+    let _reset = Reset(TAGGED.replace(true));
+    streaming(f)
+}
+
+/// Run a task-session statement (GD-0061): its spill reaches only a
+/// [`streaming_tagged`] caller. Under a plain [`streaming`] caller it is
+/// materialised into the result, which stays behind the release tag, so an
+/// untagged temp-file handle never carries a task's rows.
+pub(crate) fn task_statement<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool, Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TAGGED.set(self.0);
+            if let Some(streaming) = self.1 {
+                STREAMING.set(streaming);
+            }
+        }
+    }
+    // A statement nested in this one is never the tagged stream's statement.
+    let tagged = TAGGED.replace(false);
+    let _reset = Reset(tagged, (!tagged).then(|| STREAMING.replace(false)));
+    f()
 }
 
 /// Run `f` for a caller that materialises whole results (HTTP/gRPC API, native

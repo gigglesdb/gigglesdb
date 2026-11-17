@@ -244,6 +244,13 @@ impl V2Db {
         })
     }
 
+    /// The task kernel (protected commit, release debits, read log; GD-0061)
+    /// runs on a local, unreplicated v2 database only: a REPLICATED store or a
+    /// cluster gateway is 0A000 (D13).
+    pub(crate) fn task_kernel_unsupported(&self) -> bool {
+        self.meta.features & engine::meta::REPLICATED != 0 || self.cluster.is_some()
+    }
+
     /// The gateway services when this database is a cluster gateway.
     pub(crate) fn cluster_services(&self) -> Option<&Arc<dyn engine::txn::ClusterServices>> {
         self.cluster.as_ref()

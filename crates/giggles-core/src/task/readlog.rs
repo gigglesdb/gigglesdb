@@ -42,7 +42,6 @@ use super::release::{lock, lock_error, TaskSessionState};
 use crate::relational::{SqlError, SqlResult, SqlRow, Value};
 use crate::roles::CatalogRole;
 use crate::storage::engine::kv::Direction;
-use crate::storage::engine::meta::REPLICATED;
 use crate::storage::{
     CoreError, Isolation, Keyspace, SqlSession, Transaction, V2Db, PROTECTED_RECORDS,
 };
@@ -432,7 +431,7 @@ fn finalize(db: &V2Db, state: &TaskSessionState, log: &Mutex<StatementLog>) {
         .rows_scanned
         .saturating_add(state.take_rows_scanned());
     let rows_read = state.take_rows_read();
-    if db.meta.features & REPLICATED != 0 || write_final(db, state, &mut log, rows_read).is_err() {
+    if db.task_kernel_unsupported() || write_final(db, state, &mut log, rows_read).is_err() {
         state.add_rows_read(rows_read);
     }
 }
