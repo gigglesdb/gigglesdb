@@ -12,18 +12,19 @@
 //! whose approximate size reached a threshold and that is out of its cooldown. `SizeSplitter`
 //! runs it (and `reconcile`) in the background.
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         mpsc::{self, RecvTimeoutError},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use giggles_core::{
     range_api::{
         ClusterTxnId, LeaseKind, RangeClient, RangeDescriptor, RangeError, RangeId, RangeSpace,
-        SYSTEM_RANGE, Timestamp, first_user_key, range_key,
+        ReplicaRole, SYSTEM_RANGE, Timestamp, first_user_key, range_key,
     },
     replicated::RangeStore,
 };
@@ -148,7 +149,87 @@ impl Splitter {
                 parent: Some(range),
             },
         ])?;
+        self.rebalance_child(right.id);
         Ok((left, right))
+    }
+
+    /// Publication is complete: moving a new user child's leader is best effort only.
+    /// A remote leader already spreads this split; only transfer a child led here.
+    fn rebalance_child(&self, range: RangeId) {
+        if range == SYSTEM_RANGE {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let handle = loop {
+            if let Some(handle) = self.host.group(range)
+                && handle.role().leader != 0
+            {
+                if handle.role().state != StateRole::Leader {
+                    return;
+                }
+                break handle;
+            }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "node {}: split child {} has no leader yet",
+                    self.node, range.0
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let desc = match self.stored(range) {
+            Ok(desc) => desc,
+            Err(e) => {
+                eprintln!("node {}: split child {} rebalance: {e}", self.node, range.0);
+                return;
+            }
+        };
+        let status = handle.membership_status().ok();
+        let mut counts = BTreeMap::<u64, usize>::new();
+        for id in self.host.groups() {
+            if let Some(group) = self.host.group(id) {
+                *counts.entry(group.role().leader).or_default() += 1;
+            }
+        }
+        let target = desc
+            .replicas
+            .iter()
+            .filter(|r| {
+                r.node != self.node
+                    && r.role == ReplicaRole::Voter
+                    && status
+                        .as_ref()
+                        .is_none_or(|s| s.reachable.contains(&r.node))
+            })
+            .min_by_key(|r| (counts.get(&r.node).copied().unwrap_or(0), r.node))
+            .map(|r| r.node);
+        let Some(target) = target else {
+            eprintln!(
+                "node {}: split child {} has no reachable transfer voter",
+                self.node, range.0
+            );
+            return;
+        };
+        handle.transfer_leader(target);
+        // The request is fire and forget. Observe briefly, without holding up a split
+        // for an election timeout or treating an unsuccessful transfer as a split error.
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if handle.role().leader == target {
+                return;
+            }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "node {}: split child {} transfer to {target} not confirmed (leader {})",
+                    self.node,
+                    range.0,
+                    handle.role().leader
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// For every range this node leads (or just `range`): if the directory record at the stored

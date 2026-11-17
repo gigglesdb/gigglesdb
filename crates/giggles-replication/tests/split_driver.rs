@@ -471,3 +471,42 @@ fn split_refuses_an_enrolled_replacement() {
         node.stop();
     }
 }
+
+#[test]
+fn successive_splits_spread_user_range_leaders() {
+    let (_root, nodes) = start();
+    let mut parent = PARENT;
+    let mut ranges = vec![PARENT];
+    for i in 0..6_u64 {
+        let (_, right) = splitter(leader(&nodes, parent))
+            .split(parent, &table(10 + 2 * i))
+            .unwrap();
+        parent = right.id;
+        ranges.push(parent);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut counts = BTreeMap::<u64, usize>::new();
+        for &range in &ranges {
+            // Count actual leaders, rather than possibly stale follower observations.
+            if let Some(node) = nodes.iter().find(|node| {
+                node.host()
+                    .group(range)
+                    .is_some_and(|h| h.role().state == raft::StateRole::Leader)
+            }) {
+                *counts.entry(node.node_id()).or_default() += 1;
+            }
+        }
+        if counts.values().sum::<usize>() == ranges.len()
+            && counts.len() >= 2
+            && counts.values().all(|&n| n < ranges.len())
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "user range leaders: {counts:?}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    for node in nodes {
+        node.stop();
+    }
+}
