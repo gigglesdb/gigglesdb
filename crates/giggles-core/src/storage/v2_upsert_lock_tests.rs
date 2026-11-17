@@ -41,6 +41,9 @@ struct Outcome { result: relational::SqlResult, shared: usize, upgrades: usize }
 struct Pending { done: mpsc::Receiver<Outcome>, worker: JoinHandle<()> }
 impl Pending {
     fn start(f: &Fixture, sql: String) -> Self {
+        Self::start_params(f, sql, vec![])
+    }
+    fn start_params(f: &Fixture, sql: String, params: Vec<relational::Value>) -> Self {
         let admin = f.admin.as_ref().unwrap().clone();
         let (send, done) = mpsc::channel();
         let worker = thread::spawn(move || {
@@ -48,7 +51,8 @@ impl Pending {
             run(&mut s, "BEGIN");
             let shared = UPSERT_SHARED.get();
             let upgrades = UPSERT_UPGRADE.get();
-            let result = run(&mut s, &sql);
+            let result = s.execute_at(&sql, &params, None, &clock())
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
             let outcome = Outcome { result, shared: UPSERT_SHARED.get() - shared,
                 upgrades: UPSERT_UPGRADE.get() - upgrades };
             run(&mut s, "COMMIT");
@@ -132,6 +136,23 @@ fn same_key_do_nothing_waits_then_skips_or_inserts() {
     }
 }
 #[test]
+fn expression_values_do_nothing_waits_then_skips() {
+    let f = Fixture::users();
+    let sql = "INSERT INTO users(email) VALUES(lower($1)) ON CONFLICT(email) DO NOTHING";
+    let mut a = f.sql();
+    run(&mut a, "BEGIN");
+    let before = UPSERT_SHARED.get();
+    let first = a.execute_at(sql, &[Text("A".into())], None, &clock()).unwrap();
+    assert_eq!(first.affected, 1);
+    assert_eq!(UPSERT_SHARED.get(), before);
+    let second = Pending::start_params(&f, sql.into(), vec![Text("A".into())]);
+    second.blocked(&a);
+    run(&mut a, "COMMIT");
+    let second = second.finish();
+    assert_eq!((second.shared, second.upgrades, second.result.affected), (0, 0, 0));
+    assert_eq!(f.rows("SELECT email FROM users"), vec![vec![Text("a".into())]]);
+}
+#[test]
 fn explicit_primary_target_locks_rows_and_refreshes() {
     for commit in [false, true] {
         let f = Fixture::new("CREATE TABLE users(id bigint PRIMARY KEY,name text)");
@@ -182,10 +203,13 @@ fn unsupported_values_row_count_set_and_isolation_fall_back() {
     let f = Fixture::users();
     let mut s = f.sql();
     let before = UPSERT_SHARED.get();
-    // The frontend currently rejects a general VALUES expression; preserve that result.
-    let expression = s.execute_at("INSERT INTO users(email) VALUES(lower($1)) ON CONFLICT(email) DO NOTHING",
-        &[Text("A".into())], None, &clock());
-    assert_eq!(expression, Err(CoreError::Sql(SqlError::Unsupported)));
+    // General VALUES expressions use the exclusive sentinel fallback, not UPSERT_SHARED.
+    let sql = "INSERT INTO users(email) VALUES(lower($1)) ON CONFLICT(email) DO NOTHING";
+    for affected in [1, 0] {
+        let expression = s.execute_at(sql, &[Text("A".into())], None, &clock()).unwrap();
+        assert_eq!(expression.affected, affected);
+    }
+    assert_eq!(f.rows("SELECT email FROM users"), vec![vec![Text("a".into())]]);
     assert_eq!(UPSERT_SHARED.get(), before);
     let rows = (0..201).map(|i| format!("('e{i}')")).collect::<Vec<_>>().join(",");
     assert_eq!(run(&mut s, &format!("INSERT INTO users(email) VALUES {rows} ON CONFLICT(email) DO NOTHING")).affected, 201);
