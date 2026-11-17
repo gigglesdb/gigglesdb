@@ -213,7 +213,8 @@ fn write_skew_through_two_gateways_fails_only_at_serializable() {
 
 /// R5-71: a SERIALIZABLE writer whose point read was overwritten (and committed) since its
 /// snapshot fails at COMMIT, as on one node; the row it would have written stays unwritten. A
-/// writer whose reads did not change commits, here across two ranges.
+/// writer whose reads did not change commits, here across two ranges. PostgreSQL commits the
+/// first writer too (one read/write dependency, no cycle): published divergence (b), E151.
 #[test]
 fn a_serializable_writer_fails_when_what_it_read_changed() {
     let (_cluster, a, b) = two(
@@ -310,7 +311,7 @@ fn phantom_write_skew_fails_only_at_serializable() {
 
 /// R5-72: a SERIALIZABLE writer whose scan would now return another row (an insert committed
 /// into its interval since its snapshot) fails at COMMIT; one whose scanned interval is
-/// unchanged commits.
+/// unchanged commits. PostgreSQL commits the first writer (no cycle): divergence (b), E151.
 #[test]
 fn a_serializable_writer_fails_when_its_scan_gained_a_row() {
     let (_cluster, a, b) = two(
@@ -328,4 +329,68 @@ fn a_serializable_writer_fails_when_its_scan_gained_a_row() {
     ok(&mut sa, "INSERT INTO log VALUES (1, 2)");
     ok(&mut sa, "COMMIT");
     assert_eq!(int(&mut sb, "SELECT n FROM log WHERE id = 1"), 2);
+}
+
+/// R5-72 (review S8): phantom write skew through a secondary index: each scan reads index
+/// entries, so the gap locks are on the index's keys.
+#[test]
+fn phantom_write_skew_through_an_index_fails_at_serializable() {
+    let (first, second, rows) = skew(
+        "CREATE TABLE t (id INT PRIMARY KEY, g INT); CREATE INDEX t_g ON t (g); INSERT INTO t VALUES (1, 1), (2, 2)",
+        "SERIALIZABLE",
+        [
+            "SELECT count(*) FROM t WHERE g = 1",
+            "SELECT count(*) FROM t WHERE g = 2",
+        ],
+        ["INSERT INTO t VALUES (3, 2)", "INSERT INTO t VALUES (4, 1)"],
+        "SELECT count(*) FROM t",
+    );
+    assert_eq!((first, second, rows), (Ok(()), Err("40001".into()), 3));
+}
+
+/// R5-72 (review S8): a table whose rows span two ranges. Each scan's gap lock is taken in both
+/// ranges; the two COMMITs' locks cross ranges, so the cycle is found by the distributed
+/// detector, and the second COMMIT fails 40001.
+#[test]
+fn phantom_write_skew_across_two_ranges_of_one_table() {
+    use crate::relational::Value;
+    use crate::storage::engine::codec;
+    // The first table created here gets id 1; split its rows at id 50.
+    let mut at = 1u64.to_be_bytes().to_vec();
+    at.extend(codec::pk_bytes(&[Value::Int(50)]).unwrap());
+    let mut splits = splits();
+    splits.push(range_key(RangeSpace::Rows, &at));
+    splits.sort();
+    let cluster = LocalCluster::new(&splits);
+    let a = gateway(&cluster, 1);
+    let b = gateway(&cluster, 2);
+    let mut s = a.admin.sql_session();
+    ok(&mut s, "CREATE TABLE t (id INT PRIMARY KEY, g INT)");
+    ok(&mut s, "INSERT INTO t VALUES (10, 1), (90, 2)");
+    let key = |id: i64| {
+        let mut key = 1u64.to_be_bytes().to_vec();
+        key.extend(codec::pk_bytes(&[Value::Int(id)]).unwrap());
+        key
+    };
+    assert_ne!(
+        cluster.range_of(RangeSpace::Rows, &key(10)),
+        cluster.range_of(RangeSpace::Rows, &key(90)),
+        "table t must be the first table (id 1), its rows split at id 50"
+    );
+    let (mut sa, mut sb) = (a.admin.sql_session(), b.admin.sql_session());
+    begin(&mut sa, "SERIALIZABLE");
+    begin(&mut sb, "SERIALIZABLE");
+    assert_eq!(int(&mut sa, "SELECT count(*) FROM t WHERE g = 1"), 1);
+    assert_eq!(int(&mut sb, "SELECT count(*) FROM t WHERE g = 2"), 1);
+    ok(&mut sa, "INSERT INTO t VALUES (20, 2)");
+    ok(&mut sb, "INSERT INTO t VALUES (80, 1)");
+    let (first, second) = race(
+        &mut sa,
+        "COMMIT",
+        &mut sb,
+        "COMMIT",
+        Duration::from_millis(300),
+    );
+    assert_eq!((first, second), (Ok(()), Err("40001".to_string())));
+    assert_eq!(int(&mut s, "SELECT count(*) FROM t"), 3);
 }

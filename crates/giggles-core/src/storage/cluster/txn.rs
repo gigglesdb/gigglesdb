@@ -567,18 +567,20 @@ impl ClusterTxnServices {
         Ok(())
     }
 
-    /// Locks held on ranges the commit does not write (FOR UPDATE / FOR SHARE rows, table
-    /// sentinels) are confirmed before committing: commit and prepare check the lock
-    /// generation only where they write, so a leader change on a lock-only range would
-    /// otherwise go unseen. A range that no longer knows the transaction, or cannot be
-    /// reached, aborts it (40001); its locks may be gone.
     /// R5-71/R5-72: a SERIALIZABLE writer read at its snapshot. At commit it takes Shared locks
     /// over what it read of Rows and Index, range by range in key order, then reads again at a
     /// timestamp taken after the last grant: a version newer than the snapshot fails 40001.
     /// Under those locks no other commit changes what it read until it ends, so its reads hold
     /// at its commit timestamp and committed SERIALIZABLE writers serialize in commit-timestamp
-    /// order. A wait that ends in a deadlock is a serialization failure (40001) here.
-    fn validate_reads(&self, txn: TxnId, reads: ReadSet, snapshot: Ts) -> Result<(), TxnError> {
+    /// order. A wait that ends in a deadlock or at the lock backstop is a serialization failure
+    /// (40001) here; a cancelled statement stays cancelled.
+    fn validate_reads(
+        &self,
+        txn: TxnId,
+        reads: ReadSet,
+        snapshot: Ts,
+        validation: ValidationConfig,
+    ) -> Result<(), TxnError> {
         let data = |ks: &Keyspace| matches!(ks, Keyspace::Rows | Keyspace::Index);
         let reads = ReadSet {
             points: reads
@@ -600,11 +602,13 @@ impl ClusterTxnServices {
             ));
         }
         targets.sort_by(|a, b| a.0.cmp(&b.0));
+        let cancel = || crate::cancellation::check().is_err();
         let shared = |rk: &[u8], target: LockTarget| {
-            self.lock_in_range(txn, rk, target, RangeLockMode::Shared, None, &|| false)
+            self.lock_in_range(txn, rk, target, RangeLockMode::Shared, None, &cancel)
                 .map(|(descriptor, _)| descriptor)
                 .map_err(|error| match error {
-                    TxnError::Deadlock => {
+                    // PostgreSQL reports neither at COMMIT: the read set could not be kept.
+                    TxnError::Deadlock | TxnError::LockTimeout => {
                         TxnError::Serialization(SerializationReason::ReadWriteConflict)
                     }
                     other => other,
@@ -616,7 +620,7 @@ impl ClusterTxnServices {
         // R5-72: each scanned interval (to its last key read, or to its end bound when the
         // scan ran out, which covers the gap after the last key) is gap-locked in every range
         // it spans, so no insert, update or delete can land inside it before this ends.
-        for range in &reads.ranges {
+        for range in reads.ranges.iter().filter(|r| !empty(&r.start, &r.end)) {
             let space = range_space(range.ks).ok_or(TxnError::Misuse)?;
             let mut route = match &range.start {
                 Bound::Included(key) | Bound::Excluded(key) => range_key(space, key),
@@ -637,9 +641,14 @@ impl ClusterTxnServices {
         }
         let at = Ts(self.oracle()?.0);
         let reader = RoutedKvRead::new(self.client.clone(), at, self.config.page_bytes);
-        Validator::new(reads, ValidationConfig::default()).validate_kv(&reader, snapshot)
+        Validator::new(reads, validation).validate_kv(&reader, snapshot)
     }
 
+    /// Locks held on ranges the commit does not write (FOR UPDATE / FOR SHARE rows, table
+    /// sentinels) are confirmed before committing: commit and prepare check the lock
+    /// generation only where they write, so a leader change on a lock-only range would
+    /// otherwise go unseen. A range that no longer knows the transaction, or cannot be
+    /// reached, aborts it (40001); its locks may be gone.
     fn check_lock_only(&self, txn: TxnId, written: &[Participant]) -> Result<(), TxnError> {
         let ranges: Vec<RangeId> = self.state(txn, |state| {
             state
@@ -728,14 +737,18 @@ fn clip_interval(
         (Some(a), Some(b)) if a < b || (a == b && matches!(end, Bound::Excluded(_))) => end.clone(),
         _ => hi,
     };
-    let empty = match (&start, &end) {
+    (!empty(&start, &end)).then_some((start, end))
+}
+
+/// Whether the interval [start, end] holds no key.
+fn empty(start: &Bound<Vec<u8>>, end: &Bound<Vec<u8>>) -> bool {
+    match (start, end) {
         (Bound::Included(a), Bound::Included(b)) => a > b,
         (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => {
             a >= b
         }
         _ => false,
-    };
-    (!empty).then_some((start, end))
+    }
 }
 
 impl Drop for ClusterTxnServices {
@@ -857,7 +870,7 @@ impl ClusterServices for ClusterTxnServices {
             if commit.writes.is_empty() && commit.raw.is_empty() {
                 return Ok(commit.snapshot);
             }
-            self.validate_reads(txn, reads, commit.snapshot)?;
+            self.validate_reads(txn, reads, commit.snapshot, commit.validation.clone())?;
         }
         let mut marker_xid = None;
         let mut dropped_counters = Vec::new();

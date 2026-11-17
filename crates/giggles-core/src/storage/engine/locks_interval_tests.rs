@@ -465,3 +465,35 @@ fn held_lists_intervals_and_they_count_toward_the_row_limit() {
     lm.release_all(TxnId(1));
     assert_clean(&lm);
 }
+
+/// Review S5: points are indexed only once a space sees an interval. Exclusive points held
+/// before the first interval still block it (the index is built then), and a manager that
+/// never sees an interval keeps no index.
+#[test]
+fn points_held_before_the_first_interval_still_block_it() {
+    let lm = manager();
+    acquire(&lm, 1, row(5), LockMode::Exclusive);
+    acquire(&lm, 1, unique(5), LockMode::Exclusive);
+    {
+        let state = lm.state.lock().unwrap();
+        assert_eq!(state.indexed, [false, false]);
+        assert!(state.points.iter().all(BTreeSet::is_empty));
+    }
+    assert_eq!(
+        now(&lm, 2, rows(1, 9), LockMode::Shared),
+        Err(LockError::Timeout)
+    );
+    {
+        let state = lm.state.lock().unwrap();
+        assert_eq!(state.indexed, [true, false]);
+    }
+    // Later points in the indexed space are indexed as they come.
+    acquire(&lm, 3, row(20), LockMode::Exclusive);
+    assert_eq!(
+        now(&lm, 2, rows(15, 25), LockMode::Shared),
+        Err(LockError::Timeout)
+    );
+    lm.release_all(TxnId(1));
+    lm.release_all(TxnId(3));
+    now(&lm, 2, rows(1, 30), LockMode::Shared).unwrap();
+}

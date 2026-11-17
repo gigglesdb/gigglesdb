@@ -486,7 +486,9 @@ mod tests {
             let key = match req.target {
                 LockTarget::Key { key, .. } => key,
                 LockTarget::TableSentinel { table } => table.to_be_bytes().to_vec(),
-                LockTarget::Interval { .. } => unimplemented!("no gap locks in this double"),
+                LockTarget::Interval { .. } => {
+                    return Err(RangeError::Corrupt("no gap locks in this double".into()));
+                }
             };
             let table = self.table(req.range)?;
             table.lock(req.txn, key, req.mode).map(|()| LockGrant {

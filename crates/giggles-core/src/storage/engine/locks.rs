@@ -298,8 +298,11 @@ struct State {
     // Per `LockSpace`: interval keys with holders or queued requests.
     intervals: [HashSet<LockKey>; 2],
     // Per `LockSpace`: byte forms of point keys with an Exclusive holder or a
-    // queued Exclusive request.
+    // queued Exclusive request. Maintained only once the space has seen an
+    // interval (`indexed`), so a manager that never takes a gap lock (every
+    // single-node one) pays nothing for it.
     points: [BTreeSet<Vec<u8>>; 2],
+    indexed: [bool; 2],
 }
 
 #[derive(Debug)]
@@ -339,6 +342,9 @@ impl LockManager {
             }
         }
         let mut state = self.state.lock().map_err(|_| LockError::Misuse)?;
+        if let LockKey::Interval { space, .. } = &key {
+            state.ensure_indexed(*space);
+        }
         let held = state
             .keys
             .get(&key)
@@ -633,9 +639,37 @@ impl State {
             }
         } else if let Some((space, id, tail)) = key.point()
             && mode == LockMode::Exclusive
+            && self.indexed[space as usize]
         {
             self.points[space as usize].insert(point_bytes(id, tail));
         }
+    }
+
+    /// Starts indexing `space`'s Exclusive points (held or queued), once, before
+    /// its first interval is checked or recorded.
+    fn ensure_indexed(&mut self, space: LockSpace) {
+        if self.indexed[space as usize] {
+            return;
+        }
+        let mut points = BTreeSet::new();
+        for (key, locks) in &self.keys {
+            let Some((point_space, id, tail)) = key.point() else {
+                continue;
+            };
+            let exclusive = locks
+                .holders
+                .values()
+                .any(|held| held.iter().any(|mode| mode == LockMode::Exclusive))
+                || locks
+                    .queue
+                    .iter()
+                    .any(|id| self.waiters[id].mode == LockMode::Exclusive);
+            if point_space == space && exclusive {
+                points.insert(point_bytes(id, tail));
+            }
+        }
+        self.points[space as usize] = points;
+        self.indexed[space as usize] = true;
     }
 
     /// Drop `key` once it has no holders or queue, and its index entry once it

@@ -176,12 +176,12 @@ impl Prepared {
         }
         // One lock per key at its strongest mode (a key held Shared, then upgraded, is held in
         // both modes), in byte order, so one record has one encoding.
-        let mut strongest: Vec<(&LockKey, LockMode)> = Vec::with_capacity(self.locks.len());
+        let mut strongest: std::collections::HashMap<&LockKey, LockMode> =
+            std::collections::HashMap::with_capacity(self.locks.len());
         for (key, mode) in &self.locks {
-            match strongest.iter_mut().find(|(held, _)| *held == key) {
-                Some(entry) if *mode == LockMode::Exclusive => entry.1 = LockMode::Exclusive,
-                Some(_) => {}
-                None => strongest.push((key, *mode)),
+            let held = strongest.entry(key).or_insert(*mode);
+            if *mode == LockMode::Exclusive {
+                *held = LockMode::Exclusive;
             }
         }
         let mut locks = Vec::with_capacity(strongest.len());
@@ -261,6 +261,7 @@ impl Prepared {
             }
         }
         let mut locks: Vec<(LockKey, LockMode)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for _ in 0..r.u32()? {
             let key = match r.u8()? {
                 1 => LockKey::Row {
@@ -290,7 +291,7 @@ impl Prepared {
             if matches!(key, LockKey::Interval { .. }) && mode != LockMode::Shared {
                 return Err(corrupt("gap lock mode"));
             }
-            if locks.iter().any(|(held, _)| *held == key) {
+            if !seen.insert(key.clone()) {
                 return Err(corrupt("duplicate lock"));
             }
             locks.push((key, mode));

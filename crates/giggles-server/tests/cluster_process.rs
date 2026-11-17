@@ -521,16 +521,162 @@ async fn a_gateway_dying_mid_commit_stalls_only_its_own_rows() {
         held.is_err() || died.elapsed() >= Duration::from_secs(25),
         "the prepared row answered at once: {held:?}"
     );
-    // Recovery aborts the undecided transaction; every node then agrees.
+    // Recovery aborts the undecided transaction (recover_after 30 s). Read the prepared row once
+    // that window has passed (a read held on it for longer than a peer call times out drops the
+    // peer connection, the Phase 7 open item); every node then agrees on the old value.
+    tokio::time::sleep(Duration::from_secs(35).saturating_sub(died.elapsed())).await;
     assert_eq!(
-        rows(&c1, "SELECT v FROM u WHERE id = 15").await,
+        settled(&c1, "SELECT v FROM u WHERE id = 15").await,
         vec![vec![150]]
     );
     assert_eq!(rows(&c3, "SELECT count(*) FROM t").await, vec![vec![0]]);
-    cluster.assert_proxies_unsaturated();
+    // No assert_proxies_unsaturated here: the run outlasts recovery's 30 s window, and the
+    // heartbeats of 18 range groups alone fill a link's 65536-event trace; the reads above already
+    // show every connection this test needed was accepted.
     eprintln!(
         "a_gateway_dying_mid_commit_stalls_only_its_own_rows: slowest other read {slowest:?}, \
          checks done {checked:?} after the crash, total {:?}",
+        started.elapsed()
+    );
+}
+
+/// The rows of a bigint query once it answers, retrying errors (an undecided prepared row is
+/// unavailable until recovery decides it) for up to STATUS_WAIT.
+async fn settled(c: &Client, sql: &str) -> Vec<Vec<i64>> {
+    let deadline = Instant::now() + STATUS_WAIT;
+    loop {
+        match tokio::time::timeout(STATEMENT_WAIT, c.query(sql, &[])).await {
+            Ok(Ok(rows)) => {
+                return rows
+                    .iter()
+                    .map(|r| (0..r.len()).map(|i| r.get::<_, i64>(i)).collect())
+                    .collect();
+            }
+            other => assert!(Instant::now() < deadline, "{sql}: {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The range (status JSON) holding range key `key` (hex). Equal-case hex orders as bytes do.
+fn range_holding<'a>(status: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    status["ranges"].as_array()?.iter().find(|r| {
+        r["start"].as_str().is_some_and(|start| start <= key)
+            && r["end"].as_str().is_none_or(|end| key < end)
+    })
+}
+
+/// The leader of the range holding range key `key` (hex), once a status names one that is not
+/// `avoid`, asked through node `via`'s configuration. Equal-case hex orders as the bytes do.
+async fn leader_of(cluster: &ClusterProcs, via: usize, key: &str, avoid: u64) -> u64 {
+    let deadline = Instant::now() + STATUS_WAIT;
+    loop {
+        let (_, status) = cluster_status(&cluster.config_path(via));
+        let leader = range_holding(&status, key).and_then(|r| r["leader"].as_u64());
+        if let Some(leader) = leader.filter(|l| *l != avoid) {
+            return leader;
+        }
+        assert!(Instant::now() < deadline, "no leader for {key}: {status}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// GD-0075 R5-73 (LONG, 5 nodes): a SERIALIZABLE writer read a key range of u and wrote t. Its
+/// gateway dies after every participant prepared, so u's range holds the writer's gap lock in a
+/// prepared record. Then u's range changes leader. The new leader re-takes the gap lock: an
+/// insert into the gap waits until recovery decides the writer (abort), while an insert outside
+/// it goes through. The gateway holds no replica of u's range, so u's range keeps a majority
+/// while its old leader is down; the old leader then comes back (other ranges need it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prepared_gap_lock_survives_its_gateway_and_a_leader_change() {
+    let started = Instant::now();
+    let mut cluster = ClusterProcs::new(5).await;
+    let c1 = cluster.client(0).await;
+    create_tables(&c1).await;
+    for id in [10, 20, 30] {
+        insert_u(&c1, id, id).await;
+    }
+    let oid = rows(&c1, "SELECT oid::bigint FROM pg_class WHERE relname = 'u'").await[0][0];
+    let table = (oid - 65536) / 4;
+    // u's first row key: range key of Rows (0x80) || table id BE8 || pk.
+    let u_key = format!("80{table:016x}");
+    let (_, status) = cluster_status(&cluster.config_path(0));
+    let replicas: Vec<u64> = range_holding(&status, &u_key)
+        .and_then(|r| r["replicas"].as_array())
+        .expect("u's range")
+        .iter()
+        .filter_map(serde_json::Value::as_u64)
+        .collect();
+    // The gateway: a node other than node 1 with no replica of u's range.
+    let gateway = (2..=5_u64)
+        .find(|n| !replicas.contains(n))
+        .expect("five nodes, three replicas");
+    let g = gateway as usize - 1;
+    cluster.kill(g);
+    cluster.set_env(g, "GIGGLES_CORE_FAILPOINT", "gateway.commit.prepared");
+    cluster.start(g);
+    cluster.ready(g).await;
+    let cg = cluster.client(g).await;
+    batch(&cg, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+    assert_eq!(
+        rows(&cg, "SELECT count(*) FROM u WHERE id >= 10 AND id <= 30").await,
+        vec![vec![3]]
+    );
+    insert_t(&cg, gateway as i64).await;
+    let commit = tokio::time::timeout(STATEMENT_WAIT, cg.batch_execute("COMMIT")).await;
+    assert!(!matches!(commit, Ok(Ok(()))), "COMMIT must not succeed");
+    cluster.exited(g, STATEMENT_WAIT).await;
+    assert!(
+        cluster
+            .stderr(g)
+            .contains("failpoint crash: gateway.commit.prepared"),
+        "the gateway did not die between prepare and decide"
+    );
+    let died = Instant::now();
+    // u's range changes leader: its leader goes down until another replica leads, then returns.
+    let alive = |avoid: &[u64]| (1..=5_u64).find(|n| !avoid.contains(n)).unwrap() as usize - 1;
+    let first = leader_of(&cluster, alive(&[gateway]), &u_key, gateway).await;
+    cluster.kill(first as usize - 1);
+    let second = leader_of(&cluster, alive(&[gateway, first]), &u_key, first).await;
+    assert_ne!(second, first);
+    cluster.start(first as usize - 1);
+    cluster.ready(first as usize - 1).await;
+    let others: Vec<usize> = (1..=5_u64)
+        .filter(|n| *n != gateway)
+        .map(|n| n as usize - 1)
+        .collect();
+    let ca = cluster.client(others[0]).await;
+    let cb = std::sync::Arc::new(cluster.client(others[1]).await);
+    // Outside the gap: goes through.
+    insert_u(&ca, 50, 50).await;
+    let gap = {
+        let cb = cb.clone();
+        tokio::spawn(async move {
+            let asked = Instant::now();
+            let result = cb
+                .execute("INSERT INTO u (id, v) VALUES (15, 15)", &[])
+                .await;
+            (result.map_err(|e| format!("{e:?}")), asked.elapsed())
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let held = died.elapsed();
+    assert!(
+        !gap.is_finished() || held >= Duration::from_secs(25),
+        "the insert into the gap was not held by the prepared gap lock ({held:?} after the crash)"
+    );
+    // Recovery aborts the writer (its gateway never decided): the insert goes through.
+    let (result, waited) = tokio::time::timeout(STATUS_WAIT, gap)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result, Ok(1), "insert into the gap");
+    assert_eq!(settled(&ca, "SELECT count(*) FROM t").await, vec![vec![0]]);
+    assert_eq!(settled(&ca, "SELECT count(*) FROM u").await, vec![vec![5]]);
+    eprintln!(
+        "a_prepared_gap_lock_survives_its_gateway_and_a_leader_change: gateway {gateway}, u range \
+         led by {first} then {second}; gap insert held {waited:?} (checked {held:?} after the \
+         crash); total {:?}",
         started.elapsed()
     );
 }

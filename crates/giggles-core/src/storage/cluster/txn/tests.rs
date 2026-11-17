@@ -758,3 +758,67 @@ fn a_cross_range_commit_with_a_leaderless_participant_aborts_retryably() {
     assert_eq!(read(&gw, 10, b"a"), None);
     assert_eq!(read(&gw, 10, b"z"), None);
 }
+
+/// GD-0075 R5-72 (review S8): a gap lock asks each range for the part of its interval that
+/// range holds, at range and keyspace edges.
+#[test]
+fn gap_lock_intervals_are_clipped_to_each_range() {
+    use crate::range_api::{Epoch, RangeDescriptor, RangeId};
+    let rows = |key: &[u8]| range_key(RangeSpace::Rows, key);
+    let desc = |start: Vec<u8>, end: Option<Vec<u8>>| RangeDescriptor {
+        id: RangeId(9),
+        epoch: Epoch(1),
+        start,
+        end,
+        replicas: Vec::new(),
+    };
+    let inc = |k: &[u8]| Bound::Included(k.to_vec());
+    let exc = |k: &[u8]| Bound::Excluded(k.to_vec());
+    let middle = desc(rows(b"c"), Some(rows(b"m")));
+    // Inside: unchanged. Wider: cut to the range.
+    assert_eq!(
+        clip_interval(&middle, RangeSpace::Rows, &inc(b"d"), &inc(b"k")),
+        Some((inc(b"d"), inc(b"k")))
+    );
+    assert_eq!(
+        clip_interval(
+            &middle,
+            RangeSpace::Rows,
+            &Bound::Unbounded,
+            &Bound::Unbounded
+        ),
+        Some((inc(b"c"), exc(b"m")))
+    );
+    // Equal keys: the excluded bound is the tighter one.
+    assert_eq!(
+        clip_interval(&middle, RangeSpace::Rows, &exc(b"c"), &inc(b"m")),
+        Some((exc(b"c"), exc(b"m")))
+    );
+    // Disjoint, touching an exclusive end, or another keyspace: nothing here.
+    assert_eq!(
+        clip_interval(&middle, RangeSpace::Rows, &inc(b"m"), &inc(b"z")),
+        None
+    );
+    assert_eq!(
+        clip_interval(&middle, RangeSpace::Rows, &inc(b"a"), &exc(b"c")),
+        None
+    );
+    assert_eq!(
+        clip_interval(&middle, RangeSpace::Index, &inc(b"d"), &inc(b"k")),
+        None
+    );
+    // A range spanning keyspaces: bounds in other keyspaces are open.
+    let spanning = desc(
+        range_key(RangeSpace::Catalog, b""),
+        Some(range_key(RangeSpace::Index, b"")),
+    );
+    assert_eq!(
+        clip_interval(&spanning, RangeSpace::Rows, &Bound::Unbounded, &inc(b"q")),
+        Some((Bound::Unbounded, inc(b"q")))
+    );
+    let tail = desc(rows(b"m"), None);
+    assert_eq!(
+        clip_interval(&tail, RangeSpace::Rows, &inc(b"a"), &Bound::Unbounded),
+        Some((inc(b"m"), Bound::Unbounded))
+    );
+}
