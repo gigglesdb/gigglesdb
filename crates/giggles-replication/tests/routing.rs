@@ -598,3 +598,81 @@ fn learned_descriptor_routes_by_id_and_older_epochs_are_ignored() {
     assert_eq!(client.descriptor_for(&key(45)), Ok(parent));
     assert_eq!(net.calls("Read"), vec![1]);
 }
+
+#[test]
+fn id_call_reaches_parent_after_learning_overlapping_split_sibling() {
+    let parent = desc(10, 1, first_user_key(), None, &[2]);
+    let left = desc(10, 2, first_user_key(), Some(key(50)), &[2]);
+    let right = desc(12, 2, key(50), None, &[3]);
+    let (net, _) = Net::new(std::slice::from_ref(&parent));
+    net.host(2, FakeRange::new(left.clone(), None));
+    net.host(3, FakeRange::new(right.clone(), None));
+    let client = net.client(9);
+    assert_eq!(client.descriptor_for(&key(10)), Ok(parent.clone()));
+
+    // Learning the sibling evicts the broad parent from key routing. No call to the
+    // parent has established a leader hint, so its replicas are the only route.
+    client.learn(&right);
+    assert_eq!(client.release(parent.id, txn()), Ok(()));
+    assert_eq!(net.calls("Release"), vec![2]);
+    assert_eq!(
+        client.commit(parent.id, parent.epoch, txn(), vec![], None, None),
+        Err(RangeError::StaleEpoch {
+            descriptor: left.clone()
+        })
+    );
+    assert_eq!(net.calls("Commit"), vec![2]);
+    // The stale reply re-caches the narrowed parent without another directory lookup.
+    assert_eq!(client.descriptor_for(&key(10)), Ok(left.clone()));
+    assert_eq!(client.descriptor_for(&key(60)), Ok(right));
+    assert_eq!(net.calls("Read"), vec![1]);
+    assert_eq!(
+        client.commit(left.id, left.epoch, txn(), vec![], None, None),
+        Ok(Timestamp(7))
+    );
+}
+
+#[test]
+fn retired_descriptors_route_only_by_id_and_refresh_after_split() {
+    use giggles_replication::route::RouteCache;
+
+    let parent = desc(10, 1, first_user_key(), None, &[2]);
+    let left = desc(10, 2, first_user_key(), Some(key(50)), &[2]);
+    let right = desc(12, 2, key(50), None, &[3]);
+    let mut cache = RouteCache::default();
+    cache.insert(parent.clone());
+    cache.insert(right.clone());
+    assert_eq!(cache.by_id(parent.id), None);
+    assert_eq!(cache.lookup(&key(10)), None);
+    assert_eq!(cache.route_hint(parent.id), Some(&parent));
+    assert_eq!(cache.lookup(&key(60)), Some(right.clone()));
+
+    cache.insert(left.clone());
+    assert_eq!(cache.by_id(left.id), Some(&left));
+    assert_eq!(cache.route_hint(left.id), Some(&left));
+    cache.invalidate(&parent); // A stale invalidation must keep the newer entry.
+    assert_eq!(cache.lookup(&key(10)), Some(left.clone()));
+    cache.invalidate(&left);
+    assert_eq!(cache.by_id(left.id), None);
+    assert_eq!(cache.lookup(&key(10)), None);
+    assert_eq!(cache.route_hint(left.id), Some(&left));
+    assert_eq!(cache.lookup(&key(60)), Some(right));
+}
+
+#[test]
+fn retired_routing_hints_clear_at_capacity() {
+    use giggles_replication::route::RouteCache;
+
+    let mut cache = RouteCache::default();
+    for id in 10..=4106 {
+        let range = desc(id, 1, first_user_key(), None, &[2]);
+        cache.insert(range.clone());
+        cache.invalidate(&range);
+        assert_eq!(cache.route_hint(range.id), Some(&range));
+    }
+    // The 4097th retirement clears the previous batch, keeping the newest hint.
+    assert_eq!(cache.route_hint(RangeId(10)), None);
+    assert_eq!(cache.route_hint(RangeId(4105)), None);
+    assert_eq!(cache.by_id(RangeId(4106)), None);
+    assert_eq!(cache.lookup(&key(10)), None);
+}

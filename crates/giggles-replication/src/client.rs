@@ -263,7 +263,7 @@ impl Router {
         if let Some(hint) = cache.leader(range).filter(|&hint| hint != self.node) {
             return Some(hint);
         }
-        let mut replicas = match cache.by_id(range) {
+        let mut replicas = match cache.route_hint(range) {
             Some(desc) => desc.replicas.clone(),
             None if range == SYSTEM_RANGE => self.bootstrap.replicas.clone(),
             None => return None,
