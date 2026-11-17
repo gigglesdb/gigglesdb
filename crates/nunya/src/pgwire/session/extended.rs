@@ -3,6 +3,7 @@ use super::*;
 use crate::value::ColumnType;
 #[derive(Clone)]
 pub(super) struct Prepared {
+    empty_query: bool,
     generation: [u8; 16],
     plan: RewritePlan,
     param_count: u32,
@@ -54,7 +55,7 @@ fn oid_type(oid: u32) -> Option<ColumnType> {
 }
 impl Prepared {
     fn local(&self) -> bool {
-        self.plan.tokenize.is_some() || matches!(self.kind, StatementKind::SessionNoop { .. })
+        self.empty_query || self.plan.tokenize.is_some() || matches!(self.kind, StatementKind::SessionNoop { .. })
     }
 }
 impl Session {
@@ -104,7 +105,16 @@ impl Session {
             return Err(failure(NyCode::SchemaStale));
         }
         let types = param_types.iter().map(|o| oid_type(*o)).collect::<Vec<_>>();
-        let statements = self.ctx.lowering.lower(sql, &snapshot, &policy, &types)?;
+        let mut statements = self.ctx.lowering.lower(sql, &snapshot, &policy, &types)?;
+        let empty_query = statements.is_empty() && sql.trim().is_empty();
+        if empty_query {
+            if !param_types.is_empty() { return Err(failure(NyCode::NotAnalysable)); }
+            statements.push(ResolvedStatement {
+                kind: StatementKind::SessionNoop { tag: "" },
+                outputs: vec![], uses: vec![], writes: vec![], param_count: 0,
+                plain_params: vec![], source_span: ir::Span { start: 0, end: sql.len() },
+            });
+        }
         if statements.len() != 1 {
             return Err(failure(NyCode::NotAnalysable));
         }
@@ -152,6 +162,7 @@ impl Session {
             *slot = ty.pg_oid().ok_or_else(protocol)?;
         }
         Ok(Prepared {
+            empty_query,
             generation: random::<16>()?,
             plan,
             param_count,
@@ -405,13 +416,13 @@ impl Session {
                         // No ParameterStatus change: application_name remains the startup value.
                         self.ctx
                             .readlog
-                            .write(&self.record(&p.sql, Outcome::Allowed))?;
+                            .write(&self.record(if p.empty_query { "" } else { &p.sql }, Outcome::Allowed))?;
                         self.ctx
                             .metrics
                             .statements_allowed
                             .fetch_add(1, Ordering::Relaxed);
                         out = self.local(Actions {
-                            client: vec![Backend::CommandComplete(tag.into())],
+                            client: vec![if p.empty_query { Backend::EmptyQueryResponse } else { Backend::CommandComplete(tag.into()) }],
                             ..Actions::default()
                         });
                     } else if p.plan.tokenize.is_some() {

@@ -2334,6 +2334,66 @@ pub(crate) mod tests {
         };
         fields.iter().find(|(k, _)| *k == b'C').unwrap().1.as_str()
     }
+    #[test]
+    fn extended_session_metadata_and_empty_query() {
+        for sql in ["SHOW TRANSACTION ISOLATION LEVEL", "select current_schema()", "select current_catalog", "", " \t\n"] {
+            let f = Fixture::new();
+            let mut s = f.session();
+            let empty = sql.trim().is_empty();
+            let parse = s.frontend(Frontend::Parse { name: "s".into(), query: sql.into(), param_types: vec![] });
+            if empty {
+                assert!(parse.upstream.is_empty());
+                assert!(matches!(parse.client.as_slice(), [Backend::ParseComplete]));
+            } else {
+                assert!(matches!(&parse.upstream[0], Frontend::Parse { query, .. } if query == sql));
+                assert!(matches!(s.backend(Backend::ParseComplete).client.as_slice(), [Backend::ParseComplete]));
+            }
+            let bind = s.frontend(Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![], params: vec![], result_formats: vec![] });
+            if empty { assert!(matches!(bind.client.as_slice(), [Backend::BindComplete])); }
+            else { assert!(matches!(s.backend(Backend::BindComplete).client.as_slice(), [Backend::BindComplete])); }
+            for kind in *b"SP" {
+                let describe = s.frontend(Frontend::Describe { kind, name: if kind == b'S' { "s" } else { "p" }.into() });
+                if empty {
+                    assert!(matches!(describe.client.last(), Some(Backend::NoData)));
+                    assert_eq!(describe.client.len(), if kind == b'S' { 2 } else { 1 });
+                    if kind == b'S' { assert!(matches!(&describe.client[0], Backend::ParameterDescription(p) if p.is_empty())); }
+                } else {
+                    assert_eq!(describe.upstream.len(), 1);
+                    if kind == b'S' { s.backend(Backend::ParameterDescription(vec![])); }
+                    assert!(matches!(s.backend(Backend::RowDescription(vec![field()])).client.as_slice(), [Backend::RowDescription(_)]));
+                }
+            }
+            let execute = s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 });
+            if empty {
+                assert!(execute.upstream.is_empty());
+                assert!(matches!(execute.client.as_slice(), [Backend::EmptyQueryResponse]));
+            } else {
+                assert_eq!(execute.upstream.len(), 1);
+                assert!(matches!(s.backend(Backend::DataRow(vec![Some(b"metadata".to_vec())])).client.as_slice(), [Backend::DataRow(_)]));
+                assert!(matches!(s.backend(Backend::CommandComplete("SELECT 1".into())).client.as_slice(), [Backend::CommandComplete(_)]));
+            }
+            s.frontend(Frontend::Sync);
+            assert!(!s.backend(Backend::ReadyForQuery(b'I')).close);
+            assert_eq!(f.allowed_records.load(Ordering::Relaxed), if empty { 1 } else { 2 });
+            // Forwarded selects have an intent and completion record; local noops have one.
+            assert!(f.identities.lock().unwrap().iter().all(|r| matches!(r.outcome, Outcome::Allowed)));
+        }
+    }
+    #[test]
+    fn extended_empty_query_refuses_parameters_and_nonempty_zero_statements() {
+        for sql in ["", " "] {
+            let f = Fixture::new(); let mut s = f.session();
+            s.frontend(Frontend::Parse { name: "s".into(), query: sql.into(), param_types: vec![] });
+            let out = s.frontend(Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![], params: vec![Some(b"x".to_vec())], result_formats: vec![] });
+            assert_eq!(code(&out), "NY004");
+            assert_eq!(f.allowed_records.load(Ordering::Relaxed), 0);
+        }
+        for (sql, param_types) in [("", vec![25]), ("-- comment", vec![]), (";", vec![])] {
+            let f = Fixture::new(); let mut s = f.session();
+            let out = s.frontend(Frontend::Parse { name: "s".into(), query: sql.into(), param_types });
+            assert_eq!(code(&out), "NY004");
+        }
+    }
     fn field() -> FieldDescription {
         FieldDescription {
             name: "value".into(),

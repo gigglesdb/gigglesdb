@@ -1332,3 +1332,53 @@ fn driver_session_settings_are_exact_and_fail_closed() {
         );
     }
 }
+
+#[test]
+fn session_metadata_allowlist() {
+    for sql in ["SHOW TRANSACTION ISOLATION LEVEL", "show transaction isolation level",
+        "SHOW transaction_isolation", "select current_schema()", "SELECT current_schema()",
+        "select current_catalog", "SELECT current_database()", "select pg_catalog.current_schema() as schema"] {
+        let s = lower(sql);
+        assert_eq!(s.kind, StatementKind::Select, "{sql}");
+        assert_eq!(s.outputs.len(), 1, "{sql}");
+        assert_eq!(s.outputs[0].label, Label::Plain);
+        assert_eq!(s.outputs[0].ty, Some(ColumnType::Text));
+        assert!(s.outputs[0].source.is_none());
+        assert!(s.uses.is_empty());
+    }
+}
+#[test]
+fn session_metadata_near_misses() {
+    let (snapshot, policy) = fixture();
+    for (sql, code) in [
+        ("SHOW search_path", NyCode::StatementNotAllowed),
+        ("SHOW ALL", NyCode::StatementNotAllowed),
+        ("SHOW server_version", NyCode::StatementNotAllowed),
+        ("SHOW transaction_read_only", NyCode::StatementNotAllowed),
+        ("select current_schema() from customers", NyCode::NotAnalysable),
+        ("select current_schema(), email from customers", NyCode::NotAnalysable),
+        ("select current_schema() where exists (select 1 from customers)", NyCode::NotAnalysable),
+        ("select current_schema() union select email from customers", NyCode::NotAnalysable),
+        ("select current_database() limit 1", NyCode::NotAnalysable),
+        ("select current_database() limit all", NyCode::NotAnalysable),
+        ("with x as (select 1) select current_schema()", NyCode::NotAnalysable),
+        ("select current_schemas(true)", NyCode::NotAnalysable),
+        ("select current_user", NyCode::NotAnalysable),
+        ("select current_schema() into t", NyCode::StatementNotAllowed),
+        ("select private.current_schema()", NyCode::NotAnalysable),
+        ("select current_schema(1)", NyCode::NotAnalysable),
+        ("select current_schema() over ()", NyCode::NotAnalysable),
+        ("select distinct current_schema()", NyCode::NotAnalysable),
+        ("select current_catalog order by 1", NyCode::NotAnalysable),
+    ] {
+        let actual = match PgLowering.lower(sql, &snapshot, &policy, &[]) {
+            Err(e) => e.code,
+            Ok(s) => match s[0].kind { StatementKind::Refused(c) => c, _ => panic!("accepted {sql}") },
+        };
+        assert_eq!(actual, code, "{sql}");
+    }
+    let statements = PgLowering.lower("SHOW TRANSACTION ISOLATION LEVEL; SELECT email FROM customers", &snapshot, &policy, &[]).unwrap();
+    assert_eq!(statements.len(), 2);
+    assert_eq!(statements[1].outputs[0].label, blind());
+    assert!(matches!(crate::ir::check::check(&statements[1], &policy, &snapshot).unwrap().outputs[0], OutputRewrite::Tokenize { .. }));
+}

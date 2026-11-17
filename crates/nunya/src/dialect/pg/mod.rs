@@ -46,6 +46,46 @@ fn empty(span: Span) -> ResolvedStatement {
     }
 }
 
+// Only a whole, table-free metadata statement may bypass expression lowering.
+fn metadata_select(s: &p::SelectStmt) -> Option<OutputColumn> {
+    if s.target_list.len() != 1
+        || !s.distinct_clause.is_empty() || s.into_clause.is_some()
+        || !s.from_clause.is_empty() || s.where_clause.is_some()
+        || !s.group_clause.is_empty() || s.group_distinct || s.having_clause.is_some()
+        || !s.window_clause.is_empty() || !s.values_lists.is_empty()
+        || !s.sort_clause.is_empty() || s.limit_offset.is_some() || s.limit_count.is_some()
+        || s.limit_option != p::LimitOption::Default as i32
+        || !s.locking_clause.is_empty() || s.with_clause.is_some()
+        || s.op != p::SetOperation::SetopNone as i32 || s.all
+        || s.larg.is_some() || s.rarg.is_some()
+    {
+        return None;
+    }
+    let target = match s.target_list[0].node.as_ref()? {
+        NodeEnum::ResTarget(t) if t.indirection.is_empty() => t,
+        _ => return None,
+    };
+    let name = match target.val.as_deref()?.node.as_ref()? {
+        NodeEnum::FuncCall(f) if f.args.is_empty() && f.agg_order.is_empty()
+            && f.agg_filter.is_none() && f.over.is_none() && !f.agg_within_group
+            && !f.agg_star && !f.agg_distinct && !f.func_variadic => {
+            let names = strings(&f.funcname).ok()?;
+            match names.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+                [name @ ("current_schema" | "current_database")]
+                | ["pg_catalog", name @ ("current_schema" | "current_database")] => (*name).to_owned(),
+                _ => return None,
+            }
+        }
+        NodeEnum::SqlvalueFunction(f)
+            if f.op == p::SqlValueFunctionOp::SvfopCurrentCatalog as i32 => "current_catalog".into(),
+        _ => return None,
+    };
+    Some(metadata_output(if target.name.is_empty() { &name } else { &target.name }))
+}
+fn metadata_output(name: &str) -> OutputColumn {
+    OutputColumn { name: name.into(), label: Label::Plain, source: None, ty: Some(ColumnType::Text) }
+}
+
 fn setting_string(n: &p::Node) -> Option<&str> {
     match n.node.as_ref()? {
         NodeEnum::AConst(c) if !c.isnull => match c.val.as_ref()? {
@@ -221,7 +261,9 @@ impl Lowering for PgLowering {
             };
             match node(raw.stmt.as_deref().ok_or_else(refuse)?)? {
                 NodeEnum::SelectStmt(s) => {
-                    if s.into_clause.is_some() {
+                    if let Some(output) = metadata_select(s) {
+                        state.statement.outputs = vec![output];
+                    } else if s.into_clause.is_some() {
                         state.statement.kind = StatementKind::Refused(NyCode::StatementNotAllowed);
                     } else if !state.tokenize(s)? {
                         match state.select(s) {
@@ -239,6 +281,10 @@ impl Lowering for PgLowering {
                         }
                     }
                 }
+                NodeEnum::VariableShowStmt(s) => match s.name.as_str() {
+                    "transaction_isolation" => state.statement.outputs = vec![metadata_output("transaction_isolation")],
+                    _ => state.statement.kind = StatementKind::Refused(NyCode::StatementNotAllowed),
+                },
                 NodeEnum::VariableSetStmt(s) => state.statement.kind = session_setting(s),
                 NodeEnum::TransactionStmt(t) => {
                     state.statement.kind = match p::TransactionStmtKind::try_from(t.kind)
