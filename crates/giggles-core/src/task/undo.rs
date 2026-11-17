@@ -1,20 +1,42 @@
-//! Per-row history planner for undo (GD-0061 R3-801, design D8).
+//! Undo (GD-0061 design D8): the per-row history planner (R3-801) and the
+//! undo preview (R3-802).
 //!
 //! [`classify`] is the pure part of `plan`: it walks a task's change-record
 //! rows and sorts every touched row into settled, superseded, conflict or a
-//! restore candidate. The dry run through the Phase 6 seam (R3-802) turns
-//! candidates into restores or `Constraint` conflicts.
-use super::definition::TableId;
-use super::preview::PreviewId;
-use super::records::{ChangeRow, ROW_BEFORE_BLANKED};
-use crate::relational::Value;
+//! restore candidate. [`undo_preview`] reads the history and the current
+//! rows, dry-runs each candidate through the Phase 6 protected seam as the
+//! native point update with its `expected_version` (one savepoint each, in
+//! ascending `(table, pk)`; earlier restores stay in place, so a restore that
+//! would succeed only after a later one is a conflict), rolls everything
+//! back and stores a kind-02 preview through the change preview's T2.
+use super::admit::StatementClass;
+use super::commit::{engine, role_error, unsupported};
+use super::definition::{RoleName, TableId, TaskDef, TaskName, TaskPrivileges};
+use super::effects::Effects;
+use super::error::{DenyRule, TaskError};
+use super::ledger::{self, OperationId};
+use super::preview::{
+    encode_after, schema_fp, store_preview, PreviewClass, PreviewId, PreviewKind, Recheck,
+    MAX_PREVIEW_ROWS, NO_CLOCK_PIN, STATE_OPEN,
+};
+use super::records::{
+    task_prefix, ChangeHeader, ChangeRow, OutcomePayload, PreviewHeader, PreviewRow,
+    PreviewScope, TaskObjectId, NS_CHANGE_HEADER, NS_CHANGE_ROW, ROW_BEFORE_BLANKED,
+};
+use crate::relational::{SqlError, TableDef, Value};
+use crate::storage::engine::{codec, kv::Direction};
+use crate::storage::roles::{role_txn, table_owner_txn, table_privileges_txn, TablePrivilege};
+use crate::storage::{Isolation, Keyspace, ProtectedRun, SqlSession, Transaction, V2Db};
+use crate::CoreError;
 use std::collections::BTreeMap;
+use std::ops::Bound;
+use std::sync::Arc;
 
-/// Undo scope: the whole task, or one operation (by its client operation ID bytes).
+/// Undo scope: the whole task, or one committed operation of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UndoScope {
     Task,
-    Operation(Vec<u8>),
+    Operation(OperationId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +203,361 @@ pub(crate) fn classify(
         plan.candidates.push(Candidate { table, pk, expect: version, restore, sets });
     }
     plan
+}
+
+/// PREVIEW UNDO OF TASK `task` [OPERATION `op`] as `role` (D8).
+///
+/// Checks, in order: not in a task session (0A000), v2 and not replicated
+/// (0A000), the task exists (42704), `role` holds the undo privilege on it
+/// and SELECT and UPDATE on its table (superuser, owner or grant; 42501).
+/// Operation scope resolves the ID through the `22` ledger and needs a
+/// committed outcome of this task (42704 otherwise). Neither revocation nor
+/// expiry stops an undo.
+///
+/// The plan runs in a Serializable transaction that is always rolled back.
+/// A restore that fails with a class-23 error, or whose run touched any row
+/// other than its own, is a `Constraint` conflict; any other error is
+/// returned. Before-values blanked by retention are `BeforeValuesExpired`
+/// conflicts. The preview is then stored as kind 02 (`counts` = restorable,
+/// conflicts, superseded, settled; `creator` = `role`; no text, parameters
+/// or clock pin) under the same `stored_previews` limit as change previews.
+/// Its expiry is `now + preview_ttl`, not capped at the task's expiry.
+pub fn undo_preview(
+    session: &mut SqlSession,
+    role: &RoleName,
+    task: &TaskName,
+    scope: UndoScope,
+) -> Result<UndoSummary, TaskError> {
+    if session.task().is_some() {
+        return Err(TaskError::NotAllowedInTaskSession(StatementClass::Other));
+    }
+    let db = session.v2_db().ok_or_else(unsupported)?;
+    if db.task_kernel_unsupported() {
+        return Err(unsupported());
+    }
+    let def = session
+        .tasks()
+        .lookup(task.as_str())?
+        .ok_or(CoreError::Sql(SqlError::UndefinedObject))?;
+    may_undo(&db, &def, &mut db.begin(Isolation::ReadCommitted), role)?;
+    // The operation's committed seq, through the 22 ledger.
+    let (scope_seq, scope) = match &scope {
+        UndoScope::Task => (None, PreviewScope { kind: 0, outcome: [0; 32] }),
+        UndoScope::Operation(op) => {
+            let key = ledger::task_outcome_key(&db, def.id, op);
+            let seq = match ledger::lookup(&db, &key)?.map(|record| record.payload) {
+                Some(OutcomePayload::Committed { task, seq }) if task == def.id => seq,
+                _ => return Err(CoreError::Sql(SqlError::UndefinedObject).into()),
+            };
+            let mut outcome = [0u8; 32];
+            outcome.copy_from_slice(&key[1..33]);
+            (Some(seq), PreviewScope { kind: 1, outcome })
+        }
+    };
+    let dry = dry_run(session, &db, &def, scope_seq)?;
+    let header = PreviewHeader {
+        kind: PreviewKind::Undo as u8,
+        state: STATE_OPEN,
+        created_ms: 0,
+        expires_ms: 0,
+        def_version: def.def_version,
+        table: def.table,
+        schema_fp: dry.schema_fp,
+        clock_pin: NO_CLOCK_PIN,
+        digest: [0; 32],
+        counts: dry.counts,
+        applied_seq: 0,
+        creator: role.clone(),
+        scope: Some(scope),
+        surface: 0,
+        text: String::new(),
+        params: encode_after(&[])?,
+    };
+    // Under the hold: the task and the role's privileges again, and the
+    // definition the plan was made on.
+    let mut recheck = |txn: &mut Transaction, current: Option<Arc<TaskDef>>, _now: u64| {
+        let current = current.ok_or(CoreError::Sql(SqlError::UndefinedObject))?;
+        may_undo(&db, &current, txn, role)?;
+        if current.def_version != def.def_version || current.table != def.table {
+            return Err(TaskError::Retry);
+        }
+        Ok(current)
+    };
+    let recheck: &mut Recheck<'_> = &mut recheck;
+    let stored = store_preview(&db, def.id, &def, recheck, header, &dry.rows, false)?;
+    let [restorable, conflicts, superseded, settled] = stored.counts;
+    Ok(UndoSummary {
+        id: stored.id,
+        digest: stored.digest,
+        restorable,
+        conflicts,
+        superseded,
+        settled,
+        expires_at: stored.expires_ms,
+    })
+}
+
+/// 42501 insufficient_privilege.
+fn no_privilege() -> TaskError {
+    CoreError::Policy(crate::Error::Scope).into()
+}
+
+/// The undo privilege on the task (never the executor), then SELECT and
+/// UPDATE on its table as SQL allows them: a superuser, the owner or grants.
+fn may_undo(
+    db: &V2Db,
+    def: &TaskDef,
+    txn: &mut Transaction,
+    role: &RoleName,
+) -> Result<(), TaskError> {
+    let Some(record) = role_txn(txn, role).map_err(role_error)? else {
+        return Err(no_privilege());
+    };
+    if !def.privileges_of(&record).contains(TaskPrivileges::UNDO) {
+        return Err(no_privilege());
+    }
+    let view = db.catalog().committed_view(txn)?;
+    let relation = view
+        .by_id
+        .get(&def.table)
+        .map(|entry| entry.def.name.clone())
+        .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+    if record.superuser
+        || table_owner_txn(txn, &relation).map_err(role_error)?.as_deref() == Some(role.as_str())
+    {
+        return Ok(());
+    }
+    let held = table_privileges_txn(txn, &relation, role).map_err(role_error)?;
+    if held.contains(&TablePrivilege::Select) && held.contains(&TablePrivilege::Update) {
+        Ok(())
+    } else {
+        Err(no_privilege())
+    }
+}
+
+/// What the dry run hands the store.
+struct UndoDryRun {
+    schema_fp: [u8; 32],
+    /// Restorable, conflicts, superseded, settled.
+    counts: [u32; 4],
+    /// Ascending `(class, table, pk, aux)`.
+    rows: Vec<PreviewRow>,
+}
+
+/// One committed Kernel `(key, value)`.
+type KernelEntry = (Vec<u8>, Vec<u8>);
+
+/// The task's `25` rows with their `seq` (from the key) and `kind` (from
+/// the `24` header), in `(seq, row_no)` order.
+fn history(txn: &mut Transaction, task: TaskObjectId) -> Result<Vec<HistoryWrite>, CoreError> {
+    let seq_of = |key: &[u8]| {
+        key.get(9..17)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_be_bytes)
+            .ok_or_else(|| CoreError::Corrupt("task change record key".into()))
+    };
+    let scan = |txn: &mut Transaction, ns| -> Result<Vec<KernelEntry>, CoreError> {
+        let (start, end) = task_prefix(ns, task);
+        let mut out = Vec::new();
+        for entry in txn.scan(
+            Keyspace::Kernel,
+            Bound::Included(start.as_slice()),
+            Bound::Excluded(end.as_slice()),
+            Direction::Forward,
+            None,
+        )? {
+            out.push(entry?);
+        }
+        Ok(out)
+    };
+    let mut kinds = BTreeMap::new();
+    for (key, value) in scan(txn, NS_CHANGE_HEADER)? {
+        kinds.insert(seq_of(&key)?, ChangeHeader::decode(&value)?.kind);
+    }
+    let mut out = Vec::new();
+    for (key, value) in scan(txn, NS_CHANGE_ROW)? {
+        let seq = seq_of(&key)?;
+        let kind = *kinds
+            .get(&seq)
+            .ok_or_else(|| CoreError::Corrupt("task change row without header".into()))?;
+        out.push(HistoryWrite { seq, kind, row: ChangeRow::decode(&value)? });
+    }
+    Ok(out)
+}
+
+/// The row's current `(version, values)` at `txn`'s snapshot, or `None`
+/// when it is gone.
+fn read_row(
+    txn: &mut Transaction,
+    table: TableId,
+    pk: &[u8],
+) -> Result<Option<(u64, Vec<Value>)>, CoreError> {
+    let mut key = table.to_be_bytes().to_vec();
+    key.extend_from_slice(pk);
+    let Some(value) = txn.get(Keyspace::Rows, &key)? else {
+        return Ok(None);
+    };
+    let record = codec::decode_row(&key, &value)?;
+    Ok((!record.tombstone).then_some((record.row_version, record.values)))
+}
+
+/// `plan` in a Serializable transaction that is always rolled back.
+fn dry_run(
+    session: &mut SqlSession,
+    db: &Arc<V2Db>,
+    def: &TaskDef,
+    scope_seq: Option<u64>,
+) -> Result<UndoDryRun, TaskError> {
+    let mut txn = db.begin(Isolation::Serializable);
+    let mark = txn.savepoint();
+    let image = db.catalog().snapshot(&mut txn)?.image().map_err(CoreError::Sql)?;
+    let tables: BTreeMap<TableId, TableDef> =
+        image.tables.values().map(|table| (table.id, table.clone())).collect();
+    let schema_fp = match tables.get(&def.table) {
+        Some(table) => schema_fp(table, image.table_constraints(table.id))?,
+        None => return Err(TaskError::Denied(DenyRule::DefinitionChanged)),
+    };
+    let writes = history(&mut txn, def.id)?;
+    // Current rows, each read once, widened to the table's columns.
+    let mut current = BTreeMap::new();
+    for write in &writes {
+        let key = (write.row.table, write.row.pk.clone());
+        if current.contains_key(&key) {
+            continue;
+        }
+        let row = match tables.get(&write.row.table) {
+            Some(table) => read_row(&mut txn, write.row.table, &write.row.pk)?.map(
+                |(version, mut values)| {
+                    values.resize(table.columns.len(), Value::Null);
+                    (version, values)
+                },
+            ),
+            None => None,
+        };
+        current.insert(key, row);
+    }
+    let read = |table: TableId, pk: &[u8]| current.get(&(table, pk.to_vec())).cloned().flatten();
+    let decode = |row: &ChangeRow| {
+        let width = tables.get(&row.table)?.columns.len();
+        let mut values = crate::storage::task_row_values(&row.before).ok()?;
+        if values.len() > width {
+            return None;
+        }
+        values.resize(width, Value::Null);
+        Some(values)
+    };
+    let plan = classify(&writes, scope_seq, &read, &decode);
+    let mut rows = Vec::new();
+    for conflict in &plan.conflicts {
+        rows.push(conflict_row(conflict.table, &conflict.pk, conflict.version_read, conflict.reason));
+    }
+    for s in &plan.superseded {
+        rows.push(PreviewRow {
+            class: PreviewClass::Superseded as u8,
+            table: s.table,
+            pk: s.pk.clone(),
+            version_read: s.version_read,
+            aux: s.seq,
+            after: Vec::new(),
+        });
+    }
+    // Each candidate through the protected seam, in ascending (table, pk).
+    let mut run = ProtectedRun { txn, effects: Effects::default() };
+    let mut restorable = 0u32;
+    for candidate in &plan.candidates {
+        let table = tables
+            .get(&candidate.table)
+            .ok_or_else(|| CoreError::Corrupt("undo candidate without table".into()))?;
+        let key = table.primary_key.iter().map(|&c| candidate.restore[c].clone()).collect();
+        let sets = candidate.sets.iter().map(|&c| (c, candidate.restore[c].clone())).collect();
+        let prepared = crate::storage::task_restore_statement(db, &run.txn, table, key, sets)?;
+        let point = run.txn.savepoint();
+        let before = run.effects.clone();
+        let (back, result) = session.execute_protected_v2_expecting(
+            db,
+            run,
+            &prepared,
+            &[],
+            Some(candidate.expect),
+            None,
+        );
+        run = back;
+        let constraint = match &result {
+            Err(error) => crate::sqlstate(error).starts_with("23"),
+            Ok(_) => {
+                run.effects.len() != before.len() + 1
+                    || !run
+                        .effects
+                        .iter()
+                        .any(|e| e.table == candidate.table && e.pk == candidate.pk)
+            }
+        };
+        if constraint {
+            run.txn.rollback_to(&point).map_err(CoreError::from)?;
+            run.effects = before;
+            run.txn.release(point).map_err(CoreError::from)?;
+            rows.push(conflict_row(
+                candidate.table,
+                &candidate.pk,
+                candidate.expect,
+                ConflictReason::Constraint,
+            ));
+            continue;
+        }
+        result.map_err(engine)?;
+        run.txn.release(point).map_err(CoreError::from)?;
+        restorable += 1;
+        rows.push(PreviewRow {
+            class: PreviewClass::Change as u8,
+            table: candidate.table,
+            pk: candidate.pk.clone(),
+            version_read: candidate.expect,
+            aux: 0,
+            after: encode_after(&candidate.restore)?,
+        });
+    }
+    crate::storage::cross_check_effects(&run.effects, &run.txn)?;
+    // Discard the restores; dropping the transaction releases the locks.
+    let ProtectedRun { mut txn, .. } = run;
+    txn.rollback_to(&mark).map_err(CoreError::from)?;
+    drop(txn);
+    if rows.len() > MAX_PREVIEW_ROWS {
+        return Err(TaskError::Denied(DenyRule::PreviewTooLarge));
+    }
+    rows.sort_by(|a, b| (a.class, a.table, &a.pk, a.aux).cmp(&(b.class, b.table, &b.pk, b.aux)));
+    let conflicts = rows.iter().filter(|r| r.class == PreviewClass::Conflict as u8).count();
+    let overflow = || TaskError::from(CoreError::Limit);
+    Ok(UndoDryRun {
+        schema_fp,
+        counts: [
+            restorable,
+            u32::try_from(conflicts).map_err(|_| overflow())?,
+            u32::try_from(plan.superseded.len()).map_err(|_| overflow())?,
+            plan.settled,
+        ],
+        rows,
+    })
+}
+
+fn conflict_row(table: TableId, pk: &[u8], version_read: u64, reason: ConflictReason) -> PreviewRow {
+    PreviewRow {
+        class: PreviewClass::Conflict as u8,
+        table,
+        pk: pk.to_vec(),
+        version_read,
+        aux: reason as u64,
+        after: Vec::new(),
+    }
+}
+
+impl crate::storage::Admin {
+    /// For tests: one task retention pass now (GD-0061 D5), with the
+    /// settings from `set_task_retention` (v2 only).
+    #[doc(hidden)]
+    pub fn task_retention_step(&self) -> Result<super::retention::RetentionStats, CoreError> {
+        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        db.retention_step()
+    }
 }
 
 #[cfg(test)]

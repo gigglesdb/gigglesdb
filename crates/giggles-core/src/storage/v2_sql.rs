@@ -723,8 +723,13 @@ impl SqlSession {
                         // No refresh occurs while staging any of the statement's rows.
                         if protected {
                             // C1/C2/C5: one fresh snapshot after every lock wait, then
-                            // coarse Catalog tracking for the rest of the run.
-                            txn.restart_snapshot()?;
+                            // coarse Catalog tracking for the rest of the run. A later
+                            // statement of a run that already restarted and wrote
+                            // (the undo dry run's per-row restores, R3-802) keeps the
+                            // run's snapshot; read validation at commit covers it.
+                            if !(txn.snapshot_restarted() && txn.has_buffered()) {
+                                txn.restart_snapshot()?;
+                            }
                             txn.track_range(Keyspace::Catalog, Bound::Unbounded, Bound::Unbounded)?;
                         } else if !self.copy_input.as_ref().is_some_and(|input| input.started) {
                             txn.begin_statement();
@@ -2364,6 +2369,22 @@ pub(crate) fn cross_check_effects(
     effects.cross_check(txn.written_keys(Keyspace::Rows))
 }
 
+/// The native point update that restores one row (GD-0061 D8, R3-802),
+/// prepared against the catalog at `txn`'s snapshot: `key` is the primary
+/// key's values and `sets` the `(column offset, value)` pairs to write.
+pub(crate) fn task_restore_statement(
+    db: &v2::V2Db,
+    txn: &Transaction,
+    table: &relational::TableDef,
+    key: Vec<relational::Value>,
+    sets: Vec<(usize, relational::Value)>,
+) -> Result<relational::Prepared, CoreError> {
+    let mut state = db.metadata_state(Some(txn))?;
+    state.sql.epoch = 0;
+    relational::Prepared::update_engine(table, key, sets, state.view.domain, &state.sql)
+        .map_err(CoreError::Sql)
+}
+
 impl SqlSession {
     /// C1, the protected-statement seam: runs one DML statement inside the
     /// caller's transaction and never commits. The run is parked on the
@@ -2378,6 +2399,20 @@ impl SqlSession {
         params: &[relational::Value],
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> (ProtectedRun, Result<relational::SqlResult, CoreError>) {
+        self.execute_protected_v2_expecting(db, run, p, params, None, clock)
+    }
+
+    /// [`Self::execute_protected_v2`] with an `expected_version` for a native
+    /// point write (the undo restores, GD-0061 D8, R3-802).
+    pub(crate) fn execute_protected_v2_expecting(
+        &mut self,
+        db: &Arc<v2::V2Db>,
+        run: ProtectedRun,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: Option<&relational::clock::ExecutionClock>,
+    ) -> (ProtectedRun, Result<relational::SqlResult, CoreError>) {
         if self.v2_transaction.is_some()
             || self.staged.is_some()
             || self.copy_input.is_some()
@@ -2390,7 +2425,7 @@ impl SqlSession {
         // its partial effects (earlier pages) must be dropped too.
         let before = (!run.effects.is_empty()).then(|| run.effects.clone());
         self.protected = Some(run);
-        let result = self.execute_v2(db, p, params, None, clock);
+        let result = self.execute_v2(db, p, params, expected_version, clock);
         let mut run = self.protected.take().expect("parked protected run");
         if result.is_err() {
             run.effects = before.unwrap_or_default();

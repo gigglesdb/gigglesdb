@@ -31,8 +31,10 @@ pub(crate) mod records;
 // dry run and commit (R3-802..R3-804) consume the rest.
 #[allow(dead_code)]
 pub mod preview;
+// R3-801 / R3-802: the history planner and the undo preview; the undo
+// commit (R3-803) consumes the rest.
 #[allow(dead_code)]
-pub(crate) mod undo;
+pub mod undo;
 // R3-613: consumed by protected_commit (R3-615+) and outcome lookup.
 #[allow(dead_code)]
 pub(crate) mod receipt;
@@ -54,6 +56,7 @@ pub use commit::{inspect_outcome, outcome, protected_commit, Actor, ProtectedReq
 pub use commit::ProtectedPoint;
 pub use ledger::{OperationId, Outcome};
 pub use preview::{preview, PreviewId, PreviewSummary, Surface};
+pub use undo::{undo_preview, ConflictReason, UndoMode, UndoScope, UndoSummary};
 pub use receipt::Receipt;
 pub use readlog::{fingerprint_and_cap, show_reads, ReadRecord, Reconciliation};
 pub use release::{Page, ReleaseTag, Released, Unreleased};

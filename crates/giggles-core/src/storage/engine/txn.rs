@@ -677,6 +677,11 @@ impl Transaction {
     pub(crate) fn snapshot_restarted(&self) -> bool {
         self.restarted
     }
+    /// Whether anything is buffered (writes, raw ops or savepoint undo
+    /// records), which makes [`Self::restart_snapshot`] illegal.
+    pub(crate) fn has_buffered(&self) -> bool {
+        !self.writes.is_empty() || !self.raw.is_empty() || !self.undo.is_empty()
+    }
     /// Records `ks[start..end]` as read without reading it, so a later commit
     /// into the range fails SERIALIZABLE validation (GD-0061 C5). Fixes the
     /// snapshot the range is relative to. A no-op below SERIALIZABLE.

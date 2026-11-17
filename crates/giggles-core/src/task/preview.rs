@@ -469,24 +469,87 @@ fn store(
     params: &[Value],
     dry: DryRun,
 ) -> Result<PreviewSummary, TaskError> {
-    let task = ctx.task;
+    let header = PreviewHeader {
+        kind: PreviewKind::Change as u8,
+        state: STATE_OPEN,
+        created_ms: 0,
+        expires_ms: 0,
+        def_version: dry.def.def_version,
+        table: dry.def.table,
+        schema_fp: dry.schema_fp,
+        clock_pin: dry.clock_pin,
+        digest: [0; 32],
+        counts: [0; 4],
+        applied_seq: 0,
+        creator: ctx.executor.clone(),
+        scope: None,
+        surface: surface as u8,
+        text: text.to_owned(),
+        params: encode_after(params)?,
+    };
+    // 2. Revoked, expired and the definition version again.
+    let mut recheck = |_: &mut Transaction, def: Option<Arc<TaskDef>>, now: u64| {
+        standing(def.as_deref(), ctx, now)?;
+        let def = def.ok_or(TaskError::Revoked)?;
+        if def.def_version != dry.def.def_version || def.table != dry.def.table {
+            return Err(TaskError::Revoked);
+        }
+        Ok(def)
+    };
+    let stored = store_preview(db, ctx.task, &dry.def, &mut recheck, header, &dry.rows, true)?;
+    Ok(PreviewSummary {
+        id: stored.id,
+        digest: stored.digest,
+        rows: stored.counts[0],
+        expires_at: WallClockMs(i64::try_from(stored.expires_ms).unwrap_or(i64::MAX)),
+    })
+}
+
+/// Rechecks the task under the store's hold, at its snapshot: gets the
+/// transaction, the definition at that snapshot and the server clock, and
+/// returns the definition to store under.
+pub(super) type Recheck<'a> =
+    dyn FnMut(&mut Transaction, Option<Arc<TaskDef>>, u64) -> Result<Arc<TaskDef>, TaskError> + 'a;
+
+/// What [`store_preview`] stored.
+pub(super) struct StoredHeader {
+    pub(super) id: PreviewId,
+    pub(super) digest: [u8; 32],
+    pub(super) counts: [u32; 4],
+    pub(super) expires_ms: u64,
+}
+
+/// T2 of a change preview (D7.2) and of an undo preview (D8): one
+/// ReadCommitted transaction under the hold on `20|task|00` (waiting at most
+/// `def.limits.lock_wait_ms`), then a statement snapshot, the head and
+/// `recheck`; the sweep of the task's expired and applied previews of both
+/// kinds; the `stored_previews` limit, which counts both kinds; the id from
+/// the head; the header (its `created_ms`, `expires_ms`, `digest` and, for a
+/// change preview, `counts[0]` filled in here) with its rows in the order
+/// given and the head, in one commit. `expires_ms` is `now + preview_ttl`,
+/// capped at the task's expiry when `cap_at_task_expiry`.
+pub(super) fn store_preview(
+    db: &Arc<V2Db>,
+    task: TaskObjectId,
+    def: &TaskDef,
+    recheck: &mut Recheck<'_>,
+    mut header: PreviewHeader,
+    rows: &[PreviewRow],
+    cap_at_task_expiry: bool,
+) -> Result<StoredHeader, TaskError> {
     // 1. The hold, then a statement snapshot taken after it, then the head.
     let mut txn = db.begin(Isolation::ReadCommitted);
-    let deadline = Instant::now().checked_add(Duration::from_millis(dry.def.limits.lock_wait_ms));
+    let deadline = Instant::now().checked_add(Duration::from_millis(def.limits.lock_wait_ms));
     txn.lock_kernel_key(&mutation_head_key(task), deadline, &|| {
         crate::cancellation::check().is_err()
     })
     .map_err(hold_error)?;
     txn.begin_statement();
     let head = authority::load_head(&mut txn, task)?;
-    // 2. Revoked, expired and the definition version again.
+    // 2. The caller's rechecks.
     let now = db.wall_now_ms();
     let def = catalog_def(db, task, DefAt::Snapshot(&mut txn))?;
-    standing(def.as_deref(), ctx, now)?;
-    let def = def.ok_or(TaskError::Revoked)?;
-    if def.def_version != dry.def.def_version || def.table != dry.def.table {
-        return Err(TaskError::Revoked);
-    }
+    let def = recheck(&mut txn, def, now)?;
     // 3. Sweep this task's expired and applied previews.
     let open = sweep(&mut txn, task, now)?;
     // 4. The limit on open previews.
@@ -496,36 +559,27 @@ fn store(
     // 5. The id.
     let id = PreviewId(head.next_preview);
     let overflow = || TaskError::from(CoreError::Limit);
-    let rows = u32::try_from(dry.rows.len()).map_err(|_| overflow())?;
+    let count = u32::try_from(rows.len()).map_err(|_| overflow())?;
+    if header.kind == PreviewKind::Change as u8 {
+        header.counts[0] = count;
+    }
     let ttl_ms = def.limits.preview_ttl_s.saturating_mul(1000);
-    let task_expiry = u64::try_from(def.expires_at.0).unwrap_or(0);
-    let expires_ms = now.saturating_add(ttl_ms).min(task_expiry);
-    let mut header = PreviewHeader {
-        kind: PreviewKind::Change as u8,
-        state: STATE_OPEN,
-        created_ms: now,
-        expires_ms,
-        def_version: def.def_version,
-        table: def.table,
-        schema_fp: dry.schema_fp,
-        clock_pin: dry.clock_pin,
-        digest: [0; 32],
-        counts: [rows, 0, 0, 0],
-        applied_seq: 0,
-        creator: ctx.executor.clone(),
-        scope: None,
-        surface: surface as u8,
-        text: text.to_owned(),
-        params: encode_after(params)?,
-    };
-    header.digest = digest(db.meta.domain, task, id, &header, &dry.rows);
-    // 6. Header, rows (ascending (table, pk)) and head, in one commit.
+    let mut expires_ms = now.saturating_add(ttl_ms);
+    if cap_at_task_expiry {
+        expires_ms = expires_ms.min(u64::try_from(def.expires_at.0).unwrap_or(0));
+    }
+    header.created_ms = now;
+    header.expires_ms = expires_ms;
+    header.def_version = def.def_version;
+    header.table = def.table;
+    header.digest = digest(db.meta.domain, task, id, &header, rows);
+    // 6. Header, rows and head, in one commit.
     let put = |txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>| -> Result<(), TaskError> {
         txn.put(Keyspace::Kernel, key, value).map_err(CoreError::from)?;
         Ok(())
     };
     put(&mut txn, preview_key(task, id.0), header.encode())?;
-    for (row_no, row) in dry.rows.iter().enumerate() {
+    for (row_no, row) in rows.iter().enumerate() {
         let row_no = u32::try_from(row_no).map_err(|_| overflow())?;
         put(&mut txn, preview_row_key(task, id.0, row_no), row.encode())?;
     }
@@ -537,12 +591,7 @@ fn store(
     };
     authority::stage_head(&mut txn, task, &next)?;
     db.catalog().commit_ddl(txn).map_err(|e| engine(e.into()))?;
-    Ok(PreviewSummary {
-        id,
-        digest: header.digest,
-        rows,
-        expires_at: WallClockMs(i64::try_from(expires_ms).unwrap_or(i64::MAX)),
-    })
+    Ok(StoredHeader { id, digest: header.digest, counts: header.counts, expires_ms })
 }
 
 /// The task's stored preview headers, in id order.

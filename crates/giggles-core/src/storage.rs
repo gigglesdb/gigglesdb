@@ -5606,7 +5606,7 @@ pub(crate) struct ProtectedRun {
     pub(crate) effects: crate::task::effects::Effects,
 }
 
-pub(crate) use v2_sql::cross_check_effects;
+pub(crate) use v2_sql::{cross_check_effects, task_restore_statement};
 
 impl SqlSession {
     /// The session's v2 database; `None` on the legacy engine (GD-0061
