@@ -566,8 +566,12 @@ impl Replica {
                 EntryType::EntryConfChangeV2 => {
                     let cc = ConfChangeV2::parse_from_bytes(&e.data)
                         .map_err(|e| Error::Corrupt(e.to_string()))?;
-                    if e.index > self.log().conf_index()? {
-                        if self.membership.accept_conf_change(&cc, e.index) {
+                    let pending = e.index > self.log().conf_index()?;
+                    let accepted = !pending || self.membership.accept_conf_change(&cc, e.index);
+                    let result = self.state.apply_conf_change(accepted.then_some(&cc), at)
+                        .map_err(|e| Error::Apply(e.to_string()))?;
+                    if pending {
+                        if accepted {
                             let cs = self.raw.apply_conf_change(&cc).map_err(Error::Raft)?;
                             crate::failpoint::hit(
                                 &self.cluster,
@@ -586,7 +590,7 @@ impl Replica {
                             refused = Some("unexpected membership configuration change".to_owned());
                         }
                     }
-                    self.state.apply_noop(at)
+                    Ok(result)
                 }
                 EntryType::EntryConfChange => self.state.apply_noop(at),
                 EntryType::EntryNormal if e.data.is_empty() => self.state.apply_noop(at),

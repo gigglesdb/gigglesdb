@@ -36,6 +36,14 @@ pub trait StateMachine: Send + Sync {
     fn applied(&self) -> Result<Option<AppliedPosition>, StateError>;
     fn apply(&self, encoded_batch: &[u8], at: AppliedPosition) -> Result<ApplyOutcome, StateError>;
     fn apply_noop(&self, at: AppliedPosition) -> Result<ApplyOutcome, StateError>;
+    /// Apply a v2 configuration entry; None denotes a refused change.
+    fn apply_conf_change(
+        &self,
+        _change: Option<&raft::eraftpb::ConfChangeV2>,
+        at: AppliedPosition,
+    ) -> Result<ApplyOutcome, StateError> {
+        self.apply_noop(at)
+    }
     fn checkpoint(&self, target: &Path) -> Result<AppliedPosition, StateError>;
     fn can_install(&self) -> bool {
         true

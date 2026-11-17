@@ -17,6 +17,9 @@ use giggles_core::{
     replicated::{RangeApplyOutcome, RangeStore, SplitOutcome},
 };
 
+use giggles_core::range_api::{ReplicaDesc, ReplicaRole};
+use raft::eraftpb::{ConfChangeType, ConfChangeV2};
+
 use crate::state::{AppliedPosition, ApplyOutcome, StateError, StateMachine};
 
 /// Per-range surface of the multi-range store (Track A's `RangeStore`, or
@@ -46,6 +49,17 @@ pub trait RangeStoreOps: Send + Sync {
         right: RangeId,
         at: AppliedPosition,
     ) -> Result<SplitOutcome, StateError>;
+    /// Persist replicas for a configuration entry (in-memory fakes may consume a no-op).
+    fn change_replicas(
+        &self,
+        range: RangeId,
+        _replicas: Vec<ReplicaDesc>,
+        _clear_lineage: bool,
+        at: AppliedPosition,
+    ) -> Result<Option<RangeDescriptor>, StateError> {
+        self.apply_noop(range, at)?;
+        Ok(None)
+    }
     fn export(&self, range: RangeId, target: &Path) -> Result<AppliedPosition, StateError>;
     fn install(&self, range: RangeId, source: &Path) -> Result<AppliedPosition, StateError>;
     fn flush(&self) -> Result<(), StateError>;
@@ -110,6 +124,16 @@ impl RangeStoreOps for RangeStore {
         at: AppliedPosition,
     ) -> Result<SplitOutcome, StateError> {
         RangeStore::split(self, range, epoch, at_key, right, core_position(at)).map_err(state_error)
+    }
+    fn change_replicas(
+        &self,
+        range: RangeId,
+        replicas: Vec<ReplicaDesc>,
+        clear_lineage: bool,
+        at: AppliedPosition,
+    ) -> Result<Option<RangeDescriptor>, StateError> {
+        RangeStore::change_replicas(self, range, replicas, clear_lineage, core_position(at))
+            .map_err(state_error)
     }
     fn export(&self, range: RangeId, target: &Path) -> Result<AppliedPosition, StateError> {
         RangeStore::export(self, range, target)
@@ -337,6 +361,44 @@ impl StateMachine for RangeStateMachine {
     }
     fn apply_noop(&self, at: AppliedPosition) -> Result<ApplyOutcome, StateError> {
         self.store.apply_noop(self.range, at)
+    }
+    fn apply_conf_change(
+        &self,
+        change: Option<&ConfChangeV2>,
+        at: AppliedPosition,
+    ) -> Result<ApplyOutcome, StateError> {
+        let Some(change) = change else {
+            return self.apply_noop(at);
+        };
+        if self.applied()?.is_some_and(|p| at.index <= p.index) {
+            return self.apply_noop(at);
+        }
+        let mut replicas = self
+            .store
+            .descriptor(self.range)?
+            .ok_or_else(|| StateError(format!("unknown range {}", self.range.0)))?
+            .replicas;
+        let mut clear_lineage = false;
+        for single in change.get_changes() {
+            let node = single.node_id;
+            replicas.retain(|r| r.node != node);
+            let role = match single.get_change_type() {
+                ConfChangeType::AddLearnerNode => ReplicaRole::Learner,
+                ConfChangeType::AddNode => ReplicaRole::Voter,
+                ConfChangeType::RemoveNode => {
+                    clear_lineage = true;
+                    continue;
+                }
+            };
+            replicas.push(ReplicaDesc { node, role });
+        }
+        if let Some(new) = self
+            .store
+            .change_replicas(self.range, replicas, clear_lineage, at)?
+        {
+            self.moved.fetch_max(new.epoch.0, Ordering::SeqCst);
+        }
+        Ok(ApplyOutcome::Applied)
     }
     fn checkpoint(&self, target: &Path) -> Result<AppliedPosition, StateError> {
         self.store.export(self.range, target)
@@ -703,4 +765,68 @@ fn take_u64(r: &mut &[u8]) -> Result<u64, StateError> {
 fn take_bytes<'a>(r: &mut &'a [u8]) -> Result<&'a [u8], StateError> {
     let len = u32::from_be_bytes(take(r, 4)?.try_into().expect("4 bytes"));
     take(r, len as usize)
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+    #[test]
+    fn membership_updates_moved_epoch() {
+        let dir = std::env::temp_dir().join(format!("moved-conf-{}", std::process::id()));
+        let store = Arc::new(RangeStore::create(&dir, [92; 16]).unwrap());
+        let range = RangeId(2);
+        store
+            .create_range(&RangeDescriptor {
+                id: range,
+                epoch: Epoch(7),
+                start: vec![],
+                end: None,
+                replicas: vec![ReplicaDesc {
+                    node: 1,
+                    role: ReplicaRole::Voter,
+                }],
+            })
+            .unwrap();
+        let state = RangeStateMachine::new(range, store.clone());
+        let mut cc = ConfChangeV2::default();
+        let mut single = raft::eraftpb::ConfChangeSingle {
+            node_id: 4,
+            ..Default::default()
+        };
+        single.set_change_type(ConfChangeType::AddLearnerNode);
+        cc.mut_changes().push(single);
+        state
+            .apply_conf_change(Some(&cc), AppliedPosition { index: 1, term: 1 })
+            .unwrap();
+        assert_eq!(state.moved_epoch().load(Ordering::SeqCst), 8);
+        state
+            .apply_conf_change(Some(&cc), AppliedPosition { index: 2, term: 1 })
+            .unwrap();
+        assert_eq!(state.moved_epoch().load(Ordering::SeqCst), 8);
+        cc.mut_changes()[0].set_change_type(ConfChangeType::AddNode);
+        let mut remove = raft::eraftpb::ConfChangeSingle {
+            node_id: 1,
+            ..Default::default()
+        };
+        remove.set_change_type(ConfChangeType::RemoveNode);
+        cc.mut_changes().push(remove);
+        cc.set_transition(raft::eraftpb::ConfChangeTransition::Explicit);
+        state
+            .apply_conf_change(Some(&cc), AppliedPosition { index: 3, term: 1 })
+            .unwrap();
+        assert_eq!(state.moved_epoch().load(Ordering::SeqCst), 9);
+        state
+            .apply_conf_change(
+                Some(&ConfChangeV2::default()),
+                AppliedPosition { index: 4, term: 1 },
+            )
+            .unwrap();
+        state
+            .apply_conf_change(None, AppliedPosition { index: 5, term: 1 })
+            .unwrap();
+        assert_eq!(state.moved_epoch().load(Ordering::SeqCst), 9);
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

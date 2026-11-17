@@ -175,3 +175,5 @@ mod registry;
 
 #[path = "registry_join.rs"]
 mod registry_join;
+#[path = "range_conf.rs"]
+mod range_conf;

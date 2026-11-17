@@ -32,6 +32,8 @@ use crate::storage::{io, v2};
 
 #[path = "split.rs"]
 mod split;
+#[path = "membership.rs"]
+mod membership;
 pub use split::SplitOutcome;
 pub(super) use split::{child_route, epoch_refusal, stale_descriptor};
 
