@@ -29,6 +29,9 @@ pub fn move_status(handle: &ReplicaHandle) -> Option<String> {
 }
 
 /// Moves `from` to the active registry node `to`. Retry on the returned leader.
+///
+/// Before starting a replacement, publish any split children: removing a replica
+/// clears split lineage, which reconciliation needs to publish those children.
 pub fn move_replica(
     node: &ClusterNode,
     range: RangeId,
@@ -113,6 +116,9 @@ pub fn move_replica(
         .into_iter()
         .find(|r| r.id == to && r.state == NodeState::Active)
         .ok_or_else(|| Error::Identity("target is not active in the registry".into()))?;
+    if status.membership.active.is_none() {
+        Splitter::new(node.host().clone(), node.client().clone()).reconcile(Some(range))?;
+    }
     if !desc.replicas.iter().any(|r| r.node == to) {
         desc.replicas.push(ReplicaDesc {
             node: to,

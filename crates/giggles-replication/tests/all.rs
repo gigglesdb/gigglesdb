@@ -180,3 +180,6 @@ mod range_conf;
 
 #[path = "range_move.rs"]
 mod range_move;
+
+#[path = "range_move_load.rs"]
+mod range_move_load;
