@@ -458,6 +458,20 @@ impl Catalog {
         self.snapshot_locked(&mut cache, txn, ts)
     }
 
+    /// The committed catalog version `txn`'s statement snapshot reads, as a cache
+    /// key for derived per-version data (GD-0061 R3-305 task predicates). `None`
+    /// for a private catalog overlay, before a snapshot is chosen, or for the
+    /// old-snapshot fallback.
+    pub(crate) fn snapshot_version(&self, txn: &Transaction) -> Option<Ts> {
+        if txn.catalog_writes().next().is_some() {
+            return None;
+        }
+        let ts = txn.current_snapshot_ts()?;
+        let cache = self.cache.lock().ok()?;
+        let end = cache.versions.partition_point(|(version, _)| *version <= ts);
+        end.checked_sub(1).map(|index| cache.versions[index].0)
+    }
+
     /// Acquire the served version and image under the same cache lock.
     /// None marks the old-snapshot fallback, whose version is unknown.
     pub(crate) fn binding_snapshot(

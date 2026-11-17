@@ -718,13 +718,38 @@ impl SqlSession {
                                 return Ok(Default::default());
                             }
                         }
-                        if !writing && image.streaming_reduction(&bound) {
+                        // GD-0061 R3-305: a task statement's table read sees only the
+                        // task's visible rows. It runs through the scoped row source;
+                        // a read that does not use a row source is refused.
+                        let scope = match &self.task {
+                            Some(ctx) if !writing && !bound.read_tables().is_empty() => {
+                                if !bound.task_source_read() {
+                                    return Err(crate::task::TaskError::NotAllowedInTaskSession(
+                                        crate::task::StatementClass::Other,
+                                    )
+                                    .into());
+                                }
+                                Some(crate::task::rows::scope(db, txn, &image, ctx)?)
+                            }
+                            _ => None,
+                        };
+                        if !writing && (scope.is_some() || image.streaming_reduction(&bound)) {
                             let source = reduction::Source::new(SqlRows {
                                 conflict_floor: None, db, txn, parts: old,
                                 writing, prepared: &bound, params, effects: None,
                             });
+                            let meter = crate::task::rows::StatementMeter::default();
+                            let scoped = scope.as_ref().map(|scope|
+                                crate::task::rows::Scoped::new(&source, scope, &meter));
                             let result = image.execute_reduction(
-                                p, params, expected_version, context.as_ref(), &source);
+                                p, params, expected_version, context.as_ref(),
+                                scoped.as_ref().map_or(
+                                    &source as &dyn relational::scan::RowSource,
+                                    |s| s as &dyn relational::scan::RowSource));
+                            if let Some(scoped) = &scoped {
+                                crate::task::rows::record(meter.counts());
+                                if let Some(error) = scoped.take_error() { return Err(error.into()); }
+                            }
                             if let Some(error) = source.error.take() { return Err(error); }
                             if let Some(error) = context.as_ref().and_then(|c| c.take_error()) { return Err(error); }
                             return result.map_err(CoreError::Sql);

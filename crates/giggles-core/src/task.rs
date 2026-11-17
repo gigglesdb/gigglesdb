@@ -35,6 +35,7 @@ pub(crate) mod undo;
 #[allow(dead_code)]
 pub(crate) mod receipt;
 pub mod release;
+pub mod rows;
 pub mod statements;
 #[cfg(test)]
 mod statements_tests;

@@ -464,11 +464,11 @@ fn undo_skips_policy_caps_and_threshold() {
 #[test]
 fn row_predicate_null_is_false() {
     let f = fixture();
-    let p = RowPredicate::compile(&f.state, &f.def.visible_rows, &f.table).unwrap();
+    let p = RowPredicate::bind(&f.state, &f.table, &f.def.visible_rows.0).unwrap();
     let values = |carrier: Value| vec![Value::Int(1), carrier, Value::Null, Value::Null];
-    assert!(p.matches(&values(Value::Int(7))).unwrap());
-    assert!(!p.matches(&values(Value::Int(8))).unwrap());
-    assert!(!p.matches(&values(Value::Null)).unwrap());
+    assert!(p.accepts(&values(Value::Int(7))).unwrap());
+    assert!(!p.accepts(&values(Value::Int(8))).unwrap());
+    assert!(!p.accepts(&values(Value::Null)).unwrap());
     let bad = PredicateText("no_such_column = 1".into());
-    assert!(RowPredicate::compile(&f.state, &bad, &f.table).is_err());
+    assert!(RowPredicate::bind(&f.state, &f.table, &bad.0).is_err());
 }

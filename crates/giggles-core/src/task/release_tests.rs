@@ -43,10 +43,63 @@ fn context() -> TaskContext {
     }
 }
 
+/// A session bound to a task. On v2 the task exists, because a task statement
+/// that reads a table binds the task's visible rows (R3-305); tasks are v2 only,
+/// so the legacy engine keeps the synthetic context.
 fn task_session(admin: &crate::storage::Admin) -> SqlSession {
     let mut sql = admin.sql_session();
-    sql.bind_task(context()).unwrap();
+    #[cfg(feature = "engine-rocksdb")]
+    let ctx = real_task(admin);
+    #[cfg(not(feature = "engine-rocksdb"))]
+    let ctx = context();
+    sql.bind_task(ctx).unwrap();
     sql
+}
+
+#[cfg(feature = "engine-rocksdb")]
+fn real_task(admin: &crate::storage::Admin) -> TaskContext {
+    use crate::storage::roles::{NewRole, TablePrivilege};
+    use crate::task::definition::{
+        DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText, WallClockMs,
+    };
+    // 2026-11-05 17:00:00 UTC.
+    let now = WallClockMs(1_793_898_000_000);
+    let roles = admin.roles();
+    for (name, task_only) in [("incident_controller", false), ("agent_exec", true)] {
+        roles.create(NewRole { name: name.into(), login: true, ..NewRole::default() }).unwrap();
+        if task_only {
+            roles.set_task_only(name, true).unwrap();
+        }
+    }
+    roles.grant_table("shipments", "incident_controller", &[TablePrivilege::Select]).unwrap();
+    let issuer = roles.get("incident_controller").unwrap().unwrap();
+    admin
+        .tasks()
+        .create(
+            &issuer,
+            NewTask {
+                name: "inc-436".into(),
+                executor: "agent_exec".into(),
+                approver: None,
+                schema: None,
+                table: "shipments".into(),
+                visible_rows: PredicateText("merchant_id = 42".into()),
+                readable: vec!["id".into(), "status".into()],
+                masked: Vec::new(),
+                untrusted_text: Vec::new(),
+                allowed_write: None,
+                mutation_caps: MutationCaps::default(),
+                disclosure_caps: DisclosureCaps { rows_read: 10, rows_returned: 10, bytes_returned: 4096 },
+                limits: LoadLimits::default(),
+                approval_threshold: 0,
+                expires: "2026-11-05 17:30:00+00".into(),
+            },
+            now,
+        )
+        .unwrap();
+    let sql = admin.sql_session();
+    crate::task::context::open_context(&sql, &context().name, &"agent_exec".to_string(), [7; 32], now, 0)
+        .unwrap()
 }
 
 fn ids(admin: &crate::storage::Admin) -> Vec<Vec<Value>> {
@@ -129,12 +182,16 @@ fn plain_exit_fails_closed_in_task_session() {
     assert_eq!(page.untasked(), Err(refused.clone()));
     let page = sql.execute_unreleased("SELECT id FROM shipments", &[], None).unwrap();
     assert_eq!(sql.release_page(page).map(|_| ()), Err(CoreError::Unsupported));
-    // Cursors: the plain fetch is refused before the cursor advances.
-    let mut cursor = sql.open_cursor(&select, &[]).unwrap();
-    assert_eq!(cursor.fetch(10, 1 << 20), Err(refused.clone()));
-    let chunk = cursor.fetch_unreleased(10, 1 << 20).unwrap();
-    assert!(chunk.is_task());
-    assert_eq!(chunk.untasked(), Err(refused.clone()));
+    // Cursors: the plain fetch is refused before the cursor advances. (A legacy
+    // cursor refuses a task session at open: tasks are v2 only.)
+    #[cfg(feature = "engine-rocksdb")]
+    {
+        let mut cursor = sql.open_cursor(&select, &[]).unwrap();
+        assert_eq!(cursor.fetch(10, 1 << 20), Err(refused.clone()));
+        let chunk = cursor.fetch_unreleased(10, 1 << 20).unwrap();
+        assert!(chunk.is_task());
+        assert_eq!(chunk.untasked(), Err(refused.clone()));
+    }
     // Native exits.
     let read = Request::Read {
         table: "shipments".into(),

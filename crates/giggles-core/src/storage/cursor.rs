@@ -13,6 +13,10 @@ pub struct Cursor {
     clock: Option<relational::clock::ExecutionClock>,
     /// The task statement's release tag (GD-0061 R3-301); `None` outside a task session.
     tag: Option<Arc<crate::task::release::ReleaseTag>>,
+    /// The task's visible rows (GD-0061 R3-305); `None` outside a task session
+    /// and for buffered cursors, whose rows were scoped when they were read.
+    scope: Option<crate::task::rows::Scope>,
+    meter: crate::task::rows::StatementMeter,
 }
 enum Data {
     Scan {
@@ -103,14 +107,26 @@ impl Cursor {
                 plan,
             } => {
                 let legacy = scan::LegacyRows(image);
+                let inner = source
+                    .as_ref()
+                    .map_or(&legacy as &dyn RowSource, |s| s as &dyn RowSource);
+                // A task cursor reads through the visible-rows wrapper (R3-305).
+                let scoped = self
+                    .scope
+                    .as_ref()
+                    .map(|scope| crate::task::rows::Scoped::new(inner, scope, &self.meter));
                 let result = plan.fetch(
                     image,
-                    source
-                        .as_ref()
-                        .map_or(&legacy as &dyn RowSource, |s| s as &dyn RowSource),
+                    scoped.as_ref().map_or(inner, |s| s as &dyn RowSource),
                     max_rows,
                     max_bytes,
                 );
+                if let Some(scoped) = &scoped {
+                    crate::task::rows::record(self.meter.counts());
+                    if let Some(error) = scoped.take_error() {
+                        return Err(error.into());
+                    }
+                }
                 if let Some(error) = source.as_ref().and_then(|s| s.error.borrow_mut().take()) {
                     return Err(error);
                 }
@@ -180,7 +196,7 @@ impl SqlSession {
                 relational::clock::ExecutionClock::new(c)
                     .with_extra_float_digits(self.extra_float_digits)
             });
-            let (image, source, context) = match &self.admin.inner.backend {
+            let (image, source, context, scope) = match &self.admin.inner.backend {
                 Backend::V2(db) => {
                     // The snapshot source below reads the local store directly; a cluster
                     // gateway buffers the result of the normal execution path instead
@@ -237,6 +253,14 @@ impl SqlSession {
                     if !p.sequences().is_empty() {
                         return self.buffer_cursor(&p, params, clock, buffer_limit);
                     }
+                    // A task statement that reads a table sees only the task's
+                    // visible rows (GD-0061 R3-305), bound at this snapshot.
+                    let scope = match &self.task {
+                        Some(ctx) if !p.read_tables().is_empty() => {
+                            Some(crate::task::rows::scope(db, txn, &image, ctx)?)
+                        }
+                        _ => None,
+                    };
                     (
                         image,
                         Some(V2Snapshot {
@@ -249,9 +273,15 @@ impl SqlSession {
                             error: RefCell::new(None),
                         }),
                         context,
+                        scope,
                     )
                 }
                 Backend::Legacy(_) => {
+                    // Tasks are v2 only: a task context here was never opened
+                    // from a task catalog.
+                    if self.task.is_some() {
+                        return Err(crate::task::TaskError::Revoked.into());
+                    }
                     let s = match &self.staged {
                         Some(s) => s.clone(),
                         None => self.admin.inner.inspect(|s| Ok(s.clone()))?,
@@ -280,7 +310,7 @@ impl SqlSession {
                             self.search_path.clone(),
                         ))
                     });
-                    (Arc::new(s.sql), None, context)
+                    (Arc::new(s.sql), None, context, None)
                 }
             };
             match Plan::new(&image, &p, params, context.clone()).map_err(CoreError::Sql)? {
@@ -292,6 +322,8 @@ impl SqlSession {
                     },
                     clock: context,
                     tag: self.release_tag(),
+                    scope,
+                    meter: Default::default(),
                 }),
                 None => self.buffer_cursor(&p, params, clock, buffer_limit),
             }
@@ -324,6 +356,8 @@ impl SqlSession {
             },
             clock: None,
             tag,
+            scope: None,
+            meter: Default::default(),
         })
     }
 }

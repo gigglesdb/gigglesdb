@@ -21,7 +21,7 @@ use super::definition::{PredicateText, TaskDef};
 use super::effects::{Effects, RowEffect};
 use super::error::{Budget, DenyRule};
 use super::records::MutationHead;
-use crate::relational::task_predicate::RowPredicate;
+use crate::relational::RowPredicate;
 use crate::relational::{Relational, SqlRow, TableDef};
 
 /// What kind of protected request is being decided.
@@ -160,12 +160,12 @@ fn policy(
     Ok(())
 }
 
-fn compile<'a>(
-    state: &'a Relational,
-    text: &'a PredicateText,
-    table: &'a TableDef,
-) -> Result<RowPredicate<'a>, DenyRule> {
-    RowPredicate::compile(state, text, table).map_err(|_| DenyRule::DefinitionChanged)
+fn compile(
+    state: &Relational,
+    text: &PredicateText,
+    table: &TableDef,
+) -> Result<RowPredicate, DenyRule> {
+    RowPredicate::bind(state, table, &text.0).map_err(|_| DenyRule::DefinitionChanged)
 }
 
 fn rows(effect: &RowEffect) -> Result<(&SqlRow, &SqlRow), DenyRule> {
@@ -175,8 +175,8 @@ fn rows(effect: &RowEffect) -> Result<(&SqlRow, &SqlRow), DenyRule> {
     }
 }
 
-fn check(predicate: &RowPredicate<'_>, row: &SqlRow, rule: DenyRule) -> Result<(), DenyRule> {
-    match predicate.matches_row(row) {
+fn check(predicate: &RowPredicate, row: &SqlRow, rule: DenyRule) -> Result<(), DenyRule> {
+    match predicate.accepts_row(row) {
         Ok(true) => Ok(()),
         Ok(false) | Err(_) => Err(rule),
     }

@@ -503,3 +503,4 @@ mod v2_insert_select_spill;
 mod pgparity_concat;
 #[path = "pgparity_typeof.rs"]
 mod pgparity_typeof;
+#[path = "task_rows.rs"] mod task_rows;

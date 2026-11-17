@@ -16,6 +16,7 @@ pub(super) mod views;
 mod outer;
 mod exists;
 mod task_refs;
+pub(super) mod row_predicate;
 use subplans::{SubplanMode, Subplans};
 use exists::RetentionScope;
 pub(super) use functions::comparison_requires_filter;

@@ -423,6 +423,24 @@ fn predicate_expression(tokens: &[Token]) -> R<Filter> {
 pub(in crate::relational) fn constraint_shape(tokens: &[Token]) -> R<String> {
     Ok(format!("{:?}", predicate_expression(tokens)?))
 }
+/// Parses and binds a task predicate against `table` alone, once (GD-0061 R3-305):
+/// the parsed filter and its bound form for repeated evaluation. Callers validate
+/// first (`task_predicate::canonical`).
+pub(in crate::relational) fn constraint_bind(
+    state: &Relational,
+    table: &TableDef,
+    tokens: &[Token],
+) -> R<(Filter, BoundFilter)> {
+    let filter = predicate_expression(tokens)?;
+    let q = table_query(
+        table,
+        &relation_key(state.table_schema(table.id), &table.name),
+        filter.clone(),
+    );
+    let mut bound = q.bind(state, 0, &[])?;
+    let bound = bound.filter.take().ok_or(SqlError::Unsupported)?;
+    Ok((filter, bound))
+}
 /// Validates a task predicate against `table` alone (bound, deterministic) and lists
 /// the table columns it reads.
 pub(in crate::relational) fn constraint_columns(

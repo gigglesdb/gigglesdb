@@ -38,6 +38,8 @@ pub(crate) struct V2Db {
     /// The one wall clock for task expiry, receipts and retention (GD-0061
     /// ruling R7); tests replace it with a manual clock.
     wall_clock: std::sync::RwLock<Arc<dyn engine::commit::Clock>>,
+    /// Bound task visible-rows predicates (GD-0061 R3-305).
+    pub(crate) row_predicates: crate::task::rows::PredicateCache,
 }
 pub(super) fn format_error(error: engine::meta::FormatError) -> CoreError {
     match error {
@@ -168,6 +170,7 @@ impl V2Db {
             next_txn: AtomicU64::new(1),
             cluster: None,
             wall_clock: std::sync::RwLock::new(Arc::new(engine::commit::SystemClock)),
+            row_predicates: Default::default(),
         };
         db.reclaim_background()?;
         Ok(db)
@@ -237,6 +240,7 @@ impl V2Db {
             next_txn: AtomicU64::new(1),
             cluster: Some(services),
             wall_clock: std::sync::RwLock::new(Arc::new(engine::commit::SystemClock)),
+            row_predicates: Default::default(),
         })
     }
 
