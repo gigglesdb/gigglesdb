@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('setup','fresh-setup','dev-server','server','ping','server-query','sql','sql-query','native-query','capabilities','backup','export','topology','outbox-example','failover','distributed','range-history','check','build','test','clippy','fmt','docs')]
+    [ValidateSet('setup','fresh-setup','dev-server','server','ping','server-query','sql','sql-query','native-query','capabilities','backup','export','topology','outbox-example','failover','check','build','test','clippy','fmt','docs')]
     [string]$Task = 'setup',
     [string]$Crate = 'all',
     [switch]$Release,
@@ -129,8 +129,6 @@ try {
             Invoke-Cargo 'giggles-outbox' @('run','--locked','--example','orders','--',"$destination/orders.db")
         }
         'failover' { Invoke-Cargo 'giggles-server' @('test','--locked','--test','all','replication_process::three_process_failover','--','--exact','--nocapture') }
-        'distributed' { Invoke-Cargo 'giggles-distributed' @('test','--locked','--test','process','--','--test-threads=1','--nocapture') }
-        'range-history' { Invoke-Cargo 'giggles-range-history' @('test','--locked','--test','process','--','--test-threads=1','--nocapture') }
         default {
             $state = Read-State
             switch ($Task) {

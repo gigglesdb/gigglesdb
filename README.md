@@ -262,7 +262,7 @@ The local shell has trusted access to the database files. See the
   export/import, ledger, transactional outbox and fault-testing utilities.
 
 Start with the [SQL compatibility reference](crates/giggles-core/SQL.md),
-[distributed runtime guide](crates/giggles-distributed/README.md),
+[distributed transactions release notes](docs/release-notes/R5.md),
 [replication release notes](docs/release-notes/R4.md), or
 [native language guide](crates/giggles-language/README.md).
 Each crate documents its supported behavior and current limits.
@@ -276,7 +276,6 @@ machines, each with a `replication` section in its configuration:
 | Binary | Use |
 | --- | --- |
 | `giggles-server` | Single-host application SQL and scoped task service; with a `replication` section, one voter of a three-voter replicated database |
-| `giggles-ranges` (`giggles-distributed`) | Multi-range runtime, transactions and membership operations through trusted owner controls |
 
 To exercise a real three-process cluster with generated mTLS credentials, run
 from the repository root:
@@ -290,7 +289,7 @@ This launches three actual server processes, kills the leader and reconnects
 with a multi-host connection string. The
 [replication release notes](docs/release-notes/R4.md) describe the configuration,
 how clients connect, lost replies and replacing a lost machine. See the
-[multi-range guide](crates/giggles-distributed/README.md) for `giggles-ranges`.
+[distributed transactions release notes](docs/release-notes/R5.md) for isolation levels in a cluster.
 
 ## Development
 
