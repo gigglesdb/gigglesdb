@@ -4,16 +4,87 @@
 # Writes /home/user/gate/{progress,summary.txt,done,<step>-*.log}.
 # done holds rc=0 when every step built, clippy passed, and every failing test
 # is listed in gate-linux-expected-failures.txt; rc=1 otherwise.
-source "$HOME/gate.env"
-out=/home/user/gate
-rm -rf "$out"; mkdir -p "$out"
-expected=/home/user/gate-linux-expected-failures.txt
-summary=$out/summary.txt
-overall=0
 note() { echo "$*" >> "$summary"; }
 progress() { echo "$(date -u +%T) $*" >> "$out/progress"; }
 # Whole-command rerun only for an infrastructure failure that produced no test results.
-flaky() { grep -qE 'LNK1171|out of memory|SIGKILL|signal: 9|^Killed' "$1" && ! grep -qE '^test result' "$1"; }
+flaky() {
+  grep -qE 'LNK1171|out of memory|SIGKILL|signal: 9|^Killed' "$1" &&
+    ! grep -qE '^test result' "$1" &&
+    ! grep -qE 'has overflowed its stack|fatal runtime error|SIGABRT|signal: 6([, )]|$)' "$1"
+}
+
+# Cargo can continue after an aborted binary. Track every Running section,
+# including ones followed by successful binaries, rather than just its totals.
+aborted_binaries() {
+  awk '
+    function binary(path) { sub(/^.*[/\\]/, "", path); return path }
+    function start(label, path) {
+      active = ++count
+      names[active] = label
+      paths[path] = active
+      bins[binary(path)] = active
+    }
+    /^[[:space:]]*Running[[:space:]]/ {
+      label = $0
+      sub(/^[[:space:]]*Running[[:space:]]+/, "", label)
+      sub(/^unittests[[:space:]]+/, "", label)
+      path = label
+      sub(/^.* \(/, "", path); sub(/\)$/, "", path)
+      sub(/ \(.*$/, "", label)
+      start(label " (" binary(path) ")", path)
+      next
+    }
+    /^[[:space:]]*Doc-tests[[:space:]]/ { active = 0; next }
+    /^test result:/ { if (active) complete[active] = 1 }
+    /^test [^ ]+ \.\.\./ { if (active) last[active] = $2 }
+    /has overflowed its stack|fatal runtime error/ {
+      if (active) {
+        runtime[active] = $0
+        sub(/^[[:space:]]+/, "", runtime[active])
+        # The thread name may be on its own line when harness output interleaves.
+        if ($0 ~ /has overflowed its stack/ && $0 ~ /\047/) {
+          test = $0
+          sub(/^.*thread \047/, "", test); sub(/\047.*$/, "", test)
+          if (test != "") last[active] = test
+        }
+      }
+    }
+    /process didn.t exit successfully|\(signal: [0-9]+/ {
+      target = active
+      if ($0 ~ /process didn.t exit successfully/) {
+        path = $0
+        sub(/^[^`]*`/, "", path); sub(/`.*$/, "", path)
+        sub(/ .*/, "", path)
+        target = paths[path]
+        if (!target) target = bins[binary(path)]
+        if (!target) {
+          previous = active
+          start(binary(path), path)
+          target = active
+          active = previous
+        }
+      }
+      if (target) {
+        reason = $0
+        if (reason ~ /\(signal: [0-9]+/) {
+          sub(/^.*\(signal: /, "signal ", reason); sub(/\).*$/, "", reason)
+        } else {
+          sub(/^[[:space:]]+/, "", reason)
+        }
+        errors[target] = reason
+      }
+    }
+    END {
+      for (i = 1; i <= count; i++) {
+        if (complete[i] && runtime[i] == "" && errors[i] == "") continue
+        reason = errors[i]
+        if (runtime[i] != "") reason = runtime[i] (reason == "" ? "" : "; " reason)
+        if (reason == "") reason = "no test result: line"
+        print "BINARY ABORTED: " names[i] " " reason ", last test started: " (last[i] == "" ? "unknown" : last[i])
+      }
+    }
+  ' "$1"
+}
 
 # run_logged <log> <cmd...>: run once, rerun once on an infrastructure flake.
 run_logged() {
@@ -26,20 +97,26 @@ run_logged() {
   return $rc
 }
 
+retry_test() {
+  (cd "$1" && cargo test --no-fail-fast "${feat[@]}" -- --exact "$2")
+}
+
 check_tests() { # check_tests <crate> <log> <rc>
-  local crate=$1 log=$2 rc=$3 results fails unexpected
+  local crate=$1 log=$2 rc=$3 results fails unexpected flakes aborted t
   results=$(grep -E '^test result' "$log")
   local p f
   p=$(echo "$results" | awk '{s+=$4} END {print s+0}')
   f=$(echo "$results" | awk '{s+=$6} END {print s+0}')
   fails=$(awk '/^failures:$/{x=1} x&&/^    [A-Za-z_:0-9]+$/{print $1} /^test result/{x=0}' "$log" | sort -u)
+  aborted=$(aborted_binaries "$log")
   unexpected='' flakes=''
   for t in $fails; do
     grep -qxF "$crate $t" "$expected" 2>/dev/null && continue
     # One exact rerun: a test that passes alone is recorded as a flake.
     local rr=$out/retry-$(echo "$t" | tr ':' '_').log
-    (cd "$crate" && cargo test --no-fail-fast "${feat[@]}" -- --exact "$t") > "$rr" 2>&1
-    if [ "$(grep -E '^test result' "$rr" | awk '{p+=$4; f+=$6} END {print (p>=1 && f==0) ? "ok" : "bad"}')" = ok ]; then
+    if retry_test "$crate" "$t" > "$rr" 2>&1 &&
+      [ -z "$(aborted_binaries "$rr")" ] &&
+      [ "$(grep -E '^test result' "$rr" | awk '{p+=$4; f+=$6} END {print (p>=1 && f==0) ? "ok" : "bad"}')" = ok ]; then
       flakes+="$t"$'\n'
     else
       unexpected+="$t"$'\n'
@@ -49,13 +126,15 @@ check_tests() { # check_tests <crate> <log> <rc>
     note "  FLAKY (failed in the full run, passed alone):"; printf '%s' "$flakes" | sed 's/^/    /' >> "$summary"
   fi
   note "  tests: passed=$p failed=$f (expected Linux-only: $(( f - $(printf '%s' "$unexpected$flakes" | grep -c . ) )))"
+  if [ -n "$unexpected$aborted" ]; then
+    note "  UNEXPECTED FAILURES:"
+    printf '%s' "$unexpected" | sed 's/^/    /' >> "$summary"
+    if [ -n "$aborted" ]; then printf '%s\n' "$aborted" | sed 's/^/    /' >> "$summary"; fi
+    return 1
+  fi
   if [ -z "$results" ] && [ "$rc" -ne 0 ]; then
     note "  BUILD/RUN ERROR (no test results), first errors:"
     grep -E '^error(\[|:)' "$log" | head -5 | sed 's/^/    /' >> "$summary"
-    return 1
-  fi
-  if [ -n "$unexpected" ]; then
-    note "  UNEXPECTED FAILURES:"; printf '%s' "$unexpected" | sed 's/^/    /' >> "$summary"
     return 1
   fi
   # rc != 0 with only expected failures is a pass; rc != 0 with no failures
@@ -65,6 +144,15 @@ check_tests() { # check_tests <crate> <log> <rc>
   fi
   return 0
 }
+
+# Sourcing exposes the log checks without starting a gate or invoking cargo.
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then return 0; fi
+source "$HOME/gate.env"
+out=/home/user/gate
+rm -rf "$out"; mkdir -p "$out"
+expected=/home/user/gate-linux-expected-failures.txt
+summary=$out/summary.txt
+overall=0
 
 cd /home/user/gigglesdb/crates || exit 1
 # Temp files on tmpfs (RocksDB/fsync-heavy tests ran 3-10x slower on the box
