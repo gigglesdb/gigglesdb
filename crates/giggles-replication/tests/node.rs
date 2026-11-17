@@ -211,6 +211,109 @@ fn deposed_leader_fails_uncommitted_waiter() {
     assert!(c.states[0].applied_batches().is_empty());
 }
 #[test]
+fn restarted_proposer_never_acks_a_recycled_context() {
+    let mut c = Cluster::new(3);
+    c.elect();
+    c.nodes[0].propose(b"old-1", 1).unwrap();
+    let old_index = c.nodes[0].last_index();
+    assert_eq!(
+        c.settle(false)
+            .into_iter()
+            .flat_map(|o| o.applied)
+            .collect::<Vec<_>>(),
+        vec![(1, old_index)]
+    );
+    c.nodes[0].propose(b"old-2", 2).unwrap();
+    let overwritten_index = c.nodes[0].last_index();
+    let isolated = c.settle(true);
+    assert!(
+        isolated
+            .iter()
+            .all(|o| o.applied.is_empty() && o.failed.is_empty())
+    );
+    for _ in 0..25 {
+        c.nodes[1].set_election_timeout(10);
+        c.nodes[2].set_election_timeout(19);
+        c.nodes[1].tick();
+        c.nodes[2].tick();
+        c.settle(true);
+    }
+    assert_eq!(c.nodes[1].role().state, StateRole::Leader);
+    for _ in 0..2 {
+        c.nodes[1].tick();
+    }
+    let mut outputs = c.settle(false);
+    assert!(c.nodes[0].applied_index() >= overwritten_index);
+    assert_eq!(
+        outputs
+            .iter()
+            .flat_map(|o| o.failed.iter().copied())
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+
+    drop(c.nodes.remove(0));
+    c.nodes.insert(
+        0,
+        Replica::new(
+            LogStore::open(&c.dir.join("1"), [7; 16], 1).unwrap(),
+            c.states[0].clone(),
+            &[1, 2, 3],
+        )
+        .unwrap(),
+    );
+    outputs.extend(c.settle(false));
+    c.nodes[1].transfer_leader(1);
+    outputs.extend(c.settle(false));
+    assert_eq!(c.nodes[0].role().state, StateRole::Leader);
+    c.nodes[0].propose(b"new", 1).unwrap();
+    let new_index = c.nodes[0].last_index();
+    assert!(new_index > overwritten_index);
+    outputs.extend(c.settle(false));
+    outputs.extend(c.settle(false));
+    assert_eq!(
+        outputs
+            .iter()
+            .flat_map(|o| o.applied.iter().copied())
+            .collect::<Vec<_>>(),
+        vec![(1, new_index)]
+    );
+    assert_eq!(
+        outputs
+            .iter()
+            .flat_map(|o| o.failed.iter().copied())
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    for state in &c.states {
+        let batches = state.applied_batches();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|(at, b)| (at.index, b.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![
+                (old_index, b"old-1".as_slice()),
+                (new_index, b"new".as_slice())
+            ]
+        );
+    }
+    let context_at = |index| {
+        c.nodes[0]
+            .log()
+            .entries(
+                index,
+                index + 1,
+                None,
+                raft::GetEntriesContext::empty(false),
+            )
+            .unwrap()[0]
+            .context
+            .clone()
+    };
+    assert_eq!(context_at(old_index), context_at(new_index));
+}
+#[test]
 fn peer_validation_and_fatal_apply() {
     use raft::eraftpb::{Entry, EntryType, Message, Snapshot, SnapshotMetadata};
     let mut c = Cluster::new(1);

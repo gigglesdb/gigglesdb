@@ -146,6 +146,109 @@ fn corrupt_file_rejected_before_raft_delivery() {
     transfer(false, true);
 }
 
+#[test]
+fn busy_peer_snapshot_reports_failure_and_releases_its_permit() {
+    let root = std::env::temp_dir().join(format!("snapshot-busy-peer-{}", std::process::id()));
+    let pki = make_pki(&root.join("pki"), &[1, 2]);
+    let listeners: Vec<_> = (0..2)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let addresses: BTreeMap<_, _> = listeners
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (i as u64 + 1, l.local_addr().unwrap().to_string()))
+        .collect();
+    drop(listeners);
+    let cluster = [75; 16];
+    let one_store = Arc::new(SnapshotStore::open(&root.join("one"), cluster).unwrap());
+    let two_store = Arc::new(SnapshotStore::open(&root.join("two"), cluster).unwrap());
+    let manifest = one_store
+        .build(42, 7, &conf(&[1, 2]), &[], |dir| {
+            fs::create_dir_all(dir)?;
+            fs::write(dir.join("checkpoint"), vec![91; 768 << 10])?;
+            Ok(())
+        })
+        .unwrap();
+    let one_sink = Arc::new(Collect::default());
+    let two_sink = Arc::new(Collect::default());
+    let two = Transport::start(
+        config_for(&pki, 2, cluster, &addresses),
+        two_sink.clone(),
+        Some(two_store),
+    )
+    .unwrap();
+
+    // Hold TLS handshakes at a relay: the first snapshot cannot finish or fail
+    // while the gate is closed, regardless of snapshot size or disk speed.
+    let relay = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let relay_address = listener.local_addr().unwrap().to_string();
+    listener.set_nonblocking(true).unwrap();
+    let listener = {
+        let _entered = relay.enter();
+        tokio::net::TcpListener::from_std(listener).unwrap()
+    };
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let destination = addresses[&2].clone();
+    relay.spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            let mut gate = gate.clone();
+            let destination = destination.clone();
+            tokio::spawn(async move {
+                if gate.wait_for(|open| *open).await.is_err() {
+                    return;
+                }
+                let mut outbound = tokio::net::TcpStream::connect(destination).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+        }
+    });
+    let mut config = config_for(&pki, 1, cluster, &addresses);
+    config.peers.get_mut(&2).unwrap().address = relay_address;
+    let one = Transport::start(config, one_sink.clone(), Some(one_store)).unwrap();
+    let mut message = Message {
+        from: 1,
+        to: 2,
+        term: 7,
+        msg_type: MessageType::MsgSnapshot,
+        ..Default::default()
+    };
+    message.set_snapshot(manifest.to_raft());
+    let mut outbox = one.outbox();
+    outbox.send(message.clone());
+    outbox.send(message.clone());
+    wait(|| !one_sink.statuses.lock().unwrap().is_empty());
+    assert_eq!(*one_sink.statuses.lock().unwrap(), vec![(2, false)]);
+    assert!(two_sink.messages.lock().unwrap().is_empty());
+
+    release.send(true).unwrap();
+    wait(|| one_sink.statuses.lock().unwrap().len() == 2);
+    assert_eq!(
+        *one_sink.statuses.lock().unwrap(),
+        vec![(2, false), (2, true)]
+    );
+    outbox.send(message.clone());
+    wait(|| one_sink.statuses.lock().unwrap().len() == 3);
+    assert_eq!(
+        *one_sink.statuses.lock().unwrap(),
+        vec![(2, false), (2, true), (2, true)]
+    );
+    wait(|| two_sink.messages.lock().unwrap().len() == 2);
+    assert_eq!(
+        *two_sink.messages.lock().unwrap(),
+        vec![(1, message.clone()), (1, message)]
+    );
+    drop(outbox);
+    one.shutdown();
+    two.shutdown();
+    drop(relay);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn conf(v: &[u64]) -> raft::eraftpb::ConfState {
     let mut cs = raft::eraftpb::ConfState::default();
     cs.set_voters(v.to_vec());
