@@ -103,6 +103,9 @@ pub struct Snapshot {
     pub user_routines: Vec<String>,
     /// Search path.
     pub search_path: Vec<String>,
+    /// Exact schema names captured by the loader, when provenance is known.
+    #[serde(default)]
+    pub captured_schemas: Option<Vec<String>>,
     /// SHA-256 of canonically ordered relations, dependents, and routine names.
     pub fingerprint: [u8; 32],
     /// Snapshot capture time in milliseconds since the Unix epoch.
@@ -120,11 +123,19 @@ impl Snapshot {
             relations,
             dependents,
             search_path,
+            captured_schemas: None,
             user_routines: vec![],
             fingerprint: [0; 32],
             taken_at_unix_ms,
         }
         .with_user_routines(vec![])
+    }
+    /// Record captured schema names without changing the schema fingerprint.
+    pub fn with_captured_schemas(mut self, mut schemas: Vec<String>) -> Self {
+        schemas.sort();
+        schemas.dedup();
+        self.captured_schemas = Some(schemas);
+        self
     }
     /// Canonicalize user routine names and include them in the schema fingerprint.
     pub fn with_user_routines(mut self, names: Vec<String>) -> Snapshot {
@@ -185,6 +196,23 @@ mod tests {
             view_definition: None,
             primary_key: vec![],
         }
+    }
+    #[test]
+    fn captured_schemas_preserve_fingerprint_and_default_for_legacy_snapshots() {
+        let base = Snapshot::new(vec![], vec![], vec!["public".into()], 0);
+        assert_eq!(base.captured_schemas, None);
+        let captured = base.clone().with_captured_schemas(vec![
+            "public".into(), "Other".into(), "public".into(),
+        ]);
+        assert_eq!(captured.captured_schemas, Some(vec!["Other".into(), "public".into()]));
+        assert_eq!(captured.fingerprint, base.fingerprint);
+        assert_eq!(captured.clone().with_user_routines(vec![]).fingerprint, base.fingerprint);
+        assert_eq!(serde_json::from_slice::<Snapshot>(&serde_json::to_vec(&captured).unwrap()).unwrap(), captured);
+        let mut legacy = serde_json::to_value(&base).unwrap();
+        legacy.as_object_mut().unwrap().remove("captured_schemas");
+        let restored: Snapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.captured_schemas, None);
+        assert_eq!(restored, base);
     }
     #[test]
     fn user_routines_are_canonical() {

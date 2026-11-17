@@ -12,6 +12,7 @@ const VIEW: &str =
     "SELECT view_definition FROM information_schema.views WHERE table_schema=$1 AND table_name=$2";
 const PRIMARY_KEY: &str = "SELECT column_name FROM information_schema.index_columns WHERE table_schema=$1 AND table_name=$2 AND index_type='PRIMARY_KEY' ORDER BY ordinal_position";
 const STREAM_CATALOGS: &str = "SELECT table_name FROM information_schema.tables WHERE table_schema='information_schema' AND table_name IN ('change_streams','change_stream_tables','change_stream_columns')";
+const SCHEMAS: &str = "SELECT schema_name FROM information_schema.schemata WHERE ((COALESCE(array_length($1::text[],1),0)>0 AND schema_name=ANY($1)) OR (COALESCE(array_length($1::text[],1),0)=0 AND schema_name NOT IN ('information_schema','pg_catalog','spanner_sys'))) ORDER BY schema_name";
 const STREAMS: &str =
     "SELECT change_stream_name,CAST(\"all\" AS text) FROM information_schema.change_streams";
 const STREAM_TABLES: &str = "SELECT change_stream_name,table_schema,table_name FROM information_schema.change_stream_tables";
@@ -72,6 +73,13 @@ pub async fn load_spanner_pg_snapshot(
     now_unix_ms: u64,
 ) -> Result<Snapshot, Refusal> {
     let selected = schemas.to_vec();
+    let captured_schemas = client
+        .query(SCHEMAS, &[&selected])
+        .await
+        .map_err(|_| unavailable())?
+        .iter()
+        .map(|row| get::<String>(row, 0))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut relations = Vec::new();
     for row in client
         .query(TABLES, &[&selected])
@@ -219,7 +227,7 @@ pub async fn load_spanner_pg_snapshot(
         dependents,
         search_path.to_vec(),
         now_unix_ms,
-    ))
+    ).with_captured_schemas(captured_schemas))
 }
 
 /// Map Spanner PostgreSQL type names while preserving unsupported types.

@@ -185,7 +185,8 @@ pub async fn load_pg_snapshot(
             .collect::<Result<Vec<_>, _>>()?;
         Ok(
             Snapshot::new(relations, dependents, opts.search_path.clone(), now_unix_ms)
-                .with_user_routines(routines),
+                .with_user_routines(routines)
+                .with_captured_schemas(schemas),
         )
     }
     .await;

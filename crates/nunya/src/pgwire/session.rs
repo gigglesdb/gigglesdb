@@ -149,6 +149,10 @@ impl Session {
     }
     fn snapshot(&mut self) -> Result<Arc<crate::schema::Snapshot>, Refusal> {
         let current = self.ctx.snapshot.read().map_err(|_| protocol())?.clone();
+        let captured = current.captured_schemas.as_ref().unwrap_or(&current.search_path);
+        if !self.pinned_path.iter().all(|schema| captured.contains(schema)) {
+            return Err(failure(NyCode::SessionEnded));
+        }
         if current.search_path == self.pinned_path { return Ok(current); }
         if let Some((source, pinned)) = &self.snapshot_cache
             && Arc::ptr_eq(source, &current)
@@ -1550,6 +1554,94 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reload_uncaptured_pinned_path_refuses_simple_query() {
+        assert_uncaptured_pinned_path_refused(false);
+    }
+
+    #[test]
+    fn reload_uncaptured_pinned_path_refuses_extended_parse() {
+        assert_uncaptured_pinned_path_refused(true);
+    }
+
+    fn assert_uncaptured_pinned_path_refused(extended: bool) {
+        for (captured, path) in [
+            (Some(vec!["public".into()]), vec!["public".into()]),
+            (Some(vec!["Other".into(), "public".into()]), vec!["other".into(), "public".into()]),
+            (Some(vec![]), vec!["other".into(), "public".into()]),
+            (None, vec!["public".into()]),
+        ] {
+            let f = Fixture::new();
+            let mut snapshot = (**f.ctx.snapshot.read().unwrap()).clone();
+            snapshot.search_path = vec!["other".into(), "public".into()];
+            snapshot = snapshot.with_captured_schemas(vec!["other".into(), "public".into()]);
+            *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot.clone());
+            let mut session = f.session();
+            // Populate the cache first, then replace its source with an invalid capture.
+            snapshot.search_path = vec!["public".into(), "other".into()];
+            *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot.clone());
+            assert!(session.snapshot().is_ok());
+            snapshot.search_path = path;
+            snapshot.captured_schemas = captured;
+            *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot);
+            let sql = "SELECT value FROM items";
+            let out = session.frontend(if extended {
+                Frontend::Parse { name: "s".into(), query: sql.into(), param_types: vec![] }
+            } else {
+                Frontend::Query(sql.into())
+            });
+            assert_eq!(code(&out), "NY011");
+            assert!(out.close);
+            assert!(out.upstream.is_empty());
+            assert_eq!(out.client.len(), 1);
+            let records = f.identities.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(matches!(records[0].outcome, Outcome::Refused(NyCode::SessionEnded)));
+            assert_eq!(records[0].statement, sql);
+            assert_eq!(records[0].rows, 0);
+            assert!(records[0].tokens_released.is_empty());
+            assert_eq!(f.allowed_records.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn reload_unknown_capture_accepts_fully_present_pinned_path() {
+        for extended in [false, true] {
+            let f = Fixture::new();
+            let mut snapshot = (**f.ctx.snapshot.read().unwrap()).clone();
+            let mut plain = snapshot.relations[0].clone();
+            plain.schema = "other".into();
+            snapshot.relations.push(plain);
+            snapshot.search_path = vec!["public".into(), "other".into()];
+            *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot.clone());
+            let mut session = f.session();
+            snapshot.search_path = vec!["other".into(), "public".into()];
+            *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot);
+            let pinned = session.snapshot().unwrap();
+            assert_eq!(pinned.captured_schemas, None);
+            assert_eq!(pinned.resolve_relation(None, "items").unwrap().schema, "public");
+            assert!(Arc::ptr_eq(&pinned, &session.snapshot().unwrap()));
+            if extended {
+                prepare_admission_portal(&mut session, "SELECT value FROM items");
+                let out = session.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 });
+                assert!(!out.close);
+                assert_eq!(out.upstream.len(), 1);
+            } else {
+                let out = session.frontend(Frontend::Query("SELECT value FROM items".into()));
+                assert!(!out.close);
+                assert_eq!(out.upstream.len(), 1);
+            }
+            session.backend(Backend::RowDescription(vec![field()]));
+            let out = session.backend(Backend::DataRow(vec![Some(b"private".to_vec())]));
+            let row = out.client.iter().find_map(|message| match message {
+                Backend::DataRow(row) => Some(row),
+                _ => None,
+            }).unwrap();
+            assert!(row[0].is_some());
+            assert_ne!(row[0].as_deref(), Some(b"private".as_slice()));
+        }
+    }
+
+    #[test]
     fn reload_pins_simple_and_extended_resolution_and_caches_each_catalog() {
         for extended in [false, true] {
             let f = Fixture::new();
@@ -1557,6 +1649,7 @@ pub(crate) mod tests {
             let mut plain = snapshot.relations[0].clone();
             plain.schema = "other".into();
             snapshot.relations.push(plain);
+            snapshot = snapshot.with_captured_schemas(vec!["public".into(), "other".into()]);
             *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot.clone());
             let mut old = f.session();
             snapshot.search_path = vec!["other".into()];
