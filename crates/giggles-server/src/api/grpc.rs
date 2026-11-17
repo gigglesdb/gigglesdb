@@ -47,8 +47,9 @@ impl Giggles for Rpc {
             .get::<Context>()
             .ok_or_else(|| ApiError::Internal.grpc_status())?;
         check_deadline(context)?;
+        let task = request.get_ref().task.as_deref();
         self.runtime
-            .open(&context.identity)
+            .open_task(&context.identity, task)
             .map(RpcResponse::new)
             .map_err(ApiError::grpc_status)
     }

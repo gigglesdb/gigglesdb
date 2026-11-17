@@ -463,7 +463,7 @@ mod tests {
             Err(ApiError::PayloadTooLarge)
         );
         assert!(
-            encode_protobuf(&proto::OpenSessionRequest {}, 0)
+            encode_protobuf(&proto::OpenSessionRequest::default(), 0)
                 .unwrap()
                 .is_empty()
         );

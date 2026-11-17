@@ -7,7 +7,11 @@ service Giggles {
   rpc CloseSession(CloseSessionRequest) returns (CloseSessionReply);
 }
 
-message OpenSessionRequest {}
+message OpenSessionRequest {
+  // GD-0061 R3-208: the task of an agent session; only the agent listeners
+  // accept it.
+  optional string task = 1;
+}
 message OpenSessionReply {
   string session_id = 1;
   uint32 idle_timeout_seconds = 2;

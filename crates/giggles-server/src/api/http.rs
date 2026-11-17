@@ -83,8 +83,8 @@ pub(crate) async fn handle(
     };
     let received = Instant::now();
     let result = match route {
-        Route::Open => json::decode_empty(&bytes)
-            .and_then(|()| runtime.open(&identity))
+        Route::Open => json::decode_open(&bytes)
+            .and_then(|open| runtime.open_task(&identity, open.task.as_deref()))
             .and_then(|reply| json::encode_open(&reply))
             .map(|bytes| (StatusCode::CREATED, bytes, None)),
         Route::Close => {

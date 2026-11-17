@@ -1,7 +1,9 @@
 //! Authorized typed execution on the existing retained Session.
 use super::codec::Invocation;
 use crate::{Role, Session};
-use giggles_core::{CoreError, Error, operations as ops, relational::SqlError};
+use giggles_core::{
+    CoreError, Error, operations as ops, relational::SqlError, task::StatementClass,
+};
 
 pub(crate) enum NativeResult {
     Control,
@@ -131,12 +133,59 @@ fn catalog_table(session: &Session, request: &ops::CatalogRequest) -> String {
     format!("{schema}.{name}")
 }
 
+/// The task statement class of a native request. A native transaction is an
+/// explicit transaction, so it is `TransactionControl` as a whole.
+fn task_class(invocation: &Invocation) -> Result<StatementClass, CoreError> {
+    fn request_class(request: &ops::Request) -> StatementClass {
+        match request {
+            ops::Request::Read { .. } | ops::Request::ReadExpressions { .. } => {
+                StatementClass::Select
+            }
+            ops::Request::Update { .. } | ops::Request::UpdateExpressions { .. } => {
+                StatementClass::Update
+            }
+            ops::Request::Delete { .. } => StatementClass::Delete,
+            ops::Request::Insert { .. }
+            | ops::Request::InsertExpressions { .. }
+            | ops::Request::InsertMany { .. }
+            | ops::Request::OnConflict { .. } => StatementClass::Insert,
+            ops::Request::Returning { request, .. } => match request.as_ref() {
+                ops::Request::Returning { .. } => StatementClass::Other,
+                inner => request_class(inner),
+            },
+        }
+    }
+    Ok(match invocation {
+        Invocation::Operation { request, .. } | Invocation::Page { request, .. } => {
+            request_class(request)
+        }
+        Invocation::Read(_) | Invocation::Join(_) => StatementClass::Select,
+        Invocation::Transaction { .. }
+        | Invocation::Begin
+        | Invocation::Commit
+        | Invocation::Rollback => StatementClass::TransactionControl,
+        Invocation::Savepoint(_) | Invocation::RollbackTo(_) | Invocation::Release(_) => {
+            StatementClass::Savepoint
+        }
+        Invocation::Catalog(_) => StatementClass::Ddl,
+        Invocation::Sequence(_) => StatementClass::Other,
+        Invocation::SearchPath(None) => StatementClass::Show,
+        Invocation::SearchPath(Some(_)) => StatementClass::Set,
+        Invocation::Legacy(_) | Invocation::Text { .. } => return Err(CoreError::Unsupported),
+    })
+}
+
 pub(crate) fn run(
     session: &mut Session,
     invocation: Invocation,
 ) -> Result<NativeResult, CoreError> {
     let result = (|| {
         session.check_binding()?;
+        // GD-0061 R3-208: a task session admits the class before any
+        // resolution, authorization or execution, as on the agent pgwire path.
+        if session.task().is_some() {
+            session.admit_backstop(task_class(&invocation)?)?;
+        }
         if let Invocation::Catalog(request) = &invocation {
             return session.authority_scope(|session| {
                 session.authorize_native_catalog(request)?;

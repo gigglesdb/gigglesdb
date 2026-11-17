@@ -158,7 +158,7 @@ async fn http_and_grpc_reject_wrong_ca_and_expired_bound_certificates() {
         if let Ok(channel) = endpoint.connect().await {
             let mut client = proto::giggles_client::GigglesClient::new(channel);
             let error = client
-                .open_session(proto::OpenSessionRequest {})
+                .open_session(proto::OpenSessionRequest::default())
                 .await
                 .unwrap_err();
             assert_ne!(
@@ -423,7 +423,7 @@ async fn grpc_typed_values_and_close_discard_uncommitted_rows() {
     let f = Fixture::new().await;
     let mut client = f.grpc_client(&f.app).await;
     let token = client
-        .open_session(proto::OpenSessionRequest {})
+        .open_session(proto::OpenSessionRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -531,7 +531,7 @@ async fn identity_binding_and_remove_readd_fence_sessions() {
     f.runtime.invalidate_bindings();
     f.service.reload_bindings(f.bindings.clone()).unwrap();
     let err = client
-        .open_session(proto::OpenSessionRequest {})
+        .open_session(proto::OpenSessionRequest::default())
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -666,7 +666,7 @@ async fn shared_logical_session_capacity_and_zero_deadline() {
     let mut client = f.grpc_client(&f.app).await;
     assert_eq!(
         client
-            .open_session(proto::OpenSessionRequest {})
+            .open_session(proto::OpenSessionRequest::default())
             .await
             .unwrap_err()
             .code(),
@@ -692,7 +692,7 @@ async fn shared_logical_session_capacity_and_zero_deadline() {
         .await
         .unwrap();
     let next = client
-        .open_session(proto::OpenSessionRequest {})
+        .open_session(proto::OpenSessionRequest::default())
         .await
         .unwrap()
         .into_inner()

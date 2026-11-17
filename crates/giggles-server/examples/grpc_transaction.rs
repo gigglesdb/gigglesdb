@@ -62,7 +62,7 @@ async fn main() -> Result<(), Error> {
     let mut client =
         GigglesClient::new(channel).max_decoding_message_size(giggles_server::MAX_RESPONSE);
     let session = client
-        .open_session(proto::OpenSessionRequest {})
+        .open_session(proto::OpenSessionRequest::default())
         .await?
         .into_inner()
         .session_id;

@@ -20,6 +20,6 @@ pub mod proto {
         tonic::include_file_descriptor_set!("giggles_descriptor");
 }
 
-pub use dispatch::{ApiRuntime, CallOwnership, Completion, Encoding, ResponseLease};
+pub use dispatch::{ApiRuntime, CallOwnership, Completion, Encoding, ListenerKind, ResponseLease};
 pub use identity::ConnectionIdentity;
 pub use limits::ApiLimits;

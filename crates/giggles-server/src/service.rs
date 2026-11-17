@@ -464,6 +464,23 @@ impl Service {
 }
 impl Service {
     /// The agent accept loop's first check: the certificate is in the agent map.
+    /// The executor role and epoch of an agent-map entry (R3-208 API identity).
+    pub(crate) fn agent_entry(&self, fingerprint: &str) -> Option<(String, u64)> {
+        let current = self.agent.lock().ok()?;
+        current
+            .entries
+            .get(fingerprint)
+            .map(|(entry, epoch)| (entry.executor.clone(), *epoch))
+    }
+    /// The role exists and is a login, task-only, non-superuser role.
+    pub(crate) fn agent_executor_valid(&self, name: &str) -> bool {
+        self.admin
+            .roles()
+            .get(name)
+            .ok()
+            .flatten()
+            .is_some_and(|role| crate::agent::bindings::executor_role(&role))
+    }
     pub(crate) fn agent_known(&self, fingerprint: &str) -> bool {
         self.agent
             .lock()
@@ -809,7 +826,7 @@ impl Session {
     /// Backstop for every internal path of a task session (design-2 section 4,
     /// call site 5): the class must be admitted. An UPDATE passes only inside
     /// `execute_protected`; outside it, it needs an operation ID.
-    fn admit_backstop(
+    pub(crate) fn admit_backstop(
         &mut self,
         class: giggles_core::task::StatementClass,
     ) -> Result<(), CoreError> {
@@ -2310,7 +2327,11 @@ impl Session {
                 Request::Ping => Ok(Response::code("ok")),
                 // Certificate-bound SQL roles are provisioned for future native
                 // privilege enforcement; this does not expose the SQL interface.
-                Request::Sql { .. } if self.fingerprint_bound && self.role_fence.is_some() => {
+                // An agent session's SQL reaches the task admission backstop in
+                // `authorize` instead (GD-0061 R3-208).
+                Request::Sql { .. }
+                    if self.fingerprint_bound && self.role_fence.is_some() && !self.agent =>
+                {
                     Err(CoreError::Policy(Error::Scope))
                 }
                 Request::Sql { sql, params } => Ok(Response {

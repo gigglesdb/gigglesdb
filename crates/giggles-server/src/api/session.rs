@@ -96,9 +96,28 @@ impl Registry {
         self.clock.now()
     }
 
+    /// Test shorthand for an open without a task.
+    #[cfg(test)]
     pub(crate) fn open(&self, owner: &ConnectionIdentity) -> Result<String, ApiError> {
+        self.open_task(owner, None)
+    }
+
+    /// `task` selects the task of an agent session (GD-0061 R3-208); an
+    /// ordinary identity must not send one.
+    pub(crate) fn open_task(
+        &self,
+        owner: &ConnectionIdentity,
+        task: Option<&str>,
+    ) -> Result<String, ApiError> {
         if self.stopping.load(Ordering::Acquire) {
             return Err(ApiError::Unavailable);
+        }
+        if task.is_some() && !owner.agent {
+            return Err(ApiError::InvalidArgument);
+        }
+        if let Some(task) = task {
+            giggles_core::task::definition::TaskName::new(task)
+                .map_err(|_| ApiError::InvalidArgument)?;
         }
         owner.check(&self.service)?;
         let slot = self
@@ -106,10 +125,17 @@ impl Registry {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ApiError::ResourceExhausted)?;
-        let session = self
-            .service
-            .session(&owner.fingerprint)
-            .map_err(|_| ApiError::Unauthenticated)?;
+        let session = if owner.agent {
+            self.service.agent_session(&owner.fingerprint, task)
+        } else {
+            self.service.session(&owner.fingerprint)
+        }
+        .map_err(|error| {
+            if owner.agent {
+                eprintln!("protocol=agent_api rejected stage=open reason={error:?}");
+            }
+            ApiError::Unauthenticated
+        })?;
         if session.epoch != owner.epoch || session.role != owner.role {
             return Err(ApiError::Unauthenticated);
         }

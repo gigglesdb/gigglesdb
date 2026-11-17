@@ -71,7 +71,18 @@ struct Job {
 
 /// Shared persistent sessions for the new listeners. Construct once per server
 /// and pass the same Arc to HTTP and gRPC; handles are local to this runtime.
+/// Which listeners a runtime serves. Each kind has its own runtime and
+/// registry, so a session token from one is `SESSION_NOT_FOUND` on the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenerKind {
+    Ordinary,
+    /// GD-0061 R3-208: agent HTTP and gRPC; certificates from the agent map
+    /// only, and every session is a task session.
+    Agent,
+}
+
 pub struct ApiRuntime {
+    kind: ListenerKind,
     service: Arc<Service>,
     registry: Arc<Registry>,
     jobs: mpsc::Sender<Job>,
@@ -84,6 +95,20 @@ pub struct ApiRuntime {
 
 impl ApiRuntime {
     pub fn new(service: Arc<Service>, limits: ApiLimits) -> Result<Arc<Self>, ApiError> {
+        Self::with_kind(service, limits, ListenerKind::Ordinary)
+    }
+
+    /// The runtime for the agent HTTP and gRPC listeners, built with
+    /// `agent.api_limits`.
+    pub fn new_agent(service: Arc<Service>, limits: ApiLimits) -> Result<Arc<Self>, ApiError> {
+        Self::with_kind(service, limits, ListenerKind::Agent)
+    }
+
+    fn with_kind(
+        service: Arc<Service>,
+        limits: ApiLimits,
+        kind: ListenerKind,
+    ) -> Result<Arc<Self>, ApiError> {
         tokio::runtime::Handle::try_current().map_err(|_| ApiError::Unavailable)?;
         let limits = limits.validate()?;
         let registry = Registry::new(service.clone(), limits);
@@ -96,6 +121,7 @@ impl ApiRuntime {
             stopped,
         ));
         Ok(Arc::new(Self {
+            kind,
             service,
             registry,
             jobs,
@@ -113,7 +139,14 @@ impl ApiRuntime {
 
     /// Only crate transport code can call this, after verifying the TLS leaf.
     pub(crate) fn authenticate(&self, fingerprint: &str) -> Result<ConnectionIdentity, ApiError> {
-        ConnectionIdentity::verified(&self.service, fingerprint)
+        match self.kind {
+            ListenerKind::Ordinary => ConnectionIdentity::verified(&self.service, fingerprint),
+            ListenerKind::Agent => ConnectionIdentity::verified_agent(&self.service, fingerprint),
+        }
+    }
+
+    pub fn kind(&self) -> ListenerKind {
+        self.kind
     }
 
     pub(crate) fn admit_call(
@@ -134,11 +167,30 @@ impl ApiRuntime {
         }))
     }
 
+    /// Test shorthand for an open without a task.
+    #[cfg(test)]
     pub(crate) fn open(
         &self,
         identity: &ConnectionIdentity,
     ) -> Result<proto::OpenSessionReply, ApiError> {
-        let session_id = self.registry.open(identity)?;
+        self.open_task(identity, None)
+    }
+
+    /// Opens a session. On the agent runtime it is a task session for `task`
+    /// (`Service::agent_session`); a refusal is `Unauthenticated`. A `task` on
+    /// the ordinary runtime is `InvalidArgument`.
+    pub(crate) fn open_task(
+        &self,
+        identity: &ConnectionIdentity,
+        task: Option<&str>,
+    ) -> Result<proto::OpenSessionReply, ApiError> {
+        if task.is_some() && self.kind == ListenerKind::Ordinary {
+            return Err(ApiError::InvalidArgument);
+        }
+        if (self.kind == ListenerKind::Agent) != identity.agent {
+            return Err(ApiError::Unauthenticated);
+        }
+        let session_id = self.registry.open_task(identity, task)?;
         Ok(proto::OpenSessionReply {
             session_id,
             idle_timeout_seconds: IDLE_TIMEOUT.as_secs() as u32,

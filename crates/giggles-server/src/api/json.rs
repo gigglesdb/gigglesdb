@@ -165,9 +165,12 @@ pub(super) fn empty(value: Json) -> Result<(), ApiError> {
 pub fn decode_empty(bytes: &[u8]) -> Result<(), ApiError> {
     empty(parse(bytes)?)
 }
+/// `{}` or `{"task":"<name>"}` (GD-0061 R3-208).
 pub fn decode_open(bytes: &[u8]) -> Result<proto::OpenSessionRequest, ApiError> {
-    decode_empty(bytes)?;
-    Ok(proto::OpenSessionRequest {})
+    let mut root = Object::new(parse(bytes)?)?;
+    let task = root.optional("task").map(text).transpose()?;
+    root.finish()?;
+    Ok(proto::OpenSessionRequest { task })
 }
 
 pub fn decode_execute(bytes: &[u8]) -> Result<proto::ExecuteRequest, ApiError> {

@@ -164,6 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let StartedListeners {
         listeners,
         api,
+        agent_api,
         addresses,
     } = start_listeners(&c, &service, &config, postgresql, agent_tls, false).await?;
     println!("{} {preview}", addresses.join(" "));
@@ -221,6 +222,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match result {
                     Ok((epoch, stale)) => {
                         api.invalidate_bindings();
+                        if let Some(agent_api) = &agent_api {
+                            agent_api.invalidate_bindings();
+                        }
                         for fingerprint in stale {
                             eprintln!("agent_binding_stale fingerprint={fingerprint}");
                         }
@@ -235,7 +239,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("control rejected; expected reload");
         }
     }
-    stop_all(listeners, &api).await?;
+    let stopped = stop_all(listeners, &api).await;
+    if let Some(agent_api) = &agent_api {
+        agent_api.shutdown().await;
+    }
+    stopped?;
     drop(service);
     #[cfg(feature = "engine-rocksdb")]
     if let Some(runtime) = cluster_runtime {
@@ -663,6 +671,8 @@ async fn stop_role(
 struct StartedListeners {
     listeners: Vec<Running>,
     api: std::sync::Arc<ApiRuntime>,
+    /// GD-0061 R3-208: the agent HTTP/gRPC runtime, with its own registry.
+    agent_api: Option<std::sync::Arc<ApiRuntime>>,
     addresses: Vec<String>,
 }
 
@@ -694,7 +704,23 @@ async fn start_listeners(
         (Some(address), Some(_)) => Some(bind_listener(address, retry).await?),
         _ => None,
     };
+    let agent_http_socket = match (c.agent.as_ref().and_then(|a| a.http), &agent_tls) {
+        (Some(address), Some(_)) => Some(bind_listener(address, retry).await?),
+        _ => None,
+    };
+    let agent_grpc_socket = match (c.agent.as_ref().and_then(|a| a.grpc), &agent_tls) {
+        (Some(address), Some(_)) => Some(bind_listener(address, retry).await?),
+        _ => None,
+    };
     let api = ApiRuntime::new(service.clone(), c.api_limits)?;
+    // The agent listeners get a runtime of their own: a separate registry, so
+    // a session token from one runtime is never valid on the other.
+    let agent_api = match (&c.agent, &agent_tls) {
+        (Some(agent), Some(_)) if agent.http.is_some() || agent.grpc.is_some() => {
+            Some(ApiRuntime::new_agent(service.clone(), agent.api_limits)?)
+        }
+        _ => None,
+    };
     let (start, gate) = watch::channel(false);
     let mut listeners = Vec::new();
     let mut addresses = Vec::new();
@@ -749,6 +775,32 @@ async fn start_listeners(
             addresses.push(format!("grpc={}", grpc.address));
             listeners.push(grpc);
         }
+        if let (Some(runtime), Some(tls), Some(agent)) = (&agent_api, &agent_tls, &c.agent) {
+            if let Some(socket) = agent_http_socket {
+                let http = serve_http_bound(
+                    socket,
+                    runtime.clone(),
+                    tls.clone(),
+                    agent.connections,
+                    gate.clone(),
+                )
+                .await?;
+                addresses.push(format!("agent_http={}", http.address));
+                listeners.push(http);
+            }
+            if let Some(socket) = agent_grpc_socket {
+                let grpc = serve_grpc_bound(
+                    socket,
+                    runtime.clone(),
+                    tls.clone(),
+                    agent.connections,
+                    gate.clone(),
+                )
+                .await?;
+                addresses.push(format!("agent_grpc={}", grpc.address));
+                listeners.push(grpc);
+            }
+        }
         if let (Some(socket), Some(tls), Some(agent)) = (agent_pg_socket, agent_tls, &c.agent) {
             let agent_pg = serve_agent_pg_bound(
                 socket,
@@ -768,12 +820,16 @@ async fn start_listeners(
     if let Err(error) = setup {
         drop(start);
         let _ = stop_all(listeners, &api).await;
+        if let Some(agent_api) = &agent_api {
+            agent_api.shutdown().await;
+        }
         return Err(error.into());
     }
     start.send_replace(true);
     Ok(StartedListeners {
         listeners,
         api,
+        agent_api,
         addresses,
     })
 }
@@ -829,9 +885,6 @@ fn validate_agent(c: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if c.replication.is_some() {
         // D13: replicated databases refuse task statements in R3.
         return Err("agent listeners are not available with replication".into());
-    }
-    if agent.http.is_some() || agent.grpc.is_some() {
-        return Err("agent http and grpc listeners are not available yet".into());
     }
     Ok(())
 }
@@ -892,6 +945,12 @@ mod tests {
         assert!(validate_agent(&config).is_ok());
         assert_eq!(config.agent.unwrap().databases, ["giggles"]);
         json["agent"]["http"] = "127.0.0.1:0".into();
+        json["agent"]["grpc"] = "127.0.0.1:0".into();
+        json["agent"]["api_limits"] = serde_json::json!({"sessions": 4});
+        let config = serde_json::from_value::<Config>(json.clone()).unwrap();
+        assert!(validate_agent(&config).is_ok());
+        assert_eq!(config.agent.unwrap().api_limits.sessions, 4);
+        json["agent"]["api_limits"] = serde_json::json!({"sessions": 0});
         assert!(validate_agent(&serde_json::from_value::<Config>(json.clone()).unwrap()).is_err());
         json["agent"] = serde_json::json!({"postgres": "127.0.0.1:0", "typo": 1});
         assert!(serde_json::from_value::<Config>(json).is_err());
