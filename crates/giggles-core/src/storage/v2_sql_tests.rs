@@ -1235,9 +1235,17 @@ fn legacy_unsupported_read_forms_keep_exact_errors() {
             assert_eq!(rows, expected, "{sql}");
         }
     }
+    for (sql, expected) in [
+        ("SELECT a.id,b.id FROM a RIGHT JOIN b ON a.id=b.id",
+         vec![vec![relational::Value::Null, relational::Value::Int(2)]]),
+        ("SELECT a.id,b.id FROM a FULL OUTER JOIN b ON a.id=b.id ORDER BY a.id NULLS LAST",
+         vec![vec![relational::Value::Int(1), relational::Value::Null],
+              vec![relational::Value::Null, relational::Value::Int(2)]]),
+    ] {
+        let result = parity(&mut a, &mut b, sql, &[]).unwrap();
+        assert_eq!(result.rows.into_iter().map(|r| r.values).collect::<Vec<_>>(), expected, "{sql}");
+    }
     for sql in [
-        "SELECT a.id,b.id FROM a RIGHT JOIN b ON a.id=b.id",
-        "SELECT a.id,b.id FROM a FULL OUTER JOIN b ON a.id=b.id",
         "SELECT (SELECT id FROM b) FROM a",
         "SELECT id FROM a WHERE id=(SELECT id FROM b)",
         "INSERT INTO b SELECT id FROM a UNION SELECT id FROM b",

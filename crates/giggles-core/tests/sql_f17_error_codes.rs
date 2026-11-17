@@ -1,7 +1,7 @@
 use bincode::Options;
 use giggles_core::{CoreError, local, relational::SqlError as E};
 
-const FIRST_UNKNOWN_TAG: u8 = 59; // next free SqlError tag; bump when appending
+const FIRST_UNKNOWN_TAG: u8 = 60; // next free SqlError tag; bump when appending
 
 #[test]
 fn f17_error_contract_goldens() {
@@ -38,6 +38,12 @@ fn f17_error_contract_goldens() {
     assert_eq!(be.serialize(&E::InvalidRecursion).unwrap(), [0, 0, 0, 58]);
     assert_eq!(local::failure(CoreError::Sql(E::InvalidRecursion)).code, 258);
     assert_eq!(serde_json::to_string(&E::InvalidRecursion).unwrap(), "\"InvalidRecursion\"");
+    assert_eq!(le.deserialize::<E>(&[59, 0, 0, 0]).unwrap(), E::DuplicateAlias);
+    assert_eq!(be.deserialize::<E>(&[0, 0, 0, 59]).unwrap(), E::DuplicateAlias);
+    assert_eq!(le.serialize(&E::DuplicateAlias).unwrap(), [59, 0, 0, 0]);
+    assert_eq!(be.serialize(&E::DuplicateAlias).unwrap(), [0, 0, 0, 59]);
+    assert_eq!(local::failure(CoreError::Sql(E::DuplicateAlias)).code, 259);
+    assert_eq!(serde_json::to_string(&E::DuplicateAlias).unwrap(), "\"DuplicateAlias\"");
     assert!(le.deserialize::<E>(&[FIRST_UNKNOWN_TAG, 0, 0, 0]).is_err());
     assert!(be.deserialize::<E>(&[0, 0, 0, FIRST_UNKNOWN_TAG]).is_err());
 }

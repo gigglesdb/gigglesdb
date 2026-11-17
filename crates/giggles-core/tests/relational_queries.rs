@@ -91,14 +91,11 @@ fn invalid_scope_duplicate_and_ambiguous_names() {
             E::Duplicate,
         ),
         ("SELECT p.id FROM people p JOIN jobs j", E::Syntax),
-        (
-            "SELECT p.id FROM people p CROSS JOIN jobs j",
-            E::Unsupported,
-        ),
     ] {
         err(&mut s, q, e);
     }
     for q in [
+        "SELECT p.id FROM people p CROSS JOIN jobs j",
         "SELECT p.id FROM people p JOIN jobs j ON j.person=p.id",
         "SELECT p.id FROM people p JOIN jobs j ON j.id>p.id",
     ] {

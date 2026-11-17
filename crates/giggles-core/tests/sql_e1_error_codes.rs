@@ -141,8 +141,14 @@ fn e1_error_names_and_local_codes() {
     assert_eq!(be.serialize(&E::InvalidRecursion).unwrap(), [0, 0, 0, 58]);
     assert_eq!(local::failure(CoreError::Sql(E::InvalidRecursion)).code, 258);
     assert_eq!(serde_json::to_string(&E::InvalidRecursion).unwrap(), "\"InvalidRecursion\"");
-    assert!(le.deserialize::<E>(&[59, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<E>(&[0, 0, 0, 59]).is_err());
+    assert_eq!(le.deserialize::<E>(&[59, 0, 0, 0]).unwrap(), E::DuplicateAlias);
+    assert_eq!(be.deserialize::<E>(&[0, 0, 0, 59]).unwrap(), E::DuplicateAlias);
+    assert_eq!(le.serialize(&E::DuplicateAlias).unwrap(), [59, 0, 0, 0]);
+    assert_eq!(be.serialize(&E::DuplicateAlias).unwrap(), [0, 0, 0, 59]);
+    assert_eq!(local::failure(CoreError::Sql(E::DuplicateAlias)).code, 259);
+    assert_eq!(serde_json::to_string(&E::DuplicateAlias).unwrap(), "\"DuplicateAlias\"");
+    assert!(le.deserialize::<E>(&[60, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<E>(&[0, 0, 0, 60]).is_err());
 }
 
 #[test]

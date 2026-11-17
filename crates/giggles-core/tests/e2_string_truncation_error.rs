@@ -48,8 +48,14 @@ fn string_data_right_truncation_has_append_only_protocol_identity() {
     assert_eq!(be.serialize(&SqlError::InvalidRecursion).unwrap(), [0, 0, 0, 58]);
     assert_eq!(local::failure(CoreError::Sql(SqlError::InvalidRecursion)).code, 258);
     assert_eq!(serde_json::to_string(&SqlError::InvalidRecursion).unwrap(), "\"InvalidRecursion\"");
-    assert!(le.deserialize::<SqlError>(&[59, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<SqlError>(&[0, 0, 0, 59]).is_err());
+    assert_eq!(le.deserialize::<SqlError>(&[59, 0, 0, 0]).unwrap(), SqlError::DuplicateAlias);
+    assert_eq!(be.deserialize::<SqlError>(&[0, 0, 0, 59]).unwrap(), SqlError::DuplicateAlias);
+    assert_eq!(le.serialize(&SqlError::DuplicateAlias).unwrap(), [59, 0, 0, 0]);
+    assert_eq!(be.serialize(&SqlError::DuplicateAlias).unwrap(), [0, 0, 0, 59]);
+    assert_eq!(local::failure(CoreError::Sql(SqlError::DuplicateAlias)).code, 259);
+    assert_eq!(serde_json::to_string(&SqlError::DuplicateAlias).unwrap(), "\"DuplicateAlias\"");
+    assert!(le.deserialize::<SqlError>(&[60, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<SqlError>(&[0, 0, 0, 60]).is_err());
 }
 
 #[test]

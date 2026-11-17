@@ -14,7 +14,7 @@ pub(super) enum Kind {
 }
 #[derive(Debug, Clone)]
 pub(super) enum Condition {
-    On(Filter),
+    On(Box<Filter>),
     Using(Vec<String>, Option<String>),
     Natural,
     Cross,
@@ -294,7 +294,7 @@ fn explicit(
             if matches!(kind, Kind::Full) && !required_equality(&on) && !constant_condition(&on) {
                 return Err(ParseError::Definite(SqlError::Unsupported));
             }
-            Condition::On(on)
+            Condition::On(Box::new(on))
         };
         left = joined(left, right, kind, condition)?;
     }
@@ -434,9 +434,9 @@ impl From {
                 push(right, a, b, filter);
             } else if has(left, a) && has(right, b) || has(left, b) && has(right, a) {
                 match condition {
-                    Condition::Cross => *condition = Condition::On(filter.clone()),
+                    Condition::Cross => *condition = Condition::On(Box::new(filter.clone())),
                     Condition::On(on) => {
-                        *on = Filter::Logic(Box::new(on.clone()), true, Box::new(filter.clone()))
+                        **on = Filter::Logic(on.clone(), true, Box::new(filter.clone()))
                     }
                     _ => {}
                 }
@@ -493,7 +493,7 @@ impl From {
                 left.visit_scalars(f);
                 right.visit_scalars(f);
                 if let Condition::On(on) = condition {
-                    f(&Scalar::Predicate(Box::new(on.clone())));
+                    f(&Scalar::Predicate(on.clone()));
                 }
             }
             Self::Alias { input, .. } => input.visit_scalars(f),
@@ -526,10 +526,10 @@ impl From {
                 left.bind_schema_names(bind, state, path)?;
                 right.bind_schema_names(bind, state, path)?;
                 if let Condition::On(on) = condition {
-                    let mut scalar = Scalar::Predicate(Box::new(on.clone()));
+                    let mut scalar = Scalar::Predicate(on.clone());
                     schema_names::scalar(&mut scalar, bind, state, path);
                     if let Scalar::Predicate(filter) = scalar {
-                        *on = *filter;
+                        *on = filter;
                     }
                 }
                 Ok(())
@@ -771,7 +771,7 @@ fn join_shape(
             .push((alias.clone(), namespace.visible[..names.len()].to_vec()));
     }
     if let Condition::On(filter) = condition {
-        on = filter.clone();
+        on = *filter.clone();
     }
     let shape = Shape {
         columns: left.columns,
@@ -1086,10 +1086,6 @@ fn pair(a: Option<&SqlRow>, b: Option<&SqlRow>, aw: usize, bw: usize) -> Vec<Val
     out.extend(b.map_or_else(|| vec![Value::Null; bw], |r| r.values.clone()));
     out
 }
-#[expect(
-    clippy::too_many_arguments,
-    reason = "join emission shares scalar and retention context"
-)]
 fn emit(
     mut values: Vec<Value>,
     version: u64,
