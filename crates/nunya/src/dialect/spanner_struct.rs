@@ -5,7 +5,7 @@ use crate::{
     policy::{Policy, Treatment},
     schema::{Column, ColumnRef, Relation, Snapshot},
 };
-use google_cloud_googleapis::spanner::v1::{KeySet, Mutation, ReadRequest, key_range, mutation};
+use googleapis_tonic_google_spanner_v1::google::spanner::v1::{KeySet, Mutation, ReadRequest, key_range, mutation};
 
 /// Location of a parameter in its original structured request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,7 +380,7 @@ mod tests {
         let mut r = request();
         r.key_set = Some(KeySet {
             all: true,
-            ranges: vec![google_cloud_googleapis::spanner::v1::KeyRange {
+            ranges: vec![googleapis_tonic_google_spanner_v1::google::spanner::v1::KeyRange {
                 start_key_type: Some(key_range::StartKeyType::StartClosed(values(1))),
                 end_key_type: Some(key_range::EndKeyType::EndOpen(values(0))),
             }],

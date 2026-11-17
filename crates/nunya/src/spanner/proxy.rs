@@ -23,7 +23,7 @@ use crate::{
     value::ColumnType,
 };
 use futures::{Stream, StreamExt};
-use google_cloud_googleapis::spanner::v1::{spanner_client::SpannerClient, *};
+use googleapis_tonic_google_spanner_v1::google::spanner::v1::{spanner_client::SpannerClient, *};
 use prost_types::{ListValue, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -1571,13 +1571,13 @@ impl SpannerService for NunyaSpanner {
     }
 }
 fn check_key_tokens(
-    set: Option<&google_cloud_googleapis::spanner::v1::KeySet>,
+    set: Option<&googleapis_tonic_google_spanner_v1::google::spanner::v1::KeySet>,
     policy: &Policy,
     plan: &RewritePlan,
     positions: &[ValuePosition],
     delete: bool,
 ) -> Result<(), Status> {
-    use google_cloud_googleapis::spanner::v1::key_range::{EndKeyType, StartKeyType};
+    use googleapis_tonic_google_spanner_v1::google::spanner::v1::key_range::{EndKeyType, StartKeyType};
     let set = set.ok_or_else(invalid)?;
     for (key, values) in set.keys.iter().enumerate() {
         for (part, value) in values.values.iter().enumerate() {
@@ -2343,7 +2343,7 @@ mod tests {
     }
     #[tokio::test]
     async fn plain_token_parameter_and_structured_values_are_refused() {
-        use google_cloud_googleapis::spanner::v1::{KeyRange, KeySet, key_range};
+        use googleapis_tonic_google_spanner_v1::google::spanner::v1::{KeyRange, KeySet, key_range};
         let f = Fixture::new().await;
         let mut policy = (**f.svc.ctx.policy.read().unwrap()).clone();
         policy.columns.clear();

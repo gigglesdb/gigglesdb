@@ -4,7 +4,7 @@ use crate::{
     error::{NyCode, Refusal},
     schema::spanner_gsql::{QueryResult, SqlRunner},
 };
-use google_cloud_googleapis::spanner::v1::*;
+use googleapis_tonic_google_spanner_v1::google::spanner::v1::*;
 use prost_types::{Value, value::Kind};
 use std::sync::Arc;
 use tonic::transport::Channel;

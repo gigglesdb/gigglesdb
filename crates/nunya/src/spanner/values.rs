@@ -3,7 +3,7 @@ use crate::{
     error::{NyCode, Refusal},
     value::{ColumnType, SqlValue},
 };
-use google_cloud_googleapis::spanner::v1::{Type, TypeCode};
+use googleapis_tonic_google_spanner_v1::google::spanner::v1::{Type, TypeCode};
 use prost_types::{value::Kind, Value};
 fn bad() -> Refusal {
     Refusal::new(

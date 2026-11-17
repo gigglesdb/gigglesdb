@@ -55,7 +55,7 @@ http = "1"
 tower = "0.4"
 prost = "0.13"
 prost-types = "0.13"
-google-cloud-googleapis = { version = "0.16.1", features = ["spanner"] }
+googleapis-tonic-google-spanner-v1 = "=0.22.0"
 gcp_auth = "0.12.7"
 tokio-stream = "0.1"
 

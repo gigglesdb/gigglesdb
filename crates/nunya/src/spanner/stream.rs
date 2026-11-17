@@ -6,7 +6,7 @@ use crate::{
     policy::DomainName,
     value::{ColumnType, SqlValue},
 };
-use google_cloud_googleapis::spanner::v1::{PartialResultSet, ResultSetMetadata, ResultSetStats};
+use googleapis_tonic_google_spanner_v1::google::spanner::v1::{PartialResultSet, ResultSetMetadata, ResultSetStats};
 use prost_types::{value::Kind, Value};
 fn bad() -> Refusal {
     Refusal::new(NyCode::NotAnalysable, "malformed Spanner stream")
@@ -165,6 +165,7 @@ pub fn emit(
         chunked_value: false,
         resume_token: resume_token.unwrap_or_default(),
         stats,
+        ..Default::default()
     }
 }
 /// Apply a complete row's rewrite plan and return released token text.
@@ -216,7 +217,7 @@ pub fn rewrite_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use google_cloud_googleapis::spanner::v1::{struct_type::Field, StructType};
+    use googleapis_tonic_google_spanner_v1::google::spanner::v1::{struct_type::Field, StructType};
     fn s(s: &str) -> Value {
         Value {
             kind: Some(Kind::StringValue(s.into())),

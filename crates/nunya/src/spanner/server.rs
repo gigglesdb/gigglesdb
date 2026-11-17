@@ -1,4 +1,4 @@
-//! Hand-written tonic 0.12 server for the Spanner API shipped by googleapis 0.16.1.
+//! Hand-written tonic 0.12 server for the Spanner API shipped by googleapis-tonic-google-spanner-v1 0.22.0.
 //!
 //! That schema exposes sixteen RPCs. Unsupported and future routes fail closed
 //! with UNIMPLEMENTED, rather than being forwarded without policy enforcement.
@@ -9,7 +9,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use google_cloud_googleapis::spanner::v1::*;
+use googleapis_tonic_google_spanner_v1::google::spanner::v1::*;
 use tonic::{Request, Response, Status, body::BoxBody, codegen::BoxFuture};
 
 /// Implements the sixteen RPCs in the pinned Spanner API schema.

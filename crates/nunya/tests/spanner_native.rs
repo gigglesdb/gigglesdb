@@ -1,5 +1,5 @@
 //! Opt-in native Spanner emulator worked example; never run by the offline suite.
-use google_cloud_googleapis::spanner::v1::{spanner_client::SpannerClient, *};
+use googleapis_tonic_google_spanner_v1::google::spanner::v1::{spanner_client::SpannerClient, *};
 use prost_types::{Value, value::Kind};
 use std::{collections::BTreeMap, net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 use tonic::{Request, Status, transport::Endpoint};

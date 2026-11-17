@@ -531,7 +531,7 @@ async fn pg_quota_continuity_reconnect_rotation_reacquire() -> ServeResult<()> {
     Ok(())
 }
 
-use google_cloud_googleapis::spanner::v1::{
+use googleapis_tonic_google_spanner_v1::google::spanner::v1::{
     CreateSessionRequest, DeleteSessionRequest, ExecuteSqlRequest, spanner_client::SpannerClient,
 };
 use tonic::{Code, Request, Status, transport::Endpoint};
@@ -1195,7 +1195,7 @@ async fn native_acquire(
     Ok((session, secret))
 }
 fn native_cells(
-    rows: &google_cloud_googleapis::spanner::v1::ResultSet,
+    rows: &googleapis_tonic_google_spanner_v1::google::spanner::v1::ResultSet,
 ) -> ServeResult<Vec<Vec<String>>> {
     rows.rows
         .iter()
@@ -1214,7 +1214,7 @@ fn native_cells(
 #[tokio::test]
 #[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_SPANNER_REST"]
 async fn spanner_reconnect_and_pool_every_token_type() -> ServeResult<()> {
-    use google_cloud_googleapis::spanner::v1::TypeCode;
+    use googleapis_tonic_google_spanner_v1::google::spanner::v1::TypeCode;
     // values::column_type maps STRING/INT64/DATE/TIMESTAMP to supported codecs.
     // BOOL has too few values (policy refuses); BYTES maps to unsupported Bytea.
     // NUMERIC/JSON/ARRAY map to unsupported Numeric/Json/Array codecs.
@@ -1285,10 +1285,10 @@ async fn native_verify(
     name: &str,
     select: &str,
     first: &[Vec<String>],
-    types: &[(&str, google_cloud_googleapis::spanner::v1::TypeCode)],
+    types: &[(&str, googleapis_tonic_google_spanner_v1::google::spanner::v1::TypeCode)],
     schema: &str,
 ) -> ServeResult<()> {
-    use google_cloud_googleapis::spanner::v1::Type;
+    use googleapis_tonic_google_spanner_v1::google::spanner::v1::Type;
     assert!(
         native_cells(
             &client
@@ -1480,7 +1480,7 @@ fn native_parameter(
     request: &mut ExecuteSqlRequest,
     name: &str,
     value: &str,
-    code: google_cloud_googleapis::spanner::v1::TypeCode,
+    code: googleapis_tonic_google_spanner_v1::google::spanner::v1::TypeCode,
 ) {
     request.params = Some(prost_types::Struct {
         fields: std::collections::BTreeMap::from([(
@@ -1492,7 +1492,7 @@ fn native_parameter(
     });
     request.param_types.insert(
         name.into(),
-        google_cloud_googleapis::spanner::v1::Type {
+        googleapis_tonic_google_spanner_v1::google::spanner::v1::Type {
             code: code as i32,
             ..Default::default()
         },
@@ -1500,8 +1500,8 @@ fn native_parameter(
 }
 
 fn native_tokenize_cell(
-    result: &google_cloud_googleapis::spanner::v1::ResultSet,
-    code: google_cloud_googleapis::spanner::v1::TypeCode,
+    result: &googleapis_tonic_google_spanner_v1::google::spanner::v1::ResultSet,
+    code: googleapis_tonic_google_spanner_v1::google::spanner::v1::TypeCode,
 ) -> ServeResult<String> {
     let fields = &result
         .metadata
@@ -1528,7 +1528,7 @@ async fn native_tokenize(
     name: &str,
     value: &str,
 ) -> ServeResult<String> {
-    use google_cloud_googleapis::spanner::v1::TypeCode;
+    use googleapis_tonic_google_spanner_v1::google::spanner::v1::TypeCode;
     let mut request = spanner_sql(name, "SELECT nunya_tokenize('email', @v)");
     native_parameter(&mut request, "v", value, TypeCode::String);
     native_tokenize_cell(
@@ -1582,7 +1582,7 @@ async fn native_tokenize_refused(client: &mut NativeClient, request: ExecuteSqlR
 #[tokio::test]
 #[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_SPANNER_REST"]
 async fn spanner_explicit_tokenize_matches_blind_read() -> ServeResult<()> {
-    use google_cloud_googleapis::spanner::v1::{ResultSet, TypeCode};
+    use googleapis_tonic_google_spanner_v1::google::spanner::v1::{ResultSet, TypeCode};
     let f = NativeFixture::new(
         "email STRING(MAX), number INT64, day DATE, ts TIMESTAMP",
         "email, number, day, ts",
@@ -1699,7 +1699,7 @@ async fn spanner_explicit_tokenize_matches_blind_read() -> ServeResult<()> {
 #[tokio::test]
 #[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_SPANNER_REST"]
 async fn spanner_tokenize_refusals_cost_no_count() -> ServeResult<()> {
-    use google_cloud_googleapis::spanner::v1::{
+    use googleapis_tonic_google_spanner_v1::google::spanner::v1::{
         TransactionOptions, TransactionSelector, TypeCode, transaction_options,
         transaction_selector,
     };
@@ -1940,7 +1940,7 @@ async fn restart_keeps_token_meaning_and_revocation_both_routes() -> ServeResult
         &native_tokens,
         &[(
             "email",
-            google_cloud_googleapis::spanner::v1::TypeCode::String,
+            googleapis_tonic_google_spanner_v1::google::spanner::v1::TypeCode::String,
         )],
         &f.schema,
     )
@@ -1983,7 +1983,7 @@ struct NativeTransactionCleanup {
 }
 impl Drop for NativeTransactionCleanup {
     fn drop(&mut self) {
-        use google_cloud_googleapis::spanner::v1::RollbackRequest;
+        use googleapis_tonic_google_spanner_v1::google::spanner::v1::RollbackRequest;
         let (endpoint, session, transaction_id) = (
             self.endpoint.clone(),
             self.session.clone(),
@@ -2023,7 +2023,7 @@ impl Drop for NativeTransactionCleanup {
 #[tokio::test]
 #[ignore = "requires NUNYA_TEST_PG, NUNYA_TEST_PG_ADMIN and NUNYA_TEST_SPANNER_* harness endpoints"]
 async fn restart_reports_open_transaction_lost() -> ServeResult<()> {
-    use google_cloud_googleapis::spanner::v1::{
+    use googleapis_tonic_google_spanner_v1::google::spanner::v1::{
         BeginTransactionRequest, CommitRequest, TransactionOptions, TransactionSelector,
         commit_request, transaction_options, transaction_selector,
     };
