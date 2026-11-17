@@ -28,7 +28,8 @@ pub(crate) struct Gateway {
 /// Attaches a gateway database for the cluster `client` reaches. `domain` is the cluster
 /// database's identity (the range store's domain). With `peer`, the gateway detects deadlocks
 /// across ranges and gateways (design.md 3.2); its `services.gateway_service()` must then be
-/// reachable by the other gateways' peers.
+/// reachable by the other gateways' peers. With a member list (`config.gateways`), the gateway
+/// joins the cluster before its catalog is loaded (Phase 11, `txn::ddl`).
 pub(crate) fn attach(
     client: Arc<dyn RangeClient>,
     config: ClusterConfig,
@@ -36,11 +37,42 @@ pub(crate) fn attach(
     domain: [u8; 16],
     limits: Limits,
 ) -> Result<Gateway, CoreError> {
+    check_members(&config, peer.is_some())?;
     let services = match peer {
         Some((peer, deadlock)) => ClusterTxnServices::with_peer(client, config, peer, deadlock),
         None => ClusterTxnServices::new(client, config),
     };
-    let db = V2Db::cluster(services.clone(), domain)?;
-    let admin = Admin::attach_backend(Backend::V2(Arc::new(db)), limits)?;
+    services.join_cluster()?;
+    let db = Arc::new(V2Db::cluster(services.clone(), domain)?);
+    let weak = Arc::downgrade(&db);
+    services.set_catalog_refresh(Box::new(move || {
+        if let Some(db) = weak.upgrade() {
+            let _ = db.catalog().refresh_latest();
+        }
+    }));
+    let admin = Admin::attach_backend(Backend::V2(db), limits)?;
     Ok(Gateway { admin, services })
+}
+
+/// A member list (Phase 11) must name this gateway, come with a peer when it names others,
+/// and have a positive liveness lease. (The node checks the lease against its lock lease.)
+fn check_members(config: &ClusterConfig, peer: bool) -> Result<(), CoreError> {
+    let gateways = &config.gateways;
+    let problem = if gateways.is_empty() {
+        return Ok(());
+    } else if !gateways.contains(&config.node) {
+        format!(
+            "gateway {} is not among the gateways {gateways:?}",
+            config.node
+        )
+    } else if !peer && gateways.iter().any(|node| *node != config.node) {
+        "a gateway with other members needs a gateway peer".to_string()
+    } else if config.gateway_lease.is_zero() {
+        "the gateway lease must be positive".to_string()
+    } else {
+        return Ok(());
+    };
+    Err(CoreError::Storage(format!(
+        "invalid gateway settings: {problem}"
+    )))
 }

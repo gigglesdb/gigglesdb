@@ -38,6 +38,9 @@ pub(crate) enum SerializationReason {
     ReadWriteConflict,
     ValidationBudget,
     SnapshotTooOld,
+    /// A cluster gateway whose membership lapsed (GD-0075 Phase 11): "gateway is fenced;
+    /// retry". The statement or transaction is refused; the session stays usable.
+    GatewayFenced,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TxnError {
@@ -229,6 +232,23 @@ pub(crate) trait ClusterServices: Send + Sync {
     fn register_xact(&self, txn: TxnId, xid: u64) -> Result<(), TxnError>;
     /// R5-55: the status of an xid that is not live on this gateway (None: never assigned).
     fn xact_status(&self, xid: u64) -> Result<Option<super::xact::XactStatus>, TxnError>;
+    /// Phase 11: a DDL statement of `txn` starts (before its local `Table(0)` lock): takes the
+    /// cluster's DDL lock once per transaction.
+    fn ddl_begin(&self, txn: TxnId, cancel: &dyn Fn() -> bool) -> Result<(), TxnError> {
+        let _ = (txn, cancel);
+        Ok(())
+    }
+    /// Phase 11: after the DDL statement's local locks, before its final snapshot: closes the
+    /// other gateways for `tables` (the ids it locks AccessExclusive).
+    fn ddl_close(
+        &self,
+        txn: TxnId,
+        tables: &[u64],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError> {
+        let _ = (txn, tables, cancel);
+        Ok(())
+    }
 }
 /// A cluster transaction's buffered effects at commit.
 pub(crate) struct ClusterCommit {
@@ -395,6 +415,8 @@ pub(crate) struct Transaction {
     snapshot: Option<Snapshot>,
     /// The last failure to obtain a statement timestamp (cluster only).
     snapshot_error: Option<TxnError>,
+    /// Fresh cluster catalog validation timestamp, reused within one statement.
+    catalog_check_ts: Option<Ts>,
     writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
     catalog_generation: u64,
     features_or: u64,
@@ -442,6 +464,7 @@ impl Transaction {
             isolation,
             snapshot: None,
             snapshot_error: None,
+            catalog_check_ts: None,
             writes: BTreeMap::new(),
             features_or: 0,
             minimum_subversion: 0,
@@ -582,12 +605,21 @@ impl Transaction {
         }
     }
     pub(crate) fn begin_statement(&mut self) {
+        self.catalog_check_ts = None;
         if self.isolation == Isolation::ReadCommitted {
             // A failed cluster timestamp leaves no snapshot: reads then fail rather
             // than run at an older timestamp.
             self.snapshot = None;
             let _ = self.try_snapshot_ts();
         }
+    }
+    pub(crate) fn catalog_check_ts(&mut self) -> Result<Ts, TxnError> {
+        if let Some(ts) = self.catalog_check_ts {
+            return Ok(ts);
+        }
+        let ts = self.services.visible_ts()?;
+        self.catalog_check_ts = Some(ts);
+        Ok(ts)
     }
     fn try_snapshot_ts(&mut self) -> Result<Ts, TxnError> {
         #[cfg(test)]
@@ -733,6 +765,19 @@ impl Transaction {
             .range((Keyspace::Catalog, Vec::new())..)
             .take_while(|((ks, _), _)| *ks == Keyspace::Catalog)
             .map(|((_, key), value)| (key, value))
+    }
+    /// DDL across gateways (Phase 11); no-op on a single node. See `ClusterServices`.
+    pub(crate) fn ddl_begin(&self, cancel: &dyn Fn() -> bool) -> Result<(), TxnError> {
+        match &self.services {
+            TxnServices::Cluster(cluster) => cluster.ddl_begin(self.id, cancel),
+            TxnServices::Local { .. } => Ok(()),
+        }
+    }
+    pub(crate) fn ddl_close(&self, tables: &[u64], cancel: &dyn Fn() -> bool) -> Result<(), TxnError> {
+        match &self.services {
+            TxnServices::Cluster(cluster) => cluster.ddl_close(self.id, tables, cancel),
+            TxnServices::Local { .. } => Ok(()),
+        }
     }
     pub(crate) fn acquire_lock(
         &self,

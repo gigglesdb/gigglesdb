@@ -205,6 +205,11 @@ impl LocalCluster {
             .insert(node, Arc::downgrade(&service));
     }
 
+    /// Makes gateway `node` unreachable for every peer call (until registered again).
+    pub(crate) fn unregister_gateway(&self, node: u64) {
+        self.gateways.lock().unwrap().remove(&node);
+    }
+
     fn service(&self, range: RangeId) -> Result<Arc<dyn RangeService>, RangeError> {
         self.services
             .lock()
@@ -333,5 +338,21 @@ impl GatewayPeer for LocalCluster {
     }
     fn txn_live(&self, node: u64, txn: ClusterTxnId) -> Result<bool, RangeError> {
         Ok(self.gateway(node)?.txn_live(txn))
+    }
+    fn ddl_close(
+        &self,
+        node: u64,
+        txn: ClusterTxnId,
+        priority: Timestamp,
+        tables: &[u64],
+    ) -> Result<bool, RangeError> {
+        self.gateway(node)?.ddl_close(txn, priority, tables)
+    }
+    fn ddl_open(&self, node: u64, txn: ClusterTxnId) -> Result<(), RangeError> {
+        self.gateway(node)?.ddl_open(txn);
+        Ok(())
+    }
+    fn ddl_live(&self, node: u64, txn: ClusterTxnId) -> Result<bool, RangeError> {
+        Ok(self.gateway(node)?.ddl_live(txn))
     }
 }

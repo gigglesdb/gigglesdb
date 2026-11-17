@@ -957,3 +957,59 @@ fn prepared_records_carry_gap_locks() {
     };
     assert!(bad.encode().is_err());
 }
+
+#[test]
+fn elapsed_leases_are_refused_before_sweeping_and_prepared_leases_survive() {
+    let f = fixture();
+    let mut cfg = config();
+    cfg.sweep = Duration::from_secs(60);
+    let e = RangeEngine::open(
+        &f.store,
+        f.store.descriptor(B).unwrap().unwrap(),
+        f.sink.clone(),
+        f.oracle.clone(),
+        cfg,
+        1,
+    )
+    .unwrap();
+    for n in 1..=4 {
+        lock(&e, txn(n), n, None).unwrap();
+        {
+            let mut state = e.state();
+            state.txns.get_mut(&txn(n)).unwrap().expires = Instant::now() - Duration::from_secs(1);
+            assert!(!state.expired.contains(&txn(n)));
+        }
+        let result = match n {
+            1 => e
+                .commit(epoch(&e), txn(n), vec![write(n, b"x")], None, None)
+                .map(|_| ()),
+            2 => e
+                .prepare(epoch(&e), txn(n), B, vec![write(n, b"x")], None)
+                .map(|_| ()),
+            3 => e.heartbeat(txn(n)),
+            _ => lock(&e, txn(n), n, None).map(|_| ()),
+        };
+        assert_eq!(
+            result,
+            Err(RangeError::Aborted("lock lease expired".into()))
+        );
+        assert!(e.locks.held(txn_id(txn(n))).is_empty());
+        assert_eq!(
+            e.heartbeat(txn(n)),
+            Err(RangeError::Aborted("lock lease expired".into()))
+        );
+    }
+    lock(&e, txn(5), 5, None).unwrap();
+    let at = e
+        .prepare(epoch(&e), txn(5), B, vec![write(5, b"p")], None)
+        .unwrap();
+    e.state().txns.get_mut(&txn(5)).unwrap().expires = Instant::now() - Duration::from_secs(1);
+    e.heartbeat(txn(5)).unwrap();
+    assert_eq!(
+        e.prepare(epoch(&e), txn(5), B, vec![write(5, b"p")], None)
+            .unwrap(),
+        at
+    );
+    assert!(!e.locks.held(txn_id(txn(5))).is_empty());
+    e.finalize(txn(5), Outcome::Abort).unwrap();
+}

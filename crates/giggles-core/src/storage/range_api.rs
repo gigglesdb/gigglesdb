@@ -530,6 +530,29 @@ pub trait GatewayPeer: Send + Sync {
         let _ = (node, txn);
         Err(RangeError::Unavailable("no txn_live".into()))
     }
+    /// DDL across gateways (Phase 11): asks `node` to close the DDL transaction `txn`'s
+    /// `tables` (drain its writers and their readers). Ok(true) = Closed, Ok(false) = Pending
+    /// (the call waits briefly on `node` first).
+    fn ddl_close(
+        &self,
+        node: u64,
+        txn: ClusterTxnId,
+        priority: Timestamp,
+        tables: &[u64],
+    ) -> Result<bool, RangeError> {
+        let _ = (node, txn, priority, tables);
+        Err(RangeError::Unavailable("no ddl_close".into()))
+    }
+    /// Ends `txn`'s close on `node` (after the DDL committed or rolled back). Idempotent.
+    fn ddl_open(&self, node: u64, txn: ClusterTxnId) -> Result<(), RangeError> {
+        let _ = (node, txn);
+        Err(RangeError::Unavailable("no ddl_open".into()))
+    }
+    /// Whether the DDL transaction `txn` still runs on its gateway `node`.
+    fn ddl_live(&self, node: u64, txn: ClusterTxnId) -> Result<bool, RangeError> {
+        let _ = (node, txn);
+        Err(RangeError::Unavailable("no ddl_live".into()))
+    }
 }
 /// Deadlock service on every gateway, called by the peer dispatcher.
 pub trait GatewayService: Send + Sync {
@@ -544,6 +567,26 @@ pub trait GatewayService: Send + Sync {
     /// Whether `txn` registered an xid on this gateway and has not ended (R5-55). A restarted
     /// gateway answers false for every earlier transaction (ids are never reused).
     fn txn_live(&self, txn: ClusterTxnId) -> bool {
+        let _ = txn;
+        false
+    }
+    /// Phase 11: closes this gateway for the DDL transaction `txn` on `tables`. Ok(true) once
+    /// closed, Ok(false) while still draining.
+    fn ddl_close(
+        &self,
+        txn: ClusterTxnId,
+        priority: Timestamp,
+        tables: &[u64],
+    ) -> Result<bool, RangeError> {
+        let _ = (txn, priority, tables);
+        Err(RangeError::Unavailable("no ddl_close".into()))
+    }
+    /// Phase 11: reopens this gateway after `txn` ended. Idempotent; unknown `txn` is a no-op.
+    fn ddl_open(&self, txn: ClusterTxnId) {
+        let _ = txn;
+    }
+    /// Phase 11: whether the DDL transaction `txn` still runs here.
+    fn ddl_live(&self, txn: ClusterTxnId) -> bool {
         let _ = txn;
         false
     }

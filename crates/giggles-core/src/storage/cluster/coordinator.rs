@@ -209,9 +209,21 @@ fn crash_point(point: &str) {
 
 /// Commits `plan` atomically across its participant ranges (GD-0075 Track D protocol,
 /// coordinator steps 1-6). Returns the commit timestamp only once Commit is durable at home.
+#[cfg(test)]
 pub(crate) fn commit_cross_range(
     client: &dyn RangeClient,
     plan: CommitPlan,
+) -> Result<Timestamp, CommitError> {
+    commit_cross_range_gated(client, plan, &|| Ok(()))
+}
+
+/// `commit_cross_range` that asks `gate` immediately before each request that can decide the
+/// outcome (every prepare, and the Decide(Commit) write); a refusal aborts the transaction
+/// (GD-0075 Phase 11: a fenced gateway sends no such request once its membership lapsed).
+pub(crate) fn commit_cross_range_gated(
+    client: &dyn RangeClient,
+    plan: CommitPlan,
+    gate: &(dyn Fn() -> Result<(), RangeError> + Sync),
 ) -> Result<Timestamp, CommitError> {
     let Some(home) = plan.participants.first() else {
         return Err(CommitError::Aborted(RangeError::Aborted(
@@ -245,6 +257,7 @@ pub(crate) fn commit_cross_range(
             .iter()
             .map(|p| {
                 s.spawn(move || {
+                    gate()?;
                     let prepared_at = prepare_with_retry(
                         client,
                         p.range,
@@ -281,6 +294,9 @@ pub(crate) fn commit_cross_range(
         Ok(c) => c,
         Err(e) => return abort(client, &plan, Some(incarnation), e),
     };
+    if let Err(e) = gate() {
+        return abort(client, &plan, Some(incarnation), e);
+    }
     let decide = HomeOp::Decide {
         txn,
         incarnation,

@@ -91,11 +91,7 @@ impl RangeEngine {
         self.check_stored(range_key.as_deref())?;
         let key = self.lock_key(&req.target)?;
         {
-            let mut state = self.state();
-            if state.expired.contains(&req.txn) {
-                // Its earlier locks here are gone: a fresh lease would hide that (S1, E67).
-                return Err(RangeError::Aborted("lock lease expired".into()));
-            }
+            let mut state = self.live_lease(self.state(), req.txn)?;
             let lease = self.config.lease;
             let entry = state.txns.entry(req.txn).or_insert(TxnEntry {
                 expires: Instant::now() + lease,
@@ -155,7 +151,7 @@ impl RangeEngine {
             self.locks.release_all(txn_id(req.txn));
             return Err(RangeError::Aborted("lock lease expired".into()));
         }
-        self.touch(req.txn);
+        self.renew(req.txn)?;
         let latest = match &req.target {
             LockTarget::TableSentinel { .. } | LockTarget::Interval { .. } => None,
             LockTarget::Key { space, key } => {
@@ -202,18 +198,35 @@ impl RangeEngine {
 
     /// Whether `txn` no longer has a lease here (expired, released or never locked).
     fn lease_lost(&self, txn: ClusterTxnId) -> bool {
-        !self.state().txns.contains_key(&txn)
+        self.live_lease(self.state(), txn)
+            .map_or(true, |state| !state.txns.contains_key(&txn))
     }
 
-    fn touch(&self, txn: ClusterTxnId) {
-        if let Some(entry) = self.state().txns.get_mut(&txn) {
-            entry.expires = Instant::now() + self.config.lease;
+    /// Enforce the sweep's expiry rule at use time, before an old lease can be revived.
+    pub(super) fn live_lease<'a>(
+        &self,
+        mut state: std::sync::MutexGuard<'a, super::EngineState>,
+        txn: ClusterTxnId,
+    ) -> Result<std::sync::MutexGuard<'a, super::EngineState>, RangeError> {
+        if state
+            .txns
+            .get(&txn)
+            .is_some_and(|entry| !entry.prepared && !entry.busy && entry.expires <= Instant::now())
+        {
+            state.txns.remove(&txn);
+            state.expired.insert(txn);
         }
+        if state.expired.contains(&txn) {
+            drop(state);
+            self.locks.release_all(txn_id(txn));
+            return Err(RangeError::Aborted("lock lease expired".into()));
+        }
+        Ok(state)
     }
 
     pub(super) fn renew(&self, txn: ClusterTxnId) -> Result<(), RangeError> {
         self.check_open()?;
-        let mut state = self.state();
+        let mut state = self.live_lease(self.state(), txn)?;
         match state.txns.get_mut(&txn) {
             Some(entry) => {
                 entry.expires = Instant::now() + self.config.lease;

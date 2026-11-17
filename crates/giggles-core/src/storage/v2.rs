@@ -215,11 +215,14 @@ impl V2Db {
         let maintenance = maintenance::Maintenance::start(&gc, true)?;
         kv.fence();
         let client = services.client();
-        let sequences = Arc::new(engine::seq::SequenceAllocator::leased(client, 0));
+        let sequences = Arc::new(engine::seq::SequenceAllocator::leased(client.clone(), 0));
         let xacts = engine::xact::XactIds::leased(sequences.clone());
+        // Catalog object ids are leased per reservation, never from a cached block: every
+        // id a DDL allocates must exceed every id already in the catalog (image validation),
+        // and DDL across gateways is serialized (Phase 11), so lease order is commit order.
         let catalog = engine::catalog::Catalog::open_with(
             engine::txn::TxnServices::Cluster(services.clone()),
-            sequences.clone(),
+            Arc::new(engine::seq::SequenceAllocator::leased(client, 1)),
         )?;
         Ok(Self {
             maintenance,

@@ -1,8 +1,13 @@
 //! Gateways running SQL through one in-process cluster (GD-0075 R5-43, R5-51/R5-56 wiring).
-use super::local::LocalCluster;
+use super::local::{LocalCluster, engine_config};
 use super::*;
 use crate::relational::{StatementClock, Value};
-use crate::storage::range_api::{RangeSpace, range_key};
+use crate::storage::cluster::txn::ddl::{Phase, ddl_lock_target, liveness_target, route};
+use crate::storage::range::engine::EngineConfig;
+use crate::storage::range_api::{
+    ClusterTxnId, LockRequest, LockTarget, RangeClient, RangeError, RangeId, RangeLockMode,
+    RangeSpace, range_key,
+};
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -29,11 +34,33 @@ fn splits() -> Vec<Vec<u8>> {
 }
 
 fn gateway(cluster: &Arc<LocalCluster>, node: u16) -> Gateway {
-    let config = ClusterConfig {
-        node,
-        heartbeat: Duration::from_millis(200),
-        ..ClusterConfig::default()
-    };
+    attach_with(
+        cluster,
+        ClusterConfig {
+            node,
+            heartbeat: Duration::from_millis(200),
+            ..ClusterConfig::default()
+        },
+    )
+}
+
+/// A gateway of the multi-gateway cluster `gateways` (Phase 11): it joins before serving. Its
+/// liveness lease stays well below the test engines' 2 s range lock lease.
+fn member(cluster: &Arc<LocalCluster>, node: u16, gateways: &[u16]) -> Gateway {
+    attach_with(
+        cluster,
+        ClusterConfig {
+            node,
+            heartbeat: Duration::from_millis(200),
+            gateways: gateways.to_vec(),
+            gateway_lease: Duration::from_millis(800),
+            ..ClusterConfig::default()
+        },
+    )
+}
+
+fn attach_with(cluster: &Arc<LocalCluster>, config: ClusterConfig) -> Gateway {
+    let node = config.node;
     let deadlock = DeadlockConfig {
         deadlock_timeout: Duration::from_millis(200),
         lock_wait_backstop: Duration::from_secs(20),
@@ -351,7 +378,9 @@ fn a_gateway_aggregate_over_the_retention_budget_spills() {
 }
 
 fn run(session: &mut crate::storage::SqlSession, sql: &str) -> crate::relational::SqlResult {
-    session.execute_at(sql, &[], None, &clock()).unwrap()
+    session
+        .execute_at(sql, &[], None, &clock())
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
 }
 
 /// P7-1: a gateway attached before another gateway's DDL serves that DDL (the catalog-generation
@@ -610,4 +639,527 @@ fn a_prepared_write_above_a_row_does_not_delay_point_reads_through_a_gateway() {
         let rows = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(rows, vec![vec![90]]);
     });
+}
+
+/// One range lock request of `txn` made directly on the cluster (a stand-in for another
+/// gateway's transaction): the range that granted it.
+fn lock_as(
+    cluster: &LocalCluster,
+    txn: ClusterTxnId,
+    target: LockTarget,
+    mode: RangeLockMode,
+    timeout_ms: u64,
+) -> Result<RangeId, RangeError> {
+    let descriptor = cluster.descriptor_for(&route(&target)).unwrap();
+    let priority = cluster.oracle().next(1).unwrap();
+    cluster
+        .lock(LockRequest {
+            range: descriptor.id,
+            epoch: descriptor.epoch,
+            txn,
+            priority,
+            target,
+            mode,
+            timeout_ms: Some(timeout_ms),
+        })
+        .map(|_| descriptor.id)
+}
+
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Phase 11 (P11-1a): member gateways join before serving and keep serving through renewal
+/// probes, past the range lock lease.
+#[test]
+fn member_gateways_join_and_hold_their_liveness_locks() {
+    let cluster = LocalCluster::new(&splits());
+    let a = member(&cluster, 1, &[1, 2]);
+    let b = member(&cluster, 2, &[1, 2]);
+    let (mut sa, mut sb) = (a.admin.sql_session(), b.admin.sql_session());
+    run(&mut sa, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+    run(&mut sb, "INSERT INTO t VALUES (1, 10)");
+    // Longer than the engines' 2 s lock lease: probes keep them serving.
+    std::thread::sleep(Duration::from_millis(2_500));
+    for gateway in [&a, &b] {
+        assert_eq!(gateway.services.membership_phase(), Phase::Serving);
+    }
+    run(&mut sb, "INSERT INTO t VALUES (2, 20)");
+    assert_eq!(
+        ints(&run(&mut sa, "SELECT id, v FROM t ORDER BY id")),
+        vec![vec![1, 10], vec![2, 20]]
+    );
+    // No DDL holds the DDL lock: a joiner's Shared request is granted at once.
+    let joiner = ClusterTxnId::new(99, 3);
+    let range = lock_as(
+        &cluster,
+        joiner,
+        ddl_lock_target(),
+        RangeLockMode::Shared,
+        100,
+    )
+    .unwrap();
+    cluster.release(range, joiner).unwrap();
+}
+
+/// Phase 11 (P11-1a): a gateway that cannot renew its liveness lock (here the range holding it
+/// has no leader) fences: no statement runs there and its open transactions never commit, not
+/// even after it rejoined. Once the range is back it rejoins and serves; the other gateway,
+/// whose liveness lock sits in another range, serves throughout.
+#[test]
+fn a_gateway_that_cannot_renew_fences_and_rejoins() {
+    // B's liveness lock alone in a range.
+    let key = |node| route(&liveness_target(node));
+    let mut bounds = splits();
+    bounds.extend([key(2), key(3)]);
+    bounds.sort();
+    let cluster = LocalCluster::new(&bounds);
+    let range = |node| cluster.descriptor_for(&key(node)).unwrap().id;
+    let liveness_range = range(2);
+    assert_ne!(liveness_range, range(1));
+    let a = member(&cluster, 1, &[1, 2]);
+    let b = member(&cluster, 2, &[1, 2]);
+    let mut sa = a.admin.sql_session();
+    let (mut sb, mut sb2, mut sb3) = (
+        b.admin.sql_session(),
+        b.admin.sql_session(),
+        b.admin.sql_session(),
+    );
+    run(&mut sa, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+    run(&mut sb, "BEGIN");
+    run(&mut sb, "INSERT INTO t VALUES (1, 1)");
+    run(&mut sb3, "BEGIN");
+    run(&mut sb3, "INSERT INTO t VALUES (3, 3)");
+    cluster.stop(liveness_range);
+    wait_until("B fences", || {
+        b.services.membership_phase() == Phase::Fenced
+    });
+    assert_eq!(a.services.membership_phase(), Phase::Serving);
+    // The open transaction cannot commit.
+    let error = sb.execute_at("COMMIT", &[], None, &clock()).unwrap_err();
+    let _ = sb.execute_at("ROLLBACK", &[], None, &clock());
+    assert!(!format!("{error:?}").is_empty());
+    // No new statement runs while fenced.
+    let error = sb2
+        .execute_at("SELECT id FROM t", &[], None, &clock())
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("Conflict"), "{error:?}");
+    // A still serves.
+    run(&mut sa, "INSERT INTO t VALUES (4, 4)");
+    // A new leader for the range: B rejoins and serves again.
+    cluster.restart(liveness_range);
+    wait_until("B rejoins", || {
+        b.services.membership_phase() == Phase::Serving
+    });
+    run(&mut sb2, "INSERT INTO t VALUES (2, 2)");
+    // A transaction live across the fence never commits, even after the rejoin.
+    let error = sb3.execute_at("COMMIT", &[], None, &clock()).unwrap_err();
+    let _ = sb3.execute_at("ROLLBACK", &[], None, &clock());
+    assert!(format!("{error:?}").contains("Conflict"), "{error:?}");
+    assert_eq!(
+        ints(&run(&mut sa, "SELECT id, v FROM t ORDER BY id")),
+        vec![vec![2, 2], vec![4, 4]]
+    );
+    assert_eq!(
+        ints(&run(&mut sb2, "SELECT id, v FROM t ORDER BY id")),
+        vec![vec![2, 2], vec![4, 4]]
+    );
+    assert_eq!(a.services.membership_phase(), Phase::Serving);
+}
+
+/// A cluster for member gateways whose range lock lease (10 s) outlasts the tests' own direct
+/// lock holders; gateways still use an 800 ms liveness lease.
+fn member_cluster() -> Arc<LocalCluster> {
+    LocalCluster::with_config(
+        &splits(),
+        EngineConfig {
+            lease: Duration::from_secs(10),
+            ..engine_config()
+        },
+    )
+}
+
+/// Gateways 1..=n, all members of one cluster.
+fn members(cluster: &Arc<LocalCluster>, n: u16) -> Vec<Gateway> {
+    let ids: Vec<u16> = (1..=n).collect();
+    ids.iter().map(|id| member(cluster, *id, &ids)).collect()
+}
+
+/// Phase 11: an evicting DDL holds a gateway's liveness key Exclusive. It is granted at once
+/// (probes hold the key only for an instant); the live, reachable gateway then fences when its
+/// validity ends, cannot rejoin while the key is held, and serves again once it is released.
+#[test]
+fn a_held_liveness_key_fences_a_live_gateway_until_released() {
+    let cluster = member_cluster();
+    let g = members(&cluster, 2);
+    let (mut sa, mut sb) = (g[0].admin.sql_session(), g[1].admin.sql_session());
+    run(&mut sa, "CREATE TABLE t(id INT PRIMARY KEY)");
+    let holder = ClusterTxnId::new(99, 1);
+    let range = lock_as(
+        &cluster,
+        holder,
+        liveness_target(2),
+        RangeLockMode::Exclusive,
+        500,
+    )
+    .unwrap();
+    wait_until("B fences", || {
+        g[1].services.membership_phase() == Phase::Fenced
+    });
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert_eq!(g[1].services.membership_phase(), Phase::Fenced);
+    assert_eq!(g[0].services.membership_phase(), Phase::Serving);
+    let error = sb
+        .execute_at("SELECT id FROM t", &[], None, &clock())
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("Conflict"), "{error:?}");
+    run(&mut sa, "INSERT INTO t VALUES (1)");
+    cluster.release(range, holder).unwrap();
+    wait_until("B rejoins", || {
+        g[1].services.membership_phase() == Phase::Serving
+    });
+    assert_eq!(ints(&run(&mut sb, "SELECT id FROM t")), vec![vec![1]]);
+}
+
+/// Runs `sql` on `gateway` in a scoped thread and checks it has not finished after 700 ms;
+/// `release` then ends what blocks it, and the statement must succeed.
+fn blocked_until(gateway: &Gateway, sql: &str, release: impl FnOnce()) {
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let ddl = scope.spawn(|| {
+            let mut s = gateway.admin.sql_session();
+            let result = s.execute_at(sql, &[], None, &clock()).map(drop);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            result
+        });
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "{sql} did not wait"
+        );
+        release();
+        ddl.join().unwrap().unwrap();
+    });
+}
+
+/// Phase 11 tests (1) and (5): an ALTER on A waits for a DML transaction open on B, and B's
+/// next INSERT after the ALTER returned uses the new column; an open read transaction of the
+/// table on B delays the next ALTER the same way.
+#[test]
+fn a_ddl_waits_for_writers_and_readers_on_other_gateways() {
+    let cluster = member_cluster();
+    let g = members(&cluster, 2);
+    let mut sb = g[1].admin.sql_session();
+    run(&mut sb, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+    run(&mut sb, "BEGIN");
+    run(&mut sb, "INSERT INTO t VALUES (1, 1)");
+    blocked_until(&g[0], "ALTER TABLE t ADD COLUMN w INT", || {
+        run(&mut sb, "COMMIT");
+    });
+    run(&mut sb, "INSERT INTO t VALUES (2, 2, 9)");
+    assert_eq!(
+        ints(&run(&mut sb, "SELECT id, w FROM t WHERE w IS NOT NULL")),
+        vec![vec![2, 9]]
+    );
+    run(&mut sb, "BEGIN");
+    run(&mut sb, "SELECT count(*) FROM t");
+    blocked_until(&g[0], "ALTER TABLE t ADD COLUMN x INT", || {
+        run(&mut sb, "COMMIT");
+    });
+    run(&mut sb, "INSERT INTO t VALUES (3, 3, 3, 3)");
+}
+
+/// A dynamically enrolled gateway drains its writer even when absent from A's config.
+#[test]
+fn a_ddl_closes_gateways_from_the_member_source() {
+    let cluster = member_cluster();
+    let a = member(&cluster, 1, &[1]);
+    let b = member(&cluster, 2, &[1, 2]);
+    a.services.set_member_source(Box::new(|| Ok(vec![1, 2, 2])));
+    let mut sb = b.admin.sql_session();
+    run(&mut sb, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+    run(&mut sb, "BEGIN");
+    run(&mut sb, "INSERT INTO t VALUES (1, 1)");
+    blocked_until(&a, "ALTER TABLE t ADD COLUMN w INT", || {
+        run(&mut sb, "COMMIT");
+    });
+    run(&mut sb, "INSERT INTO t VALUES (2, 2, 9)");
+    assert_eq!(
+        ints(&run(&mut sb, "SELECT id, w FROM t WHERE w IS NOT NULL")),
+        vec![vec![2, 9]]
+    );
+}
+
+#[test]
+fn a_failing_member_source_refuses_ddl_with_a_transient_error() {
+    let cluster = member_cluster();
+    let a = member(&cluster, 1, &[1]);
+    let mut sa = a.admin.sql_session();
+    run(&mut sa, "CREATE TABLE t(id INT PRIMARY KEY)");
+    a.services.set_member_source(Box::new(|| {
+        Err(RangeError::Unavailable("registry unavailable".into()))
+    }));
+    let error = sa
+        .execute_at("ALTER TABLE t ADD COLUMN w INT", &[], None, &clock())
+        .unwrap_err();
+    assert!(
+        matches!(error, CoreError::Sql(crate::relational::SqlError::Conflict)),
+        "{error:?}"
+    );
+    a.services.set_member_source(Box::new(|| Ok(vec![1])));
+    // The failed DDL released its locks and did not publish the column.
+    run(&mut sa, "ALTER TABLE t ADD COLUMN w INT");
+}
+
+/// Phase 11 test (2): DDL through two gateways at once serializes (no 40001, no lost column)
+/// and both gateways end with the same catalog.
+#[test]
+fn concurrent_ddl_through_two_gateways_serializes() {
+    let cluster = member_cluster();
+    let g = members(&cluster, 2);
+    run(
+        &mut g[0].admin.sql_session(),
+        "CREATE TABLE t(id INT PRIMARY KEY)",
+    );
+    std::thread::scope(|scope| {
+        for (i, gateway) in g.iter().enumerate() {
+            scope.spawn(move || {
+                let mut s = gateway.admin.sql_session();
+                for k in 0..4 {
+                    run(&mut s, &format!("ALTER TABLE t ADD COLUMN c{i}_{k} INT"));
+                    run(&mut s, &format!("CREATE TABLE n{i}_{k}(id INT)"));
+                }
+            });
+        }
+    });
+    run(
+        &mut g[0].admin.sql_session(),
+        "INSERT INTO t(id) VALUES (1)",
+    );
+    for gateway in &g {
+        let mut s = gateway.admin.sql_session();
+        assert_eq!(run(&mut s, "SELECT * FROM t").rows[0].values.len(), 9);
+        for name in ["n0_3", "n1_3"] {
+            run(&mut s, &format!("SELECT count(*) FROM {name}"));
+        }
+    }
+}
+
+/// Phase 11 test (3): A holds row x and B waits for it; A's ALTER then waits for its proxy on
+/// B, which waits for B's transaction: one cycle across gateways, exactly one 40P01.
+#[test]
+fn a_cycle_through_a_ddl_proxy_ends_with_one_deadlock() {
+    let cluster = member_cluster();
+    let g = members(&cluster, 2);
+    let mut sa = g[0].admin.sql_session();
+    run(&mut sa, "CREATE TABLE x(id INT PRIMARY KEY, n INT)");
+    run(&mut sa, "INSERT INTO x VALUES (1, 0)");
+    run(&mut sa, "BEGIN");
+    run(&mut sa, "UPDATE x SET n = n + 1 WHERE id = 1");
+    let (alter, update) = std::thread::scope(|scope| {
+        let b = &g[1];
+        let update = scope.spawn(move || {
+            let mut s = b.admin.sql_session();
+            s.execute_at("UPDATE x SET n = n + 1 WHERE id = 1", &[], None, &clock())
+                .map(drop)
+                .map_err(|e| format!("{e:?}"))
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let alter = sa
+            .execute_at("ALTER TABLE x ADD COLUMN w INT", &[], None, &clock())
+            .map(drop)
+            .map_err(|e| format!("{e:?}"));
+        let end = if alter.is_ok() { "COMMIT" } else { "ROLLBACK" };
+        run(&mut sa, end);
+        (alter, update.join().unwrap())
+    });
+    let failed: Vec<_> = [&alter, &update]
+        .into_iter()
+        .filter_map(|r| r.as_ref().err())
+        .collect();
+    assert_eq!(failed.len(), 1, "{alter:?} {update:?}");
+    assert!(failed[0].contains("Deadlock"), "{failed:?}");
+}
+
+/// Phase 11 test (4): a member no peer can reach is evicted. The DDL completes once that
+/// gateway's liveness has lapsed; the gateway fences, and rejoins after the DDL with the new
+/// catalog.
+#[test]
+fn an_unreachable_gateway_is_evicted_and_rejoins_with_the_new_catalog() {
+    let cluster = LocalCluster::new(&splits());
+    let lock_lease = Duration::from_secs(2);
+    let gateway_lease = Duration::from_millis(300);
+    let g: Vec<_> = (1..=3)
+        .map(|node| {
+            attach_with(
+                &cluster,
+                ClusterConfig {
+                    node,
+                    gateways: vec![1, 2, 3],
+                    heartbeat: Duration::from_millis(50),
+                    gateway_lease,
+                    lock_lease,
+                    ..ClusterConfig::default()
+                },
+            )
+        })
+        .collect();
+    run(
+        &mut g[0].admin.sql_session(),
+        "CREATE TABLE t(id INT PRIMARY KEY)",
+    );
+    cluster.unregister_gateway(3);
+    let started = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        let alter = scope.spawn(|| {
+            run(
+                &mut g[0].admin.sql_session(),
+                "ALTER TABLE t ADD COLUMN w INT",
+            );
+        });
+        wait_until("C fences", || {
+            g[2].services.membership_phase() == Phase::Fenced
+        });
+        alter.join().unwrap();
+    });
+    assert!(started.elapsed() >= gateway_lease + lock_lease);
+    wait_until("C rejoins", || {
+        g[2].services.membership_phase() == Phase::Serving
+    });
+    let mut sc = g[2].admin.sql_session();
+    run(&mut sc, "INSERT INTO t VALUES (1, 5)");
+    assert_eq!(ints(&run(&mut sc, "SELECT id, w FROM t")), vec![vec![1, 5]]);
+}
+
+/// Phase 11 (review B3): a REPEATABLE READ transaction on B whose snapshot predates an ALTER
+/// through A fails its INSERT with 40001, as on one node, instead of writing the old layout.
+#[test]
+fn a_repeatable_read_writer_fails_after_another_gateways_ddl() {
+    let cluster = member_cluster();
+    let g = members(&cluster, 2);
+    let (mut sa, mut sb) = (g[0].admin.sql_session(), g[1].admin.sql_session());
+    run(&mut sa, "CREATE TABLE t(id bigint PRIMARY KEY)");
+    sb.set_isolation(crate::storage::SqlIsolation::RepeatableRead);
+    run(&mut sb, "BEGIN");
+    run(&mut sb, "SELECT 1");
+    run(&mut sa, "ALTER TABLE t ADD COLUMN w bigint DEFAULT 5");
+    let error = sb
+        .execute_at("INSERT INTO t VALUES (1)", &[], None, &clock())
+        .unwrap_err();
+    let _ = sb.execute_at("ROLLBACK", &[], None, &clock());
+    assert!(format!("{error:?}").contains("Conflict"), "{error:?}");
+    sb.set_isolation(crate::storage::SqlIsolation::ReadCommitted);
+    // Explicit values: an INSERT that takes an added column's DEFAULT fails with Sql(Type) on
+    // every gateway (also the DDL's own) in cluster mode today, unrelated to Phase 11.
+    run(&mut sb, "INSERT INTO t VALUES (1, 7)");
+    assert_eq!(ints(&run(&mut sa, "SELECT id, w FROM t")), vec![vec![1, 7]]);
+}
+
+/// Phase 11 (review S1): `DROP TABLE a, b` closes every table it drops, so it waits for a
+/// reader of `b` on another gateway (the statement's first table is `a`).
+#[test]
+fn a_multi_table_drop_waits_for_a_reader_of_any_of_its_tables() {
+    let cluster = member_cluster();
+    let g = members(&cluster, 2);
+    let mut sb = g[1].admin.sql_session();
+    run(&mut sb, "CREATE TABLE a(id INT PRIMARY KEY)");
+    run(&mut sb, "CREATE TABLE b(id INT PRIMARY KEY)");
+    run(&mut sb, "BEGIN");
+    run(&mut sb, "SELECT count(*) FROM b");
+    blocked_until(&g[0], "DROP TABLE a, b", || {
+        run(&mut sb, "COMMIT");
+    });
+    let error = sb
+        .execute_at("SELECT count(*) FROM b", &[], None, &clock())
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("UnknownTable"), "{error:?}");
+}
+
+/// Phase 11 (review S6): a member list must name the gateway and come with a peer.
+#[test]
+fn gateway_member_settings_are_checked() {
+    let cluster = member_cluster();
+    let config = |node, gateways: &[u16]| ClusterConfig {
+        node,
+        gateways: gateways.to_vec(),
+        ..ClusterConfig::default()
+    };
+    let attach_plain =
+        |config| attach(cluster.clone(), config, None, [9; 16], Limits::default()).map(|_| ());
+    let error = attach_plain(config(1, &[2, 3])).unwrap_err();
+    assert!(format!("{error:?}").contains("not among"), "{error:?}");
+    let error = attach_plain(config(1, &[1, 2])).unwrap_err();
+    assert!(format!("{error:?}").contains("peer"), "{error:?}");
+}
+
+/// Fencing must drain leases even when there are no commit calls left in flight.
+#[test]
+fn a_fenced_gateway_closes_only_after_its_lock_lease() {
+    let cluster = LocalCluster::new(&splits());
+    let lease = Duration::from_secs(2);
+    let b = attach_with(
+        &cluster,
+        ClusterConfig {
+            node: 2,
+            gateways: vec![1, 2],
+            gateway_lease: Duration::from_millis(200),
+            lock_lease: lease,
+            heartbeat: Duration::from_millis(50),
+            ..ClusterConfig::default()
+        },
+    );
+    let holder = ClusterTxnId::new(99, 1);
+    let range = lock_as(
+        &cluster,
+        holder,
+        liveness_target(2),
+        RangeLockMode::Exclusive,
+        100,
+    )
+    .unwrap();
+    wait_until("B fences", || {
+        b.services.membership_phase() == Phase::Fenced
+    });
+    let fenced = std::time::Instant::now();
+    let peer = b.services.gateway_service();
+    let ddl = ClusterTxnId::new(1, 100);
+    assert!(
+        !peer
+            .ddl_close(ddl, crate::range_api::Timestamp(1), &[])
+            .unwrap()
+    );
+    // Keep the eviction key held so B cannot rejoin while we observe it.
+    while fenced.elapsed() < lease {
+        cluster.heartbeat(range, holder).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        peer.ddl_close(ddl, crate::range_api::Timestamp(1), &[])
+            .unwrap()
+    );
+    cluster.release(range, holder).unwrap();
+}
+
+#[test]
+fn a_single_member_without_a_peer_can_run_ddl() {
+    let cluster = member_cluster();
+    let g = attach(
+        cluster,
+        ClusterConfig {
+            gateways: vec![1],
+            ..ClusterConfig::default()
+        },
+        None,
+        [9; 16],
+        Limits::default(),
+    )
+    .unwrap();
+    run(
+        &mut g.admin.sql_session(),
+        "CREATE TABLE alone(id INT PRIMARY KEY)",
+    );
 }

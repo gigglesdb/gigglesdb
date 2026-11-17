@@ -71,12 +71,12 @@ impl RangeEngine {
     /// Marks `txn` busy (one commit or prepare at a time), after any running one ends. The
     /// transaction must hold a lease here in this term, unless every write is catalog-only.
     fn begin(&self, txn: ClusterTxnId, writes: &[RangeWrite]) -> Result<Begun<'_>, RangeError> {
-        let mut state = self.idle(txn);
+        let state = self.idle(txn);
         self.check_open()?;
         if let Some(record) = state.prepared.get(&txn) {
             return Ok(Begun::Prepared(record.at));
         }
-        let expired = state.expired.contains(&txn);
+        let mut state = self.live_lease(state, txn)?;
         let catalog_only = !writes.is_empty()
             && writes
                 .iter()
@@ -86,7 +86,6 @@ impl RangeEngine {
                 entry.busy = true;
                 Ok(Begun::Ready(Busy(self, txn)))
             }
-            None if expired => Err(RangeError::Aborted("lock lease expired".into())),
             // The system range holds no lockable target (design.md 1), so a DDL's catalog-only
             // commit there needs no lease.
             None if catalog_only => {

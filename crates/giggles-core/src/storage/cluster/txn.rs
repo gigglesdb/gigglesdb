@@ -2,7 +2,7 @@
 //! the per-table writer sentinel (design.md 3.1), buffered single-range commit, release and
 //! lock-lease heartbeats. Multi-range commit is R5-51 (Track D).
 use super::coordinator::{
-    CommitError, CommitPlan, Participant, commit_cross_range,
+    CommitError, CommitPlan, Participant, commit_cross_range_gated,
     deadlock::{DeadlockConfig, DeadlockDetector, DetectorHandle, LocalLocks},
 };
 use super::read::{RoutedKvRead, past_end, range_space};
@@ -35,6 +35,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Gateway membership and DDL across gateways (GD-0075 Phase 11), in cluster/ddl.rs.
+#[path = "ddl.rs"]
+pub(crate) mod ddl;
 #[cfg(test)]
 mod tests;
 
@@ -67,6 +70,14 @@ pub(crate) struct ClusterConfig {
     pub(crate) lock_backstop: Duration,
     /// Attempts for NotLeader / Unavailable / StaleEpoch before giving up.
     pub(crate) retries: u32,
+    /// Every gateway of the cluster, this one included (Phase 11). Empty: single-gateway
+    /// mode (no membership, no fencing).
+    pub(crate) gateways: Vec<u16>,
+    /// How long a granted liveness lock lets this gateway serve (`ddl` module); below the
+    /// range lock lease.
+    pub(crate) gateway_lease: Duration,
+    /// Lease of transaction locks at the ranges.
+    pub(crate) lock_lease: Duration,
 }
 impl Default for ClusterConfig {
     fn default() -> Self {
@@ -78,6 +89,9 @@ impl Default for ClusterConfig {
             lock_slice: Duration::from_millis(500),
             lock_backstop: Duration::from_secs(300),
             retries: 8,
+            gateways: Vec::new(),
+            gateway_lease: Duration::from_secs(6),
+            lock_lease: Duration::from_secs(10),
         }
     }
 }
@@ -101,6 +115,10 @@ struct TxnState {
     exclusive_tables: BTreeSet<u64>,
     /// Set when a heartbeat learns the locks were lost (leader change, lease expiry).
     aborted: bool,
+    /// Set when the gateway fenced while the transaction was live: it never runs again.
+    fenced: bool,
+    /// A DDL transaction across gateways (Phase 11): the members it closed or evicted.
+    ddl: Option<ddl::DdlTxn>,
     /// Where the transaction is waiting now (for R5-56's deadlock detector).
     waiting: Option<WaitSite>,
 }
@@ -121,6 +139,8 @@ pub(crate) struct ClusterTxnServices {
     peer: Option<Arc<dyn GatewayPeer>>,
     /// What the peer dispatcher serves for this gateway: deadlock calls and `txn_live`.
     endpoint: Arc<GatewayEndpoint>,
+    /// Gateway membership (Phase 11): whether this gateway may serve.
+    membership: ddl::Membership,
 }
 
 /// This gateway's `GatewayService`: deadlock calls go to the detector (none without peers),
@@ -128,10 +148,15 @@ pub(crate) struct ClusterTxnServices {
 struct GatewayEndpoint {
     detector: Option<Arc<DeadlockDetector>>,
     xact_owners: Mutex<HashSet<TxnId>>,
+    /// The gateway's services, for the DDL calls (Phase 11).
+    services: std::sync::OnceLock<Weak<ClusterTxnServices>>,
 }
 impl GatewayEndpoint {
     fn owners(&self) -> std::sync::MutexGuard<'_, HashSet<TxnId>> {
         self.xact_owners.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    fn services(&self) -> Option<Arc<ClusterTxnServices>> {
+        self.services.get().and_then(Weak::upgrade)
     }
 }
 impl GatewayService for GatewayEndpoint {
@@ -157,6 +182,26 @@ impl GatewayService for GatewayEndpoint {
     }
     fn txn_live(&self, txn: ClusterTxnId) -> bool {
         self.owners().contains(&TxnId(txn.0))
+    }
+    fn ddl_close(
+        &self,
+        txn: ClusterTxnId,
+        _priority: Timestamp,
+        tables: &[u64],
+    ) -> Result<bool, RangeError> {
+        match self.services() {
+            Some(services) => services.proxy_close(txn, tables),
+            None => Err(RangeError::Unavailable("gateway closed".into())),
+        }
+    }
+    fn ddl_open(&self, txn: ClusterTxnId) {
+        if let Some(services) = self.services() {
+            services.proxy_open(txn);
+        }
+    }
+    fn ddl_live(&self, txn: ClusterTxnId) -> bool {
+        self.services()
+            .is_some_and(|services| services.ddl_live(txn))
     }
 }
 
@@ -222,6 +267,7 @@ impl ClusterTxnServices {
         peer: Option<(Arc<dyn GatewayPeer>, DeadlockConfig)>,
     ) -> Arc<Self> {
         let gateway = Arc::new(LockManager::new(LockConfig::default()));
+        let membership = !config.gateways.is_empty();
         let peer_handle = peer.as_ref().map(|(peer, _)| peer.clone());
         let detector = peer.map(|(peer, deadlock)| {
             DeadlockDetector::new(
@@ -236,6 +282,7 @@ impl ClusterTxnServices {
         let endpoint = Arc::new(GatewayEndpoint {
             detector: detector.clone(),
             xact_owners: Mutex::new(HashSet::new()),
+            services: std::sync::OnceLock::new(),
         });
         let services = Arc::new(Self {
             client,
@@ -248,8 +295,10 @@ impl ClusterTxnServices {
             _detector_thread: thread,
             peer: peer_handle,
             endpoint,
+            membership: ddl::Membership::new(membership),
         });
         let weak = Arc::downgrade(&services);
+        let _ = services.endpoint.services.set(weak.clone());
         let stop = services.stop.clone();
         let period = services.config.heartbeat;
         thread::Builder::new()
@@ -668,7 +717,33 @@ impl ClusterTxnServices {
         Ok(())
     }
 
+    /// Normal release, also used by the ambiguous-DDL settle thread.
+    fn finish_release(&self, txn: TxnId) {
+        let state = self
+            .txns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&txn);
+        if let Some(mut state) = state {
+            // A DDL reopens the gateways it closed before its range locks go (Phase 11).
+            if let Some(ddl) = state.ddl.take() {
+                self.end_ddl(txn, ddl);
+            }
+            for range in state.ranges {
+                // Unreleased locks die with their lease; nothing to retry here.
+                let _ = self.client.release(range, ClusterTxnId(txn.0));
+            }
+        }
+        self.gateway.release_all(txn);
+        // The transaction has ended (after its commit returned, or rolled back): an xid it
+        // registered is no longer live here (R5-55 rule 3c).
+        self.endpoint.owners().remove(&txn);
+    }
+
     fn heartbeat_all(&self) {
+        if self.gate().is_err() {
+            return;
+        }
         // Only ranges that granted a lock: a request that failed before the leader saw it
         // left no lease there, and "holds no locks" from it must not abort the transaction.
         let work: Vec<(TxnId, Vec<RangeId>)> = {
@@ -680,6 +755,9 @@ impl ClusterTxnServices {
         };
         for (txn, ranges) in work {
             for range in ranges {
+                if self.gate().is_err() {
+                    return;
+                }
                 if let Err(RangeError::Aborted(_)) =
                     self.client.heartbeat(range, ClusterTxnId(txn.0))
                 {
@@ -757,6 +835,7 @@ fn empty(start: &Bound<Vec<u8>>, end: &Bound<Vec<u8>>) -> bool {
 impl Drop for ClusterTxnServices {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.leave();
     }
 }
 
@@ -781,10 +860,13 @@ fn heartbeat_loop(services: Weak<ClusterTxnServices>, stop: Arc<AtomicBool>, per
 
 impl ClusterServices for ClusterTxnServices {
     fn snapshot(&self, txn: TxnId) -> Result<Ts, TxnError> {
+        // A fenced gateway serves no statement; a transaction live across a fence never
+        // runs again (ddl module).
+        let joined = self.check_serving()?;
         let ts = self.oracle()?;
-        self.state(txn, |state| {
+        self.admit(txn, joined, |state| {
             state.priority.get_or_insert(ts);
-        });
+        })?;
         Ok(Ts(ts.0))
     }
     fn now(&self) -> Result<Ts, TxnError> {
@@ -888,8 +970,61 @@ impl ClusterServices for ClusterTxnServices {
     fn write_set_bytes(&self) -> usize {
         self.config.write_set_bytes
     }
-    fn commit(&self, txn: TxnId, mut commit: ClusterCommit) -> Result<Ts, TxnError> {
+    fn commit(&self, txn: TxnId, commit: ClusterCommit) -> Result<Ts, TxnError> {
+        // Counted until it returns, and before the transaction's own checks: a gateway rejoins,
+        // and answers a DDL's close without a proxy, only once no commit call is in flight.
+        let _commit = self.begin_commit()?;
         self.check_live(txn)?;
+        let result = self.commit_writes(txn, commit);
+        if result == Err(TxnError::CommitAmbiguous) {
+            // A DDL whose outcome is unknown keeps the other gateways closed until it settled.
+            self.state(txn, |state| {
+                if let Some(ddl) = state.ddl.as_mut() {
+                    ddl.ambiguous = true;
+                }
+            });
+        }
+        result
+    }
+    fn release_all(&self, txn: TxnId) {
+        if !self.defer_ddl_release(txn) {
+            self.finish_release(txn);
+        }
+    }
+    fn next_txn_id(&self) -> TxnId {
+        ClusterTxnServices::next_txn_id(self)
+    }
+    fn ddl_begin(&self, txn: TxnId, cancel: &dyn Fn() -> bool) -> Result<(), TxnError> {
+        self.begin_ddl(txn, cancel)
+    }
+    fn ddl_close(
+        &self,
+        txn: TxnId,
+        tables: &[u64],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError> {
+        self.close_ddl(txn, tables, cancel)
+    }
+    fn client(&self) -> Arc<dyn RangeClient> {
+        self.client.clone()
+    }
+    fn register_xact(&self, txn: TxnId, xid: u64) -> Result<(), TxnError> {
+        // Live before the record can be read: whoever finds Owner and asks hears "live".
+        self.endpoint.owners().insert(txn);
+        let result = self.write_owner(txn, xid);
+        if result.is_err() {
+            self.endpoint.owners().remove(&txn);
+        }
+        result
+    }
+    fn xact_status(&self, xid: u64) -> Result<Option<XactStatus>, TxnError> {
+        self.xact_status_of(xid)
+    }
+}
+
+impl ClusterTxnServices {
+    /// The commit itself (`ClusterServices::commit` counts it and checks the transaction).
+    fn commit_writes(&self, txn: TxnId, mut commit: ClusterCommit) -> Result<Ts, TxnError> {
         let serializable = commit.isolation == Isolation::Serializable;
         if serializable {
             let reads = commit.reads.take().unwrap_or_default();
@@ -1022,21 +1157,23 @@ impl ClusterServices for ClusterTxnServices {
                     participants: groups,
                     lock_only,
                 };
-                commit_cross_range(self.client.as_ref(), plan).map_err(|e| match e {
-                    // A participant without a leader (a split child reopening or electing)
-                    // aborted the transaction before any decision: retryable, not an I/O error.
-                    CommitError::Aborted(
-                        RangeError::NotLeader { .. } | RangeError::Unavailable(_),
-                    ) => TxnError::Serialization(SerializationReason::WriteConflict),
-                    CommitError::Aborted(cause) => match txn_error(cause) {
-                        // A definite abort is never reported as an unknown outcome.
-                        TxnError::CommitAmbiguous => {
-                            TxnError::Serialization(SerializationReason::WriteConflict)
-                        }
-                        other => other,
+                commit_cross_range_gated(self.client.as_ref(), plan, &|| self.gate()).map_err(
+                    |e| match e {
+                        // A participant without a leader (a split child reopening or electing)
+                        // aborted the transaction before any decision: retryable, not an I/O error.
+                        CommitError::Aborted(
+                            RangeError::NotLeader { .. } | RangeError::Unavailable(_),
+                        ) => TxnError::Serialization(SerializationReason::WriteConflict),
+                        CommitError::Aborted(cause) => match txn_error(cause) {
+                            // A definite abort is never reported as an unknown outcome.
+                            TxnError::CommitAmbiguous => {
+                                TxnError::Serialization(SerializationReason::WriteConflict)
+                            }
+                            other => other,
+                        },
+                        CommitError::Unknown(_) => TxnError::CommitAmbiguous,
                     },
-                    CommitError::Unknown(_) => TxnError::CommitAmbiguous,
-                })?
+                )?
             }
         };
         for key in dropped_counters {
@@ -1051,39 +1188,7 @@ impl ClusterServices for ClusterTxnServices {
         }
         Ok(Ts(ts.0))
     }
-    fn release_all(&self, txn: TxnId) {
-        let state = self
-            .txns
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&txn);
-        if let Some(state) = state {
-            for range in state.ranges {
-                // Unreleased locks die with their lease; nothing to retry here.
-                let _ = self.client.release(range, ClusterTxnId(txn.0));
-            }
-        }
-        self.gateway.release_all(txn);
-        // The transaction has ended (after its commit returned, or rolled back): an xid it
-        // registered is no longer live here (R5-55 rule 3c).
-        self.endpoint.owners().remove(&txn);
-    }
-    fn next_txn_id(&self) -> TxnId {
-        ClusterTxnServices::next_txn_id(self)
-    }
-    fn client(&self) -> Arc<dyn RangeClient> {
-        self.client.clone()
-    }
-    fn register_xact(&self, txn: TxnId, xid: u64) -> Result<(), TxnError> {
-        // Live before the record can be read: whoever finds Owner and asks hears "live".
-        self.endpoint.owners().insert(txn);
-        let result = self.write_owner(txn, xid);
-        if result.is_err() {
-            self.endpoint.owners().remove(&txn);
-        }
-        result
-    }
-    fn xact_status(&self, xid: u64) -> Result<Option<XactStatus>, TxnError> {
+    fn xact_status_of(&self, xid: u64) -> Result<Option<XactStatus>, TxnError> {
         let (node, owner) = match read_record(self.client.as_ref(), xid)? {
             Lookup::Pending => return Ok(Some(XactStatus::InProgress)),
             // Never assigned, or the assignment failed before anyone saw the xid.
@@ -1137,6 +1242,14 @@ impl ClusterTxnServices {
         let started = Instant::now();
         loop {
             attempt += 1;
+            // Phase 11: no commit request once this gateway's membership lapsed.
+            if self.gate().is_err() {
+                return Err(if maybe_applied {
+                    TxnError::CommitAmbiguous
+                } else {
+                    TxnError::Serialization(SerializationReason::GatewayFenced)
+                });
+            }
             match self.client.commit(
                 group.range,
                 group.epoch,

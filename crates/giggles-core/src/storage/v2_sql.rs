@@ -409,6 +409,14 @@ impl SqlSession {
                         // new FK edges), so retain its exclusive catalog barrier. DML
                         // shares this sentinel regardless of whether any FK exists.
                         if writing {
+                            // Phase 11: the cluster's DDL lock before the local barrier, so a
+                            // DDL that is its transaction's first write never holds Table(0)
+                            // while another gateway's DDL runs (after earlier DML it holds
+                            // Table(0) RowExclusive while waiting; the deadlock detector then
+                            // breaks any cycle).
+                            if ddl {
+                                txn.ddl_begin(&|| crate::cancellation::check().is_err())?;
+                            }
                             txn.acquire_lock(
                                 engine::locks::LockKey::Table(0),
                                 if ddl {
@@ -520,6 +528,11 @@ impl SqlSession {
                             .iter()
                             .map(|(name, table)| (table.id, name))
                             .collect::<BTreeMap<_, _>>();
+                        let exclusive: Vec<u64> = locks
+                            .iter()
+                            .filter(|(_, mode)| ddl && **mode == LockMode::AccessExclusive)
+                            .map(|(id, _)| *id)
+                            .collect();
                         for (id, mode) in locks {
                             if !table_names.contains_key(&id) {
                                 txn.acquire_lock(engine::locks::LockKey::Table(id), mode, None, &|| crate::cancellation::check().is_err())?;
@@ -700,6 +713,11 @@ impl SqlSession {
                                         &|| crate::cancellation::check().is_err())?;
                                 }
                             }
+                        }
+                        // Phase 11: other gateways drain their writers and the readers of
+                        // `exclusive` (as locals did above) before the snapshot is chosen.
+                        if ddl {
+                            txn.ddl_close(&exclusive, &|| crate::cancellation::check().is_err())?;
                         }
                         // Choose ONE snapshot after every potentially blocking lock.
                         // No refresh occurs while staging any of the statement's rows.

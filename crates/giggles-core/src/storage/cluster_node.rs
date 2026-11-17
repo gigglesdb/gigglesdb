@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use super::cluster::coordinator::deadlock::DeadlockConfig;
 use super::cluster::db;
-use super::cluster::txn::ClusterConfig;
+use super::cluster::txn::{ClusterConfig, ClusterTxnServices};
 use super::range::engine::{EngineConfig, RangeEngines};
 use super::range::home::RecoveryConfig;
 use crate::range_api::{
@@ -198,6 +198,14 @@ pub struct GatewaySettings {
     pub deadlock_timeout: Duration,
     /// Scan period of the deadlock detector.
     pub deadlock_tick: Duration,
+    /// Every gateway of the cluster, this one included (DDL across gateways, Phase 11).
+    /// Empty: single-gateway mode. Non-empty: attaching joins the cluster first.
+    pub gateways: Vec<u16>,
+    /// How long a renewed liveness lock lets the gateway serve; must stay below the range
+    /// lock lease (`EngineSettings::lease`) so a cut-off gateway fences before its locks expire.
+    pub gateway_lease: Duration,
+    /// Transaction lock lease at the ranges; must match EngineSettings::lease.
+    pub lock_lease: Duration,
 }
 
 impl Default for GatewaySettings {
@@ -214,20 +222,36 @@ impl Default for GatewaySettings {
             write_set_bytes: cluster.write_set_bytes,
             deadlock_timeout: deadlock.deadlock_timeout,
             deadlock_tick: deadlock.tick,
+            gateways: cluster.gateways,
+            gateway_lease: cluster.gateway_lease,
+            lock_lease: cluster.lock_lease,
         }
     }
 }
 
 /// A gateway's SQL database and, with a peer, its deadlock service.
 pub struct ClusterGateway {
+    services: Arc<ClusterTxnServices>,
     pub admin: Admin,
     /// Serve it to the other gateways' peers (probe, abort, blockers, cancel_wait).
     pub gateway_service: Option<Arc<dyn GatewayService>>,
 }
 
+impl ClusterGateway {
+    /// Supplies additional gateway members to close before DDL. Lookup failures refuse
+    /// the DDL with a retryable serialization error.
+    pub fn set_member_source(
+        &self,
+        source: Box<dyn Fn() -> Result<Vec<u16>, RangeError> + Send + Sync>,
+    ) {
+        self.services.set_member_source(source);
+    }
+}
+
 /// Attaches a gateway database for the cluster `client` reaches. `domain` is the cluster
 /// database's identity (the range store's domain); `peer` enables cross-gateway deadlock
-/// detection. Attaching reads the catalog and writes nothing.
+/// detection. Attaching reads the catalog and writes nothing; with `settings.gateways` it first
+/// joins the cluster (takes its liveness lock).
 pub fn attach_gateway(
     client: Arc<dyn RangeClient>,
     settings: GatewaySettings,
@@ -243,6 +267,9 @@ pub fn attach_gateway(
         lock_slice: settings.lock_slice,
         lock_backstop: settings.lock_backstop,
         retries: settings.retries,
+        gateways: settings.gateways,
+        gateway_lease: settings.gateway_lease,
+        lock_lease: settings.lock_lease,
     };
     let deadlock = DeadlockConfig {
         deadlock_timeout: settings.deadlock_timeout,
@@ -259,6 +286,7 @@ pub fn attach_gateway(
     Ok(ClusterGateway {
         admin: gateway.admin,
         gateway_service: Some(gateway.services.gateway_service()),
+        services: gateway.services,
     })
 }
 

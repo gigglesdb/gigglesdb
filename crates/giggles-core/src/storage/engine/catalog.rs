@@ -2,11 +2,14 @@
 //!
 //! Cluster gateways (GD-0075): another gateway's DDL reaches this cache through the
 //! catalog-generation record (`refresh_locked`), checked when a statement takes its snapshot.
-//! Table locks are local to each gateway, so until Phase 11 (R5-100) nothing orders DML on one
-//! gateway against DDL on the same table through another: a DML transaction that resolved the
-//! table before the DDL committed can still commit against the old definition (for example,
-//! insert into a table another gateway has just dropped, or write rows in the layout before an
-//! `ADD COLUMN ... DEFAULT` or a type change). Run schema changes while the table is quiet.
+//! Table locks are local to each gateway; Phase 11 (R5-100, `cluster::txn::ddl`) orders DDL
+//! against every other gateway: before a DDL statement chooses its snapshot, each other member
+//! takes, as the DDL's proxy, `Table(0)` and the statement's tables AccessExclusive in its own
+//! lock manager, and holds them until the DDL has committed or rolled back. DML holds `Table(0)`
+//! RowExclusive to transaction end and takes its statement snapshot after that grant, so no
+//! transaction writes across a DDL, and every statement after the DDL's commit returned reads
+//! the new generation here and reloads. Readers of the DDL's tables are drained the same way.
+//! A member that cannot be reached is evicted (fenced) and serves again only after the DDL.
 #[cfg(test)]
 use super::kv::Kv;
 use super::{
@@ -575,6 +578,15 @@ impl Catalog {
         Ok(())
     }
 
+    /// Cluster gateways (Phase 11): checks the generation token at a fresh oracle timestamp and
+    /// reloads the catalog there when another gateway's DDL changed it.
+    pub(crate) fn refresh_latest(&self) -> Result<(), CoreError> {
+        let now = self.services.visible_ts()?;
+        let mut cache = self.cache.lock().map_err(|_| corrupt("catalog cache mutex poisoned"))?;
+        cache.ensure_live()?;
+        self.refresh_locked(&mut cache, now)
+    }
+
     /// The committed catalog at `ts` (bounded below the cluster records on a gateway).
     fn load_at(&self, ts: Ts) -> Result<CatalogView, CoreError> {
         load_view_until(&*self.services.read_view(ts), ts, catalog_end(&self.services))
@@ -725,6 +737,11 @@ impl Catalog {
                 _ => {}
             }
         }
+        // Phase 11: in a cluster the other gateways drain these tables' readers too (their
+        // writers are already excluded by the DDL's proxies' `Table(0)`).
+        if !tables.is_empty() {
+            txn.ddl_close(&tables.iter().copied().collect::<Vec<_>>(), cancel)?;
+        }
         for id in tables {
             txn.acquire_lock(
                 LockKey::Table(id),
@@ -870,8 +887,21 @@ impl Catalog {
                 (base, entry)
             };
             txn.acquire_lock(LockKey::Table(entry.def.id), mode, deadline, cancel)?;
-            let cache = self.cache.lock().map_err(|_| TxnError::Misuse)?;
+            let now = if txn.isolation() != Isolation::ReadCommitted
+                && matches!(self.services, TxnServices::Cluster(_))
+            {
+                // A gateway's cache is only as new as its last refresh: compare a fixed-snapshot
+                // transaction against the catalog at a fresh oracle timestamp, so a table changed
+                // through another gateway fails it with 40001 as on one node (Phase 11).
+                Some(txn.catalog_check_ts()?)
+            } else {
+                None
+            };
+            let mut cache = self.cache.lock().map_err(|_| TxnError::Misuse)?;
             cache.ensure_live()?;
+            if let Some(now) = now {
+                self.refresh_locked(&mut cache, now)?;
+            }
             let latest = cache.versions.last().unwrap().1.by_name.get(name);
             if latest == base.as_ref() {
                 return Ok(entry);
