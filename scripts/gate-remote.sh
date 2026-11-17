@@ -21,7 +21,7 @@
 # Exit: 0 gate passed, 1 gate failed (unexpected test failures or build or
 # clippy errors), 2 usage error, 3 daily start cap reached (gate locally),
 # 4 no slot free in time, 5 infrastructure error. Results land in
-# J:/gigglesdb-work/boat/runs/<utc>-<tip12>/ (summary.txt, logs.tar.gz).
+# J:/gigglesdb-work/boat/runs/<utc>-<tip12>-<sanitized-who>-<pid>/ (summary.txt, logs.tar.gz).
 # Linux-only expected failures are listed in scripts/gate-linux-expected-failures.txt.
 set -euo pipefail
 
@@ -58,7 +58,7 @@ g() { git -C "$repo" "$@"; }
 tip=$(g rev-parse --verify "$tip^{commit}")
 short=${tip:0:12}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-run="$boatdir/runs/$stamp-$short"
+run="$boatdir/runs/$stamp-$short-${who//[^A-Za-z0-9_.-]/_}-$$"
 mkdir -p "$run" "$boatdir/slots"
 log() { echo "[gate-remote $(date -u +%T)] $*" >&2; }
 bj() { "$B" --no-update "$@"; }
@@ -93,7 +93,7 @@ cleanup() {
   exit $rc
 }
 trap cleanup EXIT
-trap 'exit 5' INT TERM
+trap 'exit 5' INT TERM HUP
 deadline=$(( $(date +%s) + slot_wait ))
 while [ -z "$slot" ]; do
   for n in $(seq 1 "$max_boxes"); do s=slot-$n

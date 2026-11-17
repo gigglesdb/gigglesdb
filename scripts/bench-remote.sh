@@ -36,7 +36,7 @@
 #
 # Exit: 0 every run passed (0 errors, invariants held), 1 some run failed, 2 usage error or matrix too
 # long, 3 daily start cap reached, 4 no slot free in time, 5 infrastructure
-# error. Results land in J:/gigglesdb-work/boat/bench/<utc>-<tip12>/
+# error. Results land in J:/gigglesdb-work/boat/bench/<utc>-<tip12>-<who>-<pid>/
 # (summary.md, results.jsonl, meta.json, logs.tar.gz).
 set -euo pipefail
 
@@ -111,7 +111,7 @@ g() { git -C "$repo" "$@"; }
 tip=$(g rev-parse --verify "$tip^{commit}")
 short=${tip:0:12}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-if [ $build_snapshot = 1 ]; then run="$boatdir/bench/snapshot-$stamp-$short"; else run="$boatdir/bench/$stamp-$short"; fi
+if [ $build_snapshot = 1 ]; then run="$boatdir/bench/snapshot-$stamp-$short-$who-$$"; else run="$boatdir/bench/$stamp-$short-$who-$$"; fi
 mkdir -p "$run" "$boatdir/slots"
 log() { echo "[bench-remote $(date -u +%T)] $*" >&2; }
 bj() { "$B" --no-update "$@"; }
@@ -145,7 +145,7 @@ cleanup() {
   exit $rc
 }
 trap cleanup EXIT
-trap 'exit 5' INT TERM
+trap 'exit 5' INT TERM HUP
 deadline=$(( $(date +%s) + slot_wait ))
 while [ -z "$slot" ]; do
   for n in $(seq 1 "$max_boxes"); do s=slot-$n

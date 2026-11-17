@@ -62,9 +62,40 @@ the script refuses the matrix (exit 2). Split it into several invocations,
 for example one `--clients` value or one `--mixes` value each, or lower
 `--repeats` or `--duration`. Each invocation is one box start.
 
+## Running several benches at once
+
+Launch each `bench-remote.sh` as its own independent background process
+(for example separate `nohup ... &` commands or separate tool background
+tasks), staggered by about 30 s. Do not fan out through one parent such as
+`xargs -P`: killing that parent can kill the children without running their
+EXIT trap. HUP, INT and TERM are trapped and clean up, but a hard kill
+(`kill -9`, `taskkill /F`) cannot be trapped.
+
+If a driver dies, finish its box by hand with these coordinator steps.
+Workers never run `boat`.
+
+1. Find the box id and slot in
+   `J:/gigglesdb-work/boat/slots/slot-*/owner` and `usage.log`; identify the
+   matching run directory and START line.
+2. Wait until `/home/user/bench/done` exists on the box:
+   `boat exec <id> -- cat /home/user/bench/done`. Read the file's `rc=` value as
+   `<rc>` and compute elapsed minutes, rounded up, from the START time.
+3. Collect the logs:
+   `boat exec <id> -- bash -lc 'cd /home/user && tar czf bench-logs.tar.gz bench bench.out'`.
+4. Run `boat scp <id>:/home/user/bench-logs.tar.gz <run-dir>/logs.tar.gz`
+   and extract `summary.md`, `results.jsonl` and `meta.json` from the archive.
+5. Delete the box: `boat delete <id> --yes`.
+6. Append an END line to `J:/gigglesdb-work/boat/usage.log` in the script's
+   format: `<utc> | <who> | <box> | large | <tip12> | END bench rc=<rc> <mins>min`.
+7. Release that run's slot with
+   `rm -rf J:/gigglesdb-work/boat/slots/slot-<n>`.
+8. Find the run's ref with `git for-each-ref refs/bench-remote`, then remove
+   it with `git update-ref -d refs/bench-remote/<stamp>-<pid>`.
+9. Remove `<run-dir>/stack.bundle`.
+
 ## Results
 
-Results land in `J:/gigglesdb-work/boat/bench/<utc>-<tip12>/`:
+Results land in `J:/gigglesdb-work/boat/bench/<utc>-<tip12>-<who>-<pid>/`:
 
 - `summary.md`: medians per config, failures and the data-dir filesystem;
 - `results.jsonl`: one line per run;
