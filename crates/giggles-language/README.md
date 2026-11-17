@@ -171,9 +171,12 @@ Profile 0.22 selects `embedded-trusted-native-0.22`, inheriting 0.21:
   undo, inspect on task NAME to|from roles`. They lower to core's
   `TaskStatement`, identical to the SQL parser's output; expressions render to
   SQL predicate text (`old.` only in `from`, `new.` only in `to`, both
-  stripped; `timestamp("..")` is a quoted literal). Parse and lowering only;
-  the general statement parser does not accept these words
-  (native_task_definition).
+  stripped; `timestamp("..")` is a quoted literal). The general statement
+  parser does not accept these words (native_task_definition).
+  `Engine::execute_task_text(actor, text)` runs one statement as the named
+  role (an unknown role is 42704; task errors keep their pgwire SQLSTATE as
+  `Error::Sql`), and the server API runs 0.22 task text for database-role
+  sessions (giggles-server task_ddl_native).
 No version implements the complete proposed native v1 language.
 
 From the repository root in PowerShell:

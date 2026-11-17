@@ -246,6 +246,8 @@ mod fk_section_network;
 mod isolation_anomalies;
 #[path = "task_only_role_sql.rs"]
 mod task_only_role_sql;
+#[path = "task_ddl_native.rs"]
+mod task_ddl_native;
 #[path = "task_ddl_network.rs"]
 mod task_ddl_network;
 

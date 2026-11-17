@@ -68,6 +68,9 @@ fn statement_text(invocation: &Invocation) -> String {
         Invocation::TaskPreview { request, .. } => serde_json::to_string(request),
         Invocation::TaskApply { change, .. } => Ok(format!("APPLY CHANGE {change}")),
         Invocation::TaskOutcome => Ok("SHOW OPERATION".into()),
+        Invocation::TaskDdl(statement) => {
+            Ok(giggles_core::task::statements::command_tag(statement).into())
+        }
         Invocation::Legacy(_) | Invocation::Text { .. } => Ok(String::new()),
     };
     json.unwrap_or_default()
@@ -244,6 +247,8 @@ pub(crate) fn class(invocation: &Invocation) -> StatementClass {
         Invocation::TaskPreview { .. } => StatementClass::Preview,
         Invocation::TaskApply { .. } => StatementClass::Apply,
         Invocation::TaskOutcome => StatementClass::OutcomeLookup,
+        // As on the agent pgwire path: a task statement is role DDL.
+        Invocation::TaskDdl(_) => StatementClass::RoleStatement,
     }
 }
 
@@ -448,6 +453,24 @@ pub(crate) fn run(
             // refuses them before this on every other listener.
             return Err(CoreError::Unsupported);
         }
+        // GD-0061 R3-113: native task statements run where the SQL forms do
+        // (`Session::execute_task_ddl`), only for database roles. A task
+        // error keeps its SQLSTATE as a native SQL error, so it equals the
+        // pgwire one.
+        if let Invocation::TaskDdl(statement) = &invocation {
+            if !matches!(&session.role, Role::Database { .. }) {
+                return Err(CoreError::Policy(Error::Scope));
+            }
+            return Ok(match session.execute_task_ddl(statement) {
+                Ok(giggles_core::task::statements::TaskOutcome::Tag(_)) => NativeResult::Control,
+                Ok(giggles_core::task::statements::TaskOutcome::Rows(_, rows)) => {
+                    NativeResult::Sql(Released::synthetic(rows))
+                }
+                Err(error) => NativeResult::Error(ops::Error::Sql {
+                    sqlstate: error.sqlstate.into(),
+                }),
+            });
+        }
         if let Invocation::Catalog(request) = &invocation {
             return session.authority_scope(|session| {
                 session.authorize_native_catalog(request)?;
@@ -491,7 +514,9 @@ pub(crate) fn run(
             Invocation::Catalog(_) | Invocation::Sequence(_) | Invocation::SearchPath(_) | Invocation::Begin | Invocation::Commit | Invocation::Rollback
             | Invocation::Savepoint(_) | Invocation::RollbackTo(_) | Invocation::Release(_) => {}
             Invocation::Legacy(_) | Invocation::Text { .. } | Invocation::TaskPreview { .. }
-            | Invocation::TaskApply { .. } | Invocation::TaskOutcome => return Err(CoreError::Unsupported),
+            | Invocation::TaskApply { .. } | Invocation::TaskOutcome | Invocation::TaskDdl(_) => {
+                return Err(CoreError::Unsupported);
+            }
         }
         let reserved = reqs.iter().any(|(table, _)| table == "giggles_join");
         for (table, _) in &mut reqs {
@@ -602,7 +627,9 @@ pub(crate) fn run(
                 return Ok(NativeResult::Control);
             }
             Invocation::Legacy(_) | Invocation::Text { .. } | Invocation::TaskPreview { .. }
-            | Invocation::TaskApply { .. } | Invocation::TaskOutcome => unreachable!(),
+            | Invocation::TaskApply { .. } | Invocation::TaskOutcome | Invocation::TaskDdl(_) => {
+                unreachable!()
+            }
         };
         match result {
             Ok(outcome) => Ok(outcome),

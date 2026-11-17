@@ -586,6 +586,44 @@ impl Engine {
     pub fn execute_catalog_text(&self, text: &str) -> Result<CatalogOutcome> {
         self.execute_catalog(&parse_catalog_with_version(text, self.version)?)
     }
+    /// GD-0061 R3-113: run one profile 0.22 native task statement (CREATE,
+    /// REVOKE, SHOW and GRANT / REVOKE forms) as the role `actor`. The
+    /// embedded caller is trusted and names the acting role; a role that does
+    /// not exist is 42704. Task errors keep their SQLSTATE as [`Error::Sql`],
+    /// the same SQLSTATE the SQL statement gets over pgwire.
+    pub fn execute_task_text(
+        &self,
+        actor: &str,
+        text: &str,
+    ) -> Result<giggles_core::task::statements::TaskOutcome> {
+        use giggles_core::task::{definition::WallClockMs, statements};
+        let statement = crate::task::parse_task_with_version(text, self.version)?;
+        let sql = |sqlstate: &str| Error::Sql { sqlstate: sqlstate.into() };
+        let role = self
+            .admin
+            .roles()
+            .get(actor)
+            .map_err(|e| match e {
+                giggles_core::roles::RoleError::Core(e) => sql(giggles_core::sqlstate(&e)),
+                // An invalid name names no role.
+                _ => sql("42704"),
+            })?
+            .ok_or_else(|| sql("42704"))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| sql("22008"))?
+            .as_millis();
+        let now = WallClockMs(i64::try_from(now).map_err(|_| sql("22008"))?);
+        // SHOW TASK READS and SHOW TASK EXPOSURE read a session; an embedded
+        // engine has no listeners, so the exposure report has no extra rows.
+        let session = self.admin.sql_session();
+        let outcome = match crate::task::show_task(&session, &role, &statement, now, &[]) {
+            Some(result) => result
+                .map(|rows| statements::TaskOutcome::Rows(statements::description(&statement), rows)),
+            None => statements::execute(&self.admin, &role, &statement, now),
+        };
+        outcome.map_err(|e| sql(e.sqlstate))
+    }
     /// Execute a definition; use [`Self::execute_catalog_optional`] for DROP VIEW IF EXISTS or DROP CONSTRAINT IF EXISTS.
     pub fn execute_catalog(&self, statement: &CatalogStatement) -> Result<CatalogOutcome> {
         reject_optional_catalog(statement)?;

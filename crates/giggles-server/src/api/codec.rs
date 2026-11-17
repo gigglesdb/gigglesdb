@@ -46,6 +46,9 @@ pub enum Invocation {
     TaskApply { change: u64, digest: [u8; 32] },
     /// The stored outcome of the request's `operation_id`.
     TaskOutcome,
+    /// GD-0061 R3-113: a profile 0.22 native task statement (CREATE, REVOKE,
+    /// SHOW and GRANT / REVOKE forms), lowered to core's statement.
+    TaskDdl(giggles_core::task::statements::TaskStatement),
 }
 
 impl Invocation {
@@ -58,6 +61,13 @@ impl Invocation {
         else {
             return Ok(self);
         };
+        // GD-0061 R3-113: task statements come first in the profiles that
+        // have them; their head words are never data operations.
+        if language_version.supports_tasks()
+            && let Ok(statement) = giggles_language::parse_task_with_version(&text, language_version)
+        {
+            return Ok(Self::TaskDdl(statement));
+        }
         match giggles_language::lower_text(&text, &bindings, language_version)
             .map_err(|_| ApiError::InvalidArgument)?
         {
