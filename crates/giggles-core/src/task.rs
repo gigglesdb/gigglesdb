@@ -34,6 +34,7 @@ pub(crate) mod undo;
 // R3-613: consumed by protected_commit (R3-615+) and outcome lookup.
 #[allow(dead_code)]
 pub(crate) mod receipt;
+pub mod readlog;
 pub mod release;
 // R3-622: driven by the v2 maintenance thread.
 pub(crate) mod retention;
@@ -50,6 +51,7 @@ pub use commit::{inspect_outcome, outcome, protected_commit, Actor, ProtectedReq
 pub use commit::ProtectedPoint;
 pub use ledger::{OperationId, Outcome};
 pub use receipt::Receipt;
+pub use readlog::{fingerprint_and_cap, show_reads, ReadRecord, Reconciliation};
 pub use release::{Page, ReleaseTag, Released, Unreleased};
 pub use retention::{RetentionConfig, RetentionStats};
 pub use error::{Budget, DenyRule, TaskError};

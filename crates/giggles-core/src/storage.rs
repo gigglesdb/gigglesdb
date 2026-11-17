@@ -3482,6 +3482,31 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
+        // GD-0061 R3-309: a task statement is logged with its text, and one
+        // that fails before its read-log entry starts (parse, abort) is
+        // logged with its error.
+        self.set_task_statement_text(sql);
+        let result = self.execute_text_unreleased(sql, params, expected_version);
+        if let Err(error) = &result {
+            self.log_text_failure(sql, params.len(), error);
+        }
+        result
+    }
+    /// Logs a SQL-text statement that failed before its read-log entry
+    /// started (GD-0061 R3-309); no-op without a task.
+    fn log_text_failure(&self, sql: &str, param_count: usize, error: &CoreError) {
+        if self.task.is_some() {
+            let class = relational::Prepared::task_class_of_sql(sql)
+                .unwrap_or(crate::task::StatementClass::Other);
+            self.log_unstarted_task_failure(class, param_count, error);
+        }
+    }
+    fn execute_text_unreleased(
+        &mut self,
+        sql: &str,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+    ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
         relational::assert_sql_frontend_allowed();
         // ROLLBACK remains available after any parse/bind/statement/commit error.
         if self.aborted {
@@ -3493,7 +3518,11 @@ impl SqlSession {
                 return Err(CoreError::Sql(relational::SqlError::Parameters));
             }
             if p.control() == Some("rollback") {
-                let tag = self.release_tag();
+                let tag = self.release_tag_with(
+                    crate::task::StatementClass::TransactionControl,
+                    0,
+                    || Ok(Default::default()),
+                );
                 self.rollback();
                 return Ok(crate::task::release::Unreleased::new(Default::default(), tag));
             }
@@ -3519,10 +3548,17 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: &relational::StatementClock,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
-        relational::assert_sql_frontend_allowed();
-        self.guard_clock(clock)?;
-        let p = self.prepare(sql)?;
-        self.execute_prepared_at_unreleased(&p, params, expected_version, clock)
+        self.set_task_statement_text(sql);
+        let result = (|| {
+            relational::assert_sql_frontend_allowed();
+            self.guard_clock(clock)?;
+            let p = self.prepare(sql)?;
+            self.execute_prepared_at_unreleased(&p, params, expected_version, clock)
+        })();
+        if let Err(error) = &result {
+            self.log_text_failure(sql, params.len(), error);
+        }
+        result
     }
     pub fn execute_prepared_at(
         &mut self,
@@ -3691,13 +3727,23 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<crate::task::release::Unreleased<relational::SqlResult>, CoreError> {
-        // GD-0061 R3-308: in a task session a write runs only inside the
-        // protected commit; any other write is refused before it runs.
-        self.refuse_task_write(p)?;
         let (tag, expanded) = self.statement_tag(p)?;
+        // GD-0061 R3-308: in a task session a write runs only inside the
+        // protected commit; any other write is refused before it runs (and
+        // logged, R3-309).
         let p = expanded.as_ref().unwrap_or(p);
-        self.execute_bound_kernel(p, params, expected_version, clock)
-            .map(|result| crate::task::release::Unreleased::new(result, tag))
+        let result = self
+            .refuse_task_write(p)
+            .and_then(|()| self.execute_bound_kernel(p, params, expected_version, clock));
+        match result {
+            Ok(result) => Ok(crate::task::release::Unreleased::new(result, tag)),
+            Err(error) => {
+                if let Some(tag) = &tag {
+                    tag.fail(&error);
+                }
+                Err(error)
+            }
+        }
     }
     /// Refuses a statement that writes (DML or DDL) in a task session outside
     /// the protected commit (GD-0061 R3-308).
@@ -3725,7 +3771,8 @@ impl SqlSession {
         p: &relational::Prepared,
     ) -> Result<(Option<Arc<crate::task::release::ReleaseTag>>, Option<relational::Prepared>), CoreError> {
         let mut expanded = None;
-        let tag = self.release_tag_with(|| {
+        let class = if self.task.is_some() { p.task_class() } else { crate::task::StatementClass::Other };
+        let tag = self.release_tag_with(class, p.parameter_count(), || {
             if !p.is_read() {
                 return Ok(Default::default());
             }
@@ -3734,7 +3781,8 @@ impl SqlSession {
             Ok(plan)
         });
         if let Some(tag) = &tag {
-            tag.refuse_denied()?;
+            // A denial is logged as the statement's outcome (R3-309).
+            tag.refuse_denied().inspect_err(|error| tag.fail(error))?;
         }
         Ok((tag, expanded))
     }
@@ -3786,9 +3834,12 @@ impl SqlSession {
     /// Adds rows a task statement's scope accepted to the session's pending
     /// `rows_read` (R3-308). The protected commit's reads are not disclosure.
     pub(crate) fn note_task_rows_read(&self, meter: &crate::task::rows::StatementMeter) {
-        let rows = meter.take_read_delta();
-        if let (None, Some(state)) = (&self.protected, &self.task_state) {
-            state.add_rows_read(rows);
+        match (&self.protected, &self.task_state) {
+            (None, Some(state)) => state.add_meter(meter),
+            _ => {
+                meter.take_read_delta();
+                meter.take_scanned_delta();
+            }
         }
     }
     fn execute_bound_kernel(

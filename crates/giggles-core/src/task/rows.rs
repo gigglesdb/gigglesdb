@@ -46,6 +46,8 @@ pub(crate) struct StatementMeter {
     read: Cell<u64>,
     /// Rows of `read` already added to the session's pending `rows_read`.
     charged: Cell<u64>,
+    /// Rows of `scanned` already added to the session's pending count (R3-309).
+    scanned_taken: Cell<u64>,
 }
 
 impl StatementMeter {
@@ -54,6 +56,13 @@ impl StatementMeter {
         let read = self.read.get();
         let delta = read.saturating_sub(self.charged.get());
         self.charged.set(read);
+        delta
+    }
+    /// Rows scanned since the last call (the read log's `rows_scanned`).
+    pub(crate) fn take_scanned_delta(&self) -> u64 {
+        let scanned = self.scanned.get();
+        let delta = scanned.saturating_sub(self.scanned_taken.get());
+        self.scanned_taken.set(scanned);
         delta
     }
     fn scanned(&self) {

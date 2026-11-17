@@ -124,7 +124,7 @@ impl Cursor {
                 if let Some(scoped) = &scoped {
                     crate::task::rows::record(self.meter.counts());
                     if let Some(tag) = &self.tag {
-                        tag.add_rows_read(self.meter.take_read_delta());
+                        tag.add_meter(&self.meter);
                     }
                     if let Some(error) = scoped.take_error() {
                         return Err(error.into());
@@ -182,6 +182,9 @@ impl SqlSession {
         buffer_limit: usize,
     ) -> Result<Cursor, CoreError> {
         relational::assert_sql_frontend_allowed();
+        // The statement's tag, kept until the outcome is known so a failure
+        // is logged as the statement's outcome (GD-0061 R3-309).
+        let mut started: Option<Arc<crate::task::release::ReleaseTag>> = None;
         let result = (|| {
             crate::cancellation::check()?;
             if self.aborted {
@@ -199,9 +202,17 @@ impl SqlSession {
             // expanded to the task's columns (GD-0061 R3-308). A denied
             // statement is refused here, before any row is read.
             let (tag, expanded) = self.statement_tag(&p)?;
+            started = tag.clone();
             if let Some(expanded) = expanded {
                 p = expanded;
             }
+            // A buffered fallback reruns the statement under its own tag:
+            // this one then logs nothing.
+            let discard = |tag: &Option<Arc<crate::task::release::ReleaseTag>>| {
+                if let Some(tag) = tag {
+                    tag.discard();
+                }
+            };
             let context = clock.map(|c| {
                 relational::clock::ExecutionClock::new(c)
                     .with_extra_float_digits(self.extra_float_digits)
@@ -212,6 +223,7 @@ impl SqlSession {
                     // gateway buffers the result of the normal execution path instead
                     // (GD-0075 P7-2; streaming over ranges is later work).
                     if db.cluster_services().is_some() {
+                        discard(&tag);
                         return self.buffer_cursor(&p, params, clock, buffer_limit);
                     }
                     // The existing transaction API cannot fork its write overlay.
@@ -223,6 +235,7 @@ impl SqlSession {
                             || t.writes_keyspace(engine::kv::Keyspace::Index)
                             || t.isolation() == engine::txn::Isolation::Serializable
                     }) {
+                        discard(&tag);
                         return self.buffer_cursor(&p, params, clock, buffer_limit);
                     }
                     if p.domain != u128::from_be_bytes(db.meta.domain) || p.epoch != 0 {
@@ -261,6 +274,7 @@ impl SqlSession {
                     let image = catalog.cursor_image().map_err(CoreError::Sql)?;
                     // Sequence-bearing selects use the established execution path.
                     if !p.sequences().is_empty() {
+                        discard(&tag);
                         return self.buffer_cursor(&p, params, clock, buffer_limit);
                     }
                     // A task statement that reads a table sees only the task's
@@ -335,12 +349,19 @@ impl SqlSession {
                     scope,
                     meter: Default::default(),
                 }),
-                None => self.buffer_cursor(&p, params, clock, buffer_limit),
+                None => {
+                    discard(&tag);
+                    self.buffer_cursor(&p, params, clock, buffer_limit)
+                }
             }
         })();
-        if result.is_err() {
+        if let Err(error) = &result {
+            if let Some(tag) = &started {
+                tag.fail(error);
+            }
             self.abort();
         }
+        drop(started);
         result
     }
     fn buffer_cursor(

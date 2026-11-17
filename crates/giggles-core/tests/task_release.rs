@@ -200,6 +200,13 @@ fn task(e: TaskError) -> CoreError {
     CoreError::Task(e)
 }
 
+/// Nothing was charged: no rows read or returned, no bytes, no debit. A
+/// refused statement still has its read-log record (R3-309).
+fn uncharged(d: &Disclosure) {
+    assert_eq!((d.rows_read, d.rows_returned, d.bytes_returned), (0, 0, 0), "{d:?}");
+    assert!(d.debits.is_empty(), "{d:?}");
+}
+
 /// The head equals the sum of the debit records (design-3 section 6).
 fn reconciles(d: &Disclosure) {
     let sum = |f: fn(&giggles_core::task::release::DebitView) -> u64| -> u64 {
@@ -313,8 +320,14 @@ fn budget_exceeded_releases_nothing_and_writes_nothing() {
             );
             assert_eq!(s.task_reservation(), Some(Default::default()));
         }
-        // Nothing was written: no head, no debit, no read-log record.
-        assert_eq!(f.disclosure(), Disclosure::default(), "{budget:?}");
+        // Nothing was returned: no returned rows or bytes and no reservation.
+        // Each refused statement has its read-log record, and the rows it
+        // read are charged at its end, saturating at the cap (R3-309).
+        let d = f.disclosure();
+        assert_eq!((d.rows_returned, d.bytes_returned, d.read_logs), (0, 0, 2), "{budget:?}");
+        assert!(d.rows_read <= cap.rows_read, "{d:?}");
+        assert!(d.debits.iter().all(|x| x.rows_returned + x.reserved_rows + x.bytes + x.reserved_bytes == 0));
+        reconciles(&d);
     }
 }
 
@@ -345,7 +358,9 @@ fn two_sessions_race_last_allowance_one_wins() {
         assert!(results.contains(&Err(task(TaskError::BudgetExceeded(Budget::RowsReturned)))));
         let d = f.disclosure();
         assert_eq!(d.rows_returned, 1);
-        assert_eq!(d.debits.len(), 1);
+        // One returned-row debit; the loser's read row is charged at its end.
+        assert_eq!(d.debits.iter().filter(|x| x.rows_returned > 0).count(), 1);
+        assert_eq!(d.read_logs, 2);
         reconciles(&d);
     }
 }
@@ -411,7 +426,9 @@ fn definition_change_denies() {
     assert_eq!(release(&mut s, ALL).map(|_| ()), Err(changed.clone()));
     assert_eq!(release(&mut s, "SELECT 1").map(|_| ()), Err(changed.clone()));
     assert_eq!(s.still_valid(), Err(changed));
-    assert_eq!(f.disclosure(), Disclosure::default());
+    let d = f.disclosure();
+    uncharged(&d);
+    assert_eq!(d.read_logs, 2);
 }
 
 #[test]
@@ -816,8 +833,8 @@ fn denied_read_writes_no_debit() {
                 s.finish_task_statement(Err(&e));
                 assert_eq!(s.task_reservation(), Some(Default::default()), "{sql}");
                 drop(s);
-                // No head, no debit, no read-log record.
-                assert_eq!(f.disclosure(), Disclosure::default(), "{sql} cursor={cursor}");
+                // No charge and no debit (the refusal has its read-log record).
+                uncharged(&f.disclosure());
             }
         }
     }
@@ -830,7 +847,7 @@ fn denied_read_writes_no_debit() {
     let s = &mut f.exact();
     assert!(s.execute_native_transaction_unreleased(&block, &Bindings::new()).is_err());
     s.finish_task_statement(Ok(()));
-    assert_eq!(f.disclosure(), Disclosure::default());
+    uncharged(&f.disclosure());
     // An allowed read in a session after a refusal is charged as usual.
     let mut s = f.exact();
     let e = run_released(&mut s, DENIED[0].0, false).unwrap_err();

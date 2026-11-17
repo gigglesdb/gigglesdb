@@ -29,8 +29,8 @@
 //!    the head plus the need against the disclosure caps (nothing is written
 //!    or released when one is exceeded), and writes the new head, the debit
 //!    `2B|task|read_seq|page_no` and, on the statement's first debit, the
-//!    read-log record `2A|task|read_seq` (outcome open; R3-309 fills its
-//!    fields), then commits synced;
+//!    read-log record `2A|task|read_seq` (outcome open; `readlog.rs`
+//!    finalizes it when the statement ends), then commits synced;
 //! 5. hand-over.
 //!
 //! A crash before the commit leaves nothing charged and nothing sent; a crash
@@ -96,8 +96,8 @@
 //! ```
 use std::cell::RefCell;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use super::admit::StatementClass;
@@ -106,6 +106,7 @@ use super::commit::{catalog_def, DefAt};
 use super::context::TaskContext;
 use super::definition::{DisclosureCaps, TaskDef};
 use super::error::{Budget, DenyRule, TaskError};
+use super::readlog::{fill_left, StatementEntry, StatementLog};
 use super::records::{
     debit_key, disclosure_head_key, read_log_key, task_prefix, DebitRecord, DisclosureHead,
     ReadLogRecord, NS_DEBIT, NS_READ_LOG,
@@ -209,14 +210,6 @@ pub struct Reservation {
     pub bytes: u64,
 }
 
-/// One statement's place in the read log: its `read_seq` (taken on its first
-/// debit) and the next page number.
-#[derive(Debug, Default)]
-pub(crate) struct StatementLog {
-    read_seq: Option<u64>,
-    pages: u32,
-}
-
 /// The release state of one task session, created by `bind_task`.
 #[derive(Debug)]
 pub(crate) struct TaskSessionState {
@@ -224,10 +217,16 @@ pub(crate) struct TaskSessionState {
     reservation: Mutex<Reservation>,
     /// Rows the scope accepted that no debit has charged yet.
     pending_rows_read: AtomicU64,
+    /// Rows the scoped sources pulled that no read-log record holds yet.
+    pending_rows_scanned: AtomicU64,
     chunk_rows: AtomicU64,
     chunk_bytes: AtomicU64,
+    /// The entry point statements are logged with (`set_task_entry`).
+    entry: AtomicU8,
+    /// The text the next statement is logged with.
+    pub(crate) pending_text: Mutex<Option<Arc<str>>>,
     /// The statement started last; `finish_task_statement` ends it.
-    current: Mutex<Option<Arc<Mutex<StatementLog>>>>,
+    pub(crate) current: Mutex<Option<Weak<StatementEntry>>>,
 }
 
 impl TaskSessionState {
@@ -236,10 +235,25 @@ impl TaskSessionState {
             ctx,
             reservation: Mutex::new(Reservation::default()),
             pending_rows_read: AtomicU64::new(0),
+            pending_rows_scanned: AtomicU64::new(0),
             chunk_rows: AtomicU64::new(DEFAULT_CHUNK_ROWS),
             chunk_bytes: AtomicU64::new(DEFAULT_CHUNK_BYTES),
+            entry: AtomicU8::new(super::readlog::ENTRY_PGWIRE_SIMPLE),
+            pending_text: Mutex::new(None),
             current: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn ctx(&self) -> &TaskContext {
+        &self.ctx
+    }
+
+    pub(crate) fn entry(&self) -> u8 {
+        self.entry.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_entry(&self, entry: u8) {
+        self.entry.store(entry, Ordering::SeqCst);
     }
 
     /// Adds rows the visible-rows scope accepted to the pending `rows_read`.
@@ -247,6 +261,24 @@ impl TaskSessionState {
         if rows > 0 {
             self.pending_rows_read.fetch_add(rows, Ordering::SeqCst);
         }
+    }
+
+    /// Takes a scoped read's new counts: accepted rows into the pending
+    /// `rows_read`, pulled rows into the pending `rows_scanned`.
+    pub(crate) fn add_meter(&self, meter: &super::rows::StatementMeter) {
+        self.add_rows_read(meter.take_read_delta());
+        let scanned = meter.take_scanned_delta();
+        if scanned > 0 {
+            self.pending_rows_scanned.fetch_add(scanned, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn take_rows_read(&self) -> u64 {
+        self.pending_rows_read.swap(0, Ordering::SeqCst)
+    }
+
+    pub(crate) fn take_rows_scanned(&self) -> u64 {
+        self.pending_rows_scanned.swap(0, Ordering::SeqCst)
     }
 
     fn reservation(&self) -> MutexGuard<'_, Reservation> {
@@ -262,7 +294,7 @@ impl Drop for TaskSessionState {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -274,23 +306,45 @@ pub struct ReleaseTag {
     /// The statement's output plan (R3-303 for SQL, R3-304 for native), or
     /// the denial its column rules gave; a denied plan refuses every page.
     plan: Result<OutputPlan, TaskError>,
-    log: Arc<Mutex<StatementLog>>,
+    /// The statement's read-log entry; its last handle finalizes the record.
+    entry: Arc<StatementEntry>,
 }
 
 impl ReleaseTag {
-    pub(crate) fn new(state: &Arc<TaskSessionState>, plan: Result<OutputPlan, TaskError>) -> Self {
-        let log = Arc::new(Mutex::new(StatementLog::default()));
-        *lock(&state.current) = Some(log.clone());
+    pub(crate) fn new(
+        state: &Arc<TaskSessionState>,
+        entry: Arc<StatementEntry>,
+        plan: Result<OutputPlan, TaskError>,
+    ) -> Self {
+        if let Ok(plan) = &plan {
+            entry.set_columns(&plan.refs);
+        }
         Self {
             state: state.clone(),
             plan,
-            log,
+            entry,
         }
     }
 
-    /// Adds rows the scope accepted while this statement produced its pages.
-    pub(crate) fn add_rows_read(&self, rows: u64) {
-        self.state.add_rows_read(rows);
+    /// Takes a scoped read's new counts while this statement produces pages.
+    pub(crate) fn add_meter(&self, meter: &super::rows::StatementMeter) {
+        self.state.add_meter(meter);
+    }
+
+    /// The statement failed with `error` (its read-log outcome).
+    pub(crate) fn fail(&self, error: &CoreError) {
+        self.entry.fail(error);
+    }
+
+    /// The statement failed with `sqlstate` (native errors).
+    pub(crate) fn fail_with(&self, sqlstate: &str) {
+        self.entry.fail_with(sqlstate);
+    }
+
+    /// The statement is rerun under a new tag (a cursor that buffers): this
+    /// one writes no record.
+    pub(crate) fn discard(&self) {
+        self.entry.discard();
     }
 
     /// The denial the statement's column rules gave, as the error that
@@ -612,7 +666,6 @@ struct Budgeting {
     reservation: Reservation,
     chunk: Reservation,
     need: Need,
-    finish: bool,
 }
 
 /// What a staged debit charges, applied to the session after the commit.
@@ -622,6 +675,9 @@ struct Staged {
     reserved: Reservation,
     /// The part of the session's reservation this page used.
     used: Reservation,
+    /// What the debit charged: rows read, returned rows and bytes (with
+    /// the reserved amounts).
+    charged: Need,
 }
 
 /// Reservation arithmetic: with `need > 0`, `max(need, min(chunk, remaining
@@ -634,25 +690,23 @@ pub(crate) fn grant(need: u64, chunk: u64, remaining: u64) -> u64 {
     need.max(chunk.min(remaining / 8)).min(remaining)
 }
 
-fn lock_error(error: TxnError) -> CoreError {
+pub(crate) fn lock_error(error: TxnError) -> CoreError {
     match error {
         TxnError::LockTimeout => CoreError::LockNotAvailable,
         other => other.into(),
     }
 }
 
-/// Steps 3 and 4 of the protocol for one page (or, with `finish`, a
-/// statement's pending `rows_read`, saturating at the cap and without the
-/// validity check). Pending `rows_read` that no commit charged is put back.
+/// Steps 3 and 4 of the protocol for one page. Pending `rows_read` that no
+/// commit charged is put back.
 fn debit(
     db: &V2Db,
     state: &TaskSessionState,
-    log: Option<&Mutex<StatementLog>>,
+    log: &Mutex<StatementLog>,
     need: Need,
-    finish: bool,
     crash: CrashPoint,
 ) -> Result<(), CoreError> {
-    let result = debit_inner(db, state, log, need, finish, crash);
+    let result = debit_inner(db, state, log, need, crash);
     if let Err((_, false)) = &result {
         state.add_rows_read(need.rows_read);
     }
@@ -665,9 +719,8 @@ type DebitResult = Result<(), (CoreError, bool)>;
 fn debit_inner(
     db: &V2Db,
     state: &TaskSessionState,
-    log: Option<&Mutex<StatementLog>>,
+    log: &Mutex<StatementLog>,
     need: Need,
-    finish: bool,
     crash: CrashPoint,
 ) -> DebitResult {
     let ctx = &state.ctx;
@@ -678,11 +731,9 @@ fn debit_inner(
     let now = db.wall_now_ms();
     // 3. Validity on every page, from the cached view and the clock.
     let latest = catalog_def(db, ctx.task, DefAt::Latest).map_err(before)?;
-    if !finish {
-        valid(latest.as_deref(), ctx, now).map_err(|e| before(e.into()))?;
-    }
+    valid(latest.as_deref(), ctx, now).map_err(|e| before(e.into()))?;
     let mut reservation = state.reservation();
-    if !finish && need.rows_read == 0 && reservation.rows >= need.rows && reservation.bytes >= need.bytes {
+    if need.rows_read == 0 && reservation.rows >= need.rows && reservation.bytes >= need.bytes {
         reservation.rows -= need.rows;
         reservation.bytes -= need.bytes;
         return Ok(());
@@ -691,10 +742,10 @@ fn debit_inner(
     let mut txn = db.begin(Isolation::ReadCommitted);
     let wait = latest.as_ref().map_or(0, |def| def.limits.lock_wait_ms);
     let deadline = Instant::now().checked_add(Duration::from_millis(wait));
-    let (pages, read_seq) = log.map_or((0, None), |log| {
+    let (pages, read_seq, template) = {
         let log = lock(log);
-        (log.pages, log.read_seq)
-    });
+        (log.debit_pages, log.read_seq, log.read_seq.is_none().then(|| log.record()))
+    };
     let chunk = Reservation {
         rows: state.chunk_rows.load(Ordering::SeqCst),
         bytes: state.chunk_bytes.load(Ordering::SeqCst),
@@ -703,18 +754,16 @@ fn debit_inner(
         &mut txn,
         db,
         ctx,
-        Budgeting { reservation: *reservation, chunk, need, finish },
+        Budgeting { reservation: *reservation, chunk, need },
         now,
         deadline,
-        (pages, read_seq),
+        (pages, read_seq, template),
     );
     let staged = match staged {
         Ok(Some(staged)) => staged,
         Ok(None) => return Ok(()),
         Err(error) => {
-            if !finish {
-                *reservation = Reservation::default();
-            }
+            *reservation = Reservation::default();
             return Err(before(error));
         }
     };
@@ -722,6 +771,8 @@ fn debit_inner(
         CrashPoint::BeforeCommit => crate::storage::crash_now(),
         CrashPoint::ErrorBeforeCommit => {
             *reservation = Reservation::default();
+            // An injected crash: the statement's end is never logged.
+            lock(log).done = true;
             return Err(before(CoreError::Storage("injected before commit".into())));
         }
         _ => {}
@@ -731,10 +782,15 @@ fn debit_inner(
         return Err(before(error.into()));
     }
     // Committed: the page is charged whatever happens next.
-    if let Some(log) = log {
+    {
         let mut log = lock(log);
         log.read_seq = Some(staged.read_seq);
-        log.pages = staged.page_no.saturating_add(1);
+        log.debit_pages = staged.page_no.saturating_add(1);
+        let totals = &mut log.totals;
+        totals.charged_rows_read = totals.charged_rows_read.saturating_add(staged.charged.rows_read);
+        totals.charged_rows_returned =
+            totals.charged_rows_returned.saturating_add(staged.charged.rows);
+        totals.charged_bytes = totals.charged_bytes.saturating_add(staged.charged.bytes);
     }
     reservation.rows = reservation.rows - staged.used.rows + staged.reserved.rows;
     reservation.bytes = reservation.bytes - staged.used.bytes + staged.reserved.bytes;
@@ -742,6 +798,8 @@ fn debit_inner(
         CrashPoint::AfterCommit | CrashPoint::BeforeAck => crate::storage::crash_now(),
         CrashPoint::ErrorAfterCommit => {
             *reservation = Reservation::default();
+            // An injected crash: the record stays open.
+            lock(log).done = true;
             return Err((CoreError::Storage("injected lost commit response".into()), true));
         }
         _ => {}
@@ -752,8 +810,8 @@ fn debit_inner(
 }
 
 /// Locks the head, re-checks validity at the snapshot, checks the caps and
-/// stages the head, the debit and (first debit of a statement) the read-log
-/// record. `None`: nothing to write.
+/// stages the head, the debit and (first debit of a statement, from
+/// `template`) the open read-log record. `None`: nothing to write.
 fn stage(
     txn: &mut Transaction,
     db: &V2Db,
@@ -761,9 +819,9 @@ fn stage(
     budgeting: Budgeting,
     now: u64,
     deadline: Option<Instant>,
-    (pages, read_seq): (u32, Option<u64>),
+    (pages, read_seq, template): (u32, Option<u64>, Option<ReadLogRecord>),
 ) -> Result<Option<Staged>, CoreError> {
-    let Budgeting { reservation, chunk, need, finish } = budgeting;
+    let Budgeting { reservation, chunk, need } = budgeting;
     let task = ctx.task;
     let head_key = disclosure_head_key(task);
     txn.lock_kernel_key(&head_key, deadline, &|| crate::cancellation::check().is_err())
@@ -772,9 +830,7 @@ fn stage(
     // only holders of this lock write it.
     txn.begin_statement();
     let def = catalog_def(db, task, DefAt::Snapshot(txn))?;
-    if !finish {
-        valid(def.as_deref(), ctx, now)?;
-    }
+    valid(def.as_deref(), ctx, now)?;
     let caps = def.as_ref().map_or(
         DisclosureCaps {
             rows_read: u64::MAX,
@@ -799,11 +855,7 @@ fn stage(
     };
     let rows = need.rows - used.rows;
     let bytes = need.bytes - used.bytes;
-    let rows_read = if finish {
-        need.rows_read.min(left_read)
-    } else {
-        need.rows_read
-    };
+    let rows_read = need.rows_read;
     let exceeded = |budget| Err(TaskError::BudgetExceeded(budget).into());
     if rows_read > left_read {
         return exceeded(Budget::RowsRead);
@@ -815,7 +867,6 @@ fn stage(
         return exceeded(Budget::BytesReturned);
     }
     if rows_read == 0 && rows == 0 && bytes == 0 {
-        // Only at a statement's end whose delta saturated: nothing to charge.
         return Ok(None);
     }
     let granted_rows = grant(rows, chunk.rows, left_rows);
@@ -825,32 +876,30 @@ fn stage(
         bytes: granted_bytes - bytes,
     };
     let overflow = || CoreError::Corrupt("task disclosure head overflow".into());
-    let (read_seq, first) = match read_seq {
-        Some(read_seq) => (read_seq, false),
+    let read_seq = match read_seq {
+        Some(read_seq) => read_seq,
         None => {
             let read_seq = head.next_read_seq;
             head.next_read_seq = read_seq.checked_add(1).ok_or_else(overflow)?;
-            (read_seq, true)
+            read_seq
         }
     };
     head.rows_read = head.rows_read.checked_add(rows_read).ok_or_else(overflow)?;
     head.rows_returned = head.rows_returned.checked_add(granted_rows).ok_or_else(overflow)?;
     head.bytes_returned = head.bytes_returned.checked_add(granted_bytes).ok_or_else(overflow)?;
-    if first {
-        // Created open by the statement's first debit; R3-309 fills the
-        // statement fields and finalizes it.
-        let record = ReadLogRecord {
-            wall_ms: now,
-            snapshot_ts: txn.current_snapshot_ts().map_or(0, |ts| ts.0),
-            credential_fingerprint: ctx.credential_fingerprint,
-            def_version: ctx.bound_def_version,
-            table_id: def.as_ref().map_or(0, |def| def.table),
-            charged_rows_read: rows_read,
-            charged_rows_returned: granted_rows,
-            charged_bytes: granted_bytes,
-            pages: 1,
-            ..ReadLogRecord::default()
-        };
+    if let Some(mut record) = template {
+        // Created open by the statement's first debit, with what the
+        // statement knows so far; its end finalizes it (`readlog.rs`).
+        record.wall_ms = now;
+        record.snapshot_ts = txn.current_snapshot_ts().map_or(0, |ts| ts.0);
+        record.credential_fingerprint = ctx.credential_fingerprint;
+        record.def_version = ctx.bound_def_version;
+        record.catalog_version = db.catalog().snapshot_version(txn).map_or(0, |ts| ts.0);
+        record.table_id = def.as_ref().map_or(0, |def| def.table);
+        record.charged_rows_read = record.charged_rows_read.saturating_add(rows_read);
+        record.charged_rows_returned = record.charged_rows_returned.saturating_add(granted_rows);
+        record.charged_bytes = record.charged_bytes.saturating_add(granted_bytes);
+        fill_left(&mut record, &caps, &head);
         txn.put(Keyspace::Kernel, read_log_key(task, read_seq), record.encode())?;
     }
     let debit = DebitRecord {
@@ -869,26 +918,45 @@ fn stage(
         page_no: pages,
         reserved,
         used,
+        charged: Need {
+            rows_read,
+            rows: granted_rows,
+            bytes: granted_bytes,
+        },
     }))
 }
 
 impl SqlSession {
     /// The tag for a statement starting now, with an empty output plan (a
     /// statement that returns no rows); `None` outside a task session (no
-    /// allocation).
+    /// allocation). For tests.
+    #[cfg(test)]
     pub(crate) fn release_tag(&self) -> Option<Arc<ReleaseTag>> {
-        self.release_tag_with(|| Ok(OutputPlan::default()))
+        self.release_tag_with(StatementClass::Other, 0, || Ok(OutputPlan::default()))
     }
 
-    /// The tag for a statement starting now, with the plan its column rules
-    /// give; `plan` runs only in a task session.
+    /// The tag for a statement of `class` with `param_count` parameters
+    /// starting now, with the plan its column rules give; `plan` runs only
+    /// in a task session. The statement's read-log entry starts here.
     pub(crate) fn release_tag_with(
         &self,
+        class: StatementClass,
+        param_count: usize,
         plan: impl FnOnce() -> Result<OutputPlan, TaskError>,
+    ) -> Option<Arc<ReleaseTag>> {
+        let entry = self.start_task_statement(class, param_count)?;
+        self.release_tag_for(entry, plan())
+    }
+
+    /// The tag of a statement whose read-log entry already started.
+    pub(crate) fn release_tag_for(
+        &self,
+        entry: Arc<StatementEntry>,
+        plan: Result<OutputPlan, TaskError>,
     ) -> Option<Arc<ReleaseTag>> {
         self.task_state
             .as_ref()
-            .map(|state| Arc::new(ReleaseTag::new(state, plan())))
+            .map(|state| Arc::new(ReleaseTag::new(state, entry, plan)))
     }
 
     /// Guard for the plain exits: a task session must use the twins.
@@ -908,22 +976,41 @@ impl SqlSession {
         let Some(tag) = tag else {
             return Ok(Released(value));
         };
+        let counts = self
+            .release_steps(&tag, &mut value)
+            .inspect_err(|e| tag.fail(e))?;
+        let mut log = lock(&tag.entry.log);
+        let totals = &mut log.totals;
+        totals.rows_scanned = totals.rows_scanned.saturating_add(tag.state.take_rows_scanned());
+        totals.released_rows = totals.released_rows.saturating_add(counts.rows);
+        totals.released_bytes = totals.released_bytes.saturating_add(counts.bytes);
+        totals.masked = totals.masked.saturating_add(counts.masked);
+        totals.withheld = totals.withheld.saturating_add(counts.withheld);
+        totals.untrusted_released =
+            totals.untrusted_released.saturating_add(counts.untrusted_released);
+        totals.pages = totals.pages.saturating_add(1);
+        drop(log);
+        // 5. Hand over.
+        Ok(Released(value))
+    }
+
+    /// Steps 1 to 4 of the protocol for one task page.
+    fn release_steps<T: Page>(&self, tag: &ReleaseTag, value: &mut T) -> Result<Counts, CoreError> {
         // 1. The statement deadline.
         crate::cancellation::check()?;
         // 2. Mask in memory; the cost is taken after masking.
         let plan = tag.plan.as_ref().map_err(|e| CoreError::Task(e.clone()))?;
-        let counts = mask_page(&mut value, plan)?;
+        let counts = mask_page(value, plan)?;
         // 3 and 4. Validity, then the durable debit (or the reservation).
         let db = self.v2_db().ok_or(CoreError::Unsupported)?;
         let crash = self.fault_points()?.0;
         let need = Need {
-            rows_read: tag.state.pending_rows_read.swap(0, Ordering::SeqCst),
+            rows_read: tag.state.take_rows_read(),
             rows: counts.rows,
             bytes: counts.bytes,
         };
-        debit(&db, &tag.state, Some(&tag.log), need, false, crash)?;
-        // 5. Hand over.
-        Ok(Released(value))
+        debit(&db, &tag.state, &tag.entry.log, need, crash)?;
+        Ok(counts)
     }
 
     /// Validity only, for re-serving an already charged page.
@@ -937,27 +1024,19 @@ impl SqlSession {
         Ok(())
     }
 
-    /// Ends the session's current task statement: a `rows_read` delta no
-    /// release charged is debited, saturating at the cap. The read-log fields
-    /// are R3-309's. No-op without a task; a failure leaves the delta pending.
-    pub fn finish_task_statement(&self, _outcome: Result<(), &CoreError>) {
-        let Some(state) = &self.task_state else {
-            return;
-        };
-        let log = lock(&state.current).take();
-        let rows_read = state.pending_rows_read.swap(0, Ordering::SeqCst);
-        if rows_read == 0 {
-            return;
+    /// Ends the session's current task statement with `outcome`: a
+    /// `rows_read` delta no release charged is debited, saturating at the
+    /// cap, and the statement's read-log record is finalized (`readlog.rs`).
+    /// A statement whose last handle already went was finalized then. No-op
+    /// without a task; a failure leaves the delta pending and the record as
+    /// it was.
+    pub fn finish_task_statement(&self, outcome: Result<(), &CoreError>) {
+        if let Some(entry) = self.current_task_statement() {
+            if let Err(error) = outcome {
+                entry.fail(error);
+            }
+            entry.finish();
         }
-        let Some(db) = self.v2_db() else {
-            return;
-        };
-        let crash = self.fault_points().map_or(CrashPoint::None, |points| points.0);
-        let need = Need {
-            rows_read,
-            ..Need::default()
-        };
-        let _ = debit(&db, state, log.as_deref(), need, true, crash);
     }
 
     /// Sets the session's reservation chunk (`agent.disclosure_chunk_rows`

@@ -19,6 +19,13 @@ pub enum TaskStatement {
     Revoke(String),
     /// `None` is SHOW TASKS.
     Show(Option<String>),
+    /// `SHOW TASK READS <task> [AFTER <read_seq>] [LIMIT <n>]` (R3-309);
+    /// executed by `task::readlog::show_reads`.
+    ShowReads {
+        task: String,
+        after: Option<u64>,
+        limit: Option<u64>,
+    },
     Grant {
         grant: bool,
         bits: TaskPrivileges,
@@ -31,7 +38,7 @@ pub fn command_tag(statement: &TaskStatement) -> &'static str {
     match statement {
         TaskStatement::Create(_) => "CREATE TASK",
         TaskStatement::Revoke(_) => "REVOKE TASK",
-        TaskStatement::Show(_) => "SHOW",
+        TaskStatement::Show(_) | TaskStatement::ShowReads { .. } => "SHOW",
         TaskStatement::Grant { grant: true, .. } => "GRANT",
         TaskStatement::Grant { grant: false, .. } => "REVOKE",
         // An error never completes; report by its head.
@@ -626,6 +633,18 @@ impl Parser<'_> {
             return Ok(TaskStatement::Show(None));
         }
         self.word("task")?;
+        // `SHOW TASK reads` shows a task named reads; READS followed by a
+        // name is the read log.
+        let named = matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.tok),
+            Some(Tok::Word(_) | Tok::QuotedIdent(_))
+        );
+        if named && self.eat_word("reads") {
+            let task = self.ident()?;
+            let after = if self.eat_word("after") { Some(self.number()?) } else { None };
+            let limit = if self.eat_word("limit") { Some(self.number()?) } else { None };
+            return Ok(TaskStatement::ShowReads { task, after, limit });
+        }
         Ok(TaskStatement::Show(Some(self.ident()?)))
     }
 

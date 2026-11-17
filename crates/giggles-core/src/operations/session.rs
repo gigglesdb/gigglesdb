@@ -1,6 +1,34 @@
 //! Typed operations in a caller-retained SQL/native transaction.
 use super::*;
 
+/// The task statement class of a native request (GD-0061 R3-309, read log).
+fn request_class(request: &Request) -> crate::task::StatementClass {
+    use crate::task::StatementClass as C;
+    match request {
+        Request::Read { .. } | Request::ReadExpressions { .. } => C::Select,
+        Request::Update { .. } | Request::UpdateExpressions { .. } => C::Update,
+        Request::Delete { .. } => C::Delete,
+        Request::Insert { .. }
+        | Request::InsertExpressions { .. }
+        | Request::InsertMany { .. }
+        | Request::OnConflict { .. } => C::Insert,
+        _ => C::Other,
+    }
+}
+
+/// The SQLSTATE a native error is logged with.
+fn native_sqlstate(error: &Error) -> String {
+    match error.sqlstate() {
+        Some(state) => state.to_owned(),
+        None => match error {
+            Error::Unsupported => "0A000",
+            Error::Limit => "54000",
+            _ => "XX000",
+        }
+        .to_owned(),
+    }
+}
+
 impl SqlSession {
     /// Execute against this session's snapshot. An idle session owns its
     /// transaction; an existing transaction remains provisional until COMMIT.
@@ -18,6 +46,11 @@ impl SqlSession {
         bindings: &Bindings,
     ) -> Result<crate::task::release::Unreleased<Outcome>> {
         let v2 = self.is_v2_engine();
+        // GD-0061 R3-309: the request's read-log entry, logged with its
+        // canonical JSON and, on failure, its error.
+        let entry = self.start_native_statement(request_class(request), bindings.len(), || {
+            serde_json::to_string(request).unwrap_or_default()
+        });
         // The tag carries the plan the task's column rules gave at binding
         // (GD-0061 R3-304/R3-308); a request refused there makes no page.
         let mut plan = None;
@@ -32,9 +65,33 @@ impl SqlSession {
                 plan = bound;
                 run_complete(session, &table, operation, None)
             },
-        )?;
-        let tag = self.release_tag_with(|| plan.ok_or(crate::task::TaskError::Revoked));
+        );
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(entry) = &entry {
+                    entry.fail_with(&native_sqlstate(&error));
+                }
+                return Err(error);
+            }
+        };
+        let tag = entry.and_then(|entry| {
+            self.release_tag_for(entry, plan.ok_or(crate::task::TaskError::Revoked))
+        });
         Ok(crate::task::release::Unreleased::new(outcome, tag))
+    }
+
+    /// Starts the read-log entry of a native task statement with `text` as
+    /// its text (GD-0061 R3-309); `None` without a task, and `text` never runs.
+    fn start_native_statement(
+        &self,
+        class: crate::task::StatementClass,
+        param_count: usize,
+        text: impl FnOnce() -> String,
+    ) -> Option<std::sync::Arc<crate::task::readlog::StatementEntry>> {
+        self.task.as_ref()?;
+        self.set_task_statement_text(&text());
+        self.start_task_statement(class, param_count)
     }
 
     /// A block stages as a unit into an outer transaction. Failure aborts that
@@ -63,13 +120,20 @@ impl SqlSession {
         // session the block is refused (fail closed, R3-308). Its steps are
         // still bound first, so a step's own column-rule denial keeps its
         // SQLSTATE, but no step runs and no row is read.
-        let tag = self.release_tag_with(|| {
-            Err(crate::task::TaskError::NotAllowedInTaskSession(
-                crate::task::StatementClass::TransactionControl,
-            ))
-        });
+        if self.task.is_some() {
+            self.set_task_statement_text(&serde_json::to_string(block).unwrap_or_default());
+        }
+        let tag = self.release_tag_with(
+            crate::task::StatementClass::TransactionControl,
+            bindings.len(),
+            || {
+                Err(crate::task::TaskError::NotAllowedInTaskSession(
+                    crate::task::StatementClass::TransactionControl,
+                ))
+            },
+        );
         let v2 = self.is_v2_engine();
-        self.native_scope(
+        let result = self.native_scope(
             block.read_only,
             || {
                 transaction::validate_transaction(block, Admission::engine(v2))?;
@@ -82,8 +146,11 @@ impl SqlSession {
                 }
                 transaction::run_transaction(session, &plan)
             },
-        )
-        .map(|outcome| crate::task::release::Unreleased::new(outcome, tag))
+        );
+        if let (Err(error), Some(tag)) = (&result, &tag) {
+            tag.fail_with(&native_sqlstate(error));
+        }
+        result.map(|outcome| crate::task::release::Unreleased::new(outcome, tag))
     }
 
     pub(super) fn native_scope<T>(

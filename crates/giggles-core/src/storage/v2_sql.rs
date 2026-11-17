@@ -759,7 +759,7 @@ impl SqlSession {
                                     |s| s as &dyn relational::scan::RowSource));
                             if let Some(scoped) = &scoped {
                                 crate::task::rows::record(meter.counts());
-                                if let Some(state) = &read_state { state.add_rows_read(meter.take_read_delta()); }
+                                if let Some(state) = &read_state { state.add_meter(&meter); }
                                 if let Some(error) = scoped.take_error() { return Err(error.into()); }
                             }
                             if let Some(error) = source.error.take() { return Err(error); }
@@ -792,7 +792,7 @@ impl SqlSession {
                         ) };
                         if scope.is_some() {
                             crate::task::rows::record(meter.counts());
-                            if let Some(state) = &read_state { state.add_rows_read(meter.take_read_delta()); }
+                            if let Some(state) = &read_state { state.add_meter(&meter); }
                         }
                         if let Some(error) = context.as_ref().and_then(|clock| clock.take_error()) {
                             return Err(error);
