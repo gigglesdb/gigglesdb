@@ -199,6 +199,8 @@ pub enum StatementKind {
 /// Resolved statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedStatement {
+    /// Fixed upstream SQL for an allowlisted metadata statement.
+    pub canonical_sql: Option<&'static str>,
     /// Kind.
     pub kind: StatementKind,
     /// Outputs.

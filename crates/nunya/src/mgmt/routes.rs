@@ -121,7 +121,7 @@ pub fn authority_error(err: AuthorityError) -> Response<Bytes> {
         LifetimeTooLong => (400, "lifetime_too_long"),
         IdempotencyConflict => (409, "idempotency_conflict"),
         SessionEnded => (409, "session_ended"),
-        Store => (503, "unavailable"),
+        Store | StandingPending => (503, "unavailable"),
     };
     error(
         StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),

@@ -110,6 +110,7 @@ impl Session {
         if empty_query {
             if !param_types.is_empty() { return Err(failure(NyCode::NotAnalysable)); }
             statements.push(ResolvedStatement {
+                canonical_sql: None,
                 kind: StatementKind::SessionNoop { tag: "" },
                 outputs: vec![], uses: vec![], writes: vec![], param_count: 0,
                 plain_params: vec![], source_span: ir::Span { start: 0, end: sql.len() },

@@ -717,6 +717,9 @@ fn rewrite_literals(
 ) -> Result<String, Refusal> {
     let mut replacements = vec![];
     for (statement, plan) in statements.iter().zip(plans) {
+        if let Some(canonical) = statement.canonical_sql {
+            replacements.push((statement.source_span.clone(), canonical.to_owned()));
+        }
         for input in &plan.inputs {
             match input {
                 InputRewrite::DecryptLiteral { span, domain, ty } => {
@@ -2056,6 +2059,40 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn metadata_canonical_query_and_parse_preserve_row_description() {
+        let f = Fixture::new();
+        for (sql, canonical, name) in [
+            ("select current_schema()", "SELECT pg_catalog.current_schema()", "current_schema"),
+            ("SELECT current_database()", "SELECT pg_catalog.current_database()", "current_database"),
+            ("select current_catalog", "SELECT current_catalog", "current_catalog"),
+        ] {
+            let mut simple = f.session();
+            let out = simple.frontend(Frontend::Query(sql.into()));
+            assert!(matches!(out.upstream.as_slice(), [Frontend::Query(q)] if q == canonical));
+            let fields = || vec![FieldDescription {
+                name: name.into(), table_oid: 0, column_attr: 0, type_oid: 19,
+                type_size: 64, type_modifier: -1, format: 0,
+            }];
+            let response = simple.backend(Backend::RowDescription(fields()));
+            assert!(matches!(response.client.as_slice(), [Backend::RowDescription(actual)] if actual == &fields()));
+            let mut extended = f.session();
+            let out = extended.frontend(Frontend::Parse {
+                name: "metadata".into(), query: sql.into(), param_types: vec![],
+            });
+            assert!(matches!(out.upstream.as_slice(), [Frontend::Parse { query, .. }] if query == canonical));
+            extended.backend(Backend::ParseComplete);
+            extended.frontend(Frontend::Describe { kind: b'S', name: "metadata".into() });
+            extended.backend(Backend::ParameterDescription(vec![]));
+            let response = extended.backend(Backend::RowDescription(fields()));
+            assert!(matches!(response.client.as_slice(), [Backend::RowDescription(actual)] if actual == &fields()));
+        }
+        let mut simple = f.session();
+        let out = simple.frontend(Frontend::Query("select current_schema(); select current_database()".into()));
+        let [Frontend::Query(query)] = out.upstream.as_slice() else { panic!("metadata query was refused") };
+        assert_eq!(query.split(';').map(str::trim).collect::<Vec<_>>(),
+            ["SELECT pg_catalog.current_schema()", "SELECT pg_catalog.current_database()"]);
+    }
+    #[test]
     fn session_setting_pipeline_preserves_upstream_order() {
         let f = Fixture::new();
         let mut session = f.session();
@@ -2438,7 +2475,13 @@ pub(crate) mod tests {
                 assert!(parse.upstream.is_empty());
                 assert!(matches!(parse.client.as_slice(), [Backend::ParseComplete]));
             } else {
-                assert!(matches!(&parse.upstream[0], Frontend::Parse { query, .. } if query == sql));
+                let expected = match sql {
+                    "select current_schema()" => "SELECT pg_catalog.current_schema()",
+                    "select current_catalog" => "SELECT current_catalog",
+                    "SHOW TRANSACTION ISOLATION LEVEL" => sql,
+                    _ => panic!("unexpected metadata fixture"),
+                };
+                assert!(matches!(&parse.upstream[0], Frontend::Parse { query, .. } if query == expected));
                 assert!(matches!(s.backend(Backend::ParseComplete).client.as_slice(), [Backend::ParseComplete]));
             }
             let bind = s.frontend(Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![], params: vec![], result_formats: vec![] });

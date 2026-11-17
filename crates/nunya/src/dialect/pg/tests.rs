@@ -1337,7 +1337,7 @@ fn driver_session_settings_are_exact_and_fail_closed() {
 fn session_metadata_allowlist() {
     for sql in ["SHOW TRANSACTION ISOLATION LEVEL", "show transaction isolation level",
         "SHOW transaction_isolation", "select current_schema()", "SELECT current_schema()",
-        "select current_catalog", "SELECT current_database()", "select pg_catalog.current_schema() as schema"] {
+        "select current_catalog", "SELECT current_database()"] {
         let s = lower(sql);
         assert_eq!(s.kind, StatementKind::Select, "{sql}");
         assert_eq!(s.outputs.len(), 1, "{sql}");
@@ -1352,6 +1352,14 @@ fn session_metadata_near_misses() {
     let (snapshot, policy) = fixture();
     for (sql, code) in [
         ("SHOW search_path", NyCode::StatementNotAllowed),
+        ("select current_schema() as s", NyCode::NotAnalysable),
+        ("select current_schema() s", NyCode::NotAnalysable),
+        ("select current_catalog as c", NyCode::NotAnalysable),
+        ("select pg_catalog.current_schema()", NyCode::NotAnalysable),
+        ("select pg_catalog.current_schema() as schema", NyCode::NotAnalysable),
+        ("select pg_catalog.current_database()", NyCode::NotAnalysable),
+        ("select current_schema", NyCode::NotAnalysable),
+
         ("SHOW ALL", NyCode::StatementNotAllowed),
         ("SHOW server_version", NyCode::StatementNotAllowed),
         ("SHOW transaction_read_only", NyCode::StatementNotAllowed),

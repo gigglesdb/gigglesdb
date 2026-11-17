@@ -83,6 +83,7 @@ fn label(policy: &Policy, column: &ColumnRef) -> Label {
 fn empty(kind: StatementKind) -> Lowered {
     Lowered {
         stmt: ResolvedStatement {
+            canonical_sql: None,
             kind,
             outputs: vec![],
             uses: vec![],

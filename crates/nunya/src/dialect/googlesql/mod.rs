@@ -88,6 +88,7 @@ pub fn lower_gsql(
                 {
                     return Ok((
                         ResolvedStatement {
+                            canonical_sql: None,
                             kind: StatementKind::Refused(NyCode::StatementNotAllowed),
                             outputs: vec![],
                             uses: vec![],
@@ -133,6 +134,7 @@ pub fn lower_gsql(
         snapshot,
         policy,
         stmt: ResolvedStatement {
+            canonical_sql: None,
             kind: StatementKind::Select,
             outputs: vec![],
             uses: vec![],

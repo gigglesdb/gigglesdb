@@ -403,6 +403,7 @@ struct State {
     applied: Vec<&'static str>,
     attempts: u64,
     failures: u64,
+    standing_pending: u64,
 }
 /// Serialized configuration reloads and data-free operational status.
 pub(crate) struct ConfigReloader {
@@ -464,6 +465,7 @@ impl ConfigReloader {
                 applied: vec![],
                 attempts: 0,
                 failures: 0,
+                standing_pending: 0,
             }),
         }
     }
@@ -523,6 +525,7 @@ impl ConfigReloader {
             Ok(candidate)
         });
         let prepared = prepared.and_then(|p| candidate.map(|c| (p, c)).map_err(str::to_owned));
+        let mut standing_pending = false;
         let result = prepared.and_then(|(prepared, candidate)| {
             let hub = self.hub.upgrade().ok_or("reload service unavailable")?;
             let revision = prepared.config.revision.clone();
@@ -535,7 +538,10 @@ impl ConfigReloader {
                 if let Some((authority, admins)) = self.appliers.get() {
                     if prepared.diff.reloadable.contains(&"standing") {
                         let counts = authority.sync_config_principals(&prepared.principals)
-                            .map_err(|error| format!("standing {error:?}"))?;
+                            .map_err(|error| {
+                                standing_pending = error == crate::state::authority::AuthorityError::StandingPending;
+                                format!("standing {error:?}")
+                            })?;
                         eprintln!("serve: config reload: standing created={} updated={} re_enabled={} disabled={}",
                             counts.created, counts.updated, counts.re_enabled, counts.disabled);
                     }
@@ -578,9 +584,15 @@ impl ConfigReloader {
         });
         if let Err(reason) = result {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.last = "rejected";
             state.failures += 1;
-            eprintln!("serve: config reload rejected: {reason}");
+            if standing_pending {
+                state.last = "standing_pending";
+                state.standing_pending += 1;
+                eprintln!("serve: config reload: standing removal in effect but not persisted; will retry on next reload");
+            } else {
+                state.last = "rejected";
+                eprintln!("serve: config reload rejected: {reason}");
+            }
         }
     }
     fn commit(&self, state: &mut State, new: Config, diff: Diff) {
@@ -656,6 +668,7 @@ impl ConfigReloader {
         let mut metrics = vec![
             ("nunya_config_reloads_total".into(), s.attempts),
             ("nunya_config_reload_failures_total".into(), s.failures),
+            ("nunya_config_reload_standing_pending_total".into(), s.standing_pending),
         ];
         metrics.extend(RESTART_ONLY.iter().map(|name| {
             (
@@ -824,6 +837,43 @@ key_file='key'
         let v = ScramVerifier::from_password(password, b"salt", 1).to_pg_string();
         format!("[{}]", names.iter().map(|name| format!("{{name='{name}',verifier='{v}'}}"))
             .collect::<Vec<_>>().join(","))
+    }
+    #[tokio::test]
+    async fn standing_removal_pending_is_visible_and_same_file_retries() {
+        use crate::state::store::RedbStore;
+        let f = Fixture::new();
+        let config = f.load(&f.text);
+        let root = crate::token::keys::RootKey::from_hex(&"01".repeat(32)).unwrap();
+        let store = Arc::new(RedbStore::open(&config.state_dir, &root).unwrap());
+        let authority = Authority::load(store.clone(), session_limits(&config.session)).unwrap();
+        authority.sync_config_principals(&config_principals(&config.standing)).unwrap();
+        let session = acquire(&authority, "agent", "pending").unwrap();
+        let hub = f.hub();
+        let reload = ConfigReloader::new(config, Arc::downgrade(&hub));
+        reload.attach(authority.clone(), Arc::new(std::sync::RwLock::new(vec![])));
+        f.load(&edit(&f.text, "standing", "[]"));
+        store.fail_commits(true);
+        reload.reload().await;
+        assert_eq!(reload.last_reload(), "standing_pending");
+        assert!(reload.status().contains("last_reload=standing_pending"));
+        assert_eq!(authority.principal(session.principal).unwrap().state, PrincipalState::Disabled);
+        assert_eq!(authority.session(session.id).unwrap().revoke_reason, Some(EndReason::ConfigRemoved));
+        assert!(authority.admit(session.id, Operation::Read).is_err());
+        assert_eq!(reload.state.lock().unwrap().running.standing.len(), 1);
+        for name in ["nunya_config_reload_failures_total", "nunya_config_reload_standing_pending_total"] {
+            assert!(reload.metrics().contains(&(name.into(), 1)));
+        }
+        let persisted = Authority::load(store.clone(), SessionLimits::default()).unwrap();
+        assert_eq!(persisted.principal(session.principal).unwrap().state, PrincipalState::Enabled);
+        drop(persisted);
+        // Retry exactly the same file; the running standing list was retained.
+        store.fail_commits(false);
+        reload.reload().await;
+        assert_eq!(reload.last_reload(), "applied");
+        assert!(reload.state.lock().unwrap().running.standing.is_empty());
+        let persisted = Authority::load(store, SessionLimits::default()).unwrap();
+        assert_eq!(persisted.principal(session.principal).unwrap().state, PrincipalState::Disabled);
+        assert_eq!(persisted.session(session.id).unwrap().revoke_reason, Some(EndReason::ConfigRemoved));
     }
     #[tokio::test]
     async fn standing_removal_revokes_connection_and_new_sessions() {

@@ -36,6 +36,7 @@ fn strings(ns: &[p::Node]) -> Result<Vec<String>> {
 }
 fn empty(span: Span) -> ResolvedStatement {
     ResolvedStatement {
+        canonical_sql: None,
         kind: StatementKind::Select,
         outputs: vec![],
         uses: vec![],
@@ -47,7 +48,7 @@ fn empty(span: Span) -> ResolvedStatement {
 }
 
 // Only a whole, table-free metadata statement may bypass expression lowering.
-fn metadata_select(s: &p::SelectStmt) -> Option<OutputColumn> {
+fn metadata_select(s: &p::SelectStmt) -> Option<(OutputColumn, &'static str)> {
     if s.target_list.len() != 1
         || !s.distinct_clause.is_empty() || s.into_clause.is_some()
         || !s.from_clause.is_empty() || s.where_clause.is_some()
@@ -62,7 +63,7 @@ fn metadata_select(s: &p::SelectStmt) -> Option<OutputColumn> {
         return None;
     }
     let target = match s.target_list[0].node.as_ref()? {
-        NodeEnum::ResTarget(t) if t.indirection.is_empty() => t,
+        NodeEnum::ResTarget(t) if t.name.is_empty() && t.indirection.is_empty() => t,
         _ => return None,
     };
     let name = match target.val.as_deref()?.node.as_ref()? {
@@ -71,16 +72,22 @@ fn metadata_select(s: &p::SelectStmt) -> Option<OutputColumn> {
             && !f.agg_star && !f.agg_distinct && !f.func_variadic => {
             let names = strings(&f.funcname).ok()?;
             match names.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-                [name @ ("current_schema" | "current_database")]
-                | ["pg_catalog", name @ ("current_schema" | "current_database")] => (*name).to_owned(),
+                ["current_schema"] => "current_schema",
+                ["current_database"] => "current_database",
                 _ => return None,
             }
         }
         NodeEnum::SqlvalueFunction(f)
-            if f.op == p::SqlValueFunctionOp::SvfopCurrentCatalog as i32 => "current_catalog".into(),
+            if f.op == p::SqlValueFunctionOp::SvfopCurrentCatalog as i32 => "current_catalog",
         _ => return None,
     };
-    Some(metadata_output(if target.name.is_empty() { &name } else { &target.name }))
+    let canonical = match name {
+        "current_schema" => "SELECT pg_catalog.current_schema()",
+        "current_database" => "SELECT pg_catalog.current_database()",
+        "current_catalog" => "SELECT current_catalog",
+        _ => return None,
+    };
+    Some((metadata_output(name), canonical))
 }
 fn metadata_output(name: &str) -> OutputColumn {
     OutputColumn { name: name.into(), label: Label::Plain, source: None, ty: Some(ColumnType::Text) }
@@ -261,7 +268,8 @@ impl Lowering for PgLowering {
             };
             match node(raw.stmt.as_deref().ok_or_else(refuse)?)? {
                 NodeEnum::SelectStmt(s) => {
-                    if let Some(output) = metadata_select(s) {
+                    if let Some((output, canonical)) = metadata_select(s) {
+                        state.statement.canonical_sql = Some(canonical);
                         state.statement.outputs = vec![output];
                     } else if s.into_clause.is_some() {
                         state.statement.kind = StatementKind::Refused(NyCode::StatementNotAllowed);

@@ -413,6 +413,7 @@ mod tests {
     }
     fn stmt() -> ResolvedStatement {
         ResolvedStatement {
+            canonical_sql: None,
             kind: StatementKind::Select,
             outputs: vec![],
             uses: vec![],

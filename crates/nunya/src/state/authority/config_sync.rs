@@ -145,40 +145,48 @@ impl Authority {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        let mut tx = self.store.write()?;
-        // Retry disabled principal rows even when memory already denied them on a failed commit.
-        for p in changed.iter().chain(
-            principals
-                .values()
-                .filter(|p| p.source == PrincipalSource::Config && !names.contains(&p.name)),
-        ) {
-            tx.put(Table::Principals, &keys::principal(p.id), &encode(p))?;
-        }
-        // Include previously revoked credentials when retrying a failed rotation.
-        for c in changed_credentials
-            .iter()
-            .chain(credentials.values().filter(|c| {
-                c.state == CredentialState::Revoked
-                    && principals
-                        .get(&c.principal)
-                        .is_some_and(|p| p.source == PrincipalSource::Config)
-            }))
-        {
-            tx.put(
-                Table::PrincipalCredentials,
-                &keys::principal_credential(c.principal, c.id),
-                &encode(c),
-            )?;
-        }
-        for s in &rows {
-            let _: AccessSession = decode(
-                &tx.get(Table::Sessions, &keys::session(s.id))?
-                    .ok_or(AuthorityError::Store)?,
-            )
-            .map_err(|_| AuthorityError::Store)?;
-            tx.put(Table::Sessions, &keys::session(s.id), &encode(s))?;
-        }
-        tx.commit()?;
+        let removal_pending = principals.values().any(|p|
+            p.source == PrincipalSource::Config && !names.contains(&p.name));
+        let persist = || -> Result<(), AuthorityError> {
+            let mut tx = self.store.write()?;
+            // Retry disabled principal rows even when memory already denied them on a failed commit.
+            for p in changed.iter().chain(
+                principals
+                    .values()
+                    .filter(|p| p.source == PrincipalSource::Config && !names.contains(&p.name)),
+            ) {
+                tx.put(Table::Principals, &keys::principal(p.id), &encode(p))?;
+            }
+            // Include previously revoked credentials when retrying a failed rotation.
+            for c in changed_credentials
+                .iter()
+                .chain(credentials.values().filter(|c| {
+                    c.state == CredentialState::Revoked
+                        && principals
+                            .get(&c.principal)
+                            .is_some_and(|p| p.source == PrincipalSource::Config)
+                }))
+            {
+                tx.put(
+                    Table::PrincipalCredentials,
+                    &keys::principal_credential(c.principal, c.id),
+                    &encode(c),
+                )?;
+            }
+            for s in &rows {
+                let _: AccessSession = decode(
+                    &tx.get(Table::Sessions, &keys::session(s.id))?
+                        .ok_or(AuthorityError::Store)?,
+                )
+                .map_err(|_| AuthorityError::Store)?;
+                tx.put(Table::Sessions, &keys::session(s.id), &encode(s))?;
+            }
+            tx.commit()?;
+            Ok(())
+        };
+        persist().map_err(|error| if removal_pending {
+            AuthorityError::StandingPending
+        } else { error })?;
         {
             let mut v = self.view.write().unwrap();
             v.principals = principals;
@@ -437,7 +445,7 @@ mod tests {
         f.store.fail_commits(true);
         assert_eq!(
             f.a.sync_config_principals(&[]).unwrap_err(),
-            AuthorityError::Store
+            AuthorityError::StandingPending
         );
         f.store.fail_commits(false);
         assert_eq!(
@@ -477,7 +485,7 @@ mod tests {
         assert_eq!(snapshot(&f.a), before);
         assert_eq!(
             f.a.sync_config_principals(&[]).unwrap_err(),
-            AuthorityError::Store
+            AuthorityError::StandingPending
         );
         assert_eq!(
             f.a.admit(s.id, Operation::Read).unwrap_err(),

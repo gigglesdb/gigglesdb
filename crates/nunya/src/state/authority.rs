@@ -111,6 +111,9 @@ pub enum AuthorityError {
     /// Storage failed or contained malformed records.
     #[error("state store unavailable")]
     Store,
+    /// Config removal is effective in memory but has not been persisted.
+    #[error("standing removal pending persistence")]
+    StandingPending,
 }
 impl From<StoreError> for AuthorityError {
     fn from(_: StoreError) -> Self {
