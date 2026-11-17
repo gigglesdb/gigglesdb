@@ -25,7 +25,8 @@
 #                           last two cores for servers, last two for the client)
 # Other options:
 #   --profile               extra diagnostic repeat per GigglesDB target/client
-#                           after normal repeats (first mix/protocol group)
+#                           after normal repeats (first mix/protocol group);
+#                           separate fp build <=1510s, profile phase <=1800s
 #   --ttl <seconds>         box lifetime, at most 7200 (default 7200)
 #   --slot-wait <seconds>   how long to wait for a free slot (default 1800)
 #   --data-root <box path>  server data parent dir on the box (default: probe
@@ -34,7 +35,8 @@
 #                           scripts/bench-snapshot-setup.sh, save the box as
 #                           gigglesdb-bench-base (never touches gigglesdb-gate-base)
 # A matrix whose estimated run time exceeds TTL minus 20 minutes (release
-# build and setup) is refused; split it into several runs.
+# build and setup), including the bounded profile build/phase, is refused;
+# split it into several runs.
 #
 # Exit: 0 every run passed (0 errors, invariants held), 1 some run failed, 2 usage error or matrix too
 # long, 3 daily start cap reached, 4 no slot free in time, 5 infrastructure
@@ -98,19 +100,29 @@ for v in "$server_cpus" "$client_cpus"; do [[ -z "$v" || "$v" =~ ^[0-9,-]+$ ]] |
 # Time estimate: each measured run costs warmup + duration + ~30s for server
 # restart, schema setup, seeding and teardown. Build and setup get a fixed 20
 # minutes. giggles-native runs once per (clients, mix), not per protocol.
+# Profiling adds 1510s for its build plus min(1800, 270 + targets * 900)s
+# for the phase, where targets counts non-pg target/client pairs (270s =
+# apt-get 190s plus perf version/sysctl checks; 900s = per-target worst case).
 count() { echo "$1" | tr ',' '\n' | grep -c .; }
 nt=$(count "$targets"); per=$(( nt * $(count "$protocols") ))
 [[ ",$targets," == *",giggles-native,"* ]] && per=$(( (nt - 1) * $(count "$protocols") + 1 ))
 runs=$(( per * $(count "$clients") * $(count "$mixes") * repeats ))
 est=$(( runs * (warmup + duration + 30) ))
-# Extra diagnostic load, readiness and server lifecycle allowance.
+measured_est=$est
+# Bounded diagnostic build, installation and per-target allowance.
 profile_runs=0
 if [ "$profile" = 1 ]; then
   for t in ${targets//,/ }; do
     [ "$t" = pg ] || profile_runs=$(( profile_runs + $(count "$clients") ))
   done
 fi
-est=$(( est + profile_runs * 300 ))
+profile_extra=0
+if [ "$profile" = 1 ] && [ "$profile_runs" -gt 0 ]; then
+  phase=$(( 270 + profile_runs * 900 ))
+  [ "$phase" -gt 1800 ] && phase=1800
+  profile_extra=$(( 1510 + phase ))
+fi
+est=$(( est + profile_extra ))
 budget=$(( ttl - 1200 ))
 if [ $build_snapshot = 0 ] && [ "$est" -gt "$budget" ]; then
   echo "matrix of $runs runs needs ~$(( est / 60 )) min, over the $(( budget / 60 )) min a ${ttl}s box leaves after 20 min of build/setup." >&2
@@ -131,6 +143,24 @@ lines=[l for l in sys.stdin.read().splitlines() if l.strip().startswith('{')]
 d=json.loads(lines[-1]) if lines else {}
 print(d.get(sys.argv[1],'') if sys.argv[1] else json.dumps(d))" "$1"; }
 bexec() { bj exec "$1" --timeout 600 --json -- bash -lc "$2" | jfield stdout; }
+bexec_t() { # <seconds> <box> <command>: bound both boat and its remote command
+  local secs=$1; shift
+  timeout --kill-after=10 "$(( secs + 30 ))" "$B" --no-update exec "$1" --timeout "$secs" --json -- bash -lc "$2" | jfield stdout
+}
+copied=0 bench_started=0
+copy_back() { # Best effort, including incomplete benches; never prevents deletion.
+  [ "$copied" = 1 ] && return 0
+  copied=1
+  bexec_t 120 "$box" "cd /home/user && timeout --kill-after=10 90 tar --exclude='*.data' --exclude='*.data.old' --exclude='raw-*' -czf bench-logs.tar.gz bench bench.out" >/dev/null || log "WARNING: log archive incomplete"
+  ( cd "$run" && timeout --kill-after=10 150 "$B" --no-update scp "$box:/home/user/bench-logs.tar.gz" logs.tar.gz >/dev/null 2>&1 ) || log "WARNING: log download failed"
+  local f
+  for f in summary.md results.jsonl meta.json progress; do
+    tar -xzOf "$run/logs.tar.gz" "bench/$f" > "$run/$f" 2>/dev/null || true
+    [ -s "$run/$f" ] || rm -f "$run/$f"
+  done
+  tar -xzf "$run/logs.tar.gz" -C "$run" --strip-components=1 bench/profiles 2>/dev/null || true
+  return 0
+}
 
 # 1. Daily start cap (UTC day, all agents; one START line per box).
 today=$(date -u +%F)
@@ -145,6 +175,10 @@ slot='' box='' ref="refs/bench-remote/$stamp-$$" started=$(date +%s)
 cleanup() {
   rc=$?
   if [ -n "$box" ]; then
+    if [ "$bench_started" = 1 ] && [ "$copied" != 1 ]; then
+      log "copying partial results back"
+      copy_back || true
+    fi
     log "deleting box $box"
     bj delete "$box" --yes >/dev/null 2>&1 || log "WARNING: delete of $box failed; delete it by hand"
     mins=$(( ($(date +%s) - started + 59) / 60 ))
@@ -200,11 +234,18 @@ head=$(bexec "$box" "cd /home/user/gigglesdb && git fetch -q /home/user/stack.bu
 [ "$(echo "$head" | tr -d '[:space:]')" = "$tip" ] || { log "checkout of $tip on box failed: $head"; exit 5; }
 
 wait_for() { # wait_for <done-file> <progress-file>
+  local previous_line="" latest_line
   while :; do
     sleep 30
-    st=$(bexec "$box" "cat $1 2>/dev/null; tail -1 $2 2>/dev/null" || true)
+    st=$(bexec_t 60 "$box" "cat $1 2>/dev/null; tail -1 $2 2>/dev/null" || true)
+    latest_line=$(echo "$st" | sed '/^rc=/d' | tail -1)
+    if [ -n "$latest_line" ] && [ "$latest_line" != "$previous_line" ]; then
+      log "box: $latest_line"
+      echo "$latest_line" >> "$run/progress.log"
+      previous_line=$latest_line
+    fi
     if echo "$st" | grep -q '^rc='; then break; fi
-    [ $(( $(date +%s) - started )) -lt $(( ttl - 300 )) ] || { log "did not finish before the box TTL"; exit 5; }
+    [ $(( $(date +%s) - started )) -lt $(( ttl - 600 )) ] || { log "did not finish before the box TTL"; exit 5; }
   done
 }
 
@@ -233,17 +274,15 @@ envs="PROFILE=$profile TARGETS=$targets CLIENTS=$clients MIXES=$mixes PROTOCOLS=
 [ -n "$server_cpus" ] && envs+=" SERVER_CPUS=$server_cpus"
 [ -n "$client_cpus" ] && envs+=" CLIENT_CPUS=$client_cpus"
 bj exec "$box" --detach -- bash -lc "$envs bash /home/user/bench-remote-runner.sh > /home/user/bench.out 2>&1" >/dev/null
-log "bench running: $runs runs, ~$(( est / 60 )) min after the build"
+bench_started=1
+log "bench running: $runs runs, ~$(( measured_est / 60 )) min measured + up to $(( (profile_extra + 59) / 60 )) min profile after the build"
 wait_for /home/user/bench/done /home/user/bench/progress
 
-# 7. Copy results back.
-bexec "$box" "cd /home/user && tar --exclude='*.data' --exclude='*.data.old' --exclude='raw-*' -czf bench-logs.tar.gz bench bench.out" >/dev/null
-( cd "$run" && bj scp "$box:/home/user/bench-logs.tar.gz" logs.tar.gz >/dev/null 2>&1 ) || log "WARNING: log download failed"
+# 7. Copy results back (also used by cleanup on failure/TTL).
+copy_back
 for f in summary.md results.jsonl meta.json; do
-  tar -xzOf "$run/logs.tar.gz" "bench/$f" > "$run/$f" 2>/dev/null || bexec "$box" "cat /home/user/bench/$f" > "$run/$f" || true
+  [ -s "$run/$f" ] || bexec "$box" "cat /home/user/bench/$f" > "$run/$f" || true
 done
-# Small profile artifacts are also directly available beside the summary.
-tar -xzf "$run/logs.tar.gz" -C "$run" --strip-components=1 bench/profiles 2>/dev/null || true
 cat "$run/summary.md"
 grc=$(echo "$st" | grep -o '^rc=[0-9]*' | cut -d= -f2)
 log "bench rc=$grc; results in $run"

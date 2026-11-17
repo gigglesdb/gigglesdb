@@ -142,28 +142,82 @@ data stays on `/home/user`, and both summary.md and meta.json say so.
 
 ## Optional profiling (`--profile`)
 
-Add `--profile` for one extra diagnostic repeat per selected GigglesDB target
-and client count, after all normal repeats. It uses the first selected mix
-and protocol group (native uses native). These 210 s loads are separate from
-`results.jsonl` and measured summary medians. The TTL estimate adds 300 s per
-extra repeat. Normal repeats never run under perf. Only profile builds export
-`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, changing the server cache key.
+Add `--profile` for one diagnostic run per selected GigglesDB target/client
+count after all measured repeats, using the first mix and protocol group
+(native uses native). Diagnostic results stay out of `results.jsonl` and
+summary medians. Normal runs use the unchanged release binary, without perf.
+A separate build in `$CARGO_TARGET_DIR-profile` enables frame pointers and
+`line-tables-only` debug information. It has a 1500 s timeout plus 10 s to
+kill; failure is nonfatal and falls back to the normal binary with DWARF.
 
-The runner installs kernel perf tools if missing, enables perf permissions,
-and attempts 60 s CPU sampling at 999 Hz with DWARF stacks, 30 s BPF lock
-contention (falling back to lock record/report), and 30 s off-CPU stacks via
-`offcputime-bpfcc` (falling back to 20 s perf sched plus timehist). Missing
-packages, kernel support, or permissions are logged and never fail the bench.
-No cargo tools are installed for profiling.
+The phase starts its budget before checking/installing perf. Installation
+has a 180 s timeout plus 10 s to kill (package-lock wait is at most 60 s).
+Each target gets a fresh server and a 150 s diagnostic load, including schema
+setup/seeding, bounded by a 240 s timeout. After up to 60 s waiting for the
+first `completed=` line, captures run sequentially while the load is active:
+
+| Step | Capture | Timeout |
+|---|---|---|
+| CPU, frame pointers | 499 Hz, `--call-graph fp`, 30 s | 45 s |
+| CPU, DWARF fallback | 99 Hz, `dwarf,8192`, 20 s | 35 s |
+| Lock | BPF contention, 30 s | 45 s |
+| Lock fallback | `perf lock record`, 30 s | 45 s |
+| Off-CPU | `offcputime-bpfcc`, 30 s | 45 s |
+| Off-CPU fallback | `perf sched record`, 20 s | 35 s |
+| Lock report / sched timehist | after load ends and server stops | 120 s each |
+| CPU report | stdio, no children, 0.5% minimum | 180 s |
+| CPU script and AWK fold | both pipeline members bounded independently | 300 s each, concurrently |
+| Flamegraph render | inferno or flamegraph.pl, when installed | 60 s |
+
+Every timeout uses `--kill-after=10`; root captures/processors run timeout
+inside `sudo -n` so root perf can be killed. The perf version/sysctl checks
+and data-size check are bounded at 15 s too. Every per-target capture,
+processing and load timeout is clamped to the remaining deadline minus 10 s;
+steps with less than 15 s available are skipped and logged. The diagnostic
+load's timeout kills its process group, including tsx children. Captures
+finish before waiting for the load, stopping the server, and post-processing.
+Raw files survive until processing ends, then are deleted. A nonempty CPU
+capture with exit 0 or timeout exit 124 counts as usable. Above 1 GB
+(1,073,741,824 bytes), `perf script` and folding are skipped; the bounded
+CPU report is still attempted. Missing tools/permissions never fail the bench.
+
+Normal time is about 5–6 min per target: server start about 20 s, seeding,
+a 150 s load covering roughly 95 s of captures, and 1–3 min for report/script.
+Worst case is 15 min per target; the whole phase has a 30 min per-box budget.
+Before starting a target, the runner reserves 900 s; if it would exceed
+1800 s since phase start, that target and all later targets are skipped.
+
+| Per-target worst-case component | Bound |
+|---|---|
+| `start_server` | <=160 s: two 60 s readiness waits plus up to 40 s stop |
+| All later capture/load/processing steps | clamped to start + 840 s, with 10 s kill-after reserved |
+| Final `stop_server` | <=40 s |
+| Total (including up to 10 s kill-after allowance) | <=890 s, within the 900 s reservation |
+
+The matrix estimate adds `1510 + min(1800, 270 + profile_runs * 900)` seconds
+when profiling has non-pg targets; `profile_runs` is non-pg targets times
+client counts, and 270 s covers perf installation (190 s) plus the bounded
+version and sysctl checks. This covers the separate build and bounded phase. The measured
+estimate is still runs times (warmup + duration + 30 s), with 20 min separately
+reserved for normal build/setup. The launch log shows measured and profile
+estimates separately; split matrices that exceed the TTL allowance.
+
+Progress includes each capture and post-processing start and budget skips.
+The local console log mirrors changed box progress lines, also saved in the
+run folder's `progress.log`. At TTL minus 600 s the waiter gives up and
+attempts partial copy-back before deleting the box; other failures after
+runner launch also trigger best-effort copy-back. Archive creation, boat
+execution and download are bounded. Incomplete/missing files are tolerated.
 
 `profiles/` is included in `logs.tar.gz` and extracted beside `summary.md`:
 `top-<target>-c<clients>.txt`, `lock-...txt`, `offcpu-...txt`, and
 `folded-...txt`; `flame-...svg` is produced when `inferno-flamegraph` or
-`flamegraph.pl` is already on PATH. Otherwise retain the folded stacks for
-rendering later. Raw perf data is deleted on the box and excluded from download.
-`meta.json` adds `profile_requested`, `profiling_ran` (at least one successful
-CPU capture), and `perf_version`. Failures are in `logs/profile-*.capture.txt`
-and `logs/perf-*`.
+`flamegraph.pl` is already on PATH. Raw perf files and `raw-*` directories
+are excluded from download as a backstop. The run folder also contains
+`results.jsonl`, `meta.json`, and the copied box `progress` file.
+`meta.json` records `profile_requested`, `profiling_ran` (usable CPU capture),
+`perf_version`, `profile_callgraph`, and `profile_build_seconds`. Failures
+are in `logs/build-profile.log`, `logs/profile-*.capture.txt` and `logs/perf-*`.
 
 Each measured JSONL record also includes `ops` and `protocols` aggregates:
 count, p50_ms, p95_ms, p99_ms, max_ms, errors. Counts include failed operations;

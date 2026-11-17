@@ -19,6 +19,16 @@ OPSET=${OPSET:-common}
 PROFILE=${PROFILE:-0}
 profile_ran=0
 perf_version=""
+PROFILE_PHASE_BUDGET=1800
+PROFILE_TARGET_WORST=900
+PROFILE_TARGET_STEPS=840
+PROFILE_LOAD_SECONDS=150
+cap() { # cap <max-secs> <deadline-epoch>; leave room for timeout's kill-after
+  local secs=$(( $2 - $(date +%s) - 10 ))
+  [ "$secs" -gt "$1" ] && secs=$1
+  [ "$secs" -ge 15 ] || return 1
+  echo "$secs"
+}
 rm -rf "$out"; mkdir -p "$out/logs"
 progress() { echo "$(date -u +%T) $*" >> "$out/progress"; }
 fail_setup() { progress "SETUP FAILED: $*"; echo "setup failed: $*" > "$out/summary.md"; declare -F stop_all >/dev/null && stop_all; echo "rc=2" > "$out/done"; exit 2; }
@@ -90,7 +100,6 @@ native_support=0
 grep -q -- 'frontend' "$lt/src/cli.ts" && native_support=1
 
 # 2. Release build.
-[ "$PROFILE" = 1 ] && export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 progress "cargo build --release giggles-server"
 command -v sccache >/dev/null 2>&1 && export RUSTC_WRAPPER=$(command -v sccache)
 s=$(date +%s)
@@ -99,6 +108,24 @@ s=$(date +%s)
 build_s=$(( $(date +%s) - s ))
 gs=$CARGO_TARGET_DIR/release/giggles-server
 progress "build done in ${build_s}s"
+gs_profile=$gs
+profile_callgraph=dwarf
+profile_build_seconds=0
+if [ "$PROFILE" = 1 ] && [[ ",$TARGETS," == *",giggles-sql,"* || ",$TARGETS," == *",giggles-native,"* ]]; then
+  progress "cargo build --release giggles-server (profile: frame pointers)"
+  s=$(date +%s)
+  if ( cd "$repo/crates/giggles-server" &&
+    CARGO_TARGET_DIR=$CARGO_TARGET_DIR-profile RUSTFLAGS="-C force-frame-pointers=yes" \
+    CARGO_PROFILE_RELEASE_DEBUG=line-tables-only timeout --kill-after=10 1500 cargo build --release --bin giggles-server
+  ) > "$out/logs/build-profile.log" 2>&1; then
+    gs_profile=$CARGO_TARGET_DIR-profile/release/giggles-server
+    profile_callgraph=fp
+  else
+    progress "profile build failed/timed out; using measured binary with dwarf fallback (see logs/build-profile.log)"
+  fi
+  profile_build_seconds=$(( $(date +%s) - s ))
+  progress "profile build done in ${profile_build_seconds}s ($profile_callgraph)"
+fi
 
 pin_server() { taskset -c "$SERVER_CPUS" "$@"; }
 wait_line() { # wait_line <file> <pattern> <seconds>
@@ -252,7 +279,8 @@ mixarg() {
 }
 protoarg() { [ "$1" = all ] && echo simple,extended,prepared || echo "${1//+/,}"; }
 loadtest() { # loadtest <target> <report> <log> <seconds> <clients> <mix> <protocols>
-  local target=$1 report=$2 log=$3 secs=$4 c=$5 mix=$6 proto=$7 url extra=()
+  local target=$1 report=$2 log=$3 secs=$4 c=$5 mix=$6 proto=$7 url extra=() prefix=()
+  [ -n "${LOAD_TIMEOUT:-}" ] && prefix=(timeout --kill-after=10 "$LOAD_TIMEOUT")
   case "$target" in
     pg) url=$pg_url; extra=(--protocols "$proto") ;;
     giggles-sql) url=$gg_url; extra=(--protocols "$proto") ;;
@@ -264,7 +292,7 @@ loadtest() { # loadtest <target> <report> <log> <seconds> <clients> <mix> <proto
              --native-ca "$tls/ca.pem" --native-cert "$tls/app.pem" --native-key "$tls/app.key")
       ;;
   esac
-  ( cd "$lt" && taskset -c "$CLIENT_CPUS" node_modules/.bin/tsx src/cli.ts load --url "$url" \
+  ( cd "$lt" && "${prefix[@]}" taskset -c "$CLIENT_CPUS" node_modules/.bin/tsx src/cli.ts load --url "$url" \
       --clients "$c" --duration "${secs}s" --rows "$ROWS" --mix "$mix" --ops "$OPS" \
       --max-error-rate 0 --report "$report" "${extra[@]}" ) > "$log" 2>&1
 }
@@ -326,18 +354,82 @@ open(res, "a").write(json.dumps(line) + "\n")
 PY
 done; done; done; done; done
 
-bench_profile() (
-set -uo pipefail
-pid=$1 out=$2 key=$3
-mkdir -p "$out"
-raw=$(mktemp -d "$out/raw-XXXXXX") || exit 0
-trap 'rm -rf "$raw"' EXIT
-log() { echo "profile $key: $*" >&2; }
-if sudo -n perf record -F 999 -g --call-graph dwarf,16384 -p "$pid" -o "$raw/perf.data" -- sleep 60; then
-  touch "$out/ran-$key"
-  sudo -n perf report -i "$raw/perf.data" --stdio --no-children --percent-limit 0.5 > "$out/top-$key.txt" || log "report failed"
+# Capture and processing run separately so every capture overlaps diagnostic load.
+bench_profile() ( # <pid> <profile-dir> <key> <deadline> <callgraph> <progress-file>
+  set -uo pipefail
+  local pid=$1 dest=$2 key=$3 tdl=$4 mode=$5 progress_file=$6 raw s rc
+  mkdir -p "$dest"
+  raw=$dest/raw-$key
+  mkdir -p "$raw"
+  log() { echo "profile $key: $*" >&2; }
+  step() { echo "$(date -u +%T) profile-$key $*" >> "$progress_file"; }
+  budget() { cap "$1" "$tdl" || { step "skipped $2: per-target budget spent"; return 1; }; }
+  step "capture cpu"
+  if [ "$mode" = fp ]; then
+    if s=$(budget 45 'capture cpu'); then
+      sudo -n timeout --kill-after=10 "$s" perf record -F 499 -g --call-graph fp -p "$pid" -o "$raw/perf.data" -- sleep 30
+      rc=$?
+    else rc=1; fi
+  else
+    if s=$(budget 35 'capture cpu'); then
+      sudo -n timeout --kill-after=10 "$s" perf record -F 99 -g --call-graph dwarf,8192 -p "$pid" -o "$raw/perf.data" -- sleep 20
+      rc=$?
+    else rc=1; fi
+  fi
+  if { [ "$rc" = 0 ] || [ "$rc" = 124 ]; } && [ -s "$raw/perf.data" ]; then
+    touch "$dest/ran-$key"
+  else log "CPU capture failed; trying other captures"
+  fi
+  step "capture lock"
+  if s=$(budget 45 'capture lock'); then
+    if ! sudo -n timeout --kill-after=10 "$s" perf lock contention -a -b -E 30 -- sleep 30 > "$dest/lock-$key.txt"; then
+      log "BPF contention unavailable; trying lock record/report"
+      if s=$(budget 45 'capture lock fallback'); then
+        sudo -n timeout --kill-after=10 "$s" perf lock record -o "$raw/lock.data" -- sleep 30 || log "lock fallback failed"
+      fi
+    fi
+  fi
+  step "capture offcpu"
+  if command -v offcputime-bpfcc >/dev/null 2>&1; then
+    if s=$(budget 45 'capture offcpu'); then
+      sudo -n timeout --kill-after=10 "$s" offcputime-bpfcc -df -p "$pid" 30 > "$dest/offcpu-$key.txt" || log "offcputime failed"
+    fi
+  elif s=$(budget 35 'capture offcpu fallback'); then
+    sudo -n timeout --kill-after=10 "$s" perf sched record -o "$raw/sched.data" -- sleep 20 || log "sched fallback failed"
+  fi
+  exit 0
+)
+
+bench_profile_post() ( # <profile-dir> <key> <deadline> <progress-file>
+  set -uo pipefail
+  local dest=$1 key=$2 tdl=$3 progress_file=$4 raw s size
+  raw=$dest/raw-$key
+  [ -d "$raw" ] || exit 0
+  trap 'rm -rf "$raw"' EXIT
+  log() { echo "profile $key: $*" >&2; }
+  step() { echo "$(date -u +%T) profile-$key $*" >> "$progress_file"; }
+  budget() { cap "$1" "$tdl" || { step "skipped $2: per-target budget spent"; return 1; }; }
+  step "post-process"
+  if [ -s "$raw/lock.data" ] && s=$(budget 120 'lock report'); then
+    sudo -n timeout --kill-after=10 "$s" perf lock report -i "$raw/lock.data" > "$dest/lock-$key.txt" || log "lock report failed"
+  fi
+  if [ -s "$raw/sched.data" ] && s=$(budget 120 'sched timehist'); then
+    sudo -n timeout --kill-after=10 "$s" perf sched timehist -i "$raw/sched.data" -s > "$dest/offcpu-$key.txt" || log "sched timehist failed"
+  fi
+  [ -s "$raw/perf.data" ] || exit 0
+  if s=$(budget 180 'perf report'); then
+    sudo -n timeout --kill-after=10 "$s" perf report -i "$raw/perf.data" --stdio --no-children --percent-limit 0.5 > "$dest/top-$key.txt" || log "report failed"
+  fi
+  if s=$(budget 15 'perf.data size'); then
+    size=$(sudo -n timeout --kill-after=10 "$s" stat -c %s "$raw/perf.data") || exit 0
+  else exit 0; fi
+  if [ "$size" -gt 1073741824 ]; then
+    step "perf.data $size bytes > 1 GB; skipping perf script"
+    exit 0
+  fi
   # Fold leaf-first frames into root-first stacks without installing tools.
-  sudo -n perf script -i "$raw/perf.data" | awk '
+  if s=$(budget 300 'perf script/fold'); then
+    sudo -n timeout --kill-after=10 "$s" perf script -i "$raw/perf.data" | timeout --kill-after=10 "$s" awk '
     function flush(    i,s) {
       if(n) { s=f[n]; for(i=n-1;i>0;i--) s=s ";" f[i]; count[s]++ }
       n=0
@@ -349,71 +441,71 @@ if sudo -n perf record -F 999 -g --call-graph dwarf,16384 -p "$pid" -o "$raw/per
       gsub(/;/, ":", line); f[++n]=line
     }
     END { flush(); for(s in count) print s " " count[s] }
-  ' > "$out/folded-$key.txt" || log "fold failed"
-  if [ -s "$out/folded-$key.txt" ]; then
+  ' > "$dest/folded-$key.txt" || log "fold failed"
+  fi
+  if [ -s "$dest/folded-$key.txt" ] && s=$(budget 60 'flamegraph render'); then
     if command -v inferno-flamegraph >/dev/null 2>&1; then
-      inferno-flamegraph < "$out/folded-$key.txt" > "$out/flame-$key.svg" || log "inferno failed"
+      timeout --kill-after=10 "$s" inferno-flamegraph < "$dest/folded-$key.txt" > "$dest/flame-$key.svg" || log "inferno failed"
     elif command -v flamegraph.pl >/dev/null 2>&1; then
-      flamegraph.pl < "$out/folded-$key.txt" > "$out/flame-$key.svg" || log "flamegraph failed"
+      timeout --kill-after=10 "$s" flamegraph.pl < "$dest/folded-$key.txt" > "$dest/flame-$key.svg" || log "flamegraph failed"
     else log "no renderer; keeping folded stacks"
     fi
   fi
-else log "CPU capture failed; trying other captures"
-fi
-if ! sudo -n perf lock contention -a -b -E 30 -- sleep 30 > "$out/lock-$key.txt"; then
-  log "BPF contention unavailable; trying lock record/report"
-  sudo -n perf lock record -o "$raw/lock.data" -- sleep 30 &&
-    sudo -n perf lock report -i "$raw/lock.data" > "$out/lock-$key.txt" || log "lock fallback failed"
-fi
-if command -v offcputime-bpfcc >/dev/null 2>&1; then
-  sudo -n offcputime-bpfcc -df -p "$pid" 30 > "$out/offcpu-$key.txt" || log "offcputime failed"
-else
-  sudo -n perf sched record -o "$raw/sched.data" -- sleep 20 &&
-    sudo -n perf sched timehist -i "$raw/sched.data" -s > "$out/offcpu-$key.txt" || log "sched fallback failed"
-fi
-exit 0
+  exit 0
 )
 
 # Diagnostics follow ALL normal repeats; one per GigglesDB target/client count.
 if [ "$PROFILE" = 1 ] && { has giggles-sql || has giggles-native; }; then
+  phase_start=$(date +%s)
   profile_ready=1
-  if ! perf --version > "$out/logs/perf-version.txt" 2>&1; then
-    sudo -n apt-get install -y "linux-tools-$(uname -r)" linux-tools-common > "$out/logs/perf-install.txt" 2>&1 || {
+  if ! timeout --kill-after=10 15 perf --version > "$out/logs/perf-version.txt" 2>&1; then
+    sudo -n timeout --kill-after=10 180 apt-get -o DPkg::Lock::Timeout=60 install -y "linux-tools-$(uname -r)" linux-tools-common > "$out/logs/perf-install.txt" 2>&1 || {
       progress "perf installation failed; skipping profiles"; profile_ready=0;
     }
   fi
   if [ "$profile_ready" = 1 ]; then
-    perf_version=$(perf --version 2>/dev/null) || profile_ready=0
-    sudo -n sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 > "$out/logs/perf-sysctl.txt" 2>&1 || progress "perf sysctl failed (captures may be unavailable)"
+    perf_version=$(timeout --kill-after=10 15 perf --version 2>/dev/null) || profile_ready=0
+    sudo -n timeout --kill-after=10 15 sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 > "$out/logs/perf-sysctl.txt" 2>&1 || progress "perf sysctl failed (captures may be unavailable)"
   fi
   if [ "$profile_ready" = 1 ]; then
+    gs=$gs_profile
     for c in "${C[@]}"; do for t in "${T[@]}"; do
       [ "$t" = pg ] && continue
       [ "$t" = giggles-native ] && [ "$native_support" = 0 ] && continue
       tag="profile-$t-c$c"
+      elapsed=$(( $(date +%s) - phase_start ))
+      if [ $(( elapsed + PROFILE_TARGET_WORST )) -gt "$PROFILE_PHASE_BUDGET" ]; then
+        progress "profile budget: skipping $tag and later targets (elapsed ${elapsed}s)"
+        break 2
+      fi
+      tdl=$(( $(date +%s) + PROFILE_TARGET_STEPS ))
       if start_server "$t" "$tag"; then
         progress "$tag mix=${M[0]} protocol=${P[0]}"
-        # Covers CPU, lock (including fallback), and off-CPU capture windows.
-        loadtest "$t" "$out/logs/$tag.json" "$out/logs/$tag.log" 210 "$c" "$(mixarg "${M[0]}")" "$(protoarg "${P[0]}")" &
-        load_pid=$!
-        # First progress line is after schema setup and seeding.
-        if wait_line "$out/logs/$tag.log" 'completed=' 60; then
-          bench_profile "$gg_pid" "$out/profiles" "$t-c$c" > "$out/logs/$tag.capture.txt" 2>&1 || progress "$tag capture failed (nonfatal)"
-        else progress "$tag load not ready; skipping captures"
+        if load_timeout=$(cap 240 "$tdl"); then
+          LOAD_TIMEOUT=$load_timeout loadtest "$t" "$out/logs/$tag.json" "$out/logs/$tag.log" "$PROFILE_LOAD_SECONDS" "$c" "$(mixarg "${M[0]}")" "$(protoarg "${P[0]}")" &
+          load_pid=$!
+          # First progress line is after schema setup and seeding.
+          if wait_line "$out/logs/$tag.log" 'completed=' 60; then
+            bench_profile "$gg_pid" "$out/profiles" "$t-c$c" "$tdl" "$profile_callgraph" "$out/progress" > "$out/logs/$tag.capture.txt" 2>&1 || progress "$tag capture failed (nonfatal)"
+          else progress "$tag load not ready; skipping captures"
+          fi
+          wait "$load_pid" || progress "$tag diagnostic load failed (nonfatal)"
+        else progress "skipped $tag load: per-target budget spent"
         fi
-        wait "$load_pid" || progress "$tag diagnostic load failed (nonfatal)"
       else progress "$tag server start failed (nonfatal)"
       fi
       stop_server
+      bench_profile_post "$out/profiles" "$t-c$c" "$tdl" "$out/progress" >> "$out/logs/$tag.capture.txt" 2>&1 || progress "$tag post-process failed (nonfatal)"
     done; done
     if compgen -G "$out/profiles/ran-*" >/dev/null; then profile_ran=1; fi
   fi
 fi
-python3 - "$out/meta.json" "$PROFILE" "$profile_ran" "$perf_version" <<'PYMETA'
+python3 - "$out/meta.json" "$PROFILE" "$profile_ran" "$perf_version" "$profile_callgraph" "$profile_build_seconds" <<'PYMETA'
 import json, sys
-path, requested, ran, version = sys.argv[1:]
+path, requested, ran, version, callgraph, build_seconds = sys.argv[1:]
 meta = json.load(open(path))
-meta.update(profile_requested=requested == "1", profiling_ran=ran == "1", perf_version=version or None)
+meta.update(profile_requested=requested == "1", profiling_ran=ran == "1", perf_version=version or None,
+            profile_callgraph=callgraph, profile_build_seconds=int(build_seconds))
 json.dump(meta, open(path, "w"), indent=1)
 PYMETA
 
