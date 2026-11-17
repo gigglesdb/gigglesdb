@@ -160,6 +160,10 @@ fn home(s: &Split, op: HomeOp) -> HomeReply {
 /// T (homed on B) prepares writes on both sides of the split key on B; then B splits at
 /// Rows table 11 into B (left) and R (right), and both halves open with a shared client.
 fn prepared_then_split() -> Split {
+    prepared_then_split_with_gap(false)
+}
+
+fn prepared_then_split_with_gap(gap: bool) -> Split {
     let f = fixture();
     let e = f.open();
     let HomeReply::Opened { incarnation } = e.home(epoch(&e), HomeOp::Open { txn: T }).unwrap()
@@ -175,6 +179,25 @@ fn prepared_then_split() -> Split {
     let mut generation = None;
     for key in [row(LEFT_T, 1), row(RIGHT_T, 2)] {
         generation = Some(lock(&e, T, key, Some(0)).unwrap().generation);
+    }
+    if gap {
+        generation = Some(
+            e.lock(LockRequest {
+                range: B,
+                epoch: epoch(&e),
+                txn: T,
+                priority: Timestamp(0),
+                target: LockTarget::Interval {
+                    space: RangeSpace::Rows,
+                    start: Bound::Included(row(LEFT_T, 0)),
+                    end: Bound::Included(row(RIGHT_T, 9)),
+                },
+                mode: RangeLockMode::Shared,
+                timeout_ms: Some(0),
+            })
+            .unwrap()
+            .generation,
+        );
     }
     let writes = [(LEFT_T, 1), (RIGHT_T, 2)]
         .map(|(table, n)| RangeWrite {
@@ -394,4 +417,19 @@ fn an_unreachable_child_fails_the_parent_finalize_until_it_returns() {
     s.cluster.down.lock().unwrap().clear();
     s.cluster.finalize(B, T, Outcome::Commit(c)).unwrap();
     committed_then_forgotten(&s, c);
+}
+
+#[test]
+fn prepared_gap_protects_the_reopened_child_after_split() {
+    let s = prepared_then_split_with_gap(true);
+    // These keys have no point locks: only the split prepared gap protects them.
+    for (engine, key) in [(&s.left, row(LEFT_T, 3)), (&s.right, row(RIGHT_T, 3))] {
+        assert_eq!(
+            lock(engine, txn(2), key.clone(), Some(0)).map(drop),
+            Err(RangeError::LockTimeout)
+        );
+    }
+    decide(&s, Outcome::Abort);
+    s.cluster.finalize(B, T, Outcome::Abort).unwrap();
+    lock(&s.right, txn(2), row(RIGHT_T, 3), Some(0)).unwrap();
 }

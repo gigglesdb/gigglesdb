@@ -59,7 +59,7 @@ fn lock_position(key: &LockKey) -> Option<Vec<u8>> {
         LockKey::Row { table, pk } if !pk.is_empty() => at(RangeSpace::Rows, *table, pk),
         LockKey::Unique { index, tuple } => at(RangeSpace::Index, *index, tuple),
         LockKey::Row { .. } | LockKey::Table(_) => None,
-        // TODO(GD-0075 P8-SPLIT): a gap lock straddling the split key must be cut in two.
+        // Intervals have no single position; split_off cuts them at the split key.
         LockKey::Interval { .. } => None,
     }
 }
@@ -138,9 +138,59 @@ impl Prepared {
         let (moved, kept): (Writes, Writes) = std::mem::take(&mut self.writes)
             .into_iter()
             .partition(|((ks, key), _)| moves(space_of(*ks).map(|space| range_key(space, key))));
-        let (moved_locks, kept_locks): (Vec<_>, Vec<_>) = std::mem::take(&mut self.locks)
-            .into_iter()
-            .partition(|(key, _)| moves(lock_position(key)));
+        let mut moved_locks = Vec::new();
+        let mut kept_locks = Vec::new();
+        for (key, mode) in std::mem::take(&mut self.locks) {
+            let LockKey::Interval { space, start, end } = &key else {
+                if moves(lock_position(&key)) {
+                    moved_locks.push((key, mode));
+                } else {
+                    kept_locks.push((key, mode));
+                }
+                continue;
+            };
+            let range_space = match space {
+                LockSpace::Row => RangeSpace::Rows,
+                LockSpace::Unique => RangeSpace::Index,
+            };
+            // Unbounded endpoints stop at the keyspace edges, not the range edges.
+            if range_key(range_space, &[]).as_slice() >= at_key {
+                moved_locks.push((key, mode));
+                continue;
+            }
+            if range_space.tag() < at_key[0] {
+                kept_locks.push((key, mode));
+                continue;
+            }
+            let at_user = &at_key[1..];
+            if matches!(start, Bound::Included(s) | Bound::Excluded(s) if s.as_slice() >= at_user) {
+                moved_locks.push((key, mode));
+            } else if match end {
+                Bound::Included(e) => e.as_slice() < at_user,
+                Bound::Excluded(e) => e.as_slice() <= at_user,
+                Bound::Unbounded => false,
+            } {
+                kept_locks.push((key, mode));
+            } else {
+                // The cut belongs to the right child; neither half is empty.
+                kept_locks.push((
+                    LockKey::Interval {
+                        space: *space,
+                        start: start.clone(),
+                        end: Bound::Excluded(at_user.to_vec()),
+                    },
+                    mode,
+                ));
+                moved_locks.push((
+                    LockKey::Interval {
+                        space: *space,
+                        start: Bound::Included(at_user.to_vec()),
+                        end: end.clone(),
+                    },
+                    mode,
+                ));
+            }
+        }
         self.writes = kept;
         self.locks = kept_locks;
         if moved.is_empty() && moved_locks.is_empty() {
@@ -322,5 +372,150 @@ impl Prepared {
             locks,
             children,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use Bound::{Excluded, Included, Unbounded};
+
+    fn record(locks: Vec<(LockKey, LockMode)>) -> Prepared {
+        Prepared {
+            home: RangeId(2),
+            at: Ts(10),
+            writes: BTreeMap::new(),
+            locks,
+            children: Vec::new(),
+        }
+    }
+
+    fn user(n: u64) -> Vec<u8> {
+        n.to_be_bytes().to_vec()
+    }
+
+    #[test]
+    fn gap_locks_split_at_bounds_and_keyspace_edges() {
+        // Each case specifies the original bounds and the expected (left, right) bounds.
+        let cases = [
+            (Included(user(1)), Included(user(4)), true, false),
+            (Included(user(6)), Included(user(9)), false, true),
+            (Included(user(1)), Included(user(9)), true, true),
+            (Included(user(1)), Unbounded, true, true),
+            (Included(user(5)), Included(user(9)), false, true),
+            (Excluded(user(5)), Included(user(9)), false, true),
+            (Included(user(1)), Excluded(user(5)), true, false),
+            (Included(user(1)), Included(user(5)), true, true),
+            (Unbounded, Included(user(9)), true, true),
+            (Unbounded, Unbounded, true, true),
+            (Included(user(5)), Included(user(5)), false, true),
+        ];
+        for (space, range_space) in [
+            (LockSpace::Row, RangeSpace::Rows),
+            (LockSpace::Unique, RangeSpace::Index),
+        ] {
+            let gap = |start, end| (LockKey::Interval { space, start, end }, LockMode::Shared);
+            for (start, end, left, right) in &cases {
+                let original = gap(start.clone(), end.clone());
+                let mut parent = record(vec![original.clone()]);
+                let child = parent.split_off(&range_key(range_space, &user(5)), RangeId(3));
+                let expected_left = if *left {
+                    vec![if *right {
+                        gap(start.clone(), Excluded(user(5)))
+                    } else {
+                        original.clone()
+                    }]
+                } else {
+                    vec![]
+                };
+                let expected_right = if *right {
+                    vec![if *left {
+                        gap(Included(user(5)), end.clone())
+                    } else {
+                        original.clone()
+                    }]
+                } else {
+                    vec![]
+                };
+                assert_eq!(parent.locks, expected_left, "{space:?} {start:?} {end:?}");
+                assert_eq!(child.is_some(), *right);
+                assert_eq!(
+                    parent.children,
+                    if *right { vec![RangeId(3)] } else { vec![] }
+                );
+                if let Some(child) = child {
+                    assert_eq!(child.locks, expected_right);
+                    assert_eq!((child.home, child.at), (parent.home, parent.at));
+                    assert!(child.children.is_empty());
+                    assert_eq!(Prepared::decode(&child.encode().unwrap()).unwrap(), child);
+                }
+                assert_eq!(Prepared::decode(&parent.encode().unwrap()).unwrap(), parent);
+            }
+            // Even unbounded gaps stay within their own keyspace.
+            for (split_space, moves) in [
+                (RangeSpace::Catalog, true),
+                (RangeSpace::Rows, space == LockSpace::Unique),
+                (RangeSpace::Index, false),
+            ] {
+                if split_space == range_space {
+                    continue;
+                }
+                let original = gap(Unbounded, Unbounded);
+                let mut parent = record(vec![original.clone()]);
+                let child = parent.split_off(&range_key(split_space, &user(5)), RangeId(3));
+                assert_eq!(child.is_some(), moves);
+                if moves {
+                    assert!(parent.locks.is_empty());
+                    assert_eq!(child.unwrap().locks, vec![original]);
+                } else {
+                    assert_eq!(parent.locks, vec![original]);
+                }
+            }
+            let original = gap(Unbounded, Unbounded);
+            let mut parent = record(vec![original.clone()]);
+            let child = parent
+                .split_off(&range_key(range_space, &[]), RangeId(3))
+                .unwrap();
+            assert!(parent.locks.is_empty());
+            assert_eq!(child.locks, vec![original]);
+        }
+    }
+
+    #[test]
+    fn writes_point_locks_and_sentinels_keep_their_split_routing() {
+        let row = |table, pk| (LockKey::Row { table, pk }, LockMode::Exclusive);
+        let kept = vec![
+            row(4, vec![1]),
+            row(6, vec![]),
+            (LockKey::Table(6), LockMode::AccessShare),
+        ];
+        let moved = vec![
+            row(5, vec![1]),
+            (
+                LockKey::Unique {
+                    index: 1,
+                    tuple: vec![1],
+                },
+                LockMode::Exclusive,
+            ),
+        ];
+        let mut parent = record([kept.clone(), moved.clone()].concat());
+        parent
+            .writes
+            .insert((Keyspace::Rows, user(4)), Some(vec![4]));
+        parent.writes.insert((Keyspace::Rows, user(5)), None);
+        let child = parent
+            .split_off(&range_key(RangeSpace::Rows, &user(5)), RangeId(3))
+            .unwrap();
+        assert_eq!(parent.locks, kept);
+        assert_eq!(child.locks, moved);
+        assert_eq!(
+            parent.writes,
+            BTreeMap::from([((Keyspace::Rows, user(4)), Some(vec![4]))])
+        );
+        assert_eq!(
+            child.writes,
+            BTreeMap::from([((Keyspace::Rows, user(5)), None)])
+        );
     }
 }
