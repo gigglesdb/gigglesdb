@@ -172,3 +172,6 @@ mod split_scan;
 
 #[path = "registry.rs"]
 mod registry;
+
+#[path = "registry_join.rs"]
+mod registry_join;

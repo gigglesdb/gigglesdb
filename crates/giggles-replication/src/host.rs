@@ -338,6 +338,13 @@ impl RangeHost {
         groups.keys().copied().collect()
     }
 
+    /// Adds newly discovered node identities to the optional node-wide liveness tracker.
+    pub fn add_liveness_peers(&self, peers: &[u64]) {
+        if let Some(liveness) = &self.inner.liveness {
+            liveness.add_peers(peers.iter().copied());
+        }
+    }
+
     /// Shuts every group down and joins its replica thread. Idempotent.
     pub fn stop(&self) {
         self.inner.stop();

@@ -13,10 +13,11 @@ use crate::{
     error::{Error, Result},
     host::{RangeHost, RangeHostConfig},
     liveness::LivenessConfig,
+    registry::{self, NodeRecord, NodeState},
     sink::SnapshotPolicy,
     transport::{
-        self, Body, CallLimits, GroupRouter, Header, NodeService, Transport, TransportConfig,
-        TransportNetwork,
+        self, Body, CallLimits, GroupRouter, Header, NodeService, PeerConfig, Transport,
+        TransportConfig, TransportNetwork,
     },
 };
 use giggles_core::{
@@ -25,17 +26,17 @@ use giggles_core::{
     range_api::{
         ClusterTxnId, Epoch, GatewayPeer, HomeOp, HomeReply, LeaseKind, LockGrant, LockRequest,
         Outcome, RangeClient, RangeDescriptor, RangeError, RangeId, RangeService, RangeSpace,
-        RangeWrite, ReadDirection, ReadPage, ReadRequest, SYSTEM_RANGE, SequenceOp,
-        SequenceReply, SystemService, Timestamp, TsOracle,
+        RangeWrite, ReadDirection, ReadPage, ReadRequest, SYSTEM_RANGE, SequenceOp, SequenceReply,
+        SystemService, Timestamp, TsOracle,
     },
     replicated::RangeStore,
 };
 use std::{
-    collections::HashMap,
-    ops::{Bound, Range},
+    collections::{BTreeMap, HashMap},
     io::Write,
+    ops::{Bound, Range},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, Mutex, OnceLock, Weak, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -324,6 +325,7 @@ pub struct ClusterNode {
     engines: Arc<NodeEngines>,
     host: Arc<RangeHost>,
     transport: Arc<Transport>,
+    static_peers: BTreeMap<u64, PeerConfig>,
     client: Arc<RoutedRangeClient>,
     /// The counted leaders the transport serves peer calls from.
     ranges: Arc<dyn LocalRanges>,
@@ -331,6 +333,28 @@ pub struct ClusterNode {
     /// The system range's descriptor as this node last learned it: the layout's at start,
     /// then the one a StaleEpoch refusal from the system range carried (review S6).
     system: Mutex<RangeDescriptor>,
+}
+
+/// Registry polling thread. Dropping it stops polling and joins an in-flight pass.
+pub struct RegistryWatcher {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl RegistryWatcher {
+    /// Stops and joins the watcher. Safe to call repeatedly.
+    pub fn stop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for RegistryWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Sibling of the store directory, written (and synced) once every hosted range of the layout
@@ -450,10 +474,96 @@ impl ClusterNode {
             engines,
             host,
             transport,
+            static_peers: config.transport.peers,
             client,
             ranges,
             status,
         })
+    }
+
+    /// Enrols the configured members after directory bootstrap; existing records are idempotent.
+    /// The timeout bounds retries between registry operations (an in-flight operation may finish later).
+    pub fn enrol_members(&self, timeout: Duration) -> Result<usize> {
+        let deadline = Instant::now() + timeout;
+        let mut written = 0;
+        for (&id, peer) in &self.static_peers {
+            let record = NodeRecord {
+                id,
+                state: NodeState::Active,
+                address: peer.address.clone(),
+                fingerprint: peer.fingerprint.clone(),
+            };
+            loop {
+                match registry::enrol(&*self.client, self.node_id, record.clone()) {
+                    Ok(new) => {
+                        written += usize::from(new);
+                        break;
+                    }
+                    Err(Error::Core(_)) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    /// Watches registry identities without changing the static bootstrap configuration.
+    /// Stop or drop the watcher before stopping the node.
+    pub fn start_registry_watcher(&self, interval: Duration) -> RegistryWatcher {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let (node, client, transport, host) = (
+            self.node_id,
+            self.client.clone(),
+            self.transport.clone(),
+            self.host.clone(),
+        );
+        let static_peers = self.static_peers.clone();
+        let thread = thread::spawn(move || {
+            let mut applied = static_peers.clone();
+            while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(interval) {
+                let result = (|| -> Result<()> {
+                    let records = registry::read_all(&*client).map_err(core)?;
+                    let (active, retired) = registry::peers(&records, node);
+                    let mut table = static_peers.clone();
+                    for (id, (address, fingerprint)) in active {
+                        table.insert(
+                            id,
+                            PeerConfig {
+                                address,
+                                fingerprint,
+                            },
+                        );
+                    }
+                    table.retain(|id, _| *id == node || !retired.contains(id));
+                    let same = table.len() == applied.len()
+                        && table.iter().all(|(id, peer)| {
+                            applied.get(id).is_some_and(|old| {
+                                old.address == peer.address && old.fingerprint == peer.fingerprint
+                            })
+                        });
+                    if !same {
+                        transport.set_peers(table.clone())?;
+                        let added: Vec<_> = table
+                            .keys()
+                            .copied()
+                            .filter(|id| *id != node && !applied.contains_key(id))
+                            .collect();
+                        host.add_liveness_peers(&added);
+                        applied = table;
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    eprintln!("node {node}: registry watch: {e}");
+                }
+            }
+        });
+        RegistryWatcher {
+            stop: Some(stop),
+            thread: Some(thread),
+        }
     }
 
     /// Every range this node replicates: role, term, leader, applied index, size and the calls
