@@ -28,18 +28,18 @@ impl Clock for SystemClock {
             .min(u64::MAX as u128) as u64
     }
 }
-#[cfg(test)]
+/// A wall clock that reads a set instant (tests and the hidden
+/// `Admin::set_task_wall_clock`).
 pub(crate) struct ManualClock(std::sync::atomic::AtomicU64);
-#[cfg(test)]
 impl ManualClock {
     pub(crate) fn new(ms: u64) -> Self {
         Self(std::sync::atomic::AtomicU64::new(ms))
     }
+    #[cfg(test)]
     pub(crate) fn set(&self, ms: u64) {
         self.0.store(ms, std::sync::atomic::Ordering::SeqCst);
     }
 }
-#[cfg(test)]
 impl Clock for ManualClock {
     fn now_ms(&self) -> u64 {
         self.0.load(std::sync::atomic::Ordering::SeqCst)

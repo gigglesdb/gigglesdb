@@ -24,7 +24,7 @@ use giggles_core::{Admin, Engine, Limits};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const TASK: &str = "inc-436";
 const DAY_MS: i64 = 86_400_000;
@@ -84,8 +84,12 @@ fn queued(admin: &Admin) -> i64 {
     count(admin, "status = 'queued'")
 }
 
-/// The worked example's `CREATE TASK`, as `incident_controller` would send it.
-fn create_task_sql(expires: &str) -> String {
+/// The worked example's limits.
+const LIMITS: &str = "statement_ms = 2000, rows_scanned = 100000, concurrent_statements = 2";
+
+/// The worked example's `CREATE TASK`, as `incident_controller` would send it,
+/// with `limits` in its WITH clause.
+fn create_task_sql(expires: &str, limits: &str) -> String {
     format!(
         "CREATE TASK \"{TASK}\" \
            EXECUTOR repair_agent APPROVER oncall_lead \
@@ -100,7 +104,7 @@ fn create_task_sql(expires: &str) -> String {
              AT MOST 25 DISTINCT ROWS AND 25 TRANSITIONS \
              APPROVE ABOVE 5 \
            DISCLOSE AT MOST 1000 ROWS READ, 2097152 BYTES RETURNED \
-           WITH (statement_ms = 2000, rows_scanned = 100000, concurrent_statements = 2) \
+           WITH ({limits}) \
            EXPIRES '{expires}'"
     )
 }
@@ -108,6 +112,11 @@ fn create_task_sql(expires: &str) -> String {
 /// A fresh v2 database: the table, the roles of the worked example and the
 /// task, created from its SQL text by `incident_controller`.
 fn setup(expires_ms: i64) -> (Dir, Admin) {
+    setup_with(expires_ms, LIMITS)
+}
+
+/// [`setup`] with other task limits.
+fn setup_with(expires_ms: i64, limits: &str) -> (Dir, Admin) {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let dir = Dir(std::env::temp_dir().join(format!(
         "task-protected-commit-{}-{}-{}",
@@ -147,7 +156,7 @@ fn setup(expires_ms: i64) -> (Dir, Admin) {
             .unwrap();
     }
     let issuer = roles.get("incident_controller").unwrap().unwrap();
-    let Some(TaskStatement::Create(new)) = parse(&create_task_sql(&timestamptz(expires_ms)))
+    let Some(TaskStatement::Create(new)) = parse(&create_task_sql(&timestamptz(expires_ms), limits))
     else {
         panic!("CREATE TASK did not parse");
     };
@@ -280,7 +289,15 @@ fn worked_example_direct_writes() {
 #[test]
 fn ten_sessions_last_slot() {
     const SESSIONS: i64 = 10;
-    let (_dir, admin) = setup(now_ms() + DAY_MS);
+    // The ten commits queue on the task's hold; under a loaded machine ten
+    // synced commits can take longer than the default 1 s lock wait, so the
+    // wait (and the statement limit) is generous: the test is about who
+    // wins, not about how fast.
+    let (_dir, admin) = setup_with(
+        now_ms() + DAY_MS,
+        "statement_ms = 120000, rows_scanned = 100000, concurrent_statements = 2, \
+         lock_wait_ms = 120000",
+    );
     let ctx = context(&admin);
     // Step 14 setup: 24 of 25 distinct rows used, each change within the
     // approval threshold of 5.
@@ -363,15 +380,17 @@ fn restart_keeps_counters_and_receipt() {
 
 #[test]
 fn expiry_blocks_write_allows_lookup() {
-    // The task expires a few seconds from now by the server's wall clock.
-    let expires = now_ms() + 3_000;
+    // The database's wall clock is pinned, then moved past the task's expiry
+    // (no real waiting, so a loaded machine cannot expire it early).
+    let start = now_ms();
+    let expires = start + DAY_MS;
     let (_dir, admin) = setup(expires);
+    admin.set_task_wall_clock(Some(start as u64)).unwrap();
     let ctx = context(&admin);
     let a2 = commit(&admin, &ctx, "a2", &requeue(1, 5)).unwrap();
     assert_eq!(queued(&admin), 5);
-    while now_ms() <= expires + 50 {
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // At its expiry instant the task is expired.
+    admin.set_task_wall_clock(Some(expires as u64)).unwrap();
     // Step 19: the outcome of `a2` is still the same receipt.
     same(&committed(lookup(&admin, &ctx, "a2")), &a2);
     // A new write is refused as expired; nothing changes and the ID is free.

@@ -25,8 +25,12 @@ use sha2::{Digest, Sha256};
 pub(crate) const DIGEST_DOMAIN: &[u8; 10] = b"GDTASKCHG\x01";
 /// Change-record header `kind` of an ordinary change (02 is an undo).
 pub(crate) const KIND_CHANGE: u8 = 1;
-/// Receipt `decision` of a committed operation (the only decision that writes a receipt).
+/// Receipt `decision` of a committed direct write or apply.
 pub(crate) const DECISION_COMMITTED: u8 = 1;
+/// Receipt `decision` of a committed complete undo (D8).
+pub(crate) const DECISION_UNDO_COMPLETE: u8 = 2;
+/// Receipt `decision` of a committed partial undo (D8).
+pub(crate) const DECISION_UNDO_PARTIAL: u8 = 3;
 
 /// `sha256(salt ‖ payload)`.
 pub(crate) fn row_hash(salt: &[u8; 16], payload: &[u8]) -> [u8; 32] {
@@ -217,6 +221,29 @@ impl Receipt {
 
     pub fn approver(&self) -> Option<&str> {
         self.record().and_then(|r| r.approver.as_deref())
+    }
+
+    /// The stored preview this operation applied or undid (full view).
+    pub fn preview(&self) -> Option<u64> {
+        self.record().map(|r| r.preview).filter(|&p| p != 0)
+    }
+
+    /// The task's distinct-row and transition counts after this operation
+    /// (full view).
+    pub fn counters_after(&self) -> Option<(u64, u64)> {
+        self.record().map(|r| (r.distinct_after, r.transitions_after))
+    }
+
+    /// An undo's mode (1 complete, 2 partial) and its restored, conflict and
+    /// superseded counts (full view; zeros for a non-undo receipt).
+    pub fn undo_counts(&self) -> Option<(u8, u32, u32, u32)> {
+        self.record()
+            .map(|r| (r.undo_mode, r.restored, r.conflicts, r.superseded))
+    }
+
+    /// The change record's kind (1 change, 2 undo) and row count, when loaded.
+    pub fn change_summary(&self) -> Option<(u8, u32)> {
+        self.change().map(|c| (c.header.kind, c.header.row_count))
     }
 }
 

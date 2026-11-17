@@ -321,8 +321,8 @@ impl V2Db {
         clock.now_ms()
     }
 
-    /// Test hook: replace the wall clock.
-    #[cfg(all(test, feature = "engine-rocksdb"))]
+    /// Test hook: replace the wall clock (also behind the hidden
+    /// `Admin::set_task_wall_clock`).
     pub(crate) fn set_wall_clock(&self, clock: Arc<dyn engine::commit::Clock>) {
         match self.wall_clock.write() {
             Ok(mut slot) => *slot = clock,

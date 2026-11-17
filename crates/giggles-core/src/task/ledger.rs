@@ -2,7 +2,9 @@
 //! lookup and staging (GD-0061 design section 6, D-G).
 //!
 //! - Identity: `02 ‖ task u64 ‖ len u16 ‖ op bytes`. Native `once` keeps its
-//!   own `01 ‖ tenant ‖ ns ‖ key` identity, so the two never collide.
+//!   own `01 ‖ tenant ‖ ns ‖ key` identity, so the two never collide. An
+//!   undo's identity is `03 ‖ task u64 ‖ preview u64` (D8), which no
+//!   client-chosen ID can produce.
 //! - Fingerprint: `sha256("GDTASKREQ\x01" ‖ task u64 ‖ kind u8 ‖ body)`, with
 //!   kind 1 Direct (`text B32 ‖ param_count u16 ‖ each param B32`), kind 2
 //!   Apply (`preview u64 ‖ digest [32]`) and kind 3 Undo
@@ -21,6 +23,8 @@ use sha2::{Digest, Sha256};
 
 /// Identity tag of a task operation (native `once` uses `01`).
 pub(crate) const TASK_IDENTITY_TAG: u8 = 2;
+/// Identity tag of an undo commit (D8).
+pub(crate) const UNDO_IDENTITY_TAG: u8 = 3;
 /// Domain prefix of the request fingerprint.
 pub(crate) const FINGERPRINT_DOMAIN: &[u8; 10] = b"GDTASKREQ\x01";
 
@@ -138,6 +142,21 @@ pub(crate) fn task_identity(task: TaskObjectId, op: &OperationId) -> Vec<u8> {
     identity.extend_from_slice(bytes);
     debug_assert!(identity.len() <= MAX_IDENTITY);
     identity
+}
+
+/// `03 ‖ task u64 ‖ preview u64` (17 bytes): the identity of the undo
+/// commit of stored undo preview `preview` (D8).
+pub(crate) fn undo_identity(task: TaskObjectId, preview: u64) -> Vec<u8> {
+    let mut identity = Vec::with_capacity(17);
+    identity.push(UNDO_IDENTITY_TAG);
+    identity.extend_from_slice(&task.0.to_be_bytes());
+    identity.extend_from_slice(&preview.to_be_bytes());
+    identity
+}
+
+/// The `22` key of an undo commit in this database's domain.
+pub(crate) fn undo_outcome_key(db: &V2Db, task: TaskObjectId, preview: u64) -> Vec<u8> {
+    outcome_key(db.meta.domain, &undo_identity(task, preview))
 }
 
 /// The `22` key of a task operation in this database's domain.

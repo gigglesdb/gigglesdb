@@ -28,7 +28,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Barrier;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Visible rows are `merchant_id = 42`: ids 1, 3 and 5.
 const ROWS: &[&str] = &[
@@ -389,13 +389,17 @@ fn revocation_between_pages_stops_second_page() {
 
 #[test]
 fn expiry_between_pages() {
-    // Expires on the next whole second at least two seconds ahead.
-    let expires_ms = (now_ms() / 1000 + 3) * 1000;
+    // Expires on a whole second a day ahead; the database's wall clock is
+    // pinned now and moved past the expiry between the pages (no real
+    // waiting, so a loaded machine cannot expire it early).
+    let start = now_ms();
+    let expires_ms = (start / 1000 + 86_400) * 1000;
     let f = Fixture::expiring(
         "task-release-expiry",
         caps(1000, 1000, 1 << 20),
         utc_text(expires_ms),
     );
+    f.admin().set_task_wall_clock(Some(start as u64)).unwrap();
     let mut s = f.agent();
     let p = s.prepare(ALL).unwrap();
     let mut cursor = s.open_cursor(&p, &[]).unwrap();
@@ -403,9 +407,7 @@ fn expiry_between_pages() {
     assert_eq!(s.release_page(first).unwrap().into_inner().len(), 1);
     let second = cursor.fetch_unreleased(1, 1 << 20).unwrap();
     let before = f.disclosure();
-    while now_ms() <= expires_ms + 50 {
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    f.admin().set_task_wall_clock(Some(expires_ms as u64)).unwrap();
     assert_eq!(s.release_page(second).map(|_| ()), Err(task(TaskError::Expired)));
     assert_eq!(s.still_valid(), Err(task(TaskError::Expired)));
     assert_eq!(f.disclosure(), before);

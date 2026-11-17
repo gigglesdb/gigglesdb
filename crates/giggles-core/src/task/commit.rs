@@ -39,8 +39,16 @@
 //! [`super::preview::apply_stage`] (D7.6 steps 1-3, 5 and 6; step 4 is
 //! `decide::evaluate` here). An Apply that consumes its preview takes it out
 //! of the head's `stored_previews` count and names the approval's role in the
-//! receipt. `Undo` (and `Actor::Undo`) stays `Unsupported` until R3-803,
-//! whose arm needs the undo-specific checks, identity and change record.
+//! receipt.
+//!
+//! R3-803 adds the undo path (D8): `Actor::Undo` with `ProtectedRequest::Undo`
+//! (any other pairing is `Unsupported`). It skips task expiry and
+//! revocation, the column rules, the allowed write, the caps and the
+//! threshold, and keeps the hold, the `seq` allocation, read validation and
+//! the effects cross-check. Its ledger identity is `03 | task | preview`;
+//! the role's undo and table privileges are checked before the outcome
+//! lookup, so a replay never shows a receipt to a role that may not undo.
+//! Nothing on this path is a recorded denial.
 //!
 //! R3-619 adds the crash seams (D-I). The commit reuses `CrashPoint`'s
 //! `BeforeCommit` (after step 13), `AfterCommit`, `BeforeAck`,
@@ -57,12 +65,14 @@ use super::effects::Effects;
 use super::error::{Budget, DenyRule, TaskError};
 use super::ledger::{self, OperationId, Outcome, RequestBody};
 use super::preview::PreviewId;
-use super::receipt::{self, ChangeRecord, Receipt, DECISION_COMMITTED};
+use super::receipt::{
+    self, ChangeRecord, Receipt, DECISION_COMMITTED, DECISION_UNDO_COMPLETE, DECISION_UNDO_PARTIAL,
+};
 use super::records::{
     change_header_key, change_row_key, receipt_key, ChangeHeader, ChangeRow, MutationHead,
     OutcomePayload, OutcomeRecord, ReceiptRecord, TaskObjectId, MAX_STATEMENT_TEXT,
 };
-use super::undo::UndoMode;
+use super::undo::{self, UndoMode, UndoStaged};
 use crate::relational::clock::ExecutionClock;
 use crate::relational::{Prepared, SqlError, Value};
 use crate::storage::engine::txn::{Savepoint, TxnError};
@@ -313,6 +323,7 @@ fn replay(
     task: TaskObjectId,
     key: &[u8],
     fp: &[u8; 32],
+    view: View,
 ) -> Result<Option<Receipt>, TaskError> {
     let Some(record) = ledger::lookup(db, key)? else {
         return Ok(None);
@@ -320,7 +331,7 @@ fn replay(
     if &record.request_fp != fp {
         return Err(TaskError::OperationConflict);
     }
-    match stored_outcome(db, task, &record, View::Minimal)? {
+    match stored_outcome(db, task, &record, view)? {
         Outcome::Committed(receipt) => Ok(Some(receipt)),
         Outcome::Denied(rule) => Err(TaskError::Denied(rule)),
         Outcome::BudgetExceeded(budget) => Err(TaskError::BudgetExceeded(budget)),
@@ -531,9 +542,21 @@ pub(crate) fn commit_sourced(
     }
     let (crash, point) = session.fault_points()?;
     let faults = Faults { crash, point };
-    let ctx = match actor {
-        Actor::Executor(ctx) => ctx,
-        Actor::Undo { .. } => return Err(unsupported()),
+    let ctx = match (actor, &request) {
+        (Actor::Executor(ctx), _) => ctx,
+        (Actor::Undo { role, task }, ProtectedRequest::Undo { preview, digest, mode }) => {
+            let undo = UndoCall {
+                db,
+                role,
+                task,
+                preview: *preview,
+                digest: *digest,
+                mode: *mode,
+                faults,
+            };
+            return commit_undo(session, undo, load_def);
+        }
+        (Actor::Undo { .. }, _) => return Err(unsupported()),
     };
     let task = ctx.task;
     // 1. Fingerprint.
@@ -543,13 +566,13 @@ pub(crate) fn commit_sourced(
             preview: preview.0,
             digest: *digest,
         },
-        // R3-803: identity kind 03 and the undo-specific checks.
+        // The executor never undoes (D8).
         ProtectedRequest::Undo { .. } => return Err(unsupported()),
     };
     let fp = ledger::request_fingerprint(task, &body);
     let key = ledger::task_outcome_key(&db, task, op);
     // 2. Outcome lookup (never writes).
-    if let Some(receipt) = replay(&db, task, &key, &fp)? {
+    if let Some(receipt) = replay(&db, task, &key, &fp, View::Minimal)? {
         return Ok(receipt);
     }
     faults.at(ProtectedPoint::AfterLookup);
@@ -602,7 +625,7 @@ fn attempt(
         .map_err(hold_error)?;
     faults.at(ProtectedPoint::AfterHold);
     // 6. A same-ID racer or a revoke may have committed while we waited.
-    if let Some(receipt) = replay(db, task, key, &fp)? {
+    if let Some(receipt) = replay(db, task, key, &fp, View::Minimal)? {
         return Ok(receipt);
     }
     let latest = load_def(db, task, DefAt::Latest)?;
@@ -822,12 +845,24 @@ fn outcome_record(
     decided_ms: u64,
     payload: OutcomePayload,
 ) -> OutcomeRecord {
+    identity_outcome(ledger::task_identity(call.ctx.task, call.op), call.fp, def, decided_ms, payload)
+}
+
+/// The ledger record of `identity`, kept until the outcome retention after
+/// the later of the decision and the task's expiry.
+fn identity_outcome(
+    identity: Vec<u8>,
+    fp: [u8; 32],
+    def: &TaskDef,
+    decided_ms: u64,
+    payload: OutcomePayload,
+) -> OutcomeRecord {
     let expires = u64::try_from(def.expires_at.0).unwrap_or(0);
     OutcomeRecord {
         flags: 0,
-        identity: ledger::task_identity(call.ctx.task, call.op),
-        request_fp: call.fp,
-        accepted_fp: call.fp,
+        identity,
+        request_fp: fp,
+        accepted_fp: fp,
         decided_lower_ms: decided_ms,
         decided_upper_ms: decided_ms,
         retain_until_ms: decided_ms.max(expires).saturating_add(OUTCOME_RETENTION_MS),
@@ -877,6 +912,188 @@ fn deny(
     call.db.catalog().commit_ddl(txn).map_err(txn_error)?;
     call.faults.after_commit()?;
     Err(error)
+}
+
+/// What every attempt of one undo call shares.
+struct UndoCall<'c> {
+    db: Arc<V2Db>,
+    role: &'c RoleName,
+    task: TaskObjectId,
+    preview: PreviewId,
+    digest: [u8; 32],
+    mode: UndoMode,
+    faults: Faults,
+}
+
+/// 42704 undefined_object: the task does not exist.
+fn no_task() -> TaskError {
+    CoreError::Sql(SqlError::UndefinedObject).into()
+}
+
+/// The undo path of [`protected_commit`] (D8). Steps: not in a task
+/// session; the task (42704) and the role's privileges (42501) at the
+/// latest committed state; the outcome lookup under `03 | task | preview`
+/// (same request: the stored full receipt, another: `OperationConflict`);
+/// the pre-check (`ApprovalStale`, `Denied(UndoHasConflicts)`, neither
+/// recorded); then [`attempt_undo`] at most three times.
+fn commit_undo(
+    session: &mut SqlSession,
+    call: UndoCall<'_>,
+    load_def: &mut LoadDef<'_>,
+) -> Result<Receipt, TaskError> {
+    if session.task().is_some() {
+        return Err(TaskError::NotAllowedInTaskSession(columns::StatementClass::Other));
+    }
+    let UndoCall { db, role, task, preview, digest, mode, faults } = &call;
+    let def = load_def(db, *task, DefAt::Latest)?.ok_or_else(no_task)?;
+    undo::may_undo(db, &def, &mut db.begin(Isolation::ReadCommitted), role)?;
+    let fp = undo_fingerprint(&call);
+    let key = ledger::undo_outcome_key(db, *task, preview.0);
+    if let Some(receipt) = replay(db, *task, &key, &fp, View::Full)? {
+        return Ok(receipt);
+    }
+    faults.at(ProtectedPoint::AfterLookup);
+    undo::undo_precheck(db, *task, *preview, digest, *mode)?;
+    let lock_wait = def.limits.lock_wait_ms;
+    let mut retry = 0;
+    loop {
+        match attempt_undo(session, &call, &key, fp, lock_wait, load_def) {
+            Err(error) if retryable(&error) => {
+                retry += 1;
+                if retry >= ATTEMPTS {
+                    return Err(TaskError::Retry);
+                }
+                backoff(retry)?;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// `sha256("GDTASKREQ\x01" ‖ task ‖ 03 ‖ preview ‖ digest ‖ mode)`.
+fn undo_fingerprint(call: &UndoCall<'_>) -> [u8; 32] {
+    let body = RequestBody::Undo {
+        preview: call.preview.0,
+        digest: call.digest,
+        mode: call.mode as u8,
+    };
+    ledger::request_fingerprint(call.task, &body)
+}
+
+/// One undo attempt: the hold, the outcome lookup again, then
+/// [`undo::undo_stage`] (recompute and compare with the restores applied),
+/// and in the one write set the kind-2 change record (its rows the restored
+/// rows with their pre-restore values), the receipt with the undo counts,
+/// the preview applied, the outcome and the head (`next_seq + 1`, the
+/// decision time and one stored preview fewer; membership, the distinct-row
+/// and transition counts and the denials stay as they are).
+fn attempt_undo(
+    session: &mut SqlSession,
+    call: &UndoCall<'_>,
+    key: &[u8],
+    fp: [u8; 32],
+    lock_wait: u64,
+    load_def: &mut LoadDef<'_>,
+) -> Result<Receipt, TaskError> {
+    let UndoCall { db, role, task, preview, digest, mode, faults } = call;
+    let task = *task;
+    let txn = db.begin(Isolation::Serializable);
+    let deadline = Instant::now().checked_add(Duration::from_millis(lock_wait));
+    authority::hold(&txn, task, deadline, &|| crate::cancellation::check().is_err())
+        .map_err(hold_error)?;
+    faults.at(ProtectedPoint::AfterHold);
+    if let Some(receipt) = replay(db, task, key, &fp, View::Full)? {
+        return Ok(receipt);
+    }
+    let def = load_def(db, task, DefAt::Latest)?.ok_or_else(no_task)?;
+    let UndoStaged { run, header: stored } =
+        undo::undo_stage(session, db, &def, role, *preview, digest, *mode, txn)?;
+    faults.at(ProtectedPoint::AfterStatement);
+    let ProtectedRun { mut txn, effects } = run;
+    crate::storage::cross_check_effects(&effects, &txn)?;
+    let head = authority::load_head(&mut txn, task)?;
+    let seq = head.next_seq;
+    let decided_ms = db.wall_now_ms();
+    let mut salt = [0u8; 16];
+    getrandom::fill(&mut salt).map_err(|e| CoreError::Storage(e.to_string()))?;
+    let (mut header, rows, effects_digest) =
+        receipt::build_change(task, seq, def.table, &effects, salt, decided_ms)?;
+    header.kind = undo::KIND_UNDO;
+    header.outcome_key.copy_from_slice(&key[1..]);
+    let put = |txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>| -> Result<(), TaskError> {
+        txn.put(Keyspace::Kernel, key, value).map_err(CoreError::from)?;
+        Ok(())
+    };
+    put(&mut txn, change_header_key(task, seq), header.encode())?;
+    for (row_no, row) in rows.iter().enumerate() {
+        let row_no = u32::try_from(row_no).map_err(|_| CoreError::Limit)?;
+        put(&mut txn, change_row_key(task, seq, row_no), row.encode())?;
+    }
+    let [_, conflicts, superseded, _] = stored.counts;
+    undo::stage_applied(&mut txn, task, *preview, stored, seq)?;
+    let next = MutationHead {
+        next_seq: seq.checked_add(1).ok_or(CoreError::Limit)?,
+        last_decided_ms: decided_ms,
+        stored_previews: head.stored_previews.saturating_sub(1),
+        ..head
+    };
+    let record = ReceiptRecord {
+        decision: match mode {
+            UndoMode::Complete => DECISION_UNDO_COMPLETE,
+            UndoMode::Partial => DECISION_UNDO_PARTIAL,
+        },
+        request_kind: ledger::KIND_UNDO,
+        flags: 0,
+        task,
+        seq,
+        def_version: def.def_version,
+        catalog_version: txn.current_snapshot_ts().map_or(0, |ts| ts.0),
+        decided_ms,
+        request_fp: fp,
+        effects_digest,
+        rows_affected: header.row_count,
+        distinct_charged: 0,
+        transitions_charged: 0,
+        noop_rows: 0,
+        distinct_after: head.distinct_rows,
+        transitions_after: head.transitions,
+        preview: preview.0,
+        undo_mode: *mode as u8,
+        restored: header.row_count,
+        conflicts,
+        superseded,
+        op_id: undo::undo_operation_id(*preview).as_bytes().to_vec(),
+        issuer: def.issuer.clone(),
+        executor: def.executor.clone(),
+        approver: Some(role.to_string()),
+    };
+    put(&mut txn, receipt_key(task, seq), record.encode())?;
+    let identity = ledger::undo_identity(task, preview.0);
+    let payload = OutcomePayload::Committed { task, seq };
+    let outcome = identity_outcome(identity, fp, &def, decided_ms, payload);
+    ledger::stage(&mut txn, key.to_vec(), &outcome)?;
+    authority::stage_head(&mut txn, task, &next)?;
+    faults.before_commit()?;
+    db.catalog()
+        .commit_ddl(txn)
+        .map_err(|e| engine(e.into()))?;
+    faults.after_commit()?;
+    Ok(Receipt::from_record(&record, Some(ChangeRecord { header, rows })))
+}
+
+impl crate::storage::Admin {
+    /// For tests: pins the database's wall clock (task expiry, receipt and
+    /// preview times, retention) at `ms` Unix milliseconds; `None` returns
+    /// to the system clock (v2 only).
+    #[doc(hidden)]
+    pub fn set_task_wall_clock(&self, ms: Option<u64>) -> Result<(), CoreError> {
+        let db = self.sql_session().v2_db().ok_or(CoreError::Unsupported)?;
+        match ms {
+            Some(ms) => db.set_wall_clock(Arc::new(crate::storage::engine::commit::ManualClock::new(ms))),
+            None => db.set_wall_clock(Arc::new(crate::storage::engine::commit::SystemClock)),
+        }
+        Ok(())
+    }
 }
 
 #[cfg(all(test, feature = "engine-rocksdb"))]

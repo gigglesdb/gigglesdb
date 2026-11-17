@@ -56,7 +56,9 @@ pub use commit::{inspect_outcome, outcome, protected_commit, Actor, ProtectedReq
 pub use commit::ProtectedPoint;
 pub use ledger::{OperationId, Outcome};
 pub use preview::{preview, PreviewId, PreviewSummary, Surface};
-pub use undo::{undo_preview, ConflictReason, UndoMode, UndoScope, UndoSummary};
+pub use undo::{
+    undo_approve, undo_operation_id, undo_preview, ConflictReason, UndoMode, UndoScope, UndoSummary,
+};
 pub use receipt::Receipt;
 pub use readlog::{fingerprint_and_cap, show_reads, ReadRecord, Reconciliation};
 pub use release::{Page, ReleaseTag, Released, Unreleased};

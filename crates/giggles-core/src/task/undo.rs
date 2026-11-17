@@ -9,19 +9,28 @@
 //! ascending `(table, pk)`; earlier restores stay in place, so a restore that
 //! would succeed only after a later one is a conflict), rolls everything
 //! back and stores a kind-02 preview through the change preview's T2.
+//!
+//! R3-803 adds the commit: [`undo_approve`] runs `ProtectedRequest::Undo`
+//! through `protected_commit` as `Actor::Undo`, whose undo path calls
+//! [`undo_precheck`] (no write), then, under the hold, [`undo_stage`]
+//! (recompute and compare) and stages a kind-2 change record, a receipt
+//! with the undo counts and the outcome under identity `03 | task |
+//! preview`. Membership and the caps are never touched.
 use super::admit::StatementClass;
-use super::commit::{engine, role_error, unsupported};
+use super::commit::{engine, protected_commit, role_error, unsupported, Actor, ProtectedRequest};
 use super::definition::{RoleName, TableId, TaskDef, TaskName, TaskPrivileges};
 use super::effects::Effects;
 use super::error::{DenyRule, TaskError};
 use super::ledger::{self, OperationId};
 use super::preview::{
-    encode_after, schema_fp, store_preview, PreviewClass, PreviewId, PreviewKind, Recheck,
-    MAX_PREVIEW_ROWS, NO_CLOCK_PIN, STATE_OPEN,
+    encode_after, schema_fp, store_preview, stored_rows, PreviewClass, PreviewId, PreviewKind,
+    Recheck, MAX_PREVIEW_ROWS, NO_CLOCK_PIN, STATE_APPLIED, STATE_OPEN,
 };
+use super::receipt::Receipt;
 use super::records::{
-    task_prefix, ChangeHeader, ChangeRow, OutcomePayload, PreviewHeader, PreviewRow,
-    PreviewScope, TaskObjectId, NS_CHANGE_HEADER, NS_CHANGE_ROW, ROW_BEFORE_BLANKED,
+    preview_key, preview_row_key, task_prefix, ChangeHeader, ChangeRow, OutcomePayload,
+    PreviewHeader, PreviewRow, PreviewScope, TaskObjectId, NS_CHANGE_HEADER, NS_CHANGE_ROW,
+    NS_OUTCOME, ROW_BEFORE_BLANKED,
 };
 use crate::relational::{SqlError, TableDef, Value};
 use crate::storage::engine::{codec, kv::Direction};
@@ -211,7 +220,10 @@ pub(crate) fn classify(
 /// (0A000), the task exists (42704), `role` holds the undo privilege on it
 /// and SELECT and UPDATE on its table (superuser, owner or grant; 42501).
 /// Operation scope resolves the ID through the `22` ledger and needs a
-/// committed outcome of this task (42704 otherwise). Neither revocation nor
+/// committed outcome of this task (42704 otherwise): an executor's ID
+/// first, then, for an ID of the form `undo:<id>`, the undo commit of
+/// stored undo preview `<id>` (identity kind 03), which is how an undo is
+/// itself undone. Neither revocation nor
 /// expiry stops an undo.
 ///
 /// The plan runs in a Serializable transaction that is always rolled back.
@@ -244,8 +256,16 @@ pub fn undo_preview(
     let (scope_seq, scope) = match &scope {
         UndoScope::Task => (None, PreviewScope { kind: 0, outcome: [0; 32] }),
         UndoScope::Operation(op) => {
-            let key = ledger::task_outcome_key(&db, def.id, op);
-            let seq = match ledger::lookup(&db, &key)?.map(|record| record.payload) {
+            // An executor's operation first; then an undo, named `undo:<id>`.
+            let mut key = ledger::task_outcome_key(&db, def.id, op);
+            let mut record = ledger::lookup(&db, &key)?;
+            if record.is_none()
+                && let Some(id) = parse_undo_operation(op)
+            {
+                key = ledger::undo_outcome_key(&db, def.id, id.0);
+                record = ledger::lookup(&db, &key)?;
+            }
+            let seq = match record.map(|record| record.payload) {
                 Some(OutcomePayload::Committed { task, seq }) if task == def.id => seq,
                 _ => return Err(CoreError::Sql(SqlError::UndefinedObject).into()),
             };
@@ -297,6 +317,193 @@ pub fn undo_preview(
     })
 }
 
+/// APPROVE UNDO `id` OF TASK `task` DIGEST `digest` MODE `mode` as `role`
+/// (D8): the undo commit, through [`protected_commit`] with
+/// [`Actor::Undo`] (ruling R3; no `TaskContext` is synthesized).
+///
+/// Not in a task session (0A000); the task must exist (42704). The rest is
+/// [`protected_commit`]'s undo path: the role's privileges (42501), the
+/// replay of a committed undo of this preview (same request: the same
+/// receipt; another mode or digest: `OperationConflict`), the pre-check
+/// (a missing, applied, expired or changed preview is `ApprovalStale`;
+/// `Complete` with conflicts is `Denied(UndoHasConflicts)`, not recorded),
+/// then, under the hold, [`undo_stage`] and the kind-2 change record and
+/// receipt. Task expiry and revocation never stop an undo. Returns the full
+/// receipt with its change record.
+pub fn undo_approve(
+    session: &mut SqlSession,
+    role: &RoleName,
+    task: &TaskName,
+    id: PreviewId,
+    digest: [u8; 32],
+    mode: UndoMode,
+) -> Result<Receipt, TaskError> {
+    if session.task().is_some() {
+        return Err(TaskError::NotAllowedInTaskSession(StatementClass::Other));
+    }
+    let db = session.v2_db().ok_or_else(unsupported)?;
+    if db.task_kernel_unsupported() {
+        return Err(unsupported());
+    }
+    let def = session
+        .tasks()
+        .lookup(task.as_str())?
+        .ok_or(CoreError::Sql(SqlError::UndefinedObject))?;
+    let request = ProtectedRequest::Undo { preview: id, digest, mode };
+    protected_commit(
+        session,
+        Actor::Undo { role, task: def.id },
+        &undo_operation_id(id),
+        request,
+    )
+}
+
+/// The operation ID an undo commit's receipt carries: `undo:<preview id>`.
+/// Its ledger identity is `03 | task | preview`, never this text.
+pub fn undo_operation_id(id: PreviewId) -> OperationId {
+    OperationId::new(format!("undo:{}", id.0)).expect("undo operation id length")
+}
+
+/// The preview id of an `undo:<id>` operation ID.
+fn parse_undo_operation(op: &OperationId) -> Option<PreviewId> {
+    let digits = std::str::from_utf8(op.as_bytes()).ok()?.strip_prefix("undo:")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) || digits.starts_with('0') {
+        return None;
+    }
+    digits.parse().ok().map(PreviewId)
+}
+
+/// The stored undo preview `id` of `task` at `txn`'s snapshot, if it can
+/// still be approved: an undo, open, unexpired, with `digest`.
+fn open_undo_header(
+    db: &V2Db,
+    txn: &mut Transaction,
+    task: TaskObjectId,
+    id: PreviewId,
+    digest: &[u8; 32],
+) -> Result<Option<PreviewHeader>, CoreError> {
+    let Some(value) = txn.get(Keyspace::Kernel, &preview_key(task, id.0))? else {
+        return Ok(None);
+    };
+    let header = PreviewHeader::decode(&value)?;
+    let open = header.kind == PreviewKind::Undo as u8
+        && header.state == STATE_OPEN
+        && header.expires_ms > db.wall_now_ms()
+        && &header.digest == digest;
+    Ok(open.then_some(header))
+}
+
+/// D8 commit step 1, the pre-check, at the latest committed state with no
+/// write and no hold: the preview must still be approvable
+/// (`ApprovalStale`), and `Complete` refuses a preview with conflicts
+/// (`Denied(UndoHasConflicts)`, not recorded, so `Partial` stays possible
+/// on the same preview).
+pub(crate) fn undo_precheck(
+    db: &V2Db,
+    task: TaskObjectId,
+    id: PreviewId,
+    digest: &[u8; 32],
+    mode: UndoMode,
+) -> Result<(), TaskError> {
+    let mut txn = db.begin(Isolation::ReadCommitted);
+    let header = open_undo_header(db, &mut txn, task, id, digest)?.ok_or(TaskError::ApprovalStale)?;
+    if mode == UndoMode::Complete && header.counts[1] > 0 {
+        return Err(TaskError::Denied(DenyRule::UndoHasConflicts));
+    }
+    Ok(())
+}
+
+/// What [`undo_stage`] hands the commit.
+pub(crate) struct UndoStaged {
+    /// The held transaction with the restores applied, and their effects.
+    pub(crate) run: ProtectedRun,
+    /// The stored header the recompute matched.
+    pub(crate) header: PreviewHeader,
+}
+
+/// D8 commit step 2, under the hold (`txn` holds it and has no snapshot
+/// yet): the role's privileges and the preview again at the snapshot, then
+/// `plan` recomputed with its restores left applied, compared with the
+/// stored preview: the schema fingerprint, the four counts and every row by
+/// `(class, table, pk, version_read, aux, after)`. Any difference is
+/// `ApprovalStale`. The definition version is not compared: a revoke bumps
+/// it, and revocation does not stop an undo.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn undo_stage(
+    session: &mut SqlSession,
+    db: &Arc<V2Db>,
+    def: &TaskDef,
+    role: &RoleName,
+    id: PreviewId,
+    digest: &[u8; 32],
+    mode: UndoMode,
+    mut txn: Transaction,
+) -> Result<UndoStaged, TaskError> {
+    may_undo(db, def, &mut txn, role)?;
+    let task = def.id;
+    let header = open_undo_header(db, &mut txn, task, id, digest)?.ok_or(TaskError::ApprovalStale)?;
+    if header.table != def.table {
+        return Err(TaskError::ApprovalStale);
+    }
+    if mode == UndoMode::Complete && header.counts[1] > 0 {
+        return Err(TaskError::Denied(DenyRule::UndoHasConflicts));
+    }
+    let mut stored = Vec::with_capacity(stored_rows(&header) as usize);
+    for row_no in 0..stored_rows(&header) {
+        let key = preview_row_key(task, id.0, row_no);
+        let Some(value) = txn.get(Keyspace::Kernel, &key).map_err(CoreError::from)? else {
+            return Err(TaskError::ApprovalStale);
+        };
+        stored.push(PreviewRow::decode(&value)?);
+    }
+    // The operation an operation-scope preview was made for, by its outcome.
+    let scope_seq = match &header.scope {
+        Some(scope) if scope.kind == 1 => {
+            let mut key = Vec::with_capacity(33);
+            key.push(NS_OUTCOME);
+            key.extend_from_slice(&scope.outcome);
+            match ledger::lookup(db, &key)?.map(|record| record.payload) {
+                Some(OutcomePayload::Committed { task: stored, seq }) if stored == task => Some(seq),
+                _ => return Err(TaskError::ApprovalStale),
+            }
+        }
+        _ => None,
+    };
+    let (dry, run) = match plan_in(session, db, def, scope_seq, txn) {
+        Ok(planned) => planned,
+        Err(TaskError::Denied(DenyRule::DefinitionChanged | DenyRule::PreviewTooLarge)) => {
+            return Err(TaskError::ApprovalStale);
+        }
+        Err(error) => return Err(error),
+    };
+    if dry.schema_fp != header.schema_fp
+        || dry.counts != header.counts
+        || dry.rows != stored
+        || run.effects.len() != dry.counts[0] as usize
+    {
+        return Err(TaskError::ApprovalStale);
+    }
+    Ok(UndoStaged { run, header })
+}
+
+/// D8 commit step 3's preview part: the header applied at `seq` and its
+/// `28` rows deleted, in the commit's write set.
+pub(crate) fn stage_applied(
+    txn: &mut Transaction,
+    task: TaskObjectId,
+    id: PreviewId,
+    mut header: PreviewHeader,
+    seq: u64,
+) -> Result<(), CoreError> {
+    for row_no in 0..stored_rows(&header) {
+        txn.delete(Keyspace::Kernel, preview_row_key(task, id.0, row_no))?;
+    }
+    header.state = STATE_APPLIED;
+    header.applied_seq = seq;
+    txn.put(Keyspace::Kernel, preview_key(task, id.0), header.encode())?;
+    Ok(())
+}
+
 /// 42501 insufficient_privilege.
 fn no_privilege() -> TaskError {
     CoreError::Policy(crate::Error::Scope).into()
@@ -304,7 +511,7 @@ fn no_privilege() -> TaskError {
 
 /// The undo privilege on the task (never the executor), then SELECT and
 /// UPDATE on its table as SQL allows them: a superuser, the owner or grants.
-fn may_undo(
+pub(crate) fn may_undo(
     db: &V2Db,
     def: &TaskDef,
     txn: &mut Transaction,
@@ -410,6 +617,26 @@ fn dry_run(
 ) -> Result<UndoDryRun, TaskError> {
     let mut txn = db.begin(Isolation::Serializable);
     let mark = txn.savepoint();
+    let (dry, run) = plan_in(session, db, def, scope_seq, txn)?;
+    // Discard the restores; dropping the transaction releases the locks.
+    let ProtectedRun { mut txn, .. } = run;
+    txn.rollback_to(&mark).map_err(CoreError::from)?;
+    drop(txn);
+    Ok(dry)
+}
+
+/// `plan` in `txn` (no snapshot taken yet): reads the history and the
+/// current rows, runs every candidate restore through the protected seam
+/// (a constraint failure is rolled back to its savepoint and becomes a
+/// conflict) and returns the stored-row form of the plan with the run, its
+/// successful restores still applied.
+fn plan_in(
+    session: &mut SqlSession,
+    db: &Arc<V2Db>,
+    def: &TaskDef,
+    scope_seq: Option<u64>,
+    mut txn: Transaction,
+) -> Result<(UndoDryRun, ProtectedRun), TaskError> {
     let image = db.catalog().snapshot(&mut txn)?.image().map_err(CoreError::Sql)?;
     let tables: BTreeMap<TableId, TableDef> =
         image.tables.values().map(|table| (table.id, table.clone())).collect();
@@ -517,17 +744,13 @@ fn dry_run(
         });
     }
     crate::storage::cross_check_effects(&run.effects, &run.txn)?;
-    // Discard the restores; dropping the transaction releases the locks.
-    let ProtectedRun { mut txn, .. } = run;
-    txn.rollback_to(&mark).map_err(CoreError::from)?;
-    drop(txn);
     if rows.len() > MAX_PREVIEW_ROWS {
         return Err(TaskError::Denied(DenyRule::PreviewTooLarge));
     }
     rows.sort_by(|a, b| (a.class, a.table, &a.pk, a.aux).cmp(&(b.class, b.table, &b.pk, b.aux)));
     let conflicts = rows.iter().filter(|r| r.class == PreviewClass::Conflict as u8).count();
     let overflow = || TaskError::from(CoreError::Limit);
-    Ok(UndoDryRun {
+    let dry = UndoDryRun {
         schema_fp,
         counts: [
             restorable,
@@ -536,7 +759,8 @@ fn dry_run(
             plan.settled,
         ],
         rows,
-    })
+    };
+    Ok((dry, run))
 }
 
 fn conflict_row(table: TableId, pk: &[u8], version_read: u64, reason: ConflictReason) -> PreviewRow {
@@ -713,5 +937,154 @@ mod tests {
         let plan = run(&[w(1, KIND_CHANGE, 1, 5, 6, Some(100))], None, &[(1, 6, 100)]);
         assert_eq!(plan.settled, 1);
         assert!(plan.candidates.is_empty() && plan.conflicts.is_empty());
+    }
+
+    // ------------------------------------------------ R3-803 byte formats
+
+    use super::super::ledger::{undo_identity, KIND_UNDO as REQUEST_UNDO, UNDO_IDENTITY_TAG};
+    use super::super::receipt::{DECISION_UNDO_COMPLETE, DECISION_UNDO_PARTIAL};
+    use super::super::records::{outcome_key, OutcomeRecord, ReceiptRecord};
+
+    #[test]
+    fn undo_identity_golden() {
+        let identity = undo_identity(TaskObjectId(0x0102_0304_0506_0708), 0x1122_3344_5566_7788);
+        assert_eq!(UNDO_IDENTITY_TAG, 3);
+        assert_eq!(
+            identity,
+            [
+                0x03, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x22, 0x33, 0x44, 0x55,
+                0x66, 0x77, 0x88
+            ]
+        );
+        // The `22` key is sha256(domain16 || identity) behind the namespace byte.
+        let key = outcome_key([0xAB; 16], &identity);
+        let mut pre = vec![0xAB; 16];
+        pre.extend_from_slice(&identity);
+        let mut expect = vec![0x22];
+        expect.extend_from_slice(&<sha2::Sha256 as sha2::Digest>::digest(&pre));
+        assert_eq!(key, expect);
+        // No `02` task identity has the same bytes: its tag differs.
+        let op = OperationId::new(identity[1..].to_vec()).unwrap();
+        let task = super::super::ledger::task_identity(TaskObjectId(0x0102_0304_0506_0708), &op);
+        assert_eq!(task[0], 2);
+        assert_ne!(outcome_key([0xAB; 16], &task), key);
+    }
+
+    #[test]
+    fn undo_operation_id_round_trip() {
+        assert_eq!(undo_operation_id(PreviewId(7)).as_bytes(), b"undo:7");
+        assert_eq!(parse_undo_operation(&undo_operation_id(PreviewId(u64::MAX))), Some(PreviewId(u64::MAX)));
+        for text in ["undo:", "undo:07", "undo:1x", "Undo:1", "undo:18446744073709551616", "op-1"] {
+            assert_eq!(parse_undo_operation(&OperationId::new(text).unwrap()), None, "{text}");
+        }
+    }
+
+    fn undo_receipt() -> ReceiptRecord {
+        ReceiptRecord {
+            decision: DECISION_UNDO_PARTIAL,
+            request_kind: REQUEST_UNDO,
+            flags: 0,
+            task: TaskObjectId(5),
+            seq: 9,
+            def_version: 2,
+            catalog_version: 0x77,
+            decided_ms: 1_000,
+            request_fp: [0x11; 32],
+            effects_digest: [0x22; 32],
+            rows_affected: 2,
+            distinct_charged: 0,
+            transitions_charged: 0,
+            noop_rows: 0,
+            distinct_after: 5,
+            transitions_after: 6,
+            preview: 4,
+            undo_mode: UndoMode::Partial as u8,
+            restored: 2,
+            conflicts: 1,
+            superseded: 3,
+            op_id: b"undo:4".to_vec(),
+            issuer: "ic".into(),
+            executor: "ra".into(),
+            approver: Some("ic".into()),
+        }
+    }
+
+    /// The `23` receipt of an undo, byte for byte (design-0 R4 additions:
+    /// `undo_mode u8, restored u32, conflicts u32, superseded u32` after
+    /// `preview u64`).
+    #[test]
+    fn undo_receipt_golden() {
+        let mut expect = vec![0x01, 0x03, 0x03, 0x00];
+        for v in [5u64, 9, 2, 0x77, 1_000] {
+            expect.extend_from_slice(&v.to_be_bytes());
+        }
+        expect.extend_from_slice(&[0x11; 32]);
+        expect.extend_from_slice(&[0x22; 32]);
+        for v in [2u32, 0, 0, 0] {
+            expect.extend_from_slice(&v.to_be_bytes());
+        }
+        for v in [5u64, 6, 4] {
+            expect.extend_from_slice(&v.to_be_bytes());
+        }
+        expect.push(0x02);
+        for v in [2u32, 1, 3] {
+            expect.extend_from_slice(&v.to_be_bytes());
+        }
+        expect.extend_from_slice(b"\x06undo:4\x02ic\x02ra\x02ic");
+        let record = undo_receipt();
+        assert_eq!(record.encode(), expect);
+        assert_eq!(ReceiptRecord::decode(&expect).unwrap(), record);
+        let complete = ReceiptRecord {
+            decision: DECISION_UNDO_COMPLETE,
+            undo_mode: UndoMode::Complete as u8,
+            ..undo_receipt()
+        };
+        assert_eq!(ReceiptRecord::decode(&complete.encode()).unwrap(), complete);
+        assert_eq!((DECISION_UNDO_COMPLETE, DECISION_UNDO_PARTIAL), (2, 3));
+    }
+
+    /// The `24` header of an undo: `kind` 02.
+    #[test]
+    fn undo_change_header_golden() {
+        let header = ChangeHeader {
+            flags: 0,
+            kind: KIND_UNDO,
+            outcome_key: [0x33; 32],
+            table: 7,
+            row_count: 2,
+            salt: [0x44; 16],
+            effects_digest: [0x55; 32],
+            decided_ms: 1_000,
+        };
+        let mut expect = vec![0x01, 0x00, 0x02];
+        expect.extend_from_slice(&[0x33; 32]);
+        expect.extend_from_slice(&7u64.to_be_bytes());
+        expect.extend_from_slice(&2u32.to_be_bytes());
+        expect.extend_from_slice(&[0x44; 16]);
+        expect.extend_from_slice(&[0x55; 32]);
+        expect.extend_from_slice(&1_000u64.to_be_bytes());
+        assert_eq!(header.encode(), expect);
+        assert_eq!(expect.len(), 103);
+        assert_eq!(ChangeHeader::decode(&expect).unwrap(), header);
+    }
+
+    /// The `22` outcome of an undo: kind 2 (committed) under the 17-byte
+    /// identity.
+    #[test]
+    fn undo_outcome_round_trip() {
+        let record = OutcomeRecord {
+            flags: 0,
+            identity: undo_identity(TaskObjectId(5), 4),
+            request_fp: [0x11; 32],
+            accepted_fp: [0x11; 32],
+            decided_lower_ms: 1_000,
+            decided_upper_ms: 1_000,
+            retain_until_ms: 2_000,
+            payload: OutcomePayload::Committed { task: TaskObjectId(5), seq: 9 },
+        };
+        let bytes = record.encode();
+        assert_eq!(&bytes[..5], &[0x01, 0x02, 0x00, 0x00, 0x11]);
+        assert_eq!(&bytes[5..22], undo_identity(TaskObjectId(5), 4).as_slice());
+        assert_eq!(OutcomeRecord::decode(&bytes).unwrap(), record);
     }
 }
