@@ -559,6 +559,22 @@ impl SqlSession {
                             txn.lock_sql_sentinel(table.id,
                                 if shared { LockMode::Shared } else { LockMode::Exclusive },
                                 &|| crate::cancellation::check().is_err())?;
+                            // Cluster FK hydration must follow the parent's Exclusive lock,
+                            // including when the transaction keeps a fixed snapshot.
+                            if fixed_snapshot
+                                && matches!(txn.services(), engine::txn::TxnServices::Cluster(_))
+                                && let Some(keys) = bound.fk_delete_lock_keys(&binding, params)
+                            {
+                                let physical = keys.iter().map(|key| {
+                                    let mut physical = table.id.to_be_bytes().to_vec();
+                                    physical.extend(codec::pk_bytes(key)?);
+                                    Ok(physical)
+                                }).collect::<Result<BTreeSet<_>, CoreError>>()?;
+                                for key in physical {
+                                    txn.lock_for_write(Keyspace::Rows, &key, None,
+                                        &|| crate::cancellation::check().is_err())?;
+                                }
+                            }
                             if let Some(keys) = candidates {
                                 let physical = keys.iter().map(|key| {
                                     let mut physical = table.id.to_be_bytes().to_vec();
@@ -1120,10 +1136,13 @@ impl SqlRows<'_> {
     /// (REPEATABLE READ, SERIALIZABLE), as PostgreSQL's RI queries for
     /// referencing rows do: a referencing row committed since the snapshot is a
     /// witness (23503/23001), and an action that writes it fails with 40001 in
-    /// lock_for_write. READ COMMITTED's statement snapshot is already latest.
+    /// lock_for_write. Cluster FK reads refresh even at READ COMMITTED, since
+    /// their row-lock wait can follow the statement snapshot.
     fn at_latest<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T, CoreError>)
         -> Result<T, CoreError> {
-        if self.statement_snapshot_is_latest() {
+        if self.statement_snapshot_is_latest()
+            && !matches!(self.txn.services(), engine::txn::TxnServices::Cluster(_))
+        {
             return read(self);
         }
         self.txn.begin_latest();
@@ -1167,6 +1186,55 @@ impl RowSink for SqlRows<'_> {
         &mut self, table: &TableDef, columns: &[u64], values: Option<&[relational::Value]>,
         parent: bool, visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
+        if matches!(self.txn.services(), engine::txn::TxnServices::Cluster(_)) {
+            let ts = self.txn.snapshot_ts();
+            if !parent {
+                return self.at_latest(|rows| rows.lookup_all(table, columns, values, false, visit));
+            }
+            if let Some(values) = values {
+                let primary = table.primary_key.iter().map(|i| table.columns[*i].id)
+                    .eq(columns.iter().copied());
+                let lock = if primary {
+                    let mut key = table.id.to_be_bytes().to_vec();
+                    key.extend(codec::pk_bytes(values)?);
+                    Some((Keyspace::Rows, key))
+                } else if let Some(index) = self.parts.indexes.iter()
+                    .find(|d| d.table == table.id && d.unique && d.columns == columns)
+                {
+                    let mut key = index.id.to_be_bytes().to_vec();
+                    key.extend(codec::index_tuple_bytes(values,
+                        &vec![codec::Direction::Asc; values.len()])?);
+                    Some((Keyspace::Index, key))
+                } else {
+                    // TODO(GD-0075): lock FK parents without an exact primary/unique key.
+                    None
+                };
+                if let Some((ks, key)) = lock {
+                    self.txn.lock_key_share(ks, &key, None,
+                        &|| crate::cancellation::check().is_err())?;
+                }
+            }
+            let fixed = !self.statement_snapshot_is_latest();
+            let mut seen = Vec::new();
+            if fixed {
+                // Keep the snapshot witness too: a parent deleted during the lock
+                // wait must produce 40001 even though the latest lookup is empty.
+                self.lookup_all(table, columns, values, true, &mut |row| {
+                    seen.push(row.values);
+                    Ok(())
+                })?;
+            }
+            self.at_latest(|rows| rows.lookup_all(table, columns, values, true, &mut |row| {
+                if fixed { seen.push(row.values.clone()); }
+                visit(row)
+            }))?;
+            for values in seen {
+                if self.fk_changed(table, &values, ts)? {
+                    return Err(CoreError::Sql(SqlError::Conflict));
+                }
+            }
+            return Ok(());
+        }
         if self.statement_snapshot_is_latest() {
             return self.lookup_all(table, columns, values, parent, visit);
         }

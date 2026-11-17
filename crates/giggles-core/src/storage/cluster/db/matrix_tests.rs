@@ -552,14 +552,10 @@ matrix! {
     delete_recreate_rc: DELETE_RECREATE, 0;
     delete_recreate_rr: DELETE_RECREATE, 1;
     delete_recreate_ser: DELETE_RECREATE, 2;
-    #[ignore = "GD-0075 R5-74 finding: concurrent parent DELETE and child INSERT both commit (orphan child)"]
     parent_delete_then_child_insert_rc: PARENT_DELETE_THEN_CHILD_INSERT, 0;
-    #[ignore = "GD-0075 R5-74 finding: concurrent parent DELETE and child INSERT both commit (orphan child)"]
     parent_delete_then_child_insert_rr: PARENT_DELETE_THEN_CHILD_INSERT, 1;
     parent_delete_then_child_insert_ser: PARENT_DELETE_THEN_CHILD_INSERT, 2;
-    #[ignore = "GD-0075 R5-74 finding: concurrent parent DELETE and child INSERT both commit (orphan child)"]
     child_insert_then_parent_delete_rc: CHILD_INSERT_THEN_PARENT_DELETE, 0;
-    #[ignore = "GD-0075 R5-74 finding: concurrent parent DELETE and child INSERT both commit (orphan child)"]
     child_insert_then_parent_delete_rr: CHILD_INSERT_THEN_PARENT_DELETE, 1;
     child_insert_then_parent_delete_ser: CHILD_INSERT_THEN_PARENT_DELETE, 2;
 }

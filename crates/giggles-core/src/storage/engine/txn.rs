@@ -199,6 +199,15 @@ pub(crate) trait ClusterServices: Send + Sync {
         deadline: Option<Instant>,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Option<LatestVersion>, TxnError>;
+    /// Shared FK witness lock in the key's range, without a writer sentinel.
+    fn lock_key_shared(
+        &self,
+        txn: TxnId,
+        ks: Keyspace,
+        key: &[u8],
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError>;
     /// The per-table writer sentinel (design.md 3.1).
     fn lock_sentinel(
         &self,
@@ -840,6 +849,21 @@ impl Transaction {
         match &self.services {
             TxnServices::Local { locks, .. } => locks.waiting_count(),
             TxnServices::Cluster(cluster) => cluster.gateway_locks().waiting_count(),
+        }
+    }
+    /// Cluster FK witness lock, held until transaction end. Local FK checks use table locks.
+    pub(crate) fn lock_key_share(
+        &mut self,
+        ks: Keyspace,
+        key: &[u8],
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError> {
+        match &self.services {
+            TxnServices::Local { .. } => Ok(()),
+            TxnServices::Cluster(cluster) => {
+                cluster.lock_key_shared(self.id, ks, key, deadline, cancel)
+            }
         }
     }
     /// Selects the snapshot before waiting. Errors keep the transaction open; rollback or drop releases its locks.

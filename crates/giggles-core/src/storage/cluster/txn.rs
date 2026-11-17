@@ -834,6 +834,32 @@ impl ClusterServices for ClusterTxnServices {
         )?;
         Ok(latest.map(|(ts, value)| (Ts(ts.0), value)))
     }
+    fn lock_key_shared(
+        &self,
+        txn: TxnId,
+        ks: Keyspace,
+        key: &[u8],
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError> {
+        let space = match ks {
+            Keyspace::Rows => RangeSpace::Rows,
+            Keyspace::Index => RangeSpace::Index,
+            _ => return Err(TxnError::Misuse),
+        };
+        if key.len() < 8 {
+            return Err(TxnError::Misuse);
+        }
+        self.lock_in_range(
+            txn,
+            &range_key(space, key),
+            LockTarget::Key { space, key: key.to_vec() },
+            RangeLockMode::Shared,
+            deadline,
+            cancel,
+        )?;
+        Ok(())
+    }
     fn lock_sentinel(
         &self,
         txn: TxnId,
