@@ -1,4 +1,5 @@
 //! Committed authority images must become visible on the next pgwire statement.
+#![cfg(feature = "engine-rocksdb")]
 mod api_support;
 use api_support::Fixture as ApiFixture;
 use giggles_core::{Engine, roles::NewRole};
