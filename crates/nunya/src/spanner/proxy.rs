@@ -15,7 +15,7 @@ use crate::{
     },
     error::{NyCode, Refusal},
     ir::{InputRewrite, RewritePlan, StatementKind, ValueSource, check::check},
-    policy::{DomainName, Policy, TokenizeSetting},
+    policy::{DomainName, Policy, TokenizeSetting, Treatment},
     readlog::{LifecycleRecord, LifecycleKind, LifecycleActor, Outcome, ReadLog, ReadLogRecord, statement_fingerprint},
     schema::Snapshot,
     state::authority::{AdmitError, Operation, TokenizeError, TokenizeLimits},
@@ -82,6 +82,19 @@ pub struct AuthInterceptor {
     /// Gateway-only bearer token.
     pub(super) token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
+fn tokenize_type_code(ty: &ColumnType) -> Result<TypeCode, Status> {
+    match ty {
+        ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => Ok(TypeCode::String),
+        ColumnType::Int8 => Ok(TypeCode::Int64),
+        ColumnType::Date => Ok(TypeCode::Date),
+        ColumnType::Timestamptz => Ok(TypeCode::Timestamp),
+        ColumnType::Int2 | ColumnType::Int4 | ColumnType::Uuid | ColumnType::Timestamp
+        | ColumnType::Bool | ColumnType::Numeric | ColumnType::Bytea | ColumnType::Json
+        | ColumnType::Jsonb | ColumnType::Array(_) | ColumnType::Enum(_)
+        | ColumnType::Other(_) => Err(invalid()),
+    }
+}
+
 fn tokenize_refusal(error: TokenizeError) -> NyCode {
     match error {
         TokenizeError::LimitReached => NyCode::TokenizeLimit,
@@ -572,7 +585,9 @@ impl NunyaSpanner {
         value: &Value,
         decode: bool,
     ) -> Result<Value, Status> {
-        let value = values::from_proto(ty, value).map_err(status)?;
+        // Spanner has one STRING wire representation for all textual column types.
+        let wire_ty = if ty.is_textual() { &ColumnType::Text } else { ty };
+        let value = values::from_proto(wire_ty, value).map_err(status)?;
         let keys = &who.keys;
         let range = policy.domains.get(domain).and_then(|d| d.range.as_ref());
         let result = if decode {
@@ -581,7 +596,7 @@ impl NunyaSpanner {
             self.ctx.codec.encode(keys, domain, ty, range, &value)
         }
         .map_err(status)?;
-        values::to_proto(ty, &result).map_err(status)
+        values::to_proto(wire_ty, &result).map_err(status)
     }
     fn sql(
         &self,
@@ -699,6 +714,7 @@ impl NunyaSpanner {
         &self,
         who: &Authenticated,
         policy: &Policy,
+        snapshot: &Snapshot,
         plan: &RewritePlan,
         names: &[String],
         params: &Option<prost_types::Struct>,
@@ -721,7 +737,14 @@ impl NunyaSpanner {
             },
             TokenizeSetting::Off => return Err(denied()),
         };
-        let (ty, value) = match arg {
+        let ty = policy.columns.iter().find_map(|(column, treatment)| match treatment {
+            Treatment::Blind { domain: d } if d == domain => {
+                snapshot.column(column).map(|column| column.ty.clone())
+            }
+            _ => None,
+        }).ok_or_else(invalid)?;
+        let code = tokenize_type_code(&ty)?;
+        let value = match arg {
             ValueSource::Param(index) => {
                 let name = index
                     .checked_sub(1)
@@ -732,25 +755,21 @@ impl NunyaSpanner {
                     .and_then(|p| p.fields.get(name))
                     .ok_or_else(invalid)?
                     .clone();
-                let ty = param_types
-                    .get(name)
-                    .map(values::column_type)
-                    .unwrap_or(ColumnType::Text);
-                (ty, value)
+                if let Some(declared) = param_types.get(name) {
+                    let declared = values::column_type(declared);
+                    if declared != ty && !(declared.is_textual() && ty.is_textual()) {
+                        return Err(invalid());
+                    }
+                }
+                value
             }
-            ValueSource::Literal { text, .. } => (
-                ColumnType::Text,
-                Value {
-                    kind: Some(prost_types::value::Kind::StringValue(text.clone())),
-                },
-            ),
+            ValueSource::Literal { text, .. } => Value {
+                kind: Some(prost_types::value::Kind::StringValue(text.clone())),
+            },
             ValueSource::Column { .. } | ValueSource::Null | ValueSource::Computed(_) => {
                 return Err(invalid());
             }
         };
-        if ty != ColumnType::Int8 && !ty.is_textual() {
-            return Err(invalid());
-        }
         let value = self.convert(who, policy, domain, &ty, &value, false)?;
         self.ctx
             .authority
@@ -765,11 +784,6 @@ impl NunyaSpanner {
                     Err(error) => error,
                 }
             })?;
-        let code = if ty == ColumnType::Int8 {
-            TypeCode::Int64
-        } else {
-            TypeCode::String
-        };
         Ok(Some(ResultSet {
             metadata: Some(ResultSetMetadata {
                 row_type: Some(StructType {
@@ -1095,7 +1109,7 @@ impl SpannerService for NunyaSpanner {
             Self::audit(&self.ctx, &self.watchers, &who, &label, 0, vec![])?;
         }
         if let Some(result) =
-            self.local_tokenize(&who, &policy, &plan, &names, &req.params, &req.param_types)?
+            self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req.params, &req.param_types)?
         {
             Self::audit(&self.ctx, &self.watchers, &who, &label, 1, local_tokens(&result)?)?;
             return Ok(Response::new(result));
@@ -1154,7 +1168,7 @@ impl SpannerService for NunyaSpanner {
             Self::audit(&self.ctx, &self.watchers, &who, &label, 0, vec![])?;
         }
         if let Some(result) =
-            self.local_tokenize(&who, &policy, &plan, &names, &req.params, &req.param_types)?
+            self.local_tokenize(&who, &policy, &snapshot, &plan, &names, &req.params, &req.param_types)?
         {
             Self::audit(&self.ctx, &self.watchers, &who, &label, 1, local_tokens(&result)?)?;
             return Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(
@@ -2496,6 +2510,7 @@ mod tests {
         ))).await;
         let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
         let policy = f.svc.ctx.policy.read().unwrap().clone();
+        let snapshot = f.svc.ctx.snapshot.read().unwrap().clone();
         let plan = RewritePlan {
             outputs: vec![],
             inputs: vec![],
@@ -2509,7 +2524,7 @@ mod tests {
         };
         let tokenize = || {
             f.svc
-                .local_tokenize(&who, &policy, &plan, &[], &None, &HashMap::new())
+                .local_tokenize(&who, &policy, &snapshot, &plan, &[], &None, &HashMap::new())
         };
         for _ in 0..10 {
             assert!(tokenize().unwrap().is_some());
@@ -2538,6 +2553,240 @@ mod tests {
             10
         );
         assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
+    // Keep schema changes local to each test; the shared fixture remains textual.
+    fn tokenize_column_type(f: &Fixture, ty: ColumnType) {
+        *f.svc.ctx.snapshot.write().unwrap() = Arc::new(Snapshot::new(
+            vec![Relation {
+                schema: "".into(),
+                name: "customers".into(),
+                kind: RelationKind::Table,
+                columns: vec![Column {
+                    name: "email".into(), ty, nullable: true,
+                    generated: None, default: None,
+                }],
+                view_definition: None,
+                primary_key: vec!["email".into()],
+            }],
+            vec![], vec!["".into()], 0,
+        ));
+    }
+    fn tokenize_count(f: &Fixture) -> u64 {
+        f.svc.ctx.authority.session_tokenizations(f.alice, &domain()).unwrap()
+    }
+    fn assert_tokenize_error(error: Status, code: NyCode) {
+        assert_eq!(error.code(), nunya_status(code).code());
+        assert!(error.message().contains(code.sqlstate()));
+    }
+    async fn tokenize_rpc(
+        f: &Fixture, req: ExecuteSqlRequest, streaming: bool,
+    ) -> Result<ResultSet, Status> {
+        if streaming {
+            let mut stream = f.svc.execute_streaming_sql(f.request(req, "alice"))
+                .await?.into_inner();
+            let part = stream.next().await.unwrap()?;
+            assert!(!part.chunked_value);
+            assert!(stream.next().await.is_none());
+            Ok(ResultSet {
+                metadata: part.metadata,
+                rows: vec![ListValue { values: part.values }],
+                ..Default::default()
+            })
+        } else {
+            Ok(f.svc.execute_sql(f.request(req, "alice")).await?.into_inner())
+        }
+    }
+    fn assert_no_tokenize_upstream(f: &Fixture) {
+        assert!(f.fake.seen.lock().unwrap().is_empty());
+        assert_eq!(f.fake.streaming.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(f.fake.batches.lock().unwrap().is_empty());
+        assert!(f.fake.commits.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn tokenize_rpcs_match_blind_read() {
+        let f = Fixture::new().await;
+        // Read once for the same session, then clear the query log to detect forwarding.
+        let read = f.query("SELECT email FROM customers").await;
+        let expected = f.svc.execute_sql(f.request(read, "alice")).await.unwrap()
+            .into_inner().rows[0].values[0].clone();
+        f.fake.seen.lock().unwrap().clear();
+        for streaming in [false, true] {
+            for literal in [false, true] {
+                let sql = if literal {
+                    "SELECT nunya_tokenize('email', 'private@example.com')"
+                } else {
+                    "SELECT nunya_tokenize('email', @v)"
+                };
+                let mut req = f.query(sql).await;
+                if !literal {
+                    req.params = Some(prost_types::Struct {
+                        fields: BTreeMap::from([("v".into(), text("private@example.com"))]),
+                    });
+                    req.param_types.insert("v".into(), Type {
+                        code: TypeCode::String as i32, ..Default::default()
+                    });
+                }
+                let result = tokenize_rpc(&f, req, streaming).await.unwrap();
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(result.rows[0].values, vec![expected.clone()]);
+                let fields = &result.metadata.unwrap().row_type.unwrap().fields;
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].name, "nunya_tokenize");
+                assert_eq!(fields[0].r#type.as_ref().unwrap().code, TypeCode::String as i32);
+            }
+        }
+        assert_eq!(tokenize_count(&f), 4);
+        assert_no_tokenize_upstream(&f);
+    }
+    #[tokio::test]
+    async fn tokenize_rpcs_use_snapshot_type() {
+        for (ty, code, input) in [
+            (ColumnType::Int8, TypeCode::Int64, "42"),
+            (ColumnType::Date, TypeCode::Date, "2020-01-01"),
+            (ColumnType::Timestamptz, TypeCode::Timestamp, "2020-01-01T12:34:56Z"),
+            (ColumnType::Varchar(None), TypeCode::String, "private@example.com"),
+            (ColumnType::Bpchar(None), TypeCode::String, "private@example.com"),
+        ] {
+            let f = Fixture::new().await;
+            tokenize_column_type(&f, ty.clone());
+            let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
+            let wire_ty = if ty.is_textual() { &ColumnType::Text } else { &ty };
+            let plain = values::from_proto(wire_ty, &text(input)).unwrap();
+            let encoded = f.svc.ctx.codec.encode(&who.keys, &domain(), &ty, None, &plain).unwrap();
+            let expected = values::to_proto(wire_ty, &encoded).unwrap();
+            for streaming in [false, true] {
+                // Literal, explicitly typed param, and omitted param type all use the column type.
+                for mode in 0..3 {
+                    let sql = if mode == 0 {
+                        format!("SELECT nunya_tokenize('email', '{input}')")
+                    } else {
+                        "SELECT nunya_tokenize('email', @v)".into()
+                    };
+                    let mut req = f.query(&sql).await;
+                    if mode != 0 {
+                        req.params = Some(prost_types::Struct {
+                            fields: BTreeMap::from([("v".into(), text(input))]),
+                        });
+                        if mode == 1 {
+                            req.param_types.insert("v".into(), Type {
+                                code: code as i32, ..Default::default()
+                            });
+                        }
+                    }
+                    let result = tokenize_rpc(&f, req, streaming).await.unwrap();
+                    assert_eq!(result.rows.len(), 1);
+                    assert_eq!(result.rows[0].values, vec![expected.clone()]);
+                    let fields = result.metadata.unwrap().row_type.unwrap().fields;
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].name, "nunya_tokenize");
+                    assert_eq!(fields[0].r#type.as_ref().unwrap().code, code as i32);
+                }
+            }
+            assert_eq!(tokenize_count(&f), 6);
+            assert_no_tokenize_upstream(&f);
+        }
+    }
+    #[tokio::test]
+    async fn tokenize_type_and_conversion_refusals_preserve_quota() {
+        let f = Fixture::new().await;
+        tokenize_column_type(&f, ColumnType::Int8);
+        for streaming in [false, true] {
+            let mut req = f.query("SELECT nunya_tokenize('email', @v)").await;
+            req.params = Some(prost_types::Struct {
+                fields: BTreeMap::from([("v".into(), text("42"))]),
+            });
+            req.param_types.insert("v".into(), Type {
+                code: TypeCode::String as i32, ..Default::default()
+            });
+            assert_tokenize_error(tokenize_rpc(&f, req, streaming).await.unwrap_err(), NyCode::NotAnalysable);
+            let req = f.query("SELECT nunya_tokenize('email', 'abc')").await;
+            assert_tokenize_error(tokenize_rpc(&f, req, streaming).await.unwrap_err(), NyCode::NotAnalysable);
+            assert_eq!(tokenize_count(&f), 0);
+        }
+        // The policy still names a blind column, but the snapshot cannot resolve it.
+        *f.svc.ctx.snapshot.write().unwrap() = Arc::new(Snapshot::new(vec![], vec![], vec!["".into()], 0));
+        for streaming in [false, true] {
+            let req = f.query("SELECT nunya_tokenize('email', '42')").await;
+            assert_tokenize_error(tokenize_rpc(&f, req, streaming).await.unwrap_err(), NyCode::NotAnalysable);
+        }
+        assert_eq!(tokenize_count(&f), 0);
+        assert_no_tokenize_upstream(&f);
+    }
+    #[tokio::test]
+    async fn tokenize_disabled_and_revoked_preserve_quota() {
+        let f = Fixture::new().await;
+        let mut policy = (*f.svc.ctx.policy.read().unwrap().clone()).clone();
+        policy.domains.get_mut(&domain()).unwrap().tokenize = TokenizeSetting::Off;
+        *f.svc.ctx.policy.write().unwrap() = Arc::new(policy);
+        for streaming in [false, true] {
+            let req = f.query("SELECT nunya_tokenize('email', 'private@example.com')").await;
+            assert_tokenize_error(tokenize_rpc(&f, req, streaming).await.unwrap_err(), NyCode::StatementNotAllowed);
+        }
+        assert_eq!(tokenize_count(&f), 0);
+        let req = f.query("SELECT nunya_tokenize('email', 'private@example.com')").await;
+        revoke(&f);
+        for streaming in [false, true] {
+            assert_tokenize_error(tokenize_rpc(&f, req.clone(), streaming).await.unwrap_err(), NyCode::TokenNotValid);
+        }
+        assert_eq!(tokenize_count(&f), 0);
+        assert_no_tokenize_upstream(&f);
+    }
+    type CounterObservation = (ReadLogRecord, u64);
+    struct CounterLog {
+        authority: Arc<Mutex<Option<Arc<crate::state::authority::Authority>>>>,
+        records: Arc<Mutex<Vec<CounterObservation>>>,
+    }
+    impl ReadLog for CounterLog {
+        fn write(&self, record: &ReadLogRecord) -> Result<(), Refusal> {
+            let count = self.authority.lock().unwrap().as_ref().unwrap()
+                .session_tokenizations(record.session, &domain()).unwrap();
+            self.records.lock().unwrap().push((record.clone(), count));
+            Ok(())
+        }
+        fn write_lifecycle(&self, _: &LifecycleRecord) -> Result<(), Refusal> { Ok(()) }
+    }
+    #[tokio::test]
+    async fn tokenize_rpc_limit_audits_after_counter() {
+        let authority = Arc::new(Mutex::new(None));
+        let records = Arc::new(Mutex::new(vec![]));
+        let f = Fixture::with_log(Box::new(CounterLog {
+            authority: authority.clone(), records: records.clone(),
+        })).await;
+        *authority.lock().unwrap() = Some(f.svc.ctx.authority.clone());
+        let req = f.query("SELECT nunya_tokenize('email', 'private@example.com')").await;
+        for i in 1..=10 {
+            tokenize_rpc(&f, req.clone(), i % 2 == 0).await.unwrap();
+            assert_eq!(tokenize_count(&f), i);
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), i as usize);
+            let (record, observed_count) = records.last().unwrap();
+            assert!(matches!(record.outcome, Outcome::Allowed));
+            assert_eq!(record.rows, 1);
+            assert_eq!(record.tokens_released.len(), 1);
+            assert_eq!(*observed_count, i);
+        }
+        assert_tokenize_error(tokenize_rpc(&f, req, true).await.unwrap_err(), NyCode::TokenizeLimit);
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 11);
+        assert_eq!(records.iter().filter(|(r, _)| matches!(r.outcome, Outcome::Allowed)).count(), 10);
+        let (refused, count) = &records[10];
+        assert!(matches!(refused.outcome, Outcome::Refused(NyCode::TokenizeLimit)));
+        assert!(refused.tokens_released.is_empty());
+        assert_eq!(refused.rows, 0);
+        assert_eq!(*count, 10);
+        assert_eq!(tokenize_count(&f), 10);
+        assert_no_tokenize_upstream(&f);
+    }
+    #[test]
+    fn tokenize_result_type_is_explicit() {
+        for ty in [
+            ColumnType::Int2, ColumnType::Int4, ColumnType::Uuid, ColumnType::Timestamp,
+            ColumnType::Bool, ColumnType::Numeric, ColumnType::Bytea, ColumnType::Json,
+            ColumnType::Jsonb, ColumnType::Array(Box::new(ColumnType::Text)),
+            ColumnType::Enum("e".into()), ColumnType::Other("unknown".into()),
+        ] {
+            assert_tokenize_error(tokenize_type_code(&ty).unwrap_err(), NyCode::NotAnalysable);
+        }
     }
     async fn wait_for(mut ready: impl FnMut() -> bool) {
         tokio::time::timeout(Duration::from_secs(2), async {
