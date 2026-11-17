@@ -30,6 +30,9 @@ pub enum TaskStatement {
         after: Option<u64>,
         limit: Option<u64>,
     },
+    /// `SHOW TASK EXPOSURE <task>` (R3-501); executed by
+    /// `task::exposure::show_exposure`.
+    ShowExposure(String),
     Grant {
         grant: bool,
         bits: TaskPrivileges,
@@ -42,7 +45,9 @@ pub fn command_tag(statement: &TaskStatement) -> &'static str {
     match statement {
         TaskStatement::Create(_) => "CREATE TASK",
         TaskStatement::Revoke(_) => "REVOKE TASK",
-        TaskStatement::Show(_) | TaskStatement::ShowReads { .. } => "SHOW",
+        TaskStatement::Show(_)
+        | TaskStatement::ShowReads { .. }
+        | TaskStatement::ShowExposure(_) => "SHOW",
         TaskStatement::Grant { grant: true, .. } => "GRANT",
         TaskStatement::Grant { grant: false, .. } => "REVOKE",
         // An error never completes; report by its head.
@@ -648,6 +653,10 @@ impl Parser<'_> {
             let after = if self.eat_word("after") { Some(self.number()?) } else { None };
             let limit = if self.eat_word("limit") { Some(self.number()?) } else { None };
             return Ok(TaskStatement::ShowReads { task, after, limit });
+        }
+        // Likewise `SHOW TASK exposure` shows a task named exposure.
+        if named && self.eat_word("exposure") {
+            return Ok(TaskStatement::ShowExposure(self.ident()?));
         }
         Ok(TaskStatement::Show(Some(self.ident()?)))
     }

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::context::TaskContext;
+use super::definition::TaskDef;
 use super::error::{DenyRule, TaskError};
 use crate::relational::scan::{Direction, KeyRange, RowSource, SourceRow, SourceRows};
 use crate::relational::{Relational, RowPredicate, SqlError, SqlRow, TableDef, Value};
@@ -220,6 +221,21 @@ fn scope_with<I: std::borrow::Borrow<Relational>>(
             .map_err(|_| TaskError::Denied(DenyRule::DefinitionChanged))
     })?;
     Ok(Scope { predicate })
+}
+
+/// The scope of `def` itself, bound against `image` without the cache and
+/// without a task session: the exposure report's live count (R3-501).
+pub(crate) fn scope_of_def(image: &Relational, def: &TaskDef) -> Result<Scope, CoreError> {
+    let table = image
+        .tables
+        .values()
+        .find(|table| table.id == def.table)
+        .ok_or(TaskError::Denied(DenyRule::OtherTable))?;
+    let predicate = RowPredicate::bind(image, table, &def.visible_rows.0)
+        .map_err(|_| TaskError::Denied(DenyRule::DefinitionChanged))?;
+    Ok(Scope {
+        predicate: Arc::new(predicate),
+    })
 }
 
 /// A `RowSource` that only yields the task's visible rows.

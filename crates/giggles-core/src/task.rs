@@ -22,6 +22,8 @@ pub mod effects;
 // R3-401: statement time, concurrent statements per task, all-agent ceiling.
 pub(crate) mod limits;
 pub mod error;
+// R3-501: SHOW TASK EXPOSURE <task>.
+pub mod exposure;
 // Consumed by the protected commit path (R3-613+); until then only its tests use it.
 #[allow(dead_code)]
 pub(crate) mod ledger;
@@ -68,3 +70,4 @@ pub use readlog::{fingerprint_and_cap, show_reads, ReadRecord, Reconciliation};
 pub use release::{Page, ReleaseTag, Released, Unreleased};
 pub use retention::{RetentionConfig, RetentionStats};
 pub use error::{Budget, DenyRule, TaskError};
+pub use exposure::show_exposure;
