@@ -55,16 +55,13 @@ impl Prepared {
                     StatementClass::Select
                 }
             }
-            Statement::Plan(plan) => {
-                if plan.read_tables().iter().any(|name| is_catalog_relation(name))
-                    || plan.write_tables().iter().any(|(name, _)| is_catalog_relation(name))
-                {
-                    StatementClass::Catalog
-                } else {
-                    // Planner shapes do not yet participate in task-session column rules.
-                    StatementClass::Other
-                }
-            }
+            // Fail closed: every GD-0079 planner statement is `Other`, so a task session refuses
+            // it, even when it names a catalog relation. Task-session column rules, catalog
+            // filtering (R3-312) and row scope and masking hook the older execution paths, not
+            // the planner, so a planner shape that mixes a catalog relation with a user table
+            // (UNION, VALUES, WITH, WITH RECURSIVE, data-modifying WITH) would otherwise run
+            // unfiltered once `Catalog` is admitted (R3-315). Non-task sessions never read this.
+            Statement::Plan(_) => StatementClass::Other,
             Statement::CompositeSelect(_) => StatementClass::Other,
             Statement::Update { .. } | Statement::UpdateExpressions { .. } => {
                 StatementClass::Update
@@ -124,8 +121,13 @@ mod tests {
             ("WITH q AS (SELECT id FROM shipments) SELECT id FROM q", StatementClass::Other),
             ("VALUES (1)", StatementClass::Other),
             (
+                // A planner statement naming a catalog relation is still `Other` (fail closed).
                 "SELECT id FROM shipments UNION SELECT table_name FROM information_schema.tables",
-                StatementClass::Catalog,
+                StatementClass::Other,
+            ),
+            (
+                "WITH c AS (SELECT table_name FROM information_schema.tables) SELECT * FROM c",
+                StatementClass::Other,
             ),
             (
                 "WITH d AS (DELETE FROM shipments WHERE id = 1 RETURNING id) SELECT id FROM d",
@@ -205,6 +207,28 @@ mod tests {
             "DROP SEQUENCE",
         ] {
             assert!(commands.contains(command), "{command} not covered: {commands:?}");
+        }
+    }
+
+    /// Fail closed (GD-0079 x R3-315): every planner statement is `Other` in a task session,
+    /// whether it names a catalog relation, the task table, both or no table at all.
+    #[test]
+    fn planner_statements_are_other_even_with_catalog_relations() {
+        // `pg_class` and other `pg_*` relations do not parse here (`Reserved`, or `Unsupported`
+        // inside WITH): the server answers them on its catalog path. `information_schema`
+        // relations do reach the planner.
+        for sql in [
+            "SELECT table_name FROM information_schema.tables UNION ALL SELECT status FROM shipments",
+            "WITH c AS (SELECT table_name FROM information_schema.tables) SELECT * FROM c",
+            "WITH t AS (SELECT * FROM shipments) SELECT * FROM t",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3)              SELECT n FROM r",
+            "WITH d AS (DELETE FROM shipments WHERE id = 1 RETURNING id) SELECT id FROM d",
+            "VALUES (1)",
+        ] {
+            let p = prepared(sql);
+            assert!(p.is_planner_statement(), "{sql}: not a planner statement");
+            assert_eq!(p.task_class(), StatementClass::Other, "{sql}");
+            assert_eq!(Prepared::task_class_of_sql(sql).unwrap(), StatementClass::Other, "{sql}");
         }
     }
 

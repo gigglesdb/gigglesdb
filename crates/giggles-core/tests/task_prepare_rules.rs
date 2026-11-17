@@ -249,3 +249,97 @@ fn non_task_session_still_gets_42703() {
     let e = s.execute("SELECT nosuch FROM shipments", &[], None).unwrap_err();
     assert_eq!(giggles_core::sqlstate(&e), "42703", "{e:?}");
 }
+
+/// The server's task-session pipeline on core types: classify the text,
+/// admit the class (`task::admit`), then run and release the page.
+fn admitted_read(
+    s: &mut SqlSession,
+    sql: &str,
+) -> Result<Vec<giggles_core::relational::SqlRow>, CoreError> {
+    let class = giggles_core::relational::Prepared::task_class_of_sql(sql)?;
+    giggles_core::task::admit::admit(s.task(), class).map_err(CoreError::Task)?;
+    let page = s.execute_unreleased(sql, &[], None)?;
+    Ok(s.release_page(page)?.into_inner().rows)
+}
+
+/// GD-0079 x R3-315, fail closed: R3's catalog filtering, row scope and
+/// masking hook the older execution paths, not the query planner, so a
+/// planner statement (UNION, WITH, VALUES, ...) is `Other` and refused in a
+/// task session even when it names a catalog relation. A plain catalog
+/// SELECT and a plain task-table SELECT are still admitted.
+#[test]
+fn planner_statements_refused_in_task_session() {
+    use giggles_core::relational::Prepared;
+    use giggles_core::task::StatementClass;
+    let f = Fixture::new("task-prepare-rules-planner");
+    let other = CoreError::Task(TaskError::NotAllowedInTaskSession(StatementClass::Other));
+    // The SQLSTATE admission gives `Other` today.
+    let s = f.agent();
+    let e = CoreError::Task(
+        giggles_core::task::admit::admit(s.task(), StatementClass::Other).unwrap_err(),
+    );
+    assert_eq!(e, other);
+    let other_state = giggles_core::sqlstate(&e);
+    assert_eq!(other_state, "0A000");
+
+    // The brief's catalog forms name `pg_class`, which core does not parse
+    // (`Reserved`; `Unsupported` inside WITH): the server answers `pg_*`
+    // relations on its catalog path. Core refuses them before any row is read.
+    for sql in [
+        "SELECT relname FROM pg_class UNION ALL SELECT status FROM shipments",
+        "WITH c AS (SELECT relname FROM pg_class) SELECT * FROM c",
+    ] {
+        assert!(Prepared::task_class_of_sql(sql).is_err(), "{sql}");
+        let mut s = f.agent();
+        let e = admitted_read(&mut s, sql).expect_err(sql);
+        assert_ne!(giggles_core::sqlstate(&e), "00000", "{sql}");
+        let mut s = f.agent();
+        let direct = s
+            .execute_unreleased(sql, &[], None)
+            .and_then(|page| s.release_page(page).map(|r| r.into_inner().rows));
+        assert!(direct.is_err(), "{sql}: {direct:?}");
+    }
+
+    // Planner statements: the same forms over `information_schema` (a
+    // catalog relation core does parse), the task table under WITH, and a
+    // table-free VALUES. Each is `Other`, refused with `Other`'s SQLSTATE.
+    for sql in [
+        "SELECT table_name FROM information_schema.tables UNION ALL SELECT status FROM shipments",
+        "WITH c AS (SELECT table_name FROM information_schema.tables) SELECT * FROM c",
+        "WITH t AS (SELECT * FROM shipments) SELECT * FROM t",
+        "VALUES (1)",
+    ] {
+        // Each reaches the planner (an untasked prepare parses without binding).
+        let p = f.admin().sql_session().prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert!(p.is_planner_statement(), "{sql}: not a planner statement");
+        assert_eq!(Prepared::task_class_of_sql(sql).unwrap(), StatementClass::Other, "{sql}");
+        let mut s = f.agent();
+        let e = admitted_read(&mut s, sql).expect_err(sql);
+        assert_eq!(e, other, "{sql}");
+        assert_eq!(giggles_core::sqlstate(&e), other_state, "{sql}");
+        // Run directly in the task session, without admission, it still
+        // returns no rows.
+        let mut s = f.agent();
+        let direct = s
+            .execute_unreleased(sql, &[], None)
+            .and_then(|page| s.release_page(page).map(|r| r.into_inner().rows));
+        assert!(direct.is_err(), "{sql}: {direct:?}");
+    }
+
+    // The plain catalog SELECT R3-315 admits is still admitted (the server
+    // answers it through the filtered catalog, R3-312).
+    // Core classifies it; the rows come from the server's catalog engine.
+    let catalog = "SELECT table_name FROM information_schema.tables";
+    let p = f.admin().sql_session().prepare(catalog).unwrap();
+    assert!(!p.is_planner_statement());
+    assert_eq!(Prepared::task_class_of_sql(catalog).unwrap(), StatementClass::Catalog);
+    let s = f.agent();
+    giggles_core::task::admit::admit(s.task(), StatementClass::Catalog).unwrap();
+
+    // A plain task-table SELECT is still admitted, runs, and sees only the
+    // task's visible row.
+    let mut s = f.agent();
+    let rows = admitted_read(&mut s, "SELECT id, status FROM shipments ORDER BY id").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::Int(1));
+}
