@@ -789,7 +789,13 @@ impl Session {
             return Err(CoreError::Policy(Error::Scope));
         }
         self.admit(class)?;
-        self.protected_scope(|session| session.prepare_with_parameter_types(sql, declared_types))
+        self.protected_scope(|session| {
+            let prepared = session.prepare_with_parameter_types(sql, declared_types)?;
+            // R3-303's column rules before anything describes the statement:
+            // a hidden column and a nonexistent one get the same rule error,
+            // never a bind error (42703) that tells them apart.
+            session.sql.task_column_rules(&prepared)
+        })
     }
     /// The only place `in_protected` is set. It is cleared on every exit,
     /// including an error or a panic out of `work` (the guard's drop).

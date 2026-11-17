@@ -382,8 +382,13 @@ impl State {
                 {
                     return Err("42601");
                 }
-                let (prepared, description) =
-                    prepare_protected_sql(session, head.class(), wrapped, oids)?;
+                let (prepared, description) = prepare_protected_sql(
+                    &mut self.diagnostic,
+                    session,
+                    head.class(),
+                    wrapped,
+                    oids,
+                )?;
                 if prepared.task_class() != StatementClass::Update {
                     return Err("42601");
                 }

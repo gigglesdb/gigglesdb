@@ -46,6 +46,7 @@
 //! nothing; every point after it leaves rows, head, membership, change record,
 //! receipt and outcome together (or, for a denial, the outcome and the head).
 use super::authority;
+use super::columns;
 use super::context::TaskContext;
 use super::decide::{self, ApprovalState, Decision, RequestKind};
 use super::definition::{RoleName, TaskDef};
@@ -597,7 +598,9 @@ fn attempt(
     if let Some(receipt) = replay(db, task, key, &fp)? {
         return Ok(receipt);
     }
-    standing(load_def(db, task, DefAt::Latest)?.as_deref(), ctx, db.wall_now_ms())?;
+    let latest = load_def(db, task, DefAt::Latest)?;
+    standing(latest.as_deref(), ctx, db.wall_now_ms())?;
+    let latest = latest.ok_or(TaskError::Revoked)?;
     // The denial mark: everything after it is discarded on a recorded
     // denial; the hold (a lock) survives the rollback.
     let mark = txn.savepoint();
@@ -612,12 +615,37 @@ fn attempt(
             (&stored.0, stored.1.as_slice(), stored.2.as_ref())
         }
     };
+    // R3-303's column rules (design-3 section 2), before the statement runs:
+    // no row is read or written, so no rows_affected, receipt or execution
+    // error (22012, casts, overflow) can tell anything about a column the
+    // task may not read. A denial is recorded (D-F "Denials").
+    let latest_catalog = {
+        let mut read = db.begin(Isolation::ReadCommitted);
+        db.catalog().snapshot(&mut read)?
+    };
+    let image = latest_catalog.image().map_err(|e| TaskError::Core(Box::new(CoreError::Sql(e))))?;
+    let ruled = columns::apply_in_catalog(
+        &latest,
+        ctx.bound_def_version,
+        &latest_catalog.parts.column_labels,
+        &image,
+        statement,
+    );
+    let expanded = match ruled {
+        Ok((expanded, _)) => expanded,
+        Err(error @ TaskError::Denied(_)) => {
+            let head = authority::load_head(&mut txn, task)?;
+            return deny(call, txn, mark, &latest, head, error);
+        }
+        Err(error) => return Err(error),
+    };
+    drop((image, latest_catalog));
     let run = ProtectedRun { txn, effects: Effects::default() };
     // The statement runs bound to the executor's task, so it reads and
     // matches only the task's visible rows (R3-306); the session's own
     // binding, if any, is restored after.
     let bound = session.task.replace(ctx.clone());
-    let (run, result) = session.execute_protected_v2(db, run, statement, params, clock);
+    let (run, result) = session.execute_protected_v2(db, run, &expanded, params, clock);
     session.task = bound;
     let ProtectedRun { mut txn, effects } = run;
     result.map_err(engine)?;
@@ -646,6 +674,17 @@ fn attempt(
         .values()
         .find(|table| table.id == def.table)
         .ok_or(TaskError::Denied(DenyRule::DefinitionChanged))?;
+    // The column rules again at the statement snapshot, in case a label or
+    // the table changed after the first check; a denial is recorded.
+    if let Err(error) =
+        columns::apply_in_catalog(&def, ctx.bound_def_version, &view.column_labels, &state, statement)
+    {
+        if !matches!(error, TaskError::Denied(_)) {
+            return Err(error);
+        }
+        let head = authority::load_head(&mut txn, task)?;
+        return deny(call, txn, mark, &def, head, error);
+    }
     // 10. Every buffered row write is an effect and vice versa.
     crate::storage::cross_check_effects(&effects, &txn)?;
     // 11. Head (exact under the hold) and the membership charge.

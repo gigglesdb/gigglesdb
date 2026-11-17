@@ -841,6 +841,7 @@ fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32]) -> R<(Pl
 /// R3-207/615: `prepare_declared_sql` for the UPDATE wrapped by a protected
 /// form, prepared inside the session's protected scope (`class` admitted first).
 fn prepare_protected_sql(
+    diagnostic: &mut Diagnostic,
     session: &mut Session,
     class: giggles_core::task::StatementClass,
     sql: &str,
@@ -850,7 +851,8 @@ fn prepare_protected_sql(
         .iter()
         .map(|&o| core_declared_type(o))
         .collect::<Vec<_>>();
-    let prepared = core(session.prepare_protected(class, sql, &declared))?;
+    // A task refusal (the column rules) keeps its own message.
+    let prepared = diagnostic.core(session.prepare_protected(class, sql, &declared))?;
     let description = core(session.describe(&prepared))?;
     if oids.len() > description.parameters.len() {
         return Err("08P01");

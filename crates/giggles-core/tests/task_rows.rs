@@ -514,8 +514,20 @@ fn untasked_divides_by_zero(f: &Fixture, sql: &str) {
 
 #[test]
 fn update_out_of_scope_matches_zero_rows() {
-    // Rows 2 and 4 are 'failed' but outside the scope.
-    let f = writable("task-rows-update-scope");
+    // Rows 2 and 4 are 'failed' but outside the scope. Where `merchant_id`
+    // is hidden the column rules refuse a filter on it before it runs.
+    let hidden = writable("task-rows-update-scope-hidden");
+    assert_eq!(
+        commit(&hidden, "outside", "UPDATE shipments SET status = 'queued' WHERE merchant_id = 7"),
+        Err(TaskError::Denied(DenyRule::ColumnNotAvailable))
+    );
+    assert_eq!(statuses(&hidden), BEFORE);
+    // Here it is readable, so the statement may filter on the scope's column.
+    let f = fixture_of(
+        "task-rows-update-scope",
+        true,
+        &["id", "merchant_id", "status", "attempt_count"],
+    );
     let counts = commits(
         &f,
         "outside",
@@ -571,7 +583,7 @@ fn update_by_pk_out_of_scope_matches_zero_rows() {
 #[test]
 fn update_set_source_reads_only_scope_rows() {
     // `attempt_count` is zero only outside the scope: no expression of the
-    // statement (SET, WHERE, the key-selecting subquery) may see such a row.
+    // statement (SET, WHERE) may see such a row.
     for (name, sql) in [
         (
             "task-rows-update-set",
@@ -583,17 +595,19 @@ fn update_set_source_reads_only_scope_rows() {
             "UPDATE shipments SET status = 'queued' \
              WHERE 1 / attempt_count >= 0 AND status = 'failed'",
         ),
-        (
-            "task-rows-update-subquery",
-            "UPDATE shipments SET status = 'queued' WHERE status = 'failed' \
-             AND id IN (SELECT id FROM shipments WHERE 1 / attempt_count >= 0)",
-        ),
     ] {
         let f = writable(name);
         untasked_divides_by_zero(&f, sql);
         commits(&f, "requeue", sql, 2);
         assert_eq!(statuses(&f), REQUEUED, "{sql}");
     }
+    // A key-selecting subquery is refused by the column rules before it runs.
+    let f = writable("task-rows-update-subquery");
+    let sql = "UPDATE shipments SET status = 'queued' WHERE status = 'failed' \
+               AND id IN (SELECT id FROM shipments WHERE 1 / attempt_count >= 0)";
+    untasked_divides_by_zero(&f, sql);
+    assert_eq!(commit(&f, "requeue", sql), Err(TaskError::Denied(DenyRule::Subquery)));
+    assert_eq!(statuses(&f), BEFORE, "{sql}");
 }
 
 fn int(value: i64) -> Expr {

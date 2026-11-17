@@ -17,8 +17,8 @@ use giggles_core::task::context::TaskContext;
 use giggles_core::task::definition::WallClockMs;
 use giggles_core::task::statements::{parse, TaskStatement};
 use giggles_core::task::{
-    outcome, protected_commit, Actor, Budget, OperationId, Outcome, ProtectedRequest, Receipt,
-    TaskError,
+    outcome, protected_commit, Actor, Budget, DenyRule, OperationId, Outcome, ProtectedRequest,
+    Receipt, TaskError,
 };
 use giggles_core::{Admin, Engine, Limits};
 use std::path::PathBuf;
@@ -383,4 +383,123 @@ fn expiry_blocks_write_allows_lookup() {
     // A resend of a recorded operation still answers its stored receipt.
     same(&commit(&admin, &ctx, "a2", &requeue(1, 5)).unwrap(), &a2);
     same(&committed(lookup(&admin, &ctx, "a2")), &a2);
+}
+
+/// A column-rule denial is a durable denial (D-F): nothing ran, the stored
+/// outcome is the rule, a resend replays it, and no receipt seq is taken.
+fn refused_before_running(admin: &Admin, ctx: &TaskContext, id: &str, text: &str, rule: DenyRule) {
+    let before = sql(admin, "SELECT id, status, attempt_count FROM shipments ORDER BY id");
+    let refused = commit(admin, ctx, id, text).unwrap_err();
+    assert_eq!(refused, TaskError::Denied(rule), "{text}");
+    assert_eq!(refused.sqlstate(), "42501", "{text}");
+    assert_eq!(lookup(admin, ctx, id), Ok(Some(Outcome::Denied(rule))), "{text}");
+    assert_eq!(commit(admin, ctx, id, text), Err(TaskError::Denied(rule)), "{text}");
+    assert_eq!(
+        sql(admin, "SELECT id, status, attempt_count FROM shipments ORDER BY id"),
+        before,
+        "{text}"
+    );
+}
+
+#[test]
+fn hidden_column_in_update_filter_refused_before_running() {
+    let (_dir, admin) = setup(now_ms() + DAY_MS);
+    let ctx = context(&admin);
+    // merchant_id is hidden: filtering on it would leak through
+    // rows_affected. A nonexistent column is refused the same way.
+    for (id, text) in [
+        ("f1", "UPDATE shipments SET status = 'queued' WHERE merchant_id = 42 AND id <= 4"),
+        ("f2", "UPDATE shipments SET status = 'queued' WHERE status = 'failed' AND merchant_id > 0"),
+        ("f3", "UPDATE shipments SET status = 'queued' WHERE no_such_column = 1"),
+        ("f4", "UPDATE shipments SET status = 'queued' WHERE id = 1 RETURNING merchant_id"),
+    ] {
+        refused_before_running(&admin, &ctx, id, text, DenyRule::ColumnNotAvailable);
+    }
+    // A masked column may only be a plain output column.
+    refused_before_running(
+        &admin,
+        &ctx,
+        "f5",
+        "UPDATE shipments SET status = 'queued' WHERE customer_email = 'c1@example.com'",
+        DenyRule::MaskedColumnPosition,
+    );
+    assert_eq!(queued(&admin), 0);
+    // No receipt was written: the first commit still takes seq 1.
+    let first = commit(&admin, &ctx, "ok", &requeue(1, 2)).unwrap();
+    assert_eq!((first.seq, first.rows_affected), (1, 2));
+}
+
+#[test]
+fn hidden_column_in_set_source_refused() {
+    let (_dir, admin) = setup(now_ms() + DAY_MS);
+    let ctx = context(&admin);
+    refused_before_running(
+        &admin,
+        &ctx,
+        "s1",
+        "UPDATE shipments SET status = CASE WHEN merchant_id = 42 THEN 'queued' ELSE status END          WHERE status = 'failed' AND id <= 4",
+        DenyRule::ColumnNotAvailable,
+    );
+    refused_before_running(
+        &admin,
+        &ctx,
+        "s2",
+        "UPDATE shipments SET status = customer_email WHERE id = 1",
+        DenyRule::MaskedColumnPosition,
+    );
+    // A target outside ALLOW UPDATE is refused by the same rules.
+    refused_before_running(
+        &admin,
+        &ctx,
+        "s3",
+        "UPDATE shipments SET attempt_count = 2 WHERE id = 1",
+        DenyRule::ColumnNotWritable,
+    );
+    assert_eq!(queued(&admin), 0);
+}
+
+#[test]
+fn division_by_hidden_column_returns_rule_sqlstate_not_22012() {
+    let (_dir, admin) = setup(now_ms() + DAY_MS);
+    let ctx = context(&admin);
+    // Run, this would divide by zero on every visible row (merchant 42).
+    let text = "UPDATE shipments SET status = 'queued' WHERE 1 / (merchant_id - 42) = 0";
+    let refused = commit(&admin, &ctx, "d1", text).unwrap_err();
+    assert_eq!(refused, TaskError::Denied(DenyRule::ColumnNotAvailable));
+    assert_ne!(refused.sqlstate(), "22012");
+    assert_eq!(refused.sqlstate(), "42501");
+    assert_eq!(queued(&admin), 0);
+    // The same on a readable column is an ordinary execution error, and is
+    // not recorded.
+    let readable = "UPDATE shipments SET status = 'queued' WHERE 1 / (attempt_count - 1) = 0 AND id <= 4";
+    let error = commit(&admin, &ctx, "d2", readable).unwrap_err();
+    assert_eq!(error.sqlstate(), "22012", "{error:?}");
+    assert_eq!(lookup(&admin, &ctx, "d2"), Ok(None));
+    assert_eq!(queued(&admin), 0);
+}
+
+#[test]
+fn readable_filter_still_commits() {
+    let (_dir, admin) = setup(now_ms() + DAY_MS);
+    let ctx = context(&admin);
+    let receipt = commit(
+        &admin,
+        &ctx,
+        "r1",
+        "UPDATE shipments SET status = 'queued' WHERE status = 'failed' AND attempt_count = 1          AND failed_at < '2026-11-05 17:07:00+00' AND id <= 3",
+    )
+    .unwrap();
+    assert_eq!((receipt.seq, receipt.rows_affected), (1, 3));
+    assert_eq!(queued(&admin), 3);
+    // RETURNING * expands to readable columns only, so it is not refused by
+    // the column rules.
+    let star = commit(
+        &admin,
+        &ctx,
+        "r2",
+        "UPDATE shipments SET status = 'queued' WHERE status = 'failed' AND id = 4 RETURNING *",
+    )
+    .unwrap();
+    assert_eq!((star.seq, star.rows_affected), (2, 1));
+    assert_eq!(queued(&admin), 4);
 }

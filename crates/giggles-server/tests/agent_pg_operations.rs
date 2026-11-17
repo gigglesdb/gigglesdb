@@ -350,7 +350,7 @@ const AFTER: [&str; 6] = ["queued", "queued", "queued", "queued", "delivered", "
 /// The worked example with a writable task: `inc-436` may set `status` from
 /// 'failed' to 'queued' on merchant 42's rows (1-5; row 5 is delivered), at
 /// most 25 rows. Row 6 belongs to merchant 7.
-fn writable_admin() -> Admin {
+fn writable_admin(readable: &[&str]) -> Admin {
     let path = scratch("agent-pg-write");
     let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), Engine::V2).unwrap();
     for statement in [
@@ -399,7 +399,7 @@ fn writable_admin() -> Admin {
                 schema: None,
                 table: "shipments".into(),
                 visible_rows: PredicateText("merchant_id = 42".into()),
-                readable: ["id", "merchant_id", "status", "attempt_count"]
+                readable: readable
                     .iter()
                     .map(|c| c.to_string())
                     .collect(),
@@ -432,10 +432,15 @@ fn writable_admin() -> Admin {
 /// A started agent server for [`writable_admin`] and a raw session on its
 /// agent listener.
 async fn writable_wire() -> (AgentServer, Wire) {
+    writable_wire_reading(&["id", "merchant_id", "status", "attempt_count"]).await
+}
+
+/// [`writable_wire`] with only `readable` readable (the others hidden).
+async fn writable_wire_reading(readable: &[&str]) -> (AgentServer, Wire) {
     let ca = certificate(None, false);
     let agent = certificate(Some(&ca), false);
     let server = AgentServer::start(
-        writable_admin(),
+        writable_admin(readable),
         ca,
         vec![],
         vec![binding(&agent, "agent_exec", &["inc-436"])],
@@ -613,4 +618,35 @@ async fn bare_update_and_preview_apply_stay_refused_on_a_writable_task() {
         );
     }
     assert_eq!(statuses(&server.admin), BEFORE);
+}
+
+#[tokio::test]
+async fn hidden_column_in_update_is_refused_with_the_rule_before_running() {
+    // merchant_id is hidden here: a filter, a SET source or a RETURNING item
+    // on it is refused by the column rules before the statement runs, with
+    // the same error as a column that does not exist, over both protocols.
+    let (server, mut wire) = writable_wire_reading(&["id", "status", "attempt_count"]).await;
+    let denied = TaskError::Denied(DenyRule::ColumnNotAvailable);
+    let expected = Some((denied.sqlstate().to_owned(), denied.message().to_owned()));
+    for (n, extended) in [false, true].into_iter().enumerate() {
+        for (m, wrapped) in [
+            REQUEUE,
+            "UPDATE shipments SET status = 'queued' WHERE 1 / (merchant_id - 42) = 0",
+            "UPDATE shipments SET status = CASE WHEN merchant_id = 42 THEN 'queued'              ELSE status END WHERE status = 'failed'",
+            "UPDATE shipments SET status = 'queued' WHERE id = 1 RETURNING merchant_id",
+            "UPDATE shipments SET status = 'queued' WHERE no_such_column = 42",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sql = format!("OPERATION 'hidden-{n}-{m}' {wrapped}");
+            let messages = run(&mut wire, &sql, extended).await;
+            assert_eq!(error_of(&messages), expected, "{sql}: {messages:?}");
+            assert_eq!(messages.last(), Some(&Msg::Ready(b'I')), "{sql}");
+        }
+    }
+    assert_eq!(statuses(&server.admin), BEFORE);
+    // A readable filter still commits on the same session.
+    let sql = "OPERATION 'ok' UPDATE shipments SET status = 'queued'                WHERE status = 'failed' AND attempt_count = 1";
+    assert_complete(&wire.simple(sql).await, "UPDATE 2", sql);
 }

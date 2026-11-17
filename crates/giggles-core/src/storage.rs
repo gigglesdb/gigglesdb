@@ -3738,6 +3738,26 @@ impl SqlSession {
         }
         Ok((tag, expanded))
     }
+    /// The task's column rules (R3-303) on a statement just prepared in a task
+    /// session, before anything describes or binds it, so a hidden column and
+    /// a nonexistent one get the same rule error and no bind error (42703)
+    /// precedes it. Returns the statement with its stars expanded (design-3
+    /// section 2, call site 1). Outside a task session, or for a class the
+    /// rules do not judge, the statement comes back unchanged. The protected
+    /// commit applies the same rules again before it runs the statement.
+    pub fn task_column_rules(
+        &self,
+        p: &relational::Prepared,
+    ) -> Result<relational::Prepared, CoreError> {
+        use crate::task::StatementClass;
+        if self.task.is_none()
+            || !matches!(p.task_class(), StatementClass::Select | StatementClass::Update)
+        {
+            return Ok(p.clone());
+        }
+        let (expanded, _) = self.task_output_plan(p).map_err(CoreError::Task)?;
+        Ok(expanded)
+    }
     fn task_output_plan(
         &self,
         p: &relational::Prepared,
