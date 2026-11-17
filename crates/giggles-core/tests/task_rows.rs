@@ -1,27 +1,37 @@
 //! GD-0061 R3-305: a task session's SQL reads see only the task's visible rows
-//! (design-3 section 3).
+//! (design-3 section 3). R3-306: so do its searched UPDATEs (through the
+//! protected commit) and its native requests: a row outside the scope is never
+//! matched, read or rewritten (worked example step 15).
 //!
 //! Task-session results stay unreleased until the release protocol (R3-308), so
 //! these tests observe the scope without reading rows: an expression that
 //! divides by zero on exactly one row shows whether that row reached the
 //! statement (22012) or not, and `task::rows::take_last_counts` shows how many
 //! rows the scoped source pulled and kept. Every case runs on the streaming
-//! cursor path and on the buffered path.
+//! cursor path and on the buffered path. Writes are observed through the
+//! receipt's `rows_affected` and the rows an untasked session reads afterwards.
 #![cfg(feature = "engine-rocksdb")]
 mod common;
 use giggles_core::{
     Admin, CoreError, Engine, Limits, SqlSession,
+    operations::{
+        Arithmetic, Bindings, Compare, Error as NativeError, Expr, Intent, Request, ValueExpr,
+    },
+    relational::Value,
     roles::{NewRole, TablePrivilege},
     task::{
+        Actor, OperationId, ProtectedRequest, Receipt, TaskError,
         context::open_context,
         definition::{
-            DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText, TaskName,
-            WallClockMs,
+            AllowedWrite, DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText,
+            TaskName, WallClockMs,
         },
+        protected_commit,
         rows::{RowCounts, take_last_counts},
     },
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// 2026-11-05 17:00:00 UTC.
 const NOW: WallClockMs = WallClockMs(1_793_898_000_000);
@@ -72,6 +82,17 @@ impl Drop for Fixture {
 }
 
 fn fixture(name: &str) -> Fixture {
+    fixture_with(name, false)
+}
+
+/// The fixture with the worked example's write: `status` from 'failed' to
+/// 'queued', and the executor holding SELECT and UPDATE. It expires far
+/// ahead of the real wall clock, which the protected commit checks.
+fn writable(name: &str) -> Fixture {
+    fixture_with(name, true)
+}
+
+fn fixture_with(name: &str, write: bool) -> Fixture {
     let path = common::fresh(name);
     let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
     let f = Fixture {
@@ -94,9 +115,17 @@ fn fixture(name: &str) -> Fixture {
             roles.set_task_only(name, true).unwrap();
         }
     }
+    let granted: &[TablePrivilege] = if write {
+        &[TablePrivilege::Select, TablePrivilege::Update]
+    } else {
+        &[TablePrivilege::Select]
+    };
     roles
-        .grant_table("shipments", "incident_controller", &[TablePrivilege::Select])
+        .grant_table("shipments", "incident_controller", granted)
         .unwrap();
+    if write {
+        roles.grant_table("shipments", "repair_agent", granted).unwrap();
+    }
     let issuer = roles.get("incident_controller").unwrap().unwrap();
     f.admin()
         .tasks()
@@ -112,21 +141,43 @@ fn fixture(name: &str) -> Fixture {
                 readable: ["id", "status", "attempt_count"].map(String::from).to_vec(),
                 masked: Vec::new(),
                 untrusted_text: Vec::new(),
-                allowed_write: None,
-                mutation_caps: MutationCaps::default(),
+                allowed_write: write.then(|| AllowedWrite {
+                    columns: ["status".to_string()].into_iter().collect(),
+                    old_row: PredicateText("status = 'failed'".into()),
+                    new_row: PredicateText("status = 'queued'".into()),
+                }),
+                mutation_caps: if write {
+                    MutationCaps {
+                        distinct_rows: 25,
+                        transitions: 25,
+                    }
+                } else {
+                    MutationCaps::default()
+                },
                 disclosure_caps: DisclosureCaps {
                     rows_read: 1000,
                     rows_returned: 1000,
                     bytes_returned: 2_097_152,
                 },
                 limits: LoadLimits::default(),
-                approval_threshold: 0,
-                expires: "2026-11-05 17:30:00+00".into(),
+                approval_threshold: if write { 25 } else { 0 },
+                expires: if write {
+                    "2099-12-31 00:00:00+00".into()
+                } else {
+                    "2026-11-05 17:30:00+00".into()
+                },
             },
-            NOW,
+            if write { WallClockMs(now_ms()) } else { NOW },
         )
         .unwrap();
     f
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -367,4 +418,310 @@ fn divides_by_zero_untasked(s: &mut SqlSession, path: Path, sql: &str) {
         Err(e) => assert_eq!(giggles_core::sqlstate(&e), "22012", "{path:?} {sql}: {e:?}"),
         Ok(()) => panic!("{path:?} {sql}: expected 22012"),
     }
+}
+
+// R3-306: searched UPDATE and native requests.
+
+/// `status` of rows 1..=6, read outside the task.
+fn statuses(f: &Fixture) -> Vec<String> {
+    f.admin()
+        .sql_session()
+        .execute("SELECT status FROM shipments ORDER BY id", &[], None)
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|row| match &row.values[0] {
+            Value::Text(text) => text.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+const BEFORE: [&str; 6] = ["failed", "failed", "queued", "failed", "failed", "done"];
+const REQUEUED: [&str; 6] = ["queued", "failed", "queued", "failed", "queued", "done"];
+
+/// `text` through the protected commit, as the bound executor.
+fn commit(f: &Fixture, op: &str, text: &str) -> Result<Receipt, TaskError> {
+    let mut agent = f.agent();
+    let ctx = agent.task().unwrap().clone();
+    let request = ProtectedRequest::Direct {
+        statement: agent.prepare(text).unwrap(),
+        params: Vec::new(),
+        text: Arc::from(text),
+    };
+    protected_commit(
+        &mut agent,
+        Actor::Executor(&ctx),
+        &OperationId::new(op.as_bytes()).unwrap(),
+        request,
+    )
+}
+
+/// `text` commits in the task with `affected` rows; returns the scoped counts.
+fn commits(f: &Fixture, op: &str, text: &str, affected: u32) -> RowCounts {
+    let _ = take_last_counts();
+    let receipt = commit(f, op, text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+    assert_eq!(receipt.rows_affected, affected, "{text}");
+    take_last_counts().unwrap_or_else(|| panic!("{text}: no scoped read"))
+}
+
+/// Outside a task `sql` fails with division by zero and changes nothing.
+fn untasked_divides_by_zero(f: &Fixture, sql: &str) {
+    match f.admin().sql_session().execute(sql, &[], None) {
+        Err(e) => assert_eq!(giggles_core::sqlstate(&e), "22012", "{sql}: {e:?}"),
+        Ok(_) => panic!("{sql}: expected 22012 without a task"),
+    }
+    assert_eq!(statuses(f), BEFORE, "{sql}");
+}
+
+#[test]
+fn update_out_of_scope_matches_zero_rows() {
+    // Rows 2 and 4 are 'failed' but outside the scope.
+    let f = writable("task-rows-update-scope");
+    let counts = commits(
+        &f,
+        "outside",
+        "UPDATE shipments SET status = 'queued' WHERE merchant_id = 7",
+        0,
+    );
+    assert_eq!(counts, RowCounts { scanned: 6, read: 3 });
+    commits(
+        &f,
+        "null",
+        "UPDATE shipments SET status = 'queued' WHERE merchant_id IS NULL",
+        0,
+    );
+    assert_eq!(statuses(&f), BEFORE);
+    // Before R3-306 rows 2 and 4 matched too and the policy denied the whole
+    // request (OutsideVisibleRows); now only the visible rows 1 and 5 match.
+    commits(
+        &f,
+        "failed",
+        "UPDATE shipments SET status = 'queued' WHERE status = 'failed'",
+        2,
+    );
+    assert_eq!(statuses(&f), REQUEUED);
+}
+
+#[test]
+fn update_by_pk_out_of_scope_matches_zero_rows() {
+    let f = writable("task-rows-update-pk");
+    for (op, id) in [("two", 2), ("four", 4), ("six", 6)] {
+        let counts = commits(
+            &f,
+            op,
+            &format!("UPDATE shipments SET status = 'queued' WHERE id = {id}"),
+            0,
+        );
+        // The point read pulled the row and dropped it.
+        assert_eq!(counts, RowCounts { scanned: 1, read: 0 }, "id {id}");
+    }
+    assert_eq!(statuses(&f), BEFORE);
+    let counts = commits(
+        &f,
+        "mixed",
+        "UPDATE shipments SET status = 'queued' WHERE id IN (1, 2, 4)",
+        1,
+    );
+    assert_eq!(counts, RowCounts { scanned: 3, read: 1 });
+    assert_eq!(
+        statuses(&f),
+        ["queued", "failed", "queued", "failed", "failed", "done"]
+    );
+}
+
+#[test]
+fn update_set_source_reads_only_scope_rows() {
+    // `attempt_count` is zero only outside the scope: no expression of the
+    // statement (SET, WHERE, the key-selecting subquery) may see such a row.
+    for (name, sql) in [
+        (
+            "task-rows-update-set",
+            "UPDATE shipments SET status = CASE WHEN 1 / attempt_count > 0 \
+             THEN 'queued' ELSE 'queued' END WHERE status = 'failed'",
+        ),
+        (
+            "task-rows-update-where",
+            "UPDATE shipments SET status = 'queued' \
+             WHERE 1 / attempt_count >= 0 AND status = 'failed'",
+        ),
+        (
+            "task-rows-update-subquery",
+            "UPDATE shipments SET status = 'queued' WHERE status = 'failed' \
+             AND id IN (SELECT id FROM shipments WHERE 1 / attempt_count >= 0)",
+        ),
+    ] {
+        let f = writable(name);
+        untasked_divides_by_zero(&f, sql);
+        commits(&f, "requeue", sql, 2);
+        assert_eq!(statuses(&f), REQUEUED, "{sql}");
+    }
+}
+
+fn int(value: i64) -> Expr {
+    Expr::Value(ValueExpr::Literal(Value::Int(value)))
+}
+fn field(name: &str) -> Expr {
+    Expr::Field(name.into())
+}
+fn compare(a: Expr, op: Compare, b: Expr) -> Expr {
+    Expr::Compare(Box::new(a), op, Box::new(b))
+}
+fn and(a: Expr, b: Expr) -> Expr {
+    Expr::And(Box::new(a), Box::new(b))
+}
+fn divide(a: Expr, b: Expr) -> Expr {
+    Expr::Arithmetic(Box::new(a), Arithmetic::Divide, Box::new(b))
+}
+/// `1 / attempt_count >= 0`: true on every visible row, fails on exactly the
+/// out-of-scope rows.
+fn inverse_attempts() -> Expr {
+    compare(divide(int(1), field("attempt_count")), Compare::Ge, int(0))
+}
+fn failed() -> Expr {
+    compare(
+        field("status"),
+        Compare::Eq,
+        Expr::Value(ValueExpr::Literal(Value::Text("failed".into()))),
+    )
+}
+fn id_is(id: i64) -> Expr {
+    compare(field("id"), Compare::Eq, int(id))
+}
+fn native_read(filter: Option<Expr>) -> Request {
+    Request::Read {
+        table: "shipments".into(),
+        filter,
+        order: Vec::new(),
+        limit: Some(ValueExpr::Literal(Value::Int(1024))),
+        projection: Vec::new(),
+    }
+}
+fn native_requeue(filter: Expr, intent: Intent) -> Request {
+    Request::Update {
+        table: "shipments".into(),
+        filter,
+        guard: None,
+        values: vec![(
+            "status".into(),
+            ValueExpr::Literal(Value::Text("queued".into())),
+        )],
+        intent,
+    }
+}
+fn many(cap: i64) -> Intent {
+    Intent::Many {
+        cap: ValueExpr::Literal(Value::Int(cap)),
+    }
+}
+
+/// `request` in a fresh task session; returns the counts of its last scoped
+/// read. A native update writes each matched row through a keyed statement,
+/// which reads that row through the scope again, so its last read is that
+/// one row.
+fn native(f: &Fixture, request: &Request) -> Result<RowCounts, NativeError> {
+    let _ = take_last_counts();
+    let page = f.agent().execute_native_unreleased(request, &Bindings::new())?;
+    assert!(page.is_task());
+    Ok(take_last_counts().expect("no scoped native read"))
+}
+
+/// `request` outside a task fails with `error`.
+fn untasked_native_fails(f: &Fixture, request: &Request, error: NativeError) {
+    assert_eq!(
+        f.admin()
+            .sql_session()
+            .execute_native(request, &Bindings::new())
+            .unwrap_err(),
+        error
+    );
+}
+
+#[test]
+fn native_read_and_update_scope() {
+    let f = writable("task-rows-native");
+    // A full read pulls every row and keeps the three visible ones.
+    assert_eq!(
+        native(&f, &native_read(None)),
+        Ok(RowCounts { scanned: 6, read: 3 })
+    );
+    // An expression that fails on the out-of-scope rows never sees them.
+    let probe = native_read(Some(inverse_attempts()));
+    untasked_native_fails(&f, &probe, NativeError::DivisionByZero);
+    assert_eq!(native(&f, &probe), Ok(RowCounts { scanned: 6, read: 3 }));
+    // A primary-key read of an invisible row reads nothing ...
+    let point = native_read(Some(and(id_is(2), inverse_attempts())));
+    untasked_native_fails(&f, &point, NativeError::DivisionByZero);
+    assert!(native(&f, &point).is_ok());
+    // ... and of a visible one reaches its expressions (1 / (2 - 2)).
+    let visible = native_read(Some(and(
+        id_is(3),
+        compare(
+            divide(
+                int(1),
+                Expr::Arithmetic(
+                    Box::new(field("attempt_count")),
+                    Arithmetic::Subtract,
+                    Box::new(int(2)),
+                ),
+            ),
+            Compare::Gt,
+            int(0),
+        ),
+    )));
+    assert_eq!(native(&f, &visible), Err(NativeError::DivisionByZero));
+    // An update of an invisible key finds nothing and changes nothing.
+    for id in [2, 4, 6] {
+        let request = native_requeue(id_is(id), Intent::One);
+        assert_eq!(native(&f, &request), Err(NativeError::NotFound), "id {id}");
+    }
+    assert_eq!(statuses(&f), BEFORE);
+    // A filter whose zero lies only outside the scope updates the visible rows;
+    // the last read is the keyed write of row 5.
+    let request = native_requeue(and(failed(), inverse_attempts()), many(10));
+    untasked_native_fails(&f, &request, NativeError::DivisionByZero);
+    assert_eq!(native(&f, &request), Ok(RowCounts { scanned: 1, read: 1 }));
+    assert_eq!(statuses(&f), REQUEUED);
+}
+
+#[test]
+fn native_matched_count_excludes_out_of_scope() {
+    // Four rows are 'failed' (1, 2, 4, 5); two of them (1, 5) are visible.
+    let f = writable("task-rows-native-matched");
+    let request = native_requeue(failed(), many(2));
+    // Outside the task four rows match, more than the cap.
+    untasked_native_fails(&f, &request, NativeError::TooManyMatches);
+    // Row 1 is visible and row 2 is not: outside the task both match.
+    let one = native_requeue(
+        and(failed(), Expr::Or(Box::new(id_is(1)), Box::new(id_is(2)))),
+        Intent::One,
+    );
+    untasked_native_fails(&f, &one, NativeError::AmbiguousMatch);
+    assert_eq!(statuses(&f), BEFORE);
+    // In the task only the two visible rows match, so the cap holds. The
+    // matching read of the same filter pulls six rows and keeps three.
+    assert_eq!(
+        native(&f, &native_read(Some(failed()))),
+        Ok(RowCounts { scanned: 6, read: 3 })
+    );
+    native(&f, &request).unwrap();
+    assert_eq!(statuses(&f), REQUEUED);
+    // The SQL path on an identical table affects the same two rows (worked
+    // example step 15, SQL and native alike), from the same scoped read.
+    let g = writable("task-rows-native-matched-sql");
+    let sql_counts = commits(
+        &g,
+        "requeue",
+        "UPDATE shipments SET status = 'queued' WHERE status = 'failed'",
+        2,
+    );
+    assert_eq!(statuses(&g), REQUEUED);
+    assert_eq!(sql_counts, RowCounts { scanned: 6, read: 3 });
+    // And Intent::One matches exactly the one visible row.
+    let h = writable("task-rows-native-matched-one");
+    native(&h, &one).unwrap();
+    assert_eq!(
+        statuses(&h),
+        ["queued", "failed", "queued", "failed", "failed", "done"]
+    );
 }

@@ -9,8 +9,13 @@
 //! secondary index on a scope column narrows the input.
 //!
 //! Wrapped here: the SELECT cursor (`Cursor::fetch`) and the buffered read
-//! (`v2_reduction::Source` in `execute_v2`). Searched UPDATE, the sink reads and
-//! native requests are R3-306.
+//! (`v2_reduction::Source` in `execute_v2`) (R3-305); the searched UPDATE's key
+//! selection (`MutationRows` in `SqlRows::mutation_keys`), the sink reads the
+//! mutation pages come from (`SqlRows` carries the scope), and native requests
+//! (`visit_native_page`, `visit_native_key`, `complete_table_engine`) (R3-306).
+//! An UPDATE of a row outside the scope therefore matches zero rows, on the
+//! SQL path and the native path alike; the protected commit's policy check
+//! (`decide`) stays as the backstop.
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use super::context::TaskContext;
 use super::error::{DenyRule, TaskError};
 use crate::relational::scan::{Direction, KeyRange, RowSource, SourceRow, SourceRows};
-use crate::relational::{Relational, RowPredicate, SqlError, TableDef, Value};
+use crate::relational::{Relational, RowPredicate, SqlError, SqlRow, TableDef, Value};
 use crate::storage::engine::txn::Transaction;
 use crate::storage::v2::V2Db;
 use crate::storage::CoreError;
@@ -82,6 +87,18 @@ impl Scope {
     pub(crate) fn table(&self) -> u64 {
         self.predicate.table()
     }
+
+    /// Counts one row pulled from the task table and keeps it only when the
+    /// predicate accepts it. A predicate that fails to evaluate hides the row
+    /// (fail closed).
+    pub(crate) fn keep(&self, row: &SqlRow, meter: &StatementMeter) -> bool {
+        meter.scanned();
+        let keep = self.predicate.accepts_row(row).unwrap_or(false);
+        if keep {
+            meter.read();
+        }
+        keep
+    }
 }
 
 /// Bound predicates by `(task, def_version, catalog version)`, on the v2
@@ -136,6 +153,29 @@ pub(crate) fn scope(
     image: &Relational,
     ctx: &TaskContext,
 ) -> Result<Scope, CoreError> {
+    scope_with(db, txn, ctx, |_| Ok(image))
+}
+
+/// [`scope`] for a caller without a statement image (native requests): the
+/// catalog image at `txn`'s snapshot is built only when the predicate is not
+/// cached.
+#[cfg_attr(not(feature = "engine-rocksdb"), allow(dead_code))]
+pub(crate) fn scope_at(
+    db: &V2Db,
+    txn: &mut Transaction,
+    ctx: &TaskContext,
+) -> Result<Scope, CoreError> {
+    scope_with(db, txn, ctx, |txn| {
+        db.catalog().snapshot(txn)?.image().map_err(CoreError::Sql)
+    })
+}
+
+fn scope_with<I: std::borrow::Borrow<Relational>>(
+    db: &V2Db,
+    txn: &mut Transaction,
+    ctx: &TaskContext,
+    image: impl FnOnce(&mut Transaction) -> Result<I, CoreError>,
+) -> Result<Scope, CoreError> {
     let view = db.catalog().committed_view(txn)?;
     let def = match view.tasks.get(&ctx.task.0) {
         Some(def) if !def.revoked => def.clone(),
@@ -151,6 +191,8 @@ pub(crate) fn scope(
     let predicate = db.row_predicates.get_or_bind(key, || {
         #[cfg(test)]
         BINDS.set(BINDS.get() + 1);
+        let image = image(txn)?;
+        let image = image.borrow();
         let table = image
             .tables
             .values()
@@ -196,15 +238,8 @@ impl<'a> Scoped<'a> {
         Err(SqlError::Unsupported)
     }
 
-    /// Counts one pulled row and keeps it only when the predicate accepts it.
-    /// A predicate that fails to evaluate hides the row (fail closed).
     fn keep(&self, row: &SourceRow<'_>) -> bool {
-        self.meter.scanned();
-        let keep = self.scope.predicate.accepts_row(&row.row).unwrap_or(false);
-        if keep {
-            self.meter.read();
-        }
-        keep
+        self.scope.keep(&row.row, self.meter)
     }
 
     fn filter<'s>(&'s self, rows: SourceRows<'s>) -> SourceRows<'s> {

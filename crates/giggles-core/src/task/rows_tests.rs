@@ -7,7 +7,7 @@ use crate::storage::roles::{NewRole, TablePrivilege};
 use crate::storage::{Admin, Engine, Limits, SqlSession};
 use crate::task::context::open_context;
 use crate::task::definition::{
-    DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText, TaskName, WallClockMs,
+    AllowedWrite, DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText, TaskName, WallClockMs,
 };
 
 const NOW: WallClockMs = WallClockMs(1_793_898_000_000);
@@ -36,7 +36,7 @@ fn admin() -> (std::path::PathBuf, Admin) {
             roles.set_task_only(name, true).unwrap();
         }
     }
-    roles.grant_table("shipments", "issuer", &[TablePrivilege::Select]).unwrap();
+    roles.grant_table("shipments", "issuer", &[TablePrivilege::Select, TablePrivilege::Update]).unwrap();
     let issuer = roles.get("issuer").unwrap().unwrap();
     admin
         .tasks()
@@ -52,11 +52,18 @@ fn admin() -> (std::path::PathBuf, Admin) {
                 readable: vec!["id".into(), "attempt_count".into()],
                 masked: Vec::new(),
                 untrusted_text: Vec::new(),
-                allowed_write: None,
-                mutation_caps: MutationCaps::default(),
+                // R3-304 applies the column rules to native writes, so the
+                // native UPDATE in `update_and_native_outcomes_count_only_scope_rows`
+                // needs a writable column.
+                allowed_write: Some(AllowedWrite {
+                    columns: ["attempt_count".to_string()].into_iter().collect(),
+                    old_row: PredicateText("attempt_count >= 0".into()),
+                    new_row: PredicateText("attempt_count >= 0".into()),
+                }),
+                mutation_caps: MutationCaps { distinct_rows: 25, transitions: 25 },
                 disclosure_caps: DisclosureCaps { rows_read: 10, rows_returned: 10, bytes_returned: 4096 },
                 limits: LoadLimits::default(),
-                approval_threshold: 0,
+                approval_threshold: 25,
                 expires: "2026-11-05 17:30:00+00".into(),
             },
             NOW,
@@ -168,6 +175,64 @@ fn changed_definition_is_refused() {
         "{error:?}"
     );
     drop(s);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// R3-306: the values behind the integration tests' probes. A task UPDATE,
+/// SQL or native, matches and affects only the visible rows (1 and 3).
+#[test]
+fn update_and_native_outcomes_count_only_scope_rows() {
+    use crate::operations::{Bindings, Compare, Expr, Intent, Request, ValueExpr};
+    let (path, admin) = admin();
+    let literal = |value: i64| ValueExpr::Literal(Value::Int(value));
+    // SQL, outside the protected commit: the statement result is scoped too.
+    let (result, tag) = agent(&admin)
+        .execute_unreleased("UPDATE shipments SET attempt_count = attempt_count + 1", &[], None)
+        .unwrap()
+        .into_parts();
+    assert!(tag.is_some());
+    assert_eq!(result.affected, 2);
+    let update = Request::Update {
+        table: "shipments".into(),
+        filter: Expr::Compare(
+            Box::new(Expr::Field("attempt_count".into())),
+            Compare::Ge,
+            Box::new(Expr::Value(literal(0))),
+        ),
+        guard: None,
+        values: vec![("attempt_count".into(), literal(9))],
+        intent: Intent::Many { cap: literal(10) },
+    };
+    let (outcome, tag) = agent(&admin)
+        .execute_native_unreleased(&update, &Bindings::new())
+        .unwrap()
+        .into_parts();
+    assert!(tag.is_some());
+    assert_eq!((outcome.matched, outcome.affected), (2, 2));
+    let read = Request::Read {
+        table: "shipments".into(),
+        filter: None,
+        order: Vec::new(),
+        limit: Some(literal(1024)),
+        projection: Vec::new(),
+    };
+    let (outcome, _) = agent(&admin)
+        .execute_native_unreleased(&read, &Bindings::new())
+        .unwrap()
+        .into_parts();
+    assert_eq!(ids(&outcome.rows), [Value::Int(1), Value::Int(3)]);
+    assert_eq!(outcome.matched, 2);
+    // Outside the task every row is there, and only 1 and 3 changed.
+    let all = admin
+        .sql_session()
+        .execute("SELECT id, attempt_count FROM shipments ORDER BY id", &[], None)
+        .unwrap()
+        .rows;
+    let counts: Vec<_> = all.iter().map(|row| row.values[1].clone()).collect();
+    assert_eq!(counts, [Value::Int(9), Value::Int(0), Value::Int(9), Value::Int(0)]);
+    let outcome = admin.sql_session().execute_native(&update, &Bindings::new()).unwrap();
+    assert_eq!(outcome.matched, 4);
     drop(admin);
     std::fs::remove_dir_all(path).unwrap();
 }

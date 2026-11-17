@@ -613,7 +613,12 @@ fn attempt(
         }
     };
     let run = ProtectedRun { txn, effects: Effects::default() };
+    // The statement runs bound to the executor's task, so it reads and
+    // matches only the task's visible rows (R3-306); the session's own
+    // binding, if any, is restored after.
+    let bound = session.task.replace(ctx.clone());
     let (run, result) = session.execute_protected_v2(db, run, statement, params, clock);
+    session.task = bound;
     let ProtectedRun { mut txn, effects } = run;
     result.map_err(engine)?;
     faults.at(ProtectedPoint::AfterStatement);

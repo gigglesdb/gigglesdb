@@ -1,6 +1,8 @@
 //! Complete, bounded materializations tied to one active transaction revision.
 use super::{CoreError, SqlSession};
 use crate::relational::{MAX_ROWS, Scan, SqlError, SqlRow, TableDef};
+use crate::task::rows::{Scope, StatementMeter};
+use crate::task::TaskError;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
@@ -32,6 +34,19 @@ thread_local! {
 /// it. It is public because integration tests in other crates assert it.
 pub fn native_input_rows() -> (u64, u64) {
     NATIVE_INPUT_ROWS.with(|n| n.get())
+}
+
+/// `visit` restricted to a task's visible rows (R3-306); every row offered is
+/// counted on `meter`. Without a scope it visits every row.
+fn scoped<'v, E>(
+    scope: Option<&'v Scope>,
+    meter: &'v StatementMeter,
+    visit: &'v mut impl FnMut(&SqlRow) -> Result<(), E>,
+) -> impl FnMut(&SqlRow) -> Result<(), E> + 'v {
+    move |row| match scope {
+        Some(scope) if !scope.keep(row, meter) => Ok(()),
+        _ => visit(row),
+    }
 }
 
 /// Reorders retained rows before the tail past a bound is released.
@@ -197,7 +212,28 @@ impl SqlSession {
         result
     }
 
+    /// The visible rows of a native request in a task session (GD-0061
+    /// R3-306), or `None` outside one. A task reads only its task table
+    /// (`OtherTable`), and tasks exist only on v2 (`Revoked` elsewhere).
+    fn native_task_scope(&mut self, table: &TableDef)
+        -> Result<Option<crate::task::rows::Scope>, CoreError> {
+        let Some(ctx) = self.task.clone() else { return Ok(None) };
+        #[cfg(feature = "engine-rocksdb")]
+        if let super::Backend::V2(db) = &self.admin.inner.backend {
+            let db = db.clone();
+            let txn = self.v2_transaction.as_mut().ok_or(CoreError::Sql(SqlError::Transaction))?;
+            let scope = crate::task::rows::scope_at(&db, txn, &ctx)?;
+            if scope.table() != table.id {
+                return Err(TaskError::Denied(crate::task::DenyRule::OtherTable).into());
+            }
+            return Ok(Some(scope));
+        }
+        let _ = (ctx, table);
+        Err(TaskError::Revoked.into())
+    }
+
     /// Visit the row with this full primary key, if any, in the statement snapshot.
+    /// In a task session a row outside the visible rows is not visited.
     fn visit_native_key<E>(
         &mut self, table: &TableDef, key: &[crate::relational::Value],
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>,
@@ -207,7 +243,12 @@ impl SqlSession {
         if let super::Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
             let snapshot = self.complete_snapshot(table).map_err(map)?;
-            self.visit_native_key_v2(&db, table, key, visit, map)?;
+            let scope = self.native_task_scope(table).map_err(map)?;
+            let meter = StatementMeter::default();
+            self.visit_native_key_v2(&db, table, key, &mut scoped(scope.as_ref(), &meter, visit), map)?;
+            if scope.is_some() {
+                crate::task::rows::record(meter.counts());
+            }
             if self.complete_snapshot(table).map_err(map)? != snapshot {
                 return Err(map(CoreError::Sql(SqlError::StaleSchema)));
             }
@@ -218,12 +259,17 @@ impl SqlSession {
     }
 
     /// Stream one statement snapshot without asserting full-table boundedness.
+    /// In a task session only visible rows are visited; every row pulled is
+    /// counted (R3-306).
     pub(crate) fn visit_native_page<E>(
         &mut self, table: &TableDef,
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>,
         map: fn(CoreError) -> E,
     ) -> Result<(), E> {
         let snapshot = self.complete_snapshot(table).map_err(map)?;
+        let scope = self.native_task_scope(table).map_err(map)?;
+        let meter = StatementMeter::default();
+        let visit = &mut scoped(scope.as_ref(), &meter, visit);
         #[cfg(feature = "engine-rocksdb")]
         if let super::Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
@@ -233,6 +279,9 @@ impl SqlSession {
         }
         #[cfg(not(feature = "engine-rocksdb"))]
         self.visit_native_page_legacy(table, visit, map)?;
+        if scope.is_some() {
+            crate::task::rows::record(meter.counts());
+        }
         if self.complete_snapshot(table).map_err(map)? != snapshot {
             return Err(map(CoreError::Sql(SqlError::StaleSchema)));
         }
@@ -306,6 +355,7 @@ impl SqlSession {
     ) -> Result<CompleteRelation, CoreError> {
         let result = (|| {
             let snapshot = self.complete_snapshot(table)?;
+            let scope = self.native_task_scope(table)?;
             let key = self.inspect_metadata(|s| Ok(s.sql.table_key(table)))?;
             let rows = self
                 .scan_engine(Scan {
@@ -347,6 +397,16 @@ impl SqlSession {
             if self.complete_snapshot(table)? != snapshot {
                 return Err(CoreError::Sql(SqlError::StaleSchema));
             }
+            // R3-306: a task session's complete input is its visible rows.
+            let rows = match &scope {
+                None => rows,
+                Some(scope) => {
+                    let meter = StatementMeter::default();
+                    let rows = rows.into_iter().filter(|row| scope.keep(row, &meter)).collect();
+                    crate::task::rows::record(meter.counts());
+                    rows
+                }
+            };
             Ok(CompleteRelation { snapshot, rows })
         })();
         if result.is_err() {

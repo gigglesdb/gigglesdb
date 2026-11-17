@@ -93,7 +93,7 @@ impl SqlSession {
             u128::from_be_bytes(db.meta.domain), &image).map_err(CoreError::Sql)?;
         let result = image.execute_with_sink(&prepared, &[], None, None,
             &mut SqlRows { db, txn, parts: &catalog.parts, writing: false,
-                conflict_floor: None, prepared: &prepared, params: &[], effects: None },
+                conflict_floor: None, prepared: &prepared, params: &[], effects: None, scope: None },
             u64::MAX, None)?;
         crate::cancellation::check()?;
         Ok(result)
@@ -708,6 +708,7 @@ impl SqlSession {
                                     prepared: &bound,
                                     params,
                                     effects: None,
+                                    scope: None,
                                 },
                                 floor..versions.start,
                                 input.finishing,
@@ -721,6 +722,10 @@ impl SqlSession {
                         // GD-0061 R3-305: a task statement's table read sees only the
                         // task's visible rows. It runs through the scoped row source;
                         // a read that does not use a row source is refused.
+                        // R3-306: a task DML statement (the protected commit binds
+                        // the executor's task for its run) reads its target through
+                        // the same scope, so rows outside it are never matched or
+                        // rewritten.
                         let scope = match &self.task {
                             Some(ctx) if !writing && !bound.read_tables().is_empty() => {
                                 if !bound.task_source_read() {
@@ -731,14 +736,17 @@ impl SqlSession {
                                 }
                                 Some(crate::task::rows::scope(db, txn, &image, ctx)?)
                             }
+                            Some(ctx) if writing && !ddl => {
+                                Some(crate::task::rows::scope(db, txn, &image, ctx)?)
+                            }
                             _ => None,
                         };
+                        let meter = crate::task::rows::StatementMeter::default();
                         if !writing && (scope.is_some() || image.streaming_reduction(&bound)) {
                             let source = reduction::Source::new(SqlRows {
                                 conflict_floor: None, db, txn, parts: old,
-                                writing, prepared: &bound, params, effects: None,
+                                writing, prepared: &bound, params, effects: None, scope: None,
                             });
-                            let meter = crate::task::rows::StatementMeter::default();
                             let scoped = scope.as_ref().map(|scope|
                                 crate::task::rows::Scoped::new(&source, scope, &meter));
                             let result = image.execute_reduction(
@@ -769,6 +777,7 @@ impl SqlSession {
                                 prepared: &bound,
                                 params,
                                 effects: protected_effects.as_deref_mut(),
+                                scope: scope.as_ref().map(|scope| (scope, &meter)),
                             },
                             versions.end,
                             if self.transaction_id.is_some() {
@@ -777,6 +786,9 @@ impl SqlSession {
                                 None
                             },
                         ) };
+                        if scope.is_some() {
+                            crate::task::rows::record(meter.counts());
+                        }
                         if let Some(error) = context.as_ref().and_then(|clock| clock.take_error()) {
                             return Err(error);
                         }
@@ -994,6 +1006,7 @@ pub(super) fn validate_pending(
             prepared: &p,
             params: &[],
             effects: None,
+            scope: None,
         },
         u64::MAX,
         Some(deferred),
@@ -1049,6 +1062,10 @@ struct SqlRows<'a> {
     /// Effects collector of a protected run (R3-609); `None` on every
     /// ordinary path.
     effects: Option<&'a mut crate::task::effects::Effects>,
+    /// The visible rows of a task statement and its meter (R3-306): the
+    /// mutation reads drop task-table rows outside them. `None` outside a
+    /// task session.
+    scope: Option<(&'a crate::task::rows::Scope, &'a crate::task::rows::StatementMeter)>,
 }
 
 fn charge_mutation_point(table: &TableDef, row: &SqlRow,
@@ -1057,6 +1074,22 @@ fn charge_mutation_point(table: &TableDef, row: &SqlRow,
     let key = relational::row_sink::row_key(table, row).map_err(CoreError::Sql)?;
     let bytes = relational::row_sink::retained_bytes(&key, row).map_err(CoreError::Sql)?;
     Ok(retention.charge(bytes).is_ok() && retention.used() <= 256 * 1024)
+}
+
+impl<'a> SqlRows<'a> {
+    /// The task scope when `table` is the task table (R3-306). Other tables
+    /// are FK and integrity reads, which see every row.
+    fn scope_of(&self, table: &TableDef)
+        -> Option<(&'a crate::task::rows::Scope, &'a crate::task::rows::StatementMeter)> {
+        self.scope.filter(|(scope, _)| scope.table() == table.id)
+    }
+    /// Drops the rows of a mutation page outside the task's visible rows, so
+    /// neither the statement's expressions nor its writes see them.
+    fn retain_scope(&self, table: &TableDef, rows: &mut DdlRows) {
+        if let Some((scope, meter)) = self.scope_of(table) {
+            rows.retain(|_, row| scope.keep(row, meter));
+        }
+    }
 }
 
 impl SqlRows<'_> {
@@ -1101,7 +1134,13 @@ impl RowSink for SqlRows<'_> {
             #[cfg(test)]
             target: state.tables[prepared.table().expect("mutation target")].id,
         };
-        let result = state.mutation_keys(prepared, params, clock, &source);
+        // R3-306: a task statement selects its keys from the visible rows only.
+        let scoped = self.scope.map(|(scope, meter)| crate::task::rows::Scoped::new(&source, scope, meter));
+        let result = state.mutation_keys(prepared, params, clock,
+            scoped.as_ref().map_or(&source as &dyn relational::scan::RowSource,
+                |scoped| scoped as &dyn relational::scan::RowSource));
+        if let Some(error) = scoped.as_ref().and_then(|scoped| scoped.take_error()) { return Err(error.into()); }
+        drop(scoped);
         if let Some(error) = source.error.into_inner() { return Err(error); }
         result.map_err(CoreError::Sql)
     }
@@ -1120,14 +1159,14 @@ impl RowSink for SqlRows<'_> {
         parent: bool, visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
         if self.statement_snapshot_is_latest() {
-            return self.lookup(table, columns, values, parent, visit);
+            return self.lookup_all(table, columns, values, parent, visit);
         }
         let ts = self.txn.snapshot_ts();
         if parent {
             // A parent the snapshot sees must not have changed since. One
             // inserted later stays invisible, and the child fails with 23503.
             let mut seen = Vec::new();
-            self.lookup(table, columns, values, true, &mut |row| {
+            self.lookup_all(table, columns, values, true, &mut |row| {
                 seen.push(row.values.clone());
                 visit(row)
             })?;
@@ -1138,7 +1177,7 @@ impl RowSink for SqlRows<'_> {
             }
             return Ok(());
         }
-        self.at_latest(|rows| rows.lookup(table, columns, values, false, visit))
+        self.at_latest(|rows| rows.lookup_all(table, columns, values, false, visit))
     }
     fn fk_child_page(
         &mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
@@ -1148,7 +1187,7 @@ impl RowSink for SqlRows<'_> {
     }
     fn fk_read_page(&mut self, table: &TableDef, after: Option<Vec<u8>>)
         -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
-        self.at_latest(|rows| rows.read_page(table, after))
+        self.at_latest(|rows| rows.read_page_all(table, after))
     }
 
     fn streams_index_builds(&self) -> bool {
@@ -1164,72 +1203,39 @@ impl RowSink for SqlRows<'_> {
             // The INSERT source is only read; protected write effects are
             // recorded by the insert pages that follow.
             effects: None,
+            scope: None,
         });
-        let result = read(&source);
+        // R3-306: a task statement's INSERT source reads only the task's
+        // visible rows (any other table is refused by the wrapper).
+        let scoped = self.scope.map(|(scope, meter)| crate::task::rows::Scoped::new(&source, scope, meter));
+        let result = read(scoped.as_ref().map_or(&source as &dyn relational::scan::RowSource,
+            |scoped| scoped as &dyn relational::scan::RowSource));
+        if let Some(error) = scoped.as_ref().and_then(|scoped| scoped.take_error()) { return Err(error.into()); }
+        drop(scoped);
         if let Some(error) = source.error.take() { return Err(error); }
         result.map_err(CoreError::Sql)
     }
+    /// One page of the mutation target; a task statement's page holds only
+    /// visible rows (R3-306). The resume key is the physical last key, so an
+    /// emptied page still advances.
     fn read_page(
         &mut self,
         table: &TableDef,
         after: Option<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
-        crate::cancellation::check()?;
-        let entry = TableEntry {
-            primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
-            def: table.clone(),
-            heap: self.parts.heap.contains(&table.id),
-            columns_ext: BTreeMap::new(),
-        };
-        let rows = self
-            .db
-            .rows
-            .scan(
-                self.txn,
-                &entry,
-                after.map_or(Bound::Unbounded, Bound::Excluded),
-                Bound::Unbounded,
-                engine::kv::Direction::Forward,
-                Some(200),
-            )?
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let Some(last) = rows.last_key_value().map(|(key, _)| key.clone()) else {
-            return Ok(None);
-        };
-        let rows = rows
-            .into_values()
-            .map(|row| {
-                let row = SqlRow {
-                    values: row.values,
-                    version: row.version,
-                };
-                relational::row_sink::row_key(table, &row).map(|key| (key, row))
-            })
-            .collect::<Result<_, _>>()
-            .map_err(CoreError::Sql)?;
-        Ok(Some((last, rows)))
+        let page = self.read_page_all(table, after)?;
+        Ok(page.map(|(last, mut rows)| {
+            self.retain_scope(table, &mut rows);
+            (last, rows)
+        }))
     }
     fn mutation_candidates(&mut self, table: &TableDef, keys: &[Vec<relational::Value>])
         -> Result<Option<DdlRows>, CoreError> {
-        #[cfg(test)]
-        if DISABLE_MUTATION_POINTS.get() { return Ok(None); }
-        let entry = TableEntry { primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(), def: table.clone(), heap: self.parts.heap.contains(&table.id),
-            columns_ext: BTreeMap::new() };
-        let mut rows = DdlRows::new();
-        let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
-        for key in keys {
-            crate::cancellation::check()?;
-            #[cfg(test)]
-            MUTATION_POINT_READS.set(MUTATION_POINT_READS.get() + 1);
-            if let Some(row) = self.db.rows.get(self.txn, &entry, key)? {
-                #[cfg(test)]
-                MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + 1);
-                let row = SqlRow { values: row.values, version: row.version };
-                if !charge_mutation_point(table, &row, &mut retention)? { return Ok(None); }
-                rows.insert(relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?, row);
-            }
+        let mut rows = self.mutation_candidates_all(table, keys)?;
+        if let Some(rows) = rows.as_mut() {
+            self.retain_scope(table, rows);
         }
-        Ok(Some(rows))
+        Ok(rows)
     }
     fn mutation_pages(
         &mut self,
@@ -1252,6 +1258,10 @@ impl RowSink for SqlRows<'_> {
                 #[cfg(test)]
                 MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + 1);
                 let row = SqlRow { values: row.values, version: row.version };
+                // R3-306: a key outside the task's visible rows matches nothing.
+                if self.scope_of(table).is_some_and(|(scope, meter)| !scope.keep(&row, meter)) {
+                    continue;
+                }
                 let key = relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?;
                 // Sparse targets can aggregate wider rows than any old page.
                 // Leave room for the eight UNIQUE sidecars and their work meters;
@@ -1313,7 +1323,7 @@ impl RowSink for SqlRows<'_> {
                 break;
             };
             lower = Bound::Excluded(last);
-            let rows = rows
+            let mut rows = rows
                 .into_values()
                 .map(|row| relational::row_sink::row_key(table, &row).map(|key| (key, row)))
                 .collect::<Result<BTreeMap<_, _>, _>>()
@@ -1322,6 +1332,13 @@ impl RowSink for SqlRows<'_> {
             {
                 MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + rows.len());
                 if let Some(hook) = AFTER_MUTATION_PAGE.with_borrow_mut(Option::take) { hook(); }
+            }
+            // R3-306: a task statement's mutation page holds only visible rows.
+            if mutating && self.scope_of(table).is_some() {
+                self.retain_scope(table, &mut rows);
+                if rows.is_empty() {
+                    continue;
+                }
             }
             let rewritten = page(rows.clone())?;
             if mutating {
@@ -1411,6 +1428,9 @@ impl RowSink for SqlRows<'_> {
         }
         Ok(())
     }
+    /// The general DML path's target lookup: in a task statement, rows of the
+    /// task table outside the visible rows are dropped (R3-306). FK witness
+    /// and conflict lookups use the unscoped `lookup_all`.
     fn lookup(
         &mut self,
         table: &TableDef,
@@ -1419,88 +1439,13 @@ impl RowSink for SqlRows<'_> {
         unique: bool,
         visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
-        let entry = TableEntry {
-            primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
-            def: table.clone(),
-            heap: self.parts.heap.contains(&table.id),
-            columns_ext: BTreeMap::new(),
-        };
-        let Some(values) = values else {
-            return self.scan_all(&entry, visit);
-        };
-        if !unique {
-            let mut after = None;
-            while let Some((last, rows)) = self.child_page(table, columns, values, after)? {
-                after = Some(last);
-                for row in rows.into_values() {
-                    visit(row).map_err(CoreError::Sql)?;
-                }
+        let scope = self.scope_of(table);
+        self.lookup_all(table, columns, values, unique, &mut |row| {
+            if scope.is_some_and(|(scope, meter)| !scope.keep(&row, meter)) {
+                return Ok(());
             }
-            return Ok(());
-        }
-        let primary = table
-            .primary_key
-            .iter()
-            .map(|i| table.columns[*i].id)
-            .collect::<Vec<_>>();
-        let order = |ids: &[u64]| {
-            ids.iter()
-                .map(|id| columns.iter().position(|c| c == id))
-                .collect::<Option<Vec<_>>>()
-        };
-        let rows = if primary.len() == columns.len()
-            && let Some(order) = order(&primary)
-        {
-            self.db
-                .rows
-                .get(
-                    self.txn,
-                    &entry,
-                    &order.iter().map(|i| values[*i].clone()).collect::<Vec<_>>(),
-                )?
-                .into_iter()
-                .collect::<Vec<_>>()
-        } else if let Some((d, order)) = self
-            .parts
-            .indexes
-            .iter()
-            .filter(|d| {
-                d.table == table.id
-                    && d.columns.len() >= columns.len()
-                    && (!unique || d.unique && d.columns.len() == columns.len())
-            })
-            .find_map(|d| order(&d.columns[..columns.len()]).map(|order| (d, order)))
-        {
-            let values = order.iter().map(|i| values[*i].clone()).collect::<Vec<_>>();
-            let tuple =
-                codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])?;
-            return engine::indexes::visit(
-                self.txn,
-                &entry,
-                d,
-                Bound::Included(tuple.clone()),
-                Bound::Included(tuple),
-                &mut |_, row| {
-                    visit(SqlRow {
-                        values: row.values,
-                        version: row.version,
-                    })
-                    .map_err(CoreError::Sql)
-                },
-            );
-        } else if unique {
-            return Err(CoreError::Sql(SqlError::InvalidForeignKey));
-        } else {
-            return self.scan_all(&entry, visit);
-        };
-        for row in rows {
-            visit(SqlRow {
-                values: row.values,
-                version: row.version,
-            })
-            .map_err(CoreError::Sql)?;
-        }
-        Ok(())
+            visit(row)
+        })
     }
     fn child_page(&mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
         after: Option<Vec<u8>>) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
@@ -1568,7 +1513,7 @@ impl RowSink for SqlRows<'_> {
         visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
         let floor = self.conflict_floor;
-        self.lookup(table, columns, Some(values), true, &mut |row| {
+        self.lookup_all(table, columns, Some(values), true, &mut |row| {
             if floor.is_some_and(|v| row.version >= v) { return Err(SqlError::CardinalityViolation); }
             visit(row)
         })
@@ -1612,6 +1557,15 @@ impl RowSink for SqlRows<'_> {
         table: &TableDef,
         visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
+        // R3-306: the general DML path loads a task statement's target
+        // through here; rows outside the visible rows are not loaded.
+        let scope = self.scope_of(table);
+        let visit = &mut |row: SqlRow| {
+            if scope.is_some_and(|(scope, meter)| !scope.keep(&row, meter)) {
+                return Ok(());
+            }
+            visit(row)
+        };
         let entry = TableEntry {
             primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
             def: table.clone(),
@@ -1902,6 +1856,159 @@ impl relational::scan::RowSource for MutationRows<'_> {
 }
 
 impl SqlRows<'_> {
+    fn read_page_all(
+        &mut self,
+        table: &TableDef,
+        after: Option<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        crate::cancellation::check()?;
+        let entry = TableEntry {
+            primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
+            def: table.clone(),
+            heap: self.parts.heap.contains(&table.id),
+            columns_ext: BTreeMap::new(),
+        };
+        let rows = self
+            .db
+            .rows
+            .scan(
+                self.txn,
+                &entry,
+                after.map_or(Bound::Unbounded, Bound::Excluded),
+                Bound::Unbounded,
+                engine::kv::Direction::Forward,
+                Some(200),
+            )?
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let Some(last) = rows.last_key_value().map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        let rows = rows
+            .into_values()
+            .map(|row| {
+                let row = SqlRow {
+                    values: row.values,
+                    version: row.version,
+                };
+                relational::row_sink::row_key(table, &row).map(|key| (key, row))
+            })
+            .collect::<Result<_, _>>()
+            .map_err(CoreError::Sql)?;
+        Ok(Some((last, rows)))
+    }
+    fn mutation_candidates_all(&mut self, table: &TableDef, keys: &[Vec<relational::Value>])
+        -> Result<Option<DdlRows>, CoreError> {
+        #[cfg(test)]
+        if DISABLE_MUTATION_POINTS.get() { return Ok(None); }
+        let entry = TableEntry { primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(), def: table.clone(), heap: self.parts.heap.contains(&table.id),
+            columns_ext: BTreeMap::new() };
+        let mut rows = DdlRows::new();
+        let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
+        for key in keys {
+            crate::cancellation::check()?;
+            #[cfg(test)]
+            MUTATION_POINT_READS.set(MUTATION_POINT_READS.get() + 1);
+            if let Some(row) = self.db.rows.get(self.txn, &entry, key)? {
+                #[cfg(test)]
+                MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + 1);
+                let row = SqlRow { values: row.values, version: row.version };
+                if !charge_mutation_point(table, &row, &mut retention)? { return Ok(None); }
+                rows.insert(relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?, row);
+            }
+        }
+        Ok(Some(rows))
+    }
+    fn lookup_all(
+        &mut self,
+        table: &TableDef,
+        columns: &[u64],
+        values: Option<&[relational::Value]>,
+        unique: bool,
+        visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
+    ) -> Result<(), CoreError> {
+        let entry = TableEntry {
+            primary_index_birth: self.parts.ext.primary_index_birth.get(&table.id).copied(),
+            def: table.clone(),
+            heap: self.parts.heap.contains(&table.id),
+            columns_ext: BTreeMap::new(),
+        };
+        let Some(values) = values else {
+            return self.scan_all(&entry, visit);
+        };
+        if !unique {
+            let mut after = None;
+            while let Some((last, rows)) = self.child_page(table, columns, values, after)? {
+                after = Some(last);
+                for row in rows.into_values() {
+                    visit(row).map_err(CoreError::Sql)?;
+                }
+            }
+            return Ok(());
+        }
+        let primary = table
+            .primary_key
+            .iter()
+            .map(|i| table.columns[*i].id)
+            .collect::<Vec<_>>();
+        let order = |ids: &[u64]| {
+            ids.iter()
+                .map(|id| columns.iter().position(|c| c == id))
+                .collect::<Option<Vec<_>>>()
+        };
+        let rows = if primary.len() == columns.len()
+            && let Some(order) = order(&primary)
+        {
+            self.db
+                .rows
+                .get(
+                    self.txn,
+                    &entry,
+                    &order.iter().map(|i| values[*i].clone()).collect::<Vec<_>>(),
+                )?
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else if let Some((d, order)) = self
+            .parts
+            .indexes
+            .iter()
+            .filter(|d| {
+                d.table == table.id
+                    && d.columns.len() >= columns.len()
+                    && (!unique || d.unique && d.columns.len() == columns.len())
+            })
+            .find_map(|d| order(&d.columns[..columns.len()]).map(|order| (d, order)))
+        {
+            let values = order.iter().map(|i| values[*i].clone()).collect::<Vec<_>>();
+            let tuple =
+                codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])?;
+            return engine::indexes::visit(
+                self.txn,
+                &entry,
+                d,
+                Bound::Included(tuple.clone()),
+                Bound::Included(tuple),
+                &mut |_, row| {
+                    visit(SqlRow {
+                        values: row.values,
+                        version: row.version,
+                    })
+                    .map_err(CoreError::Sql)
+                },
+            );
+        } else if unique {
+            return Err(CoreError::Sql(SqlError::InvalidForeignKey));
+        } else {
+            return self.scan_all(&entry, visit);
+        };
+        for row in rows {
+            visit(SqlRow {
+                values: row.values,
+                version: row.version,
+            })
+            .map_err(CoreError::Sql)?;
+        }
+        Ok(())
+    }
     fn scan_index(&self, table: &TableDef) -> Option<IndexRange> {
         self.scan_index_predicates(table, &self.prepared.v2_index_predicates(self.params))
     }
