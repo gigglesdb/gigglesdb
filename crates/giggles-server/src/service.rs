@@ -1120,7 +1120,13 @@ impl Session {
             crate::auth::statements::AdminStatement::DropTable(..) => {
                 giggles_core::task::StatementClass::Ddl
             }
-            _ => giggles_core::task::StatementClass::RoleStatement,
+            crate::auth::statements::AdminStatement::Error(_)
+            | crate::auth::statements::AdminStatement::Create(..)
+            | crate::auth::statements::AdminStatement::Alter(..)
+            | crate::auth::statements::AdminStatement::Drop(..)
+            | crate::auth::statements::AdminStatement::Grant { .. } => {
+                giggles_core::task::StatementClass::RoleStatement
+            }
         };
         self.admit_backstop(class).map_err(|error| sqlstate(&error))?;
         let Role::Database { name } = &self.role else {
@@ -1409,6 +1415,7 @@ impl Session {
         ),
         CoreError,
     > {
+        self.admit_backstop(giggles_core::task::StatementClass::Catalog)?;
         self.authority_scope(|session| {
             let (epoch, tables, indexes) = session.catalog_snapshot()?;
             let metadata = session.sql.catalog_metadata()?;
@@ -2718,6 +2725,27 @@ impl Session {
         received: std::time::Instant,
         context: &Cancellation,
     ) -> Response {
+        // GD-0061 R3-210 backstop (design-2 section 4, call site 5): on a task
+        // session the framed surface admits only `Ping`. A `Sql` request goes
+        // on to `authorize`, which admits its statement's own class (R3-208);
+        // every other request is `Other`, refused before it is unwrapped.
+        if self.sql.task().is_some() {
+            let class = match &request {
+                Request::Ping => Some(giggles_core::task::StatementClass::Show),
+                Request::Sql { .. } => None,
+                Request::Deadline { .. }
+                | Request::Preview { .. }
+                | Request::Execute { .. }
+                | Request::RepairSql { .. }
+                | Request::Status { .. } => Some(giggles_core::task::StatementClass::Other),
+            };
+            if let Some(class) = class
+                && let Err(error) = self.admit_backstop(class)
+            {
+                self.abort();
+                return Response::error(&error);
+            }
+        }
         let (request, budget) = match request {
             Request::Deadline { budget_ms, request } => {
                 if budget_ms > 10_000 || matches!(*request, Request::Deadline { .. }) {

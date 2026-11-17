@@ -259,6 +259,9 @@ mod agent_api_connect;
 #[path = "agent_api_profile.rs"]
 mod agent_api_profile;
 
+#[path = "agent_backstops.rs"]
+mod agent_backstops;
+
 #[path = "agent_limits.rs"]
 mod agent_limits;
 
