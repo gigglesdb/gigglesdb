@@ -17,8 +17,8 @@ use crate::task::definition::{
 use crate::task::ledger::{self, OperationId};
 use crate::task::receipt::{self, Receipt};
 use crate::task::records::{
-    change_header_key, debit_key, outcome_key, read_log_key, receipt_key, NS_AUTHORITY,
-    NS_MAX, NS_MEMBERSHIP, NS_MIN, NS_RECEIPT, OUTCOME_PAYLOAD_BLANKED,
+    change_header_key, debit_key, outcome_key, read_log_key, receipt_key, LEDGER_HEADER_KEY,
+    NS_AUTHORITY, NS_MAX, NS_MEMBERSHIP, NS_MIN, NS_RECEIPT, OUTCOME_PAYLOAD_BLANKED,
 };
 use crate::{Admin, Engine, Limits};
 use std::path::PathBuf;
@@ -385,19 +385,81 @@ fn outcome_deleted_after_expiry_plus_30_days() {
     assert!(kernel(&db, &receipt_key(task, 1)).is_some());
 }
 
+/// A native `once` insert into `shipments`, published through the real
+/// once engine as a kind-1 `22` record with a GDOU receipt (R3-625).
+fn once_insert(
+    engine: &crate::operations::Engine,
+    domain: u128,
+    key: &str,
+    id: i64,
+    retention_seconds: u64,
+) {
+    use crate::operations::once::{
+        OnceBody, OnceIdentity, OnceRequest, OnceTime, ONCE_CONTRACT_VERSION,
+    };
+    use crate::operations::{Bindings, Request, ValueExpr};
+    use crate::relational::Value;
+    let request = OnceRequest {
+        contract_version: ONCE_CONTRACT_VERSION,
+        identity: OnceIdentity {
+            database_domain: domain,
+            tenant: 42,
+            namespace: "ops".into(),
+            key: key.as_bytes().to_vec(),
+        },
+        retention_seconds,
+        body: OnceBody::Operation(Request::Insert {
+            table: "shipments".into(),
+            values: vec![
+                ("id".into(), ValueExpr::Literal(Value::Int(id))),
+                ("merchant_id".into(), ValueExpr::Literal(Value::Int(9))),
+                ("status".into(), ValueExpr::Literal(Value::Text("delivered".into()))),
+                ("attempt_count".into(), ValueExpr::Literal(Value::Int(0))),
+            ],
+        }),
+    };
+    let clock = || {
+        Ok(OnceTime {
+            lower_unix_seconds: 100,
+            upper_unix_seconds: 110,
+            valid_until: std::time::Instant::now() + Duration::from_secs(10),
+        })
+    };
+    assert!(!engine.execute_once(&request, &Bindings::new(), &clock).unwrap().replayed);
+}
+
 #[test]
 fn once_records_untouched() {
     let f = fixture();
     f.commit("requeue-1");
     let db = f.db();
-    let domain = db.meta.domain;
-    let once = outcome(b"\x01tenant\x00ns\x00key", 0, OutcomePayload::Once(b"GDOU".to_vec()));
-    let blanked = outcome(b"\x01tenant\x00ns\x00old", 0, OutcomePayload::Once(Vec::new()));
-    let once_records: Vec<_> = [&once, &blanked]
-        .iter()
-        .map(|record| (outcome_key(domain, &record.identity), record.encode()))
+    let domain = u128::from_be_bytes(db.meta.domain);
+    // Two native once outcomes in the shared `22` ledger: one live GDOU
+    // receipt, and one whose payload compaction has blanked.
+    let engine = crate::operations::Engine::new(f.admin.clone());
+    once_insert(&engine, domain, "live", 100, 600);
+    once_insert(&engine, domain, "old", 101, 1);
+    let compact_clock = || {
+        Ok(crate::operations::once::OnceTime {
+            lower_unix_seconds: 200,
+            upper_unix_seconds: 210,
+            valid_until: std::time::Instant::now() + Duration::from_secs(10),
+        })
+    };
+    assert_eq!(engine.compact_outcomes(&compact_clock), Ok(1));
+    let mut once_records: Vec<_> = namespace(&db, NS_OUTCOME)
+        .into_iter()
+        .filter(|(_, value)| OutcomeRecord::decode(value).unwrap().payload.kind() == 1)
         .collect();
-    put(&db, once_records.clone());
+    once_records.sort();
+    let decoded: Vec<_> =
+        once_records.iter().map(|(_, value)| OutcomeRecord::decode(value).unwrap()).collect();
+    assert_eq!(decoded.len(), 2);
+    assert!(decoded.iter().any(|record| record.flags == 0
+        && matches!(&record.payload, OutcomePayload::Once(bytes) if bytes.starts_with(b"GDOU"))));
+    assert!(decoded.iter().any(|record| record.flags == OUTCOME_PAYLOAD_BLANKED
+        && record.payload == OutcomePayload::Once(Vec::new())));
+    let ledger_header = kernel(&db, &LEDGER_HEADER_KEY).unwrap();
     f.revoke();
     let kept = |db: &V2Db| {
         [NS_AUTHORITY, NS_MEMBERSHIP, NS_RECEIPT]
@@ -413,9 +475,8 @@ fn once_records_untouched() {
     assert_eq!(kept(&db), before);
     let mut outcomes = namespace(&db, NS_OUTCOME);
     outcomes.sort();
-    let mut expected = once_records;
-    expected.sort();
-    assert_eq!(outcomes, expected);
+    assert_eq!(outcomes, once_records);
+    assert_eq!(kernel(&db, &LEDGER_HEADER_KEY).unwrap(), ledger_header);
     // The change header stays; only its before-values went.
     assert_eq!(namespace(&db, NS_CHANGE_HEADER).len(), 1);
 }
