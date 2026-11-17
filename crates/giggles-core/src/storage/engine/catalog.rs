@@ -373,6 +373,7 @@ impl CatalogCache {
 pub(crate) struct Catalog {
     cache: Mutex<CatalogCache>,
     current: RwLock<Option<(Ts, Arc<CatalogSnapshot>)>>,
+    current_version: std::sync::atomic::AtomicU64,
     services: TxnServices,
     seq: Arc<SequenceAllocator>,
 }
@@ -406,6 +407,7 @@ impl Catalog {
         Ok(Self {
             cache: Mutex::new(cache),
             current: RwLock::new(None),
+            current_version: std::sync::atomic::AtomicU64::new(visible.0),
             services,
             seq,
         })
@@ -423,6 +425,17 @@ impl Catalog {
             .map_err(|_| TxnError::Misuse)?
             .ensure_live()?;
         Ok(())
+    }
+
+    /// A local committed generation, or None during publication or before warming.
+    /// Invalidation precedes sequencer submission, just like `current`.
+    pub(crate) fn current_version(&self) -> Option<u64> {
+        let TxnServices::Local { seq, .. } = &self.services else { return None; };
+        // Acquire visibility before reading the generation, as `current_at` does.
+        // Observing a committed DDL then also observes its earlier invalidation.
+        let visible = seq.visible_ts();
+        let version = self.current_version.load(std::sync::atomic::Ordering::Acquire);
+        (version != 0 && version <= visible.0).then_some(version)
     }
 
     fn current_for(&self, txn: &Transaction, ts: Ts) -> Option<(Ts, Arc<CatalogSnapshot>)> {
@@ -649,6 +662,7 @@ impl Catalog {
         {
             *self.current.write().map_err(|_| corrupt("catalog current lock poisoned"))? =
                 Some((version, snapshot.clone()));
+            self.current_version.store(version.0, std::sync::atomic::Ordering::Release);
         }
         Ok(snapshot)
     }
@@ -695,9 +709,13 @@ impl Catalog {
         let kv = self.services.read_view(ts);
         let view = load_view_until(&*kv, ts, catalog_end(&self.services))?;
         if matches!(self.services, TxnServices::Local { .. }) {
+            self.current_version.store(0, std::sync::atomic::Ordering::Release);
             *self.current.write().map_err(|_| corrupt("catalog current lock poisoned"))? = None;
         }
         cache.publish(ts, view);
+        if matches!(self.services, TxnServices::Local { .. }) && !cache.poisoned {
+            self.current_version.store(ts.0, std::sync::atomic::Ordering::Release);
+        }
         if matches!(self.services, TxnServices::Cluster(_)) && !cache.poisoned {
             cache.tokens.insert(ts, (generation_token(&*kv, ts)?, ts));
         }
@@ -1185,6 +1203,7 @@ impl Catalog {
         // current RwLock read. New snapshots cannot return the old catalog;
         // they wait on this mutex until commit and publication are complete.
         if matches!(self.services, TxnServices::Local { .. }) {
+            self.current_version.store(0, std::sync::atomic::Ordering::Release);
             *self.current.write().map_err(|_| TxnError::Misuse)? = None;
         }
         finish(txn, guard, |ts| {
@@ -1203,6 +1222,9 @@ impl Catalog {
                 }
             };
             cache.publish(ts, view);
+            if matches!(self.services, TxnServices::Local { .. }) {
+                self.current_version.store(ts.0, std::sync::atomic::Ordering::Release);
+            }
             if let Some(token) = token {
                 cache.tokens.insert(ts, (token, ts));
             }

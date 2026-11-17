@@ -442,3 +442,10 @@ fn non_task_catalog_unchanged() {
             .map(|r| r.map(String::from).to_vec())
     );
 }
+
+#[test]
+fn task_sessions_exclude_unnamed_plan_cache() {
+    let (_, agent, _) = fixture();
+    assert!(agent.task().is_some());
+    assert_eq!(agent.sql.committed_catalog_version(), None);
+}

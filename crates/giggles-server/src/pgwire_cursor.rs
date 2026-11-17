@@ -206,7 +206,7 @@ impl Cursors {
         };
         match command {
             Command::Declare { sql, prepared, .. } => {
-                let (plan, desc) = prepare_declared_sql(session, sql, oids)?;
+                let (plan, desc) = prepare_declared_sql(session, sql, oids, false)?;
                 let Plan::Sql(p) = plan else { unreachable!() };
                 if p.command() != "SELECT" {
                     return Err("42601");

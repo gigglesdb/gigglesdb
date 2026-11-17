@@ -884,12 +884,12 @@ fn core_declared_type(oid: u32) -> Option<DataType> {
     }
 }
 
-fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32]) -> R<(Plan, Description)> {
+fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32], unnamed: bool) -> R<(Plan, Description)> {
     let declared = oids
         .iter()
         .map(|&o| core_declared_type(o))
         .collect::<Vec<_>>();
-    let prepared = core(session.prepare_with_parameter_types(sql, &declared))?;
+    let prepared = core(if unnamed { session.prepare_unnamed(sql, &declared) } else { session.prepare_with_parameter_types(sql, &declared) })?;
     let description = core(session.describe(&prepared))?;
     if oids.len() > description.parameters.len() {
         return Err("08P01");
@@ -949,6 +949,7 @@ enum Plan {
 }
 #[derive(Clone)]
 struct Statement {
+    description_version: Option<u64>,
     sql_bytes: usize,
     sql: String,
     declared_oids: Vec<u32>,
@@ -970,7 +971,13 @@ impl Statement {
                 }
                 Ok(self.d.clone())
             }
-            Plan::Sql(p) => core(session.describe(p)),
+            Plan::Sql(p) => {
+                if self.description_version.is_some()
+                    && self.description_version == session.sql.committed_catalog_version()
+                    && session.sql.prepared_is_current(p)
+                { return Ok(self.d.clone()); }
+                core(session.describe(p))
+            },
             Plan::Copy(copy, p) => {
                 core(session.copy_columns(copy, p))?;
                 Ok(self.d.clone())
@@ -1267,7 +1274,9 @@ impl State {
         sql: &str,
         oids: Vec<u32>,
         session: &mut Session,
+        unnamed: bool,
     ) -> R<Statement> {
+        let before_version = session.sql.committed_catalog_version();
         // GD-0061 R3-206: a task session admits the class before any catalog
         // or sequence read, on its own path.
         if session.task().is_some() {
@@ -1284,6 +1293,7 @@ impl State {
             }
             let d = crate::agent::preview::approver_description(&change);
             return Ok(Statement {
+                description_version: None,
                 sql_bytes: sql.len(),
                 sql: sql.to_owned(),
                 declared_oids: oids,
@@ -1305,6 +1315,7 @@ impl State {
             }
             let d = crate::task_ddl::description(&stmt);
             return Ok(Statement {
+                description_version: None,
                 sql_bytes: sql.len(),
                 sql: sql.to_owned(),
                 declared_oids: oids,
@@ -1440,7 +1451,7 @@ impl State {
             (Plan::Catalog(Box::new(plan), fields, epoch), d)
         } else {
             self.diagnostic.phase = "application prepare";
-            prepare_declared_sql(session, sql, &oids)?
+            prepare_declared_sql(session, sql, &oids, unnamed)?
         };
         if oids.len() > d.parameters.len() {
             return Err("08P01");
@@ -1468,7 +1479,7 @@ impl State {
                 })
             {
                 let was_aborted = session.is_aborted();
-                match prepare_declared_sql(session, sql, &oids) {
+                match prepare_declared_sql(session, sql, &oids, unnamed) {
                     Ok((application, description))
                         if oids.len() <= description.parameters.len()
                             && oids
@@ -1520,7 +1531,13 @@ impl State {
                 parameter_oids[i] = o;
             }
         }
+        let description_version = before_version.filter(|version| {
+            unnamed && matches!(&p, Plan::Sql(plan) if !plan.is_ddl())
+                && matches!(&session.role, Role::Database { .. })
+                && session.sql.committed_catalog_version() == Some(*version)
+        });
         Ok(Statement {
+            description_version,
             sql_bytes: sql.len(),
             sql: sql.to_owned(),
             declared_oids: oids,
@@ -1544,7 +1561,7 @@ impl State {
         if !stale {
             return Ok(());
         }
-        let new = self.prepare_statement(&old.sql, old.declared_oids.clone(), session)?;
+        let new = self.prepare_statement(&old.sql, old.declared_oids.clone(), session, false)?;
         if old.parameter_oids != new.parameter_oids
             || old.d.columns != new.d.columns
             || old.d.type_oids != new.d.type_oids
@@ -1660,7 +1677,7 @@ impl State {
                 {
                     return Err("54000");
                 }
-                let statement = self.prepare_statement(&sql, oids, session)?;
+                let statement = self.prepare_statement(&sql, oids, session, name.is_empty())?;
                 if !name.is_empty() {
                     self.named_statement_bytes += sql.len();
                 }

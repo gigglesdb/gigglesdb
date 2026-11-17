@@ -2074,6 +2074,7 @@ pub struct SqlSession {
     extra_float_digits: i32,
     search_path: Vec<String>,
     schema_user: String,
+    unnamed_plans: Vec<(UnnamedPlanKey, relational::Prepared)>,
     authority_managed: bool,
     ddl_owner: Option<String>,
     staged_revision: u64,
@@ -2095,6 +2096,15 @@ mod complete_relation;
 pub(crate) use complete_relation::CompleteRelation;
 pub use complete_relation::native_input_rows;
 
+#[derive(PartialEq)]
+struct UnnamedPlanKey {
+    sql: String,
+    declared_types: Vec<Option<relational::DataType>>,
+    catalog_version: u64,
+    search_path: Vec<String>,
+    schema_user: String,
+}
+
 impl Admin {
     pub fn sql_session(&self) -> SqlSession {
         SqlSession {
@@ -2112,6 +2122,7 @@ impl Admin {
             extra_float_digits: 1,
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
+            unnamed_plans: Vec::new(),
             authority_managed: false,
             ddl_owner: None,
             staged_revision: 0,
@@ -3415,6 +3426,48 @@ impl SqlSession {
     /// Whether a prepared statement belongs to the current transaction lifetime.
     pub fn prepared_is_current(&self, p: &relational::Prepared) -> bool {
         p.transaction.is_none() || p.transaction == self.transaction_id
+    }
+
+    /// Lock-free local catalog generation. Transactions and cluster gateways
+    /// deliberately use the normal snapshot path instead.
+    pub fn committed_catalog_version(&self) -> Option<u64> {
+        if self.in_transaction() || self.aborted || self.task.is_some() { return None; }
+        match &self.admin.inner.backend {
+            Backend::V2(db) if db.cluster_services().is_none() => db.catalog().current_version(),
+            _ => None,
+        }
+    }
+
+    /// Reuse only SELECT preparation in an unnamed, ordinary SQL session.
+    /// Authorization belongs to the caller and must run on every invocation.
+    pub fn prepare_unnamed(
+        &mut self, sql: &str, declared_types: &[Option<relational::DataType>],
+    ) -> Result<relational::Prepared, CoreError> {
+        relational::assert_sql_frontend_allowed();
+        let key = self.committed_catalog_version().filter(|_| {
+            sql.trim_start().get(..7).is_some_and(|head| head.eq_ignore_ascii_case("SELECT "))
+        }).map(|catalog_version| UnnamedPlanKey {
+            sql: sql.into(), declared_types: declared_types.into(), catalog_version,
+            search_path: self.search_path.clone(), schema_user: self.schema_user.clone(),
+        });
+        if let Some(key) = &key
+            && let Some(index) = self.unnamed_plans.iter().position(|(saved, _)| saved == key)
+        {
+            relational::take_sql_warnings();
+            let entry = self.unnamed_plans.remove(index);
+            let p = entry.1.clone();
+            self.unnamed_plans.push(entry);
+            return Ok(p);
+        }
+        let p = self.prepare(sql)?;
+        if let Some(key) = key
+            && self.committed_catalog_version() == Some(key.catalog_version)
+            && !p.is_ddl()
+        {
+            if self.unnamed_plans.len() == 64 { self.unnamed_plans.remove(0); }
+            self.unnamed_plans.push((key, p.clone()));
+        }
+        Ok(p)
     }
 
     /// Parses and binds a statement. In a task session the task's column

@@ -230,6 +230,7 @@ impl State {
             parameter_oids[i] = o;
         }
         Ok(Statement {
+            description_version: None,
             sql_bytes: sql.len(),
             sql: sql.to_owned(),
             declared_oids: oids,
@@ -419,7 +420,7 @@ impl State {
                 .core(Err(CoreError::Task(TaskError::OperationIdRequired)));
         }
         admit(&mut self.diagnostic, session, class)?;
-        let (plan, description) = prepare_declared_sql(session, sql, oids)?;
+        let (plan, description) = prepare_declared_sql(session, sql, oids, false)?;
         // The bound statement must be what was admitted.
         if plan_class(&plan) != Some(class) {
             return Err(refuse(&mut self.diagnostic, StatementClass::Other));

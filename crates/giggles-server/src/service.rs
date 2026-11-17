@@ -1548,6 +1548,16 @@ impl Session {
         sql: &str,
         declared_types: &[Option<relational::DataType>],
     ) -> Result<Prepared, CoreError> {
+        self.prepare_parameter_types_inner(sql, declared_types, false)
+    }
+    pub(crate) fn prepare_unnamed(
+        &mut self, sql: &str, declared_types: &[Option<relational::DataType>],
+    ) -> Result<Prepared, CoreError> {
+        self.prepare_parameter_types_inner(sql, declared_types, true)
+    }
+    fn prepare_parameter_types_inner(
+        &mut self, sql: &str, declared_types: &[Option<relational::DataType>], unnamed: bool,
+    ) -> Result<Prepared, CoreError> {
         fn declared(
             p: Prepared,
             types: &[Option<relational::DataType>],
@@ -1649,10 +1659,11 @@ impl Session {
             session.authorize_sequence_sql(sql)?;
             let p = if matches!(&session.role, Role::Database { .. }) {
                 declared(
-                    session
-                        .sql
-                        .prepare(sql)
-                        .map_err(|error| parse_error(session, error))?,
+                    (if unnamed && session.sql.task().is_none() {
+                        session.sql.prepare_unnamed(sql, declared_types)
+                    } else {
+                        session.sql.prepare(sql)
+                    }).map_err(|error| parse_error(session, error))?,
                     declared_types,
                 )?
             } else if session.in_transaction() && !session.is_aborted() {

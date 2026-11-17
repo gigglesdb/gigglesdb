@@ -191,7 +191,13 @@ fn metadata_cycle_counts() {
         metadata_parse(&mut state, &mut session, name);
         metadata_bind(&mut state, &mut session, name);
         assert_eq!(text_rows(&metadata_describe_execute(&mut state, &mut session).unwrap()), vec![vec!["7"]]);
-        assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 12, 19, 0], "cycle {name:?}");
+        assert_eq!(giggles_core::metadata_read_counts::take(), if name.is_empty() { [7, 0, 9, 16, 0] } else { [7, 0, 12, 19, 0] }, "cycle {name:?}");
+        if name.is_empty() {
+            metadata_parse(&mut state, &mut session, name);
+            metadata_bind(&mut state, &mut session, name);
+            metadata_describe_execute(&mut state, &mut session).unwrap();
+            assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 8, 15, 0]);
+        }
         if !name.is_empty() {
             metadata_bind(&mut state, &mut session, name);
             metadata_describe_execute(&mut state, &mut session).unwrap();
@@ -201,7 +207,7 @@ fn metadata_cycle_counts() {
     simple(&mut state, &mut session, "SELECT v FROM t WHERE id = 1").unwrap();
     assert_eq!(giggles_core::metadata_read_counts::take(), [0, 0, 9, 9, 0]);
     extended(&mut state, &mut session, "INSERT INTO serial_t (v) VALUES (8)").unwrap();
-    assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 12, 19, 0]);
+    assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 9, 16, 0]);
 }
 #[test]
 fn metadata_ddl_between_bind_and_execute() {
@@ -237,4 +243,84 @@ fn metadata_ddl_between_bind_and_execute() {
             }
         }
     }
+}
+
+fn parse_sql(state: &mut State, session: &mut Session, sql: &str) -> R<()> {
+    let mut body = vec![0];
+    cstr(sql, &mut body);
+    body.extend(0u16.to_be_bytes());
+    state.handle(b'P', &body, session, &mut vec![], std::time::Instant::now()).map(|_| ())
+}
+
+#[test]
+fn unnamed_cache_hit_and_transaction_exclusion() {
+    let mut session = fixture();
+    session.execute_sql("CREATE TABLE t (id int PRIMARY KEY, v int)", &[]).unwrap();
+    let mut state = state();
+    giggles_core::metadata_read_counts::take();
+    metadata_parse(&mut state, &mut session, "");
+    let cold = giggles_core::metadata_read_counts::take();
+    metadata_parse(&mut state, &mut session, "");
+    let warm = giggles_core::metadata_read_counts::take();
+    assert_eq!(cold[2], warm[2] + 1, "only core parse/bind is skipped");
+    simple(&mut state, &mut session, "BEGIN").unwrap();
+    metadata_parse(&mut state, &mut session, "");
+    giggles_core::metadata_read_counts::take();
+    metadata_parse(&mut state, &mut session, "");
+    let transaction = giggles_core::metadata_read_counts::take();
+    assert!(transaction[0] > 0);
+    simple(&mut state, &mut session, "ROLLBACK").unwrap();
+}
+
+#[test]
+fn unnamed_cache_catalog_and_search_path_invalidation() {
+    let mut session = fixture();
+    session.execute_sql("CREATE TABLE t (id int PRIMARY KEY, v int)", &[]).unwrap();
+    session.execute_sql("INSERT INTO t VALUES (1, 7)", &[]).unwrap();
+    let mut state = state();
+    assert_eq!(text_rows(&extended(&mut state, &mut session, "SELECT * FROM t").unwrap()), vec![vec!["1", "7"]]);
+    extended(&mut state, &mut session, "SELECT * FROM t").unwrap();
+    let mut other = session.service.role_session("owner").unwrap();
+    other.execute_sql("ALTER TABLE t ADD COLUMN w int", &[]).unwrap();
+    assert_eq!(data_rows(&extended(&mut state, &mut session, "SELECT * FROM t").unwrap()), vec![vec![Some("1".into()), Some("7".into()), None]]);
+    other.execute_sql("CREATE SCHEMA alternate", &[]).unwrap();
+    other.execute_sql("CREATE TABLE alternate.t (v int)", &[]).unwrap();
+    other.execute_sql("INSERT INTO alternate.t VALUES (42)", &[]).unwrap();
+    extended(&mut state, &mut session, "SELECT * FROM t").unwrap();
+    simple(&mut state, &mut session, "SET search_path = alternate").unwrap();
+    assert_eq!(text_rows(&extended(&mut state, &mut session, "SELECT * FROM t").unwrap()), vec![vec!["42"]]);
+}
+
+#[test]
+fn unnamed_cache_rechecks_revoked_select() {
+    let mut owner = fixture();
+    let mut owner_state = state();
+    simple(&mut owner_state, &mut owner, "CREATE TABLE t (id int PRIMARY KEY, v int)").unwrap();
+    simple(&mut owner_state, &mut owner, "CREATE ROLE reader LOGIN").unwrap();
+    simple(&mut owner_state, &mut owner, "GRANT SELECT ON t TO reader").unwrap();
+    let mut reader = owner.service.role_session("reader").unwrap();
+    let mut reader_state = state();
+    extended(&mut reader_state, &mut reader, "SELECT v FROM t").unwrap();
+    extended(&mut reader_state, &mut reader, "SELECT v FROM t").unwrap();
+    simple(&mut owner_state, &mut owner, "REVOKE SELECT ON t FROM reader").unwrap();
+    assert_eq!(parse_sql(&mut reader_state, &mut reader, "SELECT v FROM t"), Err("42501"));
+}
+
+#[test]
+fn unnamed_cache_lru_capacity() {
+    let mut session = fixture();
+    session.execute_sql("CREATE TABLE t (id int PRIMARY KEY)", &[]).unwrap();
+    let mut state = state();
+    let sql = "SELECT id FROM t WHERE id = 0";
+    parse_sql(&mut state, &mut session, sql).unwrap();
+    giggles_core::metadata_read_counts::take();
+    parse_sql(&mut state, &mut session, sql).unwrap();
+    let hit = giggles_core::metadata_read_counts::take();
+    for id in 1..=64 {
+        parse_sql(&mut state, &mut session, &format!("SELECT id FROM t WHERE id = {id}")).unwrap();
+    }
+    giggles_core::metadata_read_counts::take();
+    parse_sql(&mut state, &mut session, sql).unwrap();
+    let miss = giggles_core::metadata_read_counts::take();
+    assert_eq!(miss[2], hit[2] + 1);
 }
