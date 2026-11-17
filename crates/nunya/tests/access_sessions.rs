@@ -1555,18 +1555,46 @@ async fn native_limited(client: &mut NativeClient, name: &str) {
     );
 }
 
+async fn native_tokenize_refused(client: &mut NativeClient, request: ExecuteSqlRequest) {
+    let unary_error = match client.execute_sql(request.clone()).await {
+        Err(error) => error,
+        Ok(_) => panic!("invalid native tokenization accepted"),
+    };
+    assert_eq!(unary_error.code(), Code::InvalidArgument);
+    assert!(
+        unary_error.message().contains("NY004"),
+        "unexpected native tokenization refusal"
+    );
+    let streaming_error = match client.execute_streaming_sql(request).await {
+        Err(error) => error,
+        Ok(response) => match response.into_inner().message().await {
+            Err(error) => error,
+            Ok(_) => panic!("invalid streaming native tokenization accepted"),
+        },
+    };
+    assert_eq!(streaming_error.code(), Code::InvalidArgument);
+    assert!(
+        streaming_error.message().contains("NY004"),
+        "unexpected streaming native tokenization refusal"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_SPANNER_REST"]
 async fn spanner_explicit_tokenize_matches_blind_read() -> ServeResult<()> {
     use google_cloud_googleapis::spanner::v1::{ResultSet, TypeCode};
     let f = NativeFixture::new(
-        "email STRING(MAX), number INT64",
-        "email, number",
-        "'alice@example.test', 42",
+        "email STRING(MAX), number INT64, day DATE, ts TIMESTAMP",
+        "email, number, day, ts",
+        "'alice@example.test', 42, DATE '2024-02-29', TIMESTAMP '2024-02-29T12:34:56.123456Z'",
         false,
     )
     .await?;
-    let mut h = f.harness(&f.policy(&["email", "number"], 20, 200), None, "")?;
+    let mut h = f.harness(
+        &f.policy(&["email", "number", "day", "ts"], 20, 200),
+        None,
+        "",
+    )?;
     h.start().await?;
     let (access, secret, _) = h
         .acquire_session("native-tokenize", "spanner-native", Mode::ReadWrite)
@@ -1577,13 +1605,21 @@ async fn spanner_explicit_tokenize_matches_blind_read() -> ServeResult<()> {
         &client
             .execute_sql(spanner_sql(
                 &name,
-                &format!("SELECT email, number FROM {}.t WHERE id = 1", f.schema),
+                &format!(
+                    "SELECT email, number, day, ts FROM {}.t WHERE id = 1",
+                    f.schema
+                ),
             ))
             .await?
             .into_inner(),
     )?;
     assert_eq!(blind.len(), 1);
-    assert_eq!(blind[0].len(), 2);
+    assert_eq!(blind[0].len(), 4);
+    assert!(blind[0][2] != "2024-02-29", "day was not blinded");
+    assert!(
+        blind[0][3] != "2024-02-29T12:34:56.123456Z",
+        "timestamp was not blinded"
+    );
     assert!(blind[0][0] != "alice@example.test", "email was not blinded");
     assert!(blind[0][1] != "42", "number was not blinded");
     let mut email_token = None;
@@ -1595,6 +1631,13 @@ async fn spanner_explicit_tokenize_matches_blind_read() -> ServeResult<()> {
             &blind[0][0],
         ),
         ("number", "42", TypeCode::Int64, &blind[0][1]),
+        ("day", "2024-02-29", TypeCode::Date, &blind[0][2]),
+        (
+            "ts",
+            "2024-02-29T12:34:56.123456Z",
+            TypeCode::Timestamp,
+            &blind[0][3],
+        ),
     ] {
         for parameterized in [false, true] {
             let sql = if parameterized {
@@ -1649,14 +1692,88 @@ async fn spanner_explicit_tokenize_matches_blind_read() -> ServeResult<()> {
     );
     let mut wrong_type = spanner_sql(&name, "SELECT nunya_tokenize('number', @v)");
     native_parameter(&mut wrong_type, "v", "42", TypeCode::String);
-    let error = match client.execute_sql(wrong_type).await {
-        Err(error) => error,
-        Ok(_) => panic!("STRING parameter accepted for INT64 domain"),
+    native_tokenize_refused(&mut client, wrong_type).await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR, NUNYA_TEST_SPANNER_DB and NUNYA_TEST_SPANNER_REST"]
+async fn spanner_tokenize_refusals_cost_no_count() -> ServeResult<()> {
+    use google_cloud_googleapis::spanner::v1::{
+        TransactionOptions, TransactionSelector, TypeCode, transaction_options,
+        transaction_selector,
     };
-    assert_eq!(error.code(), Code::InvalidArgument);
+    const LIMIT: u64 = 3;
+    let f = NativeFixture::new(
+        "email STRING(MAX), number INT64",
+        "email, number",
+        "'alice@example.test', 42",
+        false,
+    )
+    .await?;
+    let mut h = f.harness(&f.policy(&["email", "number"], LIMIT, 200), None, "")?;
+    h.start().await?;
+    let (access, secret, _) = h
+        .acquire_session("native-free-refusals", "spanner-native", Mode::ReadWrite)
+        .await?;
+    let mut cleanup = f.sessions();
+    let (mut client, name) = native_open(&h, &access, &secret, &f.database, &mut cleanup).await?;
+    let mut wrong_type = spanner_sql(&name, "SELECT nunya_tokenize('number', @v)");
+    native_parameter(&mut wrong_type, "v", "42", TypeCode::String);
+    native_tokenize_refused(&mut client, wrong_type).await;
+
+    let mut begin = spanner_sql(&name, "SELECT nunya_tokenize('email', @v)");
+    native_parameter(&mut begin, "v", "alice@example.test", TypeCode::String);
+    begin.transaction = Some(TransactionSelector {
+        selector: Some(transaction_selector::Selector::Begin(TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadWrite(
+                transaction_options::ReadWrite::default(),
+            )),
+            ..Default::default()
+        })),
+    });
+    native_tokenize_refused(&mut client, begin).await;
+    native_tokenize_refused(
+        &mut client,
+        spanner_sql(&name, "SELECT nunya_tokenize('email', 'a''b')"),
+    )
+    .await;
+    let mut null = spanner_sql(&name, "SELECT nunya_tokenize('email', @v)");
+    native_parameter(&mut null, "v", "", TypeCode::String);
+    null.params
+        .as_mut()
+        .ok_or("missing null parameter map")?
+        .fields
+        .insert(
+            "v".into(),
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::NullValue(0)),
+            },
+        );
+    native_tokenize_refused(&mut client, null).await;
+
+    // Each domain still has its entire quota after both RPCs refuse the inputs.
+    for _ in 0..LIMIT {
+        native_tokenize(&mut client, &name, "alice@example.test").await?;
+        let mut number = spanner_sql(&name, "SELECT nunya_tokenize('number', @v)");
+        native_parameter(&mut number, "v", "42", TypeCode::Int64);
+        native_tokenize_cell(
+            &client.execute_sql(number).await?.into_inner(),
+            TypeCode::Int64,
+        )?;
+    }
+    native_limited(&mut client, &name).await;
+    let error = match client
+        .execute_sql(spanner_sql(&name, "SELECT nunya_tokenize('number', '42')"))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("native number tokenization limit bypassed"),
+    };
+    assert_eq!(error.code(), Code::PermissionDenied);
     assert!(
-        error.message().contains("NY004"),
-        "unexpected parameter type refusal"
+        error.message().contains("NY007"),
+        "unexpected number quota refusal"
     );
     Ok(())
 }

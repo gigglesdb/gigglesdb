@@ -566,7 +566,10 @@ impl State<'_> {
         {
             return Ok(false);
         }
-        if f.name.0.len() != 1
+        if matches!(
+            s.projection.as_slice(),
+            [a::SelectItem::ExprWithAlias { .. }]
+        ) || f.name.0.len() != 1
             || self.sql_has_backslash
             || q.with.is_some()
             || q.order_by.is_some()
@@ -621,22 +624,28 @@ impl State<'_> {
             ] => (domain, value),
             _ => return Err(refuse()),
         };
-        let domain = match domain {
-            a::Expr::Value(a::Value::SingleQuotedString(s) | a::Value::DoubleQuotedString(s)) => {
-                crate::policy::DomainName(s.clone())
+        let literal = |expr: &a::Expr| -> Result<String> {
+            let text = match expr {
+                a::Expr::Value(a::Value::SingleQuotedString(s)) if !s.contains('\'') => s,
+                a::Expr::Value(a::Value::DoubleQuotedString(s)) if !s.contains('"') => s,
+                _ => return Err(refuse()),
+            };
+            if text.contains(['\n', '\r']) {
+                return Err(refuse());
             }
-            _ => return Err(refuse()),
+            Ok(text.clone())
         };
+        let domain = crate::policy::DomainName(literal(domain)?);
         let arg = match value {
             a::Expr::Value(a::Value::Placeholder(_)) => {
                 let e = self.expression(value, &vec![], &Context::Other)?;
                 self.plain.extend(e.params);
                 e.value
             }
-            a::Expr::Value(a::Value::SingleQuotedString(s) | a::Value::DoubleQuotedString(s)) => {
+            a::Expr::Value(a::Value::SingleQuotedString(_) | a::Value::DoubleQuotedString(_)) => {
                 ValueSource::Literal {
                     span: self.stmt.source_span.clone(),
-                    text: s.clone(),
+                    text: literal(value)?,
                 }
             }
             _ => return Err(refuse()),

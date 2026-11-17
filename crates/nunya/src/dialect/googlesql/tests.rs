@@ -411,7 +411,6 @@ fn exact_tokenize_shape() {
     for sql in [
         "SELECT nunya_tokenize('email', @v)",
         "SELECT `nunya_tokenize`('email', @v)",
-        "SELECT nunya_tokenize('email', @v) AS t",
         "SELECT nunya_tokenize('email', @v);",
     ] {
         let (stmt, names) = lower_gsql(sql, &snapshot, &policy).unwrap();
@@ -467,7 +466,10 @@ fn exact_tokenize_shape() {
             "Email",
             "bob@x.com",
         ),
-        ("SELECT nunya_tokenize('email', 'a''b')", "email", "a'b"),
+        (r#"SELECT nunya_tokenize('email', "a'b")"#, "email", "a'b"),
+        (r#"SELECT nunya_tokenize('email', 'a"b')"#, "email", "a\"b"),
+        (r#"SELECT nunya_tokenize("em'ail", 'x')"#, "em'ail", "x"),
+        (r#"SELECT nunya_tokenize('em"ail', 'x')"#, "em\"ail", "x"),
     ] {
         let (stmt, names) = lower_gsql(sql, &snapshot, &policy).unwrap();
         assert_eq!(
@@ -494,6 +496,20 @@ fn exact_tokenize_shape() {
 fn tokenize_unsupported_shapes_fail_closed() {
     let (snapshot, policy) = fixture();
     for sql in [
+        "SELECT nunya_tokenize('email', @v) AS t",
+        "SELECT nunya_tokenize('email', @v) AS `t`",
+        "SELECT nunya_tokenize('email', 'a''b')",
+        "SELECT nunya_tokenize('em''ail', @v)",
+        r#"SELECT nunya_tokenize('email', "a""b")"#,
+        r#"SELECT nunya_tokenize("em""ail", @v)"#,
+        "SELECT nunya_tokenize('email', 'a\nb')",
+        "SELECT nunya_tokenize('email', 'a\rb')",
+        "SELECT nunya_tokenize('em\nail', @v)",
+        "SELECT nunya_tokenize('em\rail', @v)",
+        "SELECT nunya_tokenize('email', \"a\nb\")",
+        "SELECT nunya_tokenize('email', \"a\rb\")",
+        "SELECT nunya_tokenize(\"em\nail\", @v)",
+        "SELECT nunya_tokenize(\"em\rail\", @v)",
         "SELECT nunya.nunya_tokenize('email',@v)",
         "SELECT nunya_tokenize('email')",
         "SELECT nunya_tokenize('email',@v,@w)",
