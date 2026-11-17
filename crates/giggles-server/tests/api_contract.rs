@@ -4,7 +4,7 @@ use giggles_server::api::{codec, json, proto};
 use prost::Message;
 
 #[test]
-fn descriptor_publishes_only_the_three_v1_methods() {
+fn descriptor_publishes_v1_methods_and_result_stream() {
     let descriptors = prost_types::FileDescriptorSet::decode(proto::FILE_DESCRIPTOR_SET).unwrap();
     let file = descriptors
         .file
@@ -21,13 +21,14 @@ fn descriptor_publishes_only_the_three_v1_methods() {
             .iter()
             .map(|m| m.name.as_deref().unwrap())
             .collect::<Vec<_>>(),
-        ["OpenSession", "Execute", "CloseSession"]
+        ["OpenSession", "Execute", "ExecuteStream", "CloseSession"]
     );
     assert!(
         service
             .method
             .iter()
-            .all(|m| !m.client_streaming.unwrap_or(false) && !m.server_streaming.unwrap_or(false))
+            .all(|m| !m.client_streaming.unwrap_or(false)
+                && m.server_streaming.unwrap_or(false) == (m.name.as_deref() == Some("ExecuteStream")))
     );
     let request = file
         .message_type

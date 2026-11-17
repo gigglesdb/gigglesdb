@@ -8,7 +8,7 @@ use super::{
     session::{Registry, SessionLease},
 };
 use crate::{Response, Service, Session};
-use giggles_core::Cancellation;
+use giggles_core::{Cancellation, relational::spill::{self, SpilledRows}};
 use prost::Message;
 use std::{
     sync::{
@@ -44,6 +44,7 @@ pub enum Encoding {
 pub struct Completion {
     pub reply: proto::ExecuteReply,
     pub json: Option<Vec<u8>>,
+    pub spill: Option<SpilledRows>,
     pub lease: ResponseLease,
 }
 
@@ -63,6 +64,7 @@ struct Job {
     context: Cancellation,
     received: Instant,
     encoding: Encoding,
+    stream: bool,
     ownership: Arc<CallOwnership>,
     reply: oneshot::Sender<Result<Completion, ApiError>>,
     #[cfg(test)]
@@ -379,6 +381,7 @@ impl ApiRuntime {
         grpc_deadline: Option<Instant>,
         ownership: Arc<CallOwnership>,
         encoding: Encoding,
+        stream: bool,
     ) -> Result<Completion, ApiError> {
         if self.stopping.load(Ordering::Acquire) {
             return Err(ApiError::Unavailable);
@@ -401,6 +404,7 @@ impl ApiRuntime {
             context,
             received,
             encoding,
+            stream,
             ownership,
             reply,
             #[cfg(test)]
@@ -518,6 +522,7 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
         context,
         received,
         encoding,
+        stream,
         ownership,
         reply,
         #[cfg(test)]
@@ -537,11 +542,26 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 context.scope(|| {
                     lease.session().authority_scope(|session| {
-                        // Immutable response construction remains within the lease. The
-                        // API materialises whole results, so v2 output keeps the result
-                        // budget (54000) instead of spilling (R2-PGLIMITS-5 B2).
-                        Ok(giggles_core::relational::spill::bounded(|| {
-                            execute_reply(session, request, received, encoding)
+                        let stream = stream && !matches!(session.role, crate::Role::Task { .. });
+                        let (result, spill) = spill::bounded(|| {
+                            if stream {
+                                spill::streaming(|| execute_reply(session, request, received, encoding))
+                            } else {
+                                (execute_reply(session, request, received, encoding), None)
+                            }
+                        });
+                        Ok(result.and_then(|(mut reply, json)| {
+                            if let Some(rows) = &spill {
+                                if let Some(proto::execute_reply::NativeResult::OperationOutcome(outcome)) = &mut reply.native_result {
+                                    outcome.matched = rows.len();
+                                }
+                                let state = proto::TransactionState::try_from(reply.transaction_state)
+                                    .map_err(|_| ApiError::Internal)?;
+                                let (reply, json) = prepare_encoded(Ok(reply), state, encoding)?;
+                                Ok((reply, json, spill))
+                            } else {
+                                Ok((reply, json, None))
+                            }
                         }))
                     })
                 })
@@ -554,9 +574,10 @@ async fn run_job(service: Arc<Service>, mut job: Job) {
                 barrier.wait();
             }
             match result {
-                Ok(Ok(Ok((reply, json)))) => Ok(Completion {
+                Ok(Ok(Ok((reply, json, spill)))) => Ok(Completion {
                     reply,
                     json,
+                    spill,
                     lease: ResponseLease {
                         session: lease,
                         _ownership: ownership,

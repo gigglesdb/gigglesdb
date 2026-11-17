@@ -39,6 +39,7 @@ fn key(id: i32) -> Option<i32> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_order_by_past_work_mem_streams_every_row_in_order() {
+    let _serial = crate::api_result_stream::SERIAL.lock().await;
     let path = std::env::temp_dir().join(format!(
         "sort-spill-network-{}-{}",
         std::process::id(),

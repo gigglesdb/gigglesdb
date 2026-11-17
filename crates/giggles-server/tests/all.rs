@@ -21,6 +21,8 @@ mod aggregate_filter_authority;
 mod alter_table_ownership;
 #[path = "ambiguous_column_error.rs"]
 mod ambiguous_column_error;
+#[path = "api_result_stream.rs"]
+mod api_result_stream;
 #[path = "api_contract.rs"]
 mod api_contract;
 #[path = "api_native.rs"]

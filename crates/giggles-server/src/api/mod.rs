@@ -14,6 +14,7 @@ pub(crate) mod native_codec;
 mod native_json;
 pub mod net;
 mod session;
+mod stream;
 
 pub mod proto {
     tonic::include_proto!("giggles.v1");

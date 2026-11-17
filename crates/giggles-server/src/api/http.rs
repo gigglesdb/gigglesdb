@@ -6,6 +6,7 @@ use super::{
     identity::ConnectionIdentity,
     json,
     net::{self, ActivityTicket},
+    stream,
 };
 use crate::transport::{IO_TIMEOUT, MAX_FRAME};
 use ::http::{HeaderMap, Method, Request, Response, StatusCode, header};
@@ -93,13 +94,13 @@ pub(crate) async fn handle(
                 } else {
                     StatusCode::CREATED
                 };
-                json::encode_open(&reply).map(|bytes| (status, bytes, None))
+                json::encode_open(&reply).map(|bytes| (status, full(bytes), None))
             }),
         Route::Close => {
             if bytes.is_empty() {
                 runtime
                     .close(&identity, token.as_deref().expect("validated token"))
-                    .map(|()| (StatusCode::NO_CONTENT, Vec::new(), None))
+                    .map(|()| (StatusCode::NO_CONTENT, full(Vec::new()), None))
             } else {
                 Err(ApiError::InvalidArgument)
             }
@@ -123,13 +124,17 @@ pub(crate) async fn handle(
                         None,
                         ownership.clone(),
                         Encoding::Json,
+                        true,
                     )
                     .await
                     .and_then(|completion| {
                         completion.lease.check_release()?;
                         Ok((
                             StatusCode::OK,
-                            completion.json.ok_or(ApiError::Internal)?,
+                            match completion.spill {
+                                Some(spill) => stream::json_body(completion.reply, spill)?,
+                                None => full(completion.json.ok_or(ApiError::Internal)?),
+                            },
                             Some(completion.lease),
                         ))
                     })
@@ -137,8 +142,8 @@ pub(crate) async fn handle(
         },
     };
     match result {
-        Ok((status, bytes, lease)) => {
-            let mut response = response(status, bytes, Some(ownership), lease, ticket);
+        Ok((status, body, lease)) => {
+            let mut response = response_body(status, body, Some(ownership), lease, ticket);
             if let Some(owner) = delivery_owner {
                 response
                     .body_mut()
@@ -226,12 +231,21 @@ fn response(
     lease: Option<ResponseLease>,
     ticket: ActivityTicket,
 ) -> Response<ResponseBody> {
-    let mut response = Response::new(ResponseBody::new(
-        tonic::body::Body::new(Full::new(Bytes::from(bytes))),
-        ownership,
-        lease,
-        ticket,
-    ));
+    response_body(status, full(bytes), ownership, lease, ticket)
+}
+
+fn full(bytes: Vec<u8>) -> tonic::body::Body {
+    tonic::body::Body::new(Full::new(Bytes::from(bytes)))
+}
+
+fn response_body(
+    status: StatusCode,
+    body: tonic::body::Body,
+    ownership: Option<Arc<CallOwnership>>,
+    lease: Option<ResponseLease>,
+    ticket: ActivityTicket,
+) -> Response<ResponseBody> {
+    let mut response = Response::new(ResponseBody::new(body, ownership, lease, ticket));
     *response.status_mut() = status;
     response.headers_mut().insert(
         header::CACHE_CONTROL,

@@ -2290,17 +2290,18 @@ fn matching_rows(s: &impl Context, rows: Vec<SqlRow>, filter: &Bound) -> Result<
     }
     Ok(matches)
 }
-fn sort(rows: &mut [SqlRow], order: &[(usize, bool)]) {
-    rows.sort_by(|a, b| {
-        for (i, desc) in order {
-            let c = compare(&a.values[*i], &b.values[*i]);
-            let c = if *desc { c.reverse() } else { c };
-            if c != Ordering::Equal {
-                return c;
-            }
+fn compare_rows(a: &SqlRow, b: &SqlRow, order: &[(usize, bool)]) -> Ordering {
+    for (i, desc) in order {
+        let c = compare(&a.values[*i], &b.values[*i]);
+        let c = if *desc { c.reverse() } else { c };
+        if c != Ordering::Equal {
+            return c;
         }
-        Ordering::Equal
-    })
+    }
+    Ordering::Equal
+}
+fn sort(rows: &mut [SqlRow], order: &[(usize, bool)]) {
+    rows.sort_by(|a, b| compare_rows(a, b, order))
 }
 fn charge_value(remaining: &mut usize, value: &Value) -> Result<()> {
     *remaining = remaining
@@ -2477,7 +2478,7 @@ fn run_complete(
                 matched += usize::from(accepted);
                 Ok(accepted)
             },
-            (limit, &mut |rows| sort(rows, &order)),
+            (limit, (!order.is_empty()).then_some(|a: &SqlRow, b: &SqlRow| compare_rows(a, b, &order))),
             input_error,
         )?;
         let read = matches!(operation, Operation::Read { .. });

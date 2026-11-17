@@ -9,6 +9,7 @@ use super::{
         self,
         giggles_server::{Giggles, GigglesServer},
     },
+    stream,
 };
 use crate::transport::{IO_TIMEOUT, MAX_FRAME, MAX_RESPONSE};
 use ::http::{HeaderMap, Method, Request, Response, Version, header};
@@ -82,6 +83,7 @@ impl Giggles for Rpc {
                 context.deadline,
                 context.ownership,
                 Encoding::Protobuf,
+                false,
             )
             .await
             .map_err(ApiError::grpc_status)?;
@@ -94,6 +96,49 @@ impl Giggles for Rpc {
             .lock()
             .map_err(|_| ApiError::Internal.grpc_status())? = Some(completion.lease);
         Ok(RpcResponse::new(completion.reply))
+    }
+
+    type ExecuteStreamStream = stream::Receiver<Result<proto::ExecuteReply, Status>>;
+
+    async fn execute_stream(
+        &self,
+        request: RpcRequest<proto::ExecuteRequest>,
+    ) -> Result<RpcResponse<Self::ExecuteStreamStream>, Status> {
+        let context = request
+            .extensions()
+            .get::<Context>()
+            .cloned()
+            .ok_or_else(|| ApiError::Internal.grpc_status())?;
+        check_deadline(&context)?;
+        let completion = self
+            .runtime
+            .execute(
+                &context.identity,
+                context
+                    .token
+                    .as_deref()
+                    .ok_or_else(|| ApiError::InvalidArgument.grpc_status())?,
+                request.into_inner(),
+                context.received,
+                context.deadline,
+                context.ownership,
+                Encoding::Protobuf,
+                true,
+            )
+            .await
+            .map_err(ApiError::grpc_status)?;
+        completion
+            .lease
+            .check_release()
+            .map_err(ApiError::grpc_status)?;
+        *context
+            .lease
+            .lock()
+            .map_err(|_| ApiError::Internal.grpc_status())? = Some(completion.lease);
+        Ok(RpcResponse::new(stream::grpc(
+            completion.reply,
+            completion.spill,
+        )))
     }
 
     async fn close_session(
@@ -139,7 +184,8 @@ pub(crate) async fn handle(
 ) -> Response<ResponseBody> {
     let path = request.uri().path().to_owned();
     let open = path == "/giggles.v1.Giggles/OpenSession";
-    let execute = path == "/giggles.v1.Giggles/Execute";
+    let execute =
+        path == "/giggles.v1.Giggles/Execute" || path == "/giggles.v1.Giggles/ExecuteStream";
     let close = path == "/giggles.v1.Giggles/CloseSession";
     if !open && !execute && !close {
         return status_response(

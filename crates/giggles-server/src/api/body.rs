@@ -79,7 +79,7 @@ struct DeliveryOwnership {
     _ownership: Option<Arc<CallOwnership>>,
     lease: Option<ResponseLease>,
     binding: Option<(ConnectionIdentity, Arc<Service>)>,
-    _ticket: ActivityTicket,
+    ticket: ActivityTicket,
 }
 
 // Hyper may drop a Body after enqueueing its final frame, before h2 has written
@@ -110,7 +110,7 @@ impl ResponseBody {
                 _ownership: ownership,
                 lease,
                 binding: None,
-                _ticket: ticket,
+                ticket,
             }))),
             done: false,
         }
@@ -155,6 +155,13 @@ impl ResponseBody {
                 return Err(error.grpc_status());
             }
         }
+        self.delivery
+            .as_ref()
+            .expect("live delivery")
+            .lock()
+            .map_err(|_| ApiError::Internal.grpc_status())?
+            .ticket
+            .write_stage();
         let bytes = self.pending.split_to(self.pending.len().min(16 * 1024));
         Ok(Frame::data(Bytes::from_owner(DeliveryChunk {
             bytes,

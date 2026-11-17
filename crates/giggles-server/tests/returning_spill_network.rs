@@ -23,6 +23,7 @@ fn spill_files() -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_returning_past_one_mebibyte_streams_every_row() {
+    let _serial = crate::api_result_stream::SERIAL.lock().await;
     let path = std::env::temp_dir().join(format!(
         "returning-spill-network-{}-{}",
         std::process::id(),

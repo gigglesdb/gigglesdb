@@ -4,6 +4,7 @@ package giggles.v1;
 service Giggles {
   rpc OpenSession(OpenSessionRequest) returns (OpenSessionReply);
   rpc Execute(ExecuteRequest) returns (ExecuteReply);
+  rpc ExecuteStream(ExecuteRequest) returns (stream ExecuteReply);
   rpc CloseSession(CloseSessionRequest) returns (CloseSessionReply);
 }
 

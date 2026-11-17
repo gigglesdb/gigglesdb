@@ -49,9 +49,6 @@ fn scoped<'v, E>(
     }
 }
 
-/// Reorders retained rows before the tail past a bound is released.
-pub(crate) type Reorder<'a> = dyn FnMut(&mut Vec<SqlRow>) + 'a;
-
 /// Logical bytes a retained native input row is charged.
 fn retained_bytes(row: &SqlRow) -> usize {
     row.values.iter().fold(std::mem::size_of::<SqlRow>(), |bytes, value| {
@@ -102,16 +99,21 @@ impl SqlSession {
     /// `bound` keeps at most `limit` rows: whenever the retained set reaches
     /// twice that, `order` stably reorders it and the tail is released. A
     /// stable order of the whole set followed by `limit` rows keeps exactly
-    /// these rows, so the caller's result is unchanged. `usize::MAX` keeps all.
-    pub(crate) fn complete_read_table_where<E>(
+    /// these rows, so the caller's result is unchanged. Ordered bounds above
+    /// 10,000 use external sort, charging only the first `limit` rows on readback.
+    pub(crate) fn complete_read_table_where<E, C>(
         &mut self,
         table: &TableDef,
         key: Option<&[crate::relational::Value]>,
         keep: &mut impl FnMut(&SqlRow) -> Result<bool, E>,
-        bound: (usize, &mut Reorder<'_>),
+        bound: (usize, Option<C>),
         map: fn(CoreError) -> E,
-    ) -> Result<CompleteRelation, E> {
+    ) -> Result<CompleteRelation, E>
+    where
+        C: Fn(&SqlRow, &SqlRow) -> std::cmp::Ordering + Copy,
+    {
         let (limit, order) = bound;
+        let cmp = |a: &SqlRow, b: &SqlRow| order.map_or(std::cmp::Ordering::Equal, |cmp| cmp(a, b));
         let threshold = limit.saturating_mul(2).max(64);
         let result = (|| {
             if !self.is_v2_engine() {
@@ -122,15 +124,21 @@ impl SqlSession {
             let mut retained = crate::relational::scan::Retention::new(
                 crate::relational::scan::MAX_RETAINED_BYTES,
             );
+            let mut sorter = (order.is_some() && limit > 10_000)
+                .then(crate::relational::spill::Sorter::new);
             let mut visit = |row: &SqlRow| {
                 NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0 + 1, n.get().1)));
                 if !keep(row)? {
                     return Ok(());
                 }
+                if let Some(sorter) = &mut sorter {
+                    return sorter.push(row.clone(), retained_bytes(row), cmp, &mut retained)
+                        .map_err(|e| map(CoreError::Sql(e)));
+                }
                 retained.charge(retained_bytes(row)).map_err(|e| map(CoreError::Sql(e)))?;
                 rows.push(row.clone());
                 if rows.len() >= threshold {
-                    order(&mut rows);
+                    rows.sort_by(cmp);
                     for dropped in rows.drain(limit..) {
                         retained.release(retained_bytes(&dropped));
                     }
@@ -141,8 +149,16 @@ impl SqlSession {
                 Some(key) => self.visit_native_key(table, key, &mut visit, map)?,
                 None => self.visit_native_page(table, &mut visit, map)?,
             }
+            if let Some(sorter) = sorter {
+                let sorted = sorter.finish(cmp, &mut retained).map_err(|e| map(CoreError::Sql(e)))?;
+                for row in sorted.take(limit) {
+                    let row = row.map_err(|e| map(CoreError::Sql(e)))?;
+                    retained.charge(retained_bytes(&row)).map_err(|e| map(CoreError::Sql(e)))?;
+                    rows.push(row);
+                }
+            }
             if rows.len() > limit {
-                order(&mut rows);
+                rows.sort_by(cmp);
                 rows.truncate(limit);
             }
             NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0, n.get().1 + rows.len() as u64)));
@@ -493,6 +509,109 @@ mod tests {
                 .unwrap();
         }
         (admin, session, table)
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn ordered_native_read_spills_matching_input_and_releases_runs() {
+        use crate::operations::{Bindings, Engine, Request, Sort, ValueExpr};
+        use crate::relational::spill;
+        use crate::storage::{Backend, engine::catalog::TableEntry};
+
+        const COUNT: usize = 18_000;
+        const LIMIT: usize = 10_001;
+        let mut token = [0; 16];
+        getrandom::fill(&mut token).unwrap();
+        let path = crate::test_artifact_root()
+            .join(format!("native-sort-{:032x}", u128::from_be_bytes(token),));
+        let spill_dir = path.join("spills");
+        std::fs::create_dir_all(&spill_dir).unwrap();
+        let admin =
+            Admin::create_engine(path.join("db"), Limits::default(), crate::Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        session
+            .execute(
+                "CREATE TABLE items (id BIGINT PRIMARY KEY, note TEXT)",
+                &[],
+                None,
+            )
+            .unwrap();
+        let table = admin.catalog().unwrap().1.remove(0);
+        let entry = TableEntry {
+            primary_index_birth: None,
+            def: table,
+            heap: false,
+            columns_ext: Default::default(),
+        };
+        let Backend::V2(db) = &admin.inner.backend else {
+            panic!("v2")
+        };
+        let note = "x".repeat(4096);
+        let row_bytes = retained_bytes(&SqlRow {
+            version: 1,
+            values: vec![V::Int(0), V::Text(note.clone())],
+        });
+        assert!(row_bytes * COUNT > crate::relational::scan::MAX_RETAINED_BYTES);
+        assert!(row_bytes * LIMIT < crate::relational::scan::MAX_RETAINED_BYTES);
+        for start in (0..COUNT).step_by(200) {
+            let mut txn = db.begin(crate::storage::Isolation::ReadCommitted);
+            for id in start..(start + 200).min(COUNT) {
+                db.rows
+                    .insert(
+                        &mut txn,
+                        &entry,
+                        vec![V::Int(id as i64), V::Text(note.clone())],
+                        None,
+                        &|| false,
+                    )
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                spill::set_thread_dir(None);
+            }
+        }
+        let _reset = Reset;
+        spill::set_thread_dir(Some(spill_dir.clone()));
+        let engine = Engine::new(admin.clone());
+        let request = Request::Read {
+            table: "items".into(),
+            filter: None,
+            order: vec![Sort {
+                field: "id".into(),
+                descending: true,
+            }],
+            limit: Some(ValueExpr::Literal(V::Int(LIMIT as i64))),
+            projection: vec!["id".into()],
+        };
+        let result = with_sql_parser_forbidden(|| engine.execute(&request, &Bindings::new())).unwrap();
+        assert_eq!(result.matched, COUNT);
+        assert!(!result.complete);
+        assert_eq!(result.rows.len(), LIMIT);
+        for (offset, row) in result.rows.iter().enumerate() {
+            assert_eq!(row.values, vec![V::Int((COUNT - 1 - offset) as i64)]);
+        }
+        assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), 0);
+        // A readback that exceeds retention must also remove every sorted run.
+        let mut all_rows = request.clone();
+        let Request::Read { limit, .. } = &mut all_rows else {
+            unreachable!()
+        };
+        *limit = Some(ValueExpr::Literal(V::Int(COUNT as i64)));
+        assert_eq!(
+            engine.execute(&all_rows, &Bindings::new()),
+            Err(crate::operations::Error::Sql {
+                sqlstate: "54000".into(),
+            })
+        );
+        assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), 0);
+        drop(engine);
+        drop(session);
+        drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     fn page(session: &mut SqlSession, table: &TableDef) -> Vec<SqlRow> {

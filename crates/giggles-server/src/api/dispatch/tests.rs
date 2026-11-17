@@ -154,6 +154,7 @@ impl Fixture {
                 None,
                 self.call(),
                 Encoding::Json,
+                false,
             )
             .await
     }
@@ -198,6 +199,7 @@ fn launch(f: &Fixture, request: proto::ExecuteRequest) -> JoinHandle<Result<Comp
                 None,
                 call,
                 Encoding::Json,
+                false,
             )
             .await
     })
@@ -305,6 +307,7 @@ async fn queued_receiver_drop_and_expired_deadline_never_dispatch() {
         None,
         call,
         Encoding::Json,
+        false,
     ));
     pending(request.as_mut()).await;
     drop(request);
@@ -327,6 +330,7 @@ async fn queued_receiver_drop_and_expired_deadline_never_dispatch() {
             None,
             g.call(),
             Encoding::Json,
+            false,
         )
         .await;
     assert_eq!(result.err(), Some(ApiError::DeadlineExceeded));
@@ -518,6 +522,7 @@ async fn invalid_and_zero_budget_requests_leave_transaction_and_fresh_context_us
             Some(Instant::now() - Duration::from_secs(1)),
             f.call(),
             Encoding::Protobuf,
+            false,
         )
         .await;
     assert_eq!(expired_grpc.err(), Some(ApiError::DeadlineExceeded));
@@ -582,6 +587,7 @@ async fn worker_panic_invalidates_session_and_recovers_all_ownership() {
             None,
             f.call(),
             Encoding::Json,
+            false,
         )
         .await
         .unwrap();
