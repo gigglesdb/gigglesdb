@@ -198,17 +198,13 @@ impl Hub {
     /// Set the service config revision on every unit and the lifecycle log.
     pub(crate) fn set_config_revision(&self, config: &str) -> Result<(), String> {
         let state = self.state.lock().map_err(|_| "policy lock unavailable")?;
-        for unit in &state.units {
-            unit.revisions
-                .write()
-                .map_err(|_| "revision lock unavailable")?
-                .config = config.into();
-        }
-        self.log
-            .1
-            .write()
-            .map_err(|_| "revision lock unavailable")?
-            .config = config.into();
+        // Acquire every publication lock before changing any revision.
+        let mut revisions = state.units.iter().map(|unit| {
+            unit.revisions.write().map_err(|_| "revision lock unavailable")
+        }).collect::<Result<Vec<_>, _>>()?;
+        let mut service = self.log.1.write().map_err(|_| "revision lock unavailable")?;
+        for revision in &mut revisions { revision.config = config.into(); }
+        service.config = config.into();
         Ok(())
     }
     /// Return the configured route's current policy.
@@ -433,7 +429,11 @@ impl Hub {
         values
     }
     /// Reload every unit manually, or just changed units after watcher debounce.
-    pub(crate) async fn run(&self, mut reload: tokio::sync::mpsc::Receiver<()>) {
+    pub(crate) async fn run(&self, mut reload: tokio::sync::mpsc::Receiver<()>, config: Option<Arc<crate::config_reload::ConfigReloader>>) {
+        let mut config_watcher = config.as_ref().map(|c| Watcher {
+            attempted: c.revision(),
+            previous: None, readable: true,
+        });
         let mut files: Vec<_> = {
             let state = self
                 .state
@@ -469,20 +469,40 @@ impl Hub {
                 _ = &mut hup => { hup.set(crate::serve::hangup()); true }
                 _ = interval.tick(), if self.watch_ms.is_some() => false,
             };
+            let mut reload_config = false;
+            if let (Some(config), Some(watcher)) = (&config, &mut config_watcher) {
+                let bytes = std::fs::read(config.path());
+                if manual {
+                    if let Ok(bytes) = &bytes { watcher.attempted = hash(bytes); }
+                    watcher.previous = None;
+                }
+                reload_config = manual || watcher.poll(bytes.as_deref().ok());
+            }
+            let mut attempts = Vec::new();
             for (index, (path, watcher)) in files.iter_mut().enumerate() {
                 let bytes = std::fs::read(&*path);
                 if manual {
-                    if let Ok(bytes) = &bytes {
-                        watcher.attempted = hash(bytes);
-                    }
+                    if let Ok(bytes) = &bytes { watcher.attempted = hash(bytes); }
                     watcher.previous = None;
                 }
                 if manual || watcher.poll(bytes.as_deref().ok()) {
-                    self.attempt(index, path, bytes);
+                    attempts.push((index, path.clone(), bytes));
                 }
             }
+            // A policy watcher trigger also rereads config, even when its bytes
+            // have not changed. A config-only trigger leaves policy units alone.
+            reload_config |= !attempts.is_empty();
+            config_before_policy(config.as_deref().filter(|_| reload_config), || {
+                for (index, path, bytes) in attempts { self.attempt(index, &path, bytes); }
+            }).await;
         }
     }
+}
+
+// The callback keeps policy attempts independent while making trigger order explicit.
+async fn config_before_policy(config: Option<&crate::config_reload::ConfigReloader>, attempt: impl FnOnce()) {
+    if let Some(config) = config { config.reload().await; }
+    attempt();
 }
 
 struct Watcher {
@@ -616,7 +636,7 @@ mod tests {
     async fn manual_reload(h: &Arc<Hub>) {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let worker = h.clone();
-        let task = tokio::spawn(async move { worker.run(rx).await });
+        let task = tokio::spawn(async move { worker.run(rx, None).await });
         tx.send(()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -950,7 +970,7 @@ mod tests {
         files.write(&files.a, 70000);
         let worker = h.clone();
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        let task = tokio::spawn(async move { worker.run(rx).await });
+        let task = tokio::spawn(async move { worker.run(rx, None).await });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if h.state.lock().unwrap().units[0].attempts == 1 {
@@ -1031,6 +1051,52 @@ mod tests {
                 "route=postgres policy=ok catalog=stale audit=ok store=ok\n".into()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn config_poll_is_independent_and_policy_triggers_reread_config() {
+        let files = crate::config_reload::tests::Fixture::new();
+        let route = id("pg");
+        let hub = Hub::new(&[(route, files.dir.join("policy"))], Some(5)).unwrap();
+        let startup = crate::config::Config::load(&files.path).unwrap();
+        let config = Arc::new(crate::config_reload::ConfigReloader::new(startup, Arc::downgrade(&hub)));
+        files.load(&files.text.replace("max_connections=256", "max_connections=257"));
+        let worker = hub.clone(); let worker_config = config.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move { worker.run(rx, Some(worker_config)).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while config.last_reload() != "applied" { tokio::time::sleep(Duration::from_millis(1)).await; }
+        }).await.unwrap();
+        assert_eq!(hub.state.lock().unwrap().units[0].attempts, 0);
+        assert!(config.metrics().contains(&("nunya_config_reloads_total".into(), 1)));
+        std::fs::write(files.dir.join("policy"), "snapshot_max_age_ms=60001\n[readlog]\nsink='stdout'\n").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hub.state.lock().unwrap().units[0].attempts < 1 { tokio::time::sleep(Duration::from_millis(1)).await; }
+        }).await.unwrap();
+        assert!(config.metrics().contains(&("nunya_config_reloads_total".into(), 2)));
+        std::fs::write(&files.path, "invalid=[").unwrap();
+        tx.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hub.state.lock().unwrap().units[0].attempts < 2 { tokio::time::sleep(Duration::from_millis(1)).await; }
+        }).await.unwrap();
+        assert_eq!(config.last_reload(), "rejected");
+        task.abort(); assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn manual_trigger_reloads_config_before_policy_attempt() {
+        let files = crate::config_reload::tests::Fixture::new();
+        let hub = files.hub();
+        let startup = crate::config::Config::load(&files.path).unwrap();
+        let config = crate::config_reload::ConfigReloader::new(startup, Arc::downgrade(&hub));
+        let new = files.load(&files.text.replace("max_connections=256", "max_connections=257"));
+        config_before_policy(Some(&config), || {
+            assert_eq!(config.last_reload(), "applied");
+            assert_eq!(hub.log.1.read().unwrap().config, new.revision);
+            assert_eq!(hub.state.lock().unwrap().units[0].attempts, 0);
+            hub.attempt(0, &files.dir.join("policy"), std::fs::read(files.dir.join("policy")));
+        }).await;
+        assert_eq!(hub.state.lock().unwrap().units[0].attempts, 1);
     }
 
     #[test]

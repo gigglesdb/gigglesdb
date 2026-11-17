@@ -37,3 +37,4 @@ pub mod serve;
 pub mod spanner_serve;
 
 mod reload;
+mod config_reload;

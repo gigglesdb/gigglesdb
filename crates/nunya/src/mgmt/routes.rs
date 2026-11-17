@@ -49,6 +49,10 @@ pub trait StatusSource: Send + Sync {
     fn policy_revision(&self, route: &str) -> Option<String>;
     /// Current configuration revision.
     fn config_revision(&self) -> Option<String>;
+    /// Pending restart-only configuration setting names.
+    fn config_restart_pending(&self) -> Vec<String> { Vec::new() }
+    /// Most recent configuration reload outcome, when available.
+    fn config_last_reload(&self) -> Option<String> { None }
     /// Configured route identifiers.
     fn route_ids(&self) -> Vec<String>;
 }
@@ -749,7 +753,8 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
             }).cloned();
             let mut status = json!({"deployment_id":data_encoding::HEXLOWER.encode(&ctx.authority.deployment_id()),
             "store_format":ctx.authority.store_format_version(), "route_ids":route_ids,
-            "policy_revisions":policy_revisions, "config_revision":ctx.status.config_revision()});
+            "policy_revisions":policy_revisions, "config_revision":ctx.status.config_revision(),
+            "config_restart_pending":ctx.status.config_restart_pending(), "config_last_reload":ctx.status.config_last_reload()});
             if let Some(revision) = legacy {
                 status["policy_revision"] = revision;
             }

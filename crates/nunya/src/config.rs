@@ -141,6 +141,8 @@ impl fmt::Debug for AdminSection {
 }
 /// Validated configuration with zeroizing secrets.
 pub struct Config {
+    /// Configuration path passed to the loader, as given.
+    pub path: PathBuf,
     /// SHA-256 of the startup config file bytes.
     pub revision: String,
     /// Agent listener.
@@ -655,6 +657,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     }
     use sha2::{Digest, Sha256};
     Ok(Config {
+        path: path.to_path_buf(),
         revision: data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes())),
         session,
         management,
