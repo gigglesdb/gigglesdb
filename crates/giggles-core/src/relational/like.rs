@@ -109,6 +109,37 @@ pub(super) fn like(
     Ok(p == pattern.len())
 }
 
+/// PG18 nondeterministic LIKE: wildcards consume characters, literal runs
+/// compare whole substrings under the collation (including ignorable chars).
+pub(super) fn collated(value:&str,pattern:&str,escape:Escape,work:&mut usize,eq:impl Fn(&str,&str)->bool)->R<bool> {
+    enum Part { Literal(String), One, Many }
+    let mut parts=Vec::new(); let mut literal=String::new(); let mut chars=pattern.chars();
+    while let Some(c)=chars.next() {
+        if Some(c)==escape.0 {literal.push(chars.next().ok_or(SqlError::InvalidEscapeSequence)?);}
+        else if matches!(c,'_'|'%') {
+            if !literal.is_empty() {parts.push(Part::Literal(std::mem::take(&mut literal)));}
+            parts.push(if c=='_' {Part::One} else {Part::Many});
+        } else {literal.push(c);}
+    }
+    if !literal.is_empty() {parts.push(Part::Literal(literal));}
+    let mut offsets:Vec<_>=value.char_indices().map(|(i,_)|i).collect(); offsets.push(value.len());
+    charge(work,offsets.len().saturating_mul(2))?;
+    let mut previous=vec![false;offsets.len()];previous[0]=true;
+    for part in parts {
+        let mut next=vec![false;offsets.len()];
+        match part {
+            Part::Many=>{let mut seen=false;for (n,p) in next.iter_mut().zip(&previous) {seen|=*p;*n=seen;}},
+            Part::One=>next[1..].copy_from_slice(&previous[..previous.len()-1]),
+            Part::Literal(p)=>for (start,matched) in previous.iter().enumerate() {if *matched {for end in start..offsets.len() {
+                charge(work,1+offsets[end]-offsets[start])?;
+                if eq(&value[offsets[start]..offsets[end]],&p) {next[end]=true;}
+            }}},
+        }
+        previous=next;
+    }
+    Ok(previous.last().copied().unwrap_or(false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,11 +1,13 @@
 //! Mutation projections use the SELECT parser, binder, and scalar evaluator.
 use super::*;
 
+type MaterializedRows = (Description, BTreeMap<Vec<u8>, SqlRow>);
+
 #[derive(Debug, Clone)]
 pub(super) struct Returning {
     query: query::Query,
     images: bool,
-    materialized: Option<(Description, BTreeMap<Vec<u8>, SqlRow>)>,
+    materialized: Option<Box<MaterializedRows>>,
 }
 
 impl Returning {
@@ -18,7 +20,7 @@ impl Returning {
         Self {
             query: query::Query::materialized_returning(table, &description.columns),
             images: false,
-            materialized: Some((description, rows)),
+            materialized: Some(Box::new((description, rows))),
         }
     }
     pub(super) fn bind_schema_names(
@@ -43,7 +45,7 @@ impl Returning {
         state: &Relational,
         description: &mut Description,
     ) -> R<()> {
-        if let Some((d, _)) = &self.materialized {
+        if let Some((d, _)) = self.materialized.as_deref() {
             description.type_oids.clone_from(&d.type_oids);
         }
         if self.images {
@@ -130,7 +132,7 @@ impl Returning {
         state: &Relational,
         seed: Vec<Option<DataType>>,
     ) -> R<(Vec<ColumnDef>, Vec<DataType>, Vec<i32>)> {
-        if let Some((d, _)) = &self.materialized {
+        if let Some((d, _)) = self.materialized.as_deref() {
             return Ok((d.columns.clone(), d.parameters.clone(), d.typmods.clone()));
         }
         let catalog = self.images.then(|| self.image_catalog(state)).transpose()?;
@@ -358,7 +360,7 @@ pub(super) fn project_pairs(
         return Ok(vec![]);
     };
     let table = &state.tables[plan.returning.query.target()];
-    if let Some((_, materialized)) = &plan.returning.materialized {
+    if let Some((_, materialized)) = plan.returning.materialized.as_deref() {
         return rows
             .iter()
             .map(|(old, new)| {

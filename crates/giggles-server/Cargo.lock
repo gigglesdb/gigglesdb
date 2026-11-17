@@ -548,6 +548,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "getrandom 0.3.4",
+ "giggles-icu",
  "giggles-pg-types",
  "giggles-transactions",
  "redb",
@@ -575,6 +576,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "giggles-icu"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "giggles-language"
 version = "0.1.0"
 dependencies = [
@@ -587,6 +595,7 @@ dependencies = [
 name = "giggles-pg-catalog"
 version = "0.1.0"
 dependencies = [
+ "giggles-icu",
  "giggles-pg-types",
  "regex",
  "sqlparser",

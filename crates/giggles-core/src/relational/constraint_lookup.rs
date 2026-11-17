@@ -114,6 +114,9 @@ pub(super) fn exists(
 ) -> R<bool> {
     tick(cancel)?;
     positions(table, columns, values)?;
+    if columns.iter().any(|id| !state.deterministic_column(*id)) {
+        return Ok(!matching_rows(state, table, columns, values, cancel)?.is_empty());
+    }
     if let Some(key) = primary_key(table, columns, values)? {
         let result = state
             .rows
@@ -196,9 +199,10 @@ pub(super) fn matching_rows(
     cancel: &mut impl FnMut() -> bool,
 ) -> R<Rows> {
     tick(cancel)?;
-    let offsets = positions(table, columns, values)?;
+    positions(table, columns, values)?;
     let base = state.rows.get(&table.id).ok_or(SqlError::UnknownTable)?;
-    if let Some(key) = primary_key(table, columns, values)? {
+    let equality = collation_keys::Key::new(state, table, columns, None)?;
+    if !equality.nondeterministic() && let Some(key) = primary_key(table, columns, values)? {
         let result = base
             .get(&key)
             .map(|row| vec![(key, row.clone())])
@@ -206,20 +210,17 @@ pub(super) fn matching_rows(
         tick(cancel)?;
         return Ok(result);
     }
-    if let Some(rows) = indexed(state, table, columns, values, false, cancel)? {
+    if !equality.nondeterministic() && let Some(rows) = indexed(state, table, columns, values, false, cancel)? {
         return Ok(rows);
     }
     if base.len() > MAX_ROWS {
         return Err(SqlError::Limit);
     }
     let mut result = Vec::new();
+    let wanted = equality.values(values)?;
     for (key, row) in base {
         tick(cancel)?;
-        if offsets
-            .iter()
-            .zip(values)
-            .all(|(i, value)| row.values.get(*i) == Some(value))
-        {
+        if wanted.is_some() && equality.tuple(&row.values)? == wanted {
             result.push((key.clone(), row.clone()));
         }
     }

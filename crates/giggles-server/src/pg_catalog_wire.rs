@@ -189,7 +189,7 @@ pub(crate) fn snapshot(
     if metadata.epoch != epoch {
         return Err("40001");
     }
-    let schemas = metadata
+    let schemas: std::collections::BTreeMap<String,(u32,u32)> = metadata
         .schemas
         .into_iter()
         .map(|(name, (id, owner))| {
@@ -202,6 +202,12 @@ pub(crate) fn snapshot(
             Ok((name, (oid, owner)))
         })
         .collect::<Result<_>>()?;
+    let collations = catalog.collations.into_iter().map(|(oid,c)| -> Result<Vec<Value>> {
+            let ns = if c.schema == "public" { 2200 } else { schemas.get(&c.schema).map(|(oid,_)| *oid).ok_or("XX000")? };
+            let owner = roles.iter().find(|r| r.name == c.owner).map_or(10, |r| r.oid);
+            let text = |v: Option<String>| v.map_or(Value::Null, Value::Text);
+            Ok(vec![Value::Int(i64::from(oid)), Value::Text(c.name), Value::Int(i64::from(ns)), Value::Int(i64::from(owner)), Value::Text(c.provider), Value::Bool(c.deterministic), Value::Int(i64::from(c.encoding)), text(c.collate), text(c.ctype), text(c.locale), text(c.rules), text(c.version), text(c.comment)])
+        }).collect::<Result<Vec<_>>>()?;
     let generation = catalog.generation;
     let mut presentation = catalog.presentation;
     if presentation.epoch != epoch { return Err("40001"); }
@@ -244,7 +250,9 @@ pub(crate) fn snapshot(
             .into_iter()
             .filter(|(id, _)| visible.contains(id))
             .collect(),
+        collations,
         user_types,
+        collation_oids: catalog.collation_oids.clone(),
         column_type_oids,
         roles,
         table_owners,

@@ -647,6 +647,7 @@ pub(super) fn validate_constants(
             columns: description.columns,
             typmods: description.typmods,
             type_oids: description.type_oids,
+            collations: vec![],
         };
         aliases(&mut meta, &cte.aliases)?;
         let mut state = catalog(state);
@@ -856,6 +857,7 @@ fn recurse<'e>(
         typmods: seed.typmods.clone(),
         type_oids: vec![],
         unknown: vec![false; seed.columns.len()],
+        collations: vec![],
     };
     aliases(&mut meta, &cte.aliases)?;
     let base_columns = meta.columns.clone();

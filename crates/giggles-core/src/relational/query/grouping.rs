@@ -53,7 +53,7 @@ fn col(name: String, ty: DataType, not_null: bool) -> ColumnDef {
         not_null,
     }
 }
-fn canonical(
+pub(super) fn canonical(
     s: &Scalar,
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     scope: usize,
@@ -204,7 +204,13 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
         if !contains_aggregate(s) {
             let key = canonical(s, self.resolve, self.scope, self.tables)?;
             if let Some(n) = self.groups.iter().position(|g| g == &key) {
-                return Ok(slot(n));
+                let value = slot(n);
+                if let Ok(bound) = s.bind(self.resolve, self.tables, &[])
+                    && let Some(collation) = bound.explicit_collation()?
+                {
+                    return Ok(Scalar::Call(format!("\0collate:{collation}"), vec![value]));
+                }
+                return Ok(value);
             }
         }
         Ok(match s {
@@ -600,6 +606,7 @@ pub(super) fn bind<'a>(
         if b.ty == DataType::Bpchar {
             return Err(SqlError::Unsupported);
         }
+        b.require_collation()?;
         slots.push(col(
             format!("__group_slot_{}", slots.len()),
             b.ty.clone(),
@@ -646,10 +653,14 @@ pub(super) fn bind<'a>(
         };
         arg.infer(expected, &mut parameters, resolve, tables)?;
         let legacy_column = matches!(arg, Scalar::Column(_));
+        if a.distinct() {aggregate_order::validate_distinct(&arg,resolve,tables)?;}
         let b = arg.bind(resolve, tables, &parameters)?;
         if b.ty == DataType::Bpchar {
             return Err(SqlError::Unsupported);
         }
+        aggregate_order::check_types(&b)?;
+        if a.distinct() { b.require_collation()?; }
+        if matches!(a.base(), Aggregate::Min | Aggregate::Max) && let Some(n)=b.explicit_collation()? { functions::collation::ready(n)?; }
         let ty = match a.base() {
             Aggregate::Count => DataType::BigInt,
             Aggregate::Avg => match b.ty {
@@ -714,19 +725,62 @@ pub(super) fn bind<'a>(
                 .ok_or(SqlError::GroupingError)?,
         })
     };
-    for s in &output_syntax {
-        s.infer(None, &mut parameters, &slot_resolve, &slot_tables)?;
-    }
-    if let Some(f) = &having_syntax {
-        f.infer_with_subqueries(&mut parameters, &slot_resolve, &slot_tables, &subqueries)?;
-    }
-    for (s, _, _) in &order_syntax {
-        s.infer(None, &mut parameters, &slot_resolve, &slot_tables)?;
-    }
-    let outputs = output_syntax
+    let dependent_metadata = lower
+        .dependents
         .iter()
-        .map(|s| s.bind(&slot_resolve, &slot_tables, &parameters))
+        .map(|c| functions::collation::bound_column(*c, &tables[c.source].columns[c.column]))
         .collect::<R<Vec<_>>>()?;
+    let outputs = {
+        let metadata = keys
+            .iter()
+            .map(Some)
+            .chain(
+                aggregates
+                    .iter()
+                    .zip(&aggregate_columns)
+                    .map(|(a, column)| match a {
+                        BoundItem::Aggregate(_, Some(value))
+                            if matches!(
+                                column.data_type,
+                                DataType::Text | DataType::Varchar | DataType::Bpchar
+                            ) =>
+                        {
+                            Some(value)
+                        }
+                        _ => None,
+                    }),
+            )
+            .chain(dependent_metadata.iter().map(Some))
+            .collect::<Vec<_>>();
+        // These IDs belong only to this output-binding overlay. Other group
+        // binders keep the original slot catalog and original column IDs.
+        let mut metadata_table = slot_table.clone();
+        for (i, column) in metadata_table.columns.iter_mut().enumerate() {
+            column.id = i as u64 + 1;
+        }
+        let metadata_tables = [&metadata_table];
+        {
+            let _collations = functions::collation::ColumnScope::enter_refs(
+                &metadata_table.columns,
+                metadata.iter().copied(),
+            )?;
+            for s in &output_syntax {
+                s.infer(None, &mut parameters, &slot_resolve, &metadata_tables)?;
+            }
+        }
+        if let Some(f) = &having_syntax {
+            f.infer_with_subqueries(&mut parameters, &slot_resolve, &slot_tables, &subqueries)?;
+        }
+        for (s, _, _) in &order_syntax {
+            s.infer(None, &mut parameters, &slot_resolve, &slot_tables)?;
+        }
+        let _collations =
+            functions::collation::ColumnScope::enter_refs(&metadata_table.columns, metadata)?;
+        output_syntax
+            .iter()
+            .map(|s| s.bind(&slot_resolve, &metadata_tables, &parameters))
+            .collect::<R<Vec<_>>>()?
+    };
     let output_sources = projection
         .iter()
         .map(|(i, _)| match i {
@@ -802,9 +856,12 @@ pub(super) fn bind<'a>(
             let original = output_order(q, &q.order[i].0, &projection, resolve, tables)?
                 .bind(resolve, tables, &parameters);
             let bound = s.bind(&slot_resolve, &slot_tables, &parameters)?;
-            let bound = if let Some(ty) = original.ok().and_then(|s| s.enum_type(tables)) {
+            let original = original.ok();
+            let bound = if let Some(ty) = original.as_ref().and_then(|s| s.enum_type(tables)) {
                 bound.with_enum(&ty)
             } else { bound };
+            let bound = if let Some(original) = &original { bound.inherit_collation(original)? } else { bound };
+            bound.require_collation()?;
             Ok((bound, *d, *n))
         })
         .collect::<R<Vec<_>>>()?;
@@ -862,7 +919,29 @@ pub(super) fn bind<'a>(
     })
 }
 #[derive(Clone)]
-pub(super) struct Key(pub(super) Vec<Value>);
+pub(super) struct Key(pub(super) Vec<Value>, Vec<Option<String>>);
+impl Key {
+    pub(super) fn plain(values: Vec<Value>) -> Self { Self(values, Vec::new()) }
+    pub(super) fn collated(values: Vec<Value>, scalars: &[BoundScalar]) -> Self {
+        Self(values, scalars.iter().map(|s| s.explicit_collation().expect("bound collation").map(str::to_owned)).collect())
+    }
+    pub(super) fn output(values: Vec<Value>, items: &[BoundItem]) -> Self {
+        Self(values, items.iter().map(|s| match s { BoundItem::Scalar(s) => s.explicit_collation().expect("bound collation").map(str::to_owned), _ => None }).collect())
+    }
+}
+fn cmp_collated(a: &[Value], b: &[Value], collations: &[Option<String>]) -> Ordering {
+    if collations.is_empty() { return cmp_values(a,b); }
+    a.iter().zip(b).enumerate().map(|(i,(a,b))| collations.get(i).and_then(Option::as_deref).map_or_else(|| cmp(a,b), |n| functions::collation::compare(n,a,b))).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
+}
+fn cmp_scalars(a: &[Value], b: &[Value], scalars: &[BoundScalar]) -> Ordering {
+    a.iter().zip(b).enumerate().map(|(i,(a,b))| scalars.get(i).and_then(|s| s.explicit_collation().expect("bound collation")).map_or_else(|| cmp(a,b), |n| functions::collation::compare(n,a,b))).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
+}
+pub(super) fn cmp_output(a: &[Value], b: &[Value], items: &[BoundItem]) -> Ordering {
+    a.iter().zip(b).enumerate().map(|(i,(a,b))| match items.get(i) {
+        Some(BoundItem::Scalar(s)) => s.explicit_collation().expect("bound collation").map_or_else(|| cmp(a,b), |n| functions::collation::compare(n,a,b)),
+        _ => cmp(a,b),
+    }).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
+}
 impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
@@ -876,7 +955,7 @@ impl PartialOrd for Key {
 }
 impl Ord for Key {
     fn cmp(&self, other: &Self) -> Ordering {
-        cmp_values(&self.0, &other.0)
+        cmp_collated(&self.0, &other.0, &self.1)
     }
 }
 /// Grouping and DISTINCT identity order.
@@ -888,9 +967,6 @@ pub(super) fn cmp_values(a: &[Value], b: &[Value]) -> Ordering {
         .unwrap_or_else(|| a.len().cmp(&b.len()))
 }
 type GroupInput = (Vec<Value>, Tuple);
-fn group_key_cmp(a: &GroupInput, b: &GroupInput) -> Ordering {
-    cmp_values(&a.0, &b.0)
-}
 fn retained(values: &[Value]) -> usize {
     std::mem::size_of_val(values) + values.iter().map(value_bytes).sum::<usize>()
 }
@@ -903,6 +979,10 @@ fn page_expr(query: &Query, expr: Option<&Expr>, params: &[Value], limit: bool) 
     }
 }
 impl Grouping {
+    pub(super) fn into_collation_outputs(self) -> Vec<Option<BoundScalar>> {
+        self.outputs.into_iter().map(Some).collect()
+    }
+
     fn initial(&self) -> Vec<Value> {
         self.aggregates
             .iter()
@@ -984,7 +1064,7 @@ impl Grouping {
                     aux.local_transition = true;
                 }
             }
-            groups.insert(Key(vec![]), (initial, auxiliary));
+            groups.insert(Key::plain(vec![]), (initial, auxiliary));
         }
         drop(retention);
         let mut aggregate_work = 0;
@@ -1003,15 +1083,15 @@ impl Grouping {
                 }
                 let mut retention = scope.borrow();
                 let mut key_work = 0;
-                let key = Key(self
+                let key = Key::collated(self
                     .keys
                     .iter()
                     .map(|s| s.eval(row, params, &mut key_work))
-                    .collect::<R<Vec<_>>>()?);
+                    .collect::<R<Vec<_>>>()?, &self.keys);
                 if sort_groups && (!hash || (hash_bytes > spill::work_mem() && !groups.contains_key(&key))) {
                     let bytes = retained(&key.0) + std::mem::size_of::<GroupInput>()
                         + row.values.iter().map(|v| retained(v) + std::mem::size_of::<Vec<Value>>()).sum::<usize>();
-                    return sorter.push((key.0, row.clone()), bytes, group_key_cmp, &mut *retention);
+                    return sorter.push((key.0, row.clone()), bytes, |a,b| cmp_scalars(&a.0,&b.0,&self.keys), &mut *retention);
                 }
                 if !groups.contains_key(&key) {
                     if !hash && groups.len() >= scan::query_row_limit() {
@@ -1079,7 +1159,7 @@ impl Grouping {
         let mut input_work = 0;
         type Group = (Key, (Vec<Value>, Vec<AggregateAuxiliary>));
         let groups: Box<dyn Iterator<Item = R<Group>> + '_> = if sort_groups {
-            let mut sorted = sorter.finish(group_key_cmp, &mut *scope.borrow())?.peekable();
+            let mut sorted = sorter.finish(|a,b| cmp_scalars(&a.0,&b.0,&self.keys), &mut *scope.borrow())?.peekable();
             let sorted_groups = std::iter::from_fn(move || {
                 let (key, mut row) = match sorted.next()? {
                     Ok(first) => first,
@@ -1100,7 +1180,7 @@ impl Grouping {
                             &self.aggregate_columns, &mut values, &mut auxiliary, &mut retention,
                             &row, params, &mut input_work, None)?;
                         match sorted.peek() {
-                            Some(Ok((next, _))) if cmp_values(next, &key) == Ordering::Equal => {
+                            Some(Ok((next, _))) if cmp_scalars(next, &key, &self.keys) == Ordering::Equal => {
                                 row = sorted.next().ok_or(SqlError::Limit)??.1;
                             }
                             _ => break,
@@ -1108,7 +1188,7 @@ impl Grouping {
                     }
                     flush_distinct(&self.aggregates, &self.aggregate_columns, &mut values,
                         &mut auxiliary, &mut retention, &mut input_work)?;
-                    Ok((Key(key), (values, auxiliary)))
+                    Ok((Key::collated(key, &self.keys), (values, auxiliary)))
                 })())
             });
             // In-memory and spilled groups have disjoint keys; merge in key order.
@@ -1138,7 +1218,11 @@ impl Grouping {
         let mut distinct = std::collections::BTreeSet::new();
         let mut skipped = 0;
         for group in groups {
-            let (key, (mut values, auxiliary)) = group?;
+            let (key, (mut values, mut auxiliary)) = group?;
+            // Hash groups can now retain aggregate-local ORDER BY inputs too.
+            // Sorted groups have already flushed their private retention scope.
+            flush_distinct(&self.aggregates, &self.aggregate_columns, &mut values,
+                &mut auxiliary, &mut scope.borrow(), &mut input_work)?;
             finish_aggregates(
                 &self.aggregates,
                 &mut values,
@@ -1193,7 +1277,7 @@ impl Grouping {
                 .map(|s| s.eval(&row, params, &mut work))
                 .collect::<R<Vec<_>>>()?;
             let values = if query.query.distinct() && !v2 {
-                let key = Key(values);
+                let key = Key::collated(values, &self.outputs);
                 if distinct.contains(&key) {
                     continue;
                 }
@@ -1245,7 +1329,7 @@ impl Grouping {
             let sorted = ordered.finish(order_cmp, &mut scope)?;
             let rows: Box<dyn Iterator<Item = R<(SqlRow, Vec<Value>)>>> = if query.query.distinct() {
                 Box::new(spill::unique_external(sorted, keyed_row_bytes,
-                    |a: &(SqlRow, Vec<Value>), b: &(SqlRow, Vec<Value>)| cmp_values(&a.0.values, &b.0.values),
+                    |a: &(SqlRow, Vec<Value>), b: &(SqlRow, Vec<Value>)| cmp_scalars(&a.0.values, &b.0.values, &self.outputs),
                     &mut scope)?)
             } else {
                 Box::new(sorted)

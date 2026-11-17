@@ -28,6 +28,36 @@ pub(super) fn place(query: &mut Query, parameters: &[PgType]) {
     }
 }
 
+/// A correlated catalog lookup can bind its already evaluated outer OIDs before
+/// a comma join is materialized. Keep the original plan immutable and apply
+/// only the existing total-predicate placement rules; no limits are raised.
+pub(super) fn bind_outer(query: &Query, outer: &[Value]) -> (Option<(Source, E)>, usize) {
+    let Source::Join(l,r,on,false,_,false) = &query.source else {return (None,0)};
+    if outer.is_empty() || !matches!(l.as_ref(),Source::Catalog(_))
+        || !matches!(r.as_ref(),Source::Catalog(_)) || *on != truth() {return (None,0);}
+    fn nodes(e: &E) -> usize {1+children(e).into_iter().map(nodes).sum::<usize>()}
+    let work = nodes(&query.filter);
+    if !left_eligible(&query.filter,query.source_width.saturating_add(outer.len()),&[]) {
+        return (None,work.saturating_mul(2));
+    }
+    let mut filter = query.filter.clone();
+    let mut changed = false;
+    walk(&mut filter, &mut |e| {
+        if matches!(e.ty, PgType::Oid | PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Bool)
+            && let K::Column(i) = e.kind
+            && let Some(value) = i.checked_sub(query.source_width).and_then(|i|outer.get(i))
+            && matches!(value, Value::Int(_) | Value::Bool(_) | Value::Null) {
+            e.kind = K::Literal(value.clone());
+            changed = true;
+        }
+    });
+    if !changed {return (None,work.saturating_mul(3));}
+    let mut source = query.source.clone();
+    place_source(&mut source,&mut filter,query.source_width,&[]);
+    push_terms(&mut source,&mut filter,query.source_width,&[]);
+    (Some((source,filter)),work.saturating_mul(query.source_width.saturating_add(4)))
+}
+
 // Optimize each query within its own scope. Derived outputs remain barriers:
 // predicates above them never cross projection, window, grouping, or LIMIT.
 fn place_inputs(source: &mut Source, width: usize, parameters: &[PgType]) {

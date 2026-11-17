@@ -178,7 +178,11 @@ impl Relational {
                 .filter(|(_, ty)| ty.schema() == ddl.name)
                 .map(|(id, _)| *id)
                 .collect();
-            if (!tables.is_empty() || !types.is_empty()) && !ddl.cascade {
+            if (!tables.is_empty() || !types.is_empty() || self.ext.collations.values().any(|c| c.schema == ddl.name)) && !ddl.cascade {
+                if let Some(c) = self.ext.collations.values().find(|c| c.schema == ddl.name) {
+                    user_types::view_replace_error(format!("cannot drop schema {} because other objects depend on it",ddl.name));
+                    user_types::sql_error_detail(format!("collation {}.{} depends on schema {}",c.schema,c.name,c.schema));
+                }
                 return Err(SqlError::DependentObjects);
             }
             if ddl.name == "public" {
@@ -209,6 +213,7 @@ impl Relational {
                 .sequences
                 .retain(|_, sequence| split_key(&sequence.name).0 != ddl.name);
             self.ext.types.retain(|id, _| !types.contains(id));
+            self.ext.collations.retain(|_,c| c.schema != ddl.name);
             self.ext.schemas.remove(&ddl.name);
         }
         Self::normalize_ext(&mut self.ext);

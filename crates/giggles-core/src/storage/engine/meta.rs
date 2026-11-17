@@ -33,7 +33,10 @@ pub(crate) const PROTECTED_RECORDS: u64 = 1 << 21;
 pub(crate) const WRITE_FENCE: u64 = 1 << 22;
 /// Feature bits whose databases export and restore refuse (GD-0061 D8, R3-111).
 pub(crate) const EXPORT_REFUSED: u64 = TASK_CATALOG | PROTECTED_RECORDS;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 23] = [
+/// V2 bits differ from legacy format 53: bit 22 belongs to WRITE_FENCE.
+pub(crate) const USER_COLLATIONS: u64 = 1 << 23;
+pub(crate) const COLUMN_COLLATIONS: u64 = 1 << 24;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 25] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -57,6 +60,8 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 23] = [
     (TASK_CATALOG, "task_catalog"),
     (PROTECTED_RECORDS, "protected_records"),
     (WRITE_FENCE, "write_fence"),
+    (USER_COLLATIONS, "user_collations"),
+    (COLUMN_COLLATIONS, "column_collations"),
 ];
 #[path = "meta_range.rs"]
 mod range_local;
@@ -357,7 +362,9 @@ pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
             | WIDE_ONCE_RECEIPTS
             | TASK_CATALOG
             | PROTECTED_RECORDS
-            | WRITE_FENCE,
+            | WRITE_FENCE
+            | USER_COLLATIONS
+            | COLUMN_COLLATIONS,
     )
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {

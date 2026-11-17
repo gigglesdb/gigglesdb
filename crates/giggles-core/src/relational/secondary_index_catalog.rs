@@ -52,8 +52,9 @@ impl Relational {
         unique: bool,
         cancel: impl FnMut() -> bool,
     ) -> R<u64> {
-        self.create_secondary_index_body(table, epoch, name, columns, unique, true, cancel)
+        self.create_secondary_index_body(table, epoch, name, columns, unique, true, None, cancel)
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_secondary_index_populated_engine(
         &mut self,
         table: &TableDef,
@@ -61,9 +62,10 @@ impl Relational {
         name: &str,
         columns: &[u64],
         unique: bool,
+        collations: Option<&[Option<column_collations::Reference>]>,
         cancel: impl FnMut() -> bool,
     ) -> R<u64> {
-        self.create_secondary_index_body(table, epoch, name, columns, unique, false, cancel)
+        self.create_secondary_index_body(table, epoch, name, columns, unique, false, collations, cancel)
     }
     #[allow(clippy::too_many_arguments)]
     fn create_secondary_index_body(
@@ -74,6 +76,7 @@ impl Relational {
         columns: &[u64],
         unique: bool,
         require_empty: bool,
+        collations: Option<&[Option<column_collations::Reference>]>,
         mut cancel: impl FnMut() -> bool,
     ) -> R<u64> {
         if cancel() {
@@ -140,7 +143,20 @@ impl Relational {
             key_encoding: 1,
             unique,
         };
+        let mut equality_state;
+        let equality = if let Some(collations) = collations {
+            equality_state = self.clone();
+            equality_state.ext.column_collations.insert(id, column_collations::Binding::Index(collations.to_vec()));
+            &equality_state
+        } else { &*self };
         if unique {
+            equality.validate_collated_unique(table, &self.rows[&table.id], std::slice::from_ref(&descriptor), &mut cancel)
+                .map_err(|e| {
+                    if e == SqlError::Duplicate {
+                        user_types::view_replace_error(format!("could not create unique index \"{}\"", split_key(name).1));
+                    }
+                    e
+                })?;
             let proof = self.unique_readiness_engine(
                 &descriptor,
                 self.epoch,
@@ -162,12 +178,16 @@ impl Relational {
                 })?;
             staged
         } else {
-            self.secondary_build_complete_engine(&descriptors, &mut cancel)?
+            equality.secondary_build_complete_engine(&descriptors, &mut cancel)?
         };
         if cancel() {
             return Err(SqlError::Aborted);
         }
         self.secondary = staged;
+        if let Some(collations) = collations {
+            self.ext.column_collations.insert(id, column_collations::Binding::Index(collations.to_vec()));
+            self.ext.ext_version = self.ext.ext_version.max(10);
+        }
         self.next_id = next;
         self.epoch = epoch;
         Ok(id)

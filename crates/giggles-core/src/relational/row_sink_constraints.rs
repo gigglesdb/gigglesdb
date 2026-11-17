@@ -131,11 +131,22 @@ pub(super) fn hydrate(
                         || matches!(action, catalog_ext::Action::NoAction)
                             && *deferral == catalog_ext::Deferral::NotDeferrable);
                     let mut witnessed = false;
+                    let collated = target_columns.iter().any(|id| !before.deterministic_column(*id));
+                    let source_equality = collation_keys::Key::new(before, source, source_columns, None).map_err(CoreError::Sql)?;
                     sink.fk_lookup(
                         &target,
                         target_columns,
-                        converted.as_deref(),
+                        if collated { None } else { converted.as_deref() },
                         parent,
+                        &mut |row| {
+                            if !collated { return Ok(true); }
+                            let candidate = targets.iter().zip(&positions).map(|(a, b)|
+                                if parent { Ok(Some(row.values[*a].clone())) } else {
+                                    query::constraint_key(&row.values[*a], &target.columns[*a].data_type, &source.columns[*b].data_type)
+                                }).collect::<R<Option<Vec<_>>>>()?;
+                            Ok(candidate.as_ref().map(|v| source_equality.values(v)).transpose()?.flatten()
+                                == source_equality.values(&values)?)
+                        },
                         &mut |row| {
                             if existence && witnessed { return Ok(()); }
                             let key = pk(&target, &row.values)?;
@@ -146,7 +157,14 @@ pub(super) fn hydrate(
                             if existence && before.rows[&target.id].contains_key(&key) && effective.is_none() {
                                 return Ok(());
                             }
-                            if !parent {
+                            if collated {
+                                let candidate_values = targets.iter().zip(&positions).map(|(a,b)|
+                                    if parent { Ok(Some(candidate.values[*a].clone())) } else {
+                                        query::constraint_key(&candidate.values[*a], &target.columns[*a].data_type, &source.columns[*b].data_type)
+                                    }).collect::<R<Option<Vec<_>>>>()?;
+                                if candidate_values.as_ref().map(|v| source_equality.values(v)).transpose()?.flatten()
+                                    != source_equality.values(&values)? { return Ok(()); }
+                            } else if !parent {
                                 for ((a, b), value) in targets.iter().zip(&positions).zip(&values) {
                                     if query::constraint_key(&candidate.values[*a], &target.columns[*a].data_type,
                                         &source.columns[*b].data_type)?.as_ref() != Some(value) {

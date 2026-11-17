@@ -138,6 +138,7 @@ struct Diagnostic {
     wire_message: Option<String>,
     wire_detail: Option<&'static str>,
     wire_hint: Option<&'static str>,
+    sql_detail: Option<String>,
     query_id: Option<String>,
     /// GD-0061 R3-310: a task-session refusal (class, error) not yet written
     /// to the read log; the task path logs it with the statement text.
@@ -158,6 +159,7 @@ impl Diagnostic {
     }
     fn core<T>(&mut self, result: Result<T, CoreError>) -> R<T> {
         let message = giggles_core::relational::take_sql_error_message();
+        self.sql_detail = giggles_core::relational::take_sql_error_detail();
         if matches!(
             &result,
             Err(CoreError::Sql(
@@ -167,7 +169,19 @@ impl Diagnostic {
                     | giggles_core::relational::SqlError::Unsupported
                     | giggles_core::relational::SqlError::InvalidTableDefinition
             ))
-        ) {
+        ) || matches!(
+            &result,
+            Err(CoreError::Sql(
+                giggles_core::relational::SqlError::Type
+                    | giggles_core::relational::SqlError::UndefinedObject
+                    | giggles_core::relational::SqlError::CollationMismatch
+                    | giggles_core::relational::SqlError::IndeterminateCollation
+            ))
+        ) && message.as_deref().is_some_and(|m| m.starts_with("collation"))
+        {
+            self.wire_message = message.clone();
+        }
+        if result.is_err() && message.as_deref().is_some_and(|m| m.starts_with("collation ") || m.starts_with("cannot drop collation ") || m.starts_with("cannot drop schema ") || m.starts_with("invalid locale name ") || m.starts_with("deterministic requires ") || m.starts_with("permission denied for schema ") || m.starts_with("must be owner of collation ")) {
             self.wire_message = message;
         }
         if let Err(error @ CoreError::WriteFenced { .. }) = &result {
@@ -218,6 +232,7 @@ fn diagnostic_error(
 ) {
     let message = match code {
         "21000" => "more than one row returned by a subquery used as an expression",
+        "42P22" => "could not determine which collation to use for string comparison",
         "42P10" => "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
         // Task codes: sites that only have the code still send a named message.
         _ if message == GENERIC_MESSAGE => {
@@ -252,7 +267,7 @@ fn diagnostic_error(
     );
     if let Some(detail) = detail {
         b.push(b'D');
-        z(diagnostic.and_then(|d| d.wire_detail).unwrap_or(&detail), &mut b);
+        z(diagnostic.and_then(|d| d.sql_detail.as_deref().or(d.wire_detail)).unwrap_or(&detail), &mut b);
     }
     if let Some(hint) = diagnostic.and_then(|d| d.wire_hint) {
         b.push(b'H');
@@ -738,10 +753,11 @@ fn complete(command: &str, r: &Released<SqlResult>, out: &mut Vec<u8>) -> R<()> 
         frame(b'N', &body, out)?;
     }
     for (message, detail, code) in giggles_core::relational::take_sql_notices() {
+        let severity = if matches!(code, Some("22023" | "01000")) { "WARNING" } else { "NOTICE" };
         let mut body = vec![];
         for (field, value) in [
-            (b'S', "NOTICE"),
-            (b'V', "NOTICE"),
+            (b'S', severity),
+            (b'V', severity),
             (b'C', code.unwrap_or("00000")),
             (b'M', message.as_str()),
         ] {
@@ -2712,6 +2728,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         state.diagnostic = Diagnostic {
             wire_detail: None,
             wire_hint: None,
+            sql_detail: None,
             wire_message: None,
             message: None,
             phase: match tag {
@@ -3137,5 +3154,30 @@ mod replication_role_diagnostic_tests {
         assert!(fields.contains(&b"HAvailable values: origin, replica, local.".as_slice()));
         diagnostic_error("42501", GENERIC_MESSAGE, Some(&Diagnostic::default()), &mut out);
         assert!(!out[5..].split(|b| *b == 0).any(|f| f.first() == Some(&b'H')));
+    }
+}
+
+#[cfg(test)]
+mod collation_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn expression_collation_errors_keep_postgres_diagnostics() {
+        let path = std::env::temp_dir().join(format!("collation-wire-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let admin = giggles_core::Admin::create(&path,giggles_core::Limits::default()).unwrap();
+        let mut session = admin.sql_session();
+        for (sql, code, message) in [
+            (r#"SELECT 1 COLLATE "C""#, "42804", "collations are not supported by type integer"),
+            (r#"SELECT 'a' COLLATE "UND-X-ICU""#, "42704", "collation \"UND-X-ICU\" for encoding \"UTF8\" does not exist"),
+            (r#"SELECT 'a' COLLATE "C" < 'B' COLLATE "und-x-icu""#, "42P21", "collation mismatch between explicit collations \"C\" and \"und-x-icu\""),
+        ] {
+            let mut diagnostic = Diagnostic::default();
+            assert_eq!(diagnostic.core(session.execute(sql,&[],None)).unwrap_err(),code);
+            assert_eq!(diagnostic.wire_message.as_deref(),Some(message));
+            let mut frame = Vec::new();
+            diagnostic_error(code,"fallback",Some(&diagnostic),&mut frame);
+            assert!(frame.windows(message.len()).any(|w| w == message.as_bytes()));
+        }
+        drop(session); drop(admin);
+        if path.is_dir() { std::fs::remove_dir_all(path).unwrap(); } else { std::fs::remove_file(path).unwrap(); }
     }
 }

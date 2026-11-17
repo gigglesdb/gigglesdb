@@ -125,7 +125,7 @@ fn static_catalog_descriptors_and_empty_rows() {
         vec![vec![Value::Int(2603)]]
     );
     let result = run("select * from pg_catalog.pg_collation", &[]);
-    assert!(result.rows.is_empty(), "pg_collation");
+    assert_eq!(result.rows.len(), 880, "pg_collation");
     assert_eq!(
         result
             .fields
@@ -140,8 +140,10 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("collprovider", PgType::Char),
             ("collisdeterministic", PgType::Bool),
             ("collencoding", PgType::Int4),
-            ("collcollate", PgType::Name),
-            ("collctype", PgType::Name),
+            ("collcollate", PgType::Text),
+            ("collctype", PgType::Text),
+            ("colllocale", PgType::Text),
+            ("collicurules", PgType::Text),
             ("collversion", PgType::Text),
         ],
         "pg_collation"

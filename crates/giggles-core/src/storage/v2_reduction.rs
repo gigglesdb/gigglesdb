@@ -142,6 +142,7 @@ impl RowSource for Source<'_> {
         let index = rows.scan_index(table);
         let mut range = range.clone();
         if range.lo == Bound::Unbounded && range.hi == Bound::Unbounded
+            && table.primary_key.iter().all(|i| !rows.parts.ext.column_collations.contains_key(&table.columns[*i].id))
             && table.primary_key.iter().all(|i| rows.parts.ext.columns
                 .get(&table.columns[*i].id).is_none_or(|c| c.type_id.is_none()))
             && let Some(primary) = relational::row_sink::reduction_range(table, rows.prepared, rows.params) {
@@ -162,6 +163,7 @@ impl RowSource for Source<'_> {
         -> Result<Option<scan::SourceRows<'s>>, SqlError> {
         let page_rows = if first { 1 } else { 200 };
         let rows = self.rows.borrow();
+        if keys.iter().any(|(i,_)|rows.parts.ext.column_collations.contains_key(&table.columns[*i].id)) {return Ok(None);}
         let primary = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>();
         let prefix = |ids: &[u64]| ids.iter().take_while(|id| keys.iter().any(|(i, _)|
             table.columns[*i].id == **id && rows.parts.ext.columns.get(id).is_none_or(|c| c.type_id.is_none())))

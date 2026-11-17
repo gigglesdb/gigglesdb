@@ -41,7 +41,7 @@ fn extension_v8_rejects_version_tag_empty_and_excessive_births() {
     let (_, mut ext, _) = fixture();
     ext.constraints.clear();
     let bytes = codec().serialize(&ext).unwrap();
-    let mut unknown = bytes.clone(); unknown[..4].copy_from_slice(&9u32.to_be_bytes());
+    let mut unknown = bytes.clone(); unknown[..4].copy_from_slice(&11u32.to_be_bytes());
     assert!(codec().deserialize::<CatalogExt>(&unknown).unwrap_err().to_string().contains(UNSUPPORTED_CATALOG_EXT));
     // Seven empty maps followed by a bounded birth map.
     let mut empty = codec().serialize(&(8u32, [0u64; 8])).unwrap();

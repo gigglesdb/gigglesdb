@@ -350,6 +350,7 @@ pub(super) fn bind(
                 operand(a, &at, resolve, tables, parameters)?,
                 operand(b, &bt, resolve, tables, parameters)?,
             ];
+            collation::derive(args.iter())?;
             if *op == BinaryOp::Concat {
                 for argument in &mut args {
                     if session_sensitive(&argument.ty, &DataType::Text) {

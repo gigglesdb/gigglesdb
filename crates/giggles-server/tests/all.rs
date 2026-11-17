@@ -322,3 +322,7 @@ mod cluster_replace;
 #[path = "write_fence_holder_network.rs"]
 mod write_fence_holder_network;
 #[path = "role_cache_network.rs"] mod role_cache_network;
+#[path = "user_collation_network.rs"]
+mod user_collation_network;
+
+#[path="column_collation_network.rs"] mod column_collation_network;

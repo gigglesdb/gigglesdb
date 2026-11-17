@@ -2,7 +2,10 @@
 use super::*;
 use crate::relational::Relational;
 pub(crate) const KEY_DEPENDENCY_IDENTITY: u64 = 1 << 17;
-pub(super) const NEW_BITS: u64 = 0x3c0 | KEY_DEPENDENCY_IDENTITY;
+// Legacy format 53 has no WRITE_FENCE; retain its independent bit assignments.
+pub(crate) const COLUMN_COLLATIONS: u64 = 1 << 23;
+pub(crate) const USER_COLLATIONS: u64 = 1 << 22;
+pub(super) const NEW_BITS: u64 = 0x3c0 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS;
 pub(super) const ROLE_BOOTSTRAP: u64 = 1 << 9;
 
 /// E1 B0b: true when CatalogExt is nonempty.
@@ -41,6 +44,8 @@ pub(super) fn feature_bits_present(s: &State) -> Result<u64, CoreError> {
         | (u64::from(extended_types_present(s)) << 7)
         | (u64::from(sequence_counters_present(s)) << 8)
         | (u64::from(role_bootstrap_present(s)) << 9)
+        | if !s.sql.catalog_ext().column_collations.is_empty() { COLUMN_COLLATIONS } else { 0 }
+        | if !s.sql.catalog_ext().collations.is_empty() { USER_COLLATIONS } else { 0 }
         | if s.sql.catalog_ext().has_key_dependency_identity() { KEY_DEPENDENCY_IDENTITY } else { 0 })
 }
 
@@ -70,13 +75,13 @@ pub(super) fn decode_bits(
         .and_then(|v| v.as_slice().try_into().ok())
         .ok_or_else(|| CoreError::Corrupt("missing or malformed feature record".into()))?;
     let bits = u64::from_be_bytes(bytes);
-    if bits & !(1023 | KEY_DEPENDENCY_IDENTITY) != 0 {
+    if bits & !(1023 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS) != 0 {
         return Err(CoreError::Unsupported);
     }
     if import && bits & ROLE_BOOTSTRAP != 0 {
         return Err(CoreError::Unsupported);
     }
-    if bits & NEW_BITS == 0 || (bits & (256 | KEY_DEPENDENCY_IDENTITY) != 0 && bits & 64 == 0) {
+    if bits & NEW_BITS == 0 || (bits & (256 | KEY_DEPENDENCY_IDENTITY | USER_COLLATIONS | COLUMN_COLLATIONS) != 0 && bits & 64 == 0) {
         return Err(CoreError::Corrupt("noncanonical feature bits".into()));
     }
     Ok(Some(bits))
@@ -119,4 +124,19 @@ fn text_kind_requires_catalog_and_extended_feature_bits() {
         from_records_mode(map, &mut || false, false),
         Err(CoreError::Corrupt(_))
     ));
+}
+
+#[cfg(test)]
+#[test]
+fn user_collations_require_feature_witness_and_roundtrip() {
+    use crate::relational::Prepared;
+    let mut state=empty(17);
+    assert_eq!(feature_bits_present(&state).unwrap() & USER_COLLATIONS,0);
+    let p=Prepared::parse("CREATE COLLATION n (provider=icu,locale='und')",17,0).unwrap();
+    state.sql.execute(&p,&[],None).unwrap();
+    let bits=feature_bits_present(&state).unwrap(); assert_ne!(bits & USER_COLLATIONS,0);
+    let records=records(&state).unwrap();
+    assert_eq!(from_records_mode(records.clone(),&mut || false,false).unwrap().sql.catalog_ext().collations.len(),1);
+    let mut bad=records; bad.insert(vec![10],(bits & !USER_COLLATIONS).to_be_bytes().to_vec());
+    assert!(from_records_mode(bad,&mut || false,false).is_err());
 }

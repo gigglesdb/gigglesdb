@@ -619,8 +619,9 @@ impl SqlSession {
                             // stall every later application writer of the table, against
                             // spec section 5. Row locks in `SqlRows::apply` and read-set
                             // validation at commit keep the run correct.
-                            let shared = fixed_snapshot || append || candidates.is_some() || upsert.is_some()
-                                || protected;
+                            let collated = binding.has_nondeterministic_keys(table);
+                            let shared = !collated && (fixed_snapshot || append || candidates.is_some() || upsert.is_some()
+                                || protected);
                             txn.lock_sql_sentinel(table.id,
                                 if shared { LockMode::Shared } else { LockMode::Exclusive },
                                 &|| crate::cancellation::check().is_err())?;
@@ -749,7 +750,7 @@ impl SqlSession {
                             let floor = catalog.allocation_floor().map_err(CoreError::Sql)?;
                             floor..floor
                         };
-                        let versions = if matches!(class, V2Class::Dml) {
+                        let versions = if matches!(class, V2Class::Dml) || p.is_create_as() {
                             if let Some(range) = self
                                 .copy_input
                                 .as_ref()
@@ -865,7 +866,7 @@ impl SqlSession {
                             return result.map_err(CoreError::Sql);
                         }
                         bound.check_view_drop(&image).map_err(CoreError::Sql)?;
-                        let result = if matches!(bound.command(), "COMMENT" | "SECURITY LABEL" | "CREATE VIEW" | "DROP VIEW") { Ok(Default::default()) } else { image.execute_with_sink(
+                        let result = if !bound.is_collation_ddl() && matches!(bound.command(), "COMMENT" | "SECURITY LABEL" | "CREATE VIEW" | "DROP VIEW") { Ok(Default::default()) } else { image.execute_with_sink(
                             p,
                             params,
                             expected_version,
@@ -1268,12 +1269,23 @@ impl RowSink for SqlRows<'_> {
     // SHARE); referencing rows of a parent key are read at the latest state.
     fn fk_lookup(
         &mut self, table: &TableDef, columns: &[u64], values: Option<&[relational::Value]>,
-        parent: bool, visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
+        parent: bool, matches: &mut dyn FnMut(&SqlRow) -> Result<bool, SqlError>,
+        visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
     ) -> Result<(), CoreError> {
         if matches!(self.txn.services(), engine::txn::TxnServices::Cluster(_)) {
             let ts = self.txn.snapshot_ts();
             if !parent {
-                return self.at_latest(|rows| rows.lookup_all(table, columns, values, false, visit));
+                return self.at_latest(|rows| rows.lookup_all(table, columns, values, false, &mut |row| {
+                    if matches(&row)? { visit(row)?; }
+                    Ok(())
+                }));
+            }
+            if values.is_none() {
+                // ICU-equal parents have no exact byte probe. Shared sentinels
+                // are lazy write intents in a cluster, so take the eager parent
+                // sentinel to keep matching owners stable through child commit.
+                self.txn.lock_sql_sentinel(table.id, LockMode::Exclusive,
+                    &|| crate::cancellation::check().is_err())?;
             }
             if let Some(values) = values {
                 let primary = table.primary_key.iter().map(|i| table.columns[*i].id)
@@ -1304,11 +1316,13 @@ impl RowSink for SqlRows<'_> {
                 // Keep the snapshot witness too: a parent deleted during the lock
                 // wait must produce 40001 even though the latest lookup is empty.
                 self.lookup_all(table, columns, values, true, &mut |row| {
+                    if !matches(&row)? { return Ok(()); }
                     seen.push(row.values);
                     Ok(())
                 })?;
             }
             self.at_latest(|rows| rows.lookup_all(table, columns, values, true, &mut |row| {
+                if !matches(&row)? { return Ok(()); }
                 if fixed { seen.push(row.values.clone()); }
                 visit(row)
             }))?;
@@ -1320,7 +1334,10 @@ impl RowSink for SqlRows<'_> {
             return Ok(());
         }
         if self.statement_snapshot_is_latest() {
-            return self.lookup_all(table, columns, values, parent, visit);
+            return self.lookup_all(table, columns, values, parent, &mut |row| {
+                if matches(&row)? { visit(row)?; }
+                Ok(())
+            });
         }
         let ts = self.txn.snapshot_ts();
         if parent {
@@ -1328,6 +1345,7 @@ impl RowSink for SqlRows<'_> {
             // inserted later stays invisible, and the child fails with 23503.
             let mut seen = Vec::new();
             self.lookup_all(table, columns, values, true, &mut |row| {
+                if !matches(&row)? { return Ok(()); }
                 seen.push(row.values.clone());
                 visit(row)
             })?;
@@ -1338,7 +1356,10 @@ impl RowSink for SqlRows<'_> {
             }
             return Ok(());
         }
-        self.at_latest(|rows| rows.lookup_all(table, columns, values, false, visit))
+        self.at_latest(|rows| rows.lookup_all(table, columns, values, false, &mut |row| {
+            if matches(&row)? { visit(row)?; }
+            Ok(())
+        }))
     }
     fn fk_child_page(
         &mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
@@ -1681,6 +1702,25 @@ impl RowSink for SqlRows<'_> {
     fn begin_conflict_pages(&mut self, floor: u64) {
         self.conflict_floor = Some(floor);
     }
+    fn collated_lookup(
+        &mut self,
+        table: &TableDef,
+        key: &relational::collation_keys::Key,
+        tuples: &BTreeSet<Vec<u8>>,
+        arbiter: bool,
+        visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
+    ) -> Result<(), CoreError> {
+        let floor = self.conflict_floor;
+        self.lookup_all(table, &[], None, true, &mut |row| {
+            if key.tuple(&row.values)?.is_some_and(|tuple| tuples.contains(&tuple)) {
+                if arbiter && floor.is_some_and(|v| row.version >= v) {
+                    return Err(SqlError::CardinalityViolation);
+                }
+                visit(row)?;
+            }
+            Ok(())
+        })
+    }
     fn conflict_lookup(
         &mut self,
         table: &TableDef,
@@ -1811,6 +1851,8 @@ impl RowSink for SqlRows<'_> {
         before: &BTreeMap<Vec<u8>, SqlRow>,
         after: &BTreeMap<Vec<u8>, SqlRow>,
     ) -> Result<(), CoreError> {
+        let mut image = relational::Relational::catalog_image(self.parts.tables.clone(), self.parts.ext.clone(), u64::MAX, 1).map_err(CoreError::Sql)?;
+        image.catalog_indexes(&self.parts.indexes).map_err(CoreError::Sql)?;
         for (key, row) in after {
             if before.contains_key(key) {
                 continue;
@@ -1831,8 +1873,35 @@ impl RowSink for SqlRows<'_> {
                 .current
                 .is_some()
             {
-                return Err(CoreError::Sql(SqlError::Duplicate));
+                return Err(CoreError::Sql(image.primary_duplicate(table)));
             }
+        }
+        if image.has_nondeterministic_keys(table) {
+            // UNIQUE checks see committed owners even with a fixed transaction
+            // snapshot. The exclusive SQL sentinel serializes collation probes.
+            image.validate_collated_unique(table, after, &self.parts.indexes,
+                &mut || crate::cancellation::check().is_err()).map_err(CoreError::Sql)?;
+            let keys = image.collated_unique_keys(table, &self.parts.indexes).map_err(CoreError::Sql)?
+                .into_iter().map(|(key, name)| {
+                    let tuples = after.iter().filter(|(pk, row)| before.get(*pk) != Some(*row))
+                        .map(|(_, row)| key.tuple(&row.values)).collect::<Result<Vec<_>, _>>()?
+                        .into_iter().flatten().collect::<BTreeSet<_>>();
+                    Ok((key, name, tuples))
+                }).collect::<Result<Vec<_>, SqlError>>().map_err(CoreError::Sql)?;
+            // Scan without retaining the table: only this publication page's
+            // proposals consume memory, even beyond the legacy row cap.
+            self.at_latest(|source| source.lookup_all(table, &[], None, true, &mut |row| {
+                let pk = relational::row_sink::row_key(table, &row)?;
+                // Only replaced/deleted owners are excluded. An unchanged
+                // snapshot witness may have different values in latest state.
+                if before.get(&pk) != after.get(&pk) { return Ok(()); }
+                for (key, name, tuples) in &keys {
+                    if key.tuple(&row.values)?.is_some_and(|tuple| tuples.contains(&tuple)) {
+                        return Err(relational::collation_keys::duplicate(name));
+                    }
+                }
+                Ok(())
+            }))?;
         }
         engine::indexes::check_occupancy(self.txn, table, before, after, &self.parts.indexes)
     }
@@ -2312,6 +2381,15 @@ impl SqlRows<'_> {
                     {
                         return None;
                     }
+                    let binding=parts.ext.column_collations.get(&column.id);
+                    let reference=match binding {Some(relational::column_collations::Binding::Column(r))=>Some(r),_=>None};
+                    let deterministic= !matches!(reference,Some(relational::column_collations::Reference::User(id)) if parts.ext.collations.get(id).is_some_and(|c|!c.deterministic));
+                    let byte_ordered=reference.is_none_or(|r|matches!(r,relational::column_collations::Reference::Builtin(100|811|950|951|962|6411|12359)));
+                    // An explicitly collated index can serve only the same semantics as the column.
+                    if let Some(relational::column_collations::Binding::Index(rs))=parts.ext.column_collations.get(&d.id)
+                        && rs.first().and_then(Option::as_ref)!=reference {return None;
+                    }
+                    if !deterministic {return None;}
                     let (mut lower, mut upper) = (None, None);
                     let mut usable = false;
                     for (name, op, value) in predicates {
@@ -2321,6 +2399,7 @@ impl SqlRows<'_> {
                         {
                             continue;
                         }
+                        if op != "=" && !byte_ordered {continue;}
                         let tuple = codec::index_tuple_bytes(
                             std::slice::from_ref(value),
                             &[codec::Direction::Asc],

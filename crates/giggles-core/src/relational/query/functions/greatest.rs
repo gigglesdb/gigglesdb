@@ -133,23 +133,23 @@ pub(super) fn bind(
             }
         })
         .collect();
-    Ok(BoundScalar {
+    let args: Vec<BoundScalar> = args;
+    if let Some(n) = collation::derive(args.iter())? { collation::ready(n)?; }
+    let result = BoundScalar {
         ty,
         node: Node::Call(name.into(), args),
-    })
+    };
+    Ok(if let Some(ty) = enum_ty {result.with_enum(&ty)} else {result})
 }
 
-pub(super) fn eval(name: &str, values: Vec<Value>, input: Option<&BoundScalar>) -> Value {
+pub(super) fn eval(name: &str, values: Vec<Value>, input: &BoundScalar) -> R<Value> {
     let mut best = Value::Null;
     for value in values {
         if value == Value::Null {
             continue;
         }
         if best == Value::Null
-            || input.map_or_else(
-                || cmp(&value, &best),
-                |input| input.compare_values(&value, &best),
-            ) == if name == "greatest" {
+            || input.try_compare_values(&value, &best)? == if name == "greatest" {
                 Ordering::Greater
             } else {
                 Ordering::Less
@@ -158,5 +158,5 @@ pub(super) fn eval(name: &str, values: Vec<Value>, input: Option<&BoundScalar>) 
             best = value;
         }
     }
-    best
+    Ok(best)
 }

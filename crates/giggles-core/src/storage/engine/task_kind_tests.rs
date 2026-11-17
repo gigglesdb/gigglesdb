@@ -344,14 +344,11 @@ fn bit_20_without_role_catalog_is_corrupt() {
 }
 
 #[test]
-fn unknown_bit_22_is_unsupported() {
+fn unknown_bit_25_is_unsupported() {
     // Bit 18 is RANGES, bit 19 WIDE_ONCE_RECEIPTS, bit 20 TASK_CATALOG and
-    // bit 21 PROTECTED_RECORDS (R3-600); bit 22 is the first unassigned one.
-    for bits in [
-        1 << 23,
-        (1 << 23) | TASK_CATALOG | ROLES,
-        1 << 23 | TASK_CATALOG,
-    ] {
+    // bit 21 PROTECTED_RECORDS (R3-600); bit 22 WRITE_FENCE; bit 23 USER_COLLATIONS; bit 24 COLUMN_COLLATIONS.
+    // Bit 25 is the first unassigned one.
+    for bits in [1 << 25, (1 << 25) | TASK_CATALOG | ROLES, 1 << 25 | TASK_CATALOG] {
         assert_eq!(
             meta::check_features(bits),
             Err(FormatError::Unsupported("feature bits".into()))

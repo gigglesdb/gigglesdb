@@ -6,6 +6,7 @@ build = "build.rs"
 autotests = false
 
 [dependencies]
+giggles-icu = { path = "../giggles-icu" }
 giggles-pg-types = { path = "../giggles-pg-types" }
 sqlparser = { version = "=0.53.0", features = ["visitor"] }
 regex = "=1.12.2"

@@ -2005,6 +2005,29 @@ impl Session {
     }
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
         self.admit_backstop(p.task_class())?;
+        if p.is_collation_ddl() {
+            let allowed = if let Role::Database { name } = &self.role {
+                let roles = self.service.admin.roles();
+                let role = roles.get(name).map_err(|_| CoreError::Policy(Error::Authentication))?
+                    .filter(|r| r.login && self.service.role_generation_matches(r, self.role_epoch()))
+                    .ok_or(CoreError::Policy(Error::Authentication))?;
+                if let Some(owner) = p.collation_new_owner() && roles.get(owner).map_err(|_| CoreError::Policy(Error::Scope))?.is_none() {
+                    return Err(CoreError::Sql(relational::SqlError::UndefinedObject));
+                }
+                let targets = self.sql.collation_authority(p)?;
+                role.superuser || targets.iter().all(|(schema, owner)| match owner {
+                    Some(owner) => owner == name && p.collation_new_owner().is_none_or(|o| o == name),
+                    None => self.sql.schema_metadata().ok().is_some_and(|m| m.schemas.get(schema).is_some_and(|(_,o)| o == name))
+                        || roles.schema_privileges(schema,name).is_ok_and(|v| v.contains(&roles::SchemaPrivilege::Create)),
+                })
+            } else { false };
+            if !allowed {
+                let targets = self.sql.collation_authority(p)?;
+                p.collation_permission_error(targets.iter().find(|(_,o)| o.is_none()).map(|(s,_)| s.as_str()));
+                self.sql.abort(); return Err(CoreError::Policy(Error::Scope));
+            }
+            return Ok(());
+        }
         if let Some((schema, owner, create)) = p.schema_ddl() {
             let allowed = if let Role::Database { name } = &self.role {
                 let roles = self.service.admin.roles();

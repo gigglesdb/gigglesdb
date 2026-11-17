@@ -442,6 +442,8 @@ impl BoundScalar {
                 Ok(Some(Value::Null))
             }
             Node::Call(name, args) => {
+                if collation::internal(name) { return args[0].plan_constant(budget); }
+                if collation::derive(args.iter())?.is_some() { return Ok(None); }
                 let mut values = Vec::with_capacity(args.len());
                 let mut dependent = false;
                 for a in args {

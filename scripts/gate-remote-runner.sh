@@ -164,6 +164,17 @@ mkdir -p "$jroot/gigglesdb-work/tmp"
 export TEMP=j:/gigglesdb-work/tmp TMP=j:/gigglesdb-work/tmp TMPDIR=$jroot/gigglesdb-work/tmp
 for c in giggles-*; do ln -sfn "$jroot" "$c/j:"; done
 note "gate at $(git rev-parse HEAD) on $(uname -m) $(rustc --version)"
+s=$(date +%s); progress "ICU provisioning"
+if icu_dir=$(bash ../scripts/icu/provision.sh 2> "$out/icu-provision.log"); then
+  export GIGGLES_ICU_DIR="$icu_dir"
+  note "ICU provisioning: ok ($(( $(date +%s) - s ))s) $GIGGLES_ICU_DIR"
+else
+  note "ICU provisioning failed ($(( $(date +%s) - s ))s); see icu-provision.log"
+  note "RESULT: FAIL"
+  progress "done rc=1 (ICU provisioning failed)"
+  echo "rc=1" > "$out/done"
+  exit 1
+fi
 for step in "$@"; do
   crate=${step%%:*}; mode=default; files=''
   case "$step" in

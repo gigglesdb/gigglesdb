@@ -397,7 +397,7 @@ impl Visitor for Scan {
             self.view_definitions |= function(&f.name).is_ok_and(|n| n == "pg_get_viewdef");
             let introspection = function(&f.name).is_ok_and(|n| matches!(n.as_str(),
                 "pg_get_indexdef" | "pg_get_constraintdef" | "pg_get_expr"
-                | "pg_get_userbyid" | "format_type" | "obj_description"
+                | "pg_get_userbyid" | "format_type" | "obj_description" | "pg_collation_actual_version"
                 | "col_description" | "shobj_description" | "pg_get_viewdef"
                 | "has_table_privilege" | "has_column_privilege"));
             self.introspection |= introspection;
@@ -614,6 +614,22 @@ fn bounded_projection(tokens: &[Token]) -> bool {
     depth == 0
 }
 
+// psql qualifies its catalog regex patterns with pg_catalog.default. Preserve
+// that existing catalog path while core continues to own scalar COLLATE.
+fn catalog_default_collation(tokens: &[Token]) -> bool {
+    let flat = tokens.iter().filter(|t|!matches!(t,Token::Whitespace(_))).collect::<Vec<_>>();
+    let word = |t: &&Token, name: &str| matches!(t, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(name));
+    let catalog_source = flat.windows(4).any(|s| {
+        (word(&s[0],"from") || word(&s[0],"join")) && word(&s[1],"pg_catalog")
+            && *s[2]==Token::Period && matches!(s[3],Token::Word(w) if catalog::relation_oid(&w.value.to_ascii_lowercase()).is_some())
+    });
+    catalog_source && flat.iter().enumerate().all(|(i,t)| {
+        !word(t,"pg_collation_for") && (!word(t,"collate") || flat.get(i+1..i+4).is_some_and(|s| {
+            word(&s[0],"pg_catalog") && *s[1]==Token::Period && word(&s[2],"default")
+        }))
+    })
+}
+
 fn plan_inner(
     sql: &str,
     gateway: bool,
@@ -648,6 +664,11 @@ fn plan_inner(
     }
     if constructors > 256 && !bounded_projection(&tokens) {
         return flat_union::plan(tokens, gateway);
+    }
+    // Core carries collation derivation through scalar binding and execution.
+    if gateway && tokens.iter().any(|t| matches!(t, Token::Word(w) if w.quote_style.is_none() && (w.value.eq_ignore_ascii_case("collate") || w.value.eq_ignore_ascii_case("pg_collation_for"))))
+        && !catalog_default_collation(&tokens) {
+        return Ok(None);
     }
     // Core owns pg_typeof expression typing, including nested regtype results.
     if tokens.windows(2).any(|pair| matches!(&pair[0], Token::Word(w) if w.value.eq_ignore_ascii_case("pg_typeof")) && pair[1] == Token::LParen) {
@@ -2110,6 +2131,12 @@ impl Compiler {
                 };
                 let lhs = operand(left)?;
                 let rhs = operand(right)?;
+                // This frontend cannot retain competing explicit collations.
+                if let (A::Collate { collation: a, .. }, A::Collate { collation: b, .. }) = (left, right)
+                    && object(a).last() != object(b).last()
+                {
+                    return Err(Error::Unsupported);
+                }
                 if (matches!(left, A::Collate { .. }) || matches!(right, A::Collate { .. }))
                     && (!matches!(lhs.ty, PgType::Text | PgType::Varchar | PgType::Name)
                         || !matches!(rhs.ty, PgType::Text | PgType::Varchar | PgType::Name))
@@ -2318,6 +2345,10 @@ impl Compiler {
                         (K::Call("_regtype".into(), vec![*e]), PgType::Oid)
                     }
                     "regclass" => (K::Regclass(e), PgType::Oid),
+                    "regcollation" => {
+                        expect(&mut e, PgType::Oid)?;
+                        (K::Call("_regcollation_display".into(), vec![*e]), PgType::Text)
+                    }
                     "regnamespace" => {
                         if let K::Literal(Value::Text(name)) = &e.kind {
                             let oid = match name.as_str() {
@@ -3309,7 +3340,7 @@ fn check_expr(e: &mut E) -> R<()> {
                     expect(&mut args[1], PgType::Text)?;
                 }
             }
-            "pg_get_userbyid" | "pg_table_is_visible" | "pg_type_is_visible" => {
+            "pg_get_userbyid" | "pg_table_is_visible" | "pg_type_is_visible" | "pg_collation_actual_version" => {
                 expect(&mut args[0], PgType::Oid)?
             }
             "has_table_privilege" | "has_column_privilege" => {
@@ -3370,6 +3401,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         | ("substring", 2 | 3)
         | ("pg_get_expr", 2 | 3)
         | ("format_type", 2)
+        | ("pg_collation_actual_version", 1)
         | ("obj_description", 1 | 2)
         | ("shobj_description", 2)
         | ("col_description", 2) => PgType::Text,
@@ -3864,7 +3896,10 @@ impl Runtime<'_> {
             flat_union::validate_wrapper(q)?;
             return self.source(&q.source, outer);
         }
-        let source = self.source(&q.source, outer)?;
+        let (bound, work) = join_selection::bind_outer(q, outer);
+        self.charge(work)?;
+        let (input, filter) = bound.as_ref().map_or((&q.source, &q.filter), |(source,filter)| (source,filter));
+        let source = self.source(input, outer)?;
         let mut filtered = vec![];
         let mut bytes = 0;
         for mut row in source {
@@ -3875,7 +3910,7 @@ impl Runtime<'_> {
                 return Err(Error::Limit);
             }
             row.extend_from_slice(outer);
-            if boolean(self.eval(&q.filter, &row, None, 0, &[], None)?)? == Some(true) {
+            if boolean(self.eval(filter, &row, None, 0, &[], None)?)? == Some(true) {
                 admit(&filtered, &row, &mut bytes)?;
                 filtered.push(row)
             }
@@ -4695,6 +4730,25 @@ impl Runtime<'_> {
         if matches!(n, "_array_subscripts" | "_vector_subscripts") {
             return subscripts::evaluate(self, n, v, remaining);
         }
+        if n == "_regcollation_display" {
+            if v[0] == N {return Ok(N);}
+            if v[0] == I(0) {return Ok(S("-".into()));}
+            let collations = &self.catalogs["pg_collation"].rows;
+            let namespaces = &self.catalogs["pg_namespace"].rows;
+            let mut path = self.snapshot.search_path.clone();
+            if !path.iter().any(|n| n == "pg_catalog") {path.insert(0,"pg_catalog".into());}
+            self.charge((path.len()+1).saturating_mul(collations.len()+namespaces.len()))?;
+            let Some(collation) = collations.iter().find(|r|r[0]==v[0]) else {
+                return Ok(S(integer(v[0].clone())?.to_string()));
+            };
+            let name = catalog::quote_identifier(&text(collation[1].clone())?);
+            let visible = path.iter().filter_map(|name| namespaces.iter().find(|r|r[1]==S(name.clone())))
+                .find_map(|namespace|collations.iter().find(|r|r[1]==collation[1] && r[2]==namespace[0]))
+                .is_some_and(|first|first[0]==v[0]);
+            if visible {return Ok(S(name));}
+            let schema = namespaces.iter().find(|r|r[0]==collation[2]).ok_or(Error::Type)?;
+            return Ok(S(format!("{}.{}",catalog::quote_identifier(&text(schema[1].clone())?),name)));
+        }
         if n == "_regclass_display" {
             if v[0] == N { return Ok(N); }
             self.charge(self.catalogs["pg_class"].rows.len() + self.catalogs["pg_namespace"].rows.len())?;
@@ -5362,6 +5416,17 @@ impl Runtime<'_> {
                 // No PostgreSQL heap/index files or scan counters are maintained.
                 // Zero measures those surfaces, not the shared engine's disk use.
                 if n == "pg_stat_get_numscans" || self.catalogs["pg_class"].rows.iter().any(|r| r[0] == v[0]) { I(0) } else { N }
+            }
+            "pg_collation_actual_version" => {
+                if let Some(row) = self.catalogs["pg_collation"].rows.iter().find(|r| r[0] == v[0]) {
+                    if row[4] == S("i".into()) {
+                        let locale = text(row[9].clone())?;
+                        let rules = if row[10] == N { None } else { Some(text(row[10].clone())?) };
+                        S(giggles_icu::Collator::open(&locale, rules.as_deref()).map_err(|_| Error::Unsupported)?.version())
+                    } else if row[4] == S("b".into()) { S("1".into()) }
+                    else if row[4] == S("c".into()) && row[7] == S("en_US.utf8".into()) { S("2.41".into()) }
+                    else { N }
+                } else { N }
             }
             "obj_description" | "col_description" => description(&self.catalogs["pg_description"].rows, n, &v),
             "shobj_description" => {

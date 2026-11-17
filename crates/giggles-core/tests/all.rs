@@ -529,3 +529,21 @@ mod v2_on_conflict_caps;
 #[path = "task_limits.rs"] mod task_limits;
 #[path = "task_exposure.rs"] mod task_exposure;
 #[path = "task_statements.rs"] mod task_statements;
+#[path = "expression_collation.rs"]
+mod expression_collation;
+
+#[path = "user_collation_ddl.rs"]
+mod user_collation_ddl;
+
+#[path = "column_collation_ddl.rs"] mod column_collation_ddl;
+#[path = "column_collation_query.rs"] mod column_collation_query;
+#[path = "column_collation_index.rs"] mod column_collation_index;
+
+#[path = "nondeterministic_unique.rs"] mod nondeterministic_unique;
+#[path = "nondeterministic_foreign_key.rs"] mod nondeterministic_foreign_key;
+#[path = "aggregate_collation_planning.rs"] mod aggregate_collation_planning;
+
+#[path = "window_collation.rs"] mod window_collation;
+
+#[path = "dml_collation.rs"]
+mod dml_collation;

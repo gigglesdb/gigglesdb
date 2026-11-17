@@ -363,7 +363,7 @@ pub(super) fn parse_expression(p: &mut Parser, value: Scalar) -> R<Scalar> {
             if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
                 return Err(SqlError::Unsupported);
             }
-            Ok(Scalar::Domain(Box::new(value), name, Err(error)))
+            Ok(Scalar::Domain(Box::new(value), name, Box::new(Err(error))))
         }
         Err(error) => Err(error),
     }

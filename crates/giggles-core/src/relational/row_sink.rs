@@ -65,9 +65,13 @@ pub(crate) trait RowSink {
         columns: &[u64],
         values: Option<&[Value]>,
         parent: bool,
+        matches: &mut dyn FnMut(&SqlRow) -> R<bool>,
         visit: &mut dyn FnMut(SqlRow) -> R<()>,
     ) -> Result<(), CoreError> {
-        self.lookup(table, columns, values, parent, visit)
+        self.lookup(table, columns, values, parent, &mut |row| {
+            if matches(&row)? { visit(row)?; }
+            Ok(())
+        })
     }
     /// `read_page` of referencing rows queued for a NO ACTION check, read like
     /// `fk_lookup`'s referencing rows.
@@ -128,6 +132,23 @@ pub(crate) trait RowSink {
         visit: &mut dyn FnMut(SqlRow) -> R<()>,
     ) -> Result<(), CoreError> {
         self.lookup(table, columns, Some(values), true, visit)
+    }
+
+    /// Byte indexes cannot probe ICU equality. Retain only matching owners.
+    fn collated_lookup(
+        &mut self,
+        table: &TableDef,
+        key: &collation_keys::Key,
+        tuples: &BTreeSet<Vec<u8>>,
+        _arbiter: bool,
+        visit: &mut dyn FnMut(SqlRow) -> R<()>,
+    ) -> Result<(), CoreError> {
+        self.scan(table, &mut |row| {
+            if key.tuple(&row.values)?.is_some_and(|tuple| tuples.contains(&tuple)) {
+                visit(row)?;
+            }
+            Ok(())
+        })
     }
 
     fn indexes(&self) -> Vec<secondary_index::Descriptor> {
@@ -375,7 +396,8 @@ impl Relational {
             Statement::AlterTable(alter) => alter.actions.iter().all(|action| {
                 matches!(
                     action,
-                    alter_table::Action::Add(..)
+                    alter_table::Action::Type(..)
+                        | alter_table::Action::Add(..)
                         | alter_table::Action::NotNull(..)
                         | alter_table::Action::Constraint(constraints::Definition::Check { .. })
                 )
@@ -428,7 +450,9 @@ impl Relational {
             }),
             _ => false,
         };
-        if index_build && sink.streams_index_builds() {
+        let collated = self.tables.values().any(|t| self.has_nondeterministic_keys(t))
+            || matches!(&prepared.statement, Statement::CreateIndex(i) if i.collations.iter().any(Option::is_some));
+        if index_build && sink.streams_index_builds() && !collated {
             let old = sink.indexes();
             let result = self
                 .execute_statement_inner(
@@ -485,7 +509,7 @@ impl Relational {
                 insert.conflict_arbiter_columns(self, &sink.indexes()),
             _ => None,
         };
-        let mut names = if let Statement::TypeDdl(user_types::Ddl::Drop {
+        let mut names = if let Some(names)=prepared.collation_drop_tables(self) {names} else if let Statement::TypeDdl(user_types::Ddl::Drop {
             names,
             cascade: true,
             ..
@@ -513,7 +537,7 @@ impl Relational {
                 })
                 .map(|(key, _)| key.clone())
                 .collect()
-        } else if matches!(prepared.v2_class(), V2Class::Ddl) {
+        } else if matches!(prepared.v2_class(), V2Class::Ddl) && !matches!(prepared.statement,Statement::Create {as_query:Some(_),..}) {
             Vec::new()
         } else {
             prepared.read_tables()
@@ -551,11 +575,19 @@ impl Relational {
             if append && is_target {
                 continue;
             }
+            let keys = if is_target && conflict_rows.is_some() {
+                std::iter::once((table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>(), None))
+                    .chain(sink.indexes().into_iter().filter(|d| d.table == table.id && d.unique)
+                        .map(|d| (d.columns, Some(d.id))))
+                    .map(|(columns, index)| collation_keys::Key::new(self, table, &columns, index)
+                        .map(|key| (columns, key)))
+                    .collect::<R<Vec<_>>>().map_err(CoreError::Sql)?
+            } else { Vec::new() };
             let rows = self
                 .rows
                 .get_mut(&table.id)
                 .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
-            let point = is_target
+            let point = (is_target && !collated)
                 .then(|| point_target(prepared, table, params, &sink.indexes()))
                 .flatten();
             let mut visit = |row: SqlRow| {
@@ -580,22 +612,18 @@ impl Relational {
                 Ok(())
             };
             if is_target && let Some(proposals) = &conflict_rows {
-                let keys = std::iter::once(
-                    table
-                        .primary_key
-                        .iter()
-                        .map(|i| table.columns[*i].id)
-                        .collect::<Vec<_>>(),
-                )
-                .chain(
-                    sink.indexes()
-                        .into_iter()
-                        .filter(|d| d.table == table.id && d.unique)
-                        .map(|d| d.columns),
-                )
-                .collect::<Vec<_>>();
+                for (columns, key) in &keys {
+                    if !key.nondeterministic() { continue; }
+                    let tuples = proposals.iter().map(|row| key.tuple(row))
+                        .collect::<R<Vec<_>>>().map_err(CoreError::Sql)?
+                        .into_iter().flatten().collect();
+                    let arbiter = arbiter.as_ref().is_some_and(|ids| ids.len() == columns.len()
+                        && columns.iter().all(|id| ids.contains(id)));
+                    sink.collated_lookup(table, key, &tuples, arbiter, &mut visit)?;
+                }
                 for proposal in proposals {
-                    for columns in &keys {
+                    for (columns, key) in &keys {
+                        if key.nondeterministic() { continue; }
                         let values = columns
                             .iter()
                             .map(|id| {
@@ -736,6 +764,9 @@ impl Relational {
                     let table = table.as_ref().expect("append target");
                     let old = &before.rows[&table.id];
                     let new = &self.rows[&table.id];
+                    if self.has_nondeterministic_keys(table) {
+                        sink.check_occupancy(table, old, new)?;
+                    }
                     // Preserve immediate PK/UNIQUE error precedence before
                     // end-of-statement constraints. The savepoint owns rollback.
                     sink.apply_indexes(
@@ -814,6 +845,7 @@ impl Relational {
                 {
                     continue;
                 }
+                if collated && after_table == Some(table) { sink.check_occupancy(table, old, after)?; }
                 sink.apply_indexes(
                     table,
                     after_table,
@@ -826,6 +858,12 @@ impl Relational {
                 }) {
                     sink.apply(table, old, after)?;
                 }
+            }
+        }
+        if writing {
+            for table in self.tables.values().filter(|t|!before.tables.values().any(|old|old.id==t.id)) {
+                let rows=&self.rows[&table.id];
+                if !rows.is_empty() {sink.apply(table,&BTreeMap::new(),rows)?;}
             }
         }
         if let Some(deferred) = deferred {

@@ -85,13 +85,13 @@ fn sql_index_quoted_names_preserve_case() {
 }
 #[test]
 fn sql_index_grammar_reject_matrix() {
+    assert_eq!(parsed("CREATE INDEX ix ON items (email COLLATE foo)").collations, [Some("foo".into())]);
     for text in [
         "CREATE INDEX CONCURRENTLY ix ON items (email)",
         "CREATE INDEX ix ON items (email DESC)",
         "CREATE INDEX ix ON items (email NULLS FIRST)",
         "CREATE INDEX ix ON items ((email))",
         "CREATE INDEX ix ON items (lower(email))",
-        "CREATE INDEX ix ON items (email COLLATE foo)",
         "CREATE INDEX ix ON items (email) INCLUDE (other)",
         "CREATE INDEX ix ON items (email) WHERE id > 0",
         "CREATE INDEX ix ON items (email) WITH (fillfactor=50)",

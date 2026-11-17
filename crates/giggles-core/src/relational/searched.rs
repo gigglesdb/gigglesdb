@@ -122,7 +122,7 @@ pub(super) fn route(
                     && source.contains(table, &new_key)?
                     && !vacated.contains(new_key.as_slice())
             {
-                return Err(SqlError::Duplicate);
+                return Err(state.primary_duplicate(table));
             }
             unique.as_mut().expect("UPDATE occupancy").visit(
                 Some((key, old)),

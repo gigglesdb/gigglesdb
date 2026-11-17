@@ -102,8 +102,8 @@ impl Plan {
         if !self.ctes.is_empty() {
             return cte::run(self, state, source, params, parameters, clock, execution);
         }
-        let description = self.describe(state, parameters.len(), parameters)?;
-        let mut result = Relation::new(description.columns, description.typmods, execution);
+        let meta = self.clone().resolve(state, &mut parameters.to_vec())?;
+        let mut result = Relation::new(meta.columns, meta.typmods, execution);
         match &self.body {
             Body::Select(select) if !select.applies.is_empty() => {
                 result =
@@ -139,8 +139,23 @@ impl Plan {
                                 .run(state, source, params, parameters, clock, execution)
                         })
                         .transpose()?;
+                    let mut input_meta = select
+                        .input
+                        .as_ref()
+                        .map(|i| i.query.clone().resolve(state, &mut parameters.to_vec()))
+                        .transpose()?;
                     if let Some(rows) = &mut input {
-                        window::run(&select.windows, rows, params, parameters, clock, execution)?;
+                        let meta = input_meta.as_mut().unwrap();
+                        window::run(
+                            &select.windows,
+                            rows,
+                            &meta.collations,
+                            params,
+                            parameters,
+                            clock,
+                            execution,
+                        )?;
+                        window::columns(&select.windows, meta, &mut parameters.to_vec())?;
                     }
                     let synthetic = input
                         .as_ref()
@@ -154,6 +169,15 @@ impl Plan {
                         })
                         .transpose()?;
                     let state = synthetic.as_ref().unwrap_or(state);
+                    let _collations = input_meta
+                        .as_ref()
+                        .map(|meta| {
+                            functions::collation::ColumnScope::enter(
+                                &state.tables[&select.input.as_ref().unwrap().name].columns,
+                                &meta.collations,
+                            )
+                        })
+                        .transpose()?;
                     let wrapper = input.as_ref().map(|rows| cte::VirtualRows {
                         base: source,
                         relations: vec![(select.input.as_ref().unwrap().name.clone(), rows)],
@@ -220,12 +244,9 @@ impl Plan {
             }
         }
         if !self.order.is_empty() {
-            let table = TableDef {
-                id: 0,
-                name: "output".into(),
-                columns: result.columns.clone(),
-                primary_key: vec![],
-            };
+            let table = bind::result_table(&result.columns);
+            let _collations =
+                functions::collation::ColumnScope::enter(&table.columns, &meta.collations)?;
             let order = self
                 .order
                 .iter()
@@ -234,6 +255,7 @@ impl Plan {
                     let mut bound =
                         scalar.bind(&|c, _| order_column(c, &table), &[&table], parameters)?;
                     bound.attach_clock(clock);
+                    bound.require_collation()?;
                     Ok((bound, *desc, *first))
                 })
                 .collect::<R<Vec<_>>>()?;

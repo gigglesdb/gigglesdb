@@ -162,9 +162,10 @@ impl Prepared {
             Statement::SecurityLabel(label) => read(&mut label.table),
             Statement::Truncate { names, .. } | Statement::DropTable { names, .. } => names.iter_mut().for_each(read),
             Statement::Create {
-                name, constraints, ..
+                name, constraints, as_query, ..
             } => {
                 *name = create(name)?;
+                if let Some((q,_))=as_query {q.bind_schema_names(&read,state,&self.search_path);}
                 definitions(constraints);
             }
             Statement::Insert { name, .. }

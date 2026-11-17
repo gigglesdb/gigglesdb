@@ -5,6 +5,8 @@ pub(super) struct Meta {
     pub typmods: Vec<i32>,
     pub type_oids: Vec<u32>,
     pub unknown: Vec<bool>,
+    // Binding-only scalar metadata for set-operation collation diagnostics.
+    pub collations: Vec<Option<BoundScalar>>,
 }
 pub(super) struct BoundPlan {
     pub plan: Plan,
@@ -112,18 +114,29 @@ impl Plan {
                         .validate_immutable_constants()?;
                     return Ok(());
                 }
+                let mut input_collations = None;
                 let synthetic = if let Some(input) = &select.input {
                     input.query.validate_constants(state, parameters)?;
-                    let d = input.query.describe(state, parameters.len(), parameters)?;
-                    let columns =
-                        window::columns(&select.windows, &d.columns, &mut parameters.to_vec())?;
-                    let mut typmods = d.typmods;
-                    typmods.resize(columns.len(), -1);
-                    Some(input_state(state, input, &columns, &typmods)?)
+                    let mut meta = input
+                        .query
+                        .clone()
+                        .resolve(state, &mut parameters.to_vec())?;
+                    window::columns(&select.windows, &mut meta, &mut parameters.to_vec())?;
+                    input_collations = Some(meta.collations);
+                    Some(input_state(state, input, &meta.columns, &meta.typmods)?)
                 } else {
                     None
                 };
                 let state = synthetic.as_ref().unwrap_or(state);
+                let _collations = input_collations
+                    .as_ref()
+                    .map(|metadata| {
+                        functions::collation::ColumnScope::enter(
+                            &state.tables[&select.input.as_ref().unwrap().name].columns,
+                            metadata,
+                        )
+                    })
+                    .transpose()?;
                 let query = window::prepare(select, state)?;
                 cte::prepare_query(&query, state)?
                     .bind_projection_seeded(state, parameters.to_vec())?
@@ -170,11 +183,49 @@ impl Plan {
             },
         })
     }
+    // Join/apply/SRF materialization currently carries types and typmods but
+    // not collation derivations. Reject collated inputs before that metadata
+    // can be discarded or bytewise hash/comparison paths can consume values.
+    fn reject_unpropagated_collations(&self, state: &Relational) -> R<()> {
+        if self.mutation.is_none()
+            && self.merge.is_none()
+            && !matches!(&self.body, Body::Select(s) if s.from.is_some() || !s.applies.is_empty())
+        {
+            return Ok(());
+        }
+        let mut collated = false;
+        let mut inspect = |s: &Scalar| {
+            if matches!(s, Scalar::Call(name, _) if functions::collation::internal(name)) {
+                collated = true;
+            }
+            Ok(())
+        };
+        self.visit_scalars(&mut |s| {
+            let _ = walk_scalar(s, &mut inspect);
+        });
+        self.visit_queries(&mut |q| {
+            let _ = q.walk_scalars(&mut inspect);
+        });
+        for name in self.read_tables() {
+            if let Ok(table) = views::table(state, &name) {
+                collated |= table
+                    .columns
+                    .iter()
+                    .any(|column| state.ext.column_collations.contains_key(&column.id));
+            }
+        }
+        if collated {
+            Err(SqlError::Unsupported)
+        } else {
+            Ok(())
+        }
+    }
     pub(super) fn resolve(
         &mut self,
         state: &Relational,
         parameters: &mut [Option<DataType>],
     ) -> R<Meta> {
+        self.reject_unpropagated_collations(state)?;
         let catalog = if self.ctes.is_empty() {
             None
         } else {
@@ -193,18 +244,27 @@ impl Plan {
                     .as_mut()
                     .map(|from| from.resolve(state, parameters))
                     .transpose()?;
+                let mut input_collations = None;
                 let synthetic = if let Some(shape) = &shape {
                     Some(join::catalog(state, shape)?)
                 } else if let Some(input) = &mut select.input {
-                    let meta = input.query.resolve(state, parameters)?;
-                    let columns = window::columns(&select.windows, &meta.columns, parameters)?;
-                    let mut typmods = meta.typmods;
-                    typmods.resize(columns.len(), -1);
-                    Some(input_state(state, input, &columns, &typmods)?)
+                    let mut meta = input.query.resolve(state, parameters)?;
+                    window::columns(&select.windows, &mut meta, parameters)?;
+                    input_collations = Some(meta.collations);
+                    Some(input_state(state, input, &meta.columns, &meta.typmods)?)
                 } else {
                     None
                 };
                 let state = synthetic.as_ref().unwrap_or(state);
+                let _collations = input_collations
+                    .as_ref()
+                    .map(|metadata| {
+                        functions::collation::ColumnScope::enter(
+                            &state.tables[&select.input.as_ref().unwrap().name].columns,
+                            metadata,
+                        )
+                    })
+                    .transpose()?;
                 let query = if let Some(shape) = &shape {
                     join::prepare(&select.query, shape)?
                 } else {
@@ -263,11 +323,33 @@ impl Plan {
                         parameters[i] = Some(ty);
                     }
                 }
+                let collations = if let Some(grouping) = bound.grouping {
+                    grouping.into_collation_outputs()
+                } else {
+                    bound
+                        .items
+                        .into_iter()
+                        .zip(&description.columns)
+                        .map(|(item, column)| match item {
+                            BoundItem::Scalar(value) => Some(value),
+                            BoundItem::Aggregate(_, Some(value))
+                                if matches!(
+                                    column.data_type,
+                                    DataType::Text | DataType::Varchar | DataType::Bpchar
+                                ) =>
+                            {
+                                Some(value)
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                };
                 let mut meta = Meta {
                     columns: description.columns,
                     typmods: description.typmods,
                     type_oids: description.type_oids,
                     unknown,
+                    collations,
                 };
                 if select.query.items.len() == meta.columns.len() {
                     for (i, (item, _)) in select.query.items.iter().enumerate() {
@@ -323,11 +405,31 @@ impl Plan {
                     typmods: vec![-1; width],
                     type_oids: vec![],
                     unknown: vec![false; width],
+                    collations: vec![],
                 }
             }
-            Body::Set { left, right, .. } => {
+            Body::Set {
+                op,
+                all,
+                left,
+                right,
+            } => {
                 let mut a = left.resolve(state, parameters)?;
                 let b = right.resolve(state, parameters)?;
+                if matches!(op, SetOp::Union) && !*all {
+                    let mut collated = false;
+                    for i in 0..a.columns.len().min(b.columns.len()) {
+                        collated |= functions::collation::set_pair(
+                            a.collations.get(i).and_then(Option::as_ref),
+                            b.collations.get(i).and_then(Option::as_ref),
+                        )?;
+                    }
+                    // Preserve the collation reader's fail-closed execution
+                    // boundary until set operators carry comparator metadata.
+                    if collated {
+                        return Err(SqlError::Unsupported);
+                    }
+                }
                 // bpchar consumers remain closed until DD-0068 comparison semantics land.
                 if a.columns
                     .iter()
@@ -361,12 +463,9 @@ impl Plan {
                 a
             }
         };
-        let table = TableDef {
-            id: 0,
-            name: "output".into(),
-            columns: meta.columns.clone(),
-            primary_key: vec![],
-        };
+        let table = result_table(&meta.columns);
+        let _collations =
+            functions::collation::ColumnScope::enter(&table.columns, &meta.collations)?;
         for (s, _, _) in &self.order {
             if self.set_result() && !matches!(s, Scalar::Column(_) | Scalar::Literal(_)) {
                 return Err(SqlError::Unsupported);
@@ -376,7 +475,9 @@ impl Plan {
             if let Scalar::Param(n) = &scalar {
                 parameters[*n - 1].get_or_insert(DataType::Text);
             }
-            scalar.bind(&|c, _| order_column(c, &table), &[&table], parameters)?;
+            scalar
+                .bind(&|c, _| order_column(c, &table), &[&table], parameters)?
+                .require_collation()?;
         }
         for s in self.limit.iter().chain(&self.offset) {
             s.infer(Some(&DataType::BigInt), parameters, &no_column, &[])?;
@@ -483,4 +584,17 @@ pub(super) fn input_state(
     let mut state = cte::catalog(base);
     cte::install(&mut state, &input.name, &columns, typmods)?;
     Ok(state)
+}
+
+pub(super) fn result_table(columns: &[ColumnDef]) -> TableDef {
+    let mut columns = columns.to_vec();
+    for (i, c) in columns.iter_mut().enumerate() {
+        c.id = i as u64 + 1;
+    }
+    TableDef {
+        id: 0,
+        name: "output".into(),
+        columns,
+        primary_key: vec![],
+    }
 }

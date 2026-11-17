@@ -15,6 +15,7 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
     let Some(table) = prepared.table().and_then(|name| state.tables.get(name)) else {
         return false;
     };
+    if state.tables.values().any(|t| state.has_nondeterministic_keys(t)) { return false; }
     let sets = match &prepared.statement {
         Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
         Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
@@ -123,6 +124,7 @@ impl Prepared {
         if insert.source.is_some() || insert.row_count() > paged_insert::SHARED_WRITE_ROWS { return None; }
         let sql_insert::LockConflict { columns, constraint, sets } = insert.lock_conflict()?;
         let table = state.tables.get(&insert.table)?;
+        if state.has_nondeterministic_keys(table) { return None; }
         let primary = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<BTreeSet<_>>();
         let unique = indexes.iter().filter(|d| d.table == table.id && d.unique).collect::<Vec<_>>();
         let target: BTreeSet<u64> = if let Some(names) = columns {
@@ -230,6 +232,7 @@ impl Prepared {
     /// Plain VALUES appends use physical latest-owner PK/UNIQUE checks.
     pub(crate) fn plain_values_append(&self, state: &Relational) -> bool {
         let Some(table) = self.table().and_then(|name| state.tables.get(name)) else { return false; };
+        if state.has_nondeterministic_keys(table) { return false; }
         if state.ext.constraints.get(&table.id).into_iter().flatten().any(|c|
             matches!(c.kind, ConstraintKind::ForeignKey { ref_table, .. } if ref_table == table.id)) {
             return false;
@@ -365,6 +368,7 @@ pub(super) fn cascade_eligible(state: &Relational, prepared: &Prepared) -> bool 
         return false;
     }
     let Some(target) = prepared.table().and_then(|name| state.tables.get(name)) else { return false; };
+    if state.tables.values().any(|t| state.has_nondeterministic_keys(t)) { return false; }
     let mut connected = BTreeSet::from([(target.id, !matches!(prepared.statement, Statement::Delete { .. }))]);
     let pk_move = moves_primary_key(state, prepared);
     let mut cascade = pk_move;
@@ -508,6 +512,8 @@ impl ActionWork {
                         table.columns.iter().position(|c| c.id == *child).unwrap(),
                         parent.columns.iter().position(|c| c.id == *parent_id).unwrap(),
                     )).collect::<Vec<_>>();
+                    let equality = collation_keys::Key::new(state, parent, ref_columns, None)
+                        .map_err(CoreError::Sql)?;
                     for (key, row) in &rows {
                         if !keys.contains(key) { continue; }
                         crate::cancellation::check()?;
@@ -517,7 +523,11 @@ impl ActionWork {
                         )).collect::<R<Option<Vec<_>>>>().map_err(CoreError::Sql)?
                             .ok_or(CoreError::Sql(SqlError::ForeignKeyViolation))?;
                         let mut found = false;
-                        sink.fk_lookup(parent, ref_columns, Some(&values), true, &mut |_| {
+                        let tuple = equality.values(&values).map_err(CoreError::Sql)?;
+                        sink.fk_lookup(parent, ref_columns,
+                            if equality.nondeterministic() { None } else { Some(&values) }, true,
+                            &mut |candidate| Ok(equality.tuple(&candidate.values)? == tuple),
+                            &mut |_| {
                             found = true;
                             Ok(())
                         })?;
@@ -547,10 +557,39 @@ impl ActionWork {
                 if values.contains(&Value::Null) || new_values.as_ref() == Some(&values) { continue; }
                 let action = if new.is_some() { on_update } else { on_delete };
                 let child = state.tables.values().find(|t| t.id == *child_id).unwrap().clone();
+                let equality = collation_keys::Key::new(state, &parent, ref_columns, None)
+                    .map_err(CoreError::Sql)?;
+                let tuple = equality.values(&values).map_err(CoreError::Sql)?;
                 let mut no_action = DeferralState::default();
                 let mut after = None;
-                while let Some((last, rows)) = sink.fk_child_page(&child, columns, &values, after)? {
+                let first_version = state.next_version;
+                loop {
+                    // Byte indexes cannot find every ICU-equal child. Read bounded
+                    // physical pages at the RI snapshot, then compare parent keys.
+                    let page = if equality.nondeterministic() {
+                        sink.fk_read_page(&child, after)?
+                    } else { sink.fk_child_page(&child, columns, &values, after)? };
+                    let Some((last, mut rows)) = page else { break; };
                     after = Some(last);
+                    if equality.nondeterministic() {
+                        let mut matching = DdlRows::new();
+                        for (key, row) in rows {
+                            // A cascade can move an ICU-equal child ahead of the
+                            // cursor. Do not act on this scan's own writes again.
+                            if row.version >= first_version { continue; }
+                            let converted = columns.iter().zip(ref_columns).map(|(a, b)| {
+                                let a = child.columns.iter().position(|c| c.id == *a).unwrap();
+                                let b = parent.columns.iter().position(|c| c.id == *b).unwrap();
+                                query::constraint_key(&row.values[a], &child.columns[a].data_type,
+                                    &parent.columns[b].data_type)
+                            }).collect::<R<Option<Vec<_>>>>().map_err(CoreError::Sql)?;
+                            if converted.as_ref().map(|v| equality.values(v)).transpose()
+                                .map_err(CoreError::Sql)?.flatten() == tuple {
+                                matching.insert(key, row);
+                            }
+                        }
+                        rows = matching;
+                    }
                     if !rows.is_empty() && *action == catalog_ext::Action::Restrict {
                         return Err(CoreError::Sql(SqlError::RestrictViolation));
                     }

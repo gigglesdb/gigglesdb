@@ -6,6 +6,7 @@ pub(super) struct CreateIndex {
     pub name: String,
     pub table: String,
     pub columns: Vec<String>,
+    pub collations: Vec<Option<String>>,
     pub unique: bool,
     pub if_not_exists: bool,
 }
@@ -48,6 +49,7 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         return Err(SqlError::Unsupported);
     }
     let mut columns = Vec::new();
+    let mut collations = Vec::new();
     loop {
         if matches!(
             p.tokens.get(p.at),
@@ -58,6 +60,7 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
             return Err(SqlError::Unsupported);
         }
         columns.push(p.name()?);
+        collations.push(if p.word("collate") {Some(column_collations::parse_name(p)?)} else {None});
         if matches!(p.tokens.get(p.at), Some(Token::QuotedIdent(_)))
             || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if !["asc", "desc", "nulls", "collate"].contains(&w.as_str()))
         {
@@ -121,6 +124,7 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         name,
         table,
         columns,
+        collations,
         unique,
         if_not_exists,
     })

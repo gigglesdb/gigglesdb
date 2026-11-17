@@ -206,6 +206,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "getrandom 0.3.4",
+ "giggles-icu",
  "giggles-model",
  "giggles-pg-types",
  "giggles-transactions",
@@ -214,6 +215,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "giggles-icu"
+version = "0.1.0"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]

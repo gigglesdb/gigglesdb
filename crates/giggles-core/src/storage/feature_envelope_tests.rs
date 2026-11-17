@@ -345,7 +345,7 @@ fn catalog_ext_wire_errors_distinguish_corrupt_and_unsupported() {
         from_records(catalog_ext_raw_records(encode(&ext).unwrap())),
         Err(CoreError::Corrupt(_))
     ));
-    ext.ext_version = 9;
+    ext.ext_version = 11;
     // Exercise the relational decoder itself, before format-53 content policy:
     // unknown extensions retain Unsupported on the older namespace-5 path.
     let unknown_records = catalog_ext_raw_records(encode(&ext).unwrap());
@@ -565,4 +565,12 @@ fn primary_birth_alone_sets_legacy_identity_bit() {
     let mut missing = r;
     missing.insert(vec![10], (bits & !KEY_DEPENDENCY_IDENTITY).to_be_bytes().to_vec());
     assert!(matches!(normal(missing), Err(CoreError::Corrupt(_))));
+}
+
+#[test]
+fn legacy_collation_feature_positions() {
+    // WRITE_FENCE is v2-only; legacy format 53 retains its original bits.
+    assert_eq!(USER_COLLATIONS, 1 << 22);
+    assert_eq!(COLUMN_COLLATIONS, 1 << 23);
+    assert!(matches!(normal(forged((1 << 24) | 64)), Err(CoreError::Unsupported)));
 }

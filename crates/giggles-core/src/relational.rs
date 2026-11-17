@@ -1,5 +1,6 @@
 //! Bounded trusted relational subset. This module grants no task authority.
 mod numeric_syntax;
+mod unicode_literal;
 #[cfg(test)]
 mod numeric_literal_tests;
 use serde::{Deserialize, Serialize};
@@ -27,7 +28,7 @@ mod ddl_type;
 pub use ddl_type::take_sql_warnings;
 mod user_types;
 pub use user_types::{
-    TypeDef, UserTypeCatalog, take_sql_error_message, take_sql_notices, type_oid,
+    TypeDef, UserTypeCatalog, take_sql_error_detail, take_sql_error_message, take_sql_notices, type_oid,
 };
 pub(crate) mod defaults;
 pub use clock::StatementClock;
@@ -279,6 +280,12 @@ pub enum SqlError {
     InvalidNtileArgument,
     /// 22016 invalid_argument_for_nth_value_function
     InvalidNthValueArgument,
+    /// 42P21 collation_mismatch: transient expression error, never persisted.
+    /// Keep the frozen serialized error tag set unchanged.
+    #[serde(skip)]
+    CollationMismatch,
+    #[serde(skip)]
+    IndeterminateCollation,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,8 +511,10 @@ impl Relational {
         next_id: u64,
         next_version: u64,
     ) -> R<Relational> {
+        let index_collations=ext.column_collations.iter().filter(|(_,b)|matches!(b,column_collations::Binding::Index(_))).map(|(id,b)|(*id,b.clone())).collect::<BTreeMap<_,_>>();
+        ext.column_collations.retain(|_,b|!matches!(b,column_collations::Binding::Index(_)));
         Self::normalize_ext(&mut ext);
-        let image = Self {
+        let mut image = Self {
             rows: tables
                 .values()
                 .map(|table| (table.id, BTreeMap::new()))
@@ -517,6 +526,8 @@ impl Relational {
             ..Self::default()
         };
         image.validate()?;
+        image.ext.column_collations.extend(index_collations);
+        Self::normalize_ext(&mut image.ext);
         Ok(image)
     }
     /// Fork a validated rows-free catalog template for a mutable statement.
@@ -812,8 +823,9 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
                 return Err(SqlError::Syntax);
             }
             continue;
-        } else if c == b'\'' {
-            i += 1;
+        } else if c == b'\'' || (matches!(c, b'u' | b'U') && b.get(i+1) == Some(&b'&') && b.get(i+2) == Some(&b'\'')) {
+            let unicode = c != b'\'';
+            i += if unicode { 3 } else { 1 };
             let mut v = Vec::new();
             let mut closed = false;
             while i < b.len() {
@@ -837,9 +849,8 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
             if v.len() > MAX_SQL {
                 return Err(SqlError::Limit);
             }
-            out.push(Token::String(
-                String::from_utf8(v).map_err(|_| SqlError::Syntax)?,
-            ));
+            let text = String::from_utf8(v).map_err(|_| SqlError::Syntax)?;
+            out.push(Token::String(if unicode { unicode_literal::decode(&text)? } else { text }));
         } else if c == b'"' {
             i += 1;
             let mut v = Vec::new();
@@ -977,6 +988,7 @@ enum Statement {
     Schema(schemas::Ddl),
     Sequence(defaults::SequenceDdl),
     TypeDdl(user_types::Ddl),
+    CollationDdl(collations::Ddl),
     CompositeSelect(user_types::CompositeSelect),
     DropTable {
         names: Vec<String>,
@@ -1005,11 +1017,13 @@ enum Statement {
         columns: Vec<ColumnDef>,
         typmods: Vec<Option<i32>>,
         user_types: Vec<Option<String>>,
+        collations: Vec<Option<String>>,
         defaults: Vec<Option<String>>,
         sequences: Vec<Option<defaults::SequenceSpec>>,
         keys: Vec<String>,
         constraints: Vec<constraints::Definition>,
         primary_name: Option<String>,
+        as_query: Option<(Box<query::Query>, bool)>,
     },
     InsertExpressions(query::InsertExpressions),
     Insert {
@@ -1054,6 +1068,10 @@ enum Statement {
 }
 mod schema_binding;
 pub(crate) mod schemas;
+pub(crate) mod collations;
+pub(crate) mod column_collations;
+pub(crate) mod collation_keys;
+pub use collations::Collation as UserCollation;
 mod task_class;
 mod task_refs;
 mod truncate;
@@ -1239,6 +1257,7 @@ impl Parser {
         Ok(out)
     }
     fn parse(&mut self) -> R<Statement> {
+        if collations::claims(&self.tokens) { return collations::parse(self).map(Statement::CollationDdl); }
         if views::claims(&self.tokens) {
             return views::parse(self).map(Statement::View);
         }
@@ -1345,11 +1364,13 @@ impl Parser {
                 false
             };
             let name = self.create_table_name()?;
+            if self.word("as") {return column_collations::parse_create_as(self,name,optional);}
             self.punct('(')?;
             let mut columns = vec![];
             let mut defaults = vec![];
             let mut typmods = vec![];
             let mut user_types = vec![];
+            let mut collations = vec![];
             let mut sequences = vec![];
             let mut keys = vec![];
             let mut constraints = vec![];
@@ -1417,6 +1438,7 @@ impl Parser {
                                                     | "references"
                                                     | "primary"
                                                     | "generated"
+                                                    | "collate"
                                             ),
                                             _ => false,
                                         },
@@ -1441,6 +1463,7 @@ impl Parser {
                     user_types.push(user_type);
                     let mut not_null = serial.is_some();
                     let mut default = None;
+                    let mut collation = None;
                     let mut sequence = serial.map(|_| defaults::SequenceSpec::default());
                     loop {
                         let column_constraint = if self.word("constraint") {
@@ -1448,7 +1471,9 @@ impl Parser {
                         } else {
                             None
                         };
-                        if self.word("generated") {
+                        if self.word("collate") {
+                            collation = Some(column_collations::parse_name(self)?);
+                        } else if self.word("generated") {
                             if sequence.is_some() || default.is_some() {
                                 return Err(SqlError::Syntax);
                             }
@@ -1487,6 +1512,7 @@ impl Parser {
                             break;
                         }
                     }
+                    collations.push(collation);
                     defaults.push(default);
                     sequences.push(sequence);
                     columns.push(ColumnDef {
@@ -1505,6 +1531,7 @@ impl Parser {
                 name,
                 optional,
                 user_types,
+                collations,
                 typmods,
                 defaults,
                 sequences,
@@ -1512,6 +1539,7 @@ impl Parser {
                 keys,
                 constraints,
                 primary_name,
+                as_query: None,
             }
         } else if self.word("insert") {
             self.need("into")?;
@@ -1851,7 +1879,7 @@ impl Prepared {
             | Statement::Update { .. }
             | Statement::UpdateExpressions { .. }
             | Statement::Delete { .. } => V2Class::Dml,
-            Statement::Truncate { .. } | Statement::Schema(_) | Statement::TypeDdl(_) => {
+            Statement::Truncate { .. } | Statement::Schema(_) | Statement::TypeDdl(_) | Statement::CollationDdl(_) => {
                 V2Class::Ddl
             }
             Statement::Sequence(_) | Statement::DropTable { .. } | Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) => V2Class::Ddl,
@@ -1866,7 +1894,8 @@ impl Prepared {
                         | alter_table::Action::RenameTable(_)
                         | alter_table::Action::Default(..)
                         | alter_table::Action::NotNull(_, false) => (),
-                        alter_table::Action::Add(..)
+                        alter_table::Action::Type(..)
+                        | alter_table::Action::Add(..)
                         | alter_table::Action::Drop(..)
                         | alter_table::Action::NotNull(_, true) => (),
                         alter_table::Action::Unique(..)
@@ -2061,6 +2090,7 @@ impl Prepared {
                 name,
                 optional: false,
                 user_types: vec![None; columns.len()],
+                collations: vec![None; columns.len()],
                 typmods: vec![None; columns.len()],
                 defaults,
                 sequences,
@@ -2068,6 +2098,7 @@ impl Prepared {
                 keys,
                 constraints: vec![],
                 primary_name: None,
+                as_query: None,
             },
             domain,
             state.epoch,
@@ -2086,6 +2117,7 @@ impl Prepared {
             Statement::CreateIndex(sql_index::CreateIndex {
                 name,
                 table,
+                collations: vec![None; columns.len()],
                 columns,
                 unique: false,
                 if_not_exists: false,
@@ -2130,7 +2162,7 @@ impl Prepared {
         let action = match action {
             A::AddColumn { column } => Action::Add(ColumnDef {
                 id: 0, name: column.name, data_type: column.data_type, not_null: column.not_null,
-            }, None, None, None, false),
+            }, None, None, None, false, None, None),
             A::DropColumn { name, cascade } => Action::Drop(name, false, cascade),
             A::RenameColumn { from, to } => Action::RenameColumn(from, to),
             A::RenameTable { to } => Action::RenameTable(to),
@@ -2661,6 +2693,7 @@ impl Prepared {
             Statement::View(ddl) => ddl.query.as_ref().map_or_else(Vec::new, query::Query::read_tables),
             Statement::Query(query) => query.read_tables(),
             Statement::Plan(plan) => plan.read_tables(),
+            Statement::Create {as_query:Some((query,_)),..} => query.read_tables(),
             Statement::InsertMulti(insert) => insert
                 .source
                 .as_ref()
@@ -2715,6 +2748,7 @@ impl Prepared {
         let query = match &self.statement {
             Statement::View(ddl) => ddl.query.as_ref(),
             Statement::Query(query) => Some(query),
+            Statement::Create {as_query:Some((query,_)),..} => Some(query.as_ref()),
             Statement::InsertMulti(insert) => insert.source.as_deref(),
             _ => searched::target(self).filter(|query| query.has_in_subquery()),
         };
@@ -2738,12 +2772,13 @@ impl Prepared {
         Ok(tables)
     }
 
+    pub(crate) fn is_create_as(&self)->bool {matches!(self.statement,Statement::Create {as_query:Some(_),..})}
     pub fn is_ddl(&self) -> bool {
         matches!(
             self.statement,
             Statement::Schema(_)
                 | Statement::Sequence(_)
-                | Statement::TypeDdl(_)
+                | Statement::TypeDdl(_) | Statement::CollationDdl(_)
                 | Statement::Create { .. }
                 | Statement::CreateIndex(_)
                 | Statement::DropIndex(_)
@@ -2786,6 +2821,7 @@ impl Prepared {
             }
             Statement::TypeDdl(ref ddl) => ddl.command(),
             Statement::Plan(ref plan) if plan.mutation_command().is_some() => plan.mutation_command().unwrap(),
+            Statement::CollationDdl(ref ddl) => ddl.command(),
             Statement::CompositeSelect(_) | Statement::Plan(_) => "SELECT",
             Statement::Sequence(ref ddl) => match ddl {
                 defaults::SequenceDdl::Create { .. } => "CREATE SEQUENCE",
@@ -3099,7 +3135,7 @@ impl Prepared {
         if !matches!(tokens.first(), Some(Token::Word(word)) if word == "alter") {
             return Ok(None);
         }
-        if matches!(tokens.get(1), Some(Token::Word(word)) if word == "sequence") {
+        if matches!(tokens.get(1), Some(Token::Word(word)) if matches!(word.as_str(), "sequence" | "collation")) {
             return Ok(None);
         }
         let mut parser = Parser {
@@ -3228,7 +3264,7 @@ impl Prepared {
         assert_sql_frontend_allowed();
         take_sql_warnings();
         let mut p = Parser {
-            tokens: lex(sql)?,
+            tokens: column_collations::rewrite_into(lex(sql)?)?,
             at: 0,
             params: BTreeSet::new(),
             relations: Vec::new(),
@@ -3547,8 +3583,11 @@ impl Relational {
         let mut ext = self.ext.clone();
         for column in &table.columns {
             ext.columns.remove(&column.id);
+            ext.column_collations.remove(&column.id);
             ext.logical_kinds.remove(&column.id);
         }
+        for d in self.secondary_descriptors_engine().iter().filter(|d|d.table==table_id) {ext.column_collations.remove(&d.id);}
+        ext.column_collations.remove(&table_id);
         ext.constraints.remove(&table_id);
         ext.table_schemas.remove(&table_id);
         ext.primary_index_birth.remove(&table_id);
@@ -3669,6 +3708,7 @@ impl Relational {
             }
         }
         if self.has_secondary_indexes_engine() {
+            column_collations::validate_index_bindings(&self.ext,self.secondary_descriptors_engine())?;
             self.secondary_validate_engine(|| crate::cancellation::check().is_err())?;
         }
         Ok(())
@@ -3935,6 +3975,7 @@ impl Relational {
         };
         let mut result = SqlResult::default();
         match &prepared.statement {
+            Statement::CollationDdl(ddl) => { collations::execute(self, ddl, prepared)?; }
             Statement::TypeDdl(ddl) => {
                 user_types::execute(self, ddl, prepared)?;
             }
@@ -4080,6 +4121,8 @@ impl Relational {
                         .collect::<Vec<_>>();
                     self.secondary =
                         self.secondary_build_complete_engine(&descriptors, &mut cancel)?;
+                    self.ext.column_collations.remove(&descriptor.id);
+                    Self::normalize_ext(&mut self.ext);
                     self.epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
                 } else if sql_index::primary_table(self, &index.name).is_some() {
                     return Err(SqlError::DependentObjects);
@@ -4109,14 +4152,21 @@ impl Relational {
                     .iter()
                     .map(|name| col(&table, name).map(|i| table.columns[i].id))
                     .collect::<R<Vec<_>>>()?;
+                let collations=index.columns.iter().zip(&index.collations).map(|(n,c)| {
+                    let column=&table.columns[col(&table,n)?];
+                    if let Some(c)=c { column_collations::resolve_column(self,column,self.ext.columns.get(&column.id).and_then(|c|c.type_id),Some(c),&prepared.search_path).map(|r|r.or(Some(column_collations::Reference::Builtin(100)))) }
+                    else {Ok(self.column_collation(column.id).cloned())}
+                }).collect::<R<Vec<_>>>()?;
                 self.create_secondary_index_populated_engine(
                     &table,
                     self.epoch,
                     &index.name,
                     &ids,
                     index.unique,
+                    index.collations.iter().any(Option::is_some).then_some(collations.as_slice()),
                     &mut cancel,
                 )?;
+
             }
             Statement::Create {
                 name,
@@ -4129,12 +4179,27 @@ impl Relational {
                 constraints,
                 primary_name,
                 user_types,
+                collations,
+                as_query,
             } => {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
                 let mut columns = columns.clone();
                 let mut typmods = typmods.clone();
+                let mut collations=collations.clone();
+                let mut ctas_rows=None;
+                if let Some((query,no_data))=as_query {
+                    let bound=query.bind(self,prepared.params,&prepared.parameter_types)?.with_clock(clock);
+                    let description=bound.description(self);
+                    collations=bound.output_collations()?.into_iter().map(|n|n.map(|n|n.split('\0').next().unwrap_or(&n).to_owned())).collect();
+                    columns=description.columns; for c in &mut columns {c.id=0;c.not_null=false;}
+                    typmods=description.typmods.into_iter().map(|n|(n>=0).then_some(n)).collect();
+                    if !no_data {
+                        let legacy=scan::LegacyRows(&*self);
+                        ctas_rows=Some(bound.execute_declared(self,injected_source.unwrap_or(&legacy),params,&mut cancel,&prepared.parameter_types)?.rows);
+                    }
+                }
                 let mut type_ids = vec![None; columns.len()];
                 for (i, name) in user_types.iter().enumerate() {
                     if let Some(name) = name {
@@ -4148,6 +4213,9 @@ impl Relational {
                         type_ids[i] = Some(id);
                     }
                 }
+                let collation_refs = columns.iter().zip(&collations).zip(&type_ids).map(|((c, n), type_id)| {
+                    column_collations::resolve_column(self, c, *type_id, n.as_deref(), &prepared.search_path)
+                }).collect::<R<Vec<_>>>()?;
                 let columns = &columns;
                 let typmods = &typmods;
                 if self.type_by_name(split_key(name).1).is_some() {
@@ -4231,6 +4299,9 @@ impl Relational {
                 )?;
                 let table = self.tables.get(name).ok_or(SqlError::UnknownTable)?.clone();
                 self.mutate_ext(|ext, _| {
+                    for (column, reference) in table.columns.iter().zip(&collation_refs) {
+                        if let Some(reference) = reference { ext.column_collations.insert(column.id, column_collations::Binding::Column(reference.clone())); }
+                    }
                     for (column, type_id) in table.columns.iter().zip(&type_ids) {
                         if let Some(id) = type_id {
                             ext.columns.entry(column.id).or_default().type_id = Some(*id);
@@ -4240,6 +4311,18 @@ impl Relational {
                 })?;
                 if let Some(name) = chosen_primary {
                     constraint_primary_key::record_name(self, &table, &name)?;
+                }
+                if let Some(rows)=ctas_rows {
+                    let quoted=|n:&str|format!("\"{}\"",n.replace('"',"\"\""));
+                    let (schema,leaf)=split_key(name);
+                    let sql=format!("INSERT INTO {}.{} VALUES ({})",quoted(schema),quoted(leaf),(1..=columns.len()).map(|i|format!("${i}")).collect::<Vec<_>>().join(","));
+                    for row in rows {
+                        let mut insert=Prepared::parse(&sql,prepared.domain,self.epoch)?;
+                        insert.search_path=prepared.search_path.clone();
+                        let ctas_cancel: &mut dyn FnMut()->bool = &mut cancel;
+                        self.execute_statement_inner(&insert,&row.values,None,ctas_cancel,clock,None,events)?;
+                        result.affected+=1;
+                    }
                 }
                 // Candidate keys must exist before self-referencing FKs bind,
                 // including UNIQUE declarations later in the CREATE body.
@@ -4308,7 +4391,7 @@ impl Relational {
                 let legacy = scan::LegacyRows(&*self);
                 let source = injected_source.unwrap_or(&legacy);
                 if source.contains(t, &key)? {
-                    return Err(SqlError::Duplicate);
+                    return Err(self.primary_duplicate(t));
                 }
                 let version = match heap_version {
                     Some(version) => version,

@@ -348,11 +348,14 @@ impl SqlSession {
                         _ => None,
                     };
                     (
-                        image,
+                        image.clone(),
                         Some(V2Snapshot {
                             #[cfg(test)]
                             index_reads: std::cell::Cell::new(0),
-                            indexes: catalog.parts.indexes.clone(),
+                            indexes: catalog.parts.indexes.iter().filter(|d| {
+                                !catalog.parts.ext.column_collations.contains_key(&d.id)
+                                    && d.columns.iter().all(|id|image.deterministic_column(*id) && image.byte_ordered(*id))
+                            }).cloned().collect(),
                             _db: db.clone(),
                             kv: db.cluster_services().map_or_else(
                                 || db.kv.clone() as Arc<dyn engine::kv::KvRead>,

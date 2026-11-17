@@ -2,6 +2,7 @@
 use super::*;
 mod arithmetic;
 mod array_constructor;
+pub(super) mod collation;
 mod concat;
 pub(in crate::relational) mod assignment;
 mod binary;
@@ -94,7 +95,8 @@ pub(super) enum Scalar {
     Binary(BinaryOp, Box<Scalar>, Box<Scalar>),
     Param(usize),
     Cast(Box<Scalar>, DataType),
-    Domain(Box<Scalar>, String, R<TypeDef>),
+    // Resolved domain definitions are cold metadata, not recursive parser locals.
+    Domain(Box<Scalar>, String, Box<R<TypeDef>>),
     Column(ColumnRef),
     Literal(Value),
     Call(String, Vec<Scalar>),
@@ -598,6 +600,8 @@ impl Scalar {
                     .into(),
                     vec![value, key],
                 );
+            } else if p.word("collate") {
+                value = collation::parse(p, value)?;
             } else if p.sym(':') {
                 p.punct(':')?;
                 casts += 1;
@@ -632,6 +636,17 @@ impl Scalar {
         {
             return array_constructor::parse(p,depth,aggregate_argument);
         }
+        // Parenthesis nesting must not retain the large routine/CASE parser
+        // frame at every level before the existing depth guard can reject it.
+        if p.sym('(') {
+            let value = Self::parse_expr(p, depth + 1, aggregate_argument)?;
+            p.punct(')')?;
+            return Ok(value);
+        }
+        Self::primary_non_grouped(p, depth, aggregate_argument)
+    }
+    #[inline(never)]
+    fn primary_non_grouped(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
         if p.word("case") {
             let operand = if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "when") {
                 None
@@ -715,11 +730,6 @@ impl Scalar {
             p.punct(')')?;
             return Ok(value);
         }
-        if p.sym('(') {
-            let value = Self::parse_expr(p, depth + 1, aggregate_argument)?;
-            p.punct(')')?;
-            return Ok(value);
-        }
         if cast::typed_literal(p) {
             let (ty, modifier) = cast_type(p)?;
             if modifier.is_some() {
@@ -748,7 +758,7 @@ impl Scalar {
                         "pg_catalog"
                             if pg18_routines::PG_CATALOG
                                 .binary_search(&routine.as_str())
-                                .is_ok() =>
+                                .is_ok() || aggregate_order::deferred(&routine).is_some() =>
                         {
                             ""
                         }
@@ -768,6 +778,7 @@ impl Scalar {
                 } else if pg18_routines::PG_CATALOG
                     .binary_search(&name.as_str())
                     .is_ok()
+                    || aggregate_order::deferred(&name).is_some()
                     || (!quoted
                         && pg18_routines::NON_UNRESERVED_KEYWORDS
                             .binary_search(&name.as_str())
@@ -934,6 +945,10 @@ impl Scalar {
                             p.punct(')')?;
                             break;
                         }
+                        if Aggregate::from_name(&name).is_some() && args.len() == 1
+                            || aggregate_order::deferred(&name).is_some() {
+                            aggregate_order::parse_args(p, &mut args, depth + 1)?;
+                        }
                         if !p.sym(',') {
                             p.punct(')')?;
                             break;
@@ -1086,6 +1101,7 @@ impl Scalar {
                     .map(result)
                     .transpose()?
                     .map(Box::new);
+                collation::derive(arms.iter().map(|(_, v)| v).chain(otherwise.iter().map(|v| v.as_ref())))?;
                 (ty, Node::Case(arms, otherwise))
             }
             Self::Unary(..) | Self::Binary(..) => unreachable!(),
@@ -1099,7 +1115,7 @@ impl Scalar {
                 Node::Param(*n),
             ),
             Self::Domain(a, _, target) => {
-                let ty = target.as_ref().map_err(Clone::clone)?;
+                let ty = target.as_ref().as_ref().map_err(Clone::clone)?;
                 let TypeDef::Domain { base, typmod, .. } = ty else {
                     return Err(SqlError::Unsupported);
                 };
@@ -1159,10 +1175,9 @@ impl Scalar {
             }
             Self::Column(c) => {
                 let c = resolve(c, tables.len())?;
-                (
-                    tables[c.source].columns[c.column].data_type.clone(),
-                    Node::Column(c, tables[c.source].columns[c.column].name.clone()),
-                )
+                let column=&tables[c.source].columns[c.column];
+                return collation::column(BoundScalar { ty:column.data_type.clone(),node:Node::Column(c,column.name.clone()) },column.id);
+
             }
             Self::Literal(v) => (
                 match v {
@@ -1191,6 +1206,40 @@ impl Scalar {
             Self::Call(name, args) if name == "\0plan_cardinality" && args.len() == 1 => {
                 let inner = args[0].bind(resolve, tables, parameters)?;
                 (inner.ty.clone(), Node::Call(name.clone(), vec![inner]))
+            }
+            Self::Call(name, args) if aggregate_order::internal(name) => {
+                let args = args.iter().map(|a| {
+                    let bound = a.bind(resolve,tables,parameters)?;
+                    Ok(if let Some(ty) = bound.enum_type(tables) {bound.with_enum(&ty)} else {bound})
+                }).collect::<R<Vec<_>>>()?;
+                for scalar in &args[1..] {
+                    scalar.require_collation()?;
+                }
+                return Ok(BoundScalar {ty:args[0].ty.clone(),node:Node::Call(name.clone(),args)});
+            }
+            Self::Call(name, args) if aggregate_order::deferred(name).is_some() => {
+                let distinct = aggregate_order::deferred(name).unwrap();
+                for arg in args {
+                    let bound = arg.bind(resolve, tables, parameters)?;
+                    if distinct { bound.require_collation()?; }
+                }
+                return Err(SqlError::Unsupported);
+            }
+            Self::Call(name, args) if collation::internal(name) => {
+                let value = args[0].bind(resolve, tables, parameters)?;
+                if let Some(TypeDef::Enum { name, .. }) = value.enum_type(tables) {
+                    user_types::view_replace_error(format!("collations are not supported by type {name}"));
+                    return Err(SqlError::Type);
+                }
+                return collation::bind(name, value);
+            }
+            Self::Call(name, args) if name == "pg_collation_for" => {
+                if args.len() != 1 { return Err(SqlError::UndefinedFunction); }
+                let a = args[0].bind(resolve, tables, parameters)?;
+                let value = if let Some(n) = a.explicit_collation()? {Value::Text(collation::display_name(n))}
+                    else if matches!(args[0], Scalar::Literal(Value::Text(_) | Value::Null)) || !matches!(a.ty, DataType::Text | DataType::Varchar | DataType::Bpchar) { Value::Null }
+                    else { Value::Text("\"default\"".into()) };
+                return Ok(BoundScalar { ty: DataType::Text, node: Node::Literal(value) });
             }
             Self::Call(name, args) if name == CAST_TYPMOD => {
                 let [inner, Self::Literal(Value::Int(modifier))] = args.as_slice() else {
@@ -1783,6 +1832,10 @@ impl Scalar {
                         }
                     }
                 }
+                collation::derive(args.iter())?;
+                if matches!(name.as_str(), "lower" | "upper" | "initcap") {
+                    for a in &args { a.require_collation()?; }
+                }
                 (ty, Node::Call(name.clone(), args))
             }
         };
@@ -1853,7 +1906,7 @@ impl BoundScalar {
             Node::EnumSort(..) | Node::Predicate(_) | Node::ZonedOperator(..) => None,
             Node::Case(..) => Some("case"),
             Node::Call(name, _) if name == array_constructor::NAME => Some("array"),
-            Node::Call(name, args) if name == "\0array_subscript" => args[0].strong_name(),
+            Node::Call(name, args) if collation::internal(name) || aggregate_order::internal(name) || name == "\0array_subscript" => args[0].strong_name(),
             Node::Call(name, _) if name.starts_with("\0json_") => None,
             Node::Call(name, _) if arithmetic::internal_name(name) => None,
             Node::Column(_, name)
@@ -1907,11 +1960,18 @@ impl BoundScalar {
             }
             Node::Column(_, name) => name,
             Node::Literal(_) => "?column?",
-            Node::Call(n, args) if n == "\0array_subscript" => args[0].name(),
             Node::Call(n, _) if n == array_constructor::NAME => "array",
+            Node::Call(n, args) if collation::internal(n) || aggregate_order::internal(n) || n == "\0array_subscript" => args[0].name(),
             Node::Call(n, _) if n.starts_with("\0json_") => "?column?",
             Node::Call(n, _) if arithmetic::internal_name(n) => "?column?",
             Node::Call(n, _) | Node::Clock(n, ..) | Node::Sequence(n, ..) | Node::Xact(n, ..) => n,
+        }
+    }
+    pub(super) fn aggregate_order_parts(&self) -> Option<(&str, &[BoundScalar])> {
+        match &self.node {
+            Node::Call(name, args) if aggregate_order::internal(name) => Some((name, args)),
+            Node::Domain(inner, _) => inner.aggregate_order_parts(),
+            _ => None,
         }
     }
     pub(super) fn eval(&self, row: &Tuple, params: &[Value], budget: &mut usize) -> R<Value> {
@@ -2074,6 +2134,7 @@ impl BoundScalar {
             }
             Node::Call(n, _) if n == "\0plan_cardinality" => Err(SqlError::CardinalityViolation),
             Node::Call(n, args) => {
+                if collation::internal(n) || aggregate_order::internal(n) { return args[0].eval(row, params, budget); }
                 if n == "pg_typeof" {
                     return args[0].eval(row, params, budget);
                 }
@@ -2109,8 +2170,9 @@ impl BoundScalar {
                     .iter()
                     .map(|a| a.eval(row, params, budget))
                     .collect::<R<Vec<_>>>()?;
+                if matches!(n.as_str(), "lower" | "upper" | "initcap") && let Some(v) = collation::casing(n, &args[0], &values[0], budget)? { return Ok(v); }
                 if greatest::known_name(n) {
-                    return Ok(greatest::eval(n, values, args.first()));
+                    return greatest::eval(n, values, self);
                 }
                 if n == array_constructor::NAME { return array_constructor::eval(&values,budget); }
                 if n != "concat"
@@ -2686,7 +2748,7 @@ impl Scalar {
                 }
             }
             Self::Domain(a, _, target) => {
-                let TypeDef::Domain { base, .. } = target.as_ref().map_err(Clone::clone)? else {
+                let TypeDef::Domain { base, .. } = target.as_ref().as_ref().map_err(Clone::clone)? else {
                     return Err(SqlError::Unsupported);
                 };
                 Self::Cast(a.clone(), base.clone()).infer(expected, parameters, resolve, tables)?;
@@ -2821,6 +2883,10 @@ impl Scalar {
             }
             Self::Call(n, args) if n == "overlay" => {
                 Self::infer_overlay(args, parameters, resolve, tables)?;
+            }
+            Self::Call(n, args) if aggregate_order::internal(n) => {
+                args[0].infer(expected, parameters, resolve, tables)?;
+                for arg in &args[1..] {arg.infer(None,parameters,resolve,tables)?;}
             }
             Self::Call(n, args) if greatest::known_name(n) => {
                 for arg in args {

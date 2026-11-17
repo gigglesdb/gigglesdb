@@ -5,10 +5,13 @@ use super::*;
 type SqlNotice = (String, Option<String>, Option<&'static str>);
 thread_local! {
     static SQL_NOTICES: std::cell::RefCell<Vec<SqlNotice>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SQL_ERROR_DETAIL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static SQL_ERROR_MESSAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 /// Consume the diagnostic immediately after a synchronous SQL call on this thread.
 /// SQLSTATE remains the stable, field-less SqlError contract.
+pub fn take_sql_error_detail() -> Option<String> { SQL_ERROR_DETAIL.with(|v| v.borrow_mut().take()) }
+pub(super) fn sql_error_detail(detail: String) { SQL_ERROR_DETAIL.with(|v| *v.borrow_mut()=Some(detail)); }
 pub fn take_sql_error_message() -> Option<String> {
     SQL_ERROR_MESSAGE.with(|message| message.borrow_mut().take())
 }
@@ -20,6 +23,12 @@ pub fn take_sql_notices() -> Vec<SqlNotice> {
 }
 pub(super) fn view_recreate_error() {
     SQL_ERROR_MESSAGE.with(|message| *message.borrow_mut() = Some("view projection bindings unavailable; recreate the view".into()));
+}
+pub(super) fn sql_notice_detail(message: String, detail: String, code: &'static str) {
+    SQL_NOTICES.with(|notices| notices.borrow_mut().push((message, Some(detail), Some(code))));
+}
+pub(super) fn sql_notice(message: String, code: &'static str) {
+    SQL_NOTICES.with(|notices| notices.borrow_mut().push((message, None, Some(code))));
 }
 pub(super) fn view_missing_notice(name: &str) {
     SQL_NOTICES.with(|notices| notices.borrow_mut().push((format!("view \"{name}\" does not exist, skipping"), None, None)));
@@ -42,6 +51,7 @@ pub(super) fn truncate_reference_error() {
 }
 pub(super) fn clear_sql_error_message() {
     take_sql_notices();
+    take_sql_error_detail();
     take_sql_error_message();
 }
 

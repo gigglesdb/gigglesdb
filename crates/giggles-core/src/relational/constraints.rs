@@ -312,7 +312,7 @@ pub(super) fn install_unique(
         return Err(SqlError::DuplicateObject);
     }
     let epoch = state.epoch;
-    let index = state.create_secondary_index_populated_engine(table, epoch, &name, &ids, true, &mut *cancel)?;
+    let index = state.create_secondary_index_populated_engine(table, epoch, &name, &ids, true, None, &mut *cancel)?;
     let id = allocate(&mut state.next_id)?;
     state.ext.constraints.entry(table.id).or_default().push(Constraint {
         id, name, kind: ConstraintKind::Unique { columns: ids, index },
@@ -445,6 +445,26 @@ pub(super) fn install(
             suffix,
         )
     });
+    if let ConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } = &kind {
+        let parent = table_by_id(state, *ref_table)?;
+        for (a, b) in columns.iter().zip(ref_columns) {
+            if (!state.deterministic_column(*a) || !state.deterministic_column(*b))
+                && state.column_collation(*a) != state.column_collation(*b) {
+                let label = |id| -> R<String> {
+                    Ok(match state.column_collation(id) {
+                        None => "default".into(),
+                        Some(column_collations::Reference::Builtin(oid)) => column_collations::builtin(*oid).ok_or(SqlError::Type)?,
+                        Some(column_collations::Reference::User(id)) => state.ext.collations.get(id).ok_or(SqlError::Type)?.name.clone(),
+                    })
+                };
+                let a_name = &table.columns.iter().find(|c| c.id == *a).ok_or(SqlError::UnknownColumn)?.name;
+                let b_name = &parent.columns.iter().find(|c| c.id == *b).ok_or(SqlError::UnknownColumn)?.name;
+                user_types::view_replace_error(format!("foreign key constraint \"{name}\" cannot be implemented"));
+                user_types::sql_error_detail(format!("Key columns \"{a_name}\" of the referencing table and \"{b_name}\" of the referenced table have incompatible collations: \"{}\" and \"{}\".  If either collation is nondeterministic, then both collations have to be the same.", label(*a)?, label(*b)?));
+                return Err(SqlError::CollationMismatch);
+            }
+        }
+    }
     ident(&name)?;
     if state.constraint_name_taken(table.id, &name) {
         return Err(SqlError::DuplicateObject);

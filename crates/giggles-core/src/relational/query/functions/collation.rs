@@ -1,0 +1,576 @@
+//! Expression collation metadata; never part of persisted values or keys.
+use super::*;
+use std::sync::{Arc, Mutex, OnceLock};
+const PREFIX: &str = "\0collate:";
+const IMPLICIT: &str = "\0implicit_collate:";
+const PROPAGATED: &str = "\0implicit_collate:metadata";
+const DATA: &str = include_str!("../../../../../giggles-icu/src/pg_collation.txt");
+pub(in crate::relational::query) fn internal(name: &str) -> bool {
+    name.starts_with(PREFIX) || name.starts_with(IMPLICIT)
+}
+pub(super) fn parse(p: &mut Parser, value: Scalar) -> R<Scalar> {
+    let (mut name, _) = Scalar::routine_name(p)?;
+    if p.sym('.') {
+        let (last, _) = Scalar::routine_name(p)?;
+        if name != "pg_catalog" {
+            name = format!("{name}.{last}");
+        } else {
+            name = last;
+        }
+    }
+    Ok(Scalar::Call(format!("{PREFIX}{name}"), vec![value]))
+}
+pub(in crate::relational::query) fn resolve_name(
+    name: &mut String,
+    state: &Relational,
+    path: &[String],
+) {
+    let Some(n) = name.strip_prefix(PREFIX) else {
+        return;
+    };
+    if let Some((_, c)) = super::super::super::collations::resolve(state, n, path) {
+        *name = format!(
+            "{PREFIX}{}.{}\0{}\0{}\0{}\0{}",
+            c.schema,
+            c.name,
+            c.provider,
+            c.deterministic,
+            c.locale.as_deref().or(c.collate.as_deref()).unwrap_or(""),
+            c.rules.as_deref().unwrap_or("")
+        );
+    }
+}
+fn user(n: &str) -> Option<(&str, bool, &str, &str)> {
+    let mut parts = n.split('\0');
+    parts.next()?;
+    Some((
+        parts.next()?,
+        parts.next()? == "true",
+        parts.next()?,
+        parts.next()?,
+    ))
+}
+pub(super) fn bind(name: &str, value: BoundScalar) -> R<BoundScalar> {
+    let n = name
+        .strip_prefix(PREFIX)
+        .or_else(|| name.strip_prefix(IMPLICIT))
+        .ok_or(SqlError::Type)?;
+    if user(n).is_none() && !DATA.lines().any(|r| r.split('|').nth(1) == Some(n)) {
+        user_types::view_replace_error(format!(
+            "collation \"{n}\" for encoding \"UTF8\" does not exist"
+        ));
+        return Err(SqlError::UndefinedObject);
+    }
+    if !matches!(
+        value.ty,
+        DataType::Text | DataType::Varchar | DataType::Bpchar
+    ) {
+        user_types::view_replace_error(format!(
+            "collations are not supported by type {}",
+            match value.ty {
+                DataType::Integer => "integer",
+                DataType::BigInt => "bigint",
+                DataType::Boolean => "boolean",
+                _ => "non-collatable",
+            }
+        ));
+        return Err(SqlError::Type);
+    }
+    Ok(BoundScalar {
+        ty: value.ty.clone(),
+        node: Node::Call(name.into(), vec![value]),
+    })
+}
+#[derive(Clone, Copy, Default)]
+struct Derivation<'a> {
+    name: Option<&'a str>,
+    explicit: bool,
+    conflict: Option<(&'a str, &'a str)>,
+}
+fn merge<'a>(args: impl Iterator<Item = &'a BoundScalar>) -> R<Derivation<'a>> {
+    let mut found = Derivation::default();
+    for a in args {
+        let d = a.collation_derivation()?;
+        if d.explicit && !found.explicit {
+            found = d;
+            continue;
+        }
+        if found.explicit && !d.explicit {
+            continue;
+        }
+        if let (Some(old), Some(n)) = (found.name, d.name) {
+            if old != n && (d.explicit || old != "default" && n != "default") {
+                if d.explicit {
+                    mismatch(old, n, true)?;
+                }
+                found.conflict = Some((old, n));
+            } else if old == "default" {
+                found.name = Some(n);
+            }
+        } else if found.name.is_none() {
+            found.name = d.name;
+        }
+        found.conflict = found.conflict.or(d.conflict);
+    }
+    Ok(found)
+}
+fn mismatch(a: &str, b: &str, explicit: bool) -> R<()> {
+    let label = |n: &str| n.split('\0').next().unwrap_or(n).to_owned();
+    user_types::view_replace_error(format!(
+        "collation mismatch between {} collations \"{}\" and \"{}\"",
+        if explicit { "explicit" } else { "implicit" },
+        label(a),
+        label(b)
+    ));
+    Err(SqlError::CollationMismatch)
+}
+impl BoundScalar {
+    fn collation_derivation(&self) -> R<Derivation<'_>> {
+        if !matches!(
+            self.ty,
+            DataType::Text | DataType::Varchar | DataType::Bpchar
+        ) {
+            return Ok(Derivation::default());
+        }
+        match &self.node {
+            // The second child carries derivation only; internal calls evaluate
+            // just the first child. Preserve indeterminate derivations across
+            // materialization without evaluating the original expression again.
+            Node::Call(n, args) if n == PROPAGATED => args[1].collation_derivation(),
+            Node::Call(n, _) if n.starts_with(PREFIX) => Ok(Derivation {
+                name: n.strip_prefix(PREFIX),
+                explicit: true,
+                conflict: None,
+            }),
+            Node::Call(n, _) if n.starts_with(IMPLICIT) => Ok(Derivation {
+                name: n.strip_prefix(IMPLICIT),
+                explicit: false,
+                conflict: None,
+            }),
+            Node::Call(n, args) if aggregate_order::internal(n) => args[0].collation_derivation(),
+            Node::Call(_, args) => merge(args.iter()),
+            Node::Cast(v)
+            | Node::TypmodCast(v, _)
+            | Node::SessionCast(v, _)
+            | Node::Domain(v, _) => v.collation_derivation(),
+            Node::Case(arms, other) => merge(
+                arms.iter()
+                    .map(|(_, v)| v)
+                    .chain(other.iter().map(|v| v.as_ref())),
+            ),
+            _ => Ok(Derivation::default()),
+        }
+    }
+    pub(in crate::relational::query) fn explicit_collation(&self) -> R<Option<&str>> {
+        let d = self.collation_derivation()?;
+        Ok(if d.conflict.is_some() { None } else { d.name })
+    }
+    pub(in crate::relational::query) fn inherit_collation(self, original: &Self) -> R<Self> {
+        self.inherit_derivation(original.collation_derivation()?)
+    }
+    fn inherit_derivation(self, d: Derivation<'_>) -> R<Self> {
+        if let Some((a, b)) = d.conflict {
+            let carrier = |n| {
+                bind(
+                    &format!("{IMPLICIT}{n}"),
+                    BoundScalar {
+                        ty: self.ty.clone(),
+                        node: Node::Literal(Value::Null),
+                    },
+                )
+            };
+            let metadata = BoundScalar {
+                ty: self.ty.clone(),
+                node: Node::Call("coalesce".into(), vec![carrier(a)?, carrier(b)?]),
+            };
+            return Ok(Self {
+                ty: self.ty.clone(),
+                node: Node::Call(PROPAGATED.into(), vec![self, metadata]),
+            });
+        }
+        if let Some(n) = d.name {
+            return bind(
+                &format!("{}{n}", if d.explicit { PREFIX } else { IMPLICIT }),
+                self,
+            );
+        }
+        Ok(self)
+    }
+    pub(in crate::relational::query) fn require_collation(&self) -> R<()> {
+        let d = self.collation_derivation()?;
+        if let Some((a, b)) = d.conflict {
+            mismatch(a, b, false)?;
+        }
+        if let Some(n) = d.name {
+            ready(n)?;
+        }
+        Ok(())
+    }
+    /// Comparison consumers defer an implicit conflict until two values really
+    /// meet (a singleton MIN/MAX or GREATEST needs no comparator).
+    pub(in crate::relational::query) fn check_comparison_collation(&self) -> R<()> {
+        if self.collation_derivation()?.conflict.is_some() {
+            return indeterminate();
+        }
+        Ok(())
+    }
+    pub(in crate::relational::query) fn try_compare_values(
+        &self,
+        a: &Value,
+        b: &Value,
+    ) -> R<Ordering> {
+        self.check_comparison_collation()?;
+        Ok(self.compare_values(a, b))
+    }
+}
+pub(in crate::relational::query) fn derive<'a>(
+    args: impl Iterator<Item = &'a BoundScalar>,
+) -> R<Option<&'a str>> {
+    let d = merge(args)?;
+    Ok(if d.conflict.is_some() { None } else { d.name })
+}
+std::thread_local! { static COLUMNS: std::cell::RefCell<BTreeMap<u64,String>> = const { std::cell::RefCell::new(BTreeMap::new()) }; }
+pub(in crate::relational::query) struct Scope(BTreeMap<u64, String>);
+impl Scope {
+    pub(in crate::relational::query) fn enter(state: &Relational) -> Self {
+        let columns = state
+            .ext
+            .column_collations
+            .iter()
+            .filter_map(|(id, b)| match b {
+                crate::relational::column_collations::Binding::Column(r) => {
+                    state.collation_name(r).ok().map(|n| (*id, n))
+                }
+                _ => None,
+            })
+            .collect();
+        Self(COLUMNS.with(|c| c.replace(columns)))
+    }
+}
+impl Drop for Scope {
+    fn drop(&mut self) {
+        COLUMNS.with(|c| c.replace(std::mem::take(&mut self.0)));
+    }
+}
+// Binding-only overrides for one materialized input. Never catalog or wire data.
+#[derive(Clone)]
+struct Metadata {
+    name: Option<String>,
+    explicit: bool,
+    conflict: Option<(String, String)>,
+}
+std::thread_local! { static MATERIALIZED: std::cell::RefCell<BTreeMap<u64, Metadata>> = const { std::cell::RefCell::new(BTreeMap::new()) }; }
+pub(in crate::relational::query) struct ColumnScope(BTreeMap<u64, Metadata>);
+impl ColumnScope {
+    pub(in crate::relational::query) fn enter(
+        columns: &[ColumnDef],
+        metadata: &[Option<BoundScalar>],
+    ) -> R<Self> {
+        Self::enter_refs(columns, metadata.iter().map(Option::as_ref))
+    }
+    pub(in crate::relational::query) fn enter_refs<'a>(
+        columns: &[ColumnDef],
+        metadata: impl IntoIterator<Item = Option<&'a BoundScalar>>,
+    ) -> R<Self> {
+        let mut values = BTreeMap::new();
+        for (c, m) in columns
+            .iter()
+            .zip(metadata.into_iter().chain(std::iter::repeat(None)))
+        {
+            let d = m
+                .map(BoundScalar::collation_derivation)
+                .transpose()?
+                .unwrap_or_default();
+            values.insert(
+                c.id,
+                Metadata {
+                    name: d.name.map(str::to_owned),
+                    explicit: d.explicit,
+                    conflict: d.conflict.map(|(a, b)| (a.to_owned(), b.to_owned())),
+                },
+            );
+        }
+        Ok(Self(MATERIALIZED.with(|c| c.replace(values))))
+    }
+}
+impl Drop for ColumnScope {
+    fn drop(&mut self) {
+        MATERIALIZED.with(|c| c.replace(std::mem::take(&mut self.0)));
+    }
+}
+pub(in crate::relational::query) fn column(value: BoundScalar, id: u64) -> R<BoundScalar> {
+    if let Some(d) = MATERIALIZED.with(|c| c.borrow().get(&id).cloned()) {
+        return value.inherit_derivation(Derivation {
+            name: d.name.as_deref(),
+            explicit: d.explicit,
+            conflict: d.conflict.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+        });
+    }
+    let n = COLUMNS.with(|c| c.borrow().get(&id).cloned());
+    if let Some(n) = n {
+        bind(&format!("{IMPLICIT}{n}"), value)
+    } else {
+        Ok(value)
+    }
+}
+pub(in crate::relational::query) fn bound_column(c: BoundColumn, d: &ColumnDef) -> R<BoundScalar> {
+    column(
+        BoundScalar {
+            ty: d.data_type.clone(),
+            node: Node::Column(c, d.name.clone()),
+        },
+        d.id,
+    )
+}
+pub(in crate::relational::query) fn has_column(id: u64) -> bool {
+    MATERIALIZED.with(|c| c.borrow().contains_key(&id))
+        || COLUMNS.with(|c| c.borrow().contains_key(&id))
+}
+type Cache = Mutex<std::collections::HashMap<String, Arc<giggles_icu::Collator>>>;
+static CACHE: OnceLock<Cache> = OnceLock::new();
+fn collator(n: &str) -> R<Arc<giggles_icu::Collator>> {
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    if let Some(c) = cache.get(n) {
+        return Ok(c.clone());
+    }
+    let locale = if let Some((_, _, locale, _)) = user(n) {
+        locale
+    } else if n == "unicode" {
+        "und"
+    } else {
+        n.strip_suffix("-x-icu").ok_or(SqlError::Unsupported)?
+    };
+    let c = Arc::new(
+        giggles_icu::Collator::open(
+            locale,
+            user(n).and_then(|(_, _, _, r)| (!r.is_empty()).then_some(r)),
+        )
+        .map_err(|_| SqlError::Unsupported)?,
+    );
+    cache.insert(n.into(), c.clone());
+    Ok(c)
+}
+pub(in crate::relational::query) fn ready(n: &str) -> R<()> {
+    if matches!(n, "en_US" | "en_US.utf8")
+        || user(n).is_some_and(|(p, _, l, _)| p == "c" && l == "en_US.utf8")
+    {
+        return Err(SqlError::Unsupported);
+    }
+    if n == "unicode" || n.ends_with("-x-icu") || user(n).is_some_and(|(p, _, _, _)| p == "i") {
+        collator(n)?;
+    }
+    Ok(())
+}
+pub(in crate::relational::query) fn compare(n: &str, a: &Value, b: &Value) -> Ordering {
+    if (n == "unicode" || n.ends_with("-x-icu") || user(n).is_some_and(|(p, _, _, _)| p == "i"))
+        && let (Value::Text(a), Value::Text(b)) = (a, b)
+    {
+        return giggles_icu::pg_compare(
+            &collator(n).expect("collation validated before execution"),
+            user(n).is_none_or(|(_, d, _, _)| d),
+            a.as_bytes(),
+            b.as_bytes(),
+        );
+    }
+    cmp(a, b)
+}
+pub(in crate::relational::query) fn pair(a: &BoundScalar, b: &BoundScalar) -> R<()> {
+    if let Some(n) = derive([a, b].into_iter())? {
+        ready(n)?;
+    }
+    Ok(())
+}
+pub(in crate::relational::query) fn compare_pair(
+    a: &BoundScalar,
+    b: &BoundScalar,
+    av: &Value,
+    bv: &Value,
+) -> R<Ordering> {
+    let d = merge([a, b].into_iter())?;
+    if d.conflict.is_some() {
+        return indeterminate();
+    }
+    let trim = |v: &Value, ty: &DataType| {
+        if *ty == DataType::Bpchar {
+            if let Value::Text(t) = v {
+                return Value::Text(t.trim_end_matches(' ').into());
+            }
+            v.clone()
+        } else {
+            v.clone()
+        }
+    };
+    let (av, bv) = (trim(av, &a.ty), trim(bv, &b.ty));
+    Ok(d.name
+        .map_or_else(|| cmp(&av, &bv), |n| compare(n, &av, &bv)))
+}
+
+fn indeterminate<T>() -> R<T> {
+    user_types::view_replace_error(
+        "could not determine which collation to use for string comparison".into(),
+    );
+    Err(SqlError::IndeterminateCollation)
+}
+
+pub(super) fn casing(
+    name: &str,
+    input: &BoundScalar,
+    value: &Value,
+    budget: &mut usize,
+) -> R<Option<Value>> {
+    let Some(n) = input.explicit_collation()? else {
+        return Ok(None);
+    };
+    let Value::Text(text) = value else {
+        return Ok(None);
+    };
+    ready(n)?;
+    let locale_name = user(n).map(|(_, _, l, _)| l);
+    let output = if n == "pg_unicode_fast" || locale_name == Some("PG_UNICODE_FAST") {
+        match name {
+            "upper" => text.to_uppercase(),
+            "lower" => text.to_lowercase(),
+            _ => {
+                let mut start = true;
+                text.chars()
+                    .map(|c| {
+                        let v: String = if start {
+                            c.to_uppercase().collect()
+                        } else {
+                            c.to_lowercase().collect()
+                        };
+                        start = !c.is_alphanumeric();
+                        v
+                    })
+                    .collect()
+            }
+        }
+    } else if n == "unicode"
+        || n.ends_with("-x-icu")
+        || user(n).is_some_and(|(p, _, _, _)| p == "i")
+    {
+        let locale = if let Some((_, _, l, _)) = user(n) {
+            l
+        } else if n == "unicode" || n == "pg_unicode_fast" {
+            "und"
+        } else {
+            n.strip_suffix("-x-icu").unwrap()
+        };
+        giggles_icu::Icu::load()
+            .map_err(|_| SqlError::Unsupported)?
+            .case_map(locale, name, text)
+            .map_err(|_| SqlError::Unsupported)?
+    } else if matches!(n, "C" | "POSIX" | "ucs_basic") || matches!(locale_name, Some("C" | "POSIX"))
+    {
+        match name {
+            "upper" => text.to_ascii_uppercase(),
+            "lower" => text.to_ascii_lowercase(),
+            _ => {
+                let mut start = true;
+                text.chars()
+                    .map(|c| {
+                        let v = if start {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c.to_ascii_lowercase()
+                        };
+                        start = !c.is_ascii_alphanumeric();
+                        v
+                    })
+                    .collect()
+            }
+        }
+    } else {
+        // C.UTF-8 uses simple Unicode mappings: expansions such as sharp s -> SS are excluded.
+        let mut start = true;
+        text.chars()
+            .map(|c| {
+                let up = name == "upper" || name == "initcap" && start;
+                start = !c.is_alphanumeric();
+                let mapped: String = if up {
+                    c.to_uppercase().collect()
+                } else {
+                    c.to_lowercase().collect()
+                };
+                if mapped.chars().count() == 1 {
+                    mapped.chars().next().unwrap()
+                } else {
+                    c
+                }
+            })
+            .collect()
+    };
+    let value = Value::Text(output);
+    charge(budget, &value)?;
+    Ok(Some(value))
+}
+
+pub(in crate::relational::query) fn like(
+    input: &BoundScalar,
+    value: &Value,
+    pattern: &Value,
+    escape: crate::relational::like::Escape,
+    insensitive: bool,
+    negated: bool,
+    work: &mut usize,
+) -> R<Option<Option<bool>>> {
+    if *value != Value::Null && *pattern != Value::Null {
+        input.check_comparison_collation()?;
+    }
+    let Some(n) = input.explicit_collation()? else {
+        return Ok(None);
+    };
+    if !user(n).is_some_and(|(_, d, _, _)| !d) {
+        return Ok(None);
+    }
+    if insensitive {
+        return Err(SqlError::Unsupported);
+    }
+    let (Value::Text(v), Value::Text(p)) = (value, pattern) else {
+        return Ok(Some(None));
+    };
+    ready(n)?;
+    Ok(Some(Some(
+        crate::relational::like::collated(v, p, escape, work, |a, b| {
+            compare(n, &Value::Text(a.into()), &Value::Text(b.into())) == Ordering::Equal
+        })? != negated,
+    )))
+}
+
+pub(in crate::relational::query) fn set_pair(
+    a: Option<&BoundScalar>,
+    b: Option<&BoundScalar>,
+) -> R<bool> {
+    let d = merge(a.into_iter().chain(b))?;
+    if let Some((a, b)) = d.conflict {
+        mismatch(a, b, false)?;
+    }
+    Ok(d.name.is_some())
+}
+
+pub(in crate::relational::query) fn comparison_binding<'a>(
+    args: impl Iterator<Item = &'a BoundScalar>,
+) -> R<(Option<String>, bool)> {
+    let d = merge(args)?;
+    Ok((d.name.map(str::to_owned), d.conflict.is_some()))
+}
+impl BoundScalar {
+    pub(in crate::relational::query) fn collation_column(&self) -> Option<BoundColumn> {
+        match &self.node {
+            Node::Column(c, _) => Some(*c),
+            Node::Call(n, args) if internal(n) => args[0].collation_column(),
+            _ => None,
+        }
+    }
+}
+
+pub(super) fn display_name(n:&str)->String {
+    let quote=|s:&str| {
+        let simple=!s.is_empty() && s.chars().enumerate().all(|(i,c)|c=='_' || c.is_ascii_lowercase() || i>0 && c.is_ascii_digit());
+        if simple && s!="default" {s.to_owned()} else {format!("\"{}\"",s.replace('"',"\"\""))}
+    };
+    let label=n.split('\0').next().unwrap_or(n);
+    if user(n).is_some() && let Some((schema,name))=label.split_once('.') {
+        if schema=="public" {quote(name)} else {format!("{}.{}",quote(schema),quote(name))}
+    } else {quote(label)}
+}

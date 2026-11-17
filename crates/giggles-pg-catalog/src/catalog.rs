@@ -700,8 +700,10 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
             ("collprovider", T::Char),
             ("collisdeterministic", T::Bool),
             ("collencoding", T::Int4),
-            ("collcollate", T::Name),
-            ("collctype", T::Name),
+            ("collcollate", T::Text),
+            ("collctype", T::Text),
+            ("colllocale", T::Text),
+            ("collicurules", T::Text),
             ("collversion", T::Text),
             ("xmin", T::Xid),
         ],
@@ -1207,7 +1209,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         if !ids.insert(t.id)
             || !names.insert((snapshot.table_schema(t.id).0, &t.name))
             || t.name.is_empty()
-            || t.columns.is_empty()
+            || t.columns.is_empty() && !snapshot.collation_oids.get(&t.id).is_some_and(Vec::is_empty)
             || t.columns.len() > 64
         {
             return Err(Error::InvalidSnapshot);
@@ -1408,6 +1410,27 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         (10144,23,17,6368,"e","f"), (10150,23,18,78,"e","f"),
     ] {
         add("pg_cast", vec![I(oid),I(source),I(target),I(function),s(context),s(method),N]);
+    }
+    for line in include_str!("../../giggles-icu/src/pg_collation.txt").lines() {
+        let fields: Vec<_> = line.split('|').collect();
+        let mut row = Vec::new();
+        for (i, field) in fields.iter().enumerate() {
+            row.push(match i {
+                0 | 6 => I(field.parse().expect("embedded collation integer")),
+                2 => I(11), 3 => I(10), 5 => B(*field == "t"),
+                _ if field.is_empty() => N,
+                _ => s(field),
+            });
+        }
+        row.push(N);
+        add("pg_collation", row);
+    }
+    for row in &snapshot.collations {
+        if row.len() != 13 { return Err(Error::InvalidSnapshot); }
+        add("pg_collation", row.clone());
+        if row[12] != N {
+            add("pg_description", vec![row[0].clone(), I(3456), I(0), row[12].clone(), N]);
+        }
     }
     // Only this freshly authorized connection is visible. TLS details beyond
     // the handshake status are not retained by the hosting session.
@@ -1853,7 +1876,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     s(&t.name),
                     s(n),
                     N,
-                    s(&index_definition(schema, t, n, &t.primary_key, true)),
+                    s(&index_definition(snapshot,None,schema, t, n, &t.primary_key, true)),
                 ],
             );
             add(
@@ -2052,10 +2075,20 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     s(&t.name),
                     s(n),
                     N,
-                    s(&index_definition(schema, t, n, &keys, index.unique)),
+                    s(&index_definition(snapshot,Some(index.id),schema, t, n, &keys, index.unique)),
                 ],
             );
         }
+    }
+    for row in &mut all.get_mut("pg_index").unwrap().rows {
+        let Some(t)=snapshot.tables.iter().find(|t|table_oid(t.id).ok().map(|o|I(i64::from(o)))==Some(row[1].clone())) else {continue};
+        let index=snapshot.indexes.iter().find(|i|table_oid(i.id).ok().map(|o|I(i64::from(o)))==Some(row[0].clone()));
+        let keys=index.map(|i|i.columns.clone()).unwrap_or_else(||t.primary_key.iter().map(|i|t.columns[*i].id).collect());
+        let overrides=index.and_then(|i|snapshot.collation_oids.get(&i.id));
+        row[11]=Value::Array(keys.iter().enumerate().map(|(n,id)| {
+            let c=t.columns.iter().find(|c|c.id==*id).unwrap();
+            I(i64::from(overrides.and_then(|v|v.get(n)).copied().filter(|oid|*oid!=0).unwrap_or_else(||column_collation(snapshot,c))))
+        }).collect());
     }
     all.get_mut("pg_index")
         .unwrap()
@@ -2135,21 +2168,31 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             I(v) => v,
             _ => 0,
         };
-        row.push(I(match oid {
-            19 | 1003 => 950,
-            25 | 1009 => 100,
-            _ => 0,
-        }));
+        row.push(I(type_collation(snapshot,oid)));
         row.push(s(type_layout(oid).0));
     }
     for row in &mut all.get_mut("pg_attribute").unwrap().rows {
-        row[11] = I(match row[2] {
-            I(19) => 950,
-            I(25) => 100,
-            _ => 0,
-        });
+        row[11] = I(match row[2] {I(oid)=>type_collation(snapshot,oid),_=>0});
     }
     for row in &mut all.get_mut("pg_attribute").unwrap().rows {
+        if let Some(t)=snapshot.tables.iter().find(|t|table_oid(t.id).ok().map(|o|I(i64::from(o)))==Some(row[0].clone()))
+            && let I(n)=row[3] && n>0 && let Some(c)=t.columns.get((n-1) as usize)
+            && let Some(o)=snapshot.collation_oids.get(&c.id).and_then(|v|v.first()) {
+            row[11]=I(i64::from(*o));
+        }
+        if let I(n)=row[3] && n>0 {
+            let offset=(n-1) as usize;
+            if let Some(index)=snapshot.indexes.iter().find(|i|table_oid(i.id).ok().map(|o|I(i64::from(o)))==Some(row[0].clone())) {
+                let column=index.columns.get(offset).and_then(|id|snapshot.tables.iter().find(|t|t.id==index.table)?.columns.iter().find(|c|c.id==*id));
+                if let Some(column)=column {
+                    let oid=snapshot.collation_oids.get(&index.id).and_then(|v|v.get(offset)).copied().filter(|oid|*oid!=0).unwrap_or_else(||column_collation(snapshot,column));
+                    row[11]=I(i64::from(oid));
+                }
+            } else if let Some(table)=snapshot.tables.iter().find(|t|table_oid(t.id).ok().map(|o|I(i64::from(o)+1))==Some(row[0].clone()))
+                && let Some(column)=table.primary_key.get(offset).and_then(|i|table.columns.get(*i)) {
+                row[11]=I(i64::from(column_collation(snapshot,column)));
+            }
+        }
         let oid = match row[2] {
             I(oid) => oid,
             _ => 0,
@@ -2537,7 +2580,20 @@ pub(crate) fn quote_identifier(name: &str) -> String {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
 }
+fn type_collation(snapshot:&CatalogSnapshot,oid:i64)->i64 {
+    match oid {19|1003=>950,25|1009|1042|1043|1014|1015=>100,_=>{
+        if snapshot.user_types.iter().any(|t|i64::from(t.oid)==oid && t.kind=='d' && matches!(t.base,25|1042|1043)) {100} else {0}
+    }}
+}
+fn column_collation(snapshot:&CatalogSnapshot,column:&ColumnDef)->u32 {
+    snapshot.collation_oids.get(&column.id).and_then(|v|v.first()).copied().unwrap_or_else(|| {
+        let oid=snapshot.column_type_oids.get(&column.id).copied().unwrap_or(scalar(column.data_type).0);
+        type_collation(snapshot,i64::from(oid)) as u32
+    })
+}
 fn index_definition(
+    snapshot:&CatalogSnapshot,
+    index:Option<u64>,
     schema: &str,
     t: &TableDef,
     name: &str,
@@ -2551,7 +2607,22 @@ fn index_definition(
         quote_identifier(schema),
         quote_identifier(&t.name),
         keys.iter()
-            .map(|k| quote_identifier(&t.columns[*k].name))
+            .enumerate().map(|(offset,k)| {
+                let c=&t.columns[*k];let mut name=quote_identifier(&c.name);
+                let col=column_collation(snapshot,c);
+                if let Some(oid)=index.and_then(|id|snapshot.collation_oids.get(&id)).and_then(|v|v.get(offset)).copied().filter(|oid|*oid!=col && *oid!=0) {
+                    let builtin=include_str!("../../giggles-icu/src/pg_collation.txt").lines().find_map(|l|{let mut f=l.split('|');(f.next()?.parse::<u32>().ok()?==oid).then(||format!("pg_catalog.{}",quote_identifier(f.next().unwrap()))) });
+                    let user=snapshot.collations.iter().find(|r|r[0]==I(i64::from(oid))).and_then(|r| {
+                        let (Value::Text(n),I(namespace))=(&r[1],&r[2]) else {return None};
+                        let schema=if *namespace==2200 {"public"} else {
+                            snapshot.schemas.iter().find(|(_, (oid,_))|i64::from(*oid)==*namespace)?.0.as_str()
+                        };
+                        Some(format!("{}.{}",quote_identifier(schema),quote_identifier(n)))
+                    });
+                    if let Some(collation)=builtin.or(user) {name.push_str(&format!(" COLLATE {collation}"));}
+                }
+                name
+            })
             .collect::<Vec<_>>()
             .join(", ")
     )

@@ -39,6 +39,7 @@ impl Prepared {
         let result = lex_into(sql, &mut tokens, false);
         if !matches!(tokens.first(), Some(Token::Word(w)) if w == "comment") { return Ok(None); }
         result?;
+        if collations::claims(&tokens) { return Ok(None); }
         let mut parser = Parser { tokens, at: 1, params: BTreeSet::new(), relations: Vec::new() };
         Ok(Some(parse(&mut parser)?.table))
     }

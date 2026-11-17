@@ -82,6 +82,7 @@ pub(super) fn resolve(
         columns: description.columns,
         typmods: description.typmods,
         type_oids: description.type_oids,
+        collations: vec![],
     })
 }
 
@@ -229,6 +230,53 @@ impl Plan {
             rows: relation.rows,
             affected: relation.affected,
         })
+    }
+}
+
+/// Joined mutations materialize join shapes and substitute outer columns with
+/// typed literals. Neither representation retains collation derivations yet.
+/// Reject before binding/matching, including explicit COLLATE in action and
+/// RETURNING expressions, rather than silently using bytewise comparisons.
+pub(super) fn reject_unpropagated_collations<'a>(
+    state: &Relational,
+    tables: &[String],
+    from: &join::From,
+    plans: impl Iterator<Item = &'a Plan>,
+) -> R<()> {
+    let mut collated = tables.iter().any(|name| {
+        views::table(state, name).is_ok_and(|table| {
+            table
+                .columns
+                .iter()
+                .any(|c| state.ext.column_collations.contains_key(&c.id))
+        })
+    });
+    let mut inspect = |s: &Scalar| {
+        let _ = walk_scalar(s, &mut |s| {
+            collated |= matches!(s, Scalar::Call(n, _) if functions::collation::internal(n));
+            Ok(())
+        });
+    };
+    from.visit_scalars(&mut inspect);
+    from.visit_queries(&mut |q| {
+        let _ = q.walk_scalars(&mut |s| {
+            inspect(s);
+            Ok(())
+        });
+    });
+    for plan in plans {
+        plan.visit_scalars(&mut inspect);
+        plan.visit_queries(&mut |q| {
+            let _ = q.walk_scalars(&mut |s| {
+                inspect(s);
+                Ok(())
+            });
+        });
+    }
+    if collated {
+        Err(SqlError::Unsupported)
+    } else {
+        Ok(())
     }
 }
 

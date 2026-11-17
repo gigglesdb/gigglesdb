@@ -46,6 +46,7 @@ pub(super) enum Semantics {
 struct ResolvedArbiter<'a> {
     columns: Vec<usize>,
     descriptor: Option<&'a Descriptor>,
+    equality: crate::relational::collation_keys::Key,
 }
 impl ResolvedArbiter<'_> {
     fn tuple(
@@ -57,13 +58,7 @@ impl ResolvedArbiter<'_> {
             .iter()
             .map(|index| value(*index))
             .collect::<Vec<_>>();
-        if values.iter().any(|value| matches!(value, Value::Null)) {
-            Ok(None)
-        } else {
-            crate::relational::encode_key(&values)
-                .map(Some)
-                .map_err(sql)
-        }
+        self.equality.values(&values).map_err(sql)
     }
 }
 
@@ -276,6 +271,8 @@ fn plan_unique_conflict_evaluated<'s>(
         arbiters.push(ResolvedArbiter {
             columns: table.primary_key.clone(),
             descriptor: None,
+            equality: crate::relational::collation_keys::Key::new(src, table,
+                &table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>(), None).map_err(sql)?,
         });
     }
     for target in targets {
@@ -292,6 +289,7 @@ fn plan_unique_conflict_evaluated<'s>(
             columns.push(index);
         }
         arbiters.push(ResolvedArbiter {
+            equality: crate::relational::collation_keys::Key::new(src, table, &target.columns, Some(target.id)).map_err(sql)?,
             columns,
             descriptor: Some(target),
         });
@@ -330,7 +328,18 @@ fn plan_unique_conflict_evaluated<'s>(
             if winner.is_none()
                 && let Some(tuple) = &tuple
             {
-                winner = if let Some(target) = arbiter.descriptor {
+                winner = if arbiter.equality.nondeterministic() {
+                    let rows = src.secondary_access_engine(table, epoch, &mut *cancel).map_err(sql)?.1;
+                    let mut found = None;
+                    for (key, old) in rows {
+                        tick(cancel)?;
+                        if arbiter.equality.tuple(&old.values).map_err(sql)?.as_ref() == Some(tuple) {
+                            found = Some((key.as_slice(), old));
+                            break;
+                        }
+                    }
+                    found
+                } else if let Some(target) = arbiter.descriptor {
                     let values = arbiter
                         .columns
                         .iter()

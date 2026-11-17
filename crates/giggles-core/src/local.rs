@@ -148,6 +148,8 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidFrameOffset => 61,
                 relational::SqlError::InvalidNtileArgument => 62,
                 relational::SqlError::InvalidNthValueArgument => 63,
+                relational::SqlError::CollationMismatch => 64,
+                relational::SqlError::IndeterminateCollation => 65,
             }
         }
     };

@@ -164,7 +164,7 @@ impl BoundQuery<'_> {
                 return Ok(false);
             }
             if self.query.distinct() && offset > 0 {
-                let key = grouping::Key(self.project_tuple(row, params, &mut 0, &mut 0)?.values);
+                let key = grouping::Key::output(self.project_tuple(row, params, &mut 0, &mut 0)?.values, &self.items);
                 if seen.contains(&key) { return Ok(false); }
                 distinct_bytes += distinct_charge(&key.0, &[], &mut execution.retention.borrow_mut())?;
                 seen.insert(key);

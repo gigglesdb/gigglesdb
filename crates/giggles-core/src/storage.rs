@@ -2154,6 +2154,10 @@ impl Admin {
             Ok((s.sql.epoch, generation))
         })
     }
+    pub fn collation_oids(&self)->Result<BTreeMap<u64,Vec<u32>>,CoreError> { self.inner.inspect_metadata(|s|s.sql.collation_oids().map_err(CoreError::Sql)) }
+    pub fn user_collations(&self) -> Result<Vec<(u32, relational::UserCollation)>, CoreError> {
+        self.inner.inspect_metadata(|s| s.sql.catalog_ext().collations.iter().map(|(id,c)| Ok((relational::type_oid(*id).map_err(CoreError::Sql)?, c.clone()))).collect())
+    }
     pub fn catalog_presentation(&self) -> Result<relational::CatalogPresentation, CoreError> {
         self.inner.inspect_metadata(|s| s.sql.catalog_presentation().map_err(CoreError::Sql))
     }
@@ -2184,6 +2188,8 @@ pub struct CatalogMetadata {
     pub tables: Vec<relational::TableDef>,
     pub schemas: relational::SchemaMetadata,
     pub types: relational::UserTypeCatalog,
+    pub collations: Vec<(u32, relational::UserCollation)>,
+    pub collation_oids: BTreeMap<u64,Vec<u32>>,
     pub generation: u64,
     pub typmods: BTreeMap<u64, i32>,
     pub indexes: Vec<IndexInfo>,
@@ -2202,6 +2208,13 @@ impl SqlSession {
                 (birth != 0).then_some((t.id, birth))
             }).collect(), s.sql.catalog_parts().2, s.sql.catalog_ext().wire_version(),
         )))
+    }
+    pub fn collation_authority(&self, p: &relational::Prepared) -> Result<Vec<(String, Option<String>)>, CoreError> {
+        self.inspect_metadata(|s| p.collation_authority(&s.sql).map_err(CoreError::Sql))
+    }
+    pub fn collation_oids(&self)->Result<BTreeMap<u64,Vec<u32>>,CoreError> { self.inspect_metadata(|s|s.sql.collation_oids().map_err(CoreError::Sql)) }
+    pub fn user_collations(&self) -> Result<Vec<(u32, relational::UserCollation)>, CoreError> {
+        self.inspect_metadata(|s| s.sql.catalog_ext().collations.iter().map(|(id,c)| Ok((relational::type_oid(*id).map_err(CoreError::Sql)?, c.clone()))).collect())
     }
     /// Logical FK binding names for tests (constraint names should be unique in the fixture).
     #[doc(hidden)]
@@ -2235,6 +2248,8 @@ impl SqlSession {
             Ok(CatalogMetadata {
                 presentation, tables,
                 schemas: s.sql.schema_metadata(), types: s.sql.user_type_catalog(),
+                collation_oids:s.sql.collation_oids().map_err(CoreError::Sql)?,
+                collations: s.sql.catalog_ext().collations.iter().map(|(id,c)| Ok((relational::type_oid(*id).map_err(CoreError::Sql)?,c.clone()))).collect::<Result<_,CoreError>>()?,
                 generation: match &self.admin.inner.backend {
                     Backend::Legacy(_) => s.sql.generation,
                     Backend::V2(_) => catalog_xid_from_hlc(s.sql.epoch),
@@ -5663,3 +5678,7 @@ impl SqlSession {
         Ok((crash, point))
     }
 }
+
+#[cfg(test)]
+#[path = "storage/column_collation_format_tests.rs"]
+mod column_collation_format_tests;

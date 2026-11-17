@@ -724,6 +724,10 @@ pub(super) fn resolve(
         *slot = Some(ty);
     }
     Ok(bind::Meta {
+        collations: bound.items.into_iter().map(|item| match item {
+            BoundItem::Scalar(value) => Some(value),
+            _ => None,
+        }).collect(),
         unknown: vec![false; d.columns.len()],
         columns: d.columns,
         typmods: d.typmods,

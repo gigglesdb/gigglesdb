@@ -673,6 +673,7 @@ fn validate_definition(def: &TableDef) -> Result<(), CoreError> {
         .map(|&offset| def.columns[offset].name.clone())
         .collect();
     validate_relation_name(&def.name)?;
+    if columns.is_empty() && def.hidden_rowid().is_some() {return Ok(());}
     validate_create_definition(crate::relational::split_key(&def.name).1, &columns, &keys)
         .map_err(|_| corrupt("invalid catalog table definition"))
 }
@@ -760,6 +761,26 @@ pub(crate) fn decode_sequence(v: &[u8]) -> Result<SequenceDef, CoreError> {
     Ok(dto.into())
 }
 // Standalone legacy v6 TypeDef, prefixed with the independent record version.
+pub(crate) fn column_collation_key(id: u64) -> Vec<u8> { object_key(23, id) }
+pub(crate) fn encode_column_collation(v: &crate::relational::column_collations::Binding) -> Result<Vec<u8>, CoreError> {
+    crate::relational::column_collations::validate_binding(v).map_err(CoreError::Sql)?;
+    encode_version(1, v)
+}
+pub(crate) fn decode_column_collation(v: &[u8]) -> Result<crate::relational::column_collations::Binding, CoreError> {
+    let b = decode_version(1, v)?;
+    crate::relational::column_collations::validate_binding(&b).map_err(|_| corrupt("invalid column collation"))?;
+    Ok(b)
+}
+pub(crate) fn collation_key(id: u64) -> Vec<u8> { object_key(22, id) }
+pub(crate) fn encode_collation(v: &crate::relational::collations::Collation) -> Result<Vec<u8>, CoreError> {
+    crate::relational::collations::validate(v).map_err(CoreError::Sql)?;
+    encode_version(1, v)
+}
+pub(crate) fn decode_collation(v: &[u8]) -> Result<crate::relational::collations::Collation, CoreError> {
+    let c = decode_version(1, v)?;
+    crate::relational::collations::validate(&c).map_err(|_| corrupt("invalid collation"))?;
+    Ok(c)
+}
 pub(crate) fn encode_type(v: TypeDef) -> Result<Vec<u8>, CoreError> {
     encode_version(1, &v)
 }
@@ -811,6 +832,8 @@ pub(crate) enum CatalogKind {
     RoleOid,
     Schema,
     TypeDefinition,
+    Collation,
+    ColumnCollation,
     Index,
     SqlView,
     RelationComment,
@@ -837,6 +860,8 @@ pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError>
             CatalogKind::Schema
         }
         Some(15) if key.len() == 9 => CatalogKind::TypeDefinition,
+        Some(23) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::ColumnCollation,
+        Some(22) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::Collation,
         Some(16) if key.len() == 9 => CatalogKind::Index,
         Some(17) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::SqlView,
         Some(18) if key.len() == 17 && key[1..9] != [0; 8] => CatalogKind::RelationComment,

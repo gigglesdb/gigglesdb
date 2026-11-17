@@ -565,7 +565,8 @@ pub(crate) struct UpdateUnique {
     indexes: Vec<UpdateUniqueIndex>,
 }
 struct UpdateUniqueIndex {
-    columns: Vec<usize>,
+    key: collation_keys::Key,
+    name: String,
     occupied: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 impl UpdateUnique {
@@ -575,34 +576,24 @@ impl UpdateUnique {
         cancel: &mut impl FnMut() -> bool,
     ) -> R<Self> {
         let mut indexes = Vec::new();
-        for descriptor in state
-            .secondary
-            .descriptors()
-            .iter()
-            .filter(|d| d.table == table.id && d.unique)
-        {
-            let columns = descriptor
-                .columns
-                .iter()
-                .map(|id| column(table, *id))
-                .collect::<R<Vec<_>>>()?;
+        let primary = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>();
+        let primary = collation_keys::Key::new(state, table, &primary, None)?;
+        let mut keys = Vec::new();
+        if primary.nondeterministic() {
+            keys.push((primary, state.primary_key_constraint_name(table).unwrap_or_default()));
+        }
+        for d in state.secondary.descriptors().iter().filter(|d| d.table == table.id && d.unique) {
+            keys.push((collation_keys::Key::new(state, table, &d.columns, Some(d.id))?, d.name.clone()));
+        }
+        for (key, name) in keys {
             let mut occupied = BTreeMap::new();
-            for (key, row) in state.rows.get(&table.id).ok_or(SqlError::UnknownTable)? {
+            for (owner, row) in state.rows.get(&table.id).ok_or(SqlError::UnknownTable)? {
                 tick(cancel)?;
-                if let Some(tuple) = Self::tuple(&columns, &row.values)? {
-                    occupied.insert(tuple, key.clone());
-                }
+                if let Some(tuple) = key.tuple(&row.values)? { occupied.insert(tuple, owner.clone()); }
             }
-            indexes.push(UpdateUniqueIndex { columns, occupied });
+            indexes.push(UpdateUniqueIndex { key, name, occupied });
         }
         Ok(Self { indexes })
-    }
-    fn tuple(columns: &[usize], values: &[Value]) -> R<Option<Vec<u8>>> {
-        if columns.iter().any(|column| values[*column] == Value::Null) {
-            return Ok(None);
-        }
-        tuple_len(columns.iter().map(|column| &values[*column]))?;
-        encode_tuple(columns.iter().map(|column| &values[*column])).map(Some)
     }
     pub(crate) fn visit(
         &mut self,
@@ -611,18 +602,18 @@ impl UpdateUnique {
         values: &[Value],
         cancel: &mut impl FnMut() -> bool,
     ) -> R<()> {
-        for UpdateUniqueIndex { columns, occupied } in &mut self.indexes {
+        for UpdateUniqueIndex { key: equality, name, occupied } in &mut self.indexes {
             tick(cancel)?;
-            let tuple = Self::tuple(columns, values)?;
+            let tuple = equality.tuple(values)?;
             if let Some(tuple) = &tuple
                 && occupied
                     .get(tuple)
                     .is_some_and(|owner| old.is_none_or(|(old_key, _)| owner.as_slice() != old_key))
             {
-                return Err(SqlError::Duplicate);
+                return Err(if equality.nondeterministic() { collation_keys::duplicate(name) } else { SqlError::Duplicate });
             }
             if let Some((_, old)) = old
-                && let Some(tuple) = Self::tuple(columns, &old.values)?
+                && let Some(tuple) = equality.tuple(&old.values)?
             {
                 occupied.remove(&tuple);
             }
@@ -755,7 +746,7 @@ impl Relational {
                         .or(prior.new)
                         .is_some_and(|(k, _)| Some(k) == identity)
             }) {
-                return Err(SqlError::Duplicate);
+                return Err(self.primary_duplicate(table(self, change.table)?));
             }
             if let Some((key, old)) = change.old {
                 if !rows
@@ -769,7 +760,7 @@ impl Relational {
             } else if let Some((key, _)) = change.new
                 && rows.contains_key(key)
             {
-                return Err(SqlError::Duplicate);
+                return Err(self.primary_duplicate(table(self, change.table)?));
             }
             if let (Some((old, _)), Some((new, _))) = (change.old, change.new)
                 && old != new
@@ -870,6 +861,9 @@ impl Relational {
                     .expect("staged table")
                     .insert(key.to_vec(), row.clone());
             }
+        }
+        for (id, map) in &rows {
+            self.validate_collated_unique(table(self, *id)?, map, ds, cancel)?;
         }
         let mut count = 0;
         let mut candidates = 0;
@@ -1069,6 +1063,9 @@ impl Relational {
         ds: &[Descriptor],
         mut cancel: impl FnMut() -> bool,
     ) -> R<Sidecar> {
+        for table in self.tables.values() {
+            self.validate_collated_unique(table, &self.rows[&table.id], ds, &mut cancel)?;
+        }
         let snap = snapshot(self, ds, NONE, &mut cancel)?;
         let tuples = snap.tuples();
         let mut staged = Sidecar::default();

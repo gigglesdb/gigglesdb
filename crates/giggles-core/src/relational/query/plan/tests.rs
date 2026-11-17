@@ -471,3 +471,51 @@ fn deeply_nested_scalar_subqueries_preserve_parser_depth_error() {
         );
     }
 }
+
+#[test]
+fn planner_collation_materialization_fails_closed() {
+    let mut state = Relational::default();
+    for sql in [
+        "CREATE COLLATION planner_ci (provider=icu,locale='und-u-ks-level2',deterministic=false)",
+        "CREATE TABLE planner_collated (v text COLLATE planner_ci)",
+        "INSERT INTO planner_collated VALUES ('ABC'),('abc')",
+    ] {
+        let p = Prepared::parse(sql, 1, state.epoch).unwrap();
+        state.execute(&p, &[], None).unwrap();
+    }
+    for sql in [
+        "SELECT * FROM planner_collated a RIGHT JOIN planner_collated b ON a.v=b.v",
+        "SELECT * FROM planner_collated a FULL JOIN planner_collated b ON a.v=b.v",
+        "SELECT * FROM planner_collated a JOIN planner_collated b USING(v)",
+        "SELECT * FROM planner_collated a NATURAL JOIN planner_collated b",
+        "SELECT * FROM planner_collated a,planner_collated b WHERE a.v=b.v",
+        "SELECT * FROM planner_collated a CROSS JOIN LATERAL (SELECT a.v) b",
+        "SELECT v = ANY (SELECT v FROM planner_collated) FROM planner_collated",
+        "SELECT v = ALL (SELECT v FROM planner_collated) FROM planner_collated",
+        "SELECT v IN (SELECT b.v FROM planner_collated b WHERE b.v=a.v) FROM planner_collated a",
+        "SELECT (SELECT v FROM planner_collated LIMIT 1) = 'abc'",
+        r#"SELECT * FROM (SELECT 'ABC' COLLATE "und-x-icu" v) a JOIN (SELECT 'abc' v) b USING(v)"#,
+        r#"SELECT * FROM (SELECT 'ABC' v) a RIGHT JOIN (SELECT 'abc' v) b ON a.v COLLATE "und-x-icu"=b.v"#,
+        r#"SELECT 'ABC' COLLATE "und-x-icu" = ANY (ARRAY['abc'])"#,
+        r#"WITH c AS (SELECT 'ABC' COLLATE "und-x-icu" v) SELECT * FROM c NATURAL JOIN (SELECT 'abc' v) b"#,
+        r#"SELECT * FROM unnest(ARRAY['ABC' COLLATE "und-x-icu"] ) u"#,
+    ] {
+        let p = Prepared::parse(sql, 1, state.epoch).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert_eq!(state.execute(&p, &[], None), Err(SqlError::Unsupported), "{sql}");
+    }
+}
+
+#[test]
+fn planner_type_sizes_stay_within_frame_budgets() {
+    let sizes = [
+        ("Scalar", std::mem::size_of::<Scalar>(), 64),
+        ("Filter", std::mem::size_of::<Filter>(), 192),
+        ("Query", std::mem::size_of::<Query>(), 384),
+        ("Plan", std::mem::size_of::<Plan>(), 256),
+        ("Statement", std::mem::size_of::<Statement>(), 512),
+    ];
+    eprintln!("{sizes:?}");
+    for (name, size, budget) in sizes {
+        assert!(size <= budget, "{name}: {size} exceeds {budget} byte frame budget");
+    }
+}

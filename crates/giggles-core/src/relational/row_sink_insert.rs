@@ -162,6 +162,7 @@ pub(crate) fn validate_append(state: &Relational, table: &TableDef, first_versio
             after = Some(last);
             rows.retain(|_, row| row.version >= first_version && row.version < version_end);
             if rows.is_empty() { continue; }
+            let inserted = rows.keys().cloned().collect::<Vec<_>>();
             let mut page = state.clone();
             page.rows.insert(table.id, rows);
             let mut before = state.clone();
@@ -170,6 +171,11 @@ pub(crate) fn validate_append(state: &Relational, table: &TableDef, first_versio
             // in before/page; recursively expanding them walks self-FK chains.
             hydrate(&page.clone(), &state.ext.constraints, &mut before, &mut page,
                 sink, &mut retention, true)?;
+            // A new self-FK row can also witness another new row's parent.
+            // Hydration must not make that seed look unchanged and skip its FK.
+            for key in inserted {
+                before.rows.get_mut(&table.id).expect("append table").remove(&key);
+            }
             rebuild(&mut page, &sink.indexes())?;
             constraints::enforce(&mut page, &before, Vec::new(), pending,
                 &mut || crate::cancellation::check().is_err(), clock).map_err(CoreError::Sql)?;

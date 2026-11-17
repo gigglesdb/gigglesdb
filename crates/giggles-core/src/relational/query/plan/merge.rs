@@ -637,6 +637,12 @@ impl Merge {
         state: &Relational,
         parameters: &mut [Option<DataType>],
     ) -> R<bind::Meta> {
+        dml::reject_unpropagated_collations(
+            state,
+            &self.read_tables(),
+            &self.input.from,
+            self.plans().chain(self.input.returning.as_ref()),
+        )?;
         let shape = self.shape(state, parameters)?;
         let table = &state.tables[&self.input.target];
         for w in &self.clauses {
@@ -713,6 +719,7 @@ impl Merge {
                 typmods: vec![],
                 type_oids: vec![],
                 unknown: vec![],
+                collations: vec![],
             })
         }
     }

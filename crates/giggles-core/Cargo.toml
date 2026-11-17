@@ -13,6 +13,7 @@ upgrade-fault-injection = []
 test-sql-parser-trap = []
 
 [dependencies]
+giggles-icu = { path = "../giggles-icu" }
 giggles-pg-types = { path = "../giggles-pg-types" }
 giggles-transactions = { path = "../giggles-transactions" }
 redb = "3.1"
@@ -73,3 +74,7 @@ required-features = ["engine-rocksdb"]
 name = "upgrade_crash"
 path = "tests/upgrade_crash.rs"
 required-features = ["engine-rocksdb", "upgrade-fault-injection"]
+
+[[test]]
+name = "missing_icu_collation"
+path = "tests/missing_icu_collation.rs"

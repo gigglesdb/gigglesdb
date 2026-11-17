@@ -284,6 +284,34 @@ const CHILD_INSERT_THEN_PARENT_DELETE: Case = Case {
     fin: (P_C_FIN, "c|1,p|1,p|2;c|1,p|1,p|2;c|1,p|1,p|2 or p|2"),
 };
 
+const COLLATED_P_C: &str = "CREATE COLLATION ci (provider=icu,locale='und-u-ks-level2',deterministic=false); CREATE TABLE p (id TEXT COLLATE ci PRIMARY KEY); CREATE TABLE c (id INT PRIMARY KEY, p TEXT COLLATE ci REFERENCES p(id)); INSERT INTO p VALUES ('one'),('two')";
+const COLLATED_PARENT_DELETE_THEN_CHILD_INSERT: Case = Case {
+    setup: COLLATED_P_C,
+    steps: &[
+        BEGIN_A, BEGIN_B,
+        ('A', "SELECT count(*) FROM p", "2"),
+        ('B', "SELECT count(*) FROM c", "0"),
+        ('A', "DELETE FROM p WHERE id='one'", "DELETE 1"),
+        ('B', "INSERT INTO c VALUES (1,'ONE')", "~E:23503;~E:40001;~E:40001"),
+        ('A', "COMMIT", "COMMIT"),
+        ('B', "COMMIT", "ROLLBACK"),
+    ],
+    fin: (P_C_FIN, "p|two"),
+};
+const COLLATED_CHILD_INSERT_THEN_PARENT_DELETE: Case = Case {
+    setup: COLLATED_P_C,
+    steps: &[
+        BEGIN_A, BEGIN_B,
+        ('A', "SELECT count(*) FROM p", "2"),
+        ('B', "SELECT count(*) FROM c", "0"),
+        ('B', "INSERT INTO c VALUES (1,'ONE')", "INSERT 0 1"),
+        ('A', "DELETE FROM p WHERE id='one'", "~E:23503"),
+        ('B', "COMMIT", "COMMIT"),
+        ('A', "COMMIT", "ROLLBACK"),
+    ],
+    fin: (P_C_FIN, "c|1,p|one,p|two"),
+};
+
 /// The outcomes `spec` admits at `level`: PostgreSQL's first, then any listed divergence.
 fn admitted(spec: &str, level: usize) -> Vec<&str> {
     let per_level: Vec<&str> = spec.split(';').collect();
@@ -558,6 +586,12 @@ matrix! {
     child_insert_then_parent_delete_rc: CHILD_INSERT_THEN_PARENT_DELETE, 0;
     child_insert_then_parent_delete_rr: CHILD_INSERT_THEN_PARENT_DELETE, 1;
     child_insert_then_parent_delete_ser: CHILD_INSERT_THEN_PARENT_DELETE, 2;
+    collated_parent_delete_then_child_insert_rc: COLLATED_PARENT_DELETE_THEN_CHILD_INSERT, 0;
+    collated_parent_delete_then_child_insert_rr: COLLATED_PARENT_DELETE_THEN_CHILD_INSERT, 1;
+    collated_parent_delete_then_child_insert_ser: COLLATED_PARENT_DELETE_THEN_CHILD_INSERT, 2;
+    collated_child_insert_then_parent_delete_rc: COLLATED_CHILD_INSERT_THEN_PARENT_DELETE, 0;
+    collated_child_insert_then_parent_delete_rr: COLLATED_CHILD_INSERT_THEN_PARENT_DELETE, 1;
+    collated_child_insert_then_parent_delete_ser: COLLATED_CHILD_INSERT_THEN_PARENT_DELETE, 2;
 }
 
 /// PostgreSQL's final query of the foreign-key cases, through a gateway.

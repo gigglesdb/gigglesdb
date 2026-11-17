@@ -88,6 +88,8 @@ pub(crate) struct CatalogView {
     pub(crate) constraints: BTreeMap<u64, BTreeMap<u64, Constraint>>,
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
     pub(crate) types: BTreeMap<u64, TypeDef>,
+    pub(crate) collations: BTreeMap<u64, relational::collations::Collation>,
+    pub(crate) column_collations: BTreeMap<u64, relational::column_collations::Binding>,
     pub(crate) schemas: BTreeMap<String, relational::schemas::Schema>,
     pub(crate) indexes: BTreeMap<u64, relational::secondary_index::Descriptor>,
     /// Task definitions (kind 19), live and revoked. Not part of `parts()`:
@@ -151,6 +153,8 @@ impl CatalogView {
         parts.indexes = self.indexes.values().cloned().collect();
         parts.ext.sequences = self.sequences.clone();
         parts.ext.types = self.types.clone();
+        parts.ext.collations = self.collations.clone();
+        parts.ext.column_collations = self.column_collations.clone();
         parts.ext.schemas = self.schemas.clone();
         if parts.ext.constraints.values().flatten().any(|c| matches!(&c.kind, crate::relational::catalog_ext::ConstraintKind::ForeignKey { deferral, .. } if *deferral != crate::relational::catalog_ext::Deferral::NotDeferrable)) {
             parts.ext.ext_version = 2;
@@ -282,6 +286,7 @@ impl CatalogSnapshot {
                     .chain(self.parts.ext.primary_index_birth.values().copied())
                     .chain(self.parts.ext.constraints.values().flatten().map(|c| c.id))
                     .chain(self.parts.ext.sequences.keys().copied())
+                    .chain(self.parts.ext.collations.keys().copied())
                     .chain(self.parts.ext.types.iter().map(|(&id, ty)| match ty {
                         relational::TypeDef::Enum { labels, .. } => {
                             id.saturating_add(labels.len() as u64)
@@ -1425,6 +1430,17 @@ fn apply_record(
             }
         }
         CatalogKind::Type => return Err(corrupt("unsupported historical type record")),
+        CatalogKind::ColumnCollation => {
+            let id = decode_id(&key[1..])?;
+            if let Some(value) = value { view.column_collations.insert(id, catalog_codec::decode_column_collation(value)?); }
+            else { view.column_collations.remove(&id); }
+        }
+        CatalogKind::Collation => {
+            let id = decode_id(&key[1..])?;
+            if let Some(value) = value {
+                view.collations.insert(id, catalog_codec::decode_collation(value)?);
+            } else { view.collations.remove(&id); }
+        }
         CatalogKind::TypeDefinition => {
             let id = decode_id(&key[1..])?;
             if let Some(value) = value {
@@ -1585,9 +1601,12 @@ fn finish_view(
     }
     if !view.schemas.is_empty()
         || !view.types.is_empty()
+        || !view.collations.is_empty() || !view.column_collations.is_empty()
         || view.by_name.keys().any(|name| name.contains('\0'))
     {
         let parts = view.parts();
+        relational::column_collations::validate_index_bindings(&parts.ext,&parts.indexes).map_err(|_|corrupt("invalid index collation binding"))?;
+        if !view.collations.is_empty() { object_ids(&parts)?; }
         relational::Relational::catalog_image(parts.tables, parts.ext, u64::MAX, 1)
             .map_err(|e| corrupt(&format!("invalid catalog image: {e:?}")))?;
     }
@@ -1623,6 +1642,7 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
     for id in parts.ext.sequences.keys() {
         insert(*id, (5, 0))?;
     }
+    for id in parts.ext.collations.keys() { insert(*id, (22, 0))?; }
     for (id, ty) in &parts.ext.types {
         insert(*id, (15, 0))?;
         if let TypeDef::Enum { labels, .. } = ty {
@@ -1645,6 +1665,7 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
     catalog_codec::validate_comments(&parts.comments, parts.tables.values(), &parts.sql_views)?;
     catalog_codec::sql_views::validate_catalog(parts)?;
     relational::catalog_ext::validate_unique_indexes(parts.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))), parts.indexes.iter()).map_err(|_| corrupt("invalid UNIQUE backing index"))?;
+    relational::column_collations::validate_index_bindings(&parts.ext,&parts.indexes).map_err(|_|corrupt("invalid index collation binding"))?;
     object_ids(parts)?;
     relational::catalog_ext::validate_key_targets(&parts.ext, parts.tables.values(), parts.indexes.iter(), u64::MAX).map_err(|_| corrupt("invalid referenced key or primary birth"))?;
     super::catalog_label_codec::validate_labels(&parts.column_labels, parts.tables.values())?;
@@ -1746,6 +1767,12 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
         catalog_codec::decode_sequence(&value)?;
         records.insert(catalog_codec::sequence_key(*id), value);
         records.insert(name_key(&def.name), id.to_be_bytes().to_vec());
+    }
+    for (id, binding) in &parts.ext.column_collations {
+        records.insert(catalog_codec::column_collation_key(*id), catalog_codec::encode_column_collation(binding)?);
+    }
+    for (id, c) in &parts.ext.collations {
+        records.insert(catalog_codec::collation_key(*id), catalog_codec::encode_collation(c)?);
     }
     for (id, ty) in &parts.ext.types {
         records.insert(

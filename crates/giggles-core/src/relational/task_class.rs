@@ -78,7 +78,7 @@ impl Prepared {
                 StatementClass::Savepoint
             }
             Statement::Schema(_)
-            | Statement::TypeDdl(_)
+            | Statement::TypeDdl(_) | Statement::CollationDdl(_)
             | Statement::Sequence(_)
             | Statement::Create { .. }
             | Statement::CreateIndex(_)

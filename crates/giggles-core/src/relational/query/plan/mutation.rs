@@ -391,6 +391,16 @@ impl Mutation {
         state: &Relational,
         parameters: &mut [Option<DataType>],
     ) -> R<bind::Meta> {
+        dml::reject_unpropagated_collations(
+            state,
+            &self.read_tables(),
+            &self.from,
+            self.groups
+                .iter()
+                .filter_map(|(_, p)| p.as_ref())
+                .chain(Some(&self.predicate))
+                .chain(self.returning.as_ref()),
+        )?;
         let catalog = self.catalog(state)?;
         let shape = self.from.resolve(&catalog, parameters)?;
         self.resolve_shape(state, parameters, &shape)
@@ -466,6 +476,7 @@ impl Mutation {
                 typmods: vec![],
                 type_oids: vec![],
                 unknown: vec![],
+                collations: vec![],
             })
         }
     }

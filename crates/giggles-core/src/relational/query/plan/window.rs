@@ -803,17 +803,24 @@ struct BoundCall {
     order: Vec<(BoundScalar, bool, bool)>,
     aggregate: Option<BoundItem>,
     column: ColumnDef,
+    collation: Option<BoundScalar>,
 }
 fn bind_call(
     call: &Call,
     columns: &[ColumnDef],
+    collations: &[Option<BoundScalar>],
     parameters: &mut [Option<DataType>],
     clock: Option<&crate::relational::clock::ExecutionClock>,
 ) -> R<BoundCall> {
+    let mut columns = columns.to_vec();
+    for (i, c) in columns.iter_mut().enumerate() {
+        c.id = i as u64 + 1;
+    }
+    let _collations = functions::collation::ColumnScope::enter(&columns, collations)?;
     let table = TableDef {
         id: 0,
         name: INPUT.into(),
-        columns: columns.to_vec(),
+        columns,
         primary_key: vec![],
     };
     for (i, s) in call.args.iter().enumerate() {
@@ -885,6 +892,9 @@ fn bind_call(
         }
         (partition, order, args, filter)
     };
+    for scalar in partition.iter().chain(order.iter().map(|(s, _, _)| s)) {
+        scalar.require_collation()?;
+    }
     if let Some(frame) = &call.spec.frame {
         let range = matches!(frame.mode, Mode::Range);
         for edge in [&frame.start, &frame.end] {
@@ -947,7 +957,24 @@ fn bind_call(
         }
         (ty, None)
     };
+    let collation = if matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar) {
+        // Value windows inherit their value arguments (including lag/lead's default).
+        let values = if matches!(call.name.as_str(), "lag" | "lead") && call.args.len() == 3 {
+            vec![call.args[0].clone(), call.args[2].clone()]
+        } else {
+            call.args.first().cloned().into_iter().collect()
+        };
+        Some(bind_expression(
+            &Scalar::Call("coalesce".into(), values),
+            &table,
+            parameters,
+            clock,
+        )?)
+    } else {
+        None
+    };
     Ok(BoundCall {
+        collation,
         args,
         filter,
         partition,
@@ -967,14 +994,21 @@ fn bind_call(
 
 pub(super) fn columns(
     calls: &[Call],
-    columns: &[ColumnDef],
+    meta: &mut bind::Meta,
     parameters: &mut [Option<DataType>],
-) -> R<Vec<ColumnDef>> {
-    let mut out = columns.to_vec();
-    for call in calls {
-        out.push(bind_call(call, columns, parameters, None)?.column);
+) -> R<()> {
+    let columns = meta.columns.clone();
+    let bound_calls = calls
+        .iter()
+        .map(|call| bind_call(call, &columns, &meta.collations, parameters, None))
+        .collect::<R<Vec<_>>>()?;
+    meta.collations.resize_with(columns.len(), || None);
+    for bound in bound_calls {
+        meta.columns.push(bound.column);
+        meta.collations.push(bound.collation);
+        meta.typmods.push(-1);
     }
-    Ok(out)
+    Ok(())
 }
 pub(super) fn prepare(select: &Select, state: &Relational) -> R<Query> {
     if select.windows.is_empty() {
@@ -1347,6 +1381,7 @@ fn frame_edge(
 pub(super) fn run(
     calls: &[Call],
     rows: &mut Relation<'_>,
+    collations: &[Option<BoundScalar>],
     params: &[Value],
     parameters: &[Option<DataType>],
     clock: Option<&crate::relational::clock::ExecutionClock>,
@@ -1357,7 +1392,13 @@ pub(super) fn run(
     }
     let input_columns = rows.columns.clone();
     for call in calls {
-        let bound = bind_call(call, &input_columns, &mut parameters.to_vec(), clock)?;
+        let bound = bind_call(
+            call,
+            &input_columns,
+            collations,
+            &mut parameters.to_vec(),
+            clock,
+        )?;
         let frame = call.spec.frame.clone().unwrap_or(Frame {
             mode: Mode::Range,
             start: Edge::Unbounded(false),
@@ -2100,7 +2141,7 @@ mod tests {
                 spec: Spec::default(),
             };
             assert_eq!(
-                run(&[call], &mut rows, &[], &[], None, &execution).unwrap_err(),
+                run(&[call], &mut rows, &[], &[], &[], None, &execution).unwrap_err(),
                 if kind == 0 {
                     SqlError::Aborted
                 } else {

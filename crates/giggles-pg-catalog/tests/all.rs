@@ -136,3 +136,11 @@ mod lateral_unnest;
 #[path = "viewdef_parity.rs"] mod viewdef_parity;
 #[path = "explain_text.rs"]
 mod explain_text;
+
+#[path = "collation_inventory.rs"]
+mod collation_inventory;
+
+#[path = "user_collation_catalog.rs"]
+mod user_collation_catalog;
+
+#[path="column_collation_catalog.rs"] mod column_collation_catalog;

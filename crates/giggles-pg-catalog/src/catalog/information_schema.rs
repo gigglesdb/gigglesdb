@@ -198,7 +198,7 @@ pub(super) fn populate(
             if *position <= 0 {
                 continue;
             }
-            generated.get_mut("columns").unwrap().push(column_row(
+            let mut column = column_row(
                 snapshot,
                 namespace,
                 &relation[1],
@@ -209,7 +209,14 @@ pub(super) fn populate(
                 attribute[11] == B(true),
                 !view,
                 all,
-            ));
+            );
+            if attribute[19] != I(0) && attribute[19] != I(100)
+                && let Some(coll)=all["pg_collation"].rows.iter().find(|c|c[0]==attribute[19]) {
+                    column[19]=s(&snapshot.database);
+                    column[20]=all["pg_namespace"].rows.iter().find(|n|n[0]==coll[2]).map_or(N,|n|n[1].clone());
+                    column[21]=coll[1].clone();
+            }
+            generated.get_mut("columns").unwrap().push(column);
         }
     }
     for table in &snapshot.tables {

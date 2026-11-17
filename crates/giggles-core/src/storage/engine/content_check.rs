@@ -31,6 +31,12 @@ pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatErr
     } else if key.first().is_some_and(|kind| matches!(kind, 14 | 15)) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::SCHEMAS_AND_USER_TYPES)
+    } else if key.first() == Some(&23) {
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        Ok(super::meta::COLUMN_COLLATIONS)
+    } else if key.first() == Some(&22) {
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        Ok(super::meta::USER_COLLATIONS)
     } else if key.first() == Some(&16) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::SECONDARY_INDEXES)
@@ -93,6 +99,14 @@ pub(crate) fn required_bits_for_catalog_value(
                 _ => 0,
             };
             Ok(64 | extra)
+        }
+        CatalogKind::ColumnCollation => {
+            catalog_codec::decode_column_collation(value).map_err(corrupt)?;
+            Ok(super::meta::COLUMN_COLLATIONS)
+        }
+        CatalogKind::Collation => {
+            catalog_codec::decode_collation(value).map_err(corrupt)?;
+            Ok(super::meta::USER_COLLATIONS)
         }
         CatalogKind::Sequence | CatalogKind::Type => Ok(64),
         // validate_meta treats a live kind-7 marker without bit 9 as Corrupt,
@@ -267,6 +281,9 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
     let mut comments = BTreeMap::new();
     let mut views = BTreeMap::new();
     let mut schemas = BTreeMap::new();
+    let mut column_collations=BTreeMap::new();
+    let mut collations=BTreeMap::new();
+    let mut indexes=BTreeMap::new();
     let mut tasks = Vec::new();
     let mut labels = BTreeMap::new();
     let mut required = 0;
@@ -336,8 +353,10 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
                     .map(|_| ())
                     .map_err(corrupt)?;
             }
+            CatalogKind::ColumnCollation => {column_collations.insert(u64::from_be_bytes(user[1..9].try_into().unwrap()),catalog_codec::decode_column_collation(value).map_err(corrupt)?);}
+            CatalogKind::Collation => {collations.insert(u64::from_be_bytes(user[1..9].try_into().unwrap()),catalog_codec::decode_collation(value).map_err(corrupt)?);}
             CatalogKind::Index => {
-                super::indexes::decode_descriptor(value).map_err(corrupt)?;
+                indexes.insert(u64::from_be_bytes(user[1..9].try_into().unwrap()),super::indexes::decode_descriptor(value).map_err(corrupt)?);
             }
             CatalogKind::Task => {
                 tasks.push(crate::task::catalog::decode_task(user, value).map_err(corrupt)?);
@@ -359,6 +378,30 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             | CatalogKind::SchemaGrant
             | CatalogKind::RoleOid => {}
         }
+    }
+    for t in tables.values().filter(|t|t.logical_columns().next().is_none()) {
+        if !matches!(column_collations.get(&t.id),Some(crate::relational::column_collations::Binding::EmptyTable)) {return Err(corrupt("empty table without collation cascade witness"));}
+    }
+    for (id,b) in &column_collations {
+        use crate::relational::column_collations::{Binding,Reference};
+        let refs=match b {
+            Binding::EmptyTable=>{
+                let t=tables.get(id).ok_or_else(||corrupt("empty table witness owner absent"))?;
+                if t.hidden_rowid().is_none() || t.logical_columns().next().is_some() {return Err(corrupt("invalid empty table witness"));}
+                vec![]
+            },
+            Binding::Column(r)=>{
+                let c=tables.values().flat_map(|t|&t.columns).find(|c|c.id==*id).ok_or_else(||corrupt("column collation owner absent"))?;
+                if !matches!(c.data_type,crate::relational::DataType::Text|crate::relational::DataType::Varchar|crate::relational::DataType::Bpchar) {return Err(corrupt("noncollatable column"));}
+                vec![r]
+            },
+            Binding::Index(rs)=>{
+                let d=indexes.get(id).ok_or_else(||corrupt("index collation owner absent"))?;
+                if rs.len()!=d.columns.len() {return Err(corrupt("index collation arity"));}
+                rs.iter().flatten().collect()
+            }
+        };
+        if refs.iter().any(|r|matches!(r,Reference::User(id) if !collations.contains_key(id))) {return Err(corrupt("collation dependency absent"));}
     }
     for (id, value) in constraints {
         let table = tables

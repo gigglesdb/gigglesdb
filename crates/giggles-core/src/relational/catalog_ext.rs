@@ -18,6 +18,8 @@ pub(crate) struct CatalogExt {
     pub(crate) schemas: BTreeMap<String, schemas::Schema>,
     pub(crate) table_schemas: BTreeMap<u64, String>,
     pub(crate) primary_index_birth: BTreeMap<u64, u64>,
+    pub(crate) collations: BTreeMap<u64, super::collations::Collation>,
+    pub(crate) column_collations: BTreeMap<u64, super::column_collations::Binding>,
 }
 impl Default for CatalogExt {
     fn default() -> Self {
@@ -31,12 +33,15 @@ impl Default for CatalogExt {
             schemas: BTreeMap::new(),
             table_schemas: BTreeMap::new(),
             primary_index_birth: BTreeMap::new(),
+            collations: BTreeMap::new(),
+            column_collations: BTreeMap::new(),
         }
     }
 }
 impl CatalogExt {
     pub(crate) fn is_empty(&self) -> bool {
-        self.columns.is_empty()
+        self.column_collations.is_empty() && self.collations.is_empty()
+            && self.columns.is_empty()
             && self.constraints.is_empty()
             && self.sequences.is_empty()
             && self.types.is_empty()
@@ -390,7 +395,11 @@ impl CatalogExt {
         !self.primary_index_birth.is_empty() || self.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { target, .. } if target != ReferencedKey::Unknown))
     }
     pub(crate) fn wire_version(&self) -> u32 {
-        if self.has_key_dependency_identity() {
+        if !self.column_collations.is_empty() {
+            10
+        } else if !self.collations.is_empty() {
+            9
+        } else if self.has_key_dependency_identity() {
             8
         } else if self.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::Unique { .. })) {
             7
@@ -417,6 +426,8 @@ impl Serialize for CatalogExt {
         use serde::ser::SerializeTuple;
         let version = self.wire_version();
         let mut out = serializer.serialize_tuple(match version {
+            10 => 11,
+            9 => 10,
             8 => 9,
             5..=7 => 8,
             4 => 6,
@@ -482,7 +493,9 @@ impl Serialize for CatalogExt {
             out.serialize_element(&self.schemas)?;
             out.serialize_element(&self.table_schemas)?;
         }
-        if version == 8 { out.serialize_element(&self.primary_index_birth)?; }
+        if version >= 8 { out.serialize_element(&self.primary_index_birth)?; }
+        if version >= 9 { out.serialize_element(&self.collations)?; }
+        if version >= 10 { out.serialize_element(&self.column_collations)?; }
         out.end()
     }
 }
@@ -587,6 +600,16 @@ impl<'de> Deserialize<'de> for CatalogExt {
         fn birth_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, u64>, D::Error> {
             bounded_map::<D, u64, MAX_TABLES>(d)
         }
+        #[derive(Deserialize)]
+        struct ColumnCollations(#[serde(deserialize_with = "bindings_map")] BTreeMap<u64, super::column_collations::Binding>);
+        fn bindings_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, super::column_collations::Binding>, D::Error> {
+            bounded_map::<D, super::column_collations::Binding, MAX_EXT_COLUMNS>(d)
+        }
+        #[derive(Deserialize)]
+        struct Collations(#[serde(deserialize_with = "collation_map")] BTreeMap<u64, super::collations::Collation>);
+        fn collation_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, super::collations::Collation>, D::Error> {
+            bounded_map::<D, super::collations::Collation, MAX_TABLES>(d)
+        }
         struct V;
         impl<'de> Visitor<'de> for V {
             type Value = CatalogExt;
@@ -601,7 +624,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     };
                 }
                 let ext_version = next!(u32);
-                if !matches!(ext_version, 1..=8) {
+                if !matches!(ext_version, 1..=10) {
                     return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
                 }
                 let columns = if ext_version >= 6 {
@@ -666,7 +689,9 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     } else {
                         BTreeMap::new()
                     },
-                    primary_index_birth: if ext_version == 8 { next!(Births).0 } else { BTreeMap::new() },
+                    primary_index_birth: if ext_version >= 8 { next!(Births).0 } else { BTreeMap::new() },
+                    collations: if ext_version >= 9 { next!(Collations).0 } else { BTreeMap::new() },
+                    column_collations: if ext_version >= 10 { next!(ColumnCollations).0 } else { BTreeMap::new() },
                 };
                 if ext_version != out.wire_version() {
                     return Err(de::Error::custom("noncanonical catalog extension version"));
@@ -674,7 +699,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                 Ok(out)
             }
         }
-        d.deserialize_tuple(9, V)
+        d.deserialize_tuple(11, V)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1149,6 +1174,7 @@ impl Relational {
         ext.ext_version = ext.wire_version();
     }
     pub(crate) fn validate_unique_indexes(&self) -> R<()> {
+        super::column_collations::validate_index_bindings(&self.ext,self.secondary_descriptors_engine())?;
         validate_unique_indexes(
             self.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))),
             self.secondary.descriptors().iter(),
@@ -1164,7 +1190,7 @@ impl Relational {
         next_id: u64,
         excluded_table: Option<u64>,
     ) -> R<()> {
-        if !matches!(ext.ext_version, 1..=8) {
+        if !matches!(ext.ext_version, 1..=10) {
             return Err(SqlError::Unsupported);
         }
         self.validate_schemas(ext, next_id, excluded_table)?;
@@ -1206,6 +1232,19 @@ impl Relational {
             .copied()
             .chain(ext.schemas.values().map(|s| s.id))
             .collect();
+        super::column_collations::validate_bindings(self, ext, excluded_table)?;
+        let mut collation_names = BTreeSet::new();
+        if ext.collations.len() > MAX_TABLES { return Err(SqlError::Limit); }
+        for (id, c) in &ext.collations {
+            super::collations::validate(c)?;
+            if *id == 0 || *id >= next_id || !used.insert(*id)
+                || !collation_names.insert((&c.schema, &c.name))
+                || self.secondary.descriptors().iter().any(|d| d.id == *id)
+                || (c.schema != "public" && !ext.schemas.contains_key(&c.schema)) {
+                return Err(SqlError::Type);
+            }
+            super::user_types::type_oid(*id)?;
+        }
         let mut type_names = BTreeSet::new();
         for (id, ty) in &ext.types {
             if *id == 0 || *id >= next_id || !used.insert(*id) || !type_names.insert(ty.name()) {
@@ -1533,6 +1572,7 @@ impl Relational {
     pub(crate) fn drop_column_ext(&mut self, id: u64) -> R<()> {
         self.mutate_ext(|ext, _| {
             ext.columns.remove(&id);
+            ext.column_collations.remove(&id);
             ext.logical_kinds.remove(&id);
             ext.sequences
                 .retain(|_, v| !matches!(v.owned_by,Some((_,c)) if c==id));

@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 mod returning_images;
 mod aggregate_filter;
+mod aggregate_order;
 mod functions;
 pub(super) mod plan;
 pub(super) mod typed_read;
@@ -250,6 +251,8 @@ enum BoundFilter {
         value: BoundScalar,
         query: usize,
         column_type: DataType,
+        collation: Option<String>,
+        collation_conflict: bool,
         negated: bool,
         clock: Option<super::clock::ExecutionClock>,
     },
@@ -640,9 +643,12 @@ impl Filter {
                     Scalar::Param(comparison_params.len()),
                 )
                 .bind(&comparison_params, resolve, tables)?;
+                let (collation,collation_conflict)=functions::collation::comparison_binding(std::iter::once(&bound).chain(subqueries.get(key,SubplanMode::In)?.items.iter().filter_map(|i|if let BoundItem::Scalar(s)=i {Some(s)} else {None})))?;
                 BoundFilter::InSubquery {
-                    value: bound,
                     query: key,
+                    collation,
+                    collation_conflict,
+                    value: bound,
                     column_type: column_type.clone(),
                     negated: *negated,
                     clock: None,
@@ -1231,6 +1237,7 @@ impl Filter {
                     av = av.enum_rank(&ty)?;
                     bv = bv.enum_rank(&ty)?;
                 }
+
                 if av.ty == DataType::Bpchar || bv.ty == DataType::Bpchar {
                     return Err(SqlError::Unsupported);
                 }
@@ -1269,6 +1276,7 @@ impl Filter {
                             .ok_or(mismatch);
                     }
                 }
+                functions::collation::pair(&av, &bv)?;
                 BoundFilter::Compare(av, op.clone(), bv)
             }
             Self::Like {
@@ -1422,6 +1430,8 @@ impl BoundFilter {
                 value,
                 query,
                 column_type,
+                collation,
+                collation_conflict,
                 negated,
                 clock,
             } => {
@@ -1444,7 +1454,7 @@ impl BoundFilter {
                         false,
                     ))?;
                     let mut values = spill::Store::new();
-                    let mut keys = functions::join_key_supported(&value.ty, column_type)
+                    let mut keys = (!*collation_conflict && collation.is_none() && functions::join_key_supported(&value.ty, column_type))
                         .then(std::collections::HashSet::new);
                     let mut key_file = None;
                     let mut has_null = false;
@@ -1528,13 +1538,20 @@ impl BoundFilter {
                         for element in materialized.values.iter()? {
                             let element = &*element?;
                             execution.comparison()?;
-                            if functions::join_equal(
+                            if *element == Value::Null {
+                                continue;
+                            }
+                            if *collation_conflict {
+                                user_types::view_replace_error("could not determine which collation to use for string comparison".into());
+                                return Err(SqlError::IndeterminateCollation);
+                            }
+                            if if let Some(n)=collation {functions::collation::compare(n,&lhs,element)==Ordering::Equal} else {functions::join_equal(
                                 &lhs,
                                 &value.ty,
                                 element,
                                 column_type,
                                 clock.as_ref(),
-                            )? {
+                            )?} {
                                 found = true;
                                 break;
                             }
@@ -1592,12 +1609,13 @@ impl BoundFilter {
                 .plan_constant(budget)?
                 .map(|v| Some((v == Value::Null) != *not))),
             Self::Compare(a, op, b) => {
+                let (ascalar, bscalar) = (a, b);
                 let a = a.plan_constant(budget)?;
                 let b = b.plan_constant(budget)?;
                 Ok(match (a, b) {
                     (Some(Value::Null), Some(_)) | (Some(_), Some(Value::Null)) => Some(None),
                     (Some(a), Some(b)) => {
-                        let c = cmp(&a, &b);
+                        let c = functions::collation::compare_pair(ascalar, bscalar, &a, &b)?;
                         Some(Some(match op.as_str() {
                             "=" => c == Ordering::Equal,
                             "<>" | "!=" => c != Ordering::Equal,
@@ -1618,6 +1636,7 @@ impl BoundFilter {
                 insensitive,
                 negated,
             } => {
+                if value.explicit_collation()?.is_some() {return Ok(None);}
                 let pattern = pattern.plan_constant(budget)?;
                 let escape = match escape {
                     Some(a) => a.plan_constant(budget)?,
@@ -1691,16 +1710,20 @@ impl BoundFilter {
                 let Some(escape) = parse_like_escape(&pattern, &escape)? else {
                     return Ok(None);
                 };
+                let input=value;
                 let value = value.eval(row, params, bytes)?;
-                eval_like(value, pattern, escape, *insensitive, *negated, bytes)?
+                match functions::collation::like(input,&value,&pattern,escape,*insensitive,*negated,bytes)? {
+                    Some(result)=>result,None=>eval_like(value, pattern, escape, *insensitive, *negated, bytes)?
+                }
             }
             Self::Compare(a, op, b) => {
+                let (ascalar, bscalar) = (a,b);
                 let a = a.eval(row, params, bytes)?;
                 let b = b.eval(row, params, bytes)?;
                 if a == Value::Null || b == Value::Null {
                     None
                 } else {
-                    let c = cmp(&a, &b);
+                    let c = functions::collation::compare_pair(ascalar, bscalar, &a, &b)?;
                     Some(match op.as_str() {
                         "=" => c == Ordering::Equal,
                         "<>" | "!=" => c != Ordering::Equal,
@@ -1765,11 +1788,12 @@ fn preprocess_aggregates(p: &mut Parser) -> R<()> {
             Token::Word(name) | Token::QuotedIdent(name) => Aggregate::from_name(name),
             _ => None,
         };
+        let deferred = matches!(&p.tokens[n], Token::Word(w) | Token::QuotedIdent(w) if matches!(w.as_str(), "array_agg" | "string_agg"));
         let qualified = n > 0 && p.tokens[n - 1] == Token::Symbol('.');
         let catalog = qualified
             && n >= 2
             && matches!(&p.tokens[n - 2], Token::Word(w) | Token::QuotedIdent(w) if w == "pg_catalog");
-        if let Some(a) = a
+        if (a.is_some() || deferred)
             && p.tokens[n + 1] == Token::Symbol('(')
             && matches!(&p.tokens[n + 2], Token::Word(w) if w == "distinct")
         {
@@ -1777,7 +1801,11 @@ fn preprocess_aggregates(p: &mut Parser) -> R<()> {
                 return Err(SqlError::Syntax);
             }
             if !qualified || catalog {
-                p.tokens[n] = Token::Word(a.with_distinct().call_name());
+                let name = if let Some(a) = a { a.with_distinct().call_name() } else {
+                    let (Token::Word(name) | Token::QuotedIdent(name)) = &p.tokens[n] else { unreachable!() };
+                    format!("\0aggregate_distinct_{name}")
+                };
+                p.tokens[n] = Token::Word(name);
             }
             p.tokens.remove(n + 2);
         }
@@ -1937,7 +1965,7 @@ impl Query {
     pub(super) fn has_domain_expression(&self) -> bool {
         let mut found = false;
         let _ = self.walk_scalars(&mut |s| {
-            found |= matches!(s, Scalar::Domain(..));
+            found |= matches!(s, Scalar::Domain(..)) || matches!(s, Scalar::Call(n,_) if functions::collation::internal(n));
             Ok(())
         });
         found
@@ -2227,7 +2255,8 @@ impl Query {
                         }
                         None
                     } else {
-                        Some(Scalar::parse_expr(p, 0, true)?)
+                        let input = Scalar::parse_expr(p, 0, true)?;
+                        Some(aggregate_order::parse(p, input, 0)?)
                     };
                     p.punct(')')?;
                     Item::Aggregate(a, c)
@@ -2765,6 +2794,7 @@ impl Query {
                 if !functions::comparable(outer_ty, inner_ty) {
                     return Err(functions::comparison_mismatch(outer_ty, inner_ty));
                 }
+                if functions::collation::has_column(tables[right].columns[inner.column].id) || functions::collation::has_column(tables[outer.source].columns[outer.column].id) { continue; }
                 if tables[right].primary_key.contains(&inner.column)
                     && functions::join_key_supported(outer_ty, inner_ty)
                 {
@@ -2814,13 +2844,14 @@ impl Query {
                         || scalar(call))
                         && aggregate_filter::decode(condition).is_ok_and(|f| filter(&f))
                 }
-                Scalar::Call(name, args) if name == functions::CAST_TYPMOD => {
+                Scalar::Call(name, args) if name == functions::CAST_TYPMOD || functions::collation::internal(name) => {
                     args.iter().all(scalar)
                 }
                 Scalar::Call(name, args) => {
                     matches!(
                         name.as_str(),
                         "abs"
+                            | "pg_collation_for"
                             // Clock functions read only the per-execution StatementClock.
                             | "now"
                             | "transaction_timestamp"
@@ -3287,6 +3318,7 @@ impl Query {
     fn primary_key_candidates(
         &self, state: &Relational, table: &TableDef, params: &[Value], max_keys: usize,
     ) -> Option<(Vec<Vec<Value>>, bool)> {
+        if table.primary_key.iter().any(|i| !state.deterministic_column(table.columns[*i].id)) { return None; }
         // Keep one candidate page within the existing 200-row staging budgets.
         fn supported(ty: &DataType) -> bool {
             matches!(ty, DataType::Boolean | DataType::SmallInt | DataType::Integer
@@ -3704,6 +3736,7 @@ impl Query {
         outer: &[&[Source]],
     ) -> R<BoundQuery<'a>> {
         let _enum_scope = functions::enum_order::Scope::enter(state);
+        let _collation_scope = functions::collation::Scope::enter(state);
         if parameters.len() > MAX_PARAMS {
             return Err(SqlError::Limit);
         }
@@ -3929,6 +3962,8 @@ impl Query {
             if tables[c.source].columns[c.column].data_type == DataType::Bpchar {
                 return Err(SqlError::Unsupported);
             }
+            let id=tables[c.source].columns[c.column].id;
+            if !state.deterministic_column(id) || op != "=" && !state.byte_ordered(id) { continue; }
             if let Expr::Literal(value) = e
                 && !matches!(value, Value::Null | Value::Text(_))
             {
@@ -4023,6 +4058,7 @@ impl Query {
                         }
                     }
                     let e = e.bind(&resolve, &tables, &parameters)?;
+                    if self.distinct() { e.require_collation()?; }
                     let (source_column, d) = if let Item::Scalar(Scalar::Column(c)) = item {
                         let name = c.name.clone();
                         let c = resolve(c, tables.len())?;
@@ -4045,7 +4081,7 @@ impl Query {
                         (None, d)
                     };
                     let item = match source_column {
-                        Some(column) if classify_plain_columns => BoundItem::Column(column),
+                        Some(column) if classify_plain_columns && !functions::collation::has_column(d.id) => BoundItem::Column(column),
                         _ => BoundItem::Scalar(e),
                     };
                     push(item, d);
@@ -4058,6 +4094,9 @@ impl Query {
                         return Err(SqlError::IndeterminateDatatype);
                     }
                     let legacy_column = matches!(c, Some(Scalar::Column(_)));
+                    if a.distinct() && let Some(input) = c {
+                        aggregate_order::validate_distinct(input,&resolve,&tables)?;
+                    }
                     let c = c
                         .as_ref()
                         .map(|e| e.bind(&resolve, &tables, &parameters))
@@ -4065,13 +4104,18 @@ impl Query {
                     let c = c.map(|e| {
                         if let Some(ty) = e.enum_type(&tables) { e.with_enum(&ty) } else { e }
                     });
+                    if c.as_ref().is_some_and(|c| c.ty == DataType::Bpchar) {
+                        return Err(SqlError::Unsupported);
+                    }
+                    if let Some(c) = &c { aggregate_order::check_types(c)?; }
+                    if a.distinct() && let Some(c) = &c { c.require_collation()?; }
+                    if matches!(a.base(), Aggregate::Min | Aggregate::Max) && let Some(c) = &c
+                        && let Some(n)=c.explicit_collation()? { functions::collation::ready(n)?;
+                    }
                     let ty = c.as_ref().map(|e| e.ty.clone());
                     if matches!(a.base(), Aggregate::Min | Aggregate::Max) && ty == Some(DataType::Uuid) {
                         user_types::view_replace_error(format!("function {}(uuid) does not exist", a.name()));
                         return Err(SqlError::UndefinedFunction);
-                    }
-                    if ty == Some(DataType::Bpchar) {
-                        return Err(SqlError::Unsupported);
                     }
                     if matches!(a.base(), Aggregate::Sum | Aggregate::Avg)
                         && !matches!(
@@ -4145,7 +4189,9 @@ impl Query {
                             if source > 0 && self.joins[source - 1].left {
                                 d.not_null = false;
                             }
-                            push(BoundItem::Column(BoundColumn { source, column }), d);
+                            let c=BoundColumn {source,column};
+                            let item=if functions::collation::has_column(d.id) { BoundItem::Scalar(functions::collation::bound_column(c,&d)?) } else {BoundItem::Column(c)};
+                            push(item, d);
                         }
                     }
                 }
@@ -4186,6 +4232,8 @@ impl Query {
                 if bound.ty == DataType::Bpchar {
                     return Err(SqlError::Unsupported);
                 }
+                bound.require_collation()?;
+
                 Ok((bound, *d, *n))
             })
             .collect::<R<Vec<_>>>()?;
@@ -4659,6 +4707,11 @@ impl BoundQuery<'_> {
         }
         Ok(())
     }
+    pub(super) fn output_collations(&self)->R<Vec<Option<String>>> {
+        self.items.iter().map(|i|match i {
+            BoundItem::Scalar(s)|BoundItem::Aggregate(_,Some(s))=>s.explicit_collation().map(|n|n.map(str::to_owned)),_=>Ok(None)
+        }).collect()
+    }
     pub(super) fn description(&self, state: &Relational) -> Description {
         Description {
             type_oids: if self.items.iter().any(|item| matches!(item, BoundItem::Ctid(_))) {
@@ -4679,7 +4732,7 @@ impl BoundQuery<'_> {
                             BoundItem::Column(column) => TypmodSource::Column(
                                 &self.tables[column.source].columns[column.column],
                             ),
-                            BoundItem::Scalar(value) => TypmodSource::Scalar(value),
+                            BoundItem::Scalar(value) => if let Some(c)=value.collation_column() {TypmodSource::Column(&self.tables[c.source].columns[c.column])} else {TypmodSource::Scalar(value)},
                             BoundItem::Ctid(_) | BoundItem::Aggregate(..) => TypmodSource::Other,
                         };
                         result_typmod(state, source)
@@ -4768,6 +4821,7 @@ impl BoundQuery<'_> {
                     scalar
                 };
                 *reverse == desc
+                    && value.explicit_collation().ok().flatten().is_none_or(|n| matches!(n,"C"|"POSIX"|"C.utf8"|"default"|"ucs_basic"|"pg_c_utf8"|"pg_unicode_fast"))
                     && matches!(scalar, Scalar::Column(c)
                 if self.tables[0].primary_key.get(i).is_some_and(|index|
                     self.tables[0].columns[*index].name == c.name
@@ -5417,7 +5471,7 @@ impl BoundQuery<'_> {
             });
             let mut retention = RetentionScope::new(execution);
             let unique = spill::unique_external(distinct, keyed_row_bytes,
-                |a: &(SqlRow, Vec<Value>), b: &(SqlRow, Vec<Value>)| grouping::cmp_values(&a.0.values, &b.0.values),
+                |a: &(SqlRow, Vec<Value>), b: &(SqlRow, Vec<Value>)| grouping::cmp_output(&a.0.values, &b.0.values, &self.items),
                 &mut retention)?;
             let rows: Box<dyn Iterator<Item = R<(SqlRow, Vec<Value>)>>> = if self.order.is_empty() {
                 Box::new(unique)
@@ -5441,7 +5495,7 @@ impl BoundQuery<'_> {
             for row in filtered {
                 let row = row?;
                 let projected = self.project_tuple(&row, params, &mut 0, &mut 0)?;
-                let key = grouping::Key(projected.values);
+                let key = grouping::Key::output(projected.values, &self.items);
                 if seen.contains(&key) {
                     continue;
                 }
@@ -5582,7 +5636,7 @@ impl BoundQuery<'_> {
                     };
                 let compare = |(_, a, a_key): &(Tuple, Vec<Value>, Option<Vec<u8>>),
                                (_, b, b_key): &(Tuple, Vec<Value>, Option<Vec<u8>>)| {
-                        for ((_, desc, first), (a, b)) in self.order.iter().zip(a.iter().zip(b)) {
+                        for ((scalar, desc, first), (a, b)) in self.order.iter().zip(a.iter().zip(b)) {
                             let ord = match (a, b) {
                                 (Value::Null, Value::Null) => Ordering::Equal,
                                 (Value::Null, _) => {
@@ -5600,7 +5654,7 @@ impl BoundQuery<'_> {
                                     }
                                 }
                                 _ => {
-                                    let ord = cmp(a, b);
+                                    let ord = scalar.compare_values(a, b);
                                     if *desc { ord.reverse() } else { ord }
                                 }
                             };
@@ -5724,7 +5778,7 @@ fn keyed_row_bytes((row, keys): &(SqlRow, Vec<Value>)) -> usize {
         + row.values.iter().chain(keys).map(|v| std::mem::size_of::<Value>() + value_bytes(v)).sum::<usize>()
 }
 fn order_values(a: &[Value], b: &[Value], order: &[(BoundScalar, bool, bool)]) -> Ordering {
-    for ((a, b), (_, desc, first)) in a.iter().zip(b).zip(order) {
+    for ((a, b), (scalar, desc, first)) in a.iter().zip(b).zip(order) {
         let ord = match (a, b) {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Null, _) => {
@@ -5742,7 +5796,7 @@ fn order_values(a: &[Value], b: &[Value], order: &[(BoundScalar, bool, bool)]) -
                 }
             }
             _ => {
-                let ord = cmp(a, b);
+                let ord = scalar.compare_values(a, b);
                 if *desc { ord.reverse() } else { ord }
             }
         };
@@ -5887,6 +5941,7 @@ struct AggregateAuxiliary {
     // budget, not the statement-wide one (DD-0068 Q4), so no 54000 from input size.
     local_transition: bool,
     count: i64,
+    ordered: Option<spill::Sorter<Vec<Value>>>,
     distinct: std::collections::BTreeSet<grouping::Key>,
     /// V2 DISTINCT aggregate inputs, deduplicated by an external sort at finish.
     pending: Option<spill::Sorter<Value>>,
@@ -5902,6 +5957,7 @@ fn aggregate_auxiliary(
             stream_column: false,
             local_transition: false,
             count: 0,
+            ordered: None,
             distinct: std::collections::BTreeSet::new(),
             pending: None,
         })
@@ -5919,12 +5975,48 @@ fn flush_distinct(
 ) -> R<()> {
     let empty = Tuple { values: vec![], version: 0 };
     for index in 0..items.len() {
+        if let Some(sorter) = auxiliary[index].ordered.take() {
+            let BoundItem::Aggregate(kind, Some(input)) = &items[index] else {return Err(SqlError::Type)};
+            let (name, args) = aggregate_order::parts(input).ok_or(SqlError::Type)?;
+            let error = RefCell::new(None);
+            let compare = |a: &Vec<Value>, b: &Vec<Value>| {
+                aggregate_order::compare(name,args,a,b).unwrap_or_else(|e| {
+                    *error.borrow_mut() = Some(e);
+                    Ordering::Equal
+                })
+            };
+            let sorted = sorter.finish(compare,retention)?;
+            if let Some(e) = error.borrow_mut().take() {return Err(e);}
+            let mut last = None;
+            for input in sorted {
+                let input = input?;
+                if let Some(e) = error.borrow_mut().take() {return Err(e);}
+                let value = input.into_iter().next().ok_or(SqlError::Type)?;
+                if value == Value::Null {continue;}
+                if kind.distinct() {
+                    if let Some(last) = &last
+                        && args[0].try_compare_values(last,&value)? == Ordering::Equal {continue;}
+                    last = Some(value.clone());
+                }
+                update_filtered_aggregates(items, &[], columns, values, auxiliary, retention,
+                    &empty, &[], work, Some((index,value)))?;
+            }
+        }
         let Some(sorter) = auxiliary[index].pending.take() else { continue };
         let mut last: Option<Value> = None;
-        for value in sorter.finish(|a: &Value, b: &Value| cmp(a, b), retention)? {
+        let scalar = match &items[index] { BoundItem::Aggregate(_,c) => c.as_ref(), _ => None };
+        let error = RefCell::new(None);
+        let compare = |a: &Value, b: &Value| scalar.map_or_else(|| Ok(cmp(a,b)), |s| s.try_compare_values(a,b)).unwrap_or_else(|e| {
+            *error.borrow_mut() = Some(e); Ordering::Equal
+        });
+        let sorted = sorter.finish(compare, retention)?;
+        if let Some(e) = error.borrow_mut().take() {return Err(e);}
+        for value in sorted {
             let value = value?;
-            if last.as_ref().is_some_and(|last| cmp(last, &value) == Ordering::Equal) {
-                continue;
+            if let Some(e) = error.borrow_mut().take() {return Err(e);}
+            if let Some(last) = &last {
+                let order = scalar.map_or_else(|| Ok(cmp(last,&value)), |s|s.try_compare_values(last,&value))?;
+                if order == Ordering::Equal {continue;}
             }
             last = Some(value.clone());
             update_filtered_aggregates(items, &[], columns, values, auxiliary, retention, &empty, &[], work,
@@ -6015,6 +6107,17 @@ fn update_filtered_aggregates(
         {
             continue;
         }
+        if inject.is_none() && let Some((name,args)) = c.as_ref().and_then(aggregate_order::parts) {
+            let input = args.iter().map(|s|s.eval(row,params,&mut 0)).collect::<R<Vec<_>>>()?;
+            let bytes = aggregate_retained(&input);
+            let error = RefCell::new(None);
+            auxiliary[index].ordered.get_or_insert_with(spill::Sorter::new).push(input,bytes,
+                |a: &Vec<Value>,b: &Vec<Value>| aggregate_order::compare(name,args,a,b).unwrap_or_else(|e| {
+                    *error.borrow_mut()=Some(e); Ordering::Equal
+                }), retention)?;
+            if let Some(e)=error.into_inner() {return Err(e);}
+            continue;
+        }
         // V2 limits each aggregate argument value on its own (DD-0068 Q4, "per-value
         // limits on v2"): computed arguments and DISTINCT inputs get a fresh scalar
         // budget per row, like PostgreSQL's per-tuple expression context. Legacy
@@ -6039,8 +6142,12 @@ fn update_filtered_aggregates(
         if a.distinct() && inject.is_none() && state.local_transition {
             let input = evaluated.ok_or(SqlError::Type)?;
             let bytes = std::mem::size_of::<Value>() + value_bytes(&input);
+            let error = RefCell::new(None);
             state.pending.get_or_insert_with(spill::Sorter::new)
-                .push(input, bytes, |a: &Value, b: &Value| cmp(a, b), retention)?;
+                .push(input, bytes, |a: &Value, b: &Value| c.as_ref().map_or_else(|| Ok(cmp(a,b)), |s| s.try_compare_values(a,b)).unwrap_or_else(|e| {
+                    *error.borrow_mut()=Some(e); Ordering::Equal
+                }), retention)?;
+            if let Some(e)=error.into_inner() {return Err(e);}
             continue;
         }
         if a.distinct() && inject.is_none() {
@@ -6049,7 +6156,10 @@ fn update_filtered_aggregates(
                 + value_bytes(input)
                 + 6 * std::mem::size_of::<usize>();
             retention.charge(bytes)?;
-            let key = grouping::Key(vec![input.clone()]);
+            let key = grouping::Key::collated(vec![input.clone()], c.as_slice());
+            if !state.distinct.is_empty() && let Some(input) = c {
+                input.check_comparison_collation()?;
+            }
             if !state.distinct.insert(key) {
                 retention.release(bytes);
                 continue;
@@ -6159,8 +6269,8 @@ fn update_filtered_aggregates(
             Aggregate::Min | Aggregate::Max => {
                 let v = v.ok_or(SqlError::Type)?;
                 if value == Value::Null
-                    || (matches!(a.base(), Aggregate::Min) && c.as_ref().ok_or(SqlError::Type)?.compare_values(v, &value) == Ordering::Less)
-                    || (matches!(a.base(), Aggregate::Max) && c.as_ref().ok_or(SqlError::Type)?.compare_values(v, &value) == Ordering::Greater)
+                    || (matches!(a.base(), Aggregate::Min) && c.as_ref().ok_or(SqlError::Type)?.try_compare_values(v, &value)? == Ordering::Less)
+                    || (matches!(a.base(), Aggregate::Max) && c.as_ref().ok_or(SqlError::Type)?.try_compare_values(v, &value)? == Ordering::Greater)
                 {
                     value = evaluated.ok_or(SqlError::Type)?;
                 }

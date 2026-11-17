@@ -46,3 +46,6 @@ pub(crate) mod write_fence;
 #[path = "write_tripwire_tests.rs"]
 mod write_tripwire_tests;
 mod native_content;
+
+#[cfg(test)]
+mod column_collation_tests;

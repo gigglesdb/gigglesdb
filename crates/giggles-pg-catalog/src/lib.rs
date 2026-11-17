@@ -197,6 +197,8 @@ pub struct CatalogSnapshot {
     /// Freshly authorized application rows, supplied by the hosting session.
     pub user_relations: std::collections::BTreeMap<String, ResultSet>,
     pub user_types: Vec<UserType>,
+    pub collations: Vec<Vec<Value>>,
+    pub collation_oids: std::collections::BTreeMap<u64,Vec<u32>>,
     pub column_type_oids: std::collections::BTreeMap<u64, u32>,
     pub tables: Vec<TableDef>,
     pub schemas: std::collections::BTreeMap<String, (u32, u32)>,
@@ -244,6 +246,8 @@ impl Default for CatalogSnapshot {
             backend_ssl: false,
             user_relations: Default::default(),
             user_types: Vec::new(),
+            collations: Vec::new(),
+            collation_oids: Default::default(),
             column_type_oids: std::collections::BTreeMap::new(),
             tables: Vec::new(),
             schemas: Default::default(),

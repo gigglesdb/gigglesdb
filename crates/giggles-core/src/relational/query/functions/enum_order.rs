@@ -28,6 +28,7 @@ impl Drop for Scope {
 impl BoundScalar {
     pub(in crate::relational::query) fn enum_type(&self, tables: &[&TableDef]) -> Option<TypeDef> {
         match &self.node {
+            Node::Call(name, args) if aggregate_order::internal(name) => args[0].enum_type(tables),
             Node::Column(c, _) => TYPES.with(|slot| {
                 slot.borrow()
                     .get(&tables[c.source].columns[c.column].id)
@@ -61,6 +62,11 @@ impl BoundScalar {
         })
     }
     pub(in crate::relational::query) fn compare_values(&self, a: &Value, b: &Value) -> Ordering {
+        if let Node::Call(name,args) = &self.node
+            && (aggregate_order::internal(name) || greatest::known_name(name)
+                && args.first().is_some_and(|a| matches!(a.node, Node::Domain(_, TypeDef::Enum { .. })))) {
+            return args[0].compare_values(a,b);
+        }
         if let Node::Domain(_, TypeDef::Enum { labels, .. }) = &self.node
             && let (Value::Text(a), Value::Text(b)) = (a, b)
         {
@@ -69,6 +75,6 @@ impl BoundScalar {
                 .position(|v| v == a)
                 .cmp(&labels.iter().position(|v| v == b));
         }
-        cmp(a, b)
+        self.explicit_collation().expect("collation bound").map_or_else(|| cmp(a,b), |n| collation::compare(n,a,b))
     }
 }
