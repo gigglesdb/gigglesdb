@@ -8,6 +8,24 @@ use crate::storage::cluster::db::local::{LocalCluster, engine_config};
 use crate::storage::engine::txn::{Transaction, TxnServices};
 use std::{ops::Bound, sync::mpsc};
 
+#[test]
+fn exhausted_transient_range_errors_are_retryable_without_hiding_unknown_outcomes() {
+    for error in [
+        RangeError::NotLeader { hint: None },
+        RangeError::NotLeader { hint: Some(2) },
+        RangeError::Unavailable("lock request unavailable".into()),
+    ] {
+        let error = txn_error(error);
+        assert_eq!(error.sqlstate(), "40001", "{error:?}");
+        assert_eq!(crate::sqlstate(&crate::CoreError::from(error)), "40001");
+    }
+    let unknown = txn_error(RangeError::Unknown("commit reply lost".into()));
+    assert_eq!(unknown, TxnError::CommitAmbiguous);
+    assert_eq!(crate::sqlstate(&crate::CoreError::from(unknown)), "08007");
+    let corrupt = txn_error(RangeError::Corrupt("damaged record".into()));
+    assert_eq!(crate::sqlstate(&crate::CoreError::from(corrupt)), "XX000");
+}
+
 fn row(table: u64, pk: &[u8]) -> Vec<u8> {
     let mut key = table.to_be_bytes().to_vec();
     key.extend_from_slice(pk);

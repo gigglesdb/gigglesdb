@@ -244,8 +244,11 @@ pub(crate) fn txn_error(error: RangeError) -> TxnError {
         RangeError::Conflict(_) => TxnError::Serialization(SerializationReason::WriteConflict),
         RangeError::Unknown(_) => TxnError::CommitAmbiguous,
         RangeError::Corrupt(message) => TxnError::Kv(KvError::Corrupt(message)),
+        // The bounded routing retry could not confirm this operation. Retry the whole
+        // transaction; this is not storage corruption. Possibly applied commits are
+        // handled separately by commit_one / the coordinator as CommitAmbiguous.
         RangeError::NotLeader { .. } | RangeError::Unavailable(_) => {
-            TxnError::Kv(KvError::Io(error.to_string()))
+            TxnError::Serialization(SerializationReason::WriteConflict)
         }
     }
 }
