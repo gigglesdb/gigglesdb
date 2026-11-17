@@ -38,6 +38,13 @@
 //! (step 13). Until R3-706 fills in [`stored_apply_source`], an Apply is
 //! `Unsupported`. `Undo` (and `Actor::Undo`) stays `Unsupported` until R3-803,
 //! whose arm needs the undo-specific checks, identity and change record.
+//!
+//! R3-619 adds the crash seams (D-I). The commit reuses `CrashPoint`'s
+//! `BeforeCommit` (after step 13), `AfterCommit`, `BeforeAck`,
+//! `ErrorBeforeCommit` and `ErrorAfterCommit`, for a recorded denial's commit
+//! too, and adds [`ProtectedPoint`]. Every point before the sync leaves
+//! nothing; every point after it leaves rows, head, membership, change record,
+//! receipt and outcome together (or, for a denial, the outcome and the head).
 use super::authority;
 use super::context::TaskContext;
 use super::decide::{self, ApprovalState, Decision, RequestKind};
@@ -58,13 +65,71 @@ use crate::storage::engine::meta::REPLICATED;
 use crate::storage::engine::txn::{Savepoint, TxnError};
 use crate::storage::roles::{table_privileges_txn, RoleError, TablePrivilege};
 use crate::storage::{Isolation, Keyspace, ProtectedRun, SqlSession, Transaction, V2Db};
-use crate::CoreError;
+use crate::{CoreError, CrashPoint};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long an operation's outcome is kept after the later of its decision
 /// and the task's expiry (D5 default; a server setting later).
 pub(crate) const OUTCOME_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// The protected commit's own crash seams (D-I), armed only through the
+/// trusted `Admin::set_protected_point`, never by environment. Each one
+/// terminates the process where it is reached.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtectedPoint {
+    /// After the outcome lookup (step 2) found nothing.
+    AfterLookup,
+    /// After the authority hold is taken (step 5).
+    AfterHold,
+    /// After the statement ran through the C1 seam (step 7).
+    AfterStatement,
+    /// After `decide::evaluate` (step 12), whatever it decided.
+    AfterDecision,
+    /// In a recorded denial, after the rollback to the mark.
+    AfterDenialRollback,
+    /// In a recorded denial, after the outcome and head are staged.
+    AfterDenialStage,
+}
+
+/// The seams armed for one call, read once at its start.
+#[derive(Clone, Copy)]
+struct Faults {
+    crash: CrashPoint,
+    point: Option<ProtectedPoint>,
+}
+
+impl Faults {
+    fn at(self, point: ProtectedPoint) {
+        if self.point == Some(point) {
+            crate::storage::crash_now();
+        }
+    }
+
+    /// Just before the sync: `BeforeCommit` and `ErrorBeforeCommit`.
+    fn before_commit(self) -> Result<(), TaskError> {
+        match self.crash {
+            CrashPoint::BeforeCommit => crate::storage::crash_now(),
+            CrashPoint::ErrorBeforeCommit => {
+                Err(CoreError::Storage("injected before commit".into()).into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// After the sync: `AfterCommit`, then `ErrorAfterCommit` (a lost
+    /// response) and `BeforeAck`. `ErrorAfterDecisionCommit` does not apply.
+    fn after_commit(self) -> Result<(), TaskError> {
+        match self.crash {
+            CrashPoint::AfterCommit | CrashPoint::BeforeAck => crate::storage::crash_now(),
+            CrashPoint::ErrorAfterCommit => {
+                Err(CoreError::Storage("injected lost commit response".into()).into())
+            }
+            _ => Ok(()),
+        }
+    }
+}
 
 /// Who performs a protected commit (ruling R3).
 pub enum Actor<'a> {
@@ -402,6 +467,7 @@ struct Call<'c> {
     work: Work<'c>,
     key: Vec<u8>,
     fp: [u8; 32],
+    faults: Faults,
 }
 
 /// A serialization failure or a deadlock: the attempt is retried in a new
@@ -455,6 +521,8 @@ pub(crate) fn commit_sourced(
     if db.meta.features & REPLICATED != 0 {
         return Err(unsupported());
     }
+    let (crash, point) = session.fault_points()?;
+    let faults = Faults { crash, point };
     let ctx = match actor {
         Actor::Executor(ctx) => ctx,
         Actor::Undo { .. } => return Err(unsupported()),
@@ -476,6 +544,7 @@ pub(crate) fn commit_sourced(
     if let Some(receipt) = replay(&db, task, &key, &fp)? {
         return Ok(receipt);
     }
+    faults.at(ProtectedPoint::AfterLookup);
     // 3. Latest committed definition.
     let def = load_def(&db, task, DefAt::Latest)?;
     standing(def.as_deref(), ctx, db.wall_now_ms())?;
@@ -489,7 +558,7 @@ pub(crate) fn commit_sourced(
         }
         ProtectedRequest::Undo { .. } => return Err(unsupported()),
     };
-    let call = Call { db, ctx, op, work, key, fp };
+    let call = Call { db, ctx, op, work, key, fp, faults };
     // Steps 4-15, at most three times. Each attempt is a new transaction;
     // the hold is released between attempts.
     let mut retry = 0;
@@ -515,7 +584,7 @@ fn attempt(
     lock_wait: u64,
     load_def: &mut LoadDef<'_>,
 ) -> Result<Receipt, TaskError> {
-    let Call { db, ctx, op, work, key, fp } = call;
+    let Call { db, ctx, op, work, key, fp, faults } = call;
     let (ctx, fp) = (*ctx, *fp);
     let task = ctx.task;
     // 4. The transaction; 5. the hold, before any snapshot (D1).
@@ -523,6 +592,7 @@ fn attempt(
     let deadline = Instant::now().checked_add(Duration::from_millis(lock_wait));
     authority::hold(&txn, task, deadline, &|| crate::cancellation::check().is_err())
         .map_err(hold_error)?;
+    faults.at(ProtectedPoint::AfterHold);
     // 6. A same-ID racer or a revoke may have committed while we waited.
     if let Some(receipt) = replay(db, task, key, &fp)? {
         return Ok(receipt);
@@ -546,6 +616,7 @@ fn attempt(
     let (run, result) = session.execute_protected_v2(db, run, statement, params, clock);
     let ProtectedRun { mut txn, effects } = run;
     result.map_err(engine)?;
+    faults.at(ProtectedPoint::AfterStatement);
     // 9. Rechecks at the statement snapshot (tracked reads).
     let def = load_def(db, task, DefAt::Snapshot(&mut txn))?;
     standing(def.as_deref(), ctx, db.wall_now_ms())?;
@@ -586,7 +657,7 @@ fn attempt(
     };
     // 12. Decide. Denied and BudgetExceeded are recorded; the other refusals
     // leave the operation ID free.
-    let charge = match decide::evaluate(
+    let decision = decide::evaluate(
         &state,
         &def,
         table,
@@ -595,7 +666,9 @@ fn attempt(
         &charge,
         kind,
         approval,
-    ) {
+    );
+    faults.at(ProtectedPoint::AfterDecision);
+    let charge = match decision {
         Decision::Commit(charge) => charge,
         Decision::Denied(rule) => {
             return deny(call, txn, mark, &def, head, TaskError::Denied(rule));
@@ -674,9 +747,11 @@ fn attempt(
     ledger::stage(&mut txn, key.clone(), &outcome)?;
     authority::stage_head(&mut txn, task, &next)?;
     // 14. One batch, synced; 15. the hold goes with the transaction.
+    faults.before_commit()?;
     db.catalog()
         .commit_ddl(txn)
         .map_err(|e| engine(e.into()))?;
+    faults.after_commit()?;
     Ok(Receipt::from_record(&record, None).minimal())
 }
 
@@ -718,6 +793,7 @@ fn deny(
     txn.rollback_to(&mark).map_err(txn_error)?;
     txn.release(mark).map_err(txn_error)?;
     txn.restart_snapshot().map_err(txn_error)?;
+    call.faults.at(ProtectedPoint::AfterDenialRollback);
     let decided_ms = call.db.wall_now_ms();
     let denial_no = head.denials.checked_add(1).ok_or(CoreError::Limit)?;
     let payload = match &error {
@@ -736,7 +812,10 @@ fn deny(
         ..head
     };
     authority::stage_head(&mut txn, task, &next)?;
+    call.faults.at(ProtectedPoint::AfterDenialStage);
+    call.faults.before_commit()?;
     call.db.catalog().commit_ddl(txn).map_err(txn_error)?;
+    call.faults.after_commit()?;
     Err(error)
 }
 

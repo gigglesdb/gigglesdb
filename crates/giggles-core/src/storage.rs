@@ -717,6 +717,8 @@ struct Inner {
     fenced: AtomicBool,
     limits: Limits,
     crash: Mutex<CrashPoint>,
+    /// The armed protected-commit crash seam (GD-0061 R3-619, D-I).
+    protected_point: Mutex<Option<crate::task::commit::ProtectedPoint>>,
     decision_hook: Mutex<Option<DecisionHook>>,
     sequences: Mutex<sequences::Live>,
     native_once_owners: Mutex<BTreeMap<native_once::NativeOnceKey, native_once::InFlight>>,
@@ -1203,6 +1205,7 @@ impl Admin {
                 fenced: AtomicBool::new(false),
                 limits,
                 crash: Mutex::new(CrashPoint::None),
+                protected_point: Mutex::new(None),
                 decision_hook: Mutex::new(None),
                 sequences: Mutex::new(sequences::Live::default()),
                 native_once_owners: Mutex::new(BTreeMap::new()),
@@ -1543,6 +1546,17 @@ impl Admin {
     /// Fault seams require the trusted admin handle; never exposed by Executor.
     pub fn set_crash_point(&self, point: CrashPoint) -> Result<(), CoreError> {
         *self.inner.crash.lock().map_err(|_| CoreError::Fenced)? = point;
+        Ok(())
+    }
+    /// Arms (or, with `None`, disarms) a protected-commit crash seam (GD-0061
+    /// R3-619, D-I). Like [`Admin::set_crash_point`] it needs the trusted admin
+    /// handle and is never driven by environment; nothing arms it by default.
+    #[doc(hidden)]
+    pub fn set_protected_point(
+        &self,
+        point: Option<crate::task::commit::ProtectedPoint>,
+    ) -> Result<(), CoreError> {
+        *self.inner.protected_point.lock().map_err(|_| CoreError::Fenced)? = point;
         Ok(())
     }
     pub fn export(&self, path: impl AsRef<Path>) -> Result<[u8; 32], CoreError> {
@@ -5292,5 +5306,15 @@ impl SqlSession {
             Backend::V2(db) => Some(Arc::clone(db)),
             Backend::Legacy(_) => None,
         }
+    }
+
+    /// The armed commit crash point and protected-commit seam (R3-619).
+    pub(crate) fn fault_points(
+        &self,
+    ) -> Result<(CrashPoint, Option<crate::task::commit::ProtectedPoint>), CoreError> {
+        let inner = &self.admin.inner;
+        let crash = *inner.crash.lock().map_err(|_| CoreError::Fenced)?;
+        let point = *inner.protected_point.lock().map_err(|_| CoreError::Fenced)?;
+        Ok((crash, point))
     }
 }

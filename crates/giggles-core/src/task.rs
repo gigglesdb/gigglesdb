@@ -42,6 +42,9 @@ mod statements_tests;
 pub use admit::StatementClass;
 // R3-615 through the agent seam (R3-207): the server's direct protected write.
 pub use commit::{inspect_outcome, outcome, protected_commit, Actor, ProtectedRequest};
+// R3-619: the protected commit's crash seams, armed by `Admin::set_protected_point`.
+#[doc(hidden)]
+pub use commit::ProtectedPoint;
 pub use ledger::{OperationId, Outcome};
 pub use receipt::Receipt;
 pub use release::{Page, ReleaseTag, Released, Unreleased};

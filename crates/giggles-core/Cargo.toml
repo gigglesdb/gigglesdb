@@ -60,6 +60,11 @@ name = "durable_boundaries"
 path = "tests/durable_boundaries.rs"
 
 [[test]]
+name = "task_commit_crash"
+path = "tests/task_commit_crash.rs"
+required-features = ["engine-rocksdb"]
+
+[[test]]
 name = "upgrade_crash"
 path = "tests/upgrade_crash.rs"
 required-features = ["engine-rocksdb", "upgrade-fault-injection"]
