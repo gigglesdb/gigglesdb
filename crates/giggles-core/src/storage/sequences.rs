@@ -313,7 +313,7 @@ impl Inner {
                     return Err(CoreError::Policy(Error::Scope));
                 }
             }
-            let _guard = crate::cancellation::lock(&inner.gate)?;
+            let _guard = inner.gate.lock_cancellable()?;
             if inner.fenced.load(Ordering::Acquire) {
                 return Err(CoreError::Fenced);
             }

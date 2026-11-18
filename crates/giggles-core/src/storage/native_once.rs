@@ -374,7 +374,7 @@ impl Inner {
         work: impl FnOnce(&mut State) -> NativeResult<T>,
     ) -> NativeResult<T> {
         let _ticket = self.enter()?;
-        let _guard = crate::cancellation::lock_notified(&self.gate, || {
+        let _guard = self.gate.lock_notified(|| {
             self.decision_point(DecisionPoint::WaitingLock)
         })?;
         if self.fenced.load(Ordering::Acquire) {

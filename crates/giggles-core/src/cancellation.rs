@@ -3,7 +3,7 @@ use crate::CoreError;
 use std::{
     cell::RefCell,
     sync::{
-        Arc, Mutex, MutexGuard, TryLockError,
+        Arc, Condvar, LockResult, Mutex, MutexGuard, PoisonError, TryLockError,
         atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant},
@@ -54,6 +54,16 @@ impl Cancellation {
         } else {
             Ok(())
         }
+    }
+    fn wait_slice(&self) -> Duration {
+        const SLICE: Duration = Duration::from_millis(5);
+        self.0
+            .deadline
+            .lock()
+            .expect("deadline lock")
+            .map_or(SLICE, |at| {
+                SLICE.min(at.saturating_duration_since(Instant::now()))
+            })
     }
     fn decide(&self) -> Result<(), CoreError> {
         self.check()?;
@@ -120,7 +130,110 @@ pub(crate) fn lock_notified<T>(
                     notified = true;
                     waiting();
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+/// A blocking mutex with bounded cancellation checks while contended.
+#[derive(Debug)]
+pub(crate) struct WaitMutex<T> {
+    inner: Mutex<T>,
+    aux: Mutex<()>,
+    cv: Condvar,
+}
+
+impl<T: Default> Default for WaitMutex<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct WaitGuard<'a, T> {
+    guard: Option<MutexGuard<'a, T>>,
+    mutex: &'a WaitMutex<T>,
+}
+
+impl<T> std::ops::Deref for WaitGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.guard.as_ref().expect("live guard")
+    }
+}
+impl<T> std::ops::DerefMut for WaitGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.guard.as_mut().expect("live guard")
+    }
+}
+impl<T> Drop for WaitGuard<'_, T> {
+    fn drop(&mut self) {
+        // Release data before taking aux: a waiter holds aux while trying inner.
+        drop(self.guard.take());
+        // Even a panicking callback must not prevent subsequent notifications.
+        let _aux = self
+            .mutex
+            .aux
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.mutex.cv.notify_all();
+    }
+}
+
+impl<T> WaitMutex<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(value),
+            aux: Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn guard<'a>(&'a self, guard: MutexGuard<'a, T>) -> WaitGuard<'a, T> {
+        WaitGuard {
+            guard: Some(guard),
+            mutex: self,
+        }
+    }
+
+    /// Plain blocking lock, preserving std's poison recovery semantics.
+    #[allow(dead_code)] // Compatibility API; production callers use cancellable locking.
+    pub(crate) fn lock(&self) -> LockResult<WaitGuard<'_, T>> {
+        match self.inner.lock() {
+            Ok(guard) => Ok(self.guard(guard)),
+            Err(error) => Err(PoisonError::new(self.guard(error.into_inner()))),
+        }
+    }
+
+    pub(crate) fn lock_cancellable(&self) -> Result<WaitGuard<'_, T>, CoreError> {
+        self.lock_notified(|| {})
+    }
+
+    pub(crate) fn lock_notified(
+        &self,
+        mut waiting: impl FnMut(),
+    ) -> Result<WaitGuard<'_, T>, CoreError> {
+        let mut notified = false;
+        let mut aux = self.aux.lock().map_err(|_| CoreError::Fenced)?;
+        loop {
+            check()?;
+            match self.inner.try_lock() {
+                Ok(guard) => return Ok(self.guard(guard)),
+                Err(TryLockError::Poisoned(_)) => return Err(CoreError::Fenced),
+                Err(TryLockError::WouldBlock) => {
+                    if !notified {
+                        notified = true;
+                        waiting();
+                    }
+                    let slice = Cancellation::current()
+                        .map_or(Duration::from_millis(5), |c| c.wait_slice());
+                    aux = self
+                        .cv
+                        .wait_timeout(aux, slice)
+                        .map_err(|_| CoreError::Fenced)?
+                        .0;
+                }
             }
         }
     }
@@ -129,6 +242,113 @@ pub(crate) fn lock_notified<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wait_mutex_wakes_on_unlock_and_notifies_once() {
+        let mutex = Arc::new(WaitMutex::new(()));
+        let guard = mutex.lock().unwrap();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = mutex.clone();
+        let job = std::thread::spawn(move || {
+            let mut calls = 0;
+            let _guard = waiter
+                .lock_notified(|| {
+                    calls += 1;
+                    waiting_tx.send(()).unwrap();
+                })
+                .unwrap();
+            done_tx.send((Instant::now(), calls)).unwrap();
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Hold for 300 ms without a sleep or busy loop.
+        assert!(done_rx.recv_timeout(Duration::from_millis(300)).is_err());
+        let released = Instant::now();
+        drop(guard);
+        let (acquired, calls) = done_rx.recv_timeout(Duration::from_millis(50)).unwrap();
+        assert!(acquired.duration_since(released) < Duration::from_millis(50));
+        assert_eq!(calls, 1);
+        job.join().unwrap();
+    }
+
+    #[test]
+    fn wait_mutex_cancellation_leaves_holder_untouched() {
+        let mutex = Arc::new(WaitMutex::new(42));
+        let guard = mutex.lock().unwrap();
+        let cancellation = Cancellation::default();
+        let other = cancellation.clone();
+        let waiter = mutex.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let job = std::thread::spawn(move || {
+            other.scope(|| {
+                let result = waiter.lock_notified(|| tx.send(()).unwrap()).map(|_| ());
+                done_tx.send(result).unwrap();
+            })
+        });
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        assert!(cancellation.cancel());
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(200)).unwrap(),
+            Err(CoreError::Cancelled)
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(*guard, 42);
+        drop(guard);
+        assert_eq!(*mutex.lock().unwrap(), 42);
+        job.join().unwrap();
+    }
+
+    #[test]
+    fn wait_mutex_expired_deadline() {
+        let mutex = WaitMutex::new(());
+        let c = Cancellation::new(Some(Instant::now()));
+        c.scope(|| {
+            assert_eq!(
+                mutex.lock_cancellable().map(|_| ()),
+                Err(CoreError::Cancelled)
+            )
+        });
+    }
+
+    #[test]
+    fn wait_mutex_poison_is_fenced() {
+        let mutex = Arc::new(WaitMutex::new(7));
+        let other = mutex.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = other.lock().unwrap();
+                panic!("poison inner mutex");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(mutex.lock_cancellable().map(|_| ()), Err(CoreError::Fenced));
+        assert_eq!(**mutex.lock().unwrap_err().get_ref(), 7);
+    }
+
+    #[test]
+    fn wait_mutex_contended_counter_is_exact() {
+        let mutex = Arc::new(WaitMutex::<u64>::default());
+        let barrier = Arc::new(std::sync::Barrier::new(32));
+        let jobs: Vec<_> = (0..32)
+            .map(|_| {
+                let mutex = mutex.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..1000 {
+                        *mutex.lock_cancellable().unwrap() += 1u64;
+                    }
+                })
+            })
+            .collect();
+        for job in jobs {
+            job.join().unwrap();
+        }
+        assert_eq!(*mutex.lock().unwrap(), 32_000);
+    }
+
     #[test]
     fn cancellation_and_decision_have_exactly_one_winner() {
         for _ in 0..256 {

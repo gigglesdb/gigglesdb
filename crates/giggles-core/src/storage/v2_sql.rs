@@ -168,10 +168,10 @@ impl SqlSession {
                 .iter()
             {
                 let slot = {
-                    let mut live = crate::cancellation::lock(&db.sql_counters)?;
+                    let mut live = db.sql_counters.lock_cancellable()?;
                     live.entry(*id).or_default().clone()
                 };
-                let mut current = crate::cancellation::lock(&slot.counter)?;
+                let mut current = slot.counter.lock_cancellable()?;
                 if current.as_ref().is_none_or(|current| current.incarnation != counter.incarnation) {
                     *current = Some(counter.clone());
                 }

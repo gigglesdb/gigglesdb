@@ -9,7 +9,7 @@ impl Inner {
             return self.native_once_locked(|state| work(&LedgerView::borrow(state)));
         };
         let _ticket = self.enter()?;
-        let _guard = crate::cancellation::lock_notified(&self.gate, || {
+        let _guard = self.gate.lock_notified(|| {
             self.decision_point(DecisionPoint::WaitingLock)
         })?;
         if self.fenced.load(Ordering::Acquire) {

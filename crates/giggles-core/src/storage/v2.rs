@@ -15,7 +15,7 @@ pub(super) mod maintenance;
 /// A stable allocation identity: entries are never replaced while the DB is open.
 #[derive(Default)]
 pub(crate) struct SeqSlot {
-    pub(crate) counter: std::sync::Mutex<Option<super::sequences::SeqCounter>>,
+    pub(crate) counter: crate::cancellation::WaitMutex<Option<super::sequences::SeqCounter>>,
 }
 
 #[allow(dead_code)]
@@ -33,7 +33,7 @@ pub(crate) struct V2Db {
     pub(crate) sequences: Arc<engine::seq::SequenceAllocator>,
     pub(crate) xacts: engine::xact::XactIds,
     pub(crate) sql_counters:
-        std::sync::Mutex<std::collections::BTreeMap<u64, Arc<SeqSlot>>>,
+        crate::cancellation::WaitMutex<std::collections::BTreeMap<u64, Arc<SeqSlot>>>,
     reclaim: std::sync::Mutex<reclaim::Registry>,
     pub(super) reclaim_errors: AtomicU64,
     binding_fences: std::sync::Mutex<std::collections::BTreeMap<(u64, u64, u64), u64>>,

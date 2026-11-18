@@ -80,14 +80,14 @@ pub(super) fn callback(
         }
         // Release the directory before waiting on an individual sequence or I/O.
         let slot = if committed {
-            let mut live = crate::cancellation::lock(&db.sql_counters)?;
+            let mut live = db.sql_counters.lock_cancellable()?;
             Some(live.entry(id).or_default().clone())
         } else {
             None
         };
         let mut live = slot
             .as_ref()
-            .map(|slot| crate::cancellation::lock(&slot.counter))
+            .map(|slot| slot.counter.lock_cancellable())
             .transpose()?;
         let mut pending = if committed {
             None

@@ -19,7 +19,7 @@ impl Admin {
             // A replicated store keeps the v1 `[07]` ledger (no protected records).
             if !presence.ledger { return Ok(0); }
             let before = kernel.load()?;
-            let gate = crate::cancellation::lock_notified(&inner.gate, || inner.decision_point(DecisionPoint::WaitingLock))?;
+            let gate = inner.gate.lock_notified(|| inner.decision_point(DecisionPoint::WaitingLock))?;
             if inner.fenced.load(Ordering::Acquire) { return Err(CoreError::Fenced.into()); }
             let lease = certify_lease(before.0.native_outcomes.as_ref(), clock()?)?;
             let mut after = before.clone();
@@ -33,7 +33,7 @@ impl Admin {
             // to blank; an already-shared ledger with nothing to blank writes nothing.
             let (header, migrated) = v2_migrate::shared_header(&mut kernel)?;
             let Some(header) = header else { return Ok(0) };
-            let gate = crate::cancellation::lock_notified(&inner.gate, || inner.decision_point(DecisionPoint::WaitingLock))?;
+            let gate = inner.gate.lock_notified(|| inner.decision_point(DecisionPoint::WaitingLock))?;
             if inner.fenced.load(Ordering::Acquire) { return Err(CoreError::Fenced.into()); }
             let lease = certify_watermark(header.once_upper_watermark_s, clock()?)?;
             let count = v2_migrate::stage_compaction(&mut kernel, &header, lease)?;

@@ -320,7 +320,7 @@ impl Admin {
         if !matches!(migration, Migration::Migrated(_)) {
             return Ok(migration);
         }
-        let _gate = crate::cancellation::lock_notified(&inner.gate, || inner.decision_point(DecisionPoint::WaitingLock))?;
+        let _gate = inner.gate.lock_notified(|| inner.decision_point(DecisionPoint::WaitingLock))?;
         if inner.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced);
         }

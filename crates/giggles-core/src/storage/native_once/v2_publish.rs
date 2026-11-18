@@ -28,14 +28,14 @@ impl SqlSession {
         let inner = self.admin.inner.clone();
         let Backend::V2(db) = &inner.backend else { unreachable!() };
         // Match SQL COMMIT's sequence validation, serialization and publication.
-        let mut live = crate::cancellation::lock(&db.sql_counters)?;
+        let mut live = db.sql_counters.lock_cancellable()?;
         let txn = self.v2_transaction.as_mut().expect("active transaction");
         if mode == NativePublishMode::Success {
             v2_sql::validate_pending(db, txn, &mut self.deferral)?;
             v2_sql::sql_sequences::stage_pending(db, txn, &self.pending_sequences)?;
         }
         let _ticket = inner.enter()?;
-        let _gate = crate::cancellation::lock_notified(&inner.gate, || {
+        let _gate = inner.gate.lock_notified(|| {
             inner.decision_point(DecisionPoint::WaitingLock)
         })?;
         if inner.fenced.load(Ordering::Acquire) { return Err(CoreError::Fenced.into()); }
@@ -101,7 +101,7 @@ impl SqlSession {
         })?;
         for (id, counter) in self.pending_sequences.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             let slot = live.entry(*id).or_default();
-            let mut current = crate::cancellation::lock(&slot.counter)?;
+            let mut current = slot.counter.lock_cancellable()?;
             if current.as_ref().is_none_or(|current| current.incarnation != counter.incarnation) {
                 *current = Some(counter.clone());
             }

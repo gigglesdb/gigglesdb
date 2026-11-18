@@ -714,7 +714,7 @@ enum Backend {
 }
 struct Inner {
     backend: Backend,
-    gate: Mutex<()>,
+    gate: crate::cancellation::WaitMutex<()>,
     admitted: AtomicUsize,
     sql_transactions: AtomicUsize,
     sql_operations: AtomicUsize,
@@ -836,7 +836,7 @@ impl Inner {
     }
     fn inspect<T>(&self, f: impl FnOnce(&State) -> Result<T, CoreError>) -> Result<T, CoreError> {
         let _ticket = self.enter()?;
-        let _guard = crate::cancellation::lock_notified(&self.gate, || {
+        let _guard = self.gate.lock_notified(|| {
             self.decision_point(DecisionPoint::WaitingLock)
         })?;
         if self.fenced.load(Ordering::Acquire) {
@@ -866,7 +866,7 @@ impl Inner {
         f: impl FnOnce(&mut State) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
         let _ticket = self.enter()?;
-        let _guard = crate::cancellation::lock_notified(&self.gate, || {
+        let _guard = self.gate.lock_notified(|| {
             self.decision_point(DecisionPoint::WaitingLock)
         })?;
         if self.fenced.load(Ordering::Acquire) {
@@ -902,7 +902,7 @@ impl Inner {
         work: impl FnOnce(&mut State) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
         let _ticket = self.enter()?;
-        let _guard = crate::cancellation::lock(&self.gate)?;
+        let _guard = self.gate.lock_cancellable()?;
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced);
         }
@@ -1232,7 +1232,7 @@ impl Admin {
         Ok(Self {
             inner: Arc::new(Inner {
                 backend,
-                gate: Mutex::new(()),
+                gate: crate::cancellation::WaitMutex::new(()),
                 admitted: AtomicUsize::new(0),
                 sql_transactions: AtomicUsize::new(0),
                 sql_operations: AtomicUsize::new(0),
