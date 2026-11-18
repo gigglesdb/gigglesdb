@@ -20,7 +20,8 @@
 #
 # Exit: 0 gate passed, 1 gate failed (unexpected test failures or build or
 # clippy errors), 2 usage error, 3 daily start cap reached (gate locally),
-# 4 no slot free in time, 5 infrastructure error. Results land in
+# 4 no slot free in time, 5 infrastructure error (including box filesystem,
+# fetch or checkout hangs). Results land in
 # J:/gigglesdb-work/boat/runs/<utc>-<tip12>-<sanitized-who>-<pid>/ (summary.txt, logs.tar.gz).
 # Linux-only expected failures are listed in scripts/gate-linux-expected-failures.txt.
 set -euo pipefail
@@ -55,7 +56,7 @@ done
 [ -x "$B" ] || { echo "boat CLI not found at $B (set BOAT)" >&2; exit 5; }
 
 g() { git -C "$repo" "$@"; }
-tip=$(g rev-parse --verify "$tip^{commit}")
+tip=$(g rev-parse --verify "$tip^{commit}") || { echo "could not resolve gate tip" >&2; exit 5; }
 short=${tip:0:12}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 run="$boatdir/runs/$stamp-$short-${who//[^A-Za-z0-9_.-]/_}-$$"
@@ -118,6 +119,10 @@ d=json.loads(lines[-1]) if lines else {}
 print(d.get(sys.argv[1],'') if sys.argv[1] else json.dumps(d))" "$1"; }
 bexec() { # bexec <id> <command>  (short commands only, 600s max)
   bj exec "$1" --timeout 600 --json -- bash -lc "$2" | jfield stdout; }
+bexec_t() { # <seconds> <box> <command>: bound both boat and its remote command
+  local secs=$1; shift
+  timeout --kill-after=10 "$(( secs + 30 ))" "$B" --no-update exec "$1" --timeout "$secs" --json -- bash -lc "$2" | jfield stdout
+}
 
 # 1. Daily start cap (UTC day, all agents; one START line per box).
 today=$(date -u +%F)
@@ -159,14 +164,22 @@ echo "pending $who $short $(date -u +%FT%TZ)" > "$boatdir/slots/$slot/owner"
 log "took $slot"
 
 # 3. Bundle the stack (commits after the snapshot's base when possible).
-base=$(cat "$boatdir/base-commit.txt")
-g update-ref "$ref" "$tip"
+base=$(cat "$boatdir/base-commit.txt") || { log "could not read snapshot base"; exit 5; }
+g update-ref "$ref" "$tip" || { log "could not create bundle ref"; exit 5; }
 if g merge-base --is-ancestor "$base" "$tip"; then
-  g bundle create "$run/stack.bundle" "$ref" "^$base" 2>/dev/null
+  g bundle create "$run/stack.bundle" "$ref" "^$base" 2>/dev/null || { log "could not create stack bundle"; exit 5; }
 else
   log "tip does not descend from snapshot base $base; sending full history"
-  g bundle create "$run/stack.bundle" "$ref" 2>/dev/null
+  g bundle create "$run/stack.bundle" "$ref" 2>/dev/null || { log "could not create stack bundle"; exit 5; }
 fi
+
+ahead=$(g rev-list --count "$tip" "^$base" 2>/dev/null) || ahead=unknown
+bundle_kib=$(( ( $(wc -c < "$run/stack.bundle") + 1023 ) / 1024 ))
+rebuild_note=''
+if [[ "$ahead" =~ ^[0-9]+$ ]] && [ "$ahead" -gt 1000 ]; then
+  rebuild_note=' (consider asking the snapshot coordinator for a rebuild)'
+fi
+log "tip is $ahead commits ahead of snapshot base ${base:0:12}; bundle $bundle_kib KiB$rebuild_note"
 
 # 4. Box from the snapshot.
 log "starting $type box from $snapshot"
@@ -186,28 +199,71 @@ log "box $box ready"
 
 # 5. Ship the bundle, runner and expected-failure list; check out the tip.
 here=$(cd "$(dirname "$0")" && pwd)
-cp "$here/gate-remote-runner.sh" "$here/gate-linux-expected-failures.txt" "$run/"
+cp "$here/gate-remote-runner.sh" "$here/gate-linux-expected-failures.txt" "$run/" || { log "could not prepare runner upload"; exit 5; }
 ( cd "$run" && for f in stack.bundle gate-remote-runner.sh gate-linux-expected-failures.txt; do
     bj scp "$f" "$box:/home/user/$f" >/dev/null 2>&1 || exit 1
   done ) || { log "upload failed"; exit 5; }
-head=$(bexec "$box" "cd /home/user/gigglesdb && git fetch -q /home/user/stack.bundle '$ref:refs/gate/tip' && git checkout -q --detach $tip && git rev-parse HEAD")
-[ "$(echo "$head" | tr -d '[:space:]')" = "$tip" ] || { log "checkout of $tip on box failed: $head"; exit 5; }
+fetch_to=${GATE_FETCH_TIMEOUT:-240}
+checkout_to=${GATE_CHECKOUT_TIMEOUT:-240}
+step5=$(bexec_t "$(( 60 + fetch_to + checkout_to + 60 ))" "$box" "
+export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true SSH_ASKPASS=/bin/true GCM_INTERACTIVE=never
+step() {
+  local name=\$1 secs=\$2 rc; shift 2
+  echo \"GATE-STEP5 \$name\"
+  timeout -k 10 \"\$secs\" \"\$@\"
+  rc=\$?
+  if [ \"\$rc\" != 0 ]; then
+    case \$rc in
+      124|137) echo \"GATE-STEP5 HUNG \$name\" ;;
+      *) echo \"GATE-STEP5 FAILED \$name rc=\$rc\" ;;
+    esac
+    exit \"\$rc\"
+  fi
+}
+step probe 60 bash -c 'cd /home/user/gigglesdb && cat .git/HEAD && git -c credential.helper= -c core.askPass= rev-parse --git-dir'
+step fetch $fetch_to git -C /home/user/gigglesdb -c credential.helper= -c core.askPass= fetch -q /home/user/stack.bundle '$ref:refs/gate/tip'
+step checkout $checkout_to git -C /home/user/gigglesdb -c credential.helper= -c core.askPass= checkout -q --detach '$tip'
+head=\$(timeout -k 10 60 git -C /home/user/gigglesdb -c credential.helper= -c core.askPass= rev-parse HEAD) || { echo 'GATE-STEP5 FAILED checkout rc='\$?; exit 1; }
+echo \"GATE-STEP5 OK \$head\"
+") || true
+marker=$(printf '%s\n' "$step5" | grep -E '^GATE-STEP5 (OK|HUNG|FAILED) ' | tail -1) || true
+if [ "$marker" != "GATE-STEP5 OK $tip" ]; then
+  if [ -n "$marker" ]; then
+    log "$marker"
+  else
+    log "no marker: boat exec timed out or failed: $(printf '%s\n' "$step5" | tail -5)"
+  fi
+  case "$marker" in
+    'GATE-STEP5 HUNG probe'|'GATE-STEP5 FAILED probe '*)
+      log "box /home/user is not readable: the snapshot's lazy filesystem did not hydrate (boat snapshot store errors?); retry later, a snapshot rebuild will not help unless the store has lost it" ;;
+  esac
+  bexec_t 30 "$box" "sudo -n journalctl --no-pager 2>/dev/null | grep -E 'lazyfs.*ERROR|lazy\\] ERROR' | tail -5 | cut -c1-300" > "$run/step5-diag.txt" || true
+  exit 5
+fi
 
 # 6. Run the gate in the background on the box and wait for it.
 args=$(printf '%q ' "${steps[@]}")
-bj exec "$box" --detach -- bash -lc "CLIPPY=$clippy bash /home/user/gate-remote-runner.sh $args > /home/user/gate.out 2>&1" >/dev/null
+bj exec "$box" --detach -- bash -lc "CLIPPY=$clippy bash /home/user/gate-remote-runner.sh $args > /home/user/gate.out 2>&1" >/dev/null || { log "could not start the gate runner on the box"; exit 5; }
 log "gate running: ${steps[*]}"
+poll_fails=0
 while :; do
   sleep 30
-  st=$(bexec "$box" "cat /home/user/gate/done 2>/dev/null; tail -1 /home/user/gate/progress 2>/dev/null" || true)
+  if st=$(bexec_t 60 "$box" "cat /home/user/gate/done 2>/dev/null; tail -1 /home/user/gate/progress 2>/dev/null || true"); then
+    poll_fails=0
+  else
+    poll_fails=$(( poll_fails + 1 ))
+    log "poll of the gate runner failed ($poll_fails/5)"
+    [ "$poll_fails" -lt 5 ] || { log "could not poll the gate runner on the box"; exit 5; }
+    continue
+  fi
   if echo "$st" | grep -q '^rc='; then break; fi
   [ $(( $(date +%s) - started )) -lt $(( ttl - 300 )) ] || { log "gate did not finish before the box TTL"; exit 5; }
 done
 
 # 7. Copy results back.
-bexec "$box" "cd /home/user && tar czf gate-logs.tar.gz gate gate.out" >/dev/null
+bexec_t 300 "$box" "cd /home/user && tar czf gate-logs.tar.gz gate gate.out" >/dev/null || { log "could not archive gate results on the box"; exit 5; }
 ( cd "$run" && bj scp "$box:/home/user/gate-logs.tar.gz" logs.tar.gz >/dev/null 2>&1 ) || log "WARNING: log download failed"
-bexec "$box" "cat /home/user/gate/summary.txt" > "$run/summary.txt"
+bexec_t 60 "$box" "cat /home/user/gate/summary.txt" > "$run/summary.txt" || { log "could not read gate summary from the box"; exit 5; }
 rm -f "$run/stack.bundle"
 cat "$run/summary.txt"
 grc=$(echo "$st" | grep -o '^rc=[0-9]*' | cut -d= -f2)
