@@ -1,6 +1,14 @@
-# GigglesDB engine benchmark: GD-0054 F0
+# giggles-engine-bench
 
-This standalone Rust 2024 crate qualifies the frozen F0 MVCC access pattern on
+Benchmarks MVCC access patterns on redb, fjall and optional RocksDB for storage-engine comparisons.
+
+**Status:** Supports synthetic engine workloads; it does not measure the SQL server, replication or production clocks.
+
+Part of [GigglesDB](../../README.md).
+
+## Details
+
+This standalone Rust 2024 crate qualifies a fixed MVCC access pattern on
 redb, fjall, and optional RocksDB. It measures engine behavior, durability grouping, retained
 versions, and space reclamation before a production engine choice. It does not
 implement the GigglesDB server, SQL layer, replication, or production HLC.
@@ -12,7 +20,7 @@ crate is **0.25.0**, backed by `librocksdb-sys` **0.19.0+11.8.1**
 (native RocksDB **11.8.1**). The `rocksdb` feature is disabled by default;
 requesting that engine without the feature prints the required build flag.
 
-## Frozen byte format
+## Details: byte format
 
 Every physical key is 25 bytes, sorted lexicographically:
 
@@ -32,14 +40,14 @@ The harness uses monotonic counter timestamps. Load increments the counter for
 each loaded row; the run writer assigns one per submitted four-row transaction.
 These counters deliberately substitute for the production HLC.
 
-## Reproduce
+## Quick start
 
-Run from `K:/Projects/gigglesdb` in PowerShell. Choose a fresh unique task folder
+Run from the repository root in PowerShell. Choose a fresh unique task folder
 for every experiment. Build outputs, temporary files, databases, and JSONL stay
-under `J:/gigglesdb-work`; existing evidence must remain in place.
+under `<work-dir>`; existing evidence must remain in place.
 
 ```powershell
-$task = 'J:/gigglesdb-work/f0-example-20261107-a'
+$task = '<work-dir>'
 New-Item -ItemType Directory -Force "$task/tmp" | Out-Null
 $env:CARGO_TARGET_DIR = "$task/target"
 $env:TEMP = "$task/tmp"
@@ -63,21 +71,21 @@ For a quick functional smoke use `load --dataset-gb 0.0001`, then
 independent mixes; the sequence above intentionally accumulates write history.
 Common required arguments (`--engine`, `--dir`, `--out`) precede the phase.
 The directory guard resolves existing ancestors and canonical paths before
-accepting a database under J:/. An intentional other-drive experiment requires
-`--allow-any-dir`. This opt-out does not change the project's output policy.
+accepting a database under the configured work root. An intentional directory outside that root requires
+`--allow-any-dir`. This opt-out does not change the harness directory restriction.
 
 ```powershell
 cargo +1.99.1 test --locked --manifest-path crates/giggles-engine-bench/Cargo.toml
 cargo +1.99.1 clippy --locked --manifest-path crates/giggles-engine-bench/Cargo.toml --all-targets -- -D warnings
 ```
 
-The required F0 verification and smoke use the qualification task below. These
+The verification and smoke tests use the qualification task below. These
 commands do not delete existing evidence. The two smoke database directories
 must be fresh before the first load; choose a new unique task if they already
 contain a completed run. Run the two Cargo checks before invoking the binary.
 
 ```powershell
-$task = 'J:/gigglesdb-work/trackF-f0-20261107'
+$task = '<work-dir>'
 New-Item -ItemType Directory -Force "$task/tmp", "$task/data", "$task/out" | Out-Null
 $env:CARGO_TARGET_DIR = "$task/target"
 $env:TEMP = "$task/tmp"
@@ -97,19 +105,19 @@ foreach ($engine in @('redb', 'fjall')) {
 }
 ```
 
-## RocksDB F0b reproduction and settings
+## RocksDB setup and settings
 
 The frozen RocksDB build uses Rust 1.99.1, MSVC 2022 Community, and LLVM 23.1.5.
 No global environment or toolchain changes are required. Run this in PowerShell
 from the repository root; use a new unique task directory for a new experiment.
 
 ```powershell
-$task = 'J:/gigglesdb-work/trackF-f0-20261107'
+$task = '<work-dir>'
 New-Item -ItemType Directory -Force "$task/tmp", "$task/data", "$task/out" | Out-Null
 $env:CARGO_TARGET_DIR = "$task/target"
 $env:TEMP = "$task/tmp"
 $env:TMP = "$task/tmp"
-$env:LIBCLANG_PATH = 'J:/tools/LLVM/bin'
+$env:LIBCLANG_PATH = '<llvm-dir>/bin'
 # If CMake is not already visible, prefix this command-local shell PATH:
 $env:PATH = 'C:/Program Files/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin;' + $env:PATH
 cargo +1.99.1 build --release --locked --features rocksdb --manifest-path crates/giggles-engine-bench/Cargo.toml
@@ -221,5 +229,5 @@ qualification evidence; do not substitute a tiny smoke for a capacity run.
 The configured 1 GiB engine cache does not cap the OS page cache. On the intended
 approximately 95 GB RAM host, small datasets can be served largely from RAM.
 Report physical RAM, dataset size, warm/cold-cache procedure, free space, and
-other machine activity alongside comparisons. F0 deliberately does not claim
+other machine activity alongside comparisons. This benchmark does not claim
 production HLC, concurrency-control, crash-injection, or end-to-end SQL results.

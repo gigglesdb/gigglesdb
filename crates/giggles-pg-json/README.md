@@ -1,5 +1,11 @@
 # giggles-pg-json
 
+PostgreSQL-style JSON and JSONB representations and operations for Rust callers.
+
+**Status:** Provides bounded standalone APIs; the qualification described below does not certify complete SQL or server integration.
+
+Part of [GigglesDB](../../README.md).
+
 Standalone UTF-8 PostgreSQL JSON/JSONB foundation. This crate has its own workspace,
 lockfile and target directory. It is **not integrated** into GigglesDB values, SQL,
 registry, catalog, wire server, persistence, native, HTTP or gRPC APIs.
@@ -115,7 +121,6 @@ container creation and remove only that owned container afterward.
 Non-C collation comparison remains unimplemented. This is a
 standalone library increment, with no SQL/binder/storage/wire-server integration.
 
-
 Typed growth mutations (`set`, `insert`, associated `Jsonb::set_lax`) implement the
 PG18 jsonb_set/jsonb_insert/jsonb_set_lax contracts. Paths are one-dimensional
 slices of optional strings. `set_lax` takes optional target, path array, replacement,
@@ -130,7 +135,7 @@ Existing object keys error on insert; reached scalars and missing intermediates
 otherwise leave the target unchanged. Root scalars error even with an empty path.
 Out-of-range array insertion prepends for negative indexes and appends for positive
 indexes, with no gap filling. NULL input arrays and multidimensional arrays are
-outside the strict set/insert slice API; lax represents NULL input arrays explicitly.
+outside the strict set/insert profile API; lax represents NULL input arrays explicitly.
 
 Mutation builds a borrowed edit plan, streams node/depth/byte-admitted canonical
 text, then parses a result only after admission. No result subtree is cloned before

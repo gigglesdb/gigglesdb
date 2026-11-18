@@ -1,15 +1,23 @@
 # giggles-migrate
 
+An offline migration rehearsal tool for contributors testing normalized input against a real GigglesDB SQL destination.
+
+**Status:** Supports bounded normalized imports; it does not connect to ScyllaDB, fence writers or transfer authority.
+
+Part of [GigglesDB](../../README.md).
+
 A small **normalized offline migration rehearsal** with actual GigglesDB SQL destination effects. It does not connect to ScyllaDB, fence source writers, transfer authority, run reverse capture, or qualify a production migration.
+
+## Quick start
 
 From the repository root in PowerShell:
 
 ```powershell
 $env:CARGO_BUILD_JOBS='2'
-$env:CARGO_TARGET_DIR="$PWD/crates/giggles-migrate/target"
+$env:CARGO_TARGET_DIR="<work-dir>/target"
 $manifest='crates/giggles-migrate/examples/manifest.json'
 $chunks='crates/giggles-migrate/examples/chunks.json'
-$db=Join-Path ([System.IO.Path]::GetTempPath()) ('giggles-rehearsal-' + [guid]::NewGuid())
+$db='<work-dir>/fresh-rehearsal-db'
 cargo run --manifest-path crates/giggles-migrate/Cargo.toml -- manifest validate $manifest
 cargo run --manifest-path crates/giggles-migrate/Cargo.toml -- reconcile $manifest $chunks
 cargo run --manifest-path crates/giggles-migrate/Cargo.toml -- import $manifest $chunks $db

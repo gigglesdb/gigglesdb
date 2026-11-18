@@ -1,5 +1,11 @@
 # giggles-ops
 
+A full snapshot backup catalog and fresh-identity restore library and CLI for local operators.
+
+**Status:** Uses verified core exports; incremental backup, PITR and automatic retention deletion are unsupported.
+
+Part of [GigglesDB](../../README.md).
+
 Local full snapshot backup catalog and restore into a fresh database identity.
 This standalone crate uses the existing `giggles-core` verified consistent export
 API. It never copies an open `data.redb` file. The library accepts an existing
@@ -12,15 +18,15 @@ From this directory in PowerShell:
 $env:CARGO_TARGET_DIR = "$PWD/target-ops"
 $env:CARGO_BUILD_JOBS = '2'
 cargo build --locked -j2
-New-Item -ItemType Directory K:/Backups/giggles-catalog
-cargo run --locked -- backup --root K:/Backups/giggles-catalog --source K:/Data/source-db --id incident-001
-cargo run --locked -- list --root K:/Backups/giggles-catalog
-cargo run --locked -- inspect --root K:/Backups/giggles-catalog --id incident-001
-cargo run --locked -- verify --root K:/Backups/giggles-catalog --id incident-001
-cargo run --locked -- restore --root K:/Backups/giggles-catalog --id incident-001 --target K:/Data/recovered-db
+New-Item -ItemType Directory ./backup-catalog
+cargo run --locked -- backup --root ./backup-catalog --source ./data/source-db --id incident-001
+cargo run --locked -- list --root ./backup-catalog
+cargo run --locked -- inspect --root ./backup-catalog --id incident-001
+cargo run --locked -- verify --root ./backup-catalog --id incident-001
+cargo run --locked -- restore --root ./backup-catalog --id incident-001 --target ./data/recovered-db
 ```
 
-`K:/Data` must already exist; `recovered-db` must not exist, even as an empty
+`./data` must already exist; `recovered-db` must not exist, even as an empty
 directory. The source database must already exist. All commands emit one JSON
 value on stdout on success, exit 0; errors emit only `{"error":"code"}` on stderr
 and exit 1. No paths, SQL, credentials or customer row values appear in errors.
@@ -108,3 +114,11 @@ Run `./verify.ps1` for fmt, strict all-target Clippy, debug/release tests, doc t
 and warning-free docs. Logs and dependency/source hashes are retained under unique
 ignored `artifacts` paths. Test fixtures use unique OS temporary directories and
 are deliberately retained, including failed/crashed cases.
+
+## Usage from sh
+
+From the repository root:
+
+```sh
+cargo run --manifest-path crates/giggles-ops/Cargo.toml -- list --root ./backup-catalog
+```

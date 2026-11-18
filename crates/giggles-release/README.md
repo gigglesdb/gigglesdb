@@ -1,11 +1,19 @@
 # giggles-release
 
+A Rust packaging library and CLI for contributors creating deterministic release archives.
+
+**Status:** Creates and verifies bounded local archives; hashes verify integrity but do not authenticate publishers.
+
+Part of [GigglesDB](../../README.md).
+
 A bounded local Rust packaging library and CLI. It creates deterministic `giggles-release-json-v1` archives (`.ggr`), verifies embedded file sizes and SHA256 hashes, and inspects the verified manifest. Hashes establish integrity against an expected digest; they do not authenticate a publisher or provide signatures.
+
+## Quick start
 
 Build and check on the currently exercised host, Windows x86_64 MSVC:
 
 ```powershell
-$env:CARGO_TARGET_DIR = "$PWD/crates/giggles-release/target-release-worker"
+$env:CARGO_TARGET_DIR = "<work-dir>/target"
 $env:CARGO_BUILD_JOBS = '1'
 cargo build --manifest-path crates/giggles-release/Cargo.toml --locked -j1
 cargo test --manifest-path crates/giggles-release/Cargo.toml --locked -j1
@@ -18,7 +26,7 @@ cargo run --manifest-path crates/giggles-release/Cargo.toml -- inspect new-relea
 
 ```json
 {
-  "workspace": "K:/work/source",
+  "workspace": "<source-dir>",
   "manifest": "crates/giggles-core/Cargo.toml",
   "release": "0.1.0-local",
   "target": "x86_64-pc-windows-msvc",
@@ -27,7 +35,7 @@ cargo run --manifest-path crates/giggles-release/Cargo.toml -- inspect new-relea
   "dirty": true,
   "build_receipt": null,
   "files": [
-    {"source":"K:/work/build/release/giggles.exe","path":"bin/giggles.exe","role":"Binary"},
+    {"source":"<build-dir>/release/giggles.exe","path":"bin/giggles.exe","role":"Binary"},
     {"source":"crates/giggles-core/README.md","path":"README.md","role":"Readme"}
   ]
 }
@@ -52,7 +60,7 @@ It invokes Cargo through argument arrays with `--locked --offline --manifest-pat
 Only an explicit action executes a trusted **locally built** executable, separately from verification:
 
 ```powershell
-cargo run --manifest-path crates/giggles-release/Cargo.toml -- smoke --local-built build-receipt.json K:/work/build/x86_64-pc-windows-msvc/release/giggles.exe K:/work/smoke
+cargo run --manifest-path crates/giggles-release/Cargo.toml -- smoke --local-built build-receipt.json <build-dir>/x86_64-pc-windows-msvc/release/giggles.exe <work-dir>/smoke
 ```
 
 This checks the local build receipt's digest, then creates a uniquely retained scratch DB, creates/inserts a SQL row and queries it in fresh processes, then inspects the reopened DB. Do not point this action at untrusted downloaded executables or receipts. Receipts and hashes are not proof of publisher identity.

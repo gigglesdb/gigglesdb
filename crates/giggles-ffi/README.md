@@ -1,14 +1,18 @@
-# GigglesDB local C ABI v1
+# giggles-ffi
 
-This is the P1 Rust kernel's trusted in-process binding, not a remote security
+The versioned C ABI for trusted in-process access to the GigglesDB Rust kernel.
+
+**Status:** Provides opaque handles and stable numeric outcome codes; it is not a remote security boundary.
+
+Part of [GigglesDB](../../README.md).
+
+This is the embedded Rust kernel's trusted in-process binding, not a remote security
 boundary. Build with `cargo build` or `cargo build --release`. MSVC outputs
 `giggles_ffi.dll`, `giggles_ffi.dll.lib` and `giggles_ffi.lib`; link C consumers
 against the import library and include `include/giggles.h`. Symbols use the C
 calling convention; all exported names start with `gd_v1_`.
 
-Design: [GD-0004](https://app.archdocs.io/design-docs/69c1e508-5416-4aca-87d8-71c4f791c0cf),
-[GD-0005 recovery](https://app.archdocs.io/design-docs/973ebf6a-0989-4397-af4c-d8b5bc2a49d8).
-Shared authority is implemented exclusively by `giggles-core`; P0 is not a
+Shared authority is implemented exclusively by `giggles-core`; `giggles-model` is not a
 runtime dependency.
 
 ## Ownership and ABI contracts
@@ -100,15 +104,15 @@ Storage errors can occur after a decision committed. Close **all** clones, reope
 rebind under trusted authority and query status of the original operation ID.
 Retry the same payload and ID; do not allocate a new ID after an unknown response.
 
-## Trust and P2 integration
+## Trust and remote service integration
 
 The embedding host, filesystem owner, admin, principal binding and certified
 logical clock are trusted. Never provide admin handles or admin dispatch to an
 untrusted task. Never use this registry as remote authentication or accept a
-remote caller's principal/time claims. P2 must authenticate transport/identity,
+remote caller's principal/time claims. remote service must authenticate transport/identity,
 map a session to an issued Executor, supply a trusted clock, restrict status/
 receipt disclosure and call the same Executor kernel. See the [core API documentation](../giggles-core/README.md).
-This slice makes no physical expiry, transport, compatibility or cloud claim.
+This profile makes no physical expiry, transport, compatibility or cloud claim.
 
 `verify.ps1 -ArtifactDirectory artifacts/UNIQUE` retains fmt/clippy/debug/release/
 doc logs. `verify-c.ps1 -ArtifactDirectory artifacts/UNIQUE -Profile debug` (or
@@ -118,4 +122,4 @@ artifacts. The C runner currently locates VS2022 Community; other toolchains and
 ABI/platform pairs need their own qualification. No installation packaging or
 header-generation compatibility campaign has been performed.
 
-P1 relational continuation GD-0006 adds gd_v1_sql_session(Admin,out). Its handle accepts {sql,params,expected_version} through gd_v1_call; close rolls back any staged transaction. Executor cannot create a SQL session. SQL codes200..216 and exact grammar/bounds/format2 migration are documented in ../giggles-core/SQL.md. Native Rust prepared/Scan APIs have no separate C opcode in this slice. Existing ABI version1 ownership and numeric policy codes remain stable.
+The relational API adds `gd_v1_sql_session(Admin,out)`. Its handle accepts {sql,params,expected_version} through gd_v1_call; close rolls back any staged transaction. Executor cannot create a SQL session. SQL codes200..216 and exact grammar/bounds/format2 migration are documented in [SQL.md](../giggles-core/SQL.md). Native Rust prepared/Scan APIs have no separate C opcode in this profile. Existing ABI version1 ownership and numeric policy codes remain stable.

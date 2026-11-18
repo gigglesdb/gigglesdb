@@ -1,9 +1,15 @@
-# App SQL tester
+# app-loadtest
+
+A Node.js SQL tester for contributors comparing asserted application operations across PostgreSQL protocols.
+
+**Status:** Supports matrix and load runs with per-run schemas; requires Node 22 and a reachable database.
+
+Part of [GigglesDB](../../README.md).
 
 Run asserted app operations through simple queries with safely inlined literals, unnamed extended queries, and reused named prepared statements. Each invocation creates a unique schema and drops it unless `--keep` is supplied. Node 22 is required; install with `npm install`.
 
 ```sh
-npm run matrix -- --url postgres://postgres:PASSWORD@127.0.0.1:5432/postgres --report J:/gigglesdb-work/dg-refresh/r5/matrix.json
+npm run matrix -- --url postgres://postgres:PASSWORD@127.0.0.1:5432/postgres --report <work-dir>/matrix.json
 npm run load -- --url postgres://postgres:PASSWORD@127.0.0.1:5432/postgres --clients 8 --duration 30s --rows 2000
 npm run load -- --url postgres://postgres:PASSWORD@127.0.0.1:5432/postgres --protocols simple --mix read=0,write=0,tx=100,error=0
 ```

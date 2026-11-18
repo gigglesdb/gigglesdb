@@ -1,3 +1,11 @@
+# giggles-server
+
+The GigglesDB server exposes SQL over the PostgreSQL wire protocol and optional native, HTTP and gRPC interfaces. Use it to connect database clients to a configured service.
+
+**Status:** Supports local development and configured services; PostgreSQL compatibility is bounded and listener capabilities differ.
+
+Part of [GigglesDB](../../README.md).
+
 ## Quick start (PostgreSQL clients)
 
 From the repository root, start a local development server:
@@ -6,8 +14,8 @@ From the repository root, start a local development server:
 ./scripts/dev.ps1 -Task dev-server -Port 5432
 ```
 
-The script stores the database and build outputs under `J:/gigglesdb-work/ide`;
-use `-Work J:/gigglesdb-work/MY-SESSION` for a separate instance and `-Port` to
+The script stores the database and build outputs in its work directory (set with
+`-Work`). Use `-Work <work-dir>` for a separate instance and `-Port` to
 choose its port. Connect your PostgreSQL client to `127.0.0.1:5432`, user
 `postgres`, database `postgres`, with TLS disabled. Development mode binds to
 `127.0.0.1` and defaults to SCRAM-SHA-256 password authentication.
@@ -71,16 +79,159 @@ afterward.
 
 WARNING: --trust-local lets any local process connect as any role without a password, including Docker containers (they arrive via 127.0.0.1) and port-forwarded peers. Use only on a single-user machine.
 
-# Single-host service preview (P2)
+## Configured mTLS service
+
+Run `giggles-server CONFIG.json`. It opens an existing
+embedded database and exposes a JSON protocol and a bounded PostgreSQL wire
+interface. These configured mTLS listeners require server and client
+certificates; they do not offer password fallback or plaintext connections.
+
+Optional HTTPS/JSON and typed gRPC listeners expose structured native reads,
+guarded writes, claims and atomic blocks, alongside parameterized SQL and scoped
+task operations. Native and SQL calls share persistent transactions, mTLS
+bindings and service limits. See the
+[HTTP/gRPC guide](API.md) for configuration and runnable clients.
+
+For this mTLS workflow, use the existing fixture generator, which creates
+the database, application table, certificates and matching authorization bindings.
+The following commands use **PowerShell**, starting at the repository root.
+
+### 1. Generate a local database and credentials
+
+```powershell
+cd crates/giggles-server
+cargo test --locked --test network executable_server_starts_and_native_client_connects -- --exact --nocapture
+```
+
+This runs a startup smoke test and prints a line like:
+
+```text
+retained_fixture=artifacts/network-fixture-12345-...-0
+```
+
+Copy that path. The test stops its server before returning and keeps the files.
+The fixture contains:
+
+| File | Purpose |
+| --- | --- |
+| `db.redb` | Persistent database, including an empty application table named `app` |
+| `server.TEST-ONLY.json` | Server configuration with fixed local ports |
+| `server.pem`, `server.key.TEST-ONLY` | Server certificate and private key |
+| `app.pem`, `app.key.TEST-ONLY` | Client identity authorized to query the `app` table |
+| `ca.pem` | CA trusted by the client and server |
+| `bindings.json` | Generated certificate-to-role mappings |
+
+These generated identities are for local demonstrations. The startup test also
+creates an `ephemeral-server.TEST-ONLY.json`; use **`server.TEST-ONLY.json`** for
+the fixed-port commands below.
+
+### 2. Run the server
+
+Remain in `crates/giggles-server`. Replace the example path with the printed path:
+
+```powershell
+$fixture = 'artifacts/network-fixture-12345-...-0'
+cargo run --locked --bin giggles-server -- "$fixture/server.TEST-ONLY.json"
+```
+
+Successful startup prints:
+
+```text
+native=127.0.0.1:7432 postgres=127.0.0.1:7433 preview=single-host
+```
+
+Leave this terminal running. Type `shutdown` and press Enter, or press Ctrl-C,
+to stop. Restart with the same configuration to reopen the same database.
+
+### 3. Connect and run queries
+
+Open a second PowerShell terminal at the repository root, then use the **same**
+fixture path:
+
+```powershell
+cd crates/giggles-server
+$fixture = 'artifacts/network-fixture-12345-...-0'
+
+function Invoke-Giggles {
+    param([string]$Json)
+    $Json | Set-Content -Encoding ascii "$fixture/request.json"
+    cargo run --locked --bin giggles-client -- 127.0.0.1:7432 localhost "$fixture/app.pem" "$fixture/app.key.TEST-ONLY" "$fixture/ca.pem" "$fixture/request.json"
+}
+
+Invoke-Giggles '{"kind":"Ping"}'
+Invoke-Giggles '{"kind":"Sql","sql":"INSERT INTO app (id,body) VALUES ($1,$2)","params":[{"Int":1},{"Text":"hello GigglesDB"}]}'
+Invoke-Giggles '{"kind":"Sql","sql":"SELECT id,body FROM app WHERE id=$1","params":[{"Int":1}]}'
+```
+
+Responses are JSON. Ping should return `"code":"ok"`; the SELECT should return
+the inserted ID and text in its SQL result. Repeating the INSERT with the same
+primary key returns an error; choose another ID or issue an UPDATE.
+
+This `giggles-client` binary belongs to **`giggles-server`**. Each invocation
+of the helper above opens a new connection, so use a persistent client connection
+for multi-statement transactions.
+
+Here, “native” means the framed JSON transport; `Sql` requests still contain SQL.
+See the [native language guide](../giggles-language/README.md) for the separate
+embedded language frontend.
+
+### PostgreSQL clients and configuration for the mTLS listener
+
+In the mTLS fixture above, port **7433** implements a bounded PostgreSQL wire subset. Tested clients include
+`tokio-postgres 0.7.15` with `tokio-postgres-rustls 0.13` and bounded pgJDBC 42.7.3
+query/transaction cases. TLS is required, hostname
+`localhost`, user/database `giggles`, and the same application certificate/key/CA.
+The certificate binding determines authority. General `psql`, JDBC and ORM
+compatibility has not been qualified; use the bundled JSON client above for the
+quickstart. See the [network compatibility matrix](COMPATIBILITY.md)
+and the protocol reference below for supported messages and driver examples.
+
+**Bounded metadata support is implemented:** identity, schemas, tables, columns,
+primary keys and type information use the real authorized catalog. Full DataGrip
+GUI introspection is not yet qualified. To check capabilities before configuring a client, run
+**PostgreSQL client compatibility** in IntelliJ or
+`powershell -NoProfile -File scripts/check-pg-clients.ps1`. It uses isolated test
+databases and reports each passing, failing and untested case. Failed or untested
+cases deliberately produce a nonzero exit code.
+
+The JSON configuration specifies `database`, `native`, `postgres`, `certificate`,
+`private_key`, `client_ca`, `bindings`, `connections`, `skew_seconds` and
+`max_pause_seconds`. Paths inside it resolve against the **process working
+directory**, not the configuration file's directory. Keep using
+`crates/giggles-server`, or convert those paths to absolute paths when moving the
+configuration.
+
+For your own schema, create the database and tables through the embedded CLI
+before starting the service, then provision certificates and matching bindings.
+The server opens an existing database; it does not create one. Network schema
+creation is unavailable, and the demo application certificate is limited to
+`app`. See [credential configuration and reload](CREDENTIALS_ADMISSION.md)
+for adding bindings and certificate rotation.
+
+### Troubleshooting
+
+- **Address already in use:** change `native` and `postgres` in your configuration
+  to unused loopback ports, and update the client address accordingly.
+- **File not found:** check your working directory and fixture path. A missing
+  database is an error, not a request to create one.
+- **Database already open:** stop the other server or embedded shell using that
+  file. A database file has one process owner.
+- **TLS or authorization failure:** use the certificate, key and CA from the
+  same fixture, with TLS hostname `localhost`. The application identity is
+  `app.pem`, not the server identity or an unbound certificate.
+- **SQL refused:** check the [SQL reference](../giggles-core/SQL.md) and the
+  table permissions in the binding. PostgreSQL wire support does not imply all
+  PostgreSQL SQL is implemented.
+
+## Details: legacy single-host service
 
 Rust server and native client over the existing giggles-core/redb database. This
 is local implementation evidence, not production, cloud, ORM or general
-PostgreSQL compatibility qualification. Designs: [GD-0007](https://app.archdocs.io/design-docs/bcc8c9b3-54d8-4f78-aeba-e64771af999c)
-and [GD-0008](https://app.archdocs.io/design-docs/ea3a9a40-18d9-48a1-aa6b-67e2f19f2847).
-See [Design documentation](https://app.archdocs.io/design-docs/5850ae99-0d51-403f-9201-d9735687a000), [COMPATIBILITY.md](COMPATIBILITY.md) and
+PostgreSQL compatibility qualification.
+See [COMPATIBILITY.md](COMPATIBILITY.md) and
 [SECURITY.md](SECURITY.md).
 
-## Run using generated local fixtures
+## Fixture and native protocol reference
 
 From this crate directory:
 
@@ -220,7 +371,7 @@ Prepared task requests use the finite typed grammar documented in
 metadata or validate typed values; only Execute enters task authority. Repeated
 Execute on the same portal checks current authority and returns a fresh redacted
 decision. Durable operation IDs deduplicate mutations across native, simple and
-extended requests. See [GD-0011](https://app.archdocs.io/design-docs/4a6a02da-d8a0-4f41-8141-7c26a5e6c313).
+extended requests.
 
 ## Verification and retained evidence
 
@@ -250,7 +401,6 @@ and roll back without SQL strings. Existing scoped task operations remain
 available. See [API.md](API.md) for configuration, schemas, limits and runnable
 clients. Both listeners are disabled unless configured and reuse the existing
 mTLS bindings and shared service admission.
-See [Design documentation](https://app.archdocs.io/design-docs/5850ae99-0d51-403f-9201-d9735687a000) for the actual parent P2 row.
 
 ### Rotating credentials
 
@@ -270,7 +420,15 @@ changes still invalidate sessions.
 HTTP/gRPC also accept native language text through the `text` request arm, for
 example `{"text":{"text":"app where id=7 select id","languageVersion":"0.16"}}`.
 Optional named `bindings` use the structured operation value format. The omitted
-version defaults to CLI profile `0.1`; supported versions are `0.1`?`0.16`.
+version defaults to CLI profile `0.1`; supported versions are `0.1` through `0.16`.
 Lowered data statements and blocks share application table authorization,
 results, and retained transactions with structured operations. Catalog and
 inspection text are refused. See [API.md](API.md) for errors and wire details.
+
+## Usage from sh
+
+From the repository root:
+
+```sh
+cargo run --manifest-path crates/giggles-server/Cargo.toml -- --dev --data DIR --port 5432
+```

@@ -1,5 +1,11 @@
 # Boulder Brand Kit
 
+Vector logos and mascots for GigglesDB, Skedaddle and Nunya contributors.
+
+**Status:** Includes editable SVG logos, transparent variants and icons; no installable font is included.
+
+Part of [GigglesDB](../README.md).
+
 Products: GigglesDB, Skedaddle, Nunya
 
 ## Primary files

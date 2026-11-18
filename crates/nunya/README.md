@@ -4,7 +4,15 @@
 
 # Nunya
 
+Nunya gives AI agents a separate database entry point that replaces protected values with session-scoped tokens. Applications keep their existing direct database connections and drivers.
+
+**Status:** Supports policy-controlled agent routes; agents must be isolated from direct database access and unmarked columns remain unprotected.
+
+Part of the GigglesDB project: [GigglesDB](../../README.md).
+
 Nunya is a separate database entry point for AI agents. Applications keep their existing direct database connections, connection strings and drivers. Agents use their own endpoint and access-session credentials; Nunya connects upstream with its own least-privilege role (`[upstream] user`) and replaces protected values with session-scoped tokens. Agents can carry tokens between approved columns without seeing the underlying values. Masked columns return a placeholder or SQL NULL. Unanalysable operations fail closed.
+
+## Service behavior
 
 `nunya serve --config <path>` starts the configured routes and snapshot refresh; the service also starts the admin endpoint. Upstream TLS supports `disable`, `require` (encrypted, accepts any certificate), and `verify-full` (hostname verification against `ca_file` as the only trust root). Set `upstream.dialect` to `postgres` (default) or `spanner-pg` for Google PGAdapter. `max_connections` defaults to 256 and permits 1 through 10000 concurrent agent connections. Admin `POST /reload`, Unix SIGHUP and optional `policy_watch_ms` (100 through 3600000) re-read the config first, then attempt policy files independently; file watches wait for two identical consecutive changed reads, and a policy watch also re-reads config. Invalid config reloads apply nothing; restart-only changes are ignored with warnings while reloadable settings apply, preserving tokens, counters and valid sessions. Check the config and per-route policy outcomes in `GET /status`, including `restart_pending`, rather than relying on the reload response; see [reloadable and restart-only settings](site/docs/configuration.html#reload). Failed or unsafe snapshot refreshes retain the old snapshot until its age causes NY008 refusals. Ctrl-C or SIGTERM stops accepting and allows sessions up to 30 seconds to drain.
 
@@ -12,7 +20,7 @@ Nunya is a separate database entry point for AI agents. Applications keep their 
 
 Agents must have no direct route to the database. Enforce this with network isolation and keep upstream credentials away from agents. Nunya does not protect against someone holding the database's own credentials. Unmarked columns are not protected. Counts of shared values remain visible, including equality relationships within a token domain and scope. Protect principal and session secrets, root keys, state files and logs using filesystem permissions. Plaintext mode is only appropriate on a trusted local network.
 
-## Quickstart
+## Quick start
 
 Deploy once, provision a principal, then connect through an access session. The [site quickstart](site/docs/quickstart.html) has the complete local PostgreSQL configuration and Windows instructions. [Concepts](site/docs/concepts.html), [configuration](site/docs/configuration.html) and [CLI reference](site/docs/cli.html) explain scope continuity, lifetime settings and commands.
 

@@ -1,10 +1,16 @@
 # giggles-export
 
+A logical relational export and fresh-import library and CLI for trusted local database owners.
+
+**Status:** Uses the bounded `giggles-logical-v1` format; it is not a physical backup or an unbounded migration tool.
+
+Part of [GigglesDB](../../README.md).
+
 Local trusted-owner logical relational export and fresh import, format `giggles-logical-v1`.
 This standalone Rust crate uses the public core `Admin`, `SqlSession`, catalog and `Scan` APIs.
 
 ```powershell
-$env:CARGO_TARGET_DIR='K:\Projects\gigglesdb\crates\giggles-export\target-export'
+$env:CARGO_TARGET_DIR='crates\giggles-export\target-export'
 $env:CARGO_BUILD_JOBS='1'
 cargo run --manifest-path crates/giggles-export/Cargo.toml -j1 -- export SOURCE_DIRECTORY output.jsonl
 cargo run --manifest-path crates/giggles-export/Cargo.toml -j1 -- verify output.jsonl
@@ -87,3 +93,11 @@ Physical backup/restore remains in `giggles-ops`. This crate makes no operationa
 Scylla compatibility, real-source migration, distributed-cut, cloud, performance, security or production
 qualification claim. PostgreSQL CONTROL remains deferred. Checksums detect corruption, not hostile
 replacement, and output contains plaintext application data under host filesystem permissions.
+
+## Usage from sh
+
+From the repository root:
+
+```sh
+cargo run --manifest-path crates/giggles-export/Cargo.toml -- verify output.jsonl
+```

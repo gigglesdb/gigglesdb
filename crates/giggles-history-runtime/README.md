@@ -1,33 +1,19 @@
 # giggles-history-runtime
 
-> **Retired target.** This harness drove the `giggles-node` replication
-> prototype (`crates/giggles-consensus`), which was removed after R4's exit
-> evidence (GD-0074 Phase 8). Its process test was removed with it. Replicated
-> `giggles-server` histories are captured and checked by
-> `crates/giggles-server/tests/replication_history.rs` with `giggles-history`;
-> see [the replication release notes](../../docs/release-notes/R4.md). The
-> library is kept for reference and history tooling reuse; it has no runnable
-> target binary on main.
+An archived capture harness for contributors studying the former three-node consensus prototype.
 
-Independent external capture harness for the former bounded consensus runtime.
-Runs **actual three-node processes**, with distinct retained redb files and
-generated mTLS peer certificates. It links only the history checker, JSON,
-certificate generation and hashing libraries. It never imports a runtime
-evaluator or computes expected results with runtime code.
+**Status:** Retired: no runnable target binary remains; server replication histories now use giggles-history.
 
-```powershell
-# NODE_BINARY was a giggles-node build from an older commit (before GD-0074 Phase 8).
-cargo run --manifest-path crates/giggles-history-runtime/Cargo.toml -j 2 -- PATH/TO/giggles-node.exe crates/giggles-history-runtime/artifacts 42
-```
+Part of [GigglesDB](../../README.md).
 
-The CLI takes `NODE_BINARY ARTIFACT_PARENT SEED`. Each run creates a unique
-retained directory and returns one JSON summary. Exit 0 requires checker PASS
-and all runtime checks pass and all three negative controls FAIL; exit 1 means
-the original checker or an observed runtime assertion FAIL; exit 2 means
-INCONCLUSIVE, including execution errors; exit 64 means invalid invocation.
-An execution error is recorded as INCONCLUSIVE in `error.json`, never PASS.
-No existing artifact is overwritten or removed. Generated keys are local test
-credentials, retained with their isolated configuration.
+> **Retired.** The former replication prototype and its process test were removed.
+> Server histories are now captured by `crates/giggles-server/tests/replication_history.rs`
+> and checked with `giggles-history`; see [replication release notes](../../docs/release-notes/R4.md).
+> The library remains for reference and tooling reuse.
+
+## Archived internals
+
+The following describes the former harness, not a runnable CLI on main.
 
 The public Rust entry point is
 `run(binary: &Path, artifact_parent: &Path, seed: u64) -> Result<Value, Box<dyn Error + Send + Sync>>`.
@@ -123,4 +109,4 @@ cargo doc --manifest-path crates/giggles-history-runtime/Cargo.toml -j 2 --no-de
 
 The process integration test, which built `giggles-node` from
 `crates/giggles-consensus` and ran the harness CLI for seeds 42 and 43, was
-removed with the prototype (GD-0074 Phase 8).
+removed with the prototype.

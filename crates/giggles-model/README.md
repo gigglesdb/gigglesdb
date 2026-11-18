@@ -1,12 +1,13 @@
-# GigglesDB P0 reference model
+# giggles-model
 
-Standalone, dependency-free Rust executable specification for bounded agent
-repairs. Phase [GD-0003](https://app.archdocs.io/design-docs/fa315680-4e33-4a5a-b764-99e502cea333)
-implements the assigned reference-model portion of
-[GD-0001](https://app.archdocs.io/design-docs/5850ae99-0d51-403f-9201-d9735687a000).
+A standalone, dependency-free Rust reference model for contributors testing bounded agent repairs.
+
+**Status:** An in-memory serial oracle; storage, SQL, networking and production authentication are outside its scope.
+
+Part of [GigglesDB](../../README.md).
 
 ```powershell
-cd K:/Projects/gigglesdb/crates/giggles-model
+cd crates/giggles-model
 cargo test --all-targets
 cargo run --example p0
 cargo run --example p0 -- --histories
@@ -126,14 +127,14 @@ preview issuance conservatively enforce monotonic time and `[valid_from,expires)
 `Uncertain` fails closed. This models an ordering/fencing rule, not a proof of
 wall-clock behavior under pauses or clock skew. No production expiry claim.
 
-## Histories, checker and P1 replay
+## Histories and checker replay
 
 `fixtures::golden_histories()` returns five `GoldenHistory` values:
 permitted, unsafe-query, stale-preview, ambiguous-retry, lifetime-budget.
 Each contains `{name,domain,events: Vec<Event>,final_state: Snapshot,transcript}`.
 `tests/fixtures/golden.txt` is the fixed transcript expectation. The example can
 emit the complete typed histories as deterministic Rust Debug text for inspection;
-that text is not a stable interchange format. P1 can depend on this crate by path
+that text is not a stable interchange format. Other tools can depend on this crate by path
 and consume its public typed fixtures directly.
 
 `Event` grammar: `Put(Key,Row)`, `Grant(Grant)`, `Revoke(TaskId)`, `Schema(epoch)`,
@@ -155,7 +156,9 @@ It treats trusted setup/approval events as witnesses and does not prove their
 real-world authorization or audit authenticity. It checks successful decision
 times; it does not reconstruct hidden preview time advancement. It preserves
 rejections without claiming each denial was necessary. It has no concurrent
-invocation/completion linearizability search. ## Ledger model
+invocation/completion linearizability search.
+
+## Ledger model
 
 `ledger::Ledger` is separate from repairs; there is no claim that calling both
 models forms one transaction. An instance represents one ledger/asset with

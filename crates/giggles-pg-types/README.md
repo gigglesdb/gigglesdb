@@ -1,6 +1,10 @@
 # giggles-pg-types
 
-Standalone representation foundation for DD68; this crate exposes no core/persisted values.
+PostgreSQL-style numeric, floating-point and temporal representations for Rust callers.
+
+**Status:** Provides bounded standalone type APIs; these checks do not establish complete engine, persistence or wire compatibility.
+
+Part of [GigglesDB](../../README.md).
 
 `Numeric::parse`, `Display`, `scale`, `Ord`/`Eq`, `to_binary`/`from_binary`,
 `checked_add/sub/mul/sum`, `round`, `div_at_scale` are public. Finite values use
@@ -63,4 +67,3 @@ docker rm -f dd68-pgtypes-oracle
 The live test checks actual image identity and server_version_num=180000 before
 comparing 109 numeric text/binary, 300 arithmetic, 25 rounding, 18 float text/binary and 4 float
 range errors. The ordinary suite has four properties with 1024 cases each.
-

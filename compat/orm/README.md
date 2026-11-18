@@ -1,16 +1,20 @@
-# ORM qualification
+# orm
+
+A compatibility harness for contributors comparing ORM migrations and model operations against PostgreSQL.
+
+**Status:** Exercises bounded Django, SQLAlchemy, Rails and Prisma samples; numeric and timestamp indexes are excluded.
+
+Part of [GigglesDB](../../README.md).
 
 Requires Docker Linux containers and a default-feature `giggles-server` binary.
 From the repository root:
 
 ```powershell
-python -I compat/orm/run.py --server-bin J:/gigglesdb-work/p1-orm/target/debug/giggles-server.exe --orm all
+python -I compat/orm/run.py --server-bin <work-dir>/target/debug/giggles-server.exe --orm all
 ```
 
 Select `django`, `sqlalchemy`, `rails` or `prisma` for one lane; `all` runs all four.
-Output defaults to unique directories
-under `J:/gigglesdb-work/p1-orm/runs`; `--out-root` must remain under
-`J:/gigglesdb-work`. Reports contain the immutable client image ID, installed
+Output defaults to unique directories in the script's fixed Windows work root. Use `--out-root` to choose a directory within that root. Reports contain the immutable client image ID, installed
 versions, binary SHA-256, per-step results and captured SQL/parameters/SQLSTATEs.
 Exit 0 means every selected step passed; exit 1 includes product or infrastructure
 failures. A forward migration failure marks model steps FAIL/blocked; no alternate

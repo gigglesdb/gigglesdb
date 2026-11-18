@@ -1,4 +1,10 @@
-# IntelliJ runs
+# scripts
+
+Development and verification scripts for GigglesDB contributors, including shared IntelliJ run configurations.
+
+**Status:** Provides Windows and macOS workflows; local rehearsals do not qualify production availability.
+
+Part of [GigglesDB](../README.md).
 
 Open the repository root in IntelliJ IDEA. The shared `.run` configurations appear
 in **Run > Edit Configurations** and the run selector, grouped by purpose. Enable
@@ -40,7 +46,7 @@ previous databases or artifacts. All generated credentials are local development
 fixtures, not deployment credentials.
 
 The current setup is recorded in `<work>/current.json` (Windows defaults to
-`J:/gigglesdb-work/ide`; macOS defaults to `~/gigglesdb-work/ide`). Its `config` field
+the script's fixed Windows work directory, selected with `-Work`; macOS defaults to `~/gigglesdb-work/ide`). Its `config` field
 points to the server configuration; its `fixture` field contains the client PEM
 files. The generated `query.json` can be edited to send a different native SQL
 request. Authorization is limited to the fixture's `app` table. Server startup

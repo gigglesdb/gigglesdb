@@ -1,4 +1,10 @@
-# UUID foundation (PostgreSQL 18.0)
+# giggles-pg-uuid
+
+A UUID representation, parser, formatter and PostgreSQL-style extraction and hashing library for Rust callers.
+
+**Status:** Standalone API tested against PostgreSQL 18.0; generation and hashing limits are described below.
+
+Part of [GigglesDB](../../README.md).
 
 Standalone crate; its own Cargo.lock and workspace. Stable initial API is in src/lib.rs:
 Uuid ([u8;16]), FromStr/Display, from_bytes/to_binary/from_binary,
@@ -20,13 +26,20 @@ No floating point conversion occurs in extraction or the oracle comparator.
 
 ## Verification
 Run from repository root:
-  cargo test --manifest-path crates/giggles-pg-uuid/Cargo.toml --target-dir target-dd68-uuid
-Opt-in Docker oracle (image must already be local):
-  cargo test --manifest-path crates/giggles-pg-uuid/Cargo.toml --target-dir target-dd68-uuid -- --include-ignored
-  cargo fmt --manifest-path crates/giggles-pg-uuid/Cargo.toml -- --check
-  cargo clippy --manifest-path crates/giggles-pg-uuid/Cargo.toml --target-dir target-dd68-uuid --all-targets -- -D warnings
 
-tests/conformance.rs is the stable executable oracle manifest. Seed:
+```sh
+cargo test --manifest-path crates/giggles-pg-uuid/Cargo.toml --target-dir target-dd68-uuid
+```
+
+Opt-in Docker oracle (image must already be local):
+
+```sh
+cargo test --manifest-path crates/giggles-pg-uuid/Cargo.toml --target-dir target-dd68-uuid -- --include-ignored
+cargo fmt --manifest-path crates/giggles-pg-uuid/Cargo.toml -- --check
+cargo clippy --manifest-path crates/giggles-pg-uuid/Cargo.toml --target-dir target-dd68-uuid --all-targets -- -D warnings
+```
+
+`tests/conformance.rs` is the stable executable oracle manifest. Seed:
 0xdd68956218000001; 768 generated UUIDs + 2 raw extremes + 4 v1/v7 endpoints.
 Version/variant dimensions vary independently. Exact SQL and comparators are
 retained there. Binary receive uses real PostgreSQL binary COPY framing.

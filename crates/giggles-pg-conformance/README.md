@@ -1,4 +1,10 @@
-# Actual PostgreSQL driver conformance
+# giggles-pg-conformance
+
+A command-line runner for PostgreSQL driver probes against owned server processes and copies of an offline test fixture.
+
+**Status:** Checks the executed client cases; it does not certify full IDE or PostgreSQL compatibility.
+
+Part of [GigglesDB](../../README.md).
 
 This standalone Rust CLI runs checked-in asserting probes against **its own**
 server processes and copies of an explicitly supplied, offline TEST fixture.
@@ -26,7 +32,7 @@ with the `app` client certificate bound to `app` only. Reserved test IDs are
 An existing server network test generates this contract:
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'K:/Projects/gigglesdb/target-gd48-conformance'
+$env:CARGO_TARGET_DIR = 'target-gd48-conformance'
 cargo test --locked --manifest-path crates/giggles-server/Cargo.toml -j1 --test network executable_server_starts_and_native_client_connects -- --exact --nocapture
 ```
 
@@ -41,14 +47,14 @@ Example manifest (replace fixture and version hashes with actual values):
 
 ```json
 {
-  "server": "K:/Projects/gigglesdb/target-datagrip/debug/giggles-server.exe",
-  "fixture": "K:/Projects/gigglesdb/crates/giggles-server/artifacts/network-fixture-EXACT",
-  "server_config": "K:/Projects/gigglesdb/crates/giggles-server/artifacts/network-fixture-EXACT/server.TEST-ONLY.json",
-  "config_base": "K:/Projects/gigglesdb/crates/giggles-server",
-  "output": "K:/Projects/gigglesdb/crates/giggles-pg-conformance/artifacts/run-UNIQUE",
-  "java": "C:/Program Files/Eclipse Adoptium/jdk-21.0.7.6-hotspot/bin/java.exe",
-  "javac": "C:/Program Files/Eclipse Adoptium/jdk-21.0.7.6-hotspot/bin/javac.exe",
-  "jdbc_jar": "C:/Users/beach/AppData/Roaming/JetBrains/DataGrip2026.2/jdbc-drivers/PostgreSQL/42.7.3/org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar",
+  "server": "/absolute/path/to/target-datagrip/debug/giggles-server.exe",
+  "fixture": "/absolute/path/to/repo/crates/giggles-server/artifacts/network-fixture-EXACT",
+  "server_config": "/absolute/path/to/repo/crates/giggles-server/artifacts/network-fixture-EXACT/server.TEST-ONLY.json",
+  "config_base": "/absolute/path/to/repo/crates/giggles-server",
+  "output": "/absolute/path/to/repo/crates/giggles-pg-conformance/artifacts/run-UNIQUE",
+  "java": "/absolute/path/to/jdk/bin/java.exe",
+  "javac": "/absolute/path/to/jdk/bin/javac.exe",
+  "jdbc_jar": "/absolute/path/to/postgresql-42.7.3.jar",
   "timeout_seconds": 90
 }
 ```
@@ -59,7 +65,7 @@ Omit Java paths to record JDBC as UNTESTED. The pgJDBC runtime version must be
 exactly 42.7.3; tokio-postgres is locked to 0.7.15 in Cargo.lock.
 
 ```powershell
-cargo run --locked --manifest-path crates/giggles-pg-conformance/Cargo.toml --target-dir target-gd48-conformance -j1 -- K:/absolute/manifest.json
+cargo run --locked --manifest-path crates/giggles-pg-conformance/Cargo.toml --target-dir target-gd48-conformance -j1 -- /absolute/path/manifest.json
 cargo test --locked --manifest-path crates/giggles-pg-conformance/Cargo.toml --target-dir target-gd48-conformance -j1
 cargo clippy --locked --manifest-path crates/giggles-pg-conformance/Cargo.toml --target-dir target-gd48-conformance -j1 --all-targets -- -D warnings
 cargo fmt --manifest-path crates/giggles-pg-conformance/Cargo.toml --check

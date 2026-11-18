@@ -1,4 +1,10 @@
-# giggles-sql
+# giggles-cli
+
+The `giggles-sql` command provides embedded SQL sessions, JSON/table output and a small REPL for local database owners.
+
+**Status:** Opens databases through trusted local Admin authority; it does not provide remote access or task authentication.
+
+Part of [GigglesDB](../../README.md).
 
 A bounded embedded SQL CLI with a persistent session, JSON/table output and a
 small REPL. It opens GigglesDB directly through trusted local `Admin` authority.
@@ -138,4 +144,10 @@ Core independently enforces row/scan/SQL limits; see [SQL.md](../giggles-core/SQ
 This CLI documents and tests the common supported CRUD subset, and does not
 promise joins or SQL compatibility beyond the current core contract.
 
-Design: [GD-0028](https://app.archdocs.io/design-docs/1afb0448-e0a6-4561-8fda-dfd289322301).
+## Usage from sh
+
+From the repository root:
+
+```sh
+cargo run --manifest-path crates/giggles-cli/Cargo.toml -- --open /path/to/database --sql 'SELECT * FROM notes LIMIT 10'
+```

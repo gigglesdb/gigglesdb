@@ -1,5 +1,13 @@
 # giggles-history
 
+A Rust library and CLI for checking bounded strict serializability of ordered integer-key transaction histories. Use it to analyze synthetic or instrumented histories.
+
+**Status:** Supports a finite model and bounded search; passing results do not qualify a distributed system.
+
+Part of [GigglesDB](../../README.md).
+
+## Usage
+
 Independent Rust library and CLI for **bounded strict serializability** of
 transactional ordered integer-key histories. It imports no GigglesDB runtime,
 model, storage or transaction evaluator. Version 1 describes a finite synthetic

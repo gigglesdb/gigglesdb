@@ -1,4 +1,10 @@
-# Cluster exit evidence kit
+# cluster-exit
+
+A cluster evidence kit for contributors running fault scenarios and recording transaction histories.
+
+**Status:** Supports local and remote test clusters; requires Python 3.11+, psycopg 3 and OpenSSL.
+
+Part of [GigglesDB](../../README.md).
 
 Use Python 3.11+ with psycopg 3 and OpenSSL on PATH. Generate a local cluster:
 
@@ -35,6 +41,6 @@ credentials. The runner provides CX, OUT, REPO, PY, CHECKER, JDBC_JAR and NODES.
 Only coordinators run the remote runner. It reserves up to six of the ten
 account slots, enforces the 200-start daily cap and a TTL of at most two hours,
 collects metadata/RTTs and partial logs, then deletes its boxes. Results are
-under `J:/gigglesdb-work/boat/cluster/<utc>-<tip12>-<who>-<pid>/`.
+in the runner's fixed Windows work directory. The runner currently has no output-root flag.
 `cluster-remote-box.sh --dry-run firewall 2001:db8::1`, `--dry-run rtt
 2001:db8::1`, and `--dry-run suite` exercise parsing without a box.

@@ -1,5 +1,11 @@
 # giggles-ledger
 
+An embedded financial module for applications using GigglesDB SQL transactions without a separate service.
+
+**Status:** Supports one ledger and asset per dedicated database; distributed postings and partial captures or reversals are unsupported.
+
+Part of [GigglesDB](../../README.md).
+
 A finite, trusted embedded financial module backed by the actual durable
 GigglesDB public SQL transaction API. It requires no service. It supports one
 ledger and asset per dedicated database, immutable scale, accounts, direct
@@ -127,7 +133,7 @@ on stdin. The process emits `{"ok": ...}` or `{"error": ...}` and exits nonzero
 on error. Use a new, absent database path. PowerShell examples:
 
 ```powershell
-$env:CARGO_TARGET_DIR='K:/Projects/gigglesdb/crates/giggles-ledger/target-ledger'
+$env:CARGO_TARGET_DIR='crates/giggles-ledger/target-ledger'
 '{"command":"create","path":"C:/Temp/example-ledger.db","definition":{"ledger":"main","asset":"USD","scale":2}}' | cargo run --manifest-path crates/giggles-ledger/Cargo.toml --bin giggles-ledger
 '{"command":"account","path":"C:/Temp/example-ledger.db","definition":{"id":"mint","rule":"Unrestricted","max_credit":null}}' | cargo run --manifest-path crates/giggles-ledger/Cargo.toml --bin giggles-ledger
 '{"command":"account","path":"C:/Temp/example-ledger.db","definition":{"id":"alice","rule":"DebitsMayNotExceedCredits","max_credit":null}}' | cargo run --manifest-path crates/giggles-ledger/Cargo.toml --bin giggles-ledger

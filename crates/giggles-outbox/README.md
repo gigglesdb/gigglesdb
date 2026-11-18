@@ -1,12 +1,20 @@
 # giggles-outbox
 
+A local outbox for applications that need SQL mutations and queued effects to commit together.
+
+**Status:** Supports bounded trusted local transactions; it never sends notifications, email or webhooks.
+
+Part of [GigglesDB](../../README.md).
+
 A bounded trusted local outbox backed by real `giggles-core` SQL transactions.
 Application mutations and enqueue commit together. The library and CLI never
 send notifications, email, webhooks, or other external effects.
 
+## Quick start
+
 ```powershell
-$env:CARGO_TARGET_DIR='K:/Projects/gigglesdb/crates/giggles-outbox/target-outbox'
-cargo run --manifest-path crates/giggles-outbox/Cargo.toml -j2 --example orders -- C:/scratch/fresh-orders-db
+$env:CARGO_TARGET_DIR='<work-dir>/target'
+cargo run --manifest-path crates/giggles-outbox/Cargo.toml -j2 --example orders -- <work-dir>/fresh-orders-db
 ```
 
 The example creates an order and its notification in one transaction, reopens the

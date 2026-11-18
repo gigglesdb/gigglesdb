@@ -1,14 +1,22 @@
-# GigglesDB local TCP fault proxy
+# giggles-faultlab
+
+A local TCP fault proxy for contributors testing connection failures. It can delay, partition, disconnect and restore opaque byte streams.
+
+**Status:** Supports bounded local fault simulations; it does not establish production availability or security.
+
+Part of [GigglesDB](../../README.md).
 
 This standalone crate is a bounded, opaque byte-stream TCP proxy for local fault
 rehearsals: delay, partition, disconnect and restore, per direction, with a
 retained event trace. Put one in front of a listener to isolate or degrade a
 connection without killing the process behind it.
 
+## Details
+
 It used to also drive a three-process rehearsal against the `giggles-node`
 replication prototype through the `giggles-client` task SDK (`run`/`check`
 binary, `lab`, `report` and node-process control). That prototype and its SDK
-were retired after R4's exit evidence (GD-0074 Phase 8), so only the proxy
+were retired, so only the proxy
 remains. Replicated `giggles-server` failover is exercised by
 `crates/giggles-server/tests/replication_process.rs`, and
 `crates/giggles-server/tests/replication_partition_process.rs` puts one proxy

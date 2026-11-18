@@ -1,4 +1,10 @@
-# PostgreSQL catalog queries
+# giggles-pg-catalog
+
+A read-only PostgreSQL metadata query evaluator for adapters that supply an authorized catalog snapshot.
+
+**Status:** Supports a bounded metadata query profile and table-free SELECTs; it does not open databases or read application rows.
+
+Part of [GigglesDB](../../README.md).
 
 This library evaluates a bounded, read-only PostgreSQL metadata query profile.
 It does not open a database or access application rows. Callers supply a coherent

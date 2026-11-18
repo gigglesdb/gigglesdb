@@ -1,4 +1,10 @@
-# ICU 76.1 runtime
+# icu
+
+Runtime provisioning scripts for contributors and distributors who need the pinned ICU collation libraries.
+
+**Status:** Requires exactly ICU 76.1.0.0; supports Windows binaries and Linux x86_64 source builds.
+
+Part of [GigglesDB](../../README.md).
 
 Run `bash scripts/icu/provision.sh`; the loader finds its cache automatically.
 Set `GIGGLES_ICU_DIR` to its output to require that installation exclusively.
@@ -9,7 +15,7 @@ install a C/C++ toolchain, make, curl, CA certificates and tar first. ICU build
 tools remain enabled because disabling tools also disables the full data build.
 
 The SHA-256-pinned downloads install below `$GIGGLES_ICU_CACHE`, defaulting to
-`J:/gigglesdb-work/icu` on Windows or
+the script's fixed Windows cache directory (override with `GIGGLES_ICU_CACHE`) or
 `${XDG_CACHE_HOME:-$HOME/.cache}/gigglesdb-icu` on Linux. Its `76.1/windows`
 or `76.1/linux` subdirectory contains the installation. Library and
 licence hashes are checked on repeat calls. Provisioning writes only inside

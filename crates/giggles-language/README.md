@@ -1,5 +1,11 @@
 # giggles-language
 
+A parser, typed AST, adapter and local CLI for the GigglesDB native language. Rust embedders can lower native requests directly into the shared typed operation engine.
+
+**Status:** Provides explicitly versioned, bounded language profiles; local Admin and filesystem owners are trusted.
+
+Part of [GigglesDB](../../README.md).
+
 `embedded-trusted-native-0.1` is a finite trusted embedded native language over
 `giggles-core`'s common typed operation engine, durable catalog and explicit
 transactions. Native text and typed ASTs lower directly into engine requests;
@@ -183,7 +189,7 @@ From the repository root in PowerShell:
 
 ```powershell
 $env:CARGO_BUILD_JOBS='1'
-$env:CARGO_TARGET_DIR='K:/Projects/gigglesdb/crates/giggles-language/target-native'
+$env:CARGO_TARGET_DIR='crates/giggles-language/target-native'
 cargo build --manifest-path crates/giggles-language/Cargo.toml -j1
 $cli='crates/giggles-language/target-native/debug/giggles-language.exe'
 & $cli capabilities
@@ -227,7 +233,7 @@ trusted embedded deployment and feature. `implemented` names executable checks;
 `rejected` names requests or typed-tree combinations that must fail before
 effects; `unverified` makes no qualification claim. These test references are
 not release attestations. The manifest publishes actual admission limits and
-pins all six GD-0042 reference revisions. It does not advertise proposed native
+pins all six  reference revisions. It does not advertise proposed native
 v1, PostgreSQL 18 compatibility, server support or performance guarantees.
 Unavailable text syntax has no corresponding Rust tree variant unless an
 explicit tree rejection entry describes it.
@@ -959,7 +965,7 @@ count columns, and neither is a row count. `describe table name` returns the exa
 primary-key indexes. SQL-created `SmallInt` columns remain `SmallInt`. Names use
 the existing canonical lowercase ASCII identifier rules; 0.12 also accepts
 canonical backtick names. Qualified names and table-name parameters are not
-part of this slice. A missing table returns `Bind("table")`.
+part of this profile. A missing table returns `Bind("table")`.
 
 Every catalog result contains `contract_version`, `database_domain`,
 `catalog_epoch`, `complete` and `result` (`Tables` or `Table`). The Rust domain is
@@ -1036,7 +1042,6 @@ The script runs formatting, Clippy, debug/release tests and rustdoc tests with
 one build job, records output and tool versions, and compares input hashes
 before and after the run. Choose a fresh artifact directory; the script keeps
 its evidence and test databases for review.
-
 
 ## Explicit trusted native 0.13 static explain
 

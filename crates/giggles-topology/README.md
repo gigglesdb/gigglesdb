@@ -1,9 +1,17 @@
 # giggles-topology
 
+A Rust library and CLI for contributors analyzing declared topology, placement and dependencies under failures.
+
+**Status:** Supports static, bounded topology analysis; reports do not prove actual availability or safe membership transitions.
+
+Part of [GigglesDB](../../README.md).
+
 A standalone Rust library and CLI for bounded, versioned declarative topology analysis.
 It evaluates static full-data memberships, placement policy, declared dependency paths,
 and optional supplied additive capacity under domain failures. Reports do not prove
 actual availability, independence, durability, recovery time, or safe membership transitions.
+
+## Quick start
 
 ```powershell
 cargo run --manifest-path crates/giggles-topology/Cargo.toml -- validate crates/giggles-topology/tests/fixtures/three-providers.json

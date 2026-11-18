@@ -1,20 +1,17 @@
-Current P2 continuation: storage writes format 3 until the first native once
-receipt adopts format 4 and namespace 7. Remote task disclosure requires
-explicit trusted cumulative accounting provisioning. See
-[task accounting](../giggles-server/TASK_ACCOUNTING.md). The original embedded
-repair interfaces below retain their trusted P0 model; historical format-1 details
-are superseded by format-2 relational, format-3 accounting and optional format-4
-native outcome extensions. Replica/protected paths reject native outcome state.
+# giggles-core
 
-# GigglesDB durable embedded core (P1 safety slice)
+The embedded database engine for Rust applications using SQL, typed operations, or local administrative APIs.
 
-Standalone Rust crate; phase [GD-0002](https://app.archdocs.io/design-docs/f386f1a9-661e-4d62-9d03-8a51e050ebe6).
-No remote, push,
-release, production, cloud, comparative or general SQL compatibility claim.
-P0 is a **dev-only** dependency. Runtime policy code never invokes `Model`.
+**Status:** Supports legacy and v2 storage engines; capabilities and limits depend on the engine and API.
+
+Part of [GigglesDB](../../README.md).
+
+## Quick start
+
+From the repository root:
 
 ```powershell
-cd K:/Projects/gigglesdb/crates/giggles-core
+cd crates/giggles-core
 cargo run --bin giggles -- demo artifacts/my-new-demo
 cargo run --bin giggles -- inspect artifacts/my-new-demo
 cargo run --bin giggles -- export artifacts/my-new-demo artifacts/my-new-export.gdb
@@ -26,7 +23,17 @@ cargo run --bin giggles -- restore artifacts/my-new-export.gdb artifacts/my-new-
 All destination directories/files must be new. No cleanup is performed. An error
 can leave an artifact; retain it and choose another path. No daemon or listener.
 
-## Integration interface
+Storage writes format 3 until the first native once receipt adopts format 4 and
+namespace 7. Remote task disclosure requires explicit trusted cumulative
+accounting provisioning; see [task accounting](../giggles-server/TASK_ACCOUNTING.md).
+Replica/protected paths reject native outcome state.
+
+## Details: embedded authority APIs
+
+The following contracts describe the legacy embedded authority profile. For
+generic SQL, see [SQL.md](SQL.md); its grammar is separate from task repair SQL.
+
+### Integration interface
 
 The [typed operation engine](OPERATIONS.md) accepts language-independent requests
 for bounded reads and guarded, capped and claim mutations. Native syntax lowers
@@ -127,7 +134,7 @@ intersection/delegation implementation exists.
 
 `policy.rs` independently enumerates/validates selected rows, transitions,
 incident bounds, exact dependencies and budgets. It is not copied Model methods.
-Public DTO/canonical request grammar began from P0 so fixtures can be converted
+Public DTO/canonical request grammar began from the reference model so fixtures can be converted
 without semantic reinterpretation. Runtime has no dependency on giggles-model.
 The evaluator reads the engine's committed records under the serialization gate,
 derives the next decision and writes records through one redb transaction.
@@ -147,7 +154,7 @@ before rows/versions, after rows and expiry. A supplied approval is checked even
 below the threshold. Predicate re-enumeration detects newly matching rows and
 removals; an ABA write increments version. Unrelated/nonmatching writes need not
 invalidate an exact set. Revoked, consumed, expired, cross-operation and stale
-approvals reject. Scope may reject before stale-preview detection, matching P0.
+approvals reject. Scope may reject before stale-preview detection, matching the reference model.
 
 Local serial locking protects full predicate sets. Default admission is 32
 in-flight calls (active plus waiting); excess calls get `Busy`. Default selected
@@ -160,7 +167,10 @@ Whole-state traversal and rewriting on each transaction are deliberate initial
 costs; no fairness, wait deadline, cancellation, scan CPU quota or disk-reserve
 claim. There is no filesystem/device power-loss qualification.
 
-## Version 1 encoding
+## Details: historical storage format 1
+
+These encoding details describe format 1. Later relational, accounting and native
+outcome extensions use storage formats 2, 3 and optionally 4.
 
 Database metadata carries format=1, domain u128, schema u64, last_time u64,
 next_approval u64 and optional restore origin. Keys are a one-byte namespace
@@ -173,7 +183,7 @@ Record values use the pinned format-1 DTO declarations and bincode 1.3 fixed-wid
 big-endian, bounded decoding with trailing bytes rejected. Enum tags are bincode
 u32 discriminants in declaration order. There are no permissive unknown tags.
 Global format=1 pins every record layout. redb's format/checksums are an additional
-storage layer, not a substitute for GigglesDB version checks. P0 request identity
+storage layer, not a substitute for GigglesDB version checks. The reference model request identity
 remains the explicit `GD-P0-REPAIR` byte-1 canonical codec, with sorted keys and
 preserved duplicate multiplicity. Operation ID is the map key, not payload bytes.
 
@@ -183,7 +193,7 @@ Verify checks total size, exact length, version, SHA256, canonical map encoding,
 namespace/key shapes, bounded typed values and authority invariants before
 returning a snapshot. Unknown or malformed input fails closed. No migration or
 salvage is attempted. The current checks do not independently prove every
-possible forged history; P0's checker/differential tests provide separate local
+possible forged history; the reference model's checker/differential tests provide separate local
 behavior evidence, not authentication of an artifact.
 
 ## Online export and fenced restore
@@ -210,11 +220,11 @@ No destructive overwrite, source fencing/promotion, replay into old authority,
 PITR or distributed reconciliation is implemented. An offline source can still
 write: coordinating source/restore deployment ownership is external to this API.
 
-## Finite SQL and CLI
+## Task repair SQL and administrative CLI
 
 Sequence `CACHE n` is stored as given, but values are allocated one at a time; PostgreSQL per-session preallocation is unsupported, so observable gaps may differ.
 
-Only these whitespace-tokenized shapes are supported (case-insensitive keywords):
+The task repair API supports only these whitespace-tokenized shapes are supported (case-insensitive keywords):
 
 ```sql
 UPDATE deliveries SET status = 'queued' WHERE tenant = 42 AND id = 0
@@ -234,7 +244,7 @@ See [LOCAL.md](LOCAL.md) for exact JSON commands and approval workflow.
 The versioned C ABI is implemented in [giggles-ffi](../giggles-ffi/README.md),
 with header, ownership contract, stable codes, bounds and an actual C client.
 
-## Verification scope and next P1 work
+## Verification and limits
 
 Tests use real redb files, retained unique directories, actual independent writer
 processes and process termination. Windows explicit durability seams use
@@ -246,25 +256,25 @@ side of the commit boundary. Tests do **not** instrument redb internal page/flus
 boundaries or cut device power. Fault hooks separately return IO errors before
 and after commit to exercise fencing and status recovery.
 
-Differential tests convert P0 DTOs, replay five public golden histories and compare
-100 deterministic seeds x100 actions with the independent P0 Model after **each**
-action. P0's independent checker verifies each completed oracle history. Seed
+Differential tests convert reference model DTOs, replay five public golden histories and compare
+100 deterministic seeds x100 actions with the independent reference model after **each**
+action. The reference model's independent checker verifies each completed oracle history. Seed
 range 0..100, LCG constants and action schedule are in tests/differential.rs;
 per-seed traces and SHA256 remain in each database directory. Debug/release run
 the same seeds and must not be counted as independent campaigns. Concurrency
 includes ten-thread last-slot, identical retry and altered-payload races. Raw
 subprocess command/stdout/stderr/status artifacts remain with each database.
 
-Unfinished P1: trusted time
+Unfinished embedded: trusted time
 source integration for a remote boundary; redacted output/disclosure accounting;
 filesystem path-alias/replacement/symlink/fork/suspend and full-disk campaigns;
 redb internal flush/torn-write/power-loss harness,
 parent-directory durability qualification; durability/platform
-qualification and installation packaging. ## Consecutive P1 interface and recovery slice
+qualification and installation packaging.
 
-[GD-0004](https://app.archdocs.io/design-docs/69c1e508-5416-4aca-87d8-71c4f791c0cf)
-and [GD-0005](https://app.archdocs.io/design-docs/973ebf6a-0989-4397-af4c-d8b5bc2a49d8)
-extend the embedded core. Exports now write/sync/readback a unique sibling staging file, then publish by
+## Details: export and recovery
+
+Exports write/sync/readback a unique sibling staging file, then publish by
 atomic no-clobber hard-link creation on the tested local filesystem. Staging
 files are intentionally retained on success and failure; do not edit hard links.
 No destination replacement or filesystem deletion occurs. Unsupported link
@@ -291,4 +301,12 @@ and CLI principal/time fields do not provide remote authentication. Production
 redaction/disclosure budgets, trusted physical time integration, issuer delegation,
 packaging and platform/durability qualification remain separate work.
 
-P1 relational continuation: see [SQL.md](SQL.md) and [GD-0006](https://app.archdocs.io/design-docs/14d046e2-cf09-4309-a392-2a12650f000e) for the trusted generic SQL/native scan subset, format2 migration and compatibility matrix. The finite task repair SQL remains separate in authority.
+See [SQL.md](SQL.md) for the trusted generic SQL/native scan subset, format2 migration and compatibility matrix. The finite task repair SQL remains separate in authority.
+
+## Usage from sh
+
+From the repository root:
+
+```sh
+cargo run --manifest-path crates/giggles-core/Cargo.toml --bin giggles -- inspect /path/to/database
+```

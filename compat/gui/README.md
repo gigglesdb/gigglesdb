@@ -1,14 +1,20 @@
-# GUI catalog qualification
+# gui
+
+A compatibility harness for contributors comparing GUI catalog requests against PostgreSQL.
+
+**Status:** Exercises pgAdmin REST requests and a DBeaver source-derived replay; it does not qualify full GUI interaction.
+
+Part of [GigglesDB](../../README.md).
 
 Run from the repository root with a prebuilt default-feature server:
 
 ```powershell
-python -I compat/gui/run.py --server-bin J:/gigglesdb-work/p1-gui/target/debug/giggles-server.exe --tool all
+python -I compat/gui/run.py --server-bin <work-dir>/target/debug/giggles-server.exe --tool all
 ```
 
 `--tool pgadmin` or `--tool dbeaver` selects one lane. Each run writes
 `report.md`, `report.json`, SQL manifests, raw JDBC observations and redacted
-server/oracle logs beneath a unique `J:/gigglesdb-work/p1-gui/runs` directory.
+server/oracle logs beneath a unique run directory in the runner's fixed Windows work root. There is currently no output-root flag.
 Exit codes: 0 = all comparisons pass, 1 = product gaps, 2 = harness/oracle error.
 Requires Docker Desktop, Python 3, and JDK 21 on PATH. No Python packages are
 installed. The server runs v2 with a fresh database and random password.

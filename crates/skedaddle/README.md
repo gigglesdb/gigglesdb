@@ -2,6 +2,12 @@
 
 # Skedaddle
 
+Skedaddle is a database migration tool with an engine-neutral coordinator and PostgreSQL-to-PostgreSQL components.
+
+**Status:** The operational runner assembles the local-filesystem backend; live PostgreSQL qualification and production readiness remain incomplete.
+
+Part of the GigglesDB project: [GigglesDB](../../README.md).
+
 Skedaddle is a database migration tool with an engine-neutral coordinator and
 PostgreSQL-to-PostgreSQL migration components. The milestone target is PostgreSQL
 16/17/18 on both endpoints, using logical replication through `pgoutput`.
@@ -9,20 +15,20 @@ S3-compatible storage, GCS and local filesystem are buffer backend choices.
 The operational CLI runner currently assembles only the local-filesystem backend.
 
 This README describes implementation boundaries and incomplete qualification.
-R3d reports the foreground local-fs runner implemented and ordinary gates passing;
+The implementation notes report the foreground local-fs runner implemented and ordinary gates passing;
 live PostgreSQL qualification was not run. Production readiness and WAL-health
 collectors remain disconnected, so the default engine cannot claim verified-ready.
 A command being present does not establish a safe live migration.
 
-## Docker harness quickstart
+## Quick start
 
 Run the existing harness from the repository root. Use a unique task directory
-under `J:/gigglesdb-work`; keep data at or below 1 GB. Docker-backed qualification
+in the script-required work root, selected with `-TaskRoot`; keep data at or below 1 GB. Docker-backed qualification
 requires Docker and the harness's pinned images. Run the disk guard first.
 These commands are operator instructions, not evidence of a completed run:
 
 ```powershell
-$taskRoot = 'J:/gigglesdb-work/skedaddle-rehearsal-<unique-run-id>'
+$taskRoot = '<work-dir>'
 crates/skedaddle/harness/run.ps1 guard -TaskRoot $taskRoot
 crates/skedaddle/harness/run.ps1 p2 -TaskRoot $taskRoot
 crates/skedaddle/harness/cleanup.ps1 -Check -TaskRoot $taskRoot
@@ -47,21 +53,21 @@ Unscoped teardown is rejected. Never prune unrelated Docker resources or remove
 another run's files. Preserve small logs/reports and remove only your task's
 regenerable bulk after its processes stop.
 
-Both PowerShell headers set `CARGO_BUILD_JOBS=4`, matching project policy.
-The run wrapper uses `<TaskRoot>/target`, except `pg-matrix`, which uses
-`J:/gigglesdb-work/gd49-target-b`. These override inherited settings.
+The run wrapper sets `CARGO_BUILD_JOBS=4` and uses `<TaskRoot>/target`
+when `CARGO_TARGET_DIR` is unset. It requires a fixed Windows work root
+and sets fixed sccache executable and cache paths.
 
 For direct Cargo work, explicitly set these variables. Use a stable target per
 track and hold the project's exclusive heavy-Cargo lock during a build/test.
 Never share a target directory between concurrent builds.
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'J:/gigglesdb-work/gd49-target-<track>'
+$env:CARGO_TARGET_DIR = '<work-dir>'
 $env:TEMP = "$taskRoot/temp"
 $env:TMP = "$taskRoot/temp"
 $env:SKEDADDLE_TEST_ROOT = "$taskRoot/test-root"
-$env:RUSTC_WRAPPER = 'J:/gigglesdb-work/tools/bin/sccache.exe'
-$env:SCCACHE_DIR = 'J:/gigglesdb-work/sccache-cache'
+$env:RUSTC_WRAPPER = '<sccache-executable>'
+$env:SCCACHE_DIR = '<work-dir>/sccache-cache'
 $env:SCCACHE_CACHE_SIZE = '100G'
 $env:CARGO_INCREMENTAL = '0'
 $env:CARGO_BUILD_JOBS = '4'
@@ -104,7 +110,7 @@ example outside the source checkout before using `skedaddle check`.
   "buffer": {
     "backend": {
       "type": "local-fs",
-      "options": { "path": "J:/gigglesdb-work/example-migration/buffer" }
+      "options": { "path": "<work-dir>" }
     },
     "manifest_put": "create-only"
   },
@@ -275,7 +281,7 @@ A declared procedure is not evidence of qualified reverse replication.
 
 ## CLI and JSON outcomes
 
-P12b reports the command tree; R3d subsequently wires the local-fs foreground
+The CLI exposes the command tree and wires the local-fs foreground
 runner. Use an explicit absolute `--state-root`. `--definition` must validate
 and match the committed definition (or the positional check/init definition).
 Init uses the first 24 hex characters of the definition digest as migration ID.
@@ -310,7 +316,7 @@ and other exact field names are unverified in the permitted excerpts.
 | Exit | Outcome / interpretation |
 |---|---|
 | 0 | `success` |
-| 1 | Undocumented in current P12b table; do not rely on the old input-error meaning. |
+| 1 | Undocumented in current documented exit-code table; do not rely on the old input-error meaning. |
 | 2 | `blocked` |
 | 3 | `invalid-input` |
 | 4 | `illegal-transition` |
@@ -368,7 +374,7 @@ Resume requires fresh-epoch handling and rejects a replacement-owner conflict;
 do not infer durable Paused from unavailable journal writes.
 E4b's final acceptance was blocked by a
 shared runner edit, and its live PG receipt-retention qualification was not run.
-R3d subsequently reports retention integrated, not a new live retention campaign.
+The implementation notes report retention integrated, not a new live retention campaign.
 
 WAL retention is separate from buffer GC. A stalled slot can retain source WAL.
 Configured budgets do not prove healthy retention or server headroom. Production
@@ -409,7 +415,7 @@ Filtering decoded output does not prove excluded bytes never crossed the connect
 
 Require TLS and an explicit CA reference on every connection. Trust errors stop
 work. Trust summaries expose configuration/reference kind, not CA identifiers or
-certificate verification. R3b reports recursive CA-reference redaction in CLI
+certificate verification. The implementation notes report recursive CA-reference redaction in CLI
 output; committed journal references remain digest-bound. Secret **values** must
 never enter journal, local state or diagnostics.
 
