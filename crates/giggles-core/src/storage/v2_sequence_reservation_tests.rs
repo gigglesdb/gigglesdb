@@ -1033,3 +1033,157 @@ fn cancelled_receiver_restores_oldest_ack() {
     assert_eq!(scalar(&mut s, "SELECT setval('cancelled_ack',5,false)"), 5);
     assert_eq!(scalar(&mut s, "SELECT nextval('cancelled_ack')"), 5);
 }
+
+// Each mode is also run alone, so one durable writer cannot mask another mode.
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn unsettled_crash_worker() {
+    let Some(path) = std::env::var_os("UNSETTLED_CRASH_PATH") else { return };
+    let path = PathBuf::from(path);
+    let mode: usize = std::env::var("UNSETTLED_CRASH_MODE").unwrap().parse().unwrap();
+    let admin = Admin::open(&path, Limits::default()).unwrap();
+    let workers: Vec<_> = (0..if mode == 4 { 4 } else { 1 }).map(|lane| {
+        let admin = admin.clone();
+        thread::spawn(move || {
+            let mut s = admin.sql_session();
+            let mut seen = 0;
+            for n in 0..80 {
+                let which = if mode == 4 { (n + lane) % 4 } else { mode };
+                let value = match which {
+                    0 => scalar(&mut s, "INSERT INTO exposed(payload) VALUES (1) RETURNING id"),
+                    1 => scalar(&mut s, "SELECT nextval('exposed_id_seq')"),
+                    2 => {
+                        run(&mut s, "BEGIN");
+                        seen = seen.max(scalar(&mut s, "SELECT nextval('exposed_id_seq')"));
+                        let v = scalar(&mut s, "INSERT INTO exposed(payload) VALUES (2) RETURNING id");
+                        run(&mut s, "ROLLBACK");
+                        v
+                    }
+                    _ => {
+                        run(&mut s, "BEGIN");
+                        let payload = 1000 + lane * 100 + n;
+                        run(&mut s, &format!("INSERT INTO exposed(payload) VALUES ({payload})"));
+                        let v = scalar(&mut s, &format!("SELECT id FROM exposed WHERE payload={payload}"));
+                        run(&mut s, "ROLLBACK");
+                        v
+                    }
+                };
+                seen = seen.max(value);
+            }
+            seen
+        })
+    }).collect();
+    let seen = workers.into_iter().map(|w| w.join().unwrap()).max().unwrap();
+    std::fs::write(path.join("client-seen"), seen.to_string()).unwrap();
+    crate::storage::crash_now();
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn abrupt_crash_never_reissues_exposed_unsettled_values() {
+    for mode in 0..5 {
+        let mut f = Fixture::new(Engine::V2);
+        run(&mut f.session(), "CREATE TABLE exposed(id bigserial PRIMARY KEY, payload integer)");
+        f.admin.take();
+        let output = Command::new(std::env::current_exe().unwrap()).args([
+            "--exact", "storage::v2_sql::sql_sequences::reservation_tests::unsettled_crash_worker",
+            "--nocapture",
+        ]).env("UNSETTLED_CRASH_PATH", &f.path)
+            .env("UNSETTLED_CRASH_MODE", mode.to_string()).output().unwrap();
+        assert_eq!(output.status.code(), Some(86), "mode {mode}: {output:?}");
+        let seen: i64 = std::fs::read_to_string(f.path.join("client-seen")).unwrap().parse().unwrap();
+        f.reopen();
+        let mut s = f.session();
+        for _ in 0..80 {
+            assert!(scalar(&mut s, "SELECT nextval('exposed_id_seq')") > seen, "mode {mode}");
+        }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn deferred_insert_avoids_coverage_wait_but_exposed_select_waits() {
+    use std::{sync::mpsc, time::{Duration, Instant}};
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE TABLE fast(id bigserial PRIMARY KEY, payload integer)");
+    scalar(&mut s, "SELECT nextval('fast_id_seq')");
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+    db.sequencer.gate_counter_acks(true);
+    let admin = f.admin.as_ref().unwrap().clone();
+    let (tx, rx) = mpsc::channel();
+    let (release, proceed) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut s = admin.sql_session();
+        run(&mut s, "BEGIN");
+        // Cross durable coverage (33) and reuse the queued reservation at 35.
+        for _ in 0..34 { run(&mut s, "INSERT INTO fast(payload) VALUES (1)"); }
+        tx.send(()).unwrap();
+        proceed.recv().unwrap();
+        run(&mut s, "COMMIT");
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while db.sequencer.held_counter_acks() == 0 {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    let completed = rx.recv_timeout(Duration::from_secs(10));
+    let admin = f.admin.as_ref().unwrap().clone();
+    let (tx, done) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut s = admin.sql_session();
+        run(&mut s, "BEGIN");
+        tx.send(scalar(&mut s, "SELECT nextval('fast_id_seq')")).unwrap();
+        run(&mut s, "ROLLBACK");
+    });
+    assert!(done.recv_timeout(Duration::from_millis(200)).is_err());
+    assert!(db.sequencer.held_counter_acks() > 0);
+    db.sequencer.gate_counter_acks(false);
+    release.send(()).unwrap();
+    worker.join().unwrap();
+    reader.join().unwrap();
+    completed.unwrap();
+    assert_eq!(done.recv_timeout(Duration::from_secs(10)).unwrap(), 36);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn deferred_coverage_survives_a_durable_backwards_install() {
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE TABLE backwards(id bigserial PRIMARY KEY, payload integer)");
+    scalar(&mut s, "SELECT nextval('backwards_id_seq')");
+    run(&mut s, "BEGIN");
+    for _ in 0..40 { run(&mut s, "INSERT INTO backwards(payload) VALUES (1)"); }
+    assert_eq!(scalar(&mut s, "SELECT setval('backwards_id_seq',1,false)"), 1);
+    run(&mut s, "ROLLBACK");
+}
+
+// Preserve the original direct-helper tests as synchronous callers. Sessions use
+// the obligation-aware signatures; these callers always settle before returning.
+#[cfg(feature = "engine-rocksdb")]
+fn callback(
+    db: Arc<v2::V2Db>, image: Arc<relational::Relational>,
+    baseline: BTreeMap<u64, u128>, pending: sequences::Pending,
+    values: sequences::SessionValues, search_path: Vec<String>,
+) -> relational::clock::SequenceCallback {
+    let unsettled = Unsettled::default();
+    let callback = super::callback(db.clone(), image, baseline, pending, values, unsettled.clone(), search_path);
+    Arc::new(move |operation, name, value, called| {
+        let result = callback(operation, name, value, called);
+        settle(&db, &unsettled)?;
+        result
+    })
+}
+
+#[cfg(feature = "engine-rocksdb")]
+fn committed_value(
+    db: &v2::V2Db, slot: &Arc<v2::SeqSlot>, id: u64,
+    def: &relational::catalog_ext::SequenceDef, operation: &str,
+    value: Option<i64>, called: bool,
+) -> Result<i64, CoreError> {
+    let unsettled = Unsettled::default();
+    let result = super::committed_value(db, slot, id, def, operation, value, called, &unsettled);
+    settle(db, &unsettled)?;
+    result
+}

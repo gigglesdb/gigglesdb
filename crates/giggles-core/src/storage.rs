@@ -2094,6 +2094,7 @@ pub struct SqlSession {
     ddl_owner: Option<String>,
     staged_revision: u64,
     sequence_values: sequences::SessionValues,
+    sequence_unsettled: v2_sql::sql_sequences::Unsettled,
     pending_sequences: sequences::Pending,
     xact: XactSlot,
     sequence_baseline: BTreeMap<u64, u128>,
@@ -2142,6 +2143,7 @@ impl Admin {
             ddl_owner: None,
             staged_revision: 0,
             sequence_values: Default::default(),
+            sequence_unsettled: Default::default(),
             pending_sequences: Default::default(),
             xact: Default::default(),
             sequence_baseline: BTreeMap::new(),
@@ -2610,8 +2612,17 @@ impl SqlSession {
         }
         result
     }
+    fn settle_sequences(&self) -> Result<(), CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            v2_sql::sql_sequences::settle(db, &self.sequence_unsettled)?;
+        }
+        Ok(())
+    }
+
     /// A gateway parse/bind/authorization failure poisons an explicit transaction.
     pub fn abort(&mut self) {
+        // Void cleanup retains obligations on failure; fallible exits retry settlement.
+        let _ = self.settle_sequences();
         self.abort_copy_input();
         if self.in_transaction() {
             self.aborted = true;
@@ -2708,6 +2719,7 @@ impl SqlSession {
                 self.commit_v2_transaction(db)
             }
         });
+        self.settle_sequences()?;
         if result.is_err() { self.abort(); }
         if self.v2_transaction.is_none() {
             self.xact.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -3295,7 +3307,9 @@ impl SqlSession {
             let key = if key.contains('\0') { key } else { format!("public\0{key}") };
             quoted(&key)
         } else { quoted(name) };
-        match callback(operation, &qualified, value, called)? {
+        let result = callback(operation, &qualified, value, called);
+        self.settle_sequences()?;
+        match result? {
             relational::Value::Int(value) => Ok(value),
             _ => Err(CoreError::Sql(relational::SqlError::Type)),
         }
@@ -3330,6 +3344,7 @@ impl SqlSession {
             if let Some(error) = clock.take_error() { return Err(error); }
             output.map_err(CoreError::Sql)
         })();
+        self.settle_sequences()?;
         if result.is_err() { self.abort(); }
         result
     }
@@ -3352,6 +3367,7 @@ impl SqlSession {
                 prepared.transaction = self.transaction_id;
                 self.execute_bound_engine(&prepared, &[], None)
             })();
+            self.settle_sequences()?;
             if result.is_err() { self.abort(); }
             return result;
         }
@@ -4613,6 +4629,7 @@ impl SqlSession {
             })
     }
     pub fn rollback(&mut self) {
+        let _ = self.settle_sequences();
         self.xact.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.copy_input = None;
         // A parked protected run is not an SQL transaction slot.

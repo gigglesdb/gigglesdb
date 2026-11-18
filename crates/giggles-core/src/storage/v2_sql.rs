@@ -155,9 +155,9 @@ impl SqlSession {
             commit_sql(db, txn, point)
         };
         if explicit && committed.is_ok() {
-            // Never allocate from a reservation before it is durable:
-            // committed live positions follow a Sync write_counter ack
-            // in the sequence callback, or this commit's durable ack.
+            // Pending incarnations enter the live cache only after this
+            // transaction's durable ack. Existing live counters can also hold
+            // queued reservations, whose returns carry settlement obligations.
             // Pending incarnations were not committed before this txn.
             // A session finding no live entry reads the durable Seq
             // counter, now equal to our staged counter, and may advance it.
@@ -191,6 +191,7 @@ impl SqlSession {
         lo: Bound<Vec<u8>>, hi: Bound<Vec<u8>>,
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
     ) -> Result<(), E> {
+        sql_sequences::settle(db, &self.sequence_unsettled).map_err(map)?;
         let _ticket = self.admin.inner.enter_sql().map_err(map)?;
         let txn = self.v2_transaction.as_mut()
             .ok_or_else(|| map(CoreError::Sql(SqlError::Transaction)))?;
@@ -233,6 +234,7 @@ impl SqlSession {
         range: (&relational::secondary_index::Descriptor, Bound<Vec<u8>>, Bound<Vec<u8>>),
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
     ) -> Result<(), E> {
+        sql_sequences::settle(db, &self.sequence_unsettled).map_err(map)?;
         let _ticket = self.admin.inner.enter_sql().map_err(map)?;
         let txn = self.v2_transaction.as_mut().ok_or_else(|| map(CoreError::Sql(SqlError::Transaction)))?;
         let catalog = db.catalog().snapshot(txn).map_err(map)?;
@@ -259,6 +261,7 @@ impl SqlSession {
         &mut self, db: &Arc<v2::V2Db>, table: &TableDef, key: &[relational::Value],
         visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
     ) -> Result<(), E> {
+        sql_sequences::settle(db, &self.sequence_unsettled).map_err(map)?;
         let _ticket = self.admin.inner.enter_sql().map_err(map)?;
         crate::cancellation::check().map_err(map)?;
         let txn = self.v2_transaction.as_mut()
@@ -276,7 +279,7 @@ impl SqlSession {
         image: Arc<relational::Relational>,
     ) -> relational::clock::SequenceCallback {
         sql_sequences::callback(db.clone(), image, self.sequence_baseline.clone(),
-            self.pending_sequences.clone(), self.sequence_values.clone(), self.search_path.clone())
+            self.pending_sequences.clone(), self.sequence_values.clone(), self.sequence_unsettled.clone(), self.search_path.clone())
     }
 
     // Typed scans deliberately retain the active statement snapshot. In
@@ -299,6 +302,7 @@ impl SqlSession {
                 conflict_floor: None, prepared: &prepared, params: &[], effects: None, scope: None },
             u64::MAX, None)?;
         crate::cancellation::check()?;
+        sql_sequences::settle(db, &self.sequence_unsettled)?;
         Ok(result)
     }
 
@@ -360,6 +364,7 @@ impl SqlSession {
                     self.sequence_baseline.clone(),
                     self.pending_sequences.clone(),
                     self.sequence_values.clone(),
+                    self.sequence_unsettled.clone(),
                     self.search_path.clone(),
                 ))
                 .with_xact(sql_xact::callback(
@@ -375,12 +380,33 @@ impl SqlSession {
             output.map_err(CoreError::Sql)
         })();
         if result.is_err() {
+            sql_sequences::settle(db, &self.sequence_unsettled)?;
             self.abort();
         }
         result
     }
 
     pub(super) fn execute_v2(
+        &mut self,
+        db: &Arc<v2::V2Db>,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: Option<&relational::clock::ExecutionClock>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        let result = self.execute_v2_inner(db, p, params, expected_version, clock);
+        // Result columns also identify spilled/streamed rows absent from rows.
+        if result.as_ref().is_err() || result.as_ref().is_ok_and(|result| !result.columns.is_empty() || !result.rows.is_empty())
+            || self.v2_transaction.is_none() || p.control() == Some("commit")
+            || p.control() == Some("rollback")
+        {
+            // Failure after a successful commit is a lost commit response.
+            sql_sequences::settle(db, &self.sequence_unsettled)?;
+        }
+        result
+    }
+
+    fn execute_v2_inner(
         &mut self,
         db: &Arc<v2::V2Db>,
         p: &relational::Prepared,
@@ -876,6 +902,7 @@ impl SqlSession {
                                 self.sequence_baseline.clone(),
                                 self.pending_sequences.clone(),
                                 self.sequence_values.clone(),
+                                self.sequence_unsettled.clone(),
                                 self.search_path.clone(),
                             ))
                             .with_xact(sql_xact::callback(

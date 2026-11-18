@@ -30,6 +30,8 @@ pub(crate) struct SeqSlot {
 pub(crate) struct SeqSlotState {
     pub(crate) counter: Option<super::sequences::SeqCounter>,
     pub(crate) durable_hw: Option<i64>,
+    // A durable install drains preceding reservations, even when moving backwards.
+    pub(crate) coverage_epoch: u64,
     pub(crate) inflight: std::collections::VecDeque<InFlight>,
     pub(crate) receiving: bool,
     // Backwards moves also wait for callers using the drained coverage to finish.
@@ -42,6 +44,7 @@ pub(crate) struct InFlight {
 }
 impl SeqSlotState {
     pub(crate) fn install(&mut self, counter: super::sequences::SeqCounter) {
+        self.coverage_epoch = self.coverage_epoch.wrapping_add(1);
         self.inflight.retain(|p| p.incarnation == counter.incarnation);
         self.durable_hw = Some(counter.log_hw);
         self.counter = Some(counter);

@@ -1,12 +1,50 @@
 //! SQL defaults use the existing v2 counter codec and durable reservations.
 use super::*;
 
+/// Values exposed even by rolled-back transactions must never be reissued after a crash.
+pub(in crate::storage) struct Obligation {
+    slot: Arc<v2::SeqSlot>,
+    id: u64,
+    def: relational::catalog_ext::SequenceDef,
+    value: i64,
+    coverage_epoch: u64,
+}
+pub(in crate::storage) type Unsettled = Arc<Mutex<Vec<Obligation>>>;
+
+pub(in crate::storage) fn settle(db: &v2::V2Db, list: &Unsettled) -> Result<(), CoreError> {
+    let mut list = list.lock().map_err(|_| CoreError::Fenced)?;
+    for item in list.iter() {
+        let mut guard = item.slot.counter.lock_cancellable()?;
+        drain_ready(&mut guard);
+        // A synchronous setval/wrap may have replaced durable_hw since allocation.
+        // Its durable install drained all older reservations before moving backwards.
+        if guard.coverage_epoch != item.coverage_epoch { continue; }
+        if guard.counter.as_ref().is_some_and(|c| c.incarnation == item.def.incarnation)
+            && guard.durable_hw.is_some_and(|hw| {
+                if item.def.increment > 0 { hw >= item.value } else { hw <= item.value }
+            })
+        {
+            continue;
+        }
+        // await_coverage checks incarnation retirement before consulting durable_hw.
+        guard.waiting_returns += 1;
+        let key = engine::catalog_codec::counter_key(item.id, item.def.incarnation);
+        let outcome = await_coverage(db, &item.slot, guard, item.id, &key, &item.def, item.value);
+        let mut guard = item.slot.counter.lock().map_err(|_| CoreError::Fenced)?;
+        guard.waiting_returns -= 1;
+        outcome?;
+    }
+    list.clear();
+    Ok(())
+}
+
 pub(super) fn callback(
     db: Arc<v2::V2Db>,
     image: Arc<relational::Relational>,
     baseline: BTreeMap<u64, u128>,
     pending: sequences::Pending,
     values: sequences::SessionValues,
+    unsettled: Unsettled,
     search_path: Vec<String>,
 ) -> relational::clock::SequenceCallback {
     Arc::new(move |operation, name, value, called| {
@@ -83,7 +121,7 @@ pub(super) fn callback(
                 let mut live = db.sql_counters.lock_cancellable()?;
                 live.entry(id).or_default().clone()
             };
-            let result = committed_value(&db, &slot, id, def, operation, value, called)?;
+            let result = committed_value(&db, &slot, id, def, operation, value, called, &unsettled)?;
             if operation == "nextval" || called {
                 values
                     .lock()
@@ -213,12 +251,13 @@ fn drain_ready(guard: &mut v2::SeqSlotState) {
 #[allow(clippy::too_many_arguments)]
 fn committed_value(
     db: &v2::V2Db,
-    slot: &v2::SeqSlot,
+    slot: &Arc<v2::SeqSlot>,
     id: u64,
     def: &relational::catalog_ext::SequenceDef,
     operation: &str,
     value: Option<i64>,
     called: bool,
+    unsettled: &Unsettled,
 ) -> Result<i64, CoreError> {
     let key = engine::catalog_codec::counter_key(id, def.incarnation);
     let mut guard = slot.counter.lock_cancellable()?;
@@ -323,6 +362,18 @@ fn committed_value(
         });
     }
     guard.counter = Some(counter);
+    // The reservation precedes a later write commit in the sequencer FIFO.
+    // Other outcomes must settle this obligation before returning to the caller.
+    if guard.inflight.iter().any(|write| {
+        write.incarnation == def.incarnation
+            && if def.increment > 0 { write.hw >= result } else { write.hw <= result }
+    }) {
+        unsettled.lock().map_err(|_| CoreError::Fenced)?.push(Obligation {
+            slot: slot.clone(), id, def: def.clone(), value: result,
+            coverage_epoch: guard.coverage_epoch,
+        });
+        return Ok(result);
+    }
     if guard.durable_hw.is_some_and(|hw| {
         if def.increment > 0 {
             hw >= result
