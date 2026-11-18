@@ -17,6 +17,7 @@
 //! SQL path and the native path alike; the protected commit's policy check
 //! (`decide`) stays as the backstop.
 use std::cell::{Cell, RefCell};
+use std::ops::Bound;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -106,6 +107,23 @@ pub(crate) struct Scope {
 impl Scope {
     pub(crate) fn table(&self) -> u64 {
         self.predicate.table()
+    }
+
+    pub(crate) fn key_range(&self) -> Option<&KeyRange> {
+        self.predicate.key_range()
+    }
+
+    pub(crate) fn prefix_values(&self, table: &TableDef) -> Vec<Value> {
+        if self.key_range().is_none() { return Vec::new(); }
+        table.primary_key.iter().map_while(|i| self.predicate.pushdown().iter()
+            .find(|(column, op, _)| column == i && *op == "=")
+            .map(|(_, _, value)| value.clone())).collect()
+    }
+
+    pub(crate) fn contains_key(&self, key: &[u8]) -> bool {
+        self.key_range().is_none_or(|range| !intersect(range, &KeyRange {
+            lo: Bound::Included(key.to_vec()), hi: Bound::Included(key.to_vec()),
+        }).is_empty())
     }
 
     /// Counts one row pulled from the task table and keeps it only when the
@@ -327,6 +345,22 @@ impl<'a> Scoped<'a> {
     }
 }
 
+/// Intersect inclusive/exclusive bounds without widening equal endpoints.
+pub(crate) fn intersect(a: &KeyRange, b: &KeyRange) -> KeyRange {
+    fn tighter(a: &Bound<Vec<u8>>, b: &Bound<Vec<u8>>, lower: bool) -> Bound<Vec<u8>> {
+        match (a, b) {
+            (Bound::Unbounded, _) => b.clone(),
+            (_, Bound::Unbounded) => a.clone(),
+            (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y)) => {
+                if x == y {
+                    if matches!(a, Bound::Excluded(_)) { a.clone() } else { b.clone() }
+                } else if (x > y) == lower { a.clone() } else { b.clone() }
+            }
+        }
+    }
+    KeyRange { lo: tighter(&a.lo, &b.lo, true), hi: tighter(&a.hi, &b.hi, false) }
+}
+
 impl RowSource for Scoped<'_> {
     fn streams_reductions(&self) -> bool {
         self.inner.streams_reductions()
@@ -339,6 +373,9 @@ impl RowSource for Scoped<'_> {
         first: bool,
     ) -> R<Option<SourceRows<'s>>> {
         self.table(table)?;
+        // A probe can choose an index outside the primary-key scope. Let the
+        // caller fall back to our bounded scan instead.
+        if self.scope.predicate.key_range().is_some() { return Ok(None); }
         Ok(self
             .inner
             .join_probe(table, keys, first)?
@@ -351,6 +388,7 @@ impl RowSource for Scoped<'_> {
         predicates: &[(usize, &str, Value)],
     ) -> R<Option<SourceRows<'s>>> {
         self.table(table)?;
+        if self.scope.predicate.key_range().is_some() { return Ok(None); }
         let predicates = self.with_pushdown(predicates);
         Ok(self
             .inner
@@ -365,6 +403,7 @@ impl RowSource for Scoped<'_> {
         after: Option<&[u8]>,
     ) -> R<Option<SourceRows<'s>>> {
         self.table(table)?;
+        if self.scope.predicate.key_range().is_some() { return Ok(None); }
         let predicates = self.with_pushdown(predicates);
         Ok(self
             .inner
@@ -374,11 +413,15 @@ impl RowSource for Scoped<'_> {
 
     fn scan<'s>(&'s self, table: &TableDef, range: &KeyRange, dir: Direction) -> R<SourceRows<'s>> {
         self.table(table)?;
-        Ok(self.filter(self.inner.scan(table, range, dir)?))
+        let range = self.scope.predicate.key_range().map_or_else(
+            || range.clone(), |scope| intersect(range, scope));
+        if range.is_empty() { return Ok(Box::new(std::iter::empty())); }
+        Ok(self.filter(self.inner.scan(table, &range, dir)?))
     }
 
     fn get<'s>(&'s self, table: &TableDef, key: &[u8]) -> R<Option<SourceRow<'s>>> {
         self.table(table)?;
+        if !self.scope.contains_key(key) { return Ok(None); }
         match self.inner.get(table, key)? {
             Some(row) if self.keep(&row)? => Ok(Some(row)),
             _ => Ok(None),
@@ -389,3 +432,49 @@ impl RowSource for Scoped<'_> {
 #[cfg(test)]
 #[path = "rows_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    #[test]
+    fn outside_prefix_point_and_empty_scan_do_not_read_source() {
+        struct Unread;
+        impl RowSource for Unread {
+            fn scan<'s>(&'s self, _: &TableDef, _: &KeyRange, _: Direction) -> R<SourceRows<'s>> {
+                panic!("empty intersection must not scan");
+            }
+            fn get<'s>(&'s self, _: &TableDef, _: &[u8]) -> R<Option<SourceRow<'s>>> {
+                panic!("outside key must not be read");
+            }
+        }
+        let mut state = Relational::default();
+        let prepared = crate::relational::Prepared::parse(
+            "CREATE TABLE items (merchant BIGINT, id INT, PRIMARY KEY (merchant, id))",
+            1, state.epoch).unwrap();
+        state.execute(&prepared, &[], None).unwrap();
+        let table = &state.tables["items"];
+        let scope = Scope { predicate: Arc::new(RowPredicate::bind(&state, table, "merchant = 42").unwrap()) };
+        let meter = StatementMeter::default();
+        let source = Scoped::new(&Unread, &scope, &meter);
+        let key = crate::relational::encode_key(&[Value::Int(7), Value::Int(1)]).unwrap();
+        assert!(source.get(table, &key).unwrap().is_none());
+        assert_eq!(source.scan(table, &KeyRange::point(key), Direction::Forward).unwrap().count(), 0);
+        assert_eq!(meter.counts(), RowCounts::default());
+    }
+
+    #[test]
+    fn intersection_keeps_stricter_equal_endpoints_and_empty_ranges() {
+        let scope = KeyRange { lo: Bound::Included(vec![2]), hi: Bound::Excluded(vec![4]) };
+        assert_eq!(intersect(&KeyRange::all(), &scope), scope);
+        assert_eq!(intersect(&scope, &KeyRange::all()), scope);
+        let caller = KeyRange { lo: Bound::Excluded(vec![2]), hi: Bound::Included(vec![4]) };
+        assert_eq!(intersect(&caller, &scope), KeyRange {
+            lo: Bound::Excluded(vec![2]), hi: Bound::Excluded(vec![4]),
+        });
+        assert_eq!(intersect(&scope, &caller), intersect(&caller, &scope));
+        assert!(intersect(&scope, &KeyRange::point(vec![4])).is_empty());
+        assert!(intersect(&scope, &KeyRange::point(vec![1])).is_empty());
+        assert!(!intersect(&scope, &KeyRange::point(vec![2])).is_empty());
+    }
+}

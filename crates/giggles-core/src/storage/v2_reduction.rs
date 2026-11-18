@@ -139,7 +139,11 @@ impl RowSource for Source<'_> {
     fn scan<'s>(&'s self, table: &TableDef, range: &scan::KeyRange, dir: scan::Direction)
         -> Result<scan::SourceRows<'s>, SqlError> {
         let rows = self.rows.borrow();
-        let index = rows.scan_index(table);
+        // A supplied primary-key range must reach the row scan: index pages
+        // do not apply primary-key bounds and would widen the SSI read set.
+        let index = if range.lo == Bound::Unbounded && range.hi == Bound::Unbounded {
+            rows.scan_index(table)
+        } else { None };
         let mut range = range.clone();
         if range.lo == Bound::Unbounded && range.hi == Bound::Unbounded
             && table.primary_key.iter().all(|i| !rows.parts.ext.column_collations.contains_key(&table.columns[*i].id))

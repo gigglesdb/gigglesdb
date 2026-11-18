@@ -713,3 +713,35 @@ fn counters_equal_change_record_totals_after_200_mixed_ops() {
         }
     }
 }
+
+#[test]
+fn key_prefix_only_conflicts_with_in_scope_app_insert() {
+    for (merchant, attempts, affected) in [(7, 1, 4), (42, 2, 5)] {
+        let f = super::commit_tests::fixture_key(true);
+        let (result, reads) = race_app_writer(&f,
+            &format!("INSERT INTO shipments VALUES (7, {merchant}, 'failed', 0)"));
+        assert_eq!(result.unwrap().rows_affected, affected);
+        // protected_commit retries 40001 once: two snapshot rechecks prove
+        // the first attempt failed; an outside-prefix write needs no retry.
+        assert_eq!(reads, attempts, "merchant {merchant}");
+    }
+}
+
+#[test]
+fn key_prefix_in_scope_writes_exhaust_retries_with_40001() {
+    let f = super::commit_tests::fixture_key(true);
+    let mut reads = 0;
+    let mut load = |db: &V2Db, task: TaskObjectId, at: DefAt<'_>| {
+        if matches!(at, DefAt::Snapshot(_)) {
+            reads += 1;
+            // Each independent application transaction commits after the
+            // protected attempt's scan, inserting a phantom in merchant 42.
+            sql(f.admin(), &format!("INSERT INTO shipments VALUES ({}, 42, 'failed', 0)", 100 + reads));
+        }
+        catalog_def(db, task, at)
+    };
+    let error = commit_as(&f, &f.ctx, "prefix-conflict", REQUEUE, &mut load).unwrap_err();
+    assert_eq!(error.sqlstate(), "40001");
+    assert_eq!(reads, 3);
+    assert_eq!(count(&f, "status = 'queued'"), 0);
+}

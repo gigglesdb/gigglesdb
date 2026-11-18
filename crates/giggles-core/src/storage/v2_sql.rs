@@ -1460,7 +1460,7 @@ impl RowSink for SqlRows<'_> {
     }
     fn fk_read_page(&mut self, table: &TableDef, after: Option<Vec<u8>>)
         -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
-        self.at_latest(|rows| rows.read_page_all(table, after))
+        self.at_latest(|rows| rows.read_page_all(table, after, None))
     }
 
     fn streams_index_builds(&self) -> bool {
@@ -1496,7 +1496,8 @@ impl RowSink for SqlRows<'_> {
         table: &TableDef,
         after: Option<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
-        let page = self.read_page_all(table, after)?;
+        let range = self.scope_of(table).and_then(|(scope, _)| scope.key_range()).cloned();
+        let page = self.read_page_all(table, after, range.as_ref())?;
         page.map(|(last, mut rows)| {
             self.retain_scope(table, &mut rows)?;
             Ok((last, rows))
@@ -1528,6 +1529,8 @@ impl RowSink for SqlRows<'_> {
             crate::cancellation::check()?;
             #[cfg(test)]
             MUTATION_POINT_READS.set(MUTATION_POINT_READS.get() + 1);
+            if self.scope_of(table).is_some_and(|(scope, _)|
+                relational::encode_key(key).is_ok_and(|key| !scope.contains_key(&key))) { continue; }
             if let Some(row) = self.db.rows.get(self.txn, &entry, key)? {
                 #[cfg(test)]
                 MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + 1);
@@ -1569,7 +1572,9 @@ impl RowSink for SqlRows<'_> {
             heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
         };
-        let mut lower = Bound::Unbounded;
+        let range = self.scope_of(table).and_then(|(scope, _)| scope.key_range()).cloned();
+        let mut lower = range.as_ref().map_or(Bound::Unbounded, |r| r.lo.clone());
+        let upper = range.map_or(Bound::Unbounded, |r| r.hi);
         loop {
             crate::cancellation::check()?;
             let rows = self
@@ -1579,7 +1584,7 @@ impl RowSink for SqlRows<'_> {
                     self.txn,
                     &entry,
                     lower,
-                    Bound::Unbounded,
+                    upper.clone(),
                     engine::kv::Direction::Forward,
                     Some(200),
                 )?
@@ -2232,6 +2237,7 @@ impl SqlRows<'_> {
         &mut self,
         table: &TableDef,
         after: Option<Vec<u8>>,
+        range: Option<&relational::scan::KeyRange>,
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
         crate::cancellation::check()?;
         let entry = TableEntry {
@@ -2240,14 +2246,19 @@ impl SqlRows<'_> {
             heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
         };
+        let incoming = relational::scan::KeyRange {
+            lo: after.map_or(Bound::Unbounded, Bound::Excluded), hi: Bound::Unbounded,
+        };
+        let range = range.map_or_else(|| incoming.clone(), |range| crate::task::rows::intersect(range, &incoming));
+        if range.is_empty() { return Ok(None); }
         let rows = self
             .db
             .rows
             .scan(
                 self.txn,
                 &entry,
-                after.map_or(Bound::Unbounded, Bound::Excluded),
-                Bound::Unbounded,
+                range.lo,
+                range.hi,
                 engine::kv::Direction::Forward,
                 Some(200),
             )?
@@ -2280,6 +2291,8 @@ impl SqlRows<'_> {
             crate::cancellation::check()?;
             #[cfg(test)]
             MUTATION_POINT_READS.set(MUTATION_POINT_READS.get() + 1);
+            if self.scope_of(table).is_some_and(|(scope, _)|
+                relational::encode_key(key).is_ok_and(|key| !scope.contains_key(&key))) { continue; }
             if let Some(row) = self.db.rows.get(self.txn, &entry, key)? {
                 #[cfg(test)]
                 MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + 1);
@@ -2384,6 +2397,9 @@ impl SqlRows<'_> {
     /// Encoded bounds from a read statement's mandatory comparisons (=, <, <=, >, >=) on a
     /// one-column integer primary key, if it has any (a heap table's row id is not one).
     fn primary_key_bounds(&self, table: &TableDef) -> Option<KeyBounds> {
+        if let Some(range) = self.scope_of(table).and_then(|(scope, _)| scope.key_range()) {
+            return Some((range.lo.clone(), range.hi.clone()));
+        }
         use relational::{DataType, Value};
         let [index] = table.primary_key.as_slice() else {
             return None;

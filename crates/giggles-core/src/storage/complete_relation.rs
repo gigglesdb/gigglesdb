@@ -308,6 +308,7 @@ impl SqlSession {
             let meter = StatementMeter::default();
             let visited: Result<(), E> = (|| {
                 for key in keys {
+                    if scope.as_ref().is_some_and(|scope| crate::relational::encode_key(key).is_ok_and(|key| !scope.contains_key(&key))) { continue; }
                     self.visit_native_key_v2(&db, table, key,
                         &mut scoped(scope.as_ref(), &meter, visit, map), map)?;
                 }
@@ -360,7 +361,14 @@ impl SqlSession {
         #[cfg(feature = "engine-rocksdb")]
         let visited = if let super::Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
-            if let Some(index) = index {
+            if let Some(range) = scope.as_ref().and_then(|scope| scope.key_range()) {
+                let range = if index.is_some() { range.clone() } else {
+                    crate::task::rows::intersect(range, &crate::relational::scan::KeyRange { lo, hi })
+                };
+                if range.is_empty() { Ok(()) } else {
+                    self.visit_native_range_v2(&db, table, range.lo, range.hi, visit, map)
+                }
+            } else if let Some(index) = index {
                 self.visit_native_index_v2(&db, table, (index, lo, hi), visit, map)
             } else { self.visit_native_range_v2(&db, table, lo, hi, visit, map) }
         } else {
@@ -454,7 +462,7 @@ impl SqlSession {
                 .scan_engine(Scan {
                     table: key.clone(),
                     projection: vec![],
-                    prefix: vec![],
+                    prefix: scope.as_ref().map_or_else(Vec::new, |scope| scope.prefix_values(table)),
                     lower: None,
                     upper: None,
                     reverse: false,
@@ -471,7 +479,7 @@ impl SqlSession {
                         .iter()
                         .map(|index| table.columns[*index].name.clone())
                         .collect(),
-                    prefix: vec![],
+                    prefix: scope.as_ref().map_or_else(Vec::new, |scope| scope.prefix_values(table)),
                     lower: None,
                     upper: None,
                     reverse: true,

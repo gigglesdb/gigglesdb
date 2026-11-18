@@ -15,6 +15,7 @@ pub(crate) struct RowPredicate {
     table: u64,
     filter: BoundFilter,
     pushdown: Vec<(usize, &'static str, Value)>,
+    key_range: Option<scan::KeyRange>,
 }
 
 const _: fn() = || {
@@ -58,11 +59,18 @@ impl RowPredicate {
         })?;
         let mut pushdown = Vec::new();
         conjuncts(table, &parsed, &mut pushdown)?;
+        let key_range = prefix_range(state, table, &pushdown);
         Ok(Self {
+            key_range,
             table: table.id,
             filter,
             pushdown,
         })
+    }
+
+    /// Primary-key prefix implied by the predicate, cached with the binding.
+    pub(crate) fn key_range(&self) -> Option<&scan::KeyRange> {
+        self.key_range.as_ref()
     }
 
     /// The table this predicate was bound on.
@@ -96,6 +104,35 @@ impl RowPredicate {
     pub(crate) fn pushdown(&self) -> &[(usize, &'static str, Value)] {
         &self.pushdown
     }
+}
+
+/// Reuse the planner's typed key bounds. Extended key types and collations
+/// need their own encoding rules, so retain the full scan for those tables.
+fn prefix_range(
+    state: &Relational,
+    table: &TableDef,
+    pushdown: &[(usize, &'static str, Value)],
+) -> Option<scan::KeyRange> {
+    if table.primary_key.iter().any(|i| {
+        let id = table.columns[*i].id;
+        state.ext.column_collations.contains_key(&id)
+            || state.ext.columns.get(&id).is_some_and(|c| c.type_id.is_some())
+    }) {
+        return None;
+    }
+    let mut predicates = Vec::new();
+    for i in &table.primary_key {
+        let Some((_, _, value)) = pushdown.iter().find(|(col, op, _)| col == i && *op == "=") else {
+            break;
+        };
+        predicates.push(Predicate {
+            column: table.columns[*i].name.clone(),
+            op: "=".into(),
+            value: Expr::Literal(value.clone()),
+        });
+    }
+    if predicates.is_empty() { return None; }
+    bounds(table, &predicates, &[]).ok().map(scan::KeyRange::from_bounds)
 }
 
 fn conjuncts(
@@ -214,6 +251,32 @@ mod tests {
             Value::Int(0),
             Value::Null,
         ]
+    }
+
+    #[test]
+    fn key_prefix_bounds_match_planner_and_fall_back_safely() {
+        let mut state = Relational::default();
+        let sql = "CREATE TABLE items (merchant BIGINT, id INT, note TEXT, PRIMARY KEY (merchant, id))";
+        let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
+        state.execute(&prepared, &[], None).unwrap();
+        let table = &state.tables["items"];
+        for (text, values, full) in [
+            ("merchant = 42", vec![Value::Int(42)], false),
+            ("merchant = 42 AND id = 3", vec![Value::Int(42), Value::Int(3)], true),
+            ("42 = merchant AND note = 'x'", vec![Value::Int(42)], false),
+        ] {
+            let p = RowPredicate::bind(&state, table, text).unwrap();
+            let key = encode_key(&values).unwrap();
+            assert_eq!(p.key_range(), Some(&scan::KeyRange {
+                lo: std::ops::Bound::Included(key.clone()),
+                hi: if full { std::ops::Bound::Included(key) } else {
+                    std::ops::Bound::Excluded(successor(key).unwrap())
+                },
+            }));
+        }
+        for text in ["id = 3", "merchant = 4.5", "merchant = 42 OR id = 3", "NOT (merchant = 42)"] {
+            assert!(RowPredicate::bind(&state, table, text).unwrap().key_range().is_none(), "{text}");
+        }
     }
 
     #[test]

@@ -57,6 +57,7 @@ use tokio_postgres::{
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub const TASK: &str = "inc-436";
+pub const SCAN_TASK: &str = "scan-limit";
 pub const TABLE: &str = "shipments";
 pub const CONTROLLER: &str = "incident_controller";
 pub const EXECUTOR: &str = "repair_agent";
@@ -255,7 +256,7 @@ impl R3Fixture {
         let service = Service::with_agent(
             admin.clone(),
             Vec::new(),
-            vec![binding(&self.agent_cert, EXECUTOR, &[TASK])],
+            vec![binding(&self.agent_cert, EXECUTOR, &[TASK, SCAN_TASK])],
             Clock::new(0, 3600).unwrap(),
             ServiceLimits::default(),
         )
@@ -332,14 +333,20 @@ impl R3Fixture {
     }
 
     /// The executor `repair_agent` on the agent listener (its certificate is
-    /// bound to `inc-436` alone).
+    /// bound to the incident and scan-limit tasks).
     pub async fn agent(&self) -> Client {
+        self.agent_for(TASK).await
+    }
+
+    /// The executor on the agent listener, selecting a bound task explicitly.
+    pub async fn agent_for(&self, task: &str) -> Client {
         let (client, connection) = tokio_postgres::Config::new()
             .host("localhost")
             .hostaddr(self.agent_address.ip())
             .port(self.agent_address.port())
             .user(EXECUTOR)
             .dbname("giggles")
+            .options(format!("-c giggles.task={task}"))
             .ssl_mode(SslMode::Require)
             .connect(MakeRustlsConnect::new(self.agent_cert.client(&self.ca)))
             .await

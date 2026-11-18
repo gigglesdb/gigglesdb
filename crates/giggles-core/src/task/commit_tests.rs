@@ -87,12 +87,19 @@ pub(super) fn clock(db: &V2Db, ms: u64) {
 }
 
 pub(super) fn fixture() -> Fixture {
+    fixture_key(false)
+}
+
+pub(super) fn fixture_key(prefix: bool) -> Fixture {
     let dir = directory();
     let admin = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
     sql(
         &admin,
-        "CREATE TABLE shipments (id bigint primary key, merchant_id bigint, status text, \
-         attempt_count int)",
+        if prefix {
+            "CREATE TABLE shipments (id bigint, merchant_id bigint, status text, attempt_count int, PRIMARY KEY (merchant_id, id))"
+        } else {
+            "CREATE TABLE shipments (id bigint primary key, merchant_id bigint, status text, attempt_count int)"
+        },
     );
     sql(
         &admin,

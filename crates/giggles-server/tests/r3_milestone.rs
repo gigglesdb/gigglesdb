@@ -29,17 +29,17 @@ mod r3_support;
 use giggles_core::{
     relational::Value,
     task::{
-        Budget, DenyRule, OperationId, Outcome, ProtectedPoint, Receipt, StatementClass,
-        TaskError,
+        Budget, DenyRule, OperationId, Outcome, ProtectedPoint, Receipt, StatementClass, TaskError,
         context::TaskDefinitions,
-        definition::{TaskName, TaskObjectId},
+        definition::{TaskName, TaskObjectId, WallClockMs},
         inspect_outcome,
+        statements::{TaskStatement, parse},
     },
 };
-use r3_support::agent_support::{DAY_MS, now_ms};
+use r3_support::agent_support::{DAY_MS, now_ms, timestamptz};
 use r3_support::{
-    APP_ROWS_PER_MERCHANT, DEFAULT_CLIENTS, EXECUTOR, EXECUTOR_PW, MAX_ATTEMPTS, R3Fixture, TABLE,
-    TASK, WorkloadReport,
+    APP_ROWS_PER_MERCHANT, CONTROLLER, DEFAULT_CLIENTS, EXECUTOR, EXECUTOR_PW, MAX_ATTEMPTS,
+    R3Fixture, SCAN_TASK, TABLE, TASK, WorkloadReport, inc_436_sql,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -231,8 +231,8 @@ fn pause_after_statement(
     })
 }
 
-/// The rows step 16 adds: a merchant the task never sees, enough of them
-/// that a scan of the table passes `rows_scanned` (100,000).
+/// The rows step 16 adds: delivered rows outside both tasks' visibility,
+/// enough that the non-key-scoped task passes `rows_scanned` (100,000).
 const BULK_MERCHANT: i64 = 7;
 const BULK_ROWS: i64 = 101_000;
 
@@ -622,8 +622,33 @@ async fn worked_example(load: bool) {
         "step 15"
     );
 
-    // step 16: with 101,000 more rows of a merchant the task never sees, a
-    // query over the table is cancelled at the scan limit (100,000).
+    // step 16: the incident task scans only merchant 42's key range. A
+    // separate task scoped by non-key status must scan the whole table,
+    // including 101,000 invisible delivered rows, and hit the default scan
+    // limit (100,000). Its read log and counters are independent of inc-436.
+    let scan_sql = inc_436_sql(&timestamptz(f.expires_ms))
+        .replace(TASK, SCAN_TASK)
+        .replace(
+            "VISIBLE ROWS WHERE (merchant_id = 42)",
+            "VISIBLE ROWS WHERE (status = 'failed')",
+        )
+        .replace(", rows_scanned = 100000", "");
+    let Some(TaskStatement::Create(new)) = parse(&scan_sql) else {
+        panic!("step 16: CREATE TASK did not parse: {scan_sql}");
+    };
+    let issuer = f.admin().roles().get(CONTROLLER).unwrap().unwrap();
+    f.admin()
+        .tasks()
+        .create(&issuer, *new, WallClockMs(f.wall_ms()))
+        .unwrap();
+    let scan_task = f
+        .admin()
+        .sql_session()
+        .task_definition(&TaskName::new(SCAN_TASK).unwrap())
+        .unwrap()
+        .expect("step 16: scan-limit exists")
+        .id;
+    let scan_agent = f.agent_for(SCAN_TASK).await;
     {
         let mut session = f.admin().sql_session();
         for insert in bulk_inserts() {
@@ -631,13 +656,15 @@ async fn worked_example(load: bool) {
         }
     }
     let step16 = "SELECT id, status FROM shipments WHERE attempt_count >= 0";
-    let result = f.retry_40001("step 16", || simple(&agent, step16)).await;
+    let result = f
+        .retry_40001("step 16", || simple(&scan_agent, step16))
+        .await;
     assert_eq!(
         failure(result, "step 16"),
         expected(TaskError::BudgetExceeded(Budget::RowsScanned)),
         "step 16"
     );
-    let log = f.admin().task_read_log(task).unwrap();
+    let log = f.admin().task_read_log(scan_task).unwrap();
     let record = log
         .iter()
         .rev()
@@ -647,7 +674,9 @@ async fn worked_example(load: bool) {
         record.rows_scanned > 100_000 && record.rows_scanned <= 100_200,
         "step 16: {record:?}"
     );
+    assert_eq!(record.sqlstate_text(), "54T01", "step 16: {record:?}");
     assert_eq!(record.released_rows, 0, "step 16");
+    drop(scan_agent);
 
     // step 17: repair_agent's password on the PostgreSQL listener is refused:
     // the role is task-only.
@@ -869,13 +898,8 @@ async fn worked_example(load: bool) {
     }
 }
 
-/// Ignored until the protected commit stops starving under the D9 workload:
-/// a task statement scans (and so tracks for validation) the whole table,
-/// not just the task's `merchant_id = 42` key prefix, so every application
-/// write to merchants 100-199 fails it with 40001 (design-6 risk R2). With
-/// four `delivery_app` connections step 05 fails all 50 attempts (each of
-/// three internal tries). Run it with `--ignored`.
-#[ignore = "R2: protected commits starve under the D9 workload (step 05, 50 x 40001)"]
+/// Task scans cover merchant 42's primary-key range, so application writes
+/// to merchants 100-199 no longer invalidate the incident task's commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worked_example_steps_1_to_22_under_application_load() {
     worked_example(true).await;

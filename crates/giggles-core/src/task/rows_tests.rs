@@ -13,6 +13,10 @@ use crate::task::definition::{
 const NOW: WallClockMs = WallClockMs(1_793_898_000_000);
 
 fn admin() -> (std::path::PathBuf, Admin) {
+    scoped_admin(false, "merchant_id = 42", LoadLimits::default())
+}
+
+fn scoped_admin(prefix: bool, predicate: &str, limits: LoadLimits) -> (std::path::PathBuf, Admin) {
     let root = crate::test_artifact_root();
     std::fs::create_dir_all(&root).unwrap();
     let mut token = [0; 16];
@@ -20,9 +24,11 @@ fn admin() -> (std::path::PathBuf, Admin) {
     let path = root.join(format!("task-rows-{:032x}", u128::from_be_bytes(token)));
     let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
     for sql in [
-        "CREATE TABLE shipments (id bigint primary key, merchant_id bigint, attempt_count int)",
+        if prefix { "CREATE TABLE shipments (id bigint, merchant_id bigint, attempt_count int, PRIMARY KEY (merchant_id, id))" }
+        else { "CREATE TABLE shipments (id bigint primary key, merchant_id bigint, attempt_count int)" },
         "CREATE TABLE carriers (id bigint primary key)",
-        "INSERT INTO shipments VALUES (1, 42, 1), (2, 7, 0), (3, 42, 2), (4, NULL, 0)",
+        if prefix { "INSERT INTO shipments VALUES (1, 42, 1), (2, 7, 0), (3, 42, 2), (4, 9, 0)" }
+        else { "INSERT INTO shipments VALUES (1, 42, 1), (2, 7, 0), (3, 42, 2), (4, NULL, 0)" },
         "INSERT INTO carriers VALUES (1)",
     ] {
         admin.sql_session().execute(sql, &[], None).unwrap();
@@ -48,7 +54,7 @@ fn admin() -> (std::path::PathBuf, Admin) {
                 approver: None,
                 schema: None,
                 table: "shipments".into(),
-                visible_rows: PredicateText("merchant_id = 42".into()),
+                visible_rows: PredicateText(predicate.into()),
                 readable: vec!["id".into(), "attempt_count".into()],
                 masked: Vec::new(),
                 untrusted_text: Vec::new(),
@@ -62,7 +68,7 @@ fn admin() -> (std::path::PathBuf, Admin) {
                 }),
                 mutation_caps: MutationCaps { distinct_rows: 25, transitions: 25 },
                 disclosure_caps: DisclosureCaps { rows_read: 10, rows_returned: 10, bytes_returned: 4096 },
-                limits: LoadLimits::default(),
+                limits,
                 approval_threshold: 25,
                 expires: "2026-11-05 17:30:00+00".into(),
             },
@@ -269,4 +275,28 @@ fn update_and_native_outcomes_count_only_scope_rows() {
     assert_eq!(outcome.matched, 4);
     drop(admin);
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn prefix_scan_counts_only_its_range_and_non_key_still_hits_limit() {
+    for (predicate, succeeds) in [("merchant_id = 42", true), ("attempt_count >= 0", false)] {
+        let (path, admin) = scoped_admin(true, predicate, LoadLimits {
+            rows_scanned: 2, ..LoadLimits::default()
+        });
+        // Even a statement index must not bypass the primary-key scope.
+        admin.sql_session().execute("CREATE INDEX attempts ON shipments(attempt_count)", &[], None).unwrap();
+        let mut s = agent(&admin);
+        let result = s.execute_unreleased("SELECT id FROM shipments WHERE attempt_count >= 0", &[], None);
+        if succeeds {
+            assert_eq!(ids(&result.unwrap().into_parts().0.rows), vec![Value::Int(1), Value::Int(3)]);
+            assert_eq!(take_last_counts().unwrap().scanned, 2);
+        } else {
+            assert!(matches!(result, Err(CoreError::Task(TaskError::BudgetExceeded(
+                crate::task::Budget::RowsScanned
+            )))), "{result:?}");
+        }
+        drop(s);
+        drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 }
