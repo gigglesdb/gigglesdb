@@ -761,13 +761,12 @@ fn bind_request_planned(
     let (table, operation) = bind_table(table, request, bindings, session.max_read_rows())?;
     Ok((table, operation, None))
 }
-/// A task refusal on the native surface keeps its SQLSTATE. Denials also
-/// retain the rule: 42501 alone cannot identify its fixed diagnostic.
+/// A task refusal on the native surface keeps its SQLSTATE and its name and
+/// fixed message: 42501 or 54T01 alone cannot identify the refusal, and a
+/// budget stop inside the read (R3-402) must reach native clients as the same
+/// task error every other surface reports (R3-1101).
 fn task_error(e: crate::task::TaskError) -> Error {
-    match e {
-        crate::task::TaskError::Denied(_) => Error::Task(e),
-        _ => Error::Sql { sqlstate: e.sqlstate().into() },
-    }
+    Error::Task(e)
 }
 /// `core`, except that a task refusal keeps its SQLSTATE (`task_error`).
 fn core_or_task(e: CoreError) -> Error {

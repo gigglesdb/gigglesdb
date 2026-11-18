@@ -360,3 +360,5 @@ mod r3_exit_outcomes;
 
 #[path = "r3_denied_surfaces.rs"]
 mod r3_denied_surfaces;
+#[path = "r3_exit_races.rs"]
+mod r3_exit_races;

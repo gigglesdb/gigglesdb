@@ -1104,6 +1104,14 @@ pub mod parity {
         http_call_auth(address, ca, Some(cert), None, method, path, token, body).await
     }
 
+    /// Credential-only HTTP probe for race tests; never presents a client certificate.
+    pub async fn credential_http_call(
+        address: SocketAddr, ca: &TestCert, secret: &str,
+        method: &str, path: &str, token: Option<&str>, body: Option<&Value>,
+    ) -> (u16, Value) {
+        http_call_auth(address, ca, None, Some(secret), method, path, token, body).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn http_call_auth(
         address: SocketAddr,
