@@ -696,6 +696,18 @@ impl ClusterNode {
             store.clone(),
             Some(engines.opener()),
         )?);
+        if let Some(liveness) = host.liveness() {
+            let calls = Arc::downgrade(transport.calls());
+            let tracker = Arc::downgrade(&liveness);
+            liveness.listen(Arc::new(move |node, alive| {
+                if !alive && !tracker.upgrade().is_some_and(|l| l.ever_heard(node)) {
+                    return;
+                }
+                if let Some(calls) = calls.upgrade() {
+                    calls.set_alive(node, alive);
+                }
+            }));
+        }
         host.set_system(Some(engines.system_service()));
         let _ = late.0.set(Arc::downgrade(&host));
         transport.set_call_handlers(Some(ranges.clone()), None);

@@ -4,7 +4,9 @@
 //! `CallRequest` frames out and `CallResponse` frames back, matched by id. Call frames carry
 //! the database cluster id (group 0's id): calls are node to node, not per group. A caller
 //! holds one slot of the peer's bounded queue until its reply or timeout; a full queue or an
-//! exhausted server pool answers `Unavailable` at once, never silence.
+//! exhausted server pool answers `Unavailable` at once, never silence. A reply timeout fails
+//! only that call; three consecutive timeouts recycle a stalled connection. Node liveness
+//! refuses new calls and, after a grace period, retires the connection while writes finish.
 use super::{Body, Header, MAX_FRAME, frame, runtime::Peers};
 use crate::call_codec::{
     self, GatewayCall, GatewayReply, NodeCall, NodeReport, PeerCall, PeerReply,
@@ -28,6 +30,8 @@ use tokio::{
 
 /// Frame header (41) plus call id (8).
 const MAX_BODY: usize = MAX_FRAME - 49;
+/// Allow a stalled heartbeat thread to recover without losing in-flight writes.
+const DEAD_GRACE: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Must stay below the range lock lease minus the gateway's eviction margin (10 s lease
 /// today), so a write is either sent promptly or never.
@@ -82,14 +86,27 @@ fn lost(call: &PeerCall, what: String) -> RangeError {
             | RangeCall::Finalize { .. }
             | RangeCall::Home { .. },
         ) => RangeError::Unknown(what),
-        PeerCall::Range(RangeCall::LockBatch(_)) => RangeError::Unavailable(what),
         _ => RangeError::Unavailable(what),
     }
+}
+
+struct Pending {
+    reply: std_mpsc::SyncSender<Reply>,
+    deadline: Instant,
+    retryable: bool,
+}
+
+#[derive(Default)]
+struct PendingState {
+    calls: HashMap<u64, Pending>,
+    retryable_failure: Option<String>,
+    timeouts: usize,
 }
 
 struct Outgoing {
     enqueued_at: Instant,
     lease_sensitive: bool,
+    retryable: bool,
     body: Vec<u8>,
     reply: Option<(std_mpsc::SyncSender<Reply>, Instant)>,
 }
@@ -102,6 +119,7 @@ impl Outgoing {
     ) -> Self {
         Self {
             enqueued_at: Instant::now(),
+            retryable: matches!(lost(call, String::new()), RangeError::Unavailable(_)),
             lease_sensitive: matches!(
                 call,
                 PeerCall::Range(
@@ -137,6 +155,23 @@ struct Conn {
     tx: mpsc::Sender<Outgoing>,
     slots: Arc<Semaphore>,
     task: JoinHandle<()>,
+    pending: Arc<Mutex<PendingState>>,
+}
+
+impl Conn {
+    fn fail_retryable(&self, why: String) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        pending.retryable_failure = Some(why.clone());
+        pending.calls.retain(|_, call| {
+            if call.retryable {
+                let _ = call
+                    .reply
+                    .try_send(Err(RangeError::Unavailable(why.clone())));
+            }
+            !call.retryable
+        });
+        !pending.calls.is_empty()
+    }
 }
 
 impl Drop for Conn {
@@ -149,7 +184,8 @@ impl Drop for Conn {
 pub struct PeerCalls {
     peers: Arc<Peers>,
     limits: RwLock<CallLimits>,
-    conns: Mutex<BTreeMap<u64, Arc<Conn>>>,
+    conns: Arc<Mutex<BTreeMap<u64, Arc<Conn>>>>,
+    dead: Arc<Mutex<BTreeMap<u64, Instant>>>,
 }
 
 impl PeerCalls {
@@ -157,7 +193,8 @@ impl PeerCalls {
         Self {
             peers,
             limits: RwLock::new(CallLimits::default()),
-            conns: Mutex::default(),
+            conns: Arc::default(),
+            dead: Arc::default(),
         }
     }
 
@@ -167,28 +204,55 @@ impl PeerCalls {
         self.conns.lock().unwrap().clear();
     }
 
-    /// Sends `call` to `node` and waits up to `timeout` for its reply.
-    pub fn call(&self, node: u64, call: PeerCall, timeout: Duration) -> Reply {
-        let drop_on_timeout = match &call {
-            PeerCall::Range(call) => drop_range_on_timeout(call),
-            _ => true,
-        };
-        self.call_with(node, call, timeout, drop_on_timeout)
+    /// Refuses new calls to dead peers immediately. Their connection and waiting replies
+    /// survive for two seconds; then the connection is retired and retryable calls fail.
+    /// Waiting writes retain the retired connection until they complete or time out.
+    /// An alive report cancels the pending failure.
+    /// A later dead report starts a fresh grace period.
+    pub fn set_alive(&self, node: u64, alive: bool) {
+        let mut dead = self.dead.lock().unwrap();
+        if alive {
+            dead.remove(&node);
+            if let Some(conn) = self.conns.lock().unwrap().get(&node) {
+                conn.pending.lock().unwrap().retryable_failure = None;
+            }
+        } else {
+            let reported = Instant::now();
+            dead.insert(node, reported);
+            let dead = self.dead.clone();
+            let conns = self.conns.clone();
+            self.peers.runtime.spawn(async move {
+                tokio::time::sleep_until((reported + DEAD_GRACE).into()).await;
+                // Match this report while holding the same lock enqueue takes before conns.
+                // An old timer must not fail calls after dead -> alive -> dead.
+                let dead = dead.lock().unwrap();
+                if dead.get(&node) == Some(&reported)
+                    && let Some(conn) = conns.lock().unwrap().remove(&node)
+                {
+                    // Never reuse this socket, even after an alive report. Each waiting
+                    // caller holds an Arc<Conn>; writes keep the retired task alive,
+                    // and the last caller returning (or timing out) aborts it via Drop.
+                    // Without pending writes there is nothing left worth preserving.
+                    if !conn.fail_retryable(format!("node {node} is not live")) {
+                        conn.task.abort();
+                    }
+                }
+            });
+        }
     }
 
-    /// As `call`; a timeout drops the connection only with `drop_on_timeout`.
-    fn call_with(
-        &self,
-        node: u64,
-        call: PeerCall,
-        timeout: Duration,
-        drop_on_timeout: bool,
-    ) -> Reply {
+    /// Nodes without a liveness report are presumed live.
+    pub fn is_live(&self, node: u64) -> bool {
+        !self.dead.lock().unwrap().contains_key(&node)
+    }
+
+    /// Sends `call` to `node` and waits up to `timeout` for its reply.
+    pub fn call(&self, node: u64, call: PeerCall, timeout: Duration) -> Reply {
         let (tx, rx) = std_mpsc::sync_channel(1);
         let deadline = Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(|| Instant::now() + LOCK_BACKSTOP);
-        let _slot = self.enqueue(node, &call, Some((tx, deadline)))?;
+        let (_slot, conn) = self.enqueue(node, &call, Some((tx, deadline)))?;
         match rx.recv_timeout(timeout) {
             // A reply that cannot be decoded or was replaced at the server says nothing
             // about whether a write ran: its outcome is unknown (design.md 2).
@@ -202,11 +266,20 @@ impl PeerCalls {
             Ok(Err(RangeError::Corrupt(why))) => Err(lost(&call, why)),
             Ok(reply) => reply,
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                // A black-holed peer would make every later call wait out its timeout
-                // too: drop the connection so they fail fast (never sent = Unavailable).
-                if drop_on_timeout {
-                    self.conns.lock().unwrap().remove(&node);
+                // Serialize recycling with replies and replacement connections.
+                let mut conns = self.conns.lock().unwrap();
+                let mut pending = conn.pending.lock().unwrap();
+                pending.timeouts += 1;
+                if pending.timeouts >= 3
+                    && conns
+                        .get(&node)
+                        .is_some_and(|current| Arc::ptr_eq(current, &conn))
+                {
+                    conns.remove(&node);
+                    conn.task.abort();
+                    pending.calls.clear();
                 }
+                // Late replies are ignored once this receiver is dropped.
                 Err(lost(&call, format!("call to node {node} timed out")))
             }
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
@@ -238,7 +311,12 @@ impl PeerCalls {
         node: u64,
         call: &PeerCall,
         reply: Option<(std_mpsc::SyncSender<Reply>, Instant)>,
-    ) -> std::result::Result<OwnedSemaphorePermit, RangeError> {
+    ) -> std::result::Result<(OwnedSemaphorePermit, Arc<Conn>), RangeError> {
+        // Serialize enqueue with liveness changes so a dead node cannot reconnect.
+        let dead = self.dead.lock().unwrap();
+        if dead.contains_key(&node) {
+            return Err(RangeError::Unavailable(format!("node {node} is not live")));
+        }
         let body = call_codec::encode_call(call)?;
         if body.len() > MAX_BODY {
             return Err(RangeError::Corrupt("call exceeds the frame limit".into()));
@@ -247,7 +325,7 @@ impl PeerCalls {
         let full = || RangeError::Unavailable("call queue full".into());
         let slot = conn.slots.clone().try_acquire_owned().map_err(|_| full())?;
         match conn.tx.try_send(Outgoing::new(call, body, reply)) {
-            Ok(()) => Ok(slot),
+            Ok(()) => Ok((slot, conn)),
             Err(mpsc::error::TrySendError::Full(_)) => Err(full()),
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.conns.lock().unwrap().remove(&node);
@@ -268,12 +346,21 @@ impl PeerCalls {
         }
         let queue = self.limits.read().unwrap().queue.max(1);
         let (tx, rx) = mpsc::channel(queue);
-        let task = self
-            .peers
-            .runtime
-            .spawn(connection(self.peers.clone(), node, rx, queue));
+        let pending = Arc::new(Mutex::new(PendingState::default()));
+        let task = self.peers.runtime.spawn(connection(
+            self.peers.clone(),
+            node,
+            rx,
+            queue,
+            pending.clone(),
+        ));
         let slots = Arc::new(Semaphore::new(queue));
-        let conn = Arc::new(Conn { tx, slots, task });
+        let conn = Arc::new(Conn {
+            tx,
+            slots,
+            task,
+            pending,
+        });
         conns.insert(node, conn.clone());
         Ok(conn)
     }
@@ -293,12 +380,7 @@ impl PeerCalls {
             GatewayCall::DdlClose { .. } | GatewayCall::DdlOpen(_) | GatewayCall::DdlLive(_)
         );
         let reply = if ddl {
-            self.call_with(
-                node,
-                PeerCall::Gateway(call),
-                timeout.min(DDL_CALL_TIMEOUT),
-                false,
-            )
+            self.call(node, PeerCall::Gateway(call), timeout.min(DDL_CALL_TIMEOUT))
         } else {
             PeerCalls::call(self, node, PeerCall::Gateway(call), timeout)
         };
@@ -326,10 +408,6 @@ impl RangeTransport for PeerCalls {
     }
 }
 
-fn drop_range_on_timeout(call: &RangeCall) -> bool {
-    !matches!(call, RangeCall::Lock(_) | RangeCall::OracleNext { .. })
-}
-
 /// Reply deadline of a range call with base deadline `base`.
 fn call_deadline(base: Duration, call: &RangeCall) -> Duration {
     match call {
@@ -351,6 +429,7 @@ fn unreachable(node: u64, error: &RangeError) -> bool {
         return false;
     };
     [
+        format!("node {node} is not live"),
         format!("call to node {node} timed out"),
         format!("call connection to node {node} lost"),
         format!("call connection to node {node} closed"),
@@ -425,7 +504,13 @@ impl GatewayPeer for PeerCalls {
 
 /// One peer's call connection: connects on demand; a failed connect fails the queued calls
 /// with `Unavailable` (never sent); a lost connection drops the waiting callers' replies.
-async fn connection(peers: Arc<Peers>, node: u64, mut rx: mpsc::Receiver<Outgoing>, queue: usize) {
+async fn connection(
+    peers: Arc<Peers>,
+    node: u64,
+    mut rx: mpsc::Receiver<Outgoing>,
+    queue: usize,
+    pending: Arc<Mutex<PendingState>>,
+) {
     while let Some(first) = rx.recv().await {
         let stream = match tokio::time::timeout(CONNECT_TIMEOUT, peers.connect(node)).await {
             Ok(Ok(stream)) => stream,
@@ -461,7 +546,6 @@ async fn connection(peers: Arc<Peers>, node: u64, mut rx: mpsc::Receiver<Outgoin
             to: me,
         };
         let (mut r, mut w) = tokio::io::split(stream);
-        let pending = Mutex::new(HashMap::new());
         let mut first = Some(first);
         let mut next_id = 0_u64;
         let writer = async {
@@ -477,21 +561,34 @@ async fn connection(peers: Arc<Peers>, node: u64, mut rx: mpsc::Receiver<Outgoin
                     continue;
                 };
                 next_id += 1;
-                if let Some(reply) = o.reply {
+                if let Some((reply, deadline)) = o.reply {
                     let mut pending = pending.lock().unwrap();
                     // Live entries hold queue slots; anything past the cap timed out.
-                    if pending.len() >= queue {
+                    if pending.calls.len() >= queue {
                         let now = Instant::now();
-                        pending.retain(|_, entry: &mut (_, Instant)| entry.1 > now);
+                        pending.calls.retain(|_, entry| entry.deadline > now);
                     }
-                    pending.insert(next_id, reply);
+                    if o.retryable
+                        && let Some(why) = &pending.retryable_failure
+                    {
+                        let _ = reply.try_send(Err(RangeError::Unavailable(why.clone())));
+                        continue;
+                    }
+                    pending.calls.insert(
+                        next_id,
+                        Pending {
+                            reply,
+                            deadline,
+                            retryable: o.retryable,
+                        },
+                    );
                 }
                 let request = Body::CallRequest {
                     id: next_id,
                     body: o.body,
                 };
                 let Ok(bytes) = frame::encode(&out, &request) else {
-                    pending.lock().unwrap().remove(&next_id);
+                    pending.lock().unwrap().calls.remove(&next_id);
                     continue;
                 };
                 if frame::write_frame(&mut w, &bytes).await.is_err() {
@@ -504,7 +601,12 @@ async fn connection(peers: Arc<Peers>, node: u64, mut rx: mpsc::Receiver<Outgoin
                 let Ok(Body::CallResponse { id, body }) = frame::decode(&back, &bytes) else {
                     return;
                 };
-                let Some((reply, _)) = pending.lock().unwrap().remove(&id) else {
+                let reply = {
+                    let mut pending = pending.lock().unwrap();
+                    pending.timeouts = 0;
+                    pending.calls.remove(&id)
+                };
+                let Some(Pending { reply, .. }) = reply else {
                     continue;
                 };
                 let _ = reply.try_send(call_codec::decode_reply(&body).and_then(|r| r));
@@ -514,6 +616,7 @@ async fn connection(peers: Arc<Peers>, node: u64, mut rx: mpsc::Receiver<Outgoin
             _ = writer => {},
             _ = reader => {},
         }
+        pending.lock().unwrap().calls.clear();
     }
 }
 
@@ -840,6 +943,7 @@ mod tests {
     fn transport_failures_are_unreachable_answers_are_not() {
         let call = PeerCall::Range(lock(None));
         for error in [
+            RangeError::Unavailable("node 3 is not live".into()),
             lost(&call, "call to node 3 timed out".into()),
             RangeError::Unknown("call to node 3 timed out".into()),
             lost(&call, "call connection to node 3 lost".into()),
@@ -882,24 +986,6 @@ mod tests {
         let peers = |call: &RangeCall| call_deadline(Duration::from_secs(1), call);
         assert_eq!(peers(&lock(Some(250))), Duration::from_millis(1250));
     }
-    #[test]
-    fn lock_and_oracle_timeouts_keep_other_calls_connected() {
-        assert!(!drop_range_on_timeout(&lock(Some(500))));
-        assert!(!drop_range_on_timeout(&lock(None)));
-        assert!(!drop_range_on_timeout(&RangeCall::OracleNext {
-            range: RangeId(1),
-            n: 1
-        }));
-        assert!(drop_range_on_timeout(&RangeCall::Commit {
-            range: RangeId(2),
-            epoch: Epoch(1),
-            txn: ClusterTxnId(7),
-            writes: vec![],
-            marker_xid: None,
-            lock_generation: None,
-        }));
-    }
-
     #[test]
     fn expired_queued_call_is_never_sent() {
         let now = Instant::now();

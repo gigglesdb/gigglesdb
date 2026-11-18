@@ -150,7 +150,7 @@ impl ClusterProcs {
                 "postgresql": {"listen": node.pg, "tls": "disabled", "loopback_trust": true},
                 "cluster": {"node_id": i + 1, "cluster": "0123456789abcdef0123456789abcdef",
                     "listen": node.listen, "log_dir": node.dir.join("raftlog"),
-                    "tick_ms": 50, "owner": "owner", "peers": peers, "split_keys": split_keys,
+                    "tick_ms": 50, "peer_call_timeout_ms": 15000, "owner": "owner", "peers": peers, "split_keys": split_keys,
                     "initial_members": (1..=if spare { n - 1 } else { n }).collect::<Vec<_>>()}
             });
             std::fs::write(

@@ -23,12 +23,6 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 /// How long a starting node waits for the directory and every range's leader.
 const READY_TIMEOUT: Duration = Duration::from_secs(600);
-/// Reply deadline of a range call (a lock call adds its own wait). A leader cut off by a
-/// silent partition answers nothing; the router tries another replica only after this, so it
-/// bounds the stall of every statement behind such a call (GD-0075 P7-2). Kept well above the
-/// engines' read wait (5 s): a read may legitimately wait that long on a prepared record, and a
-/// call timeout drops the peer connection with every call on it (delta review D1).
-const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A running cluster node and its gateway. Dropping it stops neither; call `stop`.
 pub struct ClusterRuntime {
@@ -93,7 +87,7 @@ impl ClusterRuntime {
             liveness: Some(LivenessConfig::default()),
             policy: Some(SnapshotPolicy::default()),
             call_limits: Some(CallLimits {
-                timeout: CALL_TIMEOUT,
+                timeout: v.peer_call_timeout,
                 ..CallLimits::default()
             }),
         })

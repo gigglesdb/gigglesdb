@@ -31,6 +31,9 @@ pub struct ClusterConfig {
     pub ca: Option<PathBuf>,
     #[serde(default = "default_tick_ms")]
     pub tick_ms: u64,
+    /// Peer range-call reply deadline in milliseconds (10000..=600000).
+    #[serde(default = "default_peer_call_timeout_ms")]
+    pub peer_call_timeout_ms: u64,
     pub replication_factor: Option<usize>,
     /// Initial layout members; excludes a joining spare from bootstrap Raft groups.
     pub initial_members: Option<Vec<u64>>,
@@ -70,6 +73,10 @@ fn default_tick_ms() -> u64 {
     100
 }
 
+fn default_peer_call_timeout_ms() -> u64 {
+    15000
+}
+
 #[derive(Debug)]
 pub struct ClusterValidated {
     pub node_id: u64,
@@ -85,6 +92,7 @@ pub struct ClusterValidated {
     pub private_key: PathBuf,
     pub ca: PathBuf,
     pub tick: Duration,
+    pub peer_call_timeout: Duration,
     pub replication_factor: usize,
     /// Strictly increasing range keys, each above `range_api::first_user_key()`.
     pub split_keys: Vec<Vec<u8>>,
@@ -178,6 +186,9 @@ impl ClusterConfig {
             }
             None
         };
+        if !(10000..=600000).contains(&self.peer_call_timeout_ms) {
+            return Err("cluster.peer_call_timeout_ms: must be between 10000 and 600000".into());
+        }
         let (log_dir, snapshot_dir) = resolve_dirs(
             "cluster",
             &self.log_dir,
@@ -258,6 +269,7 @@ impl ClusterConfig {
                 .unwrap_or_else(|| private_key.into()),
             ca: self.ca.clone().unwrap_or_else(|| ca.into()),
             tick: Duration::from_millis(self.tick_ms),
+            peer_call_timeout: Duration::from_millis(self.peer_call_timeout_ms),
             replication_factor,
             split_keys,
             owner: self.owner.clone(),
@@ -299,6 +311,7 @@ mod tests {
             private_key: None,
             ca: None,
             tick_ms: 100,
+            peer_call_timeout_ms: default_peer_call_timeout_ms(),
             replication_factor: None,
             initial_members: None,
             split_keys: Vec::new(),
@@ -480,6 +493,27 @@ mod tests {
     }
 
     #[test]
+    fn validates_peer_call_timeout() {
+        for ms in [10000, 15000, 600000] {
+            let c = ClusterConfig {
+                peer_call_timeout_ms: ms,
+                ..config()
+            };
+            assert_eq!(
+                validate(&c).unwrap().peer_call_timeout,
+                Duration::from_millis(ms)
+            );
+        }
+        for ms in [0, 1000, 2000, 9999, 600001, u64::MAX] {
+            let c = ClusterConfig {
+                peer_call_timeout_ms: ms,
+                ..config()
+            };
+            reject(&c, "cluster.peer_call_timeout_ms:");
+        }
+    }
+
+    #[test]
     fn rejects_split_keys() {
         let first = hex::encode(range_api::first_user_key());
         let catalog = key(RangeSpace::Catalog, b"x");
@@ -599,6 +633,11 @@ mod tests {
         });
         let c: ClusterConfig = serde_json::from_value(minimal.clone()).unwrap();
         assert_eq!(c.tick_ms, 100);
+        assert_eq!(c.peer_call_timeout_ms, 15000);
+        assert_eq!(
+            validate(&c).unwrap().peer_call_timeout,
+            Duration::from_secs(15)
+        );
         assert!(c.peers.is_empty() && c.split_keys.is_empty() && c.replication_factor.is_none());
         let mut unknown = minimal.clone();
         unknown["surprise"] = true.into();

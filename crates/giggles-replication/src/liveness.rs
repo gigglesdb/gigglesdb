@@ -40,6 +40,7 @@ pub type Listener = Arc<dyn Fn(u64, bool) + Send + Sync>;
 struct Peer {
     heard: Instant,
     alive: bool,
+    ever_heard: bool,
 }
 struct State {
     peers: BTreeMap<u64, Peer>,
@@ -134,6 +135,7 @@ impl Liveness {
                 s.peers.entry(id).or_insert(Peer {
                     heard: Instant::now(),
                     alive: true,
+                    ever_heard: false,
                 });
             }
         }
@@ -151,10 +153,28 @@ impl Liveness {
 
     /// Records a heartbeat from `from` (the receiving side of `LIVENESS_GROUP`).
     pub fn heard(&self, from: u64) {
-        let mut s = self.state.0.lock().expect("liveness mutex poisoned");
-        if let Some(peer) = s.peers.get_mut(&from) {
-            peer.heard = Instant::now();
+        if from == self.node {
+            return;
         }
+        let mut s = self.state.0.lock().expect("liveness mutex poisoned");
+        let peer = s.peers.entry(from).or_insert(Peer {
+            heard: Instant::now(),
+            alive: true,
+            ever_heard: false,
+        });
+        peer.heard = Instant::now();
+        peer.ever_heard = true;
+    }
+
+    /// Whether a heartbeat has ever arrived from this peer since startup.
+    pub fn ever_heard(&self, node: u64) -> bool {
+        self.state
+            .0
+            .lock()
+            .expect("liveness mutex poisoned")
+            .peers
+            .get(&node)
+            .is_some_and(|peer| peer.ever_heard)
     }
 
     /// Peers currently considered alive.

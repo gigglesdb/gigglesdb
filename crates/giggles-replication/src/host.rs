@@ -331,6 +331,11 @@ impl RangeHost {
         self.inner.roles.set_system(system);
     }
 
+    /// Coalesced peer liveness tracker, when enabled.
+    pub fn liveness(&self) -> Option<Arc<Liveness>> {
+        self.inner.liveness.clone()
+    }
+
     pub fn node_id(&self) -> u64 {
         self.inner.config.node_id
     }
