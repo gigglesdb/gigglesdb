@@ -9,17 +9,15 @@ mod extended;
 mod gamma;
 mod gamma_data;
 mod hyperbolic;
-mod ibm_pending;
+mod ibm;
 mod pow;
 mod pow_data;
 pub use basic::{cbrt, exp, log, log10};
 pub use erf::{erf, erfc};
 pub use gamma::{lgamma, tgamma};
 pub use hyperbolic::{acosh, asinh, atanh, cosh, sinh, tanh};
-pub use ibm_pending::{acos, asin, atan, atan2, cos, sin, tan};
+pub use ibm::{acos, asin, atan, atan2, cos, sin, tan};
 pub use pow::pow;
-/// Set to false when replacing ibm_pending with the qualified IBM module.
-pub const IBM_PENDING: bool = true;
 
 pub static IDENTITY: &std::ffi::CStr = c"giggles-glibm/1 glibc-2.41-12+deb13u4 x86_64-fma";
 #[unsafe(no_mangle)]

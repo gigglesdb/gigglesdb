@@ -27,12 +27,8 @@ const IBM: &[(&str, Unary)] = &[
 ];
 fn names() -> Vec<&'static str> {
     let mut names: Vec<_> = UNARY.iter().map(|(n, _)| *n).chain(["pow"]).collect();
-    if !m::IBM_PENDING {
-        names.extend(IBM.iter().map(|(n, _)| *n));
-        names.push("atan2");
-    } else {
-        eprintln!("skip IBM sin/cos/tan/asin/acos/atan/atan2: ibm_pending stubs");
-    }
+    names.extend(IBM.iter().map(|(n, _)| *n));
+    names.push("atan2");
     names
 }
 fn run(name: &str, records: impl Iterator<Item = Vec<u64>>) -> usize {

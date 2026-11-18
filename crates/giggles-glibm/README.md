@@ -9,20 +9,9 @@ It is not wired into GigglesDB.
 
 ## Status and integration
 
-This lane implements cbrt, exp, log, log10, pow, sinh, cosh, tanh, asinh,
-acosh, atanh, erf, erfc, tgamma and lgamma (including lgamma_neg).
-The seven IBM exports intentionally return NaN in `src/ibm_pending.rs`.
-**Negative gamma paths depend on sin/cos and cannot pass standalone
-qualification until the parallel IBM module is merged.** Tests do not hide
-these failures. To integrate, replace `mod ibm_pending` and its reexports
-with `mod ibm` and its reexports, and set `IBM_PENDING` to false. This also
-enables checking all seven IBM fixture/sweep files.
-
-All 15 implemented routines passed 2,000 fixtures and 1,000,000 sweep records
-each in both debug and release diagnostics with the parallel lane's IBM
-module substituted temporarily. That module is not included in this commit.
-The standalone crate qualifies 13 routines; negative tgamma/lgamma records
-remain expected failures until integration. Do not deploy this stub build.
+All 22 functions are wired to the portable implementation, including the IBM
+sin, cos, tan, asin, acos, atan and atan2 routines and gamma's internal calls.
+The IBM unit tests and all 22 fixture/sweep streams are enabled.
 
 ## Provenance and operation
 
