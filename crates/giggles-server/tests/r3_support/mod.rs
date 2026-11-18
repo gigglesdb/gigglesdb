@@ -81,6 +81,15 @@ pub const DEFAULT_CLIENTS: usize = 4;
 /// D9: at most 50 attempts per agent step.
 pub const MAX_ATTEMPTS: u32 = 50;
 
+// R3 load tests measure per-task limits and the application latency bound, not
+// the node-wide request rate cap. A fast box exceeded the 4096/s default and
+// the server closed connections without an error frame (gate-18).
+const LOAD_TEST_LIMITS: ServiceLimits = ServiceLimits {
+    sessions: 128,
+    burst: 1_000_000,
+    per_second: 1_000_000,
+};
+
 const SCHEMA: &str = "CREATE TABLE shipments (merchant_id bigint, id bigint, status text, \
      failed_at timestamptz, attempt_count int, customer_email text, card_token text, \
      PRIMARY KEY (merchant_id, id))";
@@ -258,7 +267,7 @@ impl R3Fixture {
             Vec::new(),
             vec![binding(&self.agent_cert, EXECUTOR, &[TASK, SCAN_TASK])],
             Clock::new(0, 3600).unwrap(),
-            ServiceLimits::default(),
+            LOAD_TEST_LIMITS,
         )
         .unwrap();
         let config = PostgresqlConfig {

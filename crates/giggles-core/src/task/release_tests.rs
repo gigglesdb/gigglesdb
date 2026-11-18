@@ -261,10 +261,14 @@ fn plain_exit_fails_closed_in_task_session() {
         assert_eq!(page.untasked(), Err(refused.clone()));
     }
     #[cfg(not(feature = "engine-rocksdb"))]
-    assert_eq!(
-        sql.execute_native_unreleased(&read, &bindings).map(|_| ()),
-        Err(crate::operations::Error::Sql { sqlstate: "28T01".into() })
-    );
+    {
+        let error = TaskError::Revoked;
+        assert_eq!(error.sqlstate(), "28T01");
+        assert_eq!(
+            sql.execute_native_unreleased(&read, &bindings).map(|_| ()),
+            Err(crate::operations::Error::Task(error))
+        );
+    }
     // Outside a task session the same calls work.
     let mut plain = admin.sql_session();
     assert_eq!(plain.execute("SELECT id FROM shipments", &[], None).unwrap().rows.len(), 3);

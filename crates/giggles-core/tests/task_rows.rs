@@ -25,6 +25,7 @@ use giggles_core::{
     roles::{NewRole, TablePrivilege},
     task::{
         Actor, DenyRule, OperationId, ProtectedRequest, Receipt, TaskError,
+        admit::StatementClass,
         context::open_context,
         definition::{
             AllowedWrite, DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText,
@@ -749,9 +750,9 @@ fn native_read_and_update_scope() {
 
 /// A native write refused in a task session (0A000, before it runs).
 fn refused_write() -> NativeError {
-    NativeError::Sql {
-        sqlstate: "0A000".into(),
-    }
+    let error = TaskError::NotAllowedInTaskSession(StatementClass::Update);
+    assert_eq!(error.sqlstate(), "0A000");
+    NativeError::Task(error)
 }
 
 #[test]

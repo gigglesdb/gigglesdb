@@ -120,7 +120,7 @@ async fn rows(
 fn code(error: tokio_postgres::Error) -> String {
     error
         .as_db_error()
-        .expect("SQL refusal")
+        .unwrap_or_else(|| panic!("SQL refusal expected, got {error:?}"))
         .code()
         .code()
         .into()
@@ -875,7 +875,12 @@ async fn agents_at_every_limit_keep_application_inside_bound() {
                 );
                 for reply in [one, two] {
                     if let Err(error) = reply {
-                        refusals.insert(error.as_db_error().unwrap().message().to_owned());
+                        // A connection-level error (closed, IO) is not a limit
+                        // refusal; name it instead of unwrapping None.
+                        let db = error.as_db_error().unwrap_or_else(|| {
+                            panic!("{name}: agent query failed without a database error: {error:?}")
+                        });
+                        refusals.insert(db.message().to_owned());
                         if error.code().is_some_and(|code| code.code() == "57014") {
                             refusals.insert("statement deadline".into());
                         }
