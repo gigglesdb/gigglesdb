@@ -2637,6 +2637,14 @@ impl Session {
                     .log_refused_task_statement(sql, class, params.len(), &error);
                 Err(error)
             };
+            // Server task DDL must be refused before core's SQL parser, as
+            // on pgwire; CREATE TASK is not core SQL grammar.
+            if crate::task_ddl::parse(sql).is_some() {
+                let class = giggles_core::task::StatementClass::RoleStatement;
+                if let Err(error) = session.admit_backstop(class) {
+                    return refused(session, class, error);
+                }
+            }
             // `prepare` admits the statement's class itself, before it parses
             // the whole statement; the refusal is logged with that class.
             let p = match session.prepare(sql) {

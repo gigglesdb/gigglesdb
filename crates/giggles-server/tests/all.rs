@@ -272,6 +272,8 @@ mod agent_limits;
 #[path = "agent_bindings.rs"]
 mod agent_bindings;
 
+#[path = "agent_bypass.rs"]
+mod agent_bypass;
 #[path = "agent_pg_connect.rs"]
 mod agent_pg_connect;
 
