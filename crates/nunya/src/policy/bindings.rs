@@ -493,8 +493,24 @@ fn reconcile_with_names(
                 updated.status = BindingStatus::NeedsRepair;
             }
             updated.family = family;
-            if show && record.show_rule.is_none() && !anchored(column) {
-                updated.show_rule = Some(column.clone());
+            match record.show_rule.as_ref() {
+                Some(old) if !matches!(doc.policy.columns.get(old), Some(Treatment::Show)) => {
+                    if !show {
+                        updated.show_rule = None;
+                    } else if updated.status == BindingStatus::Active
+                        && !bindings.iter().any(|(other, r)| {
+                            other != identity && r.show_rule.as_ref() == Some(column)
+                        })
+                    {
+                        // The operator moved the rule along with this identity,
+                        // without taking another identity's anchor.
+                        updated.show_rule = Some(column.clone());
+                    }
+                }
+                None if show && updated.status == BindingStatus::Active && !anchored(column) => {
+                    updated.show_rule = Some(column.clone());
+                }
+                Some(_) | None => {}
             }
             if updated != *record {
                 changes
@@ -584,19 +600,32 @@ fn reconcile_with_names(
                     .iter()
                     .any(|column| column.name == record.column.column)
         });
-        if !columns.contains_key(identity)
+        let retire = !columns.contains_key(identity)
             && (!name_still_present || snapshot.column_id(&record.column).is_some())
             && record.status != BindingStatus::Retired
-            && (doc.route_default == RouteDefault::Tokenize || record.linked)
-        {
+            && (doc.route_default == RouteDefault::Tokenize || record.linked);
+        let clear_absent_anchor = !columns.contains_key(identity)
+            && record.show_rule.as_ref().is_some_and(|old| {
+                !matches!(doc.policy.columns.get(old), Some(Treatment::Show))
+                    && !matches!(doc.policy.columns.get(&record.column), Some(Treatment::Show))
+            });
+        if retire || clear_absent_anchor {
             changes.insert(
                 identity.clone(),
                 vec![BindingChange::Update {
                     identity: identity.clone(),
                     column: record.column.clone(),
                     family: record.family,
-                    show_rule: record.show_rule.clone(),
-                    status: BindingStatus::Retired,
+                    show_rule: if clear_absent_anchor {
+                        None
+                    } else {
+                        record.show_rule.clone()
+                    },
+                    status: if retire {
+                        BindingStatus::Retired
+                    } else {
+                        record.status
+                    },
                 }],
             );
         }
@@ -1366,6 +1395,88 @@ mod tests {
         show.route_default = RouteDefault::Show;
         assert!(reconcile(&RouteBindings::default(), &show, &snapshot).is_empty());
     }
+    #[test]
+    fn stale_show_anchor_cannot_grant_dropped_name_to_renamed_identity() {
+        use super::super::effective::{Effective, Origin};
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let named = |n: &str| ColumnRef {
+            column: n.into(),
+            ..column()
+        };
+        let mut doc = document();
+        doc.policy.columns.insert(named("a"), Treatment::Show);
+        doc.policy.columns.insert(named("b"), Treatment::Show);
+        let first = snap(vec![
+            (named("a"), Some(id(1)), ColumnType::Text),
+            (named("b"), Some(id(2)), ColumnType::Text),
+        ]);
+        let before = refresh(&store, &route(), &doc, &first).unwrap();
+        doc.policy.columns.remove(&named("b"));
+        let renamed = pg("a", 2, ColumnType::Text);
+        // Compilation must also fail closed before reconciliation persists changes.
+        assert_ne!(
+            result(&doc, &renamed, &before, &named("a")).0,
+            Effective::Show
+        );
+        let after = refresh(&store, &route(), &doc, &renamed).unwrap();
+        assert_eq!(after.get(&id(2)).unwrap().show_rule, Some(named("b")));
+        assert_eq!(
+            result(&doc, &renamed, &after, &named("a")),
+            (Effective::Masked { placeholder: None }, Origin::NeedsRepair)
+        );
+    }
+
+    #[test]
+    fn show_anchor_rename_keeps_old_rule_then_follows_rule_to_new_name() {
+        use super::super::effective::{Effective, Origin};
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let old = column();
+        let new = ColumnRef {
+            column: "renamed".into(),
+            ..column()
+        };
+        let mut doc = document();
+        doc.policy.columns.insert(old.clone(), Treatment::Show);
+        refresh(&store, &route(), &doc, &pg("email", 1, ColumnType::Text)).unwrap();
+        let renamed = pg("renamed", 1, ColumnType::Text);
+        let kept = refresh(&store, &route(), &doc, &renamed).unwrap();
+        assert_eq!(kept.get(&id(1)).unwrap().show_rule, Some(old.clone()));
+        assert_eq!(
+            result(&doc, &renamed, &kept, &new),
+            (Effective::Show, Origin::Explicit)
+        );
+        doc.policy.columns.remove(&old);
+        doc.policy.columns.insert(new.clone(), Treatment::Show);
+        let moved = refresh(&store, &route(), &doc, &renamed).unwrap();
+        assert_eq!(moved.get(&id(1)).unwrap().show_rule, Some(new.clone()));
+        assert_eq!(
+            result(&doc, &renamed, &moved, &new),
+            (Effective::Show, Origin::Explicit)
+        );
+        assert_eq!(load(&store, &route()).unwrap(), moved);
+    }
+
+    #[test]
+    fn removed_show_rule_clears_persisted_anchor_and_uses_route_default() {
+        use super::super::effective::{Effective, Origin};
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let mut doc = document();
+        doc.policy.columns.insert(column(), Treatment::Show);
+        let snapshot = pg("email", 1, ColumnType::Text);
+        refresh(&store, &route(), &doc, &snapshot).unwrap();
+        doc.policy.columns.clear();
+        let after = refresh(&store, &route(), &doc, &snapshot).unwrap();
+        assert_eq!(after.get(&id(1)).unwrap().show_rule, None);
+        assert!(matches!(
+            result(&doc, &snapshot, &after, &column()),
+            (Effective::BlindPrivate { .. }, Origin::RouteDefault)
+        ));
+        assert_eq!(load(&store, &route()).unwrap(), after);
+    }
+
     #[test]
     fn postgres_rename_keeps_domain_and_anchored_show() {
         use super::super::effective::{Effective, Origin};

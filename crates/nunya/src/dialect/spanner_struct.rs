@@ -77,7 +77,8 @@ fn label(policy: &Policy, column: &ColumnRef) -> Label {
     match policy.treatment(column) {
         Some(Treatment::Blind { domain }) => Label::Blind(domain.clone()),
         Some(Treatment::Masked { .. }) => Label::Masked,
-        Some(Treatment::Show) | None => Label::Plain,
+        Some(Treatment::Show) => Label::Plain,
+        None => Label::Masked,
     }
 }
 fn empty(kind: StatementKind) -> Lowered {
@@ -320,10 +321,9 @@ mod tests {
                 domain: DomainName("email".into()),
             },
         );
-        (
-            Snapshot::new(vec![r, outbox], vec![], vec!["".into()], 0),
-            p,
-        )
+        let snapshot = Snapshot::new(vec![r, outbox], vec![], vec!["".into()], 0);
+        let p = crate::policy::effective::legacy_policy(p, &snapshot);
+        (snapshot, p)
     }
     fn values(n: usize) -> ListValue {
         ListValue {
@@ -478,8 +478,25 @@ mod tests {
             columns: Default::default(),
             ..p
         };
+        let plain = crate::policy::effective::legacy_policy(plain, &s);
         let lowered = lower_read(&request(), &s, &plain).unwrap();
         assert_eq!(lowered.stmt.param_count, 0);
         assert!(check(&lowered.stmt, &plain, &s).is_ok());
+    }
+    #[test]
+    fn read_missing_policy_column_is_masked_and_refused() {
+        let (snapshot, mut policy) = fixture();
+        let missing = ColumnRef {
+            schema: "".into(),
+            table: "Users".into(),
+            column: "Name".into(),
+        };
+        policy.columns.remove(&missing);
+        let lowered = lower_read(&request(), &snapshot, &policy).unwrap();
+        assert_eq!(lowered.stmt.outputs[1].label, Label::Masked);
+        assert_eq!(
+            check(&lowered.stmt, &policy, &snapshot).unwrap_err().code,
+            NyCode::NotAnalysable
+        );
     }
 }

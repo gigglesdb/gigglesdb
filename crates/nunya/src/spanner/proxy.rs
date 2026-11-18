@@ -2839,6 +2839,8 @@ mod tests {
         let f = Fixture::new().await;
         let mut policy = (**f.svc.ctx.policy.read().unwrap()).clone();
         policy.columns.clear();
+        let snapshot = f.svc.ctx.snapshot.read().unwrap().clone();
+        let policy = crate::policy::effective::legacy_policy(policy, &snapshot);
         *f.svc.ctx.policy.write().unwrap() = Arc::new(policy);
         let mut req = f.query("UPDATE customers SET email = @v").await;
         req.params = Some(prost_types::Struct {

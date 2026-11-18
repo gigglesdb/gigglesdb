@@ -522,24 +522,14 @@ impl ConfigReloader {
             && p.diff.reloadable.iter().any(|s| ["schemas", "search_path"].contains(s))) {
             Err("snapshot unavailable")
         } else { Ok(None) };
-        let candidate = candidate.and_then(|candidate| {
-            if let (Some(catalog), Some(snapshot)) = (self.catalog.get(), candidate.as_ref()) {
-                let policy = catalog.context.policy.read().map_err(|_| "snapshot unavailable")?;
-                crate::policy::validate::validate(&policy, snapshot).map_err(|_| "snapshot validation failed")?;
-            }
-            Ok(candidate)
-        });
         let prepared = prepared.and_then(|p| candidate.map(|c| (p, c)).map_err(str::to_owned));
         let mut standing_pending = false;
         let result = prepared.and_then(|(prepared, candidate)| {
             let hub = self.hub.upgrade().ok_or("reload service unavailable")?;
             let revision = prepared.config.revision.clone();
-            hub.commit_config_revision(&revision, || {
-                // The Hub publication lock keeps policy attempts from racing this validation.
-                if let (Some(catalog), Some(snapshot)) = (self.catalog.get(), candidate.as_ref()) {
-                    let policy = catalog.context.policy.read().map_err(|_| "snapshot unavailable")?;
-                    crate::policy::validate::validate(&policy, snapshot).map_err(|_| "snapshot validation failed")?;
-                }
+            let route = self.catalog.get().map(|catalog| crate::reload::Route::Postgres(catalog.context.clone()));
+            let refresh = route.as_ref().zip(candidate);
+            hub.commit_config_refresh(&revision, refresh, || {
                 if let Some((authority, admins)) = self.appliers.get() {
                     if prepared.diff.reloadable.contains(&"standing") {
                         let counts = authority.sync_config_principals(&prepared.principals)
@@ -563,11 +553,6 @@ impl ConfigReloader {
                 }
                 if let Some(transports) = self.transports.get() {
                     transports.apply(prepared.route_tls, prepared.management_tls, prepared.config.max_connections);
-                }
-                if let Some(catalog) = self.catalog.get()
-                    && let Some(snapshot) = candidate
-                {
-                    *catalog.context.snapshot.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(snapshot);
                 }
                 if let Some(transports) = self.transports.get() {
                     if prepared.diff.reloadable.iter().any(|s| ["schemas", "search_path", "snapshot_refresh_ms"].contains(s)) {
@@ -1401,7 +1386,9 @@ key_file='key'
             let transports = Transports::new(&cfg).unwrap();
             let pg = PgFixture::new();
             let original = pg.ctx.snapshot.read().unwrap().clone();
+            std::fs::write(f.dir.join("policy"), "[readlog]\nsink='stdout'\n[[column]]\ntable='public.items'\nname='value'\nmasked=true\n").unwrap();
             let hub = Hub::new(&[(pg.ctx.route.clone(), f.dir.join("policy"))], None, cfg.policy_settings.clone()).unwrap();
+            hub.register(crate::reload::Route::Postgres(pg.ctx.clone())).unwrap();
             let reload = ConfigReloader::new(cfg, Arc::downgrade(&hub));
             reload.attach_transports(transports.clone());
             let source_snapshot = (*original).clone();
@@ -1472,9 +1459,10 @@ key_file='key'
     async fn in_flight_capture_does_not_lock_status_and_serializes_reload() {
         let f = Fixture::new();
         let cfg = f.load(&f.text);
-        let hub = f.hub();
+        let hub = Hub::new(&[(crate::state::model::RouteId::new("postgres").unwrap(), f.dir.join("policy"))], None, cfg.policy_settings.clone()).unwrap();
         let reload = Arc::new(ConfigReloader::new(cfg, Arc::downgrade(&hub)));
         let pg = crate::pgwire::session::tests::Fixture::new();
+        hub.register(crate::reload::Route::Postgres(pg.ctx.clone())).unwrap();
         let captured = pg.ctx.snapshot.read().unwrap().clone();
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());

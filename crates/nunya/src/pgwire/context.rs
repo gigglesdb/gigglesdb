@@ -61,6 +61,9 @@ type CancelMap = HashMap<(i32, [u8; 4]), (i32, Vec<u8>)>;
 /// Shared TLS configuration captured afresh for each handshake.
 pub type ReloadableTls = Arc<RwLock<Option<Arc<rustls::ServerConfig>>>>;
 
+/// A consistently captured policy, policy revision and schema snapshot.
+pub type PolicyAndSnapshot = (Arc<Policy>, Option<String>, Arc<Snapshot>);
+
 /// Gateway resources and configuration shared by sessions.
 pub struct GatewayContext {
     /// Shared durable session authority.
@@ -98,6 +101,19 @@ pub struct GatewayContext {
 }
 
 impl GatewayContext {
+    /// Capture policy, revision and catalog under the publication lock order.
+    pub fn policy_and_snapshot(&self) -> Result<PolicyAndSnapshot, Refusal> {
+        let policy = self.policy.read().map_err(|_| {
+            Refusal::new(NyCode::ProtocolNotAllowed, "policy unavailable")
+        })?;
+        let revision = self.policy_revision.read().map_err(|_| {
+            Refusal::new(NyCode::ProtocolNotAllowed, "policy unavailable")
+        })?;
+        let snapshot = self.snapshot.read().map_err(|_| {
+            Refusal::new(NyCode::ProtocolNotAllowed, "snapshot unavailable")
+        })?;
+        Ok((policy.clone(), revision.clone(), snapshot.clone()))
+    }
     /// Capture the policy and its revision in one consistent read.
     pub fn policy_snapshot(&self) -> Result<(Arc<Policy>, Option<String>), Refusal> {
         // Lock order: policy guard, then revision; writers retain the policy write guard.

@@ -178,6 +178,19 @@ pub fn validate(policy: &Policy, snapshot: &Snapshot) -> Result<(), Vec<PolicyEr
             }
         }
     }
+    if let Err(dependent_errors) = validate_dependents(policy, snapshot) {
+        errors.extend(dependent_errors);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Refuse dependents that can copy protected columns outside the gateway.
+pub fn validate_dependents(policy: &Policy, snapshot: &Snapshot) -> Result<(), Vec<PolicyError>> {
+    let mut errors = Vec::new();
     for dependent in &snapshot.dependents {
         if dependent.kind == DependentKind::View {
             continue;
@@ -203,6 +216,48 @@ pub fn validate(policy: &Policy, snapshot: &Snapshot) -> Result<(), Vec<PolicyEr
     } else {
         Err(errors)
     }
+}
+
+/// A names-only advisory about a valid identity-anchored declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyWarning {
+    /// Names-only description of the declaration and its captured name.
+    pub message: String,
+}
+
+/// Validate declarations, allowing missing Show names only with live identity anchors.
+pub fn validate_document(
+    doc: &PolicyDocument,
+    snapshot: &Snapshot,
+    bindings: &super::bindings::RouteBindings,
+) -> Result<Vec<PolicyWarning>, Vec<PolicyError>> {
+    let mut warnings = vec![];
+    let mut errors = vec![];
+    for (column, treatment) in &doc.policy.columns {
+        if *treatment != Treatment::Show || snapshot.column(column).is_some() {
+            continue;
+        }
+        let renamed = bindings.iter().find_map(|(identity, record)| {
+            if record.status != super::bindings::BindingStatus::Active
+                || record.show_rule.as_ref() != Some(column)
+            {
+                return None;
+            }
+            snapshot.column_ids.iter().find_map(|(name, id)| {
+                (id == identity && snapshot.column(name).is_some()).then_some(name)
+            })
+        });
+        if let Some(renamed) = renamed {
+            warnings.push(PolicyWarning { message: format!(
+                "show rule names {}, renamed to {}", column_name(column), column_name(renamed)
+            ) });
+        } else {
+            error(&mut errors, &format!("column {}", column_name(column)), "column does not exist in snapshot");
+        }
+    }
+    if let Err(other) = validate(&doc.policy, snapshot) { errors.extend(other); }
+    if let Err(other) = validate_links(doc, snapshot) { errors.extend(other); }
+    if errors.is_empty() { Ok(warnings) } else { Err(errors) }
 }
 
 /// Validate linked fields and declared domain compatibility against a snapshot.

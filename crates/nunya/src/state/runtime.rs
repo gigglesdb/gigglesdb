@@ -145,6 +145,7 @@ pub struct StateRuntime {
     pub registry: Registry,
     lifecycle_log: Arc<OnceLock<Arc<dyn ReadLog>>>,
     store_health: Arc<StoreHealth>,
+    store: Arc<dyn Store>,
     ends: Arc<EndCounters>,
 }
 impl fmt::Debug for StateRuntime {
@@ -166,6 +167,9 @@ fn store_error(error: StoreError) -> String {
     }
 }
 impl StateRuntime {
+    /// Share the monitored durable store used by this runtime.
+    pub fn store(&self) -> Arc<dyn Store> { self.store.clone() }
+
     /// Whether the most recent store write attempt succeeded, initially true.
     pub fn store_last_write_ok(&self) -> bool {
         self.store_health.last_write_ok.load(Ordering::Relaxed)
@@ -248,7 +252,7 @@ impl StateRuntime {
         let store_health = Arc::new(StoreHealth::default());
         let store = Arc::new(CountingStore { inner: store, health: store_health.clone() });
         let ends = Arc::new(EndCounters::default());
-        let authority = Authority::load(store, limits).unwrap();
+        let authority = Authority::load(store.clone(), limits).unwrap();
         let registry = Registry::new();
         let lifecycle_log = Arc::new(OnceLock::new());
         authority.set_hook(Arc::new(RegistryHook {
@@ -259,6 +263,7 @@ impl StateRuntime {
             registry,
             lifecycle_log,
             store_health,
+            store,
             ends,
         })
     }
@@ -278,7 +283,7 @@ impl StateRuntime {
         let store = Arc::new(CountingStore { inner: store, health: store_health.clone() });
         let ends = Arc::new(EndCounters::default());
         let authority = Authority::load(
-            store,
+            store.clone(),
             session_limits(session),
         )
         .map_err(|e| format!("state authority load failed: {e}"))?;
@@ -296,6 +301,7 @@ impl StateRuntime {
             registry,
             lifecycle_log,
             store_health,
+            store,
             ends,
         }))
     }

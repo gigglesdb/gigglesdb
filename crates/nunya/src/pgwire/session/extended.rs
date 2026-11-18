@@ -6,6 +6,7 @@ pub(super) struct Prepared {
     empty_query: bool,
     generation: [u8; 16],
     plan: RewritePlan,
+    columns: Vec<crate::schema::ColumnRef>,
     param_count: u32,
     kind: StatementKind,
     param_types: Vec<u32>,
@@ -54,6 +55,14 @@ fn oid_type(oid: u32) -> Option<ColumnType> {
     })
 }
 impl Prepared {
+    fn check_treatments(&self, current: &Arc<Policy>) -> Result<(), Refusal> {
+        if !Arc::ptr_eq(current, &self.policy)
+            && self.columns.iter().any(|column| current.treatment(column) != self.policy.treatment(column))
+        {
+            return Err(failure(NyCode::SchemaStale));
+        }
+        Ok(())
+    }
     fn local(&self) -> bool {
         self.empty_query || self.plan.tokenize.is_some() || matches!(self.kind, StatementKind::SessionNoop { .. })
     }
@@ -99,9 +108,9 @@ impl Session {
         out
     }
     fn prepare(&mut self, sql: &str, param_types: Vec<u32>) -> Result<Prepared, Refusal> {
-        let (policy, policy_revision) = self.ctx.policy_snapshot()?;
+        let (policy, policy_revision, snapshot) = self.ctx.policy_and_snapshot()?;
         self.statement_revision = policy_revision.clone();
-        let snapshot = self.snapshot()?;
+        let snapshot = self.pin_snapshot(snapshot)?;
         if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms) > policy.snapshot_max_age_ms
         {
             return Err(failure(NyCode::SchemaStale));
@@ -168,6 +177,18 @@ impl Session {
             empty_query,
             generation: random::<16>()?,
             plan,
+            columns: statement.outputs.iter().filter_map(|output| output.source.clone())
+                .chain(statement.uses.iter().map(|usage| usage.column.clone()))
+                .chain(statement.uses.iter().filter_map(|usage| match &usage.kind {
+                    UseKind::Equality { other: ValueSource::Column { column, .. } } => Some(column.clone()),
+                    _ => None,
+                }))
+                .chain(statement.writes.iter().map(|write| write.column.clone()))
+                .chain(statement.writes.iter().filter_map(|write| match &write.value {
+                    ValueSource::Column { column, .. } => Some(column.clone()),
+                    _ => None,
+                }))
+                .collect(),
             param_count,
             kind: statement.kind.clone(),
             param_types,
@@ -276,6 +297,8 @@ impl Session {
                         .get(&statement)
                         .cloned()
                         .ok_or_else(|| failure(NyCode::NotAnalysable))?;
+                    let (current, _) = self.ctx.policy_snapshot()?;
+                    p.check_treatments(&current)?;
                     if params.len() != p.param_count as usize {
                         return Err(failure(NyCode::NotAnalysable));
                     }
@@ -405,7 +428,12 @@ impl Session {
                     if !mode.permits_write() && writes(&p.kind) {
                         return Err(failure(NyCode::StatementNotAllowed));
                     }
-                    let snapshot = self.snapshot()?;
+                    let (current, _, snapshot) = self.ctx.policy_and_snapshot()?;
+                    if let Err(error) = p.check_treatments(&current) {
+                        stale_execute = true;
+                        return Err(error);
+                    }
+                    let snapshot = self.pin_snapshot(snapshot)?;
                     if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms)
                         > p.policy.snapshot_max_age_ms
                     {
@@ -839,4 +867,34 @@ fn rewrite_fields(fields: &mut [FieldDescription], plan: &RewritePlan) -> Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod treatment_tests {
+    use super::*;
+
+    #[test]
+    fn cached_dependency_absent_to_present_refuses() {
+        let fixture = super::super::tests::Fixture::new();
+        let mut planned = (**fixture.ctx.policy.read().unwrap()).clone();
+        let column = planned.columns.keys().next().unwrap().clone();
+        planned.columns.clear();
+        let mut current = planned.clone();
+        current.columns.insert(column.clone(), crate::policy::Treatment::Show);
+        let prepared = Prepared {
+            empty_query: false,
+            generation: [0; 16],
+            plan: RewritePlan { outputs: vec![], inputs: vec![], tokenize: None },
+            columns: vec![column],
+            param_count: 0,
+            kind: StatementKind::Select,
+            param_types: vec![],
+            policy: Arc::new(planned),
+            policy_revision: None,
+            sql: String::new(),
+            rewritten: String::new(),
+            token_ty: None,
+        };
+        assert_eq!(prepared.check_treatments(&Arc::new(current)).unwrap_err().code, NyCode::SchemaStale);
+    }
 }

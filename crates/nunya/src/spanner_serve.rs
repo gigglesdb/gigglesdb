@@ -50,15 +50,25 @@ pub fn parse_section(value: &toml::Value) -> Result<SpannerNativeSection, String
     }
     Ok(section)
 }
+fn legacy_document(policy: Policy) -> crate::policy::PolicyDocument {
+    crate::policy::PolicyDocument {
+        policy, version: crate::policy::PolicyVersion::Legacy,
+        route_default: crate::policy::RouteDefault::Show,
+        json_paths: vec![], links: vec![], file_readlog: None, file_snapshot_max_age_ms: None,
+    }
+}
 fn publish_snapshot(
-    policy: &Policy,
+    declared: &crate::policy::PolicyDocument,
+    policy: &RwLock<Arc<Policy>>,
     current: &RwLock<Arc<crate::schema::Snapshot>>,
     snapshot: crate::schema::Snapshot,
 ) -> Result<(), String> {
-    if crate::policy::validate::validate(policy, &snapshot).is_ok() {
-        *current
-            .write()
-            .map_err(|_| "spanner: snapshot unavailable".to_owned())? = Arc::new(snapshot);
+    if crate::policy::validate::validate_document(declared, &snapshot, &Default::default()).is_ok() {
+        let compiled = crate::policy::effective::served_policy(declared, &snapshot, &Default::default());
+        let mut policy = policy.write().map_err(|_| "spanner: policy unavailable".to_owned())?;
+        let mut current = current.write().map_err(|_| "spanner: snapshot unavailable".to_owned())?;
+        *current = Arc::new(snapshot);
+        *policy = Arc::new(compiled);
     }
     Ok(())
 }
@@ -144,10 +154,13 @@ pub(crate) async fn run_spanner_with_hub(
         let snapshot = crate::schema::spanner_gsql::load_gsql_snapshot(&runner, now())
             .await
             .map_err(|_| "spanner: catalog unavailable".to_owned())?;
-        if hub.is_none() {
-            crate::policy::validate::validate(&policy, &snapshot)
+        // The standalone API accepts legacy Policy only; configured routes use the Hub document.
+        let declared = legacy_document((*policy).clone());
+        let policy = if hub.is_none() {
+            crate::policy::validate::validate_document(&declared, &snapshot, &Default::default())
                 .map_err(|_| "spanner: policy validation failed".to_owned())?;
-        }
+            Arc::new(crate::policy::effective::served_policy(&declared, &snapshot, &Default::default()))
+        } else { policy };
         let ctx = Arc::new(SpannerContext {
             authority: state.authority,
             registry: state.registry,
@@ -180,12 +193,7 @@ pub(crate) async fn run_spanner_with_hub(
                         let _ = hub.refresh(&crate::reload::Route::Spanner(ctx.clone()), snapshot);
                         continue;
                     }
-                    let policy = ctx
-                        .policy
-                        .read()
-                        .map_err(|_| "spanner: policy unavailable".to_owned())?
-                        .clone();
-                    publish_snapshot(&policy, &ctx.snapshot, snapshot)?;
+                    publish_snapshot(&declared, &ctx.policy, &ctx.snapshot, snapshot)?;
                 }
             }
             #[allow(unreachable_code)]
@@ -249,7 +257,8 @@ mod tests {
             },
         );
         publish_snapshot(
-            &policy,
+            &legacy_document(policy.clone()),
+            &RwLock::new(Arc::new(policy.clone())),
             &current,
             Snapshot::new(vec![], vec![], vec![String::new()], 20),
         )
@@ -258,7 +267,8 @@ mod tests {
         assert_eq!(current.read().unwrap().taken_at_unix_ms, 10);
         policy.columns.clear();
         publish_snapshot(
-            &policy,
+            &legacy_document(policy.clone()),
+            &RwLock::new(Arc::new(policy.clone())),
             &current,
             Snapshot::new(vec![], vec![], vec![String::new()], 30),
         )

@@ -1,6 +1,6 @@
 //! Shared policy reload coordination for every serving route.
 use crate::{
-    policy::Policy,
+    policy::{Policy, PolicyDocument, PolicyVersion, RouteDefault, bindings::{self, RouteBindings}},
     schema::Snapshot,
     serve::{ReloadableLog, now, parse_policy_bytes, readlog_key},
     state::model::RouteId,
@@ -41,12 +41,22 @@ impl Route {
         }
     }
 }
+struct PublishedRoute {
+    route: Route,
+    policy: Arc<Policy>,
+    refresh_failed: bool,
+}
+impl std::ops::Deref for PublishedRoute {
+    type Target = Route;
+    fn deref(&self) -> &Route { &self.route }
+}
 struct Unit {
     identity: PathBuf,
     path: PathBuf,
     revisions: Arc<RwLock<crate::serve::Revisions>>,
     policy: Arc<Policy>,
-    routes: Vec<Route>,
+    doc: Arc<PolicyDocument>,
+    routes: Vec<PublishedRoute>,
     hash: String,
     applied: u64,
     last: &'static str,
@@ -72,13 +82,14 @@ pub(crate) struct Hub {
     state: Mutex<State>,
     /// Service lifecycle and management audit log.
     pub(crate) log: ReloadableLog,
+    store: RwLock<Option<Arc<dyn crate::state::store::Store>>>,
     watch_ms: Option<u64>,
     service: crate::policy::ServicePolicySettings,
 }
 fn hash(bytes: &[u8]) -> String {
     data_encoding::HEXLOWER.encode(&Sha256::digest(bytes))
 }
-fn parse(path: &Path, bytes: &[u8], service: &crate::policy::ServicePolicySettings) -> Result<Policy, String> {
+fn parse(path: &Path, bytes: &[u8], service: &crate::policy::ServicePolicySettings) -> Result<PolicyDocument, String> {
     parse_policy_bytes(path, bytes, service).map_err(crate::serve::errors)
 }
 impl Hub {
@@ -101,7 +112,7 @@ impl Hub {
                     let (policy, snapshot) = route.locks();
                     match (policy.read(), snapshot.read()) {
                         (Ok(policy), Ok(snapshot)) => {
-                            policy_ok &= Arc::ptr_eq(&policy, &unit.policy);
+                            policy_ok &= Arc::ptr_eq(&policy, &route.policy) && !route.refresh_failed;
                             if at.saturating_sub(snapshot.taken_at_unix_ms)
                                 > policy.snapshot_max_age_ms
                             {
@@ -156,7 +167,8 @@ impl Hub {
                 index
             } else {
                 let bytes = std::fs::read(path).map_err(|_| "policy file unavailable")?;
-                let policy = Arc::new(parse(path, &bytes, &service)?);
+                let doc = Arc::new(parse(path, &bytes, &service)?);
+                let policy = Arc::new(doc.policy.clone());
                 if units
                     .first()
                     .is_some_and(|unit| readlog_key(&unit.policy.readlog) != readlog_key(&policy.readlog))
@@ -168,6 +180,7 @@ impl Hub {
                     identity,
                     path: path.clone(),
                     policy,
+                    doc,
                     routes: vec![],
                     revisions: Arc::new(RwLock::new(crate::serve::Revisions {
                         policy: digest.clone(),
@@ -194,10 +207,46 @@ impl Hub {
                 Arc::new(AtomicBool::new(true)),
             ),
             state: Mutex::new(State { units, configured }),
+            store: RwLock::new(None),
             watch_ms,
             service,
         }))
     }
+    /// Attach durable bindings before any route is registered.
+    pub(crate) fn set_store(&self, store: Arc<dyn crate::state::store::Store>) -> Result<(), String> {
+        let state = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        if state.units.iter().any(|unit| !unit.routes.is_empty()) {
+            return Err("policy store must be set before registration".into());
+        }
+        *self.store.write().map_err(|_| "policy bindings unavailable")? = Some(store);
+        Ok(())
+    }
+
+    fn compile(&self, doc: &PolicyDocument, route: &RouteId, snapshot: &Snapshot) -> Result<Arc<Policy>, String> {
+        let store = self.store.read().map_err(|_| "policy bindings unavailable")?;
+        let needs_bindings = (doc.version == PolicyVersion::V2 && doc.route_default == RouteDefault::Tokenize)
+            || !doc.links.is_empty();
+        if needs_bindings && store.is_none() {
+            return Err("policy bindings unavailable".into());
+        }
+        let mut bindings = match store.as_ref() {
+            Some(store) => bindings::load(store.as_ref(), route).map_err(|e| e.to_string())?,
+            None => RouteBindings::default(),
+        };
+        let warnings = crate::policy::validate::validate_document(doc, snapshot, &bindings)
+            .map_err(crate::serve::errors)?;
+        if needs_bindings {
+            bindings = bindings::refresh(store.as_ref().ok_or("policy bindings unavailable")?.as_ref(), route, doc, snapshot)
+                .map_err(|e| e.to_string())?;
+        }
+        let policy = crate::policy::effective::served_policy(doc, snapshot, &bindings);
+        crate::policy::validate::validate_dependents(&policy, snapshot).map_err(crate::serve::errors)?;
+        for warning in warnings {
+            eprintln!("serve: policy warning: {}", warning.message.replace(['\r', '\n'], " "));
+        }
+        Ok(Arc::new(policy))
+    }
+
     /// Set the service config revision on every unit and the lifecycle log.
     pub(crate) fn set_config_revision(&self, config: &str) -> Result<(), String> {
         self.commit_config_revision(config, || Ok(()))
@@ -206,7 +255,13 @@ impl Hub {
     pub(crate) fn commit_config_revision(
         &self, config: &str, apply: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        let state = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        self.commit_config_refresh(config, None, apply)
+    }
+    /// Commit configuration and an optional recompiled catalog under one publication lock.
+    pub(crate) fn commit_config_refresh(
+        &self, config: &str, refresh: Option<(&Route, Snapshot)>, apply: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|_| "policy lock unavailable")?;
         // Validate all locks before the only fallible applier. Release revision guards
         // during apply: principal revocation emits lifecycle records using these locks.
         {
@@ -215,7 +270,12 @@ impl Hub {
             }).collect::<Result<Vec<_>, _>>()?;
             let _service = self.log.1.write().map_err(|_| "revision lock unavailable")?;
         }
-        apply()?;
+        if let Some((route, snapshot)) = refresh {
+            let index = state.unit(route.id())?;
+            self.publish_refresh(&mut state.units[index], route, snapshot, apply)?;
+        } else {
+            apply()?;
+        }
         let mut revisions: Vec<_> = state.units.iter().map(|unit| {
             unit.revisions.write().unwrap_or_else(std::sync::PoisonError::into_inner)
         }).collect();
@@ -253,13 +313,10 @@ impl Hub {
         let index = state.unit(route.id())?;
         let s = &mut state.units[index];
         let (policy, snapshot) = route.locks();
-        crate::policy::validate::validate(
-            &s.policy,
-            &**snapshot.read().map_err(|_| "snapshot lock unavailable")?,
-        )
-        .map_err(crate::serve::errors)?;
+        let mut current = policy.write().map_err(|_| "policy lock unavailable")?;
+        let snapshot = snapshot.read().map_err(|_| "snapshot lock unavailable")?;
+        let compiled = self.compile(&s.doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, &snapshot)?;
         {
-            let mut current = policy.write().map_err(|_| "policy lock unavailable")?;
             let revision = match &route {
                 Route::Postgres(ctx) => Some(&ctx.policy_revision),
                 Route::Spanner(ctx) => Some(&ctx.policy_revision),
@@ -269,9 +326,11 @@ impl Hub {
             if let Some(revision) = revision {
                 *revision.write().map_err(|_| "revision lock unavailable")? = Some(s.hash.clone());
             }
-            *current = s.policy.clone();
+            *current = compiled.clone();
         }
-        s.routes.push(route);
+        drop(snapshot);
+        drop(current);
+        s.routes.push(PublishedRoute { route, policy: compiled, refresh_failed: false });
         Ok(())
     }
     /// Validate a fresh catalog against this route's policy unit.
@@ -280,21 +339,39 @@ impl Hub {
     }
     /// Publish a catalog only if its settings are still current under the publication lock.
     pub(crate) fn refresh_if(&self, route: &Route, snapshot: Snapshot, current: impl FnOnce() -> bool) -> Result<(), String> {
-        let state = self.state.lock().map_err(|_| "policy lock unavailable")?;
+        let mut state = self.state.lock().map_err(|_| "policy lock unavailable")?;
         if !current() { return Ok(()); }
-        let s = &state.units[state.unit(route.id())?];
-        crate::policy::validate::validate(&s.policy, &snapshot).map_err(crate::serve::errors)?;
-        *route
-            .locks()
-            .1
-            .write()
-            .map_err(|_| "snapshot lock unavailable")? = Arc::new(snapshot);
-        Ok(())
+        let index = state.unit(route.id())?;
+        let s = &mut state.units[index];
+        self.publish_refresh(s, route, snapshot, || Ok(()))
     }
+
+    fn publish_refresh(&self, unit: &mut Unit, route: &Route, snapshot: Snapshot, apply: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        let result = (|| {
+            let (policy, catalog) = route.locks();
+            let mut policy = policy.write().map_err(|_| "policy lock unavailable")?;
+            let mut catalog = catalog.write().map_err(|_| "snapshot lock unavailable")?;
+            let compiled = self.compile(&unit.doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, &snapshot)?;
+            apply()?;
+            *catalog = Arc::new(snapshot);
+            *policy = compiled.clone();
+            Ok(compiled)
+        })();
+        for registered in &mut unit.routes {
+            if std::ptr::eq(registered.locks().0, route.locks().0) {
+                match &result {
+                    Ok(compiled) => { registered.policy = compiled.clone(); registered.refresh_failed = false; }
+                    Err(_) => registered.refresh_failed = true,
+                }
+            }
+        }
+        result.map(|_| ())
+    }
+
     fn apply(
         &self,
         unit: usize,
-        candidate: Result<Policy, String>,
+        candidate: Result<PolicyDocument, String>,
         digest: Option<String>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|_| "policy lock unavailable")?;
@@ -303,7 +380,8 @@ impl Hub {
         s.attempts += 1;
         s.last_time = now();
         let result = (|| {
-            let policy = Arc::new(candidate?);
+            let doc = Arc::new(candidate?);
+            let policy = Arc::new(doc.policy.clone());
             if independent && readlog_key(&policy.readlog) != readlog_key(&s.policy.readlog) {
                 return Err("policy files name different read logs".into());
             }
@@ -317,7 +395,7 @@ impl Hub {
             }
             let mut route_revisions = Vec::new();
             for route in &s.routes {
-                let revision = match route {
+                let revision = match &route.route {
                     Route::Postgres(ctx) => Some(&ctx.policy_revision),
                     Route::Spanner(ctx) => Some(&ctx.policy_revision),
                     #[cfg(test)]
@@ -327,10 +405,9 @@ impl Hub {
                     route_revisions.push(revision.write().map_err(|_| "revision lock unavailable")?);
                 }
             }
-            for snapshot in &snapshots {
-                crate::policy::validate::validate(&policy, snapshot)
-                    .map_err(crate::serve::errors)?;
-            }
+            let compiled = s.routes.iter().zip(&snapshots).map(|(route, snapshot)| {
+                self.compile(&doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, snapshot)
+            }).collect::<Result<Vec<_>, String>>()?;
             let replacement = if readlog_key(&policy.readlog) != readlog_key(&s.policy.readlog) {
                 Some(
                     crate::readlog::open_sink(&policy.readlog)
@@ -352,18 +429,23 @@ impl Hub {
             if let Some(replacement) = replacement {
                 *log = replacement;
             }
-            for current in &mut policies {
-                **current = policy.clone();
+            for (current, compiled) in policies.iter_mut().zip(&compiled) {
+                **current = compiled.clone();
             }
             for current in &mut route_revisions {
                 **current = Some(revision.clone());
             }
             revisions.policy = revision.clone();
-            Ok::<_, String>(policy)
+            Ok::<_, String>((doc, policy, compiled))
         })();
         match result {
-            Ok(policy) => {
+            Ok((doc, policy, compiled)) => {
+                s.doc = doc;
                 s.policy = policy;
+                for (route, compiled) in s.routes.iter_mut().zip(compiled) {
+                    route.policy = compiled;
+                    route.refresh_failed = false;
+                }
                 s.hash = digest.ok_or("policy digest unavailable")?;
                 s.applied = now();
                 s.last = "applied";
@@ -430,7 +512,7 @@ impl Hub {
             ]);
         }
         for route in s.units.iter().flat_map(|unit| &unit.routes) {
-            if let Route::Postgres(ctx) = route {
+            if let Route::Postgres(ctx) = &route.route {
                 let m = ctx.metrics.snapshot();
                 values.extend([
                     ("nunya_connections_total".into(), m.connections),
@@ -569,6 +651,10 @@ mod tests {
             readlog: ReadLogSink::Stdout,
         }
     }
+    fn document(policy: Policy) -> PolicyDocument {
+        PolicyDocument { policy, version: PolicyVersion::Legacy, route_default: RouteDefault::Show,
+            links: vec![], json_paths: vec![], file_readlog: None, file_snapshot_max_age_ms: None }
+    }
     fn id(name: &str) -> RouteId {
         RouteId::new(name).unwrap()
     }
@@ -588,6 +674,7 @@ mod tests {
                         policy: hash(b"initial"),
                         config: "config-test".into(),
                     })),
+                    doc: Arc::new(document(p.clone())),
                     policy: Arc::new(p),
                     routes: vec![],
                     hash: hash(b"initial"),
@@ -599,6 +686,7 @@ mod tests {
                 }],
                 configured: vec![(id("postgres"), 0)],
             }),
+            store: RwLock::new(None),
             watch_ms: None,
             service: crate::policy::ServicePolicySettings::default(),
         }
@@ -768,7 +856,7 @@ mod tests {
         let state = h.state.lock().unwrap();
         for unit in &state.units {
             assert!(Arc::ptr_eq(
-                &unit.policy,
+                &unit.routes[0].policy,
                 &unit.routes[0].locks().0.read().unwrap()
             ));
         }
@@ -1188,8 +1276,8 @@ mod tests {
         }
         let mut valid = policy();
         valid.snapshot_max_age_ms = 12345;
-        h.apply(0, Ok(valid.clone()), Some(hash(b"valid"))).unwrap();
-        assert!(h.apply(0, Ok(candidate), Some(hash(b"invalid"))).is_err());
+        h.apply(0, Ok(document(valid.clone())), Some(hash(b"valid"))).unwrap();
+        assert!(h.apply(0, Ok(document(candidate)), Some(hash(b"invalid"))).is_err());
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).unwrap();
         let missing_parent = std::env::temp_dir().join(format!(
@@ -1201,7 +1289,7 @@ mod tests {
             path: missing_parent.join("readlog"),
             max_bytes: 1024,
         };
-        assert!(h.apply(0, Ok(bad_log), Some(hash(b"bad-log"))).is_err());
+        assert!(h.apply(0, Ok(document(bad_log)), Some(hash(b"bad-log"))).is_err());
         h.register(Route::Test(
             id("postgres"),
             RwLock::new(Arc::new(policy())),
@@ -1295,7 +1383,7 @@ mod tests {
             path: dir.join("audit.log"),
             max_bytes: 1024,
         };
-        h.apply(0, Ok(new), Some("R2".into())).unwrap();
+        h.apply(0, Ok(document(new)), Some("R2".into())).unwrap();
         assert_eq!(ctx.policy_revision.read().unwrap().as_deref(), Some("R2"));
         assert_eq!(ctx.policy.read().unwrap().snapshot_max_age_ms, 123);
         ctx.readlog
@@ -1322,7 +1410,7 @@ mod tests {
         assert_eq!(logged["config_revision"], "config-test");
         let mut next = (*h.policy_for(&id("spanner-native")).unwrap()).clone();
         next.snapshot_max_age_ms = 124;
-        h.apply(0, Ok(next), Some(hash(b"next"))).unwrap();
+        h.apply(0, Ok(document(next)), Some(hash(b"next"))).unwrap();
         ctx.readlog
             .write(&crate::readlog::ReadLogRecord {
                 ts_unix_ms: 2,
@@ -1401,7 +1489,7 @@ mod tests {
         assert_eq!(revision, Some(hash(b"initial")));
         let mut next = policy();
         next.snapshot_max_age_ms = 42;
-        h.apply(0, Ok(next), Some("R2".into())).unwrap();
+        h.apply(0, Ok(document(next)), Some("R2".into())).unwrap();
         let (current, revision) = ctx.policy_snapshot().unwrap();
         assert_eq!(revision.as_deref(), Some("R2"));
         assert_eq!(current.snapshot_max_age_ms, 42);
@@ -1421,6 +1509,229 @@ mod tests {
         assert_eq!(h.policy_for(&id("a")).unwrap().snapshot_max_age_ms, 123);
         assert_eq!(h.policy_for(&id("a")).unwrap().readlog, ReadLogSink::Stdout);
         assert_eq!(h.state.lock().unwrap().units[0].last, "applied");
+    }
+
+    fn customer_column(name: &str) -> ColumnRef {
+        ColumnRef { schema: "public".into(), table: "customers".into(), column: name.into() }
+    }
+    fn customer_id(attnum: i16) -> crate::schema::ColumnId {
+        crate::schema::ColumnId::Pg { relation_oid: 123, attnum }
+    }
+    fn customers(columns: &[(&str, i16)]) -> Snapshot {
+        use crate::{schema::{Column, Relation, RelationKind}, value::ColumnType};
+        Snapshot::new(vec![Relation {
+            schema: "public".into(), name: "customers".into(), kind: RelationKind::Table,
+            columns: columns.iter().map(|(name, _)| Column {
+                name: (*name).into(), ty: ColumnType::Text, nullable: true, generated: None, default: None,
+            }).collect(), view_definition: None, primary_key: vec![],
+        }], vec![], vec!["public".into()], now()).with_column_ids(columns.iter().map(|(name, id)| {
+            (customer_column(name), customer_id(*id))
+        }).collect())
+    }
+    fn tokenize_hub(files: &Files, routes: &[&str]) -> Arc<Hub> {
+        std::fs::write(&files.a, "version=2\ndefault='tokenize'\n").unwrap();
+        Hub::new(&routes.iter().map(|name| (id(name), files.a.clone())).collect::<Vec<_>>(), None,
+            crate::policy::ServicePolicySettings { readlog: Some(ReadLogSink::Stdout), ..Default::default() }).unwrap()
+    }
+    fn binding_store(files: &Files) -> Arc<crate::state::store::RedbStore> {
+        Arc::new(crate::state::store::RedbStore::open(&files.dir.join("state"),
+            &crate::token::keys::RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap())
+    }
+    #[test]
+    fn tokenize_registers_index_and_view_with_base_column_rewrites() {
+        use crate::{dialect::{Lowering, pg::PgLowering}, ir::{Label, OutputRewrite}, schema::RelationKind};
+        let files = Files::new();
+        let hub = tokenize_hub(&files, &["a"]);
+        hub.set_store(binding_store(&files)).unwrap();
+        let mut doc = (*hub.state.lock().unwrap().units[0].doc).clone();
+        doc.policy.columns.insert(customer_column("masked"), Treatment::Masked { placeholder: None });
+        doc.policy.columns.insert(customer_column("visible"), Treatment::Show);
+        hub.apply(0, Ok(doc), Some(hash(b"view rules"))).unwrap();
+        let mut snapshot = customers(&[("email", 1), ("masked", 2), ("visible", 3)]);
+        let mut index = snapshot.relations[0].clone();
+        index.name = "customers_pkey".into();
+        index.kind = RelationKind::Other;
+        index.columns.truncate(1);
+        let mut view = snapshot.relations[0].clone();
+        view.name = "customer_view".into();
+        view.kind = RelationKind::View;
+        view.view_definition = Some("SELECT email, masked, visible FROM public.customers".into());
+        snapshot.relations.extend([index, view]);
+        hub.register(test_route("a", snapshot.clone())).unwrap();
+        let state = hub.state.lock().unwrap();
+        let served = state.units[0].routes[0].locks().0.read().unwrap();
+        let statement = PgLowering.lower("SELECT email, masked, visible FROM public.customer_view", &snapshot, &served, &[]).unwrap().remove(0);
+        assert_eq!(statement.outputs[0].source, Some(customer_column("email")));
+        assert!(matches!(&statement.outputs[0].label, Label::Blind(domain) if Some(domain) == served.domain_of(&customer_column("email"))));
+        assert_eq!(statement.outputs[1].label, Label::Masked);
+        assert_eq!(statement.outputs[2].label, Label::Plain);
+        let plan = crate::ir::check::check(&statement, &served, &snapshot).unwrap();
+        assert!(matches!(&plan.outputs[0], OutputRewrite::Tokenize { domain, .. } if Some(domain) == served.domain_of(&customer_column("email"))));
+        assert_eq!(plan.outputs[1], OutputRewrite::Mask { placeholder: None });
+        assert_eq!(plan.outputs[2], OutputRewrite::Pass);
+    }
+
+    #[test]
+    fn tokenize_compilation_still_refuses_dependents_reading_default_blind_columns() {
+        use crate::schema::{DependentKind, DependentObject};
+        let files = Files::new();
+        let hub = tokenize_hub(&files, &["a"]);
+        hub.set_store(binding_store(&files)).unwrap();
+        let mut snapshot = customers(&[("email", 1)]);
+        snapshot.dependents.push(DependentObject {
+            name: "copy_email".into(),
+            kind: DependentKind::Trigger,
+            reads: vec![customer_column("email")],
+            writes_table: None,
+        });
+        let error = hub.register(test_route("a", snapshot)).unwrap_err();
+        assert!(error.contains("trigger copy_email reads blind column public.customers.email"));
+        assert!(hub.state.lock().unwrap().units[0].routes.is_empty());
+    }
+
+    #[test]
+    fn tokenize_registration_requires_store_and_publishes_persisted_generated_domain() {
+        let files = Files::new();
+        let hub = tokenize_hub(&files, &["a"]);
+        assert_eq!(hub.register(test_route("a", customers(&[("email", 1)]))).unwrap_err(), "policy bindings unavailable");
+        assert!(hub.state.lock().unwrap().units[0].routes.is_empty());
+        let store = binding_store(&files);
+        hub.set_store(store.clone()).unwrap();
+        hub.register(test_route("a", customers(&[("email", 1)]))).unwrap();
+        let persisted = bindings::load(store.as_ref(), &id("a")).unwrap();
+        let domain = persisted.get(&customer_id(1)).unwrap().domain.as_ref().unwrap();
+        let state = hub.state.lock().unwrap();
+        let served = state.units[0].routes[0].locks().0.read().unwrap();
+        assert_eq!(served.domain_of(&customer_column("email")), Some(domain));
+        assert!(served.domains.contains_key(domain));
+        drop(served); drop(state);
+        assert!(hub.readiness(true, true).0);
+        assert!(hub.set_store(store).is_err());
+    }
+    #[test]
+    fn refresh_persists_before_pair_publication_and_recovers_readiness() {
+        let files = Files::new();
+        let hub = tokenize_hub(&files, &["postgres"]);
+        let store = binding_store(&files);
+        hub.set_store(store.clone()).unwrap();
+        let fixture = crate::pgwire::session::tests::Fixture::new();
+        let ctx = &fixture.ctx;
+        *ctx.snapshot.write().unwrap() = Arc::new(customers(&[("email", 1)]));
+        hub.register(Route::Postgres(ctx.clone())).unwrap();
+        let original_policy = ctx.policy.read().unwrap().clone();
+        let original_snapshot = ctx.snapshot.read().unwrap().clone();
+        let next = customers(&[("email", 1), ("recovery_email", 2)]);
+        store.fail_commits(true);
+        assert!(hub.refresh_if(&Route::Postgres(ctx.clone()), next.clone(), || true).is_err());
+        assert!(Arc::ptr_eq(&original_policy, &ctx.policy.read().unwrap()));
+        assert!(Arc::ptr_eq(&original_snapshot, &ctx.snapshot.read().unwrap()));
+        assert!(bindings::load(store.as_ref(), &ctx.route).unwrap().get(&customer_id(2)).is_none());
+        assert!(!hub.readiness(true, true).0);
+        assert!(hub.readiness(true, true).1.contains("policy=unavailable"));
+        store.fail_commits(false);
+        // A stale capture neither publishes nor clears the failed-refresh readiness.
+        hub.refresh_if(&Route::Postgres(ctx.clone()), next.clone(), || false).unwrap();
+        assert!(!hub.readiness(true, true).0);
+        hub.refresh_if(&Route::Postgres(ctx.clone()), next, || true).unwrap();
+        let persisted = bindings::load(store.as_ref(), &ctx.route).unwrap();
+        let policy = ctx.policy.read().unwrap();
+        let snapshot = ctx.snapshot.read().unwrap();
+        let added = customer_column("recovery_email");
+        assert!(snapshot.column(&added).is_some());
+        assert_eq!(policy.domain_of(&added), persisted.get(&customer_id(2)).unwrap().domain.as_ref());
+        assert_ne!(policy.domain_of(&added), policy.domain_of(&customer_column("email")));
+        drop(snapshot); drop(policy);
+        assert!(hub.readiness(true, true).0);
+        // A successful policy reload also clears a failed refresh.
+        store.fail_commits(true);
+        assert!(hub.refresh(&Route::Postgres(ctx.clone()), customers(&[("email", 1), ("recovery_email", 2), ("extra", 3)])).is_err());
+        store.fail_commits(false);
+        let doc = (*hub.state.lock().unwrap().units[0].doc).clone();
+        hub.apply(0, Ok(doc), Some(hash(b"reapplied"))).unwrap();
+        assert!(hub.readiness(true, true).0);
+        // Readiness detects a foreign policy replacement even when its values agree.
+        let foreign = Arc::new((**ctx.policy.read().unwrap()).clone());
+        *ctx.policy.write().unwrap() = foreign;
+        assert!(!hub.readiness(true, true).0);
+    }
+    #[test]
+    fn legacy_registration_compiles_declared_and_unlisted_columns_without_store() {
+        let files = Files::new();
+        std::fs::write(&files.a, "[readlog]\nsink='stdout'\n[[column]]\ntable='public.customers'\nname='email'\nmasked=true\n").unwrap();
+        let hub = Hub::new(&[(id("a"), files.a.clone())], None, Default::default()).unwrap();
+        hub.register(test_route("a", customers(&[("email", 1), ("other", 2)]))).unwrap();
+        let state = hub.state.lock().unwrap();
+        let policy = state.units[0].routes[0].locks().0.read().unwrap();
+        assert_eq!(policy.treatment(&customer_column("email")), Some(&Treatment::Masked { placeholder: None }));
+        assert_eq!(policy.treatment(&customer_column("other")), Some(&Treatment::Show));
+        assert_eq!(policy.columns.len(), 2);
+    }
+    #[test]
+    fn renamed_show_rule_validates_warns_and_compiles_only_with_active_anchor() {
+        let files = Files::new();
+        let hub = tokenize_hub(&files, &["a"]);
+        let store = binding_store(&files);
+        hub.set_store(store.clone()).unwrap();
+        let mut doc = (*hub.state.lock().unwrap().units[0].doc).clone();
+        doc.policy.columns.insert(customer_column("email"), Treatment::Show);
+        hub.apply(0, Ok(doc.clone()), Some(hash(b"show"))).unwrap();
+        hub.register(test_route("a", customers(&[("email", 1)]))).unwrap();
+        let renamed = customers(&[("contact", 1)]);
+        let bindings = bindings::load(store.as_ref(), &id("a")).unwrap();
+        let warnings = crate::policy::validate::validate_document(&doc, &renamed, &bindings).unwrap();
+        assert_eq!(warnings[0].message, "show rule names public.customers.email, renamed to public.customers.contact");
+        let compiled = hub.compile(&doc, &id("a"), &renamed).unwrap();
+        assert_eq!(compiled.treatment(&customer_column("contact")), Some(&Treatment::Show));
+        let empty = RouteBindings::default();
+        assert!(crate::policy::validate::validate_document(&doc, &renamed, &empty).is_err());
+        let unanchored = crate::policy::effective::served_policy(&doc, &renamed, &empty);
+        assert_eq!(unanchored.treatment(&customer_column("contact")), Some(&Treatment::Masked { placeholder: None }));
+        let mut inactive = bindings.clone();
+        inactive.get_mut(&customer_id(1)).unwrap().status = crate::policy::bindings::BindingStatus::NeedsRepair;
+        assert!(crate::policy::validate::validate_document(&doc, &renamed, &inactive).is_err());
+        assert!(crate::policy::validate::validate_document(&doc, &customers(&[("contact", 2)]), &bindings).is_err());
+        for treatment in [Treatment::Masked { placeholder: None }, Treatment::Blind { domain: crate::policy::DomainName("secret".into()) }] {
+            doc.policy.columns.insert(customer_column("email"), treatment);
+            assert!(crate::policy::validate::validate_document(&doc, &renamed, &bindings).is_err());
+        }
+    }
+
+    #[test]
+    fn policy_reload_recompiles_each_route_and_rejects_failed_binding_writes_atomically() {
+        let files = Files::new();
+        let hub = Hub::new(&[(id("a"), files.a.clone()), (id("b"), files.a.clone())], None, Default::default()).unwrap();
+        let store = binding_store(&files);
+        hub.set_store(store.clone()).unwrap();
+        hub.register(test_route("a", customers(&[("email", 1)]))).unwrap();
+        hub.register(test_route("b", customers(&[("other", 2)]))).unwrap();
+        let before: Vec<_> = hub.state.lock().unwrap().units[0].routes.iter()
+            .map(|r| r.locks().0.read().unwrap().clone()).collect();
+        let bytes = b"version=2\ndefault='tokenize'\n";
+        let doc = parse(&files.a, bytes, &crate::policy::ServicePolicySettings {
+            readlog: Some(ReadLogSink::Stdout), ..Default::default()
+        }).unwrap();
+        store.fail_commits(true);
+        assert!(hub.apply(0, Ok(doc.clone()), Some(hash(bytes))).is_err());
+        {
+            let state = hub.state.lock().unwrap();
+            for (route, old) in state.units[0].routes.iter().zip(&before) {
+                assert!(Arc::ptr_eq(&route.locks().0.read().unwrap(), old));
+            }
+            assert_eq!(state.units[0].doc.version, PolicyVersion::Legacy);
+        }
+        store.fail_commits(false);
+        hub.apply(0, Ok(doc), Some(hash(bytes))).unwrap();
+        let a = bindings::load(store.as_ref(), &id("a")).unwrap();
+        let b = bindings::load(store.as_ref(), &id("b")).unwrap();
+        let state = hub.state.lock().unwrap();
+        let policies: Vec<_> = state.units[0].routes.iter().map(|r| r.locks().0.read().unwrap()).collect();
+        assert_eq!(policies[0].domain_of(&customer_column("email")), a.get(&customer_id(1)).unwrap().domain.as_ref());
+        assert_eq!(policies[1].domain_of(&customer_column("other")), b.get(&customer_id(2)).unwrap().domain.as_ref());
+        assert_ne!(a.get(&customer_id(1)).unwrap().domain, b.get(&customer_id(2)).unwrap().domain);
+        assert!(policies[0].treatment(&customer_column("other")).is_none());
+        assert!(policies[1].treatment(&customer_column("email")).is_none());
+        drop(policies); drop(state);
+        assert!(hub.readiness(true, true).0);
     }
 
 }

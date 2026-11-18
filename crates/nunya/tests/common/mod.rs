@@ -92,10 +92,22 @@ pub fn harness_fixture() -> (Snapshot, Policy) {
         snapshot_max_age_ms: 60_000,
         readlog: ReadLogSink::Stdout,
     };
-    (
-        Snapshot::new(relations, vec![], vec!["public".into()], 0),
+    let snapshot = Snapshot::new(relations, vec![], vec!["public".into()], 0);
+    let doc = nunya::policy::PolicyDocument {
         policy,
-    )
+        version: nunya::policy::PolicyVersion::Legacy,
+        route_default: nunya::policy::RouteDefault::Show,
+        json_paths: vec![],
+        links: vec![],
+        file_readlog: None,
+        file_snapshot_max_age_ms: None,
+    };
+    let policy = nunya::policy::effective::served_policy(
+        &doc,
+        &snapshot,
+        &nunya::policy::bindings::RouteBindings::default(),
+    );
+    (snapshot, policy)
 }
 
 /// Fallible operations in the process-based serve fixture.

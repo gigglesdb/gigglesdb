@@ -155,8 +155,12 @@ impl Session {
             end_requested: None,
         }
     }
+    #[cfg(test)]
     fn snapshot(&mut self) -> Result<Arc<crate::schema::Snapshot>, Refusal> {
         let current = self.ctx.snapshot.read().map_err(|_| protocol())?.clone();
+        self.pin_snapshot(current)
+    }
+    fn pin_snapshot(&mut self, current: Arc<crate::schema::Snapshot>) -> Result<Arc<crate::schema::Snapshot>, Refusal> {
         let captured = current.captured_schemas.as_ref().unwrap_or(&current.search_path);
         if !self.pinned_path.iter().all(|schema| captured.contains(schema)) {
             return Err(failure(NyCode::SessionEnded));
@@ -382,9 +386,9 @@ impl Session {
         let result = (|| {
             // Admit at processing time so deferred queries use current authority.
             let mode = self.admit()?;
-            let (policy, revision) = self.ctx.policy_snapshot()?;
+            let (policy, revision, snapshot) = self.ctx.policy_and_snapshot()?;
             self.statement_revision = revision;
-            let snapshot = self.snapshot()?;
+            let snapshot = self.pin_snapshot(snapshot)?;
             if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms)
                 > policy.snapshot_max_age_ms
             {
@@ -1747,6 +1751,9 @@ pub(crate) mod tests {
             plain.schema = "other".into();
             snapshot.relations.push(plain);
             snapshot = snapshot.with_captured_schemas(vec!["public".into(), "other".into()]);
+            let policy = (**f.ctx.policy.read().unwrap()).clone();
+            let policy = crate::policy::effective::legacy_policy(policy, &snapshot);
+            *f.ctx.policy.write().unwrap() = Arc::new(policy);
             *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot.clone());
             let mut old = f.session();
             snapshot.search_path = vec!["other".into()];
@@ -2780,6 +2787,9 @@ pub(crate) mod tests {
             view_definition: None,
             primary_key: vec![],
         });
+        let policy = (**f.ctx.policy.read().unwrap()).clone();
+        let policy = crate::policy::effective::legacy_policy(policy, &snapshot);
+        *f.ctx.policy.write().unwrap() = Arc::new(policy);
         *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot);
         f
     }
@@ -4008,6 +4018,118 @@ pub(crate) mod tests {
         assert_eq!(execute.upstream.len(), 1);
         assert!(matches!(&execute.upstream[0],Frontend::Execute{portal,..} if portal=="c"));
     }
+    #[test]
+    fn prepared_treatment_refresh_refuses_bind_and_existing_portal_execute() {
+        for bind_before_refresh in [false, true] {
+            let f = Fixture::new();
+            let column = ColumnRef { schema: "public".into(), table: "items".into(), column: "value".into() };
+            let mut initial = (**f.ctx.policy.read().unwrap()).clone();
+            initial.columns.insert(column.clone(), Treatment::Show);
+            *f.ctx.policy.write().unwrap() = Arc::new(initial);
+            let mut s = f.session();
+            s.frontend(Frontend::Parse { name: "s".into(), query: "SELECT value FROM items".into(), param_types: vec![] });
+            s.backend(Backend::ParseComplete);
+            let bind = || Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![], params: vec![], result_formats: vec![] };
+            if bind_before_refresh {
+                s.frontend(bind());
+                s.backend(Backend::BindComplete);
+            }
+            let mut next = (**f.ctx.policy.read().unwrap()).clone();
+            next.columns.insert(column, Treatment::Masked { placeholder: None });
+            *f.ctx.policy.write().unwrap() = Arc::new(next);
+            let out = if bind_before_refresh {
+                s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 })
+            } else { s.frontend(bind()) };
+            assert!(out.upstream.is_empty());
+            assert!(out.client.iter().any(|m| matches!(m, Backend::ErrorResponse(fields) if *fields == nunya_error(NyCode::SchemaStale))));
+        }
+    }
+
+    #[test]
+    fn prepared_output_and_write_treatment_presence_changes_refuse() {
+        for sql in ["SELECT value FROM items", "UPDATE items SET value = 'x'"] {
+            let f = Fixture::new();
+            let column = ColumnRef { schema: "public".into(), table: "items".into(), column: "value".into() };
+            let mut initial = (**f.ctx.policy.read().unwrap()).clone();
+            initial.columns.insert(column.clone(), Treatment::Show);
+            *f.ctx.policy.write().unwrap() = Arc::new(initial);
+            let mut s = f.session();
+            let parsed = s.frontend(Frontend::Parse { name: "s".into(), query: sql.into(), param_types: vec![] });
+            assert!(matches!(parsed.upstream.as_slice(), [Frontend::Parse { .. }]), "{sql}");
+            s.backend(Backend::ParseComplete);
+            let mut next = (**f.ctx.policy.read().unwrap()).clone();
+            next.columns.remove(&column);
+            *f.ctx.policy.write().unwrap() = Arc::new(next);
+            let out = s.frontend(Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![], params: vec![], result_formats: vec![] });
+            assert!(out.upstream.is_empty(), "{sql}");
+            assert!(out.client.iter().any(|m| matches!(m, Backend::ErrorResponse(fields) if *fields == nunya_error(NyCode::SchemaStale))), "{sql}");
+        }
+    }
+
+    #[test]
+    fn prepared_non_output_use_treatment_refresh_refuses() {
+        let f = Fixture::new();
+        let mut s = f.session();
+        let parsed = s.frontend(Frontend::Parse { name: "s".into(), query: "SELECT count(value) FROM items".into(), param_types: vec![] });
+        assert!(matches!(parsed.upstream.as_slice(), [Frontend::Parse { .. }]));
+        s.backend(Backend::ParseComplete);
+        let mut next = (**f.ctx.policy.read().unwrap()).clone();
+        for treatment in next.columns.values_mut() { *treatment = Treatment::Masked { placeholder: None }; }
+        *f.ctx.policy.write().unwrap() = Arc::new(next);
+        let out = s.frontend(Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![], params: vec![], result_formats: vec![] });
+        assert!(out.upstream.is_empty());
+        assert!(out.client.iter().any(|m| matches!(m, Backend::ErrorResponse(fields) if *fields == nunya_error(NyCode::SchemaStale))));
+    }
+
+    #[test]
+    fn policy_catalog_capture_retains_publication_guard_until_snapshot_read() {
+        let f = Fixture::new();
+        let revision = f.ctx.policy_revision.write().unwrap();
+        let snapshot = f.ctx.snapshot.write().unwrap();
+        let reader_ctx = f.ctx.clone();
+        let reader = std::thread::spawn(move || reader_ctx.policy_and_snapshot().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reader_holds_policy = loop {
+            match f.ctx.policy.try_write() {
+                Err(std::sync::TryLockError::WouldBlock) => break true,
+                Err(std::sync::TryLockError::Poisoned(_)) => break false,
+                Ok(guard) => drop(guard),
+            }
+            if std::time::Instant::now() >= deadline { break false; }
+            std::thread::yield_now();
+        };
+        drop(revision);
+        let writer_ctx = f.ctx.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _policy = writer_ctx.policy.write().unwrap();
+            sent.send(()).unwrap();
+        });
+        let blocked = matches!(received.recv_timeout(std::time::Duration::from_millis(200)), Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        drop(snapshot);
+        reader.join().unwrap();
+        writer.join().unwrap();
+        assert!(reader_holds_policy);
+        assert!(blocked, "publication guard released before catalog capture completed");
+    }
+
+    #[test]
+    fn unrelated_treatment_refresh_keeps_prepared_execution() {
+        let f = Fixture::new();
+        let mut s = f.session();
+        s.frontend(Frontend::Parse { name: "s".into(), query: "SELECT value FROM items".into(), param_types: vec![] });
+        s.backend(Backend::ParseComplete);
+        let mut next = (**f.ctx.policy.read().unwrap()).clone();
+        next.columns.insert(ColumnRef { schema: "public".into(), table: "other".into(), column: "value".into() }, Treatment::Masked { placeholder: None });
+        *f.ctx.policy.write().unwrap() = Arc::new(next);
+        let bound = s.frontend(Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![], params: vec![], result_formats: vec![] });
+        assert!(matches!(bound.upstream.as_slice(), [Frontend::Bind { .. }]));
+        s.backend(Backend::BindComplete);
+        let out = s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 });
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Execute { .. }]));
+        assert!(out.client.is_empty());
+    }
+
     #[test]
     fn statement_snapshot_retains_revision_and_tokenize_limits_across_reload() {
         for sql in ["SELECT value FROM items", "SELECT nunya_tokenize('secret', 'private')"] {

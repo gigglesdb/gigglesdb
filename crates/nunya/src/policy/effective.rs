@@ -1,6 +1,6 @@
 //! Compile declared policy into a treatment for every captured column.
 use super::{
-    DomainName, DomainSettings, PolicyDocument, RouteDefault, TokenizeSetting, Treatment,
+    DomainName, DomainSettings, Policy, PolicyDocument, RouteDefault, TokenizeSetting, Treatment,
     bindings::{BindingStatus, RouteBindings, TypeFamily},
 };
 use crate::{
@@ -108,6 +108,53 @@ pub fn effective_all(
         .collect()
 }
 
+/// Compile the complete snapshot policy consumed by analyzers, including generated domains.
+pub fn served_policy(
+    doc: &PolicyDocument,
+    snapshot: &Snapshot,
+    bindings: &RouteBindings,
+) -> Policy {
+    let mut policy = doc.policy.clone();
+    policy.columns = effective_all(doc, snapshot, bindings)
+        .into_iter()
+        .map(|(column, (effective, _))| {
+            let treatment = match effective {
+                Effective::Show => Treatment::Show,
+                Effective::Masked { placeholder } => Treatment::Masked { placeholder },
+                Effective::Blind { domain }
+                | Effective::BlindLinked { domain }
+                | Effective::BlindPrivate { domain } => {
+                    policy
+                        .domains
+                        .entry(domain.clone())
+                        .or_insert_with(|| domain_settings(doc, &domain));
+                    Treatment::Blind { domain }
+                }
+            };
+            (column, treatment)
+        })
+        .collect();
+    policy
+}
+
+/// Compile a sparse legacy test fixture using its captured snapshot.
+#[cfg(test)]
+pub(crate) fn legacy_policy(policy: Policy, snapshot: &Snapshot) -> Policy {
+    served_policy(
+        &PolicyDocument {
+            policy,
+            version: super::PolicyVersion::Legacy,
+            route_default: RouteDefault::Show,
+            json_paths: vec![],
+            links: vec![],
+            file_readlog: None,
+            file_snapshot_max_age_ms: None,
+        },
+        snapshot,
+        &RouteBindings::default(),
+    )
+}
+
 /// Return declared settings, keeping explicit minting off for generated domains.
 pub fn domain_settings(doc: &PolicyDocument, domain: &DomainName) -> DomainSettings {
     doc.policy
@@ -198,9 +245,15 @@ fn compile(
             return explicit(treatment);
         }
         Some(Treatment::Show) => {
-            // The identity holds a Show anchor, under this name or a name it had before a
-            // PostgreSQL rename, so the explicit rule confirms the grant on the same identity.
-            if record.is_some_and(|r| r.show_rule.is_some()) {
+            // A previous name confirms this identity's grant only while that
+            // name still has a Show rule. An unrelated current-name rule cannot
+            // revive a stale anchor.
+            if record
+                .and_then(|r| r.show_rule.as_ref())
+                .is_some_and(|old| {
+                    old == column || matches!(doc.policy.columns.get(old), Some(Treatment::Show))
+                })
+            {
                 return (Effective::Show, Origin::Explicit);
             }
             return withheld(
@@ -258,8 +311,9 @@ fn compile(
     }
 }
 
+/// Compiler proofs and shared bound analyzer fixtures.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         policy::{
@@ -268,6 +322,128 @@ mod tests {
         },
         schema::{Column, Relation, RelationKind},
     };
+
+    #[test]
+    fn served_legacy_fills_snapshot_and_drops_absent_rules() {
+        let entries = type_entries();
+        let snapshot = snapshot(entries.clone());
+        let mut doc = document(RouteDefault::Show);
+        doc.version = PolicyVersion::Legacy;
+        for (i, treatment) in [
+            Treatment::Show,
+            Treatment::Masked {
+                placeholder: Some("hidden".into()),
+            },
+            Treatment::Blind {
+                domain: DomainName("declared".into()),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            doc.policy.columns.insert(entries[i].0.clone(), treatment);
+        }
+        let absent = ColumnRef {
+            column: "absent".into(),
+            ..entries[0].0.clone()
+        };
+        doc.policy.columns.insert(absent.clone(), Treatment::Show);
+        let served = served_policy(&doc, &snapshot, &RouteBindings::default());
+        assert_eq!(served.columns.len(), entries.len());
+        assert!(!served.columns.contains_key(&absent));
+        for (column, _) in entries {
+            assert_eq!(
+                served.treatment(&column),
+                Some(doc.policy.treatment(&column).unwrap_or(&Treatment::Show))
+            );
+        }
+        assert_eq!(served.snapshot_max_age_ms, doc.policy.snapshot_max_age_ms);
+        assert_eq!(served.readlog, doc.policy.readlog);
+    }
+
+    /// Build a bound Tokenize policy for analyzer tests without a database connection.
+    pub(crate) fn compiled_tokenize_fixture(
+        schema: &str,
+        table: &str,
+    ) -> (Snapshot, Policy, DomainName) {
+        use crate::{
+            policy::bindings,
+            schema::ColumnId,
+            state::{model::RouteId, store::RedbStore},
+            token::keys::RootKey,
+        };
+        let entries = [
+            ("text", ColumnType::Text),
+            ("small", ColumnType::Int2),
+            ("flag", ColumnType::Bool),
+            ("kind", ColumnType::Enum("kind".into())),
+            ("numeric", ColumnType::Numeric),
+            ("bytes", ColumnType::Bytea),
+            ("array", ColumnType::Array(Box::new(ColumnType::Text))),
+            ("json", ColumnType::Json),
+        ]
+        .into_iter()
+        .map(|(name, ty)| {
+            (
+                ColumnRef {
+                    schema: schema.into(),
+                    table: table.into(),
+                    column: name.into(),
+                },
+                ty,
+            )
+        })
+        .collect::<Vec<_>>();
+        let text = entries[0].0.clone();
+        let id = ColumnId::Pg {
+            relation_oid: 7,
+            attnum: 1,
+        };
+        let mut snapshot = snapshot(entries).with_column_ids(BTreeMap::from([(text, id.clone())]));
+        snapshot.search_path = vec![schema.into()];
+        let doc = document(RouteDefault::Tokenize);
+        let path = std::env::temp_dir().join(format!(
+            "served-{}",
+            bindings::generate_domain_name().unwrap().0
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let store = RedbStore::open(&path, &RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap();
+        let route = RouteId::new("served-test").unwrap();
+        let bindings = bindings::refresh(&store, &route, &doc, &snapshot).unwrap();
+        let domain = bindings.get(&id).unwrap().domain.clone().unwrap();
+        let policy = served_policy(&doc, &snapshot, &bindings);
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+        (snapshot, policy, domain)
+    }
+
+    #[test]
+    fn served_tokenize_compiles_bound_text_and_masks_unsupported_types() {
+        let (snapshot, policy, domain) = compiled_tokenize_fixture("public", "types");
+        assert_eq!(policy.columns.len(), snapshot.relations[0].columns.len());
+        for column in &snapshot.relations[0].columns {
+            let reference = ColumnRef {
+                schema: "public".into(),
+                table: "types".into(),
+                column: column.name.clone(),
+            };
+            let expected = if column.name == "text" {
+                Treatment::Blind {
+                    domain: domain.clone(),
+                }
+            } else {
+                Treatment::Masked { placeholder: None }
+            };
+            assert_eq!(policy.treatment(&reference), Some(&expected));
+        }
+        assert_eq!(
+            policy.domains[&domain],
+            DomainSettings {
+                tokenize: TokenizeSetting::Off,
+                range: None
+            }
+        );
+    }
 
     #[test]
     fn linked_treatments_and_settings() {
@@ -332,6 +508,14 @@ mod tests {
                     Origin::Linked
                 )
             );
+            let served = served_policy(&doc, &snap, &records);
+            assert_eq!(
+                served.treatment(&a),
+                Some(&Treatment::Blind {
+                    domain: shared.clone()
+                })
+            );
+            assert_eq!(served.domains[&shared], domain_settings(&doc, &shared));
             assert_eq!(
                 effective(&doc, &snap, &RouteBindings::default(), &a).unwrap(),
                 withheld(Origin::Unbound)

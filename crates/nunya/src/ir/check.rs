@@ -525,10 +525,9 @@ mod tests {
             primary_key: vec![],
         })
         .collect();
-        (
-            policy,
-            Snapshot::new(relations, vec![], vec!["public".into()], 0),
-        )
+        let snapshot = Snapshot::new(relations, vec![], vec!["public".into()], 0);
+        let policy = crate::policy::effective::legacy_policy(policy, &snapshot);
+        (policy, snapshot)
     }
     fn stmt() -> ResolvedStatement {
         ResolvedStatement {

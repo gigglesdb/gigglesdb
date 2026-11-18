@@ -296,7 +296,7 @@ pub(crate) async fn snapshot(
     result.map_err(|_| "upstream schema snapshot unavailable".into())
 }
 /// Parse policy bytes and resolve its audit path relative to the policy file.
-pub(crate) fn parse_policy_bytes(path: &Path, bytes: &[u8], service: &crate::policy::ServicePolicySettings) -> Result<Policy, Vec<PolicyError>> {
+pub(crate) fn parse_policy_bytes(path: &Path, bytes: &[u8], service: &crate::policy::ServicePolicySettings) -> Result<crate::policy::PolicyDocument, Vec<PolicyError>> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
         vec![PolicyError {
             message: "policy file is not UTF-8".into(),
@@ -309,17 +309,10 @@ pub(crate) fn parse_policy_bytes(path: &Path, bytes: &[u8], service: &crate::pol
         *log = path.parent().unwrap_or(Path::new(".")).join(&*log);
     }
     let document = crate::policy::file::resolve(document, service)?;
-    if document.version == crate::policy::PolicyVersion::V2 {
-        let refusal = if document.route_default == crate::policy::RouteDefault::Tokenize {
-            Some("policy: default tokenize is not served yet")
-        } else if !document.json_paths.is_empty() {
-            Some("policy: json_path rules are not served yet")
-        } else { None };
-        if let Some(message) = refusal {
-            return Err(vec![PolicyError { message: message.into() }]);
-        }
+    if !document.json_paths.is_empty() {
+        return Err(vec![PolicyError { message: "policy: json_path rules are not served yet".into() }]);
     }
-    Ok(document.policy)
+    Ok(document)
 }
 pub(crate) use crate::policy::file::readlog_key;
 #[cfg(test)]
@@ -444,6 +437,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         }
     }
     let hub = crate::reload::Hub::new(&policy_routes, config.policy_watch_ms, config.policy_settings.clone())?;
+    hub.set_store(runtime.store())?;
     let admins: crate::mgmt::routes::Admins = Arc::new(std::sync::RwLock::new(config.management.as_ref().map(|m| {
         m.admins.iter().map(|a| (a.name.clone(), crate::pgwire::auth::ScramVerifier {
             salt: a.verifier.salt.clone(), iterations: a.verifier.iterations,
@@ -949,7 +943,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(policy.readlog, crate::policy::ReadLogSink::File { path, .. } if path == Path::new("config/audit.jsonl"))
+            matches!(policy.policy.readlog, crate::policy::ReadLogSink::File { path, .. } if path == Path::new("config/audit.jsonl"))
         );
         assert!(parse_policy_bytes(Path::new("unused"), &[255], &crate::policy::ServicePolicySettings::default()).is_err());
     }
@@ -984,15 +978,15 @@ mod tests {
         let service = ServicePolicySettings { readlog: Some(ReadLogSink::Stdout), snapshot_max_age_ms: Some(123) };
         let path = Path::new("policy.toml");
         let legacy = parse_policy_bytes(path, b"", &service).unwrap();
-        assert_eq!(legacy.readlog, ReadLogSink::Stdout);
-        assert_eq!(legacy.snapshot_max_age_ms, 123);
+        assert_eq!(legacy.policy.readlog, ReadLogSink::Stdout);
+        assert_eq!(legacy.policy.snapshot_max_age_ms, 123);
+        assert!(parse_policy_bytes(path, b"version=2\ndefault='tokenize'", &service).is_ok());
         let show = b"version=2\ndefault='show'\n[[column]]\ntable='public.t'\nname='plain'\nshow=true\n";
         let policy = parse_policy_bytes(path, show, &service).unwrap();
-        assert_eq!(policy.readlog, ReadLogSink::Stdout);
-        assert!(policy.columns.values().all(|t| *t == Treatment::Show));
+        assert_eq!(policy.policy.readlog, ReadLogSink::Stdout);
+        assert!(policy.policy.columns.values().all(|t| *t == Treatment::Show));
         for (bytes, message) in [
             (b"[readlog]\nsink='file'\npath='audit.log'".as_slice(), "readlog: policy file and service config disagree"),
-            (b"version=2\ndefault='tokenize'".as_slice(), "policy: default tokenize is not served yet"),
             (b"version=2\ndefault='show'\n[[json_path]]\ntable='public.t'\nname='data'\npath='$.a'\nmasked=true".as_slice(), "policy: json_path rules are not served yet"),
         ] {
             assert_eq!(parse_policy_bytes(path, bytes, &service).unwrap_err()[0].message, message);
@@ -1014,6 +1008,22 @@ mod tests {
         };
         let bytes = b"[readlog]\nsink='file'\npath='./gd88-audit.log'";
         let policy = parse_policy_bytes(&base.join("policy.toml"), bytes, &service).unwrap();
-        assert_eq!(readlog_key(&policy.readlog), service.readlog.unwrap());
+        assert_eq!(readlog_key(&policy.policy.readlog), service.readlog.unwrap());
     }
+    #[test]
+    fn tokenize_default_accepts_scalars_but_still_refuses_json_paths() {
+        let service = crate::policy::ServicePolicySettings {
+            readlog: Some(crate::policy::ReadLogSink::Stdout), ..Default::default()
+        };
+        let path = Path::new("policy.toml");
+        let scalar = parse_policy_bytes(path, b"version=2\ndefault='tokenize'", &service).unwrap();
+        assert_eq!(scalar.route_default, crate::policy::RouteDefault::Tokenize);
+        let errors = parse_policy_bytes(path,
+            b"version=2\ndefault='tokenize'\n[[json_path]]\ntable='public.t'\nname='data'\npath='$.a'\nmasked=true", &service).unwrap_err();
+        assert_eq!(errors[0].message, "policy: json_path rules are not served yet");
+        let errors = parse_policy_bytes(path,
+            b"version=2\ndefault='tokenize'\n[[link]]\nfields=['public.t.a','public.t.b']", &service).unwrap_err();
+        assert!(errors[0].message.contains("link"));
+    }
+
 }

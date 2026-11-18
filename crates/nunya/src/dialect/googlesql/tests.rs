@@ -58,7 +58,9 @@ fn fixture() -> (Snapshot, Policy) {
             primary_key: vec![],
         });
     }
-    (Snapshot::new(rs, vec![], vec!["".into()], 0), p)
+    let snapshot = Snapshot::new(rs, vec![], vec!["".into()], 0);
+    let p = crate::policy::effective::legacy_policy(p, &snapshot);
+    (snapshot, p)
 }
 fn lower(sql: &str) -> ResolvedStatement {
     let (s, p) = fixture();
@@ -591,4 +593,94 @@ fn tokenize_in_view_definition_fails_closed() {
             .code,
         NyCode::NotAnalysable,
     );
+}
+
+#[test]
+fn missing_policy_column_never_becomes_plain() {
+    let (snapshot, mut policy) = fixture();
+    let missing = ColumnRef {
+        schema: "".into(),
+        table: "Notes".into(),
+        column: "Body".into(),
+    };
+    policy.columns.remove(&missing);
+    let lower = |sql: &str| lower_gsql(sql, &snapshot, &policy).map(|s| s.0);
+    for sql in [
+        "SELECT Body FROM Notes",
+        "SELECT * FROM Notes",
+        "SELECT Body AS renamed FROM Notes",
+        "SELECT d.Body FROM (SELECT Body FROM Notes) d",
+        "WITH d AS (SELECT Body FROM Notes) SELECT Body FROM d",
+        "DELETE FROM Notes WHERE TRUE THEN RETURN Body",
+        "SELECT Id FROM Notes WHERE Body = @p",
+        "SELECT n.Id FROM Notes n JOIN Notes m ON n.Body = m.Body",
+        "SELECT Body FROM Notes GROUP BY Body",
+        "SELECT Id FROM Notes ORDER BY Body",
+    ] {
+        if let Ok(stmt) = lower(sql) {
+            let outputs = stmt
+                .outputs
+                .iter()
+                .filter(|o| o.source.as_ref() == Some(&missing))
+                .collect::<Vec<_>>();
+            let uses = stmt
+                .uses
+                .iter()
+                .filter(|u| u.column == missing)
+                .collect::<Vec<_>>();
+            assert!(!outputs.is_empty() || !uses.is_empty(), "{sql}");
+            assert!(outputs.iter().all(|o| o.label == Label::Masked), "{sql}");
+            assert!(uses.iter().all(|u| u.label == Label::Masked), "{sql}");
+            assert!(
+                crate::ir::check::check(&stmt, &policy, &snapshot).is_err(),
+                "{sql}"
+            );
+        }
+    }
+    let direct = lower("SELECT Body FROM Notes").unwrap();
+    assert_eq!(direct.outputs[0].label, Label::Masked);
+    assert_eq!(
+        crate::ir::check::check(&direct, &policy, &snapshot)
+            .unwrap_err()
+            .code,
+        NyCode::NotAnalysable
+    );
+    let predicate = lower("SELECT Id FROM Notes WHERE Body = @p").unwrap();
+    assert_eq!(
+        crate::ir::check::check(&predicate, &policy, &snapshot)
+            .unwrap_err()
+            .code,
+        NyCode::MaskedExpression
+    );
+}
+
+#[test]
+fn compiled_tokenize_policy_drives_output_rewrites_and_predicate_refusals() {
+    let (snapshot, policy, domain) =
+        crate::policy::effective::tests::compiled_tokenize_fixture("", "types");
+    let lower = |sql: &str| lower_gsql(sql, &snapshot, &policy).map(|s| s.0);
+    let stmt = lower("SELECT text, small, flag, kind FROM types").unwrap();
+    let plan = crate::ir::check::check(&stmt, &policy, &snapshot).unwrap();
+    assert_eq!(
+        plan.outputs,
+        vec![
+            OutputRewrite::Tokenize {
+                domain,
+                ty: ColumnType::Text
+            },
+            OutputRewrite::Mask { placeholder: None },
+            OutputRewrite::Mask { placeholder: None },
+            OutputRewrite::Mask { placeholder: None },
+        ]
+    );
+    for name in ["small", "flag", "kind"] {
+        let sql = format!("SELECT text FROM types WHERE {name} IS NULL");
+        let stmt = lower(&sql).unwrap();
+        assert_eq!(
+            crate::ir::check::check(&stmt, &policy, &snapshot)
+                .unwrap_err()
+                .code,
+            NyCode::MaskedExpression
+        );
+    }
 }

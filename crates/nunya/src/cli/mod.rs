@@ -66,7 +66,7 @@ enum KeyCommand {
 }
 fn load_policy(path: &Path, service: &crate::policy::ServicePolicySettings) -> Result<crate::policy::Policy, Vec<String>> {
     let bytes = std::fs::read(path).map_err(|_| vec!["policy file unavailable".into()])?;
-    crate::serve::parse_policy_bytes(path, &bytes, service).map_err(|errors| {
+    crate::serve::parse_policy_bytes(path, &bytes, service).map(|doc| doc.policy).map_err(|errors| {
         errors
             .into_iter()
             .map(|e| e.to_string())
@@ -246,7 +246,7 @@ mod tests {
         let checked = load_policy(&path, &crate::policy::ServicePolicySettings::default()).unwrap();
         let served =
             crate::serve::parse_policy_bytes(&path, &std::fs::read(&path).unwrap(), &crate::policy::ServicePolicySettings::default()).unwrap();
-        assert_eq!(checked.readlog, served.readlog);
+        assert_eq!(checked.readlog, served.policy.readlog);
         let absolute = crate::policy::ReadLogSink::File {
             path: dir.as_path().join("read.log"),
             max_bytes: 104857600,

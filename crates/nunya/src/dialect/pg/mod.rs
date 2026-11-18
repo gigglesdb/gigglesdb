@@ -200,7 +200,8 @@ impl State<'_> {
         match self.policy.treatment(col) {
             Some(Treatment::Blind { domain }) => Label::Blind(domain.clone()),
             Some(Treatment::Masked { .. }) => Label::Masked,
-            Some(Treatment::Show) | None => Label::Plain,
+            Some(Treatment::Show) => Label::Plain,
+            None => Label::Masked,
         }
     }
     fn root(

@@ -68,10 +68,9 @@ fn fixture() -> (Snapshot, Policy) {
         view_definition: Some("SELECT id, email FROM public.customers".into()),
         primary_key: vec![],
     });
-    (
-        Snapshot::new(relations, vec![], vec!["public".into()], 0),
-        policy,
-    )
+    let snapshot = Snapshot::new(relations, vec![], vec!["public".into()], 0);
+    let policy = crate::policy::effective::legacy_policy(policy, &snapshot);
+    (snapshot, policy)
 }
 fn lower(sql: &str) -> ResolvedStatement {
     let (s, p) = fixture();
@@ -1389,4 +1388,102 @@ fn session_metadata_near_misses() {
     assert_eq!(statements.len(), 2);
     assert_eq!(statements[1].outputs[0].label, blind());
     assert!(matches!(crate::ir::check::check(&statements[1], &policy, &snapshot).unwrap().outputs[0], OutputRewrite::Tokenize { .. }));
+}
+
+#[test]
+fn missing_policy_column_never_becomes_plain() {
+    let (snapshot, mut policy) = fixture();
+    let missing = ColumnRef {
+        schema: "public".into(),
+        table: "notes".into(),
+        column: "body".into(),
+    };
+    policy.columns.remove(&missing);
+    let lower = |sql: &str| {
+        PgLowering
+            .lower(sql, &snapshot, &policy, &[])
+            .map(|mut s| s.remove(0))
+    };
+    for sql in [
+        "SELECT body FROM notes",
+        "SELECT * FROM notes",
+        "SELECT body AS renamed FROM notes",
+        "SELECT d.body FROM (SELECT body FROM notes) d",
+        "WITH d AS (SELECT body FROM notes) SELECT body FROM d",
+        "DELETE FROM notes RETURNING body",
+        "SELECT id FROM notes WHERE body = $1",
+        "SELECT n.id FROM notes n JOIN notes m ON n.body = m.body",
+        "SELECT body FROM notes GROUP BY body",
+        "SELECT id FROM notes ORDER BY body",
+    ] {
+        if let Ok(stmt) = lower(sql) {
+            let outputs = stmt
+                .outputs
+                .iter()
+                .filter(|o| o.source.as_ref() == Some(&missing))
+                .collect::<Vec<_>>();
+            let uses = stmt
+                .uses
+                .iter()
+                .filter(|u| u.column == missing)
+                .collect::<Vec<_>>();
+            assert!(!outputs.is_empty() || !uses.is_empty(), "{sql}");
+            assert!(outputs.iter().all(|o| o.label == Label::Masked), "{sql}");
+            assert!(uses.iter().all(|u| u.label == Label::Masked), "{sql}");
+            assert!(
+                crate::ir::check::check(&stmt, &policy, &snapshot).is_err(),
+                "{sql}"
+            );
+        }
+    }
+    let direct = lower("SELECT body FROM notes").unwrap();
+    assert_eq!(direct.outputs[0].label, Label::Masked);
+    assert_eq!(
+        crate::ir::check::check(&direct, &policy, &snapshot)
+            .unwrap_err()
+            .code,
+        NyCode::NotAnalysable
+    );
+    let predicate = lower("SELECT id FROM notes WHERE body = $1").unwrap();
+    assert_eq!(
+        crate::ir::check::check(&predicate, &policy, &snapshot)
+            .unwrap_err()
+            .code,
+        NyCode::MaskedExpression
+    );
+}
+
+#[test]
+fn compiled_tokenize_policy_drives_output_rewrites_and_predicate_refusals() {
+    let (snapshot, policy, domain) =
+        crate::policy::effective::tests::compiled_tokenize_fixture("public", "types");
+    let lower = |sql: &str| {
+        PgLowering
+            .lower(sql, &snapshot, &policy, &[])
+            .map(|mut s| s.remove(0))
+    };
+    let stmt = lower("SELECT text, small, flag, kind FROM types").unwrap();
+    let plan = crate::ir::check::check(&stmt, &policy, &snapshot).unwrap();
+    assert_eq!(
+        plan.outputs,
+        vec![
+            OutputRewrite::Tokenize {
+                domain,
+                ty: ColumnType::Text
+            },
+            OutputRewrite::Mask { placeholder: None },
+            OutputRewrite::Mask { placeholder: None },
+            OutputRewrite::Mask { placeholder: None },
+        ]
+    );
+    for name in ["small", "flag", "kind"] {
+        let sql = format!("SELECT text FROM types WHERE {name} IS NULL");
+        let stmt = lower(&sql).unwrap();
+        assert_eq!(
+            crate::ir::check::check(&stmt, &policy, &snapshot)
+                .unwrap_err()
+                .code,
+            NyCode::MaskedExpression
+        );
+    }
 }
