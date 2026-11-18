@@ -2864,3 +2864,711 @@ async fn reload_removed_standing_ends_pg_and_native_sessions() -> ServeResult<()
     spanner_denied(native_result, "NY003");
     Ok(())
 }
+
+// Live qualification checks deliberately accumulate failures so every probe is reported.
+#[derive(Default)]
+struct LiveChecks {
+    pass: usize,
+    fail: usize,
+}
+impl LiveChecks {
+    fn check(&mut self, test: &str, name: &str, ok: bool, detail: String) {
+        if ok {
+            self.pass += 1;
+        } else {
+            self.fail += 1;
+        }
+        eprintln!(
+            "{} {test}/{name}: {detail}",
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    fn finish(&self, test: &str, iterations: usize) {
+        eprintln!(
+            "SUMMARY {test} iterations={iterations} pass={} fail={}",
+            self.pass, self.fail
+        );
+        assert_eq!(self.fail, 0, "live qualification checks failed");
+    }
+}
+
+fn live_outcome<T>(result: Result<T, tokio_postgres::Error>) -> String {
+    match result {
+        Ok(_) => "ok".into(),
+        Err(e) if e.code().is_some() => e.code().map(|c| c.code().to_owned()).unwrap_or_default(),
+        Err(e) if e.is_closed() => "closed".into(),
+        Err(_) => "transport-error".into(),
+    }
+}
+
+async fn live_budget(h: &ServeHarness, owner: &MgmtClient) -> ServeResult<(usize, bool)> {
+    let mut successes = 0;
+    // A session limit can be hit before the principal limit: rotate sessions.
+    for _ in 0..3 {
+        let (s, secret) = acquire(owner, false, None).await?;
+        let (c, _d) = session_connect(h, &s, &secret).await?;
+        let mut this_session = 0;
+        for n in 0..=400 {
+            let outcome = live_outcome(
+                c.simple_query(&format!(
+                    "SELECT nunya_tokenize('email', 'followup-{successes}-{n}')"
+                ))
+                .await,
+            );
+            if outcome == "NY007" {
+                if this_session < 400 {
+                    return Ok((successes, true));
+                }
+                break;
+            }
+            if outcome != "ok" {
+                return Ok((successes, false));
+            }
+            successes += 1;
+            this_session += 1;
+        }
+    }
+    Ok((successes, false))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires NUNYA_TEST_PG pointing at harness database"]
+async fn live_revocation_races_tokenize_through_gateway() -> ServeResult<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Instant;
+    const TEST: &str = "live_revocation_races_tokenize_through_gateway";
+    const ITERATIONS: usize = 20;
+    let policy = file_sink_policy()
+        .replace(
+            "tokenize_limit_per_session = 20",
+            "tokenize_limit_per_session = 400",
+        )
+        .replace(
+            "tokenize_limit_per_principal = 200",
+            "tokenize_limit_per_principal = 600",
+        );
+    let mut h = ServeHarness::new(
+        &policy,
+        Some(&std::env::var("NUNYA_TEST_PG")?),
+        None,
+        None,
+        "",
+    )?;
+    h.start().await?;
+    let mut checks = LiveChecks::default();
+    for iteration in 0..ITERATIONS {
+        let name = format!("live-race-{iteration}");
+        let (s, secret, principal) = h
+            .acquire_session(&name, "postgres", Mode::ReadWrite)
+            .await?;
+        let owner = owner(&h, &name, &principal)?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(tokio::sync::Barrier::new(9));
+        let first_success = Arc::new(tokio::sync::Notify::new());
+        let mut tasks = Vec::new();
+        for connection in 0..8 {
+            let (client, driver) = session_connect(&h, &s, &secret).await?;
+            let stopped = stopped.clone();
+            let barrier = barrier.clone();
+            let first_success = first_success.clone();
+            tasks.push(tokio::spawn(async move {
+                let _driver = driver;
+                barrier.wait().await;
+                let mut records = Vec::new();
+                let mut after = 0;
+                for n in 0..10000 {
+                    if stopped.load(Ordering::SeqCst) {
+                        after += 1;
+                    }
+                    let start = Instant::now();
+                    let outcome = live_outcome(client.simple_query(&format!(
+                        "SELECT nunya_tokenize('email', 'race-{iteration}-{connection}-{n}')"
+                    )).await);
+                    let end = Instant::now();
+                    if outcome == "ok" {
+                        first_success.notify_one();
+                    }
+                    records.push((start, end, outcome));
+                    if after >= 3 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                records
+            }));
+        }
+        barrier.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), first_success.notified()).await?;
+        // A seed-free jitter derived from the wall clock varies the race window.
+        let jitter = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos() % 500;
+        tokio::time::sleep(Duration::from_micros(u64::from(jitter))).await;
+        h.admin().revoke(&s.id).await?;
+        let revoked = Instant::now();
+        stopped.store(true, Ordering::SeqCst);
+        let mut all = Vec::new();
+        for task in tasks {
+            all.push(task.await?);
+        }
+        let successes = all.iter().flatten().filter(|r| r.2 == "ok").count();
+        let before = all
+            .iter()
+            .flatten()
+            .filter(|r| r.1 <= revoked && r.2 == "ok")
+            .count();
+        let post_refusals = all
+            .iter()
+            .flatten()
+            .filter(|r| r.0 > revoked && matches!(r.2.as_str(), "NY011" | "NY003" | "closed"))
+            .count();
+        let quota_before = all
+            .iter()
+            .flatten()
+            .any(|r| r.1 <= revoked && r.2 == "NY007")
+            && successes == 400;
+        let mut no_resurrection = true;
+        let mut post_ok = true;
+        for records in &all {
+            let mut refused = false;
+            let mut post = 0;
+            for (start, _, outcome) in records {
+                if outcome == "ok" && (refused || *start > revoked) {
+                    no_resurrection = false;
+                }
+                if matches!(outcome.as_str(), "NY011" | "NY003" | "closed") {
+                    refused = true;
+                }
+                if *start > revoked {
+                    post += 1;
+                    if !matches!(outcome.as_str(), "NY011" | "NY003" | "closed")
+                        && !(quota_before && outcome == "NY007")
+                    {
+                        post_ok = false;
+                    }
+                }
+            }
+            post_ok &= post > 0;
+        }
+        let fresh = live_outcome(connect(&h, &format!("session:{}", s.id), &secret).await);
+        checks.check(TEST, "no-success-after-revoke", no_resurrection && before > 0 && post_refusals > 0,
+            format!("iteration={iteration} before={before} post_refusals={post_refusals} successes={successes}"));
+        checks.check(TEST, "refused-after-revoke", post_ok && matches!(fresh.as_str(), "NY003" | "NY011"),
+            format!("iteration={iteration} fresh={fresh} quota_before={quota_before} post_refusals={post_refusals}"));
+        let (remaining, hit_limit) = live_budget(&h, &owner).await?;
+        checks.check(TEST, "counter-within-limit", successes <= 400 && successes + remaining <= 600 && hit_limit,
+            format!("iteration={iteration} burst={successes} followup={remaining} session_limit=400 principal_limit=600 exhausted={hit_limit}"));
+        if iteration % 5 == 0 || iteration == ITERATIONS - 1 {
+            h.restart().await?;
+            let fresh = live_outcome(connect(&h, &format!("session:{}", s.id), &secret).await);
+            let ended = h
+                .admin()
+                .sessions()
+                .await?
+                .iter()
+                .any(|v| v.id == s.id && v.state == nunya::state::model::SessionState::Revoked);
+            let (after, hit_after) = live_budget(&h, &owner).await?;
+            checks.check(TEST, "no-resurrection-after-restart", fresh == "NY003" && ended && hit_limit && hit_after && after == 0,
+                format!("iteration={iteration} fresh={fresh} revoked={ended} before_remaining=0 after_remaining={after} exhausted={hit_after}"));
+        }
+    }
+    checks.finish(TEST, ITERATIONS);
+    Ok(())
+}
+
+// Own the trigger function as well as its table, including on assertion unwinding.
+struct LiveCommitFixture {
+    table: TableGuard,
+    function: String,
+}
+impl Drop for LiveCommitFixture {
+    fn drop(&mut self) {
+        let url = self.table.url.clone();
+        let table = self.table.name.clone();
+        let function = self.function.clone();
+        let _ = std::thread::spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                rt.block_on(async {
+                    if let Ok((c, conn)) = tokio_postgres::connect(&url, NoTls).await {
+                        let _driver = Driver(tokio::spawn(async move { let _ = conn.await; }));
+                        let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS public.{table}; DROP FUNCTION IF EXISTS public.{function}()" )).await;
+                    }
+                });
+            }
+        }).join();
+    }
+}
+
+async fn live_sleeping_backend(
+    admin: &Client,
+    table: &str,
+    expected: Option<i32>,
+) -> ServeResult<i32> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            // Match the captured transaction backend, or the unique autocommit table.
+            let rows = admin.query(
+                "SELECT pid FROM pg_stat_activity WHERE usename = 'nunya' AND state = 'active' AND wait_event = 'PgSleep' AND (($2::int IS NOT NULL AND pid = $2) OR ($2::int IS NULL AND query LIKE $1))",
+                &[&format!("%{table}%"), &expected],
+            ).await?;
+            if rows.len() == 1 { return Ok::<i32, Box<dyn std::error::Error + Send + Sync>>(rows[0].get(0)); }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires NUNYA_TEST_PG and NUNYA_TEST_PG_ADMIN pointing at harness database"]
+async fn live_pg_ny012_commit_outcome_unknown_no_replay() -> ServeResult<()> {
+    const TEST: &str = "live_pg_ny012_commit_outcome_unknown_no_replay";
+    let admin_url = std::env::var("NUNYA_TEST_PG_ADMIN")?;
+    let (admin, conn) = tokio_postgres::connect(&admin_url, NoTls).await?;
+    let _admin_driver = Driver(tokio::spawn(async move {
+        let _ = conn.await;
+    }));
+    let table = format!("live_commit_{}", nunya::token::SessionId::random().to_hex());
+    let function = format!("{table}_sleep");
+    let _fixture = LiveCommitFixture {
+        table: TableGuard {
+            url: admin_url,
+            name: table.clone(),
+        },
+        function: function.clone(),
+    };
+    admin.batch_execute(&format!(
+        "CREATE TABLE public.{table} (id int); GRANT SELECT, INSERT ON public.{table} TO nunya;
+         CREATE FUNCTION public.{function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$;
+         CREATE CONSTRAINT TRIGGER live_delay AFTER INSERT ON public.{table} DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.{function}()"
+    )).await?;
+    let mut h = ServeHarness::new(
+        &file_sink_policy(),
+        Some(&std::env::var("NUNYA_TEST_PG")?),
+        None,
+        None,
+        "",
+    )?;
+    h.start().await?;
+    let mut checks = LiveChecks::default();
+    for variant in ["A", "B", "C"] {
+        for repetition in 0..5 {
+            let key = (if variant == "A" {
+                0
+            } else if variant == "B" {
+                10
+            } else {
+                20
+            }) + repetition;
+            let (s, secret, _) = h
+                .acquire_session(
+                    &format!("live-commit-{variant}-{repetition}"),
+                    "postgres",
+                    Mode::ReadWrite,
+                )
+                .await?;
+            let (client, _driver) = session_connect(&h, &s, &secret).await?;
+            let insert = format!("INSERT INTO public.{table} (id) VALUES ({key})");
+            if variant != "B" {
+                client.batch_execute("BEGIN").await?;
+                client.batch_execute(&insert).await?;
+            }
+            let expected = if variant != "B" {
+                let row = admin.query_one("SELECT pid FROM pg_stat_activity WHERE usename = 'nunya' AND state = 'idle in transaction' AND query LIKE $1", &[&format!("%{table}%")]).await?;
+                Some(row.get::<_, i32>(0))
+            } else {
+                None
+            };
+            let statement = if variant == "B" {
+                insert
+            } else {
+                "COMMIT".into()
+            };
+            let call =
+                tokio::spawn(async move { live_outcome(client.simple_query(&statement).await) });
+            let pid = live_sleeping_backend(&admin, &table, expected).await?;
+            if variant == "C" {
+                admin
+                    .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+                    .await?;
+            } else {
+                h.admin().revoke(&s.id).await?;
+            }
+            let outcome = tokio::time::timeout(Duration::from_secs(10), call).await??;
+            checks.check(
+                TEST,
+                if variant == "C" {
+                    "terminated-outcome"
+                } else {
+                    "ny012"
+                },
+                if variant == "C" {
+                    outcome != "ok"
+                } else {
+                    outcome == "NY012"
+                },
+                format!("variant={variant} repetition={repetition} outcome={outcome}"),
+            );
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            let count_sql = format!("SELECT count(*) FROM public.{table} WHERE id = $1");
+            let first: i64 = admin.query_one(&count_sql, &[&key]).await?.get(0);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let second: i64 = admin.query_one(&count_sql, &[&key]).await?.get(0);
+            checks.check(
+                TEST,
+                "no-replay",
+                (0..=1).contains(&first) && (0..=1).contains(&second) && first == second,
+                format!("variant={variant} repetition={repetition} first={first} second={second}"),
+            );
+            if variant != "C" {
+                let fresh = live_outcome(connect(&h, &format!("session:{}", s.id), &secret).await);
+                checks.check(
+                    TEST,
+                    "session-ended",
+                    fresh == "NY003",
+                    format!("variant={variant} repetition={repetition} fresh={fresh}"),
+                );
+                let records = std::fs::read_to_string(h.dir().join("read.log"))?
+                    .lines()
+                    .map(serde_json::from_str::<serde_json::Value>)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let id = s.id.to_string();
+                let own: Vec<_> = records.iter().filter(|r| r["session"] == id).collect();
+                let ended = own.iter().any(|r| {
+                    r["kind"] == "lifecycle"
+                        && r["event"] == "connection_ended"
+                        && r["reason"] == "revoked"
+                });
+                let forwarded = own.iter().any(|r| {
+                    r["kind"] == "statement"
+                        && r["statement"].as_str().is_some_and(|v| {
+                            if variant == "B" {
+                                v.contains(&table) && v.to_uppercase().contains("INSERT")
+                            } else {
+                                v.to_uppercase().contains("COMMIT")
+                            }
+                        })
+                });
+                let ny012 = own.iter().any(|r| r["outcome"] == "NY012");
+                checks.check(TEST, "audit", ended && forwarded,
+                    format!("variant={variant} repetition={repetition} connection_ended_revoked={ended} forwarded_statement={forwarded} audit_ny012={ny012}"));
+            }
+        }
+    }
+    checks.finish(TEST, 15);
+    Ok(())
+}
+
+// Record times and outcomes without retaining token contents.
+struct LiveLimitAttempt {
+    start: std::time::Instant,
+    end: std::time::Instant,
+    outcome: String,
+}
+
+async fn live_limit_clients(
+    h: &ServeHarness,
+    sessions: &[(&SessionView, &SessionSecret, usize)],
+    label: &str,
+    revoke: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )>,
+) -> ServeResult<Vec<tokio::task::JoinHandle<Vec<LiveLimitAttempt>>>> {
+    use std::sync::atomic::Ordering;
+    let clients = sessions.iter().map(|s| s.2).sum::<usize>();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(clients));
+    let mut tasks = Vec::new();
+    for (session_index, (session, secret, count)) in sessions.iter().enumerate() {
+        for connection in 0..*count {
+            let (client, driver) = session_connect(h, session, secret).await?;
+            let barrier = barrier.clone();
+            let label = format!("{label}-{session_index}-{connection}");
+            let revoke = revoke.clone();
+            tasks.push(tokio::spawn(async move {
+                let _driver = driver;
+                barrier.wait().await;
+                let mut records = Vec::new();
+                let mut quota_probes = 0;
+                let mut post_revoke = 0;
+                // Enough to exhaust either configured quota even with unfair scheduling.
+                for attempt in 0..120 {
+                    let start = std::time::Instant::now();
+                    let after = revoke
+                        .as_ref()
+                        .is_some_and(|(_, flag)| flag.load(Ordering::SeqCst));
+                    let outcome = live_outcome(
+                        client
+                            .simple_query(&format!(
+                                "SELECT nunya_tokenize('email', '{label}-{attempt}')"
+                            ))
+                            .await,
+                    );
+                    let end = std::time::Instant::now();
+                    if outcome == "ok" {
+                        if let Some((successes, _)) = &revoke {
+                            successes.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    if outcome == "NY007" || quota_probes > 0 {
+                        quota_probes += 1;
+                    }
+                    if after {
+                        post_revoke += 1;
+                    }
+                    records.push(LiveLimitAttempt {
+                        start,
+                        end,
+                        outcome,
+                    });
+                    if revoke.is_some() {
+                        if post_revoke >= 3 {
+                            break;
+                        }
+                        // Keep quota refusals bounded while giving the revoker time to run.
+                        if quota_probes > 0 && !after {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    } else if quota_probes >= 3 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                records
+            }));
+        }
+    }
+    Ok(tasks)
+}
+
+async fn live_limit_collect(
+    tasks: Vec<tokio::task::JoinHandle<Vec<LiveLimitAttempt>>>,
+) -> ServeResult<Vec<Vec<LiveLimitAttempt>>> {
+    let mut records = Vec::new();
+    for task in tasks {
+        records.push(task.await?);
+    }
+    Ok(records)
+}
+
+fn live_limit_exact(records: &[Vec<LiveLimitAttempt>], expected: usize) -> (bool, usize, usize) {
+    let successes = records
+        .iter()
+        .flatten()
+        .filter(|r| r.outcome == "ok")
+        .count();
+    let mut ended = 0;
+    let mut ordered = true;
+    for connection in records {
+        let mut refused = false;
+        for attempt in connection {
+            if attempt.outcome == "NY007" {
+                refused = true;
+            } else if attempt.outcome != "ok" || refused {
+                ordered = false;
+            }
+        }
+        ended += usize::from(connection.last().is_some_and(|r| r.outcome == "NY007"));
+    }
+    (
+        successes == expected && ended == records.len() && ordered,
+        successes,
+        ended,
+    )
+}
+
+async fn live_limit_budget(
+    h: &ServeHarness,
+    owner: &MgmtClient,
+    label: &str,
+) -> ServeResult<(usize, bool)> {
+    let mut successes = 0;
+    // Session limit is 40; two sessions suffice for the principal limit of 60.
+    for rotation in 0..3 {
+        let (session, secret) = acquire(owner, false, None).await?;
+        let (client, _driver) = session_connect(h, &session, &secret).await?;
+        let mut this_session = 0;
+        for attempt in 0..=40 {
+            let outcome = live_outcome(
+                client
+                    .simple_query(&format!(
+                        "SELECT nunya_tokenize('email', '{label}-{rotation}-{attempt}')"
+                    ))
+                    .await,
+            );
+            if outcome == "NY007" {
+                if this_session < 40 {
+                    return Ok((successes, true));
+                }
+                break;
+            }
+            if outcome != "ok" {
+                return Ok((successes, false));
+            }
+            successes += 1;
+            this_session += 1;
+        }
+    }
+    Ok((successes, false))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires NUNYA_TEST_PG pointing at harness database"]
+async fn live_parallel_tokenize_respects_limits() -> ServeResult<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::time::Instant;
+    const TEST: &str = "live_parallel_tokenize_respects_limits";
+    const ITERATIONS: usize = 20;
+    let policy = file_sink_policy()
+        .replace(
+            "tokenize_limit_per_session = 20",
+            "tokenize_limit_per_session = 40",
+        )
+        .replace(
+            "tokenize_limit_per_principal = 200",
+            "tokenize_limit_per_principal = 60",
+        );
+    let mut h = ServeHarness::new(
+        &policy,
+        Some(&std::env::var("NUNYA_TEST_PG")?),
+        None,
+        None,
+        "",
+    )?;
+    h.start().await?;
+    let mut checks = LiveChecks::default();
+    for iteration in 0..ITERATIONS {
+        let name = format!("live-limits-{iteration}");
+        let (s1, secret1, principal) = h
+            .acquire_session(&name, "postgres", Mode::ReadWrite)
+            .await?;
+        let first_owner = owner(&h, &name, &principal)?;
+        let records = live_limit_collect(
+            live_limit_clients(
+                &h,
+                &[(&s1, &secret1, 8)],
+                &format!("session-{iteration}"),
+                None,
+            )
+            .await?,
+        )
+        .await?;
+        let (exact, successes, ended) = live_limit_exact(&records, 40);
+        checks.check(TEST, "session-limit-parallel", exact && records.len() == 8,
+            format!("iteration={iteration} successes={successes} expected=40 ny007_connections={ended}/8 ordered_probes={exact}"));
+
+        let (s2, secret2) = acquire(&first_owner, false, None).await?;
+        let (s3, secret3) = acquire(&first_owner, false, None).await?;
+        let records = live_limit_collect(
+            live_limit_clients(
+                &h,
+                &[(&s2, &secret2, 4), (&s3, &secret3, 4)],
+                &format!("principal-{iteration}"),
+                None,
+            )
+            .await?,
+        )
+        .await?;
+        let (exact, successes, ended) = live_limit_exact(&records, 20);
+        checks.check(TEST, "principal-limit-parallel", exact && records.len() == 8,
+            format!("iteration={iteration} successes={successes} expected=20 ny007_connections={ended}/8 ordered_probes={exact}"));
+
+        let name = format!("live-limit-revoke-{iteration}");
+        let (s4, secret4, principal) = h
+            .acquire_session(&name, "postgres", Mode::ReadWrite)
+            .await?;
+        let second_owner = owner(&h, &name, &principal)?;
+        let observed = Arc::new(AtomicUsize::new(0));
+        let revoked_flag = Arc::new(AtomicBool::new(false));
+        let tasks = live_limit_clients(
+            &h,
+            &[(&s4, &secret4, 8)],
+            &format!("revoke-{iteration}"),
+            Some((observed.clone(), revoked_flag.clone())),
+        )
+        .await?;
+        let threshold = tokio::time::timeout(Duration::from_secs(5), async {
+            while observed.load(Ordering::SeqCst) < 35 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let at_revoke = observed.load(Ordering::SeqCst);
+        h.admin().revoke(&s4.id).await?;
+        let revoked = Instant::now();
+        revoked_flag.store(true, Ordering::SeqCst);
+        let records = live_limit_collect(tasks).await?;
+        let successes = records
+            .iter()
+            .flatten()
+            .filter(|r| r.outcome == "ok")
+            .count();
+        let mut post_started = 0;
+        let mut post_refusals = 0;
+        let mut quota_before = 0;
+        let mut valid = true;
+        let mut ended = 0;
+        for connection in &records {
+            let mut saw_revocation = false;
+            let mut post = 0;
+            for attempt in connection {
+                let refusal = matches!(attempt.outcome.as_str(), "NY011" | "NY003" | "closed");
+                if attempt.outcome == "ok" && (saw_revocation || attempt.start > revoked) {
+                    valid = false;
+                }
+                saw_revocation |= refusal;
+                if attempt.start > revoked {
+                    post_started += 1;
+                    post += 1;
+                    post_refusals += usize::from(refusal);
+                }
+                if attempt.end > revoked && attempt.outcome != "ok" && !refusal {
+                    valid = false;
+                }
+                if attempt.outcome == "NY007" {
+                    quota_before += usize::from(attempt.end <= revoked);
+                    if attempt.end > revoked {
+                        valid = false;
+                    }
+                } else if attempt.outcome != "ok" && !refusal {
+                    valid = false;
+                }
+            }
+            ended += usize::from(
+                post > 0
+                    && connection.last().is_some_and(|r| {
+                        matches!(r.outcome.as_str(), "NY011" | "NY003" | "closed")
+                    }),
+            );
+        }
+        checks.check(TEST, "revoke-at-limit", threshold && at_revoke >= 35 && successes <= 40
+            && successes > 0 && valid && ended == 8 && post_started > 0 && post_started == post_refusals,
+            format!("iteration={iteration} threshold={threshold} observed_at_revoke={at_revoke} burst={successes} limit=40 post_started={post_started} post_refusals={post_refusals} ended={ended}/8 quota_before={quota_before} valid={valid}"));
+        let (followup, exhausted) =
+            live_limit_budget(&h, &second_owner, &format!("remaining-{iteration}")).await?;
+        checks.check(TEST, "revoke-budget-exact", successes <= 40 && successes + followup == 60 && exhausted,
+            format!("iteration={iteration} burst={successes} followup={followup} total={} expected=60 exhausted={exhausted}", successes + followup));
+
+        if (iteration + 1) % 5 == 0 || iteration == ITERATIONS - 1 {
+            h.restart().await?;
+            let (session, secret) = acquire(&first_owner, false, None).await?;
+            let (client, _driver) = session_connect(&h, &session, &secret).await?;
+            let first = live_outcome(
+                client
+                    .simple_query(&format!(
+                        "SELECT nunya_tokenize('email', 'restart-{iteration}')"
+                    ))
+                    .await,
+            );
+            let revoked_login =
+                live_outcome(connect(&h, &format!("session:{}", s4.id), &secret4).await);
+            checks.check(TEST, "restart-keeps-counters", first == "NY007" && revoked_login == "NY003",
+                format!("iteration={iteration} exhausted_principal={first} revoked_credential={revoked_login}"));
+        }
+    }
+    checks.finish(TEST, ITERATIONS);
+    Ok(())
+}
