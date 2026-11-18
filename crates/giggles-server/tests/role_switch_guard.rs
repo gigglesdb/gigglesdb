@@ -105,12 +105,13 @@ fn role_acquisition_paths_are_guarded() {
             }
         }
     }
-    // role_session, session and agent_session (R3-204).
+    // role_session, session, agent_session (R3-204) and credential_session
+    // (R3-1304: executor_role filter, task bound, role generation fence).
     let in_service = session_literals
         .iter()
         .all(|s| s.starts_with("giggles-server/src/service.rs:"));
     assert!(
-        session_literals.len() == 3 && in_service,
+        session_literals.len() == 4 && in_service,
         "{MESSAGE}: Session literals {session_literals:?}"
     );
     assert!(problems.is_empty(), "{MESSAGE}: {problems:?}");
