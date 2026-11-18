@@ -168,7 +168,9 @@ impl<'a> VersionedRange<'a> {
             if self.previous.as_deref() == Some(user) || ts > self.snapshot {
                 continue;
             }
-            self.previous = Some(user.to_vec());
+            let previous = self.previous.get_or_insert_with(Vec::new);
+            previous.clear();
+            previous.extend_from_slice(user);
             if let Some(payload) = decode(&value)? {
                 return Ok(Some((user.to_vec(), payload.to_vec())));
             }
@@ -234,5 +236,87 @@ impl Iterator for VersionedRange<'_> {
                 Some(Err(error))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::engine::{
+        kv::{Durability, KvBackend, WriteBatch},
+        kv_mem::MemKv,
+    };
+
+    #[test]
+    fn forward_scan_reuses_previous_across_versions_and_tombstones() {
+        let kv = MemKv::new();
+        let mut batch = WriteBatch::default();
+        for (key, versions) in [
+            (
+                b"a".as_slice(),
+                [
+                    (30, Some(b"future-a".as_slice())),
+                    (20, Some(b"a20")),
+                    (10, Some(b"a10")),
+                ],
+            ),
+            (
+                b"b".as_slice(),
+                [(30, None), (20, None), (10, Some(b"b10"))],
+            ),
+            (
+                b"c".as_slice(),
+                [
+                    (30, Some(b"future-c".as_slice())),
+                    (20, Some(b"c20")),
+                    (10, Some(b"c10")),
+                ],
+            ),
+            (
+                b"d".as_slice(),
+                [
+                    (50, Some(b"d50".as_slice())),
+                    (40, None),
+                    (30, Some(b"d30")),
+                ],
+            ),
+            (
+                b"e".as_slice(),
+                [
+                    (30, None),
+                    (20, Some(b"e20".as_slice())),
+                    (10, Some(b"e10")),
+                ],
+            ),
+        ] {
+            for (ts, payload) in versions {
+                batch.put(
+                    Keyspace::Catalog,
+                    codec::user_key_seek_at(key, Ts(ts)),
+                    payload.map_or_else(encode_tombstone, encode_live),
+                );
+            }
+        }
+        kv.write(batch, Durability::Sync).unwrap();
+        // Empty user keys are invalid even in generic MVCC keyspaces.
+        assert!(validate_key(Keyspace::Catalog, b"").is_err());
+        let mut scan = VersionedRange::new(
+            &kv,
+            Keyspace::Catalog,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            Direction::Forward,
+            Ts(25),
+        )
+        .unwrap();
+        assert_eq!(
+            scan.by_ref().collect::<Result<Vec<_>, _>>().unwrap(),
+            vec![
+                (b"a".to_vec(), b"a20".to_vec()),
+                (b"c".to_vec(), b"c20".to_vec()),
+                (b"e".to_vec(), b"e20".to_vec()),
+            ]
+        );
+        assert!(scan.next().is_none());
     }
 }
