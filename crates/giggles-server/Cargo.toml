@@ -46,6 +46,7 @@ protoc-bin-vendored = "3"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
+futures-core = "0.3"
 giggles-core = { path = "../giggles-core", default-features = false, features = ["test-sql-parser-trap", "test-metadata-counts"] }
 giggles-faultlab = { path = "../giggles-faultlab" }
 giggles-history = { path = "../giggles-history" }
@@ -61,3 +62,7 @@ path = "tests/all.rs"
 [[test]]
 name = "network"
 path = "tests/network.rs"
+
+[[test]]
+name = "r3_crash"
+path = "tests/r3_crash.rs"
