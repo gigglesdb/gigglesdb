@@ -53,8 +53,10 @@ pub enum Origin {
     NoCodec,
     /// A JSON column has no path rules.
     JsonNoPaths,
-    /// JSON path enforcement is pending, so the entire column is withheld.
-    JsonPathsPending,
+    /// JSON path rules filter direct reads; every other use is refused.
+    JsonPaths,
+    /// Path rules on a non-JSON type withhold the whole column.
+    JsonPathsUnsupportedType,
 }
 
 /// Failure to compile a column treatment.
@@ -115,9 +117,36 @@ pub fn served_policy(
     bindings: &RouteBindings,
 ) -> Policy {
     let mut policy = doc.policy.clone();
+    policy.json_filters.clear();
     policy.columns = effective_all(doc, snapshot, bindings)
         .into_iter()
-        .map(|(column, (effective, _))| {
+        .map(|(column, (effective, origin))| {
+            if origin == Origin::JsonPaths {
+                let rules: Vec<_> = doc
+                    .json_paths
+                    .iter()
+                    .filter(|r| r.column == column)
+                    .cloned()
+                    .collect();
+                for rule in &rules {
+                    if let super::JsonPathTreatment::Blind { domain, .. } = &rule.treatment {
+                        policy
+                            .domains
+                            .entry(domain.clone())
+                            .or_insert_with(|| domain_settings(doc, domain));
+                    }
+                }
+                let mode = if matches!(doc.policy.treatment(&column), Some(Treatment::Show))
+                    || doc.route_default == RouteDefault::Show
+                {
+                    crate::json::filter::JsonMode::Show
+                } else {
+                    crate::json::filter::JsonMode::Tokenize
+                };
+                policy
+                    .json_filters
+                    .insert(column.clone(), super::JsonColumnFilter { rules, mode });
+            }
             let treatment = match effective {
                 Effective::Show => Treatment::Show,
                 Effective::Masked { placeholder } => Treatment::Masked { placeholder },
@@ -191,9 +220,33 @@ fn compile(
     column: &ColumnRef,
     ty: &ColumnType,
 ) -> (Effective, Origin) {
-    if doc.json_paths.iter().any(|rule| rule.column == *column) {
-        return withheld(Origin::JsonPathsPending);
+    let base = compile_without_paths(doc, snapshot, bindings, column, ty);
+    if matches!(base.1, Origin::NeedsRepair | Origin::Unbound) {
+        return base;
     }
+    if doc.json_paths.iter().any(|rule| rule.column == *column) {
+        return withheld(if matches!(ty, ColumnType::Json | ColumnType::Jsonb) {
+            Origin::JsonPaths
+        } else {
+            Origin::JsonPathsUnsupportedType
+        });
+    }
+    if snapshot.column_id(column).and_then(|id| bindings.get(id))
+        .and_then(|record| record.show_rule.as_ref())
+        .is_some_and(|old| old != column && doc.json_paths.iter().any(|rule| &rule.column == old))
+    {
+        return withheld(Origin::NeedsRepair);
+    }
+    base
+}
+
+fn compile_without_paths(
+    doc: &PolicyDocument,
+    snapshot: &Snapshot,
+    bindings: &RouteBindings,
+    column: &ColumnRef,
+    ty: &ColumnType,
+) -> (Effective, Origin) {
     let record = snapshot.column_id(column).and_then(|id| bindings.get(id));
     let named_link = doc.links.iter().any(|link| link.fields.contains(column));
     if named_link || record.is_some_and(|r| r.linked) {
@@ -583,6 +636,7 @@ pub(crate) mod tests {
             file_readlog: None,
             file_snapshot_max_age_ms: None,
             policy: Policy {
+                json_filters: Default::default(),
                 columns: BTreeMap::new(),
                 domains: BTreeMap::new(),
                 snapshot_max_age_ms: 60000,
@@ -864,7 +918,7 @@ pub(crate) mod tests {
         let snapshot = snapshot(entries.clone());
         for mode in [RouteDefault::Tokenize, RouteDefault::Show] {
             // Include non-JSON types: any path declaration must fail closed.
-            for (reference, _) in &entries {
+            for (reference, ty) in &entries {
                 for treatment in [
                     None,
                     Some(Treatment::Show),
@@ -884,16 +938,133 @@ pub(crate) mod tests {
                     if let Some(treatment) = treatment {
                         doc.policy.columns.insert(reference.clone(), treatment);
                     }
-                    assert_eq!(
-                        effective(&doc, &snapshot, &RouteBindings::default(), reference),
-                        Ok((
-                            Effective::Masked { placeholder: None },
-                            Origin::JsonPathsPending
-                        ))
-                    );
+                    let (treatment, origin) =
+                        effective(&doc, &snapshot, &RouteBindings::default(), reference).unwrap();
+                    assert_eq!(treatment, Effective::Masked { placeholder: None });
+                    let served = served_policy(&doc, &snapshot, &RouteBindings::default());
+                    if matches!(ty, ColumnType::Json | ColumnType::Jsonb) {
+                        assert!(matches!(origin, Origin::JsonPaths | Origin::Unbound));
+                        assert_eq!(
+                            served.json_filter(reference).is_some(),
+                            origin == Origin::JsonPaths
+                        );
+                    } else {
+                        assert!(served.json_filter(reference).is_none());
+                        assert!(matches!(
+                            origin,
+                            Origin::JsonPathsUnsupportedType | Origin::Unbound
+                        ));
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn json_filters_have_modes_order_domains_and_masked_treatment() {
+        use crate::json::filter::JsonMode;
+        use crate::policy::{JsonTokenType, bindings};
+        use crate::schema::ColumnId;
+        use crate::state::{model::RouteId, store::RedbStore};
+        use crate::token::keys::RootKey;
+        let c = type_entries()[0].0.clone();
+        let snap = snapshot(vec![(c.clone(), ColumnType::Jsonb)]).with_column_ids(BTreeMap::from([(
+            c.clone(),
+            ColumnId::Pg {
+                relation_oid: 333,
+                attnum: 1,
+            },
+        )]));
+        let path = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap()).join(format!(
+            "json-planning-{}",
+            bindings::generate_domain_name().unwrap().0
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let store = RedbStore::open(&path, &RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap();
+        let route = RouteId::new("json-planning").unwrap();
+        for (default, show, mode) in [
+            (RouteDefault::Tokenize, false, JsonMode::Tokenize),
+            (RouteDefault::Show, false, JsonMode::Show),
+            (RouteDefault::Tokenize, true, JsonMode::Show),
+        ] {
+            let mut doc = document(default);
+            if show {
+                doc.policy.columns.insert(c.clone(), Treatment::Show);
+            }
+            doc.json_paths = vec![
+                JsonPathRule {
+                    column: c.clone(),
+                    path: vec![PathSegment::Key("a".into())],
+                    treatment: JsonPathTreatment::Blind {
+                        domain: DomainName("leaf".into()),
+                        ty: JsonTokenType::Text,
+                    },
+                },
+                JsonPathRule {
+                    column: c.clone(),
+                    path: vec![PathSegment::Key("b".into())],
+                    treatment: JsonPathTreatment::Masked,
+                },
+            ];
+            let records = bindings::refresh(&store, &route, &doc, &snap).unwrap();
+            let served = served_policy(&doc, &snap, &records);
+            let filter = served.json_filter(&c).unwrap();
+            assert!(filter.mode == mode);
+            assert_eq!(filter.rules, doc.json_paths);
+            assert_eq!(
+                served.treatment(&c),
+                Some(&Treatment::Masked { placeholder: None })
+            );
+            assert_eq!(
+                served.domains[&DomainName("leaf".into())],
+                domain_settings(&doc, &DomainName("leaf".into()))
+            );
+            let mut broken = records.clone();
+            broken
+                .get_mut(&ColumnId::Pg {
+                    relation_oid: 333,
+                    attnum: 1,
+                })
+                .unwrap()
+                .status = BindingStatus::NeedsRepair;
+            // Tokenize applies persisted repair checks before JSON path release.
+            if default == RouteDefault::Tokenize {
+                assert!(
+                    served_policy(&doc, &snap, &broken)
+                        .json_filter(&c)
+                        .is_none()
+                );
+            }
+            if show {
+                assert!(
+                    served_policy(&doc, &snap, &RouteBindings::default())
+                        .json_filter(&c)
+                        .is_none()
+                );
+            }
+            let other = snapshot(vec![(c.clone(), ColumnType::Text)]);
+            assert!(
+                served_policy(&doc, &other, &RouteBindings::default())
+                    .json_filter(&c)
+                    .is_none()
+            );
+            if show {
+                let renamed = ColumnRef { column: "doc2".into(), ..c.clone() };
+                let renamed_snapshot = snapshot(vec![(renamed.clone(), ColumnType::Jsonb)])
+                    .with_column_ids(BTreeMap::from([(renamed.clone(), ColumnId::Pg { relation_oid: 333, attnum: 1 })]));
+                assert_eq!(effective(&doc, &renamed_snapshot, &records, &renamed).unwrap(), withheld(Origin::NeedsRepair));
+                assert!(served_policy(&doc, &renamed_snapshot, &records).json_filter(&renamed).is_none());
+                assert!(super::super::validate::validate_document(&doc, &renamed_snapshot, &records).is_err());
+            }
+            doc.json_paths.clear();
+            assert!(
+                served_policy(&doc, &snap, &records)
+                    .json_filter(&c)
+                    .is_none()
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

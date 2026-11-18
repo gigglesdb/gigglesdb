@@ -555,6 +555,7 @@ pub fn parse_policy_document(toml_text: &str) -> Result<PolicyDocument, Vec<Poli
             file_readlog: readlog.clone(),
             file_snapshot_max_age_ms: age,
             policy: Policy {
+                json_filters: Default::default(),
                 columns,
                 domains,
                 snapshot_max_age_ms: age.unwrap_or(60000),

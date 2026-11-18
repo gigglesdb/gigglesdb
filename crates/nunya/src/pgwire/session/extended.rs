@@ -57,7 +57,8 @@ fn oid_type(oid: u32) -> Option<ColumnType> {
 impl Prepared {
     fn check_treatments(&self, current: &Arc<Policy>) -> Result<(), Refusal> {
         if !Arc::ptr_eq(current, &self.policy)
-            && self.columns.iter().any(|column| current.treatment(column) != self.policy.treatment(column))
+            && self.columns.iter().any(|column| current.treatment(column) != self.policy.treatment(column)
+                || current.json_filter(column) != self.policy.json_filter(column))
         {
             return Err(failure(NyCode::SchemaStale));
         }
@@ -857,10 +858,12 @@ impl Session {
         Ok(vec![response])
     }
 }
-fn rewrite_fields(fields: &mut [FieldDescription], plan: &RewritePlan) -> Result<(), Refusal> {
+/// Validate upstream output types and clear modifiers for rewritten fields.
+pub(super) fn rewrite_fields(fields: &mut [FieldDescription], plan: &RewritePlan) -> Result<(), Refusal> {
     if fields.len() != plan.outputs.len() {
         return Err(failure(NyCode::NotAnalysable));
     }
+    validate_json_fields(fields, plan)?;
     for (field, output) in fields.iter_mut().zip(&plan.outputs) {
         if !matches!(output, OutputRewrite::Pass) {
             field.type_modifier = -1;
@@ -896,5 +899,15 @@ mod treatment_tests {
             token_ty: None,
         };
         assert_eq!(prepared.check_treatments(&Arc::new(current)).unwrap_err().code, NyCode::SchemaStale);
+        let mut current = (*prepared.policy).clone();
+        let filter = super::super::tests::json_test_filter(crate::json::filter::JsonMode::Show, false, false);
+        current.json_filters.insert(prepared.columns[0].clone(), filter.clone());
+        assert_eq!(prepared.check_treatments(&Arc::new(current.clone())).unwrap_err().code, NyCode::SchemaStale);
+        let mut prepared = prepared;
+        prepared.policy = Arc::new(current.clone());
+        assert!(prepared.check_treatments(&Arc::new(current.clone())).is_ok());
+        current.json_filters.get_mut(&prepared.columns[0]).unwrap().rules.clear();
+        assert_eq!(prepared.check_treatments(&Arc::new(current)).unwrap_err().code, NyCode::SchemaStale);
+
     }
 }

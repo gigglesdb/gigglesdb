@@ -1033,6 +1033,14 @@ impl NunyaSpanner {
                 policy.domains.get(domain).and_then(|d| d.range.as_ref()),
                 value,
             )
+        }, &mut |filter, bytes, released| {
+            crate::json::filter::apply_collect(
+                &filter.rules, filter.mode, keys, &ctx.codec, &policy.domains,
+                &crate::json::JsonLimits::default(),
+                crate::json::filter::JsonInput {
+                    format: crate::json::codec::JsonFormat::SpannerJson, bytes,
+                }, released,
+            )
         })
         .map_err(status)
     }
@@ -2590,6 +2598,7 @@ mod tests {
                 column: "email".into(),
             };
             let policy = Policy {
+                json_filters: Default::default(),
                 columns: BTreeMap::from([(col, Treatment::Blind { domain: domain() })]),
                 domains: BTreeMap::from([(
                     domain(),
@@ -3064,6 +3073,27 @@ mod tests {
             precommit_token: vec![0, 255, seq_num as u8],
             seq_num,
         }
+    }
+    #[test]
+    fn structured_json_read_plans_filter() {
+        use crate::{ir::OutputRewrite, json::filter::JsonMode, policy::{JsonColumnFilter, JsonPathRule, JsonPathTreatment, PathSegment}};
+        let column = ColumnRef { schema: "".into(), table: "events".into(), column: "payload".into() };
+        let filter = JsonColumnFilter { mode: JsonMode::Show, rules: vec![JsonPathRule { column: column.clone(), path: vec![PathSegment::Key("protected".into())], treatment: JsonPathTreatment::Masked }] };
+        let policy = Policy {
+            json_filters: BTreeMap::from([(column.clone(), filter.clone())]),
+            columns: BTreeMap::from([(column, Treatment::Masked { placeholder: None })]),
+            domains: BTreeMap::new(), snapshot_max_age_ms: 1000, readlog: ReadLogSink::Stdout,
+        };
+        let snapshot = Snapshot::new(vec![Relation {
+            schema: "".into(), name: "events".into(), kind: RelationKind::Table,
+            columns: vec![Column { name: "payload".into(), ty: ColumnType::Json, nullable: true, generated: None, default: None }],
+            view_definition: None, primary_key: vec![],
+        }], vec![], vec!["".into()], 0);
+        let req = ReadRequest { table: "events".into(), columns: vec!["payload".into()], key_set: Some(KeySet { all: true, ..Default::default() }), ..Default::default() };
+        // Both Read and StreamingRead use this lowering/check path.
+        let lowered = spanner_struct::lower_read(&req, &snapshot, &policy).unwrap();
+        let plan = check(&lowered.stmt, &policy, &snapshot).unwrap();
+        assert_eq!(plan.outputs, vec![OutputRewrite::JsonFilter { filter, ty: ColumnType::Json }]);
     }
     async fn customer_read(f: &Fixture) -> ReadRequest {
         ReadRequest {

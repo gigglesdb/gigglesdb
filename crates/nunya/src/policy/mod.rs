@@ -93,6 +93,9 @@ pub struct ServicePolicySettings {
 /// Policy.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Policy {
+    /// Columns released only through a JSON path filter; their treatment stays Masked.
+    #[serde(skip)]
+    pub json_filters: BTreeMap<ColumnRef, JsonColumnFilter>,
     /// Columns.
     pub columns: BTreeMap<ColumnRef, Treatment>,
     /// Domains.
@@ -102,7 +105,33 @@ pub struct Policy {
     /// Readlog.
     pub readlog: ReadLogSink,
 }
+/// Rules and default mode for sanitizing one JSON column.
+#[derive(Clone, PartialEq, Eq)]
+pub struct JsonColumnFilter {
+    /// Path rules in declaration order.
+    pub rules: Vec<JsonPathRule>,
+    /// Treatment of unlisted members.
+    pub mode: crate::json::filter::JsonMode,
+}
+impl std::fmt::Debug for JsonColumnFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mode = match self.mode {
+            crate::json::filter::JsonMode::Show => "Show",
+            crate::json::filter::JsonMode::Tokenize => "Tokenize",
+        };
+        f.debug_struct("JsonColumnFilter")
+            .field("rules", &self.rules)
+            .field("mode", &mode)
+            .finish()
+    }
+}
+
 impl Policy {
+    /// Return the required JSON output filter for a column.
+    pub fn json_filter(&self, c: &ColumnRef) -> Option<&JsonColumnFilter> {
+        self.json_filters.get(c)
+    }
+
     /// Return the treatment of a fully qualified column.
     pub fn treatment(&self, c: &ColumnRef) -> Option<&Treatment> {
         self.columns.get(c)

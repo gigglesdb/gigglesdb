@@ -190,6 +190,10 @@ impl State<'_> {
         for n in &s.distinct_clause {
             if n.node.is_some() {
                 self.clause_item(n, &scope, &outputs, Context::OrderBy, UseKind::Order)?;
+            } else {
+                for output in &outputs {
+                    self.record(&expr::Expr::column(output.clone()), UseKind::GroupBy, &Context::GroupBy);
+                }
             }
         }
         for n in [&s.limit_count, &s.limit_offset].into_iter().flatten() {

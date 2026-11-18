@@ -309,9 +309,6 @@ pub(crate) fn parse_policy_bytes(path: &Path, bytes: &[u8], service: &crate::pol
         *log = path.parent().unwrap_or(Path::new(".")).join(&*log);
     }
     let document = crate::policy::file::resolve(document, service)?;
-    if !document.json_paths.is_empty() {
-        return Err(vec![PolicyError { message: "policy: json_path rules are not served yet".into() }]);
-    }
     Ok(document)
 }
 pub(crate) use crate::policy::file::readlog_key;
@@ -891,6 +888,7 @@ mod tests {
     }
     fn policy() -> Policy {
         Policy {
+            json_filters: Default::default(),
             columns: BTreeMap::new(),
             domains: BTreeMap::new(),
             snapshot_max_age_ms: 60000,
@@ -985,12 +983,9 @@ mod tests {
         let policy = parse_policy_bytes(path, show, &service).unwrap();
         assert_eq!(policy.policy.readlog, ReadLogSink::Stdout);
         assert!(policy.policy.columns.values().all(|t| *t == Treatment::Show));
-        for (bytes, message) in [
-            (b"[readlog]\nsink='file'\npath='audit.log'".as_slice(), "readlog: policy file and service config disagree"),
-            (b"version=2\ndefault='show'\n[[json_path]]\ntable='public.t'\nname='data'\npath='$.a'\nmasked=true".as_slice(), "policy: json_path rules are not served yet"),
-        ] {
-            assert_eq!(parse_policy_bytes(path, bytes, &service).unwrap_err()[0].message, message);
-        }
+        assert!(parse_policy_bytes(path, b"version=2\ndefault='show'\n[[json_path]]\ntable='public.t'\nname='data'\npath='$.a'\nmasked=true", &service).is_ok());
+        assert_eq!(parse_policy_bytes(path, b"[readlog]\nsink='file'\npath='audit.log'", &service).unwrap_err()[0].message,
+            "readlog: policy file and service config disagree");
         assert_eq!(parse_policy_bytes(path, show, &ServicePolicySettings::default()).unwrap_err()[0].message, "readlog: missing table");
     }
 
@@ -1011,16 +1006,15 @@ mod tests {
         assert_eq!(readlog_key(&policy.policy.readlog), service.readlog.unwrap());
     }
     #[test]
-    fn tokenize_default_accepts_scalars_but_still_refuses_json_paths() {
+    fn tokenize_default_accepts_scalars_and_json_paths() {
         let service = crate::policy::ServicePolicySettings {
             readlog: Some(crate::policy::ReadLogSink::Stdout), ..Default::default()
         };
         let path = Path::new("policy.toml");
         let scalar = parse_policy_bytes(path, b"version=2\ndefault='tokenize'", &service).unwrap();
         assert_eq!(scalar.route_default, crate::policy::RouteDefault::Tokenize);
-        let errors = parse_policy_bytes(path,
-            b"version=2\ndefault='tokenize'\n[[json_path]]\ntable='public.t'\nname='data'\npath='$.a'\nmasked=true", &service).unwrap_err();
-        assert_eq!(errors[0].message, "policy: json_path rules are not served yet");
+        assert!(parse_policy_bytes(path,
+            b"version=2\ndefault='tokenize'\n[[json_path]]\ntable='public.t'\nname='data'\npath='$.a'\nmasked=true", &service).is_ok());
         let errors = parse_policy_bytes(path,
             b"version=2\ndefault='tokenize'\n[[link]]\nfields=['public.t.a','public.t.b']", &service).unwrap_err();
         assert!(errors[0].message.contains("link"));

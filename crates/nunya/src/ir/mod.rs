@@ -220,6 +220,13 @@ pub struct ResolvedStatement {
 /// Output rewrite.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputRewrite {
+    /// Release a direct JSON read only through its path filter.
+    JsonFilter {
+        /// Compiled path rules and default mode.
+        filter: crate::policy::JsonColumnFilter,
+        /// Captured JSON database type.
+        ty: ColumnType,
+    },
     /// Pass.
     Pass,
     /// Tokenize this output in the named domain.

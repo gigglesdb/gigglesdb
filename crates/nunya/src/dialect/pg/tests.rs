@@ -6,6 +6,7 @@ use crate::{
 use std::collections::BTreeMap;
 fn fixture() -> (Snapshot, Policy) {
     let mut policy = Policy {
+        json_filters: Default::default(),
         columns: BTreeMap::new(),
         domains: BTreeMap::new(),
         snapshot_max_age_ms: 0,
@@ -1486,4 +1487,31 @@ fn compiled_tokenize_policy_drives_output_rewrites_and_predicate_refusals() {
             NyCode::MaskedExpression
         );
     }
+}
+
+#[test]
+fn distinct_uses_grouping_rules_for_every_output() {
+    let (mut snapshot, mut policy) = fixture();
+    for name in ["id", "email", "country"] {
+        let stmt = PgLowering.lower(&format!("SELECT DISTINCT {name} FROM customers"), &snapshot, &policy, &[]).unwrap().remove(0);
+        if name != "id" {
+            assert!(has(&stmt, UseKind::GroupBy, Context::GroupBy));
+        }
+        let result = crate::ir::check::check(&stmt, &policy, &snapshot);
+        if name == "country" {
+            assert_eq!(result.unwrap_err().code, NyCode::MaskedExpression);
+        } else {
+            let grouped = PgLowering.lower(&format!("SELECT {name} FROM customers GROUP BY {name}"), &snapshot, &policy, &[]).unwrap().remove(0);
+            assert_eq!(result.unwrap(), crate::ir::check::check(&grouped, &policy, &snapshot).unwrap());
+        }
+    }
+    let column = ColumnRef { schema: "public".into(), table: "notes".into(), column: "body".into() };
+    snapshot.relations.iter_mut().find(|r| r.name == "notes").unwrap().columns[1].ty = ColumnType::Json;
+    policy.columns.insert(column.clone(), Treatment::Masked { placeholder: None });
+    policy.json_filters.insert(column.clone(), crate::policy::JsonColumnFilter {
+        mode: crate::json::filter::JsonMode::Show,
+        rules: vec![crate::policy::JsonPathRule { column, path: vec![], treatment: crate::policy::JsonPathTreatment::Masked }],
+    });
+    let stmt = PgLowering.lower("SELECT DISTINCT body FROM notes", &snapshot, &policy, &[]).unwrap().remove(0);
+    assert_eq!(crate::ir::check::check(&stmt, &policy, &snapshot).unwrap_err().code, NyCode::MaskedExpression);
 }

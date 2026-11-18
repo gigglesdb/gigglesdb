@@ -123,10 +123,10 @@ pub fn check(
             Label::Tainted => return Err(refusal(NyCode::BlindOperation)),
             Label::Masked => {
                 ty(snapshot, &usage.column)?;
-                if !matches!(
-                    (&usage.kind, &usage.context),
-                    (UseKind::Output, Context::SelectList | Context::Returning)
-                ) {
+                let allowed = matches!((&usage.kind, &usage.context), (UseKind::Output, Context::SelectList))
+                    || (policy.json_filter(&usage.column).is_none()
+                        && matches!((&usage.kind, &usage.context), (UseKind::Output, Context::Returning)));
+                if !allowed {
                     return Err(refusal(NyCode::MaskedExpression));
                 }
             }
@@ -178,6 +178,9 @@ pub fn check(
         }
     }
     for write in &stmt.writes {
+        if policy.json_filter(&write.column).is_some() {
+            return Err(refusal(NyCode::MaskedExpression));
+        }
         match &write.label {
             Label::Tainted => return Err(refusal(NyCode::NotAnalysable)),
             Label::Blind(domain) => {
@@ -284,7 +287,14 @@ pub fn check(
                     .source
                     .as_ref()
                     .ok_or_else(|| refusal(NyCode::MaskedExpression))?;
-                ty(snapshot, source)?;
+                let column_ty = ty(snapshot, source)?;
+                if let Some(filter) = policy.json_filter(source) {
+                    if !matches!(column_ty, ColumnType::Json | ColumnType::Jsonb) {
+                        return Err(refusal(NyCode::NotAnalysable));
+                    }
+                    plan.outputs.push(OutputRewrite::JsonFilter { filter: filter.clone(), ty: column_ty });
+                    continue;
+                }
                 match policy.treatment(source) {
                     Some(Treatment::Masked { placeholder }) => OutputRewrite::Mask {
                         placeholder: placeholder.clone(),
@@ -305,6 +315,134 @@ mod tests {
         policy::{DomainSettings, ReadLogSink},
         schema::{Column, Relation, RelationKind},
     };
+    #[test]
+    fn json_filter_only_allows_direct_select_and_never_writes() {
+        use crate::policy::JsonColumnFilter;
+        let (mut policy, mut snapshot) = fixture();
+        let c = col("customers", "email");
+        snapshot.relations[0].columns.iter_mut().for_each(|column| {
+            if column.name == "email" {
+                column.ty = ColumnType::Jsonb;
+            }
+        });
+        policy
+            .columns
+            .insert(c.clone(), Treatment::Masked { placeholder: None });
+        let filter = JsonColumnFilter {
+            rules: vec![],
+            mode: crate::json::filter::JsonMode::Tokenize,
+        };
+        policy.json_filters.insert(c.clone(), filter.clone());
+        let mut direct = stmt();
+        direct.uses.push(ColumnUse {
+            column: c.clone(),
+            label: Label::Masked,
+            kind: UseKind::Output,
+            context: Context::SelectList,
+        });
+        direct.outputs.push(OutputColumn {
+            name: "document".into(),
+            label: Label::Masked,
+            source: Some(c.clone()),
+            ty: Some(ColumnType::Jsonb),
+        });
+        assert_eq!(
+            check(&direct, &policy, &snapshot).unwrap().outputs,
+            vec![OutputRewrite::JsonFilter {
+                filter,
+                ty: ColumnType::Jsonb
+            }]
+        );
+        for (kind, context) in [
+            (UseKind::Output, Context::Returning),
+            (
+                UseKind::Equality {
+                    other: literal(0, 1),
+                },
+                Context::Where,
+            ),
+            (UseKind::Function { name: "f".into() }, Context::SelectList),
+            (UseKind::Cast, Context::SelectList),
+            (UseKind::Order, Context::OrderBy),
+        ] {
+            let mut s = direct.clone();
+            s.uses[0].kind = kind;
+            s.uses[0].context = context;
+            let err = check(&s, &policy, &snapshot).unwrap_err();
+            assert_eq!(err.code, NyCode::MaskedExpression);
+            assert!(!format!("{err:?}").contains("secret-document"));
+        }
+        for value in [
+            ValueSource::Null,
+            ValueSource::Param(1),
+            ValueSource::Literal {
+                span: Span { start: 0, end: 1 },
+                text: "secret-document".into(),
+            },
+        ] {
+            let mut s = stmt();
+            s.kind = StatementKind::Update;
+            s.writes.push(WriteTarget {
+                column: c.clone(),
+                label: Label::Masked,
+                value,
+            });
+            let err = check(&s, &policy, &snapshot).unwrap_err();
+            assert_eq!(err.code, NyCode::MaskedExpression);
+            assert!(!format!("{err:?}").contains("secret-document"));
+        }
+        let mut copy = stmt();
+        copy.kind = StatementKind::Insert;
+        copy.writes.push(WriteTarget {
+            column: col("notes", "body"),
+            label: Label::Plain,
+            value: ValueSource::Column {
+                column: c.clone(),
+                label: Label::Masked,
+            },
+        });
+        assert_eq!(
+            check(&copy, &policy, &snapshot).unwrap_err().code,
+            NyCode::MaskedExpression
+        );
+        // Exercise the real analyzer, including INSERT..SELECT propagation.
+        use crate::dialect::{Lowering, pg::PgLowering};
+        let direct_sql = PgLowering
+            .lower("SELECT email FROM customers", &snapshot, &policy, &[])
+            .unwrap();
+        assert!(matches!(
+            check(&direct_sql[0], &policy, &snapshot).unwrap().outputs[0],
+            OutputRewrite::JsonFilter { .. }
+        ));
+        for sql in [
+            "UPDATE customers SET country = 'x' RETURNING email",
+            "SELECT country FROM customers WHERE email = '{}'",
+            "SELECT length(email) FROM customers",
+            "SELECT email::text FROM customers",
+            "SELECT country FROM customers ORDER BY email",
+            "UPDATE customers SET email = '{}'",
+            "UPDATE customers SET email = $1",
+            "UPDATE customers SET email = NULL",
+            "INSERT INTO notes (body) SELECT email FROM customers",
+        ] {
+            let result = PgLowering
+                .lower(sql, &snapshot, &policy, &[])
+                .and_then(|statements| check(&statements[0], &policy, &snapshot));
+            let err = result.unwrap_err();
+            assert_eq!(err.code, NyCode::MaskedExpression, "{sql}");
+            assert!(!format!("{err:?}").contains("secret-document"));
+        }
+        snapshot.relations[0].columns.iter_mut().for_each(|column| {
+            if column.name == "email" {
+                column.ty = ColumnType::Text;
+            }
+        });
+        assert_eq!(
+            check(&direct, &policy, &snapshot).unwrap_err().code,
+            NyCode::NotAnalysable
+        );
+    }
+
     #[test]
     fn persisted_links_allow_join_and_write_only_while_linked() {
         use crate::{
@@ -464,6 +602,7 @@ mod tests {
             },
         );
         let policy = Policy {
+            json_filters: Default::default(),
             columns,
             domains: ["email", "phone"]
                 .into_iter()

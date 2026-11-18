@@ -233,8 +233,17 @@ pub fn validate_document(
 ) -> Result<Vec<PolicyWarning>, Vec<PolicyError>> {
     let mut warnings = vec![];
     let mut errors = vec![];
+    let path_columns: HashSet<_> = doc.json_paths.iter().map(|rule| &rule.column).collect();
+    for column in &path_columns {
+        if snapshot.column(column).is_none() {
+            error(&mut errors, &format!("column {}", column_name(column)), "column does not exist in snapshot");
+        }
+    }
     for (column, treatment) in &doc.policy.columns {
         if *treatment != Treatment::Show || snapshot.column(column).is_some() {
+            continue;
+        }
+        if path_columns.contains(column) {
             continue;
         }
         let renamed = bindings.iter().find_map(|(identity, record)| {
@@ -323,6 +332,7 @@ mod tests {
     };
     fn fixture(types: &[ColumnType]) -> (Policy, Snapshot) {
         let mut policy = Policy {
+            json_filters: Default::default(),
             columns: BTreeMap::new(),
             domains: BTreeMap::new(),
             snapshot_max_age_ms: 60000,
@@ -559,6 +569,7 @@ mod tests {
     #[test]
     fn show_is_validated_like_an_absent_column() {
         let policy = Policy {
+            json_filters: Default::default(),
             columns: [(
                 ColumnRef {
                     schema: "missing".into(),
@@ -600,6 +611,24 @@ mod tests {
             .iter()
             .any(|error| error.message.starts_with("link") && error.message.contains(text))
     }
+    #[test]
+    fn missing_json_path_columns_are_errors_once_per_column() {
+        let (mut doc, snapshot) = linked(&[ColumnType::Text], false);
+        doc.links.clear();
+        let column = ColumnRef { schema: "public".into(), table: "customers".into(), column: "doc".into() };
+        doc.policy.columns.insert(column.clone(), Treatment::Show);
+        for key in ["a", "b"] {
+            doc.json_paths.push(super::super::JsonPathRule {
+                column: column.clone(),
+                path: vec![super::super::PathSegment::Key(key.into())],
+                treatment: super::super::JsonPathTreatment::Masked,
+            });
+        }
+        let errors = validate_document(&doc, &snapshot, &super::super::bindings::RouteBindings::default()).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, "column public.customers.doc: column does not exist in snapshot");
+    }
+
     #[test]
     fn links_require_existing_columns() {
         let (doc, mut snapshot) = linked(&[ColumnType::Text, ColumnType::Text], false);

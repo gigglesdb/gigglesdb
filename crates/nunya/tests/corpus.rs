@@ -40,6 +40,8 @@ fn summarize(plan: &RewritePlan) -> Plan {
             .outputs
             .iter()
             .map(|o| match o {
+                // 6b-2 applies the filter here
+                OutputRewrite::JsonFilter { .. } => panic!("JSON filtering unavailable in legacy corpus"),
                 OutputRewrite::Pass => "pass".into(),
                 OutputRewrite::Tokenize { domain, .. } => format!("tokenize:{}", domain.0),
                 OutputRewrite::Mask { .. } => "mask".into(),

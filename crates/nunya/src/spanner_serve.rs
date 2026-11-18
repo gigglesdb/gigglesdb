@@ -239,6 +239,7 @@ mod tests {
             schema::{ColumnRef, Snapshot},
         };
         let mut policy = Policy {
+            json_filters: Default::default(),
             columns: BTreeMap::new(),
             domains: BTreeMap::new(),
             snapshot_max_age_ms: 1000,

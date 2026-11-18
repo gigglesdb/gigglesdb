@@ -444,7 +444,6 @@ impl Hub {
                 s.policy = policy;
                 for (route, compiled) in s.routes.iter_mut().zip(compiled) {
                     route.policy = compiled;
-                    route.refresh_failed = false;
                 }
                 s.hash = digest.ok_or("policy digest unavailable")?;
                 s.applied = now();
@@ -645,6 +644,7 @@ mod tests {
     use std::collections::BTreeMap;
     fn policy() -> Policy {
         Policy {
+            json_filters: Default::default(),
             columns: BTreeMap::new(),
             domains: BTreeMap::new(),
             snapshot_max_age_ms: 60000,
@@ -1642,12 +1642,16 @@ mod tests {
         assert_ne!(policy.domain_of(&added), policy.domain_of(&customer_column("email")));
         drop(snapshot); drop(policy);
         assert!(hub.readiness(true, true).0);
-        // A successful policy reload also clears a failed refresh.
+        // A policy reload cannot recover a snapshot refresh failure.
         store.fail_commits(true);
         assert!(hub.refresh(&Route::Postgres(ctx.clone()), customers(&[("email", 1), ("recovery_email", 2), ("extra", 3)])).is_err());
         store.fail_commits(false);
         let doc = (*hub.state.lock().unwrap().units[0].doc).clone();
         hub.apply(0, Ok(doc), Some(hash(b"reapplied"))).unwrap();
+        assert!(!hub.readiness(true, true).0);
+        hub.commit_config_revision("unchanged", || Ok(())).unwrap();
+        assert!(!hub.readiness(true, true).0);
+        hub.refresh(&Route::Postgres(ctx.clone()), customers(&[("email", 1), ("recovery_email", 2), ("extra", 3)])).unwrap();
         assert!(hub.readiness(true, true).0);
         // Readiness detects a foreign policy replacement even when its values agree.
         let foreign = Arc::new((**ctx.policy.read().unwrap()).clone());

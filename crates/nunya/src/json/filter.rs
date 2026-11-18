@@ -57,6 +57,21 @@ pub fn apply(
     limits: &JsonLimits,
     input: JsonInput<'_>,
 ) -> Result<JsonOutput, Refusal> {
+    apply_collect(rules, mode, keys, codec, domains, limits, input, &mut Vec::new())
+}
+
+/// Apply path rules and append rendered Blind leaf tokens after successful encoding.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_collect(
+    rules: &[JsonPathRule],
+    mode: JsonMode,
+    keys: &ScopeKeys,
+    codec: &dyn TokenCodec,
+    domains: &BTreeMap<DomainName, DomainSettings>,
+    limits: &JsonLimits,
+    input: JsonInput<'_>,
+    released: &mut Vec<String>,
+) -> Result<JsonOutput, Refusal> {
     let first = rules
         .first()
         .ok_or_else(|| refuse("missing JSON path rules"))?;
@@ -71,16 +86,20 @@ pub fn apply(
         }
     }
     let tree = codec::decode(input.format, input.bytes, limits)?;
-    let filter = Filter {
+    let mut collected = Vec::new();
+    let mut filter = Filter {
         mode,
         keys,
         codec,
         domains,
+        released: &mut collected,
     };
-    match filter.node(&tree, &rules.iter().collect::<Vec<_>>(), 0, true)? {
-        Some(value) => Ok(JsonOutput::Document(codec::encode(input.format, &value)?)),
-        None => Ok(JsonOutput::SqlNull),
-    }
+    let output = match filter.node(&tree, &rules.iter().collect::<Vec<_>>(), 0, true)? {
+        Some(value) => JsonOutput::Document(codec::encode(input.format, &value)?),
+        None => JsonOutput::SqlNull,
+    };
+    released.extend(collected);
+    Ok(output)
 }
 
 struct Filter<'a> {
@@ -88,11 +107,12 @@ struct Filter<'a> {
     keys: &'a ScopeKeys,
     codec: &'a dyn TokenCodec,
     domains: &'a BTreeMap<DomainName, DomainSettings>,
+    released: &'a mut Vec<String>,
 }
 
 impl Filter<'_> {
     fn leaf(
-        &self,
+        &mut self,
         value: &JsonValue,
         treatment: &JsonPathTreatment,
     ) -> Result<Option<JsonValue>, Refusal> {
@@ -141,13 +161,16 @@ impl Filter<'_> {
                     }
                     _ => return Err(refuse("invalid JSON token result")),
                 };
+                self.released.push(String::from_utf8(encode_text(&token)
+                    .map_err(|_| refuse("invalid JSON token result"))?)
+                    .map_err(|_| refuse("invalid JSON token result"))?);
                 Ok(Some(rendered))
             }
         }
     }
 
     fn node(
-        &self,
+        &mut self,
         value: &JsonValue,
         rules: &[&JsonPathRule],
         depth: usize,
@@ -323,6 +346,21 @@ mod tests {
     }
     fn doc(text: &str) -> JsonOutput {
         JsonOutput::Document(text.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn collected_tokens_match_rendered_leaves_and_fail_atomically() {
+        let rules = [blind("$.a[*]", JsonTokenType::Int4)];
+        let mut released = vec![];
+        let output = apply_collect(&rules, JsonMode::Tokenize, &ScopeKeys::new([7; 32]), &StandardCodec,
+            &domains(), &JsonLimits::default(), JsonInput { format: JsonFormat::PgJsonText, bytes: br#"{"a":[123,null,456]}"# }, &mut released).unwrap();
+        let JsonOutput::Document(bytes) = output else { panic!("expected document") };
+        let rendered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(released, vec![rendered["a"][0].to_string(), rendered["a"][2].to_string()]);
+        let before = released.clone();
+        assert!(apply_collect(&rules, JsonMode::Tokenize, &ScopeKeys::new([7; 32]), &StandardCodec,
+            &domains(), &JsonLimits::default(), JsonInput { format: JsonFormat::PgJsonText, bytes: br#"{"a":[123],"a":[456]}"# }, &mut released).is_err());
+        assert_eq!(released, before);
     }
 
     #[test]

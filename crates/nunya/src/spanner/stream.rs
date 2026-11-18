@@ -204,12 +204,19 @@ pub fn emit(
         ..Default::default()
     }
 }
+type JsonRewrite<'a> = dyn FnMut(
+    &crate::policy::JsonColumnFilter,
+    &[u8],
+    &mut Vec<String>,
+) -> Result<crate::json::filter::JsonOutput, Refusal> + 'a;
+
 /// Apply a complete row's rewrite plan and return released token text.
 pub fn rewrite_row(
     row: &mut [Value],
     plan: &[OutputRewrite],
     types: &[ColumnType],
     tokenize: &mut dyn FnMut(&DomainName, &ColumnType, &SqlValue) -> Result<SqlValue, Refusal>,
+    json: &mut JsonRewrite<'_>,
 ) -> Result<Vec<String>, Refusal> {
     if row.len() != plan.len() || row.len() != types.len() {
         return Err(bad());
@@ -217,10 +224,23 @@ pub fn rewrite_row(
     let mut rewritten = row.to_vec();
     let mut released = Vec::new();
     for ((value, action), actual) in rewritten.iter_mut().zip(plan).zip(types) {
+        if let OutputRewrite::JsonFilter { ty, .. } = action
+            && (ty != actual || !matches!(ty, ColumnType::Json))
+        {
+            return Err(bad());
+        }
         if matches!(value.kind, Some(Kind::NullValue(0))) {
             continue;
         }
         match action {
+            OutputRewrite::JsonFilter { filter, .. } => {
+                let Some(Kind::StringValue(text)) = &value.kind else { return Err(bad()); };
+                value.kind = Some(match json(filter, text.as_bytes(), &mut released)? {
+                    crate::json::filter::JsonOutput::Document(bytes) =>
+                        Kind::StringValue(String::from_utf8(bytes).map_err(|_| bad())?),
+                    crate::json::filter::JsonOutput::SqlNull => Kind::NullValue(0),
+                });
+            }
             OutputRewrite::Pass => {}
             OutputRewrite::Mask { placeholder } => {
                 *value = Value {
@@ -422,6 +442,7 @@ mod tests {
             &plan,
             &vec![ColumnType::Text; 4],
             &mut |_, _, _| Ok(SqlValue::Text("token".into())),
+            &mut |_, _, _| unreachable!(),
         )
         .unwrap();
         assert_eq!(tokens, vec!["token"]);
@@ -429,7 +450,7 @@ mod tests {
         assert_eq!(row[1], s("masked"));
         assert_eq!(row[2], s("plain"));
         assert!(matches!(row[3].kind, Some(Kind::NullValue(0))));
-        assert!(rewrite_row(&mut row, &[], &[], &mut |_, _, _| unreachable!()).is_err());
+        assert!(rewrite_row(&mut row, &[], &[], &mut |_, _, _| unreachable!(), &mut |_, _, _| unreachable!()).is_err());
     }
     #[test]
     fn mixed_list_boundaries_and_objects() {
@@ -459,6 +480,84 @@ mod tests {
         merge(&mut a, object(vec![("a", s("two")), ("b", s("three"))]), 0).unwrap();
         assert_eq!(a, object(vec![("a", s("onetwo")), ("b", s("three"))]));
     }
+    fn json_filter(mode: crate::json::filter::JsonMode, root: bool, blind: bool) -> crate::policy::JsonColumnFilter {
+        use crate::policy::{JsonPathRule, JsonPathTreatment, JsonTokenType, PathSegment};
+        crate::policy::JsonColumnFilter {
+            mode,
+            rules: vec![JsonPathRule {
+                column: crate::schema::ColumnRef { schema: "".into(), table: "events".into(), column: "payload".into() },
+                path: if root { vec![] } else { vec![PathSegment::Key("protected".into())] },
+                treatment: if blind { JsonPathTreatment::Blind { domain: DomainName("d".into()), ty: JsonTokenType::Text } } else { JsonPathTreatment::Masked },
+            }],
+        }
+    }
+    fn apply_json(filter: &crate::policy::JsonColumnFilter, bytes: &[u8], released: &mut Vec<String>) -> Result<crate::json::filter::JsonOutput, Refusal> {
+        crate::json::filter::apply_collect(
+            &filter.rules, filter.mode, &crate::token::ScopeKeys::new([7;32]), &crate::token::StandardCodec,
+            &std::collections::BTreeMap::from([(DomainName("d".into()), crate::policy::DomainSettings { tokenize: crate::policy::TokenizeSetting::Off, range: None })]),
+            &crate::json::JsonLimits::default(), crate::json::filter::JsonInput { format: crate::json::codec::JsonFormat::SpannerJson, bytes }, released,
+        )
+    }
+    #[test]
+    fn json_rows_modes_nulls_kinds_and_atomic_refusal() {
+        use crate::{json::filter::JsonMode, token::TokenCodec};
+        for (mode, blind) in [(JsonMode::Show, false), (JsonMode::Tokenize, true)] {
+            let filter = json_filter(mode, false, blind);
+            let mut plan = vec![OutputRewrite::Mask { placeholder: None }, OutputRewrite::JsonFilter { filter, ty: ColumnType::Json }];
+            let types = [ColumnType::Text, ColumnType::Json];
+            let run = |row: &mut [Value], plan: &[OutputRewrite], types: &[ColumnType]| rewrite_row(row, plan, types, &mut |_, _, _| unreachable!(), &mut apply_json);
+            let mut row = vec![s("earlier"), s(r#"{"protected":"hidden","unknown":"visible"}"#)];
+            let released = run(&mut row, &plan, &types).unwrap();
+            let token = crate::token::StandardCodec.encode(&crate::token::ScopeKeys::new([7;32]), &DomainName("d".into()), &ColumnType::Text, None, &SqlValue::Text("hidden".into())).unwrap();
+            let SqlValue::Text(token) = token else { panic!("expected text token") };
+            assert_eq!(released, if blind { vec![token.clone()] } else { vec![] });
+            let expected = if blind { format!(r#"{{"protected":"{token}"}}"#) } else { r#"{"unknown":"visible"}"#.into() };
+            assert_eq!(row[1], s(&expected));
+            if !blind {
+                row[1] = s(r#"{"protected":{"nested":"hidden"},"unknown":"visible"}"#);
+                run(&mut row, &plan, &types).unwrap();
+                assert_eq!(row[1], s(&expected));
+            }
+            for cell in [s(r#"{"protected":"hidden","protected":"hidden"}"#), Value { kind: Some(Kind::BoolValue(true)) }, Value { kind: None }] {
+                let mut row = vec![s("earlier"), cell];
+                let before = row.clone();
+                let error = run(&mut row, &plan, &types).unwrap_err();
+                assert!(!format!("{error:?}").contains("hidden"));
+                assert_eq!(row, before);
+            }
+            let mut row = vec![s("earlier"), Value { kind: Some(Kind::NullValue(0)) }];
+            run(&mut row, &plan, &types).unwrap();
+            assert!(matches!(row[1].kind, Some(Kind::NullValue(0))));
+            assert!(run(&mut row, &plan, &[ColumnType::Text, ColumnType::Text]).is_err());
+            plan[1] = OutputRewrite::JsonFilter { filter: json_filter(mode, true, false), ty: ColumnType::Json };
+            row[1] = s(r#"{"protected":"hidden"}"#);
+            run(&mut row, &plan, &types).unwrap();
+            assert!(matches!(row[1].kind, Some(Kind::NullValue(0))));
+        }
+        let plan = [OutputRewrite::JsonFilter { filter: json_filter(JsonMode::Show, false, false), ty: ColumnType::Json }];
+        let mut row = vec![s("{}")];
+        assert!(rewrite_row(&mut row, &plan, &[ColumnType::Json], &mut |_, _, _| unreachable!(), &mut |_, _, _| Ok(crate::json::filter::JsonOutput::Document(vec![255]))).is_err());
+        assert_eq!(row, vec![s("{}")]);
+    }
+    #[test]
+    fn json_split_chunks_filter_once_after_assembly() {
+        let mut reassembler = Reassembler::new();
+        let mut first = part(vec![s(r#"{"protected":"hid"#)], true);
+        first.metadata = Some(meta(1));
+        let (events, _) = reassembler.push(first).unwrap();
+        assert!(!events.iter().any(|e| matches!(e, Event::Row(_))));
+        let (events, _) = reassembler.push(part(vec![s(r#"den","unknown":"visible"}"#)], false)).unwrap();
+        let mut calls = 0;
+        let mut rows = 0;
+        for event in events {
+            if let Event::Row(mut row) = event {
+                rewrite_row(&mut row, &[OutputRewrite::JsonFilter { filter: json_filter(crate::json::filter::JsonMode::Show, false, false), ty: ColumnType::Json }], &[ColumnType::Json], &mut |_, _, _| unreachable!(), &mut |filter, bytes, released| { calls += 1; apply_json(filter, bytes, released) }).unwrap();
+                assert_eq!(row, vec![s(r#"{"unknown":"visible"}"#)]);
+                rows += 1;
+            }
+        }
+        assert_eq!((calls, rows), (1, 1));
+    }
     #[test]
     fn rewrite_failure_is_atomic() {
         let mut row = vec![s("a"), s("b")];
@@ -474,9 +573,22 @@ mod tests {
             &mut row,
             &plan,
             &[ColumnType::Text, ColumnType::Text],
-            &mut |_, _, _| Err(bad())
+            &mut |_, _, _| Err(bad()),
+            &mut |_, _, _| unreachable!(),
         )
         .is_err());
+        assert_eq!(row, original);
+        let json_plan = vec![
+            OutputRewrite::Mask { placeholder: None },
+            OutputRewrite::JsonFilter {
+                filter: json_filter(crate::json::filter::JsonMode::Show, false, false),
+                ty: ColumnType::Json,
+            },
+        ];
+        assert!(rewrite_row(
+            &mut row, &json_plan, &[ColumnType::Text, ColumnType::Json],
+            &mut |_, _, _| unreachable!(), &mut apply_json,
+        ).is_err());
         assert_eq!(row, original);
     }
 }

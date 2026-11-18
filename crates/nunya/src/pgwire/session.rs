@@ -21,7 +21,7 @@ use crate::{
         model::Mode,
     },
     token::{PrincipalId, ScopeKeys, SessionId, TokenCodec, keys::derive_scope_v2},
-    value::SqlValue,
+    value::{ColumnType, SqlValue},
 };
 use bytes::BytesMut;
 mod extended;
@@ -632,6 +632,7 @@ impl Session {
                 {
                     return Err(failure(NyCode::NotAnalysable));
                 }
+                validate_json_fields(&fields, &active.plan)?;
                 for (field, output) in fields.iter_mut().zip(&active.plan.outputs) {
                     if !matches!(output, OutputRewrite::Pass) {
                         field.type_modifier = -1;
@@ -926,6 +927,18 @@ fn format_at(formats: &[i16], index: usize, len: usize) -> Result<i16, Refusal> 
         Err(protocol())
     }
 }
+fn validate_json_fields(fields: &[FieldDescription], plan: &RewritePlan) -> Result<(), Refusal> {
+    for (field, output) in fields.iter().zip(&plan.outputs) {
+        if let OutputRewrite::JsonFilter { ty, .. } = output
+            && (!matches!(ty, ColumnType::Json | ColumnType::Jsonb)
+                || ty.pg_oid() != Some(field.type_oid))
+        {
+            return Err(failure(NyCode::NotAnalysable));
+        }
+    }
+    Ok(())
+}
+
 type RewrittenRow = (Vec<Option<Vec<u8>>>, Vec<String>);
 
 fn rewrite_row(
@@ -946,6 +959,22 @@ fn rewrite_row(
         let format = format_at(formats, i, len)?;
         result.push(match (cell, output) {
             (None, _) => None,
+            (Some(bytes), OutputRewrite::JsonFilter { filter, ty }) => {
+                use crate::json::{codec::JsonFormat, filter::{JsonInput, JsonOutput}};
+                let format = match (ty, format) {
+                    (ColumnType::Json, 0 | 1) => JsonFormat::PgJsonText,
+                    (ColumnType::Jsonb, 0) => JsonFormat::PgJsonbText,
+                    (ColumnType::Jsonb, 1) => JsonFormat::PgJsonbBinary,
+                    _ => return Err(failure(NyCode::NotAnalysable)),
+                };
+                match crate::json::filter::apply_collect(
+                    &filter.rules, filter.mode, keys, codec, &policy.domains,
+                    &crate::json::JsonLimits::default(), JsonInput { format, bytes: &bytes }, &mut tokens,
+                )? {
+                    JsonOutput::Document(bytes) => Some(bytes),
+                    JsonOutput::SqlNull => None,
+                }
+            }
             (Some(bytes), OutputRewrite::Pass) => Some(bytes),
             (Some(_), OutputRewrite::Mask { placeholder }) => {
                 placeholder.as_ref().map(|s| s.as_bytes().to_vec())
@@ -1509,6 +1538,7 @@ pub(crate) mod tests {
                 column: "value".into(),
             };
             let policy = Policy {
+                json_filters: Default::default(),
                 columns: [(
                     col,
                     Treatment::Blind {
@@ -2986,6 +3016,71 @@ pub(crate) mod tests {
         session.frontend(Frontend::Query("SELECT value FROM items".into()));
         assert!(session.backend(Backend::RowDescription(vec![])).close);
     }
+    /// Construct a path filter for wire-format and prepared-policy regression tests.
+    pub(super) fn json_test_filter(mode: crate::json::filter::JsonMode, root: bool, blind: bool) -> crate::policy::JsonColumnFilter {
+        use crate::policy::{JsonPathRule, JsonPathTreatment, JsonTokenType, PathSegment};
+        crate::policy::JsonColumnFilter {
+            mode,
+            rules: vec![JsonPathRule {
+                column: crate::schema::ColumnRef { schema: "public".into(), table: "items".into(), column: "value".into() },
+                path: if root { vec![] } else { vec![PathSegment::Key("protected".into())] },
+                treatment: if blind {
+                    JsonPathTreatment::Blind { domain: DomainName("secret".into()), ty: JsonTokenType::Text }
+                } else { JsonPathTreatment::Masked },
+            }],
+        }
+    }
+
+    #[test]
+    fn json_rows_formats_modes_nulls_and_refusals() {
+        use crate::json::filter::JsonMode;
+        let f = Fixture::new();
+        let session = f.session();
+        let policy = f.ctx.policy.read().unwrap();
+        for (ty, format) in [(ColumnType::Json, 0), (ColumnType::Json, 1), (ColumnType::Jsonb, 0), (ColumnType::Jsonb, 1)] {
+            for (mode, blind) in [(JsonMode::Show, false), (JsonMode::Tokenize, true)] {
+                let mut filter = json_test_filter(mode, false, blind);
+                let mut plan = RewritePlan { outputs: vec![OutputRewrite::Pass, OutputRewrite::JsonFilter { filter: filter.clone(), ty: ty.clone() }], inputs: vec![], tokenize: None };
+                let wire = |text: &str| {
+                    let mut bytes = if ty == ColumnType::Jsonb && format == 1 { vec![1] } else { vec![] };
+                    bytes.extend_from_slice(text.as_bytes()); bytes
+                };
+                let run = |cell, plan: &RewritePlan| rewrite_row(vec![Some(b"earlier".to_vec()), cell], plan, &[format], &policy, &session.keys, &f.ctx.codec);
+                let token = f.ctx.codec.encode(&session.keys, &DomainName("secret".into()), &ColumnType::Text, None, &SqlValue::Text("hidden".into())).unwrap();
+                let SqlValue::Text(token) = token else { panic!("expected text token") };
+                let expected = if blind { format!(r#"{{"protected":"{token}"}}"#) } else { r#"{"unknown":"visible"}"#.into() };
+                let expected = if ty == ColumnType::Jsonb { expected.replace("\":\"", "\": \"") } else { expected };
+                if !blind {
+                    let row = run(Some(wire(r#"{"protected":{"nested":"hidden"},"unknown":"visible"}"#)), &plan).unwrap().0;
+                    assert_eq!(row[1], Some(wire(&expected)));
+                }
+                let (row, released) = run(Some(wire(r#"{"protected":"hidden","unknown":"visible"}"#)), &plan).unwrap();
+                assert_eq!(released, if blind { vec![token.clone()] } else { vec![] });
+                assert_eq!(row, vec![Some(b"earlier".to_vec()), Some(wire(&expected))]);
+                assert_eq!(run(None, &plan).unwrap().0[1], None);
+                let error = run(Some(wire(r#"{"protected":"hidden","protected":"hidden"}"#)), &plan).unwrap_err();
+                assert!(!format!("{error:?}").contains("hidden"));
+                filter = json_test_filter(mode, true, false);
+                plan.outputs[1] = OutputRewrite::JsonFilter { filter, ty: ty.clone() };
+                assert_eq!(run(Some(wire(r#"{"protected":"hidden"}"#)), &plan).unwrap().0[1], None);
+            }
+        }
+    }
+
+    #[test]
+    fn json_row_description_requires_matching_oid() {
+        for (ty, oid) in [(ColumnType::Json, 114), (ColumnType::Jsonb, 3802)] {
+            let plan = RewritePlan { outputs: vec![OutputRewrite::JsonFilter { filter: json_test_filter(crate::json::filter::JsonMode::Show, false, false), ty }], inputs: vec![], tokenize: None };
+            let mut field = field();
+            field.type_oid = oid;
+            assert!(validate_json_fields(std::slice::from_ref(&field), &plan).is_ok());
+            assert!(super::extended::rewrite_fields(std::slice::from_mut(&mut field), &plan).is_ok());
+            field.type_oid = if oid == 114 { 3802 } else { 114 };
+            assert_eq!(validate_json_fields(std::slice::from_ref(&field), &plan).unwrap_err().code, NyCode::NotAnalysable);
+            assert!(super::extended::rewrite_fields(&mut [field], &plan).is_err());
+        }
+    }
+
     #[test]
     fn row_mask_null_and_width() {
         let f = Fixture::new();

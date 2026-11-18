@@ -21,6 +21,7 @@ mod tests {
     #[test]
     fn recognizes_only_declared_domains_and_base32_prefixes() {
         let policy = Policy {
+            json_filters: Default::default(),
             columns: Default::default(),
             domains: [(
                 DomainName("email".into()),

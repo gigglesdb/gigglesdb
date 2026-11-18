@@ -58,6 +58,7 @@ pub fn harness_fixture() -> (Snapshot, Policy) {
     };
     let domain = DomainName("email".into());
     let policy = Policy {
+        json_filters: Default::default(),
         columns: BTreeMap::from([
             (
                 column("customers", "email"),
