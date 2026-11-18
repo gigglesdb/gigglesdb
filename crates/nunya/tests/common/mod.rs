@@ -227,6 +227,62 @@ impl ServeHarness {
         result
     }
 
+    /// Repoint a stopped fixture without changing its deployment, root key or sessions.
+    pub fn set_upstream(
+        &mut self,
+        url: &str,
+        tls: &str,
+        ca_file: Option<&str>,
+        host: Option<&str>,
+    ) -> ServeResult<()> {
+        if self.child.is_some() {
+            return Err("stop serve before changing its upstream".into());
+        }
+        let pg: tokio_postgres::Config = url.parse().map_err(|_| "invalid test upstream URL")?;
+        let url_host = match pg.get_hosts().first() {
+            Some(tokio_postgres::config::Host::Tcp(host)) => host.as_str(),
+            _ => return Err("TCP upstream required".into()),
+        };
+        let path = self.dir.join("nunya.toml");
+        let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+        let upstream = config
+            .get_mut("upstream")
+            .and_then(toml::Value::as_table_mut)
+            .ok_or("fixture has no upstream")?;
+        for (key, value) in [
+            ("host", host.unwrap_or(url_host)),
+            ("tls", tls),
+            ("user", pg.get_user().unwrap_or("postgres")),
+            ("dbname", pg.get_dbname().unwrap_or("app")),
+        ] {
+            upstream.insert(key.into(), toml::Value::String(value.into()));
+        }
+        upstream.insert(
+            "port".into(),
+            toml::Value::Integer(i64::from(*pg.get_ports().first().unwrap_or(&5432))),
+        );
+        upstream.insert(
+            "application_name".into(),
+            toml::Value::String(
+                self.dir
+                    .file_name()
+                    .ok_or("missing fixture name")?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
+        upstream.remove("ca_file");
+        if let Some(ca) = ca_file {
+            upstream.insert("ca_file".into(), toml::Value::String(ca.into()));
+        }
+        std::fs::write(
+            self.dir.join("password"),
+            pg.get_password().unwrap_or_default(),
+        )?;
+        std::fs::write(path, toml::to_string(&config)?)?;
+        Ok(())
+    }
+
     fn spawn(&mut self) -> ServeResult<std::process::Child> {
         self.reservations.clear();
         self.starts += 1;
@@ -272,6 +328,14 @@ impl ServeHarness {
         let error = self.startup_error("serve management readiness timed out");
         self.stop()?;
         Err(error)
+    }
+
+    /// Observe an early serve exit without killing an otherwise running process.
+    pub fn has_exited(&mut self) -> ServeResult<bool> {
+        match &mut self.child {
+            Some(child) => Ok(child.try_wait()?.is_some()),
+            None => Ok(true),
+        }
     }
 
     /// Kill and reap the primary child, keeping configuration and state intact.

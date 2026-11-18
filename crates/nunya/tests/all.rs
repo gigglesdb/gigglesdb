@@ -40,3 +40,5 @@ mod spanner_native;
 mod spanner_pg;
 
 #[path = "bindings_live.rs"] mod bindings_live;
+#[path = "upstream_tls.rs"]
+mod upstream_tls;
