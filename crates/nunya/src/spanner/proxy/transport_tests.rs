@@ -29,25 +29,93 @@ async fn closed_port_writes_are_ny010_without_unknown_audit() {
     assert!(lifecycle.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn generated_readiness_prefix_is_never_an_unknown_write() {
-    let lifecycle = Arc::new(Mutex::new(vec![]));
-    let f = Fixture::with_log(Box::new(CaptureLog(Arc::default(), lifecycle.clone()))).await;
-    let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
-    let audit = WriteAudit::new(&f.svc, &who);
-    // Pin googleapis-tonic 0.22.0's generated ready() failure prefix.
-    let error = audit.finish_error(forwarded_transport(Status::unknown("Service was not ready: transport error"), true));
-    assert_eq!(error.code(), tonic::Code::Unavailable);
-    assert!(error.message().starts_with("NY010: "));
-    assert!(lifecycle.lock().unwrap().is_empty());
-    // A concurrent revoke must not relabel a genuine transport loss.
-    revoke(&f);
-    let error = audit.finish_error(forwarded_transport(Status::unknown("unrelated error"), true));
-    assert_ended(error, true);
+fn assert_unknown_audit(lifecycle: &Mutex<Vec<LifecycleRecord>>, error: Status) {
+    assert_eq!(error.message(), nunya_status(NyCode::WriteOutcomeUnknown).message());
     let records = lifecycle.lock().unwrap();
     let records: Vec<_> = records.iter().filter(|r| r.kind == LifecycleKind::WriteOutcomeUnknown).collect();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].reason, "upstream_lost");
+}
+
+#[tokio::test]
+async fn upstream_readiness_prefix_is_an_unknown_write() {
+    for commit in [true, false] {
+        let lifecycle = Arc::new(Mutex::new(vec![]));
+        let f = Fixture::with_log(Box::new(CaptureLog(Arc::default(), lifecycle.clone()))).await;
+        let error = Status::unknown("Service was not ready: transport error");
+        let error = if commit {
+            let session = f.session().await;
+            *f.fake.commit_status.lock().unwrap() = Some(error);
+            let error = f.svc.commit(f.request(CommitRequest { session, ..Default::default() }, "alice")).await.unwrap_err();
+            assert_eq!(f.fake.commits.lock().unwrap().len(), 1);
+            error
+        } else {
+            let mut req = f.query("UPDATE customers SET email = @v").await;
+            req.transaction = Some(TransactionSelector {
+                selector: Some(transaction_selector::Selector::Begin(rw_options())),
+            });
+            req.params = Some(prost_types::Struct { fields: [("v".into(), f.token())].into() });
+            *f.fake.sql_status.lock().unwrap() = Some(error);
+            let error = f.svc.execute_sql(f.request(req, "alice")).await.unwrap_err();
+            assert_eq!(f.fake.seen.lock().unwrap().len(), 1);
+            error
+        };
+        assert_unknown_audit(&lifecycle, error);
+    }
+}
+
+#[tokio::test]
+async fn streaming_errors_after_first_part_are_unknown_writes() {
+    for code in [tonic::Code::Unknown, tonic::Code::Unavailable] {
+        let lifecycle = Arc::new(Mutex::new(vec![]));
+        let f = Fixture::with_log(Box::new(CaptureLog(Arc::default(), lifecycle.clone()))).await;
+        let mut req = f.query("UPDATE customers SET email = @v").await;
+        req.transaction = Some(TransactionSelector {
+            selector: Some(transaction_selector::Selector::Begin(rw_options())),
+        });
+        req.params = Some(prost_types::Struct { fields: [("v".into(), f.token())].into() });
+        *f.fake.stream_error_after_first.lock().unwrap() = Some(Status::new(code, "Service was not ready: transport error"));
+        let mut stream = f.svc.execute_streaming_sql(f.request(req, "alice")).await.unwrap().into_inner();
+        assert!(stream.next().await.unwrap().is_ok());
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(stream.next().await.is_none());
+        assert_unknown_audit(&lifecycle, error);
+    }
+}
+
+#[tokio::test]
+async fn local_readiness_failure_leaves_dispatch_marker_unset() {
+    #[derive(Clone)]
+    struct NotReady;
+    impl tower::Service<()> for NotReady {
+        type Response = ();
+        type Error = Status;
+        type Future = std::future::Ready<Result<(), Status>>;
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Status>> {
+            std::task::Poll::Ready(Err(Status::unknown("local readiness failure")))
+        }
+        fn call(&mut self, _: ()) -> Self::Future {
+            panic!("unready service must not dispatch")
+        }
+    }
+    let lifecycle = Arc::new(Mutex::new(vec![]));
+    let f = Fixture::with_log(Box::new(CaptureLog(Arc::default(), lifecycle.clone()))).await;
+    let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
+    let audit = WriteAudit::new(&f.svc, &who);
+    let marker = DispatchMarker::default();
+    let mut service = DispatchService { inner: NotReady, marker: marker.clone() };
+    let result = tower::ServiceExt::ready(&mut service).await;
+    let error = match result { Err(error) => error, Ok(_) => panic!("service unexpectedly ready") };
+    assert!(!marker.dispatched());
+    let error = audit.finish_error(marker.classify(error, true));
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(error.message().starts_with("NY010: "));
+    assert!(lifecycle.lock().unwrap().is_empty());
+
+    // Keep transport loss distinct from concurrent session revocation.
+    revoke(&f);
+    let error = audit.finish_error(forwarded_transport(Status::unknown("transport error"), true));
+    assert_unknown_audit(&lifecycle, error);
 }
 
 #[tokio::test]

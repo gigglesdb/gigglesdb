@@ -116,6 +116,42 @@ impl Interceptor for AuthInterceptor {
 }
 /// Trusted intercepted upstream client.
 pub(super) type Client = SpannerClient<InterceptedService<Channel, AuthInterceptor>>;
+// One marker belongs to one RPC, including all generated-client clones.
+#[derive(Clone, Default)]
+struct DispatchMarker(Arc<std::sync::atomic::AtomicBool>);
+impl DispatchMarker {
+    fn dispatched(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn classify(&self, error: Status, write: bool) -> Status {
+        if write && (!self.dispatched() || connection_refused(&error)) {
+            upstream_not_ready()
+        } else {
+            forwarded_transport(error, write)
+        }
+    }
+}
+#[derive(Clone)]
+struct DispatchService<S> {
+    inner: S,
+    marker: DispatchMarker,
+}
+impl<S, R> tower::Service<R> for DispatchService<S>
+where
+    S: tower::Service<R>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+    fn call(&mut self, request: R) -> Self::Future {
+        self.marker.0.store(true, std::sync::atomic::Ordering::Release);
+        self.inner.call(request)
+    }
+}
+type WriteClient = SpannerClient<InterceptedService<DispatchService<Channel>, AuthInterceptor>>;
 type ConfigurationSnapshot = (Arc<Policy>, Arc<Snapshot>, Option<String>);
 type ResultStream = Pin<Box<dyn Stream<Item = Result<PartialResultSet, Status>> + Send + 'static>>;
 /// Native Spanner service and its gateway-created session ownership registry.
@@ -275,6 +311,8 @@ async fn ready_for_write(channel: &Channel, write: bool) -> Result<(), Status> {
     }
     Ok(())
 }
+// A wire-decoded Status has no io::Error source. A local TCP refusal proves
+// no send, but only before any response part has been received.
 fn connection_refused(error: &Status) -> bool {
     use std::error::Error;
     let mut source = error.source();
@@ -287,15 +325,6 @@ fn connection_refused(error: &Status) -> bool {
     false
 }
 fn forwarded_transport(error: Status, write: bool) -> Status {
-    // googleapis-tonic 0.22.0 emits this prefix only when its pre-send
-    // ready() fails. Backstop the race after our own readiness check.
-    // Channel readiness reserves buffer space. A lazy/reconnecting tonic
-    // channel can report a TCP refusal from call() instead: it also proves
-    // no request was sent. Never classify by arbitrary upstream message text.
-    if write && ((error.code() == tonic::Code::Unknown && error.message().starts_with("Service was not ready"))
-        || connection_refused(&error)) {
-        return upstream_not_ready();
-    }
     if write && matches!(error.code(), tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Cancelled | tonic::Code::DeadlineExceeded) {
         unknown_status(UnknownCause::UpstreamLost)
     } else {
@@ -333,6 +362,18 @@ async fn cancellable<T>(
         biased;
         _ = ended(signal) => Err(ended_status(write)),
         result = future => result.map_err(|error| forwarded_transport(error, write)),
+    }
+}
+async fn cancellable_write<T>(
+    signal: &mut tokio::sync::watch::Receiver<bool>,
+    write: bool,
+    marker: &DispatchMarker,
+    future: impl std::future::Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    tokio::select! {
+        biased;
+        _ = ended(signal) => Err(ended_status(write)),
+        result = future => result.map_err(|error| marker.classify(error, write)),
     }
 }
 // The receiver is discarded immediately on revocation, including queued results.
@@ -426,6 +467,11 @@ async fn upstream_client(
     channel: &Channel,
     provider: &Option<Arc<dyn gcp_auth::TokenProvider>>,
 ) -> Result<Client, Status> {
+    Ok(SpannerClient::with_interceptor(channel.clone(), upstream_interceptor(provider).await?))
+}
+async fn upstream_interceptor(
+    provider: &Option<Arc<dyn gcp_auth::TokenProvider>>,
+) -> Result<AuthInterceptor, Status> {
     if let Some(provider) = provider {
         let token = provider
             .token(&["https://www.googleapis.com/auth/spanner.data"])
@@ -434,16 +480,9 @@ async fn upstream_client(
         let token = format!("Bearer {}", token.as_str())
             .parse()
             .map_err(|_| nunya_status(NyCode::TokenNotValid))?;
-        // Reuse the channel and replace only its interceptor token.
-        Ok(SpannerClient::with_interceptor(
-            channel.clone(),
-            AuthInterceptor { token: Some(token) },
-        ))
+        Ok(AuthInterceptor { token: Some(token) })
     } else {
-        Ok(SpannerClient::with_interceptor(
-            channel.clone(),
-            AuthInterceptor::default(),
-        ))
+        Ok(AuthInterceptor::default())
     }
 }
 /// Connect to the configured upstream; downstream credentials never leave Nunya.
@@ -827,6 +866,11 @@ impl NunyaSpanner {
     }
     async fn client(&self) -> Result<Client, Status> {
         upstream_client(&self.channel, &self.provider).await
+    }
+    async fn write_client(&self) -> Result<(WriteClient, DispatchMarker), Status> {
+        let marker = DispatchMarker::default();
+        let service = DispatchService { inner: self.channel.clone(), marker: marker.clone() };
+        Ok((SpannerClient::with_interceptor(service, upstream_interceptor(&self.provider).await?), marker))
     }
     fn configuration(&self) -> Result<ConfigurationSnapshot, Status> {
         // Lock order: policy, then revision; writers retain the policy write guard.
@@ -1247,6 +1291,7 @@ impl NunyaSpanner {
                 let mut reassembler = Reassembler::new();
                 let mut precommit = stream::Precommit::default();
                 let mut types = None;
+                let mut received_part = false;
                 loop {
                     let part = tokio::select! {
                         biased;
@@ -1256,7 +1301,14 @@ impl NunyaSpanner {
                     let Some(part) = part else {
                         break;
                     };
-                    let mut part = part.map_err(|error| forwarded_transport(error, write))?;
+                    let mut part = part.map_err(|error| {
+                        if write && !received_part && connection_refused(&error) {
+                            upstream_not_ready()
+                        } else {
+                            forwarded_transport(error, write)
+                        }
+                    })?;
+                    received_part = true;
                     ctx.authority
                         .admit(who.session, Operation::Read)
                         .map_err(|_| ended_status(write))?;
@@ -1531,13 +1583,13 @@ impl SpannerService for NunyaSpanner {
             self.check_response(&who, &signal, false)?;
             return Ok(Response::new(result));
         }
-        let mut client = self.client().await?;
+        let (mut client, marker) = self.write_client().await?;
         ready_for_write(&self.channel, write).await?;
         let outcome_audit = WriteAudit::new(self, &who);
         let result = async {
             let inline = inline_read_write(req.transaction.as_ref());
             let session = req.session.clone();
-            let mut result = cancellable(&mut signal, write, client.execute_sql(req))
+            let mut result = cancellable_write(&mut signal, write, &marker, client.execute_sql(req))
                 .await?
                 .into_inner();
             self.record_inline(&session, who.session, inline, write, result.metadata.as_ref())?;
@@ -1603,12 +1655,12 @@ impl SpannerService for NunyaSpanner {
                 },
             )]))));
         }
-        let mut client = self.client().await?;
+        let (mut client, marker) = self.write_client().await?;
         let inline = inline_read_write(req.transaction.as_ref());
         let session = req.session.clone();
         ready_for_write(&self.channel, write).await?;
         let outcome_audit = WriteAudit::new(self, &who);
-        let upstream = cancellable(&mut signal, write, client.execute_streaming_sql(req))
+        let upstream = cancellable_write(&mut signal, write, &marker, client.execute_streaming_sql(req))
             .await.map_err(|error| outcome_audit.finish_error(error))?
             .into_inner();
         Ok(Response::new(
@@ -1658,13 +1710,13 @@ impl SpannerService for NunyaSpanner {
         for label in &labels {
             Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), label, 0, vec![])?;
         }
-        let mut client = self.client().await?;
+        let (mut client, marker) = self.write_client().await?;
         ready_for_write(&self.channel, true).await?;
         let outcome_audit = WriteAudit::new(self, &who);
         let result = async {
             let inline = inline_read_write(req.transaction.as_ref());
             let session = req.session.clone();
-            let mut result = cancellable(&mut signal, true, client.execute_batch_dml(req))
+            let mut result = cancellable_write(&mut signal, true, &marker, client.execute_batch_dml(req))
                 .await?
                 .into_inner();
             self.record_inline(&session, who.session, inline, true, result.result_sets.first().and_then(|set| set.metadata.as_ref()))?;
@@ -1867,11 +1919,11 @@ impl SpannerService for NunyaSpanner {
             0,
             vec![],
         )?;
-        let mut client = self.client().await?;
+        let (mut client, marker) = self.write_client().await?;
         ready_for_write(&self.channel, true).await?;
         let outcome_audit = WriteAudit::new(self, &who);
         let result = async {
-            let result = cancellable(&mut signal, true, client.commit(req)).await;
+            let result = cancellable_write(&mut signal, true, &marker, client.commit(req)).await;
             let retry = result.as_ref().is_ok_and(|response| {
                 matches!(
                     response.get_ref().multiplexed_session_retry,
@@ -2118,6 +2170,9 @@ mod tests {
     struct Fake {
         result_token: Mutex<Option<MultiplexedSessionPrecommitToken>>,
         next_commit: Mutex<Option<CommitResponse>>,
+        commit_status: Mutex<Option<Status>>,
+        sql_status: Mutex<Option<Status>>,
+        stream_error_after_first: Mutex<Option<Status>>,
         commit_error: Mutex<Option<tonic::Code>>,
         sql_error: Mutex<Option<tonic::Code>>,
         begins: Mutex<Vec<BeginTransactionRequest>>,
@@ -2231,6 +2286,15 @@ mod tests {
             &self,
             req: Request<ExecuteSqlRequest>,
         ) -> Result<Response<ResultStream>, Status> {
+            if let Some(error) = self.stream_error_after_first.lock().unwrap().take() {
+                return Ok(Response::new(Box::pin(futures::stream::iter([
+                    Ok(PartialResultSet {
+                        metadata: Some(ResultSetMetadata::default()),
+                        stats: Some(ResultSetStats::default()), ..Default::default()
+                    }),
+                    Err(error),
+                ]))));
+            }
             if let Some(parts) = self.parts.lock().unwrap().take() {
                 return Ok(Response::new(Box::pin(futures::stream::iter(parts.into_iter().map(Ok)))));
             }
@@ -2334,6 +2398,9 @@ mod tests {
             if self.hold_sql.load(std::sync::atomic::Ordering::Relaxed) {
                 self.release.notified().await;
             }
+            if let Some(error) = self.sql_status.lock().unwrap().take() {
+                return Err(error);
+            }
             if let Some(code) = self.sql_error.lock().unwrap().take() {
                 return Err(Status::new(code, "upstream error"));
             }
@@ -2400,6 +2467,9 @@ mod tests {
             self.commits.lock().unwrap().push(req.into_inner());
             if self.hold_commit.load(std::sync::atomic::Ordering::Relaxed) {
                 self.release.notified().await;
+            }
+            if let Some(error) = self.commit_status.lock().unwrap().take() {
+                return Err(error);
             }
             if let Some(code) = self.commit_error.lock().unwrap().take() {
                 return Err(Status::new(code, "upstream error"));
