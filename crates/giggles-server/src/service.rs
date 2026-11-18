@@ -2581,6 +2581,21 @@ impl Session {
         let result = self.run_prepared(p, &[], true)?.untasked()?;
         Ok(result.rows.into_iter().next().and_then(|row| row.values.into_iter().next()))
     }
+    /// Inspect a mutation's access path under the mutation's own privileges.
+    /// The synthetic SELECT is never a user read and releases only plan facts.
+    pub(crate) fn explain_mutation_facts(
+        &mut self, authority: &Prepared, sql: &str,
+    ) -> Result<(String, Option<Value>), CoreError> {
+        self.authority_scope(|session| {
+            session.authorize(authority)?;
+            if session.sql.task().is_some() { return Err(task_session_refusal()); }
+            let p = session.sql.prepare(sql)?;
+            if p.command() != "EXPLAIN" { return Err(CoreError::Sql(relational::SqlError::Unsupported)); }
+            let table = p.table().ok_or(CoreError::Policy(Error::Scope))?.to_owned();
+            let result = session.sql.execute_prepared_unreleased(&p, &[], None)?.untasked()?;
+            Ok((table, result.rows.into_iter().next().and_then(|r| r.values.into_iter().next())))
+        })
+    }
     /// `execute_prepared`, with the result held until `release_page`.
     pub fn execute_prepared_unreleased(
         &mut self,

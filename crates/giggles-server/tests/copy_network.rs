@@ -818,3 +818,42 @@ async fn missing_copy_columns_follow_supplied_field_conversion() {
         f.stop().await;
     }
 }
+
+#[tokio::test]
+async fn copy_to_option_profiles() {
+    let f = Fixture::with_engine(if cfg!(feature = "engine-rocksdb") { giggles_core::Engine::V2 } else { giggles_core::Engine::Legacy }).await;
+    let mut s = f.connect().await;
+    query(&mut s, "INSERT INTO t VALUES (1,'a,b',1),(2,'q\"x',NULL),(3,'',3)").await;
+    for (options, expected) in [
+        ("WITH (FORMAT TEXT, HEADER, DELIMITER '|', NULL 'NUL')", "i|x|n\n1|a,b|1\n2|q\"x|NUL\n3||3\n"),
+        ("WITH (FORMAT CSV, QUOTE '~', ESCAPE '!')", "1,~a,b~,1\n2,q\"x,\n3,~~,3\n"),
+        ("WITH CSV HEADER FORCE QUOTE *", "i,x,n\n\"1\",\"a,b\",\"1\"\n\"2\",\"q\"\"x\",\n\"3\",\"\",\"3\"\n"),
+        ("WITH (FORMAT CSV, HEADER, FORCE_QUOTE (x))", "i,x,n\n1,\"a,b\",1\n2,\"q\"\"x\",\n3,\"\",3\n"),
+        ("WITH (FORMAT CSV, NULL 'NUL', DELIMITER '|', ENCODING 'UTF8')", "1|a,b|1\n2|\"q\"\"x\"|NUL\n3||3\n"),
+        ("CSV FORCE QUOTE x", "1,\"a,b\",1\n2,\"q\"\"x\",\n3,\"\",3\n"),
+        ("CSV QUOTE AS '~' ESCAPE AS '!'", "1,~a,b~,1\n2,q\"x,\n3,~~,3\n"),
+    ] {
+        let r = query(&mut s, &format!("COPY (SELECT * FROM t ORDER BY i) TO STDOUT {options}")).await;
+        let data: Vec<u8> = r.iter().filter(|r| r.0 == b'd').flat_map(|r| r.1.iter().copied()).collect();
+        assert_eq!(data, expected.as_bytes(), "{options}");
+    }
+    let r = query(&mut s, "COPY (SELECT 1) TO STDOUT BINARY").await;
+    assert_eq!(r[0].0, b'H'); assert_eq!(r[0].1[0], 1);
+    assert!(!r.iter().any(|r| r.0 == b'E'));
+    query(&mut s, "INSERT INTO t VALUES (4,'q~!x',4)").await;
+    let r = query(&mut s, "COPY (SELECT x FROM t WHERE i=4) TO STDOUT CSV QUOTE '~' ESCAPE '!'").await;
+    let data: Vec<u8> = r.iter().filter(|r| r.0 == b'd').flat_map(|r| r.1.iter().copied()).collect();
+    assert_eq!(data, b"~q!~!!x~\n");
+    for (options, code) in [
+        ("(DEFAULT 'x')", "0A000"), ("(FORCE_QUOTE *)", "0A000"),
+        ("(FORMAT CSV, QUOTE 'xx')", "0A000"), ("(FORMAT CSV, ESCAPE 'xx')", "0A000"),
+        ("(DELIMITER 'xx')", "0A000"), ("(FORMAT CSV, NULL ',')", "22023"),
+        ("(FORMAT CSV, NULL '\"')", "22023"), ("(FORMAT CSV, HEADER MATCH)", "0A000"),
+        ("(ENCODING 'bogus')", "22023"), ("(FORMAT CSV, FORCE_QUOTE (bogus))", "42703"),
+        ("(FORMAT CSV, FORMAT CSV)", "42601"),
+    ] {
+        let r = query(&mut s, &format!("COPY t TO STDOUT {options}")).await;
+        error(&r, code);
+    }
+    drop(s); f.stop().await;
+}

@@ -1442,7 +1442,7 @@ impl State {
             self.diagnostic.phase = "application prepare";
             return Err("42501");
         } else if let Some(query) = explain::prepare(sql, session)? {
-            (Plan::Explain(query), explain::description())
+            { let description = explain::description(&query); (Plan::Explain(query), description) }
         } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic, session)? {
             let (epoch, _, _) = core(session.catalog_snapshot())?;
             let fields = giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;

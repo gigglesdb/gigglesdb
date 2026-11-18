@@ -118,6 +118,9 @@ impl State {
     ) -> R<()> {
         let prepared = core(session.prepare(&options.select))?;
         let description = core(session.describe(&prepared))?;
+        for name in &options.force_columns {
+            if !description.columns.iter().any(|c| c.name == *name) { return Err("42703"); }
+        }
         self.settings.queried = session.in_transaction();
         // PostgreSQL streams COPY TO STDOUT: a spilled v2 result is read from its
         // temp file in chunks and flushed as it goes, never materialised.
@@ -154,7 +157,9 @@ impl State {
                 if i > 0 {
                     data.push(options.delimiter);
                 }
-                copy_csv_field(column.name.as_bytes(), options, &mut data);
+                if options.format == 1 {
+                    copy_csv_field(column.name.as_bytes(), options, false, &mut data);
+                } else { data.extend(column.name.as_bytes()); }
             }
             data.push(b'\n');
             frame(b'd', &data, out)?;
@@ -191,12 +196,12 @@ impl State {
                     }
                     None => data.extend(&options.null),
                     Some(value) if options.format == 1 => {
-                        copy_csv_field(&value, options, &mut data)
+                        copy_csv_field(&value, options, options.force_all || options.force_columns.contains(&column.name), &mut data)
                     }
                     Some(value) => {
                         let escaped = value
                             .iter()
-                            .filter(|b| matches!(b, b'\\' | b'\t' | b'\n' | b'\r' | 8 | 12 | 11))
+                            .filter(|b| **b == options.delimiter || matches!(b, b'\\' | b'\t' | b'\n' | b'\r' | 8 | 12 | 11))
                             .count();
                         let size = data
                             .len()
@@ -534,7 +539,7 @@ impl State {
             self.settings.queried = session.in_transaction();
             // Plan text the server builds (its core reads refuse a task session).
             let result = Released::synthetic(explain::execute(&query, session)?);
-            let description = explain::description();
+            let description = explain::description(&query);
             row_description(&description, &[], out)?;
             rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
                 &result, &description, &[], 0, result.get().rows.len(), out)?;
@@ -947,8 +952,8 @@ pub(super) fn execute_settings(
     Ok(())
 }
 
-fn copy_csv_field(value: &[u8], options: &crate::auth::statements::CopyOutput, out: &mut Vec<u8>) {
-    let quoted = value == options.null
+fn copy_csv_field(value: &[u8], options: &crate::auth::statements::CopyOutput, force: bool, out: &mut Vec<u8>) {
+    let quoted = force || value == options.null
         || value == b"\\."
         || value
             .iter()
@@ -957,8 +962,8 @@ fn copy_csv_field(value: &[u8], options: &crate::auth::statements::CopyOutput, o
         out.push(options.quote);
     }
     for b in value {
-        if quoted && *b == options.quote {
-            out.push(*b);
+        if quoted && (*b == options.quote || *b == options.escape) {
+            out.push(options.escape);
         }
         out.push(*b);
     }

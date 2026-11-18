@@ -34,6 +34,7 @@ enum Token {
     LParen,
     RParen,
     Semi,
+    Star,
     Other,
 }
 fn lex(sql: &str) -> Result<Vec<Token>, &'static str> {
@@ -44,6 +45,7 @@ fn lex(sql: &str) -> Result<Vec<Token>, &'static str> {
             continue;
         }
         out.push(match c {
+            '*' => Token::Star,
             ',' => Token::Comma,
             '.' => Token::Dot,
             '(' => Token::LParen,
@@ -118,6 +120,13 @@ impl Parser {
             return Err("42601");
         }
         Ok(name)
+    }
+    fn copy_argument(&mut self) -> Result<String, &'static str> {
+        let value = match self.tokens.get(self.pos) {
+            Some(Token::Text(s) | Token::Word(s) | Token::Ident(s)) => s.clone(),
+            _ => return Err("42601"),
+        };
+        self.pos += 1; Ok(value)
     }
     fn comma(&mut self) -> bool {
         if self.tokens.get(self.pos) == Some(&Token::Comma) {
@@ -723,6 +732,9 @@ pub(crate) struct CopyOutput {
     pub delimiter: u8,
     pub quote: u8,
     pub null: Vec<u8>,
+    pub escape: u8,
+    pub force_all: bool,
+    pub force_columns: Vec<String>,
 }
 
 pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'static str> {
@@ -803,85 +815,104 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'stat
         delimiter: b'\t',
         quote: b'"',
         null: b"\\N".to_vec(),
+        escape: b'"',
+        force_all: false,
+        force_columns: vec![],
     };
     p.kw("with");
     let mut delimiter = None;
     let mut null = None;
     let mut quote = None;
-    if p.tokens.get(p.pos) == Some(&Token::LParen) {
-        p.pos += 1;
-        loop {
-            let option = p.ident()?;
-            match option.as_str() {
-                "format" => {
-                    options.format = match p.ident()?.as_str() {
-                        "text" => 0,
-                        "csv" => 1,
-                        "binary" => 2,
-                        _ => return Err("22023"),
+    let mut escape = None;
+    let mut seen = std::collections::HashSet::new();
+    let parenthesized = p.tokens.get(p.pos) == Some(&Token::LParen);
+    if parenthesized { p.pos += 1; }
+    while p.pos < p.tokens.len() && p.tokens.get(p.pos) != Some(&Token::RParen) {
+        let mut option = p.ident()?;
+        if !parenthesized && option == "force" { p.need("quote")?; option = "force_quote".into(); }
+        let key = if matches!(option.as_str(), "csv" | "binary") { "format" } else { &option };
+        if !seen.insert(key.to_owned()) { return Err("42601"); }
+        match option.as_str() {
+            "csv" if !parenthesized => options.format = 1,
+            "binary" if !parenthesized => options.format = 2,
+            "format" => options.format = match p.copy_argument()?.to_ascii_lowercase().as_str() {
+                "text" => 0, "csv" => 1, "binary" => 2, _ => return Err("22023"),
+            },
+            "header" => {
+                if p.kw("match") { return Err("0A000"); }
+                options.header = !(p.kw("false") || p.kw("off") || p.kw("0"));
+                p.kw("true"); p.kw("on"); p.kw("1");
+                if let Some(Token::Text(value)) = p.tokens.get(p.pos) {
+                    options.header = match value.to_ascii_lowercase().as_str() {
+                        "true" | "on" | "1" => true, "false" | "off" | "0" => false,
+                        _ => return Err("42601"),
+                    }; p.pos += 1;
+                }
+            }
+            "force_quote" => {
+                if p.tokens.get(p.pos) == Some(&Token::Star) {
+                    // The COPY option grammar admits only '*' here.
+                    p.pos += 1; options.force_all = true;
+                } else {
+                    if parenthesized {
+                        if p.tokens.get(p.pos) != Some(&Token::LParen) { return Err("42601"); }
+                        p.pos += 1;
+                    }
+                    options.force_columns = p.names(false)?;
+                    if parenthesized {
+                        if p.tokens.get(p.pos) != Some(&Token::RParen) { return Err("42601"); }
+                        p.pos += 1;
                     }
                 }
-                "header" => {
-                    options.header = !p.kw("false");
-                    p.kw("true");
-                }
-                "delimiter" | "quote" | "null" => {
-                    let Some(Token::Text(value)) = p.tokens.get(p.pos) else {
-                        return Err("42601");
-                    };
-                    let value = value.as_bytes().to_vec();
-                    p.pos += 1;
-                    match option.as_str() {
-                        "delimiter" => delimiter = Some(value),
-                        "quote" => quote = Some(value),
-                        _ => null = Some(value),
+            }
+            "delimiter" | "quote" | "escape" | "null" | "default" | "encoding" => {
+                if !parenthesized { p.kw("as"); }
+                if !parenthesized && !matches!(p.tokens.get(p.pos), Some(Token::Text(_))) { return Err("42601"); }
+                let value = p.copy_argument()?.into_bytes();
+                match option.as_str() {
+                    "delimiter" => delimiter = Some(value),
+                    "quote" => quote = Some(value),
+                    "escape" => escape = Some(value),
+                    "null" => null = Some(value),
+                    "default" => return Err("0A000"),
+                    _ => {
+                        if !value.eq_ignore_ascii_case(b"utf8") && !value.eq_ignore_ascii_case(b"utf-8") {
+                            return Err("22023");
+                        }
                     }
                 }
-                _ => return Err("42601"),
             }
-            if !p.comma() {
-                break;
-            }
+            _ => return Err("42601"),
         }
-        if p.tokens.get(p.pos) != Some(&Token::RParen) {
-            return Err("42601");
-        }
+        if parenthesized && !p.comma() { break; }
+    }
+    if parenthesized {
+        if p.tokens.get(p.pos) != Some(&Token::RParen) { return Err("42601"); }
         p.pos += 1;
     }
-    if p.pos != p.tokens.len() {
-        return Err("42601");
-    }
-    if options.format == 2
-        && (delimiter.is_some() || null.is_some() || quote.is_some() || options.header)
-    {
-        return Err("42601");
-    }
-    if options.format != 1 && (quote.is_some() || options.header) {
-        return Err("0A000");
-    }
-    if options.format == 1 {
-        options.delimiter = b',';
-        options.null.clear();
-    }
+    if p.pos != p.tokens.len() { return Err("42601"); }
+    if options.format == 2 && (delimiter.is_some() || null.is_some() || seen.contains("header")) { return Err("42601"); }
+    if options.format != 1 && (quote.is_some() || escape.is_some() || seen.contains("force_quote")) { return Err("0A000"); }
+    if options.format == 1 { options.delimiter = b','; options.null.clear(); }
     if let Some(d) = delimiter {
-        if d.len() != 1 || matches!(d[0], b'\n' | b'\r') {
-            return Err("22023");
-        }
+        if d.len() != 1 { return Err("0A000"); }
+        if matches!(d[0], b'\n' | b'\r') { return Err("22023"); }
+        if options.format == 0 && (d[0] == b'\\' || d[0] == b'.' || d[0].is_ascii_lowercase() || d[0].is_ascii_digit()) { return Err("22023"); }
         options.delimiter = d[0];
     }
     if let Some(q) = quote {
-        if q.len() != 1 || matches!(q[0], b'\n' | b'\r') {
-            return Err("22023");
-        }
+        if q.len() != 1 { return Err("0A000"); }
         options.quote = q[0];
     }
-    if options.format == 1 && options.quote == options.delimiter {
-        return Err("22023");
+    options.escape = options.quote;
+    if let Some(e) = escape {
+        if e.len() != 1 { return Err("0A000"); }
+        options.escape = e[0];
     }
+    if options.format == 1 && options.quote == options.delimiter { return Err("22023"); }
     if let Some(n) = null {
-        if n.iter().any(|b| matches!(b, b'\n' | b'\r')) {
-            return Err("22023");
-        }
+        if n.iter().any(|b| matches!(b, b'\n' | b'\r')) { return Err("22023"); }
+        if n.contains(&options.delimiter) || (options.format == 1 && n.contains(&options.quote)) { return Err("22023"); }
         options.null = n;
     }
     let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
@@ -1072,7 +1103,7 @@ mod tests {
                 "{sql}"
             );
         }
-        for name in ["x".repeat(64), format!("\"{}\"", "é".repeat(32))] {
+        for name in ["x".repeat(64), format!("\"{}\"", "ÃƒÂ©".repeat(32))] {
             assert!(matches!(
                 parse(&format!("DROP TABLE {name}")),
                 Some(AdminStatement::Error("42601"))
@@ -1111,7 +1142,7 @@ mod tests {
             Some(AdminStatement::Error("42601"))
         ));
         assert!(matches!(
-            parse(&format!("CREATE ROLE \"{}\"", "é".repeat(32))),
+            parse(&format!("CREATE ROLE \"{}\"", "ÃƒÂ©".repeat(32))),
             Some(AdminStatement::Error("42601"))
         ));
     }

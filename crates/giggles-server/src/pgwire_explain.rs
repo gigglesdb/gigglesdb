@@ -2,9 +2,9 @@
 use super::*;
 use giggles_pg_catalog::ExplainQuery;
 
-pub(super) fn description() -> Description {
+pub(super) fn description(query: &ExplainQuery) -> Description {
     Description {
-        type_oids: vec![],
+        type_oids: if query.json { vec![114] } else { vec![] },
         typmods: vec![-1],
         parameters: vec![],
         columns: vec![giggles_core::relational::ColumnDef {
@@ -63,12 +63,18 @@ pub(super) fn execute(query: &ExplainQuery, session: &mut Session) -> R<SqlResul
     // Recheck authority and bind against the current schema on every execution.
     let p = core(session.prepare(&query.sql))?;
     core(session.describe(&p))?;
+    if query.verbose && (query.table.is_some() || query.output.is_empty()) { return Err("0A000"); }
     let mut lines = if query.modification == Some("Insert") {
         vec!["Result".into()]
     } else if let Some(table) = &query.table {
-        let p = core(session.prepare(&format!("EXPLAIN {}", query.read_sql)))?;
-        let table_key = p.table().ok_or("0A000")?.to_owned();
-        let Some(Value::Text(facts)) = core(session.explain_facts(&p))? else {
+        let sql = format!("EXPLAIN {}", query.read_sql);
+        let (table_key, facts) = if query.modification.is_some() {
+            core(session.explain_mutation_facts(&p, &sql))?
+        } else {
+            let read = core(session.prepare(&sql))?;
+            (read.table().ok_or("0A000")?.to_owned(), core(session.explain_facts(&read))?)
+        };
+        let Some(Value::Text(facts)) = facts else {
             return Err("0A000");
         };
         // Grouping uses an ordered BTreeMap, not PostgreSQL's HashAggregate.
@@ -157,6 +163,35 @@ pub(super) fn execute(query: &ExplainQuery, session: &mut Session) -> R<SqlResul
             &[],
             lines,
         );
+    }
+    if query.json {
+        // Restrict JSON to the Result shape until its remaining node attributes
+        // can be supplied from execution facts rather than guessed.
+        if lines != ["Result"] || query.analyze || query.verbose { return Err("0A000"); }
+        lines = vec!["[\n  {\n    \"Plan\": {\n      \"Node Type\": \"Result\",\n      \"Parallel Aware\": false,\n      \"Async Capable\": false,\n      \"Disabled\": false\n    }\n  }\n]".into()];
+    } else {
+        if query.analyze {
+            // These profiles have one access node (and optionally a mutation).
+            // Complex operators need per-operator counters before admission.
+            if query.limit || lines.iter().any(|l| l.contains("Aggregate") || l.trim_start().starts_with("Sort")) { return Err("0A000"); }
+            let result = core(session.execute_prepared_unreleased(&p, &[]))?;
+            let result = core(session.release_page(result))?.into_inner();
+            let count = if query.modification.is_some() { result.affected as usize } else { result.rows.len() };
+            for (i, line) in lines.iter_mut().enumerate() {
+                if i == 0 || line.contains("->") {
+                    let rows = if i == 0 && query.modification.is_some() { result.rows.len() } else { count };
+                    line.push_str(&format!(" (actual rows={rows}.00 loops=1)"));
+                }
+            }
+            if lines.iter().any(|l| l.contains("Index Scan")) {
+                let indent = if query.modification.is_some() { "        " } else { "  " };
+                lines.push(format!("{indent}Index Searches: 1"));
+            }
+        }
+        if query.verbose {
+            if query.table.is_some() || query.output.is_empty() { return Err("0A000"); }
+            lines.push(format!("  Output: {}", query.output.join(", ")));
+        }
     }
     Ok(SqlResult {
         columns: vec!["QUERY PLAN".into()],

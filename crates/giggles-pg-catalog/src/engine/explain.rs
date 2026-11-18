@@ -11,39 +11,49 @@ pub struct ExplainQuery {
     pub filter_columns: Vec<String>,
     pub sort: Vec<String>,
     pub limit: bool,
+    pub analyze: bool,
+    pub verbose: bool,
+    pub json: bool,
+    pub output: Vec<String>,
 }
 
-/// Recognize only the COSTS OFF text profile. Other options retain their old route.
+/// Deterministic presentation profile; host-dependent costs and timing remain unsupported.
 fn statement(sql: &str) -> R<Option<Box<a::Statement>>> {
-    if !sql
-        .trim_start()
-        .get(..7)
-        .is_some_and(|s| s.eq_ignore_ascii_case("explain"))
-    {
-        return Ok(None);
-    }
-    if sql.len() > 65_536 {
-        return Err(Error::Limit);
-    }
+    if !sql.trim_start().get(..7).is_some_and(|s| s.eq_ignore_ascii_case("explain")) { return Ok(None); }
+    if sql.len() > 65_536 { return Err(Error::Limit); }
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(|_| Error::Syntax)?;
-    let [
-        a::Statement::Explain {
-            analyze: false,
-            verbose: false,
-            query_plan: false,
-            statement,
-            format: None,
-            options: Some(options),
-            ..
-        },
-    ] = statements.as_slice()
-    else {
-        return Ok(None);
-    };
-    if options.len() != 1 || !options[0].to_string().eq_ignore_ascii_case("COSTS OFF") {
-        return Ok(None);
-    }
+    let [a::Statement::Explain { statement, .. }] = statements.as_slice() else { return Ok(None); };
     Ok(Some(statement.clone()))
+}
+
+fn profile(sql: &str) -> R<(bool, bool, bool)> {
+    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(|_| Error::Syntax)?;
+    let [a::Statement::Explain { analyze, verbose, format, options, .. }] = statements.as_slice() else { return Err(Error::Unsupported); };
+    let mut analyze = *analyze;
+    let mut verbose = *verbose;
+    let mut json = format.as_ref().is_some_and(|f| f.to_string().eq_ignore_ascii_case("JSON"));
+    let mut costs = true;
+    let mut timing = true;
+    let mut summary = true;
+    let mut buffers = true;
+    for option in options.iter().flatten() {
+        let text = option.to_string().to_ascii_uppercase();
+        let words: Vec<_> = text.split_whitespace().collect();
+        let value = match words.get(1).copied() {
+            None | Some("TRUE" | "ON" | "1") => true,
+            Some("FALSE" | "OFF" | "0") => false,
+            Some("JSON" | "TEXT") if words[0] == "FORMAT" => { json = words[1] == "JSON"; continue; }
+            _ => return Err(Error::Unsupported),
+        };
+        match words[0] {
+            "ANALYZE" => analyze = value, "VERBOSE" => verbose = value,
+            "COSTS" => costs = value, "TIMING" => timing = value,
+            "SUMMARY" => summary = value, "BUFFERS" => buffers = value,
+            _ => return Err(Error::Unsupported),
+        }
+    }
+    if costs || (analyze && (timing || summary || buffers)) { return Err(Error::Unsupported); }
+    Ok((analyze, verbose, json))
 }
 
 /// Extract the statement for caller authorization before expression deparsing.
@@ -53,9 +63,8 @@ pub fn explain_statement(sql: &str) -> R<Option<String>> {
 
 /// Deparse the supported shapes after the caller has authorized the statement.
 pub fn explain_query(sql: &str) -> R<Option<ExplainQuery>> {
-    let Some(statement) = statement(sql)? else {
-        return Ok(None);
-    };
+    let Some(statement) = statement(sql)? else { return Ok(None); };
+    let (analyze, verbose, json) = profile(sql)?;
     let mutation = match statement.as_ref() {
         a::Statement::Update { table, selection, from: None, .. } => Some(("Update", table, selection)),
         a::Statement::Delete(delete) if delete.using.is_none() => {
@@ -67,7 +76,7 @@ pub fn explain_query(sql: &str) -> R<Option<ExplainQuery>> {
             matches!(q.body.as_ref(), a::SetExpr::Values(values) if values.rows.len() == 1)) => {
             return Ok(Some(ExplainQuery { sql: statement.to_string(), read_sql: String::new(),
                 modification: Some("Insert"), table: Some(insert.table_name.to_string()),
-                filter: None, filter_columns: vec![], sort: vec![], limit: false }));
+                filter: None, filter_columns: vec![], sort: vec![], limit: false, analyze, verbose, json, output: vec![] }));
         },
         _ => None,
     };
@@ -89,6 +98,7 @@ pub fn explain_query(sql: &str) -> R<Option<ExplainQuery>> {
         .ok_or(Error::Unsupported)?;
         shape.sql = statement.to_string();
         shape.modification = Some(command);
+        shape.analyze = analyze; shape.verbose = verbose; shape.json = json;
         return Ok(Some(shape));
     }
     let a::Statement::Query(query) = statement.as_ref() else {
@@ -177,5 +187,22 @@ pub fn explain_query(sql: &str) -> R<Option<ExplainQuery>> {
         filter_columns,
         sort,
         limit: query.limit.is_some() || query.offset.is_some(),
+        analyze, verbose, json,
+        output: select.projection.iter().map(|item| match item {
+            a::SelectItem::UnnamedExpr(e) | a::SelectItem::ExprWithAlias { expr: e, .. } => viewdef::expr(e, false, 0),
+            _ => Err(Error::Unsupported),
+        }).collect::<R<Vec<_>>>().unwrap_or_default(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explain_profiles() {
+        for sql in ["EXPLAIN (COSTS OFF) SELECT 1", "EXPLAIN (VERBOSE, COSTS OFF) SELECT 1", "EXPLAIN (FORMAT JSON, COSTS OFF) SELECT 1", "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) UPDATE c SET n=11 WHERE id=1"] {
+            assert!(explain_query(sql).unwrap().is_some(), "{sql}");
+        }
+        assert!(explain_query("EXPLAIN (ANALYZE, COSTS OFF) SELECT 1").is_err());
+    }
 }

@@ -191,6 +191,23 @@ async fn oracle_text_on_simple_and_extended_wire() {
             assert_eq!(error.code().unwrap().code(), "0A000", "{sql}");
         }
     }
+    for (sql, expected) in [
+        ("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT 1", vec!["Result (actual rows=1.00 loops=1)"]),
+        ("EXPLAIN (VERBOSE, COSTS OFF) SELECT 1 AS constant", vec!["Result", "  Output: 1"]),
+        ("EXPLAIN (FORMAT JSON, COSTS OFF) SELECT 1", vec!["[\n  {\n    \"Plan\": {\n      \"Node Type\": \"Result\",\n      \"Parallel Aware\": false,\n      \"Async Capable\": false,\n      \"Disabled\": false\n    }\n  }\n]"]),
+    ] {
+        let messages = client.simple_query(sql).await.unwrap();
+        let actual: Vec<_> = messages.iter().filter_map(|m| match m { tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0), _ => None }).collect();
+        assert_eq!(actual, expected, "{sql}");
+    }
+    client.batch_execute("INSERT INTO ex VALUES (1,true,'old')").await.unwrap();
+    client.batch_execute("BEGIN").await.unwrap();
+    let rows = client.query("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) UPDATE ex SET v='new' WHERE id=1", &[]).await.unwrap();
+    assert_eq!(rows.iter().map(|r| r.get::<_,String>(0)).collect::<Vec<_>>(), vec!["Update on ex (actual rows=0.00 loops=1)", "  ->  Index Scan using ex_pkey on ex (actual rows=1.00 loops=1)", "        Index Cond: (id = 1)", "        Index Searches: 1"]);
+    assert_eq!(client.query_one("SELECT v FROM ex WHERE id=1", &[]).await.unwrap().get::<_,String>(0), "new");
+    client.batch_execute("ROLLBACK").await.unwrap();
+    client.batch_execute("GRANT UPDATE ON ex TO other").await.unwrap();
+    assert_eq!(client.query_one("SELECT v FROM ex WHERE id=1", &[]).await.unwrap().get::<_,String>(0), "old");
     drop(client);
     connection.await.unwrap().unwrap();
     let (client, connection) = tokio_postgres::Config::new()
@@ -216,6 +233,9 @@ async fn oracle_text_on_simple_and_extended_wire() {
             assert_eq!(error.code().unwrap().code(), "42501", "{sql}");
         }
     }
+    client.simple_query("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) UPDATE ex SET v='constant'").await.unwrap();
+    let error = client.simple_query("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) UPDATE ex SET v='constant' WHERE id=1").await.unwrap_err();
+    assert_eq!(error.code().unwrap().code(), "42501");
     drop(client);
     connection.await.unwrap().unwrap();
     running.shutdown().await.unwrap();
