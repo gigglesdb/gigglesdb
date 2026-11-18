@@ -150,18 +150,20 @@ async fn ordered_result_sets_quotes_comments_and_empty_queries() {
             .iter()
             .all(|m| matches!(m, SimpleQueryMessage::CommandComplete(0)))
     );
-    // Splitting preserves lexemes; the existing evaluator still rejects
-    // dollar-quoted expressions in the catalog profile.
+    // Splitting preserves dollar-quoted lexemes and their embedded semicolons.
     for literal in ["$$a;b$$", "$tag$a;b$tag$"] {
         let single = format!("SELECT {literal} AS x");
-        let expected = code(c.simple_query(&single).await.unwrap_err());
         assert_eq!(
-            code(
-                c.simple_query(&format!("{single}; SELECT 2 AS y"))
+            values(&c.simple_query(&single).await.unwrap()),
+            ["a;b"]
+        );
+        assert_eq!(
+            values(
+                &c.simple_query(&format!("{single}; SELECT 2 AS y"))
                     .await
-                    .unwrap_err()
+                    .unwrap()
             ),
-            expected
+            ["a;b", "2"]
         );
     }
     assert_eq!(
