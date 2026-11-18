@@ -384,6 +384,11 @@ impl State {
             Ok(None) | Err(giggles_pg_catalog::Error::Syntax) => return Ok(None),
             Err(error) => return Err(catalog_wire::error(error)),
         };
+        if plan.contains_subquery() && !plan.user_relations().is_empty() {
+            let error = CoreError::Task(TaskError::Denied(giggles_core::task::DenyRule::Subquery));
+            self.diagnostic.task_refusal = Some((StatementClass::Catalog, error.clone()));
+            return self.diagnostic.core(Err(error));
+        }
         let epoch = if plan.depends_on_relations() {
             admit(&mut self.diagnostic, session, StatementClass::Catalog)?;
             self.diagnostic.core(session.catalog_snapshot())?.0

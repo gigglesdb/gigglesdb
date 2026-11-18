@@ -34,6 +34,7 @@ fn description(rows: &[Vec<Value>], name: &str, args: &[Value]) -> Value {
 
 #[derive(Debug, Clone)]
 pub struct Plan {
+    contains_subquery: bool,
     query: Query,
     user_relations: BTreeMap<String, Vec<Field>>,
     parameters: usize,
@@ -43,6 +44,10 @@ pub struct Plan {
     view_definitions: bool,
 }
 impl Plan {
+    /// Whether the parsed statement contains a nested query or a WITH clause.
+    pub fn contains_subquery(&self) -> bool {
+        self.contains_subquery
+    }
     pub fn refreshes_view_definitions(&self) -> bool {
         self.view_definitions && self.user_relations.is_empty()
     }
@@ -335,6 +340,8 @@ pub fn plan_gateway_with_relations(
     plan_inner(sql, true, Some(relations))
 }
 struct Scan {
+    queries: usize,
+    contains_subquery: bool,
     view_definitions: bool,
     catalog: bool,
     explicit_catalog: bool,
@@ -351,6 +358,8 @@ struct Scan {
 impl Visitor for Scan {
     type Break = Error;
     fn pre_visit_query(&mut self, q: &a::Query) -> ControlFlow<Error> {
+        self.queries += 1;
+        self.contains_subquery |= self.queries > 1 || q.with.is_some();
         if let Some(with) = &q.with {
             for cte in &with.cte_tables {
                 self.ctes.insert(ident(&cte.alias.name));
@@ -469,6 +478,8 @@ impl Visitor for Scan {
 impl Scan {
     fn new() -> Self {
         Self {
+            queries: 0,
+            contains_subquery: false,
             view_definitions: false,
             catalog: false,
             explicit_catalog: false,
@@ -810,6 +821,7 @@ fn plan_inner(
     let query = c.query(q, &vec![])?;
     let mut plan = finish_plan(query, c.parameters, projection_parameters.0)?;
     if let Some(plan) = &mut plan {
+        plan.contains_subquery = scan.contains_subquery;
         plan.user_relations = c.used_relations;
         plan.view_definitions = scan.view_definitions;
         let mut uses = TextCastParameters(BTreeMap::new(), BTreeMap::new());
@@ -834,6 +846,7 @@ fn finish_plan(
         .collect::<Vec<_>>();
     join_selection::place(&mut query, &parameter_types);
     Ok(Some(Plan {
+        contains_subquery: false,
         user_relations: BTreeMap::new(),
         projection_parameters,
         query,
@@ -5958,6 +5971,23 @@ fn comparison_operand(mut expr: &A) -> &A {
 #[cfg(test)]
 mod relation_dependency_tests {
     use super::*;
+
+    #[test]
+    fn subquery_shape_survives_planning() {
+        for sql in [
+            "SELECT (SELECT count(*) FROM pg_class)",
+            "SELECT oid FROM pg_class WHERE oid IN (SELECT oid FROM pg_class)",
+            "SELECT oid FROM pg_class WHERE EXISTS (SELECT oid FROM pg_namespace)",
+            "SELECT * FROM (SELECT oid FROM pg_class) x",
+            "WITH unused AS (SELECT oid FROM pg_namespace) SELECT oid FROM pg_class",
+            "SELECT oid FROM pg_class WHERE EXISTS (SELECT 1 WHERE EXISTS (SELECT oid FROM pg_namespace))",
+        ] {
+            assert!(plan(sql).unwrap().unwrap().contains_subquery(), "{sql}");
+        }
+        for sql in ["SELECT oid FROM pg_class", "SELECT 'SELECT' FROM pg_class"] {
+            assert!(!plan(sql).unwrap().unwrap().contains_subquery(), "{sql}");
+        }
+    }
 
     #[test]
     fn conservative_dependencies() {

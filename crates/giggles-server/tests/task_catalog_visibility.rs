@@ -247,3 +247,52 @@ async fn non_task_catalog_unchanged() {
         assert_eq!(answer, recorded, "exchange {i}; all answers: {answers:#?}");
     }
 }
+
+const CATALOG_SUBQUERY: &str = "SELECT c.relname FROM pg_class c WHERE c.relnamespace IN (SELECT oid FROM pg_namespace WHERE nspname = 'public') ORDER BY c.relname";
+const MIXED_SUBQUERY: &str = "SELECT relname FROM pg_class WHERE relname IN (SELECT status FROM shipments)";
+
+#[tokio::test]
+async fn catalog_only_subquery_is_filtered_and_uncharged() {
+    filtered_uncharged(CATALOG_SUBQUERY, &[&["shipments"], &["shipments_pkey"]]).await;
+}
+
+#[tokio::test]
+async fn mixed_subqueries_are_denied_and_uncharged() {
+    let (server, _agent, _ordinary, mut wire) = agent_wire().await;
+    seed(&server);
+    let task = server.admin.tasks().get("inc-436").unwrap().unwrap().id;
+    let before = server.admin.task_disclosure(task).unwrap();
+    let queries = [
+        MIXED_SUBQUERY,
+        "SELECT (SELECT status FROM shipments LIMIT 1) FROM pg_class",
+        "SELECT relname FROM pg_class WHERE EXISTS (SELECT status FROM shipments)",
+        "SELECT c.relname FROM pg_class c JOIN (SELECT status FROM shipments) s ON true",
+        "WITH s AS (SELECT status FROM shipments) SELECT c.relname FROM pg_class c JOIN s ON true",
+        "SELECT status FROM shipments WHERE EXISTS (SELECT oid FROM pg_namespace)",
+    ];
+    for sql in queries {
+        for messages in [wire.simple(sql).await, wire.extended(sql, &[], 0).await] {
+            assert_eq!(error_of(&messages), Some(("42501".into(), "denied: subqueries are not allowed in a task statement".into())), "{sql}: {messages:?}");
+            assert!(rows(&messages).is_empty());
+        }
+    }
+    let after = server.admin.task_disclosure(task).unwrap();
+    assert_eq!(after.rows_returned, before.rows_returned);
+    assert_eq!(after.debits.len(), before.debits.len());
+    let records = server.admin.task_read_log(task).unwrap();
+    assert_eq!(records.len(), queries.len() * 2);
+    for record in records {
+        assert_eq!(record.sqlstate_text(), "42501");
+        assert_eq!((record.pages, record.released_rows), (0, 0));
+    }
+}
+
+#[tokio::test]
+async fn non_task_mixed_subquery_remains_allowed() {
+    let (server, _agent, ordinary, _wire) = agent_wire().await;
+    seed(&server);
+    let (_listener, mut wire) = ordinary_wire(&server, &ordinary).await;
+    for messages in [wire.simple(MIXED_SUBQUERY).await, wire.extended(MIXED_SUBQUERY, &[], 0).await] {
+        assert_eq!(error_of(&messages), None, "{messages:?}");
+    }
+}
