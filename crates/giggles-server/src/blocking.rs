@@ -22,6 +22,16 @@ impl Blocking {
         &self,
         context: &giggles_core::Cancellation,
     ) -> Result<OwnedSemaphorePermit, giggles_core::CoreError> {
+        context.check()?;
+        // Tokio assigns released permits directly to FIFO queued waiters before
+        // exposing any surplus to try_acquire, so this cannot overtake a waiter.
+        // Check cancellation first, including when a permit is immediately free.
+        if let Ok(permit) = self.0.clone().try_acquire_owned() {
+            // As in the slow path: a cancel or deadline that lands while the
+            // permit is taken drops it and never submits work.
+            context.check()?;
+            return Ok(permit);
+        }
         let acquire = self.0.clone().acquire_owned();
         tokio::pin!(acquire);
         loop {
@@ -68,6 +78,44 @@ impl Blocking {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn admit_fast_path_cannot_overtake_queued_waiter() {
+        let pool = super::Blocking(std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+        let held = pool.0.clone().acquire_owned().await.unwrap();
+        let context = giggles_core::Cancellation::new(None);
+        let mut queued = Box::pin(pool.admit(&context));
+        pending(queued.as_mut()).await;
+        drop(held);
+        // Poll the newcomer before polling the woken waiter. The released
+        // permit must already belong to the waiter, not the free permit count.
+        let mut newcomer = Box::pin(pool.admit(&context));
+        pending(newcomer.as_mut()).await;
+        let first = timeout(Duration::from_secs(2), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        pending(newcomer.as_mut()).await;
+        drop(first);
+        let second = timeout(Duration::from_secs(2), newcomer)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(second);
+        assert_eq!(pool.0.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_admit_rejects_even_with_free_permit() {
+        let pool = super::Blocking::new();
+        let context = giggles_core::Cancellation::new(None);
+        context.cancel();
+        assert_eq!(
+            pool.admit(&context).await.unwrap_err(),
+            giggles_core::CoreError::Cancelled
+        );
+        assert_eq!(pool.0.available_permits(), super::MAX_BLOCKING);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn authenticated_cancellation_while_all_permits_held_never_submits_work() {
         let pool = super::Blocking::new();
