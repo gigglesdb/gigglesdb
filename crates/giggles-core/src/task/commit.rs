@@ -106,22 +106,33 @@ pub enum ProtectedPoint {
     AfterDenialStage,
 }
 
+/// A trusted pause seam at the [`ProtectedPoint`]s (GD-0061 R3-902, design-7
+/// D9 step 13): called on the committing thread each time a point is
+/// reached, before any armed crash. Set only through the trusted
+/// `Admin::set_protected_hook`, never by environment or network input.
+#[doc(hidden)]
+pub type ProtectedHook = Arc<dyn Fn(ProtectedPoint) + Send + Sync>;
+
 /// The seams armed for one call, read once at its start.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Faults {
     crash: CrashPoint,
     point: Option<ProtectedPoint>,
+    hook: Option<ProtectedHook>,
 }
 
 impl Faults {
-    fn at(self, point: ProtectedPoint) {
+    fn at(&self, point: ProtectedPoint) {
+        if let Some(hook) = &self.hook {
+            hook(point);
+        }
         if self.point == Some(point) {
             crate::storage::crash_now();
         }
     }
 
     /// Just before the sync: `BeforeCommit` and `ErrorBeforeCommit`.
-    fn before_commit(self) -> Result<(), TaskError> {
+    fn before_commit(&self) -> Result<(), TaskError> {
         match self.crash {
             CrashPoint::BeforeCommit => crate::storage::crash_now(),
             CrashPoint::ErrorBeforeCommit => {
@@ -133,7 +144,7 @@ impl Faults {
 
     /// After the sync: `AfterCommit`, then `ErrorAfterCommit` (a lost
     /// response) and `BeforeAck`. `ErrorAfterDecisionCommit` does not apply.
-    fn after_commit(self) -> Result<(), TaskError> {
+    fn after_commit(&self) -> Result<(), TaskError> {
         match self.crash {
             CrashPoint::AfterCommit | CrashPoint::BeforeAck => crate::storage::crash_now(),
             CrashPoint::ErrorAfterCommit => {
@@ -584,8 +595,8 @@ fn commit_checked(
     if db.task_kernel_unsupported() {
         return Err(unsupported());
     }
-    let (crash, point) = session.fault_points()?;
-    let faults = Faults { crash, point };
+    let (crash, point, hook) = session.fault_points()?;
+    let faults = Faults { crash, point, hook };
     let ctx = match (actor, &request) {
         (Actor::Executor(ctx), _) => ctx,
         (Actor::Undo { role, task }, ProtectedRequest::Undo { preview, digest, mode }) => {

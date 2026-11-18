@@ -725,6 +725,8 @@ struct Inner {
     crash: Mutex<CrashPoint>,
     /// The armed protected-commit crash seam (GD-0061 R3-619, D-I).
     protected_point: Mutex<Option<crate::task::commit::ProtectedPoint>>,
+    /// The protected-commit pause seam (GD-0061 R3-902).
+    protected_hook: Mutex<Option<crate::task::commit::ProtectedHook>>,
     decision_hook: Mutex<Option<DecisionHook>>,
     sequences: Mutex<sequences::Live>,
     native_once_owners: Mutex<BTreeMap<native_once::NativeOnceKey, native_once::InFlight>>,
@@ -1239,6 +1241,7 @@ impl Admin {
                 limits,
                 crash: Mutex::new(CrashPoint::None),
                 protected_point: Mutex::new(None),
+                protected_hook: Mutex::new(None),
                 decision_hook: Mutex::new(None),
                 sequences: Mutex::new(sequences::Live::default()),
                 native_once_owners: Mutex::new(BTreeMap::new()),
@@ -1605,6 +1608,18 @@ impl Admin {
         point: Option<crate::task::commit::ProtectedPoint>,
     ) -> Result<(), CoreError> {
         *self.inner.protected_point.lock().map_err(|_| CoreError::Fenced)? = point;
+        Ok(())
+    }
+    /// Installs (or, with `None`, removes) the protected-commit pause seam
+    /// (GD-0061 R3-902): `hook` runs on the committing thread at every
+    /// [`crate::task::ProtectedPoint`] of the calls that start after this.
+    /// Trusted admin handle only; nothing installs one by default.
+    #[doc(hidden)]
+    pub fn set_protected_hook(
+        &self,
+        hook: Option<crate::task::commit::ProtectedHook>,
+    ) -> Result<(), CoreError> {
+        *self.inner.protected_hook.lock().map_err(|_| CoreError::Fenced)? = hook;
         Ok(())
     }
     pub fn export(&self, path: impl AsRef<Path>) -> Result<[u8; 32], CoreError> {
@@ -5724,11 +5739,19 @@ impl SqlSession {
     /// The armed commit crash point and protected-commit seam (R3-619).
     pub(crate) fn fault_points(
         &self,
-    ) -> Result<(CrashPoint, Option<crate::task::commit::ProtectedPoint>), CoreError> {
+    ) -> Result<
+        (
+            CrashPoint,
+            Option<crate::task::commit::ProtectedPoint>,
+            Option<crate::task::commit::ProtectedHook>,
+        ),
+        CoreError,
+    > {
         let inner = &self.admin.inner;
         let crash = *inner.crash.lock().map_err(|_| CoreError::Fenced)?;
         let point = *inner.protected_point.lock().map_err(|_| CoreError::Fenced)?;
-        Ok((crash, point))
+        let hook = inner.protected_hook.lock().map_err(|_| CoreError::Fenced)?.clone();
+        Ok((crash, point, hook))
     }
 }
 

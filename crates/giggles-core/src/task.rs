@@ -64,7 +64,7 @@ pub use commit::{
 };
 // R3-619: the protected commit's crash seams, armed by `Admin::set_protected_point`.
 #[doc(hidden)]
-pub use commit::ProtectedPoint;
+pub use commit::{ProtectedHook, ProtectedPoint};
 pub use ledger::{OperationId, Outcome};
 pub use preview::{preview, PreviewId, PreviewSummary, Surface};
 pub use undo::{
