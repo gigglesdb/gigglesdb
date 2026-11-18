@@ -201,6 +201,58 @@ struct SessionWatcher {
     stop: tokio::sync::oneshot::Sender<()>,
     ended: tokio::sync::watch::Receiver<bool>,
 }
+// Captured before forwarding: watcher cleanup must not erase the connection id.
+#[derive(Clone)]
+struct WriteAudit {
+    ctx: Arc<SpannerContext>,
+    who: Authenticated,
+    connection: Option<u64>,
+}
+impl WriteAudit {
+    fn new(service: &NunyaSpanner, who: &Authenticated) -> Self {
+        Self {
+            ctx: service.ctx.clone(), who: who.clone(),
+            connection: service.watchers.lock().ok().and_then(|w| w.get(&who.session).map(|w| w.connection)),
+        }
+    }
+    fn record(&self, reason: &'static str) {
+        if self.ctx.readlog.write_lifecycle(&LifecycleRecord {
+            kind: LifecycleKind::WriteOutcomeUnknown,
+            at_ms: (self.ctx.clock)(), principal: self.who.principal.to_hex(),
+            session: Some(self.who.session.to_hex()), route: Some(self.ctx.route.as_str().into()),
+            connection: self.connection, actor: LifecycleActor::System, reason,
+        }).is_err() {
+            eprintln!("audit: write outcome unknown record unavailable");
+        }
+    }
+    fn finish(&self, error: Status, reason: Option<&'static str>) -> Status {
+        if error.code() == tonic::Code::Unknown
+            && error.message() == nunya_status(NyCode::WriteOutcomeUnknown).message()
+        {
+            let reason = reason.unwrap_or_else(|| {
+                if let Some(row) = self.ctx.authority.session(self.who.session) {
+                    if matches!(row.revoke_reason, Some(crate::state::model::EndReason::Expired | crate::state::model::EndReason::IdleTimeout))
+                        || row.expires_ms <= (self.ctx.clock)() {
+                        return "expired";
+                    }
+                    if row.ended_ms.is_some() || row.revoke_reason.is_some() {
+                        return "revoked";
+                    }
+                }
+                "upstream_lost"
+            });
+            self.record(reason);
+        }
+        error
+    }
+}
+fn forwarded_transport(error: Status, write: bool) -> Status {
+    if write && matches!(error.code(), tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Cancelled | tonic::Code::DeadlineExceeded) {
+        nunya_status(NyCode::WriteOutcomeUnknown)
+    } else {
+        remote(error)
+    }
+}
 fn ended_status(write: bool) -> Status {
     nunya_status(if write {
         NyCode::WriteOutcomeUnknown
@@ -229,7 +281,7 @@ async fn cancellable<T>(
     tokio::select! {
         biased;
         _ = ended(signal) => Err(ended_status(write)),
-        result = future => result.map_err(remote),
+        result = future => result.map_err(|error| forwarded_transport(error, write)),
     }
 }
 // The receiver is discarded immediately on revocation, including queued results.
@@ -238,6 +290,7 @@ struct EndCheckedStream {
     signal: tokio::sync::watch::Receiver<bool>,
     wake: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     write: bool,
+    audit: Option<WriteAudit>,
 }
 impl EndCheckedStream {
     fn new(
@@ -251,6 +304,13 @@ impl EndCheckedStream {
             signal,
             wake: Box::pin(async move { ended(&mut wake_signal).await }),
             write,
+            audit: None,
+        }
+    }
+    fn error(&mut self, error: Status) -> Status {
+        match self.audit.take() {
+            Some(audit) => audit.finish(error, None),
+            None => error,
         }
     }
 }
@@ -267,7 +327,7 @@ impl Stream for EndCheckedStream {
         }
         if *this.signal.borrow() || this.wake.as_mut().poll(cx).is_ready() {
             this.receiver.take();
-            return std::task::Poll::Ready(Some(Err(ended_status(this.write))));
+            return std::task::Poll::Ready(Some(Err(this.error(ended_status(this.write)))));
         }
         let result = match this.receiver.as_mut() {
             Some(receiver) => receiver.poll_recv(cx),
@@ -275,8 +335,15 @@ impl Stream for EndCheckedStream {
         };
         if *this.signal.borrow() {
             this.receiver.take();
-            return std::task::Poll::Ready(Some(Err(ended_status(this.write))));
+            return std::task::Poll::Ready(Some(Err(this.error(ended_status(this.write)))));
         }
+        let result = match result {
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.receiver.take();
+                std::task::Poll::Ready(Some(Err(this.error(error))))
+            }
+            other => other,
+        };
         if matches!(result, std::task::Poll::Ready(None)) {
             this.receiver.take();
         }
@@ -1115,6 +1182,7 @@ impl NunyaSpanner {
         mut signal: tokio::sync::watch::Receiver<bool>,
         write: bool,
         mut inline_session: Option<String>,
+        outcome_audit: WriteAudit,
     ) -> ResultStream {
         let ctx = self.ctx.clone();
         let watchers = self.watchers.clone();
@@ -1140,7 +1208,7 @@ impl NunyaSpanner {
                     ctx.authority
                         .admit(who.session, Operation::Read)
                         .map_err(|_| ended_status(write))?;
-                    let mut part = part.map_err(remote)?;
+                    let mut part = part.map_err(|error| forwarded_transport(error, write))?;
                     if let Some(session) = inline_session.as_ref()
                         && let Some(transaction) = part.metadata.as_ref().and_then(|m| m.transaction.as_ref()) {
                         track_transaction(&transactions, who.session, session, &transaction.id, if write { TxnState::Dml } else { TxnState::Clean })?;
@@ -1223,7 +1291,9 @@ impl NunyaSpanner {
                 let _ = tx.send(Err(error)).await;
             }
         });
-        Box::pin(EndCheckedStream::new(rx, client_signal, write))
+        let mut stream = EndCheckedStream::new(rx, client_signal, write);
+        stream.audit = Some(outcome_audit);
+        Box::pin(stream)
     }
 }
 fn owned(
@@ -1411,19 +1481,24 @@ impl SpannerService for NunyaSpanner {
             return Ok(Response::new(result));
         }
         let mut client = self.client().await?;
-        let inline = inline_read_write(req.transaction.as_ref());
-        let session = req.session.clone();
-        let mut result = cancellable(&mut signal, write, client.execute_sql(req))
-            .await?
-            .into_inner();
-        self.record_inline(&session, who.session, inline, write, result.metadata.as_ref())?;
-        let tokens = self
-            .rows(&who, &policy, &plan, &mut result)
-            .map_err(|e| after_forward(e, write))?;
-        Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, result.rows.len() as u64, tokens)
-            .map_err(|e| after_forward(e, write))?;
-        self.check_response(&who, &signal, write)?;
-        Ok(Response::new(result))
+        let outcome_audit = WriteAudit::new(self, &who);
+        let unknown_reason = None;
+        let result = async {
+            let inline = inline_read_write(req.transaction.as_ref());
+            let session = req.session.clone();
+            let mut result = cancellable(&mut signal, write, client.execute_sql(req))
+                .await?
+                .into_inner();
+            self.record_inline(&session, who.session, inline, write, result.metadata.as_ref())?;
+            let tokens = self
+                .rows(&who, &policy, &plan, &mut result)
+                .map_err(|e| after_forward(e, write))?;
+            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, result.rows.len() as u64, tokens)
+                .map_err(|e| after_forward(e, write))?;
+            self.check_response(&who, &signal, write)?;
+            Ok(Response::new(result))
+        }.await;
+        result.map_err(|error| outcome_audit.finish(error, unknown_reason))
     }
     async fn execute_streaming_sql(
         &self,
@@ -1480,11 +1555,12 @@ impl SpannerService for NunyaSpanner {
         let mut client = self.client().await?;
         let inline = inline_read_write(req.transaction.as_ref());
         let session = req.session.clone();
+        let outcome_audit = WriteAudit::new(self, &who);
         let upstream = cancellable(&mut signal, write, client.execute_streaming_sql(req))
-            .await?
+            .await.map_err(|error| outcome_audit.finish(error, None))?
             .into_inner();
         Ok(Response::new(
-            self.stream(who, policy, revision, plan, label, upstream, signal, write, inline.then_some(session)),
+            self.stream(who, policy, revision, plan, label, upstream, signal, write, inline.then_some(session), outcome_audit),
         ))
     }
     async fn execute_batch_dml(
@@ -1531,34 +1607,39 @@ impl SpannerService for NunyaSpanner {
             Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), label, 0, vec![])?;
         }
         let mut client = self.client().await?;
-        let inline = inline_read_write(req.transaction.as_ref());
-        let session = req.session.clone();
-        let mut result = cancellable(&mut signal, true, client.execute_batch_dml(req))
-            .await?
-            .into_inner();
-        self.record_inline(&session, who.session, inline, true, result.result_sets.first().and_then(|set| set.metadata.as_ref()))?;
-        if result.result_sets.len() > plans.len() {
-            return Err(ended_status(true));
-        }
-        for (i, set) in result.result_sets.iter_mut().enumerate() {
-            let tokens = self
-                .rows(&who, &policy, &plans[i], set)
-                .map_err(|e| after_forward(e, true))?;
-            Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &labels[i], set.rows.len() as u64, tokens)
-                .map_err(|e| after_forward(e, true))?;
-        }
-        if let Some(s) = &mut result.status {
-            s.message = if s.code == 0 {
-                String::new()
-            } else {
-                redact_status(tonic::Code::from_i32(s.code))
-                    .message()
-                    .to_owned()
-            };
-            s.details.clear();
-        }
-        self.check_response(&who, &signal, true)?;
-        Ok(Response::new(result))
+        let outcome_audit = WriteAudit::new(self, &who);
+        let unknown_reason = None;
+        let result = async {
+            let inline = inline_read_write(req.transaction.as_ref());
+            let session = req.session.clone();
+            let mut result = cancellable(&mut signal, true, client.execute_batch_dml(req))
+                .await?
+                .into_inner();
+            self.record_inline(&session, who.session, inline, true, result.result_sets.first().and_then(|set| set.metadata.as_ref()))?;
+            if result.result_sets.len() > plans.len() {
+                return Err(ended_status(true));
+            }
+            for (i, set) in result.result_sets.iter_mut().enumerate() {
+                let tokens = self
+                    .rows(&who, &policy, &plans[i], set)
+                    .map_err(|e| after_forward(e, true))?;
+                Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &labels[i], set.rows.len() as u64, tokens)
+                    .map_err(|e| after_forward(e, true))?;
+            }
+            if let Some(s) = &mut result.status {
+                s.message = if s.code == 0 {
+                    String::new()
+                } else {
+                    redact_status(tonic::Code::from_i32(s.code))
+                        .message()
+                        .to_owned()
+                };
+                s.details.clear();
+            }
+            self.check_response(&who, &signal, true)?;
+            Ok(Response::new(result))
+        }.await;
+        result.map_err(|error| outcome_audit.finish(error, unknown_reason))
     }
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<ResultSet>, Status> {
         let who = self.authenticate(&req)?;
@@ -1625,6 +1706,7 @@ impl SpannerService for NunyaSpanner {
         let upstream = cancellable(&mut signal, false, self.client().await?.streaming_read(req))
             .await?
             .into_inner();
+        let outcome_audit = WriteAudit::new(self, &who);
         Ok(Response::new(self.stream(
             who,
             policy,
@@ -1635,6 +1717,7 @@ impl SpannerService for NunyaSpanner {
             signal,
             false,
             inline.then_some(session),
+            outcome_audit,
         )))
     }
     async fn begin_transaction(
@@ -1733,22 +1816,28 @@ impl SpannerService for NunyaSpanner {
             vec![],
         )?;
         let mut client = self.client().await?;
-        let result = cancellable(&mut signal, true, client.commit(req)).await;
-        let retry = result.as_ref().is_ok_and(|response| {
-            matches!(
-                response.get_ref().multiplexed_session_retry,
-                Some(commit_response::MultiplexedSessionRetry::PrecommitToken(_))
-            )
-        });
-        if retry && let (Some((session, id)), Some(state)) = (key, state) {
-            track_transaction(&self.transactions, state.owner, &session, &id, state.state)
-                .map_err(|e| after_forward(e, true))?;
-        }
-        let response = result?.into_inner();
-        if !retry && response.commit_timestamp.is_none() {
-            return Err(nunya_status(NyCode::WriteOutcomeUnknown));
-        }
-        Ok(Response::new(response))
+        let outcome_audit = WriteAudit::new(self, &who);
+        let mut unknown_reason = None;
+        let result = async {
+            let result = cancellable(&mut signal, true, client.commit(req)).await;
+            let retry = result.as_ref().is_ok_and(|response| {
+                matches!(
+                    response.get_ref().multiplexed_session_retry,
+                    Some(commit_response::MultiplexedSessionRetry::PrecommitToken(_))
+                )
+            });
+            if retry && let (Some((session, id)), Some(state)) = (key, state) {
+                track_transaction(&self.transactions, state.owner, &session, &id, state.state)
+                    .map_err(|e| after_forward(e, true))?;
+            }
+            let response = result?.into_inner();
+            if !retry && response.commit_timestamp.is_none() {
+                unknown_reason = Some("no_commit_timestamp");
+                return Err(nunya_status(NyCode::WriteOutcomeUnknown));
+            }
+            Ok(Response::new(response))
+        }.await;
+        result.map_err(|error| outcome_audit.finish(error, unknown_reason))
     }
     async fn partition_query(
         &self,
@@ -1977,6 +2066,8 @@ mod tests {
     struct Fake {
         result_token: Mutex<Option<MultiplexedSessionPrecommitToken>>,
         next_commit: Mutex<Option<CommitResponse>>,
+        commit_error: Mutex<Option<tonic::Code>>,
+        sql_error: Mutex<Option<tonic::Code>>,
         begins: Mutex<Vec<BeginTransactionRequest>>,
         rollbacks: Mutex<Vec<(String, Vec<u8>)>>,
         next_transaction: std::sync::atomic::AtomicUsize,
@@ -2191,6 +2282,9 @@ mod tests {
             if self.hold_sql.load(std::sync::atomic::Ordering::Relaxed) {
                 self.release.notified().await;
             }
+            if let Some(code) = self.sql_error.lock().unwrap().take() {
+                return Err(Status::new(code, "upstream error"));
+            }
             if dml {
                 return Ok(Response::new(ResultSet { metadata: transaction.map(|transaction| ResultSetMetadata { transaction: Some(transaction), ..Default::default() }), precommit_token: self.result_token.lock().unwrap().clone(), ..Default::default() }));
             }
@@ -2254,6 +2348,9 @@ mod tests {
             self.commits.lock().unwrap().push(req.into_inner());
             if self.hold_commit.load(std::sync::atomic::Ordering::Relaxed) {
                 self.release.notified().await;
+            }
+            if let Some(code) = self.commit_error.lock().unwrap().take() {
+                return Err(Status::new(code, "upstream error"));
             }
             Ok(Response::new(self.next_commit.lock().unwrap().take().unwrap_or(CommitResponse {
                 commit_timestamp: Some(prost_types::Timestamp { seconds: 1, nanos: 0 }),
@@ -3123,8 +3220,9 @@ mod tests {
         ).unwrap();
         // Keep the watcher false to exercise the authoritative recheck itself.
         let (_signal_tx, signal) = tokio::sync::watch::channel(false);
+        let outcome_audit = WriteAudit::new(&f.svc, &who);
         let mut stream = f.svc.stream(
-            who, policy, revision, plan, req.sql, upstream, signal, false, None,
+            who, policy, revision, plan, req.sql, upstream, signal, false, None, outcome_audit,
         );
         let row = stream.next().await.unwrap().unwrap();
         assert_eq!(row.values.len(), 1);
@@ -4331,6 +4429,59 @@ mod tests {
             f.fake.streaming.load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+    }
+    #[tokio::test]
+    async fn upstream_commit_loss_and_missing_timestamp_are_audited() {
+        for (upstream, expected_reason) in [
+            (Some(tonic::Code::Unavailable), Some("upstream_lost")),
+            (Some(tonic::Code::Aborted), None),
+            (None, Some("no_commit_timestamp")),
+        ] {
+            let records = Arc::new(Mutex::new(vec![]));
+            let lifecycle = Arc::new(Mutex::new(vec![]));
+            let f = Fixture::with_log(Box::new(CaptureLog(records, lifecycle.clone()))).await;
+            let session = f.session().await;
+            let connection = f.svc.watchers.lock().unwrap()[&f.alice].connection;
+            *f.fake.commit_error.lock().unwrap() = upstream;
+            *f.fake.next_commit.lock().unwrap() = Some(CommitResponse::default());
+            let error = f.svc.commit(f.request(CommitRequest { session, ..Default::default() }, "alice")).await.unwrap_err();
+            if expected_reason.is_some() { assert_ended(error, true); }
+            else { assert_eq!(error.code(), tonic::Code::Aborted); }
+            assert_eq!(f.fake.commits.lock().unwrap().len(), 1);
+            let audit = lifecycle.lock().unwrap();
+            assert_eq!(audit.len(), usize::from(expected_reason.is_some()));
+            if let Some(reason) = expected_reason {
+                assert_eq!(audit[0].kind, LifecycleKind::WriteOutcomeUnknown);
+                assert_eq!(audit[0].reason, reason);
+                assert_eq!(audit[0].connection, Some(connection));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn upstream_dml_loss_is_unknown_but_read_is_unchanged() {
+        for write in [false, true] {
+            let records = Arc::new(Mutex::new(vec![]));
+            let lifecycle = Arc::new(Mutex::new(vec![]));
+            let f = Fixture::with_log(Box::new(CaptureLog(records, lifecycle.clone()))).await;
+            let mut req = f.query(if write { "UPDATE customers SET email = @v" } else { "SELECT email FROM customers" }).await;
+            if write {
+                req.transaction = Some(TransactionSelector {
+                    selector: Some(transaction_selector::Selector::Begin(rw_options())),
+                });
+                req.params = Some(prost_types::Struct { fields: [("v".into(), f.token())].into() });
+            }
+            *f.fake.sql_error.lock().unwrap() = Some(tonic::Code::Unavailable);
+            let error = f.svc.execute_sql(f.request(req, "alice")).await.unwrap_err();
+            if write { assert_ended(error, true); }
+            else { assert_eq!(error.code(), tonic::Code::Unavailable); }
+            assert_eq!(f.fake.seen.lock().unwrap().len(), 1);
+            let audit = lifecycle.lock().unwrap();
+            assert_eq!(audit.len(), usize::from(write));
+            if write {
+                assert_eq!(audit[0].kind, LifecycleKind::WriteOutcomeUnknown);
+                assert_eq!(audit[0].reason, "upstream_lost");
+            }
+        }
     }
     #[tokio::test]
     async fn commit_in_flight_is_ny012_after_revocation() {

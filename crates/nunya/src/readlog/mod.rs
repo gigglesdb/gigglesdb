@@ -70,6 +70,8 @@ pub enum LifecycleKind {
     SessionEnded,
     /// A registered connection ended.
     ConnectionEnded,
+    /// A forwarded write has an unknown outcome.
+    WriteOutcomeUnknown,
 }
 /// Non-secret actor responsible for a lifecycle event.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -468,6 +470,7 @@ mod tests {
             }));
         }
         for (kind, code) in [
+            (LifecycleKind::WriteOutcomeUnknown, "write_outcome_unknown"),
             (LifecycleKind::Issued, "issued"), (LifecycleKind::Renewed, "renewed"),
             (LifecycleKind::Revoked, "revoked"), (LifecycleKind::PrincipalDisabled, "principal_disabled"),
             (LifecycleKind::ResumeRefused, "resume_refused"), (LifecycleKind::ConnectionEnded, "connection_ended"),
@@ -477,6 +480,20 @@ mod tests {
         for (actor, code) in [(LifecycleActor::Owner, "owner"), (LifecycleActor::ConfigAdmin, "config_admin"), (LifecycleActor::Socket, "socket")] {
             assert_eq!(serde_json::to_value(actor).unwrap(), code);
         }
+    }
+    #[test]
+    fn write_outcome_unknown_json_is_data_free() {
+        let mut record = lifecycle(LifecycleActor::System);
+        record.kind = LifecycleKind::WriteOutcomeUnknown;
+        record.route = Some("postgres".into());
+        record.connection = Some(7);
+        record.reason = "upstream_lost";
+        let value: serde_json::Value = serde_json::from_slice(&lifecycle_line(&record).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({
+            "kind": "lifecycle", "event": "write_outcome_unknown", "ts": 42,
+            "principal": "01".repeat(16), "session": "02".repeat(16),
+            "route": "postgres", "connection": 7, "actor": "system", "reason": "upstream_lost"
+        }));
     }
     #[test]
     fn file_log_orders_both_record_kinds() {

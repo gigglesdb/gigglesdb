@@ -184,6 +184,28 @@ impl Session {
                 | Pending::Sync => false,
             })
     }
+    fn audit_unknown(&self, reason: &'static str) {
+        if self.ctx.readlog.write_lifecycle(&LifecycleRecord {
+            kind: LifecycleKind::WriteOutcomeUnknown,
+            at_ms: (self.ctx.clock)(),
+            principal: self.principal.to_hex(),
+            session: Some(self.session.to_hex()),
+            route: Some(self.ctx.route.as_str().into()),
+            connection: self.connection,
+            actor: LifecycleActor::System,
+            reason,
+        }).is_err() {
+            eprintln!("audit: write outcome unknown record unavailable");
+        }
+    }
+    fn upstream_lost(&self, error: Refusal) -> Refusal {
+        if self.write_in_flight() {
+            self.audit_unknown("upstream_lost");
+            failure(NyCode::WriteOutcomeUnknown)
+        } else {
+            error
+        }
+    }
     /// Audit and close an ended connection, preserving uncertain write outcomes.
     pub(crate) fn end(&mut self, reason: crate::state::registry::EndReason) -> Actions {
         let code = if self.write_in_flight() {
@@ -206,6 +228,9 @@ impl Session {
             },
         };
         let failed = self.ctx.readlog.write_lifecycle(&record).is_err();
+        if code == NyCode::WriteOutcomeUnknown {
+            self.audit_unknown(record.reason);
+        }
         Actions {
             client: vec![Backend::ErrorResponse(nunya_error(if failed && code == NyCode::SessionEnded {
                 NyCode::ReadLogUnavailable
@@ -1287,7 +1312,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
                     end_connection(agent, &mut upstream, &mut session, reason).await?;
                     return Ok(());
                 }
-                response=upstream.recv()=>session.backend(response?),
+                response=upstream.recv()=>session.backend(response.map_err(|error| session.upstream_lost(error))?),
                 request=agent.recv()=>{
                     let request=request?;
                     if matches!(request,Frontend::Terminate){break;}
@@ -1310,7 +1335,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
                     end_connection(agent, &mut upstream, &mut session, reason).await?;
                     return Ok(());
                 }
-                response=upstream.recv()=>session.backend(response?),
+                response=upstream.recv()=>session.backend(response.map_err(|error| session.upstream_lost(error))?),
                 request=agent.recv()=>session.frontend(request?),
             }
         };
@@ -1325,7 +1350,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
                     end_connection(agent, &mut upstream, &mut session, reason).await?;
                     return Ok(());
                 }
-                result = upstream.send(&actions.upstream) => result?,
+                result = upstream.send(&actions.upstream) => result.map_err(|error| session.upstream_lost(error))?,
             }
         }
         if let Some(reason) = send_or_end(agent, &mut end, &actions.client).await? {
@@ -2229,7 +2254,11 @@ pub(crate) mod tests {
             assert_eq!(out.client.len(), 1);
             assert_eq!(f.records.lock().unwrap().len(), before);
             let lifecycle = f.lifecycle.lock().unwrap();
-            assert_eq!(lifecycle.len(), 1);
+            assert_eq!(lifecycle.len(), if expected == "NY012" { 2 } else { 1 });
+            if expected == "NY012" {
+                assert_eq!(lifecycle[1].kind, LifecycleKind::WriteOutcomeUnknown);
+                assert_eq!(lifecycle[1].reason, "revoked");
+            }
             let record = &lifecycle[0];
             assert_eq!(record.kind, LifecycleKind::ConnectionEnded);
             assert_eq!(record.actor, LifecycleActor::System);
@@ -2253,6 +2282,39 @@ pub(crate) mod tests {
         assert_eq!(records[0].reason, "expired");
         assert_eq!(records[0].connection, Some(7));
         assert!(f.identities.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn upstream_loss_preserves_unknown_write_and_never_replays() {
+        for kind in ["COMMIT", "extended", "SELECT value FROM items", "idle"] {
+            let f = Fixture::new();
+            let mut s = f.session();
+            if kind == "extended" {
+                prepare_admission_portal(&mut s, "INSERT INTO items(value) VALUES (NULL)");
+                s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 });
+            } else if kind != "idle" {
+                s.frontend(Frontend::Query(kind.into()));
+            }
+            let write = kind == "COMMIT" || kind == "extended";
+            let error = s.upstream_lost(failure(NyCode::ProtocolNotAllowed));
+            assert_eq!(error.code, if write { NyCode::WriteOutcomeUnknown } else { NyCode::ProtocolNotAllowed });
+            let records = f.lifecycle.lock().unwrap();
+            assert_eq!(records.len(), usize::from(write));
+            if write {
+                assert_eq!(records[0].kind, LifecycleKind::WriteOutcomeUnknown);
+                assert_eq!(records[0].reason, "upstream_lost");
+            }
+        }
+    }
+    #[test]
+    fn expired_write_has_both_lifecycle_records() {
+        let f = Fixture::new();
+        let mut s = f.session();
+        s.frontend(Frontend::Query("COMMIT".into()));
+        assert_eq!(code(&s.end(crate::state::registry::EndReason::Expired)), "NY012");
+        let records = f.lifecycle.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].kind, LifecycleKind::WriteOutcomeUnknown);
+        assert_eq!(records[1].reason, "expired");
     }
     #[test]
     fn end_audit_failure_with_write_in_flight_is_ny012() {
@@ -2456,6 +2518,85 @@ pub(crate) mod tests {
             server.await.unwrap();
             fake.await.unwrap();
             let _ = connection.await.unwrap();
+        }).await.unwrap();
+    }
+    #[tokio::test]
+    async fn tcp_upstream_recv_loss_never_replays_writes() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            for variant in ["COMMIT", "extended", "SELECT value FROM items"] {
+                let mut f = Fixture::new();
+                let (id, _) = acquire_login(&f, "postgres");
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let ctx = Arc::get_mut(&mut f.ctx).unwrap();
+                ctx.upstream.host = "127.0.0.1".into();
+                ctx.upstream.port = listener.local_addr().unwrap().port();
+                let fake_ctx = f.ctx.clone();
+                let fake = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut wire = Agent { io: Box::new(stream), buffer: BytesMut::new(), ctx: fake_ctx };
+                    wire.startup().await.unwrap();
+                    wire.send(&[Backend::AuthenticationOk,
+                        Backend::BackendKeyData { pid: 123, secret: vec![1,2,3,4] },
+                        Backend::ReadyForQuery(b'I')]).await.unwrap();
+                    assert!(matches!(wire.recv().await.unwrap(), Frontend::Query(_)));
+                    wire.send(&[Backend::CommandComplete("SET".into()), Backend::ReadyForQuery(b'I')]).await.unwrap();
+                    loop {
+                        let reply = match wire.recv().await.unwrap() {
+                            Frontend::Query(sql) => { assert_eq!(sql, variant); break; }
+                            Frontend::Execute { .. } => { assert_eq!(variant, "extended"); break; }
+                            Frontend::Parse { query, .. } => {
+                                assert_eq!(query, "INSERT INTO items(value) VALUES (NULL)");
+                                vec![Backend::ParseComplete]
+                            }
+                            Frontend::Describe { .. } => vec![Backend::ParameterDescription(vec![]), Backend::NoData],
+                            Frontend::Bind { .. } => vec![Backend::BindComplete],
+                            Frontend::Sync => vec![Backend::ReadyForQuery(b'I')],
+                            Frontend::Flush => vec![],
+                            _ => panic!("unexpected fixture request"),
+                        };
+                        wire.send(&reply).await.unwrap();
+                    }
+                    // EOF on the response side, but keep reading to detect any replay.
+                    wire.io.shutdown().await.unwrap();
+                    loop {
+                        match wire.recv().await {
+                            Ok(Frontend::Sync | Frontend::Flush | Frontend::Terminate) => {},
+                            Err(_) => break,
+                            Ok(_) => panic!("gateway replayed work after upstream loss"),
+                        }
+                    }
+                    assert!(tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept()).await.is_err());
+                });
+                let gateway = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = gateway.local_addr().unwrap();
+                let ctx = f.ctx.clone();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = gateway.accept().await.unwrap();
+                    serve_tcp(stream, ctx).await;
+                });
+                let (client, connection) = tokio_postgres::Config::new().host("127.0.0.1").port(addr.port())
+                    .user(format!("session:{}", id.to_hex())).password("login-secret")
+                    .dbname("app").connect(tokio_postgres::NoTls).await.unwrap();
+                let driver = tokio::spawn(connection);
+                let error = if variant == "extended" {
+                    client.execute("INSERT INTO items(value) VALUES (NULL)", &[]).await.unwrap_err()
+                } else {
+                    client.batch_execute(variant).await.unwrap_err()
+                };
+                let write = variant != "SELECT value FROM items";
+                assert_eq!(error.code().map(|c| c.code()), Some(if write { "NY012" } else { "NY010" }));
+                drop(client);
+                server.await.unwrap();
+                fake.await.unwrap();
+                let _ = driver.await.unwrap();
+                let audit = f.lifecycle.lock().unwrap();
+                assert_eq!(audit.len(), usize::from(write));
+                if write {
+                    assert_eq!(audit[0].kind, LifecycleKind::WriteOutcomeUnknown);
+                    assert_eq!(audit[0].reason, "upstream_lost");
+                    assert_eq!(audit[0].session, Some(id.to_hex()));
+                }
+            }
         }).await.unwrap();
     }
     fn code(actions: &Actions) -> &str {

@@ -3194,16 +3194,8 @@ async fn live_pg_ny012_commit_outcome_unknown_no_replay() -> ServeResult<()> {
             let outcome = tokio::time::timeout(Duration::from_secs(10), call).await??;
             checks.check(
                 TEST,
-                if variant == "C" {
-                    "terminated-outcome"
-                } else {
-                    "ny012"
-                },
-                if variant == "C" {
-                    outcome != "ok"
-                } else {
-                    outcome == "NY012"
-                },
+                "ny012",
+                outcome == "NY012",
                 format!("variant={variant} repetition={repetition} outcome={outcome}"),
             );
             tokio::time::sleep(Duration::from_secs(6)).await;
@@ -3217,6 +3209,18 @@ async fn live_pg_ny012_commit_outcome_unknown_no_replay() -> ServeResult<()> {
                 (0..=1).contains(&first) && (0..=1).contains(&second) && first == second,
                 format!("variant={variant} repetition={repetition} first={first} second={second}"),
             );
+            let records = std::fs::read_to_string(h.dir().join("read.log"))?
+                .lines().map(serde_json::from_str::<serde_json::Value>)
+                .collect::<Result<Vec<_>, _>>()?;
+            let reason = if variant == "C" { "upstream_lost" } else { "revoked" };
+            let unknown = records.iter().any(|record| {
+                record["session"] == s.id.to_string()
+                    && record["kind"] == "lifecycle"
+                    && record["event"] == "write_outcome_unknown"
+                    && record["reason"] == reason
+            });
+            checks.check(TEST, "audit-outcome-unknown", unknown,
+                format!("variant={variant} repetition={repetition} reason={reason}"));
             if variant != "C" {
                 let fresh = live_outcome(connect(&h, &format!("session:{}", s.id), &secret).await);
                 checks.check(
