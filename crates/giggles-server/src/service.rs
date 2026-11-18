@@ -771,6 +771,12 @@ impl Service {
             sql,
             zone: Some(SessionZone::Fixed(0)),
             transaction_us: None,
+            zone_setting: None,
+            implicit_ddl: false,
+            #[cfg(test)]
+            control_calls: 0,
+            #[cfg(test)]
+            fast_control_calls: 0,
             sequence_owner_candidates: BTreeSet::new(),
             search_path: String::new(),
             api_path: ApiPathState::default(),
