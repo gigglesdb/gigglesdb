@@ -1,11 +1,13 @@
 //! Pre-split cluster bootstrap for tests and development (GD-0075 R5-24).
 //!
 //! A pre-split database starts with the system range 1 = `[MIN, first_user_key())`
-//! and one user range per interval between consecutive split keys, ranges 2, 3, ...
-//! in key order, all at epoch 1. Voters are assigned round-robin over the nodes.
+//! and subsequent ranges 2, 3, ... bounded by the user split keys and a fixed bound
+//! at the reserved gateway lock tables, in key order, all at epoch 1. The fixed
+//! bound isolates those tables from user Rows ranges. Voters are assigned
+//! round-robin over the nodes.
 use giggles_core::range_api::{
-    Epoch, RangeDescriptor, RangeError, RangeId, RangeWrite, ReplicaDesc, ReplicaRole,
-    SYSTEM_RANGE, first_user_key, split_range_key,
+    Epoch, RangeDescriptor, RangeError, RangeId, RangeSpace, RangeWrite, ReplicaDesc, ReplicaRole,
+    SYSTEM_RANGE, first_user_key, range_key, split_range_key,
 };
 
 use crate::directory;
@@ -13,7 +15,8 @@ use crate::directory;
 /// Descriptors of a pre-split database. `splits` are range keys strictly above
 /// `first_user_key()` in increasing order (each a whole user key or a table/index
 /// prefix, design.md Changes, R5-80 constraint); `nodes` are the node ids;
-/// each range gets `replication` voters (at most the node count), assigned
+/// the reserved gateway lock boundary is included even if absent from `splits`.
+/// Each range gets `replication` voters (at most the node count), assigned
 /// round-robin starting one node later for each successive range.
 pub fn presplit(
     splits: &[Vec<u8>],
@@ -41,6 +44,11 @@ pub fn presplit(
         }
         bounds.push(split.clone());
     }
+    // Keep gateway liveness and DDL locks out of every user Rows range. Existing
+    // clusters retain their layout and rely on membership probes following splits.
+    bounds.push(range_key(RangeSpace::Rows, &(u64::MAX - 6).to_be_bytes()));
+    bounds.sort();
+    bounds.dedup();
     let mut out = Vec::with_capacity(bounds.len());
     for (i, start) in bounds.iter().enumerate() {
         let mut replicas: Vec<ReplicaDesc> = (0..replication)

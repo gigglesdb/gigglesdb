@@ -458,8 +458,8 @@ async fn cluster_status_reports_a_running_cluster() {
     let ranges = status["ranges"].as_array().unwrap();
     assert_eq!(
         ranges.len(),
-        crate::cluster_harness::split_keys().len() + 2,
-        "the system range, the range below the first split key, one range per split key"
+        crate::cluster_harness::split_keys().len() + 3,
+        "the system range, the range below the first split key, one range per split key, the reserved gateway lock range"
     );
     for range in ranges {
         assert!(range["leader"].is_u64(), "range without a leader: {range}");

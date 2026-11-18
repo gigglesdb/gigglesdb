@@ -49,17 +49,31 @@ impl Drop for Root {
     }
 }
 
-/// Three nodes over TLS; range 1 = system, range 2 = every user key.
+/// Three nodes over TLS with the legacy layout: range 1 = system, range 2 = every user key.
 fn start() -> (Root, Vec<ClusterNode>) {
+    start_layout(true)
+}
+
+fn start_layout(legacy: bool) -> (Root, Vec<ClusterNode>) {
+    // Tests of this file run in parallel: a counter keeps their roots apart even when
+    // two start within one clock tick.
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
     let root = Root(std::env::temp_dir().join(format!(
-        "split-scan-{}-{}",
+        "split-scan-{}-{}-{}",
         std::process::id(),
+        STARTED.fetch_add(1, Ordering::Relaxed),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
     )));
-    let layout = presplit(&[], &NODES, 3).unwrap();
+    let mut layout = presplit(&[], &NODES, 3).unwrap();
+    if legacy {
+        // Existing clusters have no separate reserved range. Preserve that layout
+        // so membership probes must follow every split of the last user range.
+        layout.pop();
+        layout.last_mut().unwrap().end = None;
+    }
     let pki = make_pki(&root.0.join("pki"), &NODES);
     let listeners: Vec<_> = NODES
         .iter()
@@ -515,5 +529,51 @@ fn sql_scans_see_each_row_once_while_the_table_splits() {
     drop((sa, sb, sc, a, b, c));
     for node in nodes {
         node.stop();
+    }
+}
+
+/// Keep splitting the range containing the highest Rows key. On the legacy layout
+/// every split moves membership locks; new layouts leave them in their own range.
+#[test]
+fn max_range_splits_preserve_membership_and_exact_scans() {
+    for legacy in [true, false] {
+        let (_root, nodes) = start_layout(legacy);
+        let a = gateway(&nodes[0]);
+        let mut session = a.admin.sql_session();
+        sql(&mut session, "CREATE TABLE t(id INT PRIMARY KEY, p INT)").unwrap();
+        let values = (1..=N).map(|id| format!("({id}, -1)")).collect::<Vec<_>>();
+        for chunk in values.chunks(250) {
+            sql(
+                &mut session,
+                &format!("INSERT INTO t VALUES {}", chunk.join(", ")),
+            )
+            .unwrap();
+        }
+        let keys = row_keys(&fresh_client(&nodes[0]));
+        let at = (1..=12)
+            .map(|i| keys[i * 150].as_slice())
+            .collect::<Vec<_>>();
+        let (splits, batches) = (Splits::default(), Batches::default());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            splits_during_scans(&nodes, &at, &mut session, None, &splits, &batches)
+        }));
+        let fences = a.membership_fences();
+        eprintln!("max-range legacy={legacy}: fences={fences}");
+        let (scans, _, _) = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        assert_eq!(splits.done.load(Ordering::Acquire), 12);
+        assert!(scans >= 12, "legacy={legacy}: {scans} scans");
+        eprintln!(
+            "max-range legacy={legacy}: 12 splits, {scans} exact scan statements, fences={fences}"
+        );
+        if !legacy {
+            assert_eq!(
+                fences, 0,
+                "reserved layout must not fence during user splits"
+            );
+        }
+        drop((session, a));
+        for node in nodes {
+            node.stop();
+        }
     }
 }

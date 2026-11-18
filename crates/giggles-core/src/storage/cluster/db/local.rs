@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::storage::range::RangeStore;
@@ -88,6 +88,19 @@ pub(crate) struct LocalCluster {
     generations: Mutex<HashMap<RangeId, u64>>,
     /// Gateway services (deadlock calls, `txn_live`) by node, for `GatewayPeer`.
     gateways: Mutex<HashMap<u64, Weak<dyn GatewayService>>>,
+    member_route: Mutex<Option<MemberRoute>>,
+}
+
+/// A split child not yet published/elected, for membership retry regressions only.
+struct MemberRoute {
+    child: RangeDescriptor,
+    parent: RangeDescriptor,
+    until: Instant,
+    learned: bool,
+    left_holder: bool,
+    stale: usize,
+    unavailable: usize,
+    granted: usize,
 }
 
 impl LocalCluster {
@@ -151,6 +164,7 @@ impl LocalCluster {
             services: Mutex::new(HashMap::new()),
             generations: Mutex::new(HashMap::new()),
             gateways: Mutex::new(HashMap::new()),
+            member_route: Mutex::new(None),
         });
         // Engines resolve prepared records and run home recovery through this cluster.
         let client: Weak<dyn RangeClient> = Arc::downgrade(&cluster) as Weak<dyn RangeClient>;
@@ -160,6 +174,31 @@ impl LocalCluster {
             cluster.restart(descriptor.id);
         }
         cluster
+    }
+
+    pub(crate) fn member_split_outage(&self, duration: Duration, left_holder: bool) {
+        let key = super::super::txn::ddl::route(&super::super::txn::ddl::liveness_target(1));
+        let parent = self.descriptor_for(&key).unwrap();
+        let mut child = parent.clone();
+        child.id = RangeId(u64::MAX);
+        child.epoch.0 += 1;
+        child.start = range_key(RangeSpace::Rows, &(u64::MAX - 6).to_be_bytes());
+        *self.member_route.lock().unwrap() = Some(MemberRoute {
+            child,
+            parent,
+            until: Instant::now() + duration,
+            learned: false,
+            left_holder,
+            stale: 0,
+            unavailable: 0,
+            granted: 0,
+        });
+    }
+
+    pub(crate) fn member_split_counts(&self) -> (usize, usize, usize) {
+        let route = self.member_route.lock().unwrap();
+        let route = route.as_ref().unwrap();
+        (route.stale, route.unavailable, route.granted)
     }
 
     /// The range holding `key` of `space`.
@@ -231,17 +270,63 @@ impl LocalCluster {
 
 impl RangeClient for LocalCluster {
     fn descriptor_for(&self, range_key: &[u8]) -> Result<RangeDescriptor, RangeError> {
+        if let Some(route) = self.member_route.lock().unwrap().as_ref()
+            && route.learned
+            && route.child.contains(range_key)
+        {
+            return Ok(route.child.clone());
+        }
         self.descriptors
             .iter()
             .find(|d| d.contains(range_key))
             .cloned()
             .ok_or_else(|| RangeError::Corrupt("no range holds the key".into()))
     }
-    fn invalidate(&self, _: &RangeDescriptor) {}
+    fn invalidate(&self, descriptor: &RangeDescriptor) {
+        if let Some(route) = self.member_route.lock().unwrap().as_mut()
+            && route.left_holder
+            && *descriptor == route.parent
+        {
+            // Invalidating the old parent lets the next lookup discover the right child.
+            route.learned = true;
+        }
+    }
+    fn learn(&self, descriptor: &RangeDescriptor) {
+        if let Some(route) = self.member_route.lock().unwrap().as_mut()
+            && *descriptor == route.child
+        {
+            route.learned = true;
+        }
+    }
     fn read(&self, req: ReadRequest) -> Result<ReadPage, RangeError> {
         self.service(req.range)?.read(req)
     }
-    fn lock(&self, req: LockRequest) -> Result<LockGrant, RangeError> {
+    fn lock(&self, mut req: LockRequest) -> Result<LockGrant, RangeError> {
+        if let Some(route) = self.member_route.lock().unwrap().as_mut()
+            && route
+                .child
+                .contains(&super::super::txn::ddl::route(&req.target))
+        {
+            if req.range != route.child.id {
+                // Match a routed client's eager caching of the holder in a StaleEpoch reply.
+                route.learned = !route.left_holder;
+                route.stale += 1;
+                let mut holder = route.child.clone();
+                if route.left_holder {
+                    holder = route.parent.clone();
+                    holder.epoch = route.child.epoch;
+                    holder.end = Some(route.child.start.clone());
+                }
+                return Err(RangeError::StaleEpoch { descriptor: holder });
+            }
+            if Instant::now() < route.until {
+                route.unavailable += 1;
+                return Err(RangeError::NotLeader { hint: None });
+            }
+            route.granted += 1;
+            req.range = route.parent.id;
+            req.epoch = route.parent.epoch;
+        }
         self.service(req.range)?.lock(req)
     }
     fn blockers(&self, range: RangeId, txn: ClusterTxnId) -> Result<Vec<ClusterTxnId>, RangeError> {
@@ -250,7 +335,12 @@ impl RangeClient for LocalCluster {
     fn cancel_wait(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError> {
         self.service(range)?.cancel_wait(txn)
     }
-    fn release(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError> {
+    fn release(&self, mut range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError> {
+        if let Some(route) = self.member_route.lock().unwrap().as_ref()
+            && range == route.child.id
+        {
+            range = route.parent.id;
+        }
         self.service(range)?.release(txn)
     }
     fn heartbeat(&self, range: RangeId, txn: ClusterTxnId) -> Result<(), RangeError> {

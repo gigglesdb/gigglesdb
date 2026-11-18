@@ -151,7 +151,10 @@ fn split_opens_the_right_group_everywhere_and_survives_restart() {
         (right.id, right.epoch, &right.start),
         (RIGHT, Epoch(2), &at)
     );
-    assert_eq!((right.end.clone(), &right.replicas), (None, &left.replicas));
+    assert_eq!(
+        (right.end.clone(), &right.replicas),
+        (Some(table(u64::MAX - 6)), &left.replicas)
+    );
     let split_at = c.applied(leader, PARENT);
     c.wait_applied(PARENT, split_at);
     // Every node hosts the right group; its log starts at the split index.
@@ -159,7 +162,10 @@ fn split_opens_the_right_group_everywhere_and_survives_restart() {
         NODES.iter().all(|&n| c.host(n).group(RIGHT).is_some())
     });
     for node in NODES {
-        assert_eq!(c.host(node).groups(), [RangeId(1), PARENT, RIGHT]);
+        assert_eq!(
+            c.host(node).groups(),
+            [RangeId(1), PARENT, RangeId(3), RIGHT]
+        );
         assert_eq!(
             c.store(node).descriptor(PARENT).unwrap(),
             Some(left.clone())
@@ -209,7 +215,10 @@ fn split_opens_the_right_group_everywhere_and_survives_restart() {
     drop(c);
     let c = start(&dir, CLUSTER, false);
     for node in NODES {
-        assert_eq!(c.host(node).groups(), [RangeId(1), PARENT, RIGHT]);
+        assert_eq!(
+            c.host(node).groups(),
+            [RangeId(1), PARENT, RangeId(3), RIGHT]
+        );
         assert_eq!(
             c.store(node).descriptor(PARENT).unwrap(),
             Some(left.clone())
@@ -259,9 +268,12 @@ fn split_needs_the_leader_and_a_key_inside_the_range() {
     }
     for node in NODES {
         let descriptor = c.store(node).descriptor(PARENT).unwrap().unwrap();
-        assert_eq!((descriptor.epoch, descriptor.end), (Epoch(1), None));
+        assert_eq!(
+            (descriptor.epoch, descriptor.end),
+            (Epoch(1), Some(table(u64::MAX - 6)))
+        );
         assert_eq!(c.store(node).descriptor(RIGHT).unwrap(), None);
-        assert_eq!(c.host(node).groups(), [RangeId(1), PARENT]);
+        assert_eq!(c.host(node).groups(), [RangeId(1), PARENT, RangeId(3)]);
     }
     drop(c);
     let _ = std::fs::remove_dir_all(&dir);

@@ -164,9 +164,9 @@ fn every_range_of_a_presplit_database_is_reachable_from_every_node() {
             .unwrap()
             .as_nanos()
     ));
-    // Range 1 = system keys, ranges 2..=5 split the user keyspaces; 3 voters each.
+    // Range 1 = system, 2..=5 = user Rows, 6 = reserved locks and Index; 3 voters each.
     let descs = presplit(&[table(100), table(200), table(300)], &NODES, 3).unwrap();
-    assert_eq!(descs.len(), 5);
+    assert_eq!(descs.len(), 6);
     let directory: Vec<(Vec<u8>, Vec<u8>)> = directory_records(&descs)
         .unwrap()
         .into_iter()
@@ -199,7 +199,8 @@ fn every_range_of_a_presplit_database_is_reachable_from_every_node() {
             )
             .unwrap(),
         );
-        let store = Arc::new(RangeStore::create(root.join(format!("n{node}/data")), CLUSTER).unwrap());
+        let store =
+            Arc::new(RangeStore::create(root.join(format!("n{node}/data")), CLUSTER).unwrap());
         for d in hosted_by(&descs, node) {
             store.create_range(&d).unwrap();
         }
@@ -244,7 +245,7 @@ fn every_range_of_a_presplit_database_is_reachable_from_every_node() {
         (table(150), &descs[2]),
         (table(250), &descs[3]),
         (table(350), &descs[4]),
-        (range_key(RangeSpace::Index, &[7; 9]), &descs[4]),
+        (range_key(RangeSpace::Index, &[7; 9]), &descs[5]),
     ];
     for (node, host, transport) in &nodes {
         let client = RoutedRangeClient::new(

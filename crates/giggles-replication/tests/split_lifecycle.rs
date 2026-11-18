@@ -135,7 +135,8 @@ fn ensure_split(c: &Cluster, range: RangeId, at: &[u8], right: RangeId, from: Ep
 }
 
 /// Every node: the same descriptors for `ranges`, which tile the user key space, a
-/// group for each, and exactly the expected rows inside each range's bounds.
+/// group for each, and exactly the expected rows inside each range's bounds. The
+/// reserved locks and Index range remains above these user Rows ranges.
 fn check_ranges(c: &Cluster, expected: &Rows, ranges: &[RangeId]) {
     let mut tiles: Vec<_> = ranges
         .iter()
@@ -146,7 +147,7 @@ fn check_ranges(c: &Cluster, expected: &Rows, ranges: &[RangeId]) {
     for pair in tiles.windows(2) {
         assert_eq!(pair[0].end.as_ref(), Some(&pair[1].start));
     }
-    assert_eq!(tiles.last().unwrap().end, None);
+    assert_eq!(tiles.last().unwrap().end, Some(table(u64::MAX - 6)));
     for n in NODES {
         for d in &tiles {
             assert_eq!(c.store(n).descriptor(d.id).unwrap().as_ref(), Some(d));

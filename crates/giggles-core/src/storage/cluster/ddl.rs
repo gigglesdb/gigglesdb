@@ -134,6 +134,7 @@ type MemberSource = dyn Fn() -> Result<Vec<u16>, RangeError> + Send + Sync;
 pub(super) struct Membership {
     member_source: Mutex<Option<Arc<MemberSource>>>,
     state: Mutex<MemberState>,
+    join: Mutex<()>,
     changed: Condvar,
     /// Proxies this gateway runs for other gateways' DDL transactions.
     proxies: Mutex<HashMap<ClusterTxnId, Arc<Proxy>>>,
@@ -152,6 +153,7 @@ struct MemberState {
     /// Commit calls running now.
     inflight: usize,
     fenced_at: Option<Instant>,
+    fences: u64,
 }
 
 fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -171,7 +173,9 @@ impl Membership {
                 joins: 0,
                 inflight: 0,
                 fenced_at: None,
+                fences: 0,
             }),
+            join: Mutex::new(()),
             changed: Condvar::new(),
             proxies: Mutex::new(HashMap::new()),
             opened: Mutex::new(HashMap::new()),
@@ -279,8 +283,22 @@ impl ClusterTxnServices {
     }
 
     /// Ok (with the current join) while this gateway may serve statements.
+    /// Tries one bounded rejoin before refusing a new statement.
     pub(super) fn check_serving(&self) -> Result<u64, TxnError> {
+        if let Ok(joined) = self.membership.lock().serving() {
+            return Ok(joined);
+        }
+        self.join_once();
         self.membership.lock().serving()
+    }
+
+    pub(crate) fn membership_fences(&self) -> u64 {
+        self.membership.lock().fences
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_background_for_test(&self) {
+        self.stop.store(true, Ordering::Release);
     }
 
     /// Asked before every request that can decide a commit: refused once the validity ended.
@@ -339,7 +357,10 @@ impl ClusterTxnServices {
         let period = self.member_wait();
         let threads: [(&str, Duration, Step); 2] = [
             ("gateway-probe", period, Self::probe_step),
-            ("gateway-ddl-watchdog", WATCHDOG, Self::watchdog),
+            ("gateway-ddl-watchdog", WATCHDOG, |services| {
+                services.watchdog();
+                WATCHDOG
+            }),
         ];
         for (name, period, step) in threads {
             let weak = Arc::downgrade(self);
@@ -356,84 +377,177 @@ impl ClusterTxnServices {
         (self.config.gateway_lease / 4).max(Duration::from_millis(1))
     }
 
-    /// One Shared request of `txn` for `target`, waiting at most `member_wait`: the range it
-    /// was granted in. A refused request releases `txn` there (it may have left a lease).
-    fn member_lock(&self, txn: ClusterTxnId, target: LockTarget) -> Result<RangeId, RangeError> {
-        let descriptor = self.client.descriptor_for(&route(&target))?;
-        let wait = self
-            .member_wait()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        let result = self.client.lock(LockRequest {
-            range: descriptor.id,
-            epoch: descriptor.epoch,
-            txn,
-            priority: MEMBER_PRIORITY,
-            target,
-            mode: RangeLockMode::Shared,
-            timeout_ms: Some(wait),
-        });
-        match result {
-            Ok(_) => Ok(descriptor.id),
-            Err(error) => {
-                if matches!(error, RangeError::StaleEpoch { .. }) {
-                    self.client.invalidate(&descriptor);
+    /// Retries a membership lock until `deadline`, retaining the successful SEND time:
+    /// retry time must never extend the lease that this probe actually proves.
+    fn member_lock(
+        &self,
+        txn: ClusterTxnId,
+        target: LockTarget,
+        deadline: Instant,
+    ) -> Result<(RangeId, Instant), RangeError> {
+        let key = route(&target);
+        let mut delay = Duration::from_millis(1);
+        let resolve = |delay: &mut Duration| loop {
+            match self.client.descriptor_for(&key) {
+                Ok(descriptor) => return Ok(descriptor),
+                Err(error @ (RangeError::NotLeader { .. } | RangeError::Unavailable(_))) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(error);
+                    }
+                    thread::sleep((*delay).min(left));
+                    *delay = (*delay * 2).min(Duration::from_millis(50));
                 }
-                let _ = self.client.release(descriptor.id, txn);
-                Err(error)
+                Err(error) => return Err(error),
+            }
+        };
+        let mut descriptor = resolve(&mut delay)?;
+        loop {
+            let sent = Instant::now();
+            if sent >= deadline {
+                return Err(RangeError::LockTimeout);
+            }
+            let wait = (deadline - sent)
+                .as_millis()
+                .max(1)
+                .try_into()
+                .unwrap_or(u64::MAX);
+            let error = match self.client.lock(LockRequest {
+                range: descriptor.id,
+                epoch: descriptor.epoch,
+                txn,
+                priority: MEMBER_PRIORITY,
+                target: target.clone(),
+                mode: RangeLockMode::Shared,
+                timeout_ms: Some(wait),
+            }) {
+                Ok(_) => return Ok((descriptor.id, sent)),
+                Err(error) => error,
+            };
+            // A transport failure may have left a lease behind.
+            let _ = self.client.release(descriptor.id, txn);
+            match error {
+                RangeError::StaleEpoch { descriptor: holder } => {
+                    self.client.invalidate(&descriptor);
+                    descriptor = if holder.contains(&key) {
+                        self.client.learn(&holder);
+                        holder
+                    } else {
+                        // The parent id may now name only the left child. Resolve the
+                        // key again rather than using a holder that cannot grant it.
+                        resolve(&mut delay)?
+                    };
+                }
+                error @ (RangeError::NotLeader { .. } | RangeError::Unavailable(_)) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(error);
+                    }
+                    thread::sleep(delay.min(left));
+                    delay = (delay * 2).min(Duration::from_millis(50));
+                    if let Some(current) = self.reroute(&key, &descriptor) {
+                        descriptor = current;
+                    }
+                }
+                error => return Err(error),
             }
         }
     }
 
-    /// One join attempt, once no commit call of a fenced past is in flight: under one
-    /// transaction, the DDL lock Shared (no DDL runs) and a probe of this gateway's liveness
+    /// One join attempt, once no commit call of a fenced past is in flight: under a
+    /// join transaction, the DDL lock Shared (no DDL runs) and a probe of this gateway's liveness
     /// key; then Serving, then the transaction ends.
     fn join_once(&self) -> bool {
+        let deadline = Instant::now() + self.member_wait();
+        // Admission and the probe thread share one bounded join, including mutex wait.
+        let _join = loop {
+            match self.membership.join.try_lock() {
+                Ok(join) => break join,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    thread::sleep(left.min(Duration::from_millis(1)));
+                }
+            }
+        };
+        if self.membership.lock().serving().is_ok() {
+            return true;
+        }
+        // A statement may notice expired validity before the next probe does.
+        if self.membership_phase() == Phase::Serving {
+            self.fence();
+        }
         if self.membership.lock().inflight > 0 {
             return false;
         }
         let join = ClusterTxnId(self.next_txn_id().0);
-        let Ok(ddl_range) = self.member_lock(join, ddl_lock_target()) else {
+        let Ok((ddl_range, _)) = self.member_lock(join, ddl_lock_target(), deadline) else {
             return false;
         };
-        let sent = Instant::now();
-        let probe = self.member_lock(join, liveness_target(self.config.node));
-        if let Ok(range) = probe {
+        // A retry releases its transaction's range locks. Use a separate probe owner so
+        // retrying liveness cannot accidentally release the join's DDL lock.
+        let probe_id = ClusterTxnId(self.next_txn_id().0);
+        let probe = self.member_lock(probe_id, liveness_target(self.config.node), deadline);
+        // A split/leader change may have dropped the earlier DDL grant too. Reconfirm it
+        // before Serving, while the liveness probe remains Shared.
+        let confirmed = if probe.is_ok() {
+            self.member_lock(join, ddl_lock_target(), deadline).ok()
+        } else {
+            None
+        };
+        let mut joined = false;
+        if let Ok((range, sent)) = probe {
             // Serving before the DDL lock goes: a DDL that starts next closes this gateway.
             let mut state = self.membership.lock();
-            state.phase = Phase::Serving;
-            state.validity = sent + self.config.gateway_lease;
-            state.joins += 1;
+            if confirmed.is_some() && Instant::now() < sent + self.config.gateway_lease {
+                joined = true;
+                state.phase = Phase::Serving;
+                state.validity = sent + self.config.gateway_lease;
+                state.joins += 1;
+            }
             self.membership.changed.notify_all();
             drop(state);
-            if range != ddl_range {
-                let _ = self.client.release(range, join);
-            }
+            let _ = self.client.release(range, probe_id);
         }
         let _ = self.client.release(ddl_range, join);
-        probe.is_ok()
+        // The reconfirmation may have routed into a new child.
+        if let Some((range, _)) = confirmed
+            && range != ddl_range
+        {
+            let _ = self.client.release(range, join);
+        }
+        joined
     }
 
     /// One renewal probe. Once the validity has passed (granted or not) the gateway fences:
     /// it may have been evicted meanwhile.
-    fn renew(&self) {
+    fn renew(&self) -> bool {
+        // An old renewal must not overwrite the validity of a statement's new join.
+        let _join = guard(&self.membership.join);
+        if self.membership_phase() != Phase::Serving {
+            return false;
+        }
         let probe = ClusterTxnId(self.next_txn_id().0);
-        let sent = Instant::now();
-        let granted = self.member_lock(probe, liveness_target(self.config.node));
-        if let Ok(range) = granted {
+        let deadline = (Instant::now() + self.member_wait()).min(self.membership.lock().validity);
+        let granted = self.member_lock(probe, liveness_target(self.config.node), deadline);
+        if let Ok((range, _)) = granted {
             let _ = self.client.release(range, probe);
         }
         let mut state = self.membership.lock();
         if state.phase != Phase::Serving {
-            return;
+            return false;
         }
         if Instant::now() >= state.validity {
             drop(state);
             self.fence();
-        } else if granted.is_ok() {
+        } else if let Ok((_, sent)) = granted {
             state.validity = sent + self.config.gateway_lease;
+            return true;
         }
+        false
     }
 
     /// Stops serving: every live transaction is marked aborted and fenced (each `gate` now
@@ -445,6 +559,7 @@ impl ClusterTxnServices {
                 return;
             }
             state.phase = Phase::Fenced;
+            state.fences += 1;
             state.fenced_at = Some(Instant::now());
             for txn in guard(&self.txns).values_mut() {
                 txn.aborted = true;
@@ -463,13 +578,16 @@ impl ClusterTxnServices {
         }
     }
 
-    fn probe_step(&self) {
-        match self.membership_phase() {
+    fn probe_step(&self) -> Duration {
+        let granted = match self.membership_phase() {
             Phase::Serving => self.renew(),
-            Phase::Joining | Phase::Fenced => {
-                self.join_once();
-            }
-            Phase::Single => {}
+            Phase::Joining | Phase::Fenced => self.join_once(),
+            Phase::Single => true,
+        };
+        if granted {
+            self.member_wait()
+        } else {
+            self.member_wait().min(Duration::from_millis(50))
         }
     }
 
@@ -879,16 +997,16 @@ impl ClusterTxnServices {
 }
 
 /// One periodic step of a membership thread.
-type Step = fn(&ClusterTxnServices);
+type Step = fn(&ClusterTxnServices) -> Duration;
 
 /// Runs `step` every `period` until the gateway is dropped.
-fn every(services: Weak<ClusterTxnServices>, period: Duration, step: Step) {
+fn every(services: Weak<ClusterTxnServices>, mut period: Duration, step: Step) {
     let Some(stop) = services.upgrade().map(|services| services.stop.clone()) else {
         return;
     };
-    let tick = period.min(Duration::from_millis(50));
     let mut waited = Duration::ZERO;
     while !stop.load(Ordering::Acquire) {
+        let tick = period.min(Duration::from_millis(50));
         thread::sleep(tick);
         waited += tick;
         if waited < period {
@@ -898,6 +1016,6 @@ fn every(services: Weak<ClusterTxnServices>, period: Duration, step: Step) {
         let Some(services) = services.upgrade() else {
             return;
         };
-        step(&services);
+        period = step(&services);
     }
 }

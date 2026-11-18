@@ -231,7 +231,7 @@ fn split_publishes_both_halves_to_the_directory() {
     assert!(right.id.0 > RANGE_ID_BASE, "{right:?}");
     assert_eq!(
         (right.epoch, right.start.clone(), right.end.clone()),
-        (Epoch(2), table(50), None)
+        (Epoch(2), table(50), Some(table(u64::MAX - 6)))
     );
     // A client on another node with an empty cache routes both halves through the directory.
     let other = nodes.iter().find(|n| n.node_id() != l.node_id()).unwrap();

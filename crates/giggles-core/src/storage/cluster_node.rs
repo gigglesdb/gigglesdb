@@ -246,6 +246,12 @@ pub struct ClusterGateway {
 }
 
 impl ClusterGateway {
+    /// Number of membership fences since this gateway was attached.
+    #[doc(hidden)]
+    pub fn membership_fences(&self) -> u64 {
+        self.services.membership_fences()
+    }
+
     /// Supplies additional gateway members to close before DDL. Lookup failures refuse
     /// the DDL with a retryable serialization error.
     pub fn set_member_source(

@@ -1170,3 +1170,62 @@ mod index_build_tests;
 #[cfg(feature = "engine-rocksdb")]
 #[path = "reclaim_tests.rs"]
 mod reclaim_tests;
+
+/// A split child answers StaleEpoch once, then has no leader for less than a lease.
+/// Repeated SELECT starts must stay admitted, including across the old validity end.
+#[test]
+fn member_probe_follows_split_child_without_fencing() {
+    // Exercise both a right-child hint and the usual left-child holder reply.
+    for left_holder in [false, true] {
+        let cluster = LocalCluster::new(&[]);
+        let gateway = member(&cluster, 1, &[1]);
+        let mut session = gateway.admin.sql_session();
+        cluster.member_split_outage(Duration::from_millis(700), left_holder);
+        let until = std::time::Instant::now() + Duration::from_millis(1_200);
+        while std::time::Instant::now() < until {
+            assert_eq!(gateway.services.membership_phase(), Phase::Serving);
+            assert_eq!(ints(&run(&mut session, "SELECT 1")), vec![vec![1]]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (stale, unavailable, granted) = cluster.member_split_counts();
+        assert_eq!(stale, 1);
+        assert!(unavailable > 1 && granted > 0, "{unavailable}, {granted}");
+        // Exercise both reserved targets on a fresh join through the child too.
+        let second = member(&cluster, 2, &[2]);
+        assert_eq!(second.services.membership_phase(), Phase::Serving);
+        // The join's DDL target also follows an unpublished, temporarily leaderless child.
+        let joining = LocalCluster::new(&[]);
+        joining.member_split_outage(Duration::from_millis(100), left_holder);
+        let joined = member(&joining, 1, &[1]);
+        assert_eq!(joined.services.membership_phase(), Phase::Serving);
+        let (stale, unavailable, granted) = joining.member_split_counts();
+        assert_eq!(stale, 1);
+        assert!(unavailable > 1 && granted >= 3, "{unavailable}, {granted}");
+    }
+}
+
+/// Recovery at statement admission must not depend on the next background probe.
+#[test]
+fn a_fenced_gateway_rejoins_at_its_next_select() {
+    let cluster = LocalCluster::new(&splits());
+    let gateway = member(&cluster, 1, &[1]);
+    let mut session = gateway.admin.sql_session();
+    let range = cluster
+        .descriptor_for(&route(&liveness_target(1)))
+        .unwrap()
+        .id;
+    cluster.stop(range);
+    wait_until("gateway fences", || {
+        gateway.services.membership_phase() == Phase::Fenced
+    });
+    gateway.services.stop_background_for_test();
+    // Drain any already running bounded join; there can be no background recovery.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(session.execute_at("SELECT 1", &[], None, &clock()).is_err());
+    assert_eq!(gateway.services.membership_fences(), 1);
+    cluster.restart(range);
+    assert_eq!(gateway.services.membership_phase(), Phase::Fenced);
+    assert_eq!(ints(&run(&mut session, "SELECT 1")), vec![vec![1]]);
+    assert_eq!(gateway.services.membership_phase(), Phase::Serving);
+    assert_eq!(gateway.services.membership_fences(), 1);
+}

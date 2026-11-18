@@ -1,8 +1,6 @@
 //! Pre-split bootstrap (GD-0075 R5-24): descriptors, round-robin voters, directory
 //! records, and routing every key of a pre-split database to its range.
-use giggles_core::range_api::{
-    RangeId, RangeSpace, SYSTEM_RANGE, first_user_key, range_key,
-};
+use giggles_core::range_api::{RangeId, RangeSpace, SYSTEM_RANGE, first_user_key, range_key};
 use giggles_replication::{
     bootstrap::{directory_records, hosted_by, presplit},
     directory::{decode_record, record_key},
@@ -17,7 +15,7 @@ fn table(id: u64) -> Vec<u8> {
 fn presplit_builds_contiguous_ranges_with_round_robin_voters() {
     let splits = [table(10), table(20), table(30)];
     let descs = presplit(&splits, &[3, 1, 2, 4], 3).unwrap();
-    assert_eq!(descs.len(), 5);
+    assert_eq!(descs.len(), 6);
     assert_eq!(descs[0].id, SYSTEM_RANGE);
     assert_eq!(descs[0].start, Vec::<u8>::new());
     assert_eq!(descs[0].end, Some(first_user_key()));
@@ -34,10 +32,11 @@ fn presplit_builds_contiguous_ranges_with_round_robin_voters() {
         expected.sort_unstable();
         assert_eq!(nodes, expected);
     }
-    assert_eq!(descs[4].end, None);
+    assert_eq!(descs[4].end, Some(table(u64::MAX - 6)));
+    assert_eq!(descs[5].end, None);
     // Every node hosts some ranges; together each range is hosted three times.
     let hosted: usize = (1..=4).map(|n| hosted_by(&descs, n).len()).sum();
-    assert_eq!(hosted, 5 * 3);
+    assert_eq!(hosted, 6 * 3);
     // Replication is capped by the node count.
     assert!(presplit(&[], &[7], 3).unwrap()[0].replicas.len() == 1);
 }
@@ -76,9 +75,15 @@ fn every_key_routes_to_its_range_and_records_round_trip() {
         (table(1), 2),
         (table(9), 2),
         (table(10), 3),
-        (range_key(RangeSpace::Rows, &[0, 0, 0, 0, 0, 0, 0, 15, 7]), 3),
+        (
+            range_key(RangeSpace::Rows, &[0, 0, 0, 0, 0, 0, 0, 15, 7]),
+            3,
+        ),
         (table(20), 4),
-        (range_key(RangeSpace::Index, &[1]), 4),
+        (table(u64::MAX - 7), 4),
+        (table(u64::MAX - 6), 5),
+        (table(u64::MAX - 5), 5),
+        (range_key(RangeSpace::Index, &[1]), 5),
     ];
     for (key, range) in probes {
         assert_eq!(cache.lookup(&key).unwrap().id, RangeId(range), "{key:02x?}");

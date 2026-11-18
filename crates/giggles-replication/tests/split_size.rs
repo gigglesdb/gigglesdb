@@ -44,7 +44,7 @@ impl Drop for Root {
 }
 
 /// Three nodes over TLS. `whole`: range 1 = the system range over every key; otherwise the
-/// presplit layout (range 1 = system, range 2 = every user key).
+/// presplit layout (range 1 = system, range 2 = user Rows, range 3 = reserved locks and Index).
 fn start(whole: bool) -> (Root, Vec<ClusterNode>) {
     let root = Root(std::env::temp_dir().join(format!(
         "split-size-{}-{}-{}",
@@ -360,8 +360,16 @@ fn a_range_that_just_split_waits_out_its_cooldown() {
     assert_eq!(first.len(), 1, "{first:?}");
     // Both halves are still above the threshold, wherever their leaders are.
     let sizes = user_ranges(&nodes);
-    assert_eq!(sizes.len(), 2);
-    assert!(sizes.values().all(|&size| size >= THRESHOLD), "{sizes:?}");
+    assert_eq!(sizes.len(), 3);
+    let reserved = nodes[0].layout().last().unwrap().id;
+    assert!(
+        sizes.iter().all(|(&id, &size)| if id == reserved {
+            size < THRESHOLD
+        } else {
+            size >= THRESHOLD
+        }),
+        "{sizes:?}"
+    );
     assert_eq!(pass(&splitters, &cooling), vec![]);
     // Without the cooldown, both split.
     assert_eq!(
