@@ -629,8 +629,8 @@ async fn leader_of(cluster: &ClusterProcs, via: usize, key: &str, avoid: u64) ->
 /// gateway dies after every participant prepared, so u's range holds the writer's gap lock in a
 /// prepared record. Then u's range changes leader. The new leader re-takes the gap lock: an
 /// insert into the gap waits until recovery decides the writer (abort), while an insert outside
-/// it goes through. The gateway holds no replica of u's range, so u's range keeps a majority
-/// while its old leader is down; the old leader then comes back (other ranges need it).
+/// it goes through. The gateway holds no replica of u's, the system or the liveness range, so
+/// these ranges keep a majority while u's old leader is down; the old leader then comes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_prepared_gap_lock_survives_its_gateway_and_a_leader_change() {
     let started = Instant::now();
@@ -645,16 +645,25 @@ async fn a_prepared_gap_lock_survives_its_gateway_and_a_leader_change() {
     // u's first row key: range key of Rows (0x80) || table id BE8 || pk.
     let u_key = format!("80{table:016x}");
     let (_, status) = cluster_status(&cluster.config_path(0));
-    let replicas: Vec<u64> = range_holding(&status, &u_key)
-        .and_then(|r| r["replicas"].as_array())
-        .expect("u's range")
-        .iter()
-        .filter_map(serde_json::Value::as_u64)
+    let protected_ranges = [
+        range_holding(&status, &u_key).expect("u's range"),
+        status["ranges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == 1)
+            .expect("system range (id 1)"),
+        range_holding(&status, "80fffffffffffffff9").expect("gateway-liveness range"),
+    ];
+    let replicas: BTreeSet<u64> = protected_ranges
+        .into_iter()
+        .flat_map(|r| r["replicas"].as_array().expect("range replicas"))
+        .map(|n| n.as_u64().expect("replica node id"))
         .collect();
-    // The gateway: a node other than node 1 with no replica of u's range.
+    // Losing the gateway and u's leader must preserve quorum for all three ranges.
     let gateway = (2..=5_u64)
         .find(|n| !replicas.contains(n))
-        .expect("five nodes, three replicas");
+        .expect("no gateway outside u's, system and gateway-liveness replica sets");
     let g = gateway as usize - 1;
     cluster.kill(g);
     cluster.set_env(g, "GIGGLES_CORE_FAILPOINT", "gateway.commit.prepared");
@@ -691,8 +700,37 @@ async fn a_prepared_gap_lock_survives_its_gateway_and_a_leader_change() {
         .collect();
     let ca = cluster.client(others[0]).await;
     let cb = std::sync::Arc::new(cluster.client(others[1]).await);
-    // Outside the gap: goes through.
-    insert_u(&ca, 50, 50).await;
+    // Wait for both gateways' liveness leases after the leader change. The insert outside
+    // the gap still goes through; the point read checks cb before it tries the locked gap.
+    let deadline = Instant::now() + STATUS_WAIT;
+    for (client, sql, expected) in [
+        (
+            &ca,
+            "INSERT INTO u (id, v) VALUES (50, 50) RETURNING id",
+            50_i64,
+        ),
+        (cb.as_ref(), "SELECT id FROM u WHERE id = 10", 10_i64),
+    ] {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining.min(STATEMENT_WAIT), client.query(sql, &[])).await
+            {
+                Ok(Ok(rows)) => {
+                    assert_eq!(rows.len(), 1, "{sql}");
+                    assert_eq!(rows[0].get::<_, i64>(0), expected, "{sql}");
+                    break;
+                }
+                Ok(Err(e)) if e.code().is_some_and(|code| code.code() == "40001") => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{sql}: gateway still fenced: {e:?}"
+                    );
+                }
+                other => panic!("{sql}: gateway readiness failed: {other:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
     let gap = {
         let cb = cb.clone();
         tokio::spawn(async move {
@@ -705,10 +743,13 @@ async fn a_prepared_gap_lock_survives_its_gateway_and_a_leader_change() {
     };
     tokio::time::sleep(Duration::from_secs(3)).await;
     let held = died.elapsed();
-    assert!(
-        !gap.is_finished() || held >= Duration::from_secs(25),
-        "the insert into the gap was not held by the prepared gap lock ({held:?} after the crash)"
-    );
+    if gap.is_finished() && held < Duration::from_secs(25) {
+        let (result, waited) = gap.await.unwrap();
+        panic!(
+            "the insert into the gap finished early: {result:?}, waited {waited:?} \
+             ({held:?} after the crash)"
+        );
+    }
     // Recovery aborts the writer (its gateway never decided): the insert goes through.
     let (result, waited) = tokio::time::timeout(STATUS_WAIT, gap)
         .await
