@@ -2719,7 +2719,7 @@ impl SqlSession {
                 self.commit_v2_transaction(db)
             }
         });
-        self.settle_sequences()?;
+        let result = result.and_then(|value| self.settle_sequences().map(|()| value));
         if result.is_err() { self.abort(); }
         if self.v2_transaction.is_none() {
             self.xact.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -3308,6 +3308,7 @@ impl SqlSession {
             quoted(&key)
         } else { quoted(name) };
         let result = callback(operation, &qualified, value, called);
+        // Like a callback error here, a settle error does not abort the transaction.
         self.settle_sequences()?;
         match result? {
             relational::Value::Int(value) => Ok(value),
@@ -3344,7 +3345,7 @@ impl SqlSession {
             if let Some(error) = clock.take_error() { return Err(error); }
             output.map_err(CoreError::Sql)
         })();
-        self.settle_sequences()?;
+        let result = result.and_then(|value| self.settle_sequences().map(|()| value));
         if result.is_err() { self.abort(); }
         result
     }
@@ -3367,7 +3368,7 @@ impl SqlSession {
                 prepared.transaction = self.transaction_id;
                 self.execute_bound_engine(&prepared, &[], None)
             })();
-            self.settle_sequences()?;
+            let result = result.and_then(|value| self.settle_sequences().map(|()| value));
             if result.is_err() { self.abort(); }
             return result;
         }

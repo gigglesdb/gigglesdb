@@ -380,8 +380,11 @@ impl SqlSession {
             output.map_err(CoreError::Sql)
         })();
         if result.is_err() {
-            sql_sequences::settle(db, &self.sequence_unsettled)?;
+            // abort() settles best-effort; surface a settle failure instead of a
+            // value-bearing error whose value is not yet durably covered.
+            let settled = sql_sequences::settle(db, &self.sequence_unsettled);
             self.abort();
+            settled?;
         }
         result
     }
@@ -401,7 +404,10 @@ impl SqlSession {
             || p.control() == Some("rollback")
         {
             // Failure after a successful commit is a lost commit response.
-            sql_sequences::settle(db, &self.sequence_unsettled)?;
+            if let Err(error) = sql_sequences::settle(db, &self.sequence_unsettled) {
+                self.abort();
+                return Err(error);
+            }
         }
         result
     }
