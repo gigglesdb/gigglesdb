@@ -746,6 +746,117 @@ fn pipelined_acks_release_slot_and_cover_returns() {
 }
 
 #[cfg(feature = "engine-rocksdb")]
+#[test]
+fn nextval_waiting_on_ack_survives_concurrent_restart() {
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE SEQUENCE restart_pipeline");
+    let mut values = BTreeSet::from([scalar(&mut s, "SELECT nextval('restart_pipeline')")]);
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
+        unreachable!()
+    };
+    db.sequencer.gate_counter_acks(true);
+    // The first durable reservation covers 1..=33. Refills are sent but their
+    // acks stay gated; value 34 must enter await_coverage.
+    for expected in 2..=33 {
+        assert_eq!(
+            scalar(&mut s, "SELECT nextval('restart_pipeline')"),
+            expected
+        );
+        assert!(values.insert(expected));
+    }
+    let admin = f.admin.as_ref().unwrap().clone();
+    let (tx, done) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        tx.send(scalar(
+            &mut admin.sql_session(),
+            "SELECT nextval('restart_pipeline')",
+        ))
+        .unwrap();
+    });
+    let slot = db
+        .sql_counters
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let guard = slot.counter.lock().unwrap();
+        let waiting = guard.waiting_returns == 1 && guard.receiving;
+        drop(guard);
+        if waiting && db.sequencer.held_counter_acks() > 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    assert!(done.try_recv().is_err());
+    let admin = f.admin.as_ref().unwrap().clone();
+    let (tx, restarted) = mpsc::channel();
+    let restart = thread::spawn(move || {
+        let mut s = admin.sql_session();
+        run(&mut s, "BEGIN");
+        run(&mut s, "ALTER SEQUENCE restart_pipeline RESTART WITH 1000");
+        run(&mut s, "COMMIT");
+        tx.send(()).unwrap();
+    });
+    let outcome = restarted.recv_timeout(Duration::from_secs(10));
+    // Always release the ack gate before propagating a failure.
+    db.sequencer.gate_counter_acks(false);
+    outcome.unwrap();
+    restart.join().unwrap();
+    let value = done.recv_timeout(Duration::from_secs(10)).unwrap();
+    waiter.join().unwrap();
+    assert_eq!(value, 34);
+    assert!(values.insert(value));
+    for expected in 1000..1010 {
+        assert_eq!(
+            scalar(&mut s, "SELECT nextval('restart_pipeline')"),
+            expected
+        );
+        assert!(values.insert(expected));
+    }
+    assert_eq!(slot.counter.lock().unwrap().waiting_returns, 0);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn stale_image_nextval_does_not_clobber_restarted_slot() {
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE SEQUENCE stale_slot");
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
+        unreachable!()
+    };
+    let image = db.metadata_state(None).unwrap().sql;
+    let (&id, def) = image.catalog_ext().sequences.iter()
+        .find(|(_, def)| def.name == "stale_slot").unwrap();
+    assert_eq!(scalar(&mut s, "SELECT nextval('stale_slot')"), 1);
+    run(&mut s, "BEGIN");
+    run(&mut s, "ALTER SEQUENCE stale_slot RESTART WITH 1000");
+    run(&mut s, "COMMIT");
+    let incarnation = db.catalog().current_local_view().unwrap().sequences[&id].incarnation;
+    assert_ne!(incarnation, def.incarnation);
+    let slot = db.sql_counters.lock().unwrap().get(&id).unwrap().clone();
+    assert_eq!(slot.counter.lock().unwrap().counter.as_ref().unwrap().incarnation, incarnation);
+    // Bypass the callback's freshness check to exercise the install guard itself.
+    assert_eq!(
+        committed_value(db, &slot, id, def, "nextval", None, false),
+        Err(CoreError::Sql(SqlError::UnknownTable))
+    );
+    assert_eq!(slot.counter.lock().unwrap().counter.as_ref().unwrap().incarnation, incarnation);
+    assert_eq!(scalar(&mut s, "SELECT nextval('stale_slot')"), 1000);
+    assert_eq!(scalar(&mut s, "SELECT nextval('stale_slot')"), 1001);
+}
+
+#[cfg(feature = "engine-rocksdb")]
 fn stress_reservations(iterations: usize) {
     let f = Fixture::new(Engine::V2);
     run(&mut f.session(), "CREATE SEQUENCE stress_pipeline");

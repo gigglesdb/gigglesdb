@@ -172,7 +172,9 @@ impl SqlSession {
                     live.entry(*id).or_default().clone()
                 };
                 let mut current = slot.counter.lock_cancellable()?;
-                if current.counter.as_ref().is_none_or(|current| current.incarnation != counter.incarnation) {
+                if db.catalog().current_local_view()?.sequences.get(id)
+                    .is_some_and(|def| def.incarnation == counter.incarnation)
+                    && current.counter.as_ref().is_none_or(|current| current.incarnation != counter.incarnation) {
                     current.install(counter.clone());
                 }
             }

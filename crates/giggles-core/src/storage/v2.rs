@@ -18,11 +18,14 @@ pub(crate) struct SeqSlot {
     pub(crate) counter: crate::cancellation::WaitMutex<SeqSlotState>,
 }
 
-/// (a) A returned value is covered by an Ok durable ack for its incarnation.
+/// (a) A returned value is covered by an Ok durable ack for its incarnation,
+/// or a committed RESTART/DROP has durably superseded it: the retired
+/// incarnation can never allocate again, including after crash.
 /// (b) Every sent highwater is at most 32 steps beyond an allocated value.
 /// (c) Sends occur under the slot lock in reservation order (sequencer FIFO).
 /// Setval and cycle wrap drain pending writes before moving backwards.
 /// Only matching-incarnation acks may advance durable_hw.
+/// Slots install only the committed-current incarnation.
 #[derive(Default)]
 pub(crate) struct SeqSlotState {
     pub(crate) counter: Option<super::sequences::SeqCounter>,

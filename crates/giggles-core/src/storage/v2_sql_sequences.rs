@@ -208,6 +208,15 @@ fn committed_value(
             .as_ref()
             .is_some_and(|c| c.incarnation == def.incarnation);
         if !in_memory {
+            if !db
+                .catalog()
+                .current_local_view()?
+                .sequences
+                .get(&id)
+                .is_some_and(|current| current.incarnation == def.incarnation)
+            {
+                return Err(CoreError::Sql(SqlError::UnknownTable));
+            }
             if guard.receiving || !guard.inflight.is_empty() {
                 guard = receive_one(slot, guard)?;
                 continue;
@@ -302,17 +311,19 @@ fn committed_value(
         return Ok(result);
     }
     guard.waiting_returns += 1;
-    let outcome = await_coverage(db, slot, guard, &key, def, result);
+    let outcome = await_coverage(db, slot, guard, id, &key, def, result);
     // Even an error or cancellation releases the backwards-move barrier.
     let mut guard = slot.counter.lock().map_err(|_| CoreError::Fenced)?;
     guard.waiting_returns -= 1;
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 fn await_coverage<'a>(
     db: &v2::V2Db,
     slot: &'a v2::SeqSlot,
     mut guard: SlotGuard<'a>,
+    id: u64,
     key: &[u8],
     def: &relational::catalog_ext::SequenceDef,
     result: i64,
@@ -324,7 +335,20 @@ fn await_coverage<'a>(
             .as_ref()
             .is_some_and(|c| c.incarnation == def.incarnation)
         {
-            return Err(CoreError::Sql(SqlError::UnknownTable));
+            if !db
+                .catalog()
+                .current_local_view()?
+                .sequences
+                .get(&id)
+                .is_some_and(|current| current.incarnation == def.incarnation)
+            {
+                // A durable RESTART/DROP retired this incarnation before install.
+                // Its allocated value can never be reissued by this incarnation.
+                return Ok(result);
+            }
+            // With installs restricted to the committed-current incarnation, this cannot happen.
+            debug_assert!(false, "current sequence incarnation missing from slot");
+            return Err(CoreError::Fenced);
         }
         if guard.durable_hw.is_some_and(|hw| {
             if def.increment > 0 {
