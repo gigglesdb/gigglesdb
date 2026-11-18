@@ -22,7 +22,7 @@ export NUNYA_AGENT_RUN_DIR
 cleanup() {
   local rc=$? name
   trap - EXIT
-  for name in gd81-d5-pg gd81-d5-emulator; do
+  for name in "${NUNYA_AGENT_PREFIX:-gd81-d5}-pg" "${NUNYA_AGENT_PREFIX:-gd81-d5}-emulator"; do
     if [[ -f $NUNYA_AGENT_RUN_DIR/owned-$name ]]; then
       docker rm -fv "$name" >/dev/null 2>&1 || rc=1
     fi
