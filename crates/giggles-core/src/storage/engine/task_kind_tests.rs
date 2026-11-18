@@ -355,3 +355,121 @@ fn unknown_bit_25_is_unsupported() {
         );
     }
 }
+
+#[test]
+fn kind_24_requires_task_catalog_bit() {
+    use crate::task::credential::{credential_key, encode_credential, CredentialRecord};
+    let key = credential_key(500, 600);
+    assert_eq!(content_check::required_bits_for_catalog_key(&key).unwrap(), TASK_CATALOG);
+    for key in [credential_key(0, 600), credential_key(500, 0)] {
+        assert!(content_check::required_bits_for_catalog_key(&key).is_err());
+    }
+    let record = CredentialRecord { issued_at: WallClockMs(1), expires_at: None, issued_by: "issuer".into(), verifier: [7; 32] };
+    let encoded = encode_credential(&record).unwrap();
+    assert_eq!(content_check::required_bits_for_catalog_value(&key, &encoded).unwrap(), TASK_CATALOG);
+    let f = setup();
+    let table = create_table(&f);
+    put_task(&f, 2, &task(500, "t", table), TASK_CATALOG | ROLES).unwrap();
+    let mut tx = txn(&f, 3);
+    tx.put(Keyspace::Catalog, key.clone(), encoded).unwrap();
+    // A persisted feature bit already admits subsequent credential writes.
+    f.catalog.commit_ddl(tx).unwrap();
+    let fresh = setup();
+    let mut tx = txn(&fresh, 1);
+    tx.delete(Keyspace::Catalog, key.clone()).unwrap();
+    assert!(fresh.catalog.commit_ddl(tx).is_err());
+    // Historical versions and tombstones must also witness the bit.
+    for tombstone in [false, true] {
+        let f = setup();
+        raw_catalog(&f.mem, key.clone(), 1, Some(encode_credential(&record).unwrap()));
+        if tombstone { raw_catalog(&f.mem, key.clone(), 2, None); }
+        seal(&f.mem);
+        assert!(content_check::check(f.mem.as_ref(), ROLES).is_err());
+        if tombstone { content_check::check(f.mem.as_ref(), TASK_CATALOG | ROLES).unwrap(); }
+    }
+}
+
+#[test]
+fn view_loads_credentials_and_rejects_orphan() {
+    use crate::task::credential::{credential_key, encode_credential, CredentialRecord};
+    let f = setup();
+    let table = create_table(&f);
+    put_task(&f, 2, &task(500, "t", table), TASK_CATALOG | ROLES).unwrap();
+    let record = CredentialRecord { issued_at: WallClockMs(1), expires_at: None, issued_by: "issuer".into(), verifier: [7; 32] };
+    let put = |task, id, tx_id| {
+        let mut tx = txn(&f, tx_id);
+        tx.require_features(TASK_CATALOG | ROLES);
+        tx.put(Keyspace::Catalog, credential_key(task, id), encode_credential(&record).unwrap()).unwrap();
+        f.catalog.commit_ddl(tx)
+    };
+    put(500, 600, 3).unwrap();
+    assert_eq!(view(&f).task_credentials[&600].0, 500);
+    assert_eq!(*view(&f).task_credentials[&600].1, record);
+    let reopened = open(f.mem.clone()).unwrap();
+    assert_eq!(view(&reopened).task_credentials, view(&f).task_credentials);
+    assert!(put(999, 601, 4).is_err());
+    put_task(&f, 5, &task(501, "u", table), TASK_CATALOG | ROLES).unwrap();
+    assert!(put(501, 600, 6).is_err());
+    let mut tx = txn(&f, 7);
+    tx.require_features(TASK_CATALOG);
+    tx.delete(Keyspace::Catalog, credential_key(500, 600)).unwrap();
+    f.catalog.commit_ddl(tx).unwrap();
+    assert!(view(&f).task_credentials.is_empty());
+    put(500, 600, 8).unwrap();
+    // Full-load duplicate and orphan checks, bypassing the overlay.
+    raw_catalog(&f.mem, credential_key(501, 600), 99, Some(encode_credential(&record).unwrap()));
+    seal(&f.mem);
+    assert!(matches!(open(f.mem.clone()), Err(crate::CoreError::Corrupt(_))));
+    let orphan = setup();
+    raw_catalog(&orphan.mem, credential_key(999, 601), 99, Some(encode_credential(&record).unwrap()));
+    seal(&orphan.mem);
+    assert!(matches!(open(orphan.mem.clone()), Err(crate::CoreError::Corrupt(_))));
+}
+
+#[test]
+fn collation_and_credential_records_stay_separate() {
+    use super::catalog_codec::{classify_catalog_key, collation_key, decode_collation, encode_collation, CatalogKind};
+    use crate::task::credential::{credential_key, decode_credential, decode_credential_key, encode_credential, CredentialRecord};
+    // Kind 22 (user collation) and kind 24 (task credential) share one id on purpose.
+    let mut collation = crate::relational::collations::builtin("C").unwrap();
+    collation.name = "mine".into();
+    collation.schema = "public".into();
+    let record = CredentialRecord { issued_at: WallClockMs(1), expires_at: None, issued_by: "issuer".into(), verifier: [7; 32] };
+    let (coll_key, cred_key) = (collation_key(900), credential_key(500, 900));
+    let (coll_value, cred_value) = (encode_collation(&collation).unwrap(), encode_credential(&record).unwrap());
+    assert_eq!((coll_key[0], cred_key[0]), (22, 24));
+    assert_eq!(classify_catalog_key(&coll_key).unwrap(), CatalogKind::Collation);
+    assert_eq!(classify_catalog_key(&cred_key).unwrap(), CatalogKind::TaskCredential);
+    assert_eq!(content_check::required_bits_for_catalog_key(&coll_key).unwrap(), meta::USER_COLLATIONS);
+    assert_eq!(content_check::required_bits_for_catalog_key(&cred_key).unwrap(), TASK_CATALOG);
+    // Neither key or value decodes as the other record type.
+    let mut old_layout = cred_key.clone();
+    old_layout[0] = 22;
+    assert!(classify_catalog_key(&old_layout).is_err());
+    assert!(decode_credential_key(&coll_key).is_err());
+    assert!(decode_credential_key(&old_layout).is_err());
+    assert!(decode_collation(&cred_value).is_err());
+    assert!(decode_credential(&coll_value).is_err());
+
+    let f = setup();
+    let table = create_table(&f);
+    put_task(&f, 2, &task(500, "t", table), TASK_CATALOG | ROLES).unwrap();
+    let mut tx = txn(&f, 3);
+    tx.require_features(TASK_CATALOG | ROLES | meta::USER_COLLATIONS);
+    tx.put(Keyspace::Catalog, coll_key, coll_value).unwrap();
+    tx.put(Keyspace::Catalog, cred_key, cred_value).unwrap();
+    f.catalog.commit_ddl(tx).unwrap();
+    let check = |v: &super::catalog::CatalogView| {
+        assert_eq!(v.collations.len(), 1);
+        assert_eq!(v.collations[&900], collation);
+        assert_eq!(v.task_credentials.len(), 1);
+        assert_eq!(v.task_credentials[&900].0, 500);
+        assert_eq!(*v.task_credentials[&900].1, record);
+    };
+    check(&view(&f));
+    let reopened = open(f.mem.clone()).unwrap();
+    check(&view(&reopened));
+    let all = features(f.mem.as_ref());
+    assert_eq!(all & (TASK_CATALOG | meta::USER_COLLATIONS), TASK_CATALOG | meta::USER_COLLATIONS);
+    content_check::check(f.mem.as_ref(), all).unwrap();
+}

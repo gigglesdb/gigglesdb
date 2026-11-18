@@ -50,8 +50,8 @@ pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatErr
         // Tombstones and history too, like kind 19.
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         super::catalog_label_codec::required_bits(key).map_err(corrupt)
-    } else if key.first() == Some(&crate::task::catalog::TASK_KIND) {
-        // Tombstones and history too: a kind-19 key never hides from old binaries.
+    } else if key.first().is_some_and(|kind| matches!(*kind, crate::task::catalog::TASK_KIND | crate::task::credential::CREDENTIAL_KIND)) {
+        // Tombstones and history too: task catalog keys never hide from old binaries.
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::TASK_CATALOG)
     } else {
@@ -123,6 +123,10 @@ pub(crate) fn required_bits_for_catalog_value(
         CatalogKind::RelationComment => {
             catalog_codec::decode_comment(value).map_err(corrupt)?;
             Ok(super::meta::RELATION_COMMENTS)
+        }
+        CatalogKind::TaskCredential => {
+            crate::task::credential::decode_credential(value).map_err(corrupt)?;
+            Ok(super::meta::TASK_CATALOG)
         }
         CatalogKind::Task => {
             crate::task::catalog::decode_task(key, value).map_err(corrupt)?;
@@ -285,6 +289,7 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
     let mut collations=BTreeMap::new();
     let mut indexes=BTreeMap::new();
     let mut tasks = Vec::new();
+    let mut credentials = BTreeMap::new();
     let mut labels = BTreeMap::new();
     let mut required = 0;
     for item in kv
@@ -358,6 +363,12 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             CatalogKind::Index => {
                 indexes.insert(u64::from_be_bytes(user[1..9].try_into().unwrap()),super::indexes::decode_descriptor(value).map_err(corrupt)?);
             }
+            CatalogKind::TaskCredential => {
+                let (task, id) = crate::task::credential::decode_credential_key(user).map_err(corrupt)?;
+                if credentials.insert(id, task).is_some() {
+                    return Err(corrupt("duplicate credential id"));
+                }
+            }
             CatalogKind::Task => {
                 tasks.push(crate::task::catalog::decode_task(user, value).map_err(corrupt)?);
             }
@@ -413,6 +424,10 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
     super::catalog_label_codec::validate_labels(&labels, tables.values()).map_err(corrupt)?;
     // Task cross rules: names are unique, and a live task's table exists.
     // Revoked tasks may outlive their table.
+    let task_ids: std::collections::BTreeSet<_> = tasks.iter().map(|task| task.id.0).collect();
+    if credentials.values().any(|task| !task_ids.contains(task)) {
+        return Err(corrupt("credential task absent"));
+    }
     let mut task_names = std::collections::BTreeSet::new();
     for task in &tasks {
         if !task_names.insert(task.name.as_str()) {

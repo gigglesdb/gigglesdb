@@ -96,6 +96,8 @@ pub(crate) struct CatalogView {
     /// SQL DDL rebuilds parts from the relational image, and tasks have
     /// their own writer, like roles.
     pub(crate) tasks: BTreeMap<u64, Arc<crate::task::definition::TaskDef>>,
+    /// Credential id -> (task id, persisted verifier record).
+    pub(crate) task_credentials: BTreeMap<u64, (u64, Arc<crate::task::credential::CredentialRecord>)>,
     /// Task name -> id, rebuilt from `tasks`; there is no name record.
     pub(crate) task_names: BTreeMap<String, u64>,
 }
@@ -1513,6 +1515,20 @@ fn apply_record(
                 view.indexes.remove(&id);
             }
         }
+        CatalogKind::TaskCredential => {
+            let (task, id) = crate::task::credential::decode_credential_key(key)?;
+            if let Some((owner, _)) = view.task_credentials.get(&id) {
+                if *owner != task {
+                    return Err(corrupt("duplicate credential id"));
+                }
+            }
+            if let Some(value) = value {
+                let record = crate::task::credential::decode_credential(value)?;
+                view.task_credentials.insert(id, (task, Arc::new(record)));
+            } else {
+                view.task_credentials.remove(&id);
+            }
+        }
         CatalogKind::Task => {
             let id = decode_id(&key[1..])?;
             if let Some(value) = value {
@@ -1627,6 +1643,11 @@ fn finish_view(
         relational::catalog_ext::validate_key_targets(&parts.ext, parts.tables.values(), parts.indexes.iter(), u64::MAX).map_err(|_| corrupt("invalid referenced key or primary birth"))?;
     }
     view.names = names;
+    for (task, _) in view.task_credentials.values() {
+        if !view.tasks.contains_key(task) {
+            return Err(corrupt("credential task absent"));
+        }
+    }
     view.task_names.clear();
     for (id, task) in &view.tasks {
         if view.task_names.insert(task.name.as_str().to_owned(), *id).is_some() {

@@ -9,6 +9,10 @@ pub mod approval;
 #[allow(dead_code)]
 pub(crate) mod authority;
 pub mod catalog;
+pub mod credential;
+#[cfg(test)]
+#[path = "task/credential_tests.rs"]
+mod credential_tests;
 // R3-615: the protected commit; the agent seam (R3-207) calls it.
 #[allow(dead_code)]
 pub(crate) mod commit;

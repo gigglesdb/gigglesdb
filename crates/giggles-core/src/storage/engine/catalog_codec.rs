@@ -838,6 +838,8 @@ pub(crate) enum CatalogKind {
     SqlView,
     RelationComment,
     Task,
+    /// Kind 24: task credential, key 24 | task | credential (GD-0061 R3-1301).
+    TaskCredential,
     /// Kind 21: untrusted-text column label (GD-0061 R3-307).
     ColumnLabel,
 }
@@ -862,6 +864,14 @@ pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError>
         Some(15) if key.len() == 9 => CatalogKind::TypeDefinition,
         Some(23) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::ColumnCollation,
         Some(22) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::Collation,
+        Some(kind)
+            if *kind == crate::task::credential::CREDENTIAL_KIND
+                && key.len() == 17
+                && key[1..9] != [0; 8]
+                && key[9..17] != [0; 8] =>
+        {
+            CatalogKind::TaskCredential
+        }
         Some(16) if key.len() == 9 => CatalogKind::Index,
         Some(17) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::SqlView,
         Some(18) if key.len() == 17 && key[1..9] != [0; 8] => CatalogKind::RelationComment,
