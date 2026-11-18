@@ -20,7 +20,7 @@ async fn segment_socket_case(case: &'static str) {
             wire.send(&[Backend::CommandComplete("SET".into()), Backend::ReadyForQuery(b'I')]).await.unwrap();
             loop {
                 let reply = match wire.recv().await.unwrap() {
-                    Frontend::Query(_) => { assert_eq!(case, "simple"); break; }
+                    Frontend::Query(_) => { assert!(matches!(case, "simple" | "simple_error" | "simple_commit_error")); break; }
                     Frontend::Parse { .. } => vec![Backend::ParseComplete],
                     Frontend::Bind { .. } => vec![Backend::BindComplete],
                     Frontend::Describe { kind: b'P', .. } => vec![Backend::NoData],
@@ -30,7 +30,10 @@ async fn segment_socket_case(case: &'static str) {
                 };
                 wire.send(&reply).await.unwrap();
             }
-            wire.send(&[Backend::CommandComplete(if case == "read" { "SELECT 0" } else { "INSERT 0 1" }.into())]).await.unwrap();
+            if !matches!(case, "simple_error" | "extended_error") {
+                wire.send(&[Backend::CommandComplete(if case == "read" { "SELECT 0" } else { "INSERT 0 1" }.into())]).await.unwrap();
+            }
+            if case.ends_with("error") { wire.send(&[sql_error_fixture("23505")]).await.unwrap(); }
             if case == "idle" { wire.send(&[Backend::ReadyForQuery(b'I')]).await.unwrap(); }
             released.await.unwrap();
             if case == "revoke" {
@@ -52,7 +55,9 @@ async fn segment_socket_case(case: &'static str) {
         let bind = Frontend::Bind { portal: "p".into(), statement: "s".into(),
             param_formats: vec![], params: vec![], result_formats: vec![] };
         let execute = Frontend::Execute { portal: "p".into(), max_rows: 0 };
-        if case == "simple" {
+        if matches!(case, "simple_error" | "simple_commit_error") {
+            close_test_send(&mut agent, Frontend::Query("INSERT INTO items(value) VALUES (NULL)".into())).await;
+        } else if case == "simple" {
             close_test_send(&mut agent, Frontend::Query("INSERT INTO items(value) VALUES (NULL); SELECT 1".into())).await;
         } else if case == "pipeline" {
             let mut bytes = BytesMut::new();
@@ -71,7 +76,13 @@ async fn segment_socket_case(case: &'static str) {
             close_test_send(&mut agent, execute).await;
             close_test_send(&mut agent, Frontend::Sync).await;
         }
-        assert!(matches!(close_test_recv(&mut agent).await, Backend::CommandComplete(_)));
+        if !matches!(case, "simple_error" | "extended_error") {
+            assert!(matches!(close_test_recv(&mut agent).await, Backend::CommandComplete(_)));
+        }
+        if case.ends_with("error") {
+            let error = close_test_recv(&mut agent).await;
+            assert_redacted_commit_error(&[error]);
+        }
         if case == "idle" {
             assert!(matches!(close_test_recv(&mut agent).await, Backend::ReadyForQuery(b'I')));
         }
@@ -80,7 +91,7 @@ async fn segment_socket_case(case: &'static str) {
             f.ctx.authority.revoke(id, crate::state::model::EndReason::AdminRevoked).unwrap();
         }
         let Backend::ErrorResponse(fields) = close_test_recv(&mut agent).await else { panic!("expected loss error") };
-        let unknown = !matches!(case, "read" | "idle");
+        let unknown = !matches!(case, "read" | "idle") && !case.ends_with("error");
         assert!(fields.iter().any(|(k, v)| *k == b'C' && v == if unknown { "NY012" } else { "NY010" }));
         drop(agent);
         server.await.unwrap();
@@ -130,20 +141,111 @@ fn segment_transaction_write_clears_only_at_ready() {
     }
 }
 
+// Keep each response ordered as it would arrive in one Query / Sync segment.
+fn segment_before_error(s: &mut Session, extended: bool, history: &str, complete: bool) {
+    let insert = "INSERT INTO items(value) VALUES (NULL)";
+    let earlier: Vec<(&str, &str)> = match history {
+        "none" => vec![],
+        "same" => vec![(insert, "INSERT 0 1")],
+        "commit" => vec![("BEGIN", "BEGIN"), (insert, "INSERT 0 1"), ("COMMIT", "COMMIT")],
+        "rollback" => vec![("BEGIN", "BEGIN"), (insert, "INSERT 0 1"), ("ROLLBACK", "ROLLBACK")],
+        _ => panic!("unknown test history"),
+    };
+    if extended {
+        for (sql, tag) in &earlier {
+            prepare_admission_portal(s, sql);
+            let out = s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 });
+            assert!(matches!(out.upstream.as_slice(), [Frontend::Execute { .. }]));
+            assert!(!s.backend(Backend::CommandComplete((*tag).into())).close);
+        }
+        prepare_admission_portal(s, insert);
+        let out = s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 });
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Execute { .. }]));
+        s.frontend(Frontend::Sync);
+    } else {
+        let query = earlier.iter().map(|(sql, _)| *sql).chain([insert]).collect::<Vec<_>>().join("; ");
+        let out = s.frontend(Frontend::Query(query));
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Query(_)]));
+        for (_, tag) in &earlier {
+            assert!(!s.backend(Backend::CommandComplete((*tag).into())).close);
+        }
+    }
+    if complete {
+        assert!(!s.backend(Backend::CommandComplete("INSERT 0 1".into())).close);
+    }
+    assert!(s.write_in_flight());
+}
+
 #[test]
-fn segment_error_preserves_unknown_until_ready() {
+fn segment_definite_error_clears_current_transaction_uncertainty() {
     for extended in [false, true] {
-        let f = Fixture::new();
-        let mut s = f.session();
-        if extended {
-            prepare_admission_portal(&mut s, "INSERT INTO items(value) VALUES (NULL)");
-            s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 });
-            s.frontend(Frontend::Sync);
-        } else { s.frontend(Frontend::Query("INSERT INTO items(value) VALUES (NULL)".into())); }
-        s.backend(Backend::ErrorResponse(vec![(b'S', "ERROR".into()), (b'C', "23505".into())]));
-        assert!(s.write_in_flight());
-        assert_eq!(s.upstream_lost(failure(NyCode::ProtocolNotAllowed), true).code, NyCode::WriteOutcomeUnknown);
-        s.backend(Backend::ReadyForQuery(b'I'));
-        assert!(!s.write_in_flight());
+        for complete in [false, true] {
+            for history in ["none", "same"] {
+                for code in ["23505", "40001", "40P01"] {
+                    for revoke in [false, true] {
+                        let f = Fixture::new();
+                        let mut s = f.session();
+                        segment_before_error(&mut s, extended, history, complete);
+                        assert!(!s.backend(sql_error_fixture(code)).close);
+                        assert!(!s.write_in_flight());
+                        if revoke {
+                            let out = s.end(crate::state::registry::EndReason::Revoked);
+                            assert!(out.close);
+                            assert!(matches!(&out.client[0], Backend::ErrorResponse(fields)
+                                if fields.iter().any(|(k, v)| *k == b'C' && v == NyCode::SessionEnded.sqlstate())));
+                        } else {
+                            assert_ne!(s.upstream_lost(failure(NyCode::ProtocolNotAllowed), true).code,
+                                NyCode::WriteOutcomeUnknown);
+                            assert!(!s.backend(Backend::ReadyForQuery(b'I')).close);
+                            assert!(!s.write_in_flight());
+                            assert!(!s.segment_known_failure);
+                            assert!(!s.segment_unresolved_before_failure);
+                        }
+                        assert!(!f.lifecycle.lock().unwrap().iter()
+                            .any(|r| r.kind == LifecycleKind::WriteOutcomeUnknown));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn segment_definite_error_preserves_previously_ended_transaction_uncertainty() {
+    for extended in [false, true] {
+        for history in ["commit", "rollback"] {
+            for revoke in [false, true] {
+                let f = Fixture::new();
+                let mut s = f.session();
+                segment_before_error(&mut s, extended, history, false);
+                assert!(!s.backend(sql_error_fixture("23505")).close);
+                assert!(s.write_in_flight());
+                if revoke {
+                    let out = s.end(crate::state::registry::EndReason::Revoked);
+                    assert!(out.close);
+                    assert!(matches!(&out.client[0], Backend::ErrorResponse(fields)
+                        if fields.iter().any(|(k, v)| *k == b'C' && v == "NY012")));
+                } else {
+                    assert_eq!(s.upstream_lost(failure(NyCode::ProtocolNotAllowed), true).code,
+                        NyCode::WriteOutcomeUnknown);
+                }
+                let audit = f.lifecycle.lock().unwrap();
+                let unknown: Vec<_> = audit.iter().filter(|r| r.kind == LifecycleKind::WriteOutcomeUnknown).collect();
+                assert_eq!(unknown.len(), 1);
+                assert_eq!(unknown[0].reason, if revoke { "revoked" } else { "upstream_lost" });
+                drop(audit);
+                assert!(!s.backend(Backend::ReadyForQuery(b'I')).close);
+                assert!(!s.write_in_flight());
+                assert!(!s.segment_known_failure);
+                assert!(!s.segment_unresolved_before_failure);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn segment_definite_error_then_socket_eof() {
+    for case in ["simple_error", "extended_error", "simple_commit_error", "extended_commit_error"] {
+        segment_socket_case(case).await;
     }
 }

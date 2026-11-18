@@ -444,7 +444,7 @@ fn implicit_commit_error_preserves_boundary_and_drains_deferred() {
         assert!(!error.close);
         assert!(error.upstream.is_empty());
         assert_redacted_commit_error(&error.client);
-        assert!(s.write_in_flight());
+        assert!(!s.write_in_flight());
         if extended {
             assert!(matches!(s.pending.front(), Some(Pending::Sync)));
             assert!(!s.skip);

@@ -652,6 +652,8 @@ impl Session {
             }
             Backend::Refused(b'A') => return Ok(vec![]),
             Backend::ErrorResponse(fields) => {
+                // Terminating errors are intercepted by Upstream::recv.
+                self.segment_known_failure = true;
                 if matches!(self.pending.front(), Some(Pending::Sync)) {
                     // Sync can fail while committing the implicit transaction. Its
                     // ReadyForQuery still ends this segment; later work is deferred.
@@ -785,6 +787,11 @@ impl Session {
             }
             (Pending::Execute(a, _), Backend::CommandComplete(tag)) => {
                 self.ctx.readlog.write(&a.record)?;
+                if self.segment_forwarded_write
+                    && matches!(a.kind, StatementKind::Commit | StatementKind::Rollback)
+                {
+                    self.segment_unresolved_before_failure = true;
+                }
                 let commit = self.aborted && matches!(a.kind, StatementKind::Commit);
                 if matches!(a.kind, StatementKind::Begin) {
                     self.status = b'T';
@@ -802,6 +809,8 @@ impl Session {
                 if matches!(status, b'I' | b'T' | b'E') =>
             {
                 self.segment_forwarded_write = false;
+                self.segment_known_failure = false;
+                self.segment_unresolved_before_failure = false;
                 self.status = status;
                 if status == b'E' {
                     self.aborted = true;

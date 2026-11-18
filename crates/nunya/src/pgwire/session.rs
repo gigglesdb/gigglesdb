@@ -105,6 +105,9 @@ pub struct Session {
     extended_execute_forwarded: bool,
     // A CommandComplete does not decide an implicit transaction before its RFQ.
     segment_forwarded_write: bool,
+    segment_known_failure: bool,
+    // A transaction ended before an error can abort the current transaction.
+    segment_unresolved_before_failure: bool,
     rollback_on_sync: bool,
     last_row_refresh_ms: Option<u64>,
     statement_revision: Option<String>,
@@ -144,6 +147,8 @@ impl Session {
             extended_deferred_bytes: 0,
             extended_execute_forwarded: false,
             segment_forwarded_write: false,
+            segment_known_failure: false,
+            segment_unresolved_before_failure: false,
             rollback_on_sync: false,
             last_row_refresh_ms: None,
             statement_revision: None,
@@ -176,7 +181,8 @@ impl Session {
     pub(crate) fn write_in_flight(&self) -> bool {
         let indeterminate =
             |active: &Active| writes(&active.kind) || matches!(active.kind, StatementKind::Commit);
-        self.segment_forwarded_write
+        (self.segment_forwarded_write
+            && (!self.segment_known_failure || self.segment_unresolved_before_failure))
             || self.active.iter().any(indeterminate)
             || self.pending.iter().any(|pending| match pending {
                 Pending::Execute(active, _) => indeterminate(active),
@@ -603,6 +609,8 @@ impl Session {
                 }
                 self.waiting = false;
                 self.segment_forwarded_write = false;
+                self.segment_known_failure = false;
+                self.segment_unresolved_before_failure = false;
                 self.status = status;
                 if status == b'E' {
                     self.aborted = true;
@@ -658,6 +666,11 @@ impl Session {
                 }
                 active.record.rows = rows;
                 self.ctx.readlog.write(&active.record)?;
+                if self.segment_forwarded_write
+                    && matches!(active.kind, StatementKind::Commit | StatementKind::Rollback)
+                {
+                    self.segment_unresolved_before_failure = true;
+                }
                 let commit = self.aborted && matches!(active.kind, StatementKind::Commit);
                 if recovery(&active.kind) {
                     self.aborted = false;
@@ -679,6 +692,9 @@ impl Session {
                 if !self.waiting {
                     return Err(protocol());
                 }
+                // Upstream::recv already excludes FATAL/PANIC. An ordinary error
+                // aborts all writes in the current transaction, including at commit.
+                self.segment_known_failure = true;
                 // An implicit commit can fail after the last CommandComplete;
                 // the Query still owns responses until its ReadyForQuery.
                 self.empty_pending = false;
