@@ -516,6 +516,8 @@ impl Session {
                             cleanup = Some(name.clone());
                             execute_portal = name;
                         }
+                        self.segment_forwarded_write |=
+                            writes(&p.kind) || matches!(p.kind, StatementKind::Commit);
                         self.pending.push_back(Pending::Execute(
                             Active {
                                 plan: p.plan,
@@ -792,6 +794,7 @@ impl Session {
             (Pending::Sync, Backend::ReadyForQuery(status))
                 if matches!(status, b'I' | b'T' | b'E') =>
             {
+                self.segment_forwarded_write = false;
                 self.status = status;
                 if status == b'E' {
                     self.aborted = true;

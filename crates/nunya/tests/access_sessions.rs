@@ -3918,3 +3918,76 @@ finally:
     checks.finish(TEST, 5);
     Ok(())
 }
+
+// Exercise implicit commits while a deferred trigger holds their closing RFQ.
+async fn live_segment_commit_case(test: &str, revoke: bool, simple: bool, repetitions: usize) -> ServeResult<()> {
+    let admin_url = std::env::var("NUNYA_TEST_PG_ADMIN")?;
+    let (admin, conn) = tokio_postgres::connect(&admin_url, NoTls).await?;
+    let _admin_driver = Driver(tokio::spawn(async move { let _ = conn.await; }));
+    let table = format!("live_segment_{}", nunya::token::SessionId::random().to_hex());
+    let function = format!("{table}_sleep");
+    let _fixture = LiveCommitFixture {
+        table: TableGuard { url: admin_url, name: table.clone() }, function: function.clone(),
+    };
+    admin.batch_execute(&format!(
+        "CREATE TABLE public.{table} (id int); GRANT SELECT, INSERT ON public.{table} TO nunya;
+         CREATE FUNCTION public.{function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$;
+         CREATE CONSTRAINT TRIGGER live_delay AFTER INSERT ON public.{table} DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.{function}()"
+    )).await?;
+    let mut h = ServeHarness::new(&file_sink_policy(), Some(&std::env::var("NUNYA_TEST_PG")?), None, None, "")?;
+    h.start().await?;
+    let mut checks = LiveChecks::default();
+    for repetition in 0..repetitions {
+        let key = i32::try_from(repetition)?;
+        let (s, secret, _) = h.acquire_session(&format!("live-segment-{repetition}"), "postgres", Mode::ReadWrite).await?;
+        let (client, _driver) = session_connect(&h, &s, &secret).await?;
+        let statement = if simple {
+            format!("INSERT INTO public.{table} (id) VALUES ({key}); SELECT 1")
+        } else { format!("INSERT INTO public.{table} (id) VALUES ($1)") };
+        let call = tokio::spawn(async move {
+            if simple { live_outcome(client.simple_query(&statement).await) }
+            else { live_outcome(client.execute(&statement, &[&key]).await) }
+        });
+        let pid = live_sleeping_backend(&admin, &table, None).await?;
+        if revoke { h.admin().revoke(&s.id).await?; }
+        else { admin.query_one("SELECT pg_terminate_backend($1)", &[&pid]).await?; }
+        let outcome = tokio::time::timeout(Duration::from_secs(10), call).await??;
+        checks.check(test, "ny012", outcome == "NY012", format!("repetition={repetition} outcome={outcome}"));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let count_sql = format!("SELECT count(*) FROM public.{table} WHERE id = $1");
+        let first: i64 = admin.query_one(&count_sql, &[&key]).await?.get(0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let second: i64 = admin.query_one(&count_sql, &[&key]).await?.get(0);
+        checks.check(test, "no-replay", (0..=1).contains(&first) && first == second,
+            format!("repetition={repetition} first={first} second={second}"));
+        let records = std::fs::read_to_string(h.dir().join("read.log"))?
+            .lines().map(serde_json::from_str::<serde_json::Value>).collect::<Result<Vec<_>, _>>()?;
+        let reason = if revoke { "revoked" } else { "upstream_lost" };
+        let unknown = records.iter().filter(|record| {
+            record["session"].as_str() == Some(s.id.as_str()) && record["kind"] == "lifecycle"
+                && record["event"] == "write_outcome_unknown" && record["reason"] == reason
+        }).count();
+        checks.check(test, "audit-outcome-unknown", unknown == 1,
+            format!("repetition={repetition} reason={reason} records={unknown}"));
+    }
+    checks.finish(test, repetitions);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires NUNYA_TEST_PG and NUNYA_TEST_PG_ADMIN pointing at harness database"]
+async fn live_pg_extended_autocommit_upstream_loss_ny012() -> ServeResult<()> {
+    live_segment_commit_case("live_pg_extended_autocommit_upstream_loss_ny012", false, false, 5).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires NUNYA_TEST_PG and NUNYA_TEST_PG_ADMIN pointing at harness database"]
+async fn live_pg_extended_autocommit_revoke_ny012() -> ServeResult<()> {
+    live_segment_commit_case("live_pg_extended_autocommit_revoke_ny012", true, false, 5).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires NUNYA_TEST_PG and NUNYA_TEST_PG_ADMIN pointing at harness database"]
+async fn live_pg_simple_multistatement_upstream_loss_ny012() -> ServeResult<()> {
+    live_segment_commit_case("live_pg_simple_multistatement_upstream_loss_ny012", false, true, 3).await
+}

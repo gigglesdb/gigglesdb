@@ -103,6 +103,8 @@ pub struct Session {
     extended_deferred: VecDeque<Frontend>,
     extended_deferred_bytes: usize,
     extended_execute_forwarded: bool,
+    // A CommandComplete does not decide an implicit transaction before its RFQ.
+    segment_forwarded_write: bool,
     rollback_on_sync: bool,
     last_row_refresh_ms: Option<u64>,
     statement_revision: Option<String>,
@@ -141,6 +143,7 @@ impl Session {
             extended_deferred: VecDeque::new(),
             extended_deferred_bytes: 0,
             extended_execute_forwarded: false,
+            segment_forwarded_write: false,
             rollback_on_sync: false,
             last_row_refresh_ms: None,
             statement_revision: None,
@@ -173,7 +176,8 @@ impl Session {
     pub(crate) fn write_in_flight(&self) -> bool {
         let indeterminate =
             |active: &Active| writes(&active.kind) || matches!(active.kind, StatementKind::Commit);
-        self.active.iter().any(indeterminate)
+        self.segment_forwarded_write
+            || self.active.iter().any(indeterminate)
             || self.pending.iter().any(|pending| match pending {
                 Pending::Execute(active, _) => indeterminate(active),
                 Pending::Local(_)
@@ -516,6 +520,9 @@ impl Session {
                     described: false,
                 });
             }
+            self.segment_forwarded_write |= self.active.iter().any(|a| {
+                writes(&a.kind) || matches!(a.kind, StatementKind::Commit)
+            });
             self.empty_pending = self.active.is_empty();
             self.waiting = true;
             Ok(Some(Actions {
@@ -592,6 +599,7 @@ impl Session {
                     return Err(protocol());
                 }
                 self.waiting = false;
+                self.segment_forwarded_write = false;
                 self.status = status;
                 if status == b'E' {
                     self.aborted = true;
@@ -1387,6 +1395,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
 #[cfg(test)]
 pub(crate) mod tests {
     include!("session/sql_error_tests.rs");
+    include!("session/segment_tests.rs");
     use super::*;
     use crate::value::ColumnType;
     use crate::{
@@ -2238,7 +2247,7 @@ pub(crate) mod tests {
             assert!(matches!(out.upstream.as_slice(), [Frontend::Query(_)]));
             assert_eq!(s.write_in_flight(), expected);
             s.backend(Backend::CommandComplete(tag.into()));
-            assert!(!s.write_in_flight());
+            assert_eq!(s.write_in_flight(), expected);
             s.backend(Backend::ReadyForQuery(b'I'));
             assert!(!s.write_in_flight());
         }
@@ -2254,6 +2263,9 @@ pub(crate) mod tests {
         ));
         assert!(s.write_in_flight());
         s.backend(Backend::CommandComplete("INSERT 0 1".into()));
+        assert!(s.write_in_flight());
+        s.frontend(Frontend::Sync);
+        s.backend(Backend::ReadyForQuery(b'I'));
         assert!(!s.write_in_flight());
     }
     #[test]
