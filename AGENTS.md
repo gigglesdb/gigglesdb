@@ -150,6 +150,26 @@ Agreed by DD-0068 on 2026-11-07, at the user's request, to speed up feature work
   affected, and is copied into DD-0068's work log. A DD-0068 follow-up fix goes
   to the front of the commit queue.
 
+### Since DD-0068 stopped (user, 2026-11-18)
+
+DD-0068 no longer runs, so nobody will answer a pre-release request. Do not
+wait for one. Wherever the rules above require a DD-0068 pre-release, the
+landing lead gets one independent review instead, before the landing gate:
+- The reviewer is a fresh agent that did not write the change, for example a
+  Codex P worker with role review.
+- For persisted-format changes it checks that databases written before the
+  change still open and read byte for byte the same, and that new bytes,
+  feature bits or `ext_version` values are written only when the new feature
+  is used. It also checks that the numbers taken do not collide with
+  anything already on main.
+- For scalar and function semantics, error codes and changed test
+  expectations, it checks each change against PostgreSQL 18.6 output from the
+  oracle image and records that output as the basis.
+- Fix what the review finds. Then record the review and its verdict in the
+  design doc's journal, with a short note in DD-0068's work log so the
+  history stays in one place. The note informs; it is not a request.
+- The heads-up notes above become those same journal notes.
+
 ## Shared compile cache (sccache)
 
 Every cargo command sets these environment variables:
