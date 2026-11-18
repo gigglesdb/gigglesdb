@@ -2907,7 +2907,6 @@ async fn live_budget(h: &ServeHarness, owner: &MgmtClient) -> ServeResult<(usize
     for _ in 0..3 {
         let (s, secret) = acquire(owner, false, None).await?;
         let (c, _d) = session_connect(h, &s, &secret).await?;
-        let mut this_session = 0;
         for n in 0..=400 {
             let outcome = live_outcome(
                 c.simple_query(&format!(
@@ -2916,7 +2915,7 @@ async fn live_budget(h: &ServeHarness, owner: &MgmtClient) -> ServeResult<(usize
                 .await,
             );
             if outcome == "NY007" {
-                if this_session < 400 {
+                if n < 400 {
                     return Ok((successes, true));
                 }
                 break;
@@ -2925,7 +2924,6 @@ async fn live_budget(h: &ServeHarness, owner: &MgmtClient) -> ServeResult<(usize
                 return Ok((successes, false));
             }
             successes += 1;
-            this_session += 1;
         }
     }
     Ok((successes, false))
@@ -3304,10 +3302,10 @@ async fn live_limit_clients(
                             .await,
                     );
                     let end = std::time::Instant::now();
-                    if outcome == "ok" {
-                        if let Some((successes, _)) = &revoke {
-                            successes.fetch_add(1, Ordering::SeqCst);
-                        }
+                    if outcome == "ok"
+                        && let Some((successes, _)) = &revoke
+                    {
+                        successes.fetch_add(1, Ordering::SeqCst);
                     }
                     if outcome == "NY007" || quota_probes > 0 {
                         quota_probes += 1;
@@ -3386,7 +3384,6 @@ async fn live_limit_budget(
     for rotation in 0..3 {
         let (session, secret) = acquire(owner, false, None).await?;
         let (client, _driver) = session_connect(h, &session, &secret).await?;
-        let mut this_session = 0;
         for attempt in 0..=40 {
             let outcome = live_outcome(
                 client
@@ -3396,7 +3393,7 @@ async fn live_limit_budget(
                     .await,
             );
             if outcome == "NY007" {
-                if this_session < 40 {
+                if attempt < 40 {
                     return Ok((successes, true));
                 }
                 break;
@@ -3405,7 +3402,6 @@ async fn live_limit_budget(
                 return Ok((successes, false));
             }
             successes += 1;
-            this_session += 1;
         }
     }
     Ok((successes, false))
