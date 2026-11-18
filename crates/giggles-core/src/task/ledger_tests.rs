@@ -35,8 +35,7 @@ fn fingerprint_golden_direct_apply_undo() {
     prefix.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
 
     // Direct: text B32, param_count u16, each param B32.
-    let direct = RequestBody::Direct {
-        text: b"UPDATE t SET v = $1",
+    let direct = RequestBody::Direct { intent: None, text: b"UPDATE t SET v = $1",
         params: vec![vec![0xAA, 0xBB], Vec::new()],
     };
     let mut expected = prefix.clone();
@@ -74,7 +73,7 @@ fn direct_and_apply_differ_for_same_rows() {
     // rendering of the direct body: only the kind byte separates them.
     let apply = RequestBody::Apply { preview: 1, digest: [0; 32] };
     let undo = RequestBody::Undo { preview: 1, digest: [0; 32], mode: 0 };
-    let direct = RequestBody::Direct { text: b"UPDATE t SET v = 1 WHERE id = 1", params: Vec::new() };
+    let direct = RequestBody::Direct { intent: None, text: b"UPDATE t SET v = 1 WHERE id = 1", params: Vec::new() };
     let fps = [
         request_fingerprint(T, &direct),
         request_fingerprint(T, &apply),
@@ -90,18 +89,17 @@ fn direct_and_apply_differ_for_same_rows() {
 #[test]
 fn param_change_changes_fingerprint() {
     let text: &[u8] = b"UPDATE t SET v = $1 WHERE id = $2";
-    let base = RequestBody::Direct { text, params: vec![vec![1], vec![2]] };
-    let changed = RequestBody::Direct { text, params: vec![vec![1], vec![3]] };
-    let fewer = RequestBody::Direct { text, params: vec![vec![1]] };
+    let base = RequestBody::Direct { intent: None, text, params: vec![vec![1], vec![2]] };
+    let changed = RequestBody::Direct { intent: None, text, params: vec![vec![1], vec![3]] };
+    let fewer = RequestBody::Direct { intent: None, text, params: vec![vec![1]] };
     // Moving a byte across the param boundary must not collide.
-    let shifted = RequestBody::Direct { text, params: vec![vec![1, 2], Vec::new()] };
+    let shifted = RequestBody::Direct { intent: None, text, params: vec![vec![1, 2], Vec::new()] };
     let base_fp = request_fingerprint(T, &base);
     assert_eq!(base_fp, request_fingerprint(T, &base.clone()));
     for other in [&changed, &fewer, &shifted] {
         assert_ne!(base_fp, request_fingerprint(T, other));
     }
-    let other_text = RequestBody::Direct {
-        text: b"UPDATE t SET v = $1 WHERE id = $2 ",
+    let other_text = RequestBody::Direct { intent: None, text: b"UPDATE t SET v = $1 WHERE id = $2 ",
         params: vec![vec![1], vec![2]],
     };
     assert_ne!(base_fp, request_fingerprint(T, &other_text));
@@ -208,4 +206,33 @@ mod engine {
         let err = stage(&mut txn, vec![0x23; 17], &record(T, &id, 1)).unwrap_err();
         assert!(matches!(err, CoreError::Corrupt(_)));
     }
+}
+
+#[test]
+fn direct_intent_suffix_golden() {
+    let body = |intent| RequestBody::Direct {
+        text: b"UPDATE t SET v = $1",
+        params: vec![vec![0xAA, 0xBB], Vec::new()],
+        intent,
+    };
+    let base = body(None);
+    let bytes = fingerprint_preimage(T, &base);
+    let one = body(Some(RowIntent::One));
+    let capped = body(Some(RowIntent::AtMost(0x0102)));
+    assert_eq!(
+        fingerprint_preimage(T, &one),
+        [bytes.as_slice(), &[1]].concat()
+    );
+    assert_eq!(
+        fingerprint_preimage(T, &capped),
+        [bytes.as_slice(), &[2, 0, 0, 0, 0, 0, 0, 1, 2]].concat()
+    );
+    let fps = [&base, &one, &capped].map(|b| request_fingerprint(T, b));
+    assert_ne!(fps[0], fps[1]);
+    assert_ne!(fps[0], fps[2]);
+    assert_ne!(fps[1], fps[2]);
+    assert_ne!(
+        request_fingerprint(T, &body(Some(RowIntent::AtMost(3)))),
+        request_fingerprint(T, &body(Some(RowIntent::AtMost(4))))
+    );
 }

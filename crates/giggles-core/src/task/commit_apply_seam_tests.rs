@@ -240,7 +240,7 @@ fn apply_fingerprint_differs_from_direct() {
     assert_ne!(receipt.request_fp, direct_receipt.request_fp);
     let body = ledger::RequestBody::Apply { preview: PREVIEW.0, digest: DIGEST };
     assert_eq!(receipt.request_fp, ledger::request_fingerprint(f.def.id, &body));
-    let direct_body = ledger::RequestBody::Direct { text: REQUEUE.as_bytes(), params: Vec::new() };
+    let direct_body = ledger::RequestBody::Direct { intent: None, text: REQUEUE.as_bytes(), params: Vec::new() };
     assert_eq!(direct_receipt.request_fp, ledger::request_fingerprint(f.def.id, &direct_body));
     // A resend replays without asking the source again.
     let q = probe();

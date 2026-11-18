@@ -922,3 +922,26 @@ async fn native_intent_bounds_the_protected_commit() {
         f.stop().await;
     }
 }
+
+#[tokio::test]
+async fn native_intent_resend_conflicts_when_bound_changes() {
+    for grpc in [false, true] {
+        let f = Fixture::start(grpc).await;
+        let token = f.open().await;
+        let native = |n| {
+            format!(
+                "update many shipments where merchant_id = 42 and status = \"failed\" set status = \"queued\" at most {n}"
+            )
+        };
+        let request = with_operation(text(&native(4)), "intent-resend");
+        assert_eq!(affected(&f.call(&token, &request).await.reply()), "4");
+        assert_eq!(f.statuses(), AFTER);
+        assert_eq!(affected(&f.call(&token, &request).await.reply()), "4");
+        assert_eq!(f.statuses(), AFTER);
+        let changed = with_operation(text(&native(5)), "intent-resend");
+        let reply = f.call(&token, &changed).await.reply();
+        assert_task_error(&reply, &TaskError::OperationConflict, &changed);
+        assert_eq!(f.statuses(), AFTER);
+        f.stop().await;
+    }
+}

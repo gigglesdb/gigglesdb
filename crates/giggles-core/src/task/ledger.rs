@@ -12,11 +12,11 @@
 //!   executor are not hashed.
 //! - Lookup never writes and takes no hold; staging only buffers the record
 //!   in the caller's transaction.
+use super::error::{Budget, DenyRule};
+use super::receipt::Receipt;
 use super::records::{
     MAX_IDENTITY, MAX_OPERATION_ID, MAX_STATEMENT_TEXT, OutcomeRecord, TaskObjectId, outcome_key,
 };
-use super::error::{Budget, DenyRule};
-use super::receipt::Receipt;
 use crate::CoreError;
 use crate::storage::{Isolation, Keyspace, PROTECTED_RECORDS, Transaction, V2Db};
 use sha2::{Digest, Sha256};
@@ -58,6 +58,13 @@ impl OperationId {
     }
 }
 
+/// The row bound attached to a protected direct request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowIntent {
+    One,
+    AtMost(u64),
+}
+
 /// The fingerprinted shape of a protected request. `ProtectedRequest`
 /// implements [`FingerprintRequest`] by producing one of these; tests build
 /// it directly, so they need no `Prepared`.
@@ -65,7 +72,9 @@ impl OperationId {
 pub(crate) enum RequestBody<'a> {
     /// `text` is the statement bytes exactly as the entry point received them;
     /// each param is the storage encoding of its `Value`.
-    Direct { text: &'a [u8], params: Vec<Vec<u8>> },
+    /// After params, no intent appends nothing (preserving legacy bytes);
+    /// `One` appends 0x01; `AtMost(n)` appends 0x02 and big-endian u64 n.
+    Direct { intent: Option<RowIntent>, text: &'a [u8], params: Vec<Vec<u8>> },
     Apply { preview: u64, digest: [u8; 32] },
     Undo { preview: u64, digest: [u8; 32], mode: u8 },
 }
@@ -105,13 +114,21 @@ pub(crate) fn fingerprint_preimage(task: TaskObjectId, request: &dyn Fingerprint
     out.extend_from_slice(&task.0.to_be_bytes());
     out.push(body.kind());
     match &body {
-        RequestBody::Direct { text, params } => {
+        RequestBody::Direct { text, params, intent } => {
             assert!(text.len() <= MAX_STATEMENT_TEXT, "statement text length");
             b32(&mut out, text);
             let count = u16::try_from(params.len()).expect("parameter count exceeds u16");
             out.extend_from_slice(&count.to_be_bytes());
             for param in params {
                 b32(&mut out, param);
+            }
+            match intent {
+                None => {}
+                Some(RowIntent::One) => out.push(0x01),
+                Some(RowIntent::AtMost(n)) => {
+                    out.push(0x02);
+                    out.extend_from_slice(&n.to_be_bytes());
+                }
             }
         }
         RequestBody::Apply { preview, digest } => {

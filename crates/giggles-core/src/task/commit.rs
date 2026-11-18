@@ -63,7 +63,7 @@ use super::decide::{self, ApprovalState, Decision, RequestKind};
 use super::definition::{LoadLimits, RoleName, TaskDef};
 use super::effects::Effects;
 use super::error::{Budget, DenyRule, TaskError};
-use super::ledger::{self, OperationId, Outcome, RequestBody};
+use super::ledger::{self, OperationId, Outcome, RequestBody, RowIntent};
 use super::preview::PreviewId;
 use super::receipt::{
     self, ChangeRecord, Receipt, DECISION_COMMITTED, DECISION_UNDO_COMPLETE, DECISION_UNDO_PARTIAL,
@@ -267,12 +267,14 @@ pub type RowCheck<'a> = dyn Fn(usize) -> Result<(), TaskError> + 'a;
 /// statement's writes are rolled back with the transaction, and no outcome,
 /// head, membership, change record or receipt is written, so the operation
 /// ID stays free. A replayed outcome (the ID already decided) is returned
-/// without the check, as for every other replay.
+/// without the check when the fingerprint (including `intent`) matches.
+/// A different intent under the same operation ID returns operation conflict.
 pub fn protected_commit_checked(
     session: &mut SqlSession,
     actor: Actor<'_>,
     op: &OperationId,
     request: ProtectedRequest,
+    intent: RowIntent,
     check: &RowCheck<'_>,
 ) -> Result<Receipt, TaskError> {
     commit_checked(
@@ -282,7 +284,7 @@ pub fn protected_commit_checked(
         request,
         &mut catalog_def,
         &mut stored_apply_source,
-        Some(check),
+        Some((intent, check)),
     )
 }
 
@@ -490,7 +492,11 @@ pub fn inspect_outcome(
 }
 
 /// The fingerprinted body of a Direct request.
-fn direct_body<'r>(text: &'r str, params: &[Value]) -> Result<RequestBody<'r>, TaskError> {
+fn direct_body<'r>(
+    text: &'r str,
+    params: &[Value],
+    intent: Option<RowIntent>,
+) -> Result<RequestBody<'r>, TaskError> {
     if text.len() > MAX_STATEMENT_TEXT || u16::try_from(params.len()).is_err() {
         return Err(TaskError::Core(Box::new(CoreError::Limit)));
     }
@@ -498,7 +504,7 @@ fn direct_body<'r>(text: &'r str, params: &[Value]) -> Result<RequestBody<'r>, T
         .iter()
         .map(|value| crate::storage::task_row_payload(std::slice::from_ref(value)))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(RequestBody::Direct { text: text.as_bytes(), params })
+    Ok(RequestBody::Direct { text: text.as_bytes(), params, intent })
 }
 
 /// Attempts per call: the first run and two internal retries (D-F).
@@ -588,8 +594,9 @@ fn commit_checked(
     request: ProtectedRequest,
     load_def: &mut LoadDef<'_>,
     sources: &mut Sources<'_>,
-    check: Option<&RowCheck<'_>>,
+    bound: Option<(RowIntent, &RowCheck<'_>)>,
 ) -> Result<Receipt, TaskError> {
+    let check = bound.map(|(_, check)| check);
     // 0. v2 only (D9), not replicated (D13).
     let db = session.v2_db().ok_or_else(unsupported)?;
     if db.task_kernel_unsupported() {
@@ -616,7 +623,9 @@ fn commit_checked(
     let task = ctx.task;
     // 1. Fingerprint.
     let body = match &request {
-        ProtectedRequest::Direct { text, params, .. } => direct_body(text, params)?,
+        ProtectedRequest::Direct { text, params, .. } => {
+            direct_body(text, params, bound.map(|(intent, _)| intent))?
+        }
         ProtectedRequest::Apply { preview, digest } => RequestBody::Apply {
             preview: preview.0,
             digest: *digest,

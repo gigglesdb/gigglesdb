@@ -523,7 +523,14 @@ fn commit_bounded(f: &Fixture, id: &str, at_most: usize) -> Result<Receipt, Task
             Ok(())
         }
     };
-    protected_commit_checked(&mut session, Actor::Executor(&f.ctx), &op(id), request, &check)
+    protected_commit_checked(
+        &mut session,
+        Actor::Executor(&f.ctx),
+        &op(id),
+        request,
+        RowIntent::AtMost(at_most as u64),
+        &check,
+    )
 }
 
 #[test]
@@ -542,5 +549,21 @@ fn row_check_refusal_records_nothing_and_leaves_the_id_free() {
     assert_eq!(receipt.rows_affected, 4);
     assert_eq!(f.statuses(), ["queued", "queued", "queued", "queued", "delivered", "failed"]);
     // A replay returns the stored receipt; the check does not run again.
-    assert_eq!(commit_bounded(&f, "requeue-1", 0).unwrap(), receipt);
+    assert_eq!(commit_bounded(&f, "requeue-1", 4).unwrap(), receipt);
+}
+
+#[test]
+fn changed_row_intent_conflicts_without_writes() {
+    let f = fixture();
+    let receipt = commit_bounded(&f, "bound-replay", 4).unwrap();
+    let stored = outcome(&f, "bound-replay").unwrap();
+    let statuses = f.statuses();
+    let stored_head = head(&f).unwrap();
+    assert_eq!(commit_bounded(&f, "bound-replay", 4).unwrap(), receipt);
+    let error = commit_bounded(&f, "bound-replay", 5).unwrap_err();
+    assert_eq!(error, TaskError::OperationConflict);
+    assert_eq!(error.sqlstate(), "42T03");
+    assert_eq!(outcome(&f, "bound-replay").unwrap(), stored);
+    assert_eq!(head(&f).unwrap(), stored_head);
+    assert_eq!(f.statuses(), statuses);
 }

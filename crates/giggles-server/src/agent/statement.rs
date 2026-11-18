@@ -37,6 +37,13 @@ pub(crate) enum RowLimit {
 }
 
 impl RowLimit {
+    fn intent(self) -> giggles_core::task::RowIntent {
+        match self {
+            Self::One => giggles_core::task::RowIntent::One,
+            Self::AtMost(n) => giggles_core::task::RowIntent::AtMost(n),
+        }
+    }
+
     /// `NotFound` or `AmbiguousMatch` for `One`, `TooManyMatches` past `n`.
     pub(crate) fn check(self, rows: u64) -> Result<(), ops::Error> {
         match self {
@@ -276,6 +283,7 @@ fn direct(
             actor,
             &op,
             request,
+            bound.limit.intent(),
             &|rows| bound.check(rows),
         ),
     }
