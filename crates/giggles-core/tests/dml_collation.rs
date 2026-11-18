@@ -1,9 +1,5 @@
 #![cfg(feature = "engine-rocksdb")]
-//! Joined DML fails closed until its materialized shapes retain derivations.
-//! PG18 oracle: ci matches abc/ABC (UPDATE 1); MERGE updates abc and inserts
-//! zzz (2 actions); DELETE USING removes both. und-x-icu matches abc/abc
-//! with the same counts, but abc/ABC produces UPDATE 0. We intentionally
-//! reject both cases, before writes, rather than return bytewise results.
+//! Joined mutation metadata and equality follow PostgreSQL 18.6.
 mod common;
 use giggles_core::{Admin, Engine, Limits, SqlSession, relational::Value as V};
 fn run(s: &mut SqlSession, sql: &str) -> Vec<Vec<V>> {
@@ -41,7 +37,7 @@ fn fixture(collation: &str) -> (Admin, SqlSession) {
 }
 #[cfg(feature = "engine-rocksdb")]
 #[test]
-fn joined_dml_rejects_implicit_collations_before_writing() {
+fn joined_dml_preserves_implicit_collations() {
     for collation in ["ci", "\"und-x-icu\""] {
         let (_admin, mut s) = fixture(collation);
         for sql in [
@@ -53,8 +49,9 @@ fn joined_dml_rejects_implicit_collations_before_writing() {
             "WITH source AS(SELECT * FROM src) UPDATE t SET v=source.v FROM source WHERE t.k=source.k",
             "WITH source AS(SELECT * FROM src) MERGE INTO t USING source ON t.k=source.k WHEN MATCHED THEN DELETE",
         ] {
-            let e = s.execute(sql, &[], None).unwrap_err();
-            assert_eq!(giggles_core::sqlstate(&e), "0A000", "{sql}: {e:?}");
+            run(&mut s, "BEGIN");
+            run(&mut s, sql);
+            run(&mut s, "ROLLBACK");
             assert_eq!(
                 run(&mut s, "SELECT id,k,v FROM t"),
                 vec![vec![V::Int(1), V::Text("abc".into()), V::Int(10)]]
@@ -85,7 +82,7 @@ fn ordinary_returning_images_preserve_column_collations() {
 }
 #[cfg(feature = "engine-rocksdb")]
 #[test]
-fn joined_dml_rejects_explicit_collations_in_all_expression_positions() {
+fn joined_dml_preserves_explicit_collations_in_all_expression_positions() {
     let admin = Admin::create_engine(
         common::fresh("dml-explicit-collation"),
         Limits::default(),
@@ -105,8 +102,9 @@ fn joined_dml_rejects_explicit_collations_in_all_expression_positions() {
         "MERGE INTO t USING t src ON false WHEN NOT MATCHED THEN INSERT VALUES(2,src.k COLLATE \"und-x-icu\")",
         "MERGE INTO t USING t src ON true WHEN MATCHED THEN DO NOTHING RETURNING old.k COLLATE \"und-x-icu\"",
     ] {
-        let e = s.execute(sql, &[], None).unwrap_err();
-        assert_eq!(giggles_core::sqlstate(&e), "0A000", "{sql}: {e:?}");
+        run(&mut s, "BEGIN");
+        run(&mut s, sql);
+        run(&mut s, "ROLLBACK");
     }
     assert_eq!(
         run(&mut s, "SELECT k FROM t"),
@@ -115,7 +113,7 @@ fn joined_dml_rejects_explicit_collations_in_all_expression_positions() {
 }
 
 #[test]
-fn cte_source_collations_are_rejected_before_materialization() {
+fn cte_source_collations_survive_materialization() {
     let (_admin, mut s) = fixture("ci");
     run(
         &mut s,
@@ -127,8 +125,9 @@ fn cte_source_collations_are_rejected_before_materialization() {
         "WITH source AS(SELECT * FROM src) DELETE FROM plain USING source WHERE plain.k=source.k",
         "WITH source AS(SELECT * FROM src) MERGE INTO plain USING source ON plain.k=source.k WHEN MATCHED THEN DELETE",
     ] {
-        let e = s.execute(sql, &[], None).unwrap_err();
-        assert_eq!(giggles_core::sqlstate(&e), "0A000", "{sql}: {e:?}");
+        run(&mut s, "BEGIN");
+        run(&mut s, sql);
+        run(&mut s, "ROLLBACK");
     }
     assert_eq!(run(&mut s, "SELECT id FROM plain"), vec![vec![V::Int(1)]]);
 }

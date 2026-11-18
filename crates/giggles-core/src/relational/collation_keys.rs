@@ -75,10 +75,7 @@ impl Key {
         let mut transformed = Vec::with_capacity(values.len());
         let mut bytes = 0usize;
         for (value, collator) in values.iter().zip(&self.collators) {
-            let value = match (value, collator) {
-                (Value::Text(text), Some(c)) => Value::Bytes(c.sort_key(text.as_bytes())),
-                _ => value.clone(),
-            };
+            let value = equality_value(value, collator.as_deref());
             bytes = bytes
                 .checked_add(value_bytes(&value))
                 .ok_or(SqlError::Limit)?;
@@ -168,6 +165,14 @@ impl Relational {
             ));
         }
         Ok(keys.into_iter().filter(|(key, _)| key.nondeterministic()).collect())
+    }
+}
+
+/// Transient hash equality representation; deterministic collations use bytes.
+pub(crate) fn equality_value(value: &Value, collator: Option<&giggles_icu::Collator>) -> Value {
+    match (value,collator) {
+        (Value::Text(text),Some(c)) => Value::Bytes(c.sort_key(text.as_bytes())),
+        _ => value.clone(),
     }
 }
 

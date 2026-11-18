@@ -1,14 +1,6 @@
 use super::*;
 use exec::Relation;
 
-fn row_cmp(a: &SqlRow, b: &SqlRow) -> Ordering {
-    a.values
-        .iter()
-        .zip(&b.values)
-        .map(|(a, b)| cmp(a, b))
-        .find(|c| *c != Ordering::Equal)
-        .unwrap_or(Ordering::Equal)
-}
 pub(super) fn sort<T>(
     rows: &mut [T],
     execution: &Execution<'_>,
@@ -33,7 +25,22 @@ pub(super) fn apply(
     mut right: Relation<'_>,
     out: &mut Relation<'_>,
     execution: &Execution<'_>,
+    collations: &[Option<BoundScalar>],
 ) -> R<()> {
+    let row_cmp = |a: &SqlRow, b: &SqlRow| {
+        a.values
+            .iter()
+            .zip(&b.values)
+            .enumerate()
+            .map(|(i, (a, b))| {
+                collations
+                    .get(i)
+                    .and_then(Option::as_ref)
+                    .map_or_else(|| cmp(a, b), |s| s.compare_values(a, b))
+            })
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    };
     if matches!(op, SetOp::Union) && all {
         for row in left.rows.into_iter().chain(right.rows) {
             if execution.cancelled() {
@@ -47,6 +54,23 @@ pub(super) fn apply(
     sort(&mut right.rows, execution, row_cmp)?;
     let mut a = left.rows.into_iter().peekable();
     let mut b = right.rows.into_iter().peekable();
+    if matches!(op, SetOp::Union) {
+        // Keep the current merge input on equal keys, as Merge Append does.
+        // The first row in each collation-equal run is its representative.
+        let mut prefer_left = true;
+        while a.peek().is_some() || b.peek().is_some() {
+            execution.comparison()?;
+            let take_left = match (a.peek(), b.peek()) {
+                (Some(a),Some(b)) => match row_cmp(a,b) { Ordering::Less=>true, Ordering::Greater=>false, Ordering::Equal=>prefer_left },
+                (Some(_),None)=>true,
+                _=>false,
+            };
+            prefer_left=take_left;
+            let row = if take_left {a.next().unwrap()} else {b.next().unwrap()};
+            if out.rows.last().is_none_or(|previous| row_cmp(previous,&row)!=Ordering::Equal) {out.push(SqlRow {values:row.values,version:0})?;}
+        }
+        return Ok(());
+    }
     // Sorted runs provide SQL NULL-equal multiset semantics without a second hash table.
     while a.peek().is_some() || b.peek().is_some() {
         if execution.cancelled() {

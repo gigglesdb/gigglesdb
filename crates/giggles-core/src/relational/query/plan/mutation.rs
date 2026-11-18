@@ -48,14 +48,17 @@ pub(super) fn claims(tokens: &[Token]) -> bool {
     else {
         return false;
     };
-    top.iter()
-        .any(|i| *i > set && *i < end && parse::word(&tokens[*i], "from") && !parse::word(&tokens[*i-1], "distinct"))
-        || top.windows(2).any(|pair| {
-            pair[1] < end
-                && pair[0] >= set
-                && (parse::word(&tokens[pair[0]], "set") || tokens[pair[0]] == Token::Symbol(','))
-                && tokens[pair[1]] == Token::Symbol('(')
-        })
+    top.iter().any(|i| {
+        *i > set
+            && *i < end
+            && parse::word(&tokens[*i], "from")
+            && !parse::word(&tokens[*i - 1], "distinct")
+    }) || top.windows(2).any(|pair| {
+        pair[1] < end
+            && pair[0] >= set
+            && (parse::word(&tokens[pair[0]], "set") || tokens[pair[0]] == Token::Symbol(','))
+            && tokens[pair[1]] == Token::Symbol('(')
+    })
 }
 pub(super) fn splits(tokens: &[Token]) -> R<Vec<&[Token]>> {
     let mut start = 0;
@@ -369,6 +372,8 @@ impl Mutation {
                 qualified.push((column.name.clone(), out.columns.len()));
                 let mut column = column.clone();
                 column.not_null = false;
+                let metadata = shape.namespace.qualified.iter().find(|(a,_)| a==&self.alias).and_then(|(_,cols)| cols.iter().find(|(name,_)|name==&column.name)).and_then(|(_,i)|shape.collations.get(*i)).and_then(Option::as_ref);
+                out.collations.push(metadata.map(|m| functions::collation::combined(Some(m),None,column.data_type.clone()).expect("resolved derivation")));
                 out.columns.push(column);
                 out.typmods.push(-1);
             }
@@ -383,6 +388,7 @@ impl Mutation {
                 not_null: false,
             });
             out.typmods.push(-1);
+            out.collations.push(None);
         }
         out
     }
@@ -391,16 +397,6 @@ impl Mutation {
         state: &Relational,
         parameters: &mut [Option<DataType>],
     ) -> R<bind::Meta> {
-        dml::reject_unpropagated_collations(
-            state,
-            &self.read_tables(),
-            &self.from,
-            self.groups
-                .iter()
-                .filter_map(|(_, p)| p.as_ref())
-                .chain(Some(&self.predicate))
-                .chain(self.returning.as_ref()),
-        )?;
         let catalog = self.catalog(state)?;
         let shape = self.from.resolve(&catalog, parameters)?;
         self.resolve_shape(state, parameters, &shape)
@@ -492,6 +488,7 @@ impl Mutation {
         version_end: u64,
         deferred: Option<&mut super::super::super::DeferralState>,
     ) -> Result<SqlResult, crate::CoreError> {
+        let _metadata = functions::collation::ColumnScope::enter(&[], &[]).map_err(crate::CoreError::Sql)?;
         use super::super::super::{assign, returning};
         let mut snapshot = state.clone();
         let mut retention = scan::Retention::new(scan::retention_limit());
@@ -634,6 +631,7 @@ impl Mutation {
         injected_source: Option<&dyn scan::RowSource>,
         mut publish: Option<&mut Publisher<'_>>,
     ) -> R<SqlResult> {
+        let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
         let description = prepared.describe(state)?;
         let parameters = description
             .parameters

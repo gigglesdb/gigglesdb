@@ -266,3 +266,30 @@ impl Function {
         Ok(out)
     }
 }
+
+impl Function {
+    pub(super) fn collations(
+        &self,
+        state: &Relational,
+        parameters: &mut [Option<DataType>],
+    ) -> R<Vec<Option<BoundScalar>>> {
+        if self.name != "unnest" {
+            return Ok(vec![]);
+        }
+        let original = if let Some(input) = &self.input {
+            input
+                .clone()
+                .resolve(state, parameters)?
+                .collations
+                .into_iter()
+                .next()
+                .flatten()
+        } else {
+            Some(self.args[0].bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)?)
+        };
+        Ok(vec![Some(functions::collation::materialized(
+            original.as_ref(),
+            self.ty(state, parameters)?,
+        )?)])
+    }
+}

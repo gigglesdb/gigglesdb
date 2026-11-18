@@ -359,6 +359,7 @@ pub(super) fn rename_scalar(s: &mut Scalar, names: &[(String, String)]) -> R<()>
 pub(super) fn empty_shape() -> join::Shape {
     join::Shape {
         columns: vec![],
+        collations: vec![],
         typmods: vec![],
         namespace: join::Namespace::default(),
     }
@@ -369,10 +370,13 @@ pub(super) fn outer_scalar(s: &mut Scalar, shape: &join::Shape, row: Option<&Sql
         if let Scalar::Column(c) = s {
             match shape.namespace.resolve(c) {
                 Ok(n) => {
-                    *s = typed(
-                        row.map_or(Value::Null, |r| r.values[n].clone()),
-                        &shape.columns[n].data_type,
-                    );
+                    *s = functions::collation::scalar(
+                        typed(
+                            row.map_or(Value::Null, |r| r.values[n].clone()),
+                            &shape.columns[n].data_type,
+                        ),
+                        shape.collations.get(n).and_then(Option::as_ref),
+                    )?;
                     used = true;
                 }
                 Err(SqlError::UnknownColumn)
@@ -534,9 +538,19 @@ fn bind_scalar(
     let table = TableDef {
         id: 0,
         name: join::INPUT.into(),
-        columns: shape.columns.clone(),
+        columns: shape
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut c = c.clone();
+                c.id = u64::MAX - i as u64;
+                c
+            })
+            .collect(),
         primary_key: vec![],
     };
+    let _collations = functions::collation::ColumnScope::enter(&table.columns, &shape.collations)?;
     let resolve = |c: &ColumnRef, _| {
         shape
             .namespace
@@ -589,6 +603,7 @@ fn prepare(
     let mut names = vec![];
     let mut constants = BTreeMap::new();
     for a in &s.applies {
+        let mut metadata;
         let (ty, name) = match &a.right {
             Right::Query(q) => {
                 let (mut q, correlated) = instantiate(q, &shape, None, state, parameters)?;
@@ -596,6 +611,7 @@ fn prepare(
                 if !a.exists && meta.columns.len() != 1 {
                     return Err(SqlError::Syntax);
                 }
+                metadata = meta.collations.into_iter().next().flatten().map(|m| functions::collation::materialized(Some(&m),m.ty.clone())).transpose()?;
                 let col = meta.columns.first().ok_or(SqlError::Syntax)?;
                 if !correlated && !a.contextual && a.comparison.is_none() && !a.exists {
                     let value = cached.and_then(|c| c.get(&a.name));
@@ -611,31 +627,48 @@ fn prepare(
                         if value.is_some_and(|v| v.many || v.values.len() > 1) {
                             cardinality(&col.data_type)
                         } else {
-                            literal
+                            functions::collation::scalar(literal, metadata.as_ref())?
                         },
                     );
                 }
                 (col.data_type.clone(), col.name.clone())
             }
-            Right::Array(s) => (
-                srf::element(&bind_scalar(s, &shape, parameters)?.ty)?,
-                "?column?".into(),
-            ),
+            Right::Array(s) => {
+                let bound = bind_scalar(s, &shape, parameters)?;
+                let ty = srf::element(&bound.ty)?;
+                metadata = Some(functions::collation::combined(Some(&bound),None,ty.clone())?);
+                (ty, "?column?".into())
+            },
         };
         if let Some((lhs, op, _)) = &a.comparison {
             let table = TableDef {
                 id: 0,
                 name: join::INPUT.into(),
-                columns: shape.columns.clone(),
+                columns: shape
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let mut c = c.clone();
+                        c.id = u64::MAX - i as u64;
+                        c
+                    })
+                    .collect(),
                 primary_key: vec![],
             };
+            let _collations =
+                functions::collation::ColumnScope::enter(&table.columns, &shape.collations)?;
             let resolve = |c: &ColumnRef, _| {
                 shape
                     .namespace
                     .resolve(c)
                     .map(|column| BoundColumn { source: 0, column })
             };
-            let cmp = comparison(lhs.clone(), op, typed(Value::Null, &ty));
+            let cmp = comparison(
+                lhs.clone(),
+                op,
+                functions::collation::scalar(typed(Value::Null, &ty), metadata.as_ref())?,
+            );
             cmp.infer(parameters, &resolve, &[&table])?;
             cmp.bind(parameters, &resolve, &[&table])?;
         }
@@ -660,6 +693,13 @@ fn prepare(
                 not_null: false,
             });
             shape.typmods.push(-1);
+            shape.collations.push(
+                if shape.columns.len() == n + 1 && a.comparison.is_none() && !a.exists {
+                    metadata.take()
+                } else {
+                    None
+                },
+            );
         }
         names.push((
             a.name.clone(),
@@ -723,11 +763,22 @@ pub(super) fn resolve(
     for (slot, ty) in parameters.iter_mut().zip(d.parameters) {
         *slot = Some(ty);
     }
-    Ok(bind::Meta {
-        collations: bound.items.into_iter().map(|item| match item {
+    // Apply queries can aggregate or group before being materialized too.
+    // Keep output derivations exactly as the ordinary SELECT resolver does;
+    // an aggregate's input is a carrier only for a collatable result type.
+    let collations = if let Some(grouping) = bound.grouping {
+        grouping.into_collation_outputs()
+    } else {
+        bound.items.into_iter().zip(&d.columns).map(|(item, column)| match item {
             BoundItem::Scalar(value) => Some(value),
+            BoundItem::Aggregate(_, Some(value)) if matches!(
+                column.data_type, DataType::Text | DataType::Varchar | DataType::Bpchar
+            ) => Some(value),
             _ => None,
-        }).collect(),
+        }).collect()
+    };
+    Ok(bind::Meta {
+        collations,
         unknown: vec![false; d.columns.len()],
         columns: d.columns,
         typmods: d.typmods,
@@ -739,6 +790,7 @@ pub(super) fn resolve(
 pub(in crate::relational::query) struct Cached {
     values: Vec<Value>,
     ty: DataType,
+    collation: Option<Scalar>,
     null_array: bool,
     many: bool,
 }
@@ -856,6 +908,10 @@ pub(super) fn run<'a>(
                         let null_array = value == Value::Null;
                         let values = srf::array_values(value, &ty)?;
                         Cached {
+                            collation: Some(functions::collation::scalar(
+                                typed(Value::Null, &ty),
+                                Some(&array),
+                            )?),
                             values,
                             ty,
                             null_array,
@@ -894,7 +950,7 @@ pub(super) fn run<'a>(
                             params,
                             &mut 0,
                         )?;
-                        let lt = lhs.ty;
+                        let lt = lhs.ty.clone();
                         let mut unknown = false;
                         let mut outcome = *all;
                         for rv in rhs.values {
@@ -907,7 +963,22 @@ pub(super) fn run<'a>(
                             } else {
                                 typed(lv.clone(), &lt)
                             };
-                            let f = comparison(left, op, typed(rv, &rhs.ty));
+                            let left = functions::collation::scalar(left, Some(&lhs))?;
+                            let right_metadata = rhs
+                                .collation
+                                .as_ref()
+                                .map(|s| {
+                                    s.bind(&|_, _| Err(SqlError::UnknownColumn), &[], parameters)
+                                })
+                                .transpose()?;
+                            let f = comparison(
+                                left,
+                                op,
+                                functions::collation::scalar(
+                                    typed(rv, &rhs.ty),
+                                    right_metadata.as_ref(),
+                                )?,
+                            );
                             let mut bound =
                                 f.bind(parameters, &|_, _| Err(SqlError::UnknownColumn), &[])?;
                             bound.attach_clock(clock);
@@ -999,6 +1070,14 @@ fn query_values(
 ) -> R<Cached> {
     match child.run(state, source, params, parameters, clock, execution) {
         Ok(rows) => {
+            let metadata = child
+                .clone()
+                .resolve(state, &mut parameters.to_vec())?
+                .collations
+                .into_iter()
+                .next()
+                .flatten();
+            let metadata = metadata.map(|m| functions::collation::materialized(Some(&m),m.ty.clone())).transpose()?;
             let ty = rows
                 .columns
                 .first()
@@ -1014,6 +1093,10 @@ fn query_values(
             )?;
             let values = rows.rows.into_iter().map(|r| r.values[0].clone()).collect();
             Ok(Cached {
+                collation: Some(functions::collation::scalar(
+                    typed(Value::Null, &ty),
+                    metadata.as_ref(),
+                )?),
                 values,
                 ty,
                 null_array: false,
@@ -1024,6 +1107,7 @@ fn query_values(
             let d = child.describe(state, parameters.len(), parameters)?;
             Ok(Cached {
                 values: vec![],
+                collation: None,
                 ty: d.columns[0].data_type.clone(),
                 null_array: false,
                 many: true,

@@ -282,7 +282,7 @@ fn projected_window_values_retain_collation() {
     );
 }
 #[test]
-fn other_new_planner_paths_fail_closed_for_collated_inputs() {
+fn other_new_planner_paths_preserve_collated_inputs() {
     let (_a, mut s) = fixture();
     for sql in [
         "SELECT x.id FROM w x RIGHT JOIN w y ON x.v=y.v",
@@ -294,14 +294,11 @@ fn other_new_planner_paths_fail_closed_for_collated_inputs() {
         "SELECT (SELECT x.v FROM w x WHERE x.id=w.id) FROM w",
         "SELECT x.id FROM w x,LATERAL (SELECT x.c) y",
         "SELECT w.id FROM w,generate_series(1,2) x",
-        "SELECT count(*) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w",
     ] {
-        assert_eq!(
-            s.execute(sql, &[], None),
-            Err(CoreError::Sql(E::Unsupported)),
-            "{sql}"
-        );
+        run(&mut s, sql);
     }
+    // Text RANGE offsets remain unsupported independently of collation propagation.
+    assert_eq!(s.execute("SELECT count(*) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w", &[], None), Err(CoreError::Sql(E::Unsupported)));
 }
 
 #[test]

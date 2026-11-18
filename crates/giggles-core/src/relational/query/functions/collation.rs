@@ -63,7 +63,7 @@ pub(super) fn bind(name: &str, value: BoundScalar) -> R<BoundScalar> {
     }
     if !matches!(
         value.ty,
-        DataType::Text | DataType::Varchar | DataType::Bpchar
+        DataType::Text | DataType::Varchar | DataType::Bpchar | DataType::TextArray
     ) {
         user_types::view_replace_error(format!(
             "collations are not supported by type {}",
@@ -128,7 +128,7 @@ impl BoundScalar {
     fn collation_derivation(&self) -> R<Derivation<'_>> {
         if !matches!(
             self.ty,
-            DataType::Text | DataType::Varchar | DataType::Bpchar
+            DataType::Text | DataType::Varchar | DataType::Bpchar | DataType::TextArray
         ) {
             return Ok(Derivation::default());
         }
@@ -290,7 +290,12 @@ impl ColumnScope {
                 },
             );
         }
-        Ok(Self(MATERIALIZED.with(|c| c.replace(values))))
+        let old = MATERIALIZED.with(|c| {
+            let old = c.borrow().clone();
+            c.borrow_mut().extend(values);
+            old
+        });
+        Ok(Self(old))
     }
 }
 impl Drop for ColumnScope {
@@ -323,8 +328,9 @@ pub(in crate::relational::query) fn bound_column(c: BoundColumn, d: &ColumnDef) 
     )
 }
 pub(in crate::relational::query) fn has_column(id: u64) -> bool {
-    MATERIALIZED.with(|c| c.borrow().contains_key(&id))
-        || COLUMNS.with(|c| c.borrow().contains_key(&id))
+    MATERIALIZED.with(|c| {
+        c.borrow().get(&id).map(|m| m.name.is_some() || m.conflict.is_some())
+    }).unwrap_or_else(|| COLUMNS.with(|c| c.borrow().contains_key(&id)))
 }
 type Cache = Mutex<std::collections::HashMap<String, Arc<giggles_icu::Collator>>>;
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -537,17 +543,6 @@ pub(in crate::relational::query) fn like(
     )))
 }
 
-pub(in crate::relational::query) fn set_pair(
-    a: Option<&BoundScalar>,
-    b: Option<&BoundScalar>,
-) -> R<bool> {
-    let d = merge(a.into_iter().chain(b))?;
-    if let Some((a, b)) = d.conflict {
-        mismatch(a, b, false)?;
-    }
-    Ok(d.name.is_some())
-}
-
 pub(in crate::relational::query) fn comparison_binding<'a>(
     args: impl Iterator<Item = &'a BoundScalar>,
 ) -> R<(Option<String>, bool)> {
@@ -564,7 +559,7 @@ impl BoundScalar {
     }
 }
 
-pub(super) fn display_name(n:&str)->String {
+pub(in crate::relational::query) fn display_name(n:&str)->String {
     let quote=|s:&str| {
         let simple=!s.is_empty() && s.chars().enumerate().all(|(i,c)|c=='_' || c.is_ascii_lowercase() || i>0 && c.is_ascii_digit());
         if simple && s!="default" {s.to_owned()} else {format!("\"{}\"",s.replace('"',"\"\""))}
@@ -573,4 +568,90 @@ pub(super) fn display_name(n:&str)->String {
     if user(n).is_some() && let Some((schema,name))=label.split_once('.') {
         if schema=="public" {quote(name)} else {format!("{}.{}",quote(schema),quote(name))}
     } else {quote(label)}
+}
+
+// Preserve binding derivations when a planner substitutes a materialized value.
+pub(in crate::relational::query) fn scalar(
+    value: Scalar,
+    metadata: Option<&BoundScalar>,
+) -> R<Scalar> {
+    let Some(metadata) = metadata else {
+        return Ok(value);
+    };
+    let d = metadata.collation_derivation()?;
+    if let Some((a, b)) = d.conflict {
+        let carrier =
+            |n: &str| Scalar::Call(format!("{IMPLICIT}{n}"), vec![Scalar::Cast(Box::new(Scalar::Literal(Value::Null)),metadata.ty.clone())]);
+        return Ok(Scalar::Call(
+            "coalesce".into(),
+            vec![value, carrier(a), carrier(b)],
+        ));
+    }
+    Ok(if let Some(n) = d.name {
+        Scalar::Call(
+            format!("{}{n}", if d.explicit { PREFIX } else { IMPLICIT }),
+            vec![value],
+        )
+    } else {
+        value
+    })
+}
+pub(in crate::relational::query) fn combined(
+    a: Option<&BoundScalar>,
+    b: Option<&BoundScalar>,
+    ty: DataType,
+) -> R<BoundScalar> {
+    BoundScalar {
+        ty,
+        node: Node::Literal(Value::Null),
+    }
+    .inherit_derivation(merge(a.into_iter().chain(b))?)
+}
+
+pub(in crate::relational::query) fn register(
+    columns: &[ColumnDef],
+    metadata: &[Option<BoundScalar>],
+) -> R<()> {
+    for (c, m) in columns.iter().zip(metadata.iter()) {
+        let d = m
+            .as_ref()
+            .map(BoundScalar::collation_derivation)
+            .transpose()?
+            .unwrap_or_default();
+        MATERIALIZED.with(|values| {
+            values.borrow_mut().insert(
+                c.id,
+                Metadata {
+                    name: d.name.map(str::to_owned),
+                    explicit: false,
+                    conflict: d.conflict.map(|(a, b)| (a.to_owned(), b.to_owned())),
+                },
+            )
+        });
+    }
+    Ok(())
+}
+pub(in crate::relational::query) fn equality_key(
+    value: Value,
+    metadata: Option<&BoundScalar>,
+) -> R<Value> {
+    let Some(n) = metadata
+        .map(BoundScalar::explicit_collation)
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(value);
+    };
+    if user(n).is_some_and(|(_, d, _, _)| !d) {
+        let c=collator(n)?;
+        return Ok(crate::relational::collation_keys::equality_value(&value,Some(c.as_ref())));
+    }
+    Ok(value)
+}
+
+/// A relation/subquery output has an implicit collation at its consumer.
+pub(in crate::relational::query) fn materialized(metadata: Option<&BoundScalar>, ty: DataType) -> R<BoundScalar> {
+    let mut d = merge(metadata.into_iter())?;
+    d.explicit = false;
+    BoundScalar { ty, node: Node::Literal(Value::Null) }.inherit_derivation(d)
 }

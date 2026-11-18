@@ -120,16 +120,16 @@ impl Namespace {
         Ok(out)
     }
 }
-#[derive(Clone)]
 pub(super) struct Shape {
     pub columns: Vec<ColumnDef>,
     pub typmods: Vec<i32>,
+    pub collations: Vec<Option<BoundScalar>>,
     pub(super) namespace: Namespace,
 }
 struct JoinShape {
     shape: Shape,
     on: Filter,
-    merged: Vec<(usize, usize, DataType)>,
+    merged: Vec<(usize, usize, DataType, bool)>,
 }
 
 fn alias(p: &mut Parser) -> R<Option<(String, Vec<String>)>> {
@@ -636,8 +636,11 @@ impl From {
                 alias,
                 aliases,
             } => {
-                let (columns, typmods) = function.resolve(state, parameters)?;
-                leaf_shape(columns, typmods, alias, aliases)
+                let (mut columns, typmods) = function.resolve(state, parameters)?;
+                if aliases.is_empty() { columns[0].name = alias.clone(); }
+                let mut shape = leaf_shape(columns, typmods, alias, aliases)?;
+                shape.collations = function.collations(state, parameters)?;
+                Ok(shape)
             }
             Self::Lateral(input) => input.resolve(state, parameters),
             Self::Leaf {
@@ -646,7 +649,9 @@ impl From {
                 aliases,
             } => {
                 let meta = query.resolve(state, parameters)?;
-                leaf_shape(meta.columns, meta.typmods, alias, aliases)
+                let mut shape = leaf_shape(meta.columns, meta.typmods, alias, aliases)?;
+                shape.collations = meta.collations.into_iter().map(|m| m.map(|m| functions::collation::materialized(Some(&m),m.ty.clone())).transpose()).collect::<R<_>>()?;
+                Ok(shape)
             }
             Self::Alias {
                 input,
@@ -724,6 +729,7 @@ pub(super) fn leaf_shape(
         .map(|(i, c)| (c.name.clone(), i))
         .collect();
     Ok(Shape {
+        collations: (0..columns.len()).map(|_| None).collect(),
         columns,
         typmods,
         namespace: Namespace {
@@ -834,7 +840,7 @@ fn join_shape(
         )?;
         let eq = Filter::Compare(col(a), "=".into(), col(offset + b));
         on = Filter::Logic(Box::new(on), true, Box::new(eq));
-        merged.push((a, b, ty));
+        merged.push((a, b, ty, false));
         visible.push((
             name.clone(),
             offset + right.columns.len() + merged.len() - 1,
@@ -851,18 +857,40 @@ fn join_shape(
             c.not_null = false;
         }
     }
+    left.collations.resize_with(offset, || None);
+    let mut right_collations = right.collations;
+    right_collations.resize_with(right_columns.len(), || None);
+    left.collations.extend(right_collations);
     left.columns.extend(right_columns);
     left.typmods.extend(right.typmods);
-    for ((a, b, ty), name) in merged.iter().zip(&names) {
-        let same = left.columns[*a].data_type == left.columns[offset + b].data_type
-            && left.typmods[*a] == left.typmods[offset + b];
+    for ((a, b, ty, prefer_right), name) in merged.iter_mut().zip(&names) {
+        let same = left.columns[*a].data_type == left.columns[offset + *b].data_type
+            && left.typmods[*a] == left.typmods[offset + *b];
+        let typmod = if same { left.typmods[*a] } else { -1 };
+        // PostgreSQL prefers an uncoerced Var for INNER USING. Its chosen
+        // value also supplies the output collation; only FULL coalesces sides.
+        let left_var = left.columns[*a].data_type == *ty && left.typmods[*a] == typmod;
+        let right_var = left.columns[offset + *b].data_type == *ty
+            && left.typmods[offset + *b] == typmod;
+        *prefer_right = matches!(kind, Kind::Right)
+            || matches!(kind, Kind::Inner) && matches!(ty, DataType::Text | DataType::Varchar)
+                && !left_var && right_var;
+        let (a_meta, b_meta) = if matches!(kind, Kind::Full | Kind::MergeFull) {
+            (left.collations[*a].as_ref(), left.collations[offset + *b].as_ref())
+        } else if *prefer_right {
+            (None, left.collations[offset + *b].as_ref())
+        } else {
+            (left.collations[*a].as_ref(), None)
+        };
+        let metadata = functions::collation::combined(a_meta, b_meta, ty.clone())?;
+        left.collations.push(Some(metadata));
         left.columns.push(ColumnDef {
             id: 0,
             name: name.clone(),
             data_type: ty.clone(),
             not_null: false,
         });
-        left.typmods.push(if same { left.typmods[*a] } else { -1 });
+        left.typmods.push(typmod);
     }
     visible.extend(
         namespace
@@ -884,11 +912,13 @@ fn join_shape(
         on = *filter.clone();
     }
     let shape = Shape {
+        collations: left.collations,
         columns: left.columns,
         typmods: left.typmods,
         namespace,
     };
     let table = table(&shape);
+    let _collations = functions::collation::ColumnScope::enter(&table.columns, &shape.collations)?;
     let resolve = |c: &ColumnRef, _: usize| {
         shape
             .namespace
@@ -913,12 +943,23 @@ fn table(shape: &Shape) -> TableDef {
     TableDef {
         id: 0,
         name: INPUT.into(),
-        columns: shape.columns.clone(),
+        columns: shape
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut c = c.clone();
+                c.id = u64::MAX - i as u64;
+                c
+            })
+            .collect(),
         primary_key: vec![],
     }
 }
 fn bound_on(spec: &JoinShape, parameters: &[Option<DataType>]) -> R<BoundFilter> {
     let table = table(&spec.shape);
+    let _collations =
+        functions::collation::ColumnScope::enter(&table.columns, &spec.shape.collations)?;
     spec.on.bind(
         parameters,
         &|c, _| {
@@ -936,7 +977,13 @@ pub(super) fn catalog(base: &Relational, shape: &Shape) -> R<Relational> {
     for (i, c) in columns.iter_mut().enumerate() {
         c.name = format!("\0join_column_{i}");
     }
-    cte::install(&mut state, INPUT, &columns, &shape.typmods)?;
+    cte::install_collated(
+        &mut state,
+        INPUT,
+        &columns,
+        &shape.typmods,
+        &shape.collations,
+    )?;
     Ok(state)
 }
 pub(super) fn prepare(query: &Query, shape: &Shape) -> R<Query> {
@@ -1078,6 +1125,21 @@ impl From {
                 )
             })
             .collect();
+        let key_metadata = keys
+            .iter()
+            .map(|(a, b)| {
+                functions::collation::combined(
+                    spec.shape.collations.get(*a).and_then(Option::as_ref),
+                    spec.shape
+                        .collations
+                        .get(offset + b)
+                        .and_then(Option::as_ref),
+                    spec.shape.columns[*a].data_type.clone(),
+                )
+                .map(Some)
+            })
+            .collect::<R<Vec<_>>>()?;
+        for metadata in key_metadata.iter().flatten() { metadata.check_comparison_collation()?; }
         let a = left.run(state, source, params, parameters, clock, execution)?;
         let b = right.run(state, source, params, parameters, clock, execution)?;
         let scratch = RetentionScope::new(execution);
@@ -1097,7 +1159,15 @@ impl From {
                     }
                 })
                 .collect::<R<Option<Vec<_>>>>()?
-                .map(|values| encode_key(&values))
+                .map(|values| {
+                    encode_key(
+                        &values
+                            .into_iter()
+                            .zip(&key_metadata)
+                            .map(|(v, m)| functions::collation::equality_key(v, m.as_ref()))
+                            .collect::<R<Vec<_>>>()?,
+                    )
+                })
                 .transpose()
         };
         if !keys.is_empty() {
@@ -1213,11 +1283,14 @@ fn emit(
     clock: Option<&super::super::super::clock::ExecutionClock>,
     out: &mut Relation<'_>,
 ) -> R<()> {
-    for (a, b, ty) in &spec.merged {
-        let value = match kind {
-            Kind::Right => &values[offset + b],
-            Kind::Full | Kind::MergeFull if values[*a] == Value::Null => &values[offset + b],
-            _ => &values[*a],
+    for (a, b, ty, prefer_right) in &spec.merged {
+        let value = if *prefer_right {
+            &values[offset + b]
+        } else {
+            match kind {
+                Kind::Full | Kind::MergeFull if values[*a] == Value::Null => &values[offset + b],
+                _ => &values[*a],
+            }
         };
         values.push(functions::coerce_clocked(value.clone(), ty, clock)?);
     }
@@ -1382,6 +1455,26 @@ fn lateral_run<'a>(
         }
     }
     Ok(out)
+}
+
+impl Clone for Shape {
+    fn clone(&self) -> Self {
+        Self {
+            columns: self.columns.clone(),
+            typmods: self.typmods.clone(),
+            namespace: self.namespace.clone(),
+            collations: self
+                .collations
+                .iter()
+                .map(|m| {
+                    m.as_ref().map(|m| {
+                        functions::collation::combined(Some(m), None, m.ty.clone())
+                            .expect("resolved derivation")
+                    })
+                })
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]

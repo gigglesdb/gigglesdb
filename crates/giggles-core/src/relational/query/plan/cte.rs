@@ -481,6 +481,7 @@ pub(super) fn install(
         .values()
         .flat_map(|t| std::iter::once(t.id).chain(t.columns.iter().map(|c| c.id)))
         .chain(state.ext.columns.keys().copied())
+        .filter(|id| *id < (1 << 62))
         .max()
         .unwrap_or(0)
         .checked_add(1)
@@ -603,7 +604,13 @@ pub(super) fn resolve(
                 return Err(SqlError::Unsupported);
             }
             aliases(&mut meta, &cte.aliases)?;
-            install(&mut state, &cte.name, &meta.columns, &meta.typmods)?;
+            install_collated(
+                &mut state,
+                &cte.name,
+                &meta.columns,
+                &meta.typmods,
+                &meta.collations,
+            )?;
             let step = right.resolve(&state, parameters)?;
             if meta.columns.len() != step.columns.len() {
                 return Err(SqlError::Syntax);
@@ -614,6 +621,22 @@ pub(super) fn resolve(
                 {
                     return Err(SqlError::Type);
                 }
+                let original = meta.collations.get(i).and_then(Option::as_ref);
+                let combined = functions::collation::combined(
+                    original,
+                    step.collations.get(i).and_then(Option::as_ref),
+                    column.data_type.clone(),
+                )?;
+                combined.require_collation()?;
+                let seed = original.map(BoundScalar::explicit_collation).transpose()?.flatten().unwrap_or("default");
+                let overall = combined.explicit_collation()?.unwrap_or("default");
+                if seed != overall {
+                    user_types::view_replace_error(format!(
+                        "recursive query \"{}\" column {} has collation {} in non-recursive term but collation {} overall",
+                        cte.name, i + 1, functions::collation::display_name(seed), functions::collation::display_name(overall)
+                    ));
+                    return Err(SqlError::CollationMismatch);
+                }
             }
             meta
         } else {
@@ -622,7 +645,13 @@ pub(super) fn resolve(
             meta
         };
         generated(cte, &mut meta, parameters)?;
-        install(&mut state, &cte.name, &meta.columns, &meta.typmods)?;
+        install_collated(
+            &mut state,
+            &cte.name,
+            &meta.columns,
+            &meta.typmods,
+            &meta.collations,
+        )?;
     }
     Ok(state)
 }
@@ -651,7 +680,13 @@ pub(super) fn validate_constants(
         };
         aliases(&mut meta, &cte.aliases)?;
         let mut state = catalog(state);
-        install(&mut state, &cte.name, &meta.columns, &meta.typmods)?;
+        install_collated(
+            &mut state,
+            &cte.name,
+            &meta.columns,
+            &meta.typmods,
+            &meta.collations,
+        )?;
         seed.validate_constants(&state, parameters)?;
         step.validate_constants(&state, parameters)
     } else {
@@ -754,6 +789,7 @@ pub(super) fn run_inner<'e>(
         &mut Vec<crate::relational::constraints::Event>,
     )>,
 ) -> R<Relation<'e>> {
+    let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
     let mut catalog = catalog(state);
     let mut materialized: Vec<(String, Relation<'e>)> = vec![];
     for cte in &plan.ctes {
@@ -780,7 +816,18 @@ pub(super) fn run_inner<'e>(
                 c.name = n.clone();
             }
         }
-        install(&mut catalog, &cte.name, &rows.columns, &rows.typmods)?;
+        let metadata = if let Some(dml)=&cte.dml {
+            dml::resolve(&mut dml.clone(), &catalog, &mut parameters.to_vec(), &cte.dml_parameters)?
+        } else if cte.recursive {
+            recursive_parts(cte)?.0.clone().resolve(&catalog,&mut parameters.to_vec())?
+        } else { cte.query.clone().resolve(&catalog, &mut parameters.to_vec())? };
+        install_collated(
+            &mut catalog,
+            &cte.name,
+            &rows.columns,
+            &rows.typmods,
+            &metadata.collations,
+        )?;
         materialized.push((cte.name.clone(), rows));
     }
     let wrapper = VirtualRows {
@@ -851,13 +898,14 @@ fn recurse<'e>(
     execution: &'e Execution<'_>,
 ) -> R<Relation<'e>> {
     let (seed, step, all) = recursive_parts(cte)?;
+    let seed_metadata = seed.clone().resolve(state,&mut parameters.to_vec())?;
     let seed = seed.run(state, source, params, parameters, clock, execution)?;
     let mut meta = Meta {
         columns: seed.columns.clone(),
         typmods: seed.typmods.clone(),
         type_oids: vec![],
         unknown: vec![false; seed.columns.len()],
-        collations: vec![],
+        collations: seed_metadata.collations,
     };
     aliases(&mut meta, &cte.aliases)?;
     let base_columns = meta.columns.clone();
@@ -870,6 +918,7 @@ fn recurse<'e>(
             seed,
             base_columns,
             base_typmods,
+            &meta.collations,
             state,
             source,
             params,
@@ -936,7 +985,7 @@ fn recurse<'e>(
     ];
     let mut seen: Vec<Vec<Value>> = vec![];
     let mut state = catalog(state);
-    install(&mut state, &cte.name, &base_columns, &base_typmods)?;
+    install_collated(&mut state, &cte.name, &base_columns, &base_typmods, &meta.collations)?;
     while !frontier.rows.is_empty() {
         let next_scope = RetentionScope::new(execution);
         let mut next = Relation::new(base_columns.clone(), base_typmods.clone(), execution);
@@ -960,7 +1009,7 @@ fn recurse<'e>(
                 let current = key(&row.values, &cycle_by);
                 for previous in &ancestor.cycle {
                     execution.comparison()?;
-                    cycle |= previous == &current;
+                    cycle |= previous.iter().zip(&current).enumerate().all(|(i,(a,b))| meta.collations.get(cycle_by[i]).and_then(Option::as_ref).map_or_else(||cmp(a,b),|m|m.compare_values(a,b)) == Ordering::Equal);
                 }
                 ancestor.cycle.push(current);
                 values.push(if cycle { mark.clone() } else { default.clone() });
@@ -970,7 +1019,7 @@ fn recurse<'e>(
                 let mut duplicate = false;
                 for previous in &seen {
                     execution.comparison()?;
-                    if previous == &values {
+                    if super::super::grouping::Key::metadata(previous.clone(),&meta.collations) == super::super::grouping::Key::metadata(values.clone(),&meta.collations) {
                         duplicate = true;
                         break;
                     }
@@ -1043,6 +1092,14 @@ fn recurse<'e>(
         seen_scope.borrow().charge(
             output.rows.len() * (std::mem::size_of::<usize>() + std::mem::size_of::<i64>()),
         )?;
+        // Breadth-first records start with a numeric depth, followed by the
+        // search fields. Depth-first and cycle paths contain only key fields.
+        let mut collations = vec![];
+        if which == 0 && cte.search.as_ref().is_some_and(|s| !s.depth) {
+            collations.push(None);
+        }
+        let by = if which == 0 { &search_by } else { &cycle_by };
+        collations.extend(by.iter().map(|i| meta.collations.get(*i).and_then(Option::as_ref)));
         let mut sorted: Vec<usize> = (0..output.rows.len()).collect();
         setops::sort(&mut sorted, execution, |a, b| {
             let path = |i: usize| {
@@ -1052,7 +1109,7 @@ fn recurse<'e>(
                     order_keys[i].1.as_ref().unwrap()
                 }
             };
-            path_cmp(path(*a), path(*b))
+            path_cmp(path(*a), path(*b), &collations)
         })?;
         let mut ranks = vec![0i64; sorted.len()];
         let mut rank = 0;
@@ -1068,7 +1125,7 @@ fn recurse<'e>(
                 } else {
                     order_keys[sorted[offset - 1]].1.as_ref().unwrap()
                 };
-                if path_cmp(a, b) != Ordering::Equal {
+                if path_cmp(a, b, &collations) != Ordering::Equal {
                     rank += 1;
                 }
             }
@@ -1102,6 +1159,7 @@ fn recurse_plain<'e>(
     mut frontier: Relation<'e>,
     columns: Vec<ColumnDef>,
     typmods: Vec<i32>,
+    collations: &[Option<BoundScalar>],
     state: &Relational,
     source: &dyn scan::RowSource,
     params: &[Value],
@@ -1110,7 +1168,7 @@ fn recurse_plain<'e>(
     execution: &'e Execution<'_>,
 ) -> R<Relation<'e>> {
     let mut state = catalog(state);
-    install(&mut state, &cte.name, &columns, &typmods)?;
+    install_collated(&mut state, &cte.name, &columns, &typmods,collations)?;
     let mut output = Relation::new(columns.clone(), typmods.clone(), execution);
     loop {
         let mut working = Relation::new(columns.clone(), typmods.clone(), execution);
@@ -1120,7 +1178,7 @@ fn recurse_plain<'e>(
                 let mut duplicate = false;
                 for previous in &output.rows {
                     execution.comparison()?;
-                    if previous.values == row.values {
+                    if super::super::grouping::Key::metadata(previous.values.clone(),collations) == super::super::grouping::Key::metadata(row.values.clone(),collations) {
                         duplicate = true;
                         break;
                     }
@@ -1156,15 +1214,15 @@ fn charge_path(scope: &RetentionScope<'_>, path: &[Vec<Value>]) -> R<()> {
                 .sum::<usize>(),
     )
 }
-fn path_cmp(a: &[Vec<Value>], b: &[Vec<Value>]) -> Ordering {
+fn path_cmp(a: &[Vec<Value>], b: &[Vec<Value>], collations: &[Option<&BoundScalar>]) -> Ordering {
     for (a, b) in a.iter().zip(b) {
-        for (a, b) in a.iter().zip(b) {
+        for (i, (a, b)) in a.iter().zip(b).enumerate() {
             // PostgreSQL record comparison sorts NULL fields after non-NULLs.
             let order = match (a, b) {
                 (Value::Null, Value::Null) => Ordering::Equal,
                 (Value::Null, _) => Ordering::Greater,
                 (_, Value::Null) => Ordering::Less,
-                _ => cmp(a, b),
+                _ => collations.get(i).copied().flatten().map_or_else(|| cmp(a, b), |m| m.compare_values(a, b)),
             };
             if order != Ordering::Equal {
                 return order;
@@ -1291,6 +1349,26 @@ pub(super) fn projection_oids(bound: &BoundQuery<'_>) -> Vec<u32> {
                 .unwrap_or(0)
         })
         .collect()
+}
+
+pub(super) fn install_collated(
+    state: &mut Relational,
+    name: &str,
+    columns: &[ColumnDef],
+    typmods: &[i32],
+    metadata: &[Option<BoundScalar>],
+) -> R<()> {
+    install(state, name, columns, typmods)?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 62);
+    let table = state.tables.get_mut(name).unwrap();
+    for c in &mut table.columns {
+        let old = c.id;
+        c.id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ext) = state.ext.columns.remove(&old) {
+            state.ext.columns.insert(c.id, ext);
+        }
+    }
+    functions::collation::register(&table.columns, metadata)
 }
 
 #[cfg(test)]

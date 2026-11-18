@@ -1029,6 +1029,7 @@ pub(super) fn prepare(select: &Select, state: &Relational) -> R<Query> {
     join::prepare(
         &query,
         &join::Shape {
+            collations: vec![],
             columns: columns.clone(),
             typmods: vec![-1; columns.len()],
             namespace,

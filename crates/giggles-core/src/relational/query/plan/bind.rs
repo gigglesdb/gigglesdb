@@ -89,6 +89,7 @@ impl Plan {
         state: &Relational,
         parameters: &[Option<DataType>],
     ) -> R<()> {
+        let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
         if self.mutation.is_some() || self.merge.is_some() { return Ok(()); }
         if !self.ctes.is_empty() {
             let mut plan = self.clone();
@@ -163,6 +164,7 @@ impl Plan {
         count: usize,
         declared: &[Option<DataType>],
     ) -> R<BoundPlan> {
+        let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
         if count > MAX_PARAMS || declared.len() > count {
             return Err(SqlError::Parameters);
         }
@@ -183,49 +185,11 @@ impl Plan {
             },
         })
     }
-    // Join/apply/SRF materialization currently carries types and typmods but
-    // not collation derivations. Reject collated inputs before that metadata
-    // can be discarded or bytewise hash/comparison paths can consume values.
-    fn reject_unpropagated_collations(&self, state: &Relational) -> R<()> {
-        if self.mutation.is_none()
-            && self.merge.is_none()
-            && !matches!(&self.body, Body::Select(s) if s.from.is_some() || !s.applies.is_empty())
-        {
-            return Ok(());
-        }
-        let mut collated = false;
-        let mut inspect = |s: &Scalar| {
-            if matches!(s, Scalar::Call(name, _) if functions::collation::internal(name)) {
-                collated = true;
-            }
-            Ok(())
-        };
-        self.visit_scalars(&mut |s| {
-            let _ = walk_scalar(s, &mut inspect);
-        });
-        self.visit_queries(&mut |q| {
-            let _ = q.walk_scalars(&mut inspect);
-        });
-        for name in self.read_tables() {
-            if let Ok(table) = views::table(state, &name) {
-                collated |= table
-                    .columns
-                    .iter()
-                    .any(|column| state.ext.column_collations.contains_key(&column.id));
-            }
-        }
-        if collated {
-            Err(SqlError::Unsupported)
-        } else {
-            Ok(())
-        }
-    }
     pub(super) fn resolve(
         &mut self,
         state: &Relational,
         parameters: &mut [Option<DataType>],
     ) -> R<Meta> {
-        self.reject_unpropagated_collations(state)?;
         let catalog = if self.ctes.is_empty() {
             None
         } else {
@@ -390,6 +354,7 @@ impl Plan {
             Body::Values(rows) => {
                 let width = rows.first().ok_or(SqlError::Syntax)?.len();
                 let mut columns = vec![];
+                let mut collations = vec![];
                 for i in 0..width {
                     let mut types = vec![];
                     for row in rows.iter() {
@@ -401,11 +366,18 @@ impl Plan {
                         }
                     }
                     let ty = common(types.into_iter())?;
+                    let mut metadata = None;
                     for row in rows.iter_mut() {
                         row[i].infer(Some(&ty), parameters, &no_column, &[])?;
                         row[i] = Scalar::Cast(Box::new(row[i].clone()), ty.clone());
-                        row[i].bind(&no_column, &[], parameters)?;
+                        let value = row[i].bind(&no_column, &[], parameters)?;
+                        metadata = Some(functions::collation::combined(
+                            metadata.as_ref(),
+                            Some(&value),
+                            ty.clone(),
+                        )?);
                     }
+                    collations.push(metadata);
                     columns.push(ColumnDef {
                         id: 0,
                         name: format!("column{}", i + 1),
@@ -418,7 +390,7 @@ impl Plan {
                     typmods: vec![-1; width],
                     type_oids: vec![],
                     unknown: vec![false; width],
-                    collations: vec![],
+                    collations,
                 }
             }
             Body::Set {
@@ -429,20 +401,19 @@ impl Plan {
             } => {
                 let mut a = left.resolve(state, parameters)?;
                 let b = right.resolve(state, parameters)?;
-                if matches!(op, SetOp::Union) && !*all {
-                    let mut collated = false;
-                    for i in 0..a.columns.len().min(b.columns.len()) {
-                        collated |= functions::collation::set_pair(
+                a.collations = (0..a.columns.len())
+                    .map(|i| {
+                        let value = functions::collation::combined(
                             a.collations.get(i).and_then(Option::as_ref),
                             b.collations.get(i).and_then(Option::as_ref),
+                            a.columns[i].data_type.clone(),
                         )?;
-                    }
-                    // Preserve the collation reader's fail-closed execution
-                    // boundary until set operators carry comparator metadata.
-                    if collated {
-                        return Err(SqlError::Unsupported);
-                    }
-                }
+                        if !matches!(op, SetOp::Union) || !*all {
+                            value.require_collation()?;
+                        }
+                        Ok(Some(value))
+                    })
+                    .collect::<R<_>>()?;
                 // bpchar consumers remain closed until DD-0068 comparison semantics land.
                 if a.columns
                     .iter()

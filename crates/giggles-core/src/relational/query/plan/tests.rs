@@ -473,7 +473,7 @@ fn deeply_nested_scalar_subqueries_preserve_parser_depth_error() {
 }
 
 #[test]
-fn planner_collation_materialization_fails_closed() {
+fn planner_collation_materialization_propagates() {
     let mut state = Relational::default();
     for sql in [
         "CREATE COLLATION planner_ci (provider=icu,locale='und-u-ks-level2',deterministic=false)",
@@ -501,7 +501,7 @@ fn planner_collation_materialization_fails_closed() {
         r#"SELECT * FROM unnest(ARRAY['ABC' COLLATE "und-x-icu"] ) u"#,
     ] {
         let p = Prepared::parse(sql, 1, state.epoch).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
-        assert_eq!(state.execute(&p, &[], None), Err(SqlError::Unsupported), "{sql}");
+        state.execute(&p, &[], None).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     }
 }
 

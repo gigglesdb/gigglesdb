@@ -586,6 +586,7 @@ impl Merge {
             not_null: false,
         });
         out.typmods.push(-1);
+        out.collations.push(None);
         out
     }
     fn returning(&self, shape: &join::Shape) -> Option<Plan> {
@@ -637,12 +638,6 @@ impl Merge {
         state: &Relational,
         parameters: &mut [Option<DataType>],
     ) -> R<bind::Meta> {
-        dml::reject_unpropagated_collations(
-            state,
-            &self.read_tables(),
-            &self.input.from,
-            self.plans().chain(self.input.returning.as_ref()),
-        )?;
         let shape = self.shape(state, parameters)?;
         let table = &state.tables[&self.input.target];
         for w in &self.clauses {
@@ -741,6 +736,7 @@ impl Merge {
         version_end: u64,
         mut deferred: Option<&mut super::super::super::DeferralState>,
     ) -> Result<SqlResult, crate::CoreError> {
+        let _metadata = functions::collation::ColumnScope::enter(&[], &[]).map_err(crate::CoreError::Sql)?;
         let mut snapshot = state.clone();
         let mut retained = scan::Retention::new(scan::retention_limit());
         for name in self.read_tables() {
@@ -831,6 +827,7 @@ impl Merge {
         injected: Option<&dyn scan::RowSource>,
         mut publish: Option<&mut Publisher<'_>>,
     ) -> R<SqlResult> {
+        let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
         let description = prepared.describe(state)?;
         let parameters = description
             .parameters

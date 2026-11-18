@@ -96,6 +96,7 @@ impl Plan {
         clock: Option<&super::super::super::clock::ExecutionClock>,
         execution: &'a Execution<'_>,
     ) -> R<Relation<'a>> {
+        let _metadata = functions::collation::ColumnScope::enter(&[], &[])?;
         if execution.cancelled() {
             return Err(SqlError::Aborted);
         }
@@ -236,7 +237,15 @@ impl Plan {
                         }
                     }
                 }
-                setops::apply(*op, *all, left, right, &mut result, execution)?;
+                setops::apply(
+                    *op,
+                    *all,
+                    left,
+                    right,
+                    &mut result,
+                    execution,
+                    &meta.collations,
+                )?;
             }
         }
         if let Some(sample) = &self.decorations.sample { sample.apply(&mut result, params, parameters, clock, execution)?; }
