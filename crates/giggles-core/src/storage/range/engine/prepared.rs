@@ -58,7 +58,7 @@ fn lock_position(key: &LockKey) -> Option<Vec<u8>> {
     match key {
         LockKey::Row { table, pk } if !pk.is_empty() => at(RangeSpace::Rows, *table, pk),
         LockKey::Unique { index, tuple } => at(RangeSpace::Index, *index, tuple),
-        LockKey::Row { .. } | LockKey::Table(_) => None,
+        LockKey::Row { .. } | LockKey::Table(_) | LockKey::RowKey { .. } => None,
         // Intervals have no single position; split_off cuts them at the split key.
         LockKey::Interval { .. } => None,
     }
@@ -263,6 +263,7 @@ impl Prepared {
                     put_bound(&mut lock, end)?;
                 }
                 LockKey::Table(_) => return Err(corrupt("table lock")),
+                LockKey::RowKey { .. } => return Err(corrupt("local row-key lock")),
             }
             lock.push(match mode {
                 LockMode::Shared => 0,

@@ -829,6 +829,23 @@ impl Transaction {
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
         self.services.acquire(self.id, key, mode, deadline, cancel)
     }
+    /// Swap read sets around an FK snapshot crosscheck. RowKey locks protect
+    /// this witness; ordinary version validation would reject non-key updates.
+    pub(crate) fn replace_reads(&mut self, reads: ReadSet) -> ReadSet {
+        std::mem::replace(&mut self.reads, reads)
+    }
+    /// Local FK key protection, separate from ordinary row writes.
+    pub(crate) fn lock_row_key(
+        &mut self, table: u64, pk_bytes: &[u8], mode: LockMode,
+        deadline: Option<Instant>, cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError> {
+        if matches!(self.services, TxnServices::Cluster(_)) {
+            return Ok(());
+        }
+        self.lock_cleanup_needed.store(true, Ordering::Relaxed);
+        self.services.acquire(self.id, LockKey::RowKey { table, pk: pk_bytes.to_vec() },
+            mode, deadline, cancel)
+    }
     /// Reads at the latest committed state until `end_latest`, recording no
     /// SERIALIZABLE reads; returns the transaction snapshot. FK checks at
     /// REPEATABLE READ and SERIALIZABLE use it for PostgreSQL's RI crosscheck:

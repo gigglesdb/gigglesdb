@@ -86,6 +86,20 @@ pub(crate) struct UpsertLockRows {
 }
 
 impl Prepared {
+    /// Conservative prelock decision before the new row image is available.
+    pub(crate) fn mutation_changes_key(&self, table: &TableDef,
+        indexes: &[secondary_index::Descriptor]) -> bool {
+        let names = match &self.statement {
+            Statement::Delete { .. } => return true,
+            Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
+            _ => return false,
+        };
+        table.columns.iter().enumerate().any(|(i, c)| names.contains(&&c.name)
+            && (table.primary_key.contains(&i) || indexes.iter().any(|d|
+                d.table == table.id && d.unique && d.columns.contains(&c.id))))
+    }
+
     pub(crate) fn upsert_lock_rows(&self, state: &Relational,
         indexes: &[secondary_index::Descriptor], params: &[Value],
         clock: Option<&clock::ExecutionClock>,

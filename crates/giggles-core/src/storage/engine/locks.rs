@@ -60,6 +60,11 @@ pub(crate) enum LockKey {
         table: u64,
         pk: Vec<u8>,
     },
+    /// FK key-share / FOR UPDATE; independent of row and interval locks.
+    RowKey {
+        table: u64,
+        pk: Vec<u8>,
+    },
     Unique {
         index: u64,
         tuple: Vec<u8>,

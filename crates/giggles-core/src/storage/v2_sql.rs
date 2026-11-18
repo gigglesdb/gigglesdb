@@ -591,11 +591,30 @@ impl SqlSession {
                             .as_ref()
                             .and_then(|name| parts.tables.get(name))
                             .map(|t| t.id);
-                        // Include the whole FK component: cascades can mutate children
-                        // and probe their other parents. Share conflicts with each
-                        // table's RowExclusive writer, while parent witnesses can share.
+                        // Local FK witnesses use RowKey locks. Only writing referential
+                        // actions retain the full component's Share/RowExclusive locks.
+                        // Cluster and DDL keep their existing component protocol.
+                        let component_locks = ddl
+                            || matches!(txn.services(), engine::txn::TxnServices::Cluster(_))
+                            || bound.write_tables().iter().any(|(name, command)| {
+                                let Some(table) = parts.tables.get(name) else { return false; };
+                                parts.ext.constraints.values().flatten().any(|c| {
+                                    let relational::catalog_ext::ConstraintKind::ForeignKey {
+                                        ref_table, on_delete, on_update, ..
+                                    } = &c.kind else { return false; };
+                                    let action = match *command {
+                                        "DELETE" => on_delete,
+                                        "UPDATE" => on_update,
+                                        _ => return false,
+                                    };
+                                    *ref_table == table.id && matches!(action,
+                                        relational::catalog_ext::Action::Cascade
+                                        | relational::catalog_ext::Action::SetNull
+                                        | relational::catalog_ext::Action::SetDefault)
+                                })
+                            });
                         let mut connected = target_id.into_iter().chain(write_ids.iter().copied()).collect::<BTreeSet<_>>();
-                        if writing {
+                        if writing && component_locks {
                             loop {
                                 let count = connected.len();
                                 for (&child, constraints) in &parts.ext.constraints {
@@ -768,6 +787,8 @@ impl SqlSession {
                                         &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
                                 }
                             }
+                            let key_prelock = fk_referenced(parts, table.id)
+                                && bound.mutation_changes_key(table, &parts.indexes);
                             if let Some(keys) = candidates {
                                 let physical = keys.iter().map(|key| {
                                     let mut physical = table.id.to_be_bytes().to_vec();
@@ -780,6 +801,11 @@ impl SqlSession {
                                 let mut retention = relational::scan::Retention::new(retention_limit);
                                 let mut fits = true;
                                 for key in physical {
+                                    if key_prelock {
+                                        txn.lock_row_key(table.id, &key[8..], LockMode::Exclusive,
+                                            crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err())
+                                            .map_err(crate::task::limits::lock_error)?;
+                                    }
                                     let target = txn.lock_for_write(Keyspace::Rows, &key, crate::task::limits::lock_deadline(),
                                         &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
                                     if let Some(bytes) = target.current {
@@ -1332,6 +1358,18 @@ impl<'a> SqlRows<'a> {
     }
 }
 
+fn fk_referenced(parts: &CatalogParts, table: u64) -> bool {
+    parts.ext.constraints.values().flatten().any(|c| matches!(c.kind,
+        relational::catalog_ext::ConstraintKind::ForeignKey { ref_table, .. } if ref_table == table))
+}
+
+fn fk_key_changed(table: &TableDef, indexes: &[relational::secondary_index::Descriptor],
+    old: &[relational::Value], new: &[relational::Value]) -> bool {
+    table.columns.iter().enumerate().any(|(i, c)| old[i] != new[i]
+        && (table.primary_key.contains(&i) || indexes.iter().any(|d|
+            d.table == table.id && d.unique && d.columns.contains(&c.id))))
+}
+
 impl SqlRows<'_> {
     /// Whether the committed version of `row` is newer than `ts`.
     fn fk_changed(&self, table: &TableDef, row: &[relational::Value], ts: engine::hlc::Ts)
@@ -1351,15 +1389,10 @@ impl SqlRows<'_> {
     /// (REPEATABLE READ, SERIALIZABLE), as PostgreSQL's RI queries for
     /// referencing rows do: a referencing row committed since the snapshot is a
     /// witness (23503/23001), and an action that writes it fails with 40001 in
-    /// lock_for_write. Cluster FK reads refresh even at READ COMMITTED, since
-    /// their row-lock wait can follow the statement snapshot.
+    /// lock_for_write. FK reads refresh even at READ COMMITTED, since a
+    /// row-key lock wait can follow the statement snapshot.
     fn at_latest<T>(&mut self, read: impl FnOnce(&mut Self) -> Result<T, CoreError>)
         -> Result<T, CoreError> {
-        if self.statement_snapshot_is_latest()
-            && !matches!(self.txn.services(), engine::txn::TxnServices::Cluster(_))
-        {
-            return read(self);
-        }
         self.txn.begin_latest();
         let result = read(self);
         self.txn.end_latest();
@@ -1387,16 +1420,13 @@ impl RowSink for SqlRows<'_> {
         if let Some(error) = source.error.into_inner() { return Err(error); }
         result.map_err(CoreError::Sql)
     }
-    // READ COMMITTED takes the statement snapshot after every FK table lock, so
-    // witnesses are current. So does a protected run: it restarts its snapshot
-    // after those locks (GD-0061 C2/C3), so no writer of a connected table is
-    // in flight and every commit is visible; its reads stay in its read set. A REPEATABLE READ or SERIALIZABLE snapshot can
-    // predate commits by the writers those locks waited for. The Share and
-    // RowExclusive locks are held to transaction end, so the latest committed
-    // state of every FK-connected table is final for this transaction. As in
-    // PostgreSQL 18 (r5/e/oracle/fk-race.out): the parent row of a child is
-    // read at the snapshot and fails with 40001 if changed since (FOR KEY
-    // SHARE); referencing rows of a parent key are read at the latest state.
+    // FK row locks (GD-0084 A2): Local child checks find latest parents, take
+    // RowKey Shared (KEY SHARE), then read latest again. Fixed snapshots retain
+    // their witnesses and crosscheck only PK/UNIQUE values, not non-key updates.
+    // RowKey is separate from Row: ordinary writes act like NO KEY UPDATE,
+    // while deletes/key changes take RowKey Exclusive (FOR UPDATE) BEFORE Row.
+    // Writing referential actions retain component table locks. Cluster keeps
+    // its existing protocol below.
     fn fk_lookup(
         &mut self, table: &TableDef, columns: &[u64], values: Option<&[relational::Value]>,
         parent: bool, matches: &mut dyn FnMut(&SqlRow) -> Result<bool, SqlError>,
@@ -1463,34 +1493,70 @@ impl RowSink for SqlRows<'_> {
             }
             return Ok(());
         }
-        if self.statement_snapshot_is_latest() {
-            return self.lookup_all(table, columns, values, parent, &mut |row| {
+        if !parent {
+            // A parent writer may have waited for a child's KEY SHARE after
+            // choosing its statement snapshot. Probe children after that wait.
+            self.txn.begin_latest();
+            let result = self.lookup_all(table, columns, values, false, &mut |row| {
                 if matches(&row)? { visit(row)?; }
                 Ok(())
             });
+            self.txn.end_latest();
+            return result;
         }
-        let ts = self.txn.snapshot_ts();
-        if parent {
-            // A parent the snapshot sees must not have changed since. One
-            // inserted later stays invisible, and the child fails with 23503.
-            let mut seen = Vec::new();
-            self.lookup_all(table, columns, values, true, &mut |row| {
-                if !matches(&row)? { return Ok(()); }
-                seen.push(row.values.clone());
-                visit(row)
-            })?;
-            for values in seen {
-                if self.fk_changed(table, &values, ts)? {
+        let fixed = !self.statement_snapshot_is_latest();
+        let mut snapshot = Vec::new();
+        if fixed {
+            let reads = self.txn.replace_reads(Default::default());
+            let result = self.lookup_all(table, columns, values, true, &mut |row| {
+                if matches(&row)? { snapshot.push(row); }
+                Ok(())
+            });
+            self.txn.replace_reads(reads);
+            result?;
+        }
+        self.txn.begin_latest();
+        let mut parents = Vec::new();
+        let result = self.lookup_all(table, columns, values, true, &mut |row| {
+                if matches(&row)? { parents.push(row); }
+                Ok(())
+            });
+        self.txn.end_latest();
+        result?;
+        if parents.is_empty() {
+            return if snapshot.is_empty() { Ok(()) }
+                else { Err(CoreError::Sql(SqlError::Conflict)) };
+        }
+        let keys = parents.iter().map(|row| codec::pk_bytes(&table.primary_key.iter()
+            .map(|i| row.values[*i].clone()).collect::<Vec<_>>()))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        for key in keys {
+            self.txn.lock_row_key(table.id, &key, LockMode::Shared,
+                crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err())
+                .map_err(crate::task::limits::lock_error)?;
+        }
+        self.txn.begin_latest();
+        let mut latest = Vec::new();
+        let result = self.lookup_all(table, columns, values, true, &mut |row| {
+                if matches(&row)? { latest.push(row); }
+                Ok(())
+            });
+        self.txn.end_latest();
+        result?;
+        if fixed {
+            for row in snapshot {
+                if !latest.iter().any(|current| !fk_key_changed(table, &self.parts.indexes,
+                    &row.values, &current.values)) {
                     return Err(CoreError::Sql(SqlError::Conflict));
                 }
+                visit(row).map_err(CoreError::Sql)?;
             }
-            return Ok(());
+        } else {
+            for row in latest { visit(row).map_err(CoreError::Sql)?; }
         }
-        self.at_latest(|rows| rows.lookup_all(table, columns, values, false, &mut |row| {
-            if matches(&row)? { visit(row)?; }
-            Ok(())
-        }))
+        Ok(())
     }
+
     fn fk_child_page(
         &mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
         after: Option<Vec<u8>>,
@@ -1986,6 +2052,28 @@ impl RowSink for SqlRows<'_> {
         before: &BTreeMap<Vec<u8>, SqlRow>,
         after: &BTreeMap<Vec<u8>, SqlRow>,
     ) -> Result<(), CoreError> {
+        // Protect changed parent keys before checking children, including
+        // fixed snapshots and searched mutations without candidate prelocks.
+        if matches!(self.txn.services(), engine::txn::TxnServices::Local { .. })
+            && fk_referenced(self.parts, table.id) {
+            let keys = before.iter().filter(|(key, old)| after.get(*key).is_none_or(|new|
+                fk_key_changed(table, &self.parts.indexes, &old.values, &new.values)))
+                .map(|(_, row)| codec::pk_bytes(&table.primary_key.iter()
+                    .map(|i| row.values[*i].clone()).collect::<Vec<_>>()))
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            for key in keys {
+                self.txn.lock_row_key(table.id, &key, LockMode::Exclusive,
+                    crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err())
+                    .map_err(crate::task::limits::lock_error)?;
+                let mut physical = table.id.to_be_bytes().to_vec();
+                physical.extend(key);
+                // Fixed-snapshot writers must detect a changed parent before
+                // reporting any child witness discovered after this wait.
+                self.txn.lock_for_write(Keyspace::Rows, &physical,
+                    crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err())
+                    .map_err(crate::task::limits::lock_error)?;
+            }
+        }
         let mut image = relational::Relational::catalog_image(self.parts.tables.clone(), self.parts.ext.clone(), u64::MAX, 1).map_err(CoreError::Sql)?;
         image.catalog_indexes(&self.parts.indexes).map_err(CoreError::Sql)?;
         for (key, row) in after {
@@ -2068,8 +2156,16 @@ impl RowSink for SqlRows<'_> {
         }
         // Acquire and validate every witness before buffering any write, with
         // deterministic physical key order for re-key and searched mutations.
-        for (key, (old, _)) in &changes {
+        for (key, (old, new)) in &changes {
             crate::cancellation::check()?;
+            if matches!(self.txn.services(), engine::txn::TxnServices::Local { .. })
+                && fk_referenced(self.parts, table.id)
+                && old.is_some_and(|old| new.is_none_or(|new|
+                    fk_key_changed(table, &self.parts.indexes, &old.values, &new.values))) {
+                self.txn.lock_row_key(table.id, &key[8..], LockMode::Exclusive,
+                    crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err())
+                    .map_err(crate::task::limits::lock_error)?;
+            }
             let target = self.txn.lock_for_write(Keyspace::Rows, key, crate::task::limits::lock_deadline(), &|| {
                 crate::cancellation::check().is_err()
             }).map_err(crate::task::limits::lock_error)?;
