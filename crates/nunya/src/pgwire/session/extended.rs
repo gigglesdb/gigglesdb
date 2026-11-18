@@ -652,6 +652,13 @@ impl Session {
             }
             Backend::Refused(b'A') => return Ok(vec![]),
             Backend::ErrorResponse(fields) => {
+                if matches!(self.pending.front(), Some(Pending::Sync)) {
+                    // Sync can fail while committing the implicit transaction. Its
+                    // ReadyForQuery still ends this segment; later work is deferred.
+                    self.rollback_on_sync = false;
+                    self.extended_execute_forwarded = false;
+                    return Ok(vec![Backend::ErrorResponse(redact_error(&fields))]);
+                }
                 let hidden = matches!(self.pending.front(), Some(Pending::RefusalError));
                 if !matches!(
                     self.pending.front(),

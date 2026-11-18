@@ -676,9 +676,11 @@ impl Session {
                 Ok(vec![Backend::EmptyQueryResponse])
             }
             Backend::ErrorResponse(fields) => {
-                if !self.waiting || (self.active.is_empty() && !self.empty_pending) {
+                if !self.waiting {
                     return Err(protocol());
                 }
+                // An implicit commit can fail after the last CommandComplete;
+                // the Query still owns responses until its ReadyForQuery.
                 self.empty_pending = false;
                 // An upstream error terminates this query and skips its remaining statements.
                 if let Some(active) = self.active.pop_front() {

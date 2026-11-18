@@ -3330,6 +3330,54 @@ async fn live_pg_upstream_sql_errors_pass_through() -> ServeResult<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires NUNYA_TEST_PG and NUNYA_TEST_PG_ADMIN pointing at harness database"]
+async fn live_pg_deferred_unique_commit_error_passes_through() -> ServeResult<()> {
+    fn check(checks: &mut LiveChecks, name: &str, ok: bool) {
+        if ok { checks.pass += 1; } else { checks.fail += 1; }
+        eprintln!("CHECK {name} {}", if ok { "PASS" } else { "FAIL" });
+    }
+    fn sql_error(result: &Result<(), tokio_postgres::Error>) -> bool {
+        result.as_ref().err().and_then(|e| e.as_db_error()).is_some_and(|e|
+            e.code().code() == "23505" && !e.message().contains("555-0100")
+                && !e.detail().unwrap_or_default().contains("555-0100"))
+    }
+    let admin_url = std::env::var("NUNYA_TEST_PG_ADMIN")?;
+    let (admin, conn) = tokio_postgres::connect(&admin_url, NoTls).await?;
+    let _admin_driver = Driver(tokio::spawn(async move { let _ = conn.await; }));
+    let table = format!("live_deferred_{}", nunya::token::SessionId::random().to_hex());
+    let _table = TableGuard { url: admin_url, name: table.clone() };
+    admin.batch_execute(&format!(
+        "CREATE TABLE public.{table} (id text, CONSTRAINT {table}_uq UNIQUE (id) DEFERRABLE INITIALLY DEFERRED);
+         INSERT INTO public.{table} VALUES ('555-0100');
+         GRANT SELECT, INSERT ON public.{table} TO nunya"
+    )).await?;
+    let mut h = ServeHarness::new(&file_sink_policy(), Some(&std::env::var("NUNYA_TEST_PG")?), None, None, "")?;
+    h.start().await?;
+    let (s, secret, _) = h.acquire_session("live-deferred-commit", "postgres", Mode::ReadWrite).await?;
+    let (client, _driver) = session_connect(&h, &s, &secret).await?;
+    let mut checks = LiveChecks::default();
+    let insert = format!("INSERT INTO public.{table} (id) VALUES ('555-0100')");
+    let prepared = client.prepare(&insert).await?;
+    let result = client.execute(&prepared, &[]).await.map(|_| ());
+    check(&mut checks, "extended-commit-23505-redacted", sql_error(&result));
+    check(&mut checks, "extended-commit-reusable", client.simple_query("SELECT 1").await.is_ok());
+    check(&mut checks, "simple-commit-23505-redacted", sql_error(&client.batch_execute(&insert).await));
+    check(&mut checks, "simple-commit-reusable", client.simple_query("SELECT 1").await.is_ok());
+    client.batch_execute("BEGIN").await?;
+    check(&mut checks, "explicit-insert-deferred", client.execute(&prepared, &[]).await.is_ok());
+    check(&mut checks, "explicit-commit-23505-redacted", sql_error(&client.batch_execute("COMMIT").await));
+    check(&mut checks, "explicit-commit-reusable", client.simple_query("SELECT 1").await.is_ok());
+    let records = std::fs::read_to_string(h.dir().join("read.log"))?
+        .lines().map(serde_json::from_str::<serde_json::Value>).collect::<Result<Vec<_>, _>>()?;
+    check(&mut checks, "no-outcome-unknown", !records.iter().any(|r|
+        r["session"].as_str() == Some(s.id.as_str())
+            && (r["event"] == "write_outcome_unknown" || r["reason"] == "upstream_lost")));
+    eprintln!("SUMMARY pass={} fail={}", checks.pass, checks.fail);
+    assert_eq!(checks.fail, 0, "live deferred commit qualification failed");
+    Ok(())
+}
+
 // Record times and outcomes without retaining token contents.
 struct LiveLimitAttempt {
     start: std::time::Instant,
