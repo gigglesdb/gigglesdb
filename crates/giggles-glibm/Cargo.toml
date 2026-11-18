@@ -1,0 +1,16 @@
+[package]
+name = "giggles-glibm"
+version = "0.1.0"
+edition = "2024"
+autotests = false
+license = "LGPL-2.1-or-later"
+
+[lib]
+name = "giggles_glibm"
+crate-type = ["cdylib", "rlib"]
+
+[workspace]
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
