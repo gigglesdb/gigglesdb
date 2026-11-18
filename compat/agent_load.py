@@ -524,7 +524,7 @@ def worker_main(spec_path):
 def under_work_base(path):
     from compat_lib.util import output_root
     path = output_root(path)
-    if not path.is_relative_to(WORK_BASE.resolve()):
+    if os.name == 'nt' and not path.is_relative_to(WORK_BASE.resolve()):
         raise ValueError('work directory must be under J:/gigglesdb-work')
     return path
 
@@ -589,7 +589,7 @@ class Run:
         self.root = under_work_base(args.work) / ('run-' + time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
         self.root.mkdir(parents=True)
         (self.root/'tmp').mkdir()
-        self.env = dict(os.environ, TEMP=str(self.root/'tmp'), TMP=str(self.root/'tmp'))
+        self.env = dict(os.environ, TEMP=str(self.root/'tmp'), TMP=str(self.root/'tmp'), TMPDIR=str(self.root/'tmp'))
         self.data = self.root/'data'
         self.log = (self.root/'harness.log').open('w', encoding='utf-8')
         self.plan = task_plan(args.rows, args.phase_b_tasks, args.phase_c_tasks)
@@ -623,18 +623,8 @@ class Run:
             c.query(f'GRANT SELECT, UPDATE ON {TABLE} TO {EXECUTOR}')
             expires = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2)).strftime('%Y-%m-%d %H:%M:%S+00')
             statements = [create_task_sql(t, expires) for tasks in self.plan.values() for t in tasks]
-            offline = False
             for sql in statements:
-                try:
-                    c.query(sql)
-                except PgError as e:
-                    # 42601 on the first CREATE TASK: this server has no task DDL
-                    # over SQL yet (R3-110). Only a --task-tool can stand in.
-                    if e.sqlstate != '42601' or sql is not statements[0] or not self.args.task_tool:
-                        raise RuntimeError(f'CREATE TASK failed ({e}); task DDL over SQL is R3-110. '
-                                           'Pass --task-tool to create tasks offline.') from e
-                    offline = True
-                    break
+                c.query(sql)
             count = c.query(f'SELECT count(*) FROM {TABLE}')[0][0][0]
             if int(count) != self.args.rows:
                 raise RuntimeError(f'loaded {count} rows, expected {self.args.rows}')
@@ -643,15 +633,6 @@ class Run:
             server.stop()
             (run/'bin'/self.args.server_bin.name).unlink(missing_ok=True)
         self.task_ddl = 'sql'
-        if offline:
-            sql_file = self.root/'tasks.sql'
-            sql_file.write_text('\n'.join(statements) + '\n', encoding='utf-8')
-            result = subprocess.run([str(self.args.task_tool), str(self.data/'db'), OWNER, str(sql_file)],
-                                    env=self.env, capture_output=True, text=True, timeout=600)
-            (self.root/'task-tool.log').write_text(result.stdout + result.stderr, encoding='utf-8')
-            if result.returncode:
-                raise RuntimeError(f'--task-tool exited {result.returncode}; see task-tool.log')
-            self.task_ddl = 'tool:' + str(self.args.task_tool)
         self.say(f'setup done: {self.args.rows} rows in {self.load_seconds}s; tasks by {self.task_ddl}')
 
     def pki(self):
@@ -823,9 +804,9 @@ class Run:
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument('--server-bin', type=Path, required=True)
+    p.add_argument('--server-bin', type=Path, default=os.environ.get('GIGGLES_SERVER_BIN'))
     p.add_argument('--smoke', action='store_true', help='10,000 rows and 5 s phases')
-    p.add_argument('--work', type=Path, default=WORK_BASE/'agent-load')
+    p.add_argument('--work', type=Path, default=os.environ.get('AGENT_LOAD_WORK') or (WORK_BASE/'agent-load' if os.name == 'nt' else None))
     p.add_argument('--report', type=Path, help='default compat/reports/<sha8>/agent-load.json (smoke: in the run directory)')
     p.add_argument('--bound', type=Path, default=BOUND_FILE)
     p.add_argument('--rows', type=int)
@@ -836,10 +817,13 @@ def parse_args(argv):
     p.add_argument('--phase-c-tasks', type=int)
     p.add_argument('--seed', type=int, default=404)
     p.add_argument('--keep-data', action='store_true')
-    p.add_argument('--task-tool', type=Path,
-                   help='stand-in until CREATE TASK over SQL (R3-110) lands: run as TOOL <db> <issuer> <sql file> '
-                        'on the stopped database to create the tasks')
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.server_bin is None or args.work is None:
+        missing = ('--server-bin or GIGGLES_SERVER_BIN' if args.server_bin is None
+                   else '--work or AGENT_LOAD_WORK on non-Windows systems')
+        p.exit(EXIT_HARNESS, f'{p.prog}: required: {missing}\n')
+    return args
+
 
 
 def main(argv=None):

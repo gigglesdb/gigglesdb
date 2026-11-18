@@ -186,7 +186,7 @@ the runner starts background observers and sequential stack captures:
 | Background, about 300 s | pidstat, iostat, biolatency, fsync histogram, syscount |
 | On-CPU, 30 s | 499 Hz frame pointers; fallback 99 Hz `dwarf,8192` |
 | Off-CPU, 30 s | `offcputime-bpfcc -f -d` |
-| Futex, 30 s | bpftrace user stacks, summed wait µs and counts |
+| Futex, 30 s | bpftrace user stacks, summed wait Âµs and counts |
 | Optional lock, 30 s | `perf lock contention -b` when supported |
 | Wakeup, 20 s | `wakeuptime-bpfcc -f` |
 | After captures/load | Copy RocksDB LOGs, stop server, CPU report/folding, SVGs, wait report |
@@ -214,7 +214,7 @@ Names below use `<key>` such as `giggles-sql-c32`:
 | File | Contents |
 |---|---|
 | `folded-<key>.txt`, `top-<key>.txt`, `flame-cpu-<key>.svg` | CPU folded stacks, text report, flamegraph |
-| `offcpu-<key>.folded`, `flame-offcpu-<key>.svg` | Blocked time in µs and flamegraph |
+| `offcpu-<key>.folded`, `flame-offcpu-<key>.svg` | Blocked time in Âµs and flamegraph |
 | `futex-<key>.txt` | User stack wait-time and count maps |
 | `wakeup-<key>.folded`, `flame-wakeup-<key>.svg` | Waker stacks/time and flamegraph |
 | `lock-<key>.txt` | Optional perf BPF lock contention |
@@ -265,3 +265,20 @@ count, p50_ms, p95_ms, p99_ms, max_ms, errors. Counts include failed operations;
 errors count terminal failures after retries, preserving existing semantics.
 Warmup is a separate invocation and is excluded. The summary includes a
 per-operation table for each measured run.
+
+## Agent-load suite (GD-0061 R3-404)
+
+Run `scripts/bench-remote.sh --suite agent-load --tip <commit> --who <name>`
+to build the release server and run the full application latency bound harness
+on a large benchmark box. This mode uses a fixed 45-minute estimate, ignores
+matrix options, and refuses `--profile` and `--build-snapshot`. The normal cap,
+slot, TTL, bundle and box cleanup rules apply. `--data-root` overrides the box
+data parent; `--results-root <local dir>` overrides the local results parent
+(default `J:/gigglesdb-work/boat/bench`) for either suite.
+
+Results include `agent-load.json`, `summary.md`, `meta.json` and `logs.tar.gz`.
+The archive includes harness artifacts except database `data` directories.
+Harness exits are 0 (pass), 2 (application errors), 3 (bound failure), and 1
+(harness failure); setup failures use rc=2 with an `AGENT-LOAD SETUP FAILED`
+summary marker. The remote wrapper succeeds only for rc=0. No smoke mode is
+used. The box needs host OpenSSL and Python 3 with the standard library.

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import unittest
 import uuid
+from unittest import mock
 
 import agent_load as al
 
@@ -114,11 +115,44 @@ class ReportSchema(unittest.TestCase):
         self.assertIn('report.schema is not ' + al.SCHEMA_ID, problems)
 
 
+class ArgumentHandling(unittest.TestCase):
+    def test_env_defaults_and_overrides(self):
+        with mock.patch.dict(os.environ, {'GIGGLES_SERVER_BIN': 'server', 'AGENT_LOAD_WORK': 'work'}, clear=True):
+            args = al.parse_args([])
+            self.assertEqual(args.server_bin, Path('server'))
+            self.assertEqual(args.work, Path('work'))
+            args = al.parse_args(['--server-bin', 'other', '--work', 'other-work'])
+            self.assertEqual(args.server_bin, Path('other'))
+            self.assertEqual(args.work, Path('other-work'))
+
+    def test_missing_defaults(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit) as caught:
+                al.parse_args([])
+            self.assertEqual(caught.exception.code, al.EXIT_HARNESS)
+            # Patch only during policy decisions, avoiding Path's platform dispatch.
+            with mock.patch.object(al.os, 'name', 'posix'):
+                with self.assertRaises(SystemExit) as caught:
+                    al.parse_args(['--server-bin', 'server'])
+            self.assertEqual(caught.exception.code, al.EXIT_HARNESS)
+
+    def test_work_policy(self):
+        allowed = Path('J:/gigglesdb-work/r3/tmp-w12').resolve()
+        outside = Path('J:/elsewhere').resolve()
+        with mock.patch('compat_lib.util.output_root', return_value=outside):
+            with mock.patch.object(al.os, 'name', 'posix'):
+                self.assertEqual(al.under_work_base('unused'), outside)
+            with mock.patch.object(al.os, 'name', 'nt'):
+                with self.assertRaises(ValueError):
+                    al.under_work_base('unused')
+        with mock.patch('compat_lib.util.output_root', return_value=allowed):
+            self.assertEqual(al.under_work_base('unused'), allowed)
+
+
 class SmokeRun(unittest.TestCase):
     """The --smoke mode against a built giggles-server (GIGGLES_SERVER_BIN).
 
-    AGENT_LOAD_TASK_TOOL, when set, is passed as --task-tool for servers that do
-    not yet run CREATE TASK over SQL (R3-110). Data and logs go under
+    Data and logs go under
     AGENT_LOAD_WORK (default J:/gigglesdb-work/agent-load/pytest).
     """
 
@@ -131,9 +165,7 @@ class SmokeRun(unittest.TestCase):
         report_path = work / 'agent-load.json'
         args = [sys.executable, '-I', str(SCRIPT), '--smoke', '--server-bin', binary, '--work', str(work),
                 '--report', str(report_path)]
-        if os.environ.get('AGENT_LOAD_TASK_TOOL'):
-            args += ['--task-tool', os.environ['AGENT_LOAD_TASK_TOOL']]
-        env = dict(os.environ, TEMP=str(work), TMP=str(work))
+        env = dict(os.environ, TEMP=str(work), TMP=str(work), TMPDIR=str(work))
         result = subprocess.run(args, capture_output=True, text=True, env=env, timeout=900)
         (work / 'pytest-stdout.log').write_text(result.stdout + result.stderr, encoding='utf-8')
         # A smoke run is too short and too small to judge the bound; it must

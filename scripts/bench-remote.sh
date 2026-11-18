@@ -24,6 +24,9 @@
 #   --server-cpus 0-5 --client-cpus 6-7   taskset split (default: all but the
 #                           last two cores for servers, last two for the client)
 # Other options:
+#   --suite matrix|agent-load  default matrix; agent-load ignores matrix options
+#                           and refuses --profile / --build-snapshot
+#   --results-root <dir>    local results parent (default J:/gigglesdb-work/boat/bench)
 #   --profile               extra diagnostic repeat per GigglesDB target/client
 #                           after normal repeats (first mix/protocol group);
 #                           separate fp build <=1510s, profile phase <=1800s
@@ -52,11 +55,14 @@ gate_snapshot=gigglesdb-gate-base
 max_starts=200   # plan-included starts per day, all agents
 max_boxes=${GATE_MAX_BOXES:-10}   # concurrent boxes, account-wide, shared with gates
 type=large       # benches run on large only
+suite=matrix results_root=J:/gigglesdb-work/boat/bench
 tip='' who='' ttl=7200 slot_wait=1800 build_snapshot=0 profile=0
 targets=pg,giggles-sql clients=8,32 mixes=read,write,tx protocols=all opset=common data_root=''
 warmup=30 duration=300 repeats=3 rows=1000 server_cpus='' client_cpus=''
 while [ $# -gt 0 ]; do
   case "$1" in
+    --suite) suite=$2; shift 2 ;;
+    --results-root) results_root=$2; shift 2 ;;
     --tip) tip=$2; shift 2 ;;
     --who) who=$2; shift 2 ;;
     --ttl) ttl=$2; shift 2 ;;
@@ -83,6 +89,14 @@ usage() { sed -n '2,40p' "$0" >&2; exit 2; }
 [[ "$who" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "bad --who" >&2; exit 2; }
 who=bench-${who#bench-}
 [ "$ttl" -le 7200 ] 2>/dev/null || { echo "--ttl must be at most 7200" >&2; exit 2; }
+case "$suite" in matrix|agent-load) ;; *) echo "bad --suite (matrix|agent-load)" >&2; exit 2 ;; esac
+if [ "$suite" = agent-load ] && { [ "$profile" = 1 ] || [ "$build_snapshot" = 1 ]; }; then
+  echo "agent-load refuses --profile and --build-snapshot" >&2; exit 2
+fi
+if [ "$suite" = agent-load ]; then
+  [[ -z "$data_root" || "$data_root" =~ ^/[A-Za-z0-9_./-]+$ ]] || { echo "bad --data-root (absolute box path)" >&2; exit 2; }
+fi
+if [ "$suite" = matrix ]; then
 [[ "$targets" =~ ^(pg|giggles-sql|giggles-native)(,(pg|giggles-sql|giggles-native))*$ ]] || { echo "bad --targets" >&2; exit 2; }
 [[ "$clients" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "bad --clients" >&2; exit 2; }
 [[ "$mixes" =~ ^[a-z0-9=+]+(,[a-z0-9=+]+)*$ ]] || { echo "bad --mixes" >&2; exit 2; }
@@ -95,6 +109,7 @@ fi
 for v in "$warmup" "$duration" "$repeats" "$rows"; do [[ "$v" =~ ^[0-9]+$ ]] || { echo "bad number $v" >&2; exit 2; }; done
 [ "$duration" -gt 0 ] && [ "$repeats" -gt 0 ] && [ "$rows" -ge 10 ] || { echo "duration/repeats must be > 0, rows >= 10" >&2; exit 2; }
 for v in "$server_cpus" "$client_cpus"; do [[ -z "$v" || "$v" =~ ^[0-9,-]+$ ]] || { echo "bad cpu list $v" >&2; exit 2; }; done
+fi
 [ -x "$B" ] || { echo "boat CLI not found at $B (set BOAT)" >&2; exit 5; }
 
 # Time estimate: each measured run costs warmup + duration + ~30s for server
@@ -103,6 +118,7 @@ for v in "$server_cpus" "$client_cpus"; do [[ -z "$v" || "$v" =~ ^[0-9,-]+$ ]] |
 # Profiling adds 1510s for its build plus min(1800, 270 + targets * 900)s
 # for the phase, where targets counts non-pg target/client pairs (270s =
 # apt-get 190s plus perf version/sysctl checks; 900s = per-target worst case).
+if [ "$suite" = matrix ]; then
 count() { echo "$1" | tr ',' '\n' | grep -c .; }
 nt=$(count "$targets"); per=$(( nt * $(count "$protocols") ))
 [[ ",$targets," == *",giggles-native,"* ]] && per=$(( (nt - 1) * $(count "$protocols") + 1 ))
@@ -123,6 +139,9 @@ if [ "$profile" = 1 ] && [ "$profile_runs" -gt 0 ]; then
   profile_extra=$(( 1510 + phase ))
 fi
 est=$(( est + profile_extra ))
+else
+  runs=1 est=2700 measured_est=2700 profile_extra=0
+fi
 budget=$(( ttl - 1200 ))
 if [ $build_snapshot = 0 ] && [ "$est" -gt "$budget" ]; then
   echo "matrix of $runs runs needs ~$(( est / 60 )) min, over the $(( budget / 60 )) min a ${ttl}s box leaves after 20 min of build/setup." >&2
@@ -134,7 +153,7 @@ g() { git -C "$repo" "$@"; }
 tip=$(g rev-parse --verify "$tip^{commit}")
 short=${tip:0:12}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-if [ $build_snapshot = 1 ]; then run="$boatdir/bench/snapshot-$stamp-$short-$who-$$"; else run="$boatdir/bench/$stamp-$short-$who-$$"; fi
+if [ $build_snapshot = 1 ]; then run="$results_root/snapshot-$stamp-$short-$who-$$"; else run="$results_root/$stamp-$short-$who-$$"; fi
 mkdir -p "$run" "$boatdir/slots"
 log() { echo "[bench-remote $(date -u +%T)] $*" >&2; }
 bj() { "$B" --no-update "$@"; }
@@ -154,7 +173,7 @@ copy_back() { # Best effort, including incomplete benches; never prevents deleti
   bexec_t 120 "$box" "cd /home/user && timeout --kill-after=10 90 tar --exclude='*.data' --exclude='*.data.old' --exclude='raw-*' -czf bench-logs.tar.gz bench bench.out" >/dev/null || log "WARNING: log archive incomplete"
   ( cd "$run" && timeout --kill-after=10 150 "$B" --no-update scp "$box:/home/user/bench-logs.tar.gz" logs.tar.gz >/dev/null 2>&1 ) || log "WARNING: log download failed"
   local f
-  for f in summary.md results.jsonl meta.json progress; do
+  for f in summary.md results.jsonl meta.json progress agent-load.json; do
     tar --force-local -xzOf "$run/logs.tar.gz" "bench/$f" > "$run/$f" 2>/dev/null || true
     [ -s "$run/$f" ] || rm -f "$run/$f"
   done
@@ -226,8 +245,11 @@ log "box $box ready"
 
 # 5. Ship the bundle and box-side scripts; check out the tip.
 here=$(cd "$(dirname "$0")" && pwd)
+[ "$suite" != agent-load ] || cp "$here/bench-agent-load-runner.sh" "$run/"
 cp "$here/bench-remote-runner.sh" "$here/bench-snapshot-setup.sh" "$run/"
-( cd "$run" && for f in stack.bundle bench-remote-runner.sh bench-snapshot-setup.sh; do
+extra_runner=''
+[ "$suite" != agent-load ] || extra_runner=bench-agent-load-runner.sh
+( cd "$run" && for f in stack.bundle bench-remote-runner.sh bench-snapshot-setup.sh $extra_runner; do
     bj scp "$f" "$box:/home/user/$f" >/dev/null 2>&1 || exit 1
   done ) || { log "upload failed"; exit 5; }
 head=$(bexec "$box" "cd /home/user/gigglesdb && git fetch -q /home/user/stack.bundle '$ref:refs/bench/tip' && git checkout -q --detach $tip && git rev-parse HEAD")
@@ -268,12 +290,18 @@ if [ $build_snapshot = 1 ]; then
   exit 0
 fi
 
+if [ "$suite" = agent-load ]; then
+  envs=''
+  [ -n "$data_root" ] && envs="DATA_ROOT=$data_root"
+  bj exec "$box" --detach -- bash -lc "$envs bash /home/user/bench-agent-load-runner.sh > /home/user/bench.out 2>&1" >/dev/null
+else
 # 6. Run the bench in the background on the box and wait for it.
 envs="PROFILE=$profile TARGETS=$targets CLIENTS=$clients MIXES=$mixes PROTOCOLS=$protocols OPSET=$opset WARMUP=$warmup DURATION=$duration REPEATS=$repeats ROWS=$rows"
 [ -n "$data_root" ] && envs+=" DATA_ROOT=$data_root"
 [ -n "$server_cpus" ] && envs+=" SERVER_CPUS=$server_cpus"
 [ -n "$client_cpus" ] && envs+=" CLIENT_CPUS=$client_cpus"
 bj exec "$box" --detach -- bash -lc "$envs bash /home/user/bench-remote-runner.sh > /home/user/bench.out 2>&1" >/dev/null
+fi
 bench_started=1
 log "bench running: $runs runs, ~$(( measured_est / 60 )) min measured + up to $(( (profile_extra + 59) / 60 )) min profile after the build"
 wait_for /home/user/bench/done /home/user/bench/progress
