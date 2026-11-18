@@ -2,7 +2,7 @@ use super::error::ApiError;
 use crate::{Role, Service};
 use std::sync::Arc;
 
-/// Authority captured after TLS verification, immutable for that connection.
+/// Authority captured from a verified certificate or a per-request credential.
 /// Fields and construction are deliberately unavailable to external callers.
 #[derive(Clone)]
 pub struct ConnectionIdentity {
@@ -13,8 +13,11 @@ pub struct ConnectionIdentity {
     database: Option<String>,
     role_listener: Option<Arc<crate::auth::RoleApiListener>>,
     role_fence: Option<(u32, u64)>,
-    // Captured by the agent runtime from the agent map only (GD-0061 R3-208).
+    // Captured by the agent runtime from its certificate map or SQL credentials.
     pub(crate) agent: bool,
+    credential: Option<giggles_core::task::definition::TaskObjectId>,
+    // Never included in Debug or identity equality. Retained only on a request.
+    pub(crate) credential_secret: Option<String>,
 }
 
 // Handle ownership follows the certificate binding. Role lifetime is checked
@@ -39,6 +42,8 @@ impl ConnectionIdentity {
             epoch: 0,
             role_fence: None,
             agent: false,
+            credential: None,
+            credential_secret: None,
             connection: Some(connection),
             database: None,
             role_listener: None,
@@ -55,6 +60,8 @@ impl ConnectionIdentity {
             epoch: session.epoch,
             role_fence: session.role_fence,
             agent: false,
+            credential: None,
+            credential_secret: None,
             connection: None,
             database: session.database.clone(),
             role_listener: Some(listener),
@@ -71,6 +78,8 @@ impl ConnectionIdentity {
             epoch: session.epoch,
             role_fence: session.role_fence,
             agent: false,
+            credential: None,
+            credential_secret: None,
             connection: None,
             database: None,
             role_listener: None,
@@ -92,12 +101,50 @@ impl ConnectionIdentity {
             epoch,
             role_fence: None,
             agent: true,
+            credential: None,
+            credential_secret: None,
             connection: None,
             database: None,
             role_listener: None,
         };
         identity.check(service)?;
         Ok(identity)
+    }
+
+    pub(crate) fn verified_credential(
+        service: &Arc<Service>,
+        secret: &str,
+    ) -> Result<Self, ApiError> {
+        let now = crate::agent::wall_now(&service.clock).map_err(|_| ApiError::Unauthenticated)?;
+        let (fingerprint, executor, epoch, task) = service
+            .credential_identity(secret, now)
+            .ok_or(ApiError::Unauthenticated)?;
+        let role = service
+            .admin
+            .roles()
+            .get(&executor)
+            .ok()
+            .flatten()
+            .filter(crate::agent::bindings::executor_role)
+            .ok_or(ApiError::Unauthenticated)?;
+        let identity = Self {
+            fingerprint,
+            role: Role::Database { name: executor },
+            epoch,
+            connection: None,
+            database: None,
+            role_listener: None,
+            role_fence: Some((role.oid, role.generation)),
+            agent: true,
+            credential: Some(task),
+            credential_secret: Some(secret.to_owned()),
+        };
+        identity.check(service)?;
+        Ok(identity)
+    }
+
+    pub(crate) fn forget_secret(&mut self) {
+        self.credential_secret = None;
     }
 
     pub(crate) fn check(&self, service: &Arc<Service>) -> Result<(), ApiError> {
@@ -124,6 +171,28 @@ impl ConnectionIdentity {
             return session
                 .check_binding()
                 .map_err(|_| ApiError::Unauthenticated);
+        }
+        if let Some(task) = self.credential {
+            let Role::Database { name } = &self.role else {
+                return Err(ApiError::Unauthenticated);
+            };
+            let now =
+                crate::agent::wall_now(&service.clock).map_err(|_| ApiError::Unauthenticated)?;
+            let valid_role = service
+                .admin
+                .roles()
+                .get(name)
+                .ok()
+                .flatten()
+                .is_some_and(|role| {
+                    crate::agent::bindings::executor_role(&role)
+                        && self.role_fence == Some((role.oid, role.generation))
+                });
+            return if valid_role && service.admin.tasks().credential_live(task, self.epoch, now) {
+                Ok(())
+            } else {
+                Err(ApiError::Unauthenticated)
+            };
         }
         if self.agent {
             // The agent entry keeps its epoch only while its executor and tasks

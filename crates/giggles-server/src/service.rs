@@ -778,6 +778,29 @@ impl Service {
         session.set_search_path("\"$user\", \"public\"");
         Ok(session)
     }
+    /// Resolve credential authority without constructing a SQL session.
+    pub(crate) fn credential_identity(
+        &self,
+        secret: &str,
+        now: giggles_core::task::definition::WallClockMs,
+    ) -> Option<(
+        String,
+        String,
+        u64,
+        giggles_core::task::definition::TaskObjectId,
+    )> {
+        let matched = self.admin.tasks().authenticate(secret, now).ok()?;
+        if !self.agent_executor_valid(&matched.executor) {
+            return None;
+        }
+        Some((
+            format!("sqlcred:{:016x}", matched.credential),
+            matched.executor,
+            matched.credential,
+            matched.task,
+        ))
+    }
+
     /// Open a task session with a SQL-issued credential. Refusals deliberately
     /// disclose neither the secret nor which authentication check failed.
     pub fn credential_session(

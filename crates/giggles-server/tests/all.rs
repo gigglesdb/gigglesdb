@@ -333,3 +333,6 @@ mod pipeline_oracle_network;
 
 #[path = "agent_credential_pg.rs"]
 mod agent_credential_pg;
+
+#[path = "agent_credential_api.rs"]
+mod agent_credential_api;

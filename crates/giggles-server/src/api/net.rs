@@ -115,8 +115,9 @@ async fn serve_bound(
                         let Ok(Ok(stream)) = timeout(IO_TIMEOUT, acceptor.accept(socket)).await else { return; };
                         let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
                         if grpc && !h2 { return; }
-                        let Some(cert) = stream.get_ref().1.peer_certificates().and_then(|chain| chain.first()) else { return; };
-                        let identity = runtime.authenticate(&tls::fingerprint(cert.as_ref()));
+                        let cert = stream.get_ref().1.peer_certificates().and_then(|chain| chain.first());
+                        if cert.is_none() && runtime.kind() != super::dispatch::ListenerKind::Agent { return; }
+                        let identity = cert.map_or(Err(ApiError::Unauthenticated), |cert| runtime.authenticate(&tls::fingerprint(cert.as_ref())));
                         let activity = Arc::new(ConnectionActivity::new());
                         let monitor = activity.clone();
                         let handler = service_fn(move |request| {
@@ -263,6 +264,12 @@ async fn handle(
     grpc: bool,
     headers_received: Instant,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    let identity = if runtime.kind() == super::dispatch::ListenerKind::Agent && identity.is_err() {
+        bearer_secret(request.headers())
+            .and_then(|secret| ConnectionIdentity::verified_credential(runtime.service(), secret))
+    } else {
+        identity
+    };
     let version = request.version();
     let release_binding = identity
         .as_ref()
@@ -325,6 +332,23 @@ async fn handle(
         response.body_mut().guard_binding(identity, service);
     }
     Ok(response)
+}
+
+fn bearer_secret(headers: &HeaderMap) -> Result<&str, ApiError> {
+    let mut values = headers.get_all(http::header::AUTHORIZATION).iter();
+    let value = values.next().ok_or(ApiError::Unauthenticated)?;
+    if values.next().is_some() || value.as_bytes().len() > 256 {
+        return Err(ApiError::Unauthenticated);
+    }
+    let value = value.to_str().map_err(|_| ApiError::Unauthenticated)?;
+    let (scheme, token) = value.split_once(' ').ok_or(ApiError::Unauthenticated)?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.bytes().any(|b| b.is_ascii_whitespace())
+    {
+        return Err(ApiError::Unauthenticated);
+    }
+    Ok(token)
 }
 
 fn validate_request_headers<B>(request: &Request<B>) -> Result<(), ApiError> {

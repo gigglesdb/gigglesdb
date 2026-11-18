@@ -193,7 +193,9 @@ impl Registry {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ApiError::ResourceExhausted)?;
-        let session = if owner.agent {
+        let session = if let Some(secret) = &owner.credential_secret {
+            self.service.credential_session(secret, None, task)
+        } else if owner.agent {
             self.service.agent_session(&owner.fingerprint, task)
         } else {
             self.service.session(&owner.fingerprint)
@@ -207,7 +209,9 @@ impl Registry {
         if session.epoch != owner.epoch || session.role != owner.role {
             return Err(ApiError::Unauthenticated);
         }
-        self.insert(owner, session, slot)
+        let mut owner = owner.clone();
+        owner.forget_secret();
+        self.insert(&owner, session, slot)
     }
 
     pub(crate) fn open_role(
