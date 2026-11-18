@@ -46,6 +46,9 @@ impl Drop for Fixture {
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with_api_limit(32).await
+    }
+    async fn start_with_api_limit(sessions: usize) -> Self {
         let path = scratch("credential-lifecycle");
         let ca = certificate(None, false);
         let server = certificate(Some(&ca), true);
@@ -70,7 +73,7 @@ impl Fixture {
             })
             .unwrap();
         drop(admin);
-        let config = json!({
+        let mut config = json!({
             "database":path.join("db.redb"), "native":"127.0.0.1:0", "postgres":"127.0.0.1:0",
             "postgresql":{"listen":"127.0.0.1:0","tls":"disabled"},
             "certificate":path.join("server.pem"),"private_key":path.join("server.key.TEST-ONLY"),
@@ -78,6 +81,9 @@ impl Fixture {
             "skew_seconds":0,"max_pause_seconds":3600,
             "agent":{"postgres":"127.0.0.1:0","http":"127.0.0.1:0","grpc":"127.0.0.1:0"}
         });
+        if sessions != 32 {
+            config["agent"]["api_limits"] = json!({"sessions":sessions});
+        }
         std::fs::write(
             path.join("config.json"),
             serde_json::to_vec_pretty(&config).unwrap(),
@@ -210,69 +216,14 @@ impl Fixture {
         Ok(client)
     }
     async fn refused(&self, secret: &str, task: Option<&str>) {
-        let error = self
-            .pg(secret, task)
-            .await
-            .expect_err("refuse agent login");
+        let error = self.pg(secret, task).await.expect_err("refuse agent login");
         assert_eq!(error.code().unwrap().code(), "28P01");
     }
     async fn http(&self, secret: &str, token: Option<&str>, body: Value) -> (u16, Value) {
-        let stream = TlsConnector::from(Arc::new(no_cert_client(&self.ca)))
-            .connect(
-                ServerName::try_from("localhost").unwrap(),
-                TcpStream::connect(self.addresses["agent_http"])
-                    .await
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .unwrap();
-        let task = tokio::spawn(connection);
-        let mut request = hyper::Request::builder()
-            .method("POST")
-            .uri(if token.is_some() {
-                "/v1/session/execute"
-            } else {
-                "/v1/sessions"
-            })
-            .header("host", "localhost")
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {secret}"));
-        if let Some(token) = token {
-            request = request.header("x-giggles-session", token);
-        }
-        let response = sender
-            .send_request(
-                request
-                    .body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status().as_u16();
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        task.abort();
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-        )
+        lifecycle_http(&self.ca, self.addresses["agent_http"], secret, token, body).await
     }
     async fn grpc(&self) -> proto::giggles_client::GigglesClient<Channel> {
-        let channel = Channel::from_shared(format!("https://{}", self.addresses["agent_grpc"]))
-            .unwrap()
-            .tls_config(
-                ClientTlsConfig::new()
-                    .domain_name("localhost")
-                    .ca_certificate(Certificate::from_pem(self.ca.cert.pem())),
-            )
-            .unwrap()
-            .connect_timeout(Duration::from_secs(5))
-            .connect()
-            .await
-            .unwrap();
-        proto::giggles_client::GigglesClient::new(channel)
+        lifecycle_grpc(&self.ca, self.addresses["agent_grpc"]).await
     }
     async fn revoke(&self, sql: &str) {
         ok(&self.ordinary("incident_controller").await, sql).await;
@@ -572,4 +523,905 @@ async fn wrong_secret_and_cross_task() {
         401
     );
     f.stop().await;
+}
+
+async fn lifecycle_http(
+    ca: &TestCert,
+    address: SocketAddr,
+    secret: &str,
+    token: Option<&str>,
+    body: Value,
+) -> (u16, Value) {
+    let stream = TlsConnector::from(Arc::new(no_cert_client(ca)))
+        .connect(
+            ServerName::try_from("localhost").unwrap(),
+            TcpStream::connect(address).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    let task = tokio::spawn(connection);
+    let mut request = hyper::Request::builder()
+        .method("POST")
+        .uri(if token.is_some() {
+            "/v1/session/execute"
+        } else {
+            "/v1/sessions"
+        })
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {secret}"));
+    if let Some(token) = token {
+        request = request.header("x-giggles-session", token);
+    }
+    let response = sender
+        .send_request(
+            request
+                .body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    task.abort();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn lifecycle_grpc(
+    ca: &TestCert,
+    address: SocketAddr,
+) -> proto::giggles_client::GigglesClient<Channel> {
+    let channel = Channel::from_shared(format!("https://{}", address))
+        .unwrap()
+        .tls_config(
+            ClientTlsConfig::new()
+                .domain_name("localhost")
+                .ca_certificate(Certificate::from_pem(ca.cert.pem())),
+        )
+        .unwrap()
+        .connect_timeout(Duration::from_secs(5))
+        .connect()
+        .await
+        .unwrap();
+    proto::giggles_client::GigglesClient::new(channel)
+}
+
+// In-process listeners make outcome retention configurable without changing the
+// shipped-process fixture above. Credentials are still issued over ordinary SQL.
+struct Lifecycle {
+    f: agent_support::parity::ParityFixture,
+    listeners: Vec<giggles_server::Running>,
+    addresses: [SocketAddr; 3],
+}
+
+impl Lifecycle {
+    async fn start() -> Self {
+        use giggles_server::{
+            agent::serve_agent_pg_bound,
+            api::net::{serve_grpc_bound, serve_http_bound},
+        };
+        let f = agent_support::parity::ParityFixture::start().await;
+        let tls = giggles_server::tls::server_optional_client(
+            vec![f.server_cert.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(f.server_cert.key.serialize_der()).into(),
+            Some(vec![f.ca.cert.der().clone()]),
+        )
+        .unwrap();
+        let (_, gate) = tokio::sync::watch::channel(true);
+        let pg = serve_agent_pg_bound(
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            f.service.clone(),
+            tls.clone(),
+            16,
+            vec!["giggles".into()],
+            gate.clone(),
+        )
+        .await
+        .unwrap();
+        let http = serve_http_bound(
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            f.agent_api.clone(),
+            tls.clone(),
+            16,
+            gate.clone(),
+        )
+        .await
+        .unwrap();
+        let grpc = serve_grpc_bound(
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            f.agent_api.clone(),
+            tls,
+            16,
+            gate,
+        )
+        .await
+        .unwrap();
+        let addresses = [pg.address, http.address, grpc.address];
+        Self {
+            f,
+            listeners: vec![pg, http, grpc],
+            addresses,
+        }
+    }
+    async fn issuer(&self) -> Client {
+        use agent_support::parity::{CONTROLLER, CONTROLLER_PW};
+        self.f.password(CONTROLLER, CONTROLLER_PW).await.unwrap()
+    }
+    async fn task(&self, name: &str, expiry: i64, caps: u64) {
+        ok(&self.issuer().await, &format!(
+            "CREATE TASK \"{name}\" EXECUTOR repair_agent ON shipments \
+             VISIBLE ROWS WHERE (merchant_id = 42) READABLE (id,status) \
+             ALLOW UPDATE (status) OLD ROW WHERE (status = 'failed') NEW ROW WHERE (status = 'queued') \
+             AT MOST 25 DISTINCT ROWS AND 25 TRANSITIONS \
+             DISCLOSE AT MOST {caps} ROWS READ, 2097152 BYTES RETURNED EXPIRES '{}'",
+            timestamptz(expiry))).await;
+    }
+    async fn issue(&self, name: &str) -> String {
+        let rows = ok(
+            &self.issuer().await,
+            &format!("ISSUE CREDENTIAL FOR TASK \"{name}\""),
+        )
+        .await;
+        rows.iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(r.get("secret").unwrap().to_owned()),
+                _ => None,
+            })
+            .unwrap()
+    }
+    async fn pg(&self, secret: &str) -> Result<Client, tokio_postgres::Error> {
+        let (client, connection) = tokio_postgres::Config::new()
+            .host("localhost")
+            .hostaddr(self.addresses[0].ip())
+            .port(self.addresses[0].port())
+            .user("repair_agent")
+            .password(secret)
+            .dbname("giggles")
+            .ssl_mode(SslMode::Require)
+            .connect(MakeRustlsConnect::new(no_cert_client(&self.f.ca)))
+            .await?;
+        tokio::spawn(connection);
+        Ok(client)
+    }
+    async fn http(&self, secret: &str, token: Option<&str>, sql: Option<&str>) -> (u16, Value) {
+        lifecycle_http(
+            &self.f.ca,
+            self.addresses[1],
+            secret,
+            token,
+            sql.map_or(json!({}), lifecycle_body),
+        )
+        .await
+    }
+    async fn grpc(&self) -> proto::giggles_client::GigglesClient<Channel> {
+        lifecycle_grpc(&self.f.ca, self.addresses[2]).await
+    }
+    async fn stop(self) {
+        for listener in self.listeners {
+            listener.shutdown().await.unwrap();
+        }
+        self.f.stop().await;
+    }
+}
+
+fn lifecycle_body(sql: &str) -> Value {
+    use agent_support::parity::Case;
+    if let Some(rest) = sql.strip_prefix("OPERATION '") {
+        let (op, statement) = rest.split_once("' ").unwrap();
+        let id = statement.rsplit_once(" = ").unwrap().1;
+        return Case::write(
+            op,
+            statement,
+            format!("update shipments where id = {id} set status = \"queued\""),
+        )
+        .native_body();
+    }
+    if let Some(op) = sql
+        .strip_prefix("SHOW OPERATION '")
+        .and_then(|s| s.strip_suffix("'"))
+    {
+        return Case::outcome(op).native_body();
+    }
+    json!({"sql":{"sql":sql}})
+}
+
+fn grpc_sql(sql: &str) -> proto::ExecuteRequest {
+    if sql.starts_with("OPERATION '") || sql.starts_with("SHOW OPERATION '") {
+        return giggles_server::api::json::decode_execute(
+            &serde_json::to_vec(&lifecycle_body(sql)).unwrap(),
+        )
+        .unwrap();
+    }
+    proto::ExecuteRequest {
+        request: Some(proto::execute_request::Request::Sql(proto::SqlRequest {
+            sql: sql.into(),
+            params: vec![],
+        })),
+        ..Default::default()
+    }
+}
+
+async fn past(deadline: i64) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while now_ms() <= deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("short test deadline reached");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn expiry_mid_session_new_write_28T02_but_outcome_lookup_works() {
+    let h = Lifecycle::start().await;
+    let expiry = now_ms() + 4000;
+    h.task("short", expiry, 1000).await;
+    let secret = h.issue("short").await;
+    let pg = h.pg(&secret).await.unwrap();
+    let http = session(h.http(&secret, None, None).await);
+    let mut grpc = h.grpc().await;
+    let token = grpc
+        .open_session(bearer(&secret, None, proto::OpenSessionRequest::default()))
+        .await
+        .unwrap()
+        .into_inner()
+        .session_id;
+    // Each protocol commits its own operation before the expiry boundary.
+    let write = |op: &str, id| {
+        format!("OPERATION '{op}' UPDATE shipments SET status = 'queued' WHERE id = {id}")
+    };
+    ok(&pg, &write("expiry-pg", 1)).await;
+    assert_eq!(
+        h.http(&secret, Some(&http), Some(&write("expiry-http", 2)))
+            .await
+            .1["code"],
+        "ok"
+    );
+    assert_eq!(
+        grpc.execute(bearer(
+            &secret,
+            Some(&token),
+            grpc_sql(&write("expiry-grpc", 3))
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .code,
+        "ok"
+    );
+    past(expiry).await;
+    let new_write = write("too-late", 4);
+    assert_eq!(
+        pg.simple_query(&new_write)
+            .await
+            .unwrap_err()
+            .code()
+            .unwrap()
+            .code(),
+        "28T02"
+    );
+    assert_eq!(
+        h.http(&secret, Some(&http), Some(&new_write)).await.1["code"],
+        "28T02"
+    );
+    assert_eq!(
+        grpc.execute(bearer(&secret, Some(&token), grpc_sql(&new_write)))
+            .await
+            .unwrap()
+            .into_inner()
+            .code,
+        "28T02"
+    );
+    // Existing and newly authenticated sessions retain the committed outcomes.
+    for fresh in [false, true] {
+        let other_pg;
+        let p = if fresh {
+            other_pg = h.pg(&secret).await.unwrap();
+            &other_pg
+        } else {
+            &pg
+        };
+        assert!(
+            ok(p, "SHOW OPERATION 'expiry-pg'")
+                .await
+                .iter()
+                .any(|r| matches!(r, SimpleQueryMessage::Row(_)))
+        );
+        let t = if fresh {
+            session(h.http(&secret, None, None).await)
+        } else {
+            http.clone()
+        };
+        assert_eq!(
+            h.http(&secret, Some(&t), Some("SHOW OPERATION 'expiry-http'"))
+                .await
+                .1["code"],
+            "ok"
+        );
+        let t = if fresh {
+            grpc.open_session(bearer(&secret, None, proto::OpenSessionRequest::default()))
+                .await
+                .unwrap()
+                .into_inner()
+                .session_id
+        } else {
+            token.clone()
+        };
+        assert_eq!(
+            grpc.execute(bearer(
+                &secret,
+                Some(&t),
+                grpc_sql("SHOW OPERATION 'expiry-grpc'")
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .code,
+            "ok"
+        );
+    }
+    h.stop().await;
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn revoke_mid_session_everything_28T01_including_outcome() {
+    let mut f = Fixture::start().await;
+    let (_, secret) = f.issue(None).await;
+    let pg = f.pg(&secret, None).await.unwrap();
+    let http = session(f.http(&secret, None, json!({})).await);
+    let mut grpc = f.grpc().await;
+    let token = grpc
+        .open_session(bearer(&secret, None, proto::OpenSessionRequest::default()))
+        .await
+        .unwrap()
+        .into_inner()
+        .session_id;
+    f.revoke("REVOKE TASK \"inc-436\"").await;
+    // SQL-credential identity revalidation precedes class admission. Revocation
+    // cuts the connection/lease even for SHOW OPERATION (design R3-1301 section 4).
+    closed(&pg).await;
+    for sql in [
+        SELECT,
+        "SHOW TASK",
+        "SET application_name = 'test'",
+        "SHOW OPERATION 'missing'",
+        "OPERATION 'revoked' UPDATE shipments SET status = 'queued' WHERE id = 1",
+    ] {
+        assert!(pg.simple_query(sql).await.is_err());
+        let (status, body) = f
+            .http(&secret, Some(&http), json!({"sql":{"sql":sql}}))
+            .await;
+        assert_eq!(status, 401, "{body}");
+        assert_eq!(body["error"]["code"], "UNAUTHENTICATED");
+        assert_eq!(
+            grpc.execute(bearer(&secret, Some(&token), grpc_sql(sql)))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+    }
+    f.stop().await;
+    revoke_mid_cert_session_28t01().await;
+}
+
+/// A certificate binding still lists the revoked task, so identity
+/// revalidation passes and `task_standing` refuses every class, including
+/// outcome lookup, with 28T01 (design-2 section 3, step 3).
+async fn revoke_mid_cert_session_28t01() {
+    use agent_support::parity::{self, ParityFixture};
+    let f = ParityFixture::start().await;
+    let (pg, connection) = tokio_postgres::Config::new()
+        .host("localhost")
+        .hostaddr(f.agent_pg.address.ip())
+        .port(f.agent_pg.address.port())
+        .user(parity::EXECUTOR)
+        .dbname("giggles")
+        .options("-c giggles.task=inc-436")
+        .ssl_mode(SslMode::Require)
+        .connect(MakeRustlsConnect::new(f.agent.client(&f.ca)))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let http = f.open_http().await.unwrap();
+    let token = f.open_grpc().await.unwrap();
+    let mut grpc = parity::grpc_client(f.agent_grpc.address, &f.ca, &f.agent).await;
+    let issuer = f
+        .password(parity::CONTROLLER, parity::CONTROLLER_PW)
+        .await
+        .unwrap();
+    ok(&issuer, "REVOKE TASK \"inc-436\"").await;
+    for sql in [
+        SELECT,
+        "SHOW OPERATION 'missing'",
+        "OPERATION 'revoked' UPDATE shipments SET status = 'queued' WHERE id = 1",
+    ] {
+        let error = pg.simple_query(sql).await.unwrap_err();
+        assert_eq!(error.code().unwrap().code(), "28T01", "pg: {sql}: {error:?}");
+        let (status, body) = parity::http_call(
+            f.agent_http.address,
+            (&f.ca, &f.agent),
+            "POST",
+            "/v1/session/execute",
+            Some(&http),
+            Some(&lifecycle_body(sql)),
+        )
+        .await;
+        assert_eq!(status, 200, "http: {sql}: {body}");
+        assert_eq!(body["code"], "28T01", "http: {sql}: {body}");
+        let reply = grpc
+            .execute(parity::with_session(&token, grpc_sql(sql)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.code, "28T01", "grpc: {sql}");
+    }
+    drop((pg, issuer));
+    f.stop().await;
+}
+
+async fn refused_three(f: &Fixture, secret: &str) {
+    let error = f
+        .pg(secret, None)
+        .await
+        .expect_err("credential must be refused");
+    let db = error.as_db_error().unwrap();
+    assert_eq!(db.code().code(), "28P01");
+    assert_eq!(
+        db.message(),
+        "password authentication failed for user \"agent_exec\""
+    );
+    let (status, body) = f.http(secret, None, json!({})).await;
+    assert_eq!(status, 401);
+    assert_eq!(body["error"]["code"], "UNAUTHENTICATED");
+    assert_eq!(
+        f.grpc()
+            .await
+            .open_session(bearer(secret, None, proto::OpenSessionRequest::default()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+}
+
+#[tokio::test]
+async fn revoked_task_refused_at_connect_on_three_protocols() {
+    let mut f = Fixture::start().await;
+    let (id, revoked) = f.issue(None).await;
+    let expiry = now_ms() + 1500;
+    let (_, expired) = f.issue(Some(expiry)).await;
+    let (_, task) = f.issue(None).await;
+    f.revoke(&format!("REVOKE CREDENTIAL {id}")).await;
+    refused_three(&f, &revoked).await;
+    past(expiry).await;
+    refused_three(&f, &expired).await;
+    f.revoke("REVOKE TASK \"inc-436\"").await;
+    refused_three(&f, &task).await;
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn after_retention_connect_refused() {
+    let h = Lifecycle::start().await;
+    h.f.service
+        .set_outcome_retention(Duration::from_millis(250));
+    let expiry = now_ms() + 1500;
+    h.task("retention", expiry, 1000).await;
+    let secret = h.issue("retention").await;
+    h.pg(&secret).await.unwrap();
+    session(h.http(&secret, None, None).await);
+    h.grpc()
+        .await
+        .open_session(bearer(&secret, None, proto::OpenSessionRequest::default()))
+        .await
+        .unwrap();
+    past(expiry + 250).await;
+    let error = h.pg(&secret).await.unwrap_err();
+    assert_eq!(error.code().unwrap().code(), "28P01");
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "password authentication failed for user \"repair_agent\""
+    );
+    assert_eq!(h.http(&secret, None, None).await.0, 401);
+    assert_eq!(
+        h.grpc()
+            .await
+            .open_session(bearer(&secret, None, proto::OpenSessionRequest::default()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    h.stop().await;
+}
+
+async fn binding_cut(rebind: bool) {
+    use agent_support::parity::{self, ParityFixture};
+    let f = ParityFixture::start().await;
+    // A tokio-postgres client exposes server-initiated closure without a query.
+    let (pg, connection) = tokio_postgres::Config::new()
+        .host("localhost")
+        .hostaddr(f.agent_pg.address.ip())
+        .port(f.agent_pg.address.port())
+        .user(parity::EXECUTOR)
+        .dbname("giggles")
+        .options("-c giggles.task=inc-436")
+        .ssl_mode(SslMode::Require)
+        .connect(MakeRustlsConnect::new(f.agent.client(&f.ca)))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let http = f.open_http().await.unwrap();
+    let token = f.open_grpc().await.unwrap();
+    let mut grpc = parity::grpc_client(f.agent_grpc.address, &f.ca, &f.agent).await;
+    let bindings = if rebind {
+        let issuer = f
+            .password(parity::CONTROLLER, parity::CONTROLLER_PW)
+            .await
+            .unwrap();
+        ok(
+            &issuer,
+            &parity::inc_436_sql(&timestamptz(now_ms() + agent_support::DAY_MS)).replacen(
+                "inc-436",
+                "inc-other",
+                1,
+            ),
+        )
+        .await;
+        vec![agent_support::binding(
+            &f.agent,
+            parity::EXECUTOR,
+            &["inc-other"],
+        )]
+    } else {
+        vec![]
+    };
+    f.service.reload_all_bindings(vec![], bindings).unwrap();
+    closed(&pg).await;
+    for _ in 0..2 {
+        let (status, body) = parity::http_call(
+            f.agent_http.address,
+            (&f.ca, &f.agent),
+            "POST",
+            "/v1/session/execute",
+            Some(&http),
+            Some(&json!({"sql":{"sql":SELECT}})),
+        )
+        .await;
+        // A removed binding fails identity (401). A rebound certificate still
+        // authenticates, so the old lease is either refused by check_binding
+        // (401) or already swept by the binding-change registry sweep (404
+        // SESSION_NOT_FOUND); either way it can never run again.
+        let code = grpc
+            .execute(parity::with_session(&token, grpc_select()))
+            .await
+            .unwrap_err()
+            .code();
+        if rebind {
+            assert!(
+                (status == 401 && body["error"]["code"] == "UNAUTHENTICATED")
+                    || (status == 404 && body["error"]["code"] == "SESSION_NOT_FOUND"),
+                "{status} {body}"
+            );
+            assert!(
+                matches!(code, Code::Unauthenticated | Code::NotFound),
+                "{code:?}"
+            );
+        } else {
+            assert_eq!(status, 401, "{body}");
+            assert_eq!(code, Code::Unauthenticated);
+        }
+    }
+    if rebind {
+        // The same certificate can open the new task, but never reuse old leases.
+        let (_, body) = parity::http_call(
+            f.agent_http.address,
+            (&f.ca, &f.agent),
+            "POST",
+            "/v1/sessions",
+            None,
+            Some(&json!({"task":"inc-other"})),
+        )
+        .await;
+        assert!(body["sessionId"].is_string(), "{body}");
+    } else {
+        assert!(f.open_http().await.is_err());
+        assert!(f.open_grpc().await.is_err());
+    }
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn rebinding_fingerprint_to_other_task_cuts_old_session_on_next_call() {
+    binding_cut(true).await;
+}
+
+#[tokio::test]
+async fn removed_binding_cuts_session_and_api_lease() {
+    binding_cut(false).await;
+}
+
+#[tokio::test]
+#[ignore = "R3-1005: no live task-definition ALTER DDL/API; only REVOKE bumps def_version"]
+async fn definition_change_requires_reconnect() {
+    // The production API cannot construct a non-revoked definition change yet.
+    // Keep the required regression visible, rather than simulate a reconnect
+    // with REVOKE (which must return Revoked instead of DefinitionChanged).
+    assert_eq!(
+        giggles_server::sqlstate(&giggles_core::CoreError::Task(
+            giggles_core::task::TaskError::Denied(giggles_core::task::DenyRule::DefinitionChanged)
+        )),
+        "42501"
+    );
+    panic!("exercise old/new sessions once live task definition changes are supported");
+}
+
+#[tokio::test]
+async fn two_sessions_same_cert_share_budgets() {
+    use agent_support::parity::{self, ParityFixture};
+    let f = ParityFixture::start().await;
+    f.service
+        .set_agent_limits(giggles_server::agent::AgentLimits {
+            disclosure_chunk_rows: 0,
+            disclosure_chunk_bytes: 0,
+            ..Default::default()
+        })
+        .unwrap();
+    let issuer = f
+        .password(parity::CONTROLLER, parity::CONTROLLER_PW)
+        .await
+        .unwrap();
+    let sql = parity::inc_436_sql(&timestamptz(now_ms() + agent_support::DAY_MS))
+        .replacen("inc-436", "budget", 1)
+        .replace("1000 ROWS READ", "2 ROWS READ")
+        .replace(
+            "READABLE (id, status, failed_at, attempt_count)",
+            "READABLE (merchant_id, id, status, failed_at, attempt_count)",
+        );
+    ok(&issuer, &sql).await;
+    f.service
+        .reload_all_bindings(
+            vec![],
+            vec![agent_support::binding(
+                &f.agent,
+                parity::EXECUTOR,
+                &["budget"],
+            )],
+        )
+        .unwrap();
+    let mut a = agent_support::connect_raw(
+        f.agent_pg.address,
+        &f.ca,
+        &f.agent,
+        &[
+            ("user", parity::EXECUTOR),
+            ("database", "giggles"),
+            ("giggles.task", "budget"),
+        ],
+    )
+    .await;
+    let mut b = agent_support::connect_raw(
+        f.agent_pg.address,
+        &f.ca,
+        &f.agent,
+        &[
+            ("user", parity::EXECUTOR),
+            ("database", "giggles"),
+            ("giggles.task", "budget"),
+        ],
+    )
+    .await;
+    let read = "SELECT id FROM shipments WHERE merchant_id = 42 AND id = 1";
+    assert_eq!(parity::observe_pg(&a.simple(read).await).sqlstate, None);
+    assert_eq!(parity::observe_pg(&b.simple(read).await).sqlstate, None);
+    let denied = parity::observe_pg(&a.simple(read).await);
+    assert_eq!(denied.sqlstate.as_deref(), Some("54T01"), "{denied:?}");
+    drop(a);
+    let mut c = agent_support::connect_raw(
+        f.agent_pg.address,
+        &f.ca,
+        &f.agent,
+        &[
+            ("user", parity::EXECUTOR),
+            ("database", "giggles"),
+            ("giggles.task", "budget"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        parity::observe_pg(&c.simple(read).await)
+            .sqlstate
+            .as_deref(),
+        Some("54T01")
+    );
+    // Switching transport does not reset the task's counters either.
+    let (status, reply) = parity::http_call(
+        f.agent_http.address,
+        (&f.ca, &f.agent),
+        "POST",
+        "/v1/sessions",
+        None,
+        Some(&json!({"task":"budget"})),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let (_, reply) = parity::http_call(
+        f.agent_http.address,
+        (&f.ca, &f.agent),
+        "POST",
+        "/v1/session/execute",
+        Some(reply["sessionId"].as_str().unwrap()),
+        Some(&json!({"sql":{"sql":read}})),
+    )
+    .await;
+    assert_eq!(reply["code"], "54T01");
+    let mut grpc = parity::grpc_client(f.agent_grpc.address, &f.ca, &f.agent).await;
+    let token = grpc
+        .open_session(proto::OpenSessionRequest {
+            task: Some("budget".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .session_id;
+    assert_eq!(
+        grpc.execute(parity::with_session(&token, grpc_sql(read)))
+            .await
+            .unwrap()
+            .into_inner()
+            .code,
+        "54T01"
+    );
+    drop(b);
+    drop(c);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn sql_credential_lifecycle_three_protocols() {
+    let mut f = Fixture::start().await;
+    let mut credentials = Vec::new();
+    for _ in 0..8 {
+        credentials.push(f.issue(None).await);
+    }
+    let issuer = f.ordinary("incident_controller").await;
+    assert_eq!(
+        issuer
+            .simple_query("ISSUE CREDENTIAL FOR TASK \"inc-436\"")
+            .await
+            .unwrap_err()
+            .code()
+            .unwrap()
+            .code(),
+        "54000"
+    );
+    f.revoke(&format!("REVOKE CREDENTIAL {}", credentials[0].0))
+        .await;
+    refused_three(&f, &credentials[0].1).await;
+    let (_, secret) = f.issue(None).await; // Revocation frees the eighth slot.
+    let pg = f.pg(&secret, None).await.unwrap();
+    let http = session(f.http(&secret, None, json!({})).await);
+    let mut grpc = f.grpc().await;
+    let token = grpc
+        .open_session(bearer(&secret, None, proto::OpenSessionRequest::default()))
+        .await
+        .unwrap()
+        .into_inner()
+        .session_id;
+    selected(&pg).await;
+    assert_eq!(
+        f.http(&secret, Some(&http), json!({"sql":{"sql":SELECT}}))
+            .await
+            .1["code"],
+        "ok"
+    );
+    assert_eq!(
+        grpc.execute(bearer(&secret, Some(&token), grpc_select()))
+            .await
+            .unwrap()
+            .into_inner()
+            .code,
+        "ok"
+    );
+    ok(&f.ordinary("owner").await, "ALTER ROLE agent_exec NOLOGIN").await;
+    assert!(pg.simple_query(SELECT).await.is_err());
+    assert_eq!(
+        f.http(&secret, Some(&http), json!({"sql":{"sql":SELECT}}))
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        grpc.execute(bearer(&secret, Some(&token), grpc_select()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    refused_three(&f, &secret).await;
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn idle_session_cut_off_at_next_call() {
+    for revoke_task in [false, true] {
+        let mut f = Fixture::start_with_api_limit(2).await;
+        let (id, secret) = f.issue(None).await;
+        let pg = f.pg(&secret, None).await.unwrap();
+        let http = session(f.http(&secret, None, json!({})).await);
+        let mut grpc = f.grpc().await;
+        let token = grpc
+            .open_session(bearer(&secret, None, proto::OpenSessionRequest::default()))
+            .await
+            .unwrap()
+            .into_inner()
+            .session_id;
+        let sql = if revoke_task {
+            "REVOKE TASK \"inc-436\"".into()
+        } else {
+            format!("REVOKE CREDENTIAL {id}")
+        };
+        f.revoke(&sql).await;
+        // No traffic is sent on any agent session before observing closure.
+        closed(&pg).await;
+        // Both API slots were occupied by idle leases. Authenticate using a
+        // different task without touching either old lease: capacity can only
+        // return if the notification/periodic sweeper reclaimed them.
+        let rows = ok(
+            &f.ordinary("incident_controller").await,
+            "ISSUE CREDENTIAL FOR TASK \"inc-437\"",
+        )
+        .await;
+        let replacement = rows
+            .iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(r.get("secret").unwrap().to_owned()),
+                _ => None,
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (status, body) = f.http(&replacement, None, json!({})).await;
+                if status == 201 {
+                    break;
+                }
+                assert_eq!(status, 429, "waiting for idle lease capacity: {body}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("idle HTTP lease swept without a call on it");
+        grpc.open_session(bearer(
+            &replacement,
+            None,
+            proto::OpenSessionRequest::default(),
+        ))
+        .await
+        .expect("idle gRPC lease also swept");
+        assert!(pg.simple_query(SELECT).await.is_err());
+        for _ in 0..2 {
+            assert_eq!(
+                f.http(&secret, Some(&http), json!({"ping":{}})).await.0,
+                401
+            );
+            assert_eq!(
+                grpc.execute(bearer(&secret, Some(&token), grpc_select()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::Unauthenticated
+            );
+        }
+        f.stop().await;
+    }
 }
