@@ -14,6 +14,25 @@ use std::{
 };
 use tokio_postgres::{Client, Config, NoTls, config::SslMode};
 
+/// Write a same-CA operator credential and return its fingerprint.
+pub(crate) fn write_operator_identity(
+    root: &std::path::Path,
+    ca_cert: &rcgen::Certificate,
+    ca_key: &KeyPair,
+) -> String {
+    let operator_key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let operator = params.signed_by(&operator_key, ca_cert, ca_key).unwrap();
+    std::fs::write(root.join("operator.pem"), operator.pem()).unwrap();
+    std::fs::write(
+        root.join("operator.key.TEST-ONLY"),
+        operator_key.serialize_pem(),
+    )
+    .unwrap();
+    hex::encode(Sha256::digest(operator.der()))
+}
+
 const WAIT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(50);
 
@@ -35,6 +54,9 @@ pub(crate) struct Cluster {
 }
 impl Cluster {
     pub(crate) fn new() -> Self {
+        Self::with_operators(false)
+    }
+    pub(crate) fn with_operators(operators: bool) -> Self {
         // Concurrent tests can receive the same coarse Windows system timestamp.
         static NEXT_CLUSTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -52,6 +74,12 @@ impl Cluster {
         let ca_key = KeyPair::generate().unwrap();
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
         std::fs::write(root.join("ca.pem"), ca_cert.pem()).unwrap();
+        let operator = write_operator_identity(&root, &ca_cert, &ca_key);
+        let operators = if operators {
+            json!([{"name": "test operator", "fingerprint": operator}])
+        } else {
+            json!([])
+        };
         let (tx, rx) = mpsc::channel();
         let nodes: Vec<_> = (0..3)
             .map(|i| {
@@ -98,7 +126,7 @@ impl Cluster {
                 "postgresql": {"listen": node.pg, "tls": "disabled", "loopback_trust": true},
                 "replication": {"node_id": i + 1, "cluster": "0123456789abcdef0123456789abcdef",
                     "listen": node.reservations[1].local_addr().unwrap(), "log_dir": node.dir.join("raftlog"),
-                    "tick_ms": 20, "owner": "owner", "peers": peers}
+                    "tick_ms": 20, "owner": "owner", "peers": peers, "operators": operators}
             });
             std::fs::write(
                 node.dir.join("config.json"),
@@ -122,6 +150,15 @@ impl Cluster {
         self.nodes[i].child.as_mut().expect("node not started")
     }
 
+    pub(crate) fn config_path(&self, i: usize) -> PathBuf {
+        self.nodes[i].dir.join("config.json")
+    }
+    pub(crate) fn operator_identity(&self) -> (PathBuf, PathBuf) {
+        (
+            self.root.join("operator.pem"),
+            self.root.join("operator.key.TEST-ONLY"),
+        )
+    }
     pub(crate) fn start(&mut self, i: usize) {
         let node = &mut self.nodes[i];
         assert!(node.child.is_none());

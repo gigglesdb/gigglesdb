@@ -64,6 +64,7 @@ pub fn transport_config(v: &ClusterValidated) -> Result<TransportConfig, String>
         },
     );
     Ok(TransportConfig {
+        operators: vec![],
         node_id: v.node_id,
         cluster: v.cluster,
         listen: v.listen.to_string(),

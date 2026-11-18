@@ -21,13 +21,14 @@ use std::{
 
 static NEXT_CLUSTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-struct Cluster {
-    nodes: Vec<Option<Node>>,
-    configs: Vec<NodeConfig>,
+pub(super) struct Cluster {
+    pub(super) nodes: Vec<Option<Node>>,
+    pub(super) configs: Vec<NodeConfig>,
+    pub(super) identity: (PathBuf, PathBuf),
     root: PathBuf,
 }
 impl Cluster {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
             "admin-net-{}-{}-{}",
             std::process::id(),
@@ -46,10 +47,19 @@ impl Cluster {
             .enumerate()
             .map(|(i, l)| (i as u64 + 1, l.local_addr().unwrap().to_string()))
             .collect();
+        let identity = super::common::certs::stray_cert(&pki);
+        let der = rustls_pemfile::certs(&mut std::io::BufReader::new(
+            fs::File::open(&identity.0).unwrap(),
+        ))
+        .next()
+        .unwrap()
+        .unwrap();
+        let operator = giggles_replication::transport::fingerprint(&der);
         let configs: Vec<_> = (1..=4)
             .map(|id| NodeConfig {
                 transport: {
                     let mut config = config_for(&pki, id, [74; 16], &addresses);
+                    config.operators = vec![operator.clone()];
                     config
                         .peers
                         .retain(|peer, _| if id == 4 { *peer != 1 } else { *peer != 4 });
@@ -72,6 +82,7 @@ impl Cluster {
         let mut c = Self {
             nodes: vec![],
             configs,
+            identity,
             root,
         };
         for config in &c.configs[..3] {
@@ -81,7 +92,7 @@ impl Cluster {
         c
     }
 
-    fn leader(&self) -> (usize, Arc<ReplicatedEngine>) {
+    pub(super) fn leader(&self) -> (usize, Arc<ReplicatedEngine>) {
         let mut found = None;
         until(|| {
             found = self.nodes.iter().enumerate().find_map(|(i, node)| {
@@ -167,8 +178,7 @@ fn until(mut ready: impl FnMut() -> bool) {
     }
 }
 
-#[test]
-fn status_and_replace_via_admin_call() {
+pub(super) fn status_and_replace_via_admin_call() {
     let mut c = Cluster::new();
     c.seed();
     // Stop node 1 only once another node has won an election.
@@ -190,6 +200,7 @@ fn status_and_replace_via_admin_call() {
         follower,
         &AdminRequest::Status,
         Duration::from_secs(10),
+        Some(c.identity.clone()),
     )
     .unwrap();
     let AdminResponse::Status(report) = status else {
@@ -220,6 +231,7 @@ fn status_and_replace_via_admin_call() {
             timeout_ms: 60_000,
         },
         Duration::from_secs(70),
+        Some(c.identity.clone()),
     )
     .unwrap();
     let AdminResponse::Done(report) = response else {
@@ -240,7 +252,8 @@ fn unknown_certificate_is_refused() {
             config,
             target,
             &AdminRequest::Status,
-            Duration::from_secs(5)
+            Duration::from_secs(5),
+            None,
         )
         .is_err()
     );

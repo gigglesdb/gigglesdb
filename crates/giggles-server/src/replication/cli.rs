@@ -3,17 +3,28 @@ use giggles_replication::{
     admin::{AdminRequest, AdminResponse},
     membership::PeerRecord,
 };
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
-pub const USAGE: &str = "usage: giggles-server replica status <config.json> | replica replace <config.json> --lost <id> --new-id <id> --new-address <host:port> --new-fingerprint <64 hex> [--timeout-secs <1..600>]";
+pub const USAGE: &str = "usage: giggles-server replica status <config.json> [--identity <cert.pem> <key.pem>] | replica replace <config.json> --lost <id> --new-id <id> --new-address <host:port> --new-fingerprint <64 hex> [--timeout-secs <1..600>] [--identity <cert.pem> <key.pem>]";
 
 #[derive(Debug)]
 pub struct Command {
     pub config: String,
+    pub identity: Option<(PathBuf, PathBuf)>,
     pub request: AdminRequest,
     pub timeout: Duration,
 }
 impl Command {
+    /// Config-dependent usage validation, before sending a membership change.
+    pub fn validate_operators(&self, operators: &[String]) -> Result<(), &'static str> {
+        if let AdminRequest::Replace { new, .. } = &self.request
+            && operators.contains(&new.fingerprint)
+        {
+            return Err("--new-fingerprint belongs to a configured operator");
+        }
+        Ok(())
+    }
+
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, &'static str> {
         let mut args = args.into_iter();
         let action = args.next().ok_or(USAGE)?;
@@ -21,20 +32,29 @@ impl Command {
             .next()
             .filter(|s| !s.is_empty() && !s.starts_with('-'))
             .ok_or(USAGE)?;
-        if action == "status" && args.next().is_none() {
-            return Ok(Self {
-                config,
-                request: AdminRequest::Status,
-                timeout: Duration::from_secs(600),
-            });
-        }
-        if action != "replace" {
+        if action != "status" && action != "replace" {
             return Err(USAGE);
         }
+        let mut identity = None;
         let (mut lost, mut id, mut address, mut fingerprint, mut timeout) =
             (None, None, None, None, None);
         while let Some(flag) = args.next() {
             let value = args.next().ok_or(USAGE)?;
+            if flag == "--identity" && identity.is_none() {
+                let key = args.next().ok_or(USAGE)?;
+                if value.is_empty()
+                    || key.is_empty()
+                    || value.starts_with('-')
+                    || key.starts_with('-')
+                {
+                    return Err(USAGE);
+                }
+                identity = Some((value.into(), key.into()));
+                continue;
+            }
+            if action == "status" {
+                return Err(USAGE);
+            }
             match flag.as_str() {
                 "--lost" if lost.is_none() => lost = Some(nonzero(&value)?),
                 "--new-id" if id.is_none() => id = Some(nonzero(&value)?),
@@ -66,6 +86,14 @@ impl Command {
             }
         }
         let timeout = Duration::from_secs(timeout.unwrap_or(600));
+        if action == "status" {
+            return Ok(Self {
+                config,
+                identity,
+                timeout,
+                request: AdminRequest::Status,
+            });
+        }
         let lost = lost.ok_or(USAGE)?;
         let id = id.ok_or(USAGE)?;
         if lost == id {
@@ -73,6 +101,7 @@ impl Command {
         }
         Ok(Self {
             config,
+            identity,
             timeout,
             request: AdminRequest::Replace {
                 lost,
@@ -151,6 +180,33 @@ mod tests {
                 .timeout,
             Duration::from_secs(1)
         );
+    }
+    #[test]
+    fn replacement_cannot_use_operator_fingerprint() {
+        let c = parse(&replacement()).unwrap();
+        assert!(c.validate_operators(&["ab".repeat(32)]).is_err());
+        assert!(c.validate_operators(&["cd".repeat(32)]).is_ok());
+        assert!(
+            parse("status cfg")
+                .unwrap()
+                .validate_operators(&["ab".repeat(32)])
+                .is_ok()
+        );
+    }
+    #[test]
+    fn identity_arguments() {
+        for base in ["status cfg".to_owned(), replacement()] {
+            let c = parse(&format!("{base} --identity cert.pem key.pem")).unwrap();
+            assert_eq!(c.identity, Some(("cert.pem".into(), "key.pem".into())));
+            for suffix in [
+                "--identity",
+                "--identity cert",
+                "--identity cert --lost",
+                "--identity c k --identity c k",
+            ] {
+                assert!(parse(&format!("{base} {suffix}")).is_err(), "{suffix}");
+            }
+        }
     }
     #[test]
     fn invalid_arguments() {

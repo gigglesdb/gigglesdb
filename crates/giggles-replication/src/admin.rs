@@ -299,13 +299,20 @@ pub fn serve(handle: &ReplicaHandle, req: AdminRequest) -> AdminResponse {
     })
 }
 /// One total deadline covers connecting, response and up to three leader redirects.
+/// `identity` optionally supplies an operator certificate and key; otherwise use the node certificate.
 pub fn call(
     config: &TransportConfig,
     target: u64,
     req: &AdminRequest,
     timeout: Duration,
+    identity: Option<(std::path::PathBuf, std::path::PathBuf)>,
 ) -> Result<AdminResponse> {
-    let (_, connector) = transport::tls(config)?;
+    let (_, connector) = transport::tls::tls_with_identity(config, identity.as_ref())?;
+    let from = if identity.is_some() {
+        transport::OPERATOR
+    } else {
+        config.node_id
+    };
     let payload = req.encode()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -317,25 +324,34 @@ pub fn call(
                 let mut stream = transport::tls::connect_admin(config, &connector, target).await?;
                 let h = Header {
                     cluster: config.cluster,
-                    from: config.node_id,
+                    from,
                     to: target,
                 };
-                transport::write_frame(
-                    &mut stream,
-                    &transport::encode(&h, &Body::AdminRequest(payload.clone()))?,
-                )
-                .await?;
-                let h = Header {
-                    from: target,
-                    to: config.node_id,
-                    ..h
-                };
-                let Body::AdminResponse(bytes) =
-                    transport::decode(&h, &transport::read_frame(&mut stream).await?)?
-                else {
-                    return Err(invalid());
-                };
-                let response = AdminResponse::decode(&bytes)?;
+                let exchange = async {
+                    transport::write_frame(
+                        &mut stream,
+                        &transport::encode(&h, &Body::AdminRequest(payload.clone()))?,
+                    )
+                    .await?;
+                    let h = Header {
+                        from: target,
+                        to: from,
+                        ..h
+                    };
+                    let Body::AdminResponse(bytes) =
+                        transport::decode(&h, &transport::read_frame(&mut stream).await?)?
+                    else {
+                        return Err(invalid());
+                    };
+                    AdminResponse::decode(&bytes)
+                }
+                .await;
+                let response = exchange.map_err(|error| match error {
+                    Error::Io(reason) => Error::Identity(format!(
+                        "connection refused by node {target}: certificate not accepted for admin ({reason})"
+                    )),
+                    other => other,
+                })?;
                 if let AdminResponse::NotLeader { leader } = response
                     && leader != 0
                     && config.peers.contains_key(&leader)
@@ -343,6 +359,14 @@ pub fn call(
                 {
                     target = leader;
                     continue;
+                }
+                if identity.is_none()
+                    && target != config.node_id
+                    && let AdminResponse::Refused(reason) = &response
+                {
+                    return Ok(AdminResponse::Refused(format!(
+                        "{reason}; run on node {target} or pass an operator identity"
+                    )));
                 }
                 return Ok(response);
             }

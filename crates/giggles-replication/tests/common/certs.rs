@@ -53,6 +53,7 @@ pub fn config_for(
     addrs: &BTreeMap<u64, String>,
 ) -> TransportConfig {
     TransportConfig {
+        operators: vec![],
         node_id: id,
         cluster,
         listen: addrs[&id].clone(),

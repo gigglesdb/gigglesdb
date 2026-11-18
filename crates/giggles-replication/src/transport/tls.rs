@@ -23,6 +23,13 @@ fn key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 }
 
 pub fn tls(config: &TransportConfig) -> Result<(TlsAcceptor, TlsConnector)> {
+    tls_with_identity(config, None)
+}
+
+pub(crate) fn tls_with_identity(
+    config: &TransportConfig,
+    identity: Option<&(std::path::PathBuf, std::path::PathBuf)>,
+) -> Result<(TlsAcceptor, TlsConnector)> {
     config.validate()?;
     let mut roots = RootCertStore::empty();
     for cert in chain(&config.ca, "ca")? {
@@ -40,12 +47,12 @@ pub fn tls(config: &TransportConfig) -> Result<(TlsAcceptor, TlsConnector)> {
             key(&config.key)?,
         )
         .map_err(|e| Error::Identity(format!("certificate/key: {e}")))?;
+    let (certificate, client_key) = identity
+        .map(|(cert, key)| (cert.as_path(), key.as_path()))
+        .unwrap_or((&config.certificate, &config.key));
     let client = ClientConfig::builder()
         .with_root_certificates(roots)
-        .with_client_auth_cert(
-            chain(&config.certificate, "certificate")?,
-            key(&config.key)?,
-        )
+        .with_client_auth_cert(chain(certificate, "certificate")?, key(client_key)?)
         .map_err(|e| Error::Identity(format!("certificate/key: {e}")))?;
     Ok((
         TlsAcceptor::from(Arc::new(server)),

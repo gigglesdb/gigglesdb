@@ -339,3 +339,5 @@ mod agent_credential_api;
 
 #[path = "agent_credential_lifecycle.rs"]
 mod agent_credential_lifecycle;
+
+#[path = "replica_admin_identity.rs"] mod replica_admin_identity;

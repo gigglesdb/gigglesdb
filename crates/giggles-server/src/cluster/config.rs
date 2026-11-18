@@ -280,6 +280,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn operators_are_not_a_cluster_config_field() {
+        let mut value = serde_json::to_value(config()).unwrap();
+        value["operators"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<ClusterConfig>(value).is_err());
+    }
+
     fn config() -> ClusterConfig {
         ClusterConfig {
             node_id: 3,

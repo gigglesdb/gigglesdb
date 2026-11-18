@@ -486,6 +486,7 @@ async fn replica_command(args: impl Iterator<Item = String>) -> i32 {
                 Path::new(&c.private_key),
                 Path::new(&c.client_ca),
             )?;
+        command.validate_operators(&v.operators)?;
         Ok((transport_config(&v)?, v.node_id))
     };
     let (transport, node_id) = match setup() {
@@ -502,6 +503,7 @@ async fn replica_command(args: impl Iterator<Item = String>) -> i32 {
             node_id,
             &command.request,
             command.timeout + Duration::from_secs(30),
+            command.identity,
         )
     })
     .await

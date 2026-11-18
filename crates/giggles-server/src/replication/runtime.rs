@@ -62,6 +62,7 @@ pub fn transport_config(v: &Validated) -> Result<TransportConfig, String> {
         },
     );
     Ok(TransportConfig {
+        operators: v.operators.clone(),
         node_id: v.node_id,
         cluster: v.cluster,
         listen: v.listen.to_string(),

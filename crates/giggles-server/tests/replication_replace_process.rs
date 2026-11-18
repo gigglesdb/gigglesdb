@@ -1,5 +1,6 @@
 #![cfg(feature = "engine-rocksdb")]
 
+use super::replication_harness::write_operator_identity;
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -48,6 +49,7 @@ impl Cluster {
         let ca_key = KeyPair::generate().unwrap();
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
         std::fs::write(root.join("ca.pem"), ca_cert.pem()).unwrap();
+        let operator = write_operator_identity(&root, &ca_cert, &ca_key);
         let (tx, rx) = mpsc::channel();
         let nodes: Vec<_> = (0..4)
             .map(|i| {
@@ -89,7 +91,8 @@ impl Cluster {
                 "postgresql": {"listen": node.pg, "tls": "disabled", "loopback_trust": true},
                 "replication": {"node_id": i + 1, "join": i == 3, "cluster": "0123456789abcdef0123456789abcdef",
                     "listen": node.reservations[1].local_addr().unwrap(), "log_dir": node.dir.join("raftlog"),
-                    "tick_ms": 20, "owner": "owner", "peers": peers}
+                    "tick_ms": 20, "owner": "owner", "peers": peers,
+                    "operators": [{"name": "test operator", "fingerprint": operator}]}
             });
             std::fs::write(node.dir.join("config.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
         }
@@ -211,7 +214,11 @@ async fn admin(cluster: &Cluster, survivor: usize, args: &[String]) -> std::proc
     let mut child = Command::new(env!("CARGO_BIN_EXE_giggles-server"))
         .args(["replica", &args[0]])
         .arg(cluster.nodes[survivor].dir.join("config.json"))
-        .args(&args[1..]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        .args(&args[1..])
+        .arg("--identity")
+        .arg(cluster.root.join("operator.pem"))
+        .arg(cluster.root.join("operator.key.TEST-ONLY"))
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(95);
     loop {
         if child.try_wait().unwrap().is_some() { return child.wait_with_output().unwrap(); }

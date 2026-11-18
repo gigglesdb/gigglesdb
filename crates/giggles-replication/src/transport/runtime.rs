@@ -1,5 +1,7 @@
 use super::calls::{CallLimits, CallServer, PeerCalls};
-use super::{Body, GroupRouter, Header, PeerConfig, TransportConfig, fingerprint, frame, tls};
+use super::{
+    Body, GroupRouter, Header, OPERATOR, PeerConfig, TransportConfig, fingerprint, frame, tls,
+};
 use crate::{
     client::LocalRanges,
     error::{Error, Result},
@@ -93,11 +95,30 @@ struct PeerTable {
 pub(crate) struct Peers {
     pub(super) config: Arc<TransportConfig>,
     table: RwLock<PeerTable>,
+    skipped: RwLock<BTreeSet<(u64, String, &'static str)>>,
     connector: tokio_rustls::TlsConnector,
     pub(super) runtime: tokio::runtime::Handle,
 }
 impl Peers {
-    fn set(self: &Arc<Self>, peers: BTreeMap<u64, PeerConfig>) -> Result<()> {
+    fn set(self: &Arc<Self>, mut peers: BTreeMap<u64, PeerConfig>) -> Result<()> {
+        peers.retain(|id, peer| {
+            let reason = if *id == OPERATOR {
+                "node id 0 is reserved for operators"
+            } else if self.config.operators.contains(&peer.fingerprint) {
+                "fingerprint belongs to an operator"
+            } else {
+                return true;
+            };
+            if self
+                .skipped
+                .write()
+                .unwrap()
+                .insert((*id, peer.fingerprint.clone(), reason))
+            {
+                eprintln!("replication skipping peers[{id}]: {reason}");
+            }
+            false
+        });
         let mut seen = BTreeSet::new();
         if peers.get(&self.config.node_id).map(|p| &p.fingerprint)
             != self
@@ -291,6 +312,7 @@ impl Transport {
                 config: BTreeMap::new(),
                 active: BTreeMap::new(),
             }),
+            skipped: RwLock::default(),
             connector,
             runtime: runtime.handle().clone(),
         });
@@ -335,7 +357,11 @@ impl Transport {
                             let Some(fp) = stream.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| fingerprint(c)) else { return };
                             let peer = shared.table.read().unwrap().config.iter().find_map(|(&id, p)|
                                 (p.fingerprint == fp).then_some(id));
-                            let Some(peer) = peer else { return };
+                            let peer = match peer {
+                                Some(peer) => peer,
+                                None if config.operators.contains(&fp) => OPERATOR,
+                                None => return,
+                            };
                             let h = Header { cluster: config.cluster, from: peer, to: config.node_id };
                             let _ = inbound(&mut stream, h, &router, &calls, &shared, &fp).await;
 
@@ -563,14 +589,24 @@ async fn inbound<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<()> {
     loop {
         let (group, h, body) = read_group(stream, &base, peers, fp).await?;
+        if h.from == OPERATOR && !matches!(body, Body::AdminRequest(_)) {
+            return Err(protocol_error());
+        }
         let reply = Header {
             from: h.to,
             to: h.from,
             ..h
         };
+        if group != 0 && matches!(body, Body::AdminRequest(_)) {
+            let response = crate::admin::AdminResponse::Refused(
+                "replica admin is only for the replicated database group".into(),
+            );
+            write_body(stream, &reply, Body::AdminResponse(response.encode()?)).await?;
+            return Ok(());
+        }
         if let Body::CallRequest { id, body } = body {
             // A call connection carries only calls, all under the database cluster id. One
-            // from this node's own certificate (an operator CLI) gets node status only.
+            // from this node's own certificate gets the node CLI calls allowed by CallServer.
             if group != 0 {
                 return Err(protocol_error());
             }
@@ -589,10 +625,16 @@ async fn inbound<S: AsyncRead + AsyncWrite + Unpin>(
         let sink = route.sink;
         match body {
             Body::AdminRequest(bytes) => {
-                let req = crate::admin::AdminRequest::decode(&bytes)?;
-                let response = tokio::task::spawn_blocking(move || sink.admin(h.from, req))
-                    .await
-                    .map_err(|_| protocol_error())?;
+                let response = if h.from != OPERATOR && h.from != h.to {
+                    crate::admin::AdminResponse::Refused(
+                        "replica admin needs an operator identity".into(),
+                    )
+                } else {
+                    let req = crate::admin::AdminRequest::decode(&bytes)?;
+                    tokio::task::spawn_blocking(move || sink.admin(h.from, req))
+                        .await
+                        .map_err(|_| protocol_error())?
+                };
                 write_body(stream, &reply, Body::AdminResponse(response.encode()?)).await?;
                 return Ok(());
             }
@@ -661,6 +703,17 @@ fn authorized(table: &PeerTable, id: u64, fp: &str) -> Result<()> {
         Err(protocol_error())
     }
 }
+fn authorize_identity(peers: &Peers, id: u64, fp: &str) -> Result<()> {
+    if id == OPERATOR {
+        if peers.config.operators.iter().any(|operator| operator == fp) {
+            Ok(())
+        } else {
+            Err(protocol_error())
+        }
+    } else {
+        authorized(&peers.table.read().unwrap(), id, fp)
+    }
+}
 async fn read_current<S: AsyncRead + Unpin>(
     stream: &mut S,
     h: &Header,
@@ -668,7 +721,7 @@ async fn read_current<S: AsyncRead + Unpin>(
     fp: &str,
 ) -> Result<Body> {
     let body = read_body(stream, h).await?;
-    authorized(&peers.table.read().unwrap(), h.from, fp)?;
+    authorize_identity(peers, h.from, fp)?;
     Ok(body)
 }
 
@@ -691,6 +744,6 @@ async fn read_group<S: AsyncRead + Unpin>(
     };
     let h = Header { cluster, ..*base };
     let body = frame::decode(&h, &bytes)?;
-    authorized(&peers.table.read().unwrap(), h.from, fp)?;
+    authorize_identity(peers, h.from, fp)?;
     Ok((group, h, body))
 }

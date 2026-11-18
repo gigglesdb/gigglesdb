@@ -5,6 +5,44 @@ use std::{
     time::Duration,
 };
 
+/// Named certificate allowed to issue replica administration requests.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorConfig {
+    pub name: String,
+    pub fingerprint: String,
+}
+
+pub(crate) fn validate_operators(
+    section: &str,
+    operators: &[OperatorConfig],
+    peers: &[(u64, SocketAddr, String)],
+    certificate: &Path,
+) -> Result<Vec<String>, String> {
+    let mut fingerprints = Vec::new();
+    for (i, operator) in operators.iter().enumerate() {
+        let field = format!("{section}.operators[{i}].fingerprint");
+        decode_hex::<32>(&operator.fingerprint, &field)?;
+        if fingerprints.contains(&operator.fingerprint)
+            || peers.iter().any(|(_, _, fp)| fp == &operator.fingerprint)
+        {
+            return Err(format!("{field}: duplicate or shared with peer"));
+        }
+        fingerprints.push(operator.fingerprint.clone());
+    }
+    if !fingerprints.is_empty() {
+        let certs =
+            crate::tls::certs(certificate).map_err(|e| format!("{section}.certificate: {e}"))?;
+        let cert = certs
+            .first()
+            .ok_or_else(|| format!("{section}.certificate: no certificates"))?;
+        if fingerprints.contains(&crate::tls::fingerprint(cert)) {
+            return Err(format!("{section}.operators: shared with node certificate"));
+        }
+    }
+    Ok(fingerprints)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
@@ -24,6 +62,8 @@ pub struct ReplicationConfig {
     pub listen: SocketAddr,
     pub log_dir: PathBuf,
     pub peers: Vec<PeerConfig>,
+    #[serde(default)]
+    pub operators: Vec<OperatorConfig>,
     pub snapshot_dir: Option<PathBuf>,
     pub certificate: Option<PathBuf>,
     pub private_key: Option<PathBuf>,
@@ -47,6 +87,7 @@ pub struct Validated {
     pub listen: SocketAddr,
     pub log_dir: PathBuf,
     pub peers: Vec<(u64, SocketAddr, String)>,
+    pub operators: Vec<String>,
     pub snapshot_dir: PathBuf,
     pub certificate: PathBuf,
     pub private_key: PathBuf,
@@ -159,6 +200,12 @@ impl ReplicationConfig {
             }
             peers.push((peer.id, peer.address, peer.fingerprint.clone()));
         }
+        let operators = validate_operators(
+            "replication",
+            &self.operators,
+            &peers,
+            self.certificate.as_deref().unwrap_or(certificate),
+        )?;
         voters.sort_unstable();
         Ok(Validated {
             node_id: self.node_id,
@@ -168,6 +215,7 @@ impl ReplicationConfig {
             listen: self.listen,
             log_dir,
             peers,
+            operators,
             snapshot_dir,
             certificate: self
                 .certificate
@@ -192,6 +240,7 @@ mod tests {
     fn config() -> ReplicationConfig {
         ReplicationConfig {
             node_id: 3,
+            operators: vec![],
             join: false,
             cluster: "0123456789abcdef0123456789abcdef".into(),
             listen: "[::1]:9003".parse().unwrap(),
@@ -228,6 +277,70 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.starts_with(field), "{error}");
+    }
+
+    #[test]
+    fn operator_fingerprints() {
+        let dir = std::env::temp_dir().join(format!(
+            "operator-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let path = dir.join("node.pem");
+        std::fs::write(&path, cert.pem()).unwrap();
+        let own = crate::tls::fingerprint(cert.der());
+        {
+            let section = "replication";
+            let peers = vec![(2, "127.0.0.1:2".parse().unwrap(), "02".repeat(32))];
+            let op = |fp: String| OperatorConfig {
+                name: "on-call".into(),
+                fingerprint: fp,
+            };
+            assert_eq!(
+                validate_operators(section, &[op("03".repeat(32))], &peers, &path).unwrap(),
+                ["03".repeat(32)]
+            );
+            for fp in [
+                "AA".repeat(32),
+                "ab".into(),
+                "gg".repeat(32),
+                peers[0].2.clone(),
+                own.clone(),
+            ] {
+                assert!(
+                    validate_operators(section, &[op(fp)], &peers, &path)
+                        .unwrap_err()
+                        .starts_with(section)
+                );
+            }
+            assert!(
+                validate_operators(
+                    section,
+                    &[op("03".repeat(32)), op("03".repeat(32))],
+                    &peers,
+                    &path
+                )
+                .is_err()
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        let mut value = serde_json::to_value(config()).unwrap();
+        value.as_object_mut().unwrap().remove("operators");
+        assert!(
+            serde_json::from_value::<ReplicationConfig>(value)
+                .unwrap()
+                .operators
+                .is_empty()
+        );
     }
 
     #[test]
