@@ -372,7 +372,9 @@ async fn cancellable_write<T>(
 ) -> Result<T, Status> {
     tokio::select! {
         biased;
-        _ = ended(signal) => Err(ended_status(write)),
+        // Cancellation drops the RPC future, so an unset marker proves it
+        // cannot have sent this write or dispatch it later.
+        _ = ended(signal) => Err(ended_status(write && marker.dispatched())),
         result = future => result.map_err(|error| marker.classify(error, write)),
     }
 }

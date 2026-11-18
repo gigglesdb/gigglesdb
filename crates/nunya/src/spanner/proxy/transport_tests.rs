@@ -118,6 +118,76 @@ async fn local_readiness_failure_leaves_dispatch_marker_unset() {
     assert_unknown_audit(&lifecycle, error);
 }
 
+fn assert_cancelled_before_dispatch(
+    audit: &WriteAudit,
+    marker: &DispatchMarker,
+    lifecycle: &Mutex<Vec<LifecycleRecord>>,
+    error: Status,
+) {
+    assert!(!marker.dispatched());
+    let error = audit.finish_error(error);
+    assert_eq!(error.code(), nunya_status(NyCode::SessionEnded).code());
+    assert_eq!(error.message(), nunya_status(NyCode::SessionEnded).message());
+    assert_ne!(error.message(), nunya_status(NyCode::WriteOutcomeUnknown).message());
+    assert!(lifecycle.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn already_ended_write_does_not_poll_or_audit_unknown() {
+    let lifecycle = Arc::new(Mutex::new(vec![]));
+    let f = Fixture::with_log(Box::new(CaptureLog(Arc::default(), lifecycle.clone()))).await;
+    let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
+    let audit = WriteAudit::new(&f.svc, &who);
+    let marker = DispatchMarker::default();
+    let (_sender, mut signal) = tokio::sync::watch::channel(true);
+    let rpc = async {
+        panic!("already-ended write must not poll the RPC future");
+        #[allow(unreachable_code)]
+        Ok::<(), Status>(())
+    };
+    let error = cancellable_write(&mut signal, true, &marker, rpc).await.unwrap_err();
+    assert_cancelled_before_dispatch(&audit, &marker, &lifecycle, error);
+}
+
+#[tokio::test]
+async fn write_cancelled_during_readiness_does_not_audit_unknown() {
+    struct PendingReady(Option<tokio::sync::oneshot::Sender<()>>);
+    impl tower::Service<()> for PendingReady {
+        type Response = ();
+        type Error = Status;
+        type Future = std::future::Ready<Result<(), Status>>;
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Status>> {
+            if let Some(sender) = self.0.take() {
+                sender.send(()).unwrap();
+            }
+            std::task::Poll::Pending
+        }
+        fn call(&mut self, _: ()) -> Self::Future {
+            panic!("pending readiness must not dispatch")
+        }
+    }
+    let lifecycle = Arc::new(Mutex::new(vec![]));
+    let f = Fixture::with_log(Box::new(CaptureLog(Arc::default(), lifecycle.clone()))).await;
+    let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
+    let audit = WriteAudit::new(&f.svc, &who);
+    let marker = DispatchMarker::default();
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let mut service = DispatchService { inner: PendingReady(Some(ready_sender)), marker: marker.clone() };
+    let (sender, mut signal) = tokio::sync::watch::channel(false);
+    let rpc = async {
+        let service = tower::ServiceExt::ready(&mut service).await?;
+        tower::Service::call(service, ()).await
+    };
+    let cancel = async {
+        ready_receiver.await.unwrap();
+        sender.send(true).unwrap();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(cancellable_write(&mut signal, true, &marker, rpc), cancel)
+    }).await.unwrap();
+    assert_cancelled_before_dispatch(&audit, &marker, &lifecycle, result.unwrap_err());
+}
+
 #[tokio::test]
 async fn commit_cancellation_records_actual_end_reason() {
     for (end, expected) in [
