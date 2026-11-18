@@ -141,6 +141,8 @@ impl fmt::Debug for AdminSection {
 }
 /// Validated configuration with zeroizing secrets.
 pub struct Config {
+    /// Routes explicitly returned to file ownership at startup.
+    pub file_policy_routes: Vec<String>,
     /// Service settings resolved with each route policy.
     pub policy_settings: crate::policy::ServicePolicySettings,
     /// Configuration path passed to the loader, as given.
@@ -401,10 +403,12 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         err(&mut e, "listen", "valid address required for upstream");
     }
     let has_spanner = m.contains_key("spanner_native");
+    let mut spanner_file_owner = false;
     let mut spanner_policy = None;
     let mut spanner_route_id = None;
     let spanner_native = m.remove("spanner_native").and_then(|mut v| {
         if let Value::Table(t) = &mut v {
+            spanner_file_owner = file_owner(t, "spanner_native.policy_owner", &mut e);
             spanner_policy = route_policy(t, "spanner_native.policy", base, &mut e);
             spanner_route_id = Some(route_id(
                 t.remove("route_id"),
@@ -478,6 +482,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     if !allow_plaintext && tls.is_none() {
         err(&mut e, "tls", "required unless allow_plaintext is true");
     }
+    let mut postgres_file_owner = false;
     let mut postgres_policy = None;
     let mut postgres_route_id = None;
     let mut dialect = UpstreamDialect::default();
@@ -485,6 +490,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         let mut u = table(
             uv,
             &[
+                "policy_owner",
                 "route_id",
                 "policy",
                 "dialect",
@@ -501,6 +507,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
             "upstream",
             &mut e,
         );
+        postgres_file_owner = file_owner(&mut u, "upstream.policy_owner", &mut e);
         if Value::Table(u.clone()).try_into::<RawUpstream>().is_err() {
             err(&mut e, "upstream", "invalid fields");
         }
@@ -697,10 +704,11 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         revision: data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes())),
         session,
         management,
-        postgres_route_id,
-        spanner_route_id,
+        postgres_route_id: postgres_route_id.clone(),
+        spanner_route_id: spanner_route_id.clone(),
         listen,
         admin_listen,
+        file_policy_routes: [(postgres_file_owner, &postgres_route_id), (spanner_file_owner, &spanner_route_id)].into_iter().filter_map(|(release, route)| if release { route.clone() } else { None }).collect(),
         postgres_policy,
         spanner_policy,
         state_dir,
@@ -846,6 +854,14 @@ fn valid_principal_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+fn file_owner(table: &mut Map<String, Value>, field: &str, errors: &mut Vec<String>) -> bool {
+    match table.remove("policy_owner") {
+        None => false,
+        Some(Value::String(owner)) if owner == "file" => true,
+        Some(_) => { err(errors, field, "must be file"); false }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,6 +932,18 @@ tls = "disable"
         let c = f.load(EXAMPLE).unwrap();
         assert_eq!(c.schemas, ["public"]);
         assert_eq!(c.search_path, ["public"]);
+    }
+    #[test]
+    fn policy_owner_is_strict_and_per_route() {
+        let f = Fixture::new();
+        let c = f.load(&EXAMPLE.replace("[upstream]", "[upstream]\npolicy_owner='file'")).unwrap();
+        assert_eq!(c.file_policy_routes, ["postgres"]);
+        assert!(f.load(EXAMPLE).unwrap().file_policy_routes.is_empty());
+        for value in ["'service'", "true", "42", "''"] {
+            assert!(f.load(&EXAMPLE.replace("[upstream]", &format!("[upstream]\npolicy_owner={value}"))).is_err());
+        }
+        let c = f.load(&format!("{EXAMPLE}{NATIVE}policy_owner='file'\n")).unwrap();
+        assert_eq!(c.file_policy_routes, ["spanner-native"]);
     }
     #[test]
     fn per_route_policy_keys_resolve_against_config_dir() {
@@ -1450,3 +1478,4 @@ tls = "disable"
     }
 
 }
+

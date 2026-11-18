@@ -190,3 +190,10 @@ pub struct PolicyDocument {
     /// Linked columns, not yet enforced.
     pub links: Vec<LinkRule>,
 }
+
+/// Durable policy revision storage.
+pub mod store;
+pub use store::{LocalRevisionStore, NewRevision, Owner, PolicyRevision, RevisionKind, RevisionStore, RevisionStoreError, RevisionSummary, WriteOutcome};
+
+/// Value-free policy previews.
+pub mod diff;

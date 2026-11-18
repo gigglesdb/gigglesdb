@@ -7,6 +7,12 @@ use serde::Serialize;
 pub enum LifecycleKind {
     /// A new session was issued.
     Issued,
+    /// File policy imported.
+    PolicyImported,
+    /// Policy draft applied.
+    PolicyApplied,
+    /// Policy revision restored.
+    PolicyRolledBack,
     /// A session was renewed.
     Renewed,
     /// A session was revoked.
@@ -34,6 +40,9 @@ pub enum Actor {
 /// Data-minimal session lifecycle evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LifecycleRecord {
+    /// Optional policy mutation evidence.
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub policy: Option<PolicyAudit>,
     /// Fixed event kind.
     pub kind: LifecycleKind,
     /// Authority clock timestamp.
@@ -66,6 +75,9 @@ impl<L: crate::readlog::ReadLog> LifecycleSink for ReadLogSink<L> {
     fn record(&self, record: &LifecycleRecord) -> Result<(), AuditUnavailable> {
         use crate::readlog::{LifecycleActor as A, LifecycleKind as K};
         let kind = match record.kind {
+            LifecycleKind::PolicyImported => K::PolicyImported,
+            LifecycleKind::PolicyApplied => K::PolicyApplied,
+            LifecycleKind::PolicyRolledBack => K::PolicyRolledBack,
             LifecycleKind::Issued => K::Issued,
             LifecycleKind::Renewed => K::Renewed,
             LifecycleKind::Revoked => K::Revoked,
@@ -79,7 +91,7 @@ impl<L: crate::readlog::ReadLog> LifecycleSink for ReadLogSink<L> {
             Actor::Socket => A::Socket,
         };
         self.0.write_lifecycle(&crate::readlog::LifecycleRecord {
-            kind, actor, at_ms: record.at_ms, principal: record.principal.clone(),
+            kind, policy: record.policy.clone(), actor, at_ms: record.at_ms, principal: record.principal.clone(),
             session: record.session.clone(), route: record.route.clone(),
             connection: None, reason: record.reason,
         }).map_err(|_| AuditUnavailable)
@@ -108,7 +120,7 @@ mod tests {
     fn record() -> LifecycleRecord {
         LifecycleRecord { kind: LifecycleKind::Issued, actor: Actor::Owner, at_ms: 17,
             principal: "principal".into(), session: Some("session".into()),
-            route: Some("postgres".into()), reason: "requested" }
+            route: Some("postgres".into()), policy: None, reason: "requested" }
     }
     #[test]
     fn maps_all_kinds_and_actors_and_preserves_metadata() {
@@ -139,8 +151,35 @@ mod tests {
         assert_eq!(sink.0.records.lock().unwrap().len(), 20);
     }
     #[test]
+    fn policy_payload_reaches_readlog_without_reason_overloading() {
+        let sink = ReadLogSink(Log::default());
+        for kind in [LifecycleKind::PolicyImported, LifecycleKind::PolicyApplied, LifecycleKind::PolicyRolledBack] {
+            let mut rec = record(); rec.kind = kind;
+            rec.policy = Some(PolicyAudit { revision: Some(4), outcome: "active", summary: Default::default(), newly_visible: vec![], newly_masked: vec![] });
+            sink.record(&rec).unwrap();
+            let records = sink.0.records.lock().unwrap();
+            assert_eq!(records.last().unwrap().policy, rec.policy);
+            assert_eq!(records.last().unwrap().reason, "requested");
+        }
+    }
+    #[test]
     fn every_write_failure_is_unavailable() {
         let sink = ReadLogSink(Log { fail: true, ..Log::default() });
         assert_eq!(sink.record(&record()), Err(AuditUnavailable));
     }
+}
+
+/// Value-free policy mutation audit payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PolicyAudit {
+    /// Newly active revision, when publication succeeded.
+    pub revision: Option<u64>,
+    /// Fixed operation outcome.
+    pub outcome: &'static str,
+    /// Diff list counts.
+    pub summary: crate::policy::diff::Summary,
+    /// Column names newly made visible.
+    pub newly_visible: Vec<serde_json::Value>,
+    /// Column names newly masked.
+    pub newly_masked: Vec<serde_json::Value>,
 }

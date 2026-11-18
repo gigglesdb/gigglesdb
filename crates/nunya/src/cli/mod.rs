@@ -1,6 +1,8 @@
 //! Operator commands.
 /// Principal administration and connection inspection.
 pub mod principal;
+/// Policy management commands.
+pub mod policy;
 /// Session helper and command implementation.
 pub mod session;
 use crate::config::Config;
@@ -30,7 +32,7 @@ enum Command {
     },
     Policy {
         #[command(subcommand)]
-        command: PolicyCommand,
+        command: policy::PolicyCommand,
     },
     Principal {
         #[command(subcommand)]
@@ -47,13 +49,6 @@ enum Command {
     Key {
         #[command(subcommand)]
         command: KeyCommand,
-    },
-}
-#[derive(Subcommand)]
-enum PolicyCommand {
-    Check {
-        #[arg(long)]
-        config: PathBuf,
     },
 }
 #[derive(Subcommand)]
@@ -198,13 +193,12 @@ fn execute(command: Command) -> Result<i32, Vec<String>> {
                 .map_err(|e| vec![e])?;
             Ok(0)
         }
-        Command::Policy {
-            command: PolicyCommand::Check { config },
-        } => {
+        Command::Policy { command: policy::PolicyCommand::Check { config } } => {
             runtime_validate(&config)?;
             println!("policy OK");
             Ok(0)
         }
+        Command::Policy { command } => Ok(policy::run_command(command)),
     }
 }
 /// Run the operator CLI and return its exit code.

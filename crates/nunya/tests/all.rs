@@ -53,3 +53,6 @@ mod json_paths_live;
 
 #[path = "shared_domains_live.rs"]
 mod shared_domains_live;
+
+#[path = "policy_revisions_live.rs"]
+mod policy_revisions_live;

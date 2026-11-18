@@ -9,3 +9,6 @@ pub mod server;
 pub mod audit;
 /// Management API client.
 pub mod client;
+
+/// Administrative policy API.
+pub mod policy;

@@ -56,6 +56,12 @@ pub struct ReadLogRecord {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleKind {
+    /// Imported policy.
+    PolicyImported,
+    /// Applied policy.
+    PolicyApplied,
+    /// Restored policy.
+    PolicyRolledBack,
     /// A session was issued.
     Issued,
     /// A session was renewed.
@@ -98,6 +104,8 @@ pub enum LifecycleActor {
 /// Data-free lifecycle audit record containing identifiers and fixed codes only.
 #[derive(Clone, Debug)]
 pub struct LifecycleRecord {
+    /// Optional policy mutation evidence; omitted from legacy encodings.
+    pub policy: Option<crate::mgmt::audit::PolicyAudit>,
     /// Lifecycle event kind.
     pub kind: LifecycleKind,
     /// Unix timestamp in milliseconds.
@@ -128,6 +136,9 @@ fn lifecycle_line(rec: &LifecycleRecord) -> Result<Vec<u8>, Refusal> {
     if let LifecycleKind::MembershipReset { retired_domains, sessions } = &rec.kind {
         record["retired_domains"] = serde_json::json!(retired_domains);
         record["sessions"] = serde_json::json!(sessions);
+    }
+    if let Some(policy) = &rec.policy {
+        record["policy"] = serde_json::to_value(policy).map_err(|_| failure())?;
     }
     let mut bytes = serde_json::to_vec(&record).map_err(|_| failure())?;
     bytes.push(b'\n');
@@ -464,6 +475,24 @@ fn redact_inner(sql: &str, depth: usize) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn old_lifecycle_bytes_and_policy_payload_are_stable() {
+        let mut record = lifecycle(LifecycleActor::Owner);
+        let old = lifecycle_line(&record).unwrap();
+        assert_eq!(old, format!("{{\"actor\":\"owner\",\"connection\":null,\"event\":\"session_ended\",\"kind\":\"lifecycle\",\"principal\":\"{}\",\"reason\":\"grant_removed\",\"route\":null,\"session\":\"{}\",\"ts\":42}}\n", "01".repeat(16), "02".repeat(16)).into_bytes());
+        record.kind = LifecycleKind::PolicyApplied;
+        record.policy = Some(crate::mgmt::audit::PolicyAudit {
+            revision: Some(7), outcome: "active", summary: Default::default(),
+            newly_visible: vec![serde_json::json!({"schema":"public","table":"users","column":"email"})], newly_masked: vec![],
+        });
+        let value: serde_json::Value = serde_json::from_slice(&lifecycle_line(&record).unwrap()).unwrap();
+        assert_eq!(value["event"], "policy_applied");
+        assert_eq!(value["policy"]["revision"], 7);
+        assert_eq!(value["policy"]["newly_visible"][0]["column"], "email");
+        record.kind = LifecycleKind::SessionEnded; record.policy = None;
+        assert_eq!(lifecycle_line(&record).unwrap(), old);
+    }
+
+    #[test]
     fn membership_reset_audit_contains_only_route_domains_and_count() {
         let mut record = lifecycle(LifecycleActor::System);
         record.kind = LifecycleKind::MembershipReset { retired_domains: vec!["retired".into()], sessions: 4 };
@@ -477,7 +506,7 @@ mod tests {
 
     fn lifecycle(actor: LifecycleActor) -> LifecycleRecord {
         LifecycleRecord {
-            kind: LifecycleKind::SessionEnded, at_ms: 42,
+            policy: None, kind: LifecycleKind::SessionEnded, at_ms: 42,
             principal: "01".repeat(16), session: Some("02".repeat(16)),
             route: None, connection: None, actor, reason: "grant_removed",
         }

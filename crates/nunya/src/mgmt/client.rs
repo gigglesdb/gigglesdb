@@ -26,6 +26,13 @@ pub enum ClientError {
     Timeout,
     /// Invalid JSON or oversized response.
     Decode,
+    /// Stale policy precondition with value-free server metadata.
+    Stale {
+        /// Current durable revision.
+        current: Box<crate::policy::RevisionSummary>,
+        /// Proposed changes.
+        diff: Box<PolicyDiffView>,
+    },
     /// Server refusal with its public error code.
     Api {
         /// HTTP response status.
@@ -37,6 +44,7 @@ pub enum ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Stale { current, diff } => write!(f, "stale policy revision; current {}; {}", current.number, diff.summary),
             Self::Transport => f.write_str("management transport unavailable"),
             Self::Tls => f.write_str("management TLS unavailable"),
             Self::Timeout => f.write_str("management request timed out"),
@@ -322,6 +330,67 @@ pub struct StatusView {
     /// Optional configuration revision.
     pub config_revision: Option<String>,
 }
+/// Route policy ownership and active revision.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PolicyStatusView {
+    /// Revision actually enforced by the route.
+    #[serde(default)]
+    pub published_revision: Option<u64>,
+    /// File or service ownership.
+    pub owner: String,
+    /// Active durable revision.
+    pub active_revision: Option<crate::policy::RevisionSummary>,
+    /// Captured catalog fingerprint.
+    pub catalog_fingerprint: String,
+}
+/// Value-free change metadata retained as server JSON.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDiffView {
+    /// Change counts.
+    pub summary: serde_json::Value,
+    /// Detailed changes and preview metadata.
+    #[serde(flatten)]
+    pub changes: std::collections::BTreeMap<String, serde_json::Value>,
+}
+/// Effective column metadata.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PolicyEffectiveView {
+    /// Value-free column projections.
+    pub columns: Vec<serde_json::Value>,
+}
+/// Successful policy validation.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PolicyValidationView {
+    /// Validation outcome.
+    pub valid: bool,
+    /// Catalog used for validation.
+    pub catalog_fingerprint: String,
+}
+/// Policy publication outcome.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PolicyMutationView {
+    /// Published revision summary.
+    pub revision: crate::policy::RevisionSummary,
+    /// Whether a prior request was replayed.
+    pub replayed: bool,
+}
+/// Historical source document with flattened metadata.
+#[derive(Serialize, Deserialize)]
+pub struct PolicyRevisionView {
+    /// Public revision metadata.
+    #[serde(flatten)]
+    pub revision: crate::policy::RevisionSummary,
+    /// Exported source, excluded from diagnostics.
+    pub policy_toml: String,
+}
+/// Exported source and optional durable revision.
+#[derive(Serialize, Deserialize)]
+pub struct PolicyExportView {
+    /// Optional durable revision summary.
+    pub revision: Option<crate::policy::RevisionSummary>,
+    /// Source document, excluded from diagnostics.
+    pub policy_toml: String,
+}
 /// One-connection-per-request management client.
 pub struct MgmtClient {
     endpoint: Endpoint,
@@ -515,8 +584,12 @@ impl MgmtClient {
         path: String,
         body: serde_json::Value,
     ) -> Result<T, ClientError> {
+        self.call_key(method, path, body, None).await
+    }
+    async fn call_key<T: DeserializeOwned>(&self, method: Method, path: String,
+        body: serde_json::Value, supplied_key: Option<String>) -> Result<T, ClientError> {
         let mutation = method != Method::GET;
-        let key = if mutation {
+        let key = if supplied_key.is_some() { supplied_key } else if mutation {
             let mut nonce = [0; 16];
             getrandom::fill(&mut nonce).map_err(|_| ClientError::Transport)?;
             Some(data_encoding::HEXLOWER.encode(&nonce))
@@ -542,6 +615,12 @@ impl MgmtClient {
                 .ok()
                 .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
                 .unwrap_or_else(|| "unknown".into());
+            if status == 409 && code == "stale_revision" {
+                #[derive(Deserialize)]
+                struct Stale { current: crate::policy::RevisionSummary, diff: PolicyDiffView }
+                let stale: Stale = serde_json::from_slice(&body).map_err(|_| ClientError::Decode)?;
+                return Err(ClientError::Stale { current: Box::new(stale.current), diff: Box::new(stale.diff) });
+            }
             return Err(ClientError::Api { status, code });
         }
         serde_json::from_slice(&body).map_err(|_| ClientError::Decode)
@@ -681,6 +760,56 @@ impl MgmtClient {
         self.call(Method::GET, "/v1/connections".into(), json!({}))
             .await
     }
+    /// Read policy status.
+    pub async fn policy_status(&self, route: &str) -> Result<PolicyStatusView, ClientError> {
+        self.call(Method::GET, policy_path(route)?, json!({})).await
+    }
+    /// Read policy effective.
+    pub async fn policy_effective(&self, route: &str) -> Result<PolicyEffectiveView, ClientError> {
+        self.call(Method::GET, format!("{}/effective", policy_path(route)?), json!({})).await
+    }
+    /// Read policy revisions.
+    pub async fn policy_revisions(&self, route: &str) -> Result<Vec<crate::policy::RevisionSummary>, ClientError> {
+        self.call(Method::GET, format!("{}/revisions", policy_path(route)?), json!({})).await
+    }
+    /// Read policy export.
+    pub async fn policy_export(&self, route: &str) -> Result<PolicyExportView, ClientError> {
+        self.call(Method::GET, format!("{}/export", policy_path(route)?), json!({})).await
+    }
+    /// Validate a draft without publication.
+    pub async fn policy_validate(&self, route: &str, toml: &str) -> Result<PolicyValidationView, ClientError> {
+        self.call(Method::POST, format!("{}/validate", policy_path(route)?), json!({"policy_toml":toml})).await
+    }
+    /// Preview a draft without publication.
+    pub async fn policy_preview(&self, route: &str, toml: &str) -> Result<PolicyDiffView, ClientError> {
+        self.call(Method::POST, format!("{}/preview", policy_path(route)?), json!({"policy_toml":toml})).await
+    }
+    /// Read one historical revision.
+    pub async fn policy_revision(&self, route: &str, n: u64) -> Result<PolicyRevisionView, ClientError> {
+        self.call(Method::GET, format!("{}/revisions/{n}", policy_path(route)?), json!({})).await
+    }
+    /// Publish a draft, returning the retry key alongside its outcome.
+    pub async fn policy_apply(&self, route: &str, toml: &str, expected_revision: u64,
+        catalog_fingerprint: &str, idempotency_key: Option<String>) -> Result<(PolicyMutationView, String), ClientError> {
+        self.policy_mutation(route, "apply", json!({"policy_toml":toml,"expected_revision":expected_revision,"catalog_fingerprint":catalog_fingerprint}), idempotency_key).await
+    }
+    /// Restore a revision with an optional retry key.
+    pub async fn policy_rollback(&self, route: &str, to: u64, expected_revision: u64, key: Option<String>) -> Result<(PolicyMutationView, String), ClientError> {
+        self.policy_mutation(route, "rollback", json!({"to":to,"expected_revision":expected_revision}), key).await
+    }
+    /// Import the configured file into service ownership.
+    pub async fn policy_import(&self, route: &str, key: Option<String>) -> Result<(PolicyMutationView, String), ClientError> {
+        self.policy_mutation(route, "import", json!({}), key).await
+    }
+    async fn policy_mutation(&self, route: &str, op: &str, body: serde_json::Value, key: Option<String>) -> Result<(PolicyMutationView, String), ClientError> {
+        let key = match key { Some(key) => key, None => {
+            let mut nonce = [0;16];
+            getrandom::fill(&mut nonce).map_err(|_| ClientError::Transport)?;
+            data_encoding::HEXLOWER.encode(&nonce)
+        }};
+        let result = self.call_key(Method::POST, format!("{}/{op}", policy_path(route)?), body, Some(key.clone())).await?;
+        Ok((result, key))
+    }
     /// Read server status.
     pub async fn status(&self) -> Result<StatusView, ClientError> {
         self.call(Method::GET, "/v1/status".into(), json!({})).await
@@ -696,6 +825,11 @@ fn valid_id(id: &str) -> Result<(), ClientError> {
 fn item(collection: &str, id: &str) -> Result<String, ClientError> {
     valid_id(id)?;
     Ok(format!("/v1/{collection}/{id}"))
+}
+
+fn policy_path(route: &str) -> Result<String, ClientError> {
+    crate::state::model::RouteId::new(route).ok_or(ClientError::Transport)?;
+    Ok(format!("/v1/routes/{route}/policy"))
 }
 
 #[cfg(test)]
@@ -882,6 +1016,45 @@ mod tests {
         assert_eq!(client.status().await.unwrap_err(), ClientError::Decode);
         server.await.unwrap();
     }
+    #[tokio::test]
+    async fn policy_apply_replay_and_typed_stale() {
+        use tokio::{net::TcpListener, io::AsyncWriteExt};
+        let revision = json!({"number":2,"route":"pg","created_unix_ms":1,"policy_sha256":"hash","catalog_fingerprint":"catalog","actor":"admin","kind":"Apply","idempotency_key":"retry","request_digest":null});
+        let diff = json!({"summary":{"newly_visible":1},"newly_visible":[{"schema":"public","table":"t","column":"c"}]});
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(listener.local_addr().unwrap());
+        let expected_revision = revision.clone(); let expected_diff = diff.clone();
+        let server = tokio::spawn(async move {
+            let mut previous = None;
+            for attempt in 0..4 {
+                let (mut io, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut io).await;
+                let text = String::from_utf8(request.clone()).unwrap();
+                assert!(text.starts_with("POST /v1/routes/pg/policy/apply "));
+                assert!(text.contains("idempotency-key: retry"));
+                if let Some(previous) = &previous { assert_eq!(&request, previous); }
+                previous = Some(request);
+                let body = if attempt == 3 { json!({"error":"file_owner_configured"}) } else if attempt == 2 { json!({"error":"stale_revision","current":revision,"diff":diff}) }
+                    else { json!({"revision":revision,"replayed":attempt == 1}) }.to_string();
+                let status = if attempt >= 2 { "409 Conflict" } else { "200 OK" };
+                let response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                io.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        for replayed in [false, true] {
+            let (result, key) = client.policy_apply("pg", "default='show'", 1, "catalog", Some("retry".into())).await.unwrap();
+            assert_eq!(key, "retry"); assert_eq!(result.replayed, replayed); assert_eq!(result.revision.number, 2);
+        }
+        match client.policy_apply("pg", "default='show'", 1, "catalog", Some("retry".into())).await.unwrap_err() {
+            ClientError::Stale { current, diff } => {
+                assert_eq!(serde_json::to_value(current).unwrap(), expected_revision);
+                assert_eq!(serde_json::to_value(diff).unwrap(), expected_diff);
+            }
+            _ => panic!("expected typed stale error"),
+        }
+        assert_eq!(client.policy_apply("pg", "default='show'", 1, "catalog", Some("retry".into())).await.unwrap_err(), ClientError::Api { status: 409, code: "file_owner_configured".into() });
+        server.await.unwrap();
+    }
     #[test]
     fn status_accepts_legacy_and_route_revision_shapes() {
         let old: StatusView = serde_json::from_value(json!({
@@ -899,3 +1072,4 @@ mod tests {
     }
 
 }
+

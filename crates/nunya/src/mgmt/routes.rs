@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fmt, sync::{Arc, RwLock}};
 
-fn idempotency_owner(caller: &Caller, origin: Origin) -> PrincipalId {
+pub(super) fn idempotency_owner(caller: &Caller, origin: Origin) -> PrincipalId {
     if let Some(id) = caller.principal {
         return id;
     }
@@ -75,6 +75,8 @@ pub type Admins = Arc<RwLock<Vec<(String, ScramVerifier)>>>;
 
 /// Shared management services and configured administrators.
 pub struct MgmtContext {
+    /// Optional policy management adapter.
+    pub policy: Option<Arc<dyn super::policy::PolicySource>>,
     /// Durable authority.
     pub authority: Arc<Authority>,
     /// Configuration administrator verifiers.
@@ -165,6 +167,7 @@ fn record_session(
         route: Some(session.route.as_str().to_owned()),
         actor: lifecycle_actor(caller, origin, session.principal),
         reason,
+        policy: None,
     })
 }
 fn audit_unavailable() -> Response<Bytes> {
@@ -373,6 +376,9 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
             return r;
         }
     };
+    if let Some((route, op, n)) = super::policy::endpoint(req.uri().path()) {
+        return super::policy::handle(ctx, &caller, origin, &req, route, op, n);
+    }
     let Some(ep) = endpoint(req.uri().path()) else {
         return error(StatusCode::NOT_FOUND, "not_found");
     };
@@ -584,6 +590,7 @@ pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Respons
                         .lifecycle
                         .record(&LifecycleRecord {
                             kind: LifecycleKind::PrincipalDisabled,
+                            policy: None,
                             at_ms: ctx.authority.now_ms(),
                             principal: id.to_hex(),
                             session: None,
@@ -810,7 +817,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(RedbStore::open(&dir, &RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap());
         let authority = Authority::load(store, SessionLimits::default()).unwrap();
-        let ctx = MgmtContext {
+        let ctx = MgmtContext { policy: None,
             authority,
             admins: Arc::new(RwLock::new(vec![("reserved".into(),
                 ScramVerifier::from_password("fixture", b"salt", 1))])),

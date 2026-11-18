@@ -121,7 +121,7 @@ impl RevocationHook for RegistryHook {
         let route = self.authority.upgrade()
             .and_then(|authority| authority.session(session))
             .map(|row| row.route.as_str().to_owned());
-        let record = LifecycleRecord {
+        let record = LifecycleRecord { policy: None,
             kind: LifecycleKind::SessionEnded,
             at_ms: crate::serve::now(),
             principal: principal.to_hex(),

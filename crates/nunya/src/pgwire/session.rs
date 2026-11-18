@@ -199,7 +199,7 @@ impl Session {
             })
     }
     fn audit_unknown(&self, reason: &'static str) {
-        if self.ctx.readlog.write_lifecycle(&LifecycleRecord {
+        if self.ctx.readlog.write_lifecycle(&LifecycleRecord { policy: None,
             kind: LifecycleKind::WriteOutcomeUnknown,
             at_ms: (self.ctx.clock)(),
             principal: self.principal.to_hex(),
@@ -231,7 +231,7 @@ impl Session {
             NyCode::SessionEnded
         };
         self.ctx.metrics.refused(code);
-        let record = LifecycleRecord {
+        let record = LifecycleRecord { policy: None,
             kind: LifecycleKind::ConnectionEnded,
             at_ms: (self.ctx.clock)(),
             principal: self.principal.to_hex(),

@@ -159,7 +159,7 @@ impl Fixture {
             .unwrap();
         let admin = make_verifier("config-admin-private.secret");
         let audit = Arc::new(AuditSink::default());
-        let ctx = MgmtContext {
+        let ctx = MgmtContext { policy: None,
             authority,
             admins: Arc::new(std::sync::RwLock::new(vec![("config-admin".into(), admin.0)])),
             connections: Arc::new(Sources),
@@ -2461,4 +2461,19 @@ fn status_legacy_revision_is_emitted_only_when_unambiguous() {
         assert_eq!(body["policy_revisions"].as_object().unwrap().len(), count);
         assert_eq!(body.get("policy_revision"), legacy.as_ref());
     }
+}
+
+#[tokio::test]
+async fn policy_client_refusal_through_real_listener() -> TransportResult {
+    use nunya::mgmt::{client::ClientError, server::spawn};
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing context")?);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let server = spawn(ctx, Some(&listener_section(false)), &f.dir, rx).await?;
+    let addr = server.tcp_addr.ok_or("missing TCP listener")?;
+    let admin = api_client(addr, "admin", "admin-private.secret");
+    assert_eq!(admin.policy_status("postgres").await.unwrap_err(), ClientError::Api { status:404, code:"not_found".into() });
+    let alice = api_client(addr, "alice", "alice-private.secret");
+    assert_eq!(alice.policy_import("postgres", Some("retry".into())).await.unwrap_err(), ClientError::Api { status:403, code:"forbidden".into() });
+    finish_server(tx, server).await
 }

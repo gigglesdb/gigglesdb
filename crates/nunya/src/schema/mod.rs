@@ -236,6 +236,21 @@ impl Snapshot {
             .find(|c| c.name == r.column)
     }
 }
+/// SHA-256 of canonical table/column names, types and captured identities.
+pub fn catalog_fingerprint(snapshot: &Snapshot) -> String {
+    let mut rows: Vec<Vec<u8>> = snapshot.relations.iter().map(|r| {
+        let mut columns: Vec<_> = r.columns.iter().map(|c| {
+            let name = ColumnRef { schema: r.schema.clone(), table: r.name.clone(), column: c.name.clone() };
+            serde_json::to_vec(&(&c.name, &c.ty, snapshot.column_id(&name)))
+                .expect("schema serialization is infallible")
+        }).collect();
+        columns.sort();
+        serde_json::to_vec(&(&r.schema, &r.name, columns)).expect("schema serialization is infallible")
+    }).collect();
+    rows.sort();
+    data_encoding::HEXLOWER.encode(&Sha256::digest(serde_json::to_vec(&rows).expect("schema serialization is infallible")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,3 +418,4 @@ mod tests {
         );
     }
 }
+

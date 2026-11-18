@@ -252,7 +252,7 @@ impl WriteAudit {
         }
     }
     fn record(&self, reason: &'static str) {
-        if self.ctx.readlog.write_lifecycle(&LifecycleRecord {
+        if self.ctx.readlog.write_lifecycle(&LifecycleRecord { policy: None,
             kind: LifecycleKind::WriteOutcomeUnknown,
             at_ms: (self.ctx.clock)(), principal: self.who.principal.to_hex(),
             session: Some(self.who.session.to_hex()), route: Some(self.ctx.route.as_str().into()),
@@ -704,7 +704,7 @@ impl NunyaSpanner {
                     reason = end.ended() => reason,
                 };
                 ended_tx.send_replace(true);
-                if ctx.readlog.write_lifecycle(&LifecycleRecord {
+                if ctx.readlog.write_lifecycle(&LifecycleRecord { policy: None,
                     kind: LifecycleKind::ConnectionEnded,
                     at_ms: (ctx.clock)(),
                     principal: principal.to_hex(),

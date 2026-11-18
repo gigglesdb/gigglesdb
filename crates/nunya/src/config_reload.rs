@@ -32,6 +32,7 @@ const RESTART_ONLY: &[&str] = &[
     "spanner_native",
     "spanner_native.route_id",
     "policy",
+    "policy_owner",
     "policy_watch_ms",
     "management.listen",
     "management.enabled",
@@ -53,6 +54,7 @@ fn upstream_tls_parts(t: &UpstreamTls) -> (u8, Option<&Path>) {
 /// Classify every configuration field without exposing setting values.
 pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
     let Config {
+        file_policy_routes: a_file_policy_routes,
         path: _,
         revision: _,
         listen: a_listen,
@@ -79,6 +81,7 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
         standing: a_standing,
     } = running;
     let Config {
+        file_policy_routes: b_file_policy_routes,
         path: _,
         revision: _,
         listen: b_listen,
@@ -112,6 +115,7 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
             }
         };
     }
+    changed!(restart_only, "policy_owner", a_file_policy_routes != b_file_policy_routes);
     changed!(restart_only, "readlog", a_policy_settings.readlog != b_policy_settings.readlog);
     changed!(restart_only, "snapshot_max_age_ms", a_policy_settings.snapshot_max_age_ms != b_policy_settings.snapshot_max_age_ms);
     changed!(restart_only, "listen", a_listen != b_listen);
@@ -253,6 +257,7 @@ fn copy_verifier(v: &ScramVerifier) -> ScramVerifier {
 /// Copy startup settings without rereading a potentially edited file.
 pub(crate) fn copy_config(c: &Config) -> Config {
     Config {
+        file_policy_routes: c.file_policy_routes.clone(),
         policy_settings: c.policy_settings.clone(),
         path: c.path.clone(),
         revision: c.revision.clone(),
@@ -1016,7 +1021,7 @@ key_file='key'
         use crate::mgmt::{auth::{authenticate, Origin}, routes::MgmtContext};
         let f = Fixture::new();
         let (runtime, _hub, r, admins) = f.live();
-        let ctx = MgmtContext { authority: runtime.authority.clone(), admins,
+        let ctx = MgmtContext { policy: None, authority: runtime.authority.clone(), admins,
             connections: Arc::new(Sources), status: Arc::new(Sources), lifecycle: Arc::new(Sources) };
         let auth = |name: &str, secret: &str| {
             let mut headers = http::HeaderMap::new();
@@ -1079,6 +1084,8 @@ key_file='key'
                 "'native2'",
                 false,
             ),
+            ("policy_owner", "upstream.policy_owner", "'file'", false),
+            ("policy_owner", "spanner_native.policy_owner", "'file'", false),
             ("policy", "policy", "'other-policy'", false),
             ("policy", "upstream.policy", "'other-policy'", false),
             ("policy", "spanner_native.policy", "'other-policy'", false),
@@ -1355,7 +1362,7 @@ key_file='key'
         let mut config = f.load(&f.text);
         config.management.as_mut().unwrap().listen = "127.0.0.1:0".parse().unwrap();
         let transports = Transports::new(&config).unwrap(); reload.attach_transports(transports.clone());
-        let ctx = Arc::new(MgmtContext { authority: runtime.authority.clone(), admins,
+        let ctx = Arc::new(MgmtContext { policy: None, authority: runtime.authority.clone(), admins,
             connections: Arc::new(Sources), status: Arc::new(Sources), lifecycle: Arc::new(Sources) });
         let (shutdown, rx) = tokio::sync::watch::channel(false);
         let server = spawn_with_tls(ctx, config.management.as_ref(), &config.state_dir, rx, transports.management.clone()).await.unwrap();

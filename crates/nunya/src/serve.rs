@@ -391,6 +391,117 @@ impl crate::mgmt::routes::StatusSource for ManagementStatus {
     fn route_ids(&self) -> Vec<String> { self.routes.iter().map(|r| r.as_str().into()).collect() }
 }
 
+struct ManagementPolicy {
+    writes: std::sync::Mutex<()>,
+    hub: Arc<crate::reload::Hub>,
+    store: Arc<dyn crate::state::store::Store>,
+}
+impl ManagementPolicy {
+    fn write(
+        &self,
+        route: &crate::state::model::RouteId,
+        operation: impl FnOnce() -> Result<crate::policy::PolicyRevision, crate::reload::PolicyOpError>,
+    ) -> Result<crate::mgmt::policy::PolicyWrite, crate::mgmt::policy::PolicyError> {
+        // Serialize adapter mutations so the pre-operation revision determines replay
+        // even when identical management requests arrive concurrently.
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| crate::mgmt::policy::PolicyError::Code(503, "policy_unavailable"))?;
+        let before = self.hub.active_revision(route)?.map(|r| r.number);
+        let revision = operation()?;
+        let replayed = before.is_some_and(|n| revision.number <= n);
+        Ok(crate::mgmt::policy::PolicyWrite { revision, replayed })
+    }
+}
+#[allow(clippy::result_large_err)] // Internal policy errors retain the stale revision for the API.
+impl crate::mgmt::policy::PolicySource for ManagementPolicy {
+    fn published(&self, r: &crate::state::model::RouteId) -> Result<Option<u64>, crate::mgmt::policy::PolicyError> { self.hub.published_revision(r).map_err(Into::into) }
+    fn validate(&self, r: &crate::state::model::RouteId, toml: &str) -> Result<crate::policy::PolicyDocument, crate::mgmt::policy::PolicyError> { self.hub.validate_draft(r, toml).map_err(Into::into) }
+    fn owner(
+        &self,
+        r: &crate::state::model::RouteId,
+    ) -> Result<crate::policy::Owner, crate::mgmt::policy::PolicyError> {
+        self.hub.owner(r).map_err(Into::into)
+    }
+    fn active(
+        &self,
+        r: &crate::state::model::RouteId,
+    ) -> Result<Option<crate::policy::PolicyRevision>, crate::mgmt::policy::PolicyError> {
+        self.hub.active_revision(r).map_err(Into::into)
+    }
+    fn history(
+        &self,
+        r: &crate::state::model::RouteId,
+    ) -> Result<Vec<crate::policy::RevisionSummary>, crate::mgmt::policy::PolicyError> {
+        self.hub.revisions(r).map_err(Into::into)
+    }
+    fn get(
+        &self,
+        r: &crate::state::model::RouteId,
+        n: u64,
+    ) -> Result<Option<crate::policy::PolicyRevision>, crate::mgmt::policy::PolicyError> {
+        self.hub.revision(r, n).map_err(Into::into)
+    }
+    fn effective(
+        &self,
+        r: &crate::state::model::RouteId,
+    ) -> Result<
+        (
+            Arc<crate::policy::PolicyDocument>,
+            Arc<crate::schema::Snapshot>,
+            crate::policy::bindings::RouteBindings,
+        ),
+        crate::mgmt::policy::PolicyError,
+    > {
+        let (d, s) = self.hub.effective_document(r)?;
+        let b = crate::policy::bindings::load(self.store.as_ref(), r)
+            .map_err(|_| crate::mgmt::policy::PolicyError::Code(503, "policy_unavailable"))?;
+        Ok((d, s, b))
+    }
+    fn fingerprint(
+        &self,
+        r: &crate::state::model::RouteId,
+    ) -> Result<String, crate::mgmt::policy::PolicyError> {
+        self.hub.current_catalog_fingerprint(r).map_err(Into::into)
+    }
+    fn export(
+        &self,
+        r: &crate::state::model::RouteId,
+    ) -> Result<String, crate::mgmt::policy::PolicyError> {
+        self.hub.policy_source(r).map_err(Into::into)
+    }
+    fn import(
+        &self,
+        r: &crate::state::model::RouteId,
+        a: &str,
+        k: String,
+    ) -> Result<crate::mgmt::policy::PolicyWrite, crate::mgmt::policy::PolicyError> {
+        self.write(r, || self.hub.import_policy(r, a, Some(k)))
+    }
+    fn apply(
+        &self,
+        r: &crate::state::model::RouteId,
+        a: &str,
+        t: &str,
+        e: u64,
+        f: &str,
+        k: String,
+    ) -> Result<crate::mgmt::policy::PolicyWrite, crate::mgmt::policy::PolicyError> {
+        self.write(r, || self.hub.apply_policy(r, a, t, e, f, Some(k)))
+    }
+    fn rollback(
+        &self,
+        r: &crate::state::model::RouteId,
+        a: &str,
+        t: u64,
+        e: u64,
+        k: String,
+    ) -> Result<crate::mgmt::policy::PolicyWrite, crate::mgmt::policy::PolicyError> {
+        self.write(r, || self.hub.rollback_policy(r, a, t, e, Some(k)))
+    }
+}
+
 /// Serve agents until a shutdown signal, draining active sessions for thirty seconds.
 pub async fn run(mut config: Config) -> Result<(), String> {
     let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
@@ -433,8 +544,12 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             policy_routes.push((route.clone(), path.clone().ok_or("route policy unavailable")?));
         }
     }
-    let hub = crate::reload::Hub::new(&policy_routes, config.policy_watch_ms, config.policy_settings.clone())?;
+    let revision_store = Arc::new(crate::policy::LocalRevisionStore::new(runtime.store()));
+    crate::reload::Hub::release_file_owners(revision_store.as_ref(), &config.file_policy_routes)?;
+    let hub = crate::reload::Hub::new_with_revision_store(&policy_routes, config.policy_watch_ms, config.policy_settings.clone(), Some(revision_store.as_ref()))?;
     hub.set_store(runtime.store())?;
+    hub.set_file_owners(&config.file_policy_routes)?;
+    hub.set_revision_store(revision_store)?;
     hub.set_authority(Arc::downgrade(&runtime.authority))?;
     let admins: crate::mgmt::routes::Admins = Arc::new(std::sync::RwLock::new(config.management.as_ref().map(|m| {
         m.admins.iter().map(|a| (a.name.clone(), crate::pgwire::auth::ScramVerifier {
@@ -481,6 +596,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let management = if config.management.is_some() || cfg!(unix) {
         let ctx = crate::mgmt::routes::MgmtContext {
+            policy: Some(Arc::new(ManagementPolicy { hub: hub.clone(), store: runtime.store(), writes: std::sync::Mutex::new(()) })),
             authority: runtime.authority.clone(), admins,
             connections: Arc::new(ManagementConnections(runtime.registry.clone())),
             status: Arc::new(ManagementStatus {
@@ -857,7 +973,7 @@ mod tests {
         let available = Arc::new(AtomicBool::new(true));
         let log = ReloadableLog(Arc::new(RwLock::new(Box::new(Sink(available.clone())))),
             Arc::new(RwLock::new(Revisions::default())), Arc::new(AtomicBool::new(true)));
-        let lifecycle = LifecycleRecord {
+        let lifecycle = LifecycleRecord { policy: None,
             kind: LifecycleKind::SessionEnded, at_ms: 1, principal: String::new(), session: None,
             route: None, connection: None, actor: LifecycleActor::System, reason: "requested",
         };

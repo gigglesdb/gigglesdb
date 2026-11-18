@@ -260,6 +260,9 @@ impl Authority {
                 for (key, bytes) in read.scan_prefix(table, b"")? {
                     let bad = || AuthorityError::Store;
                     match table {
+                        Table::PolicyRevisions | Table::PolicyHeads | Table::PolicyIdempotency => {
+                            crate::policy::store::validate_record(table, &key, &bytes).map_err(|_| bad())?;
+                        }
                         Table::DomainBindings => {
                             let record: crate::policy::bindings::BindingRecord =
                                 decode(&bytes).map_err(|_| bad())?;
