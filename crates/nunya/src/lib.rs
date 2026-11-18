@@ -11,6 +11,8 @@ pub mod dialect;
 pub mod error;
 /// Ir support.
 pub mod ir;
+/// Ordered JSON documents and wire codecs.
+pub mod json;
 /// Management API.
 pub mod mgmt;
 /// Pgwire support.

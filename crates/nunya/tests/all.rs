@@ -40,5 +40,7 @@ mod spanner_native;
 mod spanner_pg;
 
 #[path = "bindings_live.rs"] mod bindings_live;
+#[path = "json_filter.rs"]
+mod json_filter;
 #[path = "upstream_tls.rs"]
 mod upstream_tls;
