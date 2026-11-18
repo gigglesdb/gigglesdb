@@ -386,6 +386,9 @@ impl Visitor for Scan {
         // Except for the closed introspection route below, the core binder
         // owns nonliteral scalars without explicit catalog context.
         self.core_scalar |= !matches!(e, A::Value(_) | A::Nested(_));
+        // Core's lexer owns prefixed strings, including PostgreSQL escape errors.
+        self.core_scalar |= matches!(e, A::Value(a::Value::DollarQuotedString(_)
+            | a::Value::EscapedStringLiteral(_) | a::Value::UnicodeStringLiteral(_)));
         // This additional gateway route is deliberately closed: nested scalar
         // calls and base relations must keep their existing core routing.
         // Special SQL function forms (SUBSTRING, TRIM, etc.) are excluded too.
@@ -5992,6 +5995,23 @@ mod pgparity_concat_routing {
         for sql in ["SELECT '{a}'::text[] || '{b}'", "SELECT 1 || '{2}'::int[]", "SELECT '{}'::jsonb || '1'", "SELECT '{}'::jsonb || '{}'::jsonb"] {
             assert!(plan(sql).unwrap().is_none(), "{sql}");
             assert!(plan_gateway(sql).unwrap().is_none(), "{sql}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pgparity_literal_routing {
+    use super::*;
+    #[test]
+    fn prefixed_strings_decline_to_the_core_lexer() {
+        for sql in ["SELECT $$it's a label$$", "SELECT $tag$it's a label$tag$",
+            r"SELECT E'it\'s\tvalue\\ok'", r"SELECT U&'caf\00e9'",
+            "SELECT $$42$$::int", "SELECT coalesce($$42$$, 'x')"] {
+            assert!(plan_gateway(sql).unwrap().is_none(), "{sql}");
+        }
+        // Plain numeric and quoted literal routing stays with the catalog path.
+        for sql in ["SELECT 1", "SELECT .5", "SELECT 'it''s a label'"] {
+            assert!(plan_gateway(sql).unwrap().is_some(), "{sql}");
         }
     }
 }

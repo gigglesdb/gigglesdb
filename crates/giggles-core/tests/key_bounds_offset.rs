@@ -176,6 +176,7 @@ fn row_count_error_protocol_identities() {
         (61, SqlError::InvalidFrameOffset),
         (62, SqlError::InvalidNtileArgument),
         (63, SqlError::InvalidNthValueArgument),
+        (64, SqlError::InvalidTablesampleArgument),
     ] {
         let le = bincode::DefaultOptions::new()
             .with_fixint_encoding()
@@ -195,9 +196,9 @@ fn row_count_error_protocol_identities() {
         assert_eq!(be.serialize(&error).unwrap(), tag.to_be_bytes());
         assert_eq!(
             giggles_core::local::failure(CoreError::Sql(error)).code,
-            200 + tag
+            if tag == 64 { 266 } else { 200 + tag }
         );
-        assert!(le.deserialize::<SqlError>(&64u32.to_le_bytes()).is_err());
-        assert!(be.deserialize::<SqlError>(&64u32.to_be_bytes()).is_err());
+        assert!(le.deserialize::<SqlError>(&65u32.to_le_bytes()).is_err());
+        assert!(be.deserialize::<SqlError>(&65u32.to_be_bytes()).is_err());
     }
 }

@@ -234,7 +234,18 @@ impl Plan {
         let state = catalog.as_ref().unwrap_or(state);
         if let Some(m) = &mut self.mutation { return m.resolve(state, parameters); }
         if let Some(m) = &mut self.merge { return m.resolve(state, parameters); }
-        let meta = match &mut self.body {
+        // Pagination can determine an otherwise unknown projection parameter.
+        for s in self.limit.iter().chain(&self.offset) {
+            s.infer(Some(&DataType::BigInt), parameters,
+                &|_, _| Err(SqlError::InvalidColumnReference), &[])?;
+        }
+        if let Some(sample) = &self.decorations.sample {
+            for s in std::iter::once(&sample.percent).chain(sample.seed.iter()) {
+                s.infer(Some(&DataType::DoublePrecision), parameters, &no_column, &[])?;
+                Scalar::Cast(Box::new(s.clone()), DataType::DoublePrecision).bind(&no_column, &[], parameters)?;
+            }
+        }
+        let mut meta = match &mut self.body {
             Body::Select(select) if !select.applies.is_empty() => {
                 subquery::resolve(select, state, parameters)?
             }
@@ -271,6 +282,7 @@ impl Plan {
                     let q = window::prepare(select, state)?;
                     cte::prepare_query(&q, state)?
                 };
+                paging::validate_distinct(&query, self.decorations.distinct_on, &self.order, state)?;
                 let mut unknown_parameters: Vec<_> = select
                     .query
                     .items
@@ -307,6 +319,7 @@ impl Plan {
                     Err(error) => return Err(error),
                 };
                 let mut description = bound.description(state);
+                group_sets::validate(&query, self.decorations.grouping_sets.as_deref(), state, &description.parameters)?;
                 let oids = cte::projection_oids(&bound);
                 if oids.iter().any(|oid| *oid != 0) {
                     description.type_oids = oids;
@@ -467,6 +480,9 @@ impl Plan {
         let _collations =
             functions::collation::ColumnScope::enter(&table.columns, &meta.collations)?;
         for (s, _, _) in &self.order {
+            if let Scalar::Literal(Value::Int(n)) = s
+                && (*n < 1 || *n as u64 > meta.columns.len().saturating_sub(self.decorations.hidden) as u64)
+            { return Err(SqlError::InvalidColumnReference); }
             if self.set_result() && !matches!(s, Scalar::Column(_) | Scalar::Literal(_)) {
                 return Err(SqlError::Unsupported);
             }
@@ -480,15 +496,17 @@ impl Plan {
                 .require_collation()?;
         }
         for s in self.limit.iter().chain(&self.offset) {
-            s.infer(Some(&DataType::BigInt), parameters, &no_column, &[])?;
-            let ty = s.bind(&no_column, &[], parameters)?.ty;
+            let no_page_column = |_: &ColumnRef, _: usize| Err(SqlError::InvalidColumnReference);
+            s.infer(Some(&DataType::BigInt), parameters, &no_page_column, &[])?;
+            let ty = s.bind(&no_page_column, &[], parameters)?.ty;
             if !integer_type(&ty)
-                && ty != DataType::Numeric
-                && !matches!(s, Scalar::Literal(Value::Null))
+                && !matches!(ty, DataType::Numeric | DataType::Real | DataType::DoublePrecision)
+                && !matches!(s, Scalar::Literal(Value::Null | Value::Text(_)))
             {
                 return Err(SqlError::Type);
             }
         }
+        paging::trim_meta(&mut meta, self.decorations.hidden);
         Ok(meta)
     }
     pub(super) fn set_result(&self) -> bool {

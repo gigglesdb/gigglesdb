@@ -9,6 +9,8 @@ mod merge;
 mod exec;
 pub(super) mod join;
 mod parse;
+mod paging;
+mod group_sets;
 mod setops;
 pub(super) mod subquery;
 mod srf;

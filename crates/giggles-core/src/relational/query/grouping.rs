@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) struct Grouping {
     keys: Vec<BoundScalar>,
+    empty_set: bool,
     aggregates: Vec<BoundItem>,
     aggregate_filters: Vec<Option<BoundFilter>>,
     direct_inputs: Vec<bool>,
@@ -22,7 +23,7 @@ fn aggregate(name: &str) -> Option<Aggregate> {
 pub(super) fn contains_aggregate(s: &Scalar) -> bool {
     match s {
         Scalar::Call(n, a) => {
-            n == aggregate_filter::CALL
+            n == "grouping" || n == aggregate_filter::CALL
                 || aggregate(n).is_some()
                 || a.iter().any(contains_aggregate)
         }
@@ -192,6 +193,7 @@ fn canonical_filter(
 }
 struct Lower<'a, F> {
     groups: Vec<String>,
+    grouping_mask: Option<Vec<bool>>,
     scope: usize,
     resolve: &'a F,
     tables: &'a [&'a TableDef],
@@ -214,6 +216,18 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
             }
         }
         Ok(match s {
+            Scalar::Call(n, args) if n == "grouping" => {
+                if args.is_empty() || args.len() > 31 || self.groups.is_empty() {
+                    return Err(SqlError::GroupingError);
+                }
+                let mut mask = 0;
+                for arg in args {
+                    let key = canonical(arg, self.resolve, self.scope, self.tables)?;
+                    let index = self.groups.iter().position(|g| g == &key).ok_or(SqlError::GroupingError)?;
+                    mask = (mask << 1) | i64::from(self.grouping_mask.as_ref().is_some_and(|m| !m[index]));
+                }
+                Scalar::Cast(Box::new(Scalar::Literal(Value::Int(mask))), DataType::Integer)
+            }
             Scalar::Column(c) => {
                 let c = (self.resolve)(c, self.scope)?;
                 if !self.dependent_sources[c.source] {
@@ -330,7 +344,7 @@ fn cast_output_name(s: &Scalar) -> Option<String> {
         _ => None,
     }
 }
-fn output_scalar(item: &Item) -> R<Scalar> {
+pub(super) fn output_scalar(item: &Item) -> R<Scalar> {
     match item {
         Item::Scalar(s) => Ok(s.clone()),
         Item::Aggregate(a, arg) => Ok(Scalar::Call(
@@ -484,6 +498,11 @@ pub(super) fn bind<'a>(
         .iter()
         .map(|s| canonical(s, resolve, tables.len(), tables))
         .collect::<R<Vec<_>>>()?;
+    // Equivalent spellings (d and t.d, or an output ordinal) identify one key.
+    let grouping_mask = q.clauses().and_then(|c| c.grouping_mask.as_ref()).map(|mask| {
+        group_identity.iter().map(|key| group_identity.iter().enumerate()
+            .any(|(i, other)| other == key && mask[i])).collect::<Vec<_>>()
+    });
     let dependent_sources = tables
         .iter()
         .enumerate()
@@ -493,11 +512,14 @@ pub(super) fn bind<'a>(
                 && table
                     .primary_key
                     .iter()
-                    .all(|column| group_identity.contains(&format!("column:{source}:{column}")))
+                    .all(|column| group_identity.iter().enumerate().any(|(i, key)|
+                        *key == format!("column:{source}:{column}")
+                            && grouping_mask.as_ref().is_none_or(|mask| mask[i])))
         })
         .collect();
     let mut lower = Lower {
         groups: group_identity,
+        grouping_mask: grouping_mask.clone(),
         scope: tables.len(),
         resolve,
         tables,
@@ -601,8 +623,8 @@ pub(super) fn bind<'a>(
     }
     let mut keys = vec![];
     let mut slots = vec![];
-    for s in groups {
-        let b = s.bind(resolve, tables, &parameters)?;
+    for (index, s) in groups.into_iter().enumerate() {
+        let mut b = s.bind(resolve, tables, &parameters)?;
         if b.ty == DataType::Bpchar {
             return Err(SqlError::Unsupported);
         }
@@ -612,6 +634,11 @@ pub(super) fn bind<'a>(
             b.ty.clone(),
             false,
         ));
+        if grouping_mask.as_ref().is_some_and(|mask| !mask[index]) {
+            b = Scalar::Cast(Box::new(Scalar::Literal(Value::Null)), b.ty.clone())
+                .bind(resolve, tables, &parameters)?
+                .inherit_collation(&b)?;
+        }
         keys.push(b);
     }
     let mut aggregates = vec![];
@@ -801,6 +828,7 @@ pub(super) fn bind<'a>(
             Item::Scalar(s) if !contains_aggregate(s) => {
                 Ok(s.bind(resolve, tables, &parameters)?.name().to_owned())
             }
+            Item::Scalar(Scalar::Call(n, _)) if n == "grouping" => Ok("grouping".into()),
             _ => Ok(b.name().to_owned()),
         })
         .collect::<R<Vec<_>>>()?;
@@ -903,6 +931,7 @@ pub(super) fn bind<'a>(
         declared: vec![],
         distinct_order_slots: vec![],
         grouping: Some(Grouping {
+            empty_set: grouping_mask.as_ref().is_some_and(|m| !m.iter().any(|b| *b)),
             keys,
             aggregates,
             aggregate_filters,
@@ -924,6 +953,9 @@ impl Key {
     pub(super) fn plain(values: Vec<Value>) -> Self { Self(values, Vec::new()) }
     pub(super) fn collated(values: Vec<Value>, scalars: &[BoundScalar]) -> Self {
         Self(values, scalars.iter().map(|s| s.explicit_collation().expect("bound collation").map(str::to_owned)).collect())
+    }
+    pub(super) fn metadata(values: Vec<Value>, scalars: &[Option<BoundScalar>]) -> Self {
+        Self(values, scalars.iter().map(|s| s.as_ref().and_then(|s| s.explicit_collation().expect("bound collation")).map(str::to_owned)).collect())
     }
     pub(super) fn output(values: Vec<Value>, items: &[BoundItem]) -> Self {
         Self(values, items.iter().map(|s| match s { BoundItem::Scalar(s) => s.explicit_collation().expect("bound collation").map(str::to_owned), _ => None }).collect())
@@ -1048,13 +1080,13 @@ impl Grouping {
         // (spilling) and stream one group's state at a time; both halves merge
         // in key order. DISTINCT aggregates always take the sorted path.
         let v2 = source.streams_reductions();
-        let sort_groups = v2 && !self.keys.is_empty();
+        let sort_groups = v2 && !self.keys.is_empty() && !self.empty_set;
         let hash = sort_groups && !self.aggregates.iter().any(|a| matches!(a, BoundItem::Aggregate(a, _) if a.distinct()));
         let mut hash_bytes = 0usize;
         let mut sorter = spill::Sorter::<GroupInput>::new();
         let mut scope = RetentionScope::new(execution);
         let mut retention = scope.borrow();
-        if self.keys.is_empty() {
+        if self.keys.is_empty() || self.empty_set {
             let initial = self.initial();
             retention.charge(retained(&initial) + std::mem::size_of::<Key>())?;
             let mut auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
@@ -1064,7 +1096,10 @@ impl Grouping {
                     aux.local_transition = true;
                 }
             }
-            groups.insert(Key::plain(vec![]), (initial, auxiliary));
+            let key = if self.keys.is_empty() { Key::plain(vec![]) } else {
+                Key::collated(vec![Value::Null; self.keys.len()], &self.keys)
+            };
+            groups.insert(key, (initial, auxiliary));
         }
         drop(retention);
         let mut aggregate_work = 0;

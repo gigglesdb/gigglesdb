@@ -1,6 +1,6 @@
 //! Bounded trusted relational subset. This module grants no task authority.
 mod numeric_syntax;
-mod unicode_literal;
+mod literal_syntax;
 #[cfg(test)]
 mod numeric_literal_tests;
 use serde::{Deserialize, Serialize};
@@ -280,6 +280,8 @@ pub enum SqlError {
     InvalidNtileArgument,
     /// 22016 invalid_argument_for_nth_value_function
     InvalidNthValueArgument,
+    /// 2202H invalid_tablesample_argument
+    InvalidTablesampleArgument,
     /// 42P21 collation_mismatch: transient expression error, never persisted.
     /// Keep the frozen serialized error tag set unchanged.
     #[serde(skip)]
@@ -823,9 +825,11 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
                 return Err(SqlError::Syntax);
             }
             continue;
-        } else if c == b'\'' || (matches!(c, b'u' | b'U') && b.get(i+1) == Some(&b'&') && b.get(i+2) == Some(&b'\'')) {
-            let unicode = c != b'\'';
-            i += if unicode { 3 } else { 1 };
+        } else if let Some((value, end)) = literal_syntax::prefixed(s, i)? {
+            out.push(Token::String(value));
+            i = end;
+        } else if c == b'\'' {
+            i += 1;
             let mut v = Vec::new();
             let mut closed = false;
             while i < b.len() {
@@ -850,7 +854,7 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
                 return Err(SqlError::Limit);
             }
             let text = String::from_utf8(v).map_err(|_| SqlError::Syntax)?;
-            out.push(Token::String(if unicode { unicode_literal::decode(&text)? } else { text }));
+            out.push(Token::String(text));
         } else if c == b'"' {
             i += 1;
             let mut v = Vec::new();

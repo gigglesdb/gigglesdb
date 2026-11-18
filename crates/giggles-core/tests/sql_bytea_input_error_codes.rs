@@ -74,8 +74,14 @@ fn bytea_closed_29_goldens() {
     assert_eq!(be.serialize(&E::InvalidNthValueArgument).unwrap(), [0, 0, 0, 63]);
     assert_eq!(local::failure(CoreError::Sql(E::InvalidNthValueArgument)).code, 263);
     assert_eq!(serde_json::to_string(&E::InvalidNthValueArgument).unwrap(), "\"InvalidNthValueArgument\"");
-    assert!(le.deserialize::<E>(&[64, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<E>(&[0, 0, 0, 64]).is_err());
+    assert_eq!(le.deserialize::<E>(&[64, 0, 0, 0]).unwrap(), E::InvalidTablesampleArgument);
+    assert_eq!(be.deserialize::<E>(&[0, 0, 0, 64]).unwrap(), E::InvalidTablesampleArgument);
+    assert_eq!(le.serialize(&E::InvalidTablesampleArgument).unwrap(), [64, 0, 0, 0]);
+    assert_eq!(be.serialize(&E::InvalidTablesampleArgument).unwrap(), [0, 0, 0, 64]);
+    assert_eq!(local::failure(CoreError::Sql(E::InvalidTablesampleArgument)).code, 266);
+    assert_eq!(serde_json::to_string(&E::InvalidTablesampleArgument).unwrap(), "\"InvalidTablesampleArgument\"");
+    assert!(le.deserialize::<E>(&[65, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<E>(&[0, 0, 0, 65]).is_err());
     assert!(le.deserialize::<E>(&[28, 0, 0, 0, 0]).is_err());
     assert!(be.deserialize::<E>(&[0, 0, 0, 28, 0]).is_err());
     for value in [

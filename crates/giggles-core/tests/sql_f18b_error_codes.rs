@@ -2,7 +2,7 @@ use bincode::Options;
 use giggles_core::{CoreError, local, relational::SqlError as E};
 
 const TAG: u8 = 52;
-const FIRST_UNKNOWN_TAG: u8 = 64; // next free SqlError tag; bump when appending
+const FIRST_UNKNOWN_TAG: u8 = 65; // next free SqlError tag; bump when appending
 
 #[test]
 fn f18b_error_contract_goldens() {
@@ -66,6 +66,12 @@ fn f18b_error_contract_goldens() {
     assert_eq!(be.serialize(&E::InvalidNthValueArgument).unwrap(), [0, 0, 0, 63]);
     assert_eq!(local::failure(CoreError::Sql(E::InvalidNthValueArgument)).code, 263);
     assert_eq!(serde_json::to_string(&E::InvalidNthValueArgument).unwrap(), "\"InvalidNthValueArgument\"");
+    assert_eq!(le.deserialize::<E>(&[64, 0, 0, 0]).unwrap(), E::InvalidTablesampleArgument);
+    assert_eq!(be.deserialize::<E>(&[0, 0, 0, 64]).unwrap(), E::InvalidTablesampleArgument);
+    assert_eq!(le.serialize(&E::InvalidTablesampleArgument).unwrap(), [64, 0, 0, 0]);
+    assert_eq!(be.serialize(&E::InvalidTablesampleArgument).unwrap(), [0, 0, 0, 64]);
+    assert_eq!(local::failure(CoreError::Sql(E::InvalidTablesampleArgument)).code, 266);
+    assert_eq!(serde_json::to_string(&E::InvalidTablesampleArgument).unwrap(), "\"InvalidTablesampleArgument\"");
     assert!(le.deserialize::<E>(&[FIRST_UNKNOWN_TAG, 0, 0, 0]).is_err());
     assert!(be.deserialize::<E>(&[0, 0, 0, FIRST_UNKNOWN_TAG]).is_err());
 }

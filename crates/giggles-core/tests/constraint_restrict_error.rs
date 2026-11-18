@@ -77,5 +77,11 @@ fn restrict_violation_appends_wire_tag_46() {
     assert_eq!(be.serialize(&SqlError::InvalidNthValueArgument).unwrap(), [0, 0, 0, 63]);
     assert_eq!(local::failure(CoreError::Sql(SqlError::InvalidNthValueArgument)).code, 263);
     assert_eq!(serde_json::to_string(&SqlError::InvalidNthValueArgument).unwrap(), "\"InvalidNthValueArgument\"");
-    assert!(le.deserialize::<SqlError>(&[64, 0, 0, 0]).is_err());
+    assert_eq!(le.deserialize::<SqlError>(&[64, 0, 0, 0]).unwrap(), SqlError::InvalidTablesampleArgument);
+    assert_eq!(be.deserialize::<SqlError>(&[0, 0, 0, 64]).unwrap(), SqlError::InvalidTablesampleArgument);
+    assert_eq!(le.serialize(&SqlError::InvalidTablesampleArgument).unwrap(), [64, 0, 0, 0]);
+    assert_eq!(be.serialize(&SqlError::InvalidTablesampleArgument).unwrap(), [0, 0, 0, 64]);
+    assert_eq!(local::failure(CoreError::Sql(SqlError::InvalidTablesampleArgument)).code, 266);
+    assert_eq!(serde_json::to_string(&SqlError::InvalidTablesampleArgument).unwrap(), "\"InvalidTablesampleArgument\"");
+    assert!(le.deserialize::<SqlError>(&[65, 0, 0, 0]).is_err());
 }

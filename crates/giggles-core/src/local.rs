@@ -150,6 +150,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidNthValueArgument => 63,
                 relational::SqlError::CollationMismatch => 64,
                 relational::SqlError::IndeterminateCollation => 65,
+                relational::SqlError::InvalidTablesampleArgument => 66,
             }
         }
     };

@@ -86,6 +86,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::InvalidFrameOffset) => "22013",
         CoreError::Sql(S::InvalidNtileArgument) => "22014",
         CoreError::Sql(S::InvalidNthValueArgument) => "22016",
+        CoreError::Sql(S::InvalidTablesampleArgument) => "2202H",
         CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
         CoreError::LockNotAvailable => "55P03",

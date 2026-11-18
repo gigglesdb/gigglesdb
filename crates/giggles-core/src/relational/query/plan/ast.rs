@@ -10,6 +10,7 @@ pub(in crate::relational) struct Plan {
     pub(super) order: Vec<(Scalar, bool, bool)>,
     pub(super) limit: Option<Scalar>,
     pub(super) offset: Option<Scalar>,
+    pub(super) decorations: Box<paging::Options>,
 }
 #[derive(Debug, Clone)]
 pub(super) enum Body {
@@ -55,6 +56,7 @@ impl Plan {
             order: vec![],
             limit: None,
             offset: None,
+            decorations: Box::default(),
         }
     }
     pub(in crate::relational) fn paged_mutation(&self) -> Option<&mutation::Mutation> {
@@ -173,6 +175,7 @@ impl Plan {
         }
         self.order.iter().for_each(|(s, _, _)| f(s));
         self.limit.iter().chain(&self.offset).for_each(&mut *f);
+        if let Some(sample) = &self.decorations.sample { f(&sample.percent); if let Some(seed) = &sample.seed { f(seed); } }
         match &self.body {
             Body::Values(rows) => rows.iter().flatten().for_each(f),
             Body::Select(s) => {
@@ -216,6 +219,10 @@ impl Plan {
         }
         for s in self.limit.iter_mut().chain(&mut self.offset) {
             schema_names::scalar(s, bind, state, path);
+        }
+        if let Some(sample) = &mut self.decorations.sample {
+            schema_names::scalar(&mut sample.percent, bind, state, path);
+            if let Some(seed) = &mut sample.seed { schema_names::scalar(seed, bind, state, path); }
         }
         match &mut self.body {
             Body::Values(rows) => {

@@ -210,6 +210,7 @@ struct QueryClauses {
     distinct: bool,
     filter: Option<Filter>,
     group: Vec<Scalar>,
+    grouping_mask: Option<Vec<bool>>,
     having: Option<Filter>,
     offset: Option<Expr>,
     page_casts: [Option<DataType>; 2],
@@ -430,7 +431,16 @@ fn admit_subquery_forms(tokens: &[Token], allow_exists: bool) -> R<()> {
 pub(super) fn admit_subquery_depth(tokens: &[Token]) -> R<()> {
     let mut stack = Vec::new();
     let mut nested = 0;
+    let mut cases = 0usize;
     for (at, token) in tokens.iter().enumerate() {
+        let label = at > 0 && (tokens[at - 1] == Token::Symbol('.')
+            || matches!(&tokens[at - 1], Token::Word(w) if w == "as"));
+        if !label {
+            if matches!(token, Token::Word(w) if w == "case") {
+                cases += 1;
+                if cases > subplans::MAX_DEPTH { return Err(SqlError::Limit); }
+            } else if matches!(token, Token::Word(w) if w == "end") { cases = cases.saturating_sub(1); }
+        }
         match token {
             Token::Symbol('(') => {
                 let sub = is_subquery_open(tokens, at);
@@ -968,10 +978,19 @@ impl Filter {
     ) -> R<Self> {
         // IS binds more tightly than prefix NOT and the logical operators.
         let mut suffixes = depth;
-        while p.word("is") {
+        loop {
+            let shorthand = if p.word("isnull") { Some(false) }
+                else if p.word("notnull") { Some(true) }
+                else if p.word("is") { None }
+                else { break; };
             suffixes += 1;
             if suffixes > 32 {
                 return Err(SqlError::Limit);
+            }
+            if let Some(negated) = shorthand {
+                let value = match f { Self::Scalar(a) => a, f => Scalar::Predicate(Box::new(f)) };
+                f = Self::Null(value, negated);
+                continue;
             }
             let negated = p.word("not");
             if p.word("distinct") {
@@ -2203,6 +2222,7 @@ impl Query {
         if let Ok(value) = p.expr()
             && p.tokens.get(p.at) != Some(&Token::Symbol(':'))
         {
+            if matches!(value, Expr::Literal(Value::Text(_))) { return Err(SqlError::Unsupported); }
             return Ok((value, None));
         }
         p.at = start;
@@ -2513,6 +2533,7 @@ impl Query {
         Self::parse(p)
     }
     pub(super) fn parse(p: &mut Parser) -> R<Self> {
+        if plan::Plan::requires_grouping_sets(&p.tokens[p.at..]) { return Err(SqlError::Unsupported); }
         admit_subquery_depth(&p.tokens[p.at..])?;
         if plan::subquery::quantified(&p.tokens[p.at..]) {
             return Err(SqlError::Unsupported);
@@ -2750,6 +2771,7 @@ impl Query {
                     distinct,
                     filter,
                     group,
+                    grouping_mask: None,
                     having,
                     offset,
                     page_casts: [limit_cast, offset_cast],

@@ -36,6 +36,38 @@ pub(super) fn top(tokens: &[Token]) -> R<Vec<usize>> {
     Ok(out)
 }
 impl Plan {
+    pub(in crate::relational) fn requires_grouping_sets(tokens: &[Token]) -> bool {
+        let mut depth = 0usize;
+        let mut group = false;
+        let mut start = false;
+        let mut at = 0;
+        while at < tokens.len() {
+            let token = &tokens[at];
+            if *token == Token::Symbol(')') { depth = depth.saturating_sub(1); }
+            let qualified = at > 0 && tokens[at - 1] == Token::Symbol('.');
+            if depth == 0 {
+                if !qualified && word(token, "group") && tokens.get(at + 1).is_some_and(|t| word(t, "by")) {
+                    group = true;
+                    start = true;
+                    at += 2;
+                    continue;
+                }
+                if group {
+                    if !qualified && ["having", "order", "limit", "offset", "fetch", "for", "union", "intersect", "except"].iter().any(|w| word(token, w)) {
+                        group = false;
+                    } else if *token == Token::Symbol(',') { start = true; }
+                    else {
+                        if start && ((word(token, "rollup") || word(token, "cube")) && tokens.get(at + 1) == Some(&Token::Symbol('('))
+                            || word(token, "grouping") && tokens.get(at + 1).is_some_and(|t| word(t, "sets"))) { return true; }
+                        start = false;
+                    }
+                }
+            }
+            if *token == Token::Symbol('(') { depth += 1; }
+            at += 1;
+        }
+        false
+    }
     pub(in crate::relational) fn claims(tokens: &[Token]) -> bool {
         if tokens.first() == Some(&Token::Symbol('(')) {
             // Parenthesized query expressions are owned by the planner.
@@ -47,6 +79,9 @@ impl Plan {
                 .first()
                 .is_some_and(|t| ["values", "table", "with"].iter().any(|w| word(t, w)));
         }
+        if Self::requires_grouping_sets(tokens)
+            || tokens.get(1).is_some_and(|t| word(t, "distinct")) && tokens.get(2).is_some_and(|t| word(t, "on"))
+        { return true; }
         // Claim detection must still see a planner construct when a later
         // operand exceeds the depth limit. Plan::parse owns validation.
         let mut depth = 0usize;
@@ -108,6 +143,11 @@ impl Plan {
         let mut order = false;
         for i in positions {
             let t = &tokens[i];
+            let qualified = i > 0 && tokens[i - 1] == Token::Symbol('.');
+            if !qualified && word(t, "fetch") && tokens.get(i + 1).is_some_and(|t| word(t, "first") || word(t, "next")) { return true; }
+            if (word(t, "limit") || word(t, "offset")) && Query::parse(&mut parser(tokens)).is_err() {
+                return true;
+            }
             if ["union", "intersect", "except"].iter().any(|w| word(t, w)) {
                 return true;
             }
@@ -126,6 +166,7 @@ impl Plan {
             {
                 from = false;
             }
+            if from && !qualified && word(t, "tablesample") { return true; }
             if from && word(t, "join") {
                 from_item = true;
             } else if word(t, "on") {
@@ -395,6 +436,15 @@ pub(super) fn pagination(mut plan: Plan, tokens: &[Token]) -> ParseResult<Plan> 
             if !p.word("rows") {
                 p.word("row");
             }
+        } else if !seen_limit && p.word("fetch") {
+            seen_limit = true;
+            if !p.word("first") { p.need("next")?; }
+            plan.limit = Some(if p.tokens.get(p.at).is_some_and(|t| word(t, "row") || word(t, "rows")) {
+                Scalar::Literal(Value::Int(1))
+            } else { Scalar::parse_expr(&mut p, 0, false)? });
+            if !p.word("row") { p.need("rows")?; }
+            if p.word("with") { p.need("ties")?; plan.decorations.with_ties = true; }
+            else { p.need("only")?; }
         } else {
             break;
         }
@@ -402,6 +452,9 @@ pub(super) fn pagination(mut plan: Plan, tokens: &[Token]) -> ParseResult<Plan> 
     if p.at != p.tokens.len() {
         return Err(SqlError::Unsupported.into());
     }
+    if plan.decorations.with_ties && plan.order.is_empty()
+        && !matches!(&plan.body, Body::Select(s) if !s.query.order.is_empty())
+    { return Err(ParseError::Definite(SqlError::Syntax)); }
     Ok(plan)
 }
 fn select_inner(
@@ -538,6 +591,13 @@ pub(super) fn select(
     owner: &mut Parser,
     depth: usize,
     next: &mut usize,
+) -> ParseResult<Plan> {
+    if paging::claims(tokens)? { paging::parse(tokens, owner, depth, next) }
+    else { select_base(tokens, owner, depth, next) }
+}
+
+pub(super) fn select_base(
+    tokens: &[Token], owner: &mut Parser, depth: usize, next: &mut usize,
 ) -> ParseResult<Plan> {
     if let Some(plan) = window::parse(tokens, owner, depth, next)? {
         return Ok(plan);

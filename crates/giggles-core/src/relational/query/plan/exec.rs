@@ -122,11 +122,8 @@ impl Plan {
                     let bound = query
                         .bind_projection_seeded(&catalog, parameters.to_vec())?
                         .with_clock(clock);
-                    for row in bound
-                        .execute_context(
-                            &catalog, &wrapper, params, parameters, execution, true, false,
-                        )?
-                        .rows
+                    result.columns = bound.columns.clone();
+                    for row in group_sets::execute(&query, self.decorations.grouping_sets.as_deref(), &catalog, &wrapper, params, parameters, clock, execution)?.rows
                     {
                         result.push(row)?;
                     }
@@ -188,9 +185,8 @@ impl Plan {
                     let bound = query
                         .bind_projection_seeded(state, parameters.to_vec())?
                         .with_clock(clock);
-                    let rows = bound.execute_context(
-                        state, source, params, parameters, execution, true, false,
-                    )?;
+                    result.columns = bound.columns.clone();
+                    let rows = group_sets::execute(&query, self.decorations.grouping_sets.as_deref(), state, source, params, parameters, clock, execution)?;
                     for row in rows.rows {
                         result.push(row)?;
                     }
@@ -243,6 +239,8 @@ impl Plan {
                 setops::apply(*op, *all, left, right, &mut result, execution)?;
             }
         }
+        if let Some(sample) = &self.decorations.sample { sample.apply(&mut result, params, parameters, clock, execution)?; }
+        let mut tie_keys = vec![];
         if !self.order.is_empty() {
             let table = bind::result_table(&result.columns);
             let _collations =
@@ -283,19 +281,28 @@ impl Plan {
             setops::sort(&mut keyed, execution, |a, b| {
                 order_values(&a.1, &b.1, &order)
             })?;
-            result.rows = keyed.into_iter().map(|(row, _)| row).collect();
+            for (row, keys) in keyed { result.rows.push(row); if self.decorations.with_ties { tie_keys.push(keys); } }
         }
+        paging::distinct(&mut result, self.decorations.distinct_on, &meta.collations, self.decorations.hidden, &mut tie_keys, execution)?;
         let limit = page(self.limit.as_ref(), true, params, parameters, clock)?;
         let offset = page(self.offset.as_ref(), false, params, parameters, clock)?.unwrap_or(0);
         if offset > 0 {
+            if !tie_keys.is_empty() { tie_keys.drain(..offset.min(tie_keys.len() as u64) as usize); }
             result
                 .rows
                 .drain(..offset.min(result.rows.len() as u64) as usize);
         }
         if let Some(limit) = limit {
-            result
-                .rows
-                .truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            let mut end = usize::try_from(limit).unwrap_or(usize::MAX).min(result.rows.len());
+            if self.decorations.with_ties && end > 0 {
+                while end < tie_keys.len() && super::super::grouping::cmp_values(&tie_keys[end], &tie_keys[end - 1]) == Ordering::Equal { end += 1; }
+            }
+            result.rows.truncate(end);
+        }
+        if self.decorations.hidden > 0 {
+            let width = result.columns.len() - self.decorations.hidden;
+            result.columns.truncate(width); result.typmods.truncate(width);
+            for row in &mut result.rows { row.values.truncate(width); }
         }
         Ok(result)
     }

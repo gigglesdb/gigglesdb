@@ -136,7 +136,7 @@ fn alias(p: &mut Parser) -> R<Option<(String, Vec<String>)>> {
     let explicit = p.word("as");
     let present = explicit
         || matches!(p.tokens.get(p.at), Some(Token::QuotedIdent(_)))
-        || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if !["natural", "inner", "left", "right", "full", "cross", "join", "on", "using"].contains(&w.as_str()));
+        || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if !["natural", "inner", "left", "right", "full", "cross", "join", "on", "using", "tablesample"].contains(&w.as_str()));
     if !present {
         return Ok(None);
     }
@@ -249,6 +249,7 @@ fn item(
     }
     let table_tokens = p.tokens[begin..p.at].to_vec();
     let (alias, aliases) = alias(p)?.unwrap_or_else(|| (split_key(&name).1.to_string(), vec![]));
+    let sample = paging::Sample::parse(p)?;
     let mut tokens = vec![
         Token::Word("select".into()),
         Token::Symbol('*'),
@@ -258,15 +259,17 @@ fn item(
     let mut leaf = parse::parser(&tokens);
     let query = Query::parse(&mut leaf)?;
     owner.relations.extend(leaf.relations);
-    Ok(From::Leaf {
-        query: Box::new(Plan::new(Body::Select(Box::new(Select {
+    let mut plan = Plan::new(Body::Select(Box::new(Select {
             applies: vec![],
             windows: vec![],
             query,
             parameters: BTreeSet::new(),
             input: None,
             from: None,
-        })))),
+        })));
+    plan.decorations.sample = sample.map(Box::new);
+    Ok(From::Leaf {
+        query: Box::new(plan),
         alias,
         aliases,
     })
