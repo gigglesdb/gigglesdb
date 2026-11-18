@@ -282,6 +282,8 @@ mod agent_pg_profile;
 mod agent_pg_operations;
 #[path = "agent_parity_harness.rs"]
 mod agent_parity_harness;
+#[path = "agent_parity_profile.rs"]
+mod agent_parity_profile;
 #[path = "r3_preview_sql.rs"]
 mod r3_preview_sql;
 #[path = "r3_undo_sql.rs"]

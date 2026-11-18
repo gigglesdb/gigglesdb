@@ -1,0 +1,320 @@
+[
+  {
+    "case": "explicit_transaction",
+    "class": "TransactionControl",
+    "known_bug": null,
+    "message": "explicit transactions are not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": "transaction { shipments where attempt_count = 2 select status }",
+      "HttpText": "transaction { shipments where attempt_count = 2 select status }",
+      "PgExtended": "BEGIN",
+      "PgSimple": "BEGIN"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "savepoint",
+    "class": "Savepoint",
+    "known_bug": null,
+    "message": "savepoints are not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": {
+        "savepoint": {
+          "name": "parity_point"
+        }
+      },
+      "HttpText": {
+        "savepoint": {
+          "name": "parity_point"
+        }
+      },
+      "PgExtended": "SAVEPOINT parity_point",
+      "PgSimple": "SAVEPOINT parity_point"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "ddl",
+    "class": "Ddl",
+    "known_bug": null,
+    "message": "schema changes are not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": {
+        "catalog": {
+          "dropTable": {
+            "table": "shipments"
+          }
+        }
+      },
+      "HttpText": {
+        "catalog": {
+          "dropTable": {
+            "table": "shipments"
+          }
+        }
+      },
+      "PgExtended": "DROP TABLE shipments",
+      "PgSimple": "DROP TABLE shipments"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "role_statement",
+    "class": "RoleStatement",
+    "known_bug": null,
+    "message": "role statements are not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": {
+        "n/a": "Native text 0.16 has no role or privilege statement form."
+      },
+      "HttpText": {
+        "n/a": "Native text 0.16 has no role or privilege statement form."
+      },
+      "PgExtended": "CREATE ROLE parity_role",
+      "PgSimple": "CREATE ROLE parity_role"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "copy",
+    "class": "Copy",
+    "known_bug": null,
+    "message": "COPY is not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": {
+        "n/a": "Native text 0.16 has no COPY form."
+      },
+      "HttpText": {
+        "n/a": "Native text 0.16 has no COPY form."
+      },
+      "PgExtended": "COPY shipments TO STDOUT",
+      "PgSimple": "COPY shipments TO STDOUT"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "explain",
+    "class": "Explain",
+    "known_bug": null,
+    "message": "EXPLAIN is not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": {
+        "n/a": "The native execute endpoint has no EXPLAIN request; lower_text rejects explain text before task admission."
+      },
+      "HttpText": {
+        "n/a": "The native execute endpoint has no EXPLAIN request; lower_text rejects explain text before task admission."
+      },
+      "PgExtended": "EXPLAIN SELECT status FROM shipments",
+      "PgSimple": "EXPLAIN SELECT status FROM shipments"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "cursor",
+    "class": "Cursor",
+    "known_bug": null,
+    "message": "cursors are not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": {
+        "n/a": "Native text 0.16 has no cursor form."
+      },
+      "HttpText": {
+        "n/a": "Native text 0.16 has no cursor form."
+      },
+      "PgExtended": "DECLARE parity_cursor CURSOR FOR SELECT status FROM shipments",
+      "PgSimple": "DECLARE parity_cursor CURSOR FOR SELECT status FROM shipments"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "lock",
+    "class": "Lock",
+    "known_bug": null,
+    "message": "explicit locks are not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": {
+        "n/a": "Native text 0.16 has no explicit lock form."
+      },
+      "HttpText": {
+        "n/a": "Native text 0.16 has no explicit lock form."
+      },
+      "PgExtended": "LOCK TABLE shipments IN ACCESS SHARE MODE",
+      "PgSimple": "LOCK TABLE shipments IN ACCESS SHARE MODE"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "catalog_query",
+    "class": "Catalog/Subquery",
+    "known_bug": "R3-1002: application_schemas leaves out tables with a timestamptz column, so a catalog query with a subquery on shipments never reaches the D12 check and is refused with a plain 42501 instead of denied/Subquery",
+    "message": "denied: subqueries are not allowed in a task statement",
+    "sqlstate": "42501",
+    "surfaces": {
+      "GrpcText": {
+        "n/a": "Native text 0.16 has no SQL catalog query form."
+      },
+      "HttpText": {
+        "n/a": "Native text 0.16 has no SQL catalog query form."
+      },
+      "PgExtended": "SELECT relname FROM pg_class WHERE relname IN (SELECT status FROM shipments)",
+      "PgSimple": "SELECT relname FROM pg_class WHERE relname IN (SELECT status FROM shipments)"
+    },
+    "task_error": "denied"
+  },
+  {
+    "case": "join",
+    "class": "Other",
+    "known_bug": null,
+    "message": "statement is not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": {
+        "typedRead": {
+          "join": {
+            "left": false,
+            "leftAlias": "s",
+            "on": {
+              "compare": {
+                "comparison": "NATIVE_COMPARISON_EQ",
+                "left": {
+                  "column": {
+                    "name": "status",
+                    "source": "s"
+                  }
+                },
+                "right": {
+                  "column": {
+                    "name": "status",
+                    "source": "t"
+                  }
+                }
+              }
+            },
+            "rightAlias": "t",
+            "table": "parity_other"
+          },
+          "projection": [
+            {
+              "alias": "status",
+              "expression": {
+                "column": {
+                  "name": "status",
+                  "source": "s"
+                }
+              }
+            }
+          ],
+          "table": "shipments"
+        }
+      },
+      "HttpText": {
+        "typedRead": {
+          "join": {
+            "left": false,
+            "leftAlias": "s",
+            "on": {
+              "compare": {
+                "comparison": "NATIVE_COMPARISON_EQ",
+                "left": {
+                  "column": {
+                    "name": "status",
+                    "source": "s"
+                  }
+                },
+                "right": {
+                  "column": {
+                    "name": "status",
+                    "source": "t"
+                  }
+                }
+              }
+            },
+            "rightAlias": "t",
+            "table": "parity_other"
+          },
+          "projection": [
+            {
+              "alias": "status",
+              "expression": {
+                "column": {
+                  "name": "status",
+                  "source": "s"
+                }
+              }
+            }
+          ],
+          "table": "shipments"
+        }
+      },
+      "PgExtended": "SELECT s.status FROM shipments s JOIN parity_other t ON s.status = t.status",
+      "PgSimple": "SELECT s.status FROM shipments s JOIN parity_other t ON s.status = t.status"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "insert",
+    "class": "Insert",
+    "known_bug": null,
+    "message": "INSERT is not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": "insert shipments set status=\"parity_value\"",
+      "HttpText": "insert shipments set status=\"parity_value\"",
+      "PgExtended": "INSERT INTO shipments (status) VALUES ('parity_value')",
+      "PgSimple": "INSERT INTO shipments (status) VALUES ('parity_value')"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "delete",
+    "class": "Delete",
+    "known_bug": null,
+    "message": "DELETE is not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": "delete shipments where attempt_count = 2",
+      "HttpText": "delete shipments where attempt_count = 2",
+      "PgExtended": "DELETE FROM shipments WHERE attempt_count = 2",
+      "PgSimple": "DELETE FROM shipments WHERE attempt_count = 2"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "multi_step_block",
+    "class": "TransactionControl",
+    "known_bug": null,
+    "message": "explicit transactions are not allowed in a task session",
+    "sqlstate": "0A000",
+    "surfaces": {
+      "GrpcText": "transaction { shipments select status; shipments select attempt_count }",
+      "HttpText": "transaction { shipments select status; shipments select attempt_count }",
+      "PgExtended": {
+        "n/a": "PostgreSQL extended Parse forbids multiple statements in one prepared statement."
+      },
+      "PgSimple": "SELECT status FROM shipments; SELECT attempt_count FROM shipments"
+    },
+    "task_error": "not_allowed"
+  },
+  {
+    "case": "write_without_operation_id",
+    "class": "Update",
+    "known_bug": null,
+    "message": "operation id required for this statement",
+    "sqlstate": "42T04",
+    "surfaces": {
+      "GrpcText": "update shipments where attempt_count = 2 set status = \"parity_value\"",
+      "HttpText": "update shipments where attempt_count = 2 set status = \"parity_value\"",
+      "PgExtended": "UPDATE shipments SET status = 'parity_value' WHERE attempt_count = 2",
+      "PgSimple": "UPDATE shipments SET status = 'parity_value' WHERE attempt_count = 2"
+    },
+    "task_error": "operation_id_required"
+  }
+]

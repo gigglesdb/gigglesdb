@@ -10,8 +10,8 @@ use giggles_core::{
     },
 };
 use giggles_server::{
-    AgentBinding, Binding, Running, Service, admission::ServiceLimits,
-    agent::serve_agent_pg_bound, clock::Clock, tls,
+    AgentBinding, Binding, Running, Service, admission::ServiceLimits, agent::serve_agent_pg_bound,
+    clock::Clock, tls,
 };
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -171,7 +171,11 @@ pub fn admin() -> Admin {
         }
     }
     roles
-        .grant_table("shipments", "incident_controller", &[TablePrivilege::Select])
+        .grant_table(
+            "shipments",
+            "incident_controller",
+            &[TablePrivilege::Select],
+        )
         .unwrap();
     admin
 }
@@ -1088,14 +1092,22 @@ pub mod parity {
         token: Option<&str>,
         body: Option<&Value>,
     ) -> (u16, Value) {
+        http_call_auth(address, ca, Some(cert), None, method, path, token, body).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn http_call_auth(
+        address: SocketAddr,
+        ca: &TestCert,
+        cert: Option<&TestCert>,
+        secret: Option<&str>,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
         tokio::time::timeout(Duration::from_secs(15), async {
-            let config = tls::client(
-                vec![cert.cert.der().clone()],
-                PrivatePkcs8KeyDer::from(cert.key.serialize_der()).into(),
-                vec![ca.cert.der().clone()],
-            )
-            .unwrap();
-            let mut config = (*config).clone();
+            let mut config = cert.map_or_else(|| super::no_cert_client(ca), |cert| cert.client(ca));
             config.alpn_protocols = vec![b"http/1.1".to_vec()];
             let socket = TcpStream::connect(address).await.unwrap();
             let stream = TlsConnector::from(Arc::new(config))
@@ -1106,6 +1118,9 @@ pub mod parity {
                 .method(method)
                 .uri(format!("https://localhost:{}{path}", address.port()))
                 .header("host", "localhost");
+            if let Some(secret) = secret {
+                request = request.header("authorization", format!("Bearer {secret}"));
+            }
             if body.is_some() {
                 request = request.header("content-type", "application/json");
             }
@@ -1141,17 +1156,26 @@ pub mod parity {
         ca: &TestCert,
         cert: &TestCert,
     ) -> proto::giggles_client::GigglesClient<Channel> {
+        grpc_client_auth(address, ca, Some(cert)).await
+    }
+
+    async fn grpc_client_auth(
+        address: SocketAddr,
+        ca: &TestCert,
+        cert: Option<&TestCert>,
+    ) -> proto::giggles_client::GigglesClient<Channel> {
+        let mut config = ClientTlsConfig::new()
+            .domain_name("localhost")
+            .ca_certificate(CaCertificate::from_pem(ca.cert.pem()));
+        if let Some(cert) = cert {
+            config = config.identity(Identity::from_pem(
+                cert.cert.pem(),
+                cert.key.serialize_pem(),
+            ));
+        }
         let channel = Channel::from_shared(format!("https://127.0.0.1:{}", address.port()))
             .unwrap()
-            .tls_config(
-                ClientTlsConfig::new()
-                    .domain_name("localhost")
-                    .ca_certificate(CaCertificate::from_pem(ca.cert.pem()))
-                    .identity(Identity::from_pem(
-                        cert.cert.pem(),
-                        cert.key.serialize_pem(),
-                    )),
-            )
+            .tls_config(config)
             .unwrap()
             .connect_timeout(Duration::from_secs(10))
             .connect()
@@ -1206,6 +1230,11 @@ pub mod parity {
         ("giggles.task", TASK),
     ];
 
+    pub enum AgentAuth {
+        Certificate,
+        Credential(String),
+    }
+
     /// The parity fixture: a v2 database with the worked example, and every
     /// listener of one service.
     ///
@@ -1216,6 +1245,7 @@ pub mod parity {
     /// - `agent_pg`, `agent_http`, `agent_grpc`: the agent listeners, where
     ///   `agent` is bound to `repair_agent` for `inc-436`.
     pub struct ParityFixture {
+        pub auth: AgentAuth,
         pub admin: Admin,
         pub service: Arc<Service>,
         pub ca: TestCert,
@@ -1342,10 +1372,16 @@ pub mod parity {
             )
             .await
             .unwrap();
+            let agent_tls = tls::server_optional_client(
+                vec![server_cert.cert.der().clone()],
+                PrivatePkcs8KeyDer::from(server_cert.key.serialize_der()).into(),
+                Some(vec![ca.cert.der().clone()]),
+            )
+            .unwrap();
             let agent_pg = serve_agent_pg_bound(
                 bind().await,
                 service.clone(),
-                tls.clone(),
+                agent_tls.clone(),
                 16,
                 vec!["giggles".into()],
                 gate.clone(),
@@ -1355,17 +1391,18 @@ pub mod parity {
             let agent_http = serve_http_bound(
                 bind().await,
                 agent_api.clone(),
-                tls.clone(),
+                agent_tls.clone(),
                 16,
                 gate.clone(),
             )
             .await
             .unwrap();
             let agent_grpc =
-                serve_grpc_bound(bind().await, agent_api.clone(), tls.clone(), 16, gate)
+                serve_grpc_bound(bind().await, agent_api.clone(), agent_tls.clone(), 16, gate)
                     .await
                     .unwrap();
             let fixture = Self {
+                auth: AgentAuth::Certificate,
                 admin,
                 service,
                 ca,
@@ -1387,6 +1424,65 @@ pub mod parity {
             };
             fixture.create_inc_436();
             fixture
+        }
+
+        /// Issue a real SQL credential as the task issuer; agent clients present no certificate.
+        pub async fn start_with_credential() -> Self {
+            let mut fixture = Self::start().await;
+            let issuer = fixture.password(CONTROLLER, CONTROLLER_PW).await.unwrap();
+            let row = issuer
+                .query_one("ISSUE CREDENTIAL FOR TASK \"inc-436\"", &[])
+                .await
+                .unwrap();
+            fixture.auth = AgentAuth::Credential(row.get(2));
+            fixture
+        }
+
+        fn cert(&self) -> Option<&TestCert> {
+            match self.auth {
+                AgentAuth::Certificate => Some(&self.agent),
+                AgentAuth::Credential(_) => None,
+            }
+        }
+
+        fn secret(&self) -> Option<&str> {
+            match &self.auth {
+                AgentAuth::Certificate => None,
+                AgentAuth::Credential(secret) => Some(secret),
+            }
+        }
+
+        fn authorize<T>(&self, mut request: tonic::Request<T>) -> tonic::Request<T> {
+            if let Some(secret) = self.secret() {
+                request
+                    .metadata_mut()
+                    .insert("authorization", format!("Bearer {secret}").parse().unwrap());
+            }
+            request
+        }
+
+        async fn agent_http_call(
+            &self,
+            method: &str,
+            path: &str,
+            token: Option<&str>,
+            body: Option<&Value>,
+        ) -> (u16, Value) {
+            http_call_auth(
+                self.agent_http.address,
+                &self.ca,
+                self.cert(),
+                self.secret(),
+                method,
+                path,
+                token,
+                body,
+            )
+            .await
+        }
+
+        async fn agent_grpc_client(&self) -> proto::giggles_client::GigglesClient<Channel> {
+            grpc_client_auth(self.agent_grpc.address, &self.ca, self.cert()).await
         }
 
         /// `CREATE TASK "inc-436"` as `incident_controller`. The PostgreSQL
@@ -1444,7 +1540,74 @@ pub mod parity {
 
         /// A raw task session on the agent pgwire listener.
         pub async fn agent_wire(&self) -> Wire {
-            connect_raw(self.agent_pg.address, &self.ca, &self.agent, AGENT_STARTUP).await
+            if let Some(secret) = self.secret() {
+                self.credential_wire(secret).await
+            } else {
+                connect_raw(self.agent_pg.address, &self.ca, &self.agent, AGENT_STARTUP).await
+            }
+        }
+
+        async fn credential_wire(&self, secret: &str) -> Wire {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut socket = TcpStream::connect(self.agent_pg.address).await.unwrap();
+            socket
+                .write_all(&[0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f])
+                .await
+                .unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), b'S');
+            let stream = TlsConnector::from(Arc::new(super::no_cert_client(&self.ca)))
+                .connect(ServerName::try_from("localhost").unwrap(), socket)
+                .await
+                .unwrap();
+            let mut wire = Wire { stream };
+            let mut body = 196608u32.to_be_bytes().to_vec();
+            for (key, value) in AGENT_STARTUP {
+                super::cstr(key, &mut body);
+                super::cstr(value, &mut body);
+            }
+            body.push(0);
+            wire.stream
+                .write_u32((body.len() + 4) as u32)
+                .await
+                .unwrap();
+            wire.stream.write_all(&body).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let mut challenged = false;
+                loop {
+                    let tag = wire.stream.read_u8().await.unwrap();
+                    let length = wire.stream.read_u32().await.unwrap();
+                    let mut body = vec![0; length as usize - 4];
+                    wire.stream.read_exact(&mut body).await.unwrap();
+                    match tag {
+                        b'R' => {
+                            let method = u32::from_be_bytes(body[..4].try_into().unwrap());
+                            match method {
+                                0 => {}
+                                3 => {
+                                    assert!(!challenged, "duplicate password challenge");
+                                    challenged = true;
+                                    let mut password = Vec::new();
+                                    super::cstr(secret, &mut password);
+                                    let mut packet = Vec::new();
+                                    super::message(b'p', &password, &mut packet);
+                                    wire.send(&packet).await;
+                                }
+                                other => panic!("unexpected agent authentication method {other}"),
+                            }
+                        }
+                        b'E' => panic!("credential startup refused"),
+                        b'Z' => {
+                            assert!(challenged);
+                            assert_eq!(body, b"I");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("credential startup timed out");
+            wire
         }
 
         /// A raw session for `app` on the legacy certificate pgwire listener.
@@ -1461,15 +1624,9 @@ pub mod parity {
         /// Opens a task session on the agent HTTP listener: its token, or
         /// the refusal's transport status (`http 401`).
         pub async fn open_http(&self) -> Result<String, String> {
-            let (status, reply) = http_call(
-                self.agent_http.address,
-                (&self.ca, &self.agent),
-                "POST",
-                "/v1/sessions",
-                None,
-                Some(&json!({"task": TASK})),
-            )
-            .await;
+            let (status, reply) = self
+                .agent_http_call("POST", "/v1/sessions", None, Some(&json!({"task": TASK})))
+                .await;
             match status {
                 201 => Ok(reply["sessionId"].as_str().unwrap().to_owned()),
                 other => Err(format!("http {other}")),
@@ -1479,12 +1636,15 @@ pub mod parity {
         /// Opens a task session on the agent gRPC listener: its token, or the
         /// refusal's transport status (`grpc Unauthenticated`).
         pub async fn open_grpc(&self) -> Result<String, String> {
-            let opened = grpc_client(self.agent_grpc.address, &self.ca, &self.agent)
+            let opened = self
+                .agent_grpc_client()
                 .await
-                .open_session(proto::OpenSessionRequest {
-                    task: Some(TASK.into()),
-                    ..Default::default()
-                })
+                .open_session(
+                    self.authorize(tonic::Request::new(proto::OpenSessionRequest {
+                        task: Some(TASK.into()),
+                        ..Default::default()
+                    })),
+                )
                 .await;
             match opened {
                 Ok(reply) => Ok(reply.into_inner().session_id),
@@ -1505,22 +1665,20 @@ pub mod parity {
                         Ok(token) => token,
                         Err(status) => return refused(status),
                     };
-                    let peer = (&self.ca, &self.agent);
-                    let (status, reply) = http_call(
-                        self.agent_http.address,
-                        peer,
-                        "POST",
-                        "/v1/session/execute",
-                        Some(&token),
-                        Some(&case.native_body()),
-                    )
-                    .await;
+                    let (status, reply) = self
+                        .agent_http_call(
+                            "POST",
+                            "/v1/session/execute",
+                            Some(&token),
+                            Some(&case.native_body()),
+                        )
+                        .await;
                     let observed = match status {
                         200 => observe_native(&reply),
                         other => refused(format!("http {other}")),
                     };
-                    let address = self.agent_http.address;
-                    http_call(address, peer, "DELETE", "/v1/session", Some(&token), None).await;
+                    self.agent_http_call("DELETE", "/v1/session", Some(&token), None)
+                        .await;
                     observed
                 }
                 Surface::GrpcText => {
@@ -1531,9 +1689,11 @@ pub mod parity {
                     let body = serde_json::to_vec(&case.native_body()).unwrap();
                     let request = wire_json::decode_execute(&body)
                         .unwrap_or_else(|error| panic!("{case:?}: {error:?}"));
-                    let mut client =
-                        grpc_client(self.agent_grpc.address, &self.ca, &self.agent).await;
-                    let observed = match client.execute(with_session(&token, request)).await {
+                    let mut client = self.agent_grpc_client().await;
+                    let observed = match client
+                        .execute(self.authorize(with_session(&token, request)))
+                        .await
+                    {
                         Ok(reply) => {
                             let json = wire_json::encode_reply(&reply.into_inner()).unwrap();
                             observe_native(&serde_json::from_slice(&json).unwrap())
@@ -1541,7 +1701,9 @@ pub mod parity {
                         Err(status) => refused(format!("grpc {:?}", status.code())),
                     };
                     let close = proto::CloseSessionRequest {};
-                    let _ = client.close_session(with_session(&token, close)).await;
+                    let _ = client
+                        .close_session(self.authorize(with_session(&token, close)))
+                        .await;
                     observed
                 }
             }
