@@ -18,6 +18,8 @@ use tokio::{
 mod copy;
 #[path = "pgwire_copy_in.rs"]
 mod copy_in;
+#[path = "pgwire_copy_external.rs"]
+mod copy_external;
 #[path = "pgwire_settings_functions.rs"]
 mod settings_functions;
 #[path = "pgwire_simple.rs"]
@@ -136,7 +138,7 @@ struct Diagnostic {
     phase: &'static str,
     message: Option<&'static str>,
     wire_message: Option<String>,
-    wire_detail: Option<&'static str>,
+    wire_detail: Option<String>,
     wire_hint: Option<&'static str>,
     sql_detail: Option<String>,
     query_id: Option<String>,
@@ -272,7 +274,7 @@ fn diagnostic_error(
     );
     if let Some(detail) = detail {
         b.push(b'D');
-        z(diagnostic.and_then(|d| d.sql_detail.as_deref().or(d.wire_detail)).unwrap_or(&detail), &mut b);
+        z(diagnostic.and_then(|d| d.sql_detail.as_deref().or(d.wire_detail.as_deref())).unwrap_or(&detail), &mut b);
     }
     if let Some(hint) = diagnostic.and_then(|d| d.wire_hint) {
         b.push(b'H');
@@ -946,6 +948,7 @@ enum Plan {
     ),
     Sql(Box<Prepared>),
     Copy(giggles_core::relational::Copy, Box<Prepared>),
+    CopyOut(Box<crate::auth::statements::CopyOutput>),
     Task(crate::task_statement::TaskStatement),
     /// GD-0061 R3-207: a protected form; task sessions only.
     Protected(Box<crate::agent::statement::ProtectedStatement>),
@@ -991,7 +994,7 @@ impl Statement {
                 core(session.copy_columns(copy, p))?;
                 Ok(self.d.clone())
             }
-            Plan::Explain(_) | Plan::Cursor(_)
+            Plan::CopyOut(_) | Plan::Explain(_) | Plan::Cursor(_)
             | Plan::Task(_)
             | Plan::AccessShare(_)
             | Plan::Admin(_)
@@ -1361,8 +1364,12 @@ impl State {
                     parameters: vec![],
                 },
             )
+        } else if let Some(options) = crate::auth::statements::copy_stdout_select(sql)? {
+            self.copy_destination_privilege(session, &options.destination)?;
+            self.prepare_copy_output(&options, session)?;
+            (Plan::CopyOut(Box::new(options)), Description { type_oids: vec![], typmods: vec![], columns: vec![], parameters: vec![] })
         } else if is_copy_sql(sql) {
-            let (copy, prepared) = core(session.prepare_copy(sql))?;
+            let (copy, prepared) = self.prepare_copy_checked(sql, session)?;
             (
                 Plan::Copy(copy, Box::new(prepared)),
                 Description {
@@ -1937,6 +1944,13 @@ impl State {
                         out,
                     )?;
                     p.result = ran();
+                    return Ok(true);
+                }
+                if let Plan::CopyOut(options) = &p.s.p {
+                    if p.result.is_some() { return Err("55000"); }
+                    let options = options.clone();
+                    p.result = ran();
+                    self.copy_stdout(&options, session, out)?;
                     return Ok(true);
                 }
                 if let Plan::Copy(copy, prepared) = &p.s.p {

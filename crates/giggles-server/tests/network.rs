@@ -594,15 +594,22 @@ async fn pinned_driver_extended_binary_types_describe_and_rollback() {
         .unwrap();
     tokio::pin!(copy);
     assert_eq!(copy.as_mut().finish().await.unwrap(), 0);
+    // STDOUT formats are covered by raw-wire pg_dump tests.
+    assert_eq!(
+        code(
+            c.simple_query("COPY app FROM STDIN WITH (FORMAT csv, HEADER true)")
+                .await
+                .unwrap_err()
+        ),
+        "0A000"
+    );
     for query in [
-        "COPY app FROM STDIN WITH (FORMAT csv, HEADER true)",
-        // STDOUT formats are covered by raw-wire pg_dump tests.
         "COPY app TO 'file' WITH (FORMAT csv)",
         "COPY app FROM 'file'",
     ] {
         assert_eq!(
             code(c.simple_query(query).await.unwrap_err()),
-            "0A000",
+            "42501",
             "{query}"
         );
     }

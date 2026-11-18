@@ -9,7 +9,11 @@ pub enum CopyFormat {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopySource { Stdin, File(String), Program(String) }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Copy {
+    pub source: CopySource,
     pub table: String,
     relation: schemas::Reference,
     pub columns: Vec<String>,
@@ -174,10 +178,14 @@ impl Copy {
             return Err(SqlError::Unsupported);
         }
         p.need("from")?;
-        if !p.word("stdin") {
-            return Err(SqlError::Unsupported);
-        }
+        let source = if p.word("stdin") { CopySource::Stdin } else {
+            let program = p.word("program");
+            let Some(Token::String(value)) = p.tokens.get(p.at) else { return Err(SqlError::Syntax); };
+            let value = value.clone(); p.at += 1;
+            if program { CopySource::Program(value) } else { CopySource::File(value) }
+        };
         let mut copy = Self {
+            source,
             relation: p.relations[0].clone(),
             table,
             columns,

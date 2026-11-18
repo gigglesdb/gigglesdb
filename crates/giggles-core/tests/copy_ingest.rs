@@ -56,13 +56,9 @@ fn envelope_grammar_and_rejections() {
             "{suffix}"
         );
     }
-    for sql in [
-        "COPY items TO STDOUT",
-        "COPY items FROM 'file'",
-        "COPY items FROM PROGRAM 'cmd'",
-    ] {
-        assert_eq!(Copy::parse(sql), Err(E::Unsupported));
-    }
+    assert_eq!(Copy::parse("COPY items TO STDOUT"), Err(E::Unsupported));
+    assert!(matches!(Copy::parse("COPY items FROM 'file'").unwrap().source, giggles_core::relational::CopySource::File(path) if path == "file"));
+    assert!(matches!(Copy::parse("COPY items FROM PROGRAM 'cmd'").unwrap().source, giggles_core::relational::CopySource::Program(command) if command == "cmd"));
     assert!(Copy::is_copy(
         " /*nested /*x*/ y*/ --comment\n CoPy items FROM STDIN '"
     ));

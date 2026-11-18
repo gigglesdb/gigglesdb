@@ -116,11 +116,13 @@ impl State {
         session: &mut Session,
         out: &mut Vec<u8>,
     ) -> R<()> {
-        let prepared = core(session.prepare(&options.select))?;
+        self.copy_destination_privilege(session, &options.destination)?;
+        let prepared = self.prepare_copy_output(options, session)?;
         let description = core(session.describe(&prepared))?;
         for name in &options.force_columns {
             if !description.columns.iter().any(|c| c.name == *name) { return Err("42703"); }
         }
+        let mut sink = copy_external::Sink::open(&options.destination, session, &mut self.diagnostic)?;
         self.settings.queried = session.in_transaction();
         // PostgreSQL streams COPY TO STDOUT: a spilled v2 result is read from its
         // temp file in chunks and flushed as it goes, never materialised.
@@ -147,9 +149,9 @@ impl State {
         for _ in &description.columns {
             header.extend(i16::from(options.format == 2).to_be_bytes());
         }
-        frame(b'H', &header, out)?;
+        if sink.is_none() { frame(b'H', &header, out)?; }
         if options.format == 2 {
-            frame(b'd', b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0", out)?;
+            self.copy_output_data(&mut sink, b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0", out)?;
         }
         if options.header {
             let mut data = Vec::new();
@@ -162,12 +164,12 @@ impl State {
                 } else { data.extend(column.name.as_bytes()); }
             }
             data.push(b'\n');
-            frame(b'd', &data, out)?;
+            self.copy_output_data(&mut sink, &data, out)?;
         }
         for row in rows {
             let row = core(row)?;
             count += 1;
-            if count.is_multiple_of(CURSOR_ROWS) {
+            if sink.is_none() && count.is_multiple_of(CURSOR_ROWS) {
                 flush_output(&self.output, out)?;
             }
             let mut data = Vec::new();
@@ -236,17 +238,21 @@ impl State {
             if options.format != 2 {
                 data.push(b'\n');
             }
-            frame(b'd', &data, out)?;
+            self.copy_output_data(&mut sink, &data, out)?;
         }
         if options.format == 2 {
-            frame(b'd', &(-1i16).to_be_bytes(), out)?;
+            self.copy_output_data(&mut sink, &(-1i16).to_be_bytes(), out)?;
         }
-        frame(b'c', &[], out)?;
+        if let Some(sink) = sink { sink.finish(&mut self.diagnostic)?; } else { frame(b'c', &[], out)?; }
         complete(
             &format!("COPY {count}"),
             &empty(),
             out,
         )
+    }
+
+    fn copy_output_data(&mut self, sink: &mut Option<copy_external::Sink>, data: &[u8], out: &mut Vec<u8>) -> R<()> {
+        if let Some(sink) = sink { sink.data(data, &mut self.diagnostic) } else { frame(b'd', data, out) }
     }
 
     fn simple_failure(
@@ -415,7 +421,7 @@ impl State {
             return self.copy_stdout(&select, session, out);
         }
         if is_copy_sql(sql) {
-            let (copy, prepared) = core(session.prepare_copy(sql))?;
+            let (copy, prepared) = self.prepare_copy_checked(sql, session)?;
             read_only_check("INSERT", &self.settings, session, &mut self.diagnostic)?;
             if self.settings.replication_role_replica() {
                 begin_implicit(session, implicit, &mut self.settings)?;
@@ -849,7 +855,7 @@ pub(super) fn parse_settings(
                 if zone {
                     diagnostic.wire_message = Some("invalid value for parameter \"TimeZone\"".into());
                     if p.tokens.iter().any(|t| matches!(t, Token::Word(w) if w.eq_ignore_ascii_case("INTERVAL"))) {
-                        diagnostic.wire_detail = Some("Cannot specify days in time zone interval");
+                        diagnostic.wire_detail = Some("Cannot specify days in time zone interval".into());
                     }
                 }
             }

@@ -724,7 +724,12 @@ pub(crate) fn access_share_tables(sql: &str) -> Result<Option<TableLockRequest>,
     Ok(Some(TableLockRequest { tables, mode: lock_mode, nowait }))
 }
 
+#[derive(Clone)]
+pub(crate) enum CopyDestination { Stdout, File(String), Program(String) }
+#[derive(Clone)]
 pub(crate) struct CopyOutput {
+    pub destination: CopyDestination,
+    pub table_name: Option<String>,
     pub select: String,
     // 0 = text, 1 = csv, 2 = binary.
     pub format: u8,
@@ -805,10 +810,15 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'stat
     if !p.kw("to") {
         return Ok(None);
     }
-    if !p.kw("stdout") {
-        return Err("0A000");
-    }
+    let destination = if p.kw("stdout") { CopyDestination::Stdout } else {
+        let program = p.kw("program");
+        let Some(Token::Text(value)) = p.tokens.get(p.pos) else { return Err("42601"); };
+        let value = value.clone(); p.pos += 1;
+        if program { CopyDestination::Program(value) } else { CopyDestination::File(value) }
+    };
     let mut options = CopyOutput {
+        destination,
+        table_name: if query.is_some() { None } else { Some(table.rsplit('.').next().unwrap_or(&table).trim_matches('"').replace("\"\"", "\"")) },
         select: String::new(),
         format: 0,
         header: false,

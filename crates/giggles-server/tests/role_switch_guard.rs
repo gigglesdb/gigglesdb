@@ -11,6 +11,8 @@ const MEMBERSHIPS_ALLOW: &[&str] = &[
     "giggles-core/src/storage/roles_engine.rs",
     "giggles-server/src/service.rs",
     "giggles-server/src/pg_catalog.rs",
+    // COPY server-file/program privilege check; read-only.
+    "giggles-server/src/pgwire_copy_external.rs",
 ];
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {

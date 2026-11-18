@@ -1124,6 +1124,7 @@ impl Inner {
 /// Trusted local administrator. Never hand this to a task executor or RPC caller.
 #[derive(Clone)]
 pub struct Admin {
+    data_directory: Option<std::path::PathBuf>,
     inner: Arc<Inner>,
 }
 #[derive(Clone)]
@@ -1135,6 +1136,13 @@ pub use v2::maintenance::MaintenanceStats;
 pub use v2::reclaim::ReclaimStats;
 
 impl Admin {
+    /// Local database directory, when this administrator is backed by local storage.
+    pub fn data_directory(&self) -> Option<&Path> { self.data_directory.as_deref() }
+    fn with_data_directory(mut self, path: &Path) -> Self {
+        self.data_directory = Some(std::path::absolute(path).unwrap_or_else(|_| path.to_owned()));
+        self
+    }
+
     /// Statement slots of task sessions (GD-0061 R3-401).
     pub(crate) fn task_load(&self) -> &Arc<crate::task::limits::TaskLoad> {
         &self.inner.task_load
@@ -1232,6 +1240,7 @@ impl Admin {
             db.attach_retention();
         }
         Ok(Self {
+            data_directory: None,
             inner: Arc::new(Inner {
                 backend,
                 gate: crate::cancellation::WaitMutex::new(()),
@@ -1287,7 +1296,7 @@ impl Admin {
                     Self::attach_backend(
                         Backend::V2(Arc::new(v2::V2Db::create(path.as_ref())?)),
                         limits,
-                    )
+                    ).map(|admin| admin.with_data_directory(path.as_ref()))
                 }
             }
         }
@@ -1360,11 +1369,11 @@ impl Admin {
             RecoveryPoint::InstallCommitted,
             RecoveryPoint::CrashInstallCommitted,
         )?;
-        Self::attach(db, limits)
+        Self::attach(db, limits).map(|admin| admin.with_data_directory(path.as_ref()))
     }
     /// Existing database only: no initialization or replacement on damage.
     pub fn open(path: impl AsRef<Path>, limits: Limits) -> Result<Self, CoreError> {
-        Self::open_with_holder_token(path.as_ref(), limits, None)
+        Self::open_with_holder_token(path.as_ref(), limits, None).map(|admin| admin.with_data_directory(path.as_ref()))
     }
     fn open_with_holder_token(
         path: &Path,

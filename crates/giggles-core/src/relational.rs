@@ -78,7 +78,7 @@ pub use giggles_pg_types::temporal::{
     Date, Interval, Time as PgTime, TimeTz, Timestamp, TimestampTz,
 };
 pub use giggles_pg_types::{Float4, Float8, Numeric};
-pub use sql_copy::{Copy, CopyFormat};
+pub use sql_copy::{Copy, CopyFormat, CopySource};
 
 pub const MAX_SQL: usize = 64 * 1024;
 /// v2 SQL text budget. Flat token/VALUES storage is linear in this byte budget.

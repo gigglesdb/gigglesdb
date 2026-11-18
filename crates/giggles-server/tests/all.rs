@@ -365,3 +365,6 @@ mod r3_exit_races;
 
 #[path = "named_statement_catalog_network.rs"]
 mod named_statement_catalog_network;
+
+#[path = "copy_server_files.rs"]
+mod copy_server_files;

@@ -179,7 +179,8 @@ impl State {
         let clock = session.copy_clock();
         let streaming = !binary && core(session.sql.begin_copy_input())?;
         if streaming { decoder.stream(); }
-        frame(b'G', &response, out)?;
+        let external = !matches!(descriptor.source, giggles_core::relational::CopySource::Stdin);
+        if !external { frame(b'G', &response, out)?; }
         self.copy = Some(CopyIn {
             descriptor,
             streaming,
@@ -195,7 +196,50 @@ impl State {
             simple_implicit: false,
             remaining: vec![],
         });
+        if external { self.external_copy_input(session, out)?; }
         Ok(())
+    }
+    fn external_copy_input(&mut self, session: &mut Session, out: &mut Vec<u8>) -> R<()> {
+        use giggles_core::relational::CopySource;
+        use std::io::Read;
+        let mut copy = self.copy.take().unwrap();
+        let mut child = None;
+        let mut reader: Box<dyn Read> = match &copy.descriptor.source {
+            CopySource::Stdin => unreachable!(),
+            CopySource::File(path) => Box::new(copy_external::input_file(session, path, &mut self.diagnostic)?),
+            CopySource::Program(command) => {
+                let mut process = copy_external::spawn(session, command, true, &mut self.diagnostic)?;
+                let stdout = process.stdout.take().ok_or("58030")?;
+                child = Some((process, command.clone()));
+                Box::new(stdout)
+            }
+        };
+        let result = (|| {
+            let mut bytes = [0; 8192];
+            loop {
+                let count = reader.read(&mut bytes).map_err(|error| copy_external::read_error(&mut self.diagnostic, error))?;
+                if count == 0 { break; }
+                let rows = copy.decoder.feed(&bytes[..count])?;
+                copy.convert(rows, session)?;
+            }
+            let rows = copy.decoder.finish()?;
+            copy.convert(rows, session)?;
+            if copy.streaming && !copy.rows.is_empty() { copy.flush_page(session, copy.rows.len())?; }
+            Ok(())
+        })();
+        drop(reader);
+        if let Err(code) = result {
+            if let Some((mut process, _)) = child { let _ = process.kill(); let _ = process.wait(); }
+            copy.decoder.diagnostic(&mut self.diagnostic);
+            return Err(code);
+        }
+        if let Some((mut process, command)) = child { copy_external::wait(&mut process, &command, &mut self.diagnostic)?; }
+        let result = if copy.streaming {
+            self.diagnostic.core(session.finish_copy_input(&copy.prepared, copy.normalized.as_ref().unwrap_or(&copy.prepared), &copy.clock))?
+        } else {
+            self.diagnostic.core(session.ingest_normalized_copy(&copy.prepared, copy.normalized.as_ref().unwrap_or(&copy.prepared), std::mem::take(&mut copy.rows), &copy.clock))?
+        };
+        complete(&format!("COPY {}", result.affected), &empty(), out)
     }
     pub(super) fn copy_message(
         &mut self,
@@ -273,7 +317,8 @@ impl State {
                 copy.failed = true;
                 copy.rows.clear();
                 copy.remaining.clear();
-                if code == "25006" {
+                copy.decoder.diagnostic(&mut self.diagnostic);
+                if code == "25006" || self.diagnostic.wire_message.is_some() {
                     diagnostic_error(code, GENERIC_MESSAGE, Some(&self.diagnostic), out);
                 } else {
                     error(code, out);

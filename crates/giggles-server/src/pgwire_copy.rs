@@ -8,6 +8,8 @@ type Row = Vec<Option<Vec<u8>>>;
 type Result<T> = std::result::Result<T, &'static str>;
 const LIMIT: usize = giggles_core::operations::MAX_INSERT_BYTES;
 pub(super) struct Decoder {
+    newline: Option<u8>,
+    newline_error: Option<u8>,
     columns: usize,
     streaming: bool,
     delimiter: u8,
@@ -25,6 +27,8 @@ pub(super) struct Decoder {
 impl Decoder {
     pub(super) fn text(columns: usize, delimiter: u8, null: Vec<u8>) -> Self {
         Self {
+            newline: None,
+            newline_error: None,
             columns,
             streaming: false,
             delimiter,
@@ -96,6 +100,26 @@ impl Decoder {
             self.text_rows(true)
         }
     }
+    pub(super) fn diagnostic(&self, d: &mut super::Diagnostic) {
+        if let Some(b) = self.newline_error {
+            let cr = b == b'\r';
+            d.wire_message = Some(format!("{} {} found in data", if self.csv { "unquoted" } else { "literal" }, if cr { "carriage return" } else { "newline" }));
+            d.wire_hint = Some(if self.csv {
+                if cr { "Use quoted CSV field to represent carriage return." } else { "Use quoted CSV field to represent newline." }
+            } else if cr { "Use \"\\r\" to represent carriage return." } else { "Use \"\\n\" to represent newline." });
+        }
+    }
+    fn newline(&mut self, at: usize) -> Result<()> {
+        let b = self.pending[at];
+        let style = if b == b'\r' && self.pending.get(at + 1) == Some(&b'\n') { 2 } else if b == b'\r' { 1 } else { 0 };
+        if let Some(old) = self.newline {
+            if old != style {
+                self.newline_error = Some(if old == 1 && style == 2 { b'\n' } else { b });
+                return Err(bad_format());
+            }
+        } else { self.newline = Some(style); }
+        Ok(())
+    }
     fn csv_rows(&mut self, eof: bool) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         let mut start = 0;
@@ -116,6 +140,8 @@ impl Decoder {
                 if !self.streaming && self.rows == giggles_core::relational::MAX_ROWS {
                     return Err("54000");
                 }
+                self.newline(self.csv_at)?;
+                let line = &self.pending[start..self.csv_at];
                 rows.push(self.csv_row(line)?);
                 self.rows += 1;
                 self.csv_at += 1;
@@ -216,6 +242,8 @@ impl Decoder {
                 if !self.streaming && self.rows == giggles_core::relational::MAX_ROWS {
                     return Err("54000");
                 }
+                self.newline(at)?;
+                let line = &self.pending[start..at];
                 rows.push(self.text_row(line)?);
                 self.rows += 1;
                 at += 1;
@@ -420,6 +448,45 @@ impl Decoder {
 mod tests {
     use super::*;
     #[test]
+    fn newline_styles_every_split() {
+        for csv in [false, true] {
+            for terminator in [b"\n".as_slice(), b"\r\n", b"\r"] {
+                let mut data = b"1".to_vec(); data.extend(terminator); data.extend(b"2"); data.extend(terminator);
+                for split in 0..=data.len() {
+                    let mut d = if csv { Decoder::csv(1, b',', vec![]) } else { Decoder::text(1, b'\t', vec![]) };
+                    let mut rows = d.feed(&data[..split]).unwrap(); rows.extend(d.feed(&data[split..]).unwrap()); rows.extend(d.finish().unwrap());
+                    assert_eq!(rows.len(), 2);
+                }
+            }
+            for data in [b"1\r\n2\n".as_slice(), b"1\n2\r\n", b"1\r2\n"] {
+                for split in 0..=data.len() {
+                    let mut d = if csv { Decoder::csv(1, b',', vec![]) } else { Decoder::text(1, b'\t', vec![]) };
+                    assert_eq!(d.feed(&data[..split]).and_then(|_| d.feed(&data[split..])).and_then(|_| d.finish()).unwrap_err(), "22P04");
+                    assert!(d.newline_error.is_some());
+                }
+            }
+        }
+        for (csv, data, kind) in [
+            (false, b"1\tq\r\n2\tr\r3\ts\r\n".as_slice(), b'\r'),
+            (false, b"1\tq\r2\tr\r\n".as_slice(), b'\n'),
+            (true, b"1,q\r\n2,r\r3,s\r\n".as_slice(), b'\r'),
+            (true, b"1,q\n2,r\r\n".as_slice(), b'\r'),
+        ] {
+            for split in 0..=data.len() {
+                let mut d = if csv {
+                    Decoder::csv(2, b',', vec![])
+                } else {
+                    Decoder::text(2, b'\t', vec![])
+                };
+                let result = d.feed(&data[..split])
+                    .and_then(|_| d.feed(&data[split..]))
+                    .and_then(|_| d.finish());
+                assert_eq!(result.unwrap_err(), "22P04", "csv {csv}, split {split}");
+                assert_eq!(d.newline_error, Some(kind), "csv {csv}, split {split}");
+            }
+        }
+    }
+    #[test]
     fn csv_every_split_and_invalid_input() {
         let data = b"1,\"a,b\",\"\"\r\n2,\"line\n\"\"quote\"\"\",\r\n\\.\nignored";
         for split in 0..=data.len() {
@@ -452,7 +519,7 @@ mod tests {
     }
     #[test]
     fn text_every_split() {
-        let data = b"1\t\\N\t\\x41\\101\\b\\f\\v\\Q\\\\\r\n2\t\tend\\\n\n\\.\nignored";
+        let data = b"1\t\\N\t\\x41\\101\\b\\f\\v\\Q\\\\\r\n2\t\tend\\\n\r\n\\.\nignored";
         for split in 0..=data.len() {
             let mut d = Decoder::text(3, b'\t', b"\\N".to_vec());
             let mut rows = d.feed(&data[..split]).unwrap();
