@@ -362,3 +362,6 @@ mod r3_exit_outcomes;
 mod r3_denied_surfaces;
 #[path = "r3_exit_races.rs"]
 mod r3_exit_races;
+
+#[path = "named_statement_catalog_network.rs"]
+mod named_statement_catalog_network;

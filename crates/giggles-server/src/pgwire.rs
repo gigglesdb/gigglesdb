@@ -1553,7 +1553,7 @@ impl State {
             }
         }
         let description_version = before_version.filter(|version| {
-            unnamed && matches!(&p, Plan::Sql(plan) if !plan.is_ddl())
+            matches!(&p, Plan::Sql(plan) if !plan.is_ddl())
                 && matches!(&session.role, Role::Database { .. })
                 && session.sql.committed_catalog_version() == Some(*version)
         });
@@ -1571,7 +1571,18 @@ impl State {
     fn refresh_statement(&mut self, name: &str, session: &mut Session) -> R<()> {
         let old = self.statements.get(name).ok_or("26000")?.clone();
         let stale = match &old.p {
-            Plan::Sql(p) | Plan::Copy(_, p) => !session.sql.prepared_is_current(p),
+            Plan::Sql(p) => {
+                !session.sql.prepared_is_current(p)
+                    || old.description_version.is_some_and(|version| {
+                        // In a transaction the committed version is unknown (None);
+                        // the transaction-lifetime fence above covers that case.
+                        session
+                            .sql
+                            .committed_catalog_version()
+                            .is_some_and(|current| current != version)
+                    })
+            }
+            Plan::Copy(_, p) => !session.sql.prepared_is_current(p),
             Plan::Catalog(_, _, _) if session.task().is_some() => false,
             Plan::Catalog(plan, _, epoch) if !plan.depends_on_relations() => {
                 let (current, _, _) = core(session.catalog_snapshot())?;
