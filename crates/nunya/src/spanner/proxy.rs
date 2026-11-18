@@ -225,43 +225,94 @@ impl WriteAudit {
             eprintln!("audit: write outcome unknown record unavailable");
         }
     }
-    fn finish(&self, error: Status, reason: Option<&'static str>) -> Status {
-        if error.code() == tonic::Code::Unknown
-            && error.message() == nunya_status(NyCode::WriteOutcomeUnknown).message()
-        {
-            let reason = reason.unwrap_or_else(|| {
-                if let Some(row) = self.ctx.authority.session(self.who.session) {
-                    if matches!(row.revoke_reason, Some(crate::state::model::EndReason::Expired | crate::state::model::EndReason::IdleTimeout))
-                        || row.expires_ms <= (self.ctx.clock)() {
-                        return "expired";
-                    }
-                    if row.ended_ms.is_some() || row.revoke_reason.is_some() {
-                        return "revoked";
-                    }
-                }
-                "upstream_lost"
-            });
-            self.record(reason);
+    fn finish(&self, error: Status, reason: UnknownCause) -> Status {
+        let reason = match reason {
+            UnknownCause::UpstreamLost => "upstream_lost",
+            UnknownCause::NoCommitTimestamp => "no_commit_timestamp",
+            // The end signal carries only a bool. Read authority only for an
+            // actual cancellation, never to infer the cause of transport loss.
+            UnknownCause::SessionEnded => {
+                if self.ctx.authority.session(self.who.session).is_some_and(|row| {
+                    matches!(row.revoke_reason, Some(crate::state::model::EndReason::Expired | crate::state::model::EndReason::IdleTimeout))
+                        || (row.revoke_reason.is_none() && row.expires_ms <= (self.ctx.clock)())
+                }) { "expired" } else { "revoked" }
+            }
+        };
+        self.record(reason);
+        // Do not expose internal error sources to the downstream caller.
+        Status::new(error.code(), error.message())
+    }
+    fn finish_error(&self, error: Status) -> Status {
+        use std::error::Error;
+        let reason = error.source().and_then(|source| source.downcast_ref::<UnknownCause>()).copied();
+        match reason {
+            Some(reason) => self.finish(error, reason),
+            None => error,
         }
-        error
     }
 }
+// A typed, data-free cause travels with the internal status until the audit
+// boundary. Every NY012 constructor must supply a cause.
+#[derive(Clone, Copy, Debug)]
+enum UnknownCause { UpstreamLost, SessionEnded, NoCommitTimestamp }
+impl std::fmt::Display for UnknownCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("write outcome unknown")
+    }
+}
+impl std::error::Error for UnknownCause {}
+fn unknown_status(reason: UnknownCause) -> Status {
+    let mut error = nunya_status(NyCode::WriteOutcomeUnknown);
+    error.set_source(Arc::new(reason));
+    error
+}
+fn upstream_not_ready() -> Status {
+    Status::unavailable(nunya_status(NyCode::ProtocolNotAllowed).message())
+}
+async fn ready_for_write(channel: &Channel, write: bool) -> Result<(), Status> {
+    if write {
+        tower::ServiceExt::ready(&mut channel.clone()).await.map_err(|_| upstream_not_ready())?;
+    }
+    Ok(())
+}
+fn connection_refused(error: &Status) -> bool {
+    use std::error::Error;
+    let mut source = error.source();
+    while let Some(error) = source {
+        if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused) {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
 fn forwarded_transport(error: Status, write: bool) -> Status {
+    // googleapis-tonic 0.22.0 emits this prefix only when its pre-send
+    // ready() fails. Backstop the race after our own readiness check.
+    // Channel readiness reserves buffer space. A lazy/reconnecting tonic
+    // channel can report a TCP refusal from call() instead: it also proves
+    // no request was sent. Never classify by arbitrary upstream message text.
+    if write && ((error.code() == tonic::Code::Unknown && error.message().starts_with("Service was not ready"))
+        || connection_refused(&error)) {
+        return upstream_not_ready();
+    }
     if write && matches!(error.code(), tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Cancelled | tonic::Code::DeadlineExceeded) {
-        nunya_status(NyCode::WriteOutcomeUnknown)
+        unknown_status(UnknownCause::UpstreamLost)
     } else {
         remote(error)
     }
 }
 fn ended_status(write: bool) -> Status {
-    nunya_status(if write {
-        NyCode::WriteOutcomeUnknown
-    } else {
-        NyCode::SessionEnded
-    })
+    if write { unknown_status(UnknownCause::SessionEnded) }
+    else { nunya_status(NyCode::SessionEnded) }
 }
 fn after_forward(error: Status, write: bool) -> Status {
-    if write { ended_status(true) } else { error }
+    if write {
+        let reason = if error.message() == nunya_status(NyCode::SessionEnded).message() {
+            UnknownCause::SessionEnded
+        } else { UnknownCause::UpstreamLost };
+        unknown_status(reason)
+    } else { error }
 }
 async fn ended(signal: &mut tokio::sync::watch::Receiver<bool>) {
     loop {
@@ -309,7 +360,7 @@ impl EndCheckedStream {
     }
     fn error(&mut self, error: Status) -> Status {
         match self.audit.take() {
-            Some(audit) => audit.finish(error, None),
+            Some(audit) => audit.finish_error(error),
             None => error,
         }
     }
@@ -1205,10 +1256,10 @@ impl NunyaSpanner {
                     let Some(part) = part else {
                         break;
                     };
+                    let mut part = part.map_err(|error| forwarded_transport(error, write))?;
                     ctx.authority
                         .admit(who.session, Operation::Read)
                         .map_err(|_| ended_status(write))?;
-                    let mut part = part.map_err(|error| forwarded_transport(error, write))?;
                     if let Some(session) = inline_session.as_ref()
                         && let Some(transaction) = part.metadata.as_ref().and_then(|m| m.transaction.as_ref()) {
                         track_transaction(&transactions, who.session, session, &transaction.id, if write { TxnState::Dml } else { TxnState::Clean })?;
@@ -1481,8 +1532,8 @@ impl SpannerService for NunyaSpanner {
             return Ok(Response::new(result));
         }
         let mut client = self.client().await?;
+        ready_for_write(&self.channel, write).await?;
         let outcome_audit = WriteAudit::new(self, &who);
-        let unknown_reason = None;
         let result = async {
             let inline = inline_read_write(req.transaction.as_ref());
             let session = req.session.clone();
@@ -1498,7 +1549,7 @@ impl SpannerService for NunyaSpanner {
             self.check_response(&who, &signal, write)?;
             Ok(Response::new(result))
         }.await;
-        result.map_err(|error| outcome_audit.finish(error, unknown_reason))
+        result.map_err(|error| outcome_audit.finish_error(error))
     }
     async fn execute_streaming_sql(
         &self,
@@ -1555,9 +1606,10 @@ impl SpannerService for NunyaSpanner {
         let mut client = self.client().await?;
         let inline = inline_read_write(req.transaction.as_ref());
         let session = req.session.clone();
+        ready_for_write(&self.channel, write).await?;
         let outcome_audit = WriteAudit::new(self, &who);
         let upstream = cancellable(&mut signal, write, client.execute_streaming_sql(req))
-            .await.map_err(|error| outcome_audit.finish(error, None))?
+            .await.map_err(|error| outcome_audit.finish_error(error))?
             .into_inner();
         Ok(Response::new(
             self.stream(who, policy, revision, plan, label, upstream, signal, write, inline.then_some(session), outcome_audit),
@@ -1607,8 +1659,8 @@ impl SpannerService for NunyaSpanner {
             Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), label, 0, vec![])?;
         }
         let mut client = self.client().await?;
+        ready_for_write(&self.channel, true).await?;
         let outcome_audit = WriteAudit::new(self, &who);
-        let unknown_reason = None;
         let result = async {
             let inline = inline_read_write(req.transaction.as_ref());
             let session = req.session.clone();
@@ -1617,7 +1669,7 @@ impl SpannerService for NunyaSpanner {
                 .into_inner();
             self.record_inline(&session, who.session, inline, true, result.result_sets.first().and_then(|set| set.metadata.as_ref()))?;
             if result.result_sets.len() > plans.len() {
-                return Err(ended_status(true));
+                return Err(unknown_status(UnknownCause::UpstreamLost));
             }
             for (i, set) in result.result_sets.iter_mut().enumerate() {
                 let tokens = self
@@ -1639,7 +1691,7 @@ impl SpannerService for NunyaSpanner {
             self.check_response(&who, &signal, true)?;
             Ok(Response::new(result))
         }.await;
-        result.map_err(|error| outcome_audit.finish(error, unknown_reason))
+        result.map_err(|error| outcome_audit.finish_error(error))
     }
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<ResultSet>, Status> {
         let who = self.authenticate(&req)?;
@@ -1816,8 +1868,8 @@ impl SpannerService for NunyaSpanner {
             vec![],
         )?;
         let mut client = self.client().await?;
+        ready_for_write(&self.channel, true).await?;
         let outcome_audit = WriteAudit::new(self, &who);
-        let mut unknown_reason = None;
         let result = async {
             let result = cancellable(&mut signal, true, client.commit(req)).await;
             let retry = result.as_ref().is_ok_and(|response| {
@@ -1832,12 +1884,11 @@ impl SpannerService for NunyaSpanner {
             }
             let response = result?.into_inner();
             if !retry && response.commit_timestamp.is_none() {
-                unknown_reason = Some("no_commit_timestamp");
-                return Err(nunya_status(NyCode::WriteOutcomeUnknown));
+                return Err(unknown_status(UnknownCause::NoCommitTimestamp));
             }
             Ok(Response::new(response))
         }.await;
-        result.map_err(|error| outcome_audit.finish(error, unknown_reason))
+        result.map_err(|error| outcome_audit.finish_error(error))
     }
     async fn partition_query(
         &self,
@@ -2062,6 +2113,7 @@ mod tests {
             .is_empty()
         );
     }
+    include!("proxy/transport_tests.rs");
     #[derive(Default)]
     struct Fake {
         result_token: Mutex<Option<MultiplexedSessionPrecommitToken>>,
