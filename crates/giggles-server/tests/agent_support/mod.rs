@@ -1026,6 +1026,15 @@ pub mod parity {
                     .as_str()
                     .map_or_else(|| inner.to_string(), str::to_owned),
             ),
+            "timestamptzBinary" => {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                let bytes = STANDARD.decode(inner.as_str().unwrap()).unwrap();
+                Some(
+                    giggles_core::relational::TimestampTz::from_binary(&bytes)
+                        .unwrap()
+                        .to_string(),
+                )
+            }
             "bytesValue" => {
                 use base64::{Engine as _, engine::general_purpose::STANDARD};
                 let bytes = STANDARD.decode(inner.as_str().unwrap()).unwrap();
