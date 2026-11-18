@@ -23,6 +23,8 @@ existing notices and provenance; it does not modify them.
 | [crates/skedaddle/licenses/Miniflux-PROVENANCE.md](crates/skedaddle/licenses/Miniflux-PROVENANCE.md) | Miniflux pinned SQL migration source | Apache-2.0 |
 | [scripts/postgres-functions/POSTGRESQL-LICENSE](scripts/postgres-functions/POSTGRESQL-LICENSE) | PostgreSQL function oracle/reference material | PostgreSQL |
 | [crates/giggles-pg-types/src/temporal/tzdata/](crates/giggles-pg-types/src/temporal/tzdata/) | IANA Time Zone Database 2026f, via Debian/PostgreSQL; version and hashes in manifest.json | Public-domain tz database data |
+| [crates/giggles-glibm/COPYING.LIB](crates/giggles-glibm/COPYING.LIB) | Portable binary64 math routines derived from GNU C Library (glibc) 2.41 (Debian 2.41-12+deb13u4), including Sun Microsystems and IBM routines; source notices retained in each module | LGPL-2.1-or-later; retained Sun Microsystems permission notices also apply |
+| [crates/giggles-glibm-loader/](crates/giggles-glibm-loader/) | First-party runtime loader for the giggles-glibm dynamic library | MIT |
 | [scripts/icu/](scripts/icu/) | Unicode ICU 76.1 runtime, fetched separately; provision.sh retains upstream LICENSE beside installed libraries | Unicode-3.0; accompanying third-party notices in upstream LICENSE apply |
 
 The PostgreSQL oracle captures under `crates/giggles-server/tests/fixtures/dd68/`
@@ -39,3 +41,10 @@ tools). These are not third-party license texts.
 Cargo dependencies retain their upstream licenses, recorded in their package
 metadata and distributed source notices. The ICU runtime is provisioned outside
 Cargo; consult its installed LICENSE for the complete bundled notices.
+
+giggles-glibm is built and distributed as a separate dynamic library
+(`giggles_glibm.dll`, `libgiggles_glibm.so`, `libgiggles_glibm.dylib`). GigglesDB does not link it:
+no GigglesDB crate depends on it in Cargo, and giggles-glibm-loader opens it
+at run time. A modified build that exports the same interface and identity
+string can replace it. ICU 76.1 is likewise downloaded and loaded at run time rather
+than linked.

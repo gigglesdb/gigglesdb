@@ -119,7 +119,10 @@ pub fn array_quote(s: &str) -> String {
     }
 }
 pub fn array_values(s: &str) -> R<Vec<Option<String>>> {
-    let bad = || SqlError::InvalidTextRepresentation;
+    let bad = || {
+        user_types::view_replace_error(format!("malformed array literal: \"{s}\""));
+        SqlError::InvalidTextRepresentation
+    };
     let inner = s
         .trim()
         .strip_prefix('{')
@@ -256,22 +259,52 @@ pub(super) fn compare_text_arrays(
     a: &Value,
     b: &Value,
     mut element: impl FnMut(&str, &str) -> std::cmp::Ordering,
-) -> std::cmp::Ordering {
+) -> R<std::cmp::Ordering> {
     use std::cmp::Ordering;
+    validate_text_array(a)?;
+    validate_text_array(b)?;
     let (Value::Text(a), Value::Text(b)) = (a, b) else {
-        return match (a, b) {
+        return Ok(match (a, b) {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Null, _) => Ordering::Less,
             (_, Value::Null) => Ordering::Greater,
-            _ => unreachable!("bound array values"),
-        };
+            _ => return Err(SqlError::InternalError),
+        });
     };
-    let a = array_values(a).expect("validated array");
-    let b = array_values(b).expect("validated array");
-    a.iter().zip(&b).map(|(a, b)| match (a, b) {
+    let a = array_values(a)?;
+    let b = array_values(b)?;
+    Ok(a.iter().zip(&b).map(|(a, b)| match (a, b) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
         (Some(a), Some(b)) => element(a, b),
-    }).find(|o| *o != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
+    }).find(|o| *o != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len())))
+}
+
+/// Validate before values enter infallible sort/map comparators.
+pub(crate) fn validate_text_array(value: &Value) -> R<()> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Text(text) => array_values(text).map(|_| ()),
+        _ => Err(SqlError::InternalError),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn malformed_array_comparison_is_an_error() {
+        let error = compare_text_arrays(&Value::Text("{a,b".into()),
+            &Value::Text("{a}".into()), str::cmp).unwrap_err();
+        assert_eq!(crate::sqlstate(&crate::CoreError::Sql(error)), "22P02");
+        assert_eq!(take_sql_error_message().as_deref(), Some("malformed array literal: \"{a,b\""));
+    }
+    #[test]
+    fn invalid_array_operand_is_internal_error() {
+        for other in [Value::Null, Value::Text("{}".into())] {
+            let error=compare_text_arrays(&Value::Int(1), &other, str::cmp).unwrap_err();
+            assert_eq!(crate::sqlstate(&crate::CoreError::Sql(error)), "XX000");
+        }
+    }
 }

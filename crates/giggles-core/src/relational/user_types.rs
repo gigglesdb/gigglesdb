@@ -18,6 +18,15 @@ pub(super) fn sql_error_detail(detail: String) { SQL_ERROR_DETAIL.with(|v| *v.bo
 pub fn take_sql_error_message() -> Option<String> {
     SQL_ERROR_MESSAGE.with(|message| message.borrow_mut().take())
 }
+/// Keep intentionally swallowed failures from replacing the caller's diagnostic.
+pub(super) fn probe_preserving_error_message<T, E>(probe: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    let saved = SQL_ERROR_MESSAGE.with(|message| message.borrow().clone());
+    let result = probe();
+    if result.is_err() {
+        SQL_ERROR_MESSAGE.with(|message| *message.borrow_mut() = saved);
+    }
+    result
+}
 pub(super) fn invalid_type_modifier_error() {
     SQL_ERROR_MESSAGE.with(|message| *message.borrow_mut() = Some("invalid type modifier".into()));
 }
@@ -757,6 +766,24 @@ impl Relational {
 mod tests {
     use super::*;
     use bincode::Options;
+    #[test]
+    fn swallowed_probe_restores_prior_message() {
+        for saved in [None, Some("division by zero")] {
+            SQL_ERROR_MESSAGE.with(|message| *message.borrow_mut() = saved.map(String::from));
+            let result: R<()> = probe_preserving_error_message(|| {
+                super::super::logical_types::array_values("{a,b")?;
+                Ok(())
+            });
+            assert_eq!(result, Err(SqlError::InvalidTextRepresentation));
+            assert_eq!(take_sql_error_message().as_deref(), saved);
+        }
+        let result: R<()> = probe_preserving_error_message(|| {
+            view_replace_error("division by zero".into());
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(take_sql_error_message().as_deref(), Some("division by zero"));
+    }
     #[test]
     fn catalog_ext_six_type_definition_scalar_tags_preserve_logical_kinds() {
         let codec = bincode::DefaultOptions::new()

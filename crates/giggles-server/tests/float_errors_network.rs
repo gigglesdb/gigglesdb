@@ -129,6 +129,11 @@ async fn postgres_float_error_messages() {
 
     for (expr, code, message) in [
         (
+            "sqrt(-1::numeric)",
+            "2201F",
+            "cannot take square root of a negative number",
+        ),
+        (
             "sqrt(-1::float8)",
             "2201F",
             "cannot take square root of a negative number",

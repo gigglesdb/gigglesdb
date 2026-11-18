@@ -77,7 +77,7 @@ impl Key {
         let mut transformed = Vec::with_capacity(values.len());
         let mut bytes = 0usize;
         for ((value, collator), array) in values.iter().zip(&self.collators).zip(&self.arrays) {
-            let value = equality_value(value, collator.as_deref(), *array);
+            let value = equality_value(value, collator.as_deref(), *array)?;
             bytes = bytes
                 .checked_add(value_bytes(&value))
                 .ok_or(SqlError::Limit)?;
@@ -171,10 +171,11 @@ impl Relational {
 }
 
 /// Transient hash equality representation; deterministic collations use bytes.
-pub(crate) fn equality_value(value: &Value, collator: Option<&giggles_icu::Collator>, array: bool) -> Value {
+pub(crate) fn equality_value(value: &Value, collator: Option<&giggles_icu::Collator>, array: bool) -> R<Value> {
+    if array { logical_types::validate_text_array(value)?; }
     if array && let (Value::Text(text), Some(c)) = (value, collator) {
         // Length-delimited element keys preserve NULLs and array boundaries.
-        let values = logical_types::array_values(text).expect("validated array");
+        let values = logical_types::array_values(text)?;
         let mut key = Vec::new();
         for value in values {
             match value {
@@ -187,12 +188,12 @@ pub(crate) fn equality_value(value: &Value, collator: Option<&giggles_icu::Colla
                 }
             }
         }
-        return Value::Bytes(key);
+        return Ok(Value::Bytes(key));
     }
-    match (value,collator) {
+    Ok(match (value,collator) {
         (Value::Text(text),Some(c)) => Value::Bytes(c.sort_key(text.as_bytes())),
         _ => value.clone(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -201,6 +202,14 @@ mod tests {
     fn sql(s: &mut Relational, text: &str) {
         let p = Prepared::parse(text, 1, s.epoch).unwrap();
         s.execute(&p, &[], None).unwrap();
+    }
+    #[test]
+    fn malformed_array_key_is_an_error() {
+        let c = giggles_icu::Collator::open("und", None).unwrap();
+        let error = equality_value(&Value::Text("{a,b".into()), Some(&c), true).unwrap_err();
+        assert_eq!(crate::sqlstate(&crate::CoreError::Sql(error)), "22P02");
+        assert_eq!(take_sql_error_message().as_deref(), Some("malformed array literal: \"{a,b\""));
+        assert_eq!(equality_value(&Value::Int(1), Some(&c), true), Err(SqlError::InternalError));
     }
     #[test]
     fn equality_keys_do_not_change_primary_or_secondary_wire_bytes() {

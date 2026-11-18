@@ -85,6 +85,19 @@ fn remainder(a: &Numeric, b: &Numeric) -> R<Numeric> {
 }
 pub(super) fn eval(name: &str, values: &[Value]) -> Option<R<Value>> {
     if let [Value::Numeric(n)] = values {
+        let zero = Numeric::parse("0").unwrap();
+        let domain = match name {
+            "sqrt" if n < &zero => Some((SqlError::InvalidArgumentForPowerFunction,
+                "cannot take square root of a negative number")),
+            "ln" | "log" | "log10" if n <= &zero => Some((SqlError::InvalidArgumentForLogarithm,
+                if n == &zero { "cannot take logarithm of zero" }
+                else { "cannot take logarithm of a negative number" })),
+            _ => None,
+        };
+        if let Some((error, message)) = domain {
+            user_types::view_replace_error(message.into());
+            return Some(Err(error));
+        }
         let result = match name {
             "sqrt" => Some(n.checked_sqrt()),
             "exp" => Some(n.checked_exp()),
@@ -99,6 +112,18 @@ pub(super) fn eval(name: &str, values: &[Value]) -> Option<R<Value>> {
     if name == "power"
         && let [Value::Numeric(base), Value::Numeric(exponent)] = values
     {
+        let zero = Numeric::parse("0").unwrap();
+        // Preserve Numeric's NaN special cases and classify only domain failures.
+        let message = if base == &zero && exponent < &zero {
+            Some("zero raised to a negative power is undefined")
+        } else if base < &zero && exponent.scale().is_some()
+            && exponent.to_string().split_once('.').is_some_and(|(_, f)| f.bytes().any(|b| b != b'0')) {
+            Some("a negative number raised to a non-integer power yields a complex result")
+        } else { None };
+        if let Some(message) = message {
+            user_types::view_replace_error(message.into());
+            return Some(Err(SqlError::InvalidArgumentForPowerFunction));
+        }
         return Some(
             base.checked_pow(exponent)
                 .map(Value::Numeric)
@@ -108,6 +133,26 @@ pub(super) fn eval(name: &str, values: &[Value]) -> Option<R<Value>> {
     if name == "log"
         && let [Value::Numeric(base), Value::Numeric(value)] = values
     {
+        let zero = Numeric::parse("0").unwrap();
+        // checked_log returns NaN before checking either argument's domain.
+        if base.to_string() != "NaN" && value.to_string() != "NaN" {
+            // PG's infinite-operand path checks both signs before either zero;
+            // finite operands retain base-first domain checking.
+            if (base.scale().is_none() || value.scale().is_none())
+                && (base < &zero || value < &zero)
+            {
+                user_types::view_replace_error("cannot take logarithm of a negative number".into());
+                return Some(Err(SqlError::InvalidArgumentForLogarithm));
+            }
+            for n in [base, value] {
+                if n <= &zero {
+                    user_types::view_replace_error(if n == &zero {
+                        "cannot take logarithm of zero".into()
+                    } else { "cannot take logarithm of a negative number".into() });
+                    return Some(Err(SqlError::InvalidArgumentForLogarithm));
+                }
+            }
+        }
         return Some(
             Numeric::checked_log(base, value)
                 .map(Value::Numeric)

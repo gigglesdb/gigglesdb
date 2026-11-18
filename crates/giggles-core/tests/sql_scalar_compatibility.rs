@@ -159,8 +159,14 @@ fn numeric_sqrt_errors_keep_core_categories_and_eager_arguments() {
     let admin = Admin::create(fresh("scalar-sqrt-errors"), Limits::default()).unwrap();
     let mut session = admin.sql_session();
     for (query, expected) in [
-        ("SELECT sqrt('-1'::numeric)", "Sql(Overflow)"),
-        ("SELECT sqrt('-Infinity'::numeric)", "Sql(Overflow)"),
+        (
+            "SELECT sqrt('-1'::numeric)",
+            "Sql(InvalidArgumentForPowerFunction)",
+        ),
+        (
+            "SELECT sqrt('-Infinity'::numeric)",
+            "Sql(InvalidArgumentForPowerFunction)",
+        ),
         (
             "SELECT sqrt('bad'::numeric)",
             "Sql(InvalidTextRepresentation)",
@@ -171,7 +177,7 @@ fn numeric_sqrt_errors_keep_core_categories_and_eager_arguments() {
         ),
         (
             "SELECT coalesce(NULL::numeric,sqrt('-1'::numeric))",
-            "Sql(Overflow)",
+            "Sql(InvalidArgumentForPowerFunction)",
         ),
     ] {
         assert_eq!(

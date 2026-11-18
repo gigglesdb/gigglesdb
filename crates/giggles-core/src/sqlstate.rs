@@ -34,6 +34,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::StaleSchema) => "0A000",
         CoreError::Sql(S::Transaction) => "25000",
         CoreError::Sql(S::Aborted) => "25P02",
+        CoreError::Sql(S::InternalError) => "XX000",
         CoreError::Sql(S::Overflow) => "22003",
         CoreError::Sql(S::InvalidArgumentForLogarithm) => "2201E",
         CoreError::Sql(S::InvalidArgumentForPowerFunction) => "2201F",

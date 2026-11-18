@@ -73,7 +73,7 @@ pub(super) fn canonical(
             // PostgreSQL grouping identity drops casts that keep the input type.
             // Parameter-only types are inferred later; unresolved bindings simply
             // retain the cast in the canonical form.
-            if let Ok(inner) = a.bind(resolve, tables, &[])
+            if let Ok(inner) = user_types::probe_preserving_error_message(|| a.bind(resolve, tables, &[]))
                 && inner.ty == *ty
             {
                 return canonical(a, resolve, scope, tables);
@@ -207,7 +207,7 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
             let key = canonical(s, self.resolve, self.scope, self.tables)?;
             if let Some(n) = self.groups.iter().position(|g| g == &key) {
                 let value = slot(n);
-                if let Ok(bound) = s.bind(self.resolve, self.tables, &[])
+                if let Ok(bound) = user_types::probe_preserving_error_message(|| s.bind(self.resolve, self.tables, &[]))
                     && let Some(collation) = bound.explicit_collation()?
                 {
                     return Ok(Scalar::Call(format!("\0collate:{collation}"), vec![value]));

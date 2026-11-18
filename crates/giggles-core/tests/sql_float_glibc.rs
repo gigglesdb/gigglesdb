@@ -553,3 +553,16 @@ fn postgres_float_error_diagnostics() {
         assert_eq!(value.value(), expected, "{expr}");
     }
 }
+
+#[test]
+fn table_free_special_functions() {
+    let admin = Admin::create(fresh("table-free-special"), Limits::default()).unwrap();
+    let result = admin.sql_session().execute(
+        "SELECT erf(0.5), erfc(0.5), gamma(0.5), lgamma(0.5)", &[], None).unwrap();
+    for (value, expected) in result.rows[0].values.iter().zip([
+        0.5204998778130465_f64, 0.4795001221869535, 1.772453850905516, 0.5723649429247001
+    ]) {
+        let Value::Float8(value) = value else { panic!("expected float8") };
+        assert_eq!(value.value().to_bits(), expected.to_bits());
+    }
+}

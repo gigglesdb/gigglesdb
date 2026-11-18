@@ -168,7 +168,7 @@ fn nonlinear_error_precedence_and_display_scale() {
     let admin = Admin::create(fresh("nonlinear-precedence"), Limits::default()).unwrap();
     let mut s = admin.sql_session();
     for (q, expected) in [
-        ("SELECT ln(-1::numeric)", "Sql(Overflow)"),
+        ("SELECT ln(-1::numeric)", "Sql(InvalidArgumentForLogarithm)"),
         ("SELECT log(1::numeric,2::numeric)", "Sql(DivisionByZero)"),
         (
             "SELECT log(NULL::numeric,'bad'::numeric)",

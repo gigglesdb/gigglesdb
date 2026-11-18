@@ -211,7 +211,7 @@ fn coalesce_hint(
         .find_map(|a| {
             cast::explicit_target(a).cloned().or_else(|| match a {
                 Scalar::Literal(Value::Null | Value::Text(_)) => None,
-                _ => a.bind(resolve, tables, parameters).ok().map(|b| b.ty),
+                _ => user_types::probe_preserving_error_message(|| a.bind(resolve, tables, parameters)).ok().map(|b| b.ty),
             })
         })
         .and_then(|ty| common_result_type([ty]).ok())
@@ -1980,6 +1980,13 @@ impl BoundScalar {
         }
     }
     pub(super) fn eval(&self, row: &Tuple, params: &[Value], budget: &mut usize) -> R<Value> {
+        let value = self.eval_inner(row, params, budget)?;
+        if self.ty == DataType::TextArray {
+            logical_types::validate_text_array(&value)?;
+        }
+        Ok(value)
+    }
+    fn eval_inner(&self, row: &Tuple, params: &[Value], budget: &mut usize) -> R<Value> {
         match &self.node {
             Node::EnumSort(inner, labels) => match inner.eval(row, params, budget)? {
                 Value::Null => Ok(Value::Null),
@@ -2945,9 +2952,18 @@ impl Scalar {
                     // Reject the missing bytea overload before text inference
                     // turns a declared argument into a parameter-type conflict.
                     for arg in args {
-                        if arg
-                            .bind(resolve, tables, parameters)
-                            .is_ok_and(|a| a.ty == DataType::Bytes)
+                        // Keep actual input errors, while unresolved overload probes
+                        // remain optional and diagnostic-neutral on failure.
+                        let probe = user_types::probe_preserving_error_message(|| {
+                            match arg.bind(resolve, tables, parameters) {
+                                Err(SqlError::InvalidTextRepresentation) => {
+                                    Ok(Err(SqlError::InvalidTextRepresentation))
+                                }
+                                result => result.map(Ok),
+                            }
+                        });
+                        if let Ok(bound) = probe
+                            && bound?.ty == DataType::Bytes
                         {
                             return Err(SqlError::UndefinedFunction);
                         }
@@ -2965,7 +2981,7 @@ impl Scalar {
                         .filter(|(i, _)| {
                             *i == 0 || matches!(n.as_str(), "btrim" | "ltrim" | "rtrim")
                         })
-                        .filter_map(|(_, a)| a.bind(resolve, tables, parameters).ok().map(|a| a.ty))
+                        .filter_map(|(_, a)| user_types::probe_preserving_error_message(|| a.bind(resolve, tables, parameters)).ok().map(|a| a.ty))
                         .find(|t| *t == DataType::Bytes);
                     let ty = if let Some(sig) =
                         uuid_ossp::signature(n, args.len()).or_else(|| binary::signature(n, args.len(), first_type.as_ref()))
@@ -2987,8 +3003,7 @@ impl Scalar {
                                     && i != 1
                                     && (cast::explicit_target(&args[1])
                                         == Some(&DataType::TimestampTz)
-                                        || args[1]
-                                            .bind(resolve, tables, parameters)
+                                        || user_types::probe_preserving_error_message(|| args[1].bind(resolve, tables, parameters))
                                             .is_ok_and(|a| a.ty == DataType::TimestampTz)) =>
                             {
                                 Some(DataType::Text)
@@ -3002,10 +3017,10 @@ impl Scalar {
                             "log" if args.len() == 2 => Some(DataType::Numeric),
                             "power"
                                 if args.iter().any(|a| {
-                                    a.bind(resolve, tables, parameters)
+                                    user_types::probe_preserving_error_message(|| a.bind(resolve, tables, parameters))
                                         .is_ok_and(|a| a.ty == DataType::Numeric)
                                 }) && !args.iter().any(|a| {
-                                    a.bind(resolve, tables, parameters).is_ok_and(|a| {
+                                    user_types::probe_preserving_error_message(|| a.bind(resolve, tables, parameters)).is_ok_and(|a| {
                                         matches!(a.ty, DataType::Real | DataType::DoublePrecision)
                                     })
                                 }) =>
@@ -3018,7 +3033,7 @@ impl Scalar {
                             // PG18 Parse with no parameter OIDs selects the
                             // preferred numeric-category type for abs(unknown).
                             "abs" => Some(
-                                a.bind(resolve, tables, parameters)
+                                user_types::probe_preserving_error_message(|| a.bind(resolve, tables, parameters))
                                     .map_or(DataType::DoublePrecision, |a| a.ty),
                             ),
                             "scale" | "min_scale" | "trim_scale" => Some(DataType::Numeric),
@@ -3027,7 +3042,7 @@ impl Scalar {
                             "mod" | "gcd" | "lcm" => args
                                 .iter()
                                 .filter_map(|a| {
-                                    a.bind(resolve, tables, parameters).ok().map(|a| a.ty)
+                                    user_types::probe_preserving_error_message(|| a.bind(resolve, tables, parameters)).ok().map(|a| a.ty)
                                 })
                                 .find(number),
                             "round" | "trunc" if args.len() == 2 => Some(if i == 1 {

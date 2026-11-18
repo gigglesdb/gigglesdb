@@ -297,6 +297,9 @@ pub enum SqlError {
     /// 2201F invalid_argument_for_power_function: transient, never persisted.
     #[serde(skip)]
     InvalidArgumentForPowerFunction,
+    /// XX000: transient executor invariant failure, never persisted.
+    #[serde(skip)]
+    InternalError,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

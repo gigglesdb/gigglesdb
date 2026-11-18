@@ -220,6 +220,10 @@ impl BoundScalar {
         b: &Value,
     ) -> R<Ordering> {
         self.check_comparison_collation()?;
+        if self.ty == DataType::TextArray {
+            logical_types::validate_text_array(a)?;
+            logical_types::validate_text_array(b)?;
+        }
         Ok(self.compare_values(a, b))
     }
 }
@@ -369,9 +373,11 @@ pub(in crate::relational::query) fn ready(n: &str) -> R<()> {
 }
 pub(in crate::relational::query) fn compare(n: &str, a: &Value, b: &Value, ty: &DataType) -> Ordering {
     if *ty == DataType::TextArray {
-        return crate::relational::logical_types::compare_text_arrays(a, b, |a, b| {
+        return user_types::probe_preserving_error_message(|| crate::relational::logical_types::compare_text_arrays(a, b, |a, b| {
             compare(n, &Value::Text(a.into()), &Value::Text(b.into()), &DataType::Text)
-        });
+        // Sort/map callbacks are infallible. Scalar evaluation validates arrays
+        // before they reach these callbacks; retain a total order on bad internal values.
+        })).unwrap_or_else(|_| cmp(a, b));
     }
     if (n == "unicode" || n.ends_with("-x-icu") || user(n).is_some_and(|(p, _, _, _)| p == "i"))
         && let (Value::Text(a), Value::Text(b)) = (a, b)
@@ -397,6 +403,10 @@ pub(in crate::relational::query) fn compare_pair(
     av: &Value,
     bv: &Value,
 ) -> R<Ordering> {
+    if a.ty == DataType::TextArray {
+        logical_types::validate_text_array(av)?;
+        logical_types::validate_text_array(bv)?;
+    }
     let d = merge([a, b].into_iter())?;
     if d.conflict.is_some() {
         return indeterminate();
@@ -412,6 +422,11 @@ pub(in crate::relational::query) fn compare_pair(
         }
     };
     let (av, bv) = (trim(av, &a.ty), trim(bv, &b.ty));
+    if a.ty == DataType::TextArray && let Some(n) = d.name {
+        return logical_types::compare_text_arrays(&av, &bv, |a, b| {
+            compare(n, &Value::Text(a.into()), &Value::Text(b.into()), &DataType::Text)
+        });
+    }
     Ok(d.name
         .map_or_else(|| cmp(&av, &bv), |n| compare(n, &av, &bv, &a.ty)))
 }
@@ -649,7 +664,7 @@ pub(in crate::relational::query) fn equality_key(
     };
     if user(n).is_some_and(|(_, d, _, _)| !d) {
         let c=collator(n)?;
-        return Ok(crate::relational::collation_keys::equality_value(&value,Some(c.as_ref()), metadata.is_some_and(|s| s.ty == DataType::TextArray)));
+        return crate::relational::collation_keys::equality_value(&value,Some(c.as_ref()), metadata.is_some_and(|s| s.ty == DataType::TextArray));
     }
     Ok(value)
 }
@@ -659,4 +674,23 @@ pub(in crate::relational::query) fn materialized(metadata: Option<&BoundScalar>,
     let mut d = merge(metadata.into_iter())?;
     d.explicit = false;
     BoundScalar { ty, node: Node::Literal(Value::Null) }.inherit_derivation(d)
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn array_comparator_fallback_preserves_diagnostic() {
+        for saved in [None, Some("division by zero")] {
+            user_types::take_sql_error_message();
+            if let Some(message) = saved {
+                user_types::view_replace_error(message.into());
+            }
+            let a = Value::Text("{a,b".into());
+            let b = Value::Text("{a}".into());
+            assert_eq!(compare("C", &a, &b, &DataType::TextArray), cmp(&a, &b));
+            assert_eq!(user_types::take_sql_error_message().as_deref(), saved);
+        }
+    }
 }

@@ -558,3 +558,9 @@ mod planner_collations;
 mod sql_float_glibc;
 #[path = "sql_extensions.rs"]
 mod sql_extensions;
+
+#[path = "sql_array_validation.rs"]
+mod sql_array_validation;
+
+#[path = "sql_numeric_domain.rs"]
+mod sql_numeric_domain;
