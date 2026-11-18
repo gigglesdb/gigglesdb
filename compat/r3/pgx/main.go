@@ -45,6 +45,7 @@ var deviations = []string{
 }
 
 type spec struct {
+	Suite       string            `json:"suite"`
 	PgPort      int               `json:"pg_port"`
 	AgentPort   int               `json:"agent_port"`
 	Database    string            `json:"database"`
@@ -77,6 +78,8 @@ type scenario struct {
 	connections                      []*pgx.Conn
 	agent, app, approver, controller *pgx.Conn
 	attempts                         int
+	task                             string
+	merchant                         int
 	a1, direct                       string
 	p1, p2, undo                     []any
 	r1, r2, before                   result
@@ -575,7 +578,11 @@ func (s *scenario) runStep(step string) {
 				r.Detail = fmt.Sprintf("%T: %v", p, p)
 			}
 		}()
-		r.Detail = s.step(step)
+		if s.spec.Suite == "exit" {
+			r.Detail = s.exitStep(step)
+		} else {
+			r.Detail = s.step(step)
+		}
 	}()
 	r.Attempts = s.attempts
 	s.output.Steps = append(s.output.Steps, r)
@@ -624,7 +631,15 @@ func main() {
 		check(e)
 		check(json.Unmarshal(data, &s.secrets))
 		pinnedVersion()
-		s.start()
+		if s.spec.Suite == "exit" {
+			steps = []string{"race", "stale", "outcomes", "lost_reply", "undo"}
+			s.output.Deviations = exitDeviations
+			s.app = s.connect("delivery_app", "", false)
+			s.approver = s.connect("oncall_lead", "", false)
+			s.controller = s.connect("incident_controller", "", false)
+		} else {
+			s.start()
+		}
 		for _, step := range steps {
 			s.runStep(step)
 		}

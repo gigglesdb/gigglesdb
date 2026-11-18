@@ -10,7 +10,7 @@ import threading
 import time
 import psycopg
 from psycopg import ClientCursor
-from r3_safeguards import STEPS, parse_spec
+from r3_safeguards import STEPS, SUITE_STEPS, parse_spec
 
 ERRORS = {
     'required': ('42T01', 'approval required: preview the change and have it approved'),
@@ -65,6 +65,9 @@ class Scenario:
         else:
             kwargs.update(password=self.secrets['owner_password'] if role == 'postgres'
                           else self.spec['passwords'][role], sslmode='disable')
+        if self.spec.get('suite') == 'exit':
+            # Listeners bind IPv4; keep localhost for TLS name verification.
+            kwargs['hostaddr'] = '127.0.0.1'
         c = psycopg.connect(**kwargs)
         self.connections.append(c)
         return c
@@ -374,14 +377,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--spec', required=True)
     args = parser.parse_args()
-    scenario = Scenario(parse_spec(args.spec))
+    spec = parse_spec(args.spec)
+    if spec['suite'] == 'exit':
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from psycopg_exit import ExitScenario
+        scenario = ExitScenario(spec)
+    else:
+        scenario = Scenario(spec)
+    steps = SUITE_STEPS[spec['suite']]
     try:
         scenario.start()
-        for step in STEPS:
+        for step in steps:
             scenario.run_step(step, getattr(scenario, 'step'+step))
     except Exception as exc:
         done = {r['step'] for r in scenario.output['steps']}
-        for step in STEPS:
+        for step in steps:
             if step not in done:
                 scenario.output['steps'].append(dict(step=step,status='FAIL',attempts=1,
                     detail=f'scenario initialization failed: {type(exc).__name__}: {exc}'))

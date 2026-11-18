@@ -710,3 +710,15 @@ at step 18 and always removes its workload container. Reports are
 deviations, and workload counts/errors. Exit codes: 0 all PASS, 2 scenario or
 unexpected workload failure, 1 harness error. Driver JSON and restart protocol
 are documented in the runner module docstring.
+
+Select `--suite exit` to run the five exit scenarios through both drivers:
+last-slot race (ten sessions), stale approvals and approver separation, the
+operation-outcome table, lost-reply recovery on a new connection, and partial
+undo with interleaved application changes. Each scenario uses an independent
+task and merchant (51..55), with one-hour task authorizations and no expiry wait.
+The application workload continues throughout. The default `--suite story`
+retains the 23-step worked example above.
+
+```
+python -I -B compat/r3_safeguards.py --suite exit --server-bin <exe> --work J:/gigglesdb-work/<task>
+```

@@ -2,9 +2,9 @@
 
 Driver protocol v1: argv is --spec PATH. JSON spec fields: pg_port, agent_port,
 database, ca, secret_file (JSON task-name -> secret), passwords (role -> password),
-expires_ms, results_path, task_sql. Secrets are never passed on argv.
+expires_ms, results_path, task_sql, suite (story|exit). Secrets are never passed on argv.
 Results are atomically replaced JSON: {"steps": [{step, status, attempts, detail}],
-"deviations": [str]}. Required step keys: 01..22 plus 13b.
+"deviations": [str]}. Story step keys: 01..22 plus 13b; exit keys: race, stale, outcomes, lost_reply, undo.
 A driver prints RESTART on stdout, flushes, and waits for RESTARTED on stdin.
 The runner kills the server tree and reopens the same config before acknowledging.
 Drivers run sequentially with separate databases; pgx is built once per run.
@@ -30,6 +30,9 @@ from compat_lib.gigglesdb import Server
 
 STEPS = [f'{n:02}' for n in range(1, 23)]
 STEPS.insert(13, '13b')
+EXIT_STEPS = ['race', 'stale', 'outcomes', 'lost_reply', 'undo']
+SUITE_STEPS = {'story': STEPS, 'exit': EXIT_STEPS}
+EXIT_TASKS = ['exit-race', 'exit-stale', 'exit-outcomes', 'exit-lost', 'exit-undo']
 PASSWORDS = {'incident_controller': 'controller-pw', 'oncall_lead': 'lead-pw',
              'delivery_app': 'app-pw', 'repair_agent': 'agent-pw'}
 
@@ -93,7 +96,7 @@ def make_config(data, pki, pg_port, agent_port):
                       'connections': 64, 'max_concurrent_statements': 16, 'bindings': []}}
 
 
-def validate_steps(rows):
+def validate_steps(rows, suite='story'):
     if not isinstance(rows, list):
         return ['steps must be a list']
     errors, seen = [], []
@@ -108,7 +111,7 @@ def validate_steps(rows):
             errors.append('invalid attempts')
         if not isinstance(r.get('detail'), str):
             errors.append('invalid detail')
-    if seen != STEPS:
+    if seen != SUITE_STEPS[suite]:
         errors.append('missing, duplicate or unordered steps')
     return errors
 
@@ -131,12 +134,15 @@ def parse_spec(path):
     for key in ('pg_port', 'agent_port'):
         if type(spec[key]) is not int or not 0 < spec[key] < 65536:
             raise ValueError('invalid port: ' + key)
+    spec.setdefault('suite', 'story')
+    if spec['suite'] not in SUITE_STEPS:
+        raise ValueError('invalid suite')
     return spec
 
 
 def report_exit(report):
     for driver in report['drivers'].values():
-        if validate_steps(driver['steps']) or any(r['status'] != 'PASS' for r in driver['steps']):
+        if validate_steps(driver['steps'], report.get('suite', 'story')) or any(r['status'] != 'PASS' for r in driver['steps']):
             return 2
         if driver['workload'].get('unexpected_errors'):
             return 2
@@ -144,7 +150,7 @@ def report_exit(report):
 
 
 def render_report(report):
-    lines = ['# R3 safeguards', '', '| Driver | Step | Status | Attempts (retries) | Detail |',
+    lines = ['# R3 safeguards: ' + report.get('suite', 'story') + ' suite', '', '| Driver | Step | Status | Attempts (retries) | Detail |',
              '|---|---|---|---|---|']
     for name, run in report['drivers'].items():
         for r in run['steps']:
@@ -156,16 +162,16 @@ def render_report(report):
     return '\n'.join(lines)
 
 
-def seed_sql():
+def seed_sql(suite='story'):
     rows = []
     start = dt.datetime(2026, 11, 5, 17, tzinfo=dt.timezone.utc)
     def at(i):
         return (start + dt.timedelta(seconds=i*10)).strftime('%Y-%m-%d %H:%M:%S+00')
-    for merchant, count in ((42, 31), (43, 40)):
+    for merchant, count in [(42, 31), (43, 40)] + ([(m, 31) for m in range(51, 56)] if suite == 'exit' else []):
         for i in range(count):
             ident = i+1
-            email = f'customer{ident}' if merchant == 42 else f'buyer{ident}'
-            rows.append(f"({merchant},{ident},'failed','{at(i%31)}',{1+i%3 if merchant==42 else 1},'{email}@example.com','tok_{merchant}_{ident}')")
+            email = f'customer{ident}' if merchant != 43 else f'buyer{ident}'
+            rows.append(f"({merchant},{ident},'failed','{at(i%31)}',{1+i%3 if merchant!=43 else 1},'{email}@example.com','tok_{merchant}_{ident}')")
     for merchant in range(100, 200):
         for ident in range(1, 21):
             status = ('delivered', 'pending', 'failed', 'queued')[(merchant+ident)%4]
@@ -261,7 +267,7 @@ def run_driver(args, driver, root, env):
         port = base.start()
         c = Pg(port, 'postgres', 'postgres')
         c.query('CREATE TABLE shipments (merchant_id bigint, id bigint, status text, failed_at timestamptz, attempt_count int, customer_email text, card_token text, PRIMARY KEY (merchant_id,id))')
-        for sql in seed_sql():
+        for sql in seed_sql(args.suite):
             c.query(sql)
         for role, password in PASSWORDS.items():
             c.query(f"CREATE ROLE {role} LOGIN " + ('TASKONLY ' if role == 'repair_agent' else '') + f"PASSWORD '{password}'")
@@ -269,12 +275,20 @@ def run_driver(args, driver, root, env):
             c.query(f'GRANT {grants} ON shipments TO {role}')
         c.close()
         c = Pg(port, 'incident_controller', 'postgres')
-        expires_ms = int(time.time()*1000) + args.expiry_seconds*1000
+        expires_ms = int(time.time()*1000) + (3600 if args.suite == 'exit' else args.expiry_seconds)*1000
         sql = task_sql(expires_ms)
-        c.query(sql)
-        rows, _ = c.query('ISSUE CREDENTIAL FOR TASK "inc-436"')
+        issued = {'owner_password': base.password}
+        for i, name in enumerate(EXIT_TASKS if args.suite == 'exit' else ['inc-436']):
+            definition = sql.replace('inc-436', name)
+            if args.suite == 'exit':
+                definition = definition.replace('merchant_id = 42', f'merchant_id = {51+i}')
+                if name == 'exit-undo':
+                    definition = definition.replace('ALLOW UPDATE (status)', 'ALLOW UPDATE (status, attempt_count)').replace("status = 'failed' AND failed_at", "status IN ('failed','queued') AND failed_at")
+            c.query(definition)
+            rows, _ = c.query(f'ISSUE CREDENTIAL FOR TASK "{name}"')
+            issued[name] = rows[0][2]
         secret_file = folder/'secrets.json'
-        write_json(secret_file, {'inc-436': rows[0][2], 'owner_password': base.password})
+        write_json(secret_file, issued)
         c.close()
     finally:
         base.stop()
@@ -285,7 +299,7 @@ def run_driver(args, driver, root, env):
     write_json(config_path, make_config(data, pki, pg, agent))
     spec_path = folder/'spec.json'
     results_path = folder/'results.json'
-    write_json(spec_path, dict(pg_port=pg, agent_port=agent, database='postgres',
+    write_json(spec_path, dict(suite=args.suite, pg_port=pg, agent_port=agent, database='postgres',
         ca=str(pki/'ca.pem'), secret_file=str(secret_file), passwords=PASSWORDS,
         expires_ms=expires_ms, results_path=str(results_path), task_sql=sql))
     server = ConfigServer(base, config_path)
@@ -310,7 +324,7 @@ def run_driver(args, driver, root, env):
                     messages.put(line)
                 messages.put(None)
             threading.Thread(target=drain, daemon=True).start()
-            deadline = time.monotonic() + args.expiry_seconds + 300
+            deadline = time.monotonic() + (3600 if args.suite == 'exit' else args.expiry_seconds) + 300
             try:
                 while True:
                     line = messages.get(timeout=max(.1, deadline-time.monotonic()))
@@ -332,8 +346,8 @@ def run_driver(args, driver, root, env):
                                    env=env, capture_output=True, timeout=30)
                     process.wait(timeout=30)
         result = json.loads(results_path.read_text(encoding='utf-8'))
-        if validate_steps(result['steps']):
-            raise RuntimeError('invalid driver results: ' + str(validate_steps(result['steps'])))
+        if validate_steps(result['steps'], args.suite):
+            raise RuntimeError('invalid driver results: ' + str(validate_steps(result['steps'], args.suite)))
         if code and all(r['status'] == 'PASS' for r in result['steps']):
             raise RuntimeError('driver exited unsuccessfully with passing results')
     finally:
@@ -346,6 +360,7 @@ def run_driver(args, driver, root, env):
 
 def argument_parser():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--suite', choices=SUITE_STEPS, default='story')
     p.add_argument('--server-bin', required=True)
     p.add_argument('--work', required=True)
     p.add_argument('--drivers', default=DEFAULT_DRIVERS)
@@ -365,7 +380,7 @@ def main():
             raise ValueError('expiry-seconds must be positive')
         root.mkdir(parents=True)
         env = go_environment(work, root, os.environ)
-        report = {'drivers': {}}
+        report = {'suite': args.suite, 'drivers': {}}
         began = time.monotonic()
         print(str(root), flush=True)
         if 'pgx' in args.drivers.split(','):

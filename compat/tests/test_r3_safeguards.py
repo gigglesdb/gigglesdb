@@ -9,6 +9,7 @@ class SafeguardsTests(unittest.TestCase):
     def test_default_drivers(self):
         args = r.argument_parser().parse_args(['--server-bin', 'server', '--work', 'work'])
         self.assertEqual(args.drivers, 'psycopg,pgx')
+        self.assertEqual(args.suite, 'story')
         self.assertEqual(args.go, str(r.PINNED_GO) if r.PINNED_GO.exists() else 'go')
 
     def test_go_environment(self):
@@ -78,13 +79,51 @@ class SafeguardsTests(unittest.TestCase):
             r.parse_handshake('READY')
 
     def test_spec(self):
-        spec = dict(pg_port=1234,agent_port=2345,database='postgres',ca='ca',
+        spec = dict(suite='story',pg_port=1234,agent_port=2345,database='postgres',ca='ca',
                     secret_file='secret',passwords={},expires_ms=123,results_path='out',task_sql='sql')
         with patch.object(Path,'read_text',return_value=json.dumps(spec)):
             self.assertEqual(r.parse_spec('not-created'), spec)
+        del spec['suite']
+        with patch.object(Path, 'read_text', return_value=json.dumps(spec)):
+            self.assertEqual(r.parse_spec('not-created')['suite'], 'story')
         del spec['secret_file']
         with patch.object(Path,'read_text',return_value=json.dumps(spec)), self.assertRaises(ValueError):
             r.parse_spec('not-created')
+
+    def test_suite_selection(self):
+        argv = ['--server-bin', 'server', '--work', 'work']
+        self.assertEqual(r.argument_parser().parse_args(argv+['--suite', 'exit']).suite, 'exit')
+        with patch('sys.stderr'), self.assertRaises(SystemExit):
+            r.argument_parser().parse_args(argv+['--suite', 'unknown'])
+
+    def test_exit_report(self):
+        rows = [dict(step=s, status='PASS', attempts=1, detail='checked') for s in r.EXIT_STEPS]
+        report = {'suite': 'exit', 'drivers': {'pgx': {'steps': rows, 'workload': {}}}}
+        self.assertEqual(r.validate_steps(rows, 'exit'), [])
+        self.assertTrue(r.validate_steps(rows))
+        self.assertTrue(r.validate_steps(rows[::-1], 'exit'))
+        self.assertEqual(r.report_exit(report), 0)
+        self.assertIn('# R3 safeguards: exit suite', r.render_report(report))
+        rows[0]['status'] = 'FAIL'
+        self.assertEqual(r.report_exit(report), 2)
+        rows.pop()
+        self.assertTrue(r.validate_steps(rows, 'exit'))
+
+    def test_exit_spec(self):
+        spec = dict(suite='exit', pg_port=1234, agent_port=2345, database='postgres', ca='ca',
+                    secret_file='secret', passwords={}, expires_ms=123, results_path='out', task_sql='sql')
+        with patch.object(Path, 'read_text', return_value=json.dumps(spec)):
+            self.assertEqual(r.parse_spec('not-created')['suite'], 'exit')
+        spec['suite'] = 'unknown'
+        with patch.object(Path, 'read_text', return_value=json.dumps(spec)), self.assertRaises(ValueError):
+            r.parse_spec('not-created')
+
+    def test_exit_seed(self):
+        sql = ','.join(r.seed_sql('exit'))
+        self.assertEqual(sql.count('@example.com'), 2071+155)
+        for merchant in range(51, 56):
+            self.assertIn(f"({merchant},31,'failed'", sql)
+            self.assertIn(f"'customer1@example.com','tok_{merchant}_1'", sql)
 
     def test_seed(self):
         sql = r.seed_sql()
