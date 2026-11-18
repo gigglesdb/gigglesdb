@@ -367,7 +367,12 @@ pub(in crate::relational::query) fn ready(n: &str) -> R<()> {
     }
     Ok(())
 }
-pub(in crate::relational::query) fn compare(n: &str, a: &Value, b: &Value) -> Ordering {
+pub(in crate::relational::query) fn compare(n: &str, a: &Value, b: &Value, ty: &DataType) -> Ordering {
+    if *ty == DataType::TextArray {
+        return crate::relational::logical_types::compare_text_arrays(a, b, |a, b| {
+            compare(n, &Value::Text(a.into()), &Value::Text(b.into()), &DataType::Text)
+        });
+    }
     if (n == "unicode" || n.ends_with("-x-icu") || user(n).is_some_and(|(p, _, _, _)| p == "i"))
         && let (Value::Text(a), Value::Text(b)) = (a, b)
     {
@@ -408,7 +413,7 @@ pub(in crate::relational::query) fn compare_pair(
     };
     let (av, bv) = (trim(av, &a.ty), trim(bv, &b.ty));
     Ok(d.name
-        .map_or_else(|| cmp(&av, &bv), |n| compare(n, &av, &bv)))
+        .map_or_else(|| cmp(&av, &bv), |n| compare(n, &av, &bv, &a.ty)))
 }
 
 fn indeterminate<T>() -> R<T> {
@@ -538,7 +543,7 @@ pub(in crate::relational::query) fn like(
     ready(n)?;
     Ok(Some(Some(
         crate::relational::like::collated(v, p, escape, work, |a, b| {
-            compare(n, &Value::Text(a.into()), &Value::Text(b.into())) == Ordering::Equal
+            compare(n, &Value::Text(a.into()), &Value::Text(b.into()), &DataType::Text) == Ordering::Equal
         })? != negated,
     )))
 }
@@ -644,7 +649,7 @@ pub(in crate::relational::query) fn equality_key(
     };
     if user(n).is_some_and(|(_, d, _, _)| !d) {
         let c=collator(n)?;
-        return Ok(crate::relational::collation_keys::equality_value(&value,Some(c.as_ref())));
+        return Ok(crate::relational::collation_keys::equality_value(&value,Some(c.as_ref()), metadata.is_some_and(|s| s.ty == DataType::TextArray)));
     }
     Ok(value)
 }

@@ -391,3 +391,33 @@ fn using_output_collations_follow_selected_values() {
         );
     }
 }
+
+// Each query below was verified with postgres:18.6 in pgp2-oracle.
+#[test]
+fn collated_arrays_compare_elements_and_preserve_equality_keys() {
+    let (_a, mut s) = fixture();
+    for (sql, expected) in [
+        (r#"SELECT (ARRAY[NULL::text] COLLATE "C") > ARRAY['z'], (ARRAY[' a']::text[] COLLATE "C") < ARRAY['!']"#, vec![true, true]),
+        (r#"SELECT (ARRAY['a'] COLLATE p2ci) = ARRAY['A'], (ARRAY['a'] COLLATE p2ci) <> ARRAY['A'], (ARRAY['a'] COLLATE p2ci) <= ARRAY['A'], (ARRAY['a'] COLLATE p2ci) >= ARRAY['A'], (ARRAY['a'] COLLATE p2ci) < ARRAY['a','b'], (ARRAY[]::text[] COLLATE "C") < ARRAY['a']"#, vec![true, false, true, true, true, true]),
+    ] {
+        assert_eq!(run(&mut s, sql), vec![expected.into_iter().map(V::Bool).collect::<Vec<_>>()], "{sql}");
+    }
+
+    for sql in [
+        "CREATE TABLE b27a(id int PRIMARY KEY,t text[])",
+        "CREATE TABLE b27b(id int PRIMARY KEY,t text[])",
+        "INSERT INTO b27a VALUES(1,ARRAY['a']),(2,ARRAY['A']),(3,ARRAY['a','b']),(4,ARRAY[NULL::text]),(5,ARRAY[' a']),(6,ARRAY['!'])",
+        "INSERT INTO b27b VALUES(10,'{A}'::text[])",
+    ] { run(&mut s, sql); }
+    assert_eq!(run(&mut s, r#"SELECT id FROM b27a ORDER BY t COLLATE "C",id"#), [5,6,2,1,3,4].map(|i| vec![V::Int(i)]).to_vec());
+    assert_eq!(run(&mut s, "SELECT count(*) FROM (SELECT DISTINCT t COLLATE p2ci FROM b27a)q"), vec![vec![V::Int(5)]]);
+    assert_eq!(run(&mut s, "SELECT count(*) FROM b27a GROUP BY t COLLATE p2ci ORDER BY count(*) DESC"), [2,1,1,1,1].map(|i| vec![V::Int(i)]).to_vec());
+    assert_eq!(run(&mut s, "SELECT a.id,b.id FROM b27a a JOIN b27b b ON a.t COLLATE p2ci=b.t ORDER BY 1"), vec![vec![V::Int(1),V::Int(10)],vec![V::Int(2),V::Int(10)]]);
+    assert_eq!(run(&mut s, "SELECT a.id,b.id FROM (SELECT id,t COLLATE p2ci t FROM b27a)a JOIN (SELECT id,t FROM b27b)b USING(t) ORDER BY 1"), vec![vec![V::Int(1),V::Int(10)],vec![V::Int(2),V::Int(10)]]);
+    for sql in [
+        "SELECT id FROM b27a WHERE t COLLATE p2ci IN(SELECT t FROM b27b) ORDER BY 1",
+        "SELECT id FROM b27a WHERE t IN(ARRAY['A'] COLLATE p2ci) ORDER BY 1",
+    ] {
+        assert_eq!(run(&mut s, sql), vec![vec![V::Int(1)],vec![V::Int(2)]], "{sql}");
+    }
+}

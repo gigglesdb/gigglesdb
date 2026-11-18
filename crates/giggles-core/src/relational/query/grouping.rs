@@ -948,29 +948,29 @@ pub(super) fn bind<'a>(
     })
 }
 #[derive(Clone)]
-pub(super) struct Key(pub(super) Vec<Value>, Vec<Option<String>>);
+pub(super) struct Key(pub(super) Vec<Value>, Vec<Option<(String, DataType)>>);
 impl Key {
     pub(super) fn plain(values: Vec<Value>) -> Self { Self(values, Vec::new()) }
     pub(super) fn collated(values: Vec<Value>, scalars: &[BoundScalar]) -> Self {
-        Self(values, scalars.iter().map(|s| s.explicit_collation().expect("bound collation").map(str::to_owned)).collect())
+        Self(values, scalars.iter().map(|s| s.explicit_collation().expect("bound collation").map(|n| (n.to_owned(), s.ty.clone()))).collect())
     }
     pub(super) fn metadata(values: Vec<Value>, scalars: &[Option<BoundScalar>]) -> Self {
-        Self(values, scalars.iter().map(|s| s.as_ref().and_then(|s| s.explicit_collation().expect("bound collation")).map(str::to_owned)).collect())
+        Self(values, scalars.iter().map(|s| s.as_ref().and_then(|s| s.explicit_collation().expect("bound collation").map(|n| (n.to_owned(), s.ty.clone())))).collect())
     }
     pub(super) fn output(values: Vec<Value>, items: &[BoundItem]) -> Self {
-        Self(values, items.iter().map(|s| match s { BoundItem::Scalar(s) => s.explicit_collation().expect("bound collation").map(str::to_owned), _ => None }).collect())
+        Self(values, items.iter().map(|s| match s { BoundItem::Scalar(s) => s.explicit_collation().expect("bound collation").map(|n| (n.to_owned(), s.ty.clone())), _ => None }).collect())
     }
 }
-fn cmp_collated(a: &[Value], b: &[Value], collations: &[Option<String>]) -> Ordering {
+fn cmp_collated(a: &[Value], b: &[Value], collations: &[Option<(String, DataType)>]) -> Ordering {
     if collations.is_empty() { return cmp_values(a,b); }
-    a.iter().zip(b).enumerate().map(|(i,(a,b))| collations.get(i).and_then(Option::as_deref).map_or_else(|| cmp(a,b), |n| functions::collation::compare(n,a,b))).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
+    a.iter().zip(b).enumerate().map(|(i,(a,b))| collations.get(i).and_then(Option::as_ref).map_or_else(|| cmp(a,b), |(n,ty)| functions::collation::compare(n,a,b,ty))).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
 }
 fn cmp_scalars(a: &[Value], b: &[Value], scalars: &[BoundScalar]) -> Ordering {
-    a.iter().zip(b).enumerate().map(|(i,(a,b))| scalars.get(i).and_then(|s| s.explicit_collation().expect("bound collation")).map_or_else(|| cmp(a,b), |n| functions::collation::compare(n,a,b))).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
+    a.iter().zip(b).enumerate().map(|(i,(a,b))| scalars.get(i).map_or_else(|| cmp(a,b), |s| s.compare_values(a,b))).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
 }
 pub(super) fn cmp_output(a: &[Value], b: &[Value], items: &[BoundItem]) -> Ordering {
     a.iter().zip(b).enumerate().map(|(i,(a,b))| match items.get(i) {
-        Some(BoundItem::Scalar(s)) => s.explicit_collation().expect("bound collation").map_or_else(|| cmp(a,b), |n| functions::collation::compare(n,a,b)),
+        Some(BoundItem::Scalar(s)) => s.compare_values(a,b),
         _ => cmp(a,b),
     }).find(|c| *c != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
 }

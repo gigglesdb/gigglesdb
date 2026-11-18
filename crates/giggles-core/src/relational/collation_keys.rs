@@ -5,6 +5,7 @@ use std::sync::Arc;
 pub(crate) struct Key {
     pub(crate) columns: Vec<usize>,
     collators: Vec<Option<Arc<giggles_icu::Collator>>>,
+    arrays: Vec<bool>,
 }
 impl Key {
     pub(crate) fn new(
@@ -51,7 +52,8 @@ impl Key {
             };
             collators.push(collator);
         }
-        Ok(Self { columns, collators })
+        let arrays = columns.iter().map(|i| table.columns[*i].data_type == DataType::TextArray).collect();
+        Ok(Self { columns, collators, arrays })
     }
     pub(crate) fn nondeterministic(&self) -> bool {
         self.collators.iter().any(Option::is_some)
@@ -74,8 +76,8 @@ impl Key {
         }
         let mut transformed = Vec::with_capacity(values.len());
         let mut bytes = 0usize;
-        for (value, collator) in values.iter().zip(&self.collators) {
-            let value = equality_value(value, collator.as_deref());
+        for ((value, collator), array) in values.iter().zip(&self.collators).zip(&self.arrays) {
+            let value = equality_value(value, collator.as_deref(), *array);
             bytes = bytes
                 .checked_add(value_bytes(&value))
                 .ok_or(SqlError::Limit)?;
@@ -169,7 +171,24 @@ impl Relational {
 }
 
 /// Transient hash equality representation; deterministic collations use bytes.
-pub(crate) fn equality_value(value: &Value, collator: Option<&giggles_icu::Collator>) -> Value {
+pub(crate) fn equality_value(value: &Value, collator: Option<&giggles_icu::Collator>, array: bool) -> Value {
+    if array && let (Value::Text(text), Some(c)) = (value, collator) {
+        // Length-delimited element keys preserve NULLs and array boundaries.
+        let values = logical_types::array_values(text).expect("validated array");
+        let mut key = Vec::new();
+        for value in values {
+            match value {
+                None => key.push(0),
+                Some(v) => {
+                    key.push(1);
+                    let bytes = c.sort_key(v.as_bytes());
+                    key.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                    key.extend(bytes);
+                }
+            }
+        }
+        return Value::Bytes(key);
+    }
     match (value,collator) {
         (Value::Text(text),Some(c)) => Value::Bytes(c.sort_key(text.as_bytes())),
         _ => value.clone(),

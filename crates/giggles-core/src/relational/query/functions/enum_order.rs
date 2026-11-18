@@ -75,6 +75,6 @@ impl BoundScalar {
                 .position(|v| v == a)
                 .cmp(&labels.iter().position(|v| v == b));
         }
-        self.explicit_collation().expect("collation bound").map_or_else(|| cmp(a,b), |n| collation::compare(n,a,b))
+        self.explicit_collation().expect("collation bound").map_or_else(|| cmp(a,b), |n| collation::compare(n,a,b,&self.ty))
     }
 }

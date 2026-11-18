@@ -1564,7 +1564,7 @@ impl BoundFilter {
                                 user_types::view_replace_error("could not determine which collation to use for string comparison".into());
                                 return Err(SqlError::IndeterminateCollation);
                             }
-                            if if let Some(n)=collation {functions::collation::compare(n,&lhs,element)==Ordering::Equal} else {functions::join_equal(
+                            if if let Some(n)=collation {functions::collation::compare(n,&lhs,element,&value.ty)==Ordering::Equal} else {functions::join_equal(
                                 &lhs,
                                 &value.ty,
                                 element,

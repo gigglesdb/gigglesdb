@@ -249,3 +249,29 @@ fn integer_input_error(error: giggles_pg_types::integer::IntegerError) -> SqlErr
         IntegerError::Limit => SqlError::Limit,
     }
 }
+
+/// The existing array codec accepts flat, one-based arrays only. Compare decoded
+/// elements, with NULL elements last, then the length (the only varying shape).
+pub(super) fn compare_text_arrays(
+    a: &Value,
+    b: &Value,
+    mut element: impl FnMut(&str, &str) -> std::cmp::Ordering,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (Value::Text(a), Value::Text(b)) = (a, b) else {
+        return match (a, b) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Less,
+            (_, Value::Null) => Ordering::Greater,
+            _ => unreachable!("bound array values"),
+        };
+    };
+    let a = array_values(a).expect("validated array");
+    let b = array_values(b).expect("validated array");
+    a.iter().zip(&b).map(|(a, b)| match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(a), Some(b)) => element(a, b),
+    }).find(|o| *o != Ordering::Equal).unwrap_or_else(|| a.len().cmp(&b.len()))
+}
