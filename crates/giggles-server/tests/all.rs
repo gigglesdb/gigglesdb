@@ -292,6 +292,8 @@ mod agent_parity_behaviour;
 mod r3_preview_sql;
 #[path = "r3_undo_sql.rs"]
 mod r3_undo_sql;
+#[path = "r3_exit_release.rs"]
+mod r3_exit_release;
 #[path = "r3_milestone.rs"]
 mod r3_milestone;
 #[path = "task_release_extended.rs"]

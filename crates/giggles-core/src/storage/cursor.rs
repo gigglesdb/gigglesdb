@@ -80,7 +80,11 @@ impl Cursor {
         drop(active);
         match &result {
             Err(_) if self.guard.as_ref().is_some_and(|guard| guard.expired()) => {
-                self.close(CoreError::Cancelled)
+                // The scan meter reports cancellation as SqlError::Aborted.
+                // Return the deadline error we store, including on this first
+                // fetch, rather than leaking 25P02 from an autocommit read.
+                self.close(CoreError::Cancelled);
+                return Err(CoreError::Cancelled);
             }
             Err(error @ CoreError::Task(crate::task::TaskError::BudgetExceeded(_)))
                 if self.guard.is_some() =>
