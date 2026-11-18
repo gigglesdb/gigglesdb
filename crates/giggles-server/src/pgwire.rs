@@ -1058,14 +1058,26 @@ fn catalog_complete(count: usize, out: &mut Vec<u8>) -> R<()> {
 }
 const CURSOR_ROWS: usize = 256;
 const CURSOR_BYTES: usize = giggles_core::relational::MAX_RESULT_BYTES;
-type Output = Option<tokio::sync::mpsc::Sender<Vec<u8>>>;
+struct OutputChannel {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    prefix: std::sync::Mutex<Vec<u8>>,
+}
+type Output = Option<OutputChannel>;
 fn flush_output(output: &Output, out: &mut Vec<u8>) -> R<()> {
-    if let Some(output) = output
-        && !out.is_empty()
-    {
-        output
-            .blocking_send(std::mem::take(out))
-            .map_err(|_| "08006")?;
+    if let Some(output) = output {
+        let mut prefix = output.prefix.lock().unwrap();
+        if !prefix.is_empty() {
+            output
+                .sender
+                .blocking_send(std::mem::take(&mut *prefix))
+                .map_err(|_| "08006")?;
+        }
+        if !out.is_empty() {
+            output
+                .sender
+                .blocking_send(std::mem::take(out))
+                .map_err(|_| "08006")?;
+        }
     }
     Ok(())
 }
@@ -2491,6 +2503,133 @@ async fn ready_tag<S: AsyncRead + Unpin>(s: &mut S) -> Option<io::Result<u8>> {
     .await
 }
 
+const FRONTEND_BATCH_MESSAGES: usize = 256;
+const FRONTEND_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+fn leader_error(out: &mut Vec<u8>) -> io::Result<()> {
+    let mut body = b"SFATAL\0VFATAL\0C57P01\0M".to_vec();
+    z(
+        "terminating connection: this node is not the replication leader",
+        &mut body,
+    );
+    body.push(0);
+    frame(b'E', &body, out).map_err(io::Error::other)
+}
+
+async fn read_frontend_body<S: AsyncRead + Unpin>(s: &mut S) -> io::Result<Vec<u8>> {
+    timeout(IO_TIMEOUT, async {
+        let n = s.read_u32().await?;
+        // SQL plus Parse's bounded name/type declarations and frame header.
+        // Other transports keep their existing frame budgets.
+        let maximum = (giggles_core::relational::MAX_STATEMENT_SQL + 2048).max(MAX_FRAME);
+        if n < 4 || n as u64 > maximum as u64 {
+            return Err(io::Error::other("wire frame limit"));
+        }
+        let mut b = vec![0; n as usize - 4];
+        s.read_exact(&mut b).await?;
+        Ok(b)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+impl State {
+    fn buffered_message(
+        &mut self,
+        message: (u8, &[u8], std::time::Instant),
+        session: &mut Session,
+        out: &mut Vec<u8>,
+        active: crate::cancel::Active,
+        refusal: Option<&'static str>,
+        admission_message: Option<String>,
+    ) -> io::Result<bool> {
+        let (tag, b, received) = message;
+        let context = active.context.clone();
+        self.diagnostic = Diagnostic {
+            wire_detail: None,
+            wire_hint: None,
+            sql_detail: None,
+            wire_message: None,
+            message: None,
+            phase: match tag {
+                b'Q' => "simple query",
+                b'P' => "parse",
+                b'B' => "bind",
+                b'D' => "describe",
+                b'E' => "execute",
+                b'S' => "sync",
+                _ => "protocol message",
+            },
+            query_id: None,
+            task_refusal: None,
+        };
+        if admission_message.is_some() {
+            self.diagnostic.phase = "admission";
+            self.diagnostic.wire_message = admission_message;
+        }
+        let keep = match context.scope(|| {
+            if let Some(code) = refusal {
+                return Err(code);
+            }
+            context.check().map_err(|e| crate::service::sqlstate(&e))?;
+            session
+                .authority_scope(|session| Ok(self.handle(tag, b, session, out, received)))
+                .map_err(|e| crate::service::sqlstate(&e))?
+        }) {
+            Ok(keep) => Ok(keep),
+            Err(code) => {
+                session.abort();
+                // COMMIT may fail and finish rollback before returning
+                // its error. No portal can outlive that transaction.
+                if tag == b'Q' && !session.in_transaction() {
+                    self.portals.clear();
+                }
+                if tag == b'S' && self.implicit {
+                    session.sql.rollback();
+                    self.settings.transaction(true, false, "ROLLBACK");
+                    session.set_time_zone(&self.settings.current.timezone);
+                    session.set_search_path(&self.settings.current.search_path);
+                    session.set_extra_float_digits(self.settings.current.extra_float_digits);
+                    self.implicit = false;
+                    self.cursors.transaction_end("ROLLBACK");
+                    self.portals.clear();
+                }
+                let message = self.diagnostic.message.unwrap_or(match code {
+                    "0A000" => "unsupported SQL feature or parameter type in this server profile",
+                    "42601" => "statement syntax is not supported by this server SQL profile",
+                    _ => GENERIC_MESSAGE,
+                });
+                if self.copy.is_some() {
+                    self.copy_error(code, session, out);
+                    Ok(true)
+                } else {
+                    diagnostic_error(code, message, Some(&self.diagnostic), out);
+                    if matches!(tag, b'Q' | b'S') {
+                        self.drain = false;
+                        ready(session, out).map(|()| true).map_err(io::Error::other)
+                    } else {
+                        self.drain = true;
+                        Ok(true)
+                    }
+                }
+            }
+        };
+        if !session.in_transaction() && !self.implicit {
+            session.service.advisory.release(session.backend_pid, true);
+        }
+        if self.copy_receiving() {
+            self.copy_active = Some(active);
+            self.copy_permit = self
+                .execution_admission
+                .as_mut()
+                .and_then(|a| a.role_permit.take());
+        } else {
+            drop(active);
+        }
+        keep
+    }
+}
+
 async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
     mut session: Session,
@@ -2531,10 +2670,10 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         ("TimeZone", timezone.as_str()),
     ]
     .into_iter()
-    .chain(matches!(session.role, Role::Database { .. }).then_some((
-        "IntervalStyle",
-        startup_settings.intervalstyle.as_str(),
-    ))) {
+    .chain(
+        matches!(session.role, Role::Database { .. })
+            .then_some(("IntervalStyle", startup_settings.intervalstyle.as_str())),
+    ) {
         let mut b = vec![];
         z(key, &mut b);
         z(value, &mut b);
@@ -2578,6 +2717,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
     session.set_extra_float_digits(state.settings.current.extra_float_digits);
     let mut admin_sync = false;
     let mut pending_tag = None;
+    let mut pending_frames = std::collections::VecDeque::<(u8, Vec<u8>, std::time::Instant)>::new();
     let mut binding_changes = session.service.binding_changes.subscribe();
     let mut binding_check_pending = true;
     loop {
@@ -2615,6 +2755,9 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                     return Ok(());
                 }
             }
+            if let Some((tag, _, _)) = pending_frames.front() {
+                break Ok(*tag);
+            }
             if let Some(tag) = pending_tag.take() {
                 break Ok(tag);
             }
@@ -2631,39 +2774,39 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(tag) => tag,
             Err(_) => return Ok(()),
         };
-        let incoming = timeout(IO_TIMEOUT, async {
-            let n = s.read_u32().await?;
-            // SQL plus Parse's bounded name/type declarations and frame header.
-            // Other transports keep their existing frame budgets.
-            let maximum = (giggles_core::relational::MAX_STATEMENT_SQL + 2048).max(MAX_FRAME);
-            if n < 4 || n as u64 > maximum as u64 {
-                return Err(io::Error::other("wire frame limit"));
+        let queued = !pending_frames.is_empty();
+        let (b, received) = if queued {
+            let (_, b, received) = pending_frames.pop_front().unwrap();
+            (b, received)
+        } else {
+            match read_frontend_body(s).await {
+                Ok(b) => (b, std::time::Instant::now()),
+                Err(_) => return Ok(()),
             }
-            let mut b = vec![0; n as usize - 4];
-            s.read_exact(&mut b).await?;
-            Ok((tag, b))
-        })
-        .await;
-        let (tag, b) = match incoming {
-            Ok(Ok(v)) => v,
-            _ => return Ok(()),
         };
-        if matches!(tag, b'Q' | b'E')
-            && let Some(gate) = session.service.statement_gate.get().cloned()
-            && !matches!(tokio::task::spawn_blocking(move || gate()).await, Ok(Ok(())))
-        {
-            let mut body = b"SFATAL\0VFATAL\0C57P01\0M".to_vec();
-            z("terminating connection: this node is not the replication leader", &mut body);
-            body.push(0);
-            let mut out = Vec::new();
-            frame(b'E', &body, &mut out).map_err(io::Error::other)?;
-            send(s, &out).await?;
-            s.shutdown().await?;
-            return Ok(());
-        }
         // An admin command may invalidate its own login generation. Deliver its
         // completion and finish the extended cycle, then reject further work.
         if admin_sync {
+            // Keep the terminal admin cycle's old gate-before-close behavior.
+            if matches!(tag, b'Q' | b'E')
+                && let Some(gate) = session.service.statement_gate.get().cloned()
+            {
+                session
+                    .service
+                    .pgwire_blocking_tasks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !matches!(
+                    tokio::task::spawn_blocking(move || gate()).await,
+                    Ok(Ok(()))
+                ) {
+                    let mut out = Vec::new();
+                    leader_error(&mut out)?;
+                    send(s, &out).await?;
+                    s.shutdown().await?;
+                    return Ok(());
+                }
+            }
+
             if tag == b'H' && b.is_empty() {
                 continue;
             }
@@ -2675,10 +2818,9 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
             return Ok(());
         }
         state.admin_completed = false;
-        if !session.service.admission.request() {
+        if !queued && !session.service.admission.request() {
             return Ok(());
         }
-        let received = std::time::Instant::now();
         // A successful implicit cycle publishes at Sync and must be cancellable
         // at that decision boundary. Recovery-only Sync remains uncancellable.
         let active = state.copy_active.take().unwrap_or_else(|| {
@@ -2698,16 +2840,23 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         // GD-0075 R5-103: the role's statement pool sits in front of the
         // service-wide blocking pool; only COPY retains it between frames.
         let role_admission = if agent_slot.is_err() {
-                // The refusal ends any COPY, so its retained role permit goes too.
-                state.copy_permit = None;
-                Ok(None)
-            } else if matches!(tag, b'Q' | b'E') && !session.is_aborted() && !state.drain
-                && state.copy.is_none() && !state.admission_exempt(tag, &b) {
-                let admission = &session.service.admission;
-                admission.statement(&session.role, Some(&active.context)).await.map(Some)
-            } else {
-                Ok(state.copy_permit.take())
-            };
+            // The refusal ends any COPY, so its retained role permit goes too.
+            state.copy_permit = None;
+            Ok(None)
+        } else if matches!(tag, b'Q' | b'E')
+            && !session.is_aborted()
+            && !state.drain
+            && state.copy.is_none()
+            && !state.admission_exempt(tag, &b)
+        {
+            let admission = &session.service.admission;
+            admission
+                .statement(&session.role, Some(&active.context))
+                .await
+                .map(Some)
+        } else {
+            Ok(state.copy_permit.take())
+        };
         let admitted = match (agent_slot, role_admission) {
             (Err(e), _) => Err((crate::service::sqlstate(&e), None)),
             (Ok(agent_slot), Ok(role)) => blocking
@@ -2757,26 +2906,59 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                 continue;
             }
         };
-        state.diagnostic = Diagnostic {
-            wire_detail: None,
-            wire_hint: None,
-            sql_detail: None,
-            wire_message: None,
-            message: None,
-            phase: match tag {
-                b'Q' => "simple query",
-                b'P' => "parse",
-                b'B' => "bind",
-                b'D' => "describe",
-                b'E' => "execute",
-                b'S' => "sync",
-                _ => "protocol message",
-            },
-            query_id: None,
-            task_refusal: None,
-        };
+        let mut batch = std::collections::VecDeque::from([(tag, b, received)]);
+        let mut bytes = batch[0].1.len();
+        // COPY may start at Execute; queued frames after it are retained for
+        // the single-message COPY path, never executed in the same scope.
+        while state.copy.is_none()
+            && !state.drain
+            && !matches!(
+                batch.back().unwrap().0,
+                b'S' | b'Q' | b'H' | b'X' | b'd' | b'c' | b'f'
+            )
+            && batch.len() < FRONTEND_BATCH_MESSAGES
+            && bytes < FRONTEND_BATCH_BYTES
+        {
+            let next = if let Some((next, _, _)) = pending_frames.front() {
+                Some(Ok(*next))
+            } else if let Some(next) = pending_tag.take() {
+                Some(Ok(next))
+            } else {
+                ready_tag(s).await
+            };
+            let next = match next {
+                Some(Ok(next)) => next,
+                Some(Err(_)) | None => break,
+            };
+            if matches!(next, b'X' | b'd' | b'c' | b'f') {
+                pending_tag = Some(next);
+                break;
+            }
+            let (body, received) = if let Some((_, body, received)) = pending_frames.pop_front() {
+                (body, received)
+            } else {
+                let body = match read_frontend_body(s).await {
+                    Ok(body) => body,
+                    Err(_) => return Ok(()),
+                };
+                let received = std::time::Instant::now();
+                if !session.service.admission.request() {
+                    return Ok(());
+                }
+                (body, received)
+            };
+            if bytes.saturating_add(body.len()) > FRONTEND_BATCH_BYTES {
+                pending_frames.push_front((next, body, received));
+                break;
+            }
+            bytes += body.len();
+            batch.push_back((next, body, received));
+        }
         let (output, mut chunks) = tokio::sync::mpsc::channel(2);
-        state.output = Some(output);
+        state.output = Some(OutputChannel {
+            sender: output,
+            prefix: std::sync::Mutex::new(Vec::new()),
+        });
         let connection_closed = session.connection_closed.clone();
         state.execution_admission = Some(ExecutionAdmission {
             role_permit,
@@ -2785,76 +2967,135 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
             context: active.context.clone(),
             first: state.copy.is_none(),
         });
-        let work = async move { tokio::task::spawn_blocking(move || {
-            // Dropped last, after `execution_admission` (R3-403 release order).
-            let _agent_slot = agent_slot;
-            let mut out = Vec::new();
-            let keep = match active.context.scope(|| {
-                active
-                    .context
-                    .check()
-                    .map_err(|e| crate::service::sqlstate(&e))?;
-                // The authority gate covers cached portal output and the
-                // actual core commit, not just Parse/Bind authorization.
-                session
-                    .authority_scope(|session| {
-                        Ok(state.handle(tag, &b, session, &mut out, received))
-                    })
-                    .map_err(|e| crate::service::sqlstate(&e))?
-            }) {
-                Ok(keep) => Ok(keep),
-                Err(code) => {
-                    session.abort();
-                    // COMMIT may fail and finish rollback before returning
-                    // its error. No portal can outlive that transaction.
-                    if tag == b'Q' && !session.in_transaction() {
-                        state.portals.clear();
+        let backend = backend.clone();
+        let work = async move {
+            session
+                .service
+                .pgwire_blocking_tasks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::task::spawn_blocking(move || {
+                // Dropped last, after `execution_admission` (R3-403 release order).
+                let _agent_slot = agent_slot;
+                let mut leader_shutdown = false;
+                let mut first_active = Some(active);
+                let mut last_tag = tag;
+                let mut binding_lost = false;
+                let mut keep = Ok(true);
+                while let Some((tag, b, received)) = batch.pop_front() {
+                    let mut out = Vec::new();
+                    last_tag = tag;
+                    state.admin_completed = false;
+                    let active = first_active
+                        .take()
+                        .or_else(|| state.copy_active.take())
+                        .unwrap_or_else(|| {
+                            backend.begin(
+                                matches!(
+                                    tag,
+                                    b'Q' | b'P' | b'B' | b'D' | b'E' | b'd' | b'c' | b'f'
+                                ) || (tag == b'S' && state.implicit && !session.is_aborted()),
+                            )
+                        });
+                    if matches!(tag, b'Q' | b'E')
+                        && session.service.statement_gate.get().is_some_and(|gate| {
+                            !matches!(
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| active
+                                    .context
+                                    .scope(|| gate()))),
+                                Ok(Ok(()))
+                            )
+                        })
+                    {
+                        keep = leader_error(&mut out).map(|()| false);
+                        state
+                            .output
+                            .as_ref()
+                            .unwrap()
+                            .prefix
+                            .lock()
+                            .unwrap()
+                            .extend(out);
+                        leader_shutdown = true;
+                        break;
                     }
-                    if tag == b'S' && state.implicit {
-                        session.sql.rollback();
-                        state.settings.transaction(true, false, "ROLLBACK");
-                        session.set_time_zone(&state.settings.current.timezone);
-                        session.set_search_path(&state.settings.current.search_path);
-                        session.set_extra_float_digits(state.settings.current.extra_float_digits);
-                        state.implicit = false;
-                        state.cursors.transaction_end("ROLLBACK");
-                        state.portals.clear();
-                    }
-                    let message = state.diagnostic.message.unwrap_or(match code {
-                        "0A000" => {
-                            "unsupported SQL feature or parameter type in this server profile"
-                        }
-                        "42601" => "statement syntax is not supported by this server SQL profile",
-                        _ => GENERIC_MESSAGE,
-                    });
-                    if state.copy.is_some() {
-                        state.copy_error(code, &mut session, &mut out);
-                        Ok(true)
+                    let needs_role = matches!(tag, b'Q' | b'E')
+                        && !session.is_aborted()
+                        && !state.drain
+                        && state.copy.is_none()
+                        && !state.admission_exempt(tag, &b);
+                    let admission = state.execution_admission.as_mut().unwrap();
+                    admission.context = active.context.clone();
+                    admission.first = state.copy.is_none();
+                    let refusal = if needs_role && admission.role_permit.is_none() {
+                        admission.blocking = None;
+                        admission
+                            .runtime
+                            .block_on(async {
+                                admission.role_permit = Some(
+                                    session
+                                        .service
+                                        .admission
+                                        .statement(&session.role, Some(&active.context))
+                                        .await?,
+                                );
+                                admission.blocking = Some(
+                                    session
+                                        .service
+                                        .blocking
+                                        .admit(&active.context)
+                                        .await
+                                        .map_err(crate::admission::StatementRefusal::Core)?,
+                                );
+                                Ok::<_, crate::admission::StatementRefusal>(())
+                            })
+                            .err()
                     } else {
-                        diagnostic_error(code, message, Some(&state.diagnostic), &mut out);
-                        if matches!(tag, b'Q' | b'S') {
-                            state.drain = false;
-                            ready(&session, &mut out)
-                                .map(|()| true)
-                                .map_err(io::Error::other)
-                        } else {
-                            state.drain = true;
-                            Ok(true)
-                        }
+                        None
+                    };
+                    // Admission refusal uses the same error/abort/drain path.
+                    keep = state.buffered_message(
+                        (tag, &b, received),
+                        &mut session,
+                        &mut out,
+                        active,
+                        refusal.as_ref().map(|e| e.sqlstate()),
+                        refusal.as_ref().map(|e| e.message()),
+                    );
+                    state
+                        .output
+                        .as_ref()
+                        .unwrap()
+                        .prefix
+                        .lock()
+                        .unwrap()
+                        .extend(out);
+                    binding_lost = session
+                        .check_binding()
+                        .is_err_and(|e| !crate::service::transient(&e));
+                    if binding_lost
+                        || !matches!(keep, Ok(true))
+                        || state.copy.is_some()
+                        || refusal.is_some()
+                    {
+                        break;
                     }
                 }
-            };
-            if !session.in_transaction() && !state.implicit { session.service.advisory.release(session.backend_pid, true); }
-            if state.copy_receiving() {
-                state.copy_active = Some(active);
-                state.copy_permit = state.execution_admission.as_mut().and_then(|a| a.role_permit.take());
-            } else {
-                drop(active);
-            }
-            state.execution_admission = None;
-            state.output = None;
-            (session, state, out, keep)
-        }).await.map_err(io::Error::other) };
+                state.execution_admission = None;
+                let out = state.output.take().unwrap().prefix.into_inner().unwrap();
+                (
+                    session,
+                    state,
+                    out,
+                    keep,
+                    batch,
+                    last_tag,
+                    binding_lost,
+                    leader_shutdown,
+                )
+            })
+            .await
+            .map_err(io::Error::other)
+        };
         tokio::pin!(work);
         let completed = loop {
             tokio::select! {
@@ -2873,16 +3114,27 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         while let Some(chunk) = chunks.recv().await {
             send(s, &chunk).await?;
         }
-        let (returned_session, returned_state, response, keep) = completed;
+        let (
+            returned_session,
+            returned_state,
+            response,
+            keep,
+            remaining,
+            tag,
+            binding_lost,
+            leader_shutdown,
+        ) = completed;
+        pending_frames = remaining.into_iter().chain(pending_frames).collect();
         session = returned_session;
         state = returned_state;
         if !keep? {
+            send(s, &response).await?;
+            if leader_shutdown {
+                s.shutdown().await?;
+            }
             return Ok(());
         }
-        if session
-            .check_binding()
-            .is_err_and(|e| !crate::service::transient(&e))
-        {
+        if binding_lost {
             if state.admin_completed {
                 send(s, &response).await?;
                 if tag == b'E' {
@@ -2896,13 +3148,13 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         // message (Parse/Bind/Describe/Execute before Sync). Sync, Query and
         // Flush always flush, as does every other send.
         if !matches!(tag, b'S' | b'Q' | b'H') {
-            let next = match pending_tag {
+            let next = match pending_tag.or_else(|| pending_frames.front().map(|f| f.0)) {
                 Some(_) => Some(Ok(0)),
                 None => ready_tag(s).await,
             };
             match next {
                 Some(Ok(next)) => {
-                    if pending_tag.is_none() {
+                    if pending_tag.is_none() && pending_frames.is_empty() {
                         pending_tag = Some(next);
                     }
                     timeout(IO_TIMEOUT, s.write_all(&response))

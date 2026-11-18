@@ -212,6 +212,7 @@ pub(crate) fn role_lookup_error(error: roles::RoleError) -> CoreError {
 pub type StatementGate = std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 pub struct Service {
+    pub(crate) pgwire_blocking_tasks: std::sync::atomic::AtomicU64,
     pub(crate) statement_gate: std::sync::OnceLock<StatementGate>,
     pub(crate) advisory: crate::advisory::Locks,
     pub(crate) blocking: crate::blocking::Blocking,
@@ -235,6 +236,11 @@ struct Credentials {
     entries: BTreeMap<String, (Role, u64)>,
 }
 impl Service {
+    #[doc(hidden)]
+    pub fn pgwire_blocking_tasks(&self) -> u64 {
+        self.pgwire_blocking_tasks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn new(admin: Admin, bindings: Vec<Binding>, clock: Clock) -> Result<Arc<Self>, CoreError> {
         Self::with_limits(
             admin,
@@ -290,6 +296,7 @@ impl Service {
         }
         Ok(Arc::new(Self {
             advisory: crate::advisory::Locks::default(),
+            pgwire_blocking_tasks: std::sync::atomic::AtomicU64::new(0),
             blocking: crate::blocking::Blocking::new(),
             cancellations: crate::cancel::Registry::default(),
             task_gate: std::sync::Mutex::new(()),
