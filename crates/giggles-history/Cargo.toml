@@ -3,7 +3,7 @@ name = "giggles-history"
 version = "0.1.0"
 edition = "2024"
 description = "Independent bounded strict-serializability history checker"
-license = "MIT OR Apache-2.0"
+license = "MPL-2.0"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

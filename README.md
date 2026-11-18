@@ -228,6 +228,8 @@ Each crate's README states what it supports and its current limits.
 
 ## Development
 
+See [Contributing](CONTRIBUTING.md) and [Security](SECURITY.md).
+
 Each crate has its own Cargo manifest; there is no root workspace. Run a
 crate's tests with:
 
@@ -242,3 +244,12 @@ backup/restore, failover suites and per-crate tests; see the
 [IntelliJ run guide](scripts/README.md).
 
 AI coding agents working in this repository follow [AGENTS.md](AGENTS.md).
+
+## License
+
+GigglesDB is licensed under the [Mozilla Public License 2.0](LICENSE).
+
+You may use, embed and link GigglesDB in closed-source or commercial applications.
+If you distribute modified versions of GigglesDB's own files, those files must
+remain available under MPL-2.0. Third-party components keep their own licenses;
+see [Third-party notices](THIRD_PARTY_NOTICES.md).

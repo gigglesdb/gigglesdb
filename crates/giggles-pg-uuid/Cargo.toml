@@ -3,7 +3,7 @@ exclude = ["reference/"]
 name = "giggles-pg-uuid"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "MPL-2.0 AND PostgreSQL"
 [workspace]
 [dependencies]
 giggles-pg-types = { path = "../giggles-pg-types" }
