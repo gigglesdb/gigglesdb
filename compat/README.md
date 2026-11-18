@@ -690,3 +690,23 @@ Until CREATE TASK runs over SQL (R3-110), pass `--task-tool TOOL` (or set
 `AGENT_LOAD_TASK_TOOL` for the test): after the setup server stops, the harness
 runs `TOOL <database> postgres <file of CREATE TASK statements>` to create the
 tasks in the stopped database.
+
+## R3 safeguards worked example
+
+Run the 23-step safeguards scenario against a real server process:
+`python -I -B compat/r3_safeguards.py --server-bin <exe> --work J:/gigglesdb-work/<task>`.
+The default `--drivers psycopg,pgx` runs both pinned drivers (psycopg 3.2.9 and
+pgx v5.7.6); pass either name to select one. Use `--psycopg-python <exe>` for
+the psycopg environment, `--expiry-seconds 300` for the real-clock expiry, and
+`--no-workload` for isolation. `--go <exe>` selects the Go toolchain (defaults
+to `C:/Users/beach/go/go1.24.5/bin/go.exe` when available, otherwise `go`).
+The runner builds pgx once into the run folder with read-only modules and
+reuses Go caches under `<work>/go/`. Child TEMP/TMP use `<run>/tmp`.
+Each driver gets a separate database under a unique run folder. Docker runs
+four concurrent pinned PostgreSQL psql loops in one container, with disjoint
+merchant subsets and insert IDs. The runner kills and restarts the server
+at step 18 and always removes its workload container. Reports are
+`report.md` and `report.json`, with per-step status, attempts/retries,
+deviations, and workload counts/errors. Exit codes: 0 all PASS, 2 scenario or
+unexpected workload failure, 1 harness error. Driver JSON and restart protocol
+are documented in the runner module docstring.
