@@ -1092,3 +1092,120 @@ fn two_children_same_parent_serializable() {
         SqlIsolation::Serializable,
     );
 }
+
+// These review schedules are not in the captured oracle matrix. Source basis:
+// PostgreSQL REL_18_6 src/backend/executor/nodeLockRows.c (TM_Updated/TM_Deleted)
+// and src/backend/access/heap/heapam.c (heap_lock_tuple, LockTupleKeyShare).
+// PG18 heap_lock_tuple/ExecLockRows reject a
+// deleted/key-updated snapshot tuple, but follow non-key update chains.
+fn fixed_snapshot_chain(level: SqlIsolation, changes: &[&str], expected: &str) {
+    let f = Fixture::new("CREATE TABLE p(id int PRIMARY KEY, code int UNIQUE, v int); CREATE TABLE c(id int PRIMARY KEY, p int REFERENCES p(code)); INSERT INTO p VALUES(1,10,0)");
+    let mut child = f.admin().sql_session();
+    child.set_isolation(level);
+    ok(&mut child, "BEGIN");
+    ok(&mut child, "SELECT * FROM p");
+    let mut writer = f.admin().sql_session();
+    // Autocommit changes expose individual versions; explicit BEGIN/COMMIT
+    // also exercises multiple changes folded into one committed version.
+    for sql in changes { ok(&mut writer, sql); }
+    let result = execute(&mut child, "INSERT INTO c VALUES(1,10)");
+    let end = execute(&mut child, "COMMIT");
+    check(&result, expected, "snapshot FK check");
+    check(&end, "OK", "snapshot end");
+    let children = rows(&mut writer, "SELECT id,p FROM c");
+    assert_eq!(children.len(), usize::from(expected == "OK"));
+}
+
+#[test]
+fn delete_reinsert_identical_repeatable_read() {
+    fixed_snapshot_chain(SqlIsolation::RepeatableRead,
+        &["DELETE FROM p WHERE id=1", "INSERT INTO p VALUES(1,10,0)"], "40001");
+}
+#[test]
+fn delete_reinsert_identical_serializable() {
+    fixed_snapshot_chain(SqlIsolation::Serializable,
+        &["DELETE FROM p WHERE id=1", "INSERT INTO p VALUES(1,10,0)"], "40001");
+}
+#[test]
+fn key_change_away_and_back_repeatable_read() {
+    fixed_snapshot_chain(SqlIsolation::RepeatableRead,
+        &["UPDATE p SET code=20 WHERE id=1", "UPDATE p SET code=10 WHERE id=1"], "40001");
+}
+#[test]
+fn nonkey_update_chain_repeatable_read() {
+    fixed_snapshot_chain(SqlIsolation::RepeatableRead,
+        &["UPDATE p SET v=1 WHERE id=1", "UPDATE p SET v=2 WHERE id=1"], "OK");
+}
+
+#[test]
+fn replacement_unique_witness_is_key_share_protected() {
+    let f = Fixture::new("CREATE TABLE p(id int PRIMARY KEY, code int UNIQUE, v int); CREATE TABLE c(id int PRIMARY KEY, p int REFERENCES p(code)); INSERT INTO p VALUES(1,10,0)");
+    let mut writer = f.admin().sql_session();
+    ok(&mut writer, "BEGIN");
+    ok(&mut writer, "UPDATE p SET code=20 WHERE id=1");
+    let admin = f.admin().clone();
+    let (started, ready) = mpsc::channel();
+    let (inserted, result) = mpsc::channel();
+    let (finish, release) = mpsc::channel();
+    let child = thread::spawn(move || {
+        let mut s = admin.sql_session();
+        ok(&mut s, "BEGIN");
+        started.send(()).unwrap();
+        let insert = execute(&mut s, "INSERT INTO c VALUES(1,10)");
+        inserted.send(insert).unwrap();
+        release.recv().unwrap();
+        execute(&mut s, "COMMIT")
+    });
+    ready.recv_timeout(Duration::from_secs(10)).unwrap();
+    let early = result.recv_timeout(Duration::from_millis(150));
+    ok(&mut writer, "INSERT INTO p VALUES(2,10,0)");
+    ok(&mut writer, "COMMIT");
+    let insert = early.clone().unwrap_or_else(|_| result.recv_timeout(Duration::from_secs(10)).unwrap());
+    let admin = f.admin().clone();
+    let (deleted, deletion) = mpsc::channel();
+    let deleter = thread::spawn(move || {
+        let mut s = admin.sql_session();
+        let delete = execute(&mut s, "DELETE FROM p WHERE id=2");
+        deleted.send(delete.clone()).unwrap();
+        delete
+    });
+    let premature_delete = deletion.recv_timeout(Duration::from_millis(150));
+    finish.send(()).unwrap();
+    let end = child.join().unwrap();
+    let delete = deleter.join().unwrap();
+    // PG may reject the original vanished witness with 23503. If the lookup
+    // follows its replacement, that replacement must remain locked until end.
+    assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+    check(&end, "OK", "child end");
+    match insert {
+        Ok(()) => {
+            assert!(matches!(premature_delete, Err(mpsc::RecvTimeoutError::Timeout)));
+            check(&delete, "23503", "replacement delete");
+        }
+        Err(CoreError::Sql(SqlError::ForeignKeyViolation)) => check(&delete, "OK", "replacement delete"),
+        other => panic!("unexpected child result: {other:?}"),
+    }
+    let parents = rows(&mut writer, "SELECT code FROM p");
+    for child in rows(&mut writer, "SELECT p FROM c") {
+        assert!(parents.contains(&child), "orphan: {child:?}");
+    }
+}
+
+#[test]
+#[ignore = "GD-0084 A2 known divergence: a single-transaction delete+reinsert of identical parent keys is indistinguishable from a non-key update; PostgreSQL 18.6 raises 40001"]
+fn single_transaction_delete_reinsert_identical_repeatable_read() {
+    fixed_snapshot_chain(SqlIsolation::RepeatableRead,
+        &["BEGIN", "DELETE FROM p WHERE id=1", "INSERT INTO p VALUES(1,10,0)", "COMMIT"], "40001");
+}
+#[test]
+#[ignore = "GD-0084 A2 known divergence: a single-transaction delete+reinsert of identical parent keys is indistinguishable from a non-key update; PostgreSQL 18.6 raises 40001"]
+fn single_transaction_delete_reinsert_identical_serializable() {
+    fixed_snapshot_chain(SqlIsolation::Serializable,
+        &["BEGIN", "DELETE FROM p WHERE id=1", "INSERT INTO p VALUES(1,10,0)", "COMMIT"], "40001");
+}
+#[test]
+#[ignore = "GD-0084 A2 known divergence: a single-transaction delete+reinsert of identical parent keys is indistinguishable from a non-key update; PostgreSQL 18.6 raises 40001"]
+fn single_transaction_key_change_away_and_back_repeatable_read() {
+    fixed_snapshot_chain(SqlIsolation::RepeatableRead,
+        &["BEGIN", "UPDATE p SET code=20 WHERE id=1", "UPDATE p SET code=10 WHERE id=1", "COMMIT"], "40001");
+}

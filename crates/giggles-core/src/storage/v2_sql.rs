@@ -1386,6 +1386,41 @@ impl SqlRows<'_> {
         physical.extend(codec::pk_bytes(&pk)?);
         Ok(self.txn.changed_since(Keyspace::Rows, &physical, ts)?)
     }
+    /// Follow every committed version since the fixed snapshot. KEY SHARE may
+    /// follow non-key updates, but cannot resurrect a deleted or re-keyed tuple.
+    fn fk_key_changed_since(&mut self, table: &TableDef, row: &SqlRow)
+        -> Result<bool, CoreError> {
+        let pk = table.primary_key.iter().map(|i| row.values[*i].clone()).collect::<Vec<_>>();
+        let mut physical = table.id.to_be_bytes().to_vec();
+        physical.extend(codec::pk_bytes(&pk)?);
+        let ts = self.txn.snapshot_ts();
+        let engine::txn::TxnServices::Local { seq, .. } = self.txn.services() else {
+            unreachable!("local FK crosscheck");
+        };
+        let start = codec::user_key_seek_at(&physical, engine::hlc::Ts(u64::MAX));
+        let end = codec::user_key_seek_at(&physical, ts);
+        let versions = seq.kv().range(Keyspace::Rows, Bound::Included(&start),
+            Bound::Excluded(&end), engine::kv::Direction::Forward)
+            .map_err(engine::txn::TxnError::from)?;
+        for version in versions {
+            crate::cancellation::check()?;
+            let (_, bytes) = version.map_err(engine::txn::TxnError::from)?;
+            let Some(bytes) = engine::mvcc::decode(&bytes).map_err(engine::txn::TxnError::from)? else {
+                return Ok(true);
+            };
+            let record = codec::decode_row(&physical, bytes)?;
+            let mut values = record.values;
+            if record.tombstone { return Ok(true); }
+            if values.len() > table.columns.len() {
+                return Err(CoreError::Corrupt("invalid v2 SQL row witness".into()));
+            }
+            values.resize(table.columns.len(), relational::Value::Null);
+            if fk_key_changed(table, &self.parts.indexes, &row.values, &values) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     /// Whether the statement snapshot was taken after every FK table lock:
     /// READ COMMITTED, or a protected run that restarted its snapshot there
     /// (GD-0061 C2/C3).
@@ -1429,7 +1464,7 @@ impl RowSink for SqlRows<'_> {
     }
     // FK row locks (GD-0084 A2): Local child checks find latest parents, take
     // RowKey Shared (KEY SHARE), then read latest again. Fixed snapshots retain
-    // their witnesses and crosscheck only PK/UNIQUE values, not non-key updates.
+    // their witnesses and crosscheck every committed version for key changes/deletes.
     // RowKey is separate from Row: ordinary writes act like NO KEY UPDATE,
     // while deletes/key changes take RowKey Exclusive (FOR UPDATE) BEFORE Row.
     // Writing referential actions retain component table locks. Cluster keeps
@@ -1522,37 +1557,41 @@ impl RowSink for SqlRows<'_> {
             self.txn.replace_reads(reads);
             result?;
         }
-        self.txn.begin_latest();
-        let mut parents = Vec::new();
-        let result = self.lookup_all(table, columns, values, true, &mut |row| {
-                if matches(&row)? { parents.push(row); }
-                Ok(())
-            });
-        self.txn.end_latest();
-        result?;
-        if parents.is_empty() {
-            return if snapshot.is_empty() { Ok(()) }
-                else { Err(CoreError::Sql(SqlError::Conflict)) };
-        }
-        let keys = parents.iter().map(|row| codec::pk_bytes(&table.primary_key.iter()
-            .map(|i| row.values[*i].clone()).collect::<Vec<_>>()))
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        for key in keys {
-            self.txn.lock_row_key(table.id, &key, LockMode::Shared,
-                crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err())
-                .map_err(crate::task::limits::lock_error)?;
-        }
-        self.txn.begin_latest();
-        let mut latest = Vec::new();
-        let result = self.lookup_all(table, columns, values, true, &mut |row| {
-                if matches(&row)? { latest.push(row); }
-                Ok(())
-            });
-        self.txn.end_latest();
-        result?;
+        let mut locked = BTreeSet::new();
+        let deadline = crate::task::limits::lock_deadline();
+        let latest = loop {
+            crate::cancellation::check()?;
+            let parents = self.at_latest(|rows| {
+                let mut parents = Vec::new();
+                rows.lookup_all(table, columns, values, true, &mut |row| {
+                    if matches(&row)? { parents.push(row); }
+                    Ok(())
+                })?;
+                Ok(parents)
+            })?;
+            let keys = parents.iter().map(|row| codec::pk_bytes(&table.primary_key.iter()
+                .map(|i| row.values[*i].clone()).collect::<Vec<_>>()))
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            if keys.is_subset(&locked) { break parents; }
+            // A lock wait can replace a UNIQUE witness with a different PK.
+            // Discard these probe rows and recheck until every returned witness
+            // owns its own KEY SHARE lock. Never pass probe rows to the visitor.
+            drop(parents);
+            for key in keys.difference(&locked) {
+                crate::cancellation::check()?;
+                if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                    return Err(crate::task::limits::lock_error(engine::txn::TxnError::LockTimeout));
+                }
+                self.txn.lock_row_key(table.id, key, LockMode::Shared, deadline,
+                    &|| crate::cancellation::check().is_err())
+                    .map_err(crate::task::limits::lock_error)?;
+            }
+            locked.extend(keys);
+        };
         if fixed {
             for row in snapshot {
-                if !latest.iter().any(|current| !fk_key_changed(table, &self.parts.indexes,
+                if self.fk_key_changed_since(table, &row)?
+                    || !latest.iter().any(|current| !fk_key_changed(table, &self.parts.indexes,
                     &row.values, &current.values)) {
                     return Err(CoreError::Sql(SqlError::Conflict));
                 }
