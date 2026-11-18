@@ -328,3 +328,5 @@ mod user_collation_network;
 #[path="column_collation_network.rs"] mod column_collation_network;
 #[path = "implicit_block_oracle_network.rs"]
 mod implicit_block_oracle_network;
+#[path = "pipeline_oracle_network.rs"]
+mod pipeline_oracle_network;
