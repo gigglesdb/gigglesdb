@@ -129,13 +129,32 @@ pub(super) fn callback(
 
 type SlotGuard<'a> = crate::cancellation::WaitGuard<'a, v2::SeqSlotState>;
 
+#[derive(Debug)]
+enum ReceiveError {
+    Core(CoreError),
+    Gone(u128),
+}
+impl From<CoreError> for ReceiveError {
+    fn from(error: CoreError) -> Self {
+        Self::Core(error)
+    }
+}
+impl From<ReceiveError> for CoreError {
+    fn from(error: ReceiveError) -> Self {
+        match error {
+            ReceiveError::Core(error) => error,
+            ReceiveError::Gone(_) => engine::txn::TxnError::SequenceGone.into(),
+        }
+    }
+}
+
 /// One receiver owns the oldest ack; all other callers release the slot while waiting.
 fn receive_one<'a>(
     slot: &'a v2::SeqSlot,
     mut guard: SlotGuard<'a>,
-) -> Result<SlotGuard<'a>, CoreError> {
+) -> Result<SlotGuard<'a>, ReceiveError> {
     if guard.receiving {
-        return guard.wait();
+        return guard.wait().map_err(ReceiveError::Core);
     }
     let Some(write) = guard.inflight.pop_front() else {
         return Ok(guard);
@@ -148,7 +167,7 @@ fn receive_one<'a>(
             let mut guard = slot.counter.lock().map_err(|_| CoreError::Fenced)?;
             guard.inflight.push_front(write);
             guard.receiving = false;
-            return Err(error);
+            return Err(error.into());
         }
         match write
             .ack
@@ -167,8 +186,11 @@ fn receive_one<'a>(
     if outcome.is_ok() {
         guard.acknowledge(write.incarnation, write.hw);
     }
-    outcome?;
-    Ok(guard)
+    match outcome {
+        Ok(()) => Ok(guard),
+        Err(engine::txn::TxnError::SequenceGone) => Err(ReceiveError::Gone(write.incarnation)),
+        Err(error) => Err(ReceiveError::Core(error.into())),
+    }
 }
 
 fn drain_ready(guard: &mut v2::SeqSlotState) {
@@ -362,18 +384,50 @@ fn await_coverage<'a>(
         if !guard.receiving && guard.inflight.is_empty() {
             let counter = guard.counter.as_ref().ok_or(CoreError::Fenced)?;
             let hw = counter.log_hw;
-            let ack = db.sequencer.send_counter(
+            let ack = match db.sequencer.send_counter(
                 key.to_vec(),
                 engine::catalog_codec::encode_counter(counter, def)?,
                 256,
-            )?;
+            ) {
+                Ok(ack) => ack,
+                Err(engine::txn::TxnError::SequenceGone) => {
+                    drop(guard);
+                    return await_retirement(db, id, def.incarnation, result);
+                }
+                Err(error) => return Err(error.into()),
+            };
             guard.inflight.push_back(v2::InFlight {
                 incarnation: def.incarnation,
                 hw,
                 ack,
             });
         }
-        guard = receive_one(slot, guard)?;
+        guard = match receive_one(slot, guard) {
+            Ok(guard) => guard,
+            Err(ReceiveError::Gone(incarnation)) if incarnation == def.incarnation => {
+                return await_retirement(db, id, def.incarnation, result);
+            }
+            Err(error) => return Err(error.into()),
+        };
+    }
+}
+
+// SequenceGone can precede the DDL's Sync and catalog publication. Release
+// the slot so publication can retire it, and remain cancellable until then.
+fn await_retirement(
+    db: &v2::V2Db,
+    id: u64,
+    incarnation: u128,
+    result: i64,
+) -> Result<i64, CoreError> {
+    loop {
+        crate::cancellation::check()?;
+        if !db.catalog().current_local_view()?.sequences.get(&id)
+            .is_some_and(|current| current.incarnation == incarnation)
+        {
+            return Ok(result);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 

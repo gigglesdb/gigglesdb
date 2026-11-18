@@ -828,6 +828,54 @@ fn nextval_waiting_on_ack_survives_concurrent_restart() {
 
 #[cfg(feature = "engine-rocksdb")]
 #[test]
+fn nextval_waiting_on_rejected_refill_survives_concurrent_restart() {
+    use std::{sync::mpsc, time::{Duration, Instant}};
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE SEQUENCE rejected_refill");
+    assert_eq!(scalar(&mut s, "SELECT nextval('rejected_refill')"), 1);
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
+        unreachable!()
+    };
+    db.sequencer.gate_counter_writes(true);
+    for expected in 2..=33 {
+        assert_eq!(scalar(&mut s, "SELECT nextval('rejected_refill')"), expected);
+    }
+    let admin = f.admin.as_ref().unwrap().clone();
+    let (tx, done) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        tx.send(admin.sql_session().execute_at(
+            "SELECT nextval('rejected_refill')", &[], None, &clock(),
+        )).unwrap();
+    });
+    let slot = db.sql_counters.lock().unwrap().values().next().unwrap().clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let guard = slot.counter.lock().unwrap();
+        if guard.waiting_returns == 1 && guard.receiving { break; }
+        drop(guard);
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    // All refills are still unsubmitted. RESTART is accepted and committed first;
+    // releasing the submissions makes real counter validation return SequenceGone.
+    run(&mut s, "BEGIN");
+    run(&mut s, "ALTER SEQUENCE rejected_refill RESTART WITH 1000");
+    run(&mut s, "COMMIT");
+    db.sequencer.gate_counter_writes(false);
+    let outcome = done.recv_timeout(Duration::from_secs(10)).unwrap();
+    waiter.join().unwrap();
+    assert_eq!(outcome.unwrap().rows[0].values, vec![Value::Int(34)]);
+    for expected in 1000..1010 {
+        assert_eq!(scalar(&mut s, "SELECT nextval('rejected_refill')"), expected);
+    }
+    let guard = slot.counter.lock().unwrap();
+    assert_eq!(guard.waiting_returns, 0);
+    assert!(!guard.receiving);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
 fn stale_image_nextval_does_not_clobber_restarted_slot() {
     let f = Fixture::new(Engine::V2);
     let mut s = f.session();

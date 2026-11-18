@@ -312,6 +312,8 @@ struct Shared {
     #[cfg(test)]
     counter_gate: Mutex<HeldCounterReplies>,
     #[cfg(test)]
+    counter_writes: Mutex<Option<Vec<Message>>>,
+    #[cfg(test)]
     max_group: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     max_mixed_group: std::sync::atomic::AtomicUsize,
@@ -461,6 +463,18 @@ impl Sequencer {
         self.shared.counter_gate.lock().unwrap().as_ref().map_or(0, Vec::len)
     }
 
+    /// Hold submissions so a DDL predecessor can retire their incarnation.
+    #[cfg(test)]
+    pub(crate) fn gate_counter_writes(&self, armed: bool) {
+        let mut gate = self.shared.counter_writes.lock().unwrap();
+        if armed {
+            assert!(gate.is_none());
+            *gate = Some(Vec::new());
+        } else if let Some(writes) = gate.take() {
+            for write in writes { self.sender.send(write).unwrap(); }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn max_group_size(&self) -> usize {
         self.shared.max_group.load(std::sync::atomic::Ordering::Relaxed)
@@ -510,6 +524,8 @@ impl Sequencer {
         let shared = Arc::new(Shared {
             #[cfg(test)]
             counter_gate: Mutex::new(None),
+            #[cfg(test)]
+            counter_writes: Mutex::new(None),
             #[cfg(test)]
             max_group: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -657,7 +673,13 @@ impl Sequencer {
         if !valid_counter_key(&key) { return Err(TxnError::Misuse); }
         if self.kv.is_fenced() { return Err(TxnError::Fenced); }
         let (reply, receive) = mpsc::channel();
-        self.sender.send(Message::Counter { key, value, features_or, reply })
+        let message = Message::Counter { key, value, features_or, reply };
+        #[cfg(test)]
+        if let Some(writes) = self.shared.counter_writes.lock().unwrap().as_mut() {
+            writes.push(message);
+            return Ok(CounterAck(receive));
+        }
+        self.sender.send(message)
             .map_err(|_| TxnError::Fenced)?;
         Ok(CounterAck(receive))
     }
