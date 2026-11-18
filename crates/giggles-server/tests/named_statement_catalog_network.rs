@@ -45,7 +45,7 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
     .unwrap();
     let mut clients = Vec::new();
     let mut tasks = Vec::new();
-    for role in ["owner", if label == "e" { "r" } else { "owner" }] {
+    for role in ["owner", if matches!(label, "e" | "h") { "r" } else { "owner" }] {
         let (client, connection) = tokio_postgres::Config::new()
             .host("127.0.0.1")
             .port(pg.address.port())
@@ -60,8 +60,13 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
     for sql in setup.split(';').filter(|sql| !sql.trim().is_empty()) {
         clients[0].batch_execute(sql).await.unwrap();
     }
+    if matches!(label, "g" | "i") {
+        clients[1].batch_execute("SET search_path = a,b").await.unwrap();
+    }
     let statement = clients[1].prepare(sql).await.unwrap();
-    clients[0].batch_execute(change).await.unwrap();
+    for sql in change.split(';').filter(|sql| !sql.trim().is_empty()) {
+        clients[0].batch_execute(sql).await.unwrap();
+    }
     let value = 7i32;
     let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
         if label == "f" { &[&value] } else { &[] };
@@ -161,6 +166,42 @@ async fn insert_drop_column() {
         "INSERT INTO t(a) VALUES($1)",
         "ALTER TABLE t DROP COLUMN a",
         Some("42703"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn search_path_rebind_after_drop() {
+    case(
+        "g",
+        "CREATE SCHEMA a; CREATE SCHEMA b; CREATE TABLE a.t(x int); CREATE TABLE b.t(x int); INSERT INTO a.t VALUES(1); INSERT INTO b.t VALUES(7)",
+        "SELECT x AS a FROM t",
+        "DROP TABLE a.t",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn revoked_existing_dependency_precedes_missing_relation() {
+    case(
+        "h",
+        "CREATE TABLE t(a int); CREATE TABLE u(a int); GRANT SELECT ON t TO r; GRANT SELECT ON u TO r",
+        "SELECT t.a FROM t CROSS JOIN u",
+        "REVOKE SELECT ON t FROM r; DROP TABLE u",
+        Some("42501"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn search_path_rebind_preserves_result_type() {
+    case(
+        "i",
+        "CREATE SCHEMA a; CREATE SCHEMA b; CREATE TABLE a.t(x int); CREATE TABLE b.t(x text)",
+        "SELECT x AS a FROM t",
+        "DROP TABLE a.t",
+        Some("0A000"),
     )
     .await;
 }

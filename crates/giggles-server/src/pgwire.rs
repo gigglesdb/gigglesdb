@@ -1596,23 +1596,51 @@ impl State {
         if let Plan::Sql(plan) = &old.p
             && session.sql.prepared_is_current(plan)
         {
-            // A previously bound dependency that disappeared must retain Execute's
-            // missing-relation error. Parsing its unqualified name again would
-            // replace it with an unresolvable authority key and report 42501.
-            // Existing relations still go through re-prepare's authorization before
-            // classification, so REVOKE continues to report 42501.
-            for table in plan.read_tables().into_iter()
-                .chain(plan.write_tables().into_iter().map(|(table, _)| table))
-            {
-                if !core(session.sql.relation_exists(&table))? {
-                    session.sql.abort();
-                    return Err("42P01");
+            // Resolve the original SQL names again: a dropped search-path entry
+            // can expose another relation instead of making the dependency missing.
+            let bound = core(session.sql.bind_relation_context(plan))?;
+            let mut missing = false;
+            let mut requirements = Vec::new();
+            for table in core(bound.authorization_tables().map_err(CoreError::Sql))? {
+                if core(session.sql.relation_exists(&table))? {
+                    requirements.push((table, giggles_core::roles::TablePrivilege::Select));
+                } else {
+                    missing = true;
                 }
+            }
+            if let Some(table) = bound.authorization_update_table()
+                && core(session.sql.relation_exists(table))?
+            {
+                requirements.push((table.to_owned(), giggles_core::roles::TablePrivilege::Update));
+            }
+            for (table, command) in bound.write_tables() {
+                if !core(session.sql.relation_exists(&table))? {
+                    missing = true;
+                    continue;
+                }
+                let privilege = match command {
+                    "INSERT" => giggles_core::roles::TablePrivilege::Insert,
+                    "UPDATE" => giggles_core::roles::TablePrivilege::Update,
+                    "DELETE" => giggles_core::roles::TablePrivilege::Delete,
+                    _ => continue,
+                };
+                requirements.push((table, privilege));
+            }
+            if missing {
+                // Preserve Execute's missing-relation error only after checking
+                // authority on every dependency that still resolves (E939).
+                core(session.authorize_table_requirements(&requirements))?;
+                return Err("42P01");
             }
         }
         let new = self.prepare_statement(&old.sql, old.declared_oids.clone(), session, false)?;
         if old.parameter_oids != new.parameter_oids
-            || old.d.columns != new.d.columns
+            || old.d.columns.len() != new.d.columns.len()
+            || old.d.columns.iter().zip(&new.d.columns).any(|(old, new)| {
+                // Rebinding can change storage identities without changing the
+                // result shape promised to the client.
+                old.name != new.name || old.data_type != new.data_type
+            })
             || old.d.type_oids != new.d.type_oids
             || old.d.typmods != new.d.typmods
         {
