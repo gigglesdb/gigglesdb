@@ -36,9 +36,8 @@ const T_V: &str = "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VAL
 const BEGIN_A: Step = ('A', "BEGIN ISOLATION LEVEL @LEVEL@", "BEGIN");
 const BEGIN_B: Step = ('B', "BEGIN ISOLATION LEVEL @LEVEL@", "BEGIN");
 const P_C: &str = "CREATE TABLE p (id INT PRIMARY KEY); CREATE TABLE c (id INT PRIMARY KEY, p INT REFERENCES p (id)); INSERT INTO p VALUES (1), (2)";
-/// PostgreSQL's final query is `SELECT 'p', id FROM p UNION ALL SELECT 'c', id FROM c ORDER BY
-/// 1, 2`; a gateway rejects UNION ALL (finding, `union_all_through_a_gateway`), so the same rows
-/// come from two queries here.
+/// The isolation cases concatenate two queries; `union_all_through_a_gateway` separately
+/// checks PostgreSQL's UNION ALL final query.
 const P_C_FIN: &str = "SELECT 'c', id FROM c ORDER BY 2; SELECT 'p', id FROM p ORDER BY 2";
 
 const LOST_UPDATE: Case = Case {
@@ -374,6 +373,7 @@ fn render_rows(result: &SqlResult) -> String {
         Value::Bool(b) => String::from(if *b { "t" } else { "f" }),
         Value::Int(n) => n.to_string(),
         Value::Text(s) => s.clone(),
+        Value::Numeric(n) => n.to_string(),
         other => format!("{other:?}"),
     };
     let rows: Vec<String> = result
@@ -596,7 +596,6 @@ matrix! {
 
 /// PostgreSQL's final query of the foreign-key cases, through a gateway.
 #[test]
-#[ignore = "GD-0075 R5-74 finding: a cluster gateway rejects UNION ALL (0A000)"]
 fn union_all_through_a_gateway() {
     let cluster = LocalCluster::new(&splits());
     let gateway = gateway(&cluster, 1);
@@ -608,4 +607,148 @@ fn union_all_through_a_gateway() {
     session.rows("INSERT INTO c VALUES (1, 1)");
     let union = "SELECT 'p', id FROM p UNION ALL SELECT 'c', id FROM c ORDER BY 1, 2";
     assert_eq!(session.rows(union), "c|1,p|1,p|2");
+}
+
+/// PG18.6 oracle: r5/hd/hd-3/pg18-union.out. Both tables occupy distinct row ranges;
+/// setup and reads also use different gateways to exercise catalog publication and routing.
+#[test]
+fn union_all_gateway_parity() {
+    use crate::relational::DataType as T;
+    use crate::storage::Engine;
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).unwrap();
+    let dir =
+        Dir(std::env::temp_dir().join(format!("union-parity-{:032x}", u128::from_be_bytes(nonce))));
+    let single = Admin::create_engine(&dir.0, Limits::default(), Engine::V2).unwrap();
+    let cluster = LocalCluster::new(&splits());
+    let gateways: Vec<_> = (1..=3).map(|node| gateway(&cluster, node)).collect();
+    for sql in [
+        "create table p(id int primary key, v text)",
+        "create table c(id bigint primary key, n int)",
+        "insert into p values (1,'a'),(2,'b')",
+        "insert into c values (2,20),(3,30)",
+    ] {
+        for admin in [&single, &gateways[0].admin] {
+            admin
+                .sql_session()
+                .execute_at(sql, &[], None, &clock())
+                .unwrap();
+        }
+    }
+    let Backend::V2(db) = &gateways[0].admin.inner.backend else {
+        unreachable!();
+    };
+    let parts = db
+        .catalog()
+        .parts(&mut db.begin(crate::storage::engine::txn::Isolation::ReadCommitted))
+        .unwrap();
+    assert_ne!(
+        cluster.range_of(RangeSpace::Rows, &parts.tables["p"].id.to_be_bytes()),
+        cluster.range_of(RangeSpace::Rows, &parts.tables["c"].id.to_be_bytes())
+    );
+    type UnionCase = (&'static str, &'static str, &'static [(&'static str, T)]);
+    let cases: &[UnionCase] = &[
+        (
+            "select id from p union all select id from c",
+            "1,2,2,3",
+            &[("id", T::BigInt)],
+        ),
+        (
+            "select id, v from p union all select id, n::text from c order by id",
+            "1|a,2|b,2|20,3|30",
+            &[("id", T::BigInt), ("v", T::Text)],
+        ),
+        (
+            "select id from p union all select id from c order by id desc limit 2",
+            "3,2",
+            &[("id", T::BigInt)],
+        ),
+        (
+            "select id from p union all select id from c order by 1 offset 1",
+            "2,2,3",
+            &[("id", T::BigInt)],
+        ),
+        (
+            "select 'x' as k, id from p union all select 'y', id from c order by k, id",
+            "x|1,x|2,y|2,y|3",
+            &[("k", T::Text), ("id", T::BigInt)],
+        ),
+        (
+            "select id from p where id > 1 union all select id from c where n > 25",
+            "2,3",
+            &[("id", T::BigInt)],
+        ),
+        (
+            "(select id from p order by id desc limit 1) union all (select id from c order by id limit 1)",
+            "2,2",
+            &[("id", T::BigInt)],
+        ),
+        (
+            "select id from p union all select id from c union all select 99",
+            "1,2,2,3,99",
+            &[("id", T::BigInt)],
+        ),
+        (
+            "select null union all select 1",
+            ",1",
+            &[("?column?", T::Integer)],
+        ),
+        (
+            "select 1.5 union all select 2",
+            "1.5,2",
+            &[("?column?", T::Numeric)],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (node, admin) in std::iter::once(&single)
+        .chain(gateways.iter().map(|g| &g.admin))
+        .enumerate()
+    {
+        let mut session = admin.sql_session();
+        for &(sql, rows, columns) in cases {
+            let result = session.execute_at(sql, &[], None, &clock());
+            let description = session
+                .prepare(sql)
+                .and_then(|prepared| session.describe(&prepared));
+            match (result, description) {
+                (Ok(result), Ok(description)) => {
+                    let actual: Vec<_> = description
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.as_str(), c.data_type.clone()))
+                        .collect();
+                    if render_rows(&result) != rows || actual != columns {
+                        failures.push(format!(
+                            "node {node}, {sql}: rows {:?}, columns {actual:?}",
+                            render_rows(&result)
+                        ));
+                    }
+                }
+                other => failures.push(format!("node {node}, {sql}: {other:?}")),
+            }
+        }
+        for (sql, state) in [
+            ("select id from p union all select v from p", "42804"),
+            ("select id, v from p union all select id from c", "42601"),
+            (
+                "select id from p union all select id from c order by v",
+                "42703",
+            ),
+        ] {
+            let error = session.execute_at(sql, &[], None, &clock()).unwrap_err();
+            if crate::sqlstate(&error) != state {
+                failures.push(format!(
+                    "node {node}, {sql}: expected {state}, got {error:?} ({})",
+                    crate::sqlstate(&error)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

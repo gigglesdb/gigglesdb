@@ -41,12 +41,12 @@ const T_V: &str = "CREATE TABLE t (id int PRIMARY KEY, v int); INSERT INTO t VAL
 const BEGIN_A: Step = ('A', "BEGIN ISOLATION LEVEL @LEVEL@", "BEGIN");
 const BEGIN_B: Step = ('B', "BEGIN ISOLATION LEVEL @LEVEL@", "BEGIN");
 const P_C: &str = "CREATE TABLE p (id INT PRIMARY KEY); CREATE TABLE c (id INT PRIMARY KEY, p INT REFERENCES p (id)); INSERT INTO p VALUES (1), (2);";
-/// PostgreSQL's final query is `P_C_UNION`; a gateway rejects UNION ALL (finding,
-/// `foreign_key_findings`), so the same rows come from two queries here.
+/// The isolation cases concatenate two queries; `foreign_key_findings` separately checks
+/// PostgreSQL's UNION ALL final query, `P_C_UNION`.
 const P_C_FIN: &str = "SELECT 'c', id FROM c ORDER BY 2; SELECT 'p', id FROM p ORDER BY 2";
 const P_C_UNION: &str = "SELECT 'p', id FROM p UNION ALL SELECT 'c', id FROM c ORDER BY 1, 2";
-/// Findings (GD-0075 R5-74): concurrent parent DELETE and child INSERT both commit at READ
-/// COMMITTED and REPEATABLE READ, leaving an orphan child. Run by `foreign_key_findings`.
+/// Former findings (GD-0075 R5-74): concurrent parent DELETE and child INSERT left an orphan
+/// child at READ COMMITTED and REPEATABLE READ. Regressions run by `foreign_key_findings`.
 const FINDINGS: [(&str, usize); 4] = [
     ("parent_delete_then_child_insert", 0),
     ("parent_delete_then_child_insert", 1),
@@ -635,10 +635,9 @@ async fn anomaly_matrix_through_three_gateways() {
     );
 }
 
-/// The findings, asserting PostgreSQL's results: the foreign-key cases at READ COMMITTED and
+/// Regressions asserting PostgreSQL's results: the foreign-key cases at READ COMMITTED and
 /// REPEATABLE READ, and PostgreSQL's UNION ALL final query.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "GD-0075 R5-74 findings: concurrent parent DELETE and child INSERT both commit (orphan child); a gateway rejects UNION ALL (0A000)"]
 async fn foreign_key_findings() {
     let procs = ClusterProcs::new(3).await;
     let client = procs.client(0).await;
