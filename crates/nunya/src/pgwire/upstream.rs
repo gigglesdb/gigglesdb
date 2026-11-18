@@ -389,7 +389,18 @@ impl Upstream {
             }
             Backend::BackendKeyData { pid, secret } => self.key = (*pid, secret.clone()),
             Backend::ReadyForQuery(status) => self.status = *status,
-            Backend::ErrorResponse(_) => return Err(bad()),
+            Backend::ErrorResponse(fields) => {
+                // Prefer PostgreSQL's non-localized severity. Terminating errors
+                // leave an in-flight write uncertain, just like transport loss.
+                let severity = fields.iter().find(|(k, _)| *k == b'V')
+                    .or_else(|| fields.iter().find(|(k, _)| *k == b'S'))
+                    .map(|(_, value)| value.as_str()).unwrap_or("ERROR");
+                if matches!(severity, "FATAL" | "PANIC") {
+                    return Err(bad());
+                }
+                // Ordinary statement errors pass through; connect's startup
+                // loops still reject them before exposing the connection.
+            }
             _ => {}
         }
         Ok(msg)

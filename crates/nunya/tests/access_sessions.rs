@@ -3260,6 +3260,76 @@ async fn live_pg_ny012_commit_outcome_unknown_no_replay() -> ServeResult<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires NUNYA_TEST_PG and NUNYA_TEST_PG_ADMIN pointing at harness database"]
+async fn live_pg_upstream_sql_errors_pass_through() -> ServeResult<()> {
+    fn check(checks: &mut LiveChecks, name: &str, ok: bool) {
+        if ok { checks.pass += 1; } else { checks.fail += 1; }
+        eprintln!("CHECK {name} {}", if ok { "PASS" } else { "FAIL" });
+    }
+    fn sql_error(result: &Result<(), tokio_postgres::Error>, code: &str) -> bool {
+        result.as_ref().err().and_then(|e| e.as_db_error()).is_some_and(|e|
+            e.code().code() == code && !e.message().contains("555-0100")
+                && !e.detail().unwrap_or_default().contains("555-0100"))
+    }
+    let admin_url = std::env::var("NUNYA_TEST_PG_ADMIN")?;
+    let (admin, conn) = tokio_postgres::connect(&admin_url, NoTls).await?;
+    let _admin_driver = Driver(tokio::spawn(async move { let _ = conn.await; }));
+    let table = format!("live_sql_errors_{}", nunya::token::SessionId::random().to_hex());
+    let _table = TableGuard { url: admin_url, name: table.clone() };
+    admin.batch_execute(&format!(
+        "CREATE TABLE public.{table} (id text PRIMARY KEY, n int NOT NULL);
+         INSERT INTO public.{table} VALUES ('555-0100', 0), ('other', 0);
+         GRANT SELECT, INSERT, UPDATE ON public.{table} TO nunya"
+    )).await?;
+    let mut h = ServeHarness::new(&file_sink_policy(), Some(&std::env::var("NUNYA_TEST_PG")?), None, None, "")?;
+    h.start().await?;
+    let (s, secret, _) = h.acquire_session("live-sql-errors", "postgres", Mode::ReadWrite).await?;
+    let (client, _driver) = session_connect(&h, &s, &secret).await?;
+    let (second, _second_driver) = session_connect(&h, &s, &secret).await?;
+    let mut checks = LiveChecks::default();
+    let insert = format!("INSERT INTO public.{table} (id, n) VALUES ('555-0100', 0)");
+    check(&mut checks, "simple-23505-redacted", sql_error(&client.batch_execute(&insert).await, "23505"));
+    let prepared = client.prepare(&insert).await?;
+    let result = client.execute(&prepared, &[]).await.map(|_| ());
+    check(&mut checks, "extended-23505-redacted", sql_error(&result, "23505"));
+    check(&mut checks, "autocommit-reusable", client.simple_query("SELECT 1").await.is_ok());
+    client.batch_execute("BEGIN").await?;
+    check(&mut checks, "transaction-23505-redacted", sql_error(&client.batch_execute(&insert).await, "23505"));
+    check(&mut checks, "transaction-25P02", sql_error(&client.batch_execute("SELECT 1").await, "25P02"));
+    let result = client.execute(&prepared, &[]).await.map(|_| ());
+    check(&mut checks, "transaction-extended-25P02", sql_error(&result, "25P02"));
+    check(&mut checks, "transaction-rollback", client.batch_execute("ROLLBACK").await.is_ok());
+    check(&mut checks, "transaction-reusable", client.simple_query("SELECT 1").await.is_ok());
+    let mut serialization = false;
+    for _ in 0..3 {
+        for c in [&client, &second] {
+            c.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE").await?;
+            c.simple_query(&format!("SELECT id, n FROM public.{table}")).await?;
+        }
+        let first_write = client.batch_execute(&format!("UPDATE public.{table} SET n = n + 1 WHERE id = '555-0100'")).await;
+        let second_write = second.batch_execute(&format!("UPDATE public.{table} SET n = n + 1 WHERE id = 'other'")).await;
+        for (c, write) in [(&client, first_write), (&second, second_write)] {
+            let result = if write.is_ok() { c.batch_execute("COMMIT").await } else { write };
+            serialization |= sql_error(&result, "40001");
+            check(&mut checks, "serializable-outcome", result.is_ok() || sql_error(&result, "40001"));
+            check(&mut checks, "serializable-rollback", c.batch_execute("ROLLBACK").await.is_ok());
+            check(&mut checks, "serializable-reusable", c.simple_query("SELECT 1").await.is_ok());
+        }
+        if serialization { break; }
+    }
+    check(&mut checks, "real-40001-redacted", serialization);
+    // All responses have completed, so audit writes precede this read.
+    let records = std::fs::read_to_string(h.dir().join("read.log"))?
+        .lines().map(serde_json::from_str::<serde_json::Value>).collect::<Result<Vec<_>, _>>()?;
+    check(&mut checks, "no-outcome-unknown", !records.iter().any(|r|
+        r["session"].as_str() == Some(s.id.as_str())
+            && (r["event"] == "write_outcome_unknown" || r["reason"] == "upstream_lost")));
+    eprintln!("SUMMARY pass={} fail={}", checks.pass, checks.fail);
+    assert_eq!(checks.fail, 0, "live SQL error qualification failed");
+    Ok(())
+}
+
 // Record times and outcomes without retaining token contents.
 struct LiveLimitAttempt {
     start: std::time::Instant,

@@ -528,7 +528,9 @@ impl Session {
             Ok(None) => {
                 let mut out = self.refuse(sql, NyCode::StatementNotAllowed, true);
                 if !out.close {
-                    out.client[0] = Backend::ErrorResponse(redact_error(&[(b'C', "25P02".into())]));
+                    out.client[0] = Backend::ErrorResponse(redact_error(&[
+                        (b'S', "ERROR".into()), (b'C', "25P02".into()),
+                    ]));
                 }
                 out
             }
@@ -1384,6 +1386,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("session/sql_error_tests.rs");
     use super::*;
     use crate::value::ColumnType;
     use crate::{

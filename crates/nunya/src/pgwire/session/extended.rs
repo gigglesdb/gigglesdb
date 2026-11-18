@@ -87,7 +87,9 @@ impl Session {
         self.rollback_on_sync |= self.extended_execute_forwarded;
         let mut local = self.refuse(sql, code, false);
         if aborted && !local.close {
-            local.client[0] = Backend::ErrorResponse(redact_error(&[(b'C', "25P02".into())]));
+            local.client[0] = Backend::ErrorResponse(redact_error(&[
+                (b'S', "ERROR".into()), (b'C', "25P02".into()),
+            ]));
         }
         let buffered = !self.pending.is_empty();
         let mut out = self.local(local);
