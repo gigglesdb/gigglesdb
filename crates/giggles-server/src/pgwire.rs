@@ -2574,8 +2574,9 @@ async fn agent_refusal<S: AsyncWrite + Unpin>(s: &mut S) -> io::Result<()> {
     send(s, &out).await
 }
 
-/// Serves one pgwire session through a write buffer. Replies to messages the
-/// client has already pipelined behind are held back and leave in one write
+/// Serves one post-startup pgwire session through read and write buffers.
+/// Replies to messages the client has already pipelined behind are held back
+/// and leave in one write
 /// with the next flushed reply (Sync, Query, Flush, or the reply after which
 /// no client byte is waiting), as PostgreSQL does. Wire bytes are unchanged.
 pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
@@ -2585,7 +2586,12 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     authenticated_already: bool,
     extra_status: &[(&str, String)],
 ) -> io::Result<()> {
-    let mut s = tokio::io::BufWriter::with_capacity(16 * 1024, s);
+    // The frame reader reads tag, length and body separately. Without a read
+    // buffer each piece is a recv syscall (measured: 41 recvfrom per read op).
+    let mut s = tokio::io::BufWriter::with_capacity(
+        16 * 1024,
+        tokio::io::BufReader::with_capacity(16 * 1024, s),
+    );
     let served =
         serve_buffered(&mut s, session, startup, authenticated_already, extra_status).await;
     // Deliver any held reply before the connection closes.
