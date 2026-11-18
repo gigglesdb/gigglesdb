@@ -1181,6 +1181,9 @@ fn between_operator_names_match_kinds() {
                 depth: 0,
                 view_depth: 0,
                 view_body: false,
+                extract_allowed: false,
+                extracts: vec![],
+                replacements: vec![],
             };
             assert_eq!(
                 state.expression(n, &vec![], &Context::Where).is_ok(),
@@ -1515,4 +1518,297 @@ fn distinct_uses_grouping_rules_for_every_output() {
     });
     let stmt = PgLowering.lower("SELECT DISTINCT body FROM notes", &snapshot, &policy, &[]).unwrap().remove(0);
     assert_eq!(crate::ir::check::check(&stmt, &policy, &snapshot).unwrap_err().code, NyCode::MaskedExpression);
+}
+
+fn extraction_fixture(mode: crate::json::filter::JsonMode) -> (Snapshot, Policy) {
+    use crate::policy::{JsonColumnFilter, JsonPathRule, JsonPathTreatment, JsonLeafType, JsonTokenType, json_path::parse_path};
+    let (mut snapshot, mut policy) = fixture();
+    let column = ColumnRef { schema: "public".into(), table: "notes".into(), column: "body".into() };
+    snapshot.relations.iter_mut().find(|r| r.name == "notes").unwrap().columns.iter_mut().find(|c| c.name == "body").unwrap().ty = ColumnType::Jsonb;
+    policy.columns.insert(column.clone(), Treatment::Masked { placeholder: None });
+    let rules = [
+        ("$.show", JsonPathTreatment::Show { ty: JsonLeafType::String }),
+        ("$.blind", JsonPathTreatment::Blind { domain: DomainName("email".into()), ty: JsonTokenType::Text }),
+        ("$.masked", JsonPathTreatment::Masked),
+        ("$.parent.child", JsonPathTreatment::Show { ty: JsonLeafType::String }),
+        ("$.array[*].child", JsonPathTreatment::Show { ty: JsonLeafType::String }),
+    ].into_iter().map(|(path, treatment)| JsonPathRule { column: column.clone(), path: parse_path(path).unwrap(), treatment }).collect();
+    policy.json_filters.insert(column, JsonColumnFilter { rules, mode });
+    (snapshot, policy)
+}
+
+#[test]
+fn json_extraction_analyzer_matrix() {
+    use crate::json::filter::JsonMode;
+    for mode in [JsonMode::Show, JsonMode::Tokenize] {
+        let (snapshot, policy) = extraction_fixture(mode);
+        for (expr, expected) in [
+            ("body->'show'", "filter"), ("body->'blind'", "filter"),
+            ("body->'masked'", "mask"), ("body->'masked'->'child'", "mask"),
+            ("body->'show'->'inside'", "mask"), ("body->'parent'", "filter"),
+            ("body->'array'->0", "filter"), ("body->'array'->(-1)->'child'", "filter"),
+            ("body#>'{parent,child}'", "filter"), ("body#>>'{parent,child}'", "text"),
+            ("body->>'show'", "text"), ("body->>'blind'", "text"),
+            ("body->'unknown'", if mode == JsonMode::Show { "pass" } else { "mask" }),
+        ] {
+            let sql = format!("SELECT {expr} FROM notes");
+            let statements = PgLowering.lower(&sql, &snapshot, &policy, &[]).unwrap();
+            let statement = &statements[0];
+            assert!(statement.outputs[0].source.is_none());
+            let plan = crate::ir::check::check(statement, &policy, &snapshot).unwrap();
+            match expected {
+                "filter" => assert!(matches!(plan.outputs[0], OutputRewrite::JsonExtract { text: false, .. }), "{expr}"),
+                "text" => {
+                    assert!(matches!(plan.outputs[0], OutputRewrite::JsonExtract { text: true, .. }));
+                    let InputRewrite::ReplaceSpan { text, .. } = &plan.inputs[0] else { panic!("missing replacement") };
+                    assert!(text.ends_with(" AS \"?column?\""));
+                    assert!(!text.contains("->>") && !text.contains("#>>"));
+                }
+                "mask" => assert_eq!(plan.outputs[0], OutputRewrite::Mask { placeholder: None }),
+                "pass" => assert_eq!(plan.outputs[0], OutputRewrite::Pass),
+                _ => panic!("invalid expectation"),
+            }
+        }
+    }
+}
+
+#[test]
+fn json_extraction_refused_forms_and_contexts_are_data_free() {
+    use crate::json::filter::JsonMode;
+    for mode in [JsonMode::Show, JsonMode::Tokenize] {
+        let (snapshot, policy) = extraction_fixture(mode);
+        let mut sqls: Vec<String> = ["E'secret'", "U&'secret'", "$$secret$$", "'secret'::text", "$1", "NULL", "1+2", "1.2", "'secret'\n'other'"]
+            .into_iter().map(|rhs| format!("SELECT body->{rhs} FROM notes")).collect();
+        sqls.extend([
+            "SELECT body#>'{NULL}' FROM notes", "SELECT body#>'{}' FROM notes",
+            "SELECT id FROM notes WHERE body->'masked' = 'secret'",
+            "SELECT body->'show' FROM notes ORDER BY 1",
+            "SELECT body->'show' AS x FROM notes ORDER BY x",
+            "SELECT id FROM notes ORDER BY body->'show'",
+            "SELECT length(body->>'show') FROM notes",
+            "SELECT (body->'show')::text FROM notes",
+            "SELECT * FROM (SELECT body->'show' FROM notes) q",
+            "WITH q AS (SELECT body->'show' FROM notes) SELECT * FROM q",
+            "SELECT body->'show' FROM (SELECT body FROM notes) q",
+            "SELECT DISTINCT body->'show' FROM notes",
+            "SELECT body->'show' FROM notes GROUP BY 1",
+            "SELECT body->'show' FROM notes UNION ALL SELECT body->'show' FROM notes",
+            "UPDATE notes SET id = 1 RETURNING body->'show'",
+        ].into_iter().map(str::to_owned));
+        for sql in sqls {
+            let result = PgLowering.lower(&sql, &snapshot, &policy, &[]).and_then(|statements| crate::ir::check::check(&statements[0], &policy, &snapshot));
+            let error = result.expect_err(&sql);
+            assert_eq!(error.code, NyCode::MaskedExpression, "{sql}");
+            assert!(!format!("{error:?}").contains("secret"));
+        }
+    }
+}
+
+#[test]
+fn json_text_extraction_rewrites_preserve_parentheses_and_aliases() {
+    let (snapshot, policy) = extraction_fixture(crate::json::filter::JsonMode::Show);
+    for expression in ["body->>'show'", "(body->>'show')", "((body)->>'show')", "((body->'parent')->>'child')", "body#>>'{parent,child}'"] {
+        for alias in ["", " AS named"] {
+            let sql = format!("SELECT {expression}{alias} FROM notes");
+            let statements = PgLowering.lower(&sql, &snapshot, &policy, &[]).unwrap();
+            let plan = crate::ir::check::check(&statements[0], &policy, &snapshot).unwrap();
+            let replacements: Vec<_> = plan.inputs.iter().map(|input| match input {
+                InputRewrite::ReplaceSpan { span, text } => (span.clone(), text.clone()),
+                _ => panic!("unexpected input rewrite"),
+            }).collect();
+            let rewritten = crate::ir::rewrite::splice(&sql, &replacements).unwrap();
+            let parsed = pg_query::parse(&rewritten, 0).unwrap();
+            let NodeEnum::SelectStmt(select) = node(parsed.protobuf.stmts[0].stmt.as_ref().unwrap()).unwrap() else { panic!("select") };
+            let NodeEnum::ResTarget(target) = node(&select.target_list[0]).unwrap() else { panic!("target") };
+            assert_eq!(target.name, if alias.is_empty() { "?column?" } else { "named" });
+            assert!(matches!(node(target.val.as_ref().unwrap()).unwrap(), NodeEnum::TypeCast(_)));
+            assert!(!rewritten.contains("->>") && !rewritten.contains("#>>"));
+        }
+    }
+}
+
+#[test]
+fn json_extraction_through_views_is_masked_expression() {
+    for definition in ["SELECT body FROM notes", "SELECT body->'show' FROM notes"] {
+        let (mut snapshot, policy) = extraction_fixture(crate::json::filter::JsonMode::Show);
+        let column = snapshot.relations.iter().find(|r| r.name == "notes").unwrap().columns.iter().find(|c| c.name == "body").unwrap().clone();
+        snapshot.relations.push(Relation { schema: "public".into(), name: "json_view".into(), kind: RelationKind::View,
+            columns: vec![column], view_definition: Some(definition.into()), primary_key: vec![] });
+        let error = PgLowering.lower("SELECT body->'show' FROM json_view", &snapshot, &policy, &[]).unwrap_err();
+        assert_eq!(error.code, NyCode::MaskedExpression);
+    }
+}
+
+
+#[test]
+fn json_predicate_guards_and_domains() {
+    use crate::{json::filter::JsonMode, policy::{JsonPathTreatment, JsonTokenType, JsonLeafType, JsonPathRule, json_path::parse_path}};
+    for mode in [JsonMode::Show, JsonMode::Tokenize] {
+        let (mut snapshot, mut policy) = extraction_fixture(mode);
+        let column = ColumnRef { schema: "public".into(), table: "notes".into(), column: "body".into() };
+        policy.json_filters.get_mut(&column).unwrap().rules.push(JsonPathRule {
+            column: column.clone(), path: parse_path("$.recipients[*].email").unwrap(),
+            treatment: JsonPathTreatment::Blind { domain: DomainName("email".into()), ty: JsonTokenType::Text },
+        });
+        for base in [ColumnType::Json, ColumnType::Jsonb] {
+            snapshot.relations.iter_mut().find(|r| r.name == "notes").unwrap().columns.iter_mut().find(|c| c.name == "body").unwrap().ty = base.clone();
+            for ty in [JsonLeafType::String, JsonLeafType::Number, JsonLeafType::Boolean] {
+                policy.json_filters.get_mut(&column).unwrap().rules[0].treatment = JsonPathTreatment::Show { ty };
+                for predicate in ["body->>'show' = 'value'", "body->'show' IS NULL", "body->'show' IS NOT NULL", "body->'array'->0->>'child' = 'value'", "((body)->>'show') = 'value'", "((body->'parent')->>'child') IS NULL"] {
+                    let sql = format!("SELECT id FROM notes WHERE {predicate}");
+                    let statements = PgLowering.lower(&sql, &snapshot, &policy, &[]).unwrap();
+                    let plan = crate::ir::check::check(&statements[0], &policy, &snapshot).unwrap();
+                    let InputRewrite::ReplaceSpan { text, .. } = &plan.inputs[0] else { panic!("guard") };
+                    let function = if base == ColumnType::Json { "json_typeof" } else { "jsonb_typeof" };
+                    assert!(text.contains(function));
+                    assert!(text.contains("CASE WHEN") && text.contains(" END)"));
+                    let kind = if predicate.contains("array") || predicate.contains("parent") { "string" } else { match ty { JsonLeafType::String => "string", JsonLeafType::Number => "number", JsonLeafType::Boolean => "boolean" } };
+                    assert!(text.contains(&format!("= '{kind}' THEN")));
+                    let replacements = plan.inputs.iter().filter_map(|i| match i { InputRewrite::ReplaceSpan { span, text } => Some((span.clone(), text.clone())), _ => None }).collect::<Vec<_>>();
+                    pg_query::parse(&crate::ir::rewrite::splice(&sql, &replacements).unwrap(), 0).unwrap();
+                }
+            }
+            for predicate in ["body->>'blind' = $1", "body->>'blind' = 'token'", "body->>'blind' IS NULL", "body->>'blind' IS NOT NULL", "body->>'blind' = body->>'blind'"] {
+                let sql = format!("SELECT id FROM notes WHERE {predicate}");
+                let statements = PgLowering.lower(&sql, &snapshot, &policy, &[]).unwrap();
+                let plan = crate::ir::check::check(&statements[0], &policy, &snapshot).unwrap();
+                assert!(plan.inputs.iter().any(|i| matches!(i, InputRewrite::ReplaceSpan { text, .. } if text.contains("= 'string' THEN"))));
+                if predicate.contains("$1") { assert!(plan.inputs.contains(&InputRewrite::DecryptParam { index: 1, domain: DomainName("email".into()), ty: ColumnType::Text })); }
+                if predicate.contains("token") { assert!(plan.inputs.iter().any(|i| matches!(i, InputRewrite::DecryptLiteral { domain, ty: ColumnType::Text, .. } if domain.0 == "email"))); }
+            }
+            let sql = "SELECT e.id FROM notes e JOIN customers c ON e.body #>> '{recipients,0,email}' = c.email";
+            let statements = PgLowering.lower(sql, &snapshot, &policy, &[]).unwrap();
+            let plan = crate::ir::check::check(&statements[0], &policy, &snapshot).unwrap();
+            assert!(plan.inputs.iter().any(|i| matches!(i, InputRewrite::ReplaceSpan { text, .. } if text.contains("= 'array'") && text.contains("= 'string'"))));
+        }
+        for ty in [JsonTokenType::Int4, JsonTokenType::Int8, JsonTokenType::Uuid, JsonTokenType::Date, JsonTokenType::Timestamp, JsonTokenType::Timestamptz] {
+            policy.json_filters.get_mut(&column).unwrap().rules[1].treatment = JsonPathTreatment::Blind { domain: DomainName("email".into()), ty };
+            let result = PgLowering.lower("SELECT id FROM notes WHERE body->>'blind' = $1", &snapshot, &policy, &[]);
+            assert_eq!(result.unwrap_err().code, NyCode::MaskedExpression);
+        }
+    }
+}
+
+#[test]
+fn json_predicate_refusal_matrix() {
+    for mode in [crate::json::filter::JsonMode::Show, crate::json::filter::JsonMode::Tokenize] {
+        let (snapshot, policy) = extraction_fixture(mode);
+        let mut sqls: Vec<String> = [
+            "body->'masked' IS NULL", "body->'masked' IS NOT NULL", "body->'parent' IS NULL",
+            "body->'blind' = $1", "body#>'{blind}' = $1", "body->>'blind' <> $1",
+            "body->>'blind' LIKE $1", "(body->>'blind')::int = $1", "body->>'blind' IN ($1)",
+            "body->>'blind' = NULL", "body->>'blind' = id", "body->>'blind' = $1::int", "body->>'blind' = 'token'::int",
+            "body @> '{}'", "body <@ '{}'", "body ? 'show'", "body ?| ARRAY['show']", "body ?& ARRAY['show']",
+            "body @? '$.show'", "body @@ '$.show'", "body->$1 IS NULL", "body#>$1 IS NULL", "body->>$1 IS NULL", "body#>>$1 IS NULL",
+            "jsonb_path_exists(body, '$.show')", "jsonb_path_query_first(body, '$.show') IS NULL",
+            "jsonb_extract_path(body, 'show') IS NULL", "json_extract_path(body, 'show') IS NULL",
+            "jsonb_extract_path_text(body, 'show') IS NULL", "json_extract_path_text(body, 'show') IS NULL",
+            "jsonb_each(body) IS NULL", "json_each(body) IS NULL", "jsonb_each_text(body) IS NULL", "json_each_text(body) IS NULL",
+        ].into_iter().map(|p| format!("SELECT id FROM notes WHERE {p}")).collect();
+        sqls.extend([
+            "UPDATE notes SET id = 1 WHERE body->>'show' IS NULL",
+            "DELETE FROM notes WHERE body->>'show' IS NULL",
+            "INSERT INTO notes (id) SELECT id FROM notes WHERE body->>'show' IS NULL",
+            "SELECT id FROM (SELECT id, body FROM notes) q WHERE body->>'show' IS NULL",
+            "WITH q AS (SELECT id, body FROM notes) SELECT id FROM q WHERE body->>'blind' IS NULL",
+        ].into_iter().map(str::to_owned));
+        for sql in sqls {
+            let result = PgLowering.lower(&sql, &snapshot, &policy, &[]).and_then(|s| crate::ir::check::check(&s[0], &policy, &snapshot));
+            assert_eq!(result.expect_err(&sql).code, NyCode::MaskedExpression, "{sql}");
+        }
+    }
+}
+
+
+#[test]
+fn json_predicate_plain_paths_and_views() {
+    let (mut snapshot, policy) = extraction_fixture(crate::json::filter::JsonMode::Show);
+    let sql = "SELECT id FROM notes WHERE body->>'unrelated' = 'value'";
+    let statements = PgLowering.lower(sql, &snapshot, &policy, &[]).unwrap();
+    assert!(crate::ir::check::check(&statements[0], &policy, &snapshot).unwrap().inputs.is_empty());
+    let column = snapshot.relations.iter().find(|r| r.name == "notes").unwrap().columns.iter().find(|c| c.name == "body").unwrap().clone();
+    snapshot.relations.push(Relation { schema: "public".into(), name: "json_view".into(), kind: RelationKind::View,
+        columns: vec![column], view_definition: Some("SELECT body FROM notes".into()), primary_key: vec![] });
+    for predicate in ["body->>'show' = 'value'", "body->>'blind' IS NULL"] {
+        let sql = format!("SELECT 1 FROM json_view WHERE {predicate}");
+        assert_eq!(PgLowering.lower(&sql, &snapshot, &policy, &[]).unwrap_err().code, NyCode::MaskedExpression);
+    }
+}
+
+#[test]
+fn f1_numeric_path_guards_plain_projection_predicate_and_blind_projection() {
+    use crate::{json::filter::JsonMode, policy::{JsonPathRule, JsonPathTreatment, JsonTokenType, json_path::parse_path}};
+    let (snapshot, mut policy) = extraction_fixture(JsonMode::Show);
+    let column = ColumnRef { schema: "public".into(), table: "notes".into(), column: "body".into() };
+    let filter = policy.json_filters.get_mut(&column).unwrap();
+    filter.rules = vec![JsonPathRule { column: column.clone(), path: parse_path("$.items[*].card").unwrap(), treatment: JsonPathTreatment::Masked },
+        JsonPathRule { column, path: parse_path("$.recipients[*].email").unwrap(), treatment: JsonPathTreatment::Blind { domain: DomainName("email".into()), ty: JsonTokenType::Text } }];
+    for sql in ["SELECT body #>> '{items,0,cvv}' FROM notes", "SELECT id FROM notes WHERE body #>> '{items,0,cvv}' = '123'", "SELECT body #>> '{recipients,0,email}' FROM notes"] {
+        let stmt = PgLowering.lower(sql, &snapshot, &policy, &[]).unwrap();
+        let plan = crate::ir::check::check(&stmt[0], &policy, &snapshot).unwrap();
+        let inputs = plan.inputs.iter().filter_map(|i| if let InputRewrite::ReplaceSpan { span, text } = i { Some((span.clone(), text.clone())) } else { None }).collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].1.contains("= 'array'"));
+        let rewritten = crate::ir::rewrite::splice(sql, &inputs).unwrap();
+        pg_query::parse(&rewritten, 0).unwrap();
+        if sql.contains("recipients") { assert!(inputs[0].1.contains("::text")); assert!(matches!(plan.outputs[0], OutputRewrite::JsonExtract { .. })); }
+        else { assert!(matches!(plan.outputs[0], OutputRewrite::Pass)); }
+    }
+}
+
+#[test]
+fn r1_pg_c_whitespace_paths_refuse_projection_and_predicate() {
+    use crate::{json::filter::JsonMode, policy::{JsonPathTreatment, json_path::parse_path}};
+    let (snapshot, mut policy) = extraction_fixture(JsonMode::Show);
+    let filter = policy.json_filters.values_mut().next().unwrap();
+    filter.rules.truncate(1);
+    filter.rules[0].path = parse_path("$.a.named.b").unwrap();
+    filter.rules[0].treatment = JsonPathTreatment::Masked;
+    for whitespace in [' ', '\t', '\n', '\x0b', '\x0c', '\r'] {
+        for op in ["#>", "#>>"] {
+            let expression = format!("body {op} '{{a,\"{whitespace}0\"}}'");
+            for sql in [format!("SELECT {expression} FROM notes"), format!("SELECT id FROM notes WHERE {expression} = 'x'")] {
+                let error = PgLowering.lower(&sql, &snapshot, &policy, &[]).unwrap_err();
+                assert_eq!(error.code, NyCode::MaskedExpression);
+            }
+        }
+    }
+}
+
+#[test]
+fn r2_pg_guarded_projection_preserves_default_and_explicit_names() {
+    use crate::{json::filter::JsonMode, policy::{JsonPathTreatment, JsonTokenType, json_path::parse_path}};
+    let (snapshot, mut policy) = extraction_fixture(JsonMode::Show);
+    let filter = policy.json_filters.values_mut().next().unwrap();
+    filter.rules.truncate(1);
+    filter.rules[0].path = parse_path("$.items[*].card").unwrap();
+    filter.rules[0].treatment = JsonPathTreatment::Masked;
+    // Cover guarded Plain, Masked, and filtered text/JSON targets.
+    for path in ["{items,0,cvv}", "{items,0,card}"] {
+        for op in ["#>", "#>>"] {
+            for alias in ["", " AS named"] {
+                let sql = format!("SELECT body {op} '{path}'{alias} FROM notes");
+                let statements = PgLowering.lower(&sql, &snapshot, &policy, &[]).unwrap();
+                let plan = crate::ir::check::check(&statements[0], &policy, &snapshot).unwrap();
+                let replacements = plan.inputs.iter().filter_map(|i| match i {
+                    InputRewrite::ReplaceSpan { span, text } => Some((span.clone(), text.clone())),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                assert_eq!(replacements.len(), 1);
+                assert!(replacements[0].1.contains("CASE WHEN"));
+                assert_eq!(replacements[0].1.ends_with(" AS \"?column?\""), alias.is_empty());
+                let rewritten = crate::ir::rewrite::splice(&sql, &replacements).unwrap();
+                let parsed = pg_query::parse(&rewritten, 0).unwrap();
+                let NodeEnum::SelectStmt(select) = node(parsed.protobuf.stmts[0].stmt.as_ref().unwrap()).unwrap() else { panic!("select") };
+                let NodeEnum::ResTarget(target) = node(&select.target_list[0]).unwrap() else { panic!("target") };
+                assert_eq!(target.name, if alias.is_empty() { "?column?" } else { "named" });
+            }
+        }
+    }
+    let filter = policy.json_filters.values_mut().next().unwrap();
+    filter.rules[0].treatment = JsonPathTreatment::Blind { domain: DomainName("email".into()), ty: JsonTokenType::Text };
+    let sql = "SELECT body #>> '{items,0,card}' FROM notes";
+    let statements = PgLowering.lower(sql, &snapshot, &policy, &[]).unwrap();
+    let plan = crate::ir::check::check(&statements[0], &policy, &snapshot).unwrap();
+    assert!(matches!(&plan.inputs[0], InputRewrite::ReplaceSpan { text, .. } if text.ends_with(" AS \"?column?\"")));
 }

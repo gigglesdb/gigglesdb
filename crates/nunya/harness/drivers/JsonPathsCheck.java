@@ -45,6 +45,43 @@ class JsonPathsCheck {
             s.setString(1,doc); s.setString(2,doc); s.executeUpdate();
         }
     }
+    static List<String> query(Connection c, String sql, String param) throws Exception {
+        try(var s=c.prepareStatement(sql)) {
+            if(param!=null) s.setString(1,param);
+            try(var r=s.executeQuery()) { var out=new ArrayList<String>(); while(r.next()) out.add(r.getString(1)); return out; }
+        }
+    }
+    static void operators(Connection c, Connection admin, String label) throws Exception {
+        for(String col : new String[]{"doc_json","doc_jsonb"}) {
+            String whole=query(c,"SELECT "+col+" FROM events",null).get(0).replaceAll("\\s+", "");
+            step(label+" masked", () -> query(c,"SELECT "+col+"->'processor_response' FROM events",null).get(0)==null);
+            step(label+" parent", () -> tokens(query(c,"SELECT "+col+"->'recipients' FROM events",null).get(0).replaceAll("\\s+", "")).equals(tokens(whole)));
+            String path=col+" #>> '{recipients,0,email}'";
+            String token=query(c,"SELECT "+path+" FROM events",null).get(0);
+            step(label+" token", () -> tokens(whole).get(0).equals(token));
+            step(label+" show-equality", () -> query(c,"SELECT id FROM events WHERE "+col+"->>'status'='sent'",null).size()==1);
+            step(label+" show-null", () -> query(c,"SELECT id FROM events WHERE "+col+"->>'status' IS NULL",null).isEmpty());
+            step(label+" token-param", () -> query(c,"SELECT id FROM events WHERE "+path+" = ?",token).size()==1);
+            step(label+" token-literal", () -> query(c,"SELECT id FROM events WHERE "+path+" = '"+token+"'",null).size()==1);
+            step(label+" join", () -> query(c,"SELECT e.id FROM events e JOIN customers c ON e."+path+" = c.email",null).size()==1);
+            for(String sql : new String[]{"SELECT id FROM events WHERE "+col+"->>'processor_response' IS NULL", "SELECT id FROM events WHERE "+col+"->>'processor_response'='x'", "SELECT "+col+"->id FROM events", "SELECT doc_jsonb @> '{}' FROM events", "SELECT doc_jsonb ? 'status' FROM events", "SELECT jsonb_path_query(doc_jsonb,'$.status') FROM events", "UPDATE events SET id=id WHERE "+col+"->>'status'='sent'"}) {
+                step(label+" refusal-NY005", () -> {try(var st=c.createStatement()) {st.execute(sql); return false;} catch(SQLException e) {return "NY005".equals(e.getSQLState());}});
+            }
+        }
+        update(admin,CHANGED);
+        step(label+" shape-projection", () -> query(c,"SELECT doc_jsonb->>'status' FROM events",null).get(0)==null);
+        step(label+" shape-predicate", () -> query(c,"SELECT id FROM events WHERE doc_jsonb->>'status'=?","{\"unapproved\": \"fixture-hidden\"}").isEmpty());
+        update(admin,ORIGINAL);
+    }
+    static void showOperators(Connection c, String label) throws Exception {
+        for(String col : new String[]{"doc_json","doc_jsonb"}) {
+            step(label+" show-parent", () -> query(c,"SELECT "+col+"->'payment' FROM events",null).get(0).replaceAll("\\s+", "").equals("{\"amount\":42}"));
+            step(label+" show-new-key", () -> "fixture-top".equals(query(c,"SELECT "+col+"->>'new_top' FROM events",null).get(0)));
+            step(label+" show-masked", () -> query(c,"SELECT "+col+" #> '{payment,card}' FROM events",null).get(0)==null);
+            step(label+" index-container", () -> query(c,"SELECT "+col+" #> '{items,0,card}' FROM events",null).get(0)==null);
+            step(label+" show-refusal", () -> {try(var st=c.createStatement()) {st.execute("SELECT id FROM events WHERE "+col+" #> '{payment,card}' IS NULL"); return false;} catch(SQLException e) {return "NY005".equals(e.getSQLState());}});
+        }
+    }
     public static void main(String[] args) {
         Logger.getLogger("org.postgresql").setLevel(Level.OFF);
         var props = new Properties(); props.setProperty("user",System.getenv("PGUSER")); props.setProperty("password",System.getenv("PGPASSWORD"));
@@ -54,9 +91,13 @@ class JsonPathsCheck {
             for (boolean binary : new boolean[]{false,true}) {
                 props.setProperty("binaryTransfer", Boolean.toString(binary));
                 if(binary) props.setProperty("binaryTransferEnable","json,jsonb"); else props.remove("binaryTransferEnable");
-                String label = "pgjdbc-"+(binary ? "binary" : "text"); update(admin, ORIGINAL);
+                String label = "pgjdbc-"+(binary ? "binary" : "text");
+                boolean show="show".equals(System.getenv("NUNYA_TEST_JSON_OPERATORS"));
+                update(admin, show ? "{\"payment\":{\"card\":\"fixture-hidden\",\"amount\":42},\"new_top\":\"fixture-top\",\"items\":{\"0\":{\"card\":\"fixture-hidden\"}}}" : ORIGINAL);
                 List<String> initial;
                 try (Connection c = DriverManager.getConnection(url,props)) {
+                    if(show) { showOperators(c,label); continue; }
+                    if("1".equals(System.getenv("NUNYA_TEST_JSON_OPERATORS"))) { operators(c,admin,label); continue; }
                     initial = read(c);
                     step(label+" token-and-columns", () -> initial.get(0).equals(initial.get(1)) && safe(initial.get(0)) && initial.get(0).contains("\"status\":\"sent\"") && tokens(initial.get(0)).size()==2);
                     update(admin, CHANGED); var changed = read(c);

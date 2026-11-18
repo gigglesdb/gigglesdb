@@ -102,6 +102,15 @@ pub fn apply_collect(
     Ok(output)
 }
 
+/// Suppress empty object roots extracted outside an array in Tokenize mode.
+pub fn extraction_output(output: JsonOutput, mode: JsonMode, keep_empty: bool, format: JsonFormat) -> Result<JsonOutput, Refusal> {
+    if mode == JsonMode::Tokenize && !keep_empty
+        && let JsonOutput::Document(bytes) = &output
+        && matches!(codec::decode(format, bytes, &JsonLimits::default())?, JsonValue::Object(ref members) if members.is_empty())
+    { return Ok(JsonOutput::SqlNull); }
+    Ok(output)
+}
+
 struct Filter<'a> {
     mode: JsonMode,
     keys: &'a ScopeKeys,
@@ -346,6 +355,25 @@ mod tests {
     }
     fn doc(text: &str) -> JsonOutput {
         JsonOutput::Document(text.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn root_leaf_checks_shape_and_matches_document_tokens() {
+        for mode in [JsonMode::Show, JsonMode::Tokenize] {
+            let mut root = show("$.a");
+            root.path.clear();
+            assert_eq!(run(std::slice::from_ref(&root), mode, "123"), JsonOutput::SqlNull);
+            assert_eq!(run(std::slice::from_ref(&root), mode, "{}"), JsonOutput::SqlNull);
+            assert_eq!(run(&[root], mode, "\"ok\""), doc("\"ok\""));
+            let leaf = blind("$.a", JsonTokenType::Text);
+            let whole = run(std::slice::from_ref(&leaf), mode, r#"{"a":"secret"}"#);
+            let JsonOutput::Document(whole) = whole else { panic!("expected document") };
+            let whole: serde_json::Value = serde_json::from_slice(&whole).unwrap();
+            let mut root = leaf;
+            root.path.clear();
+            let JsonOutput::Document(single) = run(&[root], mode, r#""secret""#) else { panic!("expected token") };
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&single).unwrap(), whole["a"]);
+        }
     }
 
     #[test]
@@ -704,5 +732,31 @@ mod tests {
                 JsonOutput::Document(codec::encode(format, &tree).unwrap())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod extraction_regression_tests {
+    use super::*;
+    #[test]
+    fn f2_empty_extracted_parent_is_null_unless_array_element() {
+        let format = JsonFormat::PgJsonText;
+        let column = crate::schema::ColumnRef { schema: "".into(), table: "docs".into(), column: "doc".into() };
+        let rules = vec![JsonPathRule { column, path: crate::policy::json_path::parse_path("$.a.b").unwrap(), treatment: JsonPathTreatment::Show { ty: JsonLeafType::String } }];
+        for input in [br#"{"a":{"x":"s"}}"#.as_slice(), b"{}"] {
+            let whole = apply(&rules, JsonMode::Tokenize, &ScopeKeys::new([7;32]), &crate::token::StandardCodec, &BTreeMap::new(), &JsonLimits::default(), JsonInput { format, bytes: input }).unwrap();
+            assert_eq!(whole, JsonOutput::Document(b"{}".to_vec()));
+            let tree = codec::decode(format, input, &JsonLimits::default()).unwrap();
+            let JsonValue::Object(ref members) = tree else { panic!("object"); };
+            let extracted = match members.iter().find(|(key, _)| key == "a") {
+                None => JsonOutput::SqlNull,
+                Some((_, value)) => {
+                    let mut rebased = rules.clone(); rebased[0].path.remove(0);
+                    apply(&rebased, JsonMode::Tokenize, &ScopeKeys::new([7;32]), &crate::token::StandardCodec, &BTreeMap::new(), &JsonLimits::default(), JsonInput { format, bytes: &codec::encode(format, value).unwrap() }).unwrap()
+                }
+            };
+            assert_eq!(extraction_output(extracted, JsonMode::Tokenize, false, format).unwrap(), JsonOutput::SqlNull);
+        }
+        assert_eq!(extraction_output(JsonOutput::Document(b"{}".to_vec()), JsonMode::Tokenize, true, format).unwrap(), JsonOutput::Document(b"{}".to_vec()));
     }
 }

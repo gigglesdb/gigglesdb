@@ -30,6 +30,7 @@ fn source(value: &ValueSource, snapshot: &Snapshot) -> Result<(), Refusal> {
         | ValueSource::Param(_)
         | ValueSource::Literal { .. }
         | ValueSource::Null
+        | ValueSource::JsonLeaf(_)
         | ValueSource::Computed(_) => {}
     }
     Ok(())
@@ -51,7 +52,7 @@ fn blind(
             domain: domain.clone(),
             ty,
         }),
-        ValueSource::Column {
+        ValueSource::JsonLeaf(other) | ValueSource::Column {
             label: Label::Blind(other),
             ..
         } => {
@@ -102,7 +103,7 @@ pub fn check(
             }
             match arg {
                 ValueSource::Param(_) | ValueSource::Literal { .. } => {}
-                ValueSource::Column { .. } | ValueSource::Null | ValueSource::Computed(_) => {
+                ValueSource::JsonLeaf(_) | ValueSource::Column { .. } | ValueSource::Null | ValueSource::Computed(_) => {
                     return Err(refusal(NyCode::NotAnalysable));
                 }
             }
@@ -112,12 +113,28 @@ pub fn check(
             plan.tokenize = Some((domain.clone(), arg.clone()));
             return Ok(plan);
         }
-        StatementKind::Select
+        StatementKind::JsonSelect { .. }
+        | StatementKind::Select
         | StatementKind::Insert
         | StatementKind::Update
         | StatementKind::Delete => {}
     }
     for usage in &stmt.uses {
+        if let UseKind::JsonLeaf { kind } = &usage.kind {
+            if !matches!(stmt.kind, StatementKind::Select | StatementKind::JsonSelect { .. }) {
+                return Err(refusal(NyCode::MaskedExpression));
+            }
+            let Label::Blind(domain) = &usage.label else { return Err(refusal(NyCode::MaskedExpression)); };
+            match (kind.as_ref(), &usage.context) {
+                (UseKind::Equality { other }, Context::Where | Context::JoinOn) => {
+                    source(other, snapshot)?;
+                    blind(other, domain, ColumnType::Text, &mut plan.inputs)?;
+                }
+                (UseKind::IsNull, Context::Where | Context::JoinOn) => {},
+                _ => return Err(refusal(NyCode::MaskedExpression)),
+            }
+            continue;
+        }
         match &usage.label {
             Label::Plain => continue,
             Label::Tainted => return Err(refusal(NyCode::BlindOperation)),
@@ -166,6 +183,7 @@ pub fn check(
                             return Err(refusal(NyCode::BlindOperation));
                         }
                     }
+                    UseKind::JsonLeaf { .. } => return Err(refusal(NyCode::MaskedExpression)),
                     UseKind::Comparison
                     | UseKind::Pattern
                     | UseKind::Order
@@ -178,6 +196,9 @@ pub fn check(
         }
     }
     for write in &stmt.writes {
+        if matches!(write.value, ValueSource::JsonLeaf(_)) {
+            return Err(refusal(NyCode::MaskedExpression));
+        }
         if policy.json_filter(&write.column).is_some() {
             return Err(refusal(NyCode::MaskedExpression));
         }
@@ -204,6 +225,7 @@ pub fn check(
                         ..
                     }
                     | ValueSource::Computed(Label::Plain) => {}
+                    ValueSource::JsonLeaf(_) => return Err(refusal(NyCode::MaskedExpression)),
                     ValueSource::Column { label, .. } | ValueSource::Computed(label) => {
                         let code = if write.label == Label::Masked {
                             NyCode::MaskedExpression
@@ -237,6 +259,7 @@ pub fn check(
                 params.insert(index, (domain, ty));
             }
             InputRewrite::DecryptLiteral { span, domain, ty } => literals.push((span, domain, ty)),
+            InputRewrite::ReplaceSpan { .. } => return Err(refusal(NyCode::NotAnalysable)),
         }
     }
     for index in params.keys() {
@@ -264,7 +287,16 @@ pub fn check(
             .into_iter()
             .map(|(span, domain, ty)| InputRewrite::DecryptLiteral { span, domain, ty }),
     );
-    for output in &stmt.outputs {
+    for (ordinal, output) in stmt.outputs.iter().enumerate() {
+        if let StatementKind::JsonSelect { outputs, .. } = &stmt.kind
+            && let Some((_, action)) = outputs.iter().find(|(i, _)| *i == ordinal)
+        {
+            if output.source.is_some() || output.label != Label::Masked {
+                return Err(refusal(NyCode::MaskedExpression));
+            }
+            plan.outputs.push(action.clone());
+            continue;
+        }
         plan.outputs.push(match &output.label {
             Label::Plain => OutputRewrite::Pass,
             Label::Tainted => return Err(refusal(NyCode::BlindOperation)),
@@ -306,6 +338,9 @@ pub fn check(
             }
         });
     }
+    if let StatementKind::JsonSelect { inputs, .. } = &stmt.kind {
+        plan.inputs.extend(inputs.clone());
+    }
     Ok(plan)
 }
 #[cfg(test)]
@@ -315,6 +350,21 @@ mod tests {
         policy::{DomainSettings, ReadLogSink},
         schema::{Column, Relation, RelationKind},
     };
+    #[test]
+    fn extracted_outputs_are_explicit_and_never_claim_column_passthrough() {
+        let (policy, snapshot) = fixture();
+        let mut statement = stmt();
+        statement.outputs.push(OutputColumn { name: "?column?".into(), label: Label::Masked, source: None, ty: Some(ColumnType::Text) });
+        let action = OutputRewrite::Mask { placeholder: None };
+        let input = InputRewrite::ReplaceSpan { span: Span { start: 0, end: 1 }, text: "NULL".into() };
+        statement.kind = StatementKind::JsonSelect { outputs: vec![(0, action.clone())], inputs: vec![input.clone()] };
+        let plan = check(&statement, &policy, &snapshot).unwrap();
+        assert_eq!(plan.outputs, vec![action]);
+        assert_eq!(plan.inputs, vec![input]);
+        statement.outputs[0].source = Some(col("customers", "email"));
+        assert_eq!(check(&statement, &policy, &snapshot).unwrap_err().code, NyCode::MaskedExpression);
+    }
+
     #[test]
     fn json_filter_only_allows_direct_select_and_never_writes() {
         use crate::policy::JsonColumnFilter;
@@ -1307,4 +1357,15 @@ mod tests {
         ));
         denied(&s, NyCode::NotAnalysable);
     }
+    #[test]
+    fn extracted_blind_uses_own_domain_and_text_type() {
+        let (p, mut snapshot) = fixture();
+        snapshot.relations[0].columns.iter_mut().find(|c| c.name == "email").unwrap().ty = ColumnType::Jsonb;
+        let mut s = stmt();
+        let mut u = usage(UseKind::JsonLeaf { kind: Box::new(UseKind::Equality { other: ValueSource::Param(1) }) }, Context::Where);
+        u.label = label("leaf-domain");
+        s.uses.push(u);
+        assert_eq!(check(&s, &p, &snapshot).unwrap().inputs, vec![InputRewrite::DecryptParam { index: 1, domain: domain("leaf-domain"), ty: ColumnType::Text }]);
+    }
+
 }

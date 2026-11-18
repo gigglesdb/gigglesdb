@@ -224,6 +224,9 @@ pub fn rewrite_row(
     let mut rewritten = row.to_vec();
     let mut released = Vec::new();
     for ((value, action), actual) in rewritten.iter_mut().zip(plan).zip(types) {
+        if let OutputRewrite::JsonExtract { base, text, .. } = action
+            && (*base != ColumnType::Json || *actual != if *text { ColumnType::Text } else { ColumnType::Json })
+        { return Err(bad()); }
         if let OutputRewrite::JsonFilter { ty, .. } = action
             && (ty != actual || !matches!(ty, ColumnType::Json))
         {
@@ -239,6 +242,25 @@ pub fn rewrite_row(
                     crate::json::filter::JsonOutput::Document(bytes) =>
                         Kind::StringValue(String::from_utf8(bytes).map_err(|_| bad())?),
                     crate::json::filter::JsonOutput::SqlNull => Kind::NullValue(0),
+                });
+            }
+            OutputRewrite::JsonExtract { filter, text, keep_empty, .. } => {
+                let Some(Kind::StringValue(input)) = &value.kind else { return Err(bad()); };
+                let mut cell_tokens = vec![];
+                value.kind = Some(match crate::json::filter::extraction_output(json(filter, input.as_bytes(), &mut cell_tokens)?, filter.mode, *keep_empty, crate::json::codec::JsonFormat::SpannerJson)? {
+                    crate::json::filter::JsonOutput::SqlNull => Kind::NullValue(0),
+                    crate::json::filter::JsonOutput::Document(bytes) if !text => {
+                        released.extend(cell_tokens);
+                        Kind::StringValue(String::from_utf8(bytes).map_err(|_| bad())?)
+                    }
+                    crate::json::filter::JsonOutput::Document(bytes) => {
+                        use crate::json::{codec::{decode, JsonFormat}, JsonLimits, JsonValue};
+                        match decode(JsonFormat::SpannerJson, &bytes, &JsonLimits::default())? {
+                            JsonValue::String(ref s) => { released.extend(cell_tokens); Kind::StringValue(s.clone()) },
+                            JsonValue::Bool(_) | JsonValue::Number(_) => { released.extend(cell_tokens); Kind::StringValue(String::from_utf8(bytes).map_err(|_| bad())?) },
+                            JsonValue::Null | JsonValue::Object(_) | JsonValue::Array(_) => Kind::NullValue(0),
+                        }
+                    }
                 });
             }
             OutputRewrite::Pass => {}
@@ -304,6 +326,15 @@ mod tests {
             precommit_token: vec![0, 255, seq_num as u8],
         }
     }
+    #[test]
+    fn json_extraction_checks_wire_types_even_for_null_rows() {
+        for (base, text, actual) in [(ColumnType::Jsonb, false, ColumnType::Json), (ColumnType::Json, true, ColumnType::Json), (ColumnType::Json, false, ColumnType::Text)] {
+            let mut row = [Value { kind: Some(Kind::NullValue(0)) }];
+            let action = OutputRewrite::JsonExtract { filter: json_filter(crate::json::filter::JsonMode::Show, false, false), base, text, keep_empty: false };
+            assert!(rewrite_row(&mut row, &[action], &[actual], &mut |_, _, _| unreachable!(), &mut |_, _, _| unreachable!()).is_err());
+        }
+    }
+
     #[test]
     fn held_precommit_on_fragment_only_last_is_flushed() {
         let mut forwarding = Precommit::default();
@@ -590,5 +621,67 @@ mod tests {
             &mut |_, _, _| unreachable!(), &mut apply_json,
         ).is_err());
         assert_eq!(row, original);
+    }
+}
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+    use crate::{json::{filter::{self, JsonInput, JsonMode, JsonOutput}, codec::JsonFormat, JsonLimits}, policy::{JsonColumnFilter, JsonLeafType, JsonPathRule, JsonPathTreatment, JsonTokenType}, schema::ColumnRef, token::{ScopeKeys, StandardCodec, TokenCodec}};
+    fn cell(text: &str) -> Value { Value { kind: Some(Kind::StringValue(text.into())) } }
+    fn filter(treatment: JsonPathTreatment) -> JsonColumnFilter {
+        JsonColumnFilter { mode: JsonMode::Tokenize, rules: vec![JsonPathRule { column: ColumnRef { schema: "".into(), table: "docs".into(), column: "doc".into() }, path: vec![], treatment }] }
+    }
+    fn run(row: &mut [Value], filter: JsonColumnFilter, text: bool) -> Result<Vec<String>, Refusal> {
+        rewrite_row(row, &[OutputRewrite::JsonExtract { filter, base: ColumnType::Json, text, keep_empty: false }], &[if text { ColumnType::Text } else { ColumnType::Json }], &mut |_, _, _| unreachable!(), &mut |f, bytes, released| filter::apply_collect(&f.rules, f.mode, &ScopeKeys::new([7;32]), &StandardCodec, &std::collections::BTreeMap::from([(DomainName("d".into()), crate::policy::DomainSettings { tokenize: crate::policy::TokenizeSetting::Off, range: None })]), &JsonLimits::default(), JsonInput { format: JsonFormat::SpannerJson, bytes }, released))
+    }
+    #[test]
+    fn extraction_text_rendering_and_sql_null() {
+        for (ty, input, expected) in [(JsonLeafType::String, "\"hello\"", Some("hello")), (JsonLeafType::Number, "123", Some("123")), (JsonLeafType::Boolean, "true", Some("true")), (JsonLeafType::String, "123", None), (JsonLeafType::String, "null", None), (JsonLeafType::String, "{}", None), (JsonLeafType::String, "[]", None)] {
+            for text in [false, true] {
+                let mut row = [cell(input)];
+                assert!(run(&mut row, filter(JsonPathTreatment::Show { ty }), text).unwrap().is_empty());
+                let expected = if text { expected } else if input == "null" { Some("null") } else { expected.map(|_| input) };
+                assert_eq!(row[0].kind, Some(expected.map_or(Kind::NullValue(0), |s| Kind::StringValue(s.into()))));
+            }
+        }
+        let mut row = [Value { kind: Some(Kind::NullValue(0)) }];
+        assert!(run(&mut row, filter(JsonPathTreatment::Masked), true).unwrap().is_empty());
+    }
+    #[test]
+    fn extraction_blind_token_matches_document_and_only_released_values_logged() {
+        let domain = DomainName("d".into());
+        let f = filter(JsonPathTreatment::Blind { domain: domain.clone(), ty: JsonTokenType::Text });
+        let SqlValue::Text(token) = StandardCodec.encode(&ScopeKeys::new([7;32]), &domain, &ColumnType::Text, None, &SqlValue::Text("secret".into())).unwrap() else { panic!("text token expected") };
+        for text in [true, false] {
+            let mut row = [cell("\"secret\"")];
+            assert_eq!(run(&mut row, f.clone(), text).unwrap().as_slice(), std::slice::from_ref(&token));
+            assert_eq!(row, [cell(&if text { token.clone() } else { format!("\"{token}\"") })]);
+        }
+        // A filtered parent can contain tokens, but JSON_VALUE(parent) releases SQL NULL.
+        let mut parent = f.clone(); parent.rules[0].path = vec![crate::policy::PathSegment::Key("email".into())];
+        let mut row = [cell("{\"email\":\"secret\"}")];
+        assert!(run(&mut row, parent, true).unwrap().is_empty());
+        assert_eq!(row[0].kind, Some(Kind::NullValue(0)));
+        for value in [cell("invalid"), Value { kind: Some(Kind::BoolValue(true)) }] {
+            let mut row = [value]; let before = row.clone();
+            assert!(run(&mut row, f.clone(), true).is_err()); assert_eq!(row, before);
+        }
+    }
+    #[test]
+    fn extraction_reassembles_fragments_before_filtering() {
+        use googleapis_tonic_google_spanner_v1::google::spanner::v1::{StructType, struct_type::Field};
+        let mut assembly = Reassembler::new();
+        let first = PartialResultSet { metadata: Some(ResultSetMetadata { row_type: Some(StructType { fields: vec![Field::default()] }), ..Default::default() }), values: vec![cell("\"sec")], chunked_value: true, ..Default::default() };
+        assert!(!assembly.push(first).unwrap().0.iter().any(|e| matches!(e, Event::Row(_))));
+        let events = assembly.push(PartialResultSet { values: vec![cell("ret\"")], ..Default::default() }).unwrap().0;
+        let mut count = 0;
+        for event in events { if let Event::Row(mut row) = event { run(&mut row, filter(JsonPathTreatment::Show { ty: JsonLeafType::String }), true).unwrap(); assert_eq!(row, [cell("secret")]); count += 1; } }
+        assert_eq!(count, 1); assembly.finish().unwrap();
+    }
+    #[test]
+    fn extraction_parent_null_does_not_log_callback_tokens() {
+        let mut row = [cell("{}")];
+        let tokens = rewrite_row(&mut row, &[OutputRewrite::JsonExtract { filter: filter(JsonPathTreatment::Masked), base: ColumnType::Json, text: true, keep_empty: false }], &[ColumnType::Text], &mut |_, _, _| unreachable!(), &mut |_, _, released| { released.push("unreleased".into()); Ok(JsonOutput::Document(b"{}".to_vec())) }).unwrap();
+        assert!(tokens.is_empty()); assert_eq!(row[0].kind, Some(Kind::NullValue(0)));
     }
 }

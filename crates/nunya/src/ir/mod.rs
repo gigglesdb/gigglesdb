@@ -45,6 +45,8 @@ pub enum ValueSource {
         /// Label.
         label: Label,
     },
+    /// A guarded Text JSON leaf in its declared domain.
+    JsonLeaf(DomainName),
     /// Null.
     Null,
     /// Computed.
@@ -79,6 +81,9 @@ pub enum Context {
 /// Use kind.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UseKind {
+    /// An operation on a guarded Text JSON leaf, independent of the base type.
+    JsonLeaf { /// Original operation.
+        kind: Box<UseKind> },
     /// Output.
     Output, // appears (bare) as an output column
     /// Equality with its direct counterpart on either side.
@@ -162,6 +167,13 @@ pub struct WriteTarget {
 pub enum StatementKind {
     /// Select.
     Select,
+    /// A SELECT with explicit direct JSON extraction projections.
+    JsonSelect {
+        /// Output ordinals and their extraction treatment.
+        outputs: Vec<(usize, OutputRewrite)>,
+        /// SQL substitutions required to preserve JSON types.
+        inputs: Vec<InputRewrite>,
+    },
     /// Insert.
     Insert,
     /// Update.
@@ -220,6 +232,17 @@ pub struct ResolvedStatement {
 /// Output rewrite.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputRewrite {
+    /// Release an extracted JSON root through rebased path rules.
+    JsonExtract {
+        /// Rebased rules and default mode.
+        filter: crate::policy::JsonColumnFilter,
+        /// Original column JSON type.
+        base: ColumnType,
+        /// Render the filtered root with PostgreSQL text extraction semantics.
+        text: bool,
+        /// Preserve an empty extracted object only for an array element.
+        keep_empty: bool,
+    },
     /// Release a direct JSON read only through its path filter.
     JsonFilter {
         /// Compiled path rules and default mode.
@@ -245,6 +268,13 @@ pub enum OutputRewrite {
 /// Input rewrite.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputRewrite {
+    /// Replace a validated SQL expression span.
+    ReplaceSpan {
+        /// Original SQL expression extent.
+        span: Span,
+        /// Validated replacement SQL.
+        text: String,
+    },
     /// Decrypt a one-based parameter in a domain and column type.
     DecryptParam {
         /// Index.

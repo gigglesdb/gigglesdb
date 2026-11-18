@@ -65,7 +65,13 @@ impl State<'_> {
                     scope.extend(self.bind_from_item(n)?);
                 }
                 let outputs = if s.values_lists.is_empty() {
-                    self.targets(&s.target_list, &scope)?
+                    let previous = self.extract_allowed;
+                    self.extract_allowed = self.depth == 1 && !self.view_body && self.view_depth == 0
+                        && s.distinct_clause.is_empty() && s.group_clause.is_empty()
+                        && s.with_clause.is_none();
+                    let result = self.targets(&s.target_list, &scope);
+                    self.extract_allowed = previous;
+                    result?
                 } else {
                     if !s.target_list.is_empty() || !s.from_clause.is_empty() {
                         return Err(refuse());
@@ -235,6 +241,20 @@ impl State<'_> {
                     self.record(&e, UseKind::Output, &Context::SelectList);
                     outputs.push(output);
                 }
+                continue;
+            }
+            if let Some(extraction) = self.json_extraction(n, scope)? {
+                let (e, action, replacement) = extraction.projection(&self.sql, target.name.is_empty(), usize::try_from(target.location).map_err(|_| json_extract::refusal())?)?;
+                if let Some(action) = action {
+                    if !self.extract_allowed { return Err(json_extract::refusal()); }
+                    self.extracts.push((outputs.len(), action));
+                }
+                if let Some(input) = replacement {
+                    if !self.extract_allowed { return Err(json_extract::refusal()); }
+                    self.replacements.push(input);
+                }
+                self.record(&e, UseKind::Output, &Context::SelectList);
+                outputs.push(scope::Output::from_expr(if target.name.is_empty() { "?column?".into() } else { target.name.clone() }, e));
                 continue;
             }
             let e = self.root(n, scope, Context::SelectList, UseKind::Output)?;

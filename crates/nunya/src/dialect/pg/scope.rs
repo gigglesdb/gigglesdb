@@ -13,6 +13,8 @@ pub(super) struct Output {
     pub ty: Option<ColumnType>,
     /// All sensitive underlying column inputs.
     pub inputs: Vec<(ColumnRef, Label)>,
+    /// Whether this value has crossed a derived relational boundary.
+    pub derived: bool,
 }
 impl Output {
     /// Discard internal provenance after all query uses have been recorded.
@@ -32,6 +34,7 @@ impl Output {
             source: e.source,
             ty: e.ty,
             inputs: e.inputs,
+            derived: true,
         }
     }
 }
@@ -164,7 +167,10 @@ impl State<'_> {
         if let Some(outer) = outer {
             self.outers.push(outer.clone());
         }
-        let result = self.select(s);
+        let result = self.select(s).map(|mut outputs| {
+            for output in &mut outputs { output.derived = true; }
+            outputs
+        });
         if outer.is_some() {
             self.outers.pop();
         }
@@ -217,6 +223,7 @@ impl State<'_> {
                                 source: Some(column),
                                 ty: Some(c.ty.clone()),
                                 inputs,
+                                derived: false,
                             }
                         })
                         .collect(),
@@ -246,11 +253,14 @@ impl State<'_> {
                         self.outers = old_outers;
                         self.view_body = old_body;
                         self.view_depth -= 1;
-                        let mut outputs = result.map_err(|_| refuse())?;
+                        let mut outputs = result.map_err(|e| if e.code == NyCode::MaskedExpression {
+                            json_extract::refusal()
+                        } else { refuse() })?;
                         if outputs.len() != relation.columns.len() {
                             return Err(refuse());
                         }
                         for (output, column) in outputs.iter_mut().zip(&relation.columns) {
+                            output.derived = true;
                             output.name = column.name.clone();
                             output.ty = Some(column.ty.clone());
                         }

@@ -87,6 +87,25 @@ impl State<'_> {
         scope: &scope::Scope,
         context: &Context,
     ) -> Result<Expr> {
+        if let Some(extraction) = self.json_extraction(n, scope)? {
+            if !matches!(self.statement.kind, StatementKind::Select) {
+                return Err(json_extract::refusal());
+            }
+            if extraction.unguarded_plain() {
+                let e = extraction.plain_expression();
+                self.record(&e, UseKind::Other { what: "JSON extraction dependency" }, context);
+                return Ok(e);
+            }
+            if !matches!(context, Context::Where | Context::JoinOn) || self.view_body {
+                return Err(json_extract::refusal());
+            }
+            let (e, rewrite) = extraction.predicate(&self.sql)?;
+            self.replacements.push(rewrite);
+            if e.label == Label::Plain {
+                self.record(&e, UseKind::Other { what: "JSON extraction dependency" }, context);
+            }
+            return Ok(e);
+        }
         match node(n)? {
             NodeEnum::ColumnRef(c) => Ok(Expr::column(self.resolve(&c.fields, scope)?)),
             NodeEnum::ParamRef(p) => {
@@ -203,6 +222,9 @@ impl State<'_> {
                 let kind = p::AExprKind::try_from(a.kind).map_err(|_| refuse())?;
                 let op = match names.as_slice() {
                     [n] => {
+                        if matches!(n.as_str(), "@>" | "<@" | "?" | "?|" | "?&" | "@?" | "@@" | "->" | "->>" | "#>" | "#>>") {
+                            return Err(json_extract::refusal());
+                        }
                         let expected = match n.as_str() {
                             "BETWEEN" => Some(p::AExprKind::AexprBetween),
                             "NOT BETWEEN" => Some(p::AExprKind::AexprNotBetween),
@@ -279,6 +301,20 @@ impl State<'_> {
                 }
                 if kind == p::AExprKind::AexprOp && op == "=" && args.len() == 2 {
                     for i in 0..2 {
+                        if let ValueSource::JsonLeaf(domain) = &args[i].value {
+                            let other = &args[1 - i].value;
+                            let compatible = match other {
+                                ValueSource::Param(_) | ValueSource::Literal { .. } => true,
+                                ValueSource::JsonLeaf(other) | ValueSource::Column { label: Label::Blind(other), .. } => domain == other,
+                                _ => false,
+                            };
+                            let counterpart = if i == 0 { a.rexpr.as_deref() } else { a.lexpr.as_deref() }.ok_or_else(json_extract::refusal)?;
+                            if !compatible || matches!(node(counterpart)?, NodeEnum::TypeCast(_)) {
+                                return Err(json_extract::refusal());
+                            }
+                        }
+                    }
+                    for i in 0..2 {
                         if args[i].bare && args[i].label != Label::Plain {
                             self.record(
                                 &args[i],
@@ -302,6 +338,7 @@ impl State<'_> {
                     && op == "="
                     && matches!(args[0].label, Label::Blind(_))
                     && args[0].bare
+                    && !matches!(args[0].value, ValueSource::JsonLeaf(_))
                 {
                     for i in 1..args.len() {
                         if matches!(
@@ -424,6 +461,11 @@ impl State<'_> {
                     [s, n] if s == "pg_catalog" => n.to_lowercase(),
                     _ => return Err(refuse()),
                 };
+                if name.starts_with("jsonb_path_") || name.starts_with("json_path_")
+                    || name.starts_with("json_extract_path") || name.starts_with("jsonb_extract_path")
+                    || name.starts_with("json_each") || name.starts_with("jsonb_each") {
+                    return Err(json_extract::refusal());
+                }
                 let aggregate = functions::aggregate(&name, self.snapshot).ok_or_else(refuse)?;
                 if f.agg_star {
                     return if name == "count" && f.args.is_empty() && !f.agg_distinct {

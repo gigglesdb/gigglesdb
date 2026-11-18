@@ -1059,7 +1059,7 @@ impl NunyaSpanner {
             }
         };
         let (stmt, names) = lower_gsql(sql, snapshot, policy).map_err(refusal)?;
-        let plan = check(&stmt, policy, snapshot).map_err(refusal)?;
+        let mut plan = check(&stmt, policy, snapshot).map_err(refusal)?;
 
         if plan.tokenize.is_none()
             && let Some(params) = params.as_ref()
@@ -1069,14 +1069,14 @@ impl NunyaSpanner {
                     InputRewrite::DecryptParam { index, .. } => {
                         index.checked_sub(1).and_then(|i| names.get(i as usize)) == Some(name)
                     }
-                    InputRewrite::DecryptLiteral { .. } => false,
+                    InputRewrite::DecryptLiteral { .. } | InputRewrite::ReplaceSpan { .. } => false,
                 });
                 if !consumed {
                     refuse_token_value(value, policy)?;
                 }
             }
         }
-        for input in &plan.inputs {
+        for input in &mut plan.inputs {
             match input {
                 InputRewrite::DecryptParam { index, domain, ty } => {
                     let name = index
@@ -1089,8 +1089,19 @@ impl NunyaSpanner {
                         .ok_or_else(invalid)?;
                     *value = self.convert(who, policy, domain, ty, value, true)?;
                 }
-                // GoogleSQL literal rendering differs from PostgreSQL: refuse rather than interpolate.
-                InputRewrite::DecryptLiteral { .. } => return Err(invalid()),
+                InputRewrite::ReplaceSpan { .. } => {},
+                InputRewrite::DecryptLiteral { span, domain, ty } => {
+                    if *ty != ColumnType::Text || !matches!(stmt.kind, StatementKind::JsonSelect { .. }) { return Err(invalid()); }
+                    if !stmt.uses.iter().any(|usage| matches!(&usage.kind,
+                        crate::ir::UseKind::JsonLeaf { kind } if matches!(kind.as_ref(), crate::ir::UseKind::Equality { other: crate::ir::ValueSource::Literal { span: literal, .. } } if literal == span))) { return Err(invalid()); }
+                    let raw = sql.get(span.start..span.end).ok_or_else(invalid)?;
+                    let text = crate::json::extract::standard_string(raw).map_err(status)?;
+                    if text.contains('\\') { return Err(invalid()); }
+                    let value = Value { kind: Some(prost_types::value::Kind::StringValue(text)) };
+                    let clear = self.convert(who, policy, domain, ty, &value, true)?;
+                    let Some(prost_types::value::Kind::StringValue(clear)) = clear.kind else { return Err(invalid()); };
+                    *input = InputRewrite::ReplaceSpan { span: span.clone(), text: gsql_string(&clear) };
+                }
             }
         }
 
@@ -1262,7 +1273,7 @@ impl NunyaSpanner {
             ValueSource::Literal { text, .. } => Value {
                 kind: Some(prost_types::value::Kind::StringValue(text.clone())),
             },
-            ValueSource::Column { .. } | ValueSource::Null | ValueSource::Computed(_) => {
+            ValueSource::JsonLeaf(_) | ValueSource::Column { .. } | ValueSource::Null | ValueSource::Computed(_) => {
                 return Err(NyCode::NotAnalysable);
             }
         };
@@ -1322,7 +1333,7 @@ impl NunyaSpanner {
                     let value = lookup(pos).ok_or_else(invalid)?;
                     result.push((index, self.convert(who, policy, domain, ty, value, true)?));
                 }
-                InputRewrite::DecryptLiteral { .. } => return Err(invalid()),
+                InputRewrite::DecryptLiteral { .. } | InputRewrite::ReplaceSpan { .. } => return Err(invalid()),
             }
         }
         Ok(result)
@@ -1649,6 +1660,7 @@ impl SpannerService for NunyaSpanner {
         let (policy, snapshot, revision) = self.configuration()?;
         let label = req.sql.clone();
         let (plan, names, kind) = self.sql(&who, revision.as_deref(), &req.sql, &mut req.params, &policy, &snapshot)?;
+        req.sql = splice_sql(&req.sql, &plan.inputs)?;
         let write = matches!(
             kind,
             StatementKind::Insert | StatementKind::Update | StatementKind::Delete
@@ -1658,7 +1670,7 @@ impl SpannerService for NunyaSpanner {
                 self.mark_selector_dml(&req.session, req.transaction.as_ref(), who.session)?;
                 self.admit_write(&who)?
             }
-            StatementKind::Select | StatementKind::Tokenize { .. } => {}
+            StatementKind::JsonSelect { .. } | StatementKind::Select | StatementKind::Tokenize { .. } => {}
             StatementKind::Begin
             | StatementKind::Commit
             | StatementKind::Rollback
@@ -1719,6 +1731,7 @@ impl SpannerService for NunyaSpanner {
         let (policy, snapshot, revision) = self.configuration()?;
         let label = req.sql.clone();
         let (plan, names, kind) = self.sql(&who, revision.as_deref(), &req.sql, &mut req.params, &policy, &snapshot)?;
+        req.sql = splice_sql(&req.sql, &plan.inputs)?;
         let write = matches!(
             kind,
             StatementKind::Insert | StatementKind::Update | StatementKind::Delete
@@ -1728,7 +1741,7 @@ impl SpannerService for NunyaSpanner {
                 self.mark_selector_dml(&req.session, req.transaction.as_ref(), who.session)?;
                 self.admit_write(&who)?
             }
-            StatementKind::Select | StatementKind::Tokenize { .. } => {}
+            StatementKind::JsonSelect { .. } | StatementKind::Select | StatementKind::Tokenize { .. } => {}
             StatementKind::Begin
             | StatementKind::Commit
             | StatementKind::Rollback
@@ -1795,12 +1808,14 @@ impl SpannerService for NunyaSpanner {
                 &policy,
                 &snapshot,
             )?;
+            statement.sql = splice_sql(&statement.sql, &plan.inputs)?;
             match kind {
                 StatementKind::Insert | StatementKind::Update | StatementKind::Delete => {}
                 StatementKind::Tokenize { .. } => {
                     return Err(self.refuse_tokenize(&who, revision.as_deref(), NyCode::NotAnalysable));
                 }
-                StatementKind::Select
+                StatementKind::JsonSelect { .. }
+                | StatementKind::Select
                 | StatementKind::Begin
                 | StatementKind::Commit
                 | StatementKind::Rollback
@@ -2101,7 +2116,7 @@ fn check_key_tokens(
                 InputRewrite::DecryptParam { index, .. } => {
                     index.checked_sub(1).and_then(|i| positions.get(i as usize)) == Some(&pos)
                 }
-                InputRewrite::DecryptLiteral { .. } => false,
+                InputRewrite::DecryptLiteral { .. } | InputRewrite::ReplaceSpan { .. } => false,
             });
             if !consumed {
                 refuse_token_value(value, policy)?;
@@ -2208,6 +2223,46 @@ fn mutation_value_mut<'a>(m: &'a mut Mutation, pos: &ValuePosition) -> Option<&'
     }
 }
 
+// Only internally generated replacements reach this splicer. Reject overlaps,
+// invalid UTF-8 boundaries and unconsumed literal rewrites before forwarding.
+fn splice_sql(sql: &str, inputs: &[InputRewrite]) -> Result<String, Status> {
+    let mut replacements = vec![];
+    for input in inputs {
+        match input {
+            InputRewrite::ReplaceSpan { span, text } => replacements.push((span, text)),
+            InputRewrite::DecryptParam { .. } => {},
+            InputRewrite::DecryptLiteral { .. } => return Err(invalid()),
+        }
+    }
+    replacements.sort_by_key(|(span, _)| span.start);
+    let mut out = String::new();
+    let mut end = 0;
+    for (span, text) in replacements {
+        if span.start < end || span.start >= span.end { return Err(invalid()); }
+        out.push_str(sql.get(end..span.start).ok_or_else(invalid)?);
+        sql.get(span.start..span.end).ok_or_else(invalid)?;
+        out.push_str(text);
+        end = span.end;
+    }
+    out.push_str(sql.get(end..).ok_or_else(invalid)?);
+    Ok(out)
+}
+fn gsql_string(value: &str) -> String {
+    let mut result = String::from("'");
+    for c in value.chars() {
+        match c {
+            '\\' => result.push_str("\\\\"),
+            '\'' => result.push_str("\\'"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if c.is_control() => result.push_str(&format!("\\u{:04x}", c as u32)),
+            c => result.push(c),
+        }
+    }
+    result.push('\''); result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2279,8 +2334,62 @@ mod tests {
         );
     }
     include!("proxy/transport_tests.rs");
+
+    #[tokio::test]
+    async fn f3_json_rpc_filtered_masked_and_guarded_unary_and_streaming() {
+        use crate::policy::{JsonColumnFilter, JsonPathRule, JsonPathTreatment, JsonTokenType, json_path::parse_path};
+        let f = Fixture::new().await;
+        let column = ColumnRef { schema: "".into(), table: "customers".into(), column: "doc".into() };
+        let mut policy = (**f.svc.ctx.policy.read().unwrap()).clone();
+        policy.columns.insert(column.clone(), Treatment::Masked { placeholder: None });
+        policy.json_filters.insert(column.clone(), JsonColumnFilter { mode: crate::json::filter::JsonMode::Show, rules: vec![
+            JsonPathRule { column: column.clone(), path: parse_path("$.secret").unwrap(), treatment: JsonPathTreatment::Blind { domain: domain(), ty: JsonTokenType::Text } },
+            JsonPathRule { column, path: parse_path("$.hidden").unwrap(), treatment: JsonPathTreatment::Masked }
+        ] });
+        *f.svc.ctx.policy.write().unwrap() = Arc::new(policy);
+        let mut snapshot = (**f.svc.ctx.snapshot.read().unwrap()).clone();
+        snapshot.relations[0].columns.push(Column { name: "doc".into(), ty: ColumnType::Json, nullable: true, generated: None, default: None });
+        *f.svc.ctx.snapshot.write().unwrap() = Arc::new(snapshot);
+        let metadata = ResultSetMetadata { row_type: Some(StructType { fields: vec![struct_type::Field { name: "v".into(), r#type: Some(Type { code: TypeCode::String as i32, ..Default::default() }) }] }), ..Default::default() };
+        for sql in ["SELECT JSON_VALUE(doc, '$.secret') FROM customers", "SELECT JSON_VALUE(doc, '$.hidden') FROM customers", "SELECT email FROM customers WHERE JSON_VALUE(doc, '$.secret') = @p", "SELECT email FROM customers WHERE JSON_VALUE(doc, '$.secret') = 'TOKEN'"] {
+            let token = f.token();
+            let Some(prost_types::value::Kind::StringValue(token_text)) = token.kind.clone() else { panic!("token"); };
+            let sql = sql.replace("TOKEN", &token_text);
+            for streaming in [false, true] {
+                let guarded = sql.contains("WHERE");
+                let input = if guarded { "private@example.com" } else { "\"private@example.com\"" };
+                let mut req = f.query(&sql).await;
+                if sql.contains("@p") { req.params = Some(prost_types::Struct { fields: BTreeMap::from([("p".into(), token.clone())]) }); }
+                let value = if streaming {
+                    *f.fake.parts.lock().unwrap() = Some(vec![PartialResultSet { metadata: Some(metadata.clone()), values: vec![text(input)], ..Default::default() }]);
+                    let mut result = f.svc.execute_streaming_sql(f.request(req, "alice")).await.unwrap().into_inner();
+                    let mut values = vec![];
+                    while let Some(part) = result.next().await { values.extend(part.unwrap().values); }
+                    values.remove(0)
+                } else {
+                    *f.fake.json_result.lock().unwrap() = Some(ResultSet { metadata: Some(metadata.clone()), rows: vec![ListValue { values: vec![text(input)] }], ..Default::default() });
+                    let result = f.svc.execute_sql(f.request(req, "alice")).await.unwrap().into_inner();
+                    let seen = f.fake.seen.lock().unwrap();
+                    if guarded { assert!(seen.last().unwrap().sql.contains("CASE WHEN")); }
+                    if sql.contains(&token_text) { assert!(!seen.last().unwrap().sql.contains(&token_text)); }
+                    result.rows[0].values[0].clone()
+                };
+                if sql.contains("hidden") { assert_eq!(value.kind, Some(prost_types::value::Kind::NullValue(0))); }
+                else { assert_eq!(value, token); }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn f4_insert_token_literal_still_refused_before_forwarding() {
+        let f = Fixture::new().await;
+        let Some(prost_types::value::Kind::StringValue(token)) = f.token().kind else { panic!("token"); };
+        let req = f.query(&format!("INSERT INTO customers (email) VALUES ('{token}')")).await;
+        assert!(f.svc.execute_sql(f.request(req, "alice")).await.is_err());
+        assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
     #[derive(Default)]
     struct Fake {
+        json_result: Mutex<Option<ResultSet>>,
         result_token: Mutex<Option<MultiplexedSessionPrecommitToken>>,
         next_commit: Mutex<Option<CommitResponse>>,
         commit_status: Mutex<Option<Status>>,
@@ -2517,6 +2626,7 @@ mod tests {
             if let Some(code) = self.sql_error.lock().unwrap().take() {
                 return Err(Status::new(code, "upstream error"));
             }
+            if let Some(result) = self.json_result.lock().unwrap().take() { return Ok(Response::new(result)); }
             if dml {
                 return Ok(Response::new(ResultSet { metadata: transaction.map(|transaction| ResultSetMetadata { transaction: Some(transaction), ..Default::default() }), precommit_token: self.result_token.lock().unwrap().clone(), ..Default::default() }));
             }
@@ -5267,5 +5377,23 @@ mod tls_rotation_tests {
         assert_eq!(new.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
         old.write_all(b"x").await.unwrap(); let mut response = [0]; old.read_exact(&mut response).await.unwrap(); assert_eq!(response, *b"x");
         drop(stalled); server.abort(); let _ = server.await;
+    }
+}
+
+#[cfg(test)]
+mod sql_splice_tests {
+    use super::*;
+    use crate::ir::Span;
+    #[test]
+    fn ordered_splices_and_fail_closed_boundaries() {
+        let r = |start, end, text: &str| InputRewrite::ReplaceSpan { span: Span { start, end }, text: text.into() };
+        assert_eq!(splice_sql("abc def ghi", &[r(8,11,"z"), r(0,3,"x")]).unwrap(), "x def z");
+        assert_eq!(splice_sql("unchanged", &[]).unwrap(), "unchanged");
+        for inputs in [vec![r(0,3,"x"),r(2,4,"y")],vec![r(0,0,"x")],vec![r(0,99,"x")],vec![r(1,2,"x")]] { assert!(splice_sql("éabc", &inputs).is_err()); }
+        assert!(splice_sql("x", &[InputRewrite::DecryptLiteral { span: Span { start: 0, end: 1 }, domain: DomainName("d".into()), ty: ColumnType::Text }]).is_err());
+    }
+    #[test]
+    fn decrypted_literal_rendering_escapes_google_sql() {
+        assert_eq!(gsql_string("a'b\\c\n\r\t\0"), "'a\\'b\\\\c\\n\\r\\t\\u0000'");
     }
 }

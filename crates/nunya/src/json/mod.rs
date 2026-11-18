@@ -8,6 +8,8 @@ use std::fmt;
 pub mod codec;
 /// Policy-directed JSON path filtering.
 pub mod filter;
+/// Concrete PostgreSQL extraction paths and policy rebasing.
+pub mod extract;
 
 /// An owned JSON value preserving member order and duplicate keys.
 #[derive(Clone, PartialEq, Eq)]

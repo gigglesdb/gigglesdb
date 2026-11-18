@@ -17,7 +17,7 @@ pub(super) struct Expr {
     pub bare: bool,
 }
 impl Expr {
-    fn plain() -> Self {
+    pub(super) fn plain() -> Self {
         Self {
             label: Label::Plain,
             value: ValueSource::Computed(Label::Plain),
@@ -49,6 +49,7 @@ impl Expr {
     /// Preserve expression provenance in a relational output.
     pub(super) fn output(self, name: String) -> Output {
         Output {
+            base: false,
             ir: OutputColumn {
                 name,
                 label: self.label,
@@ -151,6 +152,10 @@ impl State<'_> {
     /// Lower only explicitly supported expression forms.
     pub(super) fn expression(&mut self, n: &a::Expr, scope: &Scope, c: &Context) -> Result<Expr> {
         use a::Expr as X;
+        if let Some(extract) = self.json_extraction(n, scope)? {
+            if !matches!(c, Context::Where | Context::JoinOn) { return Err(refuse()); }
+            return self.json_predicate(extract);
+        }
         match n {
             X::Identifier(i) => Ok(Expr::column(self.resolve(std::slice::from_ref(i), scope)?)),
             X::CompoundIdentifier(ids) => {
@@ -255,6 +260,27 @@ impl State<'_> {
                     self.expression(left, scope, c)?,
                     self.expression(right, scope, c)?,
                 ];
+                if *op == B::Eq && es.iter().any(|e| matches!(e.value, ValueSource::JsonLeaf(_))) {
+                    for (i, node) in [left.as_ref(), right.as_ref()].iter().enumerate() {
+                        if let X::Value(a::Value::SingleQuotedString(value)) = node {
+                            let mut counterpart = [left.as_ref(), right.as_ref()][1-i];
+                            while let X::Nested(inner) = counterpart { counterpart = inner; }
+                            let extraction = self.json_extraction(counterpart, scope)?.ok_or_else(refuse)?;
+                            let boundary = if i == 0 { extraction.span.start } else { extraction.span.end };
+                            es[i].value = ValueSource::Literal { span: json_extract::literal_span(self.sql, value, boundary, i == 0)?, text: value.clone() };
+                        }
+                    }
+                    for i in 0..2 {
+                        if let ValueSource::JsonLeaf(domain) = &es[i].value {
+                            let compatible = match &es[1-i].value {
+                                ValueSource::Param(_) | ValueSource::Literal { .. } => true,
+                                ValueSource::JsonLeaf(other) | ValueSource::Column { label: Label::Blind(other), .. } => domain == other,
+                                _ => false,
+                            };
+                            if !compatible || matches!([left.as_ref(), right.as_ref()][1-i], X::Cast { .. }) { return Err(refuse()); }
+                        }
+                    }
+                }
                 for i in 0..2 {
                     if *op == B::Eq && es[i].bare && es[i].label != Label::Plain {
                         self.record(
@@ -341,6 +367,7 @@ impl State<'_> {
                 for i in 1..es.len() {
                     if !negated
                         && es[0].bare
+                        && !matches!(es[0].value, ValueSource::JsonLeaf(_))
                         && matches!(es[0].label, Label::Blind(_))
                         && matches!(es[i].value, ValueSource::Param(_))
                     {

@@ -34,6 +34,7 @@ fn summarize(plan: &RewritePlan) -> Plan {
                     format!("param:{index}:{}", domain.0)
                 }
                 InputRewrite::DecryptLiteral { domain, .. } => format!("literal:{}", domain.0),
+                InputRewrite::ReplaceSpan { .. } => panic!("JSON extraction unavailable in legacy corpus"),
             })
             .collect(),
         outputs: plan
@@ -42,6 +43,7 @@ fn summarize(plan: &RewritePlan) -> Plan {
             .map(|o| match o {
                 // 6b-2 applies the filter here
                 OutputRewrite::JsonFilter { .. } => panic!("JSON filtering unavailable in legacy corpus"),
+                OutputRewrite::JsonExtract { .. } => panic!("JSON extraction unavailable in legacy corpus"),
                 OutputRewrite::Pass => "pass".into(),
                 OutputRewrite::Tokenize { domain, .. } => format!("tokenize:{}", domain.0),
                 OutputRewrite::Mask { .. } => "mask".into(),

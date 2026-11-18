@@ -40,7 +40,8 @@ impl State<'_> {
                 {
                     return Err(refuse());
                 }
-                let os = self.query(&c.query)?;
+                let mut os = self.query(&c.query)?;
+                for o in &mut os { o.base = false; }
                 let bs = Self::bind(os, String::new(), String::new(), Some(&c.alias))?;
                 self.ctes.insert(
                     c.alias.name.value.to_lowercase(),
@@ -93,8 +94,10 @@ impl State<'_> {
                 ) {
                     return Err(refuse());
                 }
+                let before = (self.json_outputs.len(), self.json_inputs.len());
                 let (_, l) = self.set(left)?;
                 let (_, r) = self.set(right)?;
+                if before != (self.json_outputs.len(), self.json_inputs.len()) { return Err(refuse()); }
                 if l.len() != r.len() {
                     return Err(refuse());
                 }
@@ -201,9 +204,13 @@ impl State<'_> {
         for item in &s.projection {
             match item {
                 a::SelectItem::UnnamedExpr(e) | a::SelectItem::ExprWithAlias { expr: e, .. } => {
-                    let e = self.root(e, &scope, Context::SelectList, UseKind::Output)?;
+                    let e = if let Some(extract) = self.json_extraction(e, &scope)? {
+                        if self.depth != 1 || self.view_depth != 0 { return Err(refuse()); }
+                        self.json_projection(extract, os.len())?
+                    } else { self.root(e, &scope, Context::SelectList, UseKind::Output)? };
                     let name = match item {
                         a::SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                        a::SelectItem::UnnamedExpr(a::Expr::Function(f)) if f.name.0.len() == 1 && matches!(f.name.0[0].value.to_ascii_lowercase().as_str(), "json_value" | "json_query") => String::new(),
                         a::SelectItem::UnnamedExpr(a::Expr::Identifier(i)) => i.value.clone(),
                         a::SelectItem::UnnamedExpr(a::Expr::CompoundIdentifier(ids)) => {
                             ids.last().ok_or_else(refuse)?.value.clone()
@@ -345,6 +352,7 @@ impl State<'_> {
                             return Err(refuse());
                         }
                         for (o, c) in os.iter_mut().zip(&r.columns) {
+                            o.base = false;
                             o.ir.name = c.name.clone();
                             o.ir.ty = Some(c.ty.clone())
                         }
@@ -359,7 +367,8 @@ impl State<'_> {
                 subquery,
                 alias,
             } => {
-                let os = self.query(subquery)?;
+                let mut os = self.query(subquery)?;
+                for o in &mut os { o.base = false; }
                 Self::bind(os, String::new(), String::new(), alias.as_ref())
             }
             a::TableFactor::NestedJoin {

@@ -388,7 +388,7 @@ async fn postgres_json_paths() -> ServeResult<()> {
             json(cell(&rows(&again, sql).await?, 0)?)? == initial_json,
         );
         if mode == "tokenize" {
-            tokio::task::block_in_place(|| run_drivers(&h, &access, &secret, &schema))?;
+            tokio::task::block_in_place(|| run_drivers(&h, &access, &secret, &schema, "0"))?;
             for refused_sql in [
                 "SELECT id FROM events WHERE doc_jsonb->>'status' = 'x'",
                 "SELECT doc_jsonb::text FROM events",
@@ -420,6 +420,7 @@ fn run_drivers(
     access: &SessionView,
     secret: &SessionSecret,
     schema: &str,
+    operators: &str,
 ) -> ServeResult<()> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for (variable, java) in [
@@ -439,6 +440,7 @@ fn run_drivers(
             command.arg(root.join("harness/drivers/json_paths_check.py"));
         }
         let output = command
+            .env("NUNYA_TEST_JSON_OPERATORS", operators)
             .env("PGHOST", "127.0.0.1")
             .env("PGPORT", h.pg_port().to_string())
             .env("PGDATABASE", "app")
@@ -1028,6 +1030,550 @@ async fn spanner_json_paths() -> ServeResult<()> {
             .delete_session(DeleteSessionRequest { name: session })
             .await?;
         h.stop()?;
+    }
+    Ok(())
+}
+
+// S7 operator contract, separate from the S6 whole-document acceptance checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires NUNYA_TEST_JSON_PG and NUNYA_TEST_JSON_PG_ADMIN"]
+async fn postgres_json_operators() -> ServeResult<()> {
+    let url = std::env::var("NUNYA_TEST_JSON_PG")?;
+    let admin_url = std::env::var("NUNYA_TEST_JSON_PG_ADMIN")?;
+    let schema = format!("json_{}", &nunya::token::SessionId::random().to_hex()[..12]);
+    let _fixture = PgFixture {
+        url: admin_url.clone(),
+        schema: schema.clone(),
+    };
+    let (admin, connection) = tokio_postgres::connect(&admin_url, NoTls).await?;
+    let _admin_driver = Driver(tokio::spawn(async move {
+        let _ = connection.await;
+    }));
+    admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.events(id int PRIMARY KEY, doc_json json, doc_jsonb jsonb); CREATE TABLE {schema}.customers(email text); INSERT INTO {schema}.events VALUES (1, '{ORIGINAL}', '{ORIGINAL}'); INSERT INTO {schema}.customers VALUES ('first@example.test'); GRANT USAGE ON SCHEMA {schema} TO PUBLIC; GRANT SELECT, UPDATE ON ALL TABLES IN SCHEMA {schema} TO PUBLIC")).await?;
+    let p = format!(
+        "{}\n[[column]]\ntable = '{schema}.customers'\nname = 'email'\nblind = 'email'\n",
+        policy(&schema, "tokenize", &["doc_json", "doc_jsonb"])
+    );
+    let mut h = ServeHarness::new(&p, Some(&url), None, None, "")?;
+    configure(&h, Some(&schema), 600000)?;
+    h.start().await?;
+    let (access, secret, _) = h
+        .acquire_session("json-operators", "postgres", Mode::ReadWrite)
+        .await?;
+    let (client, task) = h.pg_connect(&access, &secret, "app").await?;
+    let _driver = Driver(task);
+    let mut checks = Checks::default();
+    for column in ["doc_json", "doc_jsonb"] {
+        println!("STAGE whole-document {column}");
+        let whole = json(cell(
+            &rows(&client, &format!("SELECT {column} FROM events")).await?,
+            0,
+        )?)?;
+        println!("STAGE extraction-projection {column}");
+        let mut projected = vec![Vec::new()];
+        for expression in [
+            format!("{column}->'processor_response'"),
+            format!("{column}->'recipients'"),
+            format!("{column}->>'status'"),
+            format!("{column} #>> '{{recipients,0,email}}'"),
+        ] {
+            println!("STAGE SELECT {expression} FROM events");
+            let result = rows(&client, &format!("SELECT {expression} FROM events")).await?;
+            checks.pass("direct-extraction-accepted", result.len() == 1);
+            projected[0].push(result[0][0].clone());
+        }
+        checks.pass("masked-projection", projected[0][0].is_none());
+        checks.pass(
+            "parent-equals-whole",
+            json(cell(&projected, 1)?)? == whole["recipients"],
+        );
+        checks.pass("show-projection", cell(&projected, 2)? == "sent");
+        let token = cell(&projected, 3)?.to_owned();
+        checks.pass(
+            "blind-token-equals-whole",
+            whole["recipients"][0]["email"] == token,
+        );
+        let statement = client.prepare(&format!("SELECT {column}->'recipients', {column}->>'status', {column} #>> '{{recipients,0,email}}' FROM events")).await?;
+        let binary = client.query(&statement, &[]).await?;
+        let parent: RawJson = binary[0].try_get(0)?;
+        checks.pass(
+            "extended-binary-parent",
+            json(parent.0.as_deref().ok_or("NULL parent")?)? == whole["recipients"],
+        );
+        checks.pass(
+            "extended-binary-show-and-blind",
+            binary[0].try_get::<_, String>(1)? == "sent"
+                && binary[0].try_get::<_, String>(2)? == token,
+        );
+        checks.pass(
+            "show-equality",
+            rows(
+                &client,
+                &format!("SELECT id FROM events WHERE {column}->>'status' = 'sent'"),
+            )
+            .await?
+            .len()
+                == 1,
+        );
+        checks.pass(
+            "show-is-null",
+            rows(
+                &client,
+                &format!("SELECT id FROM events WHERE {column}->>'status' IS NULL"),
+            )
+            .await?
+            .is_empty(),
+        );
+        let statement = client
+            .prepare(&format!(
+                "SELECT id FROM events WHERE {column} #>> '{{recipients,0,email}}' = $1"
+            ))
+            .await?;
+        checks.pass(
+            "blind-param-extended-binary",
+            client.query(&statement, &[&token]).await?.len() == 1,
+        );
+        checks.pass(
+            "blind-literal",
+            rows(
+                &client,
+                &format!(
+                    "SELECT id FROM events WHERE {column} #>> '{{recipients,0,email}}' = '{token}'"
+                ),
+            )
+            .await?
+            .len()
+                == 1,
+        );
+        checks.pass("blind-join", rows(&client, &format!("SELECT e.id FROM events e JOIN customers c ON e.{column} #>> '{{recipients,0,email}}' = c.email")).await?.len() == 1);
+        for sql in [
+            format!("SELECT id FROM events WHERE {column}->>'processor_response' = 'x'"),
+            format!("SELECT id FROM events WHERE {column}->>'processor_response' IS NULL"),
+        ] {
+            let error = client
+                .simple_query(&sql)
+                .await
+                .err()
+                .ok_or("PRODUCT BUG: masked predicate accepted")?;
+            checks.pass(
+                "masked-predicate-NY005",
+                error.code().is_some_and(|c| c.code() == "NY005"),
+            );
+        }
+    }
+    update(&admin, &schema, CHANGED).await?;
+    checks.pass(
+        "show-shape-change-projection",
+        rows(&client, "SELECT doc_jsonb->>'status' FROM events").await?[0][0].is_none(),
+    );
+    checks.pass("show-shape-change-predicate", rows(&client, "SELECT id FROM events WHERE doc_jsonb->>'status' = '{\"unapproved\": \"fixture-hidden\"}'").await?.is_empty());
+    for sql in [
+        "SELECT doc_jsonb @> '{}' FROM events",
+        "SELECT doc_jsonb ? 'status' FROM events",
+        "SELECT jsonb_path_query(doc_jsonb, '$.status') FROM events",
+        "SELECT doc_jsonb->id FROM events",
+        "UPDATE events SET id = id WHERE doc_jsonb->>'status' = 'sent'",
+    ] {
+        refused(&client, sql, &mut checks).await?;
+    }
+    update(&admin, &schema, ORIGINAL).await?;
+    tokio::task::block_in_place(|| run_drivers(&h, &access, &secret, &schema, "1"))?;
+    h.stop()?;
+    let show_policy = format!(
+        "{}\n[[json_path]]\ntable = '{schema}.events'\nname = 'doc_json'\npath = '$.items[*].card'\nmasked = true\n[[json_path]]\ntable = '{schema}.events'\nname = 'doc_jsonb'\npath = '$.items[*].card'\nmasked = true\n",
+        policy(&schema, "show", &["doc_json", "doc_jsonb"])
+    );
+    let mut show = ServeHarness::new(&show_policy, Some(&url), None, None, "")?;
+    configure(&show, Some(&schema), 600000)?;
+    show.start().await?;
+    let (a, b, _) = show
+        .acquire_session("json-show-operators", "postgres", Mode::ReadWrite)
+        .await?;
+    let (c, task) = show.pg_connect(&a, &b, "app").await?;
+    let _show_driver = Driver(task);
+    update(&admin, &schema, r#"{"payment":{"card":"fixture-hidden","amount":42},"new_top":"fixture-top","items":{"0":{"card":"fixture-hidden"}}}"#).await?;
+    for col in ["doc_json", "doc_jsonb"] {
+        let whole = json(cell(
+            &rows(&c, &format!("SELECT {col} FROM events")).await?,
+            0,
+        )?)?;
+        checks.pass(
+            "show-parent-filtered",
+            json(cell(
+                &rows(&c, &format!("SELECT {col}->'payment' FROM events")).await?,
+                0,
+            )?)? == whole["payment"],
+        );
+        checks.pass(
+            "show-new-key",
+            cell(
+                &rows(&c, &format!("SELECT {col}->>'new_top' FROM events")).await?,
+                0,
+            )? == "fixture-top",
+        );
+        checks.pass(
+            "show-masked-projection",
+            rows(
+                &c,
+                &format!("SELECT {col} #> '{{payment,card}}' FROM events"),
+            )
+            .await?[0][0]
+                .is_none(),
+        );
+        checks.pass(
+            "index-container-guard",
+            rows(
+                &c,
+                &format!("SELECT {col} #> '{{items,0,card}}' FROM events"),
+            )
+            .await?[0][0]
+                .is_none(),
+        );
+        refused(
+            &c,
+            &format!("SELECT id FROM events WHERE {col} #> '{{payment,card}}' IS NULL"),
+            &mut checks,
+        )
+        .await?;
+    }
+    tokio::task::block_in_place(|| run_drivers(&show, &a, &b, &schema, "show"))?;
+    checks.report("postgres-operators-tokio");
+    show.stop()?;
+    Ok(())
+}
+
+async fn operator_native_rows(
+    client: &mut NativeClient,
+    session: &str,
+    sql: &str,
+    streaming: bool,
+) -> ServeResult<Vec<Vec<Option<String>>>> {
+    fn value(v: prost_types::Value) -> ServeResult<Option<String>> {
+        match v.kind {
+            Some(prost_types::value::Kind::StringValue(s)) => Ok(Some(s)),
+            Some(prost_types::value::Kind::NullValue(_)) => Ok(None),
+            _ => Err("unexpected operator result type".into()),
+        }
+    }
+    if !streaming {
+        return client
+            .execute_sql(native_sql(session, sql))
+            .await?
+            .into_inner()
+            .rows
+            .into_iter()
+            .map(|r| r.values.into_iter().map(value).collect())
+            .collect();
+    }
+    let mut stream = client
+        .execute_streaming_sql(native_sql(session, sql))
+        .await?
+        .into_inner();
+    let mut out = Vec::new();
+    while let Some(part) = stream.message().await? {
+        if part.chunked_value {
+            return Err("unexpected chunked small operator fixture".into());
+        }
+        for v in part.values {
+            out.push(vec![value(v)?]);
+        }
+    }
+    Ok(out)
+}
+
+#[tokio::test]
+#[ignore = "requires Spanner emulator environment"]
+async fn spanner_json_operators() -> ServeResult<()> {
+    let rest = std::env::var("NUNYA_TEST_SPANNER_REST")?;
+    let database = std::env::var("NUNYA_TEST_SPANNER_DB")?;
+    let endpoint = format!("http://{}", std::env::var("NUNYA_TEST_SPANNER_EMULATOR")?);
+    // Probe upstream semantics independently of Nunya's mandatory container guards.
+    let probe = native_rest(
+        &rest,
+        "POST",
+        &format!("{database}/sessions"),
+        serde_json::json!({}),
+    )
+    .await?;
+    let probe_name = probe["name"].as_str().ok_or("probe session missing")?;
+    let observation = native_rest(
+        &rest,
+        "POST",
+        &format!("{probe_name}:executeSql"),
+        serde_json::json!({"sql": r#"SELECT JSON_VALUE(JSON '{"0":"member"}', '$[0]')"#}),
+    )
+    .await?;
+    println!(
+        "OBSERVATION emulator-object-index-zero {}",
+        observation["rows"]
+    );
+    native_rest(&rest, "DELETE", probe_name, serde_json::json!({})).await?;
+    for mode in ["tokenize", "show"] {
+        let schema = format!("json_{}", &nunya::token::SessionId::random().to_hex()[..12]);
+        let table = format!("{schema}.events");
+        let customers = format!("{schema}.customers");
+        let mut fixture = NativeFixture {
+            rest: rest.clone(),
+            database: database.clone(),
+            schema: schema.clone(),
+            names: vec![],
+        };
+        native_ddl(
+            &rest,
+            &database,
+            vec![
+                format!("CREATE SCHEMA {schema}"),
+                format!("CREATE TABLE {table} (id INT64 NOT NULL, doc JSON) PRIMARY KEY (id)"),
+                format!("CREATE TABLE {customers} (email STRING(MAX) NOT NULL) PRIMARY KEY(email)"),
+            ],
+        )
+        .await?;
+        native_update(
+            &rest,
+            &database,
+            &format!("INSERT INTO {table} (id,doc) VALUES (1, JSON '{ORIGINAL}')"),
+        )
+        .await?;
+        native_update(
+            &rest,
+            &database,
+            &format!("INSERT INTO {customers} (email) VALUES ('first@example.test')"),
+        )
+        .await?;
+        let p = format!(
+            "{}\n[[column]]\ntable = '{customers}'\nname = 'email'\nblind = 'email'\n[[json_path]]\ntable = '{table}'\nname = 'doc'\npath = '$.items[*].card'\nmasked = true\n",
+            policy(&schema, mode, &["doc"])
+        );
+        let mut h = ServeHarness::new(
+            &p,
+            None,
+            None,
+            Some(NativeUpstream {
+                database: &database,
+                emulator_endpoint: &endpoint,
+            }),
+            "",
+        )?;
+        configure(&h, None, 600000)?;
+        h.start().await?;
+        let (a, b, _) = h
+            .acquire_session("json-native-operators", "spanner-native", Mode::ReadWrite)
+            .await?;
+        let mut client = native_client(&h, &a, &b).await?;
+        let session = client
+            .create_session(CreateSessionRequest {
+                database: database.clone(),
+                ..Default::default()
+            })
+            .await?
+            .into_inner()
+            .name;
+        fixture.names.push(session.clone());
+        for streaming in [false, true] {
+            let mut checks = Checks::default();
+            let initial = if mode == "tokenize" {
+                ORIGINAL
+            } else {
+                r#"{"payment":{"card":"fixture-hidden","amount":42},"new_top":"fixture-top","items":{"0":{"card":"fixture-hidden"}}}"#
+            };
+            native_update(
+                &rest,
+                &database,
+                &format!("UPDATE {table} SET doc=JSON '{initial}' WHERE id=1"),
+            )
+            .await?;
+            let whole = json(cell(
+                &operator_native_rows(
+                    &mut client,
+                    &session,
+                    &format!("SELECT doc FROM {table}"),
+                    streaming,
+                )
+                .await?,
+                0,
+            )?)?;
+            let parent = if mode == "tokenize" {
+                "recipients"
+            } else {
+                "payment"
+            };
+            let got = operator_native_rows(
+                &mut client,
+                &session,
+                &format!("SELECT JSON_QUERY(doc, '$.{parent}') FROM {table}"),
+                streaming,
+            )
+            .await?;
+            checks.pass(
+                "native-parent-filtered",
+                json(cell(&got, 0)?)? == whole[parent],
+            );
+            let masked = if mode == "tokenize" {
+                "processor_response"
+            } else {
+                "payment.card"
+            };
+            checks.pass(
+                "native-masked-null",
+                operator_native_rows(
+                    &mut client,
+                    &session,
+                    &format!("SELECT JSON_QUERY(doc, '$.{masked}') FROM {table}"),
+                    streaming,
+                )
+                .await?[0][0]
+                    .is_none(),
+            );
+            if mode == "tokenize" {
+                let got = operator_native_rows(
+                    &mut client,
+                    &session,
+                    &format!("SELECT JSON_VALUE(doc, '$.recipients[0].email') FROM {table}"),
+                    streaming,
+                )
+                .await?;
+                let token = cell(&got, 0)?;
+                checks.pass(
+                    "native-token-whole",
+                    whole["recipients"][0]["email"] == token,
+                );
+                for (expr, label, n) in [
+                    (
+                        "JSON_VALUE(doc, '$.status') = 'sent'".to_owned(),
+                        "show-equality",
+                        1,
+                    ),
+                    (
+                        "JSON_VALUE(doc, '$.status') IS NULL".to_owned(),
+                        "show-null",
+                        0,
+                    ),
+                    (
+                        format!("JSON_VALUE(doc, '$.recipients[0].email') = '{token}'"),
+                        "blind-literal",
+                        1,
+                    ),
+                ] {
+                    checks.pass(
+                        label,
+                        operator_native_rows(
+                            &mut client,
+                            &session,
+                            &format!("SELECT id FROM {table} WHERE {expr}"),
+                            streaming,
+                        )
+                        .await?
+                        .len()
+                            == n,
+                    );
+                }
+                let mut req = native_sql(
+                    &session,
+                    &format!(
+                        "SELECT id FROM {table} WHERE JSON_VALUE(doc, '$.recipients[0].email') = @token"
+                    ),
+                );
+                req.params = Some(prost_types::Struct {
+                    fields: std::collections::BTreeMap::from([(
+                        "token".into(),
+                        prost_types::Value {
+                            kind: Some(prost_types::value::Kind::StringValue(token.into())),
+                        },
+                    )]),
+                });
+                req.param_types.insert("token".into(),googleapis_tonic_google_spanner_v1::google::spanner::v1::Type { code: googleapis_tonic_google_spanner_v1::google::spanner::v1::TypeCode::String as i32, ..Default::default() });
+                if streaming {
+                    let mut st = client.execute_streaming_sql(req).await?.into_inner();
+                    let mut n = 0;
+                    while let Some(p) = st.message().await? {
+                        n += p.values.len();
+                    }
+                    checks.pass("blind-param", n == 1);
+                } else {
+                    checks.pass(
+                        "blind-param",
+                        client.execute_sql(req).await?.into_inner().rows.len() == 1,
+                    );
+                }
+                checks.pass("native-blind-join",operator_native_rows(&mut client,&session,&format!("SELECT e.id FROM {table} e JOIN {customers} c ON JSON_VALUE(e.doc, '$.recipients[0].email') = c.email"),streaming).await?.len()==1);
+                native_update(
+                    &rest,
+                    &database,
+                    &format!("UPDATE {table} SET doc=JSON '{CHANGED}' WHERE id=1"),
+                )
+                .await?;
+                checks.pass(
+                    "native-shape-null",
+                    operator_native_rows(
+                        &mut client,
+                        &session,
+                        &format!("SELECT JSON_VALUE(doc, '$.status') FROM {table}"),
+                        streaming,
+                    )
+                    .await?[0][0]
+                        .is_none(),
+                );
+                checks.pass("native-shape-predicate",operator_native_rows(&mut client,&session,&format!(r#"SELECT id FROM {table} WHERE JSON_VALUE(doc, '$.status') = '{{"unapproved":"fixture-hidden"}}'"#),streaming).await?.is_empty());
+            } else {
+                checks.pass(
+                    "native-show-new-key",
+                    cell(
+                        &operator_native_rows(
+                            &mut client,
+                            &session,
+                            &format!("SELECT JSON_VALUE(doc, '$.new_top') FROM {table}"),
+                            streaming,
+                        )
+                        .await?,
+                        0,
+                    )? == "fixture-top",
+                );
+                checks.pass(
+                    "native-index-container-guard",
+                    operator_native_rows(
+                        &mut client,
+                        &session,
+                        &format!("SELECT JSON_QUERY(doc, '$.items[0].card') FROM {table}"),
+                        streaming,
+                    )
+                    .await?[0][0]
+                        .is_none(),
+                );
+            }
+            for sql in [
+                format!("SELECT id FROM {table} WHERE JSON_VALUE(doc, '$.{masked}') IS NULL"),
+                format!("SELECT id FROM {table} WHERE JSON_VALUE(doc, '$.{masked}') = 'x'"),
+                format!("SELECT id FROM {table} WHERE JSON_QUERY(doc, '$.status') IS NULL"),
+                format!("SELECT JSON_VALUE(doc, doc) FROM {table}"),
+                format!("UPDATE {table} SET id=id WHERE JSON_VALUE(doc, '$.status') = 'sent'"),
+                format!("SELECT JSON_KEYS(doc) FROM {table}"),
+            ] {
+                if streaming {
+                    native_refused(
+                        client
+                            .execute_streaming_sql(native_sql(&session, &sql))
+                            .await,
+                        "native-refusal",
+                        &mut checks,
+                    )?;
+                } else {
+                    native_refused(
+                        client.execute_sql(native_sql(&session, &sql)).await,
+                        "native-refusal",
+                        &mut checks,
+                    )?;
+                }
+            }
+            checks.report(&format!(
+                "spanner-operators-{mode}-{}",
+                if streaming { "streaming" } else { "unary" }
+            ));
+        }
+        client
+            .delete_session(DeleteSessionRequest { name: session })
+            .await?;
+        h.stop()?;
+        native_ddl(&rest, &database, vec![format!("DROP TABLE {customers}")]).await?;
     }
     Ok(())
 }

@@ -13,6 +13,7 @@ mod dml;
 mod expr;
 mod functions;
 mod lexer;
+mod json_extract;
 mod scope;
 mod select;
 #[cfg(test)]
@@ -194,6 +195,9 @@ struct State<'a> {
     depth: usize,
     view_depth: usize,
     view_body: bool,
+    extract_allowed: bool,
+    extracts: Vec<(usize, OutputRewrite)>,
+    replacements: Vec<InputRewrite>,
 }
 impl State<'_> {
     fn label(&self, col: &ColumnRef) -> Label {
@@ -219,6 +223,11 @@ impl State<'_> {
         Ok(e)
     }
     fn record(&mut self, e: &expr::Expr, kind: UseKind, context: &Context) {
+        if matches!(e.value, ValueSource::JsonLeaf(_))
+            && !matches!(kind, UseKind::Equality { .. } | UseKind::IsNull) {
+            self.statement.uses.push(ColumnUse { column: e.inputs[0].0.clone(), label: Label::Masked, kind, context: context.clone() });
+            return;
+        }
         for (column, label) in &e.inputs {
             self.statement.uses.push(ColumnUse {
                 column: column.clone(),
@@ -227,7 +236,9 @@ impl State<'_> {
                 } else {
                     label.clone()
                 },
-                kind: kind.clone(),
+                kind: if matches!(e.value, ValueSource::JsonLeaf(_)) {
+                    UseKind::JsonLeaf { kind: Box::new(kind.clone()) }
+                } else { kind.clone() },
                 context: context.clone(),
             });
         }
@@ -266,6 +277,9 @@ impl Lowering for PgLowering {
                 depth: 0,
                 view_depth: 0,
                 view_body: false,
+                extract_allowed: false,
+                extracts: vec![],
+                replacements: vec![],
             };
             match node(raw.stmt.as_deref().ok_or_else(refuse)?)? {
                 NodeEnum::SelectStmt(s) => {
@@ -323,6 +337,10 @@ impl Lowering for PgLowering {
                     Err(e) => return Err(e),
                 },
                 _ => state.statement.kind = StatementKind::Refused(NyCode::StatementNotAllowed),
+            }
+            if !state.extracts.is_empty() || !state.replacements.is_empty() {
+                if state.statement.kind != StatementKind::Select { return Err(json_extract::refusal()); }
+                state.statement.kind = StatementKind::JsonSelect { outputs: state.extracts, inputs: state.replacements };
             }
             state.statement.plain_params = state.plain.into_iter().collect();
             statements.push(state.statement);

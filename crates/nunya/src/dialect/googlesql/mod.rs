@@ -16,6 +16,7 @@ use sqlparser::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 mod expr;
+mod json_extract;
 mod query;
 #[cfg(test)]
 mod tests;
@@ -27,6 +28,7 @@ fn refuse() -> Refusal {
 }
 #[derive(Clone)]
 struct Output {
+    base: bool,
     ir: OutputColumn,
     inputs: Vec<(ColumnRef, Label)>,
 }
@@ -41,6 +43,9 @@ struct Bound {
 }
 type Scope = Vec<Bound>;
 struct State<'a> {
+    sql: &'a str,
+    json_outputs: Vec<(usize, OutputRewrite)>,
+    json_inputs: Vec<InputRewrite>,
     snapshot: &'a Snapshot,
     policy: &'a Policy,
     stmt: ResolvedStatement,
@@ -131,6 +136,7 @@ pub fn lower_gsql(
         }
     }
     let mut s = State {
+        sql, json_outputs: vec![], json_inputs: vec![],
         snapshot,
         policy,
         stmt: ResolvedStatement {
@@ -155,6 +161,10 @@ pub fn lower_gsql(
         sql_has_backslash: sql.contains('\\'),
     };
     s.statement(&parsed[0])?;
+    if !s.json_outputs.is_empty() || !s.json_inputs.is_empty() {
+        if s.stmt.kind != StatementKind::Select { return Err(refuse()); }
+        s.stmt.kind = StatementKind::JsonSelect { outputs: s.json_outputs, inputs: s.json_inputs };
+    }
     s.stmt.plain_params = s.plain.into_iter().collect();
     Ok((s.stmt, s.names))
 }
@@ -179,6 +189,10 @@ impl State<'_> {
         }
     }
     fn record(&mut self, e: &expr::Expr, kind: UseKind, context: &Context) {
+        if matches!(e.value, ValueSource::JsonLeaf(_)) && !matches!(kind, UseKind::Equality { .. } | UseKind::IsNull) {
+            for (column, _) in &e.inputs { self.stmt.uses.push(ColumnUse { column: column.clone(), label: Label::Masked, kind: kind.clone(), context: context.clone() }); }
+            return;
+        }
         for (c, l) in &e.inputs {
             self.stmt.uses.push(ColumnUse {
                 column: c.clone(),
@@ -187,7 +201,7 @@ impl State<'_> {
                 } else {
                     l.clone()
                 },
-                kind: kind.clone(),
+                kind: if matches!(e.value, ValueSource::JsonLeaf(_)) { UseKind::JsonLeaf { kind: Box::new(kind.clone()) } } else { kind.clone() },
                 context: context.clone(),
             })
         }
@@ -299,6 +313,7 @@ impl State<'_> {
                 };
                 let label = self.label(&col);
                 Output {
+                    base: r.kind == RelationKind::Table,
                     inputs: if label == Label::Plain {
                         vec![]
                     } else {

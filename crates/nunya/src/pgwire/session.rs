@@ -764,7 +764,8 @@ impl Session {
 fn writes(kind: &StatementKind) -> bool {
     match kind {
         StatementKind::Insert | StatementKind::Update | StatementKind::Delete => true,
-        StatementKind::Select
+        StatementKind::JsonSelect { .. }
+        | StatementKind::Select
         | StatementKind::Begin
         | StatementKind::Commit
         | StatementKind::Rollback
@@ -785,6 +786,10 @@ fn recovery(kind: &StatementKind) -> bool {
 fn literal_text<'a>(statement: &'a ResolvedStatement, span: &ir::Span) -> Result<&'a str, Refusal> {
     let uses = statement.uses.iter().filter_map(|u| match &u.kind {
         UseKind::Equality { other } => Some(other),
+        UseKind::JsonLeaf { kind } => match kind.as_ref() {
+            UseKind::Equality { other } => Some(other),
+            _ => None,
+        },
         _ => None,
     });
     uses.chain(statement.writes.iter().map(|w| &w.value))
@@ -826,6 +831,7 @@ fn rewrite_literals(
                     replacements.push((span.clone(), ir::rewrite::literal_for(&decoded)?));
                 }
                 InputRewrite::DecryptParam { .. } => {}
+                InputRewrite::ReplaceSpan { span, text } => replacements.push((span.clone(), text.clone())),
             }
         }
     }
@@ -955,6 +961,12 @@ fn format_at(formats: &[i16], index: usize, len: usize) -> Result<i16, Refusal> 
 }
 fn validate_json_fields(fields: &[FieldDescription], plan: &RewritePlan) -> Result<(), Refusal> {
     for (field, output) in fields.iter().zip(&plan.outputs) {
+        if let OutputRewrite::JsonExtract { base, text, .. } = output {
+            let expected = if *text { Some(25) } else { base.pg_oid() };
+            if !matches!(base, ColumnType::Json | ColumnType::Jsonb) || expected != Some(field.type_oid) {
+                return Err(failure(NyCode::NotAnalysable));
+            }
+        }
         if let OutputRewrite::JsonFilter { ty, .. } = output
             && (!matches!(ty, ColumnType::Json | ColumnType::Jsonb)
                 || ty.pg_oid() != Some(field.type_oid))
@@ -999,6 +1011,28 @@ fn rewrite_row(
                 )? {
                     JsonOutput::Document(bytes) => Some(bytes),
                     JsonOutput::SqlNull => None,
+                }
+            }
+            (Some(bytes), OutputRewrite::JsonExtract { filter, base, text, keep_empty }) => {
+                use crate::json::{codec::{self, JsonFormat}, filter::{JsonInput, JsonOutput}, JsonLimits, JsonValue};
+                let wire = match (base, *text, format) {
+                    (ColumnType::Json, _, 0 | 1) => JsonFormat::PgJsonText,
+                    (ColumnType::Jsonb, true, 0 | 1) | (ColumnType::Jsonb, false, 0) => JsonFormat::PgJsonbText,
+                    (ColumnType::Jsonb, false, 1) => JsonFormat::PgJsonbBinary,
+                    _ => return Err(failure(NyCode::NotAnalysable)),
+                };
+                match crate::json::filter::extraction_output(crate::json::filter::apply_collect(&filter.rules, filter.mode, keys, codec,
+                    &policy.domains, &JsonLimits::default(), JsonInput { format: wire, bytes: &bytes }, &mut tokens)?, filter.mode, *keep_empty, wire)? {
+                    JsonOutput::SqlNull => None,
+                    JsonOutput::Document(bytes) if !text => Some(bytes),
+                    JsonOutput::Document(bytes) => {
+                        let tree = codec::decode(wire, &bytes, &JsonLimits::default())?;
+                        match &tree {
+                            JsonValue::Null => None,
+                            JsonValue::String(s) => Some(s.as_bytes().to_vec()),
+                            JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::Array(_) | JsonValue::Object(_) => Some(bytes),
+                        }
+                    }
                 }
             }
             (Some(bytes), OutputRewrite::Pass) => Some(bytes),
@@ -1093,7 +1127,7 @@ fn rewrite_bind(
                     });
                 }
             }
-            InputRewrite::DecryptLiteral { .. } => {}
+            InputRewrite::DecryptLiteral { .. } | InputRewrite::ReplaceSpan { .. } => {}
         }
     }
     Ok(())
@@ -3156,6 +3190,148 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn json_extract_rows_preserve_tokens_types_and_wire_formats() {
+        use crate::{json::filter::JsonMode, policy::{JsonPathTreatment, JsonLeafType}};
+        let f = Fixture::new();
+        let session = f.session();
+        let policy = f.ctx.policy.read().unwrap();
+        for base in [ColumnType::Json, ColumnType::Jsonb] {
+            for format in [0, 1] {
+                for text in [false, true] {
+                    let wire = |value: &str, text_result: bool| {
+                        let mut bytes = if base == ColumnType::Jsonb && format == 1 && !text_result { vec![1] } else { vec![] };
+                        bytes.extend_from_slice(value.as_bytes()); bytes
+                    };
+                    let mut filter = json_test_filter(JsonMode::Tokenize, true, true);
+                    let make = |filter| RewritePlan { outputs: vec![OutputRewrite::JsonExtract { filter, base: base.clone(), text, keep_empty: false }], inputs: vec![], tokenize: None };
+                    let run = |bytes, plan: &RewritePlan| rewrite_row(vec![bytes], plan, &[format], &policy, &session.keys, &f.ctx.codec);
+                    let plan = make(filter.clone());
+                    let (row, tokens) = run(Some(wire(r#""hidden""#, text)), &plan).unwrap();
+                    let whole = RewritePlan { outputs: vec![OutputRewrite::JsonFilter { filter: json_test_filter(JsonMode::Tokenize, false, true), ty: base.clone() }], inputs: vec![], tokenize: None };
+                    let (document, whole_tokens) = run(Some(wire(r#"{"protected":"hidden"}"#, false)), &whole).unwrap();
+                    assert!(document[0].is_some());
+                    assert_eq!(tokens, whole_tokens);
+                    assert_eq!(row[0], Some(if text { tokens[0].as_bytes().to_vec() } else { wire(&format!("\"{}\"", tokens[0]), false) }));
+                    assert_eq!(run(None, &plan).unwrap().0, vec![None]);
+                    assert_eq!(run(Some(wire("{}", text)), &plan).unwrap().0, vec![None]);
+                    filter.rules[0].treatment = JsonPathTreatment::Show { ty: JsonLeafType::String };
+                    let plan = make(filter);
+                    for input in ["123", "{}", "[]"] {
+                        assert_eq!(run(Some(wire(input, text)), &plan).unwrap().0, vec![None]);
+                    }
+                    let expected = if text { b"hello".to_vec() } else { wire(r#""hello""#, false) };
+                    assert_eq!(run(Some(wire(r#""hello""#, text)), &plan).unwrap().0, vec![Some(expected)]);
+                    let null = run(Some(wire("null", text)), &plan).unwrap().0;
+                    assert_eq!(null, vec![if text { None } else { Some(wire("null", false)) }]);
+                    for (ty, input) in [(JsonLeafType::Number, "123"), (JsonLeafType::Boolean, "true")] {
+                        let mut numeric = json_test_filter(JsonMode::Show, true, false);
+                        numeric.rules[0].treatment = JsonPathTreatment::Show { ty };
+                        let plan = make(numeric);
+                        assert_eq!(run(Some(wire(input, text)), &plan).unwrap().0,
+                            vec![Some(if text { input.as_bytes().to_vec() } else { wire(input, false) })]);
+                    }
+                    let parent = json_test_filter(JsonMode::Show, false, false);
+                    let input = r#"{"protected":"hidden","other":"visible"}"#;
+                    let extracted = make(parent.clone());
+                    let whole = RewritePlan { outputs: vec![OutputRewrite::JsonFilter { filter: parent, ty: base.clone() }], inputs: vec![], tokenize: None };
+                    let a = run(Some(wire(input, text)), &extracted).unwrap().0;
+                    let b = run(Some(wire(input, false)), &whole).unwrap().0;
+                    let mut expected = b[0].clone().unwrap();
+                    if text && base == ColumnType::Jsonb && format == 1 { expected.remove(0); }
+                    assert_eq!(a, vec![Some(expected)]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn json_extraction_simple_extended_and_suspended_portals() {
+        use crate::json::filter::JsonMode;
+        for base in [ColumnType::Json, ColumnType::Jsonb] {
+            for text in [false, true] {
+                for extended in [false, true] {
+                    for format in if extended { vec![0, 1] } else { vec![0] } {
+                        let f = Fixture::new();
+                        let mut snapshot = (**f.ctx.snapshot.read().unwrap()).clone();
+                        snapshot.relations[0].columns[0].ty = base.clone();
+                        *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot);
+                        let mut policy = (**f.ctx.policy.read().unwrap()).clone();
+                        let filter = json_test_filter(JsonMode::Tokenize, false, true);
+                        policy.columns.insert(filter.rules[0].column.clone(), Treatment::Masked { placeholder: None });
+                        policy.json_filters.insert(filter.rules[0].column.clone(), filter);
+                        *f.ctx.policy.write().unwrap() = Arc::new(policy);
+                        let mut session = f.session();
+                        let query = format!("SELECT value->{}'protected' FROM items", if text { ">" } else { "" });
+                        let action = if extended {
+                            let action = session.frontend(Frontend::Parse { name: "s".into(), query, param_types: vec![] });
+                            assert!(!session.backend(Backend::ParseComplete).close);
+                            session.frontend(Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![], params: vec![], result_formats: vec![format] });
+                            assert!(!session.backend(Backend::BindComplete).close);
+                            session.frontend(Frontend::Execute { portal: "p".into(), max_rows: 1 });
+                            action
+                        } else {
+                            let action = session.frontend(Frontend::Query(query));
+                            let mut field = field();
+                            field.type_oid = if text { 25 } else { base.pg_oid().unwrap() };
+                            assert!(!session.backend(Backend::RowDescription(vec![field])).close);
+                            action
+                        };
+                        assert_eq!(action.upstream.len(), 1);
+                        let sql = match &action.upstream[0] {
+                            Frontend::Parse { query, .. } | Frontend::Query(query) => query,
+                            _ => panic!("query expected"),
+                        };
+                        assert_eq!(sql.contains("::text"), text);
+                        let mut bytes = if base == ColumnType::Jsonb && !text && format == 1 { vec![1] } else { vec![] };
+                        bytes.extend_from_slice(br#""hidden""#);
+                        let mut first = None;
+                        for iteration in 0..if extended { 2 } else { 1 } {
+                            let action = session.backend(Backend::DataRow(vec![Some(bytes.clone())]));
+                            assert!(!action.close);
+                            let Backend::DataRow(row) = &action.client[0] else { panic!("expected row") };
+                            assert!(row[0].is_some());
+                            if iteration == 0 { first = Some(row.clone()); } else { assert_eq!(Some(row.clone()), first); }
+                            if extended && iteration == 0 {
+                                assert!(!session.backend(Backend::PortalSuspended).close);
+                                assert_eq!(session.frontend(Frontend::Execute { portal: "p".into(), max_rows: 1 }).upstream.len(), 1);
+                            }
+                        }
+                        assert!(!session.backend(Backend::CommandComplete("SELECT 1".into())).close);
+                        assert!(f.records.lock().unwrap().iter().any(|(rows, tokens)| *rows > 0 && *tokens > 0));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_json_extraction_tracks_filter_dependencies_even_when_plain() {
+        use crate::json::filter::JsonMode;
+        for expression in ["value->>'protected'", "length(value->>'other')"] {
+            let f = Fixture::new();
+            let mut snapshot = (**f.ctx.snapshot.read().unwrap()).clone();
+            snapshot.relations[0].columns[0].ty = ColumnType::Jsonb;
+            *f.ctx.snapshot.write().unwrap() = Arc::new(snapshot);
+            let mut policy = (**f.ctx.policy.read().unwrap()).clone();
+            let filter = json_test_filter(JsonMode::Show, false, true);
+            let column = filter.rules[0].column.clone();
+            policy.columns.insert(column.clone(), Treatment::Masked { placeholder: None });
+            policy.json_filters.insert(column.clone(), filter);
+            *f.ctx.policy.write().unwrap() = Arc::new(policy);
+            let mut session = f.session();
+            let parsed = session.frontend(Frontend::Parse { name: "s".into(), query: format!("SELECT {expression} FROM items"), param_types: vec![] });
+            assert_eq!(parsed.upstream.len(), 1);
+            session.backend(Backend::ParseComplete);
+            let mut policy = (**f.ctx.policy.read().unwrap()).clone();
+            policy.json_filters.get_mut(&column).unwrap().rules[0].treatment = crate::policy::JsonPathTreatment::Masked;
+            *f.ctx.policy.write().unwrap() = Arc::new(policy);
+            let action = session.frontend(Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![], params: vec![], result_formats: vec![] });
+            assert!(action.upstream.is_empty());
+            assert_eq!(code(&action), "NY008");
+        }
+    }
+
+    #[test]
     fn json_row_description_requires_matching_oid() {
         for (ty, oid) in [(ColumnType::Json, 114), (ColumnType::Jsonb, 3802)] {
             let plan = RewritePlan { outputs: vec![OutputRewrite::JsonFilter { filter: json_test_filter(crate::json::filter::JsonMode::Show, false, false), ty }], inputs: vec![], tokenize: None };
@@ -4698,6 +4874,29 @@ pub(crate) mod tests {
         active.io.shutdown().await.unwrap();
         first_server.await.unwrap(); second_server.await.unwrap();
         fake.abort(); let _ = fake.await;
+    }
+
+    #[test]
+    fn json_predicate_splice_guards_and_decrypts_literal() {
+        let f = Fixture::new();
+        let session = f.session();
+        let mut snapshot = (**f.ctx.snapshot.read().unwrap()).clone();
+        snapshot.relations[0].columns[0].ty = ColumnType::Jsonb;
+        let mut policy = (**f.ctx.policy.read().unwrap()).clone();
+        let filter = json_test_filter(crate::json::filter::JsonMode::Tokenize, false, true);
+        policy.columns.insert(filter.rules[0].column.clone(), Treatment::Masked { placeholder: None });
+        policy.json_filters.insert(filter.rules[0].column.clone(), filter);
+        let domain = DomainName("secret".into());
+        let token = f.ctx.codec.encode(&session.keys, &domain, &ColumnType::Text, None, &SqlValue::Text("O'Brien".into())).unwrap();
+        let SqlValue::Text(token) = token else { panic!("text") };
+        let sql = format!("SELECT 1 FROM items WHERE value->>'protected' = '{}'", token.replace("'", "''"));
+        let statements = f.ctx.lowering.lower(&sql, &snapshot, &policy, &[]).unwrap();
+        let plans = statements.iter().map(|s| ir::check::check(s, &policy, &snapshot).unwrap()).collect::<Vec<_>>();
+        let rewritten = rewrite_literals(&sql, &statements, &plans, &policy, &session.keys, &f.ctx.codec).unwrap();
+        assert!(rewritten.contains("CASE WHEN") && rewritten.contains("jsonb_typeof(value->'protected') = 'string'"));
+        assert!(rewritten.ends_with(" = 'O''Brien'"));
+        assert!(!rewritten.contains(&token));
+        pg_query::parse(&rewritten, 0).unwrap();
     }
 
 }
