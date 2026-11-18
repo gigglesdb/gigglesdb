@@ -701,6 +701,7 @@ impl Relational {
                 }
             }
         }
+        let write_targets = constraint_rows::write_targets(self, prepared, &edges);
         if writing && actions.is_none() {
             while hydrate(
                 &self.clone(),
@@ -710,6 +711,7 @@ impl Relational {
                 sink,
                 &mut retention,
                 append,
+                &write_targets,
             )? > 0
             {}
         }
@@ -799,6 +801,7 @@ impl Relational {
                                     sink,
                                     &mut retention,
                                     append,
+                                    &write_targets,
                                 )? == 0
                                 {
                                     break;

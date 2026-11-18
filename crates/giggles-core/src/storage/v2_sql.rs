@@ -920,6 +920,13 @@ impl SqlSession {
                         } else {
                             1..u64::MAX
                         };
+                        #[cfg(test)]
+                        if matches!(class, V2Class::Dml) {
+                            AFTER_DML_VERSION_RESERVATION.with(|hook| {
+                                let callback = hook.borrow_mut().take();
+                                if let Some(callback) = callback { callback(); }
+                            });
+                        }
                         let catalog_image = catalog.image()
                         .map_err(|error| match error {
                             E::Unsupported => CoreError::Sql(E::Unsupported),
@@ -2813,3 +2820,8 @@ mod protected_validation_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "v2_protected_fk_tests.rs"]
 mod protected_fk_tests;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static AFTER_DML_VERSION_RESERVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}

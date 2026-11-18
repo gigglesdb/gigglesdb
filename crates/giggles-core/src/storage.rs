@@ -69,6 +69,8 @@ mod copy_input;
 #[cfg(feature = "engine-rocksdb")]
 mod v2_export;
 mod v2_sql;
+#[cfg(all(test, feature = "engine-rocksdb"))]
+mod v2_fk_row_lock_tests;
 use copy_input::CopyInput;
 pub use cursor::Cursor;
 pub use secondary_index_public::IndexInfo;

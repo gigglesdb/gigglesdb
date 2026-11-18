@@ -170,7 +170,7 @@ pub(crate) fn validate_append(state: &Relational, table: &TableDef, first_versio
             // Only new rows need outgoing witnesses. Hydrated parents are identical
             // in before/page; recursively expanding them walks self-FK chains.
             hydrate(&page.clone(), &state.ext.constraints, &mut before, &mut page,
-                sink, &mut retention, true)?;
+                sink, &mut retention, true, &BTreeSet::new())?;
             // A new self-FK row can also witness another new row's parent.
             // Hydration must not make that seed look unchanged and skip its FK.
             for key in inserted {

@@ -11,6 +11,33 @@ pub(super) fn rebuild(
     Ok(())
 }
 
+/// Include indirect action targets, including cycles, without treating outgoing
+/// existence witnesses as writable tables.
+pub(super) fn write_targets(
+    state: &Relational, prepared: &Prepared, edges: &BTreeMap<u64, Vec<Constraint>>,
+) -> BTreeSet<u64> {
+    let mut targets = prepared.table().into_iter().map(str::to_owned)
+        .chain(prepared.write_tables().into_iter().map(|(name, _)| name))
+        .filter_map(|name| state.tables.get(&name).map(|table| table.id))
+        .collect::<BTreeSet<_>>();
+    loop {
+        let count = targets.len();
+        for (child, constraints) in edges {
+            for constraint in constraints {
+                if let ConstraintKind::ForeignKey { ref_table, on_delete, on_update, .. } = &constraint.kind
+                    && targets.contains(ref_table)
+                    && [on_delete, on_update].iter().any(|action| matches!(action,
+                        catalog_ext::Action::Cascade | catalog_ext::Action::SetNull | catalog_ext::Action::SetDefault))
+                {
+                    targets.insert(*child);
+                }
+            }
+        }
+        if targets.len() == count { return targets; }
+    }
+}
+
+#[expect(clippy::too_many_arguments, reason = "FK hydration shares statement images, budget and write targets")]
 pub(super) fn hydrate(
     seeds: &Relational,
     edges: &BTreeMap<u64, Vec<Constraint>>,
@@ -19,6 +46,7 @@ pub(super) fn hydrate(
     sink: &mut impl RowSink,
     budget: &mut scan::Retention,
     parents_only: bool,
+    write_targets: &BTreeSet<u64>,
 ) -> Result<usize, CoreError> {
     let mut added = 0;
     for (child_id, cs) in edges {
@@ -184,10 +212,16 @@ pub(super) fn hydrate(
                             if old.len() >= MAX_ROWS {
                                 return Err(SqlError::Limit);
                             }
-                            before.next_version = before
-                                .next_version
-                                .max(row.version.checked_add(1).ok_or(SqlError::Overflow)?);
-                            staged.next_version = staged.next_version.max(before.next_version);
+                            // Only tables this statement can rewrite constrain its allocator:
+                            // direct write targets and transitive referential-action children.
+                            // An existence-only parent can have a newer reserved range,
+                            // just like a source row, without consuming our reservation.
+                            if write_targets.contains(&target.id) {
+                                before.next_version = before
+                                    .next_version
+                                    .max(row.version.checked_add(1).ok_or(SqlError::Overflow)?);
+                                staged.next_version = staged.next_version.max(before.next_version);
+                            }
                             staged
                                 .rows
                                 .get_mut(&target.id)
@@ -234,7 +268,7 @@ pub(super) fn paged_pending(
                 let mut before = state.clone();
                 let mut retention = scan::Retention::new(scan::retention_limit());
                 while hydrate(&page.clone(), &state.ext.constraints, &mut before, &mut page,
-                    sink, &mut retention, true)? > 0 {}
+                    sink, &mut retention, true, &BTreeSet::new())? > 0 {}
                 rebuild(&mut page, &sink.indexes())?;
                 page.validate_deferred(&mut pending, || crate::cancellation::check().is_err())
                     .map_err(CoreError::Sql)?;
