@@ -3572,3 +3572,183 @@ async fn live_parallel_tokenize_respects_limits() -> ServeResult<()> {
     checks.finish(TEST, ITERATIONS);
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG pointing at harness database"]
+async fn live_two_deployments_refuse_cross_deployment_reuse() -> ServeResult<()> {
+    const TEST: &str = "live_two_deployments_refuse_cross_deployment_reuse";
+    eprintln!();
+    let upstream = std::env::var("NUNYA_TEST_PG")?;
+    let policy = file_sink_policy();
+    let mut a = ServeHarness::new(&policy, Some(&upstream), None, None, "")?;
+    let mut b = ServeHarness::new(&policy, Some(&upstream), None, None, "")?;
+    a.start().await?;
+    b.start().await?;
+    let mut checks = LiveChecks::default();
+    let status_a = a.admin().status().await?;
+    let status_b = b.admin().status().await?;
+    let distinct = !status_a.deployment_id.is_empty()
+        && !status_b.deployment_id.is_empty()
+        && status_a.deployment_id != status_b.deployment_id;
+    let separate = a.state_dir() != b.state_dir();
+    let same_root =
+        std::fs::read(a.dir().join("root.key"))? == std::fs::read(b.dir().join("root.key"))?;
+    checks.check(
+        TEST,
+        "distinct-deployments",
+        distinct && separate && same_root,
+        format!("distinct_ids={distinct} separate_state_dirs={separate} same_root={same_root}"),
+    );
+
+    let (sa, secret_a, principal_a) = a
+        .acquire_session("deployment-owner", "postgres", Mode::ReadWrite)
+        .await?;
+    let (sb, secret_b, _) = b
+        .acquire_session("deployment-owner", "postgres", Mode::ReadWrite)
+        .await?;
+    let (ca, _da) = session_connect(&a, &sa, &secret_a).await?;
+    let (ca2, _da2) = session_connect(&a, &sa, &secret_a).await?;
+    let (cb, _db) = session_connect(&b, &sb, &secret_b).await?;
+    let ta = token(&ca).await?;
+    let ta2 = token(&ca2).await?;
+    let tb = token(&cb).await?;
+    let tb2 = token(&cb).await?;
+    let sql = "SELECT nunya_tokenize('email', 'deployment-scope@example.test')";
+    let explicit_a = values(&ca, sql).await?;
+    let explicit_b = values(&cb, sql).await?;
+    let explicit_valid = [&explicit_a, &explicit_b]
+        .iter()
+        .all(|rows| rows.len() == 1 && rows[0].len() == 1 && rows[0][0].starts_with("tok_"));
+    let stable = ta == ta2 && tb == tb2;
+    checks.check(TEST, "same-plaintext-different-tokens",
+        ta.starts_with("tok_") && tb.starts_with("tok_") && ta != tb && stable
+            && explicit_valid && explicit_a != explicit_b,
+        format!("row_tokens_differ={} explicit_tokens_differ={} stable={stable} explicit_valid={explicit_valid} lengths={},{}",
+            ta != tb, explicit_a != explicit_b, ta.len(), tb.len()));
+
+    let own = cb
+        .query("SELECT id FROM customers WHERE email = $1", &[&tb])
+        .await;
+    let own_ok = own
+        .as_ref()
+        .is_ok_and(|rows| rows.len() == 1 && rows[0].get::<_, i32>(0) == 1);
+    let extended = live_outcome(
+        cb.query("SELECT id FROM customers WHERE email = $1", &[&ta])
+            .await,
+    );
+    let literal = live_outcome(
+        cb.simple_query(&format!(
+            "SELECT id FROM customers WHERE email = '{}'",
+            ta.replace('\'', "''")
+        ))
+        .await,
+    );
+    let own_literal = values(
+        &cb,
+        &format!(
+            "SELECT id FROM customers WHERE email = '{}'",
+            tb.replace('\'', "''")
+        ),
+    )
+    .await;
+    let own_literal_ok = own_literal.is_ok_and(|rows| rows == vec![vec!["1".to_owned()]]);
+    checks.check(TEST, "foreign-token-refused",
+        own_ok && own_literal_ok && extended.starts_with("NY") && literal.starts_with("NY"),
+        format!("extended_sqlstate={extended} literal_sqlstate={literal} own_parameter_id1={own_ok} own_literal_id1={own_literal_ok}"));
+
+    let own_session = live_outcome(connect(&a, &format!("session:{}", sa.id), &secret_a).await);
+    let foreign_session = live_outcome(connect(&b, &format!("session:{}", sa.id), &secret_a).await);
+    checks.check(
+        TEST,
+        "foreign-session-refused",
+        own_session == "ok" && foreign_session == "NY003",
+        format!("own_login={own_session} foreign_sqlstate={foreign_session}"),
+    );
+
+    let own_principal = acquire(&owner(&a, "deployment-owner", &principal_a)?, false, None).await;
+    let foreign_principal =
+        acquire(&owner(&b, "deployment-owner", &principal_a)?, false, None).await;
+    let refusal = foreign_principal
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<ClientError>());
+    let refused = matches!(
+        refusal,
+        Some(ClientError::Api {
+            status: 401 | 403,
+            ..
+        })
+    );
+    checks.check(
+        TEST,
+        "foreign-principal-refused",
+        own_principal.is_ok() && refused,
+        format!(
+            "own_acquire={} foreign_error={refusal:?}",
+            own_principal.is_ok()
+        ),
+    );
+    checks.finish(TEST, 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG, NUNYA_TEST_PG_ADMIN and NUNYA_TEST_SPANNER_* harness endpoints"]
+async fn live_two_deployments_native_refuse_cross_deployment_reuse() -> ServeResult<()> {
+    use googleapis_tonic_google_spanner_v1::google::spanner::v1::TypeCode;
+    const TEST: &str = "live_two_deployments_native_refuse_cross_deployment_reuse";
+    eprintln!();
+    let (f, mut a) = restart_fixture().await?;
+    let policy = std::fs::read_to_string(a.dir().join("policy.toml"))?;
+    let mut b = f.harness(&policy, Some(&std::env::var("NUNYA_TEST_PG")?), "")?;
+    let path = b.dir().join("nunya.toml");
+    let config = std::fs::read_to_string(&path)?;
+    std::fs::write(path, format!("schemas = ['public', '{}']\n{config}", f.schema))?;
+    a.start().await?;
+    b.start().await?;
+    let (sa, secret_a, _) = a.acquire_session("native-a", "spanner-native", Mode::ReadWrite).await?;
+    let (sb, secret_b, _) = b.acquire_session("native-b", "spanner-native", Mode::ReadWrite).await?;
+    let mut cleanup = f.sessions();
+    let (mut ca, name_a) = native_open(&a, &sa, &secret_a, &f.database, &mut cleanup).await?;
+    let (mut cb, name_b) = native_open(&b, &sb, &secret_b, &f.database, &mut cleanup).await?;
+    let select = format!("SELECT email FROM {}.t WHERE id = 1", f.schema);
+    let ta = native_cells(&ca.execute_sql(spanner_sql(&name_a, &select)).await?.into_inner())?;
+    let tb = native_cells(&cb.execute_sql(spanner_sql(&name_b, &select)).await?.into_inner())?;
+    let again = native_cells(&ca.execute_sql(spanner_sql(&name_a, &select)).await?.into_inner())?;
+    let ea = native_tokenize(&mut ca, &name_a, "deployment-scope@example.test").await?;
+    let eb = native_tokenize(&mut cb, &name_b, "deployment-scope@example.test").await?;
+    let valid = [&ta, &tb].iter().all(|rows|
+        rows.len() == 1 && rows[0].len() == 1 && rows[0][0].starts_with("tok_"));
+    let mut checks = LiveChecks::default();
+    checks.check(TEST, "native-same-plaintext-different-tokens",
+        valid && ta != tb && ta == again && ea != eb && ea.starts_with("tok_")
+            && eb.starts_with("tok_") && a.state_dir() != b.state_dir(),
+        format!("valid={valid} row_tokens_differ={} explicit_tokens_differ={} stable={}",
+            ta != tb, ea != eb, ta == again));
+    if !valid {
+        checks.check(TEST, "native-foreign-token-refused", false, "no valid tokens for probe".into());
+    } else {
+        let predicate = format!("SELECT id FROM {}.t WHERE email = @v", f.schema);
+        let mut own = spanner_sql(&name_b, &predicate);
+        native_parameter(&mut own, "v", &tb[0][0], TypeCode::String);
+        let own_ok = match cb.execute_sql(own).await {
+            Ok(response) => native_cells(&response.into_inner())? == vec![vec!["1".to_owned()]],
+            Err(_) => false,
+        };
+        let mut foreign = spanner_sql(&name_b, &predicate);
+        native_parameter(&mut foreign, "v", &ta[0][0], TypeCode::String);
+        let (refused, outcome) = match cb.execute_sql(foreign).await {
+            Ok(_) => (false, "ok".to_owned()),
+            Err(status) => {
+                let sqlstate = status.message().split(':').next()
+                    .filter(|s| s.len() == 5 && s.starts_with("NY"))
+                    .unwrap_or("no-sqlstate");
+                (sqlstate != "no-sqlstate", format!("{:?}/{sqlstate}", status.code()))
+            }
+        };
+        checks.check(TEST, "native-foreign-token-refused", own_ok && refused,
+            format!("foreign_outcome={outcome} own_parameter_id1={own_ok}"));
+    }
+    checks.finish(TEST, 1);
+    Ok(())
+}
