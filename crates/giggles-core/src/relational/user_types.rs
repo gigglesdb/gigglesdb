@@ -5,11 +5,14 @@ use super::*;
 type SqlNotice = (String, Option<String>, Option<&'static str>);
 thread_local! {
     static SQL_NOTICES: std::cell::RefCell<Vec<SqlNotice>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SQL_ERROR_HINT: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
     static SQL_ERROR_DETAIL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static SQL_ERROR_MESSAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 /// Consume the diagnostic immediately after a synchronous SQL call on this thread.
 /// SQLSTATE remains the stable, field-less SqlError contract.
+pub fn take_sql_error_hint() -> Option<&'static str> { SQL_ERROR_HINT.with(|v| v.borrow_mut().take()) }
+pub(super) fn sql_error_hint(hint: &'static str) { SQL_ERROR_HINT.with(|v| *v.borrow_mut()=Some(hint)); }
 pub fn take_sql_error_detail() -> Option<String> { SQL_ERROR_DETAIL.with(|v| v.borrow_mut().take()) }
 pub(super) fn sql_error_detail(detail: String) { SQL_ERROR_DETAIL.with(|v| *v.borrow_mut()=Some(detail)); }
 pub fn take_sql_error_message() -> Option<String> {
@@ -51,6 +54,7 @@ pub(super) fn truncate_reference_error() {
 }
 pub(super) fn clear_sql_error_message() {
     take_sql_notices();
+    take_sql_error_hint();
     take_sql_error_detail();
     take_sql_error_message();
 }
@@ -728,6 +732,7 @@ impl CompositeSelect {
 /// Catalog type metadata from one SQL snapshot.
 #[derive(Debug, Clone)]
 pub struct UserTypeCatalog {
+    pub extensions: BTreeMap<String, super::extensions::InstalledExtension>,
     pub epoch: u64,
     pub types: BTreeMap<u64, TypeDef>,
     pub column_types: BTreeMap<u64, u64>,
@@ -735,6 +740,7 @@ pub struct UserTypeCatalog {
 impl Relational {
     pub(crate) fn user_type_catalog(&self) -> UserTypeCatalog {
         UserTypeCatalog {
+            extensions: self.ext.extensions.clone(),
             epoch: self.epoch,
             types: self.ext.types.clone(),
             column_types: self

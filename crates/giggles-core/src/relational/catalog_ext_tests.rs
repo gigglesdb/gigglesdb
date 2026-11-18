@@ -53,7 +53,7 @@ fn constraint_extension_frozen_v1_and_canonical_v2_goldens() {
             .contains("noncanonical")
     );
     let mut unknown = bytes(V1);
-    unknown[..4].copy_from_slice(&11u32.to_be_bytes());
+    unknown[..4].copy_from_slice(&12u32.to_be_bytes());
     assert!(
         codec()
             .deserialize::<CatalogExt>(&unknown)
@@ -611,7 +611,7 @@ fn unique_origin_v7_roundtrip_and_old_index_has_no_origin() {
     let mut old: Relational = bincode::deserialize(&base).unwrap();
     old.secondary_restore_engine(secondary_index::codec::decode_pending(&indexes, || false).unwrap(), || false).unwrap();
     assert!(old.catalog_presentation().unwrap().constraints.is_empty());
-    let mut unknown = ext; unknown[..4].copy_from_slice(&11u32.to_be_bytes());
+    let mut unknown = ext; unknown[..4].copy_from_slice(&12u32.to_be_bytes());
     assert!(codec().deserialize::<CatalogExt>(&unknown).unwrap_err().to_string().contains(catalog_ext::UNSUPPORTED_CATALOG_EXT));
 }
 

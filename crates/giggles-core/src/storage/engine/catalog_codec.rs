@@ -834,6 +834,7 @@ pub(crate) enum CatalogKind {
     TypeDefinition,
     Collation,
     ColumnCollation,
+    Extensions,
     Index,
     SqlView,
     RelationComment,
@@ -843,6 +844,9 @@ pub(crate) enum CatalogKind {
     /// Kind 21: untrusted-text column label (GD-0061 R3-307).
     ColumnLabel,
 }
+/// Singleton built-in extension inventory; 24 belongs to task credentials.
+pub(crate) const EXTENSIONS_KIND: u8 = 25;
+
 pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError> {
     Ok(match key.first() {
         Some(1) if key.len() == 9 => CatalogKind::Table,
@@ -862,6 +866,7 @@ pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError>
             CatalogKind::Schema
         }
         Some(15) if key.len() == 9 => CatalogKind::TypeDefinition,
+        Some(&EXTENSIONS_KIND) if key.len() == 1 => CatalogKind::Extensions,
         Some(23) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::ColumnCollation,
         Some(22) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::Collation,
         Some(kind)
@@ -1039,3 +1044,14 @@ pub(crate) fn requires_text_backed_types(def: &TableDef) -> bool {
 #[cfg(test)]
 #[path = "catalog_codec_tests.rs"]
 mod tests;
+
+pub(crate) fn encode_extensions(v: &BTreeMap<String, crate::relational::InstalledExtension>) -> Result<Vec<u8>, CoreError> {
+    encode_version(1, v)
+}
+pub(crate) fn decode_extensions(v: &[u8]) -> Result<BTreeMap<String, crate::relational::InstalledExtension>, CoreError> {
+    #[derive(Deserialize)]
+    struct Map(#[serde(deserialize_with = "crate::relational::catalog_ext::extension_map")] BTreeMap<String, crate::relational::InstalledExtension>);
+    let Map(map) = decode_version(1, v)?;
+    if map.is_empty() || map.len() > 64 || map.keys().any(|n| n.len() > 63) { return Err(corrupt("invalid extension map")); }
+    Ok(map)
+}

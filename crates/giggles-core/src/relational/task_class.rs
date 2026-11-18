@@ -76,7 +76,7 @@ impl Prepared {
             Statement::Savepoint(_) | Statement::Release(_) | Statement::RollbackTo(_) => {
                 StatementClass::Savepoint
             }
-            Statement::Schema(_)
+            Statement::Extension(_) | Statement::Schema(_)
             | Statement::TypeDdl(_) | Statement::CollationDdl(_)
             | Statement::Sequence(_)
             | Statement::Create { .. }

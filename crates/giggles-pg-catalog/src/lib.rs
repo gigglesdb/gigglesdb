@@ -173,6 +173,7 @@ pub struct UserType {
 /// the host remains responsible for authentication, membership, and authorization.
 #[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
+    pub extensions: Vec<ExtensionDef>,
     /// Catalog xid: legacy publication counter or V2 physical HLC seconds.
     /// xmin exposes its low 32 bits; this is never a raw HLC timestamp.
     pub generation: u64,
@@ -234,6 +235,7 @@ impl CatalogSnapshot {
 impl Default for CatalogSnapshot {
     fn default() -> Self {
         Self {
+            extensions: vec![ExtensionDef::plpgsql(), ExtensionDef::uuid_ossp()],
             generation: 0,
             views: Default::default(),
             constraints: Vec::new(), column_defaults: Default::default(),
@@ -487,5 +489,25 @@ pub fn parse_xid(text: &str) -> Result<u32, Error> {
         Ok(0u32.wrapping_sub(value))
     } else {
         Ok(value)
+    }
+}
+
+/// Built-in extension availability and optional per-database installation.
+#[derive(Debug, Clone)]
+pub struct ExtensionDef {
+    pub name: String, pub default_version: String, pub versions: Vec<String>, pub comment: String,
+    pub relocatable: bool, pub superuser: bool, pub trusted: bool, pub schema: Option<String>,
+    pub requires: Vec<String>, pub installed: Option<(u32, u32, u32, String)>,
+}
+impl ExtensionDef {
+    pub fn plpgsql() -> Self {
+        Self { name: "plpgsql".into(), default_version: "1.0".into(), versions: vec!["1.0".into()],
+            comment: "PL/pgSQL procedural language".into(), relocatable: false, superuser: true, trusted: true,
+            schema: Some("pg_catalog".into()), requires: vec![], installed: Some((13643, 10, 11, "1.0".into())) }
+    }
+    pub fn uuid_ossp() -> Self {
+        Self { name: "uuid-ossp".into(), default_version: "1.1".into(), versions: vec!["1.1".into()],
+            comment: "generate universally unique identifiers (UUIDs)".into(), relocatable: true, superuser: true, trusted: true,
+            schema: None, requires: vec![], installed: None }
     }
 }

@@ -901,7 +901,9 @@ async fn owner_key_hygiene(protocol: Protocol) {
         .find(|(kind, _)| *kind == b'E')
         .unwrap_or_else(|| panic!("{protocol:?}: SELECT a FROM rb: {messages:?}"));
     assert!(
-        error.split(|byte| *byte == 0).any(|field| field == b"C42501"),
+        error
+            .split(|byte| *byte == 0)
+            .any(|field| field == b"C42501"),
         "{protocol:?}: SELECT a FROM rb: {messages:?}"
     );
     assert!(
@@ -1004,4 +1006,172 @@ async fn simple_owner_key_hygiene() {
 #[tokio::test]
 async fn extended_owner_key_hygiene() {
     owner_key_hygiene(Protocol::Extended).await;
+}
+
+#[tokio::test]
+async fn extension_scalars_route_through_database_context() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = Fixture::new().await;
+    let owner = f.connect("owner", "owner-pw").await;
+    const HINT: &str = "No function matches the given name and argument types. You might need to add explicit type casts.";
+    async fn missing(client: &Client, sql: &str, message: &str) {
+        let error = client.simple_query(sql).await.unwrap_err();
+        let error = error.as_db_error().unwrap();
+        assert_eq!(error.code().code(), "42883", "{sql}");
+        assert_eq!(error.message(), message);
+        assert_eq!(error.hint(), Some(HINT));
+    }
+    missing(
+        &owner,
+        "SELECT uuid_nil()",
+        "function uuid_nil() does not exist",
+    )
+    .await;
+    owner
+        .simple_query("CREATE EXTENSION \"uuid-ossp\"")
+        .await
+        .unwrap();
+    for (sql, expected) in [
+        (
+            "SELECT uuid_generate_v5('6ba7b810-9dad-11d1-80b4-00c04fd430c8','example.com')",
+            vec!["cfbff0d1-9375-5685-968c-48ce8b15ae17"],
+        ),
+        (
+            "SELECT uuid_generate_v3(uuid_ns_url(), 'http://x'), uuid_nil(), uuid_ns_dns(), uuid_ns_oid(), uuid_ns_x500()",
+            vec![
+                "53b14841-9895-312b-bb91-82c1f08c9edd",
+                "00000000-0000-0000-0000-000000000000",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "6ba7b812-9dad-11d1-80b4-00c04fd430c8",
+                "6ba7b814-9dad-11d1-80b4-00c04fd430c8",
+            ],
+        ),
+        (
+            "SELECT length(uuid_generate_v4()::text), uuid_generate_v1() IS NOT NULL",
+            vec!["36", "t"],
+        ),
+        ("SELECT pg_typeof(uuid_nil())", vec!["uuid"]),
+    ] {
+        let messages = owner.simple_query(sql).await.unwrap();
+        let row = messages
+            .iter()
+            .find_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (0..row.len())
+                .map(|i| row.get(i).unwrap())
+                .collect::<Vec<_>>(),
+            expected,
+            "{sql}"
+        );
+        if sql.starts_with("SELECT uuid_generate_v5") {
+            assert_eq!(row.columns()[0].name(), "uuid_generate_v5");
+        }
+    }
+    // Typed Parse UUID/TEXT, text-format Bind values, and text-format result.
+    let mut stream = raw_connect(f.pg.address, "owner").await;
+    let mut parse = b"\0SELECT uuid_generate_v5($1,$2)\0".to_vec();
+    parse.extend_from_slice(&2u16.to_be_bytes());
+    parse.extend_from_slice(&2950u32.to_be_bytes());
+    parse.extend_from_slice(&25u32.to_be_bytes());
+    let mut bind = vec![0, 0, 0, 0, 0, 2];
+    for value in ["6ba7b810-9dad-11d1-80b4-00c04fd430c8", "example.com"] {
+        bind.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        bind.extend_from_slice(value.as_bytes());
+    }
+    bind.extend_from_slice(&[0, 0]);
+    for (kind, body) in [
+        (b'P', parse),
+        (b'B', bind),
+        (b'E', vec![0; 5]),
+        (b'S', vec![]),
+    ] {
+        stream.write_u8(kind).await.unwrap();
+        stream.write_u32((body.len() + 4) as u32).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+    }
+    let mut rows = 0;
+    loop {
+        let kind = stream.read_u8().await.unwrap();
+        let len = stream.read_u32().await.unwrap();
+        let mut body = vec![0; len as usize - 4];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_ne!(kind, b'E', "{body:?}");
+        if kind == b'D' {
+            assert_eq!(&body[6..], b"cfbff0d1-9375-5685-968c-48ce8b15ae17");
+            rows += 1;
+        }
+        if kind == b'Z' {
+            break;
+        }
+    }
+    assert_eq!(rows, 1);
+    drop(stream);
+    // Task admission must still run before extension binding, on both protocols.
+    f.service
+        .reload_bindings(vec![Binding {
+            fingerprint: tls::fingerprint(f.app.cert.der()),
+            role: Role::Task {
+                domain: f.admin.authority_metadata().unwrap().0.to_string(),
+                task: TaskId(91),
+                principal: Principal(92),
+            },
+        }])
+        .unwrap();
+    let server_tls = tls::server(
+        vec![f.server.cert.der().clone()],
+        PrivatePkcs8KeyDer::from(f.server.key.serialize_der()).into(),
+        vec![f.ca.cert.der().clone()],
+    )
+    .unwrap();
+    let agent = serve_pg(
+        "127.0.0.1:0".parse().unwrap(),
+        f.service.clone(),
+        server_tls,
+        8,
+    )
+    .await
+    .unwrap();
+    let client_tls = tls::client(
+        vec![f.app.cert.der().clone()],
+        PrivatePkcs8KeyDer::from(f.app.key.serialize_der()).into(),
+        vec![f.ca.cert.der().clone()],
+    )
+    .unwrap();
+    let (task, connection) = Config::new()
+        .host("localhost")
+        .hostaddr(agent.address.ip())
+        .port(agent.address.port())
+        .user("giggles")
+        .dbname("giggles")
+        .ssl_mode(SslMode::Require)
+        .connect(MakeRustlsConnect::new((*client_tls).clone()))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    for protocol in [Protocol::Simple, Protocol::Extended] {
+        protocol.error(&task, "SELECT uuid_nil()", "42501").await;
+    }
+    owner
+        .simple_query("DROP EXTENSION \"uuid-ossp\"")
+        .await
+        .unwrap();
+    missing(
+        &owner,
+        "SELECT uuid_nil()",
+        "function uuid_nil() does not exist",
+    )
+    .await;
+    for protocol in [Protocol::Simple, Protocol::Extended] {
+        protocol.error(&task, "SELECT uuid_nil()", "42501").await;
+    }
+    drop(task);
+    drop(owner);
+    agent.shutdown().await.unwrap();
+    f.pg.shutdown().await.unwrap();
 }

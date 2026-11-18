@@ -226,7 +226,8 @@ impl InsertExpressions {
             params: BTreeSet::new(),
             relations: Vec::new(),
         };
-        let value = Scalar::parse_aggregate_argument(&mut parser, 0)?;
+        let mut value = Scalar::parse_aggregate_argument(&mut parser, 0)?;
+        value.resolve_extension_default();
         if parser.at != parser.tokens.len() || !parser.params.is_empty() {
             return Err(SqlError::Unsupported);
         }

@@ -361,6 +361,7 @@ impl State {
         self.diagnostic.phase = "catalog planning";
         if Prepared::application_dml(sql, giggles_pg_catalog::catalog_identifier)
             || !Prepared::sequence_dependencies(sql).is_empty()
+            || Prepared::extension_routine_call(sql)
         {
             return Ok(None);
         }

@@ -160,6 +160,8 @@ impl Diagnostic {
     fn core<T>(&mut self, result: Result<T, CoreError>) -> R<T> {
         let message = giggles_core::relational::take_sql_error_message();
         self.sql_detail = giggles_core::relational::take_sql_error_detail();
+        self.wire_hint = giggles_core::relational::take_sql_error_hint();
+        if result.is_err() && message.as_deref().is_some_and(|m| m.starts_with("function uuid_") || m.starts_with("extension ") || m.starts_with("cannot drop extension ") || m.starts_with("schema ")) { self.wire_message = message.clone(); }
         if matches!(
             &result,
             Err(CoreError::Sql(
@@ -798,9 +800,9 @@ fn catalog_plan(
     if Prepared::application_dml(sql, giggles_pg_catalog::catalog_identifier) {
         return Ok(None);
     }
-    // Dependency-bearing sequence calls use the SQL execution context, never
+    // Sequence and extension calls use the database execution context, never
     // the immutable catalog evaluator or the positive table-free allowlist.
-    if !Prepared::sequence_dependencies(sql).is_empty() {
+    if !Prepared::sequence_dependencies(sql).is_empty() || Prepared::extension_routine_call(sql) {
         return Ok(None);
     }
     let planned = match giggles_pg_catalog::plan_gateway(sql) {
@@ -888,12 +890,16 @@ fn core_declared_type(oid: u32) -> Option<DataType> {
 }
 
 fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32], unnamed: bool) -> R<(Plan, Description)> {
+    prepare_declared_sql_diagnostic(&mut Diagnostic::default(), session, sql, oids, unnamed)
+}
+
+fn prepare_declared_sql_diagnostic(diagnostic: &mut Diagnostic, session: &mut Session, sql: &str, oids: &[u32], unnamed: bool) -> R<(Plan, Description)> {
     let declared = oids
         .iter()
         .map(|&o| core_declared_type(o))
         .collect::<Vec<_>>();
-    let prepared = core(if unnamed { session.prepare_unnamed(sql, &declared) } else { session.prepare_with_parameter_types(sql, &declared) })?;
-    let description = core(session.describe(&prepared))?;
+    let prepared = diagnostic.core(if unnamed { session.prepare_unnamed(sql, &declared) } else { session.prepare_with_parameter_types(sql, &declared) })?;
+    let description = diagnostic.core(session.describe(&prepared))?;
     if oids.len() > description.parameters.len() {
         return Err("08P01");
     }
@@ -1466,7 +1472,7 @@ impl State {
             (Plan::Catalog(Box::new(plan), fields, epoch), d)
         } else {
             self.diagnostic.phase = "application prepare";
-            prepare_declared_sql(session, sql, &oids, unnamed)?
+            prepare_declared_sql_diagnostic(&mut self.diagnostic, session, sql, &oids, unnamed)?
         };
         if oids.len() > d.parameters.len() {
             return Err("08P01");
@@ -1494,7 +1500,7 @@ impl State {
                 })
             {
                 let was_aborted = session.is_aborted();
-                match prepare_declared_sql(session, sql, &oids, unnamed) {
+                match prepare_declared_sql_diagnostic(&mut self.diagnostic, session, sql, &oids, unnamed) {
                     Ok((application, description))
                         if oids.len() <= description.parameters.len()
                             && oids

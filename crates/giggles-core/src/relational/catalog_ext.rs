@@ -19,6 +19,7 @@ pub(crate) struct CatalogExt {
     pub(crate) table_schemas: BTreeMap<u64, String>,
     pub(crate) primary_index_birth: BTreeMap<u64, u64>,
     pub(crate) collations: BTreeMap<u64, super::collations::Collation>,
+    pub(crate) extensions: BTreeMap<String, super::extensions::InstalledExtension>,
     pub(crate) column_collations: BTreeMap<u64, super::column_collations::Binding>,
 }
 impl Default for CatalogExt {
@@ -34,13 +35,14 @@ impl Default for CatalogExt {
             table_schemas: BTreeMap::new(),
             primary_index_birth: BTreeMap::new(),
             collations: BTreeMap::new(),
+            extensions: BTreeMap::new(),
             column_collations: BTreeMap::new(),
         }
     }
 }
 impl CatalogExt {
     pub(crate) fn is_empty(&self) -> bool {
-        self.column_collations.is_empty() && self.collations.is_empty()
+        self.extensions.is_empty() && self.column_collations.is_empty() && self.collations.is_empty()
             && self.columns.is_empty()
             && self.constraints.is_empty()
             && self.sequences.is_empty()
@@ -395,7 +397,9 @@ impl CatalogExt {
         !self.primary_index_birth.is_empty() || self.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { target, .. } if target != ReferencedKey::Unknown))
     }
     pub(crate) fn wire_version(&self) -> u32 {
-        if !self.column_collations.is_empty() {
+        if !self.extensions.is_empty() {
+            11
+        } else if !self.column_collations.is_empty() {
             10
         } else if !self.collations.is_empty() {
             9
@@ -426,6 +430,7 @@ impl Serialize for CatalogExt {
         use serde::ser::SerializeTuple;
         let version = self.wire_version();
         let mut out = serializer.serialize_tuple(match version {
+            11 => 12,
             10 => 11,
             9 => 10,
             8 => 9,
@@ -496,6 +501,7 @@ impl Serialize for CatalogExt {
         if version >= 8 { out.serialize_element(&self.primary_index_birth)?; }
         if version >= 9 { out.serialize_element(&self.collations)?; }
         if version >= 10 { out.serialize_element(&self.column_collations)?; }
+        if version >= 11 { out.serialize_element(&self.extensions)?; }
         out.end()
     }
 }
@@ -582,6 +588,8 @@ impl<'de> Deserialize<'de> for CatalogExt {
             d.deserialize_map(SV)
         }
         #[derive(Deserialize)]
+        struct Extensions(#[serde(deserialize_with = "extension_map")] BTreeMap<String, super::extensions::InstalledExtension>);
+        #[derive(Deserialize)]
         struct Membership(#[serde(deserialize_with = "membership_map")] BTreeMap<u64, String>);
         fn membership_map<'de, D: serde::Deserializer<'de>>(
             d: D,
@@ -624,7 +632,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     };
                 }
                 let ext_version = next!(u32);
-                if !matches!(ext_version, 1..=10) {
+                if !matches!(ext_version, 1..=11) {
                     return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
                 }
                 let columns = if ext_version >= 6 {
@@ -692,6 +700,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     primary_index_birth: if ext_version >= 8 { next!(Births).0 } else { BTreeMap::new() },
                     collations: if ext_version >= 9 { next!(Collations).0 } else { BTreeMap::new() },
                     column_collations: if ext_version >= 10 { next!(ColumnCollations).0 } else { BTreeMap::new() },
+                    extensions: if ext_version >= 11 { next!(Extensions).0 } else { BTreeMap::new() },
                 };
                 if ext_version != out.wire_version() {
                     return Err(de::Error::custom("noncanonical catalog extension version"));
@@ -699,7 +708,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                 Ok(out)
             }
         }
-        d.deserialize_tuple(11, V)
+        d.deserialize_tuple(12, V)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1190,7 +1199,7 @@ impl Relational {
         next_id: u64,
         excluded_table: Option<u64>,
     ) -> R<()> {
-        if !matches!(ext.ext_version, 1..=10) {
+        if !matches!(ext.ext_version, 1..=11) {
             return Err(SqlError::Unsupported);
         }
         self.validate_schemas(ext, next_id, excluded_table)?;
@@ -1232,6 +1241,7 @@ impl Relational {
             .copied()
             .chain(ext.schemas.values().map(|s| s.id))
             .collect();
+        super::extensions::validate(ext)?;
         super::column_collations::validate_bindings(self, ext, excluded_table)?;
         let mut collation_names = BTreeSet::new();
         if ext.collations.len() > MAX_TABLES { return Err(SqlError::Limit); }
@@ -1647,3 +1657,30 @@ mod logical_catalog_ext_tests {
 #[cfg(test)]
 #[path = "fk_target_codec_tests.rs"]
 mod fk_target_codec_tests;
+
+pub(crate) fn extension_map<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, super::extensions::InstalledExtension>, D::Error> {
+    struct SV;
+    impl<'de> Visitor<'de> for SV {
+        type Value = BTreeMap<String, super::extensions::InstalledExtension>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("bounded extensions")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+            if a.size_hint().is_some_and(|n| n > 64) {
+                return Err(de::Error::custom("too many extensions"));
+            }
+            let mut out = BTreeMap::new();
+            #[derive(Deserialize)]
+            struct Name(#[serde(deserialize_with = "name")] String);
+            while let Some(key) = a.next_key::<Name>()? {
+                if out.len() >= 64 || out.insert(key.0, a.next_value()?).is_some() {
+                    return Err(de::Error::custom("invalid extensions"));
+                }
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_map(SV)
+}

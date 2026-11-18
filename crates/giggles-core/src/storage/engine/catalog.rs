@@ -89,6 +89,7 @@ pub(crate) struct CatalogView {
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
     pub(crate) types: BTreeMap<u64, TypeDef>,
     pub(crate) collations: BTreeMap<u64, relational::collations::Collation>,
+    pub(crate) extensions: BTreeMap<String, relational::InstalledExtension>,
     pub(crate) column_collations: BTreeMap<u64, relational::column_collations::Binding>,
     pub(crate) schemas: BTreeMap<String, relational::schemas::Schema>,
     pub(crate) indexes: BTreeMap<u64, relational::secondary_index::Descriptor>,
@@ -156,6 +157,7 @@ impl CatalogView {
         parts.ext.sequences = self.sequences.clone();
         parts.ext.types = self.types.clone();
         parts.ext.collations = self.collations.clone();
+        parts.ext.extensions = self.extensions.clone();
         parts.ext.column_collations = self.column_collations.clone();
         parts.ext.schemas = self.schemas.clone();
         if parts.ext.constraints.values().flatten().any(|c| matches!(&c.kind, crate::relational::catalog_ext::ConstraintKind::ForeignKey { deferral, .. } if *deferral != crate::relational::catalog_ext::Deferral::NotDeferrable)) {
@@ -1536,6 +1538,9 @@ fn apply_record(
             }
         }
         CatalogKind::Type => return Err(corrupt("unsupported historical type record")),
+        CatalogKind::Extensions => {
+            view.extensions = match value { Some(v) => catalog_codec::decode_extensions(v)?, None => BTreeMap::new() };
+        }
         CatalogKind::ColumnCollation => {
             let id = decode_id(&key[1..])?;
             if let Some(value) = value { view.column_collations.insert(id, catalog_codec::decode_column_collation(value)?); }
@@ -1726,7 +1731,7 @@ fn finish_view(
     }
     if !view.schemas.is_empty()
         || !view.types.is_empty()
-        || !view.collations.is_empty() || !view.column_collations.is_empty()
+        || !view.extensions.is_empty() || !view.collations.is_empty() || !view.column_collations.is_empty()
         || view.by_name.keys().any(|name| name.contains('\0'))
     {
         let parts = view.parts();
@@ -1892,6 +1897,9 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
         catalog_codec::decode_sequence(&value)?;
         records.insert(catalog_codec::sequence_key(*id), value);
         records.insert(name_key(&def.name), id.to_be_bytes().to_vec());
+    }
+    if !parts.ext.extensions.is_empty() {
+        records.insert(vec![catalog_codec::EXTENSIONS_KIND], catalog_codec::encode_extensions(&parts.ext.extensions)?);
     }
     for (id, binding) in &parts.ext.column_collations {
         records.insert(catalog_codec::column_collation_key(*id), catalog_codec::encode_column_collation(binding)?);

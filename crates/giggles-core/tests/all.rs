@@ -556,3 +556,5 @@ mod planner_collations;
 
 #[path = "sql_float_glibc.rs"]
 mod sql_float_glibc;
+#[path = "sql_extensions.rs"]
+mod sql_extensions;

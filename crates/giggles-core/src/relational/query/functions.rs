@@ -24,6 +24,7 @@ mod integer_formats;
 mod join;
 pub(super) use join::{join_equal, join_key, join_key_supported};
 mod md5;
+pub(super) mod uuid_ossp;
 mod numeric;
 mod overlay;
 #[cfg(test)]
@@ -487,9 +488,9 @@ impl Scalar {
                 }) || case.otherwise.as_ref().is_some_and(Self::has_volatile_call)
             }
             Self::Call(name, args) => {
-                matches!(
+                uuid_ossp::volatile_name(name) || matches!(
                     name.as_str(),
-                    "nextval"
+                    "uuid_generate_v1" | "uuid_generate_v1mc" | "uuid_generate_v4" | "nextval"
                         | "setval"
                         | "currval"
                         | "random"
@@ -774,7 +775,9 @@ impl Scalar {
                         "information_schema" => UNDEFINED_ROUTINE_PREFIX,
                         _ => INVALID_SCHEMA_ROUTINE_PREFIX,
                     };
-                    (format!("{prefix}{routine}"), quoted)
+                    if uuid_ossp::known(&routine) { (format!("\0uuid-ossp:{name}\0{routine}"), quoted) } else { (format!("{prefix}{routine}"), quoted) }
+                } else if uuid_ossp::known(&name) {
+                    (format!("\0uuid-ossp:{name}"), quoted)
                 } else if pg18_routines::PG_CATALOG
                     .binary_search(&name.as_str())
                     .is_ok()
@@ -1254,7 +1257,8 @@ impl Scalar {
                     ),
                 });
             }
-            Self::Call(name, _) if deferred_routine_error(name).is_some() => {
+            Self::Call(name, args) if deferred_routine_error(name).is_some() => {
+                uuid_ossp::missing_diagnostic(name, args, resolve, tables, parameters)?;
                 return Err(deferred_routine_error(name).unwrap());
             }
             Self::Call(name, args) if name == "overlay" => {
@@ -1462,6 +1466,7 @@ impl Scalar {
                         .map(|(_, a)| &a.ty)
                         .or_else(|| args.first().map(|a| &a.ty)),
                 )
+                .or_else(|| uuid_ossp::signature(name, args.len()))
                 .or_else(|| md5::signature(name, args.len(), args.first().map(|a| &a.ty)))
                 .or_else(|| character::signature(name, args.len()))
                 .or_else(|| quoting::signature(name, args.len(), args.first().map(|a| &a.ty)))
@@ -2199,6 +2204,7 @@ impl BoundScalar {
                 }
                 if let Some(result) = position::eval(n, &values, budget)
                     .or_else(|| binary::eval(n, &values, budget))
+                    .or_else(|| uuid_ossp::eval(n, &values))
                     .or_else(|| md5::eval(n, &values, budget))
                     .or_else(|| character::eval(n, &values, budget))
                     .or_else(|| quoting::eval(n, &values, budget))
@@ -2864,6 +2870,7 @@ impl Scalar {
                     arg.infer(None, parameters, resolve, tables)?;
                     validate(arg, parameters, resolve, tables)?;
                 }
+                uuid_ossp::missing_diagnostic(n, args, resolve, tables, parameters)?;
                 return Err(deferred_routine_error(n).unwrap());
             }
             Self::Call(n, args) if n == "pg_xact_status" => {
@@ -2961,7 +2968,7 @@ impl Scalar {
                         .filter_map(|(_, a)| a.bind(resolve, tables, parameters).ok().map(|a| a.ty))
                         .find(|t| *t == DataType::Bytes);
                     let ty = if let Some(sig) =
-                        binary::signature(n, args.len(), first_type.as_ref())
+                        uuid_ossp::signature(n, args.len()).or_else(|| binary::signature(n, args.len(), first_type.as_ref()))
                             .or_else(|| {
                                 md5::signature(n, args.len(), first_type.as_ref())
                                     .filter(|signature| signature.is_ok())

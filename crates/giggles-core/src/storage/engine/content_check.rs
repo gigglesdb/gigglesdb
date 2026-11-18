@@ -31,6 +31,9 @@ pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatErr
     } else if key.first().is_some_and(|kind| matches!(kind, 14 | 15)) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::SCHEMAS_AND_USER_TYPES)
+    } else if key.first() == Some(&catalog_codec::EXTENSIONS_KIND) {
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        Ok(super::meta::BUILTIN_EXTENSIONS)
     } else if key.first() == Some(&23) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::COLUMN_COLLATIONS)
@@ -99,6 +102,10 @@ pub(crate) fn required_bits_for_catalog_value(
                 _ => 0,
             };
             Ok(64 | extra)
+        }
+        CatalogKind::Extensions => {
+            catalog_codec::decode_extensions(value).map_err(corrupt)?;
+            Ok(super::meta::BUILTIN_EXTENSIONS)
         }
         CatalogKind::ColumnCollation => {
             catalog_codec::decode_column_collation(value).map_err(corrupt)?;
@@ -358,6 +365,7 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
                     .map(|_| ())
                     .map_err(corrupt)?;
             }
+            CatalogKind::Extensions => { catalog_codec::decode_extensions(value).map_err(corrupt)?; }
             CatalogKind::ColumnCollation => {column_collations.insert(u64::from_be_bytes(user[1..9].try_into().unwrap()),catalog_codec::decode_column_collation(value).map_err(corrupt)?);}
             CatalogKind::Collation => {collations.insert(u64::from_be_bytes(user[1..9].try_into().unwrap()),catalog_codec::decode_collation(value).map_err(corrupt)?);}
             CatalogKind::Index => {

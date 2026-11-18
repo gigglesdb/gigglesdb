@@ -55,6 +55,7 @@ fn captured_expanded_global_discovery() {
             2 => 17,
             4 => 2, // Built-in pg_default and pg_global tablespaces.
             5 => 3, // Two tablespaces plus the snapshot database.
+            10 => 1, // Fresh PostgreSQL installs plpgsql.
             11 => 3,
             12 => 26, // PG18.6 casts from the reflected integer/text GUI inventory.
             _ => 0,
@@ -81,7 +82,7 @@ fn bounded_union_ctes_aggregate_array_queries() {
         vec![vec![Value::Array(vec![Value::Int(2), Value::Int(3)])]]
     );
     let r = run("SELECT array_agg(oid) FROM pg_extension", &[]);
-    assert_eq!(r.rows, vec![vec![Value::Null]]);
+    assert_eq!(r.rows, vec![vec![Value::Array(vec![Value::Int(13643)])]]);
     let r = run(
         "SELECT relnamespace,array_agg(oid ORDER BY oid) FROM pg_class WHERE relnamespace=2200 GROUP BY relnamespace",
         &[],

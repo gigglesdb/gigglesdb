@@ -868,6 +868,7 @@ impl SqlSession {
                             }
                         })?;
                         let mut image = catalog_image.catalog_image_for_statement(ids.start, versions.start);
+                        p.check_extension_views(&image, old.sql_views.values().map(|v| (v.name.as_str(), v.select.as_str()))).map_err(CoreError::Sql)?;
                         let context = clock.map(|clock| {
                             clock.with_sequences(sql_sequences::callback(
                                 db.clone(),

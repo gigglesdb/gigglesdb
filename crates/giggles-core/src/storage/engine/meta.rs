@@ -36,7 +36,8 @@ pub(crate) const EXPORT_REFUSED: u64 = TASK_CATALOG | PROTECTED_RECORDS;
 /// V2 bits differ from legacy format 53: bit 22 belongs to WRITE_FENCE.
 pub(crate) const USER_COLLATIONS: u64 = 1 << 23;
 pub(crate) const COLUMN_COLLATIONS: u64 = 1 << 24;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 25] = [
+pub(crate) const BUILTIN_EXTENSIONS: u64 = 1 << 25;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 26] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -62,6 +63,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 25] = [
     (WRITE_FENCE, "write_fence"),
     (USER_COLLATIONS, "user_collations"),
     (COLUMN_COLLATIONS, "column_collations"),
+    (BUILTIN_EXTENSIONS, "builtin_extensions"),
 ];
 #[path = "meta_range.rs"]
 mod range_local;
@@ -364,7 +366,7 @@ pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
             | PROTECTED_RECORDS
             | WRITE_FENCE
             | USER_COLLATIONS
-            | COLUMN_COLLATIONS,
+            | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS,
     )
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {

@@ -1756,17 +1756,8 @@ impl Compiler {
                         && args.settings.is_none()
                     {
                         (
-                            Source::Empty,
-                            vec![
-                                Field {
-                                    name: "name".into(),
-                                    data_type: PgType::Name,
-                                },
-                                Field {
-                                    name: "version".into(),
-                                    data_type: PgType::Text,
-                                },
-                            ],
+                            Source::Catalog(n.clone()),
+                            catalog::schema(&n).ok_or(Error::Unsupported)?,
                             alias,
                             n,
                         )

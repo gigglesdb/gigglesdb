@@ -13,6 +13,8 @@ pub(super) mod conflict;
 mod grouping;
 mod insert_values;
 mod schema_names;
+mod extension_dependencies;
+pub(in crate::relational) use extension_dependencies::{extension_call, view_call as extension_view_call};
 mod subplans;
 mod derived;
 pub(super) mod views;
@@ -1984,7 +1986,7 @@ impl Query {
     pub(super) fn has_domain_expression(&self) -> bool {
         let mut found = false;
         let _ = self.walk_scalars(&mut |s| {
-            found |= matches!(s, Scalar::Domain(..)) || matches!(s, Scalar::Call(n,_) if functions::collation::internal(n));
+            found |= matches!(s, Scalar::Domain(..)) || matches!(s, Scalar::Call(n,_) if functions::collation::internal(n) || n.starts_with("\0uuid-ossp:"));
             Ok(())
         });
         found
@@ -3245,7 +3247,10 @@ impl Query {
                 Scalar::Column(_) => false,
                 Scalar::Cast(s, _) | Scalar::Domain(s, ..) | Scalar::Unary(_, s) => scalar(s),
                 Scalar::Binary(_, a, b) => scalar(a) && scalar(b),
-                Scalar::Call(name, _) if TRANSACTION_STATE_ROUTINES.contains(&name.as_str()) => {
+                Scalar::Call(name, _)
+                    if TRANSACTION_STATE_ROUTINES.contains(&name.as_str())
+                        || extensions::routine_name(name) =>
+                {
                     false
                 }
                 Scalar::Call(_, args) => args.iter().all(scalar),

@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod alter_table;
 mod comments;
 mod security_label;
+mod extensions;
 mod views;
 #[cfg(test)]
 #[path = "relational/catalog_image_tests.rs"]
@@ -27,6 +28,8 @@ mod constraint_primary_key;
 mod ddl_type;
 pub use ddl_type::take_sql_warnings;
 mod user_types;
+pub use extensions::{InstalledExtension, BuiltinExtension, ExtensionFunction, BUILTINS as BUILTIN_EXTENSIONS};
+pub use user_types::take_sql_error_hint;
 pub use user_types::{
     TypeDef, UserTypeCatalog, take_sql_error_detail, take_sql_error_message, take_sql_notices, type_oid,
 };
@@ -1015,6 +1018,7 @@ enum Statement {
     AlterTable(alter_table::AlterTable),
     Comment(comments::Comment),
     SecurityLabel(security_label::Label),
+    Extension(extensions::Ddl),
     View(views::Ddl),
     CreateIndex(sql_index::CreateIndex),
     DropIndex(sql_index::DropIndex),
@@ -1274,6 +1278,7 @@ impl Parser {
         if self.word("comment") {
             return comments::parse(self).map(Statement::Comment);
         }
+        if extensions::claims(&self.tokens[self.at..]) { return extensions::parse(self).map(Statement::Extension); }
         if security_label::claims(&self.tokens[self.at..]) {
             return security_label::parse(self).map(Statement::SecurityLabel);
         }
@@ -1734,6 +1739,7 @@ pub struct Prepared {
     relations: Vec<schemas::Reference>,
     search_path: Vec<String>,
     schema_user: String,
+    extension_owner: std::sync::Arc<std::sync::atomic::AtomicU32>,
     warnings: Vec<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1889,7 +1895,7 @@ impl Prepared {
             | Statement::Update { .. }
             | Statement::UpdateExpressions { .. }
             | Statement::Delete { .. } => V2Class::Dml,
-            Statement::Truncate { .. } | Statement::Schema(_) | Statement::TypeDdl(_) | Statement::CollationDdl(_) => {
+            Statement::Truncate { .. } | Statement::Extension(_) | Statement::Schema(_) | Statement::TypeDdl(_) | Statement::CollationDdl(_) => {
                 V2Class::Ddl
             }
             Statement::Sequence(_) | Statement::DropTable { .. } | Statement::Comment(_) | Statement::SecurityLabel(_) | Statement::View(_) => V2Class::Ddl,
@@ -1942,6 +1948,7 @@ impl Prepared {
             relations: Vec::new(),
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
+            extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
             unbound_statement: None,
             warnings: vec![],
         }
@@ -2786,7 +2793,7 @@ impl Prepared {
     pub fn is_ddl(&self) -> bool {
         matches!(
             self.statement,
-            Statement::Schema(_)
+            Statement::Extension(_) | Statement::Schema(_)
                 | Statement::Sequence(_)
                 | Statement::TypeDdl(_) | Statement::CollationDdl(_)
                 | Statement::Create { .. }
@@ -2823,7 +2830,9 @@ impl Prepared {
     pub fn command(&self) -> &'static str {
         match self.statement {
             Statement::Schema(ref ddl) => {
-                if ddl.create {
+                if ddl.rename.is_some() {
+                    "ALTER SCHEMA"
+                } else if ddl.create {
                     "CREATE SCHEMA"
                 } else {
                     "DROP SCHEMA"
@@ -2832,6 +2841,7 @@ impl Prepared {
             Statement::TypeDdl(ref ddl) => ddl.command(),
             Statement::Plan(ref plan) if plan.mutation_command().is_some() => plan.mutation_command().unwrap(),
             Statement::CollationDdl(ref ddl) => ddl.command(),
+            Statement::Extension(ref ddl) => ddl.command(),
             Statement::CompositeSelect(_) | Statement::Plan(_) => "SELECT",
             Statement::Sequence(ref ddl) => match ddl {
                 defaults::SequenceDdl::Create { .. } => "CREATE SEQUENCE",
@@ -2923,6 +2933,7 @@ impl Prepared {
             relations: Vec::new(),
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
+            extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
             unbound_statement: None,
             warnings: vec![],
             statement: Statement::Select {
@@ -3175,6 +3186,10 @@ impl Prepared {
             _ => Ok(vec![]),
         }
     }
+    /// Lexical routing hint; core resolves extension installation and signatures.
+    pub fn extension_routine_call(sql: &str) -> bool {
+        extensions::routine_call(sql)
+    }
     /// Parse-only negative routing hint. No binding, evaluation, metadata or authority.
     /// Parse failures and dependency-bearing queries keep their existing gateway path.
     pub fn rejects_unsupported_table_free_scalar(sql: &str) -> bool {
@@ -3346,6 +3361,7 @@ impl Prepared {
             relations: p.relations,
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
+            extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
             unbound_statement: None,
             warnings: take_sql_warnings(),
         })
@@ -3970,6 +3986,7 @@ impl Relational {
                 relations: Vec::new(),
                 search_path: vec!["public".into()],
                 schema_user: "giggles".into(),
+            extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
                 unbound_statement: None,
                 warnings: vec![],
                 statement: Statement::Insert {
@@ -3985,6 +4002,7 @@ impl Relational {
         };
         let mut result = SqlResult::default();
         match &prepared.statement {
+            Statement::Extension(ddl) => { extensions::execute(self, ddl, prepared)?; }
             Statement::CollationDdl(ddl) => { collations::execute(self, ddl, prepared)?; }
             Statement::TypeDdl(ddl) => {
                 user_types::execute(self, ddl, prepared)?;

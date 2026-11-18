@@ -2211,6 +2211,18 @@ impl Session {
             }
             return Ok(());
         }
+        if let Some((create, names)) = p.extension_ddl() {
+            let allowed = if let Role::Database { name } = &self.role {
+                let role = self.service.admin.roles().get(name).map_err(role_lookup_error)?
+                    .filter(|r| r.login && self.service.role_generation_matches(r, self.role_epoch()))
+                    .ok_or(CoreError::Policy(Error::Authentication))?;
+                p.set_extension_owner(role.oid);
+                role.superuser || (!create && names.iter().all(|n| self.sql.user_type_catalog().ok()
+                    .and_then(|m| m.extensions.get(n).map(|e| e.owner == role.oid)).unwrap_or(true)))
+            } else { false };
+            if !allowed { self.sql.abort(); return Err(CoreError::Policy(Error::Scope)); }
+            return Ok(());
+        }
         if let Some((schema, owner, create)) = p.schema_ddl() {
             let allowed = if let Role::Database { name } = &self.role {
                 let roles = self.service.admin.roles();

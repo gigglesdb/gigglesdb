@@ -180,9 +180,14 @@ fn schema_acl_defaults_quote_acl_role_names() {
 }
 
 #[test]
-fn extension_inventory_matches_no_installed_extensions() {
+fn extension_inventory_matches_fresh_postgres() {
     let result = run("SELECT x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable, x.extversion, x.extconfig, x.extcondition FROM pg_extension x JOIN pg_namespace n ON n.oid = x.extnamespace").unwrap();
-    assert!(result.rows.is_empty());
+    // PostgreSQL 18.6, fresh database: plpgsql is installed by default.
+    assert_eq!(result.rows, vec![vec![
+        Value::Int(3079), Value::Int(13643), Value::Text("plpgsql".into()),
+        Value::Text("pg_catalog".into()), Value::Bool(false),
+        Value::Text("1.0".into()), Value::Null, Value::Null,
+    ]]);
     assert_eq!(
         result
             .fields

@@ -27,7 +27,7 @@ at zero. Unknown catalogs are rejected.
 The virtual catalog describes one certificate-bound presentation role. Role
 inheritance, role expiration and PostgreSQL role connection policies are absent;
 the expiration and connection-limit fields are NULL. Managed PostgreSQL tablespaces,
-extensions, foreign servers, procedural languages, event triggers, inheritance,
+foreign servers, procedural languages, event triggers, inheritance,
 PostgreSQL access methods/operator classes/collations and user-defined casts have
 explicit empty catalogs. The timezone catalogs are empty because presentation
 labels do not establish a timezone conversion database. The primary-key index
@@ -81,3 +81,5 @@ an epoch. This is not general PostgreSQL timestamp-function support. Standalone
 PostgreSQL lock-age/MVCC queries (`pg_locks`, `age(transactionid)`, `txid_current`)
 remain unsupported. DataGrip's observed optional StateNumber probe is among them;
 no synthetic transaction marker is returned.
+
+Built-in extension availability and installed versions are exposed by pg_extension, pg_available_extensions and pg_available_extension_versions. See [extensions](../../docs/extensions.md).

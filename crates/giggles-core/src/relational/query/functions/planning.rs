@@ -31,6 +31,7 @@ pub(super) fn sequence_volatility(name: &str) -> Option<Volatility> {
 }
 fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, bool)> {
     use DataType::*;
+    if let Some(immutable) = uuid_ossp::immutable(name) { return Some((immutable, true)); }
     if matches!(
         name,
         "\0array_subscript" | "array_length" | "\0json_get" | "\0json_text"
@@ -509,7 +510,7 @@ impl BoundScalar {
             Node::Cast(value) => {
                 value.constraint_immutable() && immutable_cast(&value.ty, &self.ty)
             }
-            Node::Call(name, args) if name == "coalesce" || greatest::known_name(name) => {
+            Node::Call(name, args) if uuid_ossp::known(name) || name == "coalesce" || greatest::known_name(name) => {
                 args.iter().all(Self::constraint_immutable)
             }
             Node::Call(name, args) => {
@@ -543,7 +544,7 @@ impl BoundScalar {
                         || self.ty == DataType::Text
                             && (number(&value.ty) || value.ty == DataType::Boolean))
             }
-            Node::Call(name, args) if name == "coalesce" || greatest::known_name(name) => {
+            Node::Call(name, args) if uuid_ossp::known(name) || name == "coalesce" || greatest::known_name(name) => {
                 args.iter().all(Self::insert_input_only)
             }
             Node::Call(name, args) => {

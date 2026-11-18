@@ -319,6 +319,7 @@ impl Copy {
             relations: vec![self.relation.clone()],
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
+            extension_owner: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
             unbound_statement: None,
             warnings: vec![],
             statement: Statement::InsertMulti(Box::new(sql_insert::Insert::copy(

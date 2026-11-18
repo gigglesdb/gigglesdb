@@ -220,7 +220,20 @@ pub(crate) fn snapshot(
     presentation.primary_names.retain(|id, _| visible.contains(id));
     presentation.comments.retain(|(table, column), _| visible.contains(table)
         && (*column == 0 || columns.contains(column)));
+    let extensions = giggles_core::relational::BUILTIN_EXTENSIONS.iter().map(|b| {
+        let installed = if b.name == "plpgsql" { Some((13643,10,11,"1.0".into())) } else {
+            types.extensions.get(b.name).map(|i| {
+                let namespace = if i.schema == "pg_catalog" { 11 } else if i.schema == "public" { 2200 }
+                    else { schemas_for_acl.schemas.get(&i.schema).map_or(2200, |(id,_)| giggles_core::relational::type_oid(*id).unwrap_or(2200)) };
+                (i.oid, i.owner, namespace, i.version.clone())
+            })
+        };
+        giggles_pg_catalog::ExtensionDef { name: b.name.into(), default_version: b.default_version.into(), versions: b.versions.iter().map(|s| (*s).into()).collect(),
+            comment: b.comment.into(), relocatable: b.relocatable, superuser: b.superuser, trusted: b.trusted,
+            schema: b.schema.map(str::to_owned), requires: b.requires.iter().map(|s| (*s).into()).collect(), installed }
+    }).collect();
     let snapshot = giggles_pg_catalog::CatalogSnapshot {
+        extensions,
         timezone: session.zone().unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0)),
         views: presentation.views.into_iter().map(|(id, v)| (id, v.definition)).collect(),
         comments: presentation.comments,
@@ -1116,6 +1129,29 @@ mod tests {
     use super::*;
     use tokio_postgres::types::{FromSql, Type};
 
+
+    #[test]
+    fn extension_catalog_rows() {
+        let path=crate::test_support::fixture_root().join(format!("extension-catalog-{}",std::process::id()));
+        let admin=giggles_core::Admin::create(&path,giggles_core::Limits::default()).unwrap();
+        admin.roles().create(giggles_core::roles::NewRole { name:"ext_owner".into(), login:true, superuser:true, ..Default::default() }).unwrap();
+        let service=crate::Service::new(admin,vec![],crate::clock::Clock::new(0,3600).unwrap()).unwrap();
+        let mut session=service.role_session("ext_owner").unwrap();
+        session.execute_sql("CREATE EXTENSION \"uuid-ossp\"",&[]).unwrap();
+        assert_eq!(session.execute_sql("SELECT uuid_nil()",&[]).unwrap().rows[0].values,vec![giggles_core::relational::Value::Text("00000000-0000-0000-0000-000000000000".into())]);
+        let (epoch,tables,indexes,typmods,types)=session.catalog_snapshot_with_typmods().unwrap();
+        let snap=snapshot(&session,epoch,tables,indexes,typmods,types).unwrap();
+        let owner=snap.roles.iter().find(|r|r.name == "ext_owner").unwrap().oid;
+        assert_eq!(snap.extensions.iter().find(|e|e.name == "uuid-ossp").unwrap().installed.as_ref().unwrap().1,owner);
+        for (sql, expected) in [
+            ("SELECT extname,extversion FROM pg_extension ORDER BY extname",vec![vec![Value::Text("plpgsql".into()),Value::Text("1.0".into())],vec![Value::Text("uuid-ossp".into()),Value::Text("1.1".into())]]),
+            ("SELECT name,installed FROM pg_available_extension_versions ORDER BY name",vec![vec![Value::Text("plpgsql".into()),Value::Bool(true)],vec![Value::Text("uuid-ossp".into()),Value::Bool(true)]]),
+        ] {
+            let plan=giggles_pg_catalog::plan(sql).unwrap().unwrap();
+            assert_eq!(giggles_pg_catalog::execute(&plan,&snap,&[]).unwrap().rows,expected);
+        }
+        drop(session);drop(service);std::fs::remove_dir_all(path).unwrap();
+    }
     #[test]
     fn held_table_lock_catalog_parity() {
         use giggles_core::{Admin, Limits, roles::NewRole, SqlTableLockMode as M};

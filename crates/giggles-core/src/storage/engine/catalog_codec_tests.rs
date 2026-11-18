@@ -728,3 +728,19 @@ fn constraint_v3_known_targets_preserve_frozen_fk_payload() {
     let pk: ConstraintDto = decode_version(1, &hex(PK)).unwrap();
     assert_corrupt(decode_constraint(&encode_version(3, &(pk, ReferencedKey::PrimaryKey)).unwrap(), &table().def));
 }
+
+#[test]
+fn extension_record_roundtrip_and_absence_preserves_bytes() {
+    let mut parts = super::super::catalog::CatalogParts::default();
+    let def=table().def;
+    parts.tables.insert(def.name.clone(),def);
+    let original = super::super::catalog::parts_records(&parts).unwrap();
+    parts.ext.extensions.insert("uuid-ossp".into(), crate::relational::InstalledExtension { schema:"public".into(),version:"1.1".into(),oid:70000,owner:10 });
+    let records = super::super::catalog::parts_records(&parts).unwrap();
+    let value = records.get(&vec![EXTENSIONS_KIND]).unwrap();
+    assert_eq!(value[0],1);
+    assert_eq!(decode_extensions(value).unwrap(),parts.ext.extensions);
+    for (key,value) in &original { assert_eq!(records.get(key),Some(value)); }
+    parts.ext.extensions.clear();
+    assert_eq!(super::super::catalog::parts_records(&parts).unwrap(),original);
+}

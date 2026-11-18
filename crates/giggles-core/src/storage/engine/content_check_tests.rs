@@ -343,3 +343,16 @@ fn key_dependency_records_require_identity_and_secondary_bits() {
     assert_eq!(required_bits_for_catalog_value(&catalog_codec::constraint_key(1, 4), &value).unwrap(),
         64 | meta::UNIQUE_CONSTRAINT_IDENTITY | meta::SECONDARY_INDEXES);
 }
+
+#[test]
+fn extension_inventory_key_does_not_require_task_catalog() {
+    assert!(matches!(catalog_codec::classify_catalog_key(&[catalog_codec::EXTENSIONS_KIND]).unwrap(), CatalogKind::Extensions));
+    assert!(matches!(catalog_codec::classify_catalog_key(&crate::task::credential::credential_key(1, 2)).unwrap(), CatalogKind::TaskCredential));
+    assert!(required_bits_for_catalog_key(&[24]).is_err());
+    assert!(required_bits_for_catalog_key(&[catalog_codec::EXTENSIONS_KIND, 1]).is_err());
+    assert_eq!(required_bits_for_catalog_key(&[catalog_codec::EXTENSIONS_KIND]).unwrap(), meta::BUILTIN_EXTENSIONS);
+    assert_eq!(
+        required_bits_for_catalog_key(&crate::task::credential::credential_key(1, 2)).unwrap(),
+        meta::TASK_CATALOG
+    );
+}

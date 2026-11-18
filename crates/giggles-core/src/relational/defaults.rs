@@ -935,6 +935,7 @@ fn sequence_reference(name: &str) -> String {
 
 #[derive(Clone)]
 enum Expression {
+    Extension(String, Vec<Expression>),
     Sequence(String),
     Number(String),
     String(String),
@@ -979,6 +980,14 @@ impl Expression {
     }
     fn resolve(&mut self, state: &Relational, path: &[String]) -> R<()> {
         match self {
+            Self::Extension(name,args) => {
+                let installed=state.ext.extensions.get("uuid-ossp").ok_or(SqlError::UndefinedFunction)?;
+                let (schema,routine)=name.split_once('\0').map_or((None,name.as_str()),|(s,n)|(Some(s),n));
+                if schema.is_some_and(|s|s != installed.schema) || schema.is_none() && installed.schema != "pg_catalog" && !path.contains(&installed.schema) {return Err(SqlError::UndefinedFunction);}
+                let routine=routine.to_owned();
+                *name=format!("{}\0{}",installed.schema,routine);
+                for a in args {a.resolve(state,path)?;}
+            }
             Self::Sequence(name) => {
                 let mut p = Parser {
                     tokens: lex(name)?,
@@ -1004,6 +1013,7 @@ impl Expression {
 
     fn ty(&self) -> DataType {
         match self {
+            Self::Extension(..) => DataType::Uuid,
             Self::Sequence(_) => DataType::BigInt,
             Self::Number(n) => number_type(n),
             Self::String(_) | Self::Null => DataType::Text,
@@ -1014,6 +1024,7 @@ impl Expression {
     }
     fn sql(&self) -> String {
         match self {
+            Self::Extension(name,args) => format!("{}({})",name.split('\0').map(|n|format!("\"{}\"",n.replace('"',"\"\""))).collect::<Vec<_>>().join("."),args.iter().map(Self::sql).collect::<Vec<_>>().join(",")),
             Self::Sequence(name) => format!("nextval({}::regclass)", quoted(name)),
             Self::Number(n) => n.clone(),
             Self::String(s) => quoted(s),
@@ -1026,6 +1037,7 @@ impl Expression {
     }
     fn canonical(&self, target: &DataType) -> R<String> {
         match self {
+            Self::Extension(..) => Ok(self.sql()),
             Self::Sequence(name) => Ok(format!("nextval({}::regclass)", quoted(name))),
             Self::Number(n) => number_text(n),
             Self::String(_) => constant_text(&self.sql(), target),
@@ -1126,6 +1138,7 @@ pub(super) fn cast_type(p: &mut Parser) -> R<DataType> {
             DataType::DoublePrecision
         }
         "text" => DataType::Text,
+        "uuid" => DataType::Uuid,
         "bytea" => DataType::Bytes,
         "date" => DataType::Date,
         "time" | "timestamp" => {
@@ -1159,7 +1172,18 @@ fn expression(p: &mut Parser, depth: usize) -> R<Expression> {
         }
         return Ok(Expression::Negative(Box::new(value)));
     }
-    let mut value = if p.sym('(') {
+    let start=p.at;
+    let mut extension=None;
+    if matches!(p.tokens.get(p.at),Some(Token::Word(_) | Token::QuotedIdent(_))) {
+        let first=alter_table::raw_name(p)?;
+        let (schema,routine)=if p.sym('.') {(Some(first),alter_table::raw_name(p)?)} else {(None,first)};
+        if super::extensions::BUILTINS.iter().flat_map(|b|b.functions).any(|f|f.name==routine) && p.sym('(') {
+            let mut args=Vec::new();
+            if !p.sym(')') { loop {args.push(expression(p,depth+1)?);if p.sym(')'){break;} p.punct(',')?;} }
+            extension=Some(Expression::Extension(schema.map_or_else(||routine.clone(),|s|format!("{s}\0{routine}")),args));
+        } else {p.at=start;}
+    }
+    let mut value = if let Some(ext)=extension {ext} else if p.sym('(') {
         let value = expression(p, depth + 1)?;
         p.punct(')')?;
         value

@@ -122,6 +122,7 @@ impl Prepared {
             relations: self.relations.clone(),
             search_path: self.search_path.clone(),
             schema_user: self.schema_user.clone(),
+            extension_owner: self.extension_owner.clone(),
             warnings: self.warnings.clone(),
         };
         let create = |name: &str| -> R<String> {

@@ -12,6 +12,7 @@ pub(crate) struct Schema {
 #[derive(Debug, Clone)]
 pub(super) struct Ddl {
     pub create: bool,
+    pub rename: Option<String>,
     pub name: String,
     pub owner: Option<String>,
     pub optional: bool,
@@ -33,16 +34,17 @@ impl Reference {
     }
 }
 pub(super) fn claims(tokens: &[Token]) -> bool {
-    matches!(tokens.first(), Some(Token::Word(w)) if w == "create" || w == "drop")
+    matches!(tokens.first(), Some(Token::Word(w)) if w == "create" || w == "drop" || w == "alter")
         && tokens.get(1) == Some(&Token::Word("schema".into()))
 }
 pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
+    let alter = p.word("alter");
     let create = p.word("create");
-    if !create {
+    if !create && !alter {
         p.need("drop")?;
     }
     p.need("schema")?;
-    let optional = p.word("if");
+    let optional = !alter && p.word("if");
     if optional {
         if create {
             p.need("not")?;
@@ -50,13 +52,14 @@ pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
         p.need("exists")?;
     }
     let name = p.name()?;
+    let rename = if alter { p.need("rename")?; p.need("to")?; Some(p.name()?) } else { None };
     let owner = if create && p.word("authorization") {
         Some(alter_table::raw_name(p)?)
     } else {
         None
     };
-    let cascade = !create && p.word("cascade");
-    if !create && !cascade {
+    let cascade = !create && !alter && p.word("cascade");
+    if !create && !alter && !cascade {
         p.word("restrict");
     }
     p.sym(';');
@@ -65,6 +68,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
     }
     Ok(Ddl {
         create,
+        rename,
         name,
         owner,
         optional,
@@ -138,7 +142,28 @@ impl Relational {
     }
     pub(super) fn schema_ddl(&mut self, ddl: &Ddl, user: &str) -> R<SqlResult> {
         let exists = ddl.name == "public" || self.ext.schemas.contains_key(&ddl.name);
-        if ddl.create {
+        if let Some(new) = &ddl.rename {
+            if !exists { return Err(SqlError::InvalidSchema); }
+            if new == "public" || self.ext.schemas.contains_key(new) { return Err(SqlError::DuplicateObject); }
+            if ddl.name == "public" { return Err(SqlError::Unsupported); }
+            // Relation/type schema relocation has separate stored bindings. Keep
+            // this rename lane limited to schemas holding extension routines.
+            if self.tables.values().any(|t| self.table_schema(t.id) == ddl.name)
+                || self.ext.types.values().any(|t| t.schema() == ddl.name)
+                || self.ext.collations.values().any(|c| c.schema == ddl.name)
+                || self.ext.sequences.values().any(|s| split_key(&s.name).0 == ddl.name)
+            { return Err(SqlError::Unsupported); }
+            for column in self.ext.columns.values_mut() {
+                if let Some(sql) = &mut column.default {
+                    *sql = rename_default_schema(sql, &ddl.name, new)?;
+                }
+            }
+            let schema = self.ext.schemas.remove(&ddl.name).unwrap();
+            self.ext.schemas.insert(new.clone(), schema);
+            for extension in self.ext.extensions.values_mut() {
+                if extension.schema == ddl.name { extension.schema = new.clone(); }
+            }
+        } else if ddl.create {
             if exists {
                 return if ddl.optional {
                     Ok(Default::default())
@@ -178,6 +203,19 @@ impl Relational {
                 .filter(|(_, ty)| ty.schema() == ddl.name)
                 .map(|(id, _)| *id)
                 .collect();
+            let extensions: Vec<_> = self.ext.extensions.iter()
+                .filter(|(_, e)| e.schema == ddl.name).map(|(n, _)| n.clone()).collect();
+            let defaults = if extensions.iter().any(|n| n == "uuid-ossp") {
+                extensions::extension_defaults(self, &[ddl.name.clone(), "public".into()])?
+            } else { Vec::new() };
+            if !extensions.is_empty() && !ddl.cascade {
+                user_types::view_replace_error(format!("cannot drop schema {} because other objects depend on it", ddl.name));
+                let mut details: Vec<_> = extensions.iter().map(|n| format!("extension {n} depends on schema {}", ddl.name)).collect();
+                details.extend(defaults.iter().map(|(_, d, f)| format!("{d} depends on function {}.{f}()", ddl.name)));
+                user_types::sql_error_detail(details.join("\n"));
+                user_types::sql_error_hint("Use DROP ... CASCADE to drop the dependent objects too.");
+                return Err(SqlError::DependentObjects);
+            }
             if (!tables.is_empty() || !types.is_empty() || self.ext.collations.values().any(|c| c.schema == ddl.name)) && !ddl.cascade {
                 if let Some(c) = self.ext.collations.values().find(|c| c.schema == ddl.name) {
                     user_types::view_replace_error(format!("cannot drop schema {} because other objects depend on it",ddl.name));
@@ -206,6 +244,17 @@ impl Relational {
             {
                 return Err(SqlError::Unsupported);
             }
+            let mut cascades: Vec<_> = extensions.iter().map(|n| format!("drop cascades to extension {n}")).collect();
+            for (id, description, _) in defaults {
+                self.ext.columns.get_mut(&id).unwrap().default = None;
+                cascades.push(format!("drop cascades to {description}"));
+            }
+            if cascades.len() == 1 {
+                user_types::sql_notice(cascades.remove(0), "00000");
+            } else if !cascades.is_empty() {
+                user_types::sql_notice_detail(format!("drop cascades to {} other objects", cascades.len()), cascades.join("\n"), "00000");
+            }
+            for name in extensions { self.ext.extensions.remove(&name); }
             for table in tables {
                 self.drop_table_with_actions(&table, true)?;
             }
@@ -326,4 +375,27 @@ pub fn schema_search_path(path: &str, user: &str) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+// Defaults have no column/alias qualifiers. Rewrite only identifier qualifiers,
+// preserving string literals that merely mention a schema or function.
+fn rename_default_schema(sql: &str, old: &str, new: &str) -> R<String> {
+    let mut tokens = lex(sql)?;
+    let mut changed = false;
+    for i in 0..tokens.len().saturating_sub(1) {
+        if matches!(&tokens[i], Token::Word(n) | Token::QuotedIdent(n) if n == old)
+            && tokens[i + 1] == Token::Symbol('.')
+        {
+            tokens[i] = Token::QuotedIdent(new.into());
+            changed = true;
+        }
+    }
+    if !changed { return Ok(sql.into()); }
+    tokens.iter().map(|t| Ok(match t {
+        Token::Word(n) | Token::Number(n) | Token::Op(n) => n.clone(),
+        Token::QuotedIdent(n) => query::constraint_quote(n),
+        Token::String(n) => format!("'{}'", n.replace('\'', "''")),
+        Token::Symbol(c) => c.to_string(),
+        Token::Param(_) => return Err(SqlError::Unsupported),
+    })).collect::<R<Vec<_>>>().map(|parts| parts.join(" "))
 }

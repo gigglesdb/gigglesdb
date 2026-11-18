@@ -133,7 +133,7 @@ fn block(state: &mut [u32; 4], input: &[u8; 64]) {
         *word = word.wrapping_add(value);
     }
 }
-fn digest(input: &[u8]) -> [u32; 4] {
+pub(super) fn digest(input: &[u8]) -> [u32; 4] {
     let mut state = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
     let (blocks, tail) = input.as_chunks::<64>();
     for bytes in blocks {

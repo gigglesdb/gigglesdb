@@ -497,6 +497,9 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
             ("amtype", T::Char),
             ("xmin", T::Xid),
         ],
+        "pg_available_extensions" => &[("name", T::Name), ("default_version", T::Text), ("installed_version", T::Text), ("comment", T::Text)],
+        "pg_available_extension_versions" => &[("name", T::Name), ("version", T::Text), ("installed", T::Bool),
+            ("superuser", T::Bool), ("trusted", T::Bool), ("relocatable", T::Bool), ("schema", T::Name), ("requires", T::NameArray), ("comment", T::Text)],
         "pg_extension" => &[
             ("oid", T::Oid),
             ("extname", T::Name),
@@ -949,6 +952,8 @@ pub(crate) fn known_names() -> &'static [&'static str] {
         "pg_replication_slots",
         "pg_am",
         "pg_extension",
+        "pg_available_extensions",
+        "pg_available_extension_versions",
         "pg_depend",
         "pg_cast",
         "pg_ts_config",
@@ -992,7 +997,7 @@ pub(crate) fn tableoid(name: &str) -> Option<u32> {
     if relation_namespace(name) != "pg_catalog"
         || matches!(
             name,
-            "pg_indexes" | "pg_tables" | "pg_views"
+            "pg_available_extensions" | "pg_available_extension_versions" | "pg_indexes" | "pg_tables" | "pg_views"
                 | "pg_seclabels"
                 | "pg_user"
                 | "pg_roles"
@@ -1046,6 +1051,8 @@ pub(crate) fn relation_oid(name: &str) -> Option<u32> {
         "pg_user_mapping" => 1418,
         // Stable virtual view identities, not persisted PostgreSQL catalog OIDs.
         "pg_locks" => 12050,
+        "pg_available_extensions" => 12052,
+        "pg_available_extension_versions" => 12053,
         "pg_stat_ssl" => 12051,
         "pg_stat_gssapi" => 12257,
         "pg_replication_slots" => 12261,
@@ -1382,6 +1389,16 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     let mut add = |name: &str, row: Vec<Value>| {
         all.get_mut(name).unwrap().rows.push(row);
     };
+    for ext in &snapshot.extensions {
+        if let Some((oid, owner, namespace, version)) = &ext.installed {
+            add("pg_extension", vec![I(i64::from(*oid)), s(&ext.name), I(i64::from(*owner)), I(i64::from(*namespace)), B(ext.relocatable), s(version), N, N, N]);
+        }
+        add("pg_available_extensions", vec![s(&ext.name), s(&ext.default_version), ext.installed.as_ref().map_or(N, |i| s(&i.3)), s(&ext.comment)]);
+        for version in &ext.versions {
+            add("pg_available_extension_versions", vec![s(&ext.name), s(version), B(ext.installed.as_ref().is_some_and(|i| &i.3 == version)),
+                B(ext.superuser), B(ext.trusted), B(ext.relocatable), ext.schema.as_ref().map_or(N, |v| s(v)), N, s(&ext.comment)]);
+        }
+    }
     add("pg_description", vec![I(2200), I(2615), I(0), s("standard public schema"), N]);
     for table in &snapshot.tables {
         for (&(id, column), description) in &snapshot.comments {
