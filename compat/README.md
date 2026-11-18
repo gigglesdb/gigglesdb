@@ -661,6 +661,12 @@ python -I compat/agent_load.py --server-bin J:/gigglesdb-work/<task>/target/debu
   (rows-scanned limit), a protected UPDATE of a row the harness holds locked
   (lock wait, 55P03), and keyset pages over its block until the rows-returned
   cap. Phases run 120 s each.
+- **Backoff** (R3-404c): agent sessions sleep with jittered exponential
+  backoff on 54T01 and 55P03 (10 ms doubling to 200 ms, reset on success),
+  like a well-behaved agent; each phase reports `agents.backoffs` and
+  `agents.backoff_ms`. The server also paces ceiling refusals: a statement
+  refused at `agent.max_concurrent_statements` waits up to
+  `agent.ceiling_refusal_delay_ms` (default 25) for a freed slot before 54T01.
 - **Bound**: `agent_load_bound.json`. For each application operation
   `p99(B) <= max(1.25 x p99(A), p99(A) + 2 ms)`, the same for C, and zero
   application errors. Change the constants only in a reviewed commit.

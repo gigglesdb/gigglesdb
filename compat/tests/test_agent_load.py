@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import random
 from pathlib import Path
 import subprocess
 import sys
@@ -19,7 +20,25 @@ def phase(select, update, insert, errors=None, agents=0):
         return dict(count=n, p50_ms=p99 / 2, p99_ms=p99, p999_ms=p99 * 1.5, max_ms=p99 * 2)
     return dict(seconds=5.0, operations=dict(select=op(select), update=op(update), insert=op(insert)),
                 application_errors=errors or {}, application_error_samples=[],
-                agents=dict(tasks=agents, sessions=agents, statements=agents * 10, outcomes={}))
+                agents=dict(tasks=agents, sessions=agents, statements=agents * 10, outcomes={},
+                            backoffs=0, backoff_ms=0))
+
+
+class BackoffDelay(unittest.TestCase):
+    def test_ranges_doubling_and_cap(self):
+        for attempt, base in ((0, 10), (1, 20), (2, 40), (3, 80), (4, 160), (5, 200), (10000, 200)):
+            rng = random.Random(42)
+            for _ in range(100):
+                delay = al.backoff_delay(attempt, rng)
+                self.assertGreaterEqual(delay, base / 2000)
+                self.assertLessEqual(delay, base / 1000)
+        self.assertEqual(al.backoff_delay(1, random.Random(42)),
+                         2 * al.backoff_delay(0, random.Random(42)))
+
+    def test_seeded_rng_is_deterministic(self):
+        first, second = random.Random('session'), random.Random('session')
+        self.assertEqual([al.backoff_delay(i, first) for i in range(20)],
+                         [al.backoff_delay(i, second) for i in range(20)])
 
 
 class PercentileMath(unittest.TestCase):
@@ -108,10 +127,14 @@ class ReportSchema(unittest.TestCase):
         broken = copy.deepcopy(again)
         del broken['phases']['C']['operations']['insert']['p99_ms']
         del broken['check']['passed']
+        del broken['phases']['A']['agents']['backoffs']
+        broken['phases']['B']['agents']['backoff_ms'] = 'bad'
         broken['schema'] = 'other'
         problems = al.validate_report(broken)
         self.assertIn('C.insert.p99_ms missing', problems)
         self.assertIn('check.passed missing', problems)
+        self.assertIn('A.agents.backoffs missing', problems)
+        self.assertIn("B.agents.backoff_ms is not <class 'int'>", problems)
         self.assertIn('report.schema is not ' + al.SCHEMA_ID, problems)
 
 
@@ -183,6 +206,8 @@ class SmokeRun(unittest.TestCase):
         self.assertEqual((b['tasks'], b['sessions']), (4, 8))
         self.assertEqual((c['tasks'], c['sessions']), (32, 32))
         self.assertEqual(report['phases']['A']['agents']['statements'], 0)
+        self.assertEqual(report['phases']['A']['agents']['backoffs'], 0)
+        self.assertGreater(c['backoffs'], 0)
         # Every agent step reaches its limit in B: rows scanned and the
         # rows-returned cap (54T01), the held row lock (55P03). In C the agent
         # statement ceiling (R3-403) refuses the sessions beyond it.

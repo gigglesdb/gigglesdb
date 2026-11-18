@@ -240,8 +240,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if c.agent.is_some() {
                 match reload_agent_limits(&path, &service) {
                     Ok(limits) => println!(
-                        "agent limits reloaded max_concurrent_statements={}",
-                        limits.max_concurrent_statements
+                        "agent limits reloaded max_concurrent_statements={} ceiling_refusal_delay_ms={}",
+                        limits.max_concurrent_statements, limits.ceiling_refusal_delay_ms
                     ),
                     Err(error) => {
                         eprintln!("agent limits reload rejected; prior limits retained: {error}")

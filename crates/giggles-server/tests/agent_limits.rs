@@ -1,6 +1,7 @@
 //! R3-403 (GD-0061 design-3 section 7): the agent statement ceiling
 //! (`agent.max_concurrent_statements`) and agent admission. Agent requests take
-//! an agent slot before a blocking worker, a full admission is 54T01 at once,
+//! an agent slot before a blocking worker, a full admission waits up to
+//! `agent.ceiling_refusal_delay_ms` for a freed slot before 54T01 (R3-404c),
 //! and applications keep the rest of the pool.
 //!
 //! Requests are held in flight by a table lock an application transaction
@@ -123,6 +124,7 @@ fn admin_with(limits: Limits) -> Admin {
                 },
                 limits: LoadLimits {
                     statement_ms: 120_000,
+                    lock_wait_ms: 120_000,
                     concurrent_statements: 32,
                     ..LoadLimits::default()
                 },
@@ -321,6 +323,7 @@ async fn ceiling_default_is_eight() {
             max_concurrent_statements: 8,
             disclosure_chunk_rows: 256,
             disclosure_chunk_bytes: 262_144,
+            ceiling_refusal_delay_ms: 25,
         }
     );
     // A service with no agent settings applied runs with the same ceiling.
@@ -340,6 +343,7 @@ async fn ceiling_default_is_eight() {
             max_concurrent_statements: 3,
             disclosure_chunk_rows: 0,
             disclosure_chunk_bytes: 4096,
+            ceiling_refusal_delay_ms: 25,
         }
     );
     assert_eq!(f.service.set_agent_limits(config.limits()), Ok(()));
@@ -411,8 +415,8 @@ async fn agent_requests_never_hold_more_than_ceiling_blocking_permits() {
     assert_eq!(f.held(), (0, 0));
     let mut holder = f.hold_table_lock();
     let (handles, mut answers) = send_all(wires, agent_update);
-    // While the admitted requests wait on the lock, the rest are refused at
-    // once: they neither queue nor take a blocking worker.
+    // While admitted requests wait on the lock, the rest are refused after
+    // the pacing delay without taking a blocking worker.
     for _ in 0..AGENTS - CEILING {
         assert_all_agents(&next(&mut answers).await);
         let (slots, permits) = f.held();
@@ -586,4 +590,102 @@ fn exposure_lists_bound_credentials() {
     // No binding, or no valid name: only the fixed row.
     assert!(exposure_listener_rows(&service, "inc-999").is_empty());
     assert!(exposure_listener_rows(&service, "").is_empty());
+}
+
+#[test]
+fn config_rejects_out_of_range_refusal_delay() {
+    for delay in [0, 1000, 1001] {
+        let config = agent_config(&format!(
+            r#"{{"postgres":"127.0.0.1:0","ceiling_refusal_delay_ms":{delay}}}"#
+        ))
+        .unwrap();
+        assert_eq!(config.validate().is_ok(), delay <= 1000);
+        assert_eq!(config.limits().ceiling_refusal_delay_ms, delay);
+    }
+    assert_eq!(
+        agent_config(r#"{"postgres":"127.0.0.1:0"}"#)
+            .unwrap()
+            .limits()
+            .ceiling_refusal_delay_ms,
+        25
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_statement_waits_for_the_refusal_delay() {
+    let f = fixture().await;
+    let held_wire = f.agent_wire().await;
+    let mut extra = f.agent_wire().await;
+    f.service
+        .set_agent_limits(AgentLimits {
+            max_concurrent_statements: 1,
+            ..AgentLimits::default()
+        })
+        .unwrap();
+    let mut holder = f.hold_table_lock();
+    let (handles, mut answers) = send_all(vec![held_wire], agent_update);
+    until("agent saturation", || f.held() == (1, 1)).await;
+    for delay in [200, 0] {
+        f.service
+            .set_agent_limits(AgentLimits {
+                max_concurrent_statements: 1,
+                ceiling_refusal_delay_ms: delay,
+                ..AgentLimits::default()
+            })
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        assert_all_agents(&extra.simple(&agent_update(2)).await);
+        if delay == 200 {
+            assert!(start.elapsed() >= Duration::from_millis(200));
+        } else {
+            assert!(start.elapsed() < Duration::from_millis(150));
+        }
+    }
+    holder.execute("ROLLBACK", &[], None).unwrap();
+    assert_updated(&next(&mut answers).await);
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn application_statements_run_while_refused_agents_wait() {
+    let f = fixture().await;
+    f.service
+        .set_agent_limits(AgentLimits {
+            max_concurrent_statements: 1,
+            ceiling_refusal_delay_ms: 1000,
+            ..AgentLimits::default()
+        })
+        .unwrap();
+    let held_wire = f.agent_wire().await;
+    let mut waiting = Vec::new();
+    for _ in 0..4 {
+        waiting.push(f.agent_wire().await);
+    }
+    let mut app = f.app_wire().await;
+    let mut holder = f.hold_table_lock();
+    let (held_handles, mut held_answers) = send_all(vec![held_wire], agent_update);
+    until("agent saturation", || f.held() == (1, 1)).await;
+    let (waiting_handles, mut waiting_answers) = send_all(waiting, |_| agent_update(2));
+    // Allow the wire tasks to enter admission; the held table lock keeps the ceiling full.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let start = tokio::time::Instant::now();
+    for _ in 0..3 {
+        let answer = tokio::time::timeout(Duration::from_millis(500), app.simple("SELECT 1"))
+            .await
+            .unwrap();
+        assert_rows(&answer, 1);
+        assert!(waiting_answers.try_recv().is_err());
+    }
+    assert!(start.elapsed() < Duration::from_millis(700));
+    assert_eq!(f.held(), (1, 1));
+    for _ in 0..4 {
+        assert_all_agents(&next(&mut waiting_answers).await);
+    }
+    holder.execute("ROLLBACK", &[], None).unwrap();
+    assert_updated(&next(&mut held_answers).await);
+    for handle in held_handles.into_iter().chain(waiting_handles) {
+        handle.await.unwrap();
+    }
 }

@@ -2920,11 +2920,13 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                     || (tag == b'S' && state.implicit && !session.is_aborted()),
             )
         });
-        // GD-0061 R3-403: an agent request takes an agent slot first, with no
-        // queue (54T01 when full), then the role pool and the blocking pool.
+        // GD-0061 R3-403/R3-404c: an agent request takes an agent slot first;
+        // when the ceiling is full it waits (async, holding no role or blocking
+        // permit) up to agent.ceiling_refusal_delay_ms for a freed slot, then
+        // gets 54T01. Then the role pool and the blocking pool.
         // Release is the reverse: blocking and role permits, then the slot.
         let agent_slot = if session.agent {
-            session.service.agent_admission.try_admit().map(Some)
+            session.service.agent_admission.admit().await.map(Some)
         } else {
             Ok(None)
         };

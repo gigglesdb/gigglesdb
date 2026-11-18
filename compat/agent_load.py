@@ -57,6 +57,8 @@ LOAD_BATCH = 500             # rows per INSERT while loading
 PAGE = 100                   # rows per agent page (step 3)
 APP_CONNS_PER_PROCESS = 2
 AGENT_SESSIONS_PER_PROCESS = 8
+BACKOFF_START_MS = 10
+BACKOFF_CAP_MS = 200
 STATUSES = ('delivered', 'pending', 'queued', 'failed')
 # Per-task limits. A full scan of the table always passes rows_scanned; one
 # page of PAGE rows of the task's own block never does. Step 1 charges rows
@@ -180,6 +182,8 @@ def validate_report(report):
         if isinstance(agents, dict):
             for key in ('tasks', 'sessions', 'statements', 'outcomes'):
                 need(agents, key, None, name + '.agents')
+            for key in ('backoffs', 'backoff_ms'):
+                need(agents, key, int, name + '.agents')
         ops = need(phase, 'operations', dict, name) or {}
         for op in OPERATIONS:
             summary = need(ops, op, dict, name + '.operations')
@@ -421,8 +425,16 @@ def outcome(error):
     return '54T01/' + BUDGETS.get(text, 'other')
 
 
+def backoff_delay(attempt, rng):
+    """Jittered exponential refusal delay in seconds, capped before exponentiation."""
+    base = min(BACKOFF_CAP_MS, BACKOFF_START_MS * 2 ** min(attempt, 5))
+    return rng.uniform(base / 2, base) / 1000
+
+
 def agent_session(spec, session, tls, start_at, end_at, out, lock):
     counts, messages = {}, {}
+    rng = random.Random(session['name'])
+    attempt, backoffs, backoff_seconds = 0, 0, 0.0
     def record(step, outcome, message=None):
         key = f'{step}:{outcome}'
         counts[key] = counts.get(key, 0) + 1
@@ -432,15 +444,23 @@ def agent_session(spec, session, tls, start_at, end_at, out, lock):
     while time.time() < start_at:
         time.sleep(min(.01, max(0, start_at - time.time())))
     def run(step, sql):
-        nonlocal conn
+        nonlocal conn, attempt, backoffs, backoff_seconds
         try:
             if conn is None:
                 conn = Pg(spec['port'], EXECUTOR, DATABASE, (('giggles.task', session['name']),), tls=tls)
             rows, _ = conn.query(sql)
             record(step, 'ok')
+            attempt = 0
             return rows
         except PgError as e:
-            record(step, outcome(e), e.message)
+            refused = outcome(e)
+            record(step, refused, e.message)
+            if refused.startswith('54T01') or refused == '55P03':
+                delay = min(backoff_delay(attempt, rng), max(0, end_at - time.time()))
+                time.sleep(delay)
+                backoffs += 1
+                backoff_seconds += delay
+                attempt += 1
             return None
         except (OSError, ConnectionError):
             record(step, 'disconnect')
@@ -471,6 +491,8 @@ def agent_session(spec, session, tls, start_at, end_at, out, lock):
     if conn is not None:
         conn.close()
     with lock:
+        out['backoffs'] += backoffs
+        out['backoff_seconds'] += backoff_seconds
         for key, n in counts.items():
             out['outcomes'][key] = out['outcomes'].get(key, 0) + n
         for key, text in messages.items():
@@ -490,7 +512,7 @@ def worker_main(spec_path):
         tls = agent_tls(spec['ca'], spec['cert'], spec['key'])
         for session in spec['sessions']:
             session['_conn'] = Pg(spec['port'], EXECUTOR, DATABASE, (('giggles.task', session['name']),), tls=tls)
-        out = dict(outcomes={}, messages={})
+        out = dict(outcomes={}, messages={}, backoffs=0, backoff_seconds=0.0)
     print('ready', flush=True)
     start_at = float(sys.stdin.readline())
     end_at = start_at + spec['seconds']
@@ -513,7 +535,8 @@ def worker_main(spec_path):
         result = dict(errors=out['errors'], samples=out['samples'],
                       counts={op: len(out['lat'][op]) for op in OPERATIONS})
     else:
-        result = dict(outcomes=out['outcomes'], messages=out['messages'])
+        result = dict(outcomes=out['outcomes'], messages=out['messages'],
+                      backoffs=out['backoffs'], backoff_seconds=out['backoff_seconds'])
     (out_dir / 'result.json').write_text(json.dumps(result, indent=1), encoding='utf-8')
     print('done', flush=True)
     return 0
@@ -727,6 +750,7 @@ class Run:
                     holder.close()
         lat = {op: array.array('d') for op in OPERATIONS}
         errors, samples, outcomes, messages = {}, [], {}, {}
+        backoffs, backoff_seconds = 0, 0.0
         for w in workers:
             result = json.loads((w['folder']/'result.json').read_text(encoding='utf-8'))
             if w['kind'] == 'app':
@@ -737,6 +761,8 @@ class Run:
                     errors[key] = errors.get(key, 0) + n
                 samples.extend(result['samples'])
             else:
+                backoffs += result['backoffs']
+                backoff_seconds += result['backoff_seconds']
                 for key, n in result['outcomes'].items():
                     outcomes[key] = outcomes.get(key, 0) + n
                 for key, text in result['messages'].items():
@@ -746,6 +772,7 @@ class Run:
             operations={op: summarize(lat[op], seconds) for op in OPERATIONS},
             application_errors=errors, application_error_samples=samples[:20],
             agents=dict(tasks=len(agent_tasks), sessions=len(sessions), statements=sum(outcomes.values()),
+                        backoffs=backoffs, backoff_ms=round(backoff_seconds * 1000),
                         outcomes=dict(sorted(outcomes.items())), messages=dict(sorted(messages.items()))))
         ops = ', '.join(f"{op} p99={summary['operations'][op]['p99_ms']}ms n={summary['operations'][op]['count']}" for op in OPERATIONS)
         self.say(f'phase {label}: {ops}; app errors={sum(errors.values())}; agent statements={summary["agents"]["statements"]}')

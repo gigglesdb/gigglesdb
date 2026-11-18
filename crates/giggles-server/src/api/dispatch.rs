@@ -497,9 +497,13 @@ async fn supervise(
 
 async fn run_job(service: Arc<Service>, mut job: Job) {
     // GD-0061 R3-403: an agent call takes an agent slot before it waits for a
-    // blocking worker; a full admission answers the all-agents error at once.
+    // blocking worker; a full admission waits briefly before refusing.
     let agent_slot = if job.lease.session().agent {
-        match service.agent_admission.try_admit() {
+        match tokio::select! {
+            biased;
+            _ = job.reply.closed() => return,
+            r = service.agent_admission.admit() => r,
+        } {
             Ok(slot) => Some(slot),
             Err(error) => return refuse_agent_call(job, &error),
         }

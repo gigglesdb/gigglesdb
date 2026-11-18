@@ -57,12 +57,20 @@ pub struct AgentConfig {
     /// `MAX_BLOCKING / 2` and at most half the engine's admitted operations.
     #[serde(default = "default_max_concurrent_statements")]
     pub max_concurrent_statements: usize,
+    /// How long a statement refused at the agent ceiling waits for a freed slot
+    /// before 54T01 (R3-404c); 0 to 1000 ms, default 25.
+    #[serde(default = "default_ceiling_refusal_delay_ms")]
+    pub ceiling_refusal_delay_ms: u64,
     /// Reservation chunk in rows for each task session (R3-403); 0 is exact.
     #[serde(default = "default_disclosure_chunk_rows")]
     pub disclosure_chunk_rows: u64,
     /// Reservation chunk in bytes for each task session (R3-403); 0 is exact.
     #[serde(default = "default_disclosure_chunk_bytes")]
     pub disclosure_chunk_bytes: u64,
+}
+
+fn default_ceiling_refusal_delay_ms() -> u64 {
+    super::limits::DEFAULT_CEILING_REFUSAL_DELAY_MS
 }
 
 fn default_max_concurrent_statements() -> usize {
@@ -120,6 +128,7 @@ impl AgentConfig {
     pub fn limits(&self) -> AgentLimits {
         AgentLimits {
             max_concurrent_statements: self.max_concurrent_statements,
+            ceiling_refusal_delay_ms: self.ceiling_refusal_delay_ms,
             disclosure_chunk_rows: self.disclosure_chunk_rows,
             disclosure_chunk_bytes: self.disclosure_chunk_bytes,
         }
