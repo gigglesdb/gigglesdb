@@ -658,7 +658,7 @@ async fn run_postgres(
                 let (mut tcp, _) = match accepted { Ok(pair) => pair, Err(_) => break Err("agent listener failed".into()) };
                 if tcp.set_nodelay(true).is_err() { continue; }
                 match permits.acquire() {
-                    Some(permit) => { let ctx = ctx.clone(); sessions.spawn(async move { let _permit = permit; crate::pgwire::session::serve_tcp(tcp, ctx).await; }); }
+                    Some(permit) => { let ctx = ctx.clone(); sessions.spawn(async move { crate::pgwire::session::serve_tcp_admitted(tcp, ctx, permit).await; }); }
                     None => {
                         let mut bytes = bytes::BytesMut::new();
                         crate::pgwire::codec::encode_backend(&crate::pgwire::codec::Backend::ErrorResponse(crate::pgwire::redact::nunya_error(crate::error::NyCode::ProtocolNotAllowed)), &mut bytes);

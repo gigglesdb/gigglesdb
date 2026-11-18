@@ -1122,6 +1122,21 @@ impl Drop for CancelGuard {
 }
 /// Serve one agent TCP connection; all errors are data-free and close the transport.
 pub async fn serve_tcp(tcp: tokio::net::TcpStream, ctx: Arc<GatewayContext>) {
+    serve_tcp_inner(tcp, ctx, None).await;
+}
+/// Serve an admitted connection, releasing capacity before the bounded close drain.
+pub(crate) async fn serve_tcp_admitted(
+    tcp: tokio::net::TcpStream,
+    ctx: Arc<GatewayContext>,
+    permit: crate::config_reload::ConnectionGuard,
+) {
+    serve_tcp_inner(tcp, ctx, Some(permit)).await;
+}
+async fn serve_tcp_inner(
+    tcp: tokio::net::TcpStream,
+    ctx: Arc<GatewayContext>,
+    permit: Option<crate::config_reload::ConnectionGuard>,
+) {
     ctx.metrics.connections.fetch_add(1, Ordering::Relaxed);
     let mut agent = Agent {
         io: Box::new(tcp),
@@ -1134,6 +1149,7 @@ pub async fn serve_tcp(tcp: tokio::net::TcpStream, ctx: Arc<GatewayContext>) {
             agent.send(&[Backend::ErrorResponse(nunya_error(error.code))]),
         ).await;
     }
+    drop(permit);
     linger_close(agent.io.as_mut()).await;
 }
 async fn end_connection(
@@ -4152,8 +4168,19 @@ pub(crate) mod tests {
 
     async fn close_test_revoke(f: &Fixture, id: SessionId) {
         f.ctx.authority.revoke(id, crate::state::model::EndReason::AdminRevoked).unwrap();
-        // Let the final error and FIN arrive, deliberately without reading them.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // This connection is the only login for this session; do not consume its error.
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let ended = f.lifecycle.lock().unwrap().iter().any(|record| {
+                    record.kind == LifecycleKind::ConnectionEnded
+                        && record.session.as_deref() == Some(id.to_hex().as_str())
+                        && record.connection.is_some()
+                        && record.reason == "revoked"
+                });
+                if ended { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
     }
 
     #[tokio::test]
@@ -4181,6 +4208,58 @@ pub(crate) mod tests {
         close_test_error(&mut wire).await;
         wire.io.shutdown().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(4), server).await.unwrap().unwrap();
+        fake.abort(); let _ = fake.await;
+    }
+
+    #[tokio::test]
+    async fn linger_byte_cap_stops_without_eof() {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let drain = tokio::spawn(async move { linger_close(&mut server).await; });
+        // No EOF: exactly the cap must finish the drain without waiting for its timer.
+        tokio::time::timeout(DRAIN_TIMEOUT / 2, async {
+            client.write_all(&vec![0; DRAIN_BYTE_CAP]).await.unwrap();
+            drain.await.unwrap();
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn linger_releases_admission_before_silent_drain() {
+        use crate::config_reload::tests::Fixture as ConfigFixture;
+        let config = ConfigFixture::new();
+        let transports = crate::config_reload::Transports::new(
+            &config.load(&config.text.replace("max_connections=256", "max_connections=1")),
+        ).unwrap();
+        let permit = transports.connections.acquire().unwrap();
+        assert!(transports.connections.acquire().is_none());
+        let f = Fixture::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (tcp, _) = listener.accept().await.unwrap();
+        let server = tokio::spawn(serve_tcp_admitted(tcp, f.ctx.clone(), permit));
+        // A malformed startup ends the session and sends a final error.
+        client.write_all(&[0, 0, 0, 4]).await.unwrap();
+        let replacement = tokio::time::timeout(DRAIN_TIMEOUT / 2, async {
+            loop {
+                if let Some(permit) = transports.connections.acquire() { break permit; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(!server.is_finished());
+        drop(replacement);
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn linger_late_read_first_preserves_pending_ny011() {
+        let mut f = Fixture::new();
+        let (id, _) = acquire_login(&f, "postgres");
+        let fake = close_test_upstream(&mut f).await;
+        let (mut wire, server) = close_test_connect(&f, id, false).await;
+        close_test_revoke(&f, id).await;
+        // Completion proves that the bounded drain has expired before the read.
+        tokio::time::timeout(std::time::Duration::from_secs(4), server).await.unwrap().unwrap();
+        close_test_error(&mut wire).await;
         fake.abort(); let _ = fake.await;
     }
 
