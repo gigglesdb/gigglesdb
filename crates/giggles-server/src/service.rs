@@ -493,6 +493,13 @@ impl Service {
     pub(crate) fn cancel_bound(&self, session: &Session, pid: u32, secret: u32) {
         // Hold registry snapshot through cancellation; reload cannot revoke
         // between validation and signaling. Never wait for the decision gate.
+        if session.credential.is_some() {
+            if session.credential_live().unwrap_or(false) {
+                self.cancellations
+                    .cancel(&session.fingerprint, session.epoch, pid, secret);
+            }
+            return;
+        }
         if session.agent {
             let Ok(current) = self.agent.lock() else {
                 return;
@@ -542,6 +549,7 @@ impl Service {
             epoch: role.generation,
             fingerprint_bound: false,
             agent: false,
+            credential: None,
             in_protected: false,
             role_fence: Some((role.oid, role.generation)),
             scoped: false,
@@ -595,6 +603,7 @@ impl Service {
             epoch,
             fingerprint_bound: true,
             agent: false,
+            credential: None,
             in_protected: false,
             role_fence,
             scoped: false,
@@ -753,6 +762,83 @@ impl Service {
             epoch,
             fingerprint_bound: true,
             agent: true,
+            credential: None,
+            in_protected: false,
+            role_fence: Some((role.oid, role.generation)),
+            scoped: false,
+            connection: None,
+            database: None,
+            sql,
+            zone: Some(SessionZone::Fixed(0)),
+            transaction_us: None,
+            sequence_owner_candidates: BTreeSet::new(),
+            search_path: String::new(),
+            api_path: ApiPathState::default(),
+        };
+        session.set_search_path("\"$user\", \"public\"");
+        Ok(session)
+    }
+    /// Open a task session with a SQL-issued credential. Refusals deliberately
+    /// disclose neither the secret nor which authentication check failed.
+    pub fn credential_session(
+        self: &Arc<Self>,
+        secret: &str,
+        user: Option<&str>,
+        task: Option<&str>,
+    ) -> Result<Session, CoreError> {
+        use giggles_core::task::context::open_context;
+        let refused = || CoreError::Policy(Error::Authentication);
+        let now = crate::agent::wall_now(&self.clock).map_err(|_| refused())?;
+        let matched = self
+            .admin
+            .tasks()
+            .authenticate(secret, now)
+            .map_err(|_| refused())?;
+        let def = self
+            .admin
+            .tasks()
+            .get_by_id(matched.task)
+            .map_err(|_| refused())?
+            .ok_or_else(refused)?;
+        if task.is_some_and(|name| name != def.name.as_str()) {
+            return Err(refused());
+        }
+        let role = self
+            .admin
+            .roles()
+            .get(&matched.executor)
+            .map_err(|_| refused())?
+            .filter(crate::agent::bindings::executor_role)
+            .ok_or_else(refused)?;
+        if user.is_some_and(|name| name != role.name) {
+            return Err(refused());
+        }
+        let id = matched.credential;
+        let mut digest = [0u8; 32];
+        digest[..8].copy_from_slice(b"sqlcred\0");
+        digest[24..].copy_from_slice(&id.to_be_bytes());
+        let retention = self
+            .outcome_retention_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut sql = self.admin.sql_session();
+        sql.set_authority_managed(true);
+        let ctx = open_context(&sql, &def.name, &role.name, digest, now, retention)
+            .map_err(|_| refused())?;
+        sql.bind_task(ctx).map_err(|_| refused())?;
+        let chunk = self.agent_admission.limits();
+        sql.set_disclosure_chunk(chunk.disclosure_chunk_rows, chunk.disclosure_chunk_bytes);
+        let mut session = Session {
+            surface: Surface::Native,
+            backend_pid: 0,
+            connection_closed: Default::default(),
+            backend_ssl: false,
+            service: self.clone(),
+            fingerprint: format!("sqlcred:{id:016x}"),
+            role: Role::Database { name: role.name },
+            epoch: id,
+            fingerprint_bound: true,
+            agent: true,
+            credential: Some((matched.task, id)),
             in_protected: false,
             role_fence: Some((role.oid, role.generation)),
             scoped: false,
@@ -801,8 +887,9 @@ pub struct Session {
     pub(crate) epoch: u64,
     // Trusted pgwire sessions pin role identity without a certificate binding.
     fingerprint_bound: bool,
-    // An agent (task) session: bound through the agent map, never the ordinary one.
+    // An agent (task) session: bound through the agent map or a SQL credential.
     pub(crate) agent: bool,
+    credential: Option<(giggles_core::task::definition::TaskObjectId, u64)>,
     // Set only by `execute_protected` while the protected seam runs; the
     // `authorize` backstop lets a task session's UPDATE through only then.
     in_protected: bool,
@@ -1030,9 +1117,20 @@ impl Session {
         }
         self.admit(class)
     }
-    /// The agent-map entry still has this session's epoch and executor and
-    /// still lists its task.
+    /// Check the SQL credential without consulting the certificate map.
+    fn credential_live(&self) -> Result<bool, CoreError> {
+        let Some((task, id)) = self.credential else {
+            return Ok(false);
+        };
+        let now = crate::agent::wall_now(&self.service.clock)
+            .map_err(|_| CoreError::Policy(Error::Authentication))?;
+        Ok(self.service.admin.tasks().credential_live(task, id, now))
+    }
+    /// The credential is live, or the certificate entry still matches this task.
     fn agent_entry_matches(&self, current: &crate::agent::bindings::AgentCredentials) -> bool {
+        if self.credential.is_some() {
+            return self.credential_live().unwrap_or(false);
+        }
         let (Some(ctx), Role::Database { name }) = (self.sql.task(), &self.role) else {
             return false;
         };
@@ -1061,6 +1159,13 @@ impl Session {
                     })
             })
             .ok_or(CoreError::Policy(Error::Authentication))?;
+        if self.credential.is_some() {
+            return if self.credential_live()? {
+                Ok(())
+            } else {
+                Err(CoreError::Policy(Error::Authentication))
+            };
+        }
         let current = self.service.agent.lock().map_err(|_| CoreError::Fenced)?;
         if self.agent_entry_matches(&current) {
             Ok(())
@@ -3047,15 +3152,12 @@ mod lifecycle_tests {
     use super::*;
 
     #[cfg(feature = "engine-rocksdb")]
-    #[test]
-    fn issue_credential_task_ddl_backstop_refuses_without_writing() {
+    fn credential_fixture() -> Arc<Service> {
         use crate::agent::{AgentBinding, wall_now};
         use giggles_core::{
-            roles::{NewRole, TablePrivilege},
-            task::{
-                definition::{DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText},
-            },
             Admin, Engine, Limits,
+            roles::{NewRole, TablePrivilege},
+            task::definition::{DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText},
         };
         let path = crate::test_support::fixture_root().join(format!(
             "agent-defchange-{}-{}",
@@ -3079,12 +3181,23 @@ mod lifecycle_tests {
         let roles = admin.roles();
         for name in ["incident_controller", "agent_exec"] {
             roles
-                .create(NewRole { name: name.into(), login: true, ..NewRole::default() })
+                .create(NewRole {
+                    name: name.into(),
+                    login: true,
+                    ..NewRole::default()
+                })
                 .unwrap();
         }
         roles.set_task_only("agent_exec", true).unwrap();
         roles
-            .grant_table("shipments", "incident_controller", &[TablePrivilege::Select])
+            .grant_table(
+                "shipments",
+                "incident_controller",
+                &[TablePrivilege::Select],
+            )
+            .unwrap();
+        roles
+            .grant_table("shipments", "agent_exec", &[TablePrivilege::Select])
             .unwrap();
         let issuer = roles.get("incident_controller").unwrap().unwrap();
         let clock = crate::clock::Clock::new(0, 3600).unwrap();
@@ -3105,7 +3218,11 @@ mod lifecycle_tests {
                     untrusted_text: Vec::new(),
                     allowed_write: None,
                     mutation_caps: MutationCaps::default(),
-                    disclosure_caps: DisclosureCaps { rows_read: 10, rows_returned: 10, bytes_returned: 4096 },
+                    disclosure_caps: DisclosureCaps {
+                        rows_read: 10,
+                        rows_returned: 10,
+                        bytes_returned: 4096,
+                    },
                     limits: LoadLimits::default(),
                     approval_threshold: 0,
                     expires: "2999-01-01 00:00:00+00".into(),
@@ -3114,14 +3231,27 @@ mod lifecycle_tests {
             )
             .unwrap();
         let fp = "aa".repeat(32);
-        let service = crate::Service::with_agent(
+        crate::Service::with_agent(
             admin.clone(),
             vec![],
-            vec![AgentBinding { fingerprint: fp.clone(), executor: "agent_exec".into(), tasks: vec!["inc-436".into()] }],
+            vec![AgentBinding {
+                fingerprint: fp.clone(),
+                executor: "agent_exec".into(),
+                tasks: vec!["inc-436".into()],
+            }],
             clock,
             crate::admission::ServiceLimits::default(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn issue_credential_task_ddl_backstop_refuses_without_writing() {
+        let service = credential_fixture();
+        let admin = &service.admin;
+        let now = crate::agent::wall_now(&service.clock).unwrap();
+        let fp = "aa".repeat(32);
         let mut session = service.agent_session(&fp, None).unwrap();
         let stmt = crate::task_ddl::parse("ISSUE CREDENTIAL FOR TASK \"inc-436\"").unwrap();
         assert!(crate::task_ddl::writes(&stmt));
@@ -3132,6 +3262,195 @@ mod lifecycle_tests {
         assert_eq!(admin.tasks().credentials(def.id, now).unwrap(), before);
     }
 
+    #[cfg(feature = "engine-rocksdb")]
+    fn issue_session_credential(
+        service: &Service,
+        expires: Option<giggles_core::task::definition::WallClockMs>,
+    ) -> giggles_core::task::credential::IssuedCredential {
+        let issuer = service
+            .admin
+            .roles()
+            .get("incident_controller")
+            .unwrap()
+            .unwrap();
+        let now = crate::agent::wall_now(&service.clock).unwrap();
+        service
+            .admin
+            .tasks()
+            .issue_credential(&issuer, "inc-436", expires, now)
+            .unwrap()
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    fn assert_auth_refused<T>(result: Result<T, CoreError>) {
+        assert!(matches!(
+            result,
+            Err(CoreError::Policy(Error::Authentication))
+        ));
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn credential_session_opens_and_selects() {
+        let service = credential_fixture();
+        service
+            .admin
+            .sql_session()
+            .execute(
+                "INSERT INTO shipments VALUES (1, 42, 'ready'), (2, 99, 'hidden')",
+                &[],
+                None,
+            )
+            .unwrap();
+        let issued = issue_session_credential(&service, None);
+        let mut session = service
+            .credential_session(issued.secret.expose(), Some("agent_exec"), Some("inc-436"))
+            .unwrap();
+        assert_eq!(session.fingerprint, format!("sqlcred:{:016x}", issued.id));
+        assert_eq!(session.epoch, issued.id);
+        let mut digest = [0; 32];
+        digest[..8].copy_from_slice(b"sqlcred\0");
+        digest[24..].copy_from_slice(&issued.id.to_be_bytes());
+        assert_eq!(session.sql.task().unwrap().credential_fingerprint, digest);
+        assert!(session.check_binding().is_ok());
+        let read = session
+            .execute_sql_unreleased("SELECT id, status FROM shipments LIMIT 10", &[])
+            .unwrap();
+        let rows = session.release_page(read).unwrap().into_inner().rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values,
+            vec![Value::Int(1), Value::Text("ready".into())]
+        );
+        let backend = service
+            .cancellations
+            .register(&session.fingerprint, session.epoch)
+            .unwrap();
+        let active = backend.begin(true);
+        service.cancel_bound(&session, backend.pid, backend.secret);
+        assert_eq!(active.context.check(), Err(CoreError::Cancelled));
+        drop(active);
+        let issuer = service
+            .admin
+            .roles()
+            .get("incident_controller")
+            .unwrap()
+            .unwrap();
+        service
+            .admin
+            .tasks()
+            .revoke_credential(&issuer, issued.id)
+            .unwrap();
+        let active = backend.begin(true);
+        service.cancel_bound(&session, backend.pid, backend.secret);
+        assert!(active.context.check().is_ok());
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn credential_session_refuses_wrong_user_task_secret() {
+        let service = credential_fixture();
+        let issued = issue_session_credential(&service, None);
+        assert_auth_refused(service.credential_session(
+            issued.secret.expose(),
+            Some("other"),
+            None,
+        ));
+        assert_auth_refused(service.credential_session(
+            issued.secret.expose(),
+            None,
+            Some("other"),
+        ));
+        assert_auth_refused(service.credential_session("invalid", None, None));
+        let mut wrong = issued.secret.expose().to_owned();
+        let last = wrong.pop().unwrap();
+        wrong.push(if last == '0' { '1' } else { '0' });
+        assert_auth_refused(service.credential_session(&wrong, None, None));
+        service.clock.latch_uncertain();
+        assert_auth_refused(service.credential_session(issued.secret.expose(), None, None));
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn credential_session_refuses_revoked_and_expired() {
+        use giggles_core::task::definition::WallClockMs;
+        let service = credential_fixture();
+        let issuer = service
+            .admin
+            .roles()
+            .get("incident_controller")
+            .unwrap()
+            .unwrap();
+        let issued = issue_session_credential(&service, None);
+        service
+            .admin
+            .tasks()
+            .revoke_credential(&issuer, issued.id)
+            .unwrap();
+        assert_auth_refused(service.credential_session(issued.secret.expose(), None, None));
+        let now = crate::agent::wall_now(&service.clock).unwrap();
+        let expiring = issue_session_credential(&service, Some(WallClockMs(now.0 + 500)));
+        let live = service
+            .credential_session(expiring.secret.expose(), None, None)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(550));
+        assert_auth_refused(service.credential_session(expiring.secret.expose(), None, None));
+        assert_auth_refused(live.check_binding());
+        let issued = issue_session_credential(&service, None);
+        service.admin.tasks().revoke(&issuer, "inc-436").unwrap();
+        assert_auth_refused(service.credential_session(issued.secret.expose(), None, None));
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn credential_check_binding_fails_after_revoke() {
+        let service = credential_fixture();
+        let issuer = service
+            .admin
+            .roles()
+            .get("incident_controller")
+            .unwrap()
+            .unwrap();
+        let issued = issue_session_credential(&service, None);
+        let session = service
+            .credential_session(issued.secret.expose(), None, None)
+            .unwrap();
+        service
+            .admin
+            .tasks()
+            .revoke_credential(&issuer, issued.id)
+            .unwrap();
+        assert_auth_refused(session.check_binding());
+        let issued = issue_session_credential(&service, None);
+        let session = service
+            .credential_session(issued.secret.expose(), None, None)
+            .unwrap();
+        service.admin.tasks().revoke(&issuer, "inc-436").unwrap();
+        assert_auth_refused(session.check_binding());
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn cert_session_unaffected() {
+        let service = credential_fixture();
+        let issued = issue_session_credential(&service, None);
+        let issuer = service
+            .admin
+            .roles()
+            .get("incident_controller")
+            .unwrap()
+            .unwrap();
+        service
+            .admin
+            .tasks()
+            .revoke_credential(&issuer, issued.id)
+            .unwrap();
+        let mut session = service.agent_session(&"aa".repeat(32), None).unwrap();
+        assert!(session.credential.is_none());
+        assert!(session.check_binding().is_ok());
+        let read = session.execute_sql_unreleased("SELECT id FROM shipments LIMIT 1", &[]).unwrap();
+        assert!(session.release_page(read).unwrap().into_inner().rows.is_empty());
+    }
 
     /// GD-0075 P11-5: a role recheck that fails transiently (a fenced gateway's 40001, an
     /// unavailable range's 08007) keeps its own SQLSTATE; other failures stay 28000.
