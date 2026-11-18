@@ -156,3 +156,176 @@ pub fn verifier(id: u64, random: &[u8; 32]) -> [u8; 32] {
 pub fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     a.iter().zip(b).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
 }
+
+use super::{
+    catalog::{TaskCatalog, TaskDdlError, ddl},
+    definition::{TaskName, TaskObjectId},
+};
+use crate::storage::{
+    engine::{kv::Keyspace, meta::TASK_CATALOG},
+    roles::CatalogRole,
+};
+
+pub const MAX_LIVE_CREDENTIALS: usize = 8;
+
+#[derive(Debug)]
+pub struct IssuedCredential {
+    pub id: u64,
+    pub task: TaskName,
+    pub secret: SecretText,
+    pub expires_at: Option<WallClockMs>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialMatch {
+    pub task: TaskObjectId,
+    pub credential: u64,
+    pub executor: String,
+    pub expires_at: Option<WallClockMs>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialRefused;
+
+fn own_live(record: &CredentialRecord, now: WallClockMs) -> bool {
+    record.expires_at.is_none_or(|expires| now < expires)
+}
+
+impl TaskCatalog {
+    /// Mint a bearer secret once; persist only its verifier.
+    pub fn issue_credential(
+        &self,
+        actor: &CatalogRole,
+        task: &str,
+        expires: Option<WallClockMs>,
+        now: WallClockMs,
+    ) -> Result<IssuedCredential, TaskDdlError> {
+        let (mut txn, _) = self.begin_write(None)?;
+        let db = self.db()?;
+        let view = db.catalog().committed_view(&mut txn)?;
+        let def = Self::current(&view, task)?;
+        Self::may_administer(actor, &def)?;
+        if def.revoked || now >= def.expires_at {
+            return Err(ddl("55000", "task is not live"));
+        }
+        if expires.is_some_and(|expires| expires <= now) {
+            return Err(ddl("22023", "credential expiry is not in the future"));
+        }
+        let mut live = 0;
+        for (&id, (task, record)) in &view.task_credentials {
+            if *task != def.id.0 {
+                continue;
+            }
+            if own_live(record, now) {
+                live += 1;
+            } else {
+                txn.delete(Keyspace::Catalog, credential_key(*task, id))?;
+            }
+        }
+        if live >= MAX_LIVE_CREDENTIALS {
+            return Err(ddl("54000", "too many live credentials for task"));
+        }
+        let id = db.sequences.next(0, 0)?;
+        let (secret, verifier) = new_secret(id)?;
+        let record = CredentialRecord {
+            issued_at: now,
+            expires_at: expires,
+            issued_by: actor.name.clone(),
+            verifier,
+        };
+        txn.put(
+            Keyspace::Catalog,
+            credential_key(def.id.0, id),
+            encode_credential(&record)?,
+        )?;
+        txn.require_features(TASK_CATALOG);
+        db.catalog().commit_ddl(txn)?;
+        Ok(IssuedCredential {
+            id,
+            task: def.name,
+            secret,
+            expires_at: expires,
+        })
+    }
+
+    pub fn revoke_credential(&self, actor: &CatalogRole, id: u64) -> Result<(), TaskDdlError> {
+        let (mut txn, _) = self.begin_write(None)?;
+        let db = self.db()?;
+        let view = db.catalog().committed_view(&mut txn)?;
+        let (task, _) = view
+            .task_credentials
+            .get(&id)
+            .ok_or_else(|| ddl("42704", format!("credential {id} does not exist")))?;
+        let def = view
+            .tasks
+            .get(task)
+            .ok_or_else(|| ddl("42704", "task does not exist"))?;
+        Self::may_administer(actor, def)?;
+        txn.delete(Keyspace::Catalog, credential_key(*task, id))?;
+        txn.require_features(TASK_CATALOG);
+        db.catalog().commit_ddl(txn)?;
+        Ok(())
+    }
+
+    /// Own-expiry filtering, in ascending credential id order.
+    pub fn credentials(
+        &self,
+        task: TaskObjectId,
+        now: WallClockMs,
+    ) -> Result<Vec<(u64, Option<WallClockMs>)>, TaskDdlError> {
+        Ok(self
+            .view()?
+            .task_credentials
+            .iter()
+            .filter(|(_, (owner, record))| *owner == task.0 && own_live(record, now))
+            .map(|(&id, (_, record))| (id, record.expires_at))
+            .collect())
+    }
+
+    /// Task expiry is handled by the session's outcome-retention policy.
+    pub fn authenticate(
+        &self,
+        secret: &str,
+        now: WallClockMs,
+    ) -> Result<CredentialMatch, CredentialRefused> {
+        let Some((id, random)) = parse_secret(secret) else {
+            // Keep the dummy hash and comparison in optimized builds too.
+            let dummy = verifier(std::hint::black_box(0), &[0; 32]);
+            std::hint::black_box(ct_eq(&dummy, &[0; 32]));
+            return Err(CredentialRefused);
+        };
+        let hash = verifier(id, &random);
+        let view = self.view().map_err(|_| CredentialRefused)?;
+        let Some((task, record)) = view.task_credentials.get(&id) else {
+            std::hint::black_box(ct_eq(&hash, &[0; 32]));
+            return Err(CredentialRefused);
+        };
+        if !ct_eq(&hash, &record.verifier) || !own_live(record, now) {
+            return Err(CredentialRefused);
+        }
+        let def = view
+            .tasks
+            .get(task)
+            .filter(|def| !def.revoked)
+            .ok_or(CredentialRefused)?;
+        Ok(CredentialMatch {
+            task: def.id,
+            credential: id,
+            executor: def.executor.clone(),
+            expires_at: record.expires_at,
+        })
+    }
+
+    pub fn credential_live(&self, task: TaskObjectId, credential: u64, now: WallClockMs) -> bool {
+        let Ok(view) = self.view() else {
+            return false;
+        };
+        view.task_credentials
+            .get(&credential)
+            .is_some_and(|(owner, record)| {
+                *owner == task.0
+                    && own_live(record, now)
+                    && view.tasks.get(owner).is_some_and(|def| !def.revoked)
+            })
+    }
+}

@@ -431,7 +431,7 @@ impl std::fmt::Display for TaskDdlError {
 
 impl std::error::Error for TaskDdlError {}
 
-fn ddl(sqlstate: &'static str, message: impl Into<String>) -> TaskDdlError {
+pub(crate) fn ddl(sqlstate: &'static str, message: impl Into<String>) -> TaskDdlError {
     TaskDdlError {
         sqlstate,
         message: message.into(),
@@ -484,7 +484,7 @@ impl TaskCatalog {
         Self { db, roles }
     }
 
-    fn db(&self) -> Result<&Arc<V2Db>, TaskDdlError> {
+    pub(crate) fn db(&self) -> Result<&Arc<V2Db>, TaskDdlError> {
         self.db
             .as_ref()
             .ok_or_else(|| ddl("0A000", "tasks require the v2 storage engine"))
@@ -501,7 +501,7 @@ impl TaskCatalog {
     /// (when given), the role lock shared, then the task catalog lock
     /// exclusive. The snapshot is refreshed after the last wait, as
     /// `roles_engine::write` does. Returns whether the table resolved.
-    fn begin_write(&self, table: Option<&str>) -> Result<(Transaction, bool), TaskDdlError> {
+    pub(crate) fn begin_write(&self, table: Option<&str>) -> Result<(Transaction, bool), TaskDdlError> {
         let db = self.db()?;
         let mut txn = db.begin(Isolation::ReadCommitted);
         let resolved = table.is_some_and(|key| {
@@ -528,7 +528,7 @@ impl TaskCatalog {
         Ok(())
     }
 
-    fn current(view: &CatalogView, name: &str) -> Result<TaskDef, TaskDdlError> {
+    pub(crate) fn current(view: &CatalogView, name: &str) -> Result<TaskDef, TaskDdlError> {
         view.task_names
             .get(name)
             .and_then(|id| view.tasks.get(id))
@@ -546,7 +546,7 @@ impl TaskCatalog {
         }
     }
 
-    fn may_administer(actor: &CatalogRole, def: &TaskDef) -> Result<(), TaskDdlError> {
+    pub(crate) fn may_administer(actor: &CatalogRole, def: &TaskDef) -> Result<(), TaskDdlError> {
         if actor.superuser || actor.name == def.issuer {
             Ok(())
         } else {
