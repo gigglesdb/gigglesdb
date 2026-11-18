@@ -271,7 +271,7 @@ impl SqlSession {
     pub(super) fn insert_sequence_callback(
         &self,
         db: &Arc<v2::V2Db>,
-        image: relational::Relational,
+        image: Arc<relational::Relational>,
     ) -> relational::clock::SequenceCallback {
         sql_sequences::callback(db.clone(), image, self.sequence_baseline.clone(),
             self.pending_sequences.clone(), self.sequence_values.clone(), self.search_path.clone())
@@ -354,7 +354,7 @@ impl SqlSession {
                 .with_extra_float_digits(self.extra_float_digits)
                 .with_sequences(sql_sequences::callback(
                     db.clone(),
-                    state.sql.clone(),
+                    Arc::new(state.sql.clone()),
                     self.sequence_baseline.clone(),
                     self.pending_sequences.clone(),
                     self.sequence_values.clone(),
@@ -858,17 +858,18 @@ impl SqlSession {
                         } else {
                             1..u64::MAX
                         };
-                        let mut image = catalog.image()
+                        let catalog_image = catalog.image()
                         .map_err(|error| match error {
                             E::Unsupported => CoreError::Sql(E::Unsupported),
                             error => {
                                 CoreError::Corrupt(format!("invalid stored v2 catalog: {error:?}"))
                             }
-                        })?.catalog_image_for_statement(ids.start, versions.start);
+                        })?;
+                        let mut image = catalog_image.catalog_image_for_statement(ids.start, versions.start);
                         let context = clock.map(|clock| {
                             clock.with_sequences(sql_sequences::callback(
                                 db.clone(),
-                                image.clone(),
+                                catalog_image,
                                 self.sequence_baseline.clone(),
                                 self.pending_sequences.clone(),
                                 self.sequence_values.clone(),

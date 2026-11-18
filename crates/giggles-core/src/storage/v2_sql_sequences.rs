@@ -3,7 +3,7 @@ use super::*;
 
 pub(super) fn callback(
     db: Arc<v2::V2Db>,
-    image: relational::Relational,
+    image: Arc<relational::Relational>,
     baseline: BTreeMap<u64, u128>,
     pending: sequences::Pending,
     values: sequences::SessionValues,
@@ -89,8 +89,6 @@ pub(super) fn callback(
             .as_ref()
             .map(|slot| crate::cancellation::lock(&slot.counter))
             .transpose()?;
-        let mut state = empty(0);
-        state.sql = image.clone();
         let mut pending = if committed {
             None
         } else {
@@ -118,24 +116,17 @@ pub(super) fn callback(
                 .get(&id)
                 .cloned()
         };
-        if let Some(counter) = &prior {
-            state.seq.insert(id, counter.clone());
-        }
-        let result = match operation {
-            "nextval" => sequences::next(&mut state, id),
-            "setval" => sequences::setval(
-                &mut state,
-                id,
+        let (result, counter) = match operation {
+            "nextval" => sequences::next_on(def, prior.clone()),
+            "setval" => sequences::set_on(
+                def,
+                prior.clone(),
                 value.ok_or(CoreError::Sql(SqlError::Parameters))?,
                 called,
             ),
             _ => Err(SqlError::Unsupported),
         }
         .map_err(CoreError::Sql)?;
-        let counter = state
-            .seq
-            .remove(&id)
-            .expect("successful sequence evaluation");
         if committed {
             // next() already computes the bounded 32-step recovery lookahead.
             // The unchanged codec writes log_hw as the recovered last_value.

@@ -60,6 +60,38 @@ pub(crate) fn next(s: &mut State, id: u64) -> R<i64> {
         .ok_or(E::Overflow)?;
     advance(counter(s, id, &def), &def, stamp)
 }
+/// Evaluate against the single counter held by a v2 SQL callback.
+fn single_counter(def: &SequenceDef, prior: Option<SeqCounter>) -> R<(SeqCounter, u64)> {
+    // Match State's stamp calculation before replacing a stale incarnation.
+    let stamp = prior
+        .as_ref()
+        .map_or(0, |c| c.stamp)
+        .checked_add(1)
+        .ok_or(E::Overflow)?;
+    let counter = prior
+        .filter(|c| c.incarnation == def.incarnation)
+        .unwrap_or_else(|| fresh(def));
+    Ok((counter, stamp))
+}
+pub(super) fn next_on(def: &SequenceDef, prior: Option<SeqCounter>) -> R<(i64, SeqCounter)> {
+    let (mut counter, stamp) = single_counter(def, prior)?;
+    let value = advance(&mut counter, def, stamp)?;
+    Ok((value, counter))
+}
+pub(super) fn set_on(
+    def: &SequenceDef,
+    prior: Option<SeqCounter>,
+    value: i64,
+    called: bool,
+) -> R<(i64, SeqCounter)> {
+    // Bounds precede stamp overflow and incarnation replacement, as in setval.
+    if value < def.min || value > def.max {
+        return Err(E::Overflow);
+    }
+    let (mut counter, stamp) = single_counter(def, prior)?;
+    set(&mut counter, value, called, stamp);
+    Ok((value, counter))
+}
 /// A counter that has handed out nothing yet.
 pub(crate) fn fresh(def: &SequenceDef) -> SeqCounter {
     SeqCounter {
@@ -395,6 +427,51 @@ mod tests {
         assert_eq!(step(2, &def(1, true)), Ok(-2));
         assert_eq!(step(-2, &def(-1, true)), Ok(2));
         assert_eq!(step(i64::MAX, &def(i64::MAX, false)), Err(E::SequenceLimit));
+    }
+    #[test]
+    fn single_counter_matches_state_operations() {
+        for increment in [1, -1] {
+            let mut state = empty(17);
+            let ddl = format!(
+                "CREATE SEQUENCE s INCREMENT {increment} START 2 MINVALUE -2 MAXVALUE 2 CYCLE"
+            );
+            let prepared = relational::Prepared::parse(&ddl, 17, 0).unwrap();
+            state.sql.execute(&prepared, &[], None).unwrap();
+            let (&id, def) = state.sql.catalog_ext().sequences.iter().next().unwrap();
+            let def = def.clone();
+            let mut prior = None;
+            for operation in [None, None, Some((0, false)), None, None,
+                Some((2, true)), None, None, None, None, None, None] {
+                let actual = match operation {
+                    None => next_on(&def, prior.take()),
+                    Some((value, called)) => set_on(&def, prior.take(), value, called),
+                }.unwrap();
+                let expected = match operation {
+                    None => next(&mut state, id),
+                    Some((value, called)) => setval(&mut state, id, value, called),
+                }.unwrap();
+                assert_eq!(actual.0, expected);
+                // Eq covers incarnation, last_value, is_called, log_hw and stamp.
+                assert_eq!(&actual.1, &state.seq[&id]);
+                prior = Some(actual.1);
+            }
+            // A stale incarnation still contributes its stamp before reset.
+            let mut stale = prior.unwrap();
+            stale.incarnation = def.incarnation.wrapping_add(1);
+            state.seq.insert(id, stale.clone());
+            let actual = next_on(&def, Some(stale)).unwrap();
+            assert_eq!(actual.0, next(&mut state, id).unwrap());
+            assert_eq!(actual.1, state.seq[&id]);
+            let mut exhausted = actual.1;
+            exhausted.stamp = u64::MAX;
+            state.seq.insert(id, exhausted.clone());
+            assert_eq!(next_on(&def, Some(exhausted.clone())), Err(E::Overflow));
+            assert_eq!(next(&mut state, id), Err(E::Overflow));
+            for value in [0, 3] {
+                assert_eq!(set_on(&def, Some(exhausted.clone()), value, false), Err(E::Overflow));
+                assert_eq!(setval(&mut state, id, value, false), Err(E::Overflow));
+            }
+        }
     }
     #[test]
     fn reference_names_preserve_quoted_case() {

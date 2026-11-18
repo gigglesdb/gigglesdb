@@ -542,7 +542,7 @@ fn cached_callback_observes_drop_and_restart() {
             .collect();
         let cb = callback(
             db.clone(),
-            image,
+            Arc::new(image),
             baseline,
             Default::default(),
             Default::default(),

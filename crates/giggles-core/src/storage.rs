@@ -3265,7 +3265,7 @@ impl SqlSession {
             },
         };
         let callback = if let Backend::V2(db) = &self.admin.inner.backend {
-            self.insert_sequence_callback(db, state.sql.clone())
+            self.insert_sequence_callback(db, Arc::new(state.sql.clone()))
         } else {
             self.admin.inner.merge_live_sequences(&mut state)?;
             sequences::merge(&mut state, &*self.pending_sequences.lock().map_err(|_| CoreError::Fenced)?);
