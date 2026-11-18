@@ -18,6 +18,11 @@ pub(in crate::storage) fn settle(db: &v2::V2Db, list: &Unsettled) -> Result<(), 
         drain_ready(&mut guard);
         // A synchronous setval/wrap may have replaced durable_hw since allocation.
         // Its durable install drained all older reservations before moving backwards.
+        // Installs only follow setval, a cycle wrap, is_called=false (setval) or an
+        // incarnation change (RESTART/DROP); each already lets PostgreSQL reissue
+        // earlier values without a crash, so a reservation whose ack failed before
+        // such an install needs no further coverage. A failed ack with no install
+        // keeps the epoch and falls through to await_coverage's fresh reservation.
         if guard.coverage_epoch != item.coverage_epoch { continue; }
         if guard.counter.as_ref().is_some_and(|c| c.incarnation == item.def.incarnation)
             && guard.durable_hw.is_some_and(|hw| {

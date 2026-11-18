@@ -1042,39 +1042,64 @@ fn unsettled_crash_worker() {
     let path = PathBuf::from(path);
     let mode: usize = std::env::var("UNSETTLED_CRASH_MODE").unwrap().parse().unwrap();
     let admin = Admin::open(&path, Limits::default()).unwrap();
-    let workers: Vec<_> = (0..if mode == 4 { 4 } else { 1 }).map(|lane| {
+    let lanes = if mode == 4 { 4 } else { 1 };
+    // Each exposure parks its session (alive, often mid-transaction) until the
+    // main thread resumes it, so the final crash finds every session still
+    // holding its last observed value: no later statement, rollback or drop
+    // can settle it first.
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<(usize, i64)>();
+    let mut resume = Vec::new();
+    let mut workers = Vec::new();
+    for lane in 0..lanes {
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        resume.push(go_tx);
         let admin = admin.clone();
-        thread::spawn(move || {
+        let seen_tx = seen_tx.clone();
+        workers.push(thread::spawn(move || {
             let mut s = admin.sql_session();
-            let mut seen = 0;
+            let expose = |value: i64| {
+                seen_tx.send((lane, value)).unwrap();
+                // A closed channel means the process is crashing; park forever.
+                if go_rx.recv().is_err() { loop { thread::park(); } }
+            };
             for n in 0..80 {
                 let which = if mode == 4 { (n + lane) % 4 } else { mode };
-                let value = match which {
-                    0 => scalar(&mut s, "INSERT INTO exposed(payload) VALUES (1) RETURNING id"),
-                    1 => scalar(&mut s, "SELECT nextval('exposed_id_seq')"),
+                match which {
+                    0 => expose(scalar(&mut s, "INSERT INTO exposed(payload) VALUES (1) RETURNING id")),
+                    1 => expose(scalar(&mut s, "SELECT nextval('exposed_id_seq')")),
                     2 => {
                         run(&mut s, "BEGIN");
-                        seen = seen.max(scalar(&mut s, "SELECT nextval('exposed_id_seq')"));
-                        let v = scalar(&mut s, "INSERT INTO exposed(payload) VALUES (2) RETURNING id");
+                        expose(scalar(&mut s, "SELECT nextval('exposed_id_seq')"));
+                        expose(scalar(&mut s, "INSERT INTO exposed(payload) VALUES (2) RETURNING id"));
                         run(&mut s, "ROLLBACK");
-                        v
                     }
                     _ => {
                         run(&mut s, "BEGIN");
                         let payload = 1000 + lane * 100 + n;
                         run(&mut s, &format!("INSERT INTO exposed(payload) VALUES ({payload})"));
-                        let v = scalar(&mut s, &format!("SELECT id FROM exposed WHERE payload={payload}"));
+                        expose(scalar(&mut s, &format!("SELECT id FROM exposed WHERE payload={payload}")));
                         run(&mut s, "ROLLBACK");
-                        v
                     }
-                };
-                seen = seen.max(value);
+                }
             }
-            seen
-        })
-    }).collect();
-    let seen = workers.into_iter().map(|w| w.join().unwrap()).max().unwrap();
+            // Finished lanes stay alive with their sessions open.
+            loop { thread::park(); }
+        }));
+    }
+    drop(seen_tx);
+    let mut seen = 0;
+    for _ in 0..lanes * 60 {
+        let (lane, value) = seen_rx.recv().unwrap();
+        seen = seen.max(value);
+        resume[lane].send(()).unwrap();
+    }
+    // Collect each lane's next exposure and crash while all of them are parked.
+    for _ in 0..lanes {
+        let (_, value) = seen_rx.recv().unwrap();
+        seen = seen.max(value);
+    }
     std::fs::write(path.join("client-seen"), seen.to_string()).unwrap();
+    let _ = workers;
     crate::storage::crash_now();
 }
 
@@ -1136,6 +1161,18 @@ fn deferred_insert_avoids_coverage_wait_but_exposed_select_waits() {
         tx.send(scalar(&mut s, "SELECT nextval('fast_id_seq')")).unwrap();
         run(&mut s, "ROLLBACK");
     });
+    // Synchronise on the reader's actual coverage wait, not on a timeout.
+    let slot = db.sql_counters.lock().unwrap().values().next().unwrap().clone();
+    loop {
+        let cancel = crate::cancellation::Cancellation::new(Some(Instant::now() + Duration::from_millis(100)));
+        let waiting = cancel.scope(|| {
+            let guard = slot.counter.lock_cancellable().unwrap();
+            guard.waiting_returns > 0 || guard.receiving
+        });
+        if waiting { break; }
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
     assert!(done.recv_timeout(Duration::from_millis(200)).is_err());
     assert!(db.sequencer.held_counter_acks() > 0);
     db.sequencer.gate_counter_acks(false);
@@ -1157,6 +1194,9 @@ fn deferred_coverage_survives_a_durable_backwards_install() {
     for _ in 0..40 { run(&mut s, "INSERT INTO backwards(payload) VALUES (1)"); }
     assert_eq!(scalar(&mut s, "SELECT setval('backwards_id_seq',1,false)"), 1);
     run(&mut s, "ROLLBACK");
+    // setval is non-transactional: the durable backwards install stands, and
+    // settling the earlier deferred values did not move the counter forward.
+    assert_eq!(scalar(&mut s, "SELECT nextval('backwards_id_seq')"), 1);
 }
 
 // Preserve the original direct-helper tests as synchronous callers. Sessions use

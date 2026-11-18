@@ -379,6 +379,8 @@ impl SqlSession {
             }
             output.map_err(CoreError::Sql)
         })();
+        // Successful normalized rows go to COPY FROM ingest, never to a client;
+        // COPY reports a count, and its statement end or commit settles them.
         if result.is_err() {
             // abort() settles best-effort; surface a settle failure instead of a
             // value-bearing error whose value is not yet durably covered.
