@@ -155,10 +155,10 @@ copy_back() { # Best effort, including incomplete benches; never prevents deleti
   ( cd "$run" && timeout --kill-after=10 150 "$B" --no-update scp "$box:/home/user/bench-logs.tar.gz" logs.tar.gz >/dev/null 2>&1 ) || log "WARNING: log download failed"
   local f
   for f in summary.md results.jsonl meta.json progress; do
-    tar -xzOf "$run/logs.tar.gz" "bench/$f" > "$run/$f" 2>/dev/null || true
+    tar --force-local -xzOf "$run/logs.tar.gz" "bench/$f" > "$run/$f" 2>/dev/null || true
     [ -s "$run/$f" ] || rm -f "$run/$f"
   done
-  tar -xzf "$run/logs.tar.gz" -C "$run" --strip-components=1 bench/profiles 2>/dev/null || true
+  tar --force-local -xzf "$run/logs.tar.gz" -C "$run" --strip-components=1 bench/profiles 2>/dev/null || true
   return 0
 }
 

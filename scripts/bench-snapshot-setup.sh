@@ -10,6 +10,81 @@
 # and builds giggles-server --release so the release target dir is warm.
 # Writes /home/user/bench.env and /home/user/bench-base.txt (versions).
 set -euxo pipefail
+# Probe-only deliberately needs neither gate.env nor package/build setup.
+perf_diagnosis() {
+  {
+    echo "diagnosis UTC=$(date -u +%FT%TZ) kernel=$(uname -r)"
+    echo "virt=$(systemd-detect-virt 2>/dev/null || true)"
+    echo "container=$(systemd-detect-virt --container 2>/dev/null || true)"
+    echo 'pid1 cgroup:'; cat /proc/1/cgroup
+    for knob in kernel.perf_event_paranoid kernel.kptr_restrict kernel.unprivileged_bpf_disabled; do
+      sysctl "$knob" || true
+    done
+    echo "lockdown=$(cat /sys/kernel/security/lockdown 2>/dev/null || echo unavailable)"
+    echo "BTF=$(test -r /sys/kernel/btf/vmlinux && echo present || echo missing)"
+    if [ -r "/boot/config-$(uname -r)" ]; then
+      grep -E 'CONFIG_(BPF_SYSCALL|KPROBES|KPROBE_EVENTS)=' "/boot/config-$(uname -r)" || true
+    elif [ -r /proc/config.gz ]; then
+      zcat /proc/config.gz | grep -E 'CONFIG_(BPF_SYSCALL|KPROBES|KPROBE_EVENTS)=' || true
+    else echo 'kernel config unavailable (BPF_SYSCALL/kprobes unknown)'; fi
+  } | tee "$HOME/bench-perf-diagnosis.txt"
+}
+# Logs are deliberately written by the calling user, not root.
+# shellcheck disable=SC2024
+probe() {
+  local name=$1; shift
+  if ! sudo -n timeout --kill-after=10 45 "$@" > "$probe_dir/$name.log" 2>&1; then
+    echo "PROBE FAILED: $name: command failed or exceeded 45 seconds" >&2
+    cat "$probe_dir/$name.log" >&2
+    # Includes active lockdown, container/cgroup and missing-BTF clues.
+    cat "$HOME/bench-perf-diagnosis.txt" >&2
+    probe_failures+=("$name")
+    return 0
+  fi
+  echo "PROBE OK: $name"
+}
+# shellcheck disable=SC2024
+perf_probes() {
+  local probe_dir libc
+  probe_failures=()
+  perf_diagnosis
+  probe_dir=$(mktemp -d)
+  # Retain small probe logs for snapshot debugging.
+  echo "probe logs: $probe_dir"
+  probe btf test -r /sys/kernel/btf/vmlinux
+  probe kprobe bpftrace -e 'kprobe:do_nanosleep { exit(); }' -c 'sleep 0.2'
+  libc=$(ldconfig -p | awk '/libc.so.6 .*x86-64/ && !found {print $NF; found=1}')
+  [ -n "$libc" ] || libc=/usr/lib/x86_64-linux-gnu/libc.so.6
+  # Python os.getpid invokes libc getpid, unlike shell builtins.
+  probe uprobe bpftrace -e "uprobe:$libc:getpid { exit(); }" -c '/usr/bin/python3 -c "import os; os.getpid()"'
+  probe futex bpftrace -e 'tracepoint:syscalls:sys_enter_futex { @calls = count(); } interval:s:1 { exit(); }'
+  probe offcputime offcputime-bpfcc -f -d 1
+  probe wakeuptime wakeuptime-bpfcc -f 1
+  probe biolatency biolatency-bpfcc -m 1 1
+  probe syscount syscount-bpfcc -L -d 1
+  probe perf-trace perf trace -- true
+  probe perf-sched perf record -e sched:sched_switch -a -o "$probe_dir/sched.data" -- sleep 0.2
+  probe pidstat pidstat -t -u -w -p $$ 1 1
+  probe iostat iostat -x 1 1
+  printf 'probe;leaf 1\n' > "$probe_dir/input.folded"
+  # shellcheck disable=SC2016  # $1/$2 expand in the inner sh, by design.
+  probe inferno sh -c 'inferno-flamegraph < "$1" > "$2"' sh "$probe_dir/input.folded" "$probe_dir/flame.svg"
+  if sudo -n timeout --kill-after=10 15 perf lock contention -a -b -- sleep 0.2 > "$probe_dir/lock.log" 2>&1; then
+    echo 'perf_lock_bpf available' | tee "$HOME/bench-perf-lock.txt"
+  else echo 'perf_lock_bpf unavailable (optional)' | tee "$HOME/bench-perf-lock.txt"; fi
+  # Run every probe first so one snapshot attempt reports all failures.
+  if [ "${#probe_failures[@]}" -gt 0 ]; then
+    echo "PROBES FAILED (${#probe_failures[@]}): ${probe_failures[*]}; see diagnosis above" >&2
+    exit 1
+  fi
+  echo PROBES_OK
+}
+if [ "${1:-}" = --probe-only ]; then
+  perf_probes
+  exit 0
+fi
+[ $# = 0 ] || { echo "usage: $0 [--probe-only]" >&2; exit 2; }
+
 export DEBIAN_FRONTEND=noninteractive
 source "$HOME/gate.env"
 repo=/home/user/gigglesdb
@@ -61,6 +136,27 @@ s=$(date +%s)
 build_s=$(( $(date +%s) - s ))
 "$CARGO_TARGET_DIR/release/giggles-server" 2>&1 | head -1 || true
 
+# Profilers are snapshot dependencies, never downloaded during a benchmark.
+sudo apt-get install -yq bpfcc-tools bpftrace sysstat linux-tools-common
+if ! sudo apt-get install -yq "linux-tools-$(uname -r)" "linux-headers-$(uname -r)"; then
+  sudo apt-get install -yq linux-tools-generic linux-headers-generic
+  # The /usr/bin/perf wrapper otherwise insists on the running kernel package.
+  real_perf=$(find /usr/lib/linux-tools -type f -name perf | sort -V | tail -1)
+  [ -n "$real_perf" ] || { echo 'PROBE FAILED: perf-install: no real perf binary' >&2; exit 1; }
+  sudo ln -sfn "$real_perf" /usr/local/bin/perf
+fi
+# Disable collectors without disabling the interactive iostat tool.
+sudo systemctl disable --now sysstat.service sysstat-collect.timer sysstat-summary.timer >/dev/null 2>&1 || true
+if [ -f /etc/default/sysstat ]; then sudo sed -i 's/^ENABLED=.*/ENABLED="false"/' /etc/default/sysstat; fi
+if [ -f /etc/cron.d/sysstat ]; then sudo mv /etc/cron.d/sysstat /etc/cron.d/sysstat.disabled; fi
+cargo install inferno --locked --version 0.12.8 --root "$HOME/.cargo"
+for tool in inferno-flamegraph inferno-collapse-perf; do
+  sudo ln -sfn "$HOME/.cargo/bin/$tool" "/usr/local/bin/$tool"
+done
+printf 'kernel.perf_event_paranoid=-1\nkernel.kptr_restrict=0\n' | sudo tee /etc/sysctl.d/99-bench-perf.conf >/dev/null
+sudo sysctl --system
+perf_probes
+
 {
   echo "commit $(git -C "$repo" rev-parse HEAD)"
   echo "os $(lsb_release -ds)"
@@ -71,6 +167,10 @@ build_s=$(( $(date +%s) - s ))
   echo "rustc $(rustc --version)"
   echo "sccache $(command -v sccache || echo none)"
   echo "release_build_seconds $build_s"
+  echo "perf_binary $(readlink -f "$(command -v perf)")"
+  echo "perf $(perf --version)"
+  echo "inferno $(inferno-flamegraph --version) pinned=0.12.8"
+  cat "$HOME/bench-perf-diagnosis.txt" "$HOME/bench-perf-lock.txt"
   echo "created $(date -u +%FT%TZ)"
 } > /home/user/bench-base.txt
 cat /home/user/bench-base.txt

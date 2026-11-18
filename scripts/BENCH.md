@@ -145,79 +145,120 @@ data stays on `/home/user`, and both summary.md and meta.json say so.
 Add `--profile` for one diagnostic run per selected GigglesDB target/client
 count after all measured repeats, using the first mix and protocol group
 (native uses native). Diagnostic results stay out of `results.jsonl` and
-summary medians. Normal runs use the unchanged release binary, without perf.
+summary medians. Normal runs use the release binary without profiling.
 A separate build in `$CARGO_TARGET_DIR-profile` enables frame pointers and
-`line-tables-only` debug information. It has a 1500 s timeout plus 10 s to
-kill; failure is nonfatal and falls back to the normal binary with DWARF.
+`line-tables-only` debug information (1500 s timeout plus 10 s to kill).
+Build failure is nonfatal: on-CPU capture falls back to the normal binary
+with DWARF; off-CPU user stacks will then be poor.
 
-The phase starts its budget before checking/installing perf. Installation
-has a 180 s timeout plus 10 s to kill (package-lock wait is at most 60 s).
-Each target gets a fresh server and a 150 s diagnostic load, including schema
-setup/seeding, bounded by a 240 s timeout. After up to 60 s waiting for the
-first `completed=` line, captures run sequentially while the load is active:
+The benchmark snapshot installs `bpfcc-tools`, `bpftrace`, `sysstat`, running
+kernel headers, `linux-tools` (perf), and pinned inferno 0.12.8 (`--locked`).
+Run `scripts/bench-snapshot-setup.sh --probe-only` on the snapshot to check
+these without package installation or building. Each required probe is
+bounded at 45 s and reports OK or FAILED; all probes run before failure:
 
-| Step | Capture | Timeout |
-|---|---|---|
-| CPU, frame pointers | 499 Hz, `--call-graph fp`, 30 s | 45 s |
-| CPU, DWARF fallback | 99 Hz, `dwarf,8192`, 20 s | 35 s |
-| Lock | BPF contention, 30 s | 45 s |
-| Lock fallback | `perf lock record`, 30 s | 45 s |
-| Off-CPU | `offcputime-bpfcc`, 30 s | 45 s |
-| Off-CPU fallback | `perf sched record`, 20 s | 35 s |
-| Lock report / sched timehist | after load ends and server stops | 120 s each |
-| CPU report | stdio, no children, 0.5% minimum | 180 s |
-| CPU script and AWK fold | both pipeline members bounded independently | 300 s each, concurrently |
-| Flamegraph render | inferno or flamegraph.pl, when installed | 60 s |
-
-Every timeout uses `--kill-after=10`; root captures/processors run timeout
-inside `sudo -n` so root perf can be killed. The perf version/sysctl checks
-and data-size check are bounded at 15 s too. Every per-target capture,
-processing and load timeout is clamped to the remaining deadline minus 10 s;
-steps with less than 15 s available are skipped and logged. The diagnostic
-load's timeout kills its process group, including tsx children. Captures
-finish before waiting for the load, stopping the server, and post-processing.
-Raw files survive until processing ends, then are deleted. A nonempty CPU
-capture with exit 0 or timeout exit 124 counts as usable. Above 1 GB
-(1,073,741,824 bytes), `perf script` and folding are skipped; the bounded
-CPU report is still attempted. Missing tools/permissions never fail the bench.
-
-Normal time is about 5–6 min per target: server start about 20 s, seeding,
-a 150 s load covering roughly 95 s of captures, and 1–3 min for report/script.
-Worst case is 15 min per target; the whole phase has a 30 min per-box budget.
-Before starting a target, the runner reserves 900 s; if it would exceed
-1800 s since phase start, that target and all later targets are skipped.
-
-| Per-target worst-case component | Bound |
+| Probe | Meaning |
 |---|---|
-| `start_server` | <=160 s: two 60 s readiness waits plus up to 40 s stop |
-| All later capture/load/processing steps | clamped to start + 840 s, with 10 s kill-after reserved |
-| Final `stop_server` | <=40 s |
-| Total (including up to 10 s kill-after allowance) | <=890 s, within the 900 s reservation |
+| btf | Running kernel exposes readable `/sys/kernel/btf/vmlinux` |
+| kprobe / uprobe | bpftrace can attach to kernel sleep / libc getpid |
+| futex | Syscall tracepoint tracing works |
+| offcputime / wakeuptime | bcc scheduler tracing and folded output work |
+| biolatency / syscount | Block latency and syscall collectors attach |
+| perf-trace / perf-sched | perf syscall and scheduler events are accessible (not an off-CPU fallback) |
+| pidstat / iostat | Thread and device observers run |
+| inferno | Folded stacks render as SVG |
+| perf_lock_bpf | Optional `perf lock contention -b` support; absence is nonfatal |
 
-The matrix estimate adds `1510 + min(1800, 270 + profile_runs * 900)` seconds
-when profiling has non-pg targets; `profile_runs` is non-pg targets times
-client counts, and 270 s covers perf installation (190 s) plus the bounded
-version and sysctl checks. This covers the separate build and bounded phase. The measured
-estimate is still runs times (warmup + duration + 30 s), with 20 min separately
-reserved for normal build/setup. The launch log shows measured and profile
-estimates separately; split matrices that exceed the TTL allowance.
+The diagnosis block (`~/bench-perf-diagnosis.txt`) shows virtualization,
+container/cgroup context, `perf_event_paranoid` (perf access), `kptr_restrict`
+(kernel symbol visibility), unprivileged BPF policy, active lockdown, BTF,
+and available kernel BPF/kprobe configuration. Probe logs are retained at the
+printed path; failures print the diagnosis too. bcc needs headers for the
+**running** kernel, even when the snapshot has headers for another kernel.
+Ubuntu perf commonly lacks BPF lock support; the runner skips it explicitly.
 
-Progress includes each capture and post-processing start and budget skips.
-The local console log mirrors changed box progress lines, also saved in the
-run folder's `progress.log`. At TTL minus 600 s the waiter gives up and
-attempts partial copy-back before deleting the box; other failures after
-runner launch also trigger best-effort copy-back. Archive creation, boat
-execution and download are bounded. Incomplete/missing files are tolerated.
+Each target starts a fresh server and a 360 s diagnostic load. After waiting
+up to 60 s for its first `completed=` line (schema setup/seeding precedes it),
+the runner starts background observers and sequential stack captures:
 
-`profiles/` is included in `logs.tar.gz` and extracted beside `summary.md`:
-`top-<target>-c<clients>.txt`, `lock-...txt`, `offcpu-...txt`, and
-`folded-...txt`; `flame-...svg` is produced when `inferno-flamegraph` or
-`flamegraph.pl` is already on PATH. Raw perf files and `raw-*` directories
-are excluded from download as a backstop. The run folder also contains
-`results.jsonl`, `meta.json`, and the copied box `progress` file.
-`meta.json` records `profile_requested`, `profiling_ran` (usable CPU capture),
-`perf_version`, `profile_callgraph`, and `profile_build_seconds`. Failures
-are in `logs/build-profile.log`, `logs/profile-*.capture.txt` and `logs/perf-*`.
+| Step | Capture |
+|---|---|
+| Background, about 300 s | pidstat, iostat, biolatency, fsync histogram, syscount |
+| On-CPU, 30 s | 499 Hz frame pointers; fallback 99 Hz `dwarf,8192` |
+| Off-CPU, 30 s | `offcputime-bpfcc -f -d` |
+| Futex, 30 s | bpftrace user stacks, summed wait µs and counts |
+| Optional lock, 30 s | `perf lock contention -b` when supported |
+| Wakeup, 20 s | `wakeuptime-bpfcc -f` |
+| After captures/load | Copy RocksDB LOGs, stop server, CPU report/folding, SVGs, wait report |
+
+Observers are bounded at 310 s. Every timeout uses `--kill-after=10`;
+root collectors run timeout inside `sudo -n`. Missing tools and permissions
+are nonfatal and recorded in the manifest. Capture, load and processing
+budgets are clamped to the remaining target deadline minus 10 s; less than
+15 s available means skip. The load timeout kills its process group,
+including tsx children. CPU perf data above 1 GB skips script/folding but
+still gets a bounded report. Raw files are deleted after processing.
+
+The phase budget is 1800 s, reserving 900 s before each target. Each target
+allows up to 160 s server startup, clamps later steps to start + 840 s,
+and leaves room for final stop/kill. The matrix estimate adds
+`1510 + min(1800, 270 + profile_runs * 900)` seconds; `profile_runs` is
+non-pg targets times client counts. Split matrices exceeding the TTL allowance.
+Progress and skipped steps appear in `progress.log` and the copied box
+`progress`. At TTL minus 600 s, the waiter attempts partial copy-back before
+deleting the box; failures after launch also attempt copy-back.
+
+`profiles/` travels in `logs.tar.gz` and is extracted to **`<run>/profiles/`**.
+Names below use `<key>` such as `giggles-sql-c32`:
+
+| File | Contents |
+|---|---|
+| `folded-<key>.txt`, `top-<key>.txt`, `flame-cpu-<key>.svg` | CPU folded stacks, text report, flamegraph |
+| `offcpu-<key>.folded`, `flame-offcpu-<key>.svg` | Blocked time in µs and flamegraph |
+| `futex-<key>.txt` | User stack wait-time and count maps |
+| `wakeup-<key>.folded`, `flame-wakeup-<key>.svg` | Waker stacks/time and flamegraph |
+| `lock-<key>.txt` | Optional perf BPF lock contention |
+| `pidstat-<key>.txt`, `iostat-<key>.txt` | Thread CPU/context switches and extended device samples |
+| `biolatency-<key>.txt`, `fsync-<key>.txt`, `syscount-<key>.txt` | Block latency, fsync/fdatasync histograms, syscall totals |
+| `manifest-<key>.txt` | Capture status, actual duration, start, PID and thread names |
+| `rocksdb-<key>/LOG-n` | Up to five live LOG files, capped at 20 MiB each |
+| `wait-report-<key>.md` | Aggregated waits, idle split, locks and storage/thread summaries |
+| `ran-<key>`, `ran-offcpu-<key>` | Usable CPU capture / nonempty off-CPU capture markers |
+
+Raw perf data and `raw-*` directories are excluded from download. `meta.json`
+(at the run root) records `profile_requested`, `profiling_ran` (CPU),
+`offcpu_ran`, `perf_version`, `profile_callgraph`, and `profile_build_seconds`.
+Check manifest statuses too: a nonempty off-CPU marker alone is not proof of
+valid stacks. Failures are in `logs/build-profile.log`,
+`logs/profile-*.capture.txt` and `logs/perf-*`.
+
+Start with `wait-report-<key>.md`. Its main table ranks working waits; idle
+Tokio parking is expected and summarized separately. Thread names have
+trailing worker numbers removed. `% of wall` divides summed wait by capture
+time and the matching thread count; absent thread counts show n/a. The
+flame-offcpu SVG gives the full picture: width is blocked time, with thread
+name at the root. Unknown symbols limit classification; inspect full stacks
+rather than treating every futex as useful work.
+
+The futex table shows user-space waits in parking_lot, std Mutex/Condvar,
+and channels. Fsync histograms plus biolatency show durability cost; pidstat
+shows which threads burn CPU versus context switch; iostat `w_await` and
+`%util` show device pressure/saturation. Off-CPU explains where threads wait
+while on-CPU shows where active time goes: together they can explain the
+observed roughly 60% idle cores. Captures are sequential samples, so their
+percentages are not an exact accounting of a single shared time interval.
+BPF can add overhead on very hot futex paths. RocksDB has no live stats
+endpoint here, so only LOG files are copied.
+
+Rerun the helper locally (Python 3.10+, stdlib only):
+
+```sh
+python -I scripts/bench-wait-report.py <run>/profiles
+```
+
+Use `--key KEY`, `--top N` (default 15), `--out FILE`, or `--full` to retain
+full stacks in the wait tables. Missing/empty captures stay visible as
+not captured; consult their manifest status.
 
 Each measured JSONL record also includes `ops` and `protocols` aggregates:
 count, p50_ms, p95_ms, p99_ms, max_ms, errors. Counts include failed operations;

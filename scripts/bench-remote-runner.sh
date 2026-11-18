@@ -22,7 +22,7 @@ perf_version=""
 PROFILE_PHASE_BUDGET=1800
 PROFILE_TARGET_WORST=900
 PROFILE_TARGET_STEPS=840
-PROFILE_LOAD_SECONDS=150
+PROFILE_LOAD_SECONDS=360
 cap() { # cap <max-secs> <deadline-epoch>; leave room for timeout's kill-after
   local secs=$(( $2 - $(date +%s) - 10 ))
   [ "$secs" -gt "$1" ] && secs=$1
@@ -355,101 +355,162 @@ PY
 done; done; done; done; done
 
 # Capture and processing run separately so every capture overlaps diagnostic load.
+# Redirects intentionally create user-owned artifacts; only collectors need root.
+# shellcheck disable=SC2024
 bench_profile() ( # <pid> <profile-dir> <key> <deadline> <callgraph> <progress-file>
   set -uo pipefail
   local pid=$1 dest=$2 key=$3 tdl=$4 mode=$5 progress_file=$6 raw s rc
-  mkdir -p "$dest"
+  local manifest bg
+  local -a jobs=()
+  mkdir -p "$dest/raw-$key"
   raw=$dest/raw-$key
-  mkdir -p "$raw"
+  manifest=$dest/manifest-$key.txt
+  printf 'server_pid=%s\nlive RocksDB stats dump unavailable (no endpoint)\n' "$pid" > "$manifest"
+  ps -L -o tid,comm -p "$pid" >> "$manifest" 2>&1 || true
   log() { echo "profile $key: $*" >&2; }
   step() { echo "$(date -u +%T) profile-$key $*" >> "$progress_file"; }
   budget() { cap "$1" "$tdl" || { step "skipped $2: per-target budget spent"; return 1; }; }
-  step "capture cpu"
-  if [ "$mode" = fp ]; then
-    if s=$(budget 45 'capture cpu'); then
-      sudo -n timeout --kill-after=10 "$s" perf record -F 499 -g --call-graph fp -p "$pid" -o "$raw/perf.data" -- sleep 30
-      rc=$?
-    else rc=1; fi
-  else
-    if s=$(budget 35 'capture cpu'); then
-      sudo -n timeout --kill-after=10 "$s" perf record -F 99 -g --call-graph dwarf,8192 -p "$pid" -o "$raw/perf.data" -- sleep 20
-      rc=$?
-    else rc=1; fi
-  fi
-  if { [ "$rc" = 0 ] || [ "$rc" = 124 ]; } && [ -s "$raw/perf.data" ]; then
-    touch "$dest/ran-$key"
-  else log "CPU capture failed; trying other captures"
-  fi
-  step "capture lock"
-  if s=$(budget 45 'capture lock'); then
-    if ! sudo -n timeout --kill-after=10 "$s" perf lock contention -a -b -E 30 -- sleep 30 > "$dest/lock-$key.txt"; then
-      log "BPF contention unavailable; trying lock record/report"
-      if s=$(budget 45 'capture lock fallback'); then
-        sudo -n timeout --kill-after=10 "$s" perf lock record -o "$raw/lock.data" -- sleep 30 || log "lock fallback failed"
+  capture() { # name limit output command...; each invocation also works in background
+    local name=$1 limit=$2 output=$3 s rc=0 start epoch status
+    shift 3
+    start=$(date -u +%FT%TZ); epoch=$(date +%s)
+    if ! command -v "$1" >/dev/null 2>&1; then
+      status=skipped; log "$name skipped: $1 missing"
+    elif s=$(budget "$limit" "$name"); then
+      step "capture $name"
+      sudo -n timeout --kill-after=10 "$s" "$@" > "$output" 2> "$dest/$name-$key.err" || rc=$?
+      status=ok
+      # timeout/SIGINT are normal for continuous observers, only with data.
+      if [ "$rc" != 0 ] && { [ "$limit" != 310 ] || { [ "$rc" != 124 ] && [ "$rc" != 130 ]; } || [ ! -s "$output" ]; }; then
+        status=failed; log "$name failed rc=$rc"
       fi
-    fi
+    else status=skipped; fi
+    printf 'capture=%s status=%s duration_seconds=%s start_utc=%s pid=%s\n' \
+      "$name" "$status" "$(( $(date +%s) - epoch ))" "$start" "$pid" >> "$manifest"
+    [ "$status" = ok ]
+  }
+  cat > "$raw/fsync.bt" <<BT
+tracepoint:syscalls:sys_enter_fsync,
+tracepoint:syscalls:sys_enter_fdatasync,
+tracepoint:syscalls:sys_enter_sync_file_range /pid == $pid/ { @start[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_fsync,
+tracepoint:syscalls:sys_exit_fdatasync,
+tracepoint:syscalls:sys_exit_sync_file_range /pid == $pid && @start[tid]/ {
+  @latency_us[probe, comm] = hist((nsecs - @start[tid]) / 1000);
+  delete(@start[tid]);
+}
+interval:s:300 { exit(); }
+END { clear(@start); }
+BT
+  cat > "$raw/futex.bt" <<BT
+tracepoint:syscalls:sys_enter_futex /pid == $pid/ {
+  \$op = args->op & 127;
+  if (\$op == 0 || \$op == 9 || \$op == 6 || \$op == 11) { @start[tid] = nsecs; }
+}
+tracepoint:syscalls:sys_exit_futex /pid == $pid && @start[tid]/ {
+  @us[comm, ustack(perf, 32)] = sum((nsecs - @start[tid]) / 1000);
+  @count[comm, ustack(perf, 32)] = count();
+  delete(@start[tid]);
+}
+interval:s:30 { exit(); }
+END { clear(@start); }
+BT
+  # Observers start first and run through the entire sequential capture window.
+  capture pidstat 310 "$dest/pidstat-$key.txt" pidstat -t -u -w -p "$pid" 1 & jobs+=("$!")
+  capture iostat 310 "$dest/iostat-$key.txt" iostat -x 1 & jobs+=("$!")
+  capture biolatency 310 "$dest/biolatency-$key.txt" biolatency-bpfcc -m 300 1 & jobs+=("$!")
+  capture fsync 310 "$dest/fsync-$key.txt" bpftrace "$raw/fsync.bt" & jobs+=("$!")
+  capture syscount 310 "$dest/syscount-$key.txt" syscount-bpfcc -p "$pid" -L -d 300 & jobs+=("$!")
+  if [ "$mode" = fp ]; then
+    capture cpu 45 "$dest/cpu-$key.txt" perf record -F 499 -g --call-graph fp -p "$pid" -o "$raw/perf.data" -- sleep 30 || true
+  else
+    capture cpu 45 "$dest/cpu-$key.txt" perf record -F 99 -g --call-graph dwarf,8192 -p "$pid" -o "$raw/perf.data" -- sleep 30 || true
   fi
-  step "capture offcpu"
-  if command -v offcputime-bpfcc >/dev/null 2>&1; then
-    if s=$(budget 45 'capture offcpu'); then
-      sudo -n timeout --kill-after=10 "$s" offcputime-bpfcc -df -p "$pid" 30 > "$dest/offcpu-$key.txt" || log "offcputime failed"
-    fi
-  elif s=$(budget 35 'capture offcpu fallback'); then
-    sudo -n timeout --kill-after=10 "$s" perf sched record -o "$raw/sched.data" -- sleep 20 || log "sched fallback failed"
+  if [ -s "$raw/perf.data" ] && grep -q "capture=cpu status=ok" "$manifest"; then touch "$dest/ran-$key"; fi
+  capture offcpu 55 "$dest/offcpu-$key.folded" offcputime-bpfcc -f -d -p "$pid" --stack-storage-size 65536 30 || true
+  [ ! -s "$dest/offcpu-$key.folded" ] || touch "$dest/ran-offcpu-$key"
+  capture futex 40 "$dest/futex-$key.txt" bpftrace "$raw/futex.bt" || true
+  # Ubuntu perf commonly advertises this option but lacks BUILD_BPF_SKEL.
+  if s=$(budget 15 'lock support') && sudo -n timeout --kill-after=10 "$s" perf lock contention -h > "$raw/lock-help" 2>&1; then :; fi
+  if [ -s "$raw/lock-help" ] && ! grep -Eqi 'not built-in|BUILD_BPF_SKEL|not supported' "$raw/lock-help"; then
+    capture lock 40 "$dest/lock-$key.txt" perf lock contention -a -b -p "$pid" -- sleep 30 || true
+  else
+    log 'lock skipped: perf BPF contention support unavailable'
+    printf 'capture=lock status=skipped duration_seconds=0 start_utc=%s pid=%s\n' "$(date -u +%FT%TZ)" "$pid" >> "$manifest"
   fi
+  capture wakeup 45 "$dest/wakeup-$key.folded" wakeuptime-bpfcc -f -p "$pid" 20 || true
+  for bg in "${jobs[@]}"; do wait "$bg" || true; done
   exit 0
 )
 
+bench_profile_rocksdb() { # copy before stop_server deletes the data directory
+  local dest=$1 key=$2 file n=0
+  mkdir -p "$dest/rocksdb-$key"
+  while IFS= read -r -d '' file; do
+    [ "$n" -lt 5 ] || break
+    n=$(( n + 1 ))
+    # Bound growing live LOG files too; find -size alone races with writes.
+    head -c 20971520 "$file" > "$dest/rocksdb-$key/LOG-$n" || true
+    printf 'rocksdb_LOG=%s copied_as=LOG-%s cap_bytes=20971520\n' "$file" "$n" >> "$dest/manifest-$key.txt"
+  done < <(find "$data/gg" -type f -name LOG -print0 2>/dev/null)
+}
+
+# Redirects intentionally remain user-owned.
+# shellcheck disable=SC2024
 bench_profile_post() ( # <profile-dir> <key> <deadline> <progress-file>
   set -uo pipefail
-  local dest=$1 key=$2 tdl=$3 progress_file=$4 raw s size
+  local dest=$1 key=$2 tdl=$3 progress_file=$4 raw s size kind input
   raw=$dest/raw-$key
   [ -d "$raw" ] || exit 0
   trap 'rm -rf "$raw"' EXIT
   log() { echo "profile $key: $*" >&2; }
-  step() { echo "$(date -u +%T) profile-$key $*" >> "$progress_file"; }
-  budget() { cap "$1" "$tdl" || { step "skipped $2: per-target budget spent"; return 1; }; }
-  step "post-process"
-  if [ -s "$raw/lock.data" ] && s=$(budget 120 'lock report'); then
-    sudo -n timeout --kill-after=10 "$s" perf lock report -i "$raw/lock.data" > "$dest/lock-$key.txt" || log "lock report failed"
-  fi
-  if [ -s "$raw/sched.data" ] && s=$(budget 120 'sched timehist'); then
-    sudo -n timeout --kill-after=10 "$s" perf sched timehist -i "$raw/sched.data" -s > "$dest/offcpu-$key.txt" || log "sched timehist failed"
-  fi
-  [ -s "$raw/perf.data" ] || exit 0
-  if s=$(budget 180 'perf report'); then
-    sudo -n timeout --kill-after=10 "$s" perf report -i "$raw/perf.data" --stdio --no-children --percent-limit 0.5 > "$dest/top-$key.txt" || log "report failed"
-  fi
-  if s=$(budget 15 'perf.data size'); then
-    size=$(sudo -n timeout --kill-after=10 "$s" stat -c %s "$raw/perf.data") || exit 0
-  else exit 0; fi
-  if [ "$size" -gt 1073741824 ]; then
-    step "perf.data $size bytes > 1 GB; skipping perf script"
-    exit 0
-  fi
-  # Fold leaf-first frames into root-first stacks without installing tools.
-  if s=$(budget 300 'perf script/fold'); then
-    sudo -n timeout --kill-after=10 "$s" perf script -i "$raw/perf.data" | timeout --kill-after=10 "$s" awk '
-    function flush(    i,s) {
-      if(n) { s=f[n]; for(i=n-1;i>0;i--) s=s ";" f[i]; count[s]++ }
-      n=0
-    }
-    /^[[:space:]]*$/ { flush(); next }
-    /^[[:space:]]+[[:xdigit:]]+[[:space:]]/ {
-      line=$0; sub(/^[[:space:]]*[[:xdigit:]]+[[:space:]]+/, "", line)
-      sub(/[[:space:]]+\(.*$/, "", line); sub(/\+0x[[:xdigit:]]+$/, "", line)
-      gsub(/;/, ":", line); f[++n]=line
-    }
-    END { flush(); for(s in count) print s " " count[s] }
-  ' > "$dest/folded-$key.txt" || log "fold failed"
-  fi
-  if [ -s "$dest/folded-$key.txt" ] && s=$(budget 60 'flamegraph render'); then
-    if command -v inferno-flamegraph >/dev/null 2>&1; then
-      timeout --kill-after=10 "$s" inferno-flamegraph < "$dest/folded-$key.txt" > "$dest/flame-$key.svg" || log "inferno failed"
-    elif command -v flamegraph.pl >/dev/null 2>&1; then
-      timeout --kill-after=10 "$s" flamegraph.pl < "$dest/folded-$key.txt" > "$dest/flame-$key.svg" || log "flamegraph failed"
-    else log "no renderer; keeping folded stacks"
+  budget() { cap "$1" "$tdl" || return 1; }
+  if [ -s "$raw/perf.data" ]; then
+    if s=$(budget 60); then
+      sudo -n timeout --kill-after=10 "$s" perf report -i "$raw/perf.data" --stdio --no-children --percent-limit 0.5 > "$dest/top-$key.txt" || log 'report failed'
     fi
+    size=1073741825
+    if s=$(budget 15); then size=$(sudo -n timeout --kill-after=10 "$s" stat -c %s "$raw/perf.data") || size=1073741825; fi
+    if [ "$size" -le 1073741824 ] && s=$(budget 120); then
+      if command -v inferno-collapse-perf >/dev/null 2>&1; then
+        sudo -n timeout --kill-after=10 "$s" perf script -i "$raw/perf.data" |
+          sudo -n timeout --kill-after=10 "$s" inferno-collapse-perf --all > "$dest/folded-$key.txt" || log 'fold failed'
+      else
+        sudo -n timeout --kill-after=10 "$s" perf script -i "$raw/perf.data" |
+          sudo -n timeout --kill-after=10 "$s" awk '
+          function flush(    i,s) {
+            if(n) { s=comm; for(i=n;i>0;i--) s=s ";" f[i]; count[s]++ } n=0
+          }
+          /^[[:space:]]*$/ { flush(); next }
+          /[[:space:]][0-9]+(\/[0-9]+)?[[:space:]]+(\[[0-9]+\][[:space:]]+)?[0-9]+\.[0-9]+:/ { flush(); comm=$0; sub(/^[[:space:]]+/, "", comm); sub(/[[:space:]]+[0-9]+(\/[0-9]+)?[[:space:]].*$/, "", comm); gsub(/;/, ":", comm); next }
+          /^[[:space:]]+[[:xdigit:]]+[[:space:]]/ {
+            line=$0; sub(/^[[:space:]]*[[:xdigit:]]+[[:space:]]+/, "", line)
+            sub(/[[:space:]]+\(.*$/, "", line); sub(/\+0x[[:xdigit:]]+$/, "", line)
+            gsub(/;/, ":", line); f[++n]=line
+          }
+          END { flush(); for(s in count) print s " " count[s] }
+        ' > "$dest/folded-$key.txt" || log 'fold failed'
+      fi
+    fi
+  fi
+  for kind in cpu offcpu wakeup; do
+    input=$dest/$kind-$key.folded
+    [ "$kind" != cpu ] || input=$dest/folded-$key.txt
+    [ -s "$input" ] || continue
+    if s=$(budget 30); then
+      if command -v inferno-flamegraph >/dev/null 2>&1; then
+        if [ "$kind" = cpu ]; then
+          sudo -n timeout --kill-after=10 "$s" inferno-flamegraph < "$input" > "$dest/flame-cpu-$key.svg" || log 'render failed'
+        else
+          sudo -n timeout --kill-after=10 "$s" inferno-flamegraph --colors io --countname us --title "$( [ "$kind" = offcpu ] && echo Off-CPU || echo Wakeup ) $key" < "$input" > "$dest/flame-$kind-$key.svg" || log 'render failed'
+        fi
+      elif command -v flamegraph.pl >/dev/null 2>&1; then
+        sudo -n timeout --kill-after=10 "$s" flamegraph.pl < "$input" > "$dest/flame-$kind-$key.svg" || log 'render failed'
+      else log 'no renderer; keeping folded stacks'; fi
+    fi
+  done
+  if command -v python3 >/dev/null 2>&1 && s=$(budget 30); then
+    timeout --kill-after=10 "$s" python3 -I "$repo/scripts/bench-wait-report.py" "$dest" --key "$key" --out "$dest/wait-report-$key.md" || log 'wait report failed'
   fi
   exit 0
 )
@@ -458,13 +519,21 @@ bench_profile_post() ( # <profile-dir> <key> <deadline> <progress-file>
 if [ "$PROFILE" = 1 ] && { has giggles-sql || has giggles-native; }; then
   phase_start=$(date +%s)
   profile_ready=1
+  if ! command -v offcputime-bpfcc >/dev/null 2>&1 || ! command -v bpftrace >/dev/null 2>&1; then
+    progress "BPF tools missing: snapshot predates P1; run bench-snapshot-setup.sh"
+  fi
+  # bcc compiles probes against the running kernel's headers; a box booted on
+  # a different kernel than the snapshot's leaves offcputime/wakeuptime dead.
+  if [ ! -e "/lib/modules/$(uname -r)/build" ]; then
+    progress "kernel headers for $(uname -r) missing; bcc captures (offcpu, wakeup, biolatency, syscount) will likely fail"
+  fi
   if ! timeout --kill-after=10 15 perf --version > "$out/logs/perf-version.txt" 2>&1; then
     sudo -n timeout --kill-after=10 180 apt-get -o DPkg::Lock::Timeout=60 install -y "linux-tools-$(uname -r)" linux-tools-common > "$out/logs/perf-install.txt" 2>&1 || {
-      progress "perf installation failed; skipping profiles"; profile_ready=0;
+      progress "perf installation failed; continuing with available BPF tools";
     }
   fi
   if [ "$profile_ready" = 1 ]; then
-    perf_version=$(timeout --kill-after=10 15 perf --version 2>/dev/null) || profile_ready=0
+    perf_version=$(timeout --kill-after=10 15 perf --version 2>/dev/null) || perf_version=""
     sudo -n timeout --kill-after=10 15 sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 > "$out/logs/perf-sysctl.txt" 2>&1 || progress "perf sysctl failed (captures may be unavailable)"
   fi
   if [ "$profile_ready" = 1 ]; then
@@ -481,7 +550,7 @@ if [ "$PROFILE" = 1 ] && { has giggles-sql || has giggles-native; }; then
       tdl=$(( $(date +%s) + PROFILE_TARGET_STEPS ))
       if start_server "$t" "$tag"; then
         progress "$tag mix=${M[0]} protocol=${P[0]}"
-        if load_timeout=$(cap 240 "$tdl"); then
+        if load_timeout=$(cap 450 "$tdl"); then
           LOAD_TIMEOUT=$load_timeout loadtest "$t" "$out/logs/$tag.json" "$out/logs/$tag.log" "$PROFILE_LOAD_SECONDS" "$c" "$(mixarg "${M[0]}")" "$(protoarg "${P[0]}")" &
           load_pid=$!
           # First progress line is after schema setup and seeding.
@@ -494,17 +563,18 @@ if [ "$PROFILE" = 1 ] && { has giggles-sql || has giggles-native; }; then
         fi
       else progress "$tag server start failed (nonfatal)"
       fi
+      bench_profile_rocksdb "$out/profiles" "$t-c$c"
       stop_server
       bench_profile_post "$out/profiles" "$t-c$c" "$tdl" "$out/progress" >> "$out/logs/$tag.capture.txt" 2>&1 || progress "$tag post-process failed (nonfatal)"
     done; done
-    if compgen -G "$out/profiles/ran-*" >/dev/null; then profile_ran=1; fi
+    if compgen -G "$out/profiles/ran-*" | grep -v "/ran-offcpu-" >/dev/null; then profile_ran=1; fi
   fi
 fi
 python3 - "$out/meta.json" "$PROFILE" "$profile_ran" "$perf_version" "$profile_callgraph" "$profile_build_seconds" <<'PYMETA'
-import json, sys
+import json, sys, glob, os
 path, requested, ran, version, callgraph, build_seconds = sys.argv[1:]
 meta = json.load(open(path))
-meta.update(profile_requested=requested == "1", profiling_ran=ran == "1", perf_version=version or None,
+meta.update(offcpu_ran=bool(glob.glob(os.path.join(os.path.dirname(path), "profiles", "ran-offcpu-*"))), profile_requested=requested == "1", profiling_ran=ran == "1", perf_version=version or None,
             profile_callgraph=callgraph, profile_build_seconds=int(build_seconds))
 json.dump(meta, open(path, "w"), indent=1)
 PYMETA
