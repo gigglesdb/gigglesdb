@@ -1,5 +1,6 @@
 //! Bind SQL relation references without changing their user-visible names.
 use super::*;
+use std::sync::Arc;
 
 pub fn relation_key(schema: &str, name: &str) -> String {
     if schema == "public" {
@@ -99,19 +100,30 @@ impl Relational {
 
 impl Prepared {
     pub(crate) fn bind_schemas(&self, state: &Relational) -> R<Self> {
-        let mut bound = self.clone();
         if self.relations.is_empty()
             && !matches!(&self.statement, Statement::Plan(_))
             && !matches!(&self.statement, Statement::Query(q) if q.has_domain_expression())
         {
-            return Ok(bound);
+            return Ok(self.clone());
         }
-        bound.statement = self
+        let unbound = self
             .unbound_statement
-            .as_deref()
-            .unwrap_or(&self.statement)
-            .clone();
-        bound.unbound_statement = Some(Box::new(bound.statement.clone()));
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::new(self.statement.clone()));
+        let mut bound = Self {
+            domain: self.domain,
+            epoch: self.epoch,
+            transaction: self.transaction,
+            statement: (*unbound).clone(),
+            unbound_statement: Some(unbound),
+            params: self.params,
+            parameter_types: self.parameter_types.clone(),
+            relations: self.relations.clone(),
+            search_path: self.search_path.clone(),
+            schema_user: self.schema_user.clone(),
+            warnings: self.warnings.clone(),
+        };
         let create = |name: &str| -> R<String> {
             let schema = if name.contains('\0') {
                 split_key(name).0.to_owned()
@@ -235,6 +247,27 @@ mod tests {
     fn run(state: &mut Relational, sql: &str) {
         let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
         state.execute(&prepared, &[], None).unwrap();
+    }
+
+    #[test]
+    fn rebinding_shares_original_statement_across_search_paths() {
+        let mut state = Relational::default();
+        run(&mut state, "CREATE SCHEMA a");
+        run(&mut state, "CREATE SCHEMA b");
+        run(&mut state, "CREATE TABLE a.t(id int PRIMARY KEY)");
+        run(&mut state, "CREATE TABLE b.t(id int PRIMARY KEY)");
+        let mut prepared = Prepared::parse("SELECT id FROM t", 1, state.epoch).unwrap();
+        prepared.search_path = vec!["a".into()];
+        let mut first = prepared.bind_schemas(&state).unwrap();
+        assert_eq!(first.storage_table(), Some("a\0t"));
+        first.search_path = vec!["b".into()];
+        let second = first.bind_schemas(&state).unwrap();
+        assert_eq!(second.storage_table(), Some("b\0t"));
+        assert!(Arc::ptr_eq(
+            first.unbound_statement.as_ref().unwrap(),
+            second.unbound_statement.as_ref().unwrap(),
+        ));
+        assert_eq!(prepared.storage_table(), Some("t"));
     }
 
     #[test]

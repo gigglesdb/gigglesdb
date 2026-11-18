@@ -91,8 +91,8 @@ impl Prepared {
             _ => {}
         };
         expand(&mut out.statement);
-        if let Some(unbound) = out.unbound_statement.as_deref_mut() {
-            expand(unbound);
+        if let Some(unbound) = out.unbound_statement.as_mut() {
+            expand(std::sync::Arc::make_mut(unbound));
         }
         out
     }

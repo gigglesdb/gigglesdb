@@ -1722,7 +1722,7 @@ pub struct Prepared {
     pub(crate) epoch: u64,
     pub(crate) transaction: Option<u128>,
     statement: Statement,
-    unbound_statement: Option<Box<Statement>>,
+    unbound_statement: Option<std::sync::Arc<Statement>>,
     params: usize,
     parameter_types: Vec<Option<DataType>>,
     relations: Vec<schemas::Reference>,

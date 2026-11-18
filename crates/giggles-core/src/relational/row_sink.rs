@@ -22,7 +22,7 @@ impl Prepared {
         if !name.contains('\0') {
             *name = format!("public\0{name}");
         }
-        self.unbound_statement = Some(Box::new(statement));
+        self.unbound_statement = Some(std::sync::Arc::new(statement));
     }
 }
 
