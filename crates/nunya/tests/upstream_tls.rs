@@ -204,6 +204,7 @@ async fn refusal(
     mode: &str,
     ca: Option<&str>,
     host: &str,
+    expected_class: &str,
 ) -> ServeResult<()> {
     let mut c = Checks::default();
     let mut h = env.harness(mode, ca, host)?;
@@ -259,12 +260,14 @@ async fn refusal(
         }
     }
     c.check(name, nothing_served);
+    let expected = format!("upstream schema connection failed: {expected_class}");
+    c.check("classified-startup-refusal", output.lines().any(|line| line == expected));
     c.check(
         "refusal-output-data-free",
         safe && no_certificate_bytes && !output.trim().is_empty(),
     );
     if safe && no_certificate_bytes {
-        std::fs::write(std::env::temp_dir().join(format!("{name}.txt")), &output)?;
+        std::fs::write(h.dir().join(format!("{name}.txt")), &output)?;
     }
     c.finish(name);
     Ok(())
@@ -279,6 +282,7 @@ async fn live_tls_verify_full_wrong_ca_refused() -> ServeResult<()> {
         "verify-full",
         Some(&env.wrong_ca),
         "localhost",
+        "tls certificate not trusted",
     )
     .await
 }
@@ -292,6 +296,7 @@ async fn live_tls_verify_full_hostname_mismatch_refused() -> ServeResult<()> {
         "verify-full",
         Some(&env.ca),
         "127.0.0.1",
+        "tls hostname mismatch",
     )
     .await
 }
@@ -305,6 +310,7 @@ async fn live_tls_disable_refused_no_fallback() -> ServeResult<()> {
         "disable",
         None,
         "localhost",
+        "server refused login sqlstate 28000",
     )
     .await
 }

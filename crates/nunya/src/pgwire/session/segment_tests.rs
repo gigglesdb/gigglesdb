@@ -142,7 +142,7 @@ fn segment_error_preserves_unknown_until_ready() {
         } else { s.frontend(Frontend::Query("INSERT INTO items(value) VALUES (NULL)".into())); }
         s.backend(Backend::ErrorResponse(vec![(b'S', "ERROR".into()), (b'C', "23505".into())]));
         assert!(s.write_in_flight());
-        assert_eq!(s.upstream_lost(failure(NyCode::ProtocolNotAllowed)).code, NyCode::WriteOutcomeUnknown);
+        assert_eq!(s.upstream_lost(failure(NyCode::ProtocolNotAllowed), true).code, NyCode::WriteOutcomeUnknown);
         s.backend(Backend::ReadyForQuery(b'I'));
         assert!(!s.write_in_flight());
     }

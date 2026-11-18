@@ -202,7 +202,10 @@ impl Session {
             eprintln!("audit: write outcome unknown record unavailable");
         }
     }
-    fn upstream_lost(&self, error: Refusal) -> Refusal {
+    fn upstream_lost(&self, error: Refusal, write_before_batch: bool) -> Refusal {
+        if error.reason == super::upstream::SEND_BEFORE_ANY_BYTE && !write_before_batch {
+            return error;
+        }
         if self.write_in_flight() {
             self.audit_unknown("upstream_lost");
             failure(NyCode::WriteOutcomeUnknown)
@@ -1349,6 +1352,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
             end_connection(agent, &mut upstream, &mut session, reason).await?;
             return Ok(());
         }
+        let write_before_batch = session.write_in_flight();
         let actions = if session.waiting {
             tokio::select! {
                 biased;
@@ -1356,7 +1360,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
                     end_connection(agent, &mut upstream, &mut session, reason).await?;
                     return Ok(());
                 }
-                response=upstream.recv()=>session.backend(response.map_err(|error| session.upstream_lost(error))?),
+                response=upstream.recv()=>session.backend(response.map_err(|error| session.upstream_lost(error, true))?),
                 request=agent.recv()=>{
                     let request=request?;
                     if matches!(request,Frontend::Terminate){break;}
@@ -1379,7 +1383,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
                     end_connection(agent, &mut upstream, &mut session, reason).await?;
                     return Ok(());
                 }
-                response=upstream.recv()=>session.backend(response.map_err(|error| session.upstream_lost(error))?),
+                response=upstream.recv()=>session.backend(response.map_err(|error| session.upstream_lost(error, true))?),
                 request=agent.recv()=>session.frontend(request?),
             }
         };
@@ -1394,7 +1398,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
                     end_connection(agent, &mut upstream, &mut session, reason).await?;
                     return Ok(());
                 }
-                result = upstream.send(&actions.upstream) => result.map_err(|error| session.upstream_lost(error))?,
+                result = upstream.send(&actions.upstream) => result.map_err(|error| session.upstream_lost(error, write_before_batch))?,
             }
         }
         if let Some(reason) = send_or_end(agent, &mut end, &actions.client).await? {
@@ -1410,6 +1414,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("session/send_failure_tests.rs");
     include!("session/sql_error_tests.rs");
     include!("session/segment_tests.rs");
     use super::*;
@@ -2344,7 +2349,7 @@ pub(crate) mod tests {
                 s.frontend(Frontend::Query(kind.into()));
             }
             let write = kind == "COMMIT" || kind == "extended";
-            let error = s.upstream_lost(failure(NyCode::ProtocolNotAllowed));
+            let error = s.upstream_lost(failure(NyCode::ProtocolNotAllowed), true);
             assert_eq!(error.code, if write { NyCode::WriteOutcomeUnknown } else { NyCode::ProtocolNotAllowed });
             let records = f.lifecycle.lock().unwrap();
             assert_eq!(records.len(), usize::from(write));

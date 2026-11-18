@@ -58,6 +58,8 @@ impl fmt::Debug for UpstreamConfig {
 trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Socket for T {}
 type Stream = Box<dyn Socket>;
+/// Static hint proving that no byte of the failed batch reached the transport.
+pub(crate) const SEND_BEFORE_ANY_BYTE: &str = "upstream send failed before any byte";
 fn bad() -> Refusal {
     Refusal::new(
         NyCode::ProtocolNotAllowed,
@@ -202,6 +204,11 @@ pub struct Upstream {
     status: u8,
 }
 impl Upstream {
+    /// Build a transport with deterministic I/O for session tests.
+    #[cfg(test)]
+    pub(crate) fn test_transport(stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static) -> Self {
+        Self { stream: Box::new(stream), buffer: BytesMut::new(), key: (0, Vec::new()), parameters: Vec::new(), status: b'I' }
+    }
     /// Connect, authenticate, apply the fixed settings, and await readiness.
     pub async fn connect(cfg: &UpstreamConfig, search_path: &[String]) -> Result<Self, Refusal> {
         let query = settings_query(search_path)?;
@@ -325,7 +332,19 @@ impl Upstream {
             }
             codec::encode_frontend(msg, &mut out);
         }
-        self.stream.write_all(&out).await.map_err(|_| bad())?;
+        let mut accepted = 0;
+        while accepted < out.len() {
+            match self.stream.write(&out[accepted..]).await {
+                Ok(n) if n > 0 => accepted += n,
+                Ok(_) | Err(_) => {
+                    return Err(if accepted == 0 {
+                        Refusal::new(NyCode::ProtocolNotAllowed, SEND_BEFORE_ANY_BYTE)
+                    } else {
+                        bad()
+                    });
+                }
+            }
+        }
         self.stream.flush().await.map_err(|_| bad())
     }
     async fn incoming(&mut self) -> Result<Incoming, Refusal> {

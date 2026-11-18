@@ -135,7 +135,70 @@ pub(crate) async fn connect_schema(cfg: &UpstreamConfig) -> Result<SchemaClient,
         connect_schema_inner(cfg),
     )
     .await
-    .map_err(|_| "upstream schema connection timed out".to_owned())?
+    .map_err(|_| schema_failure("network"))?
+}
+fn schema_failure(class: &str) -> String {
+    format!("upstream schema connection failed: {class}")
+}
+fn login_class(code: &str) -> String {
+    if code.len() == 5 && code.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        format!("server refused login sqlstate {code}")
+    } else {
+        "other".into()
+    }
+}
+fn schema_error_class(mut error: &(dyn std::error::Error + 'static)) -> String {
+    let mut network = false;
+    loop {
+        if let Some(error) = error.downcast_ref::<rustls::Error>() {
+            return match error {
+                rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidForName
+                    | rustls::CertificateError::NotValidForNameContext { .. },
+                ) => "tls hostname mismatch",
+                rustls::Error::InvalidCertificate(_) => "tls certificate not trusted",
+                _ => "tls other",
+            }.into();
+        }
+        if let Some(error) = error.downcast_ref::<tokio_postgres::Error>()
+            && let Some(code) = error.code()
+        {
+            return login_class(code.code());
+        }
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            network = true;
+            if let Some(inner) = io.get_ref() {
+                error = inner;
+                continue;
+            }
+        }
+        match error.source() {
+            Some(source) => error = source,
+            None => return if network { "network" } else { "other" }.into(),
+        }
+    }
+}
+#[cfg(test)]
+mod schema_connection_tests {
+    use super::*;
+    #[test]
+    fn startup_failure_classes_are_data_free() {
+        for (error, expected) in [
+            (rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer), "tls certificate not trusted"),
+            (rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature), "tls certificate not trusted"),
+            (rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName), "tls hostname mismatch"),
+            (rustls::Error::General("private detail".into()), "tls other"),
+        ] {
+            let wrapped = std::io::Error::other(error);
+            assert_eq!(schema_error_class(&wrapped), expected);
+        }
+        assert_eq!(schema_error_class(&std::io::Error::from(std::io::ErrorKind::ConnectionRefused)), "network");
+        assert_eq!(login_class("28000"), "server refused login sqlstate 28000");
+        assert_eq!(login_class("28P01"), "server refused login sqlstate 28P01");
+        for invalid in ["", "280000", "28\n01", "\u{e9}001"] {
+            assert_eq!(login_class(invalid), "other");
+        }
+    }
 }
 async fn connect_schema_inner(cfg: &UpstreamConfig) -> Result<SchemaClient, String> {
     let mut pg = tokio_postgres::Config::new();
@@ -146,13 +209,13 @@ async fn connect_schema_inner(cfg: &UpstreamConfig) -> Result<SchemaClient, Stri
         .dbname(&cfg.dbname)
         .application_name(&cfg.application_name)
         .connect_timeout(Duration::from_millis(cfg.connect_timeout_ms));
-    let fail = || "upstream schema connection failed".to_owned();
+    let fail = || schema_failure("other");
     if matches!(cfg.tls, UpstreamTls::Disable) {
         pg.ssl_mode(tokio_postgres::config::SslMode::Disable);
         let (client, connection) = pg
             .connect(tokio_postgres::NoTls)
             .await
-            .map_err(|_| fail())?;
+            .map_err(|error| schema_failure(&schema_error_class(&error)))?;
         return Ok(SchemaClient {
             client,
             driver: tokio::spawn(async move {
@@ -172,13 +235,14 @@ async fn connect_schema_inner(cfg: &UpstreamConfig) -> Result<SchemaClient, Stri
             .with_custom_certificate_verifier(Arc::new(RequireVerifier))
             .with_no_client_auth(),
         UpstreamTls::VerifyFull { ca_file } => {
-            let pem = std::fs::read(ca_file).map_err(|_| fail())?;
+            let pem = std::fs::read(ca_file).map_err(|_| schema_failure("ca file unreadable"))?;
             let mut roots = rustls::RootCertStore::empty();
             for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
-                roots.add(cert.map_err(|_| fail())?).map_err(|_| fail())?;
+                roots.add(cert.map_err(|_| schema_failure("ca file invalid"))?)
+                    .map_err(|_| schema_failure("ca file invalid"))?;
             }
             if roots.is_empty() {
-                return Err(fail());
+                return Err(schema_failure("ca file invalid"));
             }
             builder.with_root_certificates(roots).with_no_client_auth()
         }
@@ -187,7 +251,7 @@ async fn connect_schema_inner(cfg: &UpstreamConfig) -> Result<SchemaClient, Stri
     let (client, connection) = pg
         .connect(tokio_postgres_rustls::MakeRustlsConnect::new(tls))
         .await
-        .map_err(|_| fail())?;
+        .map_err(|error| schema_failure(&schema_error_class(&error)))?;
     Ok(SchemaClient {
         client,
         driver: tokio::spawn(async move {
