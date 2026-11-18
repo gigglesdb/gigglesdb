@@ -796,6 +796,12 @@ fn attempt(
     }
     // 10. Every buffered row write is an effect and vice versa.
     crate::storage::cross_check_effects(&effects, &txn)?;
+    // A cascade outside the task is an authority refusal on every surface,
+    // before a native intent can count its extra effects as ambiguous matches.
+    if effects.iter().any(|effect| effect.table != def.table) {
+        let head = authority::load_head(&mut txn, task)?;
+        return deny(call, txn, mark, &def, head, TaskError::Denied(DenyRule::OtherTable));
+    }
     // The caller's row bound on the real affected count, before anything is
     // charged or staged: a refusal drops the transaction (rows and hold) and
     // records nothing.

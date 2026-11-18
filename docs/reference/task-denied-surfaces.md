@@ -1,0 +1,38 @@
+# Task-session denied surfaces
+
+A task credential grants only its task's bounded authority. This table is generated from `crates/giggles-server/tests/fixtures/r3/task_denied_surfaces.json` by `r3_denied_surfaces::published_table_matches_fixture`. Regenerate with `GIGGLES_BLESS_TASK_DENIED_SURFACES=1`. Entry points name the tested protocol forms; native protocols have no SQL-only COPY, role, cursor, or function-definition form. A dash means no error is sent. HTTP/gRPC aggregate and arbitrary-function examples use their legacy Sql request, which reports SQLSTATE without taskError or message. Unsupported SQL definitions are rejected by the SQL profile before task admission. Composite codes list the outcomes of the variants in that row. Row 19 verifies that task databases cannot be exported or restored and SQL credentials cannot authenticate against another database. Revoked SQL credentials lose their transport leases (fresh PostgreSQL login is refused; HTTP returns 401 and gRPC returns Unauthenticated). SQL credentials infer their task when the task selector is omitted. Row 23 returns the same task denial on PostgreSQL, HTTP and gRPC before checking native row-count intent.
+
+| ID | Surface | Example | Entry points | Code | SQLSTATE | Test |
+| --- | --- | --- | --- | --- | --- | --- |
+| 01 | Executor ordinary login | ordinary password and certificate-map login | pg_login | LoginRefused | 28P01 | ds_01_executor_login |
+| 02 | Hidden column projected | SELECT card_token FROM shipments | pg_simple, pg_extended, http, grpc | Denied | 42501 | ds_02_hidden_projection |
+| 03 | Masked column in WHERE | SELECT id FROM shipments WHERE customer_email = 'customer1@example.com' | pg_simple, pg_extended, http, grpc | Denied | 42501 | ds_03_masked_predicate |
+| 04 | Masked column in ORDER BY | SELECT id FROM shipments ORDER BY customer_email | pg_simple, pg_extended, http, grpc | Denied | 42501 | ds_04_masked_order |
+| 05 | Masked column in aggregate | SELECT max(customer_email) FROM shipments | pg_simple, pg_extended, http, grpc | Denied | 42501 | ds_05_masked_aggregate |
+| 06 | Masked column as written value | UPDATE shipments SET status = customer_email WHERE id = 2 | pg_simple, pg_extended, http, grpc | Denied | 42501 | ds_06_masked_write |
+| 07 | Hidden or masked RETURNING | UPDATE shipments SET status = 'queued' WHERE id = 2 RETURNING card_token | pg_simple, pg_extended | Denied | 42501 | ds_07_hidden_returning |
+| 08 | Constraint error redaction | UPDATE shipments SET status = queued collides on hidden card_token | pg_simple, pg_extended, http, grpc | ConstraintViolation | 23505 | ds_08_constraint_redaction |
+| 09 | Join, subquery, or view outside task | join another table; subquery; view | pg_simple, pg_extended | NotAllowedInTaskSession(Other)\|Denied | 0A000 / 42501 | ds_09_other_relations |
+| 10 | Split statements and instruction text | SELECT 1; UPDATE shipments SET status = queued | pg_simple | NotAllowedInTaskSession(TransactionControl) | 0A000 | ds_10_split_and_instruction |
+| 11 | COPY and file reads | COPY shipments TO STDOUT; COPY FROM; pg_read_file | pg_simple, pg_extended | NotAllowedInTaskSession(Copy)\|Denied | 0A000 / 42501 | ds_11_copy_and_files |
+| 12 | DDL, functions, triggers, security definer | DROP TABLE; CREATE FUNCTION; CREATE TRIGGER | pg_simple, pg_extended | NotAllowedInTaskSession(Ddl)\|SyntaxUnsupported | 0A000 / 42601 | ds_12_ddl |
+| 13 | Sequence and non-allowlisted functions | nextval; setval; pg_read_file | pg_simple, pg_extended, http, grpc | Denied | 42501 | ds_13_functions |
+| 14 | Transaction control and native blocks | BEGIN; COMMIT; SAVEPOINT; native transaction | pg_simple, pg_extended, http, grpc | NotAllowedInTaskSession(TransactionControl)\|NotAllowedInTaskSession(Savepoint) | 0A000 / 0A000 | ds_14_transactions |
+| 15 | INSERT, DELETE, EXPLAIN, cursors, LOCK | INSERT; DELETE; EXPLAIN; DECLARE; LOCK | pg_simple, pg_extended | NotAllowedInTaskSession(Insert)\|NotAllowedInTaskSession(Delete)\|NotAllowedInTaskSession(Explain)\|NotAllowedInTaskSession(Cursor)\|NotAllowedInTaskSession(Lock) | 0A000 / 0A000 / 0A000 / 0A000 / 0A000 | ds_15_refused_classes |
+| 16 | Role and authorization statements | SET ROLE; SET SESSION AUTHORIZATION; CREATE ROLE | pg_simple, pg_extended | NotAllowedInTaskSession(Set)\|NotAllowedInTaskSession(RoleStatement) | 0A000 / 0A000 | ds_16_role_statements |
+| 17 | Write without operation ID | UPDATE without operationId | pg_simple, pg_extended, http, grpc | OperationIdRequired | 42T04 | ds_17_operation_id |
+| 18 | Expired or revoked task | write after task expiry; revoked SQL credentials lose their transport lease | pg_simple, pg_extended, http, grpc | Expired\|LoginRefused | 28T02 / 28P01 | ds_18_expiry_revocation |
+| 19 | Restored or cloned certificate | Task database export/restore; SQL credential reused on another server | v2_export, v2_restore, pg_connect, http_open, grpc_open | ExportRefused\|LoginRefused | 0A000 / 28P01 | ds_19_restored_certificate |
+| 20 | Credentials share task budget | ten rotated SQL credentials, one task budget (eight active credentials maximum) | agent_login, pg_simple, pg_extended, http, grpc | BudgetExceeded(DistinctRows) | 54T01 | ds_20_shared_budget |
+| 21 | Changed retry request | same operation ID with changed SQL or native at-most bound | pg_simple, pg_extended, http, grpc | OperationConflict | 42T03 | ds_21_operation_conflict |
+| 22 | Preview approval binding | approve A, apply B or mismatched digest | pg_simple, pg_extended, http, grpc | ApprovalRequired\|ApprovalStale | 42T01 / 55T01 | ds_22_preview_binding |
+| 23 | Foreign-key reach or writable primary key | FK action outside table (PG Denied; native_error on HTTP/gRPC); writable PK refused in CREATE TASK | pg_simple, pg_extended, http, grpc | Denied\|PrimaryKeyTaskRefused | 42501 / 0A000 | ds_23_foreign_key_primary_key |
+| 24 | Stored preview flood | preview until stored-preview cap | http, grpc | BudgetExceeded(StoredPreviews) | 54T01 | ds_24_preview_budget |
+| 25 | Executor inspection | SHOW TASK READS; SHOW TASK EXPOSURE; SHOW CHANGE refused; operation outcome exposes only five summary fields | pg_simple, pg_extended, http, grpc | NotAllowedInTaskSession(RoleStatement)\|NotAllowedInTaskSession(Other) | 0A000 / 0A000 | ds_25_inspection |
+| 26 | Approval and task administration | APPROVE; UNDO; CREATE TASK; approver = executor | pg_simple, pg_extended, http, grpc | NotAllowedInTaskSession(Other)\|NotAllowedInTaskSession(RoleStatement)\|ApproverTaskRefused | 0A000 / 0A000 / 22023 | ds_26_approval_authority |
+| 27 | Missing or changed task | SQL credential infers omitted task; different task refused at login; SET giggles.task refused mid-session | agent_login, pg_simple, pg_extended | LoginRefused\|NotAllowedInTaskSession(Set) | 28P01 / 0A000 | ds_27_task_binding |
+| 28 | Catalog scope | catalog query outside task table | pg_simple, pg_extended | ZeroRows\|Denied | — / 42501 | ds_28_catalog_scope |
+| 29 | Native Join and legacy Sql | structured Join; legacy Sql | http, grpc | NotAllowedInTaskSession(Other)\|NotAllowedInTaskSession(TransactionControl) | 0A000 / 0A000 | ds_29_native_bypass |
+| 30 | Other merchant row | SELECT id, status FROM shipments WHERE id = 40 (exists only for merchant 43) | pg_simple, pg_extended, http, grpc | ZeroRows | — | ds_30_other_merchant |
+| 31 | Lost connection and outcome lookup | disconnect then SHOW OPERATION | pg_simple | NotApplicable | — | ds_31_lost_connection |
+| 32 | Embedded API and CLI boundary | no embedded or CLI task session | embedded | NotApplicable | — | ds_32_embedded_boundary |

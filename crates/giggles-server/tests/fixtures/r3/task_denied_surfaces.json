@@ -1,0 +1,389 @@
+[
+  {
+    "id": "01",
+    "surface": "Executor ordinary login",
+    "example": "ordinary password and certificate-map login",
+    "entry_points": [
+      "pg_login"
+    ],
+    "code": "LoginRefused",
+    "test": "ds_01_executor_login"
+  },
+  {
+    "id": "02",
+    "surface": "Hidden column projected",
+    "example": "SELECT card_token FROM shipments",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "Denied",
+    "test": "ds_02_hidden_projection"
+  },
+  {
+    "id": "03",
+    "surface": "Masked column in WHERE",
+    "example": "SELECT id FROM shipments WHERE customer_email = 'customer1@example.com'",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "Denied",
+    "test": "ds_03_masked_predicate"
+  },
+  {
+    "id": "04",
+    "surface": "Masked column in ORDER BY",
+    "example": "SELECT id FROM shipments ORDER BY customer_email",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "Denied",
+    "test": "ds_04_masked_order"
+  },
+  {
+    "id": "05",
+    "surface": "Masked column in aggregate",
+    "example": "SELECT max(customer_email) FROM shipments",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "Denied",
+    "test": "ds_05_masked_aggregate"
+  },
+  {
+    "id": "06",
+    "surface": "Masked column as written value",
+    "example": "UPDATE shipments SET status = customer_email WHERE id = 2",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "Denied",
+    "test": "ds_06_masked_write"
+  },
+  {
+    "id": "07",
+    "surface": "Hidden or masked RETURNING",
+    "example": "UPDATE shipments SET status = 'queued' WHERE id = 2 RETURNING card_token",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended"
+    ],
+    "code": "Denied",
+    "test": "ds_07_hidden_returning"
+  },
+  {
+    "id": "08",
+    "surface": "Constraint error redaction",
+    "example": "UPDATE shipments SET status = queued collides on hidden card_token",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "ConstraintViolation",
+    "test": "ds_08_constraint_redaction"
+  },
+  {
+    "id": "09",
+    "surface": "Join, subquery, or view outside task",
+    "example": "join another table; subquery; view",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended"
+    ],
+    "code": "NotAllowedInTaskSession(Other)|Denied",
+    "test": "ds_09_other_relations"
+  },
+  {
+    "id": "10",
+    "surface": "Split statements and instruction text",
+    "example": "SELECT 1; UPDATE shipments SET status = queued",
+    "entry_points": [
+      "pg_simple"
+    ],
+    "code": "NotAllowedInTaskSession(TransactionControl)",
+    "test": "ds_10_split_and_instruction"
+  },
+  {
+    "id": "11",
+    "surface": "COPY and file reads",
+    "example": "COPY shipments TO STDOUT; COPY FROM; pg_read_file",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended"
+    ],
+    "code": "NotAllowedInTaskSession(Copy)|Denied",
+    "test": "ds_11_copy_and_files"
+  },
+  {
+    "id": "12",
+    "surface": "DDL, functions, triggers, security definer",
+    "example": "DROP TABLE; CREATE FUNCTION; CREATE TRIGGER",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended"
+    ],
+    "code": "NotAllowedInTaskSession(Ddl)|SyntaxUnsupported",
+    "test": "ds_12_ddl"
+  },
+  {
+    "id": "13",
+    "surface": "Sequence and non-allowlisted functions",
+    "example": "nextval; setval; pg_read_file",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "Denied",
+    "test": "ds_13_functions"
+  },
+  {
+    "id": "14",
+    "surface": "Transaction control and native blocks",
+    "example": "BEGIN; COMMIT; SAVEPOINT; native transaction",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "NotAllowedInTaskSession(TransactionControl)|NotAllowedInTaskSession(Savepoint)",
+    "test": "ds_14_transactions"
+  },
+  {
+    "id": "15",
+    "surface": "INSERT, DELETE, EXPLAIN, cursors, LOCK",
+    "example": "INSERT; DELETE; EXPLAIN; DECLARE; LOCK",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended"
+    ],
+    "code": "NotAllowedInTaskSession(Insert)|NotAllowedInTaskSession(Delete)|NotAllowedInTaskSession(Explain)|NotAllowedInTaskSession(Cursor)|NotAllowedInTaskSession(Lock)",
+    "test": "ds_15_refused_classes"
+  },
+  {
+    "id": "16",
+    "surface": "Role and authorization statements",
+    "example": "SET ROLE; SET SESSION AUTHORIZATION; CREATE ROLE",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended"
+    ],
+    "code": "NotAllowedInTaskSession(Set)|NotAllowedInTaskSession(RoleStatement)",
+    "test": "ds_16_role_statements"
+  },
+  {
+    "id": "17",
+    "surface": "Write without operation ID",
+    "example": "UPDATE without operationId",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "OperationIdRequired",
+    "test": "ds_17_operation_id"
+  },
+  {
+    "id": "18",
+    "surface": "Expired or revoked task",
+    "example": "write after task expiry; revoked SQL credentials lose their transport lease",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "Expired|LoginRefused",
+    "test": "ds_18_expiry_revocation"
+  },
+  {
+    "id": "19",
+    "surface": "Restored or cloned certificate",
+    "example": "Task database export/restore; SQL credential reused on another server",
+    "entry_points": [
+      "v2_export",
+      "v2_restore",
+      "pg_connect",
+      "http_open",
+      "grpc_open"
+    ],
+    "code": "ExportRefused|LoginRefused",
+    "test": "ds_19_restored_certificate"
+  },
+  {
+    "id": "20",
+    "surface": "Credentials share task budget",
+    "example": "ten rotated SQL credentials, one task budget (eight active credentials maximum)",
+    "entry_points": [
+      "agent_login",
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "BudgetExceeded(DistinctRows)",
+    "test": "ds_20_shared_budget"
+  },
+  {
+    "id": "21",
+    "surface": "Changed retry request",
+    "example": "same operation ID with changed SQL or native at-most bound",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "OperationConflict",
+    "test": "ds_21_operation_conflict"
+  },
+  {
+    "id": "22",
+    "surface": "Preview approval binding",
+    "example": "approve A, apply B or mismatched digest",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "ApprovalRequired|ApprovalStale",
+    "test": "ds_22_preview_binding"
+  },
+  {
+    "id": "23",
+    "surface": "Foreign-key reach or writable primary key",
+    "example": "FK action outside table (PG Denied; native_error on HTTP/gRPC); writable PK refused in CREATE TASK",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "Denied|PrimaryKeyTaskRefused",
+    "test": "ds_23_foreign_key_primary_key"
+  },
+  {
+    "id": "24",
+    "surface": "Stored preview flood",
+    "example": "preview until stored-preview cap",
+    "entry_points": [
+      "http",
+      "grpc"
+    ],
+    "code": "BudgetExceeded(StoredPreviews)",
+    "test": "ds_24_preview_budget"
+  },
+  {
+    "id": "25",
+    "surface": "Executor inspection",
+    "example": "SHOW TASK READS; SHOW TASK EXPOSURE; SHOW CHANGE refused; operation outcome exposes only five summary fields",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "NotAllowedInTaskSession(RoleStatement)|NotAllowedInTaskSession(Other)",
+    "test": "ds_25_inspection"
+  },
+  {
+    "id": "26",
+    "surface": "Approval and task administration",
+    "example": "APPROVE; UNDO; CREATE TASK; approver = executor",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "NotAllowedInTaskSession(Other)|NotAllowedInTaskSession(RoleStatement)|ApproverTaskRefused",
+    "test": "ds_26_approval_authority"
+  },
+  {
+    "id": "27",
+    "surface": "Missing or changed task",
+    "example": "SQL credential infers omitted task; different task refused at login; SET giggles.task refused mid-session",
+    "entry_points": [
+      "agent_login",
+      "pg_simple",
+      "pg_extended"
+    ],
+    "code": "LoginRefused|NotAllowedInTaskSession(Set)",
+    "test": "ds_27_task_binding"
+  },
+  {
+    "id": "28",
+    "surface": "Catalog scope",
+    "example": "catalog query outside task table",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended"
+    ],
+    "code": "ZeroRows|Denied",
+    "test": "ds_28_catalog_scope"
+  },
+  {
+    "id": "29",
+    "surface": "Native Join and legacy Sql",
+    "example": "structured Join; legacy Sql",
+    "entry_points": [
+      "http",
+      "grpc"
+    ],
+    "code": "NotAllowedInTaskSession(Other)|NotAllowedInTaskSession(TransactionControl)",
+    "test": "ds_29_native_bypass"
+  },
+  {
+    "id": "30",
+    "surface": "Other merchant row",
+    "example": "SELECT id, status FROM shipments WHERE id = 40 (exists only for merchant 43)",
+    "entry_points": [
+      "pg_simple",
+      "pg_extended",
+      "http",
+      "grpc"
+    ],
+    "code": "ZeroRows",
+    "test": "ds_30_other_merchant"
+  },
+  {
+    "id": "31",
+    "surface": "Lost connection and outcome lookup",
+    "example": "disconnect then SHOW OPERATION",
+    "entry_points": [
+      "pg_simple"
+    ],
+    "code": "NotApplicable",
+    "test": "ds_31_lost_connection"
+  },
+  {
+    "id": "32",
+    "surface": "Embedded API and CLI boundary",
+    "example": "no embedded or CLI task session",
+    "entry_points": [
+      "embedded"
+    ],
+    "code": "NotApplicable",
+    "test": "ds_32_embedded_boundary"
+  }
+]

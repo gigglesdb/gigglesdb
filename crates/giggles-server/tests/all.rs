@@ -357,3 +357,6 @@ mod float_errors_network;
 mod r3_exit_writers;
 #[path = "r3_exit_outcomes.rs"]
 mod r3_exit_outcomes;
+
+#[path = "r3_denied_surfaces.rs"]
+mod r3_denied_surfaces;
