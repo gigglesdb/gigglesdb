@@ -1593,6 +1593,23 @@ impl State {
         if !stale {
             return Ok(());
         }
+        if let Plan::Sql(plan) = &old.p
+            && session.sql.prepared_is_current(plan)
+        {
+            // A previously bound dependency that disappeared must retain Execute's
+            // missing-relation error. Parsing its unqualified name again would
+            // replace it with an unresolvable authority key and report 42501.
+            // Existing relations still go through re-prepare's authorization before
+            // classification, so REVOKE continues to report 42501.
+            for table in plan.read_tables().into_iter()
+                .chain(plan.write_tables().into_iter().map(|(table, _)| table))
+            {
+                if !core(session.sql.relation_exists(&table))? {
+                    session.sql.abort();
+                    return Err("42P01");
+                }
+            }
+        }
         let new = self.prepare_statement(&old.sql, old.declared_oids.clone(), session, false)?;
         if old.parameter_oids != new.parameter_oids
             || old.d.columns != new.d.columns

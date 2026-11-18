@@ -194,7 +194,9 @@ fn metadata_cycle_counts() {
         metadata_parse(&mut state, &mut session, name);
         metadata_bind(&mut state, &mut session, name);
         assert_eq!(text_rows(&metadata_describe_execute(&mut state, &mut session).unwrap()), vec![vec!["7"]]);
-        assert_eq!(giggles_core::metadata_read_counts::take(), if name.is_empty() { [7, 0, 9, 16, 0] } else { [7, 0, 12, 19, 0] }, "cycle {name:?}");
+        // Named statements now retain description_version too, avoiding the same
+        // three metadata reads as the unnamed description cache.
+        assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 9, 16, 0], "cycle {name:?}");
         if name.is_empty() {
             metadata_parse(&mut state, &mut session, name);
             metadata_bind(&mut state, &mut session, name);
@@ -204,7 +206,8 @@ fn metadata_cycle_counts() {
         if !name.is_empty() {
             metadata_bind(&mut state, &mut session, name);
             metadata_describe_execute(&mut state, &mut session).unwrap();
-            assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 7, 14, 0]);
+            // Rebinding the cached named description also saves three reads.
+            assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 4, 11, 0]);
         }
     }
     simple(&mut state, &mut session, "SELECT v FROM t WHERE id = 1").unwrap();
