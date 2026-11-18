@@ -1186,7 +1186,12 @@ impl Session {
             .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
             .ok_or_else(|| fail("28000", "role is not permitted to log in"))?;
         let now = crate::agent::wall_now(&self.service.clock).map_err(from_core)?;
-        crate::task_ddl::run(self, &actor, stmt, now)
+        let outcome = crate::task_ddl::run(self, &actor, stmt, now)?;
+        if matches!(stmt, giggles_core::task::statements::TaskStatement::Revoke(_)
+            | giggles_core::task::statements::TaskStatement::RevokeCredential(_)) {
+            self.service.binding_changes.send_replace(());
+        }
+        Ok(outcome)
     }
     pub(crate) fn execute_admin(
         &mut self,
@@ -3040,6 +3045,93 @@ impl Session {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn issue_credential_task_ddl_backstop_refuses_without_writing() {
+        use crate::agent::{AgentBinding, wall_now};
+        use giggles_core::{
+            roles::{NewRole, TablePrivilege},
+            task::{
+                definition::{DisclosureCaps, LoadLimits, MutationCaps, NewTask, PredicateText},
+            },
+            Admin, Engine, Limits,
+        };
+        let path = crate::test_support::fixture_root().join(format!(
+            "agent-defchange-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let admin =
+            Admin::create_engine(path.join("db.redb"), Limits::default(), Engine::V2).unwrap();
+        admin
+            .sql_session()
+            .execute(
+                "CREATE TABLE shipments (id bigint primary key, merchant_id bigint, status text)",
+                &[],
+                None,
+            )
+            .unwrap();
+        let roles = admin.roles();
+        for name in ["incident_controller", "agent_exec"] {
+            roles
+                .create(NewRole { name: name.into(), login: true, ..NewRole::default() })
+                .unwrap();
+        }
+        roles.set_task_only("agent_exec", true).unwrap();
+        roles
+            .grant_table("shipments", "incident_controller", &[TablePrivilege::Select])
+            .unwrap();
+        let issuer = roles.get("incident_controller").unwrap().unwrap();
+        let clock = crate::clock::Clock::new(0, 3600).unwrap();
+        let now = wall_now(&clock).unwrap();
+        admin
+            .tasks()
+            .create(
+                &issuer,
+                NewTask {
+                    name: "inc-436".into(),
+                    executor: "agent_exec".into(),
+                    approver: None,
+                    schema: None,
+                    table: "shipments".into(),
+                    visible_rows: PredicateText("merchant_id = 42".into()),
+                    readable: vec!["id".into(), "status".into()],
+                    masked: Vec::new(),
+                    untrusted_text: Vec::new(),
+                    allowed_write: None,
+                    mutation_caps: MutationCaps::default(),
+                    disclosure_caps: DisclosureCaps { rows_read: 10, rows_returned: 10, bytes_returned: 4096 },
+                    limits: LoadLimits::default(),
+                    approval_threshold: 0,
+                    expires: "2999-01-01 00:00:00+00".into(),
+                },
+                now,
+            )
+            .unwrap();
+        let fp = "aa".repeat(32);
+        let service = crate::Service::with_agent(
+            admin.clone(),
+            vec![],
+            vec![AgentBinding { fingerprint: fp.clone(), executor: "agent_exec".into(), tasks: vec!["inc-436".into()] }],
+            clock,
+            crate::admission::ServiceLimits::default(),
+        )
+        .unwrap();
+        let mut session = service.agent_session(&fp, None).unwrap();
+        let stmt = crate::task_ddl::parse("ISSUE CREDENTIAL FOR TASK \"inc-436\"").unwrap();
+        assert!(crate::task_ddl::writes(&stmt));
+        let def = admin.tasks().get("inc-436").unwrap().unwrap();
+        let before = admin.tasks().credentials(def.id, now).unwrap();
+        let error = session.execute_task_ddl(&stmt).unwrap_err();
+        assert_eq!(error.sqlstate, "0A000");
+        assert_eq!(admin.tasks().credentials(def.id, now).unwrap(), before);
+    }
+
 
     /// GD-0075 P11-5: a role recheck that fails transiently (a fenced gateway's 40001, an
     /// unavailable range's 08007) keeps its own SQLSTATE; other failures stay 28000.

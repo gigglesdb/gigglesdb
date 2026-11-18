@@ -569,3 +569,14 @@ async fn non_task_sessions_unaffected() {
     assert!(catalog_text.contains("customers"), "{catalog:?}");
     assert!(catalog_text.contains("shipments"), "{catalog:?}");
 }
+
+#[tokio::test]
+async fn issue_credential_is_refused_without_writing() {
+    let (server, agent, _) = started().await;
+    let def = server.admin.tasks().get("inc-436").unwrap().unwrap();
+    let before = server.admin.tasks().credentials(def.id, WallClockMs(now_ms())).unwrap();
+    let mut wire = connect_raw(server.agent.address, &server.ca, &agent, AGENT_STARTUP).await;
+    let reply = wire.simple("ISSUE CREDENTIAL FOR TASK \"inc-436\"").await;
+    assert_eq!(error_of(&reply).unwrap().0, "0A000");
+    assert_eq!(server.admin.tasks().credentials(def.id, WallClockMs(now_ms())).unwrap(), before);
+}

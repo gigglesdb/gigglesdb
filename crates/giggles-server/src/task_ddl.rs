@@ -44,7 +44,11 @@ pub(crate) fn description(stmt: &TaskStatement) -> Description {
 /// parse error, which never runs). Writes pass the read-only check.
 pub(crate) fn writes(stmt: &TaskStatement) -> bool {
     match stmt {
-        TaskStatement::Create(_) | TaskStatement::Revoke(_) | TaskStatement::Grant { .. } => true,
+        TaskStatement::Create(_)
+        | TaskStatement::Revoke(_)
+        | TaskStatement::Grant { .. }
+        | TaskStatement::IssueCredential { .. }
+        | TaskStatement::RevokeCredential(_) => true,
         TaskStatement::Error(_)
         | TaskStatement::Show(_)
         | TaskStatement::ShowReads { .. }
@@ -97,6 +101,8 @@ pub(crate) fn run(
         TaskStatement::Error(_)
         | TaskStatement::Create(_)
         | TaskStatement::Revoke(_)
+        | TaskStatement::IssueCredential { .. }
+        | TaskStatement::RevokeCredential(_)
         | TaskStatement::Show(_)
         | TaskStatement::Grant { .. } => {
             statements::execute(&session.service.admin, actor, stmt, now)

@@ -986,7 +986,7 @@ fn writable(view: &CatalogView, entry: &TableEntry, column: &str) -> Result<(), 
 pub(crate) const PG_EPOCH_UNIX_MS: i64 = 946_684_800_000;
 
 /// The EXPIRES literal: a finite timestamp with an explicit UTC offset (22007).
-fn parse_expiry(text: &str) -> Result<WallClockMs, TaskDdlError> {
+pub(super) fn parse_expiry(text: &str) -> Result<WallClockMs, TaskDdlError> {
     let invalid = || ddl("22007", "EXPIRES needs a timestamp with an explicit offset");
     let at = |offset_east| {
         let settings = ParserSettings {

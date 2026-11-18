@@ -48,12 +48,32 @@ pub fn exposure_listener_rows(service: &crate::Service, task: &str) -> Vec<(Stri
     };
     let mut bound = service.agent_bindings_for(&name);
     bound.sort();
-    bound
+    let mut rows: Vec<_> = bound
         .into_iter()
         .map(|(fingerprint, executor)| {
             ("credential".to_owned(), format!("{fingerprint} as {executor}"))
         })
-        .collect()
+        .collect();
+    if let Ok(now) = wall_now(&service.clock) {
+        let tasks = service.admin.tasks();
+        if let Ok(Some(def)) = tasks.get(task)
+            && !def.revoked
+            && let Ok(credentials) = tasks.credentials(def.id, now)
+        {
+            for (id, expires) in credentials {
+                let expires = match expires {
+                    None => "never".to_owned(),
+                    Some(ms) => match giggles_core::task::statements::wall_timestamp(ms) {
+                        Ok(ts) => ts.to_string(),
+                        Err(_) => continue,
+                    },
+                };
+                rows.push(("credential".into(),
+                    format!("sql {id} as {} expires {expires}", def.executor)));
+            }
+        }
+    }
+    rows
 }
 
 /// Step 3 of per-call revalidation: an expired task may still look up outcomes,

@@ -501,3 +501,154 @@ mod change_statements {
         );
     }
 }
+
+#[test]
+fn credential_parse_tags_and_description() {
+    use super::statements::description;
+    use crate::relational::DataType;
+    for (sql, task, expires) in [
+        ("ISSUE CREDENTIAL FOR TASK t", "t", None),
+        (
+            "ISSUE CREDENTIAL FOR TASK \"Mixed task\" EXPIRES '2030-01-01 00:00:00+00'",
+            "Mixed task",
+            Some("2030-01-01 00:00:00+00"),
+        ),
+    ] {
+        let stmt = parse(sql).unwrap();
+        assert_eq!(
+            stmt,
+            TaskStatement::IssueCredential {
+                task: task.into(),
+                expires: expires.map(str::to_owned)
+            }
+        );
+        assert_eq!(command_tag(&stmt), "ISSUE CREDENTIAL");
+        let d = description(&stmt);
+        assert_eq!(
+            d.columns
+                .iter()
+                .map(|c| (c.name.as_str(), c.data_type.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("credential_id", DataType::BigInt),
+                ("task", DataType::Text),
+                ("secret", DataType::Text),
+                ("expires_at", DataType::TimestampTz)
+            ]
+        );
+    }
+    let revoke = parse("REVOKE CREDENTIAL 42;").unwrap();
+    assert_eq!(revoke, TaskStatement::RevokeCredential(42));
+    assert_eq!(command_tag(&revoke), "REVOKE CREDENTIAL");
+    assert!(description(&revoke).columns.is_empty());
+    assert_eq!(parse("REVOKE credential FROM r"), None);
+    for sql in [
+        "ISSUE CREDENTIAL",
+        "ISSUE CREDENTIAL FOR TASK t EXPIRES 42",
+        "ISSUE CREDENTIAL FOR TASK t garbage",
+        "REVOKE CREDENTIAL -1",
+        "REVOKE CREDENTIAL 18446744073709551616",
+        "REVOKE CREDENTIAL 1.5",
+        "REVOKE CREDENTIAL 42 garbage",
+    ] {
+        assert_eq!(error(sql), "42601");
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn credential_execute_show_and_revoke() {
+    use super::{
+        definition::WallClockMs,
+        statements::{TaskOutcome, execute},
+    };
+    use crate::{
+        Admin, Engine, Limits,
+        roles::{NewRole, TablePrivilege},
+    };
+    let dir = std::env::temp_dir().join(format!("credential-statements-{}", std::process::id()));
+    let admin = Admin::create_engine(&dir, Limits::default(), Engine::V2).unwrap();
+    admin
+        .sql_session()
+        .execute("CREATE TABLE tbl (id bigint primary key)", &[], None)
+        .unwrap();
+    for name in ["issuer", "other", "a"] {
+        admin
+            .roles()
+            .create(NewRole {
+                name: name.into(),
+                login: true,
+                ..NewRole::default()
+            })
+            .unwrap();
+    }
+    admin.roles().set_task_only("a", true).unwrap();
+    admin
+        .roles()
+        .grant_table("tbl", "issuer", &[TablePrivilege::Select])
+        .unwrap();
+    let issuer = admin.roles().get("issuer").unwrap().unwrap();
+    let other = admin.roles().get("other").unwrap().unwrap();
+    let now = WallClockMs(1_793_898_000_000);
+    execute(&admin, &issuer, &parse(MINIMAL).unwrap(), now).unwrap();
+    let issue = parse("ISSUE CREDENTIAL FOR TASK t").unwrap();
+    assert_eq!(
+        execute(&admin, &other, &issue, now).unwrap_err().sqlstate,
+        "42501"
+    );
+    assert_eq!(
+        execute(
+            &admin,
+            &issuer,
+            &parse("ISSUE CREDENTIAL FOR TASK t EXPIRES 'bad'").unwrap(),
+            now
+        )
+        .unwrap_err()
+        .sqlstate,
+        "22007"
+    );
+    for expiry in [None, Some("2029-01-01 00:00:00+00")] {
+        let sql = expiry.map_or_else(
+            || "ISSUE CREDENTIAL FOR TASK t".to_owned(),
+            |ts| format!("ISSUE CREDENTIAL FOR TASK t EXPIRES '{ts}'"),
+        );
+        let outcome = execute(&admin, &issuer, &parse(&sql).unwrap(), now).unwrap();
+        let debug = format!("{outcome:?}");
+        let TaskOutcome::Rows(_, issued) = outcome else {
+            panic!("expected rows")
+        };
+        let Value::Int(id) = issued.rows[0].values[0] else {
+            panic!("expected id")
+        };
+        let Value::Text(secret) = &issued.rows[0].values[2] else {
+            panic!("expected secret")
+        };
+        assert!(secret.starts_with("ggtc1_"));
+        assert!(!debug.contains(secret));
+        assert_eq!(issued.rows[0].values[3] == Value::Null, expiry.is_none());
+        let show = parse("SHOW TASK t").unwrap();
+        let TaskOutcome::Rows(d, shown) = execute(&admin, &issuer, &show, now).unwrap() else {
+            panic!("expected rows")
+        };
+        assert_eq!(d.columns.len(), 26);
+        assert_eq!(shown.columns[25], "credentials");
+        let Value::Text(list) = &shown.rows[0].values[25] else {
+            panic!("expected list")
+        };
+        assert!(list.starts_with(&format!("{id} expires ")));
+        assert!(!list.contains(secret));
+        assert!(!format!("{shown:?}").contains(secret));
+        let revoke = TaskStatement::RevokeCredential(id as u64);
+        assert_eq!(
+            execute(&admin, &other, &revoke, now).unwrap_err().sqlstate,
+            "42501"
+        );
+        execute(&admin, &issuer, &revoke, now).unwrap();
+        let TaskOutcome::Rows(_, shown) = execute(&admin, &issuer, &show, now).unwrap() else {
+            panic!("expected rows")
+        };
+        assert_eq!(shown.rows[0].values[25], Value::Text(String::new()));
+    }
+    drop(admin);
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -21,6 +21,11 @@ pub enum TaskStatement {
     Error(&'static str),
     Create(Box<NewTask>),
     Revoke(String),
+    IssueCredential {
+        task: String,
+        expires: Option<String>,
+    },
+    RevokeCredential(u64),
     /// `None` is SHOW TASKS.
     Show(Option<String>),
     /// `SHOW TASK READS <task> [AFTER <read_seq>] [LIMIT <n>]` (R3-309);
@@ -48,6 +53,8 @@ pub fn command_tag(statement: &TaskStatement) -> &'static str {
     match statement {
         TaskStatement::Create(_) => "CREATE TASK",
         TaskStatement::Revoke(_) => "REVOKE TASK",
+        TaskStatement::IssueCredential { .. } => "ISSUE CREDENTIAL",
+        TaskStatement::RevokeCredential(_) => "REVOKE CREDENTIAL",
         TaskStatement::Show(_)
         | TaskStatement::ShowReads { .. }
         | TaskStatement::ShowExposure(_)
@@ -66,6 +73,8 @@ const UNSUPPORTED: &str = "0A000";
 enum Head {
     Create,
     RevokeTask,
+    IssueCredential,
+    RevokeCredential,
     Show,
     Privileges,
 }
@@ -85,6 +94,12 @@ fn classify(sql: &str) -> Option<Head> {
     let second = words.get(1).map(String::as_str);
     match (first, second) {
         ("create", Some("task")) => Some(Head::Create),
+        ("issue", Some("credential")) => Some(Head::IssueCredential),
+        ("revoke", Some("credential"))
+            if !head_words(sql, usize::MAX).iter().any(|w| w == "from") =>
+        {
+            Some(Head::RevokeCredential)
+        }
         // `REVOKE task FROM r` revokes membership in a role named task.
         ("revoke", Some("task")) if !head_words(sql, usize::MAX).iter().any(|w| w == "from") => {
             Some(Head::RevokeTask)
@@ -124,6 +139,8 @@ pub fn parse(sql: &str) -> Option<TaskStatement> {
     let result = match head {
         Head::Create => p.create().map(|t| TaskStatement::Create(Box::new(t))),
         Head::RevokeTask => p.revoke_task(),
+        Head::IssueCredential => p.issue_credential(),
+        Head::RevokeCredential => p.revoke_credential(),
         Head::Show => p.show(),
         Head::Privileges => p.privileges(),
     }
@@ -635,6 +652,29 @@ impl Parser<'_> {
         })
     }
 
+    fn issue_credential(&mut self) -> P<TaskStatement> {
+        self.words(&["issue", "credential", "for", "task"])?;
+        let task = self.ident()?;
+        let expires = if self.eat_word("expires") {
+            match self.tokens.get(self.pos).map(|t| &t.tok) {
+                Some(Tok::Str(text)) => {
+                    let text = text.clone();
+                    self.pos += 1;
+                    Some(text)
+                }
+                _ => return Err(SYNTAX),
+            }
+        } else {
+            None
+        };
+        Ok(TaskStatement::IssueCredential { task, expires })
+    }
+
+    fn revoke_credential(&mut self) -> P<TaskStatement> {
+        self.words(&["revoke", "credential"])?;
+        Ok(TaskStatement::RevokeCredential(self.number()?))
+    }
+
     fn revoke_task(&mut self) -> P<TaskStatement> {
         self.words(&["revoke", "task"])?;
         Ok(TaskStatement::Revoke(self.ident()?))
@@ -662,9 +702,7 @@ impl Parser<'_> {
         if named && self.eat_word("exposure") {
             // `FOR CREATE TASK ...` is a draft; `SHOW TASK EXPOSURE for`
             // shows a task named for.
-            let word = |at: usize, want: &str| {
-                matches!(self.tokens.get(at).map(|t| &t.tok), Some(Tok::Word(w)) if w == want)
-            };
+            let word = |at: usize, want: &str| matches!(self.tokens.get(at).map(|t| &t.tok), Some(Tok::Word(w)) if w == want);
             if word(self.pos, "for") && word(self.pos + 1, "create") {
                 self.pos += 1;
                 return Ok(TaskStatement::ShowExposureDraft(Box::new(self.create()?)));
@@ -1173,14 +1211,32 @@ pub fn undo_receipt_result(receipt: &Receipt) -> Result<SqlResult, CoreError> {
 // `description` gives their shapes, and `execute` refuses them with 0A000.
 
 /// What a task statement produced: a command tag, or a SHOW result.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum TaskOutcome {
     Tag(&'static str),
     Rows(crate::relational::Description, SqlResult),
 }
 
+impl std::fmt::Debug for TaskOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tag(tag) => f.debug_tuple("Tag").field(tag).finish(),
+            Self::Rows(description, rows) if rows.columns.iter().any(|c| c == "secret") => f
+                .debug_tuple("Rows")
+                .field(description)
+                .field(&"[REDACTED]")
+                .finish(),
+            Self::Rows(description, rows) => f
+                .debug_tuple("Rows")
+                .field(description)
+                .field(rows)
+                .finish(),
+        }
+    }
+}
+
 /// The SHOW TASK / SHOW TASKS columns, in order (design-1 section 5).
-pub const SHOW_TASK_COLUMNS: [&str; 25] = [
+pub const SHOW_TASK_COLUMNS: [&str; 26] = [
     "task",
     "id",
     "def_version",
@@ -1206,13 +1262,14 @@ pub const SHOW_TASK_COLUMNS: [&str; 25] = [
     "revoked",
     "expired",
     "grants",
+    "credentials",
 ];
 
-fn show_task_types() -> [crate::relational::DataType; 25] {
+fn show_task_types() -> [crate::relational::DataType; 26] {
     use crate::relational::DataType::{BigInt, Boolean, Text, TimestampTz as Tz};
     [
         Text, BigInt, BigInt, Text, Text, Text, Text, Text, Text, Text, Text, Text, Text, Text,
-        BigInt, BigInt, BigInt, BigInt, BigInt, Text, BigInt, Tz, Boolean, Boolean, Text,
+        BigInt, BigInt, BigInt, BigInt, BigInt, Text, BigInt, Tz, Boolean, Boolean, Text, Text,
     ]
 }
 
@@ -1234,6 +1291,12 @@ fn read_types() -> Vec<crate::relational::DataType> {
 pub fn description(stmt: &TaskStatement) -> crate::relational::Description {
     use crate::relational::DataType::{BigInt, Text};
     let columns: Vec<(&str, crate::relational::DataType)> = match stmt {
+        TaskStatement::IssueCredential { .. } => vec![
+            ("credential_id", BigInt),
+            ("task", Text),
+            ("secret", Text),
+            ("expires_at", crate::relational::DataType::TimestampTz),
+        ],
         TaskStatement::Show(_) => SHOW_TASK_COLUMNS
             .iter()
             .copied()
@@ -1254,6 +1317,7 @@ pub fn description(stmt: &TaskStatement) -> crate::relational::Description {
         TaskStatement::Error(_)
         | TaskStatement::Create(_)
         | TaskStatement::Revoke(_)
+        | TaskStatement::RevokeCredential(_)
         | TaskStatement::Grant { .. } => Vec::new(),
     };
     crate::relational::Description {
@@ -1289,6 +1353,34 @@ pub fn execute(
             tasks.create(actor, (**new).clone(), now)?;
             Ok(TaskOutcome::Tag(command_tag(stmt)))
         }
+        TaskStatement::IssueCredential { task, expires } => {
+            let expires = expires
+                .as_deref()
+                .map(super::catalog::parse_expiry)
+                .transpose()?;
+            let issued = tasks.issue_credential(actor, task, expires, now)?;
+            let expires = issued
+                .expires_at
+                .map(wall_timestamp)
+                .transpose()?
+                .map_or(Value::Null, Value::TimestampTz);
+            Ok(TaskOutcome::Rows(
+                description(stmt),
+                one_row(
+                    &["credential_id", "task", "secret", "expires_at"],
+                    vec![
+                        int_value(issued.id)?,
+                        Value::Text(issued.task.as_str().to_owned()),
+                        Value::Text(issued.secret.expose().to_owned()),
+                        expires,
+                    ],
+                ),
+            ))
+        }
+        TaskStatement::RevokeCredential(id) => {
+            tasks.revoke_credential(actor, *id)?;
+            Ok(TaskOutcome::Tag(command_tag(stmt)))
+        }
         TaskStatement::Revoke(name) => {
             tasks.revoke(actor, name)?;
             Ok(TaskOutcome::Tag(command_tag(stmt)))
@@ -1312,13 +1404,14 @@ pub fn execute(
             let defs: Vec<_> = match name {
                 // Unknown and not visible are the same 42704: existence
                 // does not leak.
-                Some(name) => vec![view
-                    .task_names
-                    .get(name)
-                    .and_then(|id| view.tasks.get(id))
-                    .filter(|def| visible(def))
-                    .cloned()
-                    .ok_or_else(|| fail("42704", format!("task \"{name}\" does not exist")))?],
+                Some(name) => vec![
+                    view.task_names
+                        .get(name)
+                        .and_then(|id| view.tasks.get(id))
+                        .filter(|def| visible(def))
+                        .cloned()
+                        .ok_or_else(|| fail("42704", format!("task \"{name}\" does not exist")))?,
+                ],
                 // `task_names` is ordered by name.
                 None => view
                     .task_names
@@ -1370,6 +1463,15 @@ fn masked_text(name: &str, constant: Option<&Value>) -> String {
                 .unwrap_or_else(|| "NULL".into())
         ),
     }
+}
+
+/// Convert task wall time without losing pre-Unix-epoch timestamps.
+pub fn wall_timestamp(ms: super::definition::WallClockMs) -> Result<TimestampTz, CoreError> {
+    let us =
+        ms.0.checked_sub(super::catalog::PG_EPOCH_UNIX_MS)
+            .and_then(|ms| ms.checked_mul(1000))
+            .ok_or(CoreError::Sql(SqlError::Overflow))?;
+    TimestampTz::from_microseconds(us).map_err(|_| CoreError::Sql(SqlError::Overflow))
 }
 
 fn show_row(
@@ -1432,6 +1534,24 @@ fn show_row(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let credentials = view
+        .task_credentials
+        .iter()
+        .filter(|(_, (owner, record))| {
+            *owner == def.id.0
+                && !def.revoked
+                && record.expires_at.is_none_or(|expires| now < expires)
+        })
+        .map(|(id, (_, record))| {
+            let expires = record
+                .expires_at
+                .map(wall_timestamp)
+                .transpose()?
+                .map_or_else(|| "never".to_owned(), |ts| ts.to_string());
+            Ok(format!("{id} expires {expires}"))
+        })
+        .collect::<Result<Vec<_>, CoreError>>()?
+        .join("; ");
     let expires_ms =
         u64::try_from(def.expires_at.0).map_err(|_| CoreError::Sql(SqlError::Overflow))?;
     Ok(SqlRow {
@@ -1465,6 +1585,7 @@ fn show_row(
             Value::Bool(def.revoked),
             Value::Bool(now >= def.expires_at),
             Value::Text(grants),
+            Value::Text(credentials),
         ],
         version: 0,
     })

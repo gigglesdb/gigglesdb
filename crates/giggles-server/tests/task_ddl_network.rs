@@ -191,7 +191,7 @@ fn field<'a>(row: &'a BTreeMap<String, Option<String>>, name: &str) -> Option<&'
         .as_deref()
 }
 
-const SHOW_COLUMNS: [&str; 25] = [
+const SHOW_COLUMNS: [&str; 26] = [
     "task",
     "id",
     "def_version",
@@ -217,6 +217,7 @@ const SHOW_COLUMNS: [&str; 25] = [
     "revoked",
     "expired",
     "grants",
+    "credentials",
 ];
 
 #[tokio::test]
