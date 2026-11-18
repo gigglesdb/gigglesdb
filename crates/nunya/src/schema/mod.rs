@@ -1,6 +1,7 @@
 //! Database schema snapshots and exact-name resolution.
 use crate::value::ColumnType;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 /// Pg.
 pub mod pg;
 /// Spanner gsql.
@@ -18,6 +19,30 @@ pub struct ColumnRef {
     pub table: String,
     /// Column.
     pub column: String,
+}
+/// Database identity of a captured column.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum ColumnId {
+    /// PostgreSQL identity, stable across column renames.
+    Pg {
+        /// Owning relation OID.
+        relation_oid: u32,
+        /// Attribute number within the relation.
+        attnum: i16,
+    },
+    /// Spanner identity from exact names and the raw information-schema type.
+    Spanner {
+        /// Schema name.
+        schema: String,
+        /// Table name.
+        table: String,
+        /// Column name.
+        column: String,
+        /// Exact information-schema type string.
+        spanner_type: String,
+    },
 }
 /// Column.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -96,6 +121,9 @@ pub struct DependentObject {
 pub struct Snapshot {
     /// Relations.
     pub relations: Vec<Relation>,
+    /// Captured column identities; an empty map means identity is unknown.
+    #[serde(default)]
+    pub column_ids: BTreeMap<ColumnRef, ColumnId>,
     /// Dependents.
     pub dependents: Vec<DependentObject>,
     /// Sorted, deduplicated lower-case names of user-defined routines and operators.
@@ -106,7 +134,7 @@ pub struct Snapshot {
     /// Exact schema names captured by the loader, when provenance is known.
     #[serde(default)]
     pub captured_schemas: Option<Vec<String>>,
-    /// SHA-256 of canonically ordered relations, dependents, and routine names.
+    /// SHA-256 of canonical relations, dependents, routine names, and known column identities.
     pub fingerprint: [u8; 32],
     /// Snapshot capture time in milliseconds since the Unix epoch.
     pub taken_at_unix_ms: u64,
@@ -121,6 +149,7 @@ impl Snapshot {
     ) -> Self {
         Self {
             relations,
+            column_ids: BTreeMap::new(),
             dependents,
             search_path,
             captured_schemas: None,
@@ -142,6 +171,20 @@ impl Snapshot {
         self.user_routines = names.into_iter().map(|name| name.to_lowercase()).collect();
         self.user_routines.sort();
         self.user_routines.dedup();
+        self.recompute_fingerprint();
+        self
+    }
+    /// Attach column identities and include them in the schema fingerprint.
+    pub fn with_column_ids(mut self, ids: BTreeMap<ColumnRef, ColumnId>) -> Snapshot {
+        self.column_ids = ids;
+        self.recompute_fingerprint();
+        self
+    }
+    /// Look up the captured identity of a fully qualified column.
+    pub fn column_id(&self, c: &ColumnRef) -> Option<&ColumnId> {
+        self.column_ids.get(c)
+    }
+    fn recompute_fingerprint(&mut self) {
         let mut canonical_relations: Vec<_> = self.relations.iter().collect();
         canonical_relations.sort_by_cached_key(|r| {
             serde_json::to_vec(r).expect("schema serialization is infallible")
@@ -153,14 +196,23 @@ impl Snapshot {
         canonical_dependents.sort_by_cached_key(|d| {
             serde_json::to_vec(d).expect("schema serialization is infallible")
         });
-        let canonical = serde_json::to_vec(&(
-            canonical_relations,
-            canonical_dependents,
-            &self.user_routines,
-        ))
+        let canonical = if self.column_ids.is_empty() {
+            serde_json::to_vec(&(
+                canonical_relations,
+                canonical_dependents,
+                &self.user_routines,
+            ))
+        } else {
+            let ids: Vec<_> = self.column_ids.iter().collect();
+            serde_json::to_vec(&(
+                canonical_relations,
+                canonical_dependents,
+                &self.user_routines,
+                ids,
+            ))
+        }
         .expect("schema serialization is infallible");
         self.fingerprint = Sha256::digest(canonical).into();
-        self
     }
     /// Resolve a relation by exact stored name, walking the search path when unqualified.
     pub fn resolve_relation(&self, schema: Option<&str>, name: &str) -> Option<&Relation> {
@@ -213,6 +265,69 @@ mod tests {
         let restored: Snapshot = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.captured_schemas, None);
         assert_eq!(restored, base);
+    }
+    #[test]
+    fn column_identity_fingerprints_and_legacy_json() {
+        let base = Snapshot::new(vec![relation("public")], vec![], vec![], 0);
+        let names = vec!["Routine".into()];
+        let legacy = base.clone().with_user_routines(names.clone());
+        assert_eq!(
+            base.clone().with_column_ids(BTreeMap::new()).fingerprint,
+            base.fingerprint
+        );
+        assert_eq!(
+            legacy.clone().with_column_ids(BTreeMap::new()).fingerprint,
+            legacy.fingerprint
+        );
+        let canonical =
+            serde_json::to_vec(&(&legacy.relations, &legacy.dependents, &legacy.user_routines))
+                .unwrap();
+        assert_eq!(
+            legacy.fingerprint,
+            <[u8; 32]>::from(Sha256::digest(canonical))
+        );
+        let c = ColumnRef {
+            schema: "public".into(),
+            table: "items".into(),
+            column: "id".into(),
+        };
+        let id = ColumnId::Pg {
+            relation_oid: 42,
+            attnum: 1,
+        };
+        let ids = BTreeMap::from([(c.clone(), id.clone())]);
+        let first = base
+            .clone()
+            .with_column_ids(ids.clone())
+            .with_user_routines(names.clone());
+        let second = base.clone().with_user_routines(names).with_column_ids(ids);
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(first.column_id(&c), Some(&id));
+        assert_eq!(base.column_id(&c), None);
+        assert_ne!(first.fingerprint, legacy.fingerprint);
+        for changed in [
+            ColumnId::Pg {
+                relation_oid: 43,
+                attnum: 1,
+            },
+            ColumnId::Pg {
+                relation_oid: 42,
+                attnum: 2,
+            },
+        ] {
+            assert_ne!(
+                first.fingerprint,
+                legacy
+                    .clone()
+                    .with_column_ids(BTreeMap::from([(c.clone(), changed)]))
+                    .fingerprint
+            );
+        }
+        let mut json = serde_json::to_value(&legacy).unwrap();
+        json.as_object_mut().unwrap().remove("column_ids");
+        let restored: Snapshot = serde_json::from_value(json).unwrap();
+        assert!(restored.column_ids.is_empty());
+        assert_eq!(restored, legacy);
     }
     #[test]
     fn user_routines_are_canonical() {

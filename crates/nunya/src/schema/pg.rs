@@ -1,5 +1,7 @@
 //! PostgreSQL catalog snapshot loading.
-use super::{Column, ColumnRef, DependentKind, DependentObject, Relation, RelationKind, Snapshot};
+use super::{
+    Column, ColumnId, ColumnRef, DependentKind, DependentObject, Relation, RelationKind, Snapshot,
+};
 use crate::{
     error::{NyCode, Refusal},
     value::ColumnType,
@@ -34,7 +36,7 @@ impl Drop for Rollback<'_> {
 }
 const SCHEMAS: &str = "SELECT nspname::text FROM pg_catalog.pg_namespace WHERE (cardinality($1::text[])>0 AND nspname=ANY($1)) OR (cardinality($1::text[])=0 AND nspname NOT IN ('pg_catalog','information_schema','pg_toast') AND nspname NOT LIKE 'pg_temp%' AND nspname NOT LIKE 'pg_toast_temp%') ORDER BY 1";
 const RELATIONS: &str = "SELECT c.oid,n.nspname::text,c.relname::text,c.relkind::text,CASE WHEN c.relkind IN ('v','m') THEN pg_catalog.pg_get_viewdef(c.oid,true) END FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=ANY($1::text[]) ORDER BY 2,3";
-const COLUMNS: &str = "SELECT a.attname::text,pg_catalog.format_type(a.atttypid,a.atttypmod),t.typtype::text,CASE WHEN t.typelem<>0 AND t.typlen=-1 THEN pg_catalog.format_type(t.typelem,NULL) END,a.atttypmod,NOT a.attnotnull,CASE WHEN a.attgenerated<>'' THEN pg_catalog.pg_get_expr(d.adbin,d.adrelid) END,CASE WHEN a.attgenerated='' THEN pg_catalog.pg_get_expr(d.adbin,d.adrelid) END,et.typtype::text FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid=a.atttypid LEFT JOIN pg_catalog.pg_type et ON et.oid=t.typelem LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=$1 AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum";
+const COLUMNS: &str = "SELECT a.attname::text,pg_catalog.format_type(a.atttypid,a.atttypmod),t.typtype::text,CASE WHEN t.typelem<>0 AND t.typlen=-1 THEN pg_catalog.format_type(t.typelem,NULL) END,a.atttypmod,NOT a.attnotnull,CASE WHEN a.attgenerated<>'' THEN pg_catalog.pg_get_expr(d.adbin,d.adrelid) END,CASE WHEN a.attgenerated='' THEN pg_catalog.pg_get_expr(d.adbin,d.adrelid) END,et.typtype::text,a.attnum FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid=a.atttypid LEFT JOIN pg_catalog.pg_type et ON et.oid=t.typelem LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=$1 AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum";
 const PRIMARY_KEY: &str = "SELECT a.attname::text FROM pg_catalog.pg_index i CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum,ord) JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum WHERE i.indrelid=$1 AND i.indisprimary AND k.ord<=i.indnkeyatts ORDER BY k.ord";
 const DEPENDENTS: &str = "SELECT 'trigger'::text,tgname::text FROM pg_catalog.pg_trigger WHERE tgrelid=$1 AND NOT tgisinternal UNION ALL SELECT 'rule',rulename::text FROM pg_catalog.pg_rewrite WHERE ev_class=$1 AND rulename<>'_RETURN' UNION ALL SELECT 'policy',polname::text FROM pg_catalog.pg_policy WHERE polrelid=$1 ORDER BY 1,2";
 const VIEW_READS: &str = "SELECT DISTINCT n.nspname::text,c.relname::text,a.attname::text FROM pg_catalog.pg_rewrite r JOIN pg_catalog.pg_depend d ON d.classid='pg_catalog.pg_rewrite'::regclass AND d.objid=r.oid AND d.refclassid='pg_catalog.pg_class'::regclass JOIN pg_catalog.pg_class c ON c.oid=d.refobjid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND (d.refobjsubid=0 OR a.attnum=d.refobjsubid) WHERE r.ev_class=$1 AND d.refobjid<>r.ev_class ORDER BY 1,2,3";
@@ -61,6 +63,7 @@ pub async fn load_pg_snapshot(
             .iter()
             .map(|r| get::<String>(r, 0))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut column_ids = std::collections::BTreeMap::new();
         let mut relations = Vec::new();
         let mut dependents = Vec::new();
         for row in client
@@ -90,8 +93,20 @@ pub async fn load_pg_snapshot(
                     .chars()
                     .next()
                     .ok_or_else(unavailable)?;
+                let column_name: String = get(&r, 0)?;
+                column_ids.insert(
+                    ColumnRef {
+                        schema: schema.clone(),
+                        table: name.clone(),
+                        column: column_name.clone(),
+                    },
+                    ColumnId::Pg {
+                        relation_oid: oid,
+                        attnum: get::<i16>(&r, 9)?,
+                    },
+                );
                 columns.push(Column {
-                    name: get(&r, 0)?,
+                    name: column_name,
                     ty: map_pg_type_with_element(
                         &get::<String>(&r, 1)?,
                         typtype,
@@ -185,6 +200,7 @@ pub async fn load_pg_snapshot(
             .collect::<Result<Vec<_>, _>>()?;
         Ok(
             Snapshot::new(relations, dependents, opts.search_path.clone(), now_unix_ms)
+                .with_column_ids(column_ids)
                 .with_user_routines(routines)
                 .with_captured_schemas(schemas),
         )

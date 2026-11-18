@@ -202,14 +202,10 @@ impl RedbStore {
                 }
             }
         }
-        if initialize {
-            for t in Table::ALL {
-                txn.open_table(t.definition()).map_err(|_| StoreError::Io)?;
-            }
-            txn.commit().map_err(|_| StoreError::Io)?;
-        } else {
-            txn.abort().map_err(|_| StoreError::Io)?;
+        for t in Table::ALL {
+            txn.open_table(t.definition()).map_err(|_| StoreError::Io)?;
         }
+        txn.commit().map_err(|_| StoreError::Io)?;
         Ok(Self {
             db,
             meta,

@@ -1,5 +1,7 @@
 //! GoogleSQL information-schema snapshots through a text-cell runner.
-use super::{Column, ColumnRef, DependentKind, DependentObject, Relation, RelationKind, Snapshot};
+use super::{
+    Column, ColumnId, ColumnRef, DependentKind, DependentObject, Relation, RelationKind, Snapshot,
+};
 use crate::{
     error::{NyCode, Refusal},
     value::ColumnType,
@@ -56,6 +58,7 @@ pub async fn load_gsql_snapshot(
     runner: &dyn SqlRunner,
     now_unix_ms: u64,
 ) -> Result<Snapshot, Refusal> {
+    let mut column_ids = std::collections::BTreeMap::new();
     let mut relations = Vec::new();
     for row in runner.query(TABLES).await.map_err(|_| unavailable())? {
         let kind = match cell(&row, 2)? {
@@ -106,6 +109,19 @@ pub async fn load_gsql_snapshot(
         if r.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
             return Err(unavailable());
         }
+        column_ids.insert(
+            ColumnRef {
+                schema: r.schema.clone(),
+                table: r.name.clone(),
+                column: name.clone(),
+            },
+            ColumnId::Spanner {
+                schema: r.schema.clone(),
+                table: r.name.clone(),
+                column: name.clone(),
+                spanner_type: cell(&row, 5)?.to_owned(),
+            },
+        );
         r.columns.push(Column {
             name,
             ty: map_spanner_type(cell(&row, 5)?),
@@ -189,12 +205,10 @@ pub async fn load_gsql_snapshot(
             }
         }
     }
-    Ok(Snapshot::new(
-        relations,
-        dependents,
-        vec![String::new()],
-        now_unix_ms,
-    ))
+    Ok(
+        Snapshot::new(relations, dependents, vec![String::new()], now_unix_ms)
+            .with_column_ids(column_ids),
+    )
 }
 /// Map GoogleSQL types, retaining unsupported names for fail-closed validation.
 pub fn map_spanner_type(t: &str) -> ColumnType {
@@ -305,6 +319,22 @@ mod tests {
     #[tokio::test]
     async fn snapshot_and_conservative_dependents() {
         let s = load_gsql_snapshot(&Fake { fail: None }, 42).await.unwrap();
+        assert_eq!(s.column_ids.len(), 3);
+        for (column, spanner_type) in [("Email", "STRING(MAX)"), ("Generated", "INT64")] {
+            assert_eq!(
+                s.column_id(&ColumnRef {
+                    schema: "".into(),
+                    table: "Users".into(),
+                    column: column.into()
+                }),
+                Some(&ColumnId::Spanner {
+                    schema: "".into(),
+                    table: "Users".into(),
+                    column: column.into(),
+                    spanner_type: spanner_type.into()
+                })
+            );
+        }
         assert_eq!(s.taken_at_unix_ms, 42);
         assert_eq!(s.search_path, vec![""]);
         assert!(s.user_routines.is_empty());

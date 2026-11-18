@@ -38,3 +38,5 @@ mod access_sessions;
 mod spanner_native;
 #[path = "spanner_pg.rs"]
 mod spanner_pg;
+
+#[path = "bindings_live.rs"] mod bindings_live;

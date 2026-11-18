@@ -1,6 +1,8 @@
 //! Shared column policy data model.
 use crate::schema::ColumnRef;
 use std::{collections::BTreeMap, path::PathBuf};
+/// Persisted identity-bound private domains.
+pub mod bindings;
 /// Compile effective column treatments.
 pub mod effective;
 /// File.

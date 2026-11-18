@@ -1,14 +1,13 @@
 //! Compile declared policy into a treatment for every captured column.
-use super::{DomainName, PolicyDocument, RouteDefault, Treatment};
+use super::{
+    DomainName, PolicyDocument, RouteDefault, Treatment,
+    bindings::{BindingStatus, RouteBindings, TypeFamily},
+};
 use crate::{
     schema::{ColumnRef, Snapshot},
     value::ColumnType,
 };
 use std::collections::BTreeMap;
-
-/// Placeholder for a private token domain assigned and persisted by GD-0088 stack 2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PendingPrivateDomain;
 
 /// Treatment compiled for a captured column.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,13 +24,20 @@ pub enum Effective {
         /// Declared token domain.
         domain: DomainName,
     },
-    /// Tokenize using a private domain that has not yet been assigned.
-    BlindPrivate(PendingPrivateDomain),
+    /// Tokenize using a persisted private domain.
+    BlindPrivate {
+        /// Persisted token domain.
+        domain: DomainName,
+    },
 }
 
 /// Reason the compiler selected a treatment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
+    /// Binding requires operator repair; values are withheld.
+    NeedsRepair,
+    /// Identity or persisted binding is missing; values are withheld.
+    Unbound,
     /// An explicit column rule selected the treatment.
     Explicit,
     /// The route default selected the treatment.
@@ -63,18 +69,20 @@ impl std::error::Error for EffectiveError {}
 pub fn effective(
     doc: &PolicyDocument,
     snapshot: &Snapshot,
+    bindings: &RouteBindings,
     column: &ColumnRef,
 ) -> Result<(Effective, Origin), EffectiveError> {
     let captured = snapshot
         .column(column)
         .ok_or(EffectiveError::UnknownColumn)?;
-    Ok(compile(doc, column, &captured.ty))
+    Ok(compile(doc, snapshot, bindings, column, &captured.ty))
 }
 
 /// Compile exactly one treatment for every fully qualified snapshot column.
 pub fn effective_all(
     doc: &PolicyDocument,
     snapshot: &Snapshot,
+    bindings: &RouteBindings,
 ) -> BTreeMap<ColumnRef, (Effective, Origin)> {
     snapshot
         .relations
@@ -86,58 +94,120 @@ pub fn effective_all(
                     table: relation.name.clone(),
                     column: column.name.clone(),
                 };
-                let treatment = compile(doc, &reference, &column.ty);
+                let treatment = compile(doc, snapshot, bindings, &reference, &column.ty);
                 (reference, treatment)
             })
         })
         .collect()
 }
 
-fn compile(doc: &PolicyDocument, column: &ColumnRef, ty: &ColumnType) -> (Effective, Origin) {
+fn explicit(treatment: &Treatment) -> (Effective, Origin) {
+    let result = match treatment {
+        Treatment::Show => Effective::Show,
+        Treatment::Masked { placeholder } => Effective::Masked {
+            placeholder: placeholder.clone(),
+        },
+        Treatment::Blind { domain } => Effective::Blind {
+            domain: domain.clone(),
+        },
+    };
+    (result, Origin::Explicit)
+}
+
+fn withheld(origin: Origin) -> (Effective, Origin) {
+    (Effective::Masked { placeholder: None }, origin)
+}
+
+fn compile(
+    doc: &PolicyDocument,
+    snapshot: &Snapshot,
+    bindings: &RouteBindings,
+    column: &ColumnRef,
+    ty: &ColumnType,
+) -> (Effective, Origin) {
     if doc.json_paths.iter().any(|rule| rule.column == *column) {
-        return (
-            Effective::Masked { placeholder: None },
-            Origin::JsonPathsPending,
-        );
-    }
-    if let Some(treatment) = doc.policy.columns.get(column) {
-        let treatment = match treatment {
-            Treatment::Show => Effective::Show,
-            Treatment::Masked { placeholder } => Effective::Masked {
-                placeholder: placeholder.clone(),
-            },
-            Treatment::Blind { domain } => Effective::Blind {
-                domain: domain.clone(),
-            },
-        };
-        return (treatment, Origin::Explicit);
+        return withheld(Origin::JsonPathsPending);
     }
     match doc.route_default {
-        RouteDefault::Show => (Effective::Show, Origin::RouteDefault),
-        RouteDefault::Tokenize => match ty {
-            ColumnType::Text
-            | ColumnType::Varchar(_)
-            | ColumnType::Bpchar(_)
-            | ColumnType::Int4
-            | ColumnType::Int8
-            | ColumnType::Uuid
-            | ColumnType::Date
-            | ColumnType::Timestamp
-            | ColumnType::Timestamptz => (
-                Effective::BlindPrivate(PendingPrivateDomain),
-                Origin::RouteDefault,
-            ),
-            ColumnType::Int2
-            | ColumnType::Bool
-            | ColumnType::Numeric
-            | ColumnType::Bytea
-            | ColumnType::Enum(_)
-            | ColumnType::Array(_)
-            | ColumnType::Other(_) => (Effective::Masked { placeholder: None }, Origin::NoCodec),
-            ColumnType::Json | ColumnType::Jsonb => {
-                (Effective::Masked { placeholder: None }, Origin::JsonNoPaths)
+        RouteDefault::Show => {
+            return match doc.policy.columns.get(column) {
+                Some(treatment) => explicit(treatment),
+                None => (Effective::Show, Origin::RouteDefault),
+            };
+        }
+        RouteDefault::Tokenize => {}
+    }
+    let record = snapshot.column_id(column).and_then(|id| bindings.get(id));
+    if let Some(record) = record {
+        match record.status {
+            BindingStatus::NeedsRepair | BindingStatus::Retired => {
+                return withheld(Origin::NeedsRepair);
             }
-        },
+            BindingStatus::Active => {}
+        }
+    }
+    match doc.policy.columns.get(column) {
+        Some(treatment @ (Treatment::Masked { .. } | Treatment::Blind { .. })) => {
+            return explicit(treatment);
+        }
+        Some(Treatment::Show) => {
+            // The identity holds a Show anchor, under this name or a name it had before a
+            // PostgreSQL rename, so the explicit rule confirms the grant on the same identity.
+            if record.is_some_and(|r| r.show_rule.is_some()) {
+                return (Effective::Show, Origin::Explicit);
+            }
+            return withheld(
+                if bindings
+                    .iter()
+                    .any(|(_, r)| r.show_rule.as_ref() == Some(column))
+                {
+                    Origin::NeedsRepair
+                } else {
+                    Origin::Unbound
+                },
+            );
+        }
+        None => {}
+    }
+    if let Some(old) = record.and_then(|r| r.show_rule.as_ref()) {
+        // A grant follows its identity across a rename, even when another column now
+        // holds the old name; that column gets no grant (see the explicit Show branch).
+        if matches!(doc.policy.columns.get(old), Some(Treatment::Show)) {
+            return (Effective::Show, Origin::Explicit);
+        }
+    }
+    match ty {
+        ColumnType::Json | ColumnType::Jsonb => withheld(Origin::JsonNoPaths),
+        ColumnType::Int2
+        | ColumnType::Bool
+        | ColumnType::Numeric
+        | ColumnType::Bytea
+        | ColumnType::Enum(_)
+        | ColumnType::Array(_)
+        | ColumnType::Other(_) => withheld(Origin::NoCodec),
+        ColumnType::Text
+        | ColumnType::Varchar(_)
+        | ColumnType::Bpchar(_)
+        | ColumnType::Int4
+        | ColumnType::Int8
+        | ColumnType::Uuid
+        | ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::Timestamptz => {
+            if let Some(domain) = record
+                .filter(|r| r.family == TypeFamily::of(ty))
+                .and_then(|r| r.domain.as_ref())
+            {
+                (
+                    Effective::BlindPrivate {
+                        domain: domain.clone(),
+                    },
+                    Origin::RouteDefault,
+                )
+            } else {
+                withheld(Origin::Unbound)
+            }
+        }
     }
 }
 
@@ -204,10 +274,7 @@ mod tests {
             | ColumnType::Uuid
             | ColumnType::Date
             | ColumnType::Timestamp
-            | ColumnType::Timestamptz => (
-                Effective::BlindPrivate(PendingPrivateDomain),
-                Origin::RouteDefault,
-            ),
+            | ColumnType::Timestamptz => (Effective::Masked { placeholder: None }, Origin::Unbound),
             ColumnType::Int2
             | ColumnType::Bool
             | ColumnType::Numeric
@@ -267,6 +334,106 @@ mod tests {
     }
 
     #[test]
+    fn persisted_bindings_cover_tokenize_origins_and_repair_precedence() {
+        use crate::{
+            policy::bindings::{self, BindingChange, BindingStatus},
+            schema::ColumnId,
+            state::{model::RouteId, store::RedbStore},
+            token::keys::RootKey,
+        };
+        let path = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap()).join(format!(
+            "effective-{}",
+            bindings::generate_domain_name().unwrap().0
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let store = RedbStore::open(&path, &RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap();
+        let route = RouteId::new("effective").unwrap();
+        let c = type_entries()[0].0.clone();
+        let id = ColumnId::Pg {
+            relation_oid: 123,
+            attnum: 1,
+        };
+        let snapshot = snapshot(vec![(c.clone(), ColumnType::Text)])
+            .with_column_ids(BTreeMap::from([(c.clone(), id.clone())]));
+        let mut doc = document(RouteDefault::Tokenize);
+        assert_eq!(
+            effective(&doc, &snapshot, &RouteBindings::default(), &c).unwrap(),
+            withheld(Origin::Unbound)
+        );
+        let mut records = bindings::refresh(&store, &route, &doc, &snapshot).unwrap();
+        let domain = records.get(&id).unwrap().domain.clone().unwrap();
+        assert_eq!(
+            effective(&doc, &snapshot, &records, &c).unwrap(),
+            (Effective::BlindPrivate { domain }, Origin::RouteDefault)
+        );
+        doc.policy.columns.insert(c.clone(), Treatment::Show);
+        assert_eq!(
+            effective(&doc, &snapshot, &records, &c).unwrap(),
+            withheld(Origin::Unbound)
+        );
+        records = bindings::refresh(&store, &route, &doc, &snapshot).unwrap();
+        assert_eq!(
+            effective(&doc, &snapshot, &records, &c).unwrap(),
+            (Effective::Show, Origin::Explicit)
+        );
+        // A Show grant anchored to a different identity can never expose this column.
+        let other = snapshot.clone().with_column_ids(BTreeMap::from([(
+            c.clone(),
+            ColumnId::Pg {
+                relation_oid: 123,
+                attnum: 2,
+            },
+        )]));
+        assert_eq!(
+            effective(&doc, &other, &records, &c).unwrap(),
+            withheld(Origin::NeedsRepair)
+        );
+        for status in [BindingStatus::NeedsRepair, BindingStatus::Retired] {
+            records = bindings::apply(
+                &store,
+                &route,
+                &[BindingChange::Update {
+                    identity: id.clone(),
+                    column: c.clone(),
+                    family: Some(TypeFamily::Text),
+                    show_rule: Some(c.clone()),
+                    status,
+                }],
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+            for rule in [
+                Treatment::Show,
+                Treatment::Masked {
+                    placeholder: Some("hidden".into()),
+                },
+                Treatment::Blind {
+                    domain: DomainName("declared".into()),
+                },
+            ] {
+                doc.policy.columns.insert(c.clone(), rule);
+                assert_eq!(
+                    effective(&doc, &snapshot, &records, &c).unwrap(),
+                    withheld(Origin::NeedsRepair)
+                );
+            }
+            doc.route_default = RouteDefault::Show;
+            assert_eq!(
+                effective(&doc, &snapshot, &records, &c).unwrap(),
+                (
+                    Effective::Blind {
+                        domain: DomainName("declared".into())
+                    },
+                    Origin::Explicit
+                )
+            );
+            doc.route_default = RouteDefault::Tokenize;
+        }
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn defaults_cover_every_type() {
         let entries = type_entries();
         let snapshot = snapshot(entries.clone());
@@ -278,7 +445,7 @@ mod tests {
                     RouteDefault::Show => (Effective::Show, Origin::RouteDefault),
                 };
                 assert_eq!(
-                    effective(&doc, &snapshot, reference),
+                    effective(&doc, &snapshot, &RouteBindings::default(), reference),
                     Ok(expected),
                     "{ty:?}"
                 );
@@ -320,8 +487,14 @@ mod tests {
                         .columns
                         .insert(reference.clone(), treatment.clone());
                     assert_eq!(
-                        effective(&doc, &snapshot, reference),
-                        Ok((expected.clone(), Origin::Explicit))
+                        effective(&doc, &snapshot, &RouteBindings::default(), reference),
+                        Ok(
+                            if mode == RouteDefault::Tokenize && treatment == Treatment::Show {
+                                (Effective::Masked { placeholder: None }, Origin::Unbound)
+                            } else {
+                                (expected.clone(), Origin::Explicit)
+                            }
+                        )
                     );
                 }
             }
@@ -355,7 +528,7 @@ mod tests {
                         doc.policy.columns.insert(reference.clone(), treatment);
                     }
                     assert_eq!(
-                        effective(&doc, &snapshot, reference),
+                        effective(&doc, &snapshot, &RouteBindings::default(), reference),
                         Ok((
                             Effective::Masked { placeholder: None },
                             Origin::JsonPathsPending
@@ -381,7 +554,7 @@ mod tests {
             treatment: JsonPathTreatment::Masked,
         });
         assert_eq!(
-            effective(&doc, &empty, &reference),
+            effective(&doc, &empty, &RouteBindings::default(), &reference),
             Err(EffectiveError::UnknownColumn)
         );
         assert_eq!(
@@ -425,7 +598,10 @@ mod tests {
                     ),
                     None => (Effective::Show, Origin::RouteDefault),
                 };
-                assert_eq!(effective(&doc, &snapshot, &reference), Ok(expected));
+                assert_eq!(
+                    effective(&doc, &snapshot, &RouteBindings::default(), &reference),
+                    Ok(expected)
+                );
             }
         }
     }
@@ -448,12 +624,12 @@ mod tests {
             path: vec![],
             treatment: JsonPathTreatment::Masked,
         });
-        let all = effective_all(&doc, &snapshot);
+        let all = effective_all(&doc, &snapshot, &RouteBindings::default());
         assert_eq!(all.len(), entries.len());
         for (reference, _) in entries {
             assert_eq!(
                 all.get(&reference).cloned(),
-                Some(effective(&doc, &snapshot, &reference).unwrap())
+                Some(effective(&doc, &snapshot, &RouteBindings::default(), &reference).unwrap())
             );
         }
     }

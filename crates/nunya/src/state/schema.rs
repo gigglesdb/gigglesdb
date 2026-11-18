@@ -27,10 +27,14 @@ pub enum Table {
     PrincipalCounters,
     /// Idempotent operation records.
     Idempotency,
+    /// Persisted column domain bindings.
+    DomainBindings,
+    /// Permanently reserved private domain names.
+    DomainNames,
 }
 impl Table {
     /// Every application table in schema order.
-    pub const ALL: [Table; 9] = [
+    pub const ALL: [Table; 11] = [
         Self::Principals,
         Self::PrincipalCredentials,
         Self::Grants,
@@ -40,6 +44,8 @@ impl Table {
         Self::SessionCounters,
         Self::PrincipalCounters,
         Self::Idempotency,
+        Self::DomainBindings,
+        Self::DomainNames,
     ];
 
     /// Stable on-disk table name.
@@ -54,6 +60,8 @@ impl Table {
             Self::SessionCounters => "session_counters",
             Self::PrincipalCounters => "principal_counters",
             Self::Idempotency => "idempotency",
+            Self::DomainBindings => "domain_bindings",
+            Self::DomainNames => "domain_names",
         }
     }
 

@@ -447,7 +447,19 @@ pub fn decode_count(bytes: &[u8]) -> Result<u64, ModelError> {
 /// Binary keys for opaque store tables.
 pub mod keys {
     use super::{CredentialId, ModelError, PrincipalId, RouteId, ScopeId, SessionId};
-    use crate::policy::DomainName;
+    use crate::{policy::DomainName, schema::ColumnId};
+    /// Route prefix for persisted column bindings.
+    pub fn domain_binding_prefix(route: &RouteId) -> Vec<u8> {
+        [route.as_str().as_bytes(), &[0]].concat()
+    }
+    /// Route and canonical column identity key.
+    pub fn domain_binding(route: &RouteId, identity: &ColumnId) -> Vec<u8> {
+        [domain_binding_prefix(route), super::encode(identity)].concat()
+    }
+    /// Globally reserved domain name key.
+    pub fn domain_name(name: &DomainName) -> Vec<u8> {
+        name.0.as_bytes().to_vec()
+    }
     /// Principal record key.
     pub fn principal(id: PrincipalId) -> Vec<u8> {
         id.0.to_vec()

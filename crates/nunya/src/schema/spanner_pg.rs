@@ -1,5 +1,7 @@
 //! Spanner PostgreSQL-dialect catalog snapshot loading through PGAdapter.
-use super::{Column, ColumnRef, DependentKind, DependentObject, Relation, RelationKind, Snapshot};
+use super::{
+    Column, ColumnId, ColumnRef, DependentKind, DependentObject, Relation, RelationKind, Snapshot,
+};
 use crate::{
     error::{NyCode, Refusal},
     value::ColumnType,
@@ -23,6 +25,26 @@ fn unavailable() -> Refusal {
 }
 fn get<T: FromSqlOwned>(row: &Row, index: usize) -> Result<T, Refusal> {
     row.try_get(index).map_err(|_| unavailable())
+}
+fn column_identity(
+    schema: &str,
+    table: &str,
+    column: &str,
+    raw_type: &str,
+) -> (ColumnRef, ColumnId) {
+    (
+        ColumnRef {
+            schema: schema.into(),
+            table: table.into(),
+            column: column.into(),
+        },
+        ColumnId::Spanner {
+            schema: schema.into(),
+            table: table.into(),
+            column: column.into(),
+            spanner_type: raw_type.into(),
+        },
+    )
 }
 fn reads(relation: &Relation) -> Vec<ColumnRef> {
     relation
@@ -80,6 +102,7 @@ pub async fn load_spanner_pg_snapshot(
         .iter()
         .map(|row| get::<String>(row, 0))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut column_ids = std::collections::BTreeMap::new();
     let mut relations = Vec::new();
     for row in client
         .query(TABLES, &[&selected])
@@ -104,9 +127,13 @@ pub async fn load_spanner_pg_snapshot(
                 "NO" => false,
                 _ => return Err(unavailable()),
             };
+            let column_name: String = get(&row, 0)?;
+            let raw_type: String = get(&row, 1)?;
+            let (column_ref, id) = column_identity(&schema, &name, &column_name, &raw_type);
+            column_ids.insert(column_ref, id);
             columns.push(Column {
-                name: get(&row, 0)?,
-                ty: map_spanner_pg_type(&get::<String>(&row, 1)?),
+                name: column_name,
+                ty: map_spanner_pg_type(&raw_type),
                 nullable,
                 generated: generated(&get::<String>(&row, 3)?, get(&row, 4)?)?,
                 default: get(&row, 5)?,
@@ -222,12 +249,11 @@ pub async fn load_spanner_pg_snapshot(
             }
         }
     }
-    Ok(Snapshot::new(
-        relations,
-        dependents,
-        search_path.to_vec(),
-        now_unix_ms,
-    ).with_captured_schemas(captured_schemas))
+    Ok(
+        Snapshot::new(relations, dependents, search_path.to_vec(), now_unix_ms)
+            .with_column_ids(column_ids)
+            .with_captured_schemas(captured_schemas),
+    )
 }
 
 /// Map Spanner PostgreSQL type names while preserving unsupported types.
@@ -275,6 +301,51 @@ pub fn map_spanner_pg_type(spanner_type: &str) -> ColumnType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct FakeColumns;
+    impl super::super::spanner_gsql::SqlRunner for FakeColumns {
+        fn query<'a>(&'a self, sql: &'a str) -> super::super::spanner_gsql::QueryResult<'a> {
+            Box::pin(async move {
+                if sql != COLUMNS {
+                    return Err(unavailable());
+                }
+                Ok(vec![
+                    vec![Some("id".into()), Some("bigint".into())],
+                    vec![Some("Label".into()), Some("character varying(42)".into())],
+                ])
+            })
+        }
+    }
+    #[tokio::test]
+    async fn fake_column_query_preserves_exact_identity() {
+        use super::super::spanner_gsql::SqlRunner;
+        let mut ids = std::collections::BTreeMap::new();
+        for row in FakeColumns.query(COLUMNS).await.unwrap() {
+            let (column, id) = column_identity(
+                "public",
+                "items",
+                row[0].as_deref().unwrap(),
+                row[1].as_deref().unwrap(),
+            );
+            ids.insert(column, id);
+        }
+        let snapshot = Snapshot::new(vec![], vec![], vec![], 0).with_column_ids(ids);
+        assert_eq!(snapshot.column_ids.len(), 2);
+        for (column, spanner_type) in [("id", "bigint"), ("Label", "character varying(42)")] {
+            assert_eq!(
+                snapshot.column_id(&ColumnRef {
+                    schema: "public".into(),
+                    table: "items".into(),
+                    column: column.into(),
+                }),
+                Some(&ColumnId::Spanner {
+                    schema: "public".into(),
+                    table: "items".into(),
+                    column: column.into(),
+                    spanner_type: spanner_type.into(),
+                })
+            );
+        }
+    }
     #[test]
     fn type_mapping() {
         for (name, expected) in [

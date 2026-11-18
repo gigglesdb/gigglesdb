@@ -260,6 +260,30 @@ impl Authority {
                 for (key, bytes) in read.scan_prefix(table, b"")? {
                     let bad = || AuthorityError::Store;
                     match table {
+                        Table::DomainBindings => {
+                            let record: crate::policy::bindings::BindingRecord =
+                                decode(&bytes).map_err(|_| bad())?;
+                            let separator = key.iter().position(|b| *b == 0).ok_or_else(bad)?;
+                            let route = std::str::from_utf8(&key[..separator])
+                                .ok().and_then(RouteId::new).ok_or_else(bad)?;
+                            if key != keys::domain_binding(&route, &record.identity) {
+                                return Err(bad());
+                            }
+                        }
+                        Table::DomainNames => {
+                            let separator = bytes.iter().position(|b| *b == 0).ok_or_else(bad)?;
+                            std::str::from_utf8(&bytes[..separator])
+                                .ok().and_then(RouteId::new).ok_or_else(bad)?;
+                            let _: crate::schema::ColumnId =
+                                decode(&bytes[separator + 1..]).map_err(|_| bad())?;
+                            let name = std::str::from_utf8(&key).map_err(|_| bad())?;
+                            if !(1..=31).contains(&name.len())
+                                || !name.as_bytes()[0].is_ascii_lowercase()
+                                || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                            {
+                                return Err(bad());
+                            }
+                        }
                         Table::Principals => {
                             let r: Principal = decode(&bytes).map_err(|_| bad())?;
                             if key != keys::principal(r.id)
