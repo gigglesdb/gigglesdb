@@ -330,3 +330,6 @@ mod user_collation_network;
 mod implicit_block_oracle_network;
 #[path = "pipeline_oracle_network.rs"]
 mod pipeline_oracle_network;
+
+#[path = "agent_credential_pg.rs"]
+mod agent_credential_pg;

@@ -168,7 +168,7 @@ async fn refused_for_wrong_user_unknown_cert_ordinary_cert_revoked_task() {
             .await,
         );
     }
-    // Certificates outside the agent map are dropped before any message.
+    // Certificates outside the agent map take the password path.
     for cert in [&unknown, &ordinary] {
         let got = start(
             &server,
@@ -176,7 +176,7 @@ async fn refused_for_wrong_user_unknown_cert_ordinary_cert_revoked_task() {
             &[("user", "agent_exec"), ("database", "giggles"), ("giggles.task", "inc-436")],
         )
         .await;
-        assert_eq!(got, Startup::Dropped);
+        assert_eq!(got.code(), Some("28P01"));
     }
     let revoked = user("inc-revoked");
     let revoked: Vec<_> = revoked.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -297,10 +297,10 @@ async fn agent_cert_refused_on_legacy_postgres_native_listeners() {
     };
     assert!(call(&agent).await.is_err());
     assert_eq!(call(&ordinary).await.unwrap().code, "ok");
-    // The ordinary certificate is in turn dropped by the agent listener.
+    // The ordinary certificate is asked for a task credential by the agent listener.
     assert_eq!(
-        start(&server, &ordinary, &[("user", "oncall_lead"), ("database", "giggles")]).await,
-        Startup::Dropped
+        start(&server, &ordinary, &[("user", "oncall_lead"), ("database", "giggles")]).await.code(),
+        Some("28P01")
     );
     native.shutdown().await.unwrap();
     legacy_pg.shutdown().await.unwrap();

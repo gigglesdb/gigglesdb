@@ -2465,6 +2465,97 @@ pub(crate) async fn run_agent<S: AsyncRead + AsyncWrite + Unpin>(
     serve_session(s, session, startup, false, &statuses).await
 }
 
+/// SQL-issued credential authentication, always inside the agent listener's TLS.
+pub(crate) async fn run_agent_password<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut S,
+    service: &std::sync::Arc<crate::Service>,
+    databases: &[String],
+    shared: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> io::Result<()> {
+    use crate::pgwire_startup::{
+        StartupPolicy, parse_startup, read_startup_packet, reject_startup,
+    };
+    if !service.admission.request() {
+        return Ok(());
+    }
+    let packet = read_startup_packet(s).await?;
+    if packet.len() == 12 && packet[..4] == 80877102u32.to_be_bytes() {
+        let pid = u32::from_be_bytes(packet[4..8].try_into().unwrap());
+        let secret = u32::from_be_bytes(packet[8..12].try_into().unwrap());
+        service.cancellations.cancel_key("sqlcred:", pid, secret);
+        return Ok(());
+    }
+    // TaskAgent already permits an omitted task; the credential selects it.
+    let startup = match parse_startup(&packet, &StartupPolicy::TaskAgent { databases }) {
+        Ok(startup) => startup,
+        Err((code, reason)) => {
+            reject_startup(s, code, reason).await?;
+            return Ok(());
+        }
+    };
+    let mut out = Vec::new();
+    frame(b'R', &3u32.to_be_bytes(), &mut out).map_err(io::Error::other)?;
+    send(s, &out).await?;
+    let password = timeout(IO_TIMEOUT, async {
+        let tag = s.read_u8().await?;
+        let length = s.read_u32().await?;
+        if tag != b'p' || !(5..=1028).contains(&length) {
+            return Err(io::Error::other("invalid password message"));
+        }
+        let mut body = vec![0; length as usize - 4];
+        s.read_exact(&mut body).await?;
+        if body.pop() != Some(0) || body.contains(&0) {
+            return Err(io::Error::other("invalid password message"));
+        }
+        String::from_utf8(body).map_err(|_| io::Error::other("invalid password message"))
+    })
+    .await;
+    let password = match password {
+        Ok(Ok(password)) => password,
+        _ => return agent_password_error(s, "08P01", "malformed password message").await,
+    };
+    let mut session =
+        match service.credential_session(&password, Some(&startup.user), startup.task.as_deref()) {
+            Ok(session) => session,
+            Err(_) => {
+                eprintln!("protocol=agent_postgres rejected stage=credential");
+                return agent_password_error(
+                    s,
+                    "28P01",
+                    &format!(
+                        "password authentication failed for user \"{}\"",
+                        startup.user,
+                    ),
+                )
+                .await;
+            }
+        };
+    session.connection = Some(shared);
+    session.backend_ssl = true;
+    session.database = Some(startup.database.clone());
+    let statuses = [
+        ("is_superuser", "off".to_owned()),
+        ("session_authorization", startup.user.clone()),
+    ];
+    // false emits AuthenticationOk once; no further challenge is sent here.
+    serve_session(s, session, startup, false, &statuses).await
+}
+
+async fn agent_password_error<S: AsyncWrite + Unpin>(
+    s: &mut S,
+    code: &str,
+    message: &str,
+) -> io::Result<()> {
+    let mut body = b"SFATAL\0VFATAL\0C".to_vec();
+    z(code, &mut body);
+    body.push(b'M');
+    z(message, &mut body);
+    body.push(0);
+    let mut out = Vec::new();
+    frame(b'E', &body, &mut out).map_err(io::Error::other)?;
+    send(s, &out).await
+}
+
 async fn agent_refusal<S: AsyncWrite + Unpin>(s: &mut S) -> io::Result<()> {
     let mut body = b"SFATAL\0VFATAL\0C28000\0M".to_vec();
     z(AGENT_REFUSAL, &mut body);

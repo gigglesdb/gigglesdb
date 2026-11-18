@@ -59,6 +59,13 @@ impl TestCert {
     }
 }
 
+/// A TLS client trusting the fixture CA without presenting a certificate.
+pub fn no_cert_client(ca: &TestCert) -> ClientConfig {
+    ClientConfig::builder()
+        .with_root_certificates(tls::roots(vec![ca.cert.der().clone()]).unwrap())
+        .with_no_client_auth()
+}
+
 /// A CA (no `ca`), or a server or client certificate signed by `ca`.
 pub fn certificate(ca: Option<&TestCert>, server: bool) -> TestCert {
     let key = KeyPair::generate().unwrap();
@@ -240,10 +247,10 @@ impl AgentServer {
             ServiceLimits::default(),
         )
         .unwrap();
-        let tls = tls::server(
+        let tls = tls::server_optional_client(
             vec![server.cert.der().clone()],
             PrivatePkcs8KeyDer::from(server.key.serialize_der()).into(),
-            vec![ca.cert.der().clone()],
+            Some(vec![ca.cert.der().clone()]),
         )
         .unwrap();
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -336,6 +343,10 @@ pub async fn raw_startup(
                 return Startup::Dropped;
             }
             match tag {
+                b'R' if body == 3u32.to_be_bytes() => {
+                    // Raw startup probes answer a password challenge with an empty password.
+                    stream.write_all(&[b'p', 0, 0, 0, 5, 0]).await.unwrap();
+                }
                 b'E' => return error_fields(body),
                 b'S' => {
                     let mut parts = body.split(|b| *b == 0);

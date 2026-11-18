@@ -182,10 +182,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The agent listener has its own TLS config: the same server certificate,
     // and the agent CA for client certificates.
     let mut agent_tls = match &c.agent {
-        Some(agent) => Some(tls::server(
+        Some(agent) => Some(tls::server_optional_client(
             tls::certs(&c.certificate)?,
             tls::key(&c.private_key)?,
-            tls::certs(agent.client_ca.as_deref().unwrap_or(&c.client_ca))?,
+            Some(tls::certs(agent.client_ca.as_deref().unwrap_or(&c.client_ca))?),
         )?),
         None => None,
     };

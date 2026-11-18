@@ -2,7 +2,7 @@
 //! config section and the agent pgwire accept loop.
 //!
 //! The agent listener is a port of its own. Its accept loop accepts only
-//! certificates in the agent binding map and builds only task sessions
+//! certificates or SQL-issued credentials and builds only task sessions
 //! (`Service::agent_session`); the ordinary listeners never build one.
 
 use super::{AgentBinding, AgentLimits};
@@ -143,9 +143,9 @@ impl AgentConfig {
 
 /// Starts a pre-bound agent pgwire listener after the common startup gate opens.
 ///
-/// Per connection, in order: SSLRequest; TLS with the agent CA (`tls`); the
-/// client certificate's fingerprint must be in the agent map, else the
-/// connection is dropped; then `pgwire::run_agent`.
+/// Per connection, in order: SSLRequest; TLS with the agent CA (`tls`);
+/// a known client certificate selects `pgwire::run_agent`; otherwise
+/// `pgwire::run_agent_password` authenticates a SQL-issued credential.
 pub async fn serve_agent_pg_bound(
     listener: TcpListener,
     service: Arc<Service>,
@@ -192,18 +192,20 @@ pub async fn serve_agent_pg_bound(
                             eprintln!("protocol=agent_postgres rejected stage=tls reason=handshake_failed_or_timed_out");
                             return;
                         };
-                        let Some(cert) = stream.get_ref().1.peer_certificates().and_then(|c| c.first()) else {
-                            eprintln!("protocol=agent_postgres rejected stage=tls reason=client_certificate_required");
-                            return;
+                        let fingerprint = stream.get_ref().1.peer_certificates()
+                            .and_then(|c| c.first())
+                            .map(|cert| crate::tls::fingerprint(cert.as_ref()))
+                            .filter(|fp| service.agent_known(fp));
+                        let result = if let Some(fingerprint) = fingerprint {
+                            crate::pgwire::run_agent(
+                                &mut stream, &service, &fingerprint, &databases, shared,
+                            ).await
+                        } else {
+                            crate::pgwire::run_agent_password(
+                                &mut stream, &service, &databases, shared,
+                            ).await
                         };
-                        let fingerprint = crate::tls::fingerprint(cert.as_ref());
-                        if !service.agent_known(&fingerprint) {
-                            eprintln!("protocol=agent_postgres rejected stage=binding reason=client_certificate_not_authorized");
-                            return;
-                        }
-                        if let Err(error) = crate::pgwire::run_agent(
-                            &mut stream, &service, &fingerprint, &databases, shared,
-                        ).await {
+                        if let Err(error) = result {
                             eprintln!("protocol=agent_postgres closed stage=wire io_kind={:?}", error.kind());
                         }
                     });
