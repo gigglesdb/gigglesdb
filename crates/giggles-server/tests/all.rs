@@ -351,3 +351,5 @@ mod agent_credential_lifecycle;
 
 #[path = "float_errors_network.rs"]
 mod float_errors_network;
+#[path = "r3_exit_writers.rs"]
+mod r3_exit_writers;
