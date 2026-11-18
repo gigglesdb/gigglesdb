@@ -449,6 +449,26 @@ pub(crate) fn application_schemas(
         .collect()
 }
 
+/// Detection only: placeholder types must never reach catalog evaluation.
+pub(crate) fn task_detection_schemas(
+    session: &crate::Session,
+    snapshot: &giggles_pg_catalog::CatalogSnapshot,
+) -> std::collections::BTreeMap<String, Vec<Field>> {
+    let mut detection = snapshot.clone();
+    for table in &mut detection.tables {
+        for column in &mut table.columns {
+            use giggles_pg_catalog::ScalarType as S;
+            if !matches!(column.data_type,
+                S::Boolean | S::SmallInt | S::Integer | S::BigInt | S::Text | S::Varchar
+                | S::Bpchar | S::Bytes | S::Numeric | S::Real | S::DoublePrecision
+            ) {
+                column.data_type = S::Text;
+            }
+        }
+    }
+    application_schemas(session, &detection)
+}
+
 pub(crate) fn with_search_path(
     mut snapshot: giggles_pg_catalog::CatalogSnapshot,
     path: &str,

@@ -355,7 +355,6 @@ async fn message_never_contains_table_or_value_text() {
 /// while native answers `not_allowed` (0A000, class Other) as the two-table
 /// join row does. Table 4(a) classifies every join as Other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "R3-1002: SQL self-join is refused with a generic 42501, native with NotAllowed(Other); see S15 report"]
 async fn self_join_refusal_identical_on_every_surface() {
     let f = ParityFixture::start_with_credential().await;
     let column = |source| json!({"column": {"source": source, "name": "status"}});
@@ -389,7 +388,6 @@ async fn self_join_refusal_identical_on_every_surface() {
 
 /// The rows marked `known_bug`, asserted as the design requires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "R3-1002: catalog subquery on a table with a timestamptz column misses the D12 check; see S15 report"]
 async fn known_bug_rows_refused_as_designed() {
     let f = ParityFixture::start_with_credential().await;
     for row in rows().into_iter().filter(|row| row.known_bug.is_some()) {

@@ -260,6 +260,10 @@ async fn catalog_only_subquery_is_filtered_and_uncharged() {
 async fn mixed_subqueries_are_denied_and_uncharged() {
     let (server, _agent, _ordinary, mut wire) = agent_wire().await;
     seed(&server);
+    // Detection must retain a table even when catalog evaluation cannot type it.
+    server.admin.sql_session().execute(
+        "ALTER TABLE shipments ADD COLUMN observed_at timestamptz", &[], None,
+    ).unwrap();
     let task = server.admin.tasks().get("inc-436").unwrap().unwrap().id;
     let before = server.admin.task_disclosure(task).unwrap();
     let queries = [

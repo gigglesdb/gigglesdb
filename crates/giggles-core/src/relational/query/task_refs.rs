@@ -332,11 +332,9 @@ impl Query {
             .any(|(i, _)| matches!(i, Item::Star | Item::QualifiedStar { .. }))
     }
 
-    /// True when the query reads no relation in its FROM list (`SELECT 1`,
-    /// `SELECT now()`). Unlike `is_table_free`, calls do not count: the task
-    /// column rules judge them (design 3.2).
-    pub(in crate::relational) fn task_has_no_sources(&self) -> bool {
-        self.sources.is_empty()
+    /// Joins remain joins even when every source names the same table.
+    pub(in crate::relational) fn task_has_join(&self) -> bool {
+        self.sources.len() > 1
     }
 
     /// Test hook: whether any call in this query is volatile.

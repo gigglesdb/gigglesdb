@@ -47,9 +47,8 @@ impl Prepared {
                     StatementClass::Catalog
                 } else if q.explain {
                     StatementClass::Explain
-                } else if !q.task_has_no_sources() && q.target() == "giggles_join" {
-                    // Table 4(a) keys on `table() == Some("giggles_join")`; a table-free
-                    // SELECT has `table() == None` and stays Select (design 3.2: driver pings).
+                } else if q.task_has_join() {
+                    // Table 4(a) refuses every join, including a self-join.
                     StatementClass::Other
                 } else {
                     StatementClass::Select
@@ -116,6 +115,7 @@ mod tests {
                 "SELECT a.id FROM shipments a JOIN others b ON a.id = b.id",
                 StatementClass::Other,
             ),
+            ("SELECT s.status FROM shipments s JOIN shipments t ON s.status = t.status", StatementClass::Other),
             ("SELECT ROW(1, 'a')::pair", StatementClass::Other),
             ("SELECT id FROM shipments UNION SELECT id FROM others", StatementClass::Other),
             ("WITH q AS (SELECT id FROM shipments) SELECT id FROM q", StatementClass::Other),

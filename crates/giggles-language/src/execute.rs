@@ -2161,6 +2161,7 @@ pub(crate) fn error(error: operations::Error) -> Error {
         operations::Error::PlanRequired => Error::PlanRequired,
         operations::Error::Duplicate => Error::Duplicate,
         operations::Error::Sql { sqlstate } => Error::Sql { sqlstate },
+        operations::Error::Task(error) => Error::Sql { sqlstate: error.sqlstate().into() },
     }
 }
 

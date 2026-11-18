@@ -790,6 +790,7 @@ pub(crate) fn encode_error(v: o::Error) -> p::NativeError {
         o::Error::PlanRequired => 18,
         o::Error::Duplicate => 19,
         o::Error::Sql { .. } => 20,
+        o::Error::Task(_) => 20,
     };
     p::NativeError {
         kind,

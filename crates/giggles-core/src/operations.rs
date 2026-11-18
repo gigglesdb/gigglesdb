@@ -118,6 +118,9 @@ pub enum Error {
     PlanRequired,
     Duplicate,
     Sql { sqlstate: String },
+    /// Process-local task diagnostics; never part of the serialized operation format.
+    #[serde(skip)]
+    Task(crate::task::TaskError),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -130,6 +133,7 @@ impl Error {
     pub fn sqlstate(&self) -> Option<&str> {
         match self {
             Self::Sql { sqlstate } => Some(sqlstate),
+            Self::Task(error) => Some(error.sqlstate()),
             Self::Duplicate => Some("23505"),
             Self::Overflow => Some("22003"),
             Self::DivisionByZero => Some("22012"),
@@ -757,9 +761,13 @@ fn bind_request_planned(
     let (table, operation) = bind_table(table, request, bindings, session.max_read_rows())?;
     Ok((table, operation, None))
 }
-/// A task refusal on the native surface keeps its SQLSTATE.
+/// A task refusal on the native surface keeps its SQLSTATE. Denials also
+/// retain the rule: 42501 alone cannot identify its fixed diagnostic.
 fn task_error(e: crate::task::TaskError) -> Error {
-    Error::Sql { sqlstate: e.sqlstate().into() }
+    match e {
+        crate::task::TaskError::Denied(_) => Error::Task(e),
+        _ => Error::Sql { sqlstate: e.sqlstate().into() },
+    }
 }
 /// `core`, except that a task refusal keeps its SQLSTATE (`task_error`).
 fn core_or_task(e: CoreError) -> Error {
@@ -3314,6 +3322,15 @@ fn insert_many(
 #[cfg(test)]
 mod duplicate_error_encoding_regression {
     use super::Error;
+    #[test]
+    fn task_diagnostics_are_process_local() {
+        let task = crate::task::TaskError::Denied(crate::task::DenyRule::ColumnNotAvailable);
+        let error = super::task_error(task.clone());
+        assert_eq!(error, Error::Task(task));
+        assert_eq!(error.sqlstate(), Some("42501"));
+        assert!(bincode::serialize(&error).is_err());
+    }
+
     #[test]
     fn existing_error_bytes_are_stable() {
         let errors = [

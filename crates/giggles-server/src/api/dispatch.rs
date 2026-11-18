@@ -848,6 +848,9 @@ fn execute_released(
                 native::NativeResult::Transaction(outcome) => Some(P::TransactionOutcome(
                     native_codec::encode_transaction_outcome(outcome)?,
                 )),
+                native::NativeResult::Error(giggles_core::operations::Error::Task(error)) => {
+                    return codec::encode_error(&giggles_core::CoreError::Task(error), state);
+                }
                 native::NativeResult::Error(error) => {
                     reply.code = if error == giggles_core::operations::Error::Unknown {
                         "08007"

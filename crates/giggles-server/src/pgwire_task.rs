@@ -371,6 +371,14 @@ impl State {
                     self.diagnostic.core(session.catalog_snapshot_with_typmods())?;
                 let snapshot =
                     catalog_wire::snapshot(session, epoch, tables, indexes, typmods, types)?;
+                let detection = catalog_wire::task_detection_schemas(session, &snapshot);
+                if let Ok(Some(plan)) = giggles_pg_catalog::plan_gateway_with_relations(sql, &detection)
+                    && plan.contains_subquery() && !plan.user_relations().is_empty()
+                {
+                    let error = CoreError::Task(TaskError::Denied(giggles_core::task::DenyRule::Subquery));
+                    self.diagnostic.task_refusal = Some((StatementClass::Catalog, error.clone()));
+                    return self.diagnostic.core(Err(error));
+                }
                 let relations = catalog_wire::application_schemas(session, &snapshot);
                 giggles_pg_catalog::plan_gateway_with_relations(sql, &relations)
             }
@@ -425,7 +433,17 @@ impl State {
                 .core(Err(CoreError::Task(TaskError::OperationIdRequired)));
         }
         admit(&mut self.diagnostic, session, class)?;
-        let (plan, description) = prepare_declared_sql(session, sql, oids, false)?;
+        let declared = oids.iter().map(|&oid| core_declared_type(oid)).collect::<Vec<_>>();
+        let prepared = session.prepare_with_parameter_types(sql, &declared);
+        if let Err(error @ CoreError::Task(_)) = &prepared {
+            self.diagnostic.task_refusal = Some((class, error.clone()));
+        }
+        let prepared = self.diagnostic.core(prepared)?;
+        let description = self.diagnostic.core(session.describe(&prepared))?;
+        if oids.len() > description.parameters.len() {
+            return Err("08P01");
+        }
+        let plan = Plan::Sql(Box::new(prepared));
         // The bound statement must be what was admitted.
         if plan_class(&plan) != Some(class) {
             return Err(refuse(&mut self.diagnostic, StatementClass::Other));

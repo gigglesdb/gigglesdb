@@ -174,16 +174,19 @@ async fn disclosure_charge_equal_on_every_wire_format() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "R3-1003: hidden/masked column denial is not a task refusal: pgwire sends plain 42501 'request rejected; consult documented code', native sends code native_error; see S15 report"]
 async fn hidden_and_masked_column_denials_identical() {
-    for case in [
-        Case::new(
-            "SELECT card_token FROM shipments",
-            "shipments select card_token",
+    use giggles_core::task::DenyRule;
+    for (case, rule) in [
+        (
+            Case::new("SELECT card_token FROM shipments", "shipments select card_token"),
+            DenyRule::ColumnNotAvailable,
         ),
-        Case::new(
-            "SELECT id FROM shipments WHERE customer_email = 'customer1@example.com'",
-            "shipments where customer_email = \"customer1@example.com\" select id",
+        (
+            Case::new(
+                "SELECT id FROM shipments WHERE customer_email = 'customer1@example.com'",
+                "shipments where customer_email = \"customer1@example.com\" select id",
+            ),
+            DenyRule::MaskedColumnPosition,
         ),
     ] {
         let mut seen = Vec::new();
@@ -193,10 +196,8 @@ async fn hidden_and_masked_column_denials_identical() {
             let before = state(&f, &[]);
             let o = f.run(surface, &case).await;
             error(&o, "42501");
-            assert!(
-                o.message.is_some(),
-                "{surface:?}: denial must retain its message: {o:?}"
-            );
+            assert_eq!(o.task_error.as_deref(), Some("denied"), "{surface:?}: {o:?}");
+            assert_eq!(o.message.as_deref(), Some(rule.message()), "{surface:?}: {o:?}");
             let after = state(&f, &[]);
             assert_eq!(after.rows, before.rows);
             assert_eq!(after.disclosure.0, 0);
