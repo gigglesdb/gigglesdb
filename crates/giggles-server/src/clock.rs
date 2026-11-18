@@ -5,12 +5,17 @@ use std::{
 };
 
 #[cfg(test)]
+type SqlWallProbe = Box<dyn FnMut() -> Duration + Send>;
+
+#[cfg(test)]
 type CertificationProbe = Box<dyn Fn(u64) + Send + Sync>;
 
 /// Time accuracy is an operator assumption. A suspend or clock discontinuity
 /// latches failure until restart under a corrected host clock.
 pub struct Clock {
-    state: Mutex<(Instant, u64, bool)>,
+    state: Mutex<(Instant, u64, bool, Option<i64>)>,
+    #[cfg(test)]
+    sql_wall: Mutex<Option<SqlWallProbe>>,
     skew: u64,
     max_pause: Duration,
     #[cfg(test)]
@@ -22,7 +27,9 @@ impl Clock {
             return Err(CoreError::Limit);
         }
         Ok(Self {
-            state: Mutex::new((Instant::now(), wall()?, false)),
+            state: Mutex::new((Instant::now(), wall()?, false, None)),
+            #[cfg(test)]
+            sql_wall: Mutex::new(None),
             skew: skew_seconds,
             max_pause: Duration::from_secs(max_pause_seconds),
             #[cfg(test)]
@@ -30,13 +37,21 @@ impl Clock {
         })
     }
     /// SQL time is not policy time: sampling does not certify or persist a watermark.
+    /// PostgreSQL does not fail statements for sub-second steps: clamp them;
+    /// whole-second backward steps still latch clock uncertainty.
     pub fn sql_micros(&self) -> Result<i64, CoreError> {
         let mut s = self.state.lock().map_err(|_| uncertain())?;
         let sampled_at = Instant::now();
-        let sample = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
-            s.2 = true;
-            uncertain()
-        })?;
+        #[cfg(test)]
+        let injected = self.sql_wall.lock().unwrap().as_mut().map(|probe| probe());
+        #[cfg(not(test))]
+        let injected: Option<Duration> = None;
+        let sample = injected
+            .map_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH), Ok)
+            .map_err(|_| {
+                s.2 = true;
+                uncertain()
+            })?;
         let now = sample.as_secs();
         let elapsed = s.0.elapsed();
         if s.2
@@ -54,8 +69,13 @@ impl Clock {
                 s.2 = true;
                 uncertain()
             })?;
-        *s = (sampled_at, now, false);
+        let micros = s.3.map_or(micros, |last| micros.max(last));
+        *s = (sampled_at, now, false, Some(micros));
         Ok(micros)
+    }
+    #[cfg(test)]
+    pub(crate) fn set_sql_wall(&self, probe: SqlWallProbe) {
+        *self.sql_wall.lock().unwrap() = Some(probe);
     }
     #[cfg(test)]
     pub(crate) fn latch_uncertain(&self) {
@@ -89,7 +109,7 @@ impl Clock {
         if let Some(probe) = self.after_certification.lock().unwrap().as_ref() {
             probe(now);
         }
-        *s = (sampled_at, now, false);
+        *s = (sampled_at, now, false, s.3);
         Ok((lower, upper))
     }
 }
@@ -125,6 +145,24 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Admin::create(dir.join("db.redb"), Default::default()).unwrap()
+    }
+    #[test]
+    fn sql_subsecond_backward_step_is_clamped() {
+        let c = Clock::new(0, 10).unwrap();
+        let t = Duration::from_secs(wall().unwrap()) + Duration::from_millis(500);
+        let mut samples = [
+            t,
+            t - Duration::from_micros(1400),
+            t + Duration::from_micros(5),
+        ]
+        .into_iter();
+        c.set_sql_wall(Box::new(move || samples.next().unwrap()));
+        let expected = i64::try_from(t.as_micros()).unwrap() - 946_684_800_000_000;
+        assert_eq!(c.sql_micros().unwrap(), expected);
+        assert_eq!(c.sql_micros().unwrap(), expected);
+        assert_eq!(c.sql_micros().unwrap(), expected + 5);
+        assert!(!c.state.lock().unwrap().2);
+        assert!(c.now(&admin()).is_ok());
     }
     #[test]
     fn sql_sample_matches_host_and_inherits_policy_latch() {

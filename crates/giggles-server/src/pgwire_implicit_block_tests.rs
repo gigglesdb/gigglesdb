@@ -5,12 +5,15 @@ use giggles_core::{Admin, Engine, Limits, roles::NewRole};
 static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn fixture() -> Session {
+    fixture_with_clock(crate::clock::Clock::new(0, 3600).unwrap())
+}
+fn fixture_with_clock(clock: crate::clock::Clock) -> Session {
     let path = crate::test_support::fixture_root().join(format!("implicit-block-{}-{}-{}",
         SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
     admin.roles().create(NewRole { name: "owner".into(), login: true, superuser: true, ..Default::default() }).unwrap();
-    let service = crate::Service::new(admin, vec![], crate::clock::Clock::new(0, 3600).unwrap()).unwrap();
+    let service = crate::Service::new(admin, vec![], clock).unwrap();
     service.role_session("owner").unwrap()
 }
 fn state() -> State {
@@ -323,4 +326,40 @@ fn unnamed_cache_lru_capacity() {
     parse_sql(&mut state, &mut session, sql).unwrap();
     let miss = giggles_core::metadata_read_counts::take();
     assert_eq!(miss[2], hit[2] + 1);
+}
+
+#[test]
+fn extended_implicit_block_survives_subsecond_backward_step() {
+    use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let clock = crate::clock::Clock::new(0, 3600).unwrap();
+    let active = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let enabled = active.clone();
+    let sampled = calls.clone();
+    let mut anchor = None;
+    clock.set_sql_wall(Box::new(move || {
+        let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        if !enabled.load(Ordering::Relaxed) {
+            return wall;
+        }
+        let t = *anchor.get_or_insert(Duration::from_secs(wall.as_secs()) + Duration::from_millis(500));
+        let call = sampled.fetch_add(1, Ordering::Relaxed);
+        if call == 0 { t } else { t - Duration::from_micros(1400) }
+    }));
+    let mut session = fixture_with_clock(clock);
+    session.execute_sql("CREATE TABLE t (id INT PRIMARY KEY)", &[]).unwrap();
+    let mut state = state();
+    active.store(true, Ordering::Relaxed);
+    let out = extended(&mut state, &mut session, "INSERT INTO t VALUES (1)").unwrap();
+    assert!(calls.load(Ordering::Relaxed) >= 3, "BEGIN, Execute and Sync must sample the clock");
+    assert!(!session.in_transaction());
+    let mut at = 0;
+    while at < out.len() {
+        assert_ne!(out[at], b'E', "unexpected ErrorResponse");
+        at += 1 + u32::from_be_bytes(out[at + 1..at + 5].try_into().unwrap()) as usize;
+    }
+    let out = extended(&mut state, &mut session, "SELECT id FROM t").unwrap();
+    assert_eq!(text_rows(&out), vec![vec!["1"]]);
+    assert!(!session.in_transaction());
 }
