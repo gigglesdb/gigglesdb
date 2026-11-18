@@ -548,6 +548,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "getrandom 0.3.4",
+ "giggles-glibm-loader",
  "giggles-icu",
  "giggles-pg-types",
  "giggles-transactions",
@@ -565,6 +566,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "giggles-glibm-loader"
+version = "0.1.0"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]
