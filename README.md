@@ -1,3 +1,5 @@
+<p align="center"><img src="brand/gigglesdb-boulder.svg" alt="GigglesDB Boulder logo" width="360"></p>
+
 # GigglesDB
 
 GigglesDB is a Rust database with an embedded SQL engine, distributed consensus,

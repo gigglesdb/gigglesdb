@@ -1,3 +1,5 @@
+<p align="center"><img src="../../brand/skedaddle-boulder.svg" alt="Skedaddle Boulder logo" width="360"></p>
+
 # Skedaddle
 
 Skedaddle is a database migration tool with an engine-neutral coordinator and

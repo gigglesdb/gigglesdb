@@ -1,3 +1,5 @@
+<p align="center"><img src="../../brand/nunya-boulder.svg" alt="Nunya Boulder logo" width="360"></p>
+
 **Documentation:** [Nunya site](site/index.html) | [Quickstart](site/docs/quickstart.html) | [Reference](site/docs/index.html)
 
 # Nunya
