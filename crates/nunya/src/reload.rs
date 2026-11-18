@@ -73,12 +73,13 @@ pub(crate) struct Hub {
     /// Service lifecycle and management audit log.
     pub(crate) log: ReloadableLog,
     watch_ms: Option<u64>,
+    service: crate::policy::ServicePolicySettings,
 }
 fn hash(bytes: &[u8]) -> String {
     data_encoding::HEXLOWER.encode(&Sha256::digest(bytes))
 }
-fn parse(path: &Path, bytes: &[u8]) -> Result<Policy, String> {
-    parse_policy_bytes(path, bytes).map_err(crate::serve::errors)
+fn parse(path: &Path, bytes: &[u8], service: &crate::policy::ServicePolicySettings) -> Result<Policy, String> {
+    parse_policy_bytes(path, bytes, service).map_err(crate::serve::errors)
 }
 impl Hub {
     /// Report data-free readiness for every configured route.
@@ -142,6 +143,7 @@ impl Hub {
     pub(crate) fn new(
         routes: &[(RouteId, PathBuf)],
         watch_ms: Option<u64>,
+        service: crate::policy::ServicePolicySettings,
     ) -> Result<Arc<Self>, String> {
         let mut units: Vec<Unit> = Vec::new();
         let mut configured = Vec::new();
@@ -154,7 +156,7 @@ impl Hub {
                 index
             } else {
                 let bytes = std::fs::read(path).map_err(|_| "policy file unavailable")?;
-                let policy = Arc::new(parse(path, &bytes)?);
+                let policy = Arc::new(parse(path, &bytes, &service)?);
                 if units
                     .first()
                     .is_some_and(|unit| readlog_key(&unit.policy.readlog) != readlog_key(&policy.readlog))
@@ -193,6 +195,7 @@ impl Hub {
             ),
             state: Mutex::new(State { units, configured }),
             watch_ms,
+            service,
         }))
     }
     /// Set the service config revision on every unit and the lifecycle log.
@@ -377,7 +380,7 @@ impl Hub {
         let digest = bytes.as_ref().ok().map(|b| hash(b));
         let candidate = bytes
             .map_err(|_| "policy file unavailable".to_owned())
-            .and_then(|b| parse(path, &b));
+            .and_then(|b| parse(path, &b, &self.service));
         match self.apply(unit, candidate, digest) {
             Ok(()) => eprintln!("serve: policy reloaded"),
             Err(e) => eprintln!(
@@ -597,6 +600,7 @@ mod tests {
                 configured: vec![(id("postgres"), 0)],
             }),
             watch_ms: None,
+            service: crate::policy::ServicePolicySettings::default(),
         }
     }
     struct Files {
@@ -632,7 +636,7 @@ mod tests {
         fn hub(&self) -> Arc<Hub> {
             Hub::new(
                 &[(id("a"), self.a.clone()), (id("b"), self.b.clone())],
-                None,
+                None, crate::policy::ServicePolicySettings::default()
             )
             .unwrap()
         }
@@ -712,7 +716,7 @@ mod tests {
                 (id("a"), files.a.clone()),
                 (id("b"), files.dir.join(".").join("a.toml")),
             ],
-            None,
+            None, crate::policy::ServicePolicySettings::default()
         )
         .unwrap();
         assert_eq!(shared.state.lock().unwrap().units.len(), 1);
@@ -827,7 +831,7 @@ mod tests {
         );
         let changed = parse(
             &files.a,
-            b"[readlog]\nsink='file'\npath='read.log'\nmax_bytes=1\n",
+            b"[readlog]\nsink='file'\npath='read.log'\nmax_bytes=1\n", &crate::policy::ServicePolicySettings::default()
         )
         .unwrap();
         assert!(hub.apply(0, Ok(changed), Some(hash(b"changed"))).is_err());
@@ -837,7 +841,7 @@ mod tests {
     async fn unit_retains_named_path_for_reload() {
         let files = Files::new();
         let named = files.dir.join("./a.toml");
-        let hub = Hub::new(&[(id("a"), named.clone())], None).unwrap();
+        let hub = Hub::new(&[(id("a"), named.clone())], None, crate::policy::ServicePolicySettings::default()).unwrap();
         assert_eq!(hub.state.lock().unwrap().units[0].path, named);
         assert_eq!(hub.state.lock().unwrap().units[0].identity, std::fs::canonicalize(&named).unwrap());
         files.write(&files.a, 70000);
@@ -863,7 +867,7 @@ mod tests {
         }
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &named).unwrap();
-        let hub = Hub::new(&[(id("a"), named.clone()), (id("b"), target.clone())], None).unwrap();
+        let hub = Hub::new(&[(id("a"), named.clone()), (id("b"), target.clone())], None, crate::policy::ServicePolicySettings::default()).unwrap();
         assert_eq!(hub.state.lock().unwrap().units.len(), 1);
         assert!(files.dir.join("read.log").exists());
         assert!(!target_dir.join("read.log").exists());
@@ -885,7 +889,7 @@ mod tests {
         let bytes = b"[readlog]\nsink='file'\npath='audit.log'\n";
         std::fs::write(&files.a, bytes).unwrap();
         assert_eq!(files.hub_error(), "policy files name different read logs");
-        let candidate = parse(&files.a, bytes).unwrap();
+        let candidate = parse(&files.a, bytes, &crate::policy::ServicePolicySettings::default()).unwrap();
         assert_eq!(
             h.apply(0, Ok(candidate), Some(hash(bytes))).unwrap_err(),
             "policy files name different read logs"
@@ -900,11 +904,11 @@ mod tests {
         files.write(&files.a, 60000);
         let single = Hub::new(
             &[(id("a"), files.a.clone()), (id("b"), files.a.clone())],
-            None,
+            None, crate::policy::ServicePolicySettings::default()
         )
         .unwrap();
         single
-            .apply(0, Ok(parse(&files.a, bytes).unwrap()), Some(hash(bytes)))
+            .apply(0, Ok(parse(&files.a, bytes, &crate::policy::ServicePolicySettings::default()).unwrap()), Some(hash(bytes)))
             .unwrap();
         assert_eq!(
             single.policy_revision_for(&id("a")),
@@ -920,7 +924,7 @@ mod tests {
         fn hub_error(&self) -> String {
             match Hub::new(
                 &[(id("a"), self.a.clone()), (id("b"), self.b.clone())],
-                None,
+                None, crate::policy::ServicePolicySettings::default()
             ) {
                 Ok(_) => panic!("expected audit sink mismatch"),
                 Err(e) => e,
@@ -982,7 +986,7 @@ mod tests {
         let files = Files::new();
         let h = Hub::new(
             &[(id("a"), files.a.clone()), (id("b"), files.b.clone())],
-            Some(5),
+            Some(5), crate::policy::ServicePolicySettings::default()
         )
         .unwrap();
         let b = h.policy_for(&id("b")).unwrap();
@@ -1076,7 +1080,7 @@ mod tests {
     async fn config_poll_is_independent_and_policy_triggers_reread_config() {
         let files = crate::config_reload::tests::Fixture::new();
         let route = id("pg");
-        let hub = Hub::new(&[(route, files.dir.join("policy"))], Some(5)).unwrap();
+        let hub = Hub::new(&[(route, files.dir.join("policy"))], Some(5), crate::policy::ServicePolicySettings::default()).unwrap();
         let startup = crate::config::Config::load(&files.path).unwrap();
         let config = Arc::new(crate::config_reload::ConfigReloader::new(startup, Arc::downgrade(&hub)));
         files.load(&files.text.replace("max_connections=256", "max_connections=257"));
@@ -1233,7 +1237,7 @@ mod tests {
                 (id("postgres"), policy_path.clone()),
                 (id("spanner-native"), policy_path.clone()),
             ],
-            Some(100),
+            Some(100), crate::policy::ServicePolicySettings::default()
         )
         .unwrap();
         h.set_config_revision("config-test").unwrap();
@@ -1402,6 +1406,21 @@ mod tests {
         assert_eq!(revision.as_deref(), Some("R2"));
         assert_eq!(current.snapshot_max_age_ms, 42);
         assert_eq!(initial.snapshot_max_age_ms, 60000);
+    }
+
+
+    #[tokio::test]
+    async fn service_settings_survive_policy_reload() {
+        let files = Files::new();
+        std::fs::write(&files.a, "").unwrap();
+        let service = crate::policy::ServicePolicySettings { readlog: Some(ReadLogSink::Stdout), snapshot_max_age_ms: Some(123) };
+        let h = Hub::new(&[(id("a"), files.a.clone())], None, service).unwrap();
+        assert_eq!(h.policy_for(&id("a")).unwrap().snapshot_max_age_ms, 123);
+        std::fs::write(&files.a, "# updated policy\n").unwrap();
+        manual_reload(&h).await;
+        assert_eq!(h.policy_for(&id("a")).unwrap().snapshot_max_age_ms, 123);
+        assert_eq!(h.policy_for(&id("a")).unwrap().readlog, ReadLogSink::Stdout);
+        assert_eq!(h.state.lock().unwrap().units[0].last, "applied");
     }
 
 }

@@ -75,6 +75,7 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
         management: a_management,
         postgres_route_id: a_postgres_route_id,
         spanner_route_id: a_spanner_route_id,
+        policy_settings: a_policy_settings,
         standing: a_standing,
     } = running;
     let Config {
@@ -100,6 +101,7 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
         management: b_management,
         postgres_route_id: b_postgres_route_id,
         spanner_route_id: b_spanner_route_id,
+        policy_settings: b_policy_settings,
         standing: b_standing,
     } = new;
     let mut diff = Diff::default();
@@ -110,6 +112,8 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
             }
         };
     }
+    changed!(restart_only, "readlog", a_policy_settings.readlog != b_policy_settings.readlog);
+    changed!(restart_only, "snapshot_max_age_ms", a_policy_settings.snapshot_max_age_ms != b_policy_settings.snapshot_max_age_ms);
     changed!(restart_only, "listen", a_listen != b_listen);
     changed!(
         restart_only,
@@ -249,6 +253,7 @@ fn copy_verifier(v: &ScramVerifier) -> ScramVerifier {
 /// Copy startup settings without rereading a potentially edited file.
 pub(crate) fn copy_config(c: &Config) -> Config {
     Config {
+        policy_settings: c.policy_settings.clone(),
         path: c.path.clone(),
         revision: c.revision.clone(),
         listen: c.listen,
@@ -776,7 +781,7 @@ key_file='key'
         }
         pub(crate) fn hub(&self) -> Arc<Hub> {
             let id = crate::state::model::RouteId::new("pg").unwrap();
-            let hub = Hub::new(&[(id, self.dir.join("policy"))], None).unwrap();
+            let hub = Hub::new(&[(id, self.dir.join("policy"))], None, Config::load(&self.path).unwrap().policy_settings).unwrap();
             hub.set_config_revision(&Config::load(&self.path).unwrap().revision)
                 .unwrap();
             hub
@@ -1396,7 +1401,7 @@ key_file='key'
             let transports = Transports::new(&cfg).unwrap();
             let pg = PgFixture::new();
             let original = pg.ctx.snapshot.read().unwrap().clone();
-            let hub = Hub::new(&[(pg.ctx.route.clone(), f.dir.join("policy"))], None).unwrap();
+            let hub = Hub::new(&[(pg.ctx.route.clone(), f.dir.join("policy"))], None, cfg.policy_settings.clone()).unwrap();
             let reload = ConfigReloader::new(cfg, Arc::downgrade(&hub));
             reload.attach_transports(transports.clone());
             let source_snapshot = (*original).clone();
@@ -1493,6 +1498,18 @@ key_file='key'
         first.await.unwrap(); second.await.unwrap();
         assert_eq!(reload.state.lock().unwrap().attempts, 2);
         assert_eq!(reload.last_reload(), "applied");
+    }
+
+
+    #[test]
+    fn service_policy_settings_require_restart() {
+        let f = Fixture::new();
+        let running = f.load(&f.text);
+        let mut new = copy_config(&running);
+        new.policy_settings.readlog = Some(crate::policy::ReadLogSink::Stdout);
+        assert_eq!(classify(&running, &new).restart_only, ["readlog"]);
+        new.policy_settings = crate::policy::ServicePolicySettings { snapshot_max_age_ms: Some(42), ..Default::default() };
+        assert_eq!(classify(&running, &new).restart_only, ["snapshot_max_age_ms"]);
     }
 
 }

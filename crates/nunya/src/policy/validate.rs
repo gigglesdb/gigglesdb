@@ -59,6 +59,9 @@ pub fn validate(policy: &Policy, snapshot: &Snapshot) -> Result<(), Vec<PolicyEr
     let mut errors = vec![];
     let mut families: BTreeMap<&DomainName, Vec<(ColumnType, &ColumnRef)>> = BTreeMap::new();
     for (column, treatment) in &policy.columns {
+        if matches!(treatment, Treatment::Show) {
+            continue;
+        }
         let context = format!("column {}", column_name(column));
         let relation = snapshot.resolve_relation(Some(&column.schema), &column.table);
         match relation {
@@ -77,6 +80,7 @@ pub fn validate(policy: &Policy, snapshot: &Snapshot) -> Result<(), Vec<PolicyEr
             continue;
         };
         match treatment {
+            Treatment::Show => (),
             Treatment::Masked { placeholder } => {
                 if placeholder.is_some() && !schema_column.ty.is_textual() {
                     error(
@@ -181,7 +185,7 @@ pub fn validate(policy: &Policy, snapshot: &Snapshot) -> Result<(), Vec<PolicyEr
             let treatment = match policy.treatment(column) {
                 Some(Treatment::Blind { .. }) => "blind",
                 Some(Treatment::Masked { .. }) => "masked",
-                None => continue,
+                Some(Treatment::Show) | None => continue,
             };
             errors.push(PolicyError {
                 message: format!(
@@ -440,5 +444,24 @@ mod tests {
             .iter_mut()
             .for_each(|c| c.ty = ColumnType::Text);
         assert!(validate(&policy, &snapshot).is_ok());
+    }
+
+    #[test]
+    fn show_is_validated_like_an_absent_column() {
+        let policy = Policy {
+            columns: [(
+                ColumnRef {
+                    schema: "missing".into(),
+                    table: "missing".into(),
+                    column: "missing".into(),
+                },
+                Treatment::Show,
+            )]
+            .into(),
+            domains: BTreeMap::new(),
+            snapshot_max_age_ms: 60000,
+            readlog: super::super::ReadLogSink::Stdout,
+        };
+        assert!(validate(&policy, &Snapshot::new(vec![], vec![], vec![], 0)).is_ok());
     }
 }

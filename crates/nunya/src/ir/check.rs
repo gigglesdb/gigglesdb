@@ -289,7 +289,7 @@ pub fn check(
                     Some(Treatment::Masked { placeholder }) => OutputRewrite::Mask {
                         placeholder: placeholder.clone(),
                     },
-                    Some(Treatment::Blind { .. }) | None => {
+                    Some(Treatment::Blind { .. }) | Some(Treatment::Show) | None => {
                         return Err(refusal(NyCode::NotAnalysable));
                     }
                 }

@@ -1,8 +1,14 @@
 //! Shared column policy data model.
 use crate::schema::ColumnRef;
 use std::{collections::BTreeMap, path::PathBuf};
+/// Compile effective column treatments.
+pub mod effective;
 /// File.
 pub mod file;
+/// JSON path policy syntax and types.
+pub mod json_path;
+/// Normalized JSON path declarations and leaf types.
+pub use json_path::{JsonLeafType, JsonPathRule, JsonPathTreatment, JsonTokenType, PathSegment};
 /// Validate.
 pub mod validate;
 #[derive(
@@ -16,6 +22,8 @@ pub struct DomainName(
 /// Treatment.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Treatment {
+    /// Explicitly permit plaintext values.
+    Show,
     /// Hide values using tokens from this domain.
     Blind {
         /// Domain.
@@ -72,6 +80,14 @@ pub enum ReadLogSink {
         max_bytes: u64,
     },
 }
+/// Service-level defaults resolved with policy file settings.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServicePolicySettings {
+    /// Optional audit destination.
+    pub readlog: Option<ReadLogSink>,
+    /// Optional maximum schema snapshot age in milliseconds.
+    pub snapshot_max_age_ms: Option<u64>,
+}
 /// Policy.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Policy {
@@ -93,7 +109,40 @@ impl Policy {
     pub fn domain_of(&self, c: &ColumnRef) -> Option<&DomainName> {
         match self.treatment(c) {
             Some(Treatment::Blind { domain }) => Some(domain),
-            Some(Treatment::Masked { .. }) | None => None,
+            Some(Treatment::Masked { .. }) | Some(Treatment::Show) | None => None,
         }
     }
+}
+
+/// Default treatment for columns without an explicit rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteDefault {
+    /// Tokenize unlisted columns.
+    Tokenize,
+    /// Show unlisted columns.
+    Show,
+}
+/// Policy file format generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyVersion {
+    /// Original policy format.
+    Legacy,
+    /// Explicit defaults and JSON path rules.
+    V2,
+}
+/// Parsed policy together with versioned routing metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDocument {
+    /// Audit destination explicitly declared in the policy file.
+    pub file_readlog: Option<ReadLogSink>,
+    /// Snapshot age explicitly declared in the policy file.
+    pub file_snapshot_max_age_ms: Option<u64>,
+    /// Existing column and domain policy.
+    pub policy: Policy,
+    /// Policy format generation.
+    pub version: PolicyVersion,
+    /// Treatment of unlisted columns.
+    pub route_default: RouteDefault,
+    /// Validated JSON path declarations, not yet enforced.
+    pub json_paths: Vec<JsonPathRule>,
 }

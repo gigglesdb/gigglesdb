@@ -77,7 +77,7 @@ fn label(policy: &Policy, column: &ColumnRef) -> Label {
     match policy.treatment(column) {
         Some(Treatment::Blind { domain }) => Label::Blind(domain.clone()),
         Some(Treatment::Masked { .. }) => Label::Masked,
-        None => Label::Plain,
+        Some(Treatment::Show) | None => Label::Plain,
     }
 }
 fn empty(kind: StatementKind) -> Lowered {

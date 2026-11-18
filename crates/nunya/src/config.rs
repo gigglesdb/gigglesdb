@@ -141,6 +141,8 @@ impl fmt::Debug for AdminSection {
 }
 /// Validated configuration with zeroizing secrets.
 pub struct Config {
+    /// Service settings resolved with each route policy.
+    pub policy_settings: crate::policy::ServicePolicySettings,
     /// Configuration path passed to the loader, as given.
     pub path: PathBuf,
     /// SHA-256 of the startup config file bytes.
@@ -234,6 +236,7 @@ macro_rules! strict_section {
     };
 }
 strict_section!(RawConfig,
+    _readlog=>"readlog", _age=>"snapshot_max_age_ms",
     _watch=>"policy_watch_ms", _max=>"max_connections", _listen=>"listen", _admin=>"admin_listen", _policy=>"policy",
     _root=>"root_key_file", _state=>"state_dir", _schemas=>"schemas",
     _search=>"search_path", _refresh=>"snapshot_refresh_ms",
@@ -350,6 +353,8 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     let mut m = table(
         v,
         &[
+            "readlog",
+            "snapshot_max_age_ms",
             "policy_watch_ms",
             "max_connections",
             "listen",
@@ -375,6 +380,21 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         err(&mut e, "config", "invalid fields");
     }
     let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut policy_errors = Vec::new();
+    let mut readlog = m.remove("readlog").map(|value|
+        crate::policy::file::parse_log(value, &mut policy_errors));
+    e.extend(policy_errors.into_iter().map(|error| error.message));
+    if let Some(crate::policy::ReadLogSink::File { path, .. }) = &mut readlog {
+        *path = resolve(base, path.clone());
+    }
+    let snapshot_max_age_ms = m.remove("snapshot_max_age_ms").and_then(|value| {
+        let age = value.as_integer().and_then(|age| u64::try_from(age).ok());
+        if age.is_none() {
+            err(&mut e, "snapshot_max_age_ms", "must be a nonnegative integer");
+        }
+        age
+    });
+    let policy_settings = crate::policy::ServicePolicySettings { readlog, snapshot_max_age_ms };
     let has_upstream = m.contains_key("upstream");
     let listen = get(&mut m, "listen", &mut e);
     if has_upstream && listen.is_none() {
@@ -672,6 +692,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     }
     use sha2::{Digest, Sha256};
     Ok(Config {
+        policy_settings,
         path: path.to_path_buf(),
         revision: data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes())),
         session,
@@ -1409,4 +1430,23 @@ tls = "disable"
             .is_err()
         );
     }
+
+    #[test]
+    fn service_policy_settings_parse_and_validate() {
+        let f = Fixture::new();
+        let c = f.load(EXAMPLE).unwrap();
+        assert_eq!(c.policy_settings, crate::policy::ServicePolicySettings::default());
+        let text = format!("snapshot_max_age_ms=0\n{EXAMPLE}\n[readlog]\nsink='file'\npath='audit.log'\nmax_bytes=12\n");
+        let c = f.load(&text).unwrap();
+        assert_eq!(c.policy_settings.snapshot_max_age_ms, Some(0));
+        assert_eq!(c.policy_settings.readlog, Some(crate::policy::ReadLogSink::File { path: f.0.join("audit.log"), max_bytes: 12 }));
+        for setting in ["snapshot_max_age_ms=-1", "snapshot_max_age_ms=1.5", "snapshot_max_age_ms='1'"] {
+            assert!(f.load(&format!("{setting}\n{EXAMPLE}")).is_err());
+        }
+        for setting in ["sink='bad'", "sink='file'", "sink='stdout'\nmax_bytes=0", "sink='stdout'\nunknown=true"] {
+            assert!(f.load(&format!("{EXAMPLE}\n[readlog]\n{setting}")).is_err());
+        }
+        assert_eq!(f.load(&format!("{EXAMPLE}\n[readlog]\nsink='stdout'")).unwrap().policy_settings.readlog, Some(crate::policy::ReadLogSink::Stdout));
+    }
+
 }

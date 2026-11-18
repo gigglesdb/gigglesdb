@@ -232,45 +232,32 @@ pub(crate) async fn snapshot(
     result.map_err(|_| "upstream schema snapshot unavailable".into())
 }
 /// Parse policy bytes and resolve its audit path relative to the policy file.
-pub(crate) fn parse_policy_bytes(path: &Path, bytes: &[u8]) -> Result<Policy, Vec<PolicyError>> {
+pub(crate) fn parse_policy_bytes(path: &Path, bytes: &[u8], service: &crate::policy::ServicePolicySettings) -> Result<Policy, Vec<PolicyError>> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
         vec![PolicyError {
             message: "policy file is not UTF-8".into(),
         }]
     })?;
-    let mut policy = crate::policy::file::parse_policy(text)?;
-    if let crate::policy::ReadLogSink::File { path: log, .. } = &mut policy.readlog
+    let mut document = crate::policy::file::parse_policy_document(text)?;
+    if let Some(crate::policy::ReadLogSink::File { path: log, .. }) = &mut document.file_readlog
         && log.is_relative()
     {
         *log = path.parent().unwrap_or(Path::new(".")).join(&*log);
     }
-    Ok(policy)
-}
-/// Normalize an audit destination for startup and reload comparisons.
-pub(crate) fn readlog_key(sink: &crate::policy::ReadLogSink) -> crate::policy::ReadLogSink {
-    use crate::policy::ReadLogSink;
-    match sink {
-        ReadLogSink::Stdout => ReadLogSink::Stdout,
-        ReadLogSink::File { path, max_bytes } => {
-            let canonical = std::fs::canonicalize(path)
-                .or_else(|error| {
-                    let parent = path
-                        .parent()
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .unwrap_or(Path::new("."));
-                    match path.file_name() {
-                        Some(name) => std::fs::canonicalize(parent).map(|p| p.join(name)),
-                        None => Err(error),
-                    }
-                })
-                .unwrap_or_else(|_| path.clone());
-            ReadLogSink::File {
-                path: canonical,
-                max_bytes: *max_bytes,
-            }
+    let document = crate::policy::file::resolve(document, service)?;
+    if document.version == crate::policy::PolicyVersion::V2 {
+        let refusal = if document.route_default == crate::policy::RouteDefault::Tokenize {
+            Some("policy: default tokenize is not served yet")
+        } else if !document.json_paths.is_empty() {
+            Some("policy: json_path rules are not served yet")
+        } else { None };
+        if let Some(message) = refusal {
+            return Err(vec![PolicyError { message: message.into() }]);
         }
     }
+    Ok(document.policy)
 }
+pub(crate) use crate::policy::file::readlog_key;
 #[cfg(test)]
 fn reload_decision(
     candidate: Result<Policy, Vec<PolicyError>>,
@@ -392,7 +379,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             policy_routes.push((route.clone(), path.clone().ok_or("route policy unavailable")?));
         }
     }
-    let hub = crate::reload::Hub::new(&policy_routes, config.policy_watch_ms)?;
+    let hub = crate::reload::Hub::new(&policy_routes, config.policy_watch_ms, config.policy_settings.clone())?;
     let admins: crate::mgmt::routes::Admins = Arc::new(std::sync::RwLock::new(config.management.as_ref().map(|m| {
         m.admins.iter().map(|a| (a.name.clone(), crate::pgwire::auth::ScramVerifier {
             salt: a.verifier.salt.clone(), iterations: a.verifier.iterations,
@@ -717,7 +704,7 @@ mod tests {
         let path = dir.join("policy.toml");
         std::fs::write(&path, "[readlog]\nsink='stdout'\n").unwrap();
         let route = crate::state::model::RouteId::new("postgres").unwrap();
-        let hub = crate::reload::Hub::new(&[(route.clone(), path)], None).unwrap();
+        let hub = crate::reload::Hub::new(&[(route.clone(), path)], None, crate::policy::ServicePolicySettings::default()).unwrap();
         hub.set_config_revision("config").unwrap();
         let revisions = hub.route_log(&route).unwrap().1;
         let status = ManagementStatus { config_reload: None, hub: hub.clone(), spanner_route: None, routes: vec![route] };
@@ -755,7 +742,7 @@ mod tests {
         std::fs::write(&a, "[readlog]\nsink='stdout'\n").unwrap();
         std::fs::write(&b, "[readlog]\nsink='stdout'\n").unwrap();
         let routes = vec![crate::state::model::RouteId::new("a").unwrap(), crate::state::model::RouteId::new("b").unwrap()];
-        let hub = crate::reload::Hub::new(&[(routes[0].clone(), a), (routes[1].clone(), b)], None).unwrap();
+        let hub = crate::reload::Hub::new(&[(routes[0].clone(), a), (routes[1].clone(), b)], None, crate::policy::ServicePolicySettings::default()).unwrap();
         hub.set_config_revision("config").unwrap();
         let status = ManagementStatus { config_reload: None, hub: hub.clone(), spanner_route: None, routes: routes.clone() };
         let first = status.policy_revision("a").unwrap();
@@ -883,15 +870,24 @@ mod tests {
     }
     #[test]
     fn captured_policy_bytes_resolve_relative_readlog() {
+        let errors =
+            parse_policy_bytes(Path::new("unused"), b"version = 2\ndefault = 'show'\n", &crate::policy::ServicePolicySettings::default())
+                .unwrap_err();
+        assert_eq!(
+            errors,
+            vec![PolicyError {
+                message: "readlog: missing table".into()
+            }]
+        );
         let policy = parse_policy_bytes(
             Path::new("config/policy.toml"),
-            b"[readlog]\nsink = 'file'\npath = 'audit.jsonl'\n",
+            b"[readlog]\nsink = 'file'\npath = 'audit.jsonl'\n", &crate::policy::ServicePolicySettings::default()
         )
         .unwrap();
         assert!(
             matches!(policy.readlog, crate::policy::ReadLogSink::File { path, .. } if path == Path::new("config/audit.jsonl"))
         );
-        assert!(parse_policy_bytes(Path::new("unused"), &[255]).is_err());
+        assert!(parse_policy_bytes(Path::new("unused"), &[255], &crate::policy::ServicePolicySettings::default()).is_err());
     }
     #[test]
     fn reload_accepts_valid_and_refuses_parse_or_schema_errors() {
@@ -916,5 +912,44 @@ mod tests {
             crate::policy::Treatment::Masked { placeholder: None },
         );
         assert!(reload_decision(Ok(invalid), &snapshot).is_err());
+    }
+
+    #[test]
+    fn service_settings_resolve_before_serving_gates() {
+        use crate::policy::{ReadLogSink, ServicePolicySettings, Treatment};
+        let service = ServicePolicySettings { readlog: Some(ReadLogSink::Stdout), snapshot_max_age_ms: Some(123) };
+        let path = Path::new("policy.toml");
+        let legacy = parse_policy_bytes(path, b"", &service).unwrap();
+        assert_eq!(legacy.readlog, ReadLogSink::Stdout);
+        assert_eq!(legacy.snapshot_max_age_ms, 123);
+        let show = b"version=2\ndefault='show'\n[[column]]\ntable='public.t'\nname='plain'\nshow=true\n";
+        let policy = parse_policy_bytes(path, show, &service).unwrap();
+        assert_eq!(policy.readlog, ReadLogSink::Stdout);
+        assert!(policy.columns.values().all(|t| *t == Treatment::Show));
+        for (bytes, message) in [
+            (b"[readlog]\nsink='file'\npath='audit.log'".as_slice(), "readlog: policy file and service config disagree"),
+            (b"version=2\ndefault='tokenize'".as_slice(), "policy: default tokenize is not served yet"),
+            (b"version=2\ndefault='show'\n[[json_path]]\ntable='public.t'\nname='data'\npath='$.a'\nmasked=true".as_slice(), "policy: json_path rules are not served yet"),
+        ] {
+            assert_eq!(parse_policy_bytes(path, bytes, &service).unwrap_err()[0].message, message);
+        }
+        assert_eq!(parse_policy_bytes(path, show, &ServicePolicySettings::default()).unwrap_err()[0].message, "readlog: missing table");
+    }
+
+
+    #[test]
+    fn file_and_service_readlog_paths_resolve_before_comparison() {
+        use crate::policy::{ReadLogSink, ServicePolicySettings};
+        let base = std::env::temp_dir();
+        let service = ServicePolicySettings {
+            readlog: Some(ReadLogSink::File {
+                path: std::fs::canonicalize(&base).unwrap().join("gd88-audit.log"),
+                max_bytes: 100 * 1024 * 1024,
+            }),
+            ..Default::default()
+        };
+        let bytes = b"[readlog]\nsink='file'\npath='./gd88-audit.log'";
+        let policy = parse_policy_bytes(&base.join("policy.toml"), bytes, &service).unwrap();
+        assert_eq!(readlog_key(&policy.readlog), service.readlog.unwrap());
     }
 }

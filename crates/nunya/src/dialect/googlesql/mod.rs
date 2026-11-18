@@ -174,7 +174,7 @@ impl State<'_> {
         match self.policy.treatment(c) {
             Some(Treatment::Blind { domain }) => Label::Blind(domain.clone()),
             Some(Treatment::Masked { .. }) => Label::Masked,
-            None => Label::Plain,
+            Some(Treatment::Show) | None => Label::Plain,
         }
     }
     fn record(&mut self, e: &expr::Expr, kind: UseKind, context: &Context) {

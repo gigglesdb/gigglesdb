@@ -64,9 +64,9 @@ enum StandingCommand {
 enum KeyCommand {
     Generate,
 }
-fn load_policy(path: &Path) -> Result<crate::policy::Policy, Vec<String>> {
+fn load_policy(path: &Path, service: &crate::policy::ServicePolicySettings) -> Result<crate::policy::Policy, Vec<String>> {
     let bytes = std::fs::read(path).map_err(|_| vec!["policy file unavailable".into()])?;
-    crate::serve::parse_policy_bytes(path, &bytes).map_err(|errors| {
+    crate::serve::parse_policy_bytes(path, &bytes, service).map_err(|errors| {
         errors
             .into_iter()
             .map(|e| e.to_string())
@@ -78,8 +78,8 @@ async fn validate(path: &Path) -> Result<(), Vec<String>> {
     if let Some(tls) = &cfg.tls {
         crate::config::load_tls(tls).map_err(|e| vec![e])?;
     }
-    let postgres_policy = cfg.postgres_policy.as_deref().map(load_policy).transpose()?;
-    let spanner_policy = cfg.spanner_policy.as_deref().map(load_policy).transpose()?;
+    let postgres_policy = cfg.postgres_policy.as_deref().map(|path| load_policy(path, &cfg.policy_settings)).transpose()?;
+    let spanner_policy = cfg.spanner_policy.as_deref().map(|path| load_policy(path, &cfg.policy_settings)).transpose()?;
     if let (Some(pg), Some(spanner)) = (&postgres_policy, &spanner_policy)
         && crate::serve::readlog_key(&pg.readlog) != crate::serve::readlog_key(&spanner.readlog)
     {
@@ -243,9 +243,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.as_path().join("policy.toml");
         std::fs::write(&path, "[readlog]\nsink='file'\npath='./read.log'\n").unwrap();
-        let checked = load_policy(&path).unwrap();
+        let checked = load_policy(&path, &crate::policy::ServicePolicySettings::default()).unwrap();
         let served =
-            crate::serve::parse_policy_bytes(&path, &std::fs::read(&path).unwrap()).unwrap();
+            crate::serve::parse_policy_bytes(&path, &std::fs::read(&path).unwrap(), &crate::policy::ServicePolicySettings::default()).unwrap();
         assert_eq!(checked.readlog, served.readlog);
         let absolute = crate::policy::ReadLogSink::File {
             path: dir.as_path().join("read.log"),

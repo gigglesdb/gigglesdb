@@ -1,6 +1,8 @@
 //! Strict policy file parsing with data-free diagnostics.
 use super::{
-    DomainName, DomainSettings, Policy, ReadLogSink, TokenizeSetting, Treatment, TypeRange,
+    DomainName, DomainSettings, JsonLeafType, JsonPathRule, JsonPathTreatment, JsonTokenType,
+    Policy, PolicyDocument, PolicyVersion, ReadLogSink, RouteDefault, TokenizeSetting, Treatment,
+    TypeRange, ServicePolicySettings,
 };
 use crate::schema::ColumnRef;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -33,6 +35,9 @@ pub(super) fn error(errors: &mut Vec<PolicyError>, context: &str, problem: &str)
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawPolicy {
+    version: Option<Value>,
+    default: Option<Value>,
+    json_path: Option<Value>,
     snapshot_max_age_ms: Option<Value>,
     readlog: Option<Value>,
     domains: Option<Value>,
@@ -63,6 +68,7 @@ struct RawRange {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawColumn {
+    show: Option<Value>,
     table: Option<Value>,
     name: Option<Value>,
     blind: Option<Value>,
@@ -129,11 +135,7 @@ fn domain_name_valid(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
-fn parse_log(value: Option<Value>, errors: &mut Vec<PolicyError>) -> ReadLogSink {
-    let Some(value) = value else {
-        error(errors, "readlog", "missing table");
-        return ReadLogSink::Stdout;
-    };
+pub(crate) fn parse_log(value: Value, errors: &mut Vec<PolicyError>) -> ReadLogSink {
     let Some(raw): Option<RawLog> = table(value, &["sink", "path", "max_bytes"], "readlog", errors)
     else {
         return ReadLogSink::Stdout;
@@ -326,27 +328,83 @@ fn parse_domains(
 
 /// Parse TOML while collecting independent policy problems without echoing values.
 pub fn parse_policy(toml_text: &str) -> Result<Policy, Vec<PolicyError>> {
+    parse_policy_document(toml_text)
+        .and_then(|doc| resolve(doc, &ServicePolicySettings::default()))
+        .map(|document| document.policy)
+}
+
+/// Parse legacy or version 2 policy declarations with sanitized diagnostics.
+pub fn parse_policy_document(toml_text: &str) -> Result<PolicyDocument, Vec<PolicyError>> {
     let value: Value = toml::from_str(toml_text).map_err(|_| {
         vec![PolicyError {
             message: "policy: invalid TOML syntax".into(),
         }]
     })?;
+    let v2 = match value.get("version") {
+        None => false,
+        Some(Value::Integer(2)) => true,
+        Some(_) => {
+            return Err(vec![PolicyError {
+                message: "policy: version must be 2".into(),
+            }]);
+        }
+    };
     let mut errors = vec![];
-    let Some(raw): Option<RawPolicy> = table(
-        value,
-        &["snapshot_max_age_ms", "readlog", "domains", "column"],
-        "policy",
-        &mut errors,
-    ) else {
+    let allowed: &[&str] = if v2 {
+        &[
+            "version",
+            "default",
+            "json_path",
+            "snapshot_max_age_ms",
+            "readlog",
+            "domains",
+            "column",
+        ]
+    } else {
+        &["snapshot_max_age_ms", "readlog", "domains", "column"]
+    };
+    let Some(raw): Option<RawPolicy> = table(value, allowed, "policy", &mut errors) else {
         return Err(errors);
     };
-    let age: Option<u64> = field(
-        raw.snapshot_max_age_ms,
-        "policy",
-        "snapshot_max_age_ms must be a nonnegative integer",
-        &mut errors,
-    );
-    let readlog = parse_log(raw.readlog, &mut errors);
+    let route_default = if v2 {
+        match raw.default.as_ref().and_then(Value::as_str) {
+            Some("tokenize") => RouteDefault::Tokenize,
+            Some("show") => RouteDefault::Show,
+            _ => {
+                error(&mut errors, "policy", "default must be tokenize or show");
+                RouteDefault::Tokenize
+            }
+        }
+    } else {
+        RouteDefault::Show
+    };
+    // Kept in the raw shape to distinguish a forbidden key from an unknown key.
+    let _ = raw.version;
+    if v2 {
+        if raw.readlog.is_some() {
+            error(&mut errors, "readlog", "moved to the service config");
+        }
+        if raw.snapshot_max_age_ms.is_some() {
+            error(
+                &mut errors,
+                "snapshot_max_age_ms",
+                "moved to the service config",
+            );
+        }
+    }
+    let age: Option<u64> = if v2 {
+        None
+    } else {
+        field(
+            raw.snapshot_max_age_ms,
+            "policy",
+            "snapshot_max_age_ms must be a nonnegative integer",
+            &mut errors,
+        )
+    };
+    let readlog = if v2 { None } else {
+        raw.readlog.map(|value| parse_log(value, &mut errors))
+    };
     let domains = parse_domains(raw.domains, &mut errors);
     let mut columns = BTreeMap::new();
     let mut seen = BTreeSet::new();
@@ -369,7 +427,11 @@ pub fn parse_policy(toml_text: &str) -> Result<Policy, Vec<PolicyError>> {
         };
         let Some(raw): Option<RawColumn> = table(
             value,
-            &["table", "name", "blind", "masked", "placeholder"],
+            if v2 {
+                &["table", "name", "blind", "masked", "placeholder", "show"]
+            } else {
+                &["table", "name", "blind", "masked", "placeholder"]
+            },
             &initial_context,
             &mut errors,
         ) else {
@@ -409,22 +471,43 @@ pub fn parse_policy(toml_text: &str) -> Result<Policy, Vec<PolicyError>> {
         {
             error(&mut errors, &context, "column listed twice");
         }
+        let has_show = raw.show.is_some();
+        let show: Option<bool> = field(raw.show, &context, "show must be true", &mut errors);
+        if has_show && show != Some(true) {
+            error(&mut errors, &context, "show must be true");
+        }
         let has_blind = raw.blind.is_some();
         let has_masked = raw.masked.is_some();
         let blind: Option<String> =
             field(raw.blind, &context, "blind must name a domain", &mut errors);
         let masked: Option<bool> = field(raw.masked, &context, "masked must be true", &mut errors);
+        let has_placeholder = raw.placeholder.is_some();
         let placeholder: Option<String> = field(
             raw.placeholder,
             &context,
             "placeholder must be a string",
             &mut errors,
         );
-        if has_blind == has_masked {
+        if v2 && has_placeholder && !has_masked {
             error(
                 &mut errors,
                 &context,
-                "requires exactly one of blind and masked",
+                "placeholder requires masked treatment",
+            );
+        }
+        if if v2 {
+            usize::from(has_blind) + usize::from(has_masked) + usize::from(has_show) != 1
+        } else {
+            has_blind == has_masked
+        } {
+            error(
+                &mut errors,
+                &context,
+                if v2 {
+                    "requires exactly one of blind, masked and show"
+                } else {
+                    "requires exactly one of blind and masked"
+                },
             );
         }
         let treatment = if has_blind {
@@ -437,7 +520,7 @@ pub fn parse_policy(toml_text: &str) -> Result<Policy, Vec<PolicyError>> {
                         &format!("domain {} is not declared", domain.0),
                     );
                 }
-                if placeholder.is_some() {
+                if !v2 && placeholder.is_some() {
                     error(
                         &mut errors,
                         &context,
@@ -446,6 +529,8 @@ pub fn parse_policy(toml_text: &str) -> Result<Policy, Vec<PolicyError>> {
                 }
                 Treatment::Blind { domain }
             })
+        } else if show == Some(true) {
+            Some(Treatment::Show)
         } else if masked == Some(true) {
             Some(Treatment::Masked { placeholder })
         } else {
@@ -458,16 +543,204 @@ pub fn parse_policy(toml_text: &str) -> Result<Policy, Vec<PolicyError>> {
             columns.insert(column, treatment);
         }
     }
+    let json_paths = parse_json_paths(raw.json_path, &domains, &columns, &mut errors);
     if errors.is_empty() {
-        Ok(Policy {
-            columns,
-            domains,
-            snapshot_max_age_ms: age.unwrap_or(60000),
-            readlog,
+        Ok(PolicyDocument {
+            file_readlog: readlog.clone(),
+            file_snapshot_max_age_ms: age,
+            policy: Policy {
+                columns,
+                domains,
+                snapshot_max_age_ms: age.unwrap_or(60000),
+                readlog: readlog.unwrap_or(ReadLogSink::Stdout),
+            },
+            version: if v2 {
+                PolicyVersion::V2
+            } else {
+                PolicyVersion::Legacy
+            },
+            route_default,
+            json_paths,
         })
     } else {
         Err(errors)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawJsonPath {
+    table: Option<Value>,
+    name: Option<Value>,
+    path: Option<Value>,
+    show: Option<Value>,
+    blind: Option<Value>,
+    masked: Option<Value>,
+    #[serde(rename = "type")]
+    ty: Option<Value>,
+}
+
+fn parse_json_paths(
+    value: Option<Value>,
+    domains: &BTreeMap<DomainName, DomainSettings>,
+    columns: &BTreeMap<ColumnRef, Treatment>,
+    errors: &mut Vec<PolicyError>,
+) -> Vec<JsonPathRule> {
+    let values = match value {
+        None => return vec![],
+        Some(Value::Array(values)) => values,
+        Some(_) => {
+            error(errors, "json_path", "expected an array of tables");
+            return vec![];
+        }
+    };
+    let mut rules: Vec<JsonPathRule> = Vec::new();
+    for value in values {
+        let context = match &value {
+            Value::Table(fields) => format!(
+                "json_path {}.{}",
+                fields.get("table").and_then(Value::as_str).unwrap_or("?"),
+                fields.get("name").and_then(Value::as_str).unwrap_or("?")
+            ),
+            _ => "json_path".into(),
+        };
+        let Some(raw): Option<RawJsonPath> = table(
+            value,
+            &["table", "name", "path", "show", "blind", "masked", "type"],
+            &context,
+            errors,
+        ) else {
+            continue;
+        };
+        let table_name = required_string(raw.table, &context, "table must be schema.table", errors);
+        let name = required_string(raw.name, &context, "name must be a string", errors);
+        let column = table_name.and_then(|table| {
+            let parts: Vec<_> = table.split('.').collect();
+            if parts.len() != 2 || parts[1].is_empty() {
+                error(errors, &context, "table must be schema.table");
+                return None;
+            }
+            name.map(|column| ColumnRef {
+                schema: parts[0].into(),
+                table: parts[1].into(),
+                column,
+            })
+        });
+        let path =
+            required_string(raw.path, &context, "path must be a string", errors).and_then(|path| {
+                match super::json_path::parse_path(&path) {
+                    Ok(path) => Some(path),
+                    Err(_) => {
+                        error(errors, &context, "invalid path");
+                        None
+                    }
+                }
+            });
+        let count = usize::from(raw.show.is_some())
+            + usize::from(raw.blind.is_some())
+            + usize::from(raw.masked.is_some());
+        if count != 1 {
+            error(
+                errors,
+                &context,
+                "requires exactly one of blind, masked and show",
+            );
+        }
+        let has_show = raw.show.is_some();
+        let has_blind = raw.blind.is_some();
+        let has_masked = raw.masked.is_some();
+        let has_type = raw.ty.is_some();
+        let show: Option<bool> = field(raw.show, &context, "show must be true", errors);
+        let masked: Option<bool> = field(raw.masked, &context, "masked must be true", errors);
+        if has_show && show != Some(true) {
+            error(errors, &context, "show must be true");
+        }
+        if has_masked && masked != Some(true) {
+            error(errors, &context, "masked must be true");
+        }
+        let blind: Option<String> = field(raw.blind, &context, "blind must name a domain", errors);
+        let ty: Option<String> = field(raw.ty, &context, "invalid type", errors);
+        let treatment = if has_show {
+            let ty = match ty.as_deref() {
+                Some("string") => Some(JsonLeafType::String),
+                Some("number") => Some(JsonLeafType::Number),
+                Some("boolean") => Some(JsonLeafType::Boolean),
+                _ => {
+                    error(
+                        errors,
+                        &context,
+                        "show requires type string, number or boolean",
+                    );
+                    None
+                }
+            };
+            ty.map(|ty| JsonPathTreatment::Show { ty })
+        } else if has_blind {
+            let ty = match ty.as_deref() {
+                Some("text") => Some(JsonTokenType::Text),
+                Some("int4") => Some(JsonTokenType::Int4),
+                Some("int8") => Some(JsonTokenType::Int8),
+                Some("uuid") => Some(JsonTokenType::Uuid),
+                Some("date") => Some(JsonTokenType::Date),
+                Some("timestamp") => Some(JsonTokenType::Timestamp),
+                Some("timestamptz") => Some(JsonTokenType::Timestamptz),
+                _ => {
+                    error(errors, &context, "blind requires a supported token type");
+                    None
+                }
+            };
+            let domain = blind.map(DomainName);
+            if domain
+                .as_ref()
+                .is_some_and(|domain| !domains.contains_key(domain))
+            {
+                error(errors, &context, "domain is not declared");
+            }
+            domain
+                .zip(ty)
+                .map(|(domain, ty)| JsonPathTreatment::Blind { domain, ty })
+        } else if has_masked {
+            if has_type {
+                error(errors, &context, "type is not allowed with masked");
+            }
+            Some(JsonPathTreatment::Masked)
+        } else {
+            None
+        };
+        if let (Some(column), Some(path), Some(treatment)) = (column, path, treatment) {
+            if matches!(
+                columns.get(&column),
+                Some(Treatment::Blind { .. } | Treatment::Masked { .. })
+            ) {
+                error(
+                    errors,
+                    &context,
+                    "column blind or masked treatment conflicts with json_path",
+                );
+            }
+            for rule in &rules {
+                if rule.column == column
+                    && (rule.path.starts_with(&path) || path.starts_with(&rule.path))
+                {
+                    error(
+                        errors,
+                        &context,
+                        if rule.path == path {
+                            "duplicate path"
+                        } else {
+                            "overlapping paths"
+                        },
+                    );
+                }
+            }
+            rules.push(JsonPathRule {
+                column,
+                path,
+                treatment,
+            });
+        }
+    }
+    rules
 }
 
 /// Load and parse a policy file without exposing its path or contents on failure.
@@ -478,6 +751,59 @@ pub fn load_policy(path: &Path) -> Result<Policy, Vec<PolicyError>> {
         }]
     })?;
     parse_policy(&text)
+}
+
+/// Normalize an audit destination for startup and reload comparisons.
+pub(crate) fn readlog_key(sink: &crate::policy::ReadLogSink) -> crate::policy::ReadLogSink {
+    use crate::policy::ReadLogSink;
+    match sink {
+        ReadLogSink::Stdout => ReadLogSink::Stdout,
+        ReadLogSink::File { path, max_bytes } => {
+            let canonical = std::fs::canonicalize(path)
+                .or_else(|error| {
+                    let parent = path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or(Path::new("."));
+                    match path.file_name() {
+                        Some(name) => std::fs::canonicalize(parent).map(|p| p.join(name)),
+                        None => Err(error),
+                    }
+                })
+                .unwrap_or_else(|_| path.clone());
+            ReadLogSink::File {
+                path: canonical,
+                max_bytes: *max_bytes,
+            }
+        }
+    }
+}
+
+/// Resolve settings with source-relative paths already expanded, refusing disagreements.
+pub fn resolve(mut doc: PolicyDocument, service: &ServicePolicySettings) -> Result<PolicyDocument, Vec<PolicyError>> {
+    let mut errors = Vec::new();
+    doc.policy.readlog = match (&doc.file_readlog, &service.readlog) {
+        (Some(file), Some(service)) if readlog_key(file) != readlog_key(service) => {
+            error(&mut errors, "readlog", "policy file and service config disagree");
+            file.clone()
+        }
+        (Some(file), _) => file.clone(),
+        (None, Some(service)) => service.clone(),
+        (None, None) => {
+            error(&mut errors, "readlog", "missing table");
+            ReadLogSink::Stdout
+        }
+    };
+    doc.policy.snapshot_max_age_ms = match (doc.file_snapshot_max_age_ms, service.snapshot_max_age_ms) {
+        (Some(file), Some(service)) if file != service => {
+            error(&mut errors, "snapshot_max_age_ms", "policy file and service config disagree");
+            file
+        }
+        (Some(file), _) => file,
+        (None, Some(service)) => service,
+        (None, None) => 60000,
+    };
+    if errors.is_empty() { Ok(doc) } else { Err(errors) }
 }
 
 #[cfg(test)]
@@ -794,5 +1120,243 @@ placeholder = "**"
             errors[0].message,
             "column public.customers.email: unknown key"
         );
+    }
+
+    const V2: &str = "version = 2\ndefault = 'tokenize'\n[domains.email]\n";
+    fn column_rule(rule: &str) -> String {
+        format!("{V2}[[column]]\ntable = 'public.customers'\nname = 'data'\n{rule}\n")
+    }
+    fn path_rule(path: &str, treatment: &str) -> String {
+        format!(
+            "[[json_path]]\ntable = 'public.customers'\nname = 'data'\npath = '{path}'\n{treatment}\n"
+        )
+    }
+    #[test]
+    fn legacy_documents_preserve_policy_and_defaults() {
+        for text in [
+            EXAMPLE,
+            include_str!("../../examples/policy.toml"),
+            include_str!("../../harness/policy.toml"),
+            include_str!("../../harness/spanner/policy_gsql.toml"),
+            &without_limits().replace("tokenize = \"on\"", "tokenize = \"off\""),
+            "[readlog]\nsink = 'stdout'",
+        ] {
+            let document = parse_policy_document(text).unwrap();
+            assert_eq!(document.policy, parse_policy(text).unwrap());
+            assert_eq!(document.version, PolicyVersion::Legacy);
+            assert_eq!(document.route_default, RouteDefault::Show);
+            assert!(document.json_paths.is_empty());
+        }
+    }
+    #[test]
+    fn v2_happy_documents_cover_all_treatments_and_types() {
+        for default in ["tokenize", "show"] {
+            let mut text = column_rule("show = true")
+                .replace("default = 'tokenize'", &format!("default = '{default}'"));
+            for (path, treatment) in [
+                ("$.s", "show = true\ntype = 'string'"),
+                ("$.n", "show = true\ntype = 'number'"),
+                ("$.b", "show = true\ntype = 'boolean'"),
+                ("$.hidden", "masked = true"),
+            ] {
+                text.push_str(&path_rule(path, treatment));
+            }
+            for ty in [
+                "text",
+                "int4",
+                "int8",
+                "uuid",
+                "date",
+                "timestamp",
+                "timestamptz",
+            ] {
+                text.push_str(&path_rule(
+                    &format!("$.{ty}"),
+                    &format!("blind = 'email'\ntype = '{ty}'"),
+                ));
+            }
+            text.push_str("[[column]]\ntable = 'public.customers'\nname = 'email'\nblind = 'email'\n[[column]]\ntable = 'public.customers'\nname = 'secret'\nmasked = true\nplaceholder = '**'\n");
+            let document = parse_policy_document(&text).unwrap();
+            assert_eq!(document.version, PolicyVersion::V2);
+            assert_eq!(
+                document.route_default,
+                if default == "show" {
+                    RouteDefault::Show
+                } else {
+                    RouteDefault::Tokenize
+                }
+            );
+            assert_eq!(document.json_paths.len(), 11);
+            assert_eq!(document.policy.columns.len(), 3);
+            let show = document
+                .policy
+                .columns
+                .iter()
+                .find(|(col, _)| col.column == "data")
+                .unwrap();
+            assert_eq!(*show.1, Treatment::Show);
+            assert_eq!(document.policy.domain_of(show.0), None);
+        }
+    }
+    #[test]
+    fn v2_strict_headers_and_service_settings() {
+        for text in [
+            "version = 2",
+            "version = 2\ndefault = 'bad'",
+            "version = 2\ndefault = true",
+            "version = 1",
+            "version = 3",
+            "version = '2'",
+            "version = true",
+            "version = 2\ndefault = 'show'\nprivate_key = 'private_value'",
+        ] {
+            assert!(parse_policy_document(text).is_err());
+        }
+        for setting in ["readlog = {}", "snapshot_max_age_ms = 42"] {
+            let text = format!("version = 2\ndefault = 'show'\n{setting}");
+            let errors = parse_policy_document(&text).unwrap_err();
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].message.ends_with("moved to the service config"));
+        }
+    }
+    #[test]
+    fn v2_strict_column_treatments() {
+        for rule in [
+            "",
+            "blind = 'email'\nshow = true",
+            "blind = 'email'\nmasked = true",
+            "masked = true\nshow = true",
+            "show = false",
+            "show = 'true'",
+            "masked = false",
+            "show = true\nplaceholder = 'x'",
+            "placeholder = 'x'",
+            "show = true\nprivate_key = 'private_value'",
+        ] {
+            assert!(parse_policy_document(&column_rule(rule)).is_err());
+        }
+    }
+    #[test]
+    fn v2_strict_json_treatments_and_column_names() {
+        for rule in [
+            "",
+            "show = true",
+            "blind = 'email'",
+            "masked = true\ntype = 'text'",
+            "show = true\ntype = 'text'",
+            "blind = 'email'\ntype = 'string'",
+            "blind = 'missing'\ntype = 'text'",
+            "show = false\ntype = 'string'",
+            "masked = false",
+            "masked = true\nshow = true\ntype = 'string'",
+            "masked = true\nprivate_key = 'private_value'",
+        ] {
+            assert!(parse_policy_document(&format!("{V2}{}", path_rule("$.a", rule))).is_err());
+        }
+        let valid = format!("{V2}{}", path_rule("$.a", "masked = true"));
+        for text in [
+            valid.replace("public.customers", "customers"),
+            valid.replace("name = 'data'", "name = 123"),
+            valid.replace("path = '$.a'", "path = 123"),
+        ] {
+            assert!(parse_policy_document(&text).is_err());
+        }
+        assert!(parse_policy_document(&valid.replace("public.customers", ".Customers")).is_ok());
+    }
+    #[test]
+    fn v2_json_paths_conflict_only_on_the_same_column() {
+        for (a, b, treatment) in [
+            ("$.a", "$.a", "masked = true"),
+            ("$.a", r#"$["a"]"#, "masked = true"),
+            ("$.a", "$.a.b", "masked = true"),
+            ("$.a.b", "$.a", "show = true\ntype = 'string'"),
+            ("$.a", "$.a.b", "show = true\ntype = 'string'"),
+        ] {
+            let text = format!(
+                "{V2}{}{}",
+                path_rule(a, treatment),
+                path_rule(b, "masked = true")
+            );
+            assert!(parse_policy_document(&text).is_err());
+            assert!(
+                parse_policy_document(&text.replacen("name = 'data'", "name = 'other'", 1)).is_ok()
+            );
+        }
+        for treatment in ["masked = true", "blind = 'email'"] {
+            assert!(
+                parse_policy_document(&format!(
+                    "{}{}",
+                    column_rule(treatment),
+                    path_rule("$.a", "masked = true")
+                ))
+                .is_err()
+            );
+        }
+        assert!(
+            parse_policy_document(&format!(
+                "{}{}",
+                column_rule("show = true"),
+                path_rule("$.a", "masked = true")
+            ))
+            .is_ok()
+        );
+    }
+    #[test]
+    fn unknown_keys_remain_redacted_in_both_versions() {
+        for text in [
+            "default = 'show'\n[readlog]\nsink = 'stdout'".to_owned(),
+            "show = true\n[readlog]\nsink = 'stdout'".to_owned(),
+            EXAMPLE.replace("blind = \"email\"", "show = true"),
+            format!("{EXAMPLE}{}", path_rule("$.a", "masked = true")),
+        ] {
+            assert!(
+                parse_policy_document(&text)
+                    .unwrap_err()
+                    .iter()
+                    .any(|e| e.message.ends_with("unknown key"))
+            );
+        }
+        for text in [
+            "version = 2\ndefault = 'show'\nprivate_key = 'private_value'".to_owned(),
+            column_rule("show = true\nprivate_key = 'private_value'"),
+            format!(
+                "{V2}{}",
+                path_rule("$.a", "masked = true\nprivate_key = 'private_value'")
+            ),
+        ] {
+            let errors = parse_policy_document(&text).unwrap_err();
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].message.ends_with("unknown key"));
+            assert!(!errors[0].message.contains("private"));
+        }
+    }
+
+    #[test]
+    fn resolution_checks_both_sources() {
+        let doc = || parse_policy_document("").unwrap();
+        let stdout = ReadLogSink::Stdout;
+        let file = ReadLogSink::File { path: PathBuf::from("other.log"), max_bytes: 1 };
+        for (declared, service, expected) in [
+            (Some(stdout.clone()), None, stdout.clone()),
+            (None, Some(stdout.clone()), stdout.clone()),
+            (Some(stdout.clone()), Some(stdout.clone()), stdout.clone()),
+        ] {
+            let mut d = doc(); d.file_readlog = declared;
+            assert_eq!(resolve(d, &ServicePolicySettings { readlog: service, ..Default::default() }).unwrap().policy.readlog, expected);
+        }
+        assert_eq!(resolve(doc(), &ServicePolicySettings::default()).unwrap_err()[0].message, "readlog: missing table");
+        let mut d = doc(); d.file_readlog = Some(stdout.clone());
+        assert_eq!(resolve(d.clone(), &ServicePolicySettings { readlog: Some(file), ..Default::default() }).unwrap_err()[0].message, "readlog: policy file and service config disagree");
+        for (declared, service, expected) in [(Some(0), None, 0), (None, Some(42), 42), (Some(42), Some(42), 42), (None, None, 60000)] {
+            d.file_snapshot_max_age_ms = declared;
+            assert_eq!(resolve(d.clone(), &ServicePolicySettings { snapshot_max_age_ms: service, ..Default::default() }).unwrap().policy.snapshot_max_age_ms, expected);
+        }
+        d.file_snapshot_max_age_ms = Some(42);
+        assert_eq!(resolve(d, &ServicePolicySettings { snapshot_max_age_ms: Some(43), ..Default::default() }).unwrap_err()[0].message, "snapshot_max_age_ms: policy file and service config disagree");
+        let base = std::env::temp_dir();
+        let mut d = doc();
+        d.file_readlog = Some(ReadLogSink::File { path: base.join(".").join("resolution.log"), max_bytes: 12 });
+        let service = ServicePolicySettings { readlog: Some(ReadLogSink::File { path: std::fs::canonicalize(base).unwrap().join("resolution.log"), max_bytes: 12 }), ..Default::default() };
+        assert!(resolve(d, &service).is_ok());
     }
 }
