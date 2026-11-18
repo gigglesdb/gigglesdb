@@ -139,7 +139,7 @@ pub fn parse_secret(secret: &str) -> Option<(u64, [u8; 32])> {
         return None;
     }
     let mut random = [0; 32];
-    for (out, pair) in random.iter_mut().zip(bytes[23..].chunks_exact(2)) {
+    for (out, pair) in random.iter_mut().zip(bytes[23..].as_chunks::<2>().0) {
         *out = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Some((id, random))

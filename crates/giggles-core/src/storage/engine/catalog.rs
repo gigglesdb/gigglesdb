@@ -1517,10 +1517,10 @@ fn apply_record(
         }
         CatalogKind::TaskCredential => {
             let (task, id) = crate::task::credential::decode_credential_key(key)?;
-            if let Some((owner, _)) = view.task_credentials.get(&id) {
-                if *owner != task {
-                    return Err(corrupt("duplicate credential id"));
-                }
+            if let Some((owner, _)) = view.task_credentials.get(&id)
+                && *owner != task
+            {
+                return Err(corrupt("duplicate credential id"));
             }
             if let Some(value) = value {
                 let record = crate::task::credential::decode_credential(value)?;

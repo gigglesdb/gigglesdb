@@ -86,7 +86,7 @@ impl Fixture {
             .ssl_mode(SslMode::Require)
             .connect_timeout(Duration::from_secs(5));
         if let Some(task) = task {
-            config.options(&format!("-c giggles.task={task}"));
+            config.options(format!("-c giggles.task={task}"));
         }
         let (client, connection) = config
             .connect(MakeRustlsConnect::new(no_cert_client(&self.server.ca)))
@@ -98,8 +98,7 @@ impl Fixture {
         let error = self
             .connect(user, secret, task)
             .await
-            .err()
-            .expect("must refuse");
+            .expect_err("must refuse");
         let error = error.as_db_error().expect("database error");
         assert_eq!(error.code().code(), "28P01");
         assert_eq!(
