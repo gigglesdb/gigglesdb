@@ -30,6 +30,31 @@ Never use `codex exec resume --last`. Several agents run Codex on this machine,
 so `--last` can pick up another agent's session. Resume only by explicit
 session id, and prefer a fresh bounded brief.
 
+## Sizing Claude leads and subagents
+
+Agreed with the user on 2026-11-17. A subagent that nears its context limit
+loses detail when it compacts, and a long session costs more usage per step
+than a fresh one, because every later turn re-reads the whole history. So
+split the work to fit each agent:
+- One Claude lead session covers one stack: brief the workers, review, gate
+  once, land, write the handoff, then stop. A lead that has landed its stack
+  is finished, even if its phase has more items.
+- Never give a lead a whole plan phase or an open-ended list. Never add new
+  items, rebases or follow-ups to a lead that is already running. Queue them
+  in the journal handoff, and start a fresh lead for each.
+- A lead that is blocked or waiting on a user decision writes its handoff and
+  stops. It does not stay idle.
+- The coordinator starts each new lead from the journal handoff with a short
+  brief: the one item, the lane, the acceptance checks and the stop condition.
+  It never passes coordinator history.
+- Leads keep their reads small: report files, greps and summary lines, not
+  whole logs, diffs or other threads' transcripts.
+- A lead that has run past about 15 turns, or past two gate rounds on one
+  stack, writes a handoff and stops at its next boundary. The coordinator
+  continues the work with a fresh lead.
+- The coordinator follows the same rule. When its own thread grows long, it
+  writes a handoff and asks the user to continue in a new thread.
+
 ## Archdocs space
 
 All GigglesDB design docs and related architecture documents must be bound to
