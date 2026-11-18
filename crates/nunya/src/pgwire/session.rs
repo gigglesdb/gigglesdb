@@ -1080,6 +1080,24 @@ async fn send_or_end(
     }
 }
 const FINAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+const DRAIN_BYTE_CAP: usize = 1024 * 1024;
+
+async fn linger_close(io: &mut dyn Transport) {
+    // TLS shutdown sends close_notify before shutting down the TCP write half.
+    let _ = tokio::time::timeout(FINAL_SEND_TIMEOUT, io.shutdown()).await;
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        let mut buffer = [0; 4096];
+        let mut remaining = DRAIN_BYTE_CAP;
+        while remaining > 0 {
+            let size = buffer.len().min(remaining);
+            match io.read(&mut buffer[..size]).await {
+                Ok(0) | Err(_) => break,
+                Ok(count) => remaining -= count,
+            }
+        }
+    }).await;
+}
 
 struct CancelGuard {
     ctx: Arc<GatewayContext>,
@@ -1106,7 +1124,7 @@ pub async fn serve_tcp(tcp: tokio::net::TcpStream, ctx: Arc<GatewayContext>) {
             agent.send(&[Backend::ErrorResponse(nunya_error(error.code))]),
         ).await;
     }
-    let _ = agent.io.shutdown().await;
+    linger_close(agent.io.as_mut()).await;
 }
 async fn end_connection(
     agent: &mut Agent,
@@ -4014,6 +4032,221 @@ pub(crate) mod tests {
         old.write_all(&[0,0,0,8,4,210,22,48]).await.unwrap();
         let mut answer = [0]; old.read_exact(&mut answer).await.unwrap(); assert_eq!(answer, *b"N");
         server.abort(); let _ = server.await;
+    }
+
+
+    // Real sockets are essential: an in-memory duplex cannot reproduce Windows RSTs.
+    async fn close_test_upstream(f: &mut Fixture) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctx = Arc::get_mut(&mut f.ctx).unwrap();
+        ctx.upstream.host = "127.0.0.1".into();
+        ctx.upstream.port = listener.local_addr().unwrap().port();
+        ctx.upstream.connect_timeout_ms = 5000;
+        let ctx = f.ctx.clone();
+        tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let ctx = ctx.clone();
+                tasks.spawn(async move {
+                    let mut wire = Agent { io: Box::new(tcp), buffer: BytesMut::new(), ctx };
+                    assert!(matches!(wire.startup().await.unwrap(), StartupMessage::Startup { .. }));
+                    wire.send(&[Backend::AuthenticationOk, Backend::ReadyForQuery(b'I')]).await.unwrap();
+                    while let Ok(Frontend::Query(_)) = wire.recv().await {
+                        if wire.send(&[Backend::CommandComplete("SELECT 1".into()), Backend::ReadyForQuery(b'I')]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    async fn close_test_recv(wire: &mut Agent) -> Backend {
+        loop {
+            if let Some(message) = codec::decode_backend(&mut wire.buffer).unwrap() {
+                return message;
+            }
+            assert_ne!(wire.io.read_buf(&mut wire.buffer).await.unwrap(), 0, "unexpected EOF");
+        }
+    }
+
+    async fn close_test_connect(f: &Fixture, id: SessionId, tls: bool)
+        -> (Agent, tokio::task::JoinHandle<()>) {
+        use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ctx = f.ctx.clone();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            serve_tcp(tcp, ctx).await;
+        });
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let io: Box<dyn Transport> = if tls {
+            use crate::config_reload::tests::{Fixture as ConfigFixture, certificate, connector};
+            let config = ConfigFixture::new();
+            let cert = certificate(&config);
+            let transports = crate::config_reload::Transports::new(&config.load(&config.text)).unwrap();
+            *f.ctx.tls.write().unwrap() = transports.postgres.read().unwrap().clone();
+            tcp.write_all(&[0,0,0,8,4,210,22,47]).await.unwrap();
+            assert_eq!(tcp.read_u8().await.unwrap(), b'S');
+            Box::new(connector(&[cert], false).connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(), tcp,
+            ).await.unwrap())
+        } else { Box::new(tcp) };
+        let mut wire = Agent { io, buffer: BytesMut::new(), ctx: f.ctx.clone() };
+        let mut startup = vec![0,0,0,0,0,3,0,0];
+        startup.extend_from_slice(format!("user\0session:{}\0database\0app\0\0", id.to_hex()).as_bytes());
+        let length = startup.len() as u32;
+        startup[..4].copy_from_slice(&length.to_be_bytes());
+        wire.io.write_all(&startup).await.unwrap();
+        assert!(matches!(close_test_recv(&mut wire).await, Backend::AuthenticationSasl(_)));
+        let mut scram = ScramSha256::new(b"login-secret", ChannelBinding::unsupported());
+        let mut initial = b"SCRAM-SHA-256\0".to_vec();
+        initial.extend_from_slice(&(scram.message().len() as i32).to_be_bytes());
+        initial.extend_from_slice(scram.message());
+        close_test_send(&mut wire, Frontend::Password(initial)).await;
+        let Backend::AuthenticationSaslContinue(data) = close_test_recv(&mut wire).await else { panic!("expected SCRAM challenge") };
+        scram.update(&data).unwrap();
+        close_test_send(&mut wire, Frontend::Password(scram.message().to_vec())).await;
+        let Backend::AuthenticationSaslFinal(data) = close_test_recv(&mut wire).await else { panic!("expected SCRAM final") };
+        scram.finish(&data).unwrap();
+        loop {
+            match close_test_recv(&mut wire).await {
+                Backend::ReadyForQuery(b'I') => break,
+                Backend::AuthenticationOk | Backend::ParameterStatus(..) | Backend::BackendKeyData { .. } => {},
+                _ => panic!("unexpected login response"),
+            }
+        }
+        (wire, server)
+    }
+
+    async fn close_test_send(wire: &mut Agent, message: Frontend) {
+        let mut bytes = BytesMut::new();
+        codec::encode_frontend(&message, &mut bytes);
+        wire.io.write_all(&bytes).await.unwrap();
+        wire.io.flush().await.unwrap();
+    }
+
+    async fn close_test_error(wire: &mut Agent) {
+        let Backend::ErrorResponse(error) = close_test_recv(wire).await else { panic!("expected final error") };
+        assert!(error.iter().any(|(key, value)| *key == b'C' && value == "NY011"));
+        assert!(wire.buffer.is_empty());
+        assert_eq!(wire.io.read(&mut [0; 1]).await.unwrap(), 0);
+    }
+
+    async fn close_test_revoke(f: &Fixture, id: SessionId) {
+        f.ctx.authority.revoke(id, crate::state::model::EndReason::AdminRevoked).unwrap();
+        // Let the final error and FIN arrive, deliberately without reading them.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn linger_tcp_revoke_write_before_read_sees_ny011() {
+        let mut f = Fixture::new();
+        let (id, _) = acquire_login(&f, "postgres");
+        let fake = close_test_upstream(&mut f).await;
+        let (mut wire, server) = close_test_connect(&f, id, false).await;
+        close_test_revoke(&f, id).await;
+        close_test_send(&mut wire, Frontend::Query("SELECT 1".into())).await;
+        close_test_error(&mut wire).await;
+        wire.io.shutdown().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(4), server).await.unwrap().unwrap();
+        fake.abort(); let _ = fake.await;
+    }
+
+    #[tokio::test]
+    async fn linger_tls_revoke_write_before_read_sees_ny011() {
+        let mut f = Fixture::new();
+        let (id, _) = acquire_login(&f, "postgres");
+        let fake = close_test_upstream(&mut f).await;
+        let (mut wire, server) = close_test_connect(&f, id, true).await;
+        close_test_revoke(&f, id).await;
+        close_test_send(&mut wire, Frontend::Query("SELECT 1".into())).await;
+        close_test_error(&mut wire).await;
+        wire.io.shutdown().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(4), server).await.unwrap().unwrap();
+        fake.abort(); let _ = fake.await;
+    }
+
+    #[tokio::test]
+    async fn linger_continuous_writer_is_bounded() {
+        let mut f = Fixture::new();
+        let (id, _) = acquire_login(&f, "postgres");
+        let fake = close_test_upstream(&mut f).await;
+        let (mut wire, server) = close_test_connect(&f, id, false).await;
+        let start = tokio::time::Instant::now();
+        close_test_revoke(&f, id).await;
+        let writer = tokio::spawn(async move {
+            loop {
+                let _ = wire.io.write_all(&[0; 4096]).await;
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(4), server).await.unwrap().unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(4));
+        writer.abort(); let _ = writer.await;
+        fake.abort(); let _ = fake.await;
+    }
+
+    #[tokio::test]
+    async fn linger_silent_client_is_bounded() {
+        let mut f = Fixture::new();
+        let (id, _) = acquire_login(&f, "postgres");
+        let fake = close_test_upstream(&mut f).await;
+        let (_wire, server) = close_test_connect(&f, id, false).await;
+        let start = tokio::time::Instant::now();
+        close_test_revoke(&f, id).await;
+        tokio::time::timeout(std::time::Duration::from_secs(4), server).await.unwrap().unwrap();
+        assert!(start.elapsed() >= DRAIN_TIMEOUT);
+        assert!(start.elapsed() < std::time::Duration::from_secs(4));
+        fake.abort(); let _ = fake.await;
+    }
+
+    #[tokio::test]
+    async fn linger_prompt_eof_finishes_early() {
+        let mut f = Fixture::new();
+        let (id, _) = acquire_login(&f, "postgres");
+        let fake = close_test_upstream(&mut f).await;
+        let (mut wire, server) = close_test_connect(&f, id, false).await;
+        close_test_revoke(&f, id).await;
+        close_test_error(&mut wire).await;
+        let start = tokio::time::Instant::now();
+        wire.io.shutdown().await.unwrap();
+        tokio::time::timeout(DRAIN_TIMEOUT / 2, server).await.unwrap().unwrap();
+        assert!(start.elapsed() < DRAIN_TIMEOUT / 2);
+        fake.abort(); let _ = fake.await;
+    }
+
+    #[tokio::test]
+    async fn linger_other_connection_can_query_during_drain() {
+        let mut f = Fixture::new();
+        use crate::state::{authority::AcquireRequest, model::Verifier};
+        use sha2::{Digest, Sha256};
+        let (first, principal) = acquire_login(&f, "postgres");
+        let second = f.ctx.authority.acquire_session(principal, AcquireRequest {
+            route: f.ctx.route.clone(), mode: None, lifetime_ms: None, isolated: false,
+            label: None, idempotency_key: "second-login".into(),
+            verifier: Verifier(ScramVerifier::from_password("login-secret", b"test-salt", 4096)),
+            secret_sha256: Sha256::digest(b"login-secret").into(),
+        }).unwrap().id;
+        let fake = close_test_upstream(&mut f).await;
+        let (mut draining, first_server) = close_test_connect(&f, first, false).await;
+        let (mut active, second_server) = close_test_connect(&f, second, false).await;
+        close_test_revoke(&f, first).await;
+        close_test_error(&mut draining).await;
+        assert!(!first_server.is_finished());
+        tokio::time::timeout(DRAIN_TIMEOUT / 2, async {
+            close_test_send(&mut active, Frontend::Query("SELECT 1".into())).await;
+            assert!(matches!(close_test_recv(&mut active).await, Backend::CommandComplete(_)));
+            assert!(matches!(close_test_recv(&mut active).await, Backend::ReadyForQuery(b'I')));
+        }).await.unwrap();
+        assert!(!first_server.is_finished());
+        draining.io.shutdown().await.unwrap();
+        close_test_send(&mut active, Frontend::Terminate).await;
+        active.io.shutdown().await.unwrap();
+        first_server.await.unwrap(); second_server.await.unwrap();
+        fake.abort(); let _ = fake.await;
     }
 
 }

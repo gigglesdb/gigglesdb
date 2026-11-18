@@ -3752,3 +3752,99 @@ async fn live_two_deployments_native_refuse_cross_deployment_reuse() -> ServeRes
     checks.finish(TEST, 1);
     Ok(())
 }
+
+
+#[tokio::test]
+#[ignore = "requires NUNYA_TEST_PG and NUNYA_TEST_PYTHON with psycopg"]
+async fn live_pg_idle_psycopg_sees_ny011_after_revoke() -> ServeResult<()> {
+    use std::process::Stdio;
+    use std::io::{BufRead, BufReader, Write};
+    struct PythonChild(std::process::Child);
+    impl Drop for PythonChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    const TEST: &str = "live_pg_idle_psycopg_sees_ny011_after_revoke";
+    const PYTHON: &str = r#"
+import os, sys, time
+import psycopg
+try:
+    conn = psycopg.connect(os.environ['NUNYA_IDLE_DSN'], autocommit=True)
+    conn.execute('SELECT 1').fetchall()
+except Exception:
+    print('NONE', flush=True)
+    sys.exit(1)
+print('READY', flush=True)
+sys.stdin.readline()
+time.sleep(1)
+try:
+    conn.execute('SELECT 1').fetchall()
+    print('OK', flush=True)
+except Exception as error:
+    print(getattr(error, 'sqlstate', None) or 'NONE', flush=True)
+finally:
+    conn.close()
+"#;
+    let python = std::env::var("NUNYA_TEST_PYTHON")
+        .map_err(|_| "NUNYA_TEST_PYTHON must name a Python interpreter with psycopg installed")?;
+    let mut h = ServeHarness::new(
+        &file_sink_policy(), Some(&std::env::var("NUNYA_TEST_PG")?), None, None, "",
+    )?;
+    h.start().await?;
+    let mut checks = LiveChecks::default();
+    for iteration in 0..5 {
+        let (session, secret, _) = h.acquire_session(
+            &format!("idle-psycopg-{iteration}"), "postgres", Mode::ReadWrite,
+        ).await?;
+        let password = secret.secret.replace('\\', "\\\\").replace('\'', "\\'");
+        let dsn = zeroize::Zeroizing::new(format!(
+            "host=127.0.0.1 port={} dbname=app user=session:{} password='{}' sslmode=disable connect_timeout=10",
+            h.pg_port(), session.id, password,
+        ));
+        let mut child = PythonChild(std::process::Command::new(&python)
+            .args(["-I", "-c", PYTHON])
+            .env("NUNYA_IDLE_DSN", dsn.as_str())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn()?);
+        let stdout = child.0.stdout.take().ok_or("missing Python stdout")?;
+        let (send, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if send.send(line).is_err() { break; }
+            }
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(20), lines.recv()).await?.transpose()?;
+        if ready.as_deref() != Some("READY") {
+            return Err("psycopg initial SELECT failed before readiness".into());
+        }
+        h.admin().revoke(&session.id).await?;
+        let mut stdin = child.0.stdin.take().ok_or("missing Python stdin")?;
+        stdin.write_all(b"continue\n")?;
+        drop(stdin);
+        let result = tokio::time::timeout(Duration::from_secs(10), lines.recv()).await?.transpose()?;
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = child.0.try_wait()? { break Ok::<_, std::io::Error>(status); }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }).await??;
+        reader.join().map_err(|_| "Python output reader failed")?;
+        // Only known data-free outcomes enter the qualification report.
+        let outcome = match result.as_deref() {
+            Some("NY011") => "NY011",
+            Some("OK") => "OK",
+            Some("NONE") => "NONE",
+            _ => "unexpected-sqlstate",
+        };
+        checks.check(TEST, "idle-psycopg-ny011", outcome == "NY011" && status.success(),
+            format!("iteration={iteration} sqlstate={outcome}"));
+        let fresh = live_outcome(connect(&h, &format!("session:{}", session.id), &secret).await);
+        checks.check(TEST, "fresh-ny003", fresh == "NY003",
+            format!("iteration={iteration} sqlstate={fresh}"));
+    }
+    h.stop()?;
+    checks.finish(TEST, 5);
+    Ok(())
+}
