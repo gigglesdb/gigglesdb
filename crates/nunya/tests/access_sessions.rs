@@ -3214,7 +3214,7 @@ async fn live_pg_ny012_commit_outcome_unknown_no_replay() -> ServeResult<()> {
                 .collect::<Result<Vec<_>, _>>()?;
             let reason = if variant == "C" { "upstream_lost" } else { "revoked" };
             let unknown = records.iter().any(|record| {
-                record["session"] == s.id.to_string()
+                record["session"].as_str() == Some(s.id.as_str())
                     && record["kind"] == "lifecycle"
                     && record["event"] == "write_outcome_unknown"
                     && record["reason"] == reason
