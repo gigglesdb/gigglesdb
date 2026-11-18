@@ -4,3 +4,6 @@
 **/artifacts/
 /composite-review.db/
 node_modules/
+
+# Machine-specific agent settings (see AGENTS_LOCAL.example.md).
+/AGENTS_LOCAL.md
