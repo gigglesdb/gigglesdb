@@ -157,6 +157,55 @@ if [ $build_snapshot = 1 ]; then run="$results_root/snapshot-$stamp-$short-$who-
 mkdir -p "$run" "$boatdir/slots"
 log() { echo "[bench-remote $(date -u +%T)] $*" >&2; }
 bj() { "$B" --no-update "$@"; }
+# BEGIN adopt_box (also exercised by the external dry-run driver)
+adopt_box() {
+  local listing
+  listing=$(bj list --all --json 2>/dev/null) || return 0
+  # Read only sandbox-level fields; nested objects and quoted braces are data.
+  printf '%s\n' "$listing" | awk -v wanted="$boxname" '
+    {
+      for (i = 1; i <= length($0); i++) {
+        c = substr($0, i, 1)
+        if (quoted) {
+          if (escaped) { token = token c; escaped = 0 }
+          else if (c == "\\") { token = token c; escaped = 1 }
+          else if (c == "\"") {
+            quoted = 0
+            if (depth == 2) {
+              if (substr($0, i + 1) ~ /^[[:space:]]*:/) {
+                key = token
+                if (key == "access") sandbox = 1
+              } else if (key == "id") id = token
+              else if (key == "name") name = token
+            }
+          } else token = token c
+          continue
+        }
+        if (c == "\"") { quoted = 1; token = "" }
+        else if (c == "{") {
+          depth++
+          if (depth == 2) { sandbox = 0; key = id = name = "" }
+        } else if (c == "}") {
+          if (depth == 2 && sandbox && !found && name == wanted && id ~ /^bx_[a-z0-9]+$/) {
+            print id
+            found = 1
+          }
+          depth--
+        }
+      }
+    }
+  ' 2>/dev/null || true
+  return 0
+}
+# END adopt_box
+recover_box() {
+  box=$(adopt_box)
+  if [ -n "$box" ]; then
+    echo "$(date -u +%FT%TZ) | $who | $box | $type | $short | START bench (adopted after failed new)" >> "$boatdir/usage.log"
+    log "adopted box $box after failed new"
+  fi
+  return 0
+}
 jfield() { python -c "import json,sys
 lines=[l for l in sys.stdin.read().splitlines() if l.strip().startswith('{')]
 d=json.loads(lines[-1]) if lines else {}
@@ -190,9 +239,12 @@ if [ "$used" -ge "$max_starts" ]; then
 fi
 
 # 2. Slot (atomic mkdir), released on exit; box deleted on every exit path.
-slot='' box='' ref="refs/bench-remote/$stamp-$$" started=$(date +%s)
+slot='' box='' boxname='' new_tried=0 ref="refs/bench-remote/$stamp-$$" started=$(date +%s)
 cleanup() {
   rc=$?
+  if [ -z "$box" ] && [ "$new_tried" = 1 ] && [ -n "$boxname" ]; then
+    recover_box
+  fi
   if [ -n "$box" ]; then
     if [ "$bench_started" = 1 ] && [ "$copied" != 1 ]; then
       log "copying partial results back"
@@ -235,10 +287,16 @@ fi
 
 # 4. Box from the snapshot.
 log "starting $type box from $from"
-out=$(bj new --from "$from" --type "$type" --no-env --ttl "$ttl" --name "$who-$short" --json 2>&1) || {
-  log "boat new failed: $(echo "$out" | tail -2)"; exit 5; }
-box=$(echo "$out" | grep -o '"id":"bx_[a-z0-9]*"' | head -1 | cut -d'"' -f4)
-[ -n "$box" ] || { log "no box id in: $(echo "$out" | tail -2)"; exit 5; }
+# Truncate only the coordinator segment, preserving the unique run suffix.
+name_who=${who//[^A-Za-z0-9_.-]/_}
+name_suffix="-$short-$stamp-$$"
+name_limit=$(( 120 - ${#name_suffix} ))
+boxname="${name_who:0:name_limit}$name_suffix"
+new_tried=1
+out=$(bj new --from "$from" --type "$type" --no-env --ttl "$ttl" --name "$boxname" --json 2>&1) || {
+  log "boat new failed: $(echo "$out" | tail -2)"; recover_box; exit 5; }
+box=$(echo "$out" | grep -o '"id":"bx_[a-z0-9]*"' | head -1 | cut -d'"' -f4) || true
+[ -n "$box" ] || { log "no box id in: $(echo "$out" | tail -2)"; recover_box; exit 5; }
 echo "$(date -u +%FT%TZ) | $who | $box | $type | $short | START bench" >> "$boatdir/usage.log"
 echo "$box $who $short $(date -u +%FT%TZ)" > "$boatdir/slots/$slot/owner"
 log "box $box ready"
