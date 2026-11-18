@@ -134,6 +134,10 @@ fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, 
         ("round", &[DoublePrecision], DoublePrecision) => Some((true, true)), // pg_proc 1342
         ("trunc", &[DoublePrecision], DoublePrecision) => Some((true, true)), // pg_proc 1343
         ("sqrt", &[DoublePrecision], DoublePrecision) => Some((true, true)), // pg_proc 1344
+        ("erf", &[DoublePrecision], DoublePrecision) => Some((true, true)),
+        ("erfc", &[DoublePrecision], DoublePrecision) => Some((true, true)),
+        ("gamma", &[DoublePrecision], DoublePrecision) => Some((true, true)),
+        ("lgamma", &[DoublePrecision], DoublePrecision) => Some((true, true)),
         ("cbrt", &[DoublePrecision], DoublePrecision) => Some((true, true)), // pg_proc 1345
         ("exp", &[DoublePrecision], DoublePrecision) => Some((true, true)), // pg_proc 1347
         ("timestamptz", &[Date, TimeTz], TimestampTz) => Some((true, true)), // pg_proc 1359

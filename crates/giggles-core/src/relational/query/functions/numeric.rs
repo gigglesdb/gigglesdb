@@ -219,15 +219,15 @@ pub(super) fn eval(name: &str, values: &[Value]) -> Option<R<Value>> {
     })())
 }
 
-// PostgreSQL REL_18_0 float.c domain/range rules; platform libm bytes
-// remain subject to exact differential qualification.
+// PostgreSQL float.c domain/range rules, with pinned glibc runtime math.
 pub(super) fn float_arity(name: &str) -> Option<usize> {
     Some(match name {
         "pi" => 0,
         "power" | "atan2" | "atan2d" => 2,
-        "sqrt" | "cbrt" | "exp" | "ln" | "log" | "log10" | "radians" | "degrees" | "sin"
-        | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
-        | "acosh" | "atanh" | "sind" | "cosd" | "tand" | "cotd" | "asind" | "acosd" | "atand" => 1,
+        "erf" | "erfc" | "gamma" | "lgamma" | "sqrt" | "cbrt" | "exp" | "ln" | "log" | "log10"
+        | "radians" | "degrees" | "sin" | "cos" | "tan" | "cot" | "asin" | "acos" | "atan"
+        | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "sind" | "cosd" | "tand"
+        | "cotd" | "asind" | "acosd" | "atand" => 1,
         _ => return None,
     })
 }
@@ -257,6 +257,11 @@ fn float_eval(name: &str, values: &[Value]) -> Option<R<Value>> {
         } else {
             0.0
         };
+        let math = if matches!(name, "sqrt" | "radians" | "degrees") {
+            None
+        } else {
+            Some(glibm()?)
+        };
         if (name == "sqrt" && x < 0.0)
             || (matches!(name, "ln" | "log" | "log10") && x <= 0.0)
             || (matches!(name, "asin" | "acos" | "atanh") && x.abs() > 1.0)
@@ -268,28 +273,47 @@ fn float_eval(name: &str, values: &[Value]) -> Option<R<Value>> {
             return Err(SqlError::Type);
         }
         let out = match name {
+            "erf" => math.unwrap().erf(x),
+            "erfc" => math.unwrap().erfc(x),
+            "gamma" => {
+                if x == f64::NEG_INFINITY {
+                    return Err(float_range_error(false));
+                }
+                let out = math.unwrap().tgamma(x);
+                if x.is_finite() && (out.is_infinite() || out.is_nan() || out == 0.0) {
+                    return Err(float_range_error(out == 0.0));
+                }
+                out
+            }
+            "lgamma" => {
+                let out = math.unwrap().lgamma(x);
+                if out.is_infinite() && !x.is_infinite() {
+                    return Err(float_range_error(false));
+                }
+                out
+            }
             "sqrt" => x.sqrt(),
-            "cbrt" => x.cbrt(),
-            "exp" => x.exp(),
-            "ln" => x.ln(),
-            "log" | "log10" => x.log10(),
-            "power" => x.powf(y),
+            "cbrt" => math.unwrap().cbrt(x),
+            "exp" => math.unwrap().exp(x),
+            "ln" => math.unwrap().log(x),
+            "log" | "log10" => math.unwrap().log10(x),
+            "power" => math.unwrap().pow(x, y),
             "radians" => x * (std::f64::consts::PI / 180.0),
             "degrees" => x / (std::f64::consts::PI / 180.0),
-            "sin" => x.sin(),
-            "cos" => x.cos(),
-            "tan" => x.tan(),
-            "cot" => 1.0 / x.tan(),
-            "asin" => x.asin(),
-            "acos" => x.acos(),
-            "atan" => x.atan(),
-            "atan2" => x.atan2(y),
-            "sinh" => x.sinh(),
-            "cosh" => x.cosh(),
-            "tanh" => x.tanh(),
-            "asinh" => x.asinh(),
-            "acosh" => x.acosh(),
-            "atanh" => x.atanh(),
+            "sin" => math.unwrap().sin(x),
+            "cos" => math.unwrap().cos(x),
+            "tan" => math.unwrap().tan(x),
+            "cot" => 1.0 / math.unwrap().tan(x),
+            "asin" => math.unwrap().asin(x),
+            "acos" => math.unwrap().acos(x),
+            "atan" => math.unwrap().atan(x),
+            "atan2" => math.unwrap().atan2(x, y),
+            "sinh" => math.unwrap().sinh(x),
+            "cosh" => math.unwrap().cosh(x),
+            "tanh" => math.unwrap().tanh(x),
+            "asinh" => math.unwrap().asinh(x),
+            "acosh" => math.unwrap().acosh(x),
+            "atanh" => math.unwrap().atanh(x),
             _ => return Err(SqlError::Unsupported),
         };
         if out.is_infinite()
@@ -305,4 +329,24 @@ fn float_eval(name: &str, values: &[Value]) -> Option<R<Value>> {
         }
         Ok(Value::Float8(Float8::from_bits(out.to_bits())))
     })())
+}
+
+/// The error is cached by the loader; emit its full search diagnostics only once.
+pub(super) fn glibm() -> R<&'static giggles_glibm_loader::Glibm> {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    giggles_glibm_loader::Glibm::get().map_err(|e| {
+        LOGGED.call_once(|| eprintln!("{e}"));
+        SqlError::Unsupported
+    })
+}
+fn float_range_error(underflow: bool) -> SqlError {
+    user_types::view_replace_error(
+        if underflow {
+            "value out of range: underflow"
+        } else {
+            "value out of range: overflow"
+        }
+        .into(),
+    );
+    SqlError::Overflow
 }

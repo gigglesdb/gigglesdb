@@ -26,32 +26,32 @@ use super::*;
 // Keep the operations and their order aligned with PostgreSQL. In particular,
 // converting to radians followed by a single libm call loses exact special angles.
 const RAD: f64 = std::f64::consts::PI / 180.0;
-fn sin_q1(x: f64) -> f64 {
+fn sin_q1(m: &giggles_glibm_loader::Glibm, x: f64) -> f64 {
     if x <= 30.0 {
-        ((x * RAD).sin() / (30.0 * RAD).sin()) / 2.0
+        (m.sin(x * RAD) / m.sin(30.0 * RAD)) / 2.0
     } else {
-        cos_q1(90.0 - x)
+        cos_q1(m, 90.0 - x)
     }
 }
-fn cos_q1(x: f64) -> f64 {
+fn cos_q1(m: &giggles_glibm_loader::Glibm, x: f64) -> f64 {
     if x <= 60.0 {
-        1.0 - ((1.0 - (x * RAD).cos()) / (1.0 - (60.0 * RAD).cos())) / 2.0
+        1.0 - ((1.0 - m.cos(x * RAD)) / (1.0 - m.cos(60.0 * RAD))) / 2.0
     } else {
-        sin_q1(90.0 - x)
+        sin_q1(m, 90.0 - x)
     }
 }
-fn asin_q1(x: f64) -> f64 {
+fn asin_q1(m: &giggles_glibm_loader::Glibm, x: f64) -> f64 {
     if x <= 0.5 {
-        (x.asin() / 0.5_f64.asin()) * 30.0
+        (m.asin(x) / m.asin(0.5)) * 30.0
     } else {
-        90.0 - (x.acos() / 0.5_f64.acos()) * 60.0
+        90.0 - (m.acos(x) / m.acos(0.5)) * 60.0
     }
 }
-fn acos_q1(x: f64) -> f64 {
+fn acos_q1(m: &giggles_glibm_loader::Glibm, x: f64) -> f64 {
     if x <= 0.5 {
-        90.0 - (x.asin() / 0.5_f64.asin()) * 30.0
+        90.0 - (m.asin(x) / m.asin(0.5)) * 30.0
     } else {
-        (x.acos() / 0.5_f64.acos()) * 60.0
+        (m.acos(x) / m.acos(0.5)) * 60.0
     }
 }
 
@@ -81,6 +81,7 @@ pub(super) fn eval(name: &str, values: &[Value]) -> Option<R<Value>> {
         } else {
             0.0
         };
+        let m = numeric::glibm()?;
         let out = if x.is_nan() || y.is_nan() {
             f64::NAN
         } else {
@@ -90,14 +91,14 @@ pub(super) fn eval(name: &str, values: &[Value]) -> Option<R<Value>> {
                         return Err(SqlError::Overflow);
                     }
                     match (name, x >= 0.0) {
-                        ("asind", true) => asin_q1(x),
-                        ("asind", false) => -asin_q1(-x),
-                        (_, true) => acos_q1(x),
-                        (_, false) => 90.0 + asin_q1(-x),
+                        ("asind", true) => asin_q1(m, x),
+                        ("asind", false) => -asin_q1(m, -x),
+                        (_, true) => acos_q1(m, x),
+                        (_, false) => 90.0 + asin_q1(m, -x),
                     }
                 }
-                "atand" => (x.atan() / 1.0_f64.atan()) * 45.0,
-                "atan2d" => (x.atan2(y) / 1.0_f64.atan()) * 45.0,
+                "atand" => (m.atan(x) / m.atan(1.0)) * 45.0,
+                "atan2d" => (m.atan2(x, y) / m.atan(1.0)) * 45.0,
                 _ => {
                     if x.is_infinite() {
                         return Err(SqlError::Overflow);
@@ -123,13 +124,13 @@ pub(super) fn eval(name: &str, values: &[Value]) -> Option<R<Value>> {
                         }
                     }
                     match name {
-                        "sind" => sign * sin_q1(a),
-                        "cosd" => sign * cos_q1(a),
+                        "sind" => sign * sin_q1(m, a),
+                        "cosd" => sign * cos_q1(m, a),
                         "tand" | "cotd" => {
                             let ratio = if name == "tand" {
-                                (sin_q1(a) / cos_q1(a)) / (sin_q1(45.0) / cos_q1(45.0))
+                                (sin_q1(m, a) / cos_q1(m, a)) / (sin_q1(m, 45.0) / cos_q1(m, 45.0))
                             } else {
-                                (cos_q1(a) / sin_q1(a)) / (cos_q1(45.0) / sin_q1(45.0))
+                                (cos_q1(m, a) / sin_q1(m, a)) / (cos_q1(m, 45.0) / sin_q1(m, 45.0))
                             };
                             let out = sign * ratio;
                             if out == 0.0 { 0.0 } else { out }

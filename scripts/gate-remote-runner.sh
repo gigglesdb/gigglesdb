@@ -175,6 +175,17 @@ else
   echo "rc=1" > "$out/done"
   exit 1
 fi
+s=$(date +%s); progress "glibm build"
+if glibm_dir=$(bash ../scripts/glibm/build.sh 2> "$out/glibm-build.log"); then
+  export GIGGLES_GLIBM_DIR="$glibm_dir"
+  note "glibm build: ok ($(( $(date +%s) - s ))s) $GIGGLES_GLIBM_DIR"
+else
+  note "glibm build failed ($(( $(date +%s) - s ))s); see glibm-build.log"
+  note "RESULT: FAIL"
+  progress "done rc=1 (glibm build failed)"
+  echo "rc=1" > "$out/done"
+  exit 1
+fi
 for step in "$@"; do
   crate=${step%%:*}; mode=default; files=''
   case "$step" in

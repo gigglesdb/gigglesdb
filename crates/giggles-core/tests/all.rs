@@ -553,3 +553,6 @@ mod paging_collation;
 
 #[path = "planner_collations.rs"]
 mod planner_collations;
+
+#[path = "sql_float_glibc.rs"]
+mod sql_float_glibc;

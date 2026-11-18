@@ -16,6 +16,7 @@ test-sql-parser-trap = []
 test-metadata-counts = []
 
 [dependencies]
+giggles-glibm-loader = { path = "../giggles-glibm-loader" }
 giggles-icu = { path = "../giggles-icu" }
 giggles-pg-types = { path = "../giggles-pg-types" }
 giggles-transactions = { path = "../giggles-transactions" }
