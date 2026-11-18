@@ -547,3 +547,6 @@ mod user_collation_ddl;
 
 #[path = "dml_collation.rs"]
 mod dml_collation;
+
+#[path = "paging_collation.rs"]
+mod paging_collation;

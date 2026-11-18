@@ -241,11 +241,12 @@ impl Plan {
         }
         if let Some(sample) = &self.decorations.sample { sample.apply(&mut result, params, parameters, clock, execution)?; }
         let mut tie_keys = vec![];
+        let mut order = vec![];
         if !self.order.is_empty() {
             let table = bind::result_table(&result.columns);
             let _collations =
                 functions::collation::ColumnScope::enter(&table.columns, &meta.collations)?;
-            let order = self
+            order = self
                 .order
                 .iter()
                 .map(|(s, desc, first)| {
@@ -295,7 +296,12 @@ impl Plan {
         if let Some(limit) = limit {
             let mut end = usize::try_from(limit).unwrap_or(usize::MAX).min(result.rows.len());
             if self.decorations.with_ties && end > 0 {
-                while end < tie_keys.len() && super::super::grouping::cmp_values(&tie_keys[end], &tie_keys[end - 1]) == Ordering::Equal { end += 1; }
+                // Peers use the same expression collations as the ORDER BY sort.
+                while end < tie_keys.len()
+                    && order_values(&tie_keys[end], &tie_keys[end - 1], &order) == Ordering::Equal
+                {
+                    end += 1;
+                }
             }
             result.rows.truncate(end);
         }
