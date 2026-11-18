@@ -1,3 +1,8 @@
+// GD-0084 N3: allocator churn; turn the feature off for A/B.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use giggles_core::{Admin, Limits};
 use giggles_server::{
     Binding, Running, Service,
