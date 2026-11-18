@@ -197,3 +197,7 @@ pub use store::{LocalRevisionStore, NewRevision, Owner, PolicyRevision, Revision
 
 /// Value-free policy previews.
 pub mod diff;
+
+/// Revision epochs and synchronous release fencing.
+pub mod fence;
+pub use fence::{RevisionFence, ReleaseSlot, column_tightens, tightens};

@@ -7,6 +7,7 @@ pub(super) struct Prepared {
     generation: [u8; 16],
     plan: RewritePlan,
     columns: Vec<crate::schema::ColumnRef>,
+    epoch: u64,
     param_count: u32,
     kind: StatementKind,
     param_types: Vec<u32>,
@@ -110,6 +111,7 @@ impl Session {
         out
     }
     fn prepare(&mut self, sql: &str, param_types: Vec<u32>) -> Result<Prepared, Refusal> {
+        let epoch = self.ctx.fence.epoch();
         let (policy, policy_revision, snapshot) = self.ctx.policy_and_snapshot()?;
         self.statement_revision = policy_revision.clone();
         let snapshot = self.pin_snapshot(snapshot)?;
@@ -176,6 +178,7 @@ impl Session {
             *slot = ty.pg_oid().ok_or_else(protocol)?;
         }
         Ok(Prepared {
+            epoch,
             empty_query,
             generation: random::<16>()?,
             plan,
@@ -431,9 +434,9 @@ impl Session {
                         return Err(failure(NyCode::StatementNotAllowed));
                     }
                     let (current, _, snapshot) = self.ctx.policy_and_snapshot()?;
-                    if let Err(error) = p.check_treatments(&current) {
+                    if crate::policy::fence::tightens(&p.policy, &current) {
                         stale_execute = true;
-                        return Err(error);
+                        return Err(failure(NyCode::SchemaStale));
                     }
                     let snapshot = self.pin_snapshot(snapshot)?;
                     if (self.ctx.clock)().saturating_sub(snapshot.taken_at_unix_ms)
@@ -550,6 +553,7 @@ impl Session {
                             writes(&p.kind) || matches!(p.kind, StatementKind::Commit);
                         self.pending.push_back(Pending::Execute(
                             Active {
+                                epoch: p.epoch,
                                 plan: p.plan,
                                 kind: p.kind,
                                 record,
@@ -646,10 +650,13 @@ impl Session {
                 self.drain_deferred(&mut out);
                 out
             }
-            Err(e) => Actions {
-                client: vec![Backend::ErrorResponse(nunya_error(e.code))],
-                close: true,
-                ..Actions::default()
+            Err(e) => {
+                self.ctx.metrics.refused(e.code);
+                Actions {
+                    client: vec![Backend::ErrorResponse(nunya_error(e.code))],
+                    close: true,
+                    ..Actions::default()
+                }
             },
         }
     }
@@ -787,6 +794,7 @@ impl Session {
                 if row.len() != a.plan.outputs.len() {
                     return Err(failure(NyCode::NotAnalysable));
                 }
+                check_release(&self.ctx, &self.release, a)?;
                 let (row, tokens) = rewrite_row(
                     row,
                     &a.plan,
@@ -886,6 +894,7 @@ mod treatment_tests {
         let mut current = planned.clone();
         current.columns.insert(column.clone(), crate::policy::Treatment::Show);
         let prepared = Prepared {
+            epoch: fixture.ctx.fence.epoch(),
             empty_query: false,
             generation: [0; 16],
             plan: RewritePlan { outputs: vec![], inputs: vec![], tokenize: None },

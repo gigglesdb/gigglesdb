@@ -162,6 +162,7 @@ pub(crate) async fn run_spanner_with_hub(
             Arc::new(crate::policy::effective::served_policy(&declared, &snapshot, &Default::default()))
         } else { policy };
         let ctx = Arc::new(SpannerContext {
+            fence: Default::default(),
             authority: state.authority,
             registry: state.registry,
             route: state.route,

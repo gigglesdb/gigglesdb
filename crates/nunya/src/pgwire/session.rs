@@ -14,7 +14,7 @@ use crate::{
         self, InputRewrite, OutputRewrite, ResolvedStatement, RewritePlan, StatementKind, UseKind,
         ValueSource,
     },
-    policy::{DomainName, Policy, TokenizeSetting},
+    policy::{DomainName, Policy, TokenizeSetting, fence::{ReleaseSlot, tightens}},
     readlog::{LifecycleActor, LifecycleKind, LifecycleRecord, Outcome, ReadLogRecord, redact_tokenize_args, statement_fingerprint},
     state::{
         authority::{AdmitError, Operation, TokenizeError, TokenizeLimits},
@@ -78,11 +78,28 @@ struct Active {
     kind: StatementKind,
     record: ReadLogRecord,
     policy: Arc<Policy>,
+    epoch: u64,
     described: bool,
+}
+fn check_release(ctx: &GatewayContext, release: &ReleaseSlot, active: &mut Active) -> Result<(), Refusal> {
+    let epoch = release.begin(&ctx.fence);
+    if epoch != active.epoch {
+        let current = ctx.policy.read().map_err(|_| protocol())?;
+        if tightens(&active.policy, &current) {
+            let mut record = active.record.clone();
+            record.outcome = Outcome::Refused(NyCode::SchemaStale);
+            ctx.readlog.write(&record)?;
+            return Err(failure(NyCode::SchemaStale));
+        }
+        active.epoch = epoch;
+        release.advance(epoch);
+    }
+    Ok(())
 }
 /// Socket-independent simple and extended protocol state with ordered responses.
 pub struct Session {
     ctx: Arc<GatewayContext>,
+    release: Arc<ReleaseSlot>,
     pinned_path: Vec<String>,
     snapshot_cache: Option<(Arc<crate::schema::Snapshot>, Arc<crate::schema::Snapshot>)>,
     keys: ScopeKeys,
@@ -124,7 +141,9 @@ impl Session {
         scope: crate::token::ScopeId,
     ) -> Self {
         let pinned_path = ctx.snapshot.read().unwrap_or_else(std::sync::PoisonError::into_inner).search_path.clone();
+        let release = ctx.fence.register();
         Self {
+            release,
             pinned_path,
             snapshot_cache: None,
             ctx,
@@ -154,6 +173,10 @@ impl Session {
             statement_revision: None,
             end_requested: None,
         }
+    }
+    /// Finish handing the current release batch to the agent socket.
+    pub(crate) fn release_done(&self) {
+        self.release.end();
     }
     #[cfg(test)]
     fn snapshot(&mut self) -> Result<Arc<crate::schema::Snapshot>, Refusal> {
@@ -386,6 +409,7 @@ impl Session {
         let result = (|| {
             // Admit at processing time so deferred queries use current authority.
             let mode = self.admit()?;
+            let epoch = self.ctx.fence.epoch();
             let (policy, revision, snapshot) = self.ctx.policy_and_snapshot()?;
             self.statement_revision = revision;
             let snapshot = self.pin_snapshot(snapshot)?;
@@ -526,6 +550,7 @@ impl Session {
                     .get(statement.source_span.start..statement.source_span.end)
                     .ok_or_else(protocol)?;
                 self.active.push_back(Active {
+                    epoch,
                     plan,
                     kind: statement.kind,
                     record: self.record(text, Outcome::Allowed),
@@ -646,6 +671,7 @@ impl Session {
                 if !active.described || row.len() != active.plan.outputs.len() {
                     return Err(failure(NyCode::NotAnalysable));
                 }
+                check_release(&self.ctx, &self.release, active)?;
                 let (row, tokens) = rewrite_row(
                     row,
                     &active.plan,
@@ -1452,7 +1478,9 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
                 result = upstream.send(&actions.upstream) => result.map_err(|error| session.upstream_lost(error, write_before_batch))?,
             }
         }
-        if let Some(reason) = send_or_end(agent, &mut end, &actions.client).await? {
+        let sent = send_or_end(agent, &mut end, &actions.client).await;
+        session.release_done();
+        if let Some(reason) = sent? {
             end_connection(agent, &mut upstream, &mut session, reason).await?;
             return Ok(());
         }
@@ -1465,6 +1493,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("session/revision_tests.rs");
     include!("session/send_failure_tests.rs");
     include!("session/sql_error_tests.rs");
     include!("session/segment_tests.rs");
@@ -1598,6 +1627,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let ctx = Arc::new(GatewayContext {
+                fence: Default::default(),
                 authority: runtime.authority.clone(),
                 registry: runtime.registry.clone(),
                 route: crate::state::model::RouteId::new("postgres").unwrap(),
@@ -3496,7 +3526,7 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn prepared_tokenize_retains_snapshot_limit_at_execute() {
+    fn prepared_tokenize_refuses_domain_limit_tightening_at_execute() {
         let f = Fixture::new();
         let mut s = f.session();
         assert!(
@@ -3513,13 +3543,14 @@ pub(crate) mod tests {
             result_formats: vec![],
         });
         set_tokenize_limits(&f, 1, 20);
-        let allowed = s.frontend(Frontend::Execute {
+        let refused = s.frontend(Frontend::Execute {
             portal: "next".into(),
             max_rows: 0,
         });
-        assert!(allowed.client.iter().any(|message| matches!(message, Backend::DataRow(_))));
-        // A new Parse captures the tightened limit without resetting durable counters.
-        assert_eq!(code(&tokenize(&mut s, true)), "NY007");
+        assert_eq!(code(&refused), "NY008");
+        assert!(!refused.client.iter().any(|message| matches!(message, Backend::DataRow(_))));
+        // Refused Execute consumes no additional durable tokenization budget.
+        assert_eq!(f.ctx.authority.session_tokenizations(s.session, &DomainName("secret".into())).unwrap(), 1);
     }
     #[test]
     fn local_tokenize_limit_and_mixed_query() {
@@ -4284,7 +4315,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn statement_snapshot_retains_revision_and_tokenize_limits_across_reload() {
+    fn statement_bound_before_domain_tightening_is_refused_at_execute() {
         for sql in ["SELECT value FROM items", "SELECT nunya_tokenize('secret', 'private')"] {
             let f = Fixture::new();
             *f.ctx.policy_revision.write().unwrap() = Some("R1".into());
@@ -4296,20 +4327,22 @@ pub(crate) mod tests {
             if !local { s.backend(Backend::BindComplete); }
             {
                 let mut current = f.ctx.policy.write().unwrap();
+                let old = current.clone();
                 let mut next = (**current).clone();
                 if let TokenizeSetting::On { limit_per_session, .. } = &mut next.domains.get_mut(&DomainName("secret".into())).unwrap().tokenize {
                     *limit_per_session = 0;
                 }
                 *current = Arc::new(next);
+                assert!(f.ctx.fence.publish(&old, &current).is_some());
                 *f.ctx.policy_revision.write().unwrap() = Some("R2".into());
             }
+            // Local tokenize has no row release check, but extended Execute's
+            // whole-policy admission check also refuses this local portal.
             let out = s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 });
-            assert!(!out.close);
-            assert!(!out.client.iter().any(|m| matches!(m, Backend::ErrorResponse(_))));
-            if !local {
-                s.backend(Backend::RowDescription(vec![field()]));
-                s.backend(Backend::CommandComplete("SELECT 0".into()));
-            }
+            assert!(out.upstream.is_empty());
+            assert!(out.client.iter().any(|m| matches!(m, Backend::ErrorResponse(fields)
+                if fields.iter().any(|(key, value)| *key == b'C' && value == "NY008"))));
+            assert!(!out.client.iter().any(|m| matches!(m, Backend::DataRow(_))));
             s.frontend(Frontend::Sync);
             s.backend(Backend::ReadyForQuery(b'I'));
             assert!(f.identities.lock().unwrap().iter().all(|r| r.policy_revision.as_deref() == Some("R1")));
@@ -4321,6 +4354,32 @@ pub(crate) mod tests {
             if local { assert!(matches!(records[0].outcome, Outcome::Refused(NyCode::TokenizeLimit))); }
             assert!(records.iter().all(|r| r.policy_revision.as_deref() == Some("R2")));
         }
+    }
+
+    #[test]
+    fn identical_republish_keeps_epoch_and_bound_revision() {
+        let f = Fixture::new();
+        *f.ctx.policy_revision.write().unwrap() = Some("R1".into());
+        let mut s = f.session();
+        prepare_admission_portal(&mut s, "SELECT value FROM items");
+        let epoch = f.ctx.fence.epoch();
+        {
+            let mut current = f.ctx.policy.write().unwrap();
+            let old = current.clone();
+            *current = Arc::new((**current).clone());
+            assert_eq!(f.ctx.fence.publish(&old, &current), None);
+            *f.ctx.policy_revision.write().unwrap() = Some("R2".into());
+        }
+        assert_eq!(f.ctx.fence.epoch(), epoch);
+        let out = s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 });
+        assert!(matches!(out.upstream.as_slice(), [Frontend::Execute { .. }]));
+        s.backend(Backend::RowDescription(vec![field()]));
+        assert_revision_row(&revision_row(&mut s), true);
+        s.release_done();
+        s.backend(Backend::CommandComplete("SELECT 1".into()));
+        let records = f.identities.lock().unwrap();
+        assert!(!records.is_empty());
+        assert!(records.iter().all(|r| r.policy_revision.as_deref() == Some("R1")));
     }
 
     #[tokio::test]

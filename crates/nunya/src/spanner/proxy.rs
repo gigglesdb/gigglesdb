@@ -15,7 +15,7 @@ use crate::{
     },
     error::{NyCode, Refusal},
     ir::{InputRewrite, RewritePlan, StatementKind, ValueSource, check::check},
-    policy::{DomainName, Policy, TokenizeSetting, Treatment},
+    policy::{DomainName, Policy, TokenizeSetting, Treatment, ReleaseSlot, tightens},
     readlog::{LifecycleRecord, LifecycleKind, LifecycleActor, Outcome, ReadLog, ReadLogRecord, statement_fingerprint},
     schema::Snapshot,
     state::authority::{AdmitError, Operation, TokenizeError, TokenizeLimits},
@@ -53,6 +53,8 @@ pub enum SpannerUpstream {
 }
 /// Shared resources for native Spanner requests.
 pub struct SpannerContext {
+    /// Shared policy revision release fence.
+    pub fence: Arc<crate::policy::RevisionFence>,
     /// Shared durable session authority.
     pub authority: Arc<crate::state::authority::Authority>,
     /// Shared live connection registry.
@@ -153,6 +155,7 @@ where
 }
 type WriteClient = SpannerClient<InterceptedService<DispatchService<Channel>, AuthInterceptor>>;
 type ConfigurationSnapshot = (Arc<Policy>, Arc<Snapshot>, Option<String>);
+type SqlPlan = (RewritePlan, Vec<String>, StatementKind);
 type ResultStream = Pin<Box<dyn Stream<Item = Result<PartialResultSet, Status>> + Send + 'static>>;
 /// Native Spanner service and its gateway-created session ownership registry.
 pub struct NunyaSpanner {
@@ -378,6 +381,66 @@ async fn cancellable_write<T>(
         result = future => result.map_err(|error| marker.classify(error, write)),
     }
 }
+static REVISION_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Number of native Spanner statements refused at a policy revision release check.
+pub fn revision_refusals() -> u64 {
+    REVISION_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+// Keep the original statement policy even when a newer policy loosens disclosure.
+#[derive(Clone)]
+struct RevisionGuard {
+    ctx: Arc<SpannerContext>,
+    slot: Arc<ReleaseSlot>,
+    policy: Arc<Policy>,
+    epoch: u64,
+    record: ReadLogRecord,
+    refused: Arc<std::sync::atomic::AtomicBool>,
+}
+impl RevisionGuard {
+    fn new(service: &NunyaSpanner, who: &Authenticated, policy: Arc<Policy>, epoch: u64,
+        revision: Option<&str>, label: &str) -> Self {
+        Self {
+            ctx: service.ctx.clone(), slot: service.ctx.fence.register(), policy, epoch,
+            record: ReadLogRecord {
+                ts_unix_ms: (service.ctx.clock)(), principal: who.principal, session: who.session,
+                scope: who.scope, credential_id: Some(who.credential),
+                connection: service.watchers.lock().ok().and_then(|w| w.get(&who.session).map(|w| w.connection)),
+                route: service.ctx.route.as_str().into(), policy_revision: revision.map(str::to_owned),
+                config_revision: None,
+                statement_fingerprint: statement_fingerprint(&crate::readlog::redact_tokenize_args(label)),
+                statement: "Spanner operation".into(), outcome: Outcome::Refused(NyCode::SchemaStale),
+                rows: 0, tokens_released: vec![],
+            },
+            refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+    fn check(&mut self, epoch: u64, write: bool) -> Result<(), Status> {
+        if epoch != self.epoch {
+            let current = self.ctx.policy.read().map_err(|_| after_forward(invalid(), write))?;
+            if tightens(&self.policy, &current) {
+                if !self.refused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    REVISION_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.ctx.readlog.write(&self.record)
+                        .map_err(|_| after_forward(nunya_status(NyCode::ReadLogUnavailable), write))?;
+                }
+                return Err(after_forward(status(refusal(NyCode::SchemaStale)), write));
+            }
+            self.epoch = epoch;
+        }
+        Ok(())
+    }
+    fn begin(&mut self, write: bool) -> Result<(), Status> {
+        let epoch = self.slot.begin(&self.ctx.fence);
+        self.check(epoch, write)?;
+        self.slot.advance(epoch);
+        Ok(())
+    }
+    fn unary(&mut self, write: bool) -> Result<(), Status> {
+        let result = self.begin(write);
+        self.slot.end();
+        result
+    }
+}
 // The receiver is discarded immediately on revocation, including queued results.
 struct EndCheckedStream {
     receiver: Option<tokio::sync::mpsc::Receiver<Result<PartialResultSet, Status>>>,
@@ -385,6 +448,7 @@ struct EndCheckedStream {
     wake: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     write: bool,
     audit: Option<WriteAudit>,
+    revision_guard: Option<RevisionGuard>,
 }
 impl EndCheckedStream {
     fn new(
@@ -399,6 +463,7 @@ impl EndCheckedStream {
             wake: Box::pin(async move { ended(&mut wake_signal).await }),
             write,
             audit: None,
+            revision_guard: None,
         }
     }
     fn error(&mut self, error: Status) -> Status {
@@ -406,6 +471,11 @@ impl EndCheckedStream {
             Some(audit) => audit.finish_error(error),
             None => error,
         }
+    }
+}
+impl Drop for EndCheckedStream {
+    fn drop(&mut self) {
+        if let Some(guard) = &self.revision_guard { guard.slot.end(); }
     }
 }
 impl Stream for EndCheckedStream {
@@ -416,6 +486,7 @@ impl Stream for EndCheckedStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if let Some(guard) = &this.revision_guard { guard.slot.end(); }
         if this.receiver.is_none() {
             return std::task::Poll::Ready(None);
         }
@@ -430,6 +501,15 @@ impl Stream for EndCheckedStream {
         if *this.signal.borrow() {
             this.receiver.take();
             return std::task::Poll::Ready(Some(Err(this.error(ended_status(this.write)))));
+        }
+        if let std::task::Poll::Ready(Some(Ok(part))) = &result
+            && (!part.values.is_empty() || part.chunked_value)
+            && let Some(guard) = &mut this.revision_guard
+            && let Err(error) = guard.begin(this.write)
+        {
+            guard.slot.end();
+            this.receiver.take();
+            return std::task::Poll::Ready(Some(Err(this.error(error))));
         }
         let result = match result {
             std::task::Poll::Ready(Some(Err(error))) => {
@@ -970,7 +1050,7 @@ impl NunyaSpanner {
         params: &mut Option<prost_types::Struct>,
         policy: &Policy,
         snapshot: &Snapshot,
-    ) -> Result<(RewritePlan, Vec<String>, StatementKind), Status> {
+    ) -> Result<SqlPlan, Status> {
         let refusal = |error: Refusal| {
             if sql.to_ascii_lowercase().contains("nunya_tokenize") {
                 self.refuse_tokenize(who, revision, error.code)
@@ -1288,12 +1368,14 @@ impl NunyaSpanner {
         write: bool,
         mut inline_session: Option<String>,
         outcome_audit: WriteAudit,
+        revision_guard: RevisionGuard,
     ) -> ResultStream {
         let ctx = self.ctx.clone();
         let watchers = self.watchers.clone();
         let transactions = self.transactions.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let client_signal = signal.clone();
+        let mut producer_guard = revision_guard.clone();
         tokio::spawn(async move {
             let mut count = 0;
             let mut tokens = vec![];
@@ -1318,6 +1400,7 @@ impl NunyaSpanner {
                             forwarded_transport(error, write)
                         }
                     })?;
+                    producer_guard.check(ctx.fence.epoch(), write)?;
                     received_part = true;
                     ctx.authority
                         .admit(who.session, Operation::Read)
@@ -1391,8 +1474,13 @@ impl NunyaSpanner {
             }
             .await;
             drop(upstream);
-            let audit =
-                Self::audit(&ctx, &watchers, &who, revision.as_deref(), &label, count, tokens).map_err(|e| after_forward(e, write));
+            // A revision refusal already wrote the terminal refused outcome.
+            let audit = if producer_guard.refused.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Self::audit(&ctx, &watchers, &who, revision.as_deref(), &label, count, tokens)
+                    .map_err(|e| after_forward(e, write))
+            };
             // A failed audit after a forwarded write is indeterminate even if the
             // upstream also failed. For reads, preserve an NY011 cancellation.
             let work = if write {
@@ -1406,6 +1494,7 @@ impl NunyaSpanner {
         });
         let mut stream = EndCheckedStream::new(rx, client_signal, write);
         stream.audit = Some(outcome_audit);
+        stream.revision_guard = Some(revision_guard);
         Box::pin(stream)
     }
 }
@@ -1556,6 +1645,7 @@ impl SpannerService for NunyaSpanner {
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
         sql_features(&req)?;
+        let epoch = self.ctx.fence.epoch();
         let (policy, snapshot, revision) = self.configuration()?;
         let label = req.sql.clone();
         let (plan, names, kind) = self.sql(&who, revision.as_deref(), &req.sql, &mut req.params, &policy, &snapshot)?;
@@ -1583,6 +1673,7 @@ impl SpannerService for NunyaSpanner {
         } else {
             label
         };
+        let mut revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision.as_deref(), &label);
         if plan.tokenize.is_none() {
             Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 0, vec![])?;
         }
@@ -1591,6 +1682,7 @@ impl SpannerService for NunyaSpanner {
         {
             Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 1, local_tokens(&result)?)?;
             self.check_response(&who, &signal, false)?;
+            revision_guard.unary(false)?;
             return Ok(Response::new(result));
         }
         let (mut client, marker) = self.write_client().await?;
@@ -1609,6 +1701,7 @@ impl SpannerService for NunyaSpanner {
             Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, result.rows.len() as u64, tokens)
                 .map_err(|e| after_forward(e, write))?;
             self.check_response(&who, &signal, write)?;
+            revision_guard.unary(write)?;
             Ok(Response::new(result))
         }.await;
         result.map_err(|error| outcome_audit.finish_error(error))
@@ -1622,6 +1715,7 @@ impl SpannerService for NunyaSpanner {
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
         sql_features(&req)?;
+        let epoch = self.ctx.fence.epoch();
         let (policy, snapshot, revision) = self.configuration()?;
         let label = req.sql.clone();
         let (plan, names, kind) = self.sql(&who, revision.as_deref(), &req.sql, &mut req.params, &policy, &snapshot)?;
@@ -1649,6 +1743,7 @@ impl SpannerService for NunyaSpanner {
         } else {
             label
         };
+        let revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision.as_deref(), &label);
         if plan.tokenize.is_none() {
             Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 0, vec![])?;
         }
@@ -1657,13 +1752,15 @@ impl SpannerService for NunyaSpanner {
         {
             Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), &label, 1, local_tokens(&result)?)?;
             self.check_response(&who, &signal, false)?;
-            return Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(
-                PartialResultSet {
-                    metadata: result.metadata,
-                    values: result.rows.into_iter().flat_map(|r| r.values).collect(),
-                    ..Default::default()
-                },
-            )]))));
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let _ = tx.try_send(Ok(PartialResultSet {
+                metadata: result.metadata,
+                values: result.rows.into_iter().flat_map(|r| r.values).collect(),
+                ..Default::default()
+            }));
+            let mut stream = EndCheckedStream::new(rx, signal, false);
+            stream.revision_guard = Some(revision_guard);
+            return Ok(Response::new(Box::pin(stream)));
         }
         let (mut client, marker) = self.write_client().await?;
         let inline = inline_read_write(req.transaction.as_ref());
@@ -1674,7 +1771,7 @@ impl SpannerService for NunyaSpanner {
             .await.map_err(|error| outcome_audit.finish_error(error))?
             .into_inner();
         Ok(Response::new(
-            self.stream(who, policy, revision, plan, label, upstream, signal, write, inline.then_some(session), outcome_audit),
+            self.stream(who, policy, revision, plan, label, upstream, signal, write, inline.then_some(session), outcome_audit, revision_guard),
         ))
     }
     async fn execute_batch_dml(
@@ -1761,9 +1858,11 @@ impl SpannerService for NunyaSpanner {
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
         read_features(&req)?;
+        let epoch = self.ctx.fence.epoch();
         let (policy, snapshot, revision) = self.configuration()?;
         let lowered = spanner_struct::lower_read(&req, &snapshot, &policy).map_err(status)?;
         let plan = check(&lowered.stmt, &policy, &snapshot).map_err(status)?;
+        let mut revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision.as_deref(), "Read");
         check_key_tokens(
             req.key_set.as_ref(),
             &policy,
@@ -1787,6 +1886,7 @@ impl SpannerService for NunyaSpanner {
         let tokens = self.rows(&who, &policy, &plan, &mut result)?;
         Self::audit(&self.ctx, &self.watchers, &who, revision.as_deref(), "Read", result.rows.len() as u64, tokens)?;
         self.check_response(&who, &signal, false)?;
+        revision_guard.unary(false)?;
         Ok(Response::new(result))
     }
     async fn streaming_read(
@@ -1798,9 +1898,11 @@ impl SpannerService for NunyaSpanner {
         self.session(&req.session, &who)?;
         let mut signal = self.end_signal(&who)?;
         read_features(&req)?;
+        let epoch = self.ctx.fence.epoch();
         let (policy, snapshot, revision) = self.configuration()?;
         let lowered = spanner_struct::lower_read(&req, &snapshot, &policy).map_err(status)?;
         let plan = check(&lowered.stmt, &policy, &snapshot).map_err(status)?;
+        let revision_guard = RevisionGuard::new(self, &who, policy.clone(), epoch, revision.as_deref(), "Read");
         check_key_tokens(
             req.key_set.as_ref(),
             &policy,
@@ -1832,6 +1934,7 @@ impl SpannerService for NunyaSpanner {
             false,
             inline.then_some(session),
             outcome_audit,
+            revision_guard,
         )))
     }
     async fn begin_transaction(
@@ -2642,6 +2745,7 @@ mod tests {
             )
             .unwrap();
             let ctx = Arc::new(SpannerContext {
+                fence: Default::default(),
                 authority: runtime.authority.clone(),
                 registry: runtime.registry.clone(),
                 route: crate::state::model::RouteId::new("spanner-native").unwrap(),
@@ -3410,8 +3514,9 @@ mod tests {
         // Keep the watcher false to exercise the authoritative recheck itself.
         let (_signal_tx, signal) = tokio::sync::watch::channel(false);
         let outcome_audit = WriteAudit::new(&f.svc, &who);
+        let revision_guard = RevisionGuard::new(&f.svc, &who, policy.clone(), f.svc.ctx.fence.epoch(), revision.as_deref(), &req.sql);
         let mut stream = f.svc.stream(
-            who, policy, revision, plan, req.sql, upstream, signal, false, None, outcome_audit,
+            who, policy, revision, plan, req.sql, upstream, signal, false, None, outcome_audit, revision_guard,
         );
         let row = stream.next().await.unwrap().unwrap();
         assert_eq!(row.values.len(), 1);
@@ -4590,6 +4695,115 @@ mod tests {
                 .unwrap_err(),
             false,
         );
+    }
+    fn revise_column(f: &Fixture, column: &str, treatment: Treatment) -> Option<u64> {
+        let mut policy = f.svc.ctx.policy.write().unwrap();
+        let old = policy.clone();
+        let mut next = (**policy).clone();
+        next.columns.insert(ColumnRef {
+            schema: "".into(), table: "customers".into(), column: column.into(),
+        }, treatment);
+        let next = Arc::new(next);
+        *policy = next.clone();
+        f.svc.ctx.fence.publish(&old, &next)
+    }
+    async fn revision_stream(f: &Fixture, read: bool) -> ResultStream {
+        f.fake.burst_stream.store(true, std::sync::atomic::Ordering::Relaxed);
+        if read {
+            f.svc.streaming_read(f.request(customer_read(f).await, "alice"))
+                .await.unwrap().into_inner()
+        } else {
+            let req = f.query("SELECT email FROM customers").await;
+            f.svc.execute_streaming_sql(f.request(req, "alice"))
+                .await.unwrap().into_inner()
+        }
+    }
+    async fn tightening_refuses_rows(read: bool, buffered: bool) {
+        let records = Arc::new(Mutex::new(vec![]));
+        let f = Fixture::with_log(Box::new(CaptureLog(records.clone(), Arc::new(Mutex::new(vec![]))))).await;
+        let before = revision_refusals();
+        let mut stream = revision_stream(&f, read).await;
+        for _ in 0..2 {
+            assert_eq!(stream.next().await.unwrap().unwrap().values, vec![f.token()]);
+        }
+        if buffered {
+            wait_for(|| f.fake.emitted.load(std::sync::atomic::Ordering::Relaxed) >= 10).await;
+        }
+        let epoch = revise_column(&f, "email", Treatment::Masked { placeholder: None }).unwrap();
+        // The last returned part remains in flight until tonic polls again.
+        assert_eq!(f.svc.ctx.fence.lagging(epoch), 1);
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(error.message().contains("NY008"));
+        assert!(revision_refusals() > before);
+        assert_eq!(f.svc.ctx.fence.lagging(epoch), 0);
+        assert!(stream.next().await.is_none());
+        assert_eq!(records.lock().unwrap().iter().filter(|r|
+            matches!(r.outcome, Outcome::Refused(NyCode::SchemaStale))).count(), 1);
+    }
+    #[tokio::test]
+    async fn revision_execute_streaming_sql_tightening() {
+        tightening_refuses_rows(false, false).await;
+    }
+    #[tokio::test]
+    async fn revision_buffered_rows_are_not_released() {
+        tightening_refuses_rows(false, true).await;
+    }
+    #[tokio::test]
+    async fn revision_streaming_read_tightening() {
+        tightening_refuses_rows(true, false).await;
+    }
+    #[tokio::test]
+    async fn revision_loosening_keeps_original_tokens() {
+        let f = Fixture::new().await;
+        let mut stream = revision_stream(&f, false).await;
+        assert_eq!(stream.next().await.unwrap().unwrap().values, vec![f.token()]);
+        assert_eq!(revise_column(&f, "email", Treatment::Show), None);
+        let mut count = 1;
+        while let Some(part) = stream.next().await {
+            assert_eq!(part.unwrap().values, vec![f.token()]);
+            count += 1;
+        }
+        assert_eq!(count, 20);
+    }
+    #[tokio::test]
+    async fn revision_unrelated_tightening_refuses() {
+        let f = Fixture::new().await;
+        revise_column(&f, "unrelated", Treatment::Show);
+        let mut stream = revision_stream(&f, false).await;
+        assert_eq!(stream.next().await.unwrap().unwrap().values, vec![f.token()]);
+        let epoch = revise_column(&f, "unrelated", Treatment::Masked { placeholder: None }).unwrap();
+        assert_eq!(f.svc.ctx.fence.lagging(epoch), 1);
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(error.message().contains("NY008"));
+        assert_eq!(f.svc.ctx.fence.lagging(epoch), 0);
+        assert!(stream.next().await.is_none());
+    }
+    #[tokio::test]
+    async fn revision_dropped_stream_ends_release() {
+        let f = Fixture::new().await;
+        let mut stream = revision_stream(&f, false).await;
+        stream.next().await.unwrap().unwrap();
+        let epoch = revise_column(&f, "email", Treatment::Masked { placeholder: None }).unwrap();
+        assert_eq!(f.svc.ctx.fence.lagging(epoch), 1);
+        drop(stream);
+        assert_eq!(f.svc.ctx.fence.lagging(epoch), 0);
+    }
+    #[tokio::test]
+    async fn revision_unary_tightening_between_plan_and_return() {
+        let f = Fixture::new().await;
+        let req = f.query("SELECT email FROM customers").await;
+        f.fake.hold_sql.store(true, std::sync::atomic::Ordering::Relaxed);
+        let call = f.svc.execute_sql(f.request(req, "alice"));
+        let tighten = async {
+            wait_for(|| f.fake.seen.lock().unwrap().len() == 1).await;
+            revise_column(&f, "email", Treatment::Masked { placeholder: None });
+            f.fake.release.notify_one();
+        };
+        let (response, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(call, tighten)
+        }).await.unwrap();
+        assert!(response.unwrap_err().message().contains("NY008"));
+        assert_eq!(f.svc.ctx.fence.lagging(f.svc.ctx.fence.epoch()), 0);
     }
     #[tokio::test]
     async fn stream_stops_after_revocation() {

@@ -56,3 +56,6 @@ mod shared_domains_live;
 
 #[path = "policy_revisions_live.rs"]
 mod policy_revisions_live;
+
+#[path = "policy_fencing_live.rs"]
+mod policy_fencing_live;

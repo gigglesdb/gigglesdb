@@ -330,9 +330,23 @@ pub struct StatusView {
     /// Optional configuration revision.
     pub config_revision: Option<String>,
 }
+/// Live release acknowledgement from a single replica.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PolicyActivationView {
+    /// Active or pending.
+    pub state: String,
+    /// Older releases still in flight.
+    pub pending_statements: usize,
+}
 /// Route policy ownership and active revision.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PolicyStatusView {
+    /// Live release status, absent on older servers.
+    #[serde(default)]
+    pub activation: Option<PolicyActivationView>,
+    /// Last value-free refusal, absent on older servers.
+    #[serde(default)]
+    pub last_rejected: Option<super::policy::PolicyRejection>,
     /// Revision actually enforced by the route.
     #[serde(default)]
     pub published_revision: Option<u64>,
@@ -369,6 +383,12 @@ pub struct PolicyValidationView {
 /// Policy publication outcome.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PolicyMutationView {
+    /// Active or pending, absent on older servers.
+    #[serde(default)]
+    pub activation: Option<String>,
+    /// Older releases still in flight, absent on older servers.
+    #[serde(default)]
+    pub pending_statements: Option<usize>,
     /// Published revision summary.
     pub revision: crate::policy::RevisionSummary,
     /// Whether a prior request was replayed.
@@ -1035,7 +1055,8 @@ mod tests {
                 if let Some(previous) = &previous { assert_eq!(&request, previous); }
                 previous = Some(request);
                 let body = if attempt == 3 { json!({"error":"file_owner_configured"}) } else if attempt == 2 { json!({"error":"stale_revision","current":revision,"diff":diff}) }
-                    else { json!({"revision":revision,"replayed":attempt == 1}) }.to_string();
+                    else if attempt == 1 { json!({"revision":revision,"replayed":true,"activation":"pending","pending_statements":1}) }
+                    else { json!({"revision":revision,"replayed":false}) }.to_string();
                 let status = if attempt >= 2 { "409 Conflict" } else { "200 OK" };
                 let response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 io.write_all(response.as_bytes()).await.unwrap();
@@ -1044,6 +1065,8 @@ mod tests {
         for replayed in [false, true] {
             let (result, key) = client.policy_apply("pg", "default='show'", 1, "catalog", Some("retry".into())).await.unwrap();
             assert_eq!(key, "retry"); assert_eq!(result.replayed, replayed); assert_eq!(result.revision.number, 2);
+            assert_eq!(result.activation.as_deref(), if replayed { Some("pending") } else { None });
+            assert_eq!(result.pending_statements, if replayed { Some(1) } else { None });
         }
         match client.policy_apply("pg", "default='show'", 1, "catalog", Some("retry".into())).await.unwrap_err() {
             ClientError::Stale { current, diff } => {
@@ -1054,6 +1077,18 @@ mod tests {
         }
         assert_eq!(client.policy_apply("pg", "default='show'", 1, "catalog", Some("retry".into())).await.unwrap_err(), ClientError::Api { status: 409, code: "file_owner_configured".into() });
         server.await.unwrap();
+    }
+    #[test]
+    fn policy_status_accepts_old_and_new_activation_fields() {
+        let old = json!({"owner":"service","active_revision":null,"catalog_fingerprint":"fp"});
+        let status: PolicyStatusView = serde_json::from_value(old.clone()).unwrap();
+        assert!(status.activation.is_none()); assert!(status.last_rejected.is_none());
+        let mut new = old;
+        new["activation"] = json!({"state":"pending","pending_statements":1});
+        new["last_rejected"] = json!({"at_ms":123,"operation":"apply","code":"invalid_policy","expected_revision":2});
+        let status: PolicyStatusView = serde_json::from_value(new).unwrap();
+        assert_eq!(status.activation.unwrap().pending_statements, 1);
+        assert_eq!(status.last_rejected.unwrap().code, "invalid_policy");
     }
     #[test]
     fn status_accepts_legacy_and_route_revision_shapes() {

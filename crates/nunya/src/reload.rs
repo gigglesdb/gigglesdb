@@ -33,6 +33,15 @@ impl Route {
         }
     }
 
+    fn fence(&self) -> Option<&Arc<crate::policy::RevisionFence>> {
+        match self {
+            Self::Postgres(c) => Some(&c.fence),
+            Self::Spanner(c) => Some(&c.fence),
+            #[cfg(test)]
+            Self::Test(..) => None,
+        }
+    }
+
     fn locks(&self) -> (&PolicyLock, &SnapshotLock) {
         match self {
             Self::Postgres(c) => (&c.policy, &c.snapshot),
@@ -324,7 +333,9 @@ impl Hub {
             let (compiled, change) = self.compile(&doc, route, &snapshot).map_err(|_| PolicyOpError::Unavailable)?;
             let mut policy = published.locks().0.write().map_err(|_| PolicyOpError::Unavailable)?;
             self.reset_membership(change.as_ref(), &policy).map_err(|_| PolicyOpError::Unavailable)?;
+            let old = policy.clone();
             *policy = compiled.clone();
+            if let Some(fence) = published.fence() { fence.publish(&old, &compiled); }
             match &published.route {
                 Route::Postgres(c) => *c.policy_revision.write().map_err(|_| PolicyOpError::Unavailable)? = Some(revision_stamp(r)),
                 Route::Spanner(c) => *c.policy_revision.write().map_err(|_| PolicyOpError::Unavailable)? = Some(revision_stamp(r)),
@@ -390,7 +401,9 @@ impl Hub {
                 WriteOutcome::Stale { current: None } => return Err(PolicyOpError::MissingRevision),
             };
             self.reset_membership(change.as_ref(), &policy).map_err(|_| PolicyOpError::Unavailable)?;
+            let old = policy.clone();
             *policy = compiled.clone();
+            if let Some(fence) = published.fence() { fence.publish(&old, &compiled); }
             let stamp = revision_stamp(&r);
             revisions.policy = stamp.clone();
             if let Some(ctx) = &mut ctx { **ctx = Some(stamp); }
@@ -735,6 +748,13 @@ impl Hub {
             self.log.2.clone(),
         ))
     }
+    /// Return the serving route's fence for management release waiting.
+    #[allow(dead_code)] // Consumed by the management release-wait task.
+    pub(crate) fn fence_for(&self, route: &RouteId) -> Option<Arc<crate::policy::RevisionFence>> {
+        let state = self.state.lock().ok()?;
+        let unit = &state.units[state.unit(route.as_str()).ok()?];
+        unit.routes.iter().find(|r| r.id() == route.as_str())?.fence().cloned()
+    }
     /// Validate and install the configured unit policy before publishing a route.
     pub(crate) fn register(&self, route: Route) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|_| "policy lock unavailable")?;
@@ -767,7 +787,9 @@ impl Hub {
         })?;
         {
             if let Some(revision) = revision.as_mut() { **revision = Some(s.revisions.read().map_err(|_| "revision lock unavailable")?.policy.clone()); }
+            let old = current.clone();
             *current = compiled.clone();
+            if let Some(fence) = route.fence() { fence.publish(&old, &compiled); }
         }
         drop(snapshot);
         drop(current);
@@ -802,7 +824,9 @@ impl Hub {
             self.reset_membership(change.as_ref(), &policy)?;
             apply()?;
             *catalog = Arc::new(snapshot);
+            let old = policy.clone();
             *policy = compiled.clone();
+            if let Some(fence) = route.fence() { fence.publish(&old, &compiled); }
             Ok(compiled)
         })();
         for registered in &mut unit.routes {
@@ -889,8 +913,10 @@ impl Hub {
             if let Some(replacement) = replacement {
                 *log = replacement;
             }
-            for (current, compiled) in policies.iter_mut().zip(&compiled) {
+            for ((current, compiled), route) in policies.iter_mut().zip(&compiled).zip(&s.routes) {
+                let old = (*current).clone();
                 **current = compiled.0.clone();
+                if let Some(fence) = route.fence() { fence.publish(&old, &compiled.0); }
             }
             for current in &mut route_revisions {
                 **current = Some(revision.clone());
@@ -1839,6 +1865,7 @@ mod tests {
         )
         .unwrap();
         let ctx = Arc::new(SpannerContext {
+            fence: Default::default(),
             authority: runtime.authority.clone(),
             registry: runtime.registry.clone(),
             route: crate::state::model::RouteId::new("spanner-native").unwrap(),
@@ -1963,6 +1990,7 @@ mod tests {
         ).unwrap();
         let h = hub();
         let ctx = Arc::new(GatewayContext {
+            fence: Default::default(),
             authority: runtime.authority.clone(), registry: runtime.registry.clone(), route: id("postgres"),
             policy: RwLock::new(Arc::new(policy())), policy_revision: RwLock::new(None),
             snapshot: RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec!["public".into()], 0))),
@@ -2598,4 +2626,80 @@ mod tests {
         assert_eq!(hub.active_revision(&id("a")).unwrap().unwrap().number, 1);
     }
 
+
+    #[test]
+    fn fence_file_apply_tightens_loosens_and_republishes() {
+        let h = hub();
+        let fixture = crate::pgwire::session::tests::Fixture::new();
+        let ctx = fixture.ctx.clone();
+        *ctx.snapshot.write().unwrap() = Arc::new(customers(&[("email", 1)]));
+        h.register(Route::Postgres(ctx.clone())).unwrap();
+        assert!(Arc::ptr_eq(&ctx.fence, &h.fence_for(&id("postgres")).unwrap()));
+        assert!(h.fence_for(&id("unknown")).is_none());
+        let initial = ctx.fence.epoch();
+        let mut blind = policy();
+        let domain = crate::policy::DomainName("email".into());
+        blind.columns.insert(customer_column("email"), Treatment::Blind { domain: domain.clone() });
+        blind.domains.insert(domain, crate::policy::DomainSettings {
+            tokenize: crate::policy::TokenizeSetting::Off, range: None,
+        });
+        h.apply(0, Ok(document(blind.clone())), Some("blind".into())).unwrap();
+        assert_eq!(ctx.fence.epoch(), initial + 1);
+        h.apply(0, Ok(document(blind.clone())), Some("same".into())).unwrap();
+        assert_eq!(ctx.fence.epoch(), initial + 1);
+        // Blind->Show that also drops the column's domain is a loosening.
+        h.apply(0, Ok(document(policy())), Some("show".into())).unwrap();
+        assert_eq!(ctx.policy.read().unwrap().treatment(&customer_column("email")), Some(&Treatment::Show));
+        assert_eq!(ctx.fence.epoch(), initial + 1);
+    }
+
+    #[test]
+    fn fence_service_apply_and_replay_publish_under_lock() {
+        let files = Files::new();
+        let h = Hub::new(&[(id("postgres"), files.a.clone())], None, Default::default()).unwrap();
+        let store = binding_store(&files);
+        h.set_store(store.clone()).unwrap();
+        h.set_revision_store(Arc::new(crate::policy::LocalRevisionStore::new(store))).unwrap();
+        let fixture = crate::pgwire::session::tests::Fixture::new();
+        let ctx = fixture.ctx.clone();
+        *ctx.snapshot.write().unwrap() = Arc::new(customers(&[("email", 1)]));
+        h.register(Route::Postgres(ctx.clone())).unwrap();
+        let old = ctx.policy.read().unwrap().clone();
+        let initial = ctx.fence.epoch();
+        let route = id("postgres");
+        h.import_policy(&route, "admin", None).unwrap();
+        let fingerprint = h.current_catalog_fingerprint(&route).unwrap();
+        let applied = h.apply_policy(&route, "admin", masked_toml(), 1, &fingerprint, Some("apply".into())).unwrap();
+        assert_eq!(ctx.fence.epoch(), initial + 1);
+        h.apply_policy(&route, "admin", masked_toml(), 1, &fingerprint, Some("apply".into())).unwrap();
+        assert_eq!(ctx.fence.epoch(), initial + 1);
+        // Simulate a durable commit whose in-memory publication was interrupted.
+        *ctx.policy.write().unwrap() = old;
+        h.state.lock().unwrap().units[0].revisions.write().unwrap().policy = "interrupted".into();
+        assert_eq!(h.apply_policy(&route, "admin", masked_toml(), 1, &fingerprint, Some("apply".into())).unwrap(), applied);
+        assert_eq!(ctx.fence.epoch(), initial + 2);
+    }
+
+    #[test]
+    fn fence_catalog_refresh_withholds_needs_repair_column() {
+        let files = Files::new();
+        let h = tokenize_hub(&files, &["postgres"]);
+        let store = binding_store(&files);
+        h.set_store(store.clone()).unwrap();
+        let fixture = crate::pgwire::session::tests::Fixture::new();
+        let ctx = fixture.ctx.clone();
+        let mut snapshot = customers(&[("email", 1)]);
+        *ctx.snapshot.write().unwrap() = Arc::new(snapshot.clone());
+        h.register(Route::Postgres(ctx.clone())).unwrap();
+        let initial = ctx.fence.epoch();
+        h.refresh(&Route::Postgres(ctx.clone()), snapshot.clone()).unwrap();
+        assert_eq!(ctx.fence.epoch(), initial);
+        assert!(matches!(ctx.policy.read().unwrap().treatment(&customer_column("email")), Some(Treatment::Blind { .. })));
+        snapshot.relations[0].columns[0].ty = crate::value::ColumnType::Int8;
+        h.refresh(&Route::Postgres(ctx.clone()), snapshot).unwrap();
+        assert_eq!(bindings::load(store.as_ref(), &id("postgres")).unwrap().get(&customer_id(1)).unwrap().status,
+            bindings::BindingStatus::NeedsRepair);
+        assert_eq!(ctx.policy.read().unwrap().treatment(&customer_column("email")), Some(&Treatment::Masked { placeholder: None }));
+        assert_eq!(ctx.fence.epoch(), initial + 1);
+    }
 }

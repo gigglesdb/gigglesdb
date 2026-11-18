@@ -66,6 +66,8 @@ pub type PolicyAndSnapshot = (Arc<Policy>, Option<String>, Arc<Snapshot>);
 
 /// Gateway resources and configuration shared by sessions.
 pub struct GatewayContext {
+    /// Shared policy revision release fence.
+    pub fence: Arc<crate::policy::RevisionFence>,
     /// Shared durable session authority.
     pub authority: Arc<crate::state::authority::Authority>,
     /// Shared live connection registry.

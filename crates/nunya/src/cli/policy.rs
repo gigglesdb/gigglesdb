@@ -95,15 +95,15 @@ async fn execute(command: PolicyCommand) -> Result<(), String> {
             let client = connection.client().map_err(|e| e.to_string())?;
             let fingerprint = catalog_fingerprint;
             let (result, key) = client.policy_apply(&route, &draft(&file)?, expected_revision, &fingerprint, idempotency_key).await.map_err(|e| e.to_string())?;
-            println!("revision {} replayed={} idempotency-key={key}", result.revision.number, result.replayed); return Ok(());
+            println!("revision {} replayed={} activation={} pending-statements={} idempotency-key={key}", result.revision.number, result.replayed, result.activation.as_deref().unwrap_or("unknown"), result.pending_statements.unwrap_or(0)); return Ok(());
         }
         Rollback { route, connection, to, expected_revision, idempotency_key } => {
             let (result, key) = connection.client().map_err(|e| e.to_string())?.policy_rollback(&route, to, expected_revision, idempotency_key).await.map_err(|e| e.to_string())?;
-            println!("revision {} replayed={} idempotency-key={key}", result.revision.number, result.replayed); return Ok(());
+            println!("revision {} replayed={} activation={} pending-statements={} idempotency-key={key}", result.revision.number, result.replayed, result.activation.as_deref().unwrap_or("unknown"), result.pending_statements.unwrap_or(0)); return Ok(());
         }
         Import { route, connection, idempotency_key } => {
             let (result, key) = connection.client().map_err(|e| e.to_string())?.policy_import(&route, idempotency_key).await.map_err(|e| e.to_string())?;
-            println!("revision {} replayed={} idempotency-key={key}", result.revision.number, result.replayed); return Ok(());
+            println!("revision {} replayed={} activation={} pending-statements={} idempotency-key={key}", result.revision.number, result.replayed, result.activation.as_deref().unwrap_or("unknown"), result.pending_statements.unwrap_or(0)); return Ok(());
         }
         Export { route, connection, output } => {
             let result = connection.client().map_err(|e| e.to_string())?.policy_export(&route).await.map_err(|e| e.to_string())?;
@@ -112,7 +112,7 @@ async fn execute(command: PolicyCommand) -> Result<(), String> {
         }
     };
     if json { println!("{value}"); }
-    else if let Some(owner) = value.get("owner") { println!("owner={owner} active-revision={} catalog-fingerprint={}", value["active_revision"]["number"], value["catalog_fingerprint"]); }
+    else if let Some(owner) = value.get("owner") { println!("owner={owner} active-revision={} catalog-fingerprint={} activation={} pending-statements={}", value["active_revision"]["number"], value["catalog_fingerprint"], value["activation"]["state"], value["activation"]["pending_statements"]); }
     else if let Some(summary) = value.get("summary") { println!("{summary} catalog-fingerprint={}", value["catalog_fingerprint"]); }
     else if let Some(columns) = value.get("columns").and_then(|c| c.as_array()) { for column in columns { println!("{}.{}.{} treatment={} origin={}", column["schema"], column["table"], column["column"], column["treatment"], column["origin"]); } }
     else if let Some(revisions) = value.as_array() { for r in revisions { println!("revision {}", r["number"]); } }

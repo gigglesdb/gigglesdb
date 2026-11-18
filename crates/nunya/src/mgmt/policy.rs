@@ -53,15 +53,62 @@ impl From<crate::reload::PolicyOpError> for PolicyError {
         }
     }
 }
+/// Live acknowledgement of older row releases in this process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activation {
+    /// No older release remains.
+    Active,
+    /// Older releases remain inside their release region.
+    Pending { statements: usize },
+}
+impl Activation {
+    /// Convert a live count into an acknowledgement.
+    pub fn from_pending(statements: usize) -> Self {
+        if statements == 0 { Self::Active } else { Self::Pending { statements } }
+    }
+    /// Public activation state.
+    pub fn state(self) -> &'static str {
+        match self { Self::Active => "active", Self::Pending { .. } => "pending" }
+    }
+    /// Count of releases checked under an older epoch.
+    pub fn pending_statements(self) -> usize {
+        match self { Self::Active => 0, Self::Pending { statements } => statements }
+    }
+}
+impl serde::Serialize for Activation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.state())
+    }
+}
+/// Value-free metadata for the last refused apply or rollback.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PolicyRejection {
+    /// Time of refusal.
+    pub at_ms: u64,
+    /// Fixed operation name.
+    pub operation: String,
+    /// Public refusal code.
+    pub code: String,
+    /// Requested precondition, absent for malformed requests.
+    pub expected_revision: Option<u64>,
+}
 /// Result of an atomic management mutation or retry.
 pub struct PolicyWrite {
     /// Published or replayed revision.
     pub revision: PolicyRevision,
     /// Whether this request was already committed.
     pub replayed: bool,
+    /// Live activation acknowledgement.
+    pub activation: Activation,
 }
 /// Runtime adapter for policy management.
 pub trait PolicySource: Send + Sync {
+    /// Live activation without waiting.
+    fn activation(&self, _r: &RouteId) -> Activation { Activation::Active }
+    /// Retain only value-free refusal metadata.
+    fn record_rejection(&self, _r: &RouteId, _rejection: PolicyRejection) {}
+    /// Most recent refused apply or rollback.
+    fn last_rejected(&self, _r: &RouteId) -> Option<PolicyRejection> { None }
     /// Actually enforced revision, if service-owned.
     fn published(&self, r: &RouteId) -> Result<Option<u64>, PolicyError> { Ok(self.active(r)?.map(|r| r.number)) }
     /// Validate a draft without persistence.
@@ -213,6 +260,8 @@ pub(super) fn handle(
     let Some(source) = ctx.policy.as_ref() else {
         return error(StatusCode::NOT_FOUND, "not_found");
     };
+    let mut publication_succeeded = false;
+    let mut rejected_code = None;
     let result = (|| -> Result<Response<Bytes>, PolicyError> {
         let (doc, snapshot, bindings) = source.effective(&route)?;
         let active = source.active(&route)?;
@@ -220,8 +269,9 @@ pub(super) fn handle(
         let ok = |v: Value| json_response(StatusCode::OK, v);
         match op {
             "" => {
+                let activation = source.activation(&route);
                 return Ok(ok(
-                    json!({"owner":match source.owner(&route)? {Owner::File=>"file",Owner::Service=>"service"},"published_revision":source.published(&route)?,"active_revision":active.as_ref().map(RevisionSummary::from),"catalog_fingerprint":fp}),
+                    json!({"owner":match source.owner(&route)? {Owner::File=>"file",Owner::Service=>"service"},"published_revision":source.published(&route)?,"active_revision":active.as_ref().map(RevisionSummary::from),"catalog_fingerprint":fp,"activation":{"state":activation,"pending_statements":activation.pending_statements()},"last_rejected":source.last_rejected(&route)}),
                 ));
             }
             "effective" => {
@@ -317,7 +367,9 @@ pub(super) fn handle(
             Ok(PolicyWrite {
                 revision: r,
                 replayed,
+                activation,
             }) => {
+                publication_succeeded = true;
                 if op != "import" && r.number > 1 {
                     let before = source.get(&route, r.number - 1)?.ok_or(PolicyError::Code(503, "policy_unavailable"))?;
                     let before = crate::policy::file::parse_policy_document(&before.policy_toml).map_err(|_| PolicyError::Code(503, "policy_unavailable"))?;
@@ -325,8 +377,8 @@ pub(super) fn handle(
                     delta = diff::diff(&before, &after, &snapshot, &bindings);
                 }
                 (Some(r.number),
-                "active",
-                ok(json!({"revision":RevisionSummary::from(&r),"replayed":replayed})),
+                activation.state(),
+                ok(json!({"revision":RevisionSummary::from(&r),"replayed":replayed,"activation":activation,"pending_statements":activation.pending_statements()})),
             )},
             Err(e) => {
                 if matches!(&e, PolicyError::Stale(_))
@@ -335,6 +387,7 @@ pub(super) fn handle(
                     delta = diff::diff(&current, draft, &catalog, &bindings);
                 }
                 let (code, response) = refusal(e, &delta);
+                rejected_code = Some(code);
                 (None, code, response)
             }
         };
@@ -369,10 +422,20 @@ pub(super) fn handle(
         }
         Ok(response)
     })();
-    match result {
+    let response = match result {
         Ok(r) => r,
         Err(e) => refusal(e, &PolicyDiff::default()).1,
+    };
+    if matches!(op, "apply" | "rollback") && !publication_succeeded && !response.status().is_success() {
+        let body: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+        let request: Value = serde_json::from_slice(req.body()).unwrap_or(Value::Null);
+        source.record_rejection(&route, PolicyRejection {
+            at_ms: ctx.authority.now_ms(), operation: op.into(),
+            code: rejected_code.or_else(|| body["error"].as_str()).unwrap_or("policy_unavailable").into(),
+            expected_revision: request["expected_revision"].as_u64(),
+        });
     }
+    response
 }
 fn column_names(entries: &[Value]) -> Vec<Value> {
     entries
@@ -402,6 +465,7 @@ mod tests {
     };
     struct Fake {
         mode: AtomicUsize,
+        rejected: Mutex<Option<PolicyRejection>>,
         calls: AtomicUsize,
     }
     impl Fake {
@@ -421,6 +485,11 @@ mod tests {
         }
     }
     impl PolicySource for Fake {
+        fn activation(&self, _: &RouteId) -> Activation {
+            if self.mode.load(Ordering::SeqCst) == 7 { Activation::Pending { statements: 1 } } else { Activation::Active }
+        }
+        fn record_rejection(&self, _: &RouteId, rejection: PolicyRejection) { *self.rejected.lock().unwrap() = Some(rejection); }
+        fn last_rejected(&self, _: &RouteId) -> Option<PolicyRejection> { self.rejected.lock().unwrap().clone() }
         fn owner(&self, _: &RouteId) -> Result<Owner, PolicyError> {
             Ok(Owner::Service)
         }
@@ -507,14 +576,15 @@ mod tests {
                 0 => Err(PolicyError::Stale(Box::new(RevisionSummary::from(
                     &self.revision(),
                 )))),
-                1 => Ok(PolicyWrite {
+                1 | 7 => Ok(PolicyWrite {
                     revision: self.revision(),
                     replayed: true,
+                    activation: self.activation(&RouteId::new("route").unwrap()),
                 }),
                 6 => {
                     let mut revision = self.revision(); revision.number = 2;
                     revision.policy_toml = "version=2\ndefault='show'\n".into();
-                    Ok(PolicyWrite { revision, replayed: self.calls.load(Ordering::SeqCst) > 1 })
+                    Ok(PolicyWrite { revision, replayed: self.calls.load(Ordering::SeqCst) > 1, activation: Activation::Active })
                 }
                 2 => Err(PolicyError::Invalid(vec!["invalid draft".into()])),
                 3 => Err(PolicyError::CatalogChanged("new_fingerprint".into())),
@@ -572,6 +642,7 @@ mod tests {
             let authority = Authority::load(store, SessionLimits::default()).unwrap();
             let fake = Arc::new(Fake {
                 mode: AtomicUsize::new(0),
+                rejected: Mutex::new(None),
                 calls: AtomicUsize::new(0),
             });
             let sink = Arc::new(Sink::default());
@@ -619,6 +690,49 @@ mod tests {
     }
     fn apply() -> Value {
         json!({"policy_toml":"version=2\ndefault='show'\n","expected_revision":0,"catalog_fingerprint":"fingerprint"})
+    }
+    #[test]
+    fn activation_and_rejections_are_value_free_and_live() {
+        let f = Fixture::new();
+        let status = || serde_json::from_slice::<Value>(f.request("", Value::Null, false).body()).unwrap();
+        let initial = status();
+        assert_eq!(initial["activation"], json!({"state":"active","pending_statements":0}));
+        assert!(initial["last_rejected"].is_null());
+        for (mode, http, code) in [(0,409,"stale_revision"),(2,422,"invalid_policy"),(3,409,"catalog_changed"),(4,422,"infrastructure_setting"),(5,503,"policy_unavailable")] {
+            f.fake.mode.store(mode, Ordering::SeqCst);
+            for op in ["apply", "rollback"] {
+                let body = if op == "apply" { apply() } else { json!({"to":1,"expected_revision":0}) };
+                assert_eq!(f.request(op, body, true).status(), http);
+                let current = status();
+                assert_eq!(current["active_revision"], initial["active_revision"]);
+                assert_eq!(current["last_rejected"]["operation"], op);
+                assert_eq!(current["last_rejected"]["code"], code);
+                assert_eq!(current["last_rejected"]["expected_revision"], 0);
+                assert!(current["last_rejected"]["at_ms"].is_u64());
+                assert_eq!(current["last_rejected"].as_object().unwrap().len(), 4);
+            }
+        }
+        let rejected = status()["last_rejected"].clone();
+        f.fake.mode.store(7, Ordering::SeqCst);
+        for op in ["apply", "rollback", "import"] {
+            let body = if op == "rollback" { json!({"to":1,"expected_revision":0}) } else { apply() };
+            let response = f.request(op, body, true);
+            assert_eq!(response.status(), 200);
+            let value: Value = serde_json::from_slice(response.body()).unwrap();
+            assert_eq!(value["activation"], "pending");
+            assert_eq!(value["pending_statements"], 1);
+            let records = f.sink.records.lock().unwrap();
+            assert_eq!(records.last().unwrap().reason, "pending");
+            assert_eq!(records.last().unwrap().policy.as_ref().unwrap().outcome, "pending");
+        }
+        assert_eq!(status()["last_rejected"], rejected);
+        assert_eq!(status()["activation"]["state"], "pending");
+        f.fake.mode.store(1, Ordering::SeqCst);
+        let response: Value = serde_json::from_slice(f.request("apply", apply(), true).body()).unwrap();
+        assert_eq!(response["activation"], "active");
+        assert_eq!(response["pending_statements"], 0);
+        assert_eq!(status()["last_rejected"], rejected);
+        f.finish();
     }
     #[test]
     fn authentication_and_authorization_cover_all_endpoints() {
@@ -824,7 +938,9 @@ mod tests {
         }
         f.sink.fail.store(true, Ordering::SeqCst);
         f.fake.mode.store(1, Ordering::SeqCst);
+        let previous_rejection = serde_json::to_value(f.fake.last_rejected(&RouteId::new("route").unwrap())).unwrap();
         assert_eq!(f.request("apply", apply(), true).status(), 503);
+        assert_eq!(serde_json::to_value(f.fake.last_rejected(&RouteId::new("route").unwrap())).unwrap(), previous_rejection);
         f.sink.fail.store(false, Ordering::SeqCst);
         for (op, body) in [
             ("rollback", json!({"to":1,"expected_revision":1})),

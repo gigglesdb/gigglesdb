@@ -391,12 +391,20 @@ impl crate::mgmt::routes::StatusSource for ManagementStatus {
     fn route_ids(&self) -> Vec<String> { self.routes.iter().map(|r| r.as_str().into()).collect() }
 }
 
+// Bound acknowledgement latency; status continues reporting any older releases.
+const ACTIVATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 struct ManagementPolicy {
+    rejections: std::sync::Mutex<std::collections::BTreeMap<crate::state::model::RouteId, crate::mgmt::policy::PolicyRejection>>,
     writes: std::sync::Mutex<()>,
     hub: Arc<crate::reload::Hub>,
     store: Arc<dyn crate::state::store::Store>,
 }
 impl ManagementPolicy {
+    fn activation_after_write(&self, route: &crate::state::model::RouteId) -> crate::mgmt::policy::Activation {
+        crate::mgmt::policy::Activation::from_pending(self.hub.fence_for(route)
+            .map_or(0, |fence| fence.wait_released(fence.epoch(), ACTIVATION_WAIT)))
+    }
     fn write(
         &self,
         route: &crate::state::model::RouteId,
@@ -411,11 +419,73 @@ impl ManagementPolicy {
         let before = self.hub.active_revision(route)?.map(|r| r.number);
         let revision = operation()?;
         let replayed = before.is_some_and(|n| revision.number <= n);
-        Ok(crate::mgmt::policy::PolicyWrite { revision, replayed })
+        // Hub publication has returned; neither the Hub nor adapter write lock is held
+        // while releases finish (their slow path may read the route policy).
+        drop(_guard);
+        let activation = self.activation_after_write(route);
+        Ok(crate::mgmt::policy::PolicyWrite { revision, replayed, activation })
+    }
+}
+#[cfg(test)]
+mod management_policy_tests {
+    use super::*;
+    use crate::mgmt::policy::{Activation, PolicySource};
+
+    #[test]
+    fn write_waits_without_adapter_lock_and_replay_reads_live_fence() {
+        let fixture = crate::pgwire::session::tests::Fixture::new();
+        let dir = std::env::temp_dir().join(format!("activation-{}", crate::token::SessionId::random().to_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        std::fs::write(&path, "[readlog]\nsink='stdout'\n").unwrap();
+        let route = crate::state::model::RouteId::new("postgres").unwrap();
+        let store = Arc::new(crate::state::store::RedbStore::open(&dir.join("state"), &crate::token::keys::RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap());
+        let hub = crate::reload::Hub::new(&[(route.clone(),path)],None,Default::default()).unwrap();
+        hub.set_store(store.clone()).unwrap();
+        hub.set_revision_store(Arc::new(crate::policy::LocalRevisionStore::new(store.clone()))).unwrap();
+        hub.register(crate::reload::Route::Postgres(fixture.ctx.clone())).unwrap();
+        let adapter = ManagementPolicy { writes: Default::default(), rejections: Default::default(), hub, store };
+        assert_eq!(adapter.import(&route,"admin","import".into()).unwrap().activation, Activation::Active);
+        let fence = adapter.hub.fence_for(&route).unwrap();
+        let slot = fence.register(); slot.begin(&fence);
+        let fp = adapter.hub.current_catalog_fingerprint(&route).unwrap();
+        let masked = "[readlog]\nsink='stdout'\n[[column]]\ntable='public.items'\nname='value'\nmasked=true\n";
+        let result = adapter.apply(&route,"admin",masked,1,&fp,"apply".into()).unwrap();
+        assert_eq!(result.activation, Activation::Pending { statements: 1 });
+        assert!(!result.replayed);
+        assert_eq!(adapter.activation(&route), Activation::Pending { statements: 1 });
+        let replay = adapter.apply(&route,"admin",masked,1,&fp,"apply".into()).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.activation, Activation::Pending { statements: 1 });
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                let _guard = adapter.writes.try_lock().expect("wait must release adapter lock");
+                let _policy = fixture.ctx.policy.read().unwrap();
+                slot.end();
+            });
+            let replay = adapter.apply(&route,"admin",masked,1,&fp,"apply".into()).unwrap();
+            assert!(replay.replayed); assert_eq!(replay.activation, Activation::Active);
+        });
+        assert_eq!(adapter.activation(&route), Activation::Active);
+        let unknown = crate::state::model::RouteId::new("unknown").unwrap();
+        assert_eq!(adapter.activation_after_write(&unknown), Activation::Active);
+        drop(adapter); drop(fixture);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 #[allow(clippy::result_large_err)] // Internal policy errors retain the stale revision for the API.
 impl crate::mgmt::policy::PolicySource for ManagementPolicy {
+    fn activation(&self, r: &crate::state::model::RouteId) -> crate::mgmt::policy::Activation {
+        crate::mgmt::policy::Activation::from_pending(self.hub.fence_for(r)
+            .map_or(0, |fence| fence.lagging(fence.epoch())))
+    }
+    fn record_rejection(&self, r: &crate::state::model::RouteId, rejection: crate::mgmt::policy::PolicyRejection) {
+        self.rejections.lock().unwrap_or_else(|e| e.into_inner()).insert(r.clone(), rejection);
+    }
+    fn last_rejected(&self, r: &crate::state::model::RouteId) -> Option<crate::mgmt::policy::PolicyRejection> {
+        self.rejections.lock().unwrap_or_else(|e| e.into_inner()).get(r).cloned()
+    }
     fn published(&self, r: &crate::state::model::RouteId) -> Result<Option<u64>, crate::mgmt::policy::PolicyError> { self.hub.published_revision(r).map_err(Into::into) }
     fn validate(&self, r: &crate::state::model::RouteId, toml: &str) -> Result<crate::policy::PolicyDocument, crate::mgmt::policy::PolicyError> { self.hub.validate_draft(r, toml).map_err(Into::into) }
     fn owner(
@@ -596,7 +666,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let management = if config.management.is_some() || cfg!(unix) {
         let ctx = crate::mgmt::routes::MgmtContext {
-            policy: Some(Arc::new(ManagementPolicy { hub: hub.clone(), store: runtime.store(), writes: std::sync::Mutex::new(()) })),
+            policy: Some(Arc::new(ManagementPolicy { rejections: Default::default(), hub: hub.clone(), store: runtime.store(), writes: std::sync::Mutex::new(()) })),
             authority: runtime.authority.clone(), admins,
             connections: Arc::new(ManagementConnections(runtime.registry.clone())),
             status: Arc::new(ManagementStatus {
@@ -741,6 +811,7 @@ async fn run_postgres(
     let root_key =
         crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
     let ctx = Arc::new(GatewayContext {
+        fence: Default::default(),
         authority: state.0.authority.clone(),
         registry: state.0.registry.clone(),
         route: state.1,
