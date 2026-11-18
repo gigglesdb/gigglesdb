@@ -1,6 +1,6 @@
 //! Compile declared policy into a treatment for every captured column.
 use super::{
-    DomainName, PolicyDocument, RouteDefault, Treatment,
+    DomainName, DomainSettings, PolicyDocument, RouteDefault, TokenizeSetting, Treatment,
     bindings::{BindingStatus, RouteBindings, TypeFamily},
 };
 use crate::{
@@ -24,6 +24,11 @@ pub enum Effective {
         /// Declared token domain.
         domain: DomainName,
     },
+    /// Tokenize using a persisted shared domain.
+    BlindLinked {
+        /// Shared token domain.
+        domain: DomainName,
+    },
     /// Tokenize using a persisted private domain.
     BlindPrivate {
         /// Persisted token domain.
@@ -34,6 +39,8 @@ pub enum Effective {
 /// Reason the compiler selected a treatment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
+    /// A persisted link selected a shared domain.
+    Linked,
     /// Binding requires operator repair; values are withheld.
     NeedsRepair,
     /// Identity or persisted binding is missing; values are withheld.
@@ -101,6 +108,18 @@ pub fn effective_all(
         .collect()
 }
 
+/// Return declared settings, keeping explicit minting off for generated domains.
+pub fn domain_settings(doc: &PolicyDocument, domain: &DomainName) -> DomainSettings {
+    doc.policy
+        .domains
+        .get(domain)
+        .cloned()
+        .unwrap_or(DomainSettings {
+            tokenize: TokenizeSetting::Off,
+            range: None,
+        })
+}
+
 fn explicit(treatment: &Treatment) -> (Effective, Origin) {
     let result = match treatment {
         Treatment::Show => Effective::Show,
@@ -127,6 +146,34 @@ fn compile(
 ) -> (Effective, Origin) {
     if doc.json_paths.iter().any(|rule| rule.column == *column) {
         return withheld(Origin::JsonPathsPending);
+    }
+    let record = snapshot.column_id(column).and_then(|id| bindings.get(id));
+    let named_link = doc.links.iter().any(|link| link.fields.contains(column));
+    if named_link || record.is_some_and(|r| r.linked) {
+        match record {
+            None => return withheld(Origin::Unbound),
+            Some(r) => match r.status {
+                BindingStatus::NeedsRepair | BindingStatus::Retired => {
+                    return withheld(Origin::NeedsRepair);
+                }
+                BindingStatus::Active => {
+                    if !r.linked {
+                        // Named in a link but not yet moved by a refresh: never
+                        // fall back to the route default (Show would leak).
+                        return withheld(Origin::Unbound);
+                    }
+                    return match &r.domain {
+                        Some(domain) => (
+                            Effective::BlindLinked {
+                                domain: domain.clone(),
+                            },
+                            Origin::Linked,
+                        ),
+                        None => withheld(Origin::Unbound),
+                    };
+                }
+            },
+        }
     }
     match doc.route_default {
         RouteDefault::Show => {
@@ -222,6 +269,131 @@ mod tests {
         schema::{Column, Relation, RelationKind},
     };
 
+    #[test]
+    fn linked_treatments_and_settings() {
+        use crate::{
+            policy::{
+                LinkRule,
+                bindings::{self, BindingChange},
+            },
+            schema::ColumnId,
+            state::{model::RouteId, store::RedbStore},
+            token::keys::RootKey,
+        };
+        let path = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap()).join(format!(
+            "effective-links-{}",
+            bindings::generate_domain_name().unwrap().0
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let store = RedbStore::open(&path, &RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap();
+        let route = RouteId::new("effective-links").unwrap();
+        let a = ColumnRef {
+            schema: "public".into(),
+            table: "t".into(),
+            column: "a".into(),
+        };
+        let b = ColumnRef {
+            column: "b".into(),
+            ..a.clone()
+        };
+        let id = ColumnId::Pg {
+            relation_oid: 1,
+            attnum: 1,
+        };
+        let snap = snapshot(vec![
+            (a.clone(), ColumnType::Text),
+            (b.clone(), ColumnType::Text),
+        ])
+        .with_column_ids(BTreeMap::from([
+            (a.clone(), id.clone()),
+            (
+                b.clone(),
+                ColumnId::Pg {
+                    relation_oid: 1,
+                    attnum: 2,
+                },
+            ),
+        ]));
+        let mut doc = document(RouteDefault::Tokenize);
+        doc.links.push(LinkRule {
+            fields: vec![a.clone(), b],
+            domain: None,
+        });
+        let (records, _) = bindings::refresh_membership(&store, &route, &doc, &snap).unwrap();
+        let shared = records.get(&id).unwrap().domain.clone().unwrap();
+        for mode in [RouteDefault::Tokenize, RouteDefault::Show] {
+            doc.route_default = mode;
+            assert_eq!(
+                effective(&doc, &snap, &records, &a).unwrap(),
+                (
+                    Effective::BlindLinked {
+                        domain: shared.clone()
+                    },
+                    Origin::Linked
+                )
+            );
+            assert_eq!(
+                effective(&doc, &snap, &RouteBindings::default(), &a).unwrap(),
+                withheld(Origin::Unbound)
+            );
+        }
+        // A link field whose record has not been moved yet is withheld on both defaults.
+        let mut unmoved = records.clone();
+        unmoved.get_mut(&id).unwrap().linked = false;
+        for mode in [RouteDefault::Tokenize, RouteDefault::Show] {
+            doc.route_default = mode;
+            assert_eq!(
+                effective(&doc, &snap, &unmoved, &a).unwrap(),
+                withheld(Origin::Unbound)
+            );
+        }
+        for status in [BindingStatus::NeedsRepair, BindingStatus::Retired] {
+            let repaired = bindings::apply(
+                &store,
+                &route,
+                &[BindingChange::Update {
+                    identity: id.clone(),
+                    column: a.clone(),
+                    family: Some(TypeFamily::Text),
+                    show_rule: None,
+                    status,
+                }],
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+            for mode in [RouteDefault::Tokenize, RouteDefault::Show] {
+                doc.route_default = mode;
+                assert_eq!(
+                    effective(&doc, &snap, &repaired, &a).unwrap(),
+                    withheld(Origin::NeedsRepair)
+                );
+            }
+        }
+        let parsed =
+            parse_policy_document("version = 2\ndefault = 'tokenize'\n[domains.shared]\n").unwrap();
+        assert_eq!(
+            domain_settings(&parsed, &DomainName("shared".into())).tokenize,
+            TokenizeSetting::Off
+        );
+        assert_eq!(
+            domain_settings(&parsed, &shared),
+            DomainSettings {
+                tokenize: TokenizeSetting::Off,
+                range: None
+            }
+        );
+        let declared = parse_policy_document(
+            "version = 2\ndefault = 'tokenize'\n[domains.shared]\ntokenize = 'on'\ntokenize_limit_per_session = 1\ntokenize_limit_per_principal = 2\ntokenize_principal_window = '1h'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            domain_settings(&declared, &DomainName("shared".into())),
+            declared.policy.domains[&DomainName("shared".into())]
+        );
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     fn document(mode: RouteDefault) -> PolicyDocument {
         PolicyDocument {
             file_readlog: None,
@@ -235,6 +407,7 @@ mod tests {
             version: PolicyVersion::V2,
             route_default: mode,
             json_paths: vec![],
+            links: vec![],
         }
     }
 

@@ -31,10 +31,12 @@ pub enum Table {
     DomainBindings,
     /// Permanently reserved private domain names.
     DomainNames,
+    /// Permanently retired generated domains.
+    RetiredDomains,
 }
 impl Table {
     /// Every application table in schema order.
-    pub const ALL: [Table; 11] = [
+    pub const ALL: [Table; 12] = [
         Self::Principals,
         Self::PrincipalCredentials,
         Self::Grants,
@@ -46,6 +48,7 @@ impl Table {
         Self::Idempotency,
         Self::DomainBindings,
         Self::DomainNames,
+        Self::RetiredDomains,
     ];
 
     /// Stable on-disk table name.
@@ -62,6 +65,7 @@ impl Table {
             Self::Idempotency => "idempotency",
             Self::DomainBindings => "domain_bindings",
             Self::DomainNames => "domain_names",
+            Self::RetiredDomains => "retired_domains",
         }
     }
 

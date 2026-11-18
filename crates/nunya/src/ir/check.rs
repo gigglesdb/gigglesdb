@@ -305,6 +305,125 @@ mod tests {
         policy::{DomainSettings, ReadLogSink},
         schema::{Column, Relation, RelationKind},
     };
+    #[test]
+    fn persisted_links_allow_join_and_write_only_while_linked() {
+        use crate::{
+            policy::{
+                bindings,
+                effective::{Effective, effective_all},
+                file::parse_policy_document,
+            },
+            schema::ColumnId,
+            state::{model::RouteId, store::RedbStore},
+            token::{self, ScopeKeys, StandardCodec, TokenCodec, keys::RootKey},
+            value::SqlValue,
+        };
+        let path = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap()).join(format!(
+            "ir-links-{}",
+            bindings::generate_domain_name().unwrap().0
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let store = RedbStore::open(&path, &RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap();
+        let route = RouteId::new("ir-links").unwrap();
+        let (_, snapshot) = fixture();
+        let email = col("customers", "email");
+        let address = col("outbox", "to_address");
+        let snapshot = snapshot.with_column_ids(BTreeMap::from([
+            (
+                email.clone(),
+                ColumnId::Pg {
+                    relation_oid: 1,
+                    attnum: 1,
+                },
+            ),
+            (
+                address.clone(),
+                ColumnId::Pg {
+                    relation_oid: 2,
+                    attnum: 1,
+                },
+            ),
+        ]));
+        let plain_doc = "version = 2\ndefault = 'tokenize'\n";
+        let linked_doc = format!(
+            "{plain_doc}[[link]]\nfields = ['public.customers.email', 'public.outbox.to_address']\n"
+        );
+        let keys = ScopeKeys::new([1; 32]);
+        let mut old_token = None;
+        for (phase, source) in [plain_doc, linked_doc.as_str(), plain_doc]
+            .into_iter()
+            .enumerate()
+        {
+            let doc = parse_policy_document(source).unwrap();
+            let (records, _) =
+                bindings::refresh_membership(&store, &route, &doc, &snapshot).unwrap();
+            let labels: BTreeMap<_, _> = effective_all(&doc, &snapshot, &records)
+                .into_iter()
+                .map(|(column, (effective, _))| {
+                    let label = match effective {
+                        Effective::Blind { domain }
+                        | Effective::BlindPrivate { domain }
+                        | Effective::BlindLinked { domain } => Label::Blind(domain),
+                        Effective::Show => Label::Plain,
+                        Effective::Masked { .. } => Label::Masked,
+                    };
+                    (column, label)
+                })
+                .collect();
+            let mut join = stmt();
+            join.uses.push(ColumnUse {
+                column: email.clone(),
+                label: labels[&email].clone(),
+                context: Context::JoinOn,
+                kind: UseKind::Equality {
+                    other: column("outbox", "to_address", labels[&address].clone()),
+                },
+            });
+            let mut write = stmt();
+            write.kind = StatementKind::Insert;
+            write.writes.push(WriteTarget {
+                column: address.clone(),
+                label: labels[&address].clone(),
+                value: column("customers", "email", labels[&email].clone()),
+            });
+            for statement in [join, write] {
+                let result = check(&statement, &doc.policy, &snapshot);
+                if phase == 1 {
+                    assert!(result.is_ok());
+                } else {
+                    assert_eq!(result.unwrap_err().code, NyCode::TokenOutsideDomain);
+                }
+            }
+            if phase == 1 {
+                let Label::Blind(shared) = &labels[&email] else {
+                    panic!("expected blind label")
+                };
+                let SqlValue::Text(token) = StandardCodec
+                    .encode(
+                        &keys,
+                        shared,
+                        &ColumnType::Text,
+                        None,
+                        &SqlValue::Text("example".into()),
+                    )
+                    .unwrap()
+                else {
+                    panic!("expected text token")
+                };
+                old_token = Some(token);
+            }
+        }
+        let retired = bindings::load_retired(&store, &route).unwrap();
+        assert_eq!(
+            token::check_not_retired(&retired, old_token.as_ref().unwrap())
+                .unwrap_err()
+                .code,
+            NyCode::TokenOutsideDomain
+        );
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     fn domain(name: &str) -> DomainName {
         DomainName(name.into())
     }

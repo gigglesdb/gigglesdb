@@ -13,6 +13,27 @@ use zeroize::Zeroizing;
 fn bad() -> Refusal {
     Refusal::new(NyCode::TokenNotValid, "invalid text token")
 }
+pub(crate) fn token_parts(text: &str) -> Result<(&str, &str), Refusal> {
+    text.strip_prefix("tok_")
+        .ok_or_else(|| Refusal::new(NyCode::BlindOperation, "plain text in blind position"))?
+        .rsplit_once('_')
+        .ok_or_else(bad)
+}
+
+/// Decode text only when its expected and embedded domains are not retired.
+pub fn decode_checked(
+    keys: &ScopeKeys,
+    domain: &DomainName,
+    value: &SqlValue,
+    retired: &super::RetiredDomains,
+) -> Result<SqlValue, Refusal> {
+    super::check_expected_not_retired(retired, domain)?;
+    if let SqlValue::Text(token) = value {
+        super::check_not_retired(retired, token)?;
+    }
+    convert(keys, domain, value, true)
+}
+
 fn cipher(keys: &ScopeKeys, domain: &DomainName) -> Aes256Siv {
     let key = subkey(keys, domain, "text");
     let mut expanded = Zeroizing::new([0; 64]);
@@ -55,10 +76,7 @@ pub(crate) fn convert(
             prefix + &BASE32_NOPAD.encode(&encrypted).to_ascii_lowercase(),
         ));
     }
-    let token = text
-        .strip_prefix("tok_")
-        .ok_or_else(|| Refusal::new(NyCode::BlindOperation, "plain text in blind position"))?;
-    let (token_domain, body) = token.rsplit_once('_').ok_or_else(bad)?;
+    let (token_domain, body) = token_parts(text)?;
     if token_domain != domain.0 {
         return Err(Refusal::new(
             NyCode::TokenOutsideDomain,

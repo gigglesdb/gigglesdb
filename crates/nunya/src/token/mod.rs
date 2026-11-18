@@ -12,6 +12,28 @@ pub mod fpe;
 pub mod keys;
 /// Text token support.
 pub mod text;
+/// Route-local retired domains, loaded with policy::bindings::load_retired.
+pub type RetiredDomains = std::collections::BTreeSet<DomainName>;
+
+pub(crate) fn check_expected_not_retired(
+    retired: &RetiredDomains,
+    domain: &DomainName,
+) -> Result<(), Refusal> {
+    if retired.contains(domain) {
+        return Err(Refusal::new(
+            crate::error::NyCode::TokenOutsideDomain,
+            "retired token domain",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse text tokens carrying a retired domain without exposing token contents.
+pub fn check_not_retired(retired: &RetiredDomains, token: &str) -> Result<(), Refusal> {
+    let (domain, _) = text::token_parts(token)?;
+    check_expected_not_retired(retired, &DomainName(domain.to_owned()))
+}
+
 // Shared implementation also used by durable credential identifiers.
 macro_rules! id_type {
     ($name:ident, $doc:literal) => {
@@ -100,6 +122,24 @@ pub trait TokenCodec {
         range: Option<&TypeRange>,
         v: &SqlValue,
     ) -> Result<SqlValue, Refusal>;
+    /// Decode text or FPE only after rejecting retired expected and embedded domains.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_checked(
+        &self,
+        keys: &ScopeKeys,
+        domain: &DomainName,
+        ty: &ColumnType,
+        range: Option<&TypeRange>,
+        v: &SqlValue,
+        retired: &RetiredDomains,
+    ) -> Result<SqlValue, Refusal> {
+        check_expected_not_retired(retired, domain)?;
+        if ty.is_textual()
+            && let SqlValue::Text(token) = v {
+                check_not_retired(retired, token)?;
+            }
+        self.decode(keys, domain, ty, range, v)
+    }
     /// Decode a value for a domain; Null passes through unchanged.
     fn decode(
         &self,
@@ -189,6 +229,75 @@ impl TokenCodec for StandardCodec {
 mod tests {
     use super::*;
     use crate::error::NyCode;
+    #[test]
+    fn retired_domains_guard_text_and_fpe_decodes() {
+        let keys = ScopeKeys::new([3; 32]);
+        let domain = DomainName("shared_with_underscores".into());
+        let other = DomainName("other".into());
+        let retired = RetiredDomains::from([domain.clone()]);
+        for (ty, plain) in [
+            (ColumnType::Text, SqlValue::Text("hello".into())),
+            (ColumnType::Int4, SqlValue::Int4(123)),
+        ] {
+            let token = StandardCodec
+                .encode(&keys, &domain, &ty, None, &plain)
+                .unwrap();
+            assert_eq!(
+                StandardCodec
+                    .decode(&keys, &domain, &ty, None, &token)
+                    .unwrap(),
+                plain
+            );
+            assert_eq!(
+                StandardCodec
+                    .decode_checked(&keys, &domain, &ty, None, &token, &RetiredDomains::new())
+                    .unwrap(),
+                plain
+            );
+            assert_eq!(
+                StandardCodec
+                    .decode_checked(&keys, &domain, &ty, None, &token, &retired)
+                    .unwrap_err()
+                    .code,
+                NyCode::TokenOutsideDomain
+            );
+            if let SqlValue::Text(text) = &token {
+                assert_eq!(
+                    check_not_retired(&retired, text).unwrap_err().code,
+                    NyCode::TokenOutsideDomain
+                );
+                assert_eq!(
+                    text::decode_checked(&keys, &domain, &token, &retired)
+                        .unwrap_err()
+                        .code,
+                    NyCode::TokenOutsideDomain
+                );
+                assert_eq!(
+                    text::decode_checked(&keys, &other, &token, &retired)
+                        .unwrap_err()
+                        .code,
+                    NyCode::TokenOutsideDomain
+                );
+                assert_eq!(
+                    text::decode_checked(&keys, &domain, &token, &RetiredDomains::new()).unwrap(),
+                    plain
+                );
+            }
+        }
+        for malformed in ["plain", "tok_missingseparator", "tok_other_!", "tok_other_"] {
+            let value = SqlValue::Text(malformed.into());
+            assert_eq!(
+                StandardCodec
+                    .decode_checked(&keys, &other, &ColumnType::Text, None, &value, &retired)
+                    .unwrap_err()
+                    .code,
+                StandardCodec
+                    .decode(&keys, &other, &ColumnType::Text, None, &value)
+                    .unwrap_err()
+                    .code
+            );
+        }
+    }
     #[test]
     fn dispatch_refusals_and_nulls() {
         let keys = ScopeKeys::new([0; 32]);

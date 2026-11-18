@@ -270,6 +270,18 @@ impl Authority {
                                 return Err(bad());
                             }
                         }
+                        Table::RetiredDomains => {
+                            std::str::from_utf8(&bytes)
+                                .ok().and_then(RouteId::new).ok_or_else(bad)?;
+                            let name = std::str::from_utf8(&key).map_err(|_| bad())?;
+                            if !(1..=31).contains(&name.len())
+                                || !name.as_bytes()[0].is_ascii_lowercase()
+                                || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                                || read.get(Table::DomainNames, &key)?.is_none()
+                            {
+                                return Err(bad());
+                            }
+                        }
                         Table::DomainNames => {
                             let separator = bytes.iter().position(|b| *b == 0).ok_or_else(bad)?;
                             std::str::from_utf8(&bytes[..separator])

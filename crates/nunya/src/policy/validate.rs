@@ -1,6 +1,7 @@
 //! Policy validation against a captured database schema.
 use super::{
-    DomainName, Policy, Treatment,
+    DomainName, Policy, PolicyDocument, Treatment,
+    bindings::TypeFamily,
     file::{PolicyError, error},
 };
 use crate::{
@@ -195,6 +196,60 @@ pub fn validate(policy: &Policy, snapshot: &Snapshot) -> Result<(), Vec<PolicyEr
                     column_name(column)
                 ),
             });
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Validate linked fields and declared domain compatibility against a snapshot.
+pub fn validate_links(doc: &PolicyDocument, snapshot: &Snapshot) -> Result<(), Vec<PolicyError>> {
+    let mut errors = vec![];
+    for link in &doc.links {
+        let mut families = HashSet::new();
+        for column in &link.fields {
+            let context = format!("link column {}", column_name(column));
+            if let Some(captured) = snapshot.column(column) {
+                if TypeFamily::of(&captured.ty).is_none() {
+                    error(&mut errors, &context, "type has no supported codec");
+                }
+                families.insert(family(&captured.ty));
+            } else {
+                error(&mut errors, &context, "column does not exist in snapshot");
+            }
+            match doc.policy.treatment(column) {
+                None => (),
+                Some(Treatment::Blind { domain }) if link.domain.as_ref() == Some(domain) => (),
+                Some(Treatment::Show | Treatment::Masked { .. } | Treatment::Blind { .. }) => {
+                    error(
+                        &mut errors,
+                        &context,
+                        "explicit column treatment conflicts with link",
+                    );
+                }
+            }
+            if doc.json_paths.iter().any(|rule| &rule.column == column) {
+                error(&mut errors, &context, "json_path conflicts with link");
+            }
+        }
+        if let Some(domain) = &link.domain {
+            for (column, treatment) in &doc.policy.columns {
+                if matches!(treatment, Treatment::Blind { domain: other } if other == domain)
+                    && let Some(captured) = snapshot.column(column)
+                {
+                    families.insert(family(&captured.ty));
+                }
+            }
+        }
+        if families.len() > 1 {
+            error(
+                &mut errors,
+                "link",
+                "columns must belong to one type family",
+            );
         }
     }
     if errors.is_empty() {
@@ -463,5 +518,118 @@ mod tests {
             readlog: super::super::ReadLogSink::Stdout,
         };
         assert!(validate(&policy, &Snapshot::new(vec![], vec![], vec![], 0)).is_ok());
+    }
+    fn linked(types: &[ColumnType], declared: bool) -> (PolicyDocument, Snapshot) {
+        let (mut policy, snapshot) = fixture(types);
+        let fields = policy.columns.keys().take(2).cloned().collect();
+        policy.columns.clear();
+        (
+            PolicyDocument {
+                file_readlog: None,
+                file_snapshot_max_age_ms: None,
+                policy,
+                version: super::super::PolicyVersion::V2,
+                route_default: super::super::RouteDefault::Tokenize,
+                json_paths: vec![],
+                links: vec![super::super::LinkRule {
+                    fields,
+                    domain: declared.then(|| DomainName("email".into())),
+                }],
+            },
+            snapshot,
+        )
+    }
+    fn link_has(doc: &PolicyDocument, snapshot: &Snapshot, text: &str) -> bool {
+        validate_links(doc, snapshot)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.message.starts_with("link") && error.message.contains(text))
+    }
+    #[test]
+    fn links_require_existing_columns() {
+        let (doc, mut snapshot) = linked(&[ColumnType::Text, ColumnType::Text], false);
+        snapshot.relations[0].columns.pop();
+        assert!(link_has(&doc, &snapshot, "does not exist"));
+    }
+    #[test]
+    fn links_require_supported_codecs() {
+        for ty in [ColumnType::Bool, ColumnType::Jsonb, ColumnType::Int2] {
+            let (doc, snapshot) = linked(&[ty.clone(), ty], false);
+            assert!(link_has(&doc, &snapshot, "no supported codec"));
+        }
+    }
+    #[test]
+    fn links_require_one_family() {
+        let (doc, snapshot) = linked(&[ColumnType::Text, ColumnType::Int8], false);
+        assert!(link_has(&doc, &snapshot, "one type family"));
+    }
+    #[test]
+    fn links_accept_textual_family_and_unlisted_fields() {
+        for declared in [false, true] {
+            let (doc, snapshot) =
+                linked(&[ColumnType::Varchar(Some(12)), ColumnType::Text], declared);
+            assert!(validate_links(&doc, &snapshot).is_ok());
+        }
+    }
+    #[test]
+    fn links_refuse_conflicting_explicit_treatments() {
+        for treatment in [
+            Treatment::Show,
+            Treatment::Masked { placeholder: None },
+            Treatment::Blind {
+                domain: DomainName("other".into()),
+            },
+        ] {
+            let (mut doc, snapshot) = linked(&[ColumnType::Text, ColumnType::Text], true);
+            doc.policy
+                .columns
+                .insert(doc.links[0].fields[0].clone(), treatment);
+            assert!(link_has(
+                &doc,
+                &snapshot,
+                "explicit column treatment conflicts"
+            ));
+        }
+    }
+    #[test]
+    fn links_accept_only_matching_explicit_blind_domain() {
+        for declared in [false, true] {
+            let (mut doc, snapshot) = linked(&[ColumnType::Text, ColumnType::Text], declared);
+            doc.policy.columns.insert(
+                doc.links[0].fields[0].clone(),
+                Treatment::Blind {
+                    domain: DomainName("email".into()),
+                },
+            );
+            assert_eq!(validate_links(&doc, &snapshot).is_ok(), declared);
+        }
+    }
+    #[test]
+    fn links_refuse_json_path_on_linked_column() {
+        let (mut doc, snapshot) = linked(&[ColumnType::Text, ColumnType::Text], false);
+        doc.json_paths.push(super::super::JsonPathRule {
+            column: doc.links[0].fields[0].clone(),
+            path: vec![],
+            treatment: super::super::JsonPathTreatment::Masked,
+        });
+        assert!(link_has(&doc, &snapshot, "json_path conflicts"));
+    }
+    #[test]
+    fn links_include_other_explicit_domain_columns_in_family_check() {
+        for ty in [ColumnType::Int8, ColumnType::Varchar(None)] {
+            let (mut doc, snapshot) =
+                linked(&[ColumnType::Text, ColumnType::Text, ty.clone()], true);
+            doc.policy.columns.insert(
+                ColumnRef {
+                    schema: "public".into(),
+                    table: "customers".into(),
+                    column: "c2".into(),
+                },
+                Treatment::Blind {
+                    domain: DomainName("email".into()),
+                },
+            );
+            assert_eq!(validate_links(&doc, &snapshot).is_ok(), ty.is_textual());
+        }
     }
 }

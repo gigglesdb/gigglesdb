@@ -132,6 +132,14 @@ pub enum PolicyVersion {
     /// Explicit defaults and JSON path rules.
     V2,
 }
+/// Columns sharing a linked token domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkRule {
+    /// Fully qualified linked columns.
+    pub fields: Vec<ColumnRef>,
+    /// Optional declared domain shared by the fields.
+    pub domain: Option<DomainName>,
+}
 /// Parsed policy together with versioned routing metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDocument {
@@ -147,4 +155,6 @@ pub struct PolicyDocument {
     pub route_default: RouteDefault,
     /// Validated JSON path declarations, not yet enforced.
     pub json_paths: Vec<JsonPathRule>,
+    /// Linked columns, not yet enforced.
+    pub links: Vec<LinkRule>,
 }

@@ -50,6 +50,7 @@ fn document() -> PolicyDocument {
         version: PolicyVersion::V2,
         route_default: RouteDefault::Tokenize,
         json_paths: vec![],
+        links: vec![],
     }
 }
 fn column(schema: &str, table: &str, name: &str) -> ColumnRef {

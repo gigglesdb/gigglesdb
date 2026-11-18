@@ -1,8 +1,8 @@
 //! Strict policy file parsing with data-free diagnostics.
 use super::{
     DomainName, DomainSettings, JsonLeafType, JsonPathRule, JsonPathTreatment, JsonTokenType,
-    Policy, PolicyDocument, PolicyVersion, ReadLogSink, RouteDefault, TokenizeSetting, Treatment,
-    TypeRange, ServicePolicySettings,
+    LinkRule, Policy, PolicyDocument, PolicyVersion, ReadLogSink, RouteDefault,
+    ServicePolicySettings, TokenizeSetting, Treatment, TypeRange,
 };
 use crate::schema::ColumnRef;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -38,6 +38,7 @@ struct RawPolicy {
     version: Option<Value>,
     default: Option<Value>,
     json_path: Option<Value>,
+    link: Option<Value>,
     snapshot_max_age_ms: Option<Value>,
     readlog: Option<Value>,
     domains: Option<Value>,
@@ -350,11 +351,15 @@ pub fn parse_policy_document(toml_text: &str) -> Result<PolicyDocument, Vec<Poli
         }
     };
     let mut errors = vec![];
+    if !v2 && value.get("link").is_some() {
+        error(&mut errors, "link", "link requires version = 2");
+    }
     let allowed: &[&str] = if v2 {
         &[
             "version",
             "default",
             "json_path",
+            "link",
             "snapshot_max_age_ms",
             "readlog",
             "domains",
@@ -543,6 +548,7 @@ pub fn parse_policy_document(toml_text: &str) -> Result<PolicyDocument, Vec<Poli
             columns.insert(column, treatment);
         }
     }
+    let links = parse_links(raw.link, &domains, &mut errors);
     let json_paths = parse_json_paths(raw.json_path, &domains, &columns, &mut errors);
     if errors.is_empty() {
         Ok(PolicyDocument {
@@ -561,10 +567,97 @@ pub fn parse_policy_document(toml_text: &str) -> Result<PolicyDocument, Vec<Poli
             },
             route_default,
             json_paths,
+            links,
         })
     } else {
         Err(errors)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLink {
+    fields: Option<Value>,
+    domain: Option<Value>,
+}
+
+fn parse_links(
+    value: Option<Value>,
+    domains: &BTreeMap<DomainName, DomainSettings>,
+    errors: &mut Vec<PolicyError>,
+) -> Vec<LinkRule> {
+    let values = match value {
+        None => return vec![],
+        Some(Value::Array(values)) => values,
+        Some(_) => {
+            error(errors, "link", "expected an array of tables");
+            return vec![];
+        }
+    };
+    let mut links = vec![];
+    let mut linked_fields = BTreeSet::new();
+    let mut linked_domains = BTreeSet::new();
+    for value in values {
+        let Some(raw): Option<RawLink> = table(value, &["fields", "domain"], "link", errors) else {
+            continue;
+        };
+        let names: Vec<String> = match raw.fields {
+            None => {
+                error(
+                    errors,
+                    "link",
+                    "fields is required and must be an array of strings",
+                );
+                continue;
+            }
+            Some(value) => match value.try_into() {
+                Ok(names) => names,
+                Err(_) => {
+                    error(errors, "link", "fields must be an array of strings");
+                    continue;
+                }
+            },
+        };
+        if names.len() < 2 {
+            error(errors, "link", "at least two fields are required");
+        }
+        let mut fields = vec![];
+        let mut seen = BTreeSet::new();
+        for name in names {
+            let parts: Vec<_> = name.split('.').collect();
+            if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+                error(errors, "link", "field must be schema.table.column");
+                continue;
+            }
+            let column = ColumnRef {
+                schema: parts[0].into(),
+                table: parts[1].into(),
+                column: parts[2].into(),
+            };
+            if !seen.insert(column.clone()) {
+                error(errors, "link", "duplicate field within a link");
+            } else if !linked_fields.insert(column.clone()) {
+                error(errors, "link", "field appears in more than one link");
+            }
+            fields.push(column);
+        }
+        let domain: Option<String> = field(raw.domain, "link", "domain must be a string", errors);
+        let domain = domain.map(DomainName);
+        if let Some(domain) = &domain {
+            if !domain_name_valid(&domain.0) || !domains.contains_key(domain) {
+                error(errors, "link", "domain must name a declared domain");
+            }
+            if !linked_domains.insert(domain.clone()) {
+                error(
+                    errors,
+                    "link",
+                    "declared domain appears in more than one link",
+                );
+            }
+        }
+        links.push(LinkRule { fields, domain });
+    }
+    links
 }
 
 #[derive(Deserialize)]
@@ -803,6 +896,11 @@ pub fn resolve(mut doc: PolicyDocument, service: &ServicePolicySettings) -> Resu
         (None, Some(service)) => service,
         (None, None) => 60000,
     };
+    // Links are dropped by the Policy projection, so refuse them until a later
+    // stack enforces shared domains (fail closed rather than serve them as Show).
+    if !doc.links.is_empty() {
+        error(&mut errors, "link", "link rules are not served yet");
+    }
     if errors.is_empty() { Ok(doc) } else { Err(errors) }
 }
 
@@ -1358,5 +1456,165 @@ placeholder = "**"
         d.file_readlog = Some(ReadLogSink::File { path: base.join(".").join("resolution.log"), max_bytes: 12 });
         let service = ServicePolicySettings { readlog: Some(ReadLogSink::File { path: std::fs::canonicalize(base).unwrap().join("resolution.log"), max_bytes: 12 }), ..Default::default() };
         assert!(resolve(d, &service).is_ok());
+    }
+    fn link_error(body: &str, expected: &str) {
+        let errors = parse_policy_document(&format!("{V2}{body}")).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("link:") && e.message.contains(expected))
+        );
+        for e in errors {
+            assert!(!e.message.contains("private_value"));
+            assert!(!e.message.contains("private_key"));
+        }
+    }
+
+    #[test]
+    fn links_are_refused_when_resolved_for_serving() {
+        let text = format!("{V2}[[link]]
+fields = ['public.a.x', 'public.b.y']
+");
+        let doc = parse_policy_document(&text).unwrap();
+        let errors = resolve(doc, &ServicePolicySettings::default()).unwrap_err();
+        assert!(errors.iter().any(|e| e.message == "link: link rules are not served yet"));
+        assert!(parse_policy(&text).is_err());
+    }
+
+    #[test]
+    fn links_parse_with_and_without_domain() {
+        for domain in ["", "domain = 'email'\n"] {
+            let text = format!("{V2}[[link]]\nfields = ['public.a.x', 'public.b.y']\n{domain}");
+            let doc = parse_policy_document(&text).unwrap();
+            assert_eq!(doc.links.len(), 1);
+            assert_eq!(
+                doc.links[0].fields,
+                vec![
+                    ColumnRef {
+                        schema: "public".into(),
+                        table: "a".into(),
+                        column: "x".into()
+                    },
+                    ColumnRef {
+                        schema: "public".into(),
+                        table: "b".into(),
+                        column: "y".into()
+                    },
+                ]
+            );
+            assert_eq!(
+                doc.links[0].domain,
+                if domain.is_empty() {
+                    None
+                } else {
+                    Some(DomainName("email".into()))
+                }
+            );
+            let fields: Vec<_> = doc.links[0]
+                .fields
+                .iter()
+                .map(|field| format!("{}.{}.{}", field.schema, field.table, field.column))
+                .collect();
+            let domain = doc.links[0]
+                .domain
+                .as_ref()
+                .map(|domain| format!("domain = {:?}\n", domain.0))
+                .unwrap_or_default();
+            let rebuilt = format!("{V2}[[link]]\nfields = {fields:?}\n{domain}");
+            assert_eq!(parse_policy_document(&rebuilt).unwrap(), doc);
+        }
+    }
+    #[test]
+    fn link_requires_fields() {
+        link_error("[[link]]\ndomain = 'email'", "fields is required");
+    }
+    #[test]
+    fn link_requires_array_of_strings() {
+        for fields in ["'private_value'", "[1, 2]", "['public.a.x', 2]"] {
+            link_error(&format!("[[link]]\nfields = {fields}"), "array of strings");
+        }
+    }
+    #[test]
+    fn link_requires_two_fields() {
+        for fields in ["[]", "['public.a.x']"] {
+            link_error(&format!("[[link]]\nfields = {fields}"), "at least two");
+        }
+    }
+    #[test]
+    fn link_requires_qualified_nonempty_fields() {
+        for field in ["private_value", "a.b", "a.b.c.d", ".b.c", "a..c", "a.b."] {
+            link_error(
+                &format!("[[link]]\nfields = ['{field}', 'public.b.y']"),
+                "schema.table.column",
+            );
+        }
+    }
+    #[test]
+    fn link_rejects_duplicate_fields() {
+        link_error(
+            "[[link]]\nfields = ['public.a.x', 'public.a.x']",
+            "duplicate field",
+        );
+    }
+    #[test]
+    fn link_rejects_overlapping_fields() {
+        link_error(
+            "[[link]]\nfields = ['public.a.x', 'public.b.y']\n[[link]]\nfields = ['public.a.x', 'public.c.z']",
+            "more than one link",
+        );
+    }
+    #[test]
+    fn link_rejects_reused_domain() {
+        link_error(
+            "[[link]]\nfields = ['public.a.x', 'public.b.y']\ndomain = 'email'\n[[link]]\nfields = ['public.c.z', 'public.d.w']\ndomain = 'email'",
+            "declared domain appears",
+        );
+    }
+    #[test]
+    fn link_requires_declared_valid_domain() {
+        for domain in ["private_value", "Bad", ""] {
+            link_error(
+                &format!("[[link]]\nfields = ['public.a.x', 'public.b.y']\ndomain = '{domain}'"),
+                "declared domain",
+            );
+        }
+    }
+    #[test]
+    fn link_requires_string_domain() {
+        link_error(
+            "[[link]]\nfields = ['public.a.x', 'public.b.y']\ndomain = 42",
+            "domain must be a string",
+        );
+    }
+    #[test]
+    fn link_rejects_unknown_key() {
+        link_error(
+            "[[link]]\nfields = ['public.a.x', 'public.b.y']\nprivate_key = 'private_value'",
+            "unknown key",
+        );
+    }
+    #[test]
+    fn link_requires_array_of_tables() {
+        // Root settings must precede the domains table in V2.
+        let errors = parse_policy_document("version = 2\ndefault = 'show'\nlink = 'private_value'")
+            .unwrap_err();
+        assert_eq!(errors[0].message, "link: expected an array of tables");
+    }
+    #[test]
+    fn link_requires_table_entries() {
+        let errors =
+            parse_policy_document("version = 2\ndefault = 'show'\nlink = ['private_value']")
+                .unwrap_err();
+        assert_eq!(errors[0].message, "link: expected a table");
+    }
+    #[test]
+    fn legacy_link_requires_version_two() {
+        let errors =
+            parse_policy_document("[[link]]\nfields = ['public.a.x', 'public.b.y']").unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message == "link: link requires version = 2")
+        );
     }
 }

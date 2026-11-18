@@ -63,7 +63,7 @@ pub enum BindingStatus {
     /// Identity is no longer present.
     Retired,
 }
-/// Persisted identity and its immutable private domain allocation.
+/// Persisted identity and its current domain membership.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindingRecord {
@@ -73,8 +73,11 @@ pub struct BindingRecord {
     pub column: ColumnRef,
     /// Compatible codec family.
     pub family: Option<TypeFamily>,
-    /// Allocated private domain.
+    /// Allocated or declared token domain.
     pub domain: Option<DomainName>,
+    /// Whether a link assigned this domain.
+    #[serde(default)]
+    pub linked: bool,
     /// Explicit Show declaration anchored to this identity.
     pub show_rule: Option<ColumnRef>,
     /// Current lifecycle state.
@@ -86,6 +89,11 @@ pub struct BindingRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteBindings(BTreeMap<ColumnId, BindingRecord>);
 impl RouteBindings {
+    /// Mutable record access for unit tests in sibling modules.
+    #[cfg(test)]
+    pub(crate) fn get_mut(&mut self, identity: &ColumnId) -> Option<&mut BindingRecord> {
+        self.0.get_mut(identity)
+    }
     /// Look up a captured identity.
     pub fn get(&self, identity: &ColumnId) -> Option<&BindingRecord> {
         self.0.get(identity)
@@ -104,9 +112,31 @@ impl RouteBindings {
             .filter(move |record| &record.column == column)
     }
 }
+/// Destination for an atomic domain move.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DomainTarget {
+    /// A declared or retained existing name.
+    Named(DomainName),
+    /// One fresh name shared by this reconciliation group.
+    Generated {
+        /// Reconciliation-local group identifier.
+        group: usize,
+    },
+    /// A fresh private allocation.
+    FreshPrivate,
+}
 /// Atomic binding mutation request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum BindingChange {
+    /// Move an active identity into a linked or private domain.
+    SetDomain {
+        /// Stable identity.
+        identity: ColumnId,
+        /// New domain destination.
+        target: DomainTarget,
+        /// Whether this is a link membership.
+        linked: bool,
+    },
     /// Allocate a new identity binding.
     Create {
         /// Stable identity.
@@ -144,6 +174,9 @@ pub enum BindingChange {
 /// Data-free binding operation failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BindingError {
+    /// A declared domain name is already allocated in persistent state.
+    #[error("declared domain name collides with an allocated name")]
+    DeclaredNameCollision,
     /// Storage or entropy unavailable.
     #[error("binding store unavailable")]
     Store,
@@ -157,6 +190,35 @@ pub enum BindingError {
     #[error("binding identity is unknown or already allocated")]
     UnknownIdentity,
 }
+/// Refuse declared domain names that collide with persisted generated names.
+pub fn check_declared_names(store: &dyn Store, doc: &PolicyDocument) -> Result<(), BindingError> {
+    let txn = store.read().map_err(|_| BindingError::Store)?;
+    let names = doc
+        .policy
+        .domains
+        .keys()
+        .chain(
+            doc.policy
+                .columns
+                .values()
+                .filter_map(|treatment| match treatment {
+                    Treatment::Blind { domain } => Some(domain),
+                    Treatment::Show | Treatment::Masked { .. } => None,
+                }),
+        )
+        .chain(doc.links.iter().filter_map(|link| link.domain.as_ref()));
+    for name in names {
+        if txn
+            .get(Table::DomainNames, &keys::domain_name(name))
+            .map_err(|_| BindingError::Store)?
+            .is_some()
+        {
+            return Err(BindingError::DeclaredNameCollision);
+        }
+    }
+    Ok(())
+}
+
 /// Generate a private name with 50 bits of operating-system entropy.
 pub fn generate_domain_name() -> Result<DomainName, BindingError> {
     let mut bytes = [0; 10];
@@ -206,10 +268,49 @@ fn apply_with_generator(
     reserved: &BTreeSet<DomainName>,
     mut generate: impl FnMut() -> Result<DomainName, BindingError>,
 ) -> Result<RouteBindings, BindingError> {
+    if changes.is_empty() {
+        return load(store, route);
+    }
     let mut txn = store.write().map_err(|_| BindingError::Store)?;
+    let mut groups: BTreeMap<usize, DomainName> = BTreeMap::new();
     let mut bindings = read_bindings(txn.as_ref(), route)?;
     for change in changes {
         let record = match change {
+            BindingChange::SetDomain {
+                identity,
+                target,
+                linked,
+            } => {
+                let mut record = bindings
+                    .get(identity)
+                    .filter(|r| r.status == BindingStatus::Active)
+                    .ok_or(BindingError::UnknownIdentity)?
+                    .clone();
+                let domain = match target {
+                    DomainTarget::Named(name) => name.clone(),
+                    DomainTarget::FreshPrivate => {
+                        allocate_domain(txn.as_mut(), route, identity, reserved, &mut generate)?
+                    }
+                    DomainTarget::Generated { group } => {
+                        if let Some(name) = groups.get(group) {
+                            name.clone()
+                        } else {
+                            let name = allocate_domain(
+                                txn.as_mut(),
+                                route,
+                                identity,
+                                reserved,
+                                &mut generate,
+                            )?;
+                            groups.insert(*group, name.clone());
+                            name
+                        }
+                    }
+                };
+                record.domain = Some(domain);
+                record.linked = *linked;
+                record
+            }
             BindingChange::Create {
                 identity,
                 column,
@@ -237,6 +338,7 @@ fn apply_with_generator(
                     column: column.clone(),
                     family: *family,
                     domain,
+                    linked: false,
                     show_rule: show_rule.clone(),
                     status: *status,
                     created_unix_ms: store.now_ms(),
@@ -275,6 +377,25 @@ fn apply_with_generator(
                 record
             }
         };
+        if let Some(old) = bindings.get(&record.identity)
+            && (old.domain != record.domain
+                || record.status == BindingStatus::Retired
+                || (old.linked
+                    && old.status == BindingStatus::Active
+                    && record.status == BindingStatus::NeedsRepair))
+                && let Some(name) = &old.domain
+                    && txn
+                        .get(Table::DomainNames, &keys::domain_name(name))
+                        .map_err(|_| BindingError::Store)?
+                        .is_some()
+                    {
+                        txn.put(
+                            Table::RetiredDomains,
+                            &keys::domain_name(name),
+                            route.as_str().as_bytes(),
+                        )
+                        .map_err(|_| BindingError::Store)?;
+                    }
         txn.put(
             Table::DomainBindings,
             &keys::domain_binding(route, &record.identity),
@@ -301,6 +422,10 @@ fn allocate_domain(
                 .get(Table::DomainNames, &keys::domain_name(&name))
                 .map_err(|_| BindingError::Store)?
                 .is_some()
+            || txn
+                .get(Table::RetiredDomains, &keys::domain_name(&name))
+                .map_err(|_| BindingError::Store)?
+                .is_some()
         {
             continue;
         }
@@ -321,10 +446,15 @@ pub fn reconcile(
     doc: &PolicyDocument,
     snapshot: &Snapshot,
 ) -> Vec<BindingChange> {
-    match doc.route_default {
-        RouteDefault::Show => return vec![],
-        RouteDefault::Tokenize => {}
-    }
+    reconcile_with_names(bindings, doc, snapshot, None)
+}
+
+fn reconcile_with_names(
+    bindings: &RouteBindings,
+    doc: &PolicyDocument,
+    snapshot: &Snapshot,
+    generated: Option<&BTreeSet<DomainName>>,
+) -> Vec<BindingChange> {
     let mut columns = BTreeMap::new();
     for relation in &snapshot.relations {
         for column in &relation.columns {
@@ -345,6 +475,13 @@ pub fn reconcile(
             .any(|(_, r)| r.show_rule.as_ref() == Some(c))
     };
     for (identity, (column, ty)) in &columns {
+        let in_link = doc.links.iter().any(|link| link.fields.contains(column));
+        if doc.route_default == RouteDefault::Show
+            && !in_link
+            && !bindings.get(identity).is_some_and(|r| r.linked)
+        {
+            continue;
+        }
         let family = TypeFamily::of(ty);
         let show = matches!(doc.policy.columns.get(column), Some(Treatment::Show));
         let default = !doc.policy.columns.contains_key(column)
@@ -375,6 +512,8 @@ pub fn reconcile(
                 && record.domain.is_none()
                 && family.is_some()
                 && default
+                && !in_link
+                && !record.linked
             {
                 changes
                     .entry(identity.clone())
@@ -393,8 +532,9 @@ pub fn reconcile(
                             || match identity {
                                 ColumnId::Pg { .. } => false,
                                 ColumnId::Spanner { .. } => {
-                                    r.column.schema == column.schema
-                                        && r.column.table == column.table
+                                    (r.column.schema == column.schema
+                                        && r.column.table == column.table)
+                                        || spanner_vanished_match(&r.identity, identity, snapshot)
                                 }
                             })
                 })
@@ -420,7 +560,7 @@ pub fn reconcile(
                     identity: identity.clone(),
                     column: column.clone(),
                     family,
-                    want_domain: !ambiguous && default && family.is_some(),
+                    want_domain: !ambiguous && default && !in_link && family.is_some(),
                     show_rule: if !ambiguous && show && !anchored(column) {
                         Some(column.clone())
                     } else {
@@ -434,21 +574,248 @@ pub fn reconcile(
                 });
         }
     }
-    changes.into_values().flatten().collect()
+    for (identity, record) in bindings.iter() {
+        // A visible column with missing identity metadata is unknown, not proven vanished.
+        let name_still_present = snapshot.relations.iter().any(|relation| {
+            relation.schema == record.column.schema
+                && relation.name == record.column.table
+                && relation
+                    .columns
+                    .iter()
+                    .any(|column| column.name == record.column.column)
+        });
+        if !columns.contains_key(identity)
+            && (!name_still_present || snapshot.column_id(&record.column).is_some())
+            && record.status != BindingStatus::Retired
+            && (doc.route_default == RouteDefault::Tokenize || record.linked)
+        {
+            changes.insert(
+                identity.clone(),
+                vec![BindingChange::Update {
+                    identity: identity.clone(),
+                    column: record.column.clone(),
+                    family: record.family,
+                    show_rule: record.show_rule.clone(),
+                    status: BindingStatus::Retired,
+                }],
+            );
+        }
+    }
+    let mut changes: Vec<_> = changes.into_values().flatten().collect();
+    let mut projected = bindings.clone();
+    for change in &changes {
+        match change {
+            BindingChange::Create {
+                identity,
+                column,
+                family,
+                show_rule,
+                status,
+                ..
+            } => {
+                projected.0.insert(
+                    identity.clone(),
+                    BindingRecord {
+                        identity: identity.clone(),
+                        column: column.clone(),
+                        family: *family,
+                        domain: None,
+                        linked: false,
+                        show_rule: show_rule.clone(),
+                        status: *status,
+                        created_unix_ms: 0,
+                    },
+                );
+            }
+            BindingChange::Update {
+                identity,
+                column,
+                family,
+                show_rule,
+                status,
+            } => {
+                if let Some(record) = projected.0.get_mut(identity) {
+                    record.column = column.clone();
+                    record.family = *family;
+                    record.show_rule = show_rule.clone();
+                    record.status = *status;
+                }
+            }
+            BindingChange::AddDomain { .. } => {}
+            BindingChange::SetDomain { .. } => {}
+        }
+    }
+    let mut linked_ids = BTreeSet::new();
+    for (group, link) in doc.links.iter().enumerate() {
+        let members: BTreeSet<_> = link
+            .fields
+            .iter()
+            .filter_map(|c| snapshot.column_id(c))
+            .filter(|id| {
+                projected
+                    .get(id)
+                    .is_some_and(|r| r.status == BindingStatus::Active)
+            })
+            .cloned()
+            .collect();
+        linked_ids.extend(members.iter().cloned());
+        let shared = members
+            .iter()
+            .next()
+            .and_then(|id| projected.get(id))
+            .and_then(|r| r.domain.clone());
+        let retained = shared.filter(|name| {
+            generated.is_none_or(|names| names.contains(name))
+                && members.iter().all(|id| {
+                    projected
+                        .get(id)
+                        .is_some_and(|r| r.linked && r.domain.as_ref() == Some(name))
+                })
+                && bindings
+                    .iter()
+                    .filter(|(_, r)| {
+                        r.status == BindingStatus::Active && r.domain.as_ref() == Some(name)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect::<BTreeSet<_>>()
+                    == members
+        });
+        let target = link.domain.clone().or(retained);
+        for identity in members {
+            if projected
+                .get(&identity)
+                .is_some_and(|record| !record.linked || target.is_none() || record.domain != target)
+            {
+                changes.push(BindingChange::SetDomain {
+                    identity,
+                    target: target
+                        .clone()
+                        .map(DomainTarget::Named)
+                        .unwrap_or(DomainTarget::Generated { group }),
+                    linked: true,
+                });
+            }
+        }
+    }
+    for (identity, record) in projected.iter() {
+        if columns.contains_key(identity)
+            && record.status == BindingStatus::Active
+            && record.linked
+            && !linked_ids.contains(identity)
+        {
+            changes.push(BindingChange::SetDomain {
+                identity: identity.clone(),
+                target: DomainTarget::FreshPrivate,
+                linked: false,
+            });
+        }
+    }
+    changes
 }
 
-/// Refresh persisted bindings, avoiding a write when no reconciliation is needed.
-pub fn refresh(
+fn spanner_vanished_match(old: &ColumnId, new: &ColumnId, snapshot: &Snapshot) -> bool {
+    match (old, new) {
+        (
+            ColumnId::Spanner {
+                schema,
+                table,
+                column,
+                spanner_type,
+            },
+            ColumnId::Spanner {
+                column: new_column,
+                spanner_type: new_type,
+                ..
+            },
+        ) => {
+            column == new_column
+                && spanner_type == new_type
+                && !snapshot
+                    .relations
+                    .iter()
+                    .any(|r| r.schema == *schema && r.name == *table)
+        }
+        (ColumnId::Pg { .. }, _) | (_, ColumnId::Pg { .. }) => false,
+    }
+}
+
+/// Route membership changes requiring session invalidation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MembershipChange {
+    /// Affected route.
+    pub route: RouteId,
+    /// Generated domains retired by this refresh.
+    pub retired: Vec<DomainName>,
+    /// Domain memberships added.
+    pub joined: Vec<(DomainName, ColumnRef)>,
+    /// Domain memberships removed.
+    pub left: Vec<(DomainName, ColumnRef)>,
+    /// Link fields withheld because identity is absent or needs repair.
+    pub skipped: Vec<ColumnRef>,
+}
+impl MembershipChange {
+    /// Whether no membership or skipped-field information changed.
+    pub fn is_empty(&self) -> bool {
+        !self.requires_reset() && self.skipped.is_empty()
+    }
+    /// Whether old session tokens must be discarded.
+    pub fn requires_reset(&self) -> bool {
+        !self.retired.is_empty() || !self.joined.is_empty() || !self.left.is_empty()
+    }
+}
+/// Test whether a generated domain was retired.
+pub fn is_retired(store: &dyn Store, name: &DomainName) -> Result<bool, BindingError> {
+    Ok(store
+        .read()
+        .map_err(|_| BindingError::Store)?
+        .get(Table::RetiredDomains, &keys::domain_name(name))
+        .map_err(|_| BindingError::Store)?
+        .is_some())
+}
+/// Load the generated domains retired by a route.
+pub fn load_retired(
+    store: &dyn Store,
+    route: &RouteId,
+) -> Result<BTreeSet<DomainName>, BindingError> {
+    let mut names = BTreeSet::new();
+    for (key, value) in store
+        .read()
+        .map_err(|_| BindingError::Store)?
+        .scan_prefix(Table::RetiredDomains, b"")
+        .map_err(|_| BindingError::Store)?
+    {
+        if value == route.as_str().as_bytes() {
+            names.insert(DomainName(
+                String::from_utf8(key).map_err(|_| BindingError::Corrupt)?,
+            ));
+        }
+    }
+    Ok(names)
+}
+/// Refresh bindings and report domain membership changes atomically.
+pub fn refresh_membership(
     store: &dyn Store,
     route: &RouteId,
     doc: &PolicyDocument,
     snapshot: &Snapshot,
-) -> Result<RouteBindings, BindingError> {
-    let bindings = load(store, route)?;
-    let changes = reconcile(&bindings, doc, snapshot);
-    if changes.is_empty() {
-        return Ok(bindings);
+) -> Result<(RouteBindings, MembershipChange), BindingError> {
+    check_declared_names(store, doc)?;
+    let before = load(store, route)?;
+    let read = store.read().map_err(|_| BindingError::Store)?;
+    let mut generated = BTreeSet::new();
+    for (key, _) in read
+        .scan_prefix(Table::DomainNames, b"")
+        .map_err(|_| BindingError::Store)?
+    {
+        generated.insert(DomainName(
+            String::from_utf8(key).map_err(|_| BindingError::Corrupt)?,
+        ));
     }
+    drop(read);
+    let retired_before = load_retired(store, route)?;
+    // A retired name is never kept as a link's shared domain.
+    generated.retain(|name| !retired_before.contains(name));
+    let changes = reconcile_with_names(&before, doc, snapshot, Some(&generated));
     let mut reserved: BTreeSet<_> = doc.policy.domains.keys().cloned().collect();
     for treatment in doc.policy.columns.values() {
         match treatment {
@@ -458,7 +825,65 @@ pub fn refresh(
             Treatment::Show | Treatment::Masked { .. } => {}
         }
     }
-    apply(store, route, &changes, &reserved)
+    reserved.extend(doc.links.iter().filter_map(|l| l.domain.clone()));
+    let after = if changes.is_empty() {
+        before.clone()
+    } else {
+        apply(store, route, &changes, &reserved)?
+    };
+    let mut change = MembershipChange {
+        route: route.clone(),
+        retired: load_retired(store, route)?
+            .difference(&retired_before)
+            .cloned()
+            .collect(),
+        joined: vec![],
+        left: vec![],
+        skipped: vec![],
+    };
+    for (identity, record) in before
+        .iter()
+        .filter(|(_, r)| r.status == BindingStatus::Active)
+    {
+        if let Some(domain) = &record.domain
+            && !after.get(identity).is_some_and(|r| {
+                r.status == BindingStatus::Active && r.domain.as_ref() == Some(domain)
+            }) {
+                change.left.push((domain.clone(), record.column.clone()));
+            }
+    }
+    for (identity, record) in after
+        .iter()
+        .filter(|(_, r)| r.status == BindingStatus::Active)
+    {
+        if let Some(domain) = &record.domain
+            && !before.get(identity).is_some_and(|r| {
+                r.status == BindingStatus::Active && r.domain.as_ref() == Some(domain)
+            }) {
+                change.joined.push((domain.clone(), record.column.clone()));
+            }
+    }
+    for column in doc.links.iter().flat_map(|l| &l.fields) {
+        if !snapshot
+            .column_id(column)
+            .and_then(|id| after.get(id))
+            .is_some_and(|r| r.status == BindingStatus::Active)
+        {
+            change.skipped.push(column.clone());
+        }
+    }
+    change.skipped.sort();
+    change.skipped.dedup();
+    Ok((after, change))
+}
+/// Refresh persisted bindings without returning membership information.
+pub fn refresh(
+    store: &dyn Store,
+    route: &RouteId,
+    doc: &PolicyDocument,
+    snapshot: &Snapshot,
+) -> Result<RouteBindings, BindingError> {
+    refresh_membership(store, route, doc, snapshot).map(|(bindings, _)| bindings)
 }
 
 #[cfg(test)]
@@ -529,6 +954,7 @@ mod tests {
             version: super::super::PolicyVersion::V2,
             route_default: RouteDefault::Tokenize,
             json_paths: vec![],
+            links: vec![],
         }
     }
     fn snap(entries: Vec<(ColumnRef, Option<ColumnId>, ColumnType)>) -> Snapshot {
@@ -587,6 +1013,308 @@ mod tests {
         super::super::effective::Origin,
     ) {
         super::super::effective::effective(doc, snapshot, bindings, c).unwrap()
+    }
+    fn linked_snapshot(n: i16) -> Snapshot {
+        snap(
+            (1..=n)
+                .map(|i| {
+                    (
+                        ColumnRef {
+                            column: format!("c{i}"),
+                            ..column()
+                        },
+                        Some(id(i)),
+                        ColumnType::Text,
+                    )
+                })
+                .collect(),
+        )
+    }
+    fn link_fields(n: i16, domain: Option<DomainName>) -> super::super::LinkRule {
+        super::super::LinkRule {
+            fields: (1..=n)
+                .map(|i| ColumnRef {
+                    column: format!("c{i}"),
+                    ..column()
+                })
+                .collect(),
+            domain,
+        }
+    }
+    fn domain(bindings: &RouteBindings, n: i16) -> DomainName {
+        bindings.get(&id(n)).unwrap().domain.clone().unwrap()
+    }
+    #[test]
+    fn generated_links_rotate_on_membership_changes_and_unlink() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let mut doc = document();
+        let snapshot = linked_snapshot(3);
+        let private = refresh(&store, &route(), &doc, &snapshot).unwrap();
+        let mut seen: BTreeSet<_> = (1..=3).map(|n| domain(&private, n)).collect();
+        doc.links.push(link_fields(2, None));
+        let (linked, change) = refresh_membership(&store, &route(), &doc, &snapshot).unwrap();
+        assert_eq!(domain(&linked, 1), domain(&linked, 2));
+        assert!(seen.insert(domain(&linked, 1)));
+        assert_eq!(
+            change.retired.iter().cloned().collect::<BTreeSet<_>>(),
+            (1..=2).map(|n| domain(&private, n)).collect()
+        );
+        assert_eq!(change.joined.len(), 2);
+        assert_eq!(change.left.len(), 2);
+        assert!(change.requires_reset());
+        store.fail_commits(true);
+        let (same, change) = refresh_membership(&store, &route(), &doc, &snapshot).unwrap();
+        assert_eq!(same, linked);
+        assert!(change.is_empty());
+        store.fail_commits(false);
+        doc.links[0] = link_fields(3, None);
+        let (larger, change) = refresh_membership(&store, &route(), &doc, &snapshot).unwrap();
+        assert!(seen.insert(domain(&larger, 1)));
+        assert_eq!(domain(&larger, 1), domain(&larger, 3));
+        assert!(change.retired.contains(&domain(&linked, 1)));
+        doc.links[0] = link_fields(2, None);
+        let (smaller, _) = refresh_membership(&store, &route(), &doc, &snapshot).unwrap();
+        assert!(seen.insert(domain(&smaller, 1)));
+        assert!(seen.insert(domain(&smaller, 3)));
+        assert!(is_retired(&store, &domain(&larger, 1)).unwrap());
+        doc.links.clear();
+        let (unlinked, change) = refresh_membership(&store, &route(), &doc, &snapshot).unwrap();
+        assert!(change.retired.contains(&domain(&smaller, 1)));
+        for n in 1..=2 {
+            assert!(seen.insert(domain(&unlinked, n)));
+            assert!(!unlinked.get(&id(n)).unwrap().linked);
+        }
+        assert!(
+            load_retired(&store, &route())
+                .unwrap()
+                .contains(&domain(&linked, 1))
+        );
+        // A vanished member also rotates the remaining generated group.
+        doc.links.push(link_fields(2, None));
+        let linked = refresh(&store, &route(), &doc, &snapshot).unwrap();
+        let (remaining, change) =
+            refresh_membership(&store, &route(), &doc, &linked_snapshot(1)).unwrap();
+        assert_ne!(domain(&remaining, 1), domain(&linked, 1));
+        assert!(change.retired.contains(&domain(&linked, 1)));
+        assert_eq!(change.skipped, vec![link_fields(2, None).fields[1].clone()]);
+    }
+    #[test]
+    fn declared_links_are_not_allocations_and_can_become_generated() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let mut doc = document();
+        let snapshot = linked_snapshot(2);
+        let before = refresh(&store, &route(), &doc, &snapshot).unwrap();
+        let declared = name("shared");
+        doc.links.push(link_fields(2, Some(declared.clone())));
+        let (after, change) = refresh_membership(&store, &route(), &doc, &snapshot).unwrap();
+        assert_eq!(domain(&after, 1), declared);
+        assert_eq!(domain(&after, 2), declared);
+        assert_eq!(change.retired.len(), 2);
+        assert!(change.retired.contains(&domain(&before, 1)));
+        assert!(!is_retired(&store, &declared).unwrap());
+        assert!(
+            store
+                .read()
+                .unwrap()
+                .get(Table::DomainNames, &keys::domain_name(&declared))
+                .unwrap()
+                .is_none()
+        );
+        store.fail_commits(true);
+        assert!(
+            refresh_membership(&store, &route(), &doc, &snapshot)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        store.fail_commits(false);
+        doc.links[0].domain = None;
+        let generated = refresh(&store, &route(), &doc, &snapshot).unwrap();
+        assert_ne!(domain(&generated, 1), declared);
+        assert_eq!(domain(&generated, 1), domain(&generated, 2));
+        assert!(!is_retired(&store, &declared).unwrap());
+    }
+    #[test]
+    fn link_collision_and_failed_commit_leave_all_tables_unchanged() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let mut doc = document();
+        let snapshot = linked_snapshot(2);
+        let before = refresh(&store, &route(), &doc, &snapshot).unwrap();
+        let capture = || {
+            Table::ALL
+                .iter()
+                .map(|t| store.read().unwrap().scan_prefix(*t, b"").unwrap())
+                .collect::<Vec<_>>()
+        };
+        let old_tables = capture();
+        doc.links.push(link_fields(2, Some(domain(&before, 1))));
+        assert_eq!(
+            refresh_membership(&store, &route(), &doc, &snapshot).unwrap_err(),
+            BindingError::DeclaredNameCollision
+        );
+        assert_eq!(capture(), old_tables);
+        doc.links[0].domain = None;
+        store.fail_commits(true);
+        assert_eq!(
+            refresh_membership(&store, &route(), &doc, &snapshot).unwrap_err(),
+            BindingError::Store
+        );
+        assert_eq!(capture(), old_tables);
+        assert_eq!(load(&store, &route()).unwrap(), before);
+        store.fail_commits(false);
+        let (after, _) = refresh_membership(&store, &route(), &doc, &snapshot).unwrap();
+        let mut generate = || Ok(domain(&before, 1));
+        assert_eq!(
+            apply_with_generator(
+                &store,
+                &route(),
+                &[create(4)],
+                &BTreeSet::new(),
+                &mut generate
+            )
+            .unwrap_err(),
+            BindingError::NameSpaceExhausted
+        );
+        assert_eq!(load(&store, &route()).unwrap(), after);
+    }
+    #[test]
+    fn show_links_only_create_linked_records_and_skip_unusable_fields() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let mut doc = document();
+        doc.route_default = RouteDefault::Show;
+        doc.links.push(link_fields(2, None));
+        let snapshot = linked_snapshot(3);
+        let (bindings, _) = refresh_membership(&store, &route(), &doc, &snapshot).unwrap();
+        assert_eq!(bindings.iter().count(), 2);
+        assert_eq!(domain(&bindings, 1), domain(&bindings, 2));
+        assert!(bindings.get(&id(3)).is_none());
+        let mut changed = snapshot.clone();
+        changed.relations[0].columns[0].ty = ColumnType::Int4;
+        let (bindings, change) = refresh_membership(&store, &route(), &doc, &changed).unwrap();
+        assert_eq!(
+            bindings.get(&id(1)).unwrap().status,
+            BindingStatus::NeedsRepair
+        );
+        assert_eq!(change.skipped, vec![link_fields(2, None).fields[0].clone()]);
+        assert_ne!(domain(&bindings, 1), domain(&bindings, 2));
+        doc.links.clear();
+        let bindings = refresh(&store, &route(), &doc, &changed).unwrap();
+        assert!(!bindings.get(&id(2)).unwrap().linked);
+        assert!(bindings.get(&id(3)).is_none());
+    }
+    #[test]
+    fn spanner_table_rename_with_matching_column_is_withheld() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let mut doc = document();
+        let old_id = spanner_id("email", "STRING");
+        let before = refresh(
+            &store,
+            &route(),
+            &doc,
+            &snap(vec![(column(), Some(old_id.clone()), ColumnType::Text)]),
+        )
+        .unwrap();
+        let old_domain = before.get(&old_id).unwrap().domain.clone().unwrap();
+        let renamed = ColumnRef {
+            table: "new_table".into(),
+            ..column()
+        };
+        let new_id = ColumnId::Spanner {
+            schema: renamed.schema.clone(),
+            table: renamed.table.clone(),
+            column: renamed.column.clone(),
+            spanner_type: "STRING".into(),
+        };
+        let unrelated = ColumnRef {
+            column: "b".into(),
+            ..renamed.clone()
+        };
+        let unrelated_id = ColumnId::Spanner {
+            schema: unrelated.schema.clone(),
+            table: unrelated.table.clone(),
+            column: unrelated.column.clone(),
+            spanner_type: "INT64".into(),
+        };
+        doc.policy.columns.insert(renamed.clone(), Treatment::Show);
+        let snapshot = snap(vec![
+            (renamed, Some(new_id.clone()), ColumnType::Text),
+            (unrelated, Some(unrelated_id.clone()), ColumnType::Int8),
+        ]);
+        let (bindings, change) = refresh_membership(&store, &route(), &doc, &snapshot).unwrap();
+        let new = bindings.get(&new_id).unwrap();
+        assert_eq!(new.status, BindingStatus::NeedsRepair);
+        assert!(new.domain.is_none());
+        assert!(new.show_rule.is_none());
+        assert_eq!(
+            bindings.get(&old_id).unwrap().status,
+            BindingStatus::Retired
+        );
+        assert_eq!(change.retired, vec![old_domain]);
+        assert_eq!(
+            bindings.get(&unrelated_id).unwrap().status,
+            BindingStatus::Active
+        );
+        assert!(bindings.get(&unrelated_id).unwrap().domain.is_some());
+    }
+    #[test]
+    fn legacy_binding_json_and_retirement_table_upgrade() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let bindings = apply(&store, &route(), &[create(1)], &BTreeSet::new()).unwrap();
+        let mut value = serde_json::to_value(bindings.get(&id(1)).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("linked");
+        let old_bytes = serde_json::to_vec(&value).unwrap();
+        let decoded: BindingRecord = model::decode(&old_bytes).unwrap();
+        assert!(!decoded.linked);
+        let mut txn = store.write().unwrap();
+        txn.put(
+            Table::DomainBindings,
+            &keys::domain_binding(&route(), &id(1)),
+            &old_bytes,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        drop(store);
+        let db = redb::Database::create(dir.0.join(STORE_FILE)).unwrap();
+        let txn = db.begin_write().unwrap();
+        assert!(
+            txn.delete_table(Table::RetiredDomains.definition())
+                .unwrap()
+        );
+        txn.commit().unwrap();
+        drop(db);
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        assert_eq!(store.meta().format_version, 1);
+        assert_eq!(
+            store
+                .read()
+                .unwrap()
+                .get(
+                    Table::DomainBindings,
+                    &keys::domain_binding(&route(), &id(1))
+                )
+                .unwrap(),
+            Some(old_bytes)
+        );
+        assert!(load_retired(&store, &route()).unwrap().is_empty());
+        assert_eq!(
+            load(&store, &route()).unwrap().get(&id(1)).unwrap(),
+            &decoded
+        );
+        let change = BindingChange::Update {
+            identity: id(1),
+            column: column(),
+            family: decoded.family,
+            show_rule: None,
+            status: BindingStatus::Retired,
+        };
+        apply(&store, &route(), &[change], &BTreeSet::new()).unwrap();
+        assert!(is_retired(&store, decoded.domain.as_ref().unwrap()).unwrap());
     }
     #[test]
     fn first_snapshot_refresh_is_idempotent_and_durable() {
@@ -1127,5 +1855,62 @@ mod tests {
         ] {
             assert_eq!(TypeFamily::of(&ty), None);
         }
+    }
+    #[test]
+    fn declared_names_refuse_generated_collisions_from_all_sources() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let bindings = apply(&store, &route(), &[create(1)], &BTreeSet::new()).unwrap();
+        let generated = bindings.get(&id(1)).unwrap().domain.clone().unwrap();
+        for source in 0..3 {
+            let mut doc = document();
+            match source {
+                0 => {
+                    doc.policy.domains.insert(
+                        generated.clone(),
+                        super::super::DomainSettings {
+                            tokenize: super::super::TokenizeSetting::Off,
+                            range: None,
+                        },
+                    );
+                }
+                1 => {
+                    doc.policy.columns.insert(
+                        column(),
+                        Treatment::Blind {
+                            domain: generated.clone(),
+                        },
+                    );
+                }
+                2 => {
+                    doc.links.push(super::super::LinkRule {
+                        fields: vec![],
+                        domain: Some(generated.clone()),
+                    });
+                }
+                _ => panic!("invalid test case"),
+            }
+            let error = check_declared_names(&store, &doc).unwrap_err();
+            assert_eq!(error, BindingError::DeclaredNameCollision);
+            assert!(!error.to_string().contains(&generated.0));
+        }
+        assert_eq!(load(&store, &route()).unwrap(), bindings);
+    }
+    #[test]
+    fn declared_names_allow_noncolliding_names_and_empty_store() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let mut doc = document();
+        doc.policy.domains.insert(
+            name("declared"),
+            super::super::DomainSettings {
+                tokenize: super::super::TokenizeSetting::Off,
+                range: None,
+            },
+        );
+        assert_eq!(check_declared_names(&store, &doc), Ok(()));
+        apply(&store, &route(), &[create(1)], &BTreeSet::new()).unwrap();
+        assert_eq!(check_declared_names(&store, &doc), Ok(()));
+        assert_eq!(check_declared_names(&store, &document()), Ok(()));
     }
 }
