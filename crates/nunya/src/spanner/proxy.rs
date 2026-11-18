@@ -954,7 +954,7 @@ impl NunyaSpanner {
         let keys = &who.keys;
         let range = policy.domains.get(domain).and_then(|d| d.range.as_ref());
         let result = if decode {
-            self.ctx.codec.decode(keys, domain, ty, range, &value)
+            self.ctx.codec.decode_checked(keys, domain, ty, range, &value, &policy.retired_domains)
         } else {
             self.ctx.codec.encode(keys, domain, ty, range, &value)
         }
@@ -2598,6 +2598,7 @@ mod tests {
                 column: "email".into(),
             };
             let policy = Policy {
+                retired_domains: Default::default(),
                 json_filters: Default::default(),
                 columns: BTreeMap::from([(col, Treatment::Blind { domain: domain() })]),
                 domains: BTreeMap::from([(
@@ -2704,6 +2705,23 @@ mod tests {
                 .unwrap()
         }
     }
+    #[tokio::test]
+    async fn retired_param_refused_before_upstream() {
+        let f = Fixture::new().await;
+        let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
+        let retired = DomainName("auto_retired_test".into());
+        let token = f.svc.ctx.codec.encode(&who.keys, &retired, &ColumnType::Text, None,
+            &crate::value::SqlValue::Text("private@example.com".into())).unwrap();
+        let mut policy = (**f.svc.ctx.policy.read().unwrap()).clone();
+        policy.retired_domains.insert(retired);
+        *f.svc.ctx.policy.write().unwrap() = Arc::new(policy);
+        let mut req = f.query("SELECT email FROM customers WHERE email = @v").await;
+        req.params = Some(prost_types::Struct { fields: [("v".into(), values::to_proto(&ColumnType::Text, &token).unwrap())].into() });
+        let err = f.svc.execute_sql(f.request(req, "alice")).await.unwrap_err();
+        assert!(err.message().contains("NY001"));
+        assert!(f.fake.seen.lock().unwrap().is_empty());
+    }
+
     struct CaptureLog(Arc<Mutex<Vec<ReadLogRecord>>>, Arc<Mutex<Vec<LifecycleRecord>>>);
     impl ReadLog for CaptureLog {
         fn write_lifecycle(&self, record: &LifecycleRecord) -> Result<(), Refusal> {
@@ -2841,6 +2859,20 @@ mod tests {
             assert_eq!(record.credential_id, authority.session_secret_credential(row.id, secret.as_bytes()));
             assert_eq!(record.connection, Some(f.svc.watchers.lock().unwrap()[&row.id].connection));
         }
+    }
+    #[tokio::test]
+    async fn retired_token_parameter_in_show_column_is_refused() {
+        let f = Fixture::new().await;
+        let mut policy = (**f.svc.ctx.policy.read().unwrap()).clone();
+        policy.columns.clear();
+        policy.retired_domains.insert(crate::policy::DomainName("retired".into()));
+        let snapshot = f.svc.ctx.snapshot.read().unwrap().clone();
+        let policy = crate::policy::effective::legacy_policy(policy, &snapshot);
+        *f.svc.ctx.policy.write().unwrap() = Arc::new(policy);
+        let mut req = f.query("UPDATE customers SET email = @v").await;
+        req.params = Some(prost_types::Struct { fields: [("v".into(), text("tok_retired_a"))].into() });
+        assert!(f.svc.execute_sql(f.request(req, "alice")).await.unwrap_err().message().contains("NY001"));
+        assert!(f.fake.seen.lock().unwrap().is_empty());
     }
     #[tokio::test]
     async fn plain_token_parameter_and_structured_values_are_refused() {
@@ -3080,6 +3112,7 @@ mod tests {
         let column = ColumnRef { schema: "".into(), table: "events".into(), column: "payload".into() };
         let filter = JsonColumnFilter { mode: JsonMode::Show, rules: vec![JsonPathRule { column: column.clone(), path: vec![PathSegment::Key("protected".into())], treatment: JsonPathTreatment::Masked }] };
         let policy = Policy {
+            retired_domains: Default::default(),
             json_filters: BTreeMap::from([(column.clone(), filter.clone())]),
             columns: BTreeMap::from([(column, Treatment::Masked { placeholder: None })]),
             domains: BTreeMap::new(), snapshot_max_age_ms: 1000, readlog: ReadLogSink::Stdout,

@@ -602,6 +602,7 @@ mod tests {
             },
         );
         let policy = Policy {
+            retired_domains: Default::default(),
             json_filters: Default::default(),
             columns,
             domains: ["email", "phone"]

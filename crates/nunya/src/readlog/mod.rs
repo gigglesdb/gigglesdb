@@ -72,6 +72,13 @@ pub enum LifecycleKind {
     ConnectionEnded,
     /// A forwarded write has an unknown outcome.
     WriteOutcomeUnknown,
+    /// A route's shared domains changed and its sessions were ended.
+    MembershipReset {
+        /// Retired generated domain names, without column data.
+        retired_domains: Vec<String>,
+        /// Active sessions ended by the reset.
+        sessions: usize,
+    },
 }
 /// Non-secret actor responsible for a lifecycle event.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -109,11 +116,20 @@ pub struct LifecycleRecord {
     pub reason: &'static str,
 }
 fn lifecycle_line(rec: &LifecycleRecord) -> Result<Vec<u8>, Refusal> {
-    let mut bytes = serde_json::to_vec(&serde_json::json!({
-        "kind": "lifecycle", "event": rec.kind, "ts": rec.at_ms,
+    let event = match &rec.kind {
+        LifecycleKind::MembershipReset { .. } => serde_json::json!("membership_reset"),
+        kind => serde_json::to_value(kind).map_err(|_| failure())?,
+    };
+    let mut record = serde_json::json!({
+        "kind": "lifecycle", "event": event, "ts": rec.at_ms,
         "principal": rec.principal, "session": rec.session, "route": rec.route,
         "connection": rec.connection, "actor": rec.actor, "reason": rec.reason,
-    })).map_err(|_| failure())?;
+    });
+    if let LifecycleKind::MembershipReset { retired_domains, sessions } = &rec.kind {
+        record["retired_domains"] = serde_json::json!(retired_domains);
+        record["sessions"] = serde_json::json!(sessions);
+    }
+    let mut bytes = serde_json::to_vec(&record).map_err(|_| failure())?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -447,6 +463,18 @@ fn redact_inner(sql: &str, depth: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn membership_reset_audit_contains_only_route_domains_and_count() {
+        let mut record = lifecycle(LifecycleActor::System);
+        record.kind = LifecycleKind::MembershipReset { retired_domains: vec!["retired".into()], sessions: 4 };
+        record.route = Some("postgres".into()); record.reason = "policy_reset";
+        let value: serde_json::Value = serde_json::from_slice(&lifecycle_line(&record).unwrap()).unwrap();
+        assert_eq!(value["event"], "membership_reset");
+        assert_eq!(value["retired_domains"], serde_json::json!(["retired"]));
+        assert_eq!(value["sessions"], 4);
+        assert_eq!(value["route"], "postgres");
+    }
+
     fn lifecycle(actor: LifecycleActor) -> LifecycleRecord {
         LifecycleRecord {
             kind: LifecycleKind::SessionEnded, at_ms: 42,

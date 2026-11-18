@@ -280,6 +280,9 @@ pub fn validate_links(doc: &PolicyDocument, snapshot: &Snapshot) -> Result<(), V
                 if TypeFamily::of(&captured.ty).is_none() {
                     error(&mut errors, &context, "type has no supported codec");
                 }
+                if !captured.ty.is_textual() {
+                    error(&mut errors, &context, "only text fields can be linked");
+                }
                 families.insert(family(&captured.ty));
             } else {
                 error(&mut errors, &context, "column does not exist in snapshot");
@@ -332,6 +335,7 @@ mod tests {
     };
     fn fixture(types: &[ColumnType]) -> (Policy, Snapshot) {
         let mut policy = Policy {
+            retired_domains: Default::default(),
             json_filters: Default::default(),
             columns: BTreeMap::new(),
             domains: BTreeMap::new(),
@@ -569,6 +573,7 @@ mod tests {
     #[test]
     fn show_is_validated_like_an_absent_column() {
         let policy = Policy {
+            retired_domains: Default::default(),
             json_filters: Default::default(),
             columns: [(
                 ColumnRef {
@@ -640,6 +645,14 @@ mod tests {
         for ty in [ColumnType::Bool, ColumnType::Jsonb, ColumnType::Int2] {
             let (doc, snapshot) = linked(&[ty.clone(), ty], false);
             assert!(link_has(&doc, &snapshot, "no supported codec"));
+        }
+    }
+    #[test]
+    fn links_refuse_every_fpe_family() {
+        for ty in [ColumnType::Int4, ColumnType::Int8, ColumnType::Uuid, ColumnType::Date,
+            ColumnType::Timestamp, ColumnType::Timestamptz] {
+            let (doc, snapshot) = linked(&[ty.clone(), ty], false);
+            assert!(link_has(&doc, &snapshot, "only text fields can be linked"));
         }
     }
     #[test]

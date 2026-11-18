@@ -1,6 +1,6 @@
 //! Shared policy reload coordination for every serving route.
 use crate::{
-    policy::{Policy, PolicyDocument, PolicyVersion, RouteDefault, bindings::{self, RouteBindings}},
+    policy::{Policy, PolicyDocument, PolicyVersion, RouteDefault, bindings::{self, RouteBindings, MembershipChange}},
     schema::Snapshot,
     serve::{ReloadableLog, now, parse_policy_bytes, readlog_key},
     state::model::RouteId,
@@ -45,6 +45,7 @@ struct PublishedRoute {
     route: Route,
     policy: Arc<Policy>,
     refresh_failed: bool,
+    membership_failed: bool,
 }
 impl std::ops::Deref for PublishedRoute {
     type Target = Route;
@@ -83,8 +84,27 @@ pub(crate) struct Hub {
     /// Service lifecycle and management audit log.
     pub(crate) log: ReloadableLog,
     store: RwLock<Option<Arc<dyn crate::state::store::Store>>>,
+    authority: RwLock<std::sync::Weak<crate::state::authority::Authority>>,
+    pending_membership: Mutex<std::collections::BTreeMap<String, MembershipChange>>,
+    #[cfg(test)]
+    reset_callback: RwLock<Option<ResetCallback>>,
     watch_ms: Option<u64>,
     service: crate::policy::ServicePolicySettings,
+}
+#[cfg(test)]
+type ResetCallback = Arc<dyn Fn(&MembershipChange, &Policy) -> Result<usize, String> + Send + Sync>;
+#[derive(Debug)]
+struct CompileError { message: String, membership: bool }
+impl CompileError {
+    fn binding(error: impl std::fmt::Display) -> Self {
+        Self { message: error.to_string(), membership: true }
+    }
+}
+impl From<String> for CompileError {
+    fn from(message: String) -> Self { Self { message, membership: false } }
+}
+impl From<&str> for CompileError {
+    fn from(message: &str) -> Self { message.to_owned().into() }
 }
 fn hash(bytes: &[u8]) -> String {
     data_encoding::HEXLOWER.encode(&Sha256::digest(bytes))
@@ -112,7 +132,7 @@ impl Hub {
                     let (policy, snapshot) = route.locks();
                     match (policy.read(), snapshot.read()) {
                         (Ok(policy), Ok(snapshot)) => {
-                            policy_ok &= Arc::ptr_eq(&policy, &route.policy) && !route.refresh_failed;
+                            policy_ok &= Arc::ptr_eq(&policy, &route.policy) && !route.refresh_failed && !route.membership_failed;
                             if at.saturating_sub(snapshot.taken_at_unix_ms)
                                 > policy.snapshot_max_age_ms
                             {
@@ -208,6 +228,10 @@ impl Hub {
             ),
             state: Mutex::new(State { units, configured }),
             store: RwLock::new(None),
+            authority: RwLock::new(std::sync::Weak::new()),
+            pending_membership: Mutex::new(Default::default()),
+            #[cfg(test)]
+            reset_callback: RwLock::new(Some(Arc::new(|_, _| Ok(0)))) ,
             watch_ms,
             service,
         }))
@@ -222,29 +246,95 @@ impl Hub {
         Ok(())
     }
 
-    fn compile(&self, doc: &PolicyDocument, route: &RouteId, snapshot: &Snapshot) -> Result<Arc<Policy>, String> {
-        let store = self.store.read().map_err(|_| "policy bindings unavailable")?;
+    /// Attach the service authority before publishing shared-domain changes.
+    pub(crate) fn set_authority(&self, authority: std::sync::Weak<crate::state::authority::Authority>) -> Result<(), String> {
+        *self.authority.write().map_err(|_| "session authority unavailable")? = authority;
+        Ok(())
+    }
+
+    fn compile(&self, doc: &PolicyDocument, route: &RouteId, snapshot: &Snapshot) -> Result<(Arc<Policy>, Option<MembershipChange>), CompileError> {
+        let store = self.store.read().map_err(|_| CompileError::binding("policy bindings unavailable"))?;
         let needs_bindings = (doc.version == PolicyVersion::V2 && doc.route_default == RouteDefault::Tokenize)
             || !doc.links.is_empty();
         if needs_bindings && store.is_none() {
-            return Err("policy bindings unavailable".into());
+            return Err(CompileError::binding("policy bindings unavailable"));
         }
         let mut bindings = match store.as_ref() {
-            Some(store) => bindings::load(store.as_ref(), route).map_err(|e| e.to_string())?,
+            Some(store) => bindings::load(store.as_ref(), route).map_err(CompileError::binding)?,
             None => RouteBindings::default(),
         };
         let warnings = crate::policy::validate::validate_document(doc, snapshot, &bindings)
             .map_err(crate::serve::errors)?;
-        if needs_bindings {
-            bindings = bindings::refresh(store.as_ref().ok_or("policy bindings unavailable")?.as_ref(), route, doc, snapshot)
-                .map_err(|e| e.to_string())?;
+        // A final removed link still has persisted linked records to reconcile.
+        if needs_bindings || bindings.iter().any(|(_, record)| record.linked) {
+            let (next, change) = bindings::refresh_membership(
+                store.as_ref().ok_or_else(|| CompileError::binding("policy bindings unavailable"))?.as_ref(), route, doc, snapshot)
+                .map_err(CompileError::binding)?;
+            bindings = next;
+            if change.requires_reset() {
+                let mut pending = self.pending_membership.lock().map_err(|_| CompileError::binding("policy bindings unavailable"))?;
+                pending.entry(route.as_str().into()).and_modify(|old| {
+                    for domain in &change.retired { if !old.retired.contains(domain) { old.retired.push(domain.clone()); } }
+                    old.joined.extend(change.joined.clone());
+                    old.left.extend(change.left.clone());
+                }).or_insert(change);
+            }
         }
-        let policy = crate::policy::effective::served_policy(doc, snapshot, &bindings);
+        let mut policy = crate::policy::effective::served_policy(doc, snapshot, &bindings);
+        if let Some(store) = store.as_ref() {
+            policy.retired_domains = bindings::load_retired(store.as_ref(), route).map_err(CompileError::binding)?;
+        }
         crate::policy::validate::validate_dependents(&policy, snapshot).map_err(crate::serve::errors)?;
         for warning in warnings {
             eprintln!("serve: policy warning: {}", warning.message.replace(['\r', '\n'], " "));
         }
-        Ok(Arc::new(policy))
+        if let Some(store) = store.as_ref()
+            && let Some(owed) = bindings::load_reset(store.as_ref(), route).map_err(CompileError::binding)? {
+            self.pending_membership.lock().map_err(|_| CompileError::binding("policy bindings unavailable"))?
+                .insert(route.as_str().into(), owed);
+        }
+        let change = self.pending_membership.lock().map_err(|_| CompileError::binding("policy bindings unavailable"))?
+            .get(route.as_str()).cloned();
+        Ok((Arc::new(policy), change))
+    }
+
+    fn reset_membership(&self, change: Option<&MembershipChange>, old: &Policy) -> Result<(), String> {
+        let Some(change) = change.filter(|change| change.requires_reset()) else { return Ok(()); };
+        let authority = self.authority.read().map_err(|_| "session authority unavailable")?.upgrade();
+        let count = if let Some(authority) = authority {
+            authority.end_route_sessions(&change.route, crate::state::model::EndReason::PolicyReset)
+                .map_err(|_| "route session reset unavailable")?
+        } else {
+            #[cfg(test)]
+            { self.reset_callback.read().map_err(|_| "session authority unavailable")?.as_ref()
+                .ok_or("session authority unavailable")?(change, old)? }
+            #[cfg(not(test))]
+            { let _ = old; return Err("session authority unavailable".into()); }
+        };
+        use crate::readlog::ReadLog;
+        self.log.write_lifecycle(&crate::readlog::LifecycleRecord {
+            kind: crate::readlog::LifecycleKind::MembershipReset {
+                retired_domains: change.retired.iter().map(|d| d.0.clone()).collect(), sessions: count,
+            },
+            at_ms: now(), principal: String::new(), session: None,
+            route: Some(change.route.as_str().into()), connection: None,
+            actor: crate::readlog::LifecycleActor::System, reason: "policy_reset",
+        }).map_err(|_| "read log unavailable".to_string())
+    }
+
+    fn membership_pending(&self, route: &str) -> bool {
+        self.pending_membership.lock().map_or(true, |pending| pending.contains_key(route))
+            || self.store.read().map_or(true, |store| store.as_ref().is_some_and(|store| {
+                RouteId::new(route).is_none_or(|route| bindings::load_reset(store.as_ref(), &route).map_or(true, |owed| owed.is_some()))
+            }))
+    }
+
+    fn membership_published(&self, route: &str) {
+        // A failed cleanup retains the durable marker, making restart repeat the safe reset.
+        if let Ok(store) = self.store.read() && let Some(store) = store.as_ref() {
+            let _ = bindings::clear_reset(store.as_ref(), route);
+        }
+        self.pending_membership.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(route);
     }
 
     /// Set the service config revision on every unit and the lifecycle log.
@@ -315,22 +405,36 @@ impl Hub {
         let (policy, snapshot) = route.locks();
         let mut current = policy.write().map_err(|_| "policy lock unavailable")?;
         let snapshot = snapshot.read().map_err(|_| "snapshot lock unavailable")?;
-        let compiled = self.compile(&s.doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, &snapshot)?;
-        {
-            let revision = match &route {
-                Route::Postgres(ctx) => Some(&ctx.policy_revision),
-                Route::Spanner(ctx) => Some(&ctx.policy_revision),
-                #[cfg(test)]
-                Route::Test(..) => None,
-            };
-            if let Some(revision) = revision {
-                *revision.write().map_err(|_| "revision lock unavailable")? = Some(s.hash.clone());
+        let revision = match &route {
+            Route::Postgres(ctx) => Some(&ctx.policy_revision),
+            Route::Spanner(ctx) => Some(&ctx.policy_revision),
+            #[cfg(test)]
+            Route::Test(..) => None,
+        };
+        let mut revision = revision.map(|revision| revision.write().map_err(|_| "revision lock unavailable")).transpose()?;
+        let (compiled, change) = self.compile(&s.doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, &snapshot)
+            .map_err(|error| {
+                if error.membership || self.membership_pending(route.id()) {
+                    for registered in &mut s.routes {
+                        if registered.id() == route.id() { registered.membership_failed = true; }
+                    }
+                }
+                error.message
+            })?;
+        self.reset_membership(change.as_ref(), &current).inspect_err(|_| {
+            for registered in &mut s.routes {
+                if registered.id() == route.id() && self.membership_pending(route.id()) { registered.membership_failed = true; }
             }
+        })?;
+        {
+            if let Some(revision) = revision.as_mut() { **revision = Some(s.hash.clone()); }
             *current = compiled.clone();
         }
         drop(snapshot);
         drop(current);
-        s.routes.push(PublishedRoute { route, policy: compiled, refresh_failed: false });
+        drop(revision);
+        self.membership_published(route.id());
+        s.routes.push(PublishedRoute { route, policy: compiled, refresh_failed: false, membership_failed: false });
         Ok(())
     }
     /// Validate a fresh catalog against this route's policy unit.
@@ -347,11 +451,16 @@ impl Hub {
     }
 
     fn publish_refresh(&self, unit: &mut Unit, route: &Route, snapshot: Snapshot, apply: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        if unit.routes.iter().any(|registered| registered.id() == route.id() && registered.membership_failed) {
+            return Err("policy membership requires successful reload".into());
+        }
         let result = (|| {
             let (policy, catalog) = route.locks();
             let mut policy = policy.write().map_err(|_| "policy lock unavailable")?;
             let mut catalog = catalog.write().map_err(|_| "snapshot lock unavailable")?;
-            let compiled = self.compile(&unit.doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, &snapshot)?;
+            let (compiled, change) = self.compile(&unit.doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, &snapshot)
+                .map_err(|error| error.message)?;
+            self.reset_membership(change.as_ref(), &policy)?;
             apply()?;
             *catalog = Arc::new(snapshot);
             *policy = compiled.clone();
@@ -360,8 +469,11 @@ impl Hub {
         for registered in &mut unit.routes {
             if std::ptr::eq(registered.locks().0, route.locks().0) {
                 match &result {
-                    Ok(compiled) => { registered.policy = compiled.clone(); registered.refresh_failed = false; }
-                    Err(_) => registered.refresh_failed = true,
+                    Ok(compiled) => { registered.policy = compiled.clone(); registered.refresh_failed = false; registered.membership_failed = false; self.membership_published(route.id()); }
+                    Err(_) => {
+                        registered.refresh_failed = true;
+                        if self.membership_pending(route.id()) { registered.membership_failed = true; }
+                    },
                 }
             }
         }
@@ -379,12 +491,21 @@ impl Hub {
         let s = &mut state.units[unit];
         s.attempts += 1;
         s.last_time = now();
+        let mut membership_failed = Vec::new();
         let result = (|| {
             let doc = Arc::new(candidate?);
             let policy = Arc::new(doc.policy.clone());
             if independent && readlog_key(&policy.readlog) != readlog_key(&s.policy.readlog) {
                 return Err("policy files name different read logs".into());
             }
+            let replacement = if readlog_key(&policy.readlog) != readlog_key(&s.policy.readlog) {
+                Some(
+                    crate::readlog::open_sink(&policy.readlog)
+                        .map_err(|_| "read log unavailable")?,
+                )
+            } else {
+                None
+            };
             // Hold every policy and snapshot lock through validation and publication.
             let mut policies = Vec::new();
             let mut snapshots = Vec::new();
@@ -392,6 +513,13 @@ impl Hub {
                 let (p, snap) = route.locks();
                 policies.push(p.write().map_err(|_| "policy lock unavailable")?);
                 snapshots.push(snap.read().map_err(|_| "snapshot lock unavailable")?);
+            }
+            let compiled = s.routes.iter().zip(&snapshots).map(|(route, snapshot)| {
+                self.compile(&doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, snapshot)
+                    .map_err(|error| { if error.membership { membership_failed.push(route.id().to_owned()); } error.message })
+            }).collect::<Result<Vec<_>, String>>()?;
+            for ((_, change), old) in compiled.iter().zip(&policies) {
+                self.reset_membership(change.as_ref(), old)?;
             }
             let mut route_revisions = Vec::new();
             for route in &s.routes {
@@ -405,17 +533,6 @@ impl Hub {
                     route_revisions.push(revision.write().map_err(|_| "revision lock unavailable")?);
                 }
             }
-            let compiled = s.routes.iter().zip(&snapshots).map(|(route, snapshot)| {
-                self.compile(&doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, snapshot)
-            }).collect::<Result<Vec<_>, String>>()?;
-            let replacement = if readlog_key(&policy.readlog) != readlog_key(&s.policy.readlog) {
-                Some(
-                    crate::readlog::open_sink(&policy.readlog)
-                        .map_err(|_| "read log unavailable")?,
-                )
-            } else {
-                None
-            };
             let mut log = self
                 .log
                 .0
@@ -430,7 +547,7 @@ impl Hub {
                 *log = replacement;
             }
             for (current, compiled) in policies.iter_mut().zip(&compiled) {
-                **current = compiled.clone();
+                **current = compiled.0.clone();
             }
             for current in &mut route_revisions {
                 **current = Some(revision.clone());
@@ -438,12 +555,17 @@ impl Hub {
             revisions.policy = revision.clone();
             Ok::<_, String>((doc, policy, compiled))
         })();
+        for route in &mut s.routes {
+            if result.is_err() && (membership_failed.iter().any(|id| id == route.id()) || self.membership_pending(route.id())) { route.membership_failed = true; }
+        }
         match result {
             Ok((doc, policy, compiled)) => {
                 s.doc = doc;
                 s.policy = policy;
                 for (route, compiled) in s.routes.iter_mut().zip(compiled) {
-                    route.policy = compiled;
+                    route.policy = compiled.0;
+                    route.membership_failed = false;
+                    self.membership_published(route.id());
                 }
                 s.hash = digest.ok_or("policy digest unavailable")?;
                 s.applied = now();
@@ -644,6 +766,7 @@ mod tests {
     use std::collections::BTreeMap;
     fn policy() -> Policy {
         Policy {
+            retired_domains: Default::default(),
             json_filters: Default::default(),
             columns: BTreeMap::new(),
             domains: BTreeMap::new(),
@@ -687,6 +810,10 @@ mod tests {
                 configured: vec![(id("postgres"), 0)],
             }),
             store: RwLock::new(None),
+            authority: RwLock::new(std::sync::Weak::new()),
+            pending_membership: Mutex::new(Default::default()),
+            #[cfg(test)]
+            reset_callback: RwLock::new(Some(Arc::new(|_, _| Ok(0)))) ,
             watch_ms: None,
             service: crate::policy::ServicePolicySettings::default(),
         }
@@ -1538,6 +1665,195 @@ mod tests {
             &crate::token::keys::RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap())
     }
     #[test]
+    fn link_files_register_and_publish_retired_domains_on_reload() {
+        for mode in ["show", "tokenize"] {
+            let files = Files::new();
+            let initial = format!("version=2\ndefault='{mode}'\n");
+            std::fs::write(&files.a, &initial).unwrap();
+            let linked = format!("{initial}[[link]]\nfields=['public.customers.email','public.outbox.to_address']\n");
+            let mut snapshot = customers(&[("email", 1)]);
+            let mut outbox = snapshot.relations[0].clone();
+            outbox.name = "outbox".into();
+            outbox.columns[0].name = "to_address".into();
+            snapshot.relations.push(outbox);
+            let other = ColumnRef { schema: "public".into(), table: "outbox".into(), column: "to_address".into() };
+            let snapshot = snapshot.with_column_ids([
+                (customer_column("email"), customer_id(1)),
+                (other.clone(), crate::schema::ColumnId::Pg { relation_oid: 124, attnum: 1 }),
+            ].into());
+            let settings = crate::policy::ServicePolicySettings { readlog: Some(ReadLogSink::Stdout), ..Default::default() };
+            let hub = Hub::new(&[(id("a"), files.a.clone())], None, settings.clone()).unwrap();
+            hub.set_store(binding_store(&files)).unwrap();
+            hub.register(test_route("a", snapshot.clone())).unwrap();
+            let before = hub.state.lock().unwrap().units[0].routes[0].policy.clone();
+            let old: Vec<_> = [customer_column("email"), other.clone()].iter()
+                .filter_map(|c| before.domain_of(c).cloned()).collect();
+            let doc = parse(&files.a, linked.as_bytes(), &settings).unwrap();
+            hub.apply(0, Ok(doc), Some(hash(linked.as_bytes()))).unwrap();
+            let policy = hub.state.lock().unwrap().units[0].routes[0].policy.clone();
+            assert!(policy.domain_of(&other).is_some());
+            assert_eq!(policy.domain_of(&other), policy.domain_of(&customer_column("email")));
+            for domain in old { assert!(policy.retired_domains.contains(&domain)); }
+            // Also register directly from a linked file, for both route defaults.
+            std::fs::write(&files.a, &linked).unwrap();
+            let direct_files = Files::new();
+            let direct = Hub::new(&[(id("b"), files.a.clone())], None, settings).unwrap();
+            direct.set_store(binding_store(&direct_files)).unwrap();
+            direct.register(test_route("b", snapshot)).unwrap();
+            let policy = direct.state.lock().unwrap().units[0].routes[0].policy.clone();
+            assert!(policy.domain_of(&other).is_some());
+            assert_eq!(policy.domain_of(&other), policy.domain_of(&customer_column("email")));
+        }
+    }
+
+    #[test]
+    fn membership_reload_resets_before_publication_and_unlinks_last_show_link() {
+        let files = Files::new();
+        std::fs::write(&files.a, "version=2\ndefault='show'\n").unwrap();
+        let settings = crate::policy::ServicePolicySettings { readlog: Some(ReadLogSink::Stdout), ..Default::default() };
+        let hub = Hub::new(&[(id("a"), files.a.clone()), (id("b"), files.b.clone())], None, settings).unwrap();
+        let store = binding_store(&files);
+        hub.set_store(store.clone()).unwrap();
+        hub.register(test_route("a", customers(&[("email", 1), ("other", 2)]))).unwrap();
+        hub.register(test_route("b", customers(&[("email", 1), ("other", 2)]))).unwrap();
+        let resets = Arc::new(Mutex::new(Vec::new()));
+        let seen = resets.clone();
+        *hub.reset_callback.write().unwrap() = Some(Arc::new(move |change, old| {
+            // These are the actual publication guards, still containing the old policy.
+            assert_eq!(change.route, id("a"));
+            let old_linked = old.domain_of(&customer_column("email")) == old.domain_of(&customer_column("other"))
+                && old.domain_of(&customer_column("email")).is_some();
+            seen.lock().unwrap().push(old_linked);
+            Ok(3)
+        }));
+        let doc = (*hub.state.lock().unwrap().units[0].doc).clone();
+        let mut linked = doc.clone();
+        linked.links.push(crate::policy::LinkRule {
+            fields: vec![customer_column("email"), customer_column("other")], domain: None,
+        });
+        hub.apply(0, Ok(linked.clone()), Some(hash(b"linked"))).unwrap();
+        assert_eq!(*resets.lock().unwrap(), vec![false]);
+        hub.apply(0, Ok(linked), Some(hash(b"unchanged"))).unwrap();
+        assert_eq!(resets.lock().unwrap().len(), 1);
+        hub.apply(0, Ok(doc), Some(hash(b"unlinked"))).unwrap();
+        assert_eq!(*resets.lock().unwrap(), vec![false, true]);
+        let records = bindings::load(store.as_ref(), &id("a")).unwrap();
+        assert!(records.iter().all(|(_, record)| !record.linked));
+        assert!(hub.readiness(true, true).0);
+    }
+
+    #[test]
+    fn later_route_failure_blocks_stale_refresh_until_reload() {
+        let files = Files::new();
+        let hub = tokenize_hub(&files, &["a", "b"]);
+        let store = binding_store(&files);
+        hub.set_store(store.clone()).unwrap();
+        let a = test_route("a", customers(&[("email", 1), ("other", 2)]));
+        let b = test_route("b", customers(&[("email", 1)]));
+        hub.register(a).unwrap(); hub.register(b).unwrap();
+        let old = hub.state.lock().unwrap().units[0].routes[0].locks().0.read().unwrap().clone();
+        let mut doc = (*hub.state.lock().unwrap().units[0].doc).clone();
+        doc.links.push(crate::policy::LinkRule { fields: vec![customer_column("email"), customer_column("other")], domain: None });
+        assert!(hub.apply(0, Ok(doc.clone()), Some(hash(b"linked"))).is_err());
+        assert!(!hub.readiness(true, true).0);
+        assert!(hub.state.lock().unwrap().units[0].routes[0].membership_failed);
+        assert!(Arc::ptr_eq(&old, &hub.state.lock().unwrap().units[0].routes[0].locks().0.read().unwrap()));
+        let records = bindings::load(store.as_ref(), &id("a")).unwrap();
+        let retired = bindings::load_retired(store.as_ref(), &id("a")).unwrap();
+        {
+            let mut state = hub.state.lock().unwrap();
+            // Exercise the production refresh with the registered route's identity;
+            // refusal happens before any route lock is acquired.
+            let route = test_route("a", customers(&[("email", 1), ("other", 2)]));
+            assert!(hub.publish_refresh(&mut state.units[0], &route, customers(&[("email", 1), ("other", 2)]), || Ok(())).is_err());
+        }
+        assert_eq!(records, bindings::load(store.as_ref(), &id("a")).unwrap());
+        assert_eq!(retired, bindings::load_retired(store.as_ref(), &id("a")).unwrap());
+        *hub.state.lock().unwrap().units[0].routes[1].locks().1.write().unwrap() = Arc::new(customers(&[("email", 1), ("other", 2)]));
+        hub.apply(0, Ok(doc), Some(hash(b"recovered"))).unwrap();
+        assert!(hub.readiness(true, true).0);
+        let state = hub.state.lock().unwrap();
+        let policy = state.units[0].routes[0].locks().0.read().unwrap();
+        assert_eq!(policy.domain_of(&customer_column("email")), policy.domain_of(&customer_column("other")));
+    }
+
+    #[test]
+    fn durable_membership_reset_survives_hub_restart() {
+        let files = Files::new();
+        let hub = tokenize_hub(&files, &["a"]);
+        let store = binding_store(&files);
+        hub.set_store(store.clone()).unwrap();
+        hub.register(test_route("a", customers(&[("email", 1), ("other", 2)]))).unwrap();
+        use crate::state::{authority::{AcquireRequest, Authority, SessionLimits}, model::{EndReason, Mode, PrincipalKind, SessionState, Verifier}};
+        let authority = Authority::load(store.clone(), SessionLimits::default()).unwrap();
+        let principal = authority.create_principal("restart-agent", PrincipalKind::Agent, false, "principal").unwrap();
+        authority.set_grants(principal.id, vec![(id("a"), Mode::ReadOnly)]).unwrap();
+        let session = authority.acquire_session(principal.id, AcquireRequest {
+            route: id("a"), mode: None, lifetime_ms: None, isolated: false, label: None,
+            idempotency_key: "session".into(),
+            verifier: Verifier(crate::pgwire::auth::ScramVerifier::from_password("test", b"salt", 2)),
+            secret_sha256: Sha256::digest(b"test").into(),
+        }).unwrap();
+        let mut doc = (*hub.state.lock().unwrap().units[0].doc).clone();
+        doc.links.push(crate::policy::LinkRule { fields: vec![customer_column("email"), customer_column("other")], domain: None });
+        *hub.reset_callback.write().unwrap() = None;
+        assert!(hub.apply(0, Ok(doc), Some(hash(b"linked"))).is_err());
+        let owed = bindings::load_reset(store.as_ref(), &id("a")).unwrap().unwrap();
+        assert!(!owed.retired.is_empty());
+        drop(hub); drop(authority); drop(store);
+        std::fs::write(&files.a, "version=2\ndefault='tokenize'\n[[link]]\nfields=['public.customers.email','public.customers.other']\n").unwrap();
+        let audit = files.dir.join("restart-audit.jsonl");
+        let hub = Hub::new(&[(id("a"), files.a.clone())], None,
+            crate::policy::ServicePolicySettings { readlog: Some(ReadLogSink::File { path: audit.clone(), max_bytes: 1000000 }), ..Default::default() }).unwrap();
+        let store = binding_store(&files); hub.set_store(store.clone()).unwrap();
+        let authority = Authority::load(store.clone(), SessionLimits::default()).unwrap();
+        assert_eq!(authority.session(session.id).unwrap().state, SessionState::Active);
+        hub.set_authority(Arc::downgrade(&authority)).unwrap();
+        hub.register(test_route("a", customers(&[("email", 1), ("other", 2)]))).unwrap();
+        assert_eq!(authority.session(session.id).unwrap().state, SessionState::Revoked);
+        assert_eq!(authority.session(session.id).unwrap().revoke_reason, Some(EndReason::PolicyReset));
+        assert!(bindings::load_reset(store.as_ref(), &id("a")).unwrap().is_none());
+        let log = std::fs::read_to_string(audit).unwrap();
+        assert!(log.contains("membership_reset"));
+        assert!(log.contains("\"sessions\":1"));
+        for domain in owed.retired { assert!(log.contains(&domain.0)); }
+    }
+
+    #[test]
+    fn binding_failure_marks_readiness_but_invalid_policy_does_not() {
+        let files = Files::new();
+        let hub = tokenize_hub(&files, &["a"]);
+        let store = binding_store(&files);
+        hub.set_store(store.clone()).unwrap();
+        hub.register(test_route("a", customers(&[("email", 1), ("other", 2)]))).unwrap();
+        let mut doc = (*hub.state.lock().unwrap().units[0].doc).clone();
+        doc.links.push(crate::policy::LinkRule { fields: vec![customer_column("email"), customer_column("other")], domain: None });
+        let before = hub.state.lock().unwrap().units[0].routes[0].policy.clone();
+        store.fail_commits(true);
+        assert!(hub.apply(0, Ok(doc.clone()), Some(hash(b"failed"))).is_err());
+        assert!(!hub.readiness(true, true).0);
+        assert!(Arc::ptr_eq(&before, &hub.state.lock().unwrap().units[0].routes[0].policy));
+        store.fail_commits(false);
+        hub.apply(0, Ok(doc), Some(hash(b"recovered"))).unwrap();
+        assert!(hub.readiness(true, true).0);
+        assert!(hub.apply(0, Err("invalid policy file".into()), None).is_err());
+        assert!(hub.readiness(true, true).0);
+    }
+
+    #[test]
+    fn refused_reset_is_retained_for_retry_after_bindings_persist() {
+        let files = Files::new();
+        let hub = tokenize_hub(&files, &["a"]);
+        hub.set_store(binding_store(&files)).unwrap();
+        *hub.reset_callback.write().unwrap() = None;
+        assert!(hub.register(test_route("a", customers(&[("email", 1)]))).is_err());
+        let calls = Arc::new(Mutex::new(0)); let count = calls.clone();
+        *hub.reset_callback.write().unwrap() = Some(Arc::new(move |_, _| { *count.lock().unwrap() += 1; Ok(0) }));
+        hub.register(test_route("a", customers(&[("email", 1)]))).unwrap();
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
     fn tokenize_registers_index_and_view_with_base_column_rewrites() {
         use crate::{dialect::{Lowering, pg::PgLowering}, ir::{Label, OutputRewrite}, schema::RelationKind};
         let files = Files::new();
@@ -1684,7 +2000,7 @@ mod tests {
         let bindings = bindings::load(store.as_ref(), &id("a")).unwrap();
         let warnings = crate::policy::validate::validate_document(&doc, &renamed, &bindings).unwrap();
         assert_eq!(warnings[0].message, "show rule names public.customers.email, renamed to public.customers.contact");
-        let compiled = hub.compile(&doc, &id("a"), &renamed).unwrap();
+        let (compiled, _) = hub.compile(&doc, &id("a"), &renamed).unwrap();
         assert_eq!(compiled.treatment(&customer_column("contact")), Some(&Treatment::Show));
         let empty = RouteBindings::default();
         assert!(crate::policy::validate::validate_document(&doc, &renamed, &empty).is_err());

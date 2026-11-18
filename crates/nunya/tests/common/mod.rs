@@ -58,6 +58,7 @@ pub fn harness_fixture() -> (Snapshot, Policy) {
     };
     let domain = DomainName("email".into());
     let policy = Policy {
+        retired_domains: Default::default(),
         json_filters: Default::default(),
         columns: BTreeMap::from([
             (

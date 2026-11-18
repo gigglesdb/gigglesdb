@@ -112,7 +112,7 @@ impl RevocationHook for RegistryHook {
             | EndReason::AdminRevoked
             | EndReason::PrincipalDisabled
             | EndReason::ConfigRemoved
-            | EndReason::GrantRemoved => {
+            | EndReason::GrantRemoved | EndReason::PolicyReset => {
                 self.ends.revoked.fetch_add(1, Ordering::Relaxed);
                 ConnectionEndReason::Revoked
             },
@@ -455,7 +455,7 @@ mod tests {
             match reason {
                 EndReason::Requested => { runtime.authority.revoke(session.id, reason).unwrap(); }
                 EndReason::GrantRemoved => { runtime.authority.set_grants(session.principal, vec![]).unwrap(); }
-                EndReason::AdminRevoked | EndReason::PrincipalDisabled | EndReason::ConfigRemoved | EndReason::Expired | EndReason::IdleTimeout => panic!("unexpected test reason"),
+                EndReason::AdminRevoked | EndReason::PrincipalDisabled | EndReason::ConfigRemoved | EndReason::PolicyReset | EndReason::Expired | EndReason::IdleTimeout => panic!("unexpected test reason"),
             }
             let records = log.0.lock().unwrap();
             assert_eq!(records.len(), 1);
@@ -686,6 +686,7 @@ mod tests {
             EndReason::PrincipalDisabled,
             EndReason::ConfigRemoved,
             EndReason::GrantRemoved,
+            EndReason::PolicyReset,
         ] {
             let registry = Registry::new();
             let session = SessionId::random();
@@ -702,7 +703,7 @@ mod tests {
                 | EndReason::AdminRevoked
                 | EndReason::PrincipalDisabled
                 | EndReason::ConfigRemoved
-                | EndReason::GrantRemoved => ConnectionEndReason::Revoked,
+                | EndReason::GrantRemoved | EndReason::PolicyReset => ConnectionEndReason::Revoked,
             };
             assert_eq!(signal.try_ended(), Some(expected));
         }

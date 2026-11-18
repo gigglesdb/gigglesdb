@@ -6,6 +6,7 @@ use crate::{
 use std::collections::BTreeMap;
 fn fixture() -> (Snapshot, Policy) {
     let mut policy = Policy {
+        retired_domains: Default::default(),
         json_filters: Default::default(),
         columns: BTreeMap::new(),
         domains: BTreeMap::new(),

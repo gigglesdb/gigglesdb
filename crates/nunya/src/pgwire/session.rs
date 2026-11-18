@@ -796,7 +796,7 @@ fn rewrite_literals(
                         .ok_or_else(protocol)?
                         .range
                         .as_ref();
-                    let decoded = codec.decode(keys, domain, ty, range, &value)?;
+                    let decoded = codec.decode_checked(keys, domain, ty, range, &value, &policy.retired_domains)?;
                     replacements.push((span.clone(), ir::rewrite::literal_for(&decoded)?));
                 }
                 InputRewrite::DecryptParam { .. } => {}
@@ -1059,7 +1059,7 @@ fn rewrite_bind(
                         .ok_or_else(protocol)?
                         .range
                         .as_ref();
-                    let value = codec.decode(keys, domain, ty, range, &token)?;
+                    let value = codec.decode_checked(keys, domain, ty, range, &token, &policy.retired_domains)?;
                     params[i] = Some(if format == 0 {
                         values::encode_text(&value)?
                     } else {
@@ -1538,6 +1538,7 @@ pub(crate) mod tests {
                 column: "value".into(),
             };
             let policy = Policy {
+                retired_domains: Default::default(),
                 json_filters: Default::default(),
                 columns: [(
                     col,
@@ -2496,6 +2497,23 @@ pub(crate) mod tests {
         s
     }
     #[test]
+    fn policy_reset_refuses_suspended_portal_resume_with_ny011() {
+        let f = Fixture::new();
+        let mut s = start_rows(&f, true);
+        s.backend(Backend::DataRow(vec![Some(b"value".to_vec())]));
+        s.backend(Backend::PortalSuspended);
+        let (_guard, signal) = f.ctx.registry.register(s.session, s.principal, f.ctx.route.as_str(), None);
+        f.ctx.authority.end_route_sessions(&f.ctx.route, crate::state::model::EndReason::PolicyReset).unwrap();
+        // Fixture has no runtime registry hook; signal as RegistryHook does after commit.
+        f.ctx.registry.signal_session(&s.session, crate::state::registry::EndReason::Revoked);
+        assert!(signal.try_ended().is_some());
+        let out = s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 1 });
+        assert_eq!(code(&out), "NY011");
+        assert!(out.upstream.is_empty());
+        assert!(!out.client.iter().any(|message| matches!(message, Backend::DataRow(_))));
+    }
+
+    #[test]
     fn relayed_rows_refresh_activity_beyond_idle_timeout() {
         for extended in [false, true] {
             let (f, now) = row_clock_fixture();
@@ -2824,6 +2842,15 @@ pub(crate) mod tests {
         f
     }
     #[test]
+    fn retired_token_literal_in_show_column_is_refused() {
+        let f = notes_fixture();
+        let mut policy = (**f.ctx.policy.read().unwrap()).clone();
+        policy.retired_domains.insert(DomainName("retired".into()));
+        *f.ctx.policy.write().unwrap() = Arc::new(policy);
+        let out = f.session().frontend(Frontend::Query("UPDATE notes SET body = 'tok_retired_a' WHERE id = 3".into()));
+        assert_eq!(code(&out), "NY001"); assert!(out.upstream.is_empty());
+    }
+    #[test]
     fn token_shaped_plain_literals_are_refused_in_simple_and_parse() {
         let f = notes_fixture();
         for sql in [
@@ -2932,6 +2959,37 @@ pub(crate) mod tests {
         assert!(out.is_empty());
         assert!(encode_limited(&Backend::ReadyForQuery(b'I'), &mut out, 5).is_ok());
     }
+    #[test]
+    fn retired_tokens_refused_in_literals_and_bind_before_send() {
+        for retired in [false, true] {
+            let f = Fixture::new();
+            let mut session = f.session();
+            let old = DomainName("auto_retired_test".into());
+            let domain = if retired { &old } else { &DomainName("secret".into()) };
+            let token = f.ctx.codec.encode(&session.keys, domain, &ColumnType::Text, None,
+                &SqlValue::Text("private@example.com".into())).unwrap();
+            let bytes = values::encode_text(&token).unwrap();
+            let mut policy = (**f.ctx.policy.read().unwrap()).clone();
+            policy.retired_domains.insert(old);
+            *f.ctx.policy.write().unwrap() = Arc::new(policy);
+            let sql = format!("SELECT value FROM items WHERE value = '{}'", String::from_utf8(bytes.clone()).unwrap());
+            let out = session.frontend(Frontend::Query(sql));
+            if retired { assert_eq!(code(&out), "NY001"); assert!(out.upstream.is_empty()); }
+            else { assert!(matches!(&out.upstream[0], Frontend::Query(sql) if sql.contains("private@example.com"))); }
+            let mut session = f.session();
+            // Encode for the new session's scope.
+            let domain = if retired { DomainName("auto_retired_test".into()) } else { DomainName("secret".into()) };
+            let token = f.ctx.codec.encode(&session.keys, &domain, &ColumnType::Text, None,
+                &SqlValue::Text("private@example.com".into())).unwrap();
+            session.frontend(Frontend::Parse { name: "s".into(), query: "SELECT value FROM items WHERE value = $1".into(), param_types: vec![25] });
+            session.backend(Backend::ParseComplete);
+            let out = session.frontend(Frontend::Bind { portal: "p".into(), statement: "s".into(), param_formats: vec![],
+                params: vec![Some(values::encode_text(&token).unwrap())], result_formats: vec![] });
+            if retired { assert_eq!(code(&out), "NY001"); assert!(out.upstream.is_empty()); }
+            else { assert!(matches!(&out.upstream[0], Frontend::Bind { params, .. } if params[0].as_deref() == Some(b"private@example.com"))); }
+        }
+    }
+
     #[test]
     fn numeric_literal_splice_with_real_lowering() {
         let f = Fixture::new();

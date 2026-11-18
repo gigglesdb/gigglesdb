@@ -33,10 +33,12 @@ pub enum Table {
     DomainNames,
     /// Permanently retired generated domains.
     RetiredDomains,
+    /// Routes awaiting membership reset and publication.
+    MembershipResets,
 }
 impl Table {
     /// Every application table in schema order.
-    pub const ALL: [Table; 12] = [
+    pub const ALL: [Table; 13] = [
         Self::Principals,
         Self::PrincipalCredentials,
         Self::Grants,
@@ -49,6 +51,7 @@ impl Table {
         Self::DomainBindings,
         Self::DomainNames,
         Self::RetiredDomains,
+        Self::MembershipResets,
     ];
 
     /// Stable on-disk table name.
@@ -66,6 +69,7 @@ impl Table {
             Self::DomainBindings => "domain_bindings",
             Self::DomainNames => "domain_names",
             Self::RetiredDomains => "retired_domains",
+            Self::MembershipResets => "membership_resets",
         }
     }
 

@@ -274,6 +274,8 @@ fn apply_with_generator(
     let mut txn = store.write().map_err(|_| BindingError::Store)?;
     let mut groups: BTreeMap<usize, DomainName> = BTreeMap::new();
     let mut bindings = read_bindings(txn.as_ref(), route)?;
+    let before = bindings.clone();
+    let mut retired = Vec::new();
     for change in changes {
         let record = match change {
             BindingChange::SetDomain {
@@ -389,6 +391,7 @@ fn apply_with_generator(
                         .map_err(|_| BindingError::Store)?
                         .is_some()
                     {
+                        retired.push(name.clone());
                         txn.put(
                             Table::RetiredDomains,
                             &keys::domain_name(name),
@@ -403,6 +406,29 @@ fn apply_with_generator(
         )
         .map_err(|_| BindingError::Store)?;
         bindings.0.insert(record.identity.clone(), record);
+    }
+    let mut owed = MembershipChange { route: route.clone(), retired, joined: vec![], left: vec![], skipped: vec![] };
+    for (identity, record) in before.iter().filter(|(_, r)| r.status == BindingStatus::Active) {
+        if let Some(domain) = &record.domain
+            && !bindings.get(identity).is_some_and(|r| r.status == BindingStatus::Active && r.domain.as_ref() == Some(domain)) {
+            owed.left.push((domain.clone(), record.column.clone()));
+        }
+    }
+    for (identity, record) in bindings.iter().filter(|(_, r)| r.status == BindingStatus::Active) {
+        if let Some(domain) = &record.domain
+            && !before.get(identity).is_some_and(|r| r.status == BindingStatus::Active && r.domain.as_ref() == Some(domain)) {
+            owed.joined.push((domain.clone(), record.column.clone()));
+        }
+    }
+    if owed.requires_reset() {
+        owed.retired.sort(); owed.retired.dedup();
+        if let Some(bytes) = txn.get(Table::MembershipResets, route.as_str().as_bytes()).map_err(|_| BindingError::Store)? {
+            let old: MembershipChange = model::decode(&bytes).map_err(|_| BindingError::Corrupt)?;
+            owed.retired.extend(old.retired);
+            owed.retired.sort(); owed.retired.dedup();
+            owed.joined.extend(old.joined); owed.left.extend(old.left);
+        }
+        txn.put(Table::MembershipResets, route.as_str().as_bytes(), &model::encode(&owed)).map_err(|_| BindingError::Store)?;
     }
     txn.commit().map_err(|_| BindingError::Store)?;
     load(store, route)
@@ -769,7 +795,8 @@ fn spanner_vanished_match(old: &ColumnId, new: &ColumnId, snapshot: &Snapshot) -
 }
 
 /// Route membership changes requiring session invalidation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MembershipChange {
     /// Affected route.
     pub route: RouteId,
@@ -791,6 +818,18 @@ impl MembershipChange {
     pub fn requires_reset(&self) -> bool {
         !self.retired.is_empty() || !self.joined.is_empty() || !self.left.is_empty()
     }
+}
+/// Load a reset owed by an already committed membership change.
+pub fn load_reset(store: &dyn Store, route: &RouteId) -> Result<Option<MembershipChange>, BindingError> {
+    store.read().map_err(|_| BindingError::Store)?
+        .get(Table::MembershipResets, route.as_str().as_bytes()).map_err(|_| BindingError::Store)?
+        .map(|bytes| model::decode(&bytes).map_err(|_| BindingError::Corrupt)).transpose()
+}
+/// Clear a reset only after sessions were ended and the policy was published.
+pub fn clear_reset(store: &dyn Store, route: &str) -> Result<(), BindingError> {
+    let mut txn = store.write().map_err(|_| BindingError::Store)?;
+    txn.delete(Table::MembershipResets, route.as_bytes()).map_err(|_| BindingError::Store)?;
+    txn.commit().map_err(|_| BindingError::Store)
 }
 /// Test whether a generated domain was retired.
 pub fn is_retired(store: &dyn Store, name: &DomainName) -> Result<bool, BindingError> {
@@ -975,6 +1014,7 @@ mod tests {
             file_readlog: None,
             file_snapshot_max_age_ms: None,
             policy: super::super::Policy {
+                retired_domains: Default::default(),
                 json_filters: Default::default(),
                 columns: BTreeMap::new(),
                 domains: BTreeMap::new(),
@@ -1316,6 +1356,7 @@ mod tests {
             txn.delete_table(Table::RetiredDomains.definition())
                 .unwrap()
         );
+        assert!(txn.delete_table(Table::MembershipResets.definition()).unwrap());
         txn.commit().unwrap();
         drop(db);
         let store = RedbStore::open(&dir.0, &root()).unwrap();
@@ -1332,6 +1373,7 @@ mod tests {
             Some(old_bytes)
         );
         assert!(load_retired(&store, &route()).unwrap().is_empty());
+        assert!(load_reset(&store, &route()).unwrap().is_none());
         assert_eq!(
             load(&store, &route()).unwrap().get(&id(1)).unwrap(),
             &decoded

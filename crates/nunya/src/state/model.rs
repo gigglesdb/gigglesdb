@@ -125,6 +125,8 @@ pub enum EndReason {
     IdleTimeout,
     /// The principal no longer grants the session route.
     GrantRemoved,
+    /// A policy revision changed the route's shared domains.
+    PolicyReset,
 }
 impl Mode {
     /// Return the more restrictive of two modes.
@@ -150,6 +152,7 @@ impl EndReason {
             Self::Expired => "expired",
             Self::IdleTimeout => "idle_timeout",
             Self::GrantRemoved => "grant_removed",
+            Self::PolicyReset => "policy_reset",
         }
     }
 }
@@ -810,6 +813,7 @@ mod tests {
             EndReason::Expired,
             EndReason::IdleTimeout,
             EndReason::GrantRemoved,
+            EndReason::PolicyReset,
         ] {
             assert_eq!(encode(&reason), encode(&reason.as_str()));
         }

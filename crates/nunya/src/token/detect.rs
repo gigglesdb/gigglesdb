@@ -6,7 +6,7 @@ pub fn looks_like_token(text: &str, policy: &Policy) -> bool {
     let Some(rest) = text.strip_prefix("tok_") else {
         return false;
     };
-    policy.domains.keys().any(|domain| {
+    policy.domains.keys().chain(policy.retired_domains.iter()).any(|domain| {
         rest.strip_prefix(&domain.0)
             .and_then(|suffix| suffix.strip_prefix('_'))
             .and_then(|suffix| suffix.as_bytes().first())
@@ -21,6 +21,7 @@ mod tests {
     #[test]
     fn recognizes_only_declared_domains_and_base32_prefixes() {
         let policy = Policy {
+            retired_domains: [DomainName("retired".into())].into(),
             json_filters: Default::default(),
             columns: Default::default(),
             domains: [(
@@ -35,6 +36,7 @@ mod tests {
             readlog: ReadLogSink::Stdout,
         };
         for text in [
+            "tok_retired_a",
             "tok_email_a",
             "tok_email_2",
             "tok_email_z...",

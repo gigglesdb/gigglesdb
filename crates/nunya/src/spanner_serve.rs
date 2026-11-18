@@ -239,6 +239,7 @@ mod tests {
             schema::{ColumnRef, Snapshot},
         };
         let mut policy = Policy {
+            retired_domains: Default::default(),
             json_filters: Default::default(),
             columns: BTreeMap::new(),
             domains: BTreeMap::new(),

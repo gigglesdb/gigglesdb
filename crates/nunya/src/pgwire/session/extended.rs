@@ -56,9 +56,10 @@ fn oid_type(oid: u32) -> Option<ColumnType> {
 }
 impl Prepared {
     fn check_treatments(&self, current: &Arc<Policy>) -> Result<(), Refusal> {
-        if !Arc::ptr_eq(current, &self.policy)
+        if current.retired_domains != self.policy.retired_domains
+            || (!Arc::ptr_eq(current, &self.policy)
             && self.columns.iter().any(|column| current.treatment(column) != self.policy.treatment(column)
-                || current.json_filter(column) != self.policy.json_filter(column))
+                || current.json_filter(column) != self.policy.json_filter(column)))
         {
             return Err(failure(NyCode::SchemaStale));
         }
@@ -319,7 +320,7 @@ impl Session {
                         &param_formats,
                         &p.param_types,
                         &p.plan,
-                        &p.policy,
+                        &current,
                         &self.keys,
                         &self.ctx.codec,
                     )?;
@@ -899,6 +900,9 @@ mod treatment_tests {
             token_ty: None,
         };
         assert_eq!(prepared.check_treatments(&Arc::new(current)).unwrap_err().code, NyCode::SchemaStale);
+        let mut retired = (*prepared.policy).clone();
+        retired.retired_domains.insert(crate::policy::DomainName("retired_generated".into()));
+        assert_eq!(prepared.check_treatments(&Arc::new(retired)).unwrap_err().code, NyCode::SchemaStale);
         let mut current = (*prepared.policy).clone();
         let filter = super::super::tests::json_test_filter(crate::json::filter::JsonMode::Show, false, false);
         current.json_filters.insert(prepared.columns[0].clone(), filter.clone());

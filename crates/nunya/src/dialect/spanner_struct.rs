@@ -304,6 +304,7 @@ mod tests {
         let col = reference(&r, &r.columns[0]);
         r.primary_key = vec!["Email".into()];
         let mut p = Policy {
+            retired_domains: Default::default(),
             json_filters: Default::default(),
             columns: Default::default(),
             domains: Default::default(),
@@ -476,6 +477,7 @@ mod tests {
         r.key_set.as_mut().unwrap().keys = vec![values(3)];
         assert!(lower_read(&r, &s, &p).is_err());
         let plain = Policy {
+            retired_domains: Default::default(),
             json_filters: Default::default(),
             columns: Default::default(),
             ..p

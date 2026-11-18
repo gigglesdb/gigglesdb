@@ -93,6 +93,9 @@ pub struct ServicePolicySettings {
 /// Policy.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Policy {
+    /// Generated domains retired on this route; their tokens are refused on input.
+    #[serde(skip)]
+    pub retired_domains: crate::token::RetiredDomains,
     /// Columns released only through a JSON path filter; their treatment stays Masked.
     #[serde(skip)]
     pub json_filters: BTreeMap<ColumnRef, JsonColumnFilter>,

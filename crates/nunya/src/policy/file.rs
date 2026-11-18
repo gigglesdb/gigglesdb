@@ -555,6 +555,7 @@ pub fn parse_policy_document(toml_text: &str) -> Result<PolicyDocument, Vec<Poli
             file_readlog: readlog.clone(),
             file_snapshot_max_age_ms: age,
             policy: Policy {
+                retired_domains: Default::default(),
                 json_filters: Default::default(),
                 columns,
                 domains,
@@ -897,11 +898,6 @@ pub fn resolve(mut doc: PolicyDocument, service: &ServicePolicySettings) -> Resu
         (None, Some(service)) => service,
         (None, None) => 60000,
     };
-    // Links are dropped by the Policy projection, so refuse them until a later
-    // stack enforces shared domains (fail closed rather than serve them as Show).
-    if !doc.links.is_empty() {
-        error(&mut errors, "link", "link rules are not served yet");
-    }
     if errors.is_empty() { Ok(doc) } else { Err(errors) }
 }
 
@@ -1472,14 +1468,13 @@ placeholder = "**"
     }
 
     #[test]
-    fn links_are_refused_when_resolved_for_serving() {
+    fn links_resolve_for_serving() {
         let text = format!("{V2}[[link]]
 fields = ['public.a.x', 'public.b.y']
 ");
         let doc = parse_policy_document(&text).unwrap();
-        let errors = resolve(doc, &ServicePolicySettings::default()).unwrap_err();
-        assert!(errors.iter().any(|e| e.message == "link: link rules are not served yet"));
-        assert!(parse_policy(&text).is_err());
+        let resolved = resolve(doc, &ServicePolicySettings { readlog: Some(ReadLogSink::Stdout), ..Default::default() }).unwrap();
+        assert_eq!(resolved.links.len(), 1);
     }
 
     #[test]

@@ -435,6 +435,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     }
     let hub = crate::reload::Hub::new(&policy_routes, config.policy_watch_ms, config.policy_settings.clone())?;
     hub.set_store(runtime.store())?;
+    hub.set_authority(Arc::downgrade(&runtime.authority))?;
     let admins: crate::mgmt::routes::Admins = Arc::new(std::sync::RwLock::new(config.management.as_ref().map(|m| {
         m.admins.iter().map(|a| (a.name.clone(), crate::pgwire::auth::ScramVerifier {
             salt: a.verifier.salt.clone(), iterations: a.verifier.iterations,
@@ -888,6 +889,7 @@ mod tests {
     }
     fn policy() -> Policy {
         Policy {
+            retired_domains: Default::default(),
             json_filters: Default::default(),
             columns: BTreeMap::new(),
             domains: BTreeMap::new(),
@@ -1015,9 +1017,10 @@ mod tests {
         assert_eq!(scalar.route_default, crate::policy::RouteDefault::Tokenize);
         assert!(parse_policy_bytes(path,
             b"version=2\ndefault='tokenize'\n[[json_path]]\ntable='public.t'\nname='data'\npath='$.a'\nmasked=true", &service).is_ok());
-        let errors = parse_policy_bytes(path,
-            b"version=2\ndefault='tokenize'\n[[link]]\nfields=['public.t.a','public.t.b']", &service).unwrap_err();
-        assert!(errors[0].message.contains("link"));
+        // Stack 4b serves [[link]] rules.
+        let linked = parse_policy_bytes(path,
+            b"version=2\ndefault='tokenize'\n[[link]]\nfields=['public.t.a','public.t.b']", &service).unwrap();
+        assert_eq!(linked.links.len(), 1);
     }
 
 }

@@ -5,6 +5,7 @@ use crate::{
 };
 fn fixture() -> (Snapshot, Policy) {
     let mut p = Policy {
+        retired_domains: Default::default(),
         json_filters: Default::default(),
         columns: BTreeMap::new(),
         domains: BTreeMap::new(),

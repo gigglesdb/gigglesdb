@@ -50,3 +50,6 @@ mod route_default_live;
 
 #[path = "json_paths_live.rs"]
 mod json_paths_live;
+
+#[path = "shared_domains_live.rs"]
+mod shared_domains_live;

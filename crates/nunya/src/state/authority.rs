@@ -270,6 +270,10 @@ impl Authority {
                                 return Err(bad());
                             }
                         }
+                        Table::MembershipResets => {
+                            let change: crate::policy::bindings::MembershipChange = decode(&bytes).map_err(|_| bad())?;
+                            if key != change.route.as_str().as_bytes() || !change.requires_reset() { return Err(bad()); }
+                        }
                         Table::RetiredDomains => {
                             std::str::from_utf8(&bytes)
                                 .ok().and_then(RouteId::new).ok_or_else(bad)?;
@@ -1051,6 +1055,28 @@ impl Authority {
         self.notify(&rows);
         Ok(())
     }
+    /// Deny a route's active sessions, persist their endings, then notify observers.
+    pub fn end_route_sessions(&self, route: &RouteId, reason: EndReason) -> Result<usize, AuthorityError> {
+        let writer = self.writer.lock().unwrap();
+        let rows = {
+            let mut v = self.view.write().unwrap();
+            let ids: Vec<_> = v.sessions.values()
+                .filter(|s| &s.route == route && s.state == SessionState::Active)
+                .map(|s| s.id).collect();
+            let count = ids.len();
+            for id in ids { end(&mut v, id, reason, self.store.now_ms()); }
+            // Include pending endings from an earlier failed persistence attempt.
+            let rows: Vec<_> = v.pending.iter().filter_map(|id| {
+                let s = &v.sessions[id];
+                (&s.route == route).then(|| s.clone())
+            }).collect();
+            (rows, count)
+        };
+        self.persist_ended(&rows.0)?;
+        drop(writer);
+        self.notify(&rows.0);
+        Ok(rows.1)
+    }
     fn persist_ended(&self, rows: &[AccessSession]) -> Result<(), AuthorityError> {
         if rows.is_empty() {
             return Ok(());
@@ -1417,6 +1443,50 @@ mod tests {
             .unwrap()
         }
     }
+    #[test]
+    fn route_reset_is_scoped_persisted_and_notified() {
+        let f = Fixture::new();
+        let p = f.principal("reset", Mode::ReadOnly);
+        let other = RouteId::new("other").unwrap();
+        f.a.set_grants(p.id, vec![(route(), Mode::ReadOnly), (other.clone(), Mode::ReadOnly)]).unwrap();
+        let first = f.acquire(p.id, "first");
+        let second = f.acquire(p.id, "second");
+        let ended = f.acquire(p.id, "ended");
+        f.a.revoke(ended.id, EndReason::Requested).unwrap();
+        let mut req = request("other"); req.route = other;
+        let untouched = f.a.acquire_session(p.id, req).unwrap();
+        f.hook.0.lock().unwrap().clear();
+        assert_eq!(f.a.end_route_sessions(&route(), EndReason::PolicyReset).unwrap(), 2);
+        for id in [first.id, second.id] {
+            assert_eq!(f.stored(id).revoke_reason, Some(EndReason::PolicyReset));
+            assert_eq!(f.stored(id).state, SessionState::Revoked);
+            assert!(f.a.admit(id, Operation::Read).is_err());
+        }
+        assert_eq!(f.stored(ended.id).revoke_reason, Some(EndReason::Requested));
+        assert!(f.a.admit(untouched.id, Operation::Read).is_ok());
+        let notifications = f.hook.0.lock().unwrap();
+        assert_eq!(notifications.len(), 2);
+        assert!(notifications.iter().all(|(_, principal, reason)| *principal == p.id && *reason == EndReason::PolicyReset));
+        drop(notifications);
+        assert_eq!(f.a.end_route_sessions(&route(), EndReason::PolicyReset).unwrap(), 0);
+        assert_eq!(f.hook.0.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn route_reset_denies_before_failed_persistence_and_retries_notification() {
+        let f = Fixture::new();
+        let p = f.principal("reset", Mode::ReadOnly);
+        let session = f.acquire(p.id, "first");
+        f.store.fail_commits(true);
+        assert!(f.a.end_route_sessions(&route(), EndReason::PolicyReset).is_err());
+        assert!(f.a.admit(session.id, Operation::Read).is_err());
+        assert!(f.hook.0.lock().unwrap().is_empty());
+        f.store.fail_commits(false);
+        f.a.end_route_sessions(&route(), EndReason::PolicyReset).unwrap();
+        assert_eq!(f.stored(session.id).revoke_reason, Some(EndReason::PolicyReset));
+        assert_eq!(f.hook.0.lock().unwrap().len(), 1);
+    }
+
     // Inject actions during commit and failures in the following pending drain.
     struct CommitStore {
         inner: Arc<RedbStore>,

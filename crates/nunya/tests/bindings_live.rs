@@ -42,6 +42,7 @@ fn document() -> PolicyDocument {
         file_readlog: None,
         file_snapshot_max_age_ms: None,
         policy: Policy {
+            retired_domains: Default::default(),
             json_filters: Default::default(),
             columns: BTreeMap::new(),
             domains: BTreeMap::new(),
