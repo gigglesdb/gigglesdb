@@ -52,6 +52,98 @@ fn create(catalog: &Catalog, tx: &mut Transaction, name: &str) {
         .unwrap();
 }
 
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn gateway_token_reads_leave_the_catalog_cache_unlocked() {
+    use crate::storage::cluster::{
+        db::{attach, local::LocalCluster},
+        txn::ClusterConfig,
+    };
+    use crate::storage::{Backend, Limits};
+    use std::{sync::mpsc, time::Duration};
+
+    let cluster = LocalCluster::new(&[]);
+    let gateway = attach(
+        cluster,
+        ClusterConfig::default(),
+        None,
+        [9; 16],
+        Limits::default(),
+    )
+    .unwrap();
+    let Backend::V2(db) = &gateway.admin.inner.backend else {
+        unreachable!()
+    };
+    let catalog = db.catalog();
+    for acquisition in 0..5 {
+        let (entered, waiting) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let resume = Mutex::new(resume);
+        *catalog.token_read_hook.lock().unwrap() = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            resume.lock().unwrap().recv().unwrap();
+        }));
+        thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let mut tx = db.begin(Isolation::ReadCommitted);
+                match acquisition {
+                    0 => {
+                        catalog.snapshot(&mut tx).unwrap();
+                    }
+                    1 => {
+                        catalog.metadata_snapshot(&tx).unwrap();
+                    }
+                    2 => {
+                        catalog.binding_snapshot(&tx).unwrap();
+                    }
+                    3 => {
+                        catalog.refresh_latest().unwrap();
+                    }
+                    _ => assert!(matches!(
+                        catalog.resolve(&mut tx, "absent", LockMode::AccessShare, None, &|| false),
+                        Err(CatalogError::Core(CoreError::Sql(SqlError::UnknownTable)))
+                    )),
+                }
+            });
+            let reached = waiting.recv_timeout(Duration::from_secs(10));
+            let unlocked = catalog.cache.try_lock().is_ok();
+            // Always release the worker before asserting, including on failure.
+            release.send(()).ok();
+            reader.join().unwrap();
+            assert!(
+                reached.is_ok(),
+                "acquisition {acquisition} never reached its token read"
+            );
+            assert!(
+                unlocked,
+                "acquisition {acquisition} held the cache during its token read"
+            );
+        });
+        *catalog.token_read_hook.lock().unwrap() = None;
+    }
+}
+
+#[test]
+fn token_recheck_uses_the_version_published_during_the_unlocked_read() {
+    let (_, _, catalog) = setup();
+    let mut cache = catalog.cache.lock().unwrap();
+    let old = Ts(10);
+    let published = Ts(20);
+    let statement = Ts(30);
+    cache.publish(old, CatalogView::default());
+    cache.tokens.insert(old, (1, old));
+    // Another statement publishes between the cheap check and the locked recheck.
+    cache.publish(published, CatalogView::default());
+    cache.tokens.insert(published, (2, published));
+    catalog
+        .refresh_locked(&mut cache, statement, Some(2))
+        .unwrap();
+    assert_eq!(cache.tokens[&published], (2, statement));
+    assert_eq!(cache.tokens[&old], (1, old));
+    catalog.refresh_locked(&mut cache, Ts(25), Some(2)).unwrap();
+    assert_eq!(cache.tokens[&published], (2, statement));
+}
+
 #[test]
 fn immutable_image_is_reused_across_data_timestamps_at_ten_and_fifty_tables() {
     for tables in [10, 50] {
