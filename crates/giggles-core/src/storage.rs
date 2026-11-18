@@ -729,7 +729,7 @@ struct Inner {
     protected_hook: Mutex<Option<crate::task::commit::ProtectedHook>>,
     decision_hook: Mutex<Option<DecisionHook>>,
     sequences: Mutex<sequences::Live>,
-    native_once_owners: Mutex<BTreeMap<native_once::NativeOnceKey, native_once::InFlight>>,
+    native_once_owners: crate::cancellation::WaitMutex<BTreeMap<native_once::NativeOnceKey, native_once::InFlight>>,
 }
 enum GuardedPersistError {
     Core(CoreError),
@@ -1244,7 +1244,7 @@ impl Admin {
                 protected_hook: Mutex::new(None),
                 decision_hook: Mutex::new(None),
                 sequences: Mutex::new(sequences::Live::default()),
-                native_once_owners: Mutex::new(BTreeMap::new()),
+                native_once_owners: crate::cancellation::WaitMutex::new(BTreeMap::new()),
             }),
         })
     }

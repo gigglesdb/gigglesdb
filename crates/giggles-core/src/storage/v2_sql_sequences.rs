@@ -78,44 +78,149 @@ pub(super) fn callback(
             }
             return Ok(relational::Value::Int(result));
         }
-        // Release the directory before waiting on an individual sequence or I/O.
-        let slot = if committed {
-            let mut live = db.sql_counters.lock_cancellable()?;
-            Some(live.entry(id).or_default().clone())
-        } else {
-            None
-        };
-        let mut live = slot
-            .as_ref()
-            .map(|slot| slot.counter.lock_cancellable())
-            .transpose()?;
+        if committed {
+            let slot = {
+                let mut live = db.sql_counters.lock_cancellable()?;
+                live.entry(id).or_default().clone()
+            };
+            let result = committed_value(&db, &slot, id, def, operation, value, called)?;
+            if operation == "nextval" || called {
+                values
+                    .lock()
+                    .map_err(|_| CoreError::Fenced)?
+                    .insert((id, def.incarnation), result);
+            }
+            return Ok(relational::Value::Int(result));
+        }
         let mut pending = if committed {
             None
         } else {
             Some(pending.lock().map_err(|_| CoreError::Fenced)?)
         };
-        let key = engine::catalog_codec::counter_key(id, def.incarnation);
-        let prior = if committed {
-            match live
-                .as_ref()
-                .expect("committed slot")
-                .as_ref()
-                .filter(|counter| counter.incarnation == def.incarnation)
-            {
-                Some(counter) => Some(counter.clone()),
-                None => db
-                    .kv
-                    .get(Keyspace::Seq, &key)?
-                    .map(|bytes| engine::catalog_codec::decode_counter(&key, &bytes, def))
-                    .transpose()?,
+        let prior = pending
+            .as_ref()
+            .expect("private sequence")
+            .get(&id)
+            .cloned();
+        let (result, counter) = match operation {
+            "nextval" => sequences::next_on(def, prior),
+            "setval" => sequences::set_on(
+                def,
+                prior,
+                value.ok_or(CoreError::Sql(SqlError::Parameters))?,
+                called,
+            ),
+            _ => Err(SqlError::Unsupported),
+        }
+        .map_err(CoreError::Sql)?;
+        pending
+            .as_mut()
+            .expect("private sequence")
+            .insert(id, counter);
+        if operation == "nextval" || called {
+            values
+                .lock()
+                .map_err(|_| CoreError::Fenced)?
+                .insert((id, def.incarnation), result);
+        }
+        Ok(relational::Value::Int(result))
+    })
+}
+
+type SlotGuard<'a> = crate::cancellation::WaitGuard<'a, v2::SeqSlotState>;
+
+/// One receiver owns the oldest ack; all other callers release the slot while waiting.
+fn receive_one<'a>(
+    slot: &'a v2::SeqSlot,
+    mut guard: SlotGuard<'a>,
+) -> Result<SlotGuard<'a>, CoreError> {
+    if guard.receiving {
+        return guard.wait();
+    }
+    let Some(write) = guard.inflight.pop_front() else {
+        return Ok(guard);
+    };
+    guard.receiving = true;
+    drop(guard);
+    let outcome = loop {
+        if let Err(error) = crate::cancellation::check() {
+            // Cancellation must not lose the oldest ack or leave receiving set.
+            let mut guard = slot.counter.lock().map_err(|_| CoreError::Fenced)?;
+            guard.inflight.push_front(write);
+            guard.receiving = false;
+            return Err(error);
+        }
+        match write
+            .ack
+            .0
+            .recv_timeout(std::time::Duration::from_millis(5))
+        {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(engine::txn::TxnError::Fenced);
             }
-        } else {
-            pending
-                .as_ref()
-                .expect("private sequence")
-                .get(&id)
-                .cloned()
-        };
+        }
+    };
+    let mut guard = slot.counter.lock().map_err(|_| CoreError::Fenced)?;
+    guard.receiving = false;
+    if outcome.is_ok() {
+        guard.acknowledge(write.incarnation, write.hw);
+    }
+    outcome?;
+    Ok(guard)
+}
+
+fn drain_ready(guard: &mut v2::SeqSlotState) {
+    if guard.receiving {
+        return;
+    }
+    while let Some(write) = guard.inflight.front() {
+        match write.ack.0.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            result => {
+                let write = guard.inflight.pop_front().unwrap();
+                if matches!(result, Ok(Ok(()))) {
+                    guard.acknowledge(write.incarnation, write.hw);
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn committed_value(
+    db: &v2::V2Db,
+    slot: &v2::SeqSlot,
+    id: u64,
+    def: &relational::catalog_ext::SequenceDef,
+    operation: &str,
+    value: Option<i64>,
+    called: bool,
+) -> Result<i64, CoreError> {
+    let key = engine::catalog_codec::counter_key(id, def.incarnation);
+    let mut guard = slot.counter.lock_cancellable()?;
+    // Re-evaluate after waiting: another allocator may have advanced or wrapped.
+    let (mut counter, result, synchronous, prior_hw) = loop {
+        drain_ready(&mut guard);
+        let in_memory = guard
+            .counter
+            .as_ref()
+            .is_some_and(|c| c.incarnation == def.incarnation);
+        if !in_memory {
+            if guard.receiving || !guard.inflight.is_empty() {
+                guard = receive_one(slot, guard)?;
+                continue;
+            }
+            if let Some(bytes) = db.kv.get(Keyspace::Seq, &key)? {
+                guard.install(engine::catalog_codec::decode_counter(&key, &bytes, def)?);
+            }
+        }
+        let prior = guard
+            .counter
+            .as_ref()
+            .filter(|c| c.incarnation == def.incarnation)
+            .cloned();
         let (result, counter) = match operation {
             "nextval" => sequences::next_on(def, prior.clone()),
             "setval" => sequences::set_on(
@@ -127,42 +232,125 @@ pub(super) fn callback(
             _ => Err(SqlError::Unsupported),
         }
         .map_err(CoreError::Sql)?;
-        if committed {
-            // next() already computes the bounded 32-step recovery lookahead.
-            // The unchanged codec writes log_hw as the recovered last_value.
-            // A wrap must be written even when its highwater equals the old one.
-            let reservation_changed = prior.as_ref().is_none_or(|old| {
-                !old.is_called
-                    || old.log_hw != counter.log_hw
-                    || (def.cycle
-                        && if def.increment > 0 {
-                            counter.last_value < old.last_value
-                        } else {
-                            counter.last_value > old.last_value
-                        })
-            });
-            if operation == "setval" || reservation_changed {
-                db.sequencer.write_counter(
-                    key,
-                    engine::catalog_codec::encode_counter(&counter, def)?,
-                    256,
-                )?;
+        let wrap = prior.as_ref().is_some_and(|old| {
+            def.cycle
+                && if def.increment > 0 {
+                    counter.last_value < old.last_value
+                } else {
+                    counter.last_value > old.last_value
+                }
+        });
+        let synchronous = operation == "setval"
+            || !in_memory
+            || wrap
+            || prior.as_ref().is_none_or(|c| !c.is_called);
+        if synchronous
+            && (guard.receiving || !guard.inflight.is_empty() || guard.waiting_returns != 0)
+        {
+            guard = if guard.receiving || !guard.inflight.is_empty() {
+                receive_one(slot, guard)?
+            } else {
+                guard.wait()?
+            };
+            continue;
+        }
+        break (counter, result, synchronous, prior.map(|c| c.log_hw));
+    };
+    if synchronous {
+        db.sequencer.write_counter(
+            key,
+            engine::catalog_codec::encode_counter(&counter, def)?,
+            256,
+        )?;
+        guard.install(counter);
+        return Ok(result);
+    }
+    let remaining = (i128::from(counter.log_hw) - i128::from(result)) / i128::from(def.increment);
+    if remaining <= 24 {
+        let mut high = result;
+        for _ in 0..sequences::SEQ_LOG_VALS {
+            match high
+                .checked_add(def.increment)
+                .filter(|v| *v >= def.min && *v <= def.max)
+            {
+                Some(value) => high = value,
+                None => break,
             }
-            **live.as_mut().expect("committed slot") = Some(counter);
+        }
+        counter.log_hw = high;
+    }
+    if prior_hw != Some(counter.log_hw) {
+        let ack = db.sequencer.send_counter(
+            key.clone(),
+            engine::catalog_codec::encode_counter(&counter, def)?,
+            256,
+        )?;
+        guard.inflight.push_back(v2::InFlight {
+            incarnation: def.incarnation,
+            hw: counter.log_hw,
+            ack,
+        });
+    }
+    guard.counter = Some(counter);
+    if guard.durable_hw.is_some_and(|hw| {
+        if def.increment > 0 {
+            hw >= result
         } else {
-            pending
-                .as_mut()
-                .expect("private sequence")
-                .insert(id, counter);
+            hw <= result
         }
-        if operation == "nextval" || called {
-            values
-                .lock()
-                .map_err(|_| CoreError::Fenced)?
-                .insert((id, def.incarnation), result);
+    }) {
+        return Ok(result);
+    }
+    guard.waiting_returns += 1;
+    let outcome = await_coverage(db, slot, guard, &key, def, result);
+    // Even an error or cancellation releases the backwards-move barrier.
+    let mut guard = slot.counter.lock().map_err(|_| CoreError::Fenced)?;
+    guard.waiting_returns -= 1;
+    outcome
+}
+
+fn await_coverage<'a>(
+    db: &v2::V2Db,
+    slot: &'a v2::SeqSlot,
+    mut guard: SlotGuard<'a>,
+    key: &[u8],
+    def: &relational::catalog_ext::SequenceDef,
+    result: i64,
+) -> Result<i64, CoreError> {
+    loop {
+        drain_ready(&mut guard);
+        if !guard
+            .counter
+            .as_ref()
+            .is_some_and(|c| c.incarnation == def.incarnation)
+        {
+            return Err(CoreError::Sql(SqlError::UnknownTable));
         }
-        Ok(relational::Value::Int(result))
-    })
+        if guard.durable_hw.is_some_and(|hw| {
+            if def.increment > 0 {
+                hw >= result
+            } else {
+                hw <= result
+            }
+        }) {
+            return Ok(result);
+        }
+        if !guard.receiving && guard.inflight.is_empty() {
+            let counter = guard.counter.as_ref().ok_or(CoreError::Fenced)?;
+            let hw = counter.log_hw;
+            let ack = db.sequencer.send_counter(
+                key.to_vec(),
+                engine::catalog_codec::encode_counter(counter, def)?,
+                256,
+            )?;
+            guard.inflight.push_back(v2::InFlight {
+                incarnation: def.incarnation,
+                hw,
+                ack,
+            });
+        }
+        guard = receive_one(slot, guard)?;
+    }
 }
 
 pub(in crate::storage) fn stage_pending(

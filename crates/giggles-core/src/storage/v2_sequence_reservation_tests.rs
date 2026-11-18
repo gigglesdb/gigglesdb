@@ -291,11 +291,12 @@ fn committed_lookahead_writes_only_on_refill_setval_and_cycle_wrap() {
     let tiny = key("tiny");
     assert_eq!(scalar(&mut s, "SELECT nextval('cached')"), 1);
     let first = db.kv.get(Keyspace::Seq, &cached).unwrap();
-    for expected in 2..=33 {
+    for expected in 2..=8 {
         assert_eq!(scalar(&mut s, "SELECT nextval('cached')"), expected);
     }
     assert_eq!(db.kv.get(Keyspace::Seq, &cached).unwrap(), first);
-    assert_eq!(scalar(&mut s, "SELECT nextval('cached')"), 34);
+    assert_eq!(scalar(&mut s, "SELECT nextval('cached')"), 9);
+    drain_sequence(db, "cached");
     assert_ne!(db.kv.get(Keyspace::Seq, &cached).unwrap(), first);
     assert_eq!(scalar(&mut s, "SELECT setval('cached',500,false)"), 500);
     let set = db.kv.get(Keyspace::Seq, &cached).unwrap();
@@ -587,8 +588,9 @@ fn durable_counter_bytes_follow_original_lookahead() {
     let key = engine::catalog_codec::counter_key(id, def.incarnation);
     for n in 1..=70 {
         assert_eq!(scalar(&mut s, "SELECT nextval('durable_bytes')"), n);
-        // Reservations are written on calls 1, 34, 67, with 32 steps ahead.
-        let refill = 1 + ((n - 1) / 33) * 33;
+        // Reservations are written on calls 1, 9, 17, ... with 32 steps ahead.
+        drain_sequence(db, "durable_bytes");
+        let refill = 1 + ((n - 1) / 8) * 8;
         let expected = sequences::SeqCounter {
             incarnation: def.incarnation,
             last_value: refill,
@@ -648,4 +650,227 @@ fn blocked_sequence_does_not_block_another() {
     assert_eq!(a.join().unwrap(), 1);
     b.join().unwrap();
     assert_eq!(result.unwrap(), 1);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+fn drain_sequence(db: &v2::V2Db, name: &str) {
+    let view = db.catalog().current_local_view().unwrap();
+    let id = *view
+        .sequences
+        .iter()
+        .find(|(_, d)| d.name == name)
+        .unwrap()
+        .0;
+    let slot = db.sql_counters.lock().unwrap().get(&id).unwrap().clone();
+    let mut guard = slot.counter.lock_cancellable().unwrap();
+    while guard.receiving || !guard.inflight.is_empty() {
+        guard = receive_one(&slot, guard).unwrap();
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn pipelined_acks_release_slot_and_cover_returns() {
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE SEQUENCE pipeline");
+    assert_eq!(scalar(&mut s, "SELECT nextval('pipeline')"), 1);
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
+        unreachable!()
+    };
+    db.sequencer.gate_counter_acks(true);
+    let (tx, rx) = mpsc::channel();
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let admin = f.admin.as_ref().unwrap().clone();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let mut s = admin.sql_session();
+                for _ in 0..4 {
+                    tx.send(scalar(&mut s, "SELECT nextval('pipeline')"))
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    let mut values = BTreeSet::from([1]);
+    for _ in 0..32 {
+        assert!(values.insert(rx.recv_timeout(Duration::from_secs(10)).unwrap()));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(values.iter().next_back(), Some(&33));
+    let admin = f.admin.as_ref().unwrap().clone();
+    let (tx, done) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        tx.send(scalar(
+            &mut admin.sql_session(),
+            "SELECT nextval('pipeline')",
+        ))
+        .unwrap()
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while db.sequencer.held_counter_acks() == 0 {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    let slot = db
+        .sql_counters
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    loop {
+        let cancel = crate::cancellation::Cancellation::new(Some(
+            Instant::now() + Duration::from_millis(100),
+        ));
+        let receiving = cancel.scope(|| slot.counter.lock_cancellable().unwrap().receiving);
+        if receiving {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    assert!(done.recv_timeout(Duration::from_millis(200)).is_err());
+    db.sequencer.gate_counter_acks(false);
+    assert!(values.insert(done.recv_timeout(Duration::from_secs(10)).unwrap()));
+    waiter.join().unwrap();
+    assert_eq!(values, (1..=34).collect());
+}
+
+#[cfg(feature = "engine-rocksdb")]
+fn stress_reservations(iterations: usize) {
+    let f = Fixture::new(Engine::V2);
+    run(&mut f.session(), "CREATE SEQUENCE stress_pipeline");
+    for _ in 0..iterations {
+        let workers: Vec<_> = (0..32)
+            .map(|_| {
+                let admin = f.admin.as_ref().unwrap().clone();
+                thread::spawn(move || {
+                    let mut s = admin.sql_session();
+                    (0..8)
+                        .map(|_| scalar(&mut s, "SELECT nextval('stress_pipeline')"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let values: Vec<_> = workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect();
+        let unique: BTreeSet<_> = values.iter().copied().collect();
+        assert_eq!(unique.len(), values.len());
+        assert!(*unique.last().unwrap() - *unique.first().unwrap() + 1 - values.len() as i64 <= 32);
+    }
+}
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn pipelined_stress() {
+    stress_reservations(1);
+}
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+#[ignore]
+fn pipelined_stress_1000() {
+    stress_reservations(1000);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn pipeline_crash_worker() {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("PIPELINE_CRASH_PATH") else {
+        return;
+    };
+    let count: i64 = std::env::var("PIPELINE_CRASH_N").unwrap().parse().unwrap();
+    let admin = Admin::open(PathBuf::from(path), Limits::default()).unwrap();
+    let mut s = admin.sql_session();
+    for _ in 0..count {
+        println!(
+            "RETURNED={}",
+            scalar(&mut s, "SELECT nextval('pipeline_crash')")
+        );
+        std::io::stdout().flush().unwrap();
+    }
+    crate::storage::crash_now();
+}
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn pipeline_crash_skips_at_most_32() {
+    for count in [50, 77] {
+        let mut f = Fixture::new(Engine::V2);
+        run(&mut f.session(), "CREATE SEQUENCE pipeline_crash");
+        f.admin.take();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::v2_sql::sql_sequences::reservation_tests::pipeline_crash_worker",
+                "--nocapture",
+            ])
+            .env("PIPELINE_CRASH_PATH", &f.path)
+            .env("PIPELINE_CRASH_N", count.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(86));
+        let printed: Vec<i64> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("RETURNED="))
+            .map(|n| n.parse().unwrap())
+            .collect();
+        assert_eq!(printed.len(), count);
+        let max = *printed.iter().max().unwrap();
+        f.reopen();
+        let next = scalar(&mut f.session(), "SELECT nextval('pipeline_crash')");
+        assert!(next > max && next - max <= 33, "{max} -> {next}");
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn cancelled_receiver_restores_oldest_ack() {
+    use std::time::{Duration, Instant};
+    let f = Fixture::new(Engine::V2);
+    let mut s = f.session();
+    run(&mut s, "CREATE SEQUENCE cancelled_ack");
+    assert_eq!(scalar(&mut s, "SELECT nextval('cancelled_ack')"), 1);
+    let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
+        unreachable!()
+    };
+    db.sequencer.gate_counter_acks(true);
+    for expected in 2..=33 {
+        assert_eq!(scalar(&mut s, "SELECT nextval('cancelled_ack')"), expected);
+    }
+    let c =
+        crate::cancellation::Cancellation::new(Some(Instant::now() + Duration::from_millis(100)));
+    assert_eq!(
+        c.scope(|| s.execute_at("SELECT nextval('cancelled_ack')", &[], None, &clock())),
+        Err(CoreError::Cancelled)
+    );
+    let slot = db
+        .sql_counters
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    {
+        let guard = slot.counter.lock().unwrap();
+        assert!(!guard.receiving);
+        assert_eq!(guard.waiting_returns, 0);
+        assert_eq!(guard.inflight.front().unwrap().hw, 41);
+    }
+    db.sequencer.gate_counter_acks(false);
+    assert_eq!(scalar(&mut s, "SELECT nextval('cancelled_ack')"), 35);
+    // A backwards move must drain all reservations and leave no stale coverage.
+    assert_eq!(scalar(&mut s, "SELECT setval('cancelled_ack',5,false)"), 5);
+    assert_eq!(scalar(&mut s, "SELECT nextval('cancelled_ack')"), 5);
 }

@@ -398,7 +398,7 @@ impl Admin {
             if let Some(record) = retained(state, &key)? {
                 return replay(&record, submitted_fingerprint).map(NativeOnceAdmission::Replay);
             }
-            let mut owners = crate::cancellation::lock(&self.inner.native_once_owners)?;
+            let mut owners = self.inner.native_once_owners.lock_cancellable()?;
             if let Some(owner) = owners.get(&key) {
                 return Err(if owner.submitted == submitted_fingerprint {
                     NativeOnceError::InProgress
@@ -445,7 +445,7 @@ impl Admin {
                 });
             }
             Ok(
-                if crate::cancellation::lock(&self.inner.native_once_owners)?.contains_key(key) {
+                if self.inner.native_once_owners.lock_cancellable()?.contains_key(key) {
                     NativeOnceLookup::InProgress
                 } else {
                     NativeOnceLookup::Absent
@@ -519,7 +519,7 @@ impl SqlSession {
             if let Some(record) = retained(&LedgerView::borrow(state), &owner.key)? {
                 return replay(&record, owner.submitted).map(|r| (r, true));
             }
-            if !crate::cancellation::lock(&inner.native_once_owners)?
+            if !inner.native_once_owners.lock_cancellable()?
                 .get(&owner.key)
                 .is_some_and(|entry| Arc::ptr_eq(&entry.token, &owner.token))
             {

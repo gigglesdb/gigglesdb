@@ -2,6 +2,8 @@
 use super::*;
 use relational::SqlError as E;
 use relational::catalog_ext::SequenceDef;
+pub(crate) const SEQ_LOG_VALS: usize = 32;
+
 type R<T> = Result<T, relational::SqlError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +128,7 @@ pub(crate) fn advance(c: &mut SeqCounter, def: &SequenceDef, stamp: u64) -> R<i6
         || (def.cycle && value == if def.increment > 0 { def.min } else { def.max })
     {
         let mut high = value;
-        for _ in 0..32 {
+        for _ in 0..SEQ_LOG_VALS {
             match high
                 .checked_add(def.increment)
                 .filter(|v| *v >= def.min && *v <= def.max)

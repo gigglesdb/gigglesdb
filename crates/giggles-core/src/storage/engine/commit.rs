@@ -306,7 +306,11 @@ static NEXT_SNAPSHOT_SHARD: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static SNAPSHOT_SHARD: usize = NEXT_SNAPSHOT_SHARD.fetch_add(1, Ordering::Relaxed) % SNAPSHOT_SHARDS;
 }
+#[cfg(test)]
+type HeldCounterReplies = Option<Vec<mpsc::Sender<Result<(), TxnError>>>>;
 struct Shared {
+    #[cfg(test)]
+    counter_gate: Mutex<HeldCounterReplies>,
     #[cfg(test)]
     max_group: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -427,6 +431,13 @@ impl FenceAccess {
         Ok(())
     }
 }
+pub(crate) struct CounterAck(pub(crate) mpsc::Receiver<Result<(), TxnError>>);
+impl CounterAck {
+    pub(crate) fn wait(self) -> Result<(), TxnError> {
+        self.0.recv().unwrap_or(Err(TxnError::Fenced))
+    }
+}
+
 pub(crate) struct Sequencer {
     kv: Arc<Kv>,
     config: SequencerConfig,
@@ -437,6 +448,19 @@ pub(crate) struct Sequencer {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 impl Sequencer {
+    #[cfg(test)]
+    pub(crate) fn gate_counter_acks(&self, armed: bool) {
+        let mut gate = self.shared.counter_gate.lock().unwrap();
+        if armed { assert!(gate.is_none()); *gate = Some(Vec::new()); }
+        else if let Some(replies) = gate.take() {
+            for reply in replies { let _ = reply.send(Ok(())); }
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn held_counter_acks(&self) -> usize {
+        self.shared.counter_gate.lock().unwrap().as_ref().map_or(0, Vec::len)
+    }
+
     #[cfg(test)]
     pub(crate) fn max_group_size(&self) -> usize {
         self.shared.max_group.load(std::sync::atomic::Ordering::Relaxed)
@@ -484,6 +508,8 @@ impl Sequencer {
             None => Ts(0),
         };
         let shared = Arc::new(Shared {
+            #[cfg(test)]
+            counter_gate: Mutex::new(None),
             #[cfg(test)]
             max_group: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -624,6 +650,17 @@ impl Sequencer {
             .map_err(|_| TxnError::Fenced)?;
         Ok(receive)
     }
+    /// Queue a reservation without waiting for its durability acknowledgment.
+    pub(crate) fn send_counter(
+        &self, key: Vec<u8>, value: Vec<u8>, features_or: u64,
+    ) -> Result<CounterAck, TxnError> {
+        if !valid_counter_key(&key) { return Err(TxnError::Misuse); }
+        if self.kv.is_fenced() { return Err(TxnError::Fenced); }
+        let (reply, receive) = mpsc::channel();
+        self.sender.send(Message::Counter { key, value, features_or, reply })
+            .map_err(|_| TxnError::Fenced)?;
+        Ok(CounterAck(receive))
+    }
     /// A counter reservation is durable independently of any SQL transaction.
     pub(crate) fn write_counter(
         &self,
@@ -631,22 +668,7 @@ impl Sequencer {
         value: Vec<u8>,
         features_or: u64,
     ) -> Result<(), TxnError> {
-        if !valid_counter_key(&key) {
-            return Err(TxnError::Misuse);
-        }
-        if self.kv.is_fenced() {
-            return Err(TxnError::Fenced);
-        }
-        let (reply, receive) = mpsc::channel();
-        self.sender
-            .send(Message::Counter {
-                key,
-                value,
-                features_or,
-                reply,
-            })
-            .map_err(|_| TxnError::Fenced)?;
-        receive.recv().unwrap_or(Err(TxnError::Fenced))
+        self.send_counter(key, value, features_or)?.wait()
     }
 }
 fn load_features(kv: &dyn KvRead) -> Result<u64, TxnError> {
@@ -1293,7 +1315,14 @@ fn process_group(
     if !accepted.is_empty() {
         log.trim(Some(trim_bound));
     }
-    for reply in counters { let _ = reply.send(Ok(())); }
+    for reply in counters {
+        #[cfg(test)]
+        {
+            let mut gate = shared.counter_gate.lock().unwrap();
+            if let Some(replies) = gate.as_mut() { replies.push(reply); continue; }
+        }
+        let _ = reply.send(Ok(()));
+    }
     for (reply, ts) in accepted {
         let _ = reply.send(Ok(ts));
     }

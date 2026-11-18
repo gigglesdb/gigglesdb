@@ -15,7 +15,39 @@ pub(super) mod maintenance;
 /// A stable allocation identity: entries are never replaced while the DB is open.
 #[derive(Default)]
 pub(crate) struct SeqSlot {
-    pub(crate) counter: crate::cancellation::WaitMutex<Option<super::sequences::SeqCounter>>,
+    pub(crate) counter: crate::cancellation::WaitMutex<SeqSlotState>,
+}
+
+/// (a) A returned value is covered by an Ok durable ack for its incarnation.
+/// (b) Every sent highwater is at most 32 steps beyond an allocated value.
+/// (c) Sends occur under the slot lock in reservation order (sequencer FIFO).
+/// Setval and cycle wrap drain pending writes before moving backwards.
+/// Only matching-incarnation acks may advance durable_hw.
+#[derive(Default)]
+pub(crate) struct SeqSlotState {
+    pub(crate) counter: Option<super::sequences::SeqCounter>,
+    pub(crate) durable_hw: Option<i64>,
+    pub(crate) inflight: std::collections::VecDeque<InFlight>,
+    pub(crate) receiving: bool,
+    // Backwards moves also wait for callers using the drained coverage to finish.
+    pub(crate) waiting_returns: usize,
+}
+pub(crate) struct InFlight {
+    pub(crate) incarnation: u128,
+    pub(crate) hw: i64,
+    pub(crate) ack: engine::commit::CounterAck,
+}
+impl SeqSlotState {
+    pub(crate) fn install(&mut self, counter: super::sequences::SeqCounter) {
+        self.inflight.retain(|p| p.incarnation == counter.incarnation);
+        self.durable_hw = Some(counter.log_hw);
+        self.counter = Some(counter);
+    }
+    pub(crate) fn acknowledge(&mut self, incarnation: u128, hw: i64) {
+        if self.counter.as_ref().is_some_and(|c| c.incarnation == incarnation) {
+            self.durable_hw = Some(hw);
+        }
+    }
 }
 
 #[allow(dead_code)]

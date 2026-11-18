@@ -167,10 +167,29 @@ impl<T> std::ops::DerefMut for WaitGuard<'_, T> {
         self.guard.as_mut().expect("live guard")
     }
 }
+impl<'a, T> WaitGuard<'a, T> {
+    /// Atomically release the data lock and wait for another unlock (or a slice).
+    pub(crate) fn wait(mut self) -> Result<WaitGuard<'a, T>, CoreError> {
+        let mutex = self.mutex;
+        let aux = mutex.aux.lock().map_err(|_| CoreError::Fenced)?;
+        drop(self.guard.take());
+        mutex.cv.notify_all();
+        let slice = Cancellation::current().map_or(Duration::from_millis(5), |c| c.wait_slice());
+        let (aux, _) = mutex
+            .cv
+            .wait_timeout(aux, slice)
+            .map_err(|_| CoreError::Fenced)?;
+        drop(aux);
+        mutex.lock_cancellable()
+    }
+}
 impl<T> Drop for WaitGuard<'_, T> {
     fn drop(&mut self) {
         // Release data before taking aux: a waiter holds aux while trying inner.
-        drop(self.guard.take());
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        drop(guard);
         // Even a panicking callback must not prevent subsequent notifications.
         let _aux = self
             .mutex
@@ -214,6 +233,12 @@ impl<T> WaitMutex<T> {
         &self,
         mut waiting: impl FnMut(),
     ) -> Result<WaitGuard<'_, T>, CoreError> {
+        check()?;
+        match self.inner.try_lock() {
+            Ok(guard) => return Ok(self.guard(guard)),
+            Err(TryLockError::Poisoned(_)) => return Err(CoreError::Fenced),
+            Err(TryLockError::WouldBlock) => {}
+        }
         let mut notified = false;
         let mut aux = self.aux.lock().map_err(|_| CoreError::Fenced)?;
         loop {
@@ -242,6 +267,30 @@ impl<T> WaitMutex<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn guard_wait_has_no_lost_unlock() {
+        for _ in 0..100 {
+            let mutex = Arc::new(WaitMutex::new(false));
+            let mut guard = mutex.lock_cancellable().unwrap();
+            let other = mutex.clone();
+            let worker = std::thread::spawn(move || {
+                *other.lock_cancellable().unwrap() = true;
+            });
+            while !*guard {
+                guard = guard.wait().unwrap();
+            }
+            drop(guard);
+            worker.join().unwrap();
+        }
+    }
+    #[test]
+    fn guard_wait_is_cancellable() {
+        let mutex = WaitMutex::new(());
+        let guard = mutex.lock().unwrap();
+        let c = Cancellation::new(Some(Instant::now()));
+        c.scope(|| assert_eq!(guard.wait().map(|_| ()), Err(CoreError::Cancelled)));
+        assert!(mutex.lock_cancellable().is_ok());
+    }
     #[test]
     fn wait_mutex_wakes_on_unlock_and_notifies_once() {
         let mutex = Arc::new(WaitMutex::new(()));

@@ -45,7 +45,7 @@ impl SqlSession {
         if let Some(record) = retained(&view, &owner.key)? {
             return replay(&record, owner.submitted).map(|record| (record, true));
         }
-        if !crate::cancellation::lock(&inner.native_once_owners)?.get(&owner.key)
+        if !inner.native_once_owners.lock_cancellable()?.get(&owner.key)
             .is_some_and(|entry| Arc::ptr_eq(&entry.token, &owner.token)) {
             return Err(CoreError::Fenced.into());
         }
@@ -102,8 +102,8 @@ impl SqlSession {
         for (id, counter) in self.pending_sequences.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             let slot = live.entry(*id).or_default();
             let mut current = slot.counter.lock_cancellable()?;
-            if current.as_ref().is_none_or(|current| current.incarnation != counter.incarnation) {
-                *current = Some(counter.clone());
+            if current.counter.as_ref().is_none_or(|current| current.incarnation != counter.incarnation) {
+                current.install(counter.clone());
             }
         }
         drop(live);
