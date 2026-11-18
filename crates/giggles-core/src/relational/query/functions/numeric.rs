@@ -262,15 +262,39 @@ fn float_eval(name: &str, values: &[Value]) -> Option<R<Value>> {
         } else {
             Some(glibm()?)
         };
-        if (name == "sqrt" && x < 0.0)
-            || (matches!(name, "ln" | "log" | "log10") && x <= 0.0)
-            || (matches!(name, "asin" | "acos" | "atanh") && x.abs() > 1.0)
-            || (name == "acosh" && x < 1.0)
-            || (name == "power"
-                && ((x == 0.0 && y < 0.0) || (x < 0.0 && y.is_finite() && y != y.trunc())))
-            || (matches!(name, "sin" | "cos" | "tan" | "cot") && x.is_infinite())
-        {
-            return Err(SqlError::Type);
+        let domain_error = match name {
+            "sqrt" if x < 0.0 => Some((
+                SqlError::InvalidArgumentForPowerFunction,
+                "cannot take square root of a negative number",
+            )),
+            "ln" | "log" | "log10" if x <= 0.0 => Some((
+                SqlError::InvalidArgumentForLogarithm,
+                if x == 0.0 {
+                    "cannot take logarithm of zero"
+                } else {
+                    "cannot take logarithm of a negative number"
+                },
+            )),
+            "power" if x == 0.0 && y < 0.0 => Some((
+                SqlError::InvalidArgumentForPowerFunction,
+                "zero raised to a negative power is undefined",
+            )),
+            "power" if x < 0.0 && y.is_finite() && y != y.trunc() => Some((
+                SqlError::InvalidArgumentForPowerFunction,
+                "a negative number raised to a non-integer power yields a complex result",
+            )),
+            "asin" | "acos" | "atanh" if x.abs() > 1.0 => {
+                Some((SqlError::Overflow, "input is out of range"))
+            }
+            "acosh" if x < 1.0 => Some((SqlError::Overflow, "input is out of range")),
+            "sin" | "cos" | "tan" | "cot" if x.is_infinite() => {
+                Some((SqlError::Overflow, "input is out of range"))
+            }
+            _ => None,
+        };
+        if let Some((error, message)) = domain_error {
+            user_types::view_replace_error(message.into());
+            return Err(error);
         }
         let out = match name {
             "erf" => math.unwrap().erf(x),
@@ -316,16 +340,28 @@ fn float_eval(name: &str, values: &[Value]) -> Option<R<Value>> {
             "atanh" => math.unwrap().atanh(x),
             _ => return Err(SqlError::Unsupported),
         };
-        if out.is_infinite()
-            && x.is_finite()
-            && y.is_finite()
-            && !(name == "cot" && x == 0.0 || name == "atanh" && x.abs() == 1.0)
-            || out == 0.0
-                && (matches!(name, "sqrt" | "cbrt" | "radians") && x != 0.0
-                    || name == "exp" && x.is_finite()
-                    || name == "power" && x != 0.0 && x.is_finite() && y.is_finite())
-        {
-            return Err(SqlError::Overflow);
+        // float.c checks ranges per function: sinh/cosh permit overflow to
+        // infinity, cot permits any infinite result, and atanh permits poles.
+        let overflow = match name {
+            "sqrt" | "cbrt" | "ln" | "log" | "log10" | "radians" | "degrees" | "exp" => {
+                out.is_infinite() && !x.is_infinite()
+            }
+            "power" => out.is_infinite() && x.is_finite() && y.is_finite(),
+            "asin" | "acos" | "atan" | "atan2" | "sin" | "cos" | "tan" | "tanh" | "erf"
+            | "erfc" => out.is_infinite(),
+            _ => false,
+        };
+        let underflow = out == 0.0
+            && match name {
+                "sqrt" | "cbrt" | "radians" | "degrees" => x != 0.0,
+                "ln" | "log" | "log10" => x != 1.0,
+                "exp" => x.is_finite(),
+                "power" => x != 0.0 && x.is_finite() && y.is_finite(),
+                "cosh" => true,
+                _ => false,
+            };
+        if overflow || underflow {
+            return Err(float_range_error(underflow));
         }
         Ok(Value::Float8(Float8::from_bits(out.to_bits())))
     })())

@@ -88,6 +88,7 @@ pub(super) fn eval(name: &str, values: &[Value]) -> Option<R<Value>> {
             match name {
                 "asind" | "acosd" => {
                     if !(-1.0..=1.0).contains(&x) {
+                        user_types::view_replace_error("input is out of range".into());
                         return Err(SqlError::Overflow);
                     }
                     match (name, x >= 0.0) {
@@ -101,6 +102,7 @@ pub(super) fn eval(name: &str, values: &[Value]) -> Option<R<Value>> {
                 "atan2d" => (m.atan2(x, y) / m.atan(1.0)) * 45.0,
                 _ => {
                     if x.is_infinite() {
+                        user_types::view_replace_error("input is out of range".into());
                         return Err(SqlError::Overflow);
                     }
                     let mut a = x % 360.0;

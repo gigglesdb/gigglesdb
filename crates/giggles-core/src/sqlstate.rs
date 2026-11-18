@@ -35,6 +35,8 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::Transaction) => "25000",
         CoreError::Sql(S::Aborted) => "25P02",
         CoreError::Sql(S::Overflow) => "22003",
+        CoreError::Sql(S::InvalidArgumentForLogarithm) => "2201E",
+        CoreError::Sql(S::InvalidArgumentForPowerFunction) => "2201F",
         CoreError::Sql(S::StringDataRightTruncation) => "22001",
         CoreError::Sql(S::UndefinedFunction) => "42883",
         CoreError::Sql(S::InvalidParameterValue) => "22023",
@@ -94,8 +96,12 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::WriteFenced { .. } => "25006",
         CoreError::Storage(_) | CoreError::Fenced => "08007",
         CoreError::Corrupt(_) | CoreError::Exists => "XX000",
-        CoreError::TempFile { disk_full: true, .. } => "53100",
-        CoreError::TempFile { disk_full: false, .. } => "58030",
+        CoreError::TempFile {
+            disk_full: true, ..
+        } => "53100",
+        CoreError::TempFile {
+            disk_full: false, ..
+        } => "58030",
     }
 }
 
@@ -103,6 +109,20 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
 mod tests {
     use super::*;
     use crate::relational;
+
+    #[test]
+    fn transient_float_errors() {
+        use relational::SqlError as S;
+        for (error, state, code) in [
+            (S::InvalidArgumentForLogarithm, "2201E", 267),
+            (S::InvalidArgumentForPowerFunction, "2201F", 268),
+        ] {
+            assert!(bincode::serialize(&error).is_err());
+            let error = CoreError::Sql(error);
+            assert_eq!(sqlstate(&error), state);
+            assert_eq!(crate::local::failure(error).code, code);
+        }
+    }
 
     #[test]
     fn sqlstate_time_zone_displacement() {

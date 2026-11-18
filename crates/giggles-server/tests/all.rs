@@ -342,3 +342,6 @@ mod agent_credential_api;
 mod agent_credential_lifecycle;
 
 #[path = "replica_admin_identity.rs"] mod replica_admin_identity;
+
+#[path = "float_errors_network.rs"]
+mod float_errors_network;

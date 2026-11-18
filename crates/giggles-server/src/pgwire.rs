@@ -168,6 +168,9 @@ impl Diagnostic {
                     | giggles_core::relational::SqlError::Null
                     | giggles_core::relational::SqlError::Unsupported
                     | giggles_core::relational::SqlError::InvalidTableDefinition
+                    | giggles_core::relational::SqlError::Overflow
+                    | giggles_core::relational::SqlError::InvalidArgumentForLogarithm
+                    | giggles_core::relational::SqlError::InvalidArgumentForPowerFunction
             ))
         ) || matches!(
             &result,

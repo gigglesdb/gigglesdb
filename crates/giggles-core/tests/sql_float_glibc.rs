@@ -49,7 +49,10 @@ fn image_bits() {
         ("asinh('-100'::float8)", 0xc0153180a93d3c2a_u64),
         ("asinh('-27'::float8)", 0xc00fea242c2068a3_u64),
         ("asinh('-10'::float8)", 0xc007fc5c506d2bdb_u64),
-        ("asinh('-3.141592653589793'::float8)", 0xbffdcbf69f10006d_u64),
+        (
+            "asinh('-3.141592653589793'::float8)",
+            0xbffdcbf69f10006d_u64,
+        ),
         ("asinh('-2'::float8)", 0xbff719218313d087_u64),
         ("acosh('1'::float8)", 0x0000000000000000_u64),
         ("acosh('1.0000001'::float8)", 0x3f3d4effc065cae4_u64),
@@ -226,4 +229,327 @@ fn missing_library_child() {
         );
     }
     assert!(s.execute("SELECT sqrt(4::float8)", &[], None).is_ok());
+}
+
+#[test]
+fn postgres_float_error_diagnostics() {
+    let admin = Admin::create(fresh("float-diagnostics"), Limits::default()).unwrap();
+    let mut s = admin.sql_session();
+    s.execute(
+        "CREATE TABLE float_input (id bigint primary key)",
+        &[],
+        None,
+    )
+    .unwrap();
+    s.execute("INSERT INTO float_input VALUES (1)", &[], None)
+        .unwrap();
+    for (expr, code, message) in [
+        (
+            "gamma('0'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "gamma('-0'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "gamma('-1'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "gamma('-Infinity'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "gamma('1e308'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "gamma('5e-324'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "lgamma('0'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "lgamma('-0'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "lgamma('-1'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "lgamma('1e308'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "sqrt('-1'::float8)",
+            "2201F",
+            "cannot take square root of a negative number",
+        ),
+        (
+            "sqrt('-0.5'::float8)",
+            "2201F",
+            "cannot take square root of a negative number",
+        ),
+        (
+            "sqrt('-Infinity'::float8)",
+            "2201F",
+            "cannot take square root of a negative number",
+        ),
+        (
+            "exp('1e308'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        ("ln('0'::float8)", "2201E", "cannot take logarithm of zero"),
+        ("ln('-0'::float8)", "2201E", "cannot take logarithm of zero"),
+        (
+            "ln('-1'::float8)",
+            "2201E",
+            "cannot take logarithm of a negative number",
+        ),
+        (
+            "ln('-0.5'::float8)",
+            "2201E",
+            "cannot take logarithm of a negative number",
+        ),
+        (
+            "ln('-Infinity'::float8)",
+            "2201E",
+            "cannot take logarithm of a negative number",
+        ),
+        ("log('0'::float8)", "2201E", "cannot take logarithm of zero"),
+        (
+            "log('-0'::float8)",
+            "2201E",
+            "cannot take logarithm of zero",
+        ),
+        (
+            "log('-1'::float8)",
+            "2201E",
+            "cannot take logarithm of a negative number",
+        ),
+        (
+            "log('-0.5'::float8)",
+            "2201E",
+            "cannot take logarithm of a negative number",
+        ),
+        (
+            "log('-Infinity'::float8)",
+            "2201E",
+            "cannot take logarithm of a negative number",
+        ),
+        (
+            "log10('0'::float8)",
+            "2201E",
+            "cannot take logarithm of zero",
+        ),
+        (
+            "log10('-0'::float8)",
+            "2201E",
+            "cannot take logarithm of zero",
+        ),
+        (
+            "log10('-1'::float8)",
+            "2201E",
+            "cannot take logarithm of a negative number",
+        ),
+        (
+            "log10('-0.5'::float8)",
+            "2201E",
+            "cannot take logarithm of a negative number",
+        ),
+        (
+            "log10('-Infinity'::float8)",
+            "2201E",
+            "cannot take logarithm of a negative number",
+        ),
+        (
+            "radians('5e-324'::float8)",
+            "22003",
+            "value out of range: underflow",
+        ),
+        (
+            "degrees('1e308'::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        ("sin('Infinity'::float8)", "22003", "input is out of range"),
+        ("sin('-Infinity'::float8)", "22003", "input is out of range"),
+        ("cos('Infinity'::float8)", "22003", "input is out of range"),
+        ("cos('-Infinity'::float8)", "22003", "input is out of range"),
+        ("tan('Infinity'::float8)", "22003", "input is out of range"),
+        ("tan('-Infinity'::float8)", "22003", "input is out of range"),
+        ("cot('Infinity'::float8)", "22003", "input is out of range"),
+        ("cot('-Infinity'::float8)", "22003", "input is out of range"),
+        ("asin('Infinity'::float8)", "22003", "input is out of range"),
+        (
+            "asin('-Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        ("asin('1e308'::float8)", "22003", "input is out of range"),
+        ("acos('Infinity'::float8)", "22003", "input is out of range"),
+        (
+            "acos('-Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        ("acos('1e308'::float8)", "22003", "input is out of range"),
+        ("acosh('0'::float8)", "22003", "input is out of range"),
+        ("acosh('-0'::float8)", "22003", "input is out of range"),
+        ("acosh('-1'::float8)", "22003", "input is out of range"),
+        ("acosh('0.5'::float8)", "22003", "input is out of range"),
+        ("acosh('-0.5'::float8)", "22003", "input is out of range"),
+        (
+            "acosh('-Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        ("acosh('5e-324'::float8)", "22003", "input is out of range"),
+        (
+            "atanh('Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        (
+            "atanh('-Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        ("atanh('1e308'::float8)", "22003", "input is out of range"),
+        ("sind('Infinity'::float8)", "22003", "input is out of range"),
+        (
+            "sind('-Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        ("cosd('Infinity'::float8)", "22003", "input is out of range"),
+        (
+            "cosd('-Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        ("tand('Infinity'::float8)", "22003", "input is out of range"),
+        (
+            "tand('-Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        ("cotd('Infinity'::float8)", "22003", "input is out of range"),
+        (
+            "cotd('-Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        (
+            "asind('Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        (
+            "asind('-Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        ("asind('1e308'::float8)", "22003", "input is out of range"),
+        (
+            "acosd('Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        (
+            "acosd('-Infinity'::float8)",
+            "22003",
+            "input is out of range",
+        ),
+        ("acosd('1e308'::float8)", "22003", "input is out of range"),
+        ("acos(2::float8)", "22003", "input is out of range"),
+        ("asind(2::float8)", "22003", "input is out of range"),
+        ("acosh(0.5::float8)", "22003", "input is out of range"),
+        (
+            "gamma(171.7::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "gamma(1e-320::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "gamma(-180.5::float8)",
+            "22003",
+            "value out of range: underflow",
+        ),
+        ("exp(710::float8)", "22003", "value out of range: overflow"),
+        (
+            "exp(-746::float8)",
+            "22003",
+            "value out of range: underflow",
+        ),
+        (
+            "power(0::float8,-1::float8)",
+            "2201F",
+            "zero raised to a negative power is undefined",
+        ),
+        (
+            "power(-1::float8,0.5::float8)",
+            "2201F",
+            "a negative number raised to a non-integer power yields a complex result",
+        ),
+        (
+            "power(-8::float8,1.0::float8/3)",
+            "2201F",
+            "a negative number raised to a non-integer power yields a complex result",
+        ),
+        (
+            "power(1e308::float8,2::float8)",
+            "22003",
+            "value out of range: overflow",
+        ),
+        (
+            "power(1e-308::float8,2::float8)",
+            "22003",
+            "value out of range: underflow",
+        ),
+        (
+            "power('5e-324'::float8,'1e308'::float8)",
+            "22003",
+            "value out of range: underflow",
+        ),
+    ] {
+        let error = s
+            .execute(&format!("SELECT {expr} FROM float_input"), &[], None)
+            .unwrap_err();
+        assert_eq!(giggles_core::sqlstate(&error), code, "{expr}");
+        assert_eq!(take_sql_error_message().as_deref(), Some(message), "{expr}");
+    }
+    for (expr, expected) in [
+        ("cosh(711::float8)", f64::INFINITY),
+        ("sinh(-711::float8)", f64::NEG_INFINITY),
+        ("cosh('1e308'::float8)", f64::INFINITY),
+        ("sinh('1e308'::float8)", f64::INFINITY),
+    ] {
+        let result = s
+            .execute(&format!("SELECT {expr} FROM float_input"), &[], None)
+            .unwrap();
+        let Value::Float8(value) = result.rows[0].values[0] else {
+            panic!("{expr}")
+        };
+        assert_eq!(value.value(), expected, "{expr}");
+    }
 }

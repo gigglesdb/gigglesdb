@@ -288,6 +288,12 @@ pub enum SqlError {
     CollationMismatch,
     #[serde(skip)]
     IndeterminateCollation,
+    /// 2201E invalid_argument_for_logarithm: transient, never persisted.
+    #[serde(skip)]
+    InvalidArgumentForLogarithm,
+    /// 2201F invalid_argument_for_power_function: transient, never persisted.
+    #[serde(skip)]
+    InvalidArgumentForPowerFunction,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
