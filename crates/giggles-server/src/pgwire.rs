@@ -974,6 +974,19 @@ struct Statement {
     query_id: Option<String>,
 }
 impl Statement {
+    fn authorize_description(&self, session: &mut Session) -> R<()> {
+        if let Plan::Sql(p) = &self.p
+            && session.task().is_none()
+        {
+            // Description caches follow the transaction snapshot; grants do not.
+            // Reuse Bind's current authority check without acquiring relation locks.
+            core(session.authority_scope(|session| {
+                session.authorize_prepared_bind(p).map(|_| ())
+            }))?;
+        }
+        Ok(())
+    }
+
     fn describe(&self, session: &mut Session) -> R<Description> {
         match &self.p {
             #[cfg(feature = "legacy-task")]
@@ -1872,6 +1885,7 @@ impl State {
                         if session.task().is_none() {
                             session.sql.begin_prepared_statement();
                         }
+                        self.statements.get(&name).ok_or("26000")?.authorize_description(session)?;
                         self.refresh_statement(&name, session)?;
                         let s = self.statements.get(&name).ok_or("26000")?;
                         self.diagnostic.query_id = s.query_id.clone();
@@ -1901,6 +1915,7 @@ impl State {
                         }
                         let p = self.portals.get(&name).ok_or("34000")?;
                         self.diagnostic.query_id = p.s.query_id.clone();
+                        p.s.authorize_description(session)?;
                         let d = p.s.describe(session)?;
                         if let Plan::Catalog(_, fields, _) = &p.s.p {
                             catalog_wire::description(fields, &p.formats, out)?;

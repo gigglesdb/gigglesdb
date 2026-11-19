@@ -98,11 +98,14 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
         }
         bind_authority_probe(pg.address, &clients[0], &admin, label).await;
         None
+    } else if label.starts_with("describe-") {
+        describe_authority_probe(pg.address, &clients[0], label).await;
+        None
     } else if label == "suspended" {
         suspended_probe(pg.address, &clients[0]).await;
         None
     } else if label.starts_with("portal") {
-        portal_probe(pg.address, &clients[0], label, change).await;
+        portal_probe(pg.address, &clients[0], &admin, label, change).await;
         None
     } else {
         let statement = clients[1].prepare(sql).await.unwrap();
@@ -422,6 +425,7 @@ async fn send(stream: &mut TcpStream, frames: &[(u8, &[u8])]) {
 async fn portal_probe(
     address: std::net::SocketAddr,
     ddl: &tokio_postgres::Client,
+    admin: &Admin,
     label: &str,
     change: &str,
 ) {
@@ -466,26 +470,23 @@ async fn portal_probe(
     }
     let changed = ddl.batch_execute(change);
     tokio::pin!(changed);
-    let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut changed).await;
-    if label.contains("view") {
-        assert!(
-            early.is_err(),
-            "underlying DDL completed while the view portal was bound: {early:?}"
-        );
-    }
-    if let Ok(ref result) = early {
-        assert_eq!(
-            result
-                .as_ref()
-                .unwrap_err()
-                .as_db_error()
-                .unwrap()
-                .code()
-                .code(),
-            "55P03",
-            "{label}"
-        );
-    }
+    // Wait for a queued request, or the direct DROP path's NOWAIT rejection.
+    // Neither outcome relies on elapsed time as evidence of lock protection.
+    let queued = tokio::select! {
+        result = &mut changed => {
+            assert!(!label.contains("view"), "view DDL must wait: {result:?}");
+            assert_eq!(result.unwrap_err().as_db_error().unwrap().code().code(), "55P03");
+            false
+        },
+        barrier = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while admin.waiting_lock_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        }) => {
+            barrier.expect("DDL lock request queued");
+            true
+        },
+    };
     send(&mut stream, &[(b'E', b"p\0\0\0\0\0"), (b'S', b"")]).await;
     let executed = receive(&mut stream, b'Z').await;
     assert!(
@@ -497,18 +498,13 @@ async fn portal_probe(
     assert_eq!(&row[..2], &[0, 1]);
     assert_eq!(&row[6..], b"7");
     if explicit {
-        if label.contains("view") {
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(200), &mut changed)
-                    .await
-                    .is_err(),
-                "DDL completed before COMMIT"
-            );
+        if queued {
+            assert!(admin.waiting_lock_count() > 0, "DDL remains queued until COMMIT");
         }
         send(&mut stream, &[(b'Q', b"COMMIT\0")]).await;
         receive(&mut stream, b'Z').await;
     }
-    if early.is_err() {
+    if queued {
         tokio::time::timeout(std::time::Duration::from_secs(10), changed)
             .await
             .unwrap()
@@ -942,4 +938,73 @@ async fn bind_view_reauthorizes_drift_between_authorization_and_locking() {
 #[tokio::test]
 async fn bind_cancelled_wait_after_revoke_reports_authorization() {
     case("bind-drift-cancel", "CREATE TABLE t(a int); GRANT SELECT ON t TO r", "", "", None).await;
+}
+
+// Describe must check live grants even when the cached shape belongs to a pinned snapshot.
+async fn describe_authority_probe(
+    address: std::net::SocketAddr,
+    owner: &tokio_postgres::Client,
+    label: &str,
+) {
+    for role in ["r", "owner"] {
+        for portal in [false, true] {
+            owner.batch_execute("GRANT SELECT ON t TO r").await.unwrap();
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let mut startup = b"\0\x03\0\0user\0".to_vec();
+            giggles_server::pgwire::z(role, &mut startup);
+            startup.extend_from_slice(b"database\0postgres\0\0");
+            stream.write_u32((startup.len() + 4) as u32).await.unwrap();
+            stream.write_all(&startup).await.unwrap();
+            receive(&mut stream, b'Z').await;
+            let mut parse = b"s\0".to_vec();
+            giggles_server::pgwire::z("SELECT * FROM t", &mut parse);
+            parse.extend_from_slice(&[0, 0]);
+            send(&mut stream, &[(b'P', &parse), (b'S', b"")]).await;
+            assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+            let begin = match label {
+                "describe-rr" => b"BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1\0".as_slice(),
+                "describe-serializable" => b"BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT 1\0".as_slice(),
+                _ => b"BEGIN ISOLATION LEVEL READ COMMITTED; SELECT 1\0".as_slice(),
+            };
+            send(&mut stream, &[(b'Q', begin)]).await;
+            assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+            if portal {
+                send(&mut stream, &[(b'B', b"p\0s\0\0\0\0\0\0\0"), (b'S', b"")]).await;
+                assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+            }
+            let describe = if portal { b"Pp\0" } else { b"Ss\0" };
+            // Still-granted control, before the revoke, uses the same cached plan.
+            send(&mut stream, &[(b'D', describe), (b'S', b"")]).await;
+            let granted = receive(&mut stream, b'Z').await;
+            assert_eq!(response_code(&granted), None);
+            assert!(granted.iter().any(|(tag, _)| *tag == b'T'));
+            owner.batch_execute("REVOKE SELECT ON t FROM r").await.unwrap();
+            send(&mut stream, &[(b'D', describe), (b'S', b"")]).await;
+            let described = receive(&mut stream, b'Z').await;
+            assert_eq!(response_code(&described), if role == "r" { Some("42501") } else { None }, "{label}, {role}, portal={portal}: {described:?}");
+            if role == "r" {
+                assert!(!described.iter().any(|(tag, _)| matches!(tag, b't' | b'T' | b'n')));
+            } else {
+                assert!(described.iter().any(|(tag, _)| *tag == b'T'));
+            }
+            send(&mut stream, &[(b'Q', b"ROLLBACK\0")]).await;
+            receive(&mut stream, b'Z').await;
+            parse[0] = b'f';
+            send(&mut stream, &[(b'P', &parse), (b'S', b"")]).await;
+            assert_eq!(response_code(&receive(&mut stream, b'Z').await), response_code(&described));
+            send(&mut stream, &[(b'X', b"")]).await;
+        }
+    }
+}
+#[tokio::test]
+async fn describe_checks_current_grants_read_committed() {
+    case("describe-rc", "CREATE TABLE t(a int); GRANT SELECT ON t TO r", "", "", None).await;
+}
+#[tokio::test]
+async fn describe_checks_current_grants_repeatable_read() {
+    case("describe-rr", "CREATE TABLE t(a int); GRANT SELECT ON t TO r", "", "", None).await;
+}
+#[tokio::test]
+async fn describe_checks_current_grants_serializable() {
+    case("describe-serializable", "CREATE TABLE t(a int); GRANT SELECT ON t TO r", "", "", None).await;
 }

@@ -197,26 +197,27 @@ fn metadata_cycle_counts() {
         metadata_parse(&mut state, &mut session, name);
         metadata_bind(&mut state, &mut session, name);
         assert_eq!(text_rows(&metadata_describe_execute(&mut state, &mut session).unwrap()), vec![vec!["7"]]);
-        // Bind adds dependency locking plus a full current-grant authorization.
+        // Bind adds dependency locking and current-grant authorization. Describe
+        // adds four metadata reads to recheck live grants even with a cached shape.
         // Named/unnamed descriptions and plans remain cached.
-        assert_eq!(giggles_core::metadata_read_counts::take(), [13, 0, 8, usize::from(name.is_empty()), 0], "cycle {name:?}");
+        assert_eq!(giggles_core::metadata_read_counts::take(), [17, 0, 8, usize::from(name.is_empty()), 0], "cycle {name:?}");
         if name.is_empty() {
             metadata_parse(&mut state, &mut session, name);
             metadata_bind(&mut state, &mut session, name);
             metadata_describe_execute(&mut state, &mut session).unwrap();
-            assert_eq!(giggles_core::metadata_read_counts::take(), [13, 0, 7, 0, 0]);
+            assert_eq!(giggles_core::metadata_read_counts::take(), [17, 0, 7, 0, 0]);
         }
         if !name.is_empty() {
             metadata_bind(&mut state, &mut session, name);
             metadata_describe_execute(&mut state, &mut session).unwrap();
             // Rebinding the cached named description also saves three reads.
-            assert_eq!(giggles_core::metadata_read_counts::take(), [13, 0, 3, 0, 0]);
+            assert_eq!(giggles_core::metadata_read_counts::take(), [17, 0, 3, 0, 0]);
         }
     }
     simple(&mut state, &mut session, "SELECT v FROM t WHERE id = 1").unwrap();
     assert_eq!(giggles_core::metadata_read_counts::take(), [0, 0, 9, 0, 0]);
     extended(&mut state, &mut session, "INSERT INTO serial_t (v) VALUES (8)").unwrap();
-    assert_eq!(giggles_core::metadata_read_counts::take(), [13, 0, 8, 0, 0]);
+    assert_eq!(giggles_core::metadata_read_counts::take(), [17, 0, 8, 0, 0]);
 }
 #[test]
 fn metadata_ddl_between_bind_and_execute() {
