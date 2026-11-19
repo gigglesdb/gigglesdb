@@ -5,7 +5,6 @@ mod agent_support;
 use agent_support::parity::{self, *};
 use agent_support::{Msg, Startup, TestCert, binding, certificate, error_of, raw_startup};
 use bytes::Bytes;
-#[cfg(feature = "legacy-task")]
 use giggles_server::api::json as wire_json;
 use giggles_server::{
     Binding, Request, Role, Running,
@@ -427,12 +426,12 @@ async fn task_session_cannot_approve_undo_define_or_revoke_tasks() {
     f.stop().await;
 }
 
-#[cfg(feature = "legacy-task")]
 #[tokio::test]
 async fn task_session_cannot_reach_legacy_giggles_json_or_request_sql() {
     let f = ParityFixture::start().await;
     let secret = issue(&f, TASK).await;
     let client = password_tls(&f, f.agent_pg.address, &secret, None).await.unwrap();
+    #[cfg(feature = "legacy-task")]
     for sql in ["GIGGLES {\"kind\":\"Ping\"}", "GIGGLES STATUS (1)"] {
         assert_eq!(
             client.simple_query(sql).await.unwrap_err().code().unwrap().code(),
@@ -455,9 +454,13 @@ async fn task_session_cannot_reach_legacy_giggles_json_or_request_sql() {
         .session_id;
     for body in [
         json!({"sql":{"sql":"GIGGLES {\"kind\":\"Ping\"}"}}),
+        #[cfg(feature = "legacy-task")]
         json!({"status":{"operation":"1"}}),
+        #[cfg(feature = "legacy-task")]
         json!({"preview":{"request":{"operation":"7","selection":{"keys":{"items":[{"tenant":"42","row":"3"}]}},"column":"COLUMN_STATUS","after":"DELIVERY_STATUS_QUEUED"}}}),
+        #[cfg(feature = "legacy-task")]
         json!({"execute":{"request":{"operation":"8","selection":{"keys":{"items":[{"tenant":"42","row":"3"}]}},"column":"COLUMN_STATUS","after":"DELIVERY_STATUS_QUEUED"}}}),
+        #[cfg(feature = "legacy-task")]
         json!({"repairSql":{"operation":"1","sql":"UPDATE shipments SET status = 'shipped'"}}),
     ] {
         let (status, reply) = http_bearer(&f, f.agent_http.address, &secret, Some(token), body.clone()).await;

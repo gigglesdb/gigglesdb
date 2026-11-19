@@ -267,11 +267,11 @@ fn database_role_is_a_serializable_provisioned_certificate_binding() {
     assert_eq!(f.service.session(APP_FP).unwrap().handle(Request::Ping).code, "ok");
 }
 
-#[cfg(feature = "legacy-task")]
 #[test]
 fn database_session_rejects_task_status_but_handles_ping_and_sql() {
     let f = Fixture::new();
     let mut owner = f.owner();
+    #[cfg(feature = "legacy-task")]
     assert_eq!(
         owner
             .handle(Request::Status {

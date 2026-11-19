@@ -797,7 +797,6 @@ mod tests {
         assert!(parse(over.as_bytes()).is_err());
     }
 
-    #[cfg(feature = "legacy-task")]
     #[test]
     fn json_integer_and_base64_canonical_forms() {
         for input in ["0", "-9223372036854775808", "9223372036854775807"] {
@@ -821,10 +820,12 @@ mod tests {
             let bytes = format!(r#"{{"sql":{{"params":[{{"intValue":"{input}"}}]}}}}"#);
             assert!(decode_execute(bytes.as_bytes()).is_err(), "{input}");
         }
+        #[cfg(feature = "legacy-task")]
         for input in ["0", "18446744073709551615"] {
             let bytes = format!(r#"{{"status":{{"operation":"{input}"}}}}"#);
             assert!(decode_execute(bytes.as_bytes()).is_ok());
         }
+        #[cfg(feature = "legacy-task")]
         for input in ["+1", "01", "-1", "18446744073709551616"] {
             let bytes = format!(r#"{{"status":{{"operation":"{input}"}}}}"#);
             assert!(decode_execute(bytes.as_bytes()).is_err());
@@ -837,10 +838,10 @@ mod tests {
             let bytes = format!(r#"{{"sql":{{"params":[{{"bytesValue":"{input}"}}]}}}}"#);
             assert!(decode_execute(bytes.as_bytes()).is_err(), "{input}");
         }
+        #[cfg(feature = "legacy-task")]
         assert!(decode_execute(br#"{"status":{"operation":1}}"#).is_err());
     }
 
-    #[cfg(feature = "legacy-task")]
     #[test]
     fn all_request_variants_match_native() {
         let cases = [
@@ -849,18 +850,22 @@ mod tests {
                 r#"{"sql":{"sql":"SELECT $1","params":[{"intValue":"-3"},{"boolValue":false},{"nullValue":"SQL_NULL"},{"textValue":"\u0000雪"},{"bytesValue":"AP8="}]}}"#,
                 serde_json::json!({"kind":"Sql","sql":"SELECT $1","params":[{"Int":-3},{"Bool":false},"Null",{"Text":"\0雪"},{"Bytes":[0,255]}]}),
             ),
+            #[cfg(feature = "legacy-task")]
             (
                 r#"{"repairSql":{"operation":"0","sql":"repair","approval":"0"}}"#,
                 serde_json::json!({"kind":"RepairSql","operation":0,"sql":"repair","approval":0}),
             ),
+            #[cfg(feature = "legacy-task")]
             (
                 r#"{"status":{"operation":"18446744073709551615"}}"#,
                 serde_json::json!({"kind":"Status","operation":u64::MAX}),
             ),
+            #[cfg(feature = "legacy-task")]
             (
                 r#"{"preview":{"request":{"operation":"7","selection":{"keys":{"items":[{"tenant":"42","row":"3"}]}},"column":"COLUMN_STATUS","after":"DELIVERY_STATUS_QUEUED"}}}"#,
                 serde_json::json!({"kind":"Preview","request":{"operation":7,"selection":{"Keys":[{"tenant":42,"row":3}]},"column":"Status","after":"Queued"}}),
             ),
+            #[cfg(feature = "legacy-task")]
             (
                 r#"{"execute":{"request":{"operation":"8","selection":{"predicate":{"tenant":"42","status":"DELIVERY_STATUS_FAILED","from":"1","until":"99"}},"column":"COLUMN_ATTEMPT_COUNT","after":"DELIVERY_STATUS_SUCCEEDED"},"approval":"0"},"budgetMs":0}"#,
                 serde_json::json!({"kind":"Execute","request":{"operation":8,"selection":{"Predicate":{"tenant":42,"status":"Failed","from":1,"until":99}},"column":"AttemptCount","after":"Succeeded"},"approval":0}),

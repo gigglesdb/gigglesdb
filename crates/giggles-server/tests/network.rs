@@ -2393,3 +2393,144 @@ pub(super) async fn raw_task(f: &Fixture) -> tokio_rustls::client::TlsStream<Tcp
     s
 }
 }
+
+async fn ordinary_limited(f: &Fixture, limits: giggles_server::admission::ServiceLimits) -> (Arc<Service>, Running, Running) {
+    let service = Service::with_limits(
+        f.admin.clone(),
+        serde_json::from_slice(&std::fs::read(f.path.join("bindings.json")).unwrap()).unwrap(),
+        Clock::new(0, 3600).unwrap(),
+        limits,
+    )
+    .unwrap();
+    let n = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        service.clone(),
+        f.server_config.clone(),
+        128,
+    )
+    .await
+    .unwrap();
+    let p = serve_pg(
+        "127.0.0.1:0".parse().unwrap(),
+        service.clone(),
+        f.server_config.clone(),
+        128,
+    )
+    .await
+    .unwrap();
+    (service, n, p)
+}
+async fn ordinary_eof<S: tokio::io::AsyncRead + Unpin>(s: &mut S) {
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(5), s.read_u8()).await.unwrap().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_application_crud_denied_table_aborts_transaction() {
+    let f = Fixture::new().await;
+    let mut c = f.native(f.app.clone()).await;
+    assert_eq!(
+        c.call(&sql(
+            "INSERT INTO app (id,body) VALUES ($1,$2)",
+            vec![Value::Int(1), Value::Text("hello".into())]
+        ))
+        .await
+        .unwrap()
+        .sql
+        .unwrap()
+        .affected,
+        1
+    );
+    assert_eq!(
+        c.call(&sql(
+            "SELECT body FROM app WHERE id=$1",
+            vec![Value::Int(1)]
+        ))
+        .await
+        .unwrap()
+        .sql
+        .unwrap()
+        .rows[0]
+            .values,
+        vec![Value::Text("hello".into())]
+    );
+    assert_eq!(c.call(&sql("BEGIN", vec![])).await.unwrap().code, "ok");
+    assert_eq!(
+        c.call(&sql("UPDATE app SET body='staged' WHERE id=1", vec![]))
+            .await
+            .unwrap()
+            .code,
+        "ok"
+    );
+    assert_eq!(
+        c.call(&sql("SELECT * FROM other WHERE id=1", vec![]))
+            .await
+            .unwrap()
+            .code,
+        "42501"
+    );
+    assert_eq!(c.call(&sql("COMMIT", vec![])).await.unwrap().code, "25P02");
+    assert_eq!(c.call(&sql("ROLLBACK", vec![])).await.unwrap().code, "ok");
+    assert_eq!(c.call(&sql("SELECT body FROM app WHERE id=$1", vec![Value::Int(1)])).await.unwrap().sql.unwrap().rows[0].values, vec![Value::Text("hello".into())]);
+    drop(c);
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_denied_native_flood_spends_global_rate_without_sql_effects() {
+    let f = Fixture::new().await;
+    let (_service, n, p) = ordinary_limited(
+        &f,
+        giggles_server::admission::ServiceLimits {
+            sessions: 8,
+            burst: 5,
+            per_second: 1,
+        },
+    )
+    .await;
+    let mut socket = TcpStream::connect(n.address).await.unwrap();
+    let mut s = tokio_rustls::TlsConnector::from(f.app.clone())
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            &mut socket,
+        )
+        .await
+        .unwrap();
+    for payload in [
+        b"{".to_vec(),
+        serde_json::to_vec(&sql("SELECT * FROM other", vec![])).unwrap(),
+        b"[]".to_vec(),
+        b"false".to_vec(),
+    ] {
+        giggles_server::write_frame(&mut s, &payload, giggles_server::MAX_FRAME)
+            .await
+            .unwrap();
+        let response: Response = serde_json::from_slice(
+            &giggles_server::read_frame(&mut s, giggles_server::MAX_RESPONSE)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(response.code.as_str(), "08P01" | "42501"));
+    }
+    giggles_server::write_frame(
+        &mut s,
+        &serde_json::to_vec(&sql("INSERT INTO app (id) VALUES (55)", vec![])).unwrap(),
+        giggles_server::MAX_FRAME,
+    )
+    .await
+    .unwrap();
+    ordinary_eof(&mut s).await;
+    assert!(
+        f.admin
+            .sql_session()
+            .execute("SELECT id FROM app LIMIT 1", &[], None)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    let mut reconnect = TcpStream::connect(p.address).await.unwrap();
+    ordinary_eof(&mut reconnect).await;
+    n.shutdown().await.unwrap();
+    p.shutdown().await.unwrap();
+    f.stop().await;
+}

@@ -215,8 +215,6 @@ fn decode_request(input: proto::execute_request::Request) -> Result<Invocation, 
             });
         }
         P::TaskOutcome(proto::TaskOutcomeRequest {}) => return Ok(Invocation::TaskOutcome),
-        #[cfg(not(feature = "legacy-task"))]
-        P::Preview(_) | P::Execute(_) | P::RepairSql(_) | P::Status(_) => return Err(ApiError::LegacyTaskRetired),
         P::Ping(_) => crate::Request::Ping,
         P::Sql(sql) => crate::Request::Sql {
             sql: sql.sql,
@@ -430,6 +428,17 @@ pub fn encode_protobuf(message: &impl Message, max: usize) -> Result<Vec<u8>, Ap
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "legacy-task"))]
+    #[test]
+    fn retired_task_wire_fields_decode_as_missing_request() {
+        for field in 3..=6 {
+            let wire = [(field << 3) | 2, 0];
+            let request = proto::ExecuteRequest::decode(wire.as_slice()).unwrap();
+            assert!(request.request.is_none());
+            assert!(matches!(decode_execute(request), Err(ApiError::InvalidArgument)));
+        }
+    }
+
     #[test]
     fn value_extremes_round_trip() {
         for value in [
@@ -615,7 +624,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "legacy-task")]
     #[test]
     fn required_presence_and_unknown_enums_reject() {
         assert_eq!(
@@ -629,6 +637,7 @@ mod tests {
             Err(ApiError::InvalidArgument)
         );
         assert!(decode_execute(proto::ExecuteRequest::default()).is_err());
+        #[cfg(feature = "legacy-task")]
         for operation in [None, Some(0), Some(u64::MAX)] {
             let req = proto::ExecuteRequest {
                 request: Some(proto::execute_request::Request::Status(
@@ -647,6 +656,7 @@ mod tests {
                 assert!(got.is_err());
             }
         }
+        #[cfg(feature = "legacy-task")]
         for value in [0, -1, i32::MAX] {
             assert!(decode_status(value).is_err());
         }

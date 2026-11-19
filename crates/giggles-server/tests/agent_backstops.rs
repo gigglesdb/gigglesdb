@@ -13,7 +13,6 @@
 #![cfg(feature = "engine-rocksdb")]
 mod agent_support;
 
-#[cfg(feature = "legacy-task")]
 use agent_support::ordinary_wire;
 use agent_support::{
     AGENT_STARTUP, AgentServer, Msg, admin, binding, certificate, connect_raw, error_of, now_ms,
@@ -286,7 +285,6 @@ async fn bare_update_through_execute_prepared_refused() {
     assert_eq!(database_state(&server), before);
 }
 
-#[cfg(feature = "legacy-task")]
 #[tokio::test]
 async fn framed_request_on_agent_session_only_ping() {
     let (server, agent, _) = started().await;
@@ -294,9 +292,11 @@ async fn framed_request_on_agent_session_only_ping() {
     let mut session = agent_session(&server, &agent);
     assert_eq!(session.handle(Request::Ping).code, "ok");
     for request in [
+        #[cfg(feature = "legacy-task")]
         Request::Status {
             operation: giggles_core::OperationId(1),
         },
+        #[cfg(feature = "legacy-task")]
         Request::RepairSql {
             operation: giggles_core::OperationId(2),
             sql: "UPDATE shipments SET status = 'pwned'".into(),
@@ -508,7 +508,6 @@ async fn planner_shapes_with_catalog_stay_in_scope() {
     assert!(server.admin.roles().get("intruder").unwrap().is_none());
 }
 
-#[cfg(feature = "legacy-task")]
 #[tokio::test]
 async fn non_task_sessions_unaffected() {
     let (server, _, ordinary) = started().await;
@@ -538,10 +537,13 @@ async fn non_task_sessions_unaffected() {
     assert!(!matches!(copy, Err(CoreError::Task(_))), "{copy:?}");
     // Framed requests other than Ping keep their pre-R3 answer (no task
     // executor behind a database role), never the task refusal.
-    let status = boss.handle(Request::Status {
-        operation: giggles_core::OperationId(1),
-    });
-    assert_ne!(status.code, "0A000", "{status:?}");
+    #[cfg(feature = "legacy-task")]
+    {
+        let status = boss.handle(Request::Status {
+            operation: giggles_core::OperationId(1),
+        });
+        assert_ne!(status.code, "0A000", "{status:?}");
+    }
     drop(boss);
 
     // On the wire: the ordinary listener answers role DDL, GRANT, COPY,

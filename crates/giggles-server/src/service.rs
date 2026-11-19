@@ -4650,7 +4650,6 @@ mod lifecycle_tests {
                 .is_empty()
         );
     }
-    #[cfg(feature = "legacy-task")]
     #[test]
     fn database_catalog_snapshot_filters_owners_and_grants_and_rechecks_role() {
         let (service, _) = fixture();
@@ -4696,6 +4695,7 @@ mod lifecycle_tests {
                 .all(|table| table.name == "app" || table.name == "owned")
         );
         assert_eq!(reader.handle(Request::Ping).code, "ok");
+        #[cfg(feature = "legacy-task")]
         assert_eq!(
             reader
                 .handle(Request::Status {
