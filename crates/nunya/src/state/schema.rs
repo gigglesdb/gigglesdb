@@ -35,6 +35,8 @@ pub enum Table {
     RetiredDomains,
     /// Routes awaiting membership reset and publication.
     MembershipResets,
+    /// Binding version and compiled route revisions.
+    BindingMeta,
     /// Immutable policy revisions.
     PolicyRevisions,
     /// Active policy revision and ownership.
@@ -44,7 +46,7 @@ pub enum Table {
 }
 impl Table {
     /// Every application table in schema order.
-    pub const ALL: [Table; 16] = [
+    pub const ALL: [Table; 17] = [
         Self::Principals,
         Self::PrincipalCredentials,
         Self::Grants,
@@ -58,6 +60,7 @@ impl Table {
         Self::DomainNames,
         Self::RetiredDomains,
         Self::MembershipResets,
+        Self::BindingMeta,
         Self::PolicyRevisions,
         Self::PolicyHeads,
         Self::PolicyIdempotency,
@@ -79,6 +82,7 @@ impl Table {
             Self::DomainNames => "domain_names",
             Self::RetiredDomains => "retired_domains",
             Self::MembershipResets => "membership_resets",
+            Self::BindingMeta => "binding_meta",
             Self::PolicyRevisions => "policy_revisions",
             Self::PolicyHeads => "policy_heads",
             Self::PolicyIdempotency => "policy_idempotency",

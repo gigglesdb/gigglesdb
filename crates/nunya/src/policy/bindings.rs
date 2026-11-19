@@ -190,6 +190,182 @@ pub enum BindingError {
     #[error("binding identity is unknown or already allocated")]
     UnknownIdentity,
 }
+
+/// Atomic view of all leader-owned domain bindings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingsSnapshot {
+    /// Monotonic persisted bindings version.
+    pub version: u64,
+    /// Routes in lexical order.
+    pub routes: BTreeMap<String, RouteSnapshot>,
+}
+/// Persisted binding state for one route.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSnapshot {
+    /// Bindings in identity order.
+    pub bindings: Vec<BindingRecord>,
+    /// Retired domains in lexical order.
+    pub retired: Vec<DomainName>,
+    /// Last compiled policy revision, or zero before first publication.
+    pub revision: u64,
+    /// Full policy stamp published by the leader.
+    pub stamp: String,
+    /// Whether a membership reset remains owed.
+    pub reset_owed: bool,
+}
+const VERSION_KEY: &[u8] = b"version";
+const REVISION_PREFIX: &[u8] = b"revision\0";
+/// Validate a binding metadata row before state is served.
+pub(crate) fn validate_meta(key: &[u8], value: &[u8]) -> Result<(), BindingError> {
+    if key == VERSION_KEY {
+        return if value.len() == 8 { Ok(()) } else { Err(BindingError::Corrupt) };
+    }
+    if std::str::from_utf8(value).map_err(|_| BindingError::Corrupt)?.is_empty() {
+        return Err(BindingError::Corrupt);
+    }
+    let route = key
+        .strip_prefix(REVISION_PREFIX)
+        .ok_or(BindingError::Corrupt)?;
+    route_name(route).map(|_| ())
+}
+fn read_u64(txn: &dyn ReadTxn, key: &[u8]) -> Result<u64, BindingError> {
+    txn.get(Table::BindingMeta, key)
+        .map_err(|_| BindingError::Store)?
+        .map(|v| {
+            v.try_into()
+                .map(u64::from_be_bytes)
+                .map_err(|_| BindingError::Corrupt)
+        })
+        .transpose()
+        .map(|v| v.unwrap_or(0))
+}
+fn bump_version(txn: &mut dyn crate::state::store::WriteTxn) -> Result<(), BindingError> {
+    let next = read_u64(txn, VERSION_KEY)?
+        .checked_add(1)
+        .ok_or(BindingError::Corrupt)?;
+    txn.put(Table::BindingMeta, VERSION_KEY, &next.to_be_bytes())
+        .map_err(|_| BindingError::Store)
+}
+fn binding_rows(txn: &dyn ReadTxn) -> Result<Vec<crate::state::store::ScanRows>, BindingError> {
+    [
+        Table::DomainBindings,
+        Table::DomainNames,
+        Table::RetiredDomains,
+        Table::MembershipResets,
+    ]
+    .into_iter()
+    .map(|table| txn.scan_prefix(table, b"").map_err(|_| BindingError::Store))
+    .collect()
+}
+fn stamp_number(stamp: &str) -> Option<u64> {
+    stamp.strip_prefix("rev-")?.split('-').next()?.parse().ok()
+}
+/// Record the leader's last published policy stamp, advancing only on change.
+pub fn record_route_stamp(
+    store: &dyn Store,
+    route: &RouteId,
+    stamp: &str,
+) -> Result<(), BindingError> {
+    let mut txn = store.write().map_err(|_| BindingError::Store)?;
+    let key = [REVISION_PREFIX, route.as_str().as_bytes()].concat();
+    let value = stamp.as_bytes();
+    validate_meta(&key, value)?;
+    if txn
+        .get(Table::BindingMeta, &key)
+        .map_err(|_| BindingError::Store)?
+        .as_deref()
+        != Some(value)
+    {
+        txn.put(Table::BindingMeta, &key, value)
+            .map_err(|_| BindingError::Store)?;
+        bump_version(txn.as_mut())?;
+    }
+    txn.commit().map_err(|_| BindingError::Store)
+}
+fn route_name(bytes: &[u8]) -> Result<String, BindingError> {
+    let name = std::str::from_utf8(bytes).map_err(|_| BindingError::Corrupt)?;
+    RouteId::new(name)
+        .map(|r| r.as_str().to_owned())
+        .ok_or(BindingError::Corrupt)
+}
+/// Read every route and version from one consistent read transaction.
+pub fn snapshot(store: &dyn Store) -> Result<BindingsSnapshot, BindingError> {
+    let txn = store.read().map_err(|_| BindingError::Store)?;
+    let mut routes: BTreeMap<String, RouteSnapshot> = BTreeMap::new();
+    for (key, value) in txn
+        .scan_prefix(Table::DomainBindings, b"")
+        .map_err(|_| BindingError::Store)?
+    {
+        let end = key
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or(BindingError::Corrupt)?;
+        let route = route_name(&key[..end])?;
+        let record: BindingRecord = model::decode(&value).map_err(|_| BindingError::Corrupt)?;
+        let id = RouteId::new(&route).ok_or(BindingError::Corrupt)?;
+        if key != keys::domain_binding(&id, &record.identity) {
+            return Err(BindingError::Corrupt);
+        }
+        routes.entry(route).or_default().bindings.push(record);
+    }
+    for (key, value) in txn
+        .scan_prefix(Table::RetiredDomains, b"")
+        .map_err(|_| BindingError::Store)?
+    {
+        let name = String::from_utf8(key).map_err(|_| BindingError::Corrupt)?;
+        routes
+            .entry(route_name(&value)?)
+            .or_default()
+            .retired
+            .push(DomainName(name));
+    }
+    for (key, value) in txn
+        .scan_prefix(Table::MembershipResets, b"")
+        .map_err(|_| BindingError::Store)?
+    {
+        let route = route_name(&key)?;
+        let reset: MembershipChange = model::decode(&value).map_err(|_| BindingError::Corrupt)?;
+        if reset.route.as_str() != route {
+            return Err(BindingError::Corrupt);
+        }
+        routes.entry(route).or_default().reset_owed = true;
+    }
+    for (key, value) in txn
+        .scan_prefix(Table::BindingMeta, REVISION_PREFIX)
+        .map_err(|_| BindingError::Store)?
+    {
+        validate_meta(&key, &value)?;
+        let stamp = String::from_utf8(value).map_err(|_| BindingError::Corrupt)?;
+        let route = routes.entry(route_name(&key[REVISION_PREFIX.len()..])?).or_default();
+        route.revision = stamp_number(&stamp).unwrap_or(0);
+        route.stamp = stamp;
+    }
+    for route in routes.values_mut() {
+        route.bindings.sort_by(|a, b| a.identity.cmp(&b.identity));
+        route.retired.sort();
+        route_bindings(route)?;
+    }
+    Ok(BindingsSnapshot {
+        version: read_u64(txn.as_ref(), VERSION_KEY)?,
+        routes,
+    })
+}
+/// Rebuild identity-indexed bindings, refusing duplicate identities.
+pub fn route_bindings(route: &RouteSnapshot) -> Result<RouteBindings, BindingError> {
+    let mut records = BTreeMap::new();
+    for record in &route.bindings {
+        if records
+            .insert(record.identity.clone(), record.clone())
+            .is_some()
+        {
+            return Err(BindingError::Corrupt);
+        }
+    }
+    Ok(RouteBindings(records))
+}
+
 /// Refuse declared domain names that collide with persisted generated names.
 pub fn check_declared_names(store: &dyn Store, doc: &PolicyDocument) -> Result<(), BindingError> {
     let txn = store.read().map_err(|_| BindingError::Store)?;
@@ -272,6 +448,7 @@ fn apply_with_generator(
         return load(store, route);
     }
     let mut txn = store.write().map_err(|_| BindingError::Store)?;
+    let persisted_before = binding_rows(txn.as_ref())?;
     let mut groups: BTreeMap<usize, DomainName> = BTreeMap::new();
     let mut bindings = read_bindings(txn.as_ref(), route)?;
     let before = bindings.clone();
@@ -430,6 +607,7 @@ fn apply_with_generator(
         }
         txn.put(Table::MembershipResets, route.as_str().as_bytes(), &model::encode(&owed)).map_err(|_| BindingError::Store)?;
     }
+    if persisted_before != binding_rows(txn.as_ref())? { bump_version(txn.as_mut())?; }
     txn.commit().map_err(|_| BindingError::Store)?;
     load(store, route)
 }
@@ -828,7 +1006,9 @@ pub fn load_reset(store: &dyn Store, route: &RouteId) -> Result<Option<Membershi
 /// Clear a reset only after sessions were ended and the policy was published.
 pub fn clear_reset(store: &dyn Store, route: &str) -> Result<(), BindingError> {
     let mut txn = store.write().map_err(|_| BindingError::Store)?;
-    txn.delete(Table::MembershipResets, route.as_bytes()).map_err(|_| BindingError::Store)?;
+    if txn.delete(Table::MembershipResets, route.as_bytes()).map_err(|_| BindingError::Store)? {
+        bump_version(txn.as_mut())?;
+    }
     txn.commit().map_err(|_| BindingError::Store)
 }
 /// Test whether a generated domain was retired.
@@ -983,6 +1163,167 @@ mod tests {
     fn route() -> RouteId {
         RouteId::new("route").unwrap()
     }
+    #[test]
+    fn version_snapshot_and_noop_writes() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let version = || snapshot(&store).unwrap().version;
+        assert_eq!(version(), 0);
+        apply(&store, &route(), &[create(1), create(2)], &BTreeSet::new()).unwrap();
+        assert_eq!(version(), 1);
+        assert!(snapshot(&store).unwrap().routes["route"].reset_owed);
+        clear_reset(&store, "route").unwrap();
+        assert_eq!(version(), 2);
+        clear_reset(&store, "route").unwrap();
+        apply(&store, &route(), &[], &BTreeSet::new()).unwrap();
+        assert_eq!(version(), 2);
+        let changes = [1, 2].map(|n| BindingChange::SetDomain {
+            identity: id(n),
+            target: DomainTarget::Generated { group: 0 },
+            linked: true,
+        });
+        apply(&store, &route(), &changes, &BTreeSet::new()).unwrap();
+        assert_eq!(version(), 3);
+        let linked = load(&store, &route()).unwrap();
+        assert_eq!(
+            linked.get(&id(1)).unwrap().domain,
+            linked.get(&id(2)).unwrap().domain
+        );
+        apply(
+            &store,
+            &route(),
+            &[BindingChange::SetDomain {
+                identity: id(1),
+                target: DomainTarget::FreshPrivate,
+                linked: false,
+            }],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(version(), 4);
+        let state = snapshot(&store).unwrap();
+        assert_eq!(state.routes["route"].retired.len(), 3);
+        assert!(state.routes["route"].reset_owed);
+        record_route_stamp(&store, &route(), "rev-19-test").unwrap();
+        assert_eq!(version(), 5);
+        record_route_stamp(&store, &route(), "rev-19-test").unwrap();
+        assert_eq!(version(), 5);
+        let revision_only = RouteId::new("revision-only").unwrap();
+        record_route_stamp(&store, &revision_only, "digest").unwrap();
+        let state = snapshot(&store).unwrap();
+        assert_eq!(state.version, 6);
+        assert_eq!(state.routes["route"].revision, 19);
+        assert_eq!(state.routes["revision-only"].stamp, "digest");
+        assert_eq!(state.routes["revision-only"].revision, 0);
+        assert_eq!(state.routes["route"].stamp, "rev-19-test");
+        assert_eq!(
+            route_bindings(&state.routes["route"]).unwrap(),
+            load(&store, &route()).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_slice::<BindingsSnapshot>(&serde_json::to_vec(&state).unwrap())
+                .unwrap(),
+            state
+        );
+        let mut duplicate = state.routes["route"].clone();
+        duplicate.bindings.push(duplicate.bindings[0].clone());
+        assert_eq!(route_bindings(&duplicate), Err(BindingError::Corrupt));
+        drop(store);
+        let reopened = RedbStore::open(&dir.0, &root()).unwrap();
+        assert_eq!(snapshot(&reopened).unwrap(), state);
+    }
+
+    #[test]
+    fn unchanged_refresh_preserves_version() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let schema = pg("email", 1, ColumnType::Text);
+        refresh(&store, &route(), &document(), &schema).unwrap();
+        let state = snapshot(&store).unwrap();
+        refresh(&store, &route(), &document(), &schema).unwrap();
+        assert_eq!(snapshot(&store).unwrap(), state);
+        let record = &state.routes["route"].bindings[0];
+        apply(
+            &store,
+            &route(),
+            &[BindingChange::Update {
+                identity: record.identity.clone(),
+                column: record.column.clone(),
+                family: record.family,
+                show_rule: record.show_rule.clone(),
+                status: record.status,
+            }],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(snapshot(&store).unwrap(), state);
+    }
+
+    #[test]
+    fn old_store_gains_binding_metadata_without_format_bump() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        apply(&store, &route(), &[create(1)], &BTreeSet::new()).unwrap();
+        let before = load(&store, &route()).unwrap();
+        drop(store);
+        let db = redb::Database::create(dir.0.join(STORE_FILE)).unwrap();
+        let txn = db.begin_write().unwrap();
+        assert!(txn.delete_table(Table::BindingMeta.definition()).unwrap());
+        txn.commit().unwrap();
+        drop(db);
+        let reopened = RedbStore::open(&dir.0, &root()).unwrap();
+        assert_eq!(reopened.meta().format_version, 1);
+        assert_eq!(load(&reopened, &route()).unwrap(), before);
+        assert_eq!(snapshot(&reopened).unwrap().version, 0);
+    }
+
+
+    #[test]
+    fn snapshot_route_union_and_version_overflow_are_fail_closed() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let reset_route = RouteId::new("reset-only").unwrap();
+        let reset = MembershipChange {
+            route: reset_route,
+            retired: vec![name("old")],
+            joined: vec![],
+            left: vec![],
+            skipped: vec![],
+        };
+        let mut txn = store.write().unwrap();
+        txn.put(
+            Table::MembershipResets,
+            b"reset-only",
+            &model::encode(&reset),
+        )
+        .unwrap();
+        txn.put(Table::RetiredDomains, b"old", b"retired-only")
+            .unwrap();
+        txn.put(Table::BindingMeta, VERSION_KEY, &u64::MAX.to_be_bytes())
+            .unwrap();
+        txn.commit().unwrap();
+        let state = snapshot(&store).unwrap();
+        assert_eq!(state.routes.len(), 2);
+        assert!(state.routes["reset-only"].reset_owed);
+        assert_eq!(state.routes["retired-only"].retired, vec![name("old")]);
+        assert_eq!(
+            clear_reset(&store, "reset-only"),
+            Err(BindingError::Corrupt)
+        );
+        assert_eq!(
+            record_route_stamp(&store, &route(), "rev-1-test"),
+            Err(BindingError::Corrupt)
+        );
+        assert_eq!(
+            apply(&store, &route(), &[create(1)], &BTreeSet::new()),
+            Err(BindingError::Corrupt)
+        );
+        assert_eq!(snapshot(&store).unwrap(), state);
+        assert!(validate_meta(b"unknown", &[0; 8]).is_err());
+        assert!(validate_meta(VERSION_KEY, &[0; 7]).is_err());
+        assert!(validate_meta(b"revision\0invalid route", &[0; 8]).is_err());
+    }
+
     fn id(n: i16) -> ColumnId {
         ColumnId::Pg {
             relation_oid: 123,

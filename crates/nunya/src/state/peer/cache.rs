@@ -18,7 +18,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, RwLock},
     time::Duration,
 };
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -45,8 +45,20 @@ struct View {
     until: u64,
     term: u64,
 }
+#[derive(Default)]
+struct BindingView {
+    term: u64,
+    version: u64,
+    fetched: Option<u64>,
+    snapshot: Option<Arc<crate::policy::bindings::BindingsSnapshot>>,
+}
+type BindingsListener = Arc<dyn Fn() + Send + Sync>;
+type LeadershipObservation = (Arc<dyn Fn() -> bool + Send + Sync>, bool);
 /// Per-pod serving state, valid only within both the serving lease and last successful sync term.
 pub struct PeerStateCache {
+    leadership: Mutex<Option<LeadershipObservation>>,
+    bindings: Mutex<BindingView>,
+    bindings_listener: RwLock<Option<BindingsListener>>,
     client: Arc<PeerClient>,
     bridge: RuntimeBridge,
     runtime: Option<tokio::runtime::Handle>,
@@ -71,6 +83,9 @@ impl PeerStateCache {
         let bridge = RuntimeBridge::with_timeout(TIMEOUT);
         let runtime = bridge.run(async { tokio::runtime::Handle::current() });
         Self {
+            leadership: Mutex::default(),
+            bindings: Mutex::default(),
+            bindings_listener: RwLock::default(),
             client,
             bridge,
             runtime,
@@ -84,8 +99,87 @@ impl PeerStateCache {
             wall: Arc::new(auth::now),
         }
     }
+    /// Observe leadership changes even when serving renewal fails.
+    pub fn set_leadership_source(&self, source: Arc<dyn Fn() -> bool + Send + Sync>) {
+        let current = source();
+        *self.leadership.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((source, current));
+    }
+    /// Recompile after either direction of a local leadership transition.
+    pub fn check_leadership(&self) {
+        let changed = {
+            let mut state = self.leadership.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((source, previous)) = state.as_mut() {
+                let current = source();
+                let changed = *previous != current;
+                *previous = current;
+                changed
+            } else { false }
+        };
+        if changed {
+            let listener = self.bindings_listener.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            if let Some(listener) = listener { listener(); }
+        }
+    }
+    /// Register a callback invoked outside cache locks when bindings change.
+    pub fn set_bindings_listener(&self, listener: BindingsListener) {
+        *self.bindings_listener.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(listener);
+    }
+    /// Return compile bindings within the current term and one successful fetch term.
+    pub fn bindings_snapshot(&self) -> Option<Arc<crate::policy::bindings::BindingsSnapshot>> {
+        let v = self.bindings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let age = (self.mono)().saturating_sub(v.fetched?);
+        if self.client.term() != v.term || u128::from(age) >= self.term.as_nanos() { return None; }
+        v.snapshot.clone()
+    }
+    fn accept_bindings(&self, reply: BindingsReply, fetched: u64) -> Result<(), PeerError> {
+        let changed = {
+            let mut v = self.bindings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if reply.term != self.client.term() || reply.term < v.term || (reply.term == v.term && reply.version < v.version) { return Err(PeerError::Stale); }
+            let was_usable = v.snapshot.is_some() && v.term == self.client.term()
+                && v.fetched.is_some_and(|at| u128::from((self.mono)().saturating_sub(at)) < self.term.as_nanos());
+            let changed = v.snapshot.is_none() || reply.term > v.term || reply.version > v.version;
+            if let Some(snapshot) = reply.snapshot {
+                if snapshot.version != reply.version { return Err(PeerError::Protocol); }
+                if changed { v.snapshot = Some(Arc::new(snapshot)); }
+            } else if changed { return Err(PeerError::Protocol); }
+            v.term = reply.term;
+            v.version = reply.version;
+            v.fetched = Some(fetched);
+            changed || (!was_usable && v.snapshot.is_some() && u128::from((self.mono)().saturating_sub(fetched)) < self.term.as_nanos())
+        };
+        if changed {
+            let listener = self.bindings_listener.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            if let Some(listener) = listener { listener(); }
+        }
+        Ok(())
+    }
+    /// Best-effort startup fetch, with retries bounded by one serving-lease term.
+    pub fn prime_bindings(&self) {
+        let start = std::time::Instant::now();
+        loop {
+            let remaining = self.term.saturating_sub(start.elapsed());
+            if remaining.is_zero() { return; }
+            if self.fetch_bindings(TIMEOUT.min(remaining)).is_ok() { return; }
+            let remaining = self.term.saturating_sub(start.elapsed());
+            if remaining.is_zero() { return; }
+            std::thread::sleep(Duration::from_millis(100).min(remaining));
+        }
+    }
+    fn sync_bindings(&self) -> Result<(), PeerError> {
+        self.fetch_bindings(TIMEOUT)
+    }
+    fn fetch_bindings(&self, timeout: Duration) -> Result<(), PeerError> {
+        let fetched = (self.mono)();
+        let request = {
+            let v = self.bindings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            BindingsRequest { have_term: if v.snapshot.is_some() { v.term } else { u64::MAX }, have_version: v.version }
+        };
+        let client = self.client.clone();
+        let reply = self.bridge.run_timeout(timeout, async move { client.bindings(request, timeout).await }).ok_or(PeerError::Timeout)??;
+        self.accept_bindings(reply, fetched)
+    }
     #[cfg(test)]
-    pub(super) fn with_clocks(
+    pub(crate) fn with_clocks(
         mut self,
         mono: Arc<dyn Fn() -> u64 + Send + Sync>,
         wall: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -214,6 +308,7 @@ impl PeerStateCache {
             .bridge
             .run(async move { client.changes(ChangesRequest { since, touched }, TIMEOUT).await })
             .ok_or(PeerError::Timeout)??;
+        let bindings_result = self.sync_bindings();
         let mut v = self.lock();
         if v.epoch != epoch { return Err(PeerError::Stale); }
         for (id, seq) in sent { if v.touched.get(&id) == Some(&seq) { v.touched.remove(&id); } }
@@ -283,7 +378,7 @@ impl PeerStateCache {
                 self.give_back(b);
             }
         }
-        Ok(())
+        bindings_result
     }
     fn load(&self, id: SessionId) -> Result<MutexGuard<'_, View>, AdmitError> {
         let mut v = self.lock();
@@ -644,5 +739,51 @@ impl Drop for PeerStateCache {
     fn drop(&mut self) {
         let mut v = self.lock();
         self.clear(&mut v);
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicBool, Ordering::SeqCst};
+    #[test]
+    fn versions_terms_freshness_and_change_listeners() {
+        let leader = crate::policy::kube_leader::LeaderState::default();
+        leader.term_for_test(2);
+        let gate = Arc::new(ServingGate::default()); gate.extend_to(u64::MAX);
+        let cache = PeerStateCache::new(Arc::new(PeerClient::new(leader.clone(), 1, "pod".into(), Arc::new(PeerAuth::new(&[7; 32]).unwrap()))), gate.clone(), Registry::default(), Duration::from_nanos(10), 1);
+        cache.client.observe_generation(2);
+        let clock = Arc::new(AtomicU64::new(0)); let c = clock.clone();
+        let cache = cache.with_clocks(Arc::new(move || c.load(SeqCst)), Arc::new(|| 0));
+        let calls = Arc::new(AtomicU64::new(0)); let n = calls.clone();
+        cache.set_bindings_listener(Arc::new(move || { n.fetch_add(1, SeqCst); }));
+        let reply = |term, version| BindingsReply { term, version, snapshot: Some(crate::policy::bindings::BindingsSnapshot { version, routes: Default::default() }) };
+        cache.accept_bindings(reply(2, 3), 0).unwrap();
+        assert_eq!(cache.bindings_snapshot().unwrap().version, 3);
+        cache.accept_bindings(reply(2, 4), 1).unwrap();
+        assert_eq!(cache.accept_bindings(reply(2, 3), 2), Err(PeerError::Stale));
+        assert_eq!(cache.accept_bindings(reply(1, 9), 2), Err(PeerError::Stale));
+        assert_eq!(cache.bindings_snapshot().unwrap().version, 4);
+        cache.accept_bindings(BindingsReply { term: 2, version: 4, snapshot: None }, 3).unwrap();
+        cache.accept_bindings(reply(2, 4), 3).unwrap();
+        assert_eq!(calls.load(SeqCst), 2);
+        clock.store(13, SeqCst);
+        assert!(cache.bindings_snapshot().is_none());
+        cache.accept_bindings(BindingsReply { term: 2, version: 4, snapshot: None }, 13).unwrap();
+        assert!(cache.bindings_snapshot().is_some());
+        assert_eq!(calls.load(SeqCst), 3);
+        cache.client.observe_generation(3);
+        assert!(cache.bindings_snapshot().is_none());
+        cache.accept_bindings(reply(3, 1), 13).unwrap();
+        assert_eq!(cache.bindings_snapshot().unwrap().version, 1);
+        assert_eq!(calls.load(SeqCst), 4);
+        let flag = Arc::new(AtomicBool::new(false)); let f = flag.clone();
+        cache.set_leadership_source(Arc::new(move || f.load(SeqCst)));
+        cache.check_leadership();
+        flag.store(true, SeqCst); cache.check_leadership(); cache.check_leadership();
+        flag.store(false, SeqCst); cache.check_leadership();
+        assert_eq!(calls.load(SeqCst), 6);
+        gate.close(); assert!(cache.bindings_snapshot().is_some());
+        clock.store(23, SeqCst); assert!(cache.bindings_snapshot().is_none());
     }
 }

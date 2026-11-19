@@ -23,6 +23,7 @@ use std::{
 };
 const TIMEOUT: Duration = Duration::from_secs(5);
 struct Fixture {
+    store: Arc<RedbStore>,
     a: Arc<Authority>,
     clock: Arc<AtomicU64>,
     dir: PathBuf,
@@ -47,7 +48,7 @@ impl Fixture {
         let store = Arc::new(
             RedbStore::with_clock(&dir, &root, Arc::new(move || c.load(Ordering::SeqCst))).unwrap(),
         );
-        let a = Authority::load(store, session_limits).unwrap();
+        let a = Authority::load(store.clone(), session_limits).unwrap();
         let p = a
             .create_principal("agent", PrincipalKind::Agent, false, "agent")
             .unwrap();
@@ -80,11 +81,12 @@ impl Fixture {
             state.clone(),
             Arc::new(PeerAuth::new(&[7; 32]).unwrap()),
             HashMap::from([("email".into(), limits)]),
-        ).with_serving_gate(gate.clone()).unwrap();
+        ).with_bindings_store(store.clone()).unwrap().with_serving_gate(gate.clone()).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(server.clone().serve(listener));
         Self {
+            store,
             a,
             clock,
             dir,
@@ -851,4 +853,205 @@ async fn credential_and_grant_refresh_preserve_live_connections_and_drop_batches
     f.a.set_grants(f.session.principal,vec![(f.session.route.clone(),Mode::ReadOnly)]).unwrap();
     let aa=a.clone();tokio::task::spawn_blocking(move||{aa.sync().unwrap();assert_eq!(aa.cached(),(0,0));assert_eq!(aa.admit(id,Operation::Write).err(),Some(crate::state::authority::AdmitError::ReadOnly));}).await.unwrap();
     assert_eq!(signal.try_ended(),None);drop(a);cleanup(f).await;
+}
+
+#[tokio::test]
+async fn bindings_conditional_round_trip_and_refusals() {
+    let f = Fixture::new(true, limits()).await;
+    crate::policy::bindings::record_route_stamp(
+        f.store.as_ref(),
+        &RouteId::new("postgres").unwrap(),
+        "rev-42-test",
+    )
+    .unwrap();
+    let c = f.client();
+    let first = c
+        .bindings(
+            BindingsRequest {
+                have_term: 0,
+                have_version: 0,
+            },
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.term, f.leader.term());
+    assert_eq!(first.version, 1);
+    let snapshot = first.snapshot.unwrap();
+    assert_eq!(snapshot.version, 1);
+    assert_eq!(snapshot.routes["postgres"].revision, 42);
+    let current = c
+        .bindings(
+            BindingsRequest {
+                have_term: first.term,
+                have_version: 1,
+            },
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert!(current.snapshot.is_none());
+    let changed_term = c
+        .bindings(
+            BindingsRequest {
+                have_term: first.term + 1,
+                have_version: 1,
+            },
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert!(changed_term.snapshot.is_some());
+    let changed_version = c
+        .bindings(
+            BindingsRequest {
+                have_term: first.term,
+                have_version: 0,
+            },
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert!(changed_version.snapshot.is_some());
+    let bad = PeerClient::with_url(
+        f.url.clone(),
+        "bad-pod".into(),
+        Arc::new(PeerAuth::new(&[8; 32]).unwrap()),
+    );
+    assert!(matches!(
+        bad.bindings(
+            BindingsRequest {
+                have_term: 0,
+                have_version: 0
+            },
+            TIMEOUT
+        )
+        .await,
+        Err(PeerError::Unauthorized)
+    ));
+    c.observe_generation(first.term + 1);
+    assert!(matches!(
+        c.bindings(
+            BindingsRequest {
+                have_term: 0,
+                have_version: 0
+            },
+            TIMEOUT
+        )
+        .await,
+        Err(PeerError::Stale)
+    ));
+    cleanup(f).await;
+    let follower = Fixture::new(false, limits()).await;
+    assert!(matches!(
+        follower
+            .client()
+            .bindings(
+                BindingsRequest {
+                    have_term: 0,
+                    have_version: 0
+                },
+                TIMEOUT
+            )
+            .await,
+        Err(PeerError::NotLeader)
+    ));
+    cleanup(follower).await;
+}
+
+#[test]
+fn bindings_messages_refuse_unknown_fields() {
+    assert!(
+        serde_json::from_str::<BindingsRequest>(r#"{"have_term":0,"have_version":0,"extra":true}"#)
+            .is_err()
+    );
+    assert!(
+        serde_json::from_str::<BindingsReply>(
+            r#"{"term":0,"version":0,"snapshot":null,"extra":true}"#
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<BindingsReply>(
+            r#"{"term":0,"version":0,"snapshot":{"version":0,"routes":{},"extra":true}}"#
+        )
+        .is_err()
+    );
+    assert!(serde_json::from_str::<BindingsReply>(r#"{"term":0,"version":0,"snapshot":{"version":0,"routes":{"route":{"bindings":[],"retired":[],"revision":0,"reset_owed":false,"extra":true}}}}"#).is_err());
+}
+
+#[tokio::test]
+async fn bindings_store_unavailable_and_follower_never_reads_it() {
+    let f = Fixture::new(true, limits()).await;
+    for leader in [false, true] {
+        let state = if leader {
+            LeaderState::live_for_test()
+        } else {
+            LeaderState::default()
+        };
+        let server = PeerServer::new(
+            f.a.clone(),
+            state,
+            Arc::new(PeerAuth::new(&[7; 32]).unwrap()),
+            HashMap::new(),
+        )
+        .with_serving_gate(f.gate.clone())
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = PeerClient::with_url(
+            format!("http://{}", listener.local_addr().unwrap()),
+            "pod-a".into(),
+            Arc::new(PeerAuth::new(&[7; 32]).unwrap()),
+        );
+        let task = tokio::spawn(server.serve(listener));
+        let result = client
+            .bindings(
+                BindingsRequest {
+                    have_term: 0,
+                    have_version: 0,
+                },
+                TIMEOUT,
+            )
+            .await;
+        assert!(matches!(
+            (leader, result),
+            (true, Err(PeerError::Protocol)) | (false, Err(PeerError::NotLeader))
+        ));
+        task.abort();
+        let _ = task.await;
+    }
+    cleanup(f).await;
+}
+
+#[cfg(all(test, feature = "kubernetes"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bindings_expire_after_one_term_and_refuse_observed_term_change() {
+    let f = Fixture::new(true, limits()).await;
+    crate::policy::bindings::record_route_stamp(f.store.as_ref(), &f.session.route, "rev-1-test").unwrap();
+    let mono = Arc::new(AtomicU64::new(1));
+    let client = Arc::new(f.client());
+    let gate = Arc::new(crate::policy::serving::ServingGate::default());
+    gate.extend_to(u64::MAX);
+    let clock = mono.clone();
+    let wall = f.clock.clone();
+    let cache = Arc::new(PeerStateCache::new(client.clone(), gate,
+        crate::state::runtime::Registry::default(), Duration::from_secs(6), 16)
+        .with_clocks(Arc::new(move || clock.load(Ordering::SeqCst)),
+            Arc::new(move || wall.load(Ordering::SeqCst))));
+    let worker = cache.clone();
+    tokio::task::spawn_blocking(move || worker.sync().unwrap()).await.unwrap();
+    assert_eq!(cache.bindings_snapshot().unwrap().routes["postgres"].revision, 1);
+    mono.store(6_000_000_000, Ordering::SeqCst);
+    assert!(cache.bindings_snapshot().is_some());
+    mono.store(6_000_000_001, Ordering::SeqCst);
+    assert!(cache.bindings_snapshot().is_none());
+    let worker = cache.clone();
+    tokio::task::spawn_blocking(move || worker.sync().unwrap()).await.unwrap();
+    assert!(cache.bindings_snapshot().is_some());
+    // A newer term observed by the shared client invalidates the old bindings
+    // immediately, even before another successful bindings fetch.
+    client.observe_generation(f.leader.term() + 1);
+    assert!(cache.bindings_snapshot().is_none());
+    drop(cache);
+    cleanup(f).await;
 }

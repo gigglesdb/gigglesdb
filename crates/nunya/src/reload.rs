@@ -97,6 +97,8 @@ pub(crate) struct Hub {
     pub(crate) serving_gate: Option<Arc<crate::policy::serving::ServingGate>>,
     #[cfg(feature = "kubernetes")]
     pub(crate) activation_tracker: RwLock<Option<Arc<crate::policy::kube_activation::ActivationTracker>>>,
+    #[cfg(feature = "kubernetes")]
+    peer_bindings: RwLock<Option<PeerBindings>>,
     state: Mutex<State>,
     /// Service lifecycle and management audit log.
     pub(crate) log: ReloadableLog,
@@ -110,6 +112,17 @@ pub(crate) struct Hub {
     reset_callback: RwLock<Option<ResetCallback>>,
     watch_ms: Option<u64>,
     service: crate::policy::ServicePolicySettings,
+}
+#[cfg(feature = "kubernetes")]
+type BindingsProvider = Arc<dyn Fn() -> Option<Arc<bindings::BindingsSnapshot>> + Send + Sync>;
+#[cfg(feature = "kubernetes")]
+struct PeerBindings {
+    leader: Arc<dyn Fn() -> bool + Send + Sync>,
+    snapshot: BindingsProvider,
+}
+#[cfg(feature = "kubernetes")]
+fn stamp_number(stamp: &str) -> Option<u64> {
+    stamp.strip_prefix("rev-")?.split('-').next()?.parse().ok()
 }
 #[cfg(test)]
 type ResetCallback = Arc<dyn Fn(&MembershipChange, &Policy) -> Result<usize, String> + Send + Sync>;
@@ -263,16 +276,25 @@ impl Hub {
         let unit = &state.units[state.unit(route.as_str()).map_err(|_| PolicyOpError::UnknownRoute)?];
         let published = unit.routes.iter().find(|r| r.id() == route.as_str()).ok_or(PolicyOpError::Unavailable)?;
         let snapshot = published.locks().1.read().map_err(|_| PolicyOpError::Unavailable)?;
-        self.check_draft(unit, route, toml, &snapshot)
+        self.check_draft(unit, route, toml, &snapshot, self.is_follower())
     }
-    fn check_draft(&self, unit: &Unit, route: &RouteId, toml: &str, snapshot: &Snapshot) -> Result<PolicyDocument, PolicyOpError> {
+    fn check_draft(&self, unit: &Unit, route: &RouteId, toml: &str, snapshot: &Snapshot, follower: bool) -> Result<PolicyDocument, PolicyOpError> {
         let doc = parse_policy_bytes(&unit.path, toml.as_bytes(), &self.service).map_err(|errors| {
             if !errors.is_empty() && errors.iter().all(|e| (e.message.starts_with("readlog:") || e.message.starts_with("snapshot_max_age_ms:")) && (e.message.ends_with("moved to the service config") || e.message.ends_with("policy file and service config disagree"))) { PolicyOpError::InfrastructureSetting }
             else { PolicyOpError::Invalid(errors.into_iter().map(|e| e.message).collect()) }
         })?;
         if readlog_key(&doc.policy.readlog) != readlog_key(&unit.doc.policy.readlog) || doc.policy.snapshot_max_age_ms != unit.doc.policy.snapshot_max_age_ms { return Err(PolicyOpError::InfrastructureSetting); }
-        let store = self.store.read().map_err(|_| PolicyOpError::Unavailable)?;
-        let bindings = match store.as_ref() { Some(s) => bindings::load(s.as_ref(), route).map_err(|_| PolicyOpError::Unavailable)?, None => RouteBindings::default() };
+        #[cfg(feature = "kubernetes")]
+        let follower = if follower {
+            let snapshot = self.binding_snapshot().ok_or(PolicyOpError::Unavailable)?;
+            Some(snapshot.routes.get(route.as_str()).map(bindings::route_bindings).transpose().map_err(|_| PolicyOpError::Unavailable)?.unwrap_or_default())
+        } else { None };
+        #[cfg(not(feature = "kubernetes"))]
+        let follower: Option<RouteBindings> = { let _ = follower; None };
+        let bindings = if let Some(bindings) = follower { bindings } else {
+            let store = self.store.read().map_err(|_| PolicyOpError::Unavailable)?;
+            match store.as_ref() { Some(s) => bindings::load(s.as_ref(), route).map_err(|_| PolicyOpError::Unavailable)?, None => RouteBindings::default() }
+        };
         crate::policy::validate::validate_document(&doc, snapshot, &bindings).map_err(|e| PolicyOpError::Invalid(e.into_iter().map(|e| e.message).collect()))?;
         let policy = crate::policy::effective::served_policy(&doc, snapshot, &bindings);
         crate::policy::validate::validate_dependents(&policy, snapshot).map_err(|e| PolicyOpError::Invalid(e.into_iter().map(|e| e.message).collect()))?;
@@ -291,6 +313,8 @@ impl Hub {
     }
     /// Transfer a single-route file policy to durable service ownership.
     pub(crate) fn import_policy(&self, route: &RouteId, actor: &str, idempotency_key: Option<String>) -> Result<PolicyRevision, PolicyOpError> {
+        let follower = self.is_follower();
+        if follower { return Err(PolicyOpError::Unavailable); }
         let mut state = self.state.lock().map_err(|_| PolicyOpError::Unavailable)?;
         let index = state.unit(route.as_str()).map_err(|_| PolicyOpError::UnknownRoute)?;
         if state.configured.iter().filter(|(_, i)| *i == index).count() != 1 { return Err(PolicyOpError::SharedPolicyFile); }
@@ -300,7 +324,7 @@ impl Hub {
         if let Some(r) = Self::replay(store.as_ref(), route, &idempotency_key, &digest)? {
             if store.owner(route)? != Owner::Service { return Err(RevisionStoreError::IdempotencyConflict.into()); }
             self.route_owners.write().map_err(|_| PolicyOpError::Unavailable)?.insert(route.as_str().into(), Owner::Service);
-            self.finish_replay(&mut state, route, &r)?;
+            self.finish_replay(&mut state, route, &r, follower)?;
             return Ok(r);
         }
         let unit = &mut state.units[index];
@@ -323,6 +347,8 @@ impl Hub {
             WriteOutcome::Stale { .. } => return Err(PolicyOpError::Unavailable),
         };
         self.route_owners.write().map_err(|_| PolicyOpError::Unavailable)?.insert(route.as_str().into(), Owner::Service);
+        #[cfg(feature = "kubernetes")]
+        self.record_bindings_revision(route.as_str(), &revision_stamp(&r), follower);
         let stamp = revision_stamp(&r);
         revisions.policy = stamp.clone();
         if let Some(ctx) = &mut ctx_revision { **ctx = Some(stamp); }
@@ -335,14 +361,16 @@ impl Hub {
         if &r.route != route { return Err(PolicyOpError::Unavailable); }
         let mut state = self.state.lock().map_err(|_| PolicyOpError::Unavailable)?;
         if self.route_owners.read().map_err(|_| PolicyOpError::Unavailable)?.get(route.as_str()) != Some(&Owner::Service) { return Err(PolicyOpError::NotServiceOwned); }
-        self.publish_revision(&mut state, route, r)
+        self.publish_revision(&mut state, route, r, self.is_follower())
     }
     #[allow(clippy::too_many_arguments)]
-    fn publish_compiled(&self, route: &RouteId, published: &PublishedRoute, policy: &mut Arc<Policy>, compiled: &Arc<Policy>, change: Option<&MembershipChange>, r: &PolicyRevision, predecessor: &str) -> Result<(), PolicyOpError> {
-        self.reset_membership(change, policy).map_err(|_| PolicyOpError::Unavailable)?;
+    fn publish_compiled(&self, route: &RouteId, published: &PublishedRoute, policy: &mut Arc<Policy>, compiled: &Arc<Policy>, change: Option<&MembershipChange>, r: &PolicyRevision, predecessor: &str, follower: bool) -> Result<(), PolicyOpError> {
+        self.reset_membership(change, policy, follower).map_err(|_| PolicyOpError::Unavailable)?;
         let old = policy.clone();
         *policy = compiled.clone();
         let tightened = published.fence().is_some_and(|f| f.publish(&old, compiled).is_some());
+        #[cfg(feature = "kubernetes")]
+        self.record_bindings_revision(route.as_str(), &revision_stamp(r), follower);
         #[cfg(feature = "kubernetes")]
         if let Some(tracker) = self.activation_tracker.read().map_err(|_| PolicyOpError::Unavailable)?.as_ref() { let previous = predecessor.strip_prefix("rev-").and_then(|s| s.split('-').next()).and_then(|s| s.parse::<u64>().ok());
             tracker.published(route.as_str(), r.number, tightened || previous != r.number.checked_sub(1)); }
@@ -350,29 +378,33 @@ impl Hub {
         let _ = (route, r, tightened, predecessor);
         Ok(())
     }
-    fn publish_revision(&self, state: &mut State, route: &RouteId, r: &PolicyRevision) -> Result<(), PolicyOpError> {
+    fn publish_revision(&self, state: &mut State, route: &RouteId, r: &PolicyRevision, follower: bool) -> Result<(), PolicyOpError> {
         let index = state.unit(route.as_str()).map_err(|_| PolicyOpError::UnknownRoute)?;
         let stamp = state.units[index].revisions.read().map_err(|_| PolicyOpError::Unavailable)?.policy.clone();
         let loaded = stamp.strip_prefix("rev-").and_then(|s| s.split('-').next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-        if loaded == r.number { return Ok(()); }
+        if loaded == r.number {
+            #[cfg(feature = "kubernetes")]
+            self.record_bindings_revision(route.as_str(), &stamp, follower);
+            return Ok(());
+        }
         if loaded > r.number { return Err(PolicyOpError::Unavailable); }
-        self.finish_publication(state, route, r)
+        self.finish_publication(state, route, r, follower)
     }
-    fn finish_replay(&self, state: &mut State, route: &RouteId, r: &PolicyRevision) -> Result<(), PolicyOpError> {
-        if self.revision_backend()?.active(route)?.is_some_and(|a| a.number == r.number) { self.publish_revision(state, route, r)?; }
+    fn finish_replay(&self, state: &mut State, route: &RouteId, r: &PolicyRevision, follower: bool) -> Result<(), PolicyOpError> {
+        if self.revision_backend()?.active(route)?.is_some_and(|a| a.number == r.number) { self.publish_revision(state, route, r, follower)?; }
         Ok(())
     }
-    fn finish_publication(&self, state: &mut State, route: &RouteId, r: &PolicyRevision) -> Result<(), PolicyOpError> {
+    fn finish_publication(&self, state: &mut State, route: &RouteId, r: &PolicyRevision, follower: bool) -> Result<(), PolicyOpError> {
         let index = state.unit(route.as_str()).map_err(|_| PolicyOpError::UnknownRoute)?;
         {
             let unit = &mut state.units[index];
             let published = unit.routes.iter().find(|p| p.id() == route.as_str()).ok_or(PolicyOpError::Unavailable)?;
             let snapshot = published.locks().1.read().map_err(|_| PolicyOpError::Unavailable)?;
-            let doc = self.check_draft(unit, route, &r.policy_toml, &snapshot).map_err(|_| PolicyOpError::Unavailable)?;
-            let (compiled, change) = self.compile(&doc, route, &snapshot).map_err(|_| PolicyOpError::Unavailable)?;
+            let doc = self.check_draft(unit, route, &r.policy_toml, &snapshot, follower).map_err(|_| PolicyOpError::Unavailable)?;
+            let (compiled, change) = self.compile(&doc, route, &snapshot, Some(&revision_stamp(r)), follower).map_err(|_| PolicyOpError::Unavailable)?;
             let mut policy = published.locks().0.write().map_err(|_| PolicyOpError::Unavailable)?;
             let predecessor = unit.revisions.read().map_err(|_| PolicyOpError::Unavailable)?.policy.clone();
-            self.publish_compiled(route, published, &mut policy, &compiled, change.as_ref(), r, &predecessor)?;
+            self.publish_compiled(route, published, &mut policy, &compiled, change.as_ref(), r, &predecessor, follower)?;
             match &published.route {
                 Route::Postgres(c) => *c.policy_revision.write().map_err(|_| PolicyOpError::Unavailable)? = Some(revision_stamp(r)),
                 Route::Spanner(c) => *c.policy_revision.write().map_err(|_| PolicyOpError::Unavailable)? = Some(revision_stamp(r)),
@@ -383,7 +415,7 @@ impl Hub {
             unit.doc = Arc::new(doc); unit.policy = Arc::new(unit.doc.policy.clone());
             unit.source = r.policy_toml.clone(); unit.hash = r.policy_sha256.clone(); unit.applied = r.created_unix_ms;
             for p in &mut unit.routes { p.policy = compiled.clone(); p.membership_failed = false; }
-            self.membership_published(route.as_str());
+            self.membership_published(route.as_str(), follower);
         }
         Ok(())
     }
@@ -404,12 +436,14 @@ impl Hub {
     }
     #[allow(clippy::too_many_arguments)]
     fn service_apply(&self, state: &mut State, route: &RouteId, actor: &str, toml: &str, expected: u64, fingerprint: &str, idempotency_key: Option<String>, kind: RevisionKind) -> Result<PolicyRevision, PolicyOpError> {
+        let follower = self.is_follower();
+        if follower { return Err(PolicyOpError::Unavailable); }
         let index = state.unit(route.as_str()).map_err(|_| PolicyOpError::UnknownRoute)?;
         let store = self.revision_backend()?;
         if store.owner(route)? != Owner::Service { return Err(PolicyOpError::NotServiceOwned); }
         let digest = request_digest(actor, toml, Some(expected), fingerprint, &kind);
         if let Some(r) = Self::replay(store.as_ref(), route, &idempotency_key, &digest)? {
-            self.finish_replay(state, route, &r).map_err(|_| PolicyOpError::Unavailable)?;
+            self.finish_replay(state, route, &r, follower).map_err(|_| PolicyOpError::Unavailable)?;
             return Ok(r);
         }
         let active = store.active(route)?.ok_or(PolicyOpError::MissingRevision)?;
@@ -417,14 +451,14 @@ impl Hub {
         let unit = &mut state.units[index];
         let published = unit.routes.iter().find(|r| r.id() == route.as_str()).ok_or(PolicyOpError::Unavailable)?;
         let snapshot = published.locks().1.read().map_err(|_| PolicyOpError::Unavailable)?;
-        let doc = self.check_draft(unit, route, toml, &snapshot)?;
+        let doc = self.check_draft(unit, route, toml, &snapshot, follower)?;
         drop(snapshot);
         let result = (|| {
             let mut policy = published.locks().0.write().map_err(|_| PolicyOpError::Unavailable)?;
             let snapshot = published.locks().1.read().map_err(|_| PolicyOpError::Unavailable)?;
             let current = crate::schema::catalog_fingerprint(&snapshot);
             if current != fingerprint { return Err(PolicyOpError::CatalogChanged { current }); }
-            let (compiled, change) = self.compile(&doc, route, &snapshot).map_err(|e| if e.membership { PolicyOpError::Unavailable } else { PolicyOpError::Invalid(vec![e.message]) })?;
+            let (compiled, change) = self.compile(&doc, route, &snapshot, Some(&format!("rev-{}-preview", expected.checked_add(1).ok_or(PolicyOpError::Unavailable)?)), follower).map_err(|e| if e.membership { PolicyOpError::Unavailable } else { PolicyOpError::Invalid(vec![e.message]) })?;
             let mut revisions = unit.revisions.write().map_err(|_| PolicyOpError::Unavailable)?;
             let ctx = match &published.route {
                 Route::Postgres(c) => Some(&c.policy_revision), Route::Spanner(c) => Some(&c.policy_revision),
@@ -437,7 +471,7 @@ impl Hub {
                 WriteOutcome::Stale { current: Some(r) } => return Err(PolicyOpError::Stale { current: (&r).into() }),
                 WriteOutcome::Stale { current: None } => return Err(PolicyOpError::MissingRevision),
             };
-            self.publish_compiled(route, published, &mut policy, &compiled, change.as_ref(), &r, &revisions.policy)?;
+            self.publish_compiled(route, published, &mut policy, &compiled, change.as_ref(), &r, &revisions.policy, follower)?;
             let stamp = revision_stamp(&r);
             revisions.policy = stamp.clone();
             if let Some(ctx) = &mut ctx { **ctx = Some(stamp); }
@@ -448,14 +482,14 @@ impl Hub {
                 unit.doc = Arc::new(doc); unit.policy = Arc::new(unit.doc.policy.clone());
                 unit.source = toml.into(); unit.hash = r.policy_sha256.clone(); unit.applied = r.created_unix_ms;
                 for p in &mut unit.routes { p.policy = compiled.clone(); p.membership_failed = false; }
-                self.membership_published(route.as_str());
+                self.membership_published(route.as_str(), follower);
                 Ok(r)
             }
             Ok((r, None)) => Ok(r),
             Err(e) => {
                 // Durable bindings or a committed revision may now be ahead of publication.
                 let ahead = store.active(route).map_or(true, |r| r.is_none_or(|r| r.number != expected));
-                if ahead || self.membership_pending(route.as_str()) { for p in &mut unit.routes { p.membership_failed = true; } }
+                if ahead || self.membership_pending(route.as_str(), follower) { for p in &mut unit.routes { p.membership_failed = true; } }
                 Err(e)
             }
         }
@@ -611,6 +645,8 @@ impl Hub {
             serving_gate: None,
             #[cfg(feature = "kubernetes")]
             activation_tracker: RwLock::new(None),
+            #[cfg(feature = "kubernetes")]
+            peer_bindings: RwLock::new(None),
             log: ReloadableLog(
                 Arc::new(RwLock::new(sink)),
                 Arc::new(RwLock::new(crate::serve::Revisions::default())),
@@ -645,7 +681,74 @@ impl Hub {
         Ok(())
     }
 
-    fn compile(&self, doc: &PolicyDocument, route: &RouteId, snapshot: &Snapshot) -> Result<(Arc<Policy>, Option<MembershipChange>), CompileError> {
+    /// Attach peer binding sources; tests can inject a snapshot and a leader flag directly.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn set_peer_bindings(&self, leader: Arc<dyn Fn() -> bool + Send + Sync>, snapshot: BindingsProvider) {
+        *self.peer_bindings.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PeerBindings { leader, snapshot });
+    }
+    #[cfg(feature = "kubernetes")]
+    fn is_follower(&self) -> bool {
+        self.peer_bindings.read().map_or(true, |p| p.as_ref().is_some_and(|p| !(p.leader)()))
+    }
+    #[cfg(not(feature = "kubernetes"))]
+    fn is_follower(&self) -> bool { false }
+    #[cfg(feature = "kubernetes")]
+    fn binding_snapshot(&self) -> Option<Arc<bindings::BindingsSnapshot>> {
+        (self.peer_bindings.read().ok()?.as_ref()?.snapshot)()
+    }
+    #[cfg(feature = "kubernetes")]
+    fn record_bindings_revision(&self, route: &str, stamp: &str, follower: bool) {
+        if follower { return; }
+        let result = (|| {
+            let peer = self.peer_bindings.read().map_err(|_| ())?;
+            if peer.is_none() { return Ok(()); }
+            let store = self.store.read().map_err(|_| ())?;
+            bindings::record_route_stamp(store.as_ref().ok_or(())?.as_ref(), &RouteId::new(route).ok_or(())?, stamp).map_err(|_| ())
+        })();
+        if result.is_err() { eprintln!("serve: binding stamp record unavailable; retry on next publication"); }
+    }
+    /// Refuse follower serving renewal while any registered route lacks compiled bindings.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn peer_bindings_ready(&self) -> bool {
+        !self.is_follower() || (self.binding_snapshot().is_some() && self.state.lock().is_ok_and(|s| s.units.iter().all(|u| u.routes.iter().all(|r| !r.membership_failed))))
+    }
+    /// Recompile current documents after a binding snapshot or leadership change.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn recompile_bindings(&self) {
+        let follower = self.is_follower();
+        let Ok(mut state) = self.state.lock() else { return; };
+        let independent = state.units.len() > 1;
+        for unit in &mut state.units {
+            let stamp = match unit.revisions.read() { Ok(r) => r.policy.clone(), Err(_) => continue };
+            let hash = unit.hash.clone();
+            let doc = (*unit.doc).clone();
+            if self.apply_unit_with_role(unit, independent, Ok(doc), Some(stamp), follower).is_err() && follower
+                && let Some(gate) = &self.serving_gate { gate.close(); }
+            unit.hash = hash;
+        }
+    }
+
+    fn compile(&self, doc: &PolicyDocument, route: &RouteId, snapshot: &Snapshot, stamp: Option<&str>, follower: bool) -> Result<(Arc<Policy>, Option<MembershipChange>), CompileError> {
+        #[cfg(not(feature = "kubernetes"))]
+        let _ = (stamp, follower);
+        #[cfg(feature = "kubernetes")]
+        if follower {
+            let snapshot_bindings = self.binding_snapshot().ok_or_else(|| CompileError::binding("leader bindings unavailable"))?;
+            let stamp = stamp.filter(|s| !s.is_empty() && !s.ends_with("-preview")).ok_or_else(|| CompileError::binding("policy stamp unavailable"))?;
+            let route_snapshot = snapshot_bindings.routes.get(route.as_str());
+            let ready = route_snapshot.is_some_and(|r| !r.reset_owed && !r.stamp.is_empty() && match (stamp_number(stamp), stamp_number(&r.stamp)) {
+                (Some(current), Some(published)) => published >= current,
+                _ => r.stamp == stamp,
+            });
+            if !ready { return Err(CompileError::binding("leader route bindings not ready")); }
+            let records = route_snapshot.map(bindings::route_bindings).transpose().map_err(CompileError::binding)?.unwrap_or_default();
+            let warnings = crate::policy::validate::validate_document(doc, snapshot, &records).map_err(crate::serve::errors)?;
+            let mut policy = crate::policy::effective::served_policy(doc, snapshot, &records);
+            policy.retired_domains = route_snapshot.map(|r| r.retired.iter().cloned().collect()).unwrap_or_default();
+            crate::policy::validate::validate_dependents(&policy, snapshot).map_err(crate::serve::errors)?;
+            for warning in warnings { eprintln!("serve: policy warning: {}", warning.message.replace(['\r', '\n'], " ")); }
+            return Ok((Arc::new(policy), None));
+        }
         let store = self.store.read().map_err(|_| CompileError::binding("policy bindings unavailable"))?;
         let needs_bindings = (doc.version == PolicyVersion::V2 && doc.route_default == RouteDefault::Tokenize)
             || !doc.links.is_empty();
@@ -691,8 +794,9 @@ impl Hub {
         Ok((Arc::new(policy), change))
     }
 
-    fn reset_membership(&self, change: Option<&MembershipChange>, old: &Policy) -> Result<(), String> {
+    fn reset_membership(&self, change: Option<&MembershipChange>, old: &Policy, follower: bool) -> Result<(), String> {
         let Some(change) = change.filter(|change| change.requires_reset()) else { return Ok(()); };
+        if follower { return Err("follower cannot reset membership".into()); }
         let authority = self.authority.read().map_err(|_| "session authority unavailable")?.upgrade();
         let count = if let Some(authority) = authority {
             authority.end_route_sessions(&change.route, crate::state::model::EndReason::PolicyReset)
@@ -715,14 +819,19 @@ impl Hub {
         }).map_err(|_| "read log unavailable".to_string())
     }
 
-    fn membership_pending(&self, route: &str) -> bool {
+    fn membership_pending(&self, route: &str, follower: bool) -> bool {
+        #[cfg(not(feature = "kubernetes"))]
+        let _ = follower;
+        #[cfg(feature = "kubernetes")]
+        if follower { return self.binding_snapshot().is_none_or(|s| s.routes.get(route).is_none_or(|r| r.reset_owed)); }
         self.pending_membership.lock().map_or(true, |pending| pending.contains_key(route))
             || self.store.read().map_or(true, |store| store.as_ref().is_some_and(|store| {
                 RouteId::new(route).is_none_or(|route| bindings::load_reset(store.as_ref(), &route).map_or(true, |owed| owed.is_some()))
             }))
     }
 
-    fn membership_published(&self, route: &str) {
+    fn membership_published(&self, route: &str, follower: bool) {
+        if follower { return; }
         // A failed cleanup retains the durable marker, making restart repeat the safe reset.
         if let Ok(store) = self.store.read() && let Some(store) = store.as_ref() {
             let _ = bindings::clear_reset(store.as_ref(), route);
@@ -799,6 +908,7 @@ impl Hub {
     }
     /// Validate and install the configured unit policy before publishing a route.
     pub(crate) fn register(&self, route: Route) -> Result<(), String> {
+        let follower = self.is_follower();
         let mut state = self.state.lock().map_err(|_| "policy lock unavailable")?;
         let index = state.unit(route.id())?;
         let s = &mut state.units[index];
@@ -813,18 +923,28 @@ impl Hub {
             Route::Test(..) => None,
         };
         let mut revision = revision.map(|revision| revision.write().map_err(|_| "revision lock unavailable")).transpose()?;
-        let (compiled, change) = self.compile(&s.doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, &snapshot)
-            .map_err(|error| {
-                if error.membership || self.membership_pending(route.id()) {
+        let compiled = self.compile(&s.doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, &snapshot, Some(s.revisions.read().map_err(|_| "revision unavailable")?.policy.as_str()), follower);
+        #[cfg(feature = "kubernetes")]
+        if compiled.as_ref().is_err_and(|e| e.membership) && follower {
+            let pending = current.clone();
+            drop(snapshot);
+            drop(current);
+            drop(revision);
+            s.routes.push(PublishedRoute { route, policy: pending, refresh_failed: false, membership_failed: true });
+            if let Some(gate) = &self.serving_gate { gate.close(); }
+            return Ok(());
+        }
+        let (compiled, change) = compiled.map_err(|error| {
+                if error.membership || self.membership_pending(route.id(), follower) {
                     for registered in &mut s.routes {
                         if registered.id() == route.id() { registered.membership_failed = true; }
                     }
                 }
                 error.message
             })?;
-        self.reset_membership(change.as_ref(), &current).inspect_err(|_| {
+        self.reset_membership(change.as_ref(), &current, follower).inspect_err(|_| {
             for registered in &mut s.routes {
-                if registered.id() == route.id() && self.membership_pending(route.id()) { registered.membership_failed = true; }
+                if registered.id() == route.id() && self.membership_pending(route.id(), follower) { registered.membership_failed = true; }
             }
         })?;
         {
@@ -836,7 +956,9 @@ impl Hub {
         drop(snapshot);
         drop(current);
         drop(revision);
-        self.membership_published(route.id());
+        #[cfg(feature = "kubernetes")]
+        self.record_bindings_revision(route.id(), &s.revisions.read().map_err(|_| "revision unavailable")?.policy, follower);
+        self.membership_published(route.id(), follower);
         s.routes.push(PublishedRoute { route, policy: compiled, refresh_failed: false, membership_failed: false });
         Ok(())
     }
@@ -854,6 +976,7 @@ impl Hub {
     }
 
     fn publish_refresh(&self, unit: &mut Unit, route: &Route, snapshot: Snapshot, apply: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        let follower = self.is_follower();
         if unit.routes.iter().any(|registered| registered.id() == route.id() && registered.membership_failed) {
             return Err("policy membership requires successful reload".into());
         }
@@ -861,23 +984,25 @@ impl Hub {
             let (policy, catalog) = route.locks();
             let mut policy = policy.write().map_err(|_| "policy lock unavailable")?;
             let mut catalog = catalog.write().map_err(|_| "snapshot lock unavailable")?;
-            let (compiled, change) = self.compile(&unit.doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, &snapshot)
+            let (compiled, change) = self.compile(&unit.doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, &snapshot, Some(unit.revisions.read().map_err(|_| "revision unavailable")?.policy.as_str()), follower)
                 .map_err(|error| error.message)?;
-            self.reset_membership(change.as_ref(), &policy)?;
+            self.reset_membership(change.as_ref(), &policy, follower)?;
             apply()?;
             *catalog = Arc::new(snapshot);
             let old = policy.clone();
             *policy = compiled.clone();
             if let Some(fence) = route.fence() { fence.publish(&old, &compiled); }
+            #[cfg(feature = "kubernetes")]
+            self.record_bindings_revision(route.id(), &unit.revisions.read().map_err(|_| "revision unavailable")?.policy, follower);
             Ok(compiled)
         })();
         for registered in &mut unit.routes {
             if std::ptr::eq(registered.locks().0, route.locks().0) {
                 match &result {
-                    Ok(compiled) => { registered.policy = compiled.clone(); registered.refresh_failed = false; registered.membership_failed = false; self.membership_published(route.id()); }
+                    Ok(compiled) => { registered.policy = compiled.clone(); registered.refresh_failed = false; registered.membership_failed = false; self.membership_published(route.id(), follower); }
                     Err(_) => {
                         registered.refresh_failed = true;
-                        if self.membership_pending(route.id()) { registered.membership_failed = true; }
+                        if self.membership_pending(route.id(), follower) { registered.membership_failed = true; }
                     },
                 }
             }
@@ -898,6 +1023,9 @@ impl Hub {
     }
 
     fn apply_unit(&self, s: &mut Unit, independent: bool, candidate: Result<PolicyDocument, String>, digest: Option<String>) -> Result<(), String> {
+        self.apply_unit_with_role(s, independent, candidate, digest, self.is_follower())
+    }
+    fn apply_unit_with_role(&self, s: &mut Unit, independent: bool, candidate: Result<PolicyDocument, String>, digest: Option<String>, follower: bool) -> Result<(), String> {
         s.attempts += 1;
         s.last_time = now();
         let mut membership_failed = Vec::new();
@@ -924,11 +1052,11 @@ impl Hub {
                 snapshots.push(snap.read().map_err(|_| "snapshot lock unavailable")?);
             }
             let compiled = s.routes.iter().zip(&snapshots).map(|(route, snapshot)| {
-                self.compile(&doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, snapshot)
+                self.compile(&doc, &RouteId::new(route.id()).ok_or("route policy unavailable")?, snapshot, digest.as_deref(), follower)
                     .map_err(|error| { if error.membership { membership_failed.push(route.id().to_owned()); } error.message })
             }).collect::<Result<Vec<_>, String>>()?;
             for ((_, change), old) in compiled.iter().zip(&policies) {
-                self.reset_membership(change.as_ref(), old)?;
+                self.reset_membership(change.as_ref(), old, follower)?;
             }
             let mut route_revisions = Vec::new();
             for route in &s.routes {
@@ -964,10 +1092,12 @@ impl Hub {
                 **current = Some(revision.clone());
             }
             revisions.policy = revision.clone();
+            #[cfg(feature = "kubernetes")]
+            for route in &s.routes { self.record_bindings_revision(route.id(), revision, follower); }
             Ok::<_, String>((doc, policy, compiled))
         })();
         for route in &mut s.routes {
-            if result.is_err() && (membership_failed.iter().any(|id| id == route.id()) || self.membership_pending(route.id())) { route.membership_failed = true; }
+            if result.is_err() && (membership_failed.iter().any(|id| id == route.id()) || self.membership_pending(route.id(), follower)) { route.membership_failed = true; }
         }
         match result {
             Ok((doc, policy, compiled)) => {
@@ -976,7 +1106,7 @@ impl Hub {
                 for (route, compiled) in s.routes.iter_mut().zip(compiled) {
                     route.policy = compiled.0;
                     route.membership_failed = false;
-                    self.membership_published(route.id());
+                    self.membership_published(route.id(), follower);
                 }
                 s.hash = digest.ok_or("policy digest unavailable")?;
                 s.applied = now();
@@ -1216,6 +1346,8 @@ mod tests {
             serving_gate: None,
             #[cfg(feature = "kubernetes")]
             activation_tracker: RwLock::new(None),
+            #[cfg(feature = "kubernetes")]
+            peer_bindings: RwLock::new(None),
             log: ReloadableLog(
                 Arc::new(RwLock::new(crate::readlog::open_sink(&p.readlog).unwrap())),
                 Arc::new(RwLock::new(crate::serve::Revisions::default())),
@@ -2460,7 +2592,7 @@ mod tests {
         let bindings = bindings::load(store.as_ref(), &id("a")).unwrap();
         let warnings = crate::policy::validate::validate_document(&doc, &renamed, &bindings).unwrap();
         assert_eq!(warnings[0].message, "show rule names public.customers.email, renamed to public.customers.contact");
-        let (compiled, _) = hub.compile(&doc, &id("a"), &renamed).unwrap();
+        let (compiled, _) = hub.compile(&doc, &id("a"), &renamed, None, hub.is_follower()).unwrap();
         assert_eq!(compiled.treatment(&customer_column("contact")), Some(&Treatment::Show));
         let empty = RouteBindings::default();
         assert!(crate::policy::validate::validate_document(&doc, &renamed, &empty).is_err());
@@ -2820,4 +2952,160 @@ mod tests {
         revision.number += 1; revision.policy_toml = "invalid policy".into();
         assert!(h.adopt_revision(&route,&revision).is_err()); assert_eq!(ctx.fence.epoch(),initial+1);
     }
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn peer_follower_uses_only_published_bindings_and_refuses_unready_snapshots() {
+        let files = Files::new();
+        let settings = crate::policy::ServicePolicySettings { readlog: Some(ReadLogSink::Stdout), ..Default::default() };
+        let doc = parse(&files.a, b"version=2\ndefault='tokenize'\n", &settings).unwrap();
+        let route = id("a");
+        let catalog = customers(&[("email", 1)]);
+        let leader = hub();
+        let leader_store = binding_store(&files);
+        leader.set_store(leader_store.clone()).unwrap();
+        leader.set_peer_bindings(Arc::new(|| true), Arc::new(|| None));
+        let (expected, change) = leader.compile(&doc, &route, &catalog, Some("rev-7-test"), leader.is_follower()).unwrap();
+        leader.reset_membership(change.as_ref(), &expected, leader.is_follower()).unwrap();
+        leader.membership_published("a", leader.is_follower());
+        leader.record_bindings_revision("a", "rev-7-test", false);
+        let published = bindings::snapshot(leader_store.as_ref()).unwrap();
+        assert_eq!(published.routes["a"].revision, 7);
+        let follower_files = Files::new();
+        let follower = hub();
+        let local = binding_store(&follower_files);
+        follower.set_store(local.clone()).unwrap();
+        let before = bindings::snapshot(local.as_ref()).unwrap();
+        let provider = Arc::new(RwLock::new(Some(Arc::new(published.clone()))));
+        let source = provider.clone();
+        follower.set_peer_bindings(Arc::new(|| false), Arc::new(move || source.read().unwrap().clone()));
+        let (actual, change) = follower.compile(&doc, &route, &catalog, Some("rev-7-test"), follower.is_follower()).unwrap();
+        assert_eq!(actual, expected);
+        assert!(change.is_none());
+        let expanded = customers(&[("email", 1), ("new", 2)]);
+        let (actual, _) = follower.compile(&doc, &route, &expanded, Some("rev-7-test"), follower.is_follower()).unwrap();
+        assert!(actual.domain_of(&customer_column("new")).is_none());
+        assert_eq!(actual.treatment(&customer_column("new")), Some(&Treatment::Masked { placeholder: None }));
+        assert!(follower.compile(&doc, &route, &catalog, Some("rev-8-test"), follower.is_follower()).unwrap_err().membership);
+        assert!(follower.compile(&doc, &route, &catalog, None, follower.is_follower()).unwrap_err().membership);
+        let mut reset = published.clone(); reset.routes.get_mut("a").unwrap().reset_owed = true;
+        *provider.write().unwrap() = Some(Arc::new(reset));
+        assert!(follower.membership_pending("a", follower.is_follower()));
+        assert!(follower.compile(&doc, &route, &catalog, Some("rev-7-test"), follower.is_follower()).unwrap_err().membership);
+        follower.membership_published("a", follower.is_follower());
+        *provider.write().unwrap() = Some(Arc::new(bindings::BindingsSnapshot { version: 1, routes: Default::default() }));
+        assert!(follower.compile(&doc, &route, &catalog, Some("rev-7-test"), follower.is_follower()).unwrap_err().membership);
+        *provider.write().unwrap() = None;
+        assert!(follower.membership_pending("a", follower.is_follower()));
+        assert!(follower.compile(&doc, &route, &catalog, Some("rev-7-test"), follower.is_follower()).unwrap_err().membership);
+        assert_eq!(bindings::snapshot(local.as_ref()).unwrap(), before);
+        assert!(follower.pending_membership.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn peer_follower_cold_registration_recovers_after_bindings_arrive() {
+        let files = Files::new();
+        let mut hub = tokenize_hub(&files, &["postgres"]);
+        let gate = Arc::new(crate::policy::serving::ServingGate::default());
+        Arc::get_mut(&mut hub).unwrap().serving_gate = Some(gate.clone());
+        let store = binding_store(&files);
+        let leader = tokenize_hub(&files, &["postgres"]);
+        leader.set_store(store.clone()).unwrap();
+        let doc = hub.state.lock().unwrap().units[0].doc.as_ref().clone();
+        let catalog = customers(&[("email", 1)]);
+        let (expected, change) = leader.compile(&doc, &id("postgres"), &catalog, Some("rev-3-test"), leader.is_follower()).unwrap();
+        leader.reset_membership(change.as_ref(), &expected, leader.is_follower()).unwrap();
+        leader.membership_published("postgres", leader.is_follower());
+        bindings::record_route_stamp(store.as_ref(), &id("postgres"), "rev-3-test").unwrap();
+        let provider = Arc::new(RwLock::new(None));
+        let source = provider.clone();
+        hub.set_peer_bindings(Arc::new(|| false), Arc::new(move || source.read().unwrap().clone()));
+        hub.state.lock().unwrap().units[0].revisions.write().unwrap().policy = "rev-3-abc".into();
+        let mut fixture = crate::pgwire::session::tests::Fixture::new();
+        Arc::get_mut(&mut fixture.ctx).unwrap().serving_gate = Some(gate.clone());
+        let ctx = fixture.ctx.clone();
+        *ctx.snapshot.write().unwrap() = Arc::new(catalog);
+        hub.register(Route::Postgres(ctx.clone())).unwrap();
+        assert!(hub.state.lock().unwrap().units[0].routes[0].membership_failed);
+        assert!(!hub.peer_bindings_ready());
+        assert!(!gate.allow());
+        assert!(!hub.readiness(true, true).0);
+        assert!(hub.refresh(&Route::Postgres(ctx.clone()), customers(&[("email", 1)])).is_err());
+        *provider.write().unwrap() = Some(Arc::new(bindings::snapshot(store.as_ref()).unwrap()));
+        hub.recompile_bindings();
+        assert!(!hub.state.lock().unwrap().units[0].routes[0].membership_failed);
+        assert!(hub.peer_bindings_ready());
+        assert_eq!(*ctx.policy.read().unwrap().as_ref(), *expected);
+        assert_eq!(ctx.policy_revision.read().unwrap().as_deref(), Some("rev-3-abc"));
+        gate.extend_to(u64::MAX);
+        assert!(hub.readiness(true, true).0);
+        *provider.write().unwrap() = None;
+        hub.recompile_bindings();
+        assert!(!gate.allow());
+        assert!(!hub.peer_bindings_ready());
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn peer_registration_only_defers_follower_membership_errors() {
+        let files = Files::new();
+        for peer_leader in [None, Some(true)] {
+            let hub = tokenize_hub(&files, &["a"]);
+            if let Some(leader) = peer_leader { hub.set_peer_bindings(Arc::new(move || leader), Arc::new(|| None)); }
+            assert_eq!(hub.register(test_route("a", customers(&[("email", 1)]))).unwrap_err(), "policy bindings unavailable");
+            assert!(hub.state.lock().unwrap().units[0].routes.is_empty());
+        }
+        let hub = tokenize_hub(&files, &["a"]);
+        let store = binding_store(&files);
+        let doc = hub.state.lock().unwrap().units[0].doc.as_ref().clone();
+        hub.set_store(store.clone()).unwrap();
+        let catalog = customers(&[("email", 1)]);
+        let (policy, change) = hub.compile(&doc, &id("a"), &catalog, Some("rev-3-test"), hub.is_follower()).unwrap();
+        hub.reset_membership(change.as_ref(), &policy, hub.is_follower()).unwrap();
+        hub.membership_published("a", hub.is_follower());
+        bindings::record_route_stamp(store.as_ref(), &id("a"), "rev-3-test").unwrap();
+        let snapshot = Arc::new(bindings::snapshot(store.as_ref()).unwrap());
+        hub.set_peer_bindings(Arc::new(|| false), Arc::new(move || Some(snapshot.clone())));
+        hub.state.lock().unwrap().units[0].revisions.write().unwrap().policy = "rev-3-abc".into();
+        let mut catalog = catalog;
+        catalog.dependents.push(crate::schema::DependentObject {
+            name: "copy_email".into(), kind: crate::schema::DependentKind::Trigger,
+            reads: vec![customer_column("email")], writes_table: None,
+        });
+        assert!(hub.register(test_route("a", catalog)).unwrap_err().contains("trigger copy_email reads blind column"));
+        assert!(hub.state.lock().unwrap().units[0].routes.is_empty());
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn peer_leader_publication_records_revision_and_recompiles_on_flip() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let files = Files::new();
+        let hub = hub();
+        let store = binding_store(&files);
+        hub.set_store(store.clone()).unwrap();
+        let leader = Arc::new(AtomicBool::new(true));
+        let flag = leader.clone();
+        let provider = Arc::new(RwLock::new(None));
+        let source = provider.clone();
+        hub.set_peer_bindings(Arc::new(move || flag.load(SeqCst)), Arc::new(move || source.read().unwrap().clone()));
+        hub.state.lock().unwrap().units[0].revisions.write().unwrap().policy = "rev-3-abc".into();
+        hub.register(test_route("postgres", customers(&[("email", 1)]))).unwrap();
+        assert_eq!(bindings::snapshot(store.as_ref()).unwrap().routes["postgres"].revision, 3);
+        let doc = hub.state.lock().unwrap().units[0].doc.as_ref().clone();
+        hub.apply(0, Ok(doc), Some("rev-4-def".into())).unwrap();
+        assert_eq!(bindings::snapshot(store.as_ref()).unwrap().routes["postgres"].revision, 4);
+        leader.store(false, SeqCst);
+        hub.recompile_bindings();
+        assert!(hub.state.lock().unwrap().units[0].routes[0].membership_failed);
+        *provider.write().unwrap() = Some(Arc::new(bindings::snapshot(store.as_ref()).unwrap()));
+        hub.recompile_bindings();
+        assert!(!hub.state.lock().unwrap().units[0].routes[0].membership_failed);
+        leader.store(true, SeqCst);
+        hub.recompile_bindings();
+        assert!(!hub.state.lock().unwrap().units[0].routes[0].membership_failed);
+    }
+
+    #[cfg(all(test, feature = "kubernetes"))]
+    mod peer_pods { include!("reload/peer_pods_tests.rs"); }
 }

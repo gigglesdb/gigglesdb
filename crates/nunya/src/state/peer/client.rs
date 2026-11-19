@@ -145,6 +145,10 @@ impl PeerClient {
     }
     /// Highest authenticated election term observed so far.
     pub fn term(&self) -> u64 { self.highest.load(Ordering::SeqCst) }
+    /// Fetch the leader's bindings using authenticated generation fencing.
+    pub async fn bindings(&self, req: BindingsRequest, timeout: Duration) -> Result<BindingsReply, PeerError> {
+        self.call("bindings", &req, timeout).await
+    }
     /// Fetch live session rows and stored authentication digests.
     pub async fn session_lookup(&self, r: Lookup, t: Duration) -> Result<LookupResult, PeerError> {
         self.call("session/lookup", &r, t).await

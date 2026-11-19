@@ -172,6 +172,11 @@ impl ServingRenewer {
     pub fn with_peer_state(mut self, cache: Option<Arc<crate::state::peer::PeerStateCache>>) -> Self { self.peer_state = cache; self }
     /// Confirm heads, CAS the Lease, then confirm heads again before extending.
     pub fn cycle(&self) -> Result<(), ServingError> {
+        if let Some(cache) = &self.peer_state {
+            cache.check_leadership();
+            // Fetch the leader's bindings before attempting adoption of a newer head.
+            let _ = cache.sync();
+        }
         let t0 = self.clock.now();
         let budget = Duration::from_secs(self.config.serving_lease_secs)
             .saturating_sub(Duration::from_millis(self.config.serving_margin_ms))

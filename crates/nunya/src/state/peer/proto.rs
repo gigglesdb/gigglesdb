@@ -101,3 +101,8 @@ pub enum ChangeKind {
     End { /// Authority ending reason.
         reason: EndReason },
 }
+
+message!(/// Request leader bindings, conditional on election term and version.
+BindingsRequest { have_term: u64, have_version: u64 });
+message!(/// Consistent leader bindings or confirmation that the caller is current.
+BindingsReply { term: u64, version: u64, snapshot: Option<crate::policy::bindings::BindingsSnapshot> });

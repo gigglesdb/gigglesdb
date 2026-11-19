@@ -29,6 +29,7 @@ struct Batch {
 }
 /// Leader state service with server-owned per-domain limits.
 pub struct PeerServer {
+    bindings_store: Option<Arc<dyn crate::state::store::Store>>,
     authority: Arc<Authority>,
     leader: LeaderState,
     serving_gate: Option<Arc<crate::policy::serving::ServingGate>>,
@@ -60,6 +61,7 @@ impl PeerServer {
         limits: HashMap<String, TokenizeLimits>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            bindings_store: None,
             authority,
             leader,
             serving_gate: None,
@@ -71,6 +73,11 @@ impl PeerServer {
             #[cfg(test)]
             slow_lookup: Mutex::default(),
         })
+    }
+    /// Supply the leader's durable bindings store.
+    pub fn with_bindings_store(mut self: Arc<Self>, store: Arc<dyn crate::state::store::Store>) -> Result<Arc<Self>, PeerError> {
+        Arc::get_mut(&mut self).ok_or(PeerError::Protocol)?.bindings_store = Some(store);
+        Ok(self)
     }
     /// Refuse requests when the leader cannot currently serve its policy.
     pub fn with_serving_gate(mut self: Arc<Self>, gate: Arc<crate::policy::serving::ServingGate>) -> Result<Arc<Self>, PeerError> {
@@ -134,7 +141,7 @@ impl PeerServer {
         } else if parts.method != http::Method::POST || parts.uri.query().is_some() {
             Err(PeerError::Protocol)
         } else {
-            self.dispatch(parts.uri.path(), &body)
+            self.dispatch(parts.uri.path(), &body, generation)
         };
         let (status, body) = result.unwrap_or_else(|_| (400, b"{\"error\":\"refused\"}".to_vec()));
         match self.auth.seal(&body, &nonce, status, generation) {
@@ -152,8 +159,18 @@ impl PeerServer {
     pub(super) fn expire_batch(&self, id: &str) {
         self.batches.lock().unwrap().get_mut(id).unwrap().expires = 0;
     }
-    fn dispatch(&self, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), PeerError> {
+    fn dispatch(&self, path: &str, body: &[u8], generation: u64) -> Result<(u16, Vec<u8>), PeerError> {
         let reply = match path {
+            "/peer/v1/bindings" => {
+                let request: BindingsRequest = decode(body)?;
+                let store = self.bindings_store.as_ref().ok_or(PeerError::Protocol)?;
+                let snapshot = crate::policy::bindings::snapshot(store.as_ref()).map_err(|_| PeerError::Protocol)?;
+                encode(&BindingsReply {
+                    term: generation,
+                    version: snapshot.version,
+                    snapshot: if request.have_term == generation && request.have_version == snapshot.version { None } else { Some(snapshot) },
+                })?
+            }
             "/peer/v1/session/lookup" => {
                 let r: Lookup = decode(body)?;
                 let result = match self.authority.session(r.session_id) {

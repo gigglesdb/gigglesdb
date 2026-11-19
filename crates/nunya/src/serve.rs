@@ -750,6 +750,18 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         let cache = Arc::new(crate::state::peer::PeerStateCache::new(
             Arc::new(crate::state::peer::PeerClient::new(leader.clone(), peer.listen.port(), k.pod_name.clone(), auth.clone())),
             hub.serving_gate.clone().ok_or("serving gate unavailable")?, runtime.registry.clone(), Duration::from_secs(k.serving_lease_secs), peer.counter_batch));
+        if !leader.is_leader() {
+            let prime_cache = cache.clone();
+            // Fetch without blocking the transport runtime; failure is retried after startup.
+            let _ = tokio::task::spawn_blocking(move || prime_cache.prime_bindings()).await;
+        }
+        let observed_leader = leader.clone();
+        cache.set_leadership_source(Arc::new(move || observed_leader.is_leader()));
+        let binding_leader = leader.clone();
+        let binding_cache = cache.clone();
+        hub.set_peer_bindings(Arc::new(move || binding_leader.is_leader()), Arc::new(move || binding_cache.bindings_snapshot()));
+        let binding_hub = Arc::downgrade(&hub);
+        cache.set_bindings_listener(Arc::new(move || { if let Some(hub) = binding_hub.upgrade() { hub.recompile_bindings(); } }));
         let limits_hub = hub.clone();
         let limits_routes: Vec<_> = policy_routes.iter().map(|(r,_)|r.clone()).collect();
         let source = Arc::new(move |domain: &str| {
@@ -771,7 +783,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             }
             selected
         });
-        let server = crate::state::peer::PeerServer::new(runtime.authority.clone(), leader.clone(), auth, Default::default()).with_limit_source(source).map_err(|e| e.to_string())?.with_serving_gate(hub.serving_gate.clone().ok_or("serving gate unavailable")?).map_err(|e| e.to_string())?;
+        let server = crate::state::peer::PeerServer::new(runtime.authority.clone(), leader.clone(), auth, Default::default()).with_bindings_store(runtime.store()).map_err(|e| e.to_string())?.with_limit_source(source).map_err(|e| e.to_string())?.with_serving_gate(hub.serving_gate.clone().ok_or("serving gate unavailable")?).map_err(|e| e.to_string())?;
         let listener = tokio::net::TcpListener::bind(peer.listen).await.map_err(|_| "peer listener unavailable")?;
         (Some(cache), Some(AbortTask(tokio::spawn(server.serve(listener)))))
     } else { (None, None) };
@@ -931,7 +943,7 @@ struct ServingPolicies(Arc<crate::reload::Hub>);
 impl crate::policy::kube_serving::LoadedPolicies for ServingPolicies {
     fn loaded(&self, route: &crate::state::model::RouteId) -> Result<u64, crate::policy::kube_serving::ServingError> {
         use crate::policy::kube_serving::ServingError;
-        if self.0.fence_for(route).is_none() { return Err(ServingError::Unavailable); }
+        if !self.0.peer_bindings_ready() || self.0.fence_for(route).is_none() { return Err(ServingError::Unavailable); }
         let stamp = self.0.policy_revision_for(route).ok_or(ServingError::Unavailable)?;
         if let Some(rest) = stamp.strip_prefix("rev-") {
             rest.split('-').next().and_then(|n| n.parse().ok()).ok_or(ServingError::Invalid)
