@@ -1026,7 +1026,7 @@ pub(super) fn validate_lock(
                         }
                 }
                 Role::Application { tables, .. } => tables.contains(table),
-                Role::Task { .. } => false,
+                Role::Task { .. } | Role::NoSql { .. } => false,
             };
             if !allowed {
                 return Err(CoreError::Policy(Error::Scope));

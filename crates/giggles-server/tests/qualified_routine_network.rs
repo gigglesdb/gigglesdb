@@ -1,7 +1,7 @@
 //! E939 policy: pgwire SQL roles reach deferred routine binding for table-free calls.
 //! Task bindings and denied table access retain 42501 before routine classification;
 //! native surfaces retain their authorization policy.
-use giggles_core::{Admin, Limits, Principal, TaskId, roles::NewRole};
+use giggles_core::{Admin, Limits, roles::NewRole};
 use giggles_server::{
     Binding, Role, Running, Service,
     auth::{PostgresqlConfig, TlsMode, serve_postgresql},
@@ -105,11 +105,7 @@ impl Fixture {
             },
             Binding {
                 fingerprint: tls::fingerprint(task.cert.der()),
-                role: Role::Task {
-                    domain,
-                    task: TaskId(1),
-                    principal: Principal(2),
-                },
+                role: Role::NoSql { domain },
             },
         ];
         let service = Service::new(admin, bindings, Clock::new(0, 3600).unwrap()).unwrap();

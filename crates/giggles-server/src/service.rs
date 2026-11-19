@@ -25,6 +25,8 @@ pub enum Role {
         tables: BTreeSet<String>,
     },
     Database { name: String },
+    /// GD-0061 R3-1202: a certificate identity with no authority; answers Ping only.
+    NoSql { domain: String },
 }
 impl Role {
     pub fn is_sql(&self) -> bool {
@@ -377,6 +379,7 @@ impl Service {
             }
             match &b.role {
                 Role::Task { domain: bound, .. } | Role::Application { domain: bound, .. }
+                | Role::NoSql { domain: bound }
                     if bound != &domain =>
                 {
                     return Err(CoreError::Policy(Error::Authentication));
@@ -1497,7 +1500,7 @@ impl Session {
                         )
                     }
                 }
-                Role::Task { .. } => return Err(CoreError::Policy(Error::Scope)),
+                Role::Task { .. } | Role::NoSql { .. } => return Err(CoreError::Policy(Error::Scope)),
             };
             let metadata = session.sql.catalog_metadata()?;
             let epoch = metadata.presentation.epoch;
@@ -2041,7 +2044,7 @@ impl Session {
                             })
                     }
                     Role::Application { tables, .. } => tables.contains(table),
-                    Role::Task { .. } => false,
+                    Role::Task { .. } | Role::NoSql { .. } => false,
                 };
                 if !allowed {
                     return Err(CoreError::Policy(Error::Scope));
@@ -2090,7 +2093,7 @@ impl Session {
         reqs: &[(String, roles::TablePrivilege)],
         superuser: bool,
     ) -> Result<bool, CoreError> {
-        if matches!(&self.role, Role::Task { .. }) {
+        if matches!(&self.role, Role::Task { .. } | Role::NoSql { .. }) {
             return Ok(false);
         }
         for (table, privilege) in reqs {
@@ -2101,7 +2104,7 @@ impl Session {
                 Role::Database { name } => {
                     superuser || self.table_privilege_allowed(table, name, Some(*privilege))?
                 }
-                Role::Task { .. } => false,
+                Role::Task { .. } | Role::NoSql { .. } => false,
             };
             if !allowed {
                 return Ok(false);
@@ -3064,6 +3067,9 @@ impl Session {
         received: std::time::Instant,
         context: &Cancellation,
     ) -> Response {
+        if matches!(&self.role, Role::NoSql { .. }) {
+            return Response::code(if matches!(request, Request::Ping) { "ok" } else { "42501" });
+        }
         // GD-0061 R3-210 backstop (design-2 section 4, call site 5): on a task
         // session the framed surface admits only `Ping`. A `Sql` request goes
         // on to `authorize`, which admits its statement's own class (R3-208);
@@ -3546,6 +3552,44 @@ mod lifecycle_tests {
             bindings,
         )
     }
+    #[test]
+    fn nosql_binding_allows_ping_only() {
+        let role: Role = serde_json::from_str(r#"{"role":"NoSql","domain":"d"}"#).unwrap();
+        assert_eq!(role, Role::NoSql { domain: "d".into() });
+        assert!(!role.is_sql());
+        assert_eq!(serde_json::to_value(&role).unwrap(), serde_json::json!({"role":"NoSql","domain":"d"}));
+
+        let (service, mut bindings) = fixture();
+        bindings[0].role = Role::NoSql {
+            domain: service.admin.authority_metadata().unwrap().0.to_string(),
+        };
+        service.reload_bindings(bindings.clone()).unwrap();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        assert_eq!(session.handle(Request::Ping).code, "ok");
+        let repair = giggles_core::Request {
+            operation: OperationId(1),
+            selection: Selection::Keys(vec![]),
+            column: Column::Status,
+            after: Status::Queued,
+        };
+        for request in [
+            Request::Sql { sql: "invalid SQL".into(), params: vec![] },
+            Request::Preview { request: repair.clone() },
+            Request::Execute { request: repair, approval: None },
+            Request::RepairSql { operation: OperationId(1), sql: "invalid SQL".into(), approval: None },
+            Request::Status { operation: OperationId(1) },
+            Request::Deadline { budget_ms: u64::MAX, request: Box::new(Request::Ping) },
+        ] {
+            assert_eq!(session.handle(request).code, "42501");
+        }
+        assert_eq!(session.handle(Request::Ping).code, "ok");
+        bindings[0].role = Role::NoSql { domain: "wrong-domain".into() };
+        assert!(matches!(
+            Service::new(service.admin.clone(), bindings, Clock::new(0, 3600).unwrap()),
+            Err(CoreError::Policy(Error::Authentication))
+        ));
+    }
+
     #[test]
     fn table_requirements_match_sql_roles_and_live_grants() {
         use roles::TablePrivilege::{Delete, Insert, Select, Update};

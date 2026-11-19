@@ -147,7 +147,7 @@ impl Fixture {
         })
         .await
     }
-    async fn with_task_resources(task_limits: giggles_core::TaskResources) -> Self {
+    async fn with_task_resources(_task_limits: giggles_core::TaskResources) -> Self {
         let path = PathBuf::from("artifacts").join(format!(
             "network-fixture-{}-{}-{}",
             std::process::id(),
@@ -194,37 +194,6 @@ impl Fixture {
         )
         .unwrap();
         drop(sql);
-        for id in 0..30 {
-            admin
-                .put(
-                    Key {
-                        tenant: TenantId(42),
-                        row: RowId(id),
-                    },
-                    Row {
-                        status: Status::Failed,
-                        failed_at: 103,
-                        attempt_count: 0,
-                        version: 0,
-                    },
-                )
-                .unwrap();
-        }
-        admin.grant(grant(1, 42, 25, 5)).unwrap();
-        admin
-            .provision_task_resources(TaskId(1), task_limits)
-            .unwrap();
-        admin.grant(grant(2, 43, 25, 5)).unwrap();
-        admin
-            .provision_task_resources(
-                TaskId(2),
-                giggles_core::TaskResources {
-                    read_rows: 1_000_000,
-                    disclosed_rows: 1_000_000,
-                    encoded_bytes: 1_000_000_000,
-                },
-            )
-            .unwrap();
         let domain = admin.authority_metadata().unwrap().0.to_string();
         let bindings = vec![
             Binding {
@@ -236,19 +205,13 @@ impl Fixture {
             },
             Binding {
                 fingerprint: tls::fingerprint(task.cert.der()),
-                role: Role::Task {
+                role: Role::NoSql {
                     domain: domain.clone(),
-                    task: TaskId(1),
-                    principal: Principal(2),
                 },
             },
             Binding {
                 fingerprint: tls::fingerprint(other.cert.der()),
-                role: Role::Task {
-                    domain,
-                    task: TaskId(2),
-                    principal: Principal(2),
-                },
+                role: Role::NoSql { domain },
             },
         ];
         std::fs::write(
