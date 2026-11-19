@@ -404,6 +404,12 @@ fn ended(error: &tokio_postgres::Error) -> bool {
     error.is_closed() || error.code() == Some(&SqlState::ADMIN_SHUTDOWN)
 }
 
+/// An outstanding write can also lose quorum mid-commit (ERROR 08007), leaving
+/// its outcome unknown and its session open until the next statement is refused.
+fn write_indeterminate(error: &tokio_postgres::Error) -> bool {
+    ended(error) || error.code() == Some(&SqlState::TRANSACTION_RESOLUTION_UNKNOWN)
+}
+
 /// Seed table t through `client` with ids in `range`, returning the acknowledged set.
 async fn seed(client: &Client, range: std::ops::Range<i64>) -> BTreeSet<i64> {
     client
@@ -438,6 +444,8 @@ enum Cut {
 /// rows, with every acknowledged write present. The single write the stream
 /// had outstanding when its session ended is the only one whose outcome is
 /// unknown; it may or may not be present, and nothing else may be.
+/// That write may return ERROR 08007 before the session ends, in which case
+/// the next statement on the same writer session must end it.
 async fn cut_live_leader(cut: Cut) {
     let mut cluster = Cluster::new().await;
     let old = cluster.leader().await;
@@ -486,9 +494,17 @@ async fn cut_live_leader(cut: Cut) {
     }
     let (streamed, unknown, error) = tokio::time::timeout(WAIT, stream).await.unwrap().unwrap();
     assert!(
-        ended(&error),
+        write_indeterminate(&error),
         "write {unknown} on the cut-off leader: {error:?}"
     );
+    if error.code() == Some(&SqlState::TRANSACTION_RESOLUTION_UNKNOWN) {
+        // Use simple protocol: the gate checks Q/E; extended Parse on a fenced ex-leader currently answers 08007 (separate follow-up).
+        let error = tokio::time::timeout(WAIT, writer.simple_query("SELECT id FROM t"))
+            .await
+            .expect("writer on the cut-off leader neither answered nor failed")
+            .expect_err("cut-off leader served a read on the writer session after 08007");
+        assert!(ended(&error), "writer after 08007: {error:?}");
+    }
     assert!(
         !streamed.is_empty(),
         "the stream committed nothing before the cut"
