@@ -44,9 +44,13 @@ fn descriptor_publishes_v1_methods_and_result_stream() {
         [
             ("ping", 1),
             ("sql", 2),
+            #[cfg(feature = "legacy-task")]
             ("preview", 3),
+            #[cfg(feature = "legacy-task")]
             ("execute", 4),
+            #[cfg(feature = "legacy-task")]
             ("repair_sql", 5),
+            #[cfg(feature = "legacy-task")]
             ("status", 6),
             ("operation", 7),
             ("transaction", 8),
@@ -68,6 +72,19 @@ fn descriptor_publishes_v1_methods_and_result_stream() {
             ("operation_id", 21)
         ]
     );
+    #[cfg(not(feature = "legacy-task"))]
+    {
+        for number in 3..=6 {
+            assert!(request.reserved_range.iter().any(|range|
+                range.start.unwrap() <= number && number < range.end.unwrap()));
+        }
+        for name in ["preview", "execute", "repair_sql", "status"] {
+            assert!(request.reserved_name.iter().any(|reserved| reserved == name));
+        }
+        for name in ["TaskRequest", "RepairSqlRequest", "StatusRequest", "Key", "Predicate"] {
+            assert!(!file.message_type.iter().any(|message| message.name.as_deref() == Some(name)));
+        }
+    }
     let budget = request
         .field
         .iter()
@@ -82,10 +99,15 @@ fn descriptor_publishes_v1_methods_and_result_stream() {
     assert_eq!(operation_id.proto3_optional, Some(true));
     for (message, fields) in [
         ("NativeSavepointRequest", vec!["name"]),
+        #[cfg(feature = "legacy-task")]
         ("TaskRequest", vec!["operation"]),
+        #[cfg(feature = "legacy-task")]
         ("RepairSqlRequest", vec!["operation", "approval"]),
+        #[cfg(feature = "legacy-task")]
         ("StatusRequest", vec!["operation"]),
+        #[cfg(feature = "legacy-task")]
         ("Key", vec!["tenant", "row"]),
+        #[cfg(feature = "legacy-task")]
         ("Predicate", vec!["tenant", "from", "until"]),
     ] {
         let descriptor = file

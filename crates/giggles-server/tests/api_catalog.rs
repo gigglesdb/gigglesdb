@@ -147,7 +147,11 @@ async fn catalog_explicit_native_sql_differences() {
     for grpc in [false,true] {
         for populated in [false,true] {
             let f=if populated { Fixture::new().await } else { Fixture::catalog_empty().await };
-            setup(&f); let token=f.open_http(&f.app,false).await;
+            setup(&f);
+            if populated {
+                f.admin.sql_session().execute("INSERT INTO other VALUES (1)", &[], None).unwrap();
+            }
+            let token=f.open_http(&f.app,false).await;
             let mut request=create("app.t");
             if !populated { request["catalog"]["createTable"]["primaryKey"]=json!([]); }
             let reply=execute(&f,&token,request,grpc).await;

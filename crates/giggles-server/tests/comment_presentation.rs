@@ -42,5 +42,19 @@ async fn comments_are_private_authorized_and_use_current_attnum() {
     owner.batch_execute("ROLLBACK").await.unwrap();
     assert_eq!(owner.query_one("SELECT col_description($1::oid,2)",&[&oid]).await.unwrap().get::<_,String>(0),"column");
     drop(clients); for connection in connections { connection.await.unwrap().unwrap(); }
-    running.shutdown().await.unwrap(); drop(service); std::fs::remove_dir_all(path).unwrap();
+    running.shutdown().await.unwrap();
+    drop(service);
+    // Windows can briefly report a sharing violation during engine teardown.
+    // Bound the wait and keep every other removal failure visible.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => break,
+            Err(error) if cfg!(windows) && error.raw_os_error() == Some(32)
+                && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("remove {} after engine shutdown: {error}", path.display()),
+        }
+    }
 }

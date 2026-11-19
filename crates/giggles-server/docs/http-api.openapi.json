@@ -404,83 +404,6 @@
                     }
                   }
                 },
-                "preview": {
-                  "value": {
-                    "preview": {
-                      "request": {
-                        "operation": "701",
-                        "selection": {
-                          "keys": {
-                            "items": [
-                              {
-                                "tenant": "42",
-                                "row": "7"
-                              }
-                            ]
-                          }
-                        },
-                        "column": "COLUMN_STATUS",
-                        "after": "DELIVERY_STATUS_QUEUED"
-                      }
-                    }
-                  }
-                },
-                "execute": {
-                  "value": {
-                    "execute": {
-                      "request": {
-                        "operation": "701",
-                        "selection": {
-                          "keys": {
-                            "items": [
-                              {
-                                "tenant": "42",
-                                "row": "7"
-                              }
-                            ]
-                          }
-                        },
-                        "column": "COLUMN_STATUS",
-                        "after": "DELIVERY_STATUS_QUEUED"
-                      },
-                      "approval": "12"
-                    }
-                  }
-                },
-                "predicate": {
-                  "value": {
-                    "preview": {
-                      "request": {
-                        "operation": "703",
-                        "selection": {
-                          "predicate": {
-                            "tenant": "42",
-                            "status": "DELIVERY_STATUS_FAILED",
-                            "from": "0",
-                            "until": "99"
-                          }
-                        },
-                        "column": "COLUMN_STATUS",
-                        "after": "DELIVERY_STATUS_QUEUED"
-                      }
-                    }
-                  }
-                },
-                "repair": {
-                  "value": {
-                    "repairSql": {
-                      "operation": "702",
-                      "sql": "UPDATE deliveries SET status = 'queued' WHERE tenant = 42 AND id = 7"
-                    }
-                  }
-                },
-                "status": {
-                  "value": {
-                    "status": {
-                      "operation": "701"
-                    }
-                  }
-                },
                 "values": {
                   "value": {
                     "sql": {
@@ -1274,22 +1197,6 @@
         "x-sensitive": true,
         "description": "Opaque secret bound to the exact authenticated leaf certificate and its current binding epoch. Never place it in logs, URLs or cookies."
       },
-      "Column": {
-        "type": "string",
-        "enum": [
-          "COLUMN_STATUS",
-          "COLUMN_FAILED_AT",
-          "COLUMN_ATTEMPT_COUNT"
-        ]
-      },
-      "DeliveryStatus": {
-        "type": "string",
-        "enum": [
-          "DELIVERY_STATUS_FAILED",
-          "DELIVERY_STATUS_QUEUED",
-          "DELIVERY_STATUS_SUCCEEDED"
-        ]
-      },
       "TransactionState": {
         "type": "string",
         "enum": [
@@ -1365,112 +1272,6 @@
         ],
         "description": "Exactly one typed value. JSON null and missing values are rejected."
       },
-      "Key": {
-        "type": "object",
-        "properties": {
-          "tenant": {
-            "$ref": "#/components/schemas/UInt64"
-          },
-          "row": {
-            "$ref": "#/components/schemas/UInt64"
-          }
-        },
-        "required": [
-          "tenant",
-          "row"
-        ],
-        "additionalProperties": false
-      },
-      "KeyList": {
-        "type": "object",
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Key"
-            },
-            "description": "Order and duplicates are preserved. Existing core rules reject duplicate keys."
-          }
-        },
-        "additionalProperties": false
-      },
-      "Predicate": {
-        "type": "object",
-        "properties": {
-          "tenant": {
-            "$ref": "#/components/schemas/UInt64"
-          },
-          "status": {
-            "$ref": "#/components/schemas/DeliveryStatus"
-          },
-          "from": {
-            "$ref": "#/components/schemas/UInt64"
-          },
-          "until": {
-            "$ref": "#/components/schemas/UInt64"
-          }
-        },
-        "required": [
-          "tenant",
-          "status",
-          "from",
-          "until"
-        ],
-        "additionalProperties": false
-      },
-      "Selection": {
-        "oneOf": [
-          {
-            "type": "object",
-            "properties": {
-              "keys": {
-                "$ref": "#/components/schemas/KeyList"
-              }
-            },
-            "required": [
-              "keys"
-            ],
-            "additionalProperties": false
-          },
-          {
-            "type": "object",
-            "properties": {
-              "predicate": {
-                "$ref": "#/components/schemas/Predicate"
-              }
-            },
-            "required": [
-              "predicate"
-            ],
-            "additionalProperties": false
-          }
-        ],
-        "description": "Predicate bounds retain the existing half-open [from, until) interpretation."
-      },
-      "TaskRequest": {
-        "type": "object",
-        "properties": {
-          "operation": {
-            "$ref": "#/components/schemas/UInt64"
-          },
-          "selection": {
-            "$ref": "#/components/schemas/Selection"
-          },
-          "column": {
-            "$ref": "#/components/schemas/Column"
-          },
-          "after": {
-            "$ref": "#/components/schemas/DeliveryStatus"
-          }
-        },
-        "required": [
-          "operation",
-          "selection",
-          "column",
-          "after"
-        ],
-        "additionalProperties": false
-      },
       "SqlRequest": {
         "type": "object",
         "properties": {
@@ -1487,33 +1288,6 @@
             "default": []
           }
         },
-        "additionalProperties": false
-      },
-      "PreviewRequest": {
-        "type": "object",
-        "properties": {
-          "request": {
-            "$ref": "#/components/schemas/TaskRequest"
-          }
-        },
-        "required": [
-          "request"
-        ],
-        "additionalProperties": false
-      },
-      "TaskExecuteRequest": {
-        "type": "object",
-        "properties": {
-          "request": {
-            "$ref": "#/components/schemas/TaskRequest"
-          },
-          "approval": {
-            "$ref": "#/components/schemas/UInt64"
-          }
-        },
-        "required": [
-          "request"
-        ],
         "additionalProperties": false
       },
       "TaskPreviewRequest": {
@@ -1538,37 +1312,6 @@
         "required": ["changeId", "digest"],
         "additionalProperties": false,
         "description": "GD-0061 R3-209: apply a stored preview. Agent listeners only."
-      },
-      "RepairSqlRequest": {
-        "type": "object",
-        "properties": {
-          "operation": {
-            "$ref": "#/components/schemas/UInt64"
-          },
-          "sql": {
-            "type": "string",
-            "default": ""
-          },
-          "approval": {
-            "$ref": "#/components/schemas/UInt64"
-          }
-        },
-        "required": [
-          "operation"
-        ],
-        "additionalProperties": false
-      },
-      "StatusRequest": {
-        "type": "object",
-        "properties": {
-          "operation": {
-            "$ref": "#/components/schemas/UInt64"
-          }
-        },
-        "required": [
-          "operation"
-        ],
-        "additionalProperties": false
       },
       "OpenSessionReply": {
         "type": "object",
@@ -1718,18 +1461,6 @@
           "sql": {
             "$ref": "#/components/schemas/SqlRequest"
           },
-          "preview": {
-            "$ref": "#/components/schemas/PreviewRequest"
-          },
-          "execute": {
-            "$ref": "#/components/schemas/TaskExecuteRequest"
-          },
-          "repairSql": {
-            "$ref": "#/components/schemas/RepairSqlRequest"
-          },
-          "status": {
-            "$ref": "#/components/schemas/StatusRequest"
-          },
           "budgetMs": {
             "type": "integer",
             "minimum": 0,
@@ -1777,26 +1508,6 @@
           {
             "required": [
               "sql"
-            ]
-          },
-          {
-            "required": [
-              "preview"
-            ]
-          },
-          {
-            "required": [
-              "execute"
-            ]
-          },
-          {
-            "required": [
-              "repairSql"
-            ]
-          },
-          {
-            "required": [
-              "status"
             ]
           },
           {

@@ -317,8 +317,13 @@ impl Fixture {
     /// with the server's own JSON decoder and the reply is shown as JSON.
     async fn call(&self, token: &str, request: &Value) -> Called {
         if self.grpc {
-            let wire = wire_json::decode_execute(&serde_json::to_vec(request).unwrap())
-                .unwrap_or_else(|error| panic!("{request}: {error:?}"));
+            let wire = match wire_json::decode_execute(&serde_json::to_vec(request).unwrap()) {
+                Ok(wire) => wire,
+                // Retired arms cannot be represented by the generated default
+                // gRPC request. Preserve the JSON decoder's refusal here.
+                Err(giggles_server::api::error::ApiError::LegacyTaskRetired) => return Called::InvalidArgument,
+                Err(error) => panic!("{request}: {error:?}"),
+            };
             let mut call = tonic::Request::new(wire);
             call.metadata_mut()
                 .insert("x-giggles-session", token.parse().unwrap());
@@ -489,17 +494,25 @@ async fn join_and_legacy_sql_refused() {
             "column": "COLUMN_STATUS", "after": "DELIVERY_STATUS_QUEUED"});
         for request in [
             join("shipments"),
-            // The legacy surface admits only `ping` (and `sql`, admitted by
-            // statement below).
-            json!({"preview": {"request": task.clone()}}),
-            json!({"execute": {"request": task.clone()}}),
-            json!({"repairSql": {"operation": "1", "sql": "UPDATE x SET y = 1"}}),
-            json!({"status": {"operation": "1"}}),
             // Sequences are not a task statement either.
             json!({"sequence": {"nextval": {"name": "s"}}}),
         ] {
             let reply = f.call(&token, &request).await.reply();
             assert_task_error(&reply, &not_allowed(StatementClass::Other), &request);
+        }
+        for request in [
+            json!({"preview": {"request": task.clone()}}),
+            json!({"execute": {"request": task.clone()}}),
+            json!({"repairSql": {"operation": "1", "sql": "UPDATE x SET y = 1"}}),
+            json!({"status": {"operation": "1"}}),
+        ] {
+            #[cfg(feature = "legacy-task")]
+            {
+                let reply = f.call(&token, &request).await.reply();
+                assert_task_error(&reply, &not_allowed(StatementClass::Other), &request);
+            }
+            #[cfg(not(feature = "legacy-task"))]
+            assert_eq!(f.call(&token, &request).await, Called::InvalidArgument, "{request}");
         }
         // Legacy SQL reaches the same statement admission as pgwire.
         for (sql, error) in [

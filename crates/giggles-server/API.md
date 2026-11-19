@@ -32,13 +32,12 @@ bound successfully. A later bind failure starts no request processing.
 Only CA-verified client certificates with a current fingerprint binding have
 authority. HTTP headers, URL paths, SQL and gRPC metadata cannot choose a role.
 Use application identities for typed data operations, transaction controls and
-parameterized SQL, and task identities for the
-existing scoped Preview, Execute, RepairSql and Status operations. Neither API
-exposes provisioning, grants, approval creation, administrative SQL,
+parameterized SQL. The legacy Preview, Execute, RepairSql and Status requests
+are retired from the published API and rejected with INVALID_ARGUMENT by default.
+Neither API exposes provisioning, grants, approval creation, administrative SQL,
 remote bound handles or trusted core `once`/`outcome` handles. Typed operations
 check every referenced table, including wrappers and later block steps, against
-the application binding before any step runs. Task identities cannot invoke
-native data operations, atomic blocks or native transaction controls.
+the application binding before any step runs.
 
 Operators may also provision an existing SQL LOGIN role in the same binding
 configuration: `{"fingerprint":"<64 lowercase SHA256 hex characters>",
