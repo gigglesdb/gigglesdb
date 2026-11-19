@@ -520,10 +520,11 @@ async fn set_role_and_session_authorization_from_any_role_cannot_enter_executor(
         ] {
             assert_eq!(
                 client.simple_query(&sql).await.unwrap_err().code().unwrap().code(),
-                "42704",
+                "42501",
                 "{role}: {sql}"
             );
         }
+        assert_eq!(client.query_one("SELECT current_user", &[]).await.unwrap().get::<_, String>(0), role);
         client.simple_query("SELECT 1").await.unwrap();
     }
     let client = password_tls(&f, f.agent_pg.address, &secret, None).await.unwrap();

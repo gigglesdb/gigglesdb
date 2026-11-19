@@ -425,24 +425,24 @@ async fn no_statement_switches_into_executor_role() {
         "GRANT repair_agent TO incident_controller",
         "GRANT repair_agent TO incident_controller WITH ADMIN OPTION",
     ] {
-        let refused = failure(simple(&controller, sql).await);
-        // SET ROLE and membership are unsupported for every role, including
-        // the ordinary approver control, rather than executor-specific checks.
-        assert_eq!(
-            refused,
-            if sql.starts_with("SET") {
-                (
-                    "42704".into(),
-                    "unrecognized configuration parameter".into(),
-                )
-            } else {
-                (
-                    "0A000".into(),
-                    "unsupported SQL feature or parameter type in this server profile".into(),
-                )
-            },
-            "{sql}"
-        );
+        let result = simple(&controller, sql).await;
+        if sql.starts_with("GRANT ") {
+            let error = result.as_ref().unwrap_err().as_db_error().unwrap();
+            let role = sql.split_whitespace().nth(1).unwrap();
+            assert_eq!(error.detail(), Some(format!(
+                "Only roles with the ADMIN option on role \"{role}\" may grant this role."
+            ).as_str()), "{sql}");
+        }
+        let refused = failure(result);
+        // SET and role membership now exist; authorization still refuses every switch.
+        let message = if sql.starts_with("SET ROLE ") {
+            format!("permission denied to set role \"{}\"", sql.trim_start_matches("SET ROLE "))
+        } else if sql.starts_with("SET SESSION AUTHORIZATION ") {
+            format!("permission denied to set session authorization \"{}\"", sql.trim_start_matches("SET SESSION AUTHORIZATION "))
+        } else {
+            format!("permission denied to grant role \"{}\"", sql.split_whitespace().nth(1).unwrap())
+        };
+        assert_eq!(refused, ("42501".into(), message), "{sql}");
         assert_eq!(
             simple(&controller, "SELECT current_user")
                 .await

@@ -75,6 +75,7 @@ fn role_acquisition_paths_are_guarded() {
     }
     let mut session_literals = Vec::new();
     let mut problems = Vec::new();
+    let mut effective_acquisitions = 0;
     for path in paths {
         let rel = path
             .strip_prefix(crates)
@@ -90,12 +91,27 @@ fn role_acquisition_paths_are_guarded() {
             {
                 session_literals.push(format!("{rel}:{}", n + 1));
             }
+            if code.contains(".effective_role =") || code.contains(".effective_session =") {
+                effective_acquisitions += 1;
+                assert_eq!(rel, "giggles-server/src/service.rs", "{MESSAGE}");
+                assert!(matches!(code.trim(), "self.effective_session = session;" | "self.effective_role = current.map(|name| Role::Database { name });"), "{MESSAGE}");
+                let start = text.find("pub(crate) fn sync_role_settings(").unwrap();
+                let end = start + text[start..].find("pub(crate) fn zone(").unwrap();
+                let guarded = &text[start..end];
+                for check in ["!self.agent && self.sql.task().is_none()", "!role.task_only", "Some(role.oid) == settings.selected_role_oid", "Some(role.oid) == settings.session_authorization_oid", "roles.can_set(session_name, name)", "auth.superuser || name == authenticated"] {
+                    assert!(guarded.contains(check), "{MESSAGE}: missing {check}");
+                }
+                assert!(guarded.lines().any(|line| line.trim() == code.trim()), "{MESSAGE}");
+            }
             if code.contains(".role =") && !code.contains(".role ==") {
                 problems.push(format!("{rel}:{}: assignment to .role", n + 1));
             }
             let upper = code.to_ascii_uppercase();
             if (upper.contains("SET ROLE") || upper.contains("SESSION AUTHORIZATION"))
                 && !code.contains("\"0A000\"")
+                && !(rel == "giggles-server/src/pgwire_simple.rs"
+                    && (code.trim() == "else { format!(\"permission denied to set session authorization \\\"{value}\\\"\") });"
+                        || code.trim() == "else if *name == crate::pg_settings::Show::Role { format!(\"permission denied to set role \\\"{value}\\\"\") }"))
             {
                 problems.push(format!("{rel}:{}: role switch syntax", n + 1));
             }
@@ -116,5 +132,6 @@ fn role_acquisition_paths_are_guarded() {
         session_literals.len() == 4 && in_service,
         "{MESSAGE}: Session literals {session_literals:?}"
     );
+    assert_eq!(effective_acquisitions, 2, "{MESSAGE}");
     assert!(problems.is_empty(), "{MESSAGE}: {problems:?}");
 }

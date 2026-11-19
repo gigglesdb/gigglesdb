@@ -185,6 +185,8 @@ pub(super) fn admin_command(stmt: &crate::auth::statements::AdminStatement) -> &
         AdminStatement::DropTable(..) => "DROP TABLE",
         AdminStatement::Grant { grant: true, .. } => "GRANT",
         AdminStatement::Grant { grant: false, .. } => "REVOKE",
+        AdminStatement::Membership { grant: true, .. } => "GRANT ROLE",
+        AdminStatement::Membership { grant: false, .. } => "REVOKE ROLE",
         AdminStatement::Error(..) => "SELECT", // Let the original syntax diagnostic win.
     }
 }

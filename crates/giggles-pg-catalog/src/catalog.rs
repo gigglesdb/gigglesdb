@@ -48,7 +48,7 @@ pub(crate) fn role_name(snapshot: &CatalogSnapshot, oid: i64) -> Option<&str> {
         .or_else(|| {
             PREDEFINED_ROLES
                 .iter()
-                .find(|(id, _)| i64::from(*id) == oid)
+                .find(|(id, name)| i64::from(*id) == oid && !snapshot.roles.iter().any(|role| role.name == *name))
                 .map(|(_, name)| *name)
         })
 }
@@ -1162,8 +1162,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     let mut role_names = BTreeSet::new();
     for role in &snapshot.roles {
         if role.name.is_empty()
-            || role.name.starts_with("pg_")
-            || PREDEFINED_ROLES.iter().any(|(oid, _)| *oid == role.oid)
+            || PREDEFINED_ROLES.iter().any(|(oid, name)| *oid == role.oid && *name != role.name)
             || !role_ids.insert(role.oid)
             || !role_names.insert(&role.name)
         {
@@ -1512,6 +1511,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     // authentication, privileges, memberships, or enforced role policies.
     let predefined = PREDEFINED_ROLES
         .iter()
+        .filter(|(_, name)| !snapshot.roles.iter().any(|role| role.name == *name))
         .map(|(oid, name)| RoleDef {
             oid: *oid,
             name: (*name).into(),
@@ -1525,6 +1525,10 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             connlimit: -1,
         })
         .collect::<Vec<_>>();
+    for row in &snapshot.role_memberships {
+        if row.len() != 7 { return Err(Error::InvalidSnapshot); }
+        add("pg_auth_members", row.clone());
+    }
     for role in snapshot.roles.iter().chain(&predefined) {
         add(
             "pg_roles",

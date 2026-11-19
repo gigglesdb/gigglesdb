@@ -10,8 +10,9 @@ use giggles_core::{
 pub(crate) enum AdminStatement {
     Error(&'static str),
     /// The third field is TASKONLY (`Some(true)`) or NOTASKONLY (`Some(false)`).
-    Create(String, RoleChanges, Option<bool>),
+    Create(String, RoleChanges, Option<bool>, CreateMemberships),
     Alter(String, RoleChanges, Option<bool>),
+    Membership { grant: bool, roles: Vec<String>, members: Vec<String>, options: giggles_core::roles::MembershipOptions, revoke: Option<giggles_core::roles::MembershipOption>, grantor: Option<String>, cascade: bool },
     Drop(bool, Vec<String>),
     /// Existence and authorization are validated for all names before dropping.
     /// Multi-name drops are not atomic: a later conflict can leave earlier names dropped.
@@ -91,6 +92,8 @@ fn lex(sql: &str) -> Result<Vec<Token>, &'static str> {
     }
     Ok(out)
 }
+type CreateMemberships = Vec<(String, Vec<String>)>;
+type ParsedRoleOptions = (RoleChanges, Option<bool>, CreateMemberships);
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -120,6 +123,18 @@ impl Parser {
             return Err("42601");
         }
         Ok(name)
+    }
+    fn role_spec(&mut self) -> Result<String, &'static str> {
+        if let Some(Token::Word(s)) = self.tokens.get(self.pos)
+            && matches!(s.as_str(), "current_user" | "session_user" | "current_role") {
+            let result = format!("\0{s}"); self.pos += 1; return Ok(result);
+        }
+        self.ident()
+    }
+    fn role_specs(&mut self) -> Result<Vec<String>, &'static str> {
+        let mut names = vec![self.role_spec()?];
+        while self.comma() { names.push(self.role_spec()?); }
+        Ok(names)
     }
     fn copy_argument(&mut self) -> Result<String, &'static str> {
         let value = match self.tokens.get(self.pos) {
@@ -151,10 +166,11 @@ impl Parser {
         }
         Ok(names)
     }
-    fn options(&mut self, user: bool) -> Result<(RoleChanges, Option<bool>), &'static str> {
+    fn options(&mut self, user: bool) -> Result<ParsedRoleOptions, &'static str> {
         self.kw("with");
         let mut c = RoleChanges::default();
         let mut task_only = None;
+        let mut memberships = Vec::new();
         while self.pos < self.tokens.len() {
             let option = match self.tokens.get(self.pos) {
                 Some(Token::Word(word)) => {
@@ -168,7 +184,15 @@ impl Parser {
                 "superuser" | "nosuperuser" => Some((&mut c.superuser, option == "superuser")),
                 "login" | "nologin" => Some((&mut c.login, option == "login")),
                 "createrole" | "nocreaterole" => Some((&mut c.createrole, option == "createrole")),
+                "inherit" | "noinherit" => Some((&mut c.inherit, option == "inherit")),
                 "taskonly" | "notaskonly" => Some((&mut task_only, option == "taskonly")),
+                "in" | "role" | "user" | "admin" => {
+                    let kind = if option == "in" {
+                        if !self.kw("role") { self.need("group")?; } "in"
+                    } else { option.as_str() };
+                    memberships.push((kind.to_owned(), self.names(false)?));
+                    None
+                }
                 "password" => {
                     if c.password.is_some() {
                         return Err("42601");
@@ -186,9 +210,9 @@ impl Parser {
                     });
                     None
                 }
-                "createdb" | "nocreatedb" | "inherit" | "noinherit" | "replication"
-                | "noreplication" | "bypassrls" | "nobypassrls" | "connection" | "valid" | "in"
-                | "role" | "admin" | "sysid" | "encrypted" | "unencrypted" | "createuser"
+                "createdb" | "nocreatedb" | "replication"
+                | "noreplication" | "bypassrls" | "nobypassrls" | "connection" | "valid"
+                | "sysid" | "encrypted" | "unencrypted" | "createuser"
                 | "nocreateuser" => return Err("0A000"),
                 _ => return Err("fallback"),
             };
@@ -201,7 +225,7 @@ impl Parser {
         if user && c.login.is_none() {
             c.login = Some(true);
         }
-        Ok((c, task_only))
+        Ok((c, task_only, memberships))
     }
     fn statement(&mut self) -> Result<AdminStatement, &'static str> {
         if self.kw("create") || self.kw("alter") {
@@ -213,9 +237,10 @@ impl Parser {
                 true
             };
             let name = self.ident()?;
-            let (changes, task_only) = self.options(user)?;
+            let (changes, task_only, memberships) = self.options(user)?;
+            if !create && !memberships.is_empty() { return Err("42601"); }
             return Ok(if create {
-                AdminStatement::Create(name, changes, task_only)
+                AdminStatement::Create(name, changes, task_only, memberships)
             } else {
                 AdminStatement::Alter(name, changes, task_only)
             });
@@ -254,6 +279,40 @@ impl Parser {
         if !grant {
             self.need("revoke")?;
         }
+        // Membership grants have no ON clause; quoted names stay identifiers.
+        if !self.tokens[self.pos..].contains(&Token::Word("on".into())) {
+            use giggles_core::roles::{MembershipOptions, MembershipOption};
+            let mut revoke = None;
+            if !grant {
+                let saved = self.pos;
+                let option = if self.kw("admin") { Some(MembershipOption::Admin) }
+                    else if self.kw("inherit") { Some(MembershipOption::Inherit) }
+                    else if self.kw("set") { Some(MembershipOption::Set) } else { None };
+                if option.is_some() && self.kw("option") {
+                    self.need("for")?; revoke = option;
+                } else { self.pos = saved; }
+            }
+            let roles = self.names(false)?;
+            self.need(if grant { "to" } else { "from" })?;
+            let members = self.role_specs()?;
+            let mut options = MembershipOptions::default();
+            if grant && self.kw("with") {
+                loop {
+                    let slot = if self.kw("admin") { &mut options.admin }
+                        else if self.kw("inherit") { &mut options.inherit }
+                        else if self.kw("set") { &mut options.set } else { return Err("42601"); };
+                    let value = if self.kw("option") || self.kw("true") { true }
+                        else if self.kw("false") { false } else { return Err("42601"); };
+                    if slot.replace(value).is_some() { return Err("42601"); }
+                    if !self.comma() { break; }
+                }
+            }
+            let grantor = if self.kw("granted") { self.need("by")?; Some(self.role_spec()?) } else { None };
+            let cascade = !grant && self.kw("cascade");
+            if !grant && !cascade { self.kw("restrict"); }
+            if self.pos != self.tokens.len() { return Err("42601"); }
+            return Ok(AdminStatement::Membership { grant, roles, members, options, revoke, grantor, cascade });
+        }
         let mut privileges = Vec::new();
         loop {
             let p = match self.tokens.get(self.pos) {
@@ -280,18 +339,12 @@ impl Parser {
         }
         let objects = self.names(!schema)?;
         self.need(if grant { "to" } else { "from" })?;
-        let role_start = self.pos;
-        let roles = self.names(false)?;
-        if self.tokens[role_start..self.pos]
-            .iter()
-            .any(|t| *t == Token::Word("public".into()))
-            || self.pos != self.tokens.len()
-        {
-            return Err("0A000");
+        let mut roles = Vec::new();
+        loop {
+            roles.push(if self.kw("public") { String::new() } else { self.ident()? });
+            if !self.comma() { break; }
         }
-        if schema && objects.iter().any(|s| s != "public") {
-            return Err("3F000");
-        }
+        if self.pos != self.tokens.len() { return Err("0A000"); }
         if privileges.iter().any(|p| {
             if schema {
                 !matches!(p.as_str(), "usage" | "create" | "all")
@@ -351,8 +404,17 @@ pub(crate) fn parse(sql: &str) -> Option<AdminStatement> {
         Some(result)
     }
 }
+// Match the bootstrap identity already used to expose pg_auth_members grantors.
+pub(crate) fn bootstrap_grantor(catalog: &giggles_core::roles::RoleCatalog) -> Result<Option<String>, RoleError> {
+    Ok(catalog.list()?.into_iter().filter(|r| r.superuser).min_by_key(|r| r.oid).map(|r| r.name))
+}
+
 fn state(e: RoleError) -> &'static str {
     match e {
+        RoleError::ReservedName | RoleError::ReservedAlter => "42939",
+        RoleError::ReservedDrop | RoleError::DependentMembership { .. } => "2BP01",
+        RoleError::MembershipCycle { .. } => "0LP01",
+        RoleError::DatabaseOwnerMembers | RoleError::DatabaseOwnerMember => "0A000",
         RoleError::Duplicate => "42710",
         RoleError::Missing => "42704",
         RoleError::Dependent => "2BP01",
@@ -391,13 +453,14 @@ pub(crate) fn execute(
     stmt: &AdminStatement,
     admin: &Admin,
     actor: &CatalogRole,
+    notices: &mut Vec<(bool, String)>,
 ) -> Result<&'static str, &'static str> {
     let catalog = admin.roles();
     match stmt {
         AdminStatement::Error(e) => Err(*e),
-        AdminStatement::Create(name, c, task_only) => {
+        AdminStatement::Create(name, c, task_only, memberships) => {
             if !actor.superuser
-                && (!actor.createrole || c.superuser == Some(true) || c.createrole == Some(true))
+                && (!actor.createrole || c.superuser == Some(true))
             {
                 return Err("42501");
             }
@@ -405,9 +468,16 @@ pub(crate) fn execute(
             {
                 return Err("22023");
             }
+            for (kind, names) in memberships {
+                for role in names {
+                    catalog.get(role).map_err(state)?.ok_or("42704")?;
+                    if kind == "in" && !actor.superuser && !catalog.admin_of(&actor.name, role).map_err(state)? { return Err("42501"); }
+                }
+            }
             let c = password(c);
             catalog
                 .create(NewRole {
+                    inherit: c.inherit,
                     name: name.clone(),
                     superuser: c.superuser.unwrap_or(false),
                     login: c.login.unwrap_or(false),
@@ -422,6 +492,21 @@ pub(crate) fn execute(
                 let _ = catalog.drop(name);
                 return Err(e);
             }
+            if admin.engine() == giggles_core::Engine::V2 && !actor.superuser && *task_only != Some(true) {
+                let bootstrap = giggles_core::roles::BOOTSTRAP_GRANTOR;
+                catalog.grant_membership_options(name, &actor.name, bootstrap,
+                    giggles_core::roles::MembershipOptions { admin: Some(true), inherit: Some(false), set: Some(false) }).map_err(state)?;
+            }
+            let bootstrap = giggles_core::roles::BOOTSTRAP_GRANTOR;
+            for (kind, names) in memberships {
+                for role in names {
+                    let (group, member) = if kind == "in" { (role.as_str(), name.as_str()) } else { (name.as_str(), role.as_str()) };
+                    if let Err(error) = catalog.grant_membership_options(group, member, if actor.superuser { bootstrap } else { &actor.name },
+                        giggles_core::roles::MembershipOptions { admin: (kind == "admin").then_some(true), ..Default::default() }) {
+                        let _ = catalog.drop(name); return Err(state(error));
+                    }
+                }
+            }
             Ok("CREATE ROLE")
         }
         AdminStatement::Alter(name, c, task_only) => {
@@ -431,6 +516,7 @@ pub(crate) fn execute(
                 && c.superuser.is_none()
                 && c.createrole.is_none()
                 && c.login.is_none()
+                && c.inherit.is_none()
                 && task_only.is_none();
             if !actor.superuser
                 && !own_password
@@ -476,6 +562,7 @@ pub(crate) fn execute(
                 let _ = catalog.alter(
                     name,
                     RoleChanges {
+                        inherit: None,
                         superuser: Some(target.superuser),
                         login: Some(target.login),
                         createrole: Some(target.createrole),
@@ -545,8 +632,7 @@ pub(crate) fn execute(
                     return Err("42P01");
                 }
                 if !actor.superuser
-                    && catalog.table_owner(name).map_err(|_| "XX000")?.as_deref()
-                        != Some(&actor.name)
+                    && catalog.table_owner(name).map_err(|_| "XX000")?.is_none_or(|owner| !catalog.privileges_of(&actor.name).is_ok_and(|roles| roles.contains(&owner)))
                 {
                     return Err("42501");
                 }
@@ -576,6 +662,42 @@ pub(crate) fn execute(
             }
             Ok("DROP TABLE")
         }
+        AdminStatement::Membership { grant, roles, members, options, revoke, grantor, cascade } => {
+            let requested = grantor.as_deref().unwrap_or(&actor.name);
+            let grantor_role = catalog.get(requested).map_err(state)?.ok_or("42704")?;
+            if requested != actor.name && !actor.superuser && !catalog.can_set(&actor.name, requested).map_err(state)? { return Err("42501"); }
+            let explicit = grantor.is_some();
+            let bootstrap = grantor_role.superuser && bootstrap_grantor(&catalog).map_err(state)?.as_deref() == Some(requested);
+            for role in roles {
+                catalog.get(role).map_err(state)?.ok_or("42704")?;
+                if !actor.superuser && !catalog.admin_of(&actor.name, role).map_err(state)? { return Err("42501"); }
+                if (!grantor_role.superuser || (explicit && *grant && !bootstrap)) && !catalog.admin_of(requested, role).map_err(state)? { return Err("42501"); }
+            }
+            let grantor = if grantor_role.superuser && (!explicit || bootstrap) { giggles_core::roles::BOOTSTRAP_GRANTOR } else { requested };
+            let display_grantor = if explicit { requested } else if grantor == giggles_core::roles::BOOTSTRAP_GRANTOR { "bootstrap" } else { grantor };
+            for member in members { catalog.get(member).map_err(state)?.ok_or("42704")?; }
+            for role in roles {
+                for member in members {
+                    if *grant {
+                        let result = if explicit {
+                            catalog.grant_membership_options_explicit(role, member, grantor, *options)
+                        } else {
+                            catalog.grant_membership_options(role, member, grantor, *options)
+                        }.map_err(state)?;
+                        if result == giggles_core::roles::MembershipGrant::Unchanged {
+                            notices.push((false, format!("role \"{member}\" has already been granted membership in role \"{role}\" by role \"{display_grantor}\"")));
+                        }
+                    } else if !if explicit {
+                        catalog.revoke_membership_options_explicit(role, member, grantor, *revoke, *cascade)
+                    } else {
+                        catalog.revoke_membership_options(role, member, grantor, *revoke, *cascade)
+                    }.map_err(state)? {
+                        notices.push((true, format!("role \"{member}\" has not been granted membership in role \"{role}\" by role \"{display_grantor}\"")));
+                    }
+                }
+            }
+            Ok(if *grant { "GRANT ROLE" } else { "REVOKE ROLE" })
+        }
         AdminStatement::Grant {
             grant,
             schema,
@@ -583,11 +705,20 @@ pub(crate) fn execute(
             roles,
             privileges,
         } => {
-            if *schema && !actor.superuser {
-                return Err("42501");
-            }
             let tables = admin.catalog().map_err(|_| "XX000")?.1;
             let schemas = admin.catalog_schema_metadata().map_err(|_| "XX000")?;
+            if *schema {
+                let privileges = catalog.privileges_of(&actor.name).map_err(state)?;
+                for schema in objects {
+                    // The default public schema is implicit until schema DDL stores metadata.
+                    if schema == "public" && !schemas.schemas.contains_key(schema) {
+                        if !actor.superuser { return Err("42501"); }
+                        continue;
+                    }
+                    let (_, owner) = schemas.schemas.get(schema).ok_or("3F000")?;
+                    if !actor.superuser && !privileges.contains(owner) { return Err("42501"); }
+                }
+            }
             for object in objects {
                 if !schema {
                     if !tables.iter().any(|t| {
@@ -599,15 +730,14 @@ pub(crate) fn execute(
                         return Err("42P01");
                     }
                     if !actor.superuser
-                        && catalog.table_owner(object).map_err(state)?.as_deref()
-                            != Some(&actor.name)
+                        && catalog.table_owner(object).map_err(state)?.is_none_or(|owner| !catalog.privileges_of(&actor.name).is_ok_and(|roles| roles.contains(&owner)))
                     {
                         return Err("42501");
                     }
                 }
             }
             for role in roles {
-                catalog.get(role).map_err(state)?.ok_or("42704")?;
+                if !role.is_empty() { catalog.get(role).map_err(state)?.ok_or("42704")?; }
             }
             let all = privileges.iter().any(|p| p == "all");
             let tp: Vec<_> = [
@@ -631,7 +761,10 @@ pub(crate) fn execute(
             .collect();
             for object in objects {
                 for role in roles {
-                    if *schema {
+                    if role.is_empty() {
+                        if *schema { catalog.change_public_schema(object, &sp, *grant) }
+                        else { catalog.change_public_table(object, &tp, *grant) }
+                    } else if *schema {
                         if *grant {
                             catalog.grant_schema(object, role, &sp)
                         } else {
@@ -943,14 +1076,44 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'stat
 mod tests {
     use super::*;
     #[test]
+    fn creator_authority_keeps_legacy_bytes_and_v2_admin_options() {
+        let mut engines = vec![giggles_core::Engine::Legacy];
+        if cfg!(feature = "engine-rocksdb") { engines.push(giggles_core::Engine::V2); }
+        for engine in engines {
+            let mut id = [0; 16];
+            getrandom::fill(&mut id).unwrap();
+            let path = std::env::temp_dir().join(format!("c4-creator-{:032x}", u128::from_be_bytes(id)));
+            let admin = Admin::create_engine(&path, giggles_core::Limits::default(), engine).unwrap();
+            let catalog = admin.roles();
+            let actor = catalog.create(NewRole { name: "manager".into(), createrole: true, ..Default::default() }).unwrap();
+            let mut notices = Vec::new();
+            for sql in ["CREATE ROLE child", "ALTER ROLE child LOGIN"] {
+                execute(&parse(sql).unwrap(), &admin, &actor, &mut notices).unwrap();
+            }
+            let edges: Vec<_> = catalog.edges().unwrap().into_iter().filter(|edge| edge.role == "child").collect();
+            if engine == giggles_core::Engine::Legacy {
+                assert!(edges.is_empty());
+            } else {
+                assert_eq!(edges.len(), 1);
+                assert_eq!(edges[0].member, "manager");
+                assert!(edges[0].admin && !edges[0].inherit && !edges[0].set);
+            }
+            execute(&parse("DROP ROLE child").unwrap(), &admin, &actor, &mut notices).unwrap();
+            assert!(catalog.get("child").unwrap().is_none());
+            drop(catalog);
+            drop(admin);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+    #[test]
     fn taskonly_parses() {
-        let Some(AdminStatement::Create(n, c, t)) = parse("CREATE ROLE agent LOGIN TASKONLY") else {
+        let Some(AdminStatement::Create(n, c, t, _)) = parse("CREATE ROLE agent LOGIN TASKONLY") else {
             panic!()
         };
         assert_eq!(n, "agent");
         assert_eq!(c.login, Some(true));
         assert_eq!(t, Some(true));
-        let Some(AdminStatement::Create(_, c, t)) =
+        let Some(AdminStatement::Create(_, c, t, _)) =
             parse("CREATE USER a WITH PASSWORD 'x' TASKONLY")
         else {
             panic!()
@@ -995,11 +1158,11 @@ mod tests {
     #[test]
     fn identifiers_and_passwords() {
         assert!(
-            matches!(parse("CREATE ROLE\"Case\" LOGIN"), Some(AdminStatement::Create(n, _, _)) if n == "Case")
+            matches!(parse("CREATE ROLE\"Case\" LOGIN"), Some(AdminStatement::Create(n, _, _, _)) if n == "Case")
         );
         assert!(parse("CREATE ROLE r \"login\"").is_none());
         assert!(parse("GRANT \"select\" ON t TO r").is_none());
-        let Some(AdminStatement::Create(n, c, _)) =
+        let Some(AdminStatement::Create(n, c, _, _)) =
             parse("CrEaTe UsEr \"A\"\"B\" WITH PASSWORD 'a''b' NOLOGIN;")
         else {
             panic!()
@@ -1035,8 +1198,6 @@ mod tests {
             "CREATE ROLE r CONNECTION LIMIT -1",
             "ALTER ROLE r CONNECTION LIMIT +1",
             "ALTER ROLE r VALID UNTIL 'tomorrow'",
-            "GRANT r TO s",
-            "GRANT SELECT ON t TO PUBLIC",
             "GRANT SELECT ON t TO r WITH GRANT OPTION",
             "REVOKE SELECT ON t FROM r CASCADE",
         ] {
@@ -1045,6 +1206,13 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+    #[test]
+    fn role_membership_grammar() {
+        assert!(matches!(parse("GRANT r TO s"), Some(AdminStatement::Membership { grant: true, roles, members, .. }) if roles == ["r"] && members == ["s"]));
+        assert!(matches!(parse("GRANT r TO CURRENT_USER WITH ADMIN TRUE, INHERIT FALSE, SET FALSE GRANTED BY SESSION_USER"), Some(AdminStatement::Membership { options, grantor, .. }) if options.admin == Some(true) && options.inherit == Some(false) && options.set == Some(false) && grantor.as_deref() == Some("\0session_user")));
+        assert!(matches!(parse("REVOKE SET OPTION FOR r FROM s CASCADE"), Some(AdminStatement::Membership { grant: false, revoke: Some(giggles_core::roles::MembershipOption::Set), cascade: true, .. })));
+        assert!(matches!(parse("GRANT r TO s WITH BOGUS TRUE"), Some(AdminStatement::Error("42601"))));
     }
     #[test]
     fn grants_and_drops() {
@@ -1064,7 +1232,7 @@ mod tests {
         ));
         assert!(matches!(
             parse("GRANT USAGE ON SCHEMA other TO a"),
-            Some(AdminStatement::Error("3F000"))
+            Some(AdminStatement::Grant { schema: true, .. })
         ));
         assert!(matches!(
             parse("GRANT SELECT ON other.t TO a"),

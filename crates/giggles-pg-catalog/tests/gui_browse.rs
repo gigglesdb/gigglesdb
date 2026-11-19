@@ -458,3 +458,47 @@ fn pgadmin_edit_type_inventory_matches_pg18() {
     assert_eq!(result.fields[0].data_type, PgType::Int4);
     assert_eq!(result.rows, vec![vec![Value::Int(4194304)]]);
 }
+
+#[test]
+fn pgadmin_role_recursion_follows_membership_chains() {
+    let mut snapshot = CatalogSnapshot::default();
+    for (oid, role, member) in [(1, 3374, 3373), (2, 3375, 3373), (3, 3377, 3373), (4, 4200, 3375)] {
+        snapshot.role_memberships.push(vec![Value::Int(oid), Value::Int(role), Value::Int(member), Value::Int(10), Value::Bool(false), Value::Bool(true), Value::Bool(true)]);
+    }
+    let sql = "WITH RECURSIVE cte AS (SELECT oid,rolname FROM pg_roles WHERE rolname='pg_monitor' UNION ALL SELECT m.roleid,pgr.rolname FROM cte JOIN pg_auth_members m ON m.member=cte.oid JOIN pg_roles pgr ON pgr.oid=m.roleid) SELECT rolname FROM cte ORDER BY rolname";
+    let result = run(sql, &snapshot);
+    assert_eq!(result.rows, ["pg_monitor", "pg_read_all_settings", "pg_read_all_stats", "pg_signal_backend", "pg_stat_scan_tables"].map(|name| vec![Value::Text(name.into())]));
+}
+
+#[test]
+fn recursive_membership_cycles_deduplicate_or_hit_existing_budget() {
+    let mut snapshot = CatalogSnapshot::default();
+    for (oid, role, member) in [(1, 3375, 3373), (2, 3373, 3375)] {
+        snapshot.role_memberships.push(vec![Value::Int(oid), Value::Int(role), Value::Int(member), Value::Int(10), Value::Bool(false), Value::Bool(true), Value::Bool(true)]);
+    }
+    let sql = "WITH RECURSIVE cte AS (SELECT oid,rolname FROM pg_roles WHERE rolname='pg_monitor' UNION SELECT m.roleid,pgr.rolname FROM cte JOIN pg_auth_members m ON m.member=cte.oid JOIN pg_roles pgr ON pgr.oid=m.roleid) SELECT rolname FROM cte ORDER BY rolname";
+    assert_eq!(run(sql, &snapshot).rows, ["pg_monitor", "pg_read_all_stats"].map(|name| vec![Value::Text(name.into())]));
+    let plan = plan(&sql.replace(" UNION ", " UNION ALL ")).unwrap().unwrap();
+    assert_eq!(execute(&plan, &snapshot, &[]), Err(Error::Limit));
+}
+
+#[test]
+fn unrelated_self_recursion_with_membership_catalog_stays_unsupported() {
+    for recursive in [
+        "SELECT cte.oid FROM cte CROSS JOIN pg_auth_members",
+        "SELECT cte.oid FROM cte JOIN pg_auth_members m ON m.member=cte.oid",
+        "SELECT m.roleid FROM cte CROSS JOIN pg_auth_members m",
+        "SELECT m.member FROM cte JOIN pg_auth_members m ON m.member=cte.oid",
+    ] {
+        let sql = format!("WITH RECURSIVE cte AS (SELECT oid FROM pg_roles WHERE rolname='pg_monitor' UNION ALL {recursive}) SELECT * FROM cte LIMIT 1");
+        assert_eq!(plan(&sql).unwrap_err(), Error::Unsupported, "{sql}");
+    }
+    let snapshot = CatalogSnapshot::default();
+    for recursive in [
+        "SELECT m.roleid FROM cte JOIN pg_auth_members m ON m.member=cte.oid",
+        "SELECT m.member FROM pg_auth_members m JOIN cte ON cte.oid=m.roleid",
+    ] {
+        let sql = format!("WITH RECURSIVE cte AS (SELECT oid FROM pg_roles WHERE rolname='pg_monitor' UNION {recursive}) SELECT * FROM cte");
+        assert_eq!(run(&sql, &snapshot).rows, vec![vec![Value::Int(3373)]]);
+    }
+}

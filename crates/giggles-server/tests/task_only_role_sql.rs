@@ -47,6 +47,7 @@ impl Fixture {
             admin
                 .roles()
                 .create(NewRole {
+                    inherit: None,
                     name: name.into(),
                     login: true,
                     superuser,

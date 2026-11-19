@@ -305,6 +305,7 @@ impl State {
         // A multi-statement Query needs settings changes before its next SQL
         // statement, rather than only at the enclosing protocol-frame boundary.
         session.set_time_zone(&self.settings.current.timezone);
+        session.sync_role_settings(&mut self.settings.current)?;
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         super::statement_deadline(&self.settings.current);
@@ -314,8 +315,10 @@ impl State {
         }
         if !session.in_transaction() && !*implicit { session.service.advisory.release(session.backend_pid, true); }
         session.set_time_zone(&self.settings.current.timezone);
+        session.sync_role_settings(&mut self.settings.current)?;
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        role_notices(session, &self.settings.current, out)?;
         result
     }
 
@@ -487,7 +490,8 @@ impl State {
                 session,
                 &mut self.diagnostic,
             )?;
-            let tag = session.execute_admin(&stmt)?;
+            let tag = session.execute_admin(&stmt).map_err(|code| self.diagnostic.role_admin_error(session, &stmt, code))?;
+            role_notices(session, &self.settings.current, out)?;
             self.admin_completed = true;
             complete(tag, &empty(), out)?;
         } else if crate::pg_settings::empty_sql(sql)? {
@@ -918,7 +922,7 @@ pub(super) fn warning(
 pub(super) fn execute_settings(
     assignments: &[crate::pg_settings::Setting],
     settings: &mut crate::pg_settings::SessionSettings,
-    session: &Session,
+    session: &mut Session,
     local_allowed: bool,
     diagnostic: &mut Diagnostic,
     out: &mut Vec<u8>,
@@ -928,6 +932,18 @@ pub(super) fn execute_settings(
     }
     if session.is_aborted() {
         return Err("25P02");
+    }
+    for assignment in assignments {
+        if let crate::pg_settings::Setting::Database { name, value, .. } = assignment
+            && matches!(name, crate::pg_settings::Show::Role | crate::pg_settings::Show::SessionAuthorization)
+            && let Err(code) = session.check_role_setting(*name, value.as_deref()) {
+                if let Some(value) = value {
+                    diagnostic.wire_message = Some(if code == "22023" { format!("role \"{value}\" does not exist") }
+                        else if *name == crate::pg_settings::Show::Role { format!("permission denied to set role \"{value}\"") }
+                        else { format!("permission denied to set session authorization \"{value}\"") });
+                }
+                return Err(code);
+        }
     }
     for assignment in assignments {
         if matches!(assignment, crate::pg_settings::Setting::Database { name: crate::pg_settings::Show::SessionReplicationRole, .. }) {
@@ -956,6 +972,10 @@ pub(super) fn execute_settings(
                 out,
             )?;
         }
+        if matches!(assignment, crate::pg_settings::Setting::Database { name: crate::pg_settings::Show::Role | crate::pg_settings::Show::SessionAuthorization, .. }) && !warn {
+            session.pin_role_settings(&mut settings.current)?;
+        }
+        session.sync_role_settings(&mut settings.current)?;
         settings_status(&before, settings, session, out)?;
         complete(assignment.tag(), &empty(), out)?;
     }
@@ -1042,6 +1062,18 @@ pub(super) fn validate_lock(
         Ok(())
     }))?;
     core(session.sql.lock_tables(tables, mode, nowait))
+}
+
+pub(super) fn role_notices(session: &mut Session, settings: &crate::pg_settings::Settings, out: &mut Vec<u8>) -> R<()> {
+    for (warning, message) in std::mem::take(&mut session.role_notices) {
+        if settings.client_min_messages == "error" || (!warning && settings.client_min_messages == "warning") { continue; }
+        let mut body = Vec::new();
+        for (field, value) in [(b'S', if warning { "WARNING" } else { "NOTICE" }), (b'C', if warning { "01000" } else { "00000" }), (b'M', message.as_str())] {
+            body.push(field); z(value, &mut body);
+        }
+        body.push(0); frame(b'N', &body, out)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

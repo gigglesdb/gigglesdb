@@ -371,3 +371,6 @@ mod copy_server_files;
 
 #[path = "row_locks_network.rs"]
 mod row_locks_network;
+
+#[path = "role_membership_network.rs"]
+mod role_membership_network;

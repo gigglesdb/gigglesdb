@@ -437,6 +437,7 @@ fn legacy_v2_role_authorization_and_reopen_parity() {
             .unwrap();
         assert!(admin.roles().visible_tables("reader").unwrap().is_empty());
         admin.roles().forget_table("items").unwrap();
+        // Bootstrap grants are logical grants, not dependencies of their display role.
         admin.roles().drop("owner").unwrap();
         assert_eq!(
             admin.roles().create(role("after_reopen")).unwrap().oid,
@@ -922,6 +923,7 @@ fn role_cache_decoded_misses_keep_raw_errors() {
     let good = role("good");
     let mut table = RoleTable::default();
     table.0.insert(key(b"role/", "good"), json(&CatalogRole {
+        inherit: true,
         name: good.name, oid: FIRST_ROLE_OID, superuser: good.superuser,
         login: good.login, createrole: good.createrole, password: good.password,
         generation: 1, task_only: false,

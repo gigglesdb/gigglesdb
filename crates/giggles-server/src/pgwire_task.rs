@@ -33,7 +33,7 @@ pub(super) fn plan_class(plan: &Plan) -> Option<StatementClass> {
         Plan::Cursor(_) => StatementClass::Cursor,
         Plan::AccessShare(_) => StatementClass::Lock,
         Plan::Admin(A::DropTable(..)) => StatementClass::Ddl,
-        Plan::Admin(A::Error(_) | A::Create(..) | A::Alter(..) | A::Drop(..) | A::Grant { .. }) => {
+        Plan::Admin(A::Error(_) | A::Create(..) | A::Alter(..) | A::Drop(..) | A::Grant { .. } | A::Membership { .. }) => {
             StatementClass::RoleStatement
         }
         Plan::Control(C::Begin(_) | C::Start(_) | C::Commit | C::Rollback | C::Set(_) | C::Session(_)) => {

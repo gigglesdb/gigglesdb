@@ -140,6 +140,7 @@ fn bootstrap_owner(
         let password = owner_password()?;
         let verifier = password_verifier(&password)?;
         roles.create(NewRole {
+            inherit: None,
             name: owner.to_owned(),
             superuser: true,
             login: true,
@@ -614,6 +615,7 @@ mod tests {
         let roles = admin.roles();
         let before = roles
             .create(NewRole {
+                inherit: None,
                 name: "owner".into(),
                 superuser: false,
                 login: false,
@@ -652,6 +654,6 @@ mod tests {
         assert_eq!(roles.get("owner").unwrap().unwrap(), owner);
         assert_eq!(bootstrap_owner(&admin, "missing").unwrap(), None);
         assert!(roles.get("missing").unwrap().is_none());
-        assert_eq!(roles.list().unwrap().len(), 1);
+        assert_eq!(roles.list().unwrap().len(), 1 + giggles_core::roles::PREDEFINED.len());
     }
 }

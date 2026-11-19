@@ -509,8 +509,8 @@ fn role_writes_through_two_gateways_serialize() {
     };
     let listed = names(&a.admin);
     assert_eq!(listed, names(&b.admin));
-    assert_eq!(listed.len(), 16);
-    assert_eq!(listed.iter().map(|r| r.1).collect::<BTreeSet<_>>().len(), 16);
+    assert_eq!(listed.len(), 16 + crate::roles::PREDEFINED.len());
+    assert_eq!(listed.iter().map(|r| r.1).collect::<BTreeSet<_>>().len(), 16 + crate::roles::PREDEFINED.len());
 }
 
 /// Raw Rows user keys (version suffix stripped) through `client` at a fresh timestamp.

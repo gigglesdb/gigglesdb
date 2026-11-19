@@ -171,6 +171,7 @@ fn bootstrap_owner(admin: &Admin, owner: &str) -> Result<(), String> {
         .ok_or("GIGGLES_OWNER_PASSWORD is required to bootstrap cluster.owner")?;
     roles
         .create(giggles_core::roles::NewRole {
+            inherit: None,
             name: owner.into(),
             superuser: true,
             login: true,

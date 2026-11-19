@@ -206,6 +206,9 @@ pub struct CatalogSnapshot {
     pub table_schemas: std::collections::BTreeMap<u64, String>,
     pub indexes: Vec<IndexDef>,
     pub user: String,
+    pub session_user: Option<String>,
+    pub role_memberships: Vec<Vec<Value>>,
+    pub role_privileges: std::collections::BTreeMap<(String, String), [bool; 3]>,
     pub database: String,
     /// Existing schemas in the session's explicit search path, in lookup order.
     pub search_path: Vec<String>,
@@ -256,6 +259,9 @@ impl Default for CatalogSnapshot {
             table_schemas: Default::default(),
             indexes: Vec::new(),
             user: "giggles".into(),
+            session_user: None,
+            role_privileges: Default::default(),
+            role_memberships: Vec::new(),
             database: "giggles".into(),
             search_path: vec!["public".into()],
             roles: vec![RoleDef {
@@ -436,6 +442,7 @@ pub enum Error {
     Mutation,
     UnknownColumn,
     UnknownRelation(String),
+    UnknownRole(String),
     AmbiguousColumn,
     DivisionByZero,
     Type,
@@ -446,6 +453,7 @@ pub enum Error {
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::UnknownRole(name) = self { return write!(f, "role \"{name}\" does not exist"); }
         if let Self::InvalidPrivilege(message) = self {
             return f.write_str(message);
         }

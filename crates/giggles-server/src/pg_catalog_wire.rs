@@ -39,6 +39,7 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
         E::InvalidSnapshot => "55000",
         E::InvalidPrivilege(_) => "22023",
         E::UnknownRelation(_) => "42P01",
+        E::UnknownRole(_) => "42704",
         E::Unsupported => "0A000",
     }
 }
@@ -91,11 +92,11 @@ pub(crate) fn snapshot(
         );
         let owner = *table_owners.get(&table.id).unwrap_or(&10);
         let mut grants = vec![];
-        for role in &roles {
-            let privileges = session
-                .sql
-                .table_privileges(&key, &role.name)
-                .map_err(|_| "XX000")?;
+        for (role, privileges) in session.service.admin.roles().table_acl(&key).map_err(|_| "XX000")? {
+            let grantee = if role.is_empty() { 0 } else {
+                let Some(role) = roles.iter().find(|r| r.name == role) else { continue; };
+                role.oid
+            };
             if !privileges.is_empty() {
                 let mut acl = vec![];
                 for privilege in privileges {
@@ -110,7 +111,7 @@ pub(crate) fn snapshot(
                 // SQL grants have no grant option; the store models the owner as
                 // the granting authority, not the identity of a superuser actor.
                 grants.push(AclEntry {
-                    grantee: role.oid,
+                    grantee,
                     grantor: owner,
                     privileges: acl,
                     grant_option: false,
@@ -270,7 +271,35 @@ pub(crate) fn snapshot(
         roles,
         table_owners,
         table_acls,
-        user: match &session.role {
+        session_user: session.session_user_name().map(str::to_owned),
+        role_memberships: {
+            let catalog = session.service.admin.roles();
+            let roles = catalog.list().map_err(|_| "XX000")?;
+            let bootstrap = roles.iter().filter(|r| r.superuser).min_by_key(|r| r.oid).map(|r| r.name.as_str()).unwrap_or("postgres");
+            let oid = |name: &str| roles.iter().find(|r| r.name == name).map(|r| Value::Int(i64::from(r.oid))).unwrap_or(Value::Null);
+            catalog.edges().map_err(|_| "XX000")?.into_iter().enumerate().map(|(n, edge)| vec![
+                Value::Int(100000 + n as i64), oid(&edge.role), oid(&edge.member), oid(if edge.grantor == giggles_core::roles::BOOTSTRAP_GRANTOR { bootstrap } else { &edge.grantor }),
+                Value::Bool(edge.admin), Value::Bool(edge.inherit), Value::Bool(edge.set),
+            ]).collect()
+        },
+        role_privileges: {
+            let catalog = session.service.admin.roles();
+            let listed = catalog.list().map_err(|_| "XX000")?;
+            let mut result = std::collections::BTreeMap::new();
+            for member in &listed {
+                let inherited = catalog.privileges_of(&member.name).map_err(|_| "XX000")?;
+                for role in &listed {
+                    // Core owns graph semantics; the adapter supplies a read-only snapshot.
+                    result.insert((member.name.clone(), role.name.clone()), [
+                        member.superuser || catalog.is_member(&member.name, &role.name).map_err(|_| "XX000")?,
+                        member.superuser || inherited.contains(&role.name),
+                        member.superuser || catalog.can_set(&member.name, &role.name).map_err(|_| "XX000")?,
+                    ]);
+                }
+            }
+            result
+        },
+        user: match session.authority_role() {
             crate::Role::Database { name } => name.clone(),
             _ => "giggles".into(),
         },
@@ -599,17 +628,18 @@ fn catalog_roles(
             continue;
         }
         name_bytes += role.name.len();
-        if role.name.starts_with("pg_") || role.oid == 10 || name_bytes > 32 * 1024 {
+        if role.oid == 10 || name_bytes > 32 * 1024 {
             continue;
         }
         oids.insert(role.name.clone(), role.oid);
+        roles.retain(|existing| existing.name != role.name);
         roles.push(giggles_pg_catalog::RoleDef {
             oid: role.oid,
             superuser: role.superuser,
             login: role.login,
             createrole: role.createrole,
             createdb: role.superuser,
-            inherit: true,
+            inherit: role.inherit,
             replication: role.superuser,
             bypassrls: role.superuser,
             connlimit: -1,

@@ -322,9 +322,6 @@ fn invalid_role_and_owner_snapshots_fail_closed() {
     x.roles.push(role(6171, "reserved_oid", true));
     cases.push(("predefined oid", x));
     let mut x = base.clone();
-    x.roles.push(role(20000, "pg_reserved", true));
-    cases.push(("reserved name", x));
-    let mut x = base.clone();
     x.table_owners.insert(8, 10);
     cases.push(("unknown table", x));
     let mut x = base.clone();
@@ -416,4 +413,14 @@ fn server_encoding_is_an_immutable_utf8_setting_in_catalog_queries() {
         assert_eq!(result.fields[0].data_type, PgType::Text, "{sql}");
         assert_eq!(result.rows, vec![vec![s("UTF8")]], "{sql}");
     }
+}
+
+#[test]
+fn stored_pg_roles_override_synthesis() {
+    let mut snapshot = CatalogSnapshot::default();
+    snapshot.roles.push(role(20000, "pg_monitor", true));
+    snapshot.roles.push(role(20001, "pg_custom", false));
+    let result = run(&snapshot, "SELECT oid,rolname,rolcanlogin,rolinherit FROM pg_roles WHERE rolname IN ('pg_monitor','pg_custom') ORDER BY oid");
+    assert_eq!(result.rows, vec![vec![i(20000), s("pg_monitor"), Value::Bool(true), Value::Bool(false)],
+        vec![i(20001), s("pg_custom"), Value::Bool(false), Value::Bool(false)]]);
 }

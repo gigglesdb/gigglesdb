@@ -89,6 +89,7 @@ async fn pg_class_distinguishes_same_named_relations_and_grants() {
         .batch_execute("GRANT SELECT ON a.t TO reader")
         .await
         .unwrap();
+    owner.batch_execute("GRANT USAGE ON SCHEMA a TO reader").await.unwrap();
     let (reader, connection) = connect("reader").connect(NoTls).await.unwrap();
     let reader_connection = tokio::spawn(connection);
     assert_eq!(

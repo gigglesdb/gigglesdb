@@ -52,26 +52,9 @@ impl State {
             "pg_write_server_files"
         };
         let mut allowed = replication_role_allowed(session)?;
-        if let Role::Database { name } = &session.role {
-            let mut pending = vec![name.clone()];
-            let mut seen = std::collections::BTreeSet::new();
-            while let Some(role) = pending.pop() {
-                if !seen.insert(role.clone()) {
-                    continue;
-                }
-                if role == required {
-                    allowed = true;
-                    break;
-                }
-                pending.extend(
-                    session
-                        .service
-                        .admin
-                        .roles()
-                        .memberships(&role)
-                        .map_err(|_| "42501")?,
-                );
-            }
+        if let Role::Database { name } = session.authority_role() {
+            allowed |= session.service.admin.roles().builtin_capabilities_of(name)
+                .map_err(|_| "42501")?.contains(required);
         }
         if allowed {
             return Ok(());

@@ -731,6 +731,7 @@ async fn setup_role(
                                 .ok().filter(|p| !p.is_empty())
                                 .ok_or("GIGGLES_OWNER_PASSWORD is required to bootstrap replication.owner")?;
                             roles.create(giggles_core::roles::NewRole {
+                                inherit: None,
                                 name: owner, superuser: true, login: true, createrole: true,
                                 password: Some(giggles_server::dev::password_verifier(&password)
                                     .map_err(|e| e.to_string())?),

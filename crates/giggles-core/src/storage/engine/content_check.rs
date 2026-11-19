@@ -159,6 +159,7 @@ pub(crate) fn required_bits_for_catalog_value(
         | CatalogKind::RoleOid => {
             super::super::roles::engine::validate_record(key, value).map_err(corrupt)?;
             Ok(super::super::roles::engine::FEATURE
+                | super::super::roles::engine::membership_features(key, value)
                 | if super::super::roles::engine::is_task_only_record(key, value) {
                     super::meta::TASK_CATALOG
                 } else {
@@ -299,6 +300,8 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
     let mut credentials = BTreeMap::new();
     let mut labels = BTreeMap::new();
     let mut required = 0;
+    let mut stored_roles = std::collections::BTreeSet::new();
+    let mut membership_endpoints = Vec::new();
     for item in kv
         .range(
             Keyspace::Catalog,
@@ -324,6 +327,10 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
         };
         required |= required_bits_for_catalog_value(user, value)?;
         match kind {
+            CatalogKind::Role => { stored_roles.insert(user[1..user.len()-1].to_vec()); }
+            CatalogKind::RoleMembership => {
+                membership_endpoints.extend(user[1..user.len()-1].split(|b| *b == 0).take(2).map(Vec::from));
+            }
             CatalogKind::SqlView => {
                 views.insert(u64::from_be_bytes(user[1..9].try_into().unwrap()), catalog_codec::sql_views::decode_view(value).map_err(corrupt)?);
             }
@@ -390,8 +397,6 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             // The role-bootstrap gate and its existing opaque payload fixture
             // are owned by validate_meta.
             CatalogKind::RoleBootstrap
-            | CatalogKind::Role
-            | CatalogKind::RoleMembership
             | CatalogKind::TableOwner
             | CatalogKind::TableGrant
             | CatalogKind::SchemaGrant
@@ -472,6 +477,10 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             continue;
         }
         catalog_codec::decode_counter(&key, &value, definition).map_err(corrupt)?;
+    }
+    if membership_endpoints.iter().any(|name| !stored_roles.contains(name)
+        && super::super::roles::PREDEFINED.iter().any(|(_, predefined)| predefined.as_bytes() == name)) {
+        required |= super::meta::ROLE_MEMBERSHIP;
     }
     if required & !features != 0 {
         return Err(corrupt("content requires unset format feature"));

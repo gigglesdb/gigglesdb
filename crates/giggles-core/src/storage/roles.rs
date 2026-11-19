@@ -12,6 +12,14 @@ use std::{
     sync::{Arc, OnceLock, atomic::Ordering},
 };
 
+#[path = "roles_membership.rs"]
+mod membership;
+use membership::*;
+pub use membership::{
+    MembershipEdge, MembershipGrant, MembershipOption, MembershipOptions, PREDEFINED,
+    BOOTSTRAP as BOOTSTRAP_GRANTOR,
+};
+
 pub const MAX_ROLE_NAME: usize = 63;
 pub const MAX_ROLES: usize = 1024;
 pub const MAX_VERIFIER: usize = 512;
@@ -38,19 +46,21 @@ impl RoleImage {
 
     fn get(&self, name: &str) -> Result<Option<CatalogRole>, RoleError> {
         let decoded = self.decoded.get_or_init(|| {
-            self.table.0.iter().filter_map(|(key, value)| {
-                let name = std::str::from_utf8(key.strip_prefix(b"role/")?).ok()?;
-                let role = decode::<CatalogRole>(value).ok()?;
-                Some((name.to_owned(), role))
-            }).collect()
+            self.table
+                .0
+                .iter()
+                .filter_map(|(key, value)| {
+                    let name = std::str::from_utf8(key.strip_prefix(b"role/")?).ok()?;
+                    let role = decode::<CatalogRole>(value).ok()?;
+                    Some((name.to_owned(), role))
+                })
+                .collect()
         });
         if let Some(role) = decoded.get(name) {
             return Ok(Some(role.clone()));
         }
         // Keep absent and corrupt records on the original lookup/error path.
-        raw_get(&self.table, &key(b"role/", name))?
-            .map(|value| decode(&value))
-            .transpose()
+        role_record(&self.table, name)
     }
 }
 
@@ -139,10 +149,14 @@ pub struct CatalogRole {
     /// old binaries refuse it through the TASK_CATALOG feature bit.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub task_only: bool,
+    #[serde(default = "inherit_default", skip_serializing_if = "is_true")]
+    pub inherit: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NewRole {
+    /// None uses PostgreSQL's default INHERIT attribute.
+    pub inherit: Option<bool>,
     pub name: String,
     pub superuser: bool,
     pub login: bool,
@@ -153,6 +167,7 @@ pub struct NewRole {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RoleChanges {
+    pub inherit: Option<bool>,
     pub superuser: Option<bool>,
     pub login: Option<bool>,
     pub createrole: Option<bool>,
@@ -176,6 +191,13 @@ pub enum SchemaPrivilege {
 
 #[derive(Debug)]
 pub enum RoleError {
+    ReservedName,
+    ReservedAlter,
+    ReservedDrop,
+    MembershipCycle { role: String, member: String },
+    DatabaseOwnerMembers,
+    DatabaseOwnerMember,
+    DependentMembership { role: String, member: String },
     Duplicate,
     Missing,
     Dependent,
@@ -187,6 +209,19 @@ pub enum RoleError {
 impl fmt::Display for RoleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ReservedName => f.write_str("role names starting with pg_ are reserved"),
+            Self::ReservedAlter => f.write_str("Cannot alter reserved roles."),
+            Self::ReservedDrop => f.write_str("cannot drop reserved role"),
+            Self::MembershipCycle { role, member } => {
+                write!(f, "role \"{role}\" is a member of role \"{member}\"")
+            }
+            Self::DatabaseOwnerMembers => {
+                f.write_str("role \"pg_database_owner\" cannot have explicit members")
+            }
+            Self::DatabaseOwnerMember => {
+                f.write_str("role \"pg_database_owner\" cannot be a member of any role")
+            }
+            Self::DependentMembership { .. } => f.write_str("dependent privileges exist"),
             Self::Duplicate => f.write_str("role already exists"),
             Self::Missing => f.write_str("role does not exist"),
             Self::Dependent => f.write_str("role owns a table"),
@@ -299,7 +334,7 @@ fn raw_get(table: &RoleTable, key: &[u8]) -> Result<Option<Vec<u8>>, RoleError> 
 }
 
 fn require_role(table: &RoleTable, name: &str) -> Result<(), RoleError> {
-    if raw_get(table, &key(b"role/", name))?.is_none() {
+    if predefined(name).is_none() && raw_get(table, &key(b"role/", name))?.is_none() {
         return Err(RoleError::Missing);
     }
     Ok(())
@@ -346,7 +381,9 @@ pub(crate) fn table_privileges_txn(
     role: &str,
 ) -> Result<BTreeSet<TablePrivilege>, RoleError> {
     let image = engine::load_txn(txn)?;
-    privileges(raw_get(&image, &grant_key(b"tgrant/", table, role))?)
+    let mut held = privileges(raw_get(&image, &grant_key(b"tgrant/", table, role))?)?;
+    held.extend(privileges::<TablePrivilege>(raw_get(&image, &grant_key(b"tgrant/", table, ""))?)?);
+    Ok(held)
 }
 
 /// `name`'s role record at `txn`'s snapshot, or `None` (GD-0061 R3-704:
@@ -356,9 +393,7 @@ pub(crate) fn role_txn(
     name: &str,
 ) -> Result<Option<CatalogRole>, RoleError> {
     let image = engine::load_txn(txn)?;
-    raw_get(&image, &key(b"role/", name))?
-        .map(|value| decode(&value))
-        .transpose()
+    role_record(&image, name)
 }
 
 /// `table`'s owner at `txn`'s snapshot, or `None` (GD-0061 R3-705: SHOW
@@ -369,7 +404,9 @@ pub(crate) fn table_owner_txn(
 ) -> Result<Option<String>, RoleError> {
     let image = engine::load_txn(txn)?;
     raw_get(&image, &key(b"owner/", table))?
-        .map(|value| String::from_utf8(value).map_err(|error| CoreError::Corrupt(error.to_string()).into()))
+        .map(|value| {
+            String::from_utf8(value).map_err(|error| CoreError::Corrupt(error.to_string()).into())
+        })
         .transpose()
 }
 
@@ -455,6 +492,10 @@ impl RoleCatalog {
             let before = RoleTable::load(&table)?;
             let mut after = before.clone();
             let result = change(&mut after)?;
+            task_only_invariants(&after)?;
+            if after.0.iter().any(|(k, v)| extended_record(k, v) || synthesized_membership(&after, k)) {
+                return Err(CoreError::Unsupported.into());
+            }
             for key in before.0.keys().filter(|key| !after.0.contains_key(*key)) {
                 table.remove(key.as_slice()).map_err(io)?;
             }
@@ -493,12 +534,17 @@ impl RoleCatalog {
     pub fn list(&self) -> Result<Vec<CatalogRole>, RoleError> {
         self.check_fenced()?;
         self.read(|table| {
-            let mut roles: Vec<CatalogRole> = Vec::new();
+            let mut roles: Vec<CatalogRole> = PREDEFINED
+                .iter()
+                .filter_map(|(_, name)| predefined(name))
+                .collect();
             if let Some(table) = table {
                 for entry in table.iter().map_err(io)? {
                     let (key, value) = entry.map_err(io)?;
                     if key.value().starts_with(b"role/") {
-                        roles.push(decode(value.value())?);
+                        let stored: CatalogRole = decode(value.value())?;
+                        roles.retain(|role| role.name != stored.name);
+                        roles.push(stored);
                     }
                 }
             }
@@ -509,12 +555,15 @@ impl RoleCatalog {
 
     pub fn is_empty(&self) -> Result<bool, RoleError> {
         self.check_fenced()?;
-        Ok(self.list()?.is_empty())
+        self.read(|table| Ok(table.is_none_or(|t| !t.0.keys().any(|k| k.starts_with(b"role/")))))
     }
 
     pub fn create(&self, new: NewRole) -> Result<CatalogRole, RoleError> {
         self.check_fenced()?;
         validate_name(&new.name)?;
+        if new.name.starts_with("pg_") {
+            return Err(RoleError::ReservedName);
+        }
         validate_verifier(new.password.as_deref())?;
         self.write(|table| {
             let role_key = key(b"role/", &new.name);
@@ -551,6 +600,7 @@ impl RoleCatalog {
                 password: new.password,
                 generation: 1,
                 task_only: false,
+                inherit: new.inherit.unwrap_or(true),
             };
             table
                 .insert(role_key.as_slice(), json(&role)?.as_slice())
@@ -565,6 +615,9 @@ impl RoleCatalog {
     pub fn alter(&self, name: &str, changes: RoleChanges) -> Result<CatalogRole, RoleError> {
         self.check_fenced()?;
         validate_name(name)?;
+        if predefined(name).is_some() && self.read(|table| Ok(table.is_none_or(|t| !t.0.contains_key(&key(b"role/", name)))))? {
+            return Err(RoleError::ReservedAlter);
+        }
         if let Some(verifier) = &changes.password {
             validate_verifier(verifier.as_deref())?;
         }
@@ -573,6 +626,9 @@ impl RoleCatalog {
             let mut role: CatalogRole =
                 decode(&raw_get(table, &role_key)?.ok_or(RoleError::Missing)?)?;
             role.generation = role.generation.checked_add(1).ok_or(RoleError::Limit)?;
+            if let Some(value) = changes.inherit {
+                role.inherit = value;
+            }
             if let Some(value) = changes.superuser {
                 role.superuser = value;
             }
@@ -595,6 +651,9 @@ impl RoleCatalog {
     /// Set or clear the task-only attribute; bumps the generation. v2 only:
     /// the legacy backend refuses with `CoreError::Unsupported`.
     pub fn set_task_only(&self, name: &str, value: bool) -> Result<CatalogRole, RoleError> {
+        if predefined(name).is_some() && self.read(|table| Ok(table.is_none_or(|t| !t.0.contains_key(&key(b"role/", name)))))? {
+            return Err(RoleError::ReservedAlter);
+        }
         self.check_fenced()?;
         if matches!(&self.inner.backend, super::Backend::Legacy(_)) {
             return Err(CoreError::Unsupported.into());
@@ -619,6 +678,9 @@ impl RoleCatalog {
     }
 
     pub fn drop(&self, name: &str) -> Result<(), RoleError> {
+        if predefined(name).is_some() && self.read(|table| Ok(table.is_none_or(|t| !t.0.contains_key(&key(b"role/", name)))))? {
+            return Err(RoleError::ReservedDrop);
+        }
         self.check_fenced()?;
         validate_name(name)?;
         self.write(|table| {
@@ -632,6 +694,7 @@ impl RoleCatalog {
                 }
                 if bytes.strip_prefix(b"member/").is_some_and(|pair| {
                     pair.split(|byte| *byte == 0)
+                        .take(2)
                         .any(|part| part == name.as_bytes())
                 }) {
                     remove.push(bytes.to_vec());
@@ -642,6 +705,18 @@ impl RoleCatalog {
                     remove.push(bytes.to_vec());
                 }
             }
+            for edge in membership_edges(table)? {
+                if edge.grantor == name && edge.role != name && edge.member != name
+                    // Synthesized built-in memberships are not dependencies of the
+                    // currently inferred bootstrap role; no grant was stored by it.
+                    && raw_get(table, &membership_key(&edge, BOOTSTRAP))?.is_some()
+                {
+                    return Err(RoleError::DependentMembership {
+                        role: edge.role,
+                        member: edge.member,
+                    });
+                }
+            }
             for key in remove {
                 table.remove(key.as_slice()).map_err(io)?;
             }
@@ -650,74 +725,233 @@ impl RoleCatalog {
         })
     }
 
-    /// Direct membership metadata; role SQL syntax is not yet exposed by the server.
+    /// Compatibility wrapper using the bootstrap grantor and default options.
     pub fn grant_membership(&self, role: &str, member: &str) -> Result<(), RoleError> {
-        self.check_fenced()?;
-        validate_name(role)?;
-        validate_name(member)?;
-        self.write(|table| {
-            require_role(table, role)?;
-            require_role(table, member)?;
-            let mut pending = vec![role.to_owned()];
-            let mut seen = BTreeSet::new();
-            while let Some(next) = pending.pop() {
-                if next == member {
-                    return Err(RoleError::Invalid);
+        let grantor = BOOTSTRAP.to_owned();
+        self.grant_membership_options(role, member, &grantor, MembershipOptions::default())
+            .map(|_| ())
+            .map_err(|e| {
+                if matches!(e, RoleError::MembershipCycle { .. }) {
+                    RoleError::Invalid
+                } else {
+                    e
                 }
-                if !seen.insert(next.clone()) {
-                    continue;
-                }
-                for key in table
-                    .0
-                    .keys()
-                    .filter_map(|key| key.strip_prefix(b"member/"))
-                {
-                    let (parent, child) =
-                        key.split_at(key.iter().position(|b| *b == 0).ok_or(RoleError::Invalid)?);
-                    if &child[1..] == next.as_bytes() {
-                        pending.push(String::from_utf8(parent.to_vec()).map_err(io)?);
-                    }
-                }
-            }
-            table
-                .insert(grant_key(b"member/", role, member).as_slice(), &[])
-                .map_err(io)?;
-            Ok(())
-        })
+            })
     }
 
     pub fn revoke_membership(&self, role: &str, member: &str) -> Result<(), RoleError> {
-        self.check_fenced()?;
-        validate_name(role)?;
+        let grantor = BOOTSTRAP.to_owned();
+        self.revoke_membership_options(role, member, &grantor, None, false)
+            .map(|_| ())
+    }
+
+    /// Direct memberships, independent of their options.
+    pub fn memberships(&self, member: &str) -> Result<BTreeSet<String>, RoleError> {
         validate_name(member)?;
-        self.write(|table| {
-            require_role(table, role)?;
-            require_role(table, member)?;
-            table
-                .remove(grant_key(b"member/", role, member).as_slice())
-                .map_err(io)?;
-            Ok(())
+        Ok(self
+            .edges()?
+            .into_iter()
+            .filter(|e| e.member == member)
+            .map(|e| e.role)
+            .collect())
+    }
+
+    pub fn edges(&self) -> Result<Vec<MembershipEdge>, RoleError> {
+        self.read(|t| membership_edges(t.unwrap_or(&RoleTable::default())))
+    }
+
+    pub fn privileges_of(&self, member: &str) -> Result<BTreeSet<String>, RoleError> {
+        validate_name(member)?;
+        Ok(reachable(&self.edges()?, member, |e| e.inherit))
+    }
+
+    /// Predefined capabilities in the inherited closure, excluding stored-name collisions.
+    pub fn builtin_capabilities_of(&self, member: &str) -> Result<BTreeSet<String>, RoleError> {
+        validate_name(member)?;
+        self.read(|table| {
+            let empty = RoleTable::default();
+            let table = table.unwrap_or(&empty);
+            let mut names = reachable(&membership_edges(table)?, member, |e| e.inherit);
+            names.retain(|name| predefined(name).is_some() && !table.0.contains_key(&key(b"role/", name)));
+            Ok(names)
         })
     }
 
-    pub fn memberships(&self, member: &str) -> Result<BTreeSet<String>, RoleError> {
-        self.check_fenced()?;
+    pub fn can_set(&self, member: &str, role: &str) -> Result<bool, RoleError> {
         validate_name(member)?;
-        self.read(|table| {
-            let mut out = BTreeSet::new();
-            if let Some(table) = table {
-                for key in table
-                    .0
-                    .keys()
-                    .filter_map(|key| key.strip_prefix(b"member/"))
-                {
-                    let separator = key.iter().position(|b| *b == 0).ok_or(RoleError::Invalid)?;
-                    if &key[separator + 1..] == member.as_bytes() {
-                        out.insert(String::from_utf8(key[..separator].to_vec()).map_err(io)?);
+        validate_name(role)?;
+        Ok(reachable(&self.edges()?, member, |e| e.set).contains(role))
+    }
+
+    pub fn is_member(&self, member: &str, role: &str) -> Result<bool, RoleError> {
+        validate_name(member)?;
+        validate_name(role)?;
+        Ok(reachable(&self.edges()?, member, |_| true).contains(role))
+    }
+
+    pub fn admin_of(&self, member: &str, role: &str) -> Result<bool, RoleError> {
+        validate_name(role)?;
+        let privileges = self.privileges_of(member)?;
+        Ok(self
+            .edges()?
+            .iter()
+            .any(|e| e.role == role && e.admin && privileges.contains(&e.member)))
+    }
+
+    /// Returns Unchanged only when an existing grant's explicitly supplied options did not change.
+    pub fn grant_membership_options(
+        &self,
+        role: &str,
+        member: &str,
+        grantor: &str,
+        options: MembershipOptions,
+    ) -> Result<MembershipGrant, RoleError> {
+        self.grant_membership_options_inner(role, member, grantor, options, false)
+    }
+
+    /// GRANTED BY addresses the named identity even when it is a superuser.
+    pub fn grant_membership_options_explicit(
+        &self, role: &str, member: &str, grantor: &str, options: MembershipOptions,
+    ) -> Result<MembershipGrant, RoleError> {
+        self.grant_membership_options_inner(role, member, grantor, options, true)
+    }
+
+    fn grant_membership_options_inner(
+        &self, role: &str, member: &str, grantor: &str, options: MembershipOptions, explicit: bool,
+    ) -> Result<MembershipGrant, RoleError> {
+        validate_name(role)?;
+        validate_name(member)?;
+        if grantor != BOOTSTRAP { validate_name(grantor)?; }
+        self.write(|table| {
+            require_role(table, role)?;
+            require_role(table, member)?;
+            let grantor = if !explicit && role_record(table, grantor)?.is_some_and(|role| role.superuser) { BOOTSTRAP } else { grantor };
+            let bootstrap = BOOTSTRAP;
+            if grantor != bootstrap {
+                require_role(table, grantor)?;
+            }
+            if role == "pg_database_owner" {
+                return Err(RoleError::DatabaseOwnerMembers);
+            }
+            if member == "pg_database_owner" {
+                return Err(RoleError::DatabaseOwnerMember);
+            }
+            let edges = membership_edges(table)?;
+            if reachable(&edges, role, |_| true).contains(member) {
+                return Err(RoleError::MembershipCycle {
+                    role: role.into(),
+                    member: member.into(),
+                });
+            }
+            let existing = edges
+                .into_iter()
+                .find(|e| e.role == role && e.member == member && e.grantor == grantor);
+            let mut edge = existing.clone().unwrap_or(MembershipEdge {
+                role: role.into(),
+                member: member.into(),
+                grantor: grantor.into(),
+                admin: false,
+                set: true,
+                inherit: role_record(table, member)?
+                    .ok_or(RoleError::Missing)?
+                    .inherit,
+            });
+            if let Some(v) = options.admin {
+                edge.admin = v;
+            }
+            if let Some(v) = options.inherit {
+                edge.inherit = v;
+            }
+            if let Some(v) = options.set {
+                edge.set = v;
+            }
+            let result = if existing.as_ref() == Some(&edge) {
+                MembershipGrant::Unchanged
+            } else if existing.is_some() {
+                MembershipGrant::Updated
+            } else {
+                MembershipGrant::Granted
+            };
+            store_edge(table, &edge)?;
+            task_only_invariants(table)?;
+            Ok(result)
+        })
+    }
+
+    /// None removes the grant; Some clears just that option. False means no matching grant.
+    pub fn revoke_membership_options(
+        &self,
+        role: &str,
+        member: &str,
+        grantor: &str,
+        option: Option<MembershipOption>,
+        cascade: bool,
+    ) -> Result<bool, RoleError> {
+        self.revoke_membership_options_inner(role, member, grantor, option, cascade, false)
+    }
+
+    /// Explicit GRANTED BY never falls back to another grantor's edge.
+    pub fn revoke_membership_options_explicit(
+        &self, role: &str, member: &str, grantor: &str,
+        option: Option<MembershipOption>, cascade: bool,
+    ) -> Result<bool, RoleError> {
+        self.revoke_membership_options_inner(role, member, grantor, option, cascade, true)
+    }
+
+    fn revoke_membership_options_inner(
+        &self, role: &str, member: &str, grantor: &str,
+        option: Option<MembershipOption>, cascade: bool, explicit: bool,
+    ) -> Result<bool, RoleError> {
+        validate_name(role)?;
+        validate_name(member)?;
+        if grantor != BOOTSTRAP { validate_name(grantor)?; }
+        self.write(|table| {
+            require_role(table, role)?;
+            require_role(table, member)?;
+            let edges = membership_edges(table)?;
+            let named_edge = edges.iter().any(|e| e.role == role && e.member == member && e.grantor == grantor);
+            let grantor = if !explicit && !named_edge && role_record(table, grantor)?.is_some_and(|r| r.superuser) { BOOTSTRAP } else { grantor };
+            let Some(mut edge) = edges
+                .iter()
+                .find(|e| e.role == role && e.member == member && e.grantor == grantor)
+                .cloned()
+            else {
+                return Ok(false);
+            };
+            if option.is_none() || (option == Some(MembershipOption::Admin) && edge.admin) {
+                let mut pending = vec![member.to_owned()];
+                let mut removed = BTreeSet::new();
+                while let Some(grantor) = pending.pop() {
+                    for dependent in edges
+                        .iter()
+                        .filter(|e| e.role == role && e.grantor == grantor)
+                    {
+                        let key = membership_key(dependent, BOOTSTRAP);
+                        if removed.insert(key.clone()) {
+                            if !cascade {
+                                return Err(RoleError::DependentMembership {
+                                    role: dependent.role.clone(),
+                                    member: dependent.member.clone(),
+                                });
+                            }
+                            table.remove(&key)?;
+                            pending.push(dependent.member.clone());
+                        }
                     }
                 }
             }
-            Ok(out)
+            match option {
+                None => table.remove(&membership_key(&edge, BOOTSTRAP))?,
+                Some(option) => {
+                    match option {
+                        MembershipOption::Admin => edge.admin = false,
+                        MembershipOption::Inherit => edge.inherit = false,
+                        MembershipOption::Set => edge.set = false,
+                    }
+                    store_edge(table, &edge)?;
+                }
+            }
+            Ok(true)
         })
     }
 
@@ -782,9 +1016,9 @@ impl RoleCatalog {
         } else {
             validate_name(object)?;
         }
-        validate_name(role)?;
+        if !role.is_empty() { validate_name(role)?; }
         self.write(|table| {
-            require_role(table, role)?;
+            if !role.is_empty() { require_role(table, role)?; }
             let key = grant_key(prefix, object, role);
             let mut current: BTreeSet<P> = privileges(raw_get(table, &key)?)?;
             for privilege in changes {
@@ -820,17 +1054,48 @@ impl RoleCatalog {
         }
         validate_name(role)?;
         self.read(|table| match table {
-            Some(table) => privileges(raw_get(table, &grant_key(prefix, object, role))?),
+            Some(table) => {
+                let mut held = privileges(raw_get(table, &grant_key(prefix, object, role))?)?;
+                held.extend(privileges::<P>(raw_get(table, &grant_key(prefix, object, ""))?)?);
+                Ok(held)
+            },
             None => Ok(BTreeSet::new()),
         })
     }
 
+    /// Direct ACL entries; the empty grantee is PUBLIC, independent of role names.
+    pub fn table_acl(&self, table: &str) -> Result<BTreeMap<String, BTreeSet<TablePrivilege>>, RoleError> {
+        self.check_fenced()?; self.validate_relation_name(table)?;
+        self.read(|image| {
+            let mut result = BTreeMap::new();
+            if let Some(image) = image {
+                let prefix = grant_key(b"tgrant/", table, "");
+                for (key, value) in &image.0 {
+                    if let Some(role) = key.strip_prefix(prefix.as_slice()) {
+                        let role = std::str::from_utf8(role).map_err(io)?.to_owned();
+                        result.insert(role, privileges(Some(value.clone()))?);
+                    }
+                }
+            }
+            Ok(result)
+        })
+    }
+    /// PUBLIC is represented by an empty ACL grantee, never by a role name.
+    /// Extended writes require ROLE_MEMBERSHIP; legacy writers refuse them.
+    pub fn change_public_table(&self, table: &str, privileges: &[TablePrivilege], grant: bool) -> Result<(), RoleError> {
+        self.change_grants(b"tgrant/", table, "", privileges, grant)
+    }
+    pub fn change_public_schema(&self, schema: &str, privileges: &[SchemaPrivilege], grant: bool) -> Result<(), RoleError> {
+        self.change_grants(b"sgrant/", schema, "", privileges, grant)
+    }
     pub fn grant_table(
         &self,
         table: &str,
         role: &str,
         privileges: &[TablePrivilege],
     ) -> Result<(), RoleError> {
+        self.check_fenced()?;
+        validate_name(role)?;
         self.change_grants(b"tgrant/", table, role, privileges, true)
     }
 
@@ -840,6 +1105,8 @@ impl RoleCatalog {
         role: &str,
         privileges: &[TablePrivilege],
     ) -> Result<(), RoleError> {
+        self.check_fenced()?;
+        validate_name(role)?;
         self.change_grants(b"tgrant/", table, role, privileges, false)
     }
 
@@ -857,6 +1124,8 @@ impl RoleCatalog {
         role: &str,
         privileges: &[SchemaPrivilege],
     ) -> Result<(), RoleError> {
+        self.check_fenced()?;
+        validate_name(role)?;
         self.change_grants(b"sgrant/", schema, role, privileges, true)
     }
 
@@ -866,6 +1135,8 @@ impl RoleCatalog {
         role: &str,
         privileges: &[SchemaPrivilege],
     ) -> Result<(), RoleError> {
+        self.check_fenced()?;
+        validate_name(role)?;
         self.change_grants(b"sgrant/", schema, role, privileges, false)
     }
 
@@ -891,7 +1162,7 @@ impl RoleCatalog {
                     } else if let Some(grant) = bytes.strip_prefix(b"tgrant/") {
                         match grant.iter().rposition(|byte| *byte == 0) {
                             Some(separator)
-                                if &grant[separator + 1..] == role.as_bytes()
+                                if (&grant[separator + 1..] == role.as_bytes() || grant[separator + 1..].is_empty())
                                     && !decode::<Vec<TablePrivilege>>(value.value())?
                                         .is_empty() =>
                             {
@@ -1052,7 +1323,7 @@ mod tests {
             let roles = admin.roles();
             assert!(roles.is_empty().unwrap());
             assert_eq!(roles.get("absent").unwrap(), None);
-            assert!(roles.list().unwrap().is_empty());
+            assert_eq!(roles.list().unwrap().len(), PREDEFINED.len());
             assert_eq!(roles.table_owner("t").unwrap(), None);
             assert!(roles.table_privileges("t", "absent").unwrap().is_empty());
             assert!(roles.schema_privileges("s", "absent").unwrap().is_empty());
@@ -1091,6 +1362,7 @@ mod tests {
                     .list()
                     .unwrap()
                     .iter()
+                    .filter(|r| !r.name.starts_with("pg_"))
                     .map(|role| role.name.as_str())
                     .collect::<Vec<_>>(),
                 [" Alpha ", "Zulu", "alpha"]
@@ -1131,6 +1403,7 @@ mod tests {
                 .alter(
                     "r",
                     RoleChanges {
+                        inherit: None,
                         superuser: Some(true),
                         login: Some(true),
                         createrole: Some(true),
@@ -1156,6 +1429,7 @@ mod tests {
                 .alter(
                     "r",
                     RoleChanges {
+                        inherit: None,
                         superuser: Some(false),
                         login: Some(false),
                         createrole: Some(false),
@@ -1329,7 +1603,7 @@ mod tests {
                     Some(valid)
                 );
             }
-            assert_eq!(roles.list().unwrap().len(), 1);
+            assert_eq!(roles.list().unwrap().len(), 1 + PREDEFINED.len());
         });
     }
 
@@ -1609,6 +1883,7 @@ mod tests {
                 .write(|table| {
                     for index in 0..MAX_ROLES {
                         let role = CatalogRole {
+                            inherit: true,
                             name: format!("r{index:04}"),
                             oid: FIRST_ROLE_OID + index as u32,
                             superuser: false,
@@ -1634,7 +1909,7 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            assert_eq!(roles.list().unwrap().len(), MAX_ROLES);
+            assert_eq!(roles.list().unwrap().len(), MAX_ROLES + PREDEFINED.len());
             assert!(matches!(
                 roles.create(new_role("extra")),
                 Err(RoleError::Limit)
@@ -1687,3 +1962,7 @@ mod tests {
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "roles_v2_tests.rs"]
 mod v2_tests;
+
+#[cfg(test)]
+#[path = "roles_membership_tests.rs"]
+mod roles_membership_tests;

@@ -588,6 +588,9 @@ impl Service {
             backend_ssl: false,
             service: self.clone(),
             fingerprint: format!("pgrole:{}", role.name),
+            effective_role: None,
+            effective_session: None,
+            role_notices: Vec::new(),
             role: Role::Database { name: role.name },
             epoch: role.generation,
             fingerprint_bound: false,
@@ -642,6 +645,9 @@ impl Service {
             connection_closed: Default::default(),
             backend_ssl: false,
             service: self.clone(),
+            effective_role: None,
+            effective_session: None,
+            role_notices: Vec::new(),
             role,
             epoch,
             fingerprint_bound: true,
@@ -801,6 +807,9 @@ impl Service {
             backend_ssl: false,
             service: self.clone(),
             fingerprint: fingerprint.to_owned(),
+            effective_role: None,
+            effective_session: None,
+            role_notices: Vec::new(),
             role: Role::Database { name: role.name },
             epoch,
             fingerprint_bound: true,
@@ -906,6 +915,9 @@ impl Service {
             backend_ssl: false,
             service: self.clone(),
             fingerprint: format!("sqlcred:{id:016x}"),
+            effective_role: None,
+            effective_session: None,
+            role_notices: Vec::new(),
             role: Role::Database { name: role.name },
             epoch: id,
             fingerprint_bound: true,
@@ -953,6 +965,9 @@ pub struct Session {
     pub(crate) backend_ssl: bool,
     pub(crate) service: Arc<Service>,
     pub(crate) role: Role,
+    effective_role: Option<Role>,
+    effective_session: Option<String>,
+    pub(crate) role_notices: Vec<(bool, String)>,
     pub(crate) database: Option<String>,
     pub(crate) fingerprint: String,
     // Fingerprint binding epoch, or the role generation for trusted pgwire sessions.
@@ -989,6 +1004,80 @@ impl Drop for Session {
     }
 }
 impl Session {
+    fn authority_role_live(&self, role: &roles::CatalogRole) -> bool {
+        if self.effective_role.is_some() { !role.task_only }
+        else { role.login && self.service.role_generation_matches(role, self.role_epoch()) }
+    }
+    pub(crate) fn authority_role(&self) -> &Role {
+        self.effective_role.as_ref().unwrap_or(&self.role)
+    }
+    pub(crate) fn session_user_name(&self) -> Option<&str> {
+        self.effective_session.as_deref().or(match &self.role { Role::Database { name } => Some(name), _ => None })
+    }
+    /// Only the database GUC path may acquire effective authority; login identity is immutable.
+    pub(crate) fn check_role_setting(&self, name: crate::pg_settings::Show, value: Option<&str>) -> Result<(), &'static str> {
+        self.check_binding().map_err(|e| sqlstate(&e))?;
+        let Role::Database { name: login } = &self.role else { return Err("42501"); };
+        if self.agent || self.sql.task().is_some() { return Err("42501"); }
+        let roles = self.service.admin.roles();
+        let authenticated = roles.get(login).map_err(|_| "XX000")?.ok_or("28000")?;
+        if name == crate::pg_settings::Show::SessionAuthorization && !authenticated.superuser
+            && value.is_some_and(|target| target != login) { return Err("42501"); }
+        if let Some(value) = value {
+            let target = roles.get(value).map_err(|_| "XX000")?.ok_or("22023")?;
+            if target.task_only { return Err("42501"); }
+            if name == crate::pg_settings::Show::Role {
+                let session = self.session_user_name().ok_or("42501")?;
+                let actor = roles.get(session).map_err(|_| "XX000")?.ok_or("42501")?;
+                if !actor.superuser && !roles.can_set(session, value).map_err(|_| "XX000")? { return Err("42501"); }
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn pin_role_settings(&self, settings: &mut crate::pg_settings::Settings) -> Result<(), &'static str> {
+        let roles = self.service.admin.roles();
+        settings.selected_role_oid = if settings.selected_role == "none" { None }
+            else { Some(roles.get(&settings.selected_role).map_err(|_| "XX000")?.ok_or("22023")?.oid) };
+        settings.session_authorization_oid = if settings.session_authorization.is_empty() { None }
+            else { Some(roles.get(&settings.session_authorization).map_err(|_| "XX000")?.ok_or("22023")?.oid) };
+        Ok(())
+    }
+    pub(crate) fn sync_role_settings(&mut self, settings: &mut crate::pg_settings::Settings) -> Result<(), &'static str> {
+        let Role::Database { name: authenticated } = &self.role else { return Ok(()); };
+        let roles = self.service.admin.roles();
+        let auth = roles.get(authenticated).map_err(|_| "XX000")?.ok_or("28000")?;
+        let mut session = (!settings.session_authorization.is_empty() && settings.session_authorization != *authenticated).then(|| settings.session_authorization.clone());
+        if let Some(name) = session.as_ref() {
+            let valid = !self.agent && self.sql.task().is_none() && roles.get(name).map_err(|_| "XX000")?
+                .is_some_and(|role| !role.task_only && Some(role.oid) == settings.session_authorization_oid
+                    && (auth.superuser || name == authenticated));
+            if !valid {
+                self.role_notices.push((true, format!("role \"{name}\" can no longer be set; role reset")));
+                session = None;
+                settings.session_authorization = authenticated.clone();
+                settings.session_authorization_oid = Some(auth.oid);
+                settings.selected_role = "none".into();
+                settings.selected_role_oid = None;
+            }
+        }
+        if settings.selected_role != "none" {
+            let name = &settings.selected_role;
+            let session_name = session.as_deref().unwrap_or(authenticated);
+            let actor = roles.get(session_name).map_err(|_| "XX000")?;
+            let valid = !self.agent && self.sql.task().is_none() && roles.get(name).map_err(|_| "XX000")?
+                .is_some_and(|role| !role.task_only && Some(role.oid) == settings.selected_role_oid)
+                && (actor.is_some_and(|role| role.superuser) || roles.can_set(session_name, name).map_err(|_| "XX000")?);
+            if !valid {
+                self.role_notices.push((true, format!("role \"{name}\" can no longer be set; role reset")));
+                settings.selected_role = "none".into();
+                settings.selected_role_oid = None;
+            }
+        }
+        let current = if settings.selected_role == "none" { session.clone() } else { Some(settings.selected_role.clone()) };
+        self.effective_session = session;
+        self.effective_role = current.map(|name| Role::Database { name });
+        Ok(())
+    }
     pub(crate) fn zone(&self) -> Option<SessionZone> {
         self.zone
     }
@@ -1343,7 +1432,7 @@ impl Session {
         let Role::Database { name } = &self.role else {
             return Err(fail("42501", "task statements need a database role"));
         };
-        let name = name.clone();
+        let _ = name;
         self.check_binding().map_err(from_core)?;
         if self.in_transaction() {
             return Err(fail("25001", "task statements cannot run inside a transaction block"));
@@ -1354,14 +1443,9 @@ impl Session {
                 "current transaction is aborted, commands ignored until end of transaction block",
             ));
         }
-        let actor = self
-            .service
-            .admin
-            .roles()
-            .get(&name)
-            .map_err(|e| from_core(role_lookup_error(e)))?
-            .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
-            .ok_or_else(|| fail("28000", "role is not permitted to log in"))?;
+        let Role::Database { name: current } = self.authority_role() else { return Err(fail("42501", "task statements need a database role")); };
+        let actor = self.service.admin.roles().get(current).map_err(|e| from_core(role_lookup_error(e)))?
+            .filter(|role| !role.task_only).ok_or_else(|| fail("42501", "role cannot acquire task authority"))?;
         let now = crate::agent::wall_now(&self.service.clock).map_err(from_core)?;
         let outcome = crate::task_ddl::run(self, &actor, stmt, now)?;
         if matches!(stmt, giggles_core::task::statements::TaskStatement::Revoke(_)
@@ -1382,18 +1466,19 @@ impl Session {
             | crate::auth::statements::AdminStatement::Create(..)
             | crate::auth::statements::AdminStatement::Alter(..)
             | crate::auth::statements::AdminStatement::Drop(..)
-            | crate::auth::statements::AdminStatement::Grant { .. } => {
+            | crate::auth::statements::AdminStatement::Grant { .. }
+            | crate::auth::statements::AdminStatement::Membership { .. } => {
                 giggles_core::task::StatementClass::RoleStatement
             }
         };
         self.admit_backstop(class).map_err(|error| sqlstate(&error))?;
-        let Role::Database { name } = &self.role else {
+        let Role::Database { .. } = &self.role else {
             return Err("42501");
         };
         self.check_binding().map_err(|error| sqlstate(&error))?;
         if let crate::auth::statements::AdminStatement::DropTable(optional, names) = stmt
             && self.in_transaction()
-            && self.sql.set_ddl_owner(Some(name))
+            && self.sql.set_ddl_owner(match self.effective_role.as_ref().unwrap_or(&self.role) { Role::Database { name } => Some(name), _ => None })
         {
             let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
             let target = names.iter().map(|name| if let Some((schema, table)) = name.split_once('\0') {
@@ -1409,14 +1494,9 @@ impl Session {
         if self.is_aborted() {
             return Err("25P02");
         }
-        let actor = self
-            .service
-            .admin
-            .roles()
-            .get(name)
-            .map_err(|e| sqlstate(&role_lookup_error(e)))?
-            .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
-            .ok_or("28000")?;
+        let Role::Database { name: current } = self.authority_role() else { return Err("42501"); };
+        let actor = self.service.admin.roles().get(current).map_err(|e| sqlstate(&role_lookup_error(e)))?
+            .filter(|role| !role.task_only).ok_or("28000")?;
         // Serialize SQL password rotations and publish aliases before returning to wire checks.
         let mut aliases = self
             .service
@@ -1428,12 +1508,17 @@ impl Session {
                 if changes.password.is_some()
                     && changes.login.is_none()
                     && changes.superuser.is_none()
-                    && changes.createrole.is_none() =>
+                    && changes.createrole.is_none()
+                    && changes.inherit.is_none() =>
             {
                 self.service.admin.roles().get(name).map_err(|_| "XX000")?
             }
             _ => None,
         };
+        if let crate::auth::statements::AdminStatement::Drop(_, names) = stmt {
+            let current = match self.authority_role() { Role::Database { name } => Some(name.as_str()), _ => None };
+            if names.iter().any(|name| current == Some(name.as_str()) || self.session_user_name() == Some(name.as_str())) { return Err("55006"); }
+        }
         let mut bound = stmt.clone();
         match &mut bound {
             crate::auth::statements::AdminStatement::DropTable(_, names)
@@ -1451,7 +1536,16 @@ impl Session {
             }
             _ => {}
         }
-        let result = crate::auth::statements::execute(&bound, &self.service.admin, &actor);
+        if let crate::auth::statements::AdminStatement::Membership { members, grantor, .. } = &mut bound {
+            for name in members.iter_mut().chain(grantor.iter_mut()) {
+                *name = match name.as_str() {
+                    "\0current_user" | "\0current_role" => actor.name.clone(),
+                    "\0session_user" => self.session_user_name().ok_or("42501")?.to_owned(),
+                    _ => name.clone(),
+                };
+            }
+        }
+        let result = crate::auth::statements::execute(&bound, &self.service.admin, &actor, &mut self.role_notices);
         // Even a multi-role DROP that returns an error may have committed a
         // preceding drop. Publish only after password aliases are ready.
         let result = (|| {
@@ -1508,7 +1602,7 @@ impl Session {
             if session.sql.task().is_some() {
                 return session.task_catalog_snapshot();
             }
-            let tables = match &session.role {
+            let tables = match session.effective_role.as_ref().unwrap_or(&session.role) {
                 Role::Application { domain, tables } => {
                     if session.service.admin.authority_metadata()?.0.to_string() != *domain {
                         return Err(CoreError::Policy(Error::Authentication));
@@ -1522,22 +1616,20 @@ impl Session {
                         .roles()
                         .get(name)
                         .map_err(role_lookup_error)?
-                        .filter(|role| {
-                            role.login
-                                && session.service.role_generation_matches(role, session.role_epoch())
-                        })
+                        .filter(|role| session.authority_role_live(role))
                         .ok_or(CoreError::Policy(Error::Authentication))?;
                     if role.superuser {
                         None
                     } else {
-                        Some(
-                            session
-                                .service
-                                .admin
-                                .roles()
-                                .visible_tables(name)
-                                .map_err(|_| CoreError::Policy(Error::Scope))?,
-                        )
+                        let catalog = session.service.admin.roles();
+                        let privileges = catalog.privileges_of(name).map_err(role_lookup_error)?;
+                        let capabilities = catalog.builtin_capabilities_of(name).map_err(role_lookup_error)?;
+                        if capabilities.contains("pg_read_all_data") || capabilities.contains("pg_write_all_data") { None }
+                        else {
+                            let mut visible = BTreeSet::new();
+                            for name in privileges { visible.extend(catalog.visible_tables(&name).map_err(role_lookup_error)?); }
+                            Some(visible)
+                        }
                     }
                 }
                 Role::NoSql { .. } => return Err(CoreError::Policy(Error::Scope)),
@@ -1913,17 +2005,15 @@ impl Session {
         self.authority_scope(|session| session.authorize_sequences(&dependencies))
     }
     fn authorize_create_sequence(&mut self) -> Result<(), CoreError> {
-        let allowed = if let Role::Database { name } = &self.role {
+        let allowed = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
             let roles = self.service.admin.roles();
             let role = roles
                 .get(name)
                 .map_err(role_lookup_error)?
-                .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
+                .filter(|role| self.authority_role_live(role))
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             role.superuser
-                || roles
-                    .schema_privileges("public", name)
-                    .is_ok_and(|privileges| privileges.contains(&roles::SchemaPrivilege::Create))
+                || self.schema_privilege_allowed("public", name, roles::SchemaPrivilege::Create)?
         } else {
             false
         };
@@ -1935,13 +2025,13 @@ impl Session {
     }
     fn authorize_sequences(&mut self, dependencies: &[Option<String>]) -> Result<(), CoreError> {
         let sequences = self.sql.sequence_owners()?;
-        let image = match &self.role {
+        let image = match self.effective_role.as_ref().unwrap_or(&self.role) {
             Role::Database { .. } => Some(self.service.admin.roles().image()
                 .map_err(|_| CoreError::Policy(Error::Authentication))?),
             _ => None,
         };
         let allowed_table = |table: &str| -> bool {
-            match (&self.role, &image) {
+            match (self.effective_role.as_ref().unwrap_or(&self.role), &image) {
                 (Role::Application { tables, .. }, _) => tables.contains(table),
                 (Role::Database { name }, Some(image)) => {
                     self.sql
@@ -1949,20 +2039,20 @@ impl Session {
                         .is_ok_and(|durable_name| {
                             self.sql
                                 .table_owner_in(image, &durable_name)
-                                .is_ok_and(|owner| owner.as_deref() == Some(name.as_str()))
+                                .is_ok_and(|owner| owner.as_ref().is_some_and(|owner| self.service.admin.roles().privileges_of(name).is_ok_and(|roles| roles.contains(owner))))
                         })
                 }
                 _ => false,
             }
         };
         let allowed_standalone = |sequence: &str| -> bool {
-            matches!(&self.role, Role::Database { .. }) && allowed_table(sequence)
+            matches!(self.effective_role.as_ref().unwrap_or(&self.role), Role::Database { .. }) && allowed_table(sequence)
         };
-        let superuser = if let (Role::Database { name }, Some(image)) = (&self.role, &image) {
+        let superuser = if let (Role::Database { name }, Some(image)) = (self.effective_role.as_ref().unwrap_or(&self.role), &image) {
             image
                 .get(name)
                 .map_err(role_lookup_error)?
-                .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
+                .filter(|role| self.authority_role_live(role))
                 .ok_or(CoreError::Policy(Error::Authentication))?
                 .superuser
         } else {
@@ -2016,12 +2106,12 @@ impl Session {
     fn authorize_alter_table(&mut self, table: &str) -> Result<(), CoreError> {
         let resolved = self.sql.resolve_relation_reference(table)?;
         let table = resolved.as_str();
-        let allowed = if let Role::Database { name } = &self.role {
+        let allowed = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
             let roles = self.service.admin.roles();
             let role = roles
                 .get(name)
                 .map_err(role_lookup_error)?
-                .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
+                .filter(|role| self.authority_role_live(role))
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             if role.superuser {
                 true
@@ -2029,11 +2119,7 @@ impl Session {
                 // The durable key follows staged renames; missing names remain
                 // ordinary absent ownership records and cannot leak 42P01.
                 let name_at_commit = self.sql.table_authority_name(table)?;
-                self.sql
-                    .table_owner(&name_at_commit)
-                    .map_err(|_| CoreError::Policy(Error::Scope))?
-                    .as_deref()
-                    == Some(name.as_str())
+                self.table_privilege_allowed(&name_at_commit, name, None)?
             }
         } else {
             false
@@ -2060,7 +2146,7 @@ impl Session {
                 let table = prepared
                     .table()
                     .ok_or(CoreError::Sql(relational::SqlError::UnknownTable))?;
-                let allowed = match &session.role {
+                let allowed = match session.effective_role.as_ref().unwrap_or(&session.role) {
                     Role::Database { name } => {
                         let role = session
                             .service
@@ -2101,6 +2187,15 @@ impl Session {
         })
     }
 
+    fn schema_privilege_allowed(&self, schema: &str, name: &str, privilege: roles::SchemaPrivilege) -> Result<bool, CoreError> {
+        let catalog = self.service.admin.roles();
+        let privileges = catalog.privileges_of(name).map_err(role_lookup_error)?;
+        let capabilities = catalog.builtin_capabilities_of(name).map_err(role_lookup_error)?;
+        let metadata = self.sql.schema_metadata()?;
+        Ok((schema == "public" && privilege == roles::SchemaPrivilege::Usage) || privileges.iter().any(|name| metadata.schemas.get(schema).is_some_and(|(_, owner)| owner == name)
+            || (privilege == roles::SchemaPrivilege::Usage && capabilities.contains(name) && matches!(name.as_str(), "pg_read_all_data" | "pg_write_all_data"))
+            || catalog.schema_privileges(schema, name).is_ok_and(|p| p.contains(&privilege))))
+    }
     fn table_privilege_allowed(
         &self,
         table: &str,
@@ -2108,19 +2203,24 @@ impl Session {
         privilege: Option<roles::TablePrivilege>,
     ) -> Result<bool, CoreError> {
         let name_at_commit = self.sql.table_authority_name(table)?;
+        let schema = name_at_commit.split_once('\0').map_or("public", |(schema, _)| schema);
+        if !self.schema_privilege_allowed(schema, name, roles::SchemaPrivilege::Usage)? { return Ok(false); }
         let owner = self
             .sql
             .table_owner(&name_at_commit)
             .map_err(|_| CoreError::Policy(Error::Scope))?;
-        Ok(owner.as_deref() == Some(name)
+        let catalog = self.service.admin.roles();
+        let roles = catalog.privileges_of(name).map_err(role_lookup_error)?;
+        let capabilities = catalog.builtin_capabilities_of(name).map_err(role_lookup_error)?;
+        Ok(roles.iter().any(|name| owner.as_ref() == Some(name)
             || privilege.is_some_and(|privilege| {
-                self.sql
-                    .table_privileges(&name_at_commit, name)
-                    .is_ok_and(|privileges| privileges.contains(&privilege))
-            }))
+                (capabilities.contains(name) && name == "pg_read_all_data" && privilege == roles::TablePrivilege::Select)
+                || (capabilities.contains(name) && name == "pg_write_all_data" && matches!(privilege, roles::TablePrivilege::Insert | roles::TablePrivilege::Update | roles::TablePrivilege::Delete))
+                || self.sql.table_privileges(&name_at_commit, name).is_ok_and(|p| p.contains(&privilege))
+            })))
     }
     pub(crate) fn table_privilege_superuser(&self) -> Result<bool, CoreError> {
-        let Role::Database { name } = &self.role else {
+        let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) else {
             return Ok(false);
         };
         self.service
@@ -2128,7 +2228,7 @@ impl Session {
             .roles()
             .get(name)
             .map_err(role_lookup_error)?
-            .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
+            .filter(|role| self.authority_role_live(role))
             .map(|role| role.superuser)
             .ok_or(CoreError::Policy(Error::Authentication))
     }
@@ -2137,15 +2237,16 @@ impl Session {
         reqs: &[(String, roles::TablePrivilege)],
         superuser: bool,
     ) -> Result<bool, CoreError> {
-        if matches!(&self.role, Role::NoSql { .. }) {
+        let acting_role = self.effective_role.as_ref().unwrap_or(&self.role);
+        if matches!(acting_role, Role::NoSql { .. }) {
             return Ok(false);
         }
         #[cfg(feature = "legacy-task")]
-        if matches!(&self.role, Role::Task { .. }) {
+        if matches!(acting_role, Role::Task { .. }) {
             return Ok(false);
         }
         for (table, privilege) in reqs {
-            let allowed = match &self.role {
+            let allowed = match self.effective_role.as_ref().unwrap_or(&self.role) {
                 Role::Application { tables, .. } => {
                     table != "giggles_join" && tables.contains(table)
                 }
@@ -2201,7 +2302,7 @@ impl Session {
         let allowed = if !matches!(self.role, Role::Database { .. }) { false }
         else if self.table_privilege_superuser()? { true }
         else {
-            let Role::Database { name } = &self.role else { unreachable!() };
+            let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) else { unreachable!() };
             let table = match request {
                 C::DropTable { table, .. } | C::AlterTable { table, .. } | C::DropView { name: table, .. } => Some(self.sql.native_relation_reference(table)?),
                 C::DropIndex { name, .. } => self.sql.native_index_table(name)?,
@@ -2209,16 +2310,14 @@ impl Session {
             };
             if let Some(table) = table {
                 let key = self.sql.table_authority_name(&table)?;
-                self.sql.table_owner(&key).map_err(|_| CoreError::Policy(Error::Scope))?.as_deref() == Some(name)
+                self.table_privilege_allowed(&key, name, None)?
             } else {
                 let schema = match request {
                     C::CreateTable { table, .. } | C::CreateView { name: table, .. } => self.sql.native_creation_schema(table)?,
                     C::CreateIndex { table, .. } => self.sql.relation_schema(&self.sql.native_relation_reference(table)?)?,
                     _ => self.sql.relation_schema("")?,
                 };
-                let create = self.sql.schema_metadata()?.schemas.get(&schema).is_some_and(|(_, owner)| owner == name)
-                    || self.service.admin.roles().schema_privileges(&schema, name)
-                        .map_err(|_| CoreError::Policy(Error::Scope))?.contains(&roles::SchemaPrivilege::Create);
+                let create = self.schema_privilege_allowed(&schema, name, roles::SchemaPrivilege::Create)?;
                 // SQL CREATE VIEW also needs SELECT on every relation the view reads.
                 create && match request {
                     C::CreateView { read, .. } => {
@@ -2242,10 +2341,10 @@ impl Session {
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
         self.admit_backstop(p.task_class())?;
         if p.is_collation_ddl() {
-            let allowed = if let Role::Database { name } = &self.role {
+            let allowed = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
                 let roles = self.service.admin.roles();
                 let role = roles.get(name).map_err(|_| CoreError::Policy(Error::Authentication))?
-                    .filter(|r| r.login && self.service.role_generation_matches(r, self.role_epoch()))
+                    .filter(|role| self.authority_role_live(role))
                     .ok_or(CoreError::Policy(Error::Authentication))?;
                 if let Some(owner) = p.collation_new_owner() && roles.get(owner).map_err(|_| CoreError::Policy(Error::Scope))?.is_none() {
                     return Err(CoreError::Sql(relational::SqlError::UndefinedObject));
@@ -2265,9 +2364,9 @@ impl Session {
             return Ok(());
         }
         if let Some((create, names)) = p.extension_ddl() {
-            let allowed = if let Role::Database { name } = &self.role {
+            let allowed = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
                 let role = self.service.admin.roles().get(name).map_err(role_lookup_error)?
-                    .filter(|r| r.login && self.service.role_generation_matches(r, self.role_epoch()))
+                    .filter(|role| self.authority_role_live(role))
                     .ok_or(CoreError::Policy(Error::Authentication))?;
                 p.set_extension_owner(role.oid);
                 role.superuser || (!create && names.iter().all(|n| self.sql.user_type_catalog().ok()
@@ -2277,12 +2376,12 @@ impl Session {
             return Ok(());
         }
         if let Some((schema, owner, create)) = p.schema_ddl() {
-            let allowed = if let Role::Database { name } = &self.role {
+            let allowed = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
                 let roles = self.service.admin.roles();
                 let role = roles
                     .get(name)
                     .map_err(role_lookup_error)?
-                    .filter(|r| r.login && self.service.role_generation_matches(r, self.role_epoch()))
+                    .filter(|role| self.authority_role_live(role))
                     .ok_or(CoreError::Policy(Error::Authentication))?;
                 if let Some(owner) = owner
                     && roles
@@ -2356,7 +2455,7 @@ impl Session {
             false
         };
         let mut superuser = false;
-        let allowed = if let Role::Database { name } = &self.role {
+        let allowed = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
             if self.table_privilege_superuser()? {
                 superuser = true;
                 true
@@ -2371,7 +2470,7 @@ impl Session {
                 for table in targets {
                     let name_at_commit = self.sql.table_authority_name(table)?;
                     owns_all &= self.sql.table_owner(&name_at_commit)
-                        .map_err(|_| CoreError::Policy(Error::Scope))?.as_deref() == Some(name.as_str());
+                        .map_err(|_| CoreError::Policy(Error::Scope))?.as_ref().is_some_and(|owner| self.service.admin.roles().privileges_of(name).is_ok_and(|roles| roles.contains(owner)));
                 }
                 owns_all
             } else if p.is_ddl() {
@@ -2385,13 +2484,7 @@ impl Session {
                     .schemas
                     .get(&schema)
                     .is_some_and(|(_, owner)| owner == name)
-                    || self
-                        .service
-                        .admin
-                        .roles()
-                        .schema_privileges(&schema, name)
-                        .map_err(|_| CoreError::Policy(Error::Scope))?
-                        .contains(&roles::SchemaPrivilege::Create)
+                    || self.schema_privilege_allowed(&schema, name, roles::SchemaPrivilege::Create)?
             } else if let Some(table) = p.table() {
                 if p.is_multi_source_read() {
                     joined_read || relation_free_plan || modifying_plan
@@ -2456,7 +2549,7 @@ impl Session {
         }
         if p.command() == "TRUNCATE TABLE" && !superuser {
             for table in self.sql.truncate_tables(p)? {
-                let permitted = match &self.role {
+                let permitted = match self.effective_role.as_ref().unwrap_or(&self.role) {
                     Role::Database { name } => self.table_privilege_allowed(
                         &table,
                         name,
@@ -2483,13 +2576,13 @@ impl Session {
             self.abort();
             return Err(CoreError::Policy(Error::Scope));
         }
-        let unrestricted = if let Role::Database { name } = &self.role {
+        let unrestricted = if let Role::Database { name } = self.effective_role.as_ref().unwrap_or(&self.role) {
             self.service
                 .admin
                 .roles()
                 .get(name)
                 .map_err(role_lookup_error)?
-                .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
+                .filter(|role| self.authority_role_live(role))
                 .ok_or(CoreError::Policy(Error::Authentication))?
                 .superuser
         } else {
@@ -2507,20 +2600,9 @@ impl Session {
                 ));
             }
         };
-        let allowed = match &self.role {
+        let allowed = match self.effective_role.as_ref().unwrap_or(&self.role) {
             Role::Application { tables, .. } => tables.contains(&target),
-            Role::Database { name } => {
-                let target = self.sql.table_authority_name(&target)?;
-                unrestricted
-                    || self
-                        .sql
-                        .table_owner(&target)
-                        .is_ok_and(|owner| owner.as_deref() == Some(name.as_str()))
-                    || self
-                        .sql
-                        .table_privileges(&target, name)
-                        .is_ok_and(|privileges| privileges.contains(&roles::TablePrivilege::Insert))
-            }
+            Role::Database { name } => unrestricted || self.table_privilege_allowed(&target, name, Some(roles::TablePrivilege::Insert))?,
             _ => false,
         };
         if !allowed {
@@ -2921,7 +3003,7 @@ impl Session {
         sequences: Vec<String>, execute: impl FnOnce(&mut Self) -> Result<(T, bool, bool), CoreError>,
     ) -> Result<T, CoreError> {
         if ddl && self.sql.in_transaction() { self.implicit_ddl = true; }
-        let transactional = self.sql.set_ddl_owner(match &self.role { Role::Database { name } => Some(name), _ => None });
+        let transactional = self.sql.set_ddl_owner(match self.effective_role.as_ref().unwrap_or(&self.role) { Role::Database { name } => Some(name), _ => None });
         let candidates = if ddl && !transactional { self.sql.sequence_owners()?.into_iter().map(|(name, _)| name).collect::<Vec<_>>() } else { vec![] };
         let preexisting = command == "CREATE TABLE" && table.map(|t| self.sql.relation_exists(t)).transpose()?.unwrap_or(false);
         // Native errors stay in the result envelope; failed execution must skip bookkeeping.
@@ -2934,7 +3016,7 @@ impl Session {
         if command == "CREATE TABLE" && !preexisting { created.extend(table.map(str::to_owned)); }
         for name in created {
             roles.forget_table(&name).map_err(|_| CoreError::Policy(Error::Scope))?;
-            if let Role::Database { name: owner } = &self.role {
+            if let Role::Database { name: owner } = self.effective_role.as_ref().unwrap_or(&self.role) {
                 roles.set_table_owner(&name, owner).map_err(|_| CoreError::Policy(Error::Scope))?;
             }
         }

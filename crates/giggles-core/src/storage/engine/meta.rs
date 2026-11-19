@@ -37,7 +37,8 @@ pub(crate) const EXPORT_REFUSED: u64 = TASK_CATALOG | PROTECTED_RECORDS;
 pub(crate) const USER_COLLATIONS: u64 = 1 << 23;
 pub(crate) const COLUMN_COLLATIONS: u64 = 1 << 24;
 pub(crate) const BUILTIN_EXTENSIONS: u64 = 1 << 25;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 26] = [
+pub(crate) const ROLE_MEMBERSHIP: u64 = 1 << 27;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 27] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -64,6 +65,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 26] = [
     (USER_COLLATIONS, "user_collations"),
     (COLUMN_COLLATIONS, "column_collations"),
     (BUILTIN_EXTENSIONS, "builtin_extensions"),
+    (ROLE_MEMBERSHIP, "role_membership"),
 ];
 #[path = "meta_range.rs"]
 mod range_local;
@@ -366,7 +368,7 @@ pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
             | PROTECTED_RECORDS
             | WRITE_FENCE
             | USER_COLLATIONS
-            | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS,
+            | COLUMN_COLLATIONS | BUILTIN_EXTENSIONS | ROLE_MEMBERSHIP,
     )
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
@@ -379,7 +381,7 @@ fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     if bits & RANGES != 0 && bits & REPLICATED == 0 {
         return Err(corrupt("ranges requires replicated"));
     }
-    if bits & TASK_CATALOG != 0 && bits & 2048 == 0 {
+    if bits & (TASK_CATALOG | ROLE_MEMBERSHIP) != 0 && bits & 2048 == 0 {
         return Err(corrupt("task catalog requires role_catalog"));
     }
     if bits & UNIQUE_CONSTRAINT_IDENTITY != 0 && bits & 68 != 68 {

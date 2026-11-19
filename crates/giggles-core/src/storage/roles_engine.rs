@@ -60,14 +60,22 @@ pub(crate) fn classify_key(key: &[u8]) -> Result<CatalogKind, CoreError> {
             .ok_or(RoleError::Invalid)
             .and_then(|(table, role)| {
                 relation(table)?;
-                validate_name(role)
+                if role.is_empty() { Ok(()) } else { validate_name(role) }
             }),
-        9 | 12 => name
+        9 => {
+            let parts: Vec<_> = name.split('\0').collect();
+            if !(2..=3).contains(&parts.len()) {
+                Err(RoleError::Invalid)
+            } else {
+                parts.into_iter().try_for_each(validate_name)
+            }
+        }
+        12 => name
             .split_once('\0')
             .ok_or(RoleError::Invalid)
             .and_then(|(object, role)| {
                 validate_name(object)?;
-                validate_name(role)
+                if role.is_empty() { Ok(()) } else { validate_name(role) }
             }),
         _ => validate_name(name),
     };
@@ -99,7 +107,12 @@ pub(crate) fn validate_record(key: &[u8], value: &[u8]) -> Result<(), CoreError>
                 return Err(corrupt("invalid catalog role"));
             }
         }
-        CatalogKind::RoleMembership if payload.is_empty() => {}
+        CatalogKind::RoleMembership => {
+            let raw = [b"member/".as_slice(), &key[1..key.len() - 1]].concat();
+            let mut table = RoleTable::default();
+            table.0.insert(raw, payload.to_vec());
+            membership_edges(&table).map_err(|e| corrupt(&e.to_string()))?;
+        }
         CatalogKind::TableOwner => {
             let name =
                 std::str::from_utf8(payload).map_err(|e| CoreError::Corrupt(e.to_string()))?;
@@ -131,6 +144,24 @@ pub(crate) fn is_task_only_record(key: &[u8], value: &[u8]) -> bool {
             .strip_prefix(&[1])
             .and_then(|payload| serde_json::from_slice::<CatalogRole>(payload).ok())
             .is_some_and(|role| role.task_only)
+}
+
+pub(crate) fn membership_features(key: &[u8], value: &[u8]) -> u64 {
+    let Some(payload) = value.strip_prefix(&[1]) else {
+        return 0;
+    };
+    let raw = match key.first() {
+        Some(8) => [b"role/".as_slice(), &key[1..key.len() - 1]].concat(),
+        Some(9) => [b"member/".as_slice(), &key[1..key.len() - 1]].concat(),
+        Some(11) => [b"tgrant/".as_slice(), &key[if key[1] == 0 { 2 } else { 1 }..key.len() - 1]].concat(),
+        Some(12) => [b"sgrant/".as_slice(), &key[1..key.len() - 1]].concat(),
+        _ => return 0,
+    };
+    if extended_record(&raw, payload) {
+        crate::storage::engine::meta::ROLE_MEMBERSHIP
+    } else {
+        0
+    }
 }
 
 pub(super) fn encode_key(raw: &[u8]) -> Result<Vec<u8>, CoreError> {
@@ -231,7 +262,12 @@ pub(crate) fn lock_shared(
     deadline: Option<Instant>,
     cancel: &dyn Fn() -> bool,
 ) -> Result<(), CoreError> {
-    txn.acquire_lock(LockKey::Table(ROLE_LOCK), LockMode::AccessShare, deadline, cancel)?;
+    txn.acquire_lock(
+        LockKey::Table(ROLE_LOCK),
+        LockMode::AccessShare,
+        deadline,
+        cancel,
+    )?;
     Ok(())
 }
 fn stage(txn: &mut Transaction, before: &RoleTable, after: &RoleTable) -> Result<(), RoleError> {
@@ -247,7 +283,9 @@ fn stage(txn: &mut Transaction, before: &RoleTable, after: &RoleTable) -> Result
         let key = encode_key(raw)?;
         let value = [vec![1], payload.clone()].concat();
         validate_record(&key, &value)?;
-        txn.require_features(FEATURE);
+        let synthesized = synthesized_membership(after, raw);
+        txn.require_features(FEATURE | membership_features(&key, &value)
+            | if synthesized { crate::storage::engine::meta::ROLE_MEMBERSHIP } else { 0 });
         if is_task_only_record(&key, &value) {
             txn.require_features(crate::storage::engine::meta::TASK_CATALOG);
         }
@@ -373,7 +411,12 @@ fn authority_objects(parts: &CatalogParts) -> BTreeMap<String, u64> {
                 .map(|(id, def)| (def.name.clone(), *id)),
         )
         .chain(parts.sql_views.iter().map(|(id, v)| {
-            let schema = parts.ext.schemas.iter().find(|(_, s)| s.id == v.schema).map_or("public", |(n, _)| n.as_str());
+            let schema = parts
+                .ext
+                .schemas
+                .iter()
+                .find(|(_, s)| s.id == v.schema)
+                .map_or("public", |(n, _)| n.as_str());
             (crate::relational::relation_key(schema, &v.name), *id)
         }))
         .collect()

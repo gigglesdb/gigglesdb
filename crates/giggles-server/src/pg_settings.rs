@@ -27,6 +27,10 @@ pub(crate) struct Settings {
     pub datestyle: String,
     pub intervalstyle: String,
     pub session_replication_role: String,
+    pub selected_role: String,
+    pub selected_role_oid: Option<u32>,
+    pub session_authorization_oid: Option<u32>,
+    pub session_authorization: String,
     /// Only public contains engine tables; non-public schemas resolve nothing.
     /// Unqualified names still resolve to public even for an empty path, until
     /// schemas exist. This is an intentional restore-compatibility divergence.
@@ -61,6 +65,10 @@ impl Default for Settings {
             datestyle: "ISO, MDY".into(),
             intervalstyle: "postgres".into(),
             session_replication_role: "origin".into(),
+            selected_role: "none".into(),
+            selected_role_oid: None,
+            session_authorization_oid: None,
+            session_authorization: String::new(),
             search_path: r#""$user", public"#.into(),
             client_min_messages: "notice".into(),
             check_function_bodies: "on".into(),
@@ -88,7 +96,7 @@ impl Settings {
 struct SavepointSettings {
     name: String,
     current: Settings,
-    local: std::collections::BTreeMap<Show, String>,
+    local: std::collections::BTreeMap<Show, (String, Option<u32>)>,
     queried: bool,
 }
 #[derive(Default)]
@@ -97,7 +105,7 @@ pub(crate) struct SessionSettings {
     saved: Option<Settings>,
     pub defaults: Settings,
     pub queried: bool,
-    local: std::collections::BTreeMap<Show, String>,
+    local: std::collections::BTreeMap<Show, (String, Option<u32>)>,
     savepoints: Vec<SavepointSettings>,
 }
 impl SessionSettings {
@@ -143,8 +151,9 @@ impl SessionSettings {
                 }
             } else {
                 self.saved = None;
-                for (name, value) in std::mem::take(&mut self.local) {
+                for (name, (value, oid)) in std::mem::take(&mut self.local) {
                     self.current.assign(name, value);
+                    self.current.assign_oid(name, oid);
                 }
             }
             self.local.clear();
@@ -175,10 +184,16 @@ impl SessionSettings {
                 if *local && !in_transaction {
                     return true;
                 }
+                if *name == Show::SessionAuthorization {
+                    if *local { self.local.entry(Show::Role).or_insert_with(|| (self.current.selected_role.clone(), self.current.selected_role_oid)); }
+                    else { self.local.remove(&Show::Role); }
+                    self.current.selected_role = "none".into();
+                    self.current.selected_role_oid = None;
+                }
                 if *local {
                     self.local
                         .entry(*name)
-                        .or_insert_with(|| name.value(&self.current).1);
+                        .or_insert_with(|| (name.value(&self.current).1, self.current.role_oid(*name)));
                 } else {
                     self.local.remove(name);
                 }
@@ -206,6 +221,12 @@ impl Setting {
     }
 }
 impl Settings {
+    fn role_oid(&self, name: Show) -> Option<u32> {
+        match name { Show::Role => self.selected_role_oid, Show::SessionAuthorization => self.session_authorization_oid, _ => None }
+    }
+    fn assign_oid(&mut self, name: Show, oid: Option<u32>) {
+        match name { Show::Role => self.selected_role_oid = oid, Show::SessionAuthorization => self.session_authorization_oid = oid, _ => {} }
+    }
     fn assign(&mut self, name: Show, value: String) {
         match name {
             Show::ApplicationName => self.application_name = value,
@@ -218,6 +239,8 @@ impl Settings {
             Show::DateStyle => self.datestyle = value,
             Show::IntervalStyle => self.intervalstyle = value,
             Show::SessionReplicationRole => self.session_replication_role = value,
+            Show::Role => self.selected_role = value,
+            Show::SessionAuthorization => self.session_authorization = value,
             Show::SearchPath => self.search_path = value,
             Show::ClientMinMessages => self.client_min_messages = value,
             Show::CheckFunctionBodies => self.check_function_bodies = value,
@@ -292,6 +315,8 @@ pub(crate) enum Show {
     TimeZone,
     IntervalStyle,
     SessionReplicationRole,
+    Role,
+    SessionAuthorization,
     ByteaOutput,
     StatementTimeout,
     LockTimeout,
@@ -367,6 +392,8 @@ impl Show {
             Self::DateStyle => ("DateStyle", settings.datestyle.clone()),
             Self::TimeZone => ("TimeZone", settings.timezone.clone()),
             Self::IntervalStyle => ("IntervalStyle", settings.intervalstyle.clone()),
+            Self::Role => ("role", settings.selected_role.clone()),
+            Self::SessionAuthorization => ("session_authorization", settings.session_authorization.clone()),
             Self::SessionReplicationRole => ("session_replication_role", settings.session_replication_role.clone()),
             Self::ByteaOutput => ("bytea_output", "hex".into()),
             Self::TransactionTimeout => ("transaction_timeout", "0".into()),

@@ -150,8 +150,8 @@ struct Diagnostic {
 }
 fn replication_role_allowed(session: &Session) -> R<bool> {
     match &session.role {
-        Role::Database { name } => Ok(session.service.admin.roles().get(name)
-            .map_err(|_| "42501")?.is_some_and(|role| role.superuser)),
+        Role::Database { .. } => { let Role::Database { name } = session.authority_role() else { unreachable!() }; Ok(session.service.admin.roles().get(name)
+            .map_err(|_| "42501")?.is_some_and(|role| role.superuser)) },
         _ => Ok(false),
     }
 }
@@ -212,6 +212,71 @@ impl Diagnostic {
     }
 
     // Only errors returned by the settings/mode parsers receive GUC diagnostics.
+    fn role_admin_error(&mut self, session: &Session, stmt: &crate::auth::statements::AdminStatement, code: &'static str) -> &'static str {
+        use crate::auth::statements::AdminStatement as A;
+        match (code, stmt) {
+            ("42939", A::Create(name, ..)) => {
+                self.wire_message = Some(format!("role name \"{name}\" is reserved"));
+                self.wire_detail = Some("Role names starting with \"pg_\" are reserved.".into());
+            }
+            ("42501", A::Create(..)) => {
+                self.wire_message = Some("permission denied to create role".into());
+                self.wire_detail = Some("Only roles with the CREATEROLE attribute may create roles.".into());
+            }
+            ("42501", A::Membership { grant, roles, grantor, .. }) => {
+                let verb = if *grant { "grant" } else { "revoke" };
+                if let Some(grantor) = grantor {
+                    let catalog = session.service.admin.roles();
+                    let grantor = match grantor.as_str() { "\0current_user" | "\0current_role" => match session.authority_role() { Role::Database { name } => name.as_str(), _ => grantor }, "\0session_user" => session.session_user_name().unwrap_or(grantor), _ => grantor };
+                    let superuser = catalog.get(grantor).ok().flatten().is_some_and(|r| r.superuser);
+                    let bootstrap = crate::auth::statements::bootstrap_grantor(&catalog).ok().flatten().as_deref() == Some(grantor);
+                    if ((*grant && !bootstrap) || (!*grant && !superuser))
+                        && let Some(role) = roles.iter().find(|role| !catalog.admin_of(grantor, role).unwrap_or(false)) {
+                        self.wire_message = Some(format!("permission denied to grant privileges as role \"{grantor}\""));
+                        self.wire_detail = Some(format!("The grantor must have the ADMIN option on role \"{role}\"."));
+                        return code;
+                    }
+                }
+                if let Some(role) = roles.first() {
+                    self.wire_message = Some(format!("permission denied to {verb} role \"{role}\""));
+                    self.wire_detail = Some(format!("Only roles with the ADMIN option on role \"{role}\" may {verb} this role."));
+                }
+            }
+            ("0LP01", A::Membership { roles, members, .. }) => {
+                if let (Some(role), Some(member)) = (roles.first(), members.first()) {
+                    self.wire_message = Some(format!("role \"{role}\" is a member of role \"{member}\""));
+                }
+            }
+            ("0A000", A::Membership { roles, members, .. }) => {
+                if roles.iter().any(|r| r == "pg_database_owner") { self.wire_message = Some("role \"pg_database_owner\" cannot have explicit members".into()); }
+                else if members.iter().any(|r| r == "pg_database_owner") { self.wire_message = Some("role \"pg_database_owner\" cannot be a member of any role".into()); }
+            }
+            ("2BP01", A::Drop(_, roles)) => {
+                if let Some(role) = roles.iter().find(|r| r.starts_with("pg_")) {
+                    self.wire_message = Some(format!("cannot drop role {role} because it is required by the database system"));
+                }
+            }
+            ("42939", A::Alter(name, ..)) => {
+                self.wire_message = Some(format!("role name \"{name}\" is reserved"));
+                self.wire_detail = Some("Cannot alter reserved roles.".into());
+            }
+            ("42704", A::Membership { roles, members, grantor, .. }) => {
+                if let Some(name) = roles.iter().chain(members).chain(grantor).find(|name| session.service.admin.roles().get(name).ok().flatten().is_none()) {
+                    self.wire_message = Some(format!("role \"{name}\" does not exist"));
+                }
+            }
+            ("55006", A::Drop(_, roles)) => {
+                let is_current = matches!(session.authority_role(), Role::Database { name } if roles.contains(name));
+                self.wire_message = Some(if is_current { "current user cannot be dropped" } else { "session user cannot be dropped" }.into());
+            }
+            ("2BP01", A::Membership { .. }) => {
+                self.wire_message = Some("dependent privileges exist".into());
+                self.wire_hint = Some("Use CASCADE to revoke them too.");
+            }
+            _ => {}
+        }
+        code
+    }
     fn settings<T>(&mut self, result: R<T>) -> R<T> {
         result.inspect_err(|code| {
             self.message = match *code {
@@ -1242,7 +1307,8 @@ fn inspect(
     if session.is_aborted() {
         return Err("25P02");
     }
-    let (name, value) = show.value(settings);
+    let (name, mut value) = show.value(settings);
+    if show == crate::pg_settings::Show::SessionAuthorization && value.is_empty() { value = session.session_user_name().unwrap_or("giggles").into(); }
     Ok((
         Description {
             type_oids: vec![],
@@ -1330,6 +1396,7 @@ impl State {
         // Settings also change through set_config and transaction recovery. Keep
         // the execution clock's zone aligned on every dispatch exit, including errors.
         session.set_time_zone(&self.settings.current.timezone);
+        session.sync_role_settings(&mut self.settings.current)?;
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         session.set_default_isolation(&self.settings.current);
@@ -1341,8 +1408,10 @@ impl State {
                 .transaction_end(if result.is_ok() { "COMMIT" } else { "ROLLBACK" });
         }
         session.set_time_zone(&self.settings.current.timezone);
+        session.sync_role_settings(&mut self.settings.current)?;
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        simple::role_notices(session, &self.settings.current, out)?;
         result
     }
     fn prepare_statement(
@@ -2088,7 +2157,8 @@ impl State {
                         session,
                         &mut self.diagnostic,
                     )?;
-                    let tag = session.execute_admin(stmt)?;
+                    let tag = session.execute_admin(stmt).map_err(|code| self.diagnostic.role_admin_error(session, stmt, code))?;
+                    simple::role_notices(session, &self.settings.current, out)?;
                     self.admin_completed = true;
                     p.result = ran();
                     complete(tag, &empty(), out)?;
@@ -2804,7 +2874,8 @@ impl State {
                     session.sql.rollback();
                     self.settings.transaction(true, false, "ROLLBACK");
                     session.set_time_zone(&self.settings.current.timezone);
-                    session.set_search_path(&self.settings.current.search_path);
+                    session.sync_role_settings(&mut self.settings.current).map_err(std::io::Error::other)?;
+        session.set_search_path(&self.settings.current.search_path);
                     session.set_extra_float_digits(self.settings.current.extra_float_digits);
                     self.implicit = false;
                     self.cursors.transaction_end("ROLLBACK");
@@ -2926,6 +2997,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         startup_settings.search_path = "public".into();
     }
     startup_settings.engine = session.service.admin.engine();
+    startup_settings.session_authorization = session.session_user_name().unwrap_or("").into();
     state.settings.defaults = startup_settings.clone();
     state.settings.current = startup_settings;
     session.set_time_zone(&state.settings.current.timezone);

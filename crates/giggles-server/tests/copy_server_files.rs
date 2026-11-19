@@ -28,6 +28,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn with_engine(engine: giggles_core::Engine) -> Self {
+        Self::with_collisions(engine, false).await
+    }
+    async fn with_collisions(engine: giggles_core::Engine, collisions: bool) -> Self {
         let path = std::env::temp_dir().join(format!(
             "copy-network-{}-{}-{}",
             std::process::id(),
@@ -68,6 +71,27 @@ impl Fixture {
         )
         .unwrap();
         drop(sql);
+        admin.roles().set_table_owner("t", "owner").unwrap();
+        let admin = if collisions {
+            drop(admin);
+            // Exact main-era JSON shape and empty-valued membership in a legacy database.
+            let db = redb::Database::open(path.join("db.redb/data.redb")).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(redb::TableDefinition::<&[u8], &[u8]>::new("giggles_roles_v1")).unwrap();
+                for (i, name) in ["pg_read_all_data", "pg_write_all_data", "pg_execute_server_program", "pg_read_server_files", "pg_write_server_files"].iter().enumerate() {
+                    let bytes = serde_json::to_vec(&giggles_core::roles::CatalogRole {
+                        name: (*name).into(), oid: 18000+i as u32, superuser: false, login: true,
+                        createrole: false, password: None, generation: 1, task_only: false, inherit: true,
+                    }).unwrap();
+                    table.insert(format!("role/{name}").as_bytes(), bytes.as_slice()).unwrap();
+                }
+                table.insert(b"member/pg_execute_server_program\0denied".as_slice(), b"".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+            drop(db);
+            Admin::open(path.join("db.redb"), Limits::default()).unwrap()
+        } else { admin };
         let service = Service::new(admin, vec![], Clock::new(0, 3600).unwrap()).unwrap();
         let config = PostgresqlConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -346,5 +370,30 @@ async fn programs_roundtrip_and_exit_details() {
             }
         );
     }
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn main_format_stored_capability_names_are_ordinary_roles() {
+    let f = Fixture::with_collisions(giggles_core::Engine::Legacy, true).await;
+    for (name, sql) in [
+        ("pg_read_all_data", "SELECT * FROM t"),
+        ("pg_write_all_data", "INSERT INTO t VALUES (9, 'x', 1)"),
+        ("pg_execute_server_program", "COPY absent TO PROGRAM 'missing'"),
+        ("pg_read_server_files", "COPY absent FROM 'missing'"),
+        ("pg_write_server_files", "COPY absent TO 'missing'"),
+        ("denied", "COPY absent TO PROGRAM 'missing'"),
+    ] {
+        let mut s = f.connect_as(name).await;
+        let result = query(&mut s, sql).await;
+        error(&result, "42501");
+    }
+    // Explicit grants still work for the stored identity.
+    let mut owner = f.connect().await;
+    let grant = query(&mut owner, "GRANT SELECT ON t TO pg_read_all_data").await;
+    assert!(!tags(&grant).contains(&b'E'), "{grant:?}");
+    let mut reader = f.connect_as("pg_read_all_data").await;
+    let read = query(&mut reader, "SELECT * FROM t").await;
+    assert!(!tags(&read).contains(&b'E'), "{read:?}");
     f.stop().await;
 }

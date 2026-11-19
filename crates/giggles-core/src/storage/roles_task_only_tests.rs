@@ -48,6 +48,7 @@ fn invalid<T: std::fmt::Debug>(result: Result<T, RoleError>) {
 #[test]
 fn existing_role_bytes_unchanged() {
     let role = CatalogRole {
+        inherit: true,
         name: "reader".into(),
         oid: 16384,
         superuser: false,
@@ -202,6 +203,7 @@ fn legacy_engine_refuses() {
 #[test]
 fn check_task_only_matrix() {
     let role = |task_only| CatalogRole {
+        inherit: true,
         name: "r".into(),
         oid: 16384,
         superuser: false,

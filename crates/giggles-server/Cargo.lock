@@ -666,6 +666,7 @@ dependencies = [
  "protoc-bin-vendored",
  "raft",
  "rcgen",
+ "redb",
  "rustls",
  "rustls-pemfile",
  "serde",

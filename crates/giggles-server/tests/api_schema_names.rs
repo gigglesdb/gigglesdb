@@ -117,6 +117,7 @@ async fn resolved_authority_denies_other_schemas_and_missing_targets() {
     let f = fixture().await;
     f.admin.roles().create(NewRole { name:"reader".into(), login:true, ..NewRole::default() }).unwrap();
     f.admin.roles().grant_table("app\0t", "reader", &[giggles_core::roles::TablePrivilege::Select]).unwrap();
+    f.admin.roles().grant_schema("app", "reader", &[giggles_core::roles::SchemaPrivilege::Usage]).unwrap();
     database(&f, "reader");
     let mut authority = f.service.role_session("reader").unwrap();
     assert!(authority.prepare("SELECT id FROM app.t").is_ok());

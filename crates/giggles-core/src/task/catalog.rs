@@ -459,6 +459,10 @@ impl From<SqlError> for TaskDdlError {
 impl From<RoleError> for TaskDdlError {
     fn from(error: RoleError) -> Self {
         let sqlstate = match &error {
+            RoleError::ReservedName | RoleError::ReservedAlter => "42939",
+            RoleError::ReservedDrop | RoleError::DependentMembership { .. } => "2BP01",
+            RoleError::MembershipCycle { .. } => "0LP01",
+            RoleError::DatabaseOwnerMembers | RoleError::DatabaseOwnerMember => "0A000",
             RoleError::Duplicate => "42710",
             RoleError::Missing => "42704",
             RoleError::Dependent => "2BP01",

@@ -235,6 +235,7 @@ fn hidden_mode_decodes_to_absent() {
 
 fn role(name: &str, superuser: bool) -> CatalogRole {
     CatalogRole {
+        inherit: true,
         name: name.into(),
         oid: 16384,
         superuser,

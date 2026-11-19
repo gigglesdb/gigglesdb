@@ -160,6 +160,8 @@ enum Source {
     Cte(std::sync::Arc<Query>),
     Union(Box<Query>, Box<Query>, bool),
     FlatUnion(Vec<Query>),
+    RoleRecursion(String, Box<Query>, Box<Query>, bool),
+    RecursiveInput(String),
     Series(E, E),
     Unnest(E, bool),
     ZipUnnest(Vec<E>, bool),
@@ -411,7 +413,7 @@ impl Visitor for Scan {
                 "pg_get_indexdef" | "pg_get_constraintdef" | "pg_get_expr"
                 | "pg_get_userbyid" | "format_type" | "obj_description" | "pg_collation_actual_version"
                 | "col_description" | "shobj_description" | "pg_get_viewdef"
-                | "has_table_privilege" | "has_column_privilege"));
+                | "pg_has_role" | "has_table_privilege" | "has_column_privilege"));
             self.introspection |= introspection;
             self.introspection_only &= introspection;
         }
@@ -912,6 +914,7 @@ pub fn execute_with_startup(
         startup,
         parameters: &parameters,
         work: 0,
+        recursive_rows: BTreeMap::new(),
     };
     let rows = rt.query(&plan.query, &[])?;
     Ok(ResultSet {
@@ -924,7 +927,7 @@ fn definitely_empty(q: &Query) -> bool {
         match s {
             Source::Empty => true,
             // No stored views/rules exist in this catalog model.
-            Source::Catalog(n) => matches!(n.as_str(), "pg_rewrite" | "pg_auth_members"),
+            Source::Catalog(n) => matches!(n.as_str(), "pg_rewrite"),
             Source::Derived(q) | Source::Cte(q) => definitely_empty(q),
             Source::Filtered(s, _) => source(s),
             Source::Join(l, r, _, left, _, _) => source(l) || !*left && source(r),
@@ -947,6 +950,80 @@ fn reorderable_catalog_filter(e: &A) -> bool {
                     && matches!(index, A::Identifier(_) | A::CompoundIdentifier(_))),
         _ => false,
     }
+}
+// Admit only a single membership edge walk, optionally looking up the reached
+// role in pg_roles for pgAdmin's name column. A catalog mention alone must not
+// enable general self-recursion, which is eagerly materialized by this engine.
+fn membership_step(step: &Query, name: &str) -> bool {
+    fn equalities(e: &E, edges: &mut Vec<(usize, usize)>) {
+        match &e.kind {
+            K::Binary(l, Op::And, r) => {
+                equalities(l, edges);
+                equalities(r, edges);
+            }
+            K::Binary(l, Op::Eq, r) => {
+                if let (K::Column(l), K::Column(r)) = (&l.kind, &r.kind) {
+                    edges.push((*l, *r));
+                }
+            }
+            _ => {}
+        }
+    }
+    fn sources<'a>(s: &'a Source, offset: usize, width: usize,
+        leaves: &mut Vec<(&'a Source, usize, usize)>, edges: &mut Vec<(usize, usize)>) -> bool {
+        match s {
+            Source::Join(l, r, on, false, rw, false) if *rw <= width => {
+                // Compiler join predicates use the SELECT's column offsets.
+                // Restrict to left-deep joins so no nested RHS rebasing is needed.
+                if matches!(r.as_ref(), Source::Join(..)) { return false; }
+                equalities(on, edges);
+                sources(l, offset, width - rw, leaves, edges)
+                    && sources(r, offset + width - rw, *rw, leaves, edges)
+            }
+            Source::Catalog(_) | Source::Cte(_) => {
+                leaves.push((s, offset, width));
+                true
+            }
+            _ => false,
+        }
+    }
+    let mut leaves = vec![];
+    let mut edges = vec![];
+    if !sources(&step.source, 0, step.source_width, &mut leaves, &mut edges)
+        || step.aggregate || step.expand.is_some() {
+        return false;
+    }
+    let mut recursive = None;
+    let mut membership = None;
+    let mut roles = vec![];
+    for (s, offset, width) in leaves {
+        match s {
+            Source::Cte(q) if matches!(&q.source, Source::RecursiveInput(n) if n == name) => {
+                if recursive.replace((offset, width)).is_some() { return false; }
+            }
+            Source::Catalog(n) if n == "pg_auth_members" => {
+                if membership.replace(offset).is_some() { return false; }
+            }
+            Source::Catalog(n) if n == "pg_roles" => roles.push((offset, width)),
+            _ => return false,
+        }
+    }
+    let (Some((input, width)), Some(member)) = (recursive, membership) else { return false; };
+    let equals = |a, b| edges.iter().any(|&(l, r)| (l == a && r == b) || (l == b && r == a));
+    let role_oid = catalog::schema("pg_roles").unwrap().iter()
+        .position(|f| f.name == "oid").unwrap();
+    // pg_auth_members has roleid at 1 and member at 2.
+    (0..width).any(|i| {
+        [(member + 2, member + 1), (member + 1, member + 2)].into_iter().any(|(from, to)| {
+            equals(input + i, from)
+                && step.projection.get(i).is_some_and(|e| e.kind == K::Column(to))
+                && roles.iter().all(|&(start, _)| equals(start + role_oid, to))
+                && step.projection.iter().enumerate().all(|(j, e)| {
+                    j == i || matches!(e.kind, K::Column(c)
+                        if roles.iter().any(|&(start, width)| c >= start && c < start + width))
+                })
+        })
+    })
 }
 impl Compiler {
     fn query(&mut self, q: &a::Query, outer: &Schema) -> R<Query> {
@@ -977,13 +1054,13 @@ impl Compiler {
                     return Err(Error::Unsupported);
                 }
                 let compiled = if with.recursive {
-                    // Only eliminate recursive steps proven empty by absent catalog
-                    // features (views/rules and role memberships).
-                    // A potentially productive recursion remains unsupported.
+                    // Fold absent catalog features and evaluate membership walks with
+                    // the same row, byte and work budgets as ordinary catalog queries.
+                    // Other productive recursive sources remain unsupported.
                     let a::SetExpr::SetOperation {
                         op: a::SetOperator::Union,
-                        set_quantifier:
-                            a::SetQuantifier::None | a::SetQuantifier::All | a::SetQuantifier::Distinct,
+                        set_quantifier: set_quantifier @ (
+                            a::SetQuantifier::None | a::SetQuantifier::All | a::SetQuantifier::Distinct),
                         left,
                         right,
                     } = cte.query.body.as_ref()
@@ -1002,11 +1079,23 @@ impl Compiler {
                     if definitely_empty(&seed) {
                         seed.source = Source::Empty;
                     }
-                    self.ctes
-                        .insert(name.clone(), std::sync::Arc::new(seed.clone()));
+                    let mut input = seed.clone();
+                    input.source = Source::RecursiveInput(name.clone());
+                    input.filter = truth();
+                    input.projection = seed.fields.iter().enumerate()
+                        .map(|(i, f)| column(i, f.data_type)).collect();
+                    input.source_width = seed.fields.len();
+                    input.order.clear();
+                    input.limit = MAX_ROWS;
+                    input.distinct = false;
+                    input.distinct_on.clear();
+                    input.expand = None;
+                    input.group.clear();
+                    input.aggregate = false;
+                    self.ctes.insert(name.clone(), std::sync::Arc::new(input.clone()));
                     branch.body = right.clone();
                     let step = self.query(&branch, outer)?;
-                    if !definitely_empty(&step) {
+                    if !definitely_empty(&step) && !membership_step(&step, &name) {
                         return Err(Error::Unsupported);
                     }
                     if seed.fields.iter().map(|f| f.data_type).collect::<Vec<_>>()
@@ -1014,7 +1103,11 @@ impl Compiler {
                     {
                         return Err(Error::Type);
                     }
-                    seed
+                    if definitely_empty(&step) { seed } else {
+                        let distinct = !matches!(set_quantifier, a::SetQuantifier::All);
+                        input.source = Source::RoleRecursion(name.clone(), Box::new(seed), Box::new(step), distinct);
+                        input
+                    }
                 } else {
                     self.query(&cte.query, &vec![])?
                 };
@@ -3350,7 +3443,7 @@ fn check_expr(e: &mut E) -> R<()> {
             "pg_get_userbyid" | "pg_table_is_visible" | "pg_type_is_visible" | "pg_collation_actual_version" => {
                 expect(&mut args[0], PgType::Oid)?
             }
-            "has_table_privilege" | "has_column_privilege" => {
+            "pg_has_role" | "has_table_privilege" | "has_column_privilege" => {
                 let last = args.len() - 1;
                 expect(&mut args[last], PgType::Text)?;
                 for arg in &mut args[..last] {
@@ -3431,6 +3524,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         }
         ("nullif", 2) => a[0].ty,
         ("coalesce", n) if n > 0 => a[0].ty,
+        ("pg_has_role", 2 | 3) => PgType::Bool,
         ("has_table_privilege", 2 | 3) | ("has_column_privilege", 3 | 4) => PgType::Bool,
         (
             "has_schema_privilege"
@@ -3551,7 +3645,7 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
                     collect_parameters(arm, types)?;
                 }
             }
-            Source::Union(l, r, _) => {
+            Source::RoleRecursion(_, l, r, _) | Source::Union(l, r, _) => {
                 collect_parameters(l, types)?;
                 collect_parameters(r, types)?;
             }
@@ -3594,6 +3688,7 @@ struct Runtime<'a> {
     catalogs: &'a BTreeMap<String, catalog::Relation>,
     parameters: &'a [Value],
     work: usize,
+    recursive_rows: BTreeMap<String, Vec<Vec<Value>>>,
 }
 fn admit(rows: &[Vec<Value>], row: &[Value], bytes: &mut usize) -> R<()> {
     let n = row.iter().map(Value::bytes).sum::<usize>();
@@ -3696,6 +3791,31 @@ impl Runtime<'_> {
                     .get(outer.len().checked_sub(q.outer_width).ok_or(Error::Type)?..)
                     .ok_or(Error::Type)?,
             ),
+            Source::RecursiveInput(name) => self.recursive_rows.get(name).cloned().ok_or(Error::Unsupported),
+            Source::RoleRecursion(name, seed, step, distinct) => {
+                let mut result = self.query(seed, outer)?;
+                let mut seen = std::collections::BTreeSet::new();
+                if *distinct { result.retain(|row| seen.insert(row.clone())); }
+                let mut pending = result.clone();
+                let mut bytes = result.iter().flatten().map(Value::bytes).sum();
+                let previous = self.recursive_rows.remove(name);
+                let outcome = (|| {
+                    while !pending.is_empty() {
+                        self.charge(pending.len())?;
+                        self.recursive_rows.insert(name.clone(), pending);
+                        pending = self.query(step, outer)?;
+                        if *distinct { pending.retain(|row| seen.insert(row.clone())); }
+                        for row in &pending {
+                            admit(&result, row, &mut bytes)?;
+                            result.push(row.clone());
+                        }
+                    }
+                    Ok(result)
+                })();
+                self.recursive_rows.remove(name);
+                if let Some(rows) = previous { self.recursive_rows.insert(name.clone(), rows); }
+                outcome
+            }
             Source::FlatUnion(arms) => flat_union::execute(self, arms, outer),
             Source::Union(l, r, distinct) => {
                 let mut out = self.query(l, outer)?;
@@ -5041,7 +5161,8 @@ impl Runtime<'_> {
                 I(self.startup.filter(|v| *v >= 0).ok_or(Error::Unsupported)?)
             }
             "current_database" | "current_catalog" => S(self.snapshot.database.clone()),
-            "current_user" | "session_user" | "current_role" | "user" => {
+            "session_user" => S(self.snapshot.session_user.as_ref().unwrap_or(&self.snapshot.user).clone()),
+            "current_user" | "current_role" | "user" => {
                 S(self.snapshot.user.clone())
             }
             "current_schema" => self
@@ -5475,6 +5596,19 @@ impl Runtime<'_> {
                             r.name == self.snapshot.user
                                 && (r.superuser || I(i64::from(r.oid)) == database[2])
                         })),
+                }
+            }
+            "pg_has_role" => {
+                if v.iter().any(|v| matches!(v, N)) { N } else {
+                    let member = if v.len() == 3 { text(v[0].clone())? } else { self.snapshot.user.clone() };
+                    let role = text(v[v.len()-2].clone())?;
+                    let option = text(v[v.len()-1].clone())?.to_ascii_uppercase();
+                    let index = match option.trim() { "MEMBER" => 0, "USAGE" => 1, "SET" => 2,
+                        _ => return Err(Error::InvalidPrivilege(format!("unrecognized privilege type: \"{option}\""))) };
+                    if !self.snapshot.role_privileges.keys().any(|(name, _)| name == &member) { return Err(Error::UnknownRole(member)); }
+                    if !self.snapshot.role_privileges.keys().any(|(_, name)| name == &role) { return Err(Error::UnknownRole(role)); }
+                    let privileges = self.snapshot.role_privileges.get(&(member, role)).ok_or(Error::Unsupported)?;
+                    B(privileges[index])
                 }
             }
             "has_table_privilege" | "has_column_privilege" => self.privilege_function(n, &v)?,

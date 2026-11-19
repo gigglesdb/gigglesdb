@@ -145,6 +145,8 @@ impl Parser {
 }
 pub(crate) fn lookup_name(name: &str) -> Result<Show> {
     match name.to_ascii_lowercase().as_str() {
+        "role" => Ok(Show::Role),
+        "session_authorization" => Ok(Show::SessionAuthorization),
         "application_name" => Ok(Show::ApplicationName),
         "extra_float_digits" => Ok(Show::ExtraFloatDigits),
         "timezone" => Ok(Show::TimeZone),
@@ -207,6 +209,32 @@ pub(crate) fn show_database(sql: &str) -> Result<Option<Show>> {
 pub(crate) fn parse_database(sql: &str) -> Result<Option<Vec<Setting>>> {
     if !first(sql, "SET") && !first(sql, "RESET") {
         return Ok(None);
+    }
+    // The two role GUCs accept PostgreSQL's special SET grammar without TO.
+    let mut role_parser = Parser::new(sql)?;
+    let reset_role = role_parser.kw("RESET");
+    if !reset_role { role_parser.need("SET")?; }
+    let mut local_role = false;
+    let session_prefix = role_parser.kw("SESSION");
+    if !session_prefix { local_role = role_parser.kw("LOCAL"); }
+    let role_name = if session_prefix && role_parser.kw("AUTHORIZATION") { Some(Show::SessionAuthorization) }
+        else if role_parser.kw("ROLE") { Some(Show::Role) }
+        else if role_parser.kw("SESSION_AUTHORIZATION") { Some(Show::SessionAuthorization) }
+        else { None };
+    if let Some(name) = role_name {
+        let value = if reset_role { None } else {
+            if role_parser.tokens.get(role_parser.at) == Some(&Token::Equals) { role_parser.at += 1; }
+            else { role_parser.kw("TO"); }
+            if role_parser.kw("DEFAULT") || (name == Show::Role && role_parser.kw("NONE")) { None }
+            else {
+                let token = role_parser.tokens.get(role_parser.at).ok_or("42601")?;
+                let name = match token { Token::Word(s) => s.to_lowercase(), Token::Ident(s) | Token::Text(s) => s.clone(), _ => return Err("42601") };
+                role_parser.at += 1;
+                Some(name)
+            }
+        };
+        role_parser.end()?;
+        return Ok(Some(vec![Setting::Database { name, value, local: local_role, reset: reset_role }]));
     }
     let mut p = Parser::new(sql)?;
     let reset = p.kw("RESET");
