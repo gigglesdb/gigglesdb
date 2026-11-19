@@ -667,6 +667,7 @@ fn validate(s: &State) -> Result<(), CoreError> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecisionPoint {
     WaitingLock,
+    PreparedBindAuthorized,
     BeforeDecision,
     Decided,
     Committed,
@@ -1233,6 +1234,14 @@ impl Admin {
         self.inner.db(TASK_EXECUTORS)?;
         self.inner.inspect(|s| Ok(s.accounting.get(&task).copied()))
     }
+    /// Trusted test inspection: number of requests actually queued on v2 locks.
+    pub fn waiting_lock_count(&self) -> usize {
+        match &self.inner.backend {
+            Backend::V2(db) => db.waiting_lock_count(),
+            _ => 0,
+        }
+    }
+
     /// Trusted test seam for deterministic local race verification. Not a wire API.
     pub fn set_decision_hook(&self, hook: Option<Arc<dyn Fn(DecisionPoint) + Send + Sync>>) {
         *self.inner.decision_hook.lock().expect("decision hook lock") = hook;
@@ -2959,11 +2968,18 @@ impl SqlSession {
             txn.held_table_locks().into_iter().map(|(table, mode, fastpath)| (txn.id().0, table, mode, fastpath)).collect()
         })
     }
+    /// Committed authority/catalog observation to take before Bind authorization.
+    pub fn prepared_bind_observation(&self) -> Result<Option<u128>, CoreError> {
+        match &self.admin.inner.backend {
+            Backend::V2(db) => db.catalog().committed_observation().map(Some),
+            _ => Ok(None),
+        }
+    }
     /// Hold prepared dependencies (including views' physical sources) through transaction end.
-    /// The caller must authorize before each attempt. `false` means the snapshot
-    /// advanced: authorize again before expanding and locking the new dependencies.
+    /// The caller must observe committed state before authorizing each attempt.
+    /// `false` requires re-authorization before expanding or locking dependencies.
     /// Errors do not abort here, so the caller can preserve error ordering.
-    pub fn lock_prepared_relations(&mut self, p: &relational::Prepared) -> Result<bool, CoreError> {
+    pub fn lock_prepared_relations(&mut self, p: &relational::Prepared, observation: Option<u128>) -> Result<bool, CoreError> {
         if !self.is_v2_engine() { return Ok(true); }
         let Backend::V2(db) = &self.admin.inner.backend else { unreachable!() };
         let db = db.clone();
@@ -2974,7 +2990,7 @@ impl SqlSession {
         let snapshot = txn.snapshot_ts();
         if let Some(error) = txn.snapshot_error() { return Err(error.clone().into()); }
         let pinned = txn.isolation() != engine::txn::Isolation::ReadCommitted;
-        let generation = db.catalog().current_version();
+        self.admin.inner.decision_point(DecisionPoint::PreparedBindAuthorized);
         // Bind and expand from one image of the portal's statement snapshot.
         // Runtime view projections already contain nested physical dependencies.
         let locks = self.inspect_metadata(|state| {
@@ -2996,24 +3012,28 @@ impl SqlSession {
                 }
             }
             Ok(locks)
-        })?;
+        });
         let txn = self.v2_transaction.as_mut().expect("open transaction");
+        if observation != Some(db.catalog().committed_observation()?) {
+            if !pinned { txn.begin_statement(); }
+            return Ok(false);
+        }
+        let locks = locks?;
         // One id order includes views and tables, matching ordinary SQL locking.
         for (id, (name, view)) in locks {
             if txn.current_snapshot_ts() != Some(snapshot)
-                || (!pinned && generation != db.catalog().current_version()) {
-                txn.begin_statement();
+                || observation != Some(db.catalog().committed_observation()?) {
+                if !pinned { txn.begin_statement(); }
                 return Ok(false);
             }
             let result = if view {
                 txn.acquire_lock(engine::locks::LockKey::Table(id),
                     engine::locks::LockMode::AccessShare, None,
-                    &|| crate::cancellation::check().is_err()).map_err(CoreError::from)
+                    &|| crate::cancellation::check().is_err()).map(|()| true).map_err(CoreError::from)
             } else {
                 match db.catalog().resolve_for_bind(txn, &name,
                     &|| crate::cancellation::check().is_err()) {
-                    Ok(Some(_)) => Ok(()),
-                    Ok(None) => return Ok(false),
+                    Ok(entry) => Ok(entry.is_some()),
                     Err(engine::catalog::CatalogError::Core(error)) => Err(error),
                     Err(engine::catalog::CatalogError::Txn(error)) => Err(error.into()),
                 }
@@ -3021,19 +3041,19 @@ impl SqlSession {
             // A wait can change grants/identities even when locking failed.
             // Re-authorize before surfacing that error or locking another dependency.
             if txn.current_snapshot_ts() != Some(snapshot)
-                || (!pinned && generation != db.catalog().current_version()) {
-                txn.begin_statement();
+                || observation != Some(db.catalog().committed_observation()?) {
+                if !pinned { txn.begin_statement(); }
                 return Ok(false);
             }
-            result?;
+            if !result? { return Ok(false); }
         }
         if txn.current_snapshot_ts() == Some(snapshot)
-            && (pinned || generation == db.catalog().current_version()) {
+            && observation == Some(db.catalog().committed_observation()?) {
             return Ok(true);
         }
         // A READ COMMITTED wait may have observed new view definitions or
         // table identities. Expand again before the portal can be published.
-        txn.begin_statement();
+        if !pinned { txn.begin_statement(); }
         Ok(false)
     }
 

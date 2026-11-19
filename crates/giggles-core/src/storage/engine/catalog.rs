@@ -448,6 +448,19 @@ impl Catalog {
         (version != 0 && version <= visible.0).then_some(version)
     }
 
+    /// Latest committed catalog observation, independent of transaction snapshots.
+    /// Role/admin writes use commit_ddl too. The publication mutex closes the
+    /// invalidation window in current_version; gateways read the durable token.
+    pub(crate) fn committed_observation(&self) -> Result<u128, CoreError> {
+        if matches!(self.services, TxnServices::Local { .. }) {
+            let cache = self.cache.lock().map_err(|_| TxnError::Misuse)?;
+            cache.ensure_live()?;
+            return Ok(cache.versions.last().expect("open catalog").0.0 as u128);
+        }
+        let ts = self.services.visible_ts()?;
+        generation_token(&*self.services.read_view(ts), ts)
+    }
+
     fn current_for(&self, txn: &Transaction, ts: Ts) -> Option<(Ts, Arc<CatalogSnapshot>)> {
         if !matches!(self.services, TxnServices::Local { .. })
             || txn.catalog_writes().next().is_some()
@@ -1112,7 +1125,7 @@ impl Catalog {
             }
             if RETURN_ON_DRIFT {
                 drop(cache);
-                txn.begin_statement();
+                if txn.isolation() == Isolation::ReadCommitted { txn.begin_statement(); }
                 return Ok(None);
             }
             if txn.isolation() != Isolation::ReadCommitted || attempt == 2 {

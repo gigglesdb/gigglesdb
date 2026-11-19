@@ -84,6 +84,9 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
             .unwrap();
     }
     let result = if label.starts_with("bind-drift") {
+        if label.contains("view") {
+            admin.roles().grant_table("v", "r", &[giggles_core::roles::TablePrivilege::Select]).unwrap();
+        }
         bind_drift_probe(pg.address, &clients[0], &admin, label).await;
         None
     } else if label.starts_with("bind-auth") {
@@ -783,7 +786,10 @@ async fn bind_drift_probe(
     admin: &Admin,
     label: &str,
 ) {
-    let recreate = label != "bind-drift-drop";
+    let view = label.contains("view");
+    let between = label.contains("between");
+    let cancelled = label.contains("cancel");
+    let recreate = label == "bind-drift-recreate" || label == "bind-drift-granted";
     let granted = label == "bind-drift-granted";
     let mut stream = TcpStream::connect(address).await.unwrap();
     let startup = b"\0\x03\0\0user\0r\0database\0postgres\0\0";
@@ -791,40 +797,67 @@ async fn bind_drift_probe(
     stream.write_all(startup).await.unwrap();
     receive(&mut stream, b'Z').await;
     let mut parse = b"s\0".to_vec();
-    giggles_server::pgwire::z("SELECT a FROM t", &mut parse);
+    giggles_server::pgwire::z(if view { "SELECT a FROM v" } else { "SELECT a FROM t" }, &mut parse);
     parse.extend_from_slice(&[0, 0]);
     send(&mut stream, &[(b'P', &parse), (b'S', b"")]).await;
     assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
-    owner
-        .batch_execute("BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE")
-        .await
-        .unwrap();
+    if view {
+        send(&mut stream, &[(b'Q', b"BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1\0")]).await;
+        assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+    }
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancellation = Arc::new(std::sync::Mutex::new(None));
+    if cancelled {
+        let cancellation = cancellation.clone();
+        admin.set_decision_hook(Some(Arc::new(move |point| {
+            if point == giggles_core::DecisionPoint::PreparedBindAuthorized {
+                *cancellation.lock().unwrap() = giggles_core::cancellation::Cancellation::current();
+            }
+        })));
+    }
+    if between {
+        let (reached, release) = (reached.clone(), release.clone());
+        admin.set_decision_hook(Some(Arc::new(move |point| {
+            if point == giggles_core::DecisionPoint::PreparedBindAuthorized {
+                reached.store(true, std::sync::atomic::Ordering::Release);
+                while !release.load(std::sync::atomic::Ordering::Acquire) { std::thread::yield_now(); }
+            }
+        })));
+    } else {
+        owner.batch_execute(if view {
+            "BEGIN; CREATE OR REPLACE VIEW v(a) AS SELECT b FROM t"
+        } else { "BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE" }).await.unwrap();
+    }
     send(&mut stream, &[(b'B', b"p\0s\0\0\0\0\0\0\0"), (b'H', b"")]).await;
     let terminal = if granted { b'2' } else { b'E' };
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(750),
-            receive(&mut stream, terminal),
-        )
-        .await
-        .is_err(),
-        "Bind must wait on the old relation"
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while if between { !reached.load(std::sync::atomic::Ordering::Acquire) }
+            else { admin.waiting_lock_count() == 0 } {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("Bind reached deterministic barrier");
     // SQL GRANT/REVOKE is disallowed in an explicit transaction (25001).
     // Change grants after Bind waits, while SQL DDL still holds the old lock.
     if !granted {
         admin
             .roles()
-            .revoke_table("t", "r", &[giggles_core::roles::TablePrivilege::Select])
+            .revoke_table(if view { "v" } else { "t" }, "r", &[giggles_core::roles::TablePrivilege::Select])
             .unwrap();
     }
     // The control uses a superuser reader: DDL holds the role-store writer
     // until commit, so an out-of-band GRANT here would deadlock the setup.
-    owner.batch_execute("DROP TABLE t").await.unwrap();
+    if cancelled {
+        assert!(cancellation.lock().unwrap().as_ref().expect("Bind cancellation scope").cancel());
+    } else {
+        owner.batch_execute(if view { "DROP VIEW v" } else { "DROP TABLE t" }).await.unwrap();
+    }
     if recreate {
         owner.batch_execute("CREATE TABLE t(a int)").await.unwrap();
     }
-    owner.batch_execute("COMMIT").await.unwrap();
+    if !between && !cancelled { owner.batch_execute("COMMIT").await.unwrap(); }
+    release.store(true, std::sync::atomic::Ordering::Release);
+    admin.set_decision_hook(None);
     let rebound = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         receive(&mut stream, terminal),
@@ -836,6 +869,7 @@ async fn bind_drift_probe(
         if granted { None } else { Some("42501") },
         "{label}: {rebound:?}"
     );
+    if cancelled { owner.batch_execute("ROLLBACK").await.unwrap(); }
     if recreate && !granted {
         // No Sync yet: a wrongly acquired replacement lock would still be held.
         owner
@@ -845,6 +879,10 @@ async fn bind_drift_probe(
     }
     send(&mut stream, &[(b'S', b"")]).await;
     receive(&mut stream, b'Z').await;
+    if view {
+        send(&mut stream, &[(b'Q', b"ROLLBACK\0")]).await;
+        receive(&mut stream, b'Z').await;
+    }
     parse[0] = b'f';
     send(&mut stream, &[(b'P', &parse), (b'S', b"")]).await;
     let fresh = receive(&mut stream, b'Z').await;
@@ -890,4 +928,18 @@ async fn bind_wait_accepts_readable_replacement() {
         None,
     )
     .await;
+}
+
+#[tokio::test]
+async fn bind_rr_view_wait_reauthorizes_after_revoke_drop() {
+    case("bind-drift-view", "CREATE TABLE t(a int,b int); CREATE VIEW v AS SELECT a FROM t; GRANT SELECT ON t TO r", "", "", None).await;
+}
+#[tokio::test]
+async fn bind_view_reauthorizes_drift_between_authorization_and_locking() {
+    case("bind-drift-view-between", "CREATE TABLE t(a int); CREATE VIEW v AS SELECT a FROM t; GRANT SELECT ON t TO r", "", "", None).await;
+}
+
+#[tokio::test]
+async fn bind_cancelled_wait_after_revoke_reports_authorization() {
+    case("bind-drift-cancel", "CREATE TABLE t(a int); GRANT SELECT ON t TO r", "", "", None).await;
 }

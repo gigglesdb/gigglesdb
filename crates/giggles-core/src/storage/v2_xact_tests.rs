@@ -233,12 +233,12 @@ fn portal_view_locks_expand_from_statement_snapshot() {
     s.begin_prepared_statement();
     let prepared = s.prepare("SELECT * FROM v2").unwrap();
     let generation = s.statement_catalog_version();
-    assert!(s.lock_prepared_relations(&prepared).unwrap());
+    assert!(s.lock_prepared_relations(&prepared, s.prepared_bind_observation().unwrap()).unwrap());
     assert_eq!(s.statement_catalog_version(), generation);
     let locks = s.held_table_locks();
     assert_eq!(locks.iter().filter(|(_, _, mode, _)| *mode == "AccessShareLock").count(), 3);
     let missing = s.prepare("SELECT * FROM missing").unwrap();
-    assert_eq!(s.lock_prepared_relations(&missing), Err(CoreError::Sql(SqlError::UnknownTable)));
+    assert_eq!(s.lock_prepared_relations(&missing, s.prepared_bind_observation().unwrap()), Err(CoreError::Sql(SqlError::UnknownTable)));
     assert!(!s.is_aborted(), "authorization must still run before exposing the lock error");
     run(&mut s, "ROLLBACK");
     drop(s);

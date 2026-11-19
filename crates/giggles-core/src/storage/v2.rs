@@ -373,6 +373,10 @@ impl V2Db {
 
     // F8a-3b routes v2 SQL sessions through this.
     #[allow(dead_code)]
+    pub(super) fn waiting_lock_count(&self) -> usize {
+        self.locks.waiting_count()
+    }
+
     pub(crate) fn catalog(&self) -> &engine::catalog::Catalog {
         &self.catalog
     }

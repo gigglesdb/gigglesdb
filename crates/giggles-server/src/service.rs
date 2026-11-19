@@ -2743,12 +2743,22 @@ impl Session {
     }
     pub(crate) fn bind_prepared_relations(&mut self, p: &Prepared) -> Result<(), CoreError> {
         self.authority_scope(|session| {
-            for _ in 0..3 {
-                let bound = session.authorize_prepared_bind(p)?;
-                if bound.is_ddl() || session.sql.lock_prepared_relations(&bound)? { return Ok(()); }
+            for attempt in 0..3 {
+                let observation = session.sql.prepared_bind_observation()?;
+                // A cancelled wait must still recheck authority after committed
+                // drift. Mask cancellation only for this bounded metadata check;
+                // the next lock attempt still sees the original cancellation.
+                let bound = if attempt == 0 {
+                    session.authorize_prepared_bind(p)?
+                } else {
+                    giggles_core::cancellation::Cancellation::default()
+                        .scope(|| session.authorize_prepared_bind(p))?
+                };
+                if bound.is_ddl() || session.sql.lock_prepared_relations(&bound, observation)? { return Ok(()); }
             }
             // Preserve fresh-Parse authorization ordering even on retry exhaustion.
-            let bound = session.authorize_prepared_bind(p)?;
+            let bound = giggles_core::cancellation::Cancellation::default()
+                .scope(|| session.authorize_prepared_bind(p))?;
             session.sql.describe(&bound)?;
             Err(CoreError::Sql(relational::SqlError::StaleSchema))
         })
