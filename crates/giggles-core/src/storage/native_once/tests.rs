@@ -582,6 +582,7 @@ fn format_three_bytes_are_frozen_and_format_four_requires_native_namespace() {
     );
 }
 
+#[cfg(feature = "legacy-task")]
 #[test]
 fn replica_methods_reject_native_state_even_after_raw_deserialization() {
     let mut state = empty(73);
@@ -755,6 +756,7 @@ fn malformed_result_codec_rejects_before_publication_and_on_record_decode() {
     }
 }
 
+#[cfg(feature = "legacy-task")]
 #[test]
 fn native_format_preserves_repair_receipt_and_accounting_namespaces() {
     let (_, admin) = fixture();

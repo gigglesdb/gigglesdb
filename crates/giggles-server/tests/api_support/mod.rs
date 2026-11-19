@@ -1,4 +1,13 @@
 #![allow(dead_code)]
+#[cfg(feature = "legacy-task")]
+use giggles_core::TaskResources as LegacyTaskResources;
+#[cfg(not(feature = "legacy-task"))]
+#[allow(dead_code)]
+pub struct LegacyTaskResources {
+    read_rows: u64,
+    disclosed_rows: u64,
+    encoded_bytes: u64,
+}
 use bytes::Bytes;
 use giggles_core::{Admin, Limits};
 #[cfg(feature = "legacy-task")]
@@ -96,7 +105,7 @@ impl Fixture {
     #[allow(dead_code)]
     pub async fn catalog_empty_engine(engine: giggles_core::Engine) -> Self {
         Self::build_engine(ApiLimits::default(), giggles_server::admission::ServiceLimits::default(),
-            giggles_core::TaskResources { read_rows: 100000, disclosed_rows: 100000, encoded_bytes: 100000000 }, false, engine).await
+            LegacyTaskResources { read_rows: 100000, disclosed_rows: 100000, encoded_bytes: 100000000 }, false, engine).await
     }
     pub async fn with_limits(limits: ApiLimits) -> Self {
         Self::with_service_limits(limits, giggles_server::admission::ServiceLimits::default()).await
@@ -108,7 +117,7 @@ impl Fixture {
         Self::build(
             limits,
             service_limits,
-            giggles_core::TaskResources {
+            LegacyTaskResources {
                 read_rows: 100000,
                 disclosed_rows: 100000,
                 encoded_bytes: 100000000,
@@ -117,7 +126,7 @@ impl Fixture {
         )
         .await
     }
-    pub async fn with_task_resources(resources: giggles_core::TaskResources) -> Self {
+    pub async fn with_task_resources(resources: LegacyTaskResources) -> Self {
         Self::build(
             ApiLimits::default(),
             giggles_server::admission::ServiceLimits::default(),
@@ -129,7 +138,7 @@ impl Fixture {
     async fn build(
         limits: ApiLimits,
         service_limits: giggles_server::admission::ServiceLimits,
-        resources: giggles_core::TaskResources,
+        resources: LegacyTaskResources,
         seed_rows: bool,
     ) -> Self {
         Self::build_engine(limits, service_limits, resources, seed_rows, giggles_core::Engine::Legacy).await
@@ -137,7 +146,7 @@ impl Fixture {
     async fn build_engine(
         limits: ApiLimits,
         service_limits: giggles_server::admission::ServiceLimits,
-        resources: giggles_core::TaskResources,
+        resources: LegacyTaskResources,
         seed_rows: bool,
         engine: giggles_core::Engine,
     ) -> Self {

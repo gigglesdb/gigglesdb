@@ -1,6 +1,9 @@
 //! Durable local task-repair kernel. See README for authority and durability limits.
+// Persisted legacy record types remain available to decode, validate, and refuse
+// upgrades of old stores. The executable task API is opt-in.
 mod accounting;
 mod types;
+#[cfg(feature = "legacy-task")]
 pub use accounting::{TaskAccounting, TaskResources};
 pub use types::*;
 pub mod pg_serde;
@@ -15,14 +18,18 @@ pub use storage::cluster_node;
 pub use storage::replicated;
 pub use storage::roles;
 pub use storage::{
-    Admin, CoreError, CrashPoint, DecisionPoint, Engine, Executor, IndexInfo, Limits, ReclaimStats,
+    Admin, CoreError, CrashPoint, DecisionPoint, Engine, IndexInfo, Limits, ReclaimStats,
     RecoveryPoint, SqlIsolation, UpgradePoint, UpgradeReport, WriteFenceStatus,
 };
 pub use storage::{Cursor, SqlSession, SqlTableLockMode};
 mod sqlstate;
 pub use sqlstate::sqlstate;
+#[cfg(feature = "legacy-task")]
 mod sql;
+#[cfg(feature = "legacy-task")]
 pub use sql::parse_repair;
+#[cfg(feature = "legacy-task")]
+pub use storage::Executor;
 
 pub mod local;
 pub mod operations;

@@ -1,3 +1,4 @@
+#![cfg(feature = "legacy-task")]
 use giggles_core::{
     replica::{Command, Image},
     *,

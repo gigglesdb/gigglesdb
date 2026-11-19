@@ -61,8 +61,6 @@ mod insert_many;
 mod inspection;
 #[path = "limit_regression.rs"]
 mod limit_regression;
-#[path = "local_workflows.rs"]
-mod local_workflows;
 #[path = "once_schema.rs"]
 mod once_schema;
 #[path = "operations.rs"]
@@ -111,8 +109,6 @@ mod relational_searched_dml;
 mod returning;
 #[path = "row_partition.rs"]
 mod row_partition;
-#[path = "safety.rs"]
-mod safety;
 #[path = "scalar_functions.rs"]
 mod scalar_functions;
 #[path = "server_boundary.rs"]
@@ -269,8 +265,6 @@ mod sql_unknown_literal_assignment;
 mod sql_update_expressions;
 #[path = "sql_upsert_expressions.rs"]
 mod sql_upsert_expressions;
-#[path = "surfaces.rs"]
-mod surfaces;
 #[path = "table_free_classification.rs"]
 mod table_free_classification;
 #[path = "temporal_constructors.rs"]

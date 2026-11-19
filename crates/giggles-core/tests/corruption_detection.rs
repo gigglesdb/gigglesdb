@@ -1,7 +1,10 @@
 //! Deterministic single-bit corruption qualification through public APIs.
+#![cfg(any(feature = "engine-rocksdb", feature = "legacy-task"))]
 mod common;
+#[cfg(feature = "legacy-task")]
+use giggles_core::Time;
 
-use giggles_core::{Admin, CoreError, Engine, Limits, Snapshot, Time, relational::SqlResult};
+use giggles_core::{Admin, CoreError, Engine, Limits, Snapshot, relational::SqlResult};
 use serde::Serialize;
 use std::{fs, path::Path};
 
@@ -47,6 +50,7 @@ fn workload(path: &Path, engine: Engine) -> (Vec<SqlResult>, Option<Snapshot>) {
         }
     }
     drop(sql);
+    #[cfg(feature = "legacy-task")]
     let snapshot = if matches!(engine, Engine::Legacy) {
         admin.put(common::key(1), common::row()).unwrap();
         let executor = admin.grant(common::grant()).unwrap();
@@ -65,6 +69,8 @@ fn workload(path: &Path, engine: Engine) -> (Vec<SqlResult>, Option<Snapshot>) {
         // The v2 public API rejects the legacy task/receipt and export APIs.
         None
     };
+    #[cfg(not(feature = "legacy-task"))]
+    let snapshot = None;
     (reads(&admin).unwrap(), snapshot)
 }
 
@@ -223,6 +229,7 @@ fn save_report(engine: Engine, counts: &Counts) {
 static REPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
+#[cfg(feature = "legacy-task")]
 fn legacy_single_bit_corruption() {
     let _lock = REPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     save_report(Engine::Legacy, &qualify(Engine::Legacy));

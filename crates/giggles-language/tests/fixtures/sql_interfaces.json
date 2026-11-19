@@ -36,12 +36,12 @@
       "endpoint": "parse_repair(operation_id, sql) -> finite Request; Executor::execute_sql(operation_id, sql, time, approval)",
       "authority": "Existing Executor task/principal binding, tenant/status scope, budgets, exact approval and canonical operation deduplication. Local time/principal assertions come from the trusted host.",
       "implemented": ["Two whitespace-tokenized UPDATE deliveries forms: one tenant/id key, or a tenant/status/failed_at half-open interval; statuses are failed, queued or succeeded.", "SQL and typed finite repair calls share canonical request binding and outcome behavior."],
-      "restrictions": ["No generic relational SqlSession, CREATE/SELECT/DELETE, other table, parameter syntax, aliases, expressions, comments, semicolon or transaction controls.", "Unsigned decimal identifiers and bounds; operators must be separate whitespace tokens."],
+      "restrictions": ["Compiled only with the non-default legacy-task feature (GD-0061 R3-1204); the default build has no finite repair parser.", "No generic relational SqlSession, CREATE/SELECT/DELETE, other table, parameter syntax, aliases, expressions, comments, semicolon or transaction controls.", "Unsigned decimal identifiers and bounds; operators must be separate whitespace tokens."],
       "unverified": ["This finite compatibility parser is not the proposed general SQL dialect."],
       "limit_ids": ["repair_sql_bytes"],
       "docs": ["crates/giggles-core/SQL.md", "crates/giggles-core/LOCAL.md"],
       "sources": [{"path":"crates/giggles-core/src/sql.rs","needle":"pub fn parse_repair"}],
-      "evidence": [{"path":"crates/giggles-core/tests/surfaces.rs","test":"narrow_sql_matches_native_and_denies_escape_grammar","scope":"Same canonical operation, finite grammar and unchanged state on rejection."}, {"path":"crates/giggles-core/tests/surfaces.rs","test":"sql_predicate_uses_exact_approval_and_same_policy","scope":"Approval and tenant policy are preserved."}, {"path":"crates/giggles-core/tests/surfaces.rs","test":"sql_size_numeric_and_operator_bounds","scope":"Parser byte/numeric/operator bounds."}]
+      "evidence": [{"path":"crates/giggles-ffi/tests/abi.rs","test":"exact_approval_typed_sql_status_retry_and_reopen","scope":"Finite repair SQL and typed requests share approval, retry and status through the legacy-task build (the core surfaces.rs tests were retired in GD-0061 R3-1204)."}]
     },
     {
       "id": "local_json_admin",
@@ -55,7 +55,7 @@
       "limit_ids": ["local_input_bytes", "local_output_bytes", "local_batch_statements", "sql_bytes", "sql_params"],
       "docs": ["crates/giggles-core/LOCAL.md", "crates/giggles-core/SQL.md"],
       "sources": [{"path":"crates/giggles-core/src/local.rs","needle":"AdminCommand::SqlBatch { statements }"}],
-      "evidence": [{"path":"crates/giggles-core/tests/local_workflows.rs","test":"trusted_sql_cli_batches_typed_rows_and_error_rollback","scope":"Actual legacy CLI subprocesses, typed rows and explicit transaction rollback."}, {"path":"crates/giggles-core/tests/local_workflows.rs","test":"bounded_invalid_inputs_do_not_mutate_database","scope":"Local malformed/oversized input leaves database unchanged."}]
+      "evidence": [{"path":"crates/giggles-core/tests/process.rs","test":"ordinary_sql_cli_batches_typed_rows_and_error_rollback","scope":"Actual giggles admin CLI subprocesses, typed rows and explicit transaction rollback."}]
     },
     {
       "id": "local_json_executor",
@@ -64,12 +64,12 @@
       "endpoint": "local::executor ExecutorCommand::Sql; trusted giggles executor CLI",
       "authority": "Existing Executor handle; operation, asserted time and approval use the same finite task engine as typed requests.",
       "implemented": ["JSON command dispatches to Executor::execute_sql and preserves stable local reply categories."],
-      "restrictions": ["No Admin dispatch, generic relational session, catalog access or generic application table SQL."],
+      "restrictions": ["Compiled only with the non-default legacy-task feature (GD-0061 R3-1204).", "No Admin dispatch, generic relational session, catalog access or generic application table SQL."],
       "unverified": ["Local DTOs do not authenticate a network principal or certify its supplied clock."],
       "limit_ids": ["local_input_bytes", "local_output_bytes", "repair_sql_bytes"],
       "docs": ["crates/giggles-core/LOCAL.md"],
       "sources": [{"path":"crates/giggles-core/src/local.rs","needle":"ExecutorCommand::Sql"}],
-      "evidence": [{"path":"crates/giggles-core/tests/local_workflows.rs","test":"sql_and_typed_retry_share_binding","scope":"SQL and typed CLI retry retain the same operation binding."}]
+      "evidence": [{"path":"crates/giggles-ffi/tests/abi.rs","test":"exact_approval_typed_sql_status_retry_and_reopen","scope":"ExecutorCommand::Sql and typed retry retain the same operation binding through the legacy-task build (the core local_workflows.rs tests were retired in GD-0061 R3-1204)."}]
     },
     {
       "id": "ffi_admin_session",

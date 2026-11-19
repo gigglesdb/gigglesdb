@@ -1,7 +1,9 @@
-#![allow(dead_code)]
+// Also included directly by dependent tests that do not define core features.
+#![allow(dead_code, unexpected_cfgs)]
 use giggles_core::*;
+use std::collections::BTreeSet;
 use std::{
-    collections::BTreeSet,
+
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -77,6 +79,7 @@ pub fn predicate(op: u64) -> Request {
         after: Status::Queued,
     }
 }
+#[cfg(feature = "legacy-task")]
 pub fn fixture(n: u64) -> (PathBuf, Admin, Executor) {
     let p = fresh("db");
     let a = Admin::create(&p, Limits::default()).unwrap();

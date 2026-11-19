@@ -1,3 +1,4 @@
+#![cfg(feature = "legacy-task")]
 mod common;
 use common::*;
 use giggles_core::*;

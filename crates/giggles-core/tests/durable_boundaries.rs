@@ -1,4 +1,5 @@
 //! Legacy and v2 durable SQL commit and logical recovery boundaries.
+#![cfg(any(feature = "engine-rocksdb", feature = "legacy-task"))]
 mod common;
 use common::*;
 use giggles_core::{relational::Value, *};
@@ -97,12 +98,14 @@ fn rows(a: &Admin) -> Vec<Vec<Value>> {
         .map(|r| r.values)
         .collect()
 }
+#[cfg(feature = "legacy-task")]
 fn receipt(a: &Admin, op: u64) -> OperationStatus {
     a.executor(TaskId(1), Principal(2))
         .unwrap()
         .status(OperationId(op))
         .unwrap()
 }
+#[cfg(feature = "legacy-task")]
 fn child(path: &Path, mode: &str) -> std::process::Output {
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "boundary_worker", "--nocapture"])
@@ -112,6 +115,7 @@ fn child(path: &Path, mode: &str) -> std::process::Output {
         .unwrap()
 }
 #[test]
+#[cfg(feature = "legacy-task")]
 fn boundary_worker() {
     let Ok(mode) = std::env::var("GD_DURABLE_MODE") else {
         return;
@@ -224,6 +228,7 @@ fn boundary_worker() {
 }
 
 #[test]
+#[cfg(feature = "legacy-task")]
 fn every_legacy_durable_boundary() {
     let mut report = Vec::new();
     for (index, boundary) in registry().into_iter().enumerate() {

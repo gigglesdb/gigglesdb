@@ -1,4 +1,6 @@
-use crate::{Admin, CoreError, Engine, Limits, roles::NewRole};
+#[cfg(feature = "legacy-task")]
+use crate::CoreError;
+use crate::{Admin, Engine, Limits, roles::NewRole};
 
 #[test]
 fn metadata_survives_reopen_and_unsupported_native_operations() {
@@ -39,6 +41,7 @@ fn metadata_survives_reopen_and_unsupported_native_operations() {
     );
     admin.export(path.join("export")).unwrap();
     Admin::verify_export(path.join("export")).unwrap();
+    #[cfg(feature = "legacy-task")]
     assert!(matches!(
         admin.task_resources(crate::TaskId(0)),
         Err(CoreError::EngineUnsupported {

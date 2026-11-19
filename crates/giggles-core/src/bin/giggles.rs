@@ -1,4 +1,5 @@
 use giggles_core::*;
+#[cfg(feature = "legacy-task")]
 use std::collections::BTreeSet;
 fn run() -> local::Reply {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -22,6 +23,7 @@ fn run() -> local::Reply {
     let work = || -> Result<local::Reply, CoreError> {
         let a = args.iter().map(String::as_str).collect::<Vec<_>>();
         match a.as_slice() {
+            #[cfg(feature = "legacy-task")]
             ["demo", path] => {
                 let db = Admin::create(path, Limits::default())?;
                 for i in 0..3 {
@@ -92,6 +94,18 @@ fn run() -> local::Reply {
                     serde_json::json!({"database": path, "export": report.export, "legacy": report.legacy}),
                 ))
             }
+            #[cfg(not(feature = "legacy-task"))]
+            [cmd @ ("admin" | "seed"), path, json] => {
+                let db = Admin::open(path, Limits::default())?;
+                let data = input(json)?;
+                if *cmd != "admin" {
+                    let value: serde_json::Value = serde_json::from_slice(&data)
+                        .map_err(|_| CoreError::Unsupported)?;
+                    if value["command"] != *cmd { return Err(CoreError::Unsupported); }
+                }
+                Ok(local::admin(&db, &data))
+            }
+            #[cfg(feature = "legacy-task")]
             [
                 cmd @ ("admin" | "seed" | "grant" | "approve" | "revoke" | "revoke_approval"),
                 path,
@@ -108,6 +122,7 @@ fn run() -> local::Reply {
                 }
                 Ok(local::admin(&db, &data))
             }
+            #[cfg(feature = "legacy-task")]
             [
                 cmd @ ("executor" | "preview" | "execute"),
                 path,
@@ -131,6 +146,7 @@ fn run() -> local::Reply {
                     &data,
                 ))
             }
+            #[cfg(feature = "legacy-task")]
             ["repair", path, task, principal, op, time, sql] => {
                 let db = Admin::open(path, Limits::default())?;
                 let num = |v: &str| v.parse::<u64>().map_err(|_| CoreError::Unsupported);
@@ -146,6 +162,7 @@ fn run() -> local::Reply {
                     .expect("serialize"),
                 ))
             }
+            #[cfg(feature = "legacy-task")]
             ["status", path, task, principal, op] => {
                 let db = Admin::open(path, Limits::default())?;
                 let num = |v: &str| v.parse::<u64>().map_err(|_| CoreError::Unsupported);

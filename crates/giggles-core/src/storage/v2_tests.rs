@@ -364,6 +364,8 @@ fn lifecycle_and_public_refusals() {
             matches!(result, Err(CoreError::EngineUnsupported { engine: "v2", feature: actual }) if actual == feature)
         );
     }
+    #[cfg(feature = "legacy-task")]
+    {
     let policy = Policy {
         tenant: TenantId(0),
         columns: Default::default(),
@@ -412,6 +414,7 @@ fn lifecycle_and_public_refusals() {
         PROTECTED_OPERATIONS,
     );
     denied(admin.revoke_approval(ApprovalId(0)), PROTECTED_OPERATIONS);
+    }
     denied(admin.snapshot(), KERNEL_RECORDS);
     denied(
         admin.put(

@@ -1,5 +1,14 @@
 // Tests may call the plain exits `clippy.toml` bans in server sources (GD-0061 R3-314).
 #![allow(clippy::disallowed_methods)]
+#[cfg(feature = "legacy-task")]
+use giggles_core::TaskResources as LegacyTaskResources;
+#[cfg(not(feature = "legacy-task"))]
+#[allow(dead_code)]
+struct LegacyTaskResources {
+    read_rows: u64,
+    disclosed_rows: u64,
+    encoded_bytes: u64,
+}
 #[path = "wire_support/mod.rs"]
 mod wire_support;
 use wire_support::{bind, cstr, execute, parse, parse_oids, pg_read, pg_send, pg_sync};
@@ -139,14 +148,14 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
-        Self::with_task_resources(giggles_core::TaskResources {
+        Self::with_task_resources(LegacyTaskResources {
             read_rows: 1_000_000,
             disclosed_rows: 1_000_000,
             encoded_bytes: 1_000_000_000,
         })
         .await
     }
-    async fn with_task_resources(_task_limits: giggles_core::TaskResources) -> Self {
+    async fn with_task_resources(_task_limits: LegacyTaskResources) -> Self {
         let path = PathBuf::from("artifacts").join(format!(
             "network-fixture-{}-{}-{}",
             std::process::id(),

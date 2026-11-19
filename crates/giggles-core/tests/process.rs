@@ -1,73 +1,19 @@
 mod common;
 use common::*;
 use giggles_core::*;
-use std::{io::Write, process::Command};
+use std::process::Command;
 #[test]
-fn subprocess_worker() {
-    let Ok(mode) = std::env::var("GIGGLES_CHILD_MODE") else {
-        return;
-    };
-    let p = std::env::var("GIGGLES_CHILD_PATH").unwrap();
-    if mode == "second" {
-        assert!(Admin::open(p, Limits::default()).is_err());
-        return;
-    }
-    let a = Admin::open(&p, Limits::default()).unwrap();
-    let e = a.executor(TaskId(1), Principal(2)).unwrap();
-    let point = match mode.as_str() {
-        "before" => CrashPoint::BeforeCommit,
-        "after" => CrashPoint::AfterCommit,
-        "ack" => CrashPoint::BeforeAck,
-        "acknowledged" => CrashPoint::None,
-        _ => panic!("bad mode"),
-    };
-    a.set_crash_point(point).unwrap();
-    let d = e
-        .execute(request(2, &[1]), Time::Certified(11), Some(ApprovalId(0)))
-        .unwrap()
-        .unwrap();
-    let mut ack = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(std::path::Path::new(&p).join("ack.txt"))
-        .unwrap();
-    writeln!(ack, "{d:?}").unwrap();
-    ack.sync_all().unwrap();
-    std::process::exit(86);
+fn ordinary_second_writer_child() {
+    let Ok(path) = std::env::var("GIGGLES_ORDINARY_SECOND_PATH") else { return; };
+    assert!(Admin::open(path, Limits::default()).is_err());
 }
-fn child(mode: &str, path: &std::path::Path) -> std::process::Output {
+#[test]
+fn ordinary_independent_process_rejects_second_writer() {
+    let p = fresh("ordinary-second-writer");
+    let _a = Admin::create(&p, Limits::default()).unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "subprocess_worker", "--nocapture"])
-        .env("GIGGLES_CHILD_MODE", mode)
-        .env("GIGGLES_CHILD_PATH", path)
-        .output()
-        .unwrap();
-    std::fs::write(
-        path.join(format!("child-{mode}.stdout.txt")),
-        &output.stdout,
-    )
-    .unwrap();
-    std::fs::write(
-        path.join(format!("child-{mode}.stderr.txt")),
-        &output.stderr,
-    )
-    .unwrap();
-    std::fs::write(
-        path.join(format!("child-{mode}.command.txt")),
-        format!(
-            "{} --exact subprocess_worker --nocapture\nmode={mode}\npath={}\nstatus={}\n",
-            std::env::current_exe().unwrap().display(),
-            path.display(),
-            output.status
-        ),
-    )
-    .unwrap();
-    output
-}
-#[test]
-fn independent_process_rejects_second_writer() {
-    let (p, _a, _e) = fixture(1);
-    let output = child("second", &p);
+        .args(["--exact", "ordinary_second_writer_child", "--nocapture"])
+        .env("GIGGLES_ORDINARY_SECOND_PATH", &p).output().unwrap();
     assert!(output.status.success(), "{:?}", output);
 }
 
@@ -240,65 +186,167 @@ mod v2_single_writer {
         assert_ne!(fs::read_to_string(lock).unwrap(), stale);
     }
 }
+
+fn ordinary_row_database(n: u64) -> (std::path::PathBuf, Admin) {
+    let path = fresh("ordinary-row-database");
+    let admin = Admin::create(&path, Limits::default()).unwrap();
+    for i in 0..n { admin.put(key(i), row()).unwrap(); }
+    (path, admin)
+}
+
 #[test]
-fn subprocess_abrupt_termination_at_all_commit_boundaries() {
-    for mode in ["before", "after", "ack", "acknowledged"] {
-        let (path, a, e) = fixture(2);
-        let acknowledged = e
-            .execute(request(1, &[0]), Time::Certified(10), None)
-            .unwrap()
-            .unwrap();
-        let preview = e.preview(&request(2, &[1]), Time::Certified(10)).unwrap();
-        assert_eq!(
-            a.approve(Principal(3), preview, Time::Certified(10))
-                .unwrap(),
-            ApprovalId(0)
-        );
-        drop(e);
-        drop(a);
-        let out = child(mode, &path);
-        assert_eq!(out.status.code(), Some(86), "{out:?}");
-        let a = Admin::open(&path, Limits::default()).unwrap();
-        let e = a.executor(TaskId(1), Principal(2)).unwrap();
-        assert_eq!(
-            e.status(OperationId(1)).unwrap(),
-            OperationStatus::Decided(Ok(acknowledged))
-        );
-        let s = a.snapshot().unwrap();
-        let committed = mode != "before";
-        assert_eq!(s.approvals[&ApprovalId(0)].consumed, committed);
-        assert_eq!(
-            a.authority_metadata().unwrap().1,
-            if committed { 11 } else { 10 }
-        );
-        assert_eq!(s.operations.len(), if committed { 2 } else { 1 });
-        assert_eq!(
-            s.tasks[&TaskId(1)].transitions,
-            if committed { 2 } else { 1 }
-        );
-        assert_eq!(
-            s.tasks[&TaskId(1)].touched.len(),
-            if committed { 2 } else { 1 }
-        );
-        assert_eq!(
-            s.rows[&key(1)].status,
-            if committed {
-                Status::Queued
-            } else {
-                Status::Failed
-            }
-        );
-        let status = e.status(OperationId(2)).unwrap();
-        assert_eq!(matches!(status, OperationStatus::Decided(Ok(_))), committed);
-        if mode == "acknowledged" {
-            assert!(path.join("ack.txt").exists());
-        }
-        // Stable retry commits once on either side of the crash boundary.
-        assert!(
-            e.execute(request(2, &[1]), Time::Certified(11), Some(ApprovalId(0)))
-                .unwrap()
-                .is_ok()
-        );
-        assert_eq!(a.snapshot().unwrap().tasks[&TaskId(1)].transitions, 2);
+fn ordinary_reject_existing_missing_corrupt_and_second_open() {
+    let (path, a) = ordinary_row_database(0);
+    assert!(Admin::create(&path, Limits::default()).is_err());
+    assert!(Admin::open(&path, Limits::default()).is_err());
+    assert!(Admin::open(fresh("absent"), Limits::default()).is_err());
+    let bad = fresh("bad");
+    std::fs::create_dir(&bad).unwrap();
+    std::fs::write(bad.join("data.redb"), b"corrupt").unwrap();
+    assert!(Admin::open(&bad, Limits::default()).is_err());
+    assert_eq!(std::fs::read(bad.join("data.redb")).unwrap(), b"corrupt");
+    drop(a);
+}
+
+#[test]
+fn ordinary_process_lock_follows_hardlink_alias() {
+    let (p, _a) = ordinary_row_database(0);
+    let alias = fresh("hardlink-alias");
+    std::fs::create_dir(&alias).unwrap();
+    std::fs::hard_link(p.join("data.redb"), alias.join("data.redb")).unwrap();
+    assert!(Admin::open(alias, Limits::default()).is_err());
+}
+
+#[test]
+fn ordinary_corrupt_engine_header_is_rejected_without_replacement() {
+    use std::io::{Seek, Write};
+    let (p, a) = ordinary_row_database(1);
+    drop(a);
+    let dest = fresh("corrupt-engine");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::copy(p.join("data.redb"), dest.join("data.redb")).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dest.join("data.redb"))
+        .unwrap();
+    f.seek(std::io::SeekFrom::Start(0)).unwrap();
+    f.write_all(&[0xff; 512]).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    assert!(Admin::open(&dest, Limits::default()).is_err());
+    assert_eq!(
+        &std::fs::read(dest.join("data.redb")).unwrap()[..512],
+        &[0xff; 512]
+    );
+    assert!(Admin::open(p, Limits::default()).is_ok());
+}
+
+mod ordinary_cli {
+use super::common::fresh;
+use serde_json::{Value, json};
+#[test]
+fn ordinary_sql_cli_batches_typed_rows_and_error_rollback() {
+    let mut c = Cli::new();
+    c.create();
+    c.admin(json!({"command":"sql_batch","statements":[{"sql":"BEGIN"},{"sql":"CREATE TABLE cli_rows (id BIGINT PRIMARY KEY, name TEXT)"},{"sql":"INSERT INTO cli_rows VALUES($1,$2)","params":[{"Int":-5},{"Text":"雪"}]},{"sql":"COMMIT"}]}),0,0);
+    let r = c.admin(
+        json!({"command":"sql","sql":"SELECT * FROM cli_rows LIMIT 5","params":[]}),
+        0,
+        0,
+    );
+    assert_eq!(r["rows"][0]["values"], json!([{"Int":-5},{"Text":"雪"}]));
+    c.admin(json!({"command":"sql_batch","statements":[{"sql":"BEGIN"},{"sql":"DELETE FROM cli_rows WHERE id=-5"},{"sql":"INSERT INTO cli_rows VALUES(NULL,'bad')"},{"sql":"COMMIT"}]}),3,207);
+    let r = c.admin(
+        json!({"command":"sql","sql":"SELECT id FROM cli_rows LIMIT 5","params":[]}),
+        0,
+        0,
+    );
+    assert_eq!(r["rows"][0]["values"], json!([{"Int":-5}]));
+    c.admin(json!({"command":"sql_batch","statements":[{"sql":"BEGIN"},{"sql":"DELETE FROM cli_rows WHERE id=-5"}]}),3,214);
+    let r = c.admin(
+        json!({"command":"sql","sql":"SELECT id FROM cli_rows LIMIT 5","params":[]}),
+        0,
+        0,
+    );
+    assert_eq!(r["rows"].as_array().unwrap().len(), 1);
+}
+struct Cli {
+    root: std::path::PathBuf,
+    db: std::path::PathBuf,
+    seq: usize,
+}
+impl Cli {
+    fn new() -> Self {
+        let root = fresh("workflow");
+        std::fs::create_dir(&root).unwrap();
+        let db = root.join("db");
+        Self { root, db, seq: 0 }
     }
+    fn call(&mut self, args: Vec<String>, exit: i32, code: u32) -> Value {
+        self.seq += 1;
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_giggles"))
+            .args(&args)
+            .output()
+            .unwrap();
+        let base = self.root.join(format!("{:03}", self.seq));
+        std::fs::write(base.with_extension("stdout"), &out.stdout).unwrap();
+        std::fs::write(base.with_extension("stderr"), &out.stderr).unwrap();
+        std::fs::write(
+            base.with_extension("command"),
+            format!(
+                "{} {args:?}\nstatus={}\n",
+                env!("CARGO_BIN_EXE_giggles"),
+                out.status
+            ),
+        )
+        .unwrap();
+        assert_eq!(out.status.code(), Some(exit), "{out:?}");
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["code"], code);
+        v["data"].clone()
+    }
+    fn create(&mut self) {
+        self.call(
+            vec![
+                "create".into(),
+                "--engine".into(),
+                "legacy".into(),
+                self.db.display().to_string(),
+            ],
+            0,
+            0,
+        );
+    }
+    fn admin(&mut self, v: Value, exit: i32, code: u32) -> Value {
+        self.call(
+            vec!["admin".into(), self.db.display().to_string(), v.to_string()],
+            exit,
+            code,
+        )
+    }
+}
+}
+
+#[test]
+fn ordinary_cli_export_verify_restore() {
+    let p = fresh("cli");
+    let run = |args: &[&std::ffi::OsStr]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_giggles"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    run(&["create".as_ref(), "--engine".as_ref(), "legacy".as_ref(), p.as_os_str()]);
+    let file = fresh("cli-export");
+    run(&["export".as_ref(), p.as_os_str(), file.as_os_str()]);
+    run(&["verify".as_ref(), file.as_os_str()]);
+    let target = fresh("cli-restore");
+    run(&["restore".as_ref(), file.as_os_str(), target.as_os_str()]);
 }

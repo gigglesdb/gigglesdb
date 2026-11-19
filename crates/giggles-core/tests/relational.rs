@@ -512,6 +512,7 @@ fn strict_rejection_matrix_and_resource_bounds() {
     );
 }
 #[test]
+#[cfg(feature = "legacy-task")]
 fn shared_repair_generation_conflicts_and_authority_stays_finite() {
     let (_, a, e) = fixture(1);
     let mut s = a.sql_session();

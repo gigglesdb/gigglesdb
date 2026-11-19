@@ -1,4 +1,8 @@
 use crate::*;
+#[cfg(not(feature = "legacy-task"))]
+use crate::accounting::TaskAccounting;
+#[cfg(all(test, not(feature = "legacy-task")))]
+use crate::accounting::TaskResources;
 mod catalog_inspection;
 mod cursor;
 mod drop_table;
@@ -694,7 +698,9 @@ impl SqlIsolation {
         }
     }
 }
+#[cfg(feature = "legacy-task")]
 const TASK_EXECUTORS: &str = "task executors";
+#[cfg(feature = "legacy-task")]
 const PROTECTED_OPERATIONS: &str = "protected operations";
 const KERNEL_RECORDS: &str = "kernel records";
 const SQL_SESSIONS: &str = "SQL sessions";
@@ -855,6 +861,7 @@ impl Inner {
     ) -> Result<T, CoreError> {
         self.change_inner(false, false, f)
     }
+    #[cfg(any(test, feature = "legacy-task"))]
     fn change_decision<T>(
         &self,
         f: impl FnOnce(&mut State) -> Result<T, CoreError>,
@@ -897,6 +904,7 @@ impl Inner {
         result
     }
     /// Hold authority serialization across durable read admission and evaluation.
+    #[cfg(feature = "legacy-task")]
     fn change_accounted<T>(
         &self,
         decision: bool,
@@ -922,6 +930,7 @@ impl Inner {
         self.persist(&mut s, Some(&previous_relations), decision)?;
         result
     }
+    #[cfg(feature = "legacy-task")]
     fn persist(
         &self,
         s: &mut State,
@@ -1083,6 +1092,7 @@ impl Inner {
         }
         Ok(())
     }
+    #[cfg(feature = "legacy-task")]
     fn request(&self, r: &Request) -> Result<(), CoreError> {
         if let Selection::Keys(k) = &r.selection
             && k.len() > self.limits.selected_keys
@@ -1091,6 +1101,7 @@ impl Inner {
         }
         Ok(())
     }
+    #[cfg(feature = "legacy-task")]
     fn selection_bound(&self, s: &State, task: TaskId, r: &Request) -> Result<(), CoreError> {
         if let Selection::Predicate {
             tenant,
@@ -1128,6 +1139,7 @@ pub struct Admin {
     inner: Arc<Inner>,
 }
 #[derive(Clone)]
+#[cfg(feature = "legacy-task")]
 pub struct Executor {
     inner: Arc<Inner>,
     credential: Credential,
@@ -1185,6 +1197,7 @@ impl Admin {
 impl Admin {
     /// One-time trusted provisioning. A task's counters and caps cannot be reset.
     /// Missing provisioning (including legacy formats) denies remote disclosure.
+    #[cfg(feature = "legacy-task")]
     pub fn provision_task_resources(
         &self,
         task: TaskId,
@@ -1208,6 +1221,7 @@ impl Admin {
             Ok(())
         })
     }
+    #[cfg(feature = "legacy-task")]
     pub fn task_resources(&self, task: TaskId) -> Result<Option<TaskAccounting>, CoreError> {
         self.inner.db(TASK_EXECUTORS)?;
         self.inner.inspect(|s| Ok(s.accounting.get(&task).copied()))
@@ -1483,6 +1497,7 @@ impl Admin {
             Ok(())
         })
     }
+    #[cfg(feature = "legacy-task")]
     pub fn grant(&self, g: Grant) -> Result<Executor, CoreError> {
         self.inner.db(TASK_EXECUTORS)?;
         let credential = self.inner.change(|s| {
@@ -1514,6 +1529,7 @@ impl Admin {
         })
     }
     /// Trusted rebind after restart; grants no task-broadening authority.
+    #[cfg(feature = "legacy-task")]
     pub fn executor(&self, task: TaskId, principal: Principal) -> Result<Executor, CoreError> {
         self.inner.db(TASK_EXECUTORS)?;
         self.inner.inspect(|s| {
@@ -1535,6 +1551,7 @@ impl Admin {
             })
         })
     }
+    #[cfg(feature = "legacy-task")]
     pub fn revoke(&self, task: TaskId) -> Result<(), CoreError> {
         self.inner.db(TASK_EXECUTORS)?;
         self.inner.change(|s| {
@@ -1557,6 +1574,7 @@ impl Admin {
             Ok(())
         })
     }
+    #[cfg(feature = "legacy-task")]
     pub fn approve(&self, who: Principal, p: Preview, time: Time) -> Result<ApprovalId, CoreError> {
         self.inner.db(PROTECTED_OPERATIONS)?;
         self.inner.request(&p.request)?;
@@ -1594,6 +1612,7 @@ impl Admin {
             Ok(id)
         })
     }
+    #[cfg(feature = "legacy-task")]
     pub fn revoke_approval(&self, id: ApprovalId) -> Result<(), CoreError> {
         self.inner.db(PROTECTED_OPERATIONS)?;
         self.inner.change(|s| {
@@ -1785,6 +1804,7 @@ impl Admin {
         Self::create_state(path, limits, s, point)
     }
 }
+#[cfg(feature = "legacy-task")]
 impl Executor {
     fn debit(s: &mut State, task: TaskId, debit: TaskResources) -> Result<(), CoreError> {
         let a = s
@@ -5373,6 +5393,8 @@ mod tests {
                 drop(db);
                 fs::copy(path.join("data.redb"), path.join("legacy-original.redb")).unwrap();
                 let a = Admin::open(&path, Limits::default()).unwrap();
+                #[cfg(feature = "legacy-task")]
+                {
                 let e = a.executor(TaskId(1), Principal(2)).unwrap();
                 assert_eq!(
                     e.reserve_disclosure(1, 10, 10),
@@ -5388,6 +5410,7 @@ mod tests {
                 )
                 .unwrap();
                 e.reserve_disclosure(1, 10, 10).unwrap();
+                }
                 let export = fresh("accounting-format-export");
                 a.export(&export).unwrap();
                 let mut bytes = fs::read(&export).unwrap();
@@ -5546,6 +5569,7 @@ mod tests {
         assert_eq!(fs::read(preserved).unwrap(), original);
     }
     #[test]
+    #[cfg(feature = "legacy-task")]
     fn full_envelope_is_reserved_and_every_accepted_boundary_state_exports() {
         let a = Admin::create(fresh("size-source"), Limits::default()).unwrap();
         let g = Grant {

@@ -64,6 +64,7 @@ pub struct Grant {
 }
 /// Opaque local capability, not a cryptographic token. Only trusted grant issues one.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "legacy-task")]
 pub(crate) struct Credential {
     pub(crate) domain: u128,
     pub(crate) task: TaskId,
@@ -100,6 +101,7 @@ pub struct Request {
     pub column: Column,
     pub after: Status,
 }
+#[cfg(any(test, feature = "legacy-task"))]
 impl Request {
     /// Versioned, length-delimited binary payload. Key-list order is immaterial;
     /// multiplicity is preserved and duplicate keys are rejected by validation.
@@ -201,11 +203,13 @@ pub enum Error {
 }
 pub type Decision = Result<Receipt, Error>;
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "legacy-task")]
 pub enum Outcome {
     Known(Decision),
     Unknown,
 }
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "legacy-task")]
 pub enum OperationStatus {
     Absent,
     Decided(Decision),
@@ -216,6 +220,7 @@ pub struct BoundDecision {
     pub decision: Decision,
 }
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "legacy-task")]
 pub enum Event {
     Put(Key, Row),
     Grant(Grant),

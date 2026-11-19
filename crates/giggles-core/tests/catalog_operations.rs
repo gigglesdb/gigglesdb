@@ -1,8 +1,11 @@
+#[cfg(feature = "legacy-task")]
+use giggles_core::{Principal, TaskId, Time};
+#[cfg(feature = "legacy-task")]
+use giggles_core::TaskResources;
 mod common;
 
 use giggles_core::{
-    Admin, Cancellation, CoreError, CrashPoint, DecisionPoint, Limits, Principal, TaskId,
-    TaskResources, Time,
+    Admin, Cancellation, CoreError, CrashPoint, DecisionPoint, Limits,
     operations::{
         Bindings, CatalogRequest, ColumnSpec, Engine, Error, Request, Transaction, TransactionStep,
         ValueExpr,
@@ -607,6 +610,7 @@ fn catalog_preparation_freezes_definition_and_rechecks_empty_state() {
 }
 
 #[test]
+#[cfg(feature = "legacy-task")]
 fn catalog_safe_create_observes_business_state_and_metadata() {
     for kind in 0..6 {
         let (_, admin, engine) = database();

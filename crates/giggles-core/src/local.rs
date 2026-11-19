@@ -1,5 +1,6 @@
 //! Version-1 trusted local JSON protocol. Never expose admin dispatch over RPC.
 use crate::*;
+#[cfg(feature = "legacy-task")]
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -168,6 +169,7 @@ fn result<T: Serialize>(r: Result<T, CoreError>) -> Reply {
         Err(e) => failure(e),
     }
 }
+#[cfg(feature = "legacy-task")]
 fn decision(d: Result<Decision, CoreError>) -> Reply {
     match d {
         Ok(Ok(r)) => result(Ok(r)),
@@ -178,10 +180,12 @@ fn decision(d: Result<Decision, CoreError>) -> Reply {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminCommand {
+    #[cfg(feature = "legacy-task")]
     ProvisionTaskResources {
         task: TaskId,
         limits: TaskResources,
     },
+    #[cfg(feature = "legacy-task")]
     TaskResources {
         task: TaskId,
     },
@@ -198,17 +202,21 @@ pub enum AdminCommand {
         key: Key,
         row: Row,
     },
+    #[cfg(feature = "legacy-task")]
     Grant {
         grant: Grant,
     },
+    #[cfg(feature = "legacy-task")]
     Approve {
         principal: Principal,
         preview: String,
         time: Time,
     },
+    #[cfg(feature = "legacy-task")]
     Revoke {
         task: TaskId,
     },
+    #[cfg(feature = "legacy-task")]
     RevokeApproval {
         approval: ApprovalId,
     },
@@ -220,6 +228,7 @@ pub enum AdminCommand {
 }
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg(feature = "legacy-task")]
 pub enum ExecutorCommand {
     Preview {
         request: Request,
@@ -246,6 +255,7 @@ fn parse<T: for<'de> Deserialize<'de>>(s: &[u8]) -> Result<T, Reply> {
     }
     serde_json::from_slice(s).map_err(|e| Reply::error(17, e))
 }
+#[cfg(feature = "legacy-task")]
 fn token(p: &Preview) -> Result<String, CoreError> {
     let bytes = bincode::serialize(p).map_err(|e| CoreError::Corrupt(e.to_string()))?;
     // Approval input contains hex, so reserve JSON wrapper space too.
@@ -254,6 +264,7 @@ fn token(p: &Preview) -> Result<String, CoreError> {
     }
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
+#[cfg(feature = "legacy-task")]
 fn untoken(s: &str) -> Result<Preview, CoreError> {
     if s.len() > MAX_INPUT || !s.len().is_multiple_of(2) {
         return Err(CoreError::Limit);
@@ -312,18 +323,24 @@ pub fn admin(a: &Admin, input: &[u8]) -> Reply {
             result(Ok(results))
         }
         AdminCommand::Catalog => result(a.catalog()),
+        #[cfg(feature = "legacy-task")]
         AdminCommand::ProvisionTaskResources { task, limits } => {
             result(a.provision_task_resources(task, limits))
         }
+        #[cfg(feature = "legacy-task")]
         AdminCommand::TaskResources { task } => result(a.task_resources(task)),
         AdminCommand::Seed { key, row } => result(a.put(key, row)),
+        #[cfg(feature = "legacy-task")]
         AdminCommand::Grant { grant } => result(a.grant(grant).map(|_| ())),
+        #[cfg(feature = "legacy-task")]
         AdminCommand::Approve {
             principal,
             preview,
             time,
         } => result(untoken(&preview).and_then(|p| a.approve(principal, p, time))),
+        #[cfg(feature = "legacy-task")]
         AdminCommand::Revoke { task } => result(a.revoke(task)),
+        #[cfg(feature = "legacy-task")]
         AdminCommand::RevokeApproval { approval } => result(a.revoke_approval(approval)),
         AdminCommand::Export { path } => result(a.export(path)),
         AdminCommand::Metadata => match a.authority_metadata() {
@@ -349,6 +366,7 @@ pub fn admin(a: &Admin, input: &[u8]) -> Reply {
         },
     }
 }
+#[cfg(feature = "legacy-task")]
 pub fn executor(e: &Executor, input: &[u8]) -> Reply {
     let c = match parse(input) {
         Ok(c) => c,

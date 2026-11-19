@@ -1,6 +1,8 @@
+#![cfg(feature = "legacy-task")]
+use giggles_core::TaskResources;
 mod common;
 use giggles_core::{
-    Admin, Limits, Principal, TaskId, TaskResources, Time,
+    Admin, Limits, Principal, TaskId,  Time,
     operations::{Engine, Error, UniqueIndexRequest},
 };
 #[test]

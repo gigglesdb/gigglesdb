@@ -1,3 +1,5 @@
+#[cfg(feature = "legacy-task")]
+use giggles_core::TaskResources;
 #[cfg(feature = "engine-rocksdb")]
 mod common;
 use giggles_core::*;
@@ -259,6 +261,7 @@ mod rocks {
     }
 
     #[test]
+    #[cfg(feature = "legacy-task")]
     fn refuses_tasks_without_changing_files() {
         let path = refusal_fixture("tasks", |a| {
             a.grant(common::grant()).unwrap();
@@ -267,6 +270,7 @@ mod rocks {
     }
 
     #[test]
+    #[cfg(feature = "legacy-task")]
     fn refuses_receipts_without_changing_files() {
         let path = refusal_fixture("receipts", |a| {
             a.put(common::key(0), common::row()).unwrap();
@@ -281,6 +285,7 @@ mod rocks {
     }
 
     #[test]
+    #[cfg(feature = "legacy-task")]
     fn refuses_protected_rejections_without_changing_files() {
         let path = refusal_fixture("protected-rejections", |a| {
             let mut request = common::request(1, &[]);
@@ -301,6 +306,7 @@ mod rocks {
     }
 
     #[test]
+    #[cfg(feature = "legacy-task")]
     fn refuses_approvals_without_changing_files() {
         let path = refusal_fixture("approvals", |a| {
             let executor = a.grant(common::grant()).unwrap();
@@ -314,6 +320,7 @@ mod rocks {
     }
 
     #[test]
+    #[cfg(feature = "legacy-task")]
     fn refuses_executor_ledger_without_changing_files() {
         let path = refusal_fixture("executor-ledger", |a| {
             a.grant(common::grant()).unwrap();
@@ -422,6 +429,7 @@ mod rocks {
     }
 
     #[test]
+    #[cfg(feature = "legacy-task")]
     fn restored_legacy_with_tasks_still_refuses_only_tasks() {
         let path = fresh("restore-origin-tasks");
         let source = path.with_file_name("source");

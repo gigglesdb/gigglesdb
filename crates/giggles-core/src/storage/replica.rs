@@ -3,8 +3,10 @@
 //! Evaluation has no filesystem, network, clock or random identity inputs.
 //! The caller MUST atomically persist the returned image with its applied index.
 use super::*;
+#[cfg(feature = "legacy-task")]
 use crate::local::{AdminCommand, Reply};
 
+#[cfg(feature = "legacy-task")]
 pub mod protected;
 
 /// Opaque, validated canonical kernel image; not an export that revokes authority.
@@ -40,6 +42,7 @@ fn replica_state_with_cancel(
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[cfg(feature = "legacy-task")]
 pub enum TaskAction {
     Preview(Request),
     Execute(Request, Option<ApprovalId>),
@@ -48,6 +51,7 @@ pub enum TaskAction {
 
 /// Administrative input is trusted/offline only. It must never be remote dispatch.
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[cfg(feature = "legacy-task")]
 pub enum Command {
     Admin(Vec<u8>),
     /// Trusted consensus release revalidation. No disclosure debit: the held
@@ -76,6 +80,7 @@ pub enum Command {
         action: TaskAction,
     },
 }
+#[cfg(feature = "legacy-task")]
 impl Command {
     /// Validate the closed command grammar before it can enter a durable log.
     pub fn validate(&self) -> Result<(), CoreError> {
@@ -138,16 +143,19 @@ impl Image {
             .collect();
         Ok(Self(encode(&records(&target)?)?))
     }
+    #[cfg(feature = "legacy-task")]
     pub fn accounting(&self, task: TaskId) -> Result<Option<TaskAccounting>, CoreError> {
         Ok(replica_state(&self.0)?.accounting.get(&task).copied())
     }
     /// The Admin handle is constructed and destroyed here; it never escapes.
+    #[cfg(feature = "legacy-task")]
     pub fn evaluate(&self, command: &Command) -> Result<(Self, Reply), CoreError> {
         command.validate()?;
         self.with_admin(|a| self.evaluate_admin(a, command))
     }
     // Share the real storage/Executor path with trusted protected staging.
     // The temporary Admin never escapes and no persistent input is changed.
+    #[cfg(feature = "legacy-task")]
     fn with_admin<T>(
         &self,
         work: impl FnOnce(&Admin) -> Result<T, CoreError>,
@@ -176,6 +184,7 @@ impl Image {
         let image = Self(encode(&records(&state)?)?);
         Ok((image, reply))
     }
+    #[cfg(feature = "legacy-task")]
     fn evaluate_admin(&self, a: &Admin, command: &Command) -> Result<Reply, CoreError> {
         let reply = match command {
             Command::ValidateRelease {
@@ -257,6 +266,7 @@ impl Image {
         Ok(reply)
     }
 }
+#[cfg(feature = "legacy-task")]
 fn hex_token(p: &Preview) -> Result<String, CoreError> {
     let b = bincode::serialize(p).map_err(io)?;
     if b.len() > (local::MAX_INPUT - 1024) / 2 {
@@ -269,6 +279,7 @@ fn hex_token(p: &Preview) -> Result<String, CoreError> {
 /// This is the data inside the trusted local Reply, not its outer wire envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "legacy-task")]
 pub struct NativeResponse {
     pub version: u32,
     pub code: String,
@@ -277,6 +288,7 @@ pub struct NativeResponse {
     pub digest: Option<String>,
     pub sql: Option<()>,
 }
+#[cfg(feature = "legacy-task")]
 impl NativeResponse {
     fn code(code: &str) -> Self {
         Self {
@@ -309,6 +321,7 @@ impl NativeResponse {
     }
 }
 // Same task-policy codes as P2. No diagnostic strings or raw errors escape.
+#[cfg(feature = "legacy-task")]
 fn native_code(error: &CoreError) -> &'static str {
     match error {
         CoreError::Policy(Error::Authentication | Error::UnknownTask) => "28000",
@@ -327,6 +340,7 @@ fn native_code(error: &CoreError) -> &'static str {
         _ => "XX000",
     }
 }
+#[cfg(feature = "legacy-task")]
 fn native_task(
     a: &Admin,
     task: TaskId,
@@ -383,7 +397,7 @@ fn native_task(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-task"))]
 mod heap_gate_tests {
     use super::*;
 

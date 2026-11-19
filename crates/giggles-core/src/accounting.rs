@@ -1,4 +1,5 @@
 //! Versioned extension to the original task/mutation model. No delivery refunds.
+#[cfg(feature = "legacy-task")]
 use crate::{CoreError, Error};
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,7 @@ impl TaskResources {
             && self.disclosed_rows <= cap.disclosed_rows
             && self.encoded_bytes <= cap.encoded_bytes
     }
+    #[cfg(feature = "legacy-task")]
     pub(crate) fn add(self, debit: Self, cap: Self) -> Result<Self, CoreError> {
         let fail = || CoreError::Policy(Error::Budget);
         let next = Self {
@@ -44,7 +46,7 @@ pub struct TaskAccounting {
     pub used: TaskResources,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-task"))]
 mod tests {
     use super::*;
     #[test]

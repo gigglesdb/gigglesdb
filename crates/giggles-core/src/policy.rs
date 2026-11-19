@@ -1,7 +1,10 @@
+#[cfg(feature = "legacy-task")]
 use crate::storage::State;
 use crate::*;
+#[cfg(feature = "legacy-task")]
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(feature = "legacy-task")]
 pub(crate) fn clock(s: &mut State, time: Time) -> Result<u64, Error> {
     match time {
         Time::Uncertain => Err(Error::UncertainTime),
@@ -12,6 +15,7 @@ pub(crate) fn clock(s: &mut State, time: Time) -> Result<u64, Error> {
         }
     }
 }
+#[cfg(feature = "legacy-task")]
 pub(crate) fn active(t: &TaskState, now: u64) -> Result<(), Error> {
     if t.revoked {
         return Err(Error::Revoked);
@@ -21,6 +25,7 @@ pub(crate) fn active(t: &TaskState, now: u64) -> Result<(), Error> {
     }
     Ok(())
 }
+// Record decoding must enforce the same legacy grant invariant in both modes.
 pub(crate) fn grant_valid(g: &Grant) -> bool {
     let p = &g.policy;
     p.incident.0 < p.incident.1
@@ -32,6 +37,7 @@ pub(crate) fn grant_valid(g: &Grant) -> bool {
 }
 /// Independent evaluator: scans the committed ordered row set under the local
 /// serialization gate, protecting both rows and complete predicate membership.
+#[cfg(feature = "legacy-task")]
 pub(crate) fn enumerate(s: &State, t: &TaskState, r: &Request) -> Result<Preview, Error> {
     let p = &t.grant.policy;
     if r.column != Column::Status || !p.columns.contains(&Column::Status) {
@@ -105,6 +111,7 @@ pub(crate) fn enumerate(s: &State, t: &TaskState, r: &Request) -> Result<Preview
         expires: p.expires,
     })
 }
+#[cfg(feature = "legacy-task")]
 pub(crate) fn charges(t: &TaskState, p: &Preview) -> Result<(BTreeSet<Key>, u64), Error> {
     let mut ids = t.touched.clone();
     ids.extend(p.effects.iter().map(|e| e.key));
@@ -119,6 +126,7 @@ pub(crate) fn charges(t: &TaskState, p: &Preview) -> Result<(BTreeSet<Key>, u64)
     }
     Ok((ids, transitions))
 }
+#[cfg(feature = "legacy-task")]
 pub(crate) fn preview(
     s: &mut State,
     task: TaskId,
@@ -132,6 +140,7 @@ pub(crate) fn preview(
     charges(t, &p)?;
     Ok(p)
 }
+#[cfg(feature = "legacy-task")]
 pub(crate) fn execute(
     s: &mut State,
     task: TaskId,
@@ -158,6 +167,7 @@ pub(crate) fn execute(
     );
     result
 }
+#[cfg(feature = "legacy-task")]
 fn decide(
     s: &mut State,
     task: TaskId,
