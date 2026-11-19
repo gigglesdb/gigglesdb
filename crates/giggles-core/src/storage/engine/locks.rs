@@ -216,10 +216,18 @@ impl LockMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct HeldModes(u16);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeldModes(u16);
 
 impl HeldModes {
+    pub(crate) fn is_subset(self, other: Self) -> bool {
+        self.intersection(other) == self
+    }
+
+    fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
     fn insert(&mut self, mode: LockMode) {
         self.0 |= 1 << mode as u8;
     }
@@ -631,6 +639,53 @@ impl LockManager {
     #[cfg(test)]
     pub(crate) fn release_all_calls(&self) -> usize {
         self.release_all_calls.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot just the requested keys; callers serialize acquisitions per transaction.
+    pub(crate) fn modes_on(&self, txn: TxnId, keys: &[(LockKey, LockMode)]) -> Vec<(LockKey, HeldModes)> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        keys.iter().map(|(key, _)| (key.clone(), state.keys.get(key)
+            .and_then(|s| s.holders.get(&txn)).copied().unwrap_or_default())).collect()
+    }
+
+    /// Undo acquisitions in reverse journal order, then wake queues only after
+    /// every key has reached its final state (including both halves of K/D).
+    pub(crate) fn restore_modes(&self, txn: TxnId, undo: &[(LockKey, HeldModes)]) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut affected = HashSet::new();
+        for (key, previous) in undo.iter().rev() {
+            let Some(locks) = state.keys.get_mut(key) else { continue; };
+            let Some(current) = locks.holders.get_mut(&txn) else { continue; };
+            // Cleanup may have removed modes since the journal snapshot.
+            // Rollback can only release ownership, never recreate it.
+            let target = previous.intersection(*current);
+            if target.iter().next().is_some() {
+                *current = target;
+            } else {
+                locks.holders.remove(&txn);
+                locks.slow.remove(&txn);
+                if let Some(keys) = state.held_keys.get_mut(&txn) { keys.remove(key); }
+                if let Some(count) = state.row_counts.get_mut(&txn) { *count -= 1; }
+            }
+            state.provisional.remove(&(txn, key.clone()));
+            affected.insert(key.clone());
+            let mut unblocked = Vec::new();
+            state.cross_queued(key, &mut unblocked);
+            affected.extend(unblocked);
+            if let LockKey::Row { table, pk } = key {
+                affected.insert(LockKey::RowKey { table: *table, pk: pk.clone() });
+            }
+        }
+        if state.held_keys.get(&txn).is_some_and(HashSet::is_empty) {
+            state.held_keys.remove(&txn);
+        }
+        if state.row_counts.get(&txn) == Some(&0) {
+            state.row_counts.remove(&txn);
+        }
+        for key in affected {
+            state.drain_queue(&key, self.config.max_row_locks_per_txn);
+            state.settle(&key);
+        }
     }
 
     /// Release held locks and terminate this transaction's pending calls with
@@ -1127,3 +1182,31 @@ mod wakeup_tests;
 #[cfg(test)]
 #[path = "locks_row_tests.rs"]
 mod row_tests;
+
+#[test]
+fn restore_modes_never_recreates_released_ownership() {
+    let locks = LockManager::new(LockConfig::default());
+    let txn = TxnId(1);
+    let other = TxnId(2);
+    let key = LockKey::Row { table: 1, pk: vec![1] };
+    locks.acquire(txn, key.clone(), LockMode::Shared, None, &|| false).unwrap();
+    locks.acquire(other, key.clone(), LockMode::Shared, None, &|| false).unwrap();
+    let previous = locks.modes_on(txn, &[(key.clone(), LockMode::Shared)]);
+    locks.release_all(txn);
+    locks.restore_modes(txn, &previous);
+    assert!(locks.held(txn).is_empty());
+    {
+        let state = locks.state.lock().unwrap();
+        assert!(!state.held_keys.contains_key(&txn));
+        assert!(!state.row_counts.contains_key(&txn));
+        assert!(!state.keys[&key].holders.contains_key(&txn));
+    }
+    // Even when the key is held again, missing historical modes stay absent.
+    locks.release_all(other);
+    locks.acquire(txn, key.clone(), LockMode::Exclusive, None, &|| false).unwrap();
+    locks.restore_modes(txn, &previous);
+    assert!(locks.held(txn).is_empty());
+    let state = locks.state.lock().unwrap();
+    assert!(!state.held_keys.contains_key(&txn));
+    assert!(!state.row_counts.contains_key(&txn));
+}

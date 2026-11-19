@@ -174,6 +174,7 @@ pub(crate) struct Savepoint {
     sequence: u64,
     undo_len: usize,
     raw_len: usize,
+    lock_undo_len: usize,
     features_or: u64,
     minimum_subversion: u32,
 }
@@ -459,6 +460,7 @@ pub(crate) struct Transaction {
     savepoints: Vec<(u64, usize)>,
     undo: Vec<UndoWrite>,
     undo_bytes: usize,
+    lock_undo: Vec<(LockKey, super::locks::HeldModes)>,
     locked: BTreeMap<(Keyspace, Vec<u8>), LockedWrite>,
     reads: ReadSet,
     /// The transaction snapshot, set aside while FK crosscheck reads run at the
@@ -509,6 +511,7 @@ impl Transaction {
             savepoints: Vec::new(),
             undo: Vec::new(),
             undo_bytes: 0,
+            lock_undo: Vec::new(),
             locked: BTreeMap::new(),
             reads: ReadSet::default(),
             set_aside: None,
@@ -546,6 +549,7 @@ impl Transaction {
             sequence: self.savepoint_sequence,
             undo_len: self.undo.len(),
             raw_len: self.raw.len(),
+            lock_undo_len: self.lock_undo.len(),
             features_or: self.features_or,
             minimum_subversion: self.minimum_subversion,
         };
@@ -564,7 +568,8 @@ impl Transaction {
     /// Restores buffered writes and keeps this mark reusable, invalidating later marks.
     /// Locks, the `locked` entries permitting writes, and SERIALIZABLE reads are
     /// deliberately retained until transaction end. Unlike PostgreSQL subtransaction
-    /// rollback, this does not release locks acquired after the mark.
+    /// rollback, this does not release locks acquired after the mark. SQL uses
+    /// `rollback_to_releasing_locks` instead.
     pub(crate) fn rollback_to(&mut self, mark: &Savepoint) -> Result<(), TxnError> {
         let index = self.savepoint_index(mark)?;
         while self.undo.len() > mark.undo_len {
@@ -592,11 +597,56 @@ impl Transaction {
         self.minimum_subversion = mark.minimum_subversion;
         Ok(())
     }
+    /// SQL subtransaction rollback. Native/statement rollback retains locks;
+    /// its journal entries still belong to any enclosing SQL savepoint.
+    pub(crate) fn rollback_to_releasing_locks(&mut self, mark: &Savepoint) -> Result<(), TxnError> {
+        if mark.lock_undo_len > self.lock_undo.len() {
+            return Err(TxnError::Misuse);
+        }
+        self.rollback_to(mark)?;
+        let undo = self.lock_undo.split_off(mark.lock_undo_len);
+        if let TxnServices::Local { locks, .. } = &self.services {
+            locks.restore_modes(self.id, &undo);
+        }
+        for (key, _) in undo {
+            let (ks, id, suffix) = match key {
+                LockKey::Row { table, pk } => (Keyspace::Rows, table, pk),
+                LockKey::Unique { index, tuple } => (Keyspace::Index, index, tuple),
+                _ => continue,
+            };
+            let mut physical = id.to_be_bytes().to_vec();
+            physical.extend(suffix);
+            self.locked.remove(&(ks, physical));
+        }
+        Ok(())
+    }
+
+    fn acquire_tracked(&mut self, requested: &[(LockKey, LockMode)], grouped: bool,
+        deadline: Option<Instant>, cancel: &dyn Fn() -> bool) -> Result<(), TxnError> {
+        let TxnServices::Local { locks, .. } = &self.services else { return Ok(()); };
+        let tracked: Vec<_> = if self.savepoints.is_empty() { Vec::new() } else {
+            requested.iter().filter(|(key, _)| match key {
+                LockKey::Row { pk, .. } => !pk.is_empty(),
+                LockKey::RowKey { .. } => true,
+                LockKey::Unique { index, .. } => *index != super::locks::CATALOG_NAME_INDEX,
+                _ => false,
+            }).cloned().collect()
+        };
+        let before = if tracked.is_empty() { Vec::new() } else { locks.modes_on(self.id, &tracked) };
+        let result = if grouped { locks.acquire_points(self.id, requested, deadline, cancel) }
+            else { locks.acquire(self.id, requested[0].0.clone(), requested[0].1, deadline, cancel) };
+        let after = if tracked.is_empty() { Vec::new() } else { locks.modes_on(self.id, &tracked) };
+        self.lock_undo.extend(before.into_iter().zip(after).filter_map(|(before, after)|
+            (before.1 != after.1 && before.1.is_subset(after.1)).then_some(before)));
+        result.map_err(Into::into)
+    }
+
     /// Keeps writes while invalidating this mark and all later marks.
     pub(crate) fn release(&mut self, mark: Savepoint) -> Result<(), TxnError> {
         let index = self.savepoint_index(&mark)?;
         self.savepoints.truncate(index);
         if self.savepoints.is_empty() {
+            self.lock_undo.clear();
             self.undo = Vec::new();
             self.undo_bytes = 0;
         }
@@ -851,8 +901,8 @@ impl Transaction {
             return Ok(());
         }
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
-        self.services.acquire(self.id, LockKey::RowKey { table, pk: pk_bytes.to_vec() },
-            mode, deadline, cancel)
+        self.acquire_tracked(&[(LockKey::RowKey { table, pk: pk_bytes.to_vec() }, mode)],
+            false, deadline, cancel)
     }
     /// Reads at the latest committed state until `end_latest`, recording no
     /// SERIALIZABLE reads; returns the transaction snapshot. FK checks at
@@ -981,12 +1031,12 @@ impl Transaction {
         &mut self, table: u64, pk: &[u8], deadline: Option<Instant>,
         cancel: &dyn Fn() -> bool,
     ) -> Result<(), TxnError> {
-        let TxnServices::Local { locks, .. } = &self.services else { return Ok(()); };
+        if matches!(self.services, TxnServices::Cluster(_)) { return Ok(()); }
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
-        locks.acquire_points(self.id, &[
+        self.acquire_tracked(&[
             (LockKey::RowKey { table, pk: pk.to_vec() }, LockMode::Exclusive),
             (LockKey::Row { table, pk: pk.to_vec() }, LockMode::Exclusive),
-        ], deadline, cancel)?;
+        ], true, deadline, cancel)?;
         Ok(())
     }
 
@@ -999,7 +1049,8 @@ impl Transaction {
     ) -> Result<WriteTarget, TxnError> {
         use crate::relational::scan::RowLock;
         let ts = self.try_snapshot_ts()?;
-        let TxnServices::Local { seq, locks } = &self.services else { return Err(TxnError::Unsupported); };
+        let TxnServices::Local { seq, .. } = &self.services else { return Err(TxnError::Unsupported); };
+        let seq = seq.clone();
         let mut physical = table.to_be_bytes().to_vec();
         physical.extend_from_slice(pk);
         let d = LockKey::Row { table, pk: pk.to_vec() };
@@ -1011,7 +1062,7 @@ impl Transaction {
             RowLock::Update => vec![(k, LockMode::Exclusive), (d, LockMode::Exclusive)],
         };
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
-        locks.acquire_points(self.id, &requested, deadline, cancel)?;
+        self.acquire_tracked(&requested, true, deadline, cancel)?;
         let latest = mvcc::latest_version(seq.kv(), Keyspace::Rows, &physical)?;
         let changed = latest.as_ref().is_some_and(|(latest, _)| *latest > ts);
         let own = self.writes.get(&(Keyspace::Rows, physical.clone()));
@@ -1050,9 +1101,7 @@ impl Transaction {
         };
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
         // Retain acquisition's misuse/poisoning errors even on a cache hit.
-        if let TxnServices::Local { locks, .. } = &self.services {
-            locks.acquire(self.id, lock.clone(), LockMode::Exclusive, deadline, cancel)?;
-        }
+        self.acquire_tracked(&[(lock, LockMode::Exclusive)], false, deadline, cancel)?;
         let write_key = (ks, key.to_vec());
         let own = self.writes.get(&write_key);
         let cached = if matches!(&self.services, TxnServices::Local { seq, .. } if seq.kv().is_single_writer() && !seq.kv().is_fenced()) {
@@ -1519,3 +1568,7 @@ mod f19_mapping_tests {
 #[cfg(test)]
 #[path = "txn_drop_tests.rs"]
 mod drop_tests;
+
+#[cfg(test)]
+#[path = "locks_savepoint_tests.rs"]
+mod locks_savepoint_tests;

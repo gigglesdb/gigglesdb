@@ -435,3 +435,112 @@ fn timed_out_update_group_leaves_no_exclusion_after_rollback_to() {
     let mut b = handle.join().unwrap(); run(&mut b, "ROLLBACK");
     drop(a); drop(b); drop(c); drop(admin); std::fs::remove_dir_all(path).unwrap();
 }
+
+// PG18.6: l7-oracle.txt and l7b-oracle.txt.
+#[test]
+fn savepoint_releases_all_select_modes_and_reverts_only_upgrades() {
+    let (admin, path) = fixture();
+    for held in ["KEY SHARE", "SHARE", "NO KEY UPDATE", "UPDATE"] {
+        let mut a = admin.sql_session(); let mut b = admin.sql_session();
+        run(&mut a, "BEGIN"); run(&mut a, "SAVEPOINT s");
+        run(&mut a, &format!("SELECT id FROM lk WHERE id=1 FOR {held}"));
+        run(&mut a, "ROLLBACK TO s");
+        run(&mut b, "SELECT id FROM lk WHERE id=1 FOR UPDATE NOWAIT");
+        run(&mut a, "ROLLBACK");
+    }
+    let mut a = admin.sql_session(); let mut b = admin.sql_session();
+    run(&mut a, "BEGIN"); run(&mut a, "SELECT id FROM lk WHERE id=1 FOR KEY SHARE");
+    run(&mut a, "SAVEPOINT s"); run(&mut a, "SELECT id FROM lk WHERE id=1 FOR UPDATE");
+    run(&mut a, "ROLLBACK TO s");
+    for mode in ["KEY SHARE", "SHARE", "NO KEY UPDATE"] {
+        run(&mut b, &format!("SELECT id FROM lk WHERE id=1 FOR {mode} NOWAIT"));
+    }
+    let error = b.execute("SELECT id FROM lk WHERE id=1 FOR UPDATE NOWAIT", &[], None).unwrap_err();
+    assert_eq!(giggles_core::sqlstate(&error), "55P03");
+    run(&mut a, "ROLLBACK");
+    drop(a); drop(b); drop(admin); std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn savepoint_nested_release_error_and_reuse() {
+    let (admin, path) = fixture(); let mut a = admin.sql_session(); let mut b = admin.sql_session();
+    run(&mut a, "BEGIN"); run(&mut a, "SAVEPOINT s1");
+    run(&mut a, "SELECT id FROM lk WHERE id=1 FOR UPDATE");
+    run(&mut a, "SAVEPOINT s2"); run(&mut a, "SELECT id FROM lk WHERE id=2 FOR UPDATE");
+    run(&mut a, "ROLLBACK TO s2");
+    run(&mut b, "SELECT id FROM lk WHERE id=2 FOR UPDATE NOWAIT");
+    assert!(b.execute("SELECT id FROM lk WHERE id=1 FOR UPDATE NOWAIT", &[], None).is_err());
+    run(&mut a, "SELECT id FROM lk WHERE id=2 FOR UPDATE"); run(&mut a, "RELEASE s2");
+    assert!(b.execute("SELECT id FROM lk WHERE id=2 FOR UPDATE NOWAIT", &[], None).is_err());
+    run(&mut a, "ROLLBACK TO s1");
+    for _ in 0..2 {
+        run(&mut b, "SELECT id FROM lk FOR UPDATE NOWAIT");
+        run(&mut a, "SELECT id FROM lk WHERE id=1 FOR UPDATE");
+        assert!(a.execute("SELECT 1/0", &[], None).is_err());
+        run(&mut a, "ROLLBACK TO s1");
+    }
+    run(&mut a, "ROLLBACK");
+    drop(a); drop(b); drop(admin); std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn savepoint_rollback_wakes_select_and_writer_waiters() {
+    use std::{sync::mpsc, thread, time::Duration};
+    for (holder, waiter) in [
+        ("SELECT id FROM lk WHERE id=1 FOR UPDATE", "SELECT id FROM lk WHERE id=1 FOR UPDATE"),
+        ("SELECT id FROM lk WHERE id=1 FOR NO KEY UPDATE", "SELECT id FROM lk WHERE id=1 FOR NO KEY UPDATE"),
+        ("UPDATE lk SET v=8 WHERE id=1", "UPDATE lk SET v=9 WHERE id=1"),
+        ("DELETE FROM lk WHERE id=1", "DELETE FROM lk WHERE id=1"),
+        ("INSERT INTO lk VALUES(5,50,0)", "INSERT INTO lk VALUES(5,51,0)"),
+        ("INSERT INTO lk VALUES(5,50,0)", "INSERT INTO lk VALUES(6,50,0)"),
+    ] {
+        let (admin, path) = fixture(); let mut a = admin.sql_session(); let mut b = admin.sql_session();
+        run(&mut a, "BEGIN"); run(&mut a, "SAVEPOINT s"); run(&mut a, holder);
+        run(&mut b, "BEGIN");
+        let (send, receive) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let cancel = giggles_core::Cancellation::new(None);
+            cancel.set_lock_timeout(Some(Duration::from_secs(6)));
+            send.send(cancel.scope(|| b.execute(waiter, &[], None))).unwrap(); b
+        });
+        wait_for_lock(&admin); assert!(receive.try_recv().is_err());
+        run(&mut a, "ROLLBACK TO s");
+        receive.recv_timeout(Duration::from_secs(7)).unwrap().unwrap();
+        let mut b = handle.join().unwrap(); run(&mut b, "ROLLBACK"); run(&mut a, "ROLLBACK");
+        drop(a); drop(b); drop(admin); std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+fn savepoint_child_insert_releases_parent_key_share() {
+    let (admin, path) = fixture(); let mut a = admin.sql_session(); let mut b = admin.sql_session();
+    run(&mut a, "CREATE TABLE sp_child(id int PRIMARY KEY, parent int REFERENCES lk(id))");
+    run(&mut a, "BEGIN"); run(&mut a, "SAVEPOINT s");
+    run(&mut a, "INSERT INTO sp_child VALUES(1,1)");
+    assert!(b.execute("SELECT id FROM lk WHERE id=1 FOR UPDATE NOWAIT", &[], None).is_err());
+    run(&mut a, "ROLLBACK TO s");
+    run(&mut b, "SELECT id FROM lk WHERE id=1 FOR UPDATE NOWAIT"); run(&mut a, "ROLLBACK");
+    drop(a); drop(b); drop(admin); std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn savepoint_upgrade_rollback_keeps_preexisting_conflicting_waiter_queued() {
+    use std::{sync::mpsc, thread, time::Duration};
+    let (admin, path) = fixture(); let mut a = admin.sql_session(); let mut b = admin.sql_session();
+    run(&mut a, "BEGIN"); run(&mut a, "SELECT id FROM lk WHERE id=1 FOR KEY SHARE");
+    run(&mut a, "SAVEPOINT s"); run(&mut a, "SELECT id FROM lk WHERE id=1 FOR UPDATE");
+    let (send, receive) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let cancel = giggles_core::Cancellation::new(None);
+        cancel.set_lock_timeout(Some(Duration::from_secs(6)));
+        send.send(cancel.scope(|| b.execute("SELECT id FROM lk WHERE id=1 FOR UPDATE", &[], None))).unwrap(); b
+    });
+    wait_for_lock(&admin);
+    run(&mut a, "ROLLBACK TO s");
+    assert_eq!(admin.waiting_lock_count(), 1);
+    assert!(receive.try_recv().is_err());
+    run(&mut a, "COMMIT");
+    receive.recv_timeout(Duration::from_secs(7)).unwrap().unwrap();
+    let b = handle.join().unwrap();
+    drop(a); drop(b); drop(admin); std::fs::remove_dir_all(path).unwrap();
+}

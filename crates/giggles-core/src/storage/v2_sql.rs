@@ -493,7 +493,7 @@ impl SqlSession {
                                     txn.release(mark)?;
                                     self.v2_savepoints.truncate(index);
                                 } else {
-                                    txn.rollback_to(&mark)?;
+                                    txn.rollback_to_releasing_locks(&mark)?;
                                     self.deferral = self.v2_savepoints[index].2.clone();
                                     self.v2_savepoints.truncate(index + 1);
                                     self.aborted = false;
