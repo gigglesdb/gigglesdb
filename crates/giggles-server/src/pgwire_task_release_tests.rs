@@ -118,6 +118,7 @@ fn state() -> State {
         implicit: false,
         settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
+        unnamed_cache: Vec::new(),
         named_statement_bytes: 0,
         portals: BTreeMap::new(),
         cursors: cursor::Cursors::default(),

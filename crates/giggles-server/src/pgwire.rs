@@ -1034,8 +1034,26 @@ enum Plan {
     /// GRANT / REVOKE ... ON TASK); sessions without a task only.
     TaskDdl(Box<giggles_core::task::statements::TaskStatement>),
 }
+#[derive(Clone, PartialEq, Eq)]
+struct ParseContext {
+    settings: crate::pg_settings::Settings,
+    role: Role,
+    session_user: Option<String>,
+}
+impl ParseContext {
+    fn matches(&self, settings: &crate::pg_settings::Settings, session: &Session) -> bool {
+        &self.settings == settings && &self.role == session.authority_role()
+            && self.session_user.as_deref() == session.session_user_name()
+    }
+    fn current(settings: &crate::pg_settings::Settings, session: &Session) -> Self {
+        Self { settings: settings.clone(), role: session.authority_role().clone(),
+            session_user: session.session_user_name().map(str::to_owned) }
+    }
+}
 #[derive(Clone)]
 struct Statement {
+    // Only an unnamed application SELECT prepared outside a transaction gets a key.
+    parse_context: Option<std::sync::Arc<ParseContext>>,
     description_version: Option<u64>,
     sql_bytes: usize,
     sql: String,
@@ -1207,6 +1225,7 @@ struct State {
     implicit: bool,
     settings: crate::pg_settings::SessionSettings,
     statements: BTreeMap<String, Statement>,
+    unnamed_cache: Vec<Statement>,
     named_statement_bytes: usize,
     portals: BTreeMap<String, Portal>,
     cursors: cursor::Cursors,
@@ -1455,6 +1474,7 @@ impl State {
     ) -> R<Statement> {
         #[cfg(test)]
         PREPARE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        self.invalidate_unnamed_for_sql(sql);
         let before_version = session.sql.statement_catalog_version();
         // GD-0061 R3-206: a task session admits the class before any catalog
         // or sequence read, on its own path.
@@ -1472,6 +1492,7 @@ impl State {
             }
             let d = crate::agent::preview::approver_description(&change);
             return Ok(Statement {
+                parse_context: None,
                 description_version: None,
                 sql_bytes: sql.len(),
                 sql: sql.to_owned(),
@@ -1494,6 +1515,7 @@ impl State {
             }
             let d = crate::task_ddl::description(&stmt);
             return Ok(Statement {
+                parse_context: None,
                 description_version: None,
                 sql_bytes: sql.len(),
                 sql: sql.to_owned(),
@@ -1507,6 +1529,7 @@ impl State {
         if !is_copy_sql(sql) {
             core(session.authorize_sequence_sql(sql))?;
         }
+        let mut plain_application = false;
         let (mut p, mut d) = if let Some(tables) =
             crate::auth::statements::access_share_tables(sql)?
         {
@@ -1638,6 +1661,7 @@ impl State {
             };
             (Plan::Catalog(Box::new(plan), fields, epoch), d)
         } else {
+            plain_application = true;
             self.diagnostic.phase = "application prepare";
             prepare_declared_sql_diagnostic(&mut self.diagnostic, session, sql, &oids, unnamed)?
         };
@@ -1723,7 +1747,14 @@ impl State {
             matches!(&p, Plan::Sql(plan) if !plan.is_ddl())
                 && session.sql.statement_catalog_version() == Some(*version)
         });
+        let parse_context = (unnamed && description_version.is_some()
+            && !session.in_transaction() && !session.agent && session.task().is_none()
+            && matches!(session.role, Role::Database { .. })
+            && plain_application
+            && matches!(&p, Plan::Sql(p) if !p.is_ddl() && p.command() == "SELECT"))
+            .then(|| std::sync::Arc::new(ParseContext::current(&self.settings.current, session)));
         Ok(Statement {
+            parse_context,
             description_version,
             sql_bytes: sql.len(),
             sql: sql.to_owned(),
@@ -1733,6 +1764,82 @@ impl State {
             parameter_oids,
             query_id: self.diagnostic.query_id.clone(),
         })
+    }
+    fn reuse_unnamed(&mut self, sql: &str, oids: &[u32], session: &mut Session) -> R<Option<Statement>> {
+        #[cfg(test)]
+        if sql.contains("r3_parse_source") { UNNAMED_REUSE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        #[cfg(test)]
+        if sql.contains("r3_parse_source") && UNNAMED_REUSE_DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return Ok(None); }
+        if session.in_transaction() || session.is_aborted() || session.agent || session.task().is_some() {
+            return Ok(None);
+        }
+        let Some(index) = self.unnamed_cache.iter().position(|entry|
+            entry.sql == sql && entry.declared_oids == oids) else { return Ok(None); };
+        let old = &self.unnamed_cache[index];
+        let Plan::Sql(p) = &old.p else { return Ok(None); };
+        if !old.parse_context.as_ref().is_some_and(|context| context.matches(&self.settings.current, session))
+            || p.is_ddl() || !session.sql.prepared_is_current(p) {
+            #[cfg(test)]
+            if sql.contains("r3_parse_source") { UNNAMED_CONTEXT_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+            self.unnamed_cache.clear();
+            return Ok(None);
+        }
+        let Some(version) = old.description_version else { return Ok(None); };
+        if !matches!(session.sql.prepared_catalog_state(), giggles_core::PreparedCatalogState::Version(Some(v)) if v == version)
+            || session.sql.committed_catalog_version() != Some(version) {
+            self.unnamed_cache.clear();
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if sql.contains("r3_parse_source") {
+            let hook = UNNAMED_BEFORE_REAUTHORIZE.lock().unwrap().take();
+            if let Some(hook) = hook { hook(); }
+        }
+        // Preserve the dispatch chain's first authorization, including sequence errors.
+        if session.authorize_sequence_sql(sql).is_err() { return Ok(None); }
+        // SELECT authorization proves visibility of every application dependency;
+        // catalog_plan returned None for this unchanged SQL, so skipping it cannot
+        // expose catalog relations or bypass their visibility checks.
+        // Re-run the application path's live authority checks. Any error or drift
+        // takes the full path, which owns error ordering and diagnostic fields.
+        if session.reauthorize_unnamed_parse(sql, p).is_err() {
+            self.unnamed_cache.clear();
+            return Ok(None);
+        }
+        if session.sql.committed_catalog_version() != Some(version) {
+            self.unnamed_cache.clear();
+            return Ok(None);
+        }
+        giggles_core::relational::take_sql_error_message();
+        giggles_core::relational::take_sql_error_detail();
+        giggles_core::relational::take_sql_error_hint();
+        giggles_core::relational::take_sql_warnings();
+        let mut statement = old.clone();
+        statement.query_id = self.diagnostic.query_id.clone();
+        self.diagnostic.phase = "parameter type declaration";
+        #[cfg(test)]
+        if sql.contains("r3_parse_source") {
+            UNNAMED_REUSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            UNNAMED_REUSE_MISSES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Some(statement))
+    }
+    fn invalidate_unnamed_for_sql(&mut self, sql: &str) {
+        // Conservative invalidation also covers SET/RESET ROLE, authorization,
+        // DISCARD (including unsupported forms), and all transaction controls.
+        if !sql.trim_start().get(..6).is_some_and(|head| head.eq_ignore_ascii_case("SELECT")) {
+            self.unnamed_cache.clear();
+        }
+    }
+    fn cache_unnamed(&mut self, statement: &Statement) {
+        const SQL_BYTES: usize = 64 * 1024;
+        if statement.parse_context.is_none() || statement.sql_bytes > SQL_BYTES { return; }
+        self.unnamed_cache.retain(|old| old.sql != statement.sql || old.declared_oids != statement.declared_oids);
+        while self.unnamed_cache.len() >= 16
+            || self.unnamed_cache.iter().map(|old| old.sql_bytes).sum::<usize>() + statement.sql_bytes > SQL_BYTES {
+            self.unnamed_cache.remove(0);
+        }
+        self.unnamed_cache.push(statement.clone());
     }
     fn refresh_statement(&mut self, name: &str, session: &mut Session) -> R<()> {
         let old = self.statements.get(name).ok_or("26000")?;
@@ -1848,6 +1955,7 @@ impl State {
                 r.end()?;
                 self.statements.remove("");
                 self.portals.remove("");
+                self.invalidate_unnamed_for_sql(&sql);
                 self.simple_query(&sql, session, out, received)?;
                 if !session.in_transaction() {
                     self.portals.clear();
@@ -1882,7 +1990,14 @@ impl State {
                 {
                     return Err("54000");
                 }
-                let statement = self.prepare_statement(&sql, oids, session, name.is_empty())?;
+                let reused = if name.is_empty() { self.reuse_unnamed(&sql, &oids, session)? } else { None };
+                let statement = match reused {
+                    Some(statement) => statement,
+                    None => self.prepare_statement(&sql, oids, session, name.is_empty())?,
+                };
+                if name.is_empty() {
+                    self.cache_unnamed(&statement);
+                }
                 if !name.is_empty() {
                     self.named_statement_bytes += sql.len();
                 }
@@ -3013,6 +3128,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
         implicit: false,
         settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
+        unnamed_cache: Vec::new(),
         named_statement_bytes: 0,
         portals: BTreeMap::new(),
         cursors: cursor::Cursors::default(),
@@ -3803,3 +3919,20 @@ mod collation_diagnostic_tests {
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "pgwire_implicit_block_tests.rs"]
 mod implicit_block_tests;
+
+#[cfg(test)]
+static UNNAMED_REUSE_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static UNNAMED_REAUTHORIZE_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static UNNAMED_REUSE_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static UNNAMED_REUSE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "../tests/unnamed_parse_network.inc"]
+mod unnamed_parse_network;
+
+#[cfg(test)]
+static UNNAMED_BEFORE_REAUTHORIZE: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static UNNAMED_CONTEXT_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

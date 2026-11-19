@@ -231,6 +231,7 @@ impl State {
             parameter_oids[i] = o;
         }
         Ok(Statement {
+            parse_context: None,
             description_version: None,
             sql_bytes: sql.len(),
             sql: sql.to_owned(),

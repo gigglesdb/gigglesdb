@@ -2907,6 +2907,19 @@ impl Session {
     pub fn still_valid(&self) -> Result<(), CoreError> {
         self.sql.still_valid()
     }
+    /// Recheck fresh application-Parse authority without parsing or describing.
+    /// Caller proves this is an unchanged non-DDL SELECT outside a transaction.
+    pub(crate) fn reauthorize_unnamed_parse(&mut self, sql: &str, p: &Prepared) -> Result<(), CoreError> {
+        #[cfg(test)]
+        if sql.contains("r3_parse_source") && crate::pgwire::UNNAMED_REAUTHORIZE_FAIL.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(CoreError::Policy(Error::Scope));
+        }
+        self.authority_scope(|session| {
+            session.reconcile_sequence_owners()?;
+            session.authorize_sequence_sql(sql)?;
+            session.authorize(p)
+        })
+    }
     /// Same dependency and sequence authorization as fresh prepare/Execute.
     /// Called inside authority_scope before any portal dependency expansion/lock.
     pub(crate) fn authorize_prepared_bind(&mut self, p: &Prepared) -> Result<Prepared, CoreError> {

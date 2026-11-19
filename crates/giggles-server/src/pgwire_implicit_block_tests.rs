@@ -27,6 +27,7 @@ fn state() -> State {
         implicit: false,
         settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
+        unnamed_cache: Vec::new(),
         named_statement_bytes: 0,
         portals: BTreeMap::new(),
         cursors: cursor::Cursors::default(),
@@ -205,7 +206,7 @@ fn metadata_cycle_counts() {
             metadata_parse(&mut state, &mut session, name);
             metadata_bind(&mut state, &mut session, name);
             metadata_describe_execute(&mut state, &mut session).unwrap();
-            assert_eq!(giggles_core::metadata_read_counts::take(), [17, 0, 7, 0, 0]);
+            assert_eq!(giggles_core::metadata_read_counts::take(), [17, 0, 6, 0, 0]);
         }
         if !name.is_empty() {
             metadata_bind(&mut state, &mut session, name);
@@ -270,7 +271,7 @@ fn unnamed_cache_hit_and_transaction_exclusion() {
     let cold = giggles_core::metadata_read_counts::take();
     metadata_parse(&mut state, &mut session, "");
     let warm = giggles_core::metadata_read_counts::take();
-    assert_eq!(cold[2], warm[2] + 1, "only core parse/bind is skipped");
+    assert_eq!(cold[2], warm[2] + 2, "core parse/bind and the server description are skipped");
     simple(&mut state, &mut session, "BEGIN").unwrap();
     metadata_parse(&mut state, &mut session, "");
     giggles_core::metadata_read_counts::take();
@@ -330,7 +331,30 @@ fn unnamed_cache_lru_capacity() {
     giggles_core::metadata_read_counts::take();
     parse_sql(&mut state, &mut session, sql).unwrap();
     let miss = giggles_core::metadata_read_counts::take();
-    assert_eq!(miss[2], hit[2] + 1);
+    assert_eq!(miss[2], hit[2] + 2);
+}
+
+#[test]
+fn unnamed_cache_sql_byte_bound_and_discard() {
+    let mut session = fixture();
+    session.execute_sql("CREATE TABLE t (id int PRIMARY KEY)", &[]).unwrap();
+    let mut state = state();
+    for id in 0..3 {
+        let sql = format!("SELECT id FROM t WHERE id = {id}{}", " ".repeat(40_000));
+        parse_sql(&mut state, &mut session, &sql).unwrap();
+        assert_eq!(state.unnamed_cache.len(), 1);
+        assert!(state.unnamed_cache.iter().map(|entry| entry.sql_bytes).sum::<usize>() <= 64 * 1024);
+    }
+    let oversized = format!("SELECT id FROM t{}", " ".repeat(64 * 1024));
+    assert_eq!(parse_sql(&mut state, &mut session, &oversized), Err("54000"));
+    assert_eq!(state.unnamed_cache.len(), 1);
+    for command in ["DISCARD ALL", "DISCARD PLANS", "RESET ROLE", "SET ROLE owner"] {
+        parse_sql(&mut state, &mut session, "SELECT id FROM t").unwrap();
+        assert!(!state.unnamed_cache.is_empty());
+        // Unsupported DISCARD still invalidates conservatively.
+        let _ = parse_sql(&mut state, &mut session, command);
+        assert!(state.unnamed_cache.is_empty(), "{command}");
+    }
 }
 
 #[test]
@@ -482,4 +506,23 @@ fn measure_bind_authorization_cost() {
     let cycle_us = started.elapsed().as_secs_f64() * 1e6 / f64::from(count);
     assert_eq!(PREPARE_CALLS.with(std::cell::Cell::get), prepares);
     eprintln!("BIND_AUTH_COST samples={count} authorization_us={authorization_us:.3} bind_execute_sync_us={cycle_us:.3} profile=dev role=non_superuser");
+}
+
+#[test]
+fn unnamed_hit_drains_thread_local_error_diagnostics() {
+    let mut session = fixture();
+    let mut state = state();
+    for sql in ["CREATE TABLE diagnostic_source(id INT)", "CREATE SCHEMA diagnostic_schema",
+        "CREATE EXTENSION \"uuid-ossp\" WITH SCHEMA diagnostic_schema"] {
+        session.execute_sql(sql, &[]).unwrap();
+    }
+    let sql = "SELECT * FROM diagnostic_source";
+    extended(&mut state, &mut session, sql).unwrap();
+    // Core errors can leave diagnostics for the wire layer to consume. Exercise
+    // the hit on that same thread before any full prepare drains those slots.
+    assert!(session.execute_sql("DROP SCHEMA diagnostic_schema", &[]).is_err());
+    assert!(state.reuse_unnamed(sql, &[], &mut session).unwrap().is_some());
+    assert_eq!(giggles_core::relational::take_sql_error_message(), None);
+    assert_eq!(giggles_core::relational::take_sql_error_detail(), None);
+    assert_eq!(giggles_core::relational::take_sql_error_hint(), None);
 }
