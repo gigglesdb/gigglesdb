@@ -75,6 +75,7 @@ pub(crate) struct V2Db {
     reclaim: std::sync::Mutex<reclaim::Registry>,
     pub(super) reclaim_errors: AtomicU64,
     binding_fences: std::sync::Mutex<std::collections::BTreeMap<(u64, u64, u64), u64>>,
+    origin_cache: std::sync::Mutex<Option<(engine::hlc::Ts, Option<u128>)>>,
     next_txn: AtomicU64,
     /// Set on a cluster gateway (GD-0075 R5-43): transactions, the catalog, allocators and
     /// sequences go to range leaders, and `kv`/`sequencer` are fenced placeholders.
@@ -128,7 +129,7 @@ impl V2Db {
             )?))
         })
         .map_err(format_error)?;
-        Self::from_kv(Arc::new(engine::kv::Kv::new(backend)))
+        Self::from_kv(Arc::new(engine::kv::Kv::new_single_writer(backend)))
     }
     #[cfg(feature = "engine-rocksdb")]
     fn from_kv(kv: Arc<engine::kv::Kv>) -> Result<Self, CoreError> {
@@ -216,6 +217,7 @@ impl V2Db {
             reclaim: Default::default(),
             reclaim_errors: AtomicU64::new(0),
             binding_fences: Default::default(),
+            origin_cache: Default::default(),
             next_txn: AtomicU64::new(1),
             cluster: None,
             wall_clock: std::sync::RwLock::new(Arc::new(engine::commit::SystemClock)),
@@ -290,6 +292,7 @@ impl V2Db {
             reclaim: Default::default(),
             reclaim_errors: AtomicU64::new(0),
             binding_fences: Default::default(),
+            origin_cache: Default::default(),
             next_txn: AtomicU64::new(1),
             cluster: Some(services),
             wall_clock: std::sync::RwLock::new(Arc::new(engine::commit::SystemClock)),
@@ -424,7 +427,7 @@ impl V2Db {
     ) -> Result<super::State, CoreError> {
         self.with_metadata_catalog(txn, |catalog, epoch, ts| {
             let mut state = super::empty(u128::from_be_bytes(self.meta.domain));
-            state.origin = self.origin_at(ts)?;
+            state.origin = self.validated_origin_at(ts)?;
             state.sql = (*catalog.image().map_err(CoreError::Sql)?).clone();
             state.sql.epoch = epoch;
             Ok(state)
@@ -449,7 +452,7 @@ impl V2Db {
     ) -> Result<T, CoreError> {
         self.with_metadata_catalog(txn, |catalog, epoch, ts| {
             // Preserve the owned metadata API's provenance read and its errors.
-            self.origin_at(ts)?;
+            self.validated_origin_at(ts)?;
             let image = catalog.image().map_err(CoreError::Sql)?;
             let mut state = super::MetadataState::new(
                 &image,
@@ -522,6 +525,25 @@ impl V2Db {
         };
         inspect(catalog, version.unwrap_or(ts).0, ts)
     }
+    /// Local MVCC commits never replace a version at an already visible timestamp.
+    /// The metadata caller pins `ts` throughout this read, including cache hits.
+    /// Reuse only an exact timestamp: no cross-commit invalidation assumption,
+    /// and no assumptions about remote writers or cluster read/lock leases.
+    fn validated_origin_at(&self, ts: engine::hlc::Ts) -> Result<Option<u128>, CoreError> {
+        if self.cluster.is_some() || !self.kv.is_single_writer() || self.kv.is_fenced() {
+            return self.origin_at(ts);
+        }
+        let mut cached = self.origin_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((validated, origin)) = *cached
+            && validated == ts
+        {
+            return Ok(origin);
+        }
+        let origin = self.origin_at(ts)?;
+        *cached = Some((ts, origin));
+        Ok(origin)
+    }
+
     /// Older SQL-only v2 databases have no kernel image. When present, its
     /// existing metadata record carries restore provenance.
     pub(super) fn origin_at(&self, ts: engine::hlc::Ts) -> Result<Option<u128>, CoreError> {
@@ -564,7 +586,7 @@ impl V2Db {
         }
         #[cfg(feature = "engine-rocksdb")]
         {
-            let kv = Arc::new(engine::kv::Kv::new(Arc::new(
+            let kv = Arc::new(engine::kv::Kv::new_single_writer(Arc::new(
                 engine::kv_rocksdb::RocksKv::open(path, 64 * 1024 * 1024)?,
             )));
             Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false, token)

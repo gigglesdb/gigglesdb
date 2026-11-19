@@ -8,7 +8,7 @@ use super::*;
 
 fn setup(budget: usize) -> (Arc<Sequencer>, Arc<LockManager>) {
     let seq = Sequencer::open(
-        Arc::new(Kv::new(Arc::new(MemKv::new()))),
+        Arc::new(Kv::new_single_writer(Arc::new(MemKv::new()))),
         Arc::new(ManualClock::new(10)),
         SequencerConfig {
             write_set_bytes: budget,
@@ -294,4 +294,106 @@ fn foreign_and_reused_transaction_ids_cannot_use_tokens() {
     assert_eq!(reused.release(mark), Err(TxnError::Misuse));
     reused.rollback_to(&own).unwrap();
     reused.release(own).unwrap();
+}
+
+#[test]
+fn repeated_write_target_preserves_versions_and_savepoint_values() {
+    for isolation in [
+        Isolation::ReadCommitted,
+        Isolation::RepeatableRead,
+        Isolation::Serializable,
+    ] {
+        for ks in [Keyspace::Rows, Keyspace::Index] {
+            let (seq, locks) = setup(4096);
+            let mut seed = txn(&seq, &locks, 1);
+            seed.lock_for_write(ks, &key(1), None, &|| false).unwrap();
+            seed.put(ks, key(1), b"base".to_vec()).unwrap();
+            seed.commit().unwrap();
+            let mut t = Transaction::begin(&seq, &locks, TxnId(2), isolation);
+            let first = t.lock_for_write(ks, &key(1), None, &|| false).unwrap();
+            let again = t.lock_for_write(ks, &key(1), None, &|| false).unwrap();
+            assert_eq!(first.current, again.current);
+            assert_eq!(first.changed_since_snapshot, again.changed_since_snapshot);
+            let mark = t.savepoint();
+            t.put(ks, key(1), b"one".to_vec()).unwrap();
+            assert!(t.locked[&(ks, key(1))].current.is_none());
+            assert_eq!(
+                t.lock_for_write(ks, &key(1), None, &|| false)
+                    .unwrap()
+                    .current,
+                Some(b"one".to_vec())
+            );
+            t.put(ks, key(1), b"two".to_vec()).unwrap();
+            assert_eq!(
+                t.lock_for_write(ks, &key(1), None, &|| false)
+                    .unwrap()
+                    .current,
+                Some(b"two".to_vec())
+            );
+            t.rollback_to(&mark).unwrap();
+            assert_eq!(
+                t.lock_for_write(ks, &key(1), None, &|| false)
+                    .unwrap()
+                    .current,
+                first.current
+            );
+            let mut other = txn(&seq, &locks, 3);
+            assert!(matches!(
+                other.lock_for_write(ks, &key(1), Some(Instant::now()), &|| false),
+                Err(TxnError::LockTimeout)
+            ));
+            drop(t);
+            assert!(other.lock_for_write(ks, &key(1), None, &|| false).is_ok());
+        }
+    }
+}
+
+#[test]
+fn repeated_lock_after_concurrent_commit_keeps_conflict_decision() {
+    for isolation in [
+        Isolation::ReadCommitted,
+        Isolation::RepeatableRead,
+        Isolation::Serializable,
+    ] {
+        let (seq, locks) = setup(4096);
+        let mut t = Transaction::begin(&seq, &locks, TxnId(1), isolation);
+        t.snapshot_ts();
+        let mut writer = txn(&seq, &locks, 2);
+        put_row(&mut writer, 1, b"new");
+        writer.commit().unwrap();
+        for _ in 0..2 {
+            let result = t.lock_for_write(Keyspace::Rows, &key(1), None, &|| false);
+            if isolation == Isolation::ReadCommitted {
+                let target = result.unwrap();
+                assert_eq!(target.current, Some(b"new".to_vec()));
+                assert!(target.changed_since_snapshot);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(TxnError::Serialization(SerializationReason::WriteConflict))
+                ));
+            }
+        }
+        if isolation == Isolation::ReadCommitted {
+            t.begin_statement();
+            assert!(
+                !t.lock_for_write(Keyspace::Rows, &key(1), None, &|| false)
+                    .unwrap()
+                    .changed_since_snapshot
+            );
+        }
+    }
+}
+
+#[test]
+fn cached_write_target_preserves_kv_fence_error() {
+    let (seq, locks) = setup(4096);
+    let mut t = txn(&seq, &locks, 1);
+    t.lock_for_write(Keyspace::Rows, &key(1), None, &|| false)
+        .unwrap();
+    seq.kv().fence();
+    assert!(matches!(
+        t.lock_for_write(Keyspace::Rows, &key(1), None, &|| false),
+        Err(TxnError::Kv(super::super::kv::KvError::Fenced))
+    ));
 }

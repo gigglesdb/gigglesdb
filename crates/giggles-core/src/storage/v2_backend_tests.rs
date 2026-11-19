@@ -170,3 +170,88 @@ fn supplied_replicated_backend_supports_sql() {
         .execute("CREATE TABLE t(id int PRIMARY KEY)", &[], None)
         .unwrap();
 }
+
+#[test]
+fn metadata_origin_cache_uses_exact_snapshot_and_never_caches_errors() {
+    use crate::storage::{Metadata, encode};
+    use engine::txn::Isolation;
+    // This private backend has no external writers; exercise the native cache path.
+    let db = super::V2Db::from_kv_with_limit(
+        Arc::new(engine::kv::Kv::new_single_writer(initialized_backend())),
+        DEFAULT_WRITE_SET_BYTES, false, None,
+    ).unwrap();
+    let old = db.begin(Isolation::ReadCommitted);
+    let ts = old.current_snapshot_ts().unwrap();
+    assert_eq!(db.validated_origin_at(ts).unwrap(), None);
+    assert_eq!(*db.origin_cache.lock().unwrap(), Some((ts, None)));
+    let metadata = Metadata {
+        format: 4,
+        domain: u128::from_be_bytes(db.meta.domain),
+        schema: 0,
+        last_time: 0,
+        next_approval: 0,
+        origin: Some(77),
+    };
+    let mut writer = db.begin(Isolation::ReadCommitted);
+    writer
+        .put(Keyspace::Kernel, vec![0], encode(&metadata).unwrap())
+        .unwrap();
+    let next = writer.commit().unwrap();
+    assert_eq!(db.validated_origin_at(next).unwrap(), Some(77));
+    assert_eq!(db.validated_origin_at(ts).unwrap(), None);
+    let mut bad = metadata;
+    bad.domain ^= 1;
+    let mut writer = db.begin(Isolation::ReadCommitted);
+    writer
+        .put(Keyspace::Kernel, vec![0], encode(&bad).unwrap())
+        .unwrap();
+    let invalid = writer.commit().unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            db.validated_origin_at(invalid),
+            Err(CoreError::Corrupt(_))
+        ));
+        assert_eq!(*db.origin_cache.lock().unwrap(), Some((ts, None)));
+    }
+    db.kv.fence();
+    assert!(db.validated_origin_at(ts).is_err());
+}
+
+#[test]
+fn repeated_sql_writes_upserts_fk_and_metadata_recreate() {
+    let admin = Admin::attach_v2_backend(
+        initialized_backend(),
+        Limits::default(),
+        DEFAULT_WRITE_SET_BYTES,
+    )
+    .unwrap();
+    let mut s = admin.sql_session();
+    for sql in [
+        "CREATE TABLE parent (id int PRIMARY KEY)",
+        "CREATE TABLE child (id int PRIMARY KEY, p int REFERENCES parent(id), v int)",
+        "INSERT INTO parent VALUES (1)",
+        "INSERT INTO child VALUES (1, 1, 0)",
+        "BEGIN",
+        "UPDATE child SET v = v + 1 WHERE id = 1",
+        "UPDATE child SET v = v + 1 WHERE id = 1",
+        "INSERT INTO child VALUES (1, 1, 9) ON CONFLICT (id) DO NOTHING",
+        "INSERT INTO child VALUES (1, 1, 3) ON CONFLICT (id) DO UPDATE SET v = excluded.v",
+        "COMMIT",
+    ] {
+        s.execute(sql, &[], None).unwrap();
+    }
+    assert_eq!(
+        s.execute("SELECT v FROM child", &[], None).unwrap().rows[0].values,
+        vec![Value::Int(3)]
+    );
+    assert!(
+        s.execute("DELETE FROM parent WHERE id = 1", &[], None)
+            .is_err()
+    );
+    s.execute("DROP TABLE child", &[], None).unwrap();
+    s.execute("CREATE TABLE child (replacement text)", &[], None)
+        .unwrap();
+    let plan = s.prepare("SELECT * FROM child").unwrap();
+    assert_eq!(s.describe(&plan).unwrap().columns.len(), 1);
+    assert!(s.execute("SELECT v FROM child", &[], None).is_err());
+}

@@ -423,6 +423,13 @@ fn snapshot_view<'a>(services: &'a TxnServices, snapshot: &'a Option<Snapshot>) 
         (TxnServices::Cluster(_), _) => &NO_SNAPSHOT,
     }
 }
+/// Learned while holding a local exclusive lock continuously until Drop.
+struct LockedWrite {
+    latest_ts: Option<Ts>,
+    // Outer None means discarded after an own write (or not needed outside RC).
+    current: Option<Option<Vec<u8>>>,
+}
+
 pub(crate) struct Transaction {
     services: TxnServices,
     id: TxnId,
@@ -451,7 +458,7 @@ pub(crate) struct Transaction {
     savepoints: Vec<(u64, usize)>,
     undo: Vec<UndoWrite>,
     undo_bytes: usize,
-    locked: BTreeSet<(Keyspace, Vec<u8>)>,
+    locked: BTreeMap<(Keyspace, Vec<u8>), LockedWrite>,
     reads: ReadSet,
     /// The transaction snapshot, set aside while FK crosscheck reads run at the
     /// latest committed state (GD-0075 R5-76); see `begin_latest`.
@@ -501,7 +508,7 @@ impl Transaction {
             savepoints: Vec::new(),
             undo: Vec::new(),
             undo_bytes: 0,
-            locked: BTreeSet::new(),
+            locked: BTreeMap::new(),
             reads: ReadSet::default(),
             set_aside: None,
             validation_config: ValidationConfig::default(),
@@ -992,26 +999,47 @@ impl Transaction {
             _ => return Err(TxnError::Misuse),
         };
         self.lock_cleanup_needed.store(true, Ordering::Relaxed);
-        let latest = match &self.services {
-            TxnServices::Local { seq, locks } => {
-                locks.acquire(self.id, lock, LockMode::Exclusive, deadline, cancel)?;
-                mvcc::latest_version(seq.kv(), ks, key)?
-            }
-            TxnServices::Cluster(cluster) => cluster.lock_key(self.id, ks, key, deadline, cancel)?,
+        // Retain acquisition's misuse/poisoning errors even on a cache hit.
+        if let TxnServices::Local { locks, .. } = &self.services {
+            locks.acquire(self.id, lock.clone(), LockMode::Exclusive, deadline, cancel)?;
+        }
+        let write_key = (ks, key.to_vec());
+        let own = self.writes.get(&write_key);
+        let cached = if matches!(&self.services, TxnServices::Local { seq, .. } if seq.kv().is_single_writer() && !seq.kv().is_fenced()) {
+            self.locked.get(&write_key).filter(|cached| {
+                self.isolation != Isolation::ReadCommitted || own.is_some() || cached.current.is_some()
+            })
+        } else {
+            None
         };
-        let changed = latest.as_ref().is_some_and(|(latest, _)| *latest > ts);
-        let own = self.writes.get(&(ks, key.to_vec()));
+        let (latest_ts, latest_value) = if let Some(cached) = cached {
+            (cached.latest_ts, cached.current.clone().flatten())
+        } else {
+            let latest = match &self.services {
+                TxnServices::Local { seq, .. } => mvcc::latest_version(seq.kv(), ks, key)?,
+                TxnServices::Cluster(cluster) => cluster.lock_key(self.id, ks, key, deadline, cancel)?,
+            };
+            match latest {
+                Some((ts, value)) => (Some(ts), value),
+                None => (None, None),
+            }
+        };
+        let changed = latest_ts.is_some_and(|latest| latest > ts);
         if self.isolation != Isolation::ReadCommitted && changed && own.is_none() {
             return Err(TxnError::Serialization(SerializationReason::WriteConflict));
         }
         let value = if let Some(own) = own {
             own.clone()
         } else if self.isolation == Isolation::ReadCommitted {
-            latest.and_then(|(_, v)| v)
+            latest_value
         } else {
             mvcc::read_at(snapshot_view(&self.services, &self.snapshot), ks, key, ts)?
         };
-        self.locked.insert((ks, key.to_vec()));
+        self.locked.insert(write_key, LockedWrite {
+            latest_ts,
+            current: (self.isolation == Isolation::ReadCommitted && own.is_none())
+                .then(|| value.clone()),
+        });
         Ok(WriteTarget {
             current: value,
             changed_since_snapshot: changed,
@@ -1048,7 +1076,7 @@ impl Transaction {
             return Err(TxnError::Misuse);
         }
         if matches!(ks, Keyspace::Rows | Keyspace::Index)
-            && !self.locked.contains(&(ks, key.clone()))
+            && !self.locked.contains_key(&(ks, key.clone()))
         {
             return Err(TxnError::Misuse);
         }
@@ -1090,6 +1118,11 @@ impl Transaction {
         }
         if self.write_limit.is_some_and(|limit| size > limit) {
             return Err(TxnError::PendingWriteLimit);
+        }
+        // Savepoint rollback retains the lock. If it removes this own write,
+        // the next RC lock request reloads the discarded value under that lock.
+        if let Some(cached) = self.locked.get_mut(&write_key) {
+            cached.current = None;
         }
         if undo_size == 0 {
             self.writes.insert(write_key, value);

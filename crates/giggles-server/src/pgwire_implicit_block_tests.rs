@@ -196,24 +196,26 @@ fn metadata_cycle_counts() {
         assert_eq!(text_rows(&metadata_describe_execute(&mut state, &mut session).unwrap()), vec![vec!["7"]]);
         // Named statements now retain description_version too, avoiding the same
         // three metadata reads as the unnamed description cache.
-        assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 9, 16, 0], "cycle {name:?}");
+        // Provenance validation is cached at an exact local snapshot timestamp:
+        // the first cycle reads once; subsequent read-only cycles reuse it.
+        assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 9, usize::from(name.is_empty()), 0], "cycle {name:?}");
         if name.is_empty() {
             metadata_parse(&mut state, &mut session, name);
             metadata_bind(&mut state, &mut session, name);
             metadata_describe_execute(&mut state, &mut session).unwrap();
-            assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 8, 15, 0]);
+            assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 8, 0, 0]);
         }
         if !name.is_empty() {
             metadata_bind(&mut state, &mut session, name);
             metadata_describe_execute(&mut state, &mut session).unwrap();
             // Rebinding the cached named description also saves three reads.
-            assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 4, 11, 0]);
+            assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 4, 0, 0]);
         }
     }
     simple(&mut state, &mut session, "SELECT v FROM t WHERE id = 1").unwrap();
-    assert_eq!(giggles_core::metadata_read_counts::take(), [0, 0, 9, 9, 0]);
+    assert_eq!(giggles_core::metadata_read_counts::take(), [0, 0, 9, 0, 0]);
     extended(&mut state, &mut session, "INSERT INTO serial_t (v) VALUES (8)").unwrap();
-    assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 9, 16, 0]);
+    assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 9, 0, 0]);
 }
 #[test]
 fn metadata_ddl_between_bind_and_execute() {

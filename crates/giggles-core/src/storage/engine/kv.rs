@@ -276,6 +276,7 @@ pub(crate) trait KvBackend: KvRead {
 pub(crate) struct Kv {
     backend: Arc<dyn KvBackend>,
     fenced: AtomicBool,
+    single_writer: bool,
 }
 
 impl Kv {
@@ -283,7 +284,17 @@ impl Kv {
         Self {
             backend,
             fenced: AtomicBool::new(false),
+            single_writer: false,
         }
+    }
+    /// Only for a backend whose versioned writes all pass through this engine's
+    /// sequencer and locks. Attached/shared backends must use `new` instead.
+    #[cfg(any(test, feature = "engine-rocksdb"))]
+    pub(crate) fn new_single_writer(backend: Arc<dyn KvBackend>) -> Self {
+        Self { single_writer: true, ..Self::new(backend) }
+    }
+    pub(crate) fn is_single_writer(&self) -> bool {
+        self.single_writer
     }
     /// Fences the handle: every later call fails without reaching the backend.
     pub(crate) fn fence(&self) {

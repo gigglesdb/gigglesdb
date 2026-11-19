@@ -549,3 +549,61 @@ mod native_once {
         assert_receipt_format(&stores);
     }
 }
+
+#[test]
+fn applied_versions_bypass_admin_lock_and_origin_caches() {
+    use crate::storage::{Backend, Metadata, encode};
+    use crate::storage::engine::{codec, hlc::Ts, mvcc, txn::{Isolation, SerializationReason, TxnError}};
+
+    for isolation in [Isolation::ReadCommitted, Isolation::RepeatableRead, Isolation::Serializable] {
+        for ks in [Keyspace::Rows, Keyspace::Index] {
+            let dir = Dir::new();
+            let store = Arc::new(ReplicaStore::create(&dir.0, [7; 16]).unwrap());
+            let key = 42u64.to_be_bytes();
+            let mut metadata = Metadata {
+                format: 4, domain: u128::from_be_bytes(store.domain()), schema: 0,
+                last_time: 0, next_approval: 0, origin: Some(11),
+            };
+            let sink = Arc::new(Fanout {
+                stores: [store.clone(), store.clone(), store.clone()], next: Mutex::new(1),
+            });
+            let admin = store.open_admin(sink, Limits::default(), v2::DEFAULT_WRITE_SET_BYTES).unwrap();
+            let Backend::V2(db) = &admin.inner.backend else { unreachable!() };
+            assert!(!db.kv.is_single_writer());
+            let mut seed = db.begin(Isolation::ReadCommitted);
+            seed.lock_for_write(ks, &key, None, &|| false).unwrap();
+            seed.put(ks, key.to_vec(), b"old".to_vec()).unwrap();
+            seed.put(Keyspace::Kernel, vec![0], encode(&metadata).unwrap()).unwrap();
+            seed.commit().unwrap();
+            let next = store.applied().unwrap().unwrap().index + 1;
+            let mut txn = db.begin(isolation);
+            let ts = txn.snapshot_ts();
+            assert_eq!(txn.lock_for_write(ks, &key, None, &|| false).unwrap().current, Some(b"old".to_vec()));
+            assert_eq!(db.metadata_state(Some(&txn)).unwrap().origin, Some(11));
+
+            // Raft apply bypasses this admin's engine locks and visible timestamp.
+            let mut applied = WriteBatch::default();
+            applied.put(ks, codec::user_key_seek_at(&key, Ts(ts.0 + 1)), mvcc::encode_live(b"new"));
+            metadata.origin = Some(22);
+            // Even an already-visible timestamp can acquire a different origin.
+            applied.put(Keyspace::Kernel, codec::user_key_seek_at(&[0], ts),
+                mvcc::encode_live(&encode(&metadata).unwrap()));
+            store.apply(&applied.encode(), pos(next, 1)).unwrap();
+            let again = txn.lock_for_write(ks, &key, None, &|| false);
+            if isolation == Isolation::ReadCommitted {
+                let target = again.unwrap();
+                assert_eq!(target.current, Some(b"new".to_vec()));
+                assert!(target.changed_since_snapshot);
+            } else {
+                assert!(matches!(again, Err(TxnError::Serialization(SerializationReason::WriteConflict))));
+            }
+            assert_eq!(db.metadata_state(Some(&txn)).unwrap().origin, Some(22));
+            db.inspect_metadata(Some(&txn), |_| Ok(())).unwrap();
+            // A malformed replacement must still fail after a successful read.
+            let mut corrupt = WriteBatch::default();
+            corrupt.put(Keyspace::Kernel, codec::user_key_seek_at(&[0], ts), mvcc::encode_live(b"invalid"));
+            store.apply(&corrupt.encode(), pos(next + 1, 1)).unwrap();
+            assert!(db.inspect_metadata(Some(&txn), |_| Ok(())).is_err());
+        }
+    }
+}
