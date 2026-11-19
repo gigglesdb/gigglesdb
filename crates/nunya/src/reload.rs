@@ -93,6 +93,10 @@ impl State {
 }
 /// Policy units and their shared audit sink.
 pub(crate) struct Hub {
+    /// Optional process serving gate, set before routes are registered.
+    pub(crate) serving_gate: Option<Arc<crate::policy::serving::ServingGate>>,
+    #[cfg(feature = "kubernetes")]
+    pub(crate) activation_tracker: RwLock<Option<Arc<crate::policy::kube_activation::ActivationTracker>>>,
     state: Mutex<State>,
     /// Service lifecycle and management audit log.
     pub(crate) log: ReloadableLog,
@@ -326,20 +330,49 @@ impl Hub {
         unit.applied = r.created_unix_ms;
         Ok(r)
     }
-    fn finish_replay(&self, state: &mut State, route: &RouteId, r: &PolicyRevision) -> Result<(), PolicyOpError> {
-        let store = self.revision_backend()?;
+    /// Publish a durable head locally without writing revision storage.
+    pub(crate) fn adopt_revision(&self, route: &RouteId, r: &PolicyRevision) -> Result<(), PolicyOpError> {
+        if &r.route != route { return Err(PolicyOpError::Unavailable); }
+        let mut state = self.state.lock().map_err(|_| PolicyOpError::Unavailable)?;
+        if self.route_owners.read().map_err(|_| PolicyOpError::Unavailable)?.get(route.as_str()) != Some(&Owner::Service) { return Err(PolicyOpError::NotServiceOwned); }
+        self.publish_revision(&mut state, route, r)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn publish_compiled(&self, route: &RouteId, published: &PublishedRoute, policy: &mut Arc<Policy>, compiled: &Arc<Policy>, change: Option<&MembershipChange>, r: &PolicyRevision, predecessor: &str) -> Result<(), PolicyOpError> {
+        self.reset_membership(change, policy).map_err(|_| PolicyOpError::Unavailable)?;
+        let old = policy.clone();
+        *policy = compiled.clone();
+        let tightened = published.fence().is_some_and(|f| f.publish(&old, compiled).is_some());
+        #[cfg(feature = "kubernetes")]
+        if let Some(tracker) = self.activation_tracker.read().map_err(|_| PolicyOpError::Unavailable)?.as_ref() { let previous = predecessor.strip_prefix("rev-").and_then(|s| s.split('-').next()).and_then(|s| s.parse::<u64>().ok());
+            tracker.published(route.as_str(), r.number, tightened || previous != r.number.checked_sub(1)); }
+        #[cfg(not(feature = "kubernetes"))]
+        let _ = (route, r, tightened, predecessor);
+        Ok(())
+    }
+    fn publish_revision(&self, state: &mut State, route: &RouteId, r: &PolicyRevision) -> Result<(), PolicyOpError> {
         let index = state.unit(route.as_str()).map_err(|_| PolicyOpError::UnknownRoute)?;
-        if store.active(route)?.is_some_and(|a| a.number == r.number) && state.units[index].revisions.read().map_err(|_| PolicyOpError::Unavailable)?.policy != revision_stamp(r) {
+        let stamp = state.units[index].revisions.read().map_err(|_| PolicyOpError::Unavailable)?.policy.clone();
+        let loaded = stamp.strip_prefix("rev-").and_then(|s| s.split('-').next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+        if loaded == r.number { return Ok(()); }
+        if loaded > r.number { return Err(PolicyOpError::Unavailable); }
+        self.finish_publication(state, route, r)
+    }
+    fn finish_replay(&self, state: &mut State, route: &RouteId, r: &PolicyRevision) -> Result<(), PolicyOpError> {
+        if self.revision_backend()?.active(route)?.is_some_and(|a| a.number == r.number) { self.publish_revision(state, route, r)?; }
+        Ok(())
+    }
+    fn finish_publication(&self, state: &mut State, route: &RouteId, r: &PolicyRevision) -> Result<(), PolicyOpError> {
+        let index = state.unit(route.as_str()).map_err(|_| PolicyOpError::UnknownRoute)?;
+        {
             let unit = &mut state.units[index];
             let published = unit.routes.iter().find(|p| p.id() == route.as_str()).ok_or(PolicyOpError::Unavailable)?;
             let snapshot = published.locks().1.read().map_err(|_| PolicyOpError::Unavailable)?;
             let doc = self.check_draft(unit, route, &r.policy_toml, &snapshot).map_err(|_| PolicyOpError::Unavailable)?;
             let (compiled, change) = self.compile(&doc, route, &snapshot).map_err(|_| PolicyOpError::Unavailable)?;
             let mut policy = published.locks().0.write().map_err(|_| PolicyOpError::Unavailable)?;
-            self.reset_membership(change.as_ref(), &policy).map_err(|_| PolicyOpError::Unavailable)?;
-            let old = policy.clone();
-            *policy = compiled.clone();
-            if let Some(fence) = published.fence() { fence.publish(&old, &compiled); }
+            let predecessor = unit.revisions.read().map_err(|_| PolicyOpError::Unavailable)?.policy.clone();
+            self.publish_compiled(route, published, &mut policy, &compiled, change.as_ref(), r, &predecessor)?;
             match &published.route {
                 Route::Postgres(c) => *c.policy_revision.write().map_err(|_| PolicyOpError::Unavailable)? = Some(revision_stamp(r)),
                 Route::Spanner(c) => *c.policy_revision.write().map_err(|_| PolicyOpError::Unavailable)? = Some(revision_stamp(r)),
@@ -404,10 +437,7 @@ impl Hub {
                 WriteOutcome::Stale { current: Some(r) } => return Err(PolicyOpError::Stale { current: (&r).into() }),
                 WriteOutcome::Stale { current: None } => return Err(PolicyOpError::MissingRevision),
             };
-            self.reset_membership(change.as_ref(), &policy).map_err(|_| PolicyOpError::Unavailable)?;
-            let old = policy.clone();
-            *policy = compiled.clone();
-            if let Some(fence) = published.fence() { fence.publish(&old, &compiled); }
+            self.publish_compiled(route, published, &mut policy, &compiled, change.as_ref(), &r, &revisions.policy)?;
             let stamp = revision_stamp(&r);
             revisions.policy = stamp.clone();
             if let Some(ctx) = &mut ctx { **ctx = Some(stamp); }
@@ -439,8 +469,12 @@ impl Hub {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let policy_available = !self.state.is_poisoned();
-        let mut ready = policy_available && !state.configured.is_empty();
+        let mut ready = policy_available && !state.configured.is_empty()
+            && self.serving_gate.as_ref().is_none_or(|g| g.allow());
         let mut body = String::new();
+        if self.serving_gate.as_ref().is_some_and(|g| !g.allow()) {
+            body.push_str("serving=unavailable\n");
+        }
         let at = now();
         for (id, unit) in &state.configured {
             let unit = &state.units[*unit];
@@ -574,6 +608,9 @@ impl Hub {
         let sink =
             crate::readlog::open_sink(&first.policy.readlog).map_err(|_| "read log unavailable")?;
         Ok(Arc::new(Self {
+            serving_gate: None,
+            #[cfg(feature = "kubernetes")]
+            activation_tracker: RwLock::new(None),
             log: ReloadableLog(
                 Arc::new(RwLock::new(sink)),
                 Arc::new(RwLock::new(crate::serve::Revisions::default())),
@@ -1176,6 +1213,9 @@ mod tests {
     fn hub() -> Hub {
         let p = policy();
         Hub {
+            serving_gate: None,
+            #[cfg(feature = "kubernetes")]
+            activation_tracker: RwLock::new(None),
             log: ReloadableLog(
                 Arc::new(RwLock::new(crate::readlog::open_sink(&p.readlog).unwrap())),
                 Arc::new(RwLock::new(crate::serve::Revisions::default())),
@@ -1215,6 +1255,20 @@ mod tests {
             watch_ms: None,
             service: crate::policy::ServicePolicySettings::default(),
         }
+    }
+    #[test]
+    fn serving_gate_controls_readiness() {
+        let mut hub = hub();
+        hub.register(test_route("postgres", empty_snapshot())).unwrap();
+        assert!(hub.readiness(true, true).0);
+        let gate = Arc::new(crate::policy::serving::ServingGate::default());
+        hub.serving_gate = Some(gate.clone());
+        assert!(!hub.readiness(true, true).0);
+        assert!(hub.readiness(true, true).1.contains("serving=unavailable"));
+        gate.extend_to(u64::MAX);
+        assert!(hub.readiness(true, true).0);
+        gate.close();
+        assert!(!hub.readiness(true, true).0);
     }
     struct Files {
         dir: PathBuf,
@@ -1872,6 +1926,7 @@ mod tests {
         .unwrap();
         let ctx = Arc::new(SpannerContext {
             fence: Default::default(),
+                serving_gate: None,
             authority: runtime.authority.clone(),
             registry: runtime.registry.clone(),
             route: crate::state::model::RouteId::new("spanner-native").unwrap(),
@@ -1997,6 +2052,7 @@ mod tests {
         let h = hub();
         let ctx = Arc::new(GatewayContext {
             fence: Default::default(),
+                serving_gate: None,
             authority: runtime.authority.clone(), registry: runtime.registry.clone(), route: id("postgres"),
             policy: RwLock::new(Arc::new(policy())), policy_revision: RwLock::new(None),
             snapshot: RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec!["public".into()], 0))),
@@ -2727,5 +2783,37 @@ mod tests {
             bindings::BindingStatus::NeedsRepair);
         assert_eq!(ctx.policy.read().unwrap().treatment(&customer_column("email")), Some(&Treatment::Masked { placeholder: None }));
         assert_eq!(ctx.fence.epoch(), initial + 1);
+    }
+
+    #[test]
+    fn follower_adoption_refuses_regression_and_file_ownership_without_revision_write() {
+        let files = Files::new();
+        let h = Hub::new(&[(id("postgres"), files.a.clone())], None, Default::default()).unwrap();
+        let store = binding_store(&files); h.set_store(store.clone()).unwrap();
+        h.set_revision_store(Arc::new(crate::policy::LocalRevisionStore::new(store))).unwrap();
+        let fixture = crate::pgwire::session::tests::Fixture::new(); let ctx = fixture.ctx.clone();
+        *ctx.snapshot.write().unwrap() = Arc::new(customers(&[("email",1)]));
+        h.register(Route::Postgres(ctx.clone())).unwrap(); let route = id("postgres");
+        let original = h.import_policy(&route,"admin",None).unwrap();
+        let initial = ctx.fence.epoch(); let slot = ctx.fence.register(); slot.begin(&ctx.fence);
+        let mut revision = original.clone(); revision.number += 1; revision.policy_toml = masked_toml().into(); revision.policy_sha256 = hash(revision.policy_toml.as_bytes());
+        h.adopt_revision(&route,&revision).unwrap();
+        assert_eq!(ctx.fence.epoch(),initial+1); assert_eq!(ctx.fence.lagging(initial+1),1);
+        assert_eq!(h.active_revision(&route).unwrap(),Some(original.clone()));
+        slot.end(); assert_eq!(ctx.fence.wait_released(initial+1,Duration::ZERO),0);
+        let stale = original.clone();
+        assert!(h.adopt_revision(&route, &stale).is_err());
+        assert_eq!(h.policy_revision_for(&route), Some(revision_stamp(&revision)));
+        h.adopt_revision(&route, &revision).unwrap();
+        revision.number += 1; revision.policy_toml = original.policy_toml; revision.policy_sha256 = hash(revision.policy_toml.as_bytes());
+        h.adopt_revision(&route,&revision).unwrap(); assert_eq!(ctx.fence.epoch(),initial+1);
+        h.route_owners.write().unwrap().insert(route.as_str().into(), Owner::File);
+        let file_policy = ctx.policy.read().unwrap().clone();
+        let mut ahead = revision.clone(); ahead.number += 1; ahead.policy_toml = masked_toml().into();
+        assert!(matches!(h.adopt_revision(&route, &ahead), Err(PolicyOpError::NotServiceOwned)));
+        assert!(Arc::ptr_eq(&file_policy, &ctx.policy.read().unwrap()));
+        h.route_owners.write().unwrap().insert(route.as_str().into(), Owner::Service);
+        revision.number += 1; revision.policy_toml = "invalid policy".into();
+        assert!(h.adopt_revision(&route,&revision).is_err()); assert_eq!(ctx.fence.epoch(),initial+1);
     }
 }

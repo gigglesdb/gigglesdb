@@ -200,6 +200,11 @@ pub mod diff;
 
 /// Revision epochs and synchronous release fencing.
 pub mod fence;
+/// Monotonic serving release gate.
+pub mod serving;
+/// Per-pod serving confirmation leases.
+#[cfg(feature = "kubernetes")]
+pub mod kube_serving;
 pub use fence::{RevisionFence, ReleaseSlot, column_tightens, tightens};
 
 /// Kubernetes policy revision storage.
@@ -209,3 +214,6 @@ pub mod kube_store;
 /// Kubernetes Lease election.
 #[cfg(feature = "kubernetes")]
 pub mod kube_leader;
+
+#[cfg(feature = "kubernetes")]
+pub mod kube_activation;

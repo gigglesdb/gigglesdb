@@ -158,6 +158,14 @@ pub struct KubernetesPolicyStore {
     pub lease_name: String,
     /// Unique candidate pod name.
     pub pod_name: String,
+    /// Downward-API Pod UID for serving Lease garbage collection.
+    pub pod_uid: Option<String>,
+    /// Per-pod serving lease term in seconds.
+    pub serving_lease_secs: u64,
+    /// Per-pod serving renewal interval in milliseconds.
+    pub serving_renew_interval_ms: u64,
+    /// Serving deadline safety margin in milliseconds.
+    pub serving_margin_ms: u64,
     /// Advertised management base URL.
     pub management_url: String,
     /// Lease lifetime in seconds.
@@ -782,10 +790,22 @@ fn dns_label(s: &str) -> bool {
 }
 fn parse_kubernetes_store(v: Value, e: &mut Vec<String>) -> KubernetesPolicyStore {
     let mut m = table(v, &["namespace", "lease_name", "pod_name", "management_url",
-        "lease_duration_secs", "renew_deadline_secs", "retry_period_secs"], "policy_store_kubernetes", e);
+        "lease_duration_secs", "renew_deadline_secs", "retry_period_secs",
+        "pod_uid", "serving_lease_secs", "serving_renew_interval_ms", "serving_margin_ms"], "policy_store_kubernetes", e);
     let namespace: String = req(&mut m, "namespace", e);
     let lease_name: String = get(&mut m, "lease_name", e).unwrap_or_else(|| "nunya-leader".into());
     let pod_name: String = req(&mut m, "pod_name", e);
+    let pod_uid: Option<String> = get(&mut m, "pod_uid", e);
+    if pod_uid.as_ref().is_some_and(|u| u.trim().is_empty()) { err(e, "pod_uid", "expected nonempty UID"); }
+    if !crate::policy::serving::valid_lease_name(&format!("nunya-serving-{pod_name}")) { err(e, "pod_name", "invalid serving Lease name"); }
+    let serving_lease_secs: u64 = get(&mut m, "serving_lease_secs", e).unwrap_or(6);
+    let serving_renew_interval_ms: u64 = get(&mut m, "serving_renew_interval_ms", e).unwrap_or(1000);
+    let serving_margin_ms: u64 = get(&mut m, "serving_margin_ms", e).unwrap_or(1000);
+    let usable = serving_lease_secs.checked_mul(1000).and_then(|t| t.checked_sub(serving_margin_ms));
+    if serving_renew_interval_ms == 0 || i32::try_from(serving_lease_secs).is_err()
+        || usable.is_none_or(|u| u == 0 || serving_renew_interval_ms.checked_mul(2).is_none_or(|i| i >= u)) {
+        err(e, "policy_store_kubernetes", "invalid serving timings");
+    }
     let management_url: String = req(&mut m, "management_url", e);
     for (field, value) in [("namespace", &namespace), ("lease_name", &lease_name)] {
         if !dns_label(value) { err(e, field, "expected DNS label"); }
@@ -804,7 +824,7 @@ fn parse_kubernetes_store(v: Value, e: &mut Vec<String>) -> KubernetesPolicyStor
         || renew_deadline_secs >= lease_duration_secs || i32::try_from(lease_duration_secs).is_err() {
         err(e, "policy_store_kubernetes", "invalid election timings");
     }
-    KubernetesPolicyStore { namespace, lease_name, pod_name, management_url,
+    KubernetesPolicyStore { namespace, lease_name, pod_name, pod_uid, serving_lease_secs, serving_renew_interval_ms, serving_margin_ms, management_url,
         lease_duration_secs, renew_deadline_secs, retry_period_secs }
 }
 fn route_policy(
@@ -1041,6 +1061,23 @@ tls = "disable"
         let mut errors = Vec::new();
         parse_kubernetes_store(Value::String("invalid".into()), &mut errors);
         assert!(!errors.is_empty());
+    }
+    #[test]
+    fn serving_settings_validation() {
+        for settings in ["serving_margin_ms=6000", "serving_margin_ms=7000",
+            "serving_renew_interval_ms=2500", "serving_renew_interval_ms=0",
+            "serving_lease_secs=9223372036854775807", "pod_uid=''",
+            "pod_name='bad_name'"] {
+            let text = if settings.starts_with("pod_name=") { KUBE.replace("pod_name='nunya-abc'", settings) }
+                else { format!("{KUBE}{settings}\n") };
+            let v: Value = toml::from_str(&text).unwrap(); let mut errors = vec![];
+            parse_kubernetes_store(v["policy_store_kubernetes"].clone(), &mut errors);
+            assert!(!errors.is_empty(), "{settings}");
+        }
+        let v: Value = toml::from_str(KUBE).unwrap(); let mut errors = vec![];
+        let k = parse_kubernetes_store(v["policy_store_kubernetes"].clone(), &mut errors);
+        assert!(errors.is_empty());
+        assert_eq!((k.serving_lease_secs, k.serving_renew_interval_ms, k.serving_margin_ms), (6, 1000, 1000));
     }
     #[cfg(feature = "kubernetes")]
     #[test]

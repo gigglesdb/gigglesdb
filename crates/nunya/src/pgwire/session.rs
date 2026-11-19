@@ -81,7 +81,19 @@ struct Active {
     epoch: u64,
     described: bool,
 }
+fn check_serving(ctx: &GatewayContext) -> Result<(), Refusal> {
+    if ctx.serving_gate.as_ref().is_some_and(|g| !g.allow()) {
+        return Err(failure(NyCode::ServingUnavailable));
+    }
+    Ok(())
+}
 fn check_release(ctx: &GatewayContext, release: &ReleaseSlot, active: &mut Active) -> Result<(), Refusal> {
+    if let Err(e) = check_serving(ctx) {
+        let mut record = active.record.clone();
+        record.outcome = Outcome::Refused(NyCode::ServingUnavailable);
+        ctx.readlog.write(&record)?;
+        return Err(e);
+    }
     let epoch = release.begin(&ctx.fence);
     if epoch != active.epoch {
         let current = ctx.policy.read().map_err(|_| protocol())?;
@@ -372,6 +384,13 @@ impl Session {
     pub fn frontend(&mut self, msg: Frontend) -> Actions {
         if matches!(msg, Frontend::Terminate) {
             return Actions {
+                close: true,
+                ..Actions::default()
+            };
+        }
+        if let Err(error) = check_serving(&self.ctx) {
+            return Actions {
+                client: vec![Backend::ErrorResponse(nunya_error(error.code))],
                 close: true,
                 ..Actions::default()
             };
@@ -1282,6 +1301,7 @@ async fn end_connection(
     Ok(())
 }
 async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusal> {
+    check_serving(&ctx)?;
     let mut tls = false;
     let user = loop {
         match agent.startup().await? {
@@ -1328,6 +1348,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
                 protocol: version,
                 params,
             } => {
+                check_serving(&ctx)?;
                 if !tls && !ctx.allow_plaintext {
                     return Err(protocol());
                 }
@@ -1662,6 +1683,7 @@ pub(crate) mod tests {
             .unwrap();
             let ctx = Arc::new(GatewayContext {
                 fence: Default::default(),
+                serving_gate: None,
                 authority: runtime.authority.clone(),
                 registry: runtime.registry.clone(),
                 route: crate::state::model::RouteId::new("postgres").unwrap(),

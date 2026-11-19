@@ -95,6 +95,7 @@ async fn gateway(url: &str, side: &str) -> TestResult<Gateway> {
     )?;
     let context = Arc::new(GatewayContext {
         fence: Default::default(),
+                serving_gate: None,
         authority: runtime.authority.clone(),
         registry: runtime.registry.clone(),
         route: nunya::state::model::RouteId::new("postgres").unwrap(),

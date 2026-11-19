@@ -412,9 +412,24 @@ struct ManagementPolicy {
     store: Arc<dyn crate::state::store::Store>,
 }
 impl ManagementPolicy {
-    fn activation_after_write(&self, route: &crate::state::model::RouteId) -> crate::mgmt::policy::Activation {
-        crate::mgmt::policy::Activation::from_pending(self.hub.fence_for(route)
-            .map_or(0, |fence| fence.wait_released(fence.epoch(), ACTIVATION_WAIT)))
+    fn activation_after_write(&self, route: &crate::state::model::RouteId, revision: u64) -> crate::mgmt::policy::Activation {
+        let start = std::time::Instant::now();
+        loop {
+            let activation = self.activation_for_revision(route, revision);
+            if activation == crate::mgmt::policy::Activation::Active || start.elapsed() >= ACTIVATION_WAIT { return activation; }
+            std::thread::sleep(Duration::from_millis(5).min(ACTIVATION_WAIT.saturating_sub(start.elapsed())));
+        }
+    }
+    fn activation_for_revision(&self, r: &crate::state::model::RouteId, revision: u64) -> crate::mgmt::policy::Activation {
+        let local = self.hub.fence_for(r).map_or(0, |f| f.lagging(f.epoch()));
+        #[cfg(feature = "kubernetes")]
+        if let Some(t) = self.hub.activation_tracker.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if !t.is_leader() { return crate::mgmt::policy::Activation::Unknown; }
+            if t.loosened(r.as_str(), revision) { return crate::mgmt::policy::Activation::Active; }
+            if !t.active(r.as_str(), revision, std::time::Instant::now()) { return crate::mgmt::policy::Activation::Pending { statements: local }; }
+        }
+        let _ = revision;
+        crate::mgmt::policy::Activation::from_pending(local)
     }
     fn write(
         &self,
@@ -433,7 +448,7 @@ impl ManagementPolicy {
         // Hub publication has returned; neither the Hub nor adapter write lock is held
         // while releases finish (their slow path may read the route policy).
         drop(_guard);
-        let activation = self.activation_after_write(route);
+        let activation = self.activation_after_write(route, revision.number);
         Ok(crate::mgmt::policy::PolicyWrite { revision, replayed, activation })
     }
 }
@@ -443,7 +458,8 @@ mod management_policy_tests {
     use crate::mgmt::policy::{Activation, PolicySource};
 
     #[test]
-    fn write_waits_without_adapter_lock_and_replay_reads_live_fence() {
+    #[allow(clippy::result_large_err)] // The mutation closure retains the API's stale-revision summary.
+    fn write_acknowledges_its_revision_without_adapter_lock_and_follower_is_unknown() {
         let fixture = crate::pgwire::session::tests::Fixture::new();
         let dir = std::env::temp_dir().join(format!("activation-{}", crate::token::SessionId::random().to_hex()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -479,8 +495,34 @@ mod management_policy_tests {
             assert!(replay.replayed); assert_eq!(replay.activation, Activation::Active);
         });
         assert_eq!(adapter.activation(&route), Activation::Active);
+        #[cfg(feature = "kubernetes")]
+        {
+            let tracker = Arc::new(crate::policy::kube_activation::ActivationTracker::new(
+                crate::policy::kube_leader::LeaderState::live_for_test(), Duration::from_secs(6)));
+            let mut lease = k8s_openapi::api::coordination::v1::Lease::default();
+            lease.metadata.name = Some("nunya-serving-slow".into()); lease.metadata.resource_version = Some("1".into());
+            tracker.observe(vec![lease], std::time::Instant::now());
+            *adapter.hub.activation_tracker.write().unwrap() = Some(tracker);
+            let start = std::time::Instant::now();
+            let result = adapter.apply(&route,"admin",masked,1,&fp,"apply".into()).unwrap();
+            assert_eq!(result.activation, Activation::Pending { statements: 0 });
+            assert!(start.elapsed() < Duration::from_millis(2300));
+            slot.advance(1);
+            assert!(fixture.ctx.fence.lagging(fixture.ctx.fence.epoch()) > 0);
+            let tracker = adapter.hub.activation_tracker.read().unwrap().as_ref().unwrap().clone();
+            tracker.published(route.as_str(),3,false);
+            // The locally loaded R2 remains pending while R3 is independently active.
+            assert_eq!(adapter.activation(&route), Activation::Pending { statements: 1 });
+            let mut written = result.revision.clone(); written.number = 3;
+            assert_eq!(adapter.write(&route, || Ok(written)).unwrap().activation, Activation::Active);
+            *adapter.hub.activation_tracker.write().unwrap() = Some(Arc::new(crate::policy::kube_activation::ActivationTracker::new(crate::policy::kube_leader::LeaderState::default(), Duration::from_secs(6))));
+            assert_eq!(adapter.activation(&route), Activation::Unknown);
+            assert_eq!(adapter.progress(&route).unwrap()["activation_reason"], "leader owns activation");
+            slot.end();
+            *adapter.hub.activation_tracker.write().unwrap() = None;
+        }
         let unknown = crate::state::model::RouteId::new("unknown").unwrap();
-        assert_eq!(adapter.activation_after_write(&unknown), Activation::Active);
+        assert_eq!(adapter.activation_after_write(&unknown, 0), Activation::Active);
         drop(adapter); drop(fixture);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -488,8 +530,18 @@ mod management_policy_tests {
 #[allow(clippy::result_large_err)] // Internal policy errors retain the stale revision for the API.
 impl crate::mgmt::policy::PolicySource for ManagementPolicy {
     fn activation(&self, r: &crate::state::model::RouteId) -> crate::mgmt::policy::Activation {
-        crate::mgmt::policy::Activation::from_pending(self.hub.fence_for(r)
-            .map_or(0, |fence| fence.lagging(fence.epoch())))
+        let revision = self.hub.policy_revision_for(r).and_then(|s| s.strip_prefix("rev-").and_then(|s| s.split('-').next()).and_then(|s| s.parse().ok())).unwrap_or(0);
+        self.activation_for_revision(r, revision)
+    }
+    fn progress(&self, r: &crate::state::model::RouteId) -> Option<serde_json::Value> {
+        #[cfg(feature = "kubernetes")]
+        if let Some(t) = self.hub.activation_tracker.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let mut status = t.status(r.as_str(), std::time::Instant::now());
+            status["loaded_revision"] = serde_json::json!(self.hub.policy_revision_for(r).and_then(|s| s.strip_prefix("rev-").and_then(|s| s.split('-').next()).and_then(|s| s.parse::<u64>().ok())).unwrap_or(0));
+            status["gate_open"] = serde_json::json!(self.hub.serving_gate.as_ref().is_some_and(|g| g.allow()));
+            return Some(status);
+        }
+        let _ = r; None
     }
     fn record_rejection(&self, r: &crate::state::model::RouteId, rejection: crate::mgmt::policy::PolicyRejection) {
         self.rejections.lock().unwrap_or_else(|e| e.into_inner()).insert(r.clone(), rejection);
@@ -655,6 +707,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         leadership = None;
         revision_store = Arc::new(crate::policy::LocalRevisionStore::new(runtime.store()));
     }
+    #[cfg(feature = "kubernetes")]
+    let serving_client = elector.as_ref().map(|(client, candidate)| (client.clone(), candidate.state()));
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     #[cfg(feature = "kubernetes")]
     let election_task = if let Some((_, candidate)) = elector {
@@ -665,7 +719,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         }).await.map_err(|_| "Kubernetes election unavailable")?;
         Some(ElectionTask { shutdown: shutdown.clone(), task: tokio::spawn(candidate.run(rx.clone())) })
     } else { None };
-    let hub = if config.policy_store == crate::config::PolicyStore::Kubernetes {
+    let mut hub = if config.policy_store == crate::config::PolicyStore::Kubernetes {
         let store = revision_store.clone();
         let routes = policy_routes.clone();
         let file_owners = config.file_policy_routes.clone();
@@ -680,9 +734,24 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         crate::reload::Hub::release_file_owners(revision_store.as_ref(), &config.file_policy_routes)?;
         crate::reload::Hub::new_with_revision_store(&policy_routes, config.policy_watch_ms, config.policy_settings.clone(), Some(revision_store.as_ref()))?
     };
+    if config.policy_store == crate::config::PolicyStore::Kubernetes {
+        Arc::get_mut(&mut hub).ok_or("policy hub already shared")?.serving_gate =
+            Some(Arc::new(crate::policy::serving::ServingGate::default()));
+    }
     hub.set_store(runtime.store())?;
     hub.set_file_owners(&config.file_policy_routes)?;
     hub.set_revision_store(revision_store)?;
+    #[cfg(feature = "kubernetes")]
+    let _serving_task = if let Some((client, leader)) = serving_client {
+        let k = config.policy_store_kubernetes.clone().ok_or("Kubernetes settings unavailable")?;
+        let gate = hub.serving_gate.clone().ok_or("serving gate unavailable")?;
+        let tracker = Arc::new(crate::policy::kube_activation::ActivationTracker::new(leader, Duration::from_secs(k.serving_lease_secs)));
+        *hub.activation_tracker.write().map_err(|_| "activation unavailable")? = Some(tracker.clone());
+        let renewer = crate::policy::kube_serving::ServingRenewer::new(client, k,
+            policy_routes.iter().map(|(route, _)| route.clone()).collect(),
+            Arc::new(ServingPolicies(hub.clone())), gate, tracker).map_err(|_| "invalid serving configuration")?;
+        Some(AbortTask(tokio::spawn(renewer.run(rx.clone()))))
+    } else { None };
     hub.set_authority(Arc::downgrade(&runtime.authority))?;
     let admins: crate::mgmt::routes::Admins = Arc::new(std::sync::RwLock::new(config.management.as_ref().map(|m| {
         m.admins.iter().map(|a| (a.name.clone(), crate::pgwire::auth::ScramVerifier {
@@ -818,6 +887,26 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     drop(runtime);
     result
 }
+#[cfg(feature = "kubernetes")]
+struct ServingPolicies(Arc<crate::reload::Hub>);
+#[cfg(feature = "kubernetes")]
+impl crate::policy::kube_serving::LoadedPolicies for ServingPolicies {
+    fn loaded(&self, route: &crate::state::model::RouteId) -> Result<u64, crate::policy::kube_serving::ServingError> {
+        use crate::policy::kube_serving::ServingError;
+        if self.0.fence_for(route).is_none() { return Err(ServingError::Unavailable); }
+        let stamp = self.0.policy_revision_for(route).ok_or(ServingError::Unavailable)?;
+        if let Some(rest) = stamp.strip_prefix("rev-") {
+            rest.split('-').next().and_then(|n| n.parse().ok()).ok_or(ServingError::Invalid)
+        } else { Ok(0) }
+    }
+    fn adopt(&self, route: &crate::state::model::RouteId, r: &crate::policy::PolicyRevision) -> Result<(), crate::policy::kube_serving::ServingError> {
+        use crate::policy::kube_serving::ServingError;
+        self.0.adopt_revision(route, r).map_err(|_| ServingError::Invalid)
+    }
+    fn released(&self, route: &crate::state::model::RouteId, timeout: Duration) -> bool {
+        self.0.fence_for(route).is_some_and(|f| f.wait_released(f.epoch(), timeout) == 0)
+    }
+}
 async fn stopped(mut rx: tokio::sync::watch::Receiver<bool>) {
     loop {
         if *rx.borrow_and_update() {
@@ -876,6 +965,7 @@ async fn run_postgres(
         crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
     let ctx = Arc::new(GatewayContext {
         fence: Default::default(),
+        serving_gate: hub.serving_gate.clone(),
         authority: state.0.authority.clone(),
         registry: state.0.registry.clone(),
         route: state.1,

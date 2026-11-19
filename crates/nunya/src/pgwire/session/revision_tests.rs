@@ -275,3 +275,56 @@ fn fence_release_check_cost() {
     println!("PERF backend rows={ROWS} total_ms={:.3} ns_per_row={:.2}", backend.as_secs_f64() * 1000.0, backend.as_nanos() as f64 / ROWS as f64);
     println!("PERF release-check rows={ROWS} total_ms={:.3} ns_per_row={:.2}", check.as_secs_f64() * 1000.0, check.as_nanos() as f64 / ROWS as f64);
 }
+
+#[test]
+fn serving_gate_refuses_simple_and_portal_rows() {
+    for extended in [false, true] {
+        let mut f = Fixture::new();
+        let gate = Arc::new(crate::policy::serving::ServingGate::default());
+        Arc::get_mut(&mut f.ctx).unwrap().serving_gate = Some(gate.clone());
+        gate.extend_to(u64::MAX);
+        let mut s = f.session();
+        if extended {
+            prepare_admission_portal(&mut s, "SELECT value FROM items");
+            s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 });
+        } else { s.frontend(Frontend::Query("SELECT value FROM items".into())); }
+        s.backend(Backend::RowDescription(vec![field()]));
+        gate.close();
+        let out = revision_row(&mut s);
+        assert!(out.close);
+        assert!(matches!(out.client.as_slice(), [Backend::ErrorResponse(fields)]
+            if fields.iter().any(|(k, v)| *k == b'C' && v == "NY013")));
+        assert!(f.identities.lock().unwrap().iter().any(|r| matches!(r.outcome, Outcome::Refused(NyCode::ServingUnavailable))));
+    }
+}
+#[tokio::test]
+async fn serving_gate_refuses_new_connection() {
+    let mut f = Fixture::new();
+    Arc::get_mut(&mut f.ctx).unwrap().serving_gate = Some(Arc::default());
+    let (client, server) = tokio::io::duplex(4096);
+    let mut agent = Agent { io: Box::new(server), buffer: BytesMut::new(), ctx: f.ctx.clone() };
+    // Refusal precedes startup/authentication and requires no upstream connection.
+    let result = serve(&mut agent, f.ctx.clone()).await;
+    assert_eq!(result.unwrap_err().code, NyCode::ServingUnavailable);
+    drop(client);
+}
+
+#[test]
+fn serving_gate_refuses_resumed_portal_execute() {
+    let mut f = Fixture::new();
+    let gate = Arc::new(crate::policy::serving::ServingGate::default());
+    Arc::get_mut(&mut f.ctx).unwrap().serving_gate = Some(gate.clone());
+    gate.extend_to(u64::MAX);
+    let mut s = f.session();
+    prepare_admission_portal(&mut s, "SELECT value FROM items");
+    s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 1 });
+    s.backend(Backend::RowDescription(vec![field()]));
+    assert_revision_row(&revision_row(&mut s), true);
+    s.release_done();
+    s.backend(Backend::PortalSuspended);
+    gate.close();
+    let out = s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 1 });
+    assert!(out.close); assert!(out.upstream.is_empty());
+    assert!(matches!(out.client.as_slice(), [Backend::ErrorResponse(fields)]
+        if fields.iter().any(|(k, v)| *k == b'C' && v == "NY013")));
+}

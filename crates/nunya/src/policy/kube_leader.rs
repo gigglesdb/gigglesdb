@@ -29,6 +29,7 @@ impl Clock for RealClock {
 #[derive(Default)]
 struct Published {
     until: Option<Duration>,
+    generation: u64,
     url: Option<String>,
 }
 /// Cheap shared leadership view; expired renewals are fenced even during a hung API call.
@@ -54,6 +55,12 @@ impl LeaderState {
             .until
             .is_some_and(|d| self.clock.mono() < d)
     }
+    #[cfg(test)]
+    pub(crate) fn live_for_test() -> Self {
+        let s = Self::default(); s.publish(Some(Duration::MAX), None); s
+    }
+    /// Acquisition generation used to discard previous activation observations.
+    pub fn generation(&self) -> u64 { self.view.read().unwrap_or_else(std::sync::PoisonError::into_inner).generation }
     /// Last observed leader management URL, if known.
     pub fn leader_url(&self) -> Option<String> {
         self.snapshot().1
@@ -73,10 +80,9 @@ impl LeaderState {
         (leader, url)
     }
     fn publish(&self, until: Option<Duration>, url: Option<String>) {
-        *self
-            .view
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Published { until, url };
+        let mut view = self.view.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = view.generation + u64::from(until.is_some() && view.until.is_none_or(|d| self.clock.mono() >= d));
+        *view = Published { until, url, generation };
     }
 }
 impl crate::mgmt::routes::Leadership for LeaderState {
@@ -638,5 +644,41 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn sigkill_takeover_uses_challenger_clock_and_fences_old_activation() {
+        let api = Arc::new(Fake::default());
+        let old_clock = Arc::new(FakeClock::default());
+        let challenger_clock = Arc::new(FakeClock::default());
+        let a = candidate(api.clone(), old_clock.clone(), "a");
+        let b = candidate(api, challenger_clock.clone(), "b");
+        a.tick().unwrap(); // Simulated SIGKILL: no stop(), no release.
+        let tracker = super::super::kube_activation::ActivationTracker::new(a.state.clone(), Duration::from_secs(6));
+        tracker.published("a", 2, false);
+        assert!(tracker.active("a", 2, Instant::now()));
+        b.tick().unwrap();
+        challenger_clock.0.store(15, Ordering::SeqCst); b.tick().unwrap(); assert!(!b.state.is_leader());
+        challenger_clock.0.store(16, Ordering::SeqCst); b.tick().unwrap(); assert!(b.state.is_leader());
+        // Paused old process has not observed its own clock yet.
+        assert!(a.state.is_leader());
+        old_clock.0.store(10, Ordering::SeqCst);
+        assert!(!a.state.is_leader()); assert!(!tracker.active("a", 2, Instant::now()));
+    }
+
+    #[test]
+    fn reacquisition_resets_existing_tracker_observation_age() {
+        let state = LeaderState::live_for_test();
+        let tracker = super::super::kube_activation::ActivationTracker::new(state.clone(),Duration::from_secs(6));
+        let now = Instant::now(); let mut lease = Lease::default();
+        lease.metadata.name = Some("nunya-serving-stopped".into()); lease.metadata.resource_version = Some("1".into());
+        lease.spec = Some(k8s_openapi::api::coordination::v1::LeaseSpec { holder_identity: Some("stopped".into()), lease_duration_seconds: Some(6), ..Default::default() });
+        tracker.observe(vec![lease.clone()],now);
+        assert!(tracker.active("a",2,now+Duration::from_secs(6)));
+        state.publish(None,None); state.publish(Some(Duration::MAX),None);
+        assert!(!tracker.active("a",2,now+Duration::from_secs(6)));
+        tracker.observe(vec![lease],now+Duration::from_secs(6));
+        assert!(!tracker.active("a",2,now+Duration::from_secs(11)));
+        assert!(tracker.active("a",2,now+Duration::from_secs(12)));
     }
 }

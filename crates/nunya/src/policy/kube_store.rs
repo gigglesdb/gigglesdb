@@ -51,6 +51,7 @@ impl From<ApiFailure> for RevisionStoreError {
 }
 trait Backend: Send + Sync {
     fn head(&self, name: &str) -> ApiResult<Option<VersionedHead>>;
+    fn head_timeout(&self, name: &str, _timeout: std::time::Duration) -> ApiResult<Option<VersionedHead>> { self.head(name) }
     fn replace(&self, name: &str, head: &Head, rv: Option<&str>) -> ApiResult<()>;
     fn copy(&self, name: &str) -> ApiResult<Option<PolicyRevision>>;
     fn create_copy(&self, name: &str, revision: &PolicyRevision) -> ApiResult<()>;
@@ -112,6 +113,27 @@ impl KubernetesRevisionStore {
             }),
             leader: None,
         }
+    }
+    /// Construct a serving-loop reader with a bounded per-call deadline.
+    pub fn serving_reader(client: Client, namespace: &str, timeout: std::time::Duration) -> Self {
+        Self { backend: Arc::new(KubeBackend {
+            heads: Api::namespaced_with(client.clone(), namespace, &resource("NunyaPolicy", "nunyapolicies")),
+            copies: Api::namespaced_with(client, namespace, &resource("NunyaPolicyRevision", "nunyapolicyrevisions")),
+            bridge: RuntimeBridge::with_timeout(timeout),
+        }), leader: None }
+    }
+    /// Quorum GET of the head only, without history repair.
+    pub fn head_number(&self, route: &RouteId) -> Result<u64, RevisionStoreError> {
+        Ok(self.serving_head(route, API_TIMEOUT)?.map_or(0, |r| r.number))
+    }
+    /// Fetch only the active service head within the serving cycle budget.
+    pub fn serving_head(&self, route: &RouteId, timeout: std::time::Duration) -> Result<Option<PolicyRevision>, RevisionStoreError> {
+        let h = self.backend.head_timeout(&name(route)?, timeout)?;
+        if let Some(h) = h {
+            validate(&h.spec, route)?;
+            if h.spec.owner == "service" { return Ok(h.spec.revision); }
+        }
+        Ok(None)
     }
     /// Fence commits using the supplied election state.
     pub fn with_leader(mut self, leader: LeaderState) -> Self {
@@ -379,9 +401,11 @@ pub(crate) const API_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub(crate) struct RuntimeBridge {
     handle: Option<Handle>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
+    timeout: std::time::Duration,
 }
 impl RuntimeBridge {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new() -> Self { Self::with_timeout(API_TIMEOUT) }
+    pub(crate) fn with_timeout(timeout: std::time::Duration) -> Self {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let started = std::thread::Builder::new()
@@ -404,6 +428,7 @@ impl RuntimeBridge {
         Self {
             handle: if started { ready_rx.recv().ok() } else { None },
             stop: Some(stop_tx),
+            timeout,
         }
     }
     // std receive also works on entered spawn_blocking threads. Worker callers may block;
@@ -412,11 +437,15 @@ impl RuntimeBridge {
         &self,
         future: impl std::future::Future<Output = T> + Send + 'static,
     ) -> Option<T> {
+        self.run_timeout(self.timeout, future)
+    }
+    pub(crate) fn run_timeout<T: Send + 'static>(&self, timeout: std::time::Duration,
+        future: impl std::future::Future<Output = T> + Send + 'static) -> Option<T> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.handle.as_ref()?.spawn(async move {
-            let _ = tx.send(tokio::time::timeout(API_TIMEOUT, future).await.ok());
+            let _ = tx.send(tokio::time::timeout(timeout, future).await.ok());
         });
-        rx.recv_timeout(API_TIMEOUT).ok().flatten()
+        rx.recv_timeout(timeout).ok().flatten()
     }
 }
 impl Drop for RuntimeBridge {
@@ -472,12 +501,13 @@ fn decode_copy(object: DynamicObject) -> ApiResult<PolicyRevision> {
     Ok(r)
 }
 impl Backend for KubeBackend {
-    fn head(&self, name: &str) -> ApiResult<Option<VersionedHead>> {
-        self.run({
+    fn head(&self, name: &str) -> ApiResult<Option<VersionedHead>> { self.head_timeout(name, API_TIMEOUT) }
+    fn head_timeout(&self, name: &str, timeout: std::time::Duration) -> ApiResult<Option<VersionedHead>> {
+        self.bridge.run_timeout(timeout, {
             let api = self.heads.clone();
             let name = name.to_owned();
             async move { api.get_opt(&name).await }
-        })?
+        }).ok_or(ApiFailure::Unavailable)?.map_err(api_error)?
         .map(|o| {
             Ok(VersionedHead {
                 rv: o.metadata.resource_version.ok_or(ApiFailure::Corrupt)?,
@@ -764,6 +794,17 @@ mod tests {
         assert_eq!(s.get(&route, 1).unwrap(), Some(r));
         assert!(s.get(&route, 3).unwrap().is_none());
         assert!(!format!("{:?}", s.active(&route)).contains("private policy body"));
+    }
+    #[test]
+    fn file_owned_head_with_active_number_is_not_a_serving_revision() {
+        let (_, s) = setup();
+        let route = route();
+        let r = written(s.write(&route, None, draft(None, "one")).unwrap());
+        assert_eq!(s.head_number(&route).unwrap(), r.number);
+        s.release_to_file(&route).unwrap();
+        assert_eq!(s.active(&route).unwrap(), Some(r));
+        assert_eq!(s.head_number(&route).unwrap(), 0);
+        assert!(s.serving_head(&route, API_TIMEOUT).unwrap().is_none());
     }
     #[test]
     fn retry_survives_leader_change_and_checks_full_digest() {
@@ -1103,5 +1144,29 @@ mod tests {
             assert_eq!(d["spec"]["scope"], "Namespaced");
             assert_eq!(d["spec"]["group"], GROUP);
         }
+    }
+
+    #[test]
+    fn resumed_old_writer_stale_resource_version_cannot_replace_successor() {
+        let (fake, s) = setup();
+        written(s.write(&route(), None, draft(None,"old")).unwrap());
+        let stale = fake.head(&name(&route()).unwrap()).ok().flatten().unwrap();
+        let successor = written(s.write(&route(), Some(1), draft(None,"successor")).unwrap());
+        struct PausedReader { backend: Arc<Fake>, cached: Mutex<Option<VersionedHead>> }
+        impl Backend for PausedReader {
+            fn head(&self, name: &str) -> ApiResult<Option<VersionedHead>> {
+                if let Some(cached) = self.cached.lock().unwrap().take() { Ok(Some(cached)) } else { self.backend.head(name) }
+            }
+            fn replace(&self, name: &str, head: &Head, rv: Option<&str>) -> ApiResult<()> { self.backend.replace(name,head,rv) }
+            fn copy(&self, name: &str) -> ApiResult<Option<PolicyRevision>> { self.backend.copy(name) }
+            fn create_copy(&self, name: &str, r: &PolicyRevision) -> ApiResult<()> { self.backend.create_copy(name,r) }
+            fn copies(&self, selector: &str) -> ApiResult<Vec<PolicyRevision>> { self.backend.copies(selector) }
+        }
+        // Resume a write paused after its head read; bypass the old leadership fence.
+        let resumed = KubernetesRevisionStore { backend: Arc::new(PausedReader { backend: fake, cached: Mutex::new(Some(stale)) }), leader: None };
+        assert!(matches!(resumed.write(&route(),Some(1),draft(None,"resumed")).unwrap(), WriteOutcome::Stale { current: Some(ref r) } if r == &successor));
+        assert_eq!(s.active(&route()).unwrap(), Some(successor));
+        let next = written(s.write(&route(), Some(2), draft(None,"next")).unwrap());
+        assert_eq!(next.number,3);
     }
 }

@@ -60,6 +60,8 @@ impl From<crate::reload::PolicyOpError> for PolicyError {
 pub enum Activation {
     /// No older release remains.
     Active,
+    /// Activation is owned by the leader.
+    Unknown,
     /// Older releases remain inside their release region.
     Pending { statements: usize },
 }
@@ -70,11 +72,11 @@ impl Activation {
     }
     /// Public activation state.
     pub fn state(self) -> &'static str {
-        match self { Self::Active => "active", Self::Pending { .. } => "pending" }
+        match self { Self::Active => "active", Self::Unknown => "unknown", Self::Pending { .. } => "pending" }
     }
     /// Count of releases checked under an older epoch.
     pub fn pending_statements(self) -> usize {
-        match self { Self::Active => 0, Self::Pending { statements } => statements }
+        match self { Self::Active | Self::Unknown => 0, Self::Pending { statements } => statements }
     }
 }
 impl serde::Serialize for Activation {
@@ -107,6 +109,8 @@ pub struct PolicyWrite {
 pub trait PolicySource: Send + Sync {
     /// Live activation without waiting.
     fn activation(&self, _r: &RouteId) -> Activation { Activation::Active }
+    /// Optional cluster and local serving progress.
+    fn progress(&self, _r: &RouteId) -> Option<serde_json::Value> { None }
     /// Retain only value-free refusal metadata.
     fn record_rejection(&self, _r: &RouteId, _rejection: PolicyRejection) {}
     /// Most recent refused apply or rollback.
@@ -273,7 +277,7 @@ pub(super) fn handle(
             "" => {
                 let activation = source.activation(&route);
                 return Ok(ok(
-                    json!({"owner":match source.owner(&route)? {Owner::File=>"file",Owner::Service=>"service"},"published_revision":source.published(&route)?,"active_revision":active.as_ref().map(RevisionSummary::from),"catalog_fingerprint":fp,"activation":{"state":activation,"pending_statements":activation.pending_statements()},"last_rejected":source.last_rejected(&route)}),
+                    json!({"owner":match source.owner(&route)? {Owner::File=>"file",Owner::Service=>"service"},"published_revision":source.published(&route)?,"active_revision":active.as_ref().map(RevisionSummary::from),"catalog_fingerprint":fp,"activation":{"state":activation,"pending_statements":activation.pending_statements()},"last_rejected":source.last_rejected(&route),"serving":source.progress(&route)}),
                 ));
             }
             "effective" => {
@@ -380,7 +384,7 @@ pub(super) fn handle(
                 }
                 (Some(r.number),
                 activation.state(),
-                ok(json!({"revision":RevisionSummary::from(&r),"replayed":replayed,"activation":activation,"pending_statements":activation.pending_statements()})),
+                ok(json!({"revision":RevisionSummary::from(&r),"replayed":replayed,"activation":activation,"pending_statements":activation.pending_statements(),"serving":source.progress(&route)})),
             )},
             Err(e) => {
                 if matches!(&e, PolicyError::Stale(_))

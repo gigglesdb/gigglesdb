@@ -20,6 +20,7 @@ data:
     [policy_store_kubernetes]
     namespace = "${POD_NAMESPACE}"
     pod_name = "${POD_NAME}"
+    pod_uid = "${POD_UID}"
     management_url = "https://${POD_IP}:6481"
     lease_name = "nunya-leader"
     lease_duration_secs = 15
@@ -71,6 +72,7 @@ spec:
               while IFS= read -r line; do
                 case "$line" in
                   *'${POD_NAMESPACE}'*) printf 'namespace = "%s"\n' "$POD_NAMESPACE" ;;
+                  *'${POD_UID}'*) printf 'pod_uid = "%s"\n' "$POD_UID" ;;
                   *'${POD_NAME}'*) printf 'pod_name = "%s"\n' "$POD_NAME" ;;
                   *'${POD_IP}'*) printf 'management_url = "https://%s:6481"\n' "$POD_IP" ;;
                   *'${ADMIN_VERIFIER}'*) printf 'verifier = "%s"\n' "$ADMIN_VERIFIER" ;;
@@ -82,6 +84,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -107,6 +113,10 @@ spec:
           image: nunya:kubernetes-preview
           args: [serve, --config, /config/nunya.toml]
           env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: POD_NAME
               valueFrom:
                 fieldRef:

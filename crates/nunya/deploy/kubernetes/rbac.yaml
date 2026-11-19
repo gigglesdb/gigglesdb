@@ -16,8 +16,8 @@ rules:
     verbs: [get, list, create]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    resourceNames: [nunya-leader]
-    verbs: [get, update]
+    # Dynamic per-pod serving names and leader listing cannot be name-scoped.
+    verbs: [get, update, list]
   # Kubernetes cannot restrict create by resourceNames.
   - apiGroups: [coordination.k8s.io]
     resources: [leases]

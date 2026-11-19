@@ -68,6 +68,8 @@ pub type PolicyAndSnapshot = (Arc<Policy>, Option<String>, Arc<Snapshot>);
 pub struct GatewayContext {
     /// Shared policy revision release fence.
     pub fence: Arc<crate::policy::RevisionFence>,
+    /// Optional per-pod serving deadline.
+    pub serving_gate: Option<Arc<crate::policy::serving::ServingGate>>,
     /// Shared durable session authority.
     pub authority: Arc<crate::state::authority::Authority>,
     /// Shared live connection registry.

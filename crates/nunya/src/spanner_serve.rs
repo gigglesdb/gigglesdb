@@ -163,6 +163,7 @@ pub(crate) async fn run_spanner_with_hub(
         } else { policy };
         let ctx = Arc::new(SpannerContext {
             fence: Default::default(),
+            serving_gate: hub.as_ref().and_then(|h| h.serving_gate.clone()),
             authority: state.authority,
             registry: state.registry,
             route: state.route,

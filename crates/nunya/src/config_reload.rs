@@ -1061,7 +1061,7 @@ key_file='key'
         new.policy_store = running.policy_store;
         new.policy_store_kubernetes = Some(crate::config::KubernetesPolicyStore {
             namespace: "default".into(), lease_name: "nunya-leader".into(),
-            pod_name: "pod".into(), management_url: "https://pod:6481".into(),
+            pod_name: "pod".into(), pod_uid: None, serving_lease_secs: 6, serving_renew_interval_ms: 1000, serving_margin_ms: 1000, management_url: "https://pod:6481".into(),
             lease_duration_secs: 15, renew_deadline_secs: 10, retry_period_secs: 2,
         });
         assert_eq!(classify(&running, &new).restart_only, ["policy_store_kubernetes"]);

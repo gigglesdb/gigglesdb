@@ -55,6 +55,8 @@ pub enum SpannerUpstream {
 pub struct SpannerContext {
     /// Shared policy revision release fence.
     pub fence: Arc<crate::policy::RevisionFence>,
+    /// Optional per-pod serving deadline.
+    pub serving_gate: Option<Arc<crate::policy::serving::ServingGate>>,
     /// Shared durable session authority.
     pub authority: Arc<crate::state::authority::Authority>,
     /// Shared live connection registry.
@@ -415,6 +417,9 @@ impl RevisionGuard {
         }
     }
     fn check(&mut self, epoch: u64, write: bool) -> Result<(), Status> {
+        if self.ctx.serving_gate.as_ref().is_some_and(|g| !g.allow()) {
+            return Err(after_forward(nunya_status(NyCode::ServingUnavailable), write));
+        }
         if epoch != self.epoch {
             let current = self.ctx.policy.read().map_err(|_| after_forward(invalid(), write))?;
             if tightens(&self.policy, &current) {
@@ -708,6 +713,9 @@ fn tls_incoming_with(
 
 impl NunyaSpanner {
     fn authenticate<T>(&self, req: &Request<T>) -> Result<Authenticated, Status> {
+        if self.ctx.serving_gate.as_ref().is_some_and(|g| !g.allow()) {
+            return Err(nunya_status(NyCode::ServingUnavailable));
+        }
         auth::authenticate(
             req.metadata(),
             &self.ctx.authority,
@@ -2856,6 +2864,7 @@ mod tests {
             .unwrap();
             let ctx = Arc::new(SpannerContext {
                 fence: Default::default(),
+                serving_gate: None,
                 authority: runtime.authority.clone(),
                 registry: runtime.registry.clone(),
                 route: crate::state::model::RouteId::new("spanner-native").unwrap(),
@@ -4806,6 +4815,21 @@ mod tests {
             false,
         );
     }
+    #[tokio::test]
+    async fn serving_gate_refuses_buffered_stream_and_unary_read() {
+        let mut f = Fixture::new().await;
+        let gate = Arc::new(crate::policy::serving::ServingGate::default());
+        Arc::get_mut(&mut f.svc.ctx).unwrap().serving_gate = Some(gate.clone());
+        gate.extend_to(u64::MAX);
+        let read_request = customer_read(&f).await;
+        let mut stream = revision_stream(&f, true).await;
+        assert!(stream.next().await.unwrap().is_ok());
+        wait_for(|| f.fake.emitted.load(std::sync::atomic::Ordering::Relaxed) >= 10).await;
+        gate.close();
+        assert_eq!(stream.next().await.unwrap().unwrap_err().code(), tonic::Code::Unavailable);
+        assert!(stream.next().await.is_none());
+        assert_eq!(f.svc.read(f.request(read_request, "alice")).await.unwrap_err().code(), tonic::Code::Unavailable);
+    }
     fn revise_column(f: &Fixture, column: &str, treatment: Treatment) -> Option<u64> {
         let mut policy = f.svc.ctx.policy.write().unwrap();
         let old = policy.clone();
@@ -4816,6 +4840,23 @@ mod tests {
         let next = Arc::new(next);
         *policy = next.clone();
         f.svc.ctx.fence.publish(&old, &next)
+    }
+    #[tokio::test]
+    async fn expired_gate_after_forwarded_dml_is_write_outcome_unknown() {
+        let mut f = Fixture::new().await;
+        let gate = Arc::new(crate::policy::serving::ServingGate::default());
+        gate.extend_to(u64::MAX);
+        Arc::get_mut(&mut f.svc.ctx).unwrap().serving_gate = Some(gate.clone());
+        let req = f.query("SELECT email FROM customers").await;
+        let who = f.svc.authenticate(&f.request((), "alice")).unwrap();
+        let (policy, _, revision) = f.svc.configuration().unwrap();
+        let epoch = f.svc.ctx.fence.epoch();
+        let mut guard = RevisionGuard::new(&f.svc, &who, policy, epoch, revision.as_deref(), &req.sql);
+        gate.close();
+        let e = guard.check(epoch, true).unwrap_err();
+        assert!(e.message().contains("NY012"));
+        assert_ne!(e.code(), tonic::Code::Unavailable);
+        assert_eq!(guard.check(epoch, false).unwrap_err().code(), tonic::Code::Unavailable);
     }
     async fn revision_stream(f: &Fixture, read: bool) -> ResultStream {
         f.fake.burst_stream.store(true, std::sync::atomic::Ordering::Relaxed);

@@ -29,6 +29,7 @@ pub fn redact_status(code: Code) -> Status {
 /// Map a Nunya refusal to its fixed public gRPC status.
 pub fn nunya_status(code: NyCode) -> Status {
     let grpc = match code {
+        NyCode::ServingUnavailable => Code::Unavailable,
         NyCode::SessionEnded => Code::PermissionDenied,
         NyCode::WriteOutcomeUnknown => Code::Unknown,
         NyCode::NotAnalysable => Code::InvalidArgument,
@@ -60,7 +61,7 @@ mod tests {
     fn refusals() {
         for code in NyCode::ALL {
             let s = nunya_status(code);
-            assert!(!matches!(
+            assert!(code == NyCode::ServingUnavailable || !matches!(
                 s.code(),
                 Code::Aborted
                     | Code::Unavailable

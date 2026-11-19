@@ -74,7 +74,7 @@ does not reset the session limit. Use this only when the user gave you the value
 
 ### Errors
 
-Nunya uses SQLSTATE codes NY001 to NY012. Follow the action for each code below.
+Nunya uses SQLSTATE codes NY001 to NY013. Follow the action for each code below.
 Do not retry refused query shapes with different spelling, casts or functions to bypass policy.
 
 - NY001: token used outside its domain. Write it only to same-domain columns.
@@ -91,6 +91,8 @@ Do not retry refused query shapes with different spelling, casts or functions to
   replacement access, then read fresh tokens if a new scope is created.
 - NY012: write outcome unknown. Never automatically replay the write. Ask the operator
   to reconcile its outcome with the database before deciding what to do next. Nunya never replays it.
+- NY013: serving lease lapsed on this gateway pod. Reconnect after a short wait and retry
+  reads; for a write that may have been forwarded, treat it as NY012.
 
 Inside a transaction, a refusal aborts it (later statements fail with 25P02).
 Run ROLLBACK, or ROLLBACK TO SAVEPOINT, before continuing.

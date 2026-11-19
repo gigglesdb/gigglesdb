@@ -26,10 +26,12 @@ pub enum NyCode {
     SessionEnded,
     /// write outcome unknown.
     WriteOutcomeUnknown,
+    /// Per-pod serving lease lapsed.
+    ServingUnavailable,
 }
 impl NyCode {
     /// Every gateway refusal code in SQLSTATE order.
-    pub const ALL: [NyCode; 12] = [
+    pub const ALL: [NyCode; 13] = [
         Self::TokenOutsideDomain,
         Self::BlindOperation,
         Self::TokenNotValid,
@@ -42,6 +44,7 @@ impl NyCode {
         Self::ProtocolNotAllowed,
         Self::SessionEnded,
         Self::WriteOutcomeUnknown,
+        Self::ServingUnavailable,
     ];
     /// Return the five-character gateway SQLSTATE.
     pub fn sqlstate(self) -> &'static str {
@@ -58,6 +61,7 @@ impl NyCode {
             Self::ProtocolNotAllowed => "NY010",
             Self::SessionEnded => "NY011",
             Self::WriteOutcomeUnknown => "NY012",
+            Self::ServingUnavailable => "NY013",
         }
     }
     /// Return a fixed message safe to show agents.
@@ -75,6 +79,7 @@ impl NyCode {
             Self::ProtocolNotAllowed => "protocol feature not allowed through the gateway",
             Self::SessionEnded => "access session ended",
             Self::WriteOutcomeUnknown => "write outcome unknown",
+            Self::ServingUnavailable => "serving lease lapsed",
         }
     }
 }
