@@ -2468,11 +2468,11 @@ pub(crate) mod tests {
             fields: vec![customer_column("email"), customer_column("other")], domain: None,
         });
         hub.apply(0, Ok(linked.clone()), Some(hash(b"linked"))).unwrap();
-        assert_eq!(*resets.lock().unwrap(), vec![false]);
+        assert!(resets.lock().unwrap().is_empty());
         hub.apply(0, Ok(linked), Some(hash(b"unchanged"))).unwrap();
-        assert_eq!(resets.lock().unwrap().len(), 1);
+        assert!(resets.lock().unwrap().is_empty());
         hub.apply(0, Ok(doc), Some(hash(b"unlinked"))).unwrap();
-        assert_eq!(*resets.lock().unwrap(), vec![false, true]);
+        assert_eq!(*resets.lock().unwrap(), vec![true]);
         let records = bindings::load(store.as_ref(), &id("a")).unwrap();
         assert!(records.iter().all(|(_, record)| !record.linked));
         assert!(hub.readiness(true, true).0);
@@ -2581,11 +2581,17 @@ pub(crate) mod tests {
         let files = Files::new();
         let hub = tokenize_hub(&files, &["a"]);
         hub.set_store(binding_store(&files)).unwrap();
+        let mut doc = (*hub.state.lock().unwrap().units[0].doc).clone();
+        doc.links.push(crate::policy::LinkRule {
+            fields: vec![customer_column("email"), customer_column("other")],
+            domain: Some(crate::policy::DomainName("shared".into())),
+        });
+        hub.apply(0, Ok(doc), Some(hash(b"declared domain"))).unwrap();
         *hub.reset_callback.write().unwrap() = None;
-        assert!(hub.register(test_route("a", customers(&[("email", 1)]))).is_err());
+        assert!(hub.register(test_route("a", customers(&[("email", 1), ("other", 2)]))).is_err());
         let calls = Arc::new(Mutex::new(0)); let count = calls.clone();
         *hub.reset_callback.write().unwrap() = Some(Arc::new(move |_, _| { *count.lock().unwrap() += 1; Ok(0) }));
-        hub.register(test_route("a", customers(&[("email", 1)]))).unwrap();
+        hub.register(test_route("a", customers(&[("email", 1), ("other", 2)]))).unwrap();
         assert_eq!(*calls.lock().unwrap(), 1);
     }
 

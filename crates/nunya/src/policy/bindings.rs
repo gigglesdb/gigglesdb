@@ -593,7 +593,8 @@ fn apply_with_generator(
     }
     for (identity, record) in bindings.iter().filter(|(_, r)| r.status == BindingStatus::Active) {
         if let Some(domain) = &record.domain
-            && !before.get(identity).is_some_and(|r| r.status == BindingStatus::Active && r.domain.as_ref() == Some(domain)) {
+            && !before.get(identity).is_some_and(|r| r.status == BindingStatus::Active && r.domain.as_ref() == Some(domain))
+            && !fresh_generated_domain(txn.as_ref(), &before, domain)? {
             owed.joined.push((domain.clone(), record.column.clone()));
         }
     }
@@ -1040,6 +1041,19 @@ pub fn load_retired(
     }
     Ok(names)
 }
+// Fresh generated names cannot have tokens in an already-open session. Check all
+// prior statuses: an inactive binding still makes a domain pre-existing.
+fn fresh_generated_domain(
+    read: &dyn ReadTxn,
+    before: &RouteBindings,
+    domain: &DomainName,
+) -> Result<bool, BindingError> {
+    Ok(!before.iter().any(|(_, record)| record.domain.as_ref() == Some(domain))
+        && read.get(Table::DomainNames, &keys::domain_name(domain))
+            .map_err(|_| BindingError::Store)?.is_some()
+        && read.get(Table::RetiredDomains, &keys::domain_name(domain))
+            .map_err(|_| BindingError::Store)?.is_none())
+}
 /// Refresh bindings and report domain membership changes atomically.
 pub fn refresh_membership(
     store: &dyn Store,
@@ -1100,6 +1114,7 @@ pub fn refresh_membership(
                 change.left.push((domain.clone(), record.column.clone()));
             }
     }
+    let read = store.read().map_err(|_| BindingError::Store)?;
     for (identity, record) in after
         .iter()
         .filter(|(_, r)| r.status == BindingStatus::Active)
@@ -1107,7 +1122,8 @@ pub fn refresh_membership(
         if let Some(domain) = &record.domain
             && !before.get(identity).is_some_and(|r| {
                 r.status == BindingStatus::Active && r.domain.as_ref() == Some(domain)
-            }) {
+            })
+            && !fresh_generated_domain(read.as_ref(), &before, domain)? {
                 change.joined.push((domain.clone(), record.column.clone()));
             }
     }
@@ -1171,19 +1187,19 @@ mod tests {
         assert_eq!(version(), 0);
         apply(&store, &route(), &[create(1), create(2)], &BTreeSet::new()).unwrap();
         assert_eq!(version(), 1);
-        assert!(snapshot(&store).unwrap().routes["route"].reset_owed);
+        assert!(!snapshot(&store).unwrap().routes["route"].reset_owed);
         clear_reset(&store, "route").unwrap();
-        assert_eq!(version(), 2);
+        assert_eq!(version(), 1);
         clear_reset(&store, "route").unwrap();
         apply(&store, &route(), &[], &BTreeSet::new()).unwrap();
-        assert_eq!(version(), 2);
+        assert_eq!(version(), 1);
         let changes = [1, 2].map(|n| BindingChange::SetDomain {
             identity: id(n),
             target: DomainTarget::Generated { group: 0 },
             linked: true,
         });
         apply(&store, &route(), &changes, &BTreeSet::new()).unwrap();
-        assert_eq!(version(), 3);
+        assert_eq!(version(), 2);
         let linked = load(&store, &route()).unwrap();
         assert_eq!(
             linked.get(&id(1)).unwrap().domain,
@@ -1200,18 +1216,18 @@ mod tests {
             &BTreeSet::new(),
         )
         .unwrap();
-        assert_eq!(version(), 4);
+        assert_eq!(version(), 3);
         let state = snapshot(&store).unwrap();
         assert_eq!(state.routes["route"].retired.len(), 3);
         assert!(state.routes["route"].reset_owed);
         record_route_stamp(&store, &route(), "rev-19-test").unwrap();
-        assert_eq!(version(), 5);
+        assert_eq!(version(), 4);
         record_route_stamp(&store, &route(), "rev-19-test").unwrap();
-        assert_eq!(version(), 5);
+        assert_eq!(version(), 4);
         let revision_only = RouteId::new("revision-only").unwrap();
         record_route_stamp(&store, &revision_only, "digest").unwrap();
         let state = snapshot(&store).unwrap();
-        assert_eq!(state.version, 6);
+        assert_eq!(state.version, 5);
         assert_eq!(state.routes["route"].revision, 19);
         assert_eq!(state.routes["revision-only"].stamp, "digest");
         assert_eq!(state.routes["revision-only"].revision, 0);
@@ -1456,6 +1472,36 @@ mod tests {
         bindings.get(&id(n)).unwrap().domain.clone().unwrap()
     }
     #[test]
+    fn new_private_column_preserves_existing_session_membership() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let doc = document();
+        let (before, initial) = refresh_membership(&store, &route(), &doc, &linked_snapshot(1)).unwrap();
+        assert!(!initial.requires_reset());
+        assert!(load_reset(&store, &route()).unwrap().is_none());
+        let (after, change) = refresh_membership(&store, &route(), &doc, &linked_snapshot(2)).unwrap();
+        assert!(!change.requires_reset());
+        assert_eq!(domain(&before, 1), domain(&after, 1));
+        assert_ne!(domain(&after, 1), domain(&after, 2));
+        assert_eq!(after.get(&id(2)).unwrap().status, BindingStatus::Active);
+        assert!(load_reset(&store, &route()).unwrap().is_none());
+    }
+
+    #[test]
+    fn new_column_joining_existing_link_requires_reset() {
+        let dir = TestDir::new();
+        let store = RedbStore::open(&dir.0, &root()).unwrap();
+        let mut doc = document();
+        doc.links.push(link_fields(2, Some(name("shared"))));
+        let before = refresh(&store, &route(), &doc, &linked_snapshot(1)).unwrap();
+        clear_reset(&store, route().as_str()).unwrap();
+        let (_, change) = refresh_membership(&store, &route(), &doc, &linked_snapshot(2)).unwrap();
+        assert!(change.requires_reset());
+        assert!(change.joined.iter().any(|(d, c)| d == &domain(&before, 1) && c.column == "c2"));
+        assert!(load_reset(&store, &route()).unwrap().unwrap().requires_reset());
+    }
+
+    #[test]
     fn generated_links_rotate_on_membership_changes_and_unlink() {
         let dir = TestDir::new();
         let store = RedbStore::open(&dir.0, &root()).unwrap();
@@ -1471,7 +1517,7 @@ mod tests {
             change.retired.iter().cloned().collect::<BTreeSet<_>>(),
             (1..=2).map(|n| domain(&private, n)).collect()
         );
-        assert_eq!(change.joined.len(), 2);
+        assert!(change.joined.is_empty());
         assert_eq!(change.left.len(), 2);
         assert!(change.requires_reset());
         store.fail_commits(true);

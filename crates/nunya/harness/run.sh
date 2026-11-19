@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ ${1:-} == policy-agent ]]; then shift; exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/policy_agent/run.sh" "$@"; fi
 if [[ ${1:-} == agent ]]; then
   shift
   exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agent/run.sh" "$@"
