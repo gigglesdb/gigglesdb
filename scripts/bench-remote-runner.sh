@@ -160,6 +160,9 @@ fi
 # rate limiter (service_limits, default 4096/s, which a 32-client run exceeds
 # with 53300 / HTTP 429) is raised to its maximum, 1,000,000/s. Its stdin is
 # a FIFO so it gets a clean "shutdown" command.
+# role_statements.concurrent is raised from its default 16 to 31 (GD-0084 Q4,
+# E236): with one bench role the per-role cap otherwise bounds commits per WAL
+# sync at 32 clients. Results at cap 31 are not comparable with earlier runs.
 gg_pid='' gg_fd='' pg_up=0
 gg_config_json() {
   cat <<JSON
@@ -168,7 +171,7 @@ gg_config_json() {
  "http":"127.0.0.1:$gg_http","api_limits":{"sessions":128},
  "certificate":"$tls/server.pem","private_key":"$tls/server.key","client_ca":"$tls/ca.pem",
  "bindings":[{"fingerprint":"$fp","role":{"role":"Database","name":"postgres"}}],
- "service_limits":{"sessions":128,"burst":1000000,"per_second":1000000},
+ "service_limits":{"sessions":128,"burst":1000000,"per_second":1000000},"role_statements":{"concurrent":31},
  "connections":128,"skew_seconds":0,"max_pause_seconds":3600}
 JSON
 }
@@ -609,7 +612,7 @@ L = ["# GigglesDB bench summary", "",
      f"op set `{meta['opset']}`: {meta['ops']}; --max-error-rate 0",
      f"data dir {meta['data_dir']}: fs **{meta['data_fstype']}** on {meta['data_device']} (mount {meta['data_mount']}; {meta['data_note']})",
      f"PostgreSQL: {meta['postgres_version']}; {meta['postgres_settings']}",
-     f"GigglesDB: {meta['giggles']}; pgwire connections {meta['giggles_config']['postgresql']['connections']}, api sessions {meta['giggles_config']['api_limits']['sessions']}, service_limits {meta['giggles_config']['service_limits']}",
+     f"GigglesDB: {meta['giggles']}; pgwire connections {meta['giggles_config']['postgresql']['connections']}, api sessions {meta['giggles_config']['api_limits']['sessions']}, service_limits {meta['giggles_config']['service_limits']}, role_statements {meta['giggles_config'].get('role_statements', 'default (16)')}",
      "",
      f"**{len(rows) - len(failed)} of {len(rows)} runs passed" + (f"; {len(failed)} FAILED (see notes)**" if failed else "**"), "",
      "| target | clients | mix | protocol | ops/s | p50 ms | p99 ms | errors | repeats | ops/s per repeat | notes |",
