@@ -173,3 +173,75 @@ fn direct_blocks_match_sql_controls() {
         assert!(!s.in_transaction() && !s.is_aborted());
     }
 }
+
+#[test]
+fn preparation_boundary_advances_only_read_committed() {
+    for (level, columns) in [("READ COMMITTED", 2), ("REPEATABLE READ", 1)] {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut s = admin.sql_session();
+        let mut other = admin.sql_session();
+        run(&mut s, "CREATE TABLE t(a int)");
+        let prepared = s.prepare("SELECT * FROM t").unwrap();
+        let before = s.statement_catalog_version();
+        assert!(before.is_some());
+        s.set_isolation(if level == "READ COMMITTED" {
+            SqlIsolation::ReadCommitted
+        } else {
+            SqlIsolation::RepeatableRead
+        });
+        run(&mut s, "BEGIN");
+        // Choose a snapshot without acquiring a relation lock that blocks DDL.
+        s.v2_transaction.as_mut().unwrap().snapshot_ts();
+        run(&mut other, "ALTER TABLE t ADD COLUMN b int");
+        assert_eq!(s.describe(&prepared).unwrap().columns.len(), 1);
+        assert_eq!(s.statement_catalog_version(), before);
+        s.begin_prepared_statement();
+        if level == "READ COMMITTED" {
+            assert_eq!(s.statement_catalog_version(), other.statement_catalog_version());
+            assert_ne!(s.statement_catalog_version(), before);
+        } else {
+            assert_eq!(s.statement_catalog_version(), before);
+        }
+        let fresh = s.prepare("SELECT * FROM t").unwrap();
+        assert_eq!(
+            s.describe(&fresh).unwrap().columns.len(),
+            columns,
+            "{level}"
+        );
+        run(&mut s, "ROLLBACK");
+        assert_eq!(s.statement_catalog_version(), other.statement_catalog_version());
+        run(&mut s, "BEGIN");
+        run(&mut s, "CREATE TABLE private_ddl(a int)");
+        assert_eq!(s.statement_catalog_version(), None);
+        assert_eq!(s.prepared_catalog_state(), PreparedCatalogState::PrivateDdl);
+        run(&mut s, "ROLLBACK");
+        drop(other);
+        drop(s);
+        drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+fn portal_view_locks_expand_from_statement_snapshot() {
+    let path = directory();
+    let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+    let mut s = admin.sql_session();
+    for sql in ["CREATE TABLE t(a int)", "CREATE VIEW v AS SELECT a FROM t",
+        "CREATE VIEW v2 AS SELECT a FROM v", "BEGIN"] { run(&mut s, sql); }
+    s.begin_prepared_statement();
+    let prepared = s.prepare("SELECT * FROM v2").unwrap();
+    let generation = s.statement_catalog_version();
+    assert!(s.lock_prepared_relations(&prepared).unwrap());
+    assert_eq!(s.statement_catalog_version(), generation);
+    let locks = s.held_table_locks();
+    assert_eq!(locks.iter().filter(|(_, _, mode, _)| *mode == "AccessShareLock").count(), 3);
+    let missing = s.prepare("SELECT * FROM missing").unwrap();
+    assert_eq!(s.lock_prepared_relations(&missing), Err(CoreError::Sql(SqlError::UnknownTable)));
+    assert!(!s.is_aborted(), "authorization must still run before exposing the lock error");
+    run(&mut s, "ROLLBACK");
+    drop(s);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}

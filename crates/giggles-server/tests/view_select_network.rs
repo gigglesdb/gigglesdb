@@ -33,7 +33,12 @@ async fn view_select_simple_extended_authority_and_drop() {
     }
     let statement = client.prepare("SELECT * FROM v").await.unwrap();
     s.execute("DROP VIEW v",&[],None).unwrap();
-    assert_eq!(client.query(&statement,&[]).await.unwrap_err().code().unwrap().code(),"42P01");
+    let refresh_error = client.query(&statement,&[]).await.unwrap_err();
+    let fresh_error = client.prepare("SELECT * FROM v").await.unwrap_err();
+    // E939 authorization-before-classification; PG 18.6 gives 42P01 here.
+    // This is a deliberate divergence that matches GigglesDB fresh Parse.
+    assert_eq!(fresh_error.code().unwrap().code(), "42501");
+    assert_eq!(refresh_error.code(), fresh_error.code());
     drop(client); connection.await.unwrap().unwrap(); running.shutdown().await.unwrap();
     drop(s); drop(service); drop(admin); std::fs::remove_dir_all(path).unwrap();
 }

@@ -2733,6 +2733,23 @@ impl Session {
     pub fn still_valid(&self) -> Result<(), CoreError> {
         self.sql.still_valid()
     }
+    /// Same dependency and sequence authorization as fresh prepare/Execute.
+    /// Called inside authority_scope before any portal dependency expansion/lock.
+    pub(crate) fn authorize_prepared_bind(&mut self, p: &Prepared) -> Result<Prepared, CoreError> {
+        let bound = self.sql.bind_relation_context(p)?;
+        self.reconcile_sequence_owners()?;
+        self.authorize(&bound)?;
+        Ok(bound)
+    }
+    pub(crate) fn bind_prepared_relations(&mut self, p: &Prepared) -> Result<(), CoreError> {
+        self.authority_scope(|session| {
+            for _ in 0..3 {
+                let bound = session.authorize_prepared_bind(p)?;
+                if bound.is_ddl() || session.sql.lock_prepared_relations(&bound)? { return Ok(()); }
+            }
+            Err(CoreError::Sql(relational::SqlError::StaleSchema))
+        })
+    }
     pub fn open_cursor(&mut self, p: &Prepared, params: &[Value]) -> Result<Cursor, CoreError> {
         self.authority_scope(|session| {
             let bound = session.sql.bind_relation_context(p)?;

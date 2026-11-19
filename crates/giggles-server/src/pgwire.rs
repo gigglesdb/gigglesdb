@@ -990,10 +990,19 @@ impl Statement {
             }
             Plan::Sql(p) => {
                 if self.description_version.is_some()
-                    && self.description_version == session.sql.committed_catalog_version()
+                    && self.description_version == session.sql.statement_catalog_version()
                     && session.sql.prepared_is_current(p)
                 { return Ok(self.d.clone()); }
-                core(session.describe(p))
+                let d = core(session.describe(p))?;
+                if self.d.columns.len() != d.columns.len()
+                    || self.d.columns.iter().zip(&d.columns).any(|(old, new)| {
+                        old.name != new.name || old.data_type != new.data_type
+                    })
+                    || self.d.type_oids != d.type_oids || self.d.typmods != d.typmods
+                {
+                    return Err("0A000");
+                }
+                Ok(d)
             },
             Plan::Copy(copy, p) => {
                 core(session.copy_columns(copy, p))?;
@@ -1096,6 +1105,10 @@ fn flush_output(output: &Output, out: &mut Vec<u8>) -> R<()> {
         }
     }
     Ok(())
+}
+#[cfg(test)]
+thread_local! {
+    static PREPARE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 struct State {
     output: Output,
@@ -1304,7 +1317,9 @@ impl State {
         session: &mut Session,
         unnamed: bool,
     ) -> R<Statement> {
-        let before_version = session.sql.committed_catalog_version();
+        #[cfg(test)]
+        PREPARE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let before_version = session.sql.statement_catalog_version();
         // GD-0061 R3-206: a task session admits the class before any catalog
         // or sequence read, on its own path.
         if session.task().is_some() {
@@ -1570,8 +1585,7 @@ impl State {
         }
         let description_version = before_version.filter(|version| {
             matches!(&p, Plan::Sql(plan) if !plan.is_ddl())
-                && matches!(&session.role, Role::Database { .. })
-                && session.sql.committed_catalog_version() == Some(*version)
+                && session.sql.statement_catalog_version() == Some(*version)
         });
         Ok(Statement {
             description_version,
@@ -1585,19 +1599,20 @@ impl State {
         })
     }
     fn refresh_statement(&mut self, name: &str, session: &mut Session) -> R<()> {
-        let old = self.statements.get(name).ok_or("26000")?.clone();
+        let old = self.statements.get(name).ok_or("26000")?;
         let stale = match &old.p {
-            Plan::Sql(p) => {
+            Plan::Sql(p) if session.task().is_none() && !p.is_ddl() => {
                 !session.sql.prepared_is_current(p)
-                    || old.description_version.is_some_and(|version| {
-                        // In a transaction the committed version is unknown (None);
-                        // the transaction-lifetime fence above covers that case.
-                        session
-                            .sql
-                            .committed_catalog_version()
-                            .is_some_and(|current| current != version)
-                    })
+                    || match session.sql.prepared_catalog_state() {
+                        giggles_core::PreparedCatalogState::PrivateDdl => true,
+                        giggles_core::PreparedCatalogState::Version(version) =>
+                            old.description_version.is_none() || old.description_version != version,
+                        giggles_core::PreparedCatalogState::UnknownBackend =>
+                            old.description_version.is_some_and(|version| session.sql.committed_catalog_version()
+                                .is_some_and(|current| current != version)),
+                    }
             }
+            Plan::Sql(p) => !session.sql.prepared_is_current(p),
             Plan::Copy(_, p) => !session.sql.prepared_is_current(p),
             Plan::Catalog(_, _, _) if session.task().is_some() => false,
             Plan::Catalog(plan, _, epoch) if !plan.depends_on_relations() => {
@@ -1609,46 +1624,7 @@ impl State {
         if !stale {
             return Ok(());
         }
-        if let Plan::Sql(plan) = &old.p
-            && session.sql.prepared_is_current(plan)
-        {
-            // Resolve the original SQL names again: a dropped search-path entry
-            // can expose another relation instead of making the dependency missing.
-            let bound = core(session.sql.bind_relation_context(plan))?;
-            let mut missing = false;
-            let mut requirements = Vec::new();
-            for table in core(bound.authorization_tables().map_err(CoreError::Sql))? {
-                if core(session.sql.relation_exists(&table))? {
-                    requirements.push((table, giggles_core::roles::TablePrivilege::Select));
-                } else {
-                    missing = true;
-                }
-            }
-            if let Some(table) = bound.authorization_update_table()
-                && core(session.sql.relation_exists(table))?
-            {
-                requirements.push((table.to_owned(), giggles_core::roles::TablePrivilege::Update));
-            }
-            for (table, command) in bound.write_tables() {
-                if !core(session.sql.relation_exists(&table))? {
-                    missing = true;
-                    continue;
-                }
-                let privilege = match command {
-                    "INSERT" => giggles_core::roles::TablePrivilege::Insert,
-                    "UPDATE" => giggles_core::roles::TablePrivilege::Update,
-                    "DELETE" => giggles_core::roles::TablePrivilege::Delete,
-                    _ => continue,
-                };
-                requirements.push((table, privilege));
-            }
-            if missing {
-                // Preserve Execute's missing-relation error only after checking
-                // authority on every dependency that still resolves (E939).
-                core(session.authorize_table_requirements(&requirements))?;
-                return Err("42P01");
-            }
-        }
+        let old = old.clone();
         let new = self.prepare_statement(&old.sql, old.declared_oids.clone(), session, false)?;
         if old.parameter_oids != new.parameter_oids
             || old.d.columns.len() != new.d.columns.len()
@@ -1783,6 +1759,17 @@ impl State {
             b'B' => {
                 let name = r.text()?;
                 let stmt = r.text()?;
+                let s = self.statements.get(&stmt).ok_or("26000")?;
+                if let Plan::Sql(p) = &s.p
+                    && session.task().is_none()
+                {
+                    if !p.is_ddl() {
+                        begin_implicit(session, &mut self.implicit, &mut self.settings)?;
+                        session.sql.begin_prepared_statement();
+                    }
+                    core(session.bind_prepared_relations(p))?;
+                }
+                // One version comparison, after locks have stabilized dependencies.
                 self.refresh_statement(&stmt, session)?;
                 let s = self.statements.get(&stmt).ok_or("26000")?.clone();
                 self.diagnostic.query_id = s.query_id.clone();
@@ -1882,6 +1869,9 @@ impl State {
                 r.end()?;
                 match kind {
                     b'S' => {
+                        if session.task().is_none() {
+                            session.sql.begin_prepared_statement();
+                        }
                         self.refresh_statement(&name, session)?;
                         let s = self.statements.get(&name).ok_or("26000")?;
                         self.diagnostic.query_id = s.query_id.clone();

@@ -677,6 +677,13 @@ pub enum Engine {
     Legacy,
     V2,
 }
+/// Prepared-plan cache policy, separate from the generation used by descriptions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedCatalogState {
+    Version(Option<u64>),
+    PrivateDdl,
+    UnknownBackend,
+}
 /// The isolation level of a SQL transaction on the v2 engine (GD-0075 R5-76).
 /// PostgreSQL's READ UNCOMMITTED runs as READ COMMITTED. The legacy engine
 /// runs every SQL transaction serializable and ignores the level.
@@ -2952,6 +2959,70 @@ impl SqlSession {
             txn.held_table_locks().into_iter().map(|(table, mode, fastpath)| (txn.id().0, table, mode, fastpath)).collect()
         })
     }
+    /// Hold prepared dependencies (including views' physical sources) through transaction end.
+    /// The caller must authorize before each attempt. `false` means the snapshot
+    /// advanced: authorize again before expanding and locking the new dependencies.
+    /// Errors do not abort here, so the caller can preserve error ordering.
+    pub fn lock_prepared_relations(&mut self, p: &relational::Prepared) -> Result<bool, CoreError> {
+        if !self.is_v2_engine() { return Ok(true); }
+        let Backend::V2(db) = &self.admin.inner.backend else { unreachable!() };
+        let db = db.clone();
+        let mut scoped = p.clone();
+        scoped.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+        let txn = self.v2_transaction.as_mut()
+            .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+        let snapshot = txn.snapshot_ts();
+        if let Some(error) = txn.snapshot_error() { return Err(error.clone().into()); }
+        let pinned = txn.isolation() != engine::txn::Isolation::ReadCommitted;
+        let generation = db.catalog().current_version();
+        // Bind and expand from one image of the portal's statement snapshot.
+        // Runtime view projections already contain nested physical dependencies.
+        let locks = self.inspect_metadata(|state| {
+            let bound = scoped.bind_schemas(&state.sql).map_err(CoreError::Sql)?;
+            let mut pending = bound.authorization_tables().map_err(CoreError::Sql)?;
+            pending.extend(bound.write_tables().into_iter().map(|(name, _)| name));
+            let mut seen = std::collections::BTreeSet::new();
+            let mut locks = BTreeMap::new();
+            while let Some(name) = pending.pop() {
+                if !seen.insert(name.clone()) { continue; }
+                if let Some(table) = state.sql.tables.get(&name) {
+                    locks.insert(table.id, (name, false));
+                } else if let Some((id, projection)) = state.sql.view_names.get(&name) {
+                    let projection = projection.as_ref().map_err(|error| CoreError::Sql(error.clone()))?;
+                    locks.insert(*id, (name, true));
+                    pending.extend(projection.reads.iter().cloned());
+                } else {
+                    return Err(CoreError::Sql(relational::SqlError::UnknownTable));
+                }
+            }
+            Ok(locks)
+        })?;
+        let txn = self.v2_transaction.as_mut().expect("open transaction");
+        // One id order includes views and tables, matching ordinary SQL locking.
+        for (id, (name, view)) in locks {
+            if view {
+                txn.acquire_lock(engine::locks::LockKey::Table(id),
+                    engine::locks::LockMode::AccessShare, None,
+                    &|| crate::cancellation::check().is_err())?;
+            } else {
+                match db.catalog().resolve(txn, &name, engine::locks::LockMode::AccessShare,
+                    None, &|| crate::cancellation::check().is_err()) {
+                    Ok(_) => {}
+                    Err(engine::catalog::CatalogError::Core(error)) => return Err(error),
+                    Err(engine::catalog::CatalogError::Txn(error)) => return Err(error.into()),
+                }
+            }
+        }
+        if txn.current_snapshot_ts() == Some(snapshot)
+            && (pinned || generation == db.catalog().current_version()) {
+            return Ok(true);
+        }
+        // A READ COMMITTED wait may have observed new view definitions or
+        // table identities. Expand again before the portal can be published.
+        txn.begin_statement();
+        Ok(false)
+    }
+
     /// Acquire explicit table locks in list order on the open v2 transaction.
     /// Legacy sessions retain their historical validated no-op behaviour.
     pub fn lock_tables(
@@ -3486,9 +3557,54 @@ impl SqlSession {
     pub fn is_aborted(&self) -> bool {
         self.aborted
     }
+    /// Start a protocol preparation boundary against the transaction's visible catalog.
+    /// READ COMMITTED advances; repeatable snapshots and private DDL stay intact.
+    pub fn begin_prepared_statement(&mut self) {
+        if let Some(txn) = &mut self.v2_transaction {
+            txn.begin_statement();
+        }
+    }
+
     /// Whether a prepared statement belongs to the current transaction lifetime.
     pub fn prepared_is_current(&self, p: &relational::Prepared) -> bool {
         p.transaction.is_none() || p.transaction == self.transaction_id
+    }
+
+    /// Catalog generation used by metadata planning at the current statement snapshot.
+    /// Private DDL, failed snapshots and unsupported backends cannot be cached.
+    pub fn statement_catalog_version(&self) -> Option<u64> {
+        if self.aborted || self.task.is_some() { return None; }
+        match &self.admin.inner.backend {
+            Backend::V2(db) if db.cluster_services().is_none() => match &self.v2_transaction {
+                Some(txn) => {
+                    if txn.catalog_writes().next().is_some() || txn.snapshot_error().is_some() {
+                        return None;
+                    }
+                    if let Some(ts) = txn.current_snapshot_ts() {
+                        // The common current-generation case needs only atomic reads.
+                        db.catalog().current_version().filter(|version| *version <= ts.0)
+                            .or_else(|| db.catalog().snapshot_version(txn).map(|version| version.0))
+                    } else {
+                        db.catalog().current_version()
+                    }
+                }
+                None => db.catalog().current_version(),
+            },
+            _ => None,
+        }
+    }
+
+    /// Unknown backends retain their historical lifetime-only revalidation.
+    /// Private catalog writes must never use that fallback, including on gateways.
+    pub fn prepared_catalog_state(&self) -> PreparedCatalogState {
+        if self.v2_transaction.as_ref().is_some_and(|txn| txn.catalog_writes().next().is_some()) {
+            return PreparedCatalogState::PrivateDdl;
+        }
+        match &self.admin.inner.backend {
+            Backend::V2(db) if db.cluster_services().is_none() =>
+                PreparedCatalogState::Version(self.statement_catalog_version()),
+            _ => PreparedCatalogState::UnknownBackend,
+        }
     }
 
     /// Lock-free local catalog generation. Transactions and cluster gateways

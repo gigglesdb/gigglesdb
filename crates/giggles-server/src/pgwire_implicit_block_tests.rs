@@ -8,10 +8,13 @@ fn fixture() -> Session {
     fixture_with_clock(crate::clock::Clock::new(0, 3600).unwrap())
 }
 fn fixture_with_clock(clock: crate::clock::Clock) -> Session {
+    fixture_with_engine(clock, Engine::V2)
+}
+fn fixture_with_engine(clock: crate::clock::Clock, engine: Engine) -> Session {
     let path = crate::test_support::fixture_root().join(format!("implicit-block-{}-{}-{}",
         SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-    let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+    let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
     admin.roles().create(NewRole { name: "owner".into(), login: true, superuser: true, ..Default::default() }).unwrap();
     let service = crate::Service::new(admin, vec![], clock).unwrap();
     service.role_session("owner").unwrap()
@@ -194,28 +197,26 @@ fn metadata_cycle_counts() {
         metadata_parse(&mut state, &mut session, name);
         metadata_bind(&mut state, &mut session, name);
         assert_eq!(text_rows(&metadata_describe_execute(&mut state, &mut session).unwrap()), vec![vec!["7"]]);
-        // Named statements now retain description_version too, avoiding the same
-        // three metadata reads as the unnamed description cache.
-        // Provenance validation is cached at an exact local snapshot timestamp:
-        // the first cycle reads once; subsequent read-only cycles reuse it.
-        assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 9, usize::from(name.is_empty()), 0], "cycle {name:?}");
+        // Bind adds dependency locking plus a full current-grant authorization.
+        // Named/unnamed descriptions and plans remain cached.
+        assert_eq!(giggles_core::metadata_read_counts::take(), [13, 0, 8, usize::from(name.is_empty()), 0], "cycle {name:?}");
         if name.is_empty() {
             metadata_parse(&mut state, &mut session, name);
             metadata_bind(&mut state, &mut session, name);
             metadata_describe_execute(&mut state, &mut session).unwrap();
-            assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 8, 0, 0]);
+            assert_eq!(giggles_core::metadata_read_counts::take(), [13, 0, 7, 0, 0]);
         }
         if !name.is_empty() {
             metadata_bind(&mut state, &mut session, name);
             metadata_describe_execute(&mut state, &mut session).unwrap();
             // Rebinding the cached named description also saves three reads.
-            assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 4, 0, 0]);
+            assert_eq!(giggles_core::metadata_read_counts::take(), [13, 0, 3, 0, 0]);
         }
     }
     simple(&mut state, &mut session, "SELECT v FROM t WHERE id = 1").unwrap();
     assert_eq!(giggles_core::metadata_read_counts::take(), [0, 0, 9, 0, 0]);
     extended(&mut state, &mut session, "INSERT INTO serial_t (v) VALUES (8)").unwrap();
-    assert_eq!(giggles_core::metadata_read_counts::take(), [7, 0, 9, 0, 0]);
+    assert_eq!(giggles_core::metadata_read_counts::take(), [13, 0, 8, 0, 0]);
 }
 #[test]
 fn metadata_ddl_between_bind_and_execute() {
@@ -229,25 +230,23 @@ fn metadata_ddl_between_bind_and_execute() {
             metadata_bind(&mut state, &mut session, name);
             let mut other = session.service.role_session("owner").unwrap();
             let mut other_state = self::state();
-            for statement in ddl.split("; ") {
-                simple(&mut other_state, &mut other, statement).unwrap();
-            }
-            // Pinned on 26fe7e55 before the fast path: a bound portal describes
-            // the new table and executes successfully, even after replacement.
+            // Probe the same AccessExclusive conflict as DDL without blocking
+            // this synchronous test thread. The network tests exercise DDL itself.
+            simple(&mut other_state, &mut other, "BEGIN").unwrap();
+            assert_eq!(simple(&mut other_state, &mut other,
+                "LOCK TABLE t IN ACCESS EXCLUSIVE MODE NOWAIT"), Err("55P03"));
+            simple(&mut other_state, &mut other, "ROLLBACK").unwrap();
             let out = metadata_describe_execute(&mut state, &mut session).unwrap();
             assert_eq!(out[0], b'T');
+            assert_eq!(text_rows(&out), vec![vec!["7"]]);
             let mut description = Reader { b: &out[5..], at: 0 };
             assert_eq!(description.u16().unwrap(), 1);
             assert_eq!(description.text().unwrap(), "v");
-            description.u32().unwrap(); // table oid
-            description.u16().unwrap(); // attribute number
-            let oid = description.u32().unwrap();
-            if ddl.starts_with("ALTER") {
-                assert_eq!(text_rows(&out), vec![vec!["7"]]);
-                assert_eq!(oid, 23);
-            } else {
-                assert!(text_rows(&out).is_empty());
-                assert_eq!(oid, 25);
+            description.u32().unwrap();
+            description.u16().unwrap();
+            assert_eq!(description.u32().unwrap(), 23);
+            for statement in ddl.split("; ") {
+                simple(&mut other_state, &mut other, statement).unwrap();
             }
         }
     }
@@ -367,4 +366,119 @@ fn extended_implicit_block_survives_subsecond_backward_step() {
     let out = extended(&mut state, &mut session, "SELECT id FROM t").unwrap();
     assert_eq!(text_rows(&out), vec![vec!["1"]]);
     assert!(!session.in_transaction());
+}
+
+
+fn named_reuse_case(begin_before_parse: bool, begin_after_parse: bool) {
+    named_reuse_engine(Engine::V2, begin_before_parse, begin_after_parse);
+}
+fn named_reuse_engine(engine: Engine, begin_before_parse: bool, begin_after_parse: bool) {
+    let mut session = fixture_with_engine(crate::clock::Clock::new(0, 3600).unwrap(), engine);
+    session.execute_sql("CREATE TABLE reuse_t(a int)", &[]).unwrap();
+    session.execute_sql("INSERT INTO reuse_t VALUES(7)", &[]).unwrap();
+    let mut state = state();
+    if begin_before_parse { simple(&mut state, &mut session, "BEGIN").unwrap(); }
+    let mut parse = Vec::new();
+    cstr("cached", &mut parse);
+    cstr("SELECT * FROM reuse_t", &mut parse);
+    parse.extend(0u16.to_be_bytes());
+    state.handle(b'P', &parse, &mut session, &mut Vec::new(), std::time::Instant::now()).unwrap();
+    let prepared = PREPARE_CALLS.with(std::cell::Cell::get);
+    assert_eq!(state.statements["cached"].description_version.is_some(), engine == Engine::V2);
+    if begin_after_parse { simple(&mut state, &mut session, "BEGIN").unwrap(); }
+    for _ in 0..4 {
+        let mut bind = Vec::new();
+        cstr("", &mut bind);
+        cstr("cached", &mut bind);
+        bind.extend([0; 6]);
+        let mut out = Vec::new();
+        let now = std::time::Instant::now();
+        state.handle(b'B', &bind, &mut session, &mut out, now).unwrap();
+        state.handle(b'D', b"P\0", &mut session, &mut out, now).unwrap();
+        state.handle(b'E', &[0; 5], &mut session, &mut out, now).unwrap();
+        state.handle(b'S', &[], &mut session, &mut out, now).unwrap();
+        assert_eq!(text_rows(&out), vec![vec!["7".to_owned()]]);
+        assert_eq!(PREPARE_CALLS.with(std::cell::Cell::get), prepared, "unchanged Bind re-prepared");
+    }
+    if begin_before_parse || begin_after_parse { simple(&mut state, &mut session, "ROLLBACK").unwrap(); }
+}
+#[test]
+fn unchanged_named_statement_reused_outside_transaction() {
+    named_reuse_case(false, false);
+}
+#[test]
+fn unchanged_named_statement_reused_after_begin() {
+    named_reuse_case(false, true);
+}
+#[test]
+fn unchanged_named_statement_prepared_inside_transaction_reused() {
+    named_reuse_case(true, false);
+}
+
+#[test]
+fn execute_rechecks_authority_after_bind() {
+    use giggles_core::roles::TablePrivilege::Select;
+    let mut owner = fixture();
+    owner.execute_sql("CREATE TABLE t(id int PRIMARY KEY, v int)", &[]).unwrap();
+    let roles = owner.service.admin.roles();
+    roles.create(NewRole { name: "reader".into(), login: true, ..Default::default() }).unwrap();
+    roles.grant_table("t", "reader", &[Select]).unwrap();
+    let mut reader = owner.service.role_session("reader").unwrap();
+    let mut state = state();
+    metadata_parse(&mut state, &mut reader, "named");
+    metadata_bind(&mut state, &mut reader, "named");
+    roles.revoke_table("t", "reader", &[Select]).unwrap();
+    assert_eq!(state.handle(b'E', &[0; 5], &mut reader, &mut Vec::new(),
+        std::time::Instant::now()), Err("42501"));
+    reader.sql.rollback();
+}
+
+#[test]
+fn unknown_backend_legacy_named_statement_reused() {
+    named_reuse_engine(Engine::Legacy, false, false);
+    named_reuse_engine(Engine::Legacy, false, true);
+    named_reuse_engine(Engine::Legacy, true, false);
+}
+#[test]
+fn measure_bind_authorization_cost() {
+    use giggles_core::roles::TablePrivilege::Select;
+    let mut owner = fixture();
+    owner.execute_sql("CREATE TABLE timing_t(a int)", &[]).unwrap();
+    owner.execute_sql("INSERT INTO timing_t VALUES(7)", &[]).unwrap();
+    let roles = owner.service.admin.roles();
+    roles.create(NewRole { name: "timing_reader".into(), login: true, ..Default::default() }).unwrap();
+    roles.grant_table("timing_t", "timing_reader", &[Select]).unwrap();
+    let mut reader = owner.service.role_session("timing_reader").unwrap();
+    let mut state = state();
+    let mut parse = b"timed\0".to_vec();
+    cstr("SELECT * FROM timing_t", &mut parse);
+    parse.extend([0;2]);
+    state.handle(b'P', &parse, &mut reader, &mut Vec::new(), std::time::Instant::now()).unwrap();
+    let Plan::Sql(prepared) = &state.statements["timed"].p else { panic!("SQL plan") };
+    let prepared = prepared.clone();
+    reader.begin_implicit_block().unwrap();
+    reader.sql.begin_prepared_statement();
+    for _ in 0..100 {
+        reader.authority_scope(|s| s.authorize_prepared_bind(&prepared)).unwrap();
+    }
+    let prepares = PREPARE_CALLS.with(std::cell::Cell::get);
+    let count = 1000;
+    let started = std::time::Instant::now();
+    for _ in 0..count {
+        std::hint::black_box(reader.authority_scope(|s| s.authorize_prepared_bind(&prepared)).unwrap());
+    }
+    let authorization_us = started.elapsed().as_secs_f64() * 1e6 / f64::from(count);
+    reader.sql.rollback();
+    let bind = b"\0timed\0\0\0\0\0\0\0";
+    let started = std::time::Instant::now();
+    for _ in 0..count {
+        let mut out = Vec::new();
+        let now = std::time::Instant::now();
+        state.handle(b'B', bind, &mut reader, &mut out, now).unwrap();
+        state.handle(b'E', &[0;5], &mut reader, &mut out, now).unwrap();
+        state.handle(b'S', &[], &mut reader, &mut out, now).unwrap();
+    }
+    let cycle_us = started.elapsed().as_secs_f64() * 1e6 / f64::from(count);
+    assert_eq!(PREPARE_CALLS.with(std::cell::Cell::get), prepares);
+    eprintln!("BIND_AUTH_COST samples={count} authorization_us={authorization_us:.3} bind_execute_sync_us={cycle_us:.3} profile=dev role=non_superuser");
 }
