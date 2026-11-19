@@ -340,6 +340,19 @@ mod rocks {
     }
 
     #[test]
+    fn legacy_task_records_refuse_with_retirement_text() {
+        let path = refusal_fixture("retirement-text", |a| {
+            a.put(common::key(0), common::row()).unwrap();
+        });
+        let error = Admin::upgrade_to_v2(&path, Limits::default()).unwrap_err();
+        assert!(
+            matches!(&error, CoreError::Storage(message) if message == "upgrade refused: this database holds records of the retired task prototype (kernel records: 1). They are not migrated to v2 (GD-0061). Export the SQL tables, restore them into a new v2 database, and define tasks there with CREATE TASK."),
+            "{error}"
+        );
+        refused_unchanged(&path, &["kernel records"]);
+    }
+
+    #[test]
     fn refuses_native_outcomes_without_changing_files() {
         use giggles_core::operations::{
             Bindings, Engine, Request as NativeRequest, ValueExpr,
@@ -443,7 +456,7 @@ mod rocks {
         drop(restored);
         let error = Admin::upgrade_to_v2(&path, Limits::default()).unwrap_err();
         assert!(
-            matches!(&error, CoreError::Storage(message) if message == "upgrade cannot represent tasks: 1"),
+            matches!(&error, CoreError::Storage(message) if message == "upgrade refused: this database holds records of the retired task prototype (tasks: 1). They are not migrated to v2 (GD-0061). Export the SQL tables, restore them into a new v2 database, and define tasks there with CREATE TASK."),
             "{error}"
         );
         refused_unchanged(&path, &["tasks"]);

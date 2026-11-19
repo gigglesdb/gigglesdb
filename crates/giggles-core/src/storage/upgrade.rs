@@ -210,7 +210,10 @@ fn refuse(s: &State) -> Result<(), CoreError> {
         .map(|(kind, count)| format!("{kind}: {count}"))
         .collect::<Vec<_>>();
     if !found.is_empty() {
-        return Err(io(format!("upgrade cannot represent {}", found.join(", "))));
+        return Err(io(format!(
+            "upgrade refused: this database holds records of the retired task prototype ({}). They are not migrated to v2 (GD-0061). Export the SQL tables, restore them into a new v2 database, and define tasks there with CREATE TASK.",
+            found.join(", ")
+        )));
     }
     Ok(())
 }
