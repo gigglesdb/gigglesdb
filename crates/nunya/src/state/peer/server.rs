@@ -29,6 +29,7 @@ struct Batch {
 }
 /// Leader state service with server-owned per-domain limits.
 pub struct PeerServer {
+    ready: Option<crate::state::leader_store::LeadershipSource>,
     bindings_store: Option<Arc<dyn crate::state::store::Store>>,
     authority: Arc<Authority>,
     leader: LeaderState,
@@ -61,6 +62,7 @@ impl PeerServer {
         limits: HashMap<String, TokenizeLimits>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            ready: None,
             bindings_store: None,
             authority,
             leader,
@@ -73,6 +75,11 @@ impl PeerServer {
             #[cfg(test)]
             slow_lookup: Mutex::default(),
         })
+    }
+    /// Require initialized state in the term used to seal the reply.
+    pub fn with_ready(mut self: Arc<Self>, ready: crate::state::leader_store::LeadershipSource) -> Result<Arc<Self>, PeerError> {
+        Arc::get_mut(&mut self).ok_or(PeerError::Protocol)?.ready = Some(ready);
+        Ok(self)
     }
     /// Supply the leader's durable bindings store.
     pub fn with_bindings_store(mut self: Arc<Self>, store: Arc<dyn crate::state::store::Store>) -> Result<Arc<Self>, PeerError> {
@@ -131,18 +138,7 @@ impl PeerServer {
             }
         }
         let generation = self.leader.term();
-        let result = if !self.leader.is_leader() || self.serving_gate.as_ref().is_some_and(|gate| !gate.allow()) {
-            encode(&Failure {
-                error: FailureCode::NotLeader,
-                generation,
-                leader: self.leader.leader_url(),
-            })
-            .map(|b| (409, b))
-        } else if parts.method != http::Method::POST || parts.uri.query().is_some() {
-            Err(PeerError::Protocol)
-        } else {
-            self.dispatch(parts.uri.path(), &body, generation)
-        };
+        let result = self.reply(&parts.method, parts.uri.path(), parts.uri.query().is_some(), &body, generation);
         let (status, body) = result.unwrap_or_else(|_| (400, b"{\"error\":\"refused\"}".to_vec()));
         match self.auth.seal(&body, &nonce, status, generation) {
             Ok(sealed) => {
@@ -153,6 +149,20 @@ impl PeerServer {
                 r
             }
             Err(_) => response(500, vec![]),
+        }
+    }
+    fn reply(&self, method: &http::Method, path: &str, has_query: bool, body: &[u8], generation: u64) -> Result<(u16, Vec<u8>), PeerError> {
+        if self.leader.held_term() != Some(generation) || self.ready.as_ref().is_some_and(|ready| ready() != Some(generation)) || self.serving_gate.as_ref().is_some_and(|gate| !gate.allow()) {
+            encode(&Failure {
+                error: FailureCode::NotLeader,
+                generation,
+                leader: self.leader.leader_url(),
+            })
+            .map(|b| (409, b))
+        } else if method != http::Method::POST || has_query {
+            Err(PeerError::Protocol)
+        } else {
+            self.dispatch(path, body, generation)
         }
     }
     #[cfg(test)]
@@ -304,4 +314,25 @@ fn response(status: u16, body: Vec<u8>) -> Response<Full<Bytes>> {
     *r.status_mut() =
         http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ready_term_gates_leader_replies() {
+        use crate::state::{authority::SessionLimits, leader_store::LeaderStore};
+        let proxy = Arc::new(LeaderStore::new(Arc::new(|| None), Arc::new(|| 0)));
+        let authority = Authority::empty(proxy, SessionLimits::default());
+        let leader = LeaderState::live_for_test();
+        leader.term_for_test(7);
+        for (ready, expected) in [(None, 409), (Some(6), 409), (Some(7), 200)] {
+            let server = PeerServer::new(authority.clone(), leader.clone(), Arc::new(PeerAuth::new(&[7; 32]).unwrap()), HashMap::new())
+                .with_ready(Arc::new(move || ready)).unwrap();
+            let request = encode(&Lookup { session_id: SessionId([0; 16]) }).unwrap();
+            let (status, body) = server.reply(&http::Method::POST, "/peer/v1/session/lookup", false, &request, 7).unwrap();
+            assert_eq!(status, expected);
+            if expected == 409 { assert!(String::from_utf8(body).unwrap().contains("not_leader")); }
+        }
+    }
 }

@@ -163,8 +163,43 @@ fn socket_path_fits(path: &Path) -> bool {
     }
 }
 
+/// Prepare the pod-specific management directory without opening durable state.
+#[cfg(feature = "kubernetes")]
+pub(crate) fn peer_socket_dir(state_dir: &Path, pod: &str) -> Result<PathBuf, String> {
+    if pod.is_empty() || pod.len() > 63
+        || !pod.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        || !pod.as_bytes()[0].is_ascii_alphanumeric()
+        || !pod.as_bytes()[pod.len() - 1].is_ascii_alphanumeric()
+    { return Err("invalid peer pod name".into()); }
+    let dir = state_dir.join("pods").join(pod);
+    std::fs::create_dir_all(&dir).map_err(|_| "management directory unavailable")?;
+    Ok(dir)
+}
 #[cfg(unix)]
-fn socket(state_dir: &Path) -> Result<(tokio::net::UnixListener, PathBuf, u32), SpawnError> {
+struct SocketOwner {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+#[cfg(unix)]
+impl SocketOwner {
+    fn new(path: PathBuf) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(&path)?;
+        Ok(Self { path, dev: meta.dev(), ino: meta.ino() })
+    }
+}
+#[cfg(unix)]
+impl Drop for SocketOwner {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.dev() == self.dev && m.ino() == self.ino) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+#[cfg(unix)]
+fn socket(state_dir: &Path) -> Result<(tokio::net::UnixListener, SocketOwner, u32), SpawnError> {
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
     let path = state_dir.join("nunya.sock");
     if !socket_path_fits(&path) {
@@ -192,7 +227,7 @@ fn socket(state_dir: &Path) -> Result<(tokio::net::UnixListener, PathBuf, u32), 
     }
     let private_dir = private_dir.ok_or(SpawnError::Socket)?;
     let temp = private_dir.join("s");
-    let mut installed = false;
+    let mut owner = None;
     let mut install = || -> std::io::Result<_> {
         let listener = tokio::net::UnixListener::bind(&temp)?;
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
@@ -205,20 +240,20 @@ fn socket(state_dir: &Path) -> Result<(tokio::net::UnixListener, PathBuf, u32), 
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+        let installed = SocketOwner::new(temp.clone())?;
         std::fs::rename(&temp, &path)?;
-        installed = true;
+        owner = Some(SocketOwner { path: path.clone(), dev: installed.dev, ino: installed.ino });
+        drop(installed);
         let service_uid = std::fs::metadata(&path)?.uid();
         std::fs::remove_dir(&private_dir)?;
         Ok((listener, service_uid))
     };
     match install() {
-        Ok((listener, service_uid)) => Ok((listener, path, service_uid)),
+        Ok((listener, service_uid)) => Ok((listener, owner.ok_or(SpawnError::Socket)?, service_uid)),
         Err(_) => {
             let _ = std::fs::remove_file(&temp);
             let _ = std::fs::remove_dir(&private_dir);
-            if installed {
-                let _ = std::fs::remove_file(&path);
-            }
+            drop(owner);
             Err(SpawnError::Socket)
         }
     }
@@ -252,9 +287,9 @@ pub(crate) async fn spawn_with_tls(
     };
     let tcp_addr = tcp.as_ref().map(TcpListener::local_addr).transpose().map_err(|_| SpawnError::Bind)?;
     #[cfg(unix)]
-    let (local, path, service_uid) = socket(state_dir)?;
+    let (local, socket_owner, service_uid) = socket(state_dir)?;
     #[cfg(unix)]
-    let socket_path = Some(path.clone());
+    let socket_path = Some(socket_owner.path.clone());
     #[cfg(not(unix))]
     let socket_path = {
         let _ = state_dir;
@@ -346,7 +381,7 @@ pub(crate) async fn spawn_with_tls(
             while connections.join_next().await.is_some() {}
         }
         #[cfg(unix)]
-        let _ = std::fs::remove_file(path);
+        drop(socket_owner);
     });
     Ok(ServerHandle {
         tcp_addr,
@@ -359,6 +394,38 @@ pub(crate) async fn spawn_with_tls(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn peer_socket_bootstraps_nested_state_without_redb() {
+        let root = PathBuf::from(std::env::var_os("TEMP").unwrap()).join(format!("peer-dir-{}", crate::token::SessionId::random().to_hex()));
+        let state = root.join("fresh/nested/state");
+        let a = peer_socket_dir(&state, "pod-a").unwrap();
+        let b = peer_socket_dir(&state, "pod-b").unwrap();
+        assert_eq!(a, state.join("pods/pod-a"));
+        assert!(a.is_dir() && b.is_dir());
+        assert!(!state.join("nunya.redb").exists());
+        for invalid in ["", "..", "../escape", "/absolute", "Pod", "-pod", "pod-", &"a".repeat(64)] {
+            assert!(peer_socket_dir(&state, invalid).is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(all(unix, feature = "kubernetes"))]
+    #[tokio::test]
+    async fn pod_sockets_and_replacement_cleanup_are_independent() {
+        let root = PathBuf::from(std::env::var_os("TEMP").unwrap()).join(format!("sock-{}", crate::token::SessionId::random().to_hex()));
+        let a = peer_socket_dir(&root, "a").unwrap();
+        let b = peer_socket_dir(&root, "b").unwrap();
+        let (la, oa, _) = socket(&a).unwrap();
+        let (lb, ob, _) = socket(&b).unwrap();
+        let (new, replacement, _) = socket(&a).unwrap();
+        drop(la); drop(oa);
+        assert!(replacement.path.exists() && ob.path.exists());
+        drop(lb); drop(ob);
+        assert!(replacement.path.exists());
+        drop(new); drop(replacement);
+        assert!(!a.join("nunya.sock").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn socket_path_byte_length_limit() {
         assert!(socket_path_fits(Path::new(&"a".repeat(107))));

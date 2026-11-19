@@ -56,6 +56,11 @@ impl LeaderState {
             .until
             .is_some_and(|d| self.clock.mono() < d)
     }
+    /// Held Lease term read atomically with its renewal deadline.
+    pub fn held_term(&self) -> Option<u64> {
+        let view = self.view.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        view.until.filter(|d| self.clock.mono() < *d).map(|_| view.term)
+    }
     #[cfg(test)]
     pub(crate) fn live_for_test() -> Self {
         let s = Self::default(); s.publish(Some(Duration::MAX), None); s

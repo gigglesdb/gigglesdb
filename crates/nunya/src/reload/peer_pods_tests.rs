@@ -13,7 +13,7 @@ use crate::{
     value::{ColumnType, SqlValue},
 };
 
-fn tokens_equal(left: &Policy, right: &Policy, columns: &[&str]) {
+pub(crate) fn tokens_equal(left: &Policy, right: &Policy, columns: &[&str]) {
     for column in columns {
         let field = customer_column(column);
         let encode = |policy: &Policy| {
@@ -37,7 +37,7 @@ fn tokens_equal(left: &Policy, right: &Policy, columns: &[&str]) {
         // Do not print token or plaintext values on assertion failure.
         assert!(encode(left) == encode(right), "pod token bytes differ");
     }
-    assert_eq!(left.retired_domains, right.retired_domains);
+    assert!(left.retired_domains == right.retired_domains);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -315,4 +315,36 @@ fn stamp_record_failure_is_nonfatal_and_retried() {
     hub.recompile_bindings();
     let expected = hub.state.lock().unwrap().units[0].revisions.read().unwrap().policy.clone();
     assert_eq!(bindings::snapshot(store.as_ref()).unwrap().routes["postgres"].stamp, expected);
+}
+
+/// Hub fixture sharing production bindings compilation with the failover tests.
+pub(crate) struct FailoverHub {
+    fixture: crate::pgwire::session::tests::Fixture,
+    hub: Arc<Hub>,
+    _files: Files,
+}
+impl FailoverHub {
+    /// Wire a leader or follower Hub to its closed-capable store and peer snapshot.
+    pub(crate) fn new(store: Arc<dyn crate::state::store::Store>, ready: Arc<dyn Fn() -> bool + Send + Sync>, cache: Option<Arc<PeerStateCache>>) -> Self {
+        let files = Files::new();
+        let hub = tokenize_hub(&files, &["postgres"]);
+        hub.set_store(store).unwrap();
+        let source = cache.clone();
+        hub.set_peer_bindings(ready, Arc::new(move || source.as_ref().and_then(|c| c.bindings_snapshot())));
+        let fixture = crate::pgwire::session::tests::Fixture::new();
+        *fixture.ctx.snapshot.write().unwrap() = Arc::new(customers(&[("email", 1)]));
+        hub.register(Route::Postgres(fixture.ctx.clone())).unwrap();
+        if let Some(cache) = cache {
+            let weak = Arc::downgrade(&hub);
+            cache.set_bindings_listener(Arc::new(move || { if let Some(h) = weak.upgrade() { h.recompile_bindings(); } }));
+        }
+        Self { fixture, hub, _files: files }
+    }
+    /// Recompile using the current role and return whether membership is usable.
+    pub(crate) fn recompile(&self) -> bool {
+        self.hub.recompile_bindings();
+        !self.hub.state.lock().unwrap().units[0].routes[0].membership_failed
+    }
+    /// Read the bound policy without exposing values in assertions.
+    pub(crate) fn policy(&self) -> Arc<Policy> { self.fixture.ctx.policy.read().unwrap().clone() }
 }

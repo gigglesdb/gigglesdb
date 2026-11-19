@@ -36,16 +36,24 @@ pub struct MaintenanceOutcome {
 pub type Registry = ConnectionRegistry<SessionId, PrincipalId>;
 
 struct StoreHealth {
+    #[cfg(feature = "kubernetes")]
+    holder: OnceLock<Weak<super::leader_store::StateHolder>>,
     failures: AtomicU64,
     last_write_ok: AtomicBool,
 }
 impl Default for StoreHealth {
     fn default() -> Self {
-        Self { failures: AtomicU64::new(0), last_write_ok: AtomicBool::new(true) }
+        Self {
+            #[cfg(feature = "kubernetes")]
+            holder: OnceLock::new(),
+            failures: AtomicU64::new(0), last_write_ok: AtomicBool::new(true)
+        }
     }
 }
 impl StoreHealth {
     fn record(&self, ok: bool) {
+        #[cfg(feature = "kubernetes")]
+        if !ok && self.holder.get().and_then(Weak::upgrade).is_some_and(|h| h.is_ready().is_none()) { return; }
         if !ok { self.failures.fetch_add(1, Ordering::Relaxed); }
         self.last_write_ok.store(ok, Ordering::Relaxed);
     }
@@ -147,6 +155,8 @@ pub struct StateRuntime {
     store_health: Arc<StoreHealth>,
     store: Arc<dyn Store>,
     ends: Arc<EndCounters>,
+    #[cfg(feature = "kubernetes")]
+    holder: Option<Arc<super::leader_store::StateHolder>>,
 }
 impl fmt::Debug for StateRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -172,6 +182,8 @@ impl StateRuntime {
 
     /// Whether the most recent store write attempt succeeded, initially true.
     pub fn store_last_write_ok(&self) -> bool {
+        #[cfg(feature = "kubernetes")]
+        if self.holder.as_ref().is_some_and(|h| h.is_ready().is_none()) { return true; }
         self.store_health.last_write_ok.load(Ordering::Relaxed)
     }
     /// Return data-free session, connection and storage metrics.
@@ -196,6 +208,8 @@ impl StateRuntime {
 
     /// Sweep expiry, flush activity and periodically purge retained tombstones.
     pub fn maintain(&self, tick: u64) -> MaintenanceOutcome {
+        #[cfg(feature = "kubernetes")]
+        if self.holder.as_ref().is_some_and(|h| h.is_ready().is_none()) { return MaintenanceOutcome::default(); }
         let mut outcome = MaintenanceOutcome::default();
         match self.authority.sweep() {
             Ok(count) => outcome.swept = count,
@@ -265,7 +279,25 @@ impl StateRuntime {
             store_health,
             store,
             ends,
+            #[cfg(feature = "kubernetes")]
+            holder: None,
         })
+    }
+
+    /// Build peer state without opening or reading its closed store.
+    #[cfg(feature = "kubernetes")]
+    pub fn open_deferred(store: Arc<dyn Store>, holder: Arc<super::leader_store::StateHolder>, session: &SessionSettings) -> Arc<Self> {
+        let store_health = Arc::new(StoreHealth::default());
+        let _ = store_health.holder.set(Arc::downgrade(&holder));
+        let store = Arc::new(CountingStore { inner: store, health: store_health.clone() });
+        let authority = Authority::empty(store.clone(), session_limits(session));
+        let registry = Registry::new();
+        let lifecycle_log = Arc::new(OnceLock::new());
+        let ends = Arc::new(EndCounters::default());
+        authority.set_hook(Arc::new(RegistryHook {
+            registry: registry.clone(), authority: Arc::downgrade(&authority), log: lifecycle_log.clone(), ends: ends.clone(),
+        }));
+        Arc::new(Self { authority, registry, lifecycle_log, store_health, store, ends, holder: Some(holder) })
     }
 
     /// Open exclusive state ownership, attach revocation signals and reconcile configuration.
@@ -303,6 +335,8 @@ impl StateRuntime {
             store_health,
             store,
             ends,
+            #[cfg(feature = "kubernetes")]
+            holder: None,
         }))
     }
 }
@@ -339,6 +373,28 @@ mod tests {
         model::{Mode, PrincipalKind, PrincipalSource, RouteId},
     };
     use std::path::PathBuf;
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn deferred_runtime_is_empty_and_idle_without_creating_state() {
+        use super::super::leader_store::{LeaderStore, StateHolder, LeadershipSource};
+        let dir = TestDir::new();
+        let path = dir.0.join("unopened");
+        let open_path = path.clone();
+        let source: LeadershipSource = Arc::new(|| None);
+        let proxy = Arc::new(LeaderStore::new(source.clone(), Arc::new(|| 0)));
+        let holder = Arc::new(StateHolder::new(proxy.clone(), source, Arc::new(move || RedbStore::open(&open_path, &root()))));
+        let runtime = StateRuntime::open_deferred(proxy, holder, &SessionSettings::default());
+        assert!(!path.exists());
+        assert_eq!(runtime.authority.active_session_count(), 0);
+        assert!(runtime.authority.principal_by_name("agent").is_none());
+        runtime.store_health.record(false);
+        let failures = runtime.store_health.failures.load(Ordering::Relaxed);
+        assert_eq!(runtime.maintain(u64::from(PURGE_EVERY)), MaintenanceOutcome::default());
+        assert_eq!(runtime.store_health.failures.load(Ordering::Relaxed), failures);
+        assert!(runtime.store_last_write_ok());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn failed_write_begin_counts_once() {

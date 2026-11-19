@@ -261,6 +261,37 @@ impl Authority {
 
     /// Load and validate every application table before accepting requests.
     pub fn load(store: Arc<dyn Store>, limits: SessionLimits) -> Result<Arc<Self>, AuthorityError> {
+        let v = Self::load_view(store.as_ref())?;
+        Ok(Arc::new(Self {
+            store,
+            limits: RwLock::new(limits),
+            view: RwLock::new(v),
+            writer: Mutex::new(()),
+            hook: RwLock::new(None),
+            #[cfg(feature = "kubernetes")]
+            peer_changes: Mutex::default(),
+            sessions_issued: AtomicU64::new(0),
+            sessions_renewed: AtomicU64::new(0),
+            resumes_refused: AtomicU64::new(0),
+        }))
+    }
+    /// Construct an empty view without reading the closed peer store.
+    #[cfg(feature = "kubernetes")]
+    pub fn empty(store: Arc<dyn Store>, limits: SessionLimits) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            limits: RwLock::new(limits),
+            view: RwLock::new(View::default()),
+            writer: Mutex::new(()),
+            hook: RwLock::new(None),
+            #[cfg(feature = "kubernetes")]
+            peer_changes: Mutex::default(),
+            sessions_issued: AtomicU64::new(0),
+            sessions_renewed: AtomicU64::new(0),
+            resumes_refused: AtomicU64::new(0),
+        })
+    }
+    fn load_view(store: &dyn Store) -> Result<View, AuthorityError> {
         let mut v = View::default();
         {
             let read = store.read()?;
@@ -425,18 +456,23 @@ impl Authority {
         {
             return Err(AuthorityError::Store);
         }
-        Ok(Arc::new(Self {
-            store,
-            limits: RwLock::new(limits),
-            view: RwLock::new(v),
-            writer: Mutex::new(()),
-            hook: RwLock::new(None),
-            #[cfg(feature = "kubernetes")]
-            peer_changes: Mutex::default(),
-            sessions_issued: AtomicU64::new(0),
-            sessions_renewed: AtomicU64::new(0),
-            resumes_refused: AtomicU64::new(0),
-        }))
+        Ok(v)
+    }
+    /// Rebuild the authoritative view from validated durable records.
+    #[cfg(feature = "kubernetes")]
+    pub fn reload(&self) -> Result<(), AuthorityError> {
+        let _writer = self.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let view = Self::load_view(self.store.as_ref())?;
+        *self.view.write().unwrap_or_else(std::sync::PoisonError::into_inner) = view;
+        self.peer_changes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).invalidate();
+        Ok(())
+    }
+    /// Empty the authoritative view without accessing durable storage.
+    #[cfg(feature = "kubernetes")]
+    pub fn clear(&self) {
+        let _writer = self.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self.view.write().unwrap_or_else(std::sync::PoisonError::into_inner) = View::default();
+        self.peer_changes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).invalidate();
     }
     /// Install the post-commit termination hook.
     pub fn set_hook(&self, hook: Arc<dyn RevocationHook>) {

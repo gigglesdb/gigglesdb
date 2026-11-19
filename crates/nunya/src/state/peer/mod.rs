@@ -57,6 +57,13 @@ impl Default for ChangeLog {
     }
 }
 impl ChangeLog {
+    pub(crate) fn invalidate(&mut self) {
+        // A distinct cursor epoch forces a refetch even with the same Lease term.
+        self.epoch = self.epoch.wrapping_add(1u64 << 32);
+        self.seq = 0;
+        self.rows.clear();
+    }
+
     pub(crate) fn push(&mut self, id: SessionId, reason: EndReason) {
         self.push_kind(id, ChangeKind::End { reason });
     }

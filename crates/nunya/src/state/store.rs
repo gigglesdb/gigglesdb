@@ -243,6 +243,73 @@ impl Store for RedbStore {
     }
 }
 
+#[cfg(feature = "kubernetes")]
+impl RedbStore {
+    pub(crate) fn owned_read(&self) -> Result<Box<dyn ReadTxn>, StoreError> {
+        Ok(Box::new(RedbRead(self.db.begin_read().map_err(|_| StoreError::Io)?)))
+    }
+    pub(crate) fn owned_write(self: &Arc<Self>) -> Result<Box<dyn WriteTxn>, StoreError> {
+        Ok(Box::new(OwnedRedbWrite {
+            txn: self.db.begin_write().map_err(|_| StoreError::Io)?,
+            _owner: self.clone(),
+        }))
+    }
+}
+#[cfg(feature = "kubernetes")]
+struct OwnedRedbWrite {
+    txn: redb::WriteTransaction,
+    _owner: Arc<RedbStore>,
+}
+#[cfg(feature = "kubernetes")]
+impl ReadTxn for OwnedRedbWrite {
+    fn get(&self, t: Table, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        let table = self
+            .txn
+            .open_table(t.definition())
+            .map_err(|_| StoreError::Io)?;
+        Ok(table
+            .get(key)
+            .map_err(|_| StoreError::Io)?
+            .map(|value| value.value().to_vec()))
+    }
+    fn scan_prefix(&self, t: Table, prefix: &[u8]) -> Result<ScanRows, StoreError> {
+        scan(
+            &self
+                .txn
+                .open_table(t.definition())
+                .map_err(|_| StoreError::Io)?,
+            prefix,
+        )
+    }
+}
+#[cfg(feature = "kubernetes")]
+impl WriteTxn for OwnedRedbWrite {
+    fn put(&mut self, t: Table, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.txn
+            .open_table(t.definition())
+            .map_err(|_| StoreError::Io)?
+            .insert(key, value)
+            .map_err(|_| StoreError::Io)?;
+        Ok(())
+    }
+    fn delete(&mut self, t: Table, key: &[u8]) -> Result<bool, StoreError> {
+        Ok(self
+            .txn
+            .open_table(t.definition())
+            .map_err(|_| StoreError::Io)?
+            .remove(key)
+            .map_err(|_| StoreError::Io)?
+            .is_some())
+    }
+    fn commit(self: Box<Self>) -> Result<(), StoreError> {
+        #[cfg(test)]
+        if self._owner.fail_commits.load(Ordering::SeqCst) {
+            return Err(StoreError::Io);
+        }
+        self.txn.commit().map_err(|_| StoreError::Io)
+    }
+}
+
 struct RedbRead(redb::ReadTransaction);
 struct RedbWrite<'a> {
     txn: redb::WriteTransaction,

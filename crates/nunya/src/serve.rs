@@ -85,10 +85,26 @@ impl<T> Drop for AbortTask<T> {
 struct ElectionTask {
     shutdown: tokio::sync::watch::Sender<bool>,
     task: JoinHandle<Result<(), crate::policy::kube_leader::ElectionError>>,
+    holder: Option<Arc<crate::state::leader_store::StateHolder>>,
+    holder_task: Option<JoinHandle<()>>,
+    holder_shutdown: Option<tokio::sync::watch::Sender<bool>>,
 }
 #[cfg(feature = "kubernetes")]
 impl Drop for ElectionTask {
-    fn drop(&mut self) { let _ = self.shutdown.send(true); }
+    fn drop(&mut self) {
+        if let Some(shutdown) = &self.holder_shutdown { let _ = shutdown.send(true); }
+        let holder_task = self.holder_task.take();
+        let holder = self.holder.take();
+        let shutdown = self.shutdown.clone();
+        // Await any in-progress blocking tick, then fence before releasing the Lease.
+        tokio::spawn(async move {
+            if let Some(task) = holder_task { let _ = task.await; }
+            if let Some(holder) = holder {
+                let _ = tokio::task::spawn_blocking(move || holder.close()).await;
+            }
+            let _ = shutdown.send(true);
+        });
+    }
 }
 #[derive(Default)]
 pub(crate) struct Revisions {
@@ -636,19 +652,30 @@ impl crate::mgmt::policy::PolicySource for ManagementPolicy {
 }
 
 /// Serve agents until a shutdown signal, draining active sessions for thirty seconds.
-pub async fn run(mut config: Config) -> Result<(), String> {
-    let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
-    let root_key =
-        crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
-    let runtime = crate::state::runtime::StateRuntime::open(
-        &config.state_dir,
-        &root_key,
-        &config.session,
-        &config.standing,
-    )?;
-    let maintenance = AbortTask(tokio::spawn(runtime.clone().run_maintenance(
-        crate::state::runtime::MAINTENANCE_INTERVAL,
-    )));
+pub async fn run(config: Config) -> Result<(), String> {
+    #[cfg(feature = "kubernetes")]
+    let mut election_task = None;
+    let result = run_inner(config, #[cfg(feature = "kubernetes")] &mut election_task).await;
+    #[cfg(feature = "kubernetes")]
+    if let Some(mut task) = election_task {
+        if let Some(shutdown) = &task.holder_shutdown { let _ = shutdown.send(true); }
+        if let Some(holder_task) = task.holder_task.take() { let _ = holder_task.await; }
+        if let Some(holder) = task.holder.take() {
+            let _ = tokio::task::spawn_blocking(move || holder.close()).await;
+        }
+        let _ = task.shutdown.send(true);
+        let _ = (&mut task.task).await;
+    }
+    result
+}
+async fn run_inner(mut config: Config, #[cfg(feature = "kubernetes")] election_task: &mut Option<ElectionTask>) -> Result<(), String> {
+    #[cfg(feature = "kubernetes")]
+    let management_dir = if config.kubernetes.is_some() {
+        let k = config.policy_store_kubernetes.as_ref().ok_or("Kubernetes settings unavailable")?;
+        crate::mgmt::server::peer_socket_dir(&config.state_dir, &k.pod_name)?
+    } else { config.state_dir.clone() };
+    #[cfg(not(feature = "kubernetes"))]
+    let management_dir = config.state_dir.clone();
     let postgres_route = if config.upstream.is_some() {
         Some(
             config
@@ -689,6 +716,32 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 retry_period: Duration::from_secs(k.retry_period_secs),
             }).map_err(|_| "Kubernetes election configuration invalid")?))
     } else { None };
+    let root_hex = zeroize::Zeroizing::new(data_encoding::HEXLOWER.encode(&*config.root_key));
+    let root_key =
+        crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
+    #[cfg(feature = "kubernetes")]
+    let holder = if config.kubernetes.is_some() {
+        let (_, candidate) = elector.as_ref().ok_or("peer mode requires Kubernetes policy store")?;
+        let leader = candidate.state();
+        let source: crate::state::leader_store::LeadershipSource = Arc::new(move || leader.held_term());
+        let proxy = Arc::new(crate::state::leader_store::LeaderStore::new(source.clone(), Arc::new(now)));
+        let path = config.state_dir.clone();
+        Some((proxy.clone(), Arc::new(crate::state::leader_store::StateHolder::new(proxy, source,
+            Arc::new(move || crate::state::store::RedbStore::open(&path, &root_key))))))
+    } else { None };
+    #[cfg(feature = "kubernetes")]
+    let runtime = if let Some((proxy, holder)) = &holder {
+        crate::state::runtime::StateRuntime::open_deferred(proxy.clone(), holder.clone(), &config.session)
+    } else {
+        let root_key = crate::token::keys::RootKey::from_hex(&root_hex).map_err(|_| "root key unavailable")?;
+        crate::state::runtime::StateRuntime::open(&config.state_dir, &root_key, &config.session, &config.standing)?
+    };
+    #[cfg(not(feature = "kubernetes"))]
+    let runtime = crate::state::runtime::StateRuntime::open(&config.state_dir, &root_key, &config.session, &config.standing)?;
+    drop(root_hex);
+    let maintenance = AbortTask(tokio::spawn(runtime.clone().run_maintenance(crate::state::runtime::MAINTENANCE_INTERVAL)));
+    #[cfg(feature = "kubernetes")]
+    let principals = Arc::new(Mutex::new(crate::state::runtime::config_principals(&config.standing)));
     let leadership: Option<Arc<dyn crate::mgmt::routes::Leadership>>;
     let revision_store: Arc<dyn crate::policy::RevisionStore>;
     #[cfg(feature = "kubernetes")]
@@ -711,14 +764,18 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let serving_client = elector.as_ref().map(|(client, candidate)| (client.clone(), candidate.state()));
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     #[cfg(feature = "kubernetes")]
-    let election_task = if let Some((_, candidate)) = elector {
+    { *election_task = if let Some((_, candidate)) = elector {
         // Make one attempt before startup ownership writes; followers still fail closed.
         let candidate = tokio::task::spawn_blocking(move || {
             let _ = candidate.tick();
             candidate
         }).await.map_err(|_| "Kubernetes election unavailable")?;
-        Some(ElectionTask { shutdown: shutdown.clone(), task: tokio::spawn(candidate.run(rx.clone())) })
-    } else { None };
+        let (election_shutdown, election_rx) = if holder.is_some() {
+            tokio::sync::watch::channel(false)
+        } else { (shutdown.clone(), rx.clone()) };
+        Some(ElectionTask { shutdown: election_shutdown, task: tokio::spawn(candidate.run(election_rx)),
+            holder: holder.as_ref().map(|(_, h)| h.clone()), holder_task: None, holder_shutdown: None })
+    } else { None }; }
     let mut hub = if config.policy_store == crate::config::PolicyStore::Kubernetes {
         let store = revision_store.clone();
         let routes = policy_routes.clone();
@@ -757,9 +814,9 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         }
         let observed_leader = leader.clone();
         cache.set_leadership_source(Arc::new(move || observed_leader.is_leader()));
-        let binding_leader = leader.clone();
+        let binding_holder = holder.as_ref().ok_or("peer state holder unavailable")?.1.clone();
         let binding_cache = cache.clone();
-        hub.set_peer_bindings(Arc::new(move || binding_leader.is_leader()), Arc::new(move || binding_cache.bindings_snapshot()));
+        hub.set_peer_bindings(Arc::new(move || binding_holder.is_ready().is_some()), Arc::new(move || binding_cache.bindings_snapshot()));
         let binding_hub = Arc::downgrade(&hub);
         cache.set_bindings_listener(Arc::new(move || { if let Some(hub) = binding_hub.upgrade() { hub.recompile_bindings(); } }));
         let limits_hub = hub.clone();
@@ -783,7 +840,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             }
             selected
         });
-        let server = crate::state::peer::PeerServer::new(runtime.authority.clone(), leader.clone(), auth, Default::default()).with_bindings_store(runtime.store()).map_err(|e| e.to_string())?.with_limit_source(source).map_err(|e| e.to_string())?.with_serving_gate(hub.serving_gate.clone().ok_or("serving gate unavailable")?).map_err(|e| e.to_string())?;
+        let server = crate::state::peer::PeerServer::new(runtime.authority.clone(), leader.clone(), auth, Default::default()).with_ready({ let h = holder.as_ref().ok_or("peer state holder unavailable")?.1.clone(); Arc::new(move || h.is_ready()) }).map_err(|e| e.to_string())?.with_bindings_store(runtime.store()).map_err(|e| e.to_string())?.with_limit_source(source).map_err(|e| e.to_string())?.with_serving_gate(hub.serving_gate.clone().ok_or("serving gate unavailable")?).map_err(|e| e.to_string())?;
         let listener = tokio::net::TcpListener::bind(peer.listen).await.map_err(|_| "peer listener unavailable")?;
         (Some(cache), Some(AbortTask(tokio::spawn(server.serve(listener)))))
     } else { (None, None) };
@@ -811,6 +868,29 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let config_reload = Arc::new(crate::config_reload::ConfigReloader::new(
         crate::config_reload::copy_config(&config), Arc::downgrade(&hub),
     ));
+    #[cfg(feature = "kubernetes")]
+    if let Some((_, holder)) = &holder {
+        config_reload.attach_peer(holder.clone(), principals.clone());
+        let authority = runtime.authority.clone();
+        let latest = principals.clone();
+        let weak_hub = Arc::downgrade(&hub);
+        holder.on_ready(Arc::new(move || {
+            let hub = weak_hub.upgrade().ok_or(crate::state::store::StoreError::Io)?;
+            hub.discard_pending_membership();
+            authority.reload().map_err(|_| crate::state::store::StoreError::Io)?;
+            authority.sync_config_principals(&latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+                .map_err(|_| crate::state::store::StoreError::Io)?;
+            hub.adopt_leader_heads().map_err(|_| crate::state::store::StoreError::Io)?;
+            hub.recompile_leader_bindings().map_err(|_| crate::state::store::StoreError::Io)?;
+            Ok(())
+        }));
+        let authority = runtime.authority.clone();
+        let weak_hub = Arc::downgrade(&hub);
+        holder.on_closed(Arc::new(move || {
+            authority.clear();
+            if let Some(hub) = weak_hub.upgrade() { hub.discard_pending_membership(); }
+        }));
+    }
     let transports = crate::config_reload::Transports::new(&config)?;
     config_reload.attach_transports(transports.clone());
     config_reload.attach(runtime.authority.clone(), admins.clone());
@@ -855,9 +935,17 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             lifecycle: Arc::new(crate::mgmt::audit::ReadLogSink(hub.log.clone())),
         };
         Some(crate::mgmt::server::spawn_with_tls(Arc::new(ctx), config.management.as_ref(),
-            &config.state_dir, rx.clone(), transports.management.clone()).await.map_err(|err| err.to_string())?)
+            &management_dir, rx.clone(), transports.management.clone()).await.map_err(|err| err.to_string())?)
     } else { None };
 
+    #[cfg(feature = "kubernetes")]
+    let (holder_shutdown, holder_rx) = tokio::sync::watch::channel(false);
+    #[cfg(feature = "kubernetes")]
+    if let (Some((_, holder)), Some(task)) = (&holder, election_task.as_mut()) {
+        let period = Duration::from_secs(config.policy_store_kubernetes.as_ref().ok_or("Kubernetes settings unavailable")?.retry_period_secs);
+        task.holder_shutdown = Some(holder_shutdown.clone());
+        task.holder_task = Some(tokio::spawn(holder.clone().run(holder_rx, period)));
+    }
     let mut routes = JoinSet::new();
     if let Some(section) = config.spanner_native.take() {
         let state = crate::spanner_serve::RouteState {
@@ -929,8 +1017,6 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         }
     };
     if let Some(management) = management { management.wait().await; }
-    #[cfg(feature = "kubernetes")]
-    if let Some(mut task) = election_task { let _ = (&mut task.task).await; }
     // Abort maintenance before releasing the runtime after all routes have drained.
     drop(maintenance);
     // Retain exclusive state ownership until all routes have drained.

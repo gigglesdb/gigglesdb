@@ -20,3 +20,10 @@ pub mod serving_state;
 /// Authenticated leader state transport.
 #[cfg(feature = "kubernetes")]
 pub mod peer;
+
+/// Fenced leader-only state ownership.
+#[cfg(feature = "kubernetes")]
+pub mod leader_store;
+
+#[cfg(all(test, feature = "kubernetes"))]
+mod failover_tests;

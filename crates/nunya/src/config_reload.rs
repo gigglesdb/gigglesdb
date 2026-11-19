@@ -430,8 +430,13 @@ struct State {
     failures: u64,
     standing_pending: u64,
 }
+#[cfg(feature = "kubernetes")]
+type PrincipalCell = Arc<Mutex<Vec<ConfigPrincipal>>>;
+
 /// Serialized configuration reloads and data-free operational status.
 pub(crate) struct ConfigReloader {
+    #[cfg(feature = "kubernetes")]
+    peer: OnceLock<(Arc<crate::state::leader_store::StateHolder>, PrincipalCell)>,
     path: PathBuf,
     serial: tokio::sync::Mutex<()>,
     catalog: OnceLock<CatalogApplier>,
@@ -476,6 +481,8 @@ impl ConfigReloader {
     /// Retain the startup configuration and weak publication target.
     pub(crate) fn new(config: Config, hub: Weak<Hub>) -> Self {
         Self {
+            #[cfg(feature = "kubernetes")]
+            peer: OnceLock::new(),
             path: config.path.clone(),
             serial: tokio::sync::Mutex::new(()),
             catalog: OnceLock::new(),
@@ -493,6 +500,11 @@ impl ConfigReloader {
                 standing_pending: 0,
             }),
         }
+    }
+    /// Defer standing updates while shared state is closed.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn attach_peer(&self, holder: Arc<crate::state::leader_store::StateHolder>, principals: PrincipalCell) {
+        assert!(self.peer.set((holder, principals)).is_ok(), "peer reload already attached");
     }
     /// Attach live authority and shared management credentials before reloads start.
     pub(crate) fn attach(&self, authority: Arc<Authority>, admins: Admins) {
@@ -544,6 +556,8 @@ impl ConfigReloader {
         } else { Ok(None) };
         let prepared = prepared.and_then(|p| candidate.map(|c| (p, c)).map_err(str::to_owned));
         let mut standing_pending = false;
+        #[cfg(feature = "kubernetes")]
+        let mut deferred = false;
         let result = prepared.and_then(|(prepared, candidate)| {
             let hub = self.hub.upgrade().ok_or("reload service unavailable")?;
             let revision = prepared.config.revision.clone();
@@ -551,7 +565,13 @@ impl ConfigReloader {
             let refresh = route.as_ref().zip(candidate);
             hub.commit_config_refresh(&revision, refresh, || {
                 if let Some((authority, admins)) = self.appliers.get() {
-                    if prepared.diff.reloadable.contains(&"standing") {
+                    #[cfg(feature = "kubernetes")]
+                    let peer_principals = self.peer.get().map(|(_, p)| p.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+                    #[cfg(feature = "kubernetes")]
+                    { deferred = self.peer.get().is_some_and(|(h, _)| h.defer_config_if_closed()); }
+                    #[cfg(not(feature = "kubernetes"))]
+                    let deferred = false;
+                    if prepared.diff.reloadable.contains(&"standing") && !deferred {
                         let counts = authority.sync_config_principals(&prepared.principals)
                             .map_err(|error| {
                                 standing_pending = error == crate::state::authority::AuthorityError::StandingPending;
@@ -570,6 +590,8 @@ impl ConfigReloader {
                             Ok(())
                         })?;
                     }
+                    #[cfg(feature = "kubernetes")]
+                    if let Some(mut principals) = peer_principals { *principals = prepared.principals.clone(); }
                 }
                 if let Some(transports) = self.transports.get() {
                     transports.apply(prepared.route_tls, prepared.management_tls, prepared.config.max_connections);
@@ -588,6 +610,8 @@ impl ConfigReloader {
                 }
                 let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 self.commit(&mut state, prepared.config, prepared.diff);
+                #[cfg(feature = "kubernetes")]
+                if deferred { state.last = "standing_pending"; state.standing_pending += 1; }
                 Ok(())
             })?;
             Ok(())
@@ -848,6 +872,41 @@ key_file='key'
         format!("[{}]", names.iter().map(|name| format!("{{name='{name}',verifier='{v}'}}"))
             .collect::<Vec<_>>().join(","))
     }
+    #[cfg(feature = "kubernetes")]
+    #[tokio::test]
+    async fn closed_holder_defers_reload_and_next_ready_applies_latest_principals() {
+        use crate::state::{leader_store::{LeaderStore, StateHolder, LeadershipSource}, store::RedbStore};
+        let f = Fixture::new();
+        let config = f.load(&f.text);
+        let hub = f.hub();
+        let source: LeadershipSource = Arc::new(|| Some(1));
+        let proxy = Arc::new(LeaderStore::new(source.clone(), Arc::new(crate::serve::now)));
+        let path = config.state_dir.clone();
+        let root = crate::token::keys::RootKey::from_hex(&"01".repeat(32)).unwrap();
+        let holder = Arc::new(StateHolder::new(proxy.clone(), source, Arc::new(move || RedbStore::open(&path, &root))));
+        let runtime = StateRuntime::open_deferred(proxy, holder.clone(), &config.session);
+        let latest = Arc::new(Mutex::new(config_principals(&config.standing)));
+        let reload = ConfigReloader::new(config, Arc::downgrade(&hub));
+        reload.attach(runtime.authority.clone(), Arc::default());
+        reload.attach_peer(holder.clone(), latest.clone());
+        let authority = runtime.authority.clone();
+        holder.on_ready(Arc::new(move || {
+            authority.reload().map_err(|_| crate::state::store::StoreError::Io)?;
+            authority.sync_config_principals(&latest.lock().unwrap()).map_err(|_| crate::state::store::StoreError::Io)?;
+            Ok(())
+        }));
+        f.load(&edit(&f.text, "standing", &entries(&["added"], "fixture")));
+        reload.reload().await;
+        assert_eq!(reload.last_reload(), "standing_pending");
+        assert_eq!(reload.state.lock().unwrap().failures, 0);
+        assert!(runtime.authority.principal_by_name("added").is_none());
+        holder.tick();
+        assert_eq!(holder.is_ready(), Some(1));
+        assert!(runtime.authority.principal_by_name("added").is_some());
+        assert!(runtime.authority.principal_by_name("agent").is_none());
+        holder.close();
+    }
+
     #[tokio::test]
     async fn standing_removal_pending_is_visible_and_same_file_retries() {
         use crate::state::store::RedbStore;

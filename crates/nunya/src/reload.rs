@@ -715,7 +715,59 @@ impl Hub {
     /// Recompile current documents after a binding snapshot or leadership change.
     #[cfg(feature = "kubernetes")]
     pub(crate) fn recompile_bindings(&self) {
-        let follower = self.is_follower();
+        self.recompile_bindings_with_role(self.is_follower());
+    }
+    /// Compile the opened leader store before publishing holder readiness.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn recompile_leader_bindings(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|_| "policy publication unavailable")?;
+        let independent = state.units.len() > 1;
+        for unit in &mut state.units {
+            let stamp = unit.revisions.read().map_err(|_| "policy revision unavailable")?.policy.clone();
+            let hash = unit.hash.clone();
+            let result = self.apply_unit_with_role(unit, independent, Ok((*unit.doc).clone()), Some(stamp.clone()), false);
+            unit.hash = hash;
+            result?;
+            if let Some(store) = self.store.read().map_err(|_| "policy bindings unavailable")?.as_ref() {
+                for route in &unit.routes {
+                    let id = RouteId::new(route.id()).ok_or("route unavailable")?;
+                    if bindings::load_reset(store.as_ref(), &id).map_err(|_| "membership reset unavailable")?.is_some() {
+                        return Err("membership reset publication unavailable".into());
+                    }
+                    bindings::record_route_stamp(store.as_ref(), &id, &stamp).map_err(|_| "binding stamp unavailable")?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Drop transient reset work at a leadership boundary under the publication lock.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn discard_pending_membership(&self) {
+        let _state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.pending_membership.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+    }
+    /// Read every current head before reconciling any route as the initializing leader.
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn adopt_leader_heads(&self) -> Result<(), String> {
+        let routes: Vec<_> = self.state.lock().map_err(|_| "policy publication unavailable")?
+            .configured.iter().map(|(route, _)| route.clone()).collect();
+        let heads = routes.iter().map(|route| {
+            let owner = self.owner(route).map_err(|_| "policy ownership unavailable")?;
+            let head = self.active_revision(route).map_err(|_| "policy head unavailable")?;
+            if owner == Owner::Service && head.is_none() { return Err("policy head unavailable"); }
+            Ok((route.clone(), owner, head))
+        }).collect::<Result<Vec<_>, _>>()?;
+        let mut state = self.state.lock().map_err(|_| "policy publication unavailable")?;
+        for (route, owner, head) in heads {
+            self.route_owners.write().map_err(|_| "policy ownership unavailable")?.insert(route.as_str().into(), owner);
+            if owner == Owner::Service && let Some(head) = head {
+                self.publish_revision(&mut state, &route, &head, false).map_err(|_| "policy adoption unavailable")?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(feature = "kubernetes")]
+    fn recompile_bindings_with_role(&self, follower: bool) {
         let Ok(mut state) = self.state.lock() else { return; };
         let independent = state.units.len() > 1;
         for unit in &mut state.units {
@@ -1316,7 +1368,7 @@ impl Watcher {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         policy::{ReadLogSink, Treatment},
@@ -3106,6 +3158,118 @@ mod tests {
         assert!(!hub.state.lock().unwrap().units[0].routes[0].membership_failed);
     }
 
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn promotion_adopts_head_before_reconciling_generated_link() {
+        let files = Files::new();
+        let a = tokenize_hub(&files, &["postgres"]);
+        let b = tokenize_hub(&files, &["postgres"]);
+        let store = binding_store(&files);
+        let backend = Arc::new(crate::policy::LocalRevisionStore::new(store.clone()));
+        a.set_store(store.clone()).unwrap(); a.set_revision_store(backend.clone()).unwrap();
+        let catalog = customers(&[("email", 1), ("other", 2)]);
+        a.register(test_route("postgres", catalog.clone())).unwrap();
+        let route = id("postgres");
+        let n1 = a.import_policy(&route, "admin", None).unwrap();
+        b.set_store(store.clone()).unwrap(); b.set_revision_store(backend).unwrap();
+        b.register(test_route("postgres", catalog)).unwrap();
+        assert_eq!(b.policy_revision_for(&route), Some(revision_stamp(&n1)));
+        let linked = "version=2\ndefault='tokenize'\n[[link]]\nfields=['public.customers.email','public.customers.other']\n";
+        let n = a.apply_policy(&route, "admin", linked, n1.number, &a.current_catalog_fingerprint(&route).unwrap(), None).unwrap();
+        let expected = a.state.lock().unwrap().units[0].routes[0].policy.clone();
+        // Holder readiness remains false during initialization: adoption must force the leader role.
+        b.set_peer_bindings(Arc::new(|| false), Arc::new(|| None));
+        b.discard_pending_membership();
+        b.adopt_leader_heads().unwrap();
+        b.recompile_leader_bindings().unwrap();
+        let actual = b.state.lock().unwrap().units[0].routes[0].policy.clone();
+        peer_pods::tokens_equal(&expected, &actual, &["email", "other"]);
+        let snapshot = bindings::snapshot(store.as_ref()).unwrap();
+        assert_eq!(snapshot.routes["postgres"].revision, n.number);
+        assert_eq!(snapshot.routes["postgres"].stamp, revision_stamp(&n));
+        assert_eq!(b.policy_revision_for(&route), Some(revision_stamp(&n)));
+        *b.revision_store.write().unwrap() = None;
+        assert!(b.adopt_leader_heads().is_err());
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn promotion_discards_stale_pending_reset_after_other_leader_completed_it() {
+        use crate::state::{authority::{AcquireRequest, Authority, SessionLimits}, model::{Mode, PrincipalKind, SessionState, Verifier}};
+        let files = Files::new();
+        let a = tokenize_hub(&files, &["a"]);
+        let b = tokenize_hub(&files, &["a"]);
+        let store = binding_store(&files);
+        let catalog = customers(&[("email", 1), ("other", 2)]);
+        for hub in [&a, &b] {
+            hub.set_store(store.clone()).unwrap();
+            hub.register(test_route("a", catalog.clone())).unwrap();
+        }
+        let mut linked = (*a.state.lock().unwrap().units[0].doc).clone();
+        linked.links.push(crate::policy::LinkRule { fields: vec![customer_column("email"), customer_column("other")], domain: None });
+        *a.reset_callback.write().unwrap() = Some(Arc::new(|_, _| Err("deposed".into())));
+        assert!(a.apply(0, Ok(linked.clone()), Some("rev-2-linked".into())).is_err());
+        assert!(!a.pending_membership.lock().unwrap().is_empty());
+        assert!(bindings::load_reset(store.as_ref(), &id("a")).unwrap().is_some());
+        b.apply(0, Ok(linked.clone()), Some("rev-2-linked".into())).unwrap();
+        assert!(bindings::load_reset(store.as_ref(), &id("a")).unwrap().is_none());
+        let authority = Authority::load(store.clone(), SessionLimits::default()).unwrap();
+        let principal = authority.create_principal("agent-b", PrincipalKind::Agent, false, "b").unwrap();
+        authority.set_grants(principal.id, vec![(id("a"), Mode::ReadOnly)]).unwrap();
+        let session = authority.acquire_session(principal.id, AcquireRequest {
+            route: id("a"), mode: None, lifetime_ms: None, isolated: false, label: None,
+            idempotency_key: "b-session".into(),
+            verifier: Verifier(crate::pgwire::auth::ScramVerifier::from_password("test", b"salt", 2)), secret_sha256: [0; 32],
+        }).unwrap();
+        a.set_authority(Arc::downgrade(&authority)).unwrap();
+        // A receives the current policy as a follower; its old transient reset still exists.
+        a.state.lock().unwrap().units[0].doc = Arc::new(linked);
+        a.discard_pending_membership();
+        a.recompile_leader_bindings().unwrap();
+        assert_eq!(authority.session(session.id).unwrap().state, SessionState::Active);
+        assert!(a.pending_membership.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binding_initialization_failure_fences_peer_until_retry() {
+        use crate::state::{authority::{Authority, SessionLimits}, leader_store::{LeaderStore, StateHolder}, peer::{Lookup, PeerAuth, PeerClient, PeerError, PeerServer}, store::{RedbStore, StoreError}};
+        let files = Files::new();
+        let hub = tokenize_hub(&files, &["postgres"]);
+        let bindings_store = binding_store(&files);
+        hub.set_store(bindings_store.clone()).unwrap();
+        hub.register(test_route("postgres", customers(&[("email", 1)]))).unwrap();
+        *hub.state.lock().unwrap().units[0].routes[0].locks().1.write().unwrap() = Arc::new(customers(&[("email", 1), ("other", 2)]));
+        let leadership = Arc::new(|| Some(1));
+        let proxy = Arc::new(LeaderStore::new(leadership.clone(), Arc::new(|| 0)));
+        let path = files.dir.join("holder");
+        let holder = Arc::new(StateHolder::new(proxy.clone(), leadership, Arc::new(move || RedbStore::open(&path, &crate::token::keys::RootKey::from_hex(&"01".repeat(32)).unwrap()))));
+        let authority = Authority::empty(proxy, SessionLimits::default());
+        let a = authority.clone(); let h = hub.clone();
+        holder.on_ready(Arc::new(move || {
+            a.reload().map_err(|_| StoreError::Io)?;
+            a.sync_config_principals(&[]).map_err(|_| StoreError::Io)?;
+            h.recompile_leader_bindings().map_err(|_| StoreError::Io)
+        }));
+        bindings_store.fail_commits(true);
+        holder.tick();
+        assert_eq!(holder.is_ready(), None);
+        let ready = holder.clone();
+        let server = PeerServer::new(authority, crate::policy::kube_leader::LeaderState::live_for_test(), Arc::new(PeerAuth::new(&[7; 32]).unwrap()), Default::default())
+            .with_ready(Arc::new(move || ready.is_ready())).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = PeerClient::with_url(format!("http://{}", listener.local_addr().unwrap()), "b".into(), Arc::new(PeerAuth::new(&[7; 32]).unwrap()));
+        let gate = Arc::new(crate::policy::serving::ServingGate::default());
+        gate.extend_to(u64::MAX);
+        let server = server.with_serving_gate(gate).unwrap();
+        let task = tokio::spawn(server.serve(listener));
+        assert!(matches!(client.session_lookup(Lookup { session_id: crate::token::SessionId::random() }, Duration::from_secs(5)).await, Err(PeerError::NotLeader)));
+        bindings_store.fail_commits(false);
+        holder.tick();
+        assert_eq!(holder.is_ready(), Some(1));
+        holder.close(); task.abort(); let _ = task.await;
+    }
+
     #[cfg(all(test, feature = "kubernetes"))]
-    mod peer_pods { include!("reload/peer_pods_tests.rs"); }
+    pub(crate) mod peer_pods { include!("reload/peer_pods_tests.rs"); }
 }
