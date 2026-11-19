@@ -224,6 +224,7 @@ fn receive_one<'a>(
     };
     guard.receiving = true;
     drop(guard);
+    let _durable = crate::Cancellation::current_durable_token();
     let outcome = loop {
         if let Err(error) = crate::cancellation::check() {
             // Cancellation must not lose the oldest ack or leave receiving set.

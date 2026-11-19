@@ -443,8 +443,10 @@ impl ApiRuntime {
         self.stopping.store(true, Ordering::Release);
         self.registry.stop();
         let _ = self.stop.send(true);
-        if let Some(task) = self.supervisor.lock().await.take() {
-            let _ = task.await;
+        if let Some(task) = self.supervisor.lock().await.take()
+            && tokio::time::timeout(crate::transport::IO_TIMEOUT, task).await.is_err()
+        {
+            eprintln!("API shutdown supervisor drain timed out");
         }
     }
 }

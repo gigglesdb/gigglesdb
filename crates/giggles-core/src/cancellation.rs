@@ -14,6 +14,7 @@ use std::{
 pub struct Cancellation(Arc<Context>);
 #[derive(Default)]
 struct Context {
+    durable: Mutex<Option<Arc<crate::DurableTracker>>>,
     state: AtomicU8,
     deadline: Mutex<Option<Instant>>,
     lock_timeout: Mutex<Option<Duration>>,
@@ -22,10 +23,26 @@ thread_local! { static CURRENT: RefCell<Option<Cancellation>> = const { RefCell:
 impl Cancellation {
     pub fn new(deadline: Option<Instant>) -> Self {
         Self(Arc::new(Context {
+            durable: Mutex::new(None),
             state: AtomicU8::new(0),
             deadline: Mutex::new(deadline),
             lock_timeout: Mutex::new(None),
         }))
+    }
+    pub fn set_durable_tracker(&self, tracker: Arc<crate::DurableTracker>) {
+        *self.0.durable.lock().expect("durable tracker") = Some(tracker);
+    }
+    pub fn durable_tracker(&self) -> Option<Arc<crate::DurableTracker>> {
+        self.0.durable.lock().expect("durable tracker").clone()
+    }
+    /// Borrow the current scope without cloning it; registration allocates nothing.
+    pub(crate) fn current_durable_token() -> Option<crate::LiveToken> {
+        CURRENT.with(|current| {
+            let current = current.borrow();
+            let context = current.as_ref()?;
+            let tracker = context.0.durable.lock().expect("durable tracker");
+            tracker.as_ref().map(|tracker| tracker.register())
+        })
     }
     pub fn current() -> Option<Self> {
         CURRENT.with(|c| c.borrow().clone())

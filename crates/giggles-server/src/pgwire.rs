@@ -1226,6 +1226,38 @@ pub(crate) fn admission_exempt(sql: &str) -> bool {
 // A Simple Query batch may contain recovery controls followed by ordinary SQL.
 // Release both pools between its statements before waiting for the next role
 // permit. Waiting here uses a Tokio worker but never a shared blocking-pool slot.
+// Fields drop in declaration order, including when execution unwinds.
+struct BlockingOwner<S, T, A, L, U> {
+    session: S,
+    state: T,
+    _agent: A,
+    _live: L,
+    _submitted: U,
+}
+
+#[cfg(test)]
+mod blocking_owner_tests {
+    #[test]
+    fn unwind_keeps_tracking_until_session_state_and_agent_retire() {
+        use std::sync::{Arc, Mutex};
+        struct Record(u8, Arc<Mutex<Vec<u8>>>);
+        impl Drop for Record {
+            fn drop(&mut self) { self.1.lock().unwrap().push(self.0); }
+        }
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let copy = order.clone();
+        assert!(std::panic::catch_unwind(move || {
+            let _owner = super::BlockingOwner {
+                session: Record(0, copy.clone()), state: Record(1, copy.clone()),
+                _agent: Record(2, copy.clone()), _live: Record(3, copy.clone()),
+                _submitted: Record(4, copy),
+            };
+            panic!("execution unwind");
+        }).is_err());
+        assert_eq!(*order.lock().unwrap(), [0, 1, 2, 3, 4]);
+    }
+}
+
 struct ExecutionAdmission {
     role_permit: Option<crate::admission::RolePermit>,
     blocking: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -3084,7 +3116,15 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                     .pgwire_blocking_tasks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !matches!(
-                    tokio::task::spawn_blocking(move || gate()).await,
+                    {
+                        let service = session.service.clone();
+                        let submitted = service.pgwire_submission_token();
+                        tokio::task::spawn_blocking(move || {
+                            let _submitted = submitted;
+                            let _live = service.pgwire_live_token();
+                            gate()
+                        }).await
+                    },
                     Ok(Ok(()))
                 ) {
                     let mut out = Vec::new();
@@ -3263,9 +3303,13 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                 .service
                 .pgwire_blocking_tasks
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let submitted = session.service.pgwire_submission_token();
             tokio::task::spawn_blocking(move || {
-                // Dropped last, after `execution_admission` (R3-403 release order).
-                let _agent_slot = agent_slot;
+                let live = session.service.pgwire_live_token();
+                let mut owner = BlockingOwner {
+                    session, state, _agent: agent_slot, _live: live, _submitted: submitted,
+                };
+                let (session, state) = (&mut owner.session, &mut owner.state);
                 let mut leader_shutdown = false;
                 let mut first_active = Some(active);
                 let mut last_tag = tag;
@@ -3286,6 +3330,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                                 ) || (tag == b'S' && state.implicit && !session.is_aborted()),
                             )
                         });
+                    active.context.set_durable_tracker(session.service.durable_tracker());
                     if matches!(tag, b'Q' | b'E')
                         && session.service.statement_gate.get().is_some_and(|gate| {
                             !matches!(
@@ -3345,7 +3390,7 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                     // Admission refusal uses the same error/abort/drain path.
                     keep = state.buffered_message(
                         (tag, &b, received),
-                        &mut session,
+                        session,
                         &mut out,
                         active,
                         refusal.as_ref().map(|e| e.sqlstate()),
@@ -3373,8 +3418,8 @@ async fn serve_buffered<S: AsyncRead + AsyncWrite + Unpin>(
                 state.execution_admission = None;
                 let out = state.output.take().unwrap().prefix.into_inner().unwrap();
                 (
-                    session,
-                    state,
+                    owner.session,
+                    owner.state,
                     out,
                     keep,
                     batch,

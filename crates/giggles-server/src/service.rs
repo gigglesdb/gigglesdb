@@ -247,7 +247,18 @@ pub(crate) fn role_lookup_error(error: roles::RoleError) -> CoreError {
 
 pub type StatementGate = std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
+#[derive(Default)]
+struct DurabilityPath {
+    awaiting: std::sync::atomic::AtomicU64,
+    releases: std::sync::atomic::AtomicU64,
+    asynchronous: std::sync::atomic::AtomicU64,
+}
 pub struct Service {
+    durability: [DurabilityPath; 3],
+    drain_entries: std::sync::atomic::AtomicU64,
+    pgwire_live: Arc<giggles_core::DurableTracker>,
+    pgwire_submitted: Arc<giggles_core::DurableTracker>,
+    durable: Arc<giggles_core::DurableTracker>,
     pub(crate) pgwire_blocking_tasks: std::sync::atomic::AtomicU64,
     pub(crate) statement_gate: std::sync::OnceLock<StatementGate>,
     pub(crate) advisory: crate::advisory::Locks,
@@ -273,6 +284,71 @@ struct Credentials {
     entries: BTreeMap<String, (Role, u64)>,
 }
 impl Service {
+    pub fn role_pool_counts(&self) -> Vec<(usize, usize, usize)> { self.admission.role_pool_counts() }
+    pub fn pgwire_blocking_live(&self) -> usize { self.pgwire_live.live() }
+    pub fn durable_tracker(&self) -> Arc<giggles_core::DurableTracker> { self.durable.clone() }
+    pub(crate) fn pgwire_submission_token(&self) -> giggles_core::LiveToken { self.pgwire_submitted.register() }
+    pub(crate) fn pgwire_live_token(&self) -> giggles_core::LiveToken { self.pgwire_live.register() }
+    /// Per-path durability counters, exported even before the first ticket.
+    pub fn durability_metrics(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering::Acquire;
+        let paths = ["local", "cluster", "nextval"];
+        let values = |read: fn(&DurabilityPath) -> &std::sync::atomic::AtomicU64| {
+            paths.iter().zip(&self.durability).map(|(path, metric)| {
+                ((*path).to_owned(), serde_json::json!(read(metric).load(Acquire)))
+            }).collect::<serde_json::Map<String, serde_json::Value>>()
+        };
+        serde_json::json!({
+            "pgwire_blocking_live": self.pgwire_blocking_live(),
+            "durable_completions_live": self.durable.live(),
+            "statements_awaiting_durability": values(|m| &m.awaiting),
+            "durable_releases_total": values(|m| &m.releases),
+            "durable_async_total": values(|m| &m.asynchronous)
+        })
+    }
+    pub fn stop_submissions(&self) { self.admin.stop_submissions(); }
+    /// Keep the runtime alive until detached workers and durable tickets retire.
+    #[doc(hidden)]
+    pub fn drain_entries(&self) -> u64 {
+        self.drain_entries.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub async fn drain(&self) -> std::io::Result<()> {
+        self.drain_with_timeout(std::time::Duration::from_secs(60)).await
+    }
+
+    /// Override the durability deadline for shutdown qualification tests.
+    #[doc(hidden)]
+    pub async fn drain_with_timeout(&self, durability_timeout: std::time::Duration) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering::Acquire;
+        self.drain_entries.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let started = tokio::time::Instant::now();
+        let mut report = started;
+        let mut workers_since = None;
+        loop {
+            let now = tokio::time::Instant::now();
+            let durable = self.durable.live() != 0
+                || self.durability.iter().any(|m| m.awaiting.load(Acquire) != 0);
+            let workers = self.pgwire_blocking_live() != 0
+                || self.pgwire_submitted.live() != 0 || self.blocking.in_use() != 0;
+            if !durable && !workers { return Ok(()); }
+            if now.duration_since(started) >= durability_timeout {
+                eprintln!("ERROR: service shutdown durability deadline exceeded: {}; abandoned statements were never acknowledged to clients", self.durability_metrics());
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "service shutdown durability drain"));
+            }
+            if durable {
+                workers_since = None;
+                if now.duration_since(report) >= std::time::Duration::from_secs(10) {
+                    eprintln!("service shutdown waiting for durability: {}", self.durability_metrics());
+                    report = now;
+                }
+            } else if now.duration_since(*workers_since.get_or_insert(now)) >= crate::transport::IO_TIMEOUT {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "service shutdown worker drain"));
+            }
+            // Recheck durability during worker draining: a worker may register late.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
     #[doc(hidden)]
     pub fn pgwire_blocking_tasks(&self) -> u64 {
         self.pgwire_blocking_tasks.load(std::sync::atomic::Ordering::Relaxed)
@@ -332,6 +408,11 @@ impl Service {
             agent_admission.apply(agent_limits);
         }
         Ok(Arc::new(Self {
+            durability: std::array::from_fn(|_| DurabilityPath::default()),
+            drain_entries: Default::default(),
+            pgwire_live: Arc::default(),
+            pgwire_submitted: Arc::default(),
+            durable: Arc::default(),
             advisory: crate::advisory::Locks::default(),
             pgwire_blocking_tasks: std::sync::atomic::AtomicU64::new(0),
             blocking: crate::blocking::Blocking::new(),

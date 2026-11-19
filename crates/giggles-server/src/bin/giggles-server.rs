@@ -297,6 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("control rejected; expected reload");
         }
     }
+    service.stop_submissions();
     let stopped = stop_all(listeners, &api).await;
     if let Some(agent_api) = &agent_api {
         agent_api.shutdown().await;
@@ -304,6 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for runtime in &role_api {
         runtime.shutdown().await;
     }
+    if let Err(error) = service.drain().await { eprintln!("{error}"); std::process::exit(1); }
     stopped?;
     drop(service);
     #[cfg(feature = "engine-rocksdb")]
@@ -603,6 +605,7 @@ async fn run_replicated(c: Config) -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut listeners = Vec::new();
     let mut api = None;
+    let mut terminal_service = None;
     let result: Result<(), Box<dyn std::error::Error>> = async {
         'roles: loop {
             let seen = repl.as_ref().unwrap().current();
@@ -612,6 +615,7 @@ async fn run_replicated(c: Config) -> Result<(), Box<dyn std::error::Error>> {
                 Ok((started, started_api, service, addresses, role)) => {
                     listeners = started;
                     api = started_api;
+                    terminal_service = service.clone();
                     println!("{} preview=replicated role={role} node={}", addresses.join(" "), repl.as_ref().unwrap().node_id());
                     io::stdout().flush()?;
                     (service, false)
@@ -680,13 +684,17 @@ async fn run_replicated(c: Config) -> Result<(), Box<dyn std::error::Error>> {
             }
             stop_role(std::mem::take(&mut listeners), api.take()).await?;
             drop(service);
+            terminal_service = None;
             drop(seen);
         }
         Ok(())
     }.await;
     reader.abort();
     let _ = reader.await;
+    if let Some(service) = &terminal_service { service.stop_submissions(); }
     let stopped = stop_role(listeners, api).await;
+    if let Some(service) = &terminal_service
+        && let Err(error) = service.drain().await { eprintln!("{error}"); std::process::exit(1); }
     tokio::task::spawn_blocking(move || repl.unwrap().stop()).await?;
     result?;
     stopped?;
@@ -987,6 +995,8 @@ async fn start_listeners(
     }
     .await;
     if let Err(error) = setup {
+        // Replicated setup failures may retry with the same serving engine.
+        if !retry { service.stop_submissions(); }
         drop(start);
         for runtime in &role_api {
             runtime.shutdown().await;
@@ -995,6 +1005,7 @@ async fn start_listeners(
         if let Some(agent_api) = &agent_api {
             agent_api.shutdown().await;
         }
+        if !retry && let Err(error) = service.drain().await { eprintln!("{error}"); std::process::exit(1); }
         return Err(error.into());
     }
     start.send_replace(true);

@@ -62,3 +62,11 @@ pub mod metadata_read_counts {
         COUNTS.with(|counts| counts.replace([0; 5]))
     }
 }
+
+mod durable;
+pub use durable::{DurableTracker, LiveToken};
+
+#[cfg(any(test, feature = "test-commit-sync"))]
+mod commit_sync_hook;
+#[cfg(any(test, feature = "test-commit-sync"))]
+pub use commit_sync_hook::CommitSyncHook;

@@ -1156,6 +1156,15 @@ pub use v2::maintenance::MaintenanceStats;
 pub use v2::reclaim::ReclaimStats;
 
 impl Admin {
+    /// Stop local commit decisions during service shutdown. Idempotent.
+    pub fn stop_submissions(&self) {
+        if let Backend::V2(db) = &self.inner.backend { db.sequencer.stop_submissions(); }
+    }
+    #[cfg(any(test, feature = "test-commit-sync"))]
+    pub fn set_commit_sync_hook(&self, hook: Option<Arc<crate::CommitSyncHook>>) {
+        if let Backend::V2(db) = &self.inner.backend { db.sequencer.set_sync_hook(hook); }
+    }
+
     /// Local database directory, when this administrator is backed by local storage.
     pub fn data_directory(&self) -> Option<&Path> { self.data_directory.as_deref() }
     fn with_data_directory(mut self, path: &Path) -> Self {

@@ -11,6 +11,7 @@ default = ["engine-rocksdb"]
 engine-rocksdb = ["dep:rocksdb"]
 # Abrupt-crash qualification only; never enable in production binaries.
 upgrade-fault-injection = []
+test-commit-sync = []
 # Instrumentation proving native execution avoids SQL parsing/public dispatch.
 test-sql-parser-trap = []
 # Scoped metadata acquisition instrumentation for protocol tests.

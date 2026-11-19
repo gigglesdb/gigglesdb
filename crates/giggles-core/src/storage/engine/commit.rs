@@ -12,7 +12,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -309,6 +309,9 @@ thread_local! {
 #[cfg(test)]
 type HeldCounterReplies = Option<Vec<mpsc::Sender<Result<(), TxnError>>>>;
 struct Shared {
+    stopped: AtomicBool,
+    #[cfg(any(test, feature = "test-commit-sync"))]
+    sync_hook: Mutex<Option<Arc<crate::CommitSyncHook>>>,
     #[cfg(test)]
     counter_gate: Mutex<HeldCounterReplies>,
     #[cfg(test)]
@@ -436,6 +439,7 @@ impl FenceAccess {
 pub(crate) struct CounterAck(pub(crate) mpsc::Receiver<Result<(), TxnError>>);
 impl CounterAck {
     pub(crate) fn wait(self) -> Result<(), TxnError> {
+        let _durable = crate::Cancellation::current_durable_token();
         self.0.recv().unwrap_or(Err(TxnError::Fenced))
     }
 }
@@ -450,6 +454,18 @@ pub(crate) struct Sequencer {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 impl Sequencer {
+    /// Fence future decisions without joining the worker or waiting for Sync.
+    pub(crate) fn stop_submissions(&self) {
+        self.shared.stopped.store(true, Ordering::Release);
+    }
+    fn stopped(&self) -> bool {
+        self.shared.stopped.load(Ordering::Acquire)
+    }
+    #[cfg(any(test, feature = "test-commit-sync"))]
+    pub(crate) fn set_sync_hook(&self, hook: Option<Arc<crate::CommitSyncHook>>) {
+        *self.shared.sync_hook.lock().unwrap() = hook;
+    }
+
     #[cfg(test)]
     pub(crate) fn gate_counter_acks(&self, armed: bool) {
         let mut gate = self.shared.counter_gate.lock().unwrap();
@@ -522,6 +538,9 @@ impl Sequencer {
             None => Ts(0),
         };
         let shared = Arc::new(Shared {
+            stopped: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-commit-sync"))]
+            sync_hook: Mutex::new(None),
             #[cfg(test)]
             counter_gate: Mutex::new(None),
             #[cfg(test)]
@@ -567,6 +586,8 @@ impl Sequencer {
         }))
     }
     fn fence_action(&self, action: FenceAction) -> Result<Option<WriteFenceRecord>, TxnError> {
+        if self.stopped() { return Err(TxnError::Fenced); }
+        let _durable = crate::Cancellation::current_durable_token();
         let (reply, receive) = mpsc::channel();
         self.sender
             .send(Message::Fence { action, reply })
@@ -636,9 +657,10 @@ impl Sequencer {
         }
     }
     pub(crate) fn submit(&self, request: CommitRequest) -> Result<Ts, TxnError> {
-        if self.kv.is_fenced() {
+        if self.stopped() || self.kv.is_fenced() {
             return Err(TxnError::Fenced);
         }
+        let _durable = crate::Cancellation::current_durable_token();
         let (reply, receive) = mpsc::channel();
         self.sender
             .send(Message::Commit(Pending { request, guard: None, reply }))
@@ -646,7 +668,8 @@ impl Sequencer {
         receive.recv().unwrap_or(Err(TxnError::Fenced))
     }
     pub(crate) fn submit_guarded(&self, request: CommitRequest, guard: CommitGuard) -> Result<Ts, TxnError> {
-        if self.kv.is_fenced() { return Err(TxnError::Fenced); }
+        if self.stopped() || self.kv.is_fenced() { return Err(TxnError::Fenced); }
+        let _durable = crate::Cancellation::current_durable_token();
         let (reply, receive) = mpsc::channel();
         self.sender.send(Message::Commit(Pending { request, guard: Some(guard), reply }))
             .map_err(|_| TxnError::Fenced)?;
@@ -660,7 +683,7 @@ impl Sequencer {
             || u64::from_be_bytes(value.as_slice().try_into().unwrap()) == 0 {
             return Err(TxnError::Misuse);
         }
-        if self.kv.is_fenced() { return Err(TxnError::Fenced); }
+        if self.stopped() || self.kv.is_fenced() { return Err(TxnError::Fenced); }
         let (reply, receive) = mpsc::channel();
         self.sender.send(Message::Highwater { key, value, reply })
             .map_err(|_| TxnError::Fenced)?;
@@ -671,7 +694,7 @@ impl Sequencer {
         &self, key: Vec<u8>, value: Vec<u8>, features_or: u64,
     ) -> Result<CounterAck, TxnError> {
         if !valid_counter_key(&key) { return Err(TxnError::Misuse); }
-        if self.kv.is_fenced() { return Err(TxnError::Fenced); }
+        if self.stopped() || self.kv.is_fenced() { return Err(TxnError::Fenced); }
         let (reply, receive) = mpsc::channel();
         let message = Message::Counter { key, value, features_or, reply };
         #[cfg(test)]
@@ -825,7 +848,7 @@ fn run(
     while let Some(message) = deferred.take().or_else(|| receiver.recv().ok()) {
         let first = match message {
             Message::Fence { action, reply } => {
-                let result = if fenced || kv.is_fenced() {
+                let result = if fenced || kv.is_fenced() || shared.stopped.load(Ordering::Acquire) {
                     Err(TxnError::Fenced)
                 } else {
                     process_fence(
@@ -846,7 +869,7 @@ fn run(
         };
         let (group, next, shutdown) = gather(first, &receiver, &config);
         deferred = next;
-        if shutdown || fenced || kv.is_fenced() {
+        if shutdown || fenced || kv.is_fenced() || shared.stopped.load(Ordering::Acquire) {
             for p in group {
                 p.reject(TxnError::Fenced);
             }
@@ -1304,6 +1327,14 @@ fn process_group(
             max.0.to_be_bytes().to_vec(),
         );
     }
+    // This load is the start of decision for this group. A shutdown fence
+    // ordered before it wins; a group already deciding can finish its Sync.
+    // Never wait for Sync (or a guard callback) in stop_submissions.
+    if shared.stopped.load(Ordering::Acquire) {
+        for (reply, _) in accepted { let _ = reply.send(Err(TxnError::Fenced)); }
+        for reply in counters { let _ = reply.send(Err(TxnError::Fenced)); }
+        return true;
+    }
     if let Some(guard) = decision
         && let Err(error) = guard.decide()
     {
@@ -1320,8 +1351,17 @@ fn process_group(
     if !batch.is_empty() {
         shared.sync_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    if !batch.is_empty()
-        && let Err(error) = kv.write(batch, Durability::Sync)
+    #[cfg(any(test, feature = "test-commit-sync"))]
+    let sync_hook = shared.sync_hook.lock().unwrap().clone();
+    #[cfg(any(test, feature = "test-commit-sync"))]
+    // Serializable read-only commits also queue behind this sequencer.
+    // Let the test seam stall those empty batches without adding a real write.
+    let sync_result = if sync_hook.is_some_and(|hook| hook.before_sync()) {
+        Err(super::kv::KvError::Io("injected commit Sync error".into()))
+    } else if !batch.is_empty() { kv.write(batch, Durability::Sync) } else { Ok(()) };
+    #[cfg(not(any(test, feature = "test-commit-sync")))]
+    let sync_result = if !batch.is_empty() { kv.write(batch, Durability::Sync) } else { Ok(()) };
+    if let Err(error) = sync_result
     {
         let error = write_error(&error);
         for (reply, _) in accepted {
@@ -1372,7 +1412,7 @@ impl Sequencer {
             })
             .collect();
         let mut hlc = HlcClock::new(self.visible_ts());
-        if self.kv.is_fenced() {
+        if self.stopped() || self.kv.is_fenced() {
             return receives
                 .into_iter()
                 .map(|_| Err(TxnError::Fenced))
@@ -1431,3 +1471,46 @@ mod write_fence_tests;
 #[cfg(test)]
 #[path = "commit_snapshot_tests.rs"]
 mod snapshot_tests;
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use super::guard_tests::{fixture, request};
+    fn write() -> CommitRequest {
+        let mut req = request(0);
+        req.writes.insert((Keyspace::Rows, vec![7]), Some(vec![8]));
+        req
+    }
+    #[test]
+    fn stop_is_idempotent_and_new_submissions_are_fenced() {
+        let (_, seq) = fixture();
+        seq.stop_submissions();
+        seq.stop_submissions();
+        assert_eq!(seq.submit(write()), Err(TxnError::Fenced));
+    }
+    #[test]
+    fn in_sync_succeeds_but_queued_work_is_fenced() {
+        let (_, seq) = fixture();
+        let hook = crate::CommitSyncHook::new();
+        seq.set_sync_hook(Some(hook.clone()));
+        let worker = { let seq = seq.clone(); thread::spawn(move || seq.submit(write())) };
+        assert!(hook.wait_entered(Duration::from_secs(5)));
+        let (reply, receive) = mpsc::channel();
+        seq.sender.send(Message::Commit(Pending { request: write(), guard: None, reply })).unwrap();
+        seq.stop_submissions();
+        seq.stop_submissions();
+        hook.release(false);
+        assert!(worker.join().unwrap().is_ok());
+        assert_eq!(receive.recv_timeout(Duration::from_secs(5)).unwrap(), Err(TxnError::Fenced));
+    }
+    #[test]
+    fn sync_error_is_not_success() {
+        let (_, seq) = fixture();
+        let hook = crate::CommitSyncHook::new();
+        seq.set_sync_hook(Some(hook.clone()));
+        hook.release(true);
+        assert!(seq.submit(write()).is_err());
+        assert_eq!(seq.submit(write()), Err(TxnError::Fenced));
+        assert_eq!(seq.visible_ts(), Ts(0));
+    }
+}

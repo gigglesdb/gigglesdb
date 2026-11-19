@@ -234,6 +234,12 @@ impl Admission {
         roles.pools.clear();
         Ok(())
     }
+    pub(crate) fn role_pool_counts(&self) -> Vec<(usize, usize, usize)> {
+        self.roles.lock().unwrap().pools.values().map(|pool| (
+            pool.running.available_permits(), pool.limits.concurrent,
+            pool.queued.load(Ordering::Acquire),
+        )).collect()
+    }
     fn role_pool(&self, key: (u8, String)) -> Result<Arc<RolePool>, StatementRefusal> {
         let mut roles = self
             .roles

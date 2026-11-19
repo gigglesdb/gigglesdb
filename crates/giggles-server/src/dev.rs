@@ -300,7 +300,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let (start, gate) = watch::channel(false);
-    let running = serve_postgresql_bound(socket, service, listener, gate.clone()).await?;
+    let running = serve_postgresql_bound(socket, service.clone(), listener, gate.clone()).await?;
     let mut api_listeners = Vec::new();
     let mut api_runtimes = Vec::new();
     let setup: io::Result<()> = async {
@@ -313,6 +313,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     .await;
     if let Err(error) = setup {
+        service.stop_submissions();
         for (_, listener) in api_listeners {
             let _ = listener.shutdown().await;
         }
@@ -320,6 +321,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             runtime.shutdown().await;
         }
         let _ = running.shutdown().await;
+        if let Err(error) = service.drain().await { eprintln!("{error}"); std::process::exit(1); }
         return Err(error.into());
     }
     start.send_replace(true);
@@ -371,6 +373,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         Ok(()) => control().await,
         Err(error) => Err(error),
     };
+    service.stop_submissions();
     let mut stopped = Ok(());
     for (_, listener) in api_listeners {
         if let Err(error) = listener.shutdown().await {
@@ -381,6 +384,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         runtime.shutdown().await;
     }
     let pg_stopped = running.shutdown().await;
+    if let Err(error) = service.drain().await { eprintln!("{error}"); std::process::exit(1); }
     control?;
     stopped?;
     pg_stopped?;

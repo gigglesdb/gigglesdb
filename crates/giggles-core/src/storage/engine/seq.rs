@@ -90,6 +90,7 @@ impl SequenceAllocator {
     fn collect(block: &mut Block, wait: bool) -> Result<(), TxnError> {
         let Some(extension) = &block.extension else { return Ok(()); };
         let result = if wait {
+            let _durable = crate::Cancellation::current_durable_token();
             extension.receive.recv().unwrap_or(Err(TxnError::Fenced))
         } else {
             match extension.receive.try_recv() {
@@ -316,6 +317,7 @@ fn persist_highwater(kv: &Kv, key: SequenceKey, highwater: u64) -> Result<(), Tx
         key.to_vec(),
         highwater.to_be_bytes().to_vec(),
     );
+    let _durable = crate::Cancellation::current_durable_token();
     kv.write(batch, Durability::Sync)?;
     Ok(())
 }
