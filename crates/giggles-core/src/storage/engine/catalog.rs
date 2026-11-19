@@ -1017,6 +1017,29 @@ impl Catalog {
         deadline: Option<Instant>,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Arc<TableEntry>, CatalogError> {
+        self.resolve_inner::<false>(txn, name, mode, deadline, cancel)
+            .map(|entry| entry.expect("ordinary resolution retries drift"))
+    }
+
+    /// Bind must re-authorize before resolving a changed catalog image.
+    /// None returns control to its bounded authorization loop without retrying.
+    pub(crate) fn resolve_for_bind(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<Arc<TableEntry>>, CatalogError> {
+        self.resolve_inner::<true>(txn, name, LockMode::AccessShare, None, cancel)
+    }
+
+    fn resolve_inner<const RETURN_ON_DRIFT: bool>(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        mode: LockMode,
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<Arc<TableEntry>>, CatalogError> {
         self.check()?;
         validate_identifier(relational::split_key(name).1)?;
         if !mode.is_table() {
@@ -1085,7 +1108,12 @@ impl Catalog {
             }
             let latest = cache.versions.last().unwrap().1.by_name.get(name);
             if latest == base.as_ref() {
-                return Ok(entry);
+                return Ok(Some(entry));
+            }
+            if RETURN_ON_DRIFT {
+                drop(cache);
+                txn.begin_statement();
+                return Ok(None);
             }
             if txn.isolation() != Isolation::ReadCommitted || attempt == 2 {
                 return Err(TxnError::Serialization(SerializationReason::WriteConflict).into());

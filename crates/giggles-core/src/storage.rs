@@ -3000,18 +3000,32 @@ impl SqlSession {
         let txn = self.v2_transaction.as_mut().expect("open transaction");
         // One id order includes views and tables, matching ordinary SQL locking.
         for (id, (name, view)) in locks {
-            if view {
+            if txn.current_snapshot_ts() != Some(snapshot)
+                || (!pinned && generation != db.catalog().current_version()) {
+                txn.begin_statement();
+                return Ok(false);
+            }
+            let result = if view {
                 txn.acquire_lock(engine::locks::LockKey::Table(id),
                     engine::locks::LockMode::AccessShare, None,
-                    &|| crate::cancellation::check().is_err())?;
+                    &|| crate::cancellation::check().is_err()).map_err(CoreError::from)
             } else {
-                match db.catalog().resolve(txn, &name, engine::locks::LockMode::AccessShare,
-                    None, &|| crate::cancellation::check().is_err()) {
-                    Ok(_) => {}
-                    Err(engine::catalog::CatalogError::Core(error)) => return Err(error),
-                    Err(engine::catalog::CatalogError::Txn(error)) => return Err(error.into()),
+                match db.catalog().resolve_for_bind(txn, &name,
+                    &|| crate::cancellation::check().is_err()) {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => return Ok(false),
+                    Err(engine::catalog::CatalogError::Core(error)) => Err(error),
+                    Err(engine::catalog::CatalogError::Txn(error)) => Err(error.into()),
                 }
+            };
+            // A wait can change grants/identities even when locking failed.
+            // Re-authorize before surfacing that error or locking another dependency.
+            if txn.current_snapshot_ts() != Some(snapshot)
+                || (!pinned && generation != db.catalog().current_version()) {
+                txn.begin_statement();
+                return Ok(false);
             }
+            result?;
         }
         if txn.current_snapshot_ts() == Some(snapshot)
             && (pinned || generation == db.catalog().current_version()) {

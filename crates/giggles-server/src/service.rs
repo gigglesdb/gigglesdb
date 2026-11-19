@@ -2747,6 +2747,9 @@ impl Session {
                 let bound = session.authorize_prepared_bind(p)?;
                 if bound.is_ddl() || session.sql.lock_prepared_relations(&bound)? { return Ok(()); }
             }
+            // Preserve fresh-Parse authorization ordering even on retry exhaustion.
+            let bound = session.authorize_prepared_bind(p)?;
+            session.sql.describe(&bound)?;
             Err(CoreError::Sql(relational::SqlError::StaleSchema))
         })
     }

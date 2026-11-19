@@ -23,7 +23,7 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
             .create(NewRole {
                 name: name.into(),
                 login: true,
-                superuser,
+                superuser: superuser || (name == "r" && label == "bind-drift-granted"),
                 ..Default::default()
             })
             .unwrap();
@@ -83,7 +83,10 @@ async fn case(label: &str, setup: &str, sql: &str, change: &str, expected: Optio
             .await
             .unwrap();
     }
-    let result = if label.starts_with("bind-auth") {
+    let result = if label.starts_with("bind-drift") {
+        bind_drift_probe(pg.address, &clients[0], &admin, label).await;
+        None
+    } else if label.starts_with("bind-auth") {
         if label.contains("view") {
             admin
                 .roles()
@@ -771,4 +774,120 @@ async fn revoked_bind_precedes_exclusive_table_lock() {
 #[tokio::test]
 async fn unreadable_view_bind_precedes_underlying_exclusive_lock() {
     case("bind-auth-locked-view", "CREATE TABLE t(a int); CREATE VIEW v AS SELECT a FROM t; GRANT SELECT ON t TO r", "", "", None).await;
+}
+
+// Start Bind while its old grants are valid, then change the catalog under its wait.
+async fn bind_drift_probe(
+    address: std::net::SocketAddr,
+    owner: &tokio_postgres::Client,
+    admin: &Admin,
+    label: &str,
+) {
+    let recreate = label != "bind-drift-drop";
+    let granted = label == "bind-drift-granted";
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let startup = b"\0\x03\0\0user\0r\0database\0postgres\0\0";
+    stream.write_u32((startup.len() + 4) as u32).await.unwrap();
+    stream.write_all(startup).await.unwrap();
+    receive(&mut stream, b'Z').await;
+    let mut parse = b"s\0".to_vec();
+    giggles_server::pgwire::z("SELECT a FROM t", &mut parse);
+    parse.extend_from_slice(&[0, 0]);
+    send(&mut stream, &[(b'P', &parse), (b'S', b"")]).await;
+    assert_eq!(response_code(&receive(&mut stream, b'Z').await), None);
+    owner
+        .batch_execute("BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    send(&mut stream, &[(b'B', b"p\0s\0\0\0\0\0\0\0"), (b'H', b"")]).await;
+    let terminal = if granted { b'2' } else { b'E' };
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            receive(&mut stream, terminal),
+        )
+        .await
+        .is_err(),
+        "Bind must wait on the old relation"
+    );
+    // SQL GRANT/REVOKE is disallowed in an explicit transaction (25001).
+    // Change grants after Bind waits, while SQL DDL still holds the old lock.
+    if !granted {
+        admin
+            .roles()
+            .revoke_table("t", "r", &[giggles_core::roles::TablePrivilege::Select])
+            .unwrap();
+    }
+    // The control uses a superuser reader: DDL holds the role-store writer
+    // until commit, so an out-of-band GRANT here would deadlock the setup.
+    owner.batch_execute("DROP TABLE t").await.unwrap();
+    if recreate {
+        owner.batch_execute("CREATE TABLE t(a int)").await.unwrap();
+    }
+    owner.batch_execute("COMMIT").await.unwrap();
+    let rebound = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        receive(&mut stream, terminal),
+    )
+    .await
+    .expect("Bind response after DDL commit");
+    assert_eq!(
+        response_code(&rebound),
+        if granted { None } else { Some("42501") },
+        "{label}: {rebound:?}"
+    );
+    if recreate && !granted {
+        // No Sync yet: a wrongly acquired replacement lock would still be held.
+        owner
+            .batch_execute("BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE NOWAIT; ROLLBACK")
+            .await
+            .unwrap();
+    }
+    send(&mut stream, &[(b'S', b"")]).await;
+    receive(&mut stream, b'Z').await;
+    parse[0] = b'f';
+    send(&mut stream, &[(b'P', &parse), (b'S', b"")]).await;
+    let fresh = receive(&mut stream, b'Z').await;
+    assert_eq!(
+        response_code(&fresh),
+        response_code(&rebound),
+        "{label}: fresh Parse"
+    );
+    send(&mut stream, &[(b'X', b"")]).await;
+}
+
+#[tokio::test]
+async fn bind_wait_reauthorizes_after_revoke_and_drop() {
+    case(
+        "bind-drift-drop",
+        "CREATE TABLE t(a int); GRANT SELECT ON t TO r",
+        "",
+        "",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bind_wait_does_not_lock_unreadable_replacement() {
+    case(
+        "bind-drift-recreate",
+        "CREATE TABLE t(a int); GRANT SELECT ON t TO r",
+        "",
+        "",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bind_wait_accepts_readable_replacement() {
+    case(
+        "bind-drift-granted",
+        "CREATE TABLE t(a int); GRANT SELECT ON t TO r",
+        "",
+        "",
+        None,
+    )
+    .await;
 }
