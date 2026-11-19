@@ -100,6 +100,7 @@ pub(crate) struct Hub {
     revision_store: RwLock<Option<Arc<dyn RevisionStore>>>,
     authority: RwLock<std::sync::Weak<crate::state::authority::Authority>>,
     file_owners: RwLock<Vec<String>>,
+    route_owners: RwLock<std::collections::BTreeMap<String, Owner>>,
     pending_membership: Mutex<std::collections::BTreeMap<String, MembershipChange>>,
     #[cfg(test)]
     reset_callback: RwLock<Option<ResetCallback>>,
@@ -187,6 +188,7 @@ impl Hub {
         for (route, index) in &configured {
             state.units[*index].service_failed = true;
             let owner = store.owner(route).map_err(|_| "service policy unavailable")?;
+            self.route_owners.write().map_err(|_| "policy ownership unavailable")?.insert(route.as_str().into(), owner);
             if owner == Owner::Service && configured.iter().filter(|(_, i)| i == index).count() != 1 {
                 state.units[*index].service_failed = true;
                 return Err("service policy cannot share a policy file".into());
@@ -293,6 +295,7 @@ impl Hub {
         let digest = request_digest(actor, "", None, "", &RevisionKind::Import);
         if let Some(r) = Self::replay(store.as_ref(), route, &idempotency_key, &digest)? {
             if store.owner(route)? != Owner::Service { return Err(RevisionStoreError::IdempotencyConflict.into()); }
+            self.route_owners.write().map_err(|_| PolicyOpError::Unavailable)?.insert(route.as_str().into(), Owner::Service);
             self.finish_replay(&mut state, route, &r)?;
             return Ok(r);
         }
@@ -315,6 +318,7 @@ impl Hub {
             WriteOutcome::Written(r) | WriteOutcome::Replayed(r) => r,
             WriteOutcome::Stale { .. } => return Err(PolicyOpError::Unavailable),
         };
+        self.route_owners.write().map_err(|_| PolicyOpError::Unavailable)?.insert(route.as_str().into(), Owner::Service);
         let stamp = revision_stamp(&r);
         revisions.policy = stamp.clone();
         if let Some(ctx) = &mut ctx_revision { **ctx = Some(stamp); }
@@ -579,6 +583,7 @@ impl Hub {
             store: RwLock::new(None),
             revision_store: RwLock::new(None),
             authority: RwLock::new(std::sync::Weak::new()),
+            route_owners: RwLock::new(Default::default()),
             file_owners: RwLock::new(Vec::new()),
             pending_membership: Mutex::new(Default::default()),
             #[cfg(test)]
@@ -950,7 +955,7 @@ impl Hub {
     }
     fn ignore_file_unit(&self, state: &mut State, unit: usize) -> bool {
         let routes: Vec<_> = state.configured.iter().filter(|(_, i)| *i == unit).map(|(r, _)| r.clone()).collect();
-        let skip = routes.iter().any(|r| self.owner(r).map_or(true, |o| o == Owner::Service));
+        let skip = self.route_owners.read().map_or(true, |owners| routes.iter().any(|r| owners.get(r.as_str()) == Some(&Owner::Service)));
         if skip && !state.units[unit].ignored_logged {
             for route in routes { eprintln!("serve: policy file ignored for route {}: service-owned", route.as_str()); }
             state.units[unit].ignored_logged = true;
@@ -1202,6 +1207,7 @@ mod tests {
             store: RwLock::new(None),
             revision_store: RwLock::new(None),
             authority: RwLock::new(std::sync::Weak::new()),
+            route_owners: RwLock::new(Default::default()),
             file_owners: RwLock::new(Vec::new()),
             pending_membership: Mutex::new(Default::default()),
             #[cfg(test)]
@@ -2457,6 +2463,26 @@ mod tests {
         (hub, store)
     }
     fn masked_toml() -> &'static str { "snapshot_max_age_ms=60000\n[readlog]\nsink='stdout'\n[[column]]\ntable='public.customers'\nname='email'\nmasked=true\n" }
+    struct NoOwnerReads;
+    impl RevisionStore for NoOwnerReads {
+        fn owner(&self, _: &RouteId) -> Result<Owner, RevisionStoreError> { panic!("watcher must use cached ownership") }
+        fn active(&self, _: &RouteId) -> Result<Option<PolicyRevision>, RevisionStoreError> { Err(RevisionStoreError::Unavailable) }
+        fn write(&self, _: &RouteId, _: Option<u64>, _: NewRevision) -> Result<WriteOutcome, RevisionStoreError> { Err(RevisionStoreError::Unavailable) }
+        fn history(&self, _: &RouteId) -> Result<Vec<RevisionSummary>, RevisionStoreError> { Err(RevisionStoreError::Unavailable) }
+        fn get(&self, _: &RouteId, _: u64) -> Result<Option<PolicyRevision>, RevisionStoreError> { Err(RevisionStoreError::Unavailable) }
+        fn release_to_file(&self, _: &RouteId) -> Result<(), RevisionStoreError> { Err(RevisionStoreError::Unavailable) }
+    }
+    #[test]
+    fn watcher_uses_cached_ownership_without_backend_reads() {
+        let files = Files::new();
+        let (hub, _store) = revision_hub(&files);
+        hub.import_policy(&id("a"), "admin", None).unwrap();
+        *hub.revision_store.write().unwrap() = Some(Arc::new(NoOwnerReads));
+        let mut state = hub.state.lock().unwrap();
+        assert!(hub.ignore_file_unit(&mut state, 0));
+        hub.route_owners.write().unwrap().insert("a".into(), Owner::File);
+        assert!(!hub.ignore_file_unit(&mut state, 0));
+    }
     #[test]
     fn import_apply_replay_stale_invalid_and_rollback() {
         let files = Files::new(); let (hub, _store) = revision_hub(&files); let route = id("a");

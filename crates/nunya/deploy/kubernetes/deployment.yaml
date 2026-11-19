@@ -1,0 +1,152 @@
+# Preview only: multi-replica serving is unsupported until GD-0088 8b/8c.
+# These replicas demonstrate the policy store and leader election only.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nunya-kubernetes
+data:
+  nunya.toml.template: |
+    listen = "0.0.0.0:6432"
+    admin_listen = "0.0.0.0:6480"
+    policy = "/etc/nunya/policy.toml"
+    root_key_file = "/credentials/root.key"
+    state_dir = "/state"
+    policy_store = "kubernetes"
+    [readlog]
+    sink = "stdout"
+    [tls]
+    cert_file = "/credentials/tls.crt"
+    key_file = "/credentials/tls.key"
+    [policy_store_kubernetes]
+    namespace = "${POD_NAMESPACE}"
+    pod_name = "${POD_NAME}"
+    management_url = "https://${POD_IP}:6481"
+    lease_name = "nunya-leader"
+    lease_duration_secs = 15
+    renew_deadline_secs = 10
+    retry_period_secs = 2
+    [upstream]
+    host = "postgres"
+    user = "nunya"
+    dbname = "app"
+    password_file = "/credentials/password"
+    tls = "verify-full"
+    ca_file = "/credentials/upstream-ca.crt"
+    [management]
+    listen = "0.0.0.0:6481"
+    [management.tls]
+    cert_file = "/credentials/tls.crt"
+    key_file = "/credentials/tls.key"
+    [[management.admin]]
+    name = "operator"
+    verifier = "${ADMIN_VERIFIER}"
+  # Replace with the intended bootstrap route policy before deploying.
+  policy.toml: |
+    version = 2
+    default = "tokenize"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nunya-policy-preview
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nunya-policy-preview
+  template:
+    metadata:
+      labels:
+        app: nunya-policy-preview
+    spec:
+      serviceAccountName: nunya
+      initContainers:
+        - name: render-config
+          image: alpine:3.21
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              # Only substitute the downward-API fields and SCRAM verifier.
+              # printf preserves the verifier's literal dollar signs.
+              while IFS= read -r line; do
+                case "$line" in
+                  *'${POD_NAMESPACE}'*) printf 'namespace = "%s"\n' "$POD_NAMESPACE" ;;
+                  *'${POD_NAME}'*) printf 'pod_name = "%s"\n' "$POD_NAME" ;;
+                  *'${POD_IP}'*) printf 'management_url = "https://%s:6481"\n' "$POD_IP" ;;
+                  *'${ADMIN_VERIFIER}'*) printf 'verifier = "%s"\n' "$ADMIN_VERIFIER" ;;
+                  *) printf '%s\n' "$line" ;;
+                esac
+              done < /template/nunya.toml.template > /rendered/nunya.toml
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: ADMIN_VERIFIER
+              valueFrom:
+                secretKeyRef:
+                  name: nunya-credentials
+                  key: admin-verifier
+          volumeMounts:
+            - name: template
+              mountPath: /template
+              readOnly: true
+            - name: rendered
+              mountPath: /rendered
+      containers:
+        - name: nunya
+          # Supply an image built with --features kubernetes.
+          image: nunya:kubernetes-preview
+          args: [serve, --config, /config/nunya.toml]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - name: postgres
+              containerPort: 6432
+            - name: admin
+              containerPort: 6480
+            - name: management
+              containerPort: 6481
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+          volumeMounts:
+            - name: template
+              mountPath: /etc/nunya
+              readOnly: true
+            - name: rendered
+              mountPath: /config
+              readOnly: true
+            - name: credentials
+              mountPath: /credentials
+              readOnly: true
+            - name: state
+              mountPath: /state
+      volumes:
+        - name: template
+          configMap:
+            name: nunya-kubernetes
+        - name: rendered
+          emptyDir: {}
+        - name: credentials
+          secret:
+            secretName: nunya-credentials
+        # Local sessions/scopes/counters are lost on restart; shared state is 8c.
+        - name: state
+          emptyDir: {}

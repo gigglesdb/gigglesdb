@@ -148,6 +148,12 @@ pub enum WriteOutcome {
 /// Data-free revision storage failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RevisionStoreError {
+    /// Route cannot be represented by a Kubernetes DNS label.
+    #[error("policy route is not a valid Kubernetes DNS label")]
+    InvalidRoute,
+    /// Serialized Kubernetes policy head exceeds one MiB.
+    #[error("policy revision exceeds the 1 MiB Kubernetes head limit")]
+    Oversized,
     /// Storage cannot be accessed.
     #[error("policy revision store unavailable")]
     Unavailable,

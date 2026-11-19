@@ -73,8 +73,15 @@ pub struct ConnectionView {
 /// Reloadable configuration administrator credentials.
 pub type Admins = Arc<RwLock<Vec<(String, ScramVerifier)>>>;
 
+/// Leadership snapshot adapter for management routing.
+pub trait Leadership: Send + Sync {
+    /// Return local leadership and the last known leader URL atomically.
+    fn leadership(&self) -> (bool, Option<String>);
+}
 /// Shared management services and configured administrators.
 pub struct MgmtContext {
+    /// Optional leader routing hook; absent for standalone deployments.
+    pub leadership: Option<Arc<dyn Leadership>>,
     /// Optional policy management adapter.
     pub policy: Option<Arc<dyn super::policy::PolicySource>>,
     /// Durable authority.
@@ -92,6 +99,29 @@ impl fmt::Debug for MgmtContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("MgmtContext { [REDACTED] }")
     }
+}
+/// Redirect before authentication, dispatch or body collection.
+pub(super) fn leader_response(ctx: &MgmtContext, origin: Origin, uri: &http::Uri) -> Option<Response<Bytes>> {
+    if origin == Origin::Socket { return None; }
+    let (leader, url) = ctx.leadership.as_ref()?.leadership();
+    if leader { return None; }
+    if let Some(url) = url
+        && let Ok(base) = url.parse::<http::Uri>()
+        && matches!(base.scheme_str(), Some("http" | "https"))
+        && base.authority().is_some_and(|a| !a.as_str().contains('@'))
+        && base.path_and_query().is_none_or(|p| p.as_str() == "/")
+        && !url.contains('#') {
+        let location = format!("{}{}", url.trim_end_matches('/'), uri.path_and_query().map_or("/", |p| p.as_str()));
+        if let Ok(value) = http::HeaderValue::from_str(&location) {
+            let mut response = Response::new(Bytes::new());
+            *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+            response.headers_mut().insert(http::header::LOCATION, value);
+            return Some(response);
+        }
+    }
+    let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "no_leader");
+    response.headers_mut().insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("2"));
+    Some(response)
 }
 /// Build a JSON response without exposing serialization errors.
 pub fn json_response(status: StatusCode, value: impl Serialize) -> Response<Bytes> {
@@ -366,6 +396,7 @@ fn endpoint(path: &str) -> Option<Endpoint> {
 }
 /// Authenticate, authorize and dispatch one bounded management request.
 pub fn handle(ctx: &MgmtContext, origin: Origin, req: Request<Bytes>) -> Response<Bytes> {
+    if let Some(response) = leader_response(ctx, origin, req.uri()) { return response; }
     use Endpoint::*;
     let caller = match authenticate(ctx, origin, req.headers()) {
         Ok(c) => c,
@@ -811,13 +842,43 @@ mod tests {
     impl LifecycleSink for Sources {
         fn record(&self, _: &LifecycleRecord) -> Result<(), AuditUnavailable> { Ok(()) }
     }
+    struct Follower(Option<String>);
+    impl Leadership for Follower { fn leadership(&self) -> (bool, Option<String>) { (false, self.0.clone()) } }
+    #[test]
+    fn followers_redirect_all_paths_before_authentication() {
+        let dir = std::env::temp_dir().join(format!("redirect-{}", SessionId::random().to_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(RedbStore::open(&dir, &RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap());
+        let mut ctx = MgmtContext { leadership: Some(Arc::new(Follower(Some("https://leader:443".into())))), policy: None,
+            authority: Authority::load(store, SessionLimits::default()).unwrap(), admins: Arc::default(),
+            connections: Arc::new(Sources), status: Arc::new(Sources), lifecycle: Arc::new(Sources) };
+        assert!(leader_response(&ctx, Origin::Socket, &"/v1/status".parse().unwrap()).is_none());
+        let local = handle(&ctx, Origin::Socket, Request::builder().uri("/v1/status").body(Bytes::new()).unwrap());
+        assert_ne!(local.status(), StatusCode::TEMPORARY_REDIRECT);
+        for path in ["/v1/status?x=1", "/v1/principals", "/unknown"] {
+            for method in ["GET", "POST", "DELETE"] {
+                let response = handle(&ctx, Origin::Network, Request::builder().method(method).uri(path).body(Bytes::from_static(b"invalid json")).unwrap());
+                assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+                assert_eq!(response.headers()[http::header::LOCATION], format!("https://leader:443{path}"));
+                assert!(response.body().is_empty());
+            }
+        }
+        for url in [None, Some("invalid".into())] {
+            ctx.leadership = Some(Arc::new(Follower(url)));
+            let response = handle(&ctx, Origin::Network, Request::new(Bytes::new()));
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[http::header::RETRY_AFTER], "2");
+            assert_eq!(serde_json::from_slice::<Value>(response.body()).unwrap()["error"], "no_leader");
+        }
+        drop(ctx); std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn configured_admin_name_refuses_principal_creation() {
         let dir = std::env::temp_dir().join(format!("routes-{}", SessionId::random().to_hex()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(RedbStore::open(&dir, &RootKey::from_hex(&"01".repeat(32)).unwrap()).unwrap());
         let authority = Authority::load(store, SessionLimits::default()).unwrap();
-        let ctx = MgmtContext { policy: None,
+        let ctx = MgmtContext { leadership: None, policy: None,
             authority,
             admins: Arc::new(RwLock::new(vec![("reserved".into(),
                 ScramVerifier::from_password("fixture", b"salt", 1))])),

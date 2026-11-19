@@ -299,6 +299,9 @@ pub struct ConnectionOpts {
     /// Management URL.
     #[arg(long, env = "NUNYA_SERVER")]
     pub server: String,
+    /// Follow one leader redirect (HTTPS endpoints and the same trusted CA required).
+    #[arg(long)]
+    pub follow_leader: bool,
     /// Trusted CA file.
     #[arg(long, env = "NUNYA_CA_FILE")]
     pub ca_file: Option<PathBuf>,
@@ -351,6 +354,7 @@ impl ConnectionOpts {
             self.ca_file.as_deref(),
             credentials,
         )
+        .map(|client| client.follow_leader_redirect(self.follow_leader))
         .map_err(Into::into)
     }
     fn context(&self, store: &HelperStore) -> Result<Context, HelperError> {

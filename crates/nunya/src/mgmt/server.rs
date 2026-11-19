@@ -94,6 +94,11 @@ async fn request(
     origin: Origin,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    if let Some(response) = routes::leader_response(&ctx, origin, req.uri()) {
+        let mut response = response.map(Full::new);
+        response.headers_mut().insert(http::header::CONNECTION, http::HeaderValue::from_static("close"));
+        return Ok(response);
+    }
     if req
         .headers()
         .get(http::header::CONTENT_LENGTH)

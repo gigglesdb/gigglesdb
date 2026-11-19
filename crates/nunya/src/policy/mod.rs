@@ -201,3 +201,11 @@ pub mod diff;
 /// Revision epochs and synchronous release fencing.
 pub mod fence;
 pub use fence::{RevisionFence, ReleaseSlot, column_tightens, tightens};
+
+/// Kubernetes policy revision storage.
+#[cfg(feature = "kubernetes")]
+pub mod kube_store;
+
+/// Kubernetes Lease election.
+#[cfg(feature = "kubernetes")]
+pub mod kube_leader;

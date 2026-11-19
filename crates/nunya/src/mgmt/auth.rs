@@ -190,7 +190,7 @@ mod tests {
                 authority.set_principal_enabled(p.id, false).unwrap();
             }
         }
-        let ctx = MgmtContext { policy: None,
+        let ctx = MgmtContext { leadership: None, policy: None,
             authority,
             admins: Arc::new(std::sync::RwLock::new(vec![("configured".into(), verifier)])),
             connections: Arc::new(Sources),

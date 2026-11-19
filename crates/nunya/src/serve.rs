@@ -79,6 +79,17 @@ impl<T> Drop for AbortTask<T> {
         self.0.abort();
     }
 }
+// Sending shutdown on every exit lets the election loop release its Lease even
+// when startup fails. Dropping its JoinHandle intentionally does not abort it.
+#[cfg(feature = "kubernetes")]
+struct ElectionTask {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    task: JoinHandle<Result<(), crate::policy::kube_leader::ElectionError>>,
+}
+#[cfg(feature = "kubernetes")]
+impl Drop for ElectionTask {
+    fn drop(&mut self) { let _ = self.shutdown.send(true); }
+}
 #[derive(Default)]
 pub(crate) struct Revisions {
     pub(crate) policy: String,
@@ -614,9 +625,61 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             policy_routes.push((route.clone(), path.clone().ok_or("route policy unavailable")?));
         }
     }
-    let revision_store = Arc::new(crate::policy::LocalRevisionStore::new(runtime.store()));
-    crate::reload::Hub::release_file_owners(revision_store.as_ref(), &config.file_policy_routes)?;
-    let hub = crate::reload::Hub::new_with_revision_store(&policy_routes, config.policy_watch_ms, config.policy_settings.clone(), Some(revision_store.as_ref()))?;
+    #[cfg(feature = "kubernetes")]
+    let elector = if config.policy_store == crate::config::PolicyStore::Kubernetes {
+        let k = config.policy_store_kubernetes.as_ref().ok_or("Kubernetes settings unavailable")?;
+        let client = kube::Client::try_default().await.map_err(|_| "Kubernetes client unavailable")?;
+        Some((client.clone(), crate::policy::kube_leader::LeaderElector::new(
+            client, &k.namespace, &k.lease_name, &k.pod_name, &k.management_url,
+            crate::policy::kube_leader::Timings {
+                lease_duration: Duration::from_secs(k.lease_duration_secs),
+                renew_deadline: Duration::from_secs(k.renew_deadline_secs),
+                retry_period: Duration::from_secs(k.retry_period_secs),
+            }).map_err(|_| "Kubernetes election configuration invalid")?))
+    } else { None };
+    let leadership: Option<Arc<dyn crate::mgmt::routes::Leadership>>;
+    let revision_store: Arc<dyn crate::policy::RevisionStore>;
+    #[cfg(feature = "kubernetes")]
+    if let Some((client, candidate)) = &elector {
+        let k = config.policy_store_kubernetes.as_ref().ok_or("Kubernetes settings unavailable")?;
+        let state = candidate.state();
+        leadership = Some(Arc::new(state.clone()));
+        revision_store = Arc::new(crate::policy::kube_store::KubernetesRevisionStore::new(
+            client.clone(), &k.namespace, tokio::runtime::Handle::current()).with_leader(state));
+    } else {
+        leadership = None;
+        revision_store = Arc::new(crate::policy::LocalRevisionStore::new(runtime.store()));
+    }
+    #[cfg(not(feature = "kubernetes"))]
+    {
+        leadership = None;
+        revision_store = Arc::new(crate::policy::LocalRevisionStore::new(runtime.store()));
+    }
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    #[cfg(feature = "kubernetes")]
+    let election_task = if let Some((_, candidate)) = elector {
+        // Make one attempt before startup ownership writes; followers still fail closed.
+        let candidate = tokio::task::spawn_blocking(move || {
+            let _ = candidate.tick();
+            candidate
+        }).await.map_err(|_| "Kubernetes election unavailable")?;
+        Some(ElectionTask { shutdown: shutdown.clone(), task: tokio::spawn(candidate.run(rx.clone())) })
+    } else { None };
+    let hub = if config.policy_store == crate::config::PolicyStore::Kubernetes {
+        let store = revision_store.clone();
+        let routes = policy_routes.clone();
+        let file_owners = config.file_policy_routes.clone();
+        let service = config.policy_settings.clone();
+        let watch = config.policy_watch_ms;
+        // Keep the client transport's runtime free while the synchronous bridge reads.
+        tokio::task::spawn_blocking(move || {
+            crate::reload::Hub::release_file_owners(store.as_ref(), &file_owners)?;
+            crate::reload::Hub::new_with_revision_store(&routes, watch, service, Some(store.as_ref()))
+        }).await.map_err(|_| "service policy unavailable")??
+    } else {
+        crate::reload::Hub::release_file_owners(revision_store.as_ref(), &config.file_policy_routes)?;
+        crate::reload::Hub::new_with_revision_store(&policy_routes, config.policy_watch_ms, config.policy_settings.clone(), Some(revision_store.as_ref()))?
+    };
     hub.set_store(runtime.store())?;
     hub.set_file_owners(&config.file_policy_routes)?;
     hub.set_revision_store(revision_store)?;
@@ -663,9 +726,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let _reload = AbortTask(tokio::spawn(async move {
         reload_hub.run(reload_rx, Some(reload_config)).await
     }));
-    let (shutdown, rx) = tokio::sync::watch::channel(false);
     let management = if config.management.is_some() || cfg!(unix) {
-        let ctx = crate::mgmt::routes::MgmtContext {
+        let ctx = crate::mgmt::routes::MgmtContext { leadership,
             policy: Some(Arc::new(ManagementPolicy { rejections: Default::default(), hub: hub.clone(), store: runtime.store(), writes: std::sync::Mutex::new(()) })),
             authority: runtime.authority.clone(), admins,
             connections: Arc::new(ManagementConnections(runtime.registry.clone())),
@@ -748,6 +810,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         }
     };
     if let Some(management) = management { management.wait().await; }
+    #[cfg(feature = "kubernetes")]
+    if let Some(mut task) = election_task { let _ = (&mut task.task).await; }
     // Abort maintenance before releasing the runtime after all routes have drained.
     drop(maintenance);
     // Retain exclusive state ownership until all routes have drained.

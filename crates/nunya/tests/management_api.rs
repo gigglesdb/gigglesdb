@@ -159,7 +159,7 @@ impl Fixture {
             .unwrap();
         let admin = make_verifier("config-admin-private.secret");
         let audit = Arc::new(AuditSink::default());
-        let ctx = MgmtContext { policy: None,
+        let ctx = MgmtContext { leadership: None, policy: None,
             authority,
             admins: Arc::new(std::sync::RwLock::new(vec![("config-admin".into(), admin.0)])),
             connections: Arc::new(Sources),
@@ -1926,6 +1926,7 @@ async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportRes
     let store = HelperStore::at(f.dir.join("helper"));
     let mut opts = AcquireOpts {
         connection: ConnectionOpts {
+            follow_leader: false,
             server: format!("http://{}", server.tcp_addr.ok_or("missing TCP listener")?),
             ca_file: None,
             principal: Some("alice".into()),
@@ -2105,6 +2106,7 @@ async fn principal_cli_lifecycle() -> TransportResult {
     let store = HelperStore::at(f.dir.join("principal-cli-helper"));
     let acquire = AcquireOpts {
         connection: ConnectionOpts {
+            follow_leader: false,
             server: format!("http://{}", server.tcp_addr.ok_or("missing TCP listener")?),
             ca_file: None,
             principal: Some("cli-principal".into()),

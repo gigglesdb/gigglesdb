@@ -139,8 +139,40 @@ impl fmt::Debug for AdminSection {
         f.write_str("AdminSection { [REDACTED] }")
     }
 }
+/// Policy revision backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyStore {
+    /// Local durable state.
+    #[default]
+    Local,
+    /// Kubernetes custom resources.
+    Kubernetes,
+}
+/// Kubernetes policy backend and election settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubernetesPolicyStore {
+    /// Namespace containing policy resources and Lease.
+    pub namespace: String,
+    /// Election Lease name.
+    pub lease_name: String,
+    /// Unique candidate pod name.
+    pub pod_name: String,
+    /// Advertised management base URL.
+    pub management_url: String,
+    /// Lease lifetime in seconds.
+    pub lease_duration_secs: u64,
+    /// Local renewal deadline in seconds.
+    pub renew_deadline_secs: u64,
+    /// Election retry interval in seconds.
+    pub retry_period_secs: u64,
+}
 /// Validated configuration with zeroizing secrets.
 pub struct Config {
+    /// Revision backend selection.
+    pub policy_store: PolicyStore,
+    /// Kubernetes backend settings.
+    pub policy_store_kubernetes: Option<KubernetesPolicyStore>,
     /// Routes explicitly returned to file ownership at startup.
     pub file_policy_routes: Vec<String>,
     /// Service settings resolved with each route policy.
@@ -238,6 +270,7 @@ macro_rules! strict_section {
     };
 }
 strict_section!(RawConfig,
+    _store=>"policy_store", _kube=>"policy_store_kubernetes",
     _readlog=>"readlog", _age=>"snapshot_max_age_ms",
     _watch=>"policy_watch_ms", _max=>"max_connections", _listen=>"listen", _admin=>"admin_listen", _policy=>"policy",
     _root=>"root_key_file", _state=>"state_dir", _schemas=>"schemas",
@@ -355,6 +388,8 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     let mut m = table(
         v,
         &[
+            "policy_store",
+            "policy_store_kubernetes",
             "readlog",
             "snapshot_max_age_ms",
             "policy_watch_ms",
@@ -380,6 +415,17 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     );
     if Value::Table(m.clone()).try_into::<RawConfig>().is_err() {
         err(&mut e, "config", "invalid fields");
+    }
+    let policy_store = get(&mut m, "policy_store", &mut e).unwrap_or_default();
+    let policy_store_kubernetes = m.remove("policy_store_kubernetes").map(|v| parse_kubernetes_store(v, &mut e));
+    if policy_store == PolicyStore::Kubernetes {
+        if policy_store_kubernetes.is_none() {
+            err(&mut e, "policy_store_kubernetes", "required for kubernetes policy store");
+        }
+        #[cfg(not(feature = "kubernetes"))]
+        err(&mut e, "policy_store", "built without the kubernetes feature");
+    } else if policy_store_kubernetes.is_some() {
+        err(&mut e, "policy_store_kubernetes", "only valid with kubernetes policy store");
     }
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     let mut policy_errors = Vec::new();
@@ -699,6 +745,8 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     }
     use sha2::{Digest, Sha256};
     Ok(Config {
+        policy_store,
+        policy_store_kubernetes,
         policy_settings,
         path: path.to_path_buf(),
         revision: data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes())),
@@ -725,6 +773,39 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         upstream,
         spanner_native,
     })
+}
+fn dns_label(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 63
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && s.as_bytes()[0].is_ascii_alphanumeric()
+        && s.as_bytes()[s.len() - 1].is_ascii_alphanumeric()
+}
+fn parse_kubernetes_store(v: Value, e: &mut Vec<String>) -> KubernetesPolicyStore {
+    let mut m = table(v, &["namespace", "lease_name", "pod_name", "management_url",
+        "lease_duration_secs", "renew_deadline_secs", "retry_period_secs"], "policy_store_kubernetes", e);
+    let namespace: String = req(&mut m, "namespace", e);
+    let lease_name: String = get(&mut m, "lease_name", e).unwrap_or_else(|| "nunya-leader".into());
+    let pod_name: String = req(&mut m, "pod_name", e);
+    let management_url: String = req(&mut m, "management_url", e);
+    for (field, value) in [("namespace", &namespace), ("lease_name", &lease_name)] {
+        if !dns_label(value) { err(e, field, "expected DNS label"); }
+    }
+    if pod_name.is_empty() || pod_name.trim() != pod_name { err(e, "pod_name", "expected nonempty pod name"); }
+    let valid_url = management_url.parse::<http::Uri>().ok().is_some_and(|u|
+        matches!(u.scheme_str(), Some("http" | "https"))
+        && u.authority().is_some_and(|a| !a.as_str().contains('@'))
+        && !management_url.contains('#')
+        && u.path_and_query().is_none_or(|p| p.as_str() == "/"));
+    if !valid_url { err(e, "management_url", "expected http/https base URL without path or userinfo"); }
+    let lease_duration_secs = get(&mut m, "lease_duration_secs", e).unwrap_or(15);
+    let renew_deadline_secs = get(&mut m, "renew_deadline_secs", e).unwrap_or(10);
+    let retry_period_secs = get(&mut m, "retry_period_secs", e).unwrap_or(2);
+    if retry_period_secs == 0 || retry_period_secs >= renew_deadline_secs
+        || renew_deadline_secs >= lease_duration_secs || i32::try_from(lease_duration_secs).is_err() {
+        err(e, "policy_store_kubernetes", "invalid election timings");
+    }
+    KubernetesPolicyStore { namespace, lease_name, pod_name, management_url,
+        lease_duration_secs, renew_deadline_secs, retry_period_secs }
 }
 fn route_policy(
     table: &mut Map<String, Value>,
@@ -902,6 +983,77 @@ password_file = "password"
 tls = "disable"
 "#;
     const NATIVE: &str = "\n[spanner_native]\nlisten='127.0.0.1:6433'\ndatabase='projects/p/instances/i/databases/d'\n";
+    const KUBE: &str = "[policy_store_kubernetes]\nnamespace='default'\npod_name='nunya-abc'\nmanagement_url='http://10.0.0.1:6481'\n";
+    #[test]
+    fn policy_store_defaults_and_unknown_selection() {
+        let f = Fixture::new();
+        let c = f.load(EXAMPLE).unwrap();
+        assert_eq!(c.policy_store, PolicyStore::Local);
+        assert!(c.policy_store_kubernetes.is_none());
+        for selection in ["'other'", "42", "[]"] {
+            assert!(f.load(&format!("policy_store={selection}\n{EXAMPLE}")).is_err());
+        }
+        assert!(f.load(&format!("{EXAMPLE}{KUBE}")).is_err());
+        assert!(f.load(&format!("policy_store='kubernetes'\n{EXAMPLE}")).is_err());
+    }
+    #[test]
+    fn kubernetes_settings_validation() {
+        let mut errors = Vec::new();
+        let v: Value = toml::from_str(KUBE).unwrap();
+        let k = parse_kubernetes_store(v["policy_store_kubernetes"].clone(), &mut errors);
+        assert!(errors.is_empty());
+        assert_eq!(k.lease_name, "nunya-leader");
+        assert_eq!((k.lease_duration_secs, k.renew_deadline_secs, k.retry_period_secs), (15, 10, 2));
+        for (from, to) in [
+            ("namespace='default'", "namespace='UPPER'"),
+            ("namespace='default'", "namespace='-bad'"),
+            ("namespace='default'", "namespace='bad-'"),
+            ("namespace='default'", "namespace=''"),
+            ("namespace='default'", "namespace=42"),
+            ("namespace='default'", ""),
+            ("pod_name='nunya-abc'", ""),
+            ("pod_name='nunya-abc'", "pod_name=''"),
+            ("pod_name='nunya-abc'", "pod_name=42"),
+            ("management_url='http://10.0.0.1:6481'", ""),
+            ("management_url='http://10.0.0.1:6481'", "management_url=42"),
+            ("management_url='http://10.0.0.1:6481'", "management_url='ftp://pod'"),
+            ("management_url='http://10.0.0.1:6481'", "management_url='http://pod/path'"),
+            ("management_url='http://10.0.0.1:6481'", "management_url='http://u@pod'"),
+            ("management_url='http://10.0.0.1:6481'", "management_url='http://pod?x'"),
+            ("management_url='http://10.0.0.1:6481'", "management_url='http://pod/#x'"),
+            ("namespace='default'", "namespace='default'\nlease_name='bad.name'"),
+            ("namespace='default'", "namespace='default'\nlease_name=42"),
+            ("namespace='default'", "namespace='default'\nunknown=true"),
+            ("namespace='default'", "namespace='default'\nretry_period_secs=0"),
+            ("namespace='default'", "namespace='default'\nretry_period_secs=10"),
+            ("namespace='default'", "namespace='default'\nrenew_deadline_secs=15"),
+            ("namespace='default'", "namespace='default'\nlease_duration_secs=2147483648"),
+            ("namespace='default'", "namespace='default'\nlease_duration_secs=-1"),
+            ("namespace='default'", "namespace='default'\nrenew_deadline_secs='10'"),
+            ("namespace='default'", "namespace='default'\nretry_period_secs=[]"),
+        ] {
+            let text = KUBE.replace(from, to);
+            let v: Value = toml::from_str(&text).unwrap();
+            let mut errors = Vec::new();
+            parse_kubernetes_store(v["policy_store_kubernetes"].clone(), &mut errors);
+            assert!(!errors.is_empty(), "refusal case {from} -> {to}");
+        }
+        let mut errors = Vec::new();
+        parse_kubernetes_store(Value::String("invalid".into()), &mut errors);
+        assert!(!errors.is_empty());
+    }
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn kubernetes_config_loads() {
+        let c = Fixture::new().load(&format!("policy_store='kubernetes'\n{EXAMPLE}{KUBE}")).unwrap();
+        assert_eq!(c.policy_store, PolicyStore::Kubernetes);
+    }
+    #[cfg(not(feature = "kubernetes"))]
+    #[test]
+    fn kubernetes_requires_feature() {
+        let errors = Fixture::new().load(&format!("policy_store='kubernetes'\n{EXAMPLE}{KUBE}")).unwrap_err();
+        assert!(errors.iter().any(|s| s.contains("built without the kubernetes feature")));
+    }
     #[test]
     fn search_path_schemas_are_captured_in_order() {
         let f = Fixture::new();

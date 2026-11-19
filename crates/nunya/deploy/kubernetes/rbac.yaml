@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nunya
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nunya
+rules:
+  - apiGroups: [nunya.gigglesdb.dev]
+    resources: [nunyapolicies]
+    verbs: [get, create, update]
+  - apiGroups: [nunya.gigglesdb.dev]
+    resources: [nunyapolicyrevisions]
+    verbs: [get, list, create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [nunya-leader]
+    verbs: [get, update]
+  # Kubernetes cannot restrict create by resourceNames.
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nunya
+subjects:
+  - kind: ServiceAccount
+    name: nunya
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nunya

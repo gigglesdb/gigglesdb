@@ -26,6 +26,11 @@ pub enum ClientError {
     Timeout,
     /// Invalid JSON or oversized response.
     Decode,
+    /// Leader redirect requiring explicit opt-in and HTTPS.
+    LeaderRedirect {
+        /// Advertised leader URL.
+        location: String,
+    },
     /// Stale policy precondition with value-free server metadata.
     Stale {
         /// Current durable revision.
@@ -45,6 +50,7 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stale { current, diff } => write!(f, "stale policy revision; current {}; {}", current.number, diff.summary),
+            Self::LeaderRedirect { location } => write!(f, "leader at {location}; following requires --follow-leader and HTTPS on both endpoints"),
             Self::Transport => f.write_str("management transport unavailable"),
             Self::Tls => f.write_str("management TLS unavailable"),
             Self::Timeout => f.write_str("management request timed out"),
@@ -416,6 +422,7 @@ pub struct MgmtClient {
     endpoint: Endpoint,
     authorization: Option<Zeroizing<String>>,
     tls: Option<Arc<rustls::ClientConfig>>,
+    follow_leader_redirect: bool,
 }
 impl fmt::Debug for MgmtClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -484,13 +491,19 @@ impl MgmtClient {
             endpoint,
             authorization,
             tls,
+            follow_leader_redirect: false,
         })
+    }
+    /// Explicitly permit one HTTPS leader redirect using the original TLS trust roots.
+    pub fn follow_leader_redirect(mut self, enabled: bool) -> Self {
+        self.follow_leader_redirect = enabled;
+        self
     }
     async fn exchange<I>(
         &self,
         io: I,
         request: Request<Full<Bytes>>,
-    ) -> Result<(u16, Bytes), ClientError>
+    ) -> Result<(u16, Bytes, Option<String>), ClientError>
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -512,6 +525,7 @@ impl MgmtClient {
             .await
             .map_err(|_| ClientError::Transport)?;
         let status = response.status().as_u16();
+        let location = response.headers().get(http::header::LOCATION).and_then(|v| v.to_str().ok()).map(str::to_owned);
         let body = Limited::new(response.into_body(), 1024 * 1024)
             .collect()
             .await
@@ -523,15 +537,15 @@ impl MgmtClient {
                 }
             })?
             .to_bytes();
-        Ok((status, body))
+        Ok((status, body, location))
     }
-    async fn once(
+    async fn send_once(
         &self,
         method: &Method,
         path: &str,
         body: Bytes,
         key: Option<&str>,
-    ) -> Result<(u16, Bytes), ClientError> {
+    ) -> Result<(u16, Bytes, Option<String>), ClientError> {
         let mut request = Request::builder()
             .method(method.clone())
             .uri(path)
@@ -598,6 +612,44 @@ impl MgmtClient {
             }
         }
     }
+    fn redirect_endpoint(&self, location: &str) -> Result<(Endpoint, String), ClientError> {
+        let uri: Uri = location.parse().map_err(|_| ClientError::Decode)?;
+        let scheme = uri.scheme_str().ok_or(ClientError::Decode)?;
+        if scheme != "https" || !matches!(self.endpoint.0, Destination::Tcp { tls: true, .. }) {
+            return Err(ClientError::LeaderRedirect { location: location.into() });
+        }
+        let authority = uri.authority().ok_or(ClientError::Decode)?;
+        let authority = if authority.port_u16().is_none() { format!("{}:{}", authority, if scheme == "https" {443} else {80}) } else { authority.to_string() };
+        if location.contains('#') { return Err(ClientError::Decode); }
+        let endpoint = format!("{scheme}://{authority}").parse()?;
+        Ok((endpoint, uri.path_and_query().map_or("/", |p| p.as_str()).to_owned()))
+    }
+    async fn send_with_retry(&self, method: &Method, path: &str, body: Bytes, key: Option<&str>) -> Result<(u16, Bytes, Option<String>), ClientError> {
+        let mut attempt = 0;
+        loop {
+            match self.send_once(method, path, body.clone(), key).await {
+                Err(ClientError::Transport | ClientError::Timeout) if method != Method::GET && key.is_some() && attempt < 2 => {
+                    sleep(Duration::from_millis(if attempt == 0 { 100 } else { 400 })).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+    async fn once(&self, method: &Method, path: &str, body: Bytes, key: Option<&str>) -> Result<(u16, Bytes), ClientError> {
+        let (status, response, location) = self.send_with_retry(method, path, body.clone(), key).await?;
+        if status != 307 { return Ok((status, response)); }
+        let location = location.ok_or(ClientError::Decode)?;
+        if !self.follow_leader_redirect {
+            return Err(ClientError::LeaderRedirect { location });
+        }
+        let (endpoint, path) = self.redirect_endpoint(&location)?;
+        let redirected = Self { endpoint, authorization: self.authorization.clone(), tls: self.tls.clone(), follow_leader_redirect: false };
+        // Retries stay on this leader with identical bytes/key, without another redirect.
+        let (status, response, _) = redirected.send_with_retry(method, &path, body, key).await?;
+        if status == 307 { return Err(ClientError::Decode); }
+        Ok((status, response))
+    }
     async fn call<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -617,19 +669,7 @@ impl MgmtClient {
             None
         };
         let body = Bytes::from(serde_json::to_vec(&body).map_err(|_| ClientError::Decode)?);
-        let mut attempt = 0;
-        let (status, body) = loop {
-            match self
-                .once(&method, &path, body.clone(), key.as_deref())
-                .await
-            {
-                Err(ClientError::Transport | ClientError::Timeout) if mutation && attempt < 2 => {
-                    sleep(Duration::from_millis(if attempt == 0 { 100 } else { 400 })).await;
-                    attempt += 1;
-                }
-                result => break result?,
-            }
-        };
+        let (status, body) = self.once(&method, &path, body, key.as_deref()).await?;
         if !(200..300).contains(&status) {
             let code = serde_json::from_slice::<serde_json::Value>(&body)
                 .ok()
@@ -902,7 +942,7 @@ mod tests {
             cfg!(unix)
         );
     }
-    async fn read_request(io: &mut TcpStream) -> Vec<u8> {
+    async fn read_request<I: AsyncRead + Unpin>(io: &mut I) -> Vec<u8> {
         use tokio::io::AsyncReadExt;
         let mut request = Vec::new();
         let mut byte = [0];
@@ -934,6 +974,91 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    fn tls_pair() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions().unwrap().with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key.into()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth();
+        (Arc::new(server), Arc::new(client))
+    }
+    #[tokio::test]
+    async fn redirects_default_refuses_without_contacting_leader() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener};
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(first.local_addr().unwrap());
+        let target = format!("https://localhost:{}/new", second.local_addr().unwrap().port());
+        let location = target.clone();
+        let server = tokio::spawn(async move {
+            let (mut io, _) = first.accept().await.unwrap();
+            read_request(&mut io).await;
+            io.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let result = client.call::<serde_json::Value>(Method::GET, "/old".into(), json!({})).await;
+        assert_eq!(result, Err(ClientError::LeaderRedirect { location: target }));
+        assert!(timeout(Duration::from_millis(50), second.accept()).await.is_err());
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn redirects_https_same_roots_once_and_retry_leader_with_same_key() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener};
+        for (second_redirect, retry) in [(false, false), (true, false), (false, true)] {
+            let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (server_tls, client_tls) = tls_pair();
+            let mut client = test_client(first.local_addr().unwrap()).follow_leader_redirect(true);
+            client.endpoint = format!("https://localhost:{}", first.local_addr().unwrap().port()).parse().unwrap();
+            client.tls = Some(client_tls);
+            let target = format!("https://localhost:{}/new?x=1", second.local_addr().unwrap().port());
+            let server = tokio::spawn(async move {
+                let acceptor = tokio_rustls::TlsAcceptor::from(server_tls);
+                let (io, _) = first.accept().await.unwrap();
+                let mut io = acceptor.accept(io).await.unwrap();
+                let original = read_request(&mut io).await;
+                io.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                io.flush().await.unwrap();
+                let mut requests = Vec::new();
+                for attempt in 0..=usize::from(retry) {
+                    let (io, _) = second.accept().await.unwrap();
+                    let mut io = acceptor.accept(io).await.unwrap();
+                    requests.push(read_request(&mut io).await);
+                    if retry && attempt == 0 { continue; }
+                    let response = if second_redirect { format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") } else { "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into() };
+                    io.write_all(response.as_bytes()).await.unwrap();
+                    io.flush().await.unwrap();
+                }
+                (original, requests)
+            });
+            let result = client.call_key::<serde_json::Value>(Method::POST, "/old".into(), json!({"payload":1}), Some("retry-key".into())).await;
+            if second_redirect { assert_eq!(result, Err(ClientError::Decode)); } else { assert!(result.is_ok()); }
+            let (original, requests) = server.await.unwrap();
+            for redirected in &requests {
+                let redirected = String::from_utf8(redirected.clone()).unwrap();
+                assert!(redirected.starts_with("POST /new?x=1 HTTP/1.1"));
+                assert_eq!(String::from_utf8(original.clone()).unwrap().split_once("\r\n\r\n").unwrap().1, redirected.split_once("\r\n\r\n").unwrap().1);
+                assert!(redirected.contains("idempotency-key: retry-key"));
+                assert!(redirected.contains("authorization: Bearer nunya.test.private"));
+            }
+            if retry { assert_eq!(requests[0], requests[1]); }
+        }
+    }
+    #[test]
+    fn redirect_schemes_are_validated() {
+        let mut client = test_client("127.0.0.1:1".parse().unwrap()).follow_leader_redirect(true);
+        assert!(client.redirect_endpoint("https://leader/v1/status").is_err());
+        assert!(client.redirect_endpoint("http://127.0.0.1:2/v1/status").is_err());
+        client.endpoint = "https://leader:443".parse().unwrap();
+        assert!(client.redirect_endpoint("https://leader/v1/status").is_ok());
+        for target in ["http://127.0.0.1:2/v1/status", "ftp://leader/v1/status", "/relative", "https://user@leader/v1/status"] {
+            assert!(client.redirect_endpoint(target).is_err());
+        }
     }
     #[tokio::test]
     async fn mutations_retry_identical_bytes_and_stop_after_three_attempts() {

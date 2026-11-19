@@ -133,7 +133,7 @@ mod tests {
     fn policy_commands_parse() {
         assert!(super::super::Cli::try_parse_from(["nunya", "policy", "apply", "pg", "p.toml", "--expected-revision", "1", "--server", "http://127.0.0.1:8000"]).is_err());
         for args in [vec!["status","pg"],vec!["effective","pg","--json"],vec!["validate","pg","p.toml"],vec!["preview","pg","p.toml","--json"],vec!["apply","pg","p.toml","--expected-revision","1","--catalog-fingerprint","catalog"],vec!["rollback","pg","--to","1","--expected-revision","2"],vec!["import","pg"],vec!["revisions","pg"],vec!["revision","pg","1"],vec!["export","pg","-o","p.toml"]] {
-            assert!(super::super::Cli::try_parse_from(["nunya","policy"].into_iter().chain(args).chain(["--server","http://127.0.0.1:8000"])).is_ok());
+            assert!(super::super::Cli::try_parse_from(["nunya","policy"].into_iter().chain(args).chain(["--server","http://127.0.0.1:8000", "--follow-leader"])).is_ok());
         }
         assert!(super::super::Cli::try_parse_from(["nunya","policy","check","--config","c.toml"]).is_ok());
     }

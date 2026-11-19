@@ -26,6 +26,7 @@ existing notices and provenance; it does not modify them.
 | [crates/giggles-glibm/COPYING.LIB](crates/giggles-glibm/COPYING.LIB) | Portable binary64 math routines derived from GNU C Library (glibc) 2.41 (Debian 2.41-12+deb13u4), including Sun Microsystems and IBM routines; source notices retained in each module | LGPL-2.1-or-later; retained Sun Microsystems permission notices also apply |
 | [crates/giggles-glibm-loader/](crates/giggles-glibm-loader/) | First-party runtime loader for the giggles-glibm dynamic library | MIT |
 | [scripts/icu/](scripts/icu/) | Unicode ICU 76.1 runtime, fetched separately; provision.sh retains upstream LICENSE beside installed libraries | Unicode-3.0; accompanying third-party notices in upstream LICENSE apply |
+| [crates/nunya/Cargo.toml](crates/nunya/Cargo.toml) | Optional `kubernetes` feature: kube 5.1 and k8s-openapi 0.29, fetched by Cargo, not vendored; permissive transitive dependencies including webpki-root-certs | Apache-2.0; transitive licenses include CDLA-Permissive-2.0 |
 
 The PostgreSQL oracle captures under `crates/giggles-server/tests/fixtures/dd68/`
 and other `tests/fixtures/dd68/` directories retain their existing provenance;

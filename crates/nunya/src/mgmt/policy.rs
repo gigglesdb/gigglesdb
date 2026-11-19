@@ -43,6 +43,8 @@ impl From<crate::reload::PolicyOpError> for PolicyError {
             E::Invalid(m) => Self::Invalid(m),
             E::Stale { current } => Self::Stale(Box::new(current)),
             E::CatalogChanged { current } => Self::CatalogChanged(current),
+            E::Store(RevisionStoreError::InvalidRoute) => Self::Code(422, "invalid_policy_route"),
+            E::Store(RevisionStoreError::Oversized) => Self::Code(413, "policy_revision_too_large"),
             E::Store(RevisionStoreError::IdempotencyConflict) => {
                 Self::Code(409, "idempotency_conflict")
             }
@@ -648,6 +650,7 @@ mod tests {
             let sink = Arc::new(Sink::default());
             Self {
                 ctx: MgmtContext {
+                    leadership: None,
                     authority,
                     admins: Arc::new(RwLock::new(vec![])),
                     connections: Arc::new(Sources),

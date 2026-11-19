@@ -20,6 +20,8 @@ pub(crate) struct Diff {
     pub(crate) restart_only: Vec<&'static str>,
 }
 const RESTART_ONLY: &[&str] = &[
+    "policy_store",
+    "policy_store_kubernetes",
     "listen",
     "admin_listen",
     "root_key",
@@ -54,6 +56,8 @@ fn upstream_tls_parts(t: &UpstreamTls) -> (u8, Option<&Path>) {
 /// Classify every configuration field without exposing setting values.
 pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
     let Config {
+        policy_store: a_policy_store,
+        policy_store_kubernetes: a_policy_store_kubernetes,
         file_policy_routes: a_file_policy_routes,
         path: _,
         revision: _,
@@ -81,6 +85,8 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
         standing: a_standing,
     } = running;
     let Config {
+        policy_store: b_policy_store,
+        policy_store_kubernetes: b_policy_store_kubernetes,
         file_policy_routes: b_file_policy_routes,
         path: _,
         revision: _,
@@ -115,6 +121,8 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
             }
         };
     }
+    changed!(restart_only, "policy_store", a_policy_store != b_policy_store);
+    changed!(restart_only, "policy_store_kubernetes", a_policy_store_kubernetes != b_policy_store_kubernetes);
     changed!(restart_only, "policy_owner", a_file_policy_routes != b_file_policy_routes);
     changed!(restart_only, "readlog", a_policy_settings.readlog != b_policy_settings.readlog);
     changed!(restart_only, "snapshot_max_age_ms", a_policy_settings.snapshot_max_age_ms != b_policy_settings.snapshot_max_age_ms);
@@ -257,6 +265,8 @@ fn copy_verifier(v: &ScramVerifier) -> ScramVerifier {
 /// Copy startup settings without rereading a potentially edited file.
 pub(crate) fn copy_config(c: &Config) -> Config {
     Config {
+        policy_store: c.policy_store,
+        policy_store_kubernetes: c.policy_store_kubernetes.clone(),
         file_policy_routes: c.file_policy_routes.clone(),
         policy_settings: c.policy_settings.clone(),
         path: c.path.clone(),
@@ -1021,7 +1031,7 @@ key_file='key'
         use crate::mgmt::{auth::{authenticate, Origin}, routes::MgmtContext};
         let f = Fixture::new();
         let (runtime, _hub, r, admins) = f.live();
-        let ctx = MgmtContext { policy: None, authority: runtime.authority.clone(), admins,
+        let ctx = MgmtContext { leadership: None, policy: None, authority: runtime.authority.clone(), admins,
             connections: Arc::new(Sources), status: Arc::new(Sources), lifecycle: Arc::new(Sources) };
         let auth = |name: &str, secret: &str| {
             let mut headers = http::HeaderMap::new();
@@ -1040,6 +1050,24 @@ key_file='key'
         assert_eq!(r.last_reload(), "applied");
         assert!(!auth("admin", "changed"));
         assert!(auth("replacement", "new"));
+    }
+    #[test]
+    fn policy_store_settings_require_restart_and_copy() {
+        let f = Fixture::new();
+        let running = f.load(&f.text);
+        let mut new = copy_config(&running);
+        new.policy_store = crate::config::PolicyStore::Kubernetes;
+        assert_eq!(classify(&running, &new).restart_only, ["policy_store"]);
+        new.policy_store = running.policy_store;
+        new.policy_store_kubernetes = Some(crate::config::KubernetesPolicyStore {
+            namespace: "default".into(), lease_name: "nunya-leader".into(),
+            pod_name: "pod".into(), management_url: "https://pod:6481".into(),
+            lease_duration_secs: 15, renew_deadline_secs: 10, retry_period_secs: 2,
+        });
+        assert_eq!(classify(&running, &new).restart_only, ["policy_store_kubernetes"]);
+        assert_eq!(classify(&new, &copy_config(&new)), Diff::default());
+        assert!(RESTART_ONLY.contains(&"policy_store"));
+        assert!(RESTART_ONLY.contains(&"policy_store_kubernetes"));
     }
     #[test]
     fn every_setting_is_classified_individually() {
@@ -1362,7 +1390,7 @@ key_file='key'
         let mut config = f.load(&f.text);
         config.management.as_mut().unwrap().listen = "127.0.0.1:0".parse().unwrap();
         let transports = Transports::new(&config).unwrap(); reload.attach_transports(transports.clone());
-        let ctx = Arc::new(MgmtContext { policy: None, authority: runtime.authority.clone(), admins,
+        let ctx = Arc::new(MgmtContext { leadership: None, policy: None, authority: runtime.authority.clone(), admins,
             connections: Arc::new(Sources), status: Arc::new(Sources), lifecycle: Arc::new(Sources) });
         let (shutdown, rx) = tokio::sync::watch::channel(false);
         let server = spawn_with_tls(ctx, config.management.as_ref(), &config.state_dir, rx, transports.management.clone()).await.unwrap();
