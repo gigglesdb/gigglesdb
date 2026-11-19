@@ -13,3 +13,10 @@ pub mod authority;
 
 /// Service-lifetime state ownership and revocation wiring.
 pub mod runtime;
+
+/// Serving-only state interface.
+pub mod serving_state;
+
+/// Authenticated leader state transport.
+#[cfg(feature = "kubernetes")]
+pub mod peer;

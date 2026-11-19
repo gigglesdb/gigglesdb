@@ -1928,6 +1928,8 @@ mod tests {
             fence: Default::default(),
                 serving_gate: None,
             authority: runtime.authority.clone(),
+                #[cfg(feature = "kubernetes")]
+                peer_state: None,
             registry: runtime.registry.clone(),
             route: crate::state::model::RouteId::new("spanner-native").unwrap(),
             policy: RwLock::new(Arc::new(policy())),
@@ -2053,7 +2055,9 @@ mod tests {
         let ctx = Arc::new(GatewayContext {
             fence: Default::default(),
                 serving_gate: None,
-            authority: runtime.authority.clone(), registry: runtime.registry.clone(), route: id("postgres"),
+            authority: runtime.authority.clone(),
+                #[cfg(feature = "kubernetes")]
+                peer_state: None, registry: runtime.registry.clone(), route: id("postgres"),
             policy: RwLock::new(Arc::new(policy())), policy_revision: RwLock::new(None),
             snapshot: RwLock::new(Arc::new(Snapshot::new(vec![], vec![], vec!["public".into()], 0))),
             root_key: crate::token::keys::RootKey::from_hex(&"00".repeat(32)).unwrap(),

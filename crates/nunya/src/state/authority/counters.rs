@@ -108,6 +108,83 @@ impl Authority {
         tx.commit()?;
         Ok(())
     }
+    /// Atomically reserve up to 64 durable tokenizations and return their principal window.
+    #[cfg(feature = "kubernetes")]
+    pub fn peer_reserve(&self, session: SessionId, domain: &DomainName, limits: &TokenizeLimits, want: u64) -> Result<(u64, u64, u64), TokenizeError> {
+        self.admit(session, Operation::Read)
+            .map_err(|_| TokenizeError::Ended)?;
+        let _writer = self.writer.lock().unwrap();
+        // Recheck after waiting for revocation or other writers.
+        self.admit(session, Operation::Read)
+            .map_err(|_| TokenizeError::Ended)?;
+        let mut tx = self.store.write()?;
+        let now = self.store.now_ms();
+        let row: AccessSession = decode(
+            &tx.get(Table::Sessions, &keys::session(session))?
+                .ok_or(TokenizeError::Ended)?,
+        )?;
+        if row.state != SessionState::Active || now >= row.expires_ms {
+            return Err(TokenizeError::Ended);
+        }
+        let session_key = keys::session_counter(session, domain)?;
+        let count = tx
+            .get(Table::SessionCounters, &session_key)?
+            .map(|b| decode_count(&b))
+            .transpose()?
+            .unwrap_or(0);
+
+        let prefix = keys::principal_counter_prefix(row.principal, domain)?;
+        let rows = tx.scan_prefix(Table::PrincipalCounters, &prefix)?;
+        let mut current = None;
+        for (key, bytes) in &rows {
+            let start = keys::principal_counter_window(key, &prefix).ok_or(TokenizeError::Store)?;
+            let (count, end) = decode_principal_count(bytes)?;
+            if end < start {
+                return Err(TokenizeError::Store);
+            }
+            if end > now && current.replace((start, count, end)).is_some() {
+                return Err(TokenizeError::Store);
+            }
+        }
+        let (start, principal_count, end) =
+            current.unwrap_or((now, 0, now.saturating_add(limits.principal_window_ms)));
+        let granted = want.min(64).min(limits.per_session.saturating_sub(count)).min(limits.per_principal.saturating_sub(principal_count));
+        if granted == 0 { return Ok((0, start, end)); }
+        let principal_key = keys::principal_counter(row.principal, domain, start)?;
+        for (key, _) in rows {
+            if key != principal_key {
+                tx.delete(Table::PrincipalCounters, &key)?;
+            }
+        }
+        let value = [encode_count(principal_count + granted), encode_count(end)].concat();
+        tx.put(
+            Table::SessionCounters,
+            &session_key,
+            &encode_count(count + granted),
+        )?;
+        tx.put(Table::PrincipalCounters, &principal_key, &value)?;
+        tx.commit()?;
+        Ok((granted, start, end))
+    }
+    /// Refund a previously reserved batch in its original principal window.
+    #[cfg(feature = "kubernetes")]
+    pub fn peer_refund(&self, session: SessionId, domain: &DomainName, window: u64, unused: u64) -> Result<(), TokenizeError> {
+        let _writer = self.writer.lock().map_err(|_| TokenizeError::Store)?;
+        let principal = self.session(session).ok_or(TokenizeError::Ended)?.principal;
+        let mut tx = self.store.write()?;
+        let sk = keys::session_counter(session, domain)?;
+        let pk = keys::principal_counter(principal, domain, window)?;
+        let sc = tx.get(Table::SessionCounters, &sk)?.map(|b| decode_count(&b)).transpose()?.ok_or(TokenizeError::Store)?;
+        let sc = sc.checked_sub(unused).ok_or(TokenizeError::Store)?;
+        if let Some(bytes) = tx.get(Table::PrincipalCounters, &pk)? {
+            let (pc, end) = decode_principal_count(&bytes)?;
+            let pc = pc.checked_sub(unused).ok_or(TokenizeError::Store)?;
+            tx.put(Table::PrincipalCounters, &pk, &[encode_count(pc), encode_count(end)].concat())?;
+        }
+        tx.put(Table::SessionCounters, &sk, &encode_count(sc))?;
+        tx.commit()?;
+        Ok(())
+    }
     /// Read the durable count for a session and domain, including ended sessions.
     pub fn session_tokenizations(
         &self,

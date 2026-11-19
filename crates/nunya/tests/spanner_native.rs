@@ -113,6 +113,8 @@ async fn session_worked_example() {
     )
     .unwrap();
     let state = nunya::spanner_serve::RouteState {
+        #[cfg(feature = "kubernetes")]
+        peer_state: None,
         authority: runtime.authority.clone(),
         registry: runtime.registry.clone(),
         route: nunya::state::model::RouteId::new("spanner-native").unwrap(),

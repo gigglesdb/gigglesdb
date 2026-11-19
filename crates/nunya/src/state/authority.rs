@@ -17,6 +17,8 @@ mod config_sync;
 mod counters;
 mod api_ext;
 mod login;
+#[cfg(feature = "kubernetes")]
+mod peer_access;
 pub use login::SessionLogin;
 pub use config_sync::{ConfigPrincipal, ConfigSync};
 pub use counters::{TokenizeError, TokenizeLimits};
@@ -71,6 +73,10 @@ pub enum AdmitError {
     /// Session is no longer authorized.
     #[error("session ended")]
     Ended,
+    /// Peer serving state is unavailable.
+    #[cfg(feature = "kubernetes")]
+    #[error("serving unavailable")]
+    Unavailable,
     /// Effective mode refuses writes.
     #[error("session is read only")]
     ReadOnly,
@@ -185,6 +191,8 @@ pub struct Authority {
     // This mutex coordinates writers only; admission never takes it.
     writer: Mutex<()>,
     hook: RwLock<Option<Arc<dyn RevocationHook>>>,
+    #[cfg(feature = "kubernetes")]
+    peer_changes: Mutex<crate::state::peer::ChangeLog>,
     sessions_issued: AtomicU64,
     sessions_renewed: AtomicU64,
     resumes_refused: AtomicU64,
@@ -420,6 +428,8 @@ impl Authority {
             view: RwLock::new(v),
             writer: Mutex::new(()),
             hook: RwLock::new(None),
+            #[cfg(feature = "kubernetes")]
+            peer_changes: Mutex::default(),
             sessions_issued: AtomicU64::new(0),
             sessions_renewed: AtomicU64::new(0),
             resumes_refused: AtomicU64::new(0),
@@ -430,6 +440,13 @@ impl Authority {
         *self.hook.write().unwrap() = Some(hook);
     }
     fn notify(&self, rows: &[AccessSession]) {
+        #[cfg(feature = "kubernetes")]
+        {
+            let mut log = self.peer_changes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for row in rows {
+                if let Some(reason) = row.revoke_reason { log.push(row.id, reason); }
+            }
+        }
         let hook = self.hook.read().unwrap().clone();
         if let Some(hook) = hook {
             for s in rows {
@@ -650,6 +667,14 @@ impl Authority {
             &encode(&c),
         )?;
         tx.commit()?;
+        #[cfg(feature = "kubernetes")]
+        {
+            // Credential revocation invalidates cached authentication material,
+            // without changing the existing lifetime of issued access sessions.
+            let sessions = self.sessions_of(id);
+            let mut log = self.peer_changes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for session in sessions { log.refresh(session.id); }
+        }
         Ok(())
     }
     /// Replace all route grants, including for configuration principals.
@@ -685,7 +710,15 @@ impl Authority {
                 let route = v.sessions[&sid].route.clone();
                 if let Some(mode) = grants.get(&route) {
                     let session = v.sessions.get_mut(&sid).ok_or(AuthorityError::Store)?;
+                    #[cfg(feature = "kubernetes")]
+                    let previous = session.mode;
                     session.mode = session.mode.min(*mode);
+                    // Restrictions take effect in memory even if durability fails; invalidate pod copies too.
+                    #[cfg(feature = "kubernetes")]
+                    if previous != session.mode {
+                        self.peer_changes.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .refresh(sid);
+                    }
                 } else {
                     end(&mut v, sid, EndReason::GrantRemoved, self.store.now_ms());
                 }
@@ -1034,6 +1067,10 @@ impl Authority {
         ended.extend(self.drain_pending_best_effort());
         drop(writer);
         self.notify(&ended);
+        #[cfg(feature = "kubernetes")]
+        if result.is_ok() {
+            self.peer_changes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).refresh(id);
+        }
         if result.is_ok() {
             self.sessions_renewed.fetch_add(1, Ordering::Relaxed);
         }

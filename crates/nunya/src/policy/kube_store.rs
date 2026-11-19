@@ -286,9 +286,14 @@ impl RevisionStore for KubernetesRevisionStore {
     ) -> Result<WriteOutcome, RevisionStoreError> {
         self.fence()?;
         let n = name(route)?;
-        let h = self.read(route)?;
+        let mut h = self.read(route)?;
         if h.is_none() && !self.backend.copies(&format!("{ROUTE_LABEL}={}", route.as_str()))?.is_empty() {
-            return Err(RevisionStoreError::Corrupt);
+            // A concurrent first writer can commit its head and copy between our
+            // GET and LIST. Re-read the commit point before declaring an orphan.
+            h = self.read(route)?;
+            if h.is_none() {
+                return Err(RevisionStoreError::Corrupt);
+            }
         }
         let current = h.as_ref().and_then(|h| h.spec.revision.clone());
         if let Some(r) = &current {
@@ -648,10 +653,16 @@ mod tests {
         ignore_retry_label: AtomicBool,
         barrier: Option<Barrier>,
         reads: AtomicUsize,
+        pause_head: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     }
     impl Backend for Fake {
         fn head(&self, name: &str) -> ApiResult<Option<VersionedHead>> {
             let head = self.state.lock().unwrap().heads.get(name).cloned();
+            let pause = self.pause_head.lock().unwrap().take();
+            if let Some((ready, resume)) = pause {
+                ready.send(()).unwrap();
+                resume.recv().unwrap();
+            }
             if self.reads.fetch_add(1, Ordering::SeqCst) < 2
                 && let Some(b) = &self.barrier
             {
@@ -835,6 +846,33 @@ mod tests {
         assert_eq!(first_key(&f), Some("key".into()));
     }
     #[test]
+    fn absent_head_read_before_concurrent_commit_is_not_corruption() {
+        let (f, store) = setup();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *f.pause_head.lock().unwrap() = Some((ready_tx, resume_rx));
+        let paused = KubernetesRevisionStore { backend: f.clone(), leader: None };
+        let writer = std::thread::spawn(move || {
+            paused.write(&route(), None, draft(None, "paused"))
+        });
+        ready_rx.recv().unwrap();
+        let winner = written(store.write(&route(), None, draft(None, "winner")).unwrap());
+        resume_tx.send(()).unwrap();
+        assert_eq!(writer.join().unwrap(), Ok(WriteOutcome::Stale { current: Some(winner.clone()) }));
+        assert_eq!(store.active(&route()).unwrap(), Some(winner.clone()));
+        assert_eq!(store.get(&route(), 1).unwrap(), Some(winner));
+        assert_eq!(store.history(&route()).unwrap().len(), 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn stale_and_simultaneous_cas_stress() {
+        for _ in 0..1000 {
+            stale_and_simultaneous_cas_preserve_winner();
+        }
+    }
+
+    #[test]
     fn stale_and_simultaneous_cas_preserve_winner() {
         let f = Arc::new(Fake {
             barrier: Some(Barrier::new(2)),
@@ -887,6 +925,7 @@ mod tests {
             .unwrap();
         assert_eq!(s.active(&route()).unwrap(), Some(winner.clone()));
         assert_eq!(s.get(&route(), 1).unwrap(), Some(winner));
+        assert_eq!(s.history(&route()).unwrap().len(), 1);
         assert!(matches!(
             s.write(&route(), None, draft(None, "stale")).unwrap(),
             WriteOutcome::Stale { .. }

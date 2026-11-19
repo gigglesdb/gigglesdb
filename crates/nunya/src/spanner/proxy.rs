@@ -59,6 +59,9 @@ pub struct SpannerContext {
     pub serving_gate: Option<Arc<crate::policy::serving::ServingGate>>,
     /// Shared durable session authority.
     pub authority: Arc<crate::state::authority::Authority>,
+    /// Optional leader-backed serving cache.
+    #[cfg(feature = "kubernetes")]
+    pub peer_state: Option<Arc<crate::state::peer::PeerStateCache>>,
     /// Shared live connection registry.
     pub registry: crate::state::runtime::Registry,
     /// Validated route identifier.
@@ -273,7 +276,7 @@ impl WriteAudit {
             // The end signal carries only a bool. Read authority only for an
             // actual cancellation, never to infer the cause of transport loss.
             UnknownCause::SessionEnded => {
-                if self.ctx.authority.session(self.who.session).is_some_and(|row| {
+                if self.ctx.serving_state().session(self.who.session).is_some_and(|row| {
                     matches!(row.revoke_reason, Some(crate::state::model::EndReason::Expired | crate::state::model::EndReason::IdleTimeout))
                         || (row.revoke_reason.is_none() && row.expires_ms <= (self.ctx.clock)())
                 }) { "expired" } else { "revoked" }
@@ -417,7 +420,7 @@ impl RevisionGuard {
         }
     }
     fn check(&mut self, epoch: u64, write: bool) -> Result<(), Status> {
-        if self.ctx.serving_gate.as_ref().is_some_and(|g| !g.allow()) {
+        if self.ctx.serving_gate.as_ref().is_some_and(|g| !g.allow()) || !self.ctx.serving_state().available() {
             return Err(after_forward(nunya_status(NyCode::ServingUnavailable), write));
         }
         if epoch != self.epoch {
@@ -547,6 +550,8 @@ fn remote(error: Status) -> Status {
 fn admission_status(error: AdmitError) -> Status {
     nunya_status(match error {
         AdmitError::ReadOnly => NyCode::StatementNotAllowed,
+                    #[cfg(feature = "kubernetes")]
+                    AdmitError::Unavailable => NyCode::ServingUnavailable,
         AdmitError::Unknown | AdmitError::Ended => NyCode::SessionEnded,
     })
 }
@@ -711,14 +716,23 @@ fn tls_incoming_with(
     })
 }
 
+impl SpannerContext {
+    /// Select the peer cache in cluster mode, otherwise the unchanged local authority.
+    pub fn serving_state(&self) -> &dyn crate::state::serving_state::ServingState {
+        #[cfg(feature = "kubernetes")]
+        if let Some(cache) = &self.peer_state { return cache.as_ref(); }
+        self.authority.as_ref()
+    }
+}
+
 impl NunyaSpanner {
     fn authenticate<T>(&self, req: &Request<T>) -> Result<Authenticated, Status> {
-        if self.ctx.serving_gate.as_ref().is_some_and(|g| !g.allow()) {
+        if self.ctx.serving_gate.as_ref().is_some_and(|g| !g.allow()) || !self.ctx.serving_state().available() {
             return Err(nunya_status(NyCode::ServingUnavailable));
         }
-        auth::authenticate(
+        auth::authenticate_state(
             req.metadata(),
-            &self.ctx.authority,
+            self.ctx.serving_state(),
             &self.ctx.route,
             &self.ctx.root_key,
         )
@@ -757,7 +771,7 @@ impl NunyaSpanner {
         if let std::collections::hash_map::Entry::Vacant(entry) = watchers.entry(who.session) {
             let row = self
                 .ctx
-                .authority
+                .serving_state()
                 .session(who.session)
                 .ok_or_else(|| nunya_status(NyCode::SessionEnded))?;
             let deadline = tokio::time::Instant::now()
@@ -770,9 +784,10 @@ impl NunyaSpanner {
             );
             // Register before rechecking admission so a concurrent revocation cannot be missed.
             self.ctx
-                .authority
+                .serving_state()
                 .admit(who.session, Operation::Read)
                 .map_err(admission_status)?;
+            self.ctx.serving_state().report(who.session, true);
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let (ended_tx, ended) = tokio::sync::watch::channel(false);
             entry.insert(SessionWatcher { connection: guard.id().get(), stop, ended });
@@ -785,6 +800,7 @@ impl NunyaSpanner {
             let principal = who.principal;
             let ctx = self.ctx.clone();
             tokio::spawn(async move {
+                let _connection_report = crate::state::serving_state::ConnectionReport::closing(ctx.serving_state(), session);
                 let _guard = guard;
                 let reason = tokio::select! {
                     biased;
@@ -845,7 +861,7 @@ impl NunyaSpanner {
             });
         } else {
             self.ctx
-                .authority
+                .serving_state()
                 .admit(who.session, Operation::Read)
                 .map_err(admission_status)?;
         }
@@ -867,14 +883,14 @@ impl NunyaSpanner {
             return Err(ended_status(false));
         }
         self.ctx
-            .authority
+            .serving_state()
             .admit(who.session, Operation::Read)
             .map_err(|_| ended_status(false))?;
         Ok(signal)
     }
     fn admit_write(&self, who: &Authenticated) -> Result<(), Status> {
         self.ctx
-            .authority
+            .serving_state()
             .admit(who.session, Operation::Write)
             .map(|_| ())
             .map_err(admission_status)
@@ -888,7 +904,7 @@ impl NunyaSpanner {
         if *signal.borrow()
             || self
                 .ctx
-                .authority
+                .serving_state()
                 .admit(who.session, Operation::Read)
                 .is_err()
         {
@@ -1294,7 +1310,7 @@ impl NunyaSpanner {
             &who.keys, domain, &ty, setting.range.as_ref(), &value,
         ).map_err(|e| e.code)?;
         let value = values::to_proto(wire_ty, &value).map_err(|e| e.code)?;
-        self.ctx.authority.record_tokenization(who.session, domain, &limits)
+        self.ctx.serving_state().record_tokenization(who.session, domain, &limits)
             .map_err(tokenize_refusal)?;
         Ok(ResultSet {
             metadata: Some(ResultSetMetadata {
@@ -1421,7 +1437,7 @@ impl NunyaSpanner {
                     })?;
                     producer_guard.check(ctx.fence.epoch(), write)?;
                     received_part = true;
-                    ctx.authority
+                    ctx.serving_state()
                         .admit(who.session, Operation::Read)
                         .map_err(|_| ended_status(write))?;
                     if let Some(session) = inline_session.as_ref()
@@ -1478,7 +1494,7 @@ impl NunyaSpanner {
                 }
                 reassembler.finish().map_err(|e| after_forward(status(e), write))?;
                 if let Some(output) = precommit.finish() {
-                    ctx.authority
+                    ctx.serving_state()
                         .admit(who.session, Operation::Read)
                         .map_err(|_| ended_status(write))?;
                     tokio::select! {
@@ -2866,6 +2882,8 @@ mod tests {
                 fence: Default::default(),
                 serving_gate: None,
                 authority: runtime.authority.clone(),
+                #[cfg(feature = "kubernetes")]
+                peer_state: None,
                 registry: runtime.registry.clone(),
                 route: crate::state::model::RouteId::new("spanner-native").unwrap(),
                 policy: RwLock::new(Arc::new(policy)),

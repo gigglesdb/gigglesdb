@@ -82,7 +82,7 @@ struct Active {
     described: bool,
 }
 fn check_serving(ctx: &GatewayContext) -> Result<(), Refusal> {
-    if ctx.serving_gate.as_ref().is_some_and(|g| !g.allow()) {
+    if ctx.serving_gate.as_ref().is_some_and(|g| !g.allow()) || !ctx.serving_state().available() {
         return Err(failure(NyCode::ServingUnavailable));
     }
     Ok(())
@@ -293,13 +293,15 @@ impl Session {
     }
     fn admit(&self) -> Result<Mode, Refusal> {
         self.ctx
-            .authority
+            .serving_state()
             .admit(self.session, Operation::Read)
             .map(|admitted| admitted.mode)
             .map_err(|error| {
                 failure(match error {
                     AdmitError::Unknown | AdmitError::Ended => NyCode::SessionEnded,
                     AdmitError::ReadOnly => NyCode::StatementNotAllowed,
+                    #[cfg(feature = "kubernetes")]
+                    AdmitError::Unavailable => NyCode::ServingUnavailable,
                 })
             })
     }
@@ -367,7 +369,7 @@ impl Session {
             return Err(failure(NyCode::StatementNotAllowed));
         };
         self.ctx
-            .authority
+            .serving_state()
             .record_tokenization(
                 self.session,
                 domain,
@@ -609,9 +611,9 @@ impl Session {
         if matches!(msg, Backend::DataRow(_)) {
             let now = (self.ctx.clock)();
             if self.last_row_refresh_ms.is_none_or(|last| now.saturating_sub(last) >= 1000) {
-                if self.ctx.authority.admit(self.session, Operation::Read).is_err() {
+                if self.ctx.serving_state().admit(self.session, Operation::Read).is_err() {
                     use crate::state::{model::EndReason as StoredEnd, registry::EndReason};
-                    self.end_requested = Some(match self.ctx.authority.session(self.session)
+                    self.end_requested = Some(match self.ctx.serving_state().session(self.session)
                         .and_then(|row| row.revoke_reason) {
                         Some(StoredEnd::Expired | StoredEnd::IdleTimeout) => EndReason::Expired,
                         _ => EndReason::Revoked,
@@ -1368,8 +1370,9 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
             }
         }
     };
+    if !ctx.serving_state().available() { return Err(failure(NyCode::ServingUnavailable)); }
     let login = auth::parse_session_user(&user).and_then(|id| {
-        ctx.authority
+        ctx.serving_state()
             .session_login(id, &ctx.route)
             .map(|login| (id, login))
     });
@@ -1412,9 +1415,10 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
     let (id, login) = login.ok_or_else(|| failure(NyCode::TokenNotValid))?;
     let credential = login.verifiers.get(matched).map(|(id, _)| *id)
         .ok_or_else(|| failure(NyCode::TokenNotValid))?;
-    ctx.authority
+    ctx.serving_state()
         .admit(id, crate::state::authority::Operation::Read)
         .map_err(|_| failure(NyCode::TokenNotValid))?;
+    let _connection_report = crate::state::serving_state::ConnectionReport::start(ctx.serving_state(), id);
     let keys = derive_scope_v2(
         &ctx.root_key,
         &login.scope.salt,
@@ -1452,7 +1456,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
         ctx: ctx.clone(),
         key,
     };
-    let deadline = ctx.authority.session(id).map(|row| {
+    let deadline = ctx.serving_state().session(id).map(|row| {
         tokio::time::Instant::now()
             + std::time::Duration::from_millis(row.expires_ms.saturating_sub(crate::serve::now()))
     });
@@ -1463,7 +1467,7 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
     session.pinned_path = pinned_path;
     session.set_connection(_connection_guard.id().get());
     // Recheck after registration so revocation between login and registration cannot be missed.
-    if ctx.authority.admit(id, Operation::Read).is_err() {
+    if ctx.serving_state().admit(id, Operation::Read).is_err() {
         let actions = session.refuse("", NyCode::SessionEnded, false);
         agent.send(&actions.client).await?;
         return Ok(());
@@ -1685,6 +1689,8 @@ pub(crate) mod tests {
                 fence: Default::default(),
                 serving_gate: None,
                 authority: runtime.authority.clone(),
+                #[cfg(feature = "kubernetes")]
+                peer_state: None,
                 registry: runtime.registry.clone(),
                 route: crate::state::model::RouteId::new("postgres").unwrap(),
                 policy_revision: RwLock::new(None),

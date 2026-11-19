@@ -20,6 +20,7 @@ pub(crate) struct Diff {
     pub(crate) restart_only: Vec<&'static str>,
 }
 const RESTART_ONLY: &[&str] = &[
+    "kubernetes.peer",
     "policy_store",
     "policy_store_kubernetes",
     "listen",
@@ -56,6 +57,7 @@ fn upstream_tls_parts(t: &UpstreamTls) -> (u8, Option<&Path>) {
 /// Classify every configuration field without exposing setting values.
 pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
     let Config {
+        kubernetes: a_kubernetes,
         policy_store: a_policy_store,
         policy_store_kubernetes: a_policy_store_kubernetes,
         file_policy_routes: a_file_policy_routes,
@@ -85,6 +87,7 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
         standing: a_standing,
     } = running;
     let Config {
+        kubernetes: b_kubernetes,
         policy_store: b_policy_store,
         policy_store_kubernetes: b_policy_store_kubernetes,
         file_policy_routes: b_file_policy_routes,
@@ -121,6 +124,7 @@ pub(crate) fn classify(running: &Config, new: &Config) -> Diff {
             }
         };
     }
+    changed!(restart_only, "kubernetes.peer", a_kubernetes != b_kubernetes);
     changed!(restart_only, "policy_store", a_policy_store != b_policy_store);
     changed!(restart_only, "policy_store_kubernetes", a_policy_store_kubernetes != b_policy_store_kubernetes);
     changed!(restart_only, "policy_owner", a_file_policy_routes != b_file_policy_routes);
@@ -265,6 +269,7 @@ fn copy_verifier(v: &ScramVerifier) -> ScramVerifier {
 /// Copy startup settings without rereading a potentially edited file.
 pub(crate) fn copy_config(c: &Config) -> Config {
     Config {
+        kubernetes: c.kubernetes.clone(),
         policy_store: c.policy_store,
         policy_store_kubernetes: c.policy_store_kubernetes.clone(),
         file_policy_routes: c.file_policy_routes.clone(),

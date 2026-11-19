@@ -91,6 +91,9 @@ async fn stopped(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
 pub struct RouteState {
     /// Shared durable authority.
     pub authority: Arc<crate::state::authority::Authority>,
+    /// Optional cluster serving cache.
+    #[cfg(feature = "kubernetes")]
+    pub peer_state: Option<Arc<crate::state::peer::PeerStateCache>>,
     /// Shared connection registry.
     pub registry: crate::state::runtime::Registry,
     /// Validated configured route identifier.
@@ -165,6 +168,8 @@ pub(crate) async fn run_spanner_with_hub(
             fence: Default::default(),
             serving_gate: hub.as_ref().and_then(|h| h.serving_gate.clone()),
             authority: state.authority,
+            #[cfg(feature = "kubernetes")]
+            peer_state: state.peer_state,
             registry: state.registry,
             route: state.route,
             policy: RwLock::new(policy),

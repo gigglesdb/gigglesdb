@@ -1,0 +1,290 @@
+//! Separate HTTP/1 peer listener with bounded bodies and fail-closed routing.
+use super::*;
+use crate::{
+    policy::{DomainName, kube_leader::LeaderState},
+    state::{
+        authority::{Authority, Operation, TokenizeError, TokenizeLimits},
+        model::SessionState,
+    },
+    token::SessionId,
+};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioIo;
+use serde::{Serialize, de::DeserializeOwned};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{Arc, Mutex},
+};
+/// Current policy limit resolver for leader reservations.
+pub type LimitSource = Arc<dyn Fn(&str) -> Option<TokenizeLimits> + Send + Sync>;
+struct Batch {
+    session: SessionId,
+    domain: DomainName,
+    window: u64,
+    granted: u64,
+    expires: u64,
+}
+/// Leader state service with server-owned per-domain limits.
+pub struct PeerServer {
+    authority: Arc<Authority>,
+    leader: LeaderState,
+    serving_gate: Option<Arc<crate::policy::serving::ServingGate>>,
+    auth: Arc<PeerAuth>,
+    limits: HashMap<String, TokenizeLimits>,
+    limit_source: Option<LimitSource>,
+    batches: Mutex<HashMap<String, Batch>>,
+    pub(super) slots: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    pub(super) slow_lookup: Mutex<Option<(SessionId, Arc<tokio::sync::Notify>)>>,
+}
+impl std::fmt::Debug for PeerServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PeerServer { [REDACTED] }")
+    }
+}
+fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, PeerError> {
+    serde_json::from_slice(body).map_err(|_| PeerError::Protocol)
+}
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, PeerError> {
+    serde_json::to_vec(value).map_err(|_| PeerError::Protocol)
+}
+impl PeerServer {
+    /// Construct an unwired peer listener service.
+    pub fn new(
+        authority: Arc<Authority>,
+        leader: LeaderState,
+        auth: Arc<PeerAuth>,
+        limits: HashMap<String, TokenizeLimits>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            authority,
+            leader,
+            serving_gate: None,
+            auth,
+            limits,
+            limit_source: None,
+            batches: Mutex::default(),
+            slots: Arc::new(tokio::sync::Semaphore::new(256)),
+            #[cfg(test)]
+            slow_lookup: Mutex::default(),
+        })
+    }
+    /// Refuse requests when the leader cannot currently serve its policy.
+    pub fn with_serving_gate(mut self: Arc<Self>, gate: Arc<crate::policy::serving::ServingGate>) -> Result<Arc<Self>, PeerError> {
+        Arc::get_mut(&mut self).ok_or(PeerError::Protocol)?.serving_gate = Some(gate);
+        Ok(self)
+    }
+    /// Resolve reservation limits from the current served policy.
+    pub fn with_limit_source(mut self: Arc<Self>, source: LimitSource) -> Result<Arc<Self>, PeerError> {
+        Arc::get_mut(&mut self).ok_or(PeerError::Protocol)?.limit_source = Some(source);
+        Ok(self)
+    }
+    /// Serve the supplied listener until the caller cancels this future.
+    pub async fn serve(
+        self: Arc<Self>,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), PeerError> {
+        if self.serving_gate.is_none() { return Err(PeerError::Protocol); }
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted=listener.accept()=> { let (socket,_)=accepted.map_err(|_|PeerError::Transport)?; let Ok(permit) = self.slots.clone().try_acquire_owned() else { drop(socket); continue; }; let service=self.clone();
+                    connections.spawn(async move { let _permit = permit; let _=tokio::time::timeout(std::time::Duration::from_secs(5), http1::Builder::new().serve_connection(TokioIo::new(socket),service_fn(move |req| {let service=service.clone();async move {Ok::<_,Infallible>(service.handle(req).await)}}))).await; });
+                },
+                _=connections.join_next(), if !connections.is_empty()=>{}
+            }
+        }
+    }
+    async fn handle(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {
+        let (parts, body) = req.into_parts();
+        let body = match tokio::time::timeout(std::time::Duration::from_secs(5), Limited::new(body, 64 * 1024).collect()).await {
+            Ok(Ok(b)) => b.to_bytes(),
+            Ok(Err(_)) | Err(_) => return response(400, vec![]),
+        };
+        let nonce = match self.auth.verify(
+            parts.method.as_str(),
+            parts.uri.path(),
+            &parts.headers,
+            &body,
+            auth::now(),
+        ) {
+            Ok(n) => n,
+            Err(_) => return response(401, vec![]),
+        };
+        #[cfg(test)]
+        if parts.uri.path() == "/peer/v1/session/lookup" {
+            let slow = self.slow_lookup.lock().unwrap().clone();
+            if let Some((id, entered)) = slow
+                && decode::<Lookup>(&body).is_ok_and(|r| r.session_id == id) {
+                entered.notify_one();
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+        }
+        let generation = self.leader.term();
+        let result = if !self.leader.is_leader() || self.serving_gate.as_ref().is_some_and(|gate| !gate.allow()) {
+            encode(&Failure {
+                error: FailureCode::NotLeader,
+                generation,
+                leader: self.leader.leader_url(),
+            })
+            .map(|b| (409, b))
+        } else if parts.method != http::Method::POST || parts.uri.query().is_some() {
+            Err(PeerError::Protocol)
+        } else {
+            self.dispatch(parts.uri.path(), &body)
+        };
+        let (status, body) = result.unwrap_or_else(|_| (400, b"{\"error\":\"refused\"}".to_vec()));
+        match self.auth.seal(&body, &nonce, status, generation) {
+            Ok(sealed) => {
+                let mut r = response(status, sealed);
+                if let Ok(v) = generation.to_string().parse() {
+                    r.headers_mut().insert("x-nunya-peer-generation", v);
+                }
+                r
+            }
+            Err(_) => response(500, vec![]),
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn expire_batch(&self, id: &str) {
+        self.batches.lock().unwrap().get_mut(id).unwrap().expires = 0;
+    }
+    fn dispatch(&self, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), PeerError> {
+        let reply = match path {
+            "/peer/v1/session/lookup" => {
+                let r: Lookup = decode(body)?;
+                let result = match self.authority.session(r.session_id) {
+                    None => LookupResult::Unknown,
+                    Some(session) => {
+                        if session.state == SessionState::Active {
+                            if let Some(credentials) = self.authority.peer_credentials(r.session_id)
+                            {
+                                let login = self
+                                    .authority
+                                    .session_login(r.session_id, &session.route)
+                                    .ok_or(PeerError::Protocol)?;
+                                LookupResult::Active {
+                                    session: Box::new(session),
+                                    credentials,
+                                    verifiers: login.verifiers,
+                                }
+                            } else {
+                                LookupResult::Ended {
+                                    reason: session.revoke_reason,
+                                }
+                            }
+                        } else {
+                            LookupResult::Ended {
+                                reason: session.revoke_reason,
+                            }
+                        }
+                    }
+                };
+                encode(&result)?
+            }
+            "/peer/v1/scope/get" => {
+                let r: ScopeGet = decode(body)?;
+                encode(&ScopeResult {
+                    scope: self.authority.scope(r.scope_id),
+                })?
+            }
+            "/peer/v1/changes" => {
+                let r: ChangesRequest = decode(body)?;
+                if r.touched.len() > 1024 { return Err(PeerError::Protocol); }
+                self.authority.peer_touch(&r.touched);
+                self.authority.sweep().map_err(|_| PeerError::Protocol)?;
+                encode(
+                    &self
+                        .authority
+                        .peer_changes(r.since, self.leader.term()),
+                )?
+            }
+            "/peer/v1/counter/reserve" => {
+                let r: Reserve = decode(body)?;
+                let limits = match &self.limit_source { Some(source) => source(&r.domain), None => self.limits.get(&r.domain).copied() }.ok_or(PeerError::Protocol)?;
+                let mut batches = self.batches.lock().map_err(|_| PeerError::Protocol)?;
+                let now = self.authority.peer_now();
+                batches.retain(|_, b| b.expires > now);
+                if batches.len() >= 65_536 {
+                    return Err(PeerError::Protocol);
+                }
+                let id = auth::nonce()?;
+                let domain = DomainName(r.domain);
+                let (granted, window, window_end) =
+                    match self
+                        .authority
+                        .peer_reserve(r.session_id, &domain, &limits, r.want)
+                    {
+                        Ok(r) => r,
+                        Err(TokenizeError::Ended) => {
+                            return Ok((
+                                200,
+                                encode(&Ended {
+                                    state: EndedState::Ended,
+                                })?,
+                            ));
+                        }
+                        Err(TokenizeError::LimitReached | TokenizeError::Store) => {
+                            return Err(PeerError::Protocol);
+                        }
+                    };
+                let expires = now.saturating_add(30_000).min(window_end);
+                if granted > 0 {
+                    batches.insert(
+                        id.clone(),
+                        Batch {
+                            session: r.session_id,
+                            domain,
+                            window,
+                            granted,
+                            expires,
+                        },
+                    );
+                }
+                encode(&Reservation {
+                    granted,
+                    batch_id: id,
+                    expires_ms: expires,
+                })?
+            }
+            "/peer/v1/counter/return" => {
+                let r: Return = decode(body)?;
+                let mut batches = self.batches.lock().map_err(|_| PeerError::Protocol)?;
+                if let Some(batch) = batches.get(&r.batch_id) {
+                    if r.unused > batch.granted {
+                        return Err(PeerError::Protocol);
+                    }
+                    if self.authority.peer_now() < batch.expires {
+                        self.authority
+                            .peer_refund(batch.session, &batch.domain, batch.window, r.unused)
+                            .map_err(|_| PeerError::Protocol)?;
+                    }
+                    batches.remove(&r.batch_id);
+                }
+                encode(&Ack { ok: true })?
+            }
+            "/peer/v1/session/report" => {
+                let r: Report = decode(body)?;
+                match r.event {
+                    Event::Start | Event::End => {
+                        self.authority
+                            .admit(r.session_id, Operation::Read)
+                            .map_err(|_| PeerError::Protocol)?;
+                    }
+                }
+                encode(&Ack { ok: true })?
+            }
+            _ => return Err(PeerError::Protocol),
+        };
+        Ok((200, reply))
+    }
+}
+fn response(status: u16, body: Vec<u8>) -> Response<Full<Bytes>> {
+    let mut r = Response::new(Full::new(Bytes::from(body)));
+    *r.status_mut() =
+        http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+    r
+}

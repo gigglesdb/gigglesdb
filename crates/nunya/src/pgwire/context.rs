@@ -72,6 +72,9 @@ pub struct GatewayContext {
     pub serving_gate: Option<Arc<crate::policy::serving::ServingGate>>,
     /// Shared durable session authority.
     pub authority: Arc<crate::state::authority::Authority>,
+    /// Optional leader-backed serving cache.
+    #[cfg(feature = "kubernetes")]
+    pub peer_state: Option<Arc<crate::state::peer::PeerStateCache>>,
     /// Shared live connection registry.
     pub registry: crate::state::runtime::Registry,
     /// Validated route identifier.
@@ -102,6 +105,15 @@ pub struct GatewayContext {
     pub tls: ReloadableTls,
     /// Whether unencrypted agent connections are permitted.
     pub allow_plaintext: bool,
+}
+
+impl GatewayContext {
+    /// Select the peer cache in cluster mode, otherwise the unchanged local authority.
+    pub fn serving_state(&self) -> &dyn crate::state::serving_state::ServingState {
+        #[cfg(feature = "kubernetes")]
+        if let Some(cache) = &self.peer_state { return cache.as_ref(); }
+        self.authority.as_ref()
+    }
 }
 
 impl GatewayContext {

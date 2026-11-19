@@ -30,6 +30,7 @@ impl Clock for RealClock {
 struct Published {
     until: Option<Duration>,
     generation: u64,
+    term: u64,
     url: Option<String>,
 }
 /// Cheap shared leadership view; expired renewals are fenced even during a hung API call.
@@ -59,8 +60,12 @@ impl LeaderState {
     pub(crate) fn live_for_test() -> Self {
         let s = Self::default(); s.publish(Some(Duration::MAX), None); s
     }
+    #[cfg(test)]
+    pub(crate) fn term_for_test(&self, term: u64) { self.view.write().unwrap().term = term; }
     /// Acquisition generation used to discard previous activation observations.
     pub fn generation(&self) -> u64 { self.view.read().unwrap_or_else(std::sync::PoisonError::into_inner).generation }
+    /// Last observed or held Lease transition term.
+    pub fn term(&self) -> u64 { self.view.read().unwrap_or_else(std::sync::PoisonError::into_inner).term }
     /// Last observed leader management URL, if known.
     pub fn leader_url(&self) -> Option<String> {
         self.snapshot().1
@@ -80,9 +85,13 @@ impl LeaderState {
         (leader, url)
     }
     fn publish(&self, until: Option<Duration>, url: Option<String>) {
+        self.publish_term(until, url, None);
+    }
+    fn publish_term(&self, until: Option<Duration>, url: Option<String>, term: Option<u64>) {
         let mut view = self.view.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = view.generation + u64::from(until.is_some() && view.until.is_none_or(|d| self.clock.mono() >= d));
-        *view = Published { until, url, generation };
+        let term = term.unwrap_or(view.term);
+        *view = Published { until, url, generation, term };
     }
 }
 impl crate::mgmt::routes::Leadership for LeaderState {
@@ -266,10 +275,11 @@ impl LeaderElector {
         let create = old.is_none();
         let mut lease = old.unwrap_or_default();
         let mut spec = lease.spec.take().unwrap_or_default();
+        let observed_term = u64::try_from(spec.lease_transitions.unwrap_or(0)).map_err(|_| ElectionError::Invalid)?;
         let held = spec.holder_identity.as_deref().filter(|s| !s.is_empty());
         let ours = held == Some(self.identity.as_str());
         if !ours {
-            self.state.publish(
+            self.state.publish_term(
                 None,
                 lease
                     .metadata
@@ -278,6 +288,7 @@ impl LeaderElector {
                     .and_then(|a| a.get(URL))
                     .cloned()
                     .filter(|_| held.is_some()),
+                Some(observed_term),
             );
         }
         // Resource version changes are renewals, regardless of remote wall-clock skew.
@@ -315,6 +326,7 @@ impl LeaderElector {
         spec.renew_time = Some(stamp);
         spec.holder_identity = Some(self.identity.clone());
         spec.lease_duration_seconds = Some(self.timings.lease_duration.as_secs() as i32);
+        let acquired_term = u64::try_from(spec.lease_transitions.unwrap_or(0)).map_err(|_| ElectionError::Invalid)?;
         lease.spec = Some(spec);
         lease.metadata.name = Some(self.name.clone());
         lease
@@ -326,7 +338,7 @@ impl LeaderElector {
         let until = self.state.clock.mono() + self.timings.renew_deadline;
         match self.api.save(lease, create) {
             Ok(()) => {
-                self.state.publish(Some(until), Some(self.url.clone()));
+                self.state.publish_term(Some(until), Some(self.url.clone()), Some(acquired_term));
                 Ok(())
             }
             Err(ElectionError::Conflict) => {
@@ -459,6 +471,10 @@ mod tests {
         clock.0.store(16, Ordering::SeqCst);
         b.tick().unwrap();
         assert!(b.state.is_leader());
+        assert_eq!(b.state.term(), 1);
+        assert_eq!(b.state.generation(), 1);
+        a.tick().unwrap();
+        assert_eq!(a.state.term(), 1);
         assert!(!a.state.is_leader());
         assert_eq!(
             api.lease

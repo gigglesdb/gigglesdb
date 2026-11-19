@@ -107,6 +107,7 @@ pub trait LoadedPolicies: Send + Sync {
 }
 /// Per-pod Lease renewer; it never deletes leases on shutdown.
 pub struct ServingRenewer {
+    peer_state: Option<Arc<crate::state::peer::PeerStateCache>>,
     stopped: std::sync::Mutex<bool>,
     confirmed: std::sync::Mutex<BTreeMap<String, u64>>,
     tracker: Option<Arc<super::kube_activation::ActivationTracker>>,
@@ -146,6 +147,7 @@ impl ServingRenewer {
         };
         gate.close();
         Ok(Self {
+            peer_state: None,
             stopped: std::sync::Mutex::new(false),
             confirmed: std::sync::Mutex::new(BTreeMap::new()),
             tracker: Some(tracker),
@@ -166,6 +168,8 @@ impl ServingRenewer {
             config,
         })
     }
+    /// Attach the peer cache before the renewal loop starts.
+    pub fn with_peer_state(mut self, cache: Option<Arc<crate::state::peer::PeerStateCache>>) -> Self { self.peer_state = cache; self }
     /// Confirm heads, CAS the Lease, then confirm heads again before extending.
     pub fn cycle(&self) -> Result<(), ServingError> {
         let t0 = self.clock.now();
@@ -189,6 +193,7 @@ impl ServingRenewer {
         let stopped = self.stopped.lock().map_err(|_| ServingError::Unavailable)?;
         if *stopped { return Err(ServingError::Unavailable); }
         self.gate.extend_to(deadline);
+        if let Some(cache) = &self.peer_state { let _ = cache.sync(); }
         Ok(())
     }
     fn remaining(&self, end: u64) -> Result<Duration, ServingError> {
@@ -372,6 +377,7 @@ mod tests {
         let renewer = ServingRenewer {
             backend: fake.clone(),
             clock: fake.clone(),
+            peer_state: None,
             stopped: Mutex::new(false),
             confirmed: Mutex::new(BTreeMap::new()),
             tracker: None,

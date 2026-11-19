@@ -97,6 +97,8 @@ async fn gateway(url: &str, side: &str) -> TestResult<Gateway> {
         fence: Default::default(),
                 serving_gate: None,
         authority: runtime.authority.clone(),
+                #[cfg(feature = "kubernetes")]
+                peer_state: None,
         registry: runtime.registry.clone(),
         route: nunya::state::model::RouteId::new("postgres").unwrap(),
         policy_revision: RwLock::new(None),

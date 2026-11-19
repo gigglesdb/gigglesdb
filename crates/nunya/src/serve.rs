@@ -742,6 +742,40 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     hub.set_file_owners(&config.file_policy_routes)?;
     hub.set_revision_store(revision_store)?;
     #[cfg(feature = "kubernetes")]
+    let (peer_state, _peer_task) = if let Some(peer) = config.kubernetes.as_ref().map(|k| &k.peer) {
+        let (_, leader) = serving_client.as_ref().ok_or("peer mode requires Kubernetes serving leases")?;
+        let k = config.policy_store_kubernetes.as_ref().ok_or("Kubernetes settings unavailable")?;
+        if peer.counter_batch == 0 || peer.counter_batch > 64 { return Err("invalid peer counter batch".into()); }
+        let auth = Arc::new(crate::state::peer::PeerAuth::from_file(&peer.secret_file).map_err(|_| "peer credential unavailable")?);
+        let cache = Arc::new(crate::state::peer::PeerStateCache::new(
+            Arc::new(crate::state::peer::PeerClient::new(leader.clone(), peer.listen.port(), k.pod_name.clone(), auth.clone())),
+            hub.serving_gate.clone().ok_or("serving gate unavailable")?, runtime.registry.clone(), Duration::from_secs(k.serving_lease_secs), peer.counter_batch));
+        let limits_hub = hub.clone();
+        let limits_routes: Vec<_> = policy_routes.iter().map(|(r,_)|r.clone()).collect();
+        let source = Arc::new(move |domain: &str| {
+            let mut selected: Option<crate::state::authority::TokenizeLimits> = None;
+            for route in &limits_routes {
+                let policy = limits_hub.policy_for(route).ok()?;
+                if let Some(settings) = policy.domains.get(&crate::policy::DomainName(domain.into())) {
+                    match settings.tokenize {
+                        crate::policy::TokenizeSetting::Off => return None,
+                        crate::policy::TokenizeSetting::On {limit_per_session, limit_per_principal, principal_window} => {
+                            let next = crate::state::authority::TokenizeLimits { per_session: u64::from(limit_per_session), per_principal: u64::from(limit_per_principal), principal_window_ms: principal_window.as_millis().try_into().ok()? };
+                            if let Some(old) = selected.as_mut() {
+                                if old.principal_window_ms != next.principal_window_ms { return None; }
+                                old.per_session = old.per_session.min(next.per_session); old.per_principal = old.per_principal.min(next.per_principal);
+                            } else { selected = Some(next); }
+                        }
+                    }
+                }
+            }
+            selected
+        });
+        let server = crate::state::peer::PeerServer::new(runtime.authority.clone(), leader.clone(), auth, Default::default()).with_limit_source(source).map_err(|e| e.to_string())?.with_serving_gate(hub.serving_gate.clone().ok_or("serving gate unavailable")?).map_err(|e| e.to_string())?;
+        let listener = tokio::net::TcpListener::bind(peer.listen).await.map_err(|_| "peer listener unavailable")?;
+        (Some(cache), Some(AbortTask(tokio::spawn(server.serve(listener)))))
+    } else { (None, None) };
+    #[cfg(feature = "kubernetes")]
     let _serving_task = if let Some((client, leader)) = serving_client {
         let k = config.policy_store_kubernetes.clone().ok_or("Kubernetes settings unavailable")?;
         let gate = hub.serving_gate.clone().ok_or("serving gate unavailable")?;
@@ -749,7 +783,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         *hub.activation_tracker.write().map_err(|_| "activation unavailable")? = Some(tracker.clone());
         let renewer = crate::policy::kube_serving::ServingRenewer::new(client, k,
             policy_routes.iter().map(|(route, _)| route.clone()).collect(),
-            Arc::new(ServingPolicies(hub.clone())), gate, tracker).map_err(|_| "invalid serving configuration")?;
+            Arc::new(ServingPolicies(hub.clone())), gate, tracker).map_err(|_| "invalid serving configuration")?.with_peer_state(peer_state.clone());
         Some(AbortTask(tokio::spawn(renewer.run(rx.clone()))))
     } else { None };
     hub.set_authority(Arc::downgrade(&runtime.authority))?;
@@ -815,6 +849,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let mut routes = JoinSet::new();
     if let Some(section) = config.spanner_native.take() {
         let state = crate::spanner_serve::RouteState {
+            #[cfg(feature = "kubernetes")]
+            peer_state: peer_state.clone(),
             authority: runtime.authority.clone(),
             registry: runtime.registry.clone(),
             route: spanner_route.ok_or("Spanner route id unavailable")?,
@@ -856,6 +892,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 ready_tx,
                 hub,
                 (runtime, route),
+                #[cfg(feature = "kubernetes")]
+                peer_state,
                 transports,
                 config_reload,
             );
@@ -944,6 +982,7 @@ async fn run_postgres(
         Arc<crate::state::runtime::StateRuntime>,
         crate::state::model::RouteId,
     ),
+    #[cfg(feature = "kubernetes")] peer_state: Option<Arc<crate::state::peer::PeerStateCache>>,
     transports: Arc<crate::config_reload::Transports>,
     config_reload: Arc<crate::config_reload::ConfigReloader>,
 ) -> Result<(), String> {
@@ -967,6 +1006,8 @@ async fn run_postgres(
         fence: Default::default(),
         serving_gate: hub.serving_gate.clone(),
         authority: state.0.authority.clone(),
+        #[cfg(feature = "kubernetes")]
+        peer_state,
         registry: state.0.registry.clone(),
         route: state.1,
         policy_revision: RwLock::new(None),

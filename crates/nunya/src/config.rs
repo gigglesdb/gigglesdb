@@ -175,8 +175,34 @@ pub struct KubernetesPolicyStore {
     /// Election retry interval in seconds.
     pub retry_period_secs: u64,
 }
+/// Optional Kubernetes peer listener settings.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubernetesSection {
+    /// Authenticated internal peer listener.
+    pub peer: PeerSection,
+}
+impl fmt::Debug for KubernetesSection { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("KubernetesSection { [REDACTED] }") } }
+/// Shared-secret peer transport configuration.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerSection {
+    /// Local counter reservation size, capped at 64.
+    #[serde(default = "peer_counter_batch")]
+    pub counter_batch: u64,
+    /// Separate internal listener address.
+    #[serde(default = "peer_listen")]
+    pub listen: SocketAddr,
+    /// Mounted cluster credential file, resolved relative to config.
+    pub secret_file: PathBuf,
+}
+impl fmt::Debug for PeerSection { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PeerSection { [REDACTED] }") } }
+fn peer_counter_batch() -> u64 { 16 }
+fn peer_listen() -> SocketAddr { SocketAddr::from(([0,0,0,0],6482)) }
 /// Validated configuration with zeroizing secrets.
 pub struct Config {
+    /// Optional separate Kubernetes peer service.
+    pub kubernetes: Option<KubernetesSection>,
     /// Revision backend selection.
     pub policy_store: PolicyStore,
     /// Kubernetes backend settings.
@@ -278,7 +304,7 @@ macro_rules! strict_section {
     };
 }
 strict_section!(RawConfig,
-    _store=>"policy_store", _kube=>"policy_store_kubernetes",
+    _peer=>"kubernetes", _store=>"policy_store", _kube=>"policy_store_kubernetes",
     _readlog=>"readlog", _age=>"snapshot_max_age_ms",
     _watch=>"policy_watch_ms", _max=>"max_connections", _listen=>"listen", _admin=>"admin_listen", _policy=>"policy",
     _root=>"root_key_file", _state=>"state_dir", _schemas=>"schemas",
@@ -396,6 +422,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     let mut m = table(
         v,
         &[
+            "kubernetes",
             "policy_store",
             "policy_store_kubernetes",
             "readlog",
@@ -436,6 +463,14 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
         err(&mut e, "policy_store_kubernetes", "only valid with kubernetes policy store");
     }
     let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut kubernetes: Option<KubernetesSection> = get(&mut m, "kubernetes", &mut e);
+    if let Some(k) = &mut kubernetes {
+        k.peer.secret_file = resolve(base, k.peer.secret_file.clone());
+        #[cfg(feature = "kubernetes")]
+        if crate::state::peer::PeerAuth::from_file(&k.peer.secret_file).is_err() { err(&mut e,"kubernetes.peer","invalid peer credential file (minimum 32 bytes)"); }
+        #[cfg(not(feature = "kubernetes"))]
+        err(&mut e,"kubernetes.peer","built without the kubernetes feature");
+    }
     let mut policy_errors = Vec::new();
     let mut readlog = m.remove("readlog").map(|value|
         crate::policy::file::parse_log(value, &mut policy_errors));
@@ -753,6 +788,7 @@ pub fn load(path: &Path) -> Result<Config, Vec<String>> {
     }
     use sha2::{Digest, Sha256};
     Ok(Config {
+        kubernetes,
         policy_store,
         policy_store_kubernetes,
         policy_settings,

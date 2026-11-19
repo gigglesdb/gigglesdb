@@ -77,6 +77,12 @@ pub fn authenticate(
     route: &RouteId,
     root: &RootKey,
 ) -> Result<Authenticated, Refusal> {
+    authenticate_state(metadata, authority, route, root)
+}
+
+/// Authenticate using the selected local or peer serving state.
+pub fn authenticate_state(metadata: &MetadataMap, authority: &dyn crate::state::serving_state::ServingState, route: &RouteId, root: &RootKey) -> Result<Authenticated, Refusal> {
+    if !authority.available() { return Err(Refusal::new(NyCode::ServingUnavailable, "serving unavailable")); }
     let mut headers = metadata.get_all("authorization").iter();
     let header = headers
         .next()
