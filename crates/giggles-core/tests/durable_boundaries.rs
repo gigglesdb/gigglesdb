@@ -1,5 +1,4 @@
 //! Legacy and v2 durable SQL commit and logical recovery boundaries.
-#![cfg(any(feature = "engine-rocksdb", feature = "legacy-task"))]
 mod common;
 use common::*;
 use giggles_core::{relational::Value, *};
@@ -105,7 +104,6 @@ fn receipt(a: &Admin, op: u64) -> OperationStatus {
         .status(OperationId(op))
         .unwrap()
 }
-#[cfg(feature = "legacy-task")]
 fn child(path: &Path, mode: &str) -> std::process::Output {
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "boundary_worker", "--nocapture"])
@@ -115,7 +113,6 @@ fn child(path: &Path, mode: &str) -> std::process::Output {
         .unwrap()
 }
 #[test]
-#[cfg(feature = "legacy-task")]
 fn boundary_worker() {
     let Ok(mode) = std::env::var("GD_DURABLE_MODE") else {
         return;
@@ -146,16 +143,20 @@ fn boundary_worker() {
         .unwrap();
     session.execute("COMMIT", &[], None).unwrap();
     ack(&path, "sql", format!("{:?}", rows(&a)));
+    #[cfg(feature = "legacy-task")]
     let e = a.executor(TaskId(1), Principal(2)).unwrap();
-    let decision = e
-        .execute(request(1, &[0]), Time::Certified(10), None)
-        .unwrap()
-        .unwrap();
-    ack(
-        &path,
-        "receipt",
-        format!("{:?}", OperationStatus::Decided(Ok(decision))),
-    );
+    #[cfg(feature = "legacy-task")]
+    {
+        let decision = e
+            .execute(request(1, &[0]), Time::Certified(10), None)
+            .unwrap()
+            .unwrap();
+        ack(
+            &path,
+            "receipt",
+            format!("{:?}", OperationStatus::Decided(Ok(decision))),
+        );
+    }
     match boundary {
         Boundary::Commit(point, is_sql) => {
             if is_sql {
@@ -178,16 +179,19 @@ fn boundary_worker() {
                     assert!(result.is_err());
                 }
             } else {
-                let result = e.execute(request(2, &[1, 2]), Time::Certified(11), None);
-                if point == CrashPoint::None {
-                    let decision = result.unwrap().unwrap();
-                    ack(
-                        &path,
-                        "final-receipt",
-                        format!("{:?}", OperationStatus::Decided(Ok(decision))),
-                    );
-                } else {
-                    assert!(result.is_err());
+                #[cfg(feature = "legacy-task")]
+                {
+                    let result = e.execute(request(2, &[1, 2]), Time::Certified(11), None);
+                    if point == CrashPoint::None {
+                        let decision = result.unwrap().unwrap();
+                        ack(
+                            &path,
+                            "final-receipt",
+                            format!("{:?}", OperationStatus::Decided(Ok(decision))),
+                        );
+                    } else {
+                        assert!(result.is_err());
+                    }
                 }
             }
         }
@@ -228,12 +232,23 @@ fn boundary_worker() {
 }
 
 #[test]
-#[cfg(feature = "legacy-task")]
 fn every_legacy_durable_boundary() {
     let mut report = Vec::new();
     for (index, boundary) in registry().into_iter().enumerate() {
+        #[cfg(not(feature = "legacy-task"))]
+        if matches!(boundary, Boundary::Commit(_, false)) {
+            continue;
+        }
+        #[cfg(feature = "legacy-task")]
         let (path, a, e) = fixture(3);
+        #[cfg(feature = "legacy-task")]
         drop(e);
+        #[cfg(not(feature = "legacy-task"))]
+        let (path, a) = {
+            let path = fresh("ordinary-durable-boundary");
+            let a = Admin::create(&path, Limits::default()).unwrap();
+            (path, a)
+        };
         drop(a);
         let output = child(&path, &index.to_string());
         fs::write(path.join("child.stdout"), &output.stdout).unwrap();
@@ -245,12 +260,15 @@ fn every_legacy_durable_boundary() {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let expected_receipt = acknowledgements
-            .iter()
-            .find(|v| v["kind"] == "receipt")
-            .unwrap();
-        assert_eq!(expected_receipt["value"], format!("{:?}", receipt(&a, 1)));
-        assert_eq!(a.snapshot().unwrap().rows[&key(0)].status, Status::Queued);
+        #[cfg(feature = "legacy-task")]
+        {
+            let expected_receipt = acknowledgements
+                .iter()
+                .find(|v| v["kind"] == "receipt")
+                .unwrap();
+            assert_eq!(expected_receipt["value"], format!("{:?}", receipt(&a, 1)));
+            assert_eq!(a.snapshot().unwrap().rows[&key(0)].status, Status::Queued);
+        }
         assert_eq!(
             acknowledgements
                 .iter()
@@ -279,6 +297,7 @@ fn every_legacy_durable_boundary() {
             _ => false,
         };
         let sql_commit = matches!(boundary, Boundary::Commit(_, true)) && committed;
+        #[cfg(feature = "legacy-task")]
         let task_commit = matches!(boundary, Boundary::Commit(_, false)) && committed;
         let mut expected = base;
         if sql_commit {
@@ -292,26 +311,29 @@ fn every_legacy_durable_boundary() {
             assert_eq!(ack["value"], format!("{actual:?}"));
         }
         let snapshot = a.snapshot().unwrap();
-        for id in [1, 2] {
-            assert_eq!(
-                snapshot.rows[&key(id)].status,
-                if task_commit {
-                    Status::Queued
-                } else {
-                    Status::Failed
-                }
-            );
-        }
-        assert_eq!(
-            matches!(receipt(&a, 2), OperationStatus::Decided(Ok(_))),
-            task_commit
-        );
-        assert_eq!(snapshot.operations.len(), if task_commit { 2 } else { 1 });
-        if let Some(ack) = acknowledgements
-            .iter()
-            .find(|v| v["kind"] == "final-receipt")
+        #[cfg(feature = "legacy-task")]
         {
-            assert_eq!(ack["value"], format!("{:?}", receipt(&a, 2)));
+            for id in [1, 2] {
+                assert_eq!(
+                    snapshot.rows[&key(id)].status,
+                    if task_commit {
+                        Status::Queued
+                    } else {
+                        Status::Failed
+                    }
+                );
+            }
+            assert_eq!(
+                matches!(receipt(&a, 2), OperationStatus::Decided(Ok(_))),
+                task_commit
+            );
+            assert_eq!(snapshot.operations.len(), if task_commit { 2 } else { 1 });
+            if let Some(ack) = acknowledgements
+                .iter()
+                .find(|v| v["kind"] == "final-receipt")
+            {
+                assert_eq!(ack["value"], format!("{:?}", receipt(&a, 2)));
+            }
         }
         // Export's existing verifier validates the recovered logical state.
         let proof = path.join("verified.export");

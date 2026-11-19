@@ -94,9 +94,15 @@ fn publish(
     if let Some(sql) = sql {
         session.execute(sql, &[], None).unwrap();
     }
-    session.publish_native_once_engine(None, owner, [2; 32], terminal_payload(), 10, mode, &mut || {
-        clock(100, 110)
-    })
+    session.publish_native_once_engine(
+        None,
+        owner,
+        [2; 32],
+        terminal_payload(),
+        10,
+        mode,
+        &mut || clock(100, 110),
+    )
 }
 
 #[test]
@@ -582,7 +588,6 @@ fn format_three_bytes_are_frozen_and_format_four_requires_native_namespace() {
     );
 }
 
-#[cfg(feature = "legacy-task")]
 #[test]
 fn replica_methods_reject_native_state_even_after_raw_deserialization() {
     let mut state = empty(73);
@@ -595,6 +600,7 @@ fn replica_methods_reject_native_state_even_after_raw_deserialization() {
     let raw: replica::Image = serde_json::from_slice(&serde_json::to_vec(&bytes).unwrap()).unwrap();
     assert_eq!(raw.domain(), Err(CoreError::Unsupported));
     assert_eq!(raw.snapshot(), Err(CoreError::Unsupported));
+    #[cfg(feature = "legacy-task")]
     assert_eq!(raw.accounting(TaskId(1)), Err(CoreError::Unsupported));
     assert_eq!(
         raw.row_partition(
@@ -606,6 +612,7 @@ fn replica_methods_reject_native_state_even_after_raw_deserialization() {
         ),
         Err(CoreError::Unsupported)
     );
+    #[cfg(feature = "legacy-task")]
     assert!(matches!(
         raw.evaluate(&replica::Command::Admin(
             br#"{"command":"catalog"}"#.to_vec()
@@ -1002,7 +1009,9 @@ fn once_replay_precedes_binding_after_a_table_name_disappears_and_is_reused() {
     assert_eq!(
         relational::with_sql_parser_forbidden(|| engine.execute(&operation, &bindings)),
         // PG18: undefined table is 42P01; native errors carry SQL's SQLSTATE (R2 parity).
-        Err(OperationError::Sql { sqlstate: "42P01".into() })
+        Err(OperationError::Sql {
+            sqlstate: "42P01".into()
+        })
     );
     let replayed = relational::with_sql_parser_forbidden(|| {
         engine.execute_once(&request, &bindings, &no_clock)

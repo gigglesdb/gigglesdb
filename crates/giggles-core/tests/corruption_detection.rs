@@ -1,5 +1,4 @@
 //! Deterministic single-bit corruption qualification through public APIs.
-#![cfg(any(feature = "engine-rocksdb", feature = "legacy-task"))]
 mod common;
 #[cfg(feature = "legacy-task")]
 use giggles_core::Time;
@@ -26,6 +25,7 @@ fn reads(admin: &Admin) -> Result<Vec<SqlResult>, CoreError> {
     QUERIES.iter().map(|q| sql.execute(q, &[], None)).collect()
 }
 
+#[cfg(any(feature = "engine-rocksdb", feature = "legacy-task"))]
 fn workload(path: &Path, engine: Engine) -> (Vec<SqlResult>, Option<Snapshot>) {
     let admin = Admin::create_engine(path, Limits::default(), engine).unwrap();
     let mut sql = admin.sql_session();
@@ -100,7 +100,17 @@ fn corruption_error(error: &CoreError) {
     }
 }
 
+#[cfg(any(feature = "engine-rocksdb", feature = "legacy-task"))]
 fn qualify(engine: Engine) -> Counts {
+    qualify_with_workload(engine, workload)
+}
+
+type WorkloadResult = (Vec<SqlResult>, Option<Snapshot>);
+
+fn qualify_with_workload(
+    engine: Engine,
+    workload: fn(&Path, Engine) -> WorkloadResult,
+) -> Counts {
     let root = common::fresh("corruption-detection");
     fs::create_dir_all(&root).unwrap();
     let source = root.join("source");
@@ -240,4 +250,41 @@ fn legacy_single_bit_corruption() {
 fn v2_single_bit_corruption() {
     let _lock = REPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     save_report(Engine::V2, &qualify(Engine::V2));
+}
+
+fn ordinary_workload(path: &Path, engine: Engine) -> (Vec<SqlResult>, Option<Snapshot>) {
+    let admin = Admin::create_engine(path, Limits::default(), engine).unwrap();
+    let mut sql = admin.sql_session();
+    for ddl in [
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, label TEXT)",
+        "CREATE TABLE labels (id BIGINT PRIMARY KEY, label TEXT)",
+        "CREATE INDEX items_label ON items (label)",
+    ] {
+        if matches!(engine, Engine::V2) && ddl.starts_with("CREATE INDEX") {
+            continue; // v2 explicitly rejects secondary indexes.
+        }
+        sql.execute(ddl, &[], None).unwrap();
+    }
+    for id in 0..64 {
+        for table in ["items", "labels"] {
+            sql.execute(
+                &format!("INSERT INTO {table} VALUES ({id}, 'payload-{id}')"),
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+    }
+    drop(sql);
+    let snapshot = Some(admin.snapshot().unwrap());
+    (reads(&admin).unwrap(), snapshot)
+}
+
+#[test]
+fn ordinary_legacy_single_bit_corruption() {
+    let _lock = REPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    save_report(
+        Engine::Legacy,
+        &qualify_with_workload(Engine::Legacy, ordinary_workload),
+    );
 }

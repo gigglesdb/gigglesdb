@@ -1,13 +1,16 @@
-#![cfg(feature = "legacy-task")]
-use giggles_core::TaskResources;
+#[cfg(feature = "legacy-task")]
+use giggles_core::{Principal, TaskId, TaskResources, Time};
 mod common;
 use giggles_core::{
-    Admin, Limits, Principal, TaskId,  Time,
+    Admin, Limits,
     operations::{Engine, Error, UniqueIndexRequest},
 };
 #[test]
 fn public_unique_all_business_predicates_refuse_without_effects() {
     for kind in 0..6 {
+        if kind != 0 && !cfg!(feature = "legacy-task") {
+            continue;
+        }
         let admin =
             Admin::create(common::fresh("public-unique-business"), Limits::default()).unwrap();
         admin
@@ -21,26 +24,29 @@ fn public_unique_all_business_predicates_refuse_without_effects() {
         if kind == 0 {
             admin.put(common::key(1), common::row()).unwrap();
         } else {
-            let executor = admin.grant(common::grant()).unwrap();
-            match kind {
-                1 => {}
-                2 => admin.revoke(TaskId(1)).unwrap(),
-                3 => admin
-                    .provision_task_resources(TaskId(1), TaskResources::default())
-                    .unwrap(),
-                4 => {
-                    let _decision = executor
-                        .execute(common::predicate(1), Time::Certified(10), None)
-                        .unwrap();
+            #[cfg(feature = "legacy-task")]
+            {
+                let executor = admin.grant(common::grant()).unwrap();
+                match kind {
+                    1 => {}
+                    2 => admin.revoke(TaskId(1)).unwrap(),
+                    3 => admin
+                        .provision_task_resources(TaskId(1), TaskResources::default())
+                        .unwrap(),
+                    4 => {
+                        let _decision = executor
+                            .execute(common::predicate(1), Time::Certified(10), None)
+                            .unwrap();
+                    }
+                    5 => {
+                        let p = executor
+                            .preview(&common::predicate(1), Time::Certified(10))
+                            .unwrap();
+                        let a = admin.approve(Principal(3), p, Time::Certified(10)).unwrap();
+                        admin.revoke_approval(a).unwrap();
+                    }
+                    _ => unreachable!(),
                 }
-                5 => {
-                    let p = executor
-                        .preview(&common::predicate(1), Time::Certified(10))
-                        .unwrap();
-                    let a = admin.approve(Principal(3), p, Time::Certified(10)).unwrap();
-                    admin.revoke_approval(a).unwrap();
-                }
-                _ => unreachable!(),
             }
         }
         let before = admin.export(common::fresh("unique-digest")).unwrap();

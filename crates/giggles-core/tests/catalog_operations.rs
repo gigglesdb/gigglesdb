@@ -1,7 +1,7 @@
 #[cfg(feature = "legacy-task")]
-use giggles_core::{Principal, TaskId, Time};
-#[cfg(feature = "legacy-task")]
 use giggles_core::TaskResources;
+#[cfg(feature = "legacy-task")]
+use giggles_core::{Principal, TaskId, Time};
 mod common;
 
 use giggles_core::{
@@ -24,7 +24,8 @@ fn column(name: &str, data_type: DataType, not_null: bool) -> ColumnSpec {
         name: name.into(),
         data_type,
         not_null,
-                default: None, generated: None,
+        default: None,
+        generated: None,
     }
 }
 fn create(name: &str) -> CatalogRequest {
@@ -80,15 +81,24 @@ fn native_index_prepare_and_execute_reject_empty_and_populated_heaps() {
             name: "heap_value".into(),
             columns: vec!["value".into()],
         };
-        assert_eq!(engine.prepare_catalog_bound(&request).unwrap_err(), Error::Unsupported);
+        assert_eq!(
+            engine.prepare_catalog_bound(&request).unwrap_err(),
+            Error::Unsupported
+        );
         assert_eq!(engine.execute_catalog(&request), Err(Error::Unsupported));
         let unique = giggles_core::operations::UniqueIndexRequest {
             table: "heap_items".into(),
             name: "heap_unique_value".into(),
             columns: vec!["value".into()],
         };
-        assert_eq!(engine.prepare_unique_index_bound(&unique).unwrap_err(), Error::Unsupported);
-        assert_eq!(engine.execute_unique_index(&unique), Err(Error::Unsupported));
+        assert_eq!(
+            engine.prepare_unique_index_bound(&unique).unwrap_err(),
+            Error::Unsupported
+        );
+        assert_eq!(
+            engine.execute_unique_index(&unique),
+            Err(Error::Unsupported)
+        );
     }
     let (_, _, engine) = database();
     engine.execute_catalog(&create("keyed_items")).unwrap();
@@ -322,7 +332,14 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
     assert_eq!(base.table.id, 1);
     assert_eq!(base.table.columns[0].id, 2);
     // PG18: CREATE TABLE two.parts without schema two is 3F000 (R2 parity).
-    reject_definition(&admin, &engine, &create("two.parts"), Error::Sql { sqlstate: "3F000".into() });
+    reject_definition(
+        &admin,
+        &engine,
+        &create("two.parts"),
+        Error::Sql {
+            sqlstate: "3F000".into(),
+        },
+    );
     for name in ["", "A", "1name", "é", "has space"] {
         reject_definition(
             &admin,
@@ -365,7 +382,9 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
             &admin,
             &engine,
             &create(name),
-            Error::Sql { sqlstate: "0A000".into() },
+            Error::Sql {
+                sqlstate: "0A000".into(),
+            },
         );
         let request = CatalogRequest::CreateTable {
             table: "candidate".into(),
@@ -379,7 +398,9 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
             &admin,
             &engine,
             &request,
-            Error::Sql { sqlstate: "0A000".into() },
+            Error::Sql {
+                sqlstate: "0A000".into(),
+            },
         );
     }
     for (columns, primary_key, expected) in [
@@ -402,7 +423,9 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         (
             vec![column("id", DataType::BigInt, true)],
             vec!["absent".into()],
-            Error::Sql { sqlstate: "42703".into() },
+            Error::Sql {
+                sqlstate: "42703".into(),
+            },
         ),
         (
             vec![column("id", DataType::BigInt, false)],
@@ -437,7 +460,9 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         &admin,
         &engine,
         &create("base"),
-        Error::Sql { sqlstate: "42P07".into() },
+        Error::Sql {
+            sqlstate: "42P07".into(),
+        },
     );
     let valid = create(&"a".repeat(63));
     let result = engine.execute_catalog(&valid).unwrap();
@@ -502,7 +527,9 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         &admin,
         &engine,
         &create("one_too_many"),
-        Error::Sql { sqlstate: "54000".into() },
+        Error::Sql {
+            sqlstate: "54000".into(),
+        },
     );
     admin
         .sql_session()
@@ -558,7 +585,9 @@ fn catalog_preparation_freezes_definition_and_rechecks_empty_state() {
     assert_eq!(created.catalog_epoch, 2);
     assert_eq!(
         engine.execute_catalog_bound(&bound),
-        Err(Error::Sql { sqlstate: "0A000".into() })
+        Err(Error::Sql {
+            sqlstate: "0A000".into()
+        })
     );
     let bound = engine.prepare_catalog_bound(&create("later")).unwrap();
     admin
@@ -582,7 +611,9 @@ fn catalog_preparation_freezes_definition_and_rechecks_empty_state() {
         .unwrap();
     assert_eq!(
         engine.execute_catalog_bound(&bound),
-        Err(Error::Sql { sqlstate: "0A000".into() })
+        Err(Error::Sql {
+            sqlstate: "0A000".into()
+        })
     );
     let fresh = engine.prepare_catalog_bound(&create("later")).unwrap();
     assert_eq!(
@@ -610,37 +641,42 @@ fn catalog_preparation_freezes_definition_and_rechecks_empty_state() {
 }
 
 #[test]
-#[cfg(feature = "legacy-task")]
 fn catalog_safe_create_observes_business_state_and_metadata() {
     for kind in 0..6 {
+        if kind != 0 && !cfg!(feature = "legacy-task") {
+            continue;
+        }
         let (_, admin, engine) = database();
         if kind == 0 {
             admin.put(common::key(1), common::row()).unwrap();
         } else {
-            let executor = admin.grant(common::grant()).unwrap();
-            match kind {
-                1 => {}
-                2 => admin.revoke(TaskId(1)).unwrap(),
-                3 => admin
-                    .provision_task_resources(TaskId(1), TaskResources::default())
-                    .unwrap(),
-                4 => {
-                    let _decision = executor
-                        .execute(common::predicate(1), Time::Certified(10), None)
-                        .unwrap();
-                    assert!(!admin.snapshot().unwrap().operations.is_empty());
+            #[cfg(feature = "legacy-task")]
+            {
+                let executor = admin.grant(common::grant()).unwrap();
+                match kind {
+                    1 => {}
+                    2 => admin.revoke(TaskId(1)).unwrap(),
+                    3 => admin
+                        .provision_task_resources(TaskId(1), TaskResources::default())
+                        .unwrap(),
+                    4 => {
+                        let _decision = executor
+                            .execute(common::predicate(1), Time::Certified(10), None)
+                            .unwrap();
+                        assert!(!admin.snapshot().unwrap().operations.is_empty());
+                    }
+                    5 => {
+                        let preview = executor
+                            .preview(&common::predicate(1), Time::Certified(10))
+                            .unwrap();
+                        let approval = admin
+                            .approve(Principal(3), preview, Time::Certified(10))
+                            .unwrap();
+                        admin.revoke_approval(approval).unwrap();
+                        assert!(!admin.snapshot().unwrap().approvals.is_empty());
+                    }
+                    _ => unreachable!(),
                 }
-                5 => {
-                    let preview = executor
-                        .preview(&common::predicate(1), Time::Certified(10))
-                        .unwrap();
-                    let approval = admin
-                        .approve(Principal(3), preview, Time::Certified(10))
-                        .unwrap();
-                    admin.revoke_approval(approval).unwrap();
-                    assert!(!admin.snapshot().unwrap().approvals.is_empty());
-                }
-                _ => unreachable!(),
             }
         }
         let before = digest(&admin);
@@ -719,22 +755,30 @@ fn catalog_epoch_domain_fences_survive_reopen_and_restore() {
     );
     assert_eq!(
         engine.execute_bound(&native_read),
-        Err(Error::Sql { sqlstate: "0A000".into() })
+        Err(Error::Sql {
+            sqlstate: "0A000".into()
+        })
     );
     assert_eq!(
         engine.execute_transaction_bound(&native_block),
-        Err(Error::Sql { sqlstate: "0A000".into() })
+        Err(Error::Sql {
+            sqlstate: "0A000".into()
+        })
     );
     assert_eq!(
         engine.execute_catalog_bound(&sibling),
-        Err(Error::Sql { sqlstate: "0A000".into() })
+        Err(Error::Sql {
+            sqlstate: "0A000".into()
+        })
     );
     let sibling = engine.prepare_catalog_bound(&create("sibling")).unwrap();
     sql.execute("CREATE TABLE sql_later (id BIGINT PRIMARY KEY)", &[], None)
         .unwrap();
     assert_eq!(
         engine.execute_catalog_bound(&sibling),
-        Err(Error::Sql { sqlstate: "0A000".into() })
+        Err(Error::Sql {
+            sqlstate: "0A000".into()
+        })
     );
     let bound = engine
         .prepare_catalog_bound(&create("restored_later"))
@@ -752,7 +796,9 @@ fn catalog_epoch_domain_fences_survive_reopen_and_restore() {
     let before = digest(&restored);
     assert_eq!(
         Engine::new(restored.clone()).execute_catalog_bound(&bound),
-        Err(Error::Sql { sqlstate: "0A000".into() })
+        Err(Error::Sql {
+            sqlstate: "0A000".into()
+        })
     );
     assert_eq!(digest(&restored), before);
     drop(sql);

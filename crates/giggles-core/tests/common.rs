@@ -3,7 +3,6 @@
 use giggles_core::*;
 use std::collections::BTreeSet;
 use std::{
-
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
