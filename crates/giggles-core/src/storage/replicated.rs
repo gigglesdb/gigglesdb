@@ -61,6 +61,10 @@ impl KvRead for ReplicatedKv {
         self.store.get(ks, key)
     }
 
+    fn first_in(&self, ks: Keyspace, start: &[u8], end: &[u8]) -> Result<Option<KvPair>, KvError> {
+        self.store.first_in(ks, start, end)
+    }
+
     fn range(
         &self,
         ks: Keyspace,

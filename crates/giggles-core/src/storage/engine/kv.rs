@@ -248,6 +248,18 @@ pub(crate) trait KvRead: Send + Sync {
         end: Bound<&[u8]>,
         dir: Direction,
     ) -> Result<KvIter<'_>, KvError>;
+    /// First pair in the bytewise half-open interval `[start, end)`.
+    /// Empty or reversed intervals return no pair.
+    fn first_in(&self, ks: Keyspace, start: &[u8], end: &[u8]) -> Result<Option<KvPair>, KvError> {
+        self.range(
+            ks,
+            Bound::Included(start),
+            Bound::Excluded(end),
+            Direction::Forward,
+        )?
+        .next()
+        .transpose()
+    }
     fn seek_ge(&self, ks: Keyspace, key: &[u8]) -> Result<Option<KvPair>, KvError> {
         self.range(
             ks,
@@ -291,7 +303,10 @@ impl Kv {
     /// sequencer and locks. Attached/shared backends must use `new` instead.
     #[cfg(any(test, feature = "engine-rocksdb"))]
     pub(crate) fn new_single_writer(backend: Arc<dyn KvBackend>) -> Self {
-        Self { single_writer: true, ..Self::new(backend) }
+        Self {
+            single_writer: true,
+            ..Self::new(backend)
+        }
     }
     pub(crate) fn is_single_writer(&self) -> bool {
         self.single_writer
@@ -362,6 +377,10 @@ impl KvRead for Kv {
         dir: Direction,
     ) -> Result<KvIter<'_>, KvError> {
         Kv::range(self, ks, start, end, dir)
+    }
+    fn first_in(&self, ks: Keyspace, start: &[u8], end: &[u8]) -> Result<Option<KvPair>, KvError> {
+        self.check()?;
+        self.backend.first_in(ks, start, end)
     }
     fn seek_ge(&self, ks: Keyspace, key: &[u8]) -> Result<Option<KvPair>, KvError> {
         Kv::seek_ge(self, ks, key)

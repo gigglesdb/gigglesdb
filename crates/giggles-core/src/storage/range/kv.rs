@@ -63,6 +63,10 @@ impl<R: std::ops::Deref<Target = dyn KvRead> + Send + Sync> KvRead for MappedRea
         }
     }
 
+    fn first_in(&self, ks: Keyspace, start: &[u8], end: &[u8]) -> Result<Option<KvPair>, KvError> {
+        self.inner.first_in(ks, start, end)
+    }
+
     fn range(
         &self,
         ks: Keyspace,
@@ -136,6 +140,10 @@ impl RangeKv {
 impl KvRead for RangeKv {
     fn get(&self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
         self.read.get(ks, key)
+    }
+
+    fn first_in(&self, ks: Keyspace, start: &[u8], end: &[u8]) -> Result<Option<KvPair>, KvError> {
+        self.read.first_in(ks, start, end)
     }
 
     fn range(

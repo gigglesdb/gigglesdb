@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub(crate) const WRITER_LOCK_FILE: &str = "giggles.lock";
@@ -73,10 +73,35 @@ impl WriterLock {
     }
 }
 
+// At most two idle iterators per CF. Checked-out iterators are exclusively owned.
+const POINT_POOL_CAP: usize = 2;
+const POINT_POOL_IDLE: Duration = Duration::from_secs(1);
+#[derive(Default)]
+struct PointPool {
+    generation: u64,
+    #[cfg(test)]
+    idle_timeout: Option<Duration>,
+    #[cfg(test)]
+    created: usize,
+    #[cfg(test)]
+    refreshed_reuses: usize,
+    idle: BTreeMap<Keyspace, Vec<(Instant, rocksdb::DBRawIterator<'static>)>>,
+}
+
 struct LockedDb {
+    // Must precede db: all lifetime-extended iterators die before their DB.
+    points: Mutex<PointPool>,
     // Field order matters: close RocksDB before releasing the explicit lock.
     db: DB,
     _writer_lock: WriterLock,
+}
+
+impl LockedDb {
+    fn clear_points(&self) {
+        let mut pool = self.points.lock().unwrap_or_else(|e| e.into_inner());
+        pool.generation = pool.generation.wrapping_add(1);
+        pool.idle.clear();
+    }
 }
 
 impl Deref for LockedDb {
@@ -90,6 +115,13 @@ pub(crate) struct RocksKv {
     db: Arc<LockedDb>,
 }
 
+impl Drop for RocksKv {
+    fn drop(&mut self) {
+        // Owned snapshots may keep LockedDb alive after this live handle dies.
+        self.db.clear_points();
+    }
+}
+
 impl RocksKv {
     pub(crate) fn open(path: &Path, cache_bytes: usize) -> Result<Self, KvError> {
         std::fs::create_dir_all(path).map_err(|error| KvError::Io(error.to_string()))?;
@@ -98,6 +130,7 @@ impl RocksKv {
 
     /// Capture an atomic, reopenable view of every column family.
     pub(crate) fn checkpoint(&self, target: &Path) -> Result<Vec<(String, u64)>, KvError> {
+        self.db.clear_points();
         let io_error = |error: std::io::Error| KvError::Io(error.to_string());
         match std::fs::symlink_metadata(target) {
             Ok(_) => return Err(KvError::Io("checkpoint target already exists".into())),
@@ -144,6 +177,7 @@ impl RocksKv {
         .map_err(map_error)?;
         Ok(Self {
             db: Arc::new(LockedDb {
+                points: Mutex::new(PointPool::default()),
                 db,
                 _writer_lock: writer_lock,
             }),
@@ -228,6 +262,7 @@ impl RocksKv {
         parts: &[SstPart],
         at_snapshot: impl FnOnce(&dyn KvRead) -> Result<T, KvError>,
     ) -> Result<SstExport<T>, KvError> {
+        self.db.clear_points();
         let io_error = |error: std::io::Error| KvError::Io(error.to_string());
         std::fs::create_dir_all(dir).map_err(io_error)?;
         let db: &DB = &self.db.db;
@@ -288,6 +323,7 @@ impl RocksKv {
     /// currently in the CF (nothing to delete if there is none); the caller must
     /// keep writers out of the interval while installing.
     pub(crate) fn ingest_sst(&self, parts: &[SstInstall]) -> Result<(), KvError> {
+        self.db.clear_points();
         let db: &DB = &self.db.db;
         let mut ingest = IngestExternalFileOptions::default();
         ingest.set_move_files(false);
@@ -373,6 +409,7 @@ impl RocksKv {
 
     /// Flush every column family's memtables to SST files, so approximate sizes count them.
     pub(crate) fn flush_memtables(&self) -> Result<(), KvError> {
+        self.db.clear_points();
         for ks in Keyspace::ALL {
             let cf = self.db.cf_handle(ks.name()).unwrap();
             self.db.flush_cf(cf).map_err(map_error)?;
@@ -489,6 +526,67 @@ impl KvRead for RocksKv {
         self.db
             .get_cf(self.db.cf_handle(ks.name()).unwrap(), key)
             .map_err(map_error)
+    }
+
+    fn first_in(&self, ks: Keyspace, start: &[u8], end: &[u8]) -> Result<Option<KvPair>, KvError> {
+        if start >= end {
+            return Ok(None);
+        }
+        let (generation, cached) = {
+            let mut pool = self.db.points.lock().unwrap_or_else(|e| e.into_inner());
+            let idle_timeout = POINT_POOL_IDLE;
+            #[cfg(test)]
+            let idle_timeout = pool.idle_timeout.unwrap_or(idle_timeout);
+            // Sweep all CFs so activity on one also releases other stale pins.
+            for idle in pool.idle.values_mut() {
+                idle.retain(|(used, _)| used.elapsed() < idle_timeout);
+            }
+            let generation = pool.generation;
+            (generation, pool.idle.get_mut(&ks).and_then(Vec::pop))
+        };
+        #[cfg(test)]
+        let reused = cached.is_some();
+        let mut iter = match cached {
+            Some((_, iter)) => iter,
+            None => {
+                let iter = self
+                    .db
+                    .raw_iterator_cf(self.db.cf_handle(ks.name()).unwrap());
+                // SAFETY: constructed only after LockedDb is in its stable Arc allocation.
+                // The iterator never escapes this method or LockedDb::points. This call's
+                // &self keeps the Arc alive while checked out; idle iterators are dropped
+                // before db by field order. Neither DB nor CF handles can be replaced.
+                // rust-rocksdb supplies Send + Sync; we add no unsafe trait impls.
+                unsafe {
+                    std::mem::transmute::<rocksdb::DBRawIterator<'_>, rocksdb::DBRawIterator<'static>>(
+                        iter,
+                    )
+                }
+            }
+        };
+        // Refresh returns a status independent of iterator.status(). On either error,
+        // drop the iterator rather than putting a potentially failed one back.
+        iter.refresh().map_err(map_error)?;
+        iter.seek(start);
+        iter.status().map_err(map_error)?;
+        let pair = iter
+            .item()
+            .filter(|(key, _)| *key < end)
+            .map(|(key, value)| (key.to_vec(), value.to_vec()));
+        let mut pool = self.db.points.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        if reused {
+            pool.refreshed_reuses += 1;
+        } else {
+            pool.created += 1;
+        }
+        if pool.generation == generation {
+            let idle = pool.idle.entry(ks).or_default();
+            if idle.len() < POINT_POOL_CAP {
+                idle.push((Instant::now(), iter));
+            }
+        }
+        Ok(pair)
     }
 
     fn range(
@@ -749,6 +847,206 @@ mod tests {
             dirs.lock().unwrap().push(dir);
             Arc::new(db)
         });
+    }
+
+    #[test]
+    fn first_in_borrowed_and_reopened() {
+        let dir = TestDir::new();
+        {
+            let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+            let mut batch = WriteBatch::default();
+            for key in [b"a", b"b", b"c", b"d", b"z"] {
+                batch.put(Keyspace::Rows, key.to_vec(), key.to_vec());
+            }
+            db.write(batch, Durability::Sync).unwrap();
+            db.flush_memtables().unwrap();
+            let mut batch = WriteBatch::default();
+            batch.delete(Keyspace::Rows, b"a".to_vec());
+            batch.delete_range(Keyspace::Rows, b"b".to_vec(), b"d".to_vec());
+            db.write(batch, Durability::Sync).unwrap();
+            db.with_snapshot(|read| {
+                super::super::kv_conformance::assert_first_in_deleted(read);
+                Ok(())
+            })
+            .unwrap();
+            super::super::mvcc::tests::point_versions(&db);
+        }
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        super::super::kv_conformance::assert_first_in_deleted(&db);
+        super::super::mvcc::tests::check_point_versions(&db);
+        super::super::mvcc::tests::check_point_versions(db.snapshot().unwrap().as_ref());
+        db.with_snapshot(|read| {
+            super::super::mvcc::tests::check_point_versions(read);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn pooled_drop_clears_pins_while_snapshot_owns_db() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        point_put(&db, b"a", b"old");
+        let snapshot = db.snapshot().unwrap();
+        db.first_in(Keyspace::Rows, b"a", b"b").unwrap();
+        let owner = db.db.clone();
+        drop(db);
+        assert!(owner.points.lock().unwrap().idle.is_empty());
+        assert_eq!(
+            snapshot.first_in(Keyspace::Rows, b"a", b"b").unwrap(),
+            Some((b"a".to_vec(), b"old".to_vec()))
+        );
+        drop(snapshot);
+        drop(owner);
+        let reopened = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        assert!(
+            reopened
+                .first_in(Keyspace::Rows, b"a", b"b")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    fn point_put(db: &RocksKv, key: &[u8], value: &[u8]) {
+        let mut batch = WriteBatch::default();
+        batch.put(Keyspace::Rows, key.to_vec(), value.to_vec());
+        db.write(batch, Durability::Sync).unwrap();
+    }
+
+    // Keep refresh proofs independent of flush latency and scheduler pauses.
+    fn disable_point_eviction(db: &RocksKv) {
+        db.db.points.lock().unwrap().idle_timeout = Some(Duration::MAX);
+    }
+
+    // Call only while this test has exclusive access to point reads. Counters
+    // advance after refresh and seek both succeed, so creation cannot pass.
+    fn reused_point(db: &RocksKv, start: &[u8], end: &[u8]) -> Option<KvPair> {
+        let before = {
+            let pool = db.db.points.lock().unwrap();
+            (pool.created, pool.refreshed_reuses)
+        };
+        let pair = db.first_in(Keyspace::Rows, start, end).unwrap();
+        let pool = db.db.points.lock().unwrap();
+        assert_eq!(
+            (pool.created, pool.refreshed_reuses),
+            (before.0, before.1 + 1)
+        );
+        pair
+    }
+
+    #[test]
+    fn pooled_refresh_put_delete_and_range_tombstones() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        disable_point_eviction(&db);
+        point_put(&db, b"a", b"old");
+        db.first_in(Keyspace::Rows, b"a", b"b").unwrap();
+        let snapshot = db.snapshot().unwrap();
+        for value in [b"old".as_slice(), b"new"] {
+            point_put(&db, b"a", value);
+            assert_eq!(
+                reused_point(&db, b"a", b"b"),
+                Some((b"a".to_vec(), value.to_vec()))
+            );
+        }
+        assert_eq!(db.db.points.lock().unwrap().idle[&Keyspace::Rows].len(), 1);
+        let mut batch = WriteBatch::default();
+        batch.delete(Keyspace::Rows, b"a".to_vec());
+        db.write(batch, Durability::Sync).unwrap();
+        assert_eq!(reused_point(&db, b"a", b"b"), None);
+        // First ever mutable-memtable range tombstone requires the refresh rebuild path.
+        for _ in 0..2 {
+            point_put(&db, b"a", b"back");
+            assert!(reused_point(&db, b"a", b"b").is_some());
+            let mut batch = WriteBatch::default();
+            batch.delete_range(Keyspace::Rows, b"a".to_vec(), b"b".to_vec());
+            db.write(batch, Durability::Sync).unwrap();
+            assert_eq!(reused_point(&db, b"a", b"b"), None);
+        }
+        assert_eq!(
+            snapshot.first_in(Keyspace::Rows, b"a", b"b").unwrap(),
+            Some((b"a".to_vec(), b"old".to_vec()))
+        );
+    }
+
+    #[test]
+    fn pooled_refresh_concurrent_own_commits() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        disable_point_eviction(&db);
+        db.first_in(Keyspace::Rows, &[0], &[6]).unwrap();
+        let reads = Mutex::new(());
+        thread::scope(|scope| {
+            for writer in 0..6u8 {
+                let db = &db;
+                let reads = &reads;
+                scope.spawn(move || {
+                    let key = [writer];
+                    let end = [writer + 1];
+                    for commit in 0..100u64 {
+                        let value = commit.to_be_bytes();
+                        point_put(db, &key, &value);
+                        thread::yield_now();
+                        // Writes still overlap other writers and readers; serialize
+                        // only checkout so every own-commit read must reuse.
+                        let _read = reads.lock().unwrap();
+                        assert_eq!(
+                            reused_point(db, &key, &end),
+                            Some((key.to_vec(), value.to_vec()))
+                        );
+                    }
+                });
+            }
+        });
+        assert!(db.db.points.lock().unwrap().idle[&Keyspace::Rows].len() <= POINT_POOL_CAP);
+    }
+
+    #[test]
+    fn pooled_refresh_superversion_and_eviction() {
+        let dir = TestDir::new();
+        {
+            let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+            disable_point_eviction(&db);
+            point_put(&db, b"a", b"old");
+            db.first_in(Keyspace::Rows, b"a", b"b").unwrap();
+            // Bypass the public clearing helper to exercise Refresh with a changed SV.
+            let cf = db.db.cf_handle(Keyspace::Rows.name()).unwrap();
+            db.db.flush_cf(cf).unwrap();
+            assert_eq!(
+                reused_point(&db, b"a", b"b"),
+                Some((b"a".to_vec(), b"old".to_vec()))
+            );
+            db.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+            assert_eq!(
+                reused_point(&db, b"a", b"b"),
+                Some((b"a".to_vec(), b"old".to_vec()))
+            );
+            point_put(&db, b"a", b"new");
+            assert_eq!(
+                reused_point(&db, b"a", b"b"),
+                Some((b"a".to_vec(), b"new".to_vec()))
+            );
+            // Restore the production timeout and age the entry without sleeping.
+            db.db.points.lock().unwrap().idle_timeout = None;
+            db.db
+                .points
+                .lock()
+                .unwrap()
+                .idle
+                .get_mut(&Keyspace::Rows)
+                .unwrap()[0]
+                .0 = Instant::now() - Duration::from_secs(2);
+            db.first_in(Keyspace::Index, b"a", b"b").unwrap();
+            assert!(db.db.points.lock().unwrap().idle[&Keyspace::Rows].is_empty());
+            db.flush_memtables().unwrap();
+            assert!(db.db.points.lock().unwrap().idle.is_empty());
+            db.first_in(Keyspace::Rows, b"a", b"b").unwrap();
+        }
+        let db = RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        assert_eq!(
+            db.first_in(Keyspace::Rows, b"a", b"b").unwrap(),
+            Some((b"a".to_vec(), b"new".to_vec()))
+        );
     }
 
     fn reopen(durability: Durability) {

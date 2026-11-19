@@ -45,6 +45,7 @@ pub(crate) fn run_all(make: &dyn Fn() -> Arc<dyn KvBackend>) {
     snapshots(make);
     large_prefix(make);
     seek(make);
+    first_in(make);
 }
 
 fn isolation(make: &dyn Fn() -> Arc<dyn KvBackend>) {
@@ -586,4 +587,79 @@ fn batch_accounting_names_and_error_mapping() {
         assert!(!error.to_string().is_empty());
     }
     assert_eq!(MemKv::new().engine_name(), "mem");
+}
+
+fn first_in(make: &dyn Fn() -> Arc<dyn KvBackend>) {
+    let db = make();
+    put(db.as_ref(), KS, &[b"a", b"b", b"c", b"d", b"z"]);
+    let before = db.snapshot().unwrap();
+    for read in [db.as_ref() as &dyn KvRead, before.as_ref()] {
+        let bounds: &[&[u8]] = &[b"", b"a", b"ab", b"b", b"c", b"d", b"e", b"z", b"zz"];
+        for start in bounds {
+            for end in bounds {
+                assert_eq!(
+                    read.first_in(KS, start, end).unwrap(),
+                    read.range(KS, Included(start), Excluded(end), Direction::Forward)
+                        .unwrap()
+                        .next()
+                        .transpose()
+                        .unwrap()
+                );
+            }
+        }
+    }
+    let mut batch = WriteBatch::default();
+    batch.delete(KS, b"a".to_vec());
+    batch.delete_range(KS, b"b".to_vec(), b"d".to_vec());
+    db.write(batch, Durability::Sync).unwrap();
+    let after = db.snapshot().unwrap();
+    for read in [db.as_ref() as &dyn KvRead, after.as_ref()] {
+        assert_first_in_deleted(read);
+    }
+    assert_eq!(
+        before.first_in(KS, b"a", b"b").unwrap(),
+        Some((b"a".to_vec(), b"a".to_vec()))
+    );
+    assert_eq!(
+        before.first_in(KS, b"b", b"c").unwrap(),
+        Some((b"b".to_vec(), b"b".to_vec()))
+    );
+}
+
+pub(super) fn assert_first_in_deleted(read: &dyn KvRead) {
+    for (start, end) in [
+        (b"a".as_slice(), b"a".as_slice()),
+        (b"z", b"a"),
+        (b"a", b"d"),
+        (b"e", b"z"),
+        (b"zz", b"zzz"),
+    ] {
+        assert_eq!(read.first_in(KS, start, end).unwrap(), None);
+    }
+    assert_eq!(
+        read.first_in(KS, b"a", b"e").unwrap(),
+        Some((b"d".to_vec(), b"d".to_vec()))
+    );
+    assert_eq!(
+        read.first_in(KS, b"d", b"z").unwrap(),
+        Some((b"d".to_vec(), b"d".to_vec()))
+    );
+    assert_eq!(
+        read.first_in(KS, b"z", b"zz").unwrap(),
+        Some((b"z".to_vec(), b"z".to_vec()))
+    );
+    assert_eq!(read.first_in(Keyspace::Index, b"a", b"zz").unwrap(), None);
+}
+
+#[test]
+fn mem_h_first_in() {
+    first_in(&|| Arc::new(MemKv::new()));
+}
+
+#[test]
+fn fenced_first_in() {
+    let kv = Kv::new(Arc::new(MemKv::new()));
+    kv.fence();
+    assert_eq!(kv.first_in(KS, b"a", b"z"), Err(KvError::Fenced));
+    assert_eq!(kv.first_in(KS, b"z", b"a"), Err(KvError::Fenced));
 }

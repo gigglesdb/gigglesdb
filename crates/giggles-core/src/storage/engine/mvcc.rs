@@ -71,16 +71,7 @@ fn version_at(
     // Bounded to this key's versions: a routed read (GD-0075 P8-0) then waits only on prepared
     // writes of this key, never on ones above it in the same range.
     let upper = codec::user_key_upper_bound(user_key);
-    let Some((key, value)) = kv
-        .range(
-            ks,
-            Bound::Included(&seek),
-            Bound::Excluded(&upper),
-            Direction::Forward,
-        )?
-        .next()
-        .transpose()?
-    else {
+    let Some((key, value)) = kv.first_in(ks, &seek, &upper)? else {
         return Ok(None);
     };
     let (found, ts) = codec::split_versioned(&key)?;
@@ -240,12 +231,64 @@ impl Iterator for VersionedRange<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::engine::{
         kv::{Durability, KvBackend, WriteBatch},
         kv_mem::MemKv,
     };
+
+    pub(crate) fn point_versions(kv: &dyn KvBackend) {
+        let mut batch = WriteBatch::default();
+        for ts in 1..=300u64 {
+            batch.put(
+                Keyspace::Catalog,
+                codec::user_key_seek_at(b"shared-a", Ts(ts * 2)),
+                if ts == 200 {
+                    encode_tombstone()
+                } else {
+                    encode_live(&ts.to_be_bytes())
+                },
+            );
+        }
+        batch.put(
+            Keyspace::Catalog,
+            codec::user_key_seek_at(b"shared-b", Ts(2)),
+            encode_live(b"adjacent"),
+        );
+        kv.write(batch, Durability::Sync).unwrap();
+        check_point_versions(kv);
+        check_point_versions(kv.snapshot().unwrap().as_ref());
+    }
+
+    pub(crate) fn check_point_versions(kv: &dyn KvRead) {
+        let ks = Keyspace::Catalog;
+        assert_eq!(version_at(kv, ks, b"shared-a", Ts(0)).unwrap(), None);
+        assert_eq!(
+            version_at(kv, ks, b"shared-a", Ts(201)).unwrap(),
+            Some((Ts(200), Some(100u64.to_be_bytes().to_vec())))
+        );
+        assert_eq!(
+            version_at(kv, ks, b"shared-a", Ts(401)).unwrap(),
+            Some((Ts(400), None))
+        );
+        assert_eq!(read_at(kv, ks, b"shared-a", Ts(401)).unwrap(), None);
+        assert_eq!(
+            latest_version(kv, ks, b"shared-a").unwrap(),
+            Some((Ts(600), Some(300u64.to_be_bytes().to_vec())))
+        );
+        assert_eq!(
+            read_at(kv, ks, b"shared-b", Ts(601)).unwrap(),
+            Some(b"adjacent".to_vec())
+        );
+        assert_eq!(version_at(kv, ks, b"shared-", Ts(601)).unwrap(), None);
+        assert_eq!(version_at(kv, ks, b"shared-aa", Ts(601)).unwrap(), None);
+    }
+
+    #[test]
+    fn point_versions_mem() {
+        point_versions(&MemKv::new());
+    }
 
     #[test]
     fn forward_scan_reuses_previous_across_versions_and_tombstones() {
