@@ -237,6 +237,7 @@ pub(super) fn expression(
     if tokens.is_empty() {
         return Err(SqlError::Syntax.into());
     }
+    super::super::row_locks::reject_plan(tokens).map_err(ParseError::Definite)?;
     if merge::claims(tokens) { return merge::parse(tokens, owner, depth, next); }
     if mutation::claims(tokens) { return mutation::parse(tokens, owner, depth, next); }
     if tokens.first().is_some_and(|t| word(t, "with")) {

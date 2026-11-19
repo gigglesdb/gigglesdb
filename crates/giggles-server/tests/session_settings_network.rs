@@ -573,6 +573,14 @@ async fn common_gucs_simple_and_extended_and_invalid_values() {
             [expected]
         );
     }
+    for (input, expected) in [("1", "1ms"), ("'2s'", "2s"), ("0", "0")] {
+        let sql = format!("SET lock_timeout={input}");
+        c.simple_query(&sql).await.unwrap();
+        assert_eq!(values(&c.simple_query("SHOW lock_timeout").await.unwrap()), [expected]);
+        c.query(&sql, &[]).await.unwrap();
+        let rows = c.query("SHOW lock_timeout", &[]).await.unwrap();
+        assert_eq!(rows[0].get::<_, String>(0), expected);
+    }
     for sql in [
         "SET extra_float_digits=4",
         "SET extra_float_digits=-16",
@@ -583,7 +591,8 @@ async fn common_gucs_simple_and_extended_and_invalid_values() {
         "SET IntervalStyle=invalid",
         "SET bytea_output=escape",
         "SET statement_timeout=-1",
-        "SET lock_timeout=1",
+        "SET lock_timeout=-1",
+        "SET lock_timeout='abc'",
         "SET idle_in_transaction_session_timeout=1",
     ] {
         assert_eq!(
@@ -808,7 +817,7 @@ async fn settings_diagnostics_do_not_rewrite_core_parameter_errors() {
         for (query, expected_code, expected_message) in [
             (sql, "22023", "request rejected; consult documented code"),
             (
-                "SET lock_timeout=1",
+                "SET idle_in_transaction_session_timeout=1",
                 "22023",
                 "invalid parameter value; not supported by this server profile",
             ),

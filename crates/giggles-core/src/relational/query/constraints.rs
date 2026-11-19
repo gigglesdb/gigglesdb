@@ -382,6 +382,7 @@ pub(in crate::relational) fn constraint_eval(
     let bound = q.bind(state, 0, &[])?;
     bound.filter.as_ref().ok_or(SqlError::Unsupported)?.eval(
         &Tuple {
+            source_versions: vec![],
             values: vec![row.values.clone()],
             version: row.version,
         },

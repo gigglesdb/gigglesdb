@@ -133,6 +133,7 @@ impl From<TxnError> for crate::CoreError {
                 Self::Sql(crate::relational::SqlError::Conflict)
             }
             TxnError::Deadlock => Self::Deadlock,
+            TxnError::LockTimeout if crate::Cancellation::lock_deadline().is_some() => Self::LockNotAvailable,
             TxnError::LockTimeout => Self::Busy,
             // CoreError has no dedicated unknown-outcome variant; Storage follows its unknown-outcome route.
             TxnError::CommitAmbiguous => Self::Storage("engine commit outcome unknown".into()),
@@ -974,6 +975,55 @@ impl Transaction {
             }
         }
     }
+    /// Writers that need both row keys use the same upgrade protocol as SELECT.
+    /// The caller still uses lock_for_write for version and snapshot checks.
+    pub(crate) fn lock_row_write_group(
+        &mut self, table: u64, pk: &[u8], deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError> {
+        let TxnServices::Local { locks, .. } = &self.services else { return Ok(()); };
+        self.lock_cleanup_needed.store(true, Ordering::Relaxed);
+        locks.acquire_points(self.id, &[
+            (LockKey::RowKey { table, pk: pk.to_vec() }, LockMode::Exclusive),
+            (LockKey::Row { table, pk: pk.to_vec() }, LockMode::Exclusive),
+        ], deadline, cancel)?;
+        Ok(())
+    }
+
+    /// Lock a SQL row without writing a version or permitting writes through a
+    /// shared row lock. K is GD-0084 A2's local-only RowKey lock.
+    pub(crate) fn lock_sql_row(
+        &mut self, table: u64, pk: &[u8],
+        mode: crate::relational::scan::RowLock, deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<WriteTarget, TxnError> {
+        use crate::relational::scan::RowLock;
+        let ts = self.try_snapshot_ts()?;
+        let TxnServices::Local { seq, locks } = &self.services else { return Err(TxnError::Unsupported); };
+        let mut physical = table.to_be_bytes().to_vec();
+        physical.extend_from_slice(pk);
+        let d = LockKey::Row { table, pk: pk.to_vec() };
+        let k = LockKey::RowKey { table, pk: pk.to_vec() };
+        let requested = match mode {
+            RowLock::KeyShare => vec![(k, LockMode::Shared)],
+            RowLock::Share => vec![(k, LockMode::Shared), (d, LockMode::Shared)],
+            RowLock::NoKeyUpdate => vec![(d, LockMode::Exclusive)],
+            RowLock::Update => vec![(k, LockMode::Exclusive), (d, LockMode::Exclusive)],
+        };
+        self.lock_cleanup_needed.store(true, Ordering::Relaxed);
+        locks.acquire_points(self.id, &requested, deadline, cancel)?;
+        let latest = mvcc::latest_version(seq.kv(), Keyspace::Rows, &physical)?;
+        let changed = latest.as_ref().is_some_and(|(latest, _)| *latest > ts);
+        let own = self.writes.get(&(Keyspace::Rows, physical.clone()));
+        if self.isolation != Isolation::ReadCommitted && changed && own.is_none() {
+            return Err(TxnError::Serialization(SerializationReason::WriteConflict));
+        }
+        let current = if let Some(own) = own { own.clone() }
+            else if self.isolation == Isolation::ReadCommitted { latest.and_then(|(_, v)| v) }
+            else { mvcc::read_at(snapshot_view(&self.services, &self.snapshot), Keyspace::Rows, &physical, ts)? };
+        Ok(WriteTarget { current, changed_since_snapshot: changed })
+    }
+
     /// Selects the snapshot before waiting. Errors keep the transaction open; rollback or drop releases its locks.
     pub(crate) fn lock_for_write(
         &mut self,

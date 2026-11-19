@@ -258,6 +258,7 @@ impl BoundExpression {
         bytes: &mut usize,
     ) -> R<Value> {
         let row = Tuple {
+            source_versions: vec![],
             values: vec![old.values.clone(), incoming.to_vec()],
             version: old.version,
         };

@@ -383,6 +383,7 @@ impl BoundScalar {
             node: Node::Literal(value),
         };
         let empty = Tuple {
+            source_versions: vec![],
             values: vec![],
             version: 0,
         };

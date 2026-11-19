@@ -562,3 +562,5 @@ mod sql_numeric_domain;
 
 #[path = "fk_row_locks.rs"]
 mod fk_row_locks;
+#[path = "sql_row_locks.rs"]
+mod sql_row_locks;

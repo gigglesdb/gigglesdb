@@ -2742,6 +2742,21 @@ impl Prepared {
             }
     }
 
+    /// Relations whose rows this statement locks, including nested SELECTs.
+    pub fn row_lock_tables(&self) -> Vec<String> {
+        match &self.statement {
+            Statement::Query(q) => q.row_lock_tables(),
+            Statement::Plan(p) => p.row_lock_tables(),
+            _ => vec![],
+        }
+    }
+    pub fn row_lock_command(&self) -> Option<&'static str> {
+        match &self.statement {
+            Statement::Query(q) => q.row_lock_command(),
+            Statement::Plan(p) => p.row_lock_command(),
+            _ => None,
+        }
+    }
     /// Mutation targets and required command privileges, including WITH substatements.
     pub fn write_tables(&self) -> Vec<(String, &'static str)> {
         match &self.statement {
@@ -4756,3 +4771,17 @@ pub(crate) mod v2_join_cache_tests;
 
 #[cfg(all(test, feature = "engine-rocksdb"))]
 pub(crate) use query::select_points::{DISABLE_SELECT_POINTS, SELECT_POINT_READS, SELECT_FILTER_SKIPS};
+
+/// Synchronous row-wait diagnostic, consumed alongside the CoreError SQLSTATE.
+pub(crate) fn row_lock_wait_error(table: &TableDef, nowait: bool) {
+    user_types::view_replace_error(if nowait {
+        format!("could not obtain lock on row in relation \"{}\"", table.name)
+    } else { "canceling statement due to lock timeout".into() });
+}
+
+/// Builds the table-privilege diagnostic for a SELECT row mark.
+pub fn row_lock_permission_error(table: &str) -> crate::CoreError {
+    let name = table.rsplit('\0').next().unwrap_or(table);
+    user_types::view_replace_error(format!("permission denied for table {name}"));
+    crate::CoreError::Policy(crate::Error::Scope)
+}

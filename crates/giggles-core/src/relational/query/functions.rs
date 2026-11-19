@@ -3376,6 +3376,7 @@ mod xact_tests {
         bound.attach_clock(Some(clock));
         bound.eval(
             &Tuple {
+                source_versions: vec![],
                 values: vec![],
                 version: 0,
             },

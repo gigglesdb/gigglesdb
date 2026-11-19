@@ -404,6 +404,7 @@ impl State {
                 &[],
                 &[],
                 &mut self.settings,
+                &mut self.diagnostic,
                 true,
                 &self.output,
                 out,
@@ -604,7 +605,7 @@ impl State {
             } else {
                 let p = self.diagnostic.core(session.prepare(sql))?;
                 let d = self.diagnostic.core(session.describe(&p))?;
-                read_only_check(p.write_tables().first().map_or(p.command(), |(_, command)| *command), &self.settings, session, &mut self.diagnostic)?;
+                read_only_check(p.row_lock_command().filter(|_| !p.row_lock_tables().is_empty()).unwrap_or_else(|| p.write_tables().first().map_or(p.command(), |(_, command)| *command)), &self.settings, session, &mut self.diagnostic)?;
                 self.settings.queried = session.in_transaction();
                 if p.command() == "SELECT" && p.write_tables().is_empty() {
                     let mut cursor = self.diagnostic.core(session.open_cursor(&p, &[]))?;

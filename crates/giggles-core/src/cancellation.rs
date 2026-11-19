@@ -16,6 +16,7 @@ pub struct Cancellation(Arc<Context>);
 struct Context {
     state: AtomicU8,
     deadline: Mutex<Option<Instant>>,
+    lock_timeout: Mutex<Option<Duration>>,
 }
 thread_local! { static CURRENT: RefCell<Option<Cancellation>> = const { RefCell::new(None) }; }
 impl Cancellation {
@@ -23,10 +24,19 @@ impl Cancellation {
         Self(Arc::new(Context {
             state: AtomicU8::new(0),
             deadline: Mutex::new(deadline),
+            lock_timeout: Mutex::new(None),
         }))
     }
     pub fn current() -> Option<Self> {
         CURRENT.with(|c| c.borrow().clone())
+    }
+    /// Sets a per-acquisition lock timeout for this synchronous request.
+    pub fn set_lock_timeout(&self, timeout: Option<Duration>) {
+        *self.0.lock_timeout.lock().expect("lock timeout") = timeout;
+    }
+    pub(crate) fn lock_deadline() -> Option<Instant> {
+        Self::current().and_then(|c| *c.0.lock_timeout.lock().expect("lock timeout"))
+            .and_then(|duration| Instant::now().checked_add(duration))
     }
     pub fn deadline(&self, at: Instant) {
         let mut d = self.0.deadline.lock().expect("deadline lock");

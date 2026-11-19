@@ -3,6 +3,7 @@ use super::*;
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 mod returning_images;
+mod row_locks;
 mod aggregate_filter;
 mod aggregate_order;
 mod functions;
@@ -205,6 +206,7 @@ struct QueryPrefix {
 
 #[derive(Debug, Clone, Default)]
 struct QueryClauses {
+    row_locks: Vec<row_locks::Clause>,
     allow_duplicate_outputs: bool,
     mutation_keys: Option<std::sync::Arc<BTreeSet<Vec<u8>>>>,
     join_namespace: Option<plan::join::Namespace>,
@@ -2014,7 +2016,7 @@ impl Query {
         if let Some(filter) = self.where_filter() {
             let _ = filter.visit_subqueries(&mut |value, _| { exists |= value.is_none(); Ok(()) });
         }
-        if exists || self.derived().is_some() { return true; }
+        if exists || self.derived().is_some() || self.has_row_locks() { return true; }
         if !self.joins.is_empty() { return true; }
         // DISTINCT and IN subqueries stream too: their state spills (R2-PGLIMITS-4).
         self.sources.len() == 1
@@ -2535,6 +2537,17 @@ impl Query {
         Self::parse(p)
     }
     pub(super) fn parse(p: &mut Parser) -> R<Self> {
+        row_locks::reject_plan(&p.tokens[p.at..])?;
+        let locks = row_locks::extract(p)?;
+        let mut query = Self::parse_unlocked(p)?;
+        if !locks.is_empty() {
+            query.allow_duplicate_outputs();
+            if let Some(Filter::Clauses(c)) = &mut query.filter { c.row_locks = locks; }
+            row_locks::validate(&query)?;
+        }
+        Ok(query)
+    }
+    fn parse_unlocked(p: &mut Parser) -> R<Self> {
         if plan::Plan::requires_grouping_sets(&p.tokens[p.at..]) { return Err(SqlError::Unsupported); }
         admit_subquery_depth(&p.tokens[p.at..])?;
         if plan::subquery::quantified(&p.tokens[p.at..]) {
@@ -2766,6 +2779,7 @@ impl Query {
                 filter
             } else {
                 Some(Filter::Clauses(Box::new(QueryClauses {
+                    row_locks: vec![],
                     allow_duplicate_outputs: false,
                     mutation_keys: None,
                     join_namespace: None,
@@ -4333,7 +4347,9 @@ pub(super) struct BoundQuery<'a> {
     declared: Vec<Option<DataType>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
+// Transient executor/spill tuple, never stored in the database.
 struct Tuple {
+    source_versions: Vec<u64>,
     values: Vec<Vec<Value>>,
     version: u64,
 }
@@ -4386,6 +4402,7 @@ fn join_rows<'a>(
         extended: false,
     }];
     let mut row = Tuple {
+        source_versions: vec![],
         values: vec![],
         version: 0,
     };
@@ -4400,6 +4417,7 @@ fn join_rows<'a>(
                     return Ok(None);
                 };
                 row.values.truncate(depth);
+                row.source_versions.truncate(depth);
                 let candidate = frames[depth].rows.next();
                 if let Some(candidate) = candidate {
                     meter.tick()?;
@@ -4412,6 +4430,7 @@ fn join_rows<'a>(
                     }
                     let equality_match = depth == 0
                         || query.joins[depth - 1].matches(&row, &candidate.row.values)?;
+                    row.source_versions.push(candidate.row.version);
                     row.values.push(candidate.row.values.clone());
                     row.values.resize_with(query.query.sources.len(), Vec::new);
                     row.values.extend_from_slice(outer);
@@ -4433,6 +4452,7 @@ fn join_rows<'a>(
                     && query.joins[depth - 1].left
                 {
                     frames[depth].extended = true;
+                    row.source_versions.push(0);
                     row.values
                         .push(vec![Value::Null; query.tables[depth].columns.len()]);
                     row.values.resize_with(query.query.sources.len(), Vec::new);
@@ -4444,6 +4464,7 @@ fn join_rows<'a>(
                 }
                 if depth == query.joins.len() {
                     return Ok(Some(Tuple {
+                        source_versions: row.source_versions.clone(),
                         values: row.values.clone(),
                         version: row.version,
                     }));
@@ -4698,6 +4719,7 @@ impl BoundQuery<'_> {
         Ok(self
             .project_tuple(
                 &Tuple {
+                    source_versions: vec![],
                     values: vec![values.to_vec()],
                     version,
                 },
@@ -4819,7 +4841,7 @@ impl BoundQuery<'_> {
         } else { source.scan(self.tables[0], range, scan::Direction::Forward) }
     }
     pub(super) fn cursor_direction(&self) -> Option<scan::Direction> {
-        if self.tables.len() != 1
+        if self.query.has_row_locks() || self.tables.len() != 1
             || !self.joins.is_empty()
             || self.aggregate
             || self.grouping.is_some()
@@ -5026,6 +5048,7 @@ impl BoundQuery<'_> {
             let row = row?;
             progress.after = Some(row.key.into_owned());
             let tuple = Tuple {
+                source_versions: vec![],
                 values: vec![row.row.values.clone()],
                 version: row.row.version,
             };
@@ -5140,6 +5163,7 @@ impl BoundQuery<'_> {
             if !self.query.mutation_input_contains(&row.key) { return Ok(None); }
             let mut work = 0;
             let tuple = Tuple {
+                source_versions: vec![],
                 values: vec![row.row.values.clone()],
                 version: row.row.version,
             };
@@ -5226,12 +5250,18 @@ impl BoundQuery<'_> {
         subquery: bool,
         insert_source: bool,
     ) -> R<SqlResult> {
+        self.subqueries.visit(&mut |mode, child| {
+            if mode == SubplanMode::Exists && child.query.row_lock_command().is_some() {
+                Err(SqlError::Unsupported)
+            } else { Ok(()) }
+        })?;
         // Read before any nested subquery runs; only this level is captured.
         let capture = (subquery || insert_source) && execution.capture.replace(false)
             && source.streams_reductions();
         if source.streams_reductions() {
             execution.unbounded.set(true);
         }
+        let physical_source = source;
         let materialized = self.materialize_derived(state, source, params, declared, execution)?;
         let source: &dyn scan::RowSource = materialized.as_ref().map_or(source, |rows| rows);
         if self.outer_slots.iter().any(|slot| slot.depth > execution.frames.borrow().len()) {
@@ -5313,6 +5343,7 @@ impl BoundQuery<'_> {
             };
             if limit != Some(0) && offset == 0 {
                 let row = Tuple {
+                    source_versions: vec![],
                     values: self.outer_values(execution),
                     version: 0,
                 };
@@ -5628,7 +5659,7 @@ impl BoundQuery<'_> {
             // V2 full sorts, and top-N sorts keeping more than TOP_N_ROWS rows
             // (OFFSET + LIMIT), spill like PostgreSQL's bounded-heap fallback.
             const TOP_N_ROWS: usize = 10_000;
-            let external = source.streams_reductions() && page.keep().is_none_or(|keep| keep > TOP_N_ROWS);
+            let external = source.streams_reductions() && (self.query.has_row_locks() || page.keep().is_none_or(|keep| keep > TOP_N_ROWS));
             let rows: Box<dyn Iterator<Item = R<Tuple>> + '_> = if self.order.is_empty() {
                 Box::new(filtered)
             } else {
@@ -5709,7 +5740,11 @@ impl BoundQuery<'_> {
             // a tuplestore, so it has no row or byte ceiling; each row still does.
             // A captured v2 subquery result is spill-backed the same way.
             let mut output = Output::new(source.streams_reductions(), subquery, insert_source, capture)?;
-            for row in page.apply(rows) {
+            let locked = rows.filter_map(|row| {
+                let row = match row { Ok(row) => row, Err(e) => return Some(Err(e)) };
+                row_locks::lock(self, row, physical_source, params, state, execution).transpose()
+            });
+            for row in page.apply(locked) {
                 let row = row?;
                 let mut scalar_work_bytes = 0usize;
                 if !matches!(output, Output::Capped(_)) {
@@ -6004,7 +6039,7 @@ fn flush_distinct(
     retention: &mut scan::Retention,
     work: &mut usize,
 ) -> R<()> {
-    let empty = Tuple { values: vec![], version: 0 };
+    let empty = Tuple { source_versions: vec![], values: vec![], version: 0 };
     for index in 0..items.len() {
         if let Some(sorter) = auxiliary[index].ordered.take() {
             let BoundItem::Aggregate(kind, Some(input)) = &items[index] else {return Err(SqlError::Type)};
@@ -6416,6 +6451,7 @@ mod average_distinct_retention_tests {
         let mut auxiliary = aggregate_auxiliary(&items, &mut retention).unwrap();
         let mut values = vec![Value::Int(0)];
         let row = Tuple {
+            source_versions: vec![],
             values: vec![],
             version: 0,
         };
@@ -6491,6 +6527,7 @@ mod average_distinct_retention_tests {
         assert_eq!(retention.used(), std::mem::size_of::<AggregateAuxiliary>());
         let mut values = vec![Value::Null];
         let row = Tuple {
+            source_versions: vec![],
             values: vec![],
             version: 0,
         };

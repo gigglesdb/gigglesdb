@@ -732,17 +732,21 @@ impl Relational {
             SqlResult::default()
         } else {
             let mut events = Vec::new();
-            let result = self
-                .execute_statement_inner(
-                    prepared,
-                    params,
-                    expected,
-                    || crate::cancellation::check().is_err(),
-                    clock,
-                    None,
-                    &mut events,
-                )
-                .map_err(CoreError::Sql)?;
+            let result = if prepared.row_lock_command().is_some() {
+                let mut result = None;
+                let snapshot = self.clone();
+                sink.with_row_source(&mut |source| {
+                    let source = scan::LockedSnapshot { snapshot: scan::LegacyRows(&snapshot), locks: source };
+                    result = Some(self.execute_statement_inner(prepared, params, expected,
+                        || crate::cancellation::check().is_err(), clock, Some(&source), &mut events)?);
+                    Ok(())
+                })?;
+                result.ok_or(CoreError::Sql(SqlError::InternalError))?
+            } else {
+                self.execute_statement_inner(prepared, params, expected,
+                    || crate::cancellation::check().is_err(), clock, None, &mut events)
+                    .map_err(CoreError::Sql)?
+            };
             if let Some(actions) = actions {
                 let table = table.as_ref().expect("conflict page target");
                 actions.publish(self, sink, table, before.rows.remove(&table.id).unwrap(),

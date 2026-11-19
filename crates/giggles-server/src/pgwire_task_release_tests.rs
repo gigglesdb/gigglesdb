@@ -388,6 +388,7 @@ fn cursor_command(
         &[],
         &[],
         &mut state.settings,
+        &mut state.diagnostic,
         true,
         &state.output,
         out,

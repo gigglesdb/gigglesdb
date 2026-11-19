@@ -1171,6 +1171,7 @@ impl Grouping {
             if query.query.sources.is_empty() {
                 meter.tick()?;
                 accept(&Tuple {
+                    source_versions: vec![],
                     values: outer.clone(),
                     version: 0,
                 })?;
@@ -1267,6 +1268,7 @@ impl Grouping {
             let mut slots = key.0;
             slots.extend(values);
             let row = Tuple {
+                source_versions: vec![],
                 values: vec![slots],
                 version: 0,
             };
@@ -1290,7 +1292,7 @@ impl Grouping {
                         values[column.source][column.column] = scalar.eval(&row, params, &mut work)?;
                     }
                     values.push(row.values[0].clone());
-                    let having_row = Tuple { values, version: 0 };
+                    let having_row = Tuple { source_versions: vec![], values, version: 0 };
                     if h.eval_with_subqueries(&having_row, params, &mut work, query, state, source, execution)? != Some(true) {
                         continue;
                     }

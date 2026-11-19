@@ -252,6 +252,7 @@ impl InsertExpressions {
         }
         value.attach_clock(clock);
         let empty = Tuple {
+            source_versions: vec![],
             values: vec![],
             version: 0,
         };
@@ -508,6 +509,7 @@ impl InsertExpressions {
             )?;
         }
         let empty = Tuple {
+            source_versions: vec![],
             values: vec![],
             version: 0,
         };

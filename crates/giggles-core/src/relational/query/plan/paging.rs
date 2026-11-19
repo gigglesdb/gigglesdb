@@ -55,6 +55,7 @@ impl Sample {
             bound.attach_clock(clock);
             match bound.eval(
                 &Tuple {
+                    source_versions: vec![],
                     values: vec![],
                     version: 0,
                 },

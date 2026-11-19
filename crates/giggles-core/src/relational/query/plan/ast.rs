@@ -92,6 +92,16 @@ impl Plan {
         }
         out
     }
+    pub(in crate::relational) fn row_lock_tables(&self) -> Vec<String> {
+        let mut out = vec![];
+        self.visit_queries(&mut |q| out.extend(q.row_lock_tables()));
+        out.sort(); out.dedup(); out
+    }
+    pub(in crate::relational) fn row_lock_command(&self) -> Option<&'static str> {
+        let mut out = None;
+        self.visit_queries(&mut |q| { if out.is_none() { out = q.row_lock_command(); } });
+        out
+    }
     pub(in crate::relational) fn write_tables(&self) -> Vec<(String, &'static str)> {
         let mut tables: Vec<_> = self.ctes
             .iter()

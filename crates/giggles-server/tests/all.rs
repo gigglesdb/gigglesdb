@@ -368,3 +368,6 @@ mod named_statement_catalog_network;
 
 #[path = "copy_server_files.rs"]
 mod copy_server_files;
+
+#[path = "row_locks_network.rs"]
+mod row_locks_network;

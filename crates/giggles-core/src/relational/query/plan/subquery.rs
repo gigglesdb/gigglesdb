@@ -899,6 +899,7 @@ pub(super) fn run<'a>(
                         array.attach_clock(clock);
                         let value = array.eval(
                             &Tuple {
+                                source_versions: vec![],
                                 values: vec![values.clone()],
                                 version: row.version,
                             },
@@ -944,6 +945,7 @@ pub(super) fn run<'a>(
                         lhs.attach_clock(clock);
                         let lv = lhs.eval(
                             &Tuple {
+                                source_versions: vec![],
                                 values: vec![values.clone()],
                                 version: row.version,
                             },
@@ -984,6 +986,7 @@ pub(super) fn run<'a>(
                             bound.attach_clock(clock);
                             match bound.eval(
                                 &Tuple {
+                                    source_versions: vec![],
                                     values: vec![],
                                     version: 0,
                                 },

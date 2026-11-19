@@ -90,6 +90,7 @@ impl RowPredicate {
     /// As [`RowPredicate::accepts`], on a stored row (keeps its version).
     pub(crate) fn accepts_row(&self, row: &SqlRow) -> R<bool> {
         let tuple = Tuple {
+            source_versions: vec![],
             values: vec![row.values.clone()],
             version: row.version,
         };

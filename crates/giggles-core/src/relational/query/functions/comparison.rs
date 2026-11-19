@@ -310,6 +310,7 @@ mod tests {
             node: Node::Literal(v),
         };
         let row = Tuple {
+            source_versions: vec![],
             values: vec![],
             version: 0,
         };
@@ -363,6 +364,7 @@ mod tests {
     fn overflow_node_inequality() {
         let c = clock("America/Chicago", "2024-01-01 00:00:00+00");
         let row = Tuple {
+            source_versions: vec![],
             values: vec![],
             version: 0,
         };

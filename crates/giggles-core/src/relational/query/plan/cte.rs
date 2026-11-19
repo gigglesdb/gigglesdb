@@ -700,6 +700,9 @@ pub(super) struct VirtualRows<'a, 'e> {
     pub relations: Vec<(String, &'a Relation<'e>)>,
 }
 impl scan::RowSource for VirtualRows<'_, '_> {
+    fn lock_row(&self, table: &TableDef, values: &[Value], mode: scan::RowLock, wait: scan::RowWait)
+        -> R<Option<SqlRow>> { self.base.lock_row(table, values, mode, wait) }
+
     fn streams_reductions(&self) -> bool {
         self.base.streams_reductions()
     }
@@ -958,6 +961,7 @@ fn recurse<'e>(
                 bound.attach_clock(clock);
                 bound.eval(
                     &Tuple {
+                        source_versions: vec![],
                         values: vec![],
                         version: 0,
                     },

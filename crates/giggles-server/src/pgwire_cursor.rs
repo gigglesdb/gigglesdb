@@ -171,6 +171,17 @@ pub(super) fn parse(sql: &str) -> R<Option<Command>> {
     };
     Ok(Some(command))
 }
+// Snapshot-backed cursors cannot yet lock rows as FETCH advances.
+fn reject_row_locks(prepared: &Prepared, hold: bool, diagnostic: &mut Diagnostic) -> R<()> {
+    let Some(command) = prepared.row_lock_command() else { return Ok(()); };
+    if hold {
+        let clause = command.strip_prefix("SELECT ").unwrap_or(command);
+        diagnostic.wire_message = Some(format!("DECLARE CURSOR WITH HOLD ... {clause} is not supported"));
+        diagnostic.wire_detail = Some("Holdable cursors must be READ ONLY.".into());
+    }
+    Err("0A000")
+}
+
 impl Cursors {
     pub fn description(&self, name: &str) -> Option<&Description> {
         self.0.get(name).map(|c| &c.description)
@@ -194,6 +205,7 @@ impl Cursors {
         command: &mut Command,
         session: &mut Session,
         oids: &[u32],
+        diagnostic: &mut Diagnostic,
     ) -> R<Description> {
         if session.is_aborted() {
             return Err("25P02");
@@ -205,12 +217,13 @@ impl Cursors {
             typmods: vec![],
         };
         match command {
-            Command::Declare { sql, prepared, .. } => {
+            Command::Declare { sql, hold, prepared, .. } => {
                 let (plan, desc) = prepare_declared_sql(session, sql, oids, false)?;
                 let Plan::Sql(p) = plan else { unreachable!() };
                 if p.command() != "SELECT" {
                     return Err("42601");
                 }
+                reject_row_locks(&p, *hold, diagnostic)?;
                 d.parameters = desc.parameters;
                 *prepared = Some(p);
             }
@@ -231,6 +244,7 @@ impl Cursors {
         params: &[Value],
         formats: &[u16],
         settings: &mut crate::pg_settings::SessionSettings,
+        diagnostic: &mut Diagnostic,
         simple: bool,
         output: &Output,
         out: &mut Vec<u8>,
@@ -264,6 +278,7 @@ impl Cursors {
                 if p.command() != "SELECT" {
                     return Err("42601");
                 }
+                reject_row_locks(&p, *hold, diagnostic)?;
                 let mut description = core(session.describe(&p))?;
                 description.parameters.clear();
                 let result = core(session.open_cursor(&p, params))?;

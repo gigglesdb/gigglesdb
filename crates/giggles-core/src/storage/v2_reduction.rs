@@ -135,6 +135,30 @@ impl Source<'_> {
     }
 }
 impl RowSource for Source<'_> {
+    fn lock_row(&self, table: &TableDef, values: &[relational::Value], mode: scan::RowLock, wait: scan::RowWait)
+        -> Result<Option<SqlRow>, SqlError> {
+        let key = codec::pk_bytes(&table.primary_key.iter().map(|i| values[*i].clone()).collect::<Vec<_>>())
+            .map_err(|e| self.error(e.into()))?;
+        let mut rows = self.rows.borrow_mut();
+        let deadline = if wait == scan::RowWait::Wait { crate::task::limits::lock_deadline() }
+            else { Some(std::time::Instant::now()) };
+        let target = match rows.txn.lock_sql_row(table.id, &key, mode, deadline,
+            &|| crate::cancellation::check().is_err()) {
+            Ok(target) => target,
+            Err(engine::txn::TxnError::LockTimeout) if wait == scan::RowWait::Skip => return Ok(None),
+            Err(engine::txn::TxnError::LockTimeout) => {
+                relational::row_lock_wait_error(table, wait == scan::RowWait::NoWait);
+                return Err(self.error(CoreError::LockNotAvailable));
+            }
+            Err(error) => return Err(self.error(crate::task::limits::lock_error(error))),
+        };
+        let Some(bytes) = target.current else { return Ok(None); };
+        let mut physical = table.id.to_be_bytes().to_vec(); physical.extend_from_slice(&key);
+        let record = codec::decode_row(&physical, &bytes).map_err(|e| self.error(e.into()))?;
+        if record.tombstone { return Ok(None); }
+        let mut values = record.values; values.resize(table.columns.len(), relational::Value::Null);
+        Ok(Some(SqlRow { values, version: record.row_version }))
+    }
     fn streams_reductions(&self) -> bool { true }
     fn scan<'s>(&'s self, table: &TableDef, range: &scan::KeyRange, dir: scan::Direction)
         -> Result<scan::SourceRows<'s>, SqlError> {

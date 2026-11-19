@@ -209,6 +209,10 @@ pub(super) fn read_only_check(
         return Err("25P02");
     }
     diagnostic.message = Some(match command {
+        "SELECT FOR UPDATE" => "cannot execute SELECT FOR UPDATE in a read-only transaction",
+        "SELECT FOR NO KEY UPDATE" => "cannot execute SELECT FOR NO KEY UPDATE in a read-only transaction",
+        "SELECT FOR SHARE" => "cannot execute SELECT FOR SHARE in a read-only transaction",
+        "SELECT FOR KEY SHARE" => "cannot execute SELECT FOR KEY SHARE in a read-only transaction",
         "INSERT" => "cannot execute INSERT in a read-only transaction",
         "UPDATE" => "cannot execute UPDATE in a read-only transaction",
         "DELETE" => "cannot execute DELETE in a read-only transaction",

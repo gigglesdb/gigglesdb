@@ -94,7 +94,7 @@ impl BoundQuery<'_> {
         outer: &[Vec<Value>], range: &scan::KeyRange) -> R<scan::SourceRows<'s>> {
         if range.is_empty() { return Ok(Box::new(std::iter::empty())); }
         let keys = if source.streams_reductions() {
-            let tuple = Tuple { values: vec![], version: 0 };
+            let tuple = Tuple { source_versions: vec![], values: vec![], version: 0 };
             self.exists_keys.iter().map(|(column, slot, value, ty)| {
                 let operand = slot.map(|c| &outer[c.source - self.query.sources.len()][c.column]);
                 let evaluated;
@@ -113,6 +113,7 @@ impl BoundQuery<'_> {
         params: &[Value],
         execution: &Execution<'_>,
     ) -> R<bool> {
+        if self.query.row_lock_command().is_some() { return Err(SqlError::Unsupported); }
         if execution.cancelled() { return Err(SqlError::Aborted); }
         let number = |e: Option<&Expr>, default, limit| -> R<Option<u64>> {
             let mut value = e.map(|e| self.query.page_value(e, params, limit)).transpose()?;
@@ -174,7 +175,7 @@ impl BoundQuery<'_> {
         };
         if self.query.sources.is_empty() {
             meter.tick()?;
-            let accepted = accept(&Tuple { values: outer, version: 0 })?;
+            let accepted = accept(&Tuple { source_versions: vec![], values: outer, version: 0 })?;
             if !self.aggregate { return Ok(accepted); }
         } else {
             let (empty, bounds) = self.base_bounds(params)?;

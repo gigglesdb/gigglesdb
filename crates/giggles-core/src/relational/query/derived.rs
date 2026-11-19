@@ -71,6 +71,25 @@ impl BoundQuery<'_> {
         params: &[Value], declared: &[Option<DataType>], execution: &'e Execution<'_>) -> R<Option<Rows<'e>>> {
         let Some(child) = self.query.derived() else { return Ok(None); };
         let bound = self.subqueries.get(child as *const Query as usize, SubplanMode::Scalar)?;
+        // A row mark above a derived projection still needs the physical key
+        // and full values, including columns omitted by the projection.
+        let mut expanded;
+        let expanded_bound;
+        let bound = if self.query.has_row_locks() {
+            expanded = child.clone();
+            expanded.allow_duplicate_outputs();
+            if let Some(Filter::Clauses(c)) = &mut expanded.filter {
+                for mark in &self.query.clauses().ok_or(SqlError::Unsupported)?.row_locks {
+                    let mut mark = mark.clone();
+                    mark.names.clear();
+                    c.row_locks.push(mark);
+                }
+            } else { return Err(SqlError::Unsupported); }
+            expanded.items.push((Item::QualifiedStar { schema: None, relation: child.sources[0].alias.clone() }, None));
+            expanded_bound = expanded.bind_projection_seeded(state,
+                bound.parameters.iter().cloned().map(Some).collect())?;
+            &expanded_bound
+        } else { bound };
         let (result, captured) = execution.capture_subquery(
             || bound.execute_context(state, source, params, declared, execution, true, false))?;
         let table = self.tables[0];

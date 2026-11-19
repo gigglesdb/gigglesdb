@@ -195,6 +195,7 @@ impl Plan {
             }
             Body::Values(rows) => {
                 let empty = Tuple {
+                    source_versions: vec![],
                     values: vec![],
                     version: 0,
                 };
@@ -274,6 +275,7 @@ impl Plan {
                     return Err(SqlError::Aborted);
                 }
                 let tuple = Tuple {
+                    source_versions: vec![],
                     values: vec![row.values.clone()],
                     version: row.version,
                 };
@@ -340,6 +342,7 @@ fn page(
     bound.attach_clock(clock);
     let value = bound.eval(
         &Tuple {
+            source_versions: vec![],
             values: vec![],
             version: 0,
         },

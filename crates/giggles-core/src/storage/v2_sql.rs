@@ -527,6 +527,9 @@ impl SqlSession {
                         (None, Some(txn)) => (txn, None),
                         (None, None) => (implicit.insert(db.begin(self.isolation.engine())), None),
                     };
+                    if p.row_lock_command().is_some() && matches!(txn.services(), engine::txn::TxnServices::Cluster(_)) {
+                        return Err(CoreError::Sql(E::Unsupported));
+                    }
                     if !self.copy_input.as_ref().is_some_and(|input| input.started) {
                         txn.begin_statement();
                     }
@@ -635,6 +638,7 @@ impl SqlSession {
                                 }
                             }
                         }
+                        let row_lock_names = bound.row_lock_tables().into_iter().collect::<BTreeSet<_>>();
                         let mut locks = BTreeMap::new();
                         for name in &names {
                             if let Some(id) = binding.view_names.get(name).map(|(id, _)| id) {
@@ -645,6 +649,8 @@ impl SqlSession {
                                     table.id,
                                     if truncating {
                                         LockMode::AccessExclusive
+                                    } else if row_lock_names.contains(name) {
+                                        LockMode::RowShare
                                     } else {
                                         LockMode::AccessShare
                                     },
@@ -696,7 +702,7 @@ impl SqlSession {
                         // A WITH statement can own several mutation targets.
                         if writing && !ddl {
                             for id in write_ids.iter().filter(|id| Some(**id) != target_id) {
-                                txn.lock_sql_sentinel(*id, if txn.isolation() == Isolation::ReadCommitted {
+                                txn.lock_sql_sentinel(*id, if txn.isolation() == Isolation::ReadCommitted && bound.row_lock_command().is_none() {
                                     LockMode::Exclusive
                                 } else { LockMode::Shared }, &|| crate::cancellation::check().is_err())?;
                             }
@@ -767,7 +773,7 @@ impl SqlSession {
                             // validation at commit keep the run correct.
                             let collated = binding.has_nondeterministic_keys(table);
                             let shared = !collated && (fixed_snapshot || append || candidates.is_some() || upsert.is_some()
-                                || protected);
+                                || protected || bound.row_lock_command().is_some());
                             txn.lock_sql_sentinel(table.id,
                                 if shared { LockMode::Shared } else { LockMode::Exclusive },
                                 &|| crate::cancellation::check().is_err())?;
@@ -787,7 +793,7 @@ impl SqlSession {
                                         &|| crate::cancellation::check().is_err()).map_err(crate::task::limits::lock_error)?;
                                 }
                             }
-                            let key_prelock = fk_referenced(parts, table.id)
+                            let key_prelock = matches!(txn.services(), engine::txn::TxnServices::Local { .. })
                                 && bound.mutation_changes_key(table, &parts.indexes);
                             if let Some(keys) = candidates {
                                 let physical = keys.iter().map(|key| {
@@ -802,7 +808,7 @@ impl SqlSession {
                                 let mut fits = true;
                                 for key in physical {
                                     if key_prelock {
-                                        txn.lock_row_key(table.id, &key[8..], LockMode::Exclusive,
+                                        txn.lock_row_write_group(table.id, &key[8..],
                                             crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err())
                                             .map_err(crate::task::limits::lock_error)?;
                                     }
@@ -2108,7 +2114,7 @@ impl RowSink for SqlRows<'_> {
                     .map(|i| row.values[*i].clone()).collect::<Vec<_>>()))
                 .collect::<Result<BTreeSet<_>, _>>()?;
             for key in keys {
-                self.txn.lock_row_key(table.id, &key, LockMode::Exclusive,
+                self.txn.lock_row_write_group(table.id, &key,
                     crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err())
                     .map_err(crate::task::limits::lock_error)?;
                 let mut physical = table.id.to_be_bytes().to_vec();
@@ -2205,10 +2211,9 @@ impl RowSink for SqlRows<'_> {
         for (key, (old, new)) in &changes {
             crate::cancellation::check()?;
             if matches!(self.txn.services(), engine::txn::TxnServices::Local { .. })
-                && fk_referenced(self.parts, table.id)
                 && old.is_some_and(|old| new.is_none_or(|new|
                     fk_key_changed(table, &self.parts.indexes, &old.values, &new.values))) {
-                self.txn.lock_row_key(table.id, &key[8..], LockMode::Exclusive,
+                self.txn.lock_row_write_group(table.id, &key[8..],
                     crate::task::limits::lock_deadline(), &|| crate::cancellation::check().is_err())
                     .map_err(crate::task::limits::lock_error)?;
             }

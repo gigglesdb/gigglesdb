@@ -1093,6 +1093,7 @@ fn compare_keys(a: &[Value], b: &[Value], order: &[(BoundScalar, bool, bool)]) -
 fn eval(b: &BoundScalar, row: &SqlRow, params: &[Value]) -> R<Value> {
     b.eval(
         &Tuple {
+            source_versions: vec![],
             values: vec![row.values.clone()],
             version: row.version,
         },
@@ -1171,6 +1172,7 @@ fn offset(
     b.attach_clock(clock);
     let v = b.eval(
         &Tuple {
+            source_versions: vec![],
             values: vec![],
             version: 0,
         },
@@ -1323,6 +1325,7 @@ fn frame_edge(
                 )),
                 _ => bound.eval(
                     &Tuple {
+                        source_versions: vec![],
                         values: vec![],
                         version: 0,
                     },
@@ -1653,6 +1656,7 @@ pub(super) fn run(
                                     &mut aux,
                                     &mut retention,
                                     &Tuple {
+                                        source_versions: vec![],
                                         values: vec![row.values.clone()],
                                         version: row.version,
                                     },

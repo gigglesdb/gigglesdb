@@ -215,6 +215,7 @@ impl Function {
                 b.attach_clock(clock);
                 values.push(b.eval(
                     &Tuple {
+                        source_versions: vec![],
                         values: vec![],
                         version: 0,
                     },

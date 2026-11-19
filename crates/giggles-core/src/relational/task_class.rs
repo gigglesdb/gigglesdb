@@ -40,6 +40,7 @@ impl Prepared {
         match &self.statement {
             Statement::Select { name, .. } if is_catalog_relation(name) => StatementClass::Catalog,
             Statement::Select { .. } => StatementClass::Select,
+            Statement::Query(q) if q.row_lock_command().is_some() => StatementClass::Other,
             Statement::Query(q) => {
                 let mut shape = StatementShape::new(StatementClass::Select);
                 q.task_refs(&mut shape, true);

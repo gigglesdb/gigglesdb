@@ -370,9 +370,8 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
         Show::XmlOption if matches!(lower.as_str(), "content" | "document") => Ok(lower),
         Show::DefaultTablespace if value.is_empty() => Ok(value),
         Show::DefaultTableAccessMethod if lower == "heap" => Ok(lower),
-        Show::StatementTimeout => statement_timeout_ms(&lower).map(|n| n.to_string()),
+        Show::StatementTimeout | Show::LockTimeout => statement_timeout_ms(&lower).map(|n| n.to_string()),
         Show::TransactionTimeout
-        | Show::LockTimeout
         | Show::IdleInTransactionSessionTimeout => {
             if value.parse::<u64>() == Ok(0) {
                 Ok("0".into())

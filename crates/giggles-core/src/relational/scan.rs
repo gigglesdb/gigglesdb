@@ -70,7 +70,14 @@ pub(crate) struct SourceRow<'a> {
     pub(crate) row: Cow<'a, SqlRow>,
 }
 pub(crate) type SourceRows<'s> = Box<dyn Iterator<Item = R<SourceRow<'s>>> + 's>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RowLock { KeyShare, Share, NoKeyUpdate, Update }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RowWait { Wait, Skip, NoWait }
 pub(crate) trait RowSource {
+    fn lock_row(&self, _table: &TableDef, _values: &[Value], _mode: RowLock, _wait: RowWait)
+        -> R<Option<SqlRow>> { Err(SqlError::Unsupported) }
+
     fn streams_reductions(&self) -> bool { false }
     /// Optional indexed inner candidates; None preserves the scan fallback.
     /// `first` requests one-row pages for demand-driven EXISTS.
@@ -130,6 +137,23 @@ impl RowSource for LegacyRows<'_> {
             key: Cow::Borrowed(key.as_slice()),
             row: Cow::Borrowed(row),
         }))
+    }
+}
+/// A materialized statement keeps its established scan semantics while row
+/// marks acquire physical locks and refresh through the transaction source.
+pub(crate) struct LockedSnapshot<'a> {
+    pub(crate) snapshot: LegacyRows<'a>,
+    pub(crate) locks: &'a dyn RowSource,
+}
+impl RowSource for LockedSnapshot<'_> {
+    fn streams_reductions(&self) -> bool { true }
+    fn lock_row(&self, table: &TableDef, values: &[Value], mode: RowLock, wait: RowWait)
+        -> R<Option<SqlRow>> { self.locks.lock_row(table, values, mode, wait) }
+    fn scan<'s>(&'s self, table: &TableDef, range: &KeyRange, dir: Direction) -> R<SourceRows<'s>> {
+        self.snapshot.scan(table, range, dir)
+    }
+    fn get<'s>(&'s self, table: &TableDef, key: &[u8]) -> R<Option<SourceRow<'s>>> {
+        self.snapshot.get(table, key)
     }
 }
 pub(crate) const CANCEL_POLL_ROWS: u64 = 64;

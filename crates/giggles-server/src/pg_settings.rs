@@ -21,6 +21,7 @@ pub(crate) enum Setting {
 pub(crate) struct Settings {
     pub application_name: String,
     pub statement_timeout: u64,
+    pub lock_timeout: u64,
     pub extra_float_digits: i32,
     pub timezone: String,
     pub datestyle: String,
@@ -54,6 +55,7 @@ impl Default for Settings {
         Self {
             application_name: String::new(),
             statement_timeout: 0,
+            lock_timeout: 0,
             extra_float_digits: 1,
             timezone: "UTC".into(),
             datestyle: "ISO, MDY".into(),
@@ -207,6 +209,7 @@ impl Settings {
     fn assign(&mut self, name: Show, value: String) {
         match name {
             Show::ApplicationName => self.application_name = value,
+            Show::LockTimeout => self.lock_timeout = database::statement_timeout_ms(&value).expect("validated GUC"),
             Show::StatementTimeout => self.statement_timeout = database::statement_timeout_ms(&value).expect("validated GUC"),
             Show::ExtraFloatDigits => {
                 self.extra_float_digits = value.parse().expect("validated GUC")
@@ -386,13 +389,13 @@ impl Show {
             Self::XmlOption => ("xmloption", settings.xmloption.clone()),
             Self::DefaultTablespace => ("default_tablespace", "".into()),
             Self::DefaultTableAccessMethod => ("default_table_access_method", "heap".into()),
-            Self::StatementTimeout => ("statement_timeout", {
-                let n = settings.statement_timeout;
+            Self::StatementTimeout | Self::LockTimeout => (
+                if self == Self::StatementTimeout { "statement_timeout" } else { "lock_timeout" }, {
+                let n = if self == Self::StatementTimeout { settings.statement_timeout } else { settings.lock_timeout };
                 if n == 0 { "0".into() } else {
                     [(86400000, "d"), (3600000, "h"), (60000, "min"), (1000, "s"), (1, "ms")].into_iter().find_map(|(factor, unit)| n.is_multiple_of(factor).then(|| format!("{}{unit}", n / factor))).unwrap()
                 }
             }),
-            Self::LockTimeout => ("lock_timeout", "0".into()),
             Self::IdleInTransactionSessionTimeout => {
                 ("idle_in_transaction_session_timeout", "0".into())
             }

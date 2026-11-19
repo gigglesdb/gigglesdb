@@ -1221,6 +1221,7 @@ impl From {
                 execution.comparison()?;
                 let values = pair(Some(row), Some(&b.rows[i]), offset, right_width);
                 let tuple = Tuple {
+                    source_versions: vec![],
                     values: vec![values],
                     version: row.version.max(b.rows[i].version),
                 };
@@ -1426,6 +1427,7 @@ fn lateral_run<'a>(
         for r in &right.rows {
             execution.comparison()?;
             let tuple = Tuple {
+                source_versions: vec![],
                 values: vec![pair(Some(row), Some(r), aw, bw)],
                 version: row.version.max(r.version),
             };

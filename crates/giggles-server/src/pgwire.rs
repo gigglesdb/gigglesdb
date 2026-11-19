@@ -163,6 +163,13 @@ impl Diagnostic {
     }
     fn core<T>(&mut self, result: Result<T, CoreError>) -> R<T> {
         let message = giggles_core::relational::take_sql_error_message();
+        if result.is_err() && message.as_deref().is_some_and(|m|
+            m.starts_with("FOR ") || m.starts_with("syntax error at or near ") || m.starts_with("could not obtain lock on row ")
+                || m == "canceling statement due to lock timeout"
+                || m.starts_with("permission denied for table ")
+                || m.starts_with("relation ") && m.contains(" clause not found in FROM clause")) {
+            self.wire_message = message.clone();
+        }
         self.sql_detail = giggles_core::relational::take_sql_error_detail();
         self.wire_hint = giggles_core::relational::take_sql_error_hint();
         if result.is_err() && message.as_deref().is_some_and(|m| m.starts_with("function uuid_") || m.starts_with("extension ") || m.starts_with("cannot drop extension ") || m.starts_with("schema ")) { self.wire_message = message.clone(); }
@@ -1191,6 +1198,9 @@ impl State {
     }
 }
 fn statement_deadline(settings: &crate::pg_settings::Settings) {
+    if let Some(context) = giggles_core::Cancellation::current() {
+        context.set_lock_timeout((settings.lock_timeout > 0).then(|| std::time::Duration::from_millis(settings.lock_timeout)));
+    }
     if settings.statement_timeout > 0 && let Some(context) = giggles_core::Cancellation::current() {
         context.deadline(std::time::Instant::now() + std::time::Duration::from_millis(settings.statement_timeout));
     }
@@ -1427,7 +1437,7 @@ impl State {
             if !session.role.is_sql() {
                 return Err("42501");
             }
-            let d = self.cursors.describe(&mut command, session, &oids)?;
+            let d = self.cursors.describe(&mut command, session, &oids, &mut self.diagnostic)?;
             (Plan::Cursor(command), d)
         } else if let Some(stmt) = crate::auth::statements::parse(sql) {
             (
@@ -1967,6 +1977,7 @@ impl State {
                         &p.params,
                         &p.formats,
                         &mut self.settings,
+                        &mut self.diagnostic,
                         false,
                         &self.output,
                         out,
@@ -2303,7 +2314,7 @@ impl State {
                 };
                 if prepared.command() == "SELECT" && prepared.write_tables().is_empty() {
                     if p.cursor.is_none() {
-                        read_only_check("SELECT", &self.settings, session, &mut self.diagnostic)?;
+                        read_only_check(prepared.row_lock_command().filter(|_| !prepared.row_lock_tables().is_empty()).unwrap_or("SELECT"), &self.settings, session, &mut self.diagnostic)?;
                         begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                         self.settings.queried = true;
                         p.cursor = Some(
@@ -2352,7 +2363,7 @@ impl State {
                 }
                 if p.result.is_none() {
                     let command = prepared.command();
-                    read_only_check(prepared.write_tables().first().map_or(command, |(_, command)| *command), &self.settings, session, &mut self.diagnostic)?;
+                    read_only_check(prepared.row_lock_command().filter(|_| !prepared.row_lock_tables().is_empty()).unwrap_or_else(|| prepared.write_tables().first().map_or(command, |(_, command)| *command)), &self.settings, session, &mut self.diagnostic)?;
                     if needs_implicit_transaction(prepared) {
                         begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     }

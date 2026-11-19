@@ -294,6 +294,7 @@ struct Waiter {
     key: LockKey,
     mode: LockMode,
     upgrade: bool,
+    group: Vec<(LockKey, LockMode)>,
     // Set by `cancel_wait`: the request ends `Deadlock` instead of being granted.
     cancelled: bool,
     changed: Arc<Condvar>,
@@ -312,6 +313,8 @@ struct State {
     row_counts: HashMap<TxnId, usize>,
     held_keys: HashMap<TxnId, HashSet<LockKey>>,
     next_waiter: u64,
+    // Group grants stay provisional until every member validates atomically.
+    provisional: HashMap<(TxnId, LockKey), HeldModes>,
     // Per `LockSpace`: interval keys with holders or queued requests.
     intervals: [HashSet<LockKey>; 2],
     // Per `LockSpace`: byte forms of point keys with an Exclusive holder or a
@@ -320,6 +323,10 @@ struct State {
     // single-node one) pays nothing for it.
     points: [BTreeSet<Vec<u8>>; 2],
     indexed: [bool; 2],
+}
+
+struct GroupContext<'a> {
+    requested: &'a [(LockKey, LockMode)],
 }
 
 #[derive(Debug)]
@@ -352,6 +359,17 @@ impl LockManager {
         deadline: Option<Instant>,
         cancel: &dyn Fn() -> bool,
     ) -> Result<(), LockError> {
+        self.acquire_group_member(txn, key.clone(), mode, deadline, cancel, GroupContext { requested: &[(key, mode)] })
+    }
+
+    fn acquire_group_member(
+        &self, txn: TxnId, key: LockKey, mode: LockMode,
+        deadline: Option<Instant>, cancel: &dyn Fn() -> bool,
+        GroupContext { requested: group }: GroupContext<'_>,
+    ) -> Result<(), LockError> {
+        let deadline = match (deadline, crate::Cancellation::lock_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b),
+        };
         if matches!(key, LockKey::Table(_)) != mode.is_table() {
             return Err(LockError::Misuse);
         }
@@ -373,22 +391,24 @@ impl LockManager {
             .get(&key)
             .and_then(|k| k.holders.get(&txn))
             .copied();
-        if held.is_some_and(|held| held.iter().any(|held| held.covers(mode))) {
+        if !state.provisional.contains_key(&(txn, key.clone()))
+            && held.is_some_and(|held| held.iter().any(|held| held.covers(mode))) {
             if mode.is_table() {
                 state.keys.get_mut(&key).unwrap().holders.get_mut(&txn).unwrap().insert(mode);
             }
             return Ok(());
         }
         let immediate = state.keys.get(&key).is_none_or(|locks| {
-            (held.is_some() || locks.queue.is_empty())
+            (held.is_some() || state.row_locker(txn, &key) || state.compatible_bypass(txn, &key, group) || locks.queue.is_empty())
                 && !locks.holders.iter().any(|(&owner, held)| {
-                    owner != txn && held.iter().any(|held| mode.conflicts(held))
+                    state.holder_conflicts(txn, &key, mode, owner, *held, group)
                 })
         }) && !state.cross_blocked(txn, &key, mode);
         // A zero deadline is a nonblocking attempt: a compatible immediate
         // acquisition, including reentrance and upgrades, still succeeds.
         if immediate {
             state.grant(txn, &key, mode, self.config.max_row_locks_per_txn)?;
+            state.finish_group(txn, group);
             state.drain_queue(&key, self.config.max_row_locks_per_txn);
             state.notify_grant(txn, &key);
             return Ok(());
@@ -399,7 +419,7 @@ impl LockManager {
         }
         let id = state.next_waiter;
         state.next_waiter = state.next_waiter.checked_add(1).ok_or(LockError::Misuse)?;
-        let upgrade = held.is_some();
+        let upgrade = held.is_some() || state.row_locker(txn, &key);
         // A request blocked only across keys queues on a fresh entry.
         state.keys.entry(key.clone()).or_default();
         let position = if upgrade {
@@ -421,6 +441,7 @@ impl LockManager {
                 key: key.clone(),
                 mode,
                 upgrade,
+                group: group.to_vec(),
                 cancelled: false,
                 changed: Arc::clone(&changed),
                 #[cfg(test)]
@@ -503,6 +524,110 @@ impl LockManager {
         }
     }
 
+    /// Acquire a group of point locks in K-then-D order for blocking calls.
+    /// Zero-deadline calls preflight the complete group atomically. The caller serializes requests made by the same transaction.
+    pub(crate) fn acquire_points(
+        &self, txn: TxnId, requested: &[(LockKey, LockMode)],
+        deadline: Option<Instant>, cancel: &dyn Fn() -> bool,
+    ) -> Result<(), LockError> {
+        let deadline = match (deadline, crate::Cancellation::lock_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b),
+        };
+        if requested.iter().any(|(key, mode)| (key.point().is_none() && !matches!(key, LockKey::RowKey { .. })) || mode.is_table()) {
+            return Err(LockError::Misuse);
+        }
+        if deadline.is_none_or(|d| d > Instant::now()) {
+            let mut ordered = requested.iter().collect::<Vec<_>>();
+            ordered.sort_by_key(|(key, _)| !matches!(key, LockKey::RowKey { .. }));
+            {
+                let mut state = self.state.lock().map_err(|_| LockError::Misuse)?;
+                for (key, _) in &ordered {
+                    let previous = state.keys.get(key).and_then(|s| s.holders.get(&txn))
+                        .copied().unwrap_or_default();
+                    state.provisional.insert((txn, key.clone()), previous);
+                }
+            }
+            let result = (|| {
+                loop {
+                    // Recheck the entire group after any wait, in K-then-D order.
+                    // Neither a queued grant nor a covered provisional mode is ownership.
+                    for (key, mode) in &ordered {
+                        self.acquire_group_member(txn, key.clone(), *mode, deadline, cancel,
+                            GroupContext { requested })?;
+                    }
+                    let mut state = self.state.lock().map_err(|_| LockError::Misuse)?;
+                    if ordered.iter().any(|(key, mode)| {
+                        state.keys.get(key).is_some_and(|locks| locks.holders.iter().any(|(&owner, held)|
+                            state.holder_conflicts(txn, key, *mode, owner, *held, requested)))
+                            || state.cross_blocked(txn, key, *mode)
+                    }) { continue; }
+                    for (key, _) in &ordered {
+                        state.provisional.remove(&(txn, key.clone()));
+                    }
+                    return Ok(());
+                }
+            })();
+            if result.is_err() {
+                // Restore precisely the pre-group modes, including upgrades of
+                // existing grants. release_all may already have removed them.
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                let mut affected = HashSet::new();
+                for (key, _) in &ordered {
+                    if let Some(previous) = state.provisional.remove(&(txn, key.clone())) {
+                        if previous.iter().next().is_some() {
+                            state.keys.entry(key.clone()).or_default().holders.insert(txn, previous);
+                        } else if state.keys.get_mut(key).is_some_and(|s| s.holders.remove(&txn).is_some()) {
+                            if let Some(keys) = state.held_keys.get_mut(&txn) { keys.remove(key); }
+                            if let Some(count) = state.row_counts.get_mut(&txn) { *count -= 1; }
+                        }
+                        affected.insert(key.clone());
+                        let mut cross = Vec::new();
+                        state.cross_queued(key, &mut cross);
+                        affected.extend(cross);
+                    }
+                }
+                for key in affected {
+                    state.drain_queue(&key, self.config.max_row_locks_per_txn);
+                    state.settle(&key);
+                }
+            }
+            return result;
+        }
+        {
+            let mut state = self.state.lock().map_err(|_| LockError::Misuse)?;
+            let blocked = requested.iter().find(|(key, mode)| {
+                let held = state.keys.get(key).and_then(|k| k.holders.get(&txn));
+                if !state.provisional.contains_key(&(txn, key.clone()))
+                    && held.is_some_and(|h| h.iter().any(|h| h.covers(*mode))) { return false; }
+                state.keys.get(key).is_some_and(|locks| {
+                    (held.is_none() && !state.row_locker(txn, key) && !state.compatible_bypass(txn, key, requested) && !locks.queue.is_empty()) || locks.holders.iter()
+                        .any(|(&owner, held)| state.holder_conflicts(txn, key, *mode, owner, *held, requested))
+                }) || state.cross_blocked(txn, key, *mode)
+            }).cloned();
+            let Some((key, mode)) = blocked else {
+                let extra = requested.iter().map(|(key, _)| key).collect::<HashSet<_>>()
+                    .into_iter().filter(|key| state.keys.get(*key)
+                        .is_none_or(|k| !k.holders.contains_key(&txn))).count();
+                if state.row_counts.get(&txn).copied().unwrap_or(0)
+                    .saturating_add(extra) > self.config.max_row_locks_per_txn {
+                    return Err(LockError::Limit);
+                }
+                for (key, mode) in requested {
+                    state.grant(txn, key, *mode, self.config.max_row_locks_per_txn)?;
+                }
+                for (key, _) in requested {
+                    state.drain_queue(key, self.config.max_row_locks_per_txn);
+                    state.notify_grant(txn, key);
+                }
+                return Ok(());
+            };
+            drop(state);
+            // Zero-deadline requests must leave the entire group untouched.
+            let _ = (key, mode);
+            Err(LockError::Timeout)
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn release_all_calls(&self) -> usize {
         self.release_all_calls.load(Ordering::Relaxed)
@@ -527,7 +652,12 @@ impl LockManager {
                 locks.holders.remove(&txn);
                 locks.slow.remove(&txn);
             }
+            state.provisional.remove(&(txn, key.clone()));
             state.cross_queued(key, &mut unblocked);
+            // D grants also determine whether queued K groups may bypass.
+            if let LockKey::Row { table, pk } = key {
+                unblocked.push(LockKey::RowKey { table: *table, pk: pk.clone() });
+            }
         }
         affected.extend(unblocked);
         state.row_counts.remove(&txn);
@@ -609,6 +739,62 @@ impl LockManager {
 }
 
 impl State {
+    // Complete a ready group under the granting mutex, before another group
+    // can overtake it while the acquiring thread is waking. A retained bypasser
+    // keeps every addition provisional, including D, until revalidation succeeds.
+    fn finish_group(&mut self, txn: TxnId, group: &[(LockKey, LockMode)]) {
+        if self.by_txn.get(&txn).is_some_and(|ids| !ids.is_empty()) { return; }
+        if group.iter().any(|(key, mode)| {
+            self.keys.get(key).is_none_or(|locks|
+                !locks.holders.get(&txn).is_some_and(|h| h.iter().any(|h| h.covers(*mode)))
+                    || locks.holders.iter().any(|(&owner, held)|
+                        self.holder_conflicts(txn, key, *mode, owner, *held, group)))
+                || self.cross_blocked(txn, key, *mode)
+        }) { return; }
+        for (key, _) in group { self.provisional.remove(&(txn, key.clone())); }
+    }
+
+    fn row_locker(&self, txn: TxnId, key: &LockKey) -> bool {
+        let (table, pk) = match key {
+            LockKey::RowKey { table, pk } | LockKey::Row { table, pk } => (*table, pk),
+            _ => return false,
+        };
+        [LockKey::RowKey { table, pk: pk.clone() }, LockKey::Row { table, pk: pk.clone() }].iter()
+            .any(|k| self.keys.get(k).and_then(|s| s.holders.get(&txn)).is_some_and(|held|
+                self.provisional_modes(txn, k).unwrap_or(*held).iter().next().is_some()))
+    }
+
+    fn provisional_modes(&self, owner: TxnId, key: &LockKey) -> Option<HeldModes> {
+        self.provisional.get(&(owner, key.clone())).copied()
+    }
+
+    // Only a whole group compatible with all actual grants can bypass tuple
+    // arbitration. Keep pre-group K modes: they are real grants too.
+    fn compatible_bypass(&self, txn: TxnId, key: &LockKey,
+        group: &[(LockKey, LockMode)]) -> bool {
+        let row_group = match key {
+            LockKey::RowKey { .. } => true,
+            LockKey::Row { table, pk } => group.iter().any(|(key, _)|
+                matches!(key, LockKey::RowKey { table: t, pk: p } if t == table && p == pk)),
+            _ => false,
+        };
+        row_group && group.iter().all(|(key, mode)| {
+            !self.cross_blocked(txn, key, *mode) && self.keys.get(key).is_none_or(|locks|
+                locks.holders.iter().all(|(&owner, held)| owner == txn ||
+                    !self.provisional_modes(owner, key).unwrap_or(*held).iter()
+                        .any(|h| mode.conflicts(h))))
+        })
+    }
+
+    fn holder_conflicts(&self, txn: TxnId, key: &LockKey, mode: LockMode,
+        owner: TxnId, held: HeldModes, group: &[(LockKey, LockMode)]) -> bool {
+        if owner == txn { return false; }
+        let effective = if self.row_locker(txn, key) || self.compatible_bypass(txn, key, group) {
+            self.provisional_modes(owner, key).unwrap_or(held)
+        } else { held };
+        effective.iter().any(|h| mode.conflicts(h))
+    }
+
     fn grant(
         &mut self,
         txn: TxnId,
@@ -818,7 +1004,16 @@ impl State {
     }
 
     fn drain_queue(&mut self, key: &LockKey, limit: usize) {
-        while let Some(&id) = self.keys.get(key).and_then(|locks| locks.queue.first()) {
+        while let Some(id) = self.keys.get(key).and_then(|locks| {
+            locks.queue.iter().copied().find(|id| {
+                let waiter = &self.waiters[id];
+                (locks.queue.first() == Some(id)
+                    || self.compatible_bypass(waiter.txn, key, &waiter.group))
+                    && (waiter.cancelled || (!locks.holders.iter().any(|(&owner, held)|
+                        self.holder_conflicts(waiter.txn, key, waiter.mode, owner, *held, &waiter.group))
+                        && !self.cross_blocked(waiter.txn, key, waiter.mode)))
+            })
+        }) {
             let waiter = &self.waiters[&id];
             let txn = waiter.txn;
             let mode = waiter.mode;
@@ -828,17 +1023,11 @@ impl State {
                 self.remove_waiter(id, Err(LockError::Deadlock));
                 continue;
             }
-            if self.keys[key]
-                .holders
-                .iter()
-                .any(|(&owner, held)| owner != txn && held.iter().any(|held| mode.conflicts(held)))
-                || self.cross_blocked(txn, key, mode)
-            {
-                break;
-            }
+            let group = waiter.group.clone();
             let result = self.grant(txn, key, mode, limit);
             self.remove_waiter(id, result);
             if result.is_ok() {
+                self.finish_group(txn, &group);
                 self.notify_grant(txn, key);
             }
         }
@@ -852,13 +1041,14 @@ impl State {
     fn queue_blockers(&self, locks: &KeyState, position: usize, blockers: &mut Vec<TxnId>) {
         let waiter = &self.waiters[&locks.queue[position]];
         for (&owner, held) in &locks.holders {
-            if owner != waiter.txn && held.iter().any(|mode| waiter.mode.conflicts(mode)) {
+            if self.holder_conflicts(waiter.txn, &waiter.key, waiter.mode, owner, *held, &waiter.group) {
                 blockers.push(owner);
             }
         }
         for preceding in &locks.queue[..position] {
             let preceding = &self.waiters[preceding];
-            if preceding.txn != waiter.txn && waiter.mode.conflicts(preceding.mode) {
+            if preceding.txn != waiter.txn && waiter.mode.conflicts(preceding.mode)
+                && !self.compatible_bypass(waiter.txn, &waiter.key, &waiter.group) {
                 blockers.push(preceding.txn);
             }
         }
@@ -933,3 +1123,7 @@ mod interval_tests;
 #[cfg(test)]
 #[path = "locks_wakeup_tests.rs"]
 mod wakeup_tests;
+
+#[cfg(test)]
+#[path = "locks_row_tests.rs"]
+mod row_tests;

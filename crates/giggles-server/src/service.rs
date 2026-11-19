@@ -2425,6 +2425,9 @@ impl Session {
             let mut reqs: Vec<_> = read_tables.into_iter()
                 .map(|table| (table, roles::TablePrivilege::Select))
                 .collect();
+            for table in p.row_lock_tables() {
+                reqs.push((table, roles::TablePrivilege::Update));
+            }
             if let Some(table) = update_table {
                 reqs.push((table.to_owned(), roles::TablePrivilege::Update));
             }
@@ -2440,8 +2443,16 @@ impl Session {
             allowed = self.table_requirements_allowed(&reqs, false)?;
         }
         if !allowed {
+            let mut error = CoreError::Policy(Error::Scope);
+            for table in p.row_lock_tables() {
+                if !self.table_requirements_allowed(&[(table.clone(), roles::TablePrivilege::Select),
+                    (table.clone(), roles::TablePrivilege::Update)], false)? {
+                    error = giggles_core::relational::row_lock_permission_error(&table);
+                    break;
+                }
+            }
             self.sql.abort();
-            return Err(CoreError::Policy(Error::Scope));
+            return Err(error);
         }
         if p.command() == "TRUNCATE TABLE" && !superuser {
             for table in self.sql.truncate_tables(p)? {
